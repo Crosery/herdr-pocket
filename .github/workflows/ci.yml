@@ -73,6 +73,33 @@ jobs:
         shell: powershell
         run: .github\windows-install-test.ps1 -Bundle (Get-ChildItem dist\herdr-pocket-*.tar.gz).FullName
 
+  # A Windows computer with herdr, as the phone sees it: list, read, type, keys, pictures,
+  # starting agents (no desktop app on Windows: hc run), through a relay on the runner.
+  windows-agents:
+    name: Windows agents
+    needs: server
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v8
+        with:
+          name: bundle
+          path: dist
+      - name: Install herdr (hc)
+        shell: powershell
+        run: |
+          irm https://releases.herdr.dev/core/install.ps1 | iex
+          Join-Path $env:LOCALAPPDATA "Programs\herdr-core" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Agents through the relay
+        shell: powershell
+        run: node --no-warnings .github/windows-agents/e2e.ts (Get-ChildItem dist\herdr-pocket-*.tar.gz).FullName
+
   mobile:
     name: Android app
     runs-on: ubuntu-latest

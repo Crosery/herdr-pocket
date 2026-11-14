@@ -306,6 +306,25 @@ export class HcAdapter extends EventEmitter {
 
   private screens = new HcScreens();
 
+  /**
+   * Starts a program (empty argv: the shell) in a new terminal of hc's own, in `cwd`, and
+   * returns its address. For computers without the desktop app; it belongs to no space.
+   */
+  async spawnTerminal(argv: string[], cwd: string): Promise<string> {
+    const out = await run(this.hcBin, ["run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", cwd, ...(argv.length ? ["--", ...argv] : [])], {
+      timeoutMs: 30_000,
+    });
+    const line = out.trim().split("\n").pop() ?? "";
+    let address: unknown;
+    try {
+      address = (JSON.parse(line) as { address?: unknown }).address;
+    } catch {
+      /* reported below */
+    }
+    if (typeof address !== "string" || !address) throw new Error(`hc run 没有返回新终端：${out.trim().slice(0, 200)}`);
+    return address;
+  }
+
   async read(
     address: string,
     lines = 200,
