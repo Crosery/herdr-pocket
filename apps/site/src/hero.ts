@@ -1,6 +1,6 @@
 // Hero stage: mascot interactions, orbiting agent avatars, status bubbles.
 import { onLang, t } from "./i18n";
-import { reducedMotion, finePointer, h, $ } from "./util";
+import { reducedMotion, finePointer, slowNetwork, afterLoad, h, $ } from "./util";
 
 const VENDORS: [string, string, "work" | "wait" | "done"][] = [
   ["claude-code", "Claude Code", "work"],
@@ -22,16 +22,24 @@ export function initHero(): void {
   const bubbles = $("#bubbles")!;
   const still = reducedMotion();
 
-  // ---- Swap the static poster for the animated loop once it has loaded.
+  // ---- Swap the static poster for the animated loop (about 1 MB) once the page
+  // has loaded and the stage is on screen. Data saver and 2G/3G keep the poster.
   const idleUrl = img.dataset.anim!;
   const tapUrl = img.dataset.tap!;
-  if (!still) {
-    const pre = new Image();
-    pre.decoding = "async";
-    pre.src = idleUrl;
-    pre.onload = () => {
-      img.src = idleUrl;
-    };
+  if (!still && !slowNetwork()) {
+    afterLoad(() => {
+      const io = new IntersectionObserver(([e]) => {
+        if (!e.isIntersecting) return;
+        io.disconnect();
+        const pre = new Image();
+        pre.decoding = "async";
+        pre.src = idleUrl;
+        pre.onload = () => {
+          img.src = idleUrl;
+        };
+      });
+      io.observe(stage);
+    });
   }
 
   // ---- Orbit
