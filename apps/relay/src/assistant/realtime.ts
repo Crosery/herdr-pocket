@@ -199,6 +199,8 @@ export class RealtimeCall {
     if (!url.searchParams.has("model")) url.searchParams.set("model", cfg.model);
     this.upstream = new WebSocket(url, {
       headers: cfg.auth === "api-key" ? { "api-key": cfg.apiKey } : { Authorization: `Bearer ${cfg.apiKey}` },
+      // Audio frames would wait for zlib on the thread pool behind the hosts' screens; server-to-server bandwidth is cheap.
+      perMessageDeflate: false,
       followRedirects: false,
       handshakeTimeout: ATTACH_TIMEOUT_MS,
       maxPayload: 16 * 1024 * 1024,

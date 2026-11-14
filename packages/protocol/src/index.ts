@@ -708,6 +708,11 @@ export type NotifyFrame = { type: "notice"; notice: Notice } | { type: "hello"; 
  * Relay -> phone: binary = 48 kHz mono PCM S16LE speech, each preceded by a
  * `response.audio.context` text frame; text = MOSS-Live events (`{action, data}`)
  * plus the relay's own `relay.state` and `relay.task`.
+ *
+ * Playback receipts follow what the speaker really played. Before
+ * `playback.stopped` the phone receipts every chunk it played in full;
+ * `played_audio_ms` is all of the answer it played, and the relay turns it into
+ * what the service expects (MOSS-Live: only the part of the chunk being played).
  */
 export const LIVE_CLIENT_ACTIONS = [
   "mic_state",
