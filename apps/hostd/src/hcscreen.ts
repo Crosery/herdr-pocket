@@ -24,6 +24,15 @@ export interface ScreenSnapshot {
   rows: number;
 }
 
+/** One paint of a watched terminal: the `ansi` of a snapshot as its lines. */
+export interface ScreenLines {
+  lines: string[];
+  /** Plain text of the same rows, only when the watch asked for it. */
+  text?: string;
+  cols: number;
+  rows: number;
+}
+
 /**
  * Colored screen snapshots from herdr-core. Keeps one framed `hc connect`
  * open; each snapshot attaches as a watch-only observer (never types or
@@ -183,8 +192,9 @@ export class HcScreens {
   async watch(
     terminal: string,
     history: number,
-    onUpdate: (snapshot: ScreenSnapshot) => void,
+    onUpdate: (paint: ScreenLines) => void,
     onError: (error: Error) => void,
+    opts: { text?: boolean } = {},
   ): Promise<() => void> {
     const r = await this.call("terminal.attach", { terminal, cols: 80, rows: 24, history, observe: true });
     const channel: number = r.channel;
@@ -195,16 +205,16 @@ export class HcScreens {
     let stopped = false;
     let timer: NodeJS.Timeout | undefined;
     let lastAt = 0;
-    let lastAnsi: string | undefined;
+    let last: string[] | undefined;
     const emit = () => {
       timer = undefined;
       if (stopped) return;
-      const ansi = screen.toAnsi(history);
+      const lines = screen.ansiLines(history);
       // Spinners and cursor blinks repaint without changing what is shown.
-      if (ansi === lastAnsi) return;
-      lastAnsi = ansi;
+      if (last && last.length === lines.length && lines.every((l, i) => l === last![i])) return;
+      last = lines;
       lastAt = Date.now();
-      onUpdate({ ansi, text: screen.toText(history), cols, rows });
+      onUpdate({ lines, text: opts.text === false ? undefined : screen.toText(history), cols, rows });
     };
     const finish = () => {
       if (stopped) return;

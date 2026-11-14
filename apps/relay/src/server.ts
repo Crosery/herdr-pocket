@@ -767,6 +767,8 @@ export class Relay {
       // A newer connection of the same device wins.
       this.conns.delete(device.id);
       prev.ws.close(4000, "replaced");
+      // Before this connection's frames: a phone subscribes again right away, often with the same ids.
+      this.endStreams(prev);
     }
     const conn: Conn = { ws, device, alive: true };
     this.conns.set(device.id, conn);
@@ -791,9 +793,7 @@ export class Relay {
       this.conns.delete(device.id);
       this.store.touch(device.id);
       this.failPendingFor(device.id);
-      for (const [id, s] of this.streams) {
-        if (s.caller.device.id === device.id || s.target === device.id) this.streams.delete(id);
-      }
+      this.endStreams(conn);
       this.events.record({ kind: "device", msg: `offline ${device.kind} "${device.name}"`, device: device.id });
       if (this.agents.delete(device.id)) {
         this.broadcast({ type: "agents", seq: ++this.seq, deviceId: device.id, agents: [] });
@@ -906,6 +906,25 @@ export class Relay {
     }
     this.streams.set(frame.id, { caller, target: frame.to });
     this.send(target, { type: "stream_subscribe", id: frame.id, from: caller.device.id, stream: frame.stream, params: frame.params });
+  }
+
+  /**
+   * A connection is gone. Its hosts stop streaming to it (else they keep a
+   * screen watch running for nobody, and refuse the same stream id when the
+   * phone comes back); its viewers learn the stream ended, so they subscribe
+   * again once the computer is back (older apps fall back to polling).
+   */
+  private endStreams(conn: Conn): void {
+    for (const [id, s] of this.streams) {
+      if (s.caller === conn) {
+        this.streams.delete(id);
+        const target = this.conns.get(s.target);
+        if (target) this.send(target, { type: "stream_unsubscribe", id, from: conn.device.id });
+      } else if (s.target === conn.device.id) {
+        this.streams.delete(id);
+        this.send(s.caller, { type: "stream_open", id, error: { code: "offline", message: "这台电脑断开了" } });
+      }
+    }
   }
 
   private routeStreamUnsubscribe(caller: Conn, frame: Extract<ClientFrame, { type: "stream_unsubscribe" }>): void {

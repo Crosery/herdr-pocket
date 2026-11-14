@@ -642,6 +642,126 @@ export interface LogEntry extends ClientLogEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal stream
+// ---------------------------------------------------------------------------
+
+/**
+ * `stream_subscribe` params of `stream: "terminal"`. Hosts ignore fields they
+ * do not know, so a viewer can always send all of them.
+ */
+export interface TerminalStreamParams {
+  agent: string;
+  /** Lines of history above the screen (hosts default to 120, at most 600). */
+  history?: number;
+  /**
+   * Ask for `terminal_rows` events (only the lines that changed) instead of a
+   * whole `terminal` screen on every paint. Hosts before this ignore it and
+   * keep sending `terminal` events: a viewer that asks must take both.
+   */
+  rows?: boolean;
+  /**
+   * `false`: no screen at all, only `queue` notices (the message box needs no
+   * picture). Hosts before this still send screens, which the viewer drops.
+   */
+  screen?: boolean;
+}
+
+/**
+ * Turns one list of lines into the next: every line, or the lines dropped
+ * from the top (a scroll) plus the lines that differ after that.
+ */
+export interface RowsChange {
+  /** Every line; replaces all. When present the other fields are absent. */
+  lines?: string[];
+  /** Lines dropped from the top first. */
+  shift?: number;
+  /** Line count afterwards: lines past it go, new ones start as "". */
+  length?: number;
+  /** Changed lines as [index after the shift, line]. */
+  set?: Array<[number, string]>;
+}
+
+/**
+ * A terminal paint as SGR-colored lines (history first, like the `ansi` of
+ * `terminal.read` split at "\n"), relative to the previous event of the same
+ * stream. The first event carries `lines`. Apply with `applyRows`.
+ */
+export interface TerminalRowsEvent extends RowsChange {
+  kind: "terminal_rows";
+  /** 1 on the first event of a stream, then +1. A gap means one was missed: subscribe again. */
+  seq: number;
+  /** Terminal size in cells; 0 when the source does not say (the herdr terminal app). */
+  cols: number;
+  rows: number;
+  at: number;
+}
+
+/** How far the content moved up between two paints: the shift that keeps the most lines in place. */
+function scrolledBy(prev: readonly string[], next: readonly string[]): number {
+  if (!prev.length || !next.length) return 0;
+  // Where sampled new lines sat before; a scroll moves them all by the same amount.
+  const where = new Map<string, number[]>();
+  for (let j = 0; j < prev.length; j++) {
+    const line = prev[j]!;
+    if (!line) continue;
+    const at = where.get(line);
+    if (!at) where.set(line, [j]);
+    else if (at.length < 4) at.push(j);
+  }
+  const candidates = new Set<number>([0]);
+  const step = Math.max(1, Math.floor(next.length / 16));
+  for (let i = 0; i < next.length; i += step) {
+    for (const j of where.get(next[i]!) ?? []) if (j > i) candidates.add(j - i);
+  }
+  let best = 0;
+  let bestHits = -1;
+  for (const k of candidates) {
+    let hits = 0;
+    const n = Math.min(next.length, prev.length - k);
+    for (let i = 0; i < n; i++) if (next[i] === prev[i + k]) hits++;
+    if (hits > bestHits || (hits === bestHits && k < best)) {
+      best = k;
+      bestHits = hits;
+    }
+  }
+  return best;
+}
+
+/** The change from `prev` to `next` as a shift plus changed lines (never `lines`). */
+export function diffRows(prev: readonly string[], next: readonly string[]): RowsChange {
+  const shift = scrolledBy(prev, next);
+  const set: Array<[number, string]> = [];
+  for (let i = 0; i < next.length; i++) if ((prev[i + shift] ?? "") !== next[i]) set.push([i, next[i]!]);
+  const out: RowsChange = { length: next.length };
+  if (shift) out.shift = shift;
+  if (set.length) out.set = set;
+  return out;
+}
+
+/** What to send for `next` after `prev`: the diff, or every line when that is not larger. Null when nothing changed. */
+export function rowsChange(prev: readonly string[] | null, next: readonly string[]): RowsChange | null {
+  if (!prev) return { lines: [...next] };
+  const d = diffRows(prev, next);
+  if (!d.shift && !d.set && d.length === prev.length) return null;
+  const diffSize = (d.set ?? []).reduce((n, [, line]) => n + line.length + 8, 24);
+  const fullSize = next.reduce((n, line) => n + line.length + 3, 0);
+  return diffSize < fullSize ? d : { lines: [...next] };
+}
+
+/** Applies a `RowsChange` (a `terminal_rows` event) to the lines it was made against. */
+export function applyRows(prev: readonly string[], change: RowsChange): string[] {
+  if (Array.isArray(change.lines)) return change.lines.map(String);
+  const out = prev.slice(Math.max(0, Number(change.shift) || 0));
+  const length = typeof change.length === "number" && change.length >= 0 ? change.length : out.length;
+  while (out.length < length) out.push("");
+  out.length = length;
+  for (const [i, line] of Array.isArray(change.set) ? change.set : []) {
+    if (Number.isInteger(i) && i >= 0 && i < length && typeof line === "string") out[i] = line;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket frames (JSON text frames, one message each)
 // ---------------------------------------------------------------------------
 
@@ -680,9 +800,16 @@ export type ServerFrame =
   /** Stream subscription forwarded to a host. */
   | { type: "stream_subscribe"; id: string; from: string; stream: "terminal" | "session"; params: unknown }
   | { type: "stream_unsubscribe"; id: string; from: string }
-  /** A host has accepted a stream subscription. */
+  /**
+   * A host has accepted a stream subscription. With `error` after it was
+   * open: the stream ended (its computer went away); subscribe again later.
+   */
   | { type: "stream_open"; id: string; result?: unknown; error?: RpcError }
-  /** Incremental terminal/session update from a subscribed host. */
+  /**
+   * Incremental terminal/session update from a subscribed host. Terminal
+   * streams carry `{ kind: "terminal", screen }` (a whole `terminal.read`
+   * result), `TerminalRowsEvent` when asked for, `queue` and `stale` notices.
+   */
   | { type: "stream_event"; id: string; event: unknown }
   | { type: "pong"; t: number }
   | { type: "error"; error: RpcError }

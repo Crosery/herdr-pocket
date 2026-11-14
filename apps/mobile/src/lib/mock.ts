@@ -6,6 +6,7 @@ import {
   PUT_LIMITS,
   agentKey,
   pairLink,
+  rowsChange,
   type Agent,
   type AssistantConfirm,
   type AssistantItem,
@@ -21,6 +22,8 @@ import {
   type PairResponse,
   type RpcMethod,
   type SubSession,
+  type TerminalRowsEvent,
+  type TerminalStreamParams,
 } from "@herdr-pocket/protocol";
 import { useLive } from "./store";
 import { isWide } from "./ansi";
@@ -434,12 +437,26 @@ export function mockLink(): Link {
     },
     subscribe(_to: string, stream: "terminal" | "session", params: unknown, onEvent: (event: any) => void, onState?: (event: any) => void) {
       onState?.({ status: "open", result: { kind: stream } });
-      if (stream === "terminal") {
-        const agent = (params as { agent?: string } | null)?.agent;
-        const timer = setInterval(() => onEvent({ kind: "terminal", screen: { ...screen(agent), cols: 46, rows: 28 }, at: now() }), 500);
-        return () => clearInterval(timer);
-      }
-      return () => undefined;
+      const p = (params ?? {}) as Partial<TerminalStreamParams>;
+      // Like a host: no screen for a queue-only stream; for a rows viewer, the whole screen once, then what changed.
+      if (stream !== "terminal" || p.screen === false) return () => undefined;
+      let last: string[] | null = null;
+      let seq = 0;
+      const paint = () => {
+        const s = screen(p.agent);
+        if (!p.rows) return onEvent({ kind: "terminal", screen: { ...s, cols: 46, rows: 28 }, at: now() });
+        const lines = s.ansi.split("\n");
+        const change = rowsChange(last, lines);
+        if (!change) return;
+        last = lines;
+        onEvent({ kind: "terminal_rows", seq: ++seq, cols: 46, rows: 28, ...change, at: now() } satisfies TerminalRowsEvent);
+      };
+      const first = setTimeout(paint, 120);
+      const timer = setInterval(paint, 500);
+      return () => {
+        clearTimeout(first);
+        clearInterval(timer);
+      };
     },
     ping() {
       useLive.setState({ rttMs: 30 + Math.round(Math.random() * 20) });
