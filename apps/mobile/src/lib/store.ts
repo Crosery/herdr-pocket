@@ -135,7 +135,13 @@ export function findAgent(key: string): Agent | undefined {
   return undefined;
 }
 
-/** A message sent from this phone that the agent's conversation has not shown yet. */
+/**
+ * Where a message sent from this phone is: on its way, typed into the agent,
+ * waiting behind the agent's turn, or not delivered (see lib/outbox.ts).
+ */
+export type SendState = "sending" | "sent" | "queued" | "failed";
+
+/** A message sent from this phone, shown at once and followed until the agent's conversation shows it. */
 export interface PendingSend {
   id: string;
   /** What the person wrote (without the picture paths the agent got). */
@@ -143,23 +149,45 @@ export interface PendingSend {
   ts: number;
   /** Image URIs of the pictures sent with it, for thumbnails. */
   pictures?: string[];
+  state: SendState;
+  /** The computer's send-queue id, matched against its `queue` stream events. */
+  queueId?: string;
+  /** It arrived during a turn: the agent's program holds it until the turn ends. */
+  waiting?: boolean;
+  /** When the computer took it. */
+  sentAt?: number;
+  /** Why it was not delivered. */
+  error?: string;
+  /** Id of the conversation's own copy, once it showed up: the bubble is that message from then on. */
+  echo?: string;
 }
 
 interface PendingState {
   byAgent: Record<string, PendingSend[]>;
-  add: (agentKey: string, text: string, pictures?: string[]) => void;
+  /** Adds a message in the `sending` state; returns its id. */
+  add: (agentKey: string, text: string, pictures?: string[]) => string;
+  update: (agentKey: string, id: string, patch: Partial<Omit<PendingSend, "id">>) => void;
   drop: (agentKey: string, ids: string[]) => void;
 }
 
 export const usePending = create<PendingState>()((set) => ({
   byAgent: {},
-  add: (agentKey, text, pictures) =>
+  add: (agentKey, text, pictures) => {
+    const id = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     set((s) => ({
       byAgent: {
         ...s.byAgent,
-        [agentKey]: [...(s.byAgent[agentKey] ?? []), { id: `pending-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, text, ts: Date.now(), pictures: pictures?.length ? pictures : undefined }].slice(-20),
+        [agentKey]: [...(s.byAgent[agentKey] ?? []), { id, text, ts: Date.now(), pictures: pictures?.length ? pictures : undefined, state: "sending" as const }].slice(-20),
       },
-    })),
+    }));
+    return id;
+  },
+  update: (agentKey, id, patch) =>
+    set((s) => {
+      const list = s.byAgent[agentKey];
+      if (!list?.some((x) => x.id === id)) return s;
+      return { byAgent: { ...s.byAgent, [agentKey]: list.map((x) => (x.id === id ? { ...x, ...patch } : x)) } };
+    }),
   drop: (agentKey, ids) =>
     set((s) => {
       const left = (s.byAgent[agentKey] ?? []).filter((x) => !ids.includes(x.id));

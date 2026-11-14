@@ -6,13 +6,15 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { call, subscribe } from "../lib/relay";
-import { sameMessage, splitPictures } from "../lib/attach";
+import { splitPictures } from "../lib/attach";
+import { followSends, forget } from "../lib/outbox";
 import { useLive, usePending, useSettings, type PendingSend } from "../lib/store";
 import { fixCjkEmphasis, hasList } from "../lib/markdown";
 import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
 import { EmptyState, TypingDots } from "./ui";
+import { ReplyDots, SendMark } from "./outbox";
 import { BusyMascot, Sparkle } from "./Mascot";
 import { CuteIcon } from "./icons";
 
@@ -29,14 +31,14 @@ type ToolCall = Extract<ConvEvent, { kind: "tool_call" }>;
 type ToolResult = Extract<ConvEvent, { kind: "tool_result" }>;
 
 export type Row =
-  | { type: "user"; id: string; text: string; ts: number; injected?: string }
+  | { type: "user"; id: string; text: string; ts: number; injected?: string; pictures?: string[] }
   | { type: "assistant"; id: string; text: string; ts: number }
   | { type: "thinking"; id: string; text: string }
   | { type: "tool"; id: string; call: ToolCall; result?: ToolResult }
   /** A run of tool calls folded into one line. */
   | { type: "tools"; id: string; items: Array<Extract<Row, { type: "tool" }>> }
   /** Sent from this phone, not yet echoed by the session. */
-  | { type: "pending"; id: string; text: string; ts: number; pictures?: string[] }
+  | { type: "pending"; id: string; text: string; ts: number; pictures?: string[]; send: PendingSend; agentKey: string }
   | { type: "turn_end"; id: string; ts: number }
   | { type: "system"; id: string; text: string; summary: string };
 
@@ -268,7 +270,8 @@ function FoldChip({ label, icon, body, align = "center", a11y }: { label: string
   );
 }
 
-const UserBubble = memo(function UserBubble({ text, injected, ts, pending, pictures }: { text: string; injected?: string; ts?: number; pending?: boolean; pictures?: string[] }) {
+/** `send`: sent from this phone and not in the conversation yet; its state shows under the bubble. */
+const UserBubble = memo(function UserBubble({ text, injected, ts, send, agentKey, pictures }: { text: string; injected?: string; ts?: number; send?: PendingSend; agentKey?: string; pictures?: string[] }) {
   const p = usePalette();
   const scale = useSettings((s) => s.textScale);
   // Picture paths sent with a message (and Claude Code's [Image #n] marks) fold into a chip.
@@ -276,14 +279,14 @@ const UserBubble = memo(function UserBubble({ text, injected, ts, pending, pictu
   return (
     <View style={{ alignItems: "flex-end", paddingLeft: 48, gap: space.xs }}>
       {shown.text ? (
-        <View style={{ backgroundColor: p.bubble, borderRadius: radius.card, borderBottomRightRadius: radius.xs, paddingHorizontal: space.lg, paddingVertical: space.md, opacity: pending ? 0.7 : 1 }}>
+        <View style={{ backgroundColor: p.bubble, borderRadius: radius.card, borderBottomRightRadius: radius.xs, paddingHorizontal: space.lg, paddingVertical: space.md }}>
           <Text selectable style={{ color: p.ink, fontSize: 15.5 * scale, lineHeight: 15.5 * scale * 1.5 }}>
             {shown.text}
           </Text>
         </View>
       ) : null}
       {pictures?.length ? (
-        <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: space.xs, opacity: pending ? 0.7 : 1 }}>
+        <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: space.xs }}>
           {pictures.map((uri, i) => (
             <Image key={i} source={{ uri }} accessibilityLabel={`发送的第 ${i + 1} 张图片`} style={{ width: 64, height: 64, borderRadius: radius.sm, backgroundColor: p.surface2 }} />
           ))}
@@ -292,8 +295,8 @@ const UserBubble = memo(function UserBubble({ text, injected, ts, pending, pictu
         <FoldChip label={`图片 ×${shown.count}`} icon="image-outline" body={shown.lines.join("\n")} align="flex-end" a11y={`这条消息带了 ${shown.count} 张图片`} />
       ) : null}
       {injected ? <FoldChip label="附加内容" icon="paperclip" body={injected} align="flex-end" a11y="这条消息的附加内容" /> : null}
-      {pending ? (
-        <Text style={{ color: p.faint, fontSize: 11.5 }}>已发到电脑，等它接收</Text>
+      {send && agentKey ? (
+        <SendMark send={send} agentKey={agentKey} time={clock(send.ts)} />
       ) : ts ? (
         <Text style={{ color: p.faint, fontSize: 11 }}>{clock(ts)}</Text>
       ) : null}
@@ -520,9 +523,9 @@ function TurnEnd({ ts }: { ts?: number }) {
 const renderRow: ListRenderItem<Row> = ({ item }) => {
   switch (item.type) {
     case "user":
-      return <UserBubble text={item.text} injected={item.injected} ts={item.ts} />;
+      return <UserBubble text={item.text} injected={item.injected} ts={item.ts} pictures={item.pictures} />;
     case "pending":
-      return <UserBubble text={item.text} pictures={item.pictures} pending />;
+      return <UserBubble text={item.text} pictures={item.pictures} send={item.send} agentKey={item.agentKey} />;
     case "tools":
       return <ToolGroup items={item.items} />;
     case "assistant":
@@ -639,31 +642,33 @@ export function ChatView({
     return [...older.filter((e) => !seen.has(e.id)), ...liveEvents];
   }, [older, liveEvents]);
 
-  // Messages sent from this phone show at once and give way to the session's own copy.
-  const pendingAll = usePending((s) => (sub ? undefined : s.byAgent[agent.key]));
-  const dropPending = usePending((s) => s.drop);
+  // Messages sent from this phone show at once and give way to the session's own copy (lib/outbox).
+  const sendsAll = usePending((s) => (sub ? undefined : s.byAgent[agent.key]));
+  const patchSend = usePending((s) => s.update);
   const [nowTick, setNowTick] = useState(Date.now());
   useEffect(() => {
-    if (!pendingAll?.length && agent.status !== "working") return;
+    if (!sendsAll?.length && agent.status !== "working") return;
     const t = setInterval(() => setNowTick(Date.now()), 5000);
     return () => clearInterval(t);
-  }, [pendingAll?.length, agent.status]);
+  }, [sendsAll?.length, agent.status]);
   const folded = useMemo(() => foldEvents(events), [events]);
-  const pending = useMemo(() => {
-    const list: PendingSend[] = pendingAll ?? [];
-    if (!list.length) return list;
-    const said = folded.filter((r): r is Extract<Row, { type: "user" }> => r.type === "user");
-    return list.filter((x) => nowTick - x.ts < PENDING_TTL_MS && !said.some((r) => r.ts >= x.ts - 15_000 && sameMessage(r.text, x.text)));
-  }, [pendingAll, folded, nowTick]);
+  const sends = useMemo(() => followSends(sendsAll ?? [], folded, { status: agent.status, queued: agent.queued }, nowTick), [sendsAll, folded, agent.status, agent.queued, nowTick]);
   useEffect(() => {
-    const gone = (pendingAll ?? []).filter((x) => !pending.includes(x)).map((x) => x.id);
-    if (gone.length) dropPending(agent.key, gone);
-  }, [pendingAll, pending, dropPending, agent.key]);
+    for (const x of sends.patches) patchSend(agent.key, x.id, x.patch);
+    if (sends.drop.length) forget(agent.key, sends.drop);
+  }, [sends, patchSend, agent.key]);
 
-  // Inverted list: newest at index 0.
+  // Inverted list: newest at index 0. The session's copy of a message from this phone keeps its bubble's key.
   const rows = useMemo(
-    () => [...folded, ...pending.map((x): Row => ({ type: "pending", id: x.id, text: x.text, ts: x.ts, pictures: x.pictures }))].reverse(),
-    [folded, pending],
+    () =>
+      [
+        ...folded.map((r): Row => {
+          const x = r.type === "user" ? sends.echoes.get(r.id) : undefined;
+          return r.type === "user" && x ? { ...r, id: x.id, pictures: x.pictures } : r;
+        }),
+        ...sends.shown.map((x): Row => ({ type: "pending", id: x.id, text: x.text, ts: x.ts, pictures: x.pictures, send: x, agentKey: agent.key })),
+      ].reverse(),
+    [folded, sends, agent.key],
   );
   const more = olderCursor === undefined ? q.data?.more : olderCursor !== null;
 
@@ -804,8 +809,8 @@ export function ChatView({
             )
           }
           ListHeaderComponent={
-            // Inverted list: the header sits under the newest message.
-            !sub && agent.status === "working" ? <WorkingBadge since={agent.statusSince} now={nowTick} /> : undefined
+            // Inverted list: the header sits under the newest message. One at a time: working, or about to answer.
+            !sub && agent.status === "working" ? <WorkingBadge since={agent.statusSince} now={nowTick} /> : sends.awaiting ? <ReplyDots /> : undefined
           }
           keyboardDismissMode="interactive"
           extraData={subCtx}
@@ -863,7 +868,6 @@ function mergeEvents(old: ConvEvent[], add: ConvEvent[]): ConvEvent[] {
     })
     .slice(-KEEP_EVENTS);
 }
-const PENDING_TTL_MS = 120_000;
 
 function workedFor(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
