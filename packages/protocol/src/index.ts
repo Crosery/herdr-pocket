@@ -912,6 +912,62 @@ export function apkAssetName(version: string): string {
   return `herdr-pocket-${version.trim().replace(/^v/i, "")}-android-arm64.apk`;
 }
 
+/** A release asset's address on GitHub (what a mirror is put in front of). */
+export function releaseAssetUrl(version: string, name: string): string {
+  return `https://github.com/${RELEASE_REPO}/releases/download/v${version.trim().replace(/^v/i, "")}/${name}`;
+}
+
+/** The newest release's checksum list; GitHub redirects it to the current release's copy. */
+export const LATEST_SUMS_URL = `https://github.com/${RELEASE_REPO}/releases/latest/download/SHA256SUMS`;
+
+/**
+ * Time zones of mainland China. GitHub downloads crawl there (about 100 KB/s for the APK,
+ * measured 2026-11), so release files come through a mirror first.
+ */
+export const CHINA_TIME_ZONES: ReadonlySet<string> = new Set(["Asia/Shanghai", "Asia/Chongqing", "Asia/Chungking", "Asia/Harbin", "Asia/Urumqi", "Asia/Kashgar", "PRC"]);
+
+/** Public proxies that pass GitHub release downloads through, tried in this order. */
+export const RELEASE_MIRRORS: readonly string[] = ["https://ghfast.top/", "https://gh-proxy.com/"];
+
+/** This device's IANA time zone, or "" when the runtime cannot say. */
+export function localTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** True when the time zone is mainland China's. */
+export function inMainlandChina(timeZone: string = localTimeZone()): boolean {
+  return CHINA_TIME_ZONES.has(timeZone);
+}
+
+/**
+ * Where to fetch a GitHub release file from, in order: the mirrors first in mainland China,
+ * GitHub itself first elsewhere, and the others after it when it fails. Whatever comes
+ * through a mirror is checked against SHA256SUMS, and Android only installs an update
+ * signed with the app's own key.
+ */
+export function releaseSources(githubUrl: string, china: boolean): string[] {
+  const mirrored = RELEASE_MIRRORS.map((m) => m + githubUrl);
+  return china ? [...mirrored, githubUrl] : [githubUrl, ...mirrored];
+}
+
+/** The release a `SHA256SUMS` listing belongs to: its version and each file's hash. */
+export function releaseFromSums(listing: string): { version: string; sums: Record<string, string> } | null {
+  const sums: Record<string, string> = {};
+  let version = "";
+  for (const line of listing.split("\n")) {
+    const m = /^([0-9a-f]{64})\s+\*?(\S+)\s*$/i.exec(line.trim());
+    if (!m) continue;
+    sums[m[2]!] = m[1]!.toLowerCase();
+    const v = /^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:-android-arm64\.apk|\.tar\.gz)$/.exec(m[2]!);
+    if (v && !version) version = v[1]!;
+  }
+  return version ? { version, sums } : null;
+}
+
 /**
  * Compares "1.2.10" with "v1.3" part by part as numbers. A pre-release ("1.3.0-beta.1")
  * sorts before its release. Returns <0, 0 or >0.

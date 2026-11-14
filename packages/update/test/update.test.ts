@@ -6,7 +6,8 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { ASSETS, compareVersions, fileMentions, findLayout, latestRelease, linkTarget, readVersion, rollback, setLink, sumFor, update } from "../src/index.ts";
+import { inMainlandChina, releaseFromSums, releaseSources } from "@herdr-pocket/protocol";
+import { ASSETS, compareVersions, fileMentions, findLayout, latestRelease, linkTarget, readVersion, rollback, setLink, sourcesFor, sumFor, update } from "../src/index.ts";
 
 /** Windows' own tar (bsdtar): Git's GNU tar on PATH reads `C:` in paths as a remote host. */
 const TAR = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
@@ -51,6 +52,35 @@ describe("versions", () => {
     const h = "a".repeat(64);
     assert.equal(sumFor(`${"b".repeat(64)}  other.apk\n${h} *dist/herdr-pocket-1.0.0.tar.gz\n`, "herdr-pocket-1.0.0.tar.gz"), h);
     assert.equal(sumFor(`${h}  x\n`, "y"), undefined);
+  });
+
+  test("the release a SHA256SUMS listing names", () => {
+    const h = "a".repeat(64);
+    const r = releaseFromSums(`${h}  herdr-pocket-0.1.3-android-arm64.apk\n${"b".repeat(64)}  herdr-pocket-0.1.3.tar.gz\n`);
+    assert.equal(r?.version, "0.1.3");
+    assert.equal(r?.sums["herdr-pocket-0.1.3-android-arm64.apk"], h);
+    assert.equal(releaseFromSums("<html>rate limited</html>"), null);
+    assert.equal(releaseFromSums(`${h}  herdr-pocket-1.0.0-rc.1-android-arm64.apk\n`)?.version, "1.0.0-rc.1");
+  });
+
+  test("mirrors come first in mainland China, after GitHub elsewhere", () => {
+    const gh = "https://github.com/o/r/releases/download/v1/x.tar.gz";
+    assert.deepEqual(releaseSources(gh, true), [`https://ghfast.top/${gh}`, `https://gh-proxy.com/${gh}`, gh]);
+    assert.equal(releaseSources(gh, false)[0], gh);
+    assert.equal(inMainlandChina("Asia/Shanghai"), true);
+    assert.equal(inMainlandChina("Asia/Hong_Kong"), false);
+    assert.equal(inMainlandChina("UTC"), false);
+    const before = process.env.HERDR_POCKET_MIRROR;
+    try {
+      process.env.HERDR_POCKET_MIRROR = "1";
+      assert.equal(sourcesFor(gh)[0], `https://ghfast.top/${gh}`);
+      process.env.HERDR_POCKET_MIRROR = "0";
+      assert.equal(sourcesFor(gh)[0], gh);
+      assert.deepEqual(sourcesFor("https://example.com/x.tar.gz"), ["https://example.com/x.tar.gz"], "only GitHub files are mirrored");
+    } finally {
+      if (before === undefined) delete process.env.HERDR_POCKET_MIRROR;
+      else process.env.HERDR_POCKET_MIRROR = before;
+    }
   });
 
   test("an unmanaged copy explains how it is updated", () => {

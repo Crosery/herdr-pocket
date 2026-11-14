@@ -34,6 +34,17 @@
 - 想从自己的 fork 更新：`HERDR_POCKET_REPO=<owner>/<repo> herdr-pocket update`；安装脚本同样认这个变量。
 - 查询 GitHub 有频率限制（未登录每小时 60 次），设置 `GITHUB_TOKEN` 可以放宽。
 
+### 中国大陆
+
+在中国大陆直连 GitHub 很慢或者连不上（2026-11 实测：直连下载 APK 约 100 KB/s，`herdr-pocket update` 直连失败），所以按设备时区判断，时区是中国大陆的（`Asia/Shanghai` 等；Windows 是“China Standard Time”）就先走镜像：
+
+- 发布文件（版本信息、发布包、APK）：先试 `ghfast.top`、`gh-proxy.com`，最后才直连 GitHub。其他地区反过来，直连失败才用镜像。
+- 版本信息读的是最新 Release 的 `SHA256SUMS`。镜像能转发这个文件，但转发不了 GitHub API。
+- 安装脚本要下载 Node 时，校验值总是取自 nodejs.org，Node 安装包本身先从 `npmmirror.com` 下载。
+- 不管从哪里下载，都会核对 `SHA256SUMS`。手机端 Android 还会检查签名，只接受同一把密钥签名的更新包。
+- 服务器时区常常是 UTC：设 `HERDR_POCKET_MIRROR=1` 强制先走镜像，设成 `0` 则不用镜像。电脑端、中转服务和安装脚本都认这个变量。
+- 手机 App 只看手机的时区。这套逻辑从 0.1.4 起才有，0.1.3 及以前的 App 还是直连 GitHub。
+
 ## 发布步骤
 
 ```sh

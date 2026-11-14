@@ -24,7 +24,8 @@ interface PocketNativeModule {
   testNotice(title: string, body: string): void;
   /** In-app update (absent in builds before it existed). */
   appVersion?(): string | null;
-  downloadUpdate?(url: string, fileName: string, size: number): Promise<string>;
+  /** `sha256`: the APK's expected hash, or "" when unknown. */
+  downloadUpdate?(url: string, fileName: string, size: number, sha256: string): Promise<string>;
   cancelUpdate?(): void;
   installUpdate?(path: string): "started" | "permission" | "missing";
   canInstallUpdates?(): boolean;

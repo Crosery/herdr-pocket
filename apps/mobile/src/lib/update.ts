@@ -3,11 +3,25 @@
  * downloads its APK with progress and hands it to the system installer. Network trouble,
  * GitHub's rate limit and a release without an APK all stay quiet unless the person asked.
  * Demo mode never calls GitHub.
+ *
+ * In mainland China (by the phone's time zone) GitHub is slow or out of reach, so the
+ * release's SHA256SUMS and APK come through a mirror first, GitHub after; elsewhere it is
+ * the other way round. A download is checked against SHA256SUMS whichever way it came.
  */
 import { Linking } from "react-native";
 import Constants from "expo-constants";
 import { create } from "zustand";
-import { RELEASE_REPO, RELEASES_PAGE, apkAssetName, compareVersions } from "@herdr-pocket/protocol";
+import {
+  LATEST_SUMS_URL,
+  RELEASE_REPO,
+  RELEASES_PAGE,
+  apkAssetName,
+  compareVersions,
+  inMainlandChina,
+  releaseAssetUrl,
+  releaseFromSums,
+  releaseSources,
+} from "@herdr-pocket/protocol";
 import { PocketNative } from "../../modules/pocket-native";
 import { isMockServer } from "./mock";
 import { useSettings, type ReleaseInfo } from "./store";
@@ -56,19 +70,66 @@ function shortNotes(body: unknown): string {
 
 type Latest = { kind: "release"; release: ReleaseInfo } | { kind: "none" } | { kind: "unknown"; why: "offline" | "limited" };
 
-async function fetchLatest(): Promise<Latest> {
+/** `fetch` that gives up after `ms`. */
+async function fetchWithin(url: string, ms: number, init: RequestInit = {}): Promise<Response> {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), 12_000);
+  const timer = setTimeout(() => abort.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: abort.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The latest release from its SHA256SUMS (no notes, no size): works through a mirror. */
+async function fetchFromSums(url: string): Promise<Latest> {
   let res: Response;
   try {
-    res = await fetch(`https://api.github.com/repos/${RELEASE_REPO}/releases/latest`, {
+    res = await fetchWithin(url, 10_000);
+  } catch {
+    return { kind: "unknown", why: "offline" };
+  }
+  if (!res.ok) return { kind: "unknown", why: res.status === 404 ? "offline" : res.status === 403 || res.status === 429 ? "limited" : "offline" };
+  const found = releaseFromSums(await res.text().catch(() => ""));
+  if (!found) return { kind: "unknown", why: "offline" };
+  const fileName = apkAssetName(found.version);
+  const sha256 = found.sums[fileName];
+  return {
+    kind: "release",
+    release: {
+      version: found.version,
+      url: sha256 ? releaseAssetUrl(found.version, fileName) : "",
+      fileName,
+      size: 0,
+      sha256,
+      page: `https://github.com/${RELEASE_REPO}/releases/tag/v${found.version}`,
+      notes: "",
+    },
+  };
+}
+
+/** Sources in order until one answers; mirrors first in mainland China. */
+async function fetchLatest(): Promise<Latest> {
+  const china = inMainlandChina();
+  const sums = releaseSources(LATEST_SUMS_URL, china).map((u) => () => fetchFromSums(u));
+  const tries = china ? [...sums.slice(0, -1), fetchFromApi, sums[sums.length - 1]!] : [fetchFromApi, ...sums];
+  let last: Latest = { kind: "unknown", why: "offline" };
+  for (const attempt of tries) {
+    last = await attempt();
+    if (last.kind !== "unknown") return last;
+  }
+  return last;
+}
+
+/** The GitHub API: release notes and sizes, but rate-limited and slow from mainland China. */
+async function fetchFromApi(): Promise<Latest> {
+  let res: Response;
+  try {
+    res = await fetchWithin(`https://api.github.com/repos/${RELEASE_REPO}/releases/latest`, 12_000, {
       headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
-      signal: abort.signal,
     });
   } catch {
     return { kind: "unknown", why: "offline" };
-  } finally {
-    clearTimeout(timer);
   }
   if (res.status === 404) return { kind: "none" };
   if (!res.ok) return { kind: "unknown", why: res.status === 403 || res.status === 429 ? "limited" : "offline" };
@@ -76,7 +137,7 @@ async function fetchLatest(): Promise<Latest> {
     tag_name?: string;
     html_url?: string;
     body?: string;
-    assets?: { name?: string; browser_download_url?: string; size?: number }[];
+    assets?: { name?: string; browser_download_url?: string; size?: number; digest?: string | null }[];
   } | null;
   const version = json?.tag_name?.trim().replace(/^v/i, "");
   if (!version) return { kind: "unknown", why: "offline" };
@@ -90,6 +151,7 @@ async function fetchLatest(): Promise<Latest> {
       url: apk?.browser_download_url ?? "",
       fileName: apk?.name ?? want,
       size: apk?.size ?? 0,
+      sha256: /^sha256:([0-9a-f]{64})$/i.exec(apk?.digest ?? "")?.[1]?.toLowerCase(),
       page: json?.html_url ?? RELEASES_PAGE,
       notes: shortNotes(json?.body),
     },
@@ -156,7 +218,19 @@ export async function downloadUpdate(): Promise<void> {
     if (e.total > 0) set({ progress: Math.min(1, e.received / e.total) });
   });
   try {
-    const path = await native.downloadUpdate(r.url, r.fileName, r.size);
+    let path: string | null = null;
+    let failed: unknown;
+    for (const url of releaseSources(r.url, inMainlandChina())) {
+      try {
+        path = await native.downloadUpdate(url, r.fileName, r.size, r.sha256 ?? "");
+        break;
+      } catch (e) {
+        failed = e;
+        applog("info", "update", `download of ${r.version} from ${url.replace(/^https?:\/\/([^/]+).*$/, "$1")} failed: ${(e as Error)?.message ?? String(e)}`);
+        set({ progress: 0 });
+      }
+    }
+    if (!path) throw failed;
     set({ phase: "ready", path, progress: 1 });
     installUpdate();
   } catch (e) {

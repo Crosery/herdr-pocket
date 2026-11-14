@@ -99,11 +99,11 @@ class PocketNativeModule : Module() {
      * Downloads a release APK into the cache; progress arrives as onUpdateProgress.
      * Runs on its own thread so a long download never holds up other native calls.
      */
-    AsyncFunction("downloadUpdate") { url: String, name: String, size: Double, promise: Promise ->
+    AsyncFunction("downloadUpdate") { url: String, name: String, size: Double, sha256: String, promise: Promise ->
       val ctx = context
       Thread {
         try {
-          val path = Updater.download(ctx, url, name, size.toLong()) { got, total ->
+          val path = Updater.download(ctx, url, name, size.toLong(), sha256) { got, total ->
             PocketBus.emit("onUpdateProgress", mapOf("received" to got.toDouble(), "total" to total.toDouble()))
           }
           promise.resolve(path)

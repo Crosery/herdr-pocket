@@ -17,6 +17,12 @@
 #   -NoService          install the command only; then run `herdr-pocket up` yourself
 #
 # With `irm ... | iex` (no parameters), set $env:HERDR_POCKET_SERVER first instead.
+#
+# In mainland China (by the time zone) GitHub and nodejs.org are slow or out of reach, so
+# downloads go through mirrors first: ghfast.top / gh-proxy.com for the release, npmmirror.com
+# for Node. Checksums still decide. $env:HERDR_POCKET_MIRROR = "1" turns that on anywhere,
+# "0" turns it off. From China, fetch the script itself through a mirror too:
+#   & ([scriptblock]::Create((irm https://ghfast.top/https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
 # Later: `herdr-pocket update` installs new releases, `herdr-pocket status` shows the state.
 
 [CmdletBinding()]
@@ -53,6 +59,33 @@ function Fetch([string]$url, [string]$out) {
       Start-Sleep -Seconds 2
     }
   }
+}
+
+# Mainland China by the time zone; HERDR_POCKET_MIRROR forces it either way.
+function InChina {
+  switch -regex ("$env:HERDR_POCKET_MIRROR") {
+    "^(1|true|on|yes)$" { return $true }
+    "^(0|false|off|no)$" { return $false }
+  }
+  $tz = [TimeZoneInfo]::Local.Id
+  return ($tz -eq "China Standard Time") -or ($tz -in @("Asia/Shanghai", "Asia/Chongqing", "Asia/Chungking", "Asia/Harbin", "Asia/Urumqi", "Asia/Kashgar", "PRC"))
+}
+$China = InChina
+
+# A github.com file from the first source that delivers: the mirrors first in China, last elsewhere.
+function GhFetch([string]$url, [string]$out) {
+  $sources = @($url, "https://ghfast.top/$url", "https://gh-proxy.com/$url")
+  if ($China) { $sources = @("https://ghfast.top/$url", "https://gh-proxy.com/$url", $url) }
+  $last = $null
+  foreach ($u in $sources) {
+    try {
+      Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $out -Headers @{ "User-Agent" = "herdr-pocket-installer" }
+      return
+    } catch {
+      $last = $_
+    }
+  }
+  throw $last
 }
 
 function Sha256([string]$file) { (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant() }
@@ -106,12 +139,20 @@ function PrivateNode {
   $base = "https://nodejs.org/dist/latest-v$NodeMajor.x"
   $tmp = NewTemp
   try {
-    Fetch "$base/SHASUMS256.txt" "$tmp\SHASUMS256.txt"
+    # The checksums from nodejs.org itself; npmmirror's latest-v* list can lag behind.
+    try {
+      Fetch "$base/SHASUMS256.txt" "$tmp\SHASUMS256.txt"
+    } catch {
+      if (-not $China) { throw }
+      Fetch "https://npmmirror.com/mirrors/node/latest-v$NodeMajor.x/SHASUMS256.txt" "$tmp\SHASUMS256.txt"
+    }
     $sums = Get-Content -Raw -LiteralPath "$tmp\SHASUMS256.txt"
-    if ($sums -notmatch "(node-v[0-9.]+-win-$arch\.zip)") { Die "nodejs.org lists no win-$arch build" }
+    if ($sums -notmatch "(node-(v[0-9.]+)-win-$arch\.zip)") { Die "nodejs.org lists no win-$arch build" }
     $file = $Matches[1]
+    $sources = @("$base/$file", "https://npmmirror.com/mirrors/node/$($Matches[2])/$file")
+    if ($China) { [array]::Reverse($sources) }
     Say "downloading $file"
-    Fetch "$base/$file" "$tmp\$file"
+    try { Fetch $sources[0] "$tmp\$file" } catch { Fetch $sources[1] "$tmp\$file" }
     if ((Sha256 "$tmp\$file") -ne (SumFor $sums $file)) { Die "checksum mismatch for $file" }
     $x = Join-Path $tmp "x"
     New-Item -ItemType Directory -Path $x | Out-Null
@@ -143,14 +184,28 @@ function InstallBundle {
     if ($From) {
       $file = (Resolve-Path -LiteralPath $From).Path
     } else {
-      if ($Version) { $tag = "v" + $Version.TrimStart("v") } else { $tag = LatestTag }
+      $sumsFile = Join-Path $tmp "SHA256SUMS"
+      $tag = ""
+      if ($Version) {
+        $tag = "v" + $Version.TrimStart("v")
+        GhFetch "https://github.com/$Repo/releases/download/$tag/SHA256SUMS" $sumsFile
+      } else {
+        # The newest release is the one its checksum list names (mirrors carry this file, not the API).
+        try {
+          GhFetch "https://github.com/$Repo/releases/latest/download/SHA256SUMS" $sumsFile
+          if ((Get-Content -Raw -LiteralPath $sumsFile) -match "herdr-pocket-([0-9][^\s]*)\.tar\.gz") { $tag = "v" + $Matches[1] }
+        } catch { }
+        if (-not $tag) {
+          $tag = LatestTag
+          if ($tag) { GhFetch "https://github.com/$Repo/releases/download/$tag/SHA256SUMS" $sumsFile }
+        }
+      }
       if (-not $tag) { Die "$Repo has no release yet (or GitHub is unreachable): use -From <bundle>" }
       $ver = $tag.TrimStart("v")
       $name = "herdr-pocket-$ver.tar.gz"
       Say "downloading Herdr Pocket $ver"
       $file = Join-Path $tmp $name
-      Fetch "https://github.com/$Repo/releases/download/$tag/$name" $file
-      Fetch "https://github.com/$Repo/releases/download/$tag/SHA256SUMS" "$tmp\SHA256SUMS"
+      GhFetch "https://github.com/$Repo/releases/download/$tag/$name" $file
       $want = SumFor (Get-Content -Raw -LiteralPath "$tmp\SHA256SUMS") $name
       if (-not $want -or (Sha256 $file) -ne $want) { Die "checksum mismatch for $name" }
     }

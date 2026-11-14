@@ -89,6 +89,8 @@ Windows 10 1809 以上或 Windows 11（x64 或 ARM64）。在 PowerShell 里运�
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
 ```
 
+在中国大陆，把脚本地址换成 `https://ghfast.top/https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1`（macOS / Linux 的 `install-host.sh` 也一样）。脚本按时区判断，发布包、Node 和以后的 `herdr-pocket update` 都会先走镜像，见 [updates.md](updates.md#中国大陆)。
+
 参数和上面一样，写法换成 PowerShell 的：`-Server`、`-Link <设置或邀请链接>`、`-Code`、`-Name`、`-ReadOnly`、`-NoService`、`-Version`、`-Dir`、`-From <发布包>`。用 `irm … | iex` 时没法带参数，先设 `$env:HERDR_POCKET_SERVER = "https://pocket.example.com"`。
 
 脚本会：
