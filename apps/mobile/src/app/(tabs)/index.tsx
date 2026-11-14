@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, KeyboardAvoidingView, Pressable, TextInput, View } from "react-native";
-import { Button, Dialog, IconButton, Portal, Snackbar, Text } from "react-native-paper";
+import { Button, Dialog, Portal, Snackbar, Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Markdown from "react-native-markdown-display";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -11,8 +11,9 @@ import { Mascot } from "../../components/Mascot";
 import { mdStyles } from "../../components/chat";
 import { CallBar, CallScreen } from "../../components/CallScreen";
 import { AgentLink, NoticeBubble } from "../../components/notice";
+import { RemindersSheet } from "../../components/reminders";
 import { useFocusEffect } from "expo-router";
-import { cancelReminder, clearAssistant, decideAction, loadAssistant, sendToAssistant, setAssistantWatching, useAssistant } from "../../lib/assistant";
+import { clearAssistant, decideAction, loadAssistant, sendToAssistant, setAssistantWatching, useAssistant } from "../../lib/assistant";
 import { dismissCallMessage, startCall, useVoice } from "../../lib/voice";
 import { findAgent, useLive, useSettings } from "../../lib/store";
 import { fixCjkEmphasis, hasList } from "../../lib/markdown";
@@ -191,33 +192,8 @@ export default function AssistantScreen() {
             </Button>
           </Dialog.Actions>
         </Dialog>
-        <Dialog visible={showReminders} onDismiss={() => setShowReminders(false)} style={{ borderRadius: radius.xl, backgroundColor: p.surface }}>
-          <Dialog.Title style={{ fontFamily: fonts.cute, color: p.ink }}>提醒</Dialog.Title>
-          <Dialog.Content style={{ gap: space.sm }}>
-            {reminders.length ? (
-              reminders.map((r) => (
-                <View key={r.id} style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-                  <MaterialCommunityIcons name={r.agent ? "eye-outline" : "alarm"} size={18} color={p.muted} />
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ color: p.ink }}>{r.text}</Text>
-                    <Text style={{ color: p.faint, fontSize: 12 }}>
-                      {r.dueAt ? `${new Date(r.dueAt).toLocaleDateString()} ${clock(r.dueAt)}` : r.until === "blocked" ? "它需要你的时候" : "它停下来的时候"}
-                    </Text>
-                  </View>
-                  <IconButton icon="close" size={18} iconColor={p.muted} accessibilityLabel="取消这个提醒" onPress={() => cancelReminder(r.id).catch((e) => setToast((e as Error).message))} style={{ margin: 0 }} />
-                </View>
-              ))
-            ) : (
-              <Text style={{ color: p.muted, lineHeight: 22 }}>还没有提醒。可以直接跟{NAME}说“半小时后提醒我……”或者“XX 跑完叫我”。</Text>
-            )}
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={() => setShowReminders(false)} textColor={p.ink}>
-              好的
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
       </Portal>
+      <RemindersSheet visible={showReminders} reminders={reminders} name={NAME} onDismiss={() => setShowReminders(false)} />
 
       <Snackbar visible={!!toast || !!callMessage} onDismiss={() => (toast ? setToast(null) : dismissCallMessage())} duration={3000} wrapperStyle={{ bottom: 90 }}>
         {toast ?? callMessage ?? ""}

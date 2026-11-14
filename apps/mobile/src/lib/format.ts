@@ -25,6 +25,49 @@ export function relTime(ts?: number | null, now = Date.now()): string {
   return new Date(ts).toLocaleDateString();
 }
 
+const pad2 = (n: number) => String(n).padStart(2, "0");
+const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+function startOfDay(ts: number): number {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+/**
+ * When something fires, the way people say it: `rel` counts down ("25 分钟后"),
+ * `abs` names the day and clock ("今天 18:30", "明天 09:30", "11月20日 周五 09:00").
+ */
+export function dueTime(dueAt: number, now: number): { rel: string; abs: string } {
+  const d = new Date(dueAt);
+  const n = new Date(now);
+  const days = Math.round((startOfDay(dueAt) - startOfDay(now)) / 86_400_000);
+  const day =
+    days === 0
+      ? "今天"
+      : days === 1
+        ? "明天"
+        : days === 2
+          ? "后天"
+          : days === -1
+            ? "昨天"
+            : `${d.getFullYear() !== n.getFullYear() ? `${d.getFullYear()}年` : ""}${d.getMonth() + 1}月${d.getDate()}日 ${WEEKDAYS[d.getDay()]}`;
+  const abs = `${day} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const left = dueAt - now;
+  // Past due only until the relay's next reminder tick fires it.
+  if (left <= 0) return { rel: "到点了", abs };
+  if (left < 60_000) return { rel: "不到 1 分钟", abs };
+  const mins = Math.ceil(left / 60_000);
+  if (mins < 60) return { rel: `${mins} 分钟后`, abs };
+  if (mins < 180) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return { rel: m ? `${h} 小时 ${m} 分钟后` : `${h} 小时后`, abs };
+  }
+  if (mins < 24 * 60) return { rel: `${Math.round(mins / 60)} 小时后`, abs };
+  return { rel: `${Math.round(mins / (24 * 60))} 天后`, abs };
+}
+
 export function agentTitle(a: Agent): string {
   return a.title?.trim() || a.preview?.trim() || basename(a.cwd) || a.localId;
 }

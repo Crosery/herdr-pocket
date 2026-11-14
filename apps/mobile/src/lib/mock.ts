@@ -490,7 +490,32 @@ export const mockApi = {
 
 type AssistantSink = { upsert: (item: AssistantItem) => void; busy: (busy: boolean, label?: string) => void; reset: (s: AssistantState) => void };
 let assistantItems: AssistantItem[] = [];
-let assistantReminders: Reminder[] = [];
+/** Seeded on first use; cancelling them all shows the empty state. */
+let assistantReminders: Reminder[] | null = null;
+
+/** What the demo starts with: a time that also watches an agent, a long one tomorrow, and two that only watch. */
+function demoReminders(): Reminder[] {
+  const t = now();
+  const tomorrow = new Date(t + 86_400_000);
+  tomorrow.setHours(9, 30, 0, 0);
+  return [
+    { id: "r-demo-1", text: "该看一眼桌宠动画的进度了，顺便看看帧率有没有打到日志里", createdAt: t - 5 * MIN, dueAt: t + 25 * MIN, agent: agentKey(HOST_A, "hc", "t4f"), until: "finished" },
+    {
+      id: "r-demo-2",
+      text: "把 notes-cli 0.2.8 的发布说明发到群里：先列三个修复（导出时中文文件名乱码、同步冲突时丢了最后一次编辑、Windows 上路径大小写不一致），再写升级步骤，最后提醒大家旧的配置文件要手动迁移，不然启动会报错，迁移命令在 README 的“升级”一节。",
+      createdAt: t - 50 * MIN,
+      dueAt: tomorrow.getTime(),
+    },
+    { id: "r-demo-3", text: "重启 relay 那个在等你拍板了", createdAt: t - 12 * MIN, agent: agentKey(HOST_B, "hc", "t8"), until: "blocked" },
+    { id: "r-demo-4", text: "「日志清理脚本影响范围评估」回完了", createdAt: t - 3 * MIN, agent: agentKey(HOST_B, "hc", "t3"), until: "finished" },
+  ];
+}
+
+function remindersNow(): Reminder[] {
+  // The relay fires due reminders and drops them; the demo just lets them go.
+  assistantReminders = (assistantReminders ?? demoReminders()).filter((r) => !r.dueAt || r.dueAt > now());
+  return assistantReminders;
+}
 let assistantConfirm: AssistantConfirm = "never";
 let assistantSink: AssistantSink | null = null;
 
@@ -506,7 +531,7 @@ function aput(item: AssistantItem) {
 }
 
 function demoState(): AssistantState {
-  return { items: assistantItems.slice(), busy: false, ready: true, voice: false, model: "演示", reminders: assistantReminders.slice(), settings: { confirm: assistantConfirm } };
+  return { items: assistantItems.slice(), busy: false, ready: true, voice: false, model: "演示", reminders: remindersNow().slice(), settings: { confirm: assistantConfirm } };
 }
 
 export const mockAssistant = {
@@ -525,7 +550,7 @@ export const mockAssistant = {
       const done = agents.filter((a) => a.status === "done" && !a.isShell);
       if (/提醒|叫我/.test(text)) {
         const r: Reminder = { id: aid("r"), text: text.replace(/^(帮我|请)?/, "").slice(0, 40), createdAt: now(), dueAt: now() + 10 * MIN };
-        assistantReminders = [...assistantReminders, r];
+        assistantReminders = [...remindersNow(), r];
         aput({ id: aid("a"), ts: now(), role: "assistant", text: "好，10 分钟后提醒你。", steps: ["设了一个提醒"], via: "text" });
         assistantSink?.reset(demoState());
       } else if (/发|回|继续|删|同意|批准/.test(text) && blocked[0]) {
@@ -608,7 +633,7 @@ export const mockAssistant = {
     assistantSink?.reset(demoState());
   },
   cancelReminder(id: string) {
-    assistantReminders = assistantReminders.filter((r) => r.id !== id);
+    assistantReminders = remindersNow().filter((r) => r.id !== id);
     assistantSink?.reset(demoState());
   },
   setConfirm(confirm: AssistantConfirm) {
