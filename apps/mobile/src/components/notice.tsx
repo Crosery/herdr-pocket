@@ -39,6 +39,22 @@ export function NoticeIcon({ look, size }: { look: { icon: CuteIconName; fg: str
   return <CuteIcon name={look.icon} size={size} color={look.fg} fill={p.dark ? "transparent" : "#FFFFFF"} strokeWidth={2.4} />;
 }
 
+/** "去看看": opens the agent's own screen, from a notice or from what the assistant did to it. */
+export function AgentLink({ agentKey }: { agentKey: string }) {
+  const p = usePalette();
+  return (
+    <Pressable
+      accessibilityRole="button"
+      onPress={() => router.push({ pathname: "/agent/[key]", params: { key: agentKey } })}
+      hitSlop={8}
+      style={({ pressed }) => ({ alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 2, minHeight: 32, paddingLeft: 12, paddingRight: 8, borderRadius: radius.pill, backgroundColor: pressed ? p.accentContainer : p.dark ? p.surface2 : "#FFF1F6" })}
+    >
+      <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 13.5 }}>去看看</Text>
+      <CuteIcon name="chevronRight" size={15} color={p.accentText} strokeWidth={2.6} />
+    </Pressable>
+  );
+}
+
 function clock(ts: number): string {
   const d = new Date(ts);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -74,17 +90,7 @@ export const NoticeBubble = memo(function NoticeBubble({ item }: { item: Assista
           </Text>
         ) : null}
         {details ? <Markdown style={styles}>{fixCjkEmphasis(details)}</Markdown> : null}
-        {agent ? (
-          <Pressable
-            accessibilityRole="button"
-            onPress={() => router.push({ pathname: "/agent/[key]", params: { key: agent.key } })}
-            hitSlop={8}
-            style={({ pressed }) => ({ alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 2, minHeight: 32, paddingLeft: 12, paddingRight: 8, borderRadius: radius.pill, backgroundColor: pressed ? p.accentContainer : p.dark ? p.surface2 : "#FFF1F6" })}
-          >
-            <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 13.5 }}>去看看</Text>
-            <CuteIcon name="chevronRight" size={15} color={p.accentText} strokeWidth={2.6} />
-          </Pressable>
-        ) : null}
+        {agent ? <AgentLink agentKey={agent.key} /> : null}
       </View>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 4 }}>
         <CuteIcon name="bell" size={12} color={p.faint} strokeWidth={2.4} />

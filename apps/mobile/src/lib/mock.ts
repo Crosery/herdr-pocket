@@ -530,14 +530,33 @@ export const mockAssistant = {
         assistantSink?.reset(demoState());
       } else if (/发|回|继续|删|同意|批准/.test(text) && blocked[0]) {
         const a = blocked[0];
+        // As the relay does it: the card names the agent and its computer, carries the message made from
+        // the person's words and those words; it runs at once unless "ask first" is on. Nothing real is sent.
+        const sent = "可以，删掉旧的迁移脚本吧。";
+        const ask = assistantConfirm === "always";
+        const name = a.where?.split(" / ")[0] || a.title;
         aput({
           id: aid("act"),
           ts: now(),
           role: "assistant",
-          text: "要我这样做吗？",
-          action: { id: aid("x"), kind: "send", agent: a.key, agentTitle: a.title, device: a.deviceId, text: "可以，删掉吧", summary: `给「${a.title}」发送：可以，删掉吧`, state: "pending", createdAt: now() },
+          text: "",
+          action: {
+            id: aid("x"),
+            kind: "send",
+            agent: a.key,
+            agentTitle: a.title,
+            agentName: name,
+            device: a.deviceId,
+            deviceName: devices.find((d) => d.id === a.deviceId)?.name,
+            text: sent,
+            said: text.trim() === sent ? undefined : text.trim(),
+            summary: `给「${a.title}」发送：${sent}`,
+            state: ask ? "pending" : "done",
+            result: ask ? undefined : "发了（演示，没有真的发）",
+            createdAt: now(),
+          },
         });
-        aput({ id: aid("a"), ts: now(), role: "assistant", text: `我准备给「${a.title}」回一句“可以，删掉吧”，你点确认我就发。`, steps: [`读了「${a.title}」的对话`], via: "text" });
+        aput({ id: aid("a"), ts: now() + 1, role: "assistant", text: ask ? "点确认就发。" : "发了，回了我告诉你。", steps: [`读了「${name}」的对话`, ...(ask ? [] : [`给「${name}」发了消息`])], via: "text" });
       } else if (/等|需要|卡/.test(text)) {
         aput({
           id: aid("a"),
@@ -582,7 +601,7 @@ export const mockAssistant = {
   decide(id: string, decision: "confirm" | "cancel") {
     const it = assistantItems.find((x) => x.action?.id === id);
     if (!it?.action || it.action.state !== "pending") return;
-    aput({ ...it, action: { ...it.action, state: decision === "confirm" ? "done" : "cancelled", result: decision === "confirm" ? "已发送（演示，没有真的发）" : "已取消" } });
+    aput({ ...it, action: { ...it.action, state: decision === "confirm" ? "done" : "cancelled", result: decision === "confirm" ? "发了（演示，没有真的发）" : "不做了" } });
   },
   clear() {
     assistantItems = [];

@@ -308,6 +308,93 @@ test("prompts: acting at once by default, asking only when chosen, and never inv
   assert.match(voiceInstructions({ board: "", pending: [], recent: "" }), /结果回来之前，不说办好了、发过去了，更不替别的 agent 说它回了什么/);
 });
 
+test("relaying: the agent gets the distilled message, the card keeps who, where and the person's own words, and the wake-up judges against those words", async () => {
+  const SPOKEN = "嗯……你跟博客那边说一下，就是他刚才那个图片上传的问题，先别管样式了，先把上传修好，哦对，别动数据库，修完跑一下测试再提交。";
+  const SENT = "先把图片上传修好，样式先不管。别动数据库。修完跑一下测试再提交。";
+  const { host, calls, publish } = await fakeHost("Mac R", (method) =>
+    method === "session.events"
+      ? {
+          sessionKey: "claude:t3",
+          more: false,
+          events: [
+            { id: "1", session: "claude:t3", ts: 1, kind: "user_message", text: SENT },
+            { id: "2", session: "claude:t3", ts: 2, kind: "assistant_message", text: "上传修好了，测试通过，已提交。" },
+          ],
+        }
+      : undefined,
+  );
+  const blog = (status: Agent["status"]) => agent("t3", status, "Fix image upload in the blog editor", { where: "博客平台 / 1", cwd: "/home/me/code/blog" });
+  await publish([blog("idle")]);
+  const phone = await pair("viewer", "Phone R");
+  const viewer = await Sock.open("/v1/ws", phone.token);
+  await viewer.next((f) => f.type === "snapshot");
+
+  // The rules are where the model writes the message: the prompt and the tool.
+  const prompt = systemPrompt("小羊", "text", "");
+  assert.match(prompt, /传话。/);
+  assert.match(prompt, /去掉口头禅、犹豫、我改口之前的说法/);
+  assert.match(prompt, /一个不丢、一字不改/);
+  assert.match(prompt, /不加我没说的要求/);
+  assert.match(prompt, /就一字不动地发/);
+  assert.match(prompt, /先用半句话问我，别猜着发/);
+  assert.doesNotMatch(prompt, /不替我润色/);
+  assert.doesNotMatch(systemPrompt("小羊", "text", "", { confirm: true }), /不替我润色/);
+
+  // Words that are already the message leave no second copy.
+  await turn(phone, viewer, "跟博客那边说：先别动", [["send_to_agent", { agent: "博客那边", text: "先别动", said: " 先别动 " }]], "发了。");
+  let items = (await api("/v1/assistant", { token: phone.token })).json.items as AssistantItem[];
+  assert.equal(items.filter((i) => i.action).pop()!.action!.said, undefined);
+  const tool = seen[seen.length - 1]!.tools.find((t) => t.name === "send_to_agent")!;
+  assert.doesNotMatch(tool.description, /不润色/);
+  assert.match(tool.description, /不是把我的话原样搬过去/);
+  assert.ok((tool.input_schema as { properties: Record<string, unknown> }).properties.said);
+
+  // The model says a few words before it sends: its answer still lands after the card, as it does after a restart.
+  let round = 0;
+  script = (req) => {
+    if (round++) return text("发了。");
+    req.onText?.("好，我跟它说。");
+    return { content: [{ type: "text", text: "好，我跟它说。" }, { type: "tool_use", id: "cs1", name: "send_to_agent", input: { agent: "博客那边", text: SENT, said: SPOKEN } }], stopReason: "tool_use", model: "test" };
+  };
+  await api("/v1/assistant/messages", { token: phone.token, body: { text: SPOKEN } });
+  await viewer.next((f) => f.type === "assistant_busy" && f.busy === false, 4000);
+  const sends = calls.filter((c) => c.method === "terminal.send");
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1]!.params.text, SENT);
+  items = (await api("/v1/assistant", { token: phone.token })).json.items as AssistantItem[];
+  const cardAt = items.findLastIndex((i) => i.action);
+  const replyAt = items.findLastIndex((i) => i.role === "assistant" && !i.action);
+  assert.equal(items[replyAt]!.text, "发了。");
+  assert.ok(replyAt > cardAt, "the answer comes after the card it reports on");
+  assert.deepEqual(items[replyAt]!.steps, ["给「博客平台」发了消息"]);
+  const card = items[cardAt]!.action!;
+  assert.equal(card.state, "done");
+  assert.equal(card.text, SENT);
+  assert.equal(card.said, SPOKEN);
+  // Named the way the answer names it, on the computer it is on.
+  assert.equal(card.agentName, "博客平台");
+  assert.equal(card.agentTitle, "Fix image upload in the blog editor");
+  assert.equal(card.deviceName, "Mac R");
+  assert.equal(card.device, host.device.id);
+  const logged = (await api("/v1/logs?kind=action&since=1h", { token: ADMIN })).json.entries as LogEntry[];
+  assert.ok(logged.some((l) => /send done/.test(l.msg) && JSON.stringify(l.data ?? {}).includes("别动数据库")));
+
+  // Its turn ends: the look compares what it did with what the person said, not only with the message.
+  const before = seen.length;
+  await publish([blog("working")]);
+  await publish([blog("done")]);
+  let woken: LlmRequest | undefined;
+  for (let i = 0; i < 50 && !woken; i++) {
+    await sleep(20);
+    woken = seen.slice(before).find((r) => String(r.system).includes("# 现在：你被叫醒了"));
+  }
+  const material = String(woken!.messages[0]!.content);
+  assert.match(material, new RegExp(`我让它做的：\\n${SENT}`));
+  assert.match(material, /我交代时的原话（你整理成上面那条发给它的）：\n嗯……你跟博客那边说一下/);
+  assert.match(String(woken!.system), /材料里有“我交代时的原话”的，以那段为准/);
+  await publish([]);
+});
+
 test("new space, new agent named by program name, costs per space, and the log answers 'where did it get stuck'", async () => {
   const spacesList = {
     spaces: [{ id: "sp1", name: "测试", tabs: 1, terminals: 1 }],

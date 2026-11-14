@@ -53,9 +53,15 @@ mockAssistant.bind({
   reset: (s) => applyAssistantState(s),
 });
 
+/** Time order, stable: an answer streamed around a tool's card ends up after the card. */
+function byTime(items: AssistantItem[]): AssistantItem[] {
+  return items.slice().sort((a, b) => a.ts - b.ts);
+}
+
 export function applyAssistantState(s: AssistantState): void {
   useAssistant.setState({
-    items: s.items,
+    // Older relays list a streamed answer where its first draft was, ahead of the card it reports on.
+    items: byTime(s.items),
     busy: s.busy,
     ready: s.ready,
     voice: s.voice,
@@ -72,8 +78,10 @@ export function upsertItem(item: AssistantItem): void {
     const i = s.items.findIndex((x) => x.id === item.id);
     if (i >= 0) {
       const items = s.items.slice();
+      const moved = items[i]!.ts !== item.ts;
       items[i] = item;
-      return { items };
+      // Each draft of a streamed answer is newer: it moves past the cards put up while it was being written.
+      return { items: moved ? byTime(items) : items };
     }
     // Keep time order: voice lines and notices can arrive slightly out of order.
     const items = [...s.items, item].sort((a, b) => a.ts - b.ts);
