@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { defaultHcBin } from "./platform.ts";
 import { Screen } from "./vt.ts";
 
 /** Frame kinds of `hc connect` in framed mode (herdr-app src/hc.rs). */
@@ -40,14 +41,14 @@ export class HcScreens {
   private streams = new Map<number, (kind: number, payload: Buffer) => void>();
   private early = new Map<number, Array<[number, Buffer]>>();
 
-  constructor(hcBin = process.env.HC_BIN ?? "hc") {
+  constructor(hcBin = defaultHcBin()) {
     this.hcBin = hcBin;
   }
 
   private connect(): Promise<void> {
     if (this.ready) return this.ready;
     this.ready = new Promise((resolve, reject) => {
-      const child = spawn(this.hcBin, ["connect"], { stdio: ["pipe", "pipe", "ignore"] });
+      const child = spawn(this.hcBin, ["connect"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
       this.child = child;
       let framed = false;
       child.stdout!.on("data", (d: Buffer) => {

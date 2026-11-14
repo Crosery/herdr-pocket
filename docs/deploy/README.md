@@ -22,6 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/i
 | Node + systemd | 不想装 Docker | `--native --domain pocket.example.com`，见 [native.md](native.md) |
 | Fly.io | 不想管服务器 | [fly.md](fly.md) |
 | Railway / Render / Zeabur / Kubernetes | 已经在用这些平台 | [platforms.md](platforms.md) |
+| Windows 上跑中转服务 | 只有 Windows 机器 | 用 Docker Desktop 跑 [docker.md](docker.md) 的 compose，或在 WSL 里按 Linux 装；电脑端本身支持 Windows，见 [host.md](host.md#windows) |
 
 Docker 方式的细节见 [docker.md](docker.md)。Cloudflare Workers 原生部署还没做，可行性评估见 [cloudflare-workers.md](cloudflare-workers.md)。
 

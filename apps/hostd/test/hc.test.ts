@@ -5,6 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HcAdapter } from "../src/hc.ts";
 
+/** These fakes are shell scripts: Windows can't run them (CI there runs the rest). */
+const SH = { skip: process.platform === "win32" && "shell-script fakes" };
+
 /**
  * A stand-in for `hc connect` that behaves like herdr-core 0.1.21: once a
  * connection subscribes, it only streams events and never answers another
@@ -45,7 +48,7 @@ process.stdin.on("data", (d) => {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-test("status follows the event stream even though the subscribed connection answers nothing else", async () => {
+test("status follows the event stream even though the subscribed connection answers nothing else", SH, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hc-fake-"));
   const listState = join(dir, "state");
   writeFileSync(listState, "done");

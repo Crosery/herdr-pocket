@@ -6,6 +6,8 @@
 //   <root>/previous -> releases/<version>  the copy before the last update, for rollback
 // An update unpacks the new copy next to the old one, checks that it starts, then swaps
 // the `current` link in one rename, so a failed update leaves the running copy untouched.
+// On Windows (scripts/install-host.ps1) the links are directory junctions, which need no
+// Developer Mode; a junction can't be renamed over another, so it is replaced instead.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -24,8 +26,10 @@ import {
   readlinkSync,
   renameSync,
   rmSync,
+  rmdirSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -35,6 +39,9 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { RELEASE_REPO, apkAssetName } from "@herdr-pocket/protocol";
+import { extractTarGz, tarVersion } from "./untar.ts";
+
+const WINDOWS = process.platform === "win32";
 
 /** The GitHub repository releases come from (set once in the protocol package); HERDR_POCKET_REPO overrides it. */
 export const DEFAULT_REPO = RELEASE_REPO;
@@ -56,6 +63,8 @@ export const SERVICES = {
   hostLaunchd: "com.herdr-pocket.hostd",
   hostSystemd: "herdr-pocket-hostd.service",
   relaySystemd: "herdr-pocket-relay.service",
+  /** Windows: the HKCU Run entry that starts `herdr-pocket service` at logon (launcher in <root>\bin). */
+  hostWindows: "HerdrPocket",
 } as const;
 
 export type Service = "host" | "relay";
@@ -234,6 +243,8 @@ export async function update(o: UpdateOptions): Promise<UpdateResult> {
 
   const unlock = lock(root);
   const work = mkdtempSync(join(root, ".update-"));
+  /** A half-made copy in releases/ to remove when the update fails (Windows). */
+  let partial: string | undefined;
   try {
     const file = join(work, "download.tar.gz");
     log(`downloading ${src.version ?? ""} ${src.url}`.replace(/\s+/, " "));
@@ -242,11 +253,22 @@ export async function update(o: UpdateOptions): Promise<UpdateResult> {
       const got = await sha256(file);
       if (got !== src.sha256) throw new Error(`checksum mismatch for ${basename(src.url)}: expected ${src.sha256}, got ${got}`);
     }
-    const dir = join(work, "app");
-    mkdirSync(dir);
-    // --no-same-owner: files belong to whoever updates (root for the relay), never to the CI runner's uid.
-    run("tar", ["-xzf", file, "-C", dir, "--strip-components=1", "--no-same-owner", "--exclude=*/apps/mobile", "--exclude=*/docs"]);
-    const version = src.version ?? readVersion(dir);
+    let dir: string;
+    let version: string;
+    if (WINDOWS) {
+      // Junctions hold absolute paths, so the copy is unpacked where it will stay.
+      version = src.version ?? tarVersion(file);
+      dir = join(root, "releases", freeReleaseName(root, version));
+      rmSync(dir, { recursive: true, force: true });
+      partial = dir;
+      extractTarGz(file, dir, { strip: 1, exclude: ["apps/mobile", "docs"] });
+    } else {
+      dir = join(work, "app");
+      mkdirSync(dir);
+      // --no-same-owner: files belong to whoever updates (root for the relay), never to the CI runner's uid.
+      run("tar", ["-xzf", file, "-C", dir, "--strip-components=1", "--no-same-owner", "--exclude=*/apps/mobile", "--exclude=*/docs"]);
+      version = src.version ?? readVersion(dir);
+    }
     if (src.kind === "source") {
       stampVersion(dir, version);
       pnpmInstall(dir, log);
@@ -255,10 +277,16 @@ export async function update(o: UpdateOptions): Promise<UpdateResult> {
     }
     smokeTest(dir, o.service, version);
 
-    const name = freeReleaseName(root, version);
-    const target = join(root, "releases", name);
-    rmSync(target, { recursive: true, force: true });
-    renameSync(dir, target);
+    let name: string;
+    if (WINDOWS) {
+      name = basename(dir);
+    } else {
+      name = freeReleaseName(root, version);
+      const target = join(root, "releases", name);
+      rmSync(target, { recursive: true, force: true });
+      renameSync(dir, target);
+    }
+    partial = undefined;
     const before = readLink(join(root, "current"));
     setLink(root, "current", `releases/${name}`);
     if (before && before !== `releases/${name}`) setLink(root, "previous", before);
@@ -267,6 +295,7 @@ export async function update(o: UpdateOptions): Promise<UpdateResult> {
     const restarted = o.restart === false ? undefined : restartService(o.service, root, log);
     return { from: current, to: version, changed: true, restarted };
   } finally {
+    if (partial) rmSync(partial, { recursive: true, force: true });
     rmSync(work, { recursive: true, force: true });
     unlock();
   }
@@ -315,6 +344,11 @@ export function restartService(service: Service, root: string, log: (msg: string
       ["launchctl", "kickstart", "-k", `${domain}/${name}`],
       ["launchctl", "bootstrap", domain, file],
     ];
+  } else if (WINDOWS) {
+    // The new copy's own `service restart`: the running supervisor hands over to it.
+    name = SERVICES.hostWindows;
+    file = join(root, "bin", "hostd-start.js");
+    commands = [[process.execPath, "--no-warnings", join(root, "current", "apps", "hostd", "src", "cli.ts"), "service", "restart"]];
   } else {
     name = SERVICES.hostSystemd;
     file = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "systemd", "user", name);
@@ -326,7 +360,7 @@ export function restartService(service: Service, root: string, log: (msg: string
   }
   let last = "";
   for (const [cmd, ...args] of commands) {
-    const r = spawnSync(cmd!, args, { encoding: "utf8" });
+    const r = spawnSync(cmd!, args, { encoding: "utf8", windowsHide: true, timeout: 90_000 });
     if (r.status === 0) {
       log(`restarted ${name}`);
       return name;
@@ -397,20 +431,54 @@ function isLink(p: string): boolean {
   }
 }
 
+/**
+ * Where a link points, as `releases/<name>`. Junctions (Windows) hold absolute paths;
+ * they are given back in the same relative form as the symlinks elsewhere.
+ */
 function readLink(p: string): string | undefined {
+  let target: string;
   try {
-    return readlinkSync(p);
+    target = readlinkSync(p);
   } catch {
     return undefined;
   }
+  if (!WINDOWS) return target;
+  const abs = target.replace(/^\\\\\?\\/, "").replace(/[\\/]+$/, "");
+  return basename(dirname(abs)) === "releases" ? `releases/${basename(abs)}` : target;
 }
 
-/** Replace a symlink in one rename, so readers see the old or the new target, never none. */
-function setLink(root: string, name: string, target: string): void {
+/** `current` or `previous` of an install, as `releases/<name>`. */
+export function linkTarget(root: string, name: "current" | "previous"): string | undefined {
+  return readLink(join(root, name));
+}
+
+/**
+ * Point `<root>/<name>` at `target` (relative to root). Elsewhere a symlink replaced in one
+ * rename, so readers see the old or the new target, never none; on Windows a junction.
+ */
+export function setLink(root: string, name: string, target: string): void {
+  if (WINDOWS) {
+    const link = join(root, name);
+    removeLink(link);
+    symlinkSync(resolve(root, target), link, "junction");
+    return;
+  }
   const tmp = join(root, `.${name}.${process.pid}`);
   rmSync(tmp, { force: true });
   symlinkSync(target, tmp);
   renameSync(tmp, join(root, name));
+}
+
+/** Removes a link (never what it points to). */
+function removeLink(p: string): void {
+  try {
+    unlinkSync(p);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    if (code !== "EPERM" && code !== "EISDIR") throw e;
+    rmdirSync(p); // a junction, on Windows versions where unlink refuses it
+  }
 }
 
 function freeReleaseName(root: string, version: string): string {
@@ -421,11 +489,17 @@ function freeReleaseName(root: string, version: string): string {
 /** Keep only the current and previous copies; drop leftovers of interrupted updates. */
 function prune(root: string, work: string): void {
   const keep = new Set([readLink(join(root, "current")), readLink(join(root, "previous"))].map((l) => l && basename(l)));
+  // A copy still in use (Windows keeps open files) is left for the next update.
+  const drop = (p: string) => {
+    try {
+      rmSync(p, { recursive: true, force: true });
+    } catch {}
+  };
   for (const name of readdirSync(join(root, "releases"))) {
-    if (!keep.has(name)) rmSync(join(root, "releases", name), { recursive: true, force: true });
+    if (!keep.has(name)) drop(join(root, "releases", name));
   }
   for (const name of readdirSync(root)) {
-    if (name.startsWith(".update-") && join(root, name) !== work) rmSync(join(root, name), { recursive: true, force: true });
+    if (name.startsWith(".update-") && join(root, name) !== work) drop(join(root, name));
   }
 }
 
@@ -453,16 +527,24 @@ function mustWrite(root: string, service: Service): void {
   }
 }
 
-function fileMentions(file: string, text: string): boolean {
+/**
+ * Whether a service file names this install. The Windows launcher is UTF-16 JScript, so its
+ * paths are string literals with doubled backslashes; Windows paths ignore case.
+ */
+export function fileMentions(file: string, text: string, windows = WINDOWS): boolean {
   try {
-    return readFileSync(file, "utf8").includes(text);
+    const b = readFileSync(file);
+    const s = b[0] === 0xff && b[1] === 0xfe ? b.subarray(2).toString("utf16le") : b.toString("utf8");
+    if (!windows) return s.includes(text);
+    const low = s.toLowerCase();
+    return [text, JSON.stringify(text).slice(1, -1)].some((t) => low.includes(t.toLowerCase()));
   } catch {
     return false;
   }
 }
 
 function run(cmd: string, args: string[], cwd?: string): void {
-  const r = spawnSync(cmd, args, { cwd, encoding: "utf8" });
+  const r = spawnSync(cmd, args, { cwd, encoding: "utf8", windowsHide: true });
   if (r.status !== 0) throw new Error(`${cmd} failed: ${(r.stderr || r.error?.message || `exit ${r.status}`).trim().slice(0, 400)}`);
 }
 
@@ -509,7 +591,8 @@ function pnpmInstall(dir: string, log: (msg: string) => void): void {
   const args = ["install", "--prod", "--frozen-lockfile", "--ignore-scripts", "--filter", "@herdr-pocket/relay...", "--filter", "@herdr-pocket/hostd..."];
   log("installing dependencies with pnpm");
   for (const pre of [["pnpm"], ["corepack", "pnpm"], ["npx", "--yes", "pnpm"]]) {
-    const r = spawnSync(pre[0]!, [...pre.slice(1), ...args], { cwd: dir, stdio: ["ignore", "inherit", "inherit"] });
+    // pnpm, corepack and npx are .cmd files on Windows, which only a shell runs (the arguments are fixed).
+    const r = spawnSync(pre[0]!, [...pre.slice(1), ...args], { cwd: dir, stdio: ["ignore", "inherit", "inherit"], shell: WINDOWS });
     if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") continue;
     if (r.status === 0) return;
     throw new Error("pnpm install failed; nothing was changed");
@@ -523,6 +606,7 @@ function smokeTest(dir: string, service: Service, version: string): void {
   const r = spawnSync(process.execPath, ["--no-warnings", ...args], {
     encoding: "utf8",
     timeout: 60_000,
+    windowsHide: true,
     env: { ...process.env, HERDR_POCKET_UPDATE_CHECK: "0" },
   });
   const out = (r.stdout ?? "").trim();

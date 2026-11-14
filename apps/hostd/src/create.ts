@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { HERDR_COMMANDS, type HerdrCommand, type LaunchOption, type SpaceInfo } from "@herdr-pocket/protocol";
 import type { AppNames } from "./hc.ts";
+import { IS_WINDOWS, onPath, programName, windowsBins } from "./platform.ts";
 import { base, run } from "./util.ts";
 
 /**
@@ -73,6 +74,15 @@ function executable(p: string): boolean {
  */
 export async function findPrograms(names: string[]): Promise<Map<string, string>> {
   const found = new Map<string, string>();
+  if (IS_WINDOWS) {
+    // A service started at logon has the person's full PATH; npm, bun and other installers' folders cover the rest.
+    const extra = windowsBins();
+    for (const name of names) {
+      const hit = onPath(name, process.env, true, extra);
+      if (hit) found.set(name, hit);
+    }
+    return found;
+  }
   const shell = process.env.SHELL || "/bin/zsh";
   try {
     const out = await run(shell, ["-lic", `for c in ${names.join(" ")}; do p=$(command -v "$c" 2>/dev/null) && echo "@@$c=$p"; done; true`], {
@@ -108,7 +118,7 @@ export async function installedLaunchers(): Promise<LaunchOption[]> {
 export function checkFolder(raw: unknown): string {
   if (typeof raw !== "string" || !raw.trim()) throw new Error("请选一个文件夹");
   let p = raw.trim();
-  if (p === "~" || p.startsWith("~/")) p = homedir() + p.slice(1);
+  if (p === "~" || p.startsWith("~/") || (IS_WINDOWS && p.startsWith("~\\"))) p = homedir() + p.slice(1);
   if (!isAbsolute(p)) throw new Error("文件夹要写完整路径，比如 ~/work_file/项目");
   p = resolve(p);
   if (!existsSync(p) || !statSync(p).isDirectory()) throw new Error(`这台电脑上没有这个文件夹：${raw}`);
@@ -286,7 +296,7 @@ export function resumeArgv(argv: unknown, installed: string[]): string[] {
   if (!Array.isArray(argv) || !argv.length || argv.length > 12 || !argv.every((a) => typeof a === "string" && a.length > 0 && a.length <= 300)) {
     throw new Error("这个会话没有可用的续跑命令");
   }
-  const program = base(argv[0] as string);
+  const program = programName(base(argv[0] as string));
   const l = LAUNCHERS.find((x) => x.argv[0] === program);
   if (!l || !installed.includes(l.id)) throw new Error(`这台电脑上不能从手机启动 ${program}`);
   return [l.argv[0]!, ...(argv.slice(1) as string[])];
@@ -295,7 +305,7 @@ export function resumeArgv(argv: unknown, installed: string[]): string[] {
 /** Runs `herdr-app do`; its answer (also an error) is JSON on stdout. */
 function doCommand(bin: string, cmd: string, args: Record<string, unknown>): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(bin, ["do", cmd, JSON.stringify(args)], { timeout: 20_000, encoding: "utf8" }, (err, stdout, stderr) => {
+    execFile(bin, ["do", cmd, JSON.stringify(args)], { timeout: 20_000, encoding: "utf8", windowsHide: true }, (err, stdout, stderr) => {
       if (stdout.trim() || !err) return resolve(stdout);
       const msg = String(stderr || err?.message || "").trim();
       reject(new Error(/no herdr window|no window|not running/i.test(msg) ? "桌面 herdr 没有打开，先在电脑上打开它" : `桌面 herdr：${msg.slice(0, 200)}`));

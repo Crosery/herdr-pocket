@@ -1,7 +1,8 @@
 import { mkdir, mkdtemp, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PUT_LIMITS } from "@herdr-pocket/protocol";
+import { stateDir } from "./platform.ts";
 
 /** A picture from a phone, checked: safe name, real bytes. */
 export interface CheckedFile {
@@ -100,7 +101,7 @@ export async function putThrough(files: CheckedFile[], put: (file: string) => Pr
 }
 
 /** Where pictures for agents of the herdr terminal app are kept (it has no `hc put`). */
-export const FILES_DIR = process.env.HERDR_POCKET_FILES ?? join(homedir(), ".local", "state", "herdr-pocket", "files");
+export const FILES_DIR = process.env.HERDR_POCKET_FILES ?? join(stateDir(), "files");
 
 /** Kept files older than this are removed the next time a picture arrives. */
 export const KEEP_MS = 7 * 24 * 3600_000;

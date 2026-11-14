@@ -2,11 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { PUT_LIMITS, textWithFiles, type Agent } from "@herdr-pocket/protocol";
 import { checkFiles, putLocal, putThrough, safeName, KEEP_MS } from "../src/put.ts";
 import { HcAdapter } from "../src/hc.ts";
 import { Host } from "../src/host.ts";
+
+/** Owner-only modes are a macOS/Linux thing; Windows keeps the files private by folder. */
+const POSIX = process.platform !== "win32";
 
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
@@ -52,10 +55,10 @@ test("putThrough hands over an owner-only temporary copy and removes it afterwar
   const seen: Array<{ file: string; mode: number; bytes: number }> = [];
   const paths = await putThrough(checkFiles([jpeg("a.jpg"), jpeg("b.jpg")]), async (file) => {
     seen.push({ file, mode: statSync(file).mode & 0o777, bytes: readFileSync(file).length });
-    return `/landed/${file.split("/").pop()}`;
+    return `/landed/${basename(file)}`;
   });
   assert.deepEqual(paths, ["/landed/a.jpg", "/landed/b.jpg"]);
-  assert.deepEqual(seen.map((s) => [s.mode, s.bytes]), [[0o600, JPEG.length], [0o600, JPEG.length]]);
+  assert.deepEqual(seen.map((s) => [POSIX ? s.mode : 0o600, s.bytes]), [[0o600, JPEG.length], [0o600, JPEG.length]]);
   assert.equal(statSync(dirname(seen[0]!.file), { throwIfNoEntry: false }), undefined, "temporary folder removed");
 
   // A failing put still cleans up.
@@ -81,12 +84,14 @@ test("putLocal keeps pictures in an owner-only folder per terminal, never overwr
   const again = await putLocal(checkFiles([jpeg("shot.jpg")]), "1/../p2", root, now);
   assert.equal(first[0], join(root, "1_.._p2", "shot.jpg"));
   assert.equal(again[0], join(root, "1_.._p2", "shot-2.jpg"));
-  assert.equal(statSync(first[0]!).mode & 0o777, 0o600);
-  assert.equal(statSync(dirname(first[0]!)).mode & 0o777, 0o700);
+  if (POSIX) {
+    assert.equal(statSync(first[0]!).mode & 0o777, 0o600);
+    assert.equal(statSync(dirname(first[0]!)).mode & 0o777, 0o700);
+  }
   assert.equal(existsSync(join(root, "old")), false, "old picture and its empty folder removed");
 });
 
-test("HcAdapter.put runs `hc put --json` and returns where the file landed", async () => {
+test("HcAdapter.put runs `hc put --json` and returns where the file landed", { skip: !POSIX && "shell-script fake" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hc-put-"));
   const bin = join(dir, "hc");
   writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" > ${JSON.stringify(join(dir, "args"))}\nprintf '{"bytes":10,"path":"/state/files/t7/a.jpg"}\\n'\n`);
@@ -112,8 +117,8 @@ test("terminal.put: checked pictures land beside the agent; an old hc and bad fi
   h.agents = [agent("hc")];
   const got: string[] = [];
   h.hc.put = async (address, file) => {
-    got.push(`${address} ${file.split("/").pop()}`);
-    return `/state/files/${address}/${file.split("/").pop()}`;
+    got.push(`${address} ${basename(file)}`);
+    return `/state/files/${address}/${basename(file)}`;
   };
   assert.deepEqual(await put({ agent: "d/hc:t1", files: [jpeg("a.jpg"), jpeg("a.jpg")] }), { paths: ["/state/files/t1/a.jpg", "/state/files/t1/a-2.jpg"] });
   assert.deepEqual(got, ["t1 a.jpg", "t1 a-2.jpg"]);

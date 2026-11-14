@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createServer, connect } from "node:net";
+import { createServer } from "node:net";
 import { existsSync, rmSync } from "node:fs";
 import { hostname, platform } from "node:os";
 import { parseArgs } from "node:util";
@@ -10,7 +10,9 @@ import { parsePairInput, parsePairLink } from "@herdr-pocket/protocol";
 import type { Agent, Device, JoinClaim, JoinTicket, LogEntry, PairCode, PairResponse, RpcMethod, ServerFrame } from "@herdr-pocket/protocol";
 import { CONFIG_PATH, CONTROL_SOCKET, loadConfig, saveConfig, type HostConfig } from "./config.ts";
 import { Host, HOSTD_VERSION } from "./host.ts";
+import { IS_WINDOWS } from "./platform.ts";
 import { lineSplitter } from "./util.ts";
+import { SERVICE_HELP, control as controlAt, serviceCommand } from "./winservice.ts";
 import { UPDATE_HELP, updateCommand, versionCommand, watchForUpdates } from "@herdr-pocket/update";
 
 const HELP = `herdr-pocket ${HOSTD_VERSION} — put this computer's herdr agents in your pocket
@@ -29,6 +31,7 @@ Setup
   pair  (alias: invite)
         Show a one-time QR + code that adds a phone (scan it) or another computer.
   status    Show login and connection state.
+${SERVICE_HELP}
 
 Updates
 ${UPDATE_HELP}
@@ -64,6 +67,8 @@ async function main(): Promise<void> {
       return pair(rest);
     case "status":
       return status();
+    case "service":
+      return serviceCommand(rest);
     case "devices":
       return devices();
     case "agents":
@@ -277,10 +282,11 @@ async function runDaemon(argv: string[]): Promise<void> {
     allow: values.allow?.split(",").map((s) => s.trim()).filter(Boolean),
   });
 
-  if (existsSync(CONTROL_SOCKET)) {
+  // A Unix socket file outlives a crash; a Windows named pipe goes with its process.
+  if (IS_WINDOWS || existsSync(CONTROL_SOCKET)) {
     const alive = await control({ op: "state" }).catch(() => null);
     if (alive) fail("herdr-pocket is already running on this computer.");
-    rmSync(CONTROL_SOCKET, { force: true });
+    if (!IS_WINDOWS) rmSync(CONTROL_SOCKET, { force: true });
   }
   const server = createServer((sock) => {
     sock.on(
@@ -307,6 +313,10 @@ async function runDaemon(argv: string[]): Promise<void> {
             };
           } else if (req.op === "call") {
             res = { ok: true, result: await host.call(req.to, req.method, req.params) };
+          } else if (req.op === "exit") {
+            // The Windows service stops the daemon this way (there is no SIGTERM there).
+            res = { ok: true };
+            setTimeout(() => shutdown(), 50);
           } else res = { ok: false, error: "unknown op" };
         } catch (e) {
           res = { ok: false, error: (e as Error).message };
@@ -323,7 +333,7 @@ async function runDaemon(argv: string[]): Promise<void> {
   const shutdown = () => {
     host.stop();
     server.close();
-    rmSync(CONTROL_SOCKET, { force: true });
+    if (!IS_WINDOWS) rmSync(CONTROL_SOCKET, { force: true });
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -479,26 +489,7 @@ async function callRemote(to: string, method: RpcMethod, params: unknown): Promi
 }
 
 function control(req: unknown): Promise<any> {
-  return new Promise((resolve, reject) => {
-    if (!existsSync(CONTROL_SOCKET)) return reject(new Error("no daemon"));
-    const sock = connect(CONTROL_SOCKET);
-    const t = setTimeout(() => {
-      sock.destroy();
-      reject(new Error("daemon timeout"));
-    }, 40_000);
-    sock.on("error", (e) => {
-      clearTimeout(t);
-      reject(e);
-    });
-    sock.on(
-      "data",
-      lineSplitter((line) => {
-        clearTimeout(t);
-        resolve(JSON.parse(line));
-      }),
-    );
-    sock.write(`${JSON.stringify(req)}\n`);
-  });
+  return controlAt(CONTROL_SOCKET, req);
 }
 
 /** Short-lived relay connection used when the daemon isn't running. */

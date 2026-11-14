@@ -1,12 +1,15 @@
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { ASSETS, compareVersions, findLayout, latestRelease, readVersion, rollback, sumFor, update } from "../src/index.ts";
+import { ASSETS, compareVersions, fileMentions, findLayout, latestRelease, linkTarget, readVersion, rollback, setLink, sumFor, update } from "../src/index.ts";
+
+/** Windows' own tar (bsdtar): Git's GNU tar on PATH reads `C:` in paths as a remote host. */
+const TAR = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
 
 const quiet = () => {};
 
@@ -21,14 +24,14 @@ function makeBundle(dir: string, version: string, works = true): string {
   const stage = mkdtempSync(join(dir, "stage-"));
   writeCopy(join(stage, `herdr-pocket-${version}`), version, works);
   const file = join(dir, `${works ? "" : "broken-"}${ASSETS.bundle(version)}`);
-  execFileSync("tar", ["-czf", file, "-C", stage, `herdr-pocket-${version}`]);
+  execFileSync(TAR, ["-czf", file, "-C", stage, `herdr-pocket-${version}`]);
   return file;
 }
 
 function makeInstall(dir: string, version: string): string {
   const root = join(dir, "install");
   writeCopy(join(root, "releases", version), version);
-  symlinkSync(`releases/${version}`, join(root, "current"));
+  setLink(root, "current", `releases/${version}`);
   return root;
 }
 
@@ -70,14 +73,14 @@ describe("update from a file", () => {
   test("installs next to the old copy and switches", async () => {
     const r = await update({ service: "host", from: makeBundle(dir, "0.2.0"), restart: false, layout: { root }, log: quiet });
     assert.deepEqual([r.from, r.to, r.changed], ["0.1.0", "0.2.0", true]);
-    assert.equal(readlinkSync(join(root, "current")), "releases/0.2.0");
-    assert.equal(readlinkSync(join(root, "previous")), "releases/0.1.0");
+    assert.equal(linkTarget(root, "current"), "releases/0.2.0");
+    assert.equal(linkTarget(root, "previous"), "releases/0.1.0");
     assert.equal(readVersion(join(root, "current")), "0.2.0");
   });
 
   test("a copy that does not start is never switched to", async () => {
     await assert.rejects(update({ service: "host", from: makeBundle(dir, "0.3.0", false), restart: false, layout: { root }, log: quiet }), /did not start/);
-    assert.equal(readlinkSync(join(root, "current")), "releases/0.2.0");
+    assert.equal(linkTarget(root, "current"), "releases/0.2.0");
     assert.deepEqual(readdirSync(join(root, "releases")).sort(), ["0.1.0", "0.2.0"]);
     assert.ok(!readdirSync(root).some((n) => n.startsWith(".update")));
   });
@@ -86,7 +89,7 @@ describe("update from a file", () => {
     const r = rollback({ service: "host", restart: false, layout: { root }, log: quiet });
     assert.deepEqual([r.from, r.to], ["0.2.0", "0.1.0"]);
     assert.equal(readVersion(join(root, "current")), "0.1.0");
-    assert.equal(readlinkSync(join(root, "previous")), "releases/0.2.0");
+    assert.equal(linkTarget(root, "previous"), "releases/0.2.0");
   });
 
   test("keeps only current and previous", async () => {
@@ -94,8 +97,8 @@ describe("update from a file", () => {
     assert.deepEqual(readdirSync(join(root, "releases")).sort(), ["0.1.0", "0.4.0"]);
     // Reinstalling the running version goes to a new folder instead of over the running one.
     await update({ service: "host", from: makeBundle(dir, "0.4.0"), restart: false, layout: { root }, log: quiet });
-    assert.match(readlinkSync(join(root, "current")), /^releases\/0\.4\.0\+/);
-    assert.equal(readlinkSync(join(root, "previous")), "releases/0.4.0");
+    assert.match(linkTarget(root, "current") ?? "", /^releases\/0\.4\.0\+/);
+    assert.equal(linkTarget(root, "previous"), "releases/0.4.0");
     assert.equal(readdirSync(join(root, "releases")).length, 2);
   });
 });
@@ -163,5 +166,22 @@ describe("update from a GitHub release", () => {
     const again = await update({ service: "host", restart: false, layout: { root }, log: quiet });
     assert.equal(again.changed, false);
     assert.ok(existsSync(join(root, "current", "apps/hostd/src/cli.ts")));
+  });
+});
+
+describe("service files", () => {
+  test("the Windows launcher (UTF-16 JScript, escaped paths) names its install", async () => {
+    const { launcherScript } = await import("../../../apps/hostd/src/winservice.ts").catch(() => ({ launcherScript: undefined }));
+    const dir = mkdtempSync(join(tmpdir(), "hp-svcfile-"));
+    const root = "C:\\Users\\张三\\AppData\\Local\\Programs\\herdr-pocket";
+    const js =
+      launcherScript?.(`${root}\\node\\node.exe`, `${root}\\current\\apps\\hostd\\src\\cli.ts`, []) ??
+      `shell.Run(${JSON.stringify(`"${root}\\node\\node.exe"`)}, 0, false);`;
+    const file = join(dir, "hostd-start.js");
+    writeFileSync(file, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(js, "utf16le")]));
+    assert.ok(fileMentions(file, root, true));
+    assert.ok(fileMentions(file, root.toLowerCase(), true));
+    assert.ok(!fileMentions(file, "C:\\Users\\other", true));
+    rmSync(dir, { recursive: true, force: true });
   });
 });
