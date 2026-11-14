@@ -221,6 +221,7 @@ jobs:
 
           - Server: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-relay.sh | sudo bash -s -- --domain pocket.example.com\`
           - Computer: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-host.sh | bash -s -- --server https://pocket.example.com\`
+          - Windows computer (PowerShell): \`& ([scriptblock]::Create((irm https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-host.ps1))) -Server https://pocket.example.com\`
           - Update: \`herdr-pocket update\` on computers, \`sudo herdr-pocket-relay update\` on the server; the app offers the new APK itself.
           EOF
           flags=()

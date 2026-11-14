@@ -1,14 +1,15 @@
 import type { Agent } from "@herdr-pocket/protocol";
 
+/** Last part of a path; Windows computers send `C:\...` paths. */
 export function basename(path?: string | null): string {
   if (!path) return "";
-  const parts = path.replace(/\/+$/, "").split("/");
+  const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
   return parts[parts.length - 1] || path;
 }
 
 export function shortPath(path?: string | null): string {
   if (!path) return "";
-  return path.replace(/^\/(Users|home)\/[^/]+/, "~");
+  return path.replace(/^\/(Users|home)\/[^/]+/, "~").replace(/^[A-Za-z]:\\Users\\[^\\]+/i, "~");
 }
 
 export function relTime(ts?: number | null, now = Date.now()): string {

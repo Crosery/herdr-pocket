@@ -1,6 +1,6 @@
 # 电脑端：安装、上线、更新
 
-macOS 和 Linux 都是一条命令，用你自己的用户运行，不需要 sudo：
+macOS 和 Linux 都是一条命令，用你自己的用户运行，不需要 sudo（Windows 见[下面](#windows)）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.sh | bash -s -- --server https://pocket.example.com
@@ -80,3 +80,39 @@ systemctl --user disable --now herdr-pocket-hostd
 1. 停掉服务（上面的 bootout / disable）并删除 plist 或 unit 文件。
 2. 删除 `~/.local/share/herdr-pocket` 和 `~/.local/bin/herdr-pocket`。
 3. 在手机 App 的设备列表里删掉这台电脑（或保留 `~/.config/herdr-pocket/hostd.json` 以便以后重装时沿用登记）。
+
+## Windows
+
+Windows 10 1809 以上或 Windows 11（x64 或 ARM64）。在 PowerShell 里运行，用你自己的账户，不需要管理员权限：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
+```
+
+参数和上面一样，写法换成 PowerShell 的：`-Server`、`-Link <设置或邀请链接>`、`-Code`、`-Name`、`-ReadOnly`、`-NoService`、`-Version`、`-Dir`、`-From <发布包>`。用 `irm … | iex` 时没法带参数，先设 `$env:HERDR_POCKET_SERVER = "https://pocket.example.com"`。
+
+脚本会：
+
+1. 下载 Node 24 到 `%LOCALAPPDATA%\Programs\herdr-pocket\node`（校验 SHA256；总是用这一份，不碰系统里的 Node）。
+2. 把发布包装到同一目录的 `releases\<版本>`，`current` 是指向它的目录联接（junction，普通用户就能建）。
+3. 写好命令 `bin\herdr-pocket.cmd`，并把 `bin` 加进你的用户 PATH（新开的终端生效）。
+4. 登记这台电脑：终端显示二维码，用已经连上的手机扫码并允许。
+5. 装成登录自启的后台服务：`HKCU\...\Run` 里的 `HerdrPocket` 项在你登录时用 `wscript` 隐藏启动一个看护进程，看护进程再运行 `herdr-pocket run`，退出了就自动重启，全程没有窗口。它跑在你自己的会话里，所以从手机启动的 agent 用的还是你的登录凭据。
+
+设置在 `%APPDATA%\herdr-pocket\hostd.json`，日志和手机发来的图片在 `%LOCALAPPDATA%\herdr-pocket`。电脑上要先装好 herdr（`hc`）；装在 `%LOCALAPPDATA%\Programs\herdr-core` 时不用加 PATH 也能找到。
+
+后台服务：
+
+```powershell
+herdr-pocket service status     # 是否登录自启、看护进程和 herdr-pocket 的进程号、日志位置
+herdr-pocket service restart    # 重启（换到 current 指向的版本）
+herdr-pocket service stop       # 停止，下次登录还会启动
+herdr-pocket service remove     # 停止并取消登录自启
+herdr-pocket service install    # 重新装上（可加 --read-only）
+```
+
+`herdr-pocket update` 在 Windows 上一样用：新版本解压到 `releases\`、试启动、切换 `current`，再让后台服务换到新版本。
+
+卸载：`herdr-pocket service remove`，然后删掉 `%LOCALAPPDATA%\Programs\herdr-pocket`、`%LOCALAPPDATA%\herdr-pocket`，并从用户 PATH 里去掉它的 `bin`；想保留登记就留着 `%APPDATA%\herdr-pocket\hostd.json`。
+
+注意：`herdr-pocket.cmd` 经过 cmd.exe，它会在 `&` 处把参数截断。要用链接登记时，用 `https://<服务器>/p/<码>` 这种形式，别用带 `&` 的 `herdrpocket://` 链接（安装脚本自己的 `-Link` 不受影响）。
