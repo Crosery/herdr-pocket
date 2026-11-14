@@ -48,49 +48,74 @@ export function initHero(): void {
     orbit.appendChild(el);
     return el;
   });
-  let angle = 0;
-  let last = performance.now();
   let visible = true;
-  let raf = 0;
+  const TAU = Math.PI * 2;
+  const PERIOD = TAU / 0.00018; // ms per revolution, about 35 s
+  const STEPS = 48;
   const tilt = (-14 * Math.PI) / 180;
-  const place = () => {
-    const w = stage.clientWidth;
-    const rx = w * 0.47;
-    const ry = w * 0.13;
-    const cx = w / 2;
-    const cy = w * 0.64;
+  // Position, size and fade of an avatar at angle `a` on a stage `w` px wide.
+  const pose = (a: number, w: number) => {
+    const ex = Math.cos(a) * w * 0.47;
+    const ey = Math.sin(a) * w * 0.13;
+    const x = ex * Math.cos(tilt) - ey * Math.sin(tilt);
+    const y = ex * Math.sin(tilt) + ey * Math.cos(tilt);
+    const depth = Math.sin(a); // +1 front, -1 back
+    const s = 0.62 + 0.38 * ((depth + 1) / 2);
+    return {
+      transform: `translate3d(${x.toFixed(1)}px, ${(w * 0.14 + y).toFixed(1)}px, 0) scale(${s.toFixed(3)})`,
+      opacity: (0.55 + 0.45 * ((depth + 1) / 2)).toFixed(2),
+    };
+  };
+  const angleOf = (i: number, ms: number) => (ms / PERIOD) * TAU + (i / items.length) * TAU;
+  // Front avatars pass over the mascot, back ones under it, slightly out of focus.
+  const layer = (ms: number) =>
     items.forEach((el, i) => {
-      const a = angle + (i / items.length) * Math.PI * 2;
-      const ex = Math.cos(a) * rx;
-      const ey = Math.sin(a) * ry;
-      const x = ex * Math.cos(tilt) - ey * Math.sin(tilt);
-      const y = ex * Math.sin(tilt) + ey * Math.cos(tilt);
-      const depth = Math.sin(a); // +1 front, -1 back
-      const s = 0.62 + 0.38 * ((depth + 1) / 2);
-      el.style.transform = `translate3d(${(cx + x - w / 2).toFixed(1)}px, ${(cy + y - w / 2).toFixed(1)}px, 0) scale(${s.toFixed(3)})`;
-      el.style.zIndex = depth > 0.05 ? "5" : "2";
-      el.style.opacity = (0.55 + 0.45 * ((depth + 1) / 2)).toFixed(2);
-      el.style.filter = depth < -0.2 ? `blur(${((-depth - 0.2) * 2.2).toFixed(2)}px)` : "none";
+      const depth = Math.sin(angleOf(i, ms));
+      const z = depth > 0.05 ? "5" : "2";
+      const blur = depth < -0.2 ? `blur(${((-depth - 0.2) * 2.2).toFixed(1)}px)` : "none";
+      if (el.style.zIndex !== z) el.style.zIndex = z;
+      if (el.style.filter !== blur) el.style.filter = blur;
     });
-  };
-  const tick = (now: number) => {
-    const dt = Math.min(64, now - last);
-    last = now;
-    angle += dt * 0.00018;
-    place();
-    raf = requestAnimationFrame(tick);
-  };
-  place();
-  window.addEventListener("resize", place);
 
-  // The orbit only runs while the stage is on screen; no frame callbacks otherwise.
+  // The orbit is a precomputed Web Animation of transform and opacity, which the
+  // browser runs on the compositor: no script or layout per frame. Stacking order
+  // and blur (which Chrome can't animate on the compositor) are set from script
+  // four times a second; over 250 ms the blur moves by at most 0.1 px.
+  let anims: Animation[] = [];
+  let builtFor = 0;
+  let layerTimer = 0;
+  const now = () => Number(anims[0]?.currentTime ?? 0);
+  const build = () => {
+    const w = stage.clientWidth;
+    if (!w || w === builtFor) return;
+    builtFor = w;
+    if (still) {
+      items.forEach((el, i) => Object.assign(el.style, pose(angleOf(i, 0), w)));
+      layer(0);
+      return;
+    }
+    const t = now();
+    anims.forEach((a) => a.cancel());
+    anims = items.map((el, i) => {
+      const frames = Array.from({ length: STEPS + 1 }, (_, k) => pose(angleOf(i, 0) + (k / STEPS) * TAU, w));
+      const anim = el.animate(frames, { duration: PERIOD, iterations: Infinity });
+      anim.currentTime = t;
+      if (!visible) anim.pause();
+      return anim;
+    });
+    layer(t);
+  };
+  build();
+  window.addEventListener("resize", build);
+
+  // Runs only while the stage is on screen.
   new IntersectionObserver(([e]) => {
     visible = e.isIntersecting;
-    cancelAnimationFrame(raf);
-    if (visible && !still) {
-      last = performance.now();
-      raf = requestAnimationFrame(tick);
-    }
+    clearInterval(layerTimer);
+    if (still) return;
+    if (!builtFor) build();
+    anims.forEach((a) => (visible ? a.play() : a.pause()));
+    if (visible) layerTimer = window.setInterval(() => layer(now()), 250);
   }).observe(stage);
 
   // ---- Parallax tilt toward the pointer
