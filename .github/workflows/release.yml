@@ -107,6 +107,9 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.meta.outputs.tag }}
       # A path context, so the stamped version is in the image.
       - uses: docker/build-push-action@v7
+        env:
+          # The job summary is enough; no build-record artifact.
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -197,10 +200,16 @@ jobs:
       PRERELEASE: ${{ needs.meta.outputs.prerelease }}
       IMAGE: ${{ needs.image.outputs.image }}
     steps:
+      # Only what the release ships: other jobs' artifacts (e.g. a Docker build
+      # record) must not end up in the release or in SHA256SUMS.
       - uses: actions/download-artifact@v8
         with:
+          name: bundle
           path: dist
-          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: apk
+          path: dist
       - run: |
           cd dist
           sha256sum -- * > SHA256SUMS
