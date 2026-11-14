@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { SHELL_HARNESSES, normalizeStatus, type Agent, type AgentStatus } from "@herdr-pocket/protocol";
 import { base, cleanTitle, debounce, lineSplitter, run } from "./util.ts";
 import { HcScreens } from "./hcscreen.ts";
-import { defaultHcBin } from "./platform.ts";
+import { defaultHcBin, programName } from "./platform.ts";
 
 /** Subset of a herdr-core (`hc`) terminal object we rely on. */
 export interface HcTerminal {
@@ -37,6 +37,9 @@ export interface AppNames {
   spaces: Map<string, string>;
   tabs: Map<string, string>;
 }
+
+/** Interpreters an agent program runs inside; their name says nothing about the agent. */
+const RUNTIMES = new Set(["node", "bun", "deno", "python", "python3", "py", "cmd", "npx"]);
 
 const KEY_ALIASES: Record<string, string> = {
   enter: "enter",
@@ -248,9 +251,17 @@ export class HcAdapter extends EventEmitter {
     this.emit("change");
   }
 
-  /** Program running in the terminal, e.g. claude-code, omp, sh. */
+  /** Program running in the terminal, e.g. claude-code, omp, sh (on Windows without `.exe`). */
   static harness(t: HcTerminal): string {
-    return t.status?.app || base(t.foreground?.argv?.[0]) || base(t.argv?.[0]) || "terminal";
+    if (t.status?.app) return t.status.app;
+    const fg = programName(base(t.foreground?.argv?.[0]));
+    const launched = programName(base(t.argv?.[0]));
+    // An agent installed by npm on Windows (claude.cmd) runs as node.exe, which is what the
+    // foreground shows; the program is the one the terminal was started with. A runtime
+    // started from a shell stays what it is.
+    const plain = (p: string) => RUNTIMES.has(p.toLowerCase()) || SHELL_HARNESSES.has(p.toLowerCase());
+    if (launched && fg && RUNTIMES.has(fg.toLowerCase()) && !plain(launched)) return launched;
+    return fg || launched || "terminal";
   }
 
   /**
@@ -299,12 +310,31 @@ export class HcAdapter extends EventEmitter {
       statusNote: HcAdapter.note(t),
       errored: ["error", "failed"].includes(t.status?.state?.toLowerCase() ?? "") || undefined,
       turn: t.turn,
-      isShell: !t.status && SHELL_HARNESSES.has(harness),
+      isShell: !t.status && SHELL_HARNESSES.has(harness.toLowerCase()),
       updatedAt: t.status_ms ?? t.created_ms ?? Date.now(),
     };
   }
 
   private screens = new HcScreens();
+
+  /**
+   * Starts a program (empty argv: the shell) in a new terminal of hc's own, in `cwd`, and
+   * returns its address. For computers without the desktop app; it belongs to no space.
+   */
+  async spawnTerminal(argv: string[], cwd: string): Promise<string> {
+    const out = await run(this.hcBin, ["run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", cwd, ...(argv.length ? ["--", ...argv] : [])], {
+      timeoutMs: 30_000,
+    });
+    const line = out.trim().split("\n").pop() ?? "";
+    let address: unknown;
+    try {
+      address = (JSON.parse(line) as { address?: unknown }).address;
+    } catch {
+      /* reported below */
+    }
+    if (typeof address !== "string" || !address) throw new Error(`hc run 没有返回新终端：${out.trim().slice(0, 200)}`);
+    return address;
+  }
 
   async read(
     address: string,

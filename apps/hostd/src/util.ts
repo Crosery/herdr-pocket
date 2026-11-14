@@ -9,7 +9,8 @@ export function run(cmd: string, args: string[], opts: { timeoutMs?: number; inp
       // windowsHide: no console window flashing up for each call when the daemon runs in the background.
       { timeout: opts.timeoutMs ?? 20_000, maxBuffer: 16 * 1024 * 1024, encoding: "utf8", windowsHide: true, ...(opts.env ? { env: opts.env } : {}) },
       (err, stdout, stderr) => {
-        if (err) reject(new Error(`${cmd} ${args[0] ?? ""} failed: ${String(stderr || err.message).trim()}`));
+        // `code` stays on the error: ENOENT means the program is not installed.
+        if (err) reject(Object.assign(new Error(`${cmd} ${args[0] ?? ""} failed: ${String(stderr || err.message).trim()}`), { code: (err as NodeJS.ErrnoException).code }));
         else resolve(stdout);
       },
     );

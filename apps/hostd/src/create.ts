@@ -105,6 +105,18 @@ export async function findPrograms(names: string[]): Promise<Map<string, string>
   return found;
 }
 
+/** argv with its program as the full path found here, so it starts whatever PATH the service has. */
+export function withProgramPath(argv: string[]): string[] {
+  return argv.length ? [programPaths.get(argv[0]!) ?? argv[0]!, ...argv.slice(1)] : argv;
+}
+
+/** What a launcher runs (empty: the computer's own shell). */
+export function launcherArgv(id: string): string[] {
+  const l = LAUNCHERS.find((x) => x.id === id);
+  if (!l) throw new Error("不支持启动这个程序");
+  return withProgramPath(l.argv);
+}
+
 /** Which launchers exist here (the shell is always there). */
 export async function installedLaunchers(): Promise<LaunchOption[]> {
   const names = LAUNCHERS.filter((l) => l.argv.length).map((l) => l.argv[0]!);
@@ -142,6 +154,18 @@ export interface AppLs {
   }>;
 }
 
+/**
+ * The desktop herdr app is not installed on this computer: herdr-core alone, as on Windows
+ * (where herdr has no desktop app) or a server. Terminals are then started with `hc run`.
+ */
+export class NoDesktopApp extends Error {
+  constructor() {
+    super("这台电脑上没有桌面 herdr");
+  }
+}
+
+const notInstalled = (e: unknown) => (e as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+
 /** The desktop herdr app (`herdr-app`), driven through its own commands. */
 export class HerdrApp {
   private bin: string;
@@ -152,7 +176,10 @@ export class HerdrApp {
 
   /** The window's spaces, tabs and terminals; throws when the window is not open. */
   async ls(): Promise<AppLs> {
-    const ls = JSON.parse(await run(this.bin, ["ls"], { timeoutMs: 8000 })) as AppLs;
+    const out = await run(this.bin, ["ls"], { timeoutMs: 8000 }).catch((e: unknown) => {
+      throw notInstalled(e) ? new NoDesktopApp() : e;
+    });
+    const ls = JSON.parse(out) as AppLs;
     if (!Array.isArray(ls?.spaces)) throw new Error("herdr-app ls: no spaces");
     return ls;
   }
@@ -190,11 +217,9 @@ export class HerdrApp {
     tab: string;
     terminal: string;
   }> {
-    const l = LAUNCHERS.find((x) => x.id === o.launcher);
-    if (!l) throw new Error("不支持启动这个程序");
+    const argv = launcherArgv(o.launcher);
     const task = o.task?.trim();
-    const argv = l.argv.length ? [programPaths.get(l.argv[0]!) ?? l.argv[0]!, ...l.argv.slice(1)] : l.argv;
-    return this.open({ ...o, argv, task: task && l.argv.length ? task : undefined });
+    return this.open({ ...o, argv, task: task && argv.length ? task : undefined });
   }
 
   /** New tab in `space`, or a new space, running `argv` (empty: a shell). Callers decide what may run. */
@@ -307,6 +332,7 @@ function doCommand(bin: string, cmd: string, args: Record<string, unknown>): Pro
   return new Promise((resolve, reject) => {
     execFile(bin, ["do", cmd, JSON.stringify(args)], { timeout: 20_000, encoding: "utf8", windowsHide: true }, (err, stdout, stderr) => {
       if (stdout.trim() || !err) return resolve(stdout);
+      if (notInstalled(err)) return reject(new NoDesktopApp());
       const msg = String(stderr || err?.message || "").trim();
       reject(new Error(/no herdr window|no window|not running/i.test(msg) ? "桌面 herdr 没有打开，先在电脑上打开它" : `桌面 herdr：${msg.slice(0, 200)}`));
     });

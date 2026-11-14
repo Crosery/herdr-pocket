@@ -101,6 +101,8 @@ Windows 10 1809 以上或 Windows 11（x64 或 ARM64）。在 PowerShell 里运�
 
 设置在 `%APPDATA%\herdr-pocket\hostd.json`，日志和手机发来的图片在 `%LOCALAPPDATA%\herdr-pocket`。电脑上要先装好 herdr（`hc`）；装在 `%LOCALAPPDATA%\Programs\herdr-core` 时不用加 PATH 也能找到。
 
+Windows 上的 herdr 只有 herdr-core，没有桌面 app，所以没有空间。手机新建 agent 时只选程序和文件夹，电脑用 `hc run` 在那个文件夹里开一个独立终端来启动它；在电脑上用 `hc ls` 找到它，`hc attach <地址>` 接手（Ctrl+\ 离开）。手机上看对话需要电脑上运行 Uniflo（它有 Windows 安装脚本）；没有 Uniflo 时，只能看终端屏幕。
+
 后台服务：
 
 ```powershell

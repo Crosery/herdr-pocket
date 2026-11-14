@@ -16,11 +16,11 @@ import {
   type ServerFrame,
 } from "@herdr-pocket/protocol";
 import { HcAdapter, type AppNames } from "./hc.ts";
-import { HerdrApp, checkFolder, herdrCommandArgs, installedLaunchers, resumeArgv } from "./create.ts";
+import { HerdrApp, NoDesktopApp, checkFolder, herdrCommandArgs, installedLaunchers, launcherArgv, resumeArgv, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
 import { SessionHints } from "./sessionhint.ts";
-import { debounce } from "./util.ts";
+import { base, debounce } from "./util.ts";
 import { InputWaits } from "./waiting.ts";
 import { typeFirstTask, type TypeTaskOptions } from "./firsttask.ts";
 import { FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from "./put.ts";
@@ -611,6 +611,29 @@ export class Host {
     if (!this.sources.includes("uniflo")) throw new RpcFailure("unsupported", "这台电脑没有运行 Uniflo，查不了会话记录");
   }
 
+  /**
+   * A new terminal through the desktop app; where there is none (herdr-core alone, as on
+   * Windows or a server) one of hc's own, outside any space. `direct` says which it was.
+   */
+  private async newTerminal(
+    viaApp: () => Promise<{ space: string; tab: string; terminal: string }>,
+    argv: string[],
+    folder: string | undefined,
+  ): Promise<{ space: string; tab: string; terminal: string; direct: boolean }> {
+    try {
+      return { ...(await viaApp()), direct: false };
+    } catch (e) {
+      if (!(e instanceof NoDesktopApp)) throw new RpcFailure("unsupported", (e as Error).message);
+    }
+    try {
+      const terminal = await this.hc.spawnTerminal(argv, folder ?? checkFolder("~"));
+      this.note("info", "create", `no desktop herdr here: started ${argv[0] ? base(argv[0]) : "a shell"} as ${terminal} with hc run`);
+      return { space: "", tab: "", terminal, direct: true };
+    } catch (e) {
+      throw new RpcFailure("unsupported", (e as Error).message);
+    }
+  }
+
   private needApp(): void {
     if (!this.sources.includes("hc")) throw new RpcFailure("unsupported", "这台电脑没有装桌面 herdr");
   }
@@ -694,14 +717,25 @@ export class Host {
       const launchers = await this.launchers;
       let spaces: Awaited<ReturnType<HerdrApp["spaces"]>> = [];
       let reason: string | undefined;
+      let standalone = false;
       if (this.opts.readOnly) reason = "这台电脑开了只读模式";
       else if (!this.sources.includes("hc")) reason = "这台电脑没有装桌面 herdr";
       try {
         spaces = await this.app.spaces();
-      } catch {
-        reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
+      } catch (e) {
+        // Without the desktop app (Windows, servers) new agents get terminals of their own.
+        if (e instanceof NoDesktopApp) standalone = true;
+        else reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
       }
-      return { spaces, launchers, folders: this.suggestFolders(spaces.map((x) => x.folder)), canCreate: !reason, reason, typesTask: true };
+      return {
+        spaces,
+        launchers,
+        folders: this.suggestFolders(spaces.map((x) => x.folder)),
+        canCreate: !reason,
+        reason,
+        typesTask: true,
+        ...(standalone ? { standalone } : {}),
+      };
     },
     "agent.create": async (p) => {
       this.writable();
@@ -717,24 +751,25 @@ export class Host {
       }
       if (!p.space && !folder) folder = checkFolder("~");
       const task = str(p.task, 20_000);
-      let r: { space: string; tab: string; terminal: string };
-      try {
-        r = await this.app.create({
-          space: str(p.space, 100),
-          spaceName: str(p.spaceName, 60),
-          tabName: str(p.tabName, 60),
-          folder,
-          launcher: launcher.id,
-          // Only programs that take it on their command line get it at start; the others have it typed in below.
-          task: launcher.takesTask ? task : undefined,
-        });
-      } catch (e) {
-        throw new RpcFailure("unsupported", (e as Error).message);
-      }
+      const r = await this.newTerminal(
+        () =>
+          this.app.create({
+            space: str(p.space, 100),
+            spaceName: str(p.spaceName, 60),
+            tabName: str(p.tabName, 60),
+            folder,
+            launcher: launcher.id,
+            // Only programs that take it on their command line get it at start; the others have it typed in below.
+            task: launcher.takesTask ? task : undefined,
+          }),
+        launcherArgv(launcher.id),
+        folder,
+      );
       await Promise.all([this.hc.list(), this.refreshNames()]);
       const made = { agent: agentKey(this.deviceId, "hc", r.terminal), space: r.space, terminal: r.terminal };
       if (!task) return made;
-      if (launcher.takesTask) return { ...made, task: "started" as const };
+      // `hc run` starts the bare program: the task is typed in like for any other.
+      if (launcher.takesTask && !r.direct) return { ...made, task: "started" as const };
       if (launcher.id === "shell") return { ...made, task: "failed" as const, taskNote: "终端不接任务" };
       const typed = await typeFirstTask(
         task,
@@ -894,12 +929,8 @@ export class Host {
       } catch (e) {
         throw new RpcFailure("unsupported", (e as Error).message);
       }
-      let r: { space: string; tab: string; terminal: string };
-      try {
-        r = await this.app.open({ space: typeof p.space === "string" && p.space ? p.space.slice(0, 100) : undefined, folder, argv });
-      } catch (e) {
-        throw new RpcFailure("unsupported", (e as Error).message);
-      }
+      const space = typeof p.space === "string" && p.space ? p.space.slice(0, 100) : undefined;
+      const r = await this.newTerminal(() => this.app.open({ space, folder, argv }), withProgramPath(argv), folder);
       await Promise.all([this.hc.list(), this.refreshNames()]);
       return { agent: agentKey(this.deviceId, "hc", r.terminal), space: r.space, terminal: r.terminal };
     },
