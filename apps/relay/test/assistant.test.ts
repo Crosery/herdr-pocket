@@ -447,8 +447,8 @@ test("time reminders fire as notices", async () => {
 
 /** Opens a call from a phone and plays MOSS-Live's side of the setup. */
 async function openCall(token: string) {
-  const upstream = new Promise<{ sock: Sock; auth?: string; url: string }>((resolve) =>
-    moss.once("connection", (ws, req) => resolve({ sock: new Sock(ws), auth: req.headers.authorization, url: req.url ?? "" })),
+  const upstream = new Promise<{ sock: Sock; auth?: string; url: string; ext?: string }>((resolve) =>
+    moss.once("connection", (ws, req) => resolve({ sock: new Sock(ws), auth: req.headers.authorization, url: req.url ?? "", ext: req.headers["sec-websocket-extensions"] })),
   );
   const call_ = await Sock.open("/v1/assistant/live", token);
   const up = await upstream;
@@ -470,6 +470,8 @@ test("voice calls go through the relay; delegated tasks are done by the text ass
   const { call_, up, attach, update } = await openCall(phone.token);
   assert.equal(up.auth, "Bearer moss-test-key");
   assert.match(up.url, /model=moss-live-1\.0/);
+  // Audio is not compressed on the way to the voice service (zlib would queue it behind other work).
+  assert.equal(up.ext, undefined);
   assert.deepEqual(attach.delegation, { type: "client" });
   assert.equal((await up.sock.next((f) => f.action === "client_context.update")).context.time_zone, "Asia/Shanghai");
   assert.ok(update.session.persona.name);
@@ -501,6 +503,17 @@ test("voice calls go through the relay; delegated tasks are done by the text ass
   await up.sock.next((f) => f.action === "mic_state");
   const done = up.sock.frames.filter((f) => f.action === "playback.completed");
   assert.deepEqual(done, [{ action: "playback.completed", run_id: "r1", turn_id: "t1" }]);
+  // A cut-off answer: the phone says how much of the answer it played; MOSS-Live is told only the part
+  // of the chunk being played, the chunk before it having its own receipt (10 ms + 15 ms of the next).
+  up.sock.send({ action: "response.audio.context", data: { chunk_id: "c2a", run_id: "r2", turn_id: "t2" } });
+  up.sock.ws.send(Buffer.alloc(960));
+  up.sock.send({ action: "response.audio.context", data: { chunk_id: "c2b", run_id: "r2", turn_id: "t2" } });
+  up.sock.ws.send(Buffer.alloc(1920));
+  await call_.next((f) => f.action === "response.audio.context" && f.data.chunk_id === "c2b");
+  call_.send({ action: "playback.chunk.completed", chunk_id: "c2a", run_id: "r2", turn_id: "t2" });
+  call_.send({ action: "playback.stopped", run_id: "r2", turn_id: "t2", played_audio_ms: 25, reason: "interrupted" });
+  const stopped = await up.sock.next((f) => f.action === "playback.stopped");
+  assert.deepEqual(stopped, { action: "playback.stopped", run_id: "r2", turn_id: "t2", played_audio_ms: 15, reason: "interrupted" });
   assert.ok(!up.sock.frames.some((f) => f.action === "session.update"));
 
   // What the person says lands in the shared thread; a revision replaces the first hearing.
@@ -561,6 +574,10 @@ test("voice calls go through the relay; delegated tasks are done by the text ass
   await sleep(40);
   assert.ok(!up.sock.frames.some((f) => f.action === "session.update"));
   up.sock.send({ action: "response.ended", data: { run_id: "r9", turn_id: "t9", status: "completed" } });
+  // The service is done, but the phone is still playing the end of it: still nothing.
+  await sleep(40);
+  assert.ok(!up.sock.frames.some((f) => f.action === "session.update"));
+  call_.send({ action: "playback.completed", run_id: "r9", turn_id: "t9" });
   // The rules mention “要告诉我的事” too; the section itself is what goes away.
   const cleared = await up.sock.next((f) => f.action === "session.update" && !/【要告诉我的事】/.test(f.session.instructions));
   assert.match(cleared.session.instructions, /【现况】/);

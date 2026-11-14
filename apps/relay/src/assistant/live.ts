@@ -8,7 +8,7 @@
  * phone sees the same events either way.
  */
 import { randomUUID } from "node:crypto";
-import { WebSocket } from "ws";
+import { WebSocket, type RawData } from "ws";
 import { LIVE_CLIENT_ACTIONS, type LiveRelayEvent, type Notice } from "@herdr-pocket/protocol";
 import type { Assistant } from "./assistant.ts";
 import { claimCall, releaseCall } from "./calls.ts";
@@ -62,10 +62,13 @@ const TO_PHONE = new Set([
 const FROM_PHONE = new Set<string>(LIVE_CLIENT_ACTIONS);
 const ATTACH_TIMEOUT_MS = 15_000;
 const REFRESH_GAP_MS = 5000;
+/** Default downlink: 48 kHz mono PCM16, 96 bytes a millisecond. */
+const BYTES_PER_MS = 96;
 /** MOSS-Live rejects instructions longer than this (characters). */
 const MAX_INSTRUCTIONS = 16_000;
 
 const str = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
+const byteLength = (d: RawData): number => (Array.isArray(d) ? d.reduce((n, b) => n + b.length, 0) : d instanceof ArrayBuffer ? d.byteLength : d.length);
 
 /**
  * Rebuilds a phone message with only the fields MOSS-Live accepts; null when it
@@ -112,8 +115,16 @@ export class LiveCall {
   /** configuring -> armed (setup accepted) -> speaking (the next answer) -> cleared once said. */
   private noticeState: "idle" | "configuring" | "armed" | "speaking" = "idle";
   private noticeRun = "";
-  /** When the answer being spoken started; 0 between answers. */
+  /** When the answer being said started; 0 when nothing is being said. */
   private speakingSince = 0;
+  /** The service is still making that answer. */
+  private answering = false;
+  /** The answer whose audio the phone has not finished playing ("" when none): it is still being heard. */
+  private playingRun = "";
+  /** Length (ms) of each chunk sent to the phone and not yet receipted, and how much of each run the receipts cover. */
+  private chunkMs = new Map<string, number>();
+  private nextChunk = "";
+  private receiptedMs = new Map<string, number>();
   private recent = "";
   private lastInstructions = "";
   private lastPush = 0;
@@ -144,6 +155,8 @@ export class LiveCall {
     url.searchParams.set("user", `herdr-pocket-${deviceId}`);
     this.upstream = new WebSocket(url, {
       headers: { Authorization: `Bearer ${cfg.apiKey}` },
+      // PCM hardly compresses, and every frame would wait for zlib on the thread pool behind the hosts' screens.
+      perMessageDeflate: false,
       followRedirects: false,
       handshakeTimeout: ATTACH_TIMEOUT_MS,
       maxPayload: 16 * 1024 * 1024,
@@ -155,6 +168,11 @@ export class LiveCall {
     this.upstream.on("open", () => this.up({ action: "attach_session", memory_scope: "session", delegation: { type: "client" } }));
     this.upstream.on("message", (data, binary) => {
       if (binary) {
+        if (this.nextChunk) {
+          this.chunkMs.set(this.nextChunk, byteLength(data) / BYTES_PER_MS);
+          if (this.chunkMs.size > 2000) this.chunkMs.delete(this.chunkMs.keys().next().value!);
+          this.nextChunk = "";
+        }
         if (phone.readyState === WebSocket.OPEN) phone.send(data, { binary: true });
         return;
       }
@@ -190,7 +208,7 @@ export class LiveCall {
         return;
       }
       const clean = cleanPhoneMessage(msg, (run) => this.turns.get(run));
-      if (clean) this.up(clean);
+      if (clean) this.up(this.receipt(clean));
       else if (typeof msg.action === "string" && FROM_PHONE.has(msg.action) && this.dropped++ < 5) this.log(`live: dropped malformed ${msg.action} from phone`);
     });
     phone.on("close", () => this.stop("手机断开了"));
@@ -205,9 +223,53 @@ export class LiveCall {
     if (this.phone.readyState === WebSocket.OPEN) this.phone.send(JSON.stringify(msg));
   }
 
-  /** An answer whose end was never announced must not hold refreshes back for good. */
+  /**
+   * An answer is being made, or the phone is still playing it: the service can
+   * be done long before the person has heard the end. One whose end was never
+   * announced must not hold refreshes back for good.
+   */
   private get speaking(): boolean {
-    return this.speakingSince > 0 && Date.now() - this.speakingSince < 45_000;
+    return this.speakingSince > 0 && (this.answering || this.playingRun !== "") && Date.now() - this.speakingSince < 45_000;
+  }
+
+  /**
+   * Playback receipts on their way up. The phone reports in playback.stopped
+   * all of the answer it played (realtime.ts needs that); MOSS-Live wants only
+   * the part of the chunk being played, the chunks before it having been
+   * receipted one by one.
+   */
+  private receipt(msg: Record<string, unknown>): Record<string, unknown> {
+    const run = String(msg.run_id);
+    switch (msg.action) {
+      case "playback.chunk.completed": {
+        const ms = this.chunkMs.get(String(msg.chunk_id));
+        this.chunkMs.delete(String(msg.chunk_id));
+        if (ms !== undefined) {
+          this.receiptedMs.set(run, (this.receiptedMs.get(run) ?? 0) + ms);
+          if (this.receiptedMs.size > 100) this.receiptedMs.delete(this.receiptedMs.keys().next().value!);
+        }
+        return msg;
+      }
+      case "playback.stopped": {
+        const before = this.receiptedMs.get(run) ?? 0;
+        this.receiptedMs.delete(run);
+        this.heard(run);
+        if (typeof msg.played_audio_ms !== "number") return msg;
+        return { ...msg, played_audio_ms: Math.max(0, Math.round(msg.played_audio_ms - before)) };
+      }
+      case "playback.completed":
+        this.receiptedMs.delete(run);
+        this.heard(run);
+        return msg;
+    }
+    return msg;
+  }
+
+  /** The phone has played all of a run it is going to play. */
+  private heard(run: string): void {
+    if (run !== this.playingRun) return;
+    this.playingRun = "";
+    this.spoke();
   }
 
   /** Rules, the snapshot, what is waiting to be said and the recent chat: one builder for every refresh (4.3). */
@@ -268,6 +330,7 @@ export class LiveCall {
   }
 
   private spoke(): void {
+    if (this.speaking) return;
     this.speakingSince = 0;
     if (this.refreshWaiting) {
       this.refreshWaiting = false;
@@ -331,17 +394,27 @@ export class LiveCall {
           this.refresh();
         }
         break;
+      case "response.audio.context":
+        if (str(d.chunk_id)) this.nextChunk = d.chunk_id;
+        break;
       case "response.audio.started":
         this.speakingSince = Date.now();
+        this.answering = true;
+        if (str(d.run_id)) this.playingRun = d.run_id;
         if (this.noticeState === "armed" && str(d.run_id)) {
           this.noticeState = "speaking";
           this.noticeRun = d.run_id;
         }
         break;
       case "response.ended":
+        this.answering = false;
         this.spoke();
         break;
       case "response.interrupted":
+        // Why it was cut (the person spoke, or playback timed out or failed): the first thing to look at when calls sound choppy.
+        this.log(`live: answer cut${str(d.reason) ? ` (${clip(d.reason, 60)})` : ""}`);
+        this.answering = false;
+        if (d.run_id === this.playingRun) this.playingRun = "";
         this.spoke();
         if (str(d.run_id)) {
           this.cut.add(d.run_id);

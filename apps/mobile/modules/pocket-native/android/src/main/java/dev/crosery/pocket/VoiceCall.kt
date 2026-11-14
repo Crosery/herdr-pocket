@@ -13,6 +13,8 @@ import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
+import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -22,15 +24,21 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
-import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
 private const val TAG = "PocketVoice"
 private const val MIC_RATE = 16_000
 private const val SPEAKER_RATE = 48_000
+private const val SPEAKER_PER_MS = SPEAKER_RATE / 1000
 /** 20 ms of 16 kHz mono PCM16. */
 private const val MIC_FRAME_BYTES = 640
+/** From Android 12 the track starts once this much is written; before, only once its whole buffer is full. */
+private const val START_THRESHOLD_MS = 40
+/** A track that holds audio but has not moved for this long is waiting to be filled: top it up with silence. */
+private const val STUCK_MS = 150L
+/** How often the play thread looks again when it has nothing to write. */
+private const val PLAY_LOOP_MS = 5L
 
 /**
  * One voice call to the relay's /v1/assistant/live. Audio never passes through
@@ -49,7 +57,9 @@ class VoiceCall(
   }
 
   private data class Ref(val chunkId: String, val runId: String, val turnId: String)
-  private class Chunk(val ref: Ref, val pcm: ByteArray, val frames: Long, val level: Float)
+  private class Chunk(val ref: Ref, val pcm: ByteArray, override val frames: Int, val level: Float) : Playout.Piece {
+    override val run: String get() = ref.runId
+  }
   private class Scope {
     var turnId = ""
     var finished = false
@@ -81,10 +91,16 @@ class VoiceCall(
   // Playback ledger; guarded by `lock`.
   private val lock = Any()
   private val contexts = ArrayDeque<Ref>()
-  private val queue = LinkedBlockingDeque<Chunk>()
+  /** Audio received and not yet written to the track: the jitter buffer. */
+  private val playout = Playout<Chunk>(SPEAKER_PER_MS)
+  /** Chunks written to the track, with the frame position their end reaches. */
   private val inflight = ArrayDeque<Pair<Chunk, Long>>()
+  /** Frames written to the track since it was last flushed, silence included. */
   private var written = 0L
+  /** Bumped by a flush: the play thread drops what it was writing and primes the track again. */
   private var generation = 0
+  /** Replies the service stopped (response.audio.stop), for the call's stats. */
+  private var stops = 0
   private val scopes = HashMap<String, Scope>()
   private val stoppedRuns = HashSet<String>()
 
@@ -143,7 +159,8 @@ class VoiceCall(
       MIC_RATE,
       AudioFormat.CHANNEL_IN_MONO,
       AudioFormat.ENCODING_PCM_16BIT,
-      maxOf(minIn, MIC_FRAME_BYTES * 8),
+      // Room for half a second: a busy phone must not lose the person's words.
+      maxOf(minIn * 2, MIC_FRAME_BYTES * 25),
     )
     if (rec.state != AudioRecord.STATE_INITIALIZED) {
       rec.release()
@@ -168,6 +185,10 @@ class VoiceCall(
       .setTransferMode(AudioTrack.MODE_STREAM)
       .setBufferSizeInBytes(maxOf(minOut, SPEAKER_RATE * 2 / 5))
       .build()
+    // The jitter buffer decides when speech starts; the track should not wait for a full buffer on top of it.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      try { tr.setStartThresholdInFrames(START_THRESHOLD_MS * SPEAKER_PER_MS) } catch (_: Throwable) {}
+    }
     track = tr
     rec.startRecording()
     tr.play()
@@ -213,6 +234,7 @@ class VoiceCall(
   // ----------------------------------------------------------------------- loops
 
   private fun micLoop() {
+    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
     val rec = record ?: return
     val frame = ByteArray(MIC_FRAME_BYTES)
     val silence = ByteArray(MIC_FRAME_BYTES)
@@ -232,28 +254,92 @@ class VoiceCall(
     }
   }
 
+  /** Frames the track has played since it was last flushed. */
+  private fun head(tr: AudioTrack): Long = try { tr.playbackHeadPosition.toLong() and 0xFFFFFFFFL } catch (_: Throwable) { written }
+
+  /** What the track needs before it plays: since Android 12 the threshold set above, before that its whole buffer. */
+  private fun startFrames(tr: AudioTrack): Long = try {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) tr.startThresholdInFrames.toLong() else tr.bufferSizeInFrames.toLong()
+  } catch (_: Throwable) {
+    (SPEAKER_RATE / 5).toLong()
+  }
+
+  /** Writes up to [frames] of silence without blocking; returns what went in. */
+  private fun writeSilence(tr: AudioTrack, silence: ByteArray, frames: Long): Long {
+    var left = frames
+    while (left > 0) {
+      val n = tr.write(silence, 0, minOf(silence.size.toLong(), left * 2).toInt(), AudioTrack.WRITE_NON_BLOCKING)
+      if (n <= 0) break
+      written += n / 2
+      left -= n / 2
+    }
+    return frames - left
+  }
+
+  /**
+   * Feeds the speaker. The jitter buffer (Playout) says when a reply has enough
+   * audio in to start, and when one that ran dry may go on. A track that ran dry
+   * plays again only once it holds its start threshold: 40 ms from Android 12
+   * (set in openAudio), the whole buffer before; there a little silence keeps it
+   * running between replies.
+   */
   private fun playLoop() {
+    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
     val tr = track ?: return
+    val silence = ByteArray(SPEAKER_PER_MS * 2 * 20)
+    var cur: Chunk? = null
+    var off = 0
+    var gen = -1
+    var lastHead = -1L
+    var headSince = 0L
+    // Silence between replies only where a dry track waits for its whole buffer (see Playout.LEAD_MS).
+    val leadFrames = if (startFrames(tr) >= tr.bufferSizeInFrames) Playout.LEAD_MS.toLong() * SPEAKER_PER_MS else 0L
     while (!ended) {
-      val chunk = queue.poll(50, TimeUnit.MILLISECONDS) ?: continue
-      val gen = synchronized(lock) {
-        if (stoppedRuns.contains(chunk.ref.runId)) {
-          -1
-        } else {
-          inflight.addLast(chunk to (written + chunk.frames))
-          written += chunk.frames
-          generation
+      val now = SystemClock.elapsedRealtime()
+      synchronized(lock) {
+        val head = head(tr)
+        if (gen != generation) {
+          // Started or flushed: an empty track only plays once it holds its start threshold.
+          gen = generation
+          cur = null
+          off = 0
+          writeSilence(tr, silence, startFrames(tr))
         }
+        if (head != lastHead) {
+          lastHead = head
+          headSince = now
+        } else if (cur == null && written - head > 0 && now - headSince >= STUCK_MS) {
+          // Holding audio but not moving: some devices want more than the threshold; give it silence.
+          writeSilence(tr, silence, tr.bufferSizeInFrames.toLong())
+          headSince = now
+        }
+        while (!ended) {
+          if (cur == null) {
+            // Speech still in the track: the end of the last chunk written, if it has not been played yet.
+            val audio = maxOf(0L, (inflight.lastOrNull()?.second ?: 0L) - head)
+            val next = playout.take(now, audio) ?: break
+            if (stoppedRuns.contains(next.ref.runId)) continue
+            inflight.addLast(next to (written + next.frames))
+            written += next.frames
+            cur = next
+            off = 0
+          }
+          val c = cur!!
+          val n = tr.write(c.pcm, off, c.pcm.size - off, AudioTrack.WRITE_NON_BLOCKING)
+          if (n < 0) {
+            // Counted as written above; the rest never went in.
+            written -= (c.pcm.size - off) / 2
+            cur = null
+            break
+          }
+          off += n
+          if (off < c.pcm.size) break
+          cur = null
+        }
+        // Nothing to write now: before Android 12, keep a little silence queued so the track keeps running.
+        if (cur == null && written - head < leadFrames) writeSilence(tr, silence, leadFrames - (written - head))
       }
-      if (gen < 0) continue
-      var off = 0
-      // A flush (interruption) bumps the generation: the rest of this chunk is dropped.
-      while (off < chunk.pcm.size && !ended && gen == synchronized(lock) { generation }) {
-        val n = tr.write(chunk.pcm, off, chunk.pcm.size - off, AudioTrack.WRITE_NON_BLOCKING)
-        if (n < 0) break
-        off += n
-        if (n == 0) Thread.sleep(8)
-      }
+      Thread.sleep(PLAY_LOOP_MS)
     }
   }
 
@@ -263,18 +349,11 @@ class VoiceCall(
     while (!ended) {
       Thread.sleep(20)
       val tr = track ?: continue
-      val head = try { tr.playbackHeadPosition.toLong() and 0xFFFFFFFFL } catch (_: Throwable) { continue }
       val out = mutableListOf<JSONObject>()
       var outLevel = 0f
       synchronized(lock) {
-        while (inflight.isNotEmpty() && inflight.first().second <= head) {
-          val (chunk, _) = inflight.removeFirst()
-          out.add(JSONObject().put("action", "playback.chunk.completed").put("chunk_id", chunk.ref.chunkId).put("run_id", chunk.ref.runId).put("turn_id", chunk.ref.turnId))
-          val s = scope(chunk.ref.runId, chunk.ref.turnId)
-          s.playedMs += chunk.frames * 1000.0 / SPEAKER_RATE
-          if (s.outstanding > 0) s.outstanding--
-          drained(chunk.ref.runId, s)?.let { out.add(it) }
-        }
+        val head = head(tr)
+        while (inflight.isNotEmpty() && inflight.first().second <= head) acked(inflight.removeFirst().first, out)
         inflight.firstOrNull()?.let { outLevel = it.first.level }
       }
       for (m in out) ws?.send(m.toString())
@@ -284,6 +363,15 @@ class VoiceCall(
         PocketBus.emit("onLevel", mapOf("mic" to micLevel.toDouble(), "out" to outLevel.toDouble()))
       }
     }
+  }
+
+  /** A chunk the speaker has played in full: its receipt, and the reply's when it was the last. Under `lock`. */
+  private fun acked(chunk: Chunk, out: MutableList<JSONObject>) {
+    out.add(JSONObject().put("action", "playback.chunk.completed").put("chunk_id", chunk.ref.chunkId).put("run_id", chunk.ref.runId).put("turn_id", chunk.ref.turnId))
+    val s = scope(chunk.ref.runId, chunk.ref.turnId)
+    s.playedMs += chunk.frames * 1000.0 / SPEAKER_RATE
+    if (s.outstanding > 0) s.outstanding--
+    drained(chunk.ref.runId, s)?.let { out.add(it) }
   }
 
   private fun scope(runId: String, turnId: String): Scope {
@@ -300,18 +388,27 @@ class VoiceCall(
 
   /** The model was interrupted: stop its speech now and report how much was heard. */
   private fun stopRun(runId: String, turnId: String, reason: String) {
-    val msg: JSONObject
+    val out = mutableListOf<JSONObject>()
     synchronized(lock) {
       stoppedRuns.add(runId)
-      queue.removeAll { it.ref.runId == runId }
+      stops++
+      playout.drop(runId)
       val s = scope(runId, turnId)
+      // Stopped, not completed: no playback.completed for it from the receipts below.
+      s.stopped = true
       val tr = track
       if (inflight.any { it.first.ref.runId == runId } && tr != null) {
-        val head = try { tr.playbackHeadPosition.toLong() and 0xFFFFFFFFL } catch (_: Throwable) { written }
-        val cur = inflight.firstOrNull()
-        if (cur != null && cur.first.ref.runId == runId) {
-          val start = cur.second - cur.first.frames
-          if (head > start) s.playedMs += (head - start) * 1000.0 / SPEAKER_RATE
+        val head = head(tr)
+        // Chunks heard in full get their receipts first (MOSS-Live asks for that order), then the part of the current one.
+        val back = mutableListOf<Chunk>()
+        for ((c, end) in inflight) {
+          val start = end - c.frames
+          when {
+            end <= head -> acked(c, out)
+            c.ref.runId == runId -> if (head > start) s.playedMs += (head - start) * 1000.0 / SPEAKER_RATE
+            // Another reply's audio in the track: it goes back to be played after the flush.
+            else -> back.add(c)
+          }
         }
         try {
           tr.pause()
@@ -319,18 +416,22 @@ class VoiceCall(
           tr.play()
         } catch (_: Throwable) {}
         inflight.clear()
+        playout.requeue(back)
         generation++
-        written = try { tr.playbackHeadPosition.toLong() and 0xFFFFFFFFL } catch (_: Throwable) { 0L }
+        written = head(tr)
       }
       s.outstanding = 0
       s.finished = true
       s.stopped = true
       s.drained = true
-      msg = JSONObject().put("action", "playback.stopped").put("run_id", runId).put("turn_id", s.turnId)
-        .put("played_audio_ms", s.playedMs.toLong()).put("reason", reason)
+      // All of the reply that was heard; the relay turns it into what each service expects.
+      out.add(
+        JSONObject().put("action", "playback.stopped").put("run_id", runId).put("turn_id", s.turnId)
+          .put("played_audio_ms", s.playedMs.toLong()).put("reason", reason),
+      )
       s.playedMs = 0.0
     }
-    ws?.send(msg.toString())
+    for (m in out) ws?.send(m.toString())
   }
 
   // ----------------------------------------------------------------------- socket
@@ -370,7 +471,11 @@ class VoiceCall(
           val m = synchronized(lock) {
             val run = d.optString("run_id")
             if (stoppedRuns.contains(run)) null
-            else scope(run, d.optString("turn_id")).let { s -> s.finished = true; drained(run, s) }
+            else {
+              // A short reply that is all in plays at once, without waiting for the cushion.
+              playout.finish(run)
+              scope(run, d.optString("turn_id")).let { s -> s.finished = true; drained(run, s) }
+            }
           }
           m?.let { webSocket.send(it.toString()) }
         }
@@ -387,7 +492,7 @@ class VoiceCall(
         val ref = contexts.removeFirstOrNull() ?: return
         if (stoppedRuns.contains(ref.runId)) return
         scope(ref.runId, ref.turnId).outstanding++
-        queue.add(Chunk(ref, pcm, (pcm.size / 2).toLong(), rms(pcm, pcm.size)))
+        playout.push(Chunk(ref, pcm, pcm.size / 2, rms(pcm, pcm.size)), SystemClock.elapsedRealtime())
       }
     }
 
@@ -419,6 +524,16 @@ class VoiceCall(
     end("挂断了")
   }
 
+  /** Mid-reply stalls of the jitter buffer, its cushion, AudioTrack underruns (silence ones too) and stopped replies. */
+  private fun stats(): JSONObject = synchronized(lock) {
+    val underruns = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) track?.underrunCount ?: -1 else -1
+    JSONObject().put("action", "call.stats").put(
+      "data",
+      JSONObject().put("stalls", playout.stalls).put("target_ms", playout.targetMs.toLong())
+        .put("max_target_ms", playout.maxTargetMs.toLong()).put("underruns", underruns).put("stops", stops),
+    )
+  }
+
   @Synchronized
   fun end(message: String) {
     if (ended) return
@@ -426,9 +541,14 @@ class VoiceCall(
     ready = false
     if (current === this) current = null
     try { ws?.close(1000, "bye") } catch (_: Throwable) {}
+    // How the speaker did, for the app's log: what a real call leaves to look at afterwards.
+    val stats = try { stats() } catch (_: Throwable) { null }
     closeAudio()
-    queue.clear()
     client.dispatcher.executorService.shutdown()
+    stats?.let {
+      Log.i(TAG, it.toString())
+      PocketBus.emit("onCallEvent", mapOf("json" to it.toString()))
+    }
     PocketBus.emit("onCall", mapOf("state" to "ended", "message" to message))
     onEnded()
   }
