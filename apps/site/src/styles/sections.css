@@ -1874,6 +1874,29 @@
 .video-frame.is-playing .video-play {
   display: none;
 }
+.video-q {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
+  margin-top: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-2);
+}
+.video-q span {
+  margin-right: 6px;
+}
+.video-q button {
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-weight: 800;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+.video-q button.is-on {
+  background: var(--pink-soft);
+  color: var(--accent-deep);
+}
 
 /* ================= DEPLOY ================= */
 .deploy {
