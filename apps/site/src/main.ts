@@ -133,7 +133,15 @@ if (!reducedMotion()) {
 // the shader sky and glossy materials cost more GPU than they can spare.
 const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8;
 const desktopClass = finePointer() && !isNarrow() && (navigator.hardwareConcurrency || 4) >= 4 && memory >= 4;
-if (desktopClass && !reducedMotion() && !slowNetwork()) {
+const canWebGL = () => {
+  try {
+    const c = document.createElement("canvas");
+    return !!(c.getContext("webgl2") || c.getContext("webgl"));
+  } catch {
+    return false;
+  }
+};
+if (desktopClass && !reducedMotion() && !slowNetwork() && canWebGL()) {
   afterLoad(() => {
     const io = new IntersectionObserver(([e]) => {
       if (!e.isIntersecting) return;
