@@ -1,0 +1,13 @@
+{
+  "name": "herdr-pocket-readme-assets",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Generates the README images in docs/readme from the brand fonts and mascot art.",
+  "scripts": {
+    "build": "node generate.mjs && node showcase.mjs"
+  },
+  "dependencies": {
+    "opentype.js": "^1.3.4"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@herdr-pocket/relay",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "bin": { "herdr-pocket-relay": "./bin/herdr-pocket-relay" },
+  "scripts": {
+    "start": "node src/main.ts",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc -p .",
+    "bootstrap": "node src/bootstrap.ts"
+  },
+  "dependencies": {
+    "@herdr-pocket/protocol": "workspace:*",
+    "@herdr-pocket/update": "workspace:*",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.9.0"
+  }
+}

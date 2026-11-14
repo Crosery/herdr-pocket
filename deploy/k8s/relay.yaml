@@ -1,0 +1,86 @@
+# Kubernetes (docs/deploy/platforms.md): one relay pod, its SQLite database on a volume.
+#   kubectl create namespace herdr-pocket
+#   kubectl -n herdr-pocket create secret generic herdr-pocket-relay \
+#     --from-literal=POCKET_PUBLIC_URL=https://pocket.example.com --from-literal=POCKET_ADMIN_TOKEN=$(openssl rand -hex 24)
+#   kubectl -n herdr-pocket apply -f deploy/k8s/relay.yaml
+# Then expose the Service through your ingress (WebSockets on /v1/ws, /v1/notify and /v1/assistant/live must pass).
+# Exactly one replica: devices, agents and pending calls live in that one process.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: herdr-pocket-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: herdr-pocket-relay
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: herdr-pocket-relay
+  template:
+    metadata:
+      labels:
+        app: herdr-pocket-relay
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+      containers:
+        - name: relay
+          image: ghcr.io/crosery/herdr-pocket-relay:latest
+          ports:
+            - containerPort: 7420
+              name: http
+          env:
+            - name: POCKET_TRUST_PROXY
+              value: "1"
+          envFrom:
+            - secretRef:
+                name: herdr-pocket-relay
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: herdr-pocket-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: herdr-pocket-relay
+spec:
+  selector:
+    app: herdr-pocket-relay
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

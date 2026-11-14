@@ -1,0 +1,134 @@
+import "./styles/base.css";
+import "./styles/sections.css";
+import "./styles/phone.css";
+
+import { gsap } from "gsap";
+import { ScrollTrigger } from "gsap/ScrollTrigger";
+import Lenis from "lenis";
+import { initI18n, setLang, getLang, onLang } from "./i18n";
+import { initHero } from "./hero";
+import { initFlow } from "./flow";
+import {
+  initMarquee,
+  initStatement,
+  initViews,
+  initAssistant,
+  initCall,
+  initCommands,
+  initBento,
+  initReveal,
+  initFaq,
+  initVideo,
+  initNav,
+  wrapTitleLines,
+} from "./sections";
+import { $, reducedMotion } from "./util";
+
+gsap.registerPlugin(ScrollTrigger);
+document.documentElement.classList.add("js");
+
+initI18n();
+
+// ---- smooth scrolling (skipped for reduced motion)
+let lenis: Lenis | null = null;
+if (!reducedMotion()) {
+  lenis = new Lenis({ lerp: 0.1, smoothWheel: true, anchors: { offset: -72 } });
+  lenis.on("scroll", ScrollTrigger.update);
+  gsap.ticker.add((time) => lenis!.raf(time * 1000));
+  gsap.ticker.lagSmoothing(0);
+}
+
+// ---- theme + language toggles
+const themeMeta = () => document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]');
+$("#theme-toggle")!.addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try {
+    localStorage.setItem("hp-theme", next);
+  } catch {}
+  themeMeta().forEach((m) => (m.content = next === "dark" ? "#1C1722" : "#FFF6F9"));
+});
+$("#lang-toggle")!.addEventListener("click", () => setLang(getLang() === "zh" ? "en" : "zh"));
+
+// ---- hero title intro
+const title = $(".hero-title")!;
+const animateTitle = (first: boolean) => {
+  const lines = wrapTitleLines(title);
+  if (!first || reducedMotion()) return;
+  gsap.from(lines, { yPercent: 110, duration: 1.1, ease: "expo.out", stagger: 0.12, delay: 0.1 });
+  gsap.from([".hero-pill", ".hero-sub", ".hero-ctas", ".hero-cmd"], {
+    y: 24,
+    opacity: 0,
+    duration: 0.9,
+    ease: "power3.out",
+    stagger: 0.08,
+    delay: 0.35,
+  });
+  gsap.from("#stage", { scale: 0.86, opacity: 0, duration: 1.3, ease: "expo.out", delay: 0.2 });
+};
+animateTitle(true);
+onLang(() => animateTitle(false));
+
+initNav();
+initHero();
+initMarquee();
+initStatement();
+initFlow(lenis);
+initViews();
+initAssistant();
+initCall();
+initCommands();
+initBento();
+initReveal();
+initFaq();
+initVideo();
+
+// ---- section headings: soft rise on enter
+if (!reducedMotion()) {
+  gsap.utils.toArray<HTMLElement>(".h2, .eyebrow, .lead").forEach((el) => {
+    if (el.closest(".flow-pin") || el.closest(".hero")) return;
+    gsap.from(el, {
+      y: 30,
+      opacity: 0,
+      duration: 1,
+      ease: "power3.out",
+      scrollTrigger: { trigger: el, start: "top 88%", once: true },
+    });
+  });
+  // the hero copy drifts up and fades as you leave
+  gsap.to(".hero-copy", {
+    yPercent: -12,
+    opacity: 0.2,
+    ease: "none",
+    scrollTrigger: { trigger: ".hero", start: "top top", end: "bottom top", scrub: true },
+  });
+  gsap.to("#stage", {
+    yPercent: 10,
+    scale: 0.94,
+    ease: "none",
+    scrollTrigger: { trigger: ".hero", start: "top top", end: "bottom top", scrub: true },
+  });
+}
+
+// ---- the 3D background loads after first paint, only where it makes sense
+const canWebGL = (() => {
+  try {
+    const c = document.createElement("canvas");
+    return !!(c.getContext("webgl2") || c.getContext("webgl"));
+  } catch {
+    return false;
+  }
+})();
+const saveData = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData;
+if (canWebGL && !reducedMotion() && !saveData) {
+  const start = () =>
+    import("./hero3d")
+      .then((m) => m.startHero3D($("#hero-canvas")!))
+      .catch((e) => console.warn("hero 3D disabled:", e));
+  const idle = (window as Window & { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => void }).requestIdleCallback;
+  if (document.readyState === "complete") (idle ? idle(start, { timeout: 1200 }) : setTimeout(start, 300));
+  else window.addEventListener("load", () => (idle ? idle(start, { timeout: 1200 }) : setTimeout(start, 300)), { once: true });
+}
+
+window.addEventListener("load", () => ScrollTrigger.refresh());
+document.fonts?.ready.then(() => ScrollTrigger.refresh());

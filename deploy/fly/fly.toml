@@ -1,0 +1,42 @@
+# Fly.io: one relay machine with a volume for the SQLite database (docs/deploy/fly.md).
+#   fly launch --config deploy/fly/fly.toml --copy-config --no-deploy --ha=false
+#   fly volumes create herdr_pocket_data --size 1 --config deploy/fly/fly.toml
+#   fly secrets set POCKET_PUBLIC_URL=https://<your app>.fly.dev --config deploy/fly/fly.toml
+#   fly deploy --config deploy/fly/fly.toml
+# Keep exactly one machine: devices, agents and pending calls live in that one process.
+app = "herdr-pocket-relay-example"
+primary_region = "nrt"
+
+[build]
+  image = "ghcr.io/crosery/herdr-pocket-relay:latest"
+
+[env]
+  POCKET_TRUST_PROXY = "1"
+
+[mounts]
+  source = "herdr_pocket_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 7420
+  force_https = true
+  # Computers hold a WebSocket open all the time; never stop the machine.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 500
+    hard_limit = 1000
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    method = "GET"
+    path = "/v1/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

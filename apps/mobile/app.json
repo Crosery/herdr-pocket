@@ -1,0 +1,84 @@
+{
+  "expo": {
+    "name": "Herdr Pocket",
+    "slug": "herdr-pocket",
+    "scheme": "herdrpocket",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/brand/icon-1024.png",
+    "userInterfaceStyle": "automatic",
+    "backgroundColor": "#FEE9F2",
+    "android": {
+      "package": "dev.crosery.herdrpocket",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/brand/adaptive-foreground.png",
+        "backgroundColor": "#FEE9F2"
+      },
+      "predictiveBackGestureEnabled": false,
+      "softwareKeyboardLayoutMode": "resize",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.REQUEST_INSTALL_PACKAGES"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "data": [
+            {
+              "scheme": "herdrpocket"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar",
+      "expo-secure-store",
+      [
+        "expo-font",
+        {
+          "fonts": [
+            "./assets/fonts/MapleMono-Regular.ttf",
+            "./assets/fonts/MapleMono-Bold.ttf"
+          ]
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "扫描电脑或服务器上显示的配对二维码",
+          "recordAudioAndroid": false,
+          "microphonePermission": "和助理语音通话时使用麦克风"
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/brand/logo.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#FEE9F2",
+          "dark": {
+            "image": "./assets/brand/logo.png",
+            "backgroundColor": "#1E1A26"
+          }
+        }
+      ],
+      "./plugins/withCleartext",
+      "./plugins/withAndroidBuild"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "platforms": [
+      "android"
+    ]
+  }
+}

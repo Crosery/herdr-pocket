@@ -1,0 +1,21 @@
+[Unit]
+Description=Herdr Pocket relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=herdr-pocket
+WorkingDirectory=/opt/herdr-pocket
+EnvironmentFile=/etc/herdr-pocket/relay.env
+ExecStart=/usr/bin/node --no-warnings apps/relay/src/main.ts
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/herdr-pocket
+
+[Install]
+WantedBy=multi-user.target

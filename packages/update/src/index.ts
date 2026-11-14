@@ -1,0 +1,533 @@
+// Version, release lookup and in-place updates for the relay and the host CLI.
+//
+// An install made by scripts/install-relay.sh or scripts/install-host.sh looks like
+//   <root>/releases/<version>/            one unpacked copy per version
+//   <root>/current  -> releases/<version>  what the service runs
+//   <root>/previous -> releases/<version>  the copy before the last update, for rollback
+// An update unpacks the new copy next to the old one, checks that it starts, then swaps
+// the `current` link in one rename, so a failed update leaves the running copy untouched.
+
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  accessSync,
+  constants,
+  copyFileSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
+import { RELEASE_REPO, apkAssetName } from "@herdr-pocket/protocol";
+
+/** The GitHub repository releases come from (set once in the protocol package); HERDR_POCKET_REPO overrides it. */
+export const DEFAULT_REPO = RELEASE_REPO;
+
+/** Root of this copy: the folder with the workspace package.json. */
+export const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+
+/** One version for relay, host and app: the root package.json, stamped by the release workflow. */
+export const VERSION = readVersion(APP_ROOT);
+
+/** Release asset names. .github/workflows/release.yml and the app's updater use the same ones. */
+export const ASSETS = {
+  bundle: (version: string) => `herdr-pocket-${version}.tar.gz`,
+  apk: apkAssetName,
+  checksums: "SHA256SUMS",
+};
+
+export const SERVICES = {
+  hostLaunchd: "com.herdr-pocket.hostd",
+  hostSystemd: "herdr-pocket-hostd.service",
+  relaySystemd: "herdr-pocket-relay.service",
+} as const;
+
+export type Service = "host" | "relay";
+
+export function readVersion(root: string): string {
+  try {
+    const v = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+    return typeof v === "string" && v ? v : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+export const repo = (): string => process.env.HERDR_POCKET_REPO || DEFAULT_REPO;
+const apiBase = (): string => (process.env.HERDR_POCKET_API || "https://api.github.com").replace(/\/+$/, "");
+const UA = "herdr-pocket-updater";
+
+/** Semver order; a pre-release sorts before its release. Returns -1, 0 or 1. */
+export function compareVersions(a: string, b: string): number {
+  const split = (v: string) => {
+    const s = v.trim().replace(/^v/i, "").split("+")[0]!;
+    const dash = s.indexOf("-");
+    const core = dash < 0 ? s : s.slice(0, dash);
+    return { nums: core.split(".").map((n) => Number.parseInt(n, 10) || 0), pre: dash < 0 ? "" : s.slice(dash + 1) };
+  };
+  const x = split(a);
+  const y = split(b);
+  for (let i = 0; i < 3; i++) {
+    const d = (x.nums[i] ?? 0) - (y.nums[i] ?? 0);
+    if (d) return Math.sign(d);
+  }
+  if (x.pre === y.pre) return 0;
+  if (!x.pre) return 1;
+  if (!y.pre) return -1;
+  return Math.sign(x.pre.localeCompare(y.pre, "en", { numeric: true }));
+}
+
+// ---------------------------------------------------------------------------
+// Releases
+// ---------------------------------------------------------------------------
+
+export interface Release {
+  version: string;
+  tag: string;
+  page: string;
+  /** Download URL by asset name. */
+  assets: Record<string, string>;
+  /** GitHub's source tarball of the tag, used when the bundle asset is missing. */
+  tarball: string;
+}
+
+/** The newest published release (GitHub skips drafts and pre-releases here). */
+export async function latestRelease(): Promise<Release> {
+  const url = `${apiBase()}/repos/${repo()}/releases/latest`;
+  const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": UA };
+  // A token only raises GitHub's rate limit; it never goes to a custom API address.
+  if (process.env.GITHUB_TOKEN && !process.env.HERDR_POCKET_API) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) }).catch((e: Error) => {
+    const cause = (e.cause as Error | undefined)?.message ?? e.message;
+    throw new Error(`could not reach ${apiBase()} (${cause})`);
+  });
+  if (res.status === 404) throw new Error(`no published release found for ${repo()}`);
+  if (!res.ok) throw new Error(`GitHub answered ${res.status} for ${url}`);
+  const j = (await res.json()) as {
+    tag_name?: string;
+    html_url?: string;
+    tarball_url?: string;
+    assets?: { name: string; browser_download_url: string }[];
+  };
+  if (!j.tag_name) throw new Error("GitHub returned a release without a tag");
+  return {
+    version: j.tag_name.replace(/^v/i, ""),
+    tag: j.tag_name,
+    page: j.html_url ?? `https://github.com/${repo()}/releases`,
+    assets: Object.fromEntries((j.assets ?? []).map((a) => [a.name, a.browser_download_url])),
+    tarball: j.tarball_url ?? `${apiBase()}/repos/${repo()}/tarball/${j.tag_name}`,
+  };
+}
+
+export interface Check {
+  current: string;
+  latest: Release;
+  newer: boolean;
+}
+
+export async function checkForUpdate(current = VERSION): Promise<Check> {
+  const latest = await latestRelease();
+  return { current, latest, newer: compareVersions(latest.version, current) > 0 };
+}
+
+/**
+ * Log a line when a newer release exists: first about a minute after start, then once a day.
+ * HERDR_POCKET_UPDATE_CHECK=0 turns it off. Failures (offline, rate limit) stay quiet.
+ */
+export function watchForUpdates(log: (msg: string) => void, command: string, timing: { firstMs?: number; everyMs?: number } = {}): () => void {
+  if (/^(0|false|off|no)$/i.test(process.env.HERDR_POCKET_UPDATE_CHECK ?? "")) return () => {};
+  const check = () =>
+    checkForUpdate().then(
+      (c) => {
+        if (c.newer) log(`version ${c.latest.version} is out (this is ${c.current}): run \`${command}\` · ${c.latest.page}`);
+      },
+      () => {},
+    );
+  const first = setTimeout(check, timing.firstMs ?? 60_000);
+  const every = setInterval(check, timing.everyMs ?? 24 * 3600_000);
+  first.unref();
+  every.unref();
+  return () => {
+    clearTimeout(first);
+    clearInterval(every);
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Install layout
+// ---------------------------------------------------------------------------
+
+export interface Layout {
+  root: string;
+}
+
+/** The managed install this code runs from, or an error that says how this copy is updated instead. */
+export function findLayout(appRoot = APP_ROOT): Layout {
+  const releases = dirname(appRoot);
+  const root = dirname(releases);
+  if (basename(releases) === "releases" && isLink(join(root, "current"))) return { root };
+  if (process.env.HERDR_POCKET_INSTALL === "docker") {
+    throw new Error("this copy runs in Docker: update it with `docker compose pull && docker compose up -d` in its folder (`herdr-pocket-relay update` on the server does that).");
+  }
+  if (existsSync(join(appRoot, ".git"))) throw new Error(`${appRoot} is a git checkout: update it with \`git pull && pnpm install\`.`);
+  throw new Error(`${appRoot} was not installed by the install script, so it can't update itself. Run the install script again (docs/deploy).`);
+}
+
+export interface UpdateOptions {
+  service: Service;
+  /** A bundle file or URL to install instead of the latest release. */
+  from?: string;
+  /** Reinstall even when the latest release is not newer. */
+  force?: boolean;
+  /** Restart the service that runs this install (default true). */
+  restart?: boolean;
+  log?: (msg: string) => void;
+  layout?: Layout;
+}
+
+export interface UpdateResult {
+  from: string;
+  to: string;
+  changed: boolean;
+  restarted?: string;
+}
+
+export async function update(o: UpdateOptions): Promise<UpdateResult> {
+  const log = o.log ?? ((m: string) => console.log(m));
+  const { root } = o.layout ?? findLayout();
+  const current = readVersion(join(root, "current"));
+  mustWrite(root, o.service);
+
+  let src: { url: string; version?: string; sha256?: string; kind: "bundle" | "source" };
+  if (o.from) {
+    src = { url: o.from, kind: "bundle" };
+  } else {
+    const rel = await latestRelease();
+    if (compareVersions(rel.version, current) <= 0 && !o.force) return { from: current, to: rel.version, changed: false };
+    const name = ASSETS.bundle(rel.version);
+    const url = rel.assets[name];
+    if (url) {
+      const sums = rel.assets[ASSETS.checksums];
+      const sha256 = sums ? sumFor(await fetchText(sums), name) : undefined;
+      if (sums && !sha256) throw new Error(`${ASSETS.checksums} of ${rel.tag} has no line for ${name}`);
+      src = { url, version: rel.version, sha256, kind: "bundle" };
+    } else {
+      src = { url: rel.tarball, version: rel.version, kind: "source" };
+    }
+  }
+
+  const unlock = lock(root);
+  const work = mkdtempSync(join(root, ".update-"));
+  try {
+    const file = join(work, "download.tar.gz");
+    log(`downloading ${src.version ?? ""} ${src.url}`.replace(/\s+/, " "));
+    await fetchTo(src.url, file);
+    if (src.sha256) {
+      const got = await sha256(file);
+      if (got !== src.sha256) throw new Error(`checksum mismatch for ${basename(src.url)}: expected ${src.sha256}, got ${got}`);
+    }
+    const dir = join(work, "app");
+    mkdirSync(dir);
+    // --no-same-owner: files belong to whoever updates (root for the relay), never to the CI runner's uid.
+    run("tar", ["-xzf", file, "-C", dir, "--strip-components=1", "--no-same-owner", "--exclude=*/apps/mobile", "--exclude=*/docs"]);
+    const version = src.version ?? readVersion(dir);
+    if (src.kind === "source") {
+      stampVersion(dir, version);
+      pnpmInstall(dir, log);
+    } else if (src.version && readVersion(dir) !== src.version) {
+      throw new Error(`the download says it is ${readVersion(dir)}, expected ${src.version}`);
+    }
+    smokeTest(dir, o.service, version);
+
+    const name = freeReleaseName(root, version);
+    const target = join(root, "releases", name);
+    rmSync(target, { recursive: true, force: true });
+    renameSync(dir, target);
+    const before = readLink(join(root, "current"));
+    setLink(root, "current", `releases/${name}`);
+    if (before && before !== `releases/${name}`) setLink(root, "previous", before);
+    prune(root, work);
+    log(`installed ${version} (was ${current})`);
+    const restarted = o.restart === false ? undefined : restartService(o.service, root, log);
+    return { from: current, to: version, changed: true, restarted };
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+    unlock();
+  }
+}
+
+/** Swap back to the copy before the last update. */
+export function rollback(o: Omit<UpdateOptions, "from" | "force">): UpdateResult {
+  const log = o.log ?? ((m: string) => console.log(m));
+  const { root } = o.layout ?? findLayout();
+  mustWrite(root, o.service);
+  const prev = readLink(join(root, "previous"));
+  const cur = readLink(join(root, "current"));
+  if (!prev || !cur || !existsSync(join(root, prev))) throw new Error("there is no earlier version to go back to");
+  const from = readVersion(join(root, "current"));
+  const to = readVersion(join(root, prev));
+  const unlock = lock(root);
+  try {
+    setLink(root, "current", prev);
+    setLink(root, "previous", cur);
+  } finally {
+    unlock();
+  }
+  log(`switched back to ${to} (was ${from})`);
+  const restarted = o.restart === false ? undefined : restartService(o.service, root, log);
+  return { from, to, changed: true, restarted };
+}
+
+/**
+ * Restart the service that runs this install: the launchd agent or systemd unit written by the
+ * install script, recognised by its file naming this install's folder. Anything else is left alone.
+ */
+export function restartService(service: Service, root: string, log: (msg: string) => void): string | undefined {
+  let file: string;
+  let commands: string[][];
+  let name: string;
+  if (service === "relay") {
+    name = SERVICES.relaySystemd;
+    file = `/etc/systemd/system/${name}`;
+    commands = [["systemctl", "restart", name]];
+  } else if (process.platform === "darwin") {
+    name = SERVICES.hostLaunchd;
+    file = join(homedir(), "Library", "LaunchAgents", `${name}.plist`);
+    const domain = `gui/${process.getuid?.() ?? 501}`;
+    // kickstart restarts a loaded agent; bootstrap loads one that is not.
+    commands = [
+      ["launchctl", "kickstart", "-k", `${domain}/${name}`],
+      ["launchctl", "bootstrap", domain, file],
+    ];
+  } else {
+    name = SERVICES.hostSystemd;
+    file = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "systemd", "user", name);
+    commands = [["systemctl", "--user", "restart", name]];
+  }
+  if (!fileMentions(file, root)) {
+    log(`no ${name} service runs ${root}; restart it yourself to use the new version`);
+    return undefined;
+  }
+  let last = "";
+  for (const [cmd, ...args] of commands) {
+    const r = spawnSync(cmd!, args, { encoding: "utf8" });
+    if (r.status === 0) {
+      log(`restarted ${name}`);
+      return name;
+    }
+    last = (r.stderr || r.error?.message || `exit ${r.status}`).trim();
+  }
+  log(`could not restart ${name} (${last}). Run: ${commands[0]!.join(" ")}`);
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// CLI commands shared by `herdr-pocket` and `herdr-pocket-relay`
+// ---------------------------------------------------------------------------
+
+export interface CommandInfo {
+  service: Service;
+  /** The command name users type, for messages. */
+  bin: string;
+}
+
+export const UPDATE_HELP = `  version [--check]   Print the version; --check also asks GitHub for the latest release.
+  update [--check] [--rollback] [--from <file|url>] [--force] [--no-restart]
+        Install the latest GitHub release next to this one, switch to it and restart the
+        service. --rollback switches back to the copy before the last update.`;
+
+export async function versionCommand(argv: string[], info: CommandInfo): Promise<void> {
+  const { values } = parseArgs({ args: argv, options: { check: { type: "boolean", default: false } } });
+  console.log(`${info.bin} ${VERSION}`);
+  if (values.check) await printCheck(info);
+}
+
+export async function updateCommand(argv: string[], info: CommandInfo): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      check: { type: "boolean", default: false },
+      rollback: { type: "boolean", default: false },
+      from: { type: "string" },
+      force: { type: "boolean", default: false },
+      "no-restart": { type: "boolean", default: false },
+    },
+  });
+  if (values.check) {
+    console.log(`${info.bin} ${VERSION}`);
+    return printCheck(info);
+  }
+  const restart = !values["no-restart"];
+  const r = values.rollback
+    ? rollback({ service: info.service, restart })
+    : await update({ service: info.service, from: values.from, force: values.force, restart });
+  if (!r.changed) console.log(`already up to date (${r.from}; latest release ${r.to})`);
+  else console.log(`✓ ${r.from} → ${r.to}${r.restarted ? ` · restarted ${r.restarted}` : ""}`);
+}
+
+async function printCheck(info: CommandInfo): Promise<void> {
+  const c = await checkForUpdate();
+  if (c.newer) console.log(`newer release: ${c.latest.version} · ${c.latest.page}\nrun \`${info.bin} update\``);
+  else console.log(`up to date (latest release ${c.latest.version})`);
+}
+
+// ---------------------------------------------------------------------------
+
+function isLink(p: string): boolean {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function readLink(p: string): string | undefined {
+  try {
+    return readlinkSync(p);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Replace a symlink in one rename, so readers see the old or the new target, never none. */
+function setLink(root: string, name: string, target: string): void {
+  const tmp = join(root, `.${name}.${process.pid}`);
+  rmSync(tmp, { force: true });
+  symlinkSync(target, tmp);
+  renameSync(tmp, join(root, name));
+}
+
+function freeReleaseName(root: string, version: string): string {
+  const inUse = new Set([readLink(join(root, "current")), readLink(join(root, "previous"))].map((l) => l && basename(l)));
+  return inUse.has(version) ? `${version}+${Date.now().toString(36)}` : version;
+}
+
+/** Keep only the current and previous copies; drop leftovers of interrupted updates. */
+function prune(root: string, work: string): void {
+  const keep = new Set([readLink(join(root, "current")), readLink(join(root, "previous"))].map((l) => l && basename(l)));
+  for (const name of readdirSync(join(root, "releases"))) {
+    if (!keep.has(name)) rmSync(join(root, "releases", name), { recursive: true, force: true });
+  }
+  for (const name of readdirSync(root)) {
+    if (name.startsWith(".update-") && join(root, name) !== work) rmSync(join(root, name), { recursive: true, force: true });
+  }
+}
+
+function lock(root: string): () => void {
+  const p = join(root, ".update.lock");
+  try {
+    mkdirSync(p);
+  } catch {
+    let age = Infinity;
+    try {
+      age = Date.now() - statSync(p).mtimeMs;
+    } catch {}
+    if (age < 30 * 60_000) throw new Error(`another update is running (${p}); delete that folder if it is not`);
+    rmSync(p, { recursive: true, force: true });
+    mkdirSync(p);
+  }
+  return () => rmSync(p, { recursive: true, force: true });
+}
+
+function mustWrite(root: string, service: Service): void {
+  try {
+    accessSync(root, constants.W_OK);
+  } catch {
+    throw new Error(`can't write to ${root}${service === "relay" ? ": run it with sudo" : ""}`);
+  }
+}
+
+function fileMentions(file: string, text: string): boolean {
+  try {
+    return readFileSync(file, "utf8").includes(text);
+  } catch {
+    return false;
+  }
+}
+
+function run(cmd: string, args: string[], cwd?: string): void {
+  const r = spawnSync(cmd, args, { cwd, encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`${cmd} failed: ${(r.stderr || r.error?.message || `exit ${r.status}`).trim().slice(0, 400)}`);
+}
+
+async function fetchTo(src: string, file: string): Promise<void> {
+  if (!/^https?:\/\//i.test(src)) {
+    copyFileSync(resolve(src.replace(/^file:\/\//i, "")), file);
+    return;
+  }
+  const res = await fetch(src, { headers: { "User-Agent": UA, Accept: "application/octet-stream" }, signal: AbortSignal.timeout(10 * 60_000) });
+  if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status} for ${src}`);
+  await pipeline(Readable.fromWeb(res.body as never), createWriteStream(file));
+}
+
+async function fetchText(url: string): Promise<string> {
+  const res = await fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(30_000) });
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
+  return res.text();
+}
+
+/** The hash for one file in a `sha256sum` listing. */
+export function sumFor(listing: string, name: string): string | undefined {
+  for (const line of listing.split("\n")) {
+    const m = /^([0-9a-f]{64})\s+\*?(.+?)\s*$/i.exec(line);
+    if (m && basename(m[2]!) === name) return m[1]!.toLowerCase();
+  }
+  return undefined;
+}
+
+async function sha256(file: string): Promise<string> {
+  const h = createHash("sha256");
+  await pipeline(createReadStream(file), h);
+  return h.digest("hex");
+}
+
+function stampVersion(dir: string, version: string): void {
+  const p = join(dir, "package.json");
+  const pkg = JSON.parse(readFileSync(p, "utf8"));
+  pkg.version = version;
+  writeFileSync(p, `${JSON.stringify(pkg, null, 2)}\n`);
+}
+
+/** Source tarballs come without node_modules: install the production deps of relay and host. */
+function pnpmInstall(dir: string, log: (msg: string) => void): void {
+  const args = ["install", "--prod", "--frozen-lockfile", "--ignore-scripts", "--filter", "@herdr-pocket/relay...", "--filter", "@herdr-pocket/hostd..."];
+  log("installing dependencies with pnpm");
+  for (const pre of [["pnpm"], ["corepack", "pnpm"], ["npx", "--yes", "pnpm"]]) {
+    const r = spawnSync(pre[0]!, [...pre.slice(1), ...args], { cwd: dir, stdio: ["ignore", "inherit", "inherit"] });
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") continue;
+    if (r.status === 0) return;
+    throw new Error("pnpm install failed; nothing was changed");
+  }
+  throw new Error("this release has no prebuilt bundle and pnpm is not installed (npm i -g pnpm)");
+}
+
+/** Start the new copy once before switching to it, so missing files or deps never reach the service. */
+function smokeTest(dir: string, service: Service, version: string): void {
+  const args = service === "host" ? [join(dir, "apps/hostd/src/cli.ts"), "--version"] : [join(dir, "apps/relay/src/cli.ts"), "selftest"];
+  const r = spawnSync(process.execPath, ["--no-warnings", ...args], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { ...process.env, HERDR_POCKET_UPDATE_CHECK: "0" },
+  });
+  const out = (r.stdout ?? "").trim();
+  if (r.status !== 0 || out !== version) {
+    const why = r.error?.message ?? (r.stderr || out || `exit ${r.status}`).trim().slice(0, 400);
+    throw new Error(`the new copy did not start (${why}); nothing was changed`);
+  }
+}

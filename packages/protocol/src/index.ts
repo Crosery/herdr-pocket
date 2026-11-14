@@ -1,0 +1,889 @@
+/**
+ * herdr-pocket wire protocol, v1.
+ *
+ * Three parties:
+ *   - relay  : the server every device registers with (e.g. a small VPS)
+ *   - host   : a computer running herdr (GUI `hc` core and/or TUI `herdr`), via `hostd`
+ *   - viewer : a phone (or any client) that watches and drives agents
+ *
+ * A host is also allowed to call other hosts, so computers can drive each other's
+ * agents through the relay ("joint debugging").
+ *
+ * Versioning follows Uniflo's rule: v1 only gains optional fields and new
+ * `type` / `kind` values. Clients must ignore what they don't recognise.
+ */
+
+export const PROTOCOL_VERSION = 1;
+
+// ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+
+export type DeviceKind = "host" | "viewer";
+
+export interface Device {
+  id: string;
+  name: string;
+  kind: DeviceKind;
+  platform?: string; // darwin | linux | ios | android | ...
+  online: boolean;
+  createdAt: number; // epoch ms
+  lastSeenAt: number; // epoch ms
+  /** Agent sources a host can bridge, e.g. ["hc", "herdr", "uniflo"]. */
+  sources?: AgentSource[];
+  version?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Agents (unified view over herdr-core terminals and herdr TUI agents)
+// ---------------------------------------------------------------------------
+
+/** Where the agent lives on its host. */
+export type AgentSource = "hc" | "herdr" | "uniflo";
+
+/**
+ * Unified status. Superset of herdr (`idle|working|blocked|done|unknown`) and
+ * herdr-core status; Uniflo `work` maps to `working`.
+ */
+export type AgentStatus = "working" | "blocked" | "done" | "idle" | "unknown";
+
+export interface Agent {
+  /** Globally unique: `<deviceId>/<source>:<localId>`. */
+  key: string;
+  deviceId: string;
+  source: AgentSource;
+  /** Address on the host: hc `t42`, herdr terminal id, ... */
+  localId: string;
+  /** Harness / program, e.g. claude-code, omp, codex, sh. */
+  harness: string;
+  /**
+   * Human title: the name given in herdr when there is one, else the Uniflo
+   * session title, else the terminal title.
+   */
+  title?: string;
+  /** Name given to the terminal in herdr (e.g. `hc run --name`); also used as `title`. */
+  name?: string;
+  /** "space / tab" location in the herdr GUI, with the names the desktop app shows. */
+  where?: string;
+  cwd?: string;
+  status: AgentStatus;
+  statusSince?: number;
+  turn?: number;
+  /** True for plain shells; the app hides them by default. */
+  isShell: boolean;
+  /** Matching Uniflo session key, when found (enables the chat view). */
+  sessionKey?: string;
+  model?: string;
+  /** First human prompt of the matched session. */
+  preview?: string;
+  costUsd?: number;
+  contextTokens?: number;
+  contextLimit?: number;
+  /** Subagent sessions spawned by the matched session (Uniflo `parent`). */
+  subagents?: number;
+  subagentsWorking?: number;
+  /**
+   * Messages typed into it while it was busy that its program has not taken
+   * yet (Claude Code and the like hold them in the input box until the turn
+   * ends). Absent or 0 when nothing is waiting.
+   */
+  queued?: number;
+  /** The oldest waiting message, clipped. */
+  queuedText?: string;
+  /** When the oldest waiting message was typed in (epoch ms). */
+  queuedSince?: number;
+  updatedAt: number;
+}
+
+/** A space in the desktop herdr app on one computer. */
+export interface SpaceInfo {
+  id: string;
+  name: string;
+  /** Folder its terminals started in. */
+  folder?: string;
+  tabs: number;
+  terminals: number;
+}
+
+/** A program the phone may start on a computer (picked by id, never a command line). */
+export interface LaunchOption {
+  id: string;
+  label: string;
+  /**
+   * Whether a first message can be given at start (on its command line). Hosts
+   * with `typesTask` (spaces.list) also take a task for the others, except the
+   * shell: they type it in once the program is up.
+   */
+  takesTask: boolean;
+}
+
+/**
+ * What became of the first task given to agent.create: `started` went in with
+ * the program, `typed` was typed in once it was up, `failed` did not reach it
+ * (`taskNote` says why; the agent is open and idle).
+ */
+export type FirstTask = "started" | "typed" | "failed";
+
+/** The desktop herdr app's layout on one computer: spaces -> tabs -> terminals. */
+export interface LayoutSpace {
+  id: string;
+  name: string;
+  folder?: string;
+  /** The space the desktop window shows now. */
+  active: boolean;
+  tabs: LayoutTab[];
+}
+
+export interface LayoutTab {
+  id: string;
+  name: string;
+  active: boolean;
+  /** Put away: out of the lists, still running. */
+  settled: boolean;
+  terminals: LayoutTerminal[];
+}
+
+export interface LayoutTerminal {
+  /** hc address, e.g. t42. */
+  terminal: string;
+  pane?: string;
+  /** Key of the published agent, when this terminal is one. */
+  agent?: string;
+  title?: string;
+  harness?: string;
+  status?: AgentStatus;
+}
+
+/**
+ * Desktop herdr commands a computer accepts over rpc (`herdr.command`), with the
+ * arguments each takes. `confirm`: it ends or starts programs, so the assistant
+ * asks first; the others only change the layout and can be undone.
+ * Ids come from `herdr.layout`. Nothing here takes a command line.
+ */
+export const HERDR_COMMANDS = {
+  "space.rename": { confirm: false, args: ["id", "name"], about: "给空间改名；name 为空字符串时恢复成按文件夹自动命名" },
+  "space.move": { confirm: false, args: ["id", "index"], about: "把空间移到第 index 位，1 是最前" },
+  "space.select": { confirm: false, args: ["id"], about: "让桌面窗口显示这个空间" },
+  "space.close": { confirm: true, args: ["id"], about: "关闭空间，并结束它里面的所有终端" },
+  "tab.rename": { confirm: false, args: ["id", "name"], about: "给标签改名；name 为空字符串时恢复成序号" },
+  "tab.move": { confirm: false, args: ["id", "index"], about: "把标签移到所在空间的第 index 位，1 是最前" },
+  "tab.select": { confirm: false, args: ["id"], about: "让桌面窗口显示这个标签" },
+  "tab.settle": { confirm: false, args: ["id"], about: "把标签收起来：不在列表里显示，但继续运行；里面的 agent 需要人时会自己回来" },
+  "tab.unsettle": { confirm: false, args: ["id"], about: "把收起的标签放回列表" },
+  "tab.close": { confirm: true, args: ["id"], about: "关闭标签，并结束它里面的终端" },
+  "pane.split": { confirm: true, args: ["pane", "direction", "launcher"], about: "把一个窗格向 right 或 down 分开，新窗格里开一个程序（launcher 是 list_launchers 里的 id，不填是普通终端）" },
+  "pane.close": { confirm: true, args: ["pane"], about: "关闭窗格，并结束它的终端" },
+  "pane.zoom": { confirm: false, args: ["pane"], about: "只显示这个窗格，或恢复显示全部" },
+  "pane.focus": { confirm: false, args: ["pane", "terminal"], about: "把焦点放到某个窗格，或显示某个终端的窗格" },
+  "terminal.pin": { confirm: false, args: ["terminal", "pinned"], about: "把 agent 置顶（pinned=true）或取消置顶（false）" },
+  "terminal.keep": { confirm: false, args: ["terminal", "place"], about: "给没有窗格的后台终端（比如子 agent）一个窗格：place 是 tab、right 或 down" },
+  "terminal.park": { confirm: false, args: ["terminal"], about: "收走终端的窗格，它在后台继续运行" },
+  "agent.focus": { confirm: false, args: ["terminal"], about: "在桌面窗口显示这个 agent" },
+} as const satisfies Record<string, { confirm: boolean; args: readonly string[]; about: string }>;
+
+export type HerdrCommand = keyof typeof HERDR_COMMANDS;
+
+/** A recorded agent session on one computer (Uniflo): any program, running or long finished. */
+export interface SessionInfo {
+  /** e.g. claude:<id>. */
+  key: string;
+  harness: string;
+  title?: string;
+  cwd?: string;
+  model?: string;
+  /** First prompt it was given. */
+  preview?: string;
+  status: "working" | "idle";
+  startedAt?: number;
+  updatedAt: number;
+  costUsd?: number;
+  steps?: number;
+  /** Parent session key, for a subagent. */
+  parent?: string;
+  /** Key of the live agent this session is open in, if any. */
+  agent?: string;
+}
+
+/** Full-text search result: one session and where the words were found in it. */
+export interface SessionHit {
+  session: string;
+  harness: string;
+  title?: string;
+  cwd?: string;
+  updatedAt: number;
+  hits: Array<{ event: string; kind: string; ts?: number; snippet: string }>;
+}
+
+/** Tokens and cost of one group (a program, model, folder or day). */
+export interface UsageRow {
+  key: string;
+  label: string;
+  sessions: number;
+  steps: number;
+  prompts: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  costUsd: number;
+}
+
+/** A subagent conversation spawned by an agent's session. */
+export interface SubSession {
+  key: string;
+  /** Session key of the direct parent (an agent's session or another subagent). */
+  parent: string;
+  /** tool_call id in the parent that spawned it, links the tool card to this child. */
+  parentCall?: string;
+  harness: string;
+  title?: string;
+  /** First prompt it was given: what it was asked to do. */
+  preview?: string;
+  model?: string;
+  status: "working" | "idle";
+  statusSince?: number;
+  startedAt?: number;
+  updatedAt: number;
+  costUsd?: number;
+  /** Its own subagents. */
+  children: number;
+}
+
+export function agentKey(deviceId: string, source: AgentSource, localId: string): string {
+  return `${deviceId}/${source}:${localId}`;
+}
+
+export function parseAgentKey(key: string): { deviceId: string; source: AgentSource; localId: string } | null {
+  const slash = key.indexOf("/");
+  if (slash <= 0) return null;
+  const rest = key.slice(slash + 1);
+  const colon = rest.indexOf(":");
+  if (colon <= 0) return null;
+  const source = rest.slice(0, colon) as AgentSource;
+  if (source !== "hc" && source !== "herdr" && source !== "uniflo") return null;
+  return { deviceId: key.slice(0, slash), source, localId: rest.slice(colon + 1) };
+}
+
+// ---------------------------------------------------------------------------
+// Conversation events (Uniflo schema v1 body, trimmed for the wire)
+// ---------------------------------------------------------------------------
+
+export type EventBody =
+  /** `injected`: harness-added blocks stripped from the text, shown folded. */
+  | { kind: "user_message"; text: string; synthetic?: boolean; injected?: string }
+  | { kind: "assistant_message"; text: string; model?: string }
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool_call"; call_id: string; name: string; input: unknown }
+  | { kind: "tool_result"; call_id: string; name?: string; output: string; is_error: boolean }
+  | { kind: "turn_start" }
+  | { kind: "turn_end"; reason?: string }
+  | { kind: "usage"; input?: number; output?: number; cost_usd?: number; model?: string }
+  /** Injected by the harness, not said by anyone. `summary` is the folded one-liner. */
+  | { kind: "system"; subtype?: string; text: string; summary?: string };
+
+export type ConvEvent = EventBody & {
+  id: string;
+  session: string;
+  ts: number;
+  pos?: string;
+  partial?: boolean;
+  truncated?: boolean;
+};
+
+// ---------------------------------------------------------------------------
+// RPC methods a host serves (callable by viewers and by other hosts)
+// ---------------------------------------------------------------------------
+
+export interface RpcMethods {
+  /** Full agent list of this host. */
+  "agents.list": { params: { includeShells?: boolean }; result: { agents: Agent[] } };
+  /** Screen + history as plain text. */
+  "terminal.read": {
+    params: { agent: string; lines?: number };
+    /**
+     * `text`: plain screen + history. `ansi`: the same rows with SGR colors
+     * only (no cursor moves), when the source can provide it; render it
+     * without wrapping at `cols` cells per row.
+     */
+    result: { text: string; ansi?: string; cols?: number; rows?: number; how?: string; complete?: boolean };
+  };
+  /** Paste text and press Enter (like `hc send`). */
+  "terminal.send": {
+    params: { agent: string; text: string; enter?: boolean };
+    /**
+     * Accepted into the ordered input queue; `position=0` means sent.
+     * `agentStatus`: the agent's status when the text arrived. `waiting`: it was
+     * in a turn, so its program holds the text until the turn ends (the agent's
+     * `queued` counts these). Older hosts send neither.
+     */
+    result: { ok: true; queueId?: string; position?: number; agentStatus?: AgentStatus; waiting?: boolean };
+  };
+  /** Press keys: enter, esc, up, down, tab, ctrl+c, y, n ... */
+  "terminal.keys": { params: { agent: string; keys: string[] }; result: { ok: true } };
+  /**
+   * Type into the terminal as the person at it would, at once: UTF-8 text with
+   * control bytes ("\r" Enter, "\x7f" Backspace). No queue, no Enter added.
+   * Hosts before this call answer `unsupported`; fall back to `terminal.send`.
+   */
+  "terminal.input": { params: { agent: string; data: string }; result: { ok: true } };
+  /** Conversation of the agent's matched Uniflo session, newest last. */
+  "session.events": {
+    /** `sub`: read a subagent session of this agent instead (from `session.children`). */
+    params: { agent: string; sub?: string; limit?: number; before?: string };
+    /** `nextBefore`: pass as `before` to load the previous page (null when none). */
+    result: { sessionKey: string | null; events: ConvEvent[]; more: boolean; nextBefore?: string | null };
+  };
+  /** Subagent sessions under the agent's session (or under `sub`), newest first. */
+  "session.children": { params: { agent: string; sub?: string }; result: { sessions: SubSession[] } };
+  /** What can be created on this computer: spaces, programs, suggested folders. */
+  "spaces.list": {
+    params: Record<string, never>;
+    /** `canCreate` false with `reason` when the desktop herdr window is closed or the host is read-only. */
+    result: {
+      spaces: SpaceInfo[];
+      launchers: LaunchOption[];
+      folders: string[];
+      canCreate: boolean;
+      reason?: string;
+      /** This host types a first task into programs that take none at start (agent.create waits for that, up to about a minute). */
+      typesTask?: boolean;
+    };
+  };
+  /**
+   * Starts an agent: in a new tab of `space`, or (no `space`) in a new space
+   * named `spaceName` (empty: named after its folder). Shown at once in the desktop app.
+   */
+  "agent.create": {
+    params: { space?: string; spaceName?: string; tabName?: string; folder?: string; launcher: string; task?: string };
+    result: { agent: string; space: string; terminal: string; task?: FirstTask; taskNote?: string };
+  };
+  "host.info": {
+    params: Record<string, never>;
+    result: { name: string; platform: string; sources: AgentSource[]; version: string; hcVersion?: string };
+  };
+  /**
+   * The person looked at this agent: a finished turn stops counting as "done"
+   * here and in the desktop app (herdr keeps this on the terminal for every client).
+   */
+  "agent.seen": { params: { agent: string }; result: { ok: true } };
+  /** Press the stop key (like `hc interrupt`); `report` says what happened. */
+  "terminal.interrupt": { params: { agent: string }; result: { ok: true; report?: string } };
+  /** End the terminal and its sub-agents. */
+  "terminal.kill": { params: { agent: string }; result: { ok: true } };
+  /** Spaces, tabs and terminals as the desktop herdr window shows them. */
+  "herdr.layout": { params: Record<string, never>; result: { spaces: LayoutSpace[] } };
+  /** One of `HERDR_COMMANDS` with its arguments. */
+  "herdr.command": { params: { command: HerdrCommand; args?: Record<string, unknown> }; result: { ok: true; result?: unknown } };
+  /**
+   * Recorded sessions on this computer, newest first. `q` is Uniflo's filter
+   * (`h:claude s:work in:<folder> since:2d` and free words). Assistant only.
+   */
+  "sessions.list": { params: { q?: string; limit?: number }; result: { sessions: SessionInfo[] } };
+  /** Full-text search over every session's transcript. Assistant only. */
+  "sessions.search": { params: { q: string; limit?: number }; result: { total: number; results: SessionHit[] } };
+  /** Conversation of any session by key, newest last. Assistant only. */
+  "sessions.read": {
+    params: { session: string; limit?: number; before?: string };
+    result: { session: SessionInfo; events: ConvEvent[]; more: boolean; nextBefore?: string | null };
+  };
+  /** Tokens and cost since `since` (`1d`, `7d`, `2026-11-01`), grouped. Assistant only. */
+  "sessions.usage": {
+    params: { since?: string; groupBy?: "harness" | "model" | "cwd" | "day" | "session" };
+    result: { since?: number; rows: UsageRow[]; total: UsageRow };
+  };
+  /**
+   * Opens a finished session again in a new tab (of `space`, else a new space),
+   * with the resume command Uniflo gives for it. Assistant only.
+   */
+  "sessions.resume": { params: { session: string; space?: string }; result: { agent: string; space: string; terminal: string } };
+}
+
+export type RpcMethod = keyof RpcMethods;
+export type RpcParams<M extends RpcMethod> = RpcMethods[M]["params"];
+export type RpcResult<M extends RpcMethod> = RpcMethods[M]["result"];
+
+export type RpcErrorCode =
+  | "bad_request"
+  | "unauthorized"
+  | "forbidden"
+  | "not_found"
+  | "offline"
+  | "timeout"
+  | "unsupported"
+  | "internal";
+
+export interface RpcError {
+  code: RpcErrorCode;
+  message: string;
+}
+
+// ---------------------------------------------------------------------------
+// Assistant (runs on the relay; one shared thread for the owner of all devices)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the assistant asks before it acts on real agents. `never` (the
+ * default): it does what it is told at once and reports the real outcome.
+ * `always`: in typed chats every action waits for the person's confirmation.
+ * Voice calls never wait for a confirmation.
+ */
+export type AssistantConfirm = "never" | "always";
+
+export interface AssistantSettings {
+  confirm: AssistantConfirm;
+}
+
+/**
+ * Something the assistant does to a real agent. With confirmation on it waits
+ * as `pending` until the person confirms it (a button in the app, or saying so
+ * in a later turn); otherwise it runs at once and the card shows the outcome.
+ */
+export interface AssistantAction {
+  id: string;
+  /**
+   * send / keys: input to an agent. create: a new agent. interrupt: the stop key.
+   * close: end the terminal. herdr: a desktop herdr command. resume: reopen a session.
+   */
+  kind: "send" | "keys" | "create" | "interrupt" | "close" | "herdr" | "resume";
+  /** Target agent key (send / keys / interrupt / close). */
+  agent?: string;
+  agentTitle?: string;
+  /** Target computer. */
+  device?: string;
+  deviceName?: string;
+  text?: string;
+  keys?: string[];
+  launcher?: string;
+  folder?: string;
+  /** create / resume: the space to add a tab to (id); absent = a new space. */
+  space?: string;
+  /** create: name for the new space / the new tab. */
+  spaceName?: string;
+  tabName?: string;
+  /** herdr: the command and its arguments. */
+  command?: HerdrCommand;
+  args?: Record<string, unknown>;
+  /** resume: the session key. */
+  session?: string;
+  /** One line for people, e.g. 给「迁移脚本」发送：继续. */
+  summary: string;
+  state: "pending" | "running" | "done" | "cancelled" | "failed" | "expired";
+  /** What happened, once it is no longer pending. */
+  result?: string;
+  createdAt: number;
+}
+
+export type NoticeKind = "blocked" | "done" | "reminder";
+
+/** Something worth telling the person without being asked. */
+export interface Notice {
+  id: string;
+  kind: NoticeKind;
+  /** Short headline, e.g. 迁移脚本 · 跑完了. Also the phone notification title. */
+  title: string;
+  /** The one sentence the assistant says about it. Also the phone notification text. */
+  body: string;
+  /** What the assistant found when it looked: ok = it worked, decide = the person has to choose, failed = it did not work, stopped = it stopped without a clear result. */
+  verdict?: NoticeVerdict;
+  /** A few more lines for the chat (plain text or simple markdown); never read aloud. */
+  details?: string;
+  agent?: string;
+  ts: number;
+}
+
+export type NoticeVerdict = "ok" | "decide" | "failed" | "stopped";
+
+export interface AssistantItem {
+  id: string;
+  ts: number;
+  role: "user" | "assistant" | "notice";
+  text: string;
+  /** How it was said; voice items come from the live call transcript. */
+  via?: "text" | "voice";
+  /** What the assistant looked at or did for this answer, one short label each. */
+  steps?: string[];
+  action?: AssistantAction;
+  notice?: Notice;
+  error?: boolean;
+}
+
+/** Something the person asked to be reminded of: at a time, or when an agent stops. */
+export interface Reminder {
+  id: string;
+  text: string;
+  createdAt: number;
+  dueAt?: number;
+  agent?: string;
+  /** With `agent`: fire when it needs you (`blocked`) or stops working (`finished`). */
+  until?: "blocked" | "finished";
+}
+
+export interface AssistantState {
+  items: AssistantItem[];
+  /** True while the assistant is working on an answer. */
+  busy: boolean;
+  /** Whether the relay has a text model configured. */
+  ready: boolean;
+  /** Whether live voice (MOSS-Live) is configured on the relay. */
+  voice: boolean;
+  model?: string;
+  reminders: Reminder[];
+  /** Older relays leave it out: they always ask first. */
+  settings?: AssistantSettings;
+}
+
+// ---------------------------------------------------------------------------
+// Logs: the relay's own events plus what phones and computers upload
+// ---------------------------------------------------------------------------
+
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+/** One line a phone or computer uploads (`log` frame or POST /v1/logs). Never tokens or keys. */
+export interface ClientLogEntry {
+  ts: number;
+  level: LogLevel;
+  /** Short dotted area, e.g. link, rpc, stream, js, voice, update, pair, send, create. */
+  kind: string;
+  /** One line, at most ~500 characters; message text inside is clipped to ~200. */
+  msg: string;
+  data?: Record<string, unknown>;
+}
+
+/** A stored log line, as GET /v1/logs returns it. */
+export interface LogEntry extends ClientLogEntry {
+  id: number;
+  /** Who wrote it: the relay itself, or the kind of device that uploaded it. */
+  source: "relay" | DeviceKind;
+  /** Device the line is from or about. */
+  device?: string;
+  deviceName?: string;
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket frames (JSON text frames, one message each)
+// ---------------------------------------------------------------------------
+
+/** Client (host or viewer) -> relay. */
+export type ClientFrame =
+  /** First frame from a host: what it can do. */
+  | { type: "hello"; version: number; platform?: string; sources?: AgentSource[]; appVersion?: string }
+  /** Host publishes its whole agent list (replaces the previous one). */
+  | { type: "agents"; agents: Agent[] }
+  /** Call a method on a host. `to` is the target deviceId. */
+  | { type: "rpc"; id: string; to: string; method: RpcMethod; params: unknown }
+  /** Host answers an rpc it received. */
+  | { type: "rpc_result"; id: string; result?: unknown; error?: RpcError }
+  /** Start a long-lived host stream; `id` is scoped to the viewer connection. */
+  | { type: "stream_subscribe"; id: string; to?: string; from?: string; stream: "terminal" | "session"; params: unknown }
+  | { type: "stream_unsubscribe"; id: string; to?: string; from?: string }
+  /** Host -> relay stream lifecycle and data frames. */
+  | { type: "stream_open"; id: string; result?: unknown; error?: RpcError }
+  | { type: "stream_event"; id: string; event: unknown }
+  | { type: "ping"; t: number }
+  /** A batch of the client's own log lines (at most 200); stored per device. Older relays ignore it. */
+  | { type: "log"; entries: ClientLogEntry[] };
+
+/** Relay -> client. */
+export type ServerFrame =
+  | { type: "welcome"; version: number; device: Device; seq: number }
+  /** Full state snapshot, sent after welcome to every client. */
+  | { type: "snapshot"; seq: number; devices: Device[]; agents: Agent[] }
+  | { type: "device"; seq: number; device: Device }
+  | { type: "device_removed"; seq: number; id: string }
+  /** Agents of one host changed (replace all agents of that device). */
+  | { type: "agents"; seq: number; deviceId: string; agents: Agent[] }
+  /** Forwarded rpc for a host to execute; `from` is the caller deviceId. */
+  | { type: "rpc"; id: string; from: string; method: RpcMethod; params: unknown }
+  | { type: "rpc_result"; id: string; result?: unknown; error?: RpcError }
+  /** Stream subscription forwarded to a host. */
+  | { type: "stream_subscribe"; id: string; from: string; stream: "terminal" | "session"; params: unknown }
+  | { type: "stream_unsubscribe"; id: string; from: string }
+  /** A host has accepted a stream subscription. */
+  | { type: "stream_open"; id: string; result?: unknown; error?: RpcError }
+  /** Incremental terminal/session update from a subscribed host. */
+  | { type: "stream_event"; id: string; event: unknown }
+  | { type: "pong"; t: number }
+  | { type: "error"; error: RpcError }
+  /** Assistant thread: a new item, or a newer version of one with the same id. Sent to viewers. */
+  | { type: "assistant_item"; item: AssistantItem }
+  /** The assistant started or stopped working; `label` says on what. */
+  | { type: "assistant_busy"; busy: boolean; label?: string }
+  /** The thread was cleared or reminders changed: refetch GET /v1/assistant. */
+  | { type: "assistant_reset" };
+
+/**
+ * GET /v1/notify?token=...&since=<ms> (WebSocket, viewers only): a light push
+ * channel for a phone's background service, separate from the main socket so
+ * it never replaces it. Server -> phone only, JSON text frames.
+ */
+export type NotifyFrame = { type: "notice"; notice: Notice } | { type: "hello"; ts: number };
+
+/**
+ * GET /v1/assistant/live?token=... (WebSocket, viewers only): a voice call.
+ *
+ * Phone -> relay: binary = 16 kHz mono PCM S16LE microphone audio; text = JSON
+ * `{action, ...}` limited to LIVE_CLIENT_ACTIONS.
+ * Relay -> phone: binary = 48 kHz mono PCM S16LE speech, each preceded by a
+ * `response.audio.context` text frame; text = MOSS-Live events (`{action, data}`)
+ * plus the relay's own `relay.state` and `relay.task`.
+ */
+export const LIVE_CLIENT_ACTIONS = [
+  "mic_state",
+  "playback.chunk.completed",
+  "playback.completed",
+  "playback.stopped",
+  "ping",
+] as const;
+
+export type LiveRelayEvent =
+  | { action: "relay.state"; data: { state: "connecting" | "ready" | "closed" | "error"; message?: string } }
+  /** A background task the voice assistant handed to the text assistant. */
+  | { action: "relay.task"; data: { id: string; title: string; status: "running" | "done" | "failed" } }
+  /**
+   * A proactive notice arrived during the call. `line` is what the voice will say; `how` tells when:
+   * `now` (it is being said through a running task) or `next` (the voice brings it up the next time the person speaks).
+   */
+  | { action: "relay.notice"; data: { id: string; line: string; how: "now" | "next" } };
+
+// ---------------------------------------------------------------------------
+// Assistant REST (device token)
+// ---------------------------------------------------------------------------
+//
+// GET    /v1/assistant                        -> AssistantState
+// POST   /v1/assistant/messages  {text}       -> { item }   (answer arrives as assistant_item frames)
+// POST   /v1/assistant/actions/:id {decision: "confirm"|"cancel"} -> { item }
+// DELETE /v1/assistant/thread                 -> { ok: true }  (starts a new conversation)
+// DELETE /v1/assistant/reminders/:id          -> { ok: true }
+// GET    /v1/assistant/settings               -> AssistantSettings & { default: AssistantConfirm }
+// POST   /v1/assistant/settings {confirm}     -> AssistantSettings   (phones see assistant_reset)
+//
+// Logs
+// POST   /v1/logs   (device)        body { entries: ClientLogEntry[] } -> { stored }   (same as the `log` frame)
+// GET    /v1/logs   (device|admin)  ?since=1h|<ms>&until=&after=<id>&device=<id|name>&kind=&level=&source=&text=&limit=
+//                                   -> { entries: LogEntry[] }   (oldest first; `after` for following)
+// GET    /admin                     a small control panel (admin token, kept in the tab's sessionStorage)
+
+// ---------------------------------------------------------------------------
+// REST
+// ---------------------------------------------------------------------------
+//
+// GET    /v1/health                         -> { ok, version, devices, online }
+// POST   /v1/pair/codes        (admin|device) body {kind?, ttlSec?} -> PairCode
+// POST   /v1/pair              body PairRequest -> PairResponse   (no auth; code is the secret.
+//                              Sending the device's previous token replaces that registration.)
+// POST   /v1/join              body {name, kind, platform?} -> JoinTicket   (no auth; rate limited.
+//                              A new device asks to join and shows `link` as a QR.)
+// POST   /v1/join/:id/claim    body {secret} -> JoinClaim          (the asking device polls this)
+// GET    /v1/join/:id          (device)     -> JoinRequest         (what the approver is shown)
+// POST   /v1/join/:id/approve  (device)     -> { device: Device }
+// POST   /v1/join/:id/deny     (device)     -> { ok: true }
+// GET    /v1/devices           (device)     -> { devices: Device[] }
+// DELETE /v1/devices/:id       (device)     -> { ok: true }       (revoke)
+// GET    /v1/ws?token=...      WebSocket
+// GET    /p/:code              HTML landing page for an invite QR (opens the app, shows the code).
+// GET    /j/:id                HTML landing page for a join QR. Both only echo the URL; they never
+//                              look the code or request up.
+//
+// First run: while the relay has no devices it keeps a one-time setup code (any device kind,
+// 30 min) printed at startup and by `node apps/relay/src/bootstrap.ts`; it is deleted as soon
+// as the first device registers.
+//
+// Auth: `Authorization: Bearer <deviceToken>` (or `?token=` for WebSocket).
+// Admin endpoints also accept the relay's admin token.
+
+export interface PairCode {
+  code: string; // short human code, e.g. "MEOW-4821"
+  expiresAt: number;
+  /** What the QR encodes: an https page on the relay, `<server>/p/<code>` (see pairLink). */
+  link: string;
+}
+
+export interface PairRequest {
+  code: string;
+  name: string;
+  kind: DeviceKind;
+  platform?: string;
+}
+
+export interface PairResponse {
+  device: Device;
+  token: string;
+}
+
+/** A device asking to join; a paired device scans its QR and approves it. */
+export interface JoinRequest {
+  id: string;
+  name: string;
+  kind: DeviceKind;
+  platform?: string;
+  expiresAt: number;
+}
+
+export interface JoinTicket extends JoinRequest {
+  /** Known only to the asking device; needed to collect the token. */
+  secret: string;
+  /** What the QR encodes: an https page on the relay, `<server>/j/<id>` (see joinLink). */
+  link: string;
+}
+
+export type JoinClaim = { status: "pending" } | { status: "denied" } | ({ status: "approved" } & PairResponse);
+
+// Links. QR codes carry an https page on the relay (`<server>/p/<code>`, `<server>/j/<id>`),
+// so any camera can open them; the page hands the same data to the app through its own
+// scheme (`herdrpocket://pair?...`, `herdrpocket://join?...`). The app reads both forms.
+
+const PAIR_CODE = /^[A-Za-z]{2,8}-?\d{2,8}$/;
+const JOIN_ID = /^[A-Za-z0-9_-]{8,32}$/;
+const trimSlash = (s: string) => s.trim().replace(/\/+$/, "");
+
+/** `<server>/<kind>/<value>`, allowing a trailing slash and query/fragment (chat apps append them). */
+function parseWebLink(link: string, kind: "p" | "j"): { server: string; value: string } | null {
+  const m = new RegExp(`^(https?:\\/\\/[^\\s?#]+)\\/${kind}\\/([A-Za-z0-9_-]+)\\/?(?:[?#]\\S*)?$`, "i").exec(link.trim());
+  return m ? { server: m[1]!, value: m[2]! } : null;
+}
+
+function parseAppLink(link: string, kind: "pair" | "join", key: "code" | "id"): { server: string; value: string } | null {
+  const m = new RegExp(`^herdrpocket:\\/\\/${kind}\\/?\\?(.*)$`, "i").exec(link.trim());
+  if (!m) return null;
+  const q = new URLSearchParams(m[1]);
+  const server = q.get("server");
+  const value = q.get(key);
+  return server && value ? { server, value } : null;
+}
+
+/** What a join QR encodes: an https page on the relay. */
+export function joinLink(server: string, id: string): string {
+  return `${trimSlash(server)}/j/${encodeURIComponent(id)}`;
+}
+
+/** The app's own deep link for a join request. */
+export function joinAppLink(server: string, id: string): string {
+  return `herdrpocket://join?server=${encodeURIComponent(trimSlash(server))}&id=${encodeURIComponent(id)}`;
+}
+
+export function parseJoinLink(link: string): { server: string; id: string } | null {
+  const hit = parseWebLink(link, "j") ?? parseAppLink(link, "join", "id");
+  return hit && JOIN_ID.test(hit.value) ? { server: hit.server, id: hit.value } : null;
+}
+
+/** What an invite QR encodes: an https page on the relay. */
+export function pairLink(server: string, code: string): string {
+  return `${trimSlash(server)}/p/${encodeURIComponent(code)}`;
+}
+
+/** The app's own deep link for an invite. */
+export function pairAppLink(server: string, code: string): string {
+  return `herdrpocket://pair?server=${encodeURIComponent(trimSlash(server))}&code=${encodeURIComponent(code)}`;
+}
+
+export function parsePairLink(link: string): { server: string; code: string } | null {
+  const hit = parseWebLink(link, "p") ?? parseAppLink(link, "pair", "code");
+  return hit && PAIR_CODE.test(hit.value.trim()) ? { server: hit.server, code: normalizeCode(hit.value) } : null;
+}
+
+/** Codes are case-insensitive and the dash is optional: "meow4821" -> "MEOW-4821". */
+function normalizeCode(code: string): string {
+  return code.trim().toUpperCase().replace(/^([A-Z]+)-?(\d+)$/, "$1-$2");
+}
+
+export function isPairCode(code: string): boolean {
+  return PAIR_CODE.test(code);
+}
+
+export function isJoinId(id: string): boolean {
+  return JOIN_ID.test(id);
+}
+
+/**
+ * What a person may paste or type when pairing: a pair link (alone or inside a pasted
+ * message), a "server code" pair, or just the code. The server is absent for a bare code.
+ */
+export function parsePairInput(input: string): { server?: string; code: string } | null {
+  const text = input.trim();
+  if (!text) return null;
+  const link = parsePairLink(text);
+  if (link) return link;
+  // A whole message pasted from a chat: the link inside it.
+  for (const m of text.matchAll(/(?:https?|herdrpocket):\/\/[^\s"'<>，。；）)]+/gi)) {
+    const inner = parsePairLink(m[0]);
+    if (inner) return inner;
+  }
+  const parts = text.split(/\s+/);
+  const code = parts[parts.length - 1]!;
+  if (!PAIR_CODE.test(code)) return null;
+  const normalized = normalizeCode(code);
+  if (parts.length === 1) return { code: normalized };
+  const server = parts.slice(0, -1).join("");
+  return /^(https?:\/\/)?[\w.-]+(:\d+)?(\/\S*)?$/i.test(server) ? { server, code: normalized } : null;
+}
+
+// Releases. The Android app is published as GitHub release assets; the in-app updater
+// and the relay's landing pages read them from this one repository.
+
+export const RELEASE_REPO = "Crosery/herdr-pocket";
+
+/** Where people download the app by hand. */
+export const RELEASES_PAGE = `https://github.com/${RELEASE_REPO}/releases/latest`;
+
+/** Release asset contract: `herdr-pocket-<version>-android-arm64.apk`, version without a leading "v". */
+export function apkAssetName(version: string): string {
+  return `herdr-pocket-${version.trim().replace(/^v/i, "")}-android-arm64.apk`;
+}
+
+/**
+ * Compares "1.2.10" with "v1.3" part by part as numbers. A pre-release ("1.3.0-beta.1")
+ * sorts before its release. Returns <0, 0 or >0.
+ */
+export function compareVersions(a: string, b: string): number {
+  const split = (v: string) => {
+    const s = v.trim().replace(/^v/i, "");
+    const dash = s.indexOf("-");
+    const main = dash < 0 ? s : s.slice(0, dash);
+    return { nums: main.split(".").map((x) => Number.parseInt(x, 10) || 0), pre: dash < 0 ? undefined : s.slice(dash + 1) };
+  };
+  const x = split(a);
+  const y = split(b);
+  for (let i = 0; i < Math.max(x.nums.length, y.nums.length); i++) {
+    const d = (x.nums[i] ?? 0) - (y.nums[i] ?? 0);
+    if (d) return d;
+  }
+  if (x.pre === y.pre) return 0;
+  if (x.pre === undefined) return 1;
+  if (y.pre === undefined) return -1;
+  // Numbers inside pre-release tags compare as numbers: rc.10 is after rc.9.
+  return x.pre.localeCompare(y.pre, "en", { numeric: true });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers shared by host and app
+// ---------------------------------------------------------------------------
+
+export const SHELL_HARNESSES = new Set(["sh", "zsh", "bash", "fish", "nu", "pwsh", "shell"]);
+
+export function normalizeStatus(raw: string | null | undefined): AgentStatus {
+  switch ((raw ?? "").toLowerCase()) {
+    case "working":
+    case "work":
+    case "busy":
+      return "working";
+    case "blocked":
+    case "waiting":
+    case "needs_input":
+      return "blocked";
+    case "done":
+      return "done";
+    case "idle":
+      return "idle";
+    default:
+      return "unknown";
+  }
+}
+
+/** Sort weight: what needs a human first. */
+export const STATUS_ORDER: Record<AgentStatus, number> = {
+  blocked: 0,
+  working: 1,
+  done: 2,
+  idle: 3,
+  unknown: 4,
+};
