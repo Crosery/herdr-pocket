@@ -236,6 +236,8 @@ export function initCommands(): void {
     const key = box.dataset.cmd as keyof typeof SITE.commands;
     $(".cmd-text", box)!.innerHTML = SITE.commands[key]
       .split(/(\s+)/)
+      // PowerShell's `::Create((irm`: keep `irm` whole when the long part before it wraps.
+      .flatMap((w) => w.split(/(?<=\(\()/))
       .map((w) => (w.trim() && w.length <= 16 ? `<span class="nw">${esc(w)}</span>` : esc(w)))
       .join("");
   };
