@@ -150,7 +150,8 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
   const claimed = new Set<number>();
   for (const x of sends) {
     const i = x.echo ? index.get(x.echo) : undefined;
-    if (i !== undefined) {
+    // A row id met again with other words (a conversation read anew) is not this message's copy.
+    if (i !== undefined && sameMessage(rows[i]!.text ?? "", x.text)) {
       claimed.add(i);
       echoes.set(x.echo!, x);
       echoAt.set(x.id, i);
