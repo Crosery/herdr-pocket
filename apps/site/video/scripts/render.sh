@@ -16,6 +16,8 @@ npx remotion still src/index.ts Intro out/poster.png --frame="${POSTER_FRAME:-54
 npx remotion still src/index.ts Og out/og.png "$@" --log=error
 # web-friendly copies
 ffmpeg -v error -y -i out/intro.mp4 -c copy -movflags +faststart ../public/video/intro.mp4
+# 720p copy for phones and slow connections (about a third of the size)
+ffmpeg -v error -y -i out/intro.mp4 -vf scale=1280:-2 -c:v libx264 -preset slow -crf 26 -pix_fmt yuv420p -c:a aac -b:a 96k -movflags +faststart ../public/video/intro-720.mp4
 cwebp -quiet -q 82 -resize 1280 0 out/poster.png -o ../public/video/intro-poster.webp
 magick out/og.png -strip -quality 86 ../public/og.jpg
 du -sh ../public/video/* ../public/og.jpg

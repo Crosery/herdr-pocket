@@ -110,6 +110,7 @@ const en: Record<string, string> = {
   "ft.13.d": "By default she just acts. Turn on Ask before acting and she checks with you each time. Voice calls never stop to wait.",
   "video.eyebrow": "Intro film",
   "video.title": "Herdr Pocket in 90 seconds",
+  "video.q": "Quality",
   "dp.eyebrow": "Get started",
   "dp.title": "Three steps to your own pocket",
   "dp.1.t": "Deploy the relay",

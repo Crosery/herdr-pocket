@@ -153,6 +153,10 @@ export function applyCallEvent(action: string | undefined, d: Record<string, any
     case "relay.task":
       useVoice.setState({ task: d.status === "running" ? (d as VoiceState["task"]) : null });
       break;
+    case "call.stats":
+      // From the native player when a call ends: how smooth the speech was on this phone.
+      applog(d.stalls || d.underruns > 0 ? "warn" : "info", "voice", `call audio: ${d.stalls ?? 0} stalls, ${d.underruns ?? -1} underruns, cushion ${d.target_ms ?? 0}/${d.max_target_ms ?? 0} ms, ${d.stops ?? 0} cut`, d);
+      break;
     case "error":
       applog("warn", "voice", `voice service error ${d.error?.code ?? "unknown"}`);
       useVoice.setState({ message: `语音服务报错：${d.error?.code ?? "未知"}` });

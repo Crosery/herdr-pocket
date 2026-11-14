@@ -9,6 +9,7 @@
     "start": "node src/main.ts",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc -p .",
+    "voice-harness": "node test/voice/harness.ts",
     "bootstrap": "node src/bootstrap.ts"
   },
   "dependencies": {

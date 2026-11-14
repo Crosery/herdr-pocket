@@ -1,18 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
-import { Image, Pressable, ScrollView, TextInput as RNTextInput, View } from "react-native";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
+import { Image, Pressable, ScrollView, TextInput as RNTextInput, View, type TextStyle } from "react-native";
 import { ActivityIndicator, Button, Checkbox, Dialog, IconButton, List, Portal, ProgressBar, Snackbar, Text } from "react-native-paper";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { PUT_LIMITS, type Agent } from "@herdr-pocket/protocol";
+import { PUT_LIMITS, type Agent, type TerminalStreamParams } from "@herdr-pocket/protocol";
 import { call, subscribe, type RelayError } from "../lib/relay";
-import { addPictures, canPickImages, pickImages, sendWithPictures, type Attachment } from "../lib/attach";
+import { addPictures, canPickImages, pickImages, type Attachment } from "../lib/attach";
+import { onQueueEvent, sendOut } from "../lib/outbox";
 import { chunks, typingDiff } from "../lib/typing";
 import { useLive, usePending, useSettings } from "../lib/store";
 import { normalizeTermKeyLayout, TERM_KEYS, visibleTermKeys } from "../lib/termkeys";
 import { compactNum, money, relTime, shortPath } from "../lib/format";
-import { parseAnsi, runColors, TERM_BG, TERM_FG } from "../lib/ansi";
+import { TERM_BG, TERM_FG } from "../lib/ansi";
+import { TermScreen, type ScreenView, type ShownRow } from "../lib/termscreen";
 import { harnessLook } from "../lib/harness";
 import { parseChoices, type Choice } from "../lib/choices";
 import { usePalette } from "../theme/theme";
@@ -48,6 +50,54 @@ function useCellMetrics() {
   return { cellRatio: m?.cell ?? 0.6, cjkRatio: m?.cjk ?? 1, probe };
 }
 
+/** Queue notices ride every terminal stream; the open terminal hands them to the message box. */
+const queueListeners = new Map<string, Set<(event: any) => void>>();
+function onQueue(agentKey: string, fn: (event: any) => void): () => void {
+  const set = queueListeners.get(agentKey) ?? new Set();
+  queueListeners.set(agentKey, set);
+  set.add(fn);
+  return () => {
+    set.delete(fn);
+    if (!set.size) queueListeners.delete(agentKey);
+  };
+}
+
+/** One terminal line. Rendered again only when its own content (or the font) changes. */
+const TermRow = memo(function TermRow({ row, style, wideGap }: { row: ShownRow; style: TextStyle; wideGap: number }) {
+  return (
+    <Text selectable style={style}>
+      {row.runs.map((r, j) => (
+        <Text
+          key={j}
+          style={{
+            color: r.fg,
+            backgroundColor: r.bg,
+            fontFamily: r.bold ? fonts.monoBold : fonts.mono,
+            fontStyle: r.italic ? "italic" : "normal",
+            textDecorationLine: r.underline ? "underline" : "none",
+            letterSpacing: r.wide ? wideGap : 0,
+          }}
+        >
+          {r.text}
+        </Text>
+      ))}
+    </Text>
+  );
+});
+
+/** Lines keyed by an id that moves with them, so a scroll mounts the new lines and moves the rest. */
+const TermRows = memo(function TermRows({ view, style, wideGap }: { view: ScreenView; style: TextStyle; wideGap: number }) {
+  return (
+    <View>
+      {view.rows.map((r) => (
+        <TermRow key={r.id} row={r.row} style={style} wideGap={wideGap} />
+      ))}
+    </View>
+  );
+});
+
+type LiveState = "connecting" | "live" | "stale" | "error";
+
 export function TerminalView({ agent, active }: { agent: Agent; active: boolean }) {
   const p = usePalette();
   const scroller = useRef<ComponentRef<typeof ScrollView>>(null);
@@ -56,37 +106,114 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
   const [width, setWidth] = useState(0);
   const [modePick, setMode] = useState<"fit" | "read" | null>(null);
   const [zoom, setZoom] = useState(READ_SIZE);
-  const [liveScreen, setLiveScreen] = useState<any>(null);
-  const [liveState, setLiveState] = useState<"connecting" | "live" | "stale" | "error">("connecting");
+  const [liveState, setLiveStateNow] = useState<LiveState>("connecting");
+  const liveRef = useRef<LiveState>("connecting");
+  const setLiveState = useCallback((s: LiveState) => {
+    if (liveRef.current === s) return;
+    liveRef.current = s;
+    setLiveStateNow(s);
+  }, []);
+  /** A screen came on the current stream. */
+  const [gotLive, setGotLive] = useState(false);
+  const gotLiveRef = useRef(false);
+  /** The stream gave nothing for a while after subscribing. */
+  const [slow, setSlow] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const failures = useRef(0);
   const pinch = useRef<{ d: number; size: number } | null>(null);
   const busy = agent.status === "working" || agent.status === "blocked";
+  const [screen] = useState(() => new TermScreen());
+  const [view, setView] = useState<ScreenView | null>(null);
+  const frame = useRef<number | null>(null);
+  // However many paints arrive, the view renders at most once per display frame, with the latest.
+  const show = useCallback(() => {
+    if (frame.current !== null) return;
+    frame.current = requestAnimationFrame(() => {
+      frame.current = null;
+      setView(screen.view());
+    });
+  }, [screen]);
+  useEffect(
+    () => () => {
+      if (frame.current !== null) cancelAnimationFrame(frame.current);
+    },
+    [],
+  );
+  // Polling is the recovery path: only while the stream is down or has not delivered yet.
+  const poll = active && (liveState === "error" || liveState === "stale" || (!gotLive && slow));
   const q = useQuery({
     queryKey: ["terminal.read", agent.key],
     queryFn: () => call(agent.deviceId, "terminal.read", { agent: agent.key, lines: 120 }),
-    enabled: active,
+    enabled: poll,
     staleTime: 10_000,
-    refetchInterval: active ? (busy ? 5000 : 12000) : false,
+    refetchInterval: poll ? (busy ? 5000 : 12000) : false,
     retry: 1,
   });
   useEffect(() => {
+    // A polled (or cached) screen only while the stream has given nothing newer.
+    if (!q.data || (gotLiveRef.current && liveRef.current === "live")) return;
+    screen.screen(q.data);
+    show();
+  }, [q.data, screen, show]);
+  useEffect(() => {
     if (!active) return;
     setLiveState("connecting");
-    const stop = subscribe(agent.deviceId, "terminal", { agent: agent.key, history: 120 }, (event) => {
-      if (event?.kind === "terminal" && event.screen) {
-        setLiveScreen(event.screen);
-        setLiveState("live");
-      } else if (event?.kind === "stale") setLiveState("stale");
-    }, (state) => setLiveState(state.status === "open" ? "live" : "error"));
+    gotLiveRef.current = false;
+    setGotLive(false);
+    setSlow(false);
+    screen.restart();
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const again = (ms: number) => {
+      retry ??= setTimeout(() => setAttempt((n) => n + 1), ms);
+    };
+    const slowTimer = setTimeout(() => setSlow(true), 1500);
+    const got = () => {
+      if (!gotLiveRef.current) {
+        gotLiveRef.current = true;
+        setGotLive(true);
+      }
+      setLiveState("live");
+      show();
+    };
+    const params: TerminalStreamParams = { agent: agent.key, history: 120, rows: true };
+    const stop = subscribe(
+      agent.deviceId,
+      "terminal",
+      params,
+      (event) => {
+        if (event?.kind === "terminal_rows") {
+          // A missed change: subscribe again, which starts with a whole screen.
+          if (screen.rows(event)) got();
+          else again(0);
+        } else if (event?.kind === "terminal" && event.screen) {
+          // Computers before row changes send the whole screen each time.
+          screen.screen(event.screen);
+          got();
+        } else if (event?.kind === "stale") setLiveState("stale");
+        else if (event?.kind === "queue") queueListeners.get(agent.key)?.forEach((fn) => fn(event));
+      },
+      (state) => {
+        if (state.status === "open") {
+          failures.current = 0;
+          setLiveState("live");
+        } else {
+          // Refused or ended (the computer went away): poll meanwhile and try the stream again.
+          setLiveState("error");
+          again(Math.min(30_000, 3000 * 2 ** failures.current++));
+        }
+      },
+    );
     // An unchanged screen sends nothing: silence is not a lost stream.
-    return stop;
-  }, [active, agent.deviceId, agent.key]);
+    return () => {
+      clearTimeout(retry);
+      clearTimeout(slowTimer);
+      stop();
+    };
+  }, [active, agent.deviceId, agent.key, attempt, screen, show, setLiveState]);
   const linkOnline = useLive((s) => s.link === "online");
-  const shown: "connecting" | "live" | "stale" | "error" = !linkOnline ? "stale" : liveState;
-  const data = liveScreen ?? q.data;
+  const shown: LiveState = !linkOnline ? "stale" : liveState;
   const { cellRatio, cjkRatio, probe } = useCellMetrics();
-  const lines = useMemo(() => parseAnsi(data?.ansi ?? data?.text ?? ""), [data?.ansi, data?.text]);
-  const widest = useMemo(() => lines.reduce((n, l) => Math.max(n, l.cells), 0), [lines]);
-  const cols = Math.max(data?.cols ?? 0, widest, 20);
+  const cols = Math.max(view?.cols ?? 0, view?.widest ?? 0, 20);
   // Wide terminals (e.g. 191 cols) are unreadable when squeezed: default to readable size + horizontal scroll.
   const mode = modePick ?? (cols <= 100 ? "fit" : "read");
   const fitSize = width ? Math.max(5, Math.min(16, (width - TERM_PAD * 2) / (cols * cellRatio))) : READ_SIZE;
@@ -95,12 +222,16 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
   // Wide chars render in the system CJK font; pad each to exactly two mono cells.
   const wideGap = 2 * cellW - fontSize * cjkRatio;
   const lineHeight = Math.round(fontSize * 1.38);
+  const rowStyle = useMemo<TextStyle>(() => ({ fontFamily: fonts.mono, fontSize, lineHeight, height: lineHeight, color: TERM_FG }), [fontSize, lineHeight]);
 
   useEffect(() => {
     if (follow) requestAnimationFrame(() => scroller.current?.scrollToEnd({ animated: false }));
-  }, [lines, follow, fontSize]);
+  }, [follow, fontSize]);
 
-  if (q.isLoading && !liveScreen) {
+  if (!view && q.isError) {
+    return <EmptyState mood="waiting" title="终端画面没拿到" body={(q.error as Error).message} action={<Button textColor={p.accentText} onPress={() => q.refetch()}>再试一次</Button>} />;
+  }
+  if (!view) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: space.sm }}>
         <ActivityIndicator />
@@ -108,11 +239,7 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
       </View>
     );
   }
-  if (q.isError && !liveScreen) {
-    return <EmptyState mood="waiting" title="终端画面没拿到" body={(q.error as Error).message} action={<Button textColor={p.accentText} onPress={() => q.refetch()}>再试一次</Button>} />;
-  }
-  const plain = (data?.text ?? "").replace(/\s+$/, "");
-  const empty = lines.every((l) => l.cells === 0);
+  const empty = view.rows.length === 0;
   return (
     <View
       style={{ flex: 1, marginHorizontal: space.lg, marginTop: space.md, marginBottom: space.sm, borderRadius: radius.card, backgroundColor: TERM_BG, overflow: "hidden" }}
@@ -138,7 +265,7 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
       <View style={{ flexDirection: "row", alignItems: "center", paddingLeft: space.lg, paddingRight: space.xs, minHeight: 44, backgroundColor: "#211B2C" }}>
         <Text style={{ flex: 1, fontFamily: fonts.mono, fontSize: 12, color: "#CFC5DA" }} numberOfLines={1}>
           {agent.localId} · {agent.where ?? agent.harness}
-          {data?.cols ? `  ${data.cols}×${data.rows ?? lines.length}` : ""}
+          {view.cols ? `  ${view.cols}×${view.height ?? view.rows.length}` : ""}
         </Text>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginRight: 4 }}>
           <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: shown === "live" ? "#5ED6A7" : shown === "stale" ? "#F0B85A" : "#E9819E" }} />
@@ -165,7 +292,7 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
           iconColor="#EDE6F3"
           accessibilityLabel="复制终端内容"
           onPress={async () => {
-            await Clipboard.setStringAsync(plain);
+            await Clipboard.setStringAsync(screen.plain());
             setCopied(true);
             setTimeout(() => setCopied(false), 1500);
           }}
@@ -178,6 +305,10 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
           // A keyboard opening below shrinks the screen: keep the newest lines in view.
           if (follow) requestAnimationFrame(() => scroller.current?.scrollToEnd({ animated: false }));
         }}
+        // Only when the content grows or shrinks: a scroll of a full history keeps its height and stays at the bottom.
+        onContentSizeChange={() => {
+          if (follow) scroller.current?.scrollToEnd({ animated: false });
+        }}
         onScrollBeginDrag={() => setFollow(false)}
         onMomentumScrollEnd={(e) => {
           const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
@@ -186,33 +317,7 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
         contentContainerStyle={{ paddingVertical: TERM_PAD }}
       >
         <ScrollView horizontal showsHorizontalScrollIndicator={mode !== "fit"} contentContainerStyle={{ paddingHorizontal: TERM_PAD }}>
-          <Text selectable style={{ fontFamily: fonts.mono, fontSize, lineHeight, color: TERM_FG }}>
-            {empty
-              ? "（屏幕是空的）"
-              : lines.map((l, i) => (
-                  <Text key={i}>
-                    {l.runs.map((r, j) => {
-                      const c = runColors(r);
-                      return (
-                        <Text
-                          key={j}
-                          style={{
-                            color: c.fg,
-                            backgroundColor: c.bg,
-                            fontFamily: r.bold ? fonts.monoBold : fonts.mono,
-                            fontStyle: r.italic ? "italic" : "normal",
-                            textDecorationLine: r.underline ? "underline" : "none",
-                            letterSpacing: r.wide ? wideGap : 0,
-                          }}
-                        >
-                          {r.text}
-                        </Text>
-                      );
-                    })}
-                    {i < lines.length - 1 ? "\n" : ""}
-                  </Text>
-                ))}
-          </Text>
+          {empty ? <Text style={rowStyle}>（屏幕是空的）</Text> : <TermRows view={view} style={rowStyle} wideGap={wideGap} />}
         </ScrollView>
       </ScrollView>
       {!follow ? (
@@ -565,9 +670,11 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   useEffect(() => stopDirect, [mode, stopDirect]);
   const showKeys = mode === "terminal" || extra;
   const showInput = mode === "chat" || (extra && boxOnly);
-  const addPending = usePending((s) => s.add);
+  /** A key press or "让它继续" on its way (messages go out on their own, see lib/outbox). */
   const [sending, setSending] = useState(false);
-  const [queue, setQueue] = useState<{ status: "queued" | "sending" | "sent" | "failed"; position: number; message?: string } | null>(null);
+  /** This phone's messages that wait in the agent's input box: their bubbles say "排队中" already. */
+  const mineWaiting = usePending((s) => (s.byAgent[agent.key] ?? []).filter((x) => x.state === "queued" && x.waiting && !x.echo).length);
+  const textScale = useSettings((x) => x.textScale);
   const [tuning, setTuning] = useState(false);
   const termKeys = useSettings((x) => x.termKeys);
   const keys = useMemo(() => visibleTermKeys(normalizeTermKeyLayout(termKeys)), [termKeys]);
@@ -576,13 +683,17 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
 
   useEffect(() => {
     if (!online) return;
-    return subscribe(agent.deviceId, "terminal", { agent: agent.key }, (event) => {
-      if (event?.kind === "queue" && event.queueId) {
-        setQueue({ status: event.status, position: event.position ?? 0, message: event.message });
-        if (event.status === "sent") setTimeout(() => setQueue((q) => (q?.status === "sent" ? null : q)), 1800);
-      }
-    });
-  }, [agent.deviceId, agent.key, online]);
+    // The computer's send queue moves the marks on the bubbles of messages sent from here.
+    const onEvent = (event: any) => {
+      if (event?.kind === "queue" && event.queueId) onQueueEvent(agent.key, event);
+    };
+    // The open terminal's stream carries them already; a second one would paint the whole screen again.
+    if (mode === "terminal") return onQueue(agent.key, onEvent);
+    // No screen needed. Computers before `screen: false` still send one; `history: 1` keeps it small
+    // (they read a 0 as the default 120).
+    const params: TerminalStreamParams = { agent: agent.key, screen: false, history: 1 };
+    return subscribe(agent.deviceId, "terminal", params, onEvent);
+  }, [agent.deviceId, agent.key, online, mode]);
 
   function refreshSoon() {
     setTimeout(() => {
@@ -591,28 +702,19 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     }, 1000);
   }
 
-  async function send() {
+  function send() {
     const t = text.trim();
     const pics = mode === "chat" ? pictures : [];
-    if ((!t && !pics.length) || sending) return;
-    setSending(true);
-    try {
-      // Pictures first reach the computer; then the text naming them goes through the queue as usual.
-      const { accepted } = await sendWithPictures(agent, t, pics);
-      setQueue({ status: accepted.position && accepted.position > 0 ? "queued" : "sending", position: accepted.position ?? 0 });
-      setText("");
-      if (pics.length) setPictures((cur) => cur.filter((x) => !pics.includes(x)));
-      // The bubble shows what the person sent: their words and the pictures, not the paths the agent got.
-      addPending(agent.key, t, pics.map((x) => `data:${x.mime};base64,${x.data}`));
-      // The "sent" notice rides the terminal stream; never leave "sending" up if it is missed.
-      setTimeout(() => setQueue((q) => (q?.status === "sending" ? null : q)), 8000);
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
-      refreshSoon();
-    } catch (e) {
-      setToast((e as Error).message);
-    } finally {
-      setSending(false);
-    }
+    if (!t && !pics.length) return;
+    // The message shows in the conversation at once, with its own state; the box is free for the next one.
+    setText("");
+    if (pics.length) setPictures((cur) => cur.filter((x) => !pics.includes(x)));
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+    void sendOut(agent, t, pics).then((r) => {
+      if (r.ok) refreshSoon();
+      // Beside the terminal there is no bubble to show the failure on.
+      else if (mode === "terminal") setToast(r.message);
+    });
   }
 
   async function attach() {
@@ -651,15 +753,10 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   async function retry() {
     Haptics.selectionAsync().catch(() => undefined);
     setSending(true);
-    try {
-      await call(agent.deviceId, "terminal.send", { agent: agent.key, text: "继续" });
-      addPending(agent.key, "继续");
-      refreshSoon();
-    } catch (e) {
-      setToast((e as Error).message);
-    } finally {
-      setSending(false);
-    }
+    const r = await sendOut(agent, "继续");
+    setSending(false);
+    if (r.ok) refreshSoon();
+    else if (mode === "terminal") setToast(r.message);
   }
 
   const keyStyle = { borderRadius: radius.pill, minHeight: 40, minWidth: 48, paddingHorizontal: 14, alignItems: "center" as const, justifyContent: "center" as const };
@@ -748,15 +845,7 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         </View>
       </View>
       ) : null}
-      {queue ? (
-        <View accessibilityLiveRegion="polite" style={{ marginHorizontal: space.lg, marginTop: space.xs, paddingHorizontal: space.md, minHeight: 30, borderRadius: radius.pill, backgroundColor: queue.status === "failed" ? p.errorContainer : p.surface2, flexDirection: "row", alignItems: "center", gap: 6 }}>
-          <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: queue.status === "failed" ? p.error : queue.status === "sent" ? "#3FB68B" : p.accentText }} />
-          <Text style={{ color: queue.status === "failed" ? p.error : p.muted, fontSize: 12.5, flex: 1 }}>
-            {queue.status === "queued" ? `正在排队 · 前面还有 ${queue.position} 条` : queue.status === "sending" ? "正在送入 agent" : queue.status === "sent" ? "已送入 agent" : `发送失败 · ${queue.message ?? "可以重试"}`}
-          </Text>
-        </View>
-      ) : null}
-      {agent.queued ? (
+      {agent.queued && !(mode === "chat" && mineWaiting >= agent.queued) ? (
         <View
           accessibilityLiveRegion="polite"
           accessibilityLabel={`排队中，${agent.queued} 条消息在它的输入框里，这一轮完了才会处理`}
@@ -779,41 +868,41 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                 <Image
                   source={{ uri: `data:${x.mime};base64,${x.data}` }}
                   accessibilityLabel={`要发送的第 ${i + 1} 张图片`}
-                  style={{ width: 60, height: 60, borderRadius: radius.sm, backgroundColor: p.surface2, borderWidth: 1, borderColor: p.dark ? p.surface3 : "#FBE3EC", opacity: sending ? 0.6 : 1 }}
+                  style={{ width: 60, height: 60, borderRadius: radius.sm, backgroundColor: p.surface2, borderWidth: 1, borderColor: p.dark ? p.surface3 : "#FBE3EC" }}
                 />
-                {!sending ? (
-                  <Pressable
-                    onPress={() => setPictures((cur) => cur.filter((y) => y.id !== x.id))}
-                    hitSlop={10}
-                    accessibilityRole="button"
-                    accessibilityLabel={`移除第 ${i + 1} 张图片`}
-                    style={({ pressed }) => ({ position: "absolute", top: -7, right: -7, width: 22, height: 22, borderRadius: 11, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.primaryPressed : p.primary, borderWidth: 2, borderColor: p.surface })}
-                  >
-                    <MaterialCommunityIcons name="close" size={12} color={p.onPrimary} />
-                  </Pressable>
-                ) : null}
+                <Pressable
+                  onPress={() => setPictures((cur) => cur.filter((y) => y.id !== x.id))}
+                  hitSlop={10}
+                  accessibilityRole="button"
+                  accessibilityLabel={`移除第 ${i + 1} 张图片`}
+                  style={({ pressed }) => ({ position: "absolute", top: -7, right: -7, width: 22, height: 22, borderRadius: 11, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.primaryPressed : p.primary, borderWidth: 2, borderColor: p.surface })}
+                >
+                  <MaterialCommunityIcons name="close" size={12} color={p.onPrimary} />
+                </Pressable>
               </View>
             ))}
           </ScrollView>
           <Text accessibilityLiveRegion="polite" style={{ color: p.muted, fontSize: 12, paddingRight: space.lg }}>
-            {sending ? "正在传图片…" : `${pictures.length}/${PUT_LIMITS.files}`}
+            {`${pictures.length}/${PUT_LIMITS.files}`}
           </Text>
         </View>
       ) : null}
       {showInput ? (
       <View
         style={{
-          flexDirection: "row",
-          gap: space.sm,
+          // Chat: the words get the full width and a toolbar sits under them. Terminal box: one row.
+          flexDirection: mode === "chat" ? "column" : "row",
+          gap: mode === "chat" ? 2 : space.sm,
           marginHorizontal: space.lg,
           marginTop: space.xs,
           backgroundColor: p.surface,
           borderRadius: radius.xl,
-          // Buttons stay at the bottom while a long message grows upward.
-          alignItems: "flex-end",
+          // The send button stays at the bottom while a long line grows upward.
+          alignItems: mode === "chat" ? "stretch" : "flex-end",
           paddingLeft: mode === "chat" ? 6 : space.lg,
           paddingRight: 6,
-          paddingVertical: 6,
+          paddingTop: mode === "chat" ? 2 : 6,
+          paddingBottom: 6,
           borderWidth: 1,
           borderColor: p.dark ? p.surface3 : "#FBE3EC",
           shadowColor: p.shadow,
@@ -823,18 +912,6 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
           elevation: p.dark ? 0 : 2,
         }}
       >
-        {mode === "chat" ? (
-          <IconTile
-            icon={extra ? "keyboardDown" : "keyboard"}
-            size={40}
-            active={extra}
-            onPress={() => setExtra((v) => !v)}
-            a11y={extra ? "收起快捷按键" : "显示回车、Esc、方向键等快捷按键"}
-          />
-        ) : null}
-        {mode === "chat" ? (
-          <IconTile icon="image" size={40} disabled={!online || picking || sending} onPress={attach} a11y="添加图片，和消息一起发给它" />
-        ) : null}
         <RNTextInput
           value={text}
           onChangeText={setText}
@@ -846,10 +923,30 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
           autoCapitalize={mode === "terminal" ? "none" : undefined}
           autoCorrect={mode === "chat"}
           onSubmitEditing={mode === "terminal" ? send : undefined}
-          style={{ flex: 1, fontFamily: mode === "terminal" ? fonts.mono : fonts.body, fontSize: mode === "terminal" ? 14 : 15.5, color: p.ink, maxHeight: 120, paddingVertical: 9 }}
+          style={
+            mode === "chat"
+              ? // Grows to about six lines, then scrolls.
+                { fontFamily: fonts.body, fontSize: 15.5 * textScale, color: p.ink, minHeight: 44, maxHeight: Math.round(15.5 * textScale * 1.4 * 6) + 18, paddingHorizontal: 10, paddingTop: 10, paddingBottom: 8 }
+              : { flex: 1, fontFamily: fonts.mono, fontSize: 14, color: p.ink, maxHeight: 120, paddingVertical: 9 }
+          }
           accessibilityLabel="发送给 agent 的内容"
         />
-        <SendPill disabled={(!text.trim() && !(mode === "chat" && pictures.length)) || sending || !online} onPress={send} />
+        {mode === "chat" ? (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+            <IconTile
+              icon={extra ? "keyboardDown" : "keyboard"}
+              size={42}
+              active={extra}
+              onPress={() => setExtra((v) => !v)}
+              a11y={extra ? "收起快捷按键" : "显示回车、Esc、方向键等快捷按键"}
+            />
+            <IconTile icon="image" size={42} disabled={!online || picking} onPress={attach} a11y="添加图片，和消息一起发给它" />
+            <View style={{ flex: 1 }} />
+            <SendPill disabled={(!text.trim() && !pictures.length) || !online} onPress={send} />
+          </View>
+        ) : (
+          <SendPill disabled={!text.trim() || !online} onPress={send} />
+        )}
       </View>
       ) : null}
       <KeyLayoutDialog visible={tuning} onDismiss={() => setTuning(false)} />

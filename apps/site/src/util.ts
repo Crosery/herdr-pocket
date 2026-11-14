@@ -2,6 +2,18 @@ export const reducedMotion = (): boolean => matchMedia("(prefers-reduced-motion:
 export const finePointer = (): boolean => matchMedia("(hover: hover) and (pointer: fine)").matches;
 export const isNarrow = (): boolean => matchMedia("(max-width: 900px)").matches;
 
+type Conn = { saveData?: boolean; effectiveType?: string };
+const conn = (): Conn | undefined => (navigator as Navigator & { connection?: Conn }).connection;
+/** Data saver on, or the browser rates the connection 3G or slower (Chromium only). */
+export const slowNetwork = (): boolean => !!conn()?.saveData || /2g|3g/.test(conn()?.effectiveType ?? "");
+
+/** Run `fn` once the page has loaded and the main thread is idle. */
+export function afterLoad(fn: () => void): void {
+  const idle = () => ("requestIdleCallback" in window ? requestIdleCallback(() => fn(), { timeout: 1500 }) : setTimeout(fn, 300));
+  if (document.readyState === "complete") idle();
+  else window.addEventListener("load", idle, { once: true });
+}
+
 export const $ = <T extends Element = HTMLElement>(sel: string, root: ParentNode = document): T | null =>
   root.querySelector<T>(sel);
 export const $$ = <T extends Element = HTMLElement>(sel: string, root: ParentNode = document): T[] =>

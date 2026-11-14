@@ -86,7 +86,7 @@ cd video
 pnpm install
 pnpm assets       # copies ../public/assets and ../src/fonts into video/public
 pnpm studio       # live preview in the browser
-pnpm render       # -> ../public/video/intro.mp4, intro-poster.webp, ../public/og.jpg
+pnpm render       # -> ../public/video/intro.mp4, intro-720.mp4, intro-poster.webp, ../public/og.jpg
 ```
 
 Rendering uses an installed Google Chrome when found (or the browser in

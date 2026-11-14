@@ -549,6 +549,16 @@ summary code {
   transition: opacity 0.9s var(--ease-out), transform 0.9s var(--ease-out);
 }
 
+/* Sections far off screen hold their looping CSS animations (main.ts sets the
+   class). Several loops animate width, box-shadow or background, which would
+   otherwise cost style, layout and paint on every frame wherever you are. */
+.is-offscreen,
+.is-offscreen *,
+.is-offscreen *::before,
+.is-offscreen *::after {
+  animation-play-state: paused !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

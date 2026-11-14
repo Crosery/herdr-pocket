@@ -6,6 +6,7 @@ import {
   PUT_LIMITS,
   agentKey,
   pairLink,
+  rowsChange,
   type Agent,
   type AssistantConfirm,
   type AssistantItem,
@@ -21,6 +22,8 @@ import {
   type PairResponse,
   type RpcMethod,
   type SubSession,
+  type TerminalRowsEvent,
+  type TerminalStreamParams,
 } from "@herdr-pocket/protocol";
 import { useLive } from "./store";
 import { isWide } from "./ansi";
@@ -296,6 +299,109 @@ function typeInto(agent: string, data: string) {
   typed[agent] = line.slice(-40).join("");
 }
 
+// A message sent in the demo plays out live, like on a real computer: the send
+// queue reports it typed in, it shows up in the conversation a moment later, the
+// agent starts working, thinks, answers and stops. Sent to a working agent, it
+// waits ("排队中") until that turn ends. A message with "失败" in it fails once,
+// so the retry on its bubble can be tried.
+
+/** Live listeners of the demo streams: conversations by session, send queues by agent. */
+const sessionSinks = new Map<string, Set<(event: unknown) => void>>();
+const queueSinks = new Map<string, Set<(event: unknown) => void>>();
+/** Text typed into a working demo agent, taken when its turn ends. */
+let held: Record<string, string[]> = {};
+/** Demo agents in a turn the demo itself will finish. */
+const inTurn = new Set<string>();
+const failedOnce = new Set<string>();
+let timers: ReturnType<typeof setTimeout>[] = [];
+let queueSeq = 0;
+
+function later(ms: number, run: () => void) {
+  timers.push(setTimeout(run, ms));
+}
+
+function listen(sinks: Map<string, Set<(event: unknown) => void>>, key: string, onEvent: (event: unknown) => void) {
+  const set = sinks.get(key) ?? new Set();
+  set.add(onEvent);
+  sinks.set(key, set);
+  return () => {
+    set.delete(onEvent);
+  };
+}
+
+function baseConversation(session: string): ConvEvent[] {
+  return session === "claude:demo-1" ? [...history(session), ...conversation(session)] : conversation(session);
+}
+
+/** Adds an event to a demo conversation and streams it, at the position the page query gives it too. */
+function say(agentKey: string, body: Record<string, unknown>) {
+  const session = agents.find((x) => x.key === agentKey)?.sessionKey;
+  if (!session) return;
+  const list = (sent[session] ??= []);
+  const e = { id: `${session}#sent${list.length}`, session, ts: now(), ...body } as ConvEvent;
+  list.push(e);
+  const pos = String(baseConversation(session).length + list.length - 1);
+  for (const sink of sessionSinks.get(session) ?? []) sink({ kind: "session", event: { ...e, pos }, at: now() });
+}
+
+function setAgent(key: string, patch: Partial<Agent>) {
+  agents = agents.map((x) => (x.key === key ? { ...x, ...patch } : x));
+  publish();
+}
+
+function demoReply(text: string): string {
+  const words = Array.from(text.split("\n")[0]!.trim());
+  const clip = words.length > 24 ? `${words.slice(0, 24).join("")}…` : words.join("");
+  return clip ? `收到：**${clip}**\n\n这是演示里的回复，真的 agent 会在这里接着干活，做完再回你。` : "收到图片了。这是演示里的回复。";
+}
+
+/** One demo turn: the message shows up, the agent starts working, thinks, answers and stops. */
+function demoTurn(key: string, text: string) {
+  inTurn.add(key);
+  later(800, () => say(key, { kind: "user_message", text }));
+  later(1600, () => setAgent(key, { status: "working", statusSince: now(), errored: undefined, statusNote: undefined }));
+  later(3200, () => say(key, { kind: "reasoning", text: "先看看现在的代码是怎么写的，再动手。" }));
+  later(6000, () => {
+    say(key, { kind: "assistant_message", text: demoReply(text) });
+    say(key, { kind: "turn_end", reason: "waiting_for_user" });
+    endTurn(key);
+  });
+}
+
+/** The turn ends; text that waited in the input box starts the next one. */
+function endTurn(key: string) {
+  inTurn.delete(key);
+  const next = held[key]?.shift();
+  const left = held[key]?.length ?? 0;
+  setAgent(key, { status: "done", statusSince: now(), queued: left || undefined, queuedText: left ? held[key]![0] : undefined, queuedSince: left ? now() : undefined });
+  if (next !== undefined) demoTurn(key, next);
+}
+
+function demoSend(key: string, text: string) {
+  const a = agents.find((x) => x.key === key);
+  if (!a) throw new Error("not_found");
+  if (/失败/.test(text) && !failedOnce.has(text)) {
+    failedOnce.add(text);
+    throw new Error("演示：这条故意没发出去，点重发");
+  }
+  const queueId = `mq${++queueSeq}`;
+  later(120, () => queueSinks.get(key)?.forEach((sink) => sink({ kind: "queue", queueId, status: "sending", position: 0, at: now() })));
+  later(450, () => queueSinks.get(key)?.forEach((sink) => sink({ kind: "queue", queueId, status: "sent", position: 0, at: now() })));
+  // Like Claude Code: text typed during a turn waits in the input box until the turn ends.
+  if (a.status === "working" || inTurn.has(key)) {
+    (held[key] ??= []).push(text);
+    setAgent(key, { queued: (a.queued ?? 0) + 1, queuedText: a.queuedText ?? text, queuedSince: a.queuedSince ?? now() });
+    // The demo's own long-running agents wrap up their turn soon, so the wait can be seen ending.
+    if (!inTurn.has(key)) {
+      inTurn.add(key);
+      later(8000, () => endTurn(key));
+    }
+    return { ok: true, queueId, position: 0, agentStatus: a.status, waiting: true };
+  }
+  demoTurn(key, text);
+  return { ok: true, queueId, position: 0, agentStatus: a.status, waiting: false };
+}
+
 /** The demo screen, with the typed line under it like a program's input box. */
 function screen(agent: string | undefined) {
   const t = agent ? typed[agent] : "";
@@ -329,6 +435,9 @@ export function mockLink(): Link {
   agents = makeAgents();
   sent = {};
   typed = {};
+  held = {};
+  inTurn.clear();
+  failedOnce.clear();
   const self: Device = { id: "dev_this_phone", name: "我的手机", kind: "viewer", platform: "android", online: true, createdAt: now(), lastSeenAt: now() };
   devices.push(self);
   useLive.setState({ link: "connecting" });
@@ -350,22 +459,8 @@ export function mockLink(): Link {
           return { agents };
         case "terminal.read":
           return { ...screen(p.agent), cols: 46, rows: 28, how: "screen", complete: true };
-        case "terminal.send": {
-          const a = agents.find((x) => x.key === p.agent);
-          // Like Claude Code: text typed during a turn waits in the input box until the turn ends.
-          if (a?.status === "working" && p.text) {
-            agents = agents.map((x) => (x.key === p.agent ? { ...x, queued: (x.queued ?? 0) + 1, queuedText: x.queuedText ?? p.text, queuedSince: x.queuedSince ?? now() } : x));
-            publish();
-            return { ok: true, position: 0, agentStatus: "working", waiting: true };
-          }
-          if (a?.sessionKey && p.text) {
-            const list = (sent[a.sessionKey] ??= []);
-            list.push({ id: `${a.sessionKey}#sent${list.length}`, session: a.sessionKey, ts: now(), kind: "user_message", text: p.text } as ConvEvent);
-          }
-          agents = agents.map((x) => (x.key === p.agent ? { ...x, status: "working", statusSince: now(), errored: undefined, statusNote: undefined } : x));
-          publish();
-          return { ok: true };
-        }
+        case "terminal.send":
+          return demoSend(p.agent ?? "", p.text ?? "");
         case "terminal.keys":
           agents = agents.map((a) => (a.key === p.agent && a.status === "blocked" ? { ...a, status: "working", statusSince: now(), errored: undefined, statusNote: undefined } : a));
           publish();
@@ -387,8 +482,7 @@ export function mockLink(): Link {
             return { sessionKey: p.sub, events: p.before ? [] : subConversation(p.sub), more: false };
           }
           if (!a?.sessionKey) return { sessionKey: null, events: [], more: false };
-          const all = a.sessionKey === "claude:demo-1" ? [...history(a.sessionKey), ...conversation(a.sessionKey)] : conversation(a.sessionKey);
-          return { sessionKey: a.sessionKey, ...page([...all, ...(sent[a.sessionKey] ?? [])], p.limit ?? 120, p.before) };
+          return { sessionKey: a.sessionKey, ...page([...baseConversation(a.sessionKey), ...(sent[a.sessionKey] ?? [])], p.limit ?? 120, p.before) };
         }
         case "session.children": {
           const a = agents.find((x) => x.key === p.agent);
@@ -434,12 +528,33 @@ export function mockLink(): Link {
     },
     subscribe(_to: string, stream: "terminal" | "session", params: unknown, onEvent: (event: any) => void, onState?: (event: any) => void) {
       onState?.({ status: "open", result: { kind: stream } });
+      const p = (params ?? {}) as Partial<TerminalStreamParams> & { sub?: string };
       if (stream === "terminal") {
-        const agent = (params as { agent?: string } | null)?.agent;
-        const timer = setInterval(() => onEvent({ kind: "terminal", screen: { ...screen(agent), cols: 46, rows: 28 }, at: now() }), 500);
-        return () => clearInterval(timer);
+        // Queue marks for the bubbles of messages sent from here.
+        const stop = p.agent ? listen(queueSinks, p.agent, onEvent) : () => undefined;
+        // Like a host: no screen for a queue-only stream; for a rows viewer, the whole screen once, then what changed.
+        if (p.screen === false) return stop;
+        let last: string[] | null = null;
+        let seq = 0;
+        const paint = () => {
+          const s = screen(p.agent);
+          if (!p.rows) return onEvent({ kind: "terminal", screen: { ...s, cols: 46, rows: 28 }, at: now() });
+          const lines = s.ansi.split("\n");
+          const change = rowsChange(last, lines);
+          if (!change) return;
+          last = lines;
+          onEvent({ kind: "terminal_rows", seq: ++seq, cols: 46, rows: 28, ...change, at: now() } satisfies TerminalRowsEvent);
+        };
+        const first = setTimeout(paint, 120);
+        const timer = setInterval(paint, 500);
+        return () => {
+          clearTimeout(first);
+          clearInterval(timer);
+          stop();
+        };
       }
-      return () => undefined;
+      const session = p.sub ? undefined : agents.find((x) => x.key === p.agent)?.sessionKey;
+      return session ? listen(sessionSinks, session, onEvent) : () => undefined;
     },
     ping() {
       useLive.setState({ rttMs: 30 + Math.round(Math.random() * 20) });
@@ -447,6 +562,8 @@ export function mockLink(): Link {
     close() {
       clearTimeout(boot);
       clearInterval(tick);
+      for (const t of timers) clearTimeout(t);
+      timers = [];
     },
   };
 }
@@ -490,7 +607,32 @@ export const mockApi = {
 
 type AssistantSink = { upsert: (item: AssistantItem) => void; busy: (busy: boolean, label?: string) => void; reset: (s: AssistantState) => void };
 let assistantItems: AssistantItem[] = [];
-let assistantReminders: Reminder[] = [];
+/** Seeded on first use; cancelling them all shows the empty state. */
+let assistantReminders: Reminder[] | null = null;
+
+/** What the demo starts with: a time that also watches an agent, a long one tomorrow, and two that only watch. */
+function demoReminders(): Reminder[] {
+  const t = now();
+  const tomorrow = new Date(t + 86_400_000);
+  tomorrow.setHours(9, 30, 0, 0);
+  return [
+    { id: "r-demo-1", text: "该看一眼桌宠动画的进度了，顺便看看帧率有没有打到日志里", createdAt: t - 5 * MIN, dueAt: t + 25 * MIN, agent: agentKey(HOST_A, "hc", "t4f"), until: "finished" },
+    {
+      id: "r-demo-2",
+      text: "把 notes-cli 0.2.8 的发布说明发到群里：先列三个修复（导出时中文文件名乱码、同步冲突时丢了最后一次编辑、Windows 上路径大小写不一致），再写升级步骤，最后提醒大家旧的配置文件要手动迁移，不然启动会报错，迁移命令在 README 的“升级”一节。",
+      createdAt: t - 50 * MIN,
+      dueAt: tomorrow.getTime(),
+    },
+    { id: "r-demo-3", text: "重启 relay 那个在等你拍板了", createdAt: t - 12 * MIN, agent: agentKey(HOST_B, "hc", "t8"), until: "blocked" },
+    { id: "r-demo-4", text: "「日志清理脚本影响范围评估」回完了", createdAt: t - 3 * MIN, agent: agentKey(HOST_B, "hc", "t3"), until: "finished" },
+  ];
+}
+
+function remindersNow(): Reminder[] {
+  // The relay fires due reminders and drops them; the demo just lets them go.
+  assistantReminders = (assistantReminders ?? demoReminders()).filter((r) => !r.dueAt || r.dueAt > now());
+  return assistantReminders;
+}
 let assistantConfirm: AssistantConfirm = "never";
 let assistantSink: AssistantSink | null = null;
 
@@ -506,7 +648,7 @@ function aput(item: AssistantItem) {
 }
 
 function demoState(): AssistantState {
-  return { items: assistantItems.slice(), busy: false, ready: true, voice: false, model: "演示", reminders: assistantReminders.slice(), settings: { confirm: assistantConfirm } };
+  return { items: assistantItems.slice(), busy: false, ready: true, voice: false, model: "演示", reminders: remindersNow().slice(), settings: { confirm: assistantConfirm } };
 }
 
 export const mockAssistant = {
@@ -525,19 +667,38 @@ export const mockAssistant = {
       const done = agents.filter((a) => a.status === "done" && !a.isShell);
       if (/提醒|叫我/.test(text)) {
         const r: Reminder = { id: aid("r"), text: text.replace(/^(帮我|请)?/, "").slice(0, 40), createdAt: now(), dueAt: now() + 10 * MIN };
-        assistantReminders = [...assistantReminders, r];
+        assistantReminders = [...remindersNow(), r];
         aput({ id: aid("a"), ts: now(), role: "assistant", text: "好，10 分钟后提醒你。", steps: ["设了一个提醒"], via: "text" });
         assistantSink?.reset(demoState());
       } else if (/发|回|继续|删|同意|批准/.test(text) && blocked[0]) {
         const a = blocked[0];
+        // As the relay does it: the card names the agent and its computer, carries the message made from
+        // the person's words and those words; it runs at once unless "ask first" is on. Nothing real is sent.
+        const sent = "可以，删掉旧的迁移脚本吧。";
+        const ask = assistantConfirm === "always";
+        const name = a.where?.split(" / ")[0] || a.title;
         aput({
           id: aid("act"),
           ts: now(),
           role: "assistant",
-          text: "要我这样做吗？",
-          action: { id: aid("x"), kind: "send", agent: a.key, agentTitle: a.title, device: a.deviceId, text: "可以，删掉吧", summary: `给「${a.title}」发送：可以，删掉吧`, state: "pending", createdAt: now() },
+          text: "",
+          action: {
+            id: aid("x"),
+            kind: "send",
+            agent: a.key,
+            agentTitle: a.title,
+            agentName: name,
+            device: a.deviceId,
+            deviceName: devices.find((d) => d.id === a.deviceId)?.name,
+            text: sent,
+            said: text.trim() === sent ? undefined : text.trim(),
+            summary: `给「${a.title}」发送：${sent}`,
+            state: ask ? "pending" : "done",
+            result: ask ? undefined : "发了（演示，没有真的发）",
+            createdAt: now(),
+          },
         });
-        aput({ id: aid("a"), ts: now(), role: "assistant", text: `我准备给「${a.title}」回一句“可以，删掉吧”，你点确认我就发。`, steps: [`读了「${a.title}」的对话`], via: "text" });
+        aput({ id: aid("a"), ts: now() + 1, role: "assistant", text: ask ? "点确认就发。" : "发了，回了我告诉你。", steps: [`读了「${name}」的对话`, ...(ask ? [] : [`给「${name}」发了消息`])], via: "text" });
       } else if (/等|需要|卡/.test(text)) {
         aput({
           id: aid("a"),
@@ -582,14 +743,14 @@ export const mockAssistant = {
   decide(id: string, decision: "confirm" | "cancel") {
     const it = assistantItems.find((x) => x.action?.id === id);
     if (!it?.action || it.action.state !== "pending") return;
-    aput({ ...it, action: { ...it.action, state: decision === "confirm" ? "done" : "cancelled", result: decision === "confirm" ? "已发送（演示，没有真的发）" : "已取消" } });
+    aput({ ...it, action: { ...it.action, state: decision === "confirm" ? "done" : "cancelled", result: decision === "confirm" ? "发了（演示，没有真的发）" : "不做了" } });
   },
   clear() {
     assistantItems = [];
     assistantSink?.reset(demoState());
   },
   cancelReminder(id: string) {
-    assistantReminders = assistantReminders.filter((r) => r.id !== id);
+    assistantReminders = remindersNow().filter((r) => r.id !== id);
     assistantSink?.reset(demoState());
   },
   setConfirm(confirm: AssistantConfirm) {

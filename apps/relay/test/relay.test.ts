@@ -278,6 +278,32 @@ test("stream subscriptions stay between caller and target host", async () => {
   p.close();
 });
 
+test("a phone that reconnects gets its streams back; the host stops the old ones", async () => {
+  const host = await pair("host", "resub host");
+  const phone = await pair("viewer", "resub phone");
+  const h = await Client.open(host.token);
+  const p1 = await Client.open(phone.token);
+  await h.next("snapshot");
+  await p1.next("snapshot");
+  p1.send({ type: "stream_subscribe", id: "r1", to: host.device.id, stream: "terminal", params: { agent: "t1" } });
+  h.send({ type: "stream_open", id: (await h.next("stream_subscribe")).id, result: { kind: "terminal" } });
+  await p1.next("stream_open", (f) => f.id === "r1");
+  // A new socket of the same phone replaces the old one before its close is seen (mobile networks).
+  const p2 = await Client.open(phone.token);
+  await p2.next("snapshot");
+  assert.equal((await h.next("stream_unsubscribe", (f) => f.id === "r1")).from, phone.device.id);
+  p2.send({ type: "stream_subscribe", id: "r1", to: host.device.id, stream: "terminal", params: { agent: "t1" } });
+  h.send({ type: "stream_open", id: (await h.next("stream_subscribe", (f) => f.id === "r1")).id, result: { kind: "terminal" } });
+  assert.equal((await p2.next("stream_open", (f) => f.id === "r1")).error, undefined);
+  h.send({ type: "stream_event", id: "r1", event: { kind: "terminal", screen: { text: "again" } } });
+  assert.deepEqual((await p2.next("stream_event", (f) => f.id === "r1")).event, { kind: "terminal", screen: { text: "again" } });
+  // The host going away ends the phone's stream, so it can subscribe again once it is back.
+  h.close();
+  assert.equal((await p2.next("stream_open", (f) => f.id === "r1" && !!f.error)).error?.code, "offline");
+  p1.close();
+  p2.close();
+});
+
 test("host-to-host calls work (joint debugging)", async () => {
   const a = await pair("host", "A");
   const b = await pair("host", "B");

@@ -450,7 +450,7 @@ export function callScreen(): HTMLElement {
     <div class="c-top"><span class="a-round">${ICON.down}</span><span class="c-timer">${t("通话中", "On call")} <span class="c-time">02:31</span></span><span class="a-round">${ICON.cc}</span></div>
     <div class="c-face" data-state="connecting">
       <span class="c-ring"></span><span class="c-ring"></span>
-      <img class="f-a" src="${A}call/connecting.webp" alt="" />
+      <img class="f-a" src="${A}call/connecting.webp" alt="" loading="lazy" />
       <img class="f-b is-off" alt="" />
       <span class="c-mute">${ICON.micOff}</span>
     </div>

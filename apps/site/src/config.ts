@@ -17,6 +17,8 @@ export const SITE = {
   /** Relative to the page, so the site works under any base path. */
   video: {
     src: "video/intro.mp4",
+    /** 720p copy, about a third of the size; the default on phones and slow connections. */
+    srcSd: "video/intro-720.mp4",
     poster: "video/intro-poster.webp",
   },
   commands: {

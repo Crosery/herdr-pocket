@@ -125,18 +125,44 @@ function sameStyle(a: Sgr, b: Sgr) {
 
 /** Parse a snapshot (with or without escapes) into styled lines; trailing blank lines are trimmed. */
 export function parseAnsi(input: string): TermLine[] {
+  const { lines } = parseLines(input, {});
+  while (lines.length > 1 && lines[lines.length - 1]!.runs.every((r) => !r.text.trim() && !r.bg)) lines.pop();
+  return lines;
+}
+
+/** One line, starting in style `start` (the previous line's `end`); `end` is the style it leaves on. */
+export function parseAnsiLine(line: string, start: Sgr = {}): { line: TermLine; end: Sgr } {
+  const r = parseLines(line, start);
+  return { line: r.lines[0] ?? { runs: [], cells: 0 }, end: r.end };
+}
+
+/** A string naming a style; "" for the default one. */
+export function sgrKey(s: Sgr): string {
+  const flags = `${s.bold ? "b" : ""}${s.dim ? "d" : ""}${s.italic ? "i" : ""}${s.underline ? "u" : ""}${s.inverse ? "r" : ""}`;
+  return s.fg || s.bg || flags ? `${s.fg ?? ""}/${s.bg ?? ""}/${flags}` : "";
+}
+
+function parseLines(input: string, start: Sgr): { lines: TermLine[]; end: Sgr } {
   const lines: TermLine[] = [];
   let runs: Run[] = [];
   let cells = 0;
-  let st: Sgr = {};
+  let st: Sgr = start;
 
-  const push = (ch: string, wide: boolean) => {
+  const push = (text: string, wide: boolean, n: number) => {
     const last = runs[runs.length - 1];
-    if (last && !!last.wide === wide && sameStyle(last, st)) last.text += ch;
-    else runs.push({ ...st, text: ch, wide: wide || undefined });
-    cells += wide ? 2 : 1;
+    if (last && !!last.wide === wide && sameStyle(last, st)) last.text += text;
+    else runs.push({ ...st, text, wide: wide || undefined });
+    cells += wide ? 2 * n : n;
   };
   const endLine = () => {
+    // Trailing spaces without a background draw nothing.
+    const last = runs[runs.length - 1];
+    if (last && !last.bg && !last.inverse) {
+      const trimmed = last.text.replace(/ +$/, "");
+      cells -= last.text.length - trimmed.length;
+      if (trimmed) last.text = trimmed;
+      else runs.pop();
+    }
     lines.push({ runs, cells });
     runs = [];
     cells = 0;
@@ -145,6 +171,19 @@ export function parseAnsi(input: string): TermLine[] {
   const s = input;
   let i = 0;
   while (i < s.length) {
+    const code = s.charCodeAt(i);
+    if (code >= 0x20 && code < 0x7f) {
+      // Plain ASCII: one slice for the whole stretch.
+      let j = i + 1;
+      while (j < s.length) {
+        const c = s.charCodeAt(j);
+        if (c < 0x20 || c >= 0x7f) break;
+        j++;
+      }
+      push(s.slice(i, j), false, j - i);
+      i = j;
+      continue;
+    }
     const ch = s[i]!;
     if (ch === "\x1b") {
       const n = s[i + 1];
@@ -182,7 +221,7 @@ export function parseAnsi(input: string): TermLine[] {
     }
     if (ch === "\t") {
       const pad = 8 - (cells % 8);
-      for (let k = 0; k < pad; k++) push(" ", false);
+      push(" ".repeat(pad), false, pad);
       i++;
       continue;
     }
@@ -196,22 +235,10 @@ export function parseAnsi(input: string): TermLine[] {
       if (last) last.text += glyph;
       continue;
     }
-    push(glyph, isWide(cp));
+    push(glyph, isWide(cp), 1);
   }
   endLine();
-
-  // Trim trailing blank lines (and trailing spaces without a background on each line).
-  for (const l of lines) {
-    const last = l.runs[l.runs.length - 1];
-    if (last && !last.bg && !last.inverse) {
-      const trimmed = last.text.replace(/ +$/, "");
-      l.cells -= last.text.length - trimmed.length;
-      if (trimmed) last.text = trimmed;
-      else l.runs.pop();
-    }
-  }
-  while (lines.length > 1 && lines[lines.length - 1]!.runs.every((r) => !r.text.trim() && !r.bg)) lines.pop();
-  return lines;
+  return { lines, end: st };
 }
 
 function rgb(h: string): [number, number, number] {
