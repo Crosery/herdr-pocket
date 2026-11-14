@@ -5,6 +5,7 @@ import {
   PROTOCOL_VERSION,
   agentKey,
   parseAgentKey,
+  rowsChange,
   type Agent,
   type AgentSource,
   type LayoutSpace,
@@ -14,8 +15,10 @@ import {
   type RpcMethod,
   type RpcMethods,
   type ServerFrame,
+  type TerminalRowsEvent,
 } from "@herdr-pocket/protocol";
 import { HcAdapter, type AppNames } from "./hc.ts";
+import type { ScreenLines } from "./hcscreen.ts";
 import { HerdrApp, NoDesktopApp, checkFolder, herdrCommandArgs, installedLaunchers, launcherArgv, resumeArgv, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
@@ -406,30 +409,44 @@ export class Host {
     const agentName = p.agent;
     try {
       const a = this.resolve(agentName);
-      if (this.streamStops.has(f.id)) throw new RpcFailure("bad_request", "重复的流 id");
-      this.streamMeta.set(f.id, { from: f.from, kind: f.stream, agent: a.key });
+      const prev = this.streamMeta.get(f.id);
+      if (prev && prev.from !== f.from) throw new RpcFailure("bad_request", "重复的流 id");
+      // The same viewer again (it reconnected through a relay that did not end the old one): the new one replaces it.
+      if (prev) this.stopStream(f.id);
+      const meta = { from: f.from, kind: f.stream, agent: a.key };
+      this.streamMeta.set(f.id, meta);
       if (f.stream === "terminal") {
-        const onUpdate = (screen: unknown) => this.sendStream(f.id, { kind: "terminal", screen, at: Date.now() });
-        const onError = (error: Error) => this.sendStream(f.id, { kind: "stale", message: error.message, at: Date.now() });
-        let stop: () => void;
-        if (a.source === "hc") {
-          stop = await this.hc.watch(a.localId, Math.min(Math.max(Number(p.history ?? 120) || 120, 0), 600), (s) => onUpdate(s), onError);
-        } else {
-          let stopped = false;
-          const tick = async () => {
-            try {
-              const r = a.source === "herdr" ? await this.herdr.read(a.localId, 400) : null;
-              if (r) onUpdate(r);
-            } catch (e) {
-              onError(e as Error);
-            }
-          };
-          const timer = setInterval(() => void tick(), 500);
-          void tick();
-          stop = () => {
-            stopped = true;
-            if (stopped) clearInterval(timer);
-          };
+        let stop: () => void = () => undefined;
+        // `screen: false`: only queue notices (they go to every terminal stream of the agent).
+        if (p.screen !== false) {
+          const paint = this.terminalPainter(f.id, p.rows === true);
+          const onError = (error: Error) => this.sendStream(f.id, { kind: "stale", message: error.message, at: Date.now() });
+          if (a.source === "hc") {
+            const history = Math.min(Math.max(Number(p.history ?? 120) || 120, 0), 600);
+            stop = await this.hc.watch(a.localId, history, paint, onError, { text: p.rows !== true });
+          } else {
+            let busy = false;
+            const tick = async () => {
+              if (busy) return;
+              busy = true;
+              try {
+                const r = a.source === "herdr" ? await this.herdr.read(a.localId, 400) : null;
+                if (r) paint({ lines: (r.ansi ?? r.text).split("\n"), text: r.text, cols: 0, rows: 0 });
+              } catch (e) {
+                onError(e as Error);
+              } finally {
+                busy = false;
+              }
+            };
+            const timer = setInterval(() => void tick(), 500);
+            void tick();
+            stop = () => clearInterval(timer);
+          }
+        }
+        // Unsubscribed (or replaced) while the watch was starting.
+        if (this.streamMeta.get(f.id) !== meta) {
+          stop();
+          return;
         }
         this.streamStops.set(f.id, stop);
         this.send({ type: "stream_open", id: f.id, result: { kind: "terminal", agent: a.key } });
@@ -478,6 +495,33 @@ export class Host {
       this.send({ type: "stream_open", id: f.id, error });
       if (error.code !== "not_found") this.note("warn", "stream", `${f.stream} stream for ${String(agentName)} failed: ${error.code}: ${error.message}`);
     }
+  }
+
+  /**
+   * Sends a terminal's paints on stream `id`, unchanged ones skipped. `rows`:
+   * as `terminal_rows` changes (only what moved or changed); else a whole
+   * `terminal` screen each time, for apps before that.
+   */
+  private terminalPainter(id: string, rows: boolean): (paint: ScreenLines) => void {
+    let last: string[] | null = null;
+    let lastText: string | undefined;
+    let seq = 0;
+    return ({ lines, text, cols, rows: height }) => {
+      if (!rows) {
+        const same = last && text === lastText && last.length === lines.length && lines.every((l, i) => l === last![i]);
+        if (same) return;
+        last = lines;
+        lastText = text;
+        const screen = { ansi: lines.join("\n"), text: text ?? "", ...(cols ? { cols, rows: height } : {}) };
+        this.sendStream(id, { kind: "terminal", screen, at: Date.now() });
+        return;
+      }
+      const change = rowsChange(last, lines);
+      if (!change) return;
+      last = lines;
+      const event: TerminalRowsEvent = { kind: "terminal_rows", seq: ++seq, cols, rows: height, ...change, at: Date.now() };
+      this.sendStream(id, event);
+    };
   }
 
   private stopStream(id: string): void {

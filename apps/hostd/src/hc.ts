@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { SHELL_HARNESSES, normalizeStatus, type Agent, type AgentStatus } from "@herdr-pocket/protocol";
 import { base, cleanTitle, debounce, lineSplitter, run } from "./util.ts";
-import { HcScreens } from "./hcscreen.ts";
+import { HcScreens, type ScreenLines } from "./hcscreen.ts";
 import { defaultHcBin, programName } from "./platform.ts";
 
 /** Subset of a herdr-core (`hc`) terminal object we rely on. */
@@ -351,9 +351,9 @@ export class HcAdapter extends EventEmitter {
     return { text: r.text ?? "", how: r.how, complete: r.complete };
   }
 
-  async watch(address: string, history: number, onUpdate: (s: { ansi: string; text: string; cols: number; rows: number }) => void, onError: (e: Error) => void): Promise<() => void> {
+  async watch(address: string, history: number, onUpdate: (s: ScreenLines) => void, onError: (e: Error) => void, opts: { text?: boolean } = {}): Promise<() => void> {
     try {
-      return await this.screens.watch(address, history, onUpdate, onError);
+      return await this.screens.watch(address, history, onUpdate, onError, opts);
     } catch (e) {
       onError(e as Error);
       throw e;

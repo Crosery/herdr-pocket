@@ -442,9 +442,14 @@ export class Screen {
    * cells and blank lines at the end trimmed. Lines end with "\n".
    */
   toAnsi(historyLines = 0): string {
+    return this.ansiLines(historyLines).join("\n");
+  }
+
+  /** The lines of `toAnsi`, each with its own colors (none carries over to the next). */
+  ansiLines(historyLines = 0): string[] {
     const rows = [...this.scrollback.slice(Math.max(0, this.scrollback.length - historyLines)), ...this.grid];
     while (rows.length && isBlank(rows[rows.length - 1]!)) rows.pop();
-    return rows.map(rowToAnsi).join("\n");
+    return rows.map(rowToAnsi);
   }
 
   toText(historyLines = 0): string {

@@ -6,6 +6,7 @@ import {
   PUT_LIMITS,
   agentKey,
   pairLink,
+  rowsChange,
   type Agent,
   type AssistantConfirm,
   type AssistantItem,
@@ -21,6 +22,8 @@ import {
   type PairResponse,
   type RpcMethod,
   type SubSession,
+  type TerminalRowsEvent,
+  type TerminalStreamParams,
 } from "@herdr-pocket/protocol";
 import { useLive } from "./store";
 import { isWide } from "./ansi";
@@ -525,16 +528,32 @@ export function mockLink(): Link {
     },
     subscribe(_to: string, stream: "terminal" | "session", params: unknown, onEvent: (event: any) => void, onState?: (event: any) => void) {
       onState?.({ status: "open", result: { kind: stream } });
-      const { agent, sub } = (params ?? {}) as { agent?: string; sub?: string };
+      const p = (params ?? {}) as Partial<TerminalStreamParams> & { sub?: string };
       if (stream === "terminal") {
-        const timer = setInterval(() => onEvent({ kind: "terminal", screen: { ...screen(agent), cols: 46, rows: 28 }, at: now() }), 500);
-        const stop = agent ? listen(queueSinks, agent, onEvent) : () => undefined;
+        // Queue marks for the bubbles of messages sent from here.
+        const stop = p.agent ? listen(queueSinks, p.agent, onEvent) : () => undefined;
+        // Like a host: no screen for a queue-only stream; for a rows viewer, the whole screen once, then what changed.
+        if (p.screen === false) return stop;
+        let last: string[] | null = null;
+        let seq = 0;
+        const paint = () => {
+          const s = screen(p.agent);
+          if (!p.rows) return onEvent({ kind: "terminal", screen: { ...s, cols: 46, rows: 28 }, at: now() });
+          const lines = s.ansi.split("\n");
+          const change = rowsChange(last, lines);
+          if (!change) return;
+          last = lines;
+          onEvent({ kind: "terminal_rows", seq: ++seq, cols: 46, rows: 28, ...change, at: now() } satisfies TerminalRowsEvent);
+        };
+        const first = setTimeout(paint, 120);
+        const timer = setInterval(paint, 500);
         return () => {
+          clearTimeout(first);
           clearInterval(timer);
           stop();
         };
       }
-      const session = sub ? undefined : agents.find((x) => x.key === agent)?.sessionKey;
+      const session = p.sub ? undefined : agents.find((x) => x.key === p.agent)?.sessionKey;
       return session ? listen(sessionSinks, session, onEvent) : () => undefined;
     },
     ping() {

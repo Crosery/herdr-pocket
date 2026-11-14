@@ -602,10 +602,13 @@ export function ChatView({
       return mergeEvents(old, page);
     });
   }, [q.data]);
+  const [attempt, setAttempt] = useState(0);
+  const failures = useRef(0);
   useEffect(() => {
     if (!active) return;
     setStreamState("connecting");
     let opened = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     const stop = subscribe(agent.deviceId, "session", { agent: agent.key, sub }, (event) => {
       if (event?.kind === "session" && event.event) {
         const e = event.event as ConvEvent;
@@ -617,13 +620,20 @@ export function ChatView({
       setStreamState(state.status === "open" ? "live" : "error");
       // A stream that reopens after a drop may have missed events; the page query fills them in.
       if (state.status === "open") {
+        failures.current = 0;
         if (opened) void q.refetch();
         opened = true;
+      } else {
+        // Refused, or ended because the computer went away: try again a little later.
+        retry ??= setTimeout(() => setAttempt((n) => n + 1), Math.min(30_000, 3000 * 2 ** failures.current++));
       }
     });
-    return stop;
+    return () => {
+      clearTimeout(retry);
+      stop();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, agent.deviceId, agent.key, sub]);
+  }, [active, agent.deviceId, agent.key, sub, attempt]);
   const kids = useQuery({
     queryKey: ["session.children", agent.key, sub ?? null],
     queryFn: () => call(agent.deviceId, "session.children", { agent: agent.key, sub }),

@@ -123,6 +123,7 @@ export async function revokeDevice(server: string, token: string, id: string): P
 // ---------------------------------------------------------------------------
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; method?: string; to?: string };
+type Stream = { id: string; to: string; stream: "terminal" | "session"; params: unknown; onEvent: StreamEvent; onState?: StreamEvent };
 
 /** React Native's WebSocket also takes request headers (the DOM typing doesn't know). */
 type RNWebSocket = new (url: string, protocols: string | string[] | null, options: { headers: Record<string, string> }) => WebSocket;
@@ -130,7 +131,7 @@ type RNWebSocket = new (url: string, protocols: string | string[] | null, option
 class SocketLink implements Link {
   private ws: WebSocket | null = null;
   private pending = new Map<string, Pending>();
-  private streams = new Map<string, { to: string; stream: "terminal" | "session"; params: unknown; onEvent: StreamEvent; onState?: StreamEvent }>();
+  private streams = new Map<string, Stream>();
   private seq = 0;
   private backoff = 1000;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -163,7 +164,14 @@ class SocketLink implements Link {
       applog("info", "link", "socket open");
       this.backoff = 1000;
       this.send({ type: "hello", version: PROTOCOL_VERSION, platform: "mobile" });
-      for (const [id, s] of this.streams) this.send({ type: "stream_subscribe", id, to: s.to, stream: s.stream, params: s.params });
+      // Under new ids: an older relay or computer may still hold the old ones and refuse them as duplicates.
+      const open = [...this.streams.values()];
+      this.streams.clear();
+      for (const s of open) {
+        s.id = this.streamId();
+        this.streams.set(s.id, s);
+        this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
+      }
       this.ping();
     };
     ws.onmessage = (ev) => {
@@ -300,14 +308,17 @@ class SocketLink implements Link {
     this.send({ type: "ping", t: Date.now() });
   }
 
+  private streamId() {
+    return `s${Date.now().toString(36)}${(this.seq++).toString(36)}`;
+  }
+
   subscribe(to: string, stream: "terminal" | "session", params: unknown, onEvent: StreamEvent, onState?: StreamEvent): () => void {
-    const id = `s${Date.now().toString(36)}${(this.seq++).toString(36)}`;
-    const entry = { to, stream, params, onEvent, onState };
-    this.streams.set(id, entry);
-    if (!this.send({ type: "stream_subscribe", id, to, stream, params })) onState?.({ status: "error", message: "还没连上服务器" });
+    const entry: Stream = { id: this.streamId(), to, stream, params, onEvent, onState };
+    this.streams.set(entry.id, entry);
+    if (!this.send({ type: "stream_subscribe", id: entry.id, to, stream, params })) onState?.({ status: "error", message: "还没连上服务器" });
     return () => {
-      this.streams.delete(id);
-      this.send({ type: "stream_unsubscribe", id, to });
+      if (this.streams.get(entry.id) === entry) this.streams.delete(entry.id);
+      this.send({ type: "stream_unsubscribe", id: entry.id, to });
     };
   }
 
