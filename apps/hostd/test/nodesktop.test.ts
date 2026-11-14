@@ -47,6 +47,7 @@ test("without the desktop app, new agents can still be made: spaces.list allows 
   assert.equal(r.canCreate, true);
   assert.equal(r.reason, undefined);
   assert.deepEqual(r.spaces, []);
+  assert.equal(r.standalone, true, "the phone shows no space choices");
   h.stop();
 });
 
@@ -81,6 +82,7 @@ test("a closed desktop window is still reported, not worked around", async () =>
   };
   const r = await call("spaces.list", {});
   assert.equal(r.canCreate, false);
+  assert.equal(r.standalone, undefined);
   await assert.rejects(call("agent.create", { launcher: "kimi" }), (e: any) => e.code === "unsupported" && /没有打开/.test(e.message));
   assert.equal(started.length, 0);
   h.stop();

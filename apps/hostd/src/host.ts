@@ -717,15 +717,25 @@ export class Host {
       const launchers = await this.launchers;
       let spaces: Awaited<ReturnType<HerdrApp["spaces"]>> = [];
       let reason: string | undefined;
+      let standalone = false;
       if (this.opts.readOnly) reason = "这台电脑开了只读模式";
       else if (!this.sources.includes("hc")) reason = "这台电脑没有装桌面 herdr";
       try {
         spaces = await this.app.spaces();
       } catch (e) {
         // Without the desktop app (Windows, servers) new agents get terminals of their own.
-        if (!(e instanceof NoDesktopApp)) reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
+        if (e instanceof NoDesktopApp) standalone = true;
+        else reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
       }
-      return { spaces, launchers, folders: this.suggestFolders(spaces.map((x) => x.folder)), canCreate: !reason, reason, typesTask: true };
+      return {
+        spaces,
+        launchers,
+        folders: this.suggestFolders(spaces.map((x) => x.folder)),
+        canCreate: !reason,
+        reason,
+        typesTask: true,
+        ...(standalone ? { standalone } : {}),
+      };
     },
     "agent.create": async (p) => {
       this.writable();

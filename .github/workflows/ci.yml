@@ -96,6 +96,14 @@ jobs:
         run: |
           irm https://releases.herdr.dev/core/install.ps1 | iex
           Join-Path $env:LOCALAPPDATA "Programs\herdr-core" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      # Conversations on the phone come from Uniflo, a separate program.
+      - name: Install Uniflo
+        shell: powershell
+        run: |
+          $env:UNIFLO_NO_SETUP = "1"
+          $env:UNIFLO_INSTALL_DIR = Join-Path $env:LOCALAPPDATA "Programs\uniflo"
+          irm https://github.com/Crosery/uniflo/releases/latest/download/install.ps1 | iex
+          $env:UNIFLO_INSTALL_DIR | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Agents through the relay
         shell: powershell
         run: node --no-warnings .github/windows-agents/e2e.ts (Get-ChildItem dist\herdr-pocket-*.tar.gz).FullName

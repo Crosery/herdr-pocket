@@ -7,6 +7,7 @@
  * answer that question for the person.
  */
 import { base } from "./util.ts";
+import { programName } from "./platform.ts";
 import { HcAdapter, type HcTerminal } from "./hc.ts";
 
 export interface TypeTaskDeps {
@@ -32,7 +33,7 @@ export interface TypeTaskOptions {
 
 export type TypeTaskResult = { ok: true; waitedMs: number; how: "status" | "screen" } | { ok: false; waitedMs: number; reason: string };
 
-const SHELLS = new Set(["zsh", "bash", "sh", "fish", "dash", "tcsh", "nu", "login"]);
+const SHELLS = new Set(["zsh", "bash", "sh", "fish", "dash", "tcsh", "nu", "login", "pwsh", "powershell"]);
 
 /** A screen asking the person something; Enter there would answer it. */
 export const QUESTION =
@@ -85,7 +86,7 @@ export async function typeFirstTask(task: string, d: TypeTaskDeps, o: TypeTaskOp
       last = shape;
       sameSince = now;
     }
-    const fg = base(t?.foreground?.argv?.[0])?.replace(/^-/, "");
+    const fg = programName(base(t?.foreground?.argv?.[0])).replace(/^-/, "").toLowerCase();
     const known = !!t?.status?.app;
     const status = t ? HcAdapter.status(t) : undefined;
     const settled = now - sameSince >= stableMs;

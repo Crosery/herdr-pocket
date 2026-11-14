@@ -4,11 +4,13 @@
 // installs Herdr Pocket from the release bundle with scripts/install-host.ps1 (registered
 // with a pair code, running as the hidden logon service), pairs a stand-in phone and
 // drives agents through the relay with the same RPCs the app sends. The agent is
-// fake-agent.mjs, also installed as `claude.cmd` so it can be started from the "phone".
+// fake-agent.mjs, also installed as `claude.cmd` so it can be started from the "phone";
+// as `claude` it keeps a Claude Code transcript, which Uniflo (installed by the workflow)
+// serves as the conversation the phone shows.
 //
 //   node --no-warnings .github/windows-agents/e2e.ts <herdr-pocket-x.y.z.tar.gz>
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -33,6 +35,7 @@ rmSync(work, { recursive: true, force: true });
 mkdirSync(project, { recursive: true });
 const PORT = 7431;
 const server = `http://127.0.0.1:${PORT}`;
+const UNIFLO = "http://127.0.0.1:7311";
 const admin = randomBytes(24).toString("hex");
 const root = join(process.env.LOCALAPPDATA!, "Programs", "herdr-pocket");
 const fake = join(here, "fake-agent.mjs");
@@ -110,6 +113,9 @@ relay.stderr!.on("data", (d) => relayOut.push(String(d)));
 
 let ws: any;
 const started: string[] = [];
+let uniflo: ChildProcess | undefined;
+const unifloOut: string[] = [];
+const getJson = async (url: string): Promise<any> => (await fetch(url)).json();
 
 async function main(): Promise<void> {
   const v = hc("--version");
@@ -120,10 +126,18 @@ async function main(): Promise<void> {
 
   await until("the relay listens", async () => relayOut.join("").includes("listening on"));
 
+  // Uniflo first: the service looks for it when it starts.
+  const uv = spawnSync("uniflo", ["--version"], { encoding: "utf8", windowsHide: true });
+  check(uv.status === 0, `Uniflo is installed (${(uv.stdout || uv.stderr).trim()})`, uv.stderr);
+  uniflo = spawn("uniflo", ["daemon", "--foreground", "--no-update-check", "--no-price-sync"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  uniflo.stdout!.on("data", (d) => unifloOut.push(String(d)));
+  uniflo.stderr!.on("data", (d) => unifloOut.push(String(d)));
+  await until("the Uniflo daemon answers", async () => (await getJson(`${UNIFLO}/v1/health`))?.ok === true);
+
   // An agent program the phone may start: found as %USERPROFILE%\.local\bin\claude.cmd.
   const bin = join(homedir(), ".local", "bin");
   mkdirSync(bin, { recursive: true });
-  writeFileSync(join(bin, "claude.cmd"), `@echo off\r\n"${process.execPath}" "${fake}" %*\r\n`);
+  writeFileSync(join(bin, "claude.cmd"), `@echo off\r\nset FAKE_CLAUDE=1\r\n"${process.execPath}" "${fake}" %*\r\n`);
 
   // The computer: installed and registered as a person would, with an invite code.
   const hostCode = (await http("/v1/pair/codes", { token: admin, body: { kind: "host" } })).code as string;
@@ -173,6 +187,7 @@ async function main(): Promise<void> {
 
   const info = await rpc("host.info");
   check(info.platform === "win32" && info.sources.includes("hc"), "host.info: Windows, with herdr-core as a source", JSON.stringify(info));
+  check(info.sources.includes("uniflo"), "host.info: Uniflo is a source too", JSON.stringify(info));
 
   // 1. An agent someone started at the computer.
   const run = hc("run", "--bg", "--no-parent", "--no-notify", "--json", "--name", "ci-manual", "--cwd", project, "--", process.execPath, fake);
@@ -223,13 +238,43 @@ async function main(): Promise<void> {
   await rpc("terminal.send", { agent: sh.agent, text: "echo hp-shell-ok" });
   await until("a shell started from the phone runs commands", async () => /^\s*hp-shell-ok\s*$/m.test(await screen(sh.agent)), { detail: () => screen(sh.agent) });
 
-  // 3. The computer's own CLI, through the service's named pipe and the relay.
+  // What herdr-core reports here and what the phone makes of it (for reading a failure below).
+  const ls = JSON.parse(hc("ls", "--json").stdout || "[]");
+  for (const t of (Array.isArray(ls) ? ls : (ls.terminals ?? [])).filter((t: any) => started.includes(t.address))) {
+    console.log(`# hc ${t.address}: argv=${JSON.stringify(t.argv)} foreground=${JSON.stringify(t.foreground)} cwd=${t.cwd} status=${JSON.stringify(t.status)}`);
+  }
+  const agentList = async () => (await rpc("agents.list", { includeShells: true })).agents as any[];
+  for (const a of await agentList()) console.log(`# agent ${a.localId}: harness=${a.harness} isShell=${a.isShell} cwd=${a.cwd} session=${a.sessionKey ?? "-"}`);
+
+  // 3. Its conversation, as the phone's chat view reads it.
+  const sessionKey = await until("the phone finds the new agent's conversation (Uniflo)", async () => (await agentList()).find((a) => a.key === made.agent)?.sessionKey as string | undefined, {
+    ms: 90_000,
+    detail: async () => {
+      const a = (await agentList()).find((x) => x.key === made.agent);
+      const sessions = ((await getJson(`${UNIFLO}/v1/sessions?limit=10`)) as any[]).map((x) => ({ key: x.key, harness: x.harness, cwd: x.cwd }));
+      return JSON.stringify({ agent: a && { harness: a.harness, cwd: a.cwd, isShell: a.isShell }, sessions }, null, 1);
+    },
+  });
+  const conversation = async () => {
+    const r = await rpc("session.events", { agent: made.agent, limit: 40 });
+    return { key: r.sessionKey as string | null, text: JSON.stringify(r.events) };
+  };
+  const conv = await conversation();
+  check(conv.key === sessionKey && conv.text.includes("done: first task from the phone"), "session.events shows the first task and the reply", conv.text.slice(0, 1500));
+  await rpc("terminal.send", { agent: made.agent, text: "second message" });
+  await until("a message sent from the phone shows up in the conversation", async () => (await conversation()).text.includes("done: second message"), {
+    ms: 60_000,
+    detail: async () => (await conversation()).text.slice(0, 1500),
+  });
+
+  // 4. The computer's own CLI, through the service's named pipe and the relay.
   const list = hp("agents", "--all");
   check(list.status === 0 && list.stdout.includes(manual) && list.stdout.includes(made.terminal), "herdr-pocket agents (on the computer) lists them", list.stdout + list.stderr);
+  // Its own agents are read with hc; herdr-pocket read is for other computers' agents.
   const read = hp("read", `win-ci/${manual}`);
-  check(read.status === 0 && read.stdout.includes("got: hello from the phone"), "herdr-pocket read works on the computer", read.stdout + read.stderr);
+  check(read.status !== 0 && /that is this computer/.test(read.stdout + read.stderr), "herdr-pocket read points to hc for this computer's own agents", read.stdout + read.stderr);
 
-  // 4. Ending one from the phone.
+  // 5. Ending one from the phone.
   await rpc("terminal.kill", { agent: made.agent }, 30_000);
   await until("terminal.kill ends it", async () => {
     const r = hc("ls", "--json");
@@ -248,10 +293,12 @@ try {
   const log = join(process.env.LOCALAPPDATA!, "herdr-pocket", "hostd.log");
   if (existsSync(log)) console.error(`\n--- ${log}\n${readFileSync(log, "utf8").split("\n").slice(-80).join("\n")}`);
   console.error(`\n--- relay\n${relayOut.join("").split("\n").slice(-60).join("\n")}`);
+  if (unifloOut.length) console.error(`\n--- uniflo\n${unifloOut.join("").split("\n").slice(-30).join("\n")}`);
 } finally {
   ws?.close();
   for (const t of started) hc("kill", t);
   hp("service", "remove");
   relay.kill();
+  uniflo?.kill();
 }
 process.exit(code);

@@ -414,6 +414,11 @@ export interface RpcMethods {
       reason?: string;
       /** This host types a first task into programs that take none at start (agent.create waits for that, up to about a minute). */
       typesTask?: boolean;
+      /**
+       * No desktop herdr on this computer (herdr on Windows is herdr-core alone; servers): there are
+       * no spaces, and a new agent gets a terminal of its own in the folder. `spaceName` is unused.
+       */
+      standalone?: boolean;
     };
   };
   /**
@@ -935,7 +940,7 @@ export function compareVersions(a: string, b: string): number {
 // Helpers shared by host and app
 // ---------------------------------------------------------------------------
 
-export const SHELL_HARNESSES = new Set(["sh", "zsh", "bash", "fish", "nu", "pwsh", "shell"]);
+export const SHELL_HARNESSES = new Set(["sh", "zsh", "bash", "fish", "nu", "pwsh", "powershell", "shell"]);
 
 export function normalizeStatus(raw: string | null | undefined): AgentStatus {
   switch ((raw ?? "").toLowerCase()) {

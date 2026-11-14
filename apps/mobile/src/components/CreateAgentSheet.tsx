@@ -113,7 +113,9 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
   }, [q.data, visible, target.spaceName]);
 
   const d = q.data;
-  const isNew = spaceId === NEW;
+  // A computer without the desktop herdr (Windows): no spaces, just a terminal in a folder.
+  const standalone = !!d?.standalone;
+  const isNew = spaceId === NEW && !standalone;
   const chosenSpace = d?.spaces.find((s) => s.id === spaceId);
   const launch = d?.launchers.find((l) => l.id === launcher);
   // Programs that can't take a task at start get it typed in once they're up, where the computer does that.
@@ -137,7 +139,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
         host,
         "agent.create",
         {
-          ...(isNew ? { spaceName: spaceName.trim() || undefined } : { space: spaceId }),
+          ...(standalone ? {} : isNew ? { spaceName: spaceName.trim() || undefined } : { space: spaceId }),
           folder: folder.trim() || undefined,
           launcher,
           task: first,
@@ -167,7 +169,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
             <View style={{ width: 40, height: 5, borderRadius: 3, backgroundColor: p.divider }} />
           </View>
           <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: space.lg, paddingTop: space.sm }}>
-            <Text style={{ flex: 1, fontFamily: fonts.cute, fontSize: 22, lineHeight: 30, color: p.ink }}>{isNew ? "新建空间" : "在这里新建 agent"}</Text>
+            <Text style={{ flex: 1, fontFamily: fonts.cute, fontSize: 22, lineHeight: 30, color: p.ink }}>{standalone ? "新建 agent" : isNew ? "新建空间" : "在这里新建 agent"}</Text>
             <Pressable accessibilityRole="button" accessibilityLabel="关闭" onPress={onDismiss} hitSlop={8} style={{ width: 40, height: 40, alignItems: "center", justifyContent: "center" }}>
               <MaterialCommunityIcons name="close" size={22} color={p.muted} />
             </Pressable>
@@ -205,14 +207,16 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
                   </View>
                 ) : null}
 
-                <Field title="空间">
-                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
-                    <Chip on={isNew} onPress={() => { setSpaceId(NEW); setFolder(""); }} label="新建空间" lead={<MaterialCommunityIcons name="plus" size={18} color={p.ink} style={{ marginLeft: 4 }} />} />
-                    {d.spaces.map((s) => (
-                      <Chip key={s.id} on={spaceId === s.id} onPress={() => { setSpaceId(s.id); setFolder(s.folder ?? ""); }} label={s.name} lead={<SpaceBadge name={s.name} size={26} />} a11y={`空间 ${s.name}`} />
-                    ))}
-                  </View>
-                </Field>
+                {standalone ? null : (
+                  <Field title="空间">
+                    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
+                      <Chip on={isNew} onPress={() => { setSpaceId(NEW); setFolder(""); }} label="新建空间" lead={<MaterialCommunityIcons name="plus" size={18} color={p.ink} style={{ marginLeft: 4 }} />} />
+                      {d.spaces.map((s) => (
+                        <Chip key={s.id} on={spaceId === s.id} onPress={() => { setSpaceId(s.id); setFolder(s.folder ?? ""); }} label={s.name} lead={<SpaceBadge name={s.name} size={26} />} a11y={`空间 ${s.name}`} />
+                      ))}
+                    </View>
+                  </Field>
+                )}
 
                 {isNew ? (
                   <Field title="空间名字">
@@ -220,7 +224,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
                   </Field>
                 ) : null}
 
-                <Field title="文件夹" hint={isNew ? "不填就是 ~" : "不填就用这个空间的文件夹"}>
+                <Field title="文件夹" hint={isNew || standalone ? "不填就是 ~" : "不填就用这个空间的文件夹"}>
                   {folders.length ? (
                     <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.sm }}>
                       {folders.map((f) => (
@@ -276,7 +280,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
 
           <View style={{ paddingHorizontal: space.lg, paddingTop: space.sm, paddingBottom: insets.bottom + space.md, gap: space.xs, borderTopWidth: 1, borderTopColor: p.divider }}>
             <Text style={{ color: p.faint, fontSize: 12, textAlign: "center" }}>
-              {busy && takesTask && task.trim() && !launch?.takesTask ? "等它启动好再把第一句话打进去，可能要半分钟到一分钟" : "建好后，电脑上的 herdr 会自动切到这个空间"}
+              {busy && takesTask && task.trim() && !launch?.takesTask ? "等它启动好再把第一句话打进去，可能要半分钟到一分钟" : standalone ? "建好后，在电脑上用 hc attach 可以接手它" : "建好后，电脑上的 herdr 会自动切到这个空间"}
             </Text>
             <Button mode="contained" disabled={!canSubmit} loading={busy} onPress={submit} contentStyle={{ height: 50 }} style={{ borderRadius: radius.pill }} labelStyle={{ fontSize: 16 }}>
               {isNew ? "新建空间并启动" : "新建 agent"}

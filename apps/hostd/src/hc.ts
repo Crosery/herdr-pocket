@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { SHELL_HARNESSES, normalizeStatus, type Agent, type AgentStatus } from "@herdr-pocket/protocol";
 import { base, cleanTitle, debounce, lineSplitter, run } from "./util.ts";
 import { HcScreens } from "./hcscreen.ts";
-import { defaultHcBin } from "./platform.ts";
+import { defaultHcBin, programName } from "./platform.ts";
 
 /** Subset of a herdr-core (`hc`) terminal object we rely on. */
 export interface HcTerminal {
@@ -248,9 +248,9 @@ export class HcAdapter extends EventEmitter {
     this.emit("change");
   }
 
-  /** Program running in the terminal, e.g. claude-code, omp, sh. */
+  /** Program running in the terminal, e.g. claude-code, omp, sh (on Windows without `.exe`). */
   static harness(t: HcTerminal): string {
-    return t.status?.app || base(t.foreground?.argv?.[0]) || base(t.argv?.[0]) || "terminal";
+    return t.status?.app || programName(base(t.foreground?.argv?.[0])) || programName(base(t.argv?.[0])) || "terminal";
   }
 
   /**
@@ -299,7 +299,7 @@ export class HcAdapter extends EventEmitter {
       statusNote: HcAdapter.note(t),
       errored: ["error", "failed"].includes(t.status?.state?.toLowerCase() ?? "") || undefined,
       turn: t.turn,
-      isShell: !t.status && SHELL_HARNESSES.has(harness),
+      isShell: !t.status && SHELL_HARNESSES.has(harness.toLowerCase()),
       updatedAt: t.status_ms ?? t.created_ms ?? Date.now(),
     };
   }

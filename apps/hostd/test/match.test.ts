@@ -41,6 +41,19 @@ test("hc terminal maps to a unified agent", () => {
   assert.equal(sh.status, "idle");
 });
 
+test("Windows program names lose their extension: claude.exe is claude, PowerShell is a shell", () => {
+  const claude = HcAdapter.toAgent({ address: "t2", cwd: "C:\\p", foreground: { argv: ["claude.exe"] } }, "d");
+  assert.equal(claude.harness, "claude");
+  assert.equal(claude.isShell, false);
+  for (const exe of ["pwsh.exe", "powershell.exe", "PowerShell.EXE"]) {
+    assert.equal(HcAdapter.toAgent({ address: "t3", foreground: { argv: [exe] } }, "d").isShell, true, exe);
+  }
+  // Same matching as on macOS: harness claude + cwd finds the Claude Code session.
+  const u = new UnifloAdapter("http://127.0.0.1:9");
+  u.sessions = [{ key: "claude:s1", harness: "claude", cwd: "C:\\p", title: "Fix it", updated_at: Date.now() } as UnifloSession];
+  assert.equal(u.enrich([claude], new Map())[0]!.sessionKey, "claude:s1");
+});
+
 test("hc status, place and name follow what the desktop app shows", () => {
   const t = (extra: object) => ({ address: "t1", status: { app: "claude-code", state: "done" }, turn: 4, ...extra });
   // A finished turn already looked at in the app is idle there, not done.
