@@ -19,7 +19,7 @@
 ![Self-hosted](https://img.shields.io/badge/relay-self--hosted-f9a8d4)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-f472b6)](LICENSE)
 
-[部署](docs/deploy/README.md) · [模型与语音配置](docs/config.md) · [下载安卓 App](https://github.com/Crosery/herdr-pocket/releases/latest) · [官网源码](apps/site)
+[官网](https://crosery.github.io/herdr-pocket/) · [部署](docs/deploy/README.md) · [模型与语音配置](docs/config.md) · [下载安卓 App](https://github.com/Crosery/herdr-pocket/releases/latest) · [官网源码](apps/site)
 
 </div>
 

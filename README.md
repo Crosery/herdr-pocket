@@ -19,7 +19,7 @@ Message them, press keys, start new ones, or just call Xiaoyang, the assistant, 
 ![Self-hosted](https://img.shields.io/badge/relay-self--hosted-f9a8d4)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-f472b6)](LICENSE)
 
-[Deploy](docs/deploy/README.md) · [Models and voice](docs/config.md) · [Download the Android app](https://github.com/Crosery/herdr-pocket/releases/latest) · [Website source](apps/site)
+[Website](https://crosery.github.io/herdr-pocket/) · [Deploy](docs/deploy/README.md) · [Models and voice](docs/config.md) · [Download the Android app](https://github.com/Crosery/herdr-pocket/releases/latest) · [Website source](apps/site)
 
 </div>
 
