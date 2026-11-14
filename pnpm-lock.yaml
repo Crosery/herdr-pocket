@@ -222,7 +222,14 @@ importers:
         specifier: ^5.9.0
         version: 5.9.3
 
-  packages/protocol: {}
+  packages/protocol:
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.19.2
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
 
   packages/update:
     dependencies:
