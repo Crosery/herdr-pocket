@@ -38,6 +38,9 @@ export interface AppNames {
   tabs: Map<string, string>;
 }
 
+/** Interpreters an agent program runs inside; their name says nothing about the agent. */
+const RUNTIMES = new Set(["node", "bun", "deno", "python", "python3", "py", "cmd", "npx"]);
+
 const KEY_ALIASES: Record<string, string> = {
   enter: "enter",
   return: "enter",
@@ -250,7 +253,15 @@ export class HcAdapter extends EventEmitter {
 
   /** Program running in the terminal, e.g. claude-code, omp, sh (on Windows without `.exe`). */
   static harness(t: HcTerminal): string {
-    return t.status?.app || programName(base(t.foreground?.argv?.[0])) || programName(base(t.argv?.[0])) || "terminal";
+    if (t.status?.app) return t.status.app;
+    const fg = programName(base(t.foreground?.argv?.[0]));
+    const launched = programName(base(t.argv?.[0]));
+    // An agent installed by npm on Windows (claude.cmd) runs as node.exe, which is what the
+    // foreground shows; the program is the one the terminal was started with. A runtime
+    // started from a shell stays what it is.
+    const plain = (p: string) => RUNTIMES.has(p.toLowerCase()) || SHELL_HARNESSES.has(p.toLowerCase());
+    if (launched && fg && RUNTIMES.has(fg.toLowerCase()) && !plain(launched)) return launched;
+    return fg || launched || "terminal";
   }
 
   /**

@@ -48,6 +48,10 @@ test("Windows program names lose their extension: claude.exe is claude, PowerShe
   for (const exe of ["pwsh.exe", "powershell.exe", "PowerShell.EXE"]) {
     assert.equal(HcAdapter.toAgent({ address: "t3", foreground: { argv: [exe] } }, "d").isShell, true, exe);
   }
+  // npm's claude.cmd runs node.exe: the program started is the agent; node from a shell stays node.
+  assert.equal(HcAdapter.harness({ address: "t4", argv: ["claude.cmd"], foreground: { argv: ["node.exe", "cli.js"] } }), "claude");
+  assert.equal(HcAdapter.harness({ address: "t5", argv: ["pwsh.exe"], foreground: { argv: ["node.exe", "x.js"] } }), "node");
+  assert.equal(HcAdapter.harness({ address: "t6", argv: ["node"], foreground: { argv: ["node", "x.js"] } }), "node");
   // Same matching as on macOS: harness claude + cwd finds the Claude Code session.
   const u = new UnifloAdapter("http://127.0.0.1:9");
   u.sessions = [{ key: "claude:s1", harness: "claude", cwd: "C:\\p", title: "Fix it", updated_at: Date.now() } as UnifloSession];

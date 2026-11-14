@@ -239,9 +239,23 @@ async function main(): Promise<void> {
   await until("a shell started from the phone runs commands", async () => /^\s*hp-shell-ok\s*$/m.test(await screen(sh.agent)), { detail: () => screen(sh.agent) });
 
   // What herdr-core reports here and what the phone makes of it (for reading a failure below).
-  const ls = JSON.parse(hc("ls", "--json").stdout || "[]");
-  for (const t of (Array.isArray(ls) ? ls : (ls.terminals ?? [])).filter((t: any) => started.includes(t.address))) {
-    console.log(`# hc ${t.address}: argv=${JSON.stringify(t.argv)} foreground=${JSON.stringify(t.foreground)} cwd=${t.cwd} status=${JSON.stringify(t.status)}`);
+  // The terminal list as the service reads it (`hc connect`, terminal.list), not `hc ls`.
+  const listed = spawnSync("hc", ["connect"], {
+    input: `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "terminal.list", params: {} })}\n`,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15_000,
+  });
+  for (const line of (listed.stdout || "").split("\n")) {
+    let m: any;
+    try {
+      m = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    for (const t of m.id === 1 ? (m.result?.terminals ?? []) : []) {
+      if (started.includes(t.address)) console.log(`# hc ${t.address}: ${JSON.stringify({ argv: t.argv, foreground: t.foreground, status: t.status })}`);
+    }
   }
   const agentList = async () => (await rpc("agents.list", { includeShells: true })).agents as any[];
   for (const a of await agentList()) console.log(`# agent ${a.localId}: harness=${a.harness} isShell=${a.isShell} cwd=${a.cwd} session=${a.sessionKey ?? "-"}`);
