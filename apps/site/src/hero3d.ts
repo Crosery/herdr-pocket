@@ -116,8 +116,10 @@ function heartShape(): THREE.Shape {
 
 export function startHero3D(host: HTMLElement): () => void {
   const isSmall = window.innerWidth < 760;
-  const renderer = new THREE.WebGLRenderer({ antialias: !isSmall, alpha: false, powerPreference: "high-performance" });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, isSmall ? 1.5 : 1.6));
+  // Default GPU (no switch to a discrete one) and at most 1.25 device pixels per
+  // CSS pixel: the soft sky looks the same, at well under the old fill cost.
+  const renderer = new THREE.WebGLRenderer({ antialias: !isSmall, alpha: false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
@@ -328,6 +330,7 @@ export function startHero3D(host: HTMLElement): () => void {
   const ray = new THREE.Raycaster();
   let scroll = 0;
   let running = true;
+  let dead = false;
   let raf = 0;
   const timer = new THREE.Timer();
 
@@ -376,12 +379,12 @@ export function startHero3D(host: HTMLElement): () => void {
   window.addEventListener("scroll", onScroll, { passive: true });
 
   const io = new IntersectionObserver(([e]) => {
-    running = e.isIntersecting && !document.hidden;
+    running = !dead && e.isIntersecting && !document.hidden;
     if (running) loop();
   });
   io.observe(host);
   const onVis = () => {
-    running = !document.hidden && host.getBoundingClientRect().bottom > 0;
+    running = !dead && !document.hidden && host.getBoundingClientRect().bottom > 0;
     if (running) loop();
   };
   document.addEventListener("visibilitychange", onVis);
@@ -426,17 +429,31 @@ export function startHero3D(host: HTMLElement): () => void {
     renderer.render(skyScene, skyCam);
     renderer.render(scene, camera);
   };
+  // A machine that can't hold about 40 fps here gets the CSS gradient instead:
+  // of the first 120 on-screen frames, more than half slower than 25 ms ends the scene.
+  let sampled = 0;
+  let slow = 0;
+  let lastT = 0;
   const loop = () => {
     cancelAnimationFrame(raf);
     if (!running) return;
+    const now = performance.now();
+    if (sampled < 120 && lastT && now - lastT < 250) {
+      sampled++;
+      if (now - lastT > 25) slow++;
+      if (sampled === 120 && slow > 60) {
+        renderer.domElement.classList.remove("is-ready");
+        setTimeout(stop, 1300);
+        dead = running = false;
+        return;
+      }
+    }
+    lastT = now;
     frame();
     raf = requestAnimationFrame(loop);
   };
-  frame();
-  renderer.domElement.classList.add("is-ready");
-  loop();
-
-  return () => {
+  const stop = () => {
+    dead = true;
     running = false;
     cancelAnimationFrame(raf);
     io.disconnect();
@@ -446,6 +463,12 @@ export function startHero3D(host: HTMLElement): () => void {
     hero.removeEventListener("pointermove", onMove);
     document.removeEventListener("visibilitychange", onVis);
     renderer.dispose();
+    renderer.forceContextLoss();
     renderer.domElement.remove();
   };
+
+  frame();
+  renderer.domElement.classList.add("is-ready");
+  loop();
+  return stop;
 }

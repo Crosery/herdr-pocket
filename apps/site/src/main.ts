@@ -22,7 +22,7 @@ import {
   initNav,
   wrapTitleLines,
 } from "./sections";
-import { $, $$, finePointer, reducedMotion } from "./util";
+import { $, $$, afterLoad, finePointer, isNarrow, reducedMotion, slowNetwork } from "./util";
 
 gsap.registerPlugin(ScrollTrigger);
 document.documentElement.classList.add("js");
@@ -128,24 +128,22 @@ if (!reducedMotion()) {
   });
 }
 
-// ---- the 3D background loads after first paint, only where it makes sense
-const canWebGL = (() => {
-  try {
-    const c = document.createElement("canvas");
-    return !!(c.getContext("webgl2") || c.getContext("webgl"));
-  } catch {
-    return false;
-  }
-})();
-const saveData = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData;
-if (canWebGL && !reducedMotion() && !saveData) {
-  const start = () =>
-    import("./hero3d")
-      .then((m) => m.startHero3D($("#hero-canvas")!))
-      .catch((e) => console.warn("hero 3D disabled:", e));
-  const idle = (window as Window & { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => void }).requestIdleCallback;
-  if (document.readyState === "complete") (idle ? idle(start, { timeout: 1200 }) : setTimeout(start, 300));
-  else window.addEventListener("load", () => (idle ? idle(start, { timeout: 1200 }) : setTimeout(start, 300)), { once: true });
+// ---- the 3D background: desktop-class devices only, after load, once the hero is on screen.
+// Phones and small or weak machines keep the CSS gradient under #hero-canvas;
+// the shader sky and glossy materials cost more GPU than they can spare.
+const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8;
+const desktopClass = finePointer() && !isNarrow() && (navigator.hardwareConcurrency || 4) >= 4 && memory >= 4;
+if (desktopClass && !reducedMotion() && !slowNetwork()) {
+  afterLoad(() => {
+    const io = new IntersectionObserver(([e]) => {
+      if (!e.isIntersecting) return;
+      io.disconnect();
+      import("./hero3d")
+        .then((m) => m.startHero3D($("#hero-canvas")!))
+        .catch((err) => console.warn("hero 3D disabled:", err));
+    });
+    io.observe($(".hero")!);
+  });
 }
 
 window.addEventListener("load", () => ScrollTrigger.refresh());
