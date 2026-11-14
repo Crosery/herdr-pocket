@@ -63,8 +63,8 @@ export const SERVICES = {
   hostLaunchd: "com.herdr-pocket.hostd",
   hostSystemd: "herdr-pocket-hostd.service",
   relaySystemd: "herdr-pocket-relay.service",
-  /** Windows: `herdr-pocket service`, started at logon by this launcher in <root>\bin. */
-  hostWindows: "herdr-pocket service",
+  /** Windows: the HKCU Run entry that starts `herdr-pocket service` at logon (launcher in <root>\bin). */
+  hostWindows: "HerdrPocket",
 } as const;
 
 export type Service = "host" | "relay";
@@ -527,12 +527,17 @@ function mustWrite(root: string, service: Service): void {
   }
 }
 
-/** Whether a service file names this install. The Windows launcher is UTF-16 (any path survives). */
-function fileMentions(file: string, text: string): boolean {
+/**
+ * Whether a service file names this install. The Windows launcher is UTF-16 JScript, so its
+ * paths are string literals with doubled backslashes; Windows paths ignore case.
+ */
+export function fileMentions(file: string, text: string, windows = WINDOWS): boolean {
   try {
     const b = readFileSync(file);
     const s = b[0] === 0xff && b[1] === 0xfe ? b.subarray(2).toString("utf16le") : b.toString("utf8");
-    return WINDOWS ? s.toLowerCase().includes(text.toLowerCase()) : s.includes(text);
+    if (!windows) return s.includes(text);
+    const low = s.toLowerCase();
+    return [text, JSON.stringify(text).slice(1, -1)].some((t) => low.includes(t.toLowerCase()));
   } catch {
     return false;
   }

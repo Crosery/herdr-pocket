@@ -24,6 +24,7 @@ export const SITE = {
     serverScript: `curl -fsSL https://raw.githubusercontent.com/${repo}/main/scripts/install-relay.sh | sudo bash -s -- --domain ${server}`,
     serverCloudflare: `curl -fsSL https://raw.githubusercontent.com/${repo}/main/scripts/install-relay.sh | sudo bash -s -- --tunnel <TUNNEL_TOKEN> --domain ${server}`,
     computerInstall: `curl -fsSL https://raw.githubusercontent.com/${repo}/main/scripts/install-host.sh | bash -s -- --server https://${server}`,
+    computerInstallWindows: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/${repo}/main/scripts/install-host.ps1))) -Server https://${server}`,
     computerUp: `herdr-pocket up --server ${server}`,
     computerPair: "herdr-pocket pair",
     cliAgents: "herdr-pocket agents",

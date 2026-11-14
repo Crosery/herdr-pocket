@@ -86,7 +86,7 @@
 
 ## 快速开始
 
-需要：一台手机和电脑都能连上的服务器（Linux），装了 herdr 的电脑（macOS 或 Linux），一台安卓手机。
+需要：一台手机和电脑都能连上的服务器（Linux），装了 herdr 的电脑（macOS、Linux 或 Windows），一台安卓手机。
 
 ### 1. 部署中转服务
 
@@ -137,6 +137,14 @@ curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/i
 它会装好 `herdr-pocket` 命令和开机自启的后台服务（macOS 用 launchd，Linux 用 systemd 用户服务）。终端会显示一个二维码，用已经连上的手机扫一下，点“允许加入”。第一台设备就是这台电脑时，把 `--server …` 换成第 2 步的设置链接：`… | bash -s -- https://pocket.example.com/p/<设置码>`。
 
 电脑上要有 Node.js 22.18 或更新的版本，没有的话安装脚本会单独下载一份，不影响系统里的 Node。
+
+**Windows**（10 1809 以上或 11）：在 PowerShell 里运行下面这条。不需要管理员权限，自带 Node，登录 Windows 后在后台自动上线，不弹窗口。
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
+```
+
+第一台设备就是这台电脑时，改用设置链接：`… -Link https://pocket.example.com/p/<设置码>`。详见 [docs/deploy/host.md](docs/deploy/host.md#windows)。
 
 ### 4. 装手机 App
 

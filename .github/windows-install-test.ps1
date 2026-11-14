@@ -41,7 +41,7 @@ $before = [regex]::Match($svc, "running \(pid (\d+)\)").Groups[1].Value
 
 # Update in place: a new folder, junction swap, the service hands over to the new copy.
 $up = Run $cmd update --from $Bundle --force
-Check ($up -match "restarted herdr-pocket service") "update switches and restarts the service"
+Check ($up -match "restarted HerdrPocket") "update switches and restarts the service"
 $now = Target $current
 Check ($now -match "releases\\$([regex]::Escape($version))\+") "current points at the new copy ($now)"
 Check ((Get-ChildItem (Join-Path $root "releases")).Count -eq 2) "two copies kept"

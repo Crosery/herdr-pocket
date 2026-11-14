@@ -86,7 +86,7 @@ Message them, press keys, start new ones, or just call Xiaoyang, the assistant, 
 
 ## Quick start
 
-You need: a server (Linux) that both your phone and your computers can reach, a computer with herdr installed (macOS or Linux), and an Android phone.
+You need: a server (Linux) that both your phone and your computers can reach, a computer with herdr installed (macOS, Linux or Windows), and an Android phone.
 
 ### 1. Deploy the relay
 
@@ -137,6 +137,14 @@ curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/i
 It installs the `herdr-pocket` command and a background service that starts automatically (launchd on macOS, a systemd user service on Linux). The terminal shows a QR code: scan it with a phone that's already connected and tap “允许加入” (Allow). If this computer is the first device, replace `--server …` with the setup link from step 2: `… | bash -s -- https://pocket.example.com/p/<setup code>`.
 
 The computer needs Node.js 22.18 or newer. If it doesn't have one, the installer downloads a separate copy that leaves the system's Node alone.
+
+**Windows** (10 1809 or newer, or 11): run this in PowerShell instead. No administrator rights needed; it brings its own Node and starts Herdr Pocket hidden when you log on.
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
+```
+
+For the first device, pass the setup link instead: `… -Link https://pocket.example.com/p/<setup code>`. Details in [docs/deploy/host.md](docs/deploy/host.md#windows).
 
 ### 4. Install the phone app
 

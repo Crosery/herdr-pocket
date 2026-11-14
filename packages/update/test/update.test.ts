@@ -6,7 +6,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { ASSETS, compareVersions, findLayout, latestRelease, linkTarget, readVersion, rollback, setLink, sumFor, update } from "../src/index.ts";
+import { ASSETS, compareVersions, fileMentions, findLayout, latestRelease, linkTarget, readVersion, rollback, setLink, sumFor, update } from "../src/index.ts";
 
 /** Windows' own tar (bsdtar): Git's GNU tar on PATH reads `C:` in paths as a remote host. */
 const TAR = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
@@ -166,5 +166,22 @@ describe("update from a GitHub release", () => {
     const again = await update({ service: "host", restart: false, layout: { root }, log: quiet });
     assert.equal(again.changed, false);
     assert.ok(existsSync(join(root, "current", "apps/hostd/src/cli.ts")));
+  });
+});
+
+describe("service files", () => {
+  test("the Windows launcher (UTF-16 JScript, escaped paths) names its install", async () => {
+    const { launcherScript } = await import("../../../apps/hostd/src/winservice.ts").catch(() => ({ launcherScript: undefined }));
+    const dir = mkdtempSync(join(tmpdir(), "hp-svcfile-"));
+    const root = "C:\\Users\\张三\\AppData\\Local\\Programs\\herdr-pocket";
+    const js =
+      launcherScript?.(`${root}\\node\\node.exe`, `${root}\\current\\apps\\hostd\\src\\cli.ts`, []) ??
+      `shell.Run(${JSON.stringify(`"${root}\\node\\node.exe"`)}, 0, false);`;
+    const file = join(dir, "hostd-start.js");
+    writeFileSync(file, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(js, "utf16le")]));
+    assert.ok(fileMentions(file, root, true));
+    assert.ok(fileMentions(file, root.toLowerCase(), true));
+    assert.ok(!fileMentions(file, "C:\\Users\\other", true));
+    rmSync(dir, { recursive: true, force: true });
   });
 });
