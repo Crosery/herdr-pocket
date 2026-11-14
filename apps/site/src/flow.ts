@@ -157,54 +157,58 @@ export function initFlow(lenis: Lenis | null): void {
     }
   };
 
-  // packets animation
+  // packets animation, only while the diagram is on screen
   let tPrev = performance.now();
   let clock = 0;
-  let visible = false;
+  let raf = 0;
   const animate = (now: number) => {
-    const dt = (now - tPrev) / 1000;
+    const dt = Math.min(0.1, (now - tPrev) / 1000);
     tPrev = now;
-    if (visible && !document.hidden) {
-      clock += dt;
-      const s = Math.min(3, Math.floor(progress * 4));
-      paths.forEach((p, pi) => {
-        const on = pi < 3 ? s >= 1 : s >= 2;
-        p.packets.forEach((c, k) => {
-          if (!on) {
-            c.style.opacity = "0";
-            return;
-          }
-          const f = (clock * (pi < 3 ? 0.42 : 0.55) + k / p.packets.length + pi * 0.13) % 1;
-          const pt = p.lit.getPointAtLength(f * p.len);
-          c.setAttribute("cx", pt.x.toFixed(1));
-          c.setAttribute("cy", pt.y.toFixed(1));
-          c.style.opacity = String(Math.sin(f * Math.PI) * 0.95);
-        });
-      });
-      // step 4: commands travel phone -> relay -> computer
-      reverse.forEach((c, k) => {
-        if (s < 3 || !paths[3]) {
+    clock += dt;
+    const s = Math.min(3, Math.floor(progress * 4));
+    paths.forEach((p, pi) => {
+      const on = pi < 3 ? s >= 1 : s >= 2;
+      p.packets.forEach((c, k) => {
+        if (!on) {
           c.style.opacity = "0";
           return;
         }
-        const f = (clock * 0.32 + k / reverse.length) % 1;
-        const target = paths[k % 3];
-        let pt: DOMPoint;
-        if (f < 0.5) {
-          const g = 1 - f / 0.5;
-          pt = paths[3].lit.getPointAtLength(g * paths[3].len);
-        } else {
-          const g = 1 - (f - 0.5) / 0.5;
-          pt = target.lit.getPointAtLength(g * target.len);
-        }
+        const f = (clock * (pi < 3 ? 0.42 : 0.55) + k / p.packets.length + pi * 0.13) % 1;
+        const pt = p.lit.getPointAtLength(f * p.len);
         c.setAttribute("cx", pt.x.toFixed(1));
         c.setAttribute("cy", pt.y.toFixed(1));
-        c.style.opacity = String(Math.sin(f * Math.PI) * 0.6 + 0.35);
+        c.style.opacity = String(Math.sin(f * Math.PI) * 0.95);
       });
-    }
-    requestAnimationFrame(animate);
+    });
+    // step 4: commands travel phone -> relay -> computer
+    reverse.forEach((c, k) => {
+      if (s < 3 || !paths[3]) {
+        c.style.opacity = "0";
+        return;
+      }
+      const f = (clock * 0.32 + k / reverse.length) % 1;
+      const target = paths[k % 3];
+      let pt: DOMPoint;
+      if (f < 0.5) {
+        const g = 1 - f / 0.5;
+        pt = paths[3].lit.getPointAtLength(g * paths[3].len);
+      } else {
+        const g = 1 - (f - 0.5) / 0.5;
+        pt = target.lit.getPointAtLength(g * target.len);
+      }
+      c.setAttribute("cx", pt.x.toFixed(1));
+      c.setAttribute("cy", pt.y.toFixed(1));
+      c.style.opacity = String(Math.sin(f * Math.PI) * 0.6 + 0.35);
+    });
+    raf = requestAnimationFrame(animate);
   };
-  new IntersectionObserver(([e]) => (visible = e.isIntersecting)).observe(diagram);
+  new IntersectionObserver(([e]) => {
+    cancelAnimationFrame(raf);
+    if (e.isIntersecting && !still) {
+      tPrev = performance.now();
+      raf = requestAnimationFrame(animate);
+    }
+  }).observe(diagram);
 
   build();
   let rt = 0;
@@ -220,7 +224,6 @@ export function initFlow(lenis: Lenis | null): void {
     steps.forEach((s) => s.classList.add("is-active"));
     return;
   }
-  requestAnimationFrame(animate);
 
   const st = ScrollTrigger.create({
     trigger: section,

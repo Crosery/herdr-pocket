@@ -22,7 +22,7 @@ import {
   initNav,
   wrapTitleLines,
 } from "./sections";
-import { $, reducedMotion } from "./util";
+import { $, $$, reducedMotion } from "./util";
 
 gsap.registerPlugin(ScrollTrigger);
 document.documentElement.classList.add("js");
@@ -68,6 +68,13 @@ const animateTitle = (first: boolean) => {
 };
 animateTitle(true);
 onLang(() => animateTitle(false));
+
+// ---- pause the CSS loops of sections that are off screen (see .is-offscreen)
+const offscreen = new IntersectionObserver(
+  (entries) => entries.forEach((e) => e.target.classList.toggle("is-offscreen", !e.isIntersecting)),
+  { rootMargin: "200px 0px" },
+);
+$$("main > section, body > footer").forEach((s) => offscreen.observe(s));
 
 initNav();
 initHero();

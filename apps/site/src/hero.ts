@@ -43,6 +43,7 @@ export function initHero(): void {
   let angle = 0;
   let last = performance.now();
   let visible = true;
+  let raf = 0;
   const tilt = (-14 * Math.PI) / 180;
   const place = () => {
     const w = stage.clientWidth;
@@ -67,17 +68,22 @@ export function initHero(): void {
   const tick = (now: number) => {
     const dt = Math.min(64, now - last);
     last = now;
-    if (visible) {
-      angle += dt * 0.00018;
-      place();
-    }
-    requestAnimationFrame(tick);
+    angle += dt * 0.00018;
+    place();
+    raf = requestAnimationFrame(tick);
   };
   place();
   window.addEventListener("resize", place);
-  if (!still) requestAnimationFrame(tick);
 
-  new IntersectionObserver(([e]) => (visible = e.isIntersecting)).observe(stage);
+  // The orbit only runs while the stage is on screen; no frame callbacks otherwise.
+  new IntersectionObserver(([e]) => {
+    visible = e.isIntersecting;
+    cancelAnimationFrame(raf);
+    if (visible && !still) {
+      last = performance.now();
+      raf = requestAnimationFrame(tick);
+    }
+  }).observe(stage);
 
   // ---- Parallax tilt toward the pointer
   if (finePointer() && !still) {
