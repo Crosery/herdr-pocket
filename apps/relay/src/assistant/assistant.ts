@@ -290,8 +290,13 @@ export class Assistant {
   /** Adds or replaces an item and tells every phone. */
   private put(item: AssistantItem, broadcast = true): AssistantItem {
     const i = this.items.findIndex((x) => x.id === item.id);
-    if (i >= 0) this.items[i] = item;
-    else {
+    if (i >= 0) {
+      const moved = this.items[i]!.ts !== item.ts;
+      this.items[i] = item;
+      // A streamed answer gets a later time with every draft: it belongs after the cards its tools put up meanwhile,
+      // the order the store reloads in (by time).
+      if (moved) this.items.sort((a, b) => a.ts - b.ts);
+    } else {
       this.items.push(item);
       if (this.items.length > MAX_ITEMS) {
         this.items.splice(0, this.items.length - MAX_ITEMS);
@@ -817,11 +822,24 @@ export class Assistant {
         const a = this.resolveAgent(input.agent);
         const text = typeof input.text === "string" ? input.text.trim() : "";
         if (!text) throw new Error("要发送的内容是空的");
+        // The person's own words stay beside the message made from them; the same words twice are just the message.
+        const raw = typeof input.said === "string" ? input.said.trim().slice(0, 4000) : "";
+        const said = raw && oneLine(raw) !== oneLine(text) ? raw : undefined;
         const r = await this.act(
-          { kind: "send", agent: a.key, agentTitle: titleOf(a), device: a.deviceId, text: text.slice(0, 4000), summary: `给「${titleOf(a)}」发送：${clip(text, 80)}` },
+          {
+            kind: "send",
+            agent: a.key,
+            agentTitle: titleOf(a),
+            agentName: this.handleOf(a),
+            device: a.deviceId,
+            deviceName: this.deviceName(a.deviceId),
+            text: text.slice(0, 4000),
+            said,
+            summary: `给「${titleOf(a)}」发送：${clip(text, 80)}`,
+          },
           turn,
           "先用一句话问要不要发；得到明确同意后再调用 confirm_action。",
-          `给「${titleOf(a)}」发了消息`,
+          `给「${this.handleOf(a)}」发了消息`,
         );
         // Watching it: its next stop comes back as a notice with what it said.
         if (input.watch === true && !r.out.startsWith("已生成待确认") && !r.out.startsWith("没办成")) {
@@ -1256,7 +1274,7 @@ export class Assistant {
       level: state === "done" ? "info" : "warn",
       msg: `${act.kind} ${state} ${Date.now() - t0}ms: ${act.summary} -> ${clip(oneLine(result), 200)}`,
       device: act.device,
-      data: { agent: act.agent, launcher: act.launcher, space: act.space ?? act.spaceName, command: act.command },
+      data: { agent: act.agent, launcher: act.launcher, space: act.space ?? act.spaceName, command: act.command, said: act.said ? clip(oneLine(act.said), 200) : undefined },
     });
     return done;
   }
@@ -1500,6 +1518,7 @@ export class Assistant {
       .map((e) => `${failed.has(e.call_id) ? "[出错] " : ""}${e.name}：${clip(oneLine(toolInput(e.input)), 120)}`);
     if (!said && !did.length) return null;
     const askedText = asked?.kind === "user_message" ? clip(asked.text.trim(), 600) : undefined;
+    const spoken = asked?.kind === "user_message" ? this.relayedFrom(a.key, asked.text) : undefined;
     const first = a.preview && oneLine(a.preview).slice(0, 40) !== oneLine(askedText ?? "").slice(0, 40) ? clip(oneLine(a.preview), 200) : undefined;
     return wakeFinished({
       handle,
@@ -1510,10 +1529,21 @@ export class Assistant {
       key: a.key,
       reminder: watching.map((r) => r.text).join("\n") || undefined,
       asked: askedText,
+      spoken,
       first,
       said: said?.kind === "assistant_message" ? headTail(said.text.trim(), 900, 500) : undefined,
       did: did.join("\n") || undefined,
     });
+  }
+
+  /**
+   * The person's own words behind the message the assistant last relayed to this
+   * agent, when that message is the one it worked on: the turn is judged against them.
+   */
+  private relayedFrom(key: string, asked: string): string | undefined {
+    const sent = [...this.items].reverse().find((x) => x.action?.kind === "send" && x.action.agent === key && x.action.state === "done")?.action;
+    if (!sent?.said || !sent.text) return undefined;
+    return oneLine(asked).includes(oneLine(sent.text).slice(0, 60)) ? clip(sent.said.trim(), 600) : undefined;
   }
 
   /** What a waiting agent shows and wants to run (5.5); null when neither can be read. */
@@ -1729,12 +1759,17 @@ const TOOLS: ToolDef[] = [
   {
     name: "send_to_agent",
     description:
-      "给 agent 发一条消息（等于在它的输入框里打字并回车）。" + SETTING_NOTE + "结果会写明：发了；它正忙着、消息排在它输入框里等这一轮完；它停在确认提示上；或者没发成和原因。它回了什么不会在结果里，要等它停下再 read_agent。`text` 写要发的原话；口述了内容就用原话，不润色、不扩写。`agent` 可以写空间名、标签名、标题、文件夹、程序名，语音听岔的也行（黑德 = herdr）。",
+      "给 agent 发一条消息（等于在它的输入框里打字并回车）。" +
+      SETTING_NOTE +
+      "结果会写明：发了；它正忙着、消息排在它输入框里等这一轮完；它停在确认提示上；或者没发成和原因。它回了什么不会在结果里，要等它停下再 read_agent。" +
+      "`text` 不是把我的话原样搬过去，是照“传话”那段整理好的一条消息：去掉口头禅、改口和说给你听的话；“他”“那个”换成具体的东西；名字、路径、数字、报错原文、限制、否定、先后一字不改；不加我没说的要求和办法；用我的口吻直接对它说，短短一两句。我明说要原话，或者内容是代码、命令、要它照抄的话，就一字不动。会改变结果的地方没听清，先问我，别发。" +
+      "`agent` 可以写空间名、标签名、标题、文件夹、程序名，语音听岔的也行（黑德 = herdr）。",
     input_schema: {
       type: "object",
       properties: {
         agent: { type: "string", description: "agent 的 key，或者它的叫法、标题、所在空间名" },
-        text: { type: "string", description: "要发的原文" },
+        text: { type: "string", description: "它收到的那条消息：我的意思，整理过，用我的口吻对它说" },
+        said: { type: "string", description: "我交代这件事时的原话（打字的照抄，通话里是我说的那几句），和 text 一起留底，手机上能对照；text 就是原话时不用填" },
         watch: { type: "boolean", description: "发完盯着它：它这一轮停下时，把它说了什么主动告诉我。我说“看它怎么回”“回了告诉我”时设 true" },
       },
       required: ["agent", "text"],
@@ -1767,7 +1802,7 @@ const TOOLS: ToolDef[] = [
         device: { type: "string" },
         launcher: { type: "string", description: "list_launchers 返回的程序 id，也可以写听到的程序名（Claude Code、克劳德、扣德克斯、基米、卓德、扣得巴迪……）" },
         folder: { type: "string", description: "工作文件夹，如 ~/work_file/xxx" },
-        task: { type: "string", description: "开好后发给它的第一条任务" },
+        task: { type: "string", description: "开好后发给它的第一条任务，照“传话”那段整理，不是原样搬我的话" },
         space: { type: "string", description: "开在哪个已有的空间里（空间名或 id），会在那个空间新开一个标签。不填就新建一个空间" },
         space_name: { type: "string", description: "新建空间时给它起的名字" },
         tab_name: { type: "string", description: "新标签的名字" },

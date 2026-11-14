@@ -530,10 +530,18 @@ export interface AssistantAction {
   /** Target agent key (send / keys / interrupt / close). */
   agent?: string;
   agentTitle?: string;
+  /** send: the short name the assistant calls the agent by, the one its answer uses. Older relays leave it out. */
+  agentName?: string;
   /** Target computer. */
   device?: string;
   deviceName?: string;
+  /** send: exactly what is typed into the agent. create: its first task. */
   text?: string;
+  /**
+   * send: the person's own words the assistant made `text` from (typed, or heard
+   * in a call), kept so both are on record. Absent when `text` is those words as they are.
+   */
+  said?: string;
   keys?: string[];
   launcher?: string;
   folder?: string;

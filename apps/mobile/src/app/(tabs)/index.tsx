@@ -10,11 +10,11 @@ import { CuteIcon } from "../../components/icons";
 import { Mascot } from "../../components/Mascot";
 import { mdStyles } from "../../components/chat";
 import { CallBar, CallScreen } from "../../components/CallScreen";
-import { NoticeBubble } from "../../components/notice";
+import { AgentLink, NoticeBubble } from "../../components/notice";
 import { useFocusEffect } from "expo-router";
 import { cancelReminder, clearAssistant, decideAction, loadAssistant, sendToAssistant, setAssistantWatching, useAssistant } from "../../lib/assistant";
 import { dismissCallMessage, startCall, useVoice } from "../../lib/voice";
-import { useLive, useSettings } from "../../lib/store";
+import { findAgent, useLive, useSettings } from "../../lib/store";
 import { fixCjkEmphasis, hasList } from "../../lib/markdown";
 import { isMockServer } from "../../lib/mock";
 import { usePalette } from "../../theme/theme";
@@ -362,22 +362,36 @@ function ActionCard({ item, onError }: { item: AssistantItem; onError: (m: strin
   }
   const icon = ACTION_ICONS[a.kind] ?? "send-outline";
   const tone = a.state === "failed" ? p.error : a.state === "done" ? "#3FB68B" : pending ? p.accentText : p.faint;
+  // A message says who got it, by the name the answer uses, and on which computer; the text itself is
+  // shown once, in full, below (the summary repeats its first 80 characters). Older relays: the summary.
+  const send = a.kind === "send" && !!a.text;
+  const who = a.agentName || a.agentTitle;
+  const head = send && who ? `发给「${who}」` : a.summary;
+  const where = send ? [a.deviceName, a.agentTitle && a.agentTitle !== who ? a.agentTitle : undefined].filter(Boolean).join(" · ") : "";
+  const agent = a.agent ? findAgent(a.agent) : undefined;
   return (
     <Card style={{ padding: space.md, gap: space.sm, borderWidth: pending ? 1.5 : 0, borderColor: p.primary }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
         <MaterialCommunityIcons name={icon} size={18} color={p.ink} />
-        <Text style={{ flex: 1, fontFamily: fonts.bodyBold, color: p.ink }}>{a.summary}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontFamily: fonts.bodyBold, color: p.ink }}>{head}</Text>
+          {where ? (
+            <Text numberOfLines={1} style={{ color: p.faint, fontSize: 12 }}>
+              {where}
+            </Text>
+          ) : null}
+        </View>
       </View>
-      {a.kind === "send" && a.text ? (
+      {send ? (
         <View style={{ backgroundColor: p.surface2, borderRadius: radius.sm, padding: space.sm }}>
-          <Text style={{ color: p.ink, lineHeight: 21 }}>{a.text}</Text>
+          <Text selectable style={{ color: p.ink, lineHeight: 21 }}>
+            {a.text}
+          </Text>
         </View>
       ) : null}
+      {send && a.said ? <SaidLine said={a.said} /> : null}
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-        <Text style={{ flex: 1, color: tone, fontSize: 12.5, fontFamily: fonts.bodySemi }}>
-          {ACTION_STATE[a.state]}
-          {a.result && !pending ? ` · ${a.result}` : ""}
-        </Text>
+        <Text style={{ flex: 1, color: tone, fontSize: 12.5, fontFamily: fonts.bodySemi }}>{stateLine(a)}</Text>
         {pending ? (
           <>
             <Button compact mode="text" textColor={p.muted} disabled={!!working} loading={working === "cancel"} onPress={() => void decide("cancel")}>
@@ -389,7 +403,40 @@ function ActionCard({ item, onError }: { item: AssistantItem; onError: (m: strin
           </>
         ) : null}
       </View>
+      {agent ? <AgentLink agentKey={agent.key} /> : null}
     </Card>
+  );
+}
+
+/**
+ * Where an action stands. A finished one is described by its own result ("发了，它正在忙这一轮…"):
+ * "已完成" in front of it read as if the agent had finished the work.
+ */
+function stateLine(a: AssistantAction): string {
+  if (a.state === "pending" || !a.result) return ACTION_STATE[a.state] ?? "";
+  return a.state === "done" ? a.result : `${ACTION_STATE[a.state]} · ${a.result}`;
+}
+
+/** The person's own words a relayed message was made from: one line, tap for all of it. */
+function SaidLine({ said }: { said: string }) {
+  const p = usePalette();
+  const [open, setOpen] = useState(false);
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ expanded: open }}
+      accessibilityLabel={`你的原话：${said}`}
+      accessibilityHint={open ? "点按收起" : "点按展开全文"}
+      onPress={() => setOpen((v) => !v)}
+      hitSlop={6}
+      style={{ flexDirection: "row", alignItems: "flex-start", gap: 6, minHeight: 32, paddingHorizontal: 2, paddingTop: 2 }}
+    >
+      <MaterialCommunityIcons name="format-quote-open" size={15} color={p.faint} style={{ marginTop: 1 }} />
+      <Text numberOfLines={open ? undefined : 1} style={{ flex: 1, color: p.muted, fontSize: 12.5, lineHeight: 18 }}>
+        你的原话：{said}
+      </Text>
+      <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-down"} size={16} color={p.faint} />
+    </Pressable>
   );
 }
 
