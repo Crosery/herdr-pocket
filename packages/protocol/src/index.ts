@@ -68,6 +68,16 @@ export interface Agent {
   cwd?: string;
   status: AgentStatus;
   statusSince?: number;
+  /**
+   * What the program says about a `blocked` state, when it says something,
+   * e.g. its error message. Older hosts never send it.
+   */
+  statusNote?: string;
+  /**
+   * The program stopped on an error (a model or connection failure) rather than
+   * on a question. `status` is `blocked` then, so older apps still flag it.
+   */
+  errored?: boolean;
   turn?: number;
   /** True for plain shells; the app hides them by default. */
   isShell: boolean;
@@ -291,6 +301,53 @@ export type ConvEvent = EventBody & {
 };
 
 // ---------------------------------------------------------------------------
+// Files sent to an agent (terminal.put)
+// ---------------------------------------------------------------------------
+
+/** A picture sent from a phone, contents in base64. */
+export interface PutFile {
+  /** Original file name; the host keeps a safe form of it. */
+  name: string;
+  /** One of `PUT_LIMITS.mimes`. */
+  mime: string;
+  data: string;
+}
+
+/**
+ * What one `terminal.put` may carry. The total stays well under the relay's
+ * 8 MiB WebSocket frame once base64 has grown it by a third; phones shrink
+ * pictures to a few hundred KB first.
+ */
+export const PUT_LIMITS = {
+  files: 6,
+  /** Bytes of one file, decoded. */
+  fileBytes: 3 * 1024 * 1024,
+  /** Bytes of all files of one call, decoded. */
+  totalBytes: 5 * 1024 * 1024,
+  mimes: ["image/jpeg", "image/png", "image/webp", "image/gif"],
+} as const;
+
+/** The message an agent gets for a text with pictures: the text, then each picture's path on a line of its own. */
+export function textWithFiles(text: string, paths: string[]): string {
+  return [text.trim(), ...paths].filter(Boolean).join("\n");
+}
+
+/**
+ * A trailing line that stands for a picture: a path `textWithFiles` appended,
+ * or Claude Code's `[Image #n]` marks, which it may put in their place.
+ */
+const PICTURE_LINE = /^(?:\/.*\.(?:jpe?g|png|webp|gif)|(?:\[Image #\d+\]\s*)+)$/i;
+
+/** Undoes `textWithFiles`: the words, the picture lines after them, and how many pictures those are. */
+export function splitFiles(message: string): { text: string; lines: string[]; count: number } {
+  const all = message.replace(/\s+$/, "").split("\n");
+  const lines: string[] = [];
+  while (all.length > 0 && PICTURE_LINE.test(all[all.length - 1]!.trim())) lines.unshift(all.pop()!.trim());
+  const count = lines.reduce((n, l) => n + (l.startsWith("/") ? 1 : (l.match(/\[Image #\d+\]/gi)?.length ?? 1)), 0);
+  return { text: all.join("\n").trim(), lines, count };
+}
+
+// ---------------------------------------------------------------------------
 // RPC methods a host serves (callable by viewers and by other hosts)
 // ---------------------------------------------------------------------------
 
@@ -326,6 +383,14 @@ export interface RpcMethods {
    * Hosts before this call answer `unsupported`; fall back to `terminal.send`.
    */
   "terminal.input": { params: { agent: string; data: string }; result: { ok: true } };
+  /**
+   * Puts pictures beside the agent on its computer (like `hc put`) and says
+   * where each landed, in order. Nothing is typed: the caller names the paths
+   * in a following `terminal.send` (see `textWithFiles`), and agents such as
+   * Claude Code and Codex read a picture from its path. Limits: `PUT_LIMITS`.
+   * Hosts before this call answer `unsupported`.
+   */
+  "terminal.put": { params: { agent: string; files: PutFile[] }; result: { paths: string[] } };
   /** Conversation of the agent's matched Uniflo session, newest last. */
   "session.events": {
     /** `sub`: read a subagent session of this agent instead (from `session.children`). */
@@ -396,7 +461,17 @@ export interface RpcMethods {
    * with the resume command Uniflo gives for it. Assistant only.
    */
   "sessions.resume": { params: { session: string; space?: string }; result: { agent: string; space: string; terminal: string } };
+  /**
+   * Harness icons as the computer's Uniflo draws them: 24×24 single-colour SVGs
+   * (`fill="currentColor"`), only safe shape elements. For marks the app can't
+   * ship itself. `ids` are Uniflo harness ids (claude, workbuddy, factory…), at
+   * most HARNESS_ICON_MAX; ids it doesn't know are left out. Older hosts answer
+   * `unsupported`.
+   */
+  "harness.icons": { params: { ids: string[] }; result: { icons: Record<string, string> } };
 }
+
+export const HARNESS_ICON_MAX = 40;
 
 export type RpcMethod = keyof RpcMethods;
 export type RpcParams<M extends RpcMethod> = RpcMethods[M]["params"];
@@ -869,6 +944,10 @@ export function normalizeStatus(raw: string | null | undefined): AgentStatus {
     case "blocked":
     case "waiting":
     case "needs_input":
+    // The program stopped on an error (e.g. "pick a different model"): it waits for a person too.
+    // `statusNote` carries what it said.
+    case "error":
+    case "failed":
       return "blocked";
     case "done":
       return "done";

@@ -124,6 +124,9 @@ export async function revokeDevice(server: string, token: string, id: string): P
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; method?: string; to?: string };
 
+/** React Native's WebSocket also takes request headers (the DOM typing doesn't know). */
+type RNWebSocket = new (url: string, protocols: string | string[] | null, options: { headers: Record<string, string> }) => WebSocket;
+
 class SocketLink implements Link {
   private ws: WebSocket | null = null;
   private pending = new Map<string, Pending>();
@@ -146,14 +149,15 @@ class SocketLink implements Link {
   }
 
   private url() {
-    return `${this.server.replace(/^http/i, "ws")}/v1/ws?token=${encodeURIComponent(this.token)}`;
+    return `${this.server.replace(/^http/i, "ws")}/v1/ws`;
   }
 
   private open() {
     if (this.closed) return;
     useLive.setState({ link: "connecting" });
     this.welcomed = false;
-    const ws = new WebSocket(this.url());
+    // The token rides in a header (React Native's third argument): a URL ends up in reverse-proxy access logs.
+    const ws = new (WebSocket as unknown as RNWebSocket)(this.url(), null, { headers: { Authorization: `Bearer ${this.token}` } });
     this.ws = ws;
     ws.onopen = () => {
       applog("info", "link", "socket open");

@@ -28,6 +28,12 @@ pnpm preview      # serve dist/ on http://127.0.0.1:5181
 The build uses a relative base (`./`), so the same `dist/` works at a domain
 root and under a sub-path. Set `SITE_BASE=/some/path/` to pin an absolute base.
 
+Link previews (Open Graph, X/Twitter cards) need an absolute image URL. Set
+`SITE_URL` to the address the site is served from, e.g.
+`SITE_URL=https://pocket.example.com/ pnpm build`; the build then rewrites
+`og:image` to an absolute URL and adds a canonical link. Without it the
+relative `og.jpg` is kept, which most link-preview crawlers ignore.
+
 ## Deploy
 
 Cloudflare Pages: create a Pages project from the repository with root
@@ -59,6 +65,10 @@ cwebp, img2webp, magick):
 ```sh
 pnpm assets
 ```
+
+The animated hero mascot (`mascot/idle.webp`, `tap.webp`, `idle-poster.webp`)
+is keyed from green-screen source clips that are not in the repository; without
+them the script keeps the committed files and regenerates everything else.
 
 Fonts in `src/fonts` are subsets of Nunito, ZCOOL KuaiLe and Maple Mono (SIL
 OFL 1.1, licenses alongside). After changing page or film text, re-subset so

@@ -16,6 +16,7 @@ import { startAppLog } from "../lib/applog";
 import { fonts } from "../theme/tokens";
 import { useAlertSync } from "../lib/alerts";
 import { IconTile } from "../components/ui";
+import { useHarnessIconSync } from "../lib/harnessRemote";
 
 SplashScreen.preventAutoHideAsync().catch(() => undefined);
 
@@ -50,6 +51,7 @@ function Navigator() {
   const p = usePalette();
   useRelayLink();
   useAlertSync();
+  useHarnessIconSync();
   return (
     <>
       <StatusBar style={p.dark ? "light" : "dark"} />
@@ -65,7 +67,7 @@ function Navigator() {
           headerLeft: ({ canGoBack }) =>
             canGoBack ? (
               <View style={{ marginRight: 10 }}>
-                <IconTile icon="back" tone="plain" size={40} shape="squircle" onPress={() => router.back()} a11y="返回" />
+                <IconTile icon="back" tone="plain" size={40} onPress={() => router.back()} a11y="返回" />
               </View>
             ) : null,
           contentStyle: { backgroundColor: p.page },

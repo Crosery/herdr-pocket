@@ -10,7 +10,7 @@ export interface HcTerminal {
   argv?: string[];
   cwd?: string | null;
   state?: string; // live | finished
-  status?: { app?: string; state?: string } | null;
+  status?: { app?: string; state?: string; msg?: string } | null;
   status_ms?: number | null;
   title?: string | null;
   turn?: number;
@@ -20,6 +20,15 @@ export interface HcTerminal {
   created_ms?: number;
   cols?: number;
   rows?: number;
+}
+
+/**
+ * True when the bottom of a screen is a panel's footer ("Esc to cancel",
+ * "Enter to confirm · Esc to exit"…), i.e. typed text would go into the panel.
+ */
+export function endsInPanel(screen: string): boolean {
+  const tail = screen.split("\n").map((l) => l.trim()).filter(Boolean).slice(-4);
+  return tail.some((l) => /\besc\b[^\n]{0,12}?\bto (cancel|close|exit|go back|dismiss)\b/i.test(l));
 }
 
 /** Space and tab names by id, as the desktop app (`herdr-app ls`) shows them. */
@@ -174,8 +183,13 @@ export class HcAdapter extends EventEmitter {
           // Applied at once: the phone must not wait for a full list. Only a change
           // of state matters; the status message changes every few seconds.
           const before = HcAdapter.status(t);
+          const noteBefore = HcAdapter.note(t);
           t.status = next;
-          if (HcAdapter.status(t) === before) return;
+          if (HcAdapter.status(t) === before) {
+            // Same state; a new error or question still has to reach the phone.
+            if (HcAdapter.note(t) !== noteBefore) this.emit("change");
+            return;
+          }
           t.status_ms = Date.now();
           this.emit("change");
         }
@@ -250,6 +264,13 @@ export class HcAdapter extends EventEmitter {
     return Number.isFinite(seen) && typeof t.turn === "number" && seen >= t.turn ? "idle" : "done";
   }
 
+  /** What the program says while it waits for a person (an error or a question), clipped. */
+  static note(t: HcTerminal): string | undefined {
+    if (HcAdapter.status(t) !== "blocked") return undefined;
+    const msg = t.status?.msg?.replace(/\s+/g, " ").trim();
+    return msg ? (msg.length > 300 ? `${msg.slice(0, 300)}…` : msg) : undefined;
+  }
+
   /** "space / tab" with the names the desktop app shows now (renames included). */
   static where(t: HcTerminal, names?: AppNames): string | undefined {
     const label = t.labels?.where;
@@ -274,6 +295,8 @@ export class HcAdapter extends EventEmitter {
       cwd: t.foreground?.cwd ?? t.cwd ?? undefined,
       status: HcAdapter.status(t),
       statusSince: t.status_ms ?? undefined,
+      statusNote: HcAdapter.note(t),
+      errored: ["error", "failed"].includes(t.status?.state?.toLowerCase() ?? "") || undefined,
       turn: t.turn,
       isShell: !t.status && SHELL_HARNESSES.has(harness),
       updatedAt: t.status_ms ?? t.created_ms ?? Date.now(),
@@ -308,10 +331,32 @@ export class HcAdapter extends EventEmitter {
 
   async send(address: string, text: string, enter = true): Promise<void> {
     if (enter) {
+      // A panel (Claude Code's /status, /config, /model…) swallows pasted text
+      // and the message is lost. An idle program showing one gets Esc first.
+      if (await this.panelOpen(address)) {
+        await run(this.hcBin, ["keys", address, "esc"]);
+        await new Promise((r) => setTimeout(r, 300));
+        if (await this.panelOpen(address)) throw new Error("它开着一个面板，消息没送进去：先在终端里按 Esc 关掉再发");
+      }
       await run(this.hcBin, ["send", address, text]);
     } else {
       // Typing without Enter: one key per character keeps it literal.
       await run(this.hcBin, ["keys", address, ...[...text].map((c) => (c === " " ? "space" : c))]);
+    }
+  }
+
+  /**
+   * True when an idle program shows a panel that Esc closes. Only idle/done:
+   * a blocked program's dialog (a permission question) is the person's to answer.
+   */
+  private async panelOpen(address: string): Promise<boolean> {
+    const t = this.terminals.get(address);
+    if (!t?.status || !["idle", "done"].includes(normalizeStatus(t.status.state))) return false;
+    try {
+      const s = await this.screens.snapshot(address, 0);
+      return endsInPanel(s.text);
+    } catch {
+      return false;
     }
   }
 
@@ -347,5 +392,21 @@ export class HcAdapter extends EventEmitter {
     const mapped = keys.map((k) => KEY_ALIASES[k.toLowerCase()] ?? (k.length === 1 ? k : null));
     if (mapped.some((k) => k === null)) throw new Error(`unknown key in ${JSON.stringify(keys)}`);
     await run(this.hcBin, ["keys", address, ...(mapped as string[])]);
+  }
+
+  /**
+   * Copies a local file beside the terminal (`hc put`; herdr-core keeps it in
+   * its own per-terminal folder, renaming on a clash) and returns where it landed.
+   */
+  async put(address: string, file: string): Promise<string> {
+    const out = await run(this.hcBin, ["put", "--json", address, file], { timeoutMs: 30_000 });
+    let path: unknown;
+    try {
+      path = (JSON.parse(out) as { path?: unknown }).path;
+    } catch {
+      path = undefined;
+    }
+    if (typeof path !== "string" || !path) throw new Error(`hc put said no path: ${out.trim().slice(0, 200)}`);
+    return path;
   }
 }

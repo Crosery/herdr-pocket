@@ -1,4 +1,3 @@
-import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useEffect, useMemo, useState } from "react";
 import { KeyboardAvoidingView, View } from "react-native";
 import { ActivityIndicator, SegmentedButtons, Text } from "react-native-paper";
@@ -14,10 +13,11 @@ import { EmptyState, HarnessAvatar, PageBackground, StatusPill } from "../../com
 import { useLive } from "../../lib/store";
 import { call, pingNow } from "../../lib/relay";
 import { Mascot } from "../../components/Mascot";
+import { CuteIcon } from "../../components/icons";
 import { agentTitle, basename, money, relTime } from "../../lib/format";
 import { parseTrail, SUB_STATUS, type Crumb } from "../../lib/subnav";
 import { usePalette } from "../../theme/theme";
-import { fonts, radius, space, statusColors, type Palette } from "../../theme/tokens";
+import { agentStatusLabel, fonts, radius, space, statusColors, type Palette } from "../../theme/tokens";
 
 type Tab = "chat" | "terminal" | "subs" | "info";
 
@@ -30,7 +30,7 @@ function DeviceLine({ agent }: { agent: Agent }) {
   const online = device?.online ?? false;
   return (
     <View accessibilityLabel={`所在电脑 ${device?.name ?? agent.deviceId}，${online ? "在线" : "离线"}`} style={{ flexDirection: "row", alignItems: "center", gap: 5 }}>
-      <MaterialCommunityIcons name="laptop" size={14} color={p.muted} />
+      <CuteIcon name="laptop" size={15} color={p.muted} strokeWidth={2.4} />
       <Text numberOfLines={1} style={{ flexShrink: 1, color: p.ink, fontFamily: fonts.bodySemi, fontSize: 13 }}>
         {device?.name ?? agent.deviceId}
       </Text>
@@ -130,7 +130,7 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
             <Text numberOfLines={1} style={{ flex: 1, color: p.muted, fontSize: 12.5 }}>
               {meta}
             </Text>
-            <StatusPill status={agent.status} compact />
+            <StatusPill status={agent.status} label={agentStatusLabel(agent)} compact />
           </View>
           <SegmentedButtons
             value={tab}

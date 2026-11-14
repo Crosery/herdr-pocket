@@ -1,17 +1,18 @@
 import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, Pressable, ScrollView, View, type ListRenderItem } from "react-native";
+import { FlatList, Image, Pressable, ScrollView, View, type ListRenderItem } from "react-native";
 import { ActivityIndicator, Button, Snackbar, Text } from "react-native-paper";
 import Markdown from "react-native-markdown-display";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { call, subscribe } from "../lib/relay";
+import { sameMessage, splitPictures } from "../lib/attach";
 import { useLive, usePending, useSettings, type PendingSend } from "../lib/store";
 import { fixCjkEmphasis, hasList } from "../lib/markdown";
 import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
-import { EmptyState } from "./ui";
+import { EmptyState, TypingDots } from "./ui";
 import { BusyMascot, Sparkle } from "./Mascot";
 import { CuteIcon } from "./icons";
 
@@ -35,7 +36,7 @@ export type Row =
   /** A run of tool calls folded into one line. */
   | { type: "tools"; id: string; items: Array<Extract<Row, { type: "tool" }>> }
   /** Sent from this phone, not yet echoed by the session. */
-  | { type: "pending"; id: string; text: string; ts: number }
+  | { type: "pending"; id: string; text: string; ts: number; pictures?: string[] }
   | { type: "turn_end"; id: string; ts: number }
   | { type: "system"; id: string; text: string; summary: string };
 
@@ -223,7 +224,7 @@ export function mdStyles(p: Palette, scale: number) {
 }
 
 /** Small tappable chip that expands into a monospace, height-capped, scrollable block. */
-function FoldChip({ label, icon, body, align = "center", a11y }: { label: string; icon: "information-outline" | "paperclip"; body: string; align?: "center" | "flex-end"; a11y: string }) {
+function FoldChip({ label, icon, body, align = "center", a11y }: { label: string; icon: "information-outline" | "paperclip" | "image-outline"; body: string; align?: "center" | "flex-end"; a11y: string }) {
   const p = usePalette();
   const [open, setOpen] = useState(false);
   return (
@@ -267,17 +268,28 @@ function FoldChip({ label, icon, body, align = "center", a11y }: { label: string
   );
 }
 
-const UserBubble = memo(function UserBubble({ text, injected, ts, pending }: { text: string; injected?: string; ts?: number; pending?: boolean }) {
+const UserBubble = memo(function UserBubble({ text, injected, ts, pending, pictures }: { text: string; injected?: string; ts?: number; pending?: boolean; pictures?: string[] }) {
   const p = usePalette();
   const scale = useSettings((s) => s.textScale);
+  // Picture paths sent with a message (and Claude Code's [Image #n] marks) fold into a chip.
+  const shown = useMemo(() => splitPictures(text), [text]);
   return (
     <View style={{ alignItems: "flex-end", paddingLeft: 48, gap: space.xs }}>
-      {text.trim() ? (
+      {shown.text ? (
         <View style={{ backgroundColor: p.bubble, borderRadius: radius.card, borderBottomRightRadius: radius.xs, paddingHorizontal: space.lg, paddingVertical: space.md, opacity: pending ? 0.7 : 1 }}>
           <Text selectable style={{ color: p.ink, fontSize: 15.5 * scale, lineHeight: 15.5 * scale * 1.5 }}>
-            {text}
+            {shown.text}
           </Text>
         </View>
+      ) : null}
+      {pictures?.length ? (
+        <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: space.xs, opacity: pending ? 0.7 : 1 }}>
+          {pictures.map((uri, i) => (
+            <Image key={i} source={{ uri }} accessibilityLabel={`发送的第 ${i + 1} 张图片`} style={{ width: 64, height: 64, borderRadius: radius.sm, backgroundColor: p.surface2 }} />
+          ))}
+        </View>
+      ) : shown.count ? (
+        <FoldChip label={`图片 ×${shown.count}`} icon="image-outline" body={shown.lines.join("\n")} align="flex-end" a11y={`这条消息带了 ${shown.count} 张图片`} />
       ) : null}
       {injected ? <FoldChip label="附加内容" icon="paperclip" body={injected} align="flex-end" a11y="这条消息的附加内容" /> : null}
       {pending ? (
@@ -510,7 +522,7 @@ const renderRow: ListRenderItem<Row> = ({ item }) => {
     case "user":
       return <UserBubble text={item.text} injected={item.injected} ts={item.ts} />;
     case "pending":
-      return <UserBubble text={item.text} pending />;
+      return <UserBubble text={item.text} pictures={item.pictures} pending />;
     case "tools":
       return <ToolGroup items={item.items} />;
     case "assistant":
@@ -641,7 +653,7 @@ export function ChatView({
     const list: PendingSend[] = pendingAll ?? [];
     if (!list.length) return list;
     const said = folded.filter((r): r is Extract<Row, { type: "user" }> => r.type === "user");
-    return list.filter((x) => nowTick - x.ts < PENDING_TTL_MS && !said.some((r) => r.ts >= x.ts - 15_000 && r.text.trim() === x.text.trim()));
+    return list.filter((x) => nowTick - x.ts < PENDING_TTL_MS && !said.some((r) => r.ts >= x.ts - 15_000 && sameMessage(r.text, x.text)));
   }, [pendingAll, folded, nowTick]);
   useEffect(() => {
     const gone = (pendingAll ?? []).filter((x) => !pending.includes(x)).map((x) => x.id);
@@ -650,7 +662,7 @@ export function ChatView({
 
   // Inverted list: newest at index 0.
   const rows = useMemo(
-    () => [...folded, ...pending.map((x): Row => ({ type: "pending", id: x.id, text: x.text, ts: x.ts }))].reverse(),
+    () => [...folded, ...pending.map((x): Row => ({ type: "pending", id: x.id, text: x.text, ts: x.ts, pictures: x.pictures }))].reverse(),
     [folded, pending],
   );
   const more = olderCursor === undefined ? q.data?.more : olderCursor !== null;
@@ -891,24 +903,10 @@ function WorkingBadge({ since, now }: { since?: number; now: number }) {
           <Text style={{ fontFamily: fonts.cute, fontSize: 15.5, color: p.accentText }}>正在干活</Text>
           <Text style={{ color: p.muted, fontSize: 12, fontFamily: fonts.bodySemi }}>{since ? workedFor(now - since) : "刚开始"}</Text>
         </View>
-        <BusyDots color={c.fg} />
+        <View style={{ marginLeft: space.xs }}>
+          <TypingDots color={c.fg} />
+        </View>
       </View>
-    </View>
-  );
-}
-
-/** Three dots taking turns, like someone typing. */
-function BusyDots({ color }: { color: string }) {
-  const [step, setStep] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setStep((n) => (n + 1) % 3), 420);
-    return () => clearInterval(t);
-  }, []);
-  return (
-    <View style={{ flexDirection: "row", gap: 4, marginLeft: space.xs }}>
-      {[0, 1, 2].map((i) => (
-        <View key={i} style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: color, opacity: i === step ? 1 : 0.3 }} />
-      ))}
     </View>
   );
 }

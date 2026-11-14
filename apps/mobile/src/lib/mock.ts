@@ -3,6 +3,7 @@
  * Lets the whole UI be demoed without a relay or a computer.
  */
 import {
+  PUT_LIMITS,
   agentKey,
   pairLink,
   type Agent,
@@ -76,6 +77,13 @@ function ag(
   };
 }
 
+const mark = (d: string) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd"><path d="${d}"/></svg>`;
+/** Demo answers for `harness.icons`: plain placeholder shapes, not anyone's logo. */
+const MOCK_MARKS: Record<string, string> = {
+  workbuddy: mark("M8 4h8a4 4 0 0 1 4 4v8a4 4 0 0 1-4 4H8a4 4 0 0 1-4-4V8a4 4 0 0 1 4-4zm1.5 6.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zm5 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"),
+  factory: mark("M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9L12 3zm0 6a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"),
+};
+
 function makeAgents(): Agent[] {
   return [
     ag(HOST_A, "t47", "claude-code", "blocked", "要不要删掉旧的迁移脚本？", "和弦本 / 1", "/Users/me/code/chord-book", 2 * MIN, {
@@ -89,10 +97,20 @@ function makeAgents(): Agent[] {
     ag(HOST_A, "t4m", "omp", "working", "博客平台 登录鉴权重构", "博客平台 / 1", "/Users/me/code/blog-platform", 3 * MIN, { sessionKey: "omp:demo-3", model: "gpt-5.5", turn: 2 }),
     ag(HOST_A, "t4q", "omp", "done", "notes-cli 0.2.8 发布检查", "notes-cli / 1", "/Users/me/code/notes-cli", 25 * MIN, { sessionKey: "omp:demo-4", turn: 6 }),
     ag(HOST_A, "t52", "codex", "idle", "API 网关用量面板", "api-gateway / 2", "/Users/me/code/api-gateway", 70 * MIN, { turn: 1 }),
+    // Harnesses without a sticker: bundled glyph (qodercli, kiro-cli), or a mark the computer sends (workbuddy, droid).
+    ag(HOST_A, "t5a", "qodercli", "idle", "README 中英对照", "notes-cli / 3", "/Users/me/code/notes-cli", 95 * MIN, { turn: 2 }),
+    ag(HOST_A, "t5b", "kiro-cli", "idle", "接口文档补全", "api-gateway / 3", "/Users/me/code/api-gateway", 2 * 3_600_000, { turn: 4 }),
+    ag(HOST_A, "t5c", "workbuddy", "idle", "周报整理", "杂事 / 1", "/Users/me/Documents", 3 * 3_600_000, { turn: 1 }),
+    ag(HOST_B, "t10", "droid", "idle", "备份脚本加重试", "运维 / 3", "/srv/ops", 4 * 3_600_000, { turn: 3 }),
     ag(HOST_A, "t4v", "sh", "idle", "zsh", "notes-cli / 2", "/Users/me/code/notes-cli", 3 * 3_600_000, { isShell: true, turn: 0 }),
     ag(HOST_B, "t3", "opencode", "working", "日志清理脚本影响范围评估", "运维 / 1", "/srv/ops", 90_000, { sessionKey: "opencode:demo-5", turn: 5 }),
     ag(HOST_B, "t5", "gemini", "done", "Nginx 证书自动续期", "运维 / 2", "/srv/ops", 50 * MIN, { turn: 2 }),
     ag(HOST_B, "t8", "claude-code", "blocked", "确认是否重启 relay 服务", "herdr-pocket / 1", "/srv/herdr-pocket", 6 * MIN, { sessionKey: "claude:demo-6", turn: 3 }),
+    ag(HOST_B, "t9", "claude-code", "blocked", "整理发布说明", "herdr-pocket / 2", "/srv/herdr-pocket", 3 * MIN, {
+      turn: 2,
+      errored: true,
+      statusNote: "API Error: 529 overloaded. The model is busy right now; try again in a moment.",
+    }),
   ];
 }
 
@@ -344,14 +362,21 @@ export function mockLink(): Link {
             const list = (sent[a.sessionKey] ??= []);
             list.push({ id: `${a.sessionKey}#sent${list.length}`, session: a.sessionKey, ts: now(), kind: "user_message", text: p.text } as ConvEvent);
           }
-          agents = agents.map((x) => (x.key === p.agent ? { ...x, status: "working", statusSince: now() } : x));
+          agents = agents.map((x) => (x.key === p.agent ? { ...x, status: "working", statusSince: now(), errored: undefined, statusNote: undefined } : x));
           publish();
           return { ok: true };
         }
         case "terminal.keys":
-          agents = agents.map((a) => (a.key === p.agent && a.status === "blocked" ? { ...a, status: "working", statusSince: now() } : a));
+          agents = agents.map((a) => (a.key === p.agent && a.status === "blocked" ? { ...a, status: "working", statusSince: now(), errored: undefined, statusNote: undefined } : a));
           publish();
           return { ok: true };
+        case "terminal.put": {
+          // Like `hc put`: each picture lands in the terminal's own folder on its computer.
+          const files = (p as { files?: { name?: string }[] }).files ?? [];
+          if (!files.length || files.length > PUT_LIMITS.files) throw new Error(`一次可以发 1 到 ${PUT_LIMITS.files} 张图片`);
+          const local = agents.find((x) => x.key === p.agent)?.localId ?? "t1";
+          return { paths: files.map((f, i) => `/Users/demo/.local/state/herdr-core/default/files/${local}/${(f.name ?? "").replace(/[^A-Za-z0-9._-]+/g, "-") || `image-${i + 1}.jpg`}`) };
+        }
         case "terminal.input":
           if (p.agent && typeof (p as { data?: unknown }).data === "string") typeInto(p.agent, (p as { data: string }).data);
           return { ok: true };
@@ -394,6 +419,11 @@ export function mockLink(): Link {
         }
         case "host.info":
           return { name: "demo", platform: "darwin", sources: ["hc"], version: "0.1.0" };
+        case "harness.icons": {
+          // Placeholder shapes standing in for what a computer's Uniflo would send (not the real marks).
+          const ids = (params as { ids?: string[] }).ids ?? [];
+          return { icons: Object.fromEntries(ids.filter((id) => MOCK_MARKS[id]).map((id) => [id, MOCK_MARKS[id]!])) };
+        }
         case "agent.seen":
           agents = agents.map((a) => (a.key === p.agent && a.status === "done" ? { ...a, status: "idle" } : a));
           publish();

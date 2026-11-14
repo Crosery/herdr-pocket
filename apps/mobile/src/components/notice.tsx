@@ -3,36 +3,40 @@
  * finished, needs them, or a reminder is due. In the chat it reads as the
  * assistant talking — its sentence first — not as a system card.
  */
-import { memo, useMemo, type ComponentProps } from "react";
+import { memo, useMemo } from "react";
 import { Pressable, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router } from "expo-router";
 import Markdown from "react-native-markdown-display";
-import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { AssistantItem, Notice } from "@herdr-pocket/protocol";
 import { findAgent, useSettings } from "../lib/store";
 import { fixCjkEmphasis } from "../lib/markdown";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
 import { mdStyles } from "./chat";
+import { CuteIcon, type CuteIconName } from "./icons";
 
-type IconName = ComponentProps<typeof MaterialCommunityIcons>["name"];
-
-/** Icon and colours for what the assistant found; older notices only carry their kind. */
-export function noticeLook(n: Pick<Notice, "kind" | "verdict">, p: Palette): { icon: IconName; fg: string; bg: string } {
+/** Icon and colours for what the assistant found; older notices only carry their kind. Same icon family as the agent status chips. */
+export function noticeLook(n: Pick<Notice, "kind" | "verdict">, p: Palette): { icon: CuteIconName; fg: string; bg: string } {
   const verdict = n.verdict ?? (n.kind === "blocked" ? "decide" : n.kind === "done" ? "ok" : undefined);
   switch (verdict) {
     case "ok":
-      return { icon: "check-circle-outline", ...statusColors("working", p.dark) };
+      return { icon: "done", ...statusColors("working", p.dark) };
     case "decide":
-      return { icon: "hand-back-left-outline", ...statusColors("blocked", p.dark) };
+      return { icon: "blocked", ...statusColors("blocked", p.dark) };
     case "failed":
-      return { icon: "alert-circle-outline", fg: p.error, bg: p.errorContainer };
+      return { icon: "alert", fg: p.error, bg: p.errorContainer };
     case "stopped":
-      return { icon: "pause-circle-outline", ...statusColors("idle", p.dark) };
+      return { icon: "pause", ...statusColors("idle", p.dark) };
     default:
-      return { icon: "alarm", fg: p.dusk, bg: p.duskContainer };
+      return { icon: "bell", fg: p.dusk, bg: p.duskContainer };
   }
+}
+
+/** A notice's icon drawn like the status chips: chubby stroke, white inner fill in light mode. */
+export function NoticeIcon({ look, size }: { look: { icon: CuteIconName; fg: string }; size: number }) {
+  const p = usePalette();
+  return <CuteIcon name={look.icon} size={size} color={look.fg} fill={p.dark ? "transparent" : "#FFFFFF"} strokeWidth={2.4} />;
 }
 
 function clock(ts: number): string {
@@ -59,7 +63,7 @@ export const NoticeBubble = memo(function NoticeBubble({ item }: { item: Assista
     <View style={{ alignSelf: "flex-start", width: "92%", gap: 4 }}>
       <View style={{ backgroundColor: p.surface, borderRadius: radius.card, borderBottomLeftRadius: 6, paddingHorizontal: space.md, paddingTop: space.md, paddingBottom: space.sm, gap: 7 }}>
         <View style={{ alignSelf: "flex-start", maxWidth: "100%", flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: look.bg, borderRadius: radius.pill, paddingLeft: 7, paddingRight: 10, paddingVertical: 3 }}>
-          <MaterialCommunityIcons name={look.icon} size={15} color={look.fg} />
+          <NoticeIcon look={look} size={15} />
           <Text numberOfLines={1} style={{ flexShrink: 1, color: look.fg, fontFamily: fonts.bodyBold, fontSize: 12.5 }}>
             {n.title}
           </Text>
@@ -78,12 +82,12 @@ export const NoticeBubble = memo(function NoticeBubble({ item }: { item: Assista
             style={({ pressed }) => ({ alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 2, minHeight: 32, paddingLeft: 12, paddingRight: 8, borderRadius: radius.pill, backgroundColor: pressed ? p.accentContainer : p.dark ? p.surface2 : "#FFF1F6" })}
           >
             <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 13.5 }}>去看看</Text>
-            <MaterialCommunityIcons name="chevron-right" size={16} color={p.accentText} />
+            <CuteIcon name="chevronRight" size={15} color={p.accentText} strokeWidth={2.6} />
           </Pressable>
         ) : null}
       </View>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 4 }}>
-        <MaterialCommunityIcons name="bell-ring-outline" size={12} color={p.faint} />
+        <CuteIcon name="bell" size={12} color={p.faint} strokeWidth={2.4} />
         <Text style={{ color: p.faint, fontSize: 11 }}>{clock(item.ts)} · 主动告诉你</Text>
       </View>
     </View>

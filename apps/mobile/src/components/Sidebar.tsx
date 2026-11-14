@@ -1,5 +1,5 @@
 /**
- * Left sliding sidebar (DSH Go's sessions drawer, adapted): computers and their
+ * Left sliding sidebar: computers and their
  * dynamically scoped Spaces, plus entries for devices and settings. Agent status
  * stays on the home page.
  * Built on RN Animated + PanResponder (no extra navigation dependency).
@@ -9,10 +9,11 @@ import { Animated, BackHandler, Easing, PanResponder, Pressable, ScrollView, use
 import { Text } from "react-native-paper";
 import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { Agent, Device } from "@herdr-pocket/protocol";
 import { SpaceBadge } from "./agents";
 import { Mascot } from "./Mascot";
+import { CuteIcon } from "./icons";
+import { IconTile } from "./ui";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space } from "../theme/tokens";
 
@@ -131,7 +132,7 @@ function QuietRow({ a, offline, onOpen }: { a: Agent; offline?: boolean; onOpen:
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`${spacedTitle(a)}，${offline ? "电脑离线" : statusLabel[a.status]}`}
+      accessibilityLabel={`${spacedTitle(a)}，${offline ? "电脑离线" : agentStatusLabel(a)}`}
       onPress={onOpen}
       style={({ pressed }) => ({ flexDirection: "row", alignItems: "center", gap: space.md, minHeight: 50, marginHorizontal: space.sm, paddingHorizontal: space.md, borderRadius: radius.md, backgroundColor: pressed ? p.surface3 : "transparent" })}
     >
@@ -141,7 +142,7 @@ function QuietRow({ a, offline, onOpen }: { a: Agent; offline?: boolean; onOpen:
           {spacedTitle(a)}
         </Text>
         <Text numberOfLines={1} style={{ color: p.faint, fontSize: 12 }}>
-          {offline ? "电脑离线" : statusLabel[a.status]} · {relTime(a.statusSince ?? a.updatedAt)}
+          {offline ? "电脑离线" : agentStatusLabel(a)} · {relTime(a.statusSince ?? a.updatedAt)}
         </Text>
       </View>
     </Pressable>
@@ -211,13 +212,11 @@ export function Sidebar({ s, d }: { s: ReturnType<typeof useSidebar>; d: Sidebar
           <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingHorizontal: space.lg }}>
             <Mascot mood="default" size={44} />
             <Text style={{ flex: 1, fontFamily: fonts.cute, fontSize: 21, color: p.ink }}>Herdr Pocket</Text>
-            <Pressable accessibilityRole="button" accessibilityLabel="关闭侧栏" onPress={s.hide} hitSlop={8} style={{ width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" }}>
-              <MaterialCommunityIcons name="chevron-left" size={24} color={p.muted} />
-            </Pressable>
+            <IconTile icon="back" tone="plain" size={40} onPress={s.hide} a11y="关闭侧栏" />
           </View>
 
           <Section title="电脑">
-            <Item on={!d.hostFilter} onPress={() => d.onHost(null)} lead={<MaterialCommunityIcons name="monitor-multiple" size={19} color={p.ink} />} label="全部电脑" count={d.allCount} a11y={`全部电脑，${d.allCount} 个 agent`} />
+            <Item on={!d.hostFilter} onPress={() => d.onHost(null)} lead={<CuteIcon name="screens" size={20} color={p.ink} fill={p.accentContainer} />} label="全部电脑" count={d.allCount} a11y={`全部电脑，${d.allCount} 个 agent`} />
             {d.hosts.map((h) => (
               <Item
                 key={h.id}
@@ -236,12 +235,12 @@ export function Sidebar({ s, d }: { s: ReturnType<typeof useSidebar>; d: Sidebar
               title="空间"
               right={
                 <Pressable accessibilityRole="button" accessibilityLabel="新建空间" onPress={d.onNewSpace} hitSlop={6} style={({ pressed }) => ({ flexDirection: "row", alignItems: "center", gap: 2, minHeight: 36, paddingHorizontal: 10, borderRadius: radius.pill, backgroundColor: pressed ? p.surface3 : p.accentContainer })}>
-                  <MaterialCommunityIcons name="plus" size={16} color={p.accentText} />
+                  <CuteIcon name="plus" size={15} color={p.accentText} strokeWidth={2.6} />
                   <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 12.5 }}>新建空间</Text>
                 </Pressable>
               }
             >
-              <Item on={!d.spaceFilter} onPress={() => d.onSpace(null)} lead={<MaterialCommunityIcons name="view-grid-outline" size={19} color={p.ink} />} label="全部空间" count={d.scopeCount} a11y={`全部空间，${d.scopeCount} 个 agent`} />
+              <Item on={!d.spaceFilter} onPress={() => d.onSpace(null)} lead={<CuteIcon name="grid" size={20} color={p.ink} fill={p.accentContainer} />} label="全部空间" count={d.scopeCount} a11y={`全部空间，${d.scopeCount} 个 agent`} />
               {d.spaces.map(([name, n]) => (
                 <Item
                   key={name}
@@ -253,7 +252,7 @@ export function Sidebar({ s, d }: { s: ReturnType<typeof useSidebar>; d: Sidebar
                   a11y={`空间 ${name}，${n} 个 agent`}
                   trailing={
                     <Pressable accessibilityRole="button" accessibilityLabel={`在 ${name} 新建 agent`} onPress={() => d.onNewInSpace(name)} hitSlop={6} style={({ pressed }) => ({ width: 36, height: 36, marginRight: -6, borderRadius: 18, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}>
-                      <MaterialCommunityIcons name="plus" size={18} color={p.muted} />
+                      <CuteIcon name="plus" size={17} color={p.muted} strokeWidth={2.4} />
                     </Pressable>
                   }
                 />
@@ -263,8 +262,8 @@ export function Sidebar({ s, d }: { s: ReturnType<typeof useSidebar>; d: Sidebar
 
           <View style={{ height: 1, backgroundColor: p.divider, marginHorizontal: space.lg, marginTop: space.lg }} />
           <View style={{ paddingTop: space.sm }}>
-            <Item onPress={() => go(() => router.navigate("/devices"))} lead={<MaterialCommunityIcons name="laptop" size={19} color={p.ink} />} label="设备" a11y="设备" />
-            <Item onPress={() => go(() => router.navigate("/settings"))} lead={<MaterialCommunityIcons name="cog-outline" size={19} color={p.ink} />} label="设置" a11y="设置" />
+            <Item onPress={() => go(() => router.navigate("/devices"))} lead={<CuteIcon name="laptop" size={20} color={p.ink} fill={p.accentContainer} />} label="设备" a11y="设备" />
+            <Item onPress={() => go(() => router.navigate("/settings"))} lead={<CuteIcon name="gear" size={20} color={p.ink} fill={p.accentContainer} />} label="设置" a11y="设置" />
           </View>
         </ScrollView>
       </Animated.View>

@@ -5,7 +5,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Markdown from "react-native-markdown-display";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { AssistantAction, AssistantItem } from "@herdr-pocket/protocol";
-import { BreathingDot, Card, IconTile, PageBackground, SendPill } from "../../components/ui";
+import { BreathingDot, Card, IconTile, PageBackground, SendPill, TypingDots } from "../../components/ui";
+import { CuteIcon } from "../../components/icons";
 import { Mascot } from "../../components/Mascot";
 import { mdStyles } from "../../components/chat";
 import { CallBar, CallScreen } from "../../components/CallScreen";
@@ -121,7 +122,7 @@ export default function AssistantScreen() {
             </View>
           ) : null}
         </View>
-        <IconTile icon="plus" tone="plain" size={40} onPress={() => setConfirmClear(true)} a11y="开始新对话" />
+        <IconTile icon="newChat" tone="plain" size={40} onPress={() => setConfirmClear(true)} a11y="开始新对话" />
       </View>
 
       {error ? (
@@ -250,12 +251,33 @@ function Welcome({ onPick, voice }: { onPick: (s: string) => void; voice: boolea
   );
 }
 
+/** 小羊 is replying: a small bubble on her side of the chat with typing dots, like the agent chat's working pill. */
 function Thinking({ label }: { label: string | null }) {
   const p = usePalette();
+  // The dots stand in for the old trailing "…".
+  const text = label && label !== "在想" ? `${NAME}正在处理${label}` : `${NAME}在想`;
   return (
-    <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingVertical: space.xs }}>
-      <BreathingDot color={p.primary} active size={8} />
-      <Text style={{ color: p.muted, fontSize: 13.5 }}>{label && label !== "在想" ? `${NAME}正在处理${label}…` : `${NAME}在想…`}</Text>
+    <View
+      accessibilityLiveRegion="polite"
+      accessibilityLabel={text}
+      style={{
+        alignSelf: "flex-start",
+        maxWidth: "92%",
+        flexDirection: "row",
+        alignItems: "center",
+        gap: space.sm,
+        backgroundColor: p.surface,
+        borderRadius: radius.card,
+        borderBottomLeftRadius: 6,
+        paddingLeft: space.md + 2,
+        paddingRight: space.md,
+        paddingVertical: 9,
+      }}
+    >
+      <TypingDots color={p.primary} size={7} />
+      <Text numberOfLines={1} style={{ flexShrink: 1, color: p.muted, fontSize: 13.5, fontFamily: fonts.bodySemi }}>
+        {text}
+      </Text>
     </View>
   );
 }
@@ -303,7 +325,7 @@ function Meta({ item }: { item: AssistantItem }) {
   const p = usePalette();
   return (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 4 }}>
-      {item.via === "voice" ? <MaterialCommunityIcons name="microphone-outline" size={12} color={p.faint} /> : null}
+      {item.via === "voice" ? <CuteIcon name="mic" size={12} color={p.faint} strokeWidth={2.4} /> : null}
       <Text style={{ color: p.faint, fontSize: 11 }}>{clock(item.ts)}</Text>
     </View>
   );

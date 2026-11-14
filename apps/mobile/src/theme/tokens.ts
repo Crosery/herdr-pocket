@@ -155,6 +155,11 @@ export const statusLabel: Record<AgentStatus, string> = {
   unknown: "未知",
 };
 
+/** The word on an agent's status chip: an error says so, though its status is `blocked`. */
+export function agentStatusLabel(a: { status: AgentStatus; errored?: boolean }): string {
+  return a.errored ? "出错了" : statusLabel[a.status];
+}
+
 /** Space swatches, reusing the status/accent pairs (all fg/bg pairs already ≥4.5:1). */
 export function spaceColors(name: string, dark: boolean, hash: (s: string) => number): { fg: string; bg: string } {
   const light = [

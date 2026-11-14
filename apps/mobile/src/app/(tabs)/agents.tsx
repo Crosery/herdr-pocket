@@ -3,7 +3,6 @@ import { Pressable, RefreshControl, SectionList, View } from "react-native";
 import { Searchbar, Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLocalSearchParams, useNavigation, router } from "expo-router";
-import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { Agent, AgentStatus } from "@herdr-pocket/protocol";
 import { AgentRow, ConnectionBanner, SpaceBadge } from "../../components/agents";
 import { EmptyState, IconTile, PageBackground } from "../../components/ui";
@@ -80,7 +79,7 @@ function FilterTag({ label, lead, onClear }: { label: string; lead?: React.React
       <Text numberOfLines={1} style={{ maxWidth: 160, color: p.ink, fontFamily: fonts.bodyBold, fontSize: 13 }}>
         {label}
       </Text>
-      <MaterialCommunityIcons name="close" size={15} color={p.accentText} />
+      <CuteIcon name="close" size={14} color={p.accentText} strokeWidth={2.6} />
     </Pressable>
   );
 }
@@ -188,7 +187,7 @@ export default function AgentsHub() {
     <View style={{ gap: space.md, paddingBottom: space.xs }}>
       {/* Raised so the mascot's speech bubble draws over the stat cards below. */}
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, zIndex: 5, elevation: 5 }}>
-        <IconTile icon="menu" tone="plain" size={46} shape="squircle" onPress={sidebar.show} a11y="打开侧栏：电脑和空间" />
+        <IconTile icon="menu" tone="plain" size={40} onPress={sidebar.show} a11y="打开侧栏：电脑和空间" />
         <View style={{ flex: 1, gap: 2 }}>
           <Text style={{ fontFamily: fonts.cute, fontSize: 24, lineHeight: 32, color: p.ink }}>{greeting()}</Text>
           <Text numberOfLines={1} style={{ color: p.muted, fontSize: 13.5 }}>
@@ -204,7 +203,7 @@ export default function AgentsHub() {
 
       {hostName || activeSpace ? (
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
-          {hostName ? <FilterTag label={hostName} lead={<MaterialCommunityIcons name="laptop" size={15} color={p.ink} style={{ marginLeft: 4 }} />} onClear={() => setSettings({ hostFilter: null })} /> : null}
+          {hostName ? <FilterTag label={hostName} lead={<View style={{ marginLeft: 4 }}><CuteIcon name="laptop" size={16} color={p.ink} fill={p.surface} /></View>} onClear={() => setSettings({ hostFilter: null })} /> : null}
           {activeSpace ? <FilterTag label={activeSpace} lead={<SpaceBadge name={activeSpace} size={22} />} onClear={() => setSpaceFilter(null)} /> : null}
         </View>
       ) : null}
@@ -253,7 +252,7 @@ export default function AgentsHub() {
             >
               <Text style={{ fontFamily: fonts.bodyBold, color: p.muted, fontSize: 14 }}>{section.title}</Text>
               <Text style={{ flex: 1, fontFamily: fonts.bodyBold, color: p.faint, fontSize: 13 }}>{section.count}</Text>
-              {canFold ? <MaterialCommunityIcons name={section.folded ? "chevron-right" : "chevron-down"} size={20} color={p.faint} /> : null}
+              {canFold ? <CuteIcon name={section.folded ? "chevronRight" : "chevronDown"} size={18} color={p.faint} /> : null}
             </Pressable>
           );
         }}
@@ -282,6 +281,7 @@ export default function AgentsHub() {
           justifyContent: "center",
           borderRadius: FAB / 2,
           backgroundColor: pressed ? p.primaryPressed : p.primary,
+          transform: [{ scale: pressed ? 0.94 : 1 }],
           shadowColor: p.shadow,
           shadowOpacity: p.dark ? 0 : 0.3,
           shadowRadius: 10,
@@ -289,7 +289,7 @@ export default function AgentsHub() {
           elevation: 4,
         })}
       >
-        <MaterialCommunityIcons name="plus" size={28} color={p.onPrimary} />
+        <CuteIcon name="plus" size={28} color={p.onPrimary} strokeWidth={2.8} />
       </Pressable>
 
       <Sidebar

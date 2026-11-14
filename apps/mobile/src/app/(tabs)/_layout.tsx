@@ -1,5 +1,6 @@
 import { Redirect, Tabs } from "expo-router";
-import { View } from "react-native";
+import type { BottomTabBarButtonProps } from "expo-router/js-tabs";
+import { Pressable, View } from "react-native";
 import { CuteIcon, type CuteIconName } from "../../components/icons";
 import { useSettings, useLive, allAgents } from "../../lib/store";
 import { useAssistant } from "../../lib/assistant";
@@ -17,6 +18,19 @@ function TabIcon({ name, focused, color }: { name: CuteIconName; focused: boolea
   );
 }
 
+/**
+ * Tab button without React Navigation's default Android ripple (a borderless
+ * gray circle). The open tab's pink pill is the selection cue; a press gives
+ * the same small squash as the app's other buttons.
+ */
+function TabButton({ ref: _ref, href: _href, android_ripple: _ripple, pressColor: _pressColor, pressOpacity: _pressOpacity, hoverEffect: _hover, style, children, ...rest }: BottomTabBarButtonProps) {
+  return (
+    <Pressable {...rest} style={({ pressed }) => [style, { transform: [{ scale: pressed ? 0.94 : 1 }] }]}>
+      {children}
+    </Pressable>
+  );
+}
+
 export default function TabsLayout() {
   const p = usePalette();
   const server = useSettings((s) => s.server);
@@ -31,6 +45,7 @@ export default function TabsLayout() {
         screenOptions={{
           headerShown: false,
           tabBarHideOnKeyboard: true,
+          tabBarButton: (props) => <TabButton {...props} />,
           tabBarActiveTintColor: p.accentText,
           tabBarInactiveTintColor: p.faint,
           tabBarLabelStyle: { fontFamily: fonts.bodyBold, fontSize: 11, marginTop: 2 },

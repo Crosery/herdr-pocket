@@ -1,20 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
-import { Pressable, ScrollView, TextInput as RNTextInput, View } from "react-native";
+import { Image, Pressable, ScrollView, TextInput as RNTextInput, View } from "react-native";
 import { ActivityIndicator, Button, Checkbox, Dialog, IconButton, List, Portal, ProgressBar, Snackbar, Text } from "react-native-paper";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { Agent } from "@herdr-pocket/protocol";
+import { PUT_LIMITS, type Agent } from "@herdr-pocket/protocol";
 import { call, subscribe, type RelayError } from "../lib/relay";
+import { addPictures, canPickImages, pickImages, sendWithPictures, type Attachment } from "../lib/attach";
 import { chunks, typingDiff } from "../lib/typing";
 import { useLive, usePending, useSettings } from "../lib/store";
 import { normalizeTermKeyLayout, TERM_KEYS, visibleTermKeys } from "../lib/termkeys";
 import { compactNum, money, relTime, shortPath } from "../lib/format";
 import { parseAnsi, runColors, TERM_BG, TERM_FG } from "../lib/ansi";
 import { harnessLook } from "../lib/harness";
+import { parseChoices, type Choice } from "../lib/choices";
 import { usePalette } from "../theme/theme";
-import { fonts, radius, space, statusColors, statusLabel } from "../theme/tokens";
+import { agentStatusLabel, fonts, radius, space, statusColors } from "../theme/tokens";
 import { TermKeyboard } from "./TermKeyboard";
 import { EmptyState, IconTile, SendPill } from "./ui";
 
@@ -232,8 +234,11 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
 // Waiting card (docked above the composer when the agent is blocked)
 // ---------------------------------------------------------------------------
 
-/** Last lines on the agent's screen, so the question it is asking can be read without leaving the chat. */
-function useScreenTail(agent: Agent, enabled: boolean, lines = 7): string[] {
+/**
+ * Last lines on the agent's screen, so the question it is asking can be read
+ * without leaving the chat, and the options it offers (`parseChoices`).
+ */
+function useScreenTail(agent: Agent, enabled: boolean, lines = 7): { tail: string[]; choices: Choice[] } {
   const q = useQuery({
     queryKey: ["terminal.tail", agent.key],
     queryFn: () => call(agent.deviceId, "terminal.read", { agent: agent.key, lines: 40 }),
@@ -244,14 +249,91 @@ function useScreenTail(agent: Agent, enabled: boolean, lines = 7): string[] {
   return useMemo(() => {
     const all = (q.data?.text ?? "").split("\n").map((l) => l.replace(/\s+$/, ""));
     while (all.length && !all[all.length - 1]!.trim()) all.pop();
-    return all.filter((l, i) => l.trim() || (i > 0 && all[i - 1]!.trim())).slice(-lines);
+    const choices = parseChoices(all);
+    return { tail: all.filter((l, i) => l.trim() || (i > 0 && all[i - 1]!.trim())).slice(-lines), choices };
   }, [q.data?.text, lines]);
 }
 
-function WaitingCard({ agent, onKey, busy, compact, onOpenTerminal }: { agent: Agent; onKey: (key: string) => void; busy: boolean; compact: boolean; onOpenTerminal?: () => void }) {
+function WaitingCard({
+  agent,
+  onKey,
+  onRetry,
+  busy,
+  compact,
+  onOpenTerminal,
+}: {
+  agent: Agent;
+  onKey: (key: string) => void;
+  onRetry: () => void;
+  busy: boolean;
+  compact: boolean;
+  onOpenTerminal?: () => void;
+}) {
   const p = usePalette();
   const c = statusColors("blocked", p.dark);
-  const tail = useScreenTail(agent, !compact);
+  // Read even beside the terminal: the options decide which keys the buttons press.
+  const { tail, choices } = useScreenTail(agent, !agent.errored);
+  if (agent.errored) {
+    // Stopped on an error, not on a question: y / n mean nothing to it.
+    return (
+      <View accessibilityLiveRegion="polite" style={{ marginHorizontal: space.lg, marginBottom: space.sm, backgroundColor: c.bg, borderRadius: radius.card, padding: space.md, gap: space.sm }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+          <MaterialCommunityIcons name="alert-circle-outline" size={18} color={c.fg} />
+          <Text style={{ flex: 1, fontFamily: fonts.cute, fontSize: 16, color: c.fg }}>它出错停下了</Text>
+        </View>
+        {agent.statusNote ? (
+          <Text selectable numberOfLines={compact ? 2 : 6} style={{ fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: p.ink }}>
+            {agent.statusNote}
+          </Text>
+        ) : null}
+        <View style={{ flexDirection: "row", gap: space.sm }}>
+          <Pressable
+            disabled={busy}
+            onPress={onRetry}
+            accessibilityRole="button"
+            accessibilityLabel="让它继续：发送“继续”"
+            style={({ pressed }) => ({ flex: 1, minHeight: 40, borderRadius: radius.pill, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.accentText : p.primary, opacity: busy ? 0.5 : 1 })}
+          >
+            <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.onPrimary }}>让它继续</Text>
+          </Pressable>
+          {!compact && onOpenTerminal ? (
+            <Pressable
+              onPress={onOpenTerminal}
+              accessibilityRole="button"
+              style={({ pressed }) => ({ flex: 1, minHeight: 40, borderRadius: radius.pill, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : p.surface })}
+            >
+              <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.ink }}>看终端</Text>
+            </Pressable>
+          ) : null}
+        </View>
+      </View>
+    );
+  }
+  const choice = (o: Choice) => (
+    <Pressable
+      key={o.key}
+      disabled={busy}
+      onPress={() => onKey(o.key)}
+      accessibilityRole="button"
+      accessibilityLabel={`选第 ${o.key} 项：${o.label}`}
+      style={({ pressed }) => ({
+        flexDirection: "row",
+        alignItems: "center",
+        gap: space.sm,
+        minHeight: 40,
+        paddingHorizontal: space.md,
+        paddingVertical: 6,
+        borderRadius: radius.md,
+        backgroundColor: pressed ? (o.selected ? p.accentText : p.surface3) : o.selected ? p.primary : p.surface,
+        opacity: busy ? 0.5 : 1,
+      })}
+    >
+      <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13, color: o.selected ? p.onPrimary : c.fg, minWidth: 14 }}>{o.key}</Text>
+      <Text numberOfLines={2} style={{ flex: 1, fontFamily: fonts.bodySemi, fontSize: 13.5, color: o.selected ? p.onPrimary : p.ink }}>
+        {o.label}
+      </Text>
+    </Pressable>
+  );
   const answer = (label: string, key: string, a11y: string, primary = false) => (
     <Pressable
       key={key}
@@ -283,7 +365,12 @@ function WaitingCard({ agent, onKey, busy, compact, onOpenTerminal }: { agent: A
           </Pressable>
         ) : null}
       </View>
-      {!compact && tail.length ? (
+      {agent.statusNote ? (
+        <Text selectable style={{ fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: p.ink }}>
+          {agent.statusNote}
+        </Text>
+      ) : null}
+      {!compact && tail.length && !choices.length ? (
         <Pressable accessibilityLabel="它屏幕上最后几行，点按去终端" onPress={onOpenTerminal} style={{ backgroundColor: TERM_BG, borderRadius: radius.sm, paddingHorizontal: space.md, paddingVertical: space.sm }}>
           {tail.map((l, i) => (
             <Text key={i} numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 11, lineHeight: 16, color: TERM_FG }}>
@@ -292,12 +379,22 @@ function WaitingCard({ agent, onKey, busy, compact, onOpenTerminal }: { agent: A
           ))}
         </Pressable>
       ) : null}
-      <View style={{ flexDirection: "row", gap: space.sm }}>
-        {answer("是 y", "y", `同意，发送 y 给 ${agent.harness}`, true)}
-        {answer("否 n", "n", "拒绝，发送 n")}
-        {answer("回车", "enter", "按回车确认当前选项")}
-        {answer("Esc", "esc", "按 Esc 取消")}
-      </View>
+      {choices.length ? (
+        <View style={{ gap: 6 }}>
+          {choices.slice(0, compact ? 4 : 9).map(choice)}
+          <View style={{ flexDirection: "row", gap: space.sm }}>
+            {answer("回车", "enter", "按回车选高亮的那项")}
+            {answer("Esc", "esc", "按 Esc 取消")}
+          </View>
+        </View>
+      ) : (
+        <View style={{ flexDirection: "row", gap: space.sm }}>
+          {answer("是 y", "y", `同意，发送 y 给 ${agent.harness}`, true)}
+          {answer("否 n", "n", "拒绝，发送 n")}
+          {answer("回车", "enter", "按回车确认当前选项")}
+          {answer("Esc", "esc", "按 Esc 取消")}
+        </View>
+      )}
     </View>
   );
 }
@@ -438,6 +535,9 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   const p = usePalette();
   const qc = useQueryClient();
   const [text, setText] = useState("");
+  /** Pictures to go with the next message (chat only). */
+  const [pictures, setPictures] = useState<Attachment[]>([]);
+  const [picking, setPicking] = useState(false);
   const [extra, setExtra] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   /** The host cannot take direct typing: fall back to the one-line box. */
@@ -493,13 +593,17 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
 
   async function send() {
     const t = text.trim();
-    if (!t || sending) return;
+    const pics = mode === "chat" ? pictures : [];
+    if ((!t && !pics.length) || sending) return;
     setSending(true);
     try {
-      const accepted = await call(agent.deviceId, "terminal.send", { agent: agent.key, text: t, enter: true });
+      // Pictures first reach the computer; then the text naming them goes through the queue as usual.
+      const { accepted } = await sendWithPictures(agent, t, pics);
       setQueue({ status: accepted.position && accepted.position > 0 ? "queued" : "sending", position: accepted.position ?? 0 });
       setText("");
-      addPending(agent.key, t);
+      if (pics.length) setPictures((cur) => cur.filter((x) => !pics.includes(x)));
+      // The bubble shows what the person sent: their words and the pictures, not the paths the agent got.
+      addPending(agent.key, t, pics.map((x) => `data:${x.mime};base64,${x.data}`));
       // The "sent" notice rides the terminal stream; never leave "sending" up if it is missed.
       setTimeout(() => setQueue((q) => (q?.status === "sending" ? null : q)), 8000);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
@@ -511,12 +615,45 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     }
   }
 
+  async function attach() {
+    if (!canPickImages()) return setToast("这个版本的 App 还不能选图片，更新 App 后再试");
+    const room = PUT_LIMITS.files - pictures.length;
+    if (room <= 0) return setToast(`一次最多发 ${PUT_LIMITS.files} 张图片`);
+    setPicking(true);
+    try {
+      const picked = await pickImages(room);
+      if (!picked.length) return;
+      const r = addPictures(pictures, picked);
+      setPictures(r.list);
+      if (r.note) setToast(r.note);
+    } catch (e) {
+      setToast(`图片没读出来：${(e as Error).message}`);
+    } finally {
+      setPicking(false);
+    }
+  }
+
   async function press(key: string, haptic: "select" | "heavy" = "select") {
     if (haptic === "heavy") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => undefined);
     else Haptics.selectionAsync().catch(() => undefined);
     setSending(true);
     try {
       await call(agent.deviceId, "terminal.keys", { agent: agent.key, keys: [key] });
+      refreshSoon();
+    } catch (e) {
+      setToast((e as Error).message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  /** After an error (a dropped connection, a model that failed): ask it to carry on. */
+  async function retry() {
+    Haptics.selectionAsync().catch(() => undefined);
+    setSending(true);
+    try {
+      await call(agent.deviceId, "terminal.send", { agent: agent.key, text: "继续" });
+      addPending(agent.key, "继续");
       refreshSoon();
     } catch (e) {
       setToast((e as Error).message);
@@ -567,7 +704,7 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
           </Pressable>
         </View>
       ) : null}
-      {agent.status === "blocked" && online ? <WaitingCard agent={agent} busy={sending} onKey={(k) => press(k)} compact={mode === "terminal"} onOpenTerminal={onOpenTerminal} /> : null}
+      {agent.status === "blocked" && online ? <WaitingCard agent={agent} busy={sending} onKey={(k) => press(k)} onRetry={retry} compact={mode === "terminal"} onOpenTerminal={onOpenTerminal} /> : null}
       {showKeys ? (
       <View style={{ flexDirection: "row", alignItems: "center" }}>
       <ScrollView horizontal style={{ flex: 1 }} showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.sm, paddingLeft: space.lg, paddingRight: space.xs, paddingVertical: space.xs }} keyboardShouldPersistTaps="always">
@@ -634,6 +771,35 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
       {padOpen ? (
         <TermKeyboard onSend={direct.push} onSystem={switchToSystem} onClose={closePad} />
       ) : null}
+      {mode === "chat" && pictures.length ? (
+        <View style={{ flexDirection: "row", alignItems: "center", marginTop: space.xs }}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.md, paddingLeft: space.lg, paddingRight: space.sm, paddingTop: 8, paddingBottom: 2 }} keyboardShouldPersistTaps="always">
+            {pictures.map((x, i) => (
+              <View key={x.id} style={{ width: 60, height: 60 }}>
+                <Image
+                  source={{ uri: `data:${x.mime};base64,${x.data}` }}
+                  accessibilityLabel={`要发送的第 ${i + 1} 张图片`}
+                  style={{ width: 60, height: 60, borderRadius: radius.sm, backgroundColor: p.surface2, borderWidth: 1, borderColor: p.dark ? p.surface3 : "#FBE3EC", opacity: sending ? 0.6 : 1 }}
+                />
+                {!sending ? (
+                  <Pressable
+                    onPress={() => setPictures((cur) => cur.filter((y) => y.id !== x.id))}
+                    hitSlop={10}
+                    accessibilityRole="button"
+                    accessibilityLabel={`移除第 ${i + 1} 张图片`}
+                    style={({ pressed }) => ({ position: "absolute", top: -7, right: -7, width: 22, height: 22, borderRadius: 11, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.primaryPressed : p.primary, borderWidth: 2, borderColor: p.surface })}
+                  >
+                    <MaterialCommunityIcons name="close" size={12} color={p.onPrimary} />
+                  </Pressable>
+                ) : null}
+              </View>
+            ))}
+          </ScrollView>
+          <Text accessibilityLiveRegion="polite" style={{ color: p.muted, fontSize: 12, paddingRight: space.lg }}>
+            {sending ? "正在传图片…" : `${pictures.length}/${PUT_LIMITS.files}`}
+          </Text>
+        </View>
+      ) : null}
       {showInput ? (
       <View
         style={{
@@ -666,6 +832,9 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
             a11y={extra ? "收起快捷按键" : "显示回车、Esc、方向键等快捷按键"}
           />
         ) : null}
+        {mode === "chat" ? (
+          <IconTile icon="image" size={40} disabled={!online || picking || sending} onPress={attach} a11y="添加图片，和消息一起发给它" />
+        ) : null}
         <RNTextInput
           value={text}
           onChangeText={setText}
@@ -680,7 +849,7 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
           style={{ flex: 1, fontFamily: mode === "terminal" ? fonts.mono : fonts.body, fontSize: mode === "terminal" ? 14 : 15.5, color: p.ink, maxHeight: 120, paddingVertical: 9 }}
           accessibilityLabel="发送给 agent 的内容"
         />
-        <SendPill disabled={!text.trim() || sending || !online} onPress={send} />
+        <SendPill disabled={(!text.trim() && !(mode === "chat" && pictures.length)) || sending || !online} onPress={send} />
       </View>
       ) : null}
       <KeyLayoutDialog visible={tuning} onDismiss={() => setTuning(false)} />
@@ -726,7 +895,7 @@ export function InfoView({ agent, bottomInset }: { agent: Agent; bottomInset: nu
         </View>
       ) : null}
       <View style={{ backgroundColor: p.surface, borderRadius: radius.card, overflow: "hidden", paddingVertical: space.xs }}>
-        {row("状态", `${statusLabel[agent.status]} · ${relTime(agent.statusSince ?? agent.updatedAt)}`, "pulse")}
+        {row("状态", `${agentStatusLabel(agent)} · ${relTime(agent.statusSince ?? agent.updatedAt)}`, "pulse")}
         {row("程序", look.label, "robot-outline")}
         {row("所在电脑", device?.name ?? agent.deviceId, "laptop")}
         {row("位置", agent.where, "tab")}

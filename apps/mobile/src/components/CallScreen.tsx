@@ -9,7 +9,6 @@ import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
-import { MaterialCommunityIcons } from "@expo/vector-icons";
 import Animated, { FadeIn, FadeInDown, FadeOut, LinearTransition } from "react-native-reanimated";
 import type { Notice } from "@herdr-pocket/protocol";
 import { callPhase, hangup, toggleMute, useVoice, type CallLine, type CallPhase } from "../lib/voice";
@@ -18,7 +17,7 @@ import { findAgent } from "../lib/store";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space } from "../theme/tokens";
 import { CallFace, LevelBars, VoiceOrb } from "./VoiceOrb";
-import { noticeLook } from "./notice";
+import { NoticeIcon, noticeLook } from "./notice";
 import { CuteIcon, type CuteIconName } from "./icons";
 import { IconTile } from "./ui";
 
@@ -223,7 +222,7 @@ function CallNotice({ notice, onOpen }: { notice: Notice; onOpen: () => void }) 
         style={{ flexDirection: "row", alignItems: "center", gap: space.md, backgroundColor: p.surface, borderRadius: radius.card, padding: space.md, elevation: p.dark ? 0 : 2, shadowColor: p.shadow, shadowOpacity: 0.14, shadowRadius: 10, shadowOffset: { width: 0, height: 4 } }}
       >
         <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: look.bg, alignItems: "center", justifyContent: "center" }}>
-          <MaterialCommunityIcons name={look.icon} size={19} color={look.fg} />
+          <NoticeIcon look={look} size={19} />
         </View>
         <View style={{ flex: 1, gap: 1 }}>
           <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, color: p.ink, fontSize: 14 }}>
@@ -235,7 +234,7 @@ function CallNotice({ notice, onOpen }: { notice: Notice; onOpen: () => void }) 
             </Text>
           ) : null}
         </View>
-        {agent ? <MaterialCommunityIcons name="chevron-right" size={20} color={p.faint} /> : null}
+        {agent ? <CuteIcon name="chevronRight" size={18} color={p.faint} /> : null}
       </Pressable>
     </Animated.View>
   );

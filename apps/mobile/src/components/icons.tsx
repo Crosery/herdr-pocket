@@ -16,8 +16,15 @@ export type CuteIconName =
   | "tune"
   | "hangup"
   | "chat"
+  | "newChat"
   | "bell"
   | "plus"
+  | "chevronRight"
+  | "alert"
+  | "pause"
+  | "close"
+  | "grid"
+  | "screens"
   | "search"
   | "menu"
   | "terminal"
@@ -33,7 +40,8 @@ export type CuteIconName =
   | "robot"
   | "laptop"
   | "gear"
-  | "plane";
+  | "plane"
+  | "image";
 
 const S = { strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
 
@@ -58,6 +66,8 @@ function shape(name: CuteIconName, ink: string, fill: string, w: number) {
       return <Path d="M14.5 5.5 L8 12 L14.5 18.5" {...line} />;
     case "chevronDown":
       return <Path d="M6.5 9.5 L12 15 L17.5 9.5" {...line} />;
+    case "chevronRight":
+      return <Path d="M9.5 5.5 L16 12 L9.5 18.5" {...line} />;
     case "send":
       return (
         <G>
@@ -126,8 +136,52 @@ function shape(name: CuteIconName, ink: string, fill: string, w: number) {
           <Path d="M10 20.5 C10.5 21.2 11.2 21.5 12 21.5 C12.8 21.5 13.5 21.2 14 20.5 M12 5 V3.5" {...line} />
         </G>
       );
+    case "newChat":
+      // A round speech bubble with a plus: start a new conversation.
+      return (
+        <G>
+          <Path d="M12 3.5 C16.7 3.5 20.5 7 20.5 11.4 C20.5 15.8 16.7 19.3 12 19.3 C10.9 19.3 9.8 19.1 8.8 18.7 L4.5 20.4 L5.7 16.5 C4.3 15.1 3.5 13.3 3.5 11.4 C3.5 7 7.3 3.5 12 3.5 Z" {...body} />
+          <Path d="M12 8.2 V14.6 M8.8 11.4 H15.2" {...line} />
+        </G>
+      );
     case "plus":
       return <Path d="M12 5.5 V18.5 M5.5 12 H18.5" {...line} />;
+    case "alert":
+      // A soft warning triangle: something went wrong.
+      return (
+        <G>
+          <Path d="M10.3 4.8 C11.1 3.4 12.9 3.4 13.7 4.8 L20.6 16.8 C21.4 18.2 20.4 19.9 18.8 19.9 H5.2 C3.6 19.9 2.6 18.2 3.4 16.8 Z" {...body} />
+          <Path d="M12 9.3 V13.2 M12 16.4 h0.01" {...line} />
+        </G>
+      );
+    case "pause":
+      return (
+        <G>
+          <Circle cx={12} cy={12} r={8.5} {...body} />
+          <Path d="M10 9.3 V14.7 M14 9.3 V14.7" {...line} />
+        </G>
+      );
+    case "close":
+      return <Path d="M7 7 L17 17 M17 7 L7 17" {...line} />;
+    case "grid":
+      // Four soft tiles: every space.
+      return (
+        <G>
+          <Rect x={4} y={4} width={7} height={7} rx={2.2} {...body} />
+          <Rect x={13} y={4} width={7} height={7} rx={2.2} {...body} />
+          <Rect x={4} y={13} width={7} height={7} rx={2.2} {...body} />
+          <Rect x={13} y={13} width={7} height={7} rx={2.2} {...body} />
+        </G>
+      );
+    case "screens":
+      // Two screens, one behind the other: every computer.
+      return (
+        <G>
+          <Path d="M7.5 6.5 V5.5 C7.5 4.4 8.4 3.5 9.5 3.5 H19 C20.1 3.5 21 4.4 21 5.5 V11.5 C21 12.6 20.1 13.5 19 13.5 H18" {...line} />
+          <Rect x={3} y={7.5} width={14} height={9.5} rx={2.2} {...body} />
+          <Path d="M7.5 20.5 H12.5 M10 17 V20.5" {...line} />
+        </G>
+      );
     case "search":
       return (
         <G>
@@ -136,7 +190,8 @@ function shape(name: CuteIconName, ink: string, fill: string, w: number) {
         </G>
       );
     case "menu":
-      return <Path d="M5 7 H19 M5 12 H15 M5 17 H19" {...line} />;
+      // Three even bars, like the design kit's header button.
+      return <Path d="M5.5 6.5 H18.5 M5.5 12 H18.5 M5.5 17.5 H18.5" {...line} />;
     case "terminal":
       return (
         <G>
@@ -189,6 +244,15 @@ function shape(name: CuteIconName, ink: string, fill: string, w: number) {
       );
     case "plane":
       return <Path d="M20.5 3.8 L3.8 10.6 L10.4 13.4 L13.2 20.2 Z M10.4 13.4 L20.5 3.8" {...body} />;
+    case "image":
+      // A little photo: a sun over a soft hill, for attaching pictures.
+      return (
+        <G>
+          <Rect x={3.5} y={4.5} width={17} height={15} rx={4} {...body} />
+          <Circle cx={9} cy={9.6} r={1.7} {...line} />
+          <Path d="M4.5 17.5 L9.6 13.2 C10.3 12.6 11.3 12.6 12 13.2 L14 15 L15.6 13.6 C16.3 13 17.3 13 18 13.6 L20 15.4" {...line} />
+        </G>
+      );
     case "check":
       return <Path d="M5.5 12.5 L10 17 L18.5 7.5" {...line} />;
     case "working":

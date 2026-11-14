@@ -28,13 +28,19 @@ magick "$M/brand/logo.png" -resize 180x180 -strip public/apple-touch-icon.png
 
 # Hero mascot: key the green-screen source clips into 480 px RGBA frames with a
 # shared crop (so idle and tap swap without a jump), then encode animated webp.
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-CROP=12,0,712,712
-python3 -I "$GEN/anim/key.py" "$GEN/anim/idle-src.mp4" "$TMP/idle" --size 480 --fps 18 --crop $CROP --xfade 6 --aq 4
-python3 -I "$GEN/anim/key.py" "$GEN/anim/tap-src.mp4" "$TMP/tap" --size 480 --fps 18 --crop $CROP --aq 4
-img2webp -loop 0 -lossy -q 72 -m 6 -d 56 "$TMP"/idle/*.png -o "$OUT/mascot/idle.webp"
-img2webp -loop 1 -lossy -q 72 -m 6 -d 56 "$TMP"/tap/*.png -o "$OUT/mascot/tap.webp"
-cwebp -quiet -q 80 -alpha_q 90 "$TMP/idle/000.png" -o "$OUT/mascot/idle-poster.webp"
+# The source clips are not published (docs/design/gen is git-ignored), so a
+# fresh clone keeps the committed idle.webp, tap.webp and idle-poster.webp.
+if [ -f "$GEN/anim/key.py" ]; then
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+  CROP=12,0,712,712
+  python3 -I "$GEN/anim/key.py" "$GEN/anim/idle-src.mp4" "$TMP/idle" --size 480 --fps 18 --crop $CROP --xfade 6 --aq 4
+  python3 -I "$GEN/anim/key.py" "$GEN/anim/tap-src.mp4" "$TMP/tap" --size 480 --fps 18 --crop $CROP --aq 4
+  img2webp -loop 0 -lossy -q 72 -m 6 -d 56 "$TMP"/idle/*.png -o "$OUT/mascot/idle.webp"
+  img2webp -loop 1 -lossy -q 72 -m 6 -d 56 "$TMP"/tap/*.png -o "$OUT/mascot/tap.webp"
+  cwebp -quiet -q 80 -alpha_q 90 "$TMP/idle/000.png" -o "$OUT/mascot/idle-poster.webp"
+else
+  echo "hero animation sources not found; keeping the committed idle.webp, tap.webp and idle-poster.webp"
+fi
 
 du -sh "$OUT"/* public/*.png

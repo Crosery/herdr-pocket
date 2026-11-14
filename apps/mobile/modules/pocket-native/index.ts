@@ -1,6 +1,17 @@
 import { requireOptionalNativeModule, type EventSubscription } from "expo";
 
-/** Android-only native side: voice call audio, the background alert service, notifications, in-app updates. */
+/** A picture from `pickImages`. */
+export interface PickedImage {
+  name: string;
+  mime: "image/jpeg";
+  /** Base64, no line breaks. */
+  data: string;
+  width: number;
+  height: number;
+  bytes: number;
+}
+
+/** Android-only native side: voice call audio, the background alert service, notifications, in-app updates, picking pictures. */
 interface PocketNativeModule {
   startCall(server: string, token: string): void;
   hangup(): void;
@@ -17,6 +28,11 @@ interface PocketNativeModule {
   cancelUpdate?(): void;
   installUpdate?(path: string): "started" | "permission" | "missing";
   canInstallUpdates?(): boolean;
+  /**
+   * Picture picker (absent in builds before it existed): up to `max` pictures,
+   * each a base64 JPEG whose longest side is at most `maxSide`. Cancelled: [].
+   */
+  pickImages?(max: number, maxSide: number, quality: number): Promise<PickedImage[]>;
   addListener(event: "onCall", fn: (e: { state: "connecting" | "ready" | "ended"; message?: string; muted?: boolean }) => void): EventSubscription;
   addListener(event: "onCallEvent", fn: (e: { json: string }) => void): EventSubscription;
   addListener(event: "onLevel", fn: (e: { mic: number; out: number }) => void): EventSubscription;

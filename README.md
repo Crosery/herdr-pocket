@@ -57,7 +57,7 @@ Message them, press keys, start new ones, or just call Xiaoyang, the assistant, 
 | | |
 |---|---|
 | **See it all** | The agents on every computer, sorted by state: working, waiting on you, done. Tap one for a formatted conversation (tool calls folded into cards) and a live terminal. |
-| **Hands on** | Send messages, press Esc / Tab / arrows / Ctrl+C. The terminal uses the app's own compact keyboard, so the system keyboard doesn't cover the screen; one tap switches back when you need to type Chinese. |
+| **Hands on** | Send messages and pictures, press Esc / Tab / arrows / Ctrl+C, and answer an agent's numbered choices with one tap. The terminal uses the app's own compact keyboard, so the system keyboard doesn't cover the screen; one tap switches back when you need to type Chinese. |
 | **New agents** | In any space on any computer, start an agent installed on that computer: Claude Code, Codex, Gemini CLI, Kimi, Cursor Agent, Droid, CodeBuddy, Qoder, OpenCode… and hand it its first task at the same time. |
 | **Xiaoyang** | One conversation for all your computers: ask who is waiting on you, where an agent is stuck, how much it has cost; have her pass on a message, press keys, start a new agent. By default she acts directly and tells you exactly how it went. When an agent gets stuck or finishes she speaks up on her own, pushing to the notification shade even while the app is closed, and she can set reminders. |
 | **Call her** | Voice calls with Xiaoyang, so you can direct things while you walk. MOSS-Live by default, and the OpenAI Realtime protocol is supported too; nothing waits for a confirm tap during a call. |

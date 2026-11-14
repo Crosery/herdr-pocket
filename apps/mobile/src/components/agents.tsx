@@ -5,7 +5,7 @@ import { router } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { Agent, AgentStatus } from "@herdr-pocket/protocol";
 import { usePalette } from "../theme/theme";
-import { fonts, radius, space, spaceColors, statusColors } from "../theme/tokens";
+import { agentStatusLabel, fonts, radius, space, spaceColors, statusColors } from "../theme/tokens";
 import { agentSpace, agentTitle, relTime, stableHash } from "../lib/format";
 import { harnessLook } from "../lib/harness";
 import { Card, HarnessAvatar, StatusPill } from "./ui";
@@ -102,7 +102,7 @@ export const AgentRow = memo(function AgentRow({ agent, offline, deviceName }: {
             <Text style={{ color: p.muted, fontFamily: fonts.bodyBold, fontSize: 12 }}>离线</Text>
           </View>
         ) : (
-          <StatusPill status={agent.status} compact />
+          <StatusPill status={agent.status} label={agentStatusLabel(agent)} compact />
         )}
         <Text style={{ fontSize: 12, color: p.faint }}>{relTime(agent.statusSince ?? agent.updatedAt)}</Text>
       </View>

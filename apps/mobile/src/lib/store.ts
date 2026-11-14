@@ -136,20 +136,28 @@ export function findAgent(key: string): Agent | undefined {
 /** A message sent from this phone that the agent's conversation has not shown yet. */
 export interface PendingSend {
   id: string;
+  /** What the person wrote (without the picture paths the agent got). */
   text: string;
   ts: number;
+  /** Image URIs of the pictures sent with it, for thumbnails. */
+  pictures?: string[];
 }
 
 interface PendingState {
   byAgent: Record<string, PendingSend[]>;
-  add: (agentKey: string, text: string) => void;
+  add: (agentKey: string, text: string, pictures?: string[]) => void;
   drop: (agentKey: string, ids: string[]) => void;
 }
 
 export const usePending = create<PendingState>()((set) => ({
   byAgent: {},
-  add: (agentKey, text) =>
-    set((s) => ({ byAgent: { ...s.byAgent, [agentKey]: [...(s.byAgent[agentKey] ?? []), { id: `pending-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, text, ts: Date.now() }].slice(-20) } })),
+  add: (agentKey, text, pictures) =>
+    set((s) => ({
+      byAgent: {
+        ...s.byAgent,
+        [agentKey]: [...(s.byAgent[agentKey] ?? []), { id: `pending-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, text, ts: Date.now(), pictures: pictures?.length ? pictures : undefined }].slice(-20),
+      },
+    })),
   drop: (agentKey, ids) =>
     set((s) => {
       const left = (s.byAgent[agentKey] ?? []).filter((x) => !ids.includes(x.id));

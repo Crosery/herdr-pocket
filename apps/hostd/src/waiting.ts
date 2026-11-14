@@ -8,7 +8,7 @@
  * again (it took the waiting input), after it has stayed stopped for a while
  * without a conversation to check, or when it is very old or the agent is gone.
  */
-import type { Agent, ConvEvent } from "@herdr-pocket/protocol";
+import { splitFiles, type Agent, type ConvEvent } from "@herdr-pocket/protocol";
 
 export interface Waiting {
   id: string;
@@ -24,6 +24,8 @@ export interface InputWaitsOptions {
   /** Same, for agents whose conversation is checked (it had its chance to show up there). */
   sessionGraceMs?: number;
   maxAgeMs?: number;
+  /** How long typed text gets to show up on the screen before its absence counts. */
+  landMs?: number;
 }
 
 const fold = (s: string) => s.replace(/\s+/g, "");
@@ -58,13 +60,26 @@ export class InputWaits {
       const list = this.byAgent.get(a.key);
       if (!list?.length) return a;
       const first = list[0]!;
-      const preview = first.text.replace(/\s+/g, " ").trim();
+      // Pictures go in as paths on this computer: the preview names them, not where they are.
+      const { text, count } = splitFiles(first.text);
+      const words = text.replace(/\s+/g, " ").trim();
+      const preview = count ? [words, `图片 ×${count}`].filter(Boolean).join(" · ") : words;
       return { ...a, queued: list.length, queuedText: Array.from(preview).length > 80 ? `${Array.from(preview).slice(0, 80).join("")}…` : preview, queuedSince: first.at };
     });
   }
 
-  /** Drops what the agents have taken. True when anything changed. */
-  async settle(agents: Agent[], events: (sessionKey: string) => Promise<ConvEvent[]>, now: number): Promise<boolean> {
+  /**
+   * Drops what the agents have taken. True when anything changed.
+   * `screen` gives an agent's visible screen: text waiting in a program's input
+   * box is on it, so text that is no longer anywhere on it was taken (Claude
+   * Code takes typed text in the middle of a turn, not only at its end).
+   */
+  async settle(
+    agents: Agent[],
+    events: (sessionKey: string) => Promise<ConvEvent[]>,
+    now: number,
+    screen?: (agent: Agent) => Promise<string | undefined>,
+  ): Promise<boolean> {
     let changed = false;
     for (const [key, list] of [...this.byAgent]) {
       const a = agents.find((x) => x.key === key);
@@ -84,10 +99,24 @@ export class InputWaits {
           said = [];
         }
       }
+      let shown: string | undefined;
+      // Only once the text had time to land (the send queue types it in after this was recorded).
+      if (screen && list.some((w) => now - w.at > (this.opts.landMs ?? 8_000))) {
+        try {
+          const s = await screen(a);
+          shown = s === undefined ? undefined : fold(s);
+          // Claude Code shows a long paste as "[Pasted text #1 +12 lines]": its words aren't on screen.
+          if (shown?.includes("[Pastedtext")) shown = undefined;
+        } catch {
+          shown = undefined;
+        }
+      }
       const grace = a.sessionKey ? (this.opts.sessionGraceMs ?? 90_000) : (this.opts.idleGraceMs ?? 20_000);
       const keep = list.filter((w) => {
         const head = fold(w.text).slice(0, 30);
         if (head && said.some((s) => s.includes(head))) return false;
+        // Programs clip long input in their box: look for its start only.
+        if (shown !== undefined && now - w.at > (this.opts.landMs ?? 8_000) && !shown.includes(fold(w.text).slice(0, 12))) return false;
         if (now - w.at > (this.opts.maxAgeMs ?? 2 * 3_600_000)) return false;
         if (a.status === "working") {
           // Stopped and then working again: the program took what was waiting.

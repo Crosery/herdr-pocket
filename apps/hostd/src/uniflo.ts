@@ -94,11 +94,25 @@ export function cleanEvent<E extends ConvEvent & Record<string, unknown>>(e: E):
   return e;
 }
 
+const SVG_TAGS = new Set(["svg", "g", "path", "circle", "ellipse", "rect", "polygon", "polyline", "line", "title"]);
+
+/**
+ * A harness icon as the phone may draw it, or undefined: a small SVG made of
+ * plain shapes only (no scripts, styles, links, images or event handlers).
+ */
+export function safeIconSvg(raw: string): string | undefined {
+  const svg = raw.replace(/<\?xml[^>]*\?>/g, "").replace(/<!--[\s\S]*?-->/g, "").trim();
+  if (!svg.startsWith("<svg") || !svg.endsWith("</svg>") || svg.length > 65_536) return undefined;
+  for (const m of svg.matchAll(/<\/?\s*([A-Za-z][\w:.-]*)/g)) if (!SVG_TAGS.has(m[1]!.toLowerCase())) return undefined;
+  if (/<!|\son\w+\s*=|href|url\s*\(|javascript:|data:/i.test(svg)) return undefined;
+  return svg;
+}
+
 /** herdr/hc program names that Uniflo calls differently; any other name is its own harness id. */
 const HARNESS_ALIAS: Record<string, string> = { "claude-code": "claude" };
 
 /** herdr/hc program name -> Uniflo harness id. */
-function harnessId(name: string | undefined): string | undefined {
+export function harnessId(name: string | undefined): string | undefined {
   return name ? (HARNESS_ALIAS[name] ?? name) : undefined;
 }
 
@@ -114,6 +128,10 @@ export class UnifloAdapter {
   private token: string | undefined;
   private timer: NodeJS.Timeout | null = null;
   private onChange: () => void = () => {};
+  /** Sessions named by a running agent (see SessionHints) that the recent list doesn't hold. */
+  private named = new Map<string, UnifloSession>();
+  /** Named keys being fetched, or not found (key -> when to look again). */
+  private namedWait = new Map<string, number>();
 
   constructor(base = process.env.UNIFLO_URL ?? "http://127.0.0.1:7311", token = process.env.UNIFLO_TOKEN) {
     this.base = base.replace(/\/+$/, "");
@@ -153,7 +171,23 @@ export class UnifloAdapter {
         if (s.status === "work") c[1]++;
         this.childCounts.set(s.parent, c);
       }
-      if (this.sig() !== before) this.onChange();
+      // Named sessions outside the recent list go stale too: read them again.
+      let namedChanged = false;
+      for (const [key, old] of [...this.named]) {
+        if (this.sessions.some((s) => s.key === old.key)) {
+          this.named.delete(key);
+          continue;
+        }
+        try {
+          // By its full key: the name may have been a short prefix.
+          const s = (await this.get(`/v1/sessions/${encodeURIComponent(old.key)}`)) as UnifloSession;
+          if (s.updated_at !== old.updated_at || s.title !== old.title) namedChanged = true;
+          this.named.set(key, s);
+        } catch {
+          /* keep the last copy */
+        }
+      }
+      if (this.sig() !== before || namedChanged) this.onChange();
     } catch {
       /* uniflo is optional */
     }
@@ -173,22 +207,68 @@ export class UnifloAdapter {
     return res.json();
   }
 
+  /** A session named by an agent: from the recent list, the named cache, or fetched now for next time. */
+  private namedSession(key: string): UnifloSession | undefined {
+    // `claude attach <id>` names a short prefix of the id.
+    const short = key.length - key.indexOf(":") - 1 < 32;
+    const hit = (x: UnifloSession) => x.key === key || (short && x.key.startsWith(key));
+    const s = this.sessions.find(hit) ?? this.named.get(key);
+    if (s) return s;
+    const wait = this.namedWait.get(key);
+    if (wait !== undefined && wait > Date.now()) return undefined;
+    // Fetching (or not found): look again in a minute at the earliest.
+    this.namedWait.set(key, Date.now() + 60_000);
+    const lookup = async (): Promise<UnifloSession | undefined> => {
+      try {
+        return (await this.get(`/v1/sessions/${encodeURIComponent(key)}`)) as UnifloSession;
+      } catch (e) {
+        if (!short) throw e;
+      }
+      const q = new URLSearchParams({ q: key.slice(key.indexOf(":") + 1), limit: "10" });
+      const found = ((await this.get(`/v1/sessions?${q}`)) as UnifloSession[]).filter(hit);
+      return found.length === 1 ? found[0] : undefined;
+    };
+    void lookup()
+      .then((found) => {
+        if (!found || !hit(found)) return;
+        this.named.set(key, found);
+        this.namedWait.delete(key);
+        this.onChange();
+      })
+      .catch(() => {});
+    return undefined;
+  }
+
   /**
    * Attaches the matching Uniflo session to each agent.
+   * 0. The session the process names itself (`hints`: its registry file or
+   *    `--resume <id>`), even when it is too old for the recent list.
    * 1. Same process id (exact).
    * 2. Otherwise same harness + cwd, but only when exactly one live agent and
    *    one candidate session share that pair — never guess between several.
    * 3. Otherwise same harness + cwd + title (the terminal title a harness sets is
    *    its session title), again only when one agent and one session share it.
    */
-  enrich(agents: Agent[], pids: Map<string, number | undefined>): Agent[] {
+  enrich(agents: Agent[], pids: Map<string, number | undefined>, hints: Map<string, string> = new Map()): Agent[] {
     if (!this.sessions.length) return agents;
     const byPid = new Map<number, UnifloSession>();
     for (const s of this.sessions) if (s.pid) byPid.set(s.pid, s);
     const used = new Set<string>();
     const matched = new Map<string, UnifloSession>();
 
+    const wanted = new Set(hints.values());
+    for (const k of this.named.keys()) if (!wanted.has(k)) this.named.delete(k);
     for (const a of agents) {
+      const key = hints.get(a.key);
+      const s = key ? this.namedSession(key) : undefined;
+      if (s && !used.has(s.key)) {
+        matched.set(a.key, s);
+        used.add(s.key);
+      }
+    }
+
+    for (const a of agents) {
+      if (matched.has(a.key)) continue;
       const pid = pids.get(a.key);
       const s = pid ? byPid.get(pid) : undefined;
       if (s) {
@@ -252,6 +332,34 @@ export class UnifloAdapter {
         updatedAt: Math.max(a.updatedAt, s.updated_at),
       };
     });
+  }
+
+  /** Harness id -> safe icon SVG, or null when Uniflo has none (it doesn't change while it runs). */
+  private iconCache = new Map<string, string | null>();
+
+  /** Icons for these harness ids, from Uniflo (`/v1/harnesses/<id>/icon.svg`); unknown ids are left out. */
+  async icons(ids: string[]): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    await Promise.all(
+      [...new Set(ids)].filter((id) => /^[a-z0-9][a-z0-9_-]{0,31}$/.test(id)).map(async (id) => {
+        if (!this.iconCache.has(id)) {
+          try {
+            const res = await fetch(`${this.base}/v1/harnesses/${id}/icon.svg`, {
+              headers: this.token ? { Authorization: `Bearer ${this.token}` } : {},
+              signal: AbortSignal.timeout(5000),
+            });
+            // A 404 is final; a failed request is asked again next time.
+            if (res.ok) this.iconCache.set(id, safeIconSvg(await res.text()) ?? null);
+            else if (res.status === 404) this.iconCache.set(id, null);
+          } catch {
+            /* uniflo down: nothing now */
+          }
+        }
+        const svg = this.iconCache.get(id);
+        if (svg) out[id] = svg;
+      }),
+    );
+    return out;
   }
 
   /** Recorded sessions, newest first; subagent sessions only when the filter asks for them (`parent:`). */

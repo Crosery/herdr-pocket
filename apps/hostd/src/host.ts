@@ -1,6 +1,7 @@
 import { homedir, hostname, platform } from "node:os";
 import { WebSocket } from "ws";
 import {
+  HARNESS_ICON_MAX,
   PROTOCOL_VERSION,
   agentKey,
   parseAgentKey,
@@ -17,10 +18,12 @@ import {
 import { HcAdapter, type AppNames } from "./hc.ts";
 import { HerdrApp, checkFolder, herdrCommandArgs, installedLaunchers, resumeArgv } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
-import { UnifloAdapter } from "./uniflo.ts";
+import { UnifloAdapter, harnessId } from "./uniflo.ts";
+import { SessionHints } from "./sessionhint.ts";
 import { debounce } from "./util.ts";
 import { InputWaits } from "./waiting.ts";
 import { typeFirstTask, type TypeTaskOptions } from "./firsttask.ts";
+import { FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from "./put.ts";
 import { LogBuffer, clipChars, levelOf } from "./logbuf.ts";
 import type { HostConfig } from "./config.ts";
 import { VERSION } from "@herdr-pocket/update";
@@ -29,7 +32,7 @@ import { VERSION } from "@herdr-pocket/update";
 export const HOSTD_VERSION = VERSION;
 
 /** Calls that change something here: logged when they work too. */
-const MUTATING = new Set(["terminal.send", "terminal.keys", "agent.create", "terminal.interrupt", "terminal.kill", "herdr.command", "sessions.resume"]);
+const MUTATING = new Set(["terminal.send", "terminal.keys", "terminal.put", "agent.create", "terminal.interrupt", "terminal.kill", "herdr.command", "sessions.resume"]);
 
 /** What a call was about, short: never more than 200 characters of anyone's message. */
 function callSummary(params: unknown, result?: unknown): Record<string, unknown> | undefined {
@@ -40,6 +43,8 @@ function callSummary(params: unknown, result?: unknown): Record<string, unknown>
     if (typeof p.text === "string") out.text = clipChars(p.text, 200);
     if (typeof p.task === "string") out.task = clipChars(p.task, 200);
     if (Array.isArray(p.keys)) out.keys = p.keys.slice(0, 16).join(" ");
+    // Pictures: how many, never their contents.
+    if (Array.isArray(p.files)) out.files = p.files.length;
     if (p.args && typeof p.args === "object") out.args = clipChars(JSON.stringify(p.args), 200);
   }
   if (result && typeof result === "object") {
@@ -75,6 +80,8 @@ export class Host {
   hc = new HcAdapter();
   herdr = new HerdrAdapter();
   uniflo = new UnifloAdapter();
+  /** Session ids running agents name themselves (Claude Code registry, `--resume <id>`). */
+  sessionHints = new SessionHints();
   app = new HerdrApp();
   private launchersCache: { at: number; list: ReturnType<typeof installedLaunchers> } | null = null;
   /** Installed programs, re-checked every 10 minutes so a newly installed agent shows up without a restart. */
@@ -125,6 +132,8 @@ export class Host {
   logEveryMs = 60_000;
   /** How long agent.create waits for a program before typing its first task (tests shorten it). */
   firstTaskOptions: TypeTaskOptions = {};
+  /** Where pictures for agents of the herdr terminal app are kept (tests point it elsewhere). */
+  filesDir = FILES_DIR;
 
   constructor(opts: HostOptions) {
     this.opts = opts;
@@ -212,14 +221,21 @@ export class Host {
   collect(): Agent[] {
     const id = this.deviceId;
     const pids = new Map<string, number | undefined>();
+    const hints = new Map<string, string>();
+    const live = new Set<number>();
     const agents: Agent[] = [];
     for (const t of this.hc.terminals.values()) {
       const a = HcAdapter.toAgent(t, id, this.names);
-      pids.set(a.key, t.foreground?.pid);
+      const pid = t.foreground?.pid;
+      pids.set(a.key, pid);
+      if (pid) live.add(pid);
+      const hint = a.isShell ? undefined : this.sessionHints.key(harnessId(a.harness), t.foreground?.argv, pid);
+      if (hint) hints.set(a.key, hint);
       agents.push(a);
     }
+    this.sessionHints.prune(live);
     for (const info of this.herdr.agents) agents.push(HerdrAdapter.toAgent(info, id));
-    return this.waits.decorate(this.uniflo.enrich(agents, pids));
+    return this.waits.decorate(this.uniflo.enrich(agents, pids, hints));
   }
 
   private publishNow(): void {
@@ -514,7 +530,9 @@ export class Host {
       if (busy) return;
       busy = true;
       try {
-        if (await this.waits.settle(this.agents, async (key) => (await this.uniflo.events(key, 15)).events, Date.now())) this.publish();
+        const screen = async (a: Agent) =>
+          a.source === "hc" && !this.sendQueues.has(a.key) ? (await this.hc.read(a.localId, 0)).text : undefined;
+        if (await this.waits.settle(this.agents, async (key) => (await this.uniflo.events(key, 15)).events, Date.now(), screen)) this.publish();
       } finally {
         busy = false;
       }
@@ -642,6 +660,25 @@ export class Host {
       if (a.source !== "hc") throw new RpcFailure("unsupported", "这个 agent 不是桌面 herdr 开的，只能用输入框发送");
       await this.hc.input(a.localId, p.data);
       return { ok: true as const };
+    },
+    "terminal.put": async (p) => {
+      this.writable();
+      const a = this.resolve(p.agent);
+      let files: CheckedFile[];
+      try {
+        files = checkFiles(p.files);
+      } catch (e) {
+        throw new RpcFailure("bad_request", (e as Error).message);
+      }
+      try {
+        // hc keeps its own copy beside the terminal; the herdr terminal app has no such place, so this computer keeps one.
+        const paths = a.source === "hc" ? await putThrough(files, (file) => this.hc.put(a.localId, file)) : await putLocal(files, a.localId, this.filesDir);
+        return { paths };
+      } catch (e) {
+        const msg = (e as Error).message;
+        if (/unrecognized subcommand|unknown command/i.test(msg)) throw new RpcFailure("unsupported", "这台电脑的 herdr 太旧，还不能收图片（没有 hc put），更新 herdr 后再试");
+        throw new RpcFailure("internal", `图片没能放到这台电脑上：${msg}`);
+      }
     },
     "session.events": async (p) => {
       const key = await this.sessionOf(p.agent, p.sub);
@@ -829,6 +866,10 @@ export class Host {
       }
       const r = await this.uniflo.events(p.session, p.limit ?? 40, p.before);
       return { session: { ...session, agent: this.agents.find((a) => a.sessionKey === session.key)?.key }, events: r.events, more: r.more, nextBefore: r.nextBefore };
+    },
+    "harness.icons": async (p) => {
+      if (!Array.isArray(p.ids) || !p.ids.every((id) => typeof id === "string")) throw new RpcFailure("bad_request", "ids must be a list");
+      return { icons: await this.uniflo.icons(p.ids.slice(0, HARNESS_ICON_MAX)) };
     },
     "sessions.usage": async (p, from) => {
       this.assistantOnly(from);

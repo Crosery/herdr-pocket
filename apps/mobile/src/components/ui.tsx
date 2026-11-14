@@ -3,11 +3,13 @@ import { Image, Pressable, View, type StyleProp, type ViewStyle } from "react-na
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Text } from "react-native-paper";
-import Animated, { cancelAnimation, useAnimatedStyle, useSharedValue, withRepeat, withSequence, withTiming } from "react-native-reanimated";
+import Svg, { G, Path, SvgXml } from "react-native-svg";
+import Animated, { cancelAnimation, Easing, useAnimatedStyle, useSharedValue, withRepeat, withSequence, withTiming, type SharedValue } from "react-native-reanimated";
 import type { AgentStatus } from "@herdr-pocket/protocol";
 import { usePalette } from "../theme/theme";
 import { fonts, motion, radius, space, statusColors, statusLabel } from "../theme/tokens";
 import { harnessLook } from "../lib/harness";
+import { useRemoteIcon } from "../lib/harnessRemote";
 import { Mascot, type MascotMood } from "./Mascot";
 import { CuteIcon, type CuteIconName } from "./icons";
 
@@ -188,10 +190,35 @@ export function BreathingDot({ color, active, size = 7 }: { color: string; activ
   return <Animated.View style={[{ width: size, height: size, borderRadius: size, backgroundColor: color }, core]} />;
 }
 
+/** Three dots taking turns, like someone typing: the lit one brightens and hops a little. */
+export function TypingDots({ color, size = 6 }: { color: string; size?: number }) {
+  const t = useSharedValue(0);
+  useEffect(() => {
+    t.value = withRepeat(withTiming(3, { duration: 1260, easing: Easing.linear }), -1, false);
+    return () => cancelAnimation(t);
+  }, [t]);
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: Math.round(size * 0.7), height: size * 2 }}>
+      {[0, 1, 2].map((i) => (
+        <TypingDot key={i} t={t} i={i} size={size} color={color} />
+      ))}
+    </View>
+  );
+}
+
+function TypingDot({ t, i, size, color }: { t: SharedValue<number>; i: number; size: number; color: string }) {
+  const anim = useAnimatedStyle(() => {
+    const phase = (t.value - i + 3) % 3;
+    const lit = phase < 1 ? Math.sin(phase * Math.PI) : 0;
+    return { opacity: 0.3 + lit * 0.7, transform: [{ translateY: -lit * size * 0.4 }] };
+  });
+  return <Animated.View style={[{ width: size, height: size, borderRadius: size / 2, backgroundColor: color }, anim]} />;
+}
+
 const STATUS_ICON: Record<AgentStatus, CuteIconName> = { working: "working", blocked: "blocked", done: "done", idle: "idle", unknown: "idle" };
 
 /** Status chip: a little icon in the status colour, the word, a tinted pill. Working and waiting breathe. */
-export function StatusPill({ status, compact }: { status: AgentStatus; compact?: boolean }) {
+export function StatusPill({ status, compact, label = statusLabel[status] }: { status: AgentStatus; compact?: boolean; label?: string }) {
   const p = usePalette();
   const c = statusColors(status, p.dark);
   const live = status === "working" || status === "blocked";
@@ -208,7 +235,7 @@ export function StatusPill({ status, compact }: { status: AgentStatus; compact?:
   const size = compact ? 13 : 15;
   return (
     <View
-      accessibilityLabel={statusLabel[status]}
+      accessibilityLabel={label}
       style={{
         flexDirection: "row",
         alignItems: "center",
@@ -223,28 +250,47 @@ export function StatusPill({ status, compact }: { status: AgentStatus; compact?:
       <Animated.View style={icon}>
         <CuteIcon name={STATUS_ICON[status]} size={size} color={c.fg} fill={p.dark ? "transparent" : "#FFFFFF"} strokeWidth={2.4} />
       </Animated.View>
-      <Text style={{ color: c.fg, fontFamily: fonts.bodyBold, fontSize: compact ? 12 : 13 }}>{statusLabel[status]}</Text>
+      <Text style={{ color: c.fg, fontFamily: fonts.bodyBold, fontSize: compact ? 12 : 13 }}>{label}</Text>
     </View>
   );
 }
 
-/** Pastel circle badge per harness with a tiny plum glyph. */
+/**
+ * Pastel circle badge per harness: its sticker, else its brand glyph (bundled,
+ * or sent by the computer's Uniflo), else a letter. Glyphs are plum (light) or near-white (dark).
+ */
 export function HarnessAvatar({ harness, isShell, size = 42, dim }: { harness: string; isShell: boolean; size?: number; dim?: boolean }) {
   const p = usePalette();
   const look = harnessLook(harness, isShell);
+  const remote = useRemoteIcon(look.remoteId);
   const bg = p.dark ? look.darkBg : look.bg;
   const fg = p.dark ? "#F3EDF7" : "#4A3B5C";
+  const mark = size * 0.52;
+  const letter = look.icon ? (
+    <MaterialCommunityIcons name={look.icon} size={size * 0.46} color={fg} />
+  ) : (
+    <Text style={{ color: fg, fontFamily: look.mono ? fonts.monoBold : fonts.cute, fontSize: size * (look.mono ? 0.32 : 0.46), lineHeight: size * 0.6 }}>{look.glyph}</Text>
+  );
+  const sticker = look.image ? <Image source={look.image} style={{ width: size, height: size, borderRadius: size / 2 }} /> : null;
   return (
     <View
       accessibilityLabel={look.label}
       style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: bg, alignItems: "center", justifyContent: "center", opacity: dim ? 0.55 : 1 }}
     >
-      {look.image ? (
-        <Image source={look.image} style={{ width: size, height: size, borderRadius: size / 2 }} />
-      ) : look.icon ? (
-        <MaterialCommunityIcons name={look.icon} size={size * 0.46} color={fg} />
+      {sticker && !look.generic ? (
+        sticker
+      ) : look.svg ? (
+        <Svg width={mark} height={mark} viewBox="0 0 24 24">
+          <G fill={fg}>
+            {look.svg.map((g, i) => (
+              <Path key={i} d={g.d} fillRule={g.fillRule ?? "evenodd"} clipRule={g.clipRule} opacity={g.opacity} transform={g.transform} />
+            ))}
+          </G>
+        </Svg>
+      ) : remote ? (
+        <SvgXml xml={remote} width={mark} height={mark} color={fg} fallback={sticker ?? letter} />
       ) : (
-        <Text style={{ color: fg, fontFamily: look.mono ? fonts.monoBold : fonts.cute, fontSize: size * (look.mono ? 0.32 : 0.46), lineHeight: size * 0.6 }}>{look.glyph}</Text>
+        sticker ?? letter
       )}
     </View>
   );
