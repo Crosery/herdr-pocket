@@ -19,7 +19,7 @@ import {
   callStateName,
   type CallState,
 } from "./demo";
-import { $, $$, h, loopWhileVisible, reducedMotion, finePointer, isNarrow, sleep, copyText, toast, renderQr } from "./util";
+import { $, $$, h, loopWhileVisible, reducedMotion, finePointer, isNarrow, slowNetwork, sleep, copyText, toast, renderQr } from "./util";
 
 // ------------------------------------------------------------------ vendors marquee
 export function initMarquee(): void {
@@ -383,10 +383,47 @@ export function initVideo(): void {
   const frame = $("#video-frame")!;
   const video = $<HTMLVideoElement>("#intro-video")!;
   const play = $("#video-play")!;
-  video.poster = SITE.video.poster;
-  frame.style.backgroundImage = `url("${SITE.video.poster}")`;
+  // The poster loads only once the section comes near, not with the first screen.
+  const near = new IntersectionObserver(
+    ([e]) => {
+      if (!e.isIntersecting) return;
+      near.disconnect();
+      video.poster = SITE.video.poster;
+      frame.style.backgroundImage = `url("${SITE.video.poster}")`;
+    },
+    { rootMargin: "800px 0px" },
+  );
+  near.observe(frame);
+
+  // Quality: 720p (about a third of the size) on phones and slow connections,
+  // 1080p on desktops; either way the other one is a tap away.
+  type Q = "sd" | "hd";
+  const qBtns = $$<HTMLButtonElement>("#video-q button");
+  let q: Q = finePointer() && !isNarrow() && !slowNetwork() ? "hd" : "sd";
+  const url = () => (q === "hd" ? SITE.video.src : SITE.video.srcSd);
+  const markQ = () =>
+    qBtns.forEach((b) => {
+      b.classList.toggle("is-on", b.dataset.q === q);
+      b.setAttribute("aria-pressed", String(b.dataset.q === q));
+    });
+  markQ();
+  qBtns.forEach((b) =>
+    b.addEventListener("click", () => {
+      if (b.dataset.q === q) return;
+      q = b.dataset.q as Q;
+      markQ();
+      if (!video.getAttribute("src")) return;
+      // switch mid-film: keep the position and the playing state
+      const at = video.currentTime;
+      const playing = !video.paused;
+      video.src = url();
+      video.currentTime = at;
+      if (playing) video.play().catch(() => {});
+    }),
+  );
+
   play.addEventListener("click", () => {
-    if (!video.src) video.src = SITE.video.src;
+    if (!video.getAttribute("src")) video.src = url();
     frame.classList.add("is-playing");
     video.play().catch(() => {
       frame.classList.remove("is-playing");
