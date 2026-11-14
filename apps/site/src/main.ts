@@ -22,20 +22,31 @@ import {
   initNav,
   wrapTitleLines,
 } from "./sections";
-import { $, $$, reducedMotion } from "./util";
+import { $, $$, finePointer, reducedMotion } from "./util";
 
 gsap.registerPlugin(ScrollTrigger);
 document.documentElement.classList.add("js");
 
 initI18n();
 
-// ---- smooth scrolling (skipped for reduced motion)
+// ---- smooth wheel scrolling on mouse and trackpad (skipped for reduced motion).
+// Touch screens keep native scrolling: Lenis does not smooth touch anyway, and
+// native scrolling runs off the main thread, so it stays fluid while the page works.
 let lenis: Lenis | null = null;
-if (!reducedMotion()) {
+if (!reducedMotion() && finePointer()) {
   lenis = new Lenis({ lerp: 0.1, smoothWheel: true, anchors: { offset: -72 } });
   lenis.on("scroll", ScrollTrigger.update);
   gsap.ticker.add((time) => lenis!.raf(time * 1000));
   gsap.ticker.lagSmoothing(0);
+} else if (!reducedMotion()) {
+  // the same gentle glide to in-page anchors that Lenis gives on desktop
+  document.addEventListener("click", (e) => {
+    const a = (e.target as Element).closest<HTMLAnchorElement>('a[href^="#"]');
+    const target = a && !a.classList.contains("skip") ? document.getElementById(a.hash.slice(1)) : null;
+    if (!target) return;
+    e.preventDefault();
+    target.scrollIntoView({ behavior: "smooth" });
+  });
 }
 
 // ---- theme + language toggles
