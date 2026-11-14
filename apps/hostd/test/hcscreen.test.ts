@@ -5,6 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HcScreens } from "../src/hcscreen.ts";
 
+/** These fakes are shell scripts: Windows can't run them (CI there runs the rest). */
+const SH = { skip: process.platform === "win32" && "shell-script fakes" };
+
 /** A framed `hc connect` stand-in: records attach params and the bytes typed on the stream. */
 function fakeHc(dir: string): { bin: string; typed: string; attaches: string } {
   const bin = join(dir, "hc");
@@ -45,7 +48,7 @@ process.stdin.on("data", (d) => {
   return { bin, typed, attaches };
 }
 
-test("typing goes out at once, in order, on one stream at the terminal's own size", async () => {
+test("typing goes out at once, in order, on one stream at the terminal's own size", SH, async () => {
   const f = fakeHc(mkdtempSync(join(tmpdir(), "hc-framed-")));
   const screens = new HcScreens(f.bin);
   try {

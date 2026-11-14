@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { SHELL_HARNESSES, normalizeStatus, type Agent, type AgentStatus } from "@herdr-pocket/protocol";
 import { base, cleanTitle, debounce, lineSplitter, run } from "./util.ts";
 import { HcScreens } from "./hcscreen.ts";
+import { defaultHcBin } from "./platform.ts";
 
 /** Subset of a herdr-core (`hc`) terminal object we rely on. */
 export interface HcTerminal {
@@ -76,7 +77,7 @@ export class HcAdapter extends EventEmitter {
 
   private hcBin: string;
 
-  constructor(hcBin = process.env.HC_BIN ?? "hc") {
+  constructor(hcBin = defaultHcBin()) {
     super();
     this.hcBin = hcBin;
   }
@@ -108,7 +109,7 @@ export class HcAdapter extends EventEmitter {
   }
 
   private connect(): void {
-    const child = spawn(this.hcBin, ["connect"], { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(this.hcBin, ["connect"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     this.child = child;
     this.lastLine = Date.now();
     child.stdout!.on(
@@ -216,7 +217,7 @@ export class HcAdapter extends EventEmitter {
   private oneShot(method: string, params: unknown, timeoutMs = 10_000): Promise<any> {
     return new Promise((resolve) => {
       let done = false;
-      const child = spawn(this.hcBin, ["connect"], { stdio: ["pipe", "pipe", "ignore"] });
+      const child = spawn(this.hcBin, ["connect"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
       const finish = (v: any) => {
         if (done) return;
         done = true;

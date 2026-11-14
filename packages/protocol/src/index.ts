@@ -336,14 +336,16 @@ export function textWithFiles(text: string, paths: string[]): string {
  * A trailing line that stands for a picture: a path `textWithFiles` appended,
  * or Claude Code's `[Image #n]` marks, which it may put in their place.
  */
-const PICTURE_LINE = /^(?:\/.*\.(?:jpe?g|png|webp|gif)|(?:\[Image #\d+\]\s*)+)$/i;
+const PICTURE_LINE = /^(?:(?:\/|[A-Za-z]:\\).*\.(?:jpe?g|png|webp|gif)|(?:\[Image #\d+\]\s*)+)$/i;
+/** An absolute path: `/…` (macOS, Linux) or `C:\…` (Windows). */
+const FILE_PATH = /^(?:\/|[A-Za-z]:\\)/;
 
 /** Undoes `textWithFiles`: the words, the picture lines after them, and how many pictures those are. */
 export function splitFiles(message: string): { text: string; lines: string[]; count: number } {
   const all = message.replace(/\s+$/, "").split("\n");
   const lines: string[] = [];
   while (all.length > 0 && PICTURE_LINE.test(all[all.length - 1]!.trim())) lines.unshift(all.pop()!.trim());
-  const count = lines.reduce((n, l) => n + (l.startsWith("/") ? 1 : (l.match(/\[Image #\d+\]/gi)?.length ?? 1)), 0);
+  const count = lines.reduce((n, l) => n + (FILE_PATH.test(l) ? 1 : (l.match(/\[Image #\d+\]/gi)?.length ?? 1)), 0);
   return { text: all.join("\n").trim(), lines, count };
 }
 

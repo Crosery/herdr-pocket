@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findPrograms } from "../src/create.ts";
 
-test("programs installed under ~/.bun/bin are found even when the shell can't tell", async () => {
+test("programs installed under ~/.bun/bin are found even when the shell can't tell", { skip: process.platform === "win32" && "macOS/Linux lookup; Windows is in platform.test.ts" }, async () => {
   // Under launchd the PATH is bare and a login shell skips ~/.zshrc, where bun adds ~/.bun/bin:
   // Claude Code was missing from the phone's "new agent" list because of that.
   const home = mkdtempSync(join(tmpdir(), "hp-home-"));
