@@ -168,10 +168,14 @@ jobs:
           apk="$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-android-arm64.apk"
           cp app/build/outputs/apk/release/app-release.apk "$apk"
           apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          # Fails the job when the APK does not verify. The summary only shows who signed it;
+          # its wording differs between build-tools ("Signer #1 certificate DN" before 37,
+          # "V2 Signer: certificate DN" since), so it never fails the job itself.
+          certs=$("$apksigner" verify --print-certs "$apk")
           {
             echo "### APK signer"
             echo '```'
-            "$apksigner" verify --print-certs "$apk" | grep -E "Signer #1 certificate (DN|SHA-256)"
+            grep -E "certificate (DN|SHA-256 digest):" <<<"$certs" | sed -E 's/^.*certificate /certificate /' | sort -u || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           rm -f "$RUNNER_TEMP/release.jks"
