@@ -38,7 +38,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { RELEASE_REPO, apkAssetName } from "@herdr-pocket/protocol";
+import { RELEASE_REPO, apkAssetName, inMainlandChina, releaseFromSums, releaseSources } from "@herdr-pocket/protocol";
 import { extractTarGz, tarVersion } from "./untar.ts";
 
 const WINDOWS = process.platform === "win32";
@@ -116,8 +116,58 @@ export interface Release {
   tarball: string;
 }
 
-/** The newest published release (GitHub skips drafts and pre-releases here). */
+/**
+ * Mirrors before GitHub: on in mainland China by this machine's time zone. A server often
+ * runs on UTC, so HERDR_POCKET_MIRROR=1 turns them on (and =0 off) whatever the time zone.
+ */
+export function mirrorsFirst(): boolean {
+  const v = process.env.HERDR_POCKET_MIRROR ?? "";
+  if (/^(1|true|on|yes)$/i.test(v)) return true;
+  if (/^(0|false|off|no)$/i.test(v)) return false;
+  return inMainlandChina();
+}
+
+/** Where to fetch a file from, in order: a github.com file also through the mirrors. */
+export function sourcesFor(url: string): string[] {
+  return url.startsWith("https://github.com/") ? releaseSources(url, mirrorsFirst()) : [url];
+}
+
+/**
+ * The newest published release (GitHub skips drafts and pre-releases here). From the API,
+ * or from the release's SHA256SUMS, which mirrors carry: in mainland China the mirrors are
+ * asked first. A custom HERDR_POCKET_API is the only source asked.
+ */
 export async function latestRelease(): Promise<Release> {
+  if (process.env.HERDR_POCKET_API) return latestFromApi();
+  const sums = sourcesFor(`https://github.com/${repo()}/releases/latest/download/${ASSETS.checksums}`).map((u) => () => latestFromSums(u));
+  const tries = mirrorsFirst() ? [...sums.slice(0, -1), latestFromApi, sums[sums.length - 1]!] : [latestFromApi, ...sums];
+  let first: unknown;
+  for (const attempt of tries) {
+    try {
+      return await attempt();
+    } catch (e) {
+      first ??= e;
+    }
+  }
+  throw first;
+}
+
+/** The release a SHA256SUMS listing names (fetched from `url`, which may be a mirror). */
+async function latestFromSums(url: string): Promise<Release> {
+  const found = releaseFromSums(await fetchText(url, [url]));
+  if (!found) throw new Error(`${url} is not a release checksum list`);
+  const tag = `v${found.version}`;
+  const file = (name: string) => `https://github.com/${repo()}/releases/download/${tag}/${name}`;
+  return {
+    version: found.version,
+    tag,
+    page: `https://github.com/${repo()}/releases/tag/${tag}`,
+    assets: Object.fromEntries(Object.keys(found.sums).concat(ASSETS.checksums).map((name) => [name, file(name)])),
+    tarball: `https://github.com/${repo()}/archive/refs/tags/${tag}.tar.gz`,
+  };
+}
+
+async function latestFromApi(): Promise<Release> {
   const url = `${apiBase()}/repos/${repo()}/releases/latest`;
   const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": UA };
   // A token only raises GitHub's rate limit; it never goes to a custom API address.
@@ -248,11 +298,7 @@ export async function update(o: UpdateOptions): Promise<UpdateResult> {
   try {
     const file = join(work, "download.tar.gz");
     log(`downloading ${src.version ?? ""} ${src.url}`.replace(/\s+/, " "));
-    await fetchTo(src.url, file);
-    if (src.sha256) {
-      const got = await sha256(file);
-      if (got !== src.sha256) throw new Error(`checksum mismatch for ${basename(src.url)}: expected ${src.sha256}, got ${got}`);
-    }
+    await fetchTo(src.url, file, src.sha256, log);
     let dir: string;
     let version: string;
     if (WINDOWS) {
@@ -548,20 +594,45 @@ function run(cmd: string, args: string[], cwd?: string): void {
   if (r.status !== 0) throw new Error(`${cmd} failed: ${(r.stderr || r.error?.message || `exit ${r.status}`).trim().slice(0, 400)}`);
 }
 
-async function fetchTo(src: string, file: string): Promise<void> {
+/** Downloads `src` (trying its mirrors in turn) and checks the hash when one is given. */
+async function fetchTo(src: string, file: string, want?: string, log: (m: string) => void = () => {}): Promise<void> {
+  const check = async () => {
+    if (!want) return;
+    const got = await sha256(file);
+    if (got !== want) throw new Error(`checksum mismatch for ${basename(src)}: expected ${want}, got ${got}`);
+  };
   if (!/^https?:\/\//i.test(src)) {
     copyFileSync(resolve(src.replace(/^file:\/\//i, "")), file);
-    return;
+    return check();
   }
-  const res = await fetch(src, { headers: { "User-Agent": UA, Accept: "application/octet-stream" }, signal: AbortSignal.timeout(10 * 60_000) });
-  if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status} for ${src}`);
-  await pipeline(Readable.fromWeb(res.body as never), createWriteStream(file));
+  let first: unknown;
+  for (const url of sourcesFor(src)) {
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/octet-stream" }, signal: AbortSignal.timeout(10 * 60_000) });
+      if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
+      await pipeline(Readable.fromWeb(res.body as never), createWriteStream(file));
+      await check();
+      return;
+    } catch (e) {
+      first ??= e;
+      log(`  ${(e as Error).message.split("\n")[0]}${url === src ? "" : ` (through ${new URL(url).host})`}; trying the next source`);
+    }
+  }
+  throw first;
 }
 
-async function fetchText(url: string): Promise<string> {
-  const res = await fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(30_000) });
-  if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
-  return res.text();
+async function fetchText(url: string, sources = sourcesFor(url)): Promise<string> {
+  let first: unknown;
+  for (const u of sources) {
+    try {
+      const res = await fetch(u, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${u}`);
+      return await res.text();
+    } catch (e) {
+      first ??= e;
+    }
+  }
+  throw first;
 }
 
 /** The hash for one file in a `sha256sum` listing. */

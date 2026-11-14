@@ -16,6 +16,12 @@
 #   --with-node         use a private Node in <dir>/node even if one is installed
 #   --no-service        install the command only; then run `herdr-pocket up` yourself
 #
+# In mainland China (by the time zone) GitHub and nodejs.org are slow or out of reach, so
+# downloads go through mirrors first: ghfast.top / gh-proxy.com for the release, npmmirror.com
+# for Node. Checksums still decide. HERDR_POCKET_MIRROR=1 turns that on anywhere (a server
+# on UTC), =0 turns it off. From China, the script itself also comes through a mirror:
+#   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.sh | bash -s -- ...
+#
 # Later: `herdr-pocket update` installs new releases, `herdr-pocket status` shows the state.
 set -euo pipefail
 # Also stop on errors inside $(...) where bash supports it (4.4+).
@@ -39,6 +45,29 @@ latest_tag() {
   case "$url" in */releases/tag/*) echo "${url##*/}" ;; *) echo "" ;; esac
 }
 
+# Mainland China by the time zone (TZ, /etc/localtime, /etc/timezone); HERDR_POCKET_MIRROR forces it.
+in_china() {
+  case "${HERDR_POCKET_MIRROR:-}" in 1 | true | on | yes) return 0 ;; 0 | false | off | no) return 1 ;; esac
+  local tz=${TZ:-}
+  [ -n "$tz" ] || tz=$(readlink /etc/localtime 2>/dev/null || true)
+  [ -n "$tz" ] || tz=$(cat /etc/timezone 2>/dev/null || true)
+  case "$tz" in *Asia/Shanghai | *Asia/Chongqing | *Asia/Chungking | *Asia/Harbin | *Asia/Urumqi | *Asia/Kashgar | *PRC) return 0 ;; esac
+  return 1
+}
+CHINA=0
+in_china && CHINA=1
+
+# A github.com file from wherever answers first in order: the mirrors first in China, last elsewhere.
+# A source slower than 20 KB/s for 20 s gives way to the next.
+gh_fetch() {
+  local u sources="$1 https://ghfast.top/$1 https://gh-proxy.com/$1"
+  [ "$CHINA" = 1 ] && sources="https://ghfast.top/$1 https://gh-proxy.com/$1 $1"
+  for u in $sources; do
+    curl -fsSL --retry 2 --connect-timeout 15 --speed-limit 20000 --speed-time 20 -o "$2" "$u" && return 0
+  done
+  return 1
+}
+
 node_ok() {
   "$1" -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a===22&&b>=18)?0:1)' 2>/dev/null
 }
@@ -49,11 +78,21 @@ private_node() {
   case "$(uname -m)" in x86_64 | amd64) arch=x64 ;; aarch64 | arm64) arch=arm64 ;; *) die "no Node build for $(uname -m)" ;; esac
   base="https://nodejs.org/dist/latest-v$NODE_MAJOR.x"
   tmp=$(mktemp -d)
-  fetch "$base/SHASUMS256.txt" "$tmp/SHASUMS256.txt" || die "could not reach nodejs.org"
+  # The checksums from nodejs.org itself; npmmirror's latest-v* list can lag behind.
+  fetch "$base/SHASUMS256.txt" "$tmp/SHASUMS256.txt" || {
+    [ "$CHINA" = 1 ] && fetch "https://npmmirror.com/mirrors/node/latest-v$NODE_MAJOR.x/SHASUMS256.txt" "$tmp/SHASUMS256.txt"
+  } || die "could not reach nodejs.org"
   file=$(grep -o "node-v[0-9.]*-$os-$arch\.tar\.gz" "$tmp/SHASUMS256.txt" | head -n 1)
   [ -n "$file" ] || die "nodejs.org lists no $os-$arch build"
   say "downloading $file"
-  fetch "$base/$file" "$tmp/$file" || die "downloading $file failed; run the installer again"
+  local ver=${file#node-} mirror
+  ver=${ver%%-*}
+  mirror="https://npmmirror.com/mirrors/node/$ver/$file"
+  if [ "$CHINA" = 1 ]; then
+    fetch "$mirror" "$tmp/$file" || fetch "$base/$file" "$tmp/$file"
+  else
+    fetch "$base/$file" "$tmp/$file" || fetch "$mirror" "$tmp/$file"
+  fi || die "downloading $file failed; run the installer again"
   want=$(awk -v f="$file" '$2 == f { print $1 }' "$tmp/SHASUMS256.txt")
   [ "$(sha256 "$tmp/$file")" = "$want" ] || die "checksum mismatch for $file"
   rm -rf "$dir.new" && mkdir -p "$dir.new"
@@ -84,13 +123,23 @@ install_bundle() {
   elif [ -n "$SOURCE" ]; then
     file=$SOURCE
   else
-    if [ -n "$VERSION" ]; then tag="v${VERSION#v}"; else tag=$(latest_tag); fi
-    [ -n "$tag" ] || die "$REPO has no release yet: use --source <checkout or bundle>"
+    if [ -n "$VERSION" ]; then
+      tag="v${VERSION#v}"
+      gh_fetch "https://github.com/$REPO/releases/download/$tag/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null || rm -f "$tmp/SHA256SUMS"
+    elif gh_fetch "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
+      # The newest release is the one its checksum list names (mirrors carry this file, not the API).
+      tag=v$(sed -n 's/^[0-9a-fA-F]\{64\}[ *]*herdr-pocket-\([^ ]*\)\.tar\.gz$/\1/p' "$tmp/SHA256SUMS" | head -n 1)
+      [ "$tag" != v ] || tag=""
+    else
+      rm -f "$tmp/SHA256SUMS"
+      tag=$(latest_tag)
+    fi
+    [ -n "$tag" ] || die "$REPO has no release yet, or GitHub$([ "$CHINA" = 1 ] && echo " and its mirrors are" || echo " is") out of reach: use --source <checkout or bundle>"
     ver=${tag#v}
     say "downloading Herdr Pocket $ver"
     file="$tmp/herdr-pocket-$ver.tar.gz"
-    fetch "https://github.com/$REPO/releases/download/$tag/herdr-pocket-$ver.tar.gz" "$file"
-    if fetch "https://github.com/$REPO/releases/download/$tag/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
+    gh_fetch "https://github.com/$REPO/releases/download/$tag/herdr-pocket-$ver.tar.gz" "$file" || die "downloading herdr-pocket-$ver.tar.gz failed; run the installer again"
+    if [ -s "$tmp/SHA256SUMS" ]; then
       want=$(awk -v f="herdr-pocket-$ver.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")
       [ "$(sha256 "$file")" = "$want" ] || die "checksum mismatch for herdr-pocket-$ver.tar.gz"
     fi

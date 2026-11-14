@@ -12,6 +12,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.IOException
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 /** Lets the installer read the downloaded APK through a content:// URI. */
@@ -20,7 +21,8 @@ class UpdateFileProvider : FileProvider()
 /**
  * In-app update: downloads a release APK into the app's cache and hands it to the system
  * installer. Android itself refuses an APK signed by a different key, so only checks that
- * cost nothing are done here (size and package name).
+ * cost little are done here: size, SHA-256 from the release's SHA256SUMS (the file may have
+ * come through a mirror) and package name.
  */
 object Updater {
   private val client = OkHttpClient.Builder()
@@ -32,19 +34,38 @@ object Updater {
 
   private fun dir(context: Context) = File(context.cacheDir, "updates").apply { mkdirs() }
 
-  /** Blocking; call off the main thread. Returns the APK's path. */
-  fun download(context: Context, url: String, name: String, size: Long, progress: (Long, Long) -> Unit): String {
+  private fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
+
+  private fun sha256Of(file: File): String {
+    val md = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+      val buf = ByteArray(64 * 1024)
+      while (true) {
+        val n = input.read(buf)
+        if (n < 0) break
+        md.update(buf, 0, n)
+      }
+    }
+    return hex(md.digest())
+  }
+
+  /** Blocking; call off the main thread. Returns the APK's path. `sha256`: "" when unknown. */
+  fun download(context: Context, url: String, name: String, size: Long, sha256: String, progress: (Long, Long) -> Unit): String {
+    val want = sha256.lowercase()
     require(name.matches(Regex("^[A-Za-z0-9._-]+\\.apk$"))) { "bad file name" }
     val dir = dir(context)
     // Only the newest download is kept.
     dir.listFiles()?.forEach { if (it.name != name && it.name != "$name.part") it.delete() }
     val target = File(dir, name)
-    if (target.exists() && (size <= 0 || target.length() == size) && isThisApp(context, target)) return target.absolutePath
+    if (target.exists() && (size <= 0 || target.length() == size) && (want.isEmpty() || sha256Of(target) == want) && isThisApp(context, target)) {
+      return target.absolutePath
+    }
     val part = File(dir, "$name.part")
     part.delete()
 
     val c = client.newCall(Request.Builder().url(url).header("Accept", "application/octet-stream").build())
     call = c
+    val md = MessageDigest.getInstance("SHA-256")
     try {
       c.execute().use { res ->
         if (!res.isSuccessful) throw IOException("HTTP ${res.code}")
@@ -59,6 +80,7 @@ object Updater {
               val n = input.read(buf)
               if (n < 0) break
               out.write(buf, 0, n)
+              md.update(buf, 0, n)
               got += n
               if (got - shown >= 256 * 1024) {
                 shown = got
@@ -75,6 +97,10 @@ object Updater {
     if (size > 0 && part.length() != size) {
       part.delete()
       throw IOException("download incomplete")
+    }
+    if (want.isNotEmpty() && hex(md.digest()) != want) {
+      part.delete()
+      throw IOException("checksum mismatch")
     }
     if (!isThisApp(context, part)) {
       part.delete()

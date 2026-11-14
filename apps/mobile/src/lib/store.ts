@@ -13,6 +13,8 @@ export interface ReleaseInfo {
   url: string;
   fileName: string;
   size: number;
+  /** The APK's SHA-256 from the release, when known; the download is checked against it. */
+  sha256?: string;
   /** Release page, for reading or downloading by hand. */
   page: string;
   notes: string;

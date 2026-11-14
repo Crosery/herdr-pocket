@@ -146,6 +146,8 @@ curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/i
 
 第一台设备就是这台电脑时，改用设置链接：`… -Link https://pocket.example.com/p/<设置码>`。详见 [docs/deploy/host.md](docs/deploy/host.md#windows)。
 
+在中国大陆，GitHub 慢的时候在脚本地址前加镜像：`https://ghfast.top/https://raw.githubusercontent.com/...`。脚本按时区判断，之后的下载和以后的更新都会自动先走镜像，见 [docs/deploy/updates.md](docs/deploy/updates.md#中国大陆)。
+
 ### 4. 装手机 App
 
 从 [Releases](https://github.com/Crosery/herdr-pocket/releases/latest) 下载 `herdr-pocket-<版本>-android-arm64.apk` 安装。之后的新版本 App 会自己提示，点一下就下载安装。
