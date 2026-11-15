@@ -2,7 +2,6 @@ import React from "react";
 import { linearTiming, TransitionSeries, type TransitionPresentation } from "@remotion/transitions";
 import { fade } from "@remotion/transitions/fade";
 import { slide } from "@remotion/transitions/slide";
-import { wipe } from "@remotion/transitions/wipe";
 import {
   SceneOpen,
   SceneProblem,
@@ -32,7 +31,7 @@ export const SCENES: [React.FC, number][] = [
 export const INTRO_FRAMES = SCENES.reduce((a, [, d]) => a + d, 0) - T * (SCENES.length - 1);
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const presentations: TransitionPresentation<any>[] = [fade(), fade(), slide({ direction: "from-right" }), wipe({ direction: "from-left" }), slide({ direction: "from-bottom" }), fade(), fade(), fade(), slide({ direction: "from-right" })];
+const presentations: TransitionPresentation<any>[] = [fade(), fade(), slide({ direction: "from-right" }), fade(), slide({ direction: "from-bottom" }), fade(), fade(), fade(), slide({ direction: "from-right" })];
 
 export const Intro: React.FC = () => (
   <TransitionSeries>

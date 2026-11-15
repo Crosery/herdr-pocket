@@ -154,11 +154,12 @@ export function fakeQr(n: number, seed = 7): boolean[] {
   return cells;
 }
 
+/** A decorative QR code as one SVG path: a grid of hundreds of elements made every theme switch restyle them all. */
 export function renderQr(el: HTMLElement, n: number, seed?: number): void {
-  el.style.gridTemplateColumns = `repeat(${n}, 1fr)`;
-  el.innerHTML = fakeQr(n, seed)
-    .map((on) => (on ? "<i></i>" : '<i class="o"></i>'))
-    .join("");
+  const cells = fakeQr(n, seed);
+  let d = "";
+  for (let i = 0; i < cells.length; i++) if (cells[i]) d += `M${i % n} ${Math.floor(i / n)}h1v1h-1z`;
+  el.innerHTML = `<svg viewBox="0 0 ${n} ${n}" shape-rendering="crispEdges" aria-hidden="true"><path d="${d}"/></svg>`;
 }
 
 export async function copyText(text: string): Promise<boolean> {
