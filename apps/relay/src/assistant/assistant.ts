@@ -118,6 +118,8 @@ export interface Asker {
 interface Turn {
   occasion: Occasion;
   facts: RunFacts;
+  /** Agents held once for a look before acting on them at once (readFirst). */
+  checked?: Set<string>;
 }
 
 const SETTING_CONFIRM = "assistant.confirm";
@@ -759,6 +761,23 @@ export class Assistant {
     return { out: this.outcome(done), step: done.state === "done" ? verb : `${verb}没成` };
   }
 
+  /**
+   * Acting at once on an agent not read in this turn: read it first and hold
+   * the action once, so a wrong pick shows before anything reaches an agent.
+   * Asking first needs none of this: the card lets the person check.
+   */
+  private async readFirst(a: Agent, turn: Turn, verb: "发" | "按"): Promise<{ out: string; step: string } | null> {
+    if (!this.direct(turn) || turn.facts.reads.some((r) => r.agent === a.key) || turn.checked?.has(a.key)) return null;
+    (turn.checked ??= new Set()).add(a.key);
+    const again = "是它就原样再调用一次；不是它就换成对的 agent，拿不准就问我指的是哪个。";
+    try {
+      const seen = await this.tool("read_agent", verb === "按" ? { agent: a.key, what: "terminal", lines: 30 } : { agent: a.key, limit: 8 }, turn);
+      return { out: `还没${verb}：先核对是不是它。\n${seen.out}\n${again}`, step: seen.step ?? `看了「${titleOf(a)}」` };
+    } catch (e) {
+      return { out: `还没${verb}：读不到「${titleOf(a)}」（${(e as Error).message}）。${again}`, step: `没读到「${titleOf(a)}」` };
+    }
+  }
+
   /** The tool result for an action that ran: only what really happened. */
   private outcome(act: AssistantAction): string {
     if (act.state !== "done") return `没办成：${act.summary}。原因：${act.result ?? "不清楚"}。照实告诉我没成和原因，不要说办了。`;
@@ -848,6 +867,8 @@ export class Assistant {
         const a = this.resolveAgent(input.agent);
         const text = typeof input.text === "string" ? input.text.trim() : "";
         if (!text) throw new Error("要发送的内容是空的");
+        const held = await this.readFirst(a, turn, "发");
+        if (held) return held;
         // The person's own words stay beside the message made from them; the same words twice are just the message.
         const raw = typeof input.said === "string" ? input.said.trim().slice(0, 4000) : "";
         const said = raw && oneLine(raw) !== oneLine(text) ? raw : undefined;
@@ -878,6 +899,8 @@ export class Assistant {
         const a = this.resolveAgent(input.agent);
         const keys = Array.isArray(input.keys) ? input.keys.filter((k): k is string => typeof k === "string" && !!k).slice(0, 16) : [];
         if (!keys.length) throw new Error("要按的键是空的");
+        const held = await this.readFirst(a, turn, "按");
+        if (held) return held;
         return this.act(
           { kind: "keys", agent: a.key, agentTitle: titleOf(a), device: a.deviceId, keys, summary: `在「${titleOf(a)}」按 ${keys.join(" ")}` },
           turn,
@@ -1788,6 +1811,7 @@ const TOOLS: ToolDef[] = [
       "给 agent 发一条消息（等于在它的输入框里打字并回车）。" +
       SETTING_NOTE +
       "结果会写明：发了；它正忙着、消息排在它输入框里等这一轮完；它停在确认提示上；或者没发成和原因。它回了什么不会在结果里，要等它停下再 read_agent。" +
+      "直接办的时候，这一轮还没读过的 agent，第一次调用只会把它读给你看、不会发；核对是它再原样调用一次。" +
       "`text` 不是把我的话原样搬过去，是照“传话”那段整理好的一条消息：去掉口头禅、改口和说给你听的话；“他”“那个”换成具体的东西；名字、路径、数字、报错原文、限制、否定、先后一字不改；不加我没说的要求和办法；用我的口吻直接对它说，短短一两句。我明说要原话，或者内容是代码、命令、要它照抄的话，就一字不动。会改变结果的地方没听清，先问我，别发。" +
       "`agent` 可以写空间名、标签名、标题、文件夹、程序名，语音听岔的也行（黑德 = herdr）。",
     input_schema: {
@@ -1804,7 +1828,7 @@ const TOOLS: ToolDef[] = [
   {
     name: "press_keys",
     description:
-      '在 agent 的终端按键，用来回答权限确认之类的提示，例如 `["enter"]`、`["y"]`、`["esc"]`、`["down","enter"]`、`["ctrl+c"]`。' + SETTING_NOTE + '按之前先用 `read_agent` 看终端，确认它停在哪个提示上。',
+      '在 agent 的终端按键，用来回答权限确认之类的提示，例如 `["enter"]`、`["y"]`、`["esc"]`、`["down","enter"]`、`["ctrl+c"]`。' + SETTING_NOTE + '按之前先用 `read_agent` 看终端，确认它停在哪个提示上；这一轮没看过就直接按，第一次调用只会先把终端读给你看、不会按。',
     input_schema: {
       type: "object",
       properties: { agent: { type: "string" }, keys: { type: "array", items: { type: "string" } } },

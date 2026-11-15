@@ -18,11 +18,16 @@ const host: AssistantHost = {
   agents: () => agents,
   toViewers: () => {},
   log: () => {},
-  call: (async (_device: string, method: string) => {
+  call: (async (_device: string, method: string, params: unknown) => {
+    hostCalls.push(method);
     if (method === "session.events") return { sessionKey: "claude:t1", more: false, events: [{ id: "1", session: "claude:t1", ts: now, kind: "assistant_message", text: "要删掉 dist 目录再重新打包，等你确认。" }] };
+    if (method === "terminal.read") return { text: "删除 dist？(y/n)\n> " };
+    if (method === "terminal.send") return { ok: true, position: 0, agentStatus: "blocked", waiting: false };
+    if (method === "terminal.keys") return { ok: true, params };
     throw new Error(`not in this test: ${method}`);
   }) as AssistantHost["call"],
 };
+const hostCalls: string[] = [];
 
 const text = (t: string): LlmResult => ({ content: [{ type: "text", text: t }], stopReason: "end_turn", model: "test" });
 const look = (): LlmResult => ({ content: [{ type: "tool_use", id: `c${Math.random().toString(36).slice(2, 7)}`, name: "read_agent", input: { agent: "d1/hc:t1" } }], stopReason: "tool_use", model: "test" });
@@ -79,6 +84,42 @@ test("when even the last answer fails, the stock line still comes", async () => 
   const answer = await chat(a, "上线检查到底卡在哪？");
   assert.match(answer.text, /^查了几轮还没理清。/);
   done();
+});
+
+test("acting at once on an agent not read this turn: read it first, hold once, then act", async () => {
+  const send = { type: "tool_use" as const, name: "send_to_agent", input: { agent: "上线检查", text: "可以删" } };
+  const keys = { type: "tool_use" as const, name: "press_keys", input: { agent: "上线检查", keys: ["y"] } };
+  const step = (b: typeof send | typeof keys): LlmResult => ({ content: [{ ...b, id: `c${Math.random().toString(36).slice(2, 7)}` }], stopReason: "tool_use", model: "test" });
+  const results = (req: LlmRequest) => req.messages.flatMap((m) => (Array.isArray(m.content) ? m.content.flatMap((b) => (b.type === "tool_result" ? [String(b.content)] : [])) : []));
+
+  // Sent without a look: the first call reads the conversation and sends nothing; the same call again sends.
+  hostCalls.length = 0;
+  let m = make((req) => (results(req).length < 2 ? step(send) : text("发了。")));
+  await chat(m.a, "跟上线检查说可以删");
+  let seen = results(m.asked[m.asked.length - 1]!);
+  assert.match(seen[0]!, /^还没发：先核对是不是它。\n[\s\S]*上线检查[\s\S]*要删掉 dist 目录再重新打包/);
+  assert.match(seen[1]!, /^办了：给「上线检查」发送：可以删/);
+  assert.deepEqual(hostCalls, ["session.events", "terminal.send"]);
+  m.done();
+
+  // Read first: nothing is held.
+  hostCalls.length = 0;
+  m = make((req) => (results(req).length === 0 ? look() : results(req).length === 1 ? step(send) : text("发了。")));
+  await chat(m.a, "跟上线检查说可以删");
+  seen = results(m.asked[m.asked.length - 1]!);
+  assert.match(seen[1]!, /^办了：/);
+  assert.deepEqual(hostCalls, ["session.events", "terminal.send"]);
+  m.done();
+
+  // Keys without a look: the terminal is read first.
+  hostCalls.length = 0;
+  m = make((req) => (results(req).length < 2 ? step(keys) : text("按了。")));
+  await chat(m.a, "帮上线检查按 y");
+  seen = results(m.asked[m.asked.length - 1]!);
+  assert.match(seen[0]!, /^还没按：先核对是不是它。\n[\s\S]*删除 dist？\(y\/n\)/);
+  assert.match(seen[1]!, /^办了：在「上线检查」按 y/);
+  assert.deepEqual(hostCalls, ["terminal.read", "terminal.keys"]);
+  m.done();
 });
 
 test("a call task always brings notes back: from the model, or from what the tools found", async () => {

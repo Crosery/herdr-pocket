@@ -217,7 +217,19 @@ test("by default an action runs at once and the answer reports what really happe
   await viewer.next((f) => f.type === "snapshot");
   assert.equal((await api("/v1/assistant/settings", { token: phone.token })).json.confirm, "never");
 
-  const [result] = await turn(phone, viewer, "跟迁移那边说测试完了再提交", [["send_to_agent", { agent: "迁移那边", text: "测试完了再提交" }]], "发了，它正忙着，这一轮完了才会看到。");
+  const [held, result] = await turn(
+    phone,
+    viewer,
+    "跟迁移那边说测试完了再提交",
+    [
+      ["send_to_agent", { agent: "迁移那边", text: "测试完了再提交" }],
+      ["send_to_agent", { agent: "迁移那边", text: "测试完了再提交" }],
+    ],
+    "发了，它正忙着，这一轮完了才会看到。",
+  );
+  // Not read in this turn: the first call only reads it, so a wrong pick shows before anything is sent.
+  // (This host cannot read conversations: the hold says so, and the second call goes through.)
+  assert.match(held!, /^还没发：读不到「迁移脚本」.*原样再调用一次/);
   // Sent at once, from the relay, with the person's words.
   const sends = calls.filter((c) => c.method === "terminal.send");
   assert.equal(sends.length, 1);
@@ -245,11 +257,14 @@ test("the 10:09 call: delivered and answered are never claimed without a send an
 
   // In a call: no confirmation; the target is found from "黑的演示端那边"; the invented reply is dropped.
   const { phone: callSock, up } = await openCall(phone.token);
-  script = (req) => (toolResults(req).length ? text(fabricated) : call("send_to_agent", { agent: "黑的演示端那边", text: "目前这些是缺陷：不能新建 Claude Code" }));
+  script = (req) => {
+    const results = toolResults(req);
+    return !results.length || /^还没发/.test(results[0]!) ? call("send_to_agent", { agent: "黑的演示端那边", text: "目前这些是缺陷：不能新建 Claude Code" }) : text(fabricated);
+  };
   up.send({ action: "session.delegation.created", data: { delegation: { id: "d1", type: "task" }, purpose: "task", objective: "跟黑的演示端那边说一下目前这些是缺陷", context: [] } });
   const said = await up.next((f) => f.action === "session.commentary.append" && f.delegation_id === "d1" && f.status === "completed");
   assert.equal(calls.filter((c) => c.method === "terminal.send").length, 1);
-  assert.equal(calls[0]!.params.agent, `${host.device.id}/hc:t77`);
+  assert.equal(calls.find((c) => c.method === "terminal.send")!.params.agent, `${host.device.id}/hc:t77`);
   assert.doesNotMatch(said.content, /回话|那边说|都有/);
   assert.match(said.content, /发过去了/);
   callSock.send({ action: "relay.hangup" });
@@ -341,7 +356,7 @@ test("relaying: the agent gets the distilled message, the card keeps who, where 
   assert.doesNotMatch(systemPrompt("小羊", "text", "", { confirm: true }), /不替我润色/);
 
   // Words that are already the message leave no second copy.
-  await turn(phone, viewer, "跟博客那边说：先别动", [["send_to_agent", { agent: "博客那边", text: "先别动", said: " 先别动 " }]], "发了。");
+  await turn(phone, viewer, "跟博客那边说：先别动", [["read_agent", { agent: "博客那边" }], ["send_to_agent", { agent: "博客那边", text: "先别动", said: " 先别动 " }]], "发了。");
   let items = (await api("/v1/assistant", { token: phone.token })).json.items as AssistantItem[];
   assert.equal(items.filter((i) => i.action).pop()!.action!.said, undefined);
   const tool = seen[seen.length - 1]!.tools.find((t) => t.name === "send_to_agent")!;
@@ -352,7 +367,8 @@ test("relaying: the agent gets the distilled message, the card keeps who, where 
   // The model says a few words before it sends: its answer still lands after the card, as it does after a restart.
   let round = 0;
   script = (req) => {
-    if (round++) return text("发了。");
+    if (round++ === 0) return call("read_agent", { agent: "博客那边" });
+    if (round > 2) return text("发了。");
     req.onText?.("好，我跟它说。");
     return { content: [{ type: "text", text: "好，我跟它说。" }, { type: "tool_use", id: "cs1", name: "send_to_agent", input: { agent: "博客那边", text: SENT, said: SPOKEN } }], stopReason: "tool_use", model: "test" };
   };
@@ -366,7 +382,7 @@ test("relaying: the agent gets the distilled message, the card keeps who, where 
   const replyAt = items.findLastIndex((i) => i.role === "assistant" && !i.action);
   assert.equal(items[replyAt]!.text, "发了。");
   assert.ok(replyAt > cardAt, "the answer comes after the card it reports on");
-  assert.deepEqual(items[replyAt]!.steps, ["给「博客平台」发了消息"]);
+  assert.deepEqual(items[replyAt]!.steps, ["读了「Fix image upload in the blog editor」的对话", "给「博客平台」发了消息"]);
   const card = items[cardAt]!.action!;
   assert.equal(card.state, "done");
   assert.equal(card.text, SENT);
