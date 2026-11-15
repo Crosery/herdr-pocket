@@ -531,18 +531,59 @@ async function withDirect<T>(fn: (c: { state: State; call: (to: string, m: RpcMe
 // ---------------------------------------------------------------------------
 
 async function http<T>(server: string, path: string, init: { token?: string; body?: unknown; method?: string }): Promise<T> {
-  const res = await fetch(server.replace(/\/+$/, "") + path, {
-    method: init.method ?? (init.body ? "POST" : "GET"),
-    headers: {
-      "Content-Type": "application/json",
-      ...(init.token ? { Authorization: `Bearer ${init.token}` } : {}),
-    },
-    body: init.body ? JSON.stringify(init.body) : undefined,
-    signal: AbortSignal.timeout(15_000),
-  });
+  let res: Response;
+  try {
+    res = await fetch(server.replace(/\/+$/, "") + path, {
+      method: init.method ?? (init.body ? "POST" : "GET"),
+      headers: {
+        "Content-Type": "application/json",
+        ...(init.token ? { Authorization: `Bearer ${init.token}` } : {}),
+      },
+      body: init.body ? JSON.stringify(init.body) : undefined,
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (e) {
+    throw unreachable(server, e);
+  }
   const json = (await res.json().catch(() => ({}))) as any;
   if (!res.ok) throw new Error(json?.error?.message ?? `HTTP ${res.status}`);
   return json as T;
+}
+
+/** The example address from the docs, copied as it is. */
+function isExampleServer(server: string): boolean {
+  try {
+    return /(^|\.)example\.(com|org|net)$/i.test(new URL(/^https?:\/\//i.test(server) ? server : `https://${server}`).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/** Node only says "fetch failed": name the address and what went wrong. */
+function unreachable(server: string, e: unknown): Error {
+  if (isExampleServer(server)) {
+    return new Error(`${server} is the example address from the docs, not a real relay.\nUse the address of your own relay (the one your phone connects to): --server <your relay>`);
+  }
+  const err = e as { name?: string; message?: string; cause?: { code?: string; message?: string } };
+  const code = err.cause?.code ?? "";
+  const detail = `${code} ${err.cause?.message ?? ""}`;
+  let host = server;
+  try {
+    host = new URL(server).host;
+  } catch {
+    /* keep it as given */
+  }
+  const why =
+    err.name === "TimeoutError" || err.name === "AbortError"
+      ? "no answer within 15 s"
+      : code === "ENOTFOUND" || code === "EAI_AGAIN"
+        ? `the name ${host} does not resolve (a typo, or no DNS record yet)`
+        : code === "ECONNREFUSED"
+          ? "nothing answers there: is the relay running, and is the port right?"
+          : /CERT|SSL|TLS/i.test(detail)
+            ? `its HTTPS certificate is not accepted (${detail.trim()})`
+            : detail.trim() || err.message || "unknown error";
+  return new Error(`cannot reach the relay at ${server}: ${why}`);
 }
 
 function needConfig(): HostConfig {

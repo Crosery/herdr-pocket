@@ -163,6 +163,37 @@ install_bundle() {
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 daemon_running() { "$CMD" status 2>/dev/null | grep -q "^daemon *running"; }
 
+# Load the launchd agent from $1, replacing the one already loaded. `launchctl bootout`
+# returns before the old process has exited, and `bootstrap` fails with "5: Input/output
+# error" while it is still there; it fails the same way for a service disabled earlier
+# (launchctl unload -w). So: enable, bootout, wait until it is gone, bootstrap, and go round
+# again if the old one was slow to stop. Over SSH with nobody logged in at the screen there
+# is no gui/<uid> domain; user/<uid> runs it then.
+launchd_load() {
+  local plist=$1 uid domain target err="" try waited
+  uid=$(id -u)
+  domain="gui/$uid"
+  launchctl print "$domain" >/dev/null 2>&1 || domain="user/$uid"
+  target="$domain/$LABEL"
+  plutil -lint -s "$plist" || die "$plist is not a valid property list"
+  launchctl enable "$target" >/dev/null 2>&1 || true
+  for try in 1 2 3 4 5; do
+    launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1 || true
+    launchctl bootout "user/$uid/$LABEL" >/dev/null 2>&1 || true
+    waited=0
+    while launchctl print "$target" >/dev/null 2>&1 && [ "$waited" -lt 30 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    err=$(launchctl bootstrap "$domain" "$plist" 2>&1) && return 0
+    [ "$try" = 1 ] && say "waiting for the previous Herdr Pocket to stop"
+    sleep 2
+  done
+  die "launchd would not start Herdr Pocket: ${err%%$'\n'*}
+  Run the same command again in a minute. If it fails the same way, send this output and:
+    launchctl print $target"
+}
+
 # ----------------------------------------------------------------------------------------------------------------------------------
 
 SERVER="" CODE="" LINK="" NAME="" READ_ONLY=0 VERSION="" SOURCE="" WITH_NODE=0 NO_SERVICE=0 INSTALLED=""
@@ -183,6 +214,18 @@ while [ $# -gt 0 ]; do
     -h | --help) [ -f "$0" ] && sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*) die "unknown option: $1 (see --help)" ;;
     *) LINK=$1; shift ;;
+  esac
+done
+
+# The example from the docs, pasted as it is: say so before downloading anything.
+for given in "$SERVER" "$LINK"; do
+  host=${given#*://}
+  host=${host%%[/:?]*}
+  case "$host" in
+    example.com | example.org | example.net | *.example.com | *.example.org | *.example.net)
+      die "$given is the example address from the docs, not a real relay.
+  Put your own relay's address after --server (the address your phone connects to).
+  No relay yet? Set one up first: https://github.com/$REPO#1-deploy-the-relay" ;;
   esac
 done
 
@@ -286,8 +329,7 @@ EOF
 </plist>
 EOF
   } >"$plist"
-  launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$plist"
+  launchd_load "$plist"
   logs="$log_dir/hostd.log"
 else
   if daemon_running && ! systemctl --user is-active --quiet "$UNIT" 2>/dev/null; then
