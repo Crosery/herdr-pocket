@@ -1,0 +1,104 @@
+# Screenshots for the iOS CI run (.github/workflows/ios.yml): a fresh install, then the demo data and each
+# main screen. Everything is reached by tapping, like a person would: no deep links (iOS asks "Open in ...?"
+# for those) and no test-only code in the app. The workflow sets the simulator to light or dark and passes
+# MODE=light|dark, which only names the files. Tab buttons are matched by their iOS label "<title>, tab, N of 4".
+appId: dev.crosery.herdrpocket
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "还没有服务器？先逛逛演示数据"
+    timeout: 60000
+- waitForAnimationToEnd
+- takeScreenshot: 01-connect-${MODE}
+
+# Into the demo: mock data inside the app, no server and no network.
+- tapOn: "还没有服务器？先逛逛演示数据"
+- extendedWaitUntil:
+    visible: "Agents(, tab.*)?"
+    timeout: 30000
+- waitForAnimationToEnd
+- takeScreenshot: 02-assistant-${MODE}
+
+- tapOn: "Agents(, tab.*)?"
+- extendedWaitUntil:
+    visible: ".*要不要删掉旧的迁移脚本.*"
+    timeout: 15000
+- waitForAnimationToEnd
+- takeScreenshot: 03-agents-${MODE}
+
+# One agent: its conversation, then its terminal. Pages above the tabs hide the tab bar, which tells
+# that a tap opened the page and did not land somewhere else.
+- tapOn: ".*要不要删掉旧的迁移脚本.*"
+- extendedWaitUntil:
+    notVisible: "Agents, tab.*"
+    timeout: 15000
+- extendedWaitUntil:
+    visible: "终端"
+    timeout: 15000
+- waitForAnimationToEnd
+- takeScreenshot: 04-agent-chat-${MODE}
+- tapOn: "终端"
+- waitForAnimationToEnd
+- takeScreenshot: 05-agent-terminal-${MODE}
+
+# Back to the tabs by starting the app again: it reopens on the demo, at the first tab.
+- stopApp
+- launchApp
+- extendedWaitUntil:
+    visible: "设备(, tab.*)?"
+    timeout: 30000
+- tapOn: "设备(, tab.*)?"
+- waitForAnimationToEnd
+- takeScreenshot: 06-devices-${MODE}
+
+- tapOn: "设置(, tab.*)?"
+- waitForAnimationToEnd
+- takeScreenshot: 07-settings-${MODE}
+
+# The assistant settings pages, each opened from the settings tab. A row is scrolled to the middle
+# first: at the bottom edge its centre sits under the tab bar and the tap would hit a tab.
+- scrollUntilVisible:
+    element: "模型([ ,，].*)?"
+    direction: DOWN
+    centerElement: true
+- tapOn: "模型([ ,，].*)?"
+- extendedWaitUntil:
+    notVisible: "设置, tab.*"
+    timeout: 15000
+- waitForAnimationToEnd
+- takeScreenshot: 08-config-models-${MODE}
+
+- stopApp
+- launchApp
+- extendedWaitUntil:
+    visible: "设置(, tab.*)?"
+    timeout: 30000
+- tapOn: "设置(, tab.*)?"
+- scrollUntilVisible:
+    element: "语音([ ,，].*)?"
+    direction: DOWN
+    centerElement: true
+- tapOn: "语音([ ,，].*)?"
+- extendedWaitUntil:
+    notVisible: "设置, tab.*"
+    timeout: 15000
+- waitForAnimationToEnd
+- takeScreenshot: 09-config-voice-${MODE}
+
+- stopApp
+- launchApp
+- extendedWaitUntil:
+    visible: "设置(, tab.*)?"
+    timeout: 30000
+- tapOn: "设置(, tab.*)?"
+- scrollUntilVisible:
+    element: "提示词([ ,，].*)?"
+    direction: DOWN
+    centerElement: true
+- tapOn: "提示词([ ,，].*)?"
+- extendedWaitUntil:
+    notVisible: "设置, tab.*"
+    timeout: 15000
+- waitForAnimationToEnd
+- takeScreenshot: 10-config-prompts-${MODE}

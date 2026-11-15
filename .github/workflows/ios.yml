@@ -41,6 +41,40 @@ jobs:
           sudo xcode-select -s "$XCODE_APP"
           xcodebuild -version | tee /dev/stderr | grep -q "^Xcode 26.6"
           xcrun simctl list runtimes
+      # Booted now, while the app builds: a fresh simulator posts a one-off "Ready for Apple
+      # Intelligence" banner about a minute after boot, long gone before the screenshots.
+      - name: Boot the simulator
+        run: |
+          # The newest iOS runtime; an iPhone 17 Pro there, or else the first iPhone.
+          udid=$(xcrun simctl list -j devices available | python3 -c '
+          import json, re, sys
+          devices = json.load(sys.stdin)["devices"]
+          def version(k):
+              m = re.search(r"iOS-(\d+)-(\d+)", k)
+              return tuple(map(int, m.groups())) if m else (0, 0)
+          for runtime in sorted((k for k in devices if "iOS" in k), key=version, reverse=True):
+              phones = [d for d in devices[runtime] if d["name"].startswith("iPhone")]
+              pick = next((d for d in phones if d["name"] == "iPhone 17 Pro"), phones[0] if phones else None)
+              if pick:
+                  print(runtime, pick["name"], file=sys.stderr)
+                  print(pick["udid"])
+                  break
+          ')
+          [ -n "$udid" ] || { echo "no iPhone simulator found"; exit 1; }
+          xcrun simctl boot "$udid"
+          echo "SIM_UDID=$udid" >>"$GITHUB_ENV"
+      # Maestro (Apache-2.0) drives the app for the screenshots; CI only, not part of the app.
+      - name: Install Maestro
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/maestro.zip" \
+            "https://github.com/mobile-dev-inc/maestro/releases/download/cli-$MAESTRO_VERSION/maestro.zip"
+          echo "$MAESTRO_SHA256  $RUNNER_TEMP/maestro.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/maestro.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/maestro/bin" >>"$GITHUB_PATH"
+          "$RUNNER_TEMP/maestro/bin/maestro" --version
+        env:
+          MAESTRO_VERSION: 2.12.1
+          MAESTRO_SHA256: 54dbb0716425626604973cbb374c585ca30272375d9ce15177a1152765ddd9d7
       # apps/mobile is outside the root workspace: it installs from its own lockfile.
       - name: Native project
         working-directory: apps/mobile
@@ -59,82 +93,45 @@ jobs:
           app="$RUNNER_TEMP/dd/Build/Products/Release-iphonesimulator/HerdrPocket.app"
           codesign -dv "$app" 2>&1 | grep -E "^(Identifier|Signature)" || true
           ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/HerdrPocket-simulator.zip"
+      # apps/mobile/.maestro/ios-screens.yaml taps through the app (connect, the in-app demo, then each
+      # screen), once per system appearance; the app follows the system theme by default.
       - name: Screenshots in demo mode
+        env:
+          MAESTRO_CLI_NO_ANALYTICS: "1"
+          MAESTRO_CLI_ANALYTICS_NOTIFICATION_DISABLED: "true"
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/dd/Build/Products/Release-iphonesimulator/HerdrPocket.app"
+          flow="$GITHUB_WORKSPACE/apps/mobile/.maestro/ios-screens.yaml"
           shots="$RUNNER_TEMP/shots"
           mkdir -p "$shots"
+          udid="$SIM_UDID"
 
-          # The newest iOS runtime; an iPhone 17 Pro there, or else the first iPhone.
-          udid=$(xcrun simctl list -j devices available | python3 -c '
-          import json, re, sys
-          devices = json.load(sys.stdin)["devices"]
-          def version(k):
-              m = re.search(r"iOS-(\d+)-(\d+)", k)
-              return tuple(map(int, m.groups())) if m else (0, 0)
-          for runtime in sorted((k for k in devices if "iOS" in k), key=version, reverse=True):
-              phones = [d for d in devices[runtime] if d["name"].startswith("iPhone")]
-              pick = next((d for d in phones if d["name"] == "iPhone 17 Pro"), phones[0] if phones else None)
-              if pick:
-                  print(runtime, pick["name"], file=sys.stderr)
-                  print(pick["udid"])
-                  break
-          ')
-          [ -n "$udid" ] || { echo "no iPhone simulator found"; exit 1; }
-
-          xcrun simctl boot "$udid"
           xcrun simctl bootstatus "$udid" -b
           xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 || true
-          xcrun simctl ui "$udid" appearance light
           xcrun simctl install "$udid" "$app"
           xcrun simctl spawn "$udid" log stream --style compact --predicate 'process == "HerdrPocket"' >"$shots/app.log" 2>&1 &
           logger=$!
 
-          # grep without -q reads to the end, so pipefail does not see launchctl cut off.
-          alive() { xcrun simctl spawn "$udid" launchctl list | grep "UIKitApplication:$APP_ID" >/dev/null; }
-          crashed=0
-          # One screen that fails to open or capture must not cost the rest.
-          shot() {
-            sleep "${2:-4}"
-            xcrun simctl io "$udid" screenshot "$shots/$1.png" >/dev/null || echo "::warning::no screenshot for $1"
-            if ! alive; then echo "::error::the app is not running after $1"; crashed=1; fi
-          }
-          go() { xcrun simctl openurl "$udid" "$1" || echo "::warning::could not open $1"; }
-
-          # A fresh install opens on the connect screen.
-          xcrun simctl launch "$udid" "$APP_ID"
-          shot 01-connect-light 12
-          xcrun simctl ui "$udid" appearance dark
-          shot 01-connect-dark 3
-          xcrun simctl ui "$udid" appearance light
-
-          # The demo server: everything below is mock data inside the app.
-          go "herdrpocket://pair?server=mock%3A%2F%2Fdemo&code=DEMO"
-          shot 02-paired 2
-          sleep 4
-
-          agent=dev_macbook%2Fhc%3At47
+          failed=0
           for mode in light dark; do
             xcrun simctl ui "$udid" appearance "$mode"
-            go "herdrpocket://";                         shot "03-assistant-$mode" 5
-            go "herdrpocket://agents";                   shot "04-agents-$mode"
-            go "herdrpocket://devices";                  shot "05-devices-$mode"
-            go "herdrpocket://agent/$agent";             shot "06-agent-chat-$mode" 5
-            go "herdrpocket://agent/$agent?tab=terminal"; shot "07-agent-terminal-$mode" 5
-            go "herdrpocket://settings";                 shot "08-settings-$mode"
-            go "herdrpocket://assistant-config/models";  shot "09-config-models-$mode"
-            go "herdrpocket://assistant-config/voice";   shot "10-config-voice-$mode"
-            go "herdrpocket://assistant-config/prompts"; shot "11-config-prompts-$mode"
+            out="$shots/maestro-$mode"
+            mkdir -p "$out"
+            # One run that stops early (it saves a screenshot of where) must not cost the other.
+            (cd "$out" && maestro test --udid "$udid" -e MODE="$mode" --test-output-dir "$out" "$flow") ||
+              { echo "::error::the $mode run stopped early; see maestro-$mode in the screenshots artifact"; failed=1; }
           done
+          # The named screenshots side by side at the top of the artifact; Maestro's logs stay below.
+          find "$shots"/maestro-* -name '[0-9][0-9]-*.png' -exec mv {} "$shots/" \;
 
           kill "$logger" 2>/dev/null || true
           cp ~/Library/Logs/DiagnosticReports/HerdrPocket* "$shots/" 2>/dev/null || true
           {
             echo "### Simulator screenshots"
-            ls "$shots" | sed 's/^/- /'
+            ls "$shots" | grep '\.png$' | sed 's/^/- /' || true
           } >>"$GITHUB_STEP_SUMMARY"
-          [ "$crashed" = 0 ]
+          [ "$failed" = 0 ]
       - uses: actions/upload-artifact@v7
         with:
           name: herdr-pocket-ios-simulator-app
