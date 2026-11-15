@@ -1,4 +1,4 @@
-import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { AppState, Image, Pressable, ScrollView, View } from "react-native";
 import { ActivityIndicator, Button, Dialog, Portal, ProgressBar, Text } from "react-native-paper";
 import { router } from "expo-router";
@@ -8,18 +8,19 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import Animated, { interpolateColor, useAnimatedStyle, useDerivedValue, withTiming } from "react-native-reanimated";
 import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
 import { Card, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
+import { Row, RowDivider as Divider, type RowIcon as IconName } from "../../components/rows";
+import { ConfigSnackbar } from "../../components/configParts";
 import { Bow, Mascot } from "../../components/Mascot";
 import { useLive, useSettings, type ThemeMode } from "../../lib/store";
 import { signOut } from "../../lib/session";
 import { isMockServer } from "../../lib/mock";
 import { loadAssistant, setAssistantConfirm, useAssistant } from "../../lib/assistant";
-import { alertsSupported, askNotificationPermission, refreshAlertState, useAlerts } from "../../lib/alerts";
-import { checkForUpdate, currentVersion, downloadUpdate, installUpdate, resumeInstallIfAllowed, useNewRelease, useUpdate } from "../../lib/update";
+import { useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
+import { alertsInBackground, alertsSupported, askNotificationPermission, refreshAlertState, useAlerts } from "../../lib/alerts";
+import { checkForUpdate, currentVersion, downloadUpdate, installUpdate, resumeInstallIfAllowed, updatesSupported, useNewRelease, useUpdate } from "../../lib/update";
 import { PocketNative } from "../../../modules/pocket-native";
 import { usePalette } from "../../theme/theme";
 import { fonts, motion, radius, space } from "../../theme/tokens";
-
-type IconName = ComponentProps<typeof MaterialCommunityIcons>["name"];
 
 const LINK_TEXT = { idle: "未连接", connecting: "连接中…", online: "已连接", offline: "断开了，重连中", unauthorized: "授权失效" } as const;
 const SCALES = [
@@ -69,8 +70,12 @@ export default function SettingsScreen() {
       : !s.alertsOn
         ? "关着：只有打开 App 时才知道"
         : alerts.connected
-          ? "在线：App 关着也会提醒你"
+          ? alertsInBackground
+            ? "在线：App 关着也会提醒你"
+            : "在线：App 开着时提醒你；iOS 上关掉 App 就收不到"
           : "正在连接服务器…";
+  // iOS keeps no background connection: alerts only while the app is open.
+  const alertsTitle = alertsInBackground ? "后台提醒" : "提醒";
 
   async function leave() {
     setConfirm(false);
@@ -176,11 +181,11 @@ export default function SettingsScreen() {
         <Card style={{ paddingVertical: space.xs }}>
           <Row
             icon="bell-outline"
-            title="后台提醒"
+            title={alertsTitle}
             sub={alertsLine}
             right={
               <Toggle
-                label="后台提醒"
+                label={alertsTitle}
                 value={s.alertsOn}
                 disabled={!alertsSupported}
                 onChange={async (v) => {
@@ -261,6 +266,9 @@ export default function SettingsScreen() {
           />
         </Card>
 
+        <SectionHeader title="小羊的模型和说话方式" />
+        <AssistantConfigCard />
+
         <SectionHeader title="列表" />
         <Card style={{ paddingVertical: space.xs }}>
           <Row
@@ -278,7 +286,11 @@ export default function SettingsScreen() {
 
         <SectionHeader title="版本" />
         <Card style={{ paddingVertical: space.xs }}>
-          <UpdateRow demo={demo} />
+          {updatesSupported ? (
+            <UpdateRow demo={demo} />
+          ) : (
+            <Row icon="update" title="当前版本" sub={`v${currentVersion()}；iOS 版不在 App 里更新`} />
+          )}
         </Card>
 
         <View style={{ alignItems: "center", gap: 6, paddingTop: space.xxxl }}>
@@ -310,7 +322,42 @@ export default function SettingsScreen() {
           </Dialog.Actions>
         </Dialog>
       </Portal>
+      {/* A save made on a config screen just closed, or another phone's change. */}
+      <ConfigSnackbar message={null} onDismiss={() => undefined} />
     </PageBackground>
+  );
+}
+
+/**
+ * The assistant's models, voice and prompts, shared by every phone: one row
+ * each, saying what is in use now. Kept fresh while the tab is in view.
+ */
+function AssistantConfigCard() {
+  useConfigWatch("config");
+  useConfigWatch("prompts");
+  const config = useAssistantConfig((x) => x.config);
+  const configError = useAssistantConfig((x) => x.configError);
+  const prompts = useAssistantConfig((x) => x.prompts);
+  const promptsError = useAssistantConfig((x) => x.promptsError);
+  const main = config?.models[0];
+  const spare = (config?.models.length ?? 1) - 1;
+  const modelsLine = config
+    ? main
+      ? `${main.model}${spare ? ` · 另有 ${spare} 个备用` : " · 没有备用"}${config.warnings.length ? ` · ${config.warnings.length} 处要看一下` : ""}`
+      : "还没有模型，小羊没法回话"
+    : (configError ?? "正在读取…");
+  const v = config?.voice;
+  const voiceLine = v ? (v.provider ? `${VOICE_LABEL[v.provider]}${v.voice ? ` · ${v.voice}` : ""}${v.key.set ? "" : " · 还没有密钥"}` : "关着：不能打电话") : (configError ?? "正在读取…");
+  const edited = prompts?.filter((x) => x.edited).length ?? 0;
+  const promptsLine = prompts ? (edited ? `改过 ${edited} 段，共 ${prompts.length} 段` : `共 ${prompts.length} 段，都是默认的`) : (promptsError ?? "正在读取…");
+  return (
+    <Card style={{ paddingVertical: space.xs }}>
+      <Row icon="brain" title="模型" sub={modelsLine} dim={!config} onPress={() => router.push("/assistant-config/models")} />
+      <Divider />
+      <Row icon="account-voice" title="语音" sub={voiceLine} dim={!config} onPress={() => router.push("/assistant-config/voice")} />
+      <Divider />
+      <Row icon="text-box-edit-outline" title="提示词" sub={promptsLine} dim={!prompts} onPress={() => router.push("/assistant-config/prompts")} />
+    </Card>
   );
 }
 
@@ -362,59 +409,6 @@ function UpdateRow({ demo }: { demo: boolean }) {
         </Text>
       ) : null}
     </Row>
-  );
-}
-
-function Divider() {
-  const p = usePalette();
-  return <View style={{ height: 1, backgroundColor: p.divider, marginLeft: space.lg + 40 + space.md, marginRight: space.lg }} />;
-}
-
-/**
- * One setting: a tinted icon tile, what it is, one line of what it does, and its
- * control on the right. Bigger controls (theme tiles, sizes) go underneath as children.
- */
-function Row({
-  icon,
-  title,
-  sub,
-  right,
-  onPress,
-  tone,
-  dim,
-  children,
-}: {
-  icon: IconName;
-  title: string;
-  sub?: string;
-  right?: ReactNode;
-  onPress?: () => void;
-  tone?: "error";
-  dim?: boolean;
-  children?: ReactNode;
-}) {
-  const p = usePalette();
-  const fg = tone === "error" ? p.error : p.accentText;
-  const body = (
-    <View style={{ paddingHorizontal: space.lg, paddingVertical: space.md, opacity: dim ? 0.55 : 1 }}>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, minHeight: 44 }}>
-        <View style={{ width: 40, height: 40, borderRadius: radius.sm, backgroundColor: tone === "error" ? p.errorContainer : p.accentContainer, alignItems: "center", justifyContent: "center" }}>
-          <MaterialCommunityIcons name={icon} size={21} color={fg} />
-        </View>
-        <View style={{ flex: 1, gap: 2 }}>
-          <Text style={{ fontFamily: fonts.bodyBold, fontSize: 15.5, color: tone === "error" ? p.error : p.ink }}>{title}</Text>
-          {sub ? <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 17 }}>{sub}</Text> : null}
-        </View>
-        {right ?? (onPress ? <MaterialCommunityIcons name="chevron-right" size={22} color={p.faint} /> : null)}
-      </View>
-      {children ? <View style={{ paddingLeft: 40 + space.md }}>{children}</View> : null}
-    </View>
-  );
-  if (!onPress) return body;
-  return (
-    <Pressable accessibilityRole="button" accessibilityLabel={sub ? `${title}，${sub}` : title} onPress={onPress} android_ripple={{ color: p.surface3 }}>
-      {body}
-    </Pressable>
   );
 }
 

@@ -2,13 +2,13 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, KeyboardAvoidingView, Pressable, TextInput, View } from "react-native";
 import { Button, Dialog, Portal, Snackbar, Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import Markdown from "react-native-markdown-display";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { AssistantAction, AssistantItem } from "@herdr-pocket/protocol";
 import { BreathingDot, Card, IconTile, PageBackground, SendPill, TypingDots } from "../../components/ui";
 import { CuteIcon } from "../../components/icons";
 import { Mascot } from "../../components/Mascot";
 import { mdStyles } from "../../components/chat";
+import { Md } from "../../components/md";
 import { CallBar, CallScreen } from "../../components/CallScreen";
 import { AgentLink, NoticeBubble } from "../../components/notice";
 import { RemindersSheet } from "../../components/reminders";
@@ -44,7 +44,6 @@ export default function AssistantScreen() {
   const server = useSettings((s) => s.server);
   const call = useVoice((s) => s.status);
   const callMessage = useVoice((s) => s.message);
-  const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -55,7 +54,13 @@ export default function AssistantScreen() {
   const [callOpen, setCallOpen] = useState(true);
   const foldCall = useCallback(() => setCallOpen(false), []);
 
+  // Load when the connection or server changes. A paused tab re-runs its effects when it comes back
+  // into view; the ref (kept while paused) stops that from reloading for nothing.
+  const loadedFor = useRef<string | null>(null);
   useEffect(() => {
+    const key = `${link} ${server}`;
+    if (loadedFor.current === key) return;
+    loadedFor.current = key;
     if (link === "online" || isMockServer(server)) void loadAssistant();
   }, [link, server]);
 
@@ -68,23 +73,26 @@ export default function AssistantScreen() {
 
   const data = useMemo(() => [...items].reverse(), [items]);
 
+  /** Sends `raw`; true once the assistant has it (the composer then clears its text). */
   const send = useCallback(
-    async (raw?: string) => {
-      const t = (raw ?? text).trim();
-      if (!t || sending) return;
+    async (raw: string): Promise<boolean> => {
+      const t = raw.trim();
+      if (!t || sending) return false;
       setSending(true);
       try {
         await sendToAssistant(t);
-        if (raw === undefined) setText("");
         list.current?.scrollToOffset({ offset: 0, animated: true });
+        return true;
       } catch (e) {
         setToast((e as Error).message);
+        return false;
       } finally {
         setSending(false);
       }
     },
-    [text, sending],
+    [sending],
   );
+  const renderItem = useCallback(({ item }: { item: AssistantItem }) => <Bubble item={item} onError={setToast} />, []);
 
   async function call_() {
     setCallOpen(true);
@@ -148,16 +156,14 @@ export default function AssistantScreen() {
             keyExtractor={(it) => it.id}
             keyboardShouldPersistTaps="handled"
             contentContainerStyle={{ paddingHorizontal: space.lg, paddingVertical: space.md, gap: space.md, flexGrow: 1 }}
-            renderItem={({ item }) => <Bubble item={item} onError={setToast} />}
+            renderItem={renderItem}
             ListHeaderComponent={busy ? <Thinking label={busyLabel} /> : undefined}
           />
         )}
 
         {inCall && !callOpen ? <CallBar name={NAME} onExpand={() => setCallOpen(true)} /> : null}
         <Composer
-          text={text}
-          onText={setText}
-          onSend={() => void send()}
+          onSend={send}
           onCall={() => void call_()}
           sending={sending}
           voice={voice || isMockServer(server)}
@@ -261,7 +267,7 @@ function Thinking({ label }: { label: string | null }) {
 const Bubble = memo(function Bubble({ item, onError }: { item: AssistantItem; onError: (m: string) => void }) {
   const p = usePalette();
   const scale = useSettings((s) => s.textScale);
-  const styles = useMemo(() => mdStyles(p, scale), [p, scale]);
+  const styles = mdStyles(p, scale);
 
   if (item.action) return <ActionCard item={item} onError={onError} />;
 
@@ -284,7 +290,7 @@ const Bubble = memo(function Bubble({ item, onError }: { item: AssistantItem; on
         {item.via === "voice" ? (
           <Text style={{ color: p.ink, fontSize: 15.5 * scale, lineHeight: 22 * scale, paddingVertical: 5 }}>{item.text}</Text>
         ) : (
-          <Markdown style={styles}>{fixCjkEmphasis(item.text || "…")}</Markdown>
+          <Md style={styles}>{fixCjkEmphasis(item.text || "…")}</Md>
         )}
       </View>
       {item.steps?.length ? (
@@ -416,24 +422,22 @@ function SaidLine({ said }: { said: string }) {
   );
 }
 
+/** Holds what is being typed itself, so a keystroke re-renders only the composer, not the chat. */
 function Composer({
-  text,
-  onText,
   onSend,
   onCall,
   sending,
   voice,
   inCall,
 }: {
-  text: string;
-  onText: (t: string) => void;
-  onSend: () => void;
+  onSend: (text: string) => Promise<boolean>;
   onCall: () => void;
   sending: boolean;
   voice: boolean;
   inCall: boolean;
 }) {
   const p = usePalette();
+  const [text, setText] = useState("");
   const empty = !text.trim();
   return (
     <View
@@ -457,7 +461,7 @@ function Composer({
     >
       <TextInput
         value={text}
-        onChangeText={onText}
+        onChangeText={setText}
         placeholder={`和${NAME}说点什么…`}
         placeholderTextColor={p.faint}
         multiline
@@ -467,7 +471,7 @@ function Composer({
       {empty && voice && !inCall ? (
         <IconTile icon="mic" tone="primary" size={42} onPress={onCall} a11y={`和${NAME}语音通话`} />
       ) : (
-        <SendPill disabled={empty || sending} onPress={onSend} />
+        <SendPill disabled={empty || sending} onPress={() => void onSend(text).then((sent) => sent && setText(""))} />
       )}
     </View>
   );

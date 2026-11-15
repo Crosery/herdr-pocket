@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { View } from "react-native";
 import { router, Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
@@ -73,7 +73,8 @@ function Navigator() {
           contentStyle: { backgroundColor: p.page },
         }}
       >
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+        {/* Paused while an agent or another screen covers it: snapshots render it later, its animations stop. */}
+        <Stack.Screen name="(tabs)" options={{ headerShown: false }} activityEnabled={1} />
         <Stack.Screen name="connect" options={{ headerShown: false, gestureEnabled: false }} />
         <Stack.Screen name="scan" options={{ title: "扫一扫", animation: "slide_from_bottom" }} />
         <Stack.Screen name="pair" options={{ title: "连接", animation: "fade" }} />
@@ -96,17 +97,15 @@ export default function RootLayout() {
     [fonts.monoBold]: require("../../assets/fonts/MapleMono-Bold.ttf"),
   });
   const hydrated = useSettings((s) => s.hydrated);
-  const [ready, setReady] = useState(false);
+  // Neither goes back once true, so this stays true once reached.
+  const ready = (loaded || !!error) && hydrated;
 
   // The phone's own log goes to the relay every minute and when the app is put away.
   useEffect(() => startAppLog(), []);
 
   useEffect(() => {
-    if ((loaded || error) && hydrated) {
-      setReady(true);
-      SplashScreen.hideAsync().catch(() => undefined);
-    }
-  }, [loaded, error, hydrated]);
+    if (ready) SplashScreen.hideAsync().catch(() => undefined);
+  }, [ready]);
 
   if (!ready) return null;
   return (

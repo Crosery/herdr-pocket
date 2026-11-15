@@ -7,13 +7,13 @@ import { memo, useMemo } from "react";
 import { Pressable, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router } from "expo-router";
-import Markdown from "react-native-markdown-display";
 import type { AssistantItem, Notice } from "@herdr-pocket/protocol";
 import { findAgent, useSettings } from "../lib/store";
 import { fixCjkEmphasis } from "../lib/markdown";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
 import { mdStyles } from "./chat";
+import { Md } from "./md";
 import { CuteIcon, type CuteIconName } from "./icons";
 
 /** Icon and colours for what the assistant found; older notices only carry their kind. Same icon family as the agent status chips. */
@@ -89,7 +89,7 @@ export const NoticeBubble = memo(function NoticeBubble({ item }: { item: Assista
             {n.body}
           </Text>
         ) : null}
-        {details ? <Markdown style={styles}>{fixCjkEmphasis(details)}</Markdown> : null}
+        {details ? <Md style={styles}>{fixCjkEmphasis(details)}</Md> : null}
         {agent ? <AgentLink agentKey={agent.key} /> : null}
       </View>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 4 }}>

@@ -1,6 +1,7 @@
 /**
- * Background alerts: a resident Android service keeps /v1/notify open and posts
- * a notification when an agent needs you, finishes, or a reminder is due.
+ * Alerts: the native side keeps /v1/notify open and posts a notification when an
+ * agent needs you, finishes, or a reminder is due. On Android a resident service
+ * does it with the app closed too; on iOS only while the app is open (no push).
  */
 import { useEffect } from "react";
 import { PermissionsAndroid, Platform } from "react-native";
@@ -11,6 +12,9 @@ import { loadToken } from "./auth";
 import { isMockServer } from "./mock";
 
 export const alertsSupported = !!PocketNative;
+
+/** Alerts keep arriving with the app closed: Android's resident service. iOS would need push notifications. */
+export const alertsInBackground = Platform.OS === "android";
 
 interface AlertsState {
   connected: boolean;
@@ -26,10 +30,17 @@ export function refreshAlertState() {
   useAlerts.setState({ connected: s.connected, notificationsAllowed: s.notificationsAllowed, batteryUnrestricted: s.batteryUnrestricted });
 }
 
-PocketNative?.addListener("onNotifier", (e) => useAlerts.setState({ connected: e.connected }));
+PocketNative?.addListener("onNotifier", (e) =>
+  useAlerts.setState({ connected: e.connected, ...(e.notificationsAllowed !== undefined ? { notificationsAllowed: e.notificationsAllowed } : {}) }),
+);
 
-/** Asks for the notification permission (Android 13+). */
+/** Asks for the notification permission (Android 13+, iOS). */
 export async function askNotificationPermission(): Promise<boolean> {
+  if (Platform.OS === "ios") {
+    const ok = (await PocketNative?.requestNotificationPermission?.().catch(() => false)) ?? false;
+    refreshAlertState();
+    return ok;
+  }
   if (Platform.OS !== "android") return false;
   if (Number(Platform.Version) < 33) return true;
   const r = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);

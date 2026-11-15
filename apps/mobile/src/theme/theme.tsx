@@ -1,10 +1,10 @@
-import { createContext, useContext, useEffect, useMemo, type ReactNode } from "react";
+import { createContext, useContext, useDeferredValue, useEffect, useMemo, type ReactNode } from "react";
 import * as SystemUI from "expo-system-ui";
 import { useColorScheme } from "react-native";
 import { MD3DarkTheme, MD3LightTheme, PaperProvider, type MD3Theme } from "react-native-paper";
 import type { MD3Type } from "react-native-paper/lib/typescript/types";
 import { useSettings } from "../lib/store";
-import { fonts, makePalette, radius, type Palette } from "./tokens";
+import { fonts, makePalette, type Palette } from "./tokens";
 
 const PaletteContext = createContext<Palette>(makePalette(false));
 
@@ -80,7 +80,9 @@ function paperTheme(p: Palette): MD3Theme {
 export function ThemeRoot({ children }: { children: ReactNode }) {
   const scheme = useColorScheme();
   const mode = useSettings((s) => s.themeMode);
-  const dark = mode === "system" ? scheme === "dark" : mode === "dark";
+  // A new look re-renders everything on screen. Deferred, the tap that picked it is answered
+  // first (the tile shows it selected) and the new colours follow as one interruptible render.
+  const dark = useDeferredValue(mode === "system" ? scheme === "dark" : mode === "dark");
   const palette = useMemo(() => makePalette(dark), [dark]);
   const theme = useMemo(() => paperTheme(palette), [palette]);
   useEffect(() => {

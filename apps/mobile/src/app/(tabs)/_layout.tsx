@@ -41,7 +41,10 @@ export default function TabsLayout() {
 
   return (
     <>
+      {/* Tabs not in view are paused (React Activity, Expo Router's replacement for freezeOnBlur): a theme
+          switch or a relay snapshot renders them after the visible tab, and their animations stop. */}
       <Tabs
+        activityEnabled
         screenOptions={{
           headerShown: false,
           tabBarHideOnKeyboard: true,

@@ -6,6 +6,8 @@ import { useSettings } from "./store";
 
 /** The phone's own model name, so several phones are tellable apart in the device list. */
 export function defaultDeviceName(): string {
+  // iOS does not tell apps the model's name: only whether it is a phone or a pad.
+  if (Platform.OS === "ios") return (Platform.constants as { interfaceIdiom?: string }).interfaceIdiom === "pad" ? "我的 iPad" : "我的 iPhone";
   const c = Platform.constants as { Model?: string; Brand?: string };
   const model = c.Model?.trim();
   if (!model) return "我的安卓手机";

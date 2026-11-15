@@ -1,0 +1,186 @@
+# iOS: build the app on a macOS 26 runner, run it in the simulator in demo mode (no relay, no
+# network) and keep screenshots, and archive an unsigned device build. Nothing is signed or published.
+name: ios
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["ios/**"]
+    paths:
+      - apps/mobile/**
+      - packages/protocol/**
+      - .github/workflows/ios.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Expo SDK 58 needs Xcode 26.4 or newer; pin it rather than follow the image default.
+  XCODE_APP: /Applications/Xcode_26.6.app
+  APP_ID: dev.crosery.herdrpocket
+
+jobs:
+  simulator:
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+      # The pnpm version comes from "packageManager" in package.json.
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/mobile/pnpm-lock.yaml
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version | tee /dev/stderr | grep -q "^Xcode 26.6"
+          xcrun simctl list runtimes
+      # apps/mobile is outside the root workspace: it installs from its own lockfile.
+      - name: Native project
+        working-directory: apps/mobile
+        run: |
+          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm exec expo prebuild --platform ios --no-install
+          cd ios && pod install
+      # Release embeds the JS bundle, so the app runs without Metro. The simulator build is
+      # signed "to run locally" (ad hoc, no team or certificate).
+      - name: Build for the simulator
+        working-directory: apps/mobile/ios
+        run: |
+          xcodebuild -workspace HerdrPocket.xcworkspace -scheme HerdrPocket -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' ARCHS=arm64 \
+            -derivedDataPath "$RUNNER_TEMP/dd" -quiet build
+          app="$RUNNER_TEMP/dd/Build/Products/Release-iphonesimulator/HerdrPocket.app"
+          codesign -dv "$app" 2>&1 | grep -E "^(Identifier|Signature)" || true
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/HerdrPocket-simulator.zip"
+      - name: Screenshots in demo mode
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/dd/Build/Products/Release-iphonesimulator/HerdrPocket.app"
+          shots="$RUNNER_TEMP/shots"
+          mkdir -p "$shots"
+
+          # The newest iOS runtime; an iPhone 17 Pro there, or else the first iPhone.
+          udid=$(xcrun simctl list -j devices available | python3 -c '
+          import json, re, sys
+          devices = json.load(sys.stdin)["devices"]
+          def version(k):
+              m = re.search(r"iOS-(\d+)-(\d+)", k)
+              return tuple(map(int, m.groups())) if m else (0, 0)
+          for runtime in sorted((k for k in devices if "iOS" in k), key=version, reverse=True):
+              phones = [d for d in devices[runtime] if d["name"].startswith("iPhone")]
+              pick = next((d for d in phones if d["name"] == "iPhone 17 Pro"), phones[0] if phones else None)
+              if pick:
+                  print(runtime, pick["name"], file=sys.stderr)
+                  print(pick["udid"])
+                  break
+          ')
+          [ -n "$udid" ] || { echo "no iPhone simulator found"; exit 1; }
+
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 || true
+          xcrun simctl ui "$udid" appearance light
+          xcrun simctl install "$udid" "$app"
+          xcrun simctl spawn "$udid" log stream --style compact --predicate 'process == "HerdrPocket"' >"$shots/app.log" 2>&1 &
+          logger=$!
+
+          # grep without -q reads to the end, so pipefail does not see launchctl cut off.
+          alive() { xcrun simctl spawn "$udid" launchctl list | grep "UIKitApplication:$APP_ID" >/dev/null; }
+          crashed=0
+          # One screen that fails to open or capture must not cost the rest.
+          shot() {
+            sleep "${2:-4}"
+            xcrun simctl io "$udid" screenshot "$shots/$1.png" >/dev/null || echo "::warning::no screenshot for $1"
+            if ! alive; then echo "::error::the app is not running after $1"; crashed=1; fi
+          }
+          go() { xcrun simctl openurl "$udid" "$1" || echo "::warning::could not open $1"; }
+
+          # A fresh install opens on the connect screen.
+          xcrun simctl launch "$udid" "$APP_ID"
+          shot 01-connect-light 12
+          xcrun simctl ui "$udid" appearance dark
+          shot 01-connect-dark 3
+          xcrun simctl ui "$udid" appearance light
+
+          # The demo server: everything below is mock data inside the app.
+          go "herdrpocket://pair?server=mock%3A%2F%2Fdemo&code=DEMO"
+          shot 02-paired 2
+          sleep 4
+
+          agent=dev_macbook%2Fhc%3At47
+          for mode in light dark; do
+            xcrun simctl ui "$udid" appearance "$mode"
+            go "herdrpocket://";                         shot "03-assistant-$mode" 5
+            go "herdrpocket://agents";                   shot "04-agents-$mode"
+            go "herdrpocket://devices";                  shot "05-devices-$mode"
+            go "herdrpocket://agent/$agent";             shot "06-agent-chat-$mode" 5
+            go "herdrpocket://agent/$agent?tab=terminal"; shot "07-agent-terminal-$mode" 5
+            go "herdrpocket://settings";                 shot "08-settings-$mode"
+            go "herdrpocket://assistant-config/models";  shot "09-config-models-$mode"
+            go "herdrpocket://assistant-config/voice";   shot "10-config-voice-$mode"
+            go "herdrpocket://assistant-config/prompts"; shot "11-config-prompts-$mode"
+          done
+
+          kill "$logger" 2>/dev/null || true
+          cp ~/Library/Logs/DiagnosticReports/HerdrPocket* "$shots/" 2>/dev/null || true
+          {
+            echo "### Simulator screenshots"
+            ls "$shots" | sed 's/^/- /'
+          } >>"$GITHUB_STEP_SUMMARY"
+          [ "$crashed" = 0 ]
+      - uses: actions/upload-artifact@v7
+        with:
+          name: herdr-pocket-ios-simulator-app
+          path: ${{ runner.temp }}/HerdrPocket-simulator.zip
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: herdr-pocket-ios-screenshots
+          path: ${{ runner.temp }}/shots
+          if-no-files-found: warn
+          retention-days: 14
+
+  device:
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/mobile/pnpm-lock.yaml
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version | tee /dev/stderr | grep -q "^Xcode 26.6"
+      - name: Native project
+        working-directory: apps/mobile
+        run: |
+          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm exec expo prebuild --platform ios --no-install
+          cd ios && pod install
+      # Unsigned: it proves the device build compiles and links; installing it needs signing elsewhere.
+      - name: Archive for devices, unsigned
+        working-directory: apps/mobile/ios
+        run: |
+          xcodebuild archive -workspace HerdrPocket.xcworkspace -scheme HerdrPocket -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/HerdrPocket.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" -quiet
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/HerdrPocket.xcarchive" "$RUNNER_TEMP/HerdrPocket-unsigned.xcarchive.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: herdr-pocket-ios-unsigned-xcarchive
+          path: ${{ runner.temp }}/HerdrPocket-unsigned.xcarchive.zip
+          if-no-files-found: error
+          retention-days: 14

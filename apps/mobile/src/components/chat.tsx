@@ -1,7 +1,6 @@
-import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Image, Pressable, ScrollView, View, type ListRenderItem } from "react-native";
 import { ActivityIndicator, Button, Snackbar, Text } from "react-native-paper";
-import Markdown from "react-native-markdown-display";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
@@ -14,6 +13,7 @@ import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
 import { EmptyState, TypingDots } from "./ui";
+import { Md } from "./md";
 import { ReplyDots, SendMark } from "./outbox";
 import { BusyMascot, Sparkle } from "./Mascot";
 import { CuteIcon } from "./icons";
@@ -36,7 +36,7 @@ export type Row =
   | { type: "thinking"; id: string; text: string }
   | { type: "tool"; id: string; call: ToolCall; result?: ToolResult }
   /** A run of tool calls folded into one line. */
-  | { type: "tools"; id: string; items: Array<Extract<Row, { type: "tool" }>> }
+  | { type: "tools"; id: string; items: Extract<Row, { type: "tool" }>[] }
   /** Sent from this phone, not yet echoed by the session. */
   | { type: "pending"; id: string; text: string; ts: number; pictures?: string[]; send: PendingSend; agentKey: string }
   | { type: "turn_end"; id: string; ts: number }
@@ -87,7 +87,7 @@ export function foldEvents(events: ConvEvent[]): Row[] {
 /** Fold each run of two or more tool calls into one "tools" row so replies are not buried under tool cards. */
 function groupTools(rows: Row[]): Row[] {
   const out: Row[] = [];
-  let run: Array<Extract<Row, { type: "tool" }>> = [];
+  let run: Extract<Row, { type: "tool" }>[] = [];
   const flush = () => {
     if (run.length >= 2) out.push({ type: "tools", id: `g-${run[0]!.id}`, items: run });
     else out.push(...run);
@@ -185,7 +185,18 @@ function toolTint(name: string, p: Palette): { bg: string; fg: string } {
 // Rows
 // ---------------------------------------------------------------------------
 
+const mdCache = new WeakMap<Palette, Map<number, ReturnType<typeof makeMdStyles>>>();
+
+/** Markdown styles for a look; the same object for the same palette and scale, so every bubble shares one renderer (see `Md`). */
 export function mdStyles(p: Palette, scale: number) {
+  let byScale = mdCache.get(p);
+  if (!byScale) mdCache.set(p, (byScale = new Map()));
+  let s = byScale.get(scale);
+  if (!s) byScale.set(scale, (s = makeMdStyles(p, scale)));
+  return s;
+}
+
+function makeMdStyles(p: Palette, scale: number) {
   const base = 15.5 * scale;
   return {
     body: { color: p.ink, fontFamily: fonts.body, fontSize: base, lineHeight: base * 1.55 },
@@ -311,7 +322,7 @@ const SubCtx = createContext<{ byCall: Map<string, SubSession>; open: (s: SubSes
 const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
   const p = usePalette();
   const scale = useSettings((s) => s.textScale);
-  const styles = useMemo(() => mdStyles(p, scale), [p, scale]);
+  const styles = mdStyles(p, scale);
   const md = useMemo(() => fixCjkEmphasis(text), [text]);
   return (
     <View
@@ -330,7 +341,7 @@ const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) 
         shadowOffset: { width: 0, height: 3 },
       }}
     >
-      <Markdown style={styles}>{md}</Markdown>
+      <Md style={styles}>{md}</Md>
     </View>
   );
 });
@@ -428,7 +439,7 @@ function ToolCard({ call: c, result, bare }: { call: ToolCall; result?: ToolResu
 }
 
 /** A run of tool calls on one line; tap to list them, tap one to see its input and output. */
-function ToolGroup({ items: tools }: { items: Array<Extract<Row, { type: "tool" }>> }) {
+function ToolGroup({ items: tools }: { items: Extract<Row, { type: "tool" }>[] }) {
   const p = usePalette();
   const [open, setOpen] = useState(false);
   const subs = useContext(SubCtx);
@@ -520,6 +531,13 @@ function TurnEnd({ ts }: { ts?: number }) {
   );
 }
 
+const ROW_GAP = { height: space.md };
+
+/** Space between chat rows; a fixed component, so a list re-render does not remount every separator. */
+function RowGap() {
+  return <View style={ROW_GAP} />;
+}
+
 const renderRow: ListRenderItem<Row> = ({ item }) => {
   switch (item.type) {
     case "user":
@@ -582,31 +600,36 @@ export function ChatView({
   const [liveEvents, setLiveEvents] = useState<ConvEvent[]>([]);
   const [streamState, setStreamState] = useState<"connecting" | "live" | "stale" | "error">("connecting");
   const linkOnline = useLive((s) => s.link === "online");
-  useEffect(() => {
-    setLiveEvents([]);
-    setOlder([]);
-    setOlderCursor(undefined);
-  }, [agent.key, sub]);
-  useEffect(() => {
+  // Another conversation starts empty, and each newest page the query brings is merged in. Done while
+  // rendering (React's way to adjust state to new props), so a frame never shows the old conversation.
+  const conv = `${agent.key}\n${sub ?? ""}`;
+  const [synced, setSynced] = useState<{ conv: string; page: typeof q.data }>({ conv, page: undefined });
+  if (synced.conv !== conv || synced.page !== q.data) {
+    const fresh = synced.conv !== conv;
+    setSynced({ conv, page: q.data });
+    let next = fresh ? [] : liveEvents;
+    if (fresh) {
+      setOlder([]);
+      setOlderCursor(undefined);
+      setStreamState("connecting");
+    }
     const page = q.data?.events;
-    if (!page?.length) return;
-    setLiveEvents((old) => {
+    if (page?.length) {
       const oldestNew = posOf(page[0]!);
-      const newestOld = old.length ? posOf(old[old.length - 1]!) : null;
+      const newestOld = next.length ? posOf(next[next.length - 1]!) : null;
       // The page no longer touches what we hold (long time away): what lies between is unknown, so start over from the page.
-      if (newestOld !== null && oldestNew !== null && oldestNew > newestOld && !old.some((e) => e.id === page[0]!.id)) {
+      if (newestOld !== null && oldestNew !== null && oldestNew > newestOld && !next.some((e) => e.id === page[0]!.id)) {
         setOlder([]);
         setOlderCursor(undefined);
-        return page;
-      }
-      return mergeEvents(old, page);
-    });
-  }, [q.data]);
+        next = page;
+      } else next = mergeEvents(next, page);
+    }
+    if (next !== liveEvents) setLiveEvents(next);
+  }
   const [attempt, setAttempt] = useState(0);
   const failures = useRef(0);
   useEffect(() => {
     if (!active) return;
-    setStreamState("connecting");
     let opened = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
     const stop = subscribe(agent.deviceId, "session", { agent: agent.key, sub }, (event) => {
@@ -625,7 +648,10 @@ export function ChatView({
         opened = true;
       } else {
         // Refused, or ended because the computer went away: try again a little later.
-        retry ??= setTimeout(() => setAttempt((n) => n + 1), Math.min(30_000, 3000 * 2 ** failures.current++));
+        retry ??= setTimeout(() => {
+          setStreamState("connecting");
+          setAttempt((n) => n + 1);
+        }, Math.min(30_000, 3000 * 2 ** failures.current++));
       }
     });
     return () => {
@@ -655,7 +681,7 @@ export function ChatView({
   // Messages sent from this phone show at once and give way to the session's own copy (lib/outbox).
   const sendsAll = usePending((s) => (sub ? undefined : s.byAgent[agent.key]));
   const patchSend = usePending((s) => s.update);
-  const [nowTick, setNowTick] = useState(Date.now());
+  const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
     if (!sendsAll?.length && agent.status !== "working") return;
     const t = setInterval(() => setNowTick(Date.now()), 5000);
@@ -688,16 +714,22 @@ export function ChatView({
   const toTopUntil = useRef(0);
   const [jumping, setJumping] = useState<{ loaded: number } | null>(null);
   const [capped, setCapped] = useState(false);
-  // Inverted list: offset 0 is the newest message.
-  const [view, setView] = useState({ y: 0, h: 0, content: 0 });
-  const atBottom = view.y < 48;
-  const atTop = !more && view.content > 0 && view.y + view.h >= view.content - 48;
+  // Inverted list: offset 0 is the newest message. The offset lives in a ref and only crossing
+  // an edge re-renders, so scrolling does not re-render the whole conversation every 64 ms.
+  const view = useRef({ y: 0, h: 0, content: 0 });
+  const [edges, setEdges] = useState({ bottom: true, end: false });
+  const measureEdges = useCallback(() => {
+    const { y, h, content } = view.current;
+    const bottom = y < 48;
+    const end = content > 0 && y + h >= content - 48;
+    setEdges((e) => (e.bottom === bottom && e.end === end ? e : { bottom, end }));
+  }, []);
+  const atBottom = edges.bottom;
+  const atTop = !more && edges.end;
   // Unread: the newest row id when the user left the bottom; rows above it are new.
   const [anchorId, setAnchorId] = useState<string | null>(null);
-  useEffect(() => {
-    if (atBottom) setAnchorId(null);
-    else if (!anchorId && rows[0]) setAnchorId(rows[0].id);
-  }, [atBottom, anchorId, rows]);
+  const anchorNow = atBottom ? null : (anchorId ?? rows[0]?.id ?? null);
+  if (anchorNow !== anchorId) setAnchorId(anchorNow);
   const unread = anchorId ? Math.max(0, rows.findIndex((r) => r.id === anchorId)) : 0;
 
   /** Fetch one older page; returns the next cursor (null at the beginning). */
@@ -788,7 +820,7 @@ export function ChatView({
           data={rows}
           keyExtractor={(r) => r.id}
           renderItem={renderRow}
-          ItemSeparatorComponent={() => <View style={{ height: space.md }} />}
+          ItemSeparatorComponent={RowGap}
           contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: bottomInset + space.md, paddingBottom: space.lg }}
           // Inverted: the list "end" is the top of the conversation. Older pages append there,
           // so the visible content keeps its offset from the bottom and nothing jumps.
@@ -796,7 +828,8 @@ export function ChatView({
           onEndReachedThreshold={1.5}
           onScroll={(e) => {
             const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
-            setView({ y: contentOffset.y, h: layoutMeasurement.height, content: contentSize.height });
+            view.current = { y: contentOffset.y, h: layoutMeasurement.height, content: contentSize.height };
+            measureEdges();
           }}
           scrollEventThrottle={64}
           onContentSizeChange={() => {
