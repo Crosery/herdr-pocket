@@ -19,7 +19,7 @@ import {
   callStateName,
   type CallState,
 } from "./demo";
-import { $, $$, h, loopWhileVisible, reducedMotion, finePointer, isNarrow, slowNetwork, sleep, copyText, toast, renderQr } from "./util";
+import { $, $$, h, loopWhileVisible, reducedMotion, finePointer, isNarrow, sleep, copyText, toast, renderQr } from "./util";
 
 // ------------------------------------------------------------------ vendors marquee
 export function initMarquee(): void {
@@ -512,93 +512,91 @@ export function initFaq(): void {
 }
 
 // ------------------------------------------------------------------ video
+// The film plays by itself, muted and looping, while it is on screen, and pauses when it
+// leaves. It is HLS in 4-second segments: the browser's own player where it has one
+// (Safari, iOS), hls.js elsewhere, fetched only when the section comes near. Segments
+// arrive a few seconds ahead of the film, not all at once, and the player picks the size.
 export function initVideo(): void {
   const frame = $("#video-frame")!;
   const video = $<HTMLVideoElement>("#intro-video")!;
-  const play = $("#video-play")!;
-  // The poster loads only once the section comes near, not with the first screen.
+
+  let loading: Promise<boolean> | undefined;
+  const load = () =>
+    (loading ??= (async () => {
+      video.poster = SITE.video.poster;
+      frame.style.backgroundImage = `url("${SITE.video.poster}")`;
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.preload = "auto";
+        video.src = SITE.video.hls;
+        return true;
+      }
+      try {
+        const { default: Hls } = await import("hls.js/light");
+        if (!Hls.isSupported()) return false;
+        const hls = new Hls({ capLevelToPlayerSize: true, maxBufferLength: 12, maxMaxBufferLength: 24 });
+        let retries = 3;
+        hls.on(Hls.Events.ERROR, (_e, d) => {
+          if (!d.fatal || retries-- <= 0) return;
+          if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+          else hls.startLoad();
+        });
+        hls.loadSource(SITE.video.hls);
+        hls.attachMedia(video);
+        return true;
+      } catch {
+        return false; // the poster stays
+      }
+    })());
+
+  let inView = false;
+  let fromStart = false;
+  const sync = async () => {
+    if (!inView || document.hidden) {
+      video.pause();
+      return;
+    }
+    if (!(await load()) || !inView || document.hidden) return;
+    // Reduced motion: nothing moves until the visitor starts it.
+    if (reducedMotion()) {
+      video.controls = true;
+      return;
+    }
+    if (fromStart) {
+      fromStart = false;
+      video.currentTime = 0;
+    }
+    video.play().catch((err: unknown) => {
+      // Autoplay refused (iOS Low Power Mode, a browser setting): let the visitor start it.
+      if (err instanceof DOMException && err.name === "NotAllowedError") video.controls = true;
+    });
+  };
+
   const near = new IntersectionObserver(
     ([e]) => {
       if (!e.isIntersecting) return;
       near.disconnect();
-      video.poster = SITE.video.poster;
-      frame.style.backgroundImage = `url("${SITE.video.poster}")`;
+      void load();
     },
-    { rootMargin: "800px 0px" },
+    { rootMargin: "600px 0px" },
   );
   near.observe(frame);
+  new IntersectionObserver(
+    ([e]) => {
+      inView = e.intersectionRatio >= 0.3;
+      void sync();
+    },
+    { threshold: [0, 0.3] },
+  ).observe(frame);
+  document.addEventListener("visibilitychange", () => void sync());
 
-  // Quality: 720p (about a third of the size) on phones and slow connections,
-  // 1080p on desktops; either way the other one is a tap away.
-  type Q = "sd" | "hd";
-  const qBtns = $$<HTMLButtonElement>("#video-q button");
-  let q: Q = finePointer() && !isNarrow() && !slowNetwork() ? "hd" : "sd";
-  const url = () => (q === "hd" ? SITE.video.src : SITE.video.srcSd);
-  const markQ = () =>
-    qBtns.forEach((b) => {
-      b.classList.toggle("is-on", b.dataset.q === q);
-      b.setAttribute("aria-pressed", String(b.dataset.q === q));
-    });
-  markQ();
-  qBtns.forEach((b) =>
-    b.addEventListener("click", () => {
-      if (b.dataset.q === q) return;
-      q = b.dataset.q as Q;
-      markQ();
-      if (!video.getAttribute("src")) return;
-      // switch mid-film: keep the position and the playing state
-      const at = video.currentTime;
-      const playing = !video.paused;
-      video.src = url();
-      video.currentTime = at;
-      if (playing) video.play().catch(() => {});
-    }),
-  );
-
-  const showPoster = () => {
-    near.disconnect();
-    video.poster = SITE.video.poster;
-    frame.style.backgroundImage = `url("${SITE.video.poster}")`;
-  };
-  // Native controls only while the film plays; before that and at the end, the big button.
-  video.controls = false;
-  const start = (quiet = false) => {
-    showPoster();
-    if (!video.getAttribute("src")) video.src = url();
-    frame.classList.add("is-playing");
-    video.controls = true;
-    video.play().catch(() => {
-      frame.classList.remove("is-playing");
-      video.controls = false;
-      if (!quiet) toast(t("视频暂时无法播放", "The video can't play right now"));
-    });
-  };
-  play.addEventListener("click", () => start());
-  // "Watch the intro" in the hero: the link scrolls here (Lenis or the touch glide in
-  // main.ts); the film starts once it is in view. The click counts as the user's
-  // go-ahead for sound; a browser that still says no leaves the play button showing.
+  // "Watch the intro" in the hero scrolls here (Lenis or the touch glide in main.ts);
+  // the film then plays from the beginning.
   $$("[data-play-video]").forEach((a) =>
     a.addEventListener("click", () => {
-      showPoster();
-      if (!video.getAttribute("src")) video.src = url();
-      video.preload = "auto";
-      let done = false;
-      const go = () => {
-        if (done) return;
-        done = true;
-        seen.disconnect();
-        clearTimeout(fallback);
-        start(true);
-      };
-      const seen = new IntersectionObserver(([e]) => e.intersectionRatio >= 0.6 && go(), { threshold: [0, 0.6, 1] });
-      seen.observe(frame);
-      const fallback = window.setTimeout(go, 2500);
+      fromStart = true;
+      void load();
     }),
   );
-  video.addEventListener("ended", () => {
-    frame.classList.remove("is-playing");
-    video.controls = false;
-  });
 }
 
 // ------------------------------------------------------------------ nav

@@ -88,13 +88,19 @@ cd video
 pnpm install
 pnpm assets       # copies ../public/assets and ../src/fonts into video/public
 pnpm studio       # live preview in the browser
-pnpm render       # -> ../public/video/intro.mp4, intro-720.mp4, intro-poster.webp, ../public/og.jpg
+pnpm render       # -> ../public/video/hls/, intro-poster.webp, ../public/og.jpg
 ```
 
-Rendering uses an installed Google Chrome when found (or the browser in
-`REMOTION_BROWSER`), so Remotion does not need to download its headless shell.
+Rendering uses Remotion's Chrome Headless Shell, downloaded on the first run.
+A full Google Chrome sometimes captures a frame before it has finished drawing it,
+and those frames flash in the film; `scripts/check-frames.mjs` stops the render
+if one gets through. `REMOTION_BROWSER` picks another browser anyway, and
 `CONCURRENCY` sets parallel tabs (default 4). The film reuses the site's
 `src/styles/phone.css`, so phone screens look the same in both.
+
+The film is published as HLS: `video/hls/master.m3u8` lists a 720p and a 1080p
+stream in 4-second segments. The page plays it muted and looping while it is on
+screen, with Safari's own HLS player or with hls.js (loaded only where needed).
 
 ## License
 
