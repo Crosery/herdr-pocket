@@ -1,6 +1,7 @@
-import { Redirect, Tabs } from "expo-router";
+import { Activity, useEffect, useState, type ReactNode } from "react";
+import { Redirect, Tabs, useIsFocused } from "expo-router";
 import type { BottomTabBarButtonProps } from "expo-router/js-tabs";
-import { Pressable, View } from "react-native";
+import { NativeComponentRegistry, Pressable, View, type ViewStyle } from "react-native";
 import { CuteIcon, type CuteIconName } from "../../components/icons";
 import { useSettings, useLive, allAgents } from "../../lib/store";
 import { useAssistant } from "../../lib/assistant";
@@ -31,6 +32,46 @@ function TabButton({ ref: _ref, href: _href, android_ripple: _ripple, pressColor
   );
 }
 
+/**
+ * The views of a paused tab stay on screen: React pauses an Activity by giving its top view
+ * display: none, and this view turns any display into "contents" (as Expo Router's own
+ * activityEnabled does), so a tab shows at once while it is still being resumed.
+ */
+const PausedContents = NativeComponentRegistry.get<{ style: ViewStyle; children: ReactNode }>("HerdrPocketPausedContents", () => ({
+  uiViewClassName: "RCTView",
+  // @ts-expect-error: React Native's attribute types do not list nested style processors.
+  validAttributes: { style: { display: { process: () => "contents" } } },
+}));
+const CONTENTS: ViewStyle = { display: "contents" };
+
+/**
+ * Tabs not in view are paused (React Activity): their effects, timers and animations stop, and a
+ * theme switch or relay snapshot does not render them. Pausing and resuming wait two frames after
+ * the switch: resuming re-attaches the effects of a whole screen, which for a long agent list took
+ * longer than the switch itself, so the tab is drawn first and resumes right after.
+ */
+function PauseWhenHidden({ children }: { children: ReactNode }) {
+  const focused = useIsFocused();
+  const [mode, setMode] = useState<"visible" | "hidden">(focused ? "visible" : "hidden");
+  useEffect(() => {
+    const next = focused ? "visible" : "hidden";
+    let second = 0;
+    const first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => setMode(next));
+    });
+    return () => {
+      cancelAnimationFrame(first);
+      cancelAnimationFrame(second);
+    };
+  }, [focused]);
+  return (
+    <Activity mode={mode}>
+      <PausedContents style={CONTENTS}>{children}</PausedContents>
+    </Activity>
+  );
+}
+const pauseWhenHidden = ({ children }: { children: ReactNode }) => <PauseWhenHidden>{children}</PauseWhenHidden>;
+
 export default function TabsLayout() {
   const p = usePalette();
   const server = useSettings((s) => s.server);
@@ -41,10 +82,8 @@ export default function TabsLayout() {
 
   return (
     <>
-      {/* Tabs not in view are paused (React Activity, Expo Router's replacement for freezeOnBlur): a theme
-          switch or a relay snapshot renders them after the visible tab, and their animations stop. */}
       <Tabs
-        activityEnabled
+        screenLayout={pauseWhenHidden}
         screenOptions={{
           headerShown: false,
           tabBarHideOnKeyboard: true,

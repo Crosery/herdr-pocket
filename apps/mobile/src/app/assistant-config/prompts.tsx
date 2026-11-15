@@ -38,7 +38,8 @@ export default function PromptsScreen() {
   return (
     <PageBackground>
       {header}
-      <ScrollView contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: space.md, paddingBottom: space.xxxl }}>
+      {/* contentInsetAdjustmentBehavior: iOS keeps the last row clear of the home indicator; Android ignores it. */}
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: space.md, paddingBottom: space.xxxl }}>
         <Text style={{ color: p.muted, fontSize: 13.5, lineHeight: 20, paddingHorizontal: space.xs }}>
           小羊怎么说话、怎么办事，都写在这里。改了从下一条消息或下一通电话开始生效，所有手机都一样。{edited ? `现在改过 ${edited} 段。` : "现在都是默认的。"}
         </Text>

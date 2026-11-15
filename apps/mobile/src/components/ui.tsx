@@ -166,24 +166,26 @@ export function Card({
       onPress={onPress}
       onLongPress={onLongPress}
       style={outerStyle}
-      onPressIn={() => (scale.value = withTiming(0.98, { duration: motion.press }))}
-      onPressOut={() => (scale.value = withTiming(1, { duration: motion.quick, easing: motion.glide }))}
+      onPressIn={() => scale.set(withTiming(0.98, { duration: motion.press }))}
+      onPressOut={() => scale.set(withTiming(1, { duration: motion.quick, easing: motion.glide }))}
     >
       <Animated.View style={[base, style, anim]}>{children}</Animated.View>
     </Pressable>
   );
 }
 
+/*
+ * The looping animations below restart from their rest value each time: a hidden tab pauses them
+ * (effects clean up), and a repeat restarts every cycle from wherever it began, so resuming
+ * mid-cycle would jump or narrow the motion.
+ */
+
 /** Dot that gently "breathes" while an agent is active. */
 export function BreathingDot({ color, active, size = 7 }: { color: string; active: boolean; size?: number }) {
   const v = useSharedValue(1);
   useEffect(() => {
-    if (active) {
-      v.value = withRepeat(withSequence(withTiming(0.35, { duration: motion.breathe / 2 }), withTiming(1, { duration: motion.breathe / 2 })), -1);
-    } else {
-      cancelAnimation(v);
-      v.value = 1;
-    }
+    v.set(1);
+    if (active) v.set(withRepeat(withSequence(withTiming(0.35, { duration: motion.breathe / 2 }), withTiming(1, { duration: motion.breathe / 2 })), -1));
     return () => cancelAnimation(v);
   }, [active, v]);
   const core = useAnimatedStyle(() => ({ opacity: 0.45 + v.value * 0.55 }));
@@ -194,7 +196,8 @@ export function BreathingDot({ color, active, size = 7 }: { color: string; activ
 export function TypingDots({ color, size = 6 }: { color: string; size?: number }) {
   const t = useSharedValue(0);
   useEffect(() => {
-    t.value = withRepeat(withTiming(3, { duration: 1260, easing: Easing.linear }), -1, false);
+    t.set(0);
+    t.set(withRepeat(withTiming(3, { duration: 1260, easing: Easing.linear }), -1, false));
     return () => cancelAnimation(t);
   }, [t]);
   return (
@@ -224,11 +227,8 @@ export function StatusPill({ status, compact, label = statusLabel[status] }: { s
   const live = status === "working" || status === "blocked";
   const v = useSharedValue(1);
   useEffect(() => {
-    if (live) v.value = withRepeat(withSequence(withTiming(0.82, { duration: motion.breathe / 2 }), withTiming(1, { duration: motion.breathe / 2 })), -1);
-    else {
-      cancelAnimation(v);
-      v.value = 1;
-    }
+    v.set(1);
+    if (live) v.set(withRepeat(withSequence(withTiming(0.82, { duration: motion.breathe / 2 }), withTiming(1, { duration: motion.breathe / 2 })), -1));
     return () => cancelAnimation(v);
   }, [live, v]);
   const icon = useAnimatedStyle(() => ({ transform: [{ scale: v.value }, { rotate: `${(1 - v.value) * (status === "working" ? 120 : 0)}deg` }] }));

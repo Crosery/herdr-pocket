@@ -40,6 +40,9 @@ export function LiveMascot({ counts, mood, size = 64, onLongPress }: { counts: M
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    // Start each loop from rest: the tab pauses this while hidden, and a reversed repeat swings
+    // between where it starts and 1, so resuming near 1 would leave the mascot all but still.
+    breath.set(0);
     breath.set(withRepeat(withTiming(1, { duration: 1800, easing: Easing.inOut(Easing.sin) }), -1, true));
     return () => cancelAnimation(breath);
   }, [breath]);

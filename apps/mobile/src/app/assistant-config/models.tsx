@@ -104,7 +104,11 @@ export default function ModelsScreen() {
   return (
     <PageBackground>
       {header}
-      <ScrollView contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: config.warnings.length ? space.md : 0, paddingBottom: space.xxxl }}>
+      {/* contentInsetAdjustmentBehavior: iOS keeps the last row clear of the home indicator; Android ignores it. */}
+      <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
+        contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: config.warnings.length ? space.md : 0, paddingBottom: space.xxxl }}
+      >
         <WarningCard lines={config.warnings} />
 
         <SectionHeader

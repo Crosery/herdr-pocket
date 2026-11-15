@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { View } from "react-native";
+import { Platform, View } from "react-native";
 import { router, Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import * as SplashScreen from "expo-splash-screen";
@@ -71,6 +71,11 @@ function Navigator() {
               </View>
             ) : null,
           contentStyle: { backgroundColor: p.page },
+          // iOS takes the status bar from each screen, not from <StatusBar>: without these a page with a
+          // header follows the navigation theme (light) and one without follows the system, not the app's theme.
+          ...(Platform.OS === "ios"
+            ? { statusBarStyle: p.dark ? "light" : "dark", headerUserInterfaceStyle: p.dark ? "dark" : "light" }
+            : null),
         }}
       >
         {/* Paused while an agent or another screen covers it: snapshots render it later, its animations stop. */}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Pressable, RefreshControl, SectionList, View } from "react-native";
 import { Searchbar, Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -39,14 +39,18 @@ const GROUP_END = { height: space.xs };
 const RowGap = () => <View style={ROW_GAP} />;
 const GroupEnd = () => <View style={GROUP_END} />;
 
-/** A number that changes once a minute: rows re-render for their "N 分钟前" even when their agent did not change. */
+/**
+ * A number that changes once a minute: rows re-render for their "N 分钟前" even when their agent did not change.
+ * An external store rather than a state timer: the tab pauses while hidden, and on coming back the store is read
+ * again at once, so the times are right on the first frame instead of after the next tick.
+ */
+const minuteNow = () => Math.floor(Date.now() / 60_000);
+function onMinute(changed: () => void): () => void {
+  const t = setInterval(changed, 15_000);
+  return () => clearInterval(t);
+}
 function useMinute(): number {
-  const [minute, setMinute] = useState(() => Math.floor(Date.now() / 60_000));
-  useEffect(() => {
-    const t = setInterval(() => setMinute(Math.floor(Date.now() / 60_000)), 15_000);
-    return () => clearInterval(t);
-  }, []);
-  return minute;
+  return useSyncExternalStore(onMinute, minuteNow);
 }
 
 /** One compact row of three counts (需要你 / 工作中 / 已完成); tap one to filter. */
