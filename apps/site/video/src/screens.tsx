@@ -63,7 +63,7 @@ export const AgentList: React.FC<{ events: [number, number, St][] }> = ({ events
   return (
     <div className="scr">
       <StatusBar />
-      <div className="scr-body">
+      <div className="scr-body a-list">
         <div className="a-top">
           <span className="a-round">{ICON.menu}</span>
           <div className="a-hello">

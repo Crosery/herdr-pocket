@@ -78,19 +78,19 @@
               Herdr Pocket 把 herdr 里跑着的 Claude Code、Codex、Gemini、OpenCode…… 接到你的 Android 手机：看状态、读对话、敲终端。小羊助理替你盯着，谁跑完了、谁卡住了，第一时间告诉你。
             </p>
             <div class="hero-ctas">
-              <a class="btn btn-accent" href="#" data-href="githubUrl" target="_blank" rel="noopener">
-                <span data-i18n="hero.cta1">在 GitHub 上查看</span>
+              <a class="btn btn-accent" href="#deploy">
+                <span data-i18n="hero.cta1">开始部署</span>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
               </a>
-              <a class="btn btn-ghost" href="#video">
+              <a class="btn btn-ghost" href="#video" data-play-video>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5-11-6.5Z" /></svg>
                 <span data-i18n="hero.cta2">看 90 秒介绍</span>
               </a>
             </div>
-            <div class="cmd hero-cmd" data-cmd="computerUp">
-              <span class="cmd-prompt">$</span><code class="cmd-text"></code>
-              <button class="cmd-copy" type="button" aria-label="Copy"><span data-i18n="ui.copy">复制</span></button>
-            </div>
+            <a class="hero-needs" href="#parts">
+              <span data-i18n="hero.needs">需要三样东西：</span>
+              <b data-i18n="hero.need1">你的服务器</b><b data-i18n="hero.need2">Android 手机</b><b data-i18n="hero.need3">装了 herdr 的电脑</b>
+            </a>
           </div>
 
           <div class="stage" id="stage">
@@ -104,7 +104,67 @@
             <div class="bubbles" id="bubbles" aria-hidden="true"></div>
           </div>
         </div>
-        <a class="scroll-hint" href="#vendors" aria-label="Scroll"><span></span></a>
+        <a class="scroll-hint" href="#parts" aria-label="Scroll"><span></span></a>
+      </section>
+
+      <!-- ============================== THREE PARTS ============================== -->
+      <section class="parts wrap" id="parts">
+        <div class="parts-head">
+          <p class="eyebrow" data-i18n="parts.eyebrow">它由三部分组成</p>
+          <h2 class="h2" data-i18n="parts.title">一台服务器，一部手机，<br />再加上你的每台电脑</h2>
+          <p class="lead" data-i18n="parts.lead">服务端在中间：手机和每台电脑都只连它，彼此不用在同一个网络里。按 1、2、3 的顺序装好，所有电脑上的 agent 就都出现在手机上。</p>
+        </div>
+        <ol class="parts-grid">
+          <li class="part part-server">
+            <div class="part-top">
+              <span class="part-num">1</span>
+              <span class="part-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6.5" rx="2" /><rect x="3.5" y="13.5" width="17" height="6.5" rx="2" /><path d="M7.5 7.25h.01M7.5 16.75h.01M11 7.25h5.5M11 16.75h5.5" /></svg></span>
+              <h3><span data-i18n="parts.s.t">服务端</span><small data-i18n="parts.s.k">中转服务</small></h3>
+            </div>
+            <p class="part-where"><span data-i18n="parts.where">装在</span><b data-i18n="parts.s.w">你自己的服务器（Linux）</b></p>
+            <p class="part-what" data-i18n="parts.s.d">手机和电脑之间的中转站：转发状态、对话和终端，小羊助理和语音通话也跑在这里。数据只经过你的服务器。</p>
+            <a class="part-act" href="#step-server"><span data-i18n="parts.s.a">一条命令部署</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg></a>
+          </li>
+          <li class="part part-phone">
+            <div class="part-top">
+              <span class="part-num">2</span>
+              <span class="part-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="6.5" y="2.5" width="11" height="19" rx="2.6" /><path d="M10.5 18.5h3" /></svg></span>
+              <h3><span data-i18n="parts.p.t">手机端</span><small data-i18n="parts.p.k">Android App</small></h3>
+            </div>
+            <p class="part-where"><span data-i18n="parts.where">装在</span><b data-i18n="parts.p.w">你的 Android 手机</b></p>
+            <p class="part-what" data-i18n="parts.p.d">看所有 agent 的状态、对话和终端，直接回复、按键，收提醒，和小羊说话。扫一下服务端给的二维码就连上。</p>
+            <a class="part-act" href="#step-phone"><span data-i18n="parts.p.a">下载安装包并连上</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg></a>
+          </li>
+          <li class="part part-pc">
+            <div class="part-top">
+              <span class="part-num">3</span>
+              <span class="part-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="11.5" rx="2" /><path d="M2 19.5h20" /></svg></span>
+              <h3><span data-i18n="parts.c.t">电脑端</span><small>herdr-pocket</small></h3>
+            </div>
+            <p class="part-where"><span data-i18n="parts.where">装在</span><b data-i18n="parts.c.w">每台跑 herdr 的电脑（macOS、Linux、Windows）</b></p>
+            <p class="part-what" data-i18n="parts.c.d">在后台常驻，读取本机 herdr 里的 agent 发给服务端，再把你从手机发来的指令交给它们。</p>
+            <a class="part-act" href="#step-computer"><span data-i18n="parts.c.a">每台电脑一条命令</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg></a>
+          </li>
+        </ol>
+      </section>
+
+      <!-- ============================== VIDEO ============================== -->
+      <section class="video-sec wrap" id="video">
+        <div class="video-head">
+          <p class="eyebrow" data-i18n="video.eyebrow">介绍片</p>
+          <h2 class="h2" data-i18n="video.title">90 秒看懂 Herdr Pocket</h2>
+        </div>
+        <div class="video-frame" id="video-frame">
+          <video id="intro-video" controls playsinline muted preload="none" width="1920" height="1080"></video>
+          <button class="video-play" id="video-play" type="button" aria-label="Play">
+            <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5-11-6.5Z" /></svg></span>
+          </button>
+        </div>
+        <div class="video-q" id="video-q" role="group" aria-labelledby="video-q-label">
+          <span id="video-q-label" data-i18n="video.q">清晰度</span>
+          <button type="button" data-q="sd" aria-pressed="false">720p</button>
+          <button type="button" data-q="hd" aria-pressed="false">1080p</button>
+        </div>
       </section>
 
       <!-- ============================== VENDORS ============================== -->
@@ -125,19 +185,19 @@
         <div class="flow-pin">
           <div class="wrap flow-head">
             <p class="eyebrow" data-i18n="how.eyebrow">工作原理</p>
-            <h2 class="h2" data-i18n="how.title">电脑 → 中转 → 手机，一条线连起来</h2>
+            <h2 class="h2" data-i18n="how.title">电脑 → 服务端 → 手机，一条线连起来</h2>
           </div>
           <div class="wrap flow-body">
             <ol class="flow-steps" id="flow-steps">
               <li class="flow-step is-active" data-step="0">
                 <span class="flow-num">01</span>
                 <h3 data-i18n="how.s1.t">每台电脑照常跑 agent</h3>
-                <p data-i18n="how.s1.d">在 herdr 里该怎么跑还怎么跑。每台电脑执行一次 <code>herdr-pocket up</code>，守护进程读取本机的 agent，把状态快照发布出去。</p>
+                <p data-i18n="how.s1.d">在 herdr 里该怎么跑还怎么跑。每台电脑装一次电脑端，它在后台读取本机的 agent，把状态快照发给服务端。</p>
               </li>
               <li class="flow-step" data-step="1">
                 <span class="flow-num">02</span>
-                <h3 data-i18n="how.s2.t">你自己的中转服务</h3>
-                <p data-i18n="how.s2.d">中转服务跑在你自己的服务器上：WebSocket 长连接、传输压缩；设备令牌只存哈希，agent 归属由服务端按连接身份改写，电脑不能冒充别人。</p>
+                <h3 data-i18n="how.s2.t">你自己的服务端</h3>
+                <p data-i18n="how.s2.d">服务端（中转服务）跑在你自己的服务器上：WebSocket 长连接、传输压缩；设备令牌只存哈希，agent 归属由服务端按连接身份改写，电脑不能冒充别人。</p>
               </li>
               <li class="flow-step" data-step="2">
                 <span class="flow-num">03</span>
@@ -155,24 +215,24 @@
               <div class="node computer" data-node="c0">
                 <div class="node-head"><span class="node-ico ico-laptop"></span><b>MacBook Pro</b></div>
                 <div class="node-agents"><img src="assets/vendors/claude-code.webp" alt="" /><img src="assets/vendors/codex.webp" alt="" /></div>
-                <div class="node-cmd">herdr-pocket up</div>
+                <div class="node-cmd" data-i18n="how.online">已连上服务端</div>
               </div>
               <div class="node computer" data-node="c1">
                 <div class="node-head"><span class="node-ico ico-desk"></span><b data-i18n="how.pc2">Linux 工作站</b></div>
                 <div class="node-agents"><img src="assets/vendors/gemini.webp" alt="" /><img src="assets/vendors/opencode.webp" alt="" /><img src="assets/vendors/kimi.webp" alt="" /></div>
-                <div class="node-cmd">herdr-pocket up</div>
+                <div class="node-cmd" data-i18n="how.online">已连上服务端</div>
               </div>
               <div class="node computer" data-node="c2">
                 <div class="node-head"><span class="node-ico ico-cloud"></span><b data-i18n="how.pc3">云主机</b></div>
                 <div class="node-agents"><img src="assets/vendors/qwen.webp" alt="" /><img src="assets/vendors/pi.webp" alt="" /></div>
-                <div class="node-cmd">herdr-pocket up</div>
+                <div class="node-cmd" data-i18n="how.online">已连上服务端</div>
               </div>
               <div class="node relay" data-node="relay">
                 <div class="relay-ring"></div>
                 <div class="relay-core">
                   <svg viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.6c0 4.5 3.1 8.3 7.5 9.4 4.4-1.1 7.5-4.9 7.5-9.4V6L12 3Z" /><path d="m8.8 12 2.2 2.2 4.3-4.4" /></svg>
                 </div>
-                <div class="relay-label"><b data-i18n="how.relay">中转服务</b><span>wss · {server}</span></div>
+                <div class="relay-label"><b data-i18n="how.relay">服务端</b><span data-i18n="how.relayAt">你的服务器</span></div>
               </div>
               <div class="node phone-node" data-node="phone">
                 <div class="mini-phone">
@@ -211,7 +271,7 @@
             <article class="view-step" data-view="pair">
               <span class="chip chip-ink" data-i18n="views.pair.k">设备</span>
               <h3 data-i18n="views.pair.t">扫一下，新电脑就加进来</h3>
-              <p data-i18n="views.pair.d">新电脑运行 <code>herdr-pocket up</code> 显示二维码，用已连上的手机扫一下、点“允许加入”。二维码就是一个 https 链接，手机相机也能直接打开；邀请码一次性、10 分钟过期，手机也能邀请别的手机。</p>
+              <p data-i18n="views.pair.d">新电脑运行安装命令后会显示二维码，用已连上的手机扫一下、点“允许加入”。二维码就是一个 https 链接，手机相机也能直接打开；邀请码一次性、10 分钟过期，手机也能邀请别的手机。</p>
             </article>
           </div>
           <div class="views-phone-col">
@@ -355,7 +415,7 @@
             <div class="card-art art-cli" aria-hidden="true">
               <code><b>$</b> herdr-pocket logs --level warn</code>
               <code><b>$</b> herdr-pocket logs --follow</code>
-              <code><b>&#8599;</b> https://{server}/admin</code>
+              <code><b>&#8599;</b> <span data-i18n="ft.12.at">你的服务器</span>/admin</code>
             </div>
             <h3 data-i18n="ft.12.t">日志都在一处</h3>
             <p data-i18n="ft.12.d">中转服务、电脑和手机的日志都收在你的中转服务上：命令行用 <code>herdr-pocket logs</code> 查，问小羊“卡在哪一步”，或者打开中转服务上的 <code>/admin</code> 网页面板。</p>
@@ -370,73 +430,112 @@
         </div>
       </section>
 
-      <!-- ============================== VIDEO ============================== -->
-      <section class="video-sec wrap" id="video">
-        <p class="eyebrow" data-i18n="video.eyebrow">介绍片</p>
-        <h2 class="h2" data-i18n="video.title">90 秒看懂 Herdr Pocket</h2>
-        <div class="video-frame" id="video-frame">
-          <video id="intro-video" controls playsinline preload="none" width="1920" height="1080"></video>
-          <button class="video-play" id="video-play" type="button" aria-label="Play">
-            <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5-11-6.5Z" /></svg></span>
-          </button>
-        </div>
-        <div class="video-q" id="video-q" role="group" aria-labelledby="video-q-label">
-          <span id="video-q-label" data-i18n="video.q">清晰度</span>
-          <button type="button" data-q="sd" aria-pressed="false">720p</button>
-          <button type="button" data-q="hd" aria-pressed="false">1080p</button>
-        </div>
-      </section>
-
       <!-- ============================== DEPLOY ============================== -->
       <section class="deploy wrap" id="deploy">
         <p class="eyebrow" data-i18n="dp.eyebrow">开始使用</p>
         <h2 class="h2" data-i18n="dp.title">三步，搭好你自己的口袋</h2>
-        <div class="deploy-grid">
-          <article class="dstep" data-reveal>
-            <span class="dstep-num">1</span>
-            <h3 data-i18n="dp.1.t">部署中转服务</h3>
-            <p data-i18n="dp.1.d">任选一种，跑在你自己的服务器上；生产环境请务必走 HTTPS。第一次启动会在日志里打印一次性的设置二维码或设置码，留给第一台手机用。</p>
-            <div class="tabs" role="tablist">
-              <button class="tab is-on" type="button" role="tab" data-tab="serverCompose">Docker Compose</button>
-              <button class="tab" type="button" role="tab" data-tab="serverScript" data-i18n="dp.tab.script">一键脚本</button>
-              <button class="tab" type="button" role="tab" data-tab="serverCloudflare">Cloudflare<span class="tab-x"> Tunnel</span></button>
+        <!-- The one field that fills every command below it -->
+        <div class="server-bar" id="server-field" data-state="empty">
+          <div class="server-bar-head">
+            <span class="server-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6.5" rx="2" /><rect x="3.5" y="13.5" width="17" height="6.5" rx="2" /><path d="M7.5 7.25h.01M7.5 16.75h.01M11 7.25h5.5M11 16.75h5.5" /></svg></span>
+            <div>
+              <label for="server-input" data-i18n="dp.field.label">你的服务器地址</label>
+              <p class="server-help" id="server-help" data-i18n="dp.field.help">手机和每台电脑都连它。填一次，下面的命令都会带上；只记在这个浏览器里。</p>
             </div>
-            <div class="cmd cmd-block" data-cmd="serverCompose" id="server-cmd">
-              <span class="cmd-prompt">$</span><code class="cmd-text"></code>
-              <button class="cmd-copy" type="button" aria-label="Copy"><span data-i18n="ui.copy">复制</span></button>
+          </div>
+          <div class="server-main">
+            <div class="server-row">
+              <input id="server-input" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="例如 pocket.example.com" aria-describedby="server-help server-msg" />
+              <span class="server-ok" id="server-ok" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" /></svg></span>
             </div>
-            <p class="tab-note" id="server-note"></p>
-            <p class="fine" data-i18n="dp.1.fine">跑起来以后，打开 <code>https://{server}/admin</code> 能看日志面板。</p>
-          </article>
-          <article class="dstep" data-reveal>
-            <span class="dstep-num">2</span>
-            <h3 data-i18n="dp.3.t">手机装上 App</h3>
-            <p data-i18n="dp.3.d">用手机相机扫上一步的二维码，会打开一个连接页；从 GitHub Releases 装好 App，再点页面上的按钮就直接连上。只有设置码时，在 App 里填上服务器地址和设置码。以后有新版本，App 里点一下就更新。</p>
-            <a class="btn btn-accent btn-block" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
-              <span data-i18n="dp.3.cta">下载 Android 安装包</span>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14" /></svg>
-            </a>
-          </article>
-          <article class="dstep" data-reveal>
-            <span class="dstep-num">3</span>
-            <h3 data-i18n="dp.2.t">每台电脑上线</h3>
-            <p data-i18n="dp.2.d">这条命令装好 <code>herdr-pocket</code>，把这台电脑登记到你的中转服务并保持在线。终端里出现二维码时，用已连上的手机扫一下、点“允许加入”。</p>
-            <div class="cmd cmd-block" data-cmd="computerInstall">
-              <span class="cmd-prompt">$</span><code class="cmd-text"></code>
-              <button class="cmd-copy" type="button" aria-label="Copy"><span data-i18n="ui.copy">复制</span></button>
-            </div>
-            <p class="fine" data-i18n="dp.2.win">Windows 在 PowerShell 里运行这条：</p>
-            <div class="cmd cmd-block" data-cmd="computerInstallWindows">
-              <span class="cmd-prompt">PS&gt;</span><code class="cmd-text"></code>
-              <button class="cmd-copy" type="button" aria-label="Copy"><span data-i18n="ui.copy">复制</span></button>
-            </div>
-            <div class="mini-term" aria-hidden="true">
-              <div class="qr-ascii" id="qr-ascii"></div>
-              <span data-i18n="dp.2.scan">用手机扫一下这个二维码</span>
-            </div>
-            <p class="fine" data-i18n="dp.3.fine">需要 herdr。macOS 和 Linux 上没有 Node.js 22.18 以上版本时，安装脚本会自带一份；Windows 上总是自带一份，不需要管理员权限。</p>
-          </article>
+            <p class="server-msg" id="server-msg" aria-live="polite"></p>
+          </div>
         </div>
+        <ol class="dsteps">
+          <li class="dstep" id="step-server" data-reveal>
+            <span class="dstep-num" aria-hidden="true">1</span>
+            <div class="dstep-card">
+              <div class="dstep-info">
+                <h3><span data-i18n="dp.1.t">部署服务端</span><small data-i18n="dp.1.k">在你自己的服务器上</small></h3>
+                <p data-i18n="dp.1.d">三种方式任选一种。第一次启动会打印一次性的设置二维码或设置码，留给第一台手机。</p>
+              </div>
+              <div class="dstep-work">
+                <div class="tabs" role="tablist" data-target="server-cmd">
+                  <button class="tab is-on" type="button" role="tab" aria-selected="true" aria-controls="server-cmd" data-tab="serverCompose">Docker Compose</button>
+                  <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="server-cmd" data-tab="serverScript" data-i18n="dp.tab.script">一键脚本</button>
+                  <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="server-cmd" data-tab="serverCloudflare">Cloudflare<span class="tab-x"> Tunnel</span></button>
+                </div>
+                <div class="term" id="server-cmd" role="tabpanel" data-cmd="serverCompose">
+                  <div class="term-bar">
+                    <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                    <span class="term-label">在服务器上运行</span>
+                    <button class="cmd-copy" type="button"><span data-i18n="ui.copy">复制</span></button>
+                  </div>
+                  <div class="term-scroll" tabindex="0"><code class="cmd-text"></code></div>
+                </div>
+                <p class="tab-note" id="server-note"></p>
+                <details class="dmore">
+                  <summary data-i18n="dp.more">细节</summary>
+                  <div class="dmore-body">
+                    <p id="server-more"></p>
+                    <p><span data-i18n="dp.1.fine">跑起来以后，日志面板在</span> <span class="srv-admin" id="srv-admin"><code>https://&lt;你的服务器地址&gt;/admin</code></span></p>
+                  </div>
+                </details>
+              </div>
+            </div>
+          </li>
+          <li class="dstep" id="step-phone" data-reveal>
+            <span class="dstep-num" aria-hidden="true">2</span>
+            <div class="dstep-card">
+              <div class="dstep-info">
+                <h3><span data-i18n="dp.3.t">手机装上 App</span><small>Android</small></h3>
+                <p data-i18n="dp.3.d">用手机相机扫上一步的设置二维码，会打开连接页；装好 App 后点页面上的按钮，就连上了。</p>
+              </div>
+              <div class="dstep-work dstep-app">
+                <a class="btn btn-accent" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
+                  <span data-i18n="dp.3.cta">下载 Android 安装包</span>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14" /></svg>
+                </a>
+                <p data-i18n="dp.3.more">只有设置码时，在 App 里填上服务器地址和设置码。以后有新版本，App 里点一下就更新。</p>
+              </div>
+            </div>
+          </li>
+          <li class="dstep" id="step-computer" data-reveal>
+            <span class="dstep-num" aria-hidden="true">3</span>
+            <div class="dstep-card">
+              <div class="dstep-info">
+                <h3><span data-i18n="dp.2.t">每台电脑上线</span><small data-i18n="dp.2.k">装了 herdr 的电脑</small></h3>
+                <p data-i18n="dp.2.d">装好电脑端 <code>herdr-pocket</code>，把这台电脑登记到你的服务端，并在后台保持在线。</p>
+                <div class="scan-hint">
+                  <div class="qr-ascii scan-qr" id="qr-ascii" aria-hidden="true"></div>
+                  <p data-i18n="dp.2.scan">终端里出现二维码时，用已连上的手机扫一下，点“允许加入”。</p>
+                </div>
+              </div>
+              <div class="dstep-work">
+                <div class="tabs" role="tablist" data-target="pc-cmd">
+                  <button class="tab is-on" type="button" role="tab" aria-selected="true" aria-controls="pc-cmd" data-tab="computerInstall">macOS · Linux</button>
+                  <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="pc-cmd" data-tab="computerInstallWindows">Windows</button>
+                </div>
+                <div class="term" id="pc-cmd" role="tabpanel" data-cmd="computerInstall">
+                  <div class="term-bar">
+                    <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                    <span class="term-label">在这台电脑的终端里运行</span>
+                    <button class="cmd-copy" type="button"><span data-i18n="ui.copy">复制</span></button>
+                  </div>
+                  <div class="term-scroll" tabindex="0"><code class="cmd-text"></code></div>
+                </div>
+                <p class="tab-note" id="pc-note"></p>
+                <details class="dmore">
+                  <summary data-i18n="dp.more">细节</summary>
+                  <div class="dmore-body">
+                    <p data-i18n="dp.3.fine">需要 herdr。macOS 和 Linux 上没有 Node.js 22.18 以上版本时，安装脚本会自带一份；Windows 上总是自带一份。都不需要管理员权限。</p>
+                    <p data-i18n="dp.2.later">以后用 <code>herdr-pocket update</code> 更新，<code>herdr-pocket status</code> 查看状态。</p>
+                  </div>
+                </details>
+              </div>
+            </div>
+          </li>
+        </ol>
       </section>
 
       <!-- ============================== FAQ ============================== -->

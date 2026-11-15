@@ -276,8 +276,8 @@ export const SceneFlow: React.FC = () => {
   const lenA = 520;
   const lenB = 320;
   const steps = [
-    ["herdr-pocket up", "每台电脑一条命令", 30],
-    ["自托管中转", "WebSocket · 令牌只存哈希", 90],
+    ["每台电脑装一次", "电脑端在后台常驻", 30],
+    ["你自己的服务端", "WebSocket · 令牌只存哈希", 90],
     ["手机实时看到", "列表、对话、终端", 170],
     ["指令沿原路送回", "回一句、按个键、新建 agent", 280],
   ] as const;
@@ -292,7 +292,7 @@ export const SceneFlow: React.FC = () => {
   return (
     <AbsoluteFill>
       <Sky seed={4} />
-      <Caption eyebrow="工作原理 · How it works" zh="电脑 → 中转 → 手机" en="Computers → relay → phone, one live line." size={60} style={{ position: "absolute", left: 120, top: 44 }} />
+      <Caption eyebrow="工作原理 · How it works" zh="电脑 → 服务端 → 手机" en="Computers → your server → phone, one live line." size={60} style={{ position: "absolute", left: 120, top: 44 }} />
       <svg style={{ position: "absolute", inset: 0 }} width={1920} height={1080}>
         <defs>
           <linearGradient id="g" gradientUnits="userSpaceOnUse" x1="560" y1="0" x2="1400" y2="0">
@@ -357,7 +357,7 @@ export const SceneFlow: React.FC = () => {
             {c.vs.map((v) => (
               <Avatar key={v} v={v} size={52} />
             ))}
-            <span style={{ marginLeft: "auto", fontFamily: FONT_MONO, fontSize: 17, color: C.ink2, background: C.bg2, padding: "4px 10px", borderRadius: 10, whiteSpace: "nowrap" }}>herdr-pocket up</span>
+            <span style={{ marginLeft: "auto", fontFamily: FONT_BODY, fontWeight: 800, fontSize: 18, color: C.mint, background: C.mintSoft, padding: "4px 12px", borderRadius: 10, whiteSpace: "nowrap" }}>● 在线</span>
           </div>
         </div>
       ))}
@@ -380,8 +380,8 @@ export const SceneFlow: React.FC = () => {
           </svg>
         </div>
         <div style={{ position: "absolute", top: 184, left: "50%", transform: "translateX(-50%)", textAlign: "center", whiteSpace: "nowrap" }}>
-          <div style={{ fontFamily: FONT_BODY, fontWeight: 900, fontSize: 30, color: C.ink }}>中转服务 · Relay</div>
-          <div style={{ fontFamily: FONT_MONO, fontSize: 20, color: C.ink2 }}>wss · {SITE.server}</div>
+          <div style={{ fontFamily: FONT_BODY, fontWeight: 900, fontSize: 30, color: C.ink }}>服务端 · Server</div>
+          <div style={{ fontFamily: FONT_BODY, fontWeight: 700, fontSize: 20, color: C.ink2 }}>跑在你自己的服务器上</div>
         </div>
       </div>
       <div style={{ position: "absolute", left: 1390, top: 170, opacity: 0.3 + 0.7 * phoneIn, transform: `translateX(${(1 - phoneIn) * 60}px)` }}>
@@ -692,14 +692,17 @@ const QR: React.FC<{ size: number; seed?: number }> = ({ size, seed = 7 }) => {
 export const SceneSelfHost: React.FC = () => {
   const f = useCurrentFrame();
   const t = useIn(0, 16);
-  const full = SITE.commands.computerUp;
-  const cmd = typed(full, f, 20, 26);
+  // An abbreviated relay install with a placeholder domain, then the setup QR it prints for the first phone.
+  const full = "curl -fsSL …/install-relay.sh | sudo bash -s -- --domain <你的域名>";
+  const cmd = typed(full, f, 20, 30);
   const qr = useIn(78, 13);
+  // the phone has scanned it: a beat after the code shows
+  const ok = useIn(124, 12);
   const chips = [
     ["Docker · Cloudflare · 一键安装", C.pinkSoft, C.deep],
     ["首次启动打印一次性二维码", C.lavSoft, C.lavDeep],
     ["二维码是 https 链接，相机一扫就开", C.mintSoft, C.mint],
-    ["日志集中在中转服务 · /admin 面板", "#fff", C.ink],
+    ["日志集中在服务端 · /admin 面板", "#fff", C.ink],
     ["设备令牌只存哈希 · 只读模式", "#fff", C.ink],
     ["Anthropic · DeepSeek · Qwen · Kimi · GLM · OpenRouter · Ollama", "#fff", C.ink],
   ] as const;
@@ -729,12 +732,12 @@ export const SceneSelfHost: React.FC = () => {
           {cmd}
           {cmd.length < full.length ? <span style={{ display: "inline-block", width: 13, height: 26, background: "#FF8FB8", verticalAlign: -4, opacity: Math.floor(f / 8) % 2 }} /> : null}
         </div>
-        {f >= 66 ? <div style={{ color: "rgba(255,255,255,.55)", marginTop: 10, fontSize: 22 }}>用已连上的手机扫一下 · scan with a connected phone</div> : null}
+        {f >= 66 ? <div style={{ color: "rgba(255,255,255,.55)", marginTop: 10, fontSize: 22 }}>服务端已启动 · 用手机扫这个设置码</div> : null}
         <div style={{ display: "flex", alignItems: "center", gap: 28, marginTop: 20, opacity: qr, transform: `scale(${0.8 + 0.2 * qr})`, transformOrigin: "0 50%" }}>
           <QR size={210} />
-          <div style={{ fontFamily: FONT_BODY, fontSize: 26, fontWeight: 800, lineHeight: 1.5 }}>
-            <div style={{ color: "#7FDBB6" }}>✓ 已允许加入</div>
-            <div style={{ color: "rgba(255,255,255,.6)", fontSize: 22 }}>Mac mini · 在线</div>
+          <div style={{ fontFamily: FONT_BODY, fontSize: 26, fontWeight: 800, lineHeight: 1.5, opacity: ok, transform: `translateX(${(1 - ok) * -16}px)` }}>
+            <div style={{ color: "#7FDBB6" }}>✓ 手机已连上</div>
+            <div style={{ color: "rgba(255,255,255,.6)", fontSize: 22 }}>下一步：每台电脑一条命令</div>
           </div>
         </div>
       </div>

@@ -50,14 +50,62 @@ if (!reducedMotion() && finePointer()) {
 }
 
 // ---- theme + language toggles
+// A theme switch restyles the whole page once. With transitions running, colour
+// fades (an inherited one on <body> above all) restyled it again on every frame for
+// 0.4 s, which is what made the switch stutter. So: switch with the colour fades off
+// (.theme-switching) and turn them back on once the new theme is on screen.
+// Only the elements that have such a fade get the rule, read from the style sheets
+// once, so turning them back on restyles those few, not the whole page.
+// The cross-fade (View Transitions) is for mouse and trackpad machines: on a phone it
+// doubled the work of a switch.
+const root = document.documentElement;
+const colourFade = /(^|,)\s*(all|color|background|border|box-shadow|fill|stroke|outline)/;
+let fadesOff = false;
+const prepareSwitch = () => {
+  if (fadesOff) return;
+  fadesOff = true;
+  const sels = new Set<string>();
+  const walk = (rules: CSSRuleList) => {
+    for (const r of Array.from(rules)) {
+      if (r instanceof CSSStyleRule) {
+        // a shorthand with var() in it leaves the longhands empty: read its text too
+        if (!colourFade.test(r.style.transitionProperty) && !colourFade.test(r.style.getPropertyValue("transition"))) continue;
+        for (const sel of r.selectorText.split(",")) {
+          const s = sel.trim().replace(/^(:root|html)((\[[^\]]*\])|(\.[\w-]+))*\s*/, "");
+          if (s) sels.add(`.theme-switching ${s}`);
+        }
+      } else if ("cssRules" in r) walk((r as CSSGroupingRule).cssRules);
+    }
+  };
+  for (const sheet of Array.from(document.styleSheets)) {
+    try {
+      walk(sheet.cssRules);
+    } catch {}
+  }
+  if (!sels.size) return;
+  const style = document.createElement("style");
+  style.textContent = `${[...sels].join(",\n")} { transition: none !important; }`;
+  document.head.append(style);
+};
 const themeMeta = () => document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]');
-$("#theme-toggle")!.addEventListener("click", () => {
-  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  document.documentElement.dataset.theme = next;
+const setTheme = (next: "light" | "dark") => {
+  prepareSwitch();
+  root.classList.add("theme-switching");
+  root.dataset.theme = next;
   try {
     localStorage.setItem("hp-theme", next);
   } catch {}
   themeMeta().forEach((m) => (m.content = next === "dark" ? "#1C1722" : "#FFF6F9"));
+};
+const endSwitch = () => root.classList.remove("theme-switching");
+$("#theme-toggle")!.addEventListener("click", () => {
+  const next = root.dataset.theme === "dark" ? "light" : "dark";
+  if (document.startViewTransition && finePointer() && !reducedMotion()) {
+    document.startViewTransition(() => setTheme(next)).finished.finally(endSwitch);
+  } else {
+    setTheme(next);
+    requestAnimationFrame(() => requestAnimationFrame(endSwitch));
+  }
 });
 $("#lang-toggle")!.addEventListener("click", () => setLang(getLang() === "zh" ? "en" : "zh"));
 
@@ -67,7 +115,7 @@ const animateTitle = (first: boolean) => {
   const lines = wrapTitleLines(title);
   if (!first || reducedMotion()) return;
   gsap.from(lines, { yPercent: 110, duration: 1.1, ease: "expo.out", stagger: 0.12, delay: 0.1 });
-  gsap.from([".hero-pill", ".hero-sub", ".hero-ctas", ".hero-cmd"], {
+  gsap.from([".hero-pill", ".hero-sub", ".hero-ctas", ".hero-needs"], {
     y: 24,
     opacity: 0,
     duration: 0.9,
@@ -79,6 +127,9 @@ const animateTitle = (first: boolean) => {
 };
 animateTitle(true);
 onLang(() => animateTitle(false));
+// Text in the other language changes section heights: measure again once every
+// section has re-rendered (the listeners run in order, this one last by a frame).
+onLang(() => requestAnimationFrame(() => ScrollTrigger.refresh()));
 
 // ---- pause the CSS loops of sections that are off screen (see .is-offscreen)
 const offscreen = new IntersectionObserver(
@@ -86,6 +137,35 @@ const offscreen = new IntersectionObserver(
   { rootMargin: "200px 0px" },
 );
 $$("main > section, body > footer").forEach((s) => offscreen.observe(s));
+
+// ---- skip painting sections far from the screen (content-visibility: auto, see .cv in base.css).
+// It cuts the paint of a theme switch about sevenfold. Each section keeps its measured
+// height as its stand-in size, so ScrollTrigger positions and anchor jumps stay exact:
+// every ScrollTrigger refresh (load, fonts, resize, language) measures with it off.
+const lazySections = $$("main > section:not(.hero):not(.flow), body > footer");
+ScrollTrigger.addEventListener("refreshInit", () => root.classList.remove("cv"));
+ScrollTrigger.addEventListener("refresh", () => {
+  // the stand-in size is the content box: padding and border come on top of it
+  for (const s of lazySections) {
+    const c = getComputedStyle(s);
+    const pad = parseFloat(c.paddingTop) + parseFloat(c.paddingBottom) + parseFloat(c.borderTopWidth) + parseFloat(c.borderBottomWidth);
+    // no `auto`: a size remembered from another width or language would win over this one
+    s.style.containIntrinsicSize = `${Math.max(0, s.getBoundingClientRect().height - pad).toFixed(2)}px`;
+  }
+  root.classList.add("cv");
+});
+// ScrollTrigger lets resizes pass on touch screens; a new width (a rotated phone)
+// still changes every height, so refresh for that.
+let lastWidth = window.innerWidth;
+let widthTimer = 0;
+window.addEventListener("resize", () => {
+  clearTimeout(widthTimer);
+  widthTimer = window.setTimeout(() => {
+    if (window.innerWidth === lastWidth) return;
+    lastWidth = window.innerWidth;
+    ScrollTrigger.refresh();
+  }, 250);
+});
 
 initNav();
 initHero();

@@ -6,8 +6,10 @@ film in `video/`. Both are standalone installs, kept out of the root pnpm
 workspace so the server install stays light.
 
 Chinese is the source language (in `index.html`); English lives in
-`src/i18n.ts`. Repository slug, example server and every shell command shown on
-the page come from one constant: `src/config.ts`.
+`src/i18n.ts`. Repository slug and every shell command shown on the page come
+from one constant: `src/config.ts`. The install commands are templates: the
+"your server address" field in the deploy section fills `{host}` and `{url}`
+(remembered in the browser), and until then they show a placeholder.
 
 ## Develop
 
