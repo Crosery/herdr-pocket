@@ -41,7 +41,7 @@ import { claimsDelivery, guardClaims, newFacts, type RunFacts } from "./guard.ts
 import { MATCH_MIN, agentNames, foldName, pickOne, rank } from "./lookup.ts";
 import type { ContentBlock, Llm, Msg, ToolDef } from "./llm.ts";
 import { PROMPT_EPOCH, delegateAsk, herdrCommandList, systemPrompt, wakeBatch, wakeBlocked, wakeFinished, type Occasion } from "./prompts.ts";
-import { clip, clockTime, cnNumber, filterTalk, noEmoji, normName, oneLine, parseWake, splitScript, spokenFor, spokenTime, stripMd } from "./speech.ts";
+import { MAX_KEEP, clip, clockTime, cnNumber, filterTalk, noEmoji, normName, oneLine, parseWake, splitScript, spokenFor, spokenTime, stripMd } from "./speech.ts";
 import { timeZone, utcOffset, zoneLabel, zoneName } from "./timezone.ts";
 
 export { clip, noEmoji } from "./speech.ts";
@@ -128,6 +128,16 @@ const CONTEXT_ITEMS = 30;
 const VOICE_CONTEXT_ITEMS = 6;
 const ACTION_TTL_MS = 10 * 60_000;
 const MAX_TOOL_ROUNDS = 8;
+/** A chat can take more looks than a call: nobody is waiting on the line (reading a long session takes several). */
+const TEXT_TOOL_ROUNDS = 12;
+/** One tool result as a call keeps it when the model wrote no notes. */
+const NOTE_CHARS = 200;
+/** Said after the last round's results: answer now from what was found. */
+const OUT_OF_ROUNDS: Record<Occasion, string> = {
+  text: "（查的次数用完了，不能再调工具。现在就根据上面已经查到的回答我：查到的说清楚，没查到的直说没查到，要我指明的再问我。）",
+  call: "（查的次数用完了，不能再调工具。现在就按“台词 / --- / 备查”的格式回：台词说清查到了什么、还缺什么，备查写已经查到的事实。）",
+  woken: "（不能再查了，按格式回。）",
+};
 /** A wake-up reads; it never proposes anything (4.6). */
 const WAKE_TOOLS = new Set(["read_agent"]);
 const WAKE_ROUNDS = 3;
@@ -421,7 +431,9 @@ export class Assistant {
       const t0 = Date.now();
       try {
         const run = await this.run(messages, { occasion: "call", signal });
-        const script = splitScript(run.text || "好了。");
+        let script = splitScript(run.text || "好了。");
+        // Notes are what the voice answers follow-up questions from: without them it can only ask again.
+        if (!script.keep.trim() && run.notes.length) script = { ...script, keep: clip(run.notes.slice(-4).join("\n"), MAX_KEEP) };
         // 4.11: how long, and how much the voice was given to say.
         this.event({
           kind: "assistant.turn",
@@ -474,26 +486,27 @@ export class Assistant {
       allow?: Set<string>;
       maxRounds?: number;
     },
-  ): Promise<{ text: string; steps: string[]; tools: string[]; guard: string[] }> {
+  ): Promise<{ text: string; steps: string[]; tools: string[]; guard: string[]; notes: string[] }> {
     const steps: string[] = [];
     const used: string[] = [];
+    /** What the tools gave back, one clipped line each: the facts a call keeps when the model wrote none. */
+    const notes: string[] = [];
     const turn: Turn = { occasion: opts.occasion, facts: newFacts() };
     const system = systemPrompt(this.name, opts.occasion, this.backendBoard(), { confirm: !this.direct(turn) });
     const tools = opts.allow ? TOOLS.filter((t) => opts.allow!.has(t.name)) : TOOLS;
-    const rounds = opts.maxRounds ?? MAX_TOOL_ROUNDS;
+    const rounds = opts.maxRounds ?? (opts.occasion === "text" ? TEXT_TOOL_ROUNDS : MAX_TOOL_ROUNDS);
     /** What is said must match what was done in this run (the guard), and the log says when it did not. */
     const finish = (raw: string) => {
       const g = guardClaims(raw, turn.facts);
       if (g.fixed.length) {
         this.event({ kind: "guard", level: "warn", msg: `${opts.occasion}: replaced a claim (${g.fixed.join(",")}) that the tools did not back: "${clip(oneLine(raw), 160)}" -> "${clip(oneLine(g.text), 80)}"` });
       }
-      return { text: g.text, steps, tools: used, guard: g.fixed };
+      return { text: g.text, steps, tools: used, guard: g.fixed, notes };
     };
-    let text = "";
-    for (let round = 0; round < rounds; round++) {
+    const answer = () => {
       let live = "";
       let lastDraft = 0;
-      const res = await this.llm!({
+      return this.llm!({
         system,
         messages,
         tools,
@@ -508,11 +521,11 @@ export class Assistant {
           }
         },
       });
-      text = res.content
-        .filter((b): b is Extract<ContentBlock, { type: "text" }> => b.type === "text")
-        .map((b) => b.text)
-        .join("")
-        .trim();
+    };
+    let text = "";
+    for (let round = 0; round < rounds; round++) {
+      const res = await answer();
+      text = textOf(res.content);
       const calls = res.content.filter((b): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use");
       if (!calls.length) return finish(noEmoji(text));
       messages.push({ role: "assistant", content: res.content });
@@ -538,14 +551,27 @@ export class Assistant {
           msg: `${opts.occasion} ${call.name} ${isError ? "failed" : "ok"} ${Date.now() - t0}ms${isError ? `: ${clip(oneLine(out), 200)}` : ""}`,
           data: { args: argSummary(input), result: isError ? undefined : clip(oneLine(out), 200) },
         });
+        if (!isError) notes.push(clip(oneLine(out), NOTE_CHARS));
         results.push({ type: "tool_result", tool_use_id: call.id, content: clip(out, 6000), is_error: isError || undefined });
       }
       // The round after next does not exist: say so, so the answer comes instead of another look.
-      if (opts.maxRounds && round === rounds - 2) results.push({ type: "text", text: "（这是最后一次查看，下一条直接按格式回。）" });
+      if (round === rounds - 2) results.push({ type: "text", text: opts.occasion === "woken" ? "（这是最后一次查看，下一条直接按格式回。）" : "（这是最后一次查看。下一条就回答，别再调工具。）" });
       messages.push({ role: "user", content: results });
       opts.onDraft?.(text, steps);
     }
-    // Out of rounds: whatever was done is still reported as it really ended.
+    // Out of rounds: one more answer, from what was found, with no further look. The tools stay
+    // declared (the history holds tool calls); a call the model still makes is not run.
+    const results = messages[messages.length - 1]!.content as ContentBlock[];
+    results.push({ type: "text", text: OUT_OF_ROUNDS[opts.occasion] });
+    try {
+      const said = noEmoji(textOf((await answer()).content));
+      this.event({ kind: "assistant.turn", level: "warn", msg: `${opts.occasion}: used all ${rounds} rounds, answered from what was found${said ? "" : " (empty)"}` });
+      if (said) return finish(said);
+    } catch (e) {
+      if (opts.signal?.aborted) throw e;
+      this.event({ kind: "assistant.turn", level: "warn", msg: `${opts.occasion}: used all ${rounds} rounds, the last answer failed: ${clip((e as Error).message, 160)}` });
+    }
+    // Nothing came: whatever was done is still reported as it really ended.
     const done = turn.facts.actions.filter((a) => a.state !== "pending");
     const tail = done.length ? `办了的：${done.map((a) => `${a.title ?? a.kind}${a.state === "done" ? "成了" : "没成"}`).join("，")}。` : "";
     return {
@@ -2124,6 +2150,15 @@ function pushAssistant(out: Msg[], text: string): void {
 
 function actionState(s: AssistantAction["state"]): string {
   return { pending: "等确认", running: "执行中", done: "已完成", cancelled: "已取消", failed: "失败", expired: "已作废" }[s];
+}
+
+/** The text blocks of an answer, joined. */
+function textOf(content: ContentBlock[]): string {
+  return content
+    .filter((b): b is Extract<ContentBlock, { type: "text" }> => b.type === "text")
+    .map((b) => b.text)
+    .join("")
+    .trim();
 }
 
 export function titleOf(a: Agent): string {
