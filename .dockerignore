@@ -13,5 +13,6 @@ scripts
 **/data
 **/*.db
 **/*.db-*
+**/*.db.key
 **/.env
 **/*.env

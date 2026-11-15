@@ -4,6 +4,7 @@ import { Relay } from "./server.ts";
 import { describeSetup } from "./setup.ts";
 import { loadModelSetup } from "./config.ts";
 import { setTimeZone } from "./assistant/timezone.ts";
+import { usePromptDir } from "./assistant/prompts.ts";
 
 const env = process.env;
 const port = Number(env.POCKET_PORT ?? 7420);
@@ -26,6 +27,17 @@ if (models.errors.length) {
 }
 // Times the assistant says and reminders it takes are in this zone (POCKET_TIMEZONE, default Asia/Shanghai).
 setTimeZone(models.timeZone);
+// Optional: a private folder whose <id>.md files replace the shipped prompts, kept out of the repository.
+if (env.POCKET_PROMPTS_DIR?.trim()) {
+  const dir = resolve(env.POCKET_PROMPTS_DIR.trim());
+  try {
+    const used = usePromptDir(dir);
+    console.log(`[relay] prompts: ${used.length ? `${used.join(", ")} from ${dir}` : `no <id>.md files in ${dir}, using the shipped ones`}`);
+  } catch (e) {
+    console.error(`[relay] POCKET_PROMPTS_DIR ${dir}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+}
 
 const relay = new Relay({
   dbPath,

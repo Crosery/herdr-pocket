@@ -23,7 +23,7 @@ mkdir -p "$stage"
 copy() {
   mkdir -p "$stage/$1"
   (cd "$root/$1" && COPYFILE_DISABLE=1 tar -cf - --exclude=node_modules --exclude=test --exclude=data \
-    --exclude='*.db' --exclude='*.db-*' --exclude='.env' --exclude='.DS_Store' .) | (cd "$stage/$1" && tar -xf -)
+    --exclude='*.db' --exclude='*.db-*' --exclude='*.db.key' --exclude='.env' --exclude='.DS_Store' .) | (cd "$stage/$1" && tar -xf -)
 }
 
 for f in package.json pnpm-lock.yaml pnpm-workspace.yaml LICENSE README.md; do

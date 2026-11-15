@@ -96,6 +96,40 @@ export function makeLlm(cfg: LlmConfig): Llm {
   };
 }
 
+/** One short request to one model: does it answer, and how fast (first word, whole answer). */
+export async function testModel(t: LlmTarget, signal?: AbortSignal): Promise<{ ok: boolean; firstMs?: number; totalMs?: number; reply?: string; error?: string }> {
+  const t0 = Date.now();
+  let first = 0;
+  try {
+    const r = await once(t, { targets: [t], firstByteMs: 20_000, totalMs: 30_000 }, {
+      system: "你在接受连通测试。只回一个字。",
+      messages: [{ role: "user", content: "回一个字：好" }],
+      tools: [],
+      maxTokens: 16,
+      signal,
+      onText: () => (first ||= Date.now() - t0),
+    });
+    const reply = r.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("").trim();
+    return { ok: true, firstMs: first || Date.now() - t0, totalMs: Date.now() - t0, reply: reply.slice(0, 40) };
+  } catch (e) {
+    return { ok: false, totalMs: Date.now() - t0, error: (e as Error).message.slice(0, 300) };
+  }
+}
+
+/** The model names a provider lists (`/v1/models`); empty when it lists none or refuses. */
+export async function listModels(t: LlmTarget): Promise<string[]> {
+  const base = t.baseUrl.replace(/\/+$/, "");
+  const anthropic = t.protocol === "anthropic";
+  const res = await fetch(anthropic ? `${base}/v1/models?limit=1000` : `${base}/models`, {
+    headers: { ...(anthropic ? { "anthropic-version": "2023-06-01" } : {}), ...authHeaders(t), ...t.headers },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new LlmError(`${t.provider}: HTTP ${res.status} ${scrub((await res.text().catch(() => "")).slice(0, 160), t.apiKey)}`);
+  const body = (await res.json().catch(() => ({}))) as { data?: Array<{ id?: unknown }> };
+  const ids = (Array.isArray(body.data) ? body.data : []).map((m) => m?.id).filter((x): x is string => typeof x === "string" && !!x);
+  return [...new Set(ids)].sort().slice(0, 500);
+}
+
 /** What a protocol needs to know while a stream is read. */
 interface Stream {
   /** Set once the answer has really started (text, a tool call, or reasoning). */
@@ -146,7 +180,7 @@ async function once(t: LlmTarget, cfg: LlmConfig, req: LlmRequest): Promise<LlmR
   }
 }
 
-function authHeaders(t: LlmTarget): Record<string, string> {
+export function authHeaders(t: LlmTarget): Record<string, string> {
   if (!t.apiKey) return {};
   switch (t.auth ?? (t.protocol === "anthropic" ? "x-api-key" : "bearer")) {
     case "bearer":

@@ -71,7 +71,7 @@ interface FileConfig {
 type Env = Record<string, string | undefined>;
 
 /** Words already used by other POCKET_* settings; a provider cannot take them as its id. */
-const RESERVED = new Set(["assistant", "voice", "moss", "admin", "public", "trust", "port", "host", "db", "config"]);
+export const RESERVED = new Set(["assistant", "voice", "moss", "admin", "public", "trust", "port", "host", "db", "config"]);
 const PROTOCOLS: Protocol[] = ["anthropic", "openai"];
 const AUTHS: AuthStyle[] = ["bearer", "x-api-key", "api-key", "none"];
 
@@ -106,7 +106,7 @@ export function loadModelSetup(env: Env, read: (path: string) => string = (p) =>
 const envId = (id: string) => `POCKET_${id.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_`;
 
 /** A URL the relay can open later: checked now, so a typo turns a feature off instead of failing mid-call. */
-function urlOk(u: string, schemes: string[]): boolean {
+export function urlOk(u: string, schemes: string[]): boolean {
   try {
     return schemes.includes(new URL(u).protocol);
   } catch {

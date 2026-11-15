@@ -3,6 +3,8 @@ dist/
 .expo/
 *.db
 *.db-*
+# The relay seals phone-set keys and prompt edits with this (next to its database).
+*.db.key
 .env
 ios/
 android/

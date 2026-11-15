@@ -179,7 +179,7 @@ export class Assistant {
   private sinks = new Set<NoticeSink>();
   private voices = new Set<VoiceSink>();
   private closed = false;
-  readonly name: string;
+  name: string;
 
   constructor(opts: AssistantOptions) {
     this.opts = opts;
@@ -197,6 +197,16 @@ export class Assistant {
       }
     }
     this.reminderTimer = setInterval(() => this.tickReminders(), opts.reminderTickMs ?? 15_000);
+  }
+
+  /**
+   * Models, name and voice as a phone just set them (Settings): the next
+   * message or call uses them; one already running finishes on the old ones.
+   */
+  useModels(m: { llm?: Llm; model?: string; name: string; voice: boolean }): void {
+    this.llm = m.llm;
+    this.name = m.name;
+    this.opts = { ...this.opts, model: m.model, voice: m.voice, name: m.name };
   }
 
   close(): void {
