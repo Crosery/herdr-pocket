@@ -15,9 +15,8 @@ export const SITE = {
   licenseUrl: `https://github.com/${repo}/blob/main/LICENSE`,
   /** Relative to the page, so the site works under any base path. */
   video: {
-    src: "video/intro.mp4",
-    /** 720p copy, about a third of the size; the default on phones and slow connections. */
-    srcSd: "video/intro-720.mp4",
+    /** HLS, 720p and 1080p in 4-second segments; written by video/scripts/render.sh. */
+    hls: "video/hls/master.m3u8",
     poster: "video/intro-poster.webp",
   },
   /** Shown in commands until the visitor types a server address in the deploy section. */

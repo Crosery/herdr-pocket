@@ -2102,61 +2102,10 @@
   border: 1px solid var(--line);
 }
 .video-frame video {
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
-}
-.video-play {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  background: radial-gradient(circle, rgba(36, 26, 48, 0) 30%, rgba(36, 26, 48, 0.25));
-}
-.video-play span {
-  width: 92px;
-  height: 92px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 20px 50px -10px rgba(217, 87, 140, 0.7), 0 0 0 10px rgba(255, 255, 255, 0.25);
-  transition: transform 0.5s var(--ease-spring);
-}
-.video-play svg {
-  width: 34px;
-  height: 34px;
-  margin-left: 5px;
-  fill: var(--accent-deep);
-}
-.video-play:hover span {
-  transform: scale(1.1);
-}
-.video-frame.is-playing .video-play {
-  display: none;
-}
-.video-q {
-  display: flex;
-  justify-content: flex-end;
-  align-items: center;
-  gap: 4px;
-  margin-top: 12px;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--ink-2);
-}
-.video-q span {
-  margin-right: 6px;
-}
-.video-q button {
-  padding: 5px 12px;
-  border-radius: 999px;
-  font-weight: 800;
-  transition: background-color 0.25s ease, color 0.25s ease;
-}
-.video-q button.is-on {
-  background: var(--pink-soft);
-  color: var(--accent-deep);
 }
 
 /* ================= DEPLOY ================= */
