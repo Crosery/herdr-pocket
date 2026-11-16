@@ -4,6 +4,7 @@ import {
   type ClientFrame,
   type Device,
   type DeviceKind,
+  type DirectOffer,
   type JoinRequest,
   type PairCode,
   type PairResponse,
@@ -18,6 +19,7 @@ import { isMockServer, mockLink, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
 import { onLinkBack } from "./assistantConfig";
 import { applog } from "./applog";
+import { DirectError, DirectLink } from "./direct";
 
 export class RelayError extends Error {
   code: RpcError["code"];
@@ -124,7 +126,14 @@ export async function revokeDevice(server: string, token: string, id: string): P
 // ---------------------------------------------------------------------------
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; method?: string; to?: string };
-type Stream = { id: string; to: string; stream: "terminal" | "session"; params: unknown; onEvent: StreamEvent; onState?: StreamEvent };
+/** `via`: the direct link carrying it; none means the relay. */
+type Stream = { id: string; to: string; stream: "terminal" | "session"; params: unknown; onEvent: StreamEvent; onState?: StreamEvent; via?: DirectLink };
+
+/** Reads that may simply be asked again through the relay when a direct link dies under them. */
+const SAFE_AGAIN = new Set<RpcMethod>([
+  "agents.list", "terminal.read", "session.events", "session.children", "spaces.list", "host.info", "agent.seen",
+  "herdr.layout", "sessions.list", "sessions.search", "sessions.read", "sessions.usage", "harness.icons",
+]);
 
 /** React Native's WebSocket also takes request headers (the DOM typing doesn't know). */
 type RNWebSocket = new (url: string, protocols: string | string[] | null, options: { headers: Record<string, string> }) => WebSocket;
@@ -143,16 +152,25 @@ class SocketLink implements Link {
   private closed = false;
   /** Set once the relay greets this socket; a close before that may mean a rejected token. */
   private welcomed = false;
+  /** Direct links by computer id (lib/direct), and when to try one again. */
+  private direct = new Map<string, DirectLink>();
+  private directTry = new Map<string, { busy: boolean; next: number; fails: number }>();
 
   constructor(private server: string, private token: string) {
     this.open();
-    this.pingTimer = setInterval(() => this.ping(), 20_000);
+    this.pingTimer = setInterval(() => {
+      this.ping();
+      this.tryDirectAll(false);
+    }, 20_000);
     this.appSub = AppState.addEventListener("change", (s: AppStateStatus) => {
       if (s !== "active") {
         // Timers stop in the background; a pong check started now would only misfire on return.
         this.clearPongWait();
         return;
       }
+      // Back in front: the phone may be on another network now. Check the direct links and try again at once.
+      for (const d of this.direct.values()) d.ping();
+      this.tryDirectAll(true);
       // Android often drops the connection of an app in the background without telling it. A socket that
       // still says open is asked at once, so a dead one is replaced in seconds, not when a call times out.
       if (this.ws?.readyState === WebSocket.OPEN) this.ping();
@@ -176,9 +194,10 @@ class SocketLink implements Link {
       this.backoff = 1000;
       this.send({ type: "hello", version: PROTOCOL_VERSION, platform: "mobile" });
       // Under new ids: an older relay or computer may still hold the old ones and refuse them as duplicates.
-      const open = [...this.streams.values()];
-      this.streams.clear();
-      for (const s of open) {
+      // Streams on a direct link stay there.
+      for (const s of [...this.streams.values()]) {
+        if (s.via) continue;
+        this.streams.delete(s.id);
         s.id = this.streamId();
         this.streams.set(s.id, s);
         this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
@@ -259,10 +278,12 @@ class SocketLink implements Link {
         const agents: Record<string, typeof f.agents> = {};
         for (const a of f.agents) (agents[a.deviceId] ??= []).push(a);
         useLive.setState({ devices, agents, link: "online" });
+        this.tryDirectAll(false);
         break;
       }
       case "device":
         useLive.setState((s) => ({ devices: { ...s.devices, [f.device.id]: f.device } }));
+        if (f.device.kind === "host" && f.device.online) this.tryDirect(f.device.id, true);
         break;
       case "device_removed":
         useLive.setState((s) => {
@@ -340,16 +361,106 @@ class SocketLink implements Link {
   }
 
   subscribe(to: string, stream: "terminal" | "session", params: unknown, onEvent: StreamEvent, onState?: StreamEvent): () => void {
-    const entry: Stream = { id: this.streamId(), to, stream, params, onEvent, onState };
+    const link = this.direct.get(to);
+    const entry: Stream = { id: this.streamId(), to, stream, params, onEvent, onState, via: link?.open ? link : undefined };
     this.streams.set(entry.id, entry);
-    if (!this.send({ type: "stream_subscribe", id: entry.id, to, stream, params })) onState?.({ status: "error", message: "还没连上服务器" });
+    this.openStream(entry);
     return () => {
       if (this.streams.get(entry.id) === entry) this.streams.delete(entry.id);
-      this.send({ type: "stream_unsubscribe", id: entry.id, to });
+      if (entry.via) entry.via.unsubscribe(entry.id);
+      else this.send({ type: "stream_unsubscribe", id: entry.id, to });
     };
   }
 
+  private openStream(s: Stream) {
+    const sent = s.via ? s.via.subscribe(s.id, s.stream, s.params) : this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
+    if (!sent) s.onState?.({ status: "error", message: "还没连上服务器" });
+  }
+
+  /** Moves every stream of `to` onto its best path now: the direct link when there is one, else the relay. */
+  private rehome(to: string) {
+    const link = this.direct.get(to);
+    for (const s of [...this.streams.values()]) {
+      if (s.to !== to || s.via === link) continue;
+      if (s.via) s.via.unsubscribe(s.id);
+      else this.send({ type: "stream_unsubscribe", id: s.id, to });
+      this.streams.delete(s.id);
+      s.id = this.streamId();
+      s.via = link;
+      this.streams.set(s.id, s);
+      // Its viewer reads the page again when the stream reports open (it may have missed something).
+      this.openStream(s);
+    }
+  }
+
+  private tryDirectAll(now: boolean) {
+    if (AppState.currentState !== "active") return;
+    for (const d of Object.values(useLive.getState().devices)) if (d.kind === "host" && d.online) this.tryDirect(d.id, now);
+  }
+
+  /**
+   * Opens a direct link to a computer when the phone can reach it. Asked through the relay, which checks
+   * who the phone is; a phone on another network simply fails to connect and tries again later.
+   */
+  private tryDirect(to: string, now: boolean) {
+    if (this.closed || this.direct.get(to)?.open) return;
+    const t = this.directTry.get(to) ?? { busy: false, next: 0, fails: 0 };
+    this.directTry.set(to, t);
+    if (t.busy || (!now && Date.now() < t.next) || (now && t.next === Infinity)) return;
+    t.busy = true;
+    void (async () => {
+      try {
+        const offer = (await this.relayCall(to, "direct.offer", {}, 8000)) as DirectOffer;
+        const link = await DirectLink.open(to, offer, {
+          onStream: (frame) => this.onFrame(frame as ServerFrame),
+          onClose: (l) => this.directGone(l),
+        });
+        if (this.closed) return link.close();
+        t.fails = 0;
+        this.direct.set(to, link);
+        useLive.setState((s) => ({ direct: { ...s.direct, [to]: link.addr } }));
+        applog("info", "link", `direct link to ${useLive.getState().devices[to]?.name ?? to} via ${link.addr}`);
+        this.rehome(to);
+      } catch (e) {
+        t.fails++;
+        // A computer from before direct links: do not ask again while the app runs.
+        if (e instanceof RelayError && (e.code === "unsupported" || e.code === "forbidden")) t.next = Infinity;
+        else t.next = Date.now() + Math.min(5 * 60_000, 15_000 * 2 ** Math.min(t.fails - 1, 5));
+      } finally {
+        t.busy = false;
+      }
+    })();
+  }
+
+  private directGone(link: DirectLink) {
+    if (this.direct.get(link.to) !== link) return;
+    this.direct.delete(link.to);
+    useLive.setState((s) => {
+      const direct = { ...s.direct };
+      delete direct[link.to];
+      return { direct };
+    });
+    if (this.closed) return;
+    applog("info", "link", "direct link closed, using the relay");
+    // Often only a moment (the app was in the background): look again soon; a phone that left the network fails fast.
+    const t = this.directTry.get(link.to);
+    if (t) t.next = Date.now() + 3000;
+    this.rehome(link.to);
+  }
+
   call(to: string, method: RpcMethod, params: unknown, timeoutMs: number): Promise<unknown> {
+    const link = this.direct.get(to);
+    if (!link?.open || method === "direct.offer") return this.relayCall(to, method, params, timeoutMs);
+    return link.call(method, params, timeoutMs).catch((e: unknown) => {
+      if (!(e instanceof DirectError)) throw e;
+      // The link died under a read: ask the relay instead. Anything that changes something is not sent twice.
+      if ((e.code === "offline" || e.code === "timeout") && SAFE_AGAIN.has(method)) return this.relayCall(to, method, params, timeoutMs);
+      if (e.code !== "not_found") applog("warn", "rpc", `${method} failed over the direct link: ${e.code}: ${e.message}`, { to });
+      throw new RelayError(e.code, e.message);
+    });
+  }
+
+  private relayCall(to: string, method: RpcMethod, params: unknown, timeoutMs: number): Promise<unknown> {
     const id = `m${Date.now().toString(36)}${(this.seq++).toString(36)}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -369,6 +480,7 @@ class SocketLink implements Link {
   close() {
     this.closed = true;
     this.clearPongWait();
+    for (const d of [...this.direct.values()]) d.close();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.appSub?.remove();

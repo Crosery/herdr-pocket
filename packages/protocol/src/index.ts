@@ -402,6 +402,14 @@ export interface RpcMethods {
   };
   /** Subagent sessions under the agent's session (or under `sub`), newest first. */
   "session.children": { params: { agent: string; sub?: string }; result: { sessions: SubSession[] } };
+  /**
+   * A one-time ticket for a direct link to this computer (on the same network, or over a VPN such as
+   * Tailscale), so calls, streams and files skip the relay. Asked through the relay, which has already
+   * authenticated the phone. The phone connects to `ws://<one of addrs>:<port>${DIRECT_PATH}?ticket=`
+   * within a minute, and both ends seal every frame with `key` (`DirectCipher`). `unsupported` when
+   * the computer has direct links off.
+   */
+  "direct.offer": { params: Record<string, never>; result: DirectOffer };
   /** What can be created on this computer: spaces, programs, suggested folders. */
   "spaces.list": {
     params: Record<string, never>;
@@ -1325,3 +1333,127 @@ export const STATUS_ORDER: Record<AgentStatus, number> = {
   idle: 3,
   unknown: 4,
 };
+
+// ---------------------------------------------------------------------------
+// Direct links (phone <-> computer without the relay)
+
+/** What `direct.offer` returns. */
+export interface DirectOffer {
+  port: number;
+  /** This computer's addresses, the likeliest first (LAN, then VPN). */
+  addrs: string[];
+  /** Single use; dies at `expiresAt` if unused. */
+  ticket: string;
+  /** 32 bytes, base64: the ChaCha20-Poly1305 key of the one link this ticket opens. */
+  key: string;
+  expiresAt: number;
+}
+
+export const DIRECT_PATH = "/v1/direct";
+
+/**
+ * Authenticated encryption, RFC 8439 ChaCha20-Poly1305 (12-byte nonce, 16-byte tag appended). Each side
+ * brings its own implementation: Node's crypto on the computer, a JavaScript one in the app.
+ */
+export interface DirectAead {
+  seal(key: Uint8Array, nonce: Uint8Array, plain: Uint8Array): Uint8Array;
+  /** Null when the data was not sealed with this key and nonce. */
+  open(key: Uint8Array, nonce: Uint8Array, sealed: Uint8Array): Uint8Array | null;
+}
+
+/** Who sealed a frame: part of the nonce, so the two directions never share one. */
+export const DIRECT_FROM_PHONE = 1;
+export const DIRECT_FROM_HOST = 2;
+
+/** Nonce of the `n`th frame one side sends: its direction byte, then `n` as a 64-bit big-endian count. */
+export function directNonce(from: number, n: number): Uint8Array {
+  const nonce = new Uint8Array(12);
+  nonce[0] = from;
+  let x = n;
+  for (let i = 11; i >= 4; i--) {
+    nonce[i] = x % 256;
+    x = Math.floor(x / 256);
+  }
+  return nonce;
+}
+
+/**
+ * One end of a direct link. Frames are JSON text, sealed as binary WebSocket messages. Nonces are not
+ * sent: each side counts the frames it sends and receives (a WebSocket keeps them in order), so a frame
+ * replayed, dropped or reordered on the way fails to open and the link is closed.
+ */
+export class DirectCipher {
+  private sent = 0;
+  private received = 0;
+  private aead: DirectAead;
+  private key: Uint8Array;
+  private me: number;
+  constructor(aead: DirectAead, key: Uint8Array, me: number) {
+    this.aead = aead;
+    this.key = key;
+    this.me = me;
+  }
+
+  seal(text: string): Uint8Array {
+    return this.aead.seal(this.key, directNonce(this.me, this.sent++), utf8Encode(text));
+  }
+
+  /** The frame's text, or null when it is not the next frame from the other end. */
+  open(data: Uint8Array): string | null {
+    const other = this.me === DIRECT_FROM_PHONE ? DIRECT_FROM_HOST : DIRECT_FROM_PHONE;
+    const plain = this.aead.open(this.key, directNonce(other, this.received), data);
+    if (!plain) return null;
+    this.received++;
+    return utf8Decode(plain);
+  }
+}
+
+type TextCodecs = { TextEncoder?: new () => { encode(s: string): Uint8Array }; TextDecoder?: new () => { decode(b: Uint8Array): string } };
+const codecs = globalThis as unknown as TextCodecs;
+
+/** UTF-8 bytes of a string (the platform's encoder when there is one). */
+export function utf8Encode(s: string): Uint8Array {
+  if (codecs.TextEncoder) return new codecs.TextEncoder().encode(s);
+  const out: number[] = [];
+  for (let i = 0; i < s.length; i++) {
+    let c = s.charCodeAt(i);
+    if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d < 0xe000) {
+        c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
+        i++;
+      }
+    }
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return Uint8Array.from(out);
+}
+
+/** The string in UTF-8 bytes (the platform's decoder when there is one). */
+export function utf8Decode(b: Uint8Array): string {
+  if (codecs.TextDecoder) return new codecs.TextDecoder().decode(b);
+  let s = "";
+  const chunk: number[] = [];
+  const flush = () => {
+    s += String.fromCharCode(...chunk);
+    chunk.length = 0;
+  };
+  for (let i = 0; i < b.length; ) {
+    const x = b[i]!;
+    let c: number;
+    if (x < 0x80) (c = x), (i += 1);
+    else if (x < 0xe0) (c = ((x & 31) << 6) | (b[i + 1]! & 63)), (i += 2);
+    else if (x < 0xf0) (c = ((x & 15) << 12) | ((b[i + 1]! & 63) << 6) | (b[i + 2]! & 63)), (i += 3);
+    else (c = ((x & 7) << 18) | ((b[i + 1]! & 63) << 12) | ((b[i + 2]! & 63) << 6) | (b[i + 3]! & 63)), (i += 4);
+    if (c >= 0x10000) {
+      c -= 0x10000;
+      chunk.push(0xd800 + (c >> 10), 0xdc00 + (c & 1023));
+    } else chunk.push(c);
+    if (chunk.length > 8000) flush();
+  }
+  flush();
+  return s;
+}

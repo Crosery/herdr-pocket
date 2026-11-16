@@ -13,7 +13,7 @@
       "supportsTablet": false,
       "infoPlist": {
         "CFBundleDevelopmentRegion": "zh-Hans",
-        "NSLocalNetworkUsageDescription": "连接局域网里自建的 Herdr Pocket 服务器",
+        "NSLocalNetworkUsageDescription": "直连同一网络里的电脑，或连接局域网里自建的 Herdr Pocket 服务器",
         "UIBackgroundModes": [
           "audio"
         ]

@@ -109,6 +109,8 @@ interface LiveState {
   /** Agents keyed by host deviceId. */
   agents: Record<string, Agent[]>;
   lastError: string | null;
+  /** Computers this phone reaches directly (no relay): device id -> the address used. */
+  direct: Record<string, string>;
   reset: () => void;
 }
 
@@ -119,7 +121,8 @@ export const useLive = create<LiveState>()((set) => ({
   devices: {},
   agents: {},
   lastError: null,
-  reset: () => set({ link: "idle", rttMs: null, self: null, devices: {}, agents: {}, lastError: null }),
+  direct: {},
+  reset: () => set({ link: "idle", rttMs: null, self: null, devices: {}, agents: {}, lastError: null, direct: {} }),
 }));
 
 export function allAgents(agents: Record<string, Agent[]>): Agent[] {

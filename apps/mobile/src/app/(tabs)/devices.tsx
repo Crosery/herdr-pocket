@@ -28,7 +28,9 @@ function DeviceRow({ d, isSelf, agentCount, onRevoke }: { d: Device; isSelf: boo
   const p = usePalette();
   const [menu, setMenu] = useState(false);
   const icon = PLATFORM_ICON[d.platform ?? ""] ?? (d.kind === "host" ? "laptop" : "cellphone");
-  const sub = [PLATFORM_LABEL[d.platform ?? ""] ?? d.platform, d.kind === "host" ? `${agentCount} 个 agent` : "手机端", d.online ? "在线" : `离线 · ${relTime(d.lastSeenAt)}`]
+  // A phone on the same network (or VPN) as the computer talks to it directly.
+  const direct = useLive((x) => x.direct[d.id]);
+  const sub = [PLATFORM_LABEL[d.platform ?? ""] ?? d.platform, d.kind === "host" ? `${agentCount} 个 agent` : "手机端", d.online ? "在线" : `离线 · ${relTime(d.lastSeenAt)}`, direct ? "直连" : null]
     .filter(Boolean)
     .join(" · ");
   return (
