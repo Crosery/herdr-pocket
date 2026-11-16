@@ -137,6 +137,8 @@ class SocketLink implements Link {
   private backoff = 1000;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  /** Set while a ping waits for its pong; firing means the socket is dead even if it still says open. */
+  private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private appSub: NativeEventSubscription | null = null;
   private closed = false;
   /** Set once the relay greets this socket; a close before that may mean a rejected token. */
@@ -146,7 +148,15 @@ class SocketLink implements Link {
     this.open();
     this.pingTimer = setInterval(() => this.ping(), 20_000);
     this.appSub = AppState.addEventListener("change", (s: AppStateStatus) => {
-      if (s === "active" && (!this.ws || this.ws.readyState > WebSocket.OPEN)) this.reconnectNow();
+      if (s !== "active") {
+        // Timers stop in the background; a pong check started now would only misfire on return.
+        this.clearPongWait();
+        return;
+      }
+      // Android often drops the connection of an app in the background without telling it. A socket that
+      // still says open is asked at once, so a dead one is replaced in seconds, not when a call times out.
+      if (this.ws?.readyState === WebSocket.OPEN) this.ping();
+      else if (!this.ws || this.ws.readyState > WebSocket.OPEN) this.reconnectNow();
     });
   }
 
@@ -190,6 +200,7 @@ class SocketLink implements Link {
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;
       this.ws = null;
+      this.clearPongWait();
       this.failPending("offline", "连接断开了");
       if (this.closed) return;
       applog(this.welcomed ? "warn" : "info", "link", `socket closed ${ev.code}${ev.reason ? ` ${ev.reason}` : ""}${this.welcomed ? "" : " before welcome"}, retry in ${Math.round(this.backoff / 1000)}s`);
@@ -220,10 +231,18 @@ class SocketLink implements Link {
 
   private reconnectNow() {
     if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.clearPongWait();
     this.backoff = 1000;
     this.ws?.close();
     this.ws = null;
+    // Calls sent on the old socket will never be answered: fail them now so they are asked again on the new one.
+    this.failPending("offline", "连接断开了");
     this.open();
+  }
+
+  private clearPongWait() {
+    if (this.pongTimer) clearTimeout(this.pongTimer);
+    this.pongTimer = null;
   }
 
   private onFrame(f: ServerFrame) {
@@ -279,6 +298,7 @@ class SocketLink implements Link {
         break;
       }
       case "pong":
+        this.clearPongWait();
         useLive.setState({ rttMs: Math.max(0, Date.now() - f.t) });
         break;
       case "error":
@@ -307,7 +327,12 @@ class SocketLink implements Link {
   }
 
   ping() {
-    this.send({ type: "ping", t: Date.now() });
+    if (!this.send({ type: "ping", t: Date.now() }) || this.pongTimer) return;
+    this.pongTimer = setTimeout(() => {
+      this.pongTimer = null;
+      applog("warn", "link", `no pong in ${PONG_WAIT_MS / 1000}s, reconnecting`);
+      this.reconnectNow();
+    }, PONG_WAIT_MS);
   }
 
   private streamId() {
@@ -343,6 +368,7 @@ class SocketLink implements Link {
 
   close() {
     this.closed = true;
+    this.clearPongWait();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.appSub?.remove();
@@ -352,6 +378,9 @@ class SocketLink implements Link {
     this.ws = null;
   }
 }
+
+/** How long a ping may wait for its pong before the socket counts as dead. */
+const PONG_WAIT_MS = 6000;
 
 /** Close code the relay uses when a device token is revoked. */
 export const REVOKED_CLOSE_CODE = 4001;
