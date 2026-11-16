@@ -12,9 +12,13 @@ Pod::Spec.new do |s|
   s.static_framework = true
 
   s.dependency 'ExpoModulesCore'
+  s.dependency 'onnxruntime-objc', '~> 1.30.0'
 
   s.frameworks = 'AVFoundation', 'PhotosUI', 'UserNotifications', 'Network'
   s.source_files = '**/*.{h,m,swift}'
+  s.resource_bundles = {
+    'PocketNativeVoice' => ['Resources/voice/*.onnx']
+  }
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'SWIFT_COMPILATION_MODE' => 'wholemodule'

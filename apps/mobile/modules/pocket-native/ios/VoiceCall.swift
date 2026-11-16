@@ -42,9 +42,10 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
    * reported its end, and a call started meanwhile waits for it here instead of
    * having its own session switched off by the one before.
    */
-  private static let sessionQueue = DispatchQueue(label: "dev.crosery.pocket.audio-session")
+  static let sessionQueue = DispatchQueue(label: "dev.crosery.pocket.audio-session")
 
   static func start(server: String, token: String) {
+    VoiceLab.stop()
     currentLock.lock()
     if _current != nil {
       currentLock.unlock()
@@ -89,6 +90,14 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
   private let server: String
   private let token: String
   private let q = DispatchQueue(label: "dev.crosery.pocket.voice", qos: .userInteractive)
+  private let spkQueue = DispatchQueue(label: "dev.crosery.pocket.spk", qos: .userInitiated)
+  private let useDenoise: Bool
+  private let voiceThreshold: Float
+  private let enrolledVoice: [Float]?
+  private var voiceModels: VoiceModels?
+  private var filter: VoiceFilter?
+  private var modelsLoaded = false
+  private var filterReset = false
 
   private var session: URLSession?
   private var ws: URLSessionWebSocketTask?
@@ -133,6 +142,9 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
   private init(server: String, token: String) {
     self.server = server
     self.token = token
+    self.useDenoise = VoicePrefs.denoise
+    self.voiceThreshold = VoicePrefs.threshold
+    self.enrolledVoice = VoicePrefs.filter ? VoicePrefs.embedding : nil
     super.init()
   }
 
@@ -140,6 +152,33 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
 
   private func begin() {
     PocketBus.emit("onCall", ["state": "connecting"])
+    let needSpeaker = enrolledVoice != nil && VoiceModelManager.isSpeakerReady()
+    if useDenoise || needSpeaker {
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let loaded = try? VoiceModelManager.openModels(needSpeaker: needSpeaker)
+        self?.q.async {
+          guard let self else { return }
+          if self.ended { return }
+          self.voiceModels = loaded
+          if let loaded, self.useDenoise || (self.enrolledVoice != nil && loaded.speaker != nil) {
+            self.filter = VoiceFilter(
+              loaded,
+              VoiceFilter.Options(denoise: self.useDenoise, enrolled: self.enrolledVoice, threshold: self.voiceThreshold),
+              worker: { [weak self] job in self?.spkQueue.async(execute: job) },
+              emit: { [weak self] pcm in
+                guard let self, !self.ended else { return }
+                let lv = pcmLevel(pcm)
+                self.micLevel = self.muted ? 0 : lv
+                if self.ready && !self.muted { self.ws?.send(.data(pcm)) { _ in } }
+              }
+            )
+          }
+          self.modelsLoaded = true
+        }
+      }
+    } else {
+      modelsLoaded = true
+    }
     do {
       try openAudio()
     } catch {
@@ -301,9 +340,27 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
       let start = micPending.startIndex
       let frame = micPending.subdata(in: start ..< start + micFrameBytes)
       micPending = micPending.subdata(in: start + micFrameBytes ..< micPending.endIndex)
-      micLevel = muted ? 0 : pcmLevel(frame)
-      // Silence keeps flowing while muted: the model expects a continuous realtime stream.
-      if ready { ws?.send(.data(muted ? silence : frame)) { _ in } }
+      if muted {
+        if filterReset {
+          filterReset = false
+          filter?.reset()
+        }
+        micLevel = 0
+        // Silence keeps flowing while muted: the model expects a continuous realtime stream.
+        if ready { ws?.send(.data(silence)) { _ in } }
+      } else if let vf = filter {
+        filterReset = false
+        let before = vf.hopsIn
+        micLevel *= 0.6
+        vf.push(frame)
+        if vf.hopsIn == before { micLevel = 0 }
+      } else if !modelsLoaded && (useDenoise || enrolledVoice != nil) {
+        // Models are still loading (~150 ms at call start); hold mic frames until ready instead of leaking raw audio.
+        micLevel = 0
+      } else {
+        micLevel = pcmLevel(frame)
+        if ready { ws?.send(.data(frame)) { _ in } }
+      }
     }
   }
 
@@ -572,6 +629,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     muted = value
     q.async {
       if self.ended { return }
+      if value { self.filterReset = true }
       if self.ready { self.sendJSON(["action": "mic_state", "enabled": !value]) }
       PocketBus.emit("onCall", ["state": "ready", "muted": value])
     }
@@ -598,13 +656,27 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
 
   /// Mid-reply stalls of the jitter buffer, its cushion and stopped replies. iOS reports no underruns: -1.
   private func stats() -> [String: Any] {
-    ["action": "call.stats", "data": [
+    var d: [String: Any] = [
       "stalls": playout.stalls,
       "target_ms": Int64(playout.targetMs),
       "max_target_ms": Int64(playout.maxTargetMs),
       "underruns": -1,
       "stops": stops,
-    ]]
+    ]
+    if let f = filter {
+      if f.hopsIn > 0 {
+        d["denoise_us"] = f.denoiseNs / 1000 / f.hopsIn
+        d["denoise_max_ms"] = f.denoiseMaxNs / 1_000_000
+      }
+      if f.checks > 0 {
+        d["vp_checks"] = f.checks
+        d["vp_max_ms"] = f.checkMsMax
+        d["vp_passed"] = f.passed
+        d["vp_blocked"] = f.blocked
+        d["vp_hold_ms"] = f.holds > 0 ? f.holdMsSum / Int64(f.holds) : 0
+      }
+    }
+    return ["action": "call.stats", "data": d]
   }
 
   /// On `q`.
@@ -624,6 +696,12 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     // How the speaker did, for the app's log: what a real call leaves to look at afterwards.
     let s = stats()
     closeAudio()
+    filter = nil
+    let modelsToDrop = voiceModels
+    voiceModels = nil
+    spkQueue.async {
+      _ = modelsToDrop
+    }
     if let json = jsonString(s) {
       NSLog("PocketVoice %@", json)
       PocketBus.emit("onCallEvent", ["json": json])

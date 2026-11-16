@@ -17,6 +17,7 @@ import { fonts } from "../theme/tokens";
 import { useAlertSync } from "../lib/alerts";
 import { IconTile } from "../components/ui";
 import { useHarnessIconSync } from "../lib/harnessRemote";
+import { syncNativeVoice } from "../lib/voice";
 
 SplashScreen.preventAutoHideAsync().catch(() => undefined);
 
@@ -109,7 +110,10 @@ export default function RootLayout() {
   useEffect(() => startAppLog(), []);
 
   useEffect(() => {
-    if (ready) SplashScreen.hideAsync().catch(() => undefined);
+    if (ready) {
+      syncNativeVoice();
+      SplashScreen.hideAsync().catch(() => undefined);
+    }
   }, [ready]);
 
   if (!ready) return null;

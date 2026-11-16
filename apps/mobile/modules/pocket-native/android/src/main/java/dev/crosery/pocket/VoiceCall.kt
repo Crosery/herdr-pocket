@@ -16,6 +16,10 @@ import android.os.Build
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import dev.crosery.pocket.voice.VoiceFilter
+import dev.crosery.pocket.voice.VoiceLab
+import dev.crosery.pocket.voice.VoiceModelManager
+import dev.crosery.pocket.voice.VoiceModels
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -24,6 +28,8 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
@@ -86,7 +92,24 @@ class VoiceCall(
   @Volatile private var ready = false
   @Volatile var muted = false
     private set
+  @Volatile private var filterReset = false
   @Volatile private var micLevel = 0f
+
+  private val useDenoise: Boolean
+  private val voiceThreshold: Float
+  private val enrolledVoice: FloatArray?
+  private val modelsReady = CountDownLatch(1)
+  @Volatile private var voiceModels: VoiceModels? = null
+  @Volatile private var filter: VoiceFilter? = null
+  private val spkExec = Executors.newSingleThreadExecutor { r -> Thread(r, "pocket-spk").apply { isDaemon = true } }
+  private var micThread: Thread? = null
+
+  init {
+    val p = Prefs(ctx)
+    useDenoise = p.voiceDenoise
+    voiceThreshold = p.voiceThreshold
+    enrolledVoice = if (p.voiceFilter) p.voiceEmbedding else null
+  }
 
   // Playback ledger; guarded by `lock`.
   private val lock = Any()
@@ -108,7 +131,22 @@ class VoiceCall(
 
   fun start() {
     current = this
+    VoiceLab.stop()
     PocketBus.emit("onCall", mapOf("state" to "connecting"))
+    val needSpeaker = enrolledVoice != null && VoiceModelManager.isSpeakerReady(ctx)
+    if (useDenoise || needSpeaker) {
+      thread("pocket-models") {
+        try {
+          voiceModels = VoiceModelManager.openModels(ctx, needSpeaker)
+        } catch (e: Throwable) {
+          Log.w(TAG, "voice models", e)
+        } finally {
+          modelsReady.countDown()
+        }
+      }
+    } else {
+      modelsReady.countDown()
+    }
     try {
       openAudio()
     } catch (e: Throwable) {
@@ -119,12 +157,12 @@ class VoiceCall(
     // The token rides in a header: a URL ends up in reverse-proxy access logs.
     val req = Request.Builder().url(wsUrl(server, "/v1/assistant/live")).header("Authorization", "Bearer $token").build()
     ws = client.newWebSocket(req, Listener())
-    thread("pocket-mic") { micLoop() }
+    micThread = thread("pocket-mic") { micLoop() }
     thread("pocket-play") { playLoop() }
     thread("pocket-ack") { ackLoop() }
   }
 
-  private fun thread(name: String, body: () -> Unit) {
+  private fun thread(name: String, body: () -> Unit): Thread {
     val t = Thread({
       try {
         body()
@@ -135,6 +173,7 @@ class VoiceCall(
     t.isDaemon = true
     threads.add(t)
     t.start()
+    return t
   }
 
   // ----------------------------------------------------------------------- audio setup
@@ -166,9 +205,9 @@ class VoiceCall(
       rec.release()
       throw IllegalStateException("没有麦克风权限")
     }
-    // Hear the person, not our own voice coming out of the speaker.
+    // Hear the person, not our own voice coming out of the speaker. When GTCRN runs, leave hardware NS off to avoid double-filtering.
     if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(rec.audioSessionId)?.let { it.enabled = true; effects.add(it) }
-    if (NoiseSuppressor.isAvailable()) NoiseSuppressor.create(rec.audioSessionId)?.let { it.enabled = true; effects.add(it) }
+    if (!useDenoise && NoiseSuppressor.isAvailable()) NoiseSuppressor.create(rec.audioSessionId)?.let { it.enabled = true; effects.add(it) }
     if (AutomaticGainControl.isAvailable()) AutomaticGainControl.create(rec.audioSessionId)?.let { it.enabled = true; effects.add(it) }
     record = rec
 
@@ -236,6 +275,24 @@ class VoiceCall(
   private fun micLoop() {
     Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
     val rec = record ?: return
+    try { modelsReady.await() } catch (_: InterruptedException) { return }
+    val models = voiceModels
+    val vf = if (models != null && (useDenoise || (enrolledVoice != null && models.speaker != null))) {
+      VoiceFilter(
+        models,
+        VoiceFilter.Options(denoise = useDenoise, enrolled = enrolledVoice, threshold = voiceThreshold),
+        worker = { r -> if (!ended) try { spkExec.execute(r) } catch (_: Throwable) {} },
+        emit = { buf, off, len ->
+          val lv = rms(buf, off, len)
+          micLevel = if (muted) 0f else lv
+          if (ready && !muted) ws?.send(buf.toByteString(off, len))
+        },
+        onVerdict = { pass, score, kind ->
+          Log.d(TAG, "voiceprint $kind score=${"%.3f".format(score)} pass=$pass")
+        },
+      )
+    } else null
+    filter = vf
     val frame = ByteArray(MIC_FRAME_BYTES)
     val silence = ByteArray(MIC_FRAME_BYTES)
     while (!ended) {
@@ -248,9 +305,25 @@ class VoiceCall(
         }
         off += n
       }
-      micLevel = if (muted) 0f else rms(frame, frame.size)
-      // Silence keeps flowing while muted: the model expects a continuous realtime stream.
-      if (ready) ws?.send((if (muted) silence else frame).toByteString(0, frame.size))
+      if (muted) {
+        if (filterReset) {
+          filterReset = false
+          vf?.reset()
+        }
+        micLevel = 0f
+        // Silence keeps flowing while muted: the model expects a continuous realtime stream.
+        if (ready) ws?.send(silence.toByteString(0, silence.size))
+      } else if (vf != null) {
+        filterReset = false
+        val before = vf.hopsIn
+        // Decay orb level gently while holding a syllable or blocking a non-owner voice.
+        micLevel *= 0.6f
+        vf.push(frame, 0, frame.size)
+        if (vf.hopsIn == before) micLevel = 0f
+      } else {
+        micLevel = rms(frame, 0, frame.size)
+        if (ready) ws?.send(frame.toByteString(0, frame.size))
+      }
     }
   }
 
@@ -492,7 +565,7 @@ class VoiceCall(
         val ref = contexts.removeFirstOrNull() ?: return
         if (stoppedRuns.contains(ref.runId)) return
         scope(ref.runId, ref.turnId).outstanding++
-        playout.push(Chunk(ref, pcm, pcm.size / 2, rms(pcm, pcm.size)), SystemClock.elapsedRealtime())
+        playout.push(Chunk(ref, pcm, pcm.size / 2, rms(pcm, 0, pcm.size)), SystemClock.elapsedRealtime())
       }
     }
 
@@ -515,6 +588,7 @@ class VoiceCall(
 
   fun setMuted(value: Boolean) {
     muted = value
+    if (value) filterReset = true
     if (ready) ws?.send(JSONObject().put("action", "mic_state").put("enabled", !value).toString())
     PocketBus.emit("onCall", mapOf("state" to "ready", "muted" to value))
   }
@@ -527,11 +601,17 @@ class VoiceCall(
   /** Mid-reply stalls of the jitter buffer, its cushion, AudioTrack underruns (silence ones too) and stopped replies. */
   private fun stats(): JSONObject = synchronized(lock) {
     val underruns = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) track?.underrunCount ?: -1 else -1
-    JSONObject().put("action", "call.stats").put(
-      "data",
-      JSONObject().put("stalls", playout.stalls).put("target_ms", playout.targetMs.toLong())
-        .put("max_target_ms", playout.maxTargetMs.toLong()).put("underruns", underruns).put("stops", stops),
-    )
+    val d = JSONObject().put("stalls", playout.stalls).put("target_ms", playout.targetMs.toLong())
+      .put("max_target_ms", playout.maxTargetMs.toLong()).put("underruns", underruns).put("stops", stops)
+    filter?.let { f ->
+      if (f.hopsIn > 0) d.put("denoise_us", f.denoiseNs / 1000 / f.hopsIn).put("denoise_max_ms", f.denoiseMaxNs / 1_000_000)
+      if (f.checks > 0) {
+        d.put("vp_checks", f.checks).put("vp_max_ms", f.checkMsMax)
+          .put("vp_passed", f.passed).put("vp_blocked", f.blocked)
+          .put("vp_hold_ms", if (f.holds > 0) f.holdMsSum / f.holds else 0)
+      }
+    }
+    JSONObject().put("action", "call.stats").put("data", d)
   }
 
   @Synchronized
@@ -544,6 +624,12 @@ class VoiceCall(
     // How the speaker did, for the app's log: what a real call leaves to look at afterwards.
     val stats = try { stats() } catch (_: Throwable) { null }
     closeAudio()
+    try { micThread?.join(1500) } catch (_: InterruptedException) {}
+    spkExec.shutdownNow()
+    try { spkExec.awaitTermination(1500, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
+    try { voiceModels?.close() } catch (_: Throwable) {}
+    voiceModels = null
+    filter = null
     client.dispatcher.executorService.shutdown()
     stats?.let {
       Log.i(TAG, it.toString())
@@ -554,12 +640,12 @@ class VoiceCall(
   }
 }
 
-private fun rms(pcm: ByteArray, len: Int): Float {
+private fun rms(pcm: ByteArray, off: Int, len: Int): Float {
   var sum = 0.0
   var n = 0
   var i = 0
   while (i + 1 < len) {
-    val s = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)).toShort().toInt()
+    val s = ((pcm[off + i + 1].toInt() shl 8) or (pcm[off + i].toInt() and 0xFF)).toShort().toInt()
     sum += (s * s).toDouble()
     n++
     i += 2

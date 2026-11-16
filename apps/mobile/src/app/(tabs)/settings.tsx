@@ -5,10 +5,9 @@ import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import Animated, { interpolateColor, useAnimatedStyle, useDerivedValue, withTiming } from "react-native-reanimated";
 import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
 import { Card, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
-import { Row, RowDivider as Divider, type RowIcon as IconName } from "../../components/rows";
+import { Row, RowDivider as Divider, Toggle, type RowIcon as IconName } from "../../components/rows";
 import { ConfigSnackbar } from "../../components/configParts";
 import { Bow, Mascot } from "../../components/Mascot";
 import { useLive, useSettings, type ThemeMode } from "../../lib/store";
@@ -18,9 +17,10 @@ import { loadAssistant, setAssistantConfirm, useAssistant } from "../../lib/assi
 import { useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
 import { alertsInBackground, alertsSupported, askNotificationPermission, refreshAlertState, useAlerts } from "../../lib/alerts";
 import { checkForUpdate, currentVersion, downloadUpdate, installUpdate, resumeInstallIfAllowed, updatesSupported, useNewRelease, useUpdate } from "../../lib/update";
+import { syncNativeVoice, voiceprintSupported } from "../../lib/voice";
 import { PocketNative } from "../../../modules/pocket-native";
 import { usePalette } from "../../theme/theme";
-import { fonts, motion, radius, space } from "../../theme/tokens";
+import { fonts, radius, space } from "../../theme/tokens";
 
 const LINK_TEXT = { idle: "未连接", connecting: "连接中…", online: "已连接", offline: "断开了，重连中", unauthorized: "授权失效" } as const;
 const SCALES = [
@@ -180,6 +180,9 @@ export default function SettingsScreen() {
 
         <SectionHeader title="小羊的模型和说话方式" />
         <AssistantConfigCard />
+
+        <SectionHeader title="通话声音" />
+        <VoiceLocalCard demo={demo} />
 
         <SectionHeader title="列表" />
         <Card style={{ paddingVertical: space.xs }}>
@@ -453,27 +456,41 @@ function UpdateRow({ demo }: { demo: boolean }) {
   );
 }
 
-/** Pill switch in the app's pink; the stock one does not take the palette on every phone. */
-function Toggle({ value, onChange, disabled, label }: { value: boolean; onChange: (v: boolean) => void; disabled?: boolean; label: string }) {
-  const p = usePalette();
-  const t = useDerivedValue(() => withTiming(value ? 1 : 0, { duration: motion.quick, easing: motion.glide }), [value]);
-  const off = p.dark ? "#4A4158" : "#E4DCEC";
-  const track = useAnimatedStyle(() => ({ backgroundColor: interpolateColor(t.value, [0, 1], [off, p.primary]) }), [off, p.primary]);
-  const knob = useAnimatedStyle(() => ({ transform: [{ translateX: t.value * 22 }] }));
+function VoiceLocalCard({ demo }: { demo: boolean }) {
+  const voiceDenoise = useSettings((x) => x.voiceDenoise);
+  const voiceFilter = useSettings((x) => x.voiceFilter);
+  const voiceprint = useSettings((x) => x.voiceprint);
+  const set = useSettings((x) => x.set);
+  const ok = voiceprintSupported || demo;
+  const vpSub = !ok
+    ? "需要装新版 App"
+    : !voiceprint
+      ? "未录入 · 任何人说话或外放都会传给小羊"
+      : voiceFilter
+        ? `已开启 · 已录入（约 ${Math.round(voiceprint.seconds)} 秒）`
+        : `已录入（约 ${Math.round(voiceprint.seconds)} 秒）· 暂时关闭`;
   return (
-    <Pressable
-      accessibilityRole="switch"
-      accessibilityLabel={label}
-      accessibilityState={{ checked: value, disabled: !!disabled }}
-      disabled={disabled}
-      hitSlop={10}
-      onPress={() => onChange(!value)}
-      style={{ opacity: disabled ? 0.5 : 1 }}
-    >
-      <Animated.View style={[{ width: 52, height: 30, borderRadius: 15, padding: 3 }, track]}>
-        <Animated.View style={[{ width: 24, height: 24, borderRadius: 12, backgroundColor: "#FFFFFF", elevation: 2, shadowColor: "#000", shadowOpacity: 0.15, shadowRadius: 2, shadowOffset: { width: 0, height: 1 } }, knob]} />
-      </Animated.View>
-    </Pressable>
+    <Card style={{ paddingVertical: space.xs }}>
+      <Row
+        icon="waveform"
+        title="通话降噪"
+        sub={!ok ? "需要装新版 App" : voiceDenoise ? "已开启 · 实时滤掉环境杂音" : "已关闭 · 原样传给语音模型"}
+        dim={!ok}
+        right={
+          <Toggle
+            label="通话降噪"
+            value={voiceDenoise}
+            disabled={!ok}
+            onChange={(v) => {
+              set({ voiceDenoise: v });
+              syncNativeVoice();
+            }}
+          />
+        }
+      />
+      <Divider />
+      <Row icon="shield-account-outline" title="只认我的声音" sub={vpSub} dim={!ok} onPress={ok ? () => router.push("/voiceprint") : undefined} />
+    </Card>
   );
 }
 

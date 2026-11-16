@@ -11,6 +11,23 @@ export interface PickedImage {
   bytes: number;
 }
 
+export interface NativeVoiceState {
+  denoise: boolean;
+  filter: boolean;
+  threshold: number;
+  enrolled: boolean;
+  modelReady: boolean;
+  modelDownloading: boolean;
+  modelSize: number;
+}
+
+export interface EnrolledVoiceprint {
+  embedding: number[];
+  seconds: number;
+  consistency: number;
+  lowest: number;
+}
+
 /**
  * Native side: voice call audio, alerts as notifications, in-app updates, picking pictures.
  * Android (Kotlin) has all of it. iOS (Swift) has voice, pictures and notifications while
@@ -44,6 +61,17 @@ interface PocketNativeModule {
    * each a base64 JPEG whose longest side is at most `maxSide`. Cancelled: [].
    */
   pickImages?(max: number, maxSide: number, quality: number): Promise<PickedImage[]>;
+  /** On-device voice denoising and owner voiceprint filtering (absent in older builds). */
+  voiceState?(): NativeVoiceState;
+  setVoiceSettings?(denoise: boolean, filter: boolean, threshold: number): void;
+  setVoiceprint?(embedding: number[] | null): void;
+  prepareVoiceModel?(): Promise<boolean>;
+  cancelVoiceModel?(): void;
+  startVoiceEnroll?(): Promise<boolean>;
+  finishVoiceEnroll?(): Promise<EnrolledVoiceprint>;
+  cancelVoiceEnroll?(): void;
+  startVoiceTest?(threshold: number): Promise<boolean>;
+  stopVoiceTest?(): void;
   addListener(event: "onCall", fn: (e: { state: "connecting" | "ready" | "ended"; message?: string; muted?: boolean }) => void): EventSubscription;
   addListener(event: "onCallEvent", fn: (e: { json: string }) => void): EventSubscription;
   addListener(event: "onLevel", fn: (e: { mic: number; out: number }) => void): EventSubscription;
@@ -51,6 +79,9 @@ interface PocketNativeModule {
   /** iOS also reports `notificationsAllowed` when the person changes it in system settings. */
   addListener(event: "onNotifier", fn: (e: { connected: boolean; notificationsAllowed?: boolean }) => void): EventSubscription;
   addListener(event: "onUpdateProgress", fn: (e: { received: number; total: number }) => void): EventSubscription;
+  addListener(event: "onVoiceModelProgress", fn: (e: { received: number; total: number }) => void): EventSubscription;
+  addListener(event: "onEnrollProgress", fn: (e: { level: number; seconds: number; full: boolean }) => void): EventSubscription;
+  addListener(event: "onVoiceTest", fn: (e: { level: number; speaking: boolean; score?: number; pass?: boolean }) => void): EventSubscription;
 }
 
 /** Null in builds without the module (e.g. a JS-only reload of an older APK). */

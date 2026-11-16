@@ -2,8 +2,9 @@ import type { ComponentProps, ReactNode } from "react";
 import { Platform, Pressable, View } from "react-native";
 import { Text } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
+import Animated, { interpolateColor, useAnimatedStyle, useDerivedValue, withTiming } from "react-native-reanimated";
 import { usePalette } from "../theme/theme";
-import { fonts, radius, space } from "../theme/tokens";
+import { fonts, motion, radius, space } from "../theme/tokens";
 
 export type RowIcon = ComponentProps<typeof MaterialCommunityIcons>["name"];
 
@@ -64,6 +65,30 @@ export function Row({
       style={({ pressed }) => (pressed && Platform.OS === "ios" ? { backgroundColor: p.surface3 } : null)}
     >
       {body}
+    </Pressable>
+  );
+}
+
+/** Pill switch in the app's pink; the stock one does not take the palette on every phone. */
+export function Toggle({ value, onChange, disabled, label }: { value: boolean; onChange: (v: boolean) => void; disabled?: boolean; label: string }) {
+  const p = usePalette();
+  const t = useDerivedValue(() => withTiming(value ? 1 : 0, { duration: motion.quick, easing: motion.glide }), [value]);
+  const off = p.dark ? "#4A4158" : "#E4DCEC";
+  const track = useAnimatedStyle(() => ({ backgroundColor: interpolateColor(t.value, [0, 1], [off, p.primary]) }), [off, p.primary]);
+  const knob = useAnimatedStyle(() => ({ transform: [{ translateX: t.value * 22 }] }));
+  return (
+    <Pressable
+      accessibilityRole="switch"
+      accessibilityLabel={label}
+      accessibilityState={{ checked: value, disabled: !!disabled }}
+      disabled={disabled}
+      hitSlop={10}
+      onPress={() => onChange(!value)}
+      style={{ opacity: disabled ? 0.5 : 1 }}
+    >
+      <Animated.View style={[{ width: 52, height: 30, borderRadius: 15, padding: 3 }, track]}>
+        <Animated.View style={[{ width: 24, height: 24, borderRadius: 12, backgroundColor: "#FFFFFF", elevation: 2, shadowColor: "#000", shadowOpacity: 0.15, shadowRadius: 2, shadowOffset: { width: 0, height: 1 } }, knob]} />
+      </Animated.View>
     </Pressable>
   );
 }
