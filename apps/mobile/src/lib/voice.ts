@@ -155,7 +155,12 @@ export function applyCallEvent(action: string | undefined, d: Record<string, any
       break;
     case "call.stats":
       // From the native player when a call ends: how smooth the speech was on this phone.
-      applog(d.stalls || d.underruns > 0 ? "warn" : "info", "voice", `call audio: ${d.stalls ?? 0} stalls, ${d.underruns ?? -1} underruns, cushion ${d.target_ms ?? 0}/${d.max_target_ms ?? 0} ms, ${d.stops ?? 0} cut`, d);
+      applog(
+        d.stalls || d.underruns > 0 ? "warn" : "info",
+        "voice",
+        `call audio: ${d.stalls ?? 0} stalls, ${d.underruns ?? -1} underruns, cushion ${d.target_ms ?? 0}/${d.max_target_ms ?? 0} ms, ${d.stops ?? 0} cut${d.denoise_us != null ? `, denoise ${d.denoise_us} us/hop` : ""}${d.vp_checks != null ? `, vp ${d.vp_passed ?? 0}/${d.vp_blocked ?? 0} (${d.vp_hold_ms ?? 0} ms hold)` : ""}`,
+        d,
+      );
       break;
     case "error":
       applog("warn", "voice", `voice service error ${d.error?.code ?? "unknown"}`);
@@ -177,6 +182,15 @@ export function applyCallLevel(mic: number, out: number): void {
 }
 
 export const voiceSupported = !!PocketNative;
+export const voiceprintSupported = !!PocketNative?.voiceState;
+
+/** Keeps native call preprocessing settings in sync with this phone's saved settings. */
+export function syncNativeVoice(): void {
+  if (!PocketNative?.setVoiceSettings) return;
+  const s = useSettings.getState();
+  PocketNative.setVoiceSettings(s.voiceDenoise, s.voiceFilter, s.voiceThreshold);
+  PocketNative.setVoiceprint?.(s.voiceprint?.embedding ?? null);
+}
 
 let wired = false;
 function wire() {
@@ -213,7 +227,7 @@ function wire() {
 wire();
 
 /** Asks for the microphone: Android through PermissionsAndroid, iOS through the native module (the system dialog shows the app.json wording). */
-async function micAllowed(): Promise<boolean> {
+export async function micAllowed(): Promise<boolean> {
   if (Platform.OS === "ios") return (await PocketNative?.requestMicrophone?.().catch(() => false)) ?? false;
   const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO, {
     title: "用麦克风和助理说话",
@@ -236,6 +250,7 @@ export async function startCall(): Promise<string | null> {
   if (!(await micAllowed())) return "没有麦克风权限，没法语音。可以在系统设置里打开";
   const token = await loadToken();
   if (!token) return "这台手机还没配对";
+  syncNativeVoice();
   useVoice.setState({ status: "connecting", message: null, muted: false, startedAt: null, ...QUIET });
   PocketNative.startCall(server, token);
   return null;

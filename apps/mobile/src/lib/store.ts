@@ -50,6 +50,11 @@ interface SettingsState {
   updateCheckedAt: number;
   updateRelease: ReleaseInfo | null;
   updatePrompted: string | null;
+  /** On-device call denoising and owner voiceprint filter. */
+  voiceDenoise: boolean;
+  voiceFilter: boolean;
+  voiceThreshold: number;
+  voiceprint: { embedding: number[]; seconds: number; consistency: number; createdAt: number } | null;
   hydrated: boolean;
   set: (patch: Partial<Omit<SettingsState, "set" | "hydrated">>) => void;
   signOut: () => void;
@@ -77,6 +82,10 @@ export const useSettings = create<SettingsState>()(
       updateCheckedAt: 0,
       updateRelease: null,
       updatePrompted: null,
+      voiceDenoise: true,
+      voiceFilter: true,
+      voiceThreshold: 0.38,
+      voiceprint: null,
       hydrated: false,
       set: (patch) => set(patch),
       signOut: () =>

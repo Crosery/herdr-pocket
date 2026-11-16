@@ -14,7 +14,17 @@ public class PocketNativeModule: Module {
   public func definition() -> ModuleDefinition {
     Name("PocketNative")
 
-    Events("onCall", "onCallEvent", "onLevel", "onNotice", "onNotifier", "onUpdateProgress")
+    Events(
+      "onCall",
+      "onCallEvent",
+      "onLevel",
+      "onNotice",
+      "onNotifier",
+      "onUpdateProgress",
+      "onVoiceModelProgress",
+      "onEnrollProgress",
+      "onVoiceTest"
+    )
 
     OnCreate {
       PocketBus.listener = { [weak self] name, body in self?.sendEvent(name, body) }
@@ -107,6 +117,87 @@ public class PocketNativeModule: Module {
     /// A local test notification, to check that alerts really show up.
     Function("testNotice") { (title: String, body: String) in
       NoticeCenter.post(id: "test-\(wallMs())", title: title, body: body)
+    }
+
+    Function("voiceState") { () -> [String: Any] in
+      [
+        "denoise": VoicePrefs.denoise,
+        "filter": VoicePrefs.filter,
+        "threshold": Double(VoicePrefs.threshold),
+        "enrolled": VoicePrefs.embedding != nil,
+        "modelReady": VoiceModelManager.isSpeakerReady(),
+        "modelDownloading": VoiceModelManager.downloading,
+        "modelSize": Double(VoiceModelManager.speakerSize),
+      ]
+    }
+
+    Function("setVoiceSettings") { (denoise: Bool, filter: Bool, threshold: Double) in
+      VoicePrefs.denoise = denoise
+      VoicePrefs.filter = filter
+      VoicePrefs.threshold = Float(min(0.80, max(0.15, threshold)))
+    }
+
+    Function("setVoiceprint") { (embedding: [Double]?) in
+      VoicePrefs.embedding = embedding?.isEmpty == false ? embedding!.map { Float($0) } : nil
+    }
+
+    AsyncFunction("prepareVoiceModel") { (promise: Promise) in
+      VoiceModelManager.downloadSpeaker(
+        onProgress: { got, total in
+          PocketBus.emit("onVoiceModelProgress", ["received": Double(got), "total": Double(total)])
+        },
+        done: { err in
+          if let err {
+            promise.reject("E_VOICE_MODEL", err.localizedDescription)
+          } else {
+            promise.resolve(true)
+          }
+        }
+      )
+    }
+
+    Function("cancelVoiceModel") {
+      VoiceModelManager.cancelDownload()
+    }
+
+    AsyncFunction("startVoiceEnroll") { (promise: Promise) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          try VoiceLab.startEnroll()
+          promise.resolve(true)
+        } catch {
+          promise.reject("E_VOICE_ENROLL", error.localizedDescription)
+        }
+      }
+    }
+
+    AsyncFunction("finishVoiceEnroll") { (promise: Promise) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          promise.resolve(try VoiceLab.finishEnroll())
+        } catch {
+          promise.reject("E_VOICE_ENROLL", error.localizedDescription)
+        }
+      }
+    }
+
+    Function("cancelVoiceEnroll") {
+      VoiceLab.stop()
+    }
+
+    AsyncFunction("startVoiceTest") { (threshold: Double, promise: Promise) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          try VoiceLab.startTest(threshold: Float(min(0.80, max(0.15, threshold))))
+          promise.resolve(true)
+        } catch {
+          promise.reject("E_VOICE_TEST", error.localizedDescription)
+        }
+      }
+    }
+
+    Function("stopVoiceTest") {
+      VoiceLab.stop()
     }
   }
 }

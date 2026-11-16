@@ -35,6 +35,33 @@ class Prefs(ctx: Context) {
   var assistantName: String
     get() = p.getString("assistantName", "小羊") ?: "小羊"
     set(v) = p.edit().putString("assistantName", v).apply()
+
+  var voiceDenoise: Boolean
+    get() = p.getBoolean("voiceDenoise", true)
+    set(v) = p.edit().putBoolean("voiceDenoise", v).apply()
+
+  var voiceFilter: Boolean
+    get() = p.getBoolean("voiceFilter", true)
+    set(v) = p.edit().putBoolean("voiceFilter", v).apply()
+
+  var voiceThreshold: Float
+    get() = p.getFloat("voiceThreshold", 0.38f)
+    set(v) = p.edit().putFloat("voiceThreshold", v).apply()
+
+  var voiceEmbedding: FloatArray?
+    get() {
+      val s = p.getString("voiceEmbedding", null) ?: return null
+      if (s.isEmpty()) return null
+      return try {
+        s.split(",").map { it.toFloat() }.toFloatArray().takeIf { it.isNotEmpty() }
+      } catch (_: Throwable) {
+        null
+      }
+    }
+    set(v) {
+      if (v == null || v.isEmpty()) p.edit().remove("voiceEmbedding").apply()
+      else p.edit().putString("voiceEmbedding", v.joinToString(",") { "%.7g".format(java.util.Locale.US, it) }).apply()
+    }
 }
 
 /** Events for the JS side, delivered while the app's module is alive. */

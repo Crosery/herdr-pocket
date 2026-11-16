@@ -6,6 +6,8 @@ import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.app.NotificationManagerCompat
+import dev.crosery.pocket.voice.VoiceLab
+import dev.crosery.pocket.voice.VoiceModelManager
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.functions.Queues
 import expo.modules.kotlin.modules.Module
@@ -18,7 +20,17 @@ class PocketNativeModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("PocketNative")
 
-    Events("onCall", "onCallEvent", "onLevel", "onNotice", "onNotifier", "onUpdateProgress")
+    Events(
+      "onCall",
+      "onCallEvent",
+      "onLevel",
+      "onNotice",
+      "onNotifier",
+      "onUpdateProgress",
+      "onVoiceModelProgress",
+      "onEnrollProgress",
+      "onVoiceTest",
+    )
 
     OnCreate {
       PocketBus.listener = { name, body -> sendEvent(name, body) }
@@ -144,6 +156,92 @@ class PocketNativeModule : Module() {
     /** A local test notification, to check that alerts really show up. */
     Function("testNotice") { title: String, body: String ->
       post(context, "test-${System.currentTimeMillis()}", title, body)
+    }
+
+    Function("voiceState") {
+      val p = Prefs(context)
+      mapOf(
+        "denoise" to p.voiceDenoise,
+        "filter" to p.voiceFilter,
+        "threshold" to p.voiceThreshold.toDouble(),
+        "enrolled" to (p.voiceEmbedding != null),
+        "modelReady" to VoiceModelManager.isSpeakerReady(context),
+        "modelDownloading" to VoiceModelManager.downloading,
+        "modelSize" to VoiceModelManager.SPEAKER_SIZE.toDouble(),
+      )
+    }
+
+    Function("setVoiceSettings") { denoise: Boolean, filter: Boolean, threshold: Double ->
+      val p = Prefs(context)
+      p.voiceDenoise = denoise
+      p.voiceFilter = filter
+      p.voiceThreshold = threshold.toFloat().coerceIn(0.15f, 0.80f)
+    }
+
+    Function("setVoiceprint") { embedding: List<Double>? ->
+      val p = Prefs(context)
+      p.voiceEmbedding = embedding?.takeIf { it.isNotEmpty() }?.map { it.toFloat() }?.toFloatArray()
+    }
+
+    AsyncFunction("prepareVoiceModel") { promise: Promise ->
+      val ctx = context
+      Thread {
+        try {
+          VoiceModelManager.downloadSpeaker(ctx) { got, total ->
+            PocketBus.emit("onVoiceModelProgress", mapOf("received" to got.toDouble(), "total" to total.toDouble()))
+          }
+          promise.resolve(true)
+        } catch (e: Throwable) {
+          promise.reject("E_VOICE_MODEL", e.message ?: "模型下载失败", e)
+        }
+      }.apply { isDaemon = true; start() }
+    }
+
+    Function("cancelVoiceModel") {
+      VoiceModelManager.cancelDownload()
+    }
+
+    AsyncFunction("startVoiceEnroll") { promise: Promise ->
+      val ctx = context
+      Thread {
+        try {
+          VoiceLab.startEnroll(ctx)
+          promise.resolve(true)
+        } catch (e: Throwable) {
+          promise.reject("E_VOICE_ENROLL", e.message ?: "打不开麦克风", e)
+        }
+      }.apply { isDaemon = true; start() }
+    }
+
+    AsyncFunction("finishVoiceEnroll") { promise: Promise ->
+      val ctx = context
+      Thread {
+        try {
+          promise.resolve(VoiceLab.finishEnroll(ctx))
+        } catch (e: Throwable) {
+          promise.reject("E_VOICE_ENROLL", e.message ?: "声纹录入失败", e)
+        }
+      }.apply { isDaemon = true; start() }
+    }
+
+    Function("cancelVoiceEnroll") {
+      VoiceLab.stop()
+    }
+
+    AsyncFunction("startVoiceTest") { threshold: Double, promise: Promise ->
+      val ctx = context
+      Thread {
+        try {
+          VoiceLab.startTest(ctx, threshold.toFloat().coerceIn(0.15f, 0.80f))
+          promise.resolve(true)
+        } catch (e: Throwable) {
+          promise.reject("E_VOICE_TEST", e.message ?: "打不开麦克风", e)
+        }
+      }.apply { isDaemon = true; start() }
+    }
+
+    Function("stopVoiceTest") {
+      VoiceLab.stop()
     }
   }
 }

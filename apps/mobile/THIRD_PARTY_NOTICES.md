@@ -2,6 +2,17 @@
 
 The Herdr Pocket Android app is licensed under AGPL-3.0-only (see `LICENSE` at the repository root). This file covers material in the app that comes from elsewhere and carries its own licence. npm dependencies keep the licences declared in their own packages.
 
+## On-device voice processing (`modules/pocket-native`)
+
+Call denoising, speech detection and owner voiceprint verification run locally on the phone using ONNX Runtime and three open-source models (no audio is sent elsewhere for verification).
+
+| Component | Source | Licence |
+|---|---|---|
+| ONNX Runtime (`onnxruntime-android` 1.32.0 / `onnxruntime-objc` 1.30.0) | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) | MIT |
+| GTCRN (`gtcrn_simple.onnx`) | [Xiaobin-Rong/gtcrn](https://github.com/Xiaobin-Rong/gtcrn), packaged by [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | MIT |
+| Silero VAD v4 (`silero_vad.onnx`) | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) | MIT |
+| 3D-Speaker CAM++ (`3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`, downloaded on demand) | [alibaba-damo-academy/3D-Speaker](https://github.com/modelscope/3D-Speaker) / ModelScope `iic/speech_campplus_sv_zh_en_16k-common_advanced` | Apache-2.0 |
+
 ## Harness brand glyphs (`src/lib/harnessIcons.ts`)
 
 Small monochrome marks drawn in an agent's avatar circle when the app has no sticker for that harness. `scripts/harness-icons.mjs` generates the file from the harness icon sprite of [Uniflo](https://github.com/Crosery/uniflo) (MIT), which took the marks from the sources below. Changes from the originals: only path geometry is kept (`d`, `fill-rule`, `clip-rule`, `opacity`, `transform`), recoloured to a single fill and fitted to a 24x24 canvas.

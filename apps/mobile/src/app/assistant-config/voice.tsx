@@ -10,8 +10,12 @@ import { useHeaderHeight } from "expo-router/react-navigation";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { AssistantConfigView, VoicePatch, VoiceProviderId } from "@herdr-pocket/protocol";
 import { Card, PageBackground } from "../../components/ui";
+import { Row } from "../../components/rows";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Input, KeyField, LoadState, SaveBar, useLeaveGuard, WarningCard } from "../../components/configParts";
 import { changeConfig, flash, loadConfig, useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
+import { useSettings } from "../../lib/store";
+import { isMockServer } from "../../lib/mock";
+import { voiceprintSupported } from "../../lib/voice";
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
 
@@ -63,6 +67,14 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
   const urlError = provider && url.trim() && !WS.test(url.trim()) ? "地址要以 ws:// 或 wss:// 开头" : null;
   const canSave = dirty && !urlError && !busy;
   const voiceWarnings = config.warnings.filter((w) => w.startsWith("语音"));
+  const voiceDenoise = useSettings((x) => x.voiceDenoise);
+  const voiceFilter = useSettings((x) => x.voiceFilter);
+  const voiceprint = useSettings((x) => x.voiceprint);
+  const server = useSettings((x) => x.server);
+  const localOk = voiceprintSupported || isMockServer(server);
+  const localSub = !localOk
+    ? "需要装新版 App"
+    : `${voiceDenoise ? "降噪已开" : "降噪关着"} · ${voiceprint ? (voiceFilter ? "只认你的声音" : "声纹已存（暂停过滤）") : "未录声纹"}`;
 
   /** Picking another service starts from its own defaults: a MOSS address is no use to another service. */
   function pick(next: VoiceProviderId | null) {
@@ -183,6 +195,9 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
                 {switched ? <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 18 }}>换了语音服务，原来的密钥不一定能用，最好填上这家的密钥。</Text> : null}
               </>
             ) : null}
+          </Card>
+          <Card style={{ paddingVertical: space.xs }}>
+            <Row icon="shield-account-outline" title="这台手机的降噪与声纹" sub={localSub} dim={!localOk} onPress={localOk ? () => router.push("/voiceprint") : undefined} />
           </Card>
           <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 18, paddingHorizontal: space.xs }}>语音没有“测一下”：改好后打一通电话试试就知道了。</Text>
           {error ? <Text style={{ color: p.error, lineHeight: 20, textAlign: "center" }}>{error}</Text> : null}

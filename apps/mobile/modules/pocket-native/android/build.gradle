@@ -11,6 +11,7 @@ android {
   defaultConfig {
     versionCode 1
     versionName '0.1.0'
+    consumerProguardFiles 'consumer-rules.pro'
   }
 }
 
@@ -18,4 +19,5 @@ dependencies {
   implementation "androidx.core:core-ktx:1.17.0"
   // Same client React Native ships; resolved to its version.
   implementation "com.squareup.okhttp3:okhttp:4.9.2"
+  implementation "com.microsoft.onnxruntime:onnxruntime-android:1.32.0"
 }
