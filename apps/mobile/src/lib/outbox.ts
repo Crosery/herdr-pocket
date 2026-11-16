@@ -21,7 +21,7 @@ export interface QueueEvent {
 export type SendResult = { ok: true } | { ok: false; message: string };
 
 /** The conversation's copy may carry the computer's clock: allow it to read a little earlier. */
-const ECHO_SLACK_MS = 30_000;
+const ECHO_SLACK_MS = 60_000;
 /**
  * How long a message not seen in the conversation stays on screen. Sent (typed in) but never shown there,
  * as with another session or a program without one: a few minutes, counted from when the computer took it.
@@ -151,7 +151,7 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
   for (const x of sends) {
     const i = x.echo ? index.get(x.echo) : undefined;
     // A row id met again with other words (a conversation read anew) is not this message's copy.
-    if (i !== undefined && sameMessage(rows[i]!.text ?? "", x.text)) {
+    if (i !== undefined && sameMessage(rows[i]!.text ?? "", x.text, !!x.pictures?.length)) {
       claimed.add(i);
       echoes.set(x.echo!, x);
       echoAt.set(x.id, i);
@@ -161,7 +161,7 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
   // Messages that went through claim first: a failed one only matches when it got in after all.
   const open = sends.filter((x) => !x.echo).sort((a, b) => Number(a.state === "failed") - Number(b.state === "failed") || a.ts - b.ts);
   for (const x of open) {
-    const hit = users.find(({ r, i }) => !claimed.has(i) && (r.ts ?? 0) >= x.ts - ECHO_SLACK_MS && sameMessage(r.text ?? "", x.text));
+    const hit = users.find(({ r, i }) => !claimed.has(i) && (r.ts ?? 0) >= x.ts - ECHO_SLACK_MS && sameMessage(r.text ?? "", x.text, !!x.pictures?.length));
     if (!hit) continue;
     claimed.add(hit.i);
     echoes.set(hit.r.id, x);

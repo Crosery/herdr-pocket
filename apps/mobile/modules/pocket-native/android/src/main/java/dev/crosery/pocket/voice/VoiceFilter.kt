@@ -4,15 +4,15 @@ import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
  * What the microphone sends during a call. Every frame read goes in; out comes the denoised audio and,
- * with a voiceprint, only the owner's speech: anyone else (the TV, a colleague, the assistant's own
- * voice leaking back) becomes silence, so the stream to the service stays continuous.
+ * with a voiceprint, only the owner's speech: anyone else (at the start of an utterance or cutting in
+ * mid-sentence, or TV/background chatter) becomes silence, so the stream to the service stays continuous.
  *
- * Latency. Denoising releases each 16 ms hop one hop later (16-32 ms behind the microphone). A voice
- * has to be heard before it can be recognised: the start of an utterance is held back until the
- * voiceprint says whose it is (0.5 s of speech when it is clearly the owner, 1 s otherwise), then sent
- * at once, and the rest goes out as it is spoken. So when the owner stops talking, the service hears
- * the end as early as it would without the check; what moves is only when it hears the start. A new
- * utterance soon after one of the owner's goes out at once and is checked as it runs.
+ * Latency & mid-call blocking. Denoising releases each 16 ms hop one hop later (16-32 ms behind the mic).
+ * An utterance start is held until verified (0.51 s when clearly the owner, 0.70-0.96 s otherwise). While
+ * open, the stream keeps a ~576 ms rolling verification cushion (`tail`) and checks the newest ~480 ms of
+ * voiced speech every 96 ms at full threshold. On any dip below threshold, emission freezes immediately and
+ * only resumes if the next check (or 640 ms borderline confirm) passes; otherwise the cushion is silenced
+ * before non-owner speech leaves the phone. Blocked audio is discarded immediately and never replayed.
  *
  * Not thread-safe: one thread (the microphone's) calls [push] and [reset]. Voiceprints are computed by
  * `worker` off that thread; their verdicts are taken up at the next hop.
@@ -24,19 +24,19 @@ class VoiceFilter(
   private val worker: (Runnable) -> Unit,
   /** PCM16 ready to send, in order. */
   private val emit: (ByteArray, Int, Int) -> Unit,
-  /** A held utterance was judged: whether it went out and its score; for captions and logs. */
+  /** A held or mid-call segment was judged: whether it passed and its score; for captions and logs. */
   private val onVerdict: (pass: Boolean, score: Float, kind: String) -> Unit = { _, _, _ -> },
 ) {
   class Options(
     val denoise: Boolean,
     /** The owner's voiceprint; null lets every voice through. */
     val enrolled: FloatArray?,
-    /** Cosine score from which a full second of speech counts as the owner's. */
+    /** Cosine score from which speech counts as the owner's. */
     val threshold: Float = 0.38f,
-    /** Clearly the owner after half a second: no need to wait for the full second. */
-    val early: Float = threshold + 0.10f,
-    /** An utterance too short for a full second (a word or two) must score this. */
-    val short: Float = threshold + 0.07f,
+    /** Clearly the owner after ~0.5 s: no need to hold longer at utterance start. */
+    val early: Float = threshold + 0.07f,
+    /** An utterance too short for 0.5 s (a word or two) must score this. */
+    val short: Float = threshold + 0.05f,
   )
 
   private class Chunk(val a: FloatArray) {
@@ -44,7 +44,7 @@ class VoiceFilter(
   }
 
   private enum class State { IDLE, HOLD, OPEN, BLOCKED }
-  private enum class Kind { EARLY, FULL, END, RECHECK }
+  private enum class Kind { EARLY, MID, FULL, END, RECHECK, CONFIRM }
   private class Verdict(val job: Int, val score: Float, val ms: Long)
 
   companion object {
@@ -56,27 +56,32 @@ class VoiceFilter(
 
     private const val START_PROB = 0.5f
     private const val SPEECH_PROB = 0.35f
-    /** Speech starts after ~0.1 s at START_PROB (a click does not), ends after 0.5 s below SPEECH_PROB. */
+    /** Speech starts after ~0.1 s at START_PROB (a click does not), ends after ~0.38 s below SPEECH_PROB. */
     private val START_W = windows(96)
-    private val END_W = windows(500)
-    private val EARLY_W = windows(500)
-    private val FULL_W = windows(1000)
-    private val SHORT_W = windows(300)
-    private val OPEN_RECHECK_W = windows(1500)
-    private val TRUSTED_RECHECK_W = windows(500)
-    private val BLOCKED_RECHECK_W = windows(500)
-    /** Audio from before speech was detected, kept so the first syllable is not lost. */
-    private val PRE_ROLL = hops(300)
-    /** Rechecks look at the last second. */
-    private val RECENT = hops(1000)
+    private val END_W = windows(384)
+    private val EARLY_W = windows(512)
+    private val MID_W = windows(704)
+    private val FULL_W = windows(960)
+    private val SHORT_W = windows(320)
+    private val RECHECK_STEP_W = windows(96)
+    private val BLOCKED_STEP_W = windows(160)
+    private val END_CHECK_MIN_W = windows(256)
+    /** Audio from before speech was detected, kept so the first consonant is not lost. */
+    private val PRE_ROLL = hops(160)
+    /** Rolling lookahead cushion held in OPEN (net lookahead = 736 - 160 = 576 ms). */
+    private val TAIL_HOPS = hops(736)
+    private val TAIL_MAX_SUSPECT = hops(1024)
+    private val PREFIX_KEEP_HOPS = hops(480)
+    /** Voiced-only speech window for fast mid-call switch checks vs borderline owner confirmation. */
+    private val FAST_SPEECH_HOPS = hops(480)
+    private val CONFIRM_SPEECH_HOPS = hops(640)
+    private val RECENT_SPEECH_HOPS = hops(800)
     /** A check uses only the speech in what it is given, when there is at least this much of it. */
     private val MIN_SPEECH = hops(250)
-    /** A new utterance within this of the owner's last one goes out at once. */
-    private val TRUST = hops(1000)
     /** Never hold longer than this (a phone too slow for the check): what is held becomes silence. */
     private val MAX_HOLD = hops(4000)
-    /** Silence skipped to make up for pre-roll sent twice, only after this long in idle (plus END_W). */
-    private val REPAY_AFTER = hops(300)
+    /** Silence skipped to make up for pre-roll sent twice, only after this long in idle. */
+    private val REPAY_AFTER = hops(200)
     private const val SEND_MAX = 3200
   }
 
@@ -101,18 +106,18 @@ class VoiceFilter(
   private val held = ArrayList<Chunk>()
   private var heldPre = 0
   private var holdStart = 0L
-  private val recent = ArrayDeque<Chunk>()
+  private val tail = ArrayDeque<Chunk>()
+  private val recentSpeech = ArrayDeque<Chunk>()
   private var speaking = false
   private var startRun = 0
   private var silRun = 0
   private var speechW = 0
   private var sinceCheckW = 0
-  private var recheckW = OPEN_RECHECK_W
-  /** Open without a check yet (right after the owner): the first check has no slack. */
-  private var trusted = false
   private var earlyTried = false
+  private var midTried = false
   private var fullTried = false
-  private var lastOwner = Long.MIN_VALUE / 2
+  private var earlyScore = 1f
+  private var suspect = false
   private var idleHops = 0
   private var debt = 0
 
@@ -144,9 +149,10 @@ class VoiceFilter(
     inLen = 0
     window = null
     state = State.IDLE
-    ring.clear(); held.clear(); recent.clear()
+    ring.clear(); held.clear(); tail.clear(); recentSpeech.clear()
     heldPre = 0
     speaking = false; startRun = 0; silRun = 0; speechW = 0; sinceCheckW = 0
+    earlyTried = false; midTried = false; fullTried = false; earlyScore = 1f; suspect = false
     job = 0
     verdicts.clear()
     idleHops = 0
@@ -201,6 +207,10 @@ class VoiceFilter(
     val p = vad!!.prob(winBuf, 0)
     w.prob = p
     c.prob = p
+    if (p >= SPEECH_PROB) {
+      keepSpeech(w)
+      keepSpeech(c)
+    }
     onWindow(p)
     take()
   }
@@ -212,12 +222,10 @@ class VoiceFilter(
         ring.addLast(c)
         if (ring.size > PRE_ROLL) ring.removeFirst()
         idleHops++
-        // Silence goes out as it comes; some of it is skipped to repay pre-roll that went out twice.
         if (debt > 0 && idleHops >= REPAY_AFTER && t % 2 == 0L) debt-- else send(null)
       }
       State.HOLD -> {
         held.add(c)
-        keep(c)
         if (held.size - heldPre >= MAX_HOLD) {
           // The check is taking too long (a slow phone): what is held goes out as silence.
           job = 0
@@ -225,28 +233,31 @@ class VoiceFilter(
         }
       }
       State.BLOCKED -> {
-        held.add(c)
-        keep(c)
-        if (held.size >= MAX_HOLD) {
-          job = 0
-          flushHeld(false)
-        }
+        // Blocked non-owner speech is silenced immediately and never retained for replay.
+        if (debt > 0 && t % 2 == 0L) debt-- else send(null)
       }
       State.OPEN -> {
-        send(c.a)
-        keep(c)
+        tail.addLast(c)
+        if (!suspect) {
+          while (tail.size > TAIL_HOPS) send(tail.removeFirst().a)
+        } else if (tail.size > TAIL_MAX_SUSPECT) {
+          send(tail.removeFirst().a)
+        }
       }
     }
   }
 
-  /** The last second, whatever became of it: what rechecks listen to. */
-  private fun keep(c: Chunk) {
-    recent.addLast(c)
-    if (recent.size > RECENT) recent.removeFirst()
+  private fun keepSpeech(c: Chunk) {
+    recentSpeech.addLast(c)
+    while (recentSpeech.size > RECENT_SPEECH_HOPS) recentSpeech.removeFirst()
+  }
+
+  private fun tailSpeech(maxHops: Int): List<Chunk> {
+    val list = recentSpeech.toList()
+    return if (list.size <= maxHops) list else list.subList(list.size - maxHops, list.size)
   }
 
   private fun onWindow(p: Float) {
-    // Speech segments, with Silero's hysteresis.
     var started = false
     var ended = false
     if (!speaking) {
@@ -276,25 +287,26 @@ class VoiceFilter(
         when {
           !speaking -> if (speechW >= SHORT_W) check(Kind.END, held) else reject()
           speechW >= FULL_W && !fullTried -> { fullTried = true; check(Kind.FULL, held) }
+          speechW >= MID_W && !midTried -> { midTried = true; check(Kind.MID, held) }
           speechW >= EARLY_W && !earlyTried -> { earlyTried = true; check(Kind.EARLY, held) }
         }
       }
       State.OPEN -> {
         if (ended) {
-          lastOwner = t
-          toIdle()
-        } else if (job == 0 && sinceCheckW >= recheckW) {
-          check(Kind.RECHECK, recent)
+          if ((suspect || sinceCheckW >= END_CHECK_MIN_W) && recentSpeech.size >= MIN_SPEECH && job == 0) {
+            check(Kind.END, recentSpeech.toList())
+          } else {
+            toIdleFromOpen()
+          }
+        } else if (job == 0 && sinceCheckW >= RECHECK_STEP_W && recentSpeech.size >= MIN_SPEECH) {
+          check(Kind.RECHECK, tailSpeech(FAST_SPEECH_HOPS))
         }
       }
       State.BLOCKED -> {
         if (job != 0) return
-        // What is held waits for a check of the last second: held audio is the owner's after all
-        // when that says so (a second of the owner's that scored low), silence otherwise.
-        if (ended) {
-          if (sinceCheckW > 0) check(Kind.END, recent) else { flushHeld(false); toIdle() }
-        } else if (sinceCheckW >= BLOCKED_RECHECK_W) {
-          check(Kind.RECHECK, recent)
+        if (ended) toIdle()
+        else if (sinceCheckW >= BLOCKED_STEP_W && recentSpeech.size >= MIN_SPEECH) {
+          check(Kind.RECHECK, tailSpeech(FAST_SPEECH_HOPS))
         }
       }
     }
@@ -305,19 +317,12 @@ class VoiceFilter(
     speechW = 0
     sinceCheckW = 0
     earlyTried = false
+    midTried = false
     fullTried = false
-    if (t - lastOwner <= TRUST) {
-      // Right after the owner spoke: most likely the owner again. Out at once, checked after a second.
-      recent.clear()
-      recent.addAll(ring)
-      flushRing(true)
-      state = State.OPEN
-      recheckW = TRUSTED_RECHECK_W
-      trusted = true
-      return
-    }
-    recent.clear()
-    recent.addAll(ring)
+    earlyScore = 1f
+    suspect = false
+    recentSpeech.clear()
+    for (c in ring) if (c.prob >= SPEECH_PROB) keepSpeech(c)
     held.clear()
     held.addAll(ring)
     heldPre = ring.size
@@ -334,7 +339,7 @@ class VoiceFilter(
     val id = ++jobSeq
     job = id
     jobKind = kind
-    jobSpeechW = if (kind == Kind.RECHECK || state == State.BLOCKED) sinceCheckW else speechW
+    jobSpeechW = if (kind == Kind.RECHECK || kind == Kind.CONFIRM || state == State.BLOCKED) sinceCheckW else speechW
     sinceCheckW = 0
     val enrolled = o.enrolled!!
     val sp = speaker!!
@@ -366,7 +371,11 @@ class VoiceFilter(
     when (state) {
       State.HOLD -> {
         val pass = when (jobKind) {
-          Kind.EARLY -> if (s >= o.early) true else null
+          Kind.EARLY -> {
+            earlyScore = s
+            if (s >= o.early) true else if (s < o.threshold - 0.10f) false else null
+          }
+          Kind.MID -> if (s >= o.threshold + 0.03f) true else null
           Kind.FULL -> s >= o.threshold
           else -> s >= (if (jobSpeechW >= EARLY_W) o.threshold else o.short)
         }
@@ -377,30 +386,60 @@ class VoiceFilter(
         }
       }
       State.OPEN -> {
-        // A little slack once checked: the same voice scores lower on some seconds than on others.
-        // Blocking costs the owner nothing but time: what follows is held until the next check.
-        if (s < o.threshold - (if (trusted) 0f else 0.05f)) {
-          onVerdict(false, s, if (trusted) "trusted" else "recheck")
-          blocked++
-          state = State.BLOCKED
-          held.clear()
-          heldPre = 0
-        } else {
-          lastOwner = t
-          recheckW = OPEN_RECHECK_W
+        if (jobKind == Kind.END) {
+          if (s >= o.threshold - 0.06f) {
+            onVerdict(true, s, "end")
+            toIdleFromOpen()
+          } else {
+            onVerdict(false, s, "end")
+            blocked++
+            dropTailAsSilence()
+            toIdle()
+          }
+          return
         }
-        trusted = false
+        if (jobKind == Kind.CONFIRM) {
+          if (s >= o.threshold) {
+            suspect = false
+            while (tail.size > TAIL_HOPS) send(tail.removeFirst().a)
+            if (!speaking) toIdleFromOpen()
+          } else {
+            onVerdict(false, s, "confirm")
+            blocked++
+            suspect = false
+            dropTailAsSilence()
+            if (speaking) { state = State.BLOCKED; sinceCheckW = 0 } else toIdle()
+          }
+          return
+        }
+        // Kind.RECHECK on newest 480 ms voiced speech:
+        if (s >= o.threshold) {
+          suspect = false
+          while (tail.size > TAIL_HOPS) send(tail.removeFirst().a)
+          if (!speaking) toIdleFromOpen()
+        } else if (!suspect) {
+          // Freeze `tail` on first dip below threshold so unverified speech cannot leave the phone.
+          suspect = true
+          if (!speaking) check(Kind.END, recentSpeech.toList())
+        } else if (s >= o.threshold - 0.05f && recentSpeech.size > FAST_SPEECH_HOPS) {
+          check(Kind.CONFIRM, tailSpeech(CONFIRM_SPEECH_HOPS))
+        } else {
+          onVerdict(false, s, "recheck")
+          blocked++
+          suspect = false
+          dropTailAsSilence()
+          if (speaking) { state = State.BLOCKED; sinceCheckW = 0 } else toIdle()
+        }
       }
       State.BLOCKED -> {
-        if (s >= o.threshold) {
-          onVerdict(true, s, "recheck")
+        if (s >= o.threshold + 0.04f) {
+          onVerdict(true, s, "resume")
           passed++
-          flushHeld(true)
-          lastOwner = t
-          if (speaking) { state = State.OPEN; recheckW = OPEN_RECHECK_W; trusted = false } else toIdle()
-        } else {
-          flushHeld(false)
-          if (!speaking) toIdle()
+          tail.clear()
+          suspect = false
+          if (speaking) { state = State.OPEN; sinceCheckW = 0 } else toIdle()
+        } else if (!speaking) {
+          toIdle()
         }
       }
       State.IDLE -> {}
@@ -410,22 +449,46 @@ class VoiceFilter(
   private fun accept() {
     passed++
     noteHold()
-    flushHeld(true)
-    lastOwner = t
-    if (speaking) {
-      state = State.OPEN
-      recheckW = OPEN_RECHECK_W
-      trusted = false
+    recentSpeech.clear()
+    for (c in held) if (c.prob >= SPEECH_PROB) keepSpeech(c)
+    tail.clear()
+    if (earlyScore < o.threshold - 0.08f) {
+      // Opening 0.5 s scored low (another speaker may have preceded the owner): mute prefix, keep verified tail.
+      val keep = minOf(held.size, PREFIX_KEEP_HOPS)
+      val cut = held.size - keep
+      for (i in heldPre until cut) {
+        if (debt > 0 && i % 2 == 0) debt-- else send(null)
+      }
+      for (i in cut until held.size) tail.addLast(held[i])
+      if (cut < heldPre) debt += heldPre - cut
     } else {
-      toIdle()
+      val cut = maxOf(0, held.size - TAIL_HOPS)
+      for (i in 0 until cut) send(held[i].a)
+      for (i in cut until held.size) tail.addLast(held[i])
+      debt += heldPre
     }
+    held.clear()
+    heldPre = 0
+    suspect = false
+    if (speaking) { state = State.OPEN; sinceCheckW = 0 } else toIdleFromOpen()
   }
 
   private fun reject() {
     blocked++
     noteHold()
-    flushHeld(false)
-    if (speaking) state = State.BLOCKED else toIdle()
+    for (i in heldPre until held.size) {
+      if (debt > 0 && i % 2 == 0) debt-- else send(null)
+    }
+    held.clear()
+    heldPre = 0
+    if (speaking) { state = State.BLOCKED; sinceCheckW = 0 } else toIdle()
+  }
+
+  private fun dropTailAsSilence() {
+    while (tail.isNotEmpty()) {
+      tail.removeFirst()
+      if (debt > 0) debt-- else send(null)
+    }
   }
 
   private fun noteHold() {
@@ -435,36 +498,22 @@ class VoiceFilter(
     if (ms > holdMsMax) holdMsMax = ms
   }
 
-  /** Sends what is held: as it was, or as silence. Pre-roll went out once already (as silence), so silence skips it. */
-  private fun flushHeld(audio: Boolean) {
-    if (audio) {
-      for (c in held) send(c.a)
-      debt += heldPre
-    } else {
-      for (i in heldPre until held.size) {
-        if (debt > 0 && i % 2 == 0) debt-- else send(null)
-      }
+  private fun toIdleFromOpen() {
+    while (tail.isNotEmpty()) {
+      val d = tail.removeFirst()
+      if (debt > 0 && d.prob < SPEECH_PROB) debt-- else send(d.a)
     }
-    held.clear()
-    heldPre = 0
-  }
-
-  private fun flushRing(audio: Boolean) {
-    if (audio) {
-      for (c in ring) send(c.a)
-      debt += ring.size
-    }
-    ring.clear()
+    toIdle()
   }
 
   private fun toIdle() {
     state = State.IDLE
-    // A check still running is about audio already sent or dropped.
     job = 0
     idleHops = 0
+    suspect = false
     held.clear()
     heldPre = 0
-    recent.clear()
+    recentSpeech.clear()
   }
 
   private fun send(a: FloatArray?) {
