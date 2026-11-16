@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { PUT_LIMITS, textWithFiles, type Agent } from "@herdr-pocket/protocol";
+import { PUT_LIMITS, sameMessage, splitFiles, textWithFiles, type Agent } from "@herdr-pocket/protocol";
 import { checkFiles, putLocal, putThrough, safeName, KEEP_MS } from "../src/put.ts";
 import { HcAdapter } from "../src/hc.ts";
 import { Host } from "../src/host.ts";
@@ -49,6 +49,47 @@ test("terminal.put files: pictures only, real bytes, within the limits, safe dis
 test("the message names each picture on a line of its own after the text", () => {
   assert.equal(textWithFiles("  看下这个报错 ", ["/a/1.jpg", "/a/2.png"]), "看下这个报错\n/a/1.jpg\n/a/2.png");
   assert.equal(textWithFiles("", ["/a/1.jpg"]), "/a/1.jpg");
+});
+
+test("splitFiles and sameMessage strip harness image marks without losing words or double-counting", () => {
+  assert.deepEqual(splitFiles("看下这个报错\n/a/1.jpg\n/a/2.png"), {
+    text: "看下这个报错",
+    lines: ["/a/1.jpg", "/a/2.png"],
+    count: 2,
+  });
+  assert.deepEqual(splitFiles("[Image #1]图片里面有什么\n[image]"), {
+    text: "图片里面有什么",
+    lines: ["[Image #1]"],
+    count: 1,
+  });
+  assert.deepEqual(splitFiles("[Image #1] 第一部分 [Image #2] 第二部分\n[image]\n[image]"), {
+    text: "第一部分 第二部分",
+    lines: ["[Image #1]", "[Image #2]"],
+    count: 2,
+  });
+  assert.deepEqual(splitFiles("[Image #1, 1568x958]  这几个去掉 [Image #2, 760x1280] 还有这里 [image] [image]"), {
+    text: "这几个去掉 还有这里",
+    lines: ["[Image #1, 1568x958]", "[Image #2, 760x1280]"],
+    count: 2,
+  });
+  assert.deepEqual(splitFiles("[Image #1]\n[image]"), {
+    text: "",
+    lines: ["[Image #1]"],
+    count: 1,
+  });
+  assert.deepEqual(splitFiles("第一段\n\n第二段"), {
+    text: "第一段\n\n第二段",
+    lines: [],
+    count: 0,
+  });
+
+  assert.equal(sameMessage("[Image #1]图片里面有什么\n[image]", "图片里面有什么", true), true);
+  assert.equal(sameMessage("[Image #1, 1568x958]  图片里面有什么\n[image]", "图片里面有什么", true), true);
+  assert.equal(sameMessage("[Image #1] 第一行 [Image #2] 第二行\n[image]\n[image]", "第一行\n第二行", true), true);
+  assert.equal(sameMessage("[Image #1]\n[image]", "", true), true);
+  assert.equal(sameMessage("", "", true), false);
+  assert.equal(sameMessage("测试完了再提交， 别直接推", "测试完了再提交，别直接推"), true);
+  assert.equal(sameMessage("[Image #1]别的文字\n[image]", "图片里面有什么", true), false);
 });
 
 test("putThrough hands over an owner-only temporary copy and removes it afterwards", async () => {

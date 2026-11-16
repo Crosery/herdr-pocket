@@ -8,7 +8,7 @@
  * again (it took the waiting input), after it has stayed stopped for a while
  * without a conversation to check, or when it is very old or the agent is gone.
  */
-import { splitFiles, type Agent, type ConvEvent } from "@herdr-pocket/protocol";
+import { sameMessage, splitFiles, type Agent, type ConvEvent } from "@herdr-pocket/protocol";
 
 export interface Waiting {
   id: string;
@@ -88,13 +88,16 @@ export class InputWaits {
         changed = true;
         continue;
       }
-      let said: string[] = [];
+      let said: Array<{ raw: string; folded: string }> = [];
       if (a.sessionKey) {
         try {
           const oldest = Math.min(...list.map((w) => w.at));
           said = (await events(a.sessionKey))
             .filter((e) => (e.kind === "user_message" || e.kind === "system") && (!e.ts || e.ts >= oldest - 10_000))
-            .map((e) => fold(e.kind === "user_message" ? `${e.text}${e.injected ?? ""}` : e.kind === "system" ? e.text : ""));
+            .map((e) => {
+              const raw = e.kind === "user_message" ? `${e.text}${e.injected ?? ""}` : e.kind === "system" ? e.text : "";
+              return { raw, folded: fold(raw) };
+            });
         } catch {
           said = [];
         }
@@ -113,10 +116,14 @@ export class InputWaits {
       }
       const grace = a.sessionKey ? (this.opts.sessionGraceMs ?? 90_000) : (this.opts.idleGraceMs ?? 20_000);
       const keep = list.filter((w) => {
-        const head = fold(w.text).slice(0, 30);
-        if (head && said.some((s) => s.includes(head))) return false;
+        const parsed = splitFiles(w.text);
+        const head = fold(parsed.text).slice(0, 30);
+        if (said.some((s) => (parsed.count > 0 && sameMessage(s.raw, w.text, true)) || (head && s.folded.includes(head)))) return false;
         // Programs clip long input in their box: look for its start only.
-        if (shown !== undefined && now - w.at > (this.opts.landMs ?? 8_000) && !shown.includes(fold(w.text).slice(0, 12))) return false;
+        const screenHead = fold(parsed.text).slice(0, 12);
+        if (shown !== undefined && now - w.at > (this.opts.landMs ?? 8_000)) {
+          if (screenHead ? !shown.includes(screenHead) : !shown.includes("[Image#") && !shown.includes(fold(w.text).slice(0, 12))) return false;
+        }
         if (now - w.at > (this.opts.maxAgeMs ?? 2 * 3_600_000)) return false;
         if (a.status === "working") {
           // Stopped and then working again: the program took what was waiting.

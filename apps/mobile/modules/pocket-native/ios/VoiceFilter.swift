@@ -1,13 +1,13 @@
 import Foundation
 
-/// Swift counterpart to VoiceFilter.kt: GTCRN denoise -> Silero VAD -> CAM++ owner voiceprint gate.
+/// Swift counterpart to VoiceFilter.kt: GTCRN denoise -> Silero VAD -> CAM++ strict owner voiceprint gate.
 final class VoiceFilter {
   struct Options {
     let denoise: Bool
     let enrolled: [Float]?
     let threshold: Float
-    var early: Float { threshold + 0.10 }
-    var short: Float { threshold + 0.07 }
+    var early: Float { threshold + 0.07 }
+    var short: Float { threshold + 0.05 }
     init(denoise: Bool, enrolled: [Float]?, threshold: Float = 0.38) {
       self.denoise = denoise
       self.enrolled = enrolled
@@ -22,7 +22,7 @@ final class VoiceFilter {
   }
 
   private enum State { case idle, hold, open, blocked }
-  private enum Kind: String { case early, full, end, recheck }
+  private enum Kind: String { case early, mid, full, end, recheck, confirm }
   private struct Verdict { let job: Int; let score: Float; let ms: Int64 }
 
   private static let hop = Denoiser.hop
@@ -33,19 +33,24 @@ final class VoiceFilter {
   private static let startProb: Float = 0.5
   private static let speechProb: Float = 0.35
   private static let startW = windows(96)
-  private static let endW = windows(500)
-  private static let earlyW = windows(500)
-  private static let fullW = windows(1000)
-  private static let shortW = windows(300)
-  private static let openRecheckW = windows(1500)
-  private static let trustedRecheckW = windows(500)
-  private static let blockedRecheckW = windows(500)
-  private static let preRoll = hops(300)
-  private static let recentMax = hops(1000)
+  private static let endW = windows(384)
+  private static let earlyW = windows(512)
+  private static let midW = windows(704)
+  private static let fullW = windows(960)
+  private static let shortW = windows(320)
+  private static let recheckStepW = windows(96)
+  private static let blockedStepW = windows(160)
+  private static let endCheckMinW = windows(256)
+  private static let preRoll = hops(160)
+  private static let tailHops = hops(736)
+  private static let tailMaxSuspect = hops(1024)
+  private static let prefixKeepHops = hops(480)
+  private static let fastSpeechHops = hops(480)
+  private static let confirmSpeechHops = hops(640)
+  private static let recentSpeechMax = hops(800)
   private static let minSpeech = hops(250)
-  private static let trust = hops(1000)
   private static let maxHold = hops(4000)
-  private static let repayAfter = hops(300)
+  private static let repayAfter = hops(200)
   private static let sendMax = 3200
 
   private let m: VoiceModels
@@ -71,17 +76,18 @@ final class VoiceFilter {
   private var held: [Chunk] = []
   private var heldPre = 0
   private var holdStart: Int64 = 0
-  private var recent: [Chunk] = []
+  private var tail: [Chunk] = []
+  private var recentSpeech: [Chunk] = []
   private var speaking = false
   private var startRun = 0
   private var silRun = 0
   private var speechW = 0
   private var sinceCheckW = 0
-  private var recheckW = openRecheckW
-  private var trusted = false
   private var earlyTried = false
+  private var midTried = false
   private var fullTried = false
-  private var lastOwner: Int64 = Int64.min / 2
+  private var earlyScore: Float = 1
+  private var suspect = false
   private var idleHops = 0
   private var debt = 0
 
@@ -130,13 +136,19 @@ final class VoiceFilter {
     state = .idle
     ring.removeAll(keepingCapacity: true)
     held.removeAll(keepingCapacity: true)
-    recent.removeAll(keepingCapacity: true)
+    tail.removeAll(keepingCapacity: true)
+    recentSpeech.removeAll(keepingCapacity: true)
     heldPre = 0
     speaking = false
     startRun = 0
     silRun = 0
     speechW = 0
     sinceCheckW = 0
+    earlyTried = false
+    midTried = false
+    fullTried = false
+    earlyScore = 1
+    suspect = false
     job = 0
     verdictLock.lock()
     verdicts.removeAll()
@@ -195,6 +207,10 @@ final class VoiceFilter {
     let p = (try? vad?.prob(winBuf)) ?? 0
     w.prob = p
     c.prob = p
+    if p >= Self.speechProb {
+      keepSpeech(w)
+      keepSpeech(c)
+    }
     onWindow(p)
     take()
   }
@@ -212,27 +228,37 @@ final class VoiceFilter {
       }
     case .hold:
       held.append(c)
-      keep(c)
       if held.count - heldPre >= Self.maxHold {
         job = 0
         reject()
       }
     case .blocked:
-      held.append(c)
-      keep(c)
-      if held.count >= Self.maxHold {
-        job = 0
-        flushHeld(false)
+      // Blocked non-owner speech is silenced immediately and never retained for replay.
+      if debt > 0 && t % 2 == 0 {
+        debt -= 1
+      } else {
+        send(nil)
       }
     case .open:
-      send(c.a)
-      keep(c)
+      tail.append(c)
+      if !suspect {
+        while tail.count > Self.tailHops {
+          send(tail.removeFirst().a)
+        }
+      } else if tail.count > Self.tailMaxSuspect {
+        send(tail.removeFirst().a)
+      }
     }
   }
 
-  private func keep(_ c: Chunk) {
-    recent.append(c)
-    if recent.count > Self.recentMax { recent.removeFirst() }
+  private func keepSpeech(_ c: Chunk) {
+    recentSpeech.append(c)
+    if recentSpeech.count > Self.recentSpeechMax { recentSpeech.removeFirst() }
+  }
+
+  private func tailSpeech(_ maxHops: Int) -> [Chunk] {
+    if recentSpeech.count <= maxHops { return recentSpeech }
+    return Array(recentSpeech.suffix(maxHops))
   }
 
   private func onWindow(_ p: Float) {
@@ -268,23 +294,29 @@ final class VoiceFilter {
       } else if speechW >= Self.fullW && !fullTried {
         fullTried = true
         check(.full, held)
+      } else if speechW >= Self.midW && !midTried {
+        midTried = true
+        check(.mid, held)
       } else if speechW >= Self.earlyW && !earlyTried {
         earlyTried = true
         check(.early, held)
       }
     case .open:
       if ended {
-        lastOwner = t
-        toIdle()
-      } else if job == 0 && sinceCheckW >= recheckW {
-        check(.recheck, recent)
+        if (suspect || sinceCheckW >= Self.endCheckMinW) && recentSpeech.count >= Self.minSpeech && job == 0 {
+          check(.end, recentSpeech)
+        } else {
+          toIdleFromOpen()
+        }
+      } else if job == 0 && sinceCheckW >= Self.recheckStepW && recentSpeech.count >= Self.minSpeech {
+        check(.recheck, tailSpeech(Self.fastSpeechHops))
       }
     case .blocked:
       if job != 0 { return }
       if ended {
-        if sinceCheckW > 0 { check(.end, recent) } else { flushHeld(false); toIdle() }
-      } else if sinceCheckW >= Self.blockedRecheckW {
-        check(.recheck, recent)
+        toIdle()
+      } else if sinceCheckW >= Self.blockedStepW && recentSpeech.count >= Self.minSpeech {
+        check(.recheck, tailSpeech(Self.fastSpeechHops))
       }
     }
   }
@@ -294,16 +326,12 @@ final class VoiceFilter {
     speechW = 0
     sinceCheckW = 0
     earlyTried = false
+    midTried = false
     fullTried = false
-    if t - lastOwner <= Self.trust {
-      recent = ring
-      flushRing(true)
-      state = .open
-      recheckW = Self.trustedRecheckW
-      trusted = true
-      return
-    }
-    recent = ring
+    earlyScore = 1
+    suspect = false
+    recentSpeech.removeAll(keepingCapacity: true)
+    for c in ring where c.prob >= Self.speechProb { keepSpeech(c) }
     held = ring
     heldPre = ring.count
     ring.removeAll(keepingCapacity: true)
@@ -322,7 +350,7 @@ final class VoiceFilter {
     jobSeq = id
     job = id
     jobKind = kind
-    jobSpeechW = (kind == .recheck || state == .blocked) ? sinceCheckW : speechW
+    jobSpeechW = (kind == .recheck || kind == .confirm || state == .blocked) ? sinceCheckW : speechW
     sinceCheckW = 0
     worker { [weak self] in
       let t0 = DispatchTime.now().uptimeNanoseconds
@@ -357,36 +385,72 @@ final class VoiceFilter {
     case .hold:
       let pass: Bool?
       switch jobKind {
-      case .early: pass = s >= o.early ? true : nil
-      case .full: pass = s >= o.threshold
-      default: pass = s >= (jobSpeechW >= Self.earlyW ? o.threshold : o.short)
+      case .early:
+        earlyScore = s
+        pass = s >= o.early ? true : (s < o.threshold - 0.10 ? false : nil)
+      case .mid:
+        pass = s >= o.threshold + 0.03 ? true : nil
+      case .full:
+        pass = s >= o.threshold
+      default:
+        pass = s >= (jobSpeechW >= Self.earlyW ? o.threshold : o.short)
       }
       if let pass {
         onVerdict(pass, s, jobKind.rawValue)
         if pass { accept() } else { reject() }
       }
     case .open:
-      if s < o.threshold - (trusted ? 0 : 0.05) {
-        onVerdict(false, s, trusted ? "trusted" : "recheck")
-        blocked += 1
-        state = .blocked
-        held.removeAll(keepingCapacity: true)
-        heldPre = 0
-      } else {
-        lastOwner = t
-        recheckW = Self.openRecheckW
+      if jobKind == .end {
+        if s >= o.threshold - 0.06 {
+          onVerdict(true, s, "end")
+          toIdleFromOpen()
+        } else {
+          onVerdict(false, s, "end")
+          blocked += 1
+          dropTailAsSilence()
+          toIdle()
+        }
+        return
       }
-      trusted = false
-    case .blocked:
+      if jobKind == .confirm {
+        if s >= o.threshold {
+          suspect = false
+          while tail.count > Self.tailHops { send(tail.removeFirst().a) }
+          if !speaking { toIdleFromOpen() }
+        } else {
+          onVerdict(false, s, "confirm")
+          blocked += 1
+          suspect = false
+          dropTailAsSilence()
+          if speaking { state = .blocked; sinceCheckW = 0 } else { toIdle() }
+        }
+        return
+      }
       if s >= o.threshold {
-        onVerdict(true, s, "recheck")
-        passed += 1
-        flushHeld(true)
-        lastOwner = t
-        if speaking { state = .open; recheckW = Self.openRecheckW; trusted = false } else { toIdle() }
+        suspect = false
+        while tail.count > Self.tailHops { send(tail.removeFirst().a) }
+        if !speaking { toIdleFromOpen() }
+      } else if !suspect {
+        suspect = true
+        if !speaking { check(.end, recentSpeech) }
+      } else if s >= o.threshold - 0.05 && recentSpeech.count > Self.fastSpeechHops {
+        check(.confirm, tailSpeech(Self.confirmSpeechHops))
       } else {
-        flushHeld(false)
-        if !speaking { toIdle() }
+        onVerdict(false, s, "recheck")
+        blocked += 1
+        suspect = false
+        dropTailAsSilence()
+        if speaking { state = .blocked; sinceCheckW = 0 } else { toIdle() }
+      }
+    case .blocked:
+      if s >= o.threshold + 0.04 {
+        onVerdict(true, s, "resume")
+        passed += 1
+        tail.removeAll(keepingCapacity: true)
+        suspect = false
+        if speaking { state = .open; sinceCheckW = 0 } else { toIdle() }
+      } else if !speaking {
+        toIdle()
       }
     case .idle:
       break
@@ -396,22 +460,51 @@ final class VoiceFilter {
   private func accept() {
     passed += 1
     noteHold()
-    flushHeld(true)
-    lastOwner = t
-    if speaking {
-      state = .open
-      recheckW = Self.openRecheckW
-      trusted = false
+    recentSpeech.removeAll(keepingCapacity: true)
+    for c in held where c.prob >= Self.speechProb { keepSpeech(c) }
+    tail.removeAll(keepingCapacity: true)
+    if earlyScore < o.threshold - 0.08 {
+      let keep = min(held.count, Self.prefixKeepHops)
+      let cut = held.count - keep
+      if heldPre < cut {
+        for i in heldPre..<cut {
+          if debt > 0 && i % 2 == 0 { debt -= 1 } else { send(nil) }
+        }
+      }
+      if cut < held.count {
+        tail.append(contentsOf: held[cut..<held.count])
+      }
+      if cut < heldPre { debt += heldPre - cut }
     } else {
-      toIdle()
+      let cut = max(0, held.count - Self.tailHops)
+      for i in 0..<cut { send(held[i].a) }
+      if cut < held.count {
+        tail.append(contentsOf: held[cut..<held.count])
+      }
+      debt += heldPre
     }
+    held.removeAll(keepingCapacity: true)
+    heldPre = 0
+    suspect = false
+    if speaking { state = .open; sinceCheckW = 0 } else { toIdleFromOpen() }
   }
 
   private func reject() {
     blocked += 1
     noteHold()
-    flushHeld(false)
-    if speaking { state = .blocked } else { toIdle() }
+    for i in heldPre..<held.count {
+      if debt > 0 && i % 2 == 0 { debt -= 1 } else { send(nil) }
+    }
+    held.removeAll(keepingCapacity: true)
+    heldPre = 0
+    if speaking { state = .blocked; sinceCheckW = 0 } else { toIdle() }
+  }
+
+  private func dropTailAsSilence() {
+    while !tail.isEmpty {
+      tail.removeFirst()
+      if debt > 0 { debt -= 1 } else { send(nil) }
+    }
   }
 
   private func noteHold() {
@@ -421,34 +514,22 @@ final class VoiceFilter {
     if ms > holdMsMax { holdMsMax = ms }
   }
 
-  private func flushHeld(_ audio: Bool) {
-    if audio {
-      for c in held { send(c.a) }
-      debt += heldPre
-    } else {
-      for i in heldPre..<held.count {
-        if debt > 0 && i % 2 == 0 { debt -= 1 } else { send(nil) }
-      }
+  private func toIdleFromOpen() {
+    while !tail.isEmpty {
+      let d = tail.removeFirst()
+      if debt > 0 && d.prob < Self.speechProb { debt -= 1 } else { send(d.a) }
     }
-    held.removeAll(keepingCapacity: true)
-    heldPre = 0
-  }
-
-  private func flushRing(_ audio: Bool) {
-    if audio {
-      for c in ring { send(c.a) }
-      debt += ring.count
-    }
-    ring.removeAll(keepingCapacity: true)
+    toIdle()
   }
 
   private func toIdle() {
     state = .idle
     job = 0
     idleHops = 0
+    suspect = false
     held.removeAll(keepingCapacity: true)
     heldPre = 0
-    recent.removeAll(keepingCapacity: true)
+    recentSpeech.removeAll(keepingCapacity: true)
   }
 
   private func send(_ a: [Float]?) {

@@ -334,19 +334,79 @@ export function textWithFiles(text: string, paths: string[]): string {
 
 /**
  * A trailing line that stands for a picture: a path `textWithFiles` appended,
- * or Claude Code's `[Image #n]` marks, which it may put in their place.
+ * Claude Code's `[Image #n]` / `[Image #n, WxH]` marks, or Uniflo's `[image]` blocks.
  */
-const PICTURE_LINE = /^(?:(?:\/|[A-Za-z]:\\).*\.(?:jpe?g|png|webp|gif)|(?:\[Image #\d+\]\s*)+)$/i;
+const IMAGE_TAG = /\[Image #\d+(?:,\s*\d+\s*[x×]\s*\d+)?\]/gi;
+const HAS_IMAGE_TAG = /\[Image #\d+(?:,\s*\d+\s*[x×]\s*\d+)?\]/i;
+const IMAGE_BLOCK = /\[image\]/gi;
+const TRAILING_IMAGE_BLOCKS = /(?:\s*\[image\])+$/i;
+const PICTURE_LINE = /^(?:(?:\/|[A-Za-z]:\\).*\.(?:jpe?g|png|webp|gif)|(?:\[Image #\d+(?:,\s*\d+\s*[x×]\s*\d+)?\]\s*)+|(?:\[image\]\s*)+)$/i;
 /** An absolute path: `/…` (macOS, Linux) or `C:\…` (Windows). */
 const FILE_PATH = /^(?:\/|[A-Za-z]:\\)/;
 
-/** Undoes `textWithFiles`: the words, the picture lines after them, and how many pictures those are. */
+/** Undoes `textWithFiles`: the words, the picture marks/paths, and how many pictures those are. */
 export function splitFiles(message: string): { text: string; lines: string[]; count: number } {
   const all = message.replace(/\s+$/, "").split("\n");
-  const lines: string[] = [];
-  while (all.length > 0 && PICTURE_LINE.test(all[all.length - 1]!.trim())) lines.unshift(all.pop()!.trim());
-  const count = lines.reduce((n, l) => n + (FILE_PATH.test(l) ? 1 : (l.match(/\[Image #\d+\]/gi)?.length ?? 1)), 0);
-  return { text: all.join("\n").trim(), lines, count };
+  const popped: string[] = [];
+  while (all.length > 0) {
+    const top = all[all.length - 1]!.trim();
+    if (!top) {
+      all.pop();
+      continue;
+    }
+    if (!PICTURE_LINE.test(top)) break;
+    popped.unshift(all.pop()!.trim());
+  }
+  const inlineBlocks: string[] = [];
+  if (all.length > 0) {
+    const last = all[all.length - 1]!;
+    const trail = TRAILING_IMAGE_BLOCKS.exec(last);
+    if (trail) {
+      inlineBlocks.push(...(trail[0].match(IMAGE_BLOCK) ?? []));
+      const trimmed = last.slice(0, trail.index).trimEnd();
+      if (trimmed) all[all.length - 1] = trimmed;
+      else all.pop();
+    }
+  }
+  const inlineTags: string[] = [];
+  const cleaned: string[] = [];
+  for (const line of all) {
+    const tags = line.match(IMAGE_TAG);
+    if (!tags) {
+      cleaned.push(line);
+      continue;
+    }
+    inlineTags.push(...tags);
+    const next = line.replace(IMAGE_TAG, "").replace(/[ \t]{2,}/g, " ").trim();
+    if (next) cleaned.push(next);
+  }
+  const pathLines = popped.filter((l) => FILE_PATH.test(l));
+  const poppedTagLines = popped.filter((l) => !FILE_PATH.test(l) && HAS_IMAGE_TAG.test(l));
+  const poppedTags = popped.flatMap((l) => l.match(IMAGE_TAG) ?? []);
+  const poppedBlocks = popped.flatMap((l) => l.match(IMAGE_BLOCK) ?? []);
+  const totalTags = inlineTags.length + poppedTags.length;
+  const totalBlocks = inlineBlocks.length + poppedBlocks.length;
+  const count = pathLines.length + Math.max(totalTags, totalBlocks);
+  const lines = [
+    ...pathLines,
+    ...inlineTags,
+    ...poppedTagLines,
+    ...(totalTags === 0 ? [...popped.filter((l) => !FILE_PATH.test(l)), ...inlineBlocks] : []),
+  ];
+  return { text: cleaned.join("\n").trim(), lines, count };
+}
+
+const foldMessageText = (s: string) => s.replace(/\s+/g, "");
+
+/** Whether a conversation copy matches what was typed/sent, ignoring attached picture marks and PTY whitespace shifts. */
+export function sameMessage(said: string, sent: string, hasFiles?: boolean): boolean {
+  const a = splitFiles(said);
+  const b = splitFiles(sent);
+  const ta = foldMessageText(a.text);
+  const tb = foldMessageText(b.text);
+  if (ta !== tb) return false;
+  if (!tb) return hasFiles ? a.count > 0 : a.count > 0 || b.count === 0;
+  return true;
 }
 
 // ---------------------------------------------------------------------------

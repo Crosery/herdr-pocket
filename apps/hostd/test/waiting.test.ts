@@ -37,6 +37,21 @@ test("text typed into a busy agent waits until its conversation shows it", async
   assert.equal(w.decorate([agent("working")])[0]!.queued, 1);
 });
 
+test("queued messages with pictures settle on Uniflo [Image #n] echoes and image-only sends", async () => {
+  const w = new InputWaits({ landMs: 1000 });
+  w.add("d/hc:t1", "q1", "看下这张图\n/tmp/files/shot-1.jpg", 1000);
+  assert.equal(
+    await w.settle([agent("working", { sessionKey: "claude:s" })], async () => [said("[Image #1]看下这张图\n[image]", 2000)], 3000),
+    true,
+  );
+  assert.equal(w.size, 0);
+
+  w.add("d/hc:t1", "q2", "/tmp/files/shot-2.png", 4000);
+  assert.equal(await w.settle([agent("working")], async () => [], 6000, async () => "❯ [Image #1]\n"), false);
+  assert.equal(await w.settle([agent("working", { sessionKey: "claude:s" })], async () => [said("[Image #1]\n[image]", 7000)], 8000), true);
+  assert.equal(w.size, 0);
+});
+
 test("without a conversation: stopped then working again means taken; stopped long enough means gone", async () => {
   const w = new InputWaits({ idleGraceMs: 1000 });
   const none = async () => [];

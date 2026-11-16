@@ -443,7 +443,7 @@ export default function VoiceprintScreen() {
         </Card>
 
         <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 19, paddingHorizontal: space.xs }}>
-          每句话开头会花约 0.5–1 秒核对声纹，后面直接放行；说完立刻截止，不会拖慢小羊接话的速度。修改设置从下一通电话生效。
+          每句话开头与通话全程都会持续核对声纹，先缓冲约半秒确认是你的音色再放行；旁人插话或外放声音会被立即静音。修改设置从下一通电话生效。
         </Text>
 
         {error ? (

@@ -4,7 +4,7 @@
  * (`terminal.put`), then sends the text naming their paths through the usual
  * send queue: Claude Code, Codex and the like read a picture from its path.
  */
-import { PUT_LIMITS, splitFiles, textWithFiles, type Agent, type RpcResult } from "@herdr-pocket/protocol";
+import { PUT_LIMITS, sameMessage, splitFiles, textWithFiles, type Agent, type RpcResult } from "@herdr-pocket/protocol";
 import { PocketNative, type PickedImage } from "../../modules/pocket-native";
 import { call, RelayError } from "./relay";
 
@@ -37,10 +37,7 @@ export async function pickImages(room: number): Promise<Attachment[]> {
  */
 export const splitPictures = splitFiles;
 
-/** Whether a message in the conversation is the one sent from this phone: same words, pictures aside. */
-export function sameMessage(said: string, sent: string): boolean {
-  return splitPictures(said).text === splitPictures(sent).text;
-}
+export { sameMessage };
 
 /** Adds newly picked pictures within `PUT_LIMITS`; `note` says what was left out and why. */
 export function addPictures(current: Attachment[], picked: Attachment[]): { list: Attachment[]; note?: string } {
