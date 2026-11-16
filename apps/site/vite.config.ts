@@ -1,11 +1,12 @@
 import { defineConfig, type Plugin } from "vite";
-import { SITE } from "./src/config";
+import { SITE, commandHtml, commandPrompt, fillCommand, type CommandKey } from "./src/config";
 
 const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-// Bake links, commands and the example server from src/config.ts into the HTML,
-// so they are right without JavaScript and for crawlers. main.ts fills the same
-// values at runtime, so config.ts stays the only place to edit.
+// Bake links and commands from src/config.ts into the HTML, so they are right
+// without JavaScript and for crawlers. Commands carry the "<your server address>"
+// placeholder (Chinese, the source language); sections.ts fills in the address a
+// visitor types, so config.ts stays the only place to edit.
 const inlineConfig = (): Plugin => ({
   name: "inline-config",
   transformIndexHtml(html) {
@@ -13,10 +14,9 @@ const inlineConfig = (): Plugin => ({
       .replace(/href="#" data-href="(\w+)"/g, (m, key: keyof typeof SITE) =>
         typeof SITE[key] === "string" ? `href="${esc(SITE[key] as string)}" data-href="${key}"` : m,
       )
-      .replace(/data-cmd="(\w+)"([\s\S]*?)<code class="cmd-text"><\/code>/g, (m, key: keyof typeof SITE.commands, mid: string) =>
-        key in SITE.commands ? `data-cmd="${key}"${mid}<code class="cmd-text">${esc(SITE.commands[key])}</code>` : m,
-      )
-      .replaceAll("{server}", SITE.server);
+      .replace(/data-cmd="(\w+)"([\s\S]*?)<code class="cmd-text"><\/code>/g, (m, key: CommandKey, mid: string) =>
+        key in SITE.commands ? `data-cmd="${key}"${mid}<code class="cmd-text">${commandHtml(fillCommand(SITE.commands[key], null, "zh"), commandPrompt(key))}</code>` : m,
+      );
   },
 });
 

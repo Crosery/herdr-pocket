@@ -40,6 +40,15 @@
   border-radius: 10px;
   box-shadow: var(--shadow-sm);
 }
+.brand span {
+  white-space: nowrap;
+}
+/* the narrowest phones: GitHub stays in the footer and the final call to action */
+@media (max-width: 380px) {
+  .nav .gh-link {
+    display: none;
+  }
+}
 .nav-links {
   display: flex;
   gap: 2px;
@@ -169,9 +178,28 @@
   gap: 12px;
   margin-top: 30px;
 }
-.hero-cmd {
-  margin-top: 22px;
-  max-width: 520px;
+/* what you need, under the buttons; links to the three parts */
+.hero-needs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 24px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink-2);
+}
+.hero-needs b {
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  color: var(--ink);
+  font-weight: 800;
+  transition: border-color 0.2s ease;
+}
+.hero-needs:hover b {
+  border-color: var(--accent);
 }
 
 /* Stage: mascot, wool cloud, orbiting agents, status bubbles */
@@ -477,8 +505,243 @@
     width: 28px;
     height: 28px;
   }
+  /* a smaller stage keeps both buttons on the first screen of a phone */
+  .hero {
+    padding-top: 84px;
+  }
+  .stage {
+    max-width: 300px;
+    margin-bottom: -18px;
+  }
+  .hero-ctas {
+    margin-top: 24px;
+  }
   .hero-ctas .btn {
-    flex: 1 1 100%;
+    flex: 1 1 auto;
+  }
+  .hero-needs {
+    margin-top: 18px;
+    font-size: 13px;
+  }
+}
+
+/* ================= THREE PARTS ================= */
+/* Server on top, phone and computers below, each joined to the server by a line:
+   the topology at a glance. On phones the lines become a tree on the left. */
+.parts {
+  --cg: 20px;
+  --rg: 56px;
+  padding-block: clamp(40px, 6vw, 80px) 10px;
+}
+.parts-head .lead {
+  margin-top: 16px;
+}
+.parts-grid {
+  list-style: none;
+  margin: 44px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--rg) var(--cg);
+}
+.part {
+  --wire: color-mix(in srgb, var(--accent) 55%, transparent);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 24px;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-sm);
+}
+.part-server {
+  grid-column: 1 / -1;
+  width: min(100%, 860px);
+  justify-self: center;
+  border-color: var(--line-2);
+  background: linear-gradient(160deg, var(--pink-soft), var(--surface) 60%);
+}
+/* wide screens: the server card in two columns, so the tree stays short */
+@media (min-width: 761px) {
+  .part-server {
+    display: grid;
+    grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+    grid-template-rows: auto 1fr;
+    gap: 6px 32px;
+  }
+  .part-server .part-what {
+    grid-column: 2;
+    grid-row: 1 / 3;
+    align-self: center;
+  }
+  .part-server .part-where {
+    grid-column: 1;
+  }
+  .part-server .part-act {
+    grid-column: 1;
+    grid-row: 3;
+    margin-top: 2px;
+  }
+  .part-server .part-what + .part-act {
+    grid-column: 2;
+    grid-row: 3;
+  }
+}
+.part-server::after,
+.part-phone::before,
+.part-pc::before {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+}
+.part-server::after {
+  left: 50%;
+  bottom: calc(var(--rg) / -2 - 1px);
+  height: calc(var(--rg) / 2);
+  border-left: 2px dashed var(--wire);
+}
+.part-phone::before,
+.part-pc::before {
+  top: calc(var(--rg) / -2);
+  height: calc(var(--rg) / 2);
+  border-top: 2px dashed var(--wire);
+}
+.part-phone::before {
+  left: 50%;
+  right: calc(var(--cg) / -2);
+  border-left: 2px dashed var(--wire);
+  border-top-left-radius: 14px;
+}
+.part-pc::before {
+  left: calc(var(--cg) / -2);
+  right: 50%;
+  border-right: 2px dashed var(--wire);
+  border-top-right-radius: 14px;
+}
+.part-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.part-num {
+  width: 34px;
+  height: 34px;
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  font-weight: 900;
+  font-size: 16px;
+  color: #fff;
+  background: linear-gradient(145deg, var(--accent), var(--lav));
+}
+.part-ico {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  background: var(--bg-2);
+  color: var(--accent-deep);
+}
+.part-ico svg {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.part h3 {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  margin-left: 4px;
+  font-size: 23px;
+  font-weight: 900;
+  line-height: 1.25;
+}
+.part h3 small {
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--ink-2);
+}
+.part-where {
+  font-size: 14.5px;
+  color: var(--ink-2);
+}
+.part-where b {
+  margin-left: 6px;
+  color: var(--ink);
+  font-weight: 800;
+}
+.part-what {
+  font-size: 15.5px;
+  color: var(--ink-2);
+}
+.part-act {
+  margin-top: auto;
+  padding-top: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  font-weight: 800;
+  color: var(--accent-deep);
+}
+.part-act svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.3s var(--ease-spring);
+}
+.part-act:hover svg {
+  transform: translateX(4px);
+}
+@media (max-width: 760px) {
+  .parts {
+    --rg: 18px;
+  }
+  .parts-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .part {
+    padding: 20px;
+  }
+  .part-phone,
+  .part-pc {
+    margin-left: 28px;
+  }
+  .part-server::after {
+    left: 12px;
+  }
+  .part-phone::before,
+  .part-pc::before {
+    left: -17px;
+    right: auto;
+    top: calc(var(--rg) * -1 - 1px);
+    width: 16px;
+    height: calc(var(--rg) + 34px);
+    border: 0;
+    border-left: 2px dashed var(--wire);
+    border-bottom: 2px dashed var(--wire);
+    border-radius: 0 0 0 12px;
+  }
+  /* the trunk runs on past the phone card to the computers */
+  .part-phone::after {
+    content: "";
+    position: absolute;
+    left: -17px;
+    top: 30px;
+    bottom: 0;
+    border-left: 2px dashed var(--wire);
   }
 }
 
@@ -1525,15 +1788,12 @@
   border-radius: 10px;
   background: #fff;
   padding: 5px;
-  display: grid;
-  grid-template-columns: repeat(13, 1fr);
   box-shadow: var(--shadow-sm);
 }
-.art-qr .qr i {
-  background: #2a2231;
-}
-.art-qr .qr i.o {
-  background: transparent;
+.art-qr .qr svg {
+  width: 100%;
+  height: 100%;
+  fill: #2a2231;
 }
 .art-qr b {
   font-family: var(--font-mono);
@@ -1829,6 +2089,7 @@
 /* ================= VIDEO ================= */
 .video-sec {
   padding-block: clamp(70px, 9vw, 120px) 20px;
+  scroll-margin-top: 20px;
 }
 .video-frame {
   position: relative;
@@ -1841,99 +2102,219 @@
   border: 1px solid var(--line);
 }
 .video-frame video {
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
-.video-play {
-  position: absolute;
-  inset: 0;
+
+/* ================= DEPLOY ================= */
+/* The address bar on top fills every command. Below it, one row per step, joined by the same
+   numbered dashed wire as the three parts: what and why on the left, the command on the right. */
+.deploy {
+  --rail: 44px;
+  --rail-gap: 18px;
+  --step-gap: 22px;
+  --bar-gap: 30px;
+  --num-top: 26px;
+  --wire: color-mix(in srgb, var(--accent) 55%, transparent);
+  padding-block: clamp(90px, 11vw, 150px) 40px;
+}
+
+/* short paragraphs here: no lone character on the last line */
+.server-help,
+.server-msg,
+.dstep-info > p,
+.dstep-app p,
+.scan-hint p,
+.tab-note,
+.dmore-body {
+  text-wrap: pretty;
+}
+
+/* ---- the server address ---- */
+.server-bar {
+  margin-top: 34px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.75fr);
+  gap: 14px 34px;
+  align-items: center;
+  padding: 24px 28px;
+  border-radius: var(--r-lg);
+  border: 1.5px solid var(--line-2);
+  background: linear-gradient(160deg, var(--pink-soft), var(--surface) 70%);
+  box-shadow: var(--shadow-sm);
+}
+.server-bar-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+.server-ico {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
   display: grid;
   place-items: center;
-  background: radial-gradient(circle, rgba(36, 26, 48, 0) 30%, rgba(36, 26, 48, 0.25));
+  background: var(--surface);
+  color: var(--accent-deep);
+  box-shadow: var(--shadow-sm);
 }
-.video-play span {
-  width: 92px;
-  height: 92px;
+.server-ico svg {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.server-bar label {
+  display: block;
+  font-weight: 900;
+  font-size: 19px;
+  line-height: 1.3;
+}
+.server-help {
+  margin-top: 4px;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+.server-row {
+  position: relative;
+}
+.server-row input {
+  width: 100%;
+  height: 54px;
+  padding: 0 50px 0 18px;
+  border-radius: 14px;
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 60%, transparent);
+  background: var(--surface);
+  color: var(--ink);
+  font: 600 16.5px/1.2 var(--font-mono);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.server-row input::placeholder {
+  color: var(--ink-3);
+}
+.server-row input:focus {
+  outline: none;
+  border-style: solid;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.server-bar[data-state="ok"] input {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--mint) 70%, transparent);
+}
+.server-bar[data-state="invalid"] input,
+.server-bar[data-state="example"] input {
+  border-style: solid;
+  border-color: var(--red);
+}
+.server-ok {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  width: 26px;
+  height: 26px;
+  margin-top: -13px;
   border-radius: 50%;
   display: grid;
   place-items: center;
-  background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 20px 50px -10px rgba(217, 87, 140, 0.7), 0 0 0 10px rgba(255, 255, 255, 0.25);
-  transition: transform 0.5s var(--ease-spring);
+  background: var(--mint);
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 0.25s ease, transform 0.35s var(--ease-spring);
 }
-.video-play svg {
-  width: 34px;
-  height: 34px;
-  margin-left: 5px;
-  fill: var(--accent-deep);
+.server-ok svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: #fff;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
-.video-play:hover span {
-  transform: scale(1.1);
+.server-bar[data-state="ok"] .server-ok {
+  opacity: 1;
+  transform: none;
 }
-.video-frame.is-playing .video-play {
+.server-msg {
+  margin-top: 9px;
+  font-size: 13.5px;
+  font-weight: 800;
+  line-height: 1.5;
+  color: var(--accent-deep);
+  overflow-wrap: anywhere;
+}
+.server-msg:empty {
   display: none;
 }
-.video-q {
-  display: flex;
-  justify-content: flex-end;
-  align-items: center;
-  gap: 4px;
-  margin-top: 12px;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--ink-2);
+.server-bar[data-state="ok"] .server-msg {
+  color: var(--mint);
 }
-.video-q span {
-  margin-right: 6px;
+.server-bar[data-state="invalid"] .server-msg,
+.server-bar[data-state="example"] .server-msg {
+  color: var(--red);
 }
-.video-q button {
-  padding: 5px 12px;
-  border-radius: 999px;
-  font-weight: 800;
-  transition: background-color 0.25s ease, color 0.25s ease;
-}
-.video-q button.is-on {
-  background: var(--pink-soft);
-  color: var(--accent-deep);
-}
-
-/* ================= DEPLOY ================= */
-.deploy {
-  padding-block: clamp(90px, 11vw, 150px) 40px;
-}
-.deploy-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.8fr) minmax(0, 1.1fr);
-  gap: 20px;
-  margin-top: 42px;
-  align-items: start;
-}
-.tab-note {
-  font-size: 13.5px;
-  line-height: 1.65;
-  color: var(--ink-2);
-}
-.tab-note code {
-  font-size: 0.92em;
+.server-msg code,
+.server-msg .ph {
   padding: 1px 6px;
   border-radius: 6px;
-  background: var(--pink-soft);
+  font: 700 0.95em var(--font-mono);
+  white-space: nowrap;
+}
+.server-msg .ph {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
   color: var(--accent-deep);
 }
+.server-msg code {
+  background: var(--mint-soft);
+  color: var(--mint);
+}
+.server-bar.is-nudged {
+  animation: nudge 0.55s ease;
+  border-color: var(--accent);
+}
+@keyframes nudge {
+  20% {
+    transform: translateX(-7px);
+  }
+  40% {
+    transform: translateX(6px);
+  }
+  60% {
+    transform: translateX(-4px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
+}
+
+/* ---- the steps ---- */
+.dsteps {
+  list-style: none;
+  margin: var(--bar-gap) 0 0;
+  padding: 0;
+  display: grid;
+  gap: var(--step-gap);
+}
 .dstep {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 26px;
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow-sm);
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+  gap: var(--rail-gap);
+  align-items: start;
 }
 .dstep-num {
-  width: 42px;
-  height: 42px;
+  position: relative;
+  z-index: 1;
+  width: var(--rail);
+  height: var(--rail);
+  margin-top: var(--num-top);
   border-radius: 14px;
   display: grid;
   place-items: center;
@@ -1943,61 +2324,110 @@
   background: linear-gradient(145deg, var(--accent), var(--lav));
   box-shadow: 0 10px 22px -10px rgba(217, 87, 140, 0.8);
 }
-.dstep h3 {
+/* the wire: from the address bar into step 1, then from each number down to the next */
+.dstep::before,
+.dstep:first-child::after {
+  content: "";
+  position: absolute;
+  left: calc(var(--rail) / 2 - 1px);
+  border-left: 2px dashed var(--wire);
+  pointer-events: none;
+}
+.dstep::before {
+  top: calc(var(--num-top) + var(--rail) + 8px);
+  bottom: calc(8px - var(--step-gap) - var(--num-top));
+}
+.dstep:last-child::before {
+  display: none;
+}
+.dstep:first-child::after {
+  top: calc(-1 * var(--bar-gap));
+  height: calc(var(--bar-gap) + var(--num-top) - 8px);
+}
+.dstep-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2.2fr);
+  gap: 18px 34px;
+  padding: 26px 28px;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-sm);
+}
+.dstep-info h3 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
   font-size: 21px;
   font-weight: 900;
+  line-height: 1.3;
 }
-.dstep p {
+.dstep-info h3 small {
+  font-size: 13.5px;
+  font-weight: 800;
   color: var(--ink-2);
-  font-size: 15.5px;
 }
-.tabs {
+.dstep-info > p {
+  margin-top: 8px;
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+.dstep-info code,
+.tab-note code,
+.dmore-body code {
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 0.9em;
+  background: var(--pink-soft);
+  color: var(--accent-deep);
+  overflow-wrap: anywhere;
+}
+.dstep-work {
+  min-width: 0;
   display: flex;
-  gap: 4px;
-  padding: 4px;
+  flex-direction: column;
+  gap: 12px;
+}
+/* step 2: the button and one line beside it */
+.dstep-app {
+  flex-direction: row;
+  align-items: center;
+  gap: 20px;
+}
+.dstep-app .btn {
+  flex: none;
+}
+.dstep-app p {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+/* step 3: what the terminal shows, small, beside the explanation */
+.scan-hint {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 10px 12px;
   border-radius: 14px;
   background: var(--bg-2);
 }
-.tab {
-  flex: 1 1 auto;
-  min-width: 0;
-  padding: 8px 6px;
-  border-radius: 10px;
-  font-size: 13px;
-  font-weight: 800;
-  color: var(--ink-2);
-  white-space: nowrap;
-  transition: background-color 0.25s ease, color 0.25s ease, box-shadow 0.25s ease;
+.scan-hint .scan-qr {
+  width: 56px;
+  height: 56px;
+  padding: 4px;
+  border-radius: 8px;
 }
-.tab.is-on {
-  background: var(--surface);
-  color: var(--ink);
-  box-shadow: var(--shadow-sm);
-}
-.cmd-block {
-  align-items: flex-start;
-  padding: 14px 10px 14px 16px;
-}
-.cmd-block .cmd-text {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  line-height: 1.6;
-  font-size: 13.5px;
-}
-.cmd-block .cmd-prompt {
-  line-height: 1.6;
-}
-.mini-term {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 14px;
-  border-radius: 16px;
-  background: var(--term-bg);
-  color: var(--term-ink);
+.scan-hint p {
   font-size: 13.5px;
   font-weight: 700;
+  line-height: 1.5;
+  color: var(--ink-2);
 }
+
+/* a QR picture (also used by the pairing screen in the views demo) */
 .qr-ascii {
   flex: none;
   width: 92px;
@@ -2005,31 +2435,288 @@
   padding: 5px;
   border-radius: 8px;
   background: #fff;
+}
+.qr-ascii svg {
+  width: 100%;
+  height: 100%;
+  fill: #241d2b;
+}
+
+/* ---- tabs ---- */
+.tabs {
+  display: inline-flex;
+  align-self: flex-start;
+  max-width: 100%;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 14px;
+  background: var(--bg-2);
+}
+.tab {
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 13.5px;
+  font-weight: 800;
+  color: var(--ink-2);
+  white-space: nowrap;
+  transition: background-color 0.25s ease, color 0.25s ease, box-shadow 0.25s ease;
+}
+.tab:hover {
+  color: var(--ink);
+}
+.tab.is-on {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-sm);
+}
+
+/* ---- the command card ---- */
+.term {
+  border-radius: 16px;
+  background: var(--term-bg);
+  color: var(--term-ink);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+.term-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 8px 8px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+.term-dots {
+  display: flex;
+  gap: 6px;
+}
+.term-dots i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.16);
+}
+.term-dots i:first-child {
+  background: var(--accent);
+}
+.term-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 800;
+  color: rgba(243, 233, 242, 0.62);
+}
+.term .cmd-copy {
+  height: 30px;
+}
+.term-scroll {
+  overflow-x: auto;
+  padding: 14px 18px 16px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+.term-scroll:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+/* the side that still hides part of a long line fades out */
+.term-scroll.is-cut-r {
+  mask-image: linear-gradient(to right, #000 calc(100% - 56px), transparent);
+}
+.term-scroll.is-cut-l {
+  mask-image: linear-gradient(to right, transparent, #000 56px);
+}
+.term-scroll.is-cut-l.is-cut-r {
+  mask-image: linear-gradient(to right, transparent, #000 56px, #000 calc(100% - 56px), transparent);
+}
+.term .cmd-text {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  overflow: visible;
+  padding: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  white-space: pre;
+  font: 500 13px/1.75 var(--font-mono);
+}
+.term .cmd-prompt {
+  user-select: none;
+}
+/* a placeholder still to be replaced, inside a command */
+.cmd-ph {
+  white-space: nowrap;
+  padding: 0 4px;
+  border-radius: 5px;
+  background: rgba(255, 143, 184, 0.24);
+  color: #ffc2d9;
+  font: inherit;
+}
+
+/* ---- the short note and "details" under a command ---- */
+.tab-note {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+.tab-note:empty {
+  display: none;
+}
+.dmore {
+  margin-top: -4px;
+  font-size: 13.5px;
+  color: var(--ink-2);
+}
+.dmore summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 800;
+  color: var(--accent-deep);
+}
+.dmore summary::-webkit-details-marker {
+  display: none;
+}
+.dmore summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform 0.25s ease, margin 0.25s ease;
+}
+.dmore[open] summary::before {
+  margin-top: 3px;
+  transform: rotate(-135deg);
+}
+.dmore-body {
+  margin-top: 8px;
   display: grid;
-  grid-template-columns: repeat(21, 1fr);
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--bg-2);
+  line-height: 1.65;
 }
-.qr-ascii i {
-  background: #241d2b;
+.dmore-body p:empty {
+  display: none;
 }
-.qr-ascii i.o {
-  background: transparent;
+.srv-admin a code {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
-.fine {
-  font-size: 13.5px !important;
-  color: var(--ink-3) !important;
+
+@media (max-width: 980px) {
+  .server-bar,
+  .dstep-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .scan-hint {
+    max-width: 420px;
+  }
+}
+/* phones: no rail; the number sits in the card and short dashes join the cards */
+@media (max-width: 760px) {
+  .deploy {
+    --step-gap: 26px;
+    --bar-gap: 26px;
+  }
+  .server-bar {
+    padding: 20px 18px;
+  }
+  .server-ico {
+    width: 38px;
+    height: 38px;
+    border-radius: 12px;
+  }
+  .server-bar label {
+    font-size: 17.5px;
+  }
+  .dstep {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .dstep-num {
+    position: absolute;
+    top: 20px;
+    left: 18px;
+    width: 32px;
+    height: 32px;
+    margin: 0;
+    border-radius: 11px;
+    font-size: 16px;
+  }
+  .dstep::before,
+  .dstep:first-child::after {
+    left: 33px;
+  }
+  .dstep::before {
+    top: 100%;
+    bottom: auto;
+    height: var(--step-gap);
+  }
+  .dstep:first-child::after {
+    top: calc(-1 * var(--bar-gap));
+    height: var(--bar-gap);
+  }
+  .dstep-card {
+    padding: 20px 18px;
+    gap: 16px;
+  }
+  .dstep-info h3 {
+    min-height: 32px;
+    padding-left: 44px;
+    font-size: 19px;
+  }
+  .dstep-info h3 small {
+    font-size: 13px;
+  }
+  .dstep-info > p {
+    font-size: 14.5px;
+  }
+  .dstep-app {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+  .tabs {
+    display: flex;
+    align-self: stretch;
+  }
+  .tab {
+    flex: 1 1 auto;
+    padding: 8px 8px;
+  }
+  .term-scroll {
+    padding: 12px 14px 14px;
+  }
+  .term .cmd-text {
+    font-size: 12.5px;
+  }
 }
 @media (max-width: 420px) {
+  .server-row input {
+    height: 50px;
+    padding: 0 44px 0 14px;
+    font-size: 15px;
+  }
+  .server-ok {
+    right: 11px;
+  }
   .tab {
     font-size: 12.5px;
   }
   .tab-x {
     display: none;
-  }
-}
-@media (max-width: 1000px) {
-  .deploy-grid {
-    grid-template-columns: minmax(0, 1fr);
-    max-width: 640px;
   }
 }
 
@@ -2195,4 +2882,23 @@
 .footer-base img {
   width: 56px;
   height: auto;
+}
+
+/* ================= PHONES: glass without the blur ================= */
+/* A backdrop blur re-samples everything behind it on every scrolled frame; on a
+   phone that is the costliest thing on the page. Touch screens and narrow windows
+   get the same tint, nearly opaque, instead. */
+@media (hover: none), (max-width: 760px) {
+  .pill,
+  .btn-ghost,
+  .bubble,
+  .notif,
+  .nav.is-scrolled .nav-inner,
+  .view-step p,
+  .view-step h3,
+  .view-step .chip {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: var(--glass-solid);
+  }
 }

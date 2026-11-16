@@ -69,7 +69,7 @@ function pill(s: Status): string {
 export function agentListScreen(): HTMLElement {
   const el = h(`<div class="scr" data-scr="list">
     ${statusBar()}
-    <div class="scr-body">
+    <div class="scr-body a-list">
       <div class="a-top">
         <span class="a-round">${ICON.menu}</span>
         <div class="a-hello"><b>${t("夜深啦", "Late night")}</b><span class="a-busy"></span></div>

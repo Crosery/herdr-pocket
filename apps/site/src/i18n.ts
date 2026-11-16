@@ -1,4 +1,4 @@
-import { SITE, type Lang } from "./config";
+import type { Lang } from "./config";
 
 // Chinese is the source language and lives in index.html; English lives here.
 // At boot the Chinese markup is captured from the DOM so switching back is lossless.
@@ -13,20 +13,43 @@ const en: Record<string, string> = {
   "hero.title": "All your coding agents,<br /><em>in your pocket.</em>",
   "hero.sub":
     "Herdr Pocket connects the Claude Code, Codex, Gemini, OpenCode… sessions running in herdr to your Android phone: live status, readable conversations, a real terminal. Xiaoyang, the assistant, keeps watch and tells you the moment something finishes or gets stuck.",
-  "hero.cta1": "View on GitHub",
+  "hero.cta1": "Get started",
   "hero.cta2": "Watch the 90-second intro",
+  "hero.needs": "You need three things:",
+  "hero.need1": "Your own server",
+  "hero.need2": "An Android phone",
+  "hero.need3": "Computers running herdr",
+  "parts.eyebrow": "Three parts",
+  "parts.title": "One server, one phone,<br />and each of your computers",
+  "parts.lead":
+    "The server sits in the middle: the phone and every computer connect only to it, so they never need to share a network. Set them up in order, 1, 2, 3, and every agent on every computer shows up on the phone.",
+  "parts.where": "Runs on",
+  "parts.s.t": "Server",
+  "parts.s.k": "the relay",
+  "parts.s.w": "Your own server (Linux)",
+  "parts.s.d": "The hub between phone and computers: it relays status, conversations and terminals, and runs the Xiaoyang assistant and voice calls. Your data only passes through your server.",
+  "parts.s.a": "Deploy with one command",
+  "parts.p.t": "Phone",
+  "parts.p.k": "Android app",
+  "parts.p.w": "Your Android phone",
+  "parts.p.d": "See every agent's status, conversation and terminal, reply and press keys, get alerts, and talk to Xiaoyang. Scan the server's QR code once to connect.",
+  "parts.p.a": "Download and connect",
+  "parts.c.t": "Computers",
+  "parts.c.w": "Every computer that runs herdr (macOS, Linux, Windows)",
+  "parts.c.d": "Stays running in the background, sends the agents in this computer's herdr to the server, and hands them what you send from the phone.",
+  "parts.c.a": "One command per computer",
   "ui.copy": "Copy",
   "vendors.title": "If it runs in herdr, it shows up in your pocket",
   statement:
     "You don't have to babysit your desk. When an agent finishes, gets stuck, or waits for your OK, your pocket knows first. Glance, reply, hit enter, and the work keeps moving.",
   "how.eyebrow": "How it works",
-  "how.title": "Computers → relay → phone, one live line",
+  "how.title": "Computers → server → phone, one live line",
   "how.s1.t": "Agents keep running on every computer",
   "how.s1.d":
-    "Run your agents in herdr like always. Each computer runs <code>herdr-pocket up</code> once; the daemon reads local agents and publishes snapshots.",
-  "how.s2.t": "Your own relay",
+    "Run your agents in herdr like always. Install the computer part once on each machine; it reads the local agents in the background and sends snapshots to the server.",
+  "how.s2.t": "Your own server",
   "how.s2.d":
-    "The relay runs on your server: long-lived WebSockets with compression. Device tokens are stored only as hashes, and agent ownership is rewritten from the connection identity, so no computer can impersonate another.",
+    "The server (the relay) runs on your own machine: long-lived WebSockets with compression. Device tokens are stored only as hashes, and agent ownership is rewritten from the connection identity, so no computer can impersonate another.",
   "how.s3.t": "The phone sees everything, live",
   "how.s3.d":
     "Pair the phone once with a QR code and every agent on every computer appears in one list. Conversations and terminals stream live, with polling as automatic recovery.",
@@ -35,7 +58,9 @@ const en: Record<string, string> = {
     "Reply, press Esc, start a new agent, or just hand it to Xiaoyang: commands travel back the same way. Computers can call each other's agents from the CLI, with read-only mode and device allowlists when you want them.",
   "how.pc2": "Linux workstation",
   "how.pc3": "Cloud VM",
-  "how.relay": "Relay",
+  "how.relay": "Server",
+  "how.relayAt": "your server",
+  "how.online": "Connected to the server",
   "views.eyebrow": "Four views in your pocket",
   "views.title": "See it all at a glance, take over in one tap",
   "views.list.k": "Agent list",
@@ -53,7 +78,7 @@ const en: Record<string, string> = {
   "views.pair.k": "Devices",
   "views.pair.t": "Scan once and a new computer joins",
   "views.pair.d":
-    "On a new computer <code>herdr-pocket up</code> prints a QR code; scan it with a connected phone and tap Allow. Every QR is a plain https link any camera can open. Invite codes are single-use and expire after 10 minutes, and phones can invite phones too.",
+    "After the install command, a new computer prints a QR code; scan it with a connected phone and tap Allow. Every QR is a plain https link any camera can open. Invite codes are single-use and expire after 10 minutes, and phones can invite phones too.",
   "as.eyebrow": "Xiaoyang, your assistant",
   "as.title": "Xiaoyang keeps watch <em>and gets things done</em>",
   "as.lead":
@@ -104,27 +129,33 @@ const en: Record<string, string> = {
   "ft.11.t": "Know what it costs",
   "ft.11.d": "Xiaoyang breaks spending down by agent, space and computer.",
   "ft.12.t": "All the logs in one place",
+  "ft.12.at": "your-server",
   "ft.12.d": "Relay, computer and phone logs all collect on your relay. Query them with <code>herdr-pocket logs</code>, ask Xiaoyang “where did it get stuck?”, or open the simple <code>/admin</code> web dashboard on your relay.",
   "ft.13.k": "Ask before acting",
   "ft.13.t": "Rather confirm first? Fine",
   "ft.13.d": "By default she just acts. Turn on Ask before acting and she checks with you each time. Voice calls never stop to wait.",
   "video.eyebrow": "Intro film",
   "video.title": "Herdr Pocket in 90 seconds",
-  "video.q": "Quality",
   "dp.eyebrow": "Get started",
   "dp.title": "Three steps to your own pocket",
-  "dp.1.t": "Deploy the relay",
-  "dp.1.d": "Pick one and run it on your own server; always use HTTPS in production. On first start the log prints a one-time setup QR code or setup code for your first phone.",
-  "dp.1.fine": "Once it's running, open <code>https://{server}/admin</code> for the log dashboard.",
+  "dp.field.label": "Your server address",
+  "dp.field.help": "The phone and every computer connect to it. Type it once and the commands below include it; it's kept only in this browser.",
+  "dp.more": "Details",
+  "dp.1.t": "Deploy the server",
+  "dp.1.k": "on your own server",
+  "dp.1.d": "Pick one of three routes. On first start it prints a one-time setup QR code or setup code for your first phone.",
+  "dp.1.fine": "Once it's running, the log dashboard is at",
   "dp.tab.script": "Install script",
   "dp.2.t": "Bring each computer online",
-  "dp.2.d": "This installs <code>herdr-pocket</code>, registers the computer with your relay and keeps it online. When a QR code appears in the terminal, scan it with your connected phone and tap Allow.",
-  "dp.2.scan": "Scan this QR code with your phone",
+  "dp.2.k": "with herdr",
+  "dp.2.d": "Installs the computer part, <code>herdr-pocket</code>, registers this computer with your server and keeps it online in the background.",
+  "dp.2.scan": "When a QR code appears in the terminal, scan it with your connected phone and tap Allow.",
+  "dp.2.later": "Later, <code>herdr-pocket update</code> updates it and <code>herdr-pocket status</code> shows how it's doing.",
   "dp.3.t": "Install the app",
-  "dp.3.d": "Point the phone's camera at the relay's QR code to open a connect page. Install the app from GitHub Releases, tap the button on that page, and you're connected. Got only a setup code? Enter it in the app together with the server address. Future versions update from inside the app.",
+  "dp.3.d": "Scan the setup QR code from step 1 with the phone's camera to open a connect page; install the app, tap the button on that page, and you're connected.",
   "dp.3.cta": "Download for Android",
-  "dp.2.win": "On Windows, run this in PowerShell:",
-  "dp.3.fine": "Requires herdr. On macOS and Linux the installer brings its own Node.js when there's no 22.18 or newer; on Windows it always does, and needs no administrator rights.",
+  "dp.3.more": "Only have a setup code? Enter it in the app together with the server address. New versions update from inside the app.",
+  "dp.3.fine": "Requires herdr. On macOS and Linux the installer brings its own Node.js when there's no 22.18 or newer; on Windows it always does. Neither needs administrator rights.",
   "faq.eyebrow": "FAQ",
   "faq.title": "Questions you might have",
   "faq.1.q": "Is there an iPhone app?",
@@ -169,17 +200,11 @@ const zh: Record<string, string> = {};
 let current: Lang = "zh";
 const listeners = new Set<(l: Lang) => void>();
 
-function fill(html: string): string {
-  return html.replaceAll("{server}", SITE.server);
-}
-
 export function initI18n(): Lang {
   for (const el of document.querySelectorAll<HTMLElement>("[data-i18n]")) {
     const key = el.dataset.i18n!;
     if (!(key in zh)) zh[key] = el.innerHTML.trim();
   }
-  // Text with a {server} token outside data-i18n nodes.
-  for (const el of document.querySelectorAll<HTMLElement>(".relay-label span")) el.textContent = fill(el.textContent ?? "");
   const l = document.documentElement.dataset.lang === "en" ? "en" : "zh";
   setLang(l, false);
   return l;
@@ -197,7 +222,7 @@ export function setLang(l: Lang, persist = true): void {
   const dict = l === "zh" ? zh : en;
   for (const el of document.querySelectorAll<HTMLElement>("[data-i18n]")) {
     const v = dict[el.dataset.i18n!] ?? zh[el.dataset.i18n!];
-    if (v != null && el.innerHTML !== v) el.innerHTML = fill(v);
+    if (v != null && el.innerHTML !== v) el.innerHTML = v;
   }
   document.title =
     l === "zh" ? "Herdr Pocket · 把所有电脑上的 coding agent 装进口袋" : "Herdr Pocket · Every coding agent, in your pocket";
