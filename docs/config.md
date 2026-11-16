@@ -11,8 +11,9 @@ Keys stay on the relay. They are never sent to the phone, never shown by `/v1/he
 
 1. **Environment variables**, usually from `/etc/herdr-pocket/relay.env` (systemd) or `relay.env` next to the Docker Compose file. Template: [`deploy/relay.env.example`](../deploy/relay.env.example).
 2. **An optional JSON file** named by `POCKET_CONFIG`, for the text-model, voice and time-zone settings only (format below). Other relay settings (port, database, admin token, public URL) are environment-only.
+3. **The app** (Settings → 模型 / 语音 / 提示词), see [Changing it from the phone](#changing-it-from-the-phone). What a phone sets overrides 1 and 2 until a phone resets it.
 
-Precedence, per setting: a non-empty environment variable, then the file, then the built-in default. A variable that is set but empty (`POCKET_X=`) counts as unset, so the empty lines of the template never hide a value from the file. A file that cannot be read or parsed stops the relay at startup with the reason.
+Precedence, per setting: a phone's change, then a non-empty environment variable, then the file, then the built-in default. A variable that is set but empty (`POCKET_X=`) counts as unset, so the empty lines of the template never hide a value from the file. A file that cannot be read or parsed stops the relay at startup with the reason.
 
 At startup the relay prints one line per problem it found (a model without a key, an unknown provider, and so on) and a summary such as `[relay] assistant: deepseek, qwen  voice: moss-live`.
 
@@ -218,6 +219,21 @@ Which services speak it, checked against their docs in 2026-11:
 - `assistant.models` may also be a comma-separated string. `assistant.apiKey`, `assistant.url` and `assistant.protocol` are the file forms of the default-provider shorthand.
 - `providers.<id>` takes `protocol`, `baseUrl`, `apiKey`, `auth`, `headers` (file only), `maxTokensField` (`max_tokens` or `max_completion_tokens`, file only) and `extraBody`.
 - `voice` takes `provider`, `apiKey`, `url`, `model`, `voice`, `speed`, and for `openai-realtime` also `auth`, `dialect`, `transcribeModel`, `language`, `vad`, `inputRate` and `outputRate`.
+
+## Changing it from the phone
+
+Any paired phone can change the assistant's name, its providers (protocol, address, key), the order models are tried in, the voice service and every prompt; computers cannot. The relay keeps one copy, so every phone sees the same settings, and a change takes effect with the next message or call, without a restart. The other phones are told at once. Two phones saving at the same moment do not overwrite each other: the later one is asked to refresh first.
+
+- **What the server sets is the starting point.** Providers from the environment or the config file show as 服务器上的; a phone can change them but not delete them. Settings → 模型 → 恢复成服务器上的设置 drops every phone change, keys included. Once a phone has changed the model list, `POCKET_ASSISTANT_MODELS` no longer decides it until that reset.
+- **Keys go in, never out.** A phone can set or clear a key; it is only ever shown whether one is set and its last four characters. A key is used only at the address (scheme, host and port) it was given for: moving a provider or the voice to another host does not take the key along, it has to be entered again. This also keeps a leaked phone token from redirecting a key to another server.
+- **Keys and prompt edits are sealed** with AES-256-GCM. The seal key is a file next to the database, `<database>.key` (`/var/lib/herdr-pocket/relay.db.key`, `/data/relay.db.key` in Docker), created on first start, readable by the relay's user only. Back it up with the database: without it, keys set from a phone cannot be read (the relay says so and falls back to the server's keys) and prompt edits are lost. A copy of the database alone holds neither.
+- **测速** on Settings → 模型 sends one short request to a model and shows the time to its first word and to the whole answer, so the fastest can go first.
+
+### Prompts
+
+The shipped prompts are Markdown files in [`apps/relay/src/assistant/prompts/`](../apps/relay/src/assistant/prompts/), one per part: `base` (personality and rules), `act_direct` / `act_ask` (acting at once or after asking), `text`, `cards_direct` / `cards_ask` (typed chats), `call`, `persona`, `voice_rules` (calls) and `woken` (looking at an agent that stopped). Placeholders such as `{{name}}` are filled in by the relay. Wake-up material, tool descriptions and the voice's hand-over line stay in code.
+
+To keep your own wording out of this repository, put files with the same names in a folder of your own and point `POCKET_PROMPTS_DIR` at it: each `<id>.md` there replaces the shipped one (and is what 恢复默认 on the phone goes back to). Edits made on a phone are stored sealed in the database, never in the repository.
 
 ## Health
 

@@ -25,13 +25,21 @@ import {
   type TerminalRowsEvent,
   type TerminalStreamParams,
 } from "@herdr-pocket/protocol";
-import { useLive } from "./store";
+import { useLive, useSettings } from "./store";
 import { isWide } from "./ansi";
 import type { Link } from "./relay";
 
 export function isMockServer(server: string | null | undefined): boolean {
   return !!server && server.startsWith("mock://");
 }
+
+/**
+ * `mock://perf`: the demo at a heavy user's size, for checking scrolling and theme changes on a
+ * phone: about 50 agents on three computers, a long first conversation with tool runs, an assistant
+ * history, and snapshots that arrive as new objects every few seconds like a real relay's.
+ */
+const PERF_SERVER = "mock://perf";
+const perfDemo = () => useSettings.getState().server === PERF_SERVER;
 
 /** What demo invite links point at: a placeholder address, so screenshots show nothing real. */
 export const MOCK_PUBLIC_URL = "https://pocket.example.com";
@@ -41,14 +49,33 @@ const MIN = 60_000;
 
 const HOST_A = "dev_macbook";
 const HOST_B = "dev_cloud_vps";
+const HOST_C = "dev_studio";
 
 function makeDevices(): Device[] {
   const t = now();
   return [
     { id: HOST_A, name: "我的 MacBook", kind: "host", platform: "darwin", online: true, createdAt: t - 9 * 86_400_000, lastSeenAt: t, sources: ["hc", "herdr", "uniflo"], version: "0.1.0" },
     { id: HOST_B, name: "云服务器", kind: "host", platform: "linux", online: true, createdAt: t - 4 * 86_400_000, lastSeenAt: t - 20_000, sources: ["hc", "uniflo"], version: "0.1.0" },
+    ...(perfDemo() ? [{ id: HOST_C, name: "工作室台式机", kind: "host", platform: "linux", online: true, createdAt: t - 6 * 86_400_000, lastSeenAt: t, sources: ["hc", "uniflo"], version: "0.1.0" } satisfies Device] : []),
     { id: "dev_pad", name: "我的平板", kind: "viewer", platform: "android", online: false, createdAt: t - 2 * 86_400_000, lastSeenAt: t - 5 * 3_600_000 },
   ];
+}
+
+/** The perf demo's extra agents: a spread of programs, states and projects. */
+function perfAgents(): Agent[] {
+  const harnesses = ["claude-code", "codex", "omp", "opencode", "gemini", "claude-code", "droid", "qodercli"];
+  const statuses: AgentStatus[] = ["working", "idle", "done", "idle", "working", "blocked", "idle", "done"];
+  const projects = ["和弦本", "桌面宠物", "博客平台", "notes-cli", "api-gateway", "运维", "数据看板", "移动端"];
+  const tasks = ["补单元测试", "修复登录超时", "重构设置页", "升级依赖", "写迁移脚本", "接口限流", "日志脱敏", "首页加载优化", "导出 CSV", "暗色模式细节"];
+  const hosts = [HOST_A, HOST_B, HOST_C];
+  return Array.from({ length: 36 }, (_, i) => {
+    const project = projects[i % projects.length]!;
+    return ag(hosts[i % hosts.length]!, `p${i}`, harnesses[i % harnesses.length]!, statuses[i % statuses.length]!, `${project} ${tasks[i % tasks.length]}`, `${project} / ${(i % 4) + 1}`, `/Users/me/code/p${i}`, (i + 1) * 7 * MIN, {
+      turn: (i % 17) + 1,
+      ...(i % 5 === 0 ? { subagents: 2, subagentsWorking: i % 10 === 0 ? 1 : 0 } : {}),
+      ...(i % 9 === 0 ? { queued: 1, queuedText: "做完顺便跑一遍测试", queuedSince: now() - 30_000 } : {}),
+    });
+  });
 }
 
 function ag(
@@ -114,6 +141,7 @@ function makeAgents(): Agent[] {
       errored: true,
       statusNote: "API Error: 529 overloaded. The model is busy right now; try again in a moment.",
     }),
+    ...(perfDemo() ? perfAgents() : []),
   ];
 }
 
@@ -204,6 +232,54 @@ function history(session: string): ConvEvent[] {
     );
   }
   return out;
+}
+
+/** The perf demo's older turns: each one thinks, runs a few tools and answers in Markdown with a list and code. */
+function perfHistory(session: string): ConvEvent[] {
+  const out: ConvEvent[] = [];
+  const t0 = now() - 30 * 3_600_000;
+  const topics = ["调一下调音器的灵敏度", "曲谱页加个夜间模式", "节拍器支持 7/8 拍", "修一下横屏时和弦图被裁掉", "录音按钮加长按确认", "歌单支持拖动排序"];
+  for (let k = 0; k < 150; k++) {
+    const t = topics[k % topics.length]!;
+    const ts = t0 + k * 10 * MIN;
+    const id = (s: string) => `${session}#p${k}${s}`;
+    const ev = (s: string, dt: number, body: Record<string, unknown>) => ({ id: id(s), session, ts: ts + dt, ...body }) as ConvEvent;
+    out.push(
+      ev("u", 0, { kind: "user_message", text: `第 ${k + 1} 件事：${t}，改完跑一下测试` }),
+      ev("r", 2000, { kind: "reasoning", text: `先找到和「${t}」有关的代码，再看测试覆盖到哪里。` }),
+      ev("c1", 4000, { kind: "tool_call", call_id: `p${k}c1`, name: "Grep", input: { pattern: `tuner|metronome|chord`, path: "src/" } }),
+      ev("o1", 5000, { kind: "tool_result", call_id: `p${k}c1`, name: "Grep", output: "src/audio/Tuner.ts\nsrc/screens/SongScreen.tsx\nsrc/components/ChordDiagram.tsx", is_error: false }),
+      ev("c2", 9000, { kind: "tool_call", call_id: `p${k}c2`, name: "Edit", input: { file_path: "src/audio/Tuner.ts", old_string: "const THRESHOLD = 0.02", new_string: "const THRESHOLD = 0.012" } }),
+      ev("o2", 9500, { kind: "tool_result", call_id: `p${k}c2`, name: "Edit", output: "The file src/audio/Tuner.ts has been updated.", is_error: false }),
+      ev("c3", 12_000, { kind: "tool_call", call_id: `p${k}c3`, name: "Bash", input: { command: "pnpm test --silent" } }),
+      ev("o3", 30_000, { kind: "tool_result", call_id: `p${k}c3`, name: "Bash", output: "PASS src/audio/Tuner.test.ts\nPASS src/components/ChordDiagram.test.tsx\nTests: 42 passed", is_error: false }),
+      ev("a", 40_000, {
+        kind: "assistant_message",
+        text: `**${t}**改好了：\n\n- 改了 \`src/audio/Tuner.ts\` 里的阈值\n- 补了 ${(k % 3) + 1} 个测试，**42 个全过**\n- 没动别的文件\n\n\`\`\`ts\nconst THRESHOLD = 0.012;\n\`\`\`\n\n要我顺手把这次改动写进更新说明吗？`,
+      }),
+      ev("e", 41_000, { kind: "turn_end" }),
+    );
+  }
+  return out;
+}
+
+/** The perf demo's assistant history: questions, answers with lists, and a few things it brought up itself. */
+function perfAssistantItems(): AssistantItem[] {
+  const t0 = now() - 8 * 3_600_000;
+  const items: AssistantItem[] = [];
+  for (let k = 0; k < 40; k++) {
+    const ts = t0 + k * 12 * MIN;
+    items.push({ id: `perf-u${k}`, ts, role: "user", text: k % 2 ? "大家都在忙什么？" : "谁在等我？", via: "text" });
+    items.push({
+      id: `perf-a${k}`,
+      ts: ts + 4000,
+      role: "assistant",
+      text: `现在 **${(k % 6) + 3} 个**在干活，${k % 4} 个等你：\n\n- 「和弦本 补单元测试」在跑测试\n- 「博客平台 修复登录超时」改完了，等你看\n- 「运维 日志脱敏」卡在一个确认上\n\n最急的是第三个，要我替你回它吗？`,
+      steps: [`看了 ${48 + (k % 3)} 个 agent`, "读了「运维 日志脱敏」的对话"],
+      via: "text",
+    });
+  }
+  return items;
 }
 
 /** Page like hostd: newest `limit` events, or the `limit` before `before` (a position index). */
@@ -330,18 +406,55 @@ function listen(sinks: Map<string, Set<(event: unknown) => void>>, key: string, 
 }
 
 function baseConversation(session: string): ConvEvent[] {
-  return session === "claude:demo-1" ? [...history(session), ...conversation(session)] : conversation(session);
+  if (session !== "claude:demo-1") return conversation(session);
+  return [...(perfDemo() ? perfHistory(session) : history(session)), ...conversation(session)];
 }
 
-/** Adds an event to a demo conversation and streams it, at the position the page query gives it too. */
-function say(agentKey: string, body: Record<string, unknown>) {
+/** Adds an event to a demo conversation and streams it, at the position the page query gives it too. Returns its index. */
+function say(agentKey: string, body: Record<string, unknown>): number | undefined {
   const session = agents.find((x) => x.key === agentKey)?.sessionKey;
   if (!session) return;
   const list = (sent[session] ??= []);
   const e = { id: `${session}#sent${list.length}`, session, ts: now(), ...body } as ConvEvent;
   list.push(e);
-  const pos = String(baseConversation(session).length + list.length - 1);
+  emit(session, list.length - 1);
+  return list.length - 1;
+}
+
+function emit(session: string, index: number) {
+  const e = sent[session]![index]!;
+  const pos = String(baseConversation(session).length + index);
   for (const sink of sessionSinks.get(session) ?? []) sink({ kind: "session", event: { ...e, pos }, at: now() });
+}
+
+/** A message still being written: the same event again with more text (the phone keeps the newer copy). */
+function grow(agentKey: string, index: number, text: string, partial: boolean) {
+  const session = agents.find((x) => x.key === agentKey)?.sessionKey;
+  const list = session ? sent[session] : undefined;
+  if (!session || !list?.[index]) return;
+  list[index] = { ...list[index], text, partial } as ConvEvent;
+  emit(session, index);
+}
+
+/** The perf demo's reply is long and streams in, as a real agent's answer does: one message growing every 200 ms. */
+const LONG_REPLY = [
+  "收到，这就把迁移脚本那边理一遍，边看边说：",
+  ...Array.from({ length: 14 }, (_, i) => `${i + 1}. 第 ${i + 1} 个文件看完了：引用都已改到新的位置，旧的入口只剩注释里还提到它，测试也跟着更新了。`),
+  "",
+  "都看完了。要删的话回我一声，我再跑一遍全部测试。",
+].join("\n");
+
+function streamReply(key: string, full: string, done: () => void) {
+  const at = say(key, { kind: "assistant_message", text: "", partial: true });
+  if (at === undefined) return done();
+  let n = 0;
+  const step = () => {
+    n = Math.min(full.length, n + 24);
+    grow(key, at, full.slice(0, n), n < full.length);
+    if (n < full.length) later(200, step);
+    else done();
+  };
+  step();
 }
 
 function setAgent(key: string, patch: Partial<Agent>) {
@@ -362,9 +475,15 @@ function demoTurn(key: string, text: string) {
   later(1600, () => setAgent(key, { status: "working", statusSince: now(), errored: undefined, statusNote: undefined }));
   later(3200, () => say(key, { kind: "reasoning", text: "先看看现在的代码是怎么写的，再动手。" }));
   later(6000, () => {
-    say(key, { kind: "assistant_message", text: demoReply(text) });
-    say(key, { kind: "turn_end", reason: "waiting_for_user" });
-    endTurn(key);
+    const done = () => {
+      say(key, { kind: "turn_end", reason: "waiting_for_user" });
+      endTurn(key);
+    };
+    if (perfDemo()) streamReply(key, LONG_REPLY, done);
+    else {
+      say(key, { kind: "assistant_message", text: demoReply(text) });
+      done();
+    }
   });
 }
 
@@ -445,11 +564,12 @@ export function mockLink(): Link {
     useLive.setState({ self, link: "online", rttMs: 38 });
     publish();
   }, 350);
-  // Gentle liveliness: the working agent's turn ticks.
+  // Gentle liveliness: the working agent's turn ticks. The perf demo sends every agent anew, as a relay snapshot does.
+  const perf = perfDemo();
   const tick = setInterval(() => {
-    agents = agents.map((a) => (a.status === "working" ? { ...a, updatedAt: now() } : a));
+    agents = agents.map((a) => (a.status === "working" ? { ...a, updatedAt: now() } : perf ? { ...a } : a));
     publish();
-  }, 8000);
+  }, perf ? 3000 : 8000);
   return {
     async call(_to: string, method: RpcMethod, params: unknown) {
       await new Promise((r) => setTimeout(r, 180));
@@ -607,6 +727,8 @@ export const mockApi = {
 
 type AssistantSink = { upsert: (item: AssistantItem) => void; busy: (busy: boolean, label?: string) => void; reset: (s: AssistantState) => void };
 let assistantItems: AssistantItem[] = [];
+/** "开始新对话" was used: the perf demo does not refill its history. */
+let assistantCleared = false;
 /** Seeded on first use; cancelling them all shows the empty state. */
 let assistantReminders: Reminder[] | null = null;
 
@@ -648,6 +770,7 @@ function aput(item: AssistantItem) {
 }
 
 function demoState(): AssistantState {
+  if (perfDemo() && !assistantItems.length && !assistantCleared) assistantItems = perfAssistantItems();
   return { items: assistantItems.slice(), busy: false, ready: true, voice: false, model: "演示", reminders: remindersNow().slice(), settings: { confirm: assistantConfirm } };
 }
 
@@ -747,6 +870,7 @@ export const mockAssistant = {
   },
   clear() {
     assistantItems = [];
+    assistantCleared = true;
     assistantSink?.reset(demoState());
   },
   cancelReminder(id: string) {

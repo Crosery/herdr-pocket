@@ -8,6 +8,17 @@
     "icon": "./assets/brand/icon-1024.png",
     "userInterfaceStyle": "automatic",
     "backgroundColor": "#FEE9F2",
+    "ios": {
+      "bundleIdentifier": "dev.crosery.herdrpocket",
+      "supportsTablet": false,
+      "infoPlist": {
+        "CFBundleDevelopmentRegion": "zh-Hans",
+        "NSLocalNetworkUsageDescription": "连接局域网里自建的 Herdr Pocket 服务器",
+        "UIBackgroundModes": [
+          "audio"
+        ]
+      }
+    },
     "android": {
       "package": "dev.crosery.herdrpocket",
       "adaptiveIcon": {
@@ -40,7 +51,12 @@
     "plugins": [
       "expo-router",
       "expo-status-bar",
-      "expo-secure-store",
+      [
+        "expo-secure-store",
+        {
+          "faceIDPermission": false
+        }
+      ],
       [
         "expo-font",
         {
@@ -78,6 +94,7 @@
       "typedRoutes": true
     },
     "platforms": [
+      "ios",
       "android"
     ]
   }

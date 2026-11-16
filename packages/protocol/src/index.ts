@@ -492,6 +492,8 @@ export type RpcErrorCode =
   | "offline"
   | "timeout"
   | "unsupported"
+  /** The thing changed since the caller last read it (e.g. another phone saved settings first). */
+  | "conflict"
   | "internal";
 
 export interface RpcError {
@@ -513,6 +515,149 @@ export type AssistantConfirm = "never" | "always";
 
 export interface AssistantSettings {
   confirm: AssistantConfirm;
+}
+
+// ---- Assistant configuration: models, keys, voice and prompts, edited from any phone ----
+//
+// The relay keeps it; every phone reads and changes the same copy, and the
+// others are told (`assistant_config`). What the server's environment or
+// POCKET_CONFIG file sets is the starting point: a phone's change overrides
+// it, "reset" goes back to it. Keys go one way: a phone can set or clear one,
+// it never reads one back (only whether one is set and its last characters).
+
+export type ModelProtocol = "anthropic" | "openai";
+export type ModelAuth = "bearer" | "x-api-key" | "api-key" | "none";
+
+/** Where a value comes from: the server's own settings, or a phone. */
+export type ConfigSource = "server" | "phone";
+
+/** A key as phones see it. */
+export interface KeyView {
+  set: boolean;
+  /** Last 4 characters, for telling keys apart; null without a key. */
+  hint: string | null;
+  from: ConfigSource | null;
+}
+
+/** A model provider (an endpoint and its key). */
+export interface ProviderView {
+  /** Lowercase letters, digits and dashes: `custom`, `deepseek`, `my-gateway`. Models name it as `provider:model`. */
+  id: string;
+  label?: string;
+  protocol: ModelProtocol;
+  baseUrl: string;
+  auth?: ModelAuth;
+  key: KeyView;
+  /** Server: defined by the environment or the config file (a phone can override it, not delete it). */
+  from: ConfigSource;
+}
+
+export interface ModelRef {
+  provider: string;
+  model: string;
+}
+
+export type VoiceProviderId = "moss-live" | "openai-realtime";
+
+export interface VoiceView {
+  /** Null: voice calls are off. */
+  provider: VoiceProviderId | null;
+  url?: string;
+  model?: string;
+  voice?: string;
+  speed?: number;
+  key: KeyView;
+}
+
+export interface AssistantConfigView {
+  /** Goes up with every change; a change sent with an older `rev` is refused (someone else changed it first). */
+  rev: number;
+  /** The assistant's name, as it calls itself. */
+  name: string;
+  providers: ProviderView[];
+  /** Tried in this order: the first is the main model, the rest step in when one fails or stays silent. */
+  models: ModelRef[];
+  voice: VoiceView;
+  /** Whether a phone has changed anything (reset goes back to the server's settings). */
+  edited: boolean;
+  updatedAt?: number;
+  updatedBy?: string;
+  /** Things that keep part of it from working (a provider without a key, an invalid URL). */
+  warnings: string[];
+}
+
+/** A change to one provider. `apiKey`: a string sets it, null removes the phone's key, absent keeps it. */
+export interface ProviderPatch {
+  id: string;
+  label?: string;
+  protocol?: ModelProtocol;
+  baseUrl?: string;
+  auth?: ModelAuth | null;
+  apiKey?: string | null;
+  /** Remove a provider a phone added (a server one can only be reset). */
+  remove?: boolean;
+}
+
+export interface VoicePatch {
+  provider?: VoiceProviderId | null;
+  url?: string | null;
+  model?: string | null;
+  voice?: string | null;
+  speed?: number | null;
+  apiKey?: string | null;
+}
+
+export interface AssistantConfigChange {
+  rev: number;
+  name?: string;
+  providers?: ProviderPatch[];
+  models?: ModelRef[];
+  voice?: VoicePatch;
+  /** Drop every phone change and go back to the server's settings (keys a phone set are removed too). */
+  reset?: boolean;
+}
+
+/** One short request to a model, to see that it answers and how fast. */
+export interface ModelTestResult {
+  ok: boolean;
+  /** Until the first word of the answer. */
+  firstMs?: number;
+  totalMs?: number;
+  reply?: string;
+  error?: string;
+}
+
+/** The prompts a phone can edit. Wake-up material and tool descriptions stay in code. */
+export type PromptId =
+  | "base"
+  | "act_direct"
+  | "act_ask"
+  | "text"
+  | "cards_direct"
+  | "cards_ask"
+  | "call"
+  | "woken"
+  | "persona"
+  | "voice_rules";
+
+export interface PromptView {
+  id: PromptId;
+  /** Short name, for the list. */
+  title: string;
+  /** What it decides, one sentence. */
+  about: string;
+  /** Group in the list: 性格与规矩, 文字聊天, 通话, 被叫醒. */
+  group: string;
+  /** Placeholders the relay fills in, e.g. `{{name}}`; leaving one out leaves that part out. */
+  slots: Array<{ slot: string; means: string }>;
+  /** What is used now. */
+  text: string;
+  /** The text the relay ships with. */
+  defaultText: string;
+  /** Changed from a phone. */
+  edited: boolean;
+  updatedAt?: number;
+  updatedBy?: string;
 }
 
 /**
@@ -826,7 +971,9 @@ export type ServerFrame =
   /** The assistant started or stopped working; `label` says on what. */
   | { type: "assistant_busy"; busy: boolean; label?: string }
   /** The thread was cleared or reminders changed: refetch GET /v1/assistant. */
-  | { type: "assistant_reset" };
+  | { type: "assistant_reset" }
+  /** The assistant's configuration or a prompt changed (from some phone): refetch what is on screen. */
+  | { type: "assistant_config"; rev: number; by?: string; what: "config" | "prompts" };
 
 /**
  * GET /v1/notify?token=...&since=<ms> (WebSocket, viewers only): a light push
@@ -878,6 +1025,15 @@ export type LiveRelayEvent =
 // DELETE /v1/assistant/reminders/:id          -> { ok: true }
 // GET    /v1/assistant/settings               -> AssistantSettings & { default: AssistantConfirm }
 // POST   /v1/assistant/settings {confirm}     -> AssistantSettings   (phones see assistant_reset)
+//
+// Configuration (phones; keys are never sent back)
+// GET    /v1/assistant/config                 -> AssistantConfigView
+// POST   /v1/assistant/config  AssistantConfigChange -> AssistantConfigView   (409 conflict: rev is old;
+//                                              other phones see assistant_config; takes effect at once)
+// POST   /v1/assistant/config/test {provider, model} | {provider: ProviderPatch, model} -> ModelTestResult
+// GET    /v1/assistant/config/models?provider=<id> -> { models: string[] }   (what the provider lists, if it does)
+// GET    /v1/assistant/prompts                -> { prompts: PromptView[] }
+// POST   /v1/assistant/prompts/:id {text} | {reset: true} -> PromptView   (other phones see assistant_config)
 //
 // Logs
 // POST   /v1/logs   (device)        body { entries: ClientLogEntry[] } -> { stored }   (same as the `log` frame)

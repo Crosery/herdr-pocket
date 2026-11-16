@@ -16,6 +16,7 @@ import {
 import { useLive } from "./store";
 import { isMockServer, mockLink, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
+import { onLinkBack } from "./assistantConfig";
 import { applog } from "./applog";
 
 export class RelayError extends Error {
@@ -230,8 +231,9 @@ class SocketLink implements Link {
       case "welcome":
         this.welcomed = true;
         useLive.setState({ self: f.device, link: "online", lastError: null });
-        // Catch up on anything the assistant said while this socket was down.
+        // Catch up on anything the assistant said, or another phone changed, while this socket was down.
         void loadAssistant();
+        onLinkBack();
         break;
       case "snapshot": {
         const devices = Object.fromEntries(f.devices.map((d) => [d.id, d]));

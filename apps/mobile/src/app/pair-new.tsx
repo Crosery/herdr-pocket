@@ -92,7 +92,8 @@ export default function InviteScreen() {
   }
 
   return (
-    <ScrollView style={{ backgroundColor: p.page }} contentContainerStyle={{ padding: space.lg, gap: space.lg }}>
+    // contentInsetAdjustmentBehavior: iOS keeps the last line clear of the home indicator; Android ignores it.
+    <ScrollView style={{ backgroundColor: p.page }} contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: space.lg, gap: space.lg }}>
       <Card style={{ alignItems: "center", gap: space.lg, padding: space.xl, borderRadius: radius.xl }}>
         {m.isPending ? (
           <ActivityIndicator style={{ marginVertical: 120 }} />

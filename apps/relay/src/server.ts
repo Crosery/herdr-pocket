@@ -24,6 +24,7 @@ import {
   type ServerFrame,
   type NotifyFrame,
   type AssistantConfirm,
+  type AssistantConfigChange,
   type LogLevel,
 } from "@herdr-pocket/protocol";
 import { VERSION } from "@herdr-pocket/update";
@@ -31,7 +32,9 @@ import { Store } from "./store.ts";
 import { issueSetupCode, type SetupInfo } from "./setup.ts";
 import { joinLanding, notFoundLanding, pairLanding, type LandingPage } from "./landing.ts";
 import { Assistant, type AssistantOptions } from "./assistant/assistant.ts";
-import { makeLlm, type Llm, type LlmTarget } from "./assistant/llm.ts";
+import { listModels, makeLlm, testModel, type Llm, type LlmTarget } from "./assistant/llm.ts";
+import { ConfigError, ConfigStore, Sealer, type EffectiveConfig } from "./assistant/configstore.ts";
+import { isPromptId, promptView, promptViews, setPromptEdits } from "./assistant/prompts.ts";
 import { startCall, endAllCalls, type LiveConfig } from "./assistant/live.ts";
 import { EventLog, levelsFrom, parseSince, type EventInput } from "./eventlog.ts";
 import { adminPage } from "./admin.ts";
@@ -46,11 +49,11 @@ export interface RelayOptions {
   trustProxy?: boolean;
   rpcTimeoutMs?: number;
   log?: (msg: string) => void;
-  /** Text assistant: models tried in order, each at its provider (see src/config.ts). */
+  /** Text assistant: models tried in order, each at its provider (see src/config.ts). Phones can change it (configstore.ts). */
   assistant?: { targets: LlmTarget[]; name?: string; firstByteMs?: number };
   /** Injected model for tests; wins over `assistant`. */
   llm?: Llm;
-  /** Live voice (MOSS-Live or an OpenAI Realtime service); off when unset. */
+  /** Live voice (MOSS-Live or an OpenAI Realtime service); off when unset. Phones can change it. */
   live?: LiveConfig;
   /** Timing overrides for tests. */
   assistantTiming?: Omit<AssistantOptions, "store" | "host" | "llm" | "model" | "name" | "voice" | "confirm">;
@@ -136,6 +139,10 @@ export class Relay {
   private notifyWss: WebSocketServer;
   private notifySubs = new Set<{ ws: WebSocket; alive: boolean }>();
   readonly assistant: Assistant;
+  /** Models, keys, voice and prompt edits as phones set them, over the server's own settings. */
+  readonly config: ConfigStore;
+  /** What is in force now. */
+  private eff: EffectiveConfig;
 
   private opts: RelayOptions;
 
@@ -161,18 +168,23 @@ export class Relay {
     this.http.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head));
     this.notifyWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
     this.heartbeat = setInterval(() => this.sweep(), 30_000);
-    const a = opts.assistant;
-    const llm =
-      opts.llm ??
-      (a?.targets.length
-        ? makeLlm({ targets: a.targets, firstByteMs: a.firstByteMs, log: (m) => this.events.record({ kind: "model", level: /fail|error|refus/i.test(m) ? "warn" : "info", msg: m }) })
-        : undefined);
+    // Keys and prompt edits are sealed with a key in a file of its own next to the database.
+    const memory = opts.dbPath === ":memory:" || opts.dbPath.startsWith("file::memory:");
+    this.config = new ConfigStore(this.store, new Sealer(memory ? null : `${opts.dbPath}.key`), {
+      targets: opts.assistant?.targets ?? [],
+      name: opts.assistant?.name,
+      firstByteMs: opts.assistant?.firstByteMs,
+      live: opts.live,
+    });
+    setPromptEdits(this.config.promptEdits());
+    this.eff = this.config.effective();
+    if (this.eff.view.edited) for (const w of this.eff.view.warnings) this.log(`config: ${w}`);
     this.assistant = new Assistant({
       store: this.store,
-      llm,
-      model: opts.llm ? "test" : a?.targets[0]?.model,
-      name: a?.name,
-      voice: !!opts.live?.apiKey,
+      llm: this.buildLlm(),
+      model: opts.llm ? "test" : this.eff.targets[0]?.model,
+      name: this.eff.name,
+      voice: !!this.eff.live?.apiKey,
       confirm: opts.assistantConfirm,
       ...opts.assistantTiming,
       host: {
@@ -189,6 +201,24 @@ export class Relay {
       const data = JSON.stringify({ type: "notice", notice } satisfies NotifyFrame);
       for (const s of this.notifySubs) if (s.ws.readyState === WebSocket.OPEN) s.ws.send(data);
     });
+  }
+
+  /** The model client for what is in force (tests inject their own). */
+  private buildLlm(): Llm | undefined {
+    if (this.opts.llm) return this.opts.llm;
+    const e = this.eff;
+    return e.targets.length
+      ? makeLlm({ targets: e.targets, firstByteMs: e.firstByteMs, log: (m) => this.events.record({ kind: "model", level: /fail|error|refus/i.test(m) ? "warn" : "info", msg: m }) })
+      : undefined;
+  }
+
+  /** A phone changed the configuration or a prompt: the next message or call uses it, and the other phones are told. */
+  private reconfigure(what: "config" | "prompts", by: string, change: string): void {
+    if (what === "prompts") setPromptEdits(this.config.promptEdits());
+    this.eff = this.config.effective();
+    this.assistant.useModels({ llm: this.buildLlm(), model: this.opts.llm ? "test" : this.eff.targets[0]?.model, name: this.eff.name, voice: !!this.eff.live?.apiKey });
+    this.events.record({ kind: "config", level: "info", msg: `${by}: ${change}` });
+    this.toViewers({ type: "assistant_config", rev: this.eff.view.rev, by, what });
   }
 
   /**
@@ -274,8 +304,8 @@ export class Relay {
         devices: this.store.listDevices().length,
         online: this.conns.size,
         // Which services are configured (names only, never keys or addresses).
-        assistant: [...new Set((this.opts.assistant?.targets ?? []).map((t) => t.provider))],
-        voice: this.opts.live ? (this.opts.live.provider ?? "moss-live") : null,
+        assistant: [...new Set(this.eff.targets.map((t) => t.provider))],
+        voice: this.eff.live ? (this.eff.live.provider ?? "moss-live") : null,
       });
       return;
     }
@@ -489,6 +519,64 @@ export class Relay {
     sendError(res, 404, "not_found", "not found");
   }
 
+  /** Settings -> 模型 / 语音 / 提示词 on any phone. Keys go in, never out. */
+  private async handleConfig(req: IncomingMessage, res: ServerResponse, path: string, by: string): Promise<void> {
+    try {
+      if (path === "/v1/assistant/config" && req.method === "GET") {
+        sendJson(res, 200, this.eff.view);
+        return;
+      }
+      if (path === "/v1/assistant/config" && req.method === "POST") {
+        const change = (await readJson(req)) as unknown as AssistantConfigChange | null;
+        if (!change || typeof change !== "object") throw new ConfigError(400, "bad_request", "要改什么没写");
+        const said = this.config.apply(change, by);
+        this.reconfigure("config", by, said);
+        sendJson(res, 200, this.eff.view);
+        return;
+      }
+      if (path === "/v1/assistant/config/test" && req.method === "POST") {
+        const body = (await readJson(req)) as { provider?: unknown; model?: unknown } | undefined;
+        const model = typeof body?.model === "string" ? body.model : "";
+        if (!model.trim()) throw new ConfigError(400, "bad_request", "要测哪个模型没写");
+        const target = this.config.targetFor(body?.provider as string, model);
+        const r = await testModel(target);
+        this.events.record({ kind: "config", level: r.ok ? "info" : "warn", msg: `${by}: tested ${target.provider}:${target.model}: ${r.ok ? `first word ${r.firstMs}ms, all ${r.totalMs}ms` : r.error}` });
+        sendJson(res, 200, r);
+        return;
+      }
+      if (path === "/v1/assistant/config/models" && req.method === "GET") {
+        const id = new URL(req.url ?? "/", "http://relay").searchParams.get("provider") ?? "";
+        try {
+          sendJson(res, 200, { models: await listModels(this.config.targetFor(id, "")) });
+        } catch (e) {
+          if (e instanceof ConfigError) throw e;
+          sendError(res, 502, "unsupported", `服务商没给模型列表：${(e as Error).message.slice(0, 160)}`);
+        }
+        return;
+      }
+      if (path === "/v1/assistant/prompts" && req.method === "GET") {
+        sendJson(res, 200, { prompts: promptViews() });
+        return;
+      }
+      const pm = /^\/v1\/assistant\/prompts\/([a-z_]{1,20})$/.exec(path);
+      if (pm && req.method === "POST") {
+        const id = pm[1];
+        if (!isPromptId(id)) throw new ConfigError(404, "not_found", "没有这条提示词");
+        const body = (await readJson(req)) as { text?: unknown; reset?: unknown } | undefined;
+        if (body?.reset === true) this.config.setPrompt(id, null, by);
+        else if (typeof body?.text === "string") this.config.setPrompt(id, body.text, by);
+        else throw new ConfigError(400, "bad_request", "要么给 text，要么 reset: true");
+        this.reconfigure("prompts", by, `prompt ${id} ${body?.reset === true ? "back to default" : "edited"}`);
+        sendJson(res, 200, promptView(id));
+        return;
+      }
+      sendError(res, 404, "not_found", "not found");
+    } catch (e) {
+      if (e instanceof ConfigError) sendError(res, e.status, e.code, e.message);
+      else throw e;
+    }
+  }
+
   private async handleAssistant(req: IncomingMessage, res: ServerResponse, path: string, auth: Device | "admin"): Promise<void> {
     if (req.method === "GET" && path === "/v1/assistant") {
       sendJson(res, 200, this.assistant.state());
@@ -501,6 +589,10 @@ export class Relay {
         return;
       }
       sendJson(res, 200, { item: this.assistant.say(text, auth === "admin" ? { id: "admin", name: "admin" } : { id: auth.id, name: auth.name }) });
+      return;
+    }
+    if (path.startsWith("/v1/assistant/config") || path.startsWith("/v1/assistant/prompts")) {
+      await this.handleConfig(req, res, path, auth === "admin" ? "admin" : auth.name);
       return;
     }
     if (path === "/v1/assistant/settings") {
@@ -606,8 +698,8 @@ export class Relay {
   /** What the control panel shows at the top: health and how the relay is set up (never keys). */
   private overview() {
     const devices = this.devices();
-    const a = this.opts.assistant;
-    const live = this.opts.live;
+    const a = this.eff;
+    const live = this.eff.live;
     const dayAgo = Date.now() - 86_400_000;
     const trouble = this.events.query({ since: dayAgo, levels: ["warn", "error"], limit: 5000 });
     const hostOf = (u: string) => {
@@ -737,7 +829,7 @@ export class Relay {
       this.notifyWss.handleUpgrade(req, socket, head, (ws) => this.onNotifyConnection(ws, since));
       return;
     }
-    const live = this.opts.live;
+    const live = this.eff.live;
     if (!live?.apiKey) {
       socket.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
       return;

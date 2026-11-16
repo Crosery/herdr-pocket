@@ -1,4 +1,4 @@
-import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { AppState, Image, Pressable, ScrollView, View } from "react-native";
 import { ActivityIndicator, Button, Dialog, Portal, ProgressBar, Text } from "react-native-paper";
 import { router } from "expo-router";
@@ -8,18 +8,19 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import Animated, { interpolateColor, useAnimatedStyle, useDerivedValue, withTiming } from "react-native-reanimated";
 import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
 import { Card, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
+import { Row, RowDivider as Divider, type RowIcon as IconName } from "../../components/rows";
+import { ConfigSnackbar } from "../../components/configParts";
 import { Bow, Mascot } from "../../components/Mascot";
 import { useLive, useSettings, type ThemeMode } from "../../lib/store";
 import { signOut } from "../../lib/session";
 import { isMockServer } from "../../lib/mock";
 import { loadAssistant, setAssistantConfirm, useAssistant } from "../../lib/assistant";
-import { alertsSupported, askNotificationPermission, refreshAlertState, useAlerts } from "../../lib/alerts";
-import { checkForUpdate, currentVersion, downloadUpdate, installUpdate, resumeInstallIfAllowed, useNewRelease, useUpdate } from "../../lib/update";
+import { useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
+import { alertsInBackground, alertsSupported, askNotificationPermission, refreshAlertState, useAlerts } from "../../lib/alerts";
+import { checkForUpdate, currentVersion, downloadUpdate, installUpdate, resumeInstallIfAllowed, updatesSupported, useNewRelease, useUpdate } from "../../lib/update";
 import { PocketNative } from "../../../modules/pocket-native";
 import { usePalette } from "../../theme/theme";
 import { fonts, motion, radius, space } from "../../theme/tokens";
-
-type IconName = ComponentProps<typeof MaterialCommunityIcons>["name"];
 
 const LINK_TEXT = { idle: "未连接", connecting: "连接中…", online: "已连接", offline: "断开了，重连中", unauthorized: "授权失效" } as const;
 const SCALES = [
@@ -38,11 +39,13 @@ const PORTRAIT = require("../../../assets/mascot/default.png");
 export default function SettingsScreen() {
   const p = usePalette();
   const insets = useSafeAreaInsets();
-  const s = useSettings();
+  // Each setting is read where it is shown (ThemeChoice, TextScaleChoice, AlertsCard, ShellsRow), so
+  // changing one redraws its own card, not the whole page.
+  const server = useSettings((x) => x.server);
+  const deviceName = useSettings((x) => x.deviceName);
   const link = useLive((x) => x.link);
   const rtt = useLive((x) => x.rttMs);
   const [confirm, setConfirm] = useState(false);
-  const alerts = useAlerts();
   const askFirst = useAssistant((x) => x.confirm);
   const assistantLoaded = useAssistant((x) => x.loaded);
   const [askError, setAskError] = useState<string | null>(null);
@@ -60,17 +63,8 @@ export default function SettingsScreen() {
     return () => sub.remove();
   }, []);
 
-  const demo = isMockServer(s.server);
+  const demo = isMockServer(server);
   const linkColor = link === "online" ? "#3FB68B" : link === "connecting" ? p.lavender : p.error;
-  const alertsLine = !alertsSupported
-    ? "需要装新版 App"
-    : demo
-      ? "演示模式没有提醒"
-      : !s.alertsOn
-        ? "关着：只有打开 App 时才知道"
-        : alerts.connected
-          ? "在线：App 关着也会提醒你"
-          : "正在连接服务器…";
 
   async function leave() {
     setConfirm(false);
@@ -113,10 +107,10 @@ export default function SettingsScreen() {
             </View>
             <View style={{ flex: 1, gap: 5, paddingRight: 34 }}>
               <Text numberOfLines={1} style={{ fontFamily: fonts.cute, fontSize: 21, lineHeight: 28, color: p.ink }}>
-                {s.deviceName ?? "这台手机"}
+                {deviceName ?? "这台手机"}
               </Text>
               <Text numberOfLines={1} style={{ color: p.muted, fontSize: 12.5, fontFamily: demo ? fonts.body : fonts.mono }}>
-                {demo ? "演示模式" : (s.server ?? "").replace(/^https?:\/\//, "")}
+                {demo ? "演示模式" : (server ?? "").replace(/^https?:\/\//, "")}
               </Text>
               <View
                 accessibilityLabel={`连接状态：${LINK_TEXT[link]}`}
@@ -138,93 +132,16 @@ export default function SettingsScreen() {
         <SectionHeader title="外观" />
         <Card style={{ paddingVertical: space.xs }}>
           <Row icon="theme-light-dark" title="主题" sub="浅色、深色，或者跟着系统走">
-            <View accessibilityRole="radiogroup" style={{ flexDirection: "row", gap: space.md, paddingTop: space.md }}>
-              {THEMES.map((t) => (
-                <ThemeTile key={t.value} mode={t.value} label={t.label} selected={s.themeMode === t.value} onPress={() => s.set({ themeMode: t.value })} />
-              ))}
-            </View>
+            <ThemeChoice />
           </Row>
           <Divider />
           <Row icon="format-size" title="对话字号" sub="聊天和 agent 对话里文字的大小">
-            <View accessibilityRole="radiogroup" style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingTop: space.md }}>
-              {SCALES.map((x) => {
-                const on = s.textScale === x.value;
-                return (
-                  <Pressable
-                    key={x.value}
-                    accessibilityRole="radio"
-                    accessibilityState={{ checked: on }}
-                    accessibilityLabel={`字号${x.label}`}
-                    onPress={() => s.set({ textScale: x.value })}
-                    style={{ width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center", backgroundColor: on ? p.primary : p.surface3, borderWidth: on ? 0 : 1, borderColor: p.divider }}
-                  >
-                    <Text style={{ fontFamily: fonts.bodyBold, fontSize: x.glyph, lineHeight: x.glyph + 6, color: on ? p.onPrimary : p.muted }}>A</Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-            <View style={{ flexDirection: "row", alignItems: "flex-end", gap: space.sm, paddingTop: space.md }}>
-              <Mascot size={30} />
-              <View style={{ flexShrink: 1, backgroundColor: p.surface3, borderRadius: radius.md, borderBottomLeftRadius: 5, paddingHorizontal: space.md, paddingVertical: 7 }}>
-                <Text style={{ color: p.ink, fontSize: 15.5 * s.textScale, lineHeight: 22 * s.textScale }}>迁移脚本跑完了，测试全过。</Text>
-              </View>
-            </View>
+            <TextScaleChoice />
           </Row>
         </Card>
 
         <SectionHeader title="助理提醒" />
-        <Card style={{ paddingVertical: space.xs }}>
-          <Row
-            icon="bell-outline"
-            title="后台提醒"
-            sub={alertsLine}
-            right={
-              <Toggle
-                label="后台提醒"
-                value={s.alertsOn}
-                disabled={!alertsSupported}
-                onChange={async (v) => {
-                  s.set({ alertsOn: v });
-                  if (v) await askNotificationPermission();
-                }}
-              />
-            }
-          />
-          <Divider />
-          <Row
-            icon="hand-back-left-outline"
-            title="agent 在等你时"
-            sub="要你确认、要你回答的时候"
-            dim={!s.alertsOn}
-            right={<Toggle label="agent 在等你时提醒" value={s.alertBlocked} disabled={!s.alertsOn} onChange={(v) => s.set({ alertBlocked: v })} />}
-          />
-          <Divider />
-          <Row
-            icon="check-circle-outline"
-            title="agent 跑完时"
-            sub="小羊先去看一眼，再告诉你结果"
-            dim={!s.alertsOn}
-            right={<Toggle label="agent 跑完时提醒" value={s.alertDone} disabled={!s.alertsOn} onChange={(v) => s.set({ alertDone: v })} />}
-          />
-          {alertsSupported && s.alertsOn && !alerts.notificationsAllowed ? (
-            <>
-              <Divider />
-              <Row icon="bell-off-outline" tone="error" title="通知被关掉了" sub="去系统设置里允许 Herdr Pocket 发通知" onPress={() => PocketNative?.openNotificationSettings()} />
-            </>
-          ) : null}
-          {alertsSupported && s.alertsOn && !alerts.batteryUnrestricted ? (
-            <>
-              <Divider />
-              <Row icon="battery-heart-outline" title="允许在后台运行" sub="不然系统省电时会把提醒断掉。点这里，选“允许”或“无限制”" onPress={() => PocketNative?.requestBatteryExemption()} />
-            </>
-          ) : null}
-          {alertsSupported && s.alertsOn ? (
-            <>
-              <Divider />
-              <Row icon="bell-ring-outline" title="发一条测试提醒" sub="看看通知能不能送到这台手机" onPress={() => PocketNative?.testNotice("小羊：测试提醒", "能看到这条，说明 agent 的提醒也能送到。")} />
-            </>
-          ) : null}
-        </Card>
+        <AlertsCard demo={demo} />
 
         <SectionHeader title="小羊办事" />
         <Card style={{ paddingVertical: space.xs }}>
@@ -261,14 +178,12 @@ export default function SettingsScreen() {
           />
         </Card>
 
+        <SectionHeader title="小羊的模型和说话方式" />
+        <AssistantConfigCard />
+
         <SectionHeader title="列表" />
         <Card style={{ paddingVertical: space.xs }}>
-          <Row
-            icon="console-line"
-            title="显示普通终端"
-            sub="没在跑 agent 的 shell 窗口"
-            right={<Toggle label="显示普通终端" value={s.showShells} onChange={(v) => s.set({ showShells: v })} />}
-          />
+          <ShellsRow />
         </Card>
 
         <SectionHeader title="连接" />
@@ -278,7 +193,11 @@ export default function SettingsScreen() {
 
         <SectionHeader title="版本" />
         <Card style={{ paddingVertical: space.xs }}>
-          <UpdateRow demo={demo} />
+          {updatesSupported ? (
+            <UpdateRow demo={demo} />
+          ) : (
+            <Row icon="update" title="当前版本" sub={`v${currentVersion()}；iOS 版不在 App 里更新`} />
+          )}
         </Card>
 
         <View style={{ alignItems: "center", gap: 6, paddingTop: space.xxxl }}>
@@ -310,7 +229,176 @@ export default function SettingsScreen() {
           </Dialog.Actions>
         </Dialog>
       </Portal>
+      {/* A save made on a config screen just closed, or another phone's change. */}
+      <ConfigSnackbar message={null} onDismiss={() => undefined} />
     </PageBackground>
+  );
+}
+
+function ThemeChoice() {
+  const themeMode = useSettings((x) => x.themeMode);
+  const set = useSettings((x) => x.set);
+  return (
+    <View accessibilityRole="radiogroup" style={{ flexDirection: "row", gap: space.md, paddingTop: space.md }}>
+      {THEMES.map((t) => (
+        <ThemeTile key={t.value} mode={t.value} label={t.label} selected={themeMode === t.value} onPress={() => set({ themeMode: t.value })} />
+      ))}
+    </View>
+  );
+}
+
+/** The four sizes and a sample bubble in the chosen one. */
+function TextScaleChoice() {
+  const p = usePalette();
+  const textScale = useSettings((x) => x.textScale);
+  const set = useSettings((x) => x.set);
+  return (
+    <>
+      <View accessibilityRole="radiogroup" style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingTop: space.md }}>
+        {SCALES.map((x) => {
+          const on = textScale === x.value;
+          return (
+            <Pressable
+              key={x.value}
+              accessibilityRole="radio"
+              accessibilityState={{ checked: on }}
+              accessibilityLabel={`字号${x.label}`}
+              onPress={() => set({ textScale: x.value })}
+              style={{ width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center", backgroundColor: on ? p.primary : p.surface3, borderWidth: on ? 0 : 1, borderColor: p.divider }}
+            >
+              <Text style={{ fontFamily: fonts.bodyBold, fontSize: x.glyph, lineHeight: x.glyph + 6, color: on ? p.onPrimary : p.muted }}>A</Text>
+            </Pressable>
+          );
+        })}
+      </View>
+      <View style={{ flexDirection: "row", alignItems: "flex-end", gap: space.sm, paddingTop: space.md }}>
+        <Mascot size={30} />
+        <View style={{ flexShrink: 1, backgroundColor: p.surface3, borderRadius: radius.md, borderBottomLeftRadius: 5, paddingHorizontal: space.md, paddingVertical: 7 }}>
+          <Text style={{ color: p.ink, fontSize: 15.5 * textScale, lineHeight: 22 * textScale }}>迁移脚本跑完了，测试全过。</Text>
+        </View>
+      </View>
+    </>
+  );
+}
+
+function AlertsCard({ demo }: { demo: boolean }) {
+  const alertsOn = useSettings((x) => x.alertsOn);
+  const alertBlocked = useSettings((x) => x.alertBlocked);
+  const alertDone = useSettings((x) => x.alertDone);
+  const set = useSettings((x) => x.set);
+  const alerts = useAlerts();
+  const alertsLine = !alertsSupported
+    ? "需要装新版 App"
+    : demo
+      ? "演示模式没有提醒"
+      : !alertsOn
+        ? "关着：只有打开 App 时才知道"
+        : alerts.connected
+          ? alertsInBackground
+            ? "在线：App 关着也会提醒你"
+            : "在线：App 开着时提醒你；iOS 上关掉 App 就收不到"
+          : "正在连接服务器…";
+  // iOS keeps no background connection: alerts only while the app is open.
+  const alertsTitle = alertsInBackground ? "后台提醒" : "提醒";
+  return (
+    <Card style={{ paddingVertical: space.xs }}>
+      <Row
+        icon="bell-outline"
+        title={alertsTitle}
+        sub={alertsLine}
+        right={
+          <Toggle
+            label={alertsTitle}
+            value={alertsOn}
+            disabled={!alertsSupported}
+            onChange={async (v) => {
+              set({ alertsOn: v });
+              if (v) await askNotificationPermission();
+            }}
+          />
+        }
+      />
+      <Divider />
+      <Row
+        icon="hand-back-left-outline"
+        title="agent 在等你时"
+        sub="要你确认、要你回答的时候"
+        dim={!alertsOn}
+        right={<Toggle label="agent 在等你时提醒" value={alertBlocked} disabled={!alertsOn} onChange={(v) => set({ alertBlocked: v })} />}
+      />
+      <Divider />
+      <Row
+        icon="check-circle-outline"
+        title="agent 跑完时"
+        sub="小羊先去看一眼，再告诉你结果"
+        dim={!alertsOn}
+        right={<Toggle label="agent 跑完时提醒" value={alertDone} disabled={!alertsOn} onChange={(v) => set({ alertDone: v })} />}
+      />
+      {alertsSupported && alertsOn && !alerts.notificationsAllowed ? (
+        <>
+          <Divider />
+          <Row icon="bell-off-outline" tone="error" title="通知被关掉了" sub="去系统设置里允许 Herdr Pocket 发通知" onPress={() => PocketNative?.openNotificationSettings()} />
+        </>
+      ) : null}
+      {alertsSupported && alertsOn && !alerts.batteryUnrestricted ? (
+        <>
+          <Divider />
+          <Row icon="battery-heart-outline" title="允许在后台运行" sub="不然系统省电时会把提醒断掉。点这里，选“允许”或“无限制”" onPress={() => PocketNative?.requestBatteryExemption()} />
+        </>
+      ) : null}
+      {alertsSupported && alertsOn ? (
+        <>
+          <Divider />
+          <Row icon="bell-ring-outline" title="发一条测试提醒" sub="看看通知能不能送到这台手机" onPress={() => PocketNative?.testNotice("小羊：测试提醒", "能看到这条，说明 agent 的提醒也能送到。")} />
+        </>
+      ) : null}
+    </Card>
+  );
+}
+
+function ShellsRow() {
+  const showShells = useSettings((x) => x.showShells);
+  const set = useSettings((x) => x.set);
+  return (
+    <Row
+      icon="console-line"
+      title="显示普通终端"
+      sub="没在跑 agent 的 shell 窗口"
+      right={<Toggle label="显示普通终端" value={showShells} onChange={(v) => set({ showShells: v })} />}
+    />
+  );
+}
+
+/**
+ * The assistant's models, voice and prompts, shared by every phone: one row
+ * each, saying what is in use now. Kept fresh while the tab is in view.
+ */
+function AssistantConfigCard() {
+  useConfigWatch("config");
+  useConfigWatch("prompts");
+  const config = useAssistantConfig((x) => x.config);
+  const configError = useAssistantConfig((x) => x.configError);
+  const prompts = useAssistantConfig((x) => x.prompts);
+  const promptsError = useAssistantConfig((x) => x.promptsError);
+  const main = config?.models[0];
+  const spare = (config?.models.length ?? 1) - 1;
+  const modelsLine = config
+    ? main
+      ? `${main.model}${spare ? ` · 另有 ${spare} 个备用` : " · 没有备用"}${config.warnings.length ? ` · ${config.warnings.length} 处要看一下` : ""}`
+      : "还没有模型，小羊没法回话"
+    : (configError ?? "正在读取…");
+  const v = config?.voice;
+  const voiceLine = v ? (v.provider ? `${VOICE_LABEL[v.provider]}${v.voice ? ` · ${v.voice}` : ""}${v.key.set ? "" : " · 还没有密钥"}` : "关着：不能打电话") : (configError ?? "正在读取…");
+  const edited = prompts?.filter((x) => x.edited).length ?? 0;
+  const promptsLine = prompts ? (edited ? `改过 ${edited} 段，共 ${prompts.length} 段` : `共 ${prompts.length} 段，都是默认的`) : (promptsError ?? "正在读取…");
+  return (
+    <Card style={{ paddingVertical: space.xs }}>
+      <Row icon="brain" title="模型" sub={modelsLine} dim={!config} onPress={() => router.push("/assistant-config/models")} />
+      <Divider />
+      <Row icon="account-voice" title="语音" sub={voiceLine} dim={!config} onPress={() => router.push("/assistant-config/voice")} />
+      <Divider />
+      <Row icon="text-box-edit-outline" title="提示词" sub={promptsLine} dim={!prompts} onPress={() => router.push("/assistant-config/prompts")} />
+    </Card>
   );
 }
 
@@ -362,59 +450,6 @@ function UpdateRow({ demo }: { demo: boolean }) {
         </Text>
       ) : null}
     </Row>
-  );
-}
-
-function Divider() {
-  const p = usePalette();
-  return <View style={{ height: 1, backgroundColor: p.divider, marginLeft: space.lg + 40 + space.md, marginRight: space.lg }} />;
-}
-
-/**
- * One setting: a tinted icon tile, what it is, one line of what it does, and its
- * control on the right. Bigger controls (theme tiles, sizes) go underneath as children.
- */
-function Row({
-  icon,
-  title,
-  sub,
-  right,
-  onPress,
-  tone,
-  dim,
-  children,
-}: {
-  icon: IconName;
-  title: string;
-  sub?: string;
-  right?: ReactNode;
-  onPress?: () => void;
-  tone?: "error";
-  dim?: boolean;
-  children?: ReactNode;
-}) {
-  const p = usePalette();
-  const fg = tone === "error" ? p.error : p.accentText;
-  const body = (
-    <View style={{ paddingHorizontal: space.lg, paddingVertical: space.md, opacity: dim ? 0.55 : 1 }}>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, minHeight: 44 }}>
-        <View style={{ width: 40, height: 40, borderRadius: radius.sm, backgroundColor: tone === "error" ? p.errorContainer : p.accentContainer, alignItems: "center", justifyContent: "center" }}>
-          <MaterialCommunityIcons name={icon} size={21} color={fg} />
-        </View>
-        <View style={{ flex: 1, gap: 2 }}>
-          <Text style={{ fontFamily: fonts.bodyBold, fontSize: 15.5, color: tone === "error" ? p.error : p.ink }}>{title}</Text>
-          {sub ? <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 17 }}>{sub}</Text> : null}
-        </View>
-        {right ?? (onPress ? <MaterialCommunityIcons name="chevron-right" size={22} color={p.faint} /> : null)}
-      </View>
-      {children ? <View style={{ paddingLeft: 40 + space.md }}>{children}</View> : null}
-    </View>
-  );
-  if (!onPress) return body;
-  return (
-    <Pressable accessibilityRole="button" accessibilityLabel={sub ? `${title}，${sub}` : title} onPress={onPress} android_ripple={{ color: p.surface3 }}>
-      {body}
-    </Pressable>
   );
 }
 

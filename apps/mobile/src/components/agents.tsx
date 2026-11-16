@@ -52,7 +52,28 @@ export function QueuedChip({ agent }: { agent: Agent }) {
   );
 }
 
-export const AgentRow = memo(function AgentRow({ agent, offline, deviceName }: { agent: Agent; offline?: boolean; deviceName?: string }) {
+type AgentRowProps = {
+  agent: Agent;
+  offline?: boolean;
+  deviceName?: string;
+  /** Changes once a minute, so the "N 分钟前" line stays current while the agent itself does not change. */
+  minute?: number;
+};
+
+/**
+ * A relay snapshot brings every agent of a computer as a new object; a row only re-renders when
+ * something it shows changed (all Agent fields are plain values), or when the minute ticks.
+ */
+function sameRow(a: AgentRowProps, b: AgentRowProps): boolean {
+  if (a.offline !== b.offline || a.deviceName !== b.deviceName || a.minute !== b.minute) return false;
+  if (a.agent === b.agent) return true;
+  const x = a.agent as unknown as Record<string, unknown>;
+  const y = b.agent as unknown as Record<string, unknown>;
+  const keys = Object.keys(x);
+  return keys.length === Object.keys(y).length && keys.every((k) => x[k] === y[k]);
+}
+
+export const AgentRow = memo(function AgentRow({ agent, offline, deviceName }: AgentRowProps) {
   const p = usePalette();
   const sub = [harnessLook(agent.harness, agent.isShell).label, deviceName, agent.turn ? `第 ${agent.turn} 轮` : null]
     .filter(Boolean)
@@ -108,9 +129,9 @@ export const AgentRow = memo(function AgentRow({ agent, offline, deviceName }: {
       </View>
     </Card>
   );
-});
+}, sameRow);
 
-const TILES: Array<{ s: AgentStatus; label: string; icon: "heart-outline" | "play-circle-outline" | "check-circle-outline" }> = [
+const TILES: { s: AgentStatus; label: string; icon: "heart-outline" | "play-circle-outline" | "check-circle-outline" }[] = [
   { s: "blocked", label: "需要你", icon: "heart-outline" },
   { s: "working", label: "工作中", icon: "play-circle-outline" },
   { s: "done", label: "已完成", icon: "check-circle-outline" },

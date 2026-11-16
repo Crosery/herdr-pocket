@@ -9,6 +9,7 @@ The repository contains the shared wire contract, the relay, the computer host d
 
 - `packages/protocol/src/index.ts`: versioned device, agent, conversation, RPC, stream, and pairing contracts. Change this before changing a cross-process message.
 - `apps/relay`: server-side WebSocket relay. Device tokens are stored as hashes; the relay rewrites published agent ownership.
+- `apps/relay/src/assistant/prompts/*.md`: the shipped assistant prompts (`prompts.ts` only fills slots). Phones can change prompts, models, keys and voice (`configstore.ts`; keys and prompt edits sealed with `<db>.key`).
 - `apps/hostd`: per-computer daemon. It bridges `hc`, the Herdr TUI socket, and Uniflo, and serves RPC/stream subscriptions.
 - `apps/mobile`: Expo SDK 58 Android app. It is intentionally excluded from the root pnpm workspace; run its checks from that directory.
 - `deploy`: systemd, Caddy, launchd, and environment examples. Never put real tokens in these files.

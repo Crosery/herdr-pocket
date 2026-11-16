@@ -7,8 +7,11 @@
  * In mainland China (by the phone's time zone) GitHub is slow or out of reach, so the
  * release's SHA256SUMS and APK come through a mirror first, GitHub after; elsewhere it is
  * the other way round. A download is checked against SHA256SUMS whichever way it came.
+ *
+ * Android only: releases ship an APK. An iOS app is not installed from inside an app,
+ * so on iOS nothing is checked or downloaded (`updatesSupported`).
  */
-import { Linking } from "react-native";
+import { Linking, Platform } from "react-native";
 import Constants from "expo-constants";
 import { create } from "zustand";
 import {
@@ -40,6 +43,9 @@ interface UpdateState {
 }
 
 export const useUpdate = create<UpdateState>()(() => ({ phase: "idle", progress: 0, path: null, note: null }));
+
+/** In-app updates install the release APK: Android only. */
+export const updatesSupported = Platform.OS === "android";
 
 const CHECK_EVERY_MS = 12 * 3600_000;
 const set = (patch: Partial<UpdateState>) => useUpdate.setState(patch);
@@ -166,6 +172,10 @@ export async function checkForUpdate(manual = false): Promise<void> {
   const s = useSettings.getState();
   const { phase } = useUpdate.getState();
   if (phase === "checking" || phase === "downloading") return;
+  if (!updatesSupported) {
+    if (manual) set({ phase: "latest", note: "iOS 版不在 App 里更新" });
+    return;
+  }
   if (isMockServer(s.server)) {
     if (manual) set({ phase: "latest", note: "演示模式不检查更新" });
     return;
@@ -206,7 +216,7 @@ function syncPhase(note: string | null = null): void {
 /** Downloads the newer APK, then opens the installer. Without the native updater, opens the release page. */
 export async function downloadUpdate(): Promise<void> {
   const r = useSettings.getState().updateRelease;
-  if (!r) return;
+  if (!r || !updatesSupported) return;
   const native = PocketNative;
   if (!r.url || !native?.downloadUpdate || !native.installUpdate) {
     await Linking.openURL(r.page).catch(() => undefined);
