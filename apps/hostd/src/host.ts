@@ -125,6 +125,15 @@ export class Host {
   private names: AppNames | undefined;
   private namesSig = "";
   private namesTimer: NodeJS.Timeout | null = null;
+  /**
+   * Sources that did not answer are looked for again this often. After a reboot or a login the
+   * daemon can start before the herdr app or Uniflo; without this it would never read
+   * conversations until it was restarted.
+   */
+  sourceRetryMs = 30_000;
+  private sourceTimer: NodeJS.Timeout | null = null;
+  private findingSources = false;
+  private sourcesLogged = false;
   /** Text typed into busy agents that their programs have not taken yet. */
   waits = new InputWaits();
   private waitTimer: NodeJS.Timeout | null = null;
@@ -163,35 +172,94 @@ export class Host {
   }
 
   async start(): Promise<void> {
-    const [hc, herdr, uniflo] = await Promise.all([this.hc.available(), this.herdr.available(), this.uniflo.available()]);
+    await this.findSources();
+    if (!this.sources.includes("hc") && !this.sources.includes("herdr")) {
+      this.log("no herdr runtime found: start the herdr app (hc) or `herdr` first. Waiting anyway.");
+    }
+    if (this.sources.length < 3) {
+      this.sourceTimer = setInterval(() => void this.findSources(), this.sourceRetryMs);
+      this.sourceTimer.unref?.();
+    }
+    this.logTimer = setInterval(() => this.flushLogs(), this.logEveryMs);
+    this.logTimer.unref?.();
+    this.connect();
+  }
+
+  /**
+   * Turns on every source that answers and is not on yet. The first time it logs the whole
+   * list; later, only what came up, and the relay is told (a second hello updates the device).
+   */
+  async findSources(): Promise<void> {
+    if (this.findingSources || this.stopped) return;
+    this.findingSources = true;
+    try {
+      await this.probeSources();
+    } finally {
+      this.findingSources = false;
+    }
+    // All three on: nothing left to look for.
+    if ((["hc", "herdr", "uniflo"] as const).every((s) => this.sources.includes(s)) && this.sourceTimer) {
+      clearInterval(this.sourceTimer);
+      this.sourceTimer = null;
+    }
+  }
+
+  private async probeSources(): Promise<void> {
+    const has = (s: AgentSource) => this.sources.includes(s);
+    const [hc, herdr, uniflo] = await Promise.all([
+      has("hc") ? false : this.hc.available(),
+      has("herdr") ? false : this.herdr.available(),
+      has("uniflo") ? false : this.uniflo.available(),
+    ]);
+    if (this.stopped) return;
+    const added: string[] = [];
     if (hc) {
       this.sources.push("hc");
       this.hc.on("change", this.publish);
       this.hc.start();
       void this.refreshNames();
       this.namesTimer = setInterval(() => void this.refreshNames(), 15_000);
+      added.push(`herdr GUI core (hc) ${this.hc.version ?? ""}`.trim());
     }
     if (herdr) {
       this.sources.push("herdr");
       this.herdr.on("change", this.publish);
       this.herdr.start();
+      added.push("herdr TUI");
     }
     if (uniflo) {
       this.sources.push("uniflo");
       this.uniflo.start(this.publish);
+      added.push("uniflo");
     }
-    this.log(
-      `sources: herdr GUI core (hc) ${hc ? `✓ ${this.hc.version ?? ""}` : "✗"} · herdr TUI ${herdr ? "✓" : "✗"} · uniflo ${uniflo ? "✓" : "✗"}`,
-    );
-    if (!hc && !herdr) this.log("no herdr runtime found: start the herdr app (hc) or `herdr` first. Waiting anyway.");
-    this.logTimer = setInterval(() => this.flushLogs(), this.logEveryMs);
-    this.logTimer.unref?.();
-    this.connect();
+    if (!this.sourcesLogged) {
+      this.sourcesLogged = true;
+      this.log(
+        `sources: herdr GUI core (hc) ${has("hc") ? `✓ ${this.hc.version ?? ""}` : "✗"} · herdr TUI ${has("herdr") ? "✓" : "✗"} · uniflo ${has("uniflo") ? "✓" : "✗"}`,
+      );
+      return;
+    }
+    if (!added.length) return;
+    this.log(`source came up: ${added.join(", ")}`);
+    this.note("info", "sources", `came up after start: ${added.join(", ")}`);
+    if (this.connected) this.hello();
+    this.publish();
+  }
+
+  private hello(): void {
+    this.send({
+      type: "hello",
+      version: PROTOCOL_VERSION,
+      platform: platform(),
+      sources: this.sources,
+      appVersion: HOSTD_VERSION,
+    });
   }
 
   stop(): void {
     this.stopped = true;
     if (this.namesTimer) clearInterval(this.namesTimer);
+    if (this.sourceTimer) clearInterval(this.sourceTimer);
     if (this.logTimer) clearInterval(this.logTimer);
     if (this.waitTimer) clearInterval(this.waitTimer);
     this.flushLogs();
@@ -277,13 +345,7 @@ export class Host {
     ws.on("open", () => {
       this.backoff = 1000;
       this.log(`connected to ${server}`);
-      this.send({
-        type: "hello",
-        version: PROTOCOL_VERSION,
-        platform: platform(),
-        sources: this.sources,
-        appVersion: HOSTD_VERSION,
-      });
+      this.hello();
       this.lastPublished = "";
       this.publishNow();
       // What happened while the link was down goes up first.
