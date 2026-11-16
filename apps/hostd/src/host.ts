@@ -8,6 +8,7 @@ import {
   rowsChange,
   type Agent,
   type AgentSource,
+  type ConvEvent,
   type LayoutSpace,
   type Device,
   type ClientFrame,
@@ -131,6 +132,9 @@ export class Host {
    * conversations until it was restarted.
    */
   sourceRetryMs = 30_000;
+  /** How often a conversation stream reads the page: without Uniflo's push, and as recovery beside it. */
+  sessionPollMs = 250;
+  sessionPollLiveMs = 2000;
   private sourceTimer: NodeJS.Timeout | null = null;
   private findingSources = false;
   private sourcesLogged = false;
@@ -516,13 +520,35 @@ export class Host {
       }
       const sessionKey = await this.sessionOf(a.key, p.sub);
       if (!sessionKey) throw new RpcFailure("not_found", "这个 agent 没有对话会话");
+      if (this.streamMeta.get(f.id) !== meta) return; // unsubscribed while the session was looked up
       let stopped = false;
       const seen = new Map<string, string>();
+      /** Event id -> `clock` when the live stream last sent it, so an older page read cannot undo it. */
+      const liveAt = new Map<string, number>();
+      let clock = 0;
+      const forward = (e: ConvEvent, fromLive: boolean) => {
+        const sig = JSON.stringify(e);
+        if (fromLive) liveAt.set(e.id, ++clock);
+        if (seen.get(e.id) === sig) return;
+        seen.set(e.id, sig);
+        if (seen.size > 2000) {
+          const old = seen.keys().next().value!;
+          seen.delete(old);
+          liveAt.delete(old);
+        }
+        this.sendStream(f.id, { kind: "session", event: e, at: Date.now() });
+      };
       let busy = false;
+      let again = false;
       let failing = false;
       const tick = async () => {
-        if (stopped || busy) return;
+        if (stopped) return;
+        if (busy) {
+          again = true;
+          return;
+        }
         busy = true;
+        const at = clock;
         try {
           // The viewer loads the page itself; the stream only has to carry what is new.
           const r = await this.uniflo.events(sessionKey, 40);
@@ -530,25 +556,39 @@ export class Host {
             failing = false;
             this.sendStream(f.id, { kind: "alive", at: Date.now() });
           }
-          for (const e of r.events) {
-            const sig = JSON.stringify(e);
-            if (seen.get(e.id) === sig) continue;
-            seen.set(e.id, sig);
-            if (seen.size > 2000) seen.delete(seen.keys().next().value!);
-            this.sendStream(f.id, { kind: "session", event: e, at: Date.now() });
-          }
+          for (const e of r.events) if ((liveAt.get(e.id) ?? 0) <= at) forward(e, false);
         } catch (e) {
           if (!failing) this.sendStream(f.id, { kind: "stale", message: (e as Error).message, at: Date.now() });
           failing = true;
         } finally {
           busy = false;
+          if (again && !stopped) {
+            again = false;
+            void tick();
+          }
         }
       };
-      const timer = setInterval(() => void tick(), 250);
+      // Uniflo pushes each event as it indexes it; the page is read when it can't (too long to send as is,
+      // the push link just came back) and, slowly, to recover. Without the push, the page is read 4 times a second.
+      const offLive = this.uniflo.onEvents(sessionKey, (e) => {
+        if (stopped) return;
+        if (e) forward(e, true);
+        else void tick();
+      });
+      let timer: NodeJS.Timeout | undefined;
+      const poll = () => {
+        timer = setTimeout(() => {
+          void tick().finally(() => {
+            if (!stopped) poll();
+          });
+        }, this.uniflo.live ? this.sessionPollLiveMs : this.sessionPollMs);
+      };
       void tick();
+      poll();
       this.streamStops.set(f.id, () => {
         stopped = true;
-        clearInterval(timer);
+        clearTimeout(timer);
+        offLive();
       });
       this.send({ type: "stream_open", id: f.id, result: { kind: "session", sessionKey } });
     } catch (e) {

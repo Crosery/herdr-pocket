@@ -19,6 +19,9 @@ export interface UnifloSession {
   usage?: { cost_usd?: number; last_context_tokens?: number; context_limit?: number; steps?: number };
 }
 
+/** The parts of a session that change what agents show: a new one, its status, process or title. */
+const sessionSig = (s: UnifloSession): string => `${s.status}|${s.pid ?? ""}|${s.title ?? ""}|${s.parent ?? ""}`;
+
 const plain = (s: string | undefined, max: number): string | undefined =>
   s ? s.replace(/<\/?[\w-]+[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, max) || undefined : undefined;
 
@@ -94,6 +97,38 @@ export function cleanEvent<E extends ConvEvent & Record<string, unknown>>(e: E):
   return e;
 }
 
+/** The longest tool output the phone gets; it shows a preview. */
+const TOOL_OUTPUT_MAX = 4000;
+
+/** What the phone gets for one Uniflo event: injected blocks folded, usage ticks dropped, long tool output clipped. */
+export function toConvEvent(raw: ConvEvent & Record<string, unknown>): ConvEvent | null {
+  const e = cleanEvent(raw);
+  if (!e) return null;
+  const out = { ...e, pos: e.pos === undefined || e.pos === null ? undefined : String(e.pos) };
+  if (e.kind === "tool_result" && typeof e.output === "string" && e.output.length > TOOL_OUTPUT_MAX) {
+    return { ...out, output: `${e.output.slice(0, TOOL_OUTPUT_MAX)}\n…`, truncated: true } as ConvEvent;
+  }
+  return out as ConvEvent;
+}
+
+/** `max_text` asked of the events API. */
+const PAGE_TEXT_MAX = 6000;
+
+/**
+ * True when the events API returns this live-stream event unchanged: no field is long enough for
+ * `max_text` to cut. Counted in UTF-8 bytes with room to spare, so it holds however Uniflo counts.
+ */
+export function sameAsPage(raw: Record<string, unknown>): boolean {
+  for (const v of Object.values(raw)) {
+    if (v === null || v === undefined || typeof v === "number" || typeof v === "boolean") continue;
+    if (Buffer.byteLength(typeof v === "string" ? v : JSON.stringify(v)) > PAGE_TEXT_MAX - 200) return false;
+  }
+  return true;
+}
+
+/** A new event of one session as the phone gets it, or null for "something changed: read the page again". */
+export type LiveListener = (event: ConvEvent | null) => void;
+
 const SVG_TAGS = new Set(["svg", "g", "path", "circle", "ellipse", "rect", "polygon", "polyline", "line", "title"]);
 
 /**
@@ -132,6 +167,20 @@ export class UnifloAdapter {
   private named = new Map<string, UnifloSession>();
   /** Named keys being fetched, or not found (key -> when to look again). */
   private namedWait = new Map<string, number>();
+  /**
+   * True while Uniflo's live stream (`/v1/stream`) is connected: a new event reaches the
+   * listeners as soon as Uniflo has indexed it, and polling only has to recover.
+   */
+  live = false;
+  private liveAbort: AbortController | null = null;
+  private liveBackoff = 1000;
+  private liveListeners = new Map<string, Set<LiveListener>>();
+  /** Every session of the last list (children too) -> the parts of it agents show (`sessionSig`). */
+  private known = new Map<string, string>();
+  private soonTimer: NodeJS.Timeout | null = null;
+  private lastRefresh = 0;
+  private refreshing = false;
+  private refreshAgain = false;
 
   constructor(base = process.env.UNIFLO_URL ?? "http://127.0.0.1:7311", token = process.env.UNIFLO_TOKEN) {
     this.base = base.replace(/\/+$/, "");
@@ -151,16 +200,133 @@ export class UnifloAdapter {
     this.onChange = onChange;
     void this.refresh();
     this.timer = setInterval(() => void this.refresh(), 8000);
+    this.liveAbort = new AbortController();
+    void this.watch(this.liveAbort.signal);
   }
 
   stop(): void {
     if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    if (this.soonTimer) clearTimeout(this.soonTimer);
+    this.soonTimer = null;
+    this.liveAbort?.abort();
+    this.liveAbort = null;
+    this.live = false;
+  }
+
+  /** Calls `fn` with each new event of `sessionKey` while the live stream is up; returns the way to stop. */
+  onEvents(sessionKey: string, fn: LiveListener): () => void {
+    let set = this.liveListeners.get(sessionKey);
+    if (!set) this.liveListeners.set(sessionKey, (set = new Set()));
+    set.add(fn);
+    return () => {
+      set.delete(fn);
+      if (!set.size && this.liveListeners.get(sessionKey) === set) this.liveListeners.delete(sessionKey);
+    };
+  }
+
+  /** Follows Uniflo's live stream (server-sent events) until stopped, reconnecting after a drop. */
+  private async watch(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      try {
+        const res = await fetch(`${this.base}/v1/stream`, {
+          headers: { Accept: "text/event-stream", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+          signal,
+        });
+        // An older Uniflo without the live stream: polling covers it; look again now and then.
+        if (res.status === 404) this.liveBackoff = 300_000;
+        if (!res.ok || !res.body) throw new Error(`uniflo /v1/stream: ${res.status}`);
+        const text = new TextDecoder();
+        let buf = "";
+        for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+          // JSON escapes a carriage return inside a string, so a raw one only ends a line.
+          buf += text.decode(chunk, { stream: true }).replace(/\r/g, "");
+          for (let i = buf.indexOf("\n\n"); i >= 0; i = buf.indexOf("\n\n")) {
+            this.onLiveFrame(buf.slice(0, i));
+            buf = buf.slice(i + 2);
+          }
+        }
+      } catch {
+        /* down, refused or stopped */
+      }
+      if (this.live) {
+        this.live = false;
+        // Polling takes over at its quick pace; one look now covers the gap.
+        this.wakeAll();
+      }
+      if (signal.aborted) return;
+      await new Promise<void>((done) => {
+        const t = setTimeout(done, this.liveBackoff);
+        t.unref?.();
+        signal.addEventListener("abort", () => (clearTimeout(t), done()), { once: true });
+      });
+      this.liveBackoff = Math.min(this.liveBackoff * 2, 300_000);
+    }
+  }
+
+  private onLiveFrame(frame: string): void {
+    let data = "";
+    for (const line of frame.split("\n")) if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(line[5] === " " ? 6 : 5);
+    if (!data) return;
+    let j: { type?: string; event?: ConvEvent & Record<string, unknown>; session?: UnifloSession };
+    try {
+      j = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (j.type === "hello") {
+      this.live = true;
+      this.liveBackoff = 1000;
+      // Whatever came while the stream was down is read once from the page.
+      this.wakeAll();
+    } else if (j.type === "event" && j.event && typeof j.event.session === "string") {
+      const set = this.liveListeners.get(j.event.session);
+      if (!set?.size) return;
+      const e = sameAsPage(j.event) ? toConvEvent(j.event) : undefined;
+      if (e === null) return; // a usage tick or an empty notice: nothing to show
+      for (const fn of [...set]) fn(e ?? null);
+    } else if (j.type === "session" && j.session?.key) {
+      // A new session (a fresh start, `/clear`, a subagent) or a changed one: match agents now, not in 8 s.
+      if (this.known.get(j.session.key) !== sessionSig(j.session)) this.refreshSoon();
+    }
+  }
+
+  private wakeAll(): void {
+    for (const set of this.liveListeners.values()) for (const fn of [...set]) fn(null);
+  }
+
+  private refreshSoon(): void {
+    if (this.soonTimer || !this.timer) return;
+    this.soonTimer = setTimeout(() => {
+      this.soonTimer = null;
+      void this.refresh();
+    }, Math.max(150, this.lastRefresh + 1000 - Date.now()));
+    this.soonTimer.unref?.();
   }
 
   private async refresh(): Promise<void> {
+    if (this.refreshing) {
+      this.refreshAgain = true;
+      return;
+    }
+    this.refreshing = true;
+    this.lastRefresh = Date.now();
+    try {
+      await this.refreshOnce();
+    } finally {
+      this.refreshing = false;
+      if (this.refreshAgain) {
+        this.refreshAgain = false;
+        this.refreshSoon();
+      }
+    }
+  }
+
+  private async refreshOnce(): Promise<void> {
     try {
       // Live agents are recent; 300 newest sessions are plenty to match against.
       const list = (await this.get("/v1/sessions?limit=300")) as UnifloSession[];
+      this.known = new Map(list.map((s) => [s.key, sessionSig(s)]));
       const before = this.sig();
       this.sessions = list.filter((s) => !s.parent);
       this.childCounts = new Map();
@@ -447,22 +613,12 @@ export class UnifloAdapter {
     limit = 80,
     before?: string,
   ): Promise<{ events: ConvEvent[]; more: boolean; nextBefore: string | null }> {
-    const q = new URLSearchParams({ limit: String(Math.min(Math.max(limit, 1), 300)), max_text: "6000" });
+    const q = new URLSearchParams({ limit: String(Math.min(Math.max(limit, 1), 300)), max_text: String(PAGE_TEXT_MAX) });
     if (before) q.set("before", before);
     const r = await this.get(`/v1/sessions/${encodeURIComponent(sessionKey)}/events?${q}`);
     const events = (r.events ?? []) as Array<ConvEvent & Record<string, unknown>>;
     return {
-      events: events
-        .map(cleanEvent)
-        .filter((e): e is ConvEvent & Record<string, unknown> => e !== null)
-        .map((e) => {
-          const out = { ...e, pos: e.pos === undefined || e.pos === null ? undefined : String(e.pos) };
-          // Tool output can be huge; the phone shows a preview.
-          if (e.kind === "tool_result" && typeof e.output === "string" && e.output.length > 4000) {
-            return { ...out, output: `${e.output.slice(0, 4000)}\n…`, truncated: true } as ConvEvent;
-          }
-          return out as ConvEvent;
-        }),
+      events: events.map(toConvEvent).filter((e): e is ConvEvent => e !== null),
       more: r.next_before !== null && r.next_before !== undefined,
       nextBefore: r.next_before === null || r.next_before === undefined ? null : String(r.next_before),
     };

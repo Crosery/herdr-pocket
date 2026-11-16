@@ -617,21 +617,28 @@ export function ChatView({
   const [olderCursor, setOlderCursor] = useState<string | null | undefined>(undefined);
   const [loadingOlder, setLoadingOlder] = useState(false);
 
+  // The session the agent is on. A new one (a fresh start, `/clear`) is another conversation: its file
+  // positions do not continue the old one's. A moment without a match keeps the last one.
+  const [session, setSession] = useState(agent.sessionKey);
+  if (agent.sessionKey && agent.sessionKey !== session) setSession(agent.sessionKey);
+  const [streamState, setStreamState] = useState<"connecting" | "live" | "stale" | "error">("connecting");
+  const busy = !!sub || agent.status === "working";
   const q = useQuery({
-    queryKey: ["session.events", agent.key, sub ?? null],
+    queryKey: ["session.events", agent.key, sub ?? null, session ?? null],
     // One screenful first; older pages load as the list is scrolled up.
     queryFn: () => call(agent.deviceId, "session.events", { agent: agent.key, sub, limit: 60 }),
     enabled: active,
-    refetchInterval: active && (sub || agent.status === "working") ? 8000 : active ? 20_000 : false,
+    // A live stream carries every new event, so the page is only a slow safety net then; without it
+    // (computer or link gone, no session yet) the page is how new events arrive, so it is read often.
+    refetchInterval: !active ? false : streamState === "live" ? 30_000 : busy ? 3000 : 10_000,
   });
   // Everything received for this conversation, by id. The newest page slides forward as the agent works;
   // without this, events between the older pages and the current page would silently disappear.
   const [liveEvents, setLiveEvents] = useState<ConvEvent[]>([]);
-  const [streamState, setStreamState] = useState<"connecting" | "live" | "stale" | "error">("connecting");
   const linkOnline = useLive((s) => s.link === "online");
   // Another conversation starts empty, and each newest page the query brings is merged in. Done while
   // rendering (React's way to adjust state to new props), so a frame never shows the old conversation.
-  const conv = `${agent.key}\n${sub ?? ""}`;
+  const conv = `${agent.key}\n${sub ?? ""}\n${session ?? ""}`;
   const [synced, setSynced] = useState<{ conv: string; page: typeof q.data }>({ conv, page: undefined });
   if (synced.conv !== conv || synced.page !== q.data) {
     const fresh = synced.conv !== conv;
@@ -688,7 +695,7 @@ export function ChatView({
       stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, agent.deviceId, agent.key, sub, attempt]);
+  }, [active, agent.deviceId, agent.key, sub, session, attempt]);
   const kids = useQuery({
     queryKey: ["session.children", agent.key, sub ?? null],
     queryFn: () => call(agent.deviceId, "session.children", { agent: agent.key, sub }),
