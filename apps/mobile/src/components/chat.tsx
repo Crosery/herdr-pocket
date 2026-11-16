@@ -1,7 +1,7 @@
-import { createContext, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, Image, Pressable, ScrollView, View, type ListRenderItem } from "react-native";
+import { createContext, memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { Image, Pressable, ScrollView, View, type NativeScrollEvent, type NativeSyntheticEvent, type ViewProps } from "react-native";
+import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
 import { ActivityIndicator, Button, Snackbar, Text } from "react-native-paper";
-import Markdown from "react-native-markdown-display";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
@@ -14,6 +14,7 @@ import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
 import { EmptyState, TypingDots } from "./ui";
+import { Md } from "./md";
 import { ReplyDots, SendMark } from "./outbox";
 import { BusyMascot, Sparkle } from "./Mascot";
 import { CuteIcon } from "./icons";
@@ -36,7 +37,7 @@ export type Row =
   | { type: "thinking"; id: string; text: string }
   | { type: "tool"; id: string; call: ToolCall; result?: ToolResult }
   /** A run of tool calls folded into one line. */
-  | { type: "tools"; id: string; items: Array<Extract<Row, { type: "tool" }>> }
+  | { type: "tools"; id: string; items: Extract<Row, { type: "tool" }>[] }
   /** Sent from this phone, not yet echoed by the session. */
   | { type: "pending"; id: string; text: string; ts: number; pictures?: string[]; send: PendingSend; agentKey: string }
   | { type: "turn_end"; id: string; ts: number }
@@ -87,7 +88,7 @@ export function foldEvents(events: ConvEvent[]): Row[] {
 /** Fold each run of two or more tool calls into one "tools" row so replies are not buried under tool cards. */
 function groupTools(rows: Row[]): Row[] {
   const out: Row[] = [];
-  let run: Array<Extract<Row, { type: "tool" }>> = [];
+  let run: Extract<Row, { type: "tool" }>[] = [];
   const flush = () => {
     if (run.length >= 2) out.push({ type: "tools", id: `g-${run[0]!.id}`, items: run });
     else out.push(...run);
@@ -185,7 +186,18 @@ function toolTint(name: string, p: Palette): { bg: string; fg: string } {
 // Rows
 // ---------------------------------------------------------------------------
 
+const mdCache = new WeakMap<Palette, Map<number, ReturnType<typeof makeMdStyles>>>();
+
+/** Markdown styles for a look; the same object for the same palette and scale, so every bubble shares one renderer (see `Md`). */
 export function mdStyles(p: Palette, scale: number) {
+  let byScale = mdCache.get(p);
+  if (!byScale) mdCache.set(p, (byScale = new Map()));
+  let s = byScale.get(scale);
+  if (!s) byScale.set(scale, (s = makeMdStyles(p, scale)));
+  return s;
+}
+
+function makeMdStyles(p: Palette, scale: number) {
   const base = 15.5 * scale;
   return {
     body: { color: p.ink, fontFamily: fonts.body, fontSize: base, lineHeight: base * 1.55 },
@@ -311,7 +323,7 @@ const SubCtx = createContext<{ byCall: Map<string, SubSession>; open: (s: SubSes
 const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
   const p = usePalette();
   const scale = useSettings((s) => s.textScale);
-  const styles = useMemo(() => mdStyles(p, scale), [p, scale]);
+  const styles = mdStyles(p, scale);
   const md = useMemo(() => fixCjkEmphasis(text), [text]);
   return (
     <View
@@ -330,7 +342,7 @@ const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) 
         shadowOffset: { width: 0, height: 3 },
       }}
     >
-      <Markdown style={styles}>{md}</Markdown>
+      <Md style={styles}>{md}</Md>
     </View>
   );
 });
@@ -428,7 +440,7 @@ function ToolCard({ call: c, result, bare }: { call: ToolCall; result?: ToolResu
 }
 
 /** A run of tool calls on one line; tap to list them, tap one to see its input and output. */
-function ToolGroup({ items: tools }: { items: Array<Extract<Row, { type: "tool" }>> }) {
+function ToolGroup({ items: tools }: { items: Extract<Row, { type: "tool" }>[] }) {
   const p = usePalette();
   const [open, setOpen] = useState(false);
   const subs = useContext(SubCtx);
@@ -520,8 +532,43 @@ function TurnEnd({ ts }: { ts?: number }) {
   );
 }
 
-const renderRow: ListRenderItem<Row> = ({ item }) => {
+/**
+ * The strip under the newest message: the working badge or the reply dots, then the space above the
+ * composer. It is the list's first row (the list is inverted) rather than its header, so when it
+ * changes the rows are laid out again like for any other row, and a reader's place is kept across it.
+ */
+type EndRow = { type: "end"; id: string; working: boolean; since?: number; now: number; awaiting: boolean; inset: number };
+type ListRow = Row | EndRow;
+const END_ID = "\u0000end";
+
+const ROW_GAP = { height: space.md };
+
+/** Space between chat rows; a fixed component, so a list re-render does not remount every separator. */
+function RowGap({ leadingItem }: { leadingItem?: ListRow }) {
+  return leadingItem?.type === "end" ? null : <View style={ROW_GAP} />;
+}
+
+/** FlashList draws a row's separator after the row, which an inverted list turns to the newer side; draw it above. */
+const SEPARATOR_ABOVE = { flexDirection: "column-reverse" } as const;
+function Cell({ style, ...rest }: ViewProps) {
+  return <View {...rest} style={[style, SEPARATOR_ABOVE]} />;
+}
+
+/** Android inverts the list by rotating it, which puts the scrollbar on the left; this moves it back (FlatList passes the same). */
+const SCROLLBAR_RIGHT = { isInvertedVirtualizedList: true };
+/** The chat keeps a reader's place itself (ChatView's keepReading). */
+const NO_MVCP = { disabled: true };
+
+const rowType = (r: ListRow) => r.type;
+
+const renderRow: ListRenderItem<ListRow> = ({ item }) => {
   switch (item.type) {
+    case "end":
+      return (
+        <View style={{ paddingBottom: item.inset }}>
+          {item.working ? <WorkingBadge since={item.since} now={item.now} /> : item.awaiting ? <ReplyDots /> : null}
+        </View>
+      );
     case "user":
       return <UserBubble text={item.text} injected={item.injected} ts={item.ts} pictures={item.pictures} />;
     case "pending":
@@ -582,31 +629,36 @@ export function ChatView({
   const [liveEvents, setLiveEvents] = useState<ConvEvent[]>([]);
   const [streamState, setStreamState] = useState<"connecting" | "live" | "stale" | "error">("connecting");
   const linkOnline = useLive((s) => s.link === "online");
-  useEffect(() => {
-    setLiveEvents([]);
-    setOlder([]);
-    setOlderCursor(undefined);
-  }, [agent.key, sub]);
-  useEffect(() => {
+  // Another conversation starts empty, and each newest page the query brings is merged in. Done while
+  // rendering (React's way to adjust state to new props), so a frame never shows the old conversation.
+  const conv = `${agent.key}\n${sub ?? ""}`;
+  const [synced, setSynced] = useState<{ conv: string; page: typeof q.data }>({ conv, page: undefined });
+  if (synced.conv !== conv || synced.page !== q.data) {
+    const fresh = synced.conv !== conv;
+    setSynced({ conv, page: q.data });
+    let next = fresh ? [] : liveEvents;
+    if (fresh) {
+      setOlder([]);
+      setOlderCursor(undefined);
+      setStreamState("connecting");
+    }
     const page = q.data?.events;
-    if (!page?.length) return;
-    setLiveEvents((old) => {
+    if (page?.length) {
       const oldestNew = posOf(page[0]!);
-      const newestOld = old.length ? posOf(old[old.length - 1]!) : null;
+      const newestOld = next.length ? posOf(next[next.length - 1]!) : null;
       // The page no longer touches what we hold (long time away): what lies between is unknown, so start over from the page.
-      if (newestOld !== null && oldestNew !== null && oldestNew > newestOld && !old.some((e) => e.id === page[0]!.id)) {
+      if (newestOld !== null && oldestNew !== null && oldestNew > newestOld && !next.some((e) => e.id === page[0]!.id)) {
         setOlder([]);
         setOlderCursor(undefined);
-        return page;
-      }
-      return mergeEvents(old, page);
-    });
-  }, [q.data]);
+        next = page;
+      } else next = mergeEvents(next, page);
+    }
+    if (next !== liveEvents) setLiveEvents(next);
+  }
   const [attempt, setAttempt] = useState(0);
   const failures = useRef(0);
   useEffect(() => {
     if (!active) return;
-    setStreamState("connecting");
     let opened = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
     const stop = subscribe(agent.deviceId, "session", { agent: agent.key, sub }, (event) => {
@@ -625,7 +677,10 @@ export function ChatView({
         opened = true;
       } else {
         // Refused, or ended because the computer went away: try again a little later.
-        retry ??= setTimeout(() => setAttempt((n) => n + 1), Math.min(30_000, 3000 * 2 ** failures.current++));
+        retry ??= setTimeout(() => {
+          setStreamState("connecting");
+          setAttempt((n) => n + 1);
+        }, Math.min(30_000, 3000 * 2 ** failures.current++));
       }
     });
     return () => {
@@ -655,7 +710,7 @@ export function ChatView({
   // Messages sent from this phone show at once and give way to the session's own copy (lib/outbox).
   const sendsAll = usePending((s) => (sub ? undefined : s.byAgent[agent.key]));
   const patchSend = usePending((s) => s.update);
-  const [nowTick, setNowTick] = useState(Date.now());
+  const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
     if (!sendsAll?.length && agent.status !== "working") return;
     const t = setInterval(() => setNowTick(Date.now()), 5000);
@@ -668,7 +723,7 @@ export function ChatView({
     if (sends.drop.length) forget(agent.key, sends.drop);
   }, [sends, patchSend, agent.key]);
 
-  // Inverted list: newest at index 0. The session's copy of a message from this phone keeps its bubble's key.
+  // Inverted list: newest first. The session's copy of a message from this phone keeps its bubble's key.
   const rows = useMemo(
     () =>
       [
@@ -680,25 +735,108 @@ export function ChatView({
       ].reverse(),
     [folded, sends, agent.key],
   );
+  const working = !sub && agent.status === "working";
+  const end = useMemo(
+    (): EndRow => ({ type: "end", id: END_ID, working, since: agent.statusSince, now: working ? nowTick : 0, awaiting: !working && !!sends.awaiting, inset: bottomInset + space.md }),
+    [working, agent.statusSince, nowTick, sends.awaiting, bottomInset],
+  );
   const more = olderCursor === undefined ? q.data?.more : olderCursor !== null;
 
-  const listRef = useRef<FlatList<Row>>(null);
+  const listRef = useRef<FlashListRef<ListRow>>(null);
   const busyRef = useRef(false);
   /** Until this time, keep pushing to the top as rows get measured (virtualised list). */
   const toTopUntil = useRef(0);
   const [jumping, setJumping] = useState<{ loaded: number } | null>(null);
   const [capped, setCapped] = useState(false);
-  // Inverted list: offset 0 is the newest message.
-  const [view, setView] = useState({ y: 0, h: 0, content: 0 });
-  const atBottom = view.y < 48;
-  const atTop = !more && view.content > 0 && view.y + view.h >= view.content - 48;
-  // Unread: the newest row id when the user left the bottom; rows above it are new.
+  // Inverted list: offset 0 is the newest message. The offset lives in a ref and only crossing
+  // an edge re-renders, so scrolling does not re-render the whole conversation every 64 ms.
+  const view = useRef({ y: 0, h: 0, content: 0 });
+  const [edges, setEdges] = useState({ bottom: true, top: false });
+  /**
+   * At the newest message: the list stays there when it grows (new rows, the working badge) or
+   * shrinks (keyboard, the choice card). Only the user's own scrolling leaves it; the list's own
+   * moves while it lays out rows do not.
+   */
+  const stick = useRef(true);
+  const dragging = useRef(false);
+  const measureEdges = useCallback(() => {
+    const { y, h, content } = view.current;
+    const bottom = y < 48;
+    const top = content > 0 && y + h >= content - 48;
+    if (dragging.current) stick.current = bottom;
+    setEdges((e) => (e.bottom === bottom && e.top === top ? e : { bottom, top }));
+  }, []);
+  /**
+   * Away from the newest message, the row at the top of the screen holds its place while rows under it
+   * grow or arrive (a streamed reply, a new message), as in a list that is not inverted. FlashList's own
+   * keeping anchors the row at the bottom edge, which an inverted list turns into the newest row; so it
+   * is off, and this anchors the top row's far end instead (the end that stays put while a row grows).
+   */
+  const hold = useRef<{ key: string; rel: number } | null>(null);
+  const corrected = useRef(0);
+  const captureHold = useCallback(() => {
+    const list = listRef.current;
+    if (!list) return;
+    const { endIndex } = list.computeVisibleIndices();
+    const row = list.props.data?.[endIndex];
+    const l = list.getLayout(endIndex);
+    hold.current = row && l ? { key: row.id, rel: l.y + l.height + list.getFirstItemOffset() - view.current.y } : null;
+  }, []);
+  const keepReading = useCallback(() => {
+    const list = listRef.current;
+    const h = hold.current;
+    if (!list || !h || stick.current || dragging.current || Date.now() < toTopUntil.current) return;
+    const at = list.props.data?.findIndex((r) => r.id === h.key) ?? -1;
+    const l = at < 0 ? undefined : list.getLayout(at);
+    if (!l) return;
+    const target = l.y + l.height + list.getFirstItemOffset() - h.rel;
+    if (Math.abs(target - view.current.y) < 0.5) return;
+    view.current.y = target;
+    corrected.current = Date.now();
+    list.scrollToOffset({ offset: target, animated: false });
+  }, []);
+  const onScroll = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
+      view.current = { y: contentOffset.y, h: layoutMeasurement.height, content: contentSize.height };
+      measureEdges();
+      // Re-anchor on the user's own scrolling, and on a jump once it settles; not on the echo of a correction.
+      if (dragging.current || (!stick.current && Date.now() - corrected.current > 150 && Date.now() >= toTopUntil.current)) captureHold();
+    },
+    [measureEdges, captureHold],
+  );
+  /** The user let go (no fling) or a fling stopped: take its final offset, then stop following the finger. */
+  const endScroll = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      onScroll(e);
+      dragging.current = false;
+    },
+    [onScroll],
+  );
+  /**
+   * The content or the list's height changed: keep to the top (jump to start), or back to the newest
+   * message if the user let go just short of it. At offset 0 nothing is needed: the list grows away from it.
+   */
+  const settle = useCallback(() => {
+    if (Date.now() < toTopUntil.current) listRef.current?.scrollToEnd({ animated: false });
+    else if (stick.current && !dragging.current && view.current.y > 0) {
+      listRef.current?.scrollToOffset({ offset: 0, animated: false });
+      setEdges((e) => (e.bottom ? e : { ...e, bottom: true }));
+      return;
+    }
+    measureEdges();
+  }, [measureEdges]);
+  const atBottom = edges.bottom;
+  const atTop = !more && edges.top;
+  // Unread: the newest row id when the user left the bottom; rows before it (newer) are new.
   const [anchorId, setAnchorId] = useState<string | null>(null);
-  useEffect(() => {
-    if (atBottom) setAnchorId(null);
-    else if (!anchorId && rows[0]) setAnchorId(rows[0].id);
-  }, [atBottom, anchorId, rows]);
+  const anchorNow = atBottom ? null : (anchorId ?? rows[0]?.id ?? null);
+  if (anchorNow !== anchorId) setAnchorId(anchorNow);
   const unread = anchorId ? Math.max(0, rows.findIndex((r) => r.id === anchorId)) : 0;
+  // Away from the newest message, rows that arrive wait below until the reader comes back (the jump button
+  // counts them): FlashList keeps row sizes by position, so a row inserted under a reader would shift the
+  // rows on screen for a frame or two. Rows already shown still grow in place, and keepReading holds the view.
+  const data = useMemo((): ListRow[] => [end, ...(unread ? rows.slice(unread) : rows)], [end, rows, unread]);
 
   /** Fetch one older page; returns the next cursor (null at the beginning). */
   async function fetchOlder(before: string, limit: number): Promise<{ next: string | null; count: number }> {
@@ -746,7 +884,12 @@ export function ChatView({
       busyRef.current = false;
       setJumping(null);
       toTopUntil.current = Date.now() + 4000;
+      stick.current = false;
+      hold.current = null;
       setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 120);
+      setTimeout(() => {
+        if (!stick.current && !dragging.current) captureHold();
+      }, 4100);
     }
   }
 
@@ -782,29 +925,44 @@ export function ChatView({
   return (
     <SubCtx.Provider value={subCtx}>
       <View style={{ flex: 1 }}>
-        <FlatList
+        <FlashList
           ref={listRef}
+          // Inverted, so the list opens at the newest message and holds it while a reply streams in.
           inverted
-          data={rows}
+          {...SCROLLBAR_RIGHT}
+          data={data}
           keyExtractor={(r) => r.id}
           renderItem={renderRow}
-          ItemSeparatorComponent={() => <View style={{ height: space.md }} />}
-          contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: bottomInset + space.md, paddingBottom: space.lg }}
+          getItemType={rowType}
+          ItemSeparatorComponent={RowGap}
+          CellRendererComponent={Cell}
+          maintainVisibleContentPosition={NO_MVCP}
+          onCommitLayoutEffect={keepReading}
+          contentContainerStyle={{ paddingHorizontal: space.lg, paddingBottom: space.lg }}
           // Inverted: the list "end" is the top of the conversation. Older pages append there,
-          // so the visible content keeps its offset from the bottom and nothing jumps.
+          // so what is on screen keeps its place.
           onEndReached={loadOlder}
           onEndReachedThreshold={1.5}
-          onScroll={(e) => {
-            const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
-            setView({ y: contentOffset.y, h: layoutMeasurement.height, content: contentSize.height });
-          }}
+          onScroll={onScroll}
           scrollEventThrottle={64}
-          onContentSizeChange={() => {
-            if (Date.now() < toTopUntil.current) listRef.current?.scrollToEnd({ animated: false });
+          onContentSizeChange={(_, height) => {
+            view.current.content = height;
+            settle();
+          }}
+          onLayout={(e) => {
+            view.current.h = e.nativeEvent.layout.height;
+            settle();
           }}
           onScrollBeginDrag={() => {
             toTopUntil.current = 0;
+            dragging.current = true;
           }}
+          // A slow drag ends without momentum; a fling's momentum is still the user's scroll.
+          onScrollEndDrag={endScroll}
+          onMomentumScrollBegin={() => {
+            dragging.current = true;
+          }}
+          onMomentumScrollEnd={endScroll}
           ListFooterComponent={
             more ? (
               <View style={{ alignItems: "center", paddingVertical: space.md, minHeight: 40 }}>
@@ -817,10 +975,6 @@ export function ChatView({
                 <View style={{ flex: 1, height: 1, backgroundColor: p.divider }} />
               </View>
             )
-          }
-          ListHeaderComponent={
-            // Inverted list: the header sits under the newest message. One at a time: working, or about to answer.
-            !sub && agent.status === "working" ? <WorkingBadge since={agent.statusSince} now={nowTick} /> : sends.awaiting ? <ReplyDots /> : undefined
           }
           keyboardDismissMode="interactive"
           extraData={subCtx}
@@ -840,7 +994,11 @@ export function ChatView({
               icon="arrow-collapse-down"
               label={unread ? `到最新，${unread} 条新消息` : "到最新"}
               badge={unread}
-              onPress={() => listRef.current?.scrollToOffset({ offset: 0, animated: true })}
+              onPress={() => {
+                stick.current = true;
+                dragging.current = false;
+                listRef.current?.scrollToOffset({ offset: 0, animated: true });
+              }}
             />
           ) : null}
         </View>

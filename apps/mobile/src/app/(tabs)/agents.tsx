@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Pressable, RefreshControl, SectionList, View } from "react-native";
 import { Searchbar, Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -30,6 +30,28 @@ const GROUPS: { key: GroupKey; title: string }[] = [
 ];
 
 const byRecent = (x: Agent, y: Agent) => (y.statusSince ?? y.updatedAt) - (x.statusSince ?? x.updatedAt);
+
+type Section = { key: GroupKey; title: string; count: number; folded: boolean; data: Agent[] };
+
+const ROW_GAP = { height: space.sm };
+const GROUP_END = { height: space.xs };
+/** Fixed components, so a list re-render (every relay snapshot) does not remount every separator. */
+const RowGap = () => <View style={ROW_GAP} />;
+const GroupEnd = () => <View style={GROUP_END} />;
+
+/**
+ * A number that changes once a minute: rows re-render for their "N 分钟前" even when their agent did not change.
+ * An external store rather than a state timer: the tab pauses while hidden, and on coming back the store is read
+ * again at once, so the times are right on the first frame instead of after the next tick.
+ */
+const minuteNow = () => Math.floor(Date.now() / 60_000);
+function onMinute(changed: () => void): () => void {
+  const t = setInterval(changed, 15_000);
+  return () => clearInterval(t);
+}
+function useMinute(): number {
+  return useSyncExternalStore(onMinute, minuteNow);
+}
 
 /** One compact row of three counts (需要你 / 工作中 / 已完成); tap one to filter. */
 function StatRow({ counts, active, onPick }: { counts: Record<AgentStatus, number>; active: AgentStatus | null; onPick: (s: AgentStatus | null) => void }) {
@@ -153,7 +175,7 @@ export default function AgentsHub() {
   const q = query.trim().toLowerCase();
   const match = useCallback((a: Agent) => !q || [agentTitle(a), a.harness, a.where, a.cwd, a.preview].some((s) => s?.toLowerCase().includes(q)), [q]);
 
-  const sections = useMemo(() => {
+  const sections = useMemo((): Section[] => {
     const by: Record<GroupKey, Agent[]> = { blocked: [], working: [], done: [], idle: [], offline: [] };
     for (const a of inScope) {
       if (!match(a)) continue;
@@ -179,6 +201,30 @@ export default function AgentsHub() {
   }, []);
 
   const multiHost = hosts.length > 1 && !hostFilter;
+  const minute = useMinute();
+  const renderItem = useCallback(
+    ({ item }: { item: Agent }) => <AgentRow agent={item} offline={!isOnline(item)} deviceName={multiHost ? devices[item.deviceId]?.name : undefined} minute={minute} />,
+    [devices, isOnline, minute, multiHost],
+  );
+  // Search and status filters ignore folding, so the header is a plain label there.
+  const canFold = !q && !filter;
+  const renderSectionHeader = useCallback(
+    ({ section }: { section: Section }) => (
+      <Pressable
+        disabled={!canFold}
+        accessibilityRole={canFold ? "button" : "header"}
+        accessibilityState={canFold ? { expanded: !section.folded } : undefined}
+        accessibilityLabel={`${section.title} ${section.count} 个${canFold ? `，点按${section.folded ? "展开" : "收起"}` : ""}`}
+        onPress={() => toggleGroup(section.key)}
+        style={({ pressed }) => ({ flexDirection: "row", alignItems: "center", gap: space.xs, minHeight: 44, marginTop: space.sm, paddingHorizontal: space.xs, borderRadius: radius.card, backgroundColor: pressed ? p.surface3 : "transparent" })}
+      >
+        <Text style={{ fontFamily: fonts.bodyBold, color: p.muted, fontSize: 14 }}>{section.title}</Text>
+        <Text style={{ flex: 1, fontFamily: fonts.bodyBold, color: p.faint, fontSize: 13 }}>{section.count}</Text>
+        {canFold ? <CuteIcon name={section.folded ? "chevronRight" : "chevronDown"} size={18} color={p.faint} /> : null}
+      </Pressable>
+    ),
+    [canFold, p, toggleGroup],
+  );
   const allDone = counts.blocked === 0 && counts.working === 0 && counts.done > 0;
   const headline = counts.blocked ? `有 ${counts.blocked} 个 agent 在等你` : counts.working ? `${counts.working} 个 agent 正在忙` : allDone ? "大家都忙完啦" : "大家都歇着呢";
   const hostName = hostFilter ? hosts.find((h) => h.id === hostFilter)?.name ?? "这台电脑" : null;
@@ -237,27 +283,10 @@ export default function AgentsHub() {
       <SectionList
         sections={sections}
         keyExtractor={(a) => a.key}
-        renderItem={({ item }) => <AgentRow agent={item} offline={!isOnline(item)} deviceName={multiHost ? devices[item.deviceId]?.name : undefined} />}
-        renderSectionHeader={({ section }) => {
-          // Search and status filters ignore folding, so the header is a plain label there.
-          const canFold = !q && !filter;
-          return (
-            <Pressable
-              disabled={!canFold}
-              accessibilityRole={canFold ? "button" : "header"}
-              accessibilityState={canFold ? { expanded: !section.folded } : undefined}
-              accessibilityLabel={`${section.title} ${section.count} 个${canFold ? `，点按${section.folded ? "展开" : "收起"}` : ""}`}
-              onPress={() => toggleGroup(section.key)}
-              style={({ pressed }) => ({ flexDirection: "row", alignItems: "center", gap: space.xs, minHeight: 44, marginTop: space.sm, paddingHorizontal: space.xs, borderRadius: radius.card, backgroundColor: pressed ? p.surface3 : "transparent" })}
-            >
-              <Text style={{ fontFamily: fonts.bodyBold, color: p.muted, fontSize: 14 }}>{section.title}</Text>
-              <Text style={{ flex: 1, fontFamily: fonts.bodyBold, color: p.faint, fontSize: 13 }}>{section.count}</Text>
-              {canFold ? <CuteIcon name={section.folded ? "chevronRight" : "chevronDown"} size={18} color={p.faint} /> : null}
-            </Pressable>
-          );
-        }}
-        renderSectionFooter={() => <View style={{ height: space.xs }} />}
-        ItemSeparatorComponent={() => <View style={{ height: space.sm }} />}
+        renderItem={renderItem}
+        renderSectionHeader={renderSectionHeader}
+        renderSectionFooter={GroupEnd}
+        ItemSeparatorComponent={RowGap}
         ListHeaderComponent={header}
         ListEmptyComponent={empty}
         stickySectionHeadersEnabled={false}

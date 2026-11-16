@@ -8,6 +8,7 @@ import type { AssistantConfirm, AssistantItem, AssistantState, Reminder, ServerF
 import { useSettings } from "./store";
 import { loadToken } from "./auth";
 import { isMockServer, mockAssistant } from "./mock";
+import { onAssistantConfigFrame } from "./assistantConfig";
 
 interface AssistantStore {
   items: AssistantItem[];
@@ -100,6 +101,9 @@ export function onAssistantFrame(f: ServerFrame): boolean {
       return true;
     case "assistant_reset":
       void loadAssistant();
+      return true;
+    case "assistant_config":
+      onAssistantConfigFrame(f);
       return true;
     default:
       return false;

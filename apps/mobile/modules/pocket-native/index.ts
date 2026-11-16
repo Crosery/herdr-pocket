@@ -11,17 +11,27 @@ export interface PickedImage {
   bytes: number;
 }
 
-/** Android-only native side: voice call audio, the background alert service, notifications, in-app updates, picking pictures. */
+/**
+ * Native side: voice call audio, alerts as notifications, in-app updates, picking pictures.
+ * Android (Kotlin) has all of it. iOS (Swift) has voice, pictures and notifications while
+ * the app is open; it has no background alert service (`notifierState().background` false),
+ * no battery exemption and no in-app install (`canInstallUpdates()` false, no download/install).
+ */
 interface PocketNativeModule {
   startCall(server: string, token: string): void;
   hangup(): void;
   setMuted(muted: boolean): void;
   callState(): { active: boolean; muted: boolean };
   configureNotifier(server: string | null, token: string | null, enabled: boolean, kinds: string[], name: string | null): void;
-  notifierState(): { enabled: boolean; connected: boolean; notificationsAllowed: boolean; batteryUnrestricted: boolean };
+  /** `background`: alerts also arrive with the app closed. Absent on Android, where they always do; false on iOS. */
+  notifierState(): { enabled: boolean; connected: boolean; notificationsAllowed: boolean; batteryUnrestricted: boolean; background?: boolean };
   requestBatteryExemption(): void;
   openNotificationSettings(): void;
   testNotice(title: string, body: string): void;
+  /** iOS: asks for the microphone (Android uses PermissionsAndroid). */
+  requestMicrophone?(): Promise<boolean>;
+  /** iOS: asks to show notifications (Android uses PermissionsAndroid). */
+  requestNotificationPermission?(): Promise<boolean>;
   /** In-app update (absent in builds before it existed). */
   appVersion?(): string | null;
   /** `sha256`: the APK's expected hash, or "" when unknown. */
@@ -38,7 +48,8 @@ interface PocketNativeModule {
   addListener(event: "onCallEvent", fn: (e: { json: string }) => void): EventSubscription;
   addListener(event: "onLevel", fn: (e: { mic: number; out: number }) => void): EventSubscription;
   addListener(event: "onNotice", fn: (e: { json: string }) => void): EventSubscription;
-  addListener(event: "onNotifier", fn: (e: { connected: boolean }) => void): EventSubscription;
+  /** iOS also reports `notificationsAllowed` when the person changes it in system settings. */
+  addListener(event: "onNotifier", fn: (e: { connected: boolean; notificationsAllowed?: boolean }) => void): EventSubscription;
   addListener(event: "onUpdateProgress", fn: (e: { received: number; total: number }) => void): EventSubscription;
 }
 

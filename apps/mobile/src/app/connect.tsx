@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AppState, KeyboardAvoidingView, Pressable, ScrollView, View } from "react-native";
+import { AppState, KeyboardAvoidingView, Platform, Pressable, ScrollView, View } from "react-native";
 import { Button, HelperText, Text, TextInput } from "react-native-paper";
 import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -83,7 +83,8 @@ export default function ConnectScreen() {
       <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding">
         <ScrollView
           keyboardShouldPersistTaps="handled"
-          contentContainerStyle={{ paddingTop: insets.top + space.xxl, paddingHorizontal: space.xl, paddingBottom: space.xxl, gap: space.xl }}
+          // On iOS the demo link at the end stays clear of the home indicator; Android keeps its spacing.
+          contentContainerStyle={{ paddingTop: insets.top + space.xxl, paddingHorizontal: space.xl, paddingBottom: space.xxl + (Platform.OS === "ios" ? insets.bottom : 0), gap: space.xl }}
         >
           <View style={{ alignItems: "center", gap: space.md }}>
             <Mascot size={104} mood="default" />

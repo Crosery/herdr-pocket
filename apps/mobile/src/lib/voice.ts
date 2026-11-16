@@ -212,6 +212,17 @@ function wire() {
 }
 wire();
 
+/** Asks for the microphone: Android through PermissionsAndroid, iOS through the native module (the system dialog shows the app.json wording). */
+async function micAllowed(): Promise<boolean> {
+  if (Platform.OS === "ios") return (await PocketNative?.requestMicrophone?.().catch(() => false)) ?? false;
+  const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO, {
+    title: "用麦克风和助理说话",
+    message: "通话时把你的声音发给助理，挂断后就停止。",
+    buttonPositive: "允许",
+  });
+  return granted === PermissionsAndroid.RESULTS.GRANTED;
+}
+
 /** Starts a call; resolves with an error message when it cannot. */
 export async function startCall(): Promise<string | null> {
   const server = useSettings.getState().server;
@@ -219,14 +230,10 @@ export async function startCall(): Promise<string | null> {
     startDemoCall();
     return null;
   }
-  if (!PocketNative || Platform.OS !== "android") return "这个版本的 App 还不支持语音，装一下新版";
+  if (!PocketNative || (Platform.OS !== "android" && Platform.OS !== "ios")) return "这个版本的 App 还不支持语音，装一下新版";
+  if (Platform.OS === "ios" && !PocketNative.requestMicrophone) return "这个版本的 App 还不支持语音，装一下新版";
   if (!server) return "还没连上服务器";
-  const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO, {
-    title: "用麦克风和助理说话",
-    message: "通话时把你的声音发给助理，挂断后就停止。",
-    buttonPositive: "允许",
-  });
-  if (granted !== PermissionsAndroid.RESULTS.GRANTED) return "没有麦克风权限，没法语音。可以在系统设置里打开";
+  if (!(await micAllowed())) return "没有麦克风权限，没法语音。可以在系统设置里打开";
   const token = await loadToken();
   if (!token) return "这台手机还没配对";
   useVoice.setState({ status: "connecting", message: null, muted: false, startedAt: null, ...QUIET });
