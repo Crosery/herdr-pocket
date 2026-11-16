@@ -7,6 +7,10 @@ export interface HostConfig {
   token: string;
   deviceId: string;
   name: string;
+  /** Direct links from phones on the same network or VPN (default on); `false` turns them off. */
+  direct?: boolean;
+  /** Port for direct links (default 7421; a busy one falls back to any free port). */
+  directPort?: number;
 }
 
 export const CONFIG_DIR = configDir();

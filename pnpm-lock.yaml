@@ -181,6 +181,9 @@ importers:
         specifier: ^8.18.0
         version: 8.22.1
     devDependencies:
+      '@noble/ciphers':
+        specifier: ^2.4.0
+        version: 2.4.0
       '@types/node':
         specifier: ^24.0.0
         version: 24.19.2
@@ -245,6 +248,10 @@ importers:
         version: 5.9.3
 
 packages:
+
+  '@noble/ciphers@2.4.0':
+    resolution: {integrity: sha512-AnjFn0Jv92laAkvMrghlFZq4qQCIN/4DxFV/eooqtC2YTjB7kBeLMS2T9KJX4Dn+ZVXLOwK0lSgqDtx9gvxtiw==}
+    engines: {node: '>= 20.19.0'}
 
   '@types/node@24.19.2':
     resolution: {integrity: sha512-93d49wCWJkCyN87MxLpNN6KXPCwFw7bVUg79mGUV1OS40JGWwVCr8n61DXCSqz7CV6/VfPkb7xec7uP2M+QHWQ==}
@@ -385,6 +392,8 @@ packages:
     engines: {node: '>=8'}
 
 snapshots:
+
+  '@noble/ciphers@2.4.0': {}
 
   '@types/node@24.19.2':
     dependencies:

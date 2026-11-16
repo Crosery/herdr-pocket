@@ -22,6 +22,7 @@ import { HcAdapter, type AppNames } from "./hc.ts";
 import type { ScreenLines } from "./hcscreen.ts";
 import { HerdrApp, NoDesktopApp, checkFolder, herdrCommandArgs, installedLaunchers, launcherArgv, resumeArgv, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
+import { DirectServer, type DirectPeer } from "./direct.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
 import { SessionHints } from "./sessionhint.ts";
 import { base, debounce } from "./util.ts";
@@ -112,6 +113,10 @@ export class Host {
   private callSeq = 0;
   private streamStops = new Map<string, () => void>();
   private streamMeta = new Map<string, { from: string; kind: "terminal" | "session"; agent: string }>();
+  /** Streams opened over a direct link answer there, not through the relay. */
+  private streamReply = new Map<string, (f: ClientFrame) => void>();
+  /** Phones connected straight to this computer (see direct.ts). */
+  direct: DirectServer;
   private sendQueues = new Map<string, Array<{ id: string; text: string; enter: boolean }>>();
   private queueSeq = 0;
   private stopped = false;
@@ -160,6 +165,40 @@ export class Host {
       this.logs.push(levelOf(m), "hostd", m);
     };
     this.deviceId = opts.config.deviceId;
+    this.direct = new DirectServer({
+      port: opts.config.directPort,
+      hostId: () => this.deviceId,
+      onFrame: (peer, f) => this.onDirectFrame(peer, f),
+      onClose: (peer) => this.stopStreams((id) => id.startsWith(peer.tag)),
+      log: (m) => this.log(m),
+    });
+  }
+
+  /** Direct links are on unless `"direct": false` in hostd.json or HERDR_POCKET_DIRECT=0. */
+  private async startDirect(): Promise<void> {
+    if (this.opts.config.direct === false || process.env.HERDR_POCKET_DIRECT === "0") return;
+    try {
+      await this.direct.start();
+      this.log(`direct links on port ${this.direct.port}`);
+    } catch (e) {
+      this.log(`direct links off: ${(e as Error).message}`);
+    }
+  }
+
+  /** A frame from a phone on a direct link: the same calls and streams as through the relay. */
+  private onDirectFrame(peer: DirectPeer, f: Record<string, unknown>): void {
+    const id = typeof f.id === "string" ? f.id : "";
+    if (f.type === "ping") peer.send({ type: "pong", t: f.t });
+    else if (f.type === "rpc" && id && typeof f.method === "string") {
+      void this.handleRpc({ type: "rpc", id, from: peer.deviceId, method: f.method as RpcMethod, params: f.params }, (x) => peer.send(x));
+    } else if (f.type === "stream_subscribe" && id && (f.stream === "terminal" || f.stream === "session")) {
+      const reply = (x: ClientFrame) => peer.send("id" in x && typeof x.id === "string" ? { ...x, id: x.id.slice(peer.tag.length) } : x);
+      void this.handleStreamSubscribe({ type: "stream_subscribe", id: peer.tag + id, from: peer.deviceId, stream: f.stream, params: f.params }, reply);
+    } else if (f.type === "stream_unsubscribe" && id) this.stopStream(peer.tag + id);
+  }
+
+  private stopStreams(which: (id: string) => boolean): void {
+    for (const id of [...this.streamStops.keys(), ...this.streamMeta.keys()]) if (which(id)) this.stopStream(id);
   }
 
   /** A structured line for the relay's log (not printed). */
@@ -186,6 +225,7 @@ export class Host {
     }
     this.logTimer = setInterval(() => this.flushLogs(), this.logEveryMs);
     this.logTimer.unref?.();
+    await this.startDirect();
     this.connect();
   }
 
@@ -270,9 +310,11 @@ export class Host {
     this.hc.stop();
     this.herdr.stop();
     this.uniflo.stop();
+    this.direct.stop();
     for (const stop of this.streamStops.values()) stop();
     this.streamStops.clear();
     this.streamMeta.clear();
+    this.streamReply.clear();
     this.ws?.close();
   }
 
@@ -401,9 +443,8 @@ export class Host {
       clearInterval(beat);
       if (this.ws !== ws) return;
       this.ws = null;
-      for (const stop of this.streamStops.values()) stop();
-      this.streamStops.clear();
-      this.streamMeta.clear();
+      // Streams of direct links do not need the relay.
+      this.stopStreams((id) => !this.streamReply.has(id));
       if (code === 4001) {
         this.log("this computer was removed from the relay. Run `herdr-pocket login` to pair again.");
         this.stopped = true;
@@ -440,21 +481,21 @@ export class Host {
 
   // -------------------------------------------------------------------------
 
-  private async handleRpc(f: Extract<ServerFrame, { type: "rpc" }>): Promise<void> {
+  private async handleRpc(f: Extract<ServerFrame, { type: "rpc" }>, reply: (x: ClientFrame) => void = (x) => this.send(x)): Promise<void> {
     try {
       const allow = this.opts.allow ?? [];
       if (allow.length && !allow.includes(f.from)) throw new RpcFailure("forbidden", "这台电脑没有授权给你");
       const handler = (this.handlers as Record<string, Handler<any> | undefined>)[f.method];
       if (!handler) throw new RpcFailure("unsupported", `unknown method ${f.method}`);
       const result = await handler((f.params ?? {}) as never, f.from);
-      this.send({ type: "rpc_result", id: f.id, result });
+      reply({ type: "rpc_result", id: f.id, result });
       if (MUTATING.has(f.method)) this.note("info", "rpc", `${f.method} from ${this.who(f.from)} ok`, callSummary(f.params, result));
     } catch (e) {
       const error: RpcError =
         e instanceof RpcFailure
           ? { code: e.code, message: e.message }
           : { code: "internal", message: e instanceof Error ? e.message : String(e) };
-      this.send({ type: "rpc_result", id: f.id, error });
+      reply({ type: "rpc_result", id: f.id, error });
       // Reads that find nothing are normal; anything else failing is worth a line.
       const quiet = error.code === "not_found" && !MUTATING.has(f.method);
       if (!quiet) this.note(error.code === "internal" ? "error" : "warn", "rpc", `${f.method} from ${this.who(f.from)} failed: ${error.code}: ${error.message}`, callSummary(f.params));
@@ -462,13 +503,17 @@ export class Host {
   }
 
   private sendStream(id: string, event: unknown): void {
-    this.send({ type: "stream_event", id, event });
+    const frame: ClientFrame = { type: "stream_event", id, event };
+    const reply = this.streamReply.get(id);
+    if (reply) reply(frame);
+    else this.send(frame);
   }
 
-  private async handleStreamSubscribe(f: Extract<ServerFrame, { type: "stream_subscribe" }>): Promise<void> {
+  private async handleStreamSubscribe(f: Extract<ServerFrame, { type: "stream_subscribe" }>, reply?: (x: ClientFrame) => void): Promise<void> {
+    const out = reply ?? ((x: ClientFrame) => this.send(x));
     const allow = this.opts.allow ?? [];
     if (allow.length && !allow.includes(f.from)) {
-      this.send({ type: "stream_open", id: f.id, error: { code: "forbidden", message: "这台电脑没有授权给你" } });
+      out({ type: "stream_open", id: f.id, error: { code: "forbidden", message: "这台电脑没有授权给你" } });
       return;
     }
     const p = (f.params ?? {}) as Record<string, unknown>;
@@ -481,6 +526,7 @@ export class Host {
       if (prev) this.stopStream(f.id);
       const meta = { from: f.from, kind: f.stream, agent: a.key };
       this.streamMeta.set(f.id, meta);
+      if (reply) this.streamReply.set(f.id, reply);
       if (f.stream === "terminal") {
         let stop: () => void = () => undefined;
         // `screen: false`: only queue notices (they go to every terminal stream of the agent).
@@ -515,7 +561,7 @@ export class Host {
           return;
         }
         this.streamStops.set(f.id, stop);
-        this.send({ type: "stream_open", id: f.id, result: { kind: "terminal", agent: a.key } });
+        out({ type: "stream_open", id: f.id, result: { kind: "terminal", agent: a.key } });
         return;
       }
       const sessionKey = await this.sessionOf(a.key, p.sub);
@@ -590,11 +636,12 @@ export class Host {
         clearTimeout(timer);
         offLive();
       });
-      this.send({ type: "stream_open", id: f.id, result: { kind: "session", sessionKey } });
+      out({ type: "stream_open", id: f.id, result: { kind: "session", sessionKey } });
     } catch (e) {
       const error: RpcError = e instanceof RpcFailure ? { code: e.code, message: e.message } : { code: "internal", message: String(e) };
       this.streamMeta.delete(f.id);
-      this.send({ type: "stream_open", id: f.id, error });
+      this.streamReply.delete(f.id);
+      out({ type: "stream_open", id: f.id, error });
       if (error.code !== "not_found") this.note("warn", "stream", `${f.stream} stream for ${String(agentName)} failed: ${error.code}: ${error.message}`);
     }
   }
@@ -630,6 +677,7 @@ export class Host {
     this.streamStops.get(id)?.();
     this.streamStops.delete(id);
     this.streamMeta.delete(id);
+    this.streamReply.delete(id);
   }
 
   private queueEvent(agent: string, event: unknown): void {
@@ -854,6 +902,10 @@ export class Host {
       if (!key) return { sessionKey: null, events: [], more: false, nextBefore: null };
       const r = await this.uniflo.events(key, p.limit ?? 80, p.before);
       return { sessionKey: key, events: r.events, more: r.more, nextBefore: r.nextBefore };
+    },
+    "direct.offer": async (_p, from) => {
+      if (!this.direct.port) throw new RpcFailure("unsupported", "这台电脑没有开直连");
+      return this.direct.offer(from);
     },
     "session.children": async (p) => {
       const key = await this.sessionOf(p.agent, p.sub);
