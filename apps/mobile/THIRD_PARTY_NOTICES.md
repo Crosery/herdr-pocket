@@ -4,14 +4,15 @@ The Herdr Pocket Android app is licensed under AGPL-3.0-only (see `LICENSE` at t
 
 ## On-device voice processing (`modules/pocket-native`)
 
-Call denoising, speech detection and owner voiceprint verification run locally on the phone using ONNX Runtime and three open-source models (no audio is sent elsewhere for verification).
+Call speech enhancement, speech activity detection, streaming target-speaker extraction and owner voiceprint verification run locally on the phone using ONNX Runtime and four open-source models (no audio is sent elsewhere for verification).
 
 | Component | Source | Licence |
 |---|---|---|
 | ONNX Runtime (`onnxruntime-android` 1.32.0 / `onnxruntime-objc` 1.30.0) | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) | MIT |
-| GTCRN (`gtcrn_simple.onnx`) | [Xiaobin-Rong/gtcrn](https://github.com/Xiaobin-Rong/gtcrn), packaged by [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | MIT |
+| DPDFNet (`dpdfnet_baseline.onnx`) | [Ceva-IP/DPDFNet](https://github.com/Ceva-IP/DPDFNet) | Apache-2.0 |
 | Silero VAD v4 (`silero_vad.onnx`) | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) | MIT |
-| 3D-Speaker CAM++ (`3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`, downloaded on demand) | [alibaba-damo-academy/3D-Speaker](https://github.com/modelscope/3D-Speaker) / ModelScope `iic/speech_campplus_sv_zh_en_16k-common_advanced` | Apache-2.0 |
+| 3D-Speaker ERes2NetV2 (`3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx`, downloaded on demand) | [modelscope/3D-Speaker](https://github.com/modelscope/3D-Speaker) / ModelScope `iic/speech_eres2netv2_sv_zh-cn_16k-common`, packaged by [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Apache-2.0 |
+| VoxLock v2 (`voxlock_enroll.onnx`, `voxlock_chunk_int8.onnx`, downloaded on demand) | [arbazsiddiqui/voxlock](https://huggingface.co/arbazsiddiqui/voxlock) | Apache-2.0 |
 
 ## Harness brand glyphs (`src/lib/harnessIcons.ts`)
 

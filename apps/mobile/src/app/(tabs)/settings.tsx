@@ -17,7 +17,7 @@ import { loadAssistant, setAssistantConfirm, useAssistant } from "../../lib/assi
 import { useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
 import { alertsInBackground, alertsSupported, askNotificationPermission, refreshAlertState, useAlerts } from "../../lib/alerts";
 import { checkForUpdate, currentVersion, downloadUpdate, installUpdate, resumeInstallIfAllowed, updatesSupported, useNewRelease, useUpdate } from "../../lib/update";
-import { syncNativeVoice, voiceprintSupported } from "../../lib/voice";
+import { isVoiceprintLegacy, syncNativeVoice, voiceprintSupported } from "../../lib/voice";
 import { PocketNative } from "../../../modules/pocket-native";
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
@@ -462,19 +462,22 @@ function VoiceLocalCard({ demo }: { demo: boolean }) {
   const voiceprint = useSettings((x) => x.voiceprint);
   const set = useSettings((x) => x.set);
   const ok = voiceprintSupported || demo;
+  const legacy = isVoiceprintLegacy(voiceprint) || (!demo && !voiceprint && Boolean(PocketNative?.voiceState?.()?.legacyEnrolled));
   const vpSub = !ok
     ? "需要装新版 App"
-    : !voiceprint
-      ? "未录入 · 任何人说话或外放都会传给小羊"
-      : voiceFilter
-        ? `已开启 · 已录入（约 ${Math.round(voiceprint.seconds)} 秒）`
-        : `已录入（约 ${Math.round(voiceprint.seconds)} 秒）· 暂时关闭`;
+    : legacy
+      ? "声纹引擎已升级，请重录一次"
+      : !voiceprint
+        ? "未录入 · 任何人说话或外放都会传给小羊"
+        : voiceFilter
+          ? `已开启 · 实时提取你的声纹人声（约 ${Math.round(voiceprint.seconds)} 秒）`
+          : `已录入（约 ${Math.round(voiceprint.seconds)} 秒）· 暂时关闭`;
   return (
     <Card style={{ paddingVertical: space.xs }}>
       <Row
         icon="waveform"
         title="通话降噪"
-        sub={!ok ? "需要装新版 App" : voiceDenoise ? "已开启 · 实时滤掉环境杂音" : "已关闭 · 原样传给语音模型"}
+        sub={!ok ? "需要装新版 App" : voiceDenoise ? "已开启 · 实时滤除环境杂音并增强人声清晰度" : "已关闭 · 原样传给语音模型"}
         dim={!ok}
         right={
           <Toggle

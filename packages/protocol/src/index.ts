@@ -1070,7 +1070,65 @@ export const LIVE_CLIENT_ACTIONS = [
   "playback.completed",
   "playback.stopped",
   "ping",
+  "client.ai_telemetry",
 ] as const;
+
+export type ClientAiTelemetryStage = "init" | "utterance" | "periodic" | "summary";
+
+/**
+ * Phone -> relay (`{ action: "client.ai_telemetry", data: ClientAiTelemetry }`):
+ * on-device audio DSP, VAD, speaker verification and target-speaker extraction
+ * metrics correlated with server-side call turns in `EventLog` (`live.ai`).
+ * Consumed by the relay only; never forwarded upstream to the voice service.
+ */
+export interface ClientAiTelemetry {
+  stage: ClientAiTelemetryStage;
+  route?: string;
+  models?: string[] | string;
+  denoise_model?: string;
+  tse_enabled?: boolean;
+  sv_enabled?: boolean;
+  vad_enabled?: boolean;
+  denoise_enabled?: boolean;
+  enroll_ms?: number;
+  threshold?: number;
+  prototypes_count?: number;
+  kind?: string;
+  pass?: boolean;
+  sv_score?: number;
+  sv_raw?: number;
+  sv_proto?: number;
+  sv_sess?: number;
+  sv_ms?: number;
+  used_ms?: number;
+  vad_prob?: number;
+  raw_dbfs?: number;
+  tse_dbfs?: number;
+  enh_dbfs?: number;
+  tse_atten_db?: number;
+  enh_gain_db?: number;
+  frames_in?: number;
+  frames_out?: number;
+  ws_gap_max_ms?: number;
+  dpdf_us_avg?: number;
+  dpdf_us_max?: number;
+  tse_ms_avg?: number;
+  tse_ms_max?: number;
+  tse_rtf?: number;
+  tse_overruns?: number;
+  tse_k?: number;
+  tse_bypassed?: boolean;
+  vad_speech_ratio?: number;
+  gated_ratio?: number;
+  utterances?: number;
+  pass_count?: number;
+  mute_count?: number;
+  sv_checks?: number;
+  sv_passed?: number;
+  duration_ms?: number;
+  call_ms?: number;
+  [key: string]: unknown;
+}
 
 export type LiveRelayEvent =
   | { action: "relay.state"; data: { state: "connecting" | "ready" | "closed" | "error"; message?: string } }

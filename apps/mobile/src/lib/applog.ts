@@ -11,13 +11,14 @@ import { useSettings } from "./store";
 import { loadToken } from "./auth";
 import { isMockServer } from "./mock";
 
-const MAX = 300;
-const BATCH = 150;
+const MAX = 500;
+const BATCH = 200;
 const EVERY_MS = 60_000;
 
 const ring: ClientLogEntry[] = [];
 let started = false;
 let uploading = false;
+let drainAgain = false;
 /** An older relay without /v1/logs: stop trying until the app restarts. */
 let unsupported = false;
 
@@ -49,7 +50,11 @@ export function applog(level: LogLevel, kind: string, msg: string, data?: Record
 
 /** Sends what the ring holds now; lines that could not go out wait for the next try. */
 export async function uploadAppLog(): Promise<void> {
-  if (uploading || unsupported || !ring.length) return;
+  if (unsupported || !ring.length) return;
+  if (uploading) {
+    drainAgain = true;
+    return;
+  }
   const server = useSettings.getState().server;
   if (!server || isMockServer(server)) {
     // The demo has no relay to keep it: the newest lines are enough.
@@ -57,6 +62,8 @@ export async function uploadAppLog(): Promise<void> {
     return;
   }
   uploading = true;
+  drainAgain = false;
+  let sent = false;
   const batch = ring.splice(0, BATCH);
   try {
     const token = await loadToken();
@@ -76,6 +83,7 @@ export async function uploadAppLog(): Promise<void> {
       if (res.status === 404) unsupported = true;
       // 5xx and network trouble: try again later. 4xx: the relay will not take these lines.
       else if (res.status >= 500) ring.unshift(...batch);
+      else if (res.ok) sent = true;
     } finally {
       clearTimeout(timer);
     }
@@ -84,6 +92,10 @@ export async function uploadAppLog(): Promise<void> {
     if (ring.length > MAX) ring.splice(MAX);
   } finally {
     uploading = false;
+    if (sent && !unsupported && (drainAgain || ring.length > 0)) {
+      drainAgain = false;
+      void uploadAppLog();
+    }
   }
 }
 

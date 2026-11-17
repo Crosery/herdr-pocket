@@ -10,22 +10,31 @@
 import { randomUUID } from "node:crypto";
 import { WebSocket, type RawData } from "ws";
 import { LIVE_CLIENT_ACTIONS, type LiveRelayEvent, type Notice } from "@herdr-pocket/protocol";
+import type { EventInput } from "../eventlog.ts";
 import type { Assistant } from "./assistant.ts";
 import { claimCall, releaseCall } from "./calls.ts";
 import { personaPrompt, voiceInstructions } from "./prompts.ts";
-import { RealtimeCall, type RealtimeConfig } from "./realtime.ts";
+import { CallTelemetry, RealtimeCall, type CallTelemetryOptions, type RealtimeConfig } from "./realtime.ts";
 import { clip } from "./speech.ts";
 import { timeZone } from "./timezone.ts";
 
 export { endAllCalls } from "./calls.ts";
+export { CallTelemetry, type CallTelemetryOptions };
 
 /** The voice service a call goes through. */
 export type LiveConfig = MossLiveConfig | RealtimeConfig;
 
 /** Opens a call on whichever voice service is configured. */
-export function startCall(phone: WebSocket, deviceId: string, cfg: LiveConfig, assistant: Assistant, log: (m: string) => void): void {
-  if (cfg.provider === "openai-realtime") new RealtimeCall(phone, deviceId, cfg, assistant, log);
-  else new LiveCall(phone, deviceId, cfg, assistant, log);
+export function startCall(
+  phone: WebSocket,
+  deviceId: string,
+  cfg: LiveConfig,
+  assistant: Assistant,
+  log: (m: string) => void,
+  event?: (ev: EventInput) => void,
+): void {
+  if (cfg.provider === "openai-realtime") new RealtimeCall(phone, deviceId, cfg, assistant, log, event);
+  else new LiveCall(phone, deviceId, cfg, assistant, log, event);
 }
 
 export interface MossLiveConfig {
@@ -78,6 +87,8 @@ export function cleanPhoneMessage(msg: Record<string, unknown>, turnOf: (runId: 
   const action = msg.action;
   if (typeof action !== "string" || !FROM_PHONE.has(action)) return null;
   switch (action) {
+    case "client.ai_telemetry":
+      return null;
     case "mic_state":
       return typeof msg.enabled === "boolean" ? { action, enabled: msg.enabled } : null;
     case "ping":
@@ -140,13 +151,15 @@ export class LiveCall {
   private cfg: MossLiveConfig;
   private assistant: Assistant;
   private log: (m: string) => void;
+  private telemetry: CallTelemetry;
 
-  constructor(phone: WebSocket, deviceId: string, cfg: MossLiveConfig, assistant: Assistant, log: (m: string) => void) {
+  constructor(phone: WebSocket, deviceId: string, cfg: MossLiveConfig, assistant: Assistant, log: (m: string) => void, event?: (ev: EventInput) => void) {
     this.phone = phone;
     this.deviceId = deviceId;
     this.cfg = cfg;
     this.assistant = assistant;
     this.log = log;
+    this.telemetry = new CallTelemetry({ callId: this.id, provider: "moss-live", deviceId, log, event });
     // MOSS-Live allows one open session per account: a new call replaces the old one.
     claimCall(this);
     this.toPhone({ action: "relay.state", data: { state: "connecting" } });
@@ -191,8 +204,12 @@ export class LiveCall {
     this.upstream.on("error", () => this.fail("连不上语音服务"));
 
     phone.on("message", (data, binary) => {
-      if (!this.ready || this.upstream.readyState !== WebSocket.OPEN) return;
       if (binary) {
+        if (!this.ready || this.upstream.readyState !== WebSocket.OPEN) {
+          this.telemetry.onPreReadyBinary(data);
+          return;
+        }
+        this.telemetry.onRxPcm(data);
         // 16 kHz mono PCM; audio-only sessions send it without a type prefix.
         this.upstream.send(data, { binary: true });
         return;
@@ -203,9 +220,20 @@ export class LiveCall {
       } catch {
         return;
       }
+      if (msg.action === "client.ai_telemetry") {
+        this.telemetry.onClientTelemetry(msg);
+        return;
+      }
+      if (!this.ready || this.upstream.readyState !== WebSocket.OPEN) {
+        if (msg.action === "relay.hangup") this.stop("挂断了");
+        return;
+      }
       if (msg.action === "relay.hangup") {
         this.stop("挂断了");
         return;
+      }
+      if (msg.action === "mic_state" && typeof msg.enabled === "boolean") {
+        this.telemetry.onMicState(msg.enabled);
       }
       const clean = cleanPhoneMessage(msg, (run) => this.turns.get(run));
       if (clean) this.up(this.receipt(clean));
@@ -363,6 +391,7 @@ export class LiveCall {
         if (this.noticeState === "configuring") this.noticeState = "armed";
         if (!this.ready) {
           this.ready = true;
+          this.telemetry.onReady();
           this.toPhone({ action: "relay.state", data: { state: "ready" } });
         }
         return;
@@ -374,10 +403,19 @@ export class LiveCall {
         this.tasks.delete(d.delegation_id);
         return;
       }
+      case "input.speech.started":
+        this.telemetry.onSpeechStarted(d.turn ?? d.turn_id);
+        break;
+      case "input.speech.stopped":
+        this.telemetry.onSpeechStopped(d.turn ?? d.turn_id);
+        break;
       case "input.transcript.done":
       case "input.transcript.revised":
         // One line per turn of this call; a revision replaces the first hearing.
-        if (typeof d.text === "string") this.assistant.voiceLine("user", d.text, d.turn ? `${this.id}-${String(d.turn)}` : undefined);
+        if (typeof d.text === "string") {
+          this.assistant.voiceLine("user", d.text, d.turn ? `${this.id}-${String(d.turn)}` : undefined);
+          this.telemetry.onTranscript(d.text, d.turn ?? d.turn_id, msg.action === "input.transcript.revised");
+        }
         break;
       case "output.transcript.done":
         // One line per answer (run): a turn can hold several ("我看看" and then the result).
@@ -405,6 +443,10 @@ export class LiveCall {
           this.noticeState = "speaking";
           this.noticeRun = d.run_id;
         }
+        this.telemetry.onResponseAudioStarted(
+          str(d.run_id) ? d.run_id : undefined,
+          str(d.turn_id) ? d.turn_id : d.turn !== undefined ? String(d.turn) : undefined,
+        );
         break;
       case "response.ended":
         this.answering = false;
@@ -413,6 +455,7 @@ export class LiveCall {
       case "response.interrupted":
         // Why it was cut (the person spoke, or playback timed out or failed): the first thing to look at when calls sound choppy.
         this.log(`live: answer cut${str(d.reason) ? ` (${clip(d.reason, 60)})` : ""}`);
+        this.telemetry.onResponseInterrupted(str(d.run_id) ? d.run_id : undefined, str(d.reason) ? d.reason : undefined);
         this.answering = false;
         if (d.run_id === this.playingRun) this.playingRun = "";
         this.spoke();
@@ -518,6 +561,7 @@ export class LiveCall {
   stop(why: string): void {
     if (this.ended) return;
     this.ended = true;
+    this.telemetry.onStop(why);
     releaseCall(this);
     clearTimeout(this.attachTimer);
     clearInterval(this.keepalive);

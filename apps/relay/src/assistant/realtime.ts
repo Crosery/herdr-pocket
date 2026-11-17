@@ -14,7 +14,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { WebSocket, type RawData } from "ws";
-import type { LiveRelayEvent, Notice } from "@herdr-pocket/protocol";
+import type { LiveRelayEvent, LogLevel, Notice } from "@herdr-pocket/protocol";
+import type { EventInput } from "../eventlog.ts";
 import type { Assistant } from "./assistant.ts";
 import { claimCall, releaseCall } from "./calls.ts";
 import { personaPrompt, voiceInstructions } from "./prompts.ts";
@@ -76,7 +77,633 @@ const BRIDGE = `【后台怎么交】
 系统消息里的【要告诉我的事】，现在就主动说，一句话，说过就不再提。`;
 
 const str = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
-const asBuffer = (d: RawData): Buffer => (Buffer.isBuffer(d) ? d : Array.isArray(d) ? Buffer.concat(d) : Buffer.from(d));
+const asBuffer = (d: RawData): Buffer =>
+  Buffer.isBuffer(d)
+    ? d
+    : Array.isArray(d)
+      ? d.length === 1
+        ? d[0]!
+        : Buffer.concat(d)
+      : Buffer.from(d);
+const rawByteLen = (d: RawData): number => (Array.isArray(d) ? d.reduce((n, b) => n + b.length, 0) : d instanceof ArrayBuffer ? d.byteLength : d.length);
+
+// ---------------------------------------------------------------------------
+// Server-side PCM16 16 kHz stream continuity + client AI inference telemetry
+// ---------------------------------------------------------------------------
+
+/** 16 kHz mono PCM16 LE: 16 samples/ms * 2 bytes = 32 bytes/ms; 10 ms hop = 160 samples. */
+const MIC_BYTES_PER_MS = 32;
+const MIC_HOP_SAMPLES = 160;
+const FULL_SCALE = 32768;
+const SILENCE_DBFS = -100;
+const AI_RATE_MAX_PER_MIN = 60;
+const AI_RATE_WINDOW_MS = 60_000;
+const RX_WINDOW_MS = 10_000;
+const RECENT_HOPS = 200; // 2.0 s rolling window at 10 ms/hop
+const FORBIDDEN_AI_KEYS = new Set(["action", "text", "transcript", "previous", "prompt", "instructions"]);
+const SAFE_KEY = /^[a-z][a-z0-9_]{0,39}$/i;
+
+const normZero = (n: number): number => (Object.is(n, -0) ? 0 : n);
+const round1 = (n: number): number => normZero(Math.round(n * 10) / 10);
+const round2 = (n: number): number => normZero(Math.round(n * 100) / 100);
+const round3 = (n: number): number => normZero(Math.round(n * 1000) / 1000);
+const cleanStr = (s: string, max: number): string => Array.from(s.replace(/\s+/g, " ").trim()).slice(0, max).join("");
+
+function rmsDbfs(sumSq: number, samples: number): number {
+  if (samples <= 0 || sumSq <= 0) return SILENCE_DBFS;
+  return round2(Math.max(SILENCE_DBFS, 20 * Math.log10(Math.sqrt(sumSq / samples) / FULL_SCALE)));
+}
+
+function peakDbfs(peak: number): number {
+  if (peak <= 0) return SILENCE_DBFS;
+  return round2(Math.max(SILENCE_DBFS, 20 * Math.log10(peak / FULL_SCALE)));
+}
+
+interface RxBucket {
+  frames: number;
+  bytes: number;
+  gapMaxMs: number;
+  gapsOver80: number;
+  hops: number;
+  zeroHops: number;
+  activeSumSq: number;
+  activeSamples: number;
+  peak: number;
+  clipped: number;
+}
+
+const emptyBucket = (): RxBucket => ({
+  frames: 0,
+  bytes: 0,
+  gapMaxMs: 0,
+  gapsOver80: 0,
+  hops: 0,
+  zeroHops: 0,
+  activeSumSq: 0,
+  activeSamples: 0,
+  peak: 0,
+  clipped: 0,
+});
+
+interface ClientAiState {
+  route?: string;
+  denoise_model?: string;
+  tse_enabled?: boolean;
+  sv_enabled?: boolean;
+  denoise_enabled?: boolean;
+  threshold?: number;
+  prototypes_count?: number;
+  enroll_ms?: number;
+  sv_score?: number;
+  sv_raw?: number;
+  sv_proto?: number;
+  sv_sess?: number;
+  sv_ms?: number;
+  pass?: boolean;
+  tse_atten_db?: number;
+  raw_dbfs?: number;
+  tse_dbfs?: number;
+  enh_dbfs?: number;
+  enh_gain_db?: number;
+  dpdf_us_avg?: number;
+  dpdf_us_max?: number;
+  tse_ms_avg?: number;
+  tse_ms_max?: number;
+  tse_rtf?: number;
+  tse_overruns?: number;
+  ws_gap_max_ms?: number;
+  vad_speech_ratio?: number;
+  gated_ratio?: number;
+}
+
+export interface CallTelemetryOptions {
+  callId: string;
+  provider: "moss-live" | "openai-realtime";
+  deviceId: string;
+  log: (m: string) => void;
+  event?: (ev: EventInput) => void;
+  now?: () => number;
+  /** Periodic incoming PCM window interval in ms; 0 disables the background timer (for deterministic tests). */
+  windowMs?: number;
+}
+
+/**
+ * Correlates server-side 16 kHz PCM stream continuity/clarity, upstream VAD/ASR/TTFA/barge-in
+ * timings, and the phone's `client.ai_telemetry` inference diagnostics under `kind: "live.ai"`.
+ * Raw user/assistant transcript words are never written to `EventLog`.
+ */
+export class CallTelemetry {
+  readonly callId: string;
+  readonly provider: "moss-live" | "openai-realtime";
+  private now: () => number;
+  private emit: (ev: EventInput) => void;
+  private startedAt: number;
+  private ready = false;
+  private stopped = false;
+  private micMuted = false;
+  private windowTimer: NodeJS.Timeout | null = null;
+
+  private preReadyDroppedBytes = 0;
+  private lastRxAt = 0;
+  private win: RxBucket = emptyBucket();
+  private total: RxBucket = emptyBucket();
+
+  private recentSumSq = new Float64Array(RECENT_HOPS);
+  private recentSamples = new Int32Array(RECENT_HOPS);
+  private recentPos = 0;
+  private recentTotalSumSq = 0;
+  private recentTotalSamples = 0;
+
+  private turn = 0;
+  private seenTurns = new Set<string>();
+  private userSpeaking = false;
+  private speechStartAt = 0;
+  private speechStoppedAt = 0;
+  private lastSpeechMs: number | undefined;
+  private turnActiveSumSq = 0;
+  private turnActiveSamples = 0;
+  private turnAsrRecorded = false;
+  private turnTtfaRecorded = false;
+  private asrSamples: number[] = [];
+  private ttfaSamples: number[] = [];
+  private interruptions = 0;
+
+  private lastAi: ClientAiState = {};
+  private clientAiEvents = 0;
+  private clientAiDropped = 0;
+  private aiRateSince = 0;
+  private aiRateCount = 0;
+  private aiRateNoted = false;
+
+  constructor(opts: CallTelemetryOptions) {
+    this.callId = opts.callId;
+    this.provider = opts.provider;
+    this.now = opts.now ?? Date.now;
+    this.startedAt = this.now();
+    this.emit = opts.event
+      ? (ev) => opts.event!({ device: opts.deviceId, ...ev })
+      : (ev) => {
+          const extra = ev.data ? ` ${JSON.stringify(ev.data)}` : "";
+          opts.log(`${ev.kind}: ${ev.msg}${extra}`);
+        };
+    const winMs = opts.windowMs ?? RX_WINDOW_MS;
+    if (winMs > 0) {
+      this.windowTimer = setInterval(() => this.flushWindow(), winMs);
+      this.windowTimer.unref?.();
+    }
+  }
+
+  onReady(): void {
+    this.ready = true;
+  }
+
+  onMicState(enabled: boolean): void {
+    this.micMuted = !enabled;
+    this.lastRxAt = 0;
+  }
+
+  onPreReadyBinary(data: RawData): void {
+    this.preReadyDroppedBytes += rawByteLen(data);
+  }
+
+  /** Zero-copy PCM16 LE 16 kHz frame inspection (< 5 microseconds for a 20 ms frame). */
+  onRxPcm(data: RawData): void {
+    const buf = asBuffer(data);
+    const t = this.now();
+    if (!this.micMuted && this.lastRxAt > 0) {
+      const gap = Math.max(0, t - this.lastRxAt);
+      if (gap > this.win.gapMaxMs) this.win.gapMaxMs = gap;
+      if (gap > this.total.gapMaxMs) this.total.gapMaxMs = gap;
+      if (gap > 80) {
+        this.win.gapsOver80++;
+        this.total.gapsOver80++;
+      }
+    }
+    this.lastRxAt = this.micMuted ? 0 : t;
+
+    this.win.frames++;
+    this.total.frames++;
+    this.win.bytes += buf.length;
+    this.total.bytes += buf.length;
+
+    const nSamples = buf.length >> 1;
+    let idx = 0;
+    while (idx < nSamples) {
+      const end = idx + MIC_HOP_SAMPLES <= nSamples ? idx + MIC_HOP_SAMPLES : nSamples;
+      const hopLen = end - idx;
+      let hopSumSq = 0;
+      let hopPeak = 0;
+      let hopClipped = 0;
+      let hopZero = true;
+      for (let i = idx; i < end; i++) {
+        const off = i << 1;
+        const s = ((buf[off]! | (buf[off + 1]! << 8)) << 16) >> 16;
+        if (s !== 0) {
+          hopZero = false;
+          const a = s < 0 ? -s : s;
+          if (a > hopPeak) hopPeak = a;
+          if (a >= 32767) hopClipped++;
+          hopSumSq += s * s;
+        }
+      }
+      this.win.hops++;
+      this.total.hops++;
+      if (hopZero) {
+        this.win.zeroHops++;
+        this.total.zeroHops++;
+        this.pushRecentHop(0, 0);
+      } else {
+        this.win.activeSumSq += hopSumSq;
+        this.win.activeSamples += hopLen;
+        this.total.activeSumSq += hopSumSq;
+        this.total.activeSamples += hopLen;
+        if (hopPeak > this.win.peak) this.win.peak = hopPeak;
+        if (hopPeak > this.total.peak) this.total.peak = hopPeak;
+        this.win.clipped += hopClipped;
+        this.total.clipped += hopClipped;
+        if (this.userSpeaking) {
+          this.turnActiveSumSq += hopSumSq;
+          this.turnActiveSamples += hopLen;
+        }
+        this.pushRecentHop(hopSumSq, hopLen);
+      }
+      idx = end;
+    }
+  }
+
+  private pushRecentHop(sumSq: number, samples: number): void {
+    const p = this.recentPos;
+    this.recentTotalSumSq += sumSq - this.recentSumSq[p]!;
+    this.recentTotalSamples += samples - this.recentSamples[p]!;
+    if (this.recentTotalSamples <= 0) {
+      this.recentTotalSamples = 0;
+      this.recentTotalSumSq = 0;
+    } else if (this.recentTotalSumSq < 0) {
+      this.recentTotalSumSq = 0;
+    }
+    this.recentSumSq[p] = sumSq;
+    this.recentSamples[p] = samples;
+    this.recentPos = (p + 1) % RECENT_HOPS;
+  }
+
+  private recentActiveDbfs(): number {
+    return rmsDbfs(this.recentTotalSumSq, this.recentTotalSamples);
+  }
+
+  private aiSnapshot(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    if (this.lastAi.route !== undefined) out.route = this.lastAi.route;
+    if (this.lastAi.sv_score !== undefined) out.sv_score = this.lastAi.sv_score;
+    if (this.lastAi.tse_atten_db !== undefined) out.tse_atten_db = this.lastAi.tse_atten_db;
+    if (this.lastAi.enh_dbfs !== undefined) out.enh_dbfs = this.lastAi.enh_dbfs;
+    if (this.lastAi.tse_rtf !== undefined) out.tse_rtf = this.lastAi.tse_rtf;
+    return out;
+  }
+
+  private syncTurn(rawTurn?: unknown, advance = false): void {
+    if (typeof rawTurn === "number" && Number.isFinite(rawTurn) && rawTurn > 0) {
+      this.turn = Math.floor(rawTurn);
+      this.seenTurns.add(String(this.turn));
+      return;
+    }
+    if (typeof rawTurn === "string" && rawTurn.trim() !== "") {
+      const trimmed = rawTurn.trim();
+      if (/^\d+$/.test(trimmed) && Number(trimmed) > 0) this.turn = Number(trimmed);
+      else if (advance || this.turn === 0) this.turn++;
+      this.seenTurns.add(trimmed);
+      return;
+    }
+    if (advance || this.turn === 0) this.turn++;
+    this.seenTurns.add(String(this.turn));
+  }
+
+  /** Flushes the current 10s incoming PCM window if active frames arrived. */
+  flushWindow(): void {
+    if (!this.ready || this.stopped || this.win.frames === 0) return;
+    const w = this.win;
+    const rxAudioMs = round1(w.bytes / MIC_BYTES_PER_MS);
+    const rxGapMaxMs = Math.round(w.gapMaxMs);
+    const rxZeroRatio = w.hops > 0 ? round3(w.zeroHops / w.hops) : 0;
+    const rxActiveDbfs = rmsDbfs(w.activeSumSq, w.activeSamples);
+    const rxPeakDbfs = peakDbfs(w.peak);
+    const data: Record<string, unknown> = {
+      callId: this.callId,
+      provider: this.provider,
+      stage: "rx_window",
+      turn: this.turn,
+      rx_frames: w.frames,
+      rx_audio_ms: rxAudioMs,
+      rx_gap_max_ms: rxGapMaxMs,
+      rx_gaps_over_80ms: w.gapsOver80,
+      rx_zero_ratio: rxZeroRatio,
+      rx_active_dbfs: rxActiveDbfs,
+      rx_peak_dbfs: rxPeakDbfs,
+      rx_clipped_samples: w.clipped,
+      ...this.aiSnapshot(),
+    };
+    const level: LogLevel = w.gapsOver80 > 0 || rxGapMaxMs > 150 ? "warn" : "info";
+    this.emit({
+      kind: "live.ai",
+      level,
+      msg: `rx 10s audio=${rxAudioMs}ms gap_max=${rxGapMaxMs}ms gaps80=${w.gapsOver80} dbfs=${rxActiveDbfs} zero=${rxZeroRatio}`,
+      data,
+    });
+    this.win = emptyBucket();
+  }
+
+  /** Ingests a `client.ai_telemetry` message from the phone (never forwarded upstream). */
+  onClientTelemetry(msg: Record<string, unknown>): void {
+    const raw = msg.data && typeof msg.data === "object" && !Array.isArray(msg.data) ? (msg.data as Record<string, unknown>) : msg;
+    const stage = typeof raw.stage === "string" && raw.stage.trim() !== "" ? cleanStr(raw.stage, 24) : "telemetry";
+    const sanitized: Record<string, unknown> = {};
+    let keys = 0;
+    for (const [k, v] of Object.entries(raw)) {
+      if (keys >= 36) break;
+      if (!SAFE_KEY.test(k) || FORBIDDEN_AI_KEYS.has(k.toLowerCase())) continue;
+      if (typeof v === "number" && Number.isFinite(v)) {
+        sanitized[k] = round3(v);
+        keys++;
+      } else if (typeof v === "boolean") {
+        sanitized[k] = v;
+        keys++;
+      } else if (typeof v === "string" && v.trim() !== "") {
+        sanitized[k] = cleanStr(v, 64);
+        keys++;
+      } else if (Array.isArray(v) && v.every((x) => typeof x === "string")) {
+        const joined = cleanStr(v.join(","), 80);
+        if (joined) {
+          sanitized[k] = joined;
+          keys++;
+        }
+      }
+    }
+
+    if (typeof sanitized.route === "string") this.lastAi.route = sanitized.route;
+    if (typeof sanitized.denoise_model === "string") this.lastAi.denoise_model = sanitized.denoise_model;
+    if (typeof sanitized.tse_enabled === "boolean") this.lastAi.tse_enabled = sanitized.tse_enabled;
+    if (typeof sanitized.sv_enabled === "boolean") this.lastAi.sv_enabled = sanitized.sv_enabled;
+    if (typeof sanitized.denoise_enabled === "boolean") this.lastAi.denoise_enabled = sanitized.denoise_enabled;
+    if (typeof sanitized.threshold === "number") this.lastAi.threshold = sanitized.threshold;
+    if (typeof sanitized.prototypes_count === "number") this.lastAi.prototypes_count = sanitized.prototypes_count;
+    if (typeof sanitized.enroll_ms === "number") this.lastAi.enroll_ms = sanitized.enroll_ms;
+    if (typeof sanitized.sv_score === "number") this.lastAi.sv_score = sanitized.sv_score;
+    if (typeof sanitized.sv_raw === "number") this.lastAi.sv_raw = sanitized.sv_raw;
+    if (typeof sanitized.sv_proto === "number") this.lastAi.sv_proto = sanitized.sv_proto;
+    if (typeof sanitized.sv_sess === "number") this.lastAi.sv_sess = sanitized.sv_sess;
+    if (typeof sanitized.sv_ms === "number") this.lastAi.sv_ms = sanitized.sv_ms;
+    if (typeof sanitized.pass === "boolean") this.lastAi.pass = sanitized.pass;
+    if (typeof sanitized.tse_atten_db === "number") this.lastAi.tse_atten_db = sanitized.tse_atten_db;
+    if (typeof sanitized.raw_dbfs === "number") this.lastAi.raw_dbfs = sanitized.raw_dbfs;
+    if (typeof sanitized.tse_dbfs === "number") this.lastAi.tse_dbfs = sanitized.tse_dbfs;
+    if (typeof sanitized.enh_dbfs === "number") this.lastAi.enh_dbfs = sanitized.enh_dbfs;
+    if (typeof sanitized.enh_gain_db === "number") this.lastAi.enh_gain_db = sanitized.enh_gain_db;
+    if (typeof sanitized.dpdf_us_avg === "number") this.lastAi.dpdf_us_avg = sanitized.dpdf_us_avg;
+    if (typeof sanitized.dpdf_us_max === "number") this.lastAi.dpdf_us_max = sanitized.dpdf_us_max;
+    if (typeof sanitized.tse_ms_avg === "number") this.lastAi.tse_ms_avg = sanitized.tse_ms_avg;
+    if (typeof sanitized.tse_ms_max === "number") this.lastAi.tse_ms_max = sanitized.tse_ms_max;
+    if (typeof sanitized.tse_rtf === "number") this.lastAi.tse_rtf = sanitized.tse_rtf;
+    if (typeof sanitized.tse_overruns === "number") this.lastAi.tse_overruns = sanitized.tse_overruns;
+    if (typeof sanitized.ws_gap_max_ms === "number") this.lastAi.ws_gap_max_ms = sanitized.ws_gap_max_ms;
+    if (typeof sanitized.vad_speech_ratio === "number") this.lastAi.vad_speech_ratio = sanitized.vad_speech_ratio;
+    if (typeof sanitized.gated_ratio === "number") this.lastAi.gated_ratio = sanitized.gated_ratio;
+
+    this.clientAiEvents++;
+    const t = this.now();
+    if (t - this.aiRateSince >= AI_RATE_WINDOW_MS) {
+      this.aiRateSince = t;
+      this.aiRateCount = 0;
+      this.aiRateNoted = false;
+    }
+    if (this.aiRateCount >= AI_RATE_MAX_PER_MIN) {
+      this.clientAiDropped++;
+      if (!this.aiRateNoted) {
+        this.aiRateNoted = true;
+        this.emit({
+          kind: "live.ai",
+          level: "warn",
+          msg: `client.ai rate limited (>${AI_RATE_MAX_PER_MIN}/min), dropping excess frames`,
+          data: { callId: this.callId, provider: this.provider, stage: "rate_limited", turn: this.turn },
+        });
+      }
+      return;
+    }
+    this.aiRateCount++;
+
+    const overruns = typeof sanitized.tse_overruns === "number" ? sanitized.tse_overruns : 0;
+    const rtf = typeof sanitized.tse_rtf === "number" ? sanitized.tse_rtf : 0;
+    const gapMax = typeof sanitized.ws_gap_max_ms === "number" ? sanitized.ws_gap_max_ms : 0;
+    const level: LogLevel = overruns > 0 || rtf > 0.85 || gapMax > 150 ? "warn" : "info";
+
+    const msgText =
+      stage === "init"
+        ? `client.ai init route=${sanitized.route ?? "-"} tse=${sanitized.tse_enabled ?? "-"} sv=${sanitized.sv_enabled ?? "-"}`
+        : stage === "utterance"
+          ? `client.ai utterance pass=${sanitized.pass ?? "-"} sv=${sanitized.sv_score ?? "-"} atten=${sanitized.tse_atten_db ?? "-"}dB enh=${sanitized.enh_dbfs ?? "-"}dBFS`
+          : stage === "periodic"
+            ? `client.ai periodic rtf=${sanitized.tse_rtf ?? "-"} dpdf=${sanitized.dpdf_us_avg ?? "-"}us gap_max=${sanitized.ws_gap_max_ms ?? "-"}ms`
+            : stage === "summary"
+              ? `client.ai summary frames=${sanitized.frames_out ?? sanitized.frames_in ?? "-"} rtf=${sanitized.tse_rtf ?? "-"} overruns=${overruns}`
+              : `client.ai ${stage}`;
+
+    this.emit({
+      kind: "live.ai",
+      level,
+      msg: msgText,
+      data: {
+        callId: this.callId,
+        provider: this.provider,
+        turn: this.turn,
+        ...sanitized,
+        stage,
+      },
+    });
+  }
+
+  onSpeechStarted(rawTurn?: unknown): void {
+    this.syncTurn(rawTurn, true);
+    const t = this.now();
+    this.speechStartAt = t;
+    this.speechStoppedAt = 0;
+    this.lastSpeechMs = undefined;
+    this.turnAsrRecorded = false;
+    this.turnTtfaRecorded = false;
+    this.userSpeaking = true;
+    this.turnActiveSumSq = this.recentTotalSumSq;
+    this.turnActiveSamples = this.recentTotalSamples;
+    const rxActiveDbfs = this.recentActiveDbfs();
+    this.emit({
+      kind: "live.ai",
+      level: "info",
+      msg: `speech started turn=${this.turn} dbfs=${rxActiveDbfs} sv=${this.lastAi.sv_score ?? "-"}`,
+      data: {
+        callId: this.callId,
+        provider: this.provider,
+        stage: "speech_started",
+        turn: this.turn,
+        rx_active_dbfs: rxActiveDbfs,
+        ...this.aiSnapshot(),
+      },
+    });
+  }
+
+  onSpeechStopped(rawTurn?: unknown): void {
+    this.syncTurn(rawTurn, false);
+    const t = this.now();
+    this.userSpeaking = false;
+    this.speechStoppedAt = t;
+    const speechMs = this.speechStartAt > 0 ? Math.max(0, t - this.speechStartAt) : undefined;
+    this.lastSpeechMs = speechMs;
+    const rxActiveDbfs = this.turnActiveSamples > 0 ? rmsDbfs(this.turnActiveSumSq, this.turnActiveSamples) : this.recentActiveDbfs();
+    this.emit({
+      kind: "live.ai",
+      level: "info",
+      msg: `speech stopped turn=${this.turn} speech=${speechMs ?? "-"}ms dbfs=${rxActiveDbfs}`,
+      data: {
+        callId: this.callId,
+        provider: this.provider,
+        stage: "speech_stopped",
+        turn: this.turn,
+        ...(speechMs !== undefined ? { speech_ms: speechMs } : {}),
+        rx_active_dbfs: rxActiveDbfs,
+        ...this.aiSnapshot(),
+      },
+    });
+  }
+
+  /** Records ASR turn completion/revision with char count & latencies (never raw user speech words). */
+  onTranscript(text: string, rawTurn?: unknown, revised = false): void {
+    this.syncTurn(rawTurn, false);
+    const t = this.now();
+    const chars = Array.from(text).length;
+    const speechMs = this.lastSpeechMs ?? (this.speechStartAt > 0 ? Math.max(0, (this.speechStoppedAt || t) - this.speechStartAt) : undefined);
+    const asrMs = this.speechStoppedAt > 0 ? Math.max(0, t - this.speechStoppedAt) : undefined;
+    if (!revised && !this.turnAsrRecorded) {
+      this.turnAsrRecorded = true;
+      if (asrMs !== undefined) this.asrSamples.push(asrMs);
+    }
+    const rxActiveDbfs = this.turnActiveSamples > 0 ? rmsDbfs(this.turnActiveSumSq, this.turnActiveSamples) : this.recentActiveDbfs();
+    this.emit({
+      kind: "live.ai",
+      level: asrMs !== undefined && asrMs > 2500 ? "warn" : "info",
+      msg: `asr ${revised ? "revised" : "done"} turn=${this.turn} chars=${chars} asr=${asrMs ?? "-"}ms speech=${speechMs ?? "-"}ms`,
+      data: {
+        callId: this.callId,
+        provider: this.provider,
+        stage: revised ? "asr_revised" : "asr_done",
+        turn: this.turn,
+        chars,
+        ...(speechMs !== undefined ? { speech_ms: speechMs } : {}),
+        ...(asrMs !== undefined ? { asr_ms: asrMs } : {}),
+        rx_active_dbfs: rxActiveDbfs,
+        ...this.aiSnapshot(),
+      },
+    });
+  }
+
+  onResponseAudioStarted(runId?: string, turnId?: string): void {
+    const t = this.now();
+    let ttfaMs: number | undefined;
+    if (this.speechStoppedAt > 0 && !this.turnTtfaRecorded) {
+      ttfaMs = Math.max(0, t - this.speechStoppedAt);
+      this.turnTtfaRecorded = true;
+      this.ttfaSamples.push(ttfaMs);
+    }
+    this.emit({
+      kind: "live.ai",
+      level: ttfaMs !== undefined && ttfaMs > 3000 ? "warn" : "info",
+      msg: `response audio started turn=${this.turn}${runId ? ` run=${cleanStr(runId, 32)}` : ""}${ttfaMs !== undefined ? ` ttfa=${ttfaMs}ms` : ""}`,
+      data: {
+        callId: this.callId,
+        provider: this.provider,
+        stage: "ttfa",
+        turn: this.turn,
+        ...(runId ? { run_id: cleanStr(runId, 64) } : {}),
+        ...(turnId ? { turn_id: cleanStr(turnId, 64) } : {}),
+        ...(ttfaMs !== undefined ? { ttfa_ms: ttfaMs } : {}),
+        ...(this.lastSpeechMs !== undefined ? { speech_ms: this.lastSpeechMs } : {}),
+      },
+    });
+  }
+
+  onResponseInterrupted(runId?: string, reason?: string): void {
+    this.interruptions++;
+    const cleanReason = reason ? cleanStr(reason, 60) : "interrupted";
+    const level: LogLevel = /timeout|error|fail|stall|disconnect/i.test(cleanReason) ? "warn" : "info";
+    const rxActiveDbfs = this.recentActiveDbfs();
+    this.emit({
+      kind: "live.ai",
+      level,
+      msg: `response interrupted reason=${cleanReason} dbfs=${rxActiveDbfs} sv=${this.lastAi.sv_score ?? "-"}`,
+      data: {
+        callId: this.callId,
+        provider: this.provider,
+        stage: "interrupted",
+        turn: this.turn,
+        reason: cleanReason,
+        ...(runId ? { run_id: cleanStr(runId, 64) } : {}),
+        rx_active_dbfs: rxActiveDbfs,
+        ...(this.lastAi.sv_score !== undefined ? { last_sv_score: this.lastAi.sv_score, sv_score: this.lastAi.sv_score } : {}),
+        ...(this.lastAi.tse_atten_db !== undefined ? { last_tse_atten_db: this.lastAi.tse_atten_db, tse_atten_db: this.lastAi.tse_atten_db } : {}),
+        ...(this.lastAi.route !== undefined ? { route: this.lastAi.route } : {}),
+      },
+    });
+  }
+
+  onStop(why: string): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.windowTimer) {
+      clearInterval(this.windowTimer);
+      this.windowTimer = null;
+    }
+    const durationMs = Math.max(0, this.now() - this.startedAt);
+    const tot = this.total;
+    const rxAudioMs = round1(tot.bytes / MIC_BYTES_PER_MS);
+    const preReadyDroppedMs = round1(this.preReadyDroppedBytes / MIC_BYTES_PER_MS);
+    const rxGapMaxMs = Math.round(tot.gapMaxMs);
+    const rxZeroRatio = tot.hops > 0 ? round3(tot.zeroHops / tot.hops) : 0;
+    const rxActiveDbfs = rmsDbfs(tot.activeSumSq, tot.activeSamples);
+    const rxPeakDbfs = peakDbfs(tot.peak);
+    const asrAvg = this.asrSamples.length ? Math.round(this.asrSamples.reduce((a, b) => a + b, 0) / this.asrSamples.length) : undefined;
+    const asrMax = this.asrSamples.length ? Math.max(...this.asrSamples) : undefined;
+    const ttfaAvg = this.ttfaSamples.length ? Math.round(this.ttfaSamples.reduce((a, b) => a + b, 0) / this.ttfaSamples.length) : undefined;
+    const ttfaMax = this.ttfaSamples.length ? Math.max(...this.ttfaSamples) : undefined;
+
+    const aiSummary: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(this.lastAi)) if (v !== undefined) aiSummary[k] = v;
+    if (this.clientAiEvents > 0) aiSummary.client_ai_events = this.clientAiEvents;
+    if (this.clientAiDropped > 0) aiSummary.client_ai_dropped = this.clientAiDropped;
+
+    const cleanWhy = cleanStr(why, 80);
+    const trouble = tot.gapsOver80 > 3 || (this.lastAi.tse_overruns ?? 0) > 0 || /error|fail|拒绝|连不上|没有及时响应/i.test(cleanWhy);
+    this.emit({
+      kind: "live.ai",
+      level: trouble ? "warn" : "info",
+      msg: `call summary dur=${durationMs}ms turns=${this.seenTurns.size} rx=${rxAudioMs}ms gap_max=${rxGapMaxMs}ms cuts=${this.interruptions} (${cleanWhy})`,
+      data: {
+        callId: this.callId,
+        provider: this.provider,
+        stage: "call_summary",
+        reason: cleanWhy,
+        duration_ms: durationMs,
+        turns: this.seenTurns.size,
+        rx_frames: tot.frames,
+        rx_audio_ms: rxAudioMs,
+        pre_ready_dropped_ms: preReadyDroppedMs,
+        rx_gap_max_ms: rxGapMaxMs,
+        rx_gaps_over_80ms: tot.gapsOver80,
+        rx_zero_ratio: rxZeroRatio,
+        rx_active_dbfs: rxActiveDbfs,
+        rx_peak_dbfs: rxPeakDbfs,
+        rx_clipped_samples: tot.clipped,
+        ...(asrAvg !== undefined ? { asr_avg_ms: asrAvg, asr_max_ms: asrMax } : {}),
+        ...(ttfaAvg !== undefined ? { ttfa_avg_ms: ttfaAvg, ttfa_max_ms: ttfaMax } : {}),
+        interruptions: this.interruptions,
+        ...aiSummary,
+      },
+    });
+  }
+}
 
 /** Linear resampler for mono PCM16 little-endian that keeps its place between chunks. */
 export class Resampler {
@@ -183,13 +810,15 @@ export class RealtimeCall {
   private cfg: RealtimeConfig;
   private assistant: Assistant;
   private log: (m: string) => void;
+  private telemetry: CallTelemetry;
 
-  constructor(phone: WebSocket, deviceId: string, cfg: RealtimeConfig, assistant: Assistant, log: (m: string) => void) {
+  constructor(phone: WebSocket, deviceId: string, cfg: RealtimeConfig, assistant: Assistant, log: (m: string) => void, event?: (ev: EventInput) => void) {
     this.phone = phone;
     this.deviceId = deviceId;
     this.cfg = cfg;
     this.assistant = assistant;
     this.log = log;
+    this.telemetry = new CallTelemetry({ callId: this.id, provider: "openai-realtime", deviceId, log, event });
     this.ga = cfg.dialect !== "beta";
     this.outRate = cfg.outputRate ?? 24_000;
     this.mic = new Resampler(PHONE_MIC_RATE, cfg.inputRate ?? 24_000);
@@ -230,8 +859,13 @@ export class RealtimeCall {
 
     phone.on("message", (data, binary) => {
       if (binary) {
-        if (!this.ready || this.upstream.readyState !== WebSocket.OPEN) return;
-        const pcm = this.mic.push(asBuffer(data));
+        if (!this.ready || this.upstream.readyState !== WebSocket.OPEN) {
+          this.telemetry.onPreReadyBinary(data);
+          return;
+        }
+        const buf = asBuffer(data);
+        this.telemetry.onRxPcm(buf);
+        const pcm = this.mic.push(buf);
         if (pcm.length) this.up({ type: "input_audio_buffer.append", audio: pcm.toString("base64") });
         return;
       }
@@ -242,6 +876,12 @@ export class RealtimeCall {
         return;
       }
       switch (msg.action) {
+        case "client.ai_telemetry":
+          this.telemetry.onClientTelemetry(msg);
+          return;
+        case "mic_state":
+          if (typeof msg.enabled === "boolean") this.telemetry.onMicState(msg.enabled);
+          return;
         case "relay.hangup":
           this.stop("挂断了");
           return;
@@ -252,9 +892,9 @@ export class RealtimeCall {
           return;
         }
         case "playback.stopped":
-          this.settle(String(msg.run_id), msg.played_audio_ms);
+          this.settle(String(msg.run_id), msg.played_audio_ms, msg.reason);
           return;
-        // mic_state, ping and chunk receipts: the service needs none of them.
+        // ping and chunk receipts: the service needs none of them.
       }
     });
     phone.on("close", () => this.stop("手机断开了"));
@@ -408,12 +1048,14 @@ export class RealtimeCall {
         if (!this.ready) {
           clearTimeout(this.attachTimer);
           this.ready = true;
+          this.telemetry.onReady();
           this.toPhone({ action: "relay.state", data: { state: "ready" } });
         }
         return;
       case "input_audio_buffer.speech_started": {
         this.userSpeaking = true;
         this.turn++;
+        this.telemetry.onSpeechStarted(this.turn);
         if (str(d.item_id)) this.cap(this.turnOf, 200).set(d.item_id, this.turn);
         // The person talks over the answer: the phone stops it now and says how much was heard.
         const now = Date.now();
@@ -430,6 +1072,7 @@ export class RealtimeCall {
       case "input_audio_buffer.speech_stopped":
         this.userSpeaking = false;
         this.speechStoppedAt = Date.now();
+        this.telemetry.onSpeechStopped(this.turn);
         // Held-back work goes out after the answer to this, or after a pause when no answer comes.
         if (this.pending.length || this.refreshWaiting) this.idleIn(AFTER_SPEECH_MS + 5);
         this.toPhone({ action: "input.speech.stopped", data: { turn: this.turn } });
@@ -445,6 +1088,7 @@ export class RealtimeCall {
         const text = typeof d.transcript === "string" ? d.transcript.trim() : "";
         const turn = (str(d.item_id) ? this.turnOf.get(d.item_id) : undefined) ?? this.turn;
         if (str(d.item_id)) this.heard.delete(d.item_id);
+        this.telemetry.onTranscript(text, turn, false);
         this.toPhone({ action: "input.transcript.done", data: { text, turn } });
         if (text) {
           this.assistant.voiceLine("user", text, `${this.id}-${turn}`);
@@ -572,6 +1216,7 @@ export class RealtimeCall {
     if (!r.audible) {
       r.audible = true;
       r.startedAt = Date.now();
+      this.telemetry.onResponseAudioStarted(r.id, r.turn);
       this.toPhone({ action: "response.audio.started", data: { run_id: r.id, turn_id: r.turn } });
     }
     const pcm = Buffer.from(d.delta, "base64");
@@ -589,11 +1234,12 @@ export class RealtimeCall {
   }
 
   /** The phone stopped a cut-off answer: the service forgets what was not heard, the captions keep what was. */
-  private settle(runId: string, playedMs: unknown): void {
+  private settle(runId: string, playedMs: unknown, reason?: unknown): void {
     const r = this.runs.get(runId);
     if (!r || r.settled) return;
     r.settled = true;
     r.stopped = true;
+    this.telemetry.onResponseInterrupted(r.id, str(reason) ? reason : "interrupted");
     const heardMs = Math.max(0, Math.min(r.ms, typeof playedMs === "number" && Number.isFinite(playedMs) ? playedMs : r.ms));
     if (this.ga && r.ms > 0) this.up({ type: "conversation.item.truncate", item_id: r.id, content_index: 0, audio_end_ms: Math.floor(heardMs) });
     // The service gives no text for part of an answer: take the same share of the words as of the audio.
@@ -708,6 +1354,7 @@ export class RealtimeCall {
   stop(why: string): void {
     if (this.ended) return;
     this.ended = true;
+    this.telemetry.onStop(why);
     releaseCall(this);
     clearTimeout(this.attachTimer);
     clearInterval(this.keepalive);

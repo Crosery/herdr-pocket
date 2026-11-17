@@ -1,104 +1,184 @@
 import Foundation
 
-/// Swift counterpart to VoiceFilter.kt: GTCRN denoise -> Silero VAD -> CAM++ strict owner voiceprint gate.
+/// Zero-stall continuous streaming voice pipeline:
+/// - Clean Path A: Mic PCM16 -> HighPass64 -> Silero VAD + ERes2NetV2-zh multi-prototype SV (NEVER denoised/TSE audio).
+/// - Audio Path B: HighPass64 -> VoxLock v2 INT8 TSE (40 ms async ring) -> DPDFNet-baseline (10 ms Vorbis STFT) -> VocalEnhancer -> 16 ms cosine residual gate -> continuous PCM16 stream.
 final class VoiceFilter {
   struct Options {
     let denoise: Bool
     let enrolled: [Float]?
+    let prototypes: [[Float]]
     let threshold: Float
-    var early: Float { threshold + 0.07 }
-    var short: Float { threshold + 0.05 }
-    init(denoise: Bool, enrolled: [Float]?, threshold: Float = 0.38) {
+    let tseEnrollment: VoxLockEnrollment?
+    let needAutoOwnerSample: Bool
+
+    init(
+      denoise: Bool,
+      enrolled: [Float]?,
+      prototypes: [[Float]] = [],
+      threshold: Float = 0.38,
+      tseEnrollment: VoxLockEnrollment? = nil,
+      needAutoOwnerSample: Bool = false
+    ) {
       self.denoise = denoise
       self.enrolled = enrolled
+      self.prototypes = prototypes
       self.threshold = threshold
+      self.tseEnrollment = tseEnrollment
+      self.needAutoOwnerSample = needAutoOwnerSample
     }
   }
 
-  private final class Chunk {
-    let a: [Float]
-    var prob: Float = 0
-    init(_ a: [Float]) { self.a = a }
+  struct UtteranceReport {
+    let kind: String
+    let pass: Bool
+    let svScore: Double
+    let svRaw: Double
+    let svProto: Double
+    let svSess: Double
+    let svMs: Int64
+    let usedMs: Int64
+    let vadProb: Double
+    let rawDbfs: Double
+    let tseDbfs: Double
+    let enhDbfs: Double
+    let tseAttenDb: Double
+    let enhGainDb: Double
   }
 
-  private enum State { case idle, hold, open, blocked }
-  private enum Kind: String { case early, mid, full, end, recheck, confirm }
-  private struct Verdict { let job: Int; let score: Float; let ms: Int64 }
+  private enum Kind: String {
+    case early, full, recheck, end
+  }
 
-  private static let hop = Denoiser.hop
-  private static let wMs = 32
-  private static func windows(_ ms: Int) -> Int { (ms + wMs - 1) / wMs }
-  private static func hops(_ ms: Int) -> Int { (ms * voiceRate / 1000 + hop - 1) / hop }
+  private struct SvVerdict {
+    let job: Int
+    let kind: Kind
+    let raw: Float
+    let proto: Float
+    let blended: Float
+    let sessCos: Float
+    let score: Float
+    let normEmb: [Float]?
+    let cleanSamples: [Float]
+    let usedSamples: Int
+    let ms: Int64
+  }
 
-  private static let startProb: Float = 0.5
+  private static let hop = Denoiser.hop // 160 samples = 10 ms
+  private static let rampSamples = 256  // 16 ms raised-cosine ramp
+  private static let tsePrebufferSamples = 896 // 56 ms fixed cushion for zero-underflow K=5 streaming
+  private static let sendMax = 3_200
+
+  private static let startProb: Float = 0.45
   private static let speechProb: Float = 0.35
-  private static let startW = windows(96)
-  private static let endW = windows(384)
-  private static let earlyW = windows(512)
-  private static let midW = windows(704)
-  private static let fullW = windows(960)
-  private static let shortW = windows(320)
-  private static let recheckStepW = windows(96)
-  private static let blockedStepW = windows(160)
-  private static let endCheckMinW = windows(256)
-  private static let preRoll = hops(160)
-  private static let tailHops = hops(736)
-  private static let tailMaxSuspect = hops(1024)
-  private static let prefixKeepHops = hops(480)
-  private static let fastSpeechHops = hops(480)
-  private static let confirmSpeechHops = hops(640)
-  private static let recentSpeechMax = hops(800)
-  private static let minSpeech = hops(250)
-  private static let maxHold = hops(4000)
-  private static let repayAfter = hops(200)
-  private static let sendMax = 3200
+  private static let startWindows = 3   // 96 ms
+  private static let endWindows = 12    // 384 ms
+  private static let earlyVoicedW = 13  // ~416 ms
+  private static let fullVoicedW = 26   // ~832 ms
+  private static let recheckStepW = 20  // ~640 ms
+  private static let minEndVoicedW = 8  // ~256 ms
+  private static let maxCleanSpeechSamples = voiceRate * 3 / 2 // 24,000 samples (1.5 s)
 
   private let m: VoiceModels
   private let o: Options
-  private let worker: (@escaping () -> Void) -> Void
+  private let spkWorker: (@escaping () -> Void) -> Void
+  private let tseWorker: (@escaping () -> Void) -> Void
   private let emit: (Data) -> Void
-  private let onVerdict: (Bool, Float, String) -> Void
+  private let onUtterance: (UtteranceReport) -> Void
 
-  private let gate: Bool
+  private let hasSv: Bool
+  private let enrolledNorm: [Float]?
+  private let prototypesNorm: [[Float]]
+  private let hpf = HighPass64()
   private let denoiser: Denoiser?
   private let vad: Vad?
+  private let vadBoost: QuietVadBoost?
+  private let enhancer: VocalEnhancer?
   private let speaker: Speaker?
+  private let tse: TargetExtractor?
 
-  private var inBuf = [Float](repeating: 0, count: hop * 4)
+  // Input staging (160-sample hop)
+  private var inBuf = [Float](repeating: 0, count: hop)
+  private var hpfBuf = [Float](repeating: 0, count: hop)
+  private var tseHopBuf = [Float](repeating: 0, count: hop)
+  private var rawAlignedHopBuf = [Float](repeating: 0, count: hop)
+  private var dpdfOutBuf = [Float](repeating: 0, count: hop)
+  private var enhOutBuf = [Float](repeating: 0, count: hop)
   private var inLen = 0
-  private var windowChunk: Chunk?
-  private var winBuf = [Float](repeating: 0, count: Vad.window)
-  private var outFloats = [Float]()
+  private var outFloats: [Float] = []
 
-  private var state: State = .idle
-  private var t: Int64 = 0
-  private var ring: [Chunk] = []
-  private var held: [Chunk] = []
-  private var heldPre = 0
-  private var holdStart: Int64 = 0
-  private var tail: [Chunk] = []
-  private var recentSpeech: [Chunk] = []
+  // TSE async ring state
+  private let tseLock = NSLock()
+  private var tseInRing: [Float] = []
+  private var tseInRead = 0
+  private var tseOutTse: [Float] = []
+  private var tseOutRaw: [Float] = []
+  private var tseOutRead = 0
+  private var tseJobRunning = false
+  private var consecutiveSlowTse = 0
+  private var _tseBypassed = false
+  private var _tseChunks = 0
+  private var _tseMsSum = 0.0
+  private var _tseMsMax = 0.0
+  private var _tseAudioMsSum = 0.0
+  private var _tseOverruns = 0
+
+  var tseEnabled: Bool { tse != nil }
+  var tseBypassed: Bool { tseLock.lock(); defer { tseLock.unlock() }; return _tseBypassed }
+  var tseChunks: Int { tseLock.lock(); defer { tseLock.unlock() }; return _tseChunks }
+  var tseMsAvg: Double {
+    tseLock.lock(); defer { tseLock.unlock() }
+    return _tseChunks > 0 ? _tseMsSum / Double(_tseChunks) : 0.0
+  }
+  var tseMsMax: Double { tseLock.lock(); defer { tseLock.unlock() }; return _tseMsMax }
+  var tseRtf: Double {
+    tseLock.lock(); defer { tseLock.unlock() }
+    return _tseAudioMsSum > 0 ? _tseMsSum / _tseAudioMsSum : 0.0
+  }
+  var tseOverruns: Int { tseLock.lock(); defer { tseLock.unlock() }; return _tseOverruns }
+  var tseKFrames: Int { tseLock.lock(); defer { tseLock.unlock() }; return tse?.kFrames ?? 0 }
+  var svEnabled: Bool { hasSv }
+
+  // Clean VAD + SV state
+  private var vadAccum: [Float] = []
+  private var cleanWin = [Float](repeating: 0, count: Vad.window)
+  private var vadProbeWin = [Float](repeating: 0, count: Vad.window)
+  private var cleanSpeechBuf: [Float] = []
+  private var unverifiedAutoSpeech: [Float] = []
+  private var verifiedOwnerBuf: [Float] = []
+  private var needOwnerSample: Bool
+
   private var speaking = false
   private var startRun = 0
   private var silRun = 0
-  private var speechW = 0
+  private var uttVoicedW = 0
   private var sinceCheckW = 0
   private var earlyTried = false
-  private var midTried = false
   private var fullTried = false
-  private var earlyScore: Float = 1
-  private var suspect = false
-  private var idleHops = 0
-  private var debt = 0
+  private var lastVadProb: Float = 0
 
+  // Smooth residual gate & rolling acoustic metrics
+  private var gatePhase: Int = rampSamples // 256 = gain 1.0 (open), 0 = gain 0.0 (muted)
+  private var suppressingResidual = false
+  private var svConfirmedNonOwner = false
+  private var lastSvScore: Float = 1.0
+  private var smoothedTseAttenDb: Double = 0.0
+  private var uttRawSqSum = 0.0
+  private var uttTseSqSum = 0.0
+  private var uttEnhSqSum = 0.0
+  private var uttAudioSamples = 0
+
+  private var sessionEmb: [Float]?
   private var jobSeq = 0
-  private var job = 0
-  private var jobKind: Kind = .full
-  private var jobSpeechW = 0
+  private var activeJob = 0
   private let verdictLock = NSLock()
-  private var verdicts: [Verdict] = []
+  private var verdicts: [SvVerdict] = []
 
+  // Performance & telemetry counters
   private(set) var hopsIn: Int64 = 0
+  private(set) var hopsGated: Int64 = 0
+  private(set) var vadWindowsTotal: Int64 = 0
+  private(set) var vadSpeechWindows: Int64 = 0
   private(set) var denoiseNs: Int64 = 0
   private(set) var denoiseMaxNs: Int64 = 0
   private(set) var checks = 0
@@ -106,55 +186,116 @@ final class VoiceFilter {
   private(set) var checkMsSum: Int64 = 0
   private(set) var passed = 0
   private(set) var blocked = 0
-  private(set) var holdMsMax: Int64 = 0
-  private(set) var holdMsSum: Int64 = 0
-  private(set) var holds = 0
+  let holdMsMax: Int64 = 0
+  let holdMsSum: Int64 = 0
+  let holds = 0
+
+  var vadSpeechRatio: Double {
+    vadWindowsTotal > 0 ? Double(vadSpeechWindows) / Double(vadWindowsTotal) : 0.0
+  }
+
+  var gatedRatio: Double {
+    hopsIn > 0 ? Double(hopsGated) / Double(hopsIn) : 0.0
+  }
 
   init(
     _ m: VoiceModels,
     _ o: Options,
     worker: @escaping (@escaping () -> Void) -> Void,
+    tseWorker: ((@escaping () -> Void) -> Void)? = nil,
     emit: @escaping (Data) -> Void,
-    onVerdict: @escaping (Bool, Float, String) -> Void = { _, _, _ in }
+    onUtterance: @escaping (UtteranceReport) -> Void = { _ in }
   ) {
     self.m = m
     self.o = o
-    self.worker = worker
+    self.spkWorker = worker
+    self.tseWorker = tseWorker ?? worker
     self.emit = emit
-    self.onVerdict = onVerdict
-    self.gate = o.enrolled != nil && m.speaker != nil
-    self.denoiser = o.denoise ? Denoiser(m) : nil
-    self.vad = self.gate ? Vad(m) : nil
-    self.speaker = self.gate ? (try? Speaker(m)) : nil
+    self.onUtterance = onUtterance
+
+    let sp = (o.enrolled != nil && m.speaker != nil) ? (try? Speaker(m)) : nil
+    self.speaker = sp
+    self.hasSv = o.enrolled != nil && sp != nil
+    self.enrolledNorm = o.enrolled.map { normalizeEmbedding($0) }
+    self.prototypesNorm = o.prototypes.map { normalizeEmbedding($0) }
+    self.needOwnerSample = o.needAutoOwnerSample && self.hasSv
+
+    if let enr = o.tseEnrollment, m.tseChunk != nil {
+      self.tse = try? TargetExtractor(m, enrollment: enr)
+    } else {
+      self.tse = nil
+    }
+
+    let runAudioChain = o.denoise || self.tse != nil
+    self.denoiser = runAudioChain ? Denoiser(m) : nil
+    self.enhancer = runAudioChain ? VocalEnhancer() : nil
+
+    let needVad = self.hasSv || self.tse != nil
+    self.vad = needVad ? Vad(m) : nil
+    self.vadBoost = needVad ? QuietVadBoost() : nil
+
+    vadAccum.reserveCapacity(Vad.window + Self.hop * 2)
+    cleanSpeechBuf.reserveCapacity(Self.maxCleanSpeechSamples + Vad.window)
+    outFloats.reserveCapacity(Self.hop * 4)
+
+    if self.tse != nil {
+      seedTsePrebuffer()
+    }
+  }
+
+  private func seedTsePrebuffer() {
+    tseLock.lock()
+    tseInRing.removeAll(keepingCapacity: true)
+    tseInRead = 0
+    tseOutTse = [Float](repeating: 0, count: Self.tsePrebufferSamples)
+    tseOutRaw = [Float](repeating: 0, count: Self.tsePrebufferSamples)
+    tseOutRead = 0
+    tseLock.unlock()
   }
 
   func reset() {
+    hpf.reset()
     denoiser?.reset()
     vad?.reset()
+    vadBoost?.reset()
+    enhancer?.reset()
     inLen = 0
-    windowChunk = nil
-    state = .idle
-    ring.removeAll(keepingCapacity: true)
-    held.removeAll(keepingCapacity: true)
-    tail.removeAll(keepingCapacity: true)
-    recentSpeech.removeAll(keepingCapacity: true)
-    heldPre = 0
+    vadAccum.removeAll(keepingCapacity: true)
+    cleanSpeechBuf.removeAll(keepingCapacity: true)
+    unverifiedAutoSpeech.removeAll(keepingCapacity: true)
     speaking = false
     startRun = 0
     silRun = 0
-    speechW = 0
+    uttVoicedW = 0
     sinceCheckW = 0
     earlyTried = false
-    midTried = false
     fullTried = false
-    earlyScore = 1
-    suspect = false
-    job = 0
+    gatePhase = Self.rampSamples
+    suppressingResidual = false
+    svConfirmedNonOwner = false
+    lastSvScore = 1.0
+    smoothedTseAttenDb = 0.0
+    uttRawSqSum = 0
+    uttTseSqSum = 0
+    uttEnhSqSum = 0
+    uttAudioSamples = 0
+    activeJob = 0
     verdictLock.lock()
     verdicts.removeAll()
     verdictLock.unlock()
-    idleHops = 0
-    debt = 0
+
+    if let tse {
+      tseLock.lock()
+      if !tseJobRunning {
+        tse.reset()
+      }
+      tseInRing.removeAll(keepingCapacity: true)
+      tseInRead = 0
+      tseOutTse = [Float](repeating: 0, count: Self.tsePrebufferSamples)
+      tseOutRaw = [Float](repeating: 0, count: Self.tsePrebufferSamples)
+      tseOutRead = 0
+      tseLock.unlock()
+    }
   }
 
   func push(_ pcm: Data) {
@@ -168,375 +309,479 @@ final class VoiceFilter {
       i += n
       if inLen == Self.hop {
         inLen = 0
-        hop()
+        processHop()
       }
     }
     flushOut()
   }
 
-  private func hop() {
+  private func processHop() {
     hopsIn += 1
-    var a = [Float](repeating: 0, count: Self.hop)
+    takeSvVerdicts()
+
+    // 1. Always run HighPass64 first so SV/VAD and TSE/DPDFNet share DC-free 64 Hz clean input.
+    hpf.process(inBuf, srcOff: 0, dst: &hpfBuf, dstOff: 0, count: Self.hop)
+
+    // 2. Clean Path A: feed unmodified HPF audio to Silero VAD & ERes2NetV2-zh ring.
+    if vad != nil {
+      vadAccum.append(contentsOf: hpfBuf)
+      while vadAccum.count >= Vad.window {
+        for i in 0..<Vad.window { cleanWin[i] = vadAccum[i] }
+        vadAccum.removeFirst(Vad.window)
+        onCleanVadWindow()
+      }
+    }
+
+    // 3. Audio Path B: VoxLock TSE (if active & not bypassed) -> DPDFNet-baseline -> VocalEnhancer.
+    let useTse = tse != nil && !tseBypassed
+    if useTse {
+      pushAndPopTseHop(hpfBuf, outTse: &tseHopBuf, outRaw: &rawAlignedHopBuf)
+    } else {
+      for i in 0..<Self.hop {
+        tseHopBuf[i] = hpfBuf[i]
+        rawAlignedHopBuf[i] = hpfBuf[i]
+      }
+    }
+
+    var rawSq = 0.0
+    var tseSq = 0.0
+    for i in 0..<Self.hop {
+      let rv = Double(rawAlignedHopBuf[i])
+      let tv = Double(tseHopBuf[i])
+      rawSq += rv * rv
+      tseSq += tv * tv
+    }
+    let hopRawRms = Float((rawSq / Double(Self.hop)).squareRoot())
+    let hopTseRms = Float((tseSq / Double(Self.hop)).squareRoot())
+    if useTse && hopRawRms > 0.012 && lastVadProb >= Self.speechProb {
+      let hopAtten = 20.0 * log10(max(Double(hopTseRms), 1e-5) / max(Double(hopRawRms), 1e-5))
+      smoothedTseAttenDb = 0.78 * smoothedTseAttenDb + 0.22 * hopAtten
+    } else if !useTse {
+      smoothedTseAttenDb = 0.0
+    }
+
     if let d = denoiser {
       let t0 = DispatchTime.now().uptimeNanoseconds
-      let ok = (try? d.hop(inBuf, off: 0, out: &a, outOff: 0)) ?? false
+      let ok = (try? d.hop(tseHopBuf, off: 0, out: &dpdfOutBuf, outOff: 0)) ?? false
       let ns = Int64(DispatchTime.now().uptimeNanoseconds - t0)
       denoiseNs += ns
       if ns > denoiseMaxNs { denoiseMaxNs = ns }
-      if !ok { return }
+      if !ok {
+        for i in 0..<Self.hop { dpdfOutBuf[i] = tseHopBuf[i] }
+      }
     } else {
-      a.replaceSubrange(0..<Self.hop, with: inBuf[0..<Self.hop])
+      for i in 0..<Self.hop { dpdfOutBuf[i] = tseHopBuf[i] }
     }
-    if !gate {
-      send(a)
-      return
+
+    if let enh = enhancer {
+      enh.process(dpdfOutBuf, into: &enhOutBuf)
+    } else {
+      for i in 0..<Self.hop { enhOutBuf[i] = dpdfOutBuf[i] }
     }
-    t += 1
-    take()
-    let c = Chunk(a)
-    place(c)
-    guard let w = windowChunk else {
-      windowChunk = c
-      return
-    }
-    windowChunk = nil
+
+    var enhSq = 0.0
     for i in 0..<Self.hop {
-      winBuf[i] = w.a[i]
-      winBuf[Self.hop + i] = c.a[i]
+      let ev = Double(enhOutBuf[i])
+      enhSq += ev * ev
     }
-    let p = (try? vad?.prob(winBuf)) ?? 0
-    w.prob = p
-    c.prob = p
-    if p >= Self.speechProb {
-      keepSpeech(w)
-      keepSpeech(c)
+    if speaking {
+      uttRawSqSum += rawSq
+      uttTseSqSum += tseSq
+      uttEnhSqSum += enhSq
+      uttAudioSamples += Self.hop
     }
-    onWindow(p)
-    take()
+
+    // 4. Smooth 16 ms raised-cosine residual gate ONLY when non-owner is confirmed.
+    updateResidualGateTarget(useTse: useTse)
+    if gatePhase < Self.rampSamples / 2 {
+      hopsGated += 1
+    }
+    for i in 0..<Self.hop {
+      if suppressingResidual {
+        if gatePhase > 0 { gatePhase -= 1 }
+      } else {
+        if gatePhase < Self.rampSamples { gatePhase += 1 }
+      }
+      let g: Float
+      if gatePhase >= Self.rampSamples {
+        g = 1.0
+      } else if gatePhase <= 0 {
+        g = 0.0
+      } else {
+        g = 0.5 - 0.5 * cos(Float.pi * Float(gatePhase) / Float(Self.rampSamples))
+      }
+      outFloats.append(enhOutBuf[i] * g)
+    }
+
+    takeSvVerdicts()
   }
 
-  private func place(_ c: Chunk) {
-    switch state {
-    case .idle:
-      ring.append(c)
-      if ring.count > Self.preRoll { ring.removeFirst() }
-      idleHops += 1
-      if debt > 0 && idleHops >= Self.repayAfter && t % 2 == 0 {
-        debt -= 1
+  private func updateResidualGateTarget(useTse: Bool) {
+    guard hasSv else {
+      suppressingResidual = false
+      return
+    }
+    if !speaking || !svConfirmedNonOwner {
+      suppressingResidual = false
+      return
+    }
+    if useTse {
+      // Hysteresis: engage residual gate only when VoxLock attenuated > 9 dB AND SV confirmed non-owner;
+      // release immediately if owner speaks (tseAttenDb >= -7.5 dB).
+      if suppressingResidual {
+        if smoothedTseAttenDb >= -7.5 { suppressingResidual = false }
       } else {
-        send(nil)
+        if smoothedTseAttenDb < -9.0 { suppressingResidual = true }
       }
-    case .hold:
-      held.append(c)
-      if held.count - heldPre >= Self.maxHold {
-        job = 0
-        reject()
+    } else {
+      suppressingResidual = true
+    }
+  }
+
+  private func pushAndPopTseHop(_ hpfHop: [Float], outTse: inout [Float], outRaw: inout [Float]) {
+    var shouldLaunch = false
+    tseLock.lock()
+    tseInRing.append(contentsOf: hpfHop)
+    if let tse, !tseJobRunning, !_tseBypassed, (tseInRing.count - tseInRead) >= tse.requiredInputSamples {
+      tseJobRunning = true
+      shouldLaunch = true
+    }
+    tseLock.unlock()
+
+    if shouldLaunch {
+      scheduleTseStep()
+    }
+
+    tseLock.lock()
+    let avail = tseOutTse.count - tseOutRead
+    let takeCount = min(Self.hop, avail)
+    for i in 0..<takeCount {
+      outTse[i] = tseOutTse[tseOutRead + i]
+      outRaw[i] = tseOutRaw[tseOutRead + i]
+    }
+    tseOutRead += takeCount
+    if tseOutRead >= 4096 && tseOutRead * 2 >= tseOutTse.count {
+      tseOutTse.removeFirst(tseOutRead)
+      tseOutRaw.removeFirst(tseOutRead)
+      tseOutRead = 0
+    }
+    if takeCount < Self.hop {
+      _tseOverruns += 1
+      for i in takeCount..<Self.hop {
+        outTse[i] = hpfHop[i]
+        outRaw[i] = hpfHop[i]
       }
-    case .blocked:
-      // Blocked non-owner speech is silenced immediately and never retained for replay.
-      if debt > 0 && t % 2 == 0 {
-        debt -= 1
-      } else {
-        send(nil)
+    }
+    tseLock.unlock()
+  }
+
+  private func scheduleTseStep() {
+    tseWorker { [weak self] in
+      self?.runTseLoop()
+    }
+  }
+
+  private func runTseLoop() {
+    guard let tse else { return }
+    while true {
+      tseLock.lock()
+      if _tseBypassed {
+        tseJobRunning = false
+        tseInRing.removeAll(keepingCapacity: true)
+        tseInRead = 0
+        tseLock.unlock()
+        return
       }
-    case .open:
-      tail.append(c)
-      if !suspect {
-        while tail.count > Self.tailHops {
-          send(tail.removeFirst().a)
+      let need = tse.requiredInputSamples
+      let avail = tseInRing.count - tseInRead
+      guard avail >= need else {
+        tseJobRunning = false
+        tseLock.unlock()
+        return
+      }
+      let inputSlice = Array(tseInRing[tseInRead ..< (tseInRead + need)])
+      tseInRead += need
+      if tseInRead >= 4096 && tseInRead * 2 >= tseInRing.count {
+        tseInRing.removeFirst(tseInRead)
+        tseInRead = 0
+      }
+      let curK = tse.kFrames
+      tseLock.unlock()
+
+      let stepRes = try? tse.step(inputSlice)
+
+      tseLock.lock()
+      if let (tseAudio, rawAudio, ms) = stepRes {
+        _tseChunks += 1
+        _tseMsSum += ms
+        if ms > _tseMsMax { _tseMsMax = ms }
+        _tseAudioMsSum += Double(curK * TargetExtractor.hop) * 1000.0 / Double(voiceRate)
+
+        let budgetMs = curK <= 5 ? 38.0 : 60.0
+        if ms > budgetMs {
+          consecutiveSlowTse += 1
+          if consecutiveSlowTse >= 3 {
+            consecutiveSlowTse = 0
+            if curK <= 5 {
+              tse.setKFrames(8)
+              NSLog("PocketVoice TSE overload (%.1f ms > 38 ms), stepping up to K=8 (64 ms)", ms)
+            } else {
+              _tseBypassed = true
+              NSLog("PocketVoice TSE overload (%.1f ms > 60 ms), bypassing TSE to DPDFNet + SV soft-gate", ms)
+            }
+          }
+        } else {
+          consecutiveSlowTse = 0
         }
-      } else if tail.count > Self.tailMaxSuspect {
-        send(tail.removeFirst().a)
+
+        tseOutTse.append(contentsOf: tseAudio)
+        tseOutRaw.append(contentsOf: rawAudio)
+      } else {
+        _tseBypassed = true
+        tseJobRunning = false
+        tseLock.unlock()
+        NSLog("PocketVoice TSE step failed, bypassing TSE")
+        return
       }
+      tseLock.unlock()
     }
   }
 
-  private func keepSpeech(_ c: Chunk) {
-    recentSpeech.append(c)
-    if recentSpeech.count > Self.recentSpeechMax { recentSpeech.removeFirst() }
-  }
+  private func onCleanVadWindow() {
+    vadWindowsTotal += 1
+    vadBoost?.prepare(cleanWin, into: &vadProbeWin)
+    let p = (try? vad?.prob(vadProbeWin)) ?? 0
+    lastVadProb = p
+    let isVoiced = p >= Self.speechProb
+    if isVoiced {
+      vadSpeechWindows += 1
+      cleanSpeechBuf.append(contentsOf: cleanWin)
+      if cleanSpeechBuf.count > Self.maxCleanSpeechSamples {
+        cleanSpeechBuf.removeFirst(cleanSpeechBuf.count - Self.maxCleanSpeechSamples)
+      }
+      if needOwnerSample && unverifiedAutoSpeech.count < VoxLockEnrollment.sampleCount {
+        unverifiedAutoSpeech.append(contentsOf: cleanWin)
+      }
+    }
 
-  private func tailSpeech(_ maxHops: Int) -> [Chunk] {
-    if recentSpeech.count <= maxHops { return recentSpeech }
-    return Array(recentSpeech.suffix(maxHops))
-  }
-
-  private func onWindow(_ p: Float) {
-    var started = false
-    var ended = false
+    var justEnded = false
     if !speaking {
-      startRun = p >= Self.startProb ? startRun + 1 : 0
-      if startRun >= Self.startW {
+      startRun = p >= Self.startProb ? (startRun + 1) : 0
+      if startRun >= Self.startWindows {
         speaking = true
         silRun = 0
-        started = true
+        uttVoicedW = isVoiced ? 1 : 0
+        sinceCheckW = 0
+        earlyTried = false
+        fullTried = false
+        svConfirmedNonOwner = false
+        uttRawSqSum = 0
+        uttTseSqSum = 0
+        uttEnhSqSum = 0
+        uttAudioSamples = 0
+        unverifiedAutoSpeech.removeAll(keepingCapacity: true)
+        if needOwnerSample && isVoiced {
+          unverifiedAutoSpeech.append(contentsOf: cleanWin)
+        }
       }
     } else {
-      silRun = p < Self.speechProb ? silRun + 1 : 0
-      if silRun >= Self.endW {
-        speaking = false
-        startRun = 0
-        ended = true
-      }
-    }
-    if p >= Self.speechProb {
-      speechW += 1
-      sinceCheckW += 1
-    }
-    if started { onStart() }
-    switch state {
-    case .idle:
-      break
-    case .hold:
-      if job != 0 { return }
-      if !speaking {
-        if speechW >= Self.shortW { check(.end, held) } else { reject() }
-      } else if speechW >= Self.fullW && !fullTried {
-        fullTried = true
-        check(.full, held)
-      } else if speechW >= Self.midW && !midTried {
-        midTried = true
-        check(.mid, held)
-      } else if speechW >= Self.earlyW && !earlyTried {
-        earlyTried = true
-        check(.early, held)
-      }
-    case .open:
-      if ended {
-        if (suspect || sinceCheckW >= Self.endCheckMinW) && recentSpeech.count >= Self.minSpeech && job == 0 {
-          check(.end, recentSpeech)
-        } else {
-          toIdleFromOpen()
+      if isVoiced {
+        silRun = 0
+        uttVoicedW += 1
+        sinceCheckW += 1
+      } else {
+        silRun += 1
+        if silRun >= Self.endWindows {
+          speaking = false
+          startRun = 0
+          justEnded = true
         }
-      } else if job == 0 && sinceCheckW >= Self.recheckStepW && recentSpeech.count >= Self.minSpeech {
-        check(.recheck, tailSpeech(Self.fastSpeechHops))
       }
-    case .blocked:
-      if job != 0 { return }
-      if ended {
-        toIdle()
-      } else if sinceCheckW >= Self.blockedStepW && recentSpeech.count >= Self.minSpeech {
-        check(.recheck, tailSpeech(Self.fastSpeechHops))
+    }
+
+    guard hasSv else { return }
+    if speaking && activeJob == 0 {
+      if !earlyTried && uttVoicedW >= Self.earlyVoicedW {
+        earlyTried = true
+        launchSvCheck(kind: .early, maxSamples: voiceRate * 3 / 5) // up to 0.6 s
+      } else if !fullTried && uttVoicedW >= Self.fullVoicedW {
+        fullTried = true
+        launchSvCheck(kind: .full, maxSamples: voiceRate) // up to 1.0 s
+      } else if fullTried && sinceCheckW >= Self.recheckStepW {
+        launchSvCheck(kind: .recheck, maxSamples: voiceRate * 5 / 4) // up to 1.25 s
       }
+    } else if justEnded {
+      if activeJob == 0 && !fullTried && uttVoicedW >= Self.minEndVoicedW {
+        launchSvCheck(kind: .end, maxSamples: voiceRate)
+      }
+      suppressingResidual = false
+      svConfirmedNonOwner = false
+      cleanSpeechBuf.removeAll(keepingCapacity: true)
     }
   }
 
-  private func onStart() {
-    if state != .idle { return }
-    speechW = 0
-    sinceCheckW = 0
-    earlyTried = false
-    midTried = false
-    fullTried = false
-    earlyScore = 1
-    suspect = false
-    recentSpeech.removeAll(keepingCapacity: true)
-    for c in ring where c.prob >= Self.speechProb { keepSpeech(c) }
-    held = ring
-    heldPre = ring.count
-    ring.removeAll(keepingCapacity: true)
-    holdStart = t
-    state = .hold
-  }
+  private func launchSvCheck(kind: Kind, maxSamples: Int) {
+    guard let enrolled = enrolledNorm, let sp = speaker, !cleanSpeechBuf.isEmpty else { return }
+    let takeLen = min(cleanSpeechBuf.count, maxSamples)
+    guard takeLen >= voiceRate / 5 else { return } // at least 200 ms of clean voiced speech
+    let slice = Array(cleanSpeechBuf.suffix(takeLen))
+    let autoCandidate: [Float]
+    if needOwnerSample && !unverifiedAutoSpeech.isEmpty {
+      autoCandidate = unverifiedAutoSpeech
+      unverifiedAutoSpeech.removeAll(keepingCapacity: true)
+    } else {
+      autoCandidate = []
+    }
 
-  private func check(_ kind: Kind, _ chunks: [Chunk]) {
-    guard let enrolled = o.enrolled, let sp = speaker else { return }
-    let voiced = chunks.filter { $0.prob >= Self.speechProb }
-    let speech = voiced.count >= Self.minSpeech ? voiced : chunks
-    var x = [Float]()
-    x.reserveCapacity(speech.count * Self.hop)
-    for c in speech { x.append(contentsOf: c.a) }
-    let id = jobSeq + 1
-    jobSeq = id
-    job = id
-    jobKind = kind
-    jobSpeechW = (kind == .recheck || kind == .confirm || state == .blocked) ? sinceCheckW : speechW
+    jobSeq += 1
+    let id = jobSeq
+    activeJob = id
     sinceCheckW = 0
-    worker { [weak self] in
+    let protos = prototypesNorm
+    let sess = sessionEmb
+    let th = o.threshold
+
+    spkWorker { [weak self] in
       let t0 = DispatchTime.now().uptimeNanoseconds
-      let score: Float
+      var raw: Float = -1
+      var proto: Float = -1
+      var blended: Float = -1
+      var sessCos: Float = -1
+      var finalScore: Float = -1
+      var normEmb: [Float]?
       do {
-        score = cosine(try sp.embed(x), enrolled)
+        let emb = try sp.embed(slice)
+        let norm = normalizeEmbedding(emb)
+        normEmb = norm
+        let sv = scoreVoiceprint(norm, centroid: enrolled, prototypes: protos)
+        raw = sv.raw
+        proto = sv.proto
+        blended = sv.blended
+        if let sess {
+          sessCos = cosine(norm, sess)
+          if blended >= th - 0.12 {
+            finalScore = max(blended, 0.65 * blended + 0.35 * sessCos)
+          } else {
+            finalScore = blended
+          }
+        } else {
+          sessCos = raw
+          finalScore = blended
+        }
       } catch {
-        score = -1
       }
       let ms = Int64((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000)
       guard let self else { return }
       self.verdictLock.lock()
-      self.verdicts.append(Verdict(job: id, score: score, ms: ms))
+      self.verdicts.append(
+        SvVerdict(
+          job: id,
+          kind: kind,
+          raw: raw,
+          proto: proto,
+          blended: blended,
+          sessCos: sessCos,
+          score: finalScore,
+          normEmb: normEmb,
+          cleanSamples: autoCandidate,
+          usedSamples: takeLen,
+          ms: ms
+        )
+      )
       self.verdictLock.unlock()
     }
   }
 
-  private func take() {
+  private func takeSvVerdicts() {
     verdictLock.lock()
-    let pending = verdicts
+    if verdicts.isEmpty {
+      verdictLock.unlock()
+      return
+    }
+    let items = verdicts
     verdicts.removeAll(keepingCapacity: true)
     verdictLock.unlock()
-    var v: Verdict?
-    for item in pending where item.job == job { v = item }
-    guard let v else { return }
-    job = 0
-    checks += 1
-    checkMsSum += v.ms
-    if v.ms > checkMsMax { checkMsMax = v.ms }
-    let s = v.score
-    switch state {
-    case .hold:
-      let pass: Bool?
-      switch jobKind {
-      case .early:
-        earlyScore = s
-        pass = s >= o.early ? true : (s < o.threshold - 0.10 ? false : nil)
-      case .mid:
-        pass = s >= o.threshold + 0.03 ? true : nil
-      case .full:
-        pass = s >= o.threshold
-      default:
-        pass = s >= (jobSpeechW >= Self.earlyW ? o.threshold : o.short)
-      }
-      if let pass {
-        onVerdict(pass, s, jobKind.rawValue)
-        if pass { accept() } else { reject() }
-      }
-    case .open:
-      if jobKind == .end {
-        if s >= o.threshold - 0.06 {
-          onVerdict(true, s, "end")
-          toIdleFromOpen()
-        } else {
-          onVerdict(false, s, "end")
-          blocked += 1
-          dropTailAsSilence()
-          toIdle()
-        }
-        return
-      }
-      if jobKind == .confirm {
-        if s >= o.threshold {
-          suspect = false
-          while tail.count > Self.tailHops { send(tail.removeFirst().a) }
-          if !speaking { toIdleFromOpen() }
-        } else {
-          onVerdict(false, s, "confirm")
-          blocked += 1
-          suspect = false
-          dropTailAsSilence()
-          if speaking { state = .blocked; sinceCheckW = 0 } else { toIdle() }
-        }
-        return
-      }
-      if s >= o.threshold {
-        suspect = false
-        while tail.count > Self.tailHops { send(tail.removeFirst().a) }
-        if !speaking { toIdleFromOpen() }
-      } else if !suspect {
-        suspect = true
-        if !speaking { check(.end, recentSpeech) }
-      } else if s >= o.threshold - 0.05 && recentSpeech.count > Self.fastSpeechHops {
-        check(.confirm, tailSpeech(Self.confirmSpeechHops))
-      } else {
-        onVerdict(false, s, "recheck")
-        blocked += 1
-        suspect = false
-        dropTailAsSilence()
-        if speaking { state = .blocked; sinceCheckW = 0 } else { toIdle() }
-      }
-    case .blocked:
-      if s >= o.threshold + 0.04 {
-        onVerdict(true, s, "resume")
+
+    for v in items {
+      if v.job == activeJob { activeJob = 0 }
+      guard v.score >= -0.99 else { continue }
+
+      checks += 1
+      checkMsSum += v.ms
+      if v.ms > checkMsMax { checkMsMax = v.ms }
+      lastSvScore = v.score
+
+      let req: Float = v.kind == .end ? (o.threshold - 0.03) : (o.threshold - 0.01)
+      let pass = v.score >= req
+      if pass {
         passed += 1
-        tail.removeAll(keepingCapacity: true)
-        suspect = false
-        if speaking { state = .open; sinceCheckW = 0 } else { toIdle() }
-      } else if !speaking {
-        toIdle()
-      }
-    case .idle:
-      break
-    }
-  }
-
-  private func accept() {
-    passed += 1
-    noteHold()
-    recentSpeech.removeAll(keepingCapacity: true)
-    for c in held where c.prob >= Self.speechProb { keepSpeech(c) }
-    tail.removeAll(keepingCapacity: true)
-    if earlyScore < o.threshold - 0.08 {
-      let keep = min(held.count, Self.prefixKeepHops)
-      let cut = held.count - keep
-      if heldPre < cut {
-        for i in heldPre..<cut {
-          if debt > 0 && i % 2 == 0 { debt -= 1 } else { send(nil) }
+        svConfirmedNonOwner = false
+        suppressingResidual = false
+        maybeUpdateSession(v)
+        maybeCaptureOwnerSample(v)
+      } else {
+        blocked += 1
+        if speaking {
+          svConfirmedNonOwner = true
         }
       }
-      if cut < held.count {
-        tail.append(contentsOf: held[cut..<held.count])
-      }
-      if cut < heldPre { debt += heldPre - cut }
+
+      let denom = Double(max(1, uttAudioSamples))
+      let rawRms = Float((uttRawSqSum / denom).squareRoot())
+      let tseRms = Float((uttTseSqSum / denom).squareRoot())
+      let enhRms = Float((uttEnhSqSum / denom).squareRoot())
+      let rDb = dbfsFromRms(rawRms)
+      let tDb = dbfsFromRms(tseRms)
+      let eDb = dbfsFromRms(enhRms)
+      let uttAtten = 20.0 * log10(max(Double(tseRms), 1e-5) / max(Double(rawRms), 1e-5))
+      let atten = (tse != nil && !tseBypassed) ? finiteDouble(uttAtten, digits: 1) : 0.0
+      let enhGain = finiteDouble(eDb - tDb, digits: 1)
+
+      onUtterance(
+        UtteranceReport(
+          kind: v.kind.rawValue,
+          pass: pass,
+          svScore: Double(v.score),
+          svRaw: Double(v.raw),
+          svProto: Double(v.proto),
+          svSess: Double(v.sessCos),
+          svMs: v.ms,
+          usedMs: Int64(v.usedSamples * 1000 / voiceRate),
+          vadProb: Double(lastVadProb),
+          rawDbfs: rDb,
+          tseDbfs: tDb,
+          enhDbfs: eDb,
+          tseAttenDb: atten,
+          enhGainDb: enhGain
+        )
+      )
+    }
+  }
+
+  private func maybeUpdateSession(_ v: SvVerdict) {
+    guard let emb = v.normEmb, v.usedSamples >= voiceRate * 3 / 5 else { return }
+    guard v.blended >= max(o.threshold + 0.08, 0.46) else { return }
+    if tse != nil && !tseBypassed && smoothedTseAttenDb < -6.0 { return }
+    if let cur = sessionEmb {
+      var blended = [Float](repeating: 0, count: cur.count)
+      for i in 0..<cur.count { blended[i] = 0.80 * cur[i] + 0.20 * emb[i] }
+      sessionEmb = normalizeEmbedding(blended)
     } else {
-      let cut = max(0, held.count - Self.tailHops)
-      for i in 0..<cut { send(held[i].a) }
-      if cut < held.count {
-        tail.append(contentsOf: held[cut..<held.count])
+      sessionEmb = emb
+    }
+  }
+
+  private func maybeCaptureOwnerSample(_ v: SvVerdict) {
+    guard needOwnerSample, !v.cleanSamples.isEmpty else { return }
+    guard v.score >= o.threshold + 0.10 else { return }
+    verifiedOwnerBuf.append(contentsOf: v.cleanSamples)
+    if verifiedOwnerBuf.count >= VoxLockEnrollment.sampleCount {
+      let ok = VoiceModelManager.saveOwnerSample(Array(verifiedOwnerBuf.prefix(VoxLockEnrollment.sampleCount)))
+      if ok {
+        needOwnerSample = false
+        verifiedOwnerBuf.removeAll()
+        unverifiedAutoSpeech.removeAll()
       }
-      debt += heldPre
-    }
-    held.removeAll(keepingCapacity: true)
-    heldPre = 0
-    suspect = false
-    if speaking { state = .open; sinceCheckW = 0 } else { toIdleFromOpen() }
-  }
-
-  private func reject() {
-    blocked += 1
-    noteHold()
-    for i in heldPre..<held.count {
-      if debt > 0 && i % 2 == 0 { debt -= 1 } else { send(nil) }
-    }
-    held.removeAll(keepingCapacity: true)
-    heldPre = 0
-    if speaking { state = .blocked; sinceCheckW = 0 } else { toIdle() }
-  }
-
-  private func dropTailAsSilence() {
-    while !tail.isEmpty {
-      tail.removeFirst()
-      if debt > 0 { debt -= 1 } else { send(nil) }
-    }
-  }
-
-  private func noteHold() {
-    let ms = (t - holdStart) * Int64(Self.hop) * 1000 / Int64(voiceRate)
-    holds += 1
-    holdMsSum += ms
-    if ms > holdMsMax { holdMsMax = ms }
-  }
-
-  private func toIdleFromOpen() {
-    while !tail.isEmpty {
-      let d = tail.removeFirst()
-      if debt > 0 && d.prob < Self.speechProb { debt -= 1 } else { send(d.a) }
-    }
-    toIdle()
-  }
-
-  private func toIdle() {
-    state = .idle
-    job = 0
-    idleHops = 0
-    suspect = false
-    held.removeAll(keepingCapacity: true)
-    heldPre = 0
-    recentSpeech.removeAll(keepingCapacity: true)
-  }
-
-  private func send(_ a: [Float]?) {
-    if let a {
-      outFloats.append(contentsOf: a)
-    } else {
-      outFloats.append(contentsOf: repeatElement(Float(0), count: Self.hop))
     }
   }
 

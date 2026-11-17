@@ -62,6 +62,34 @@ class Prefs(ctx: Context) {
       if (v == null || v.isEmpty()) p.edit().remove("voiceEmbedding").apply()
       else p.edit().putString("voiceEmbedding", v.joinToString(",") { "%.7g".format(java.util.Locale.US, it) }).apply()
     }
+
+  var voicePrototypes: List<FloatArray>?
+    get() {
+      val s = p.getString("voicePrototypes", null) ?: return null
+      if (s.isEmpty()) return null
+      return try {
+        s.split(";").mapNotNull { row ->
+          if (row.isEmpty()) null
+          else row.split(",").map { it.toFloat() }.toFloatArray().takeIf { it.isNotEmpty() }
+        }.takeIf { it.isNotEmpty() }
+      } catch (_: Throwable) {
+        null
+      }
+    }
+    set(v) {
+      if (v.isNullOrEmpty()) p.edit().remove("voicePrototypes").apply()
+      else {
+        val encoded = v.joinToString(";") { arr -> arr.joinToString(",") { "%.7g".format(java.util.Locale.US, it) } }
+        p.edit().putString("voicePrototypes", encoded).apply()
+      }
+    }
+
+  var voiceModelVersion: String?
+    get() = p.getString("voiceModelVersion", null)
+    set(v) {
+      if (v.isNullOrEmpty()) p.edit().remove("voiceModelVersion").apply()
+      else p.edit().putString("voiceModelVersion", v).apply()
+    }
 }
 
 /** Events for the JS side, delivered while the app's module is alive. */

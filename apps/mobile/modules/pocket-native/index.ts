@@ -16,6 +16,9 @@ export interface NativeVoiceState {
   filter: boolean;
   threshold: number;
   enrolled: boolean;
+  tseReady?: boolean;
+  modelVersion?: string;
+  legacyEnrolled?: boolean;
   modelReady: boolean;
   modelDownloading: boolean;
   modelSize: number;
@@ -23,6 +26,11 @@ export interface NativeVoiceState {
 
 export interface EnrolledVoiceprint {
   embedding: number[];
+  prototypes?: number[][];
+  modelVersion?: string;
+  hasSample?: boolean;
+  route?: string;
+  snrDb?: number;
   seconds: number;
   consistency: number;
   lowest: number;
@@ -65,6 +73,7 @@ interface PocketNativeModule {
   voiceState?(): NativeVoiceState;
   setVoiceSettings?(denoise: boolean, filter: boolean, threshold: number): void;
   setVoiceprint?(embedding: number[] | null): void;
+  setVoiceprintMeta?(prototypes: number[][] | null, modelVersion: string | null): void;
   prepareVoiceModel?(): Promise<boolean>;
   cancelVoiceModel?(): void;
   startVoiceEnroll?(): Promise<boolean>;
@@ -81,7 +90,19 @@ interface PocketNativeModule {
   addListener(event: "onUpdateProgress", fn: (e: { received: number; total: number }) => void): EventSubscription;
   addListener(event: "onVoiceModelProgress", fn: (e: { received: number; total: number }) => void): EventSubscription;
   addListener(event: "onEnrollProgress", fn: (e: { level: number; seconds: number; full: boolean }) => void): EventSubscription;
-  addListener(event: "onVoiceTest", fn: (e: { level: number; speaking: boolean; score?: number; pass?: boolean }) => void): EventSubscription;
+  addListener(
+    event: "onVoiceTest",
+    fn: (e: {
+      level: number;
+      speaking: boolean;
+      score?: number;
+      rawScore?: number;
+      protoScore?: number;
+      pass?: boolean;
+      inferMs?: number;
+      route?: string;
+    }) => void,
+  ): EventSubscription;
 }
 
 /** Null in builds without the module (e.g. a JS-only reload of an older APK). */

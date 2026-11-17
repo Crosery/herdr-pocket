@@ -20,4 +20,5 @@ dependencies {
   // Same client React Native ships; resolved to its version.
   implementation "com.squareup.okhttp3:okhttp:4.9.2"
   implementation "com.microsoft.onnxruntime:onnxruntime-android:1.32.0"
+  testImplementation "junit:junit:4.13.2"
 }

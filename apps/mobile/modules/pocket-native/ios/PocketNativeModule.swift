@@ -120,12 +120,19 @@ public class PocketNativeModule: Module {
     }
 
     Function("voiceState") { () -> [String: Any] in
-      [
+      let enrolled = VoicePrefs.isCurrentEnrolled
+      let legacyEnrolled = VoicePrefs.isLegacyEnrolled
+      let modelReady = VoiceModelManager.isSpeakerReady()
+      let tseReady = enrolled && VoiceModelManager.isTseReady()
+      return [
         "denoise": VoicePrefs.denoise,
         "filter": VoicePrefs.filter,
         "threshold": Double(VoicePrefs.threshold),
-        "enrolled": VoicePrefs.embedding != nil,
-        "modelReady": VoiceModelManager.isSpeakerReady(),
+        "enrolled": enrolled,
+        "legacyEnrolled": legacyEnrolled,
+        "tseReady": tseReady,
+        "modelVersion": VOICEPRINT_MODEL_VERSION,
+        "modelReady": modelReady,
         "modelDownloading": VoiceModelManager.downloading,
         "modelSize": Double(VoiceModelManager.speakerSize),
       ]
@@ -138,7 +145,24 @@ public class PocketNativeModule: Module {
     }
 
     Function("setVoiceprint") { (embedding: [Double]?) in
-      VoicePrefs.embedding = embedding?.isEmpty == false ? embedding!.map { Float($0) } : nil
+      if let emb = embedding, !emb.isEmpty {
+        VoicePrefs.embedding = emb.map { Float($0) }
+      } else {
+        VoicePrefs.clearVoiceprint()
+      }
+    }
+
+    Function("setVoiceprintMeta") { (prototypes: [[Double]]?, modelVersion: String?) in
+      if let protos = prototypes, !protos.isEmpty {
+        VoicePrefs.prototypes = protos.map { $0.map { Float($0) } }
+      } else {
+        VoicePrefs.prototypes = nil
+      }
+      if let ver = modelVersion, !ver.isEmpty {
+        VoicePrefs.modelVersion = ver
+      } else {
+        VoicePrefs.modelVersion = nil
+      }
     }
 
     AsyncFunction("prepareVoiceModel") { (promise: Promise) in

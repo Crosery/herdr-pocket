@@ -6,6 +6,20 @@ import type { TermKeyLayout } from "./termkeys";
 
 export type ThemeMode = "system" | "light" | "dark";
 
+export const VOICEPRINT_MODEL_VERSION = "eres2netv2-voxlock-v2";
+
+export interface SavedVoiceprint {
+  embedding: number[];
+  prototypes?: number[][];
+  modelVersion?: string;
+  hasSample?: boolean;
+  route?: string;
+  snrDb?: number;
+  seconds: number;
+  consistency: number;
+  createdAt: number;
+}
+
 /** A newer app release found on GitHub (see lib/update.ts). */
 export interface ReleaseInfo {
   version: string;
@@ -54,7 +68,7 @@ interface SettingsState {
   voiceDenoise: boolean;
   voiceFilter: boolean;
   voiceThreshold: number;
-  voiceprint: { embedding: number[]; seconds: number; consistency: number; createdAt: number } | null;
+  voiceprint: SavedVoiceprint | null;
   hydrated: boolean;
   set: (patch: Partial<Omit<SettingsState, "set" | "hydrated">>) => void;
   signOut: () => void;

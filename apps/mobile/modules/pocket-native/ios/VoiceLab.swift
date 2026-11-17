@@ -1,6 +1,27 @@
 import AVFoundation
 import Foundation
 
+func currentAudioRoute() -> String {
+  let route = AVAudioSession.sharedInstance().currentRoute
+  let ports = (route.outputs + route.inputs).map(\.portType)
+  for p in ports {
+    if p == .bluetoothHFP || p == .bluetoothA2DP || p == .bluetoothLE {
+      return "bt"
+    }
+  }
+  for p in ports {
+    if p == .headphones || p == .headsetMic || p == .usbAudio || p == .carAudio {
+      return "wired"
+    }
+  }
+  for p in route.outputs.map(\.portType) {
+    if p == .builtInSpeaker {
+      return "speaker"
+    }
+  }
+  return "builtin"
+}
+
 enum VoiceLab {
   private static let micRate = 16_000.0
   private static let maxEnrollSec: Float = 20
@@ -13,6 +34,7 @@ enum VoiceLab {
     let q = DispatchQueue(label: "dev.crosery.pocket.vlab", qos: .userInteractive)
     let spkQueue = DispatchQueue(label: "dev.crosery.pocket.vlab-spk", qos: .userInitiated)
     var stopped = false
+    var route = "speaker"
     var collector: SpeechCollector?
     var timer: DispatchSourceTimer?
     init(kind: String, models: VoiceModels) {
@@ -32,15 +54,17 @@ enum VoiceLab {
     stop()
     guard VoiceCall.current == nil else { throw callErr("正在通话中，挂断后再录声纹") }
     guard VoiceModelManager.isSpeakerReady() else { throw callErr("声纹模型还没准备好") }
-    let models = try VoiceModelManager.openModels(needSpeaker: true)
+    let models = try VoiceModelManager.openModels(needSpeaker: true, needTse: false)
     guard models.speaker != nil else { throw callErr("声纹模型打不开") }
     let s = Session(kind: "enroll", models: models)
     let col = SpeechCollector(models)
     s.collector = col
     do {
       try openMic(s) { pcm in
+        s.route = currentAudioRoute()
         if col.seconds < maxEnrollSec { col.push(pcm) }
       }
+      s.route = currentAudioRoute()
     } catch {
       closeEngine(s)
       throw error
@@ -50,8 +74,8 @@ enum VoiceLab {
     t.setEventHandler {
       if s.stopped { return }
       PocketBus.emit("onEnrollProgress", [
-        "level": Double(col.level),
-        "seconds": Double(col.seconds),
+        "level": finiteDouble(Double(col.level), digits: 4),
+        "seconds": finiteDouble(Double(col.seconds), digits: 2),
         "full": col.seconds >= maxEnrollSec,
       ])
     }
@@ -70,35 +94,53 @@ enum VoiceLab {
     }
     current = nil
     lock.unlock()
+    let activeRoute = s.route
     stopSession(s)
     guard let col = s.collector, let vp = try col.voiceprint(minSeconds: minEnrollSec) else {
       let got = s.collector?.seconds ?? 0
       throw callErr("录到的有效说话只有 \(String(format: "%.1f", got)) 秒，再多说几句试试")
     }
+    let hasSample = VoiceModelManager.saveOwnerSample(vp.ownerSample)
     VoicePrefs.embedding = vp.embedding
+    VoicePrefs.prototypes = vp.prototypes
+    VoicePrefs.modelVersion = VOICEPRINT_MODEL_VERSION
     VoicePrefs.filter = true
     return [
       "embedding": vp.embedding.map { Double($0) },
-      "seconds": Double(vp.seconds),
-      "consistency": Double(vp.consistency),
-      "lowest": Double(vp.lowest),
+      "prototypes": vp.prototypes.map { $0.map { Double($0) } },
+      "modelVersion": VOICEPRINT_MODEL_VERSION,
+      "hasSample": hasSample,
+      "route": activeRoute,
+      "snrDb": finiteDouble(Double(vp.snrDb), digits: 1),
+      "seconds": finiteDouble(Double(vp.seconds), digits: 2),
+      "consistency": finiteDouble(Double(vp.consistency), digits: 4),
+      "lowest": finiteDouble(Double(vp.lowest), digits: 4),
     ]
   }
 
   static func startTest(threshold: Float) throws {
     stop()
     guard VoiceCall.current == nil else { throw callErr("正在通话中，挂断后再测试") }
-    guard let enrolled = VoicePrefs.embedding else { throw callErr("还没有录入声纹") }
-    guard VoiceModelManager.isSpeakerReady() else { throw callErr("声纹模型还没准备好") }
-    let models = try VoiceModelManager.openModels(needSpeaker: true)
-    let den = Denoiser(models)
+    if VoicePrefs.isLegacyEnrolled {
+      throw callErr("声纹引擎已升级，请重录一次声纹")
+    }
+    guard VoicePrefs.isCurrentEnrolled, let rawEnrolled = VoicePrefs.embedding else {
+      throw callErr("还没有录入声纹")
+    }
+    guard VoiceModelManager.isSvOnlyReady() else { throw callErr("声纹模型还没准备好") }
+    let enrolled = normalizeEmbedding(rawEnrolled)
+    let prototypes = (VoicePrefs.prototypes ?? []).map { normalizeEmbedding($0) }
+
+    let models = try VoiceModelManager.openModels(needSpeaker: true, needTse: false)
+    let hpf = HighPass64()
     let vad = Vad(models)
+    let vadBoost = QuietVadBoost()
     let sp = try Speaker(models)
     let s = Session(kind: "test", models: models)
 
-    var hopIn = [Float](repeating: 0, count: Denoiser.hop)
-    var hopLen = 0
-    var win = [Float](repeating: 0, count: Vad.window)
+    var inWin = [Float](repeating: 0, count: Vad.window)
+    var hpfWin = [Float](repeating: 0, count: Vad.window)
+    var vadWin = [Float](repeating: 0, count: Vad.window)
     var winLen = 0
     var speechBuf: [Float] = []
     speechBuf.reserveCapacity(voiceRate * 2)
@@ -107,57 +149,78 @@ enum VoiceLab {
     var checkPending = false
     var level: Float = 0
 
-    func runCheck(_ copy: [Float], _ lv: Float) {
+    func runCheck(_ copy: [Float], _ lv: Float, _ rt: String) {
       if checkPending || copy.count < voiceRate * 2 / 5 { return }
       checkPending = true
       s.spkQueue.async {
         defer { s.q.async { checkPending = false } }
-        let score = (try? cosine(sp.embed(copy), enrolled)) ?? -1
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        guard let rawEmb = try? sp.embed(copy), !rawEmb.isEmpty else { return }
+        let inferMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
+        let norm = normalizeEmbedding(rawEmb)
+        let sv = scoreVoiceprint(norm, centroid: enrolled, prototypes: prototypes)
         if !s.stopped {
-          PocketBus.emit("onVoiceTest", ["level": Double(lv), "speaking": true, "score": Double(score), "pass": score >= threshold])
+          PocketBus.emit("onVoiceTest", [
+            "level": finiteDouble(Double(lv), digits: 4),
+            "speaking": true,
+            "score": finiteDouble(Double(sv.blended), digits: 4),
+            "rawScore": finiteDouble(Double(sv.raw), digits: 4),
+            "protoScore": finiteDouble(Double(sv.proto), digits: 4),
+            "pass": sv.blended >= threshold,
+            "inferMs": finiteDouble(inferMs, digits: 1),
+            "route": rt,
+          ])
         }
       }
     }
 
     do {
       try openMic(s) { pcm in
+        s.route = currentAudioRoute()
         var tmp = [Float](repeating: 0, count: pcm.count / 2)
         pcm16ToFloat(pcm, out: &tmp, outOff: 0)
         var i = 0
         while i < tmp.count && !s.stopped {
-          let take = min(tmp.count - i, Denoiser.hop - hopLen)
-          for k in 0..<take { hopIn[hopLen + k] = tmp[i + k] }
-          hopLen += take
+          let take = min(tmp.count - i, Vad.window - winLen)
+          for k in 0..<take { inWin[winLen + k] = tmp[i + k] }
+          winLen += take
           i += take
-          if hopLen < Denoiser.hop { continue }
-          hopLen = 0
-          guard (try? den.hop(hopIn, off: 0, out: &win, outOff: winLen)) == true else { continue }
-          winLen += Denoiser.hop
           if winLen < Vad.window { continue }
           winLen = 0
+
+          // CRITICAL: Clean-path decoupling — HPF only, NEVER denoised audio!
+          hpf.process(inWin, srcOff: 0, dst: &hpfWin, dstOff: 0, count: Vad.window)
+
           var e = 0.0
-          for v in win { e += Double(v) * Double(v) }
+          for v in hpfWin { e += Double(v) * Double(v) }
           level = Float(min(1.0, (e / Double(Vad.window)).squareRoot() * 4.0))
-          let p = (try? vad.prob(win)) ?? 0
+
+          vadBoost.prepare(hpfWin, into: &vadWin)
+          let p = (try? vad.prob(vadWin)) ?? 0
           if p >= 0.35 {
             speaking = true
             silRun = 0
-            speechBuf.append(contentsOf: win)
+            speechBuf.append(contentsOf: hpfWin)
             if speechBuf.count > voiceRate * 2 {
               speechBuf.removeFirst(speechBuf.count - voiceRate * 2)
             }
-            if speechBuf.count >= voiceRate * 4 / 5 { runCheck(speechBuf, level) }
+            if speechBuf.count >= voiceRate * 4 / 5 {
+              runCheck(speechBuf, level, s.route)
+            }
           } else if speaking {
             silRun += 1
             if silRun >= 15 {
               speaking = false
               silRun = 0
-              if speechBuf.count >= voiceRate * 2 / 5 { runCheck(speechBuf, level) }
+              if speechBuf.count >= voiceRate * 2 / 5 {
+                runCheck(speechBuf, level, s.route)
+              }
               speechBuf.removeAll(keepingCapacity: true)
             }
           }
         }
       }
+      s.route = currentAudioRoute()
     } catch {
       closeEngine(s)
       throw error
@@ -167,7 +230,11 @@ enum VoiceLab {
     t.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
     t.setEventHandler {
       if s.stopped { return }
-      PocketBus.emit("onVoiceTest", ["level": Double(level), "speaking": speaking])
+      PocketBus.emit("onVoiceTest", [
+        "level": finiteDouble(Double(level), digits: 4),
+        "speaking": speaking,
+        "route": s.route,
+      ])
     }
     t.resume()
     s.timer = t

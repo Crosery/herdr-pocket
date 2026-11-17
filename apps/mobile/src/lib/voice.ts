@@ -7,10 +7,16 @@ import { PermissionsAndroid, Platform } from "react-native";
 import { makeMutable, withTiming } from "react-native-reanimated";
 import { create } from "zustand";
 import { PocketNative } from "../../modules/pocket-native";
-import { useSettings } from "./store";
+import { useSettings, VOICEPRINT_MODEL_VERSION } from "./store";
 import { loadToken } from "./auth";
 import { isMockServer, mockAssistant } from "./mock";
-import { applog } from "./applog";
+import { applog, uploadAppLog } from "./applog";
+
+export { VOICEPRINT_MODEL_VERSION };
+
+export function isVoiceprintLegacy(vp: { modelVersion?: string } | null | undefined): boolean {
+  return Boolean(vp && vp.modelVersion !== VOICEPRINT_MODEL_VERSION);
+}
 
 export type CallStatus = "idle" | "connecting" | "ready" | "ended";
 
@@ -153,6 +159,9 @@ export function applyCallEvent(action: string | undefined, d: Record<string, any
     case "relay.task":
       useVoice.setState({ task: d.status === "running" ? (d as VoiceState["task"]) : null });
       break;
+    case "client.ai_telemetry":
+      logAiTelemetry(d);
+      break;
     case "call.stats":
       // From the native player when a call ends: how smooth the speech was on this phone.
       applog(
@@ -161,12 +170,116 @@ export function applyCallEvent(action: string | undefined, d: Record<string, any
         `call audio: ${d.stalls ?? 0} stalls, ${d.underruns ?? -1} underruns, cushion ${d.target_ms ?? 0}/${d.max_target_ms ?? 0} ms, ${d.stops ?? 0} cut${d.denoise_us != null ? `, denoise ${d.denoise_us} us/hop` : ""}${d.vp_checks != null ? `, vp ${d.vp_passed ?? 0}/${d.vp_blocked ?? 0} (${d.vp_hold_ms ?? 0} ms hold)` : ""}`,
         d,
       );
+      void uploadAppLog();
       break;
     case "error":
       applog("warn", "voice", `voice service error ${d.error?.code ?? "unknown"}`);
       useVoice.setState({ message: `语音服务报错：${d.error?.code ?? "未知"}` });
       break;
   }
+}
+
+function fmtNum(v: unknown, digits: number): string | null {
+  return typeof v === "number" && Number.isFinite(v) ? v.toFixed(digits) : null;
+}
+
+function fmtSignedDb(v: unknown): string | null {
+  return typeof v === "number" && Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${v.toFixed(1)} dB` : null;
+}
+
+function fmtPct(v: unknown): string | null {
+  return typeof v === "number" && Number.isFinite(v) ? `${Math.round(v * 100)}%` : null;
+}
+
+function logAiTelemetry(d: Record<string, any>): void {
+  const stage = typeof d.stage === "string" ? d.stage : "telemetry";
+  if (stage === "init") {
+    const route = typeof d.route === "string" && d.route ? d.route : "default";
+    const hasDenoise = d.denoise_enabled !== false && d.denoise !== false && d.denoise_model !== "off" && d.denoise_model !== "none";
+    const hasTse = Boolean(d.tse_enabled ?? d.tse ?? (Array.isArray(d.models) && d.models.some((m: unknown) => /voxlock|tse/i.test(String(m)))));
+    const hasSv = Boolean(d.sv_enabled ?? d.sv ?? (Array.isArray(d.models) && d.models.some((m: unknown) => /eres2net|sv|speaker/i.test(String(m)))));
+    const hasVad = d.vad_enabled !== false && (hasSv || hasTse || Boolean(d.vad_enabled) || (Array.isArray(d.models) && d.models.some((m: unknown) => /vad|silero/i.test(String(m)))));
+    const models = [hasDenoise && "DPDFNet", hasTse && "VoxLock TSE", hasSv && "ERes2NetV2-zh", hasVad && "Silero VAD"].filter(Boolean).join(" + ") || "raw mic";
+    const parts = [`ai init [${route}]: ${models}`];
+    const enrollMs = fmtNum(d.enroll_ms, 0);
+    if (enrollMs !== null) parts.push(`enroll ${enrollMs} ms`);
+    const thr = fmtNum(d.threshold, 2);
+    if (thr !== null) parts.push(`thr ${thr}`);
+    const protos = d.prototypes_count ?? d.prototypes;
+    if (typeof protos === "number") parts.push(`protos ${protos}`);
+    applog("info", "voice.ai", parts.join(", "), d);
+    return;
+  }
+
+  if (stage === "utterance") {
+    const verdict = d.pass === false ? "mute" : "pass";
+    const kind = typeof d.kind === "string" && d.kind && d.kind !== verdict ? `(${d.kind})` : "";
+    const parts = [`ai utterance ${verdict}${kind}`];
+    const sv = fmtNum(d.sv_score, 2);
+    if (sv !== null) {
+      const hasBreak = d.sv_raw != null || d.sv_proto != null || d.sv_sess != null;
+      const sub = hasBreak ? ` (raw ${fmtNum(d.sv_raw, 2) ?? "-"}/proto ${fmtNum(d.sv_proto, 2) ?? "-"}/sess ${fmtNum(d.sv_sess, 2) ?? "-"})` : "";
+      parts.push(`sv ${sv}${sub}`);
+    }
+    const atten = fmtSignedDb(d.tse_atten_db);
+    if (atten !== null) parts.push(`tse ${atten}`);
+    if (d.raw_dbfs != null || d.enh_dbfs != null) {
+      parts.push(`${fmtNum(d.raw_dbfs, 1) ?? "-"}->${fmtNum(d.enh_dbfs, 1) ?? "-"} dBFS`);
+    }
+    const svMs = fmtNum(d.sv_ms, 0);
+    if (svMs !== null) parts.push(`sv_ms ${svMs} ms`);
+    const usedMs = fmtNum(d.used_ms, 0);
+    if (usedMs !== null) parts.push(`used ${usedMs} ms`);
+    if (Number(d.tse_overruns) > 0) parts.push(`overruns ${d.tse_overruns}`);
+    const warn = Number(d.tse_overruns) > 0 || Number(d.sv_ms) > 250;
+    applog(warn ? "warn" : "info", "voice.ai", parts.join(", "), d);
+    return;
+  }
+
+  if (stage === "periodic") {
+    const parts = [
+      `ai stream: frames ${d.frames_in ?? 0}/${d.frames_out ?? 0}`,
+      `gap_max ${fmtNum(d.ws_gap_max_ms, 0) ?? 0} ms`,
+      `dpdf ${fmtNum(d.dpdf_us_avg, 0) ?? 0} us`,
+      `tse ${fmtNum(d.tse_ms_avg, 1) ?? "0.0"} ms (rtf ${fmtNum(d.tse_rtf, 2) ?? "0.00"})`,
+      `speech ${fmtPct(d.vad_speech_ratio) ?? "0%"}`,
+    ];
+    const gated = fmtPct(d.gated_ratio);
+    if (gated !== null) parts.push(`gated ${gated}`);
+    if (Number(d.tse_overruns) > 0) parts.push(`overruns ${d.tse_overruns}`);
+    const warn = Number(d.ws_gap_max_ms) > 120 || Number(d.tse_rtf) > 0.85 || Number(d.tse_overruns) > 0;
+    applog(warn ? "warn" : "info", "voice.ai", parts.join(", "), d);
+    return;
+  }
+
+  if (stage === "summary") {
+    const route = typeof d.route === "string" && d.route ? ` [${d.route}]` : "";
+    const parts = [`ai summary${route}`];
+    const durMs = d.duration_ms ?? d.call_ms;
+    if (typeof durMs === "number" && Number.isFinite(durMs)) parts.push(`${(durMs / 1000).toFixed(1)}s`);
+    if (d.frames_in != null || d.frames_out != null) parts.push(`frames ${d.frames_in ?? 0}/${d.frames_out ?? 0}`);
+    const gapMax = fmtNum(d.ws_gap_max_ms, 0);
+    if (gapMax !== null) parts.push(`gap_max ${gapMax} ms`);
+    const dpdfUs = fmtNum(d.dpdf_us_avg, 0);
+    if (dpdfUs !== null) parts.push(`dpdf ${dpdfUs} us`);
+    if (d.tse_ms_avg != null || d.tse_rtf != null) {
+      parts.push(`tse ${fmtNum(d.tse_ms_avg, 1) ?? "-"} ms (rtf ${fmtNum(d.tse_rtf, 2) ?? "-"})`);
+    }
+    const svChecks = d.sv_checks ?? d.vp_checks;
+    if (svChecks != null) {
+      parts.push(`sv ${d.sv_passed ?? d.vp_passed ?? 0}/${svChecks} pass`);
+    }
+    const speech = fmtPct(d.vad_speech_ratio);
+    if (speech !== null) parts.push(`speech ${speech}`);
+    if (Number(d.tse_overruns) > 0) parts.push(`overruns ${d.tse_overruns}`);
+    if (d.tse_bypassed) parts.push("tse_bypassed");
+    const warn = Number(d.ws_gap_max_ms) > 120 || Number(d.tse_rtf) > 0.85 || Number(d.tse_overruns) > 0 || Boolean(d.tse_bypassed);
+    applog(warn ? "warn" : "info", "voice.ai", parts.join(", "), d);
+    void uploadAppLog();
+    return;
+  }
+
+  applog("info", "voice.ai", `ai ${stage}`, d);
 }
 
 /** Loudness from the native side, ten times a second. Also decides when the assistant has really stopped being heard. */
@@ -189,7 +302,14 @@ export function syncNativeVoice(): void {
   if (!PocketNative?.setVoiceSettings) return;
   const s = useSettings.getState();
   PocketNative.setVoiceSettings(s.voiceDenoise, s.voiceFilter, s.voiceThreshold);
-  PocketNative.setVoiceprint?.(s.voiceprint?.embedding ?? null);
+  if (s.voiceprint?.modelVersion === VOICEPRINT_MODEL_VERSION) {
+    PocketNative.setVoiceprint?.(s.voiceprint.embedding);
+    PocketNative.setVoiceprintMeta?.(s.voiceprint.prototypes ?? null, s.voiceprint.modelVersion);
+  } else {
+    // Incompatible legacy CAM++ voiceprint (or none): clear native embedding so it never poisons ERes2NetV2 cosine checks.
+    PocketNative.setVoiceprint?.(null);
+    PocketNative.setVoiceprintMeta?.(null, null);
+  }
 }
 
 let wired = false;
@@ -202,6 +322,7 @@ function wire() {
       setWaiting(false);
       callLevel.value = 0;
       useVoice.setState({ status: "ended", message: e.message ?? null, muted: false, startedAt: null, ...QUIET });
+      void uploadAppLog();
     } else {
       useVoice.setState((s) => ({
         status: e.state,

@@ -160,14 +160,23 @@ class PocketNativeModule : Module() {
 
     Function("voiceState") {
       val p = Prefs(context)
+      val hasEmb = p.voiceEmbedding != null
+      val ver = p.voiceModelVersion
+      val enrolled = hasEmb && ver == VoiceModelManager.VOICEPRINT_MODEL_VERSION
+      val legacyEnrolled = hasEmb && ver != VoiceModelManager.VOICEPRINT_MODEL_VERSION
+      val modelReady = VoiceModelManager.isSpeakerReady(context)
+      val tseReady = enrolled && modelReady && VoiceModelManager.hasOwnerSample(context)
       mapOf(
         "denoise" to p.voiceDenoise,
         "filter" to p.voiceFilter,
         "threshold" to p.voiceThreshold.toDouble(),
-        "enrolled" to (p.voiceEmbedding != null),
-        "modelReady" to VoiceModelManager.isSpeakerReady(context),
+        "enrolled" to enrolled,
+        "legacyEnrolled" to legacyEnrolled,
+        "tseReady" to tseReady,
+        "modelVersion" to VoiceModelManager.VOICEPRINT_MODEL_VERSION,
+        "modelReady" to modelReady,
         "modelDownloading" to VoiceModelManager.downloading,
-        "modelSize" to VoiceModelManager.SPEAKER_SIZE.toDouble(),
+        "modelSize" to VoiceModelManager.MODEL_PACK_SIZE.toDouble(),
       )
     }
 
@@ -180,7 +189,23 @@ class PocketNativeModule : Module() {
 
     Function("setVoiceprint") { embedding: List<Double>? ->
       val p = Prefs(context)
-      p.voiceEmbedding = embedding?.takeIf { it.isNotEmpty() }?.map { it.toFloat() }?.toFloatArray()
+      val arr = embedding?.takeIf { it.isNotEmpty() }?.map { it.toFloat() }?.toFloatArray()
+      if (arr == null) {
+        p.voiceEmbedding = null
+        p.voicePrototypes = null
+        p.voiceModelVersion = null
+        VoiceModelManager.deleteOwnerSample(context)
+      } else {
+        p.voiceEmbedding = arr
+      }
+    }
+
+    Function("setVoiceprintMeta") { prototypes: List<List<Double>>?, modelVersion: String? ->
+      val p = Prefs(context)
+      p.voicePrototypes = prototypes
+        ?.mapNotNull { row -> row.takeIf { it.isNotEmpty() }?.map { it.toFloat() }?.toFloatArray() }
+        ?.takeIf { it.isNotEmpty() }
+      p.voiceModelVersion = modelVersion?.takeIf { it.isNotEmpty() }
     }
 
     AsyncFunction("prepareVoiceModel") { promise: Promise ->

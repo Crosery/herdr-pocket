@@ -83,7 +83,7 @@ export function adminPage(): string {
       <select id="since"><option value="15m">15 分钟</option><option value="1h" selected>1 小时</option><option value="6h">6 小时</option><option value="1d">1 天</option><option value="7d">7 天</option><option value="14d">14 天</option></select>
       <select id="device"><option value="">所有设备</option></select>
       <select id="source"><option value="">所有来源</option><option value="relay">服务器</option><option value="host">电脑</option><option value="viewer">手机</option></select>
-      <input id="kind" placeholder="类别，如 assistant、action、rpc" size="22">
+      <input id="kind" placeholder="类别，如 live.ai、voice.ai、assistant、rpc" size="28">
       <select id="level"><option value="">所有级别</option><option value="info">info 以上</option><option value="warn">warn 以上</option><option value="error">只看 error</option></select>
       <input id="text" placeholder="包含文字" size="16">
       <select id="limit"><option>100</option><option selected>300</option><option>1000</option></select>

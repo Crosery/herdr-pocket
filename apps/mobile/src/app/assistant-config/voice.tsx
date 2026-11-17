@@ -15,7 +15,7 @@ import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Input, KeyField, Loa
 import { changeConfig, flash, loadConfig, useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
 import { useSettings } from "../../lib/store";
 import { isMockServer } from "../../lib/mock";
-import { voiceprintSupported } from "../../lib/voice";
+import { isVoiceprintLegacy, voiceprintSupported } from "../../lib/voice";
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
 
@@ -72,9 +72,18 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
   const voiceprint = useSettings((x) => x.voiceprint);
   const server = useSettings((x) => x.server);
   const localOk = voiceprintSupported || isMockServer(server);
+  const legacy = isVoiceprintLegacy(voiceprint);
   const localSub = !localOk
     ? "需要装新版 App"
-    : `${voiceDenoise ? "降噪已开" : "降噪关着"} · ${voiceprint ? (voiceFilter ? "只认你的声音" : "声纹已存（暂停过滤）") : "未录声纹"}`;
+    : `${voiceDenoise ? "降噪已开" : "降噪关着"} · ${
+        legacy
+          ? "声纹引擎已升级，请重录一次"
+          : voiceprint
+            ? voiceFilter
+              ? "只提取你的声音"
+              : "声纹已存（暂停提取）"
+            : "未录声纹"
+      }`;
 
   /** Picking another service starts from its own defaults: a MOSS address is no use to another service. */
   function pick(next: VoiceProviderId | null) {

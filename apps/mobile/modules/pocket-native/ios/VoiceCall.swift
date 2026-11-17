@@ -4,7 +4,7 @@ import Foundation
 private let micRate = 16_000.0
 private let speakerRate = 48_000
 private let speakerPerMs = speakerRate / 1000
-/// 20 ms of 16 kHz mono PCM16.
+/// 20 ms of 16 kHz mono PCM16 (320 samples = 2 DPDFNet 10 ms hops).
 private let micFrameBytes = 640
 /// How often the play timer looks again for audio to schedule.
 private let playLoopMs = 5
@@ -18,15 +18,10 @@ private struct CallError: LocalizedError {
 
 /**
  * One voice call to the relay's /v1/assistant/live, the iOS side of VoiceCall.kt.
- * Audio never passes through JavaScript: the microphone goes straight to the
+ * Audio never passes through JavaScript: the microphone goes straight through the
+ * zero-stall native pipeline (`VoxLock -> DPDFNet-baseline -> VocalEnhancer`) to the
  * socket, speech straight to the speaker, and playback receipts follow what was
- * actually heard (MOSS-Live playback.* events). JS only gets the text events for
- * captions and state, through the same onCall / onCallEvent / onLevel events.
- *
- * Everything but the microphone tap runs on one serial queue `q` (the Kotlin
- * side's `lock`). AVAudioEngine's voice processing gives echo cancellation,
- * noise suppression and gain control; the session's voiceChat mode routes to a
- * headset when one is connected, otherwise to the loudspeaker.
+ * actually heard (MOSS-Live playback.* events).
  */
 final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
   private static let currentLock = NSLock()
@@ -36,12 +31,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     set { currentLock.lock(); _current = newValue; currentLock.unlock() }
   }
 
-  /**
-   * Audio session changes, one at a time across calls. Switching the session off
-   * can block for seconds while the system stops I/O; it runs after the call has
-   * reported its end, and a call started meanwhile waits for it here instead of
-   * having its own session switched off by the one before.
-   */
   static let sessionQueue = DispatchQueue(label: "dev.crosery.pocket.audio-session")
 
   static func start(server: String, token: String) {
@@ -90,10 +79,14 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
   private let server: String
   private let token: String
   private let q = DispatchQueue(label: "dev.crosery.pocket.voice", qos: .userInteractive)
+  private let micQueue = DispatchQueue(label: "dev.crosery.pocket.mic", qos: .userInteractive)
+  private let tseQueue = DispatchQueue(label: "dev.crosery.pocket.tse", qos: .userInteractive)
   private let spkQueue = DispatchQueue(label: "dev.crosery.pocket.spk", qos: .userInitiated)
+
   private let useDenoise: Bool
   private let voiceThreshold: Float
   private let enrolledVoice: [Float]?
+  private let voicePrototypes: [[Float]]
   private var voiceModels: VoiceModels?
   private var filter: VoiceFilter?
   private var modelsLoaded = false
@@ -111,14 +104,24 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
   private var observers: [NSObjectProtocol] = []
 
   // Call state; on `q`.
+  private var startedAtMs: Int64 = monoMs()
   private var ended = false
   private var opened = false
   private var ready = false
+  private var summarySent = false
   private var micLevel: Float = 0
+  private var lastRoute = "speaker"
+  private var pendingInitTelemetryJson: String?
+
+  // Outbound PCM continuity telemetry; on `q`.
+  private var framesIn: Int64 = 0
+  private var framesOut: Int64 = 0
+  private var lastWsSendAtMs: Int64 = 0
+  private var wsGapMaxMsWindow: Int64 = 0
+  private var wsGapMaxMsCall: Int64 = 0
 
   private let flagLock = NSLock()
   private var _muted = false
-  /// Read from the JS thread (callState), so behind a lock.
   var muted: Bool {
     get { flagLock.lock(); defer { flagLock.unlock() }; return _muted }
     set { flagLock.lock(); _muted = newValue; flagLock.unlock() }
@@ -126,15 +129,10 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
 
   // Playback ledger; on `q`.
   private var contexts: [Ref] = []
-  /// Audio received and not yet scheduled on the player: the jitter buffer.
   private let playout = Playout<Chunk>(framesPerMs: speakerPerMs)
-  /// Chunks scheduled on the player and not yet heard in full, oldest first.
   private var inflight: [Chunk] = []
-  /// When the first of `inflight` started playing.
   private var headStartedAt: Int64 = 0
-  /// Bumped by a flush: receipts from the player for what was flushed are ignored.
   private var generation = 0
-  /// Replies the service stopped (response.audio.stop), for the call's stats.
   private var stops = 0
   private var scopes: [String: Scope] = [:]
   private var stoppedRuns = Set<String>()
@@ -144,56 +142,93 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     self.token = token
     self.useDenoise = VoicePrefs.denoise
     self.voiceThreshold = VoicePrefs.threshold
-    self.enrolledVoice = VoicePrefs.filter ? VoicePrefs.embedding : nil
+    let canFilter = VoicePrefs.filter && VoicePrefs.isCurrentEnrolled
+    self.enrolledVoice = canFilter ? VoicePrefs.embedding : nil
+    self.voicePrototypes = canFilter ? (VoicePrefs.prototypes ?? []) : []
     super.init()
   }
 
   // MARK: - start
 
   private func begin() {
+    startedAtMs = monoMs()
     PocketBus.emit("onCall", ["state": "connecting"])
-    let needSpeaker = enrolledVoice != nil && VoiceModelManager.isSpeakerReady()
-    if useDenoise || needSpeaker {
-      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-        let loaded = try? VoiceModelManager.openModels(needSpeaker: needSpeaker)
-        self?.q.async {
-          guard let self else { return }
-          if self.ended { return }
-          self.voiceModels = loaded
-          if let loaded, self.useDenoise || (self.enrolledVoice != nil && loaded.speaker != nil) {
-            self.filter = VoiceFilter(
-              loaded,
-              VoiceFilter.Options(denoise: self.useDenoise, enrolled: self.enrolledVoice, threshold: self.voiceThreshold),
-              worker: { [weak self] job in self?.spkQueue.async(execute: job) },
-              emit: { [weak self] pcm in
-                guard let self, !self.ended else { return }
-                let lv = pcmLevel(pcm)
-                self.micLevel = self.muted ? 0 : lv
-                if self.ready && !self.muted { self.ws?.send(.data(pcm)) { _ in } }
-              }
-            )
-          }
-          self.modelsLoaded = true
-        }
-      }
-    } else {
-      modelsLoaded = true
-    }
     do {
       try openAudio()
+      lastRoute = currentAudioRoute()
     } catch {
       end("打不开麦克风：\(error.localizedDescription)")
       return
     }
+
+    let needSpeaker = enrolledVoice != nil && VoiceModelManager.isSvOnlyReady()
+    let ownerSample = (enrolledVoice != nil) ? VoiceModelManager.loadOwnerSample() : nil
+    let needTse = enrolledVoice != nil && ownerSample != nil && VoiceModelManager.isTseReady()
+
+    if useDenoise || needSpeaker || needTse {
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        guard let self else { return }
+        let tLoad0 = DispatchTime.now().uptimeNanoseconds
+        let loaded = try? VoiceModelManager.openModels(needSpeaker: needSpeaker, needTse: needTse)
+        let loadMs = Int64((DispatchTime.now().uptimeNanoseconds - tLoad0) / 1_000_000)
+
+        var tseEnr: VoxLockEnrollment?
+        var enrollMs: Int64 = 0
+        if let loaded, needTse, let sample = ownerSample {
+          if let (enr, ms) = try? VoxLockEnrollment.compute(loaded, ownerSamples: sample) {
+            tseEnr = enr
+            enrollMs = ms
+          }
+        }
+
+        var createdFilter: VoiceFilter?
+        if let loaded, self.useDenoise || (self.enrolledVoice != nil && loaded.speaker != nil) || tseEnr != nil {
+          createdFilter = VoiceFilter(
+            loaded,
+            VoiceFilter.Options(
+              denoise: self.useDenoise,
+              enrolled: self.enrolledVoice,
+              prototypes: self.voicePrototypes,
+              threshold: self.voiceThreshold,
+              tseEnrollment: tseEnr,
+              needAutoOwnerSample: self.enrolledVoice != nil && ownerSample == nil
+            ),
+            worker: { [weak self] job in self?.spkQueue.async(execute: job) },
+            tseWorker: { [weak self] job in self?.tseQueue.async(execute: job) },
+            emit: { [weak self] pcm in
+              self?.q.async { self?.onFilteredPcm(pcm) }
+            },
+            onUtterance: { [weak self] rep in
+              self?.q.async { self?.emitUtteranceTelemetry(rep) }
+            }
+          )
+        }
+
+        self.micQueue.async { [weak self] in
+          guard let self else { return }
+          self.voiceModels = loaded
+          self.filter = createdFilter
+          self.modelsLoaded = true
+          self.q.async {
+            if self.ended { return }
+            self.emitInitTelemetry(filter: createdFilter, loadMs: loadMs, enrollMs: enrollMs)
+          }
+        }
+      }
+    } else {
+      micQueue.async { [weak self] in
+        self?.modelsLoaded = true
+      }
+      emitInitTelemetry(filter: nil, loadMs: 0, enrollMs: 0)
+    }
+
     guard let url = wsUrl(server, "/v1/assistant/live") else {
       end("服务器地址不对")
       return
     }
     var req = URLRequest(url: url)
-    // The token rides in a header: a URL ends up in reverse-proxy access logs.
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     let config = URLSessionConfiguration.default
-    // The socket stays open for the whole call; the connect timeout is the timer below.
     config.timeoutIntervalForRequest = 7 * 24 * 3600
     config.timeoutIntervalForResource = 7 * 24 * 3600
     let ops = OperationQueue()
@@ -208,6 +243,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     receive(task)
     every(ms: playLoopMs) { [weak self] in self?.pump() }
     every(ms: 100) { [weak self] in self?.reportLevel() }
+    every(ms: 5_000) { [weak self] in self?.emitPeriodicTelemetry() }
     every(ms: 20_000) { [weak self] in self?.ping() }
     q.asyncAfter(deadline: .now() + 15) { [weak self] in
       guard let self, !self.ended, !self.opened else { return }
@@ -236,19 +272,14 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     guard VoiceCall.micAllowed() else { throw CallError(message: "没有麦克风权限") }
     let audio = AVAudioSession.sharedInstance()
     try VoiceCall.sessionQueue.sync {
-      // Voice chat: a headset when one is connected, otherwise the loudspeaker (a hands-free call).
       try audio.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
       try? audio.setPreferredSampleRate(Double(speakerRate))
       try? audio.setPreferredIOBufferDuration(0.02)
       try audio.setActive(true)
     }
     #if !targetEnvironment(simulator)
-    // Hear the person, not our own voice coming out of the speaker.
     try? engine.inputNode.setVoiceProcessingEnabled(true)
     #endif
-    // Not in the iOS Simulator: its audio server deadlocks on voice processing and
-    // CoreAudio aborts the app ("RPC timeout. Apparently deadlocked"). The Mac's
-    // microphone and speakers are enough to check a call there.
     engine.attach(player)
     engine.connect(player, to: engine.mainMixerNode, format: speakerFormat)
     try installMicTap()
@@ -267,7 +298,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     })
   }
 
-  /// The microphone at its own rate, turned into 16 kHz mono PCM16 on the tap's thread.
   private func installMicTap() throws {
     let input = engine.inputNode
     let format = input.outputFormat(forBus: 0)
@@ -277,7 +307,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     input.removeTap(onBus: 0)
     input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(max(256, format.sampleRate / 50)), format: format) { [weak self] buffer, _ in
       guard let data = VoiceCall.convert(buffer, with: converter, to: target) else { return }
-      self?.q.async { self?.onMic(data) }
+      self?.micQueue.async { self?.onMicBuffer(data) }
     }
   }
 
@@ -300,12 +330,10 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     return Data(bytes: channel[0], count: Int(out.frameLength) * 2)
   }
 
-  /// A headset came or went (or the system reset the audio): carry on with the new hardware.
   private func restartEngine() {
     if ended { return }
     do {
       if !engine.isRunning {
-        // What was on the player may not have been heard: it goes back to be played again.
         generation += 1
         player.stop()
         playout.requeue(inflight)
@@ -317,6 +345,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
         try engine.start()
       }
       player.play()
+      lastRoute = currentAudioRoute()
     } catch {
       end("音频设备变了，通话断了")
     }
@@ -330,38 +359,206 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     engine.stop()
   }
 
-  // MARK: - microphone
+  // MARK: - microphone (`micQueue` -> `q`)
 
-  private func onMic(_ data: Data) {
-    if ended { return }
+  private func onMicBuffer(_ data: Data) {
     micPending.append(data)
-    let muted = self.muted
+    let isMuted = self.muted
     while micPending.count >= micFrameBytes {
       let start = micPending.startIndex
       let frame = micPending.subdata(in: start ..< start + micFrameBytes)
       micPending = micPending.subdata(in: start + micFrameBytes ..< micPending.endIndex)
-      if muted {
+      q.async { [weak self] in self?.framesIn += 1 }
+      if isMuted {
         if filterReset {
           filterReset = false
           filter?.reset()
         }
-        micLevel = 0
-        // Silence keeps flowing while muted: the model expects a continuous realtime stream.
-        if ready { ws?.send(.data(silence)) { _ in } }
+        q.async { [weak self] in self?.sendMutedSilence() }
       } else if let vf = filter {
         filterReset = false
-        let before = vf.hopsIn
-        micLevel *= 0.6
         vf.push(frame)
-        if vf.hopsIn == before { micLevel = 0 }
       } else if !modelsLoaded && (useDenoise || enrolledVoice != nil) {
-        // Models are still loading (~150 ms at call start); hold mic frames until ready instead of leaking raw audio.
-        micLevel = 0
+        // Models still loading (~150 ms at call start): send continuous silence if WS is already ready so stream never gaps.
+        q.async { [weak self] in self?.sendMutedSilence() }
       } else {
-        micLevel = pcmLevel(frame)
-        if ready { ws?.send(.data(frame)) { _ in } }
+        q.async { [weak self] in self?.onFilteredPcm(frame) }
       }
     }
+  }
+
+  private func sendMutedSilence() {
+    if ended { return }
+    micLevel = 0
+    sendBinaryPcm(silence)
+  }
+
+  private func onFilteredPcm(_ pcm: Data) {
+    if ended { return }
+    if muted {
+      micLevel = 0
+      sendBinaryPcm(silence)
+      return
+    }
+    micLevel = pcmLevel(pcm)
+    sendBinaryPcm(pcm)
+  }
+
+  private func sendBinaryPcm(_ pcm: Data) {
+    guard ready, let ws else { return }
+    let now = monoMs()
+    if lastWsSendAtMs > 0 {
+      let gap = now - lastWsSendAtMs
+      if gap > wsGapMaxMsWindow { wsGapMaxMsWindow = gap }
+      if gap > wsGapMaxMsCall { wsGapMaxMsCall = gap }
+    }
+    lastWsSendAtMs = now
+    framesOut += 1
+    ws.send(.data(pcm)) { _ in }
+  }
+
+  // MARK: - AI telemetry (`client.ai_telemetry`)
+
+  private func emitTelemetry(_ d: [String: Any]) {
+    let payload: [String: Any] = ["action": "client.ai_telemetry", "data": d]
+    guard let json = jsonString(payload) else { return }
+    PocketBus.emit("onCallEvent", ["json": json])
+    if ready {
+      ws?.send(.string(json)) { _ in }
+    } else if (d["stage"] as? String) == "init" {
+      pendingInitTelemetryJson = json
+    }
+  }
+
+  private func emitInitTelemetry(filter f: VoiceFilter?, loadMs: Int64, enrollMs: Int64) {
+    lastRoute = currentAudioRoute()
+    let svEnabled = f?.svEnabled ?? false
+    let tseEnabled = f?.tseEnabled ?? false
+    let vadEnabled = svEnabled || tseEnabled
+    let denoiseActive = (useDenoise || tseEnabled) && f != nil
+    var activeModels: [String] = []
+    if denoiseActive { activeModels.append("dpdfnet_baseline") }
+    if tseEnabled { activeModels.append("voxlock_v2_int8") }
+    if svEnabled { activeModels.append("eres2netv2_zh") }
+    if vadEnabled { activeModels.append("silero_vad_v4") }
+    emitTelemetry([
+      "stage": "init",
+      "platform": "ios",
+      "route": lastRoute,
+      "models": activeModels,
+      "denoise_enabled": denoiseActive,
+      "denoise_model": denoiseActive ? "dpdfnet_baseline" : "none",
+      "sv_enabled": svEnabled,
+      "sv_model": svEnabled ? "eres2netv2_zh" : "none",
+      "tse_enabled": tseEnabled,
+      "tse_model": tseEnabled ? "voxlock_v2_int8" : "none",
+      "vad_enabled": vadEnabled,
+      "vad_model": vadEnabled ? "silero_vad_v4" : "none",
+      "model_version": VOICEPRINT_MODEL_VERSION,
+      "load_ms": loadMs,
+      "enroll_ms": enrollMs,
+      "threshold": finiteDouble(Double(voiceThreshold), digits: 3),
+      "prototypes_count": voicePrototypes.count,
+    ])
+  }
+
+  private func emitUtteranceTelemetry(_ r: VoiceFilter.UtteranceReport) {
+    if ended { return }
+    lastRoute = currentAudioRoute()
+    emitTelemetry([
+      "stage": "utterance",
+      "route": lastRoute,
+      "kind": r.kind,
+      "pass": r.pass,
+      "sv_score": finiteDouble(r.svScore, digits: 4),
+      "sv_raw": finiteDouble(r.svRaw, digits: 4),
+      "sv_proto": finiteDouble(r.svProto, digits: 4),
+      "sv_sess": finiteDouble(r.svSess, digits: 4),
+      "sv_ms": r.svMs,
+      "used_ms": r.usedMs,
+      "vad_prob": finiteDouble(r.vadProb, digits: 3),
+      "raw_dbfs": finiteDouble(r.rawDbfs, digits: 1),
+      "tse_dbfs": finiteDouble(r.tseDbfs, digits: 1),
+      "enh_dbfs": finiteDouble(r.enhDbfs, digits: 1),
+      "tse_atten_db": finiteDouble(r.tseAttenDb, digits: 1),
+      "enh_gain_db": finiteDouble(r.enhGainDb, digits: 1),
+      "tse_overruns": filter?.tseOverruns ?? 0,
+    ])
+  }
+
+  private func emitPeriodicTelemetry() {
+    guard ready, !ended else { return }
+    lastRoute = currentAudioRoute()
+    let gapMax = wsGapMaxMsWindow
+    wsGapMaxMsWindow = 0
+    let f = filter
+    let hops = max(Int64(1), f?.hopsIn ?? 0)
+    let dpdfUsAvg: Int64 = (f != nil && (f?.hopsIn ?? 0) > 0) ? ((f!.denoiseNs / 1000) / hops) : 0
+    let dpdfUsMax: Int64 = (f?.denoiseMaxNs ?? 0) / 1000
+    emitTelemetry([
+      "stage": "periodic",
+      "route": lastRoute,
+      "frames_in": framesIn,
+      "frames_out": framesOut,
+      "ws_gap_max_ms": gapMax,
+      "dpdf_us_avg": dpdfUsAvg,
+      "dpdf_us_max": dpdfUsMax,
+      "tse_ms_avg": finiteDouble(f?.tseMsAvg ?? 0, digits: 2),
+      "tse_ms_max": finiteDouble(f?.tseMsMax ?? 0, digits: 2),
+      "tse_rtf": finiteDouble(f?.tseRtf ?? 0, digits: 3),
+      "tse_overruns": f?.tseOverruns ?? 0,
+      "tse_k": f?.tseKFrames ?? 0,
+      "tse_bypassed": f?.tseBypassed ?? false,
+      "vad_speech_ratio": finiteDouble(f?.vadSpeechRatio ?? 0, digits: 3),
+      "gated_ratio": finiteDouble(f?.gatedRatio ?? 0, digits: 3),
+    ])
+  }
+
+  private func emitSummaryTelemetryOnce() {
+    if summarySent { return }
+    summarySent = true
+    let f = filter
+    let hops = max(Int64(1), f?.hopsIn ?? 0)
+    let dpdfUsAvg: Int64 = (f != nil && (f?.hopsIn ?? 0) > 0) ? ((f!.denoiseNs / 1000) / hops) : 0
+    let dpdfUsMax: Int64 = (f?.denoiseMaxNs ?? 0) / 1000
+    let svChecks = f?.checks ?? 0
+    let svMsAvg: Int64 = svChecks > 0 ? ((f?.checkMsSum ?? 0) / Int64(svChecks)) : 0
+    let tseEnabled = f?.tseEnabled ?? false
+    let denoiseActive = (useDenoise || tseEnabled) && f != nil
+    let svPassed = f?.passed ?? 0
+    let svBlocked = f?.blocked ?? 0
+    emitTelemetry([
+      "stage": "summary",
+      "platform": "ios",
+      "route": lastRoute,
+      "duration_ms": max(0, monoMs() - startedAtMs),
+      "frames_in": framesIn,
+      "frames_out": framesOut,
+      "ws_gap_max_ms": wsGapMaxMsCall,
+      "denoise_model": denoiseActive ? "dpdfnet_baseline" : "none",
+      "tse_enabled": tseEnabled,
+      "tse_k": f?.tseKFrames ?? 0,
+      "tse_bypassed": f?.tseBypassed ?? false,
+      "sv_enabled": f?.svEnabled ?? false,
+      "dpdf_us_avg": dpdfUsAvg,
+      "dpdf_us_max": dpdfUsMax,
+      "tse_ms_avg": finiteDouble(f?.tseMsAvg ?? 0, digits: 2),
+      "tse_ms_max": finiteDouble(f?.tseMsMax ?? 0, digits: 2),
+      "tse_rtf": finiteDouble(f?.tseRtf ?? 0, digits: 3),
+      "tse_overruns": f?.tseOverruns ?? 0,
+      "utterances": svChecks,
+      "pass_count": svPassed,
+      "mute_count": svBlocked,
+      "sv_checks": svChecks,
+      "sv_ms_avg": svMsAvg,
+      "sv_ms_max": f?.checkMsMax ?? 0,
+      "sv_passed": svPassed,
+      "sv_blocked": svBlocked,
+      "vad_speech_ratio": finiteDouble(f?.vadSpeechRatio ?? 0, digits: 3),
+      "gated_ratio": finiteDouble(f?.gatedRatio ?? 0, digits: 3),
+      "stalls": playout.stalls,
+      "stops": stops,
+    ])
   }
 
   // MARK: - speaker
@@ -380,7 +577,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     return buffer
   }
 
-  /// Speech on the player not heard yet, in frames. The chunk playing counts until the player says it is done.
   private func pendingFrames(_ now: Int64) -> Int64 {
     guard let head = inflight.first else { return 0 }
     let total = inflight.reduce(Int64(0)) { $0 + Int64($1.frames) }
@@ -388,11 +584,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     return max(1, total - into)
   }
 
-  /**
-   * Feeds the speaker. The jitter buffer (Playout) says when a reply has enough
-   * audio in to start, and when one that ran dry may go on; up to `aheadMs` of it
-   * is scheduled on the player at a time, like the Android track's buffer.
-   */
   private func pump() {
     if ended { return }
     let now = monoMs()
@@ -414,7 +605,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     }
   }
 
-  /// The player has played `chunk` in full: its receipt, and those of any before it.
   private func played(_ chunk: Chunk, _ gen: Int) {
     if ended || gen != generation { return }
     guard let i = inflight.firstIndex(where: { $0 === chunk }) else { return }
@@ -430,7 +620,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     PocketBus.emit("onLevel", ["mic": Double(micLevel), "out": Double(inflight.first?.level ?? 0)])
   }
 
-  /// A chunk the speaker has played in full: its receipt, and the reply's when it was the last.
   private func acked(_ chunk: Chunk, _ out: inout [[String: Any]]) {
     out.append(["action": "playback.chunk.completed", "chunk_id": chunk.ref.chunkId, "run_id": chunk.ref.runId, "turn_id": chunk.ref.turnId])
     let s = scope(chunk.ref.runId, chunk.ref.turnId)
@@ -452,24 +641,20 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     return ["action": "playback.completed", "run_id": runId, "turn_id": s.turnId]
   }
 
-  /// The model was interrupted: stop its speech now and report how much was heard.
   private func stopRun(_ runId: String, _ turnId: String, _ reason: String) {
     var out: [[String: Any]] = []
     stoppedRuns.insert(runId)
     stops += 1
     playout.drop(runId)
     let s = scope(runId, turnId)
-    // Stopped, not completed: no playback.completed for it from the receipts.
     s.stopped = true
     if inflight.contains(where: { $0.ref.runId == runId }) {
-      // Chunks heard in full already have their receipts; this adds the part of the one playing.
       let heard = min(Int64(inflight[0].frames), max(0, (monoMs() - headStartedAt) * Int64(speakerPerMs)))
       var back: [Chunk] = []
       for (i, c) in inflight.enumerated() {
         if c.ref.runId == runId {
           if i == 0 { s.playedMs += Double(heard) * 1000 / Double(speakerRate) }
         } else {
-          // Another reply's audio on the player: it goes back to be played after the flush.
           back.append(c)
         }
       }
@@ -483,7 +668,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     s.finished = true
     s.stopped = true
     s.drained = true
-    // All of the reply that was heard; the relay turns it into what each service expects.
     out.append(["action": "playback.stopped", "run_id": runId, "turn_id": s.turnId, "played_audio_ms": Int64(s.playedMs), "reason": reason])
     s.playedMs = 0
     send(out)
@@ -561,6 +745,10 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
       case "ready":
         ready = true
         sendJSON(["action": "mic_state", "enabled": !muted])
+        if let pendingInit = pendingInitTelemetryJson {
+          pendingInitTelemetryJson = nil
+          ws?.send(.string(pendingInit)) { _ in }
+        }
         PocketBus.emit("onCall", ["state": "ready"])
       case "error", "closed":
         let message = str("message")
@@ -584,7 +772,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     case "response.audio.done":
       let run = str("run_id")
       if !stoppedRuns.contains(run) {
-        // A short reply that is all in plays at once, without waiting for the cushion.
         playout.finish(run)
         let s = scope(run, str("turn_id"))
         s.finished = true
@@ -596,7 +783,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     default:
       break
     }
-    // Captions and state for the UI; audio contexts are only plumbing.
     if action != "response.audio.context" { PocketBus.emit("onCallEvent", ["json": text]) }
   }
 
@@ -627,9 +813,11 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
 
   func setMuted(_ value: Bool) {
     muted = value
+    micQueue.async {
+      if value { self.filterReset = true }
+    }
     q.async {
       if self.ended { return }
-      if value { self.filterReset = true }
       if self.ready { self.sendJSON(["action": "mic_state", "enabled": !value]) }
       PocketBus.emit("onCall", ["state": "ready", "muted": value])
     }
@@ -642,7 +830,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
         self.end("挂断了")
         return
       }
-      // Close only once the hangup is out (or after a second), so the relay hears it.
+      self.emitSummaryTelemetryOnce()
       var done = false
       let finish = {
         if done { return }
@@ -654,7 +842,6 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     }
   }
 
-  /// Mid-reply stalls of the jitter buffer, its cushion and stopped replies. iOS reports no underruns: -1.
   private func stats() -> [String: Any] {
     var d: [String: Any] = [
       "stalls": playout.stalls,
@@ -673,7 +860,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
         d["vp_max_ms"] = f.checkMsMax
         d["vp_passed"] = f.passed
         d["vp_blocked"] = f.blocked
-        d["vp_hold_ms"] = f.holds > 0 ? f.holdMsSum / Int64(f.holds) : 0
+        d["vp_hold_ms"] = 0
       }
     }
     return ["action": "call.stats", "data": d]
@@ -682,6 +869,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
   /// On `q`.
   private func end(_ message: String) {
     if ended { return }
+    emitSummaryTelemetryOnce()
     ended = true
     ready = false
     VoiceCall.currentLock.lock()
@@ -693,21 +881,26 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     ws = nil
     session?.invalidateAndCancel()
     session = nil
-    // How the speaker did, for the app's log: what a real call leaves to look at afterwards.
+
     let s = stats()
     closeAudio()
-    filter = nil
+    let filterToDrop = filter
     let modelsToDrop = voiceModels
-    voiceModels = nil
-    spkQueue.async {
-      _ = modelsToDrop
+    micQueue.async { [weak self] in
+      self?.filter = nil
+      self?.voiceModels = nil
+      self?.tseQueue.async {
+        self?.spkQueue.async {
+          _ = filterToDrop
+          _ = modelsToDrop
+        }
+      }
     }
     if let json = jsonString(s) {
       NSLog("PocketVoice %@", json)
       PocketBus.emit("onCallEvent", ["json": json])
     }
     PocketBus.emit("onCall", ["state": "ended", "message": message])
-    // Last, and off the call's queue: this can block (see sessionQueue). Other apps' audio may resume.
     VoiceCall.sessionQueue.async {
       try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }

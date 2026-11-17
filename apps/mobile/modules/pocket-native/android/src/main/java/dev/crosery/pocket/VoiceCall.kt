@@ -1,11 +1,7 @@
 package dev.crosery.pocket
 
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioDeviceInfo
-import android.media.AudioFocusRequest
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
@@ -16,6 +12,8 @@ import android.os.Build
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import dev.crosery.pocket.voice.CommAudioRoute
+import dev.crosery.pocket.voice.Denoiser
 import dev.crosery.pocket.voice.VoiceFilter
 import dev.crosery.pocket.voice.VoiceLab
 import dev.crosery.pocket.voice.VoiceModelManager
@@ -31,26 +29,29 @@ import org.json.JSONObject
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.round
 import kotlin.math.sqrt
 
 private const val TAG = "PocketVoice"
 private const val MIC_RATE = 16_000
 private const val SPEAKER_RATE = 48_000
 private const val SPEAKER_PER_MS = SPEAKER_RATE / 1000
-/** 20 ms of 16 kHz mono PCM16. */
+/** 20 ms of 16 kHz mono PCM16 (exact 2 * Denoiser.HOP of 160 samples for zero framing jitter). */
 private const val MIC_FRAME_BYTES = 640
+private const val HOPS_PER_MIC_FRAME = MIC_FRAME_BYTES / (Denoiser.HOP * 2) // 2
 /** From Android 12 the track starts once this much is written; before, only once its whole buffer is full. */
 private const val START_THRESHOLD_MS = 40
 /** A track that holds audio but has not moved for this long is waiting to be filled: top it up with silence. */
 private const val STUCK_MS = 150L
 /** How often the play thread looks again when it has nothing to write. */
 private const val PLAY_LOOP_MS = 5L
+private const val PERIODIC_TELEMETRY_MS = 5_000L
 
 /**
  * One voice call to the relay's /v1/assistant/live. Audio never passes through
  * JavaScript: the microphone goes straight to the socket, speech straight to the
  * speaker, and playback receipts follow what was actually heard (MOSS-Live
- * playback.* events). JS only gets the text events for captions and state.
+ * playback.* events). JS gets captions, state, and structured AI telemetry.
  */
 class VoiceCall(
   private val ctx: Context,
@@ -81,9 +82,8 @@ class VoiceCall(
     .connectTimeout(15, TimeUnit.SECONDS)
     .build()
   private var ws: WebSocket? = null
-  private val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-  private var focus: AudioFocusRequest? = null
-  private var prevMode = AudioManager.MODE_NORMAL
+  private var routeHandle: CommAudioRoute.Handle? = null
+  @Volatile private var activeRoute = "speaker"
   private var record: AudioRecord? = null
   private var track: AudioTrack? = null
   private val effects = mutableListOf<android.media.audiofx.AudioEffect>()
@@ -98,17 +98,36 @@ class VoiceCall(
   private val useDenoise: Boolean
   private val voiceThreshold: Float
   private val enrolledVoice: FloatArray?
+  private val enrolledProtos: List<FloatArray>?
   private val modelsReady = CountDownLatch(1)
   @Volatile private var voiceModels: VoiceModels? = null
+  @Volatile private var ownerSample: FloatArray? = null
   @Volatile private var filter: VoiceFilter? = null
   private val spkExec = Executors.newSingleThreadExecutor { r -> Thread(r, "pocket-spk").apply { isDaemon = true } }
+  private val tseExec = Executors.newSingleThreadExecutor { r ->
+    Thread({
+      try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) } catch (_: Throwable) {}
+      r.run()
+    }, "pocket-tse").apply { isDaemon = true }
+  }
   private var micThread: Thread? = null
+
+  private val callStartedElapsed = SystemClock.elapsedRealtime()
+  private val telemetryLock = Any()
+  private var pendingInitTelemetry: String? = null
+  private var lastWsSendElapsed = 0L
+  private var windowWsGapMaxMs = 0L
+  private var callWsGapMaxMs = 0L
+  private var rawFramesIn = 0L
+  private var rawFramesOut = 0L
 
   init {
     val p = Prefs(ctx)
     useDenoise = p.voiceDenoise
     voiceThreshold = p.voiceThreshold
-    enrolledVoice = if (p.voiceFilter) p.voiceEmbedding else null
+    val versionOk = p.voiceModelVersion == VoiceModelManager.VOICEPRINT_MODEL_VERSION
+    enrolledVoice = if (p.voiceFilter && versionOk) p.voiceEmbedding else null
+    enrolledProtos = if (enrolledVoice != null) p.voicePrototypes else null
   }
 
   // Playback ledger; guarded by `lock`.
@@ -133,11 +152,14 @@ class VoiceCall(
     current = this
     VoiceLab.stop()
     PocketBus.emit("onCall", mapOf("state" to "connecting"))
-    val needSpeaker = enrolledVoice != null && VoiceModelManager.isSpeakerReady(ctx)
-    if (useDenoise || needSpeaker) {
+    val needSv = enrolledVoice != null && VoiceModelManager.isSvModelReady(ctx)
+    val hasSample = enrolledVoice != null && VoiceModelManager.hasOwnerSample(ctx)
+    val needTse = hasSample && VoiceModelManager.isTseModelsReady(ctx)
+    if (useDenoise || needSv || needTse) {
       thread("pocket-models") {
         try {
-          voiceModels = VoiceModelManager.openModels(ctx, needSpeaker)
+          if (needTse) ownerSample = VoiceModelManager.loadOwnerSample(ctx)
+          voiceModels = VoiceModelManager.openModels(ctx, needSpeaker = needSv, needTse = needTse && ownerSample != null)
         } catch (e: Throwable) {
           Log.w(TAG, "voice models", e)
         } finally {
@@ -179,17 +201,9 @@ class VoiceCall(
   // ----------------------------------------------------------------------- audio setup
 
   private fun openAudio() {
-    prevMode = am.mode
-    val attrs = AudioAttributes.Builder()
-      .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-      .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-      .build()
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN).setAudioAttributes(attrs).build()
-      am.requestAudioFocus(focus!!)
-    }
-    am.mode = AudioManager.MODE_IN_COMMUNICATION
-    routeOutput()
+    val rh = CommAudioRoute.open(ctx)
+    routeHandle = rh
+    activeRoute = rh.route
 
     val minIn = AudioRecord.getMinBufferSize(MIC_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
     @Suppress("MissingPermission")
@@ -199,13 +213,13 @@ class VoiceCall(
       AudioFormat.CHANNEL_IN_MONO,
       AudioFormat.ENCODING_PCM_16BIT,
       // Room for half a second: a busy phone must not lose the person's words.
-      maxOf(minIn * 2, MIC_FRAME_BYTES * 25),
+      maxOf(minIn * 2, MIC_FRAME_BYTES * 30),
     )
     if (rec.state != AudioRecord.STATE_INITIALIZED) {
       rec.release()
       throw IllegalStateException("没有麦克风权限")
     }
-    // Hear the person, not our own voice coming out of the speaker. When GTCRN runs, leave hardware NS off to avoid double-filtering.
+    // Hear the person, not our own voice coming out of the speaker. When DPDFNet runs, leave hardware NS off to avoid double-filtering.
     if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(rec.audioSessionId)?.let { it.enabled = true; effects.add(it) }
     if (!useDenoise && NoiseSuppressor.isAvailable()) NoiseSuppressor.create(rec.audioSessionId)?.let { it.enabled = true; effects.add(it) }
     if (AutomaticGainControl.isAvailable()) AutomaticGainControl.create(rec.audioSessionId)?.let { it.enabled = true; effects.add(it) }
@@ -213,7 +227,7 @@ class VoiceCall(
 
     val minOut = AudioTrack.getMinBufferSize(SPEAKER_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
     val tr = AudioTrack.Builder()
-      .setAudioAttributes(attrs)
+      .setAudioAttributes(rh.attrs)
       .setAudioFormat(
         AudioFormat.Builder()
           .setSampleRate(SPEAKER_RATE)
@@ -233,23 +247,6 @@ class VoiceCall(
     tr.play()
   }
 
-  /** Headset when one is plugged in, otherwise the loudspeaker (a hands-free call). */
-  private fun routeOutput() {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-      val devices = am.availableCommunicationDevices
-      val headset = devices.firstOrNull {
-        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-          it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET || it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-          it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-      }
-      val target = headset ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-      if (target != null) am.setCommunicationDevice(target)
-    } else {
-      @Suppress("DEPRECATION")
-      am.isSpeakerphoneOn = !am.isWiredHeadsetOn && !am.isBluetoothScoOn
-    }
-  }
-
   private fun closeAudio() {
     try { record?.stop() } catch (_: Throwable) {}
     try { record?.release() } catch (_: Throwable) {}
@@ -259,15 +256,184 @@ class VoiceCall(
     try { track?.release() } catch (_: Throwable) {}
     record = null
     track = null
-    try {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) am.clearCommunicationDevice()
-      else {
-        @Suppress("DEPRECATION")
-        am.isSpeakerphoneOn = false
+    routeHandle?.restore()
+    routeHandle = null
+  }
+
+  // ----------------------------------------------------------------------- AI telemetry
+
+  private fun sendBinaryFrame(buf: ByteArray, off: Int, len: Int) {
+    if (!ready) return
+    val now = SystemClock.elapsedRealtime()
+    synchronized(telemetryLock) {
+      if (lastWsSendElapsed > 0L) {
+        val gap = now - lastWsSendElapsed
+        if (gap > windowWsGapMaxMs) windowWsGapMaxMs = gap
+        if (gap > callWsGapMaxMs) callWsGapMaxMs = gap
       }
-      am.mode = prevMode
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) focus?.let { am.abandonAudioFocusRequest(it) }
-    } catch (_: Throwable) {}
+      lastWsSendElapsed = now
+    }
+    ws?.send(buf.toByteString(off, len))
+  }
+
+  private fun emitAiTelemetry(data: JSONObject, queueIfNotReady: Boolean = false) {
+    val json = JSONObject().put("action", "client.ai_telemetry").put("data", data).toString()
+    PocketBus.emit("onCallEvent", mapOf("json" to json))
+    synchronized(telemetryLock) {
+      if (ready) {
+        try { ws?.send(json) } catch (_: Throwable) {}
+      } else if (queueIfNotReady) {
+        pendingInitTelemetry = json
+      }
+    }
+  }
+
+  private fun emitInitTelemetry(models: VoiceModels?, vf: VoiceFilter?) {
+    val svActive = vf?.isSvActive == true
+    val tseActive = vf?.isTseActive == true
+    val d = JSONObject()
+      .put("stage", "init")
+      .put("route", activeRoute)
+      .put("denoise_enabled", useDenoise && models != null)
+      .put("denoise_model", if (useDenoise && models != null) "dpdfnet_baseline" else "none")
+      .put("vad_enabled", models != null && (svActive || tseActive))
+      .put("sv_enabled", svActive)
+      .put("sv_model", if (svActive) "eres2netv2_zh" else "none")
+      .put("tse_enabled", tseActive)
+      .put("tse_model", if (tseActive) "voxlock_v2_int8" else "none")
+      .put("model_version", VoiceModelManager.VOICEPRINT_MODEL_VERSION)
+      .put("enroll_ms", vf?.enrollMs ?: 0L)
+      .put("threshold", safeRound(voiceThreshold.toDouble(), 1000.0))
+      .put("prototypes_count", enrolledProtos?.size ?: 0)
+      .put("has_owner_sample", ownerSample != null)
+    Log.i(TAG, "ai.init $d")
+    emitAiTelemetry(d, queueIfNotReady = true)
+  }
+
+  private fun emitUtteranceTelemetry(u: VoiceFilter.UtteranceTelemetry, vf: VoiceFilter?) {
+    val d = JSONObject()
+      .put("stage", "utterance")
+      .put("route", activeRoute)
+      .put("kind", u.kind)
+      .put("pass", u.pass)
+      .put("sv_score", safeRound(u.svScore.toDouble(), 1000.0))
+      .put("sv_raw", safeRound(u.svRaw.toDouble(), 1000.0))
+      .put("sv_proto", safeRound(u.svProto.toDouble(), 1000.0))
+      .put("sv_sess", safeRound(u.svSess.toDouble(), 1000.0))
+      .put("sv_ms", u.svMs)
+      .put("used_ms", u.usedMs)
+      .put("vad_prob", safeRound(u.vadProb.toDouble(), 1000.0))
+      .put("raw_dbfs", safeRound(u.rawDbfs.toDouble(), 10.0))
+      .put("tse_dbfs", safeRound(u.tseDbfs.toDouble(), 10.0))
+      .put("enh_dbfs", safeRound(u.enhDbfs.toDouble(), 10.0))
+      .put("tse_atten_db", safeRound(u.tseAttenDb.toDouble(), 10.0))
+      .put("enh_gain_db", safeRound(u.enhGainDb.toDouble(), 10.0))
+      .put("tse_overruns", vf?.tseOverruns ?: 0)
+    Log.d(TAG, "ai.utterance $d")
+    emitAiTelemetry(d)
+  }
+
+  private fun emitPeriodicTelemetry(
+    vf: VoiceFilter?,
+    prevHopsIn: Long,
+    prevHopsOut: Long,
+    prevDenoiseNs: Long,
+    prevTseChunks: Long,
+    prevTseMsSum: Double,
+    prevTseAudioMs: Double,
+    prevVadTotal: Long,
+    prevVadSpeech: Long,
+    prevVoicedOut: Long,
+    prevGatedOut: Long,
+  ) {
+    val gapMax = synchronized(telemetryLock) {
+      val g = windowWsGapMaxMs
+      windowWsGapMaxMs = 0L
+      g
+    }
+    val framesIn = if (vf != null) vf.hopsIn - prevHopsIn else rawFramesIn - prevHopsIn
+    val framesOut = if (vf != null) vf.hopsOut - prevHopsOut else rawFramesOut - prevHopsOut
+    val dpdfUsAvg = if (vf != null && framesIn > 0) (vf.denoiseNs - prevDenoiseNs) / 1000L / framesIn else 0L
+    val dpdfUsMax = if (vf != null) vf.denoiseMaxNs / 1000L else 0L
+    val dTseChunks = if (vf != null) vf.tseChunks - prevTseChunks else 0L
+    val dTseMs = if (vf != null) vf.tseMsSum - prevTseMsSum else 0.0
+    val dTseAudioMs = if (vf != null) vf.tseAudioMsSum - prevTseAudioMs else 0.0
+    val tseMsAvg = if (dTseChunks > 0) dTseMs / dTseChunks else 0.0
+    val tseRtf = if (dTseAudioMs > 0.0) dTseMs / dTseAudioMs else 0.0
+    val dVadTotal = if (vf != null) vf.vadWindowsTotal - prevVadTotal else 0L
+    val dVadSpeech = if (vf != null) vf.vadSpeechWindows - prevVadSpeech else 0L
+    val vadRatio = if (dVadTotal > 0) dVadSpeech.toDouble() / dVadTotal else 0.0
+    val dVoiced = if (vf != null) vf.voicedOutHops - prevVoicedOut else 0L
+    val dGated = if (vf != null) vf.gatedOutHops - prevGatedOut else 0L
+    val gatedRatio = if (dVoiced > 0) dGated.toDouble() / dVoiced else 0.0
+
+    val d = JSONObject()
+      .put("stage", "periodic")
+      .put("route", activeRoute)
+      .put("frames_in", framesIn)
+      .put("frames_out", framesOut)
+      .put("ws_gap_max_ms", gapMax)
+      .put("dpdf_us_avg", dpdfUsAvg)
+      .put("dpdf_us_max", dpdfUsMax)
+      .put("tse_ms_avg", safeRound(tseMsAvg, 100.0))
+      .put("tse_ms_max", safeRound(vf?.tseMsMax ?: 0.0, 100.0))
+      .put("tse_rtf", safeRound(tseRtf, 1000.0))
+      .put("tse_overruns", vf?.tseOverruns ?: 0)
+      .put("tse_k", if (vf?.isTseActive == true) vf.tseK else 0)
+      .put("tse_bypassed", vf?.tseBypassed ?: false)
+      .put("vad_speech_ratio", safeRound(vadRatio, 1000.0))
+      .put("gated_ratio", safeRound(gatedRatio, 1000.0))
+      .put("raw_dbfs", safeRound((vf?.lastRawDbfs ?: -90f).toDouble(), 10.0))
+      .put("tse_dbfs", safeRound((vf?.lastTseDbfs ?: -90f).toDouble(), 10.0))
+      .put("enh_dbfs", safeRound((vf?.lastEnhDbfs ?: -90f).toDouble(), 10.0))
+    emitAiTelemetry(d)
+  }
+
+  private fun buildSummaryTelemetry(): JSONObject {
+    val vf = filter
+    val durationMs = maxOf(0L, SystemClock.elapsedRealtime() - callStartedElapsed)
+    val gapMax = synchronized(telemetryLock) { callWsGapMaxMs }
+    val underruns = synchronized(lock) {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) track?.underrunCount ?: -1 else -1
+    }
+    val playStalls = synchronized(lock) { playout.stalls }
+    val framesIn = vf?.hopsIn ?: rawFramesIn
+    val framesOut = vf?.hopsOut ?: rawFramesOut
+    val dpdfUsAvg = if (vf != null && vf.hopsIn > 0) vf.denoiseNs / 1000L / vf.hopsIn else 0L
+    val dpdfUsMax = if (vf != null) vf.denoiseMaxNs / 1000L else 0L
+    val tseMsAvg = if (vf != null && vf.tseChunks > 0) vf.tseMsSum / vf.tseChunks else 0.0
+    val tseRtf = if (vf != null && vf.tseAudioMsSum > 0.0) vf.tseMsSum / vf.tseAudioMsSum else 0.0
+    val vadRatio = if (vf != null && vf.vadWindowsTotal > 0) vf.vadSpeechWindows.toDouble() / vf.vadWindowsTotal else 0.0
+    val gatedRatio = if (vf != null && vf.voicedOutHops > 0) vf.gatedOutHops.toDouble() / vf.voicedOutHops else 0.0
+
+    val d = JSONObject()
+      .put("stage", "summary")
+      .put("route", activeRoute)
+      .put("duration_ms", durationMs)
+      .put("frames_in", framesIn)
+      .put("frames_out", framesOut)
+      .put("ws_gap_max_ms", gapMax)
+      .put("dpdf_us_avg", dpdfUsAvg)
+      .put("dpdf_us_max", dpdfUsMax)
+      .put("tse_enabled", vf?.isTseActive ?: false)
+      .put("tse_bypassed", vf?.tseBypassed ?: false)
+      .put("tse_ms_avg", safeRound(tseMsAvg, 100.0))
+      .put("tse_ms_max", safeRound(vf?.tseMsMax ?: 0.0, 100.0))
+      .put("tse_rtf", safeRound(tseRtf, 1000.0))
+      .put("tse_overruns", vf?.tseOverruns ?: 0)
+      .put("sv_checks", vf?.checks ?: 0)
+      .put("sv_passed", vf?.passed ?: 0)
+      .put("sv_blocked", vf?.blocked ?: 0)
+      .put("utterances", vf?.checks ?: 0)
+      .put("pass_count", vf?.passed ?: 0)
+      .put("mute_count", vf?.blocked ?: 0)
+      .put("sv_ms_avg", if (vf != null && vf.checks > 0) vf.checkMsSum / vf.checks else 0L)
+      .put("sv_ms_max", vf?.checkMsMax ?: 0L)
+      .put("vad_speech_ratio", safeRound(vadRatio, 1000.0))
+      .put("gated_ratio", safeRound(gatedRatio, 1000.0))
+      .put("play_stalls", playStalls)
+      .put("play_underruns", underruns)
+    return JSONObject().put("action", "client.ai_telemetry").put("data", d)
   }
 
   // ----------------------------------------------------------------------- loops
@@ -277,22 +443,52 @@ class VoiceCall(
     val rec = record ?: return
     try { modelsReady.await() } catch (_: InterruptedException) { return }
     val models = voiceModels
-    val vf = if (models != null && (useDenoise || (enrolledVoice != null && models.speaker != null))) {
+    val sample = ownerSample
+    val wantFilter = models != null && (
+      useDenoise ||
+        (enrolledVoice != null && models.speaker != null) ||
+        (sample != null && models.hasTse)
+      )
+    var vfRef: VoiceFilter? = null
+    val vf = if (wantFilter) {
       VoiceFilter(
-        models,
-        VoiceFilter.Options(denoise = useDenoise, enrolled = enrolledVoice, threshold = voiceThreshold),
+        m = models!!,
+        o = VoiceFilter.Options(
+          denoise = useDenoise,
+          enrolled = enrolledVoice,
+          prototypes = enrolledProtos,
+          ownerSample = sample,
+          threshold = voiceThreshold,
+          captureMissingSample = enrolledVoice != null && sample == null,
+        ),
         worker = { r -> if (!ended) try { spkExec.execute(r) } catch (_: Throwable) {} },
+        tseWorker = { r -> if (!ended) try { tseExec.execute(r) } catch (_: Throwable) {} },
         emit = { buf, off, len ->
           val lv = rms(buf, off, len)
           micLevel = if (muted) 0f else lv
-          if (ready && !muted) ws?.send(buf.toByteString(off, len))
+          if (!muted) sendBinaryFrame(buf, off, len)
         },
-        onVerdict = { pass, score, kind ->
-          Log.d(TAG, "voiceprint $kind score=${"%.3f".format(score)} pass=$pass")
+        onUtterance = { u -> emitUtteranceTelemetry(u, vfRef) },
+        onOverload = { action, ms ->
+          Log.w(TAG, "VoxLock overload action=$action tse_ms=${"%.1f".format(ms)}")
+        },
+        onOwnerSampleCaptured = { captured ->
+          if (!ended) {
+            try {
+              spkExec.execute {
+                if (VoiceModelManager.saveOwnerSample(ctx, captured)) {
+                  Log.i(TAG, "Backfilled missing owner_sample.pcm from verified call speech")
+                }
+              }
+            } catch (_: Throwable) {}
+          }
         },
       )
     } else null
+    vfRef = vf
     filter = vf
+    emitInitTelemetry(models, vf)
+
     val frame = ByteArray(MIC_FRAME_BYTES)
     val silence = ByteArray(MIC_FRAME_BYTES)
     while (!ended) {
@@ -311,18 +507,18 @@ class VoiceCall(
           vf?.reset()
         }
         micLevel = 0f
+        rawFramesIn += HOPS_PER_MIC_FRAME
+        rawFramesOut += HOPS_PER_MIC_FRAME
         // Silence keeps flowing while muted: the model expects a continuous realtime stream.
-        if (ready) ws?.send(silence.toByteString(0, silence.size))
+        sendBinaryFrame(silence, 0, silence.size)
       } else if (vf != null) {
         filterReset = false
-        val before = vf.hopsIn
-        // Decay orb level gently while holding a syllable or blocking a non-owner voice.
-        micLevel *= 0.6f
         vf.push(frame, 0, frame.size)
-        if (vf.hopsIn == before) micLevel = 0f
       } else {
+        rawFramesIn += HOPS_PER_MIC_FRAME
+        rawFramesOut += HOPS_PER_MIC_FRAME
         micLevel = rms(frame, 0, frame.size)
-        if (ready) ws?.send(frame.toByteString(0, frame.size))
+        sendBinaryFrame(frame, 0, frame.size)
       }
     }
   }
@@ -351,10 +547,7 @@ class VoiceCall(
 
   /**
    * Feeds the speaker. The jitter buffer (Playout) says when a reply has enough
-   * audio in to start, and when one that ran dry may go on. A track that ran dry
-   * plays again only once it holds its start threshold: 40 ms from Android 12
-   * (set in openAudio), the whole buffer before; there a little silence keeps it
-   * running between replies.
+   * audio in to start, and when one that ran dry may go on.
    */
   private fun playLoop() {
     Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -365,14 +558,12 @@ class VoiceCall(
     var gen = -1
     var lastHead = -1L
     var headSince = 0L
-    // Silence between replies only where a dry track waits for its whole buffer (see Playout.LEAD_MS).
     val leadFrames = if (startFrames(tr) >= tr.bufferSizeInFrames) Playout.LEAD_MS.toLong() * SPEAKER_PER_MS else 0L
     while (!ended) {
       val now = SystemClock.elapsedRealtime()
       synchronized(lock) {
         val head = head(tr)
         if (gen != generation) {
-          // Started or flushed: an empty track only plays once it holds its start threshold.
           gen = generation
           cur = null
           off = 0
@@ -382,13 +573,11 @@ class VoiceCall(
           lastHead = head
           headSince = now
         } else if (cur == null && written - head > 0 && now - headSince >= STUCK_MS) {
-          // Holding audio but not moving: some devices want more than the threshold; give it silence.
           writeSilence(tr, silence, tr.bufferSizeInFrames.toLong())
           headSince = now
         }
         while (!ended) {
           if (cur == null) {
-            // Speech still in the track: the end of the last chunk written, if it has not been played yet.
             val audio = maxOf(0L, (inflight.lastOrNull()?.second ?: 0L) - head)
             val next = playout.take(now, audio) ?: break
             if (stoppedRuns.contains(next.ref.runId)) continue
@@ -400,7 +589,6 @@ class VoiceCall(
           val c = cur!!
           val n = tr.write(c.pcm, off, c.pcm.size - off, AudioTrack.WRITE_NON_BLOCKING)
           if (n < 0) {
-            // Counted as written above; the rest never went in.
             written -= (c.pcm.size - off) / 2
             cur = null
             break
@@ -409,16 +597,27 @@ class VoiceCall(
           if (off < c.pcm.size) break
           cur = null
         }
-        // Nothing to write now: before Android 12, keep a little silence queued so the track keeps running.
         if (cur == null && written - head < leadFrames) writeSilence(tr, silence, leadFrames - (written - head))
       }
       Thread.sleep(PLAY_LOOP_MS)
     }
   }
 
-  /** Acknowledges chunks once the speaker has really played them, and reports levels for the UI. */
+  /** Acknowledges chunks once the speaker has really played them, reports levels, and emits 5s periodic AI telemetry. */
   private fun ackLoop() {
     var lastLevel = 0L
+    var lastPeriodic = SystemClock.elapsedRealtime()
+    var prevHopsIn = 0L
+    var prevHopsOut = 0L
+    var prevDenoiseNs = 0L
+    var prevTseChunks = 0L
+    var prevTseMsSum = 0.0
+    var prevTseAudioMs = 0.0
+    var prevVadTotal = 0L
+    var prevVadSpeech = 0L
+    var prevVoicedOut = 0L
+    var prevGatedOut = 0L
+
     while (!ended) {
       Thread.sleep(20)
       val tr = track ?: continue
@@ -434,6 +633,39 @@ class VoiceCall(
       if (now - lastLevel >= 100) {
         lastLevel = now
         PocketBus.emit("onLevel", mapOf("mic" to micLevel.toDouble(), "out" to outLevel.toDouble()))
+      }
+      val el = SystemClock.elapsedRealtime()
+      if (ready && el - lastPeriodic >= PERIODIC_TELEMETRY_MS) {
+        lastPeriodic = el
+        val vf = filter
+        emitPeriodicTelemetry(
+          vf = vf,
+          prevHopsIn = prevHopsIn,
+          prevHopsOut = prevHopsOut,
+          prevDenoiseNs = prevDenoiseNs,
+          prevTseChunks = prevTseChunks,
+          prevTseMsSum = prevTseMsSum,
+          prevTseAudioMs = prevTseAudioMs,
+          prevVadTotal = prevVadTotal,
+          prevVadSpeech = prevVadSpeech,
+          prevVoicedOut = prevVoicedOut,
+          prevGatedOut = prevGatedOut,
+        )
+        if (vf != null) {
+          prevHopsIn = vf.hopsIn
+          prevHopsOut = vf.hopsOut
+          prevDenoiseNs = vf.denoiseNs
+          prevTseChunks = vf.tseChunks
+          prevTseMsSum = vf.tseMsSum
+          prevTseAudioMs = vf.tseAudioMsSum
+          prevVadTotal = vf.vadWindowsTotal
+          prevVadSpeech = vf.vadSpeechWindows
+          prevVoicedOut = vf.voicedOutHops
+          prevGatedOut = vf.gatedOutHops
+        } else {
+          prevHopsIn = rawFramesIn
+          prevHopsOut = rawFramesOut
+        }
       }
     }
   }
@@ -467,19 +699,16 @@ class VoiceCall(
       stops++
       playout.drop(runId)
       val s = scope(runId, turnId)
-      // Stopped, not completed: no playback.completed for it from the receipts below.
       s.stopped = true
       val tr = track
       if (inflight.any { it.first.ref.runId == runId } && tr != null) {
         val head = head(tr)
-        // Chunks heard in full get their receipts first (MOSS-Live asks for that order), then the part of the current one.
         val back = mutableListOf<Chunk>()
         for ((c, end) in inflight) {
           val start = end - c.frames
           when {
             end <= head -> acked(c, out)
             c.ref.runId == runId -> if (head > start) s.playedMs += (head - start) * 1000.0 / SPEAKER_RATE
-            // Another reply's audio in the track: it goes back to be played after the flush.
             else -> back.add(c)
           }
         }
@@ -497,7 +726,6 @@ class VoiceCall(
       s.finished = true
       s.stopped = true
       s.drained = true
-      // All of the reply that was heard; the relay turns it into what each service expects.
       out.add(
         JSONObject().put("action", "playback.stopped").put("run_id", runId).put("turn_id", s.turnId)
           .put("played_audio_ms", s.playedMs.toLong()).put("reason", reason),
@@ -519,8 +747,15 @@ class VoiceCall(
         "relay.state" -> {
           when (d.optString("state")) {
             "ready" -> {
-              ready = true
+              val initMsg = synchronized(telemetryLock) {
+                ready = true
+                lastWsSendElapsed = 0L
+                val p = pendingInitTelemetry
+                pendingInitTelemetry = null
+                p
+              }
               webSocket.send(JSONObject().put("action", "mic_state").put("enabled", !muted).toString())
+              initMsg?.let { try { webSocket.send(it) } catch (_: Throwable) {} }
               PocketBus.emit("onCall", mapOf("state" to "ready"))
             }
             "error", "closed" -> {
@@ -545,7 +780,6 @@ class VoiceCall(
             val run = d.optString("run_id")
             if (stoppedRuns.contains(run)) null
             else {
-              // A short reply that is all in plays at once, without waiting for the cushion.
               playout.finish(run)
               scope(run, d.optString("turn_id")).let { s -> s.finished = true; drained(run, s) }
             }
@@ -598,7 +832,7 @@ class VoiceCall(
     end("挂断了")
   }
 
-  /** Mid-reply stalls of the jitter buffer, its cushion, AudioTrack underruns (silence ones too) and stopped replies. */
+  /** Mid-reply stalls of the jitter buffer, its cushion, AudioTrack underruns, and voice preprocessing stats. */
   private fun stats(): JSONObject = synchronized(lock) {
     val underruns = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) track?.underrunCount ?: -1 else -1
     val d = JSONObject().put("stalls", playout.stalls).put("target_ms", playout.targetMs.toLong())
@@ -608,7 +842,7 @@ class VoiceCall(
       if (f.checks > 0) {
         d.put("vp_checks", f.checks).put("vp_max_ms", f.checkMsMax)
           .put("vp_passed", f.passed).put("vp_blocked", f.blocked)
-          .put("vp_hold_ms", if (f.holds > 0) f.holdMsSum / f.holds else 0)
+          .put("vp_hold_ms", 0)
       }
     }
     JSONObject().put("action", "call.stats").put("data", d)
@@ -618,19 +852,34 @@ class VoiceCall(
   fun end(message: String) {
     if (ended) return
     ended = true
+    val wasReady = ready
     ready = false
     if (current === this) current = null
-    try { ws?.close(1000, "bye") } catch (_: Throwable) {}
-    // How the speaker did, for the app's log: what a real call leaves to look at afterwards.
+
+    val summary = try { buildSummaryTelemetry() } catch (_: Throwable) { null }
     val stats = try { stats() } catch (_: Throwable) { null }
+    if (wasReady && summary != null) {
+      try { ws?.send(summary.toString()) } catch (_: Throwable) {}
+    }
+    try { ws?.close(1000, "bye") } catch (_: Throwable) {}
+
     closeAudio()
     try { micThread?.join(1500) } catch (_: InterruptedException) {}
     spkExec.shutdownNow()
+    tseExec.shutdownNow()
     try { spkExec.awaitTermination(1500, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
+    try { tseExec.awaitTermination(1500, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
+    try { filter?.close() } catch (_: Throwable) {}
     try { voiceModels?.close() } catch (_: Throwable) {}
     voiceModels = null
+    ownerSample = null
     filter = null
     client.dispatcher.executorService.shutdown()
+
+    summary?.let {
+      Log.i(TAG, it.toString())
+      PocketBus.emit("onCallEvent", mapOf("json" to it.toString()))
+    }
     stats?.let {
       Log.i(TAG, it.toString())
       PocketBus.emit("onCallEvent", mapOf("json" to it.toString()))
@@ -639,6 +888,9 @@ class VoiceCall(
     onEnded()
   }
 }
+
+private fun safeRound(v: Double, scale: Double): Double =
+  if (v.isFinite()) round(v * scale) / scale else 0.0
 
 private fun rms(pcm: ByteArray, off: Int, len: Int): Float {
   var sum = 0.0

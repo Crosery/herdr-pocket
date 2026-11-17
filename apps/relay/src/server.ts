@@ -836,7 +836,7 @@ export class Relay {
     }
     this.notifyWss.handleUpgrade(req, socket, head, (ws) => {
       this.log(`live: call from "${auth.name}" (${auth.id})`);
-      startCall(ws, auth.id, live, this.assistant, this.log);
+      startCall(ws, auth.id, live, this.assistant, this.log, (ev) => this.events.record({ device: auth.id, ...ev }));
     });
   }
 
@@ -1147,8 +1147,8 @@ function sendError(res: ServerResponse, status: number, code: RpcError["code"], 
 
 /** A plain journal line as an event: "live: call ended" is kind live, "http error" is an error. */
 function plainEvent(m: string): EventInput {
-  const prefix = /^([a-z][a-z-]{1,20}):\s/i.exec(m);
-  const kind = prefix && ["assistant", "live", "assistant notice"].includes(prefix[1]!.toLowerCase()) ? prefix[1]!.toLowerCase() : "relay";
+  const prefix = /^([a-z][a-z.-]{1,20}):\s/i.exec(m);
+  const kind = prefix && ["assistant", "live", "live.ai", "realtime", "assistant notice"].includes(prefix[1]!.toLowerCase()) ? prefix[1]!.toLowerCase() : "relay";
   const msg = kind === "relay" ? m : m.slice(prefix![0].length);
   const level = /^http error/.test(m) ? "error" : /\b(fail(ed|ure)?|error|rejected|refused|timeout|dropped)\b/i.test(m) ? "warn" : "info";
   return { kind, level, msg };
