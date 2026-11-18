@@ -90,6 +90,7 @@ class VoiceCall(
 
   @Volatile private var ended = false
   @Volatile private var ready = false
+  @Volatile private var captureStarted = false
   @Volatile var muted = false
     private set
   @Volatile private var filterReset = false
@@ -100,6 +101,8 @@ class VoiceCall(
   private val enrolledVoice: FloatArray?
   private val enrolledProtos: List<FloatArray>?
   private val modelsReady = CountDownLatch(1)
+  private val relayReady = CountDownLatch(1)
+  private val modelLock = Any()
   @Volatile private var voiceModels: VoiceModels? = null
   @Volatile private var ownerSample: FloatArray? = null
   @Volatile private var filter: VoiceFilter? = null
@@ -158,8 +161,15 @@ class VoiceCall(
     if (useDenoise || needSv || needTse) {
       thread("pocket-models") {
         try {
-          if (needTse) ownerSample = VoiceModelManager.loadOwnerSample(ctx)
-          voiceModels = VoiceModelManager.openModels(ctx, needSpeaker = needSv, needTse = needTse && ownerSample != null)
+          val sample = if (needTse) VoiceModelManager.loadOwnerSample(ctx) else null
+          val models = VoiceModelManager.openModels(ctx, needSpeaker = needSv, needTse = needTse && sample != null)
+          synchronized(modelLock) {
+            if (ended) models.close()
+            else {
+              ownerSample = sample
+              voiceModels = models
+            }
+          }
         } catch (e: Throwable) {
           Log.w(TAG, "voice models", e)
         } finally {
@@ -243,7 +253,6 @@ class VoiceCall(
       try { tr.setStartThresholdInFrames(START_THRESHOLD_MS * SPEAKER_PER_MS) } catch (_: Throwable) {}
     }
     track = tr
-    rec.startRecording()
     tr.play()
   }
 
@@ -439,9 +448,9 @@ class VoiceCall(
   // ----------------------------------------------------------------------- loops
 
   private fun micLoop() {
-    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
     val rec = record ?: return
     try { modelsReady.await() } catch (_: InterruptedException) { return }
+    if (ended) return
     val models = voiceModels
     val sample = ownerSample
     val wantFilter = models != null && (
@@ -459,7 +468,7 @@ class VoiceCall(
           prototypes = enrolledProtos,
           ownerSample = sample,
           threshold = voiceThreshold,
-          captureMissingSample = enrolledVoice != null && sample == null,
+          requireIsolation = enrolledVoice != null,
         ),
         worker = { r -> if (!ended) try { spkExec.execute(r) } catch (_: Throwable) {} },
         tseWorker = { r -> if (!ended) try { tseExec.execute(r) } catch (_: Throwable) {} },
@@ -471,23 +480,40 @@ class VoiceCall(
         onUtterance = { u -> emitUtteranceTelemetry(u, vfRef) },
         onOverload = { action, ms ->
           Log.w(TAG, "VoxLock overload action=$action tse_ms=${"%.1f".format(ms)}")
-        },
-        onOwnerSampleCaptured = { captured ->
-          if (!ended) {
-            try {
-              spkExec.execute {
-                if (VoiceModelManager.saveOwnerSample(ctx, captured)) {
-                  Log.i(TAG, "Backfilled missing owner_sample.pcm from verified call speech")
-                }
-              }
-            } catch (_: Throwable) {}
-          }
+          val f = vfRef
+          emitAiTelemetry(JSONObject()
+            .put("stage", "periodic")
+            .put("kind", action)
+            .put("tse_k", f?.tseK ?: 0)
+            .put("tse_enabled", f?.isTseActive == true)
+            .put("tse_bypassed", f?.tseBypassed == true)
+            .put("tse_overruns", f?.tseOverruns ?: 0L))
         },
       )
     } else null
     vfRef = vf
     filter = vf
     emitInitTelemetry(models, vf)
+    if (enrolledVoice != null && vf?.isTseActive != true) {
+      end("人声分离未就绪，请到「只认我的声音」重新下载模型或录制声纹")
+      return
+    }
+
+    // Do not collect half a second of queued AudioRecord data while loading models.
+    // Otherwise the first read delivers that queue in a burst and overruns VoxLock.
+    try { relayReady.await() } catch (_: InterruptedException) { return }
+    if (ended) return
+    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+    try {
+      rec.startRecording()
+    } catch (e: Throwable) {
+      Log.w(TAG, "start recording", e)
+      end("打不开麦克风")
+      return
+    }
+    if (ended) return
+    captureStarted = true
+    PocketBus.emit("onCall", mapOf("state" to "ready", "muted" to muted))
 
     val frame = ByteArray(MIC_FRAME_BYTES)
     val silence = ByteArray(MIC_FRAME_BYTES)
@@ -496,11 +522,15 @@ class VoiceCall(
       while (off < frame.size && !ended) {
         val n = rec.read(frame, off, frame.size - off)
         if (n <= 0) {
-          if (n < 0) return
+          if (n < 0) {
+            if (!ended) end("麦克风已断开")
+            return
+          }
           continue
         }
         off += n
       }
+      if (ended) return
       if (muted) {
         if (filterReset) {
           filterReset = false
@@ -756,7 +786,7 @@ class VoiceCall(
               }
               webSocket.send(JSONObject().put("action", "mic_state").put("enabled", !muted).toString())
               initMsg?.let { try { webSocket.send(it) } catch (_: Throwable) {} }
-              PocketBus.emit("onCall", mapOf("state" to "ready"))
+              relayReady.countDown()
             }
             "error", "closed" -> {
               end(d.optString("message").ifEmpty { "通话结束了" })
@@ -824,12 +854,11 @@ class VoiceCall(
     muted = value
     if (value) filterReset = true
     if (ready) ws?.send(JSONObject().put("action", "mic_state").put("enabled", !value).toString())
-    PocketBus.emit("onCall", mapOf("state" to "ready", "muted" to value))
+    if (captureStarted && !ended) PocketBus.emit("onCall", mapOf("state" to "ready", "muted" to value))
   }
 
   fun hangup() {
-    try { ws?.send(JSONObject().put("action", "relay.hangup").toString()) } catch (_: Throwable) {}
-    end("挂断了")
+    end("挂断了", notifyRelay = true)
   }
 
   /** Mid-reply stalls of the jitter buffer, its cushion, AudioTrack underruns, and voice preprocessing stats. */
@@ -849,9 +878,11 @@ class VoiceCall(
   }
 
   @Synchronized
-  fun end(message: String) {
+  fun end(message: String, notifyRelay: Boolean = false) {
     if (ended) return
     ended = true
+    modelsReady.countDown()
+    relayReady.countDown()
     val wasReady = ready
     ready = false
     if (current === this) current = null
@@ -861,18 +892,26 @@ class VoiceCall(
     if (wasReady && summary != null) {
       try { ws?.send(summary.toString()) } catch (_: Throwable) {}
     }
+    // Relay composes its call summary on hangup, so final phone metrics must precede it.
+    if (notifyRelay) {
+      try { ws?.send(JSONObject().put("action", "relay.hangup").toString()) } catch (_: Throwable) {}
+    }
     try { ws?.close(1000, "bye") } catch (_: Throwable) {}
 
     closeAudio()
-    try { micThread?.join(1500) } catch (_: InterruptedException) {}
+    if (micThread !== Thread.currentThread()) {
+      try { micThread?.join(1500) } catch (_: InterruptedException) {}
+    }
     spkExec.shutdownNow()
     tseExec.shutdownNow()
     try { spkExec.awaitTermination(1500, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
     try { tseExec.awaitTermination(1500, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
     try { filter?.close() } catch (_: Throwable) {}
-    try { voiceModels?.close() } catch (_: Throwable) {}
-    voiceModels = null
-    ownerSample = null
+    synchronized(modelLock) {
+      try { voiceModels?.close() } catch (_: Throwable) {}
+      voiceModels = null
+      ownerSample = null
+    }
     filter = null
     client.dispatcher.executorService.shutdown()
 

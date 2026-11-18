@@ -11,6 +11,8 @@ internal interface VoiceBackend : AutoCloseable {
   val hasTse: Boolean
   val enrollMs: Long get() = 0L
   fun reset()
+  /** The recurrent extraction state is owned by the TSE worker. */
+  fun resetTse() {}
   fun denoise(x: FloatArray, off: Int, out: FloatArray, outOff: Int): Boolean
   fun vadProb(win: FloatArray, off: Int): Float
   fun embed(x: FloatArray, off: Int, len: Int): FloatArray
@@ -39,6 +41,7 @@ internal class ModelsBackend(
         val t0 = System.nanoTime()
         vl.enroll(ownerSample48k)
         enrollMs = (System.nanoTime() - t0) / 1_000_000
+        vl.warmUp()
         voxlock = vl
       } catch (_: Throwable) {
         vl.close()
@@ -52,8 +55,9 @@ internal class ModelsBackend(
   override fun reset() {
     denoiser?.reset()
     vad?.reset()
-    voxlock?.resetState()
   }
+
+  override fun resetTse() { voxlock?.resetState() }
 
   override fun denoise(x: FloatArray, off: Int, out: FloatArray, outOff: Int): Boolean =
     denoiser?.hop(x, off, out, outOff) ?: run {
@@ -76,14 +80,12 @@ internal class ModelsBackend(
 }
 
 /**
- * Zero-stall continuous streaming call voice pipeline:
+ * Streaming call voice pipeline:
  * 1. `HighPass64` cleans DC/wind rumble once at input.
  * 2. Parallel clean HPF path feeds `Silero VAD v4` + `ERes2NetV2-zh` multi-prototype SV (never denoised/TSE audio).
- * 3. `VoxLock` v2 (`chunk_int8.onnx`, `K = 5` = 40 ms, dynamic step-up to `K = 8` = 64 ms or smooth bypass on overload)
- *    continuously extracts the enrolled owner's voice in real time without freezing packet emission.
- * 4. `DPDFNet-baseline` (10 ms hop = 160 samples) + `VocalEnhancer` polish residual noise and vocal presence.
- * 5. Smooth 16 ms cosine gain ramp attenuates residual bleed to `0.0f` ONLY during confirmed solo non-owner speech
- *    (`tseAttenDb < -9 dB` and `svScore < threshold`), keeping 100% of owner speech continuous and unclipped.
+ * 3. VoxLock emits the enrolled speaker's estimated waveform, not the verified input mixture.
+ * 4. DPDFNet can clean the extracted waveform; do not boost quiet residual voices in owner-only mode.
+ * 5. On extraction failure, owner-only mode emits silence at the same cadence instead of the mixture.
  */
 class VoiceFilter internal constructor(
   internal val backend: VoiceBackend,
@@ -135,6 +137,7 @@ class VoiceFilter internal constructor(
     val ownerSample: FloatArray? = null,
     val threshold: Float = 0.38f,
     val captureMissingSample: Boolean = false,
+    val requireIsolation: Boolean = enrolled != null,
   )
 
   data class UtteranceTelemetry(
@@ -186,7 +189,10 @@ class VoiceFilter internal constructor(
     private const val RECHECK_WINDOW_SAMPLES = 20_480 // 1280 ms
     private const val CLEAN_RING_CAP = 32_000 // 2.0 s
     private const val SESS_MIN_SAMPLES = 14_400 // 900 ms
-    private const val TSE_PREBUFFER_SAMPLES = 7 * HOP // 1120 samples = 70 ms (40 ms chunk + 24 ms OLA + 6 ms margin)
+    // Capture delivers 20 ms packets. Budget for the first full chunk and its inference before playout.
+    private const val TSE_PREBUFFER_HOPS = 11
+    private const val TSE_RECOVERY_PREBUFFER_HOPS = 15
+    private const val TSE_RETRY_DELAY_HOPS = 8
     private const val TSE_K5_BUDGET_MS = 38.0
     private const val TSE_K8_BUDGET_MS = 60.0
     private const val TSE_MAX_BACKLOG_SAMPLES = 3_840 // 240 ms
@@ -201,7 +207,7 @@ class VoiceFilter internal constructor(
 
   private val hpf = if (o.denoise || svEnabled || tseEnabled) HighPass64() else null
   private val vadBoost = if (svEnabled || tseEnabled) QuietVadBoost() else null
-  private val enhancer = if (o.denoise) VocalEnhancer() else null
+  private val enhancer = if (o.denoise && !o.requireIsolation) VocalEnhancer() else null
   private val gainRamp = CosineRamp(rampSamples = 256) // 16 ms cosine ramp
 
   // Per-hop working buffers (single-threaded on mic thread).
@@ -211,6 +217,7 @@ class VoiceFilter internal constructor(
   private val stageIn = FloatArray(HOP)
   private val denBuf = FloatArray(HOP)
   private val enhBuf = FloatArray(HOP)
+  private val silentHop = FloatArray(HOP)
 
   // Clean HPF path for Silero VAD + ERes2NetV2-zh.
   private val cleanVadFifo = FloatArray(Vad.WINDOW + HOP * 2)
@@ -229,9 +236,15 @@ class VoiceFilter internal constructor(
   private val tseResults = ConcurrentLinkedQueue<TseRawResult>()
   @Volatile private var tseJobInFlight = false
   private var slowTseStreak = 0
+  private var tseGen = 0
+  private var tseNeedsReset = false
+  private var tseRetryAtHop = 0L
+  private var tseRetried = false
 
+  @Volatile
   var tseK = VoxLockStreamer.DEFAULT_K
     private set
+  @Volatile
   var tseBypassed = false
     private set
 
@@ -298,7 +311,8 @@ class VoiceFilter internal constructor(
     tseOutRead = 0
     tseOutLen = 0
     if (tseEnabled && !tseBypassed) {
-      appendTseOutZeros(TSE_PREBUFFER_SAMPLES)
+      val hops = if (tseK == VoxLockStreamer.DEFAULT_K) TSE_PREBUFFER_HOPS else TSE_RECOVERY_PREBUFFER_HOPS
+      appendTseOutZeros(hops * HOP)
     }
   }
 
@@ -351,8 +365,9 @@ class VoiceFilter internal constructor(
     cleanVadLen = 0
     cleanVoicedLen = 0
     voxStreamer.reset()
+    tseGen++
+    tseNeedsReset = tseEnabled
     tseResults.clear()
-    tseJobInFlight = false
     slowTseStreak = 0
     primeTsePrebuffer()
     speaking = false
@@ -411,28 +426,35 @@ class VoiceFilter internal constructor(
       drainSvResults()
     }
 
-    // 4. Streaming Target Speaker Extraction (`VoxLock`) or direct clean HPF feed.
+    // 4. Only the extractor can populate the owner-only uplink.
+    maybeRetryTse()
     if (tseEnabled && !tseBypassed) {
       drainTseResults()
-      voxStreamer.pushInput(hpfBuf, 0, HOP)
-      if (voxStreamer.bufferedInputSamples > TSE_MAX_BACKLOG_SAMPLES && tseJobInFlight) {
-        tseOverruns++
-        tseBypassed = true
-        onOverload("bypass_backlog", voxStreamer.bufferedInputSamples * 1000.0 / VOICE_RATE)
-      }
-      dispatchTseIfReady()
-      drainTseResults()
       if (!tseBypassed) {
-        popTseOut(stageIn)
-      } else {
-        System.arraycopy(hpfBuf, 0, stageIn, 0, HOP)
-        lastRawDbfs = rmsToDbfs(rawHopRms)
-        lastTseDbfs = lastRawDbfs
-        lastTseAttenDb = 0f
+        voxStreamer.pushInput(hpfBuf, 0, HOP)
+        if (voxStreamer.bufferedInputSamples > TSE_MAX_BACKLOG_SAMPLES && tseJobInFlight) {
+          suspendTse("bypass_backlog", voxStreamer.bufferedInputSamples * 1000.0 / VOICE_RATE, retry = true)
+        }
+        dispatchTseIfReady()
+        drainTseResults()
       }
+    }
+    if (isTseActive) {
+      popTseOut(stageIn)
     } else {
-      System.arraycopy(hpfBuf, 0, stageIn, 0, HOP)
       lastRawDbfs = rmsToDbfs(rawHopRms)
+      if (o.requireIsolation) {
+        lastTseDbfs = -90f
+        lastEnhDbfs = -90f
+        lastTseAttenDb = attenDb(0f, rawHopRms)
+        if (speaking) {
+          voicedOutHops++
+          gatedOutHops++
+        }
+        sendHop(silentHop)
+        return
+      }
+      System.arraycopy(hpfBuf, 0, stageIn, 0, HOP)
       lastTseDbfs = lastRawDbfs
       lastTseAttenDb = 0f
     }
@@ -444,7 +466,8 @@ class VoiceFilter internal constructor(
       val ns = System.nanoTime() - t0
       denoiseNs += ns
       if (ns > denoiseMaxNs) denoiseMaxNs = ns
-      enhancer!!.process(denBuf, enhBuf, HOP)
+      if (enhancer != null) enhancer.process(denBuf, enhBuf, HOP)
+      else System.arraycopy(denBuf, 0, enhBuf, 0, HOP)
     } else {
       System.arraycopy(stageIn, 0, enhBuf, 0, HOP)
     }
@@ -632,36 +655,62 @@ class VoiceFilter internal constructor(
     }
   }
 
+  private fun suspendTse(action: String, ms: Double, retry: Boolean) {
+    if (tseBypassed) return
+    tseOverruns++
+    tseBypassed = true
+    tseGen++
+    tseNeedsReset = true
+    voxStreamer.reset()
+    primeTsePrebuffer()
+    if (retry && o.requireIsolation && !tseRetried) tseRetryAtHop = hopsIn + TSE_RETRY_DELAY_HOPS
+    onOverload(action, ms)
+  }
+
+  private fun maybeRetryTse() {
+    if (tseRetryAtHop == 0L || hopsIn < tseRetryAtHop || tseJobInFlight) return
+    tseRetryAtHop = 0L
+    tseRetried = true
+    tseK = VoxLockStreamer.FALLBACK_K
+    slowTseStreak = 0
+    tseBypassed = false
+    // Do not replay buffered speech from before the failure.
+    backend.reset()
+    enhancer?.reset()
+    gainRamp.reset(1f)
+    primeTsePrebuffer()
+    onOverload("retry_k8", 0.0)
+  }
+
   private fun dispatchTseIfReady() {
     while (!tseBypassed && !tseJobInFlight && voxStreamer.canStep(tseK)) {
       val kRun = tseK
       val wavLen = kRun * VoxLockStreamer.HOP + VoxLockStreamer.OVERLAP
       val wavCopy = FloatArray(wavLen)
       val prep = voxStreamer.prepareWav(kRun, wavCopy)
-      val gen = resetGen
+      val gen = tseGen
+      val resetState = tseNeedsReset
+      tseNeedsReset = false
       tseJobInFlight = true
       try {
         tseWorker(Runnable {
           val framesOut = FloatArray(kRun * VoxLockStreamer.N_FFT)
           val t0 = System.nanoTime()
-          var ok = false
           try {
+            if (resetState) backend.resetTse()
             backend.tseChunk(wavCopy, prep.wavLen, kRun, framesOut)
-            ok = true
-          } catch (_: Throwable) {
-          }
-          val ms = (System.nanoTime() - t0) / 1_000_000.0
-          if (ok) {
+            val ms = (System.nanoTime() - t0) / 1_000_000.0
             tseResults.add(TseRawResult(gen = gen, kFrames = kRun, frames = framesOut, rawRms = prep.rawRms, ms = ms))
-          } else {
+          } catch (_: Throwable) {
+            val ms = (System.nanoTime() - t0) / 1_000_000.0
             tseResults.add(TseRawResult(gen = gen, kFrames = kRun, frames = FloatArray(0), rawRms = prep.rawRms, ms = ms))
+          } finally {
+            tseJobInFlight = false
           }
-          tseJobInFlight = false
         })
       } catch (_: Throwable) {
         tseJobInFlight = false
-        tseOverruns++
-        tseBypassed = true
+        suspendTse("bypass_dispatch", 0.0, retry = false)
         break
       }
       // If `tseWorker` executed inline (deterministic tests), drain right away so multiple steps in one push succeed.
@@ -672,11 +721,9 @@ class VoiceFilter internal constructor(
   private fun drainTseResults() {
     while (true) {
       val r = tseResults.poll() ?: break
-      if (r.gen != resetGen) continue
+      if (r.gen != tseGen) continue
       if (r.frames.isEmpty()) {
-        tseOverruns++
-        tseBypassed = true
-        onOverload("bypass_error", r.ms)
+        suspendTse("bypass_error", r.ms, retry = false)
         continue
       }
       val count = voxStreamer.completeStep(r.frames, r.kFrames, tseSynthScratch)
@@ -695,14 +742,13 @@ class VoiceFilter internal constructor(
       if (r.ms > budget) {
         slowTseStreak++
         if (slowTseStreak >= 3) {
-          tseOverruns++
           slowTseStreak = 0
           if (tseK == VoxLockStreamer.DEFAULT_K) {
+            tseOverruns++
             tseK = VoxLockStreamer.FALLBACK_K
             onOverload("step_k8", r.ms)
           } else {
-            tseBypassed = true
-            onOverload("bypass_tse", r.ms)
+            suspendTse("bypass_tse", r.ms, retry = true)
           }
         }
       } else {

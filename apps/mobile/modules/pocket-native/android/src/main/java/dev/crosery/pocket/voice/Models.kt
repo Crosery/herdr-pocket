@@ -227,6 +227,8 @@ class VoxLock(private val m: VoiceModels) : AutoCloseable {
     private val HC_SHAPE = longArrayOf(6, 32, 256)
     private const val HC_FLOATS = 6 * 32 * 256
     private const val MAX_WAV = VoxLockStreamer.MAX_K * VoxLockStreamer.HOP + VoxLockStreamer.OVERLAP // 1408
+    // Same level and polarity correction as the VoxLock v2 streaming reference.
+    private const val OUTPUT_GAIN = -0.5f
   }
 
   private val enrollSession = requireNotNull(m.voxlockEnroll) { "no voxlock enroll model" }
@@ -274,6 +276,14 @@ class VoxLock(private val m: VoiceModels) : AutoCloseable {
     cBuf.zero()
   }
 
+  /** Pay the first chunk's native setup cost before starting the microphone clock. */
+  fun warmUp() {
+    val k = VoxLockStreamer.DEFAULT_K
+    val n = k * VoxLockStreamer.HOP + VoxLockStreamer.OVERLAP
+    chunk(FloatArray(n), n, k, FloatArray(k * VoxLockStreamer.N_FFT))
+    resetState()
+  }
+
   /** Runs one chunk (`wavLen = kFrames * 128 + 384`) and writes `kFrames * 512` floats to `framesOut`. */
   fun chunk(wav: FloatArray, wavLen: Int, kFrames: Int, framesOut: FloatArray) {
     val ten = requireNotNull(tEnrollN) { "VoxLock.enroll not called" }
@@ -302,6 +312,7 @@ class VoxLock(private val m: VoiceModels) : AutoCloseable {
             val fb = r.floats("frames")
             fb.rewind()
             fb.get(framesOut, 0, kFrames * VoxLockStreamer.N_FFT)
+            for (i in 0 until kFrames * VoxLockStreamer.N_FFT) framesOut[i] *= OUTPUT_GAIN
           }
         }
       }

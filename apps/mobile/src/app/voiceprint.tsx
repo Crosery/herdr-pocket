@@ -1,9 +1,9 @@
 /**
  * 通话降噪与声纹: phone-local streaming speech enhancement (DPDFNet-baseline),
  * continuous target-speaker extraction (VoxLock), and multi-prototype speaker
- * verification (Silero VAD + 3D-Speaker ERes2NetV2-zh). Everything runs on this
- * phone; verification audio never leaves the device, and only isolated owner
- * speech reaches the live voice service without stalling sentence starts.
+ * verification (Silero VAD + 3D-Speaker ERes2NetV2-zh). Enrollment stays on
+ * the phone. Owner-only calls use the locally extracted audio instead of
+ * forwarding the original mixture when extraction is unavailable.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ScrollView, View } from "react-native";
@@ -419,7 +419,7 @@ export default function VoiceprintScreen() {
           <Row
             icon="waveform"
             title="通话降噪"
-            sub={voiceDenoise ? "已开启 · 实时滤除环境杂音并增强人声清晰度，延迟约 20 毫秒" : "已关闭 · 麦克风声音原样传给小羊"}
+            sub={voiceDenoise ? "已开启 · 实时压低环境杂音" : "已关闭 · 不再做额外降噪"}
             right={
               <Toggle
                 label="通话降噪"
@@ -442,7 +442,7 @@ export default function VoiceprintScreen() {
                   legacy
                     ? "声纹引擎已升级，请重录一次以恢复声纹人声提取"
                     : voiceFilter
-                      ? "已开启 · 实时提取你的声纹人声，旁人说话与外放杂音自动剥离且不断流"
+                      ? "已开启 · 按已录声纹从通话音频中提取你的声音"
                       : "暂时关闭 · 已录声纹保留着，随时能打开"
                 }
                 right={
@@ -559,8 +559,8 @@ export default function VoiceprintScreen() {
                 <Text style={{ flex: 1, color: testResult ? (testResult.pass ? good.fg : p.error) : p.muted, fontFamily: fonts.bodySemi, fontSize: 14 }}>
                   {testResult
                     ? testResult.pass
-                      ? `认出是你，会放行 · 匹配度 ${(testResult.score * 100).toFixed(0)}%`
-                      : `不是你的声音，会静音 · 匹配度 ${(testResult.score * 100).toFixed(0)}%`
+                      ? `匹配录入的声纹 · 相似度 ${(testResult.score * 100).toFixed(0)}%`
+                      : `未匹配录入的声纹 · 相似度 ${(testResult.score * 100).toFixed(0)}%`
                     : testSpeaking
                       ? "正在核对声纹…"
                       : "对着手机说句话，或者让旁人说一句试试"}
@@ -652,7 +652,7 @@ export default function VoiceprintScreen() {
         </Card>
 
         <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 19, paddingHorizontal: space.xs }}>
-          通话全程在手机本地实时提取你的声纹人声并持续核对音色，句子开头零缓冲、不断流；旁人插话与外放杂音会自动剥离静音。修改设置从下一通电话生效。
+          开启「只认我的声音」后，手机会按已录声纹提取你的声音再发送。分离暂时跟不上时会发送静音，不会直接传出未分离的原声。修改设置从下一通电话生效。
         </Text>
 
         {error ? (

@@ -337,6 +337,91 @@ class VoicePipelineTest {
   }
 
   @Test
+  fun ownerOnlyWithoutExtractionNeverEmitsTheInputMixture() {
+    val backend = isolationBackend(hasTse = false)
+    val input = loudHop()
+    val out = ByteArrayOutputStream()
+    val strict = VoiceFilter(
+      backend = backend,
+      o = VoiceFilter.Options(denoise = true, enrolled = floatArrayOf(1f)),
+      worker = { it.run() },
+      emit = { b, off, n -> out.write(b, off, n) },
+    )
+    repeat(70) { strict.push(input, 0, input.size) }
+    assertEquals(70 * input.size, out.size())
+    assertTrue("speaker verdicts alone cannot admit unseparated PCM", out.toByteArray().all { it == 0.toByte() })
+
+    out.reset()
+    val ordinary = VoiceFilter(
+      backend = backend,
+      o = VoiceFilter.Options(denoise = false, enrolled = null),
+      worker = { it.run() },
+      emit = { b, off, n -> out.write(b, off, n) },
+    )
+    ordinary.push(input, 0, input.size)
+    assertTrue("disabling voiceprint filtering still sends ordinary mic audio", input.contentEquals(out.toByteArray()))
+  }
+
+  @Test
+  fun ownerOnlyOverloadEmitsSilenceThenResumesFromFreshTseState() {
+    val out = ByteArrayOutputStream()
+    val tasks = ArrayDeque<Runnable>()
+    val actions = ArrayList<String>()
+    var resets = 0
+    val vf = VoiceFilter(
+      backend = isolationBackend(hasTse = true, onReset = { resets++ }),
+      o = VoiceFilter.Options(denoise = false, enrolled = floatArrayOf(1f)),
+      worker = { it.run() },
+      tseWorker = { tasks.addLast(it) },
+      emit = { b, off, n -> out.write(b, off, n) },
+      onOverload = { reason, _ -> actions.add(reason) },
+    )
+    val input = loudHop()
+    repeat(40) { vf.push(input, 0, input.size) }
+    assertTrue(vf.tseBypassed)
+    assertEquals(listOf("bypass_backlog"), actions)
+    assertEquals(1, tasks.size)
+    assertEquals(input.size * 40, out.size())
+    assertTrue(out.toByteArray().all { it == 0.toByte() })
+
+    tasks.removeFirst().run() // Stale result must not be played after recovery.
+    repeat(45) {
+      vf.push(input, 0, input.size)
+      while (tasks.isNotEmpty()) tasks.removeFirst().run()
+    }
+    assertEquals(listOf("bypass_backlog", "retry_k8"), actions)
+    assertEquals(1, resets)
+    assertTrue(vf.isTseActive)
+    assertEquals(input.size * 85, out.size())
+    assertTrue("fresh extraction resumes without releasing the dry mic path", out.toByteArray().drop(input.size * 40).any { it != 0.toByte() })
+  }
+
+  private fun loudHop(): ByteArray {
+    val samples = FloatArray(VoiceFilter.HOP) { i -> (0.35 * sin(2.0 * PI * 320 * i / VOICE_RATE)).toFloat() }
+    return ByteArray(VoiceFilter.HOP * 2).also { floatToPcm16(samples, 0, samples.size, it, 0) }
+  }
+
+  private fun isolationBackend(hasTse: Boolean, onReset: () -> Unit = {}): VoiceBackend = object : VoiceBackend {
+    override val hasSpeaker = true
+    override val hasTse = hasTse
+    override fun reset() {}
+    override fun resetTse() = onReset()
+    override fun denoise(x: FloatArray, off: Int, out: FloatArray, outOff: Int): Boolean {
+      System.arraycopy(x, off, out, outOff, Denoiser.HOP)
+      return true
+    }
+    override fun vadProb(win: FloatArray, off: Int) = 0.95f
+    override fun embed(x: FloatArray, off: Int, len: Int) = floatArrayOf(1f)
+    override fun tseChunk(wav: FloatArray, wavLen: Int, kFrames: Int, framesOut: FloatArray) {
+      for (f in 0 until kFrames) {
+        for (i in 0 until VoxLockStreamer.N_FFT) {
+          framesOut[f * VoxLockStreamer.N_FFT + i] = wav[f * VoxLockStreamer.HOP + i] * VoxLockStreamer.WIN_SQ[i]
+        }
+      }
+    }
+  }
+
+  @Test
   fun multiPrototypeScoringAndSpeechCollectorEnrollment() {
     // 1. Multi-prototype scoring formula: 0.65 * cosine(e, mean) + 0.35 * maxProtoCosine(e, protos).
     val protoNormal = normalizeEmbedding(FloatArray(192) { if (it == 0) 1f else 0f })
