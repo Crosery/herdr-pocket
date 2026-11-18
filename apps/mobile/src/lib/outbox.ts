@@ -8,6 +8,7 @@
  */
 import type { Agent } from "@herdr-pocket/protocol";
 import { sameMessage, sendWithPictures, type Attachment } from "./attach";
+import { RelayError } from "./relay";
 import { findAgent, usePending, type PendingSend, type SendState } from "./store";
 
 /** A send-queue event from the computer (`queue` on the terminal stream). */
@@ -26,7 +27,7 @@ const ECHO_SLACK_MS = 60_000;
  * How long a message not seen in the conversation stays on screen. Sent (typed in) but never shown there,
  * as with another session or a program without one: a few minutes, counted from when the computer took it.
  */
-const TTL: Record<SendState, number> = { sending: Infinity, sent: 3 * 60_000, queued: 2 * 3_600_000, failed: 30 * 60_000 };
+const TTL: Record<SendState, number> = { sending: Infinity, sent: 3 * 60_000, queued: 2 * 3_600_000, uncertain: Infinity, failed: 30 * 60_000 };
 /** How long a message keeps its bubble's identity (key, thumbnails) once the conversation shows it. */
 const ECHO_KEEP_MS = 15 * 60_000;
 /** The computer counts text held during a turn (`Agent.queued`) once its agent list goes out. */
@@ -51,11 +52,11 @@ export function sendOut(agent: Agent, text: string, pictures: Attachment[] = [])
   return deliver(agent, id, text);
 }
 
-/** Sends a message that did not go through again, keeping its place. */
-export function resend(agentKey: string, id: string): Promise<SendResult> {
+/** Resends a message in place. An unconfirmed send needs explicit consent to risk a duplicate. */
+export function resend(agentKey: string, id: string, allowDuplicate = false): Promise<SendResult> {
   const x = find(agentKey, id);
   const agent = findAgent(agentKey);
-  if (!x || x.state !== "failed") return Promise.resolve({ ok: false, message: "这条消息已经不在了" });
+  if (!x || x.echo || (x.state !== "failed" && !(allowDuplicate && x.state === "uncertain"))) return Promise.resolve({ ok: false, message: "这条消息不能重发" });
   if (!agent) {
     patch(agentKey, id, { error: "找不到这个 agent 了" });
     return Promise.resolve({ ok: false, message: "找不到这个 agent 了" });
@@ -74,7 +75,7 @@ function deliver(agent: Agent, id: string, text: string): Promise<SendResult> {
   const run = (lines.get(agent.key) ?? Promise.resolve()).then(async (): Promise<SendResult> => {
     try {
       const { accepted } = await sendWithPictures(agent, text, keep.get(id) ?? []);
-      keep.delete(id);
+      if (!accepted.queueId) keep.delete(id);
       const waiting = !!accepted.waiting;
       const behind = (accepted.position ?? 0) > 0;
       // Older computers send no queue events: accepted is as far as the phone can follow.
@@ -84,18 +85,24 @@ function deliver(agent: Agent, id: string, text: string): Promise<SendResult> {
         early.delete(ev.queueId);
         onQueueEvent(agent.key, ev);
       }
-      // Never leave "sending" up when the computer's "sent" was missed.
-      setTimeout(() => {
-        if (find(agent.key, id)?.state === "sending") patch(agent.key, id, { state: "sent" });
-      }, 8000);
+      if (accepted.queueId && !waiting && !behind) {
+        setTimeout(() => {
+          const x = find(agent.key, id);
+          if (x?.state === "sending") patch(agent.key, id, { state: "uncertain" });
+        }, 8000);
+      }
       return { ok: true };
     } catch (e) {
-      const message = (e as Error).message || "没发出去";
-      patch(agent.key, id, { state: "failed", error: message });
+      const uncertain = e instanceof RelayError && e.uncertain;
+      const message = uncertain ? "发送结果待确认" : (e as Error).message || "没发出去";
+      patch(agent.key, id, { state: uncertain ? "uncertain" : "failed", error: message });
       return { ok: false, message };
     }
   });
   lines.set(agent.key, run);
+  void run.then(() => {
+    if (lines.get(agent.key) === run) lines.delete(agent.key);
+  });
   return run;
 }
 
@@ -112,7 +119,10 @@ export function onQueueEvent(agentKey: string, ev: QueueEvent) {
   }
   if (ev.status === "queued" && (ev.position ?? 0) > 0) patch(agentKey, x.id, { state: "queued" });
   else if (ev.status === "sending" && !x.waiting && x.state !== "sent") patch(agentKey, x.id, { state: "sending" });
-  else if (ev.status === "sent") patch(agentKey, x.id, { state: x.waiting ? "queued" : "sent", sentAt: Date.now() });
+  else if (ev.status === "sent") {
+    keep.delete(x.id);
+    patch(agentKey, x.id, { state: x.waiting ? "queued" : "sent", sentAt: Date.now() });
+  }
   else if (ev.status === "failed") patch(agentKey, x.id, { state: "failed", error: ev.message || "电脑那边没打进去" });
 }
 
@@ -158,8 +168,8 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
     }
   }
   const users = rows.map((r, i) => ({ r, i })).filter(({ r }) => r.type === "user");
-  // Messages that went through claim first: a failed one only matches when it got in after all.
-  const open = sends.filter((x) => !x.echo).sort((a, b) => Number(a.state === "failed") - Number(b.state === "failed") || a.ts - b.ts);
+  // Confirmed sends claim first. Ambiguous sends can still have a transcript echo.
+  const open = sends.filter((x) => !x.echo && x.state !== "failed").sort((a, b) => Number(a.state === "uncertain") - Number(b.state === "uncertain") || a.ts - b.ts);
   for (const x of open) {
     const hit = users.find(({ r, i }) => !claimed.has(i) && (r.ts ?? 0) >= x.ts - ECHO_SLACK_MS && sameMessage(r.text ?? "", x.text, !!x.pictures?.length));
     if (!hit) continue;
@@ -191,7 +201,7 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
   if (last && !drop.includes(last.id) && agent.status !== "working" && agent.status !== "blocked" && now - last.ts < AWAIT_MS) {
     const at = echoAt.get(last.id);
     const state = at !== undefined ? "sent" : shown.find((x) => x.id === last.id)?.state;
-    if (state === "sending" || state === "sent") {
+    if (state === "sent") {
       // A reply is anything the agent wrote or did after the message (or, not matched yet, after it was sent).
       awaiting = !rows.some((r, i) => r.type !== "user" && r.type !== "system" && (at !== undefined ? i > at : (r.ts ?? 0) >= last.ts));
     }

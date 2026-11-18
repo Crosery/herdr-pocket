@@ -163,9 +163,9 @@ export function findAgent(key: string): Agent | undefined {
 
 /**
  * Where a message sent from this phone is: on its way, typed into the agent,
- * waiting behind the agent's turn, or not delivered (see lib/outbox.ts).
+ * waiting behind the agent's turn, unconfirmed, or not delivered (see lib/outbox.ts).
  */
-export type SendState = "sending" | "sent" | "queued" | "failed";
+export type SendState = "sending" | "sent" | "queued" | "uncertain" | "failed";
 
 /** A message sent from this phone, shown at once and followed until the agent's conversation shows it. */
 export interface PendingSend {

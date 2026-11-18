@@ -45,7 +45,7 @@ const PONG_WAIT_MS = 4000;
 
 export class DirectError extends Error {
   code: RpcError["code"];
-  constructor(code: RpcError["code"], message: string) {
+  constructor(code: RpcError["code"], message: string, readonly uncertain = false) {
     super(message);
     this.code = code;
   }
@@ -188,7 +188,7 @@ export class DirectLink {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new DirectError("timeout", "电脑那边没有及时回应"));
+        reject(new DirectError("timeout", "电脑那边没有及时回应", true));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       if (!this.send({ type: "rpc", id, to: this.to, method, params })) {
@@ -214,7 +214,7 @@ export class DirectLink {
     if (this.pongTimer) clearTimeout(this.pongTimer);
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
-      p.reject(new DirectError("offline", "直连断开了"));
+      p.reject(new DirectError("offline", "直连断开了", true));
     }
     this.pending.clear();
     try {

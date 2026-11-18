@@ -597,7 +597,6 @@ export function ChatView({
   agent,
   active,
   bottomInset,
-  onNoSession,
   sub,
   childCount,
   trail = [],
@@ -605,7 +604,6 @@ export function ChatView({
   agent: Agent;
   active: boolean;
   bottomInset: number;
-  onNoSession: () => void;
   /** Read a subagent session of this agent instead of its own. */
   sub?: string;
   /** Known number of children of the session on screen (enables `session.children`). */
@@ -622,20 +620,19 @@ export function ChatView({
   const [session, setSession] = useState(agent.sessionKey);
   if (agent.sessionKey && agent.sessionKey !== session) setSession(agent.sessionKey);
   const [streamState, setStreamState] = useState<"connecting" | "live" | "stale" | "error">("connecting");
-  const busy = !!sub || agent.status === "working";
+  const [waitingForSession, setWaitingForSession] = useState(false);
+  const linkOnline = useLive((s) => s.link === "online");
   const q = useQuery({
     queryKey: ["session.events", agent.key, sub ?? null, session ?? null],
     // One screenful first; older pages load as the list is scrolled up.
     queryFn: () => call(agent.deviceId, "session.events", { agent: agent.key, sub, limit: 60 }),
     enabled: active,
-    // A live stream carries every new event, so the page is only a slow safety net then; without it
-    // (computer or link gone, no session yet) the page is how new events arrive, so it is read often.
-    refetchInterval: !active ? false : streamState === "live" ? 30_000 : busy ? 3000 : 10_000,
+    // Recover missed events while the stream is unavailable or still finding a session.
+    refetchInterval: !active || (!linkOnline && streamState !== "live") ? false : streamState === "live" && !!session ? 30_000 : 3000,
   });
   // Everything received for this conversation, by id. The newest page slides forward as the agent works;
   // without this, events between the older pages and the current page would silently disappear.
   const [liveEvents, setLiveEvents] = useState<ConvEvent[]>([]);
-  const linkOnline = useLive((s) => s.link === "online");
   // Another conversation starts empty, and each newest page the query brings is merged in. Done while
   // rendering (React's way to adjust state to new props), so a frame never shows the old conversation.
   const conv = `${agent.key}\n${sub ?? ""}\n${session ?? ""}`;
@@ -676,10 +673,13 @@ export function ChatView({
       } else if (event?.kind === "stale") setStreamState("stale");
       else if (event?.kind === "alive") setStreamState("live");
     }, (state) => {
+      setWaitingForSession(state.code === "not_found" && !sub && !session);
       setStreamState(state.status === "open" ? "live" : "error");
       // A stream that reopens after a drop may have missed events; the page query fills them in.
       if (state.status === "open") {
         failures.current = 0;
+        clearTimeout(retry);
+        retry = undefined;
         if (opened) void q.refetch();
         opened = true;
       } else {
@@ -696,6 +696,11 @@ export function ChatView({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, agent.deviceId, agent.key, sub, session, attempt]);
+  useEffect(() => {
+    if (active && linkOnline && !q.isFetching) void q.refetch();
+    // The socket may have come back before the stream is ready.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, linkOnline]);
   const kids = useQuery({
     queryKey: ["session.children", agent.key, sub ?? null],
     queryFn: () => call(agent.deviceId, "session.children", { agent: agent.key, sub }),
@@ -766,6 +771,18 @@ export function ChatView({
    */
   const stick = useRef(true);
   const dragging = useRef(false);
+  const latestSend = sendsAll?.[sendsAll.length - 1]?.id;
+  const seenSend = useRef(latestSend);
+  useEffect(() => {
+    const added = latestSend && latestSend !== seenSend.current && sendsAll?.at(-1)?.state === "sending";
+    seenSend.current = latestSend;
+    if (!added) return;
+    stick.current = true;
+    dragging.current = false;
+    toTopUntil.current = 0;
+    listRef.current?.scrollToOffset({ offset: 0, animated: false });
+    setEdges((e) => e.bottom ? e : { ...e, bottom: true });
+  }, [latestSend, sendsAll]);
   const measureEdges = useCallback(() => {
     const { y, h, content } = view.current;
     const bottom = y < 48;
@@ -900,9 +917,8 @@ export function ChatView({
     }
   }
 
-  // The stream can deliver the first events before the recovery query returns.
-  // Do not hide a live conversation behind a slow/unavailable snapshot request.
-  if (q.isLoading && !liveEvents.length) {
+  // Pending local messages and streamed events stay visible while a snapshot is loading.
+  if (sub && q.isLoading && !rows.length) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: space.sm }}>
         <ActivityIndicator />
@@ -910,24 +926,15 @@ export function ChatView({
       </View>
     );
   }
-  if (q.isError && !liveEvents.length) {
+  if (sub && q.isError && !rows.length) {
     return <EmptyState mood="waiting" title="对话没加载出来" body={(q.error as Error).message} action={<Button textColor={p.accentText} onPress={() => q.refetch()}>再试一次</Button>} />;
   }
-  if (q.data && !q.data.sessionKey && !liveEvents.length) {
-    return (
-      <EmptyState
-        mood="waiting"
-        title="还没找到它的对话记录"
-        body={sub ? "这个子 agent 的会话暂时读不到。" : "这台电脑的 Uniflo 里没有和它对应的会话。可以先看终端画面。"}
-        action={
-          sub ? undefined : <Button mode="contained-tonal" icon="console" onPress={onNoSession} style={{ borderRadius: radius.pill }}>
-            看终端
-          </Button>
-        }
-      />
-    );
-  }
-  if (!rows.length) return <EmptyState mood="sleepy" title="还没有对话" body={streamState === "error" || streamState === "stale" ? "实时连接暂时中断，正在重试；也可以点刷新。" : "它开始干活后，这里会实时更新。"} action={<Button textColor={p.accentText} onPress={() => q.refetch()}>刷新对话</Button>} />;
+  if (sub && !rows.length) return <EmptyState mood="sleepy" title="还没有对话" />;
+  const connectionNote = !linkOnline && streamState !== "live"
+    ? "和服务器断开了，正在重连"
+    : streamState === "stale" || (streamState === "error" && !waitingForSession)
+      ? "实时更新暂时中断，正在重试"
+      : q.isError && streamState !== "live" ? "对话同步失败，正在重试" : null;
 
   return (
     <SubCtx.Provider value={subCtx}>
@@ -975,13 +982,13 @@ export function ChatView({
               <View style={{ alignItems: "center", paddingVertical: space.md, minHeight: 40 }}>
                 {loadingOlder ? <ActivityIndicator size={16} /> : null}
               </View>
-            ) : (
+            ) : rows.some((row) => row.type !== "pending") ? (
               <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingVertical: space.md }}>
                 <View style={{ flex: 1, height: 1, backgroundColor: p.divider }} />
                 <Text style={{ color: p.faint, fontSize: 11.5 }}>对话开头</Text>
                 <View style={{ flex: 1, height: 1, backgroundColor: p.divider }} />
               </View>
-            )
+            ) : null
           }
           keyboardDismissMode="interactive"
           extraData={subCtx}
@@ -1010,9 +1017,9 @@ export function ChatView({
           ) : null}
         </View>
         {/* Quiet is not broken: only say so when the link is down or the computer reports it cannot read the session. */}
-        {!linkOnline || streamState === "stale" || streamState === "error" ? (
+        {connectionNote ? (
           <View pointerEvents="none" style={{ position: "absolute", top: 4, alignSelf: "center", paddingHorizontal: 10, minHeight: 24, justifyContent: "center", borderRadius: radius.pill, backgroundColor: p.surface2 }}>
-            <Text style={{ color: p.faint, fontSize: 11 }}>{!linkOnline ? "和服务器断开了，正在重连" : "实时更新暂时中断，每隔几秒自动刷新"}</Text>
+            <Text style={{ color: p.faint, fontSize: 11 }}>{connectionNote}</Text>
           </View>
         ) : null}
         <Snackbar visible={capped} onDismiss={() => setCapped(false)} duration={4000}>

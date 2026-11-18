@@ -60,7 +60,7 @@ The wire contract is `packages/protocol/src/index.ts`, resolved by Metro (`metro
 
 ## Agent screen
 
-- 对话: runs of two or more tool calls fold into one line; thinking shows its first line. A message sent from the phone shows at once and gives way to the session's own copy. Every event received is kept by id, so the sliding newest page never leaves a hole; only a page that no longer touches what is held starts the list over.
+- 对话: 新建 Agent 后直接打开对话，空会话可以直接输入。手机发出的消息立即出现，并显示发送、排队或待确认状态。断线后会补拉会话记录。如果发送结果未知，重发前会提示可能重复。工具调用和思考过程保留折叠展示。
 - 终端: key bar only; the keyboard button opens a one-line box that sends with Enter. 对话: message box only; the keyboard button shows the key bar.
 - “实时” means the stream is open, not that frames keep arriving: an unchanged screen sends nothing.
 

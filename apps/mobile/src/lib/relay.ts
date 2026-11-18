@@ -23,7 +23,7 @@ import { DirectError, DirectLink } from "./direct";
 
 export class RelayError extends Error {
   code: RpcError["code"];
-  constructor(code: RpcError["code"], message: string) {
+  constructor(code: RpcError["code"], message: string, readonly uncertain = false) {
     super(message);
     this.code = code;
   }
@@ -300,7 +300,7 @@ class SocketLink implements Link {
       case "stream_open": {
         const s = this.streams.get(f.id);
         if (f.error) applog("warn", "stream", `${s?.stream ?? "?"} stream failed: ${f.error.code}: ${f.error.message}`, { to: s?.to });
-        if (f.error) s?.onState?.({ status: "error", message: f.error.message });
+        if (f.error) s?.onState?.({ status: "error", code: f.error.code, message: f.error.message });
         else s?.onState?.({ status: "open", result: f.result });
         break;
       }
@@ -314,7 +314,11 @@ class SocketLink implements Link {
         this.pending.delete(f.id);
         clearTimeout(p.timer);
         if (f.error && f.error.code !== "not_found") applog("warn", "rpc", `${p.method ?? "call"} failed: ${f.error.code}: ${f.error.message}`, { to: p.to });
-        if (f.error) p.reject(new RelayError(f.error.code, f.error.message));
+        if (f.error) {
+          const { code, message } = f.error;
+          // Existing relays report a lost host connection after forwarding as an offline response.
+          p.reject(new RelayError(code, message, code === "timeout" || (code === "offline" && message === "电脑端断开了连接")));
+        }
         else p.resolve(f.result);
         break;
       }
@@ -342,7 +346,7 @@ class SocketLink implements Link {
   private failPending(code: RpcError["code"], message: string) {
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
-      p.reject(new RelayError(code, message));
+      p.reject(new RelayError(code, message, true));
     }
     this.pending.clear();
   }
@@ -456,7 +460,7 @@ class SocketLink implements Link {
       // The link died under a read: ask the relay instead. Anything that changes something is not sent twice.
       if ((e.code === "offline" || e.code === "timeout") && SAFE_AGAIN.has(method)) return this.relayCall(to, method, params, timeoutMs);
       if (e.code !== "not_found") applog("warn", "rpc", `${method} failed over the direct link: ${e.code}: ${e.message}`, { to });
-      throw new RelayError(e.code, e.message);
+      throw new RelayError(e.code, e.message, e.uncertain);
     });
   }
 
@@ -466,7 +470,7 @@ class SocketLink implements Link {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         applog("warn", "rpc", `${method} timed out after ${timeoutMs}ms`, { to });
-        reject(new RelayError("timeout", "电脑那边没有及时回应"));
+        reject(new RelayError("timeout", "电脑那边没有及时回应", true));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, method, to });
       if (!this.send({ type: "rpc", id, to, method, params })) {

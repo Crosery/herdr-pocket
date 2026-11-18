@@ -87,14 +87,8 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
   const p = usePalette();
   const insets = useSafeAreaInsets();
   const headerHeight = useHeaderHeight();
-  const [tab, setTab] = useState<Tab>(initialTab ?? "chat");
+  const [tab, setTab] = useState<Tab>(initialTab ?? (agent.isShell ? "terminal" : "chat"));
   const subs = agent.subagents ?? 0;
-
-  useEffect(() => {
-    if (!agent.sessionKey && tab === "chat" && !initialTab) setTab("terminal");
-    // Only on first resolution of the agent.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agent.key]);
 
   // Opening a finished agent is looking at it: herdr stops counting it as "已完成", on the desktop too.
   useEffect(() => {
@@ -142,7 +136,7 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
           />
         </View>
         <View style={{ flex: 1 }}>
-          {tab === "chat" ? <ChatView agent={agent} active bottomInset={0} onNoSession={() => setTab("terminal")} childCount={subs} /> : null}
+          {tab === "chat" ? <ChatView agent={agent} active bottomInset={0} childCount={subs} /> : null}
           {tab === "terminal" ? <TerminalView agent={agent} active /> : null}
           {tab === "subs" ? <SubagentList agent={agent} trail={[]} active bottomInset={insets.bottom} /> : null}
           {tab === "info" ? <InfoView agent={agent} bottomInset={0} /> : null}
@@ -214,7 +208,7 @@ function SubDetail({ agent, sub, trail }: { agent: Agent; sub: string; trail: Cr
         ) : null}
       </View>
       <View style={{ flex: 1 }}>
-        {tab === "chat" ? <ChatView agent={agent} sub={sub} childCount={kids} trail={trail} active bottomInset={0} onNoSession={() => undefined} /> : null}
+        {tab === "chat" ? <ChatView agent={agent} sub={sub} childCount={kids} trail={trail} active bottomInset={0} /> : null}
         {tab === "subs" ? <SubagentList agent={agent} sub={sub} trail={trail} active bottomInset={insets.bottom} /> : null}
       </View>
       <View style={{ alignItems: "center", paddingTop: space.sm, paddingBottom: insets.bottom + space.sm }}>

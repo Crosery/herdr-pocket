@@ -1,4 +1,4 @@
-import { Pressable, View } from "react-native";
+import { Alert, Pressable, View } from "react-native";
 import { Text } from "react-native-paper";
 import * as Haptics from "expo-haptics";
 import Animated, { FadeIn } from "react-native-reanimated";
@@ -16,13 +16,15 @@ import { TypingDots } from "./ui";
  */
 export function SendMark({ send, agentKey, time }: { send: PendingSend; agentKey: string; time: string }) {
   const p = usePalette();
-  if (send.state === "failed") {
+  const uncertain = send.state === "uncertain";
+  if (send.state === "failed" || uncertain) {
+    const label = uncertain ? "发送结果待确认" : send.error ? `没发出去：${send.error}` : "没发出去";
     const pill = { minHeight: 30, paddingHorizontal: space.md, borderRadius: radius.pill, flexDirection: "row" as const, alignItems: "center" as const, gap: 3 };
     return (
       <View accessibilityLiveRegion="polite" style={{ flexDirection: "row", alignItems: "center", gap: 6, maxWidth: "100%" }}>
         <MaterialCommunityIcons name="alert-circle-outline" size={14} color={p.error} />
-        <Text numberOfLines={1} accessibilityLabel={`没发出去${send.error ? `：${send.error}` : ""}`} style={{ flexShrink: 1, color: p.error, fontSize: 12 }}>
-          {send.error ? `没发出去：${send.error}` : "没发出去"}
+        <Text numberOfLines={1} accessibilityLabel={label} style={{ flexShrink: 1, color: p.error, fontSize: 12 }}>
+          {label}
         </Text>
         <Pressable
           onPress={() => forget(agentKey, [send.id])}
@@ -36,7 +38,12 @@ export function SendMark({ send, agentKey, time }: { send: PendingSend; agentKey
         <Pressable
           onPress={() => {
             Haptics.selectionAsync().catch(() => undefined);
-            void resend(agentKey, send.id);
+            if (uncertain) {
+              Alert.alert("要重发这条消息吗？", "原消息可能已经送达，重发可能产生重复。", [
+                { text: "取消", style: "cancel" },
+                { text: "重发", onPress: () => void resend(agentKey, send.id, true) },
+              ]);
+            } else void resend(agentKey, send.id);
           }}
           accessibilityRole="button"
           accessibilityLabel="重新发送这条消息"
@@ -59,8 +66,8 @@ export function SendMark({ send, agentKey, time }: { send: PendingSend; agentKey
   }
   const sent = send.state === "sent";
   return (
-    <View accessible accessibilityLabel={sent ? `已发送 ${time}` : "正在发送"} style={{ flexDirection: "row", alignItems: "center", gap: 3 }}>
-      {sent ? <Text style={{ color: p.faint, fontSize: 11 }}>{time}</Text> : null}
+    <View accessible accessibilityLiveRegion="polite" accessibilityLabel={sent ? `已发送 ${time}` : "正在发送"} style={{ flexDirection: "row", alignItems: "center", gap: 3 }}>
+      <Text style={{ color: p.faint, fontSize: 11 }}>{sent ? time : "发送中"}</Text>
       <MaterialCommunityIcons name={sent ? "check" : "clock-outline"} size={12} color={p.faint} />
     </View>
   );

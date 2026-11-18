@@ -148,7 +148,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
       );
       onDismiss();
       if (res.task === "failed") Alert.alert("开好了，但第一句话没交给它", res.taskNote ?? "它现在空着，没在做这件事。");
-      router.push({ pathname: "/agent/[key]", params: { key: res.agent, fresh: String(Date.now()) } });
+      router.push({ pathname: "/agent/[key]", params: { key: res.agent, tab: "chat", fresh: String(Date.now()) } });
     } catch (e) {
       const err = e as RelayError;
       // It may well be open already: say so, so nobody taps again and gets two.

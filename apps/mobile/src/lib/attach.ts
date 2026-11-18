@@ -76,6 +76,8 @@ export async function sendWithPictures(agent: Agent, text: string, pictures: Att
       if (err.code === "unsupported" && /unknown method/i.test(err.message)) {
         throw new RelayError("unsupported", "这台电脑上的 herdr-pocket 版本太旧，还收不了图片，更新后再试");
       }
+      // The message was never submitted when the upload fails, even if a file made it through.
+      if (err.uncertain) throw new RelayError(err.code, err.message);
       throw err;
     }
     if (paths.length !== pictures.length) throw new RelayError("internal", "电脑那边没收全图片，没有发送");
