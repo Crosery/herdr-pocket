@@ -41,7 +41,7 @@ There is no default model list. Without models, or when no listed model has a us
 |---|---|---|---|---|
 | `anthropic` | Anthropic | Anthropic Messages | `https://api.anthropic.com` | `x-api-key` header, `anthropic-version: 2023-06-01` |
 | `openai` | OpenAI | Chat Completions | `https://api.openai.com/v1` | sends `max_completion_tokens` (`max_tokens` is deprecated there) |
-| `mimo` | Xiaomi MiMo | Chat Completions | `https://token-plan-cn.xiaomimimo.com/v1` | disables thinking by default (`thinking: { type: "disabled" }`) for fast responses |
+| `mimo` | Xiaomi MiMo | Chat Completions | `https://token-plan-cn.xiaomimimo.com/v1` | uses `reasoning_effort: "low"` + `parallel_tool_calls` on tool turns; disables thinking on connectivity pings |
 | `deepseek` | DeepSeek | Chat Completions | `https://api.deepseek.com` | Anthropic-compatible: `https://api.deepseek.com/anthropic` |
 | `qwen` | Alibaba Cloud Model Studio (DashScope) | Chat Completions | `https://dashscope.aliyuncs.com/compatible-mode/v1` | Singapore: `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. Keys belong to one region. Anthropic-compatible: `https://dashscope.aliyuncs.com/apps/anthropic` |
 | `moonshot` | Moonshot Kimi | Chat Completions | `https://api.moonshot.cn/v1` | International: `https://api.moonshot.ai/v1`. Sends `max_completion_tokens` (its docs deprecate `max_tokens`). Anthropic-compatible: `https://api.moonshot.cn/anthropic` |

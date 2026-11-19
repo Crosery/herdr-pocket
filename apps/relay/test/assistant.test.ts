@@ -7,7 +7,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { Agent, AssistantItem, ServerFrame } from "@herdr-pocket/protocol";
 import { Relay } from "../src/server.ts";
 import type { Llm, LlmRequest, LlmResult } from "../src/assistant/llm.ts";
-import { handlesFor, noEmoji } from "../src/assistant/assistant.ts";
+import { Assistant, handlesFor, noEmoji, promisesLookWithoutTools } from "../src/assistant/assistant.ts";
+import { Store } from "../src/store.ts";
 import { filterTalk, normName, parseWake, splitScript, spokenTime } from "../src/assistant/speech.ts";
 import { personaPrompt, systemPrompt, voiceInstructions } from "../src/assistant/prompts.ts";
 
@@ -823,4 +824,86 @@ test("short names: herdr's name first, then a space of its own, never two agents
   assert.equal(normName("V 零五零 UI"), normName("v050-ui"));
   assert.equal(spokenTime(Date.parse("2026-11-13T20:20:00+08:00")), "周五晚上八点二十");
   assert.equal(spokenTime(Date.parse("2026-11-14T02:05:00+08:00")), "周六凌晨两点零五");
+});
+
+test("empty look promises trigger a same-turn nudge and read-only tools execute in parallel", async () => {
+  assert.equal(promisesLookWithoutTools("好，我先把这 5 个都读一遍。"), true);
+  assert.equal(promisesLookWithoutTools("Fixing U 在跑。另外还有 4 个在等我，我先去看看它们分别卡在哪儿。"), true);
+  assert.equal(promisesLookWithoutTools("Fixing U 在跑，另外 4 个一切正常。"), false);
+
+  const { publish } = await fakeHost("Mac P");
+  publish([agent("t11", "working", "Task A"), agent("t12", "blocked", "Task B")]);
+  const phone = await pair("viewer", "Redmi P");
+  const p = await Sock.open("/v1/ws", phone.token);
+  await p.next((f) => f.type === "snapshot");
+  await sleep(50);
+
+  let step = 0;
+  script = (req) => {
+    step++;
+    if (step === 1) return text("好，我先把这 2 个都读一遍。");
+    if (step === 2) {
+      const lastMsg = req.messages[req.messages.length - 1]!;
+      assert.match(String(lastMsg.content), /还没有调用任何工具/);
+      return {
+        content: [
+          { type: "tool_use", id: "c1", name: "read_agent", input: { agent: "Task A", what: "terminal" } },
+          { type: "tool_use", id: "c2", name: "read_agent", input: { agent: "Task B", what: "terminal" } },
+        ],
+        stopReason: "tool_use",
+        model: "test",
+      };
+    }
+    return text("Task A 在跑，Task B 在等你。");
+  };
+  await api("/v1/assistant/messages", { token: phone.token, body: { text: "帮我看下两个的进度" } });
+  const done = await p.next((f) => f.type === "assistant_item" && f.item.role === "assistant" && f.item.text === "Task A 在跑，Task B 在等你。");
+  assert.equal(step, 3);
+  assert.equal(done.item.steps?.length, 2);
+  await p.next((f) => f.type === "assistant_busy" && f.busy === false);
+
+  // Verify read-only tools run concurrently via Promise.all rather than sequentially.
+  const store = new Store(join(dir, "parallel.db"));
+  let inflight = 0;
+  let peak = 0;
+  let callTurn = 0;
+  const asst = new Assistant({
+    store,
+    promptEpoch: 0,
+    host: {
+      devices: () => [{ id: "d1", name: "Mac", kind: "host", createdAt: 0, online: true, lastSeenAt: Date.now() }],
+      agents: () => [
+        { key: "d1/hc:t1", deviceId: "d1", source: "hc", localId: "t1", harness: "codex", status: "working", title: "Alpha", isShell: false, updatedAt: 1 },
+        { key: "d1/hc:t2", deviceId: "d1", source: "hc", localId: "t2", harness: "codex", status: "working", title: "Beta", isShell: false, updatedAt: 1 },
+      ],
+      async call() {
+        inflight++;
+        peak = Math.max(peak, inflight);
+        await sleep(30);
+        inflight--;
+        return { text: "ok" } as any;
+      },
+      toViewers: () => {},
+      log: () => {},
+    },
+    llm: async () => {
+      callTurn++;
+      if (callTurn === 1) {
+        return {
+          content: [
+            { type: "tool_use", id: "p1", name: "read_agent", input: { agent: "Alpha", what: "terminal" } },
+            { type: "tool_use", id: "p2", name: "read_agent", input: { agent: "Beta", what: "terminal" } },
+          ],
+          stopReason: "tool_use",
+          model: "test",
+        };
+      }
+      return text("都在跑");
+    },
+  });
+  asst.say("都看看");
+  await sleep(150);
+  assert.equal(peak, 2);
+  asst.close();
+  store.close();
 });

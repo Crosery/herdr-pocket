@@ -13,7 +13,7 @@ import { HERDR_COMMANDS, type PromptId, type PromptView } from "@herdr-pocket/pr
  * model back to it: only later items are given to the model (4.8). Set it to
  * the moment the prompts change. The app's own history is not affected.
  */
-export const PROMPT_EPOCH = Date.parse("2026-11-14T10:30:00+08:00");
+export const PROMPT_EPOCH = Date.parse("2026-11-19T19:48:00+08:00");
 
 export type Occasion = "text" | "call" | "woken";
 

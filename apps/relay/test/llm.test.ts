@@ -1,7 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { listModels, makeLlm, type LlmTarget, type Msg, type ToolDef } from "../src/assistant/llm.ts";
+import { listModels, makeLlm, testModel, type LlmTarget, type Msg, type ToolDef } from "../src/assistant/llm.ts";
 
 /** One local server plays every upstream; the path says which. */
 let server: Server;
@@ -234,4 +234,41 @@ test("Ollama native API: NDJSON /api/chat and /api/tags without API key", async 
   assert.deepEqual(await listModels(target), ["qwen3:8b"]);
   const r = await makeLlm({ targets: [target] })({ system: "s", messages: [{ role: "user", content: "在吗" }], tools: [] });
   assert.deepEqual(r.content, [{ type: "text", text: "在的" }]);
+});
+
+test("MiMo disables thinking on connectivity pings, enables reasoning_effort=low + parallel_tool_calls on tool turns, and keeps reasoning_content", async () => {
+  seen.length = 0;
+  handler = (_path, body, res) => {
+    if (!body.tools?.length) {
+      stream(res, [{ choices: [{ delta: { content: "好" }, finish_reason: "stop" }] }]);
+      return;
+    }
+    const hasResult = body.messages.some((m: any) => m.role === "tool");
+    if (!hasResult) {
+      stream(res, [
+        { choices: [{ delta: { reasoning_content: "need to read first" } }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "tc_1", function: { name: "list_agents", arguments: "{}" } }] }, finish_reason: "tool_calls" }] },
+      ]);
+      return;
+    }
+    stream(res, [{ choices: [{ delta: { content: "全在跑" }, finish_reason: "stop" }] }]);
+  };
+  const target: LlmTarget = { provider: "mimo", protocol: "openai", baseUrl: `${base}/mimo/v1`, apiKey: "k-mimo", model: "mimo-v2.6-flash" };
+  const ping = await testModel(target);
+  assert.equal(ping.ok, true);
+  assert.deepEqual(seen[0]!.body.thinking, { type: "disabled" });
+
+  const llm = makeLlm({ targets: [target] });
+  const msgs: Msg[] = [{ role: "user", content: "看下" }];
+  const r1 = await llm({ system: "s", messages: msgs, tools: TOOLS });
+  assert.equal(seen[1]!.body.thinking, undefined);
+  assert.equal(seen[1]!.body.reasoning_effort, "low");
+  assert.equal(seen[1]!.body.parallel_tool_calls, true);
+  assert.equal(r1.reasoning, "need to read first");
+  msgs.push({ role: "assistant", content: r1.content, reasoning: r1.reasoning });
+  msgs.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "tc_1", content: "ok" }] });
+  const r2 = await llm({ system: "s", messages: msgs, tools: TOOLS });
+  assert.deepEqual(r2.content, [{ type: "text", text: "全在跑" }]);
+  const assistantTurn = seen[2]!.body.messages.find((m: any) => m.role === "assistant");
+  assert.equal(assistantTurn.reasoning_content, "need to read first");
 });

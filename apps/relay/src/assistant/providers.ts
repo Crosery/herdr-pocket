@@ -20,7 +20,7 @@ export const TEXT_PRESETS: Record<string, TextPreset> = {
   anthropic: { label: "Anthropic", protocol: "anthropic", baseUrl: "https://api.anthropic.com" },
   // max_tokens is deprecated in favour of max_completion_tokens (o-series models refuse it).
   openai: { label: "OpenAI", protocol: "openai", baseUrl: "https://api.openai.com/v1", maxTokensField: "max_completion_tokens" },
-  mimo: { label: "小米 MiMo", protocol: "openai", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", extraBody: { thinking: { type: "disabled" } } },
+  mimo: { label: "小米 MiMo", protocol: "openai", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" },
   deepseek: { label: "DeepSeek", protocol: "openai", baseUrl: "https://api.deepseek.com" },
   // Beijing region; Singapore: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
   qwen: { label: "Qwen (Alibaba Cloud Model Studio / DashScope)", protocol: "openai", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },

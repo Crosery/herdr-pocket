@@ -142,6 +142,27 @@ const OUT_OF_ROUNDS: Record<Occasion, string> = {
 };
 /** A wake-up reads; it never proposes anything (4.6). */
 const WAKE_TOOLS = new Set(["read_agent"]);
+const READ_ONLY_TOOLS = new Set([
+  "list_agents",
+  "list_devices",
+  "read_agent",
+  "list_launchers",
+  "list_spaces",
+  "search_sessions",
+  "list_sessions",
+  "read_session",
+  "usage",
+  "costs",
+  "read_logs",
+  "list_reminders",
+]);
+
+/** Detects when the model promised to check agents ("我先去看看 / 读一遍") without actually calling any tool. */
+export function promisesLookWithoutTools(text: string): boolean {
+  const s = text.trim();
+  if (!s || s.length > 200) return false;
+  return /(?:我先?|现在|这就|马上|我去|我来|帮你)(?:去|先|把|给)?[^。！？\n]{0,20}(?:看看|看下|看一眼|读一遍|读一下|查一下|查查|翻一下|翻翻)/.test(s);
+}
 const WAKE_ROUNDS = 3;
 const WAKE_CONCURRENCY = 2;
 const TOUCH_WINDOW_MS = 10 * 60_000;
@@ -475,7 +496,7 @@ export class Assistant {
       if (it.role === "user") pushUser(out, it.via === "voice" ? `[语音] ${it.text}` : it.text);
       else if (it.role === "notice") pushAssistant(out, this.noticeLine(it));
       else if (it.action) pushAssistant(out, `${it.text ? `${it.text}\n` : ""}[操作 ${it.action.id}：${it.action.summary}；状态：${actionState(it.action.state)}${it.action.result ? `，${it.action.result}` : ""}]`);
-      else if (it.text) pushAssistant(out, it.text);
+      else if (it.text) pushAssistant(out, it.steps?.length ? `[已查：${it.steps.join("；")}]\n${it.text}` : it.text);
     }
     while (out.length && out[0]!.role !== "user") out.shift();
     if (!out.length) out.push({ role: "user", content: "你好" });
@@ -538,41 +559,72 @@ export class Assistant {
       });
     };
     let text = "";
+    let nudged = false;
     for (let round = 0; round < rounds; round++) {
       const res = await answer();
       text = textOf(res.content);
       const calls = res.content.filter((b): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use");
-      if (!calls.length) return finish(noEmoji(text));
-      messages.push({ role: "assistant", content: res.content });
-      const results: ContentBlock[] = [];
-      for (const call of calls) {
+      if (!calls.length) {
+        if (!nudged && used.length === 0 && opts.occasion === "text" && tools.length > 0 && promisesLookWithoutTools(text)) {
+          nudged = true;
+          this.event({
+            kind: "guard",
+            level: "info",
+            msg: `text: model promised a look without calling tools ("${clip(oneLine(text), 80)}"), nudging once`,
+          });
+          messages.push(
+            { role: "assistant", content: text, ...(res.reasoning ? { reasoning: res.reasoning } : {}) },
+            { role: "user", content: "（你刚才只说了要去查看，还没有调用任何工具。现在直接并行调用工具（如 read_agent / list_agents），拿到结果后再回答我。）" },
+          );
+          continue;
+        }
+        return finish(noEmoji(text));
+      }
+      messages.push({ role: "assistant", content: res.content, ...(res.reasoning ? { reasoning: res.reasoning } : {}) });
+      if (opts.occasion === "text") this.setBusy(true, calls.length > 1 ? `在查 ${calls.length} 项` : "在查");
+      const execCall = async (call: Extract<ContentBlock, { type: "tool_use" }>) => {
         let out: string;
+        let step: string | undefined;
         let isError = false;
         const input = (call.input ?? {}) as Record<string, unknown>;
         const t0 = Date.now();
-        used.push(call.name);
         try {
           if (opts.allow && !opts.allow.has(call.name)) throw new Error("这次只看不动手，没有这个工具");
           const r = await this.tool(call.name, input, turn);
           out = r.out;
-          if (r.step) steps.push(r.step);
+          step = r.step;
         } catch (e) {
           out = `出错：${(e as Error).message}`;
           isError = true;
         }
+        return { call, input, out, step, isError, ms: Date.now() - t0 };
+      };
+      const parallel = calls.length > 1 && calls.every((c) => READ_ONLY_TOOLS.has(c.name));
+      const outcomes = parallel
+        ? await Promise.all(calls.map(execCall))
+        : await (async () => {
+            const seq: Array<Awaited<ReturnType<typeof execCall>>> = [];
+            for (const c of calls) seq.push(await execCall(c));
+            return seq;
+          })();
+      const results: ContentBlock[] = [];
+      for (const item of outcomes) {
+        used.push(item.call.name);
+        if (item.step) steps.push(item.step);
         this.event({
           kind: "assistant.tool",
-          level: isError ? "warn" : "info",
-          msg: `${opts.occasion} ${call.name} ${isError ? "failed" : "ok"} ${Date.now() - t0}ms${isError ? `: ${clip(oneLine(out), 200)}` : ""}`,
-          data: { args: argSummary(input), result: isError ? undefined : clip(oneLine(out), 200) },
+          level: item.isError ? "warn" : "info",
+          msg: `${opts.occasion} ${item.call.name} ${item.isError ? "failed" : "ok"} ${item.ms}ms${item.isError ? `: ${clip(oneLine(item.out), 200)}` : ""}`,
+          data: { args: argSummary(item.input), result: item.isError ? undefined : clip(oneLine(item.out), 200) },
         });
-        if (!isError) notes.push(clip(oneLine(out), NOTE_CHARS));
-        results.push({ type: "tool_result", tool_use_id: call.id, content: clip(out, 6000), is_error: isError || undefined });
+        if (!item.isError) notes.push(clip(oneLine(item.out), NOTE_CHARS));
+        results.push({ type: "tool_result", tool_use_id: item.call.id, content: clip(item.out, 6000), is_error: item.isError || undefined });
       }
+      if (opts.occasion === "text") this.setBusy(true, "在整理");
       // The round after next does not exist: say so, so the answer comes instead of another look.
       if (round === rounds - 2) results.push({ type: "text", text: opts.occasion === "woken" ? "（这是最后一次查看，下一条直接按格式回。）" : "（这是最后一次查看。下一条就回答，别再调工具。）" });
       messages.push({ role: "user", content: results });
-      opts.onDraft?.(text, steps);
+      opts.onDraft?.(text, [...steps]);
     }
     // Out of rounds: one more answer, from what was found, with no further look. The tools stay
     // declared (the history holds tool calls); a call the model still makes is not run.

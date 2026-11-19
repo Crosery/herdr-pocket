@@ -17,6 +17,7 @@ export type ContentBlock =
 export interface Msg {
   role: "user" | "assistant";
   content: string | ContentBlock[];
+  reasoning?: string;
 }
 
 export interface ToolDef {
@@ -39,6 +40,7 @@ export interface LlmResult {
   content: ContentBlock[];
   stopReason: string | null;
   model: string;
+  reasoning?: string;
 }
 
 export type Llm = (req: LlmRequest) => Promise<LlmResult>;
@@ -272,7 +274,17 @@ async function once(t: LlmTarget, cfg: LlmConfig, req: LlmRequest): Promise<LlmR
         body: JSON.stringify({ ...responsesBody(t, req), ...t.extraBody }),
       });
     } else {
-      const autoExtra = base.includes("xiaomimimo.com") && (!t.extraBody || t.extraBody.thinking === undefined) ? { thinking: { type: "disabled" } } : undefined;
+      const isMimo = base.includes("xiaomimimo.com") || t.provider === "mimo";
+      const autoExtra = isMimo
+        ? req.tools.length === 0
+          ? !t.extraBody || t.extraBody.thinking === undefined
+            ? { thinking: { type: "disabled" } }
+            : undefined
+          : {
+              ...(t.extraBody?.reasoning_effort === undefined ? { reasoning_effort: "low" } : {}),
+              ...(t.extraBody?.parallel_tool_calls === undefined ? { parallel_tool_calls: true } : {}),
+            }
+        : undefined;
       res = await fetchWithRootV1Fallback(`${base}/chat/completions`, base, "/chat/completions", {
         method: "POST",
         signal: ac.signal,
@@ -371,7 +383,7 @@ function anthropicBody(t: LlmTarget, req: LlmRequest): Record<string, unknown> {
     max_tokens: req.maxTokens ?? 1200,
     stream: true,
     system: req.system,
-    messages: req.messages,
+    messages: req.messages.map(({ role, content }) => ({ role, content })),
     ...(req.tools.length ? { tools: req.tools } : {}),
   };
 }
@@ -436,7 +448,11 @@ export function toOpenaiMessages(msgs: Msg[]): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (const m of msgs) {
     if (typeof m.content === "string") {
-      out.push({ role: m.role, content: m.content });
+      out.push({
+        role: m.role,
+        content: m.content,
+        ...(m.role === "assistant" && m.reasoning ? { reasoning_content: m.reasoning } : {}),
+      });
       continue;
     }
     const text = m.content
@@ -447,7 +463,12 @@ export function toOpenaiMessages(msgs: Msg[]): Array<Record<string, unknown>> {
       const calls = m.content
         .filter((b): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use")
         .map((b) => ({ id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) } }));
-      out.push(calls.length ? { role: "assistant", content: text || null, tool_calls: calls } : { role: "assistant", content: text });
+      out.push({
+        role: "assistant",
+        content: text || null,
+        ...(calls.length ? { tool_calls: calls } : {}),
+        ...(m.reasoning ? { reasoning_content: m.reasoning } : {}),
+      });
       continue;
     }
     for (const b of m.content) if (b.type === "tool_result") out.push({ role: "tool", tool_call_id: b.tool_use_id, content: b.content });
@@ -460,6 +481,7 @@ const OPENAI_STOP: Record<string, string> = { tool_calls: "tool_use", function_c
 
 async function readOpenai(events: AsyncGenerator<any>, t: LlmTarget, req: LlmRequest, stream: Stream): Promise<LlmResult> {
   let text = "";
+  let reasoning = "";
   const calls: Array<{ id: string; name: string; args: string }> = [];
   let stopReason: string | null = null;
   for await (const d of events) {
@@ -473,7 +495,13 @@ async function readOpenai(events: AsyncGenerator<any>, t: LlmTarget, req: LlmReq
       req.onText?.(delta.content);
     }
     // Thinking models reason before they answer: that counts as having started, but is not the answer.
-    if ((typeof delta.reasoning_content === "string" && delta.reasoning_content) || (typeof delta.reasoning === "string" && delta.reasoning)) stream.started();
+    if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+      stream.started();
+      reasoning += delta.reasoning_content;
+    } else if (typeof delta.reasoning === "string" && delta.reasoning) {
+      stream.started();
+      reasoning += delta.reasoning;
+    }
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
         stream.started();
@@ -494,7 +522,7 @@ async function readOpenai(events: AsyncGenerator<any>, t: LlmTarget, req: LlmReq
     if (!c?.name) return;
     content.push({ type: "tool_use", id: c.id || `call_${Date.now().toString(36)}_${n}`, name: c.name, input: parseArgs(c.args) });
   });
-  return { content, stopReason, model: t.model };
+  return { content, stopReason, model: t.model, ...(reasoning ? { reasoning } : {}) };
 }
 
 // ---------------------------------------------------------------------------
