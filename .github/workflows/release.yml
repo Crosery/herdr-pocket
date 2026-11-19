@@ -248,7 +248,7 @@ jobs:
       - name: Build web rawfile bundle
         working-directory: apps/desktop
         run: |
-          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm install --frozen-lockfile
           pnpm build:harmony
       - name: Install SDK runtime dependencies
         run: |
@@ -268,8 +268,9 @@ jobs:
           ohpm install --all
           hvigorw assembleHap --mode module -p module=entry@default -p product=default -p buildMode=release --no-daemon
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          cp entry/build/default/outputs/default/entry-default-unsigned.hap \
-            "$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-harmonyos-arm64.hap"
+          hap=$(find entry/build -name "*.hap" | head -n 1)
+          test -n "$hap"
+          cp "$hap" "$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-harmonyos-arm64.hap"
       - uses: actions/upload-artifact@v7
         with:
           name: harmony
@@ -328,16 +329,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - run: node scripts/set-version.mjs "$VERSION"
+      - name: Stamp version
+        shell: bash
+        run: node scripts/set-version.mjs "$VERSION"
       - name: Install JS deps
         working-directory: apps/desktop
-        run: pnpm install --frozen-lockfile --ignore-workspace
+        shell: bash
+        run: pnpm install --frozen-lockfile
       - name: Build Tauri bundle
         working-directory: apps/desktop
+        shell: bash
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
           NO_STRIP: "true"
-        run: pnpm exec tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+        run: pnpm exec tauri build --target ${{ matrix.target }} --bundles "${{ matrix.bundles }}"
       - name: Collect Unix packages
         if: runner.os != 'Windows'
         shell: bash

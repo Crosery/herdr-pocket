@@ -8,7 +8,8 @@
         "runtimeOS": "HarmonyOS",
         "buildOption": {
           "strictMode": {
-            "caseSensitiveCheck": true
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
           }
         }
       }
