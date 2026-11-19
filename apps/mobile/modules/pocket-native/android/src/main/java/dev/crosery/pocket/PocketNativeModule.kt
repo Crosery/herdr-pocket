@@ -164,19 +164,32 @@ class PocketNativeModule : Module() {
       val ver = p.voiceModelVersion
       val enrolled = hasEmb && ver == VoiceModelManager.VOICEPRINT_MODEL_VERSION
       val legacyEnrolled = hasEmb && ver != VoiceModelManager.VOICEPRINT_MODEL_VERSION
-      val modelReady = VoiceModelManager.isSpeakerReady(context)
+      val svReady = VoiceModelManager.isSvModelReady(context)
+      val tseModelsReady = VoiceModelManager.isTseModelsReady(context)
+      val modelReady = svReady && tseModelsReady
       val tseReady = enrolled && modelReady && VoiceModelManager.hasOwnerSample(context)
+      val realRtf = if (p.lastCallTseRtf > 0f) p.lastCallTseRtf.toDouble() else p.benchTseRtf.toDouble()
       mapOf(
         "denoise" to p.voiceDenoise,
         "filter" to p.voiceFilter,
         "threshold" to p.voiceThreshold.toDouble(),
+        "voiceTier" to p.voiceTier,
+        "firstSpeaker" to p.voiceFirstSpeaker,
         "enrolled" to enrolled,
         "legacyEnrolled" to legacyEnrolled,
+        "svReady" to svReady,
+        "tseModelsReady" to tseModelsReady,
         "tseReady" to tseReady,
         "modelVersion" to VoiceModelManager.VOICEPRINT_MODEL_VERSION,
         "modelReady" to modelReady,
         "modelDownloading" to VoiceModelManager.downloading,
+        "svSize" to VoiceModelManager.SV_PACK_SIZE.toDouble(),
         "modelSize" to VoiceModelManager.MODEL_PACK_SIZE.toDouble(),
+        "recommendedTier" to p.benchRecommendedTier,
+        "recommendReason" to p.benchReason,
+        "benchDpdfUs" to if (p.benchDpdfUs > 0f) p.benchDpdfUs.toDouble() else null,
+        "benchTseRtf" to if (realRtf > 0.0) realRtf else null,
+        "benchAt" to p.benchAt.toDouble(),
       )
     }
 
@@ -185,6 +198,12 @@ class PocketNativeModule : Module() {
       p.voiceDenoise = denoise
       p.voiceFilter = filter
       p.voiceThreshold = threshold.toFloat().coerceIn(0.15f, 0.80f)
+    }
+
+    Function("setVoiceMode") { tier: String, firstSpeaker: Boolean ->
+      val p = Prefs(context)
+      p.voiceTier = if (tier in setOf("auto", "denoise", "sv", "tse")) tier else "auto"
+      p.voiceFirstSpeaker = firstSpeaker
     }
 
     Function("setVoiceprint") { embedding: List<Double>? ->
@@ -212,12 +231,38 @@ class PocketNativeModule : Module() {
       val ctx = context
       Thread {
         try {
-          VoiceModelManager.downloadSpeaker(ctx) { got, total ->
+          VoiceModelManager.downloadModels(ctx, "tse") { got, total ->
             PocketBus.emit("onVoiceModelProgress", mapOf("received" to got.toDouble(), "total" to total.toDouble()))
           }
           promise.resolve(true)
         } catch (e: Throwable) {
           promise.reject("E_VOICE_MODEL", e.message ?: "模型下载失败", e)
+        }
+      }.apply { isDaemon = true; start() }
+    }
+
+    AsyncFunction("prepareVoiceTier") { tier: String, promise: Promise ->
+      val ctx = context
+      val cleanTier = if (tier == "sv") "sv" else "tse"
+      Thread {
+        try {
+          VoiceModelManager.downloadModels(ctx, cleanTier) { got, total ->
+            PocketBus.emit("onVoiceModelProgress", mapOf("received" to got.toDouble(), "total" to total.toDouble()))
+          }
+          promise.resolve(true)
+        } catch (e: Throwable) {
+          promise.reject("E_VOICE_MODEL", e.message ?: "模型下载失败", e)
+        }
+      }.apply { isDaemon = true; start() }
+    }
+
+    AsyncFunction("benchmarkVoiceDevice") { promise: Promise ->
+      val ctx = context
+      Thread {
+        try {
+          promise.resolve(VoiceModelManager.benchmarkDevice(ctx))
+        } catch (e: Throwable) {
+          promise.reject("E_VOICE_BENCH", e.message ?: "性能检测失败", e)
         }
       }.apply { isDaemon = true; start() }
     }

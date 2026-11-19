@@ -5,13 +5,14 @@
  */
 import { useCallback, useState, type ReactNode } from "react";
 import { Pressable, TextInput, View, type TextInputProps } from "react-native";
-import { ActivityIndicator, Button, Dialog, Portal, Snackbar, Text } from "react-native-paper";
+import { ActivityIndicator, Button, Dialog, Portal, Text } from "react-native-paper";
 import { useIsFocused, usePreventRemove } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { KeyView } from "@herdr-pocket/protocol";
 import { flash, keyLine, useAssistantConfig } from "../lib/assistantConfig";
 import { Mascot } from "./Mascot";
+import { PocketToast } from "./ui";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space, statusColors } from "../theme/tokens";
 
@@ -262,16 +263,16 @@ export function ConfigSnackbar({ message, onDismiss, action, bottom = 0 }: { mes
   const focused = useIsFocused();
   const shared = useAssistantConfig((s) => s.flash);
   const text = message ?? (focused ? shared : null);
+  const isErr = !!text && /(失败|错误|无效|不能|没法|断|超时|冲突|不对)/.test(text);
   return (
-    <Snackbar
+    <PocketToast
       visible={focused && !!text}
-      onDismiss={() => (message ? onDismiss() : flash(null))}
-      duration={message && action ? 5000 : 3000}
+      message={text}
+      tone={isErr ? "error" : "info"}
+      bottom={Math.max(24, bottom)}
       action={message && action ? action : undefined}
-      wrapperStyle={{ bottom }}
-    >
-      {text ?? ""}
-    </Snackbar>
+      onDismiss={() => (message ? onDismiss() : flash(null))}
+    />
   );
 }
 

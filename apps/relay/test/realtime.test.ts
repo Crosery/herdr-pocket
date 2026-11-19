@@ -163,6 +163,7 @@ test("an OpenAI Realtime voice call: same phone events as MOSS-Live, tasks throu
   assert.deepEqual(s.audio.input.format, { type: "audio/pcm", rate: 24000 });
   assert.deepEqual(s.audio.input.transcription, { model: "gpt-4o-mini-transcribe", language: "zh" });
   assert.deepEqual(s.audio.input.turn_detection, { type: "server_vad", create_response: true, interrupt_response: true });
+  assert.deepEqual(s.audio.input.noise_reduction, { type: "near_field" });
   assert.deepEqual(s.audio.output, { format: { type: "audio/pcm", rate: 24000 }, voice: "marin" });
   assert.deepEqual(
     s.tools.map((t: any) => [t.type, t.name, t.parameters.required]),
@@ -319,4 +320,185 @@ test("a setup the service refuses ends the call with a reason", async () => {
   up.send({ type: "error", error: { type: "invalid_request_error", code: "invalid_value", message: "bad voice" } });
   const err = await call.next((f) => f.action === "relay.state" && f.data.state === "error");
   assert.equal(err.data.message, "语音会话配置失败（invalid_value）");
+});
+
+test("voice catalog endpoint lists selectable voices per provider", async () => {
+  const phone = await pair("viewer", "VoiceCatalogPhone");
+  const openai = await api("/v1/assistant/config/voices?provider=openai-realtime", { token: phone.token });
+  assert.equal(openai.provider, "openai-realtime");
+  assert.equal(openai.defaultVoice, "marin");
+  assert.equal(openai.voices.length, 10);
+  assert.equal(openai.voices[0].id, "marin");
+  assert.ok(!openai.voices.some((v: { id: string }) => v.id === "nova" || v.id === "onyx"));
+
+  const moss = await api("/v1/assistant/config/voices?provider=moss-live", { token: phone.token });
+  assert.equal(moss.provider, "moss-live");
+  assert.deepEqual(moss.voices, []);
+});
+
+test("fast Realtime answer before input ASR completes keeps audio immediate and captions/thread in user-then-assistant order", async () => {
+  const phone = await pair("viewer", "OrderPhone");
+  const upstream = new Promise<Sock>((resolve) => rt.once("connection", (ws) => resolve(new Sock(ws))));
+  const call = await Sock.open("/v1/assistant/live", phone.token);
+  const up = await upstream;
+  await up.next((f) => f.type === "session.update");
+  up.send({ type: "session.updated", session: {} });
+  await call.next((f) => f.action === "relay.state" && f.data.state === "ready");
+
+  up.send({ type: "input_audio_buffer.speech_started", item_id: "u_fast", audio_start_ms: 0 });
+  await call.next((f) => f.action === "input.speech.started" && f.data.turn === 1);
+  up.send({ type: "input_audio_buffer.speech_stopped", item_id: "u_fast", audio_end_ms: 1500 });
+  await call.next((f) => f.action === "input.speech.stopped" && f.data.turn === 1);
+
+  // Assistant audio and transcript finish before input_audio_transcription.completed arrives.
+  up.send({ type: "response.created", response: { id: "resp_fast", status: "in_progress" } });
+  up.send({ type: "response.output_audio.delta", response_id: "resp_fast", item_id: "a_fast", delta: pcm(240, 200).toString("base64") });
+  up.send({ type: "response.output_audio_transcript.delta", response_id: "resp_fast", item_id: "a_fast", delta: "怎么个" });
+  up.send({ type: "response.output_audio.done", response_id: "resp_fast", item_id: "a_fast" });
+  up.send({ type: "response.output_audio_transcript.done", response_id: "resp_fast", item_id: "a_fast", transcript: "怎么个意思呢？" });
+  up.send({ type: "response.done", response: { id: "resp_fast", status: "completed" } });
+
+  // Audio playback frames reach the phone immediately with zero ASR wait.
+  assert.deepEqual((await call.next((f) => f.action === "response.audio.started" && f.data.run_id === "a_fast")).data, { run_id: "a_fast", turn_id: "1" });
+  await call.next((f) => f.action === "response.audio.context" && f.data.run_id === "a_fast");
+  assert.deepEqual((await call.next((f) => f.action === "response.audio.done" && f.data.run_id === "a_fast")).data, { run_id: "a_fast", turn_id: "1" });
+  await sleep(30);
+  assert.equal(call.binary.length, 1);
+
+  // Assistant captions and response.ended wait for the turn's user ASR.
+  assert.ok(!call.frames.some((f) => f.action === "output.transcript.updated" || f.action === "output.transcript.done" || f.action === "response.ended"));
+  const beforeAsr = (await api("/v1/assistant", { token: phone.token })).items as Array<{ role: string; text: string }>;
+  assert.ok(!beforeAsr.some((i) => i.text === "怎么个意思呢？"));
+
+  const ordered: string[] = [];
+  const onOrder = (d: Buffer | string, isBinary: boolean) => {
+    if (isBinary) return;
+    const f = JSON.parse(d.toString());
+    if (f.action) ordered.push(f.action);
+  };
+  call.ws.on("message", onOrder);
+  up.send({ type: "conversation.item.input_audio_transcription.completed", item_id: "u_fast", content_index: 0, transcript: "你是人类吗？" });
+  await call.next((f) => f.action === "response.ended" && f.data.run_id === "a_fast");
+  call.ws.off("message", onOrder);
+
+  assert.deepEqual(ordered, ["input.transcript.done", "output.transcript.done", "response.ended"]);
+
+  const afterAsr = (await api("/v1/assistant", { token: phone.token })).items as Array<{ role: string; text: string }>;
+  const uIdx = afterAsr.findIndex((i) => i.role === "user" && i.text === "你是人类吗？");
+  const aIdx = afterAsr.findIndex((i) => i.role === "assistant" && i.text === "怎么个意思呢？");
+  assert.ok(uIdx >= 0 && aIdx >= 0 && uIdx < aIdx, `expected user before assistant, got uIdx=${uIdx} aIdx=${aIdx}`);
+
+  call.send({ action: "relay.hangup" });
+  await call.next((f) => f.action === "relay.state" && f.data.state === "closed");
+});
+
+test("ASR slower than hold timeout still flushes captions and keeps saved thread & mobile CallLine order", async () => {
+  const port = (rt.address() as { port: number }).port;
+  const r2 = new Relay({
+    dbPath: join(dir, "t-asr-hold.db"),
+    adminToken: ADMIN,
+    log: () => {},
+    llm,
+    live: {
+      provider: "openai-realtime",
+      url: `ws://127.0.0.1:${port}/v1/realtime`,
+      apiKey: "rt-test-key",
+      model: "gpt-realtime",
+      voice: "marin",
+      transcribeModel: "gpt-4o-mini-transcribe",
+      language: "zh",
+      refreshGapMs: 0,
+      asrHoldMs: 120,
+    },
+  });
+  const base2 = `http://127.0.0.1:${await r2.listen(0, "127.0.0.1")}`;
+  try {
+    const api2 = async (path: string, init: { token?: string; body?: unknown } = {}) => {
+      const res = await fetch(base2 + path, {
+        method: init.body ? "POST" : "GET",
+        headers: { "Content-Type": "application/json", ...(init.token ? { Authorization: `Bearer ${init.token}` } : {}) },
+        body: init.body ? JSON.stringify(init.body) : undefined,
+      });
+      return (await res.json()) as any;
+    };
+    const code = (await api2("/v1/pair/codes", { token: ADMIN, body: { kind: "viewer" } })).code;
+    const phone = (await api2("/v1/pair", { body: { code, name: "HoldPhone", kind: "viewer" } })) as { token: string };
+
+    const upstream = new Promise<Sock>((resolve) => rt.once("connection", (ws) => resolve(new Sock(ws))));
+    const ws = new WebSocket(`${base2.replace("http", "ws")}/v1/assistant/live?token=${encodeURIComponent(phone.token)}`);
+    const call = new Sock(ws);
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+    const up = await upstream;
+    await up.next((f) => f.type === "session.update");
+    up.send({ type: "session.updated", session: {} });
+    await call.next((f) => f.action === "relay.state" && f.data.state === "ready");
+
+    up.send({ type: "input_audio_buffer.speech_started", item_id: "u_slow", audio_start_ms: 0 });
+    await call.next((f) => f.action === "input.speech.started");
+    up.send({ type: "input_audio_buffer.speech_stopped", item_id: "u_slow", audio_end_ms: 1400 });
+    await call.next((f) => f.action === "input.speech.stopped");
+
+    up.send({ type: "response.created", response: { id: "resp_slow", status: "in_progress" } });
+    up.send({ type: "response.output_audio.delta", response_id: "resp_slow", item_id: "a_slow", delta: pcm(240, 200).toString("base64") });
+    up.send({ type: "response.output_audio_transcript.done", response_id: "resp_slow", item_id: "a_slow", transcript: "怎么个意思呢？" });
+    up.send({ type: "response.done", response: { id: "resp_slow", status: "completed" } });
+
+    // Hold expires cleanly before late ASR arrives, flushing assistant caption & response.ended.
+    assert.equal((await call.next((f) => f.action === "output.transcript.done" && f.data.run_id === "a_slow")).data.text, "怎么个意思呢？");
+    await call.next((f) => f.action === "response.ended" && f.data.run_id === "a_slow");
+
+    // Late ASR arrives after hold timeout: thread order still sorts user before assistant.
+    up.send({ type: "conversation.item.input_audio_transcription.completed", item_id: "u_slow", content_index: 0, transcript: "你是人类吗？" });
+    assert.deepEqual((await call.next((f) => f.action === "input.transcript.done")).data, { text: "你是人类吗？", turn: 1 });
+    await sleep(30);
+
+    const items = (await api2("/v1/assistant", { token: phone.token })).items as Array<{ role: string; text: string }>;
+    assert.deepEqual(
+      items.map((i) => [i.role, i.text]),
+      [
+        ["user", "你是人类吗？"],
+        ["assistant", "怎么个意思呢？"],
+      ],
+    );
+
+    // Mobile CallLine helpers: late user turn inserts above the same turn's reply, not below it,
+    // and never re-enters "小羊在想" once that turn has already started/finished answering.
+    type CallLine = { id: string; role: "user" | "assistant"; text: string; final: boolean; turn?: number };
+    const voiceOrderUrl = new URL("../../mobile/src/lib/voiceOrder.ts", import.meta.url).href;
+    const { numTurn, shouldWaitForAnswer, upsertCallLine } = (await import(voiceOrderUrl)) as {
+      numTurn: (v: unknown) => number | undefined;
+      shouldWaitForAnswer: (turn: number | undefined, lastAnsweredTurn: number, speaking: boolean) => boolean;
+      upsertCallLine: (lines: CallLine[], line: CallLine, maxLines?: number) => CallLine[];
+    };
+    let lines: CallLine[] = [{ id: "a:prev", role: "assistant", text: "嗯，我轻点说一点哦。", final: true, turn: 2 }];
+    lines = upsertCallLine(lines, { id: "a:r3", role: "assistant", text: "怎么个意思呢？", final: true, turn: numTurn("3") });
+    assert.equal(shouldWaitForAnswer(numTurn(3), 3, false), false);
+    assert.equal(shouldWaitForAnswer(numTurn(4), 3, false), true);
+    assert.equal(shouldWaitForAnswer(undefined, 3, false), true);
+    assert.equal(shouldWaitForAnswer(4, 3, true), false);
+
+    lines = upsertCallLine(lines, { id: "u:3", role: "user", text: "你是人类吗？", final: true, turn: numTurn(3) });
+    assert.deepEqual(
+      lines.map((l) => [l.id, l.role, l.text]),
+      [
+        ["a:prev", "assistant", "嗯，我轻点说一点哦。"],
+        ["u:3", "user", "你是人类吗？"],
+        ["a:r3", "assistant", "怎么个意思呢？"],
+      ],
+    );
+
+    // Legacy / demo lines without turn keep insertion order.
+    let demoLines: CallLine[] = [{ id: "a:0", role: "assistant", text: "哎，我在。", final: true }];
+    demoLines = upsertCallLine(demoLines, { id: "u:open", role: "user", text: "帮我看看谁跑完了", final: true });
+    demoLines = upsertCallLine(demoLines, { id: "a:2", role: "assistant", text: "迁移脚本跑完了", final: true });
+    assert.deepEqual(demoLines.map((l) => l.id), ["a:0", "u:open", "a:2"]);
+
+    call.send({ action: "relay.hangup" });
+    await call.next((f) => f.action === "relay.state" && f.data.state === "closed");
+  } finally {
+    await r2.close();
+  }
 });

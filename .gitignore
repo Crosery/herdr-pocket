@@ -1,5 +1,6 @@
 node_modules/
 dist/
+!apps/relay/src/admin/dist/
 .expo/
 *.db
 *.db-*
@@ -19,6 +20,7 @@ apps/mobile/modules/pocket-native/android/.cxx/
 # Private: maintainer notes and local machine state
 AGENTS.local.md
 *.local.md
+.claude/
 
 # Not published: real-device/emulator evidence and image-generation logs
 # (they contain private machine names, paths and project names)

@@ -1,10 +1,10 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { Image, Pressable, View, type StyleProp, type ViewStyle } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Text } from "react-native-paper";
 import Svg, { G, Path, SvgXml } from "react-native-svg";
-import Animated, { cancelAnimation, Easing, useAnimatedStyle, useSharedValue, withRepeat, withSequence, withTiming, type SharedValue } from "react-native-reanimated";
+import Animated, { cancelAnimation, Easing, FadeInDown, FadeOut, useAnimatedStyle, useSharedValue, withRepeat, withSequence, withTiming, type SharedValue } from "react-native-reanimated";
 import type { AgentStatus } from "@herdr-pocket/protocol";
 import { usePalette } from "../theme/theme";
 import { fonts, motion, radius, space, statusColors, statusLabel } from "../theme/tokens";
@@ -343,6 +343,97 @@ export function PageTitle({ children, sub, right }: { children: ReactNode; sub?:
         {sub ? <Text style={{ color: p.muted, fontSize: 14.5 }}>{sub}</Text> : null}
       </View>
       {right}
+    </View>
+  );
+}
+
+export type PocketToastTone = "hangup" | "info" | "error";
+
+/** Compact pastel floating pill toast, replacing full-width dark Material Snackbars. */
+export function PocketToast({
+  visible,
+  message,
+  onDismiss,
+  duration,
+  bottom = 86,
+  tone = "info",
+  action,
+}: {
+  visible: boolean;
+  message: string | null;
+  onDismiss: () => void;
+  duration?: number;
+  bottom?: number;
+  tone?: PocketToastTone;
+  action?: { label: string; onPress: () => void };
+}) {
+  const p = usePalette();
+  const dismissRef = useRef(onDismiss);
+  dismissRef.current = onDismiss;
+  const ms = duration ?? (tone === "hangup" ? 1100 : action ? 3800 : tone === "error" ? 2500 : 2000);
+
+  useEffect(() => {
+    if (!visible || !message) return;
+    const t = setTimeout(() => dismissRef.current(), ms);
+    return () => clearTimeout(t);
+  }, [visible, message, ms]);
+
+  if (!visible || !message) return null;
+
+  const badgeBg = tone === "error" ? p.errorContainer : p.accentContainer;
+  const badgeColor = tone === "error" ? p.error : p.accentText;
+  const badgeIcon: CuteIconName = tone === "hangup" ? "hangup" : tone === "error" ? "alert" : "check";
+
+  return (
+    <View pointerEvents="box-none" style={{ position: "absolute", left: space.lg, right: space.lg, bottom, alignItems: "center", zIndex: 50 }}>
+      <Animated.View entering={FadeInDown.duration(150)} exiting={FadeOut.duration(120)} style={{ maxWidth: 340 }}>
+        <Pressable
+          accessibilityRole="alert"
+          accessibilityLiveRegion="polite"
+          onPress={onDismiss}
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 9,
+            paddingLeft: 9,
+            paddingRight: action ? 9 : 15,
+            paddingVertical: 7,
+            borderRadius: radius.pill,
+            backgroundColor: p.surface,
+            borderWidth: 1,
+            borderColor: tone === "error" ? (p.dark ? "#6B3042" : "#F6C5D2") : p.divider,
+            shadowColor: p.shadow,
+            shadowOpacity: p.dark ? 0.34 : 0.16,
+            shadowRadius: 14,
+            shadowOffset: { width: 0, height: 5 },
+            elevation: p.dark ? 0 : 4,
+          }}
+        >
+          <View style={{ width: 24, height: 24, borderRadius: 12, backgroundColor: badgeBg, alignItems: "center", justifyContent: "center" }}>
+            <CuteIcon name={badgeIcon} size={14} color={badgeColor} fill={badgeBg} />
+          </View>
+          <Text numberOfLines={2} style={{ flexShrink: 1, color: p.ink, fontSize: 13.5, lineHeight: 19, fontFamily: fonts.bodySemi }}>
+            {message}
+          </Text>
+          {action ? (
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => {
+                action.onPress();
+                onDismiss();
+              }}
+              style={({ pressed }) => ({
+                paddingHorizontal: 10,
+                paddingVertical: 4,
+                borderRadius: radius.pill,
+                backgroundColor: pressed ? p.primaryPressed : p.accentContainer,
+              })}
+            >
+              <Text style={{ color: p.accentText, fontSize: 12.5, fontFamily: fonts.bodyBold }}>{action.label}</Text>
+            </Pressable>
+          ) : null}
+        </Pressable>
+      </Animated.View>
     </View>
   );
 }

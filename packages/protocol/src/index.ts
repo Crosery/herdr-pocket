@@ -627,6 +627,42 @@ export interface ModelRef {
 
 export type VoiceProviderId = "moss-live" | "openai-realtime";
 
+export interface VoiceOption {
+  id: string;
+  label: string;
+  gender?: "female" | "male" | "neutral";
+  hint?: string;
+  recommended?: boolean;
+}
+
+export interface VoiceCatalogResponse {
+  provider: VoiceProviderId;
+  defaultVoice?: string;
+  voices: VoiceOption[];
+}
+
+export const OPENAI_REALTIME_VOICES: readonly VoiceOption[] = [
+  { id: "marin", label: "Marin · 自然女声", gender: "female", hint: "新一代旗舰女声，自然清晰", recommended: true },
+  { id: "shimmer", label: "Shimmer · 轻柔女声", gender: "female", hint: "柔和甜美，适合日常通话", recommended: true },
+  { id: "coral", label: "Coral · 温暖女声", gender: "female", hint: "亲切轻快，聊天感强" },
+  { id: "sage", label: "Sage · 沉稳女声", gender: "female", hint: "清晰柔和，语调平稳" },
+  { id: "cedar", label: "Cedar · 沉稳男声", gender: "male", hint: "新一代旗舰男声，温暖稳重" },
+  { id: "ash", label: "Ash · 磁性男声", gender: "male", hint: "表现力强的自然男声" },
+  { id: "verse", label: "Verse · 明快男声", gender: "male", hint: "节奏利落，适合问答" },
+  { id: "ballad", label: "Ballad · 温和男声", gender: "male", hint: "柔和叙事风格" },
+  { id: "echo", label: "Echo · 清朗男声", gender: "male", hint: "干净标准的男声" },
+  { id: "alloy", label: "Alloy · 中性标准", gender: "neutral", hint: "初代默认中性音色" },
+] as const;
+
+export const MOSS_LIVE_VOICES: readonly VoiceOption[] = [] as const;
+
+export function voiceCatalogFor(provider: VoiceProviderId): VoiceCatalogResponse {
+  if (provider === "openai-realtime") {
+    return { provider, defaultVoice: "marin", voices: OPENAI_REALTIME_VOICES.map((v) => ({ ...v })) };
+  }
+  return { provider: "moss-live", voices: [] };
+}
+
 export interface VoiceView {
   /** Null: voice calls are off. */
   provider: VoiceProviderId | null;
@@ -1158,6 +1194,7 @@ export type LiveRelayEvent =
 //                                              other phones see assistant_config; takes effect at once)
 // POST   /v1/assistant/config/test {provider, model} | {provider: ProviderPatch, model} -> ModelTestResult
 // GET    /v1/assistant/config/models?provider=<id> -> { models: string[] }   (what the provider lists, if it does)
+// GET    /v1/assistant/config/voices?provider=<id> -> VoiceCatalogResponse
 // GET    /v1/assistant/prompts                -> { prompts: PromptView[] }
 // POST   /v1/assistant/prompts/:id {text} | {reset: true} -> PromptView   (other phones see assistant_config)
 //

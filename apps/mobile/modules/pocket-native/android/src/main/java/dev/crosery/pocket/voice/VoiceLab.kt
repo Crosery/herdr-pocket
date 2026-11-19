@@ -155,7 +155,7 @@ object VoiceLab {
   fun startEnroll(ctx: Context) {
     stop()
     if (VoiceCall.current != null) throw IllegalStateException("正在通话中，挂断后再录声纹")
-    if (!VoiceModelManager.isSpeakerReady(ctx)) throw IllegalStateException("声纹模型还没准备好")
+    if (!VoiceModelManager.isSvModelReady(ctx)) throw IllegalStateException("声纹模型还没准备好")
     val models = VoiceModelManager.openModels(ctx, needSpeaker = true, needTse = false)
     if (models.speaker == null) {
       models.close()
@@ -236,7 +236,7 @@ object VoiceLab {
     if (p.voiceModelVersion != VoiceModelManager.VOICEPRINT_MODEL_VERSION) {
       throw IllegalStateException("声纹引擎已升级，请重录一次")
     }
-    if (!VoiceModelManager.isSpeakerReady(ctx)) throw IllegalStateException("声纹模型还没准备好")
+    if (!VoiceModelManager.isSvModelReady(ctx)) throw IllegalStateException("声纹模型还没准备好")
     val enrolledNorm = normalizeEmbedding(enrolledRaw)
     val protosNorm = p.voicePrototypes?.map { normalizeEmbedding(it) }
     val models = VoiceModelManager.openModels(ctx, needSpeaker = true, needTse = false)

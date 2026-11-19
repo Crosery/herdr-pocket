@@ -5,21 +5,23 @@
  * Rules follow apps/relay/src/assistant/configstore.ts (rev, server providers
  * can't be removed, reset drops every phone change, at least one model).
  */
-import type {
-  AssistantConfigChange,
-  AssistantConfigView,
-  KeyView,
-  ModelProtocol,
-  ModelAuth,
-  ModelRef,
-  ModelTestResult,
-  PromptId,
-  PromptView,
-  ProviderPatch,
-  ProviderView,
-  VoicePatch,
-  VoiceProviderId,
-  VoiceView,
+import {
+  voiceCatalogFor,
+  type AssistantConfigChange,
+  type AssistantConfigView,
+  type KeyView,
+  type ModelProtocol,
+  type ModelAuth,
+  type ModelRef,
+  type ModelTestResult,
+  type PromptId,
+  type PromptView,
+  type ProviderPatch,
+  type ProviderView,
+  type VoiceCatalogResponse,
+  type VoicePatch,
+  type VoiceProviderId,
+  type VoiceView,
 } from "@herdr-pocket/protocol";
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -350,6 +352,10 @@ export const mockConfig = {
     await wait(450);
     if (!providerViews(saved).has(provider)) fail(404, "not_found", `没有叫 ${provider} 的服务商。`);
     return LISTS[provider] ?? [];
+  },
+  async voices(provider: VoiceProviderId): Promise<VoiceCatalogResponse> {
+    await wait(120);
+    return voiceCatalogFor(provider);
   },
   async prompts(): Promise<PromptView[]> {
     await wait(200);

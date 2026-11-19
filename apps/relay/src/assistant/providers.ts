@@ -39,4 +39,4 @@ export const VOICE_PROVIDERS = ["moss-live", "openai-realtime"] as const;
 export type VoiceProvider = (typeof VOICE_PROVIDERS)[number];
 
 export const MOSS_DEFAULTS = { url: "wss://api.mosi.cn/v1/realtime", model: "moss-live-1.0", speed: 1.1 };
-export const REALTIME_DEFAULTS = { url: "wss://api.openai.com/v1/realtime", model: "gpt-realtime", transcribeModel: "gpt-4o-mini-transcribe", rate: 24_000 };
+export const REALTIME_DEFAULTS = { url: "wss://api.openai.com/v1/realtime", model: "gpt-realtime", voice: "marin", transcribeModel: "gpt-4o-mini-transcribe", rate: 24_000 };

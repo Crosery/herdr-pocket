@@ -337,23 +337,23 @@ class VoicePipelineTest {
   }
 
   @Test
-  fun ownerOnlyWithoutExtractionNeverEmitsTheInputMixture() {
-    val backend = isolationBackend(hasTse = false)
+  fun ownerOnlyWithoutAnySpeakerOrTseEmitsSilenceAndDegradesToSvWhenAvailable() {
+    val noModels = isolationBackend(hasTse = false, hasSpeaker = false)
     val input = loudHop()
     val out = ByteArrayOutputStream()
     val strict = VoiceFilter(
-      backend = backend,
+      backend = noModels,
       o = VoiceFilter.Options(denoise = true, enrolled = floatArrayOf(1f)),
       worker = { it.run() },
       emit = { b, off, n -> out.write(b, off, n) },
     )
     repeat(70) { strict.push(input, 0, input.size) }
     assertEquals(70 * input.size, out.size())
-    assertTrue("speaker verdicts alone cannot admit unseparated PCM", out.toByteArray().all { it == 0.toByte() })
+    assertTrue("no TSE and no SV admits zero mixture PCM", out.toByteArray().all { it == 0.toByte() })
 
     out.reset()
     val ordinary = VoiceFilter(
-      backend = backend,
+      backend = noModels,
       o = VoiceFilter.Options(denoise = false, enrolled = null),
       worker = { it.run() },
       emit = { b, off, n -> out.write(b, off, n) },
@@ -363,13 +363,101 @@ class VoicePipelineTest {
   }
 
   @Test
-  fun ownerOnlyOverloadEmitsSilenceThenResumesFromFreshTseState() {
+  fun tseBypassWithSpeakerVerificationDegradesGracefullyInsteadOfMutingOwner() {
+    val ownerEmb = normalizeEmbedding(FloatArray(192) { if (it == 0) 1f else 0f })
+    val otherEmb = normalizeEmbedding(FloatArray(192) { if (it == 1) 1f else 0f })
+    var currentIsOwner = true
+    val backend = object : VoiceBackend {
+      override val hasSpeaker = true
+      override val hasTse = false
+      override fun reset() {}
+      override fun denoise(x: FloatArray, off: Int, out: FloatArray, outOff: Int): Boolean {
+        System.arraycopy(x, off, out, outOff, Denoiser.HOP)
+        return true
+      }
+      override fun vadProb(win: FloatArray, off: Int) = 0.95f
+      override fun embed(x: FloatArray, off: Int, len: Int) = if (currentIsOwner) ownerEmb else otherEmb
+      override fun tseChunk(wav: FloatArray, wavLen: Int, kFrames: Int, framesOut: FloatArray) {}
+    }
+
+    val ownerOut = ByteArrayOutputStream()
+    val otherOut = ByteArrayOutputStream()
+    var activeOut = ownerOut
+    val vf = VoiceFilter(
+      backend = backend,
+      o = VoiceFilter.Options(denoise = true, enrolled = ownerEmb, threshold = 0.40f, requireIsolation = true),
+      worker = { it.run() },
+      emit = { b, off, n -> activeOut.write(b, off, n) },
+    )
+    val hop = loudHop()
+    repeat(80) { vf.push(hop, 0, hop.size) } // 800 ms owner speech
+    currentIsOwner = false
+    activeOut = otherOut
+    repeat(120) { vf.push(hop, 0, hop.size) } // 1200 ms non-owner speech
+
+    val ownerBytes = ownerOut.toByteArray()
+    val ownerFloats = FloatArray(ownerBytes.size / 2).also { pcm16ToFloat(ownerBytes, 0, ownerBytes.size, it, 0) }
+    assertTrue("owner speech preserved in SV-only tier (rms=${rmsFloat(ownerFloats)})", rmsFloat(ownerFloats) > 0.10f)
+
+    val otherBytes = otherOut.toByteArray()
+    val otherFloats = FloatArray(otherBytes.size / 2).also { pcm16ToFloat(otherBytes, 0, otherBytes.size, it, 0) }
+    assertEquals("imposter tail ramped to 0 in SV-only tier", 0f, rmsFloat(otherFloats, otherFloats.size * 2 / 3, otherFloats.size / 3), 1e-4f)
+  }
+
+  @Test
+  fun lockFirstSpeakerCapturesSessionSpeakerAndGatesSecondSpeaker() {
+    val firstEmb = normalizeEmbedding(FloatArray(192) { if (it == 0) 1f else 0f })
+    val secondEmb = normalizeEmbedding(FloatArray(192) { if (it == 2) 1f else 0f })
+    var speakerOne = true
+    var speechOn = true
+    val verdicts = ArrayList<Boolean>()
+    val backend = object : VoiceBackend {
+      override val hasSpeaker = true
+      override val hasTse = false
+      override fun reset() {}
+      override fun denoise(x: FloatArray, off: Int, out: FloatArray, outOff: Int): Boolean {
+        System.arraycopy(x, off, out, outOff, Denoiser.HOP)
+        return true
+      }
+      override fun vadProb(win: FloatArray, off: Int) = if (speechOn) 0.95f else 0.01f
+      override fun embed(x: FloatArray, off: Int, len: Int) = if (speakerOne) firstEmb else secondEmb
+      override fun tseChunk(wav: FloatArray, wavLen: Int, kFrames: Int, framesOut: FloatArray) {}
+    }
+
+    val secondOut = ByteArrayOutputStream()
+    var recordSecond = false
+    val vf = VoiceFilter(
+      backend = backend,
+      o = VoiceFilter.Options(denoise = true, enrolled = null, threshold = 0.40f, requireIsolation = false, lockFirstSpeaker = true),
+      worker = { it.run() },
+      emit = { b, off, n -> if (recordSecond) secondOut.write(b, off, n) },
+      onUtterance = { verdicts.add(it.pass) },
+    )
+    val hop = loudHop()
+    val silence = ByteArray(hop.size)
+    // 1.2s first speaker -> pause -> 1.2s second speaker
+    repeat(120) { vf.push(hop, 0, hop.size) }
+    speechOn = false
+    repeat(60) { vf.push(silence, 0, silence.size) }
+    speechOn = true
+    speakerOne = false
+    recordSecond = true
+    repeat(120) { vf.push(hop, 0, hop.size) }
+
+    assertTrue("first speaker passed and second speaker blocked ($verdicts)", verdicts.any { it } && verdicts.any { !it })
+    val sBytes = secondOut.toByteArray()
+    val sFloats = FloatArray(sBytes.size / 2).also { pcm16ToFloat(sBytes, 0, sBytes.size, it, 0) }
+    assertEquals("second speaker tail gated to 0", 0f, rmsFloat(sFloats, sFloats.size * 2 / 3, sFloats.size / 3), 1e-4f)
+  }
+
+  @Test
+  fun ownerOnlyOverloadEmitsSilenceWhenSvMissingThenResumesFromFreshTseState() {
     val out = ByteArrayOutputStream()
     val tasks = ArrayDeque<Runnable>()
     val actions = ArrayList<String>()
     var resets = 0
     val vf = VoiceFilter(
-      backend = isolationBackend(hasTse = true, onReset = { resets++ }),
+      backend = isolationBackend(hasTse = true, hasSpeaker = false, onReset = { resets++ }),
       o = VoiceFilter.Options(denoise = false, enrolled = floatArrayOf(1f)),
       worker = { it.run() },
       tseWorker = { tasks.addLast(it) },
@@ -401,8 +489,8 @@ class VoicePipelineTest {
     return ByteArray(VoiceFilter.HOP * 2).also { floatToPcm16(samples, 0, samples.size, it, 0) }
   }
 
-  private fun isolationBackend(hasTse: Boolean, onReset: () -> Unit = {}): VoiceBackend = object : VoiceBackend {
-    override val hasSpeaker = true
+  private fun isolationBackend(hasTse: Boolean, hasSpeaker: Boolean = true, onReset: () -> Unit = {}): VoiceBackend = object : VoiceBackend {
+    override val hasSpeaker = hasSpeaker
     override val hasTse = hasTse
     override fun reset() {}
     override fun resetTse() = onReset()

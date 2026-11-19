@@ -276,7 +276,7 @@ export class ConfigStore {
     const serverKey = same?.apiKey && originOf(same.url) === originOf(url) ? same.apiKey : undefined;
     const apiKey = phoneKey ?? serverKey;
     const model = o.model ?? same?.model ?? (moss ? MOSS_DEFAULTS.model : REALTIME_DEFAULTS.model);
-    const voice = o.voice ?? same?.voice;
+    const voice = o.voice ?? same?.voice ?? (moss ? undefined : REALTIME_DEFAULTS.voice);
     const speed = o.speed ?? same?.speed ?? (moss ? MOSS_DEFAULTS.speed : undefined);
     const view: VoiceView = { provider, url, model, ...(voice ? { voice } : {}), ...(speed ? { speed } : {}), key: keyView(apiKey, phoneKey ? "phone" : serverKey ? "server" : null) };
     if (!apiKey) {
@@ -290,6 +290,7 @@ export class ConfigStore {
     const common = { url, apiKey, model, ...(voice ? { voice } : {}), ...(speed ? { speed } : {}) };
     if (moss) return { live: { ...(same ?? {}), provider: "moss-live", ...common }, view };
     const r = same?.provider === "openai-realtime" ? same : undefined;
+    const noiseReduction = r?.noiseReduction !== undefined ? r.noiseReduction : r?.auth === "api-key" ? undefined : ("near_field" as const);
     return {
       live: {
         dialect: "ga",
@@ -298,6 +299,7 @@ export class ConfigStore {
         transcribeModel: REALTIME_DEFAULTS.transcribeModel,
         inputRate: REALTIME_DEFAULTS.rate,
         outputRate: REALTIME_DEFAULTS.rate,
+        ...(noiseReduction !== undefined ? { noiseReduction } : {}),
         ...(r ?? {}),
         provider: "openai-realtime",
         ...common,

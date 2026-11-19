@@ -1,7 +1,7 @@
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Image, Pressable, ScrollView, View, type NativeScrollEvent, type NativeSyntheticEvent, type ViewProps } from "react-native";
 import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
-import { ActivityIndicator, Button, Snackbar, Text } from "react-native-paper";
+import { ActivityIndicator, Button, Text } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
@@ -13,7 +13,7 @@ import { fixCjkEmphasis, hasList } from "../lib/markdown";
 import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
-import { EmptyState, TypingDots } from "./ui";
+import { EmptyState, PocketToast, TypingDots } from "./ui";
 import { Md } from "./md";
 import { ReplyDots, SendMark } from "./outbox";
 import { BusyMascot, Sparkle } from "./Mascot";
@@ -1022,9 +1022,14 @@ export function ChatView({
             <Text style={{ color: p.faint, fontSize: 11 }}>{connectionNote}</Text>
           </View>
         ) : null}
-        <Snackbar visible={capped} onDismiss={() => setCapped(false)} duration={4000}>
-          对话太长，只载入了最近约 {JUMP_CAP} 条，这里是已载入部分的开头
-        </Snackbar>
+        <PocketToast
+          visible={capped}
+          message={`对话太长，只载入了最近约 ${JUMP_CAP} 条，这里是已载入部分的开头`}
+          tone="info"
+          duration={2800}
+          bottom={24}
+          onDismiss={() => setCapped(false)}
+        />
       </View>
     </SubCtx.Provider>
   );

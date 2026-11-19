@@ -188,7 +188,7 @@ function Caption({ line, recent }: { line: CallLine; recent: boolean }) {
   const p = usePalette();
   if (line.role === "user") {
     return (
-      <Animated.View entering={FadeIn.duration(180)} style={{ alignSelf: "flex-end", maxWidth: "82%", opacity: recent ? 1 : 0.5, backgroundColor: p.surface3, borderRadius: radius.card, borderBottomRightRadius: 6, paddingHorizontal: space.md, paddingVertical: 8, borderWidth: 1, borderColor: p.divider }}>
+      <Animated.View entering={FadeIn.duration(180)} layout={LinearTransition.duration(180)} style={{ alignSelf: "flex-end", maxWidth: "82%", opacity: recent ? 1 : 0.5, backgroundColor: p.surface3, borderRadius: radius.card, borderBottomRightRadius: 6, paddingHorizontal: space.md, paddingVertical: 8, borderWidth: 1, borderColor: p.divider }}>
         <Text style={{ color: p.muted, fontSize: 14.5, lineHeight: 21 }}>{line.text}</Text>
       </Animated.View>
     );
@@ -196,6 +196,7 @@ function Caption({ line, recent }: { line: CallLine; recent: boolean }) {
   return (
     <Animated.View
       entering={FadeIn.duration(180)}
+      layout={LinearTransition.duration(180)}
       style={{ alignSelf: "flex-start", maxWidth: "90%", opacity: recent ? 1 : 0.5, backgroundColor: p.surface, borderRadius: radius.card, borderBottomLeftRadius: 6, paddingHorizontal: space.lg, paddingVertical: 11, elevation: p.dark || !recent ? 0 : 2, shadowColor: p.shadow, shadowOpacity: 0.12, shadowRadius: 10, shadowOffset: { width: 0, height: 4 } }}
     >
       <Text style={{ color: p.ink, fontSize: 16.5, lineHeight: 25, fontFamily: fonts.bodySemi }}>{line.text}</Text>

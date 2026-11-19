@@ -319,7 +319,9 @@ export class Assistant {
       // the order the store reloads in (by time).
       if (moved) this.items.sort((a, b) => a.ts - b.ts);
     } else {
+      const outOfOrder = this.items.length > 0 && item.ts < this.items[this.items.length - 1]!.ts;
       this.items.push(item);
+      if (outOfOrder) this.items.sort((a, b) => a.ts - b.ts);
       if (this.items.length > MAX_ITEMS) {
         this.items.splice(0, this.items.length - MAX_ITEMS);
         this.store.pruneAssistantItems(MAX_ITEMS);
@@ -351,12 +353,13 @@ export class Assistant {
   }
 
   /** Transcript lines from a voice call join the same thread. */
-  voiceLine(role: "user" | "assistant", text: string, key?: string): void {
+  voiceLine(role: "user" | "assistant", text: string, key?: string, ts?: number): void {
     const clean = text.trim();
     if (!clean) return;
     const id = key ? `v-${role}-${key}` : newId(role === "user" ? "u" : "a");
     const old = this.items.find((x) => x.id === id);
-    this.put({ id, ts: old?.ts ?? this.now(), role, text: clean.slice(0, 4000), via: "voice" });
+    const itemTs = old?.ts ?? (typeof ts === "number" && Number.isFinite(ts) ? ts : this.now());
+    this.put({ id, ts: itemTs, role, text: clean.slice(0, 4000), via: "voice" });
     if (role === "user") this.event({ kind: "live.heard", msg: clip(oneLine(clean), 200) });
     else if (!old) this.checkVoiceClaim(clean);
   }

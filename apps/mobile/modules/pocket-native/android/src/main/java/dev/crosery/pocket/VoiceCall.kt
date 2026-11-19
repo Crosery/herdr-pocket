@@ -98,6 +98,9 @@ class VoiceCall(
 
   private val useDenoise: Boolean
   private val voiceThreshold: Float
+  private val configuredTier: String
+  private val effectiveTier: String
+  private val useFirstSpeaker: Boolean
   private val enrolledVoice: FloatArray?
   private val enrolledProtos: List<FloatArray>?
   private val modelsReady = CountDownLatch(1)
@@ -128,9 +131,24 @@ class VoiceCall(
     val p = Prefs(ctx)
     useDenoise = p.voiceDenoise
     voiceThreshold = p.voiceThreshold
+    configuredTier = p.voiceTier
     val versionOk = p.voiceModelVersion == VoiceModelManager.VOICEPRINT_MODEL_VERSION
-    enrolledVoice = if (p.voiceFilter && versionOk) p.voiceEmbedding else null
+    val rawEnrolled = if (p.voiceFilter && versionOk) p.voiceEmbedding else null
+    val wantIdentity = rawEnrolled != null || p.voiceFirstSpeaker
+    effectiveTier = when {
+      !wantIdentity || configuredTier == "denoise" -> "denoise"
+      configuredTier == "tse" -> "tse"
+      configuredTier == "sv" -> "sv"
+      rawEnrolled != null &&
+        VoiceModelManager.isTseModelsReady(ctx) &&
+        VoiceModelManager.hasOwnerSample(ctx) &&
+        (p.lastCallTseRtf <= 0f || p.lastCallTseRtf <= 0.85f) &&
+        (p.benchRecommendedTier == null || p.benchRecommendedTier == "tse") -> "tse"
+      else -> "sv"
+    }
+    enrolledVoice = if (effectiveTier != "denoise") rawEnrolled else null
     enrolledProtos = if (enrolledVoice != null) p.voicePrototypes else null
+    useFirstSpeaker = effectiveTier != "denoise" && p.voiceFirstSpeaker && enrolledVoice == null
   }
 
   // Playback ledger; guarded by `lock`.
@@ -155,9 +173,9 @@ class VoiceCall(
     current = this
     VoiceLab.stop()
     PocketBus.emit("onCall", mapOf("state" to "connecting"))
-    val needSv = enrolledVoice != null && VoiceModelManager.isSvModelReady(ctx)
-    val hasSample = enrolledVoice != null && VoiceModelManager.hasOwnerSample(ctx)
-    val needTse = hasSample && VoiceModelManager.isTseModelsReady(ctx)
+    val needSv = effectiveTier != "denoise" && (enrolledVoice != null || useFirstSpeaker) && VoiceModelManager.isSvModelReady(ctx)
+    val hasSample = effectiveTier == "tse" && enrolledVoice != null && VoiceModelManager.hasOwnerSample(ctx)
+    val needTse = effectiveTier == "tse" && hasSample && VoiceModelManager.isTseModelsReady(ctx)
     if (useDenoise || needSv || needTse) {
       thread("pocket-models") {
         try {
@@ -303,6 +321,9 @@ class VoiceCall(
     val d = JSONObject()
       .put("stage", "init")
       .put("route", activeRoute)
+      .put("tier", effectiveTier)
+      .put("configured_tier", configuredTier)
+      .put("first_speaker", useFirstSpeaker)
       .put("denoise_enabled", useDenoise && models != null)
       .put("denoise_model", if (useDenoise && models != null) "dpdfnet_baseline" else "none")
       .put("vad_enabled", models != null && (svActive || tseActive))
@@ -455,7 +476,7 @@ class VoiceCall(
     val sample = ownerSample
     val wantFilter = models != null && (
       useDenoise ||
-        (enrolledVoice != null && models.speaker != null) ||
+        ((enrolledVoice != null || useFirstSpeaker) && models.speaker != null) ||
         (sample != null && models.hasTse)
       )
     var vfRef: VoiceFilter? = null
@@ -469,6 +490,7 @@ class VoiceCall(
           ownerSample = sample,
           threshold = voiceThreshold,
           requireIsolation = enrolledVoice != null,
+          lockFirstSpeaker = useFirstSpeaker,
         ),
         worker = { r -> if (!ended) try { spkExec.execute(r) } catch (_: Throwable) {} },
         tseWorker = { r -> if (!ended) try { tseExec.execute(r) } catch (_: Throwable) {} },
@@ -494,9 +516,15 @@ class VoiceCall(
     vfRef = vf
     filter = vf
     emitInitTelemetry(models, vf)
-    if (enrolledVoice != null && vf?.isTseActive != true) {
-      end("人声分离未就绪，请到「只认我的声音」重新下载模型或录制声纹")
-      return
+    if (effectiveTier != "denoise" && (enrolledVoice != null || useFirstSpeaker)) {
+      if (effectiveTier == "tse" && configuredTier == "tse" && vf?.isTseActive != true && vf?.isSvActive != true) {
+        end("人声分离未就绪，请到「通话降噪与声纹」下载模型或改用灵巧声纹")
+        return
+      }
+      if (vf?.isSvActive != true && vf?.isTseActive != true) {
+        end("声纹模型未下载，请先到「通话降噪与声纹」下载声纹模型")
+        return
+      }
     }
 
     // Do not collect half a second of queued AudioRecord data while loading models.
@@ -889,6 +917,11 @@ class VoiceCall(
 
     val summary = try { buildSummaryTelemetry() } catch (_: Throwable) { null }
     val stats = try { stats() } catch (_: Throwable) { null }
+    try {
+      filter?.let { f ->
+        if (f.tseAudioMsSum > 0.0) Prefs(ctx).lastCallTseRtf = (f.tseMsSum / f.tseAudioMsSum).toFloat()
+      }
+    } catch (_: Throwable) {}
     if (wasReady && summary != null) {
       try { ws?.send(summary.toString()) } catch (_: Throwable) {}
     }

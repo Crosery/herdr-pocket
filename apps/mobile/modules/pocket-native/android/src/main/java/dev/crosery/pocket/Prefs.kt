@@ -48,6 +48,39 @@ class Prefs(ctx: Context) {
     get() = p.getFloat("voiceThreshold", 0.38f)
     set(v) = p.edit().putFloat("voiceThreshold", v).apply()
 
+  /** "auto" | "denoise" | "sv" | "tse" */
+  var voiceTier: String
+    get() = p.getString("voiceTier", "auto") ?: "auto"
+    set(v) = p.edit().putString("voiceTier", v).apply()
+
+  var voiceFirstSpeaker: Boolean
+    get() = p.getBoolean("voiceFirstSpeaker", false)
+    set(v) = p.edit().putBoolean("voiceFirstSpeaker", v).apply()
+
+  var lastCallTseRtf: Float
+    get() = p.getFloat("lastCallTseRtf", -1f)
+    set(v) = p.edit().putFloat("lastCallTseRtf", v).apply()
+
+  var benchRecommendedTier: String?
+    get() = p.getString("benchRecommendedTier", null)
+    set(v) = p.edit().putString("benchRecommendedTier", v).apply()
+
+  var benchReason: String?
+    get() = p.getString("benchReason", null)
+    set(v) = p.edit().putString("benchReason", v).apply()
+
+  var benchDpdfUs: Float
+    get() = p.getFloat("benchDpdfUs", -1f)
+    set(v) = p.edit().putFloat("benchDpdfUs", v).apply()
+
+  var benchTseRtf: Float
+    get() = p.getFloat("benchTseRtf", -1f)
+    set(v) = p.edit().putFloat("benchTseRtf", v).apply()
+
+  var benchAt: Long
+    get() = p.getLong("benchAt", 0L)
+    set(v) = p.edit().putLong("benchAt", v).apply()
+
   var voiceEmbedding: FloatArray?
     get() {
       val s = p.getString("voiceEmbedding", null) ?: return null

@@ -4,6 +4,7 @@
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -601,15 +602,60 @@ test("logs: phones and computers upload, tokens never stored, filters and follow
   assert.ok(!JSON.stringify(all).match(/hp_[A-Za-z0-9_-]{10}/));
   assert.equal(redact(`Bearer ${secret} and sk-1234567890abcdef`), "Bearer *** and sk-***");
 
-  // The panel itself is a page; its data needs the admin token.
+  // The panel itself is a page; its built bundle + assets serve cleanly and its APIs need the admin token.
   const page = await api("/admin");
   assert.equal(page.status, 200);
   assert.match(page.type, /text\/html/);
   assert.match(page.raw, /Herdr Pocket 控制台/);
+  const inlineBoot = /<script>\s*([\s\S]*?)<\/script>/.exec(page.raw);
+  assert.ok(inlineBoot?.[1], "expected inline theme boot script in /admin html");
+  new vm.Script(inlineBoot[1]);
+
+  const jsMatch = /src="\.\/(admin-assets\/[^"]+\.js)"/.exec(page.raw);
+  const cssMatch = /href="\.\/(admin-assets\/[^"]+\.css)"/.exec(page.raw);
+  assert.ok(jsMatch?.[1], "expected built module script tag in /admin html");
+  assert.ok(cssMatch?.[1], "expected built stylesheet link tag in /admin html");
+
+  const jsAsset = await api(`/${jsMatch[1]}`);
+  assert.equal(jsAsset.status, 200);
+  assert.match(jsAsset.type, /javascript/);
+  const jsSubpath = await api(`/admin/${jsMatch[1]}`);
+  assert.equal(jsSubpath.status, 200);
+
+  const cssAsset = await api(`/${cssMatch[1]}`);
+  assert.equal(cssAsset.status, 200);
+  assert.match(cssAsset.type, /text\/css/);
+
+  const mascot = await api("/admin-assets/mascot/hello.webp");
+  assert.equal(mascot.status, 200);
+  assert.match(mascot.type, /image\/webp/);
+  const vendor = await api("/admin-assets/vendors/claude-code.webp");
+  assert.equal(vendor.status, 200);
+  assert.match(vendor.type, /image\/webp/);
+
+  assert.match(page.raw, /favicon\.ico/);
+  assert.match(page.raw, /favicon-64\.png/);
+  for (const icoPath of ["/admin-assets/brand/favicon.ico", "/admin/admin-assets/brand/favicon.ico", "/favicon.ico", "/admin/favicon.ico"]) {
+    const ico = await api(icoPath);
+    assert.equal(ico.status, 200, icoPath);
+    assert.match(ico.type, /image\/x-icon/, icoPath);
+  }
+  const pngIcon = await api("/admin-assets/brand/favicon-64.png");
+  assert.equal(pngIcon.status, 200);
+  assert.match(pngIcon.type, /image\/png/);
+
+  assert.equal((await api("/admin-assets/%2e%2e/index.html")).status, 404);
+
+  const code = await api("/v1/pair/codes", { token: ADMIN, body: { kind: "viewer" } });
+  assert.equal(code.status, 200);
+  assert.match(String(code.json.qrSvg ?? ""), /^<svg[\s\S]*<\/svg>/);
+
   assert.equal((await api("/v1/admin/overview", { token: phone.token })).status, 401);
   const overview = (await api("/v1/admin/overview", { token: ADMIN })).json;
   assert.equal(overview.assistant.confirm, "never");
   assert.ok(overview.devices >= 2);
+  assert.ok(Array.isArray(overview.agentList));
+  assert.ok(Array.isArray(overview.joins));
   assert.ok(overview.last24h.error >= 1);
   assert.ok(!JSON.stringify(overview).includes("moss-test-key"));
 });

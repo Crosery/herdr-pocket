@@ -174,11 +174,14 @@ test("voice: another service needs its own key; with one, the service's defaults
   let e = cfg.effective();
   assert.equal(e.live, undefined);
   assert.ok(e.view.warnings.some((w) => /语音还没有密钥/.test(w)));
-  cfg.apply({ rev: 1, voice: { apiKey: "rt-phone-key-9999", voice: "marin" } }, "a");
+  cfg.apply({ rev: 1, voice: { apiKey: "rt-phone-key-9999" } }, "a");
   e = cfg.effective();
   assert.equal(e.live?.provider, "openai-realtime");
   assert.equal(e.live?.apiKey, "rt-phone-key-9999");
   assert.equal(e.live?.model, "gpt-realtime");
+  assert.equal(e.live?.voice, "marin");
+  assert.equal((e.live as any)?.noiseReduction, "near_field");
+  assert.equal(e.view.voice.voice, "marin");
   assert.deepEqual(e.view.voice.key, { set: true, hint: "9999", from: "phone" });
   cfg.apply({ rev: 2, voice: { provider: null } }, "a");
   assert.equal(cfg.effective().live, undefined);

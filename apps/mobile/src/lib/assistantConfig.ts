@@ -11,19 +11,21 @@
 import { useCallback } from "react";
 import { useFocusEffect } from "expo-router";
 import { create } from "zustand";
-import type {
-  AssistantConfigChange,
-  AssistantConfigView,
-  KeyView,
-  ModelProtocol,
-  ModelRef,
-  ModelTestResult,
-  PromptId,
-  PromptView,
-  ProviderPatch,
-  ProviderView,
-  ServerFrame,
-  VoiceProviderId,
+import {
+  voiceCatalogFor,
+  type AssistantConfigChange,
+  type AssistantConfigView,
+  type KeyView,
+  type ModelProtocol,
+  type ModelRef,
+  type ModelTestResult,
+  type PromptId,
+  type PromptView,
+  type ProviderPatch,
+  type ProviderView,
+  type ServerFrame,
+  type VoiceCatalogResponse,
+  type VoiceProviderId,
 } from "@herdr-pocket/protocol";
 import { useLive, useSettings } from "./store";
 import { loadToken } from "./auth";
@@ -225,6 +227,16 @@ export async function listProviderModels(provider: string): Promise<string[]> {
     return Array.isArray(r.models) ? r.models : [];
   } catch (e) {
     throw asRequestError(e);
+  }
+}
+
+/** Curated voices offered for a voice service; falls back to the built-in catalog on older relays. */
+export async function loadVoices(provider: VoiceProviderId): Promise<VoiceCatalogResponse> {
+  try {
+    if (demo()) return await mockConfig.voices(provider);
+    return await request<VoiceCatalogResponse>(`/v1/assistant/config/voices?provider=${encodeURIComponent(provider)}`, { timeoutMs: 8_000 });
+  } catch {
+    return voiceCatalogFor(provider);
   }
 }
 

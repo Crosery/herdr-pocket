@@ -2,17 +2,17 @@
  * 语音: which live voice service calls use (or none), its address, model,
  * voice and speed, and its key (write-only, like the model keys).
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { KeyboardAvoidingView, ScrollView, View } from "react-native";
 import { Button, IconButton, Text } from "react-native-paper";
 import { router, Stack } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import type { AssistantConfigView, VoicePatch, VoiceProviderId } from "@herdr-pocket/protocol";
+import type { AssistantConfigView, VoiceOption, VoicePatch, VoiceProviderId } from "@herdr-pocket/protocol";
 import { Card, PageBackground } from "../../components/ui";
 import { Row } from "../../components/rows";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Input, KeyField, LoadState, SaveBar, useLeaveGuard, WarningCard } from "../../components/configParts";
-import { changeConfig, flash, loadConfig, useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
+import { changeConfig, flash, loadConfig, loadVoices, useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
 import { useSettings } from "../../lib/store";
 import { isMockServer } from "../../lib/mock";
 import { isVoiceprintLegacy, voiceprintSupported } from "../../lib/voice";
@@ -55,10 +55,25 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
   const [voice, setVoice] = useState(v.voice ?? "");
   const [speed, setSpeed] = useState<number | null>(v.speed ?? null);
   const [apiKey, setApiKey] = useState("");
+  const [voiceOptions, setVoiceOptions] = useState<VoiceOption[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [askClear, setAskClear] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    if (!provider) {
+      setVoiceOptions([]);
+      return;
+    }
+    void loadVoices(provider).then((cat) => {
+      if (alive) setVoiceOptions(cat.voices);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [provider]);
 
   const switched = provider !== v.provider;
   const dirty = switched || (!!provider && (url.trim() !== (v.url ?? "") || model.trim() !== (v.model ?? "") || voice.trim() !== (v.voice ?? "") || speed !== (v.speed ?? null))) || !!apiKey;
@@ -92,7 +107,7 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
     const back = next === v.provider;
     setUrl(back ? (v.url ?? "") : "");
     setModel(back ? (v.model ?? "") : "");
-    setVoice(back ? (v.voice ?? "") : "");
+    setVoice(back ? (v.voice ?? "") : next === "openai-realtime" ? "marin" : "");
     setSpeed(back ? (v.speed ?? null) : null);
   }
 
@@ -167,8 +182,28 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
                 <Field title="模型" hint={switched && !model.trim() ? "不填就用默认的" : undefined}>
                   <Input value={model} onChangeText={setModel} placeholder={provider === "moss-live" ? "moss-live-1.0" : "gpt-realtime"} autoCapitalize="none" mono accessibilityLabel="模型" />
                 </Field>
-                <Field title="声音" hint="服务商那里的声音名字，不填就用默认的">
-                  <Input value={voice} onChangeText={setVoice} placeholder="默认的声音" autoCapitalize="none" mono accessibilityLabel="声音" />
+                <Field
+                  title="声音"
+                  hint={
+                    voiceOptions.find((x) => x.id === voice.trim())?.hint ??
+                    (provider === "openai-realtime" ? "可点选上面的音色，也可直接填名字；留空默认用 marin" : "服务商那里的声音名字，不填就用默认的")
+                  }
+                >
+                  {voiceOptions.length ? (
+                    <Chips>
+                      {voiceOptions.map((item) => (
+                        <Chip key={item.id} on={voice.trim() === item.id} label={item.label} onPress={() => setVoice(item.id)} />
+                      ))}
+                    </Chips>
+                  ) : null}
+                  <Input
+                    value={voice}
+                    onChangeText={setVoice}
+                    placeholder={provider === "openai-realtime" ? "marin（默认）" : "默认的声音"}
+                    autoCapitalize="none"
+                    mono
+                    accessibilityLabel="声音"
+                  />
                 </Field>
                 <Field title="语速" hint={speed == null ? "现在用服务商默认的语速" : "1.0 是正常速度，0.5 到 1.5 之间"}>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>

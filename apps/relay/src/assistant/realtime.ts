@@ -38,17 +38,23 @@ export interface RealtimeConfig {
   transcribeModel?: string;
   language?: string;
   vad?: "server_vad" | "semantic_vad";
+  /** OpenAI Realtime GA background-speaker suppression (`near_field` for phones/headsets). */
+  noiseReduction?: "near_field" | "far_field" | null;
   /** Sample rates the service takes and gives (24 kHz for OpenAI). */
   inputRate?: number;
   outputRate?: number;
   /** Least time between two refreshes of the voice's instructions. */
   refreshGapMs?: number;
+  /** Max ms to hold assistant captions while waiting for the person's ASR of the same turn. */
+  asrHoldMs?: number;
 }
 
 const PHONE_MIC_RATE = 16_000;
 const PHONE_SPEAKER_RATE = 48_000;
 const ATTACH_TIMEOUT_MS = 15_000;
 const REFRESH_GAP_MS = 5000;
+const ASR_HOLD_MS = 900;
+const ASR_SPEECH_MAX_MS = 5000;
 const MAX_INSTRUCTIONS = 16_000;
 /** After the person stops, the service starts its own answer: a notice waits this long so the two do not collide. */
 const AFTER_SPEECH_MS = 1500;
@@ -765,6 +771,12 @@ interface Run {
   stopped: boolean;
   /** The cut was reported upstream and to the phone. */
   settled: boolean;
+  /** Final output transcript event was received from upstream. */
+  transcriptDone: boolean;
+  /** Assistant captions for this run are waiting for the same turn's user ASR. */
+  deferredText: boolean;
+  /** Response status waiting to emit response.ended after deferred captions flush. */
+  deferredEnd?: string;
   out: Resampler;
 }
 
@@ -780,6 +792,9 @@ export class RealtimeCall {
   private turn = 0;
   private turnOf = new Map<string, number>();
   private heard = new Map<string, string>();
+  private speechAt = new Map<number, number>();
+  private asrPendingTurn = 0;
+  private asrHoldTimer: NodeJS.Timeout | null = null;
   private runs = new Map<string, Run>();
   /** The answer being generated upstream, and since when. */
   private active: string | null = null;
@@ -795,7 +810,7 @@ export class RealtimeCall {
   /** Notices to bring up as soon as nobody is speaking. */
   private pending: Array<{ line: string; details?: string }> = [];
   /** The last few lines of this call, for tasks handed to the backend. */
-  private recent: Array<{ role: string; content: string }> = [];
+  private recent: Array<{ role: string; content: string; turn?: number }> = [];
   private recentText = "";
   private lastInstructions = "";
   private lastPush = 0;
@@ -933,6 +948,7 @@ export class RealtimeCall {
           audio: {
             input: {
               format: { type: "audio/pcm", rate: c.inputRate ?? 24_000 },
+              ...(c.noiseReduction ? { noise_reduction: { type: c.noiseReduction } } : {}),
               turn_detection: { type: vad, create_response: true, interrupt_response: true },
               ...(c.transcribeModel ? { transcription: { model: c.transcribeModel, ...(c.language ? { language: c.language } : {}) } } : {}),
             },
@@ -1053,8 +1069,14 @@ export class RealtimeCall {
         }
         return;
       case "input_audio_buffer.speech_started": {
+        this.flushAsrHold();
         this.userSpeaking = true;
         this.turn++;
+        this.cap(this.speechAt, 50).set(this.turn, Date.now());
+        if (this.cfg.transcribeModel) {
+          this.asrPendingTurn = this.turn;
+          this.armAsrHold(ASR_SPEECH_MAX_MS);
+        }
         this.telemetry.onSpeechStarted(this.turn);
         if (str(d.item_id)) this.cap(this.turnOf, 200).set(d.item_id, this.turn);
         // The person talks over the answer: the phone stops it now and says how much was heard.
@@ -1072,6 +1094,8 @@ export class RealtimeCall {
       case "input_audio_buffer.speech_stopped":
         this.userSpeaking = false;
         this.speechStoppedAt = Date.now();
+        this.cap(this.speechAt, 50).set(this.turn, this.speechStoppedAt);
+        if (this.asrPendingTurn === this.turn) this.armAsrHold(this.cfg.asrHoldMs ?? ASR_HOLD_MS);
         this.telemetry.onSpeechStopped(this.turn);
         // Held-back work goes out after the answer to this, or after a pause when no answer comes.
         if (this.pending.length || this.refreshWaiting) this.idleIn(AFTER_SPEECH_MS + 5);
@@ -1091,14 +1115,18 @@ export class RealtimeCall {
         this.telemetry.onTranscript(text, turn, false);
         this.toPhone({ action: "input.transcript.done", data: { text, turn } });
         if (text) {
-          this.assistant.voiceLine("user", text, `${this.id}-${turn}`);
-          this.remember("user", text);
+          this.assistant.voiceLine("user", text, `${this.id}-${turn}`, this.speechAt.get(turn));
+          this.remember("user", text, turn);
         }
+        if (this.asrPendingTurn === turn) this.flushAsrHold();
         return;
       }
-      case "conversation.item.input_audio_transcription.failed":
+      case "conversation.item.input_audio_transcription.failed": {
+        const turn = (str(d.item_id) ? this.turnOf.get(d.item_id) : undefined) ?? this.turn;
         this.log(`realtime: transcription failed ${String(d.error?.code ?? d.error?.message ?? "").slice(0, 80)}`);
+        if (this.asrPendingTurn === turn) this.flushAsrHold();
         return;
+      }
       case "response.created":
         this.active = str(d.response?.id) ? d.response.id : "?";
         this.activeSince = Date.now();
@@ -1119,7 +1147,10 @@ export class RealtimeCall {
         if (!str(d.item_id) || typeof d.delta !== "string") return;
         const r = this.run(d.item_id, d.response_id);
         r.text += d.delta;
-        if (!r.stopped && r.text.trim()) this.toPhone({ action: "output.transcript.updated", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
+        if (!r.stopped && r.text.trim()) {
+          if (this.isTurnAsrPending(r.turn)) r.deferredText = true;
+          else this.toPhone({ action: "output.transcript.updated", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
+        }
         return;
       }
       case "response.output_audio_transcript.done":
@@ -1129,9 +1160,9 @@ export class RealtimeCall {
         if (typeof d.transcript === "string") r.text = d.transcript;
         // A cut-off answer keeps what was heard (settle), not what was meant.
         if (r.stopped || !r.text.trim()) return;
-        this.toPhone({ action: "output.transcript.done", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
-        this.assistant.voiceLine("assistant", r.text, `${this.id}-${r.id}`);
-        this.remember("assistant", r.text);
+        r.transcriptDone = true;
+        if (this.isTurnAsrPending(r.turn)) r.deferredText = true;
+        else this.emitAssistantTranscriptDone(r);
         return;
       }
       case "response.function_call_arguments.done":
@@ -1153,7 +1184,12 @@ export class RealtimeCall {
           this.audioDone(r);
         }
         if (resp.status === "failed") this.log(`realtime: answer failed ${String(resp.status_details?.error?.code ?? resp.status_details?.reason ?? "").slice(0, 80)}`);
-        this.toPhone({ action: "response.ended", data: { run_id: last?.id ?? id, turn_id: last?.turn ?? String(this.turn), status: resp.status ?? (d.type === "response.cancelled" ? "cancelled" : "completed") } });
+        const status = resp.status ?? (d.type === "response.cancelled" ? "cancelled" : "completed");
+        if (last && (last.audible || last.deferredText) && this.isTurnAsrPending(last.turn)) {
+          last.deferredEnd = status;
+        } else {
+          this.toPhone({ action: "response.ended", data: { run_id: last?.id ?? id, turn_id: last?.turn ?? String(this.turn), status } });
+        }
         if (this.createQueued) {
           this.createQueued = false;
           this.respond();
@@ -1202,6 +1238,8 @@ export class RealtimeCall {
         played: false,
         stopped: false,
         settled: false,
+        transcriptDone: false,
+        deferredText: false,
         out: new Resampler(this.outRate, PHONE_SPEAKER_RATE),
       };
       this.cap(this.runs, 50).set(itemId, r);
@@ -1247,14 +1285,71 @@ export class RealtimeCall {
     const heard = r.ms > 0 ? chars.slice(0, Math.round((chars.length * heardMs) / r.ms)).join("").trim() : "";
     this.toPhone({ action: "response.interrupted", data: { run_id: r.id, turn_id: r.turn, text: heard } });
     if (heard) {
-      this.assistant.voiceLine("assistant", `${heard}…`, `${this.id}-${r.id}`);
-      this.remember("assistant", `${heard}…`);
+      this.assistant.voiceLine("assistant", `${heard}…`, `${this.id}-${r.id}`, this.assistantTs(r.turn));
+      this.remember("assistant", `${heard}…`, Number(r.turn));
     }
     this.idleSoon();
   }
 
-  private remember(role: "user" | "assistant", content: string): void {
-    this.recent = [...this.recent, { role, content: clip(content, 200) }].slice(-6);
+  private isTurnAsrPending(turn: string | number): boolean {
+    return this.asrPendingTurn > 0 && Number(turn) === this.asrPendingTurn;
+  }
+
+  private assistantTs(turn: string | number): number {
+    return Math.max(Date.now(), (this.speechAt.get(Number(turn)) ?? 0) + 1);
+  }
+
+  private armAsrHold(ms: number): void {
+    if (this.asrHoldTimer) clearTimeout(this.asrHoldTimer);
+    this.asrHoldTimer = setTimeout(() => this.flushAsrHold(), ms);
+  }
+
+  private emitAssistantTranscriptDone(r: Run): void {
+    this.toPhone({ action: "output.transcript.done", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
+    this.assistant.voiceLine("assistant", r.text, `${this.id}-${r.id}`, this.assistantTs(r.turn));
+    this.remember("assistant", r.text, Number(r.turn));
+  }
+
+  private flushAsrHold(): void {
+    if (this.asrHoldTimer) {
+      clearTimeout(this.asrHoldTimer);
+      this.asrHoldTimer = null;
+    }
+    if (!this.asrPendingTurn) return;
+    const pending = this.asrPendingTurn;
+    this.asrPendingTurn = 0;
+    for (const r of this.runs.values()) {
+      if (Number(r.turn) !== pending) continue;
+      if (r.deferredText && !r.stopped && r.text.trim()) {
+        r.deferredText = false;
+        if (r.transcriptDone) this.emitAssistantTranscriptDone(r);
+        else this.toPhone({ action: "output.transcript.updated", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
+      } else {
+        r.deferredText = false;
+      }
+      if (r.deferredEnd !== undefined) {
+        const status = r.deferredEnd;
+        r.deferredEnd = undefined;
+        this.toPhone({ action: "response.ended", data: { run_id: r.id, turn_id: r.turn, status } });
+      }
+    }
+  }
+
+  private remember(role: "user" | "assistant", content: string, turn?: number): void {
+    const entry = { role, content: clip(content, 200), ...(turn !== undefined && Number.isFinite(turn) ? { turn } : {}) };
+    let next: Array<{ role: string; content: string; turn?: number }>;
+    if (role === "user" && entry.turn !== undefined) {
+      const idx = this.recent.findIndex((e) => e.role === "assistant" && e.turn !== undefined && e.turn >= entry.turn!);
+      if (idx >= 0) {
+        next = this.recent.slice();
+        next.splice(idx, 0, entry);
+      } else {
+        next = [...this.recent, entry];
+      }
+    } else {
+      next = [...this.recent, entry];
+    }
+    this.recent = next.slice(-6);
   }
 
   // ---------------------------------------------------------------------------
@@ -1285,7 +1380,7 @@ export class RealtimeCall {
     const title = clip(objective.replace(/\s+/g, " ").trim(), 40);
     this.toPhone({ action: "relay.task", data: { id: callId, title, status: "running" } });
     this.assistant
-      .delegate(objective, this.recent.slice(), ac.signal)
+      .delegate(objective, this.recent.map(({ role, content }) => ({ role, content })), ac.signal)
       .then((script) => {
         if (ac.signal.aborted) return;
         this.tasks.delete(callId);
@@ -1360,6 +1455,7 @@ export class RealtimeCall {
     clearInterval(this.keepalive);
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (this.asrHoldTimer) clearTimeout(this.asrHoldTimer);
     this.detach();
     for (const ac of this.tasks.values()) ac.abort();
     this.tasks.clear();

@@ -68,6 +68,8 @@ interface SettingsState {
   voiceDenoise: boolean;
   voiceFilter: boolean;
   voiceThreshold: number;
+  voiceTier: "auto" | "denoise" | "sv" | "tse";
+  voiceFirstSpeaker: boolean;
   voiceprint: SavedVoiceprint | null;
   hydrated: boolean;
   set: (patch: Partial<Omit<SettingsState, "set" | "hydrated">>) => void;
@@ -99,6 +101,8 @@ export const useSettings = create<SettingsState>()(
       voiceDenoise: true,
       voiceFilter: true,
       voiceThreshold: 0.38,
+      voiceTier: "auto",
+      voiceFirstSpeaker: false,
       voiceprint: null,
       hydrated: false,
       set: (patch) => set(patch),

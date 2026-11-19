@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
 import { Image, Pressable, ScrollView, TextInput as RNTextInput, View, type TextStyle } from "react-native";
-import { ActivityIndicator, Button, Checkbox, Dialog, IconButton, List, Portal, ProgressBar, Snackbar, Text } from "react-native-paper";
+import { ActivityIndicator, Button, Checkbox, Dialog, IconButton, List, Portal, ProgressBar, Text } from "react-native-paper";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -20,7 +20,7 @@ import { parseChoices, type Choice } from "../lib/choices";
 import { usePalette } from "../theme/theme";
 import { agentStatusLabel, fonts, radius, space, statusColors } from "../theme/tokens";
 import { TermKeyboard } from "./TermKeyboard";
-import { EmptyState, IconTile, SendPill } from "./ui";
+import { EmptyState, IconTile, PocketToast, SendPill } from "./ui";
 
 // ---------------------------------------------------------------------------
 // Terminal
@@ -950,9 +950,7 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
       </View>
       ) : null}
       <KeyLayoutDialog visible={tuning} onDismiss={() => setTuning(false)} />
-      <Snackbar visible={!!toast} onDismiss={() => setToast(null)} duration={2500} wrapperStyle={{ bottom: 140 }}>
-        {toast ?? ""}
-      </Snackbar>
+      <PocketToast visible={!!toast} message={toast} tone="info" bottom={140} onDismiss={() => setToast(null)} />
     </View>
   );
 }

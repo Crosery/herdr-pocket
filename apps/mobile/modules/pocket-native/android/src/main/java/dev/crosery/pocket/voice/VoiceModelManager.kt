@@ -1,12 +1,16 @@
 package dev.crosery.pocket.voice
 
+import android.app.ActivityManager
 import android.content.Context
+import android.os.Build
+import dev.crosery.pocket.Prefs
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 object VoiceModelManager {
@@ -21,6 +25,8 @@ object VoiceModelManager {
   const val VOXLOCK_CHUNK_SIZE = 56_560_589L
   const val VOXLOCK_CHUNK_SHA256 = "c50ffdc8d723fd4f91cb08889f3d0143491f95967b705f35c444a0b4afe88172"
 
+  const val SV_PACK_SIZE = SPEAKER_SIZE
+  const val VOXLOCK_PACK_SIZE = VOXLOCK_ENROLL_SIZE + VOXLOCK_CHUNK_SIZE
   const val MODEL_PACK_SIZE = SPEAKER_SIZE + VOXLOCK_ENROLL_SIZE + VOXLOCK_CHUNK_SIZE // 149_025_914L
 
   const val OWNER_SAMPLE_SAMPLES = 48_000
@@ -168,17 +174,113 @@ object VoiceModelManager {
   }
 
   /**
-   * Downloads and SHA-256 verifies ERes2NetV2-zh + VoxLock v2 (enroll + chunk_int8), reporting
-   * cumulative progress across all 3 files against [MODEL_PACK_SIZE] (`149_025_914L` bytes). Blocking.
+   * Benchmarks on-device ONNX throughput (`DPDFNet` per-hop cost + `VoxLock` chunk cost if present / real call RTF)
+   * and stores the recommended tier (`denoise` | `sv` | `tse`) in [Prefs].
    */
-  fun downloadSpeaker(ctx: Context, onProgress: (Long, Long) -> Unit) {
-    if (isSpeakerReady(ctx)) {
-      onProgress(MODEL_PACK_SIZE, MODEL_PACK_SIZE)
+  fun benchmarkDevice(ctx: Context): Map<String, Any> {
+    val models = openModels(ctx, needSpeaker = false, needTse = isTseModelsReady(ctx))
+    var dpdfUsAvg = 0.0
+    var benchTseRtf = -1.0
+    try {
+      val denoiser = Denoiser(models)
+      val vad = Vad(models)
+      val hopIn = FloatArray(Denoiser.HOP) { 0.01f }
+      val hopOut = FloatArray(Denoiser.HOP)
+      val vadWin = FloatArray(Vad.WINDOW)
+      repeat(5) {
+        denoiser.hop(hopIn, 0, hopOut, 0)
+        vad.prob(vadWin, 0)
+      }
+      val t0 = System.nanoTime()
+      repeat(25) {
+        denoiser.hop(hopIn, 0, hopOut, 0)
+      }
+      dpdfUsAvg = (System.nanoTime() - t0) / 25.0 / 1000.0
+
+      if (models.hasTse) {
+        val vl = VoxLock(models)
+        try {
+          vl.enroll(FloatArray(VoxLock.ENROLL_SAMPLES) { 0.01f })
+          vl.warmUp()
+          val k = VoxLockStreamer.DEFAULT_K
+          val wavLen = k * VoxLockStreamer.HOP + VoxLockStreamer.OVERLAP
+          val wav = FloatArray(wavLen) { 0.01f }
+          val out = FloatArray(k * VoxLockStreamer.N_FFT)
+          val ts0 = System.nanoTime()
+          repeat(3) { vl.chunk(wav, wavLen, k, out) }
+          val tseMsAvg = (System.nanoTime() - ts0) / 3.0 / 1_000_000.0
+          benchTseRtf = tseMsAvg / 40.0
+        } finally {
+          vl.close()
+        }
+      }
+    } finally {
+      models.close()
+    }
+
+    val am = ctx.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+    val memInfo = ActivityManager.MemoryInfo()
+    am?.getMemoryInfo(memInfo)
+    val ramMb = (memInfo.totalMem / (1024L * 1024L)).toInt()
+    val cores = Runtime.getRuntime().availableProcessors()
+    val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else Build.HARDWARE
+
+    val p = Prefs(ctx)
+    val realCallTseRtf = p.lastCallTseRtf.toDouble()
+    val measuredTseRtf = maxOf(realCallTseRtf, benchTseRtf)
+    val dpdfRtf = dpdfUsAvg / 10_000.0
+
+    val (recommended, reason) = if (measuredTseRtf > 0.0) {
+      when {
+        measuredTseRtf <= 0.80 -> "tse" to String.format(Locale.US, "实测分离负载 %.0f%%（单帧降噪 %.2f ms），可流畅运行旗舰分离模型", measuredTseRtf * 100.0, dpdfUsAvg / 1000.0)
+        dpdfRtf <= 0.75 -> "sv" to String.format(Locale.US, "实测人声分离负载 %.2fx 超出实时上限，推荐 68 MB 灵巧声纹门控（不吞字、不断流）", measuredTseRtf)
+        else -> "denoise" to String.format(Locale.US, "设备当前负载较高（降噪单帧 %.2f ms），推荐仅开内置轻量降噪", dpdfUsAvg / 1000.0)
+      }
+    } else {
+      when {
+        dpdfUsAvg <= 1650.0 && cores >= 8 && ramMb >= 7000 ->
+          "tse" to String.format(Locale.US, "芯片算力充裕（降噪 %.2f ms/帧 · %d核），支持 142 MB 旗舰人声分离", dpdfUsAvg / 1000.0, cores)
+        dpdfUsAvg <= 6800.0 ->
+          "sv" to String.format(Locale.US, "实测降噪 %.2f ms/帧（%d核），推荐 68 MB 灵巧声纹门控（稳且省空间）", dpdfUsAvg / 1000.0, cores)
+        else ->
+          "denoise" to String.format(Locale.US, "实测降噪 %.2f ms/帧，推荐内置轻量降噪保证零卡顿", dpdfUsAvg / 1000.0)
+      }
+    }
+
+    val now = System.currentTimeMillis()
+    p.benchRecommendedTier = recommended
+    p.benchReason = reason
+    p.benchDpdfUs = dpdfUsAvg.toFloat()
+    if (measuredTseRtf > 0.0) p.benchTseRtf = measuredTseRtf.toFloat()
+    p.benchAt = now
+
+    return mapOf(
+      "recommendedTier" to recommended,
+      "reason" to reason,
+      "dpdfUs" to dpdfUsAvg,
+      "tseRtf" to if (measuredTseRtf > 0.0) measuredTseRtf else -1.0,
+      "cores" to cores,
+      "ramMb" to ramMb,
+      "soc" to (soc ?: ""),
+      "at" to now,
+    )
+  }
+
+  /**
+   * Downloads and SHA-256 verifies models for `tier`:
+   * - `"sv"`: `ERes2NetV2-zh` (`~68 MB`)
+   * - `"tse"` (default): `ERes2NetV2-zh + VoxLock v2` (`~142 MB`)
+   */
+  fun downloadModels(ctx: Context, tier: String, onProgress: (Long, Long) -> Unit) {
+    val specs = if (tier == "sv") listOf(SPEAKER_SPEC) else PACK_SPECS
+    val totalSize = specs.sumOf { it.size }
+    if (specs.all { isSpecReady(ctx, it) }) {
+      onProgress(totalSize, totalSize)
       return
     }
     synchronized(this) {
-      if (isSpeakerReady(ctx)) {
-        onProgress(MODEL_PACK_SIZE, MODEL_PACK_SIZE)
+      if (specs.all { isSpecReady(ctx, it) }) {
+        onProgress(totalSize, totalSize)
         return
       }
       cancelled = false
@@ -186,11 +288,11 @@ object VoiceModelManager {
       val d = dir(ctx)
       var completedBytes = 0L
       try {
-        for (spec in PACK_SPECS) {
+        for (spec in specs) {
           if (cancelled) throw IOException("已取消下载")
           if (isSpecReady(ctx, spec)) {
             completedBytes += spec.size
-            onProgress(completedBytes, MODEL_PACK_SIZE)
+            onProgress(completedBytes, totalSize)
             continue
           }
           val target = File(d, spec.fileName)
@@ -203,14 +305,14 @@ object VoiceModelManager {
             part.delete()
             try {
               fetchAndVerify(url, part, spec) { got ->
-                onProgress(minOf(MODEL_PACK_SIZE, completedBytes + got), MODEL_PACK_SIZE)
+                onProgress(minOf(totalSize, completedBytes + got), totalSize)
               }
               stamp.delete()
               target.delete()
               if (!part.renameTo(target)) throw IOException("无法保存声纹模型 (${spec.fileName})")
               stamp.writeText(spec.stampText)
               completedBytes += spec.size
-              onProgress(completedBytes, MODEL_PACK_SIZE)
+              onProgress(completedBytes, totalSize)
               ok = true
               break
             } catch (e: Throwable) {
@@ -229,6 +331,10 @@ object VoiceModelManager {
       }
     }
   }
+
+  /** Legacy entrypoint: downloads the full 142 MB SOTA pack. */
+  fun downloadSpeaker(ctx: Context, onProgress: (Long, Long) -> Unit) =
+    downloadModels(ctx, "tse", onProgress)
 
   fun cancelDownload() {
     cancelled = true

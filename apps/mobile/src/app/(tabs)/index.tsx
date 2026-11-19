@@ -1,10 +1,10 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, KeyboardAvoidingView, Pressable, TextInput, View } from "react-native";
-import { Button, Dialog, Portal, Snackbar, Text } from "react-native-paper";
+import { Button, Dialog, Portal, Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { AssistantAction, AssistantItem } from "@herdr-pocket/protocol";
-import { BreathingDot, Card, IconTile, PageBackground, SendPill, TypingDots } from "../../components/ui";
+import { BreathingDot, Card, IconTile, PageBackground, PocketToast, SendPill, TypingDots } from "../../components/ui";
 import { CuteIcon } from "../../components/icons";
 import { Mascot } from "../../components/Mascot";
 import { mdStyles } from "../../components/chat";
@@ -201,9 +201,13 @@ export default function AssistantScreen() {
       </Portal>
       <RemindersSheet visible={showReminders} reminders={reminders} name={NAME} onDismiss={() => setShowReminders(false)} />
 
-      <Snackbar visible={!!toast || !!callMessage} onDismiss={() => (toast ? setToast(null) : dismissCallMessage())} duration={3000} wrapperStyle={{ bottom: 90 }}>
-        {toast ?? callMessage ?? ""}
-      </Snackbar>
+      <PocketToast
+        visible={!!toast || !!callMessage}
+        message={toast ?? callMessage}
+        tone={!toast && (callMessage === "挂断了" || callMessage === "通话结束了") ? "hangup" : "error"}
+        bottom={86}
+        onDismiss={() => (toast ? setToast(null) : dismissCallMessage())}
+      />
     </PageBackground>
   );
 }

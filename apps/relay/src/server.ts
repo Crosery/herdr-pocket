@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
+import QRCode from "qrcode";
 import {
   PROTOCOL_VERSION,
   isJoinId,
@@ -8,6 +9,7 @@ import {
   joinLink,
   pairLink,
   parsePairInput,
+  voiceCatalogFor,
   type Agent,
   type ClientFrame,
   type Device,
@@ -26,6 +28,7 @@ import {
   type AssistantConfirm,
   type AssistantConfigChange,
   type LogLevel,
+  type VoiceProviderId,
 } from "@herdr-pocket/protocol";
 import { VERSION } from "@herdr-pocket/update";
 import { Store } from "./store.ts";
@@ -37,7 +40,7 @@ import { ConfigError, ConfigStore, Sealer, type EffectiveConfig } from "./assist
 import { isPromptId, promptView, promptViews, setPromptEdits } from "./assistant/prompts.ts";
 import { startCall, endAllCalls, type LiveConfig } from "./assistant/live.ts";
 import { EventLog, levelsFrom, parseSince, type EventInput } from "./eventlog.ts";
-import { adminPage } from "./admin.ts";
+import { adminPage, adminAsset } from "./admin.ts";
 
 export interface RelayOptions {
   dbPath: string;
@@ -289,9 +292,43 @@ export class Relay {
         "Cache-Control": "no-store",
         "X-Frame-Options": "DENY",
         "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+        "Content-Security-Policy":
+          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'",
       });
       res.end(req.method === "HEAD" ? undefined : adminPage());
+      return;
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && (path === "/favicon.ico" || path === "/admin/favicon.ico")) {
+      const ico = adminAsset("brand/favicon.ico");
+      if (!ico) {
+        sendError(res, 404, "not_found", "not found");
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": ico.type,
+        "Content-Length": ico.body.length,
+        "Cache-Control": "public, max-age=86400",
+        "X-Content-Type-Options": "nosniff",
+      });
+      res.end(req.method === "HEAD" ? undefined : ico.body);
+      return;
+    }
+
+    const assetMatch = /^\/(?:admin\/)?admin-assets\/(.+)$/.exec(path);
+    if ((req.method === "GET" || req.method === "HEAD") && assetMatch) {
+      const asset = adminAsset(assetMatch[1]!);
+      if (!asset) {
+        sendError(res, 404, "not_found", "not found");
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": asset.type,
+        "Content-Length": asset.body.length,
+        "Cache-Control": asset.immutable ? "public, max-age=31536000, immutable" : "public, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+      });
+      res.end(req.method === "HEAD" ? undefined : asset.body);
       return;
     }
 
@@ -444,7 +481,9 @@ export class Relay {
       const kind = body.kind === "host" || body.kind === "viewer" ? (body.kind as DeviceKind) : undefined;
       const ttlSec = typeof body.ttlSec === "number" ? body.ttlSec : undefined;
       const row = this.store.createPairCode({ kind, ttlSec, createdBy: auth === "admin" ? "admin" : auth.id });
-      const out: PairCode = { code: row.code, expiresAt: row.expiresAt, link: pairLink(this.publicUrl(req), row.code) };
+      const link = pairLink(this.publicUrl(req), row.code);
+      const qrSvg = await QRCode.toString(link, { type: "svg", margin: 1 }).catch(() => undefined);
+      const out: PairCode & { qrSvg?: string } = { code: row.code, expiresAt: row.expiresAt, link, ...(qrSvg ? { qrSvg } : {}) };
       sendJson(res, 200, out);
       return;
     }
@@ -552,6 +591,14 @@ export class Relay {
           if (e instanceof ConfigError) throw e;
           sendError(res, 502, "unsupported", `服务商没给模型列表：${(e as Error).message.slice(0, 160)}`);
         }
+        return;
+      }
+      if (path === "/v1/assistant/config/voices" && req.method === "GET") {
+        const raw = new URL(req.url ?? "/", "http://relay").searchParams.get("provider");
+        const activeProvider = this.eff.live?.provider ?? "openai-realtime";
+        const provider: VoiceProviderId =
+          raw === "moss-live" || raw === "openai-realtime" ? raw : activeProvider === "moss-live" ? "moss-live" : "openai-realtime";
+        sendJson(res, 200, voiceCatalogFor(provider));
         return;
       }
       if (path === "/v1/assistant/prompts" && req.method === "GET") {
@@ -697,7 +744,10 @@ export class Relay {
 
   /** What the control panel shows at the top: health and how the relay is set up (never keys). */
   private overview() {
+    this.sweepJoins();
     const devices = this.devices();
+    const deviceNames = new Map(devices.map((d) => [d.id, d.name]));
+    const agents = this.allAgents();
     const a = this.eff;
     const live = this.eff.live;
     const dayAgo = Date.now() - 86_400_000;
@@ -710,13 +760,19 @@ export class Relay {
       }
     };
     const host = [...new Set((a?.targets ?? []).map((t) => hostOf(t.baseUrl)).filter(Boolean))].join(", ");
+    const joins: JoinRequest[] = [];
+    for (const j of this.joins.values()) {
+      if (j.state === "pending") joins.push(j.req);
+    }
     return {
       version: VERSION,
       protocol: PROTOCOL_VERSION,
       startedAt: STARTED,
       devices: devices.length,
       online: devices.filter((d) => d.online).length,
-      agents: this.allAgents().filter((x) => !x.isShell).length,
+      agents: agents.filter((x) => !x.isShell).length,
+      agentList: agents.map((ag) => ({ ...ag, deviceName: deviceNames.get(ag.deviceId) ?? ag.deviceId })),
+      joins,
       assistant: {
         ready: this.assistant.state().ready,
         models: this.opts.llm ? ["test"] : (a?.targets ?? []).map((t) => `${t.provider}:${t.model}`),
@@ -724,7 +780,7 @@ export class Relay {
         confirm: this.assistant.confirmMode(),
         busy: this.assistant.state().busy,
       },
-      voice: live?.apiKey ? { provider: live.provider ?? "moss-live", model: live.model, endpoint: hostOf(live.url) } : null,
+      voice: live?.apiKey ? { provider: live.provider ?? "moss-live", model: live.model, ...(live.voice ? { voice: live.voice } : {}), endpoint: hostOf(live.url) } : null,
       last24h: { warn: trouble.filter((e) => e.level === "warn").length, error: trouble.filter((e) => e.level === "error").length },
       actions: this.assistant
         .state()

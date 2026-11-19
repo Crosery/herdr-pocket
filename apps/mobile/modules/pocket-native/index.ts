@@ -11,17 +11,40 @@ export interface PickedImage {
   bytes: number;
 }
 
+export type VoiceTier = "auto" | "denoise" | "sv" | "tse";
+
+export interface VoiceBenchmarkResult {
+  recommendedTier: "denoise" | "sv" | "tse";
+  reason: string;
+  dpdfUs: number;
+  tseRtf: number;
+  cores: number;
+  ramMb: number;
+  soc: string;
+  at: number;
+}
+
 export interface NativeVoiceState {
   denoise: boolean;
   filter: boolean;
   threshold: number;
+  voiceTier?: VoiceTier;
+  firstSpeaker?: boolean;
   enrolled: boolean;
+  svReady?: boolean;
+  tseModelsReady?: boolean;
   tseReady?: boolean;
   modelVersion?: string;
   legacyEnrolled?: boolean;
   modelReady: boolean;
   modelDownloading: boolean;
+  svSize?: number;
   modelSize: number;
+  recommendedTier?: "denoise" | "sv" | "tse" | null;
+  recommendReason?: string | null;
+  benchDpdfUs?: number | null;
+  benchTseRtf?: number | null;
+  benchAt?: number;
 }
 
 export interface EnrolledVoiceprint {
@@ -72,9 +95,12 @@ interface PocketNativeModule {
   /** On-device voice denoising and owner voiceprint filtering (absent in older builds). */
   voiceState?(): NativeVoiceState;
   setVoiceSettings?(denoise: boolean, filter: boolean, threshold: number): void;
+  setVoiceMode?(tier: VoiceTier, firstSpeaker: boolean): void;
   setVoiceprint?(embedding: number[] | null): void;
   setVoiceprintMeta?(prototypes: number[][] | null, modelVersion: string | null): void;
   prepareVoiceModel?(): Promise<boolean>;
+  prepareVoiceTier?(tier: "sv" | "tse"): Promise<boolean>;
+  benchmarkVoiceDevice?(): Promise<VoiceBenchmarkResult>;
   cancelVoiceModel?(): void;
   startVoiceEnroll?(): Promise<boolean>;
   finishVoiceEnroll?(): Promise<EnrolledVoiceprint>;

@@ -11,8 +11,10 @@ import { useSettings, VOICEPRINT_MODEL_VERSION } from "./store";
 import { loadToken } from "./auth";
 import { isMockServer, mockAssistant } from "./mock";
 import { applog, uploadAppLog } from "./applog";
+import { type CallLine, numTurn, shouldWaitForAnswer, upsertCallLine } from "./voiceOrder";
 
 export { VOICEPRINT_MODEL_VERSION };
+export { type CallLine, numTurn, shouldWaitForAnswer, upsertCallLine };
 
 export function isVoiceprintLegacy(vp: { modelVersion?: string } | null | undefined): boolean {
   return Boolean(vp && vp.modelVersion !== VOICEPRINT_MODEL_VERSION);
@@ -22,15 +24,6 @@ export type CallStatus = "idle" | "connecting" | "ready" | "ended";
 
 /** What the call is doing right now; one at a time, in this order of priority. */
 export type CallPhase = "connecting" | "speaking" | "thinking" | "muted" | "listening" | "idle";
-
-/** One caption of the current call. Text is always the whole line so far, never a piece. */
-export interface CallLine {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  /** False while the line is still being said. */
-  final: boolean;
-}
 
 interface VoiceState {
   status: CallStatus;
@@ -76,23 +69,26 @@ export function callPhase(s: Pick<VoiceState, "status" | "speaking" | "task" | "
 
 const MAX_LINES = 30;
 
-/** Adds a caption or replaces the one with the same id. */
-function upsertLine(lines: CallLine[], line: CallLine): CallLine[] {
-  const i = lines.findIndex((l) => l.id === line.id);
-  if (i >= 0) {
-    const next = lines.slice();
-    next[i] = line;
-    return next;
-  }
-  return [...lines, line].slice(-MAX_LINES);
-}
-
 /** The person's sentence in progress has no turn number yet; it gets one when it ends. */
 const OPEN_USER = "u:open";
 let waitTimer: ReturnType<typeof setTimeout> | null = null;
 let lastOutAt = 0;
+let activeUserTurn: number | undefined;
+let lastAnsweredTurn = 0;
 /** The sentence the person just finished, to tell its late pieces from a new sentence. */
 let lastHeard = { text: "", at: 0 };
+
+function resetCallTurnState() {
+  activeUserTurn = undefined;
+  lastAnsweredTurn = 0;
+  lastOutAt = 0;
+  lastHeard = { text: "", at: 0 };
+}
+
+function noteAnswerTurn(raw: unknown) {
+  const t = numTurn(raw);
+  if (t !== undefined && t > lastAnsweredTurn) lastAnsweredTurn = t;
+}
 
 function setWaiting(on: boolean) {
   if (waitTimer) clearTimeout(waitTimer);
@@ -104,56 +100,79 @@ function setWaiting(on: boolean) {
 export function applyCallEvent(action: string | undefined, d: Record<string, any>): void {
   const text = typeof d.text === "string" ? d.text : "";
   switch (action) {
-    case "input.speech.started":
+    case "input.speech.started": {
+      const t = numTurn(d.turn);
+      if (t !== undefined) activeUserTurn = t;
       setWaiting(false);
       useVoice.setState({ listening: true });
       break;
-    case "input.speech.stopped":
+    }
+    case "input.speech.stopped": {
+      const t = numTurn(d.turn);
+      if (t !== undefined) activeUserTurn = t;
       useVoice.setState({ listening: false });
       break;
-    case "input.transcript.updated":
+    }
+    case "input.transcript.updated": {
       if (!text.trim()) break;
       // A piece of the sentence that has just ended can arrive after its end: it is not a new sentence.
       if (Date.now() - lastHeard.at < 2500 && lastHeard.text.startsWith(text.trim())) break;
-      useVoice.setState((s) => ({ lines: upsertLine(s.lines, { id: OPEN_USER, role: "user", text, final: false }) }));
+      const turn = numTurn(d.turn) ?? activeUserTurn;
+      useVoice.setState((s) => ({ lines: upsertCallLine(s.lines, { id: OPEN_USER, role: "user", text, final: false, turn }, MAX_LINES) }));
       break;
+    }
     case "input.transcript.done":
     case "input.transcript.revised": {
-      const id = d.turn != null ? `u:${d.turn}` : OPEN_USER;
+      const turn = numTurn(d.turn) ?? activeUserTurn;
+      const id = turn !== undefined ? `u:${turn}` : OPEN_USER;
       useVoice.setState((s) => {
         // The sentence in progress becomes this turn; a later correction replaces the turn's text.
         const rest = action === "input.transcript.done" ? s.lines.filter((l) => l.id !== OPEN_USER) : s.lines;
-        return { lines: text.trim() ? upsertLine(rest, { id, role: "user", text, final: true }) : rest.filter((l) => l.id !== id) };
+        return {
+          lines: text.trim()
+            ? upsertCallLine(rest, { id, role: "user", text, final: true, turn }, MAX_LINES)
+            : rest.filter((l) => l.id !== id),
+        };
       });
       if (action === "input.transcript.done" && text.trim()) {
         lastHeard = { text: text.trim(), at: Date.now() };
-        setWaiting(true);
+        if (shouldWaitForAnswer(turn, lastAnsweredTurn, useVoice.getState().speaking)) setWaiting(true);
       }
       break;
     }
     case "output.transcript.updated":
     case "output.transcript.done": {
       if (!text.trim()) break;
+      noteAnswerTurn(d.turn_id);
       const id = `a:${d.run_id ?? d.turn_id ?? "current"}`;
-      useVoice.setState((s) => ({ lines: upsertLine(s.lines, { id, role: "assistant", text, final: action === "output.transcript.done" }) }));
+      const turn = numTurn(d.turn_id);
+      useVoice.setState((s) => ({
+        lines: upsertCallLine(s.lines, { id, role: "assistant", text, final: action === "output.transcript.done", turn }, MAX_LINES),
+      }));
       break;
     }
     case "response.audio.started":
+      noteAnswerTurn(d.turn_id);
       setWaiting(false);
       lastOutAt = Date.now();
       useVoice.setState({ speaking: true });
       break;
     case "response.interrupted": {
       // Cut off mid-sentence: keep what was actually said.
+      noteAnswerTurn(d.turn_id);
       const id = `a:${d.run_id ?? d.turn_id ?? "current"}`;
+      const turn = numTurn(d.turn_id);
       lastOutAt = 0;
       useVoice.setState((s) => ({
         speaking: false,
-        lines: text.trim() ? upsertLine(s.lines, { id, role: "assistant", text: `${text.trim()}…`, final: true }) : s.lines.map((l) => (l.id === id ? { ...l, final: true } : l)),
+        lines: text.trim()
+          ? upsertCallLine(s.lines, { id, role: "assistant", text: `${text.trim()}…`, final: true, turn }, MAX_LINES)
+          : s.lines.map((l) => (l.id === id ? { ...l, final: true } : l)),
       }));
       break;
     }
     case "response.ended":
+      noteAnswerTurn(d.turn_id);
       setWaiting(false);
       break;
     case "relay.task":
@@ -302,6 +321,7 @@ export function syncNativeVoice(): void {
   if (!PocketNative?.setVoiceSettings) return;
   const s = useSettings.getState();
   PocketNative.setVoiceSettings(s.voiceDenoise, s.voiceFilter, s.voiceThreshold);
+  PocketNative.setVoiceMode?.(s.voiceTier, s.voiceFirstSpeaker);
   if (s.voiceprint?.modelVersion === VOICEPRINT_MODEL_VERSION) {
     PocketNative.setVoiceprint?.(s.voiceprint.embedding);
     PocketNative.setVoiceprintMeta?.(s.voiceprint.prototypes ?? null, s.voiceprint.modelVersion);
@@ -320,6 +340,7 @@ function wire() {
     if (e.state !== useVoice.getState().status) applog(e.state === "ended" && e.message ? "warn" : "info", "voice", `call ${e.state}${e.message ? `: ${e.message}` : ""}`);
     if (e.state === "ended") {
       setWaiting(false);
+      resetCallTurnState();
       callLevel.value = 0;
       useVoice.setState({ status: "ended", message: e.message ?? null, muted: false, startedAt: null, ...QUIET });
       void uploadAppLog();
@@ -372,6 +393,8 @@ export async function startCall(): Promise<string | null> {
   const token = await loadToken();
   if (!token) return "这台手机还没配对";
   syncNativeVoice();
+  setWaiting(false);
+  resetCallTurnState();
   useVoice.setState({ status: "connecting", message: null, muted: false, startedAt: null, ...QUIET });
   PocketNative.startCall(server, token);
   return null;
@@ -414,6 +437,7 @@ const DEMO_SCRIPT: { who: "user" | "assistant"; text: string; task?: string; not
 
 function startDemoCall() {
   stopDemoCall(null);
+  resetCallTurnState();
   useVoice.setState({ status: "connecting", message: null, muted: false, startedAt: null, ...QUIET });
   const timers: ReturnType<typeof setTimeout>[] = [];
   const at = (ms: number, fn: () => void) => timers.push(setTimeout(fn, ms));
@@ -478,6 +502,7 @@ function stopDemoCall(message: string | null) {
   clearInterval(demo.ticker);
   demo = null;
   setWaiting(false);
+  resetCallTurnState();
   callLevel.value = 0;
   // Same as a real call: "ended" shows the reason once, then the screen goes back to idle.
   useVoice.setState({ status: message ? "ended" : "idle", message, muted: false, startedAt: null, ...QUIET });

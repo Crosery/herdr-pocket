@@ -6,11 +6,11 @@
  * forwarding the original mixture when extraction is unavailable.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ScrollView, View } from "react-native";
+import { Pressable, ScrollView, View } from "react-native";
 import { Button, ProgressBar, Text } from "react-native-paper";
 import { Stack } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import { PocketNative } from "../../modules/pocket-native";
+import { PocketNative, type VoiceTier } from "../../modules/pocket-native";
 import { Card, PageBackground } from "../components/ui";
 import { Row, RowDivider as Divider, Toggle } from "../components/rows";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Pill } from "../components/configParts";
@@ -22,6 +22,12 @@ import { usePalette } from "../theme/theme";
 import { fonts, radius, space, statusColors } from "../theme/tokens";
 
 type Phase = "idle" | "downloading" | "recording" | "finishing" | "testing";
+
+const TIER_TITLE: Record<"denoise" | "sv" | "tse", string> = {
+  denoise: "仅环境降噪（0 MB）",
+  sv: "灵巧声纹（68 MB）",
+  tse: "旗舰人声分离（142 MB）",
+};
 
 interface TestResult {
   score: number;
@@ -61,15 +67,29 @@ export default function VoiceprintScreen() {
   const voiceDenoise = useSettings((x) => x.voiceDenoise);
   const voiceFilter = useSettings((x) => x.voiceFilter);
   const voiceThreshold = useSettings((x) => x.voiceThreshold);
+  const voiceTier = useSettings((x) => x.voiceTier);
+  const voiceFirstSpeaker = useSettings((x) => x.voiceFirstSpeaker);
   const voiceprint = useSettings((x) => x.voiceprint);
   const set = useSettings((x) => x.set);
   const callStatus = useVoice((x) => x.status);
   const inCall = callStatus === "connecting" || callStatus === "ready";
 
-  const [modelReady, setModelReady] = useState(() => (demo ? true : (PocketNative?.voiceState?.()?.modelReady ?? false)));
-  const [modelSizeMb] = useState(() => Math.max(1, Math.round((PocketNative?.voiceState?.()?.modelSize ?? 149_025_914) / 1_048_576)));
-  const [nativeLegacy, setNativeLegacy] = useState(() => (demo ? false : Boolean(PocketNative?.voiceState?.()?.legacyEnrolled)));
+  const initialNative = demo ? undefined : PocketNative?.voiceState?.();
+  const [svReady, setSvReady] = useState(() => (demo ? true : Boolean(initialNative?.svReady ?? initialNative?.modelReady)));
+  const [tseReady, setTseReady] = useState(() => (demo ? true : Boolean(initialNative?.tseModelsReady ?? initialNative?.modelReady)));
+  const [svSizeMb] = useState(() => Math.max(1, Math.round((initialNative?.svSize ?? 71_441_526) / 1_048_576)));
+  const [modelSizeMb] = useState(() => Math.max(1, Math.round((initialNative?.modelSize ?? 149_025_914) / 1_048_576)));
+  const [nativeLegacy, setNativeLegacy] = useState(() => (demo ? false : Boolean(initialNative?.legacyEnrolled)));
+  const [bench, setBench] = useState<{ tier: "denoise" | "sv" | "tse"; reason: string } | null>(() =>
+    demo
+      ? { tier: "sv", reason: "演示环境：推荐 68 MB 灵巧声纹门控" }
+      : initialNative?.recommendedTier
+        ? { tier: initialNative.recommendedTier, reason: initialNative.recommendReason ?? "" }
+        : null,
+  );
+  const [benchBusy, setBenchBusy] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
+  const [dlLabel, setDlLabel] = useState("声纹与人声模型");
   const [dlProgress, setDlProgress] = useState(0);
   const [level, setLevel] = useState(0);
   const [seconds, setSeconds] = useState(0);
@@ -107,9 +127,41 @@ export default function VoiceprintScreen() {
     }
   }, [stopDemo]);
 
+  const runBenchmark = useCallback(async () => {
+    if (demo) {
+      setBench({ tier: "sv", reason: "演示环境：降噪 2.4 ms/帧，推荐 68 MB 灵巧声纹门控" });
+      return;
+    }
+    if (!PocketNative?.benchmarkVoiceDevice || benchBusy) return;
+    setBenchBusy(true);
+    try {
+      const r = await PocketNative.benchmarkVoiceDevice();
+      setBench({ tier: r.recommendedTier, reason: r.reason });
+    } catch {
+      // Keep UI usable even if device benchmark is unavailable.
+    } finally {
+      setBenchBusy(false);
+    }
+  }, [demo, benchBusy]);
+
   useEffect(() => {
+    if (!demo && !bench && PocketNative?.benchmarkVoiceDevice) {
+      void runBenchmark();
+    }
     return () => stopAny();
   }, [stopAny]);
+
+  const refreshModelFlags = useCallback(() => {
+    if (demo) {
+      setSvReady(true);
+      setTseReady(true);
+      return;
+    }
+    const st = PocketNative?.voiceState?.();
+    if (!st) return;
+    setSvReady(Boolean(st.svReady ?? st.modelReady));
+    setTseReady(Boolean(st.tseModelsReady ?? st.modelReady));
+  }, [demo]);
 
   useEffect(() => {
     if (!PocketNative) return;
@@ -168,18 +220,22 @@ export default function VoiceprintScreen() {
     };
   }, []);
 
-  async function ensureModel(): Promise<boolean> {
-    if (modelReady) return true;
-    if (!PocketNative?.prepareVoiceModel) {
+  async function ensureTierModel(target: "sv" | "tse"): Promise<boolean> {
+    if (demo) return true;
+    if (target === "sv" && svReady) return true;
+    if (target === "tse" && svReady && tseReady) return true;
+    const dl = PocketNative?.prepareVoiceTier ?? PocketNative?.prepareVoiceModel;
+    if (!dl) {
       setError("这个版本的 App 还没带声纹功能，先更新 App");
       return false;
     }
     setPhase("downloading");
+    setDlLabel(target === "sv" ? `灵巧声纹模型（约 ${svSizeMb} MB）` : `旗舰人声分离包（总计约 ${modelSizeMb} MB）`);
     setDlProgress(0);
     setError(null);
     try {
-      await PocketNative.prepareVoiceModel();
-      setModelReady(true);
+      await (PocketNative?.prepareVoiceTier ? PocketNative.prepareVoiceTier(target) : PocketNative!.prepareVoiceModel!());
+      refreshModelFlags();
       return true;
     } catch (e) {
       const msg = (e as Error).message || "下载失败";
@@ -188,6 +244,29 @@ export default function VoiceprintScreen() {
     } finally {
       setPhase((cur) => (cur === "downloading" ? "idle" : cur));
     }
+  }
+
+  async function chooseTier(next: VoiceTier) {
+    if (busy) return;
+    set({ voiceTier: next });
+    syncNativeVoice();
+    if (next === "sv" && !svReady) await ensureTierModel("sv");
+    else if (next === "tse" && (!svReady || !tseReady)) await ensureTierModel("tse");
+    else if (next === "auto") {
+      if (bench?.tier === "tse" && (!svReady || !tseReady)) await ensureTierModel("tse");
+      else if (bench?.tier === "sv" && !svReady) await ensureTierModel("sv");
+    }
+  }
+
+  async function toggleFirstSpeaker(next: boolean) {
+    if (!next) {
+      set({ voiceFirstSpeaker: false });
+      syncNativeVoice();
+      return;
+    }
+    if (!(await ensureTierModel("sv"))) return;
+    set({ voiceFirstSpeaker: true, ...(voiceTier === "denoise" ? { voiceTier: "auto" } : {}) });
+    syncNativeVoice();
   }
 
   async function beginEnroll() {
@@ -214,7 +293,8 @@ export default function VoiceprintScreen() {
       setError("没有麦克风权限，没法录声纹。可以在系统设置里打开");
       return;
     }
-    if (!(await ensureModel())) return;
+    const wantTse = voiceTier === "tse" || (voiceTier === "auto" && bench?.tier === "tse");
+    if (!(await ensureTierModel(wantTse ? "tse" : "sv"))) return;
     if (!PocketNative?.startVoiceEnroll) {
       setError("这个版本的 App 还没带声纹功能，先更新 App");
       return;
@@ -356,7 +436,7 @@ export default function VoiceprintScreen() {
       setError("没有麦克风权限，没法测试");
       return;
     }
-    if (!(await ensureModel())) return;
+    if (!(await ensureTierModel("sv"))) return;
     if (!PocketNative?.startVoiceTest) return;
     try {
       syncNativeVoice();
@@ -411,6 +491,49 @@ export default function VoiceprintScreen() {
           .join(" · ")
       : "";
 
+  const enrollNeedDownload = !svReady || ((voiceTier === "tse" || (voiceTier === "auto" && bench?.tier === "tse")) && !tseReady);
+  const autoNeedDownload = bench?.tier === "tse" ? !(svReady && tseReady) : bench?.tier === "sv" ? !svReady : false;
+  const tierCards: ReadonlyArray<{
+    id: VoiceTier;
+    title: string;
+    desc: string;
+    badge?: string;
+    status: string;
+    ready: boolean;
+  }> = [
+    {
+      id: "auto",
+      title: "自动匹配（省心默认）",
+      desc: "不用手动挑：自动采用上方推荐方案，高负载时自动降级不断流",
+      status: autoNeedDownload ? "点此准备模型" : "默认推荐",
+      ready: !autoNeedDownload,
+    },
+    {
+      id: "sv",
+      title: `灵巧声纹 · ${svSizeMb} MB`,
+      desc: "识别你本人或首个说话人，中端与主流机型最稳、不吞字",
+      badge: bench?.tier === "sv" ? "本机推荐" : undefined,
+      status: svReady ? "已下载" : "点此下载",
+      ready: svReady,
+    },
+    {
+      id: "tse",
+      title: `旗舰人声分离 · ${modelSizeMb} MB`,
+      desc: "额外叠加实时波形分离，适合骁龙 8 系等旗舰处理器",
+      badge: bench?.tier === "tse" ? "本机推荐" : undefined,
+      status: svReady && tseReady ? "已下载" : svReady ? "点此补齐" : "点此下载",
+      ready: svReady && tseReady,
+    },
+    {
+      id: "denoise",
+      title: "仅环境降噪 · 0 MB",
+      desc: "内置免下载，只压低环境杂音，不区分谁在说话",
+      badge: bench?.tier === "denoise" ? "本机推荐" : undefined,
+      status: "内置就绪",
+      ready: true,
+    },
+  ];
+
   return (
     <PageBackground>
       <Stack.Screen options={{ title: "通话降噪与声纹" }} />
@@ -440,9 +563,9 @@ export default function VoiceprintScreen() {
                 title="只认我的声音"
                 sub={
                   legacy
-                    ? "声纹引擎已升级，请重录一次以恢复声纹人声提取"
+                    ? "声纹引擎已升级，请重录一次以启用"
                     : voiceFilter
-                      ? "已开启 · 按已录声纹从通话音频中提取你的声音"
+                      ? "已开启 · 按已录声纹识别本人并抑制旁人说话"
                       : "暂时关闭 · 已录声纹保留着，随时能打开"
                 }
                 right={
@@ -459,6 +582,93 @@ export default function VoiceprintScreen() {
               />
             </>
           ) : null}
+          <Divider />
+          <Row
+            icon="account-lock-outline"
+            title="未录声纹只认第一个说话人"
+            sub={
+              voiceFilter && voiceprint && !legacy
+                ? voiceFirstSpeaker
+                  ? "已开启（当前已启用个人声纹，个人声纹优先）"
+                  : "个人声纹关闭时，自动锁定每通电话首位开口的人"
+                : voiceFirstSpeaker
+                  ? "已开启 · 自动锁定首个说话人，抑制之后旁人插话"
+                  : `关闭 · 开着时自动屏蔽旁人（需 ${svSizeMb} MB 灵巧声纹模型）`
+            }
+            right={
+              <Toggle
+                label="未录声纹只认第一个说话人"
+                value={voiceFirstSpeaker}
+                disabled={busy}
+                onChange={(v) => void toggleFirstSpeaker(v)}
+              />
+            }
+          />
+        </Card>
+
+        <Card style={{ padding: space.lg, gap: space.md }}>
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: space.sm }}>
+            <Text style={{ fontFamily: fonts.cute, fontSize: 18, color: p.ink }}>声音过滤方案</Text>
+            <Button mode="text" compact disabled={benchBusy || busy} loading={benchBusy} textColor={p.accentText} onPress={() => void runBenchmark()}>
+              {benchBusy ? "检测中" : "重测算力"}
+            </Button>
+          </View>
+
+          <View style={{ backgroundColor: p.surface2, borderRadius: radius.md, padding: space.md, gap: 4 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" }}>
+              <Pill tone={bench ? "good" : "plain"} text={bench ? `已按本机算力推荐：${TIER_TITLE[bench.tier]}` : benchBusy ? "正在检测芯片算力…" : "尚未检测性能"} />
+            </View>
+            <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 19 }}>
+              {bench?.reason || "检测仅需不到 1 秒，保持「自动匹配」即可按本机芯片自动选中最优方案。"}
+            </Text>
+          </View>
+
+          <View style={{ gap: space.sm }}>
+            {tierCards.map((c) => {
+              const selected = voiceTier === c.id;
+              return (
+                <Pressable
+                  key={c.id}
+                  accessibilityRole="radio"
+                  accessibilityState={{ checked: selected, disabled: busy }}
+                  disabled={busy}
+                  onPress={() => void chooseTier(c.id)}
+                  style={({ pressed }) => ({
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: space.md,
+                    padding: space.md,
+                    borderRadius: radius.md,
+                    backgroundColor: pressed ? p.surface3 : selected ? p.surface2 : p.surface,
+                    borderWidth: 1.5,
+                    borderColor: selected ? p.primary : p.divider,
+                  })}
+                >
+                  <View
+                    style={{
+                      width: 18,
+                      height: 18,
+                      borderRadius: 9,
+                      borderWidth: 2,
+                      borderColor: selected ? p.primary : p.faint,
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    {selected ? <View style={{ width: 9, height: 9, borderRadius: 4.5, backgroundColor: p.primary }} /> : null}
+                  </View>
+                  <View style={{ flex: 1, gap: 2 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <Text style={{ color: p.ink, fontFamily: fonts.bodySemi, fontSize: 13.5 }}>{c.title}</Text>
+                      {c.badge ? <Pill tone="good" text={c.badge} /> : null}
+                    </View>
+                    <Text style={{ color: p.faint, fontSize: 12, lineHeight: 17 }}>{c.desc}</Text>
+                  </View>
+                  <Pill tone={c.ready ? (selected ? "good" : "plain") : "soft"} text={c.status} />
+                </Pressable>
+              );
+            })}
+          </View>
         </Card>
 
         {voiceprint && !legacy ? (
@@ -504,7 +714,7 @@ export default function VoiceprintScreen() {
           {phase === "downloading" ? (
             <View style={{ gap: space.sm }}>
               <Text style={{ color: p.ink, fontSize: 14 }}>
-                正在准备本地声纹与人声提取模型（约 {modelSizeMb} MB），{Math.round(dlProgress * 100)}%
+                正在准备{dlLabel}，{Math.round(dlProgress * 100)}%
               </Text>
               <ProgressBar progress={dlProgress} color={p.primary} style={{ height: 8, borderRadius: 4, backgroundColor: p.surface3 }} />
               <Button mode="text" textColor={p.muted} onPress={() => PocketNative?.cancelVoiceModel?.()} style={{ alignSelf: "flex-end" }}>
@@ -614,9 +824,9 @@ export default function VoiceprintScreen() {
                   </View>
                 </View>
               ) : null}
-              {!modelReady ? (
+              {!svReady ? (
                 <Text style={{ color: p.muted, fontSize: 13.5, lineHeight: 20 }}>
-                  首次录入需要下载约 {modelSizeMb} MB 的本地声纹与人声提取模型。模型和录音都只留在你的手机里，不会上传。
+                  首次录入只需要先下载约 {svSizeMb} MB 的灵巧声纹模型；模型和录音都只留在你的手机里，不会上传。
                 </Text>
               ) : (
                 <View style={{ backgroundColor: p.surface2, borderRadius: radius.md, padding: space.md, gap: space.xs }}>
@@ -625,10 +835,10 @@ export default function VoiceprintScreen() {
                 </View>
               )}
               <Button mode="contained" onPress={beginEnroll} style={{ borderRadius: radius.pill }} contentStyle={{ height: 46 }}>
-                {!modelReady
+                {enrollNeedDownload
                   ? legacy
-                    ? "下载新模型并重录"
-                    : "下载声纹模型并录制"
+                    ? "下载模型并重录"
+                    : "下载推荐模型并录制"
                   : legacy
                     ? "重新录制以启用新声纹"
                     : voiceprint
@@ -652,7 +862,7 @@ export default function VoiceprintScreen() {
         </Card>
 
         <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 19, paddingHorizontal: space.xs }}>
-          开启「只认我的声音」后，手机会按已录声纹提取你的声音再发送。分离暂时跟不上时会发送静音，不会直接传出未分离的原声。修改设置从下一通电话生效。
+          开启声纹过滤后，手机会优先使用与性能匹配的过滤方案；即使旗舰人声分离在个别机型上负载过高，也会自动平滑切回灵巧声纹门控，不会再突然全静音。修改设置从下一通电话生效。
         </Text>
 
         {error ? (

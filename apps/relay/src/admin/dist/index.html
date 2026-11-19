@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <meta name="referrer" content="no-referrer" />
+  <link rel="icon" type="image/x-icon" href="./admin-assets/brand/favicon.ico" />
+  <link rel="icon" type="image/png" sizes="64x64" href="./admin-assets/brand/favicon-64.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./admin-assets/brand/apple-touch-icon.png" />
+  <title>Herdr Pocket 控制台</title>
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("herdr-pocket-admin-theme");
+        var theme = saved === "dark" || saved === "light"
+          ? saved
+          : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.setAttribute("data-theme", theme);
+      } catch (e) {}
+    })();
+  </script>
+  <script type="module" crossorigin src="./admin-assets/index-jxc3JImL.js"></script>
+  <link rel="stylesheet" crossorigin href="./admin-assets/index-Cc2V2Jjt.css">
+</head>
+<body>
+  <div id="root"><template><input placeholder="类别，如 live.ai、voice.ai、assistant、rpc" /></template></div>
+</body>
+</html>
