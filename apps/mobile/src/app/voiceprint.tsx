@@ -24,9 +24,9 @@ import { fonts, radius, space, statusColors } from "../theme/tokens";
 type Phase = "idle" | "downloading" | "recording" | "finishing" | "testing";
 
 const TIER_TITLE: Record<"denoise" | "sv" | "tse", string> = {
-  denoise: "仅环境降噪（0 MB）",
+  denoise: "暂不启用声纹（建议关闭声纹）",
   sv: "灵巧声纹（68 MB）",
-  tse: "旗舰人声分离（142 MB）",
+  tse: "旗舰声纹分离（142 MB）",
 };
 
 interface TestResult {
@@ -64,10 +64,10 @@ export default function VoiceprintScreen() {
   const p = usePalette();
   const server = useSettings((x) => x.server);
   const demo = isMockServer(server);
-  const voiceDenoise = useSettings((x) => x.voiceDenoise);
   const voiceFilter = useSettings((x) => x.voiceFilter);
   const voiceThreshold = useSettings((x) => x.voiceThreshold);
   const voiceTier = useSettings((x) => x.voiceTier);
+  const effectiveChoice: "auto" | "sv" | "tse" = voiceTier === "sv" || voiceTier === "tse" ? voiceTier : "auto";
   const voiceFirstSpeaker = useSettings((x) => x.voiceFirstSpeaker);
   const voiceprint = useSettings((x) => x.voiceprint);
   const set = useSettings((x) => x.set);
@@ -293,7 +293,7 @@ export default function VoiceprintScreen() {
       setError("没有麦克风权限，没法录声纹。可以在系统设置里打开");
       return;
     }
-    const wantTse = voiceTier === "tse" || (voiceTier === "auto" && bench?.tier === "tse");
+    const wantTse = effectiveChoice === "tse" || (effectiveChoice === "auto" && bench?.tier === "tse");
     if (!(await ensureTierModel(wantTse ? "tse" : "sv"))) return;
     if (!PocketNative?.startVoiceEnroll) {
       setError("这个版本的 App 还没带声纹功能，先更新 App");
@@ -491,10 +491,10 @@ export default function VoiceprintScreen() {
           .join(" · ")
       : "";
 
-  const enrollNeedDownload = !svReady || ((voiceTier === "tse" || (voiceTier === "auto" && bench?.tier === "tse")) && !tseReady);
+  const enrollNeedDownload = !svReady || ((effectiveChoice === "tse" || (effectiveChoice === "auto" && bench?.tier === "tse")) && !tseReady);
   const autoNeedDownload = bench?.tier === "tse" ? !(svReady && tseReady) : bench?.tier === "sv" ? !svReady : false;
   const tierCards: ReadonlyArray<{
-    id: VoiceTier;
+    id: "auto" | "sv" | "tse";
     title: string;
     desc: string;
     badge?: string;
@@ -504,7 +504,7 @@ export default function VoiceprintScreen() {
     {
       id: "auto",
       title: "自动匹配（省心默认）",
-      desc: "不用手动挑：自动采用上方推荐方案，高负载时自动降级不断流",
+      desc: "不用手动挑：自动采用本机推荐的声纹模型，高负载时自动降级不断流",
       status: autoNeedDownload ? "点此准备模型" : "默认推荐",
       ready: !autoNeedDownload,
     },
@@ -518,46 +518,21 @@ export default function VoiceprintScreen() {
     },
     {
       id: "tse",
-      title: `旗舰人声分离 · ${modelSizeMb} MB`,
+      title: `旗舰声纹分离 · ${modelSizeMb} MB`,
       desc: "额外叠加实时波形分离，适合骁龙 8 系等旗舰处理器",
       badge: bench?.tier === "tse" ? "本机推荐" : undefined,
       status: svReady && tseReady ? "已下载" : svReady ? "点此补齐" : "点此下载",
       ready: svReady && tseReady,
     },
-    {
-      id: "denoise",
-      title: "仅环境降噪 · 0 MB",
-      desc: "内置免下载，只压低环境杂音，不区分谁在说话",
-      badge: bench?.tier === "denoise" ? "本机推荐" : undefined,
-      status: "内置就绪",
-      ready: true,
-    },
   ];
 
   return (
     <PageBackground>
-      <Stack.Screen options={{ title: "通话降噪与声纹" }} />
+      <Stack.Screen options={{ title: "只认我的声音" }} />
       <ScrollView contentContainerStyle={{ padding: space.lg, gap: space.lg, paddingBottom: space.xxxl }}>
         <Card style={{ paddingVertical: space.xs }}>
-          <Row
-            icon="waveform"
-            title="通话降噪"
-            sub={voiceDenoise ? "已开启 · 实时压低环境杂音" : "已关闭 · 不再做额外降噪"}
-            right={
-              <Toggle
-                label="通话降噪"
-                value={voiceDenoise}
-                disabled={busy}
-                onChange={(v) => {
-                  set({ voiceDenoise: v });
-                  syncNativeVoice();
-                }}
-              />
-            }
-          />
           {voiceprint || legacy ? (
             <>
-              <Divider />
               <Row
                 icon="shield-account-outline"
                 title="只认我的声音"
@@ -580,9 +555,9 @@ export default function VoiceprintScreen() {
                   />
                 }
               />
+              <Divider />
             </>
           ) : null}
-          <Divider />
           <Row
             icon="account-lock-outline"
             title="未录声纹只认第一个说话人"
@@ -608,7 +583,7 @@ export default function VoiceprintScreen() {
 
         <Card style={{ padding: space.lg, gap: space.md }}>
           <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: space.sm }}>
-            <Text style={{ fontFamily: fonts.cute, fontSize: 18, color: p.ink }}>声音过滤方案</Text>
+            <Text style={{ fontFamily: fonts.cute, fontSize: 18, color: p.ink }}>声纹模型档位</Text>
             <Button mode="text" compact disabled={benchBusy || busy} loading={benchBusy} textColor={p.accentText} onPress={() => void runBenchmark()}>
               {benchBusy ? "检测中" : "重测算力"}
             </Button>
@@ -625,7 +600,7 @@ export default function VoiceprintScreen() {
 
           <View style={{ gap: space.sm }}>
             {tierCards.map((c) => {
-              const selected = voiceTier === c.id;
+              const selected = effectiveChoice === c.id;
               return (
                 <Pressable
                   key={c.id}

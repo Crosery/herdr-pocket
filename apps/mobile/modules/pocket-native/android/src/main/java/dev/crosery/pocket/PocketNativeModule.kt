@@ -125,6 +125,20 @@ class PocketNativeModule : Module() {
       }.start()
     }
 
+    AsyncFunction("downloadUpdateUrls") { urls: List<String>, name: String, size: Double, sha256: String, promise: Promise ->
+      val ctx = context
+      Thread {
+        try {
+          val path = Updater.downloadUrls(ctx, urls, name, size.toLong(), sha256) { got, total ->
+            PocketBus.emit("onUpdateProgress", mapOf("received" to got.toDouble(), "total" to total.toDouble()))
+          }
+          promise.resolve(path)
+        } catch (e: Throwable) {
+          promise.reject("E_UPDATE_DOWNLOAD", e.message ?: "download failed", e)
+        }
+      }.start()
+    }
+
     Function("cancelUpdate") {
       Updater.cancel()
     }

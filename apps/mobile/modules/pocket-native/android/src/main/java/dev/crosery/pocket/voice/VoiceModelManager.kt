@@ -3,15 +3,12 @@ package dev.crosery.pocket.voice
 import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
+import dev.crosery.pocket.FastDownloader
 import dev.crosery.pocket.Prefs
-import okhttp3.Call
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 
 object VoiceModelManager {
   const val VOICEPRINT_MODEL_VERSION = "eres2netv2-voxlock-v2"
@@ -48,8 +45,9 @@ object VoiceModelManager {
     size = SPEAKER_SIZE,
     sha256 = SPEAKER_SHA256,
     urls = listOf(
+      "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
-      "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+      "https://cdn.gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
     ),
@@ -79,12 +77,7 @@ object VoiceModelManager {
 
   private val PACK_SPECS = listOf(SPEAKER_SPEC, VOXLOCK_ENROLL_SPEC, VOXLOCK_CHUNK_SPEC)
 
-  private val client = OkHttpClient.Builder()
-    .connectTimeout(20, TimeUnit.SECONDS)
-    .readTimeout(90, TimeUnit.SECONDS)
-    .build()
-
-  @Volatile private var activeCall: Call? = null
+  @Volatile private var activeToken: FastDownloader.CancelToken? = null
   @Volatile private var cancelled = false
   @Volatile var downloading = false
     private set
@@ -285,11 +278,13 @@ object VoiceModelManager {
       }
       cancelled = false
       downloading = true
+      val token = FastDownloader.CancelToken()
+      activeToken = token
       val d = dir(ctx)
       var completedBytes = 0L
       try {
         for (spec in specs) {
-          if (cancelled) throw IOException("已取消下载")
+          if (cancelled || token.cancelled) throw IOException("已取消下载")
           if (isSpecReady(ctx, spec)) {
             completedBytes += spec.size
             onProgress(completedBytes, totalSize)
@@ -298,35 +293,31 @@ object VoiceModelManager {
           val target = File(d, spec.fileName)
           val stamp = File(d, spec.stampName)
           val part = File(d, "${spec.fileName}.part")
-          var lastErr: Throwable? = null
-          var ok = false
-          for (url in spec.urls) {
-            if (cancelled) throw IOException("已取消下载")
-            part.delete()
-            try {
-              fetchAndVerify(url, part, spec) { got ->
-                onProgress(minOf(totalSize, completedBytes + got), totalSize)
-              }
-              stamp.delete()
-              target.delete()
-              if (!part.renameTo(target)) throw IOException("无法保存声纹模型 (${spec.fileName})")
-              stamp.writeText(spec.stampText)
-              completedBytes += spec.size
-              onProgress(completedBytes, totalSize)
-              ok = true
-              break
-            } catch (e: Throwable) {
-              part.delete()
-              lastErr = e
-              if (cancelled || e is InterruptedException) throw e
+          part.delete()
+          try {
+            FastDownloader.download(
+              urls = spec.urls,
+              partFile = part,
+              expectedSize = spec.size,
+              expectedSha256 = spec.sha256,
+              token = token,
+            ) { got, _ ->
+              onProgress(minOf(totalSize, completedBytes + got), totalSize)
             }
-          }
-          if (!ok) {
-            throw IOException("下载声纹模型失败：${lastErr?.message ?: "网络异常"}", lastErr)
+            stamp.delete()
+            target.delete()
+            if (!part.renameTo(target)) throw IOException("无法保存声纹模型 (${spec.fileName})")
+            stamp.writeText(spec.stampText)
+            completedBytes += spec.size
+            onProgress(completedBytes, totalSize)
+          } catch (e: Throwable) {
+            part.delete()
+            if (cancelled || token.cancelled || e is InterruptedException) throw IOException("已取消下载", e)
+            throw IOException("下载声纹模型失败：${e.message ?: "网络异常"}", e)
           }
         }
       } finally {
-        activeCall = null
+        activeToken = null
         downloading = false
       }
     }
@@ -338,39 +329,7 @@ object VoiceModelManager {
 
   fun cancelDownload() {
     cancelled = true
-    activeCall?.cancel()
-  }
-
-  private fun fetchAndVerify(url: String, part: File, spec: ModelSpec, onFileProgress: (Long) -> Unit) {
-    val c = client.newCall(Request.Builder().url(url).header("Accept", "application/octet-stream").build())
-    activeCall = c
-    val md = MessageDigest.getInstance("SHA-256")
-    c.execute().use { res ->
-      if (!res.isSuccessful) throw IOException("HTTP ${res.code}")
-      val body = res.body ?: throw IOException("空响应")
-      body.byteStream().use { input ->
-        part.outputStream().use { out ->
-          val buf = ByteArray(64 * 1024)
-          var got = 0L
-          var shown = 0L
-          while (true) {
-            if (cancelled) throw IOException("已取消下载")
-            val n = input.read(buf)
-            if (n < 0) break
-            out.write(buf, 0, n)
-            md.update(buf, 0, n)
-            got += n
-            if (got - shown >= 256 * 1024) {
-              shown = got
-              onFileProgress(got)
-            }
-          }
-          onFileProgress(got)
-        }
-      }
-    }
-    if (part.length() != spec.size) throw IOException("模型大小不对 (${part.length()} != ${spec.size})")
-    if (hex(md.digest()) != spec.sha256) throw IOException("模型校验失败 (${spec.fileName})")
+    activeToken?.cancel()
   }
 
   private fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }

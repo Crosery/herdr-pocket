@@ -6,7 +6,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { inMainlandChina, releaseFromSums, releaseSources } from "@herdr-pocket/protocol";
+import { allReleaseSources, inMainlandChina, releaseFromSums, releaseSources } from "@herdr-pocket/protocol";
 import { ASSETS, compareVersions, fileMentions, findLayout, latestRelease, linkTarget, readVersion, rollback, setLink, sourcesFor, sumFor, update } from "../src/index.ts";
 
 /** Windows' own tar (bsdtar): Git's GNU tar on PATH reads `C:` in paths as a remote host. */
@@ -66,8 +66,19 @@ describe("versions", () => {
   test("mirrors come first in mainland China, after GitHub elsewhere", () => {
     const gh = "https://github.com/o/r/releases/download/v1/x.tar.gz";
     assert.deepEqual(releaseSources(gh, true), [`https://ghfast.top/${gh}`, `https://gh-proxy.com/${gh}`, gh]);
+    assert.deepEqual(allReleaseSources(gh, true), [
+      `https://ghfast.top/${gh}`,
+      `https://gh-proxy.com/${gh}`,
+      `https://cdn.gh-proxy.com/${gh}`,
+      `https://edgeone.gh-proxy.com/${gh}`,
+      gh,
+    ]);
+    assert.equal(allReleaseSources(gh, false)[0], gh);
     assert.equal(releaseSources(gh, false)[0], gh);
     assert.equal(inMainlandChina("Asia/Shanghai"), true);
+    assert.equal(inMainlandChina("Asia/Beijing"), true);
+    assert.equal(inMainlandChina("GMT+08:00", "zh-CN", 480), true);
+    assert.equal(inMainlandChina("GMT+08:00", "zh-TW", 480), false);
     assert.equal(inMainlandChina("Asia/Hong_Kong"), false);
     assert.equal(inMainlandChina("UTC"), false);
     const before = process.env.HERDR_POCKET_MIRROR;

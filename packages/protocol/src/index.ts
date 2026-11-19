@@ -1383,10 +1383,22 @@ export const LATEST_SUMS_URL = `https://github.com/${RELEASE_REPO}/releases/late
  * Time zones of mainland China. GitHub downloads crawl there (about 100 KB/s for the APK,
  * measured 2026-11), so release files come through a mirror first.
  */
-export const CHINA_TIME_ZONES: ReadonlySet<string> = new Set(["Asia/Shanghai", "Asia/Chongqing", "Asia/Chungking", "Asia/Harbin", "Asia/Urumqi", "Asia/Kashgar", "PRC"]);
+export const CHINA_TIME_ZONES: ReadonlySet<string> = new Set([
+  "Asia/Shanghai",
+  "Asia/Beijing",
+  "Asia/Chongqing",
+  "Asia/Chungking",
+  "Asia/Harbin",
+  "Asia/Urumqi",
+  "Asia/Kashgar",
+  "PRC",
+]);
 
-/** Public proxies that pass GitHub release downloads through, tried in this order. */
+/** Primary public proxies that pass GitHub release downloads through, tried in this order. */
 export const RELEASE_MIRRORS: readonly string[] = ["https://ghfast.top/", "https://gh-proxy.com/"];
+
+/** Additional healthy CDN mirrors used when probing & striping parallel chunk downloads. */
+export const RELEASE_EXTRA_MIRRORS: readonly string[] = ["https://cdn.gh-proxy.com/", "https://edgeone.gh-proxy.com/"];
 
 /** This device's IANA time zone, or "" when the runtime cannot say. */
 export function localTimeZone(): string {
@@ -1397,9 +1409,26 @@ export function localTimeZone(): string {
   }
 }
 
-/** True when the time zone is mainland China's. */
-export function inMainlandChina(timeZone: string = localTimeZone()): boolean {
-  return CHINA_TIME_ZONES.has(timeZone);
+/** This device's locale (e.g. "zh-CN"), or "" when unavailable. */
+export function localLocale(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().locale ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** True when the device is in mainland China by IANA zone (or UTC+8 + zh-CN locale when the runtime reports an offset ID). */
+export function inMainlandChina(timeZone?: string, locale?: string, utcOffsetMinutes?: number): boolean {
+  const explicit = timeZone !== undefined;
+  const tz = timeZone ?? localTimeZone();
+  if (CHINA_TIME_ZONES.has(tz)) return true;
+  if (tz === "" || /^(?:GMT|UTC)\+0?8(?::00)?$|^Etc\/GMT-8$/i.test(tz)) {
+    const loc = locale ?? (explicit ? "" : localLocale());
+    const off = utcOffsetMinutes ?? (explicit && locale === undefined ? 0 : -new Date().getTimezoneOffset());
+    if (off === 480 && (/(?:^|[-_])CN(?:$|[-_])/i.test(loc) || /^zh[-_]Hans$/i.test(loc))) return true;
+  }
+  return false;
 }
 
 /**
@@ -1410,6 +1439,12 @@ export function inMainlandChina(timeZone: string = localTimeZone()): boolean {
  */
 export function releaseSources(githubUrl: string, china: boolean): string[] {
   const mirrored = RELEASE_MIRRORS.map((m) => m + githubUrl);
+  return china ? [...mirrored, githubUrl] : [githubUrl, ...mirrored];
+}
+
+/** Full mirror set (primary + extra edge/CDN mirrors) ordered by region for active probing & parallel striping. */
+export function allReleaseSources(githubUrl: string, china: boolean): string[] {
+  const mirrored = [...RELEASE_MIRRORS, ...RELEASE_EXTRA_MIRRORS].map((m) => m + githubUrl);
   return china ? [...mirrored, githubUrl] : [githubUrl, ...mirrored];
 }
 

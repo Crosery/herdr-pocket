@@ -18,6 +18,7 @@ import {
   LATEST_SUMS_URL,
   RELEASE_REPO,
   RELEASES_PAGE,
+  allReleaseSources,
   apkAssetName,
   compareVersions,
   inMainlandChina,
@@ -114,11 +115,31 @@ async function fetchFromSums(url: string): Promise<Latest> {
   };
 }
 
-/** Sources in order until one answers; mirrors first in mainland China. */
+/** Sources in order until one answers; mirrors race concurrently in mainland China. */
 async function fetchLatest(): Promise<Latest> {
   const china = inMainlandChina();
   const sums = releaseSources(LATEST_SUMS_URL, china).map((u) => () => fetchFromSums(u));
-  const tries = china ? [...sums.slice(0, -1), fetchFromApi, sums[sums.length - 1]!] : [fetchFromApi, ...sums];
+  if (china && sums.length > 1) {
+    try {
+      return await Promise.any(
+        sums.slice(0, -1).map(async (fn) => {
+          const r = await fn();
+          if (r.kind === "unknown") throw new Error(r.why);
+          return r;
+        }),
+      );
+    } catch {
+      // Fall through to GitHub API and direct download.
+    }
+    const rest = [fetchFromApi, sums[sums.length - 1]!];
+    let last: Latest = { kind: "unknown", why: "offline" };
+    for (const attempt of rest) {
+      last = await attempt();
+      if (last.kind !== "unknown") return last;
+    }
+    return last;
+  }
+  const tries = [fetchFromApi, ...sums];
   let last: Latest = { kind: "unknown", why: "offline" };
   for (const attempt of tries) {
     last = await attempt();
@@ -230,17 +251,22 @@ export async function downloadUpdate(): Promise<void> {
   try {
     let path: string | null = null;
     let failed: unknown;
-    for (const url of releaseSources(r.url, inMainlandChina())) {
-      try {
-        path = await native.downloadUpdate(url, r.fileName, r.size, r.sha256 ?? "");
-        break;
-      } catch (e) {
-        failed = e;
-        applog("info", "update", `download of ${r.version} from ${url.replace(/^https?:\/\/([^/]+).*$/, "$1")} failed: ${(e as Error)?.message ?? String(e)}`);
-        set({ progress: 0 });
+    const urls = allReleaseSources(r.url, inMainlandChina());
+    if (native.downloadUpdateUrls) {
+      path = await native.downloadUpdateUrls(urls, r.fileName, r.size, r.sha256 ?? "");
+    } else {
+      for (const url of urls) {
+        try {
+          path = await native.downloadUpdate!(url, r.fileName, r.size, r.sha256 ?? "");
+          break;
+        } catch (e) {
+          failed = e;
+          applog("info", "update", `download of ${r.version} from ${url.replace(/^https?:\/\/([^/]+).*$/, "$1")} failed: ${(e as Error)?.message ?? String(e)}`);
+          set({ progress: 0 });
+        }
       }
     }
-    if (!path) throw failed;
+    if (!path) throw failed ?? new Error("download failed");
     set({ phase: "ready", path, progress: 1 });
     installUpdate();
   } catch (e) {

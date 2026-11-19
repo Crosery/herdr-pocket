@@ -7,13 +7,9 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
-import okhttp3.Call
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
 
 /** Lets the installer read the downloaded APK through a content:// URI. */
 class UpdateFileProvider : FileProvider()
@@ -25,12 +21,7 @@ class UpdateFileProvider : FileProvider()
  * come through a mirror) and package name.
  */
 object Updater {
-  private val client = OkHttpClient.Builder()
-    .connectTimeout(20, TimeUnit.SECONDS)
-    .readTimeout(60, TimeUnit.SECONDS)
-    .build()
-
-  @Volatile private var call: Call? = null
+  @Volatile private var activeToken: FastDownloader.CancelToken? = null
 
   private fun dir(context: Context) = File(context.cacheDir, "updates").apply { mkdirs() }
 
@@ -50,7 +41,21 @@ object Updater {
   }
 
   /** Blocking; call off the main thread. Returns the APK's path. `sha256`: "" when unknown. */
-  fun download(context: Context, url: String, name: String, size: Long, sha256: String, progress: (Long, Long) -> Unit): String {
+  fun download(context: Context, url: String, name: String, size: Long, sha256: String, progress: (Long, Long) -> Unit): String =
+    downloadUrls(context, listOf(url), name, size, sha256, progress)
+
+  /**
+   * Region-aware, probe-raced multi-mirror parallel download into cache.
+   * Returns the verified APK's path. `sha256`: "" when unknown.
+   */
+  fun downloadUrls(
+    context: Context,
+    urls: List<String>,
+    name: String,
+    size: Long,
+    sha256: String,
+    progress: (Long, Long) -> Unit,
+  ): String {
     val want = sha256.lowercase()
     require(name.matches(Regex("^[A-Za-z0-9._-]+\\.apk$"))) { "bad file name" }
     val dir = dir(context)
@@ -63,44 +68,19 @@ object Updater {
     val part = File(dir, "$name.part")
     part.delete()
 
-    val c = client.newCall(Request.Builder().url(url).header("Accept", "application/octet-stream").build())
-    call = c
-    val md = MessageDigest.getInstance("SHA-256")
+    val token = FastDownloader.CancelToken()
+    activeToken = token
     try {
-      c.execute().use { res ->
-        if (!res.isSuccessful) throw IOException("HTTP ${res.code}")
-        val body = res.body ?: throw IOException("empty response")
-        val total = body.contentLength().takeIf { it > 0 } ?: size
-        body.byteStream().use { input ->
-          part.outputStream().use { out ->
-            val buf = ByteArray(64 * 1024)
-            var got = 0L
-            var shown = 0L
-            while (true) {
-              val n = input.read(buf)
-              if (n < 0) break
-              out.write(buf, 0, n)
-              md.update(buf, 0, n)
-              got += n
-              if (got - shown >= 256 * 1024) {
-                shown = got
-                progress(got, total)
-              }
-            }
-            progress(got, total)
-          }
-        }
-      }
+      FastDownloader.download(
+        urls = urls,
+        partFile = part,
+        expectedSize = size,
+        expectedSha256 = want,
+        token = token,
+        onProgress = progress,
+      )
     } finally {
-      call = null
-    }
-    if (size > 0 && part.length() != size) {
-      part.delete()
-      throw IOException("download incomplete")
-    }
-    if (want.isNotEmpty() && hex(md.digest()) != want) {
-      part.delete()
-      throw IOException("checksum mismatch")
+      if (activeToken === token) activeToken = null
     }
     if (!isThisApp(context, part)) {
       part.delete()
@@ -112,7 +92,7 @@ object Updater {
   }
 
   fun cancel() {
-    call?.cancel()
+    activeToken?.cancel()
   }
 
   private fun isThisApp(context: Context, apk: File): Boolean {

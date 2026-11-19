@@ -140,7 +140,24 @@ export function sourcesFor(url: string): string[] {
 export async function latestRelease(): Promise<Release> {
   if (process.env.HERDR_POCKET_API) return latestFromApi();
   const sums = sourcesFor(`https://github.com/${repo()}/releases/latest/download/${ASSETS.checksums}`).map((u) => () => latestFromSums(u));
-  const tries = mirrorsFirst() ? [...sums.slice(0, -1), latestFromApi, sums[sums.length - 1]!] : [latestFromApi, ...sums];
+  if (mirrorsFirst() && sums.length > 1) {
+    try {
+      return await Promise.any(sums.slice(0, -1).map((fn) => fn()));
+    } catch {
+      // Fall through to GitHub API and direct download.
+    }
+    const rest = [latestFromApi, sums[sums.length - 1]!];
+    let first: unknown;
+    for (const attempt of rest) {
+      try {
+        return await attempt();
+      } catch (e) {
+        first ??= e;
+      }
+    }
+    throw first;
+  }
+  const tries = [latestFromApi, ...sums];
   let first: unknown;
   for (const attempt of tries) {
     try {

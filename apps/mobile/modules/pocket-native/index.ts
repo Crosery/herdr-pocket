@@ -84,6 +84,7 @@ interface PocketNativeModule {
   appVersion?(): string | null;
   /** `sha256`: the APK's expected hash, or "" when unknown. */
   downloadUpdate?(url: string, fileName: string, size: number, sha256: string): Promise<string>;
+  downloadUpdateUrls?(urls: string[], fileName: string, size: number, sha256: string): Promise<string>;
   cancelUpdate?(): void;
   installUpdate?(path: string): "started" | "permission" | "missing";
   canInstallUpdates?(): boolean;
