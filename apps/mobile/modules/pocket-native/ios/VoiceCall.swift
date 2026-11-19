@@ -85,6 +85,9 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
 
   private let useDenoise: Bool
   private let voiceThreshold: Float
+  private let configuredTier: String
+  private let effectiveTier: String
+  private let useFirstSpeaker: Bool
   private let enrolledVoice: [Float]?
   private let voicePrototypes: [[Float]]
   private var voiceModels: VoiceModels?
@@ -142,9 +145,29 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     self.token = token
     self.useDenoise = VoicePrefs.denoise
     self.voiceThreshold = VoicePrefs.threshold
-    let canFilter = VoicePrefs.filter && VoicePrefs.isCurrentEnrolled
-    self.enrolledVoice = canFilter ? VoicePrefs.embedding : nil
-    self.voicePrototypes = canFilter ? (VoicePrefs.prototypes ?? []) : []
+    let tier = VoicePrefs.voiceTier
+    self.configuredTier = tier
+    let versionOk = VoicePrefs.isCurrentEnrolled
+    let rawEnrolled = (VoicePrefs.filter && versionOk) ? VoicePrefs.embedding : nil
+    let wantIdentity = rawEnrolled != nil || VoicePrefs.firstSpeaker
+    if !wantIdentity || tier == "denoise" {
+      self.effectiveTier = "denoise"
+    } else if tier == "tse" {
+      self.effectiveTier = "tse"
+    } else if tier == "sv" {
+      self.effectiveTier = "sv"
+    } else if rawEnrolled != nil &&
+      VoiceModelManager.isTseReady() &&
+      (VoicePrefs.lastCallTseRtf <= 0 || VoicePrefs.lastCallTseRtf <= 0.85) &&
+      (VoicePrefs.benchRecommendedTier == nil || VoicePrefs.benchRecommendedTier == "tse") {
+      self.effectiveTier = "tse"
+    } else {
+      self.effectiveTier = "sv"
+    }
+    let enrolled = self.effectiveTier != "denoise" ? rawEnrolled : nil
+    self.enrolledVoice = enrolled
+    self.voicePrototypes = enrolled != nil ? (VoicePrefs.prototypes ?? []) : []
+    self.useFirstSpeaker = self.effectiveTier != "denoise" && VoicePrefs.firstSpeaker && enrolled == nil
     super.init()
   }
 
@@ -161,9 +184,9 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
       return
     }
 
-    let needSpeaker = enrolledVoice != nil && VoiceModelManager.isSvOnlyReady()
-    let ownerSample = (enrolledVoice != nil) ? VoiceModelManager.loadOwnerSample() : nil
-    let needTse = enrolledVoice != nil && ownerSample != nil && VoiceModelManager.isTseReady()
+    let needSpeaker = effectiveTier != "denoise" && (enrolledVoice != nil || useFirstSpeaker) && VoiceModelManager.isSvOnlyReady()
+    let ownerSample = (effectiveTier == "tse" && enrolledVoice != nil) ? VoiceModelManager.loadOwnerSample() : nil
+    let needTse = effectiveTier == "tse" && ownerSample != nil && VoiceModelManager.isTseReady()
 
     if useDenoise || needSpeaker || needTse {
       DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -182,7 +205,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
         }
 
         var createdFilter: VoiceFilter?
-        if let loaded, self.useDenoise || (self.enrolledVoice != nil && loaded.speaker != nil) || tseEnr != nil {
+        if let loaded, self.useDenoise || (needSpeaker && loaded.speaker != nil) || tseEnr != nil {
           createdFilter = VoiceFilter(
             loaded,
             VoiceFilter.Options(
@@ -191,7 +214,8 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
               prototypes: self.voicePrototypes,
               threshold: self.voiceThreshold,
               tseEnrollment: tseEnr,
-              needAutoOwnerSample: self.enrolledVoice != nil && ownerSample == nil
+              needAutoOwnerSample: self.effectiveTier == "tse" && self.enrolledVoice != nil && ownerSample == nil,
+              lockFirstSpeaker: self.useFirstSpeaker
             ),
             worker: { [weak self] job in self?.spkQueue.async(execute: job) },
             tseWorker: { [weak self] job in self?.tseQueue.async(execute: job) },
@@ -870,6 +894,9 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
   private func end(_ message: String) {
     if ended { return }
     emitSummaryTelemetryOnce()
+    if let f = filter, f.tseAudioMsSum > 0 {
+      VoicePrefs.lastCallTseRtf = f.tseMsSum / f.tseAudioMsSum
+    }
     ended = true
     ready = false
     VoiceCall.currentLock.lock()

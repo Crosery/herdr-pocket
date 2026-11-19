@@ -10,16 +10,16 @@
 See what Claude Code, Codex, Gemini CLI and the other agents on each of your computers are doing, right from your phone.<br />
 Message them, press keys, start new ones, or just call Xiaoyang, the assistant, and let her handle it.
 
-*Your coding agents on every computer, in your pocket: a self-hosted relay, a small daemon per computer, and an Android app with a voice assistant.*
+*Your coding agents on every computer, in your pocket: a self-hosted relay, a small daemon per computer, and mobile & desktop apps with a voice assistant.*
 
 [![Release](https://img.shields.io/github/v/release/Crosery/herdr-pocket?color=f472b6&label=release)](https://github.com/Crosery/herdr-pocket/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/Crosery/herdr-pocket/ci.yml?branch=main&label=CI)](https://github.com/Crosery/herdr-pocket/actions/workflows/ci.yml)
-![Android](https://img.shields.io/badge/app-Android-a78bfa)
+![Clients](https://img.shields.io/badge/clients-Android%20%C2%B7%20iOS%20%C2%B7%20HarmonyOS%20%C2%B7%20Desktop-a78bfa)
 ![Node](https://img.shields.io/badge/node-%E2%89%A5%2022.18-c084fc)
 ![Self-hosted](https://img.shields.io/badge/relay-self--hosted-f9a8d4)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-f472b6)](LICENSE)
 
-[Website](https://crosery.github.io/herdr-pocket/) · [Deploy](docs/deploy/README.md) · [Models and voice](docs/config.md) · [Download the Android app](https://github.com/Crosery/herdr-pocket/releases/latest) · [Website source](apps/site)
+[Website](https://crosery.github.io/herdr-pocket/) · [Deploy](docs/deploy/README.md) · [Models and voice](docs/config.md) · [Download clients](https://github.com/Crosery/herdr-pocket/releases/latest) · [Website source](apps/site)
 
 </div>
 
@@ -146,9 +146,14 @@ The computer needs Node.js 22.18 or newer. If it doesn't have one, the installer
 
 For the first device, pass the setup link instead: `… -Link https://pocket.example.com/p/<setup code>`. Details in [docs/deploy/host.md](docs/deploy/host.md#windows).
 
-### 4. Install the phone app
+### 4. Install a mobile or desktop client
 
-Download `herdr-pocket-<version>-android-arm64.apk` from [Releases](https://github.com/Crosery/herdr-pocket/releases/latest) and install it. After that the app tells you about new versions itself; one tap downloads and installs them.
+Download your platform package from [Releases](https://github.com/Crosery/herdr-pocket/releases/latest):
+
+- **Android**: `herdr-pocket-<version>-android-arm64.apk` (with in-app self-update and multi-mirror voice model download)
+- **iOS**: `herdr-pocket-<version>-ios-arm64.ipa` (unsigned `.ipa`; install via AltStore, SideStore, TrollStore, or Xcode)
+- **HarmonyOS NEXT**: `herdr-pocket-<version>-harmonyos-arm64.hap` (unsigned `.hap`; install or sign with DevEco Studio)
+- **Desktop (macOS / Windows / Linux)**: `macos-{arm64,x64}.dmg`, `windows-x64-setup.exe` / `.msi`, or `linux-x64.{AppImage,deb}`
 
 ### 5. Add more devices
 
@@ -233,7 +238,9 @@ Computer and server updates first unpack the new version into a directory next t
 | `packages/update` | Version numbers, GitHub Releases checks, in-place updates and rollback |
 | `apps/relay` | The relay and Xiaoyang the assistant |
 | `apps/hostd` | The computer-side background program and the `herdr-pocket` command line |
-| `apps/mobile` | The Android app (Expo SDK 58), not part of the root pnpm workspace |
+| `apps/mobile` | Android & iOS mobile app (Expo SDK 58), not part of the root pnpm workspace |
+| `apps/desktop` | Cross-platform desktop app (React + Tauri v2 for macOS, Windows, Linux) and shared HarmonyOS web UI |
+| `apps/harmony` | HarmonyOS NEXT Stage-Model ArkTS shell |
 | `apps/site` | Website and intro video (Vite + three.js; the video is rendered with Remotion) |
 | `deploy/`, `scripts/` | Docker, systemd, launchd, Fly, Render and k8s configs, and the install scripts |
 

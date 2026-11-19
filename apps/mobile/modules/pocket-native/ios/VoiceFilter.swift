@@ -11,6 +11,7 @@ final class VoiceFilter {
     let threshold: Float
     let tseEnrollment: VoxLockEnrollment?
     let needAutoOwnerSample: Bool
+    let lockFirstSpeaker: Bool
 
     init(
       denoise: Bool,
@@ -18,7 +19,8 @@ final class VoiceFilter {
       prototypes: [[Float]] = [],
       threshold: Float = 0.38,
       tseEnrollment: VoxLockEnrollment? = nil,
-      needAutoOwnerSample: Bool = false
+      needAutoOwnerSample: Bool = false,
+      lockFirstSpeaker: Bool = false
     ) {
       self.denoise = denoise
       self.enrolled = enrolled
@@ -26,6 +28,7 @@ final class VoiceFilter {
       self.threshold = threshold
       self.tseEnrollment = tseEnrollment
       self.needAutoOwnerSample = needAutoOwnerSample
+      self.lockFirstSpeaker = lockFirstSpeaker
     }
   }
 
@@ -131,6 +134,8 @@ final class VoiceFilter {
     return _tseChunks > 0 ? _tseMsSum / Double(_tseChunks) : 0.0
   }
   var tseMsMax: Double { tseLock.lock(); defer { tseLock.unlock() }; return _tseMsMax }
+  var tseMsSum: Double { tseLock.lock(); defer { tseLock.unlock() }; return _tseMsSum }
+  var tseAudioMsSum: Double { tseLock.lock(); defer { tseLock.unlock() }; return _tseAudioMsSum }
   var tseRtf: Double {
     tseLock.lock(); defer { tseLock.unlock() }
     return _tseAudioMsSum > 0 ? _tseMsSum / _tseAudioMsSum : 0.0
@@ -213,12 +218,13 @@ final class VoiceFilter {
     self.emit = emit
     self.onUtterance = onUtterance
 
-    let sp = (o.enrolled != nil && m.speaker != nil) ? (try? Speaker(m)) : nil
+    let wantSv = o.enrolled != nil || o.lockFirstSpeaker
+    let sp = (wantSv && m.speaker != nil) ? (try? Speaker(m)) : nil
     self.speaker = sp
-    self.hasSv = o.enrolled != nil && sp != nil
+    self.hasSv = wantSv && sp != nil
     self.enrolledNorm = o.enrolled.map { normalizeEmbedding($0) }
     self.prototypesNorm = o.prototypes.map { normalizeEmbedding($0) }
-    self.needOwnerSample = o.needAutoOwnerSample && self.hasSv
+    self.needOwnerSample = o.needAutoOwnerSample && o.enrolled != nil && self.hasSv
 
     if let enr = o.tseEnrollment, m.tseChunk != nil {
       self.tse = try? TargetExtractor(m, enrollment: enr)
@@ -621,7 +627,9 @@ final class VoiceFilter {
   }
 
   private func launchSvCheck(kind: Kind, maxSamples: Int) {
-    guard let enrolled = enrolledNorm, let sp = speaker, !cleanSpeechBuf.isEmpty else { return }
+    let enrolled = enrolledNorm
+    let lockFirst = o.lockFirstSpeaker && enrolled == nil
+    guard (enrolled != nil || lockFirst), let sp = speaker, !cleanSpeechBuf.isEmpty else { return }
     let takeLen = min(cleanSpeechBuf.count, maxSamples)
     guard takeLen >= voiceRate / 5 else { return } // at least 200 ms of clean voiced speech
     let slice = Array(cleanSpeechBuf.suffix(takeLen))
@@ -653,20 +661,35 @@ final class VoiceFilter {
         let emb = try sp.embed(slice)
         let norm = normalizeEmbedding(emb)
         normEmb = norm
-        let sv = scoreVoiceprint(norm, centroid: enrolled, prototypes: protos)
-        raw = sv.raw
-        proto = sv.proto
-        blended = sv.blended
-        if let sess {
-          sessCos = cosine(norm, sess)
-          if blended >= th - 0.12 {
-            finalScore = max(blended, 0.65 * blended + 0.35 * sessCos)
+        if let enrolled {
+          let sv = scoreVoiceprint(norm, centroid: enrolled, prototypes: protos)
+          raw = sv.raw
+          proto = sv.proto
+          blended = sv.blended
+          if let sess {
+            sessCos = cosine(norm, sess)
+            if blended >= th - 0.12 {
+              finalScore = max(blended, 0.65 * blended + 0.35 * sessCos)
+            } else {
+              finalScore = blended
+            }
           } else {
+            sessCos = raw
             finalScore = blended
           }
+        } else if let sess {
+          let sc = cosine(norm, sess)
+          raw = sc
+          proto = sc
+          blended = sc
+          sessCos = sc
+          finalScore = sc
         } else {
-          sessCos = raw
-          finalScore = blended
+          raw = 1.0
+          proto = 1.0
+          blended = 1.0
+          sessCos = 1.0
+          finalScore = 1.0
         }
       } catch {
       }
@@ -709,15 +732,31 @@ final class VoiceFilter {
       checks += 1
       checkMsSum += v.ms
       if v.ms > checkMsMax { checkMsMax = v.ms }
-      lastSvScore = v.score
 
       let req: Float = v.kind == .end ? (o.threshold - 0.03) : (o.threshold - 0.01)
-      let pass = v.score >= req
+      let firstLockMode = enrolledNorm == nil && o.lockFirstSpeaker
+      var effectiveScore = v.score
+      var pass: Bool
+      if firstLockMode {
+        if let sess = sessionEmb, let emb = v.normEmb {
+          effectiveScore = cosine(emb, sess)
+          pass = effectiveScore >= req
+        } else {
+          pass = true
+        }
+        if sessionEmb == nil, let emb = v.normEmb, (v.usedSamples >= voiceRate * 3 / 5 || v.kind == .end) {
+          sessionEmb = emb
+          pass = true
+        }
+      } else {
+        pass = effectiveScore >= req
+      }
+      lastSvScore = effectiveScore
       if pass {
         passed += 1
         svConfirmedNonOwner = false
         suppressingResidual = false
-        maybeUpdateSession(v)
+        maybeUpdateSession(v, effectiveScore: effectiveScore, firstLockMode: firstLockMode)
         maybeCaptureOwnerSample(v)
       } else {
         blocked += 1
@@ -741,7 +780,7 @@ final class VoiceFilter {
         UtteranceReport(
           kind: v.kind.rawValue,
           pass: pass,
-          svScore: Double(v.score),
+          svScore: Double(effectiveScore),
           svRaw: Double(v.raw),
           svProto: Double(v.proto),
           svSess: Double(v.sessCos),
@@ -758,9 +797,11 @@ final class VoiceFilter {
     }
   }
 
-  private func maybeUpdateSession(_ v: SvVerdict) {
+  private func maybeUpdateSession(_ v: SvVerdict, effectiveScore: Float, firstLockMode: Bool) {
     guard let emb = v.normEmb, v.usedSamples >= voiceRate * 3 / 5 else { return }
-    guard v.blended >= max(o.threshold + 0.08, 0.46) else { return }
+    let confidence = firstLockMode ? effectiveScore : v.blended
+    guard confidence >= max(o.threshold + 0.08, 0.46) else { return }
+    if firstLockMode && sessionEmb == nil { return }
     if tse != nil && !tseBypassed && smoothedTseAttenDb < -6.0 { return }
     if let cur = sessionEmb {
       var blended = [Float](repeating: 0, count: cur.count)

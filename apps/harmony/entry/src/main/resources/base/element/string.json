@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Herdr Pocket HarmonyOS NEXT 客户端"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Herdr Pocket"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Herdr Pocket"
+    },
+    {
+      "name": "mic_reason",
+      "value": "用于与小羊进行实时语音通话"
+    },
+    {
+      "name": "camera_reason",
+      "value": "用于扫描配对二维码连接服务器"
+    }
+  ]
+}

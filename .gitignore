@@ -16,6 +16,12 @@ android/
 apps/mobile/modules/pocket-native/android/build/
 apps/mobile/modules/pocket-native/android/.gradle/
 apps/mobile/modules/pocket-native/android/.cxx/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+apps/harmony/.hvigor/
+apps/harmony/**/build/
+apps/harmony/**/oh_modules/
+apps/harmony/entry/src/main/resources/rawfile/
 
 # Private: maintainer notes and local machine state
 AGENTS.local.md

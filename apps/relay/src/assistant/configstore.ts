@@ -103,8 +103,8 @@ type SavedPrompts = Partial<Record<PromptId, { sealed: Sealed; updatedAt: number
 const CONFIG_KEY = "assistant.config";
 const PROMPTS_KEY = "assistant.prompts";
 const PROVIDER_ID = /^[a-z][a-z0-9-]{0,31}$/;
-const PROTOCOLS: ModelProtocol[] = ["anthropic", "openai"];
-const AUTHS: ModelAuth[] = ["bearer", "x-api-key", "api-key", "none"];
+const PROTOCOLS: ModelProtocol[] = ["openai", "openai-responses", "anthropic", "gemini", "ollama"];
+const AUTHS: ModelAuth[] = ["bearer", "x-api-key", "api-key", "x-goog-api-key", "none"];
 const VOICES: VoiceProviderId[] = ["moss-live", "openai-realtime"];
 const MAX_MODELS = 12;
 const MAX_PROMPT = 20_000;
@@ -250,8 +250,8 @@ export class ConfigStore {
         key: keyView(apiKey, phoneKey ? "phone" : serverKey ? "server" : null),
         from: b ? "server" : "phone",
       };
-      // A server provider the relay already took without a key (a local model) needs none.
-      const keyless = auth === "none" || (b !== undefined && !b.apiKey && !o.key && originOf(b.baseUrl) === origin);
+      // A server provider the relay already took without a key (a local model) or Ollama needs none.
+      const keyless = auth === "none" || protocol === "ollama" || (b !== undefined && !b.apiKey && !o.key && originOf(b.baseUrl) === origin);
       const moved = !apiKey && (opened !== undefined || !!b?.apiKey);
       const issue = !urlOk(baseUrl, ["http:", "https:"]) ? " 的地址不对" : !apiKey && !keyless ? (moved ? " 换了地址，密钥要重新填一次" : " 还没有密钥") : undefined;
       const { apiKey: _, ...rest } = b ?? ({} as Partial<Omit<LlmTarget, "model">>);
@@ -362,6 +362,11 @@ export class ConfigStore {
     const id = typeof p?.id === "string" ? p.id.trim() : "";
     if (!PROVIDER_ID.test(id) || RESERVED.has(id)) throw new ConfigError(400, "bad_request", `服务商的名字“${id}”不行：用小写字母、数字和短横线，字母开头。`);
     const server = this.base.targets.some((t) => t.provider === id);
+    if (p.reset) {
+      if (!server) throw new ConfigError(400, "bad_request", "只有服务器上配的服务商才能恢复默认。");
+      delete next.providers[id];
+      return `provider ${id} reset`;
+    }
     if (p.remove) {
       if (server) throw new ConfigError(400, "bad_request", "服务器上配的服务商不能删，只能改，或者恢复成服务器上的设置。");
       delete next.providers[id];
@@ -376,7 +381,7 @@ export class ConfigStore {
       else delete o.label;
     }
     if (p.protocol !== undefined) {
-      if (!PROTOCOLS.includes(p.protocol)) throw new ConfigError(400, "bad_request", "协议只能是 anthropic 或 openai。");
+      if (!PROTOCOLS.includes(p.protocol)) throw new ConfigError(400, "bad_request", `协议只能是 ${PROTOCOLS.join("、")}。`);
       o.protocol = p.protocol;
     }
     if (p.baseUrl !== undefined) {

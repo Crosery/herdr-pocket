@@ -2,5 +2,7 @@ packages:
   - packages/*
   - apps/*
   - "!apps/admin"
+  - "!apps/desktop"
+  - "!apps/harmony"
   - "!apps/mobile"
   - "!apps/site"

@@ -53,7 +53,7 @@ enum VoiceLab {
   static func startEnroll() throws {
     stop()
     guard VoiceCall.current == nil else { throw callErr("正在通话中，挂断后再录声纹") }
-    guard VoiceModelManager.isSpeakerReady() else { throw callErr("声纹模型还没准备好") }
+    guard VoiceModelManager.isSvOnlyReady() else { throw callErr("声纹模型还没准备好") }
     let models = try VoiceModelManager.openModels(needSpeaker: true, needTse: false)
     guard models.speaker != nil else { throw callErr("声纹模型打不开") }
     let s = Session(kind: "enroll", models: models)

@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 enum VoicePrefs {
@@ -6,6 +7,14 @@ enum VoicePrefs {
   private static let kDenoise = "pocket.voiceDenoise"
   private static let kFilter = "pocket.voiceFilter"
   private static let kThreshold = "pocket.voiceThreshold"
+  private static let kVoiceTier = "pocket.voiceTier"
+  private static let kFirstSpeaker = "pocket.voiceFirstSpeaker"
+  private static let kLastCallTseRtf = "pocket.lastCallTseRtf"
+  private static let kBenchTier = "pocket.benchRecommendedTier"
+  private static let kBenchReason = "pocket.benchReason"
+  private static let kBenchDpdfUs = "pocket.benchDpdfUs"
+  private static let kBenchTseRtf = "pocket.benchTseRtf"
+  private static let kBenchAt = "pocket.benchAt"
   private static let kEmbedding = "pocket.voiceEmbedding"
   private static let kPrototypes = "pocket.voicePrototypes"
   private static let kModelVersion = "pocket.voiceModelVersion"
@@ -26,6 +35,65 @@ enum VoicePrefs {
       return v > 0 ? v : 0.38
     }
     set { d.set(newValue, forKey: kThreshold) }
+  }
+
+  /// `"auto" | "denoise" | "sv" | "tse"`
+  static var voiceTier: String {
+    get {
+      let raw = d.string(forKey: kVoiceTier) ?? "auto"
+      return ["auto", "denoise", "sv", "tse"].contains(raw) ? raw : "auto"
+    }
+    set {
+      let clean = ["auto", "denoise", "sv", "tse"].contains(newValue) ? newValue : "auto"
+      d.set(clean, forKey: kVoiceTier)
+    }
+  }
+
+  static var firstSpeaker: Bool {
+    get { d.object(forKey: kFirstSpeaker) == nil ? false : d.bool(forKey: kFirstSpeaker) }
+    set { d.set(newValue, forKey: kFirstSpeaker) }
+  }
+
+  static var lastCallTseRtf: Double {
+    get { d.object(forKey: kLastCallTseRtf) == nil ? -1.0 : d.double(forKey: kLastCallTseRtf) }
+    set { d.set(newValue, forKey: kLastCallTseRtf) }
+  }
+
+  static var benchRecommendedTier: String? {
+    get {
+      guard let s = d.string(forKey: kBenchTier), !s.isEmpty else { return nil }
+      return s
+    }
+    set {
+      if let v = newValue, !v.isEmpty { d.set(v, forKey: kBenchTier) }
+      else { d.removeObject(forKey: kBenchTier) }
+    }
+  }
+
+  static var benchReason: String? {
+    get {
+      guard let s = d.string(forKey: kBenchReason), !s.isEmpty else { return nil }
+      return s
+    }
+    set {
+      if let v = newValue, !v.isEmpty { d.set(v, forKey: kBenchReason) }
+      else { d.removeObject(forKey: kBenchReason) }
+    }
+  }
+
+  static var benchDpdfUs: Double {
+    get { d.object(forKey: kBenchDpdfUs) == nil ? -1.0 : d.double(forKey: kBenchDpdfUs) }
+    set { d.set(newValue, forKey: kBenchDpdfUs) }
+  }
+
+  static var benchTseRtf: Double {
+    get { d.object(forKey: kBenchTseRtf) == nil ? -1.0 : d.double(forKey: kBenchTseRtf) }
+    set { d.set(newValue, forKey: kBenchTseRtf) }
+  }
+
+  static var benchAt: Int64 {
+    get { Int64(d.double(forKey: kBenchAt)) }
+    set { d.set(Double(newValue), forKey: kBenchAt) }
   }
 
   static var embedding: [Float]? {
@@ -267,8 +335,9 @@ enum VoiceModelManager {
     size: 71_441_526,
     sha256: "bf1a75b9930474cf3389ef415e6e5d38ca96fea4a3a00f7e301d080a58ee2239",
     urls: [
+      "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
-      "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+      "https://cdn.gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
@@ -298,10 +367,11 @@ enum VoiceModelManager {
   )
 
   private static let allSpecs: [ModelSpec] = [eres2netSpec, voxlockEnrollSpec, voxlockChunkSpec]
+  static let svSize: Int64 = eres2netSpec.size // 71_441_526
   static let speakerSize: Int64 = 149_025_914
 
   private static let lock = NSLock()
-  private static var activeTask: URLSessionDownloadTask?
+  private static var activeToken: FastDownloader.CancelToken?
   private static var cancelled = false
   private static var _downloading = false
   static var downloading: Bool {
@@ -400,8 +470,103 @@ enum VoiceModelManager {
     isSpecReady(eres2netSpec)
   }
 
+  static func isTseModelsReady() -> Bool {
+    isSpecReady(voxlockEnrollSpec) && isSpecReady(voxlockChunkSpec)
+  }
+
   static func isTseReady() -> Bool {
-    isSpecReady(voxlockEnrollSpec) && isSpecReady(voxlockChunkSpec) && hasOwnerSample()
+    isTseModelsReady() && hasOwnerSample()
+  }
+
+  static func benchmarkDevice() throws -> [String: Any] {
+    let models = try openModels(needSpeaker: false, needTse: isTseModelsReady())
+    let denoiser = Denoiser(models)
+    let vad = Vad(models)
+    let hopIn = [Float](repeating: 0.01, count: Denoiser.hop)
+    var hopOut = [Float](repeating: 0, count: Denoiser.hop)
+    let vadWin = [Float](repeating: 0, count: Vad.window)
+    for _ in 0..<5 {
+      _ = try? denoiser.hop(hopIn, off: 0, out: &hopOut, outOff: 0)
+      _ = try? vad.prob(vadWin)
+    }
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    for _ in 0..<25 {
+      _ = try? denoiser.hop(hopIn, off: 0, out: &hopOut, outOff: 0)
+    }
+    let dpdfUsAvg = Double(DispatchTime.now().uptimeNanoseconds - t0) / 25.0 / 1_000.0
+
+    var benchTseRtf = -1.0
+    if models.tseEnroll != nil && models.tseChunk != nil {
+      let dummySample = [Float](repeating: 0.01, count: VoxLockEnrollment.sampleCount)
+      if let (enr, _) = try? VoxLockEnrollment.compute(models, ownerSamples: dummySample),
+         let extractor = try? TargetExtractor(models, enrollment: enr) {
+        let firstInput = [Float](repeating: 0.01, count: extractor.requiredInputSamples)
+        _ = try? extractor.step(firstInput)
+        let stepInput = [Float](repeating: 0.01, count: extractor.requiredInputSamples)
+        let ts0 = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<3 {
+          _ = try? extractor.step(stepInput)
+        }
+        let tseMsAvg = Double(DispatchTime.now().uptimeNanoseconds - ts0) / 3.0 / 1_000_000.0
+        benchTseRtf = tseMsAvg / 40.0
+      }
+    }
+
+    let cores = ProcessInfo.processInfo.activeProcessorCount
+    let ramMb = Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024))
+    var sys = utsname()
+    uname(&sys)
+    let machine = withUnsafePointer(to: &sys.machine) {
+      $0.withMemoryRebound(to: CChar.self, capacity: Int(_SYS_NAMELEN)) {
+        String(cString: $0)
+      }
+    }
+
+    let realCallTseRtf = VoicePrefs.lastCallTseRtf
+    let measuredTseRtf = max(realCallTseRtf, benchTseRtf)
+    let dpdfRtf = dpdfUsAvg / 10_000.0
+
+    let recommended: String
+    let reason: String
+    if measuredTseRtf > 0.0 {
+      if measuredTseRtf <= 0.80 {
+        recommended = "tse"
+        reason = String(format: "实测分离负载 %.0f%%（单帧降噪 %.2f ms），可流畅运行旗舰分离模型", measuredTseRtf * 100.0, dpdfUsAvg / 1000.0)
+      } else if dpdfRtf <= 0.75 {
+        recommended = "sv"
+        reason = String(format: "实测人声分离负载 %.2fx 超出实时上限，推荐 68 MB 灵巧声纹门控（不吞字、不断流）", measuredTseRtf)
+      } else {
+        recommended = "denoise"
+        reason = String(format: "设备当前负载较高（降噪单帧 %.2f ms），推荐仅开内置轻量降噪", dpdfUsAvg / 1000.0)
+      }
+    } else if dpdfUsAvg <= 1650.0 && cores >= 6 && ramMb >= 5500 {
+      recommended = "tse"
+      reason = String(format: "芯片算力充裕（降噪 %.2f ms/帧 · %d核），支持 142 MB 旗舰人声分离", dpdfUsAvg / 1000.0, cores)
+    } else if dpdfUsAvg <= 6800.0 {
+      recommended = "sv"
+      reason = String(format: "实测降噪 %.2f ms/帧（%d核），推荐 68 MB 灵巧声纹门控（稳且省空间）", dpdfUsAvg / 1000.0, cores)
+    } else {
+      recommended = "denoise"
+      reason = String(format: "实测降噪 %.2f ms/帧，推荐内置轻量降噪保证零卡顿", dpdfUsAvg / 1000.0)
+    }
+
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+    VoicePrefs.benchRecommendedTier = recommended
+    VoicePrefs.benchReason = reason
+    VoicePrefs.benchDpdfUs = dpdfUsAvg
+    if measuredTseRtf > 0.0 { VoicePrefs.benchTseRtf = measuredTseRtf }
+    VoicePrefs.benchAt = nowMs
+
+    return [
+      "recommendedTier": recommended,
+      "reason": reason,
+      "dpdfUs": dpdfUsAvg,
+      "tseRtf": measuredTseRtf > 0.0 ? measuredTseRtf : -1.0,
+      "cores": cores,
+      "ramMb": ramMb,
+      "soc": machine,
+      "at": Double(nowMs),
+    ]
   }
 
   private static func bundledModelPath(_ name: String) -> String? {
@@ -425,12 +590,19 @@ enum VoiceModelManager {
     return try VoiceModels.load(dpdfPath: dpdf, vadPath: vad, speakerPath: spk, tseEnrollPath: te, tseChunkPath: tc)
   }
 
-  static func downloadSpeaker(onProgress: @escaping (Int64, Int64) -> Void, done: @escaping (Error?) -> Void) {
-    if isSpeakerReady() {
-      onProgress(speakerSize, speakerSize)
+  static func downloadModels(
+    tier: String,
+    onProgress: @escaping (Int64, Int64) -> Void,
+    done: @escaping (Error?) -> Void
+  ) {
+    let specs = (tier == "sv") ? [eres2netSpec] : allSpecs
+    let totalSize = specs.reduce(Int64(0)) { $0 + $1.size }
+    if specs.allSatisfy({ isSpecReady($0) }) {
+      onProgress(totalSize, totalSize)
       done(nil)
       return
     }
+    let cancelToken = FastDownloader.CancelToken()
     lock.lock()
     if _downloading {
       lock.unlock()
@@ -439,26 +611,71 @@ enum VoiceModelManager {
     }
     _downloading = true
     cancelled = false
+    activeToken = cancelToken
     lock.unlock()
 
     DispatchQueue.global(qos: .userInitiated).async {
-      // Remove obsolete 28 MB CAM++ file if present from older builds.
+      defer {
+        lock.lock()
+        activeToken = nil
+        _downloading = false
+        lock.unlock()
+      }
       if let d = try? dir() {
         try? FileManager.default.removeItem(at: d.appendingPathComponent("speaker.onnx"))
         try? FileManager.default.removeItem(at: d.appendingPathComponent("speaker.ok"))
       }
-      downloadSpecAt(0, completedBytes: 0, onProgress: onProgress) { err in
-        downloading = false
-        done(err)
+      var completedBytes: Int64 = 0
+      for spec in specs {
+        if isCancelled() || cancelToken.cancelled {
+          done(NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled, userInfo: [NSLocalizedDescriptionKey: "已取消下载"]))
+          return
+        }
+        if isSpecReady(spec) {
+          completedBytes += spec.size
+          onProgress(min(totalSize, completedBytes), totalSize)
+          continue
+        }
+        do {
+          let target = try modelURL(spec)
+          let stamp = try stampURL(spec)
+          let part = target.deletingLastPathComponent().appendingPathComponent("\(spec.fileName).part")
+          try? FileManager.default.removeItem(at: part)
+          try FastDownloader.download(
+            urls: spec.urls,
+            partFile: part,
+            expectedSize: spec.size,
+            expectedSha256: spec.sha256,
+            token: cancelToken,
+            onProgress: { got, _ in
+              onProgress(min(totalSize, completedBytes + min(spec.size, got)), totalSize)
+            }
+          )
+          try? FileManager.default.removeItem(at: stamp)
+          try? FileManager.default.removeItem(at: target)
+          try FileManager.default.moveItem(at: part, to: target)
+          try "\(spec.size):\(spec.sha256)".write(to: stamp, atomically: true, encoding: .utf8)
+          completedBytes += spec.size
+          onProgress(min(totalSize, completedBytes), totalSize)
+        } catch {
+          done(error)
+          return
+        }
       }
+      onProgress(totalSize, totalSize)
+      done(nil)
     }
+  }
+
+  static func downloadSpeaker(onProgress: @escaping (Int64, Int64) -> Void, done: @escaping (Error?) -> Void) {
+    downloadModels(tier: "tse", onProgress: onProgress, done: done)
   }
 
   static func cancelDownload() {
     lock.lock()
     cancelled = true
-    let t = activeTask
-    activeTask = nil
+    let t = activeToken
+    activeToken = nil
     lock.unlock()
     t?.cancel()
   }
@@ -469,179 +686,7 @@ enum VoiceModelManager {
     return cancelled
   }
 
-  private static func downloadSpecAt(
-    _ specIdx: Int,
-    completedBytes: Int64,
-    onProgress: @escaping (Int64, Int64) -> Void,
-    done: @escaping (Error?) -> Void
-  ) {
-    if isCancelled() {
-      done(NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled, userInfo: [NSLocalizedDescriptionKey: "已取消下载"]))
-      return
-    }
-    if specIdx >= allSpecs.count {
-      onProgress(speakerSize, speakerSize)
-      done(nil)
-      return
-    }
-    let spec = allSpecs[specIdx]
-    if isSpecReady(spec) {
-      let nextCompleted = min(speakerSize, completedBytes + spec.size)
-      onProgress(nextCompleted, speakerSize)
-      downloadSpecAt(specIdx + 1, completedBytes: nextCompleted, onProgress: onProgress, done: done)
-      return
-    }
-    trySpecUrls(spec, urlIdx: 0, completedBytes: completedBytes, lastError: nil, onProgress: onProgress) { err in
-      if let err {
-        done(err)
-      } else {
-        let nextCompleted = min(speakerSize, completedBytes + spec.size)
-        onProgress(nextCompleted, speakerSize)
-        downloadSpecAt(specIdx + 1, completedBytes: nextCompleted, onProgress: onProgress, done: done)
-      }
-    }
-  }
-
-  private static func trySpecUrls(
-    _ spec: ModelSpec,
-    urlIdx: Int,
-    completedBytes: Int64,
-    lastError: Error?,
-    onProgress: @escaping (Int64, Int64) -> Void,
-    done: @escaping (Error?) -> Void
-  ) {
-    if isCancelled() {
-      done(NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled, userInfo: [NSLocalizedDescriptionKey: "已取消下载"]))
-      return
-    }
-    if urlIdx >= spec.urls.count {
-      done(lastError ?? NSError(domain: "PocketVoice", code: 3, userInfo: [NSLocalizedDescriptionKey: "下载声纹模型失败"]))
-      return
-    }
-    guard let url = URL(string: spec.urls[urlIdx]) else {
-      trySpecUrls(spec, urlIdx: urlIdx + 1, completedBytes: completedBytes, lastError: lastError, onProgress: onProgress, done: done)
-      return
-    }
-    let dl = MirrorFetch(
-      url: url,
-      expectedFileBytes: spec.size,
-      onProgress: { fileGot in
-        let cumulative = min(speakerSize, completedBytes + min(spec.size, fileGot))
-        onProgress(cumulative, speakerSize)
-      },
-      done: { result in
-        switch result {
-        case .success(let tmp):
-          do {
-            let target = try modelURL(spec)
-            let stamp = try stampURL(spec)
-            let attrs = try FileManager.default.attributesOfItem(atPath: tmp.path)
-            let gotSize = (attrs[.size] as? NSNumber)?.int64Value ?? -1
-            guard gotSize == spec.size, sha256(tmp) == spec.sha256 else {
-              try? FileManager.default.removeItem(at: tmp)
-              throw NSError(domain: "PocketVoice", code: 4, userInfo: [NSLocalizedDescriptionKey: "模型校验失败"])
-            }
-            try? FileManager.default.removeItem(at: target)
-            try FileManager.default.moveItem(at: tmp, to: target)
-            try "\(spec.size):\(spec.sha256)".write(to: stamp, atomically: true, encoding: .utf8)
-            done(nil)
-          } catch {
-            trySpecUrls(spec, urlIdx: urlIdx + 1, completedBytes: completedBytes, lastError: error, onProgress: onProgress, done: done)
-          }
-        case .failure(let err):
-          if (err as NSError).code == NSURLErrorCancelled || isCancelled() {
-            done(err)
-          } else {
-            trySpecUrls(spec, urlIdx: urlIdx + 1, completedBytes: completedBytes, lastError: err, onProgress: onProgress, done: done)
-          }
-        }
-      }
-    )
-    lock.lock()
-    activeTask = dl.start()
-    lock.unlock()
-  }
-
   private static func sha256(_ url: URL) -> String? {
-    guard let stream = InputStream(url: url) else { return nil }
-    stream.open()
-    defer { stream.close() }
-    var h = SHA256()
-    var buf = [UInt8](repeating: 0, count: 64 * 1024)
-    while stream.hasBytesAvailable {
-      let n = stream.read(&buf, maxLength: buf.count)
-      if n < 0 { return nil }
-      if n == 0 { break }
-      h.update(data: Data(bytes: buf, count: n))
-    }
-    return h.finalize().map { String(format: "%02x", $0) }.joined()
-  }
-
-  private final class MirrorFetch: NSObject, URLSessionDownloadDelegate {
-    private let url: URL
-    private let expectedFileBytes: Int64
-    private let onProgress: (Int64) -> Void
-    private let done: (Result<URL, Error>) -> Void
-    private var lastReport: Int64 = 0
-    private var finished = false
-    private var session: URLSession?
-
-    init(
-      url: URL,
-      expectedFileBytes: Int64,
-      onProgress: @escaping (Int64) -> Void,
-      done: @escaping (Result<URL, Error>) -> Void
-    ) {
-      self.url = url
-      self.expectedFileBytes = expectedFileBytes
-      self.onProgress = onProgress
-      self.done = done
-    }
-
-    func start() -> URLSessionDownloadTask {
-      let s = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-      session = s
-      let task = s.downloadTask(with: url)
-      task.resume()
-      return task
-    }
-
-    func urlSession(
-      _ session: URLSession,
-      downloadTask: URLSessionDownloadTask,
-      didWriteData bytesWritten: Int64,
-      totalBytesWritten: Int64,
-      totalBytesExpectedToWrite: Int64
-    ) {
-      let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedFileBytes
-      if totalBytesWritten - lastReport >= 256 * 1024 || totalBytesWritten >= total {
-        lastReport = totalBytesWritten
-        onProgress(totalBytesWritten)
-      }
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-      guard !finished else { return }
-      finished = true
-      defer { session.finishTasksAndInvalidate() }
-      if let http = downloadTask.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-        done(.failure(NSError(domain: "PocketVoice", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"])))
-        return
-      }
-      let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("voice-\(UUID().uuidString).onnx")
-      do {
-        try FileManager.default.copyItem(at: location, to: tmp)
-        done(.success(tmp))
-      } catch {
-        done(.failure(error))
-      }
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-      guard !finished, let error else { return }
-      finished = true
-      session.finishTasksAndInvalidate()
-      done(.failure(error))
-    }
+    FastDownloader.sha256(url)
   }
 }

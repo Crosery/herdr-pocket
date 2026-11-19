@@ -45,6 +45,8 @@ export default function AssistantScreen() {
   const call = useVoice((s) => s.status);
   const callMessage = useVoice((s) => s.message);
   const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
+  const lastSentRef = useRef<{ text: string; at: number } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [showReminders, setShowReminders] = useState(false);
@@ -77,7 +79,11 @@ export default function AssistantScreen() {
   const send = useCallback(
     async (raw: string): Promise<boolean> => {
       const t = raw.trim();
-      if (!t || sending) return false;
+      const now = Date.now();
+      if (!t || sendingRef.current) return false;
+      if (lastSentRef.current && lastSentRef.current.text === t && now - lastSentRef.current.at < 500) return false;
+      sendingRef.current = true;
+      lastSentRef.current = { text: t, at: now };
       setSending(true);
       try {
         await sendToAssistant(t);
@@ -87,10 +93,11 @@ export default function AssistantScreen() {
         setToast((e as Error).message);
         return false;
       } finally {
+        sendingRef.current = false;
         setSending(false);
       }
     },
-    [sending],
+    [],
   );
   const renderItem = useCallback(({ item }: { item: AssistantItem }) => <Bubble item={item} onError={setToast} />, []);
 

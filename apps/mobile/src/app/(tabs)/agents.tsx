@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { Pressable, RefreshControl, SectionList, View } from "react-native";
-import { Searchbar, Text } from "react-native-paper";
+import { Pressable, RefreshControl, View } from "react-native";
+import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useLocalSearchParams, useNavigation, router } from "expo-router";
+import { useIsFocused, useLocalSearchParams, useNavigation, router } from "expo-router";
+import { FlashList, type ListRenderItem } from "@shopify/flash-list";
+import { Searchbar } from "react-native-paper";
 import type { Agent, AgentStatus } from "@herdr-pocket/protocol";
 import { AgentRow, ConnectionBanner, SpaceBadge } from "../../components/agents";
 import { EmptyState, IconTile, PageBackground } from "../../components/ui";
@@ -32,25 +34,23 @@ const GROUPS: { key: GroupKey; title: string }[] = [
 const byRecent = (x: Agent, y: Agent) => (y.statusSince ?? y.updatedAt) - (x.statusSince ?? x.updatedAt);
 
 type Section = { key: GroupKey; title: string; count: number; folded: boolean; data: Agent[] };
+type AgentListRow =
+  | { kind: "header"; key: string; section: Section }
+  | { kind: "agent"; key: string; agent: Agent; lastInSection: boolean };
 
-const ROW_GAP = { height: space.sm };
-const GROUP_END = { height: space.xs };
-/** Fixed components, so a list re-render (every relay snapshot) does not remount every separator. */
-const RowGap = () => <View style={ROW_GAP} />;
-const GroupEnd = () => <View style={GROUP_END} />;
+const noopSubscribe = () => () => {};
 
 /**
- * A number that changes once a minute: rows re-render for their "N 分钟前" even when their agent did not change.
- * An external store rather than a state timer: the tab pauses while hidden, and on coming back the store is read
- * again at once, so the times are right on the first frame instead of after the next tick.
+ * A number that changes once a minute while this tab is focused: rows re-render for their
+ * "N 分钟前" even when their agent did not change, and read a fresh timestamp immediately on return.
  */
 const minuteNow = () => Math.floor(Date.now() / 60_000);
 function onMinute(changed: () => void): () => void {
   const t = setInterval(changed, 15_000);
   return () => clearInterval(t);
 }
-function useMinute(): number {
-  return useSyncExternalStore(onMinute, minuteNow);
+function useMinute(active: boolean): number {
+  return useSyncExternalStore(active ? onMinute : noopSubscribe, minuteNow);
 }
 
 /** One compact row of three counts (需要你 / 工作中 / 已完成); tap one to filter. */
@@ -118,6 +118,7 @@ export default function AgentsHub() {
   const foldedGroups = useSettings((s) => s.foldedGroups);
   const setSettings = useSettings((s) => s.set);
   const sidebar = useSidebar();
+  const focused = useIsFocused();
   const navigation = useNavigation();
   // The sidebar is a full-height overlay: hide the tab bar while it is open.
   useEffect(() => {
@@ -189,6 +190,18 @@ export default function AgentsHub() {
     });
   }, [filter, foldedGroups, inScope, isOnline, match, q]);
 
+  const rows = useMemo<AgentListRow[]>(() => {
+    const out: AgentListRow[] = [];
+    for (const s of sections) {
+      out.push({ kind: "header", key: `h:${s.key}`, section: s });
+      for (let i = 0; i < s.data.length; i++) {
+        const agent = s.data[i]!;
+        out.push({ kind: "agent", key: agent.key, agent, lastInSection: i === s.data.length - 1 });
+      }
+    }
+    return out;
+  }, [sections]);
+
   const toggleGroup = useCallback(
     (key: GroupKey) => setSettings({ foldedGroups: foldedGroups.includes(key) ? foldedGroups.filter((k) => k !== key) : [...foldedGroups, key] }),
     [foldedGroups, setSettings],
@@ -201,30 +214,48 @@ export default function AgentsHub() {
   }, []);
 
   const multiHost = hosts.length > 1 && !hostFilter;
-  const minute = useMinute();
-  const renderItem = useCallback(
-    ({ item }: { item: Agent }) => <AgentRow agent={item} offline={!isOnline(item)} deviceName={multiHost ? devices[item.deviceId]?.name : undefined} minute={minute} />,
-    [devices, isOnline, minute, multiHost],
-  );
+  const minute = useMinute(focused);
   // Search and status filters ignore folding, so the header is a plain label there.
   const canFold = !q && !filter;
-  const renderSectionHeader = useCallback(
-    ({ section }: { section: Section }) => (
-      <Pressable
-        disabled={!canFold}
-        accessibilityRole={canFold ? "button" : "header"}
-        accessibilityState={canFold ? { expanded: !section.folded } : undefined}
-        accessibilityLabel={`${section.title} ${section.count} 个${canFold ? `，点按${section.folded ? "展开" : "收起"}` : ""}`}
-        onPress={() => toggleGroup(section.key)}
-        style={({ pressed }) => ({ flexDirection: "row", alignItems: "center", gap: space.xs, minHeight: 44, marginTop: space.sm, paddingHorizontal: space.xs, borderRadius: radius.card, backgroundColor: pressed ? p.surface3 : "transparent" })}
-      >
-        <Text style={{ fontFamily: fonts.bodyBold, color: p.muted, fontSize: 14 }}>{section.title}</Text>
-        <Text style={{ flex: 1, fontFamily: fonts.bodyBold, color: p.faint, fontSize: 13 }}>{section.count}</Text>
-        {canFold ? <CuteIcon name={section.folded ? "chevronRight" : "chevronDown"} size={18} color={p.faint} /> : null}
-      </Pressable>
-    ),
-    [canFold, p, toggleGroup],
+  const renderRow = useCallback<ListRenderItem<AgentListRow>>(
+    ({ item }) => {
+      if (item.kind === "header") {
+        const { section } = item;
+        return (
+          <Pressable
+            disabled={!canFold}
+            accessibilityRole={canFold ? "button" : "header"}
+            accessibilityState={canFold ? { expanded: !section.folded } : undefined}
+            accessibilityLabel={`${section.title} ${section.count} 个${canFold ? `，点按${section.folded ? "展开" : "收起"}` : ""}`}
+            onPress={() => toggleGroup(section.key)}
+            style={({ pressed }) => ({
+              flexDirection: "row",
+              alignItems: "center",
+              gap: space.xs,
+              minHeight: 44,
+              marginTop: space.sm,
+              marginBottom: section.folded ? space.xs : 0,
+              paddingHorizontal: space.xs,
+              borderRadius: radius.card,
+              backgroundColor: pressed ? p.surface3 : "transparent",
+            })}
+          >
+            <Text style={{ fontFamily: fonts.bodyBold, color: p.muted, fontSize: 14 }}>{section.title}</Text>
+            <Text style={{ flex: 1, fontFamily: fonts.bodyBold, color: p.faint, fontSize: 13 }}>{section.count}</Text>
+            {canFold ? <CuteIcon name={section.folded ? "chevronRight" : "chevronDown"} size={18} color={p.faint} /> : null}
+          </Pressable>
+        );
+      }
+      return (
+        <View style={{ paddingBottom: item.lastInSection ? space.xs : space.sm }}>
+          <AgentRow agent={item.agent} offline={!isOnline(item.agent)} deviceName={multiHost ? devices[item.agent.deviceId]?.name : undefined} minute={minute} />
+        </View>
+      );
+    },
+    [canFold, devices, isOnline, minute, multiHost, p, toggleGroup],
   );
+  const rowKey = useCallback((r: AgentListRow) => r.key, []);
+  const rowType = useCallback((r: AgentListRow) => r.kind, []);
   const allDone = counts.blocked === 0 && counts.working === 0 && counts.done > 0;
   const headline = counts.blocked ? `有 ${counts.blocked} 个 agent 在等你` : counts.working ? `${counts.working} 个 agent 正在忙` : allDone ? "大家都忙完啦" : "大家都歇着呢";
   const hostName = hostFilter ? hosts.find((h) => h.id === hostFilter)?.name ?? "这台电脑" : null;
@@ -280,16 +311,15 @@ export default function AgentsHub() {
       <View style={{ paddingTop: insets.top + space.sm }}>
         <ConnectionBanner />
       </View>
-      <SectionList
-        sections={sections}
-        keyExtractor={(a) => a.key}
-        renderItem={renderItem}
-        renderSectionHeader={renderSectionHeader}
-        renderSectionFooter={GroupEnd}
-        ItemSeparatorComponent={RowGap}
+      <FlashList
+        data={rows}
+        keyExtractor={rowKey}
+        getItemType={rowType}
+        renderItem={renderRow}
         ListHeaderComponent={header}
         ListEmptyComponent={empty}
-        stickySectionHeadersEnabled={false}
+        removeClippedSubviews={false}
+        drawDistance={500}
         contentContainerStyle={{ paddingHorizontal: space.lg, paddingBottom: FAB + space.lg * 2, paddingTop: space.sm }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[p.primary]} />}
         keyboardShouldPersistTaps="handled"

@@ -1,7 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { makeLlm, type LlmTarget, type Msg, type ToolDef } from "../src/assistant/llm.ts";
+import { listModels, makeLlm, type LlmTarget, type Msg, type ToolDef } from "../src/assistant/llm.ts";
 
 /** One local server plays every upstream; the path says which. */
 let server: Server;
@@ -157,4 +157,81 @@ test("fallback: a provider that stays silent past the first-token limit is skipp
   const ok = await makeLlm({ targets: [t("slow", "/slow"), t("fast", "/fast")], firstByteMs: 150 })({ system: "s", messages: [{ role: "user", content: "hi" }], tools: [] });
   assert.deepEqual(ok.content, [{ type: "text", text: "到了" }]);
   await assert.rejects(makeLlm({ targets: [t("slow", "/slow"), t("empty", "/empty")], firstByteMs: 150 })({ system: "s", messages: [{ role: "user", content: "hi" }], tools: [] }), { message: "empty:m: empty answer" });
+});
+
+test("OpenAI Responses API: streams tool_call and text, lists models", async () => {
+  seen.length = 0;
+  handler = (path, _b, res) => {
+    if (path === "/resp/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ data: [{ id: "gpt-5-codex" }, { id: "gpt-4.1" }] }));
+      return;
+    }
+    if (seen.filter((s) => s.path === "/resp/v1/responses").length === 1) {
+      stream(res, [
+        { type: "response.output_item.added", output_index: 0, item: { id: "fc_1", call_id: "call_r1", type: "function_call", name: "list_agents", arguments: "" } },
+        { type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"device":"Win"}' },
+        { type: "response.output_item.done", output_index: 0, item: { id: "fc_1", call_id: "call_r1", type: "function_call", name: "list_agents", arguments: '{"device":"Win"}' } },
+        { type: "response.completed" },
+      ]);
+    } else {
+      stream(res, [
+        { type: "response.output_text.delta", delta: "全部" },
+        { type: "response.output_text.delta", delta: "正常" },
+        { type: "response.completed" },
+      ]);
+    }
+  };
+  const target: LlmTarget = { provider: "codex", protocol: "openai-responses", baseUrl: `${base}/resp/v1`, apiKey: "k-resp", model: "gpt-5-codex" };
+  assert.deepEqual(await listModels(target), ["gpt-4.1", "gpt-5-codex"]);
+  const llm = makeLlm({ targets: [target] });
+  const msgs: Msg[] = [{ role: "user", content: "查一下" }];
+  const r1 = await llm({ system: "sys", messages: msgs, tools: TOOLS, maxTokens: 120 });
+  assert.deepEqual(r1.content, [{ type: "tool_use", id: "call_r1", name: "list_agents", input: { device: "Win" } }]);
+  assert.equal(r1.stopReason, "tool_use");
+  msgs.push({ role: "assistant", content: r1.content });
+  msgs.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "call_r1", content: "ok" }] });
+  const r2 = await llm({ system: "sys", messages: msgs, tools: TOOLS });
+  assert.deepEqual(r2.content, [{ type: "text", text: "全部正常" }]);
+  const req2 = seen.at(-1)!;
+  assert.equal(req2.body.instructions, "sys");
+  assert.ok(req2.body.input.some((x: any) => x.type === "function_call" && x.call_id === "call_r1"));
+  assert.ok(req2.body.input.some((x: any) => x.type === "function_call_output" && x.call_id === "call_r1"));
+});
+
+test("Google Gemini native API: x-goog-api-key, functionCall/functionResponse and model list", async () => {
+  seen.length = 0;
+  handler = (path, _b, res) => {
+    if (path.startsWith("/gem/v1beta/models?")) {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ models: [{ name: "models/gemini-2.5-flash" }] }));
+      return;
+    }
+    stream(res, [
+      { candidates: [{ content: { parts: [{ thought: true, text: "thinking..." }] } }] },
+      { candidates: [{ content: { parts: [{ functionCall: { name: "list_agents", args: { device: "Linux" } } }] }, finishReason: "STOP" }] },
+    ]);
+  };
+  const target: LlmTarget = { provider: "gem", protocol: "gemini", baseUrl: `${base}/gem`, apiKey: "k-gem", model: "gemini-2.5-flash" };
+  assert.deepEqual(await listModels(target), ["gemini-2.5-flash"]);
+  const r = await makeLlm({ targets: [target] })({ system: "s", messages: [{ role: "user", content: "hi" }], tools: TOOLS });
+  assert.equal(seen[0]!.headers["x-goog-api-key"], "k-gem");
+  assert.equal(r.content[0]!.type, "tool_use");
+  assert.equal((r.content[0] as any).name, "list_agents");
+  assert.deepEqual((r.content[0] as any).input, { device: "Linux" });
+});
+
+test("Ollama native API: NDJSON /api/chat and /api/tags without API key", async () => {
+  seen.length = 0;
+  handler = (path, _b, res) => {
+    if (path === "/ol/api/tags") {
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ models: [{ name: "qwen3:8b" }] }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/x-ndjson" });
+    res.write(`${JSON.stringify({ message: { role: "assistant", content: "在" }, done: false })}\n`);
+    res.end(`${JSON.stringify({ message: { role: "assistant", content: "的" }, done: true })}\n`);
+  };
+  const target: LlmTarget = { provider: "ol", protocol: "ollama", baseUrl: `${base}/ol`, model: "qwen3:8b" };
+  assert.deepEqual(await listModels(target), ["qwen3:8b"]);
+  const r = await makeLlm({ targets: [target] })({ system: "s", messages: [{ role: "user", content: "在吗" }], tools: [] });
+  assert.deepEqual(r.content, [{ type: "text", text: "在的" }]);
 });

@@ -45,7 +45,7 @@ export class Screen {
   private x = 0;
   private y = 0;
   private sgr = "";
-  private saved = { x: 0, y: 0, sgr: "" };
+  private saved = { x: 0, y: 0, sgr: "", wrapNext: false };
   private top = 0;
   private bottom: number;
   private alt: Cell[][] | null = null;
@@ -192,10 +192,10 @@ export class Screen {
     }
     switch (k) {
       case "7":
-        this.saved = { x: this.x, y: this.y, sgr: this.sgr };
+        this.saved = { x: this.x, y: this.y, sgr: this.sgr, wrapNext: this.wrapNext };
         break;
       case "8":
-        ({ x: this.x, y: this.y, sgr: this.sgr } = this.saved);
+        ({ x: this.x, y: this.y, sgr: this.sgr, wrapNext: this.wrapNext } = this.saved);
         break;
       case "D":
         this.lineFeed();
@@ -205,6 +205,7 @@ export class Screen {
         this.lineFeed();
         break;
       case "M":
+        this.wrapNext = false;
         if (this.y === this.top) this.scrollDown(1);
         else if (this.y > 0) this.y--;
         break;
@@ -212,6 +213,7 @@ export class Screen {
         this.grid = this.blankGrid();
         this.x = this.y = 0;
         this.sgr = "";
+        this.wrapNext = false;
         break;
       default:
         break; // ESC H (tab set), ESC =, ESC > ...
@@ -225,7 +227,7 @@ export class Screen {
     if (/[ -/]$/.test(body)) return; // intermediate bytes: DECSCUSR etc.
     const nums = params.split(";").map((p) => parseInt(p, 10));
     const n = (idx: number, def = 1) => (Number.isFinite(nums[idx]) && nums[idx]! > 0 ? nums[idx]! : def);
-    this.wrapNext = false;
+    // Preserve pending line wrap across SGR (`m`) and DEC private mode toggles (`?2026h/l`, `?25l/h`).
     if (priv === "?") {
       if (final === "h" || final === "l") {
         for (const m of nums) if (m === 1049 || m === 1047 || m === 47) this.altScreen(final === "h");
@@ -241,57 +243,71 @@ export class Screen {
       case "f":
         this.y = this.clampY(n(0) - 1);
         this.x = this.clampX(n(1) - 1);
+        this.wrapNext = false;
         break;
       case "A":
         this.y = Math.max(this.top <= this.y ? this.top : 0, this.y - n(0));
+        this.wrapNext = false;
         break;
       case "B":
       case "e":
         this.y = Math.min(this.bottom >= this.y ? this.bottom : this.rows - 1, this.y + n(0));
+        this.wrapNext = false;
         break;
       case "C":
       case "a":
         this.x = this.clampX(this.x + n(0));
+        this.wrapNext = false;
         break;
       case "D":
         this.x = this.clampX(this.x - n(0));
+        this.wrapNext = false;
         break;
       case "E":
         this.y = this.clampY(this.y + n(0));
         this.x = 0;
+        this.wrapNext = false;
         break;
       case "F":
         this.y = this.clampY(this.y - n(0));
         this.x = 0;
+        this.wrapNext = false;
         break;
       case "G":
       case "`":
         this.x = this.clampX(n(0) - 1);
+        this.wrapNext = false;
         break;
       case "d":
         this.y = this.clampY(n(0) - 1);
+        this.wrapNext = false;
         break;
       case "J":
         this.eraseDisplay(Number.isFinite(nums[0]) ? nums[0]! : 0);
+        this.wrapNext = false;
         break;
       case "K":
         this.eraseLine(Number.isFinite(nums[0]) ? nums[0]! : 0);
+        this.wrapNext = false;
         break;
       case "X": {
         const row = this.grid[this.y]!;
         for (let x = this.x; x < Math.min(this.cols, this.x + n(0)); x++) row[x] = this.blankStyled();
+        this.wrapNext = false;
         break;
       }
       case "P": {
         const row = this.grid[this.y]!;
         row.splice(this.x, n(0));
         while (row.length < this.cols) row.push(this.blankStyled());
+        this.wrapNext = false;
         break;
       }
       case "@": {
         const row = this.grid[this.y]!;
         row.splice(this.x, 0, ...Array.from({ length: n(0) }, () => this.blankStyled()));
         row.length = this.cols;
+        this.wrapNext = false;
         break;
       }
       case "L":
@@ -301,6 +317,7 @@ export class Screen {
             this.grid.splice(this.y, 0, this.blankRow());
           }
         }
+        this.wrapNext = false;
         break;
       case "M":
         if (this.y >= this.top && this.y <= this.bottom) {
@@ -309,12 +326,15 @@ export class Screen {
             this.grid.splice(this.bottom, 0, this.blankRow());
           }
         }
+        this.wrapNext = false;
         break;
       case "S":
         this.scrollUp(n(0));
+        this.wrapNext = false;
         break;
       case "T":
         this.scrollDown(n(0));
+        this.wrapNext = false;
         break;
       case "r":
         this.top = this.clampY(n(0) - 1);
@@ -325,12 +345,13 @@ export class Screen {
         }
         this.x = 0;
         this.y = 0;
+        this.wrapNext = false;
         break;
       case "s":
-        this.saved = { x: this.x, y: this.y, sgr: this.sgr };
+        this.saved = { x: this.x, y: this.y, sgr: this.sgr, wrapNext: this.wrapNext };
         break;
       case "u":
-        ({ x: this.x, y: this.y } = this.saved);
+        ({ x: this.x, y: this.y, wrapNext: this.wrapNext } = this.saved);
         break;
       default:
         break;
@@ -380,10 +401,31 @@ export class Screen {
     if (on && !this.alt) {
       this.alt = this.grid;
       this.grid = this.blankGrid();
+      this.wrapNext = false;
     } else if (!on && this.alt) {
       this.grid = this.alt;
       this.alt = null;
+      this.wrapNext = false;
     }
+  }
+
+  resize(cols: number, rows: number): void {
+    const nextCols = Math.max(1, cols);
+    const nextRows = Math.max(1, rows);
+    if (nextCols === this.cols && nextRows === this.rows) return;
+    this.cols = nextCols;
+    this.rows = nextRows;
+    this.grid = this.grid.slice(0, nextRows).map((r) => {
+      const row = r.slice(0, nextCols);
+      while (row.length < nextCols) row.push(BLANK);
+      return row;
+    });
+    while (this.grid.length < nextRows) this.grid.push(this.blankRow());
+    this.top = 0;
+    this.bottom = nextRows - 1;
+    this.x = this.clampX(this.x);
+    this.y = this.clampY(this.y);
+    this.wrapNext = false;
   }
 
   private applySgr(params: string): void {

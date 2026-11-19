@@ -10,16 +10,16 @@
 在手机上看每台电脑里 Claude Code、Codex、Gemini CLI 这些 agent 在干什么，<br />
 给它们发消息、按键、开新的，或者直接打电话让助理小羊替你去办。
 
-*Your coding agents on every computer, in your pocket: a self-hosted relay, a small daemon per computer, and an Android app with a voice assistant.*
+*Your coding agents on every computer, in your pocket: a self-hosted relay, a small daemon per computer, and mobile & desktop apps with a voice assistant.*
 
 [![Release](https://img.shields.io/github/v/release/Crosery/herdr-pocket?color=f472b6&label=release)](https://github.com/Crosery/herdr-pocket/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/Crosery/herdr-pocket/ci.yml?branch=main&label=CI)](https://github.com/Crosery/herdr-pocket/actions/workflows/ci.yml)
-![Android](https://img.shields.io/badge/app-Android-a78bfa)
+![Clients](https://img.shields.io/badge/clients-Android%20%C2%B7%20iOS%20%C2%B7%20HarmonyOS%20%C2%B7%20Desktop-a78bfa)
 ![Node](https://img.shields.io/badge/node-%E2%89%A5%2022.18-c084fc)
 ![Self-hosted](https://img.shields.io/badge/relay-self--hosted-f9a8d4)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-f472b6)](LICENSE)
 
-[官网](https://crosery.github.io/herdr-pocket/) · [部署](docs/deploy/README.md) · [模型与语音配置](docs/config.md) · [下载安卓 App](https://github.com/Crosery/herdr-pocket/releases/latest) · [官网源码](apps/site)
+[官网](https://crosery.github.io/herdr-pocket/) · [部署](docs/deploy/README.md) · [模型与语音配置](docs/config.md) · [下载各端客户端](https://github.com/Crosery/herdr-pocket/releases/latest) · [官网源码](apps/site)
 
 </div>
 
@@ -148,9 +148,14 @@ curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/i
 
 在中国大陆，GitHub 慢的时候在脚本地址前加镜像：`https://ghfast.top/https://raw.githubusercontent.com/...`。脚本按时区判断，之后的下载和以后的更新都会自动先走镜像，见 [docs/deploy/updates.md](docs/deploy/updates.md#中国大陆)。
 
-### 4. 装手机 App
+### 4. 装手机 / 桌面客户端
 
-从 [Releases](https://github.com/Crosery/herdr-pocket/releases/latest) 下载 `herdr-pocket-<版本>-android-arm64.apk` 安装。之后的新版本 App 会自己提示，点一下就下载安装。
+从 [Releases](https://github.com/Crosery/herdr-pocket/releases/latest) 选择对应平台的安装包：
+
+- **Android**：`herdr-pocket-<版本>-android-arm64.apk`（支持应用内自动更新与多镜像声纹模型下载）
+- **iOS**：`herdr-pocket-<版本>-ios-arm64.ipa`（未签名包，可通过 AltStore、SideStore、TrollStore 或 Xcode 签名安装）
+- **鸿蒙（HarmonyOS NEXT）**：`herdr-pocket-<版本>-harmonyos-arm64.hap`（未签名 `.hap`，可用 DevEco Studio 签名安装）
+- **PC 桌面端（Windows / macOS / Linux）**：`macos-{arm64,x64}.dmg`、`windows-x64-setup.exe` / `.msi`、`linux-x64.{AppImage,deb}`
 
 ### 5. 加更多设备
 
@@ -235,7 +240,9 @@ herdr-pocket update                           # 更新到最新版本（--check 
 | `packages/update` | 版本号、GitHub Releases 检查、原地更新和回滚 |
 | `apps/relay` | 中转服务和助理小羊 |
 | `apps/hostd` | 电脑端后台程序和 `herdr-pocket` 命令行 |
-| `apps/mobile` | 安卓 App（Expo SDK 58），不在根目录的 pnpm workspace 里 |
+| `apps/mobile` | Android 与 iOS 客户端（Expo SDK 58），不在根目录的 pnpm workspace 里 |
+| `apps/desktop` | PC 桌面端（React + Tauri v2，支持 Windows / macOS / Linux）及共享鸿蒙网页前端 |
+| `apps/harmony` | HarmonyOS NEXT 原生 ArkTS 工程 |
 | `apps/site` | 官网和介绍视频（Vite + three.js，视频用 Remotion 渲染） |
 | `deploy/`、`scripts/` | Docker、systemd、launchd、Fly、Render、k8s 配置和安装脚本 |
 

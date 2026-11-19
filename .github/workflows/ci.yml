@@ -126,6 +126,25 @@ jobs:
       - run: pnpm install --frozen-lockfile --ignore-workspace
       - run: pnpm typecheck
 
+  desktop:
+    name: Desktop & Harmony UI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile --ignore-workspace
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm build:harmony
+
   image:
     name: Relay image
     runs-on: ubuntu-latest

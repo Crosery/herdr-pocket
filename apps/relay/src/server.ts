@@ -583,10 +583,14 @@ export class Relay {
         sendJson(res, 200, r);
         return;
       }
-      if (path === "/v1/assistant/config/models" && req.method === "GET") {
-        const id = new URL(req.url ?? "/", "http://relay").searchParams.get("provider") ?? "";
+      if (path === "/v1/assistant/config/models" && (req.method === "GET" || req.method === "POST")) {
+        let provider: unknown = new URL(req.url ?? "/", "http://relay").searchParams.get("provider") ?? "";
+        if (req.method === "POST") {
+          const body = (await readJson(req)) as { provider?: unknown } | undefined;
+          provider = body?.provider ?? "";
+        }
         try {
-          sendJson(res, 200, { models: await listModels(this.config.targetFor(id, "")) });
+          sendJson(res, 200, { models: await listModels(this.config.targetFor(provider as string, "")) });
         } catch (e) {
           if (e instanceof ConfigError) throw e;
           sendError(res, 502, "unsupported", `服务商没给模型列表：${(e as Error).message.slice(0, 160)}`);

@@ -143,6 +143,7 @@ export default function ModelsScreen() {
                 fastest={fastest?.i === i}
                 busy={busy}
                 onTest={() => void testModel(m)}
+                onMakeMain={() => makeMain(i)}
                 onUp={() => move(i, -1)}
                 onDown={() => move(i, 1)}
                 onRemove={() => remove(i)}
@@ -198,7 +199,7 @@ export default function ModelsScreen() {
             </View>
           ))}
           <RowDivider />
-          <Row icon="plus" title="添加服务商" sub="一个地址加一个密钥，Anthropic 或 OpenAI 兼容的都行" onPress={() => router.push("/assistant-config/provider")} />
+          <Row icon="plus" title="添加服务商" sub="一键选常用平台预设，自动扫描可用模型" onPress={() => router.push("/assistant-config/provider")} />
         </Card>
         <View style={{ paddingTop: space.sm }}>
           <Note>服务器上配的服务商可以改，不能删；手机上加的可以删。密钥只能设、不能看，App 里只显示最后几位。</Note>
@@ -274,6 +275,7 @@ function ModelItem({
   fastest,
   busy,
   onTest,
+  onMakeMain,
   onUp,
   onDown,
   onRemove,
@@ -286,6 +288,7 @@ function ModelItem({
   fastest: boolean;
   busy: boolean;
   onTest: () => void;
+  onMakeMain: () => void;
   onUp: () => void;
   onDown: () => void;
   onRemove: () => void;
@@ -312,6 +315,27 @@ function ModelItem({
         </Text>
         <TestLine test={test} />
       </Pressable>
+      {i > 0 ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`把 ${m.model} 设为主模型`}
+          disabled={busy}
+          onPress={onMakeMain}
+          hitSlop={6}
+          style={({ pressed }) => ({
+            paddingHorizontal: 10,
+            minHeight: 30,
+            justifyContent: "center",
+            borderRadius: radius.pill,
+            backgroundColor: pressed ? p.accentContainer : p.surface2,
+            borderWidth: 1,
+            borderColor: p.divider,
+            marginRight: 2,
+          })}
+        >
+          <Text style={{ fontSize: 11.5, fontFamily: fonts.bodyBold, color: p.accentText }}>设为主模型</Text>
+        </Pressable>
+      ) : null}
       <IconButton icon="chevron-up" size={20} disabled={busy || i === 0} onPress={onUp} accessibilityLabel={`${m.model} 上移`} style={{ margin: 0 }} />
       <IconButton icon="chevron-down" size={20} disabled={busy || i === count - 1} onPress={onDown} accessibilityLabel={`${m.model} 下移`} style={{ margin: 0 }} />
       <IconButton icon="trash-can-outline" size={20} disabled={busy || count === 1} onPress={onRemove} accessibilityLabel={`去掉 ${m.model}`} iconColor={p.error} style={{ margin: 0 }} />

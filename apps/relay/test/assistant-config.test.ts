@@ -291,15 +291,41 @@ test("phones change models and prompts over the API; the next message uses them 
     assert.equal(t2.json.ok, true);
     assert.equal(seen.at(-1)!.key, PHONE_KEY);
     assert.equal((await api("/v1/assistant/config", { token: phone.token })).json.providers.length, 1);
-    // What the provider lists.
+    // What the provider lists (both saved GET and unsaved draft POST).
     assert.deepEqual((await api("/v1/assistant/config/models?provider=custom", { token: phone.token })).json.models, ["careful-model", "fast-model", "new-model"]);
+    assert.deepEqual(
+      (await api("/v1/assistant/config/models", { token: phone.token, body: { provider: { id: "mine", protocol: "anthropic", baseUrl: gwUrl, apiKey: PHONE_KEY } } })).json.models,
+      ["careful-model", "fast-model", "new-model"],
+    );
+
+    // Per-provider reset restores a modified server provider without dropping a separate phone provider.
+    const mod = await api("/v1/assistant/config", {
+      token: phone.token,
+      body: {
+        rev: view.rev,
+        providers: [
+          { id: "custom", label: "MimoTmp", protocol: "openai" },
+          { id: "ollama-local", label: "Ollama", protocol: "ollama", baseUrl: gwUrl },
+        ],
+      },
+    });
+    assert.equal(mod.status, 200);
+    assert.equal(mod.json.providers.find((x: any) => x.id === "ollama-local").auth ?? "ollama", "ollama");
+    const restored = await api("/v1/assistant/config", {
+      token: phone.token,
+      body: { rev: mod.json.rev, providers: [{ id: "custom", reset: true }] },
+    });
+    assert.equal(restored.status, 200);
+    assert.equal(restored.json.providers.find((x: any) => x.id === "custom").protocol, "anthropic");
+    assert.ok(restored.json.providers.some((x: any) => x.id === "ollama-local"));
 
     // Switch the main model: the next message goes to it; the other phone is told.
-    const changed = await api("/v1/assistant/config", { token: phone.token, body: { rev: view.rev, models: [{ provider: "custom", model: "new-model" }] } });
+    const revBeforeModel = restored.json.rev;
+    const changed = await api("/v1/assistant/config", { token: phone.token, body: { rev: revBeforeModel, models: [{ provider: "custom", model: "new-model" }] } });
     assert.equal(changed.status, 200);
-    assert.equal((await api("/v1/assistant/config", { token: phone.token, body: { rev: view.rev, name: "晚了" } })).status, 409);
+    assert.equal((await api("/v1/assistant/config", { token: phone.token, body: { rev: revBeforeModel, name: "晚了" } })).status, 409);
     await new Promise((r) => setTimeout(r, 50));
-    assert.ok(frames.some((f) => f.type === "assistant_config" && f.what === "config" && f.by === "Phone A" && f.rev === view.rev + 1));
+    assert.ok(frames.some((f) => f.type === "assistant_config" && f.what === "config" && f.by === "Phone A" && f.rev === revBeforeModel + 1));
     assert.equal((await api("/v1/health")).json.assistant[0], "custom");
 
     // A prompt edit from the phone is what the model gets next.

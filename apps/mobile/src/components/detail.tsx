@@ -644,6 +644,7 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   const [pictures, setPictures] = useState<Attachment[]>([]);
   const [picking, setPicking] = useState(false);
   const [extra, setExtra] = useState(false);
+  const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   /** The host cannot take direct typing: fall back to the one-line box. */
   const [boxOnly, setBoxOnly] = useState(false);
@@ -706,6 +707,10 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     const t = text.trim();
     const pics = mode === "chat" ? pictures : [];
     if (!t && !pics.length) return;
+    const now = Date.now();
+    const sig = `${agent.key}\0${t}\0${pics.map((x) => x.id).join(",")}`;
+    if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 500) return;
+    lastSendRef.current = { sig, at: now };
     // The message shows in the conversation at once, with its own state; the box is free for the next one.
     setText("");
     if (pics.length) setPictures((cur) => cur.filter((x) => !pics.includes(x)));

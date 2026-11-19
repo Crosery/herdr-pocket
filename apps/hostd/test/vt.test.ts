@@ -47,3 +47,14 @@ test("screen model: split escape sequences across writes", () => {
 test("sgrOnly keeps colors and drops cursor/OSC escapes", () => {
   assert.equal(sgrOnly("\x1b[?25l\x1b]0;t\x07\x1b[1;31mhi\x1b[0m\x1b[K\r\n"), "\x1b[1;31mhi\x1b[0m\n");
 });
+
+test("screen model: SGR reset or private mode at right margin keeps delayed wrap and avoids duplicate redraw lines", () => {
+  // Exact 10-column line wrapped with SGR reset (\x1b[0m) and synchronized-output toggle (\x1b[?2026h)
+  const s = new Screen(10, 6);
+  s.write("\x1b[36mabcdefghij\x1b[0m\x1b[?2026hMORE\x1b[?2026l\r\n\r\nstatus1\r\n");
+  // Ink redraws from cursor row up by 2 rows (replacing empty line + status1, leaving prompt untouched)
+  s.write("\x1b[2A\x1b[2Kmid\r\n\x1b[2Kstatus2\r\n");
+  const lines = s.toText().split("\n");
+  assert.equal(lines.filter((l) => l.includes("abcdefghij")).length, 1);
+  assert.deepEqual(lines, ["abcdefghij", "MORE", "mid", "status2"]);
+});

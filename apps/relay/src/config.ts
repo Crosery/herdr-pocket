@@ -72,8 +72,8 @@ type Env = Record<string, string | undefined>;
 
 /** Words already used by other POCKET_* settings; a provider cannot take them as its id. */
 export const RESERVED = new Set(["assistant", "voice", "moss", "admin", "public", "trust", "port", "host", "db", "config"]);
-const PROTOCOLS: Protocol[] = ["anthropic", "openai"];
-const AUTHS: AuthStyle[] = ["bearer", "x-api-key", "api-key", "none"];
+const PROTOCOLS: Protocol[] = ["openai", "openai-responses", "anthropic", "gemini", "ollama"];
+const AUTHS: AuthStyle[] = ["bearer", "x-api-key", "api-key", "x-goog-api-key", "none"];
 
 export function loadModelSetup(env: Env, read: (path: string) => string = (p) => readFileSync(p, "utf8")): ModelSetup {
   const out: ModelSetup = { timeZone: DEFAULT_TIME_ZONE, warnings: [], errors: [], summary: { assistant: [], voice: null } };
@@ -143,7 +143,7 @@ function assistantSetup(e: (n: string) => string | undefined, file: FileConfig, 
     // `custom` stays on the Anthropic protocol unless told otherwise: that is what POCKET_ASSISTANT_URL always meant.
     const protocol = (e(`${P}PROTOCOL`) ?? (isDefault ? e("POCKET_ASSISTANT_PROTOCOL") : undefined) ?? fp.protocol ?? (isDefault ? fa.protocol : undefined) ?? preset?.protocol ?? (id === "custom" ? "anthropic" : "openai")).toLowerCase();
     const auth = (e(`${P}AUTH`) ?? fp.auth)?.toLowerCase();
-    let extraBody = fp.extraBody;
+    let extraBody = fp.extraBody ?? preset?.extraBody;
     const extraEnv = e(`${P}EXTRA_BODY`);
     if (extraEnv) {
       try {
@@ -154,7 +154,7 @@ function assistantSetup(e: (n: string) => string | undefined, file: FileConfig, 
       }
     }
     if (!PROTOCOLS.includes(protocol as Protocol)) {
-      out.warnings.push(`assistant: provider "${id}" has an unknown protocol "${protocol}" (anthropic or openai); its models are skipped.`);
+      out.warnings.push(`assistant: provider "${id}" has an unknown protocol "${protocol}" (${PROTOCOLS.join(", ")}); its models are skipped.`);
       return null;
     }
     if (auth && !AUTHS.includes(auth as AuthStyle)) {
@@ -170,7 +170,7 @@ function assistantSetup(e: (n: string) => string | undefined, file: FileConfig, 
       out.warnings.push(`assistant: provider "${id}" has an invalid base URL "${baseUrl}"; its models are skipped.`);
       return null;
     }
-    if (!apiKey && !preset?.keyless && auth !== "none") {
+    if (!apiKey && !preset?.keyless && auth !== "none" && protocol !== "ollama") {
       out.warnings.push(`assistant: provider "${id}" has no key (set ${isDefault ? "POCKET_ASSISTANT_KEY or " : ""}${P}API_KEY); its models are skipped.`);
       return null;
     }

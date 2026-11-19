@@ -593,8 +593,32 @@ export interface AssistantSettings {
 // it, "reset" goes back to it. Keys go one way: a phone can set or clear one,
 // it never reads one back (only whether one is set and its last characters).
 
-export type ModelProtocol = "anthropic" | "openai";
-export type ModelAuth = "bearer" | "x-api-key" | "api-key" | "none";
+export type ModelProtocol = "openai" | "openai-responses" | "anthropic" | "gemini" | "ollama";
+export type ModelAuth = "bearer" | "x-api-key" | "api-key" | "x-goog-api-key" | "none";
+
+export interface ProviderPresetItem {
+  id: string;
+  label: string;
+  protocol: ModelProtocol;
+  baseUrl: string;
+  auth?: ModelAuth;
+  recommendedModel?: string;
+}
+
+export const PROVIDER_PRESETS: readonly ProviderPresetItem[] = [
+  { id: "mimo", label: "小米 MiMo", protocol: "openai", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", recommendedModel: "mimo-v2.6-flash" },
+  { id: "deepseek", label: "DeepSeek", protocol: "openai", baseUrl: "https://api.deepseek.com/v1", recommendedModel: "deepseek-chat" },
+  { id: "openai", label: "OpenAI", protocol: "openai", baseUrl: "https://api.openai.com/v1", recommendedModel: "gpt-4.1-mini" },
+  { id: "openai-codex", label: "OpenAI Responses / Codex", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", recommendedModel: "gpt-5-codex" },
+  { id: "anthropic", label: "Anthropic Claude", protocol: "anthropic", baseUrl: "https://api.anthropic.com", recommendedModel: "claude-sonnet-4-5" },
+  { id: "gemini", label: "Google Gemini 原生", protocol: "gemini", baseUrl: "https://generativelanguage.googleapis.com", recommendedModel: "gemini-2.5-flash" },
+  { id: "qwen", label: "通义千问 (DashScope)", protocol: "openai", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", recommendedModel: "qwen-plus" },
+  { id: "moonshot", label: "Moonshot Kimi", protocol: "openai", baseUrl: "https://api.moonshot.cn/v1", recommendedModel: "kimi-k2-0711-preview" },
+  { id: "zhipu", label: "智谱 GLM", protocol: "openai", baseUrl: "https://open.bigmodel.cn/api/paas/v4", recommendedModel: "glm-4.5-air" },
+  { id: "siliconflow", label: "SiliconFlow", protocol: "openai", baseUrl: "https://api.siliconflow.cn/v1" },
+  { id: "openrouter", label: "OpenRouter", protocol: "openai", baseUrl: "https://openrouter.ai/api/v1" },
+  { id: "ollama", label: "Ollama 本地", protocol: "ollama", baseUrl: "http://localhost:11434", auth: "none" },
+] as const;
 
 /** Where a value comes from: the server's own settings, or a phone. */
 export type ConfigSource = "server" | "phone";
@@ -700,6 +724,8 @@ export interface ProviderPatch {
   apiKey?: string | null;
   /** Remove a provider a phone added (a server one can only be reset). */
   remove?: boolean;
+  /** Reset a server-defined provider back to the server's settings without touching other config. */
+  reset?: boolean;
 }
 
 export interface VoicePatch {
@@ -1456,7 +1482,7 @@ export function releaseFromSums(listing: string): { version: string; sums: Recor
     const m = /^([0-9a-f]{64})\s+\*?(\S+)\s*$/i.exec(line.trim());
     if (!m) continue;
     sums[m[2]!] = m[1]!.toLowerCase();
-    const v = /^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:-android-arm64\.apk|\.tar\.gz)$/.exec(m[2]!);
+    const v = /^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:-(?:android-arm64\.apk|ios-arm64\.ipa|harmonyos-arm64\.hap|macos-(?:arm64|x64)\.dmg|windows-x64(?:-setup\.exe|\.msi)|linux-x64(?:\.deb|\.AppImage))|\.tar\.gz)$/.exec(m[2]!);
     if (v && !version) version = v[1]!;
   }
   return version ? { version, sums } : null;

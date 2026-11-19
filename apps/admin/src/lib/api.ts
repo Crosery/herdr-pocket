@@ -24,8 +24,40 @@ export function setSavedToken(token: string): void {
 export type DeviceKind = "host" | "viewer";
 export type AgentStatus = "working" | "blocked" | "done" | "idle" | "unknown";
 export type VoiceProviderId = "moss-live" | "openai-realtime";
-export type ModelProtocol = "anthropic" | "openai";
-export type ModelAuth = "bearer" | "x-api-key" | "api-key" | "none";
+export type ModelProtocol = "openai" | "openai-responses" | "anthropic" | "gemini" | "ollama";
+export type ModelAuth = "bearer" | "x-api-key" | "api-key" | "x-goog-api-key" | "none";
+
+export const PROTOCOL_LABEL: Record<ModelProtocol, string> = {
+  openai: "OpenAI 兼容",
+  "openai-responses": "Responses / Codex",
+  anthropic: "Anthropic",
+  gemini: "Google Gemini",
+  ollama: "Ollama 本地",
+};
+
+export interface AdminPresetItem {
+  id: string;
+  label: string;
+  protocol: ModelProtocol;
+  baseUrl: string;
+  auth?: ModelAuth;
+  recommendedModel?: string;
+}
+
+export const ADMIN_PROVIDER_PRESETS: readonly AdminPresetItem[] = [
+  { id: "mimo", label: "小米 MiMo", protocol: "openai", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", recommendedModel: "mimo-v2.6-flash" },
+  { id: "deepseek", label: "DeepSeek", protocol: "openai", baseUrl: "https://api.deepseek.com/v1", recommendedModel: "deepseek-chat" },
+  { id: "openai", label: "OpenAI", protocol: "openai", baseUrl: "https://api.openai.com/v1", recommendedModel: "gpt-4.1-mini" },
+  { id: "openai-codex", label: "OpenAI Responses / Codex", protocol: "openai-responses", baseUrl: "https://api.openai.com/v1", recommendedModel: "gpt-5-codex" },
+  { id: "anthropic", label: "Anthropic Claude", protocol: "anthropic", baseUrl: "https://api.anthropic.com", recommendedModel: "claude-sonnet-4-5" },
+  { id: "gemini", label: "Google Gemini 原生", protocol: "gemini", baseUrl: "https://generativelanguage.googleapis.com", recommendedModel: "gemini-2.5-flash" },
+  { id: "qwen", label: "通义千问", protocol: "openai", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", recommendedModel: "qwen-plus" },
+  { id: "moonshot", label: "Moonshot Kimi", protocol: "openai", baseUrl: "https://api.moonshot.cn/v1", recommendedModel: "kimi-k2-0711-preview" },
+  { id: "zhipu", label: "智谱 GLM", protocol: "openai", baseUrl: "https://open.bigmodel.cn/api/paas/v4", recommendedModel: "glm-4.5-air" },
+  { id: "siliconflow", label: "SiliconFlow", protocol: "openai", baseUrl: "https://api.siliconflow.cn/v1" },
+  { id: "openrouter", label: "OpenRouter", protocol: "openai", baseUrl: "https://openrouter.ai/api/v1" },
+  { id: "ollama", label: "Ollama 本地", protocol: "ollama", baseUrl: "http://localhost:11434", auth: "none" },
+];
 
 export interface Device {
   id: string;
@@ -260,10 +292,12 @@ export const adminApi = {
   config: () => reqJson<AssistantConfigView>("/v1/assistant/config"),
   saveConfig: (patch: Record<string, unknown>) =>
     reqJson<AssistantConfigView>("/v1/assistant/config", { method: "POST", body: JSON.stringify(patch) }),
-  testModel: (provider: string, model: string) =>
+  testModel: (provider: string | Record<string, unknown>, model: string) =>
     reqJson<ModelTestResult>("/v1/assistant/config/test", { method: "POST", body: JSON.stringify({ provider, model }) }),
-  fetchProviderModels: (provider: string) =>
-    reqJson<{ models: string[] }>(`/v1/assistant/config/models?provider=${encodeURIComponent(provider)}`),
+  fetchProviderModels: (provider: string | Record<string, unknown>) =>
+    typeof provider === "string"
+      ? reqJson<{ models: string[] }>(`/v1/assistant/config/models?provider=${encodeURIComponent(provider)}`)
+      : reqJson<{ models: string[] }>("/v1/assistant/config/models", { method: "POST", body: JSON.stringify({ provider }) }),
   voices: (provider: VoiceProviderId) =>
     reqJson<VoiceCatalogResponse>(`/v1/assistant/config/voices?provider=${encodeURIComponent(provider)}`),
   prompts: () => reqJson<{ prompts: PromptView[] }>("/v1/assistant/prompts"),

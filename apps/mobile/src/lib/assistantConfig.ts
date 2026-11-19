@@ -57,7 +57,13 @@ export const useAssistantConfig = create<ConfigStore>()(() => ({ ...EMPTY }));
 export const CONFLICT_TEXT = "另一台手机刚改过，已刷新，再改一次";
 const OLD_RELAY = "服务器还不支持在手机上改这些，更新服务器后就能用";
 
-export const PROTOCOL_LABEL: Record<ModelProtocol, string> = { anthropic: "Anthropic", openai: "OpenAI 兼容" };
+export const PROTOCOL_LABEL: Record<ModelProtocol, string> = {
+  openai: "OpenAI 兼容",
+  "openai-responses": "Responses / Codex",
+  anthropic: "Anthropic",
+  gemini: "Google Gemini",
+  ollama: "Ollama 本地",
+};
 export const VOICE_LABEL: Record<VoiceProviderId, string> = { "moss-live": "MOSS-Live", "openai-realtime": "OpenAI Realtime 兼容" };
 
 export const modelKey = (m: ModelRef) => `${m.provider}:${m.model}`;
@@ -219,11 +225,14 @@ async function runTest(body: { provider: string | ProviderPatch; model: string }
   }
 }
 
-/** The model names a provider lists; empty when it lists none. */
-export async function listProviderModels(provider: string): Promise<string[]> {
+/** The model names a provider lists (saved provider id or unsaved draft ProviderPatch); empty when it lists none. */
+export async function listProviderModels(provider: string | ProviderPatch): Promise<string[]> {
   try {
     if (demo()) return await mockConfig.models(provider);
-    const r = await request<{ models?: string[] }>(`/v1/assistant/config/models?provider=${encodeURIComponent(provider)}`, { timeoutMs: 20_000 });
+    const r =
+      typeof provider === "string"
+        ? await request<{ models?: string[] }>(`/v1/assistant/config/models?provider=${encodeURIComponent(provider)}`, { timeoutMs: 20_000 })
+        : await request<{ models?: string[] }>("/v1/assistant/config/models", { body: { provider }, timeoutMs: 20_000 });
     return Array.isArray(r.models) ? r.models : [];
   } catch (e) {
     throw asRequestError(e);

@@ -1,12 +1,14 @@
 # A tag vX.Y.Z builds and publishes a release:
-#   herdr-pocket-X.Y.Z.tar.gz               relay + host bundle (what installers and `update` use)
-#   herdr-pocket-X.Y.Z-android-arm64.apk    the Android app (what the in-app updater uses)
-#   SHA256SUMS                              checksums of both
-#   ghcr.io/<owner>/herdr-pocket-relay:X.Y.Z, :X.Y and :latest (multi-arch relay image)
-# The version is stamped from the tag (scripts/set-version.mjs) before anything is built.
-# APK signing: repository secrets ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
-# ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD (docs/deploy/updates.md). Without them the APK is
-# signed with the public debug key and the job says so.
+#   herdr-pocket-X.Y.Z.tar.gz                     relay + host bundle (installers & `update`)
+#   herdr-pocket-X.Y.Z-android-arm64.apk          Android app
+#   herdr-pocket-X.Y.Z-ios-arm64.ipa              iOS unsigned sideload package
+#   herdr-pocket-X.Y.Z-harmonyos-arm64.hap        HarmonyOS NEXT unsigned HAP
+#   herdr-pocket-X.Y.Z-macos-{arm64,x64}.dmg      macOS desktop installers
+#   herdr-pocket-X.Y.Z-windows-x64-setup.exe      Windows desktop NSIS installer
+#   herdr-pocket-X.Y.Z-windows-x64.msi            Windows desktop MSI installer
+#   herdr-pocket-X.Y.Z-linux-x64.{deb,AppImage}   Linux desktop packages
+#   SHA256SUMS                                    checksums of all artifacts
+#   ghcr.io/<owner>/herdr-pocket-relay:X.Y.Z, :X.Y and :latest
 name: Release
 
 on:
@@ -105,10 +107,8 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ needs.meta.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.meta.outputs.tag }}
-      # A path context, so the stamped version is in the image.
       - uses: docker/build-push-action@v7
         env:
-          # The job summary is enough; no build-record artifact.
           DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
@@ -139,7 +139,6 @@ jobs:
           distribution: temurin
           java-version: 21
       - uses: android-actions/setup-android@v4
-      # Version name and versionCode go into app.json; prebuild carries them into android/.
       - run: node scripts/set-version.mjs "$VERSION"
       - name: Generate android/
         working-directory: apps/mobile
@@ -171,9 +170,6 @@ jobs:
           apk="$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-android-arm64.apk"
           cp app/build/outputs/apk/release/app-release.apk "$apk"
           apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
-          # Fails the job when the APK does not verify. The summary only shows who signed it;
-          # its wording differs between build-tools ("Signer #1 certificate DN" before 37,
-          # "V2 Signer: certificate DN" since), so it never fails the job itself.
           certs=$("$apksigner" verify --print-certs "$apk")
           {
             echo "### APK signer"
@@ -188,8 +184,194 @@ jobs:
           path: dist/herdr-pocket-${{ needs.meta.outputs.version }}-android-arm64.apk
           if-no-files-found: error
 
+  ios:
+    needs: meta
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      XCODE_APP: /Applications/Xcode_26.6.app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/mobile/pnpm-lock.yaml
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version | tee /dev/stderr | grep -q "^Xcode 26.6"
+      - run: node scripts/set-version.mjs "$VERSION"
+      - name: Native project
+        working-directory: apps/mobile
+        run: |
+          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm exec expo prebuild --platform ios --no-install
+          cd ios && pod install
+      - name: Archive unsigned IPA
+        working-directory: apps/mobile/ios
+        run: |
+          xcodebuild archive -workspace HerdrPocket.xcworkspace -scheme HerdrPocket -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/HerdrPocket.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" -quiet
+          mkdir -p "$RUNNER_TEMP/ipa/Payload" "$GITHUB_WORKSPACE/dist"
+          cp -R "$RUNNER_TEMP/HerdrPocket.xcarchive/Products/Applications/"*.app "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-ios-arm64.ipa" Payload)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ios
+          path: dist/herdr-pocket-${{ needs.meta.outputs.version }}-ios-arm64.ipa
+          if-no-files-found: error
+
+  harmony:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: node scripts/set-version.mjs "$VERSION"
+      # Must run on Node 24 before setup-ohos prepends Node 18 to PATH.
+      - name: Build web rawfile bundle
+        working-directory: apps/desktop
+        run: |
+          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm build:harmony
+      - name: Install SDK runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: ErBWs/setup-ohos@v2
+        with:
+          version: '6.1.1.280'
+          cache: true
+      - name: Build unsigned HAP
+        working-directory: apps/harmony
+        run: |
+          ohpm install --all
+          hvigorw assembleHap --mode module -p module=entry@default -p product=default -p buildMode=release --no-daemon
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp entry/build/default/outputs/default/entry-default-unsigned.hap \
+            "$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-harmonyos-arm64.hap"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: harmony
+          path: dist/herdr-pocket-${{ needs.meta.outputs.version }}-harmonyos-arm64.hap
+          if-no-files-found: error
+
+  desktop:
+    needs: meta
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app
+            artifact: desktop-macos-arm64
+            arch: arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app
+            artifact: desktop-macos-x64
+            arch: x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            artifact: desktop-windows-x64
+            arch: x64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+            artifact: desktop-linux-x64
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: ${{ matrix.artifact }}
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: node scripts/set-version.mjs "$VERSION"
+      - name: Install JS deps
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile --ignore-workspace
+      - name: Build Tauri bundle
+        working-directory: apps/desktop
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+        run: pnpm exec tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Collect Unix packages
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          base="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            app=$(find "$base/macos" -maxdepth 1 -name "*.app" | head -n 1)
+            hdiutil create -volname "Herdr Pocket" -srcfolder "$app" -ov -format UDZO \
+              "dist/herdr-pocket-$VERSION-macos-${{ matrix.arch }}.dmg"
+          else
+            deb=$(find "$base/deb" -maxdepth 1 -name "*.deb" | head -n 1)
+            appimg=$(find "$base/appimage" -maxdepth 1 -name "*.AppImage" | head -n 1)
+            cp "$deb" "dist/herdr-pocket-$VERSION-linux-x64.deb"
+            cp "$appimg" "dist/herdr-pocket-$VERSION-linux-x64.AppImage"
+          fi
+      - name: Collect Windows packages
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $base = "apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          $exe = Get-ChildItem "$base/nsis/*.exe" | Select-Object -First 1
+          $msi = Get-ChildItem "$base/msi/*.msi" | Select-Object -First 1
+          Copy-Item $exe.FullName "dist/herdr-pocket-$env:VERSION-windows-x64-setup.exe"
+          Copy-Item $msi.FullName "dist/herdr-pocket-$env:VERSION-windows-x64.msi"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/herdr-pocket-*
+          if-no-files-found: error
+
   release:
-    needs: [meta, bundle, image, android]
+    needs: [meta, bundle, image, android, ios, harmony, desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -200,8 +382,6 @@ jobs:
       PRERELEASE: ${{ needs.meta.outputs.prerelease }}
       IMAGE: ${{ needs.image.outputs.image }}
     steps:
-      # Only what the release ships: other jobs' artifacts (e.g. a Docker build
-      # record) must not end up in the release or in SHA256SUMS.
       - uses: actions/download-artifact@v8
         with:
           name: bundle
@@ -210,19 +390,33 @@ jobs:
         with:
           name: apk
           path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: ios
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: harmony
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-*
+          path: dist
+          merge-multiple: true
       - run: |
           cd dist
-          sha256sum -- * > SHA256SUMS
+          LC_ALL=C sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       - name: Publish
         run: |
           cat > notes.md <<EOF
           Relay image: \`$IMAGE:$VERSION\` (also \`:latest\` for releases)
 
-          - Server: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-relay.sh | sudo bash -s -- --domain pocket.example.com\`
-          - Computer: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-host.sh | bash -s -- --server https://pocket.example.com\`
-          - Windows computer (PowerShell): \`& ([scriptblock]::Create((irm https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-host.ps1))) -Server https://pocket.example.com\`
-          - Update: \`herdr-pocket update\` on computers, \`sudo herdr-pocket-relay update\` on the server; the app offers the new APK itself.
+          - **Server**: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-relay.sh | sudo bash -s -- --domain pocket.example.com\`
+          - **Computer daemon**: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-host.sh | bash -s -- --server https://pocket.example.com\` (Windows: \`install-host.ps1\`)
+          - **Mobile clients**: Android (\`.apk\`), iOS (\`.ipa\` unsigned sideload), HarmonyOS NEXT (\`.hap\` unsigned)
+          - **Desktop clients**: macOS (\`arm64\`/\`x64\` \`.dmg\`), Windows (\`-setup.exe\`/\`.msi\`), Linux (\`.AppImage\`/\`.deb\`)
+          - **Update**: \`herdr-pocket update\` on computers, \`sudo herdr-pocket-relay update\` on the server, or check inside the client settings.
           EOF
           flags=()
           [ "$PRERELEASE" = true ] && flags+=(--prerelease)

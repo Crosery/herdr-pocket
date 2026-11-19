@@ -80,6 +80,7 @@ const VOICE_DEFAULTS: Record<VoiceProviderId, { url: string; model: string; spee
 /** What each demo provider lists, and how fast each model answers (first word, whole answer). */
 const LISTS: Record<string, string[]> = {
   custom: ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-6.1-luna", "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"],
+  mimo: ["mimo-v2.6-flash", "mimo-v2.6-pro"],
   deepseek: ["deepseek-chat", "deepseek-reasoner"],
 };
 const SPEED: Record<string, [number, number]> = {
@@ -121,16 +122,17 @@ function providerViews(s: DemoSaved): Map<string, { view: ProviderView; issue?: 
     const o = s.providers[id] ?? {};
     const key = keyView(o.key, b?.key);
     const auth = o.auth ?? b?.auth;
+    const protocol = o.protocol ?? b?.protocol ?? "openai";
     const view: ProviderView = {
       id,
       ...(o.label ?? b?.label ? { label: o.label ?? b?.label } : {}),
-      protocol: o.protocol ?? b?.protocol ?? "openai",
+      protocol,
       baseUrl: o.baseUrl ?? b?.baseUrl ?? "",
       ...(auth ? { auth } : {}),
       key,
       from: b ? "server" : "phone",
     };
-    const issue = !urlOk(view.baseUrl, ["http:", "https:"]) ? " 的地址不对" : !key.set && auth !== "none" ? " 还没有密钥" : undefined;
+    const issue = !urlOk(view.baseUrl, ["http:", "https:"]) ? " 的地址不对" : !key.set && auth !== "none" && protocol !== "ollama" ? " 还没有密钥" : undefined;
     out.set(id, { view, ...(issue ? { issue } : {}) });
   }
   return out;
@@ -182,6 +184,11 @@ function applyProvider(next: DemoSaved, p: ProviderPatch) {
   const id = p.id?.trim() ?? "";
   if (!PROVIDER_ID.test(id)) fail(400, "bad_request", `服务商的名字“${id}”不行：用小写字母、数字和短横线，字母开头。`);
   const server = id in SERVER.providers;
+  if (p.reset) {
+    if (!server) fail(400, "bad_request", "只有服务器上配的服务商才能恢复默认。");
+    delete next.providers[id];
+    return;
+  }
   if (p.remove) {
     if (server) fail(400, "bad_request", "服务器上配的服务商不能删，只能改，或者恢复成服务器上的设置。");
     delete next.providers[id];
@@ -348,10 +355,18 @@ export const mockConfig = {
     await wait(Math.min(totalMs, 3200));
     return { ok: true, firstMs, totalMs, reply: "你好，我在。" };
   },
-  async models(provider: string): Promise<string[]> {
-    await wait(450);
-    if (!providerViews(saved).has(provider)) fail(404, "not_found", `没有叫 ${provider} 的服务商。`);
-    return LISTS[provider] ?? [];
+  async models(provider: string | ProviderPatch): Promise<string[]> {
+    await wait(350);
+    if (typeof provider === "string") {
+      if (!providerViews(saved).has(provider)) fail(404, "not_found", `没有叫 ${provider} 的服务商。`);
+      return LISTS[provider] ?? [];
+    }
+    const next: DemoSaved = JSON.parse(JSON.stringify(saved)) as DemoSaved;
+    applyProvider(next, { ...provider, remove: false });
+    const p = providerViews(next).get(provider.id);
+    if (!p || p.issue) fail(400, "bad_request", `${p?.view.label ?? provider.id}${p?.issue ?? " 没配好"}。`);
+    if (provider.baseUrl?.includes("xiaomimimo.com")) return LISTS.mimo ?? [];
+    return LISTS[provider.id] ?? ["gpt-4.1-mini", "gpt-4.1"];
   },
   async voices(provider: VoiceProviderId): Promise<VoiceCatalogResponse> {
     await wait(120);

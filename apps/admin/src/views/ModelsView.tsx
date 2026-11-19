@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowDown,
@@ -12,14 +12,19 @@ import {
   RotateCcw,
   Save,
   Server,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import {
+  ADMIN_PROVIDER_PRESETS,
+  PROTOCOL_LABEL,
   adminApi,
   fmtAgo,
+  type AdminPresetItem,
   type AssistantConfigView,
   type ModelAuth,
   type ModelProtocol,
+  type ModelRef,
   type ModelTestResult,
   type ProviderView,
 } from "../lib/api";
@@ -32,12 +37,44 @@ import {
   PocketInput,
   PocketPopover,
   PocketSelect,
+  PocketSwitch,
   useToast,
 } from "../components/ui/PocketUI";
 
 interface TestState {
   running?: boolean;
   result?: ModelTestResult;
+}
+
+const URL_HINT: Record<ModelProtocol, string> = {
+  openai: "https://api.example.com/v1",
+  "openai-responses": "https://api.openai.com/v1",
+  anthropic: "https://api.anthropic.com",
+  gemini: "https://generativelanguage.googleapis.com",
+  ollama: "http://localhost:11434",
+};
+
+function deriveProviderId(presetId: string | null, label: string, url: string, existing: readonly string[]): string {
+  const taken = new Set(existing);
+  let raw = presetId && presetId !== "custom" ? presetId : "";
+  if (!raw && label.trim()) {
+    raw = label.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  }
+  if (!raw && url.trim()) {
+    try {
+      const host = new URL(url.trim()).hostname.replace(/^(api|llm|gateway|token-plan(?:-cn)?)\./i, "");
+      raw = (host.split(".")[0] ?? "").toLowerCase().replace(/[^a-z0-9-]+/g, "");
+    } catch {
+      raw = "";
+    }
+  }
+  if (!raw || !/^[a-z]/.test(raw)) raw = raw ? `p-${raw}` : "custom-gw";
+  const base = raw.slice(0, 26);
+  if (!taken.has(base)) return base;
+  for (let i = 2; i < 99; i++) {
+    if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
+  }
+  return `gw-${Date.now().toString(36).slice(-4)}`;
 }
 
 export function ModelsView({
@@ -58,18 +95,35 @@ export function ModelsView({
 
   const [newProv, setNewProv] = useState(config.providers[0]?.id ?? "");
   const [newModel, setNewModel] = useState("");
+  const [addAsMain, setAddAsMain] = useState(false);
 
-  // Provider dialog
+  // Provider 1-step modal state
   const [provModalOpen, setProvModalOpen] = useState(false);
   const [editingProv, setEditingProv] = useState<ProviderView | null>(null);
+  const [presetId, setPresetId] = useState<string | null>("mimo");
   const [pId, setPId] = useState("");
+  const [pIdEdited, setPIdEdited] = useState(false);
   const [pLabel, setPLabel] = useState("");
   const [pProtocol, setPProtocol] = useState<ModelProtocol>("openai");
   const [pAuth, setPAuth] = useState<"" | ModelAuth>("");
   const [pUrl, setPUrl] = useState("");
   const [pKey, setPKey] = useState("");
+  const [pMore, setPMore] = useState(false);
+
+  // Modal upstream scanner + model enablement
+  const [modalScanned, setModalScanned] = useState<string[] | null>(null);
+  const [modalScanning, setModalScanning] = useState(false);
+  const [modalScanErr, setModalScanErr] = useState<string | null>(null);
+  const [modalFilter, setModalFilter] = useState("");
+  const [modalPicked, setModalPicked] = useState<string[]>([]);
+  const [modalManualModel, setModalManualModel] = useState("");
+  const [modalMakeMain, setModalMakeMain] = useState(true);
+  const [modalTestModel, setModalTestModel] = useState("");
+  const [modalTesting, setModalTesting] = useState(false);
+  const [modalTestResult, setModalTestResult] = useState<ModelTestResult | null>(null);
   const [savingProv, setSavingProv] = useState(false);
   const [deleteProvTarget, setDeleteProvTarget] = useState<ProviderView | null>(null);
+  const scanSeqRef = useRef(0);
 
   useEffect(() => {
     setNameDraft(config.name || "小羊");
@@ -78,15 +132,139 @@ export function ModelsView({
     }
   }, [config]);
 
+  const effectiveId = useMemo(
+    () => (editingProv ? editingProv.id : pIdEdited && pId.trim() ? pId.trim() : deriveProviderId(presetId, pLabel, pUrl, config.providers.map((x) => x.id))),
+    [editingProv, pIdEdited, pId, presetId, pLabel, pUrl, config.providers],
+  );
+
+  const applyPreset = (item: AdminPresetItem | "custom") => {
+    setModalScanned(null);
+    setModalScanErr(null);
+    setModalTestResult(null);
+    if (item === "custom") {
+      setPresetId("custom");
+      setPLabel("");
+      setPProtocol("openai");
+      setPAuth("");
+      setPUrl("");
+      setModalPicked([]);
+      setModalTestModel("");
+      return;
+    }
+    setPresetId(item.id);
+    setPLabel(item.label);
+    setPProtocol(item.protocol);
+    setPAuth(item.auth ?? "");
+    setPUrl(item.baseUrl);
+    setModalPicked(item.recommendedModel ? [item.recommendedModel] : []);
+    setModalTestModel(item.recommendedModel ?? "");
+  };
+
   const openProvModal = (p: ProviderView | null) => {
     setEditingProv(p);
-    setPId(p?.id ?? "");
-    setPLabel(p?.label ?? "");
-    setPProtocol(p?.protocol ?? "openai");
-    setPAuth(p?.auth ?? "");
-    setPUrl(p?.baseUrl ?? "");
-    setPKey("");
+    setModalScanned(null);
+    setModalScanErr(null);
+    setModalFilter("");
+    setModalManualModel("");
+    setModalTestResult(null);
+    setPIdEdited(false);
+    setPMore(Boolean(p?.auth));
+    if (p) {
+      setPresetId(null);
+      setPId(p.id);
+      setPLabel(p.label ?? "");
+      setPProtocol(p.protocol);
+      setPAuth(p.auth ?? "");
+      setPUrl(p.baseUrl);
+      setPKey("");
+      const firstExisting = config.models.find((m) => m.provider === p.id)?.model ?? "";
+      setModalPicked([]);
+      setModalMakeMain(false);
+      setModalTestModel(firstExisting);
+    } else {
+      const def = ADMIN_PROVIDER_PRESETS[0]!;
+      setPresetId(def.id);
+      setPId("");
+      setPLabel(def.label);
+      setPProtocol(def.protocol);
+      setPAuth(def.auth ?? "");
+      setPUrl(def.baseUrl);
+      setPKey("");
+      setModalPicked(def.recommendedModel ? [def.recommendedModel] : []);
+      setModalMakeMain(true);
+      setModalTestModel(def.recommendedModel ?? "");
+    }
     setProvModalOpen(true);
+  };
+
+  const canScanDraft =
+    provModalOpen &&
+    /^https?:\/\/\S+$/i.test(pUrl.trim()) &&
+    (Boolean(pKey.trim()) || Boolean(editingProv?.key.set) || pAuth === "none" || pProtocol === "ollama");
+
+  const scanDraftModels = async (silent = false) => {
+    if (!canScanDraft) return;
+    const seq = ++scanSeqRef.current;
+    setModalScanning(true);
+    setModalScanErr(null);
+    try {
+      const draft: Record<string, unknown> = {
+        id: effectiveId,
+        protocol: pProtocol,
+        baseUrl: pUrl.trim(),
+        auth: pAuth || null,
+      };
+      if (pKey.trim()) draft.apiKey = pKey.trim();
+      const res = await adminApi.fetchProviderModels(draft);
+      if (scanSeqRef.current !== seq) return;
+      setModalScanned(res.models);
+      if (res.models.length && !modalTestModel.trim()) {
+        setModalTestModel(res.models[0]!);
+      }
+      if (!res.models.length && !silent) toast("上游没有返回模型，可手动填模型名");
+    } catch (e) {
+      if (scanSeqRef.current !== seq) return;
+      setModalScanned([]);
+      setModalScanErr((e as Error).message);
+    } finally {
+      if (scanSeqRef.current === seq) setModalScanning(false);
+    }
+  };
+
+  // Auto-scan when modal is open and URL + credentials become valid.
+  useEffect(() => {
+    if (!canScanDraft) return;
+    const timer = setTimeout(() => {
+      void scanDraftModels(true);
+    }, 600);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provModalOpen, effectiveId, pProtocol, pUrl, pAuth, pKey]);
+
+  const runDraftTest = async () => {
+    const targetModel = modalTestModel.trim() || modalPicked[0] || modalManualModel.trim();
+    if (!targetModel) {
+      toast("先选一个或填写要测速的模型名", true);
+      return;
+    }
+    setModalTesting(true);
+    setModalTestResult(null);
+    try {
+      const draft: Record<string, unknown> = {
+        id: effectiveId,
+        label: pLabel.trim(),
+        protocol: pProtocol,
+        baseUrl: pUrl.trim(),
+        auth: pAuth || null,
+      };
+      if (pKey.trim()) draft.apiKey = pKey.trim();
+      const res = await adminApi.testModel(draft, targetModel);
+      setModalTestResult(res);
+    } catch (e) {
+      setModalTestResult({ ok: false, error: (e as Error).message });
+    } finally {
+      setModalTesting(false);
+    }
   };
 
   const saveName = async () => {
@@ -102,25 +280,47 @@ export function ModelsView({
     }
   };
 
+  const chosenModalModels = useMemo(() => {
+    const out: string[] = [];
+    for (const m of modalPicked) if (m.trim() && !out.includes(m.trim())) out.push(m.trim());
+    if (modalManualModel.trim() && !out.includes(modalManualModel.trim())) out.push(modalManualModel.trim());
+    return out;
+  }, [modalPicked, modalManualModel]);
+
   const saveProvider = async () => {
-    if (!pId.trim()) {
-      toast("请填写服务商 ID（小写字母/数字/短横线）", true);
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(effectiveId)) {
+      toast("服务商代号只能用小写字母开头 + 小写字母/数字/短横线", true);
+      return;
+    }
+    if (!/^https?:\/\/\S+$/i.test(pUrl.trim())) {
+      toast("请填写有效的 http:// 或 https:// 地址", true);
       return;
     }
     setSavingProv(true);
     try {
       const patch: Record<string, unknown> = {
-        id: pId.trim(),
+        id: effectiveId,
         label: pLabel.trim(),
         protocol: pProtocol,
         baseUrl: pUrl.trim(),
         auth: pAuth || null,
       };
       if (pKey.trim()) patch.apiKey = pKey.trim();
-      const cfg = await adminApi.saveConfig({ rev: config.rev, providers: [patch] });
+      let nextModels: ModelRef[] | undefined;
+      if (chosenModalModels.length) {
+        const pickedRefs: ModelRef[] = chosenModalModels.map((model) => ({ provider: effectiveId, model }));
+        const keySet = new Set(pickedRefs.map((x) => `${x.provider}:${x.model}`));
+        const rest = config.models.filter((x) => !keySet.has(`${x.provider}:${x.model}`));
+        nextModels = (modalMakeMain ? [...pickedRefs, ...rest] : [...rest, ...pickedRefs]).slice(0, 12);
+      }
+      const cfg = await adminApi.saveConfig({
+        rev: config.rev,
+        providers: [patch],
+        ...(nextModels ? { models: nextModels } : {}),
+      });
       onConfigUpdated(cfg);
       setProvModalOpen(false);
-      toast("服务商已保存");
+      toast(chosenModalModels.length ? `已保存「${pLabel.trim() || effectiveId}」并启用 ${chosenModalModels.join("、")}` : "服务商已保存");
     } catch (e) {
       toast((e as Error).message, true);
     } finally {
@@ -155,6 +355,19 @@ export function ModelsView({
     }
   };
 
+  const makeMainModel = async (idx: number) => {
+    const chosen = config.models[idx];
+    if (!chosen || idx === 0) return;
+    const next = [chosen, ...config.models.filter((_, i) => i !== idx)];
+    try {
+      const cfg = await adminApi.saveConfig({ rev: config.rev, models: next });
+      onConfigUpdated(cfg);
+      toast(`已将 ${chosen.model} 设为主模型`);
+    } catch (e) {
+      toast((e as Error).message, true);
+    }
+  };
+
   const reorderModel = async (idx: number, dir: -1 | 1) => {
     const target = idx + dir;
     if (target < 0 || target >= config.models.length) return;
@@ -181,27 +394,40 @@ export function ModelsView({
     }
   };
 
-  const addModelToChain = async (prov = newProv, modelName = newModel) => {
+  const addModelToChain = async (prov = newProv, modelName = newModel, promote = addAsMain) => {
     const p = prov.trim();
     const m = modelName.trim();
     if (!p || !m) {
       toast("先选好服务商并填上模型名", true);
       return;
     }
+    const rest = config.models.filter((x) => !(x.provider === p && x.model === m));
+    const next = promote ? [{ provider: p, model: m }, ...rest] : [...rest, { provider: p, model: m }];
     try {
       const cfg = await adminApi.saveConfig({
         rev: config.rev,
-        models: [...config.models, { provider: p, model: m }],
+        models: next.slice(0, 12),
       });
       onConfigUpdated(cfg);
       setNewModel("");
-      toast(`已追加模型 ${m}`);
+      toast(promote ? `已将 ${m} 添加并设为主模型` : `已追加模型 ${m}`);
+    } catch (e) {
+      toast((e as Error).message, true);
+    }
+  };
+
+  const resetOneProvider = async (provId: string) => {
+    try {
+      const cfg = await adminApi.saveConfig({ rev: config.rev, providers: [{ id: provId, reset: true }] });
+      onConfigUpdated(cfg);
+      toast(`已恢复「${provId}」为服务器原始配置`);
     } catch (e) {
       toast((e as Error).message, true);
     }
   };
 
   const fetchedForSelected = fetchedByProv[newProv] ?? [];
+  const filteredModalModels = (modalScanned ?? []).filter((m) => !modalFilter.trim() || m.toLowerCase().includes(modalFilter.trim().toLowerCase()));
 
   return (
     <div className="stack">
@@ -277,29 +503,29 @@ export function ModelsView({
                       <div className="row" style={{ gap: 8 }}>
                         <span style={{ fontWeight: 800, fontSize: 15 }}>{p.label || p.id}</span>
                         <span className={`pk-pill ${p.protocol === "anthropic" ? "lavender" : "pink"} mono`}>
-                          {p.protocol}
+                          {PROTOCOL_LABEL[p.protocol] ?? p.protocol}
                         </span>
                       </div>
                       <div className="faint mono truncate" style={{ marginTop: 3 }}>
                         {p.baseUrl}
                       </div>
                     </div>
-                    <span className={`pk-pill ${p.key.set ? "working" : "blocked"}`}>
+                    <span className={`pk-pill ${p.key.set || p.protocol === "ollama" || p.auth === "none" ? "working" : "blocked"}`}>
                       <KeyRound size={11} />
                       <span>
-                        {p.key.set ? `··${p.key.hint || "****"}` : p.auth === "none" ? "免密钥" : "缺密钥"}
+                        {p.key.set ? `··${p.key.hint || "****"}` : p.auth === "none" || p.protocol === "ollama" ? "免密钥" : "缺密钥"}
                       </span>
                     </span>
                   </div>
 
                   <div className="between wrap" style={{ gap: 8 }}>
                     <span className="faint">
-                      来源：{p.from === "phone" ? "控制台 / 手机覆盖" : "服务器预设"}
+                      来源：{p.from === "phone" ? "控制台 / 手机新增" : "服务器预设"}
                     </span>
                     <div className="row wrap" style={{ gap: 6 }}>
                       <PocketButton variant="ghost" size="sm" onClick={() => openProvModal(p)}>
                         <Pencil size={13} />
-                        <span>编辑</span>
+                        <span>编辑 / 选模型</span>
                       </PocketButton>
                       <PocketPopover
                         trigger={
@@ -326,7 +552,7 @@ export function ModelsView({
                                   type="button"
                                   className="prompt-item"
                                   style={{ padding: "6px 10px" }}
-                                  onClick={() => addModelToChain(p.id, m)}
+                                  onClick={() => addModelToChain(p.id, m, false)}
                                 >
                                   <div className="between">
                                     <span className="mono" style={{ fontSize: 12 }}>{m}</span>
@@ -342,6 +568,12 @@ export function ModelsView({
                           )}
                         </div>
                       </PocketPopover>
+                      {p.from === "server" && config.edited ? (
+                        <PocketButton variant="ghost" size="sm" onClick={() => resetOneProvider(p.id)}>
+                          <RotateCcw size={13} />
+                          <span>还原</span>
+                        </PocketButton>
+                      ) : null}
                       {p.from === "phone" ? (
                         <PocketButton variant="danger" size="sm" onClick={() => setDeleteProvTarget(p)}>
                           <Trash2 size={13} />
@@ -377,7 +609,7 @@ export function ModelsView({
                 <th>顺位</th>
                 <th>模型与服务商</th>
                 <th>测速指标</th>
-                <th style={{ width: 170 }}>调整</th>
+                <th style={{ width: 250 }}>调整</th>
               </tr>
             </thead>
             <tbody>
@@ -429,6 +661,11 @@ export function ModelsView({
                           <Gauge size={13} />
                           <span>测速</span>
                         </PocketButton>
+                        {idx > 0 ? (
+                          <PocketButton variant="soft" size="sm" onClick={() => void makeMainModel(idx)}>
+                            <span>设为主模型</span>
+                          </PocketButton>
+                        ) : null}
                         <PocketIconButton
                           size="sm"
                           tooltip="上移顺位"
@@ -478,12 +715,16 @@ export function ModelsView({
               mono
               value={newModel}
               onChange={(e) => setNewModel(e.target.value)}
-              placeholder="输入模型 ID，或用上方「拉取模型」快速加入"
+              placeholder="输入模型 ID，比如 mimo-v2.6-flash"
               onKeyDown={(e) => {
                 if (e.key === "Enter") addModelToChain();
               }}
             />
           </div>
+          <label className="row" style={{ gap: 6, cursor: "pointer", fontSize: 13 }}>
+            <PocketSwitch checked={addAsMain} onCheckedChange={setAddAsMain} label="设为默认主模型" />
+            <span>设为主模型</span>
+          </label>
           <PocketButton variant="primary" onClick={() => addModelToChain()}>
             <Plus size={15} />
             <span>加入顺位</span>
@@ -493,7 +734,7 @@ export function ModelsView({
         {fetchedForSelected.length ? (
           <div className="row wrap" style={{ marginTop: 10, gap: 6 }}>
             <span className="faint">快捷填入已拉取模型：</span>
-            {fetchedForSelected.slice(0, 8).map((id) => (
+            {fetchedForSelected.slice(0, 12).map((id) => (
               <button
                 key={id}
                 type="button"
@@ -507,28 +748,53 @@ export function ModelsView({
         ) : null}
       </PocketCard>
 
-      {/* Add / Edit Provider Modal */}
+      {/* One-Step Add / Edit Provider + Auto-Scan Dialog */}
       <PocketDialog
         open={provModalOpen}
         onOpenChange={setProvModalOpen}
-        title={editingProv ? `编辑服务商：${editingProv.id}` : "新增模型服务商"}
+        title={editingProv ? `配置服务商：${editingProv.label || editingProv.id}` : "一键添加模型服务商"}
       >
-        <div className="stack" style={{ gap: 12 }}>
-          <div className="field">
-            <span className="field-label">服务商 ID（小写字母/数字/短横线）</span>
-            <PocketInput
-              mono
-              disabled={!!editingProv}
-              value={pId}
-              onChange={(e) => setPId(e.target.value)}
-              placeholder="my-gateway"
-            />
-          </div>
-          <div className="field">
-            <span className="field-label">显示名称</span>
-            <PocketInput value={pLabel} onChange={(e) => setPLabel(e.target.value)} placeholder="自建网关" />
-          </div>
+        <div className="stack" style={{ gap: 12, maxHeight: "72vh", overflowY: "auto", paddingRight: 4 }}>
+          {!editingProv ? (
+            <div className="field">
+              <span className="field-label">快捷预设</span>
+              <div className="row wrap" style={{ gap: 6 }}>
+                {ADMIN_PROVIDER_PRESETS.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={`slot-chip`}
+                    style={
+                      presetId === item.id
+                        ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" }
+                        : undefined
+                    }
+                    onClick={() => applyPreset(item)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  className="slot-chip"
+                  style={
+                    presetId === "custom"
+                      ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" }
+                      : undefined
+                  }
+                  onClick={() => applyPreset("custom")}
+                >
+                  自定义接口
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           <div className="grid-2" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <div className="field">
+              <span className="field-label">显示名称</span>
+              <PocketInput value={pLabel} onChange={(e) => setPLabel(e.target.value)} placeholder="小米 MiMo" />
+            </div>
             <div className="field">
               <span className="field-label">协议类型</span>
               <PocketSelect
@@ -536,51 +802,173 @@ export function ModelsView({
                 onValueChange={(v) => setPProtocol(v as ModelProtocol)}
                 options={[
                   { value: "openai", label: "OpenAI 兼容" },
-                  { value: "anthropic", label: "Anthropic" },
-                ]}
-              />
-            </div>
-            <div className="field">
-              <span className="field-label">鉴权方式</span>
-              <PocketSelect
-                value={pAuth}
-                onValueChange={(v) => setPAuth(v as "" | ModelAuth)}
-                options={[
-                  { value: "", label: "默认 (Bearer)" },
-                  { value: "bearer", label: "Bearer" },
-                  { value: "x-api-key", label: "x-api-key" },
-                  { value: "api-key", label: "api-key" },
-                  { value: "none", label: "无需密钥" },
+                  { value: "openai-responses", label: "OpenAI Responses / Codex" },
+                  { value: "anthropic", label: "Anthropic Claude" },
+                  { value: "gemini", label: "Google Gemini 原生" },
+                  { value: "ollama", label: "Ollama 本地" },
                 ]}
               />
             </div>
           </div>
+
           <div className="field">
             <span className="field-label">接口 Base URL</span>
             <PocketInput
               mono
               value={pUrl}
               onChange={(e) => setPUrl(e.target.value)}
-              placeholder="https://llm.example.com/v1"
+              placeholder={URL_HINT[pProtocol]}
             />
           </div>
-          <div className="field">
-            <span className="field-label">API 密钥（留空保持原值）</span>
-            <PocketInput
-              mono
-              type="password"
-              value={pKey}
-              onChange={(e) => setPKey(e.target.value)}
-              placeholder="输入新密钥替换"
-            />
+
+          {pProtocol !== "ollama" || pAuth === "bearer" ? (
+            <div className="field">
+              <span className="field-label">{editingProv?.key.set ? "API 密钥（留空保持原值）" : "API 密钥"}</span>
+              <PocketInput
+                mono
+                type="password"
+                value={pKey}
+                onChange={(e) => setPKey(e.target.value)}
+                placeholder={editingProv?.key.set ? `当前已设 ··${editingProv.key.hint || "****"}` : "输入或粘贴 API Key"}
+              />
+            </div>
+          ) : (
+            <div className="faint">Ollama 本地接口默认免密钥，填写地址即可直接扫描。</div>
+          )}
+
+          <div>
+            <PocketButton size="sm" variant="ghost" onClick={() => setPMore((v) => !v)}>
+              <span>{pMore ? "收起高级设置（代号 / 鉴权头）" : `高级设置（代号：${effectiveId}）`}</span>
+            </PocketButton>
+            {pMore ? (
+              <div className="grid-2" style={{ gridTemplateColumns: "1fr 1fr", marginTop: 8 }}>
+                <div className="field">
+                  <span className="field-label">服务商代号 ID</span>
+                  <PocketInput
+                    mono
+                    disabled={!!editingProv}
+                    value={editingProv ? editingProv.id : pIdEdited ? pId : effectiveId}
+                    onChange={(e) => {
+                      setPIdEdited(true);
+                      setPId(e.target.value.toLowerCase());
+                    }}
+                    placeholder="my-gateway"
+                  />
+                </div>
+                <div className="field">
+                  <span className="field-label">鉴权方式</span>
+                  <PocketSelect
+                    value={pAuth}
+                    onValueChange={(v) => setPAuth(v as "" | ModelAuth)}
+                    options={[
+                      { value: "", label: "按协议自动匹配" },
+                      { value: "bearer", label: "Bearer" },
+                      { value: "x-api-key", label: "x-api-key" },
+                      { value: "api-key", label: "api-key" },
+                      { value: "x-goog-api-key", label: "x-goog-api-key" },
+                      { value: "none", label: "无需密钥" },
+                    ]}
+                  />
+                </div>
+              </div>
+            ) : null}
           </div>
+
+          {/* Inline Upstream Scanner + One-Click Enable */}
+          <div style={{ borderTop: "1px solid var(--divider)", paddingTop: 10 }} className="stack">
+            <div className="between wrap">
+              <div>
+                <div style={{ fontWeight: 800, fontSize: 13.5 }}>扫描上游模型并启用</div>
+                <div className="faint">填好地址与密钥会自动扫描；点击可选中一个或多个模型</div>
+              </div>
+              <PocketButton size="sm" variant="soft" disabled={!canScanDraft || modalScanning} onClick={() => void scanDraftModels(false)}>
+                <CloudDownload size={13} />
+                <span>{modalScanning ? "扫描中…" : "扫描模型"}</span>
+              </PocketButton>
+            </div>
+
+            {modalScanErr ? <div className="faint">自动扫描未取得列表（{modalScanErr}），可手动填入下方模型名。</div> : null}
+
+            {modalScanned && modalScanned.length ? (
+              <div className="stack" style={{ gap: 6 }}>
+                {modalScanned.length > 8 ? (
+                  <PocketInput mono value={modalFilter} onChange={(e) => setModalFilter(e.target.value)} placeholder={`筛选模型（共 ${modalScanned.length} 个）`} />
+                ) : null}
+                <div className="row wrap" style={{ gap: 6, maxHeight: 150, overflowY: "auto" }}>
+                  {filteredModalModels.slice(0, 60).map((m) => {
+                    const active = modalPicked.includes(m);
+                    return (
+                      <button
+                        key={m}
+                        type="button"
+                        className="slot-chip"
+                        style={
+                          active
+                            ? { background: "var(--accent)", color: "#fff", borderColor: "var(--accent)" }
+                            : undefined
+                        }
+                        onClick={() => {
+                          setModalPicked((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
+                          if (!active) setModalTestModel(m);
+                        }}
+                      >
+                        {m}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="row wrap" style={{ gap: 8 }}>
+              <div className="grow">
+                <PocketInput
+                  mono
+                  value={modalManualModel}
+                  onChange={(e) => {
+                    setModalManualModel(e.target.value);
+                    if (e.target.value.trim()) setModalTestModel(e.target.value.trim());
+                  }}
+                  placeholder="手动填或补充模型名，比如 mimo-v2.6-flash"
+                />
+              </div>
+              <PocketButton
+                size="sm"
+                variant="soft"
+                disabled={modalTesting || !canScanDraft}
+                onClick={() => void runDraftTest()}
+              >
+                <Sparkles size={13} />
+                <span>{modalTesting ? "测速中…" : "先测一下"}</span>
+              </PocketButton>
+            </div>
+
+            {chosenModalModels.length ? (
+              <div className="between wrap" style={{ background: "var(--bg-soft)", padding: "8px 12px", borderRadius: 10 }}>
+                <div className="faint mono">待启用：{chosenModalModels.join(", ")}</div>
+                <label className="row" style={{ gap: 6, cursor: "pointer", fontSize: 13 }}>
+                  <PocketSwitch checked={modalMakeMain} onCheckedChange={setModalMakeMain} label="保存后设为主模型" />
+                  <span>设为默认主模型</span>
+                </label>
+              </div>
+            ) : null}
+
+            {modalTestResult ? (
+              <div className="faint" style={{ color: modalTestResult.ok ? "var(--ok-text)" : "var(--blush-text)" }}>
+                {modalTestResult.ok
+                  ? `通了 · 首字 ${modalTestResult.firstMs ?? "-"}ms · 总 ${modalTestResult.totalMs ?? "-"}ms${modalTestResult.reply ? ` · 回：${modalTestResult.reply}` : ""}`
+                  : `没通：${modalTestResult.error || "连接失败"}`}
+              </div>
+            ) : null}
+          </div>
+
           <div className="row" style={{ justifyContent: "flex-end", marginTop: 6 }}>
             <PocketButton variant="ghost" onClick={() => setProvModalOpen(false)}>
               取消
             </PocketButton>
             <PocketButton variant="primary" onClick={saveProvider} disabled={savingProv}>
               <Save size={15} />
-              <span>{savingProv ? "保存中…" : "保存服务商"}</span>
+              <span>{savingProv ? "保存中…" : chosenModalModels.length ? "保存并启用模型" : "保存服务商"}</span>
             </PocketButton>
           </div>
         </div>

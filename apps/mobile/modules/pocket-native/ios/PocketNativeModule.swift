@@ -122,26 +122,45 @@ public class PocketNativeModule: Module {
     Function("voiceState") { () -> [String: Any] in
       let enrolled = VoicePrefs.isCurrentEnrolled
       let legacyEnrolled = VoicePrefs.isLegacyEnrolled
-      let modelReady = VoiceModelManager.isSpeakerReady()
-      let tseReady = enrolled && VoiceModelManager.isTseReady()
-      return [
+      let svReady = VoiceModelManager.isSvOnlyReady()
+      let tseModelsReady = VoiceModelManager.isTseModelsReady()
+      let modelReady = svReady && tseModelsReady
+      let tseReady = enrolled && modelReady && VoiceModelManager.hasOwnerSample()
+      let realRtf = VoicePrefs.lastCallTseRtf > 0 ? VoicePrefs.lastCallTseRtf : VoicePrefs.benchTseRtf
+      var state: [String: Any] = [
         "denoise": VoicePrefs.denoise,
         "filter": VoicePrefs.filter,
         "threshold": Double(VoicePrefs.threshold),
+        "voiceTier": VoicePrefs.voiceTier,
+        "firstSpeaker": VoicePrefs.firstSpeaker,
         "enrolled": enrolled,
         "legacyEnrolled": legacyEnrolled,
+        "svReady": svReady,
+        "tseModelsReady": tseModelsReady,
         "tseReady": tseReady,
         "modelVersion": VOICEPRINT_MODEL_VERSION,
         "modelReady": modelReady,
         "modelDownloading": VoiceModelManager.downloading,
+        "svSize": Double(VoiceModelManager.svSize),
         "modelSize": Double(VoiceModelManager.speakerSize),
+        "benchAt": Double(VoicePrefs.benchAt),
       ]
+      if let rec = VoicePrefs.benchRecommendedTier { state["recommendedTier"] = rec }
+      if let reason = VoicePrefs.benchReason { state["recommendReason"] = reason }
+      if VoicePrefs.benchDpdfUs > 0 { state["benchDpdfUs"] = VoicePrefs.benchDpdfUs }
+      if realRtf > 0 { state["benchTseRtf"] = realRtf }
+      return state
     }
 
     Function("setVoiceSettings") { (denoise: Bool, filter: Bool, threshold: Double) in
       VoicePrefs.denoise = denoise
       VoicePrefs.filter = filter
       VoicePrefs.threshold = Float(min(0.80, max(0.15, threshold)))
+    }
+
+    Function("setVoiceMode") { (tier: String, firstSpeaker: Bool) in
+      VoicePrefs.voiceTier = tier
+      VoicePrefs.firstSpeaker = firstSpeaker
     }
 
     Function("setVoiceprint") { (embedding: [Double]?) in
@@ -166,7 +185,8 @@ public class PocketNativeModule: Module {
     }
 
     AsyncFunction("prepareVoiceModel") { (promise: Promise) in
-      VoiceModelManager.downloadSpeaker(
+      VoiceModelManager.downloadModels(
+        tier: "tse",
         onProgress: { got, total in
           PocketBus.emit("onVoiceModelProgress", ["received": Double(got), "total": Double(total)])
         },
@@ -178,6 +198,33 @@ public class PocketNativeModule: Module {
           }
         }
       )
+    }
+
+    AsyncFunction("prepareVoiceTier") { (tier: String, promise: Promise) in
+      let cleanTier = (tier == "sv") ? "sv" : "tse"
+      VoiceModelManager.downloadModels(
+        tier: cleanTier,
+        onProgress: { got, total in
+          PocketBus.emit("onVoiceModelProgress", ["received": Double(got), "total": Double(total)])
+        },
+        done: { err in
+          if let err {
+            promise.reject("E_VOICE_MODEL", err.localizedDescription)
+          } else {
+            promise.resolve(true)
+          }
+        }
+      )
+    }
+
+    AsyncFunction("benchmarkVoiceDevice") { (promise: Promise) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          promise.resolve(try VoiceModelManager.benchmarkDevice())
+        } catch {
+          promise.reject("E_VOICE_BENCH", error.localizedDescription)
+        }
+      }
     }
 
     Function("cancelVoiceModel") {

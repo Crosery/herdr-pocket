@@ -1,0 +1,6 @@
+# Standalone project: kept out of the repository's root workspace so the
+# server install stays light.
+packages:
+  - "."
+allowBuilds:
+  esbuild: true

@@ -1,0 +1,11 @@
+{
+  "modelVersion": "6.1.1",
+  "name": "herdr-pocket-harmony",
+  "version": "0.2.0",
+  "description": "Herdr Pocket HarmonyOS NEXT Client",
+  "main": "",
+  "author": "Crosery",
+  "license": "AGPL-3.0-only",
+  "dependencies": {},
+  "devDependencies": {}
+}

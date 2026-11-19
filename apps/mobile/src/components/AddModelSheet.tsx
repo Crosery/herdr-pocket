@@ -24,6 +24,7 @@ export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible
   const server = useSettings((s) => s.server);
   const [provider, setProvider] = useState<string | null>(config.models[0]?.provider ?? config.providers[0]?.id ?? null);
   const [model, setModel] = useState("");
+  const [asMain, setAsMain] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -49,7 +50,7 @@ export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible
     setError(null);
     try {
       const ref = { provider, model: name };
-      await changeConfig({ models: [...config.models, ref] });
+      await changeConfig({ models: asMain ? [ref, ...config.models] : [...config.models, ref] });
       onAdded(ref);
     } catch (e) {
       setError((e as Error).message);
@@ -83,8 +84,12 @@ export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible
             </Field>
 
             <Field title="模型名" hint="照服务商那里的写法填，也可以在下面点一个" error={taken ? "这个模型已经在列表里了" : null}>
-              <Input value={model} onChangeText={setModel} placeholder="比如 gpt-6.1-terra" autoCapitalize="none" mono accessibilityLabel="模型名" />
+              <Input value={model} onChangeText={setModel} placeholder="比如 mimo-v2.6-flash" autoCapitalize="none" mono accessibilityLabel="模型名" />
             </Field>
+            <Chips>
+              <Chip on={!asMain} onPress={() => setAsMain(false)} label={`加在最后（备用 ${position}）`} />
+              <Chip on={asMain} onPress={() => setAsMain(true)} label="直接设为默认主模型" />
+            </Chips>
 
             {provider ? (
               <Field title="它列出的模型">
@@ -117,7 +122,9 @@ export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible
           </ScrollView>
 
           <View style={{ paddingHorizontal: space.lg, paddingTop: space.sm, paddingBottom: insets.bottom + space.md, gap: space.xs, borderTopWidth: 1, borderTopColor: p.divider }}>
-            <Text style={{ color: p.faint, fontSize: 12, textAlign: "center" }}>加在最后，当备用 {position}。测过觉得快，再往上挪</Text>
+            <Text style={{ color: p.faint, fontSize: 12, textAlign: "center" }}>
+              {asMain ? "保存后会立刻作为小羊默认主模型" : `加在最后，当备用 ${position}。测过觉得快，可一键设为主模型`}
+            </Text>
             <Button mode="contained" disabled={!provider || !name || taken || busy} loading={busy} onPress={add} contentStyle={{ height: 50 }} style={{ borderRadius: radius.pill }} labelStyle={{ fontSize: 16 }}>
               添加并测一下
             </Button>
