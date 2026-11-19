@@ -7,7 +7,7 @@
   <img src="docs/readme/hero-zh-light.svg" width="100%" alt="Herdr Pocket：所有电脑上的 coding agent，都装进你的口袋。穿淡紫色卫衣的吉祥物小羊站在云朵上欢呼。" />
 </picture>
 
-在手机上看每台电脑里 Claude Code、Codex、Gemini CLI 这些 agent 在干什么，<br />
+在手机（Android / iOS / 鸿蒙 HarmonyOS NEXT）或桌面电脑（Windows / macOS / Linux）上看每台电脑里 Claude Code、Codex、Gemini CLI 这些 agent 在干什么，<br />
 给它们发消息、按键、开新的，或者直接打电话让助理小羊替你去办。
 
 *Your coding agents on every computer, in your pocket: a self-hosted relay, a small daemon per computer, and mobile & desktop apps with a voice assistant.*
@@ -60,7 +60,7 @@
 | **随手操作** | 发消息和图片，按 Esc / Tab / 方向键 / Ctrl+C，agent 给出编号选项时点一下就能选。终端用 App 自带的紧凑键盘，不让系统输入法挡住屏幕，要打中文时一键切回去。 |
 | **开新 agent** | 在任意一台电脑的任意空间里，启动那台电脑上装了的 agent：Claude Code、Codex、Gemini CLI、Kimi、Cursor Agent、Droid、CodeBuddy、Qoder、OpenCode…… 第一条任务一起交过去。 |
 | **助理小羊** | 一个对话管所有电脑：问谁在等你、某个 agent 卡在哪、花了多少钱；让它传话、按键、开新的 agent。默认直接动手，结果照实告诉你。agent 卡住或跑完时它会主动说，App 关着也会推送到通知栏，还能设提醒。 |
-| **打电话** | 和小羊语音通话，边走路边指挥。默认用 MOSS-Live，也支持 OpenAI Realtime 协议；通话里不用点确认。 |
+| **打电话** | 和小羊语音通话，边走路边指挥。支持 MOSS-Live 与 OpenAI Realtime 双协议，内置端侧声纹锁定与通话降噪；通话里不用点确认。 |
 | **扫码就连** | 二维码是普通的 https 链接，任何相机都能扫；新服务器的第一台设备扫启动时打印的码就行，不用复制密钥。 |
 | **电脑互相调用** | 在一台电脑的终端里看另一台电脑的 agent、给它发消息、按键。 |
 | **自己的服务器** | 中转服务部署在你自己的机器上：Docker、Cloudflare Tunnel、Node + systemd、Fly.io、Render、Kubernetes 都有现成配置。 |
@@ -82,11 +82,11 @@
 
 - **电脑端** `herdr-pocket`：每台电脑一个后台程序，读 herdr 里的 agent，把状态、对话和终端发给中转服务，执行手机发来的操作。
 - **中转服务** relay：负责设备配对和令牌、在线状态、请求转发，小羊助理也跑在这里。所有设备都只主动连它，电脑不用开端口。
-- **手机 App**：Expo / React Native 写的安卓应用。
+- **全端客户端（手机与桌面）**：Android 与 iOS 客户端（Expo / React Native + 原生语音、声纹降噪与多镜像分片加速模块）、鸿蒙 HarmonyOS NEXT 原生 Stage 模型客户端（`.hap`），以及 Windows / macOS / Linux 桌面客户端（Tauri v2）。
 
 ## 快速开始
 
-需要：一台手机和电脑都能连上的服务器（Linux），装了 herdr 的电脑（macOS、Linux 或 Windows），一台安卓手机。
+需要：一台手机和电脑都能连上的服务器（Linux），装了 herdr 的电脑（macOS、Linux 或 Windows），以及一部手机（Android、iOS 或鸿蒙 HarmonyOS NEXT）或任意桌面电脑客户端。
 
 ### 1. 部署中转服务
 
@@ -184,7 +184,7 @@ POCKET_VOICE_KEY=...
 # POCKET_ASSISTANT_CONFIRM=never       # always：文字对话里先问再动手（通话从不等确认）
 ```
 
-内置的文字模型厂商：Anthropic、OpenAI、DeepSeek、通义千问、Kimi、智谱 GLM、硅基流动、火山方舟、OpenRouter、Gemini、Ollama（本地），以及任意 OpenAI 或 Anthropic 兼容的自建网关。每家的地址、变量和配置文件写法见 [docs/config.md](docs/config.md)。
+内置的文字模型厂商：小米 MiMo、Anthropic、OpenAI、DeepSeek、通义千问、Kimi、智谱 GLM、硅基流动、火山方舟、OpenRouter、Gemini、Ollama（本地），支持 `OpenAI Chat`、`OpenAI Responses (Codex)`、`Anthropic`、`Google Gemini`、`Ollama` 五种协议；在客户端和 `/admin` 控制台填好密钥即可一键自动扫描上游模型并排好主备顺序。每家的地址、变量和配置文件写法见 [docs/config.md](docs/config.md)。
 
 “动手前先问我”也可以在 App 的设置里或 `/admin` 里切换，改过的值存在服务器上。
 
@@ -220,7 +220,7 @@ herdr-pocket update                           # 更新到最新版本（--check 
 
 ## 日志和控制台
 
-- **`/admin`**：浏览器打开 `https://pocket.example.com/admin`，填 `POCKET_ADMIN_TOKEN`（安装脚本会生成一个）。能看版本、在线设备、助理模型、最近 24 小时的统计、日志和小羊做过的操作，能吊销设备、切换“动手前先问我”。
+- **`/admin`**：浏览器打开 `https://pocket.example.com/admin`，填 `POCKET_ADMIN_TOKEN`（安装脚本会生成一个）。可配置模型与服务商（含一键扫描上游模型）、实时语音与音色、系统提示词，查看版本、在线设备、最近 24 小时统计、扫码配对与实时日志，还能吊销设备或切换“动手前先问我”。
 - **`herdr-pocket logs`**：任意一台已登记的电脑都能查，可按时间、设备、类型、级别、关键字过滤，`--follow` 持续跟。
 - 手机和电脑的日志会定时上传到中转服务，上传前抹掉令牌和密钥。
 
@@ -253,6 +253,7 @@ pnpm --filter @herdr-pocket/relay test
 pnpm --filter @herdr-pocket/hostd test
 
 cd apps/mobile && pnpm install && pnpm typecheck
+cd apps/desktop && pnpm install && pnpm typecheck && pnpm build && pnpm build:harmony
 ```
 
 App 不连服务器也能看：在连接页点“还没有服务器？先逛逛演示数据”。协作约定见 [AGENTS.md](AGENTS.md)，文档索引见 [docs/README.md](docs/README.md)，App 的开发和打包见 [apps/mobile/README.md](apps/mobile/README.md)。
@@ -269,4 +270,4 @@ Herdr Pocket 以 [GNU Affero General Public License v3.0 only](LICENSE)（AGPL-3
 - 不能把它或它的一部分并进闭源产品。
 - 本协议不授予 “Herdr Pocket” 名称和 Logo 的商标使用权。发布修改版请换一个名字和包名，不要让人误以为是官方版本。
 
-**Additional permission under AGPL-3.0 section 7.** The website in `apps/site` may be combined with GSAP (distributed under its own “Standard no-charge” license), and the intro video project in `apps/site/video` with Remotion (distributed under the Remotion License), without those libraries falling under the AGPL. They keep their own terms: Remotion, for example, requires a paid company license above a certain team size. Neither library is used by the relay, the computer daemon or the Android app.
+**Additional permission under AGPL-3.0 section 7.** The website in `apps/site` may be combined with GSAP (distributed under its own “Standard no-charge” license), and the intro video project in `apps/site/video` with Remotion (distributed under the Remotion License), without those libraries falling under the AGPL. They keep their own terms: Remotion, for example, requires a paid company license above a certain team size. Neither library is used by the relay, the computer daemon or the mobile and desktop client apps.

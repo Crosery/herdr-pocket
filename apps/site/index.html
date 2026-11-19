@@ -6,13 +6,13 @@
     <title>Herdr Pocket · 把所有电脑上的 coding agent 装进口袋</title>
     <meta
       name="description"
-      content="Herdr Pocket 把每台电脑上 herdr 里的 coding agent（Claude Code、Codex、Gemini、OpenCode……）装进 Android 手机：实时状态、排版好的对话、终端直连，小羊助理主动提醒，支持语音通话，中转服务自己部署。"
+      content="Herdr Pocket 把每台电脑上 herdr 里的 coding agent（Claude Code、Codex、Gemini、OpenCode……）装进 Android、iOS、鸿蒙（HarmonyOS NEXT）手机与 Windows / macOS / Linux 桌面客户端：实时状态、排版好的对话、终端直连，小羊助理主动提醒，支持语音通话，中转服务自己部署。"
     />
     <meta name="theme-color" content="#FFF6F9" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#1C1722" media="(prefers-color-scheme: dark)" />
     <meta property="og:type" content="website" />
     <meta property="og:title" content="Herdr Pocket" />
-    <meta property="og:description" content="Every coding agent on every computer, in your pocket. 开源、自托管的 Android agent 遥控器。" />
+    <meta property="og:description" content="Every coding agent on every computer, in your pocket. 开源、自托管的全平台（Android · iOS · HarmonyOS NEXT · Windows · macOS · Linux）agent 遥控器。" />
     <meta property="og:image" content="og.jpg" />
     <meta name="twitter:card" content="summary_large_image" />
     <link rel="icon" type="image/png" sizes="64x64" href="favicon.png" />
@@ -111,8 +111,8 @@
       <section class="parts wrap" id="parts">
         <div class="parts-head">
           <p class="eyebrow" data-i18n="parts.eyebrow">它由三部分组成</p>
-          <h2 class="h2" data-i18n="parts.title">一台服务器，一部手机，<br />再加上你的每台电脑</h2>
-          <p class="lead" data-i18n="parts.lead">服务端在中间：手机和每台电脑都只连它，彼此不用在同一个网络里。按 1、2、3 的顺序装好，所有电脑上的 agent 就都出现在手机上。</p>
+          <h2 class="h2" data-i18n="parts.title">一台服务器，手机与桌面客户端，<br />再加上你的每台电脑</h2>
+          <p class="lead" data-i18n="parts.lead">服务端在中间：手机、桌面客户端和每台电脑都只连它，彼此不用在同一个网络里。按 1、2、3 的顺序装好，所有电脑上的 agent 就都出现在你的客户端上。</p>
         </div>
         <ol class="parts-grid">
           <li class="part part-server">
@@ -131,7 +131,7 @@
               <span class="part-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="6.5" y="2.5" width="11" height="19" rx="2.6" /><path d="M10.5 18.5h3" /></svg></span>
               <h3><span data-i18n="parts.p.t">客户端</span><small data-i18n="parts.p.k">手机 & 桌面端</small></h3>
             </div>
-            <p class="part-where"><span data-i18n="parts.where">装在</span><b data-i18n="parts.p.w">Android / iOS / 鸿蒙 / 桌面电脑</b></p>
+            <p class="part-where"><span data-i18n="parts.where">装在</span><b data-i18n="parts.p.w">Android / iOS / 鸿蒙 HarmonyOS NEXT / Windows / macOS / Linux</b></p>
             <p class="part-what" data-i18n="parts.p.d">看所有 agent 的状态、对话和终端，直接回复、按键，收提醒，和小羊说话。扫一下服务端给的二维码就连上。</p>
             <a class="part-act" href="#step-phone"><span data-i18n="parts.p.a">下载安装包并连上</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg></a>
           </li>
@@ -308,7 +308,7 @@
             </li>
             <li data-reveal>
               <span class="as-ico"><svg viewBox="0 0 24 24"><path d="M12 3.5 20 8v8l-8 4.5L4 16V8l8-4.5Z" /><path d="M4 8l8 4.5L20 8M12 12.5v8" /></svg></span>
-              <div><h3 data-i18n="as.p5.t">模型随你选</h3><p data-i18n="as.p5.d">Anthropic，或任意 OpenAI 兼容服务：DeepSeek、Qwen、Kimi、GLM、OpenRouter，也可以是本地的 Ollama。</p></div>
+              <div><h3 data-i18n="as.p5.t">模型随你选</h3><p data-i18n="as.p5.d">支持 OpenAI Chat、OpenAI Responses (Codex)、Anthropic、Google Gemini 原生与本地 Ollama 五种协议；内置小米 MiMo、DeepSeek、通义千问、Kimi、GLM、OpenRouter 预设，填上密钥即可自动扫描上游模型。</p></div>
             </li>
           </ul>
         </div>
@@ -321,7 +321,7 @@
           <div class="call-copy">
             <p class="eyebrow eyebrow-light" data-i18n="call.eyebrow">语音通话</p>
             <h2 class="h2" data-i18n="call.title">懒得打字？<br />给小羊打个电话。</h2>
-            <p class="lead" data-i18n="call.lead">实时语音通话，默认接入 MOSS-Live，更多实时语音服务正在接入。边走路边问“谁跑完了”，她会去查，再用声音告诉你。语音经你自己的中转服务转发，key 只留在服务器上。</p>
+            <p class="lead" data-i18n="call.lead">实时语音通话，支持 MOSS-Live 与 OpenAI Realtime 双协议，内置端侧声纹识别与通话降噪。边走路边问“谁跑完了”，她会去查，再用声音告诉你。语音经你自己的中转服务转发，密钥只留在服务器上。</p>
             <div class="call-states" id="call-states" role="tablist" aria-label="Call states"></div>
             <p class="call-hint" data-i18n="call.hint">六种表情跟着通话状态切换，点一下试试。</p>
           </div>
@@ -480,15 +480,43 @@
             <span class="dstep-num" aria-hidden="true">2</span>
             <div class="dstep-card">
               <div class="dstep-info">
-                <h3><span data-i18n="dp.3.t">装上客户端</span><small>Android · iOS · HarmonyOS · Desktop</small></h3>
+                <h3><span data-i18n="dp.3.t">装上客户端</span><small>Android · HarmonyOS NEXT · iOS · macOS · Windows · Linux</small></h3>
                 <p data-i18n="dp.3.d">用手机相机扫上一步的设置二维码，会打开连接页；装好手机或桌面客户端后点连接，或直接填入配对码，就连上了。</p>
               </div>
               <div class="dstep-work dstep-app">
-                <a class="btn btn-accent" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
-                  <span data-i18n="dp.3.cta">下载各平台客户端</span>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14" /></svg>
-                </a>
-                <p data-i18n="dp.3.more">只有设置码时，在 App 里填上服务器地址和设置码。以后有新版本，App 里点一下就更新。</p>
+                <div class="dstep-app-top">
+                  <a class="btn btn-accent" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
+                    <span data-i18n="dp.3.cta">下载各平台客户端</span>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14" /></svg>
+                  </a>
+                  <p data-i18n="dp.3.more">只有设置码时，在 App 里填上服务器地址和设置码。以后有新版本，App 里点一下就更新。</p>
+                </div>
+                <div class="dl-grid">
+                  <a class="dl-card" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
+                    <span class="dl-head"><b>Android</b><span class="dl-ext">.apk</span></span>
+                    <small data-i18n="dp.dl.android">arm64 安装包 · 应用内一键更新</small>
+                  </a>
+                  <a class="dl-card" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
+                    <span class="dl-head"><b>HarmonyOS NEXT</b><span class="dl-ext">.hap</span></span>
+                    <small data-i18n="dp.dl.harmony">鸿蒙原生 Stage 模型安装包</small>
+                  </a>
+                  <a class="dl-card" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
+                    <span class="dl-head"><b>iOS</b><span class="dl-ext">.ipa</span></span>
+                    <small data-i18n="dp.dl.ios">AltStore / SideStore / TrollStore 侧载</small>
+                  </a>
+                  <a class="dl-card" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
+                    <span class="dl-head"><b>macOS</b><span class="dl-ext">.dmg</span></span>
+                    <small data-i18n="dp.dl.macos">Apple Silicon (arm64) 与 Intel (x64)</small>
+                  </a>
+                  <a class="dl-card" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
+                    <span class="dl-head"><b>Windows</b><span class="dl-ext">.exe · .msi</span></span>
+                    <small data-i18n="dp.dl.windows">x64 NSIS 安装器与 MSI 包</small>
+                  </a>
+                  <a class="dl-card" href="#" data-href="releasesUrl" target="_blank" rel="noopener">
+                    <span class="dl-head"><b>Linux</b><span class="dl-ext">.AppImage · .deb</span></span>
+                    <small data-i18n="dp.dl.linux">x64 免安装镜像与 Debian 包</small>
+                  </a>
+                </div>
               </div>
             </div>
           </li>
@@ -536,8 +564,8 @@
         <h2 class="h2" data-i18n="faq.title">你可能想问</h2>
         <div class="faq-list">
           <details>
-            <summary data-i18n="faq.1.q">支持 iPhone、鸿蒙或 PC 桌面端吗？</summary>
-            <div class="faq-a"><p data-i18n="faq.1.a">全部支持。移动端提供 Android (.apk)、iOS 未签名侧载包 (.ipa) 与 HarmonyOS NEXT (.hap)；PC 桌面端提供 macOS (.dmg)、Windows (.exe / .msi) 与 Linux (.AppImage / .deb)。</p></div>
+            <summary data-i18n="faq.1.q">支持鸿蒙（HarmonyOS NEXT）、iPhone 和电脑桌面端吗？</summary>
+            <div class="faq-a"><p data-i18n="faq.1.a">全部已发布。移动端提供 Android (.apk)、鸿蒙 HarmonyOS NEXT (.hap，DevEco Studio 签名安装) 与 iOS 未签名侧载包 (.ipa，AltStore / SideStore / TrollStore / Xcode 安装)；桌面端提供 macOS (arm64 / x64 .dmg)、Windows (x64 -setup.exe / .msi) 与 Linux (x64 .AppImage / .deb)，界面与交互全端一致。</p></div>
           </details>
           <details>
             <summary data-i18n="faq.2.q">能看哪些 agent？</summary>
@@ -557,7 +585,7 @@
           </details>
           <details>
             <summary data-i18n="faq.6.q">助理和语音用什么模型？</summary>
-            <div class="faq-a"><p data-i18n="faq.6.a">文字助理可以接 Anthropic，或任意 OpenAI 兼容服务（DeepSeek、Qwen、Kimi、GLM、OpenRouter、Ollama 等），在服务器上配置。语音通话默认用 MOSS-Live，更多实时语音服务正在接入。不配置就没有助理或语音，其他功能照常用。</p></div>
+            <div class="faq-a"><p data-i18n="faq.6.a">文字助理支持 OpenAI Chat、OpenAI Responses、Anthropic、Google Gemini 原生与本地 Ollama 五种协议（内置小米 MiMo、DeepSeek、通义千问、Kimi、GLM、硅基流动、火山方舟、OpenRouter 等预设），可在客户端或 /admin 网页后台一键自动扫描上游模型并排好主备顺序。语音通话支持 MOSS-Live 与 OpenAI Realtime。不配模型时只是没有助理或语音，其余功能照常用。</p></div>
           </details>
           <details>
             <summary data-i18n="faq.7.q">App 关着也能收到提醒吗？</summary>

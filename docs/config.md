@@ -41,6 +41,7 @@ There is no default model list. Without models, or when no listed model has a us
 |---|---|---|---|---|
 | `anthropic` | Anthropic | Anthropic Messages | `https://api.anthropic.com` | `x-api-key` header, `anthropic-version: 2023-06-01` |
 | `openai` | OpenAI | Chat Completions | `https://api.openai.com/v1` | sends `max_completion_tokens` (`max_tokens` is deprecated there) |
+| `mimo` | Xiaomi MiMo | Chat Completions | `https://token-plan-cn.xiaomimimo.com/v1` | disables thinking by default (`thinking: { type: "disabled" }`) for fast responses |
 | `deepseek` | DeepSeek | Chat Completions | `https://api.deepseek.com` | Anthropic-compatible: `https://api.deepseek.com/anthropic` |
 | `qwen` | Alibaba Cloud Model Studio (DashScope) | Chat Completions | `https://dashscope.aliyuncs.com/compatible-mode/v1` | Singapore: `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. Keys belong to one region. Anthropic-compatible: `https://dashscope.aliyuncs.com/apps/anthropic` |
 | `moonshot` | Moonshot Kimi | Chat Completions | `https://api.moonshot.cn/v1` | International: `https://api.moonshot.ai/v1`. Sends `max_completion_tokens` (its docs deprecate `max_tokens`). Anthropic-compatible: `https://api.moonshot.cn/anthropic` |
@@ -64,8 +65,8 @@ Example model ids from the vendors' docs in 2026-11 (check the vendor's current 
 |---|---|
 | `POCKET_<ID>_API_KEY` | key for this provider (not needed for `ollama`) |
 | `POCKET_<ID>_BASE_URL` | replaces the preset's base URL (international endpoints, proxies). Required for ids that are not presets |
-| `POCKET_<ID>_PROTOCOL` | `openai` or `anthropic`. Example: `POCKET_DEEPSEEK_PROTOCOL=anthropic` with `POCKET_DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic` |
-| `POCKET_<ID>_AUTH` | `bearer`, `x-api-key`, `api-key` or `none`. Default: `x-api-key` for Anthropic, `bearer` for OpenAI |
+| `POCKET_<ID>_PROTOCOL` | `openai`, `openai-responses`, `anthropic`, `gemini`, or `ollama`. Example: `POCKET_DEEPSEEK_PROTOCOL=anthropic` with `POCKET_DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic` |
+| `POCKET_<ID>_AUTH` | `bearer`, `x-api-key`, `x-goog-api-key`, `api-key`, or `none`. Default: `x-api-key` for Anthropic, `x-goog-api-key` for Gemini, `none` for Ollama, `bearer` for OpenAI Chat/Responses |
 | `POCKET_<ID>_EXTRA_BODY` | JSON merged into every request body last, e.g. `'{"reasoning_effort":"low"}'`, `'{"enable_thinking":false}'`, or a larger output limit for a reasoning model (`'{"max_completion_tokens":4000}'`) |
 
 Any other id works as a provider once it has a base URL: `POCKET_MYGW_BASE_URL=https://llm.example.com/v1`, `POCKET_MYGW_API_KEY=…`, then `mygw:some-model` in the list. Such providers default to the OpenAI protocol. These ids are reserved: `assistant`, `voice`, `moss`, `admin`, `public`, `trust`, `port`, `host`, `db`, `config`.

@@ -7,7 +7,7 @@
   <img src="docs/readme/hero-en-light.svg" width="100%" alt="Herdr Pocket: every coding agent on every computer, in your pocket. The mascot Xiaoyang, a sheep girl in a lavender hoodie, cheers from a cloud." />
 </picture>
 
-See what Claude Code, Codex, Gemini CLI and the other agents on each of your computers are doing, right from your phone.<br />
+See what Claude Code, Codex, Gemini CLI and the other agents on each of your computers are doing, right from your phone (Android, iOS, HarmonyOS NEXT) or desktop (Windows, macOS, Linux).<br />
 Message them, press keys, start new ones, or just call Xiaoyang, the assistant, and let her handle it.
 
 *Your coding agents on every computer, in your pocket: a self-hosted relay, a small daemon per computer, and mobile & desktop apps with a voice assistant.*
@@ -60,7 +60,7 @@ Message them, press keys, start new ones, or just call Xiaoyang, the assistant, 
 | **Hands on** | Send messages and pictures, press Esc / Tab / arrows / Ctrl+C, and answer an agent's numbered choices with one tap. The terminal uses the app's own compact keyboard, so the system keyboard doesn't cover the screen; one tap switches back when you need to type Chinese. |
 | **New agents** | In any space on any computer, start an agent installed on that computer: Claude Code, Codex, Gemini CLI, Kimi, Cursor Agent, Droid, CodeBuddy, Qoder, OpenCode… and hand it its first task at the same time. |
 | **Xiaoyang** | One conversation for all your computers: ask who is waiting on you, where an agent is stuck, how much it has cost; have her pass on a message, press keys, start a new agent. By default she acts directly and tells you exactly how it went. When an agent gets stuck or finishes she speaks up on her own, pushing to the notification shade even while the app is closed, and she can set reminders. |
-| **Call her** | Voice calls with Xiaoyang, so you can direct things while you walk. MOSS-Live by default, and the OpenAI Realtime protocol is supported too; nothing waits for a confirm tap during a call. |
+| **Call her** | Voice calls with Xiaoyang, so you can direct things while you walk. Supports MOSS-Live and OpenAI Realtime with on-device voiceprint lock and call noise suppression; nothing waits for a confirm tap during a call. |
 | **Scan to connect** | QR codes are plain https links that any camera can scan. The first device on a new server just scans the code printed at startup; no keys to copy. |
 | **Computer to computer** | From one computer's terminal, look at another computer's agents, send them messages and press keys. |
 | **Your own server** | The relay runs on your own machine, with ready-made setups for Docker, Cloudflare Tunnel, Node + systemd, Fly.io, Render and Kubernetes. |
@@ -82,11 +82,11 @@ Message them, press keys, start new ones, or just call Xiaoyang, the assistant, 
 
 - **Computer side** `herdr-pocket`: one background program per computer. It reads the agents in herdr, sends their state, conversations and terminals to the relay, and carries out what the phone asks for.
 - **Relay**: handles device pairing and tokens, online status and request forwarding; Xiaoyang the assistant runs here too. Every device only ever connects out to it, so computers don't need to open any ports.
-- **Phone app**: an Android app written with Expo / React Native.
+- **Mobile & desktop clients**: Android and iOS apps (Expo / React Native with native voice, noise-suppression, and multi-mirror download modules), HarmonyOS NEXT native Stage-model app (`.hap`), and cross-platform desktop apps for Windows, macOS, and Linux (Tauri v2).
 
 ## Quick start
 
-You need: a server (Linux) that both your phone and your computers can reach, a computer with herdr installed (macOS, Linux or Windows), and an Android phone.
+You need: a server (Linux) that your clients and computers can reach, a computer with herdr installed (macOS, Linux or Windows), and a phone (Android, iOS or HarmonyOS NEXT) or desktop client.
 
 ### 1. Deploy the relay
 
@@ -182,7 +182,7 @@ POCKET_VOICE_KEY=...
 # POCKET_ASSISTANT_CONFIRM=never       # always: ask before acting in text chats (calls never wait for confirmation)
 ```
 
-Built-in text model providers: Anthropic, OpenAI, DeepSeek, Qwen (Tongyi Qianwen), Kimi, Zhipu GLM, SiliconFlow, Volcano Engine Ark, OpenRouter, Gemini, Ollama (local), and any self-hosted gateway compatible with OpenAI or Anthropic. Each provider's address, variables and config-file format are in [docs/config.md](docs/config.md).
+Built-in text model providers: Xiaomi MiMo, Anthropic, OpenAI, DeepSeek, Qwen (Tongyi Qianwen), Kimi, Zhipu GLM, SiliconFlow, Volcano Engine Ark, OpenRouter, Gemini, and Ollama (local). Five protocols are supported (`OpenAI Chat`, `OpenAI Responses (Codex)`, `Anthropic`, `Google Gemini`, and `Ollama`), with 1-tap upstream model auto-scanning in the mobile app, desktop app, and `/admin`. Each provider's address, variables and config-file format are in [docs/config.md](docs/config.md).
 
 Ask before acting (“动手前先问我”) can also be switched in the app's settings or in `/admin`; the changed value is stored on the server.
 
@@ -218,7 +218,7 @@ Computer and server updates first unpack the new version into a directory next t
 
 ## Logs and console
 
-- **`/admin`**: open `https://pocket.example.com/admin` in a browser and enter `POCKET_ADMIN_TOKEN` (the installer generates one). It shows the version, online devices, the assistant's models, statistics for the last 24 hours, logs, and the actions Xiaoyang has taken; you can revoke devices and toggle ask before acting there.
+- **`/admin`**: open `https://pocket.example.com/admin` in a browser and enter `POCKET_ADMIN_TOKEN` (the installer generates one). Configure text providers/models (with upstream model auto-scan), realtime voice, and prompts; inspect version, online devices, 24h statistics, pairing QR codes, and live logs; revoke devices or toggle ask before acting.
 - **`herdr-pocket logs`**: works from any registered computer. Filter by time, device, kind, level and keyword; `--follow` keeps watching.
 - Phone and computer logs are uploaded to the relay periodically, with tokens and keys wiped out before upload.
 
@@ -251,6 +251,7 @@ pnpm --filter @herdr-pocket/relay test
 pnpm --filter @herdr-pocket/hostd test
 
 cd apps/mobile && pnpm install && pnpm typecheck
+cd apps/desktop && pnpm install && pnpm typecheck && pnpm build && pnpm build:harmony
 ```
 
 You can look around the app without a server: on the connect screen, tap “还没有服务器？先逛逛演示数据” (No server yet? Look around with demo data). Collaboration conventions are in [AGENTS.md](AGENTS.md), the docs index is [docs/README.md](docs/README.md), and app development and packaging are in [apps/mobile/README.md](apps/mobile/README.md).
@@ -267,4 +268,4 @@ Herdr Pocket is released under the [GNU Affero General Public License v3.0 only]
 - You may not fold it, or any part of it, into a closed-source product.
 - This license grants no trademark rights to the “Herdr Pocket” name or logo. If you publish a modified version, give it a different name and package name, so nobody mistakes it for the official one.
 
-**Additional permission under AGPL-3.0 section 7.** The website in `apps/site` may be combined with GSAP (distributed under its own “Standard no-charge” license), and the intro video project in `apps/site/video` with Remotion (distributed under the Remotion License), without those libraries falling under the AGPL. They keep their own terms: Remotion, for example, requires a paid company license above a certain team size. Neither library is used by the relay, the computer daemon or the Android app.
+**Additional permission under AGPL-3.0 section 7.** The website in `apps/site` may be combined with GSAP (distributed under its own “Standard no-charge” license), and the intro video project in `apps/site/video` with Remotion (distributed under the Remotion License), without those libraries falling under the AGPL. They keep their own terms: Remotion, for example, requires a paid company license above a certain team size. Neither library is used by the relay, the computer daemon or the mobile and desktop client apps.

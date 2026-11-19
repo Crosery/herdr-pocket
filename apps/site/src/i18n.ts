@@ -20,9 +20,9 @@ const en: Record<string, string> = {
   "hero.need2": "Mobile or desktop app",
   "hero.need3": "Computers running herdr",
   "parts.eyebrow": "Three parts",
-  "parts.title": "One server, one phone,<br />and each of your computers",
+  "parts.title": "One server, mobile & desktop apps,<br />and each of your computers",
   "parts.lead":
-    "The server sits in the middle: the phone and every computer connect only to it, so they never need to share a network. Set them up in order, 1, 2, 3, and every agent on every computer shows up on the phone.",
+    "The server sits in the middle: mobile apps, desktops and every computer connect only to it, so they never need to share a network. Set them up in order, 1, 2, 3, and every agent on every computer shows up in every client.",
   "parts.where": "Runs on",
   "parts.s.t": "Server",
   "parts.s.k": "the relay",
@@ -31,7 +31,7 @@ const en: Record<string, string> = {
   "parts.s.a": "Deploy with one command",
   "parts.p.t": "Clients",
   "parts.p.k": "Mobile & Desktop",
-  "parts.p.w": "Android, iOS, HarmonyOS & Desktop",
+  "parts.p.w": "Android / iOS / HarmonyOS NEXT / Windows / macOS / Linux",
   "parts.p.d": "See every agent's status, conversation and terminal, reply and press keys, get alerts, and talk to Xiaoyang. Scan the server's QR code once to connect.",
   "parts.p.a": "Download and connect",
   "parts.c.t": "Computers",
@@ -94,11 +94,12 @@ const en: Record<string, string> = {
   "as.p4.d":
     "Sending text, pressing keys, creating a space, starting any installed agent (Claude Code, Codex, Gemini, Kimi…): she does it, then tells you how it really went, like “Sent, no reply yet” or “It's busy, so it's queued in the input box.” Rather be asked first? Turn it on in settings; it's off by default.",
   "as.p5.t": "Bring your own model",
-  "as.p5.d": "Anthropic, or any OpenAI-compatible service: DeepSeek, Qwen, Kimi, GLM, OpenRouter, or a local Ollama.",
+  "as.p5.d":
+    "Supports 5 protocols—OpenAI Chat, OpenAI Responses (Codex), Anthropic, Google Gemini native and local Ollama—with built-in presets (Xiaomi MiMo, DeepSeek, Qwen, Kimi, GLM, OpenRouter) and 1-tap upstream model auto-scanning.",
   "call.eyebrow": "Voice calls",
   "call.title": "Too lazy to type?<br />Give Xiaoyang a call.",
   "call.lead":
-    "Real-time voice calls, powered by MOSS-Live by default with more realtime voice providers on the way. Ask “what finished?” on a walk; she checks, then tells you out loud. Audio goes through your own relay and the API key never leaves your server.",
+    "Real-time voice calls supporting MOSS-Live and OpenAI Realtime, with on-device voiceprint lock and call noise suppression. Ask “what finished?” on a walk; she checks, then tells you out loud. Audio goes through your own relay and API keys never leave your server.",
   "call.hint": "Six faces follow the call state. Tap one to try it.",
   "ft.eyebrow": "Details",
   "ft.title": "The little things, already handled",
@@ -155,11 +156,18 @@ const en: Record<string, string> = {
   "dp.3.d": "Scan the setup QR code from step 1 with the phone's camera to open a connect page; install the app, tap the button on that page, and you're connected.",
   "dp.3.cta": "Download clients",
   "dp.3.more": "Only have a setup code? Enter it in the app together with the server address. New versions update from inside the app.",
+  "dp.dl.android": "arm64 APK · in-app self-update",
+  "dp.dl.harmony": "HarmonyOS Stage-model HAP",
+  "dp.dl.ios": "AltStore / SideStore / TrollStore sideload",
+  "dp.dl.macos": "Apple Silicon (arm64) & Intel (x64)",
+  "dp.dl.windows": "x64 NSIS setup & MSI",
+  "dp.dl.linux": "x64 AppImage & Debian package",
   "dp.3.fine": "Requires herdr. On macOS and Linux the installer brings its own Node.js when there's no 22.18 or newer; on Windows it always does. Neither needs administrator rights.",
   "faq.eyebrow": "FAQ",
   "faq.title": "Questions you might have",
-  "faq.1.q": "Are iPhone, HarmonyOS, and desktop supported?",
-  "faq.1.a": "Yes. Mobile releases cover Android (.apk), unsigned iOS sideload (.ipa), and HarmonyOS NEXT (.hap); desktop apps ship for macOS (.dmg), Windows (.exe / .msi), and Linux (.AppImage / .deb).",
+  "faq.1.q": "Are HarmonyOS NEXT, iPhone, and desktop supported?",
+  "faq.1.a":
+    "Yes, all platforms ship together in each release: Android (.apk), HarmonyOS NEXT (.hap, signed with DevEco Studio), unsigned iOS sideload (.ipa for AltStore / SideStore / TrollStore / Xcode), plus macOS (arm64 / x64 .dmg), Windows (x64 -setup.exe / .msi) and Linux (x64 .AppImage / .deb) with consistent pink UI.",
   "faq.2.q": "Which agents can I see?",
   "faq.2.a":
     "Anything running in herdr: Claude Code, Codex, Gemini, OpenCode, Kimi, Qwen, Cursor Agent, Droid, CodeBuddy, Qoder, omp, pi and more, plus plain terminal programs. Recognised agents get their own avatar. Xiaoyang can also start any agent CLI installed on a computer for you.",
@@ -173,7 +181,7 @@ const en: Record<string, string> = {
     "Yes, when you ask. She sends text, presses keys, creates spaces and starts agents, then tells you the real result, like “Sent, no reply yet” or “It's busy, so it's queued in the input box.” To approve each action first, turn on Ask before acting in settings (off by default); during voice calls she never stops to wait. For a view-only phone, see the next question.",
   "faq.6.q": "Which models power the assistant and voice?",
   "faq.6.a":
-    "The text assistant works with Anthropic or any OpenAI-compatible service (DeepSeek, Qwen, Kimi, GLM, OpenRouter, Ollama and others), configured on your server. Voice calls use MOSS-Live by default, with more realtime voice providers being added. Without them you simply have no assistant or voice; everything else works.",
+    "The text assistant supports OpenAI Chat, OpenAI Responses, Anthropic, Google Gemini native and local Ollama (with built-in presets for Xiaomi MiMo, DeepSeek, Qwen, Kimi, GLM, SiliconFlow, Volcengine Ark, OpenRouter and more), plus 1-tap upstream model auto-scanning in the apps and /admin. Voice calls support MOSS-Live and OpenAI Realtime. Without them you simply have no assistant or voice; everything else works.",
   "faq.7.q": "Do alerts arrive when the app is closed?",
   "faq.7.a":
     "Yes. A persistent service on the phone stays connected to your relay, with no Google push involved. Some Android skins need you to allow background running.",

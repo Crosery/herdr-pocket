@@ -2390,18 +2390,78 @@
   flex-direction: column;
   gap: 12px;
 }
-/* step 2: the button and one line beside it */
+/* step 2: button + note, plus 6-platform client download grid */
 .dstep-app {
-  flex-direction: row;
-  align-items: center;
-  gap: 20px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 16px;
 }
-.dstep-app .btn {
+.dstep-app-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px 20px;
+}
+.dstep-app-top .btn {
   flex: none;
 }
-.dstep-app p {
+.dstep-app-top p {
+  flex: 1 1 240px;
   font-size: 14px;
   line-height: 1.6;
+  color: var(--ink-2);
+}
+.dl-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.dl-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  text-decoration: none;
+  color: inherit;
+  transition:
+    border-color 0.2s ease,
+    transform 0.2s ease,
+    background 0.2s ease,
+    box-shadow 0.2s ease;
+}
+.dl-card:hover {
+  border-color: var(--line-2);
+  background: var(--surface);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-sm);
+}
+.dl-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.dl-head b {
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--ink);
+}
+.dl-ext {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--pink-soft);
+  color: var(--accent-deep);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.dl-card small {
+  font-size: 12px;
+  line-height: 1.45;
   color: var(--ink-2);
 }
 /* step 3: what the terminal shows, small, beside the explanation */
@@ -2624,6 +2684,9 @@
   .scan-hint {
     max-width: 420px;
   }
+  .dl-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 /* phones: no rail; the number sits in the card and short dashes join the cards */
 @media (max-width: 760px) {
@@ -2687,6 +2750,14 @@
     flex-direction: column;
     align-items: stretch;
     gap: 12px;
+  }
+  .dstep-app-top {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .dl-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
   .tabs {
     display: flex;
