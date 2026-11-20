@@ -68,7 +68,9 @@ jobs:
       - run: node scripts/set-version.mjs "$VERSION"
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
-      - run: pnpm --filter @herdr-pocket/relay --filter @herdr-pocket/hostd --filter @herdr-pocket/update test
+      - run: pnpm --filter @herdr-pocket/relay test
+      - run: pnpm --filter @herdr-pocket/hostd test
+      - run: pnpm --filter @herdr-pocket/update test
       - run: scripts/pack-release.sh dist
       - uses: actions/upload-artifact@v7
         with:

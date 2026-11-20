@@ -324,7 +324,7 @@ test("phones change models and prompts over the API; the next message uses them 
     const changed = await api("/v1/assistant/config", { token: phone.token, body: { rev: revBeforeModel, models: [{ provider: "custom", model: "new-model" }] } });
     assert.equal(changed.status, 200);
     assert.equal((await api("/v1/assistant/config", { token: phone.token, body: { rev: revBeforeModel, name: "晚了" } })).status, 409);
-    await new Promise((r) => setTimeout(r, 50));
+    for (let i = 0; i < 100 && !frames.some((f) => f.type === "assistant_config" && f.what === "config" && f.by === "Phone A" && f.rev === revBeforeModel + 1); i++) await new Promise((r) => setTimeout(r, 20));
     assert.ok(frames.some((f) => f.type === "assistant_config" && f.what === "config" && f.by === "Phone A" && f.rev === revBeforeModel + 1));
     assert.equal((await api("/v1/health")).json.assistant[0], "custom");
 
@@ -336,6 +336,7 @@ test("phones change models and prompts over the API; the next message uses them 
     const asked = seen.findLast((s) => JSON.stringify(s.body?.messages ?? []).includes("在吗"))!;
     assert.equal(asked.body.model, "new-model");
     assert.match(asked.body.system, /^你叫小羊。今天只说一个字。/);
+    for (let i = 0; i < 100 && !frames.some((f) => f.type === "assistant_config" && f.what === "prompts"); i++) await new Promise((r) => setTimeout(r, 20));
     assert.ok(frames.some((f) => f.type === "assistant_config" && f.what === "prompts"));
     const list = (await api("/v1/assistant/prompts", { token: phone.token })).json.prompts as PromptView[];
     assert.equal(list.length, 10);
