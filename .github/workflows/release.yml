@@ -219,8 +219,18 @@ jobs:
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/HerdrPocket.xcarchive" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" -quiet
           mkdir -p "$RUNNER_TEMP/ipa/Payload" "$GITHUB_WORKSPACE/dist"
-          cp -R "$RUNNER_TEMP/HerdrPocket.xcarchive/Products/Applications/"*.app "$RUNNER_TEMP/ipa/Payload/"
-          (cd "$RUNNER_TEMP/ipa" && zip -qry "$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-ios-arm64.ipa" Payload)
+          app_src=$(find "$RUNNER_TEMP/HerdrPocket.xcarchive/Products/Applications" -maxdepth 1 -name "*.app" | head -n 1)
+          test -n "$app_src"
+          app_dst="$RUNNER_TEMP/ipa/Payload/$(basename "$app_src")"
+          ditto "$app_src" "$app_dst"
+          if [ -d "$app_dst/Frameworks" ]; then
+            for fw in "$app_dst/Frameworks/"*; do
+              [ -e "$fw" ] && codesign --force --sign - --timestamp=none "$fw"
+            done
+          fi
+          codesign --force --sign - --timestamp=none "$app_dst"
+          codesign -dv "$app_dst" 2>&1 | grep -E "^(Identifier|Signature)"
+          (cd "$RUNNER_TEMP/ipa" && ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-ios-arm64.ipa")
       - uses: actions/upload-artifact@v7
         with:
           name: ios
@@ -351,7 +361,18 @@ jobs:
           base="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
           if [ "${{ runner.os }}" = "macOS" ]; then
             app=$(find "$base/macos" -maxdepth 1 -name "*.app" | head -n 1)
-            hdiutil create -volname "Herdr Pocket" -srcfolder "$app" -ov -format UDZO \
+            test -n "$app"
+            if ! codesign --verify --deep --strict "$app" 2>/dev/null; then
+              codesign --force --deep --sign - --entitlements apps/desktop/src-tauri/entitlements.plist "$app"
+              codesign --verify --deep --strict "$app"
+            fi
+            python3 -m venv "$RUNNER_TEMP/dmg-venv"
+            "$RUNNER_TEMP/dmg-venv/bin/pip" install --quiet dmgbuild==2.0.0
+            "$RUNNER_TEMP/dmg-venv/bin/dmgbuild" \
+              -s scripts/dmg-settings.py \
+              -D "app=$app" \
+              -D "repo=$GITHUB_WORKSPACE" \
+              "Herdr Pocket" \
               "dist/herdr-pocket-$VERSION-macos-${{ matrix.arch }}.dmg"
           else
             deb=$(find "$base/deb" -maxdepth 1 -name "*.deb" | head -n 1)
@@ -408,6 +429,16 @@ jobs:
           pattern: desktop-*
           path: dist
           merge-multiple: true
+      - name: Preserve pre-uploaded notarized macOS DMGs
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mkdir -p dist-pre
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "herdr-pocket-$VERSION-macos-*.dmg" --dir dist-pre 2>/dev/null; then
+              for f in dist-pre/herdr-pocket-$VERSION-macos-*.dmg; do
+                [ -s "$f" ] && cp -f "$f" "dist/$(basename "$f")" && echo "Preserved notarized asset: $(basename "$f")"
+              done
+            fi
+          fi
       - run: |
           cd dist
           LC_ALL=C sha256sum -- * > SHA256SUMS

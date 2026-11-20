@@ -9,7 +9,7 @@ export class PocketHarmonyBridge {
   private static instance: PocketHarmonyBridge | null = null;
   private context: common.UIAbilityContext | null = null;
   private pref: preferences.Preferences | null = null;
-  private versionName: string = '0.2.0';
+  private versionName: string = '0.2.1';
   private topDip: number = 0;
   private bottomDip: number = 0;
   private pendingUrl: string = '';
@@ -96,6 +96,18 @@ export class PocketHarmonyBridge {
 
   getSafeArea(): string {
     return `{"top":${this.topDip},"bottom":${this.bottomDip}}`;
+  }
+
+  readRawFile(relPath: string): ArrayBuffer | null {
+    if (!this.context || !relPath || relPath.includes('..')) {
+      return null;
+    }
+    try {
+      const raw: Uint8Array = this.context.resourceManager.getRawFileContentSync(relPath);
+      return raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
+    } catch (_err) {
+      return null;
+    }
   }
 
   getPref(key: string): string {

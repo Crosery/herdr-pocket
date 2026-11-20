@@ -60,12 +60,39 @@ fn clear_auth(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_hostd_config_path() -> Option<PathBuf> {
+    if let Some(custom) = std::env::var_os("HERDR_POCKET_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(custom).join("hostd.json"));
+    }
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .map(|h| PathBuf::from(h).join("AppData").join("Roaming"))
+            });
+        return base.map(|dir| dir.join("herdr-pocket").join("hostd.json"));
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| PathBuf::from(h).join(".config").join("herdr-pocket").join("hostd.json"))
+    }
+}
+
+#[tauri::command]
+fn runtime_arch() -> &'static str {
+    std::env::consts::ARCH
+}
+
 #[tauri::command]
 fn hostd_status() -> HostdLocalStatus {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from);
-    let Some(home) = home else {
+    let Some(cfg_path) = resolve_hostd_config_path() else {
         return HostdLocalStatus {
             installed: false,
             configured: false,
@@ -73,7 +100,6 @@ fn hostd_status() -> HostdLocalStatus {
             device_name: None,
         };
     };
-    let cfg_path = home.join(".config").join("herdr-pocket").join("hostd.json");
     if !cfg_path.exists() {
         return HostdLocalStatus {
             installed: false,
@@ -112,7 +138,8 @@ pub fn run() {
             load_auth,
             save_auth,
             clear_auth,
-            hostd_status
+            hostd_status,
+            runtime_arch
         ])
         .run(tauri::generate_context!())
         .expect("error while running Herdr Pocket desktop application");

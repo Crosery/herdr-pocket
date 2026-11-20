@@ -309,15 +309,26 @@ export interface ReleaseUpdateInfo {
   downloadUrl: string;
 }
 
-function platformDownloadAsset(version: string, platform: PlatformKind): string {
+async function detectMacArch(): Promise<"arm64" | "x64"> {
+  if (isTauri()) {
+    try {
+      const arch = await tauriInvoke<string>("runtime_arch");
+      if (arch === "aarch64" || arch === "arm64") return "arm64";
+      if (arch === "x86_64" || arch === "x64") return "x64";
+    } catch {
+      // Fallback to navigator heuristic outside Tauri
+    }
+  }
+  return typeof navigator !== "undefined" && /intel|x86_64/i.test(navigator.userAgent) ? "x64" : "arm64";
+}
+
+function platformDownloadAsset(version: string, platform: PlatformKind, macArch: "arm64" | "x64"): string {
   const clean = version.trim().replace(/^v/i, "");
   switch (platform) {
     case "openharmony":
       return `herdr-pocket-${clean}-harmonyos-arm64.hap`;
-    case "macos": {
-      const arch = typeof navigator !== "undefined" && /intel|x86_64/i.test(navigator.userAgent) ? "x64" : "arm64";
-      return `herdr-pocket-${clean}-macos-${arch}.dmg`;
-    }
+    case "macos":
+      return `herdr-pocket-${clean}-macos-${macArch}.dmg`;
     case "windows":
       return `herdr-pocket-${clean}-windows-x64-setup.exe`;
     case "linux":
@@ -358,7 +369,8 @@ export async function checkReleaseUpdate(): Promise<ReleaseUpdateInfo> {
   if (!parsed) throw new Error("无法解析最新版本信息");
   const current = appVersion();
   const platform = detectPlatform();
-  const asset = platformDownloadAsset(parsed.version, platform);
+  const macArch = platform === "macos" ? await detectMacArch() : "arm64";
+  const asset = platformDownloadAsset(parsed.version, platform, macArch);
   const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${parsed.version}/${asset}`;
   const downloadUrl = allReleaseSources(rawUrl, china)[0] ?? rawUrl;
   return {

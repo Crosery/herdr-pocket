@@ -2,9 +2,9 @@
   "app": {
     "bundleName": "dev.crosery.herdrpocket",
     "vendor": "crosery",
-    "versionCode": 2000,
-    "versionName": "0.2.0",
-    "icon": "$media:app_icon",
+    "versionCode": 2001,
+    "versionName": "0.2.1",
+    "icon": "$media:layered_image",
     "label": "$string:app_name"
   }
 }

@@ -1,8 +1,10 @@
 [package]
 name = "herdr-pocket-desktop"
-version = "0.2.0"
+version = "0.2.1"
 description = "Herdr Pocket Desktop Client"
-authors = ["Herdr Pocket"]
+authors = ["Herdr Pocket <noreply@users.noreply.github.com>"]
+homepage = "https://github.com/Crosery/herdr-pocket"
+repository = "https://github.com/Crosery/herdr-pocket"
 license = "AGPL-3.0-only"
 edition = "2021"
 
