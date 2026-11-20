@@ -151,6 +151,29 @@ const DEMO_TERMINALS: Record<string, string[]> = {
   ],
 };
 
+const DEMO_FILES: Array<{ dir: string; name: string; kind: "file" | "dir"; size?: number; private?: boolean; ignored?: boolean; hidden?: boolean; body?: string }> = [
+  { dir: "", name: "src", kind: "dir" },
+  { dir: "", name: "node_modules", kind: "dir", ignored: true },
+  { dir: "", name: ".env", kind: "file", size: 120, private: true, hidden: true },
+  {
+    dir: "",
+    name: "README.md",
+    kind: "file",
+    size: 220,
+    body: "# demo-app\n\n演示用的小项目。\n\n## 开发\n\n- `pnpm install`\n- `pnpm dev`\n\n登录回调在 `src/auth/callback.ts`。\n",
+  },
+  { dir: "", name: "package.json", kind: "file", size: 160, body: '{\n  "name": "demo-app",\n  "private": true,\n  "scripts": {\n    "dev": "vite",\n    "test": "vitest run"\n  }\n}\n' },
+  { dir: "src", name: "auth", kind: "dir" },
+  { dir: "src", name: "index.ts", kind: "file", size: 90, body: 'import { handleCallback } from "./auth/callback";\n\nexport function start(): void {\n  console.log("demo-app ready");\n}\n\nexport { handleCallback };\n' },
+  {
+    dir: "src/auth",
+    name: "callback.ts",
+    kind: "file",
+    size: 300,
+    body: 'export interface CallbackQuery {\n  code: string;\n  state?: string;\n}\n\n// TODO: reject an empty state once the 7-day grace period ends.\nexport function handleCallback(q: CallbackQuery): boolean {\n  if (!q.code) return false;\n  return true;\n}\n',
+  },
+];
+
 let demoAssistantState: AssistantState = {
   ready: true,
   voice: true,
@@ -175,17 +198,43 @@ let demoAssistantState: AssistantState = {
   ],
 };
 
-let demoConfig: AssistantConfigView = {
-  rev: 1,
-  name: "小羊",
-  providers: [
-    { id: "openai", label: "Demo Provider", protocol: "openai", baseUrl: "https://api.example.com/v1", auth: "bearer", key: { set: true, hint: "demo", from: "server" }, from: "server" },
-  ],
-  models: [{ provider: "openai", model: "gpt-demo" }],
-  voice: { provider: "openai-realtime", url: "wss://api.example.com/v1/realtime", model: "gpt-realtime", voice: "marin", speed: 1.0, key: { set: true, hint: "demo", from: "server" } },
-  edited: false,
-  warnings: [],
+// Demo models and providers mirror the mobile demo (apps/mobile/src/lib/mockConfig.ts).
+const DEMO_SERVER_PROVIDER = { id: "custom", label: "自建网关", protocol: "openai" as const, baseUrl: "https://llm.example.com/v1", key: { set: true, hint: "a1b2", from: "server" as const }, from: "server" as const };
+const DEMO_MODEL_LISTS: Record<string, string[]> = {
+  custom: ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-6.1-luna", "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"],
+  deepseek: ["deepseek-chat", "deepseek-reasoner"],
 };
+const DEMO_SPEED: Record<string, [number, number]> = {
+  "gpt-6.1-terra": [1800, 2400],
+  "claude-sonnet-5-5": [1200, 2100],
+  "gpt-6.1-sol": [900, 1600],
+  "gpt-6.1-luna": [700, 1300],
+  "claude-opus-5-5": [2600, 4100],
+  "claude-haiku-5-5": [600, 1100],
+  "deepseek-chat": [1500, 2600],
+  "deepseek-reasoner": [4200, 6800],
+};
+
+function demoAssistantConfig(rev: number): AssistantConfigView {
+  return {
+    rev,
+    name: "小羊",
+    providers: [
+      { ...DEMO_SERVER_PROVIDER, key: { ...DEMO_SERVER_PROVIDER.key } },
+      { id: "deepseek", label: "DeepSeek", protocol: "openai", baseUrl: "https://deepseek.example.com/v1", key: { set: true, hint: "e5d4", from: "phone" }, from: "phone" },
+    ],
+    models: [
+      { provider: "custom", model: "gpt-6.1-terra" },
+      { provider: "custom", model: "claude-sonnet-5-5" },
+      { provider: "custom", model: "gpt-6.1-sol" },
+    ],
+    voice: { provider: "openai-realtime", url: "wss://api.example.com/v1/realtime", model: "gpt-realtime", voice: "marin", speed: 1.0, key: { set: true, hint: "demo", from: "server" } },
+    edited: false,
+    warnings: [],
+  };
+}
+
+let demoConfig: AssistantConfigView = demoAssistantConfig(1);
 
 const demoPrompts: PromptView[] = [
   { id: "base", title: "基础规则", about: "规定小羊的行为准则", group: "性格与规矩", slots: [{ slot: "{{name}}", means: "助理名字" }], text: "你是 {{name}}，负责照看所有电脑上的开发任务。", defaultText: "你是 {{name}}，负责照看所有电脑上的开发任务。", edited: false },
@@ -213,6 +262,15 @@ export const mockApi = {
     return { code, expiresAt: Date.now() + 30 * min, link: `https://pocket.example.com/p/${code}` };
   },
   async call(to: string, method: RpcMethod, params: any): Promise<any> {
+    if (method === "host.info") {
+      const d = DEMO_DEVICES.find((x) => x.id === to);
+      // One computer with a checked, partly outdated set and one that has not checked yet.
+      const tools =
+        to === "dev-mac"
+          ? { app: "0.9.4", herdr: "0.6.2", hc: "0.6.2", uniflo: "1.3.0", latest: { app: "0.9.4", hc: "0.7.0", uniflo: "1.3.0", checkedAt: Date.now() - 3 * 60 * min } }
+          : { hc: "0.7.0", uniflo: "1.2.1" };
+      return { name: d?.name ?? "demo", platform: d?.platform ?? "darwin", sources: ["hc", "uniflo"], version: d?.version ?? "0.2.0", tools, files: true };
+    }
     if (method === "terminal.read") {
       const lines = DEMO_TERMINALS[params.agent] ?? ["(demo terminal)"];
       return { text: lines.join("\n"), ansi: lines.join("\n"), cols: 80, rows: 24, complete: true };
@@ -245,6 +303,25 @@ export const mockApi = {
         folders: ["~/work/demo-app", "~/repos/sample-cli"],
         canCreate: true,
       };
+    }
+    if (method === "files.list") {
+      const path: string = (params.path ?? "").replace(/^\/+|\/+$/g, "");
+      const all = DEMO_FILES.filter((f) => f.dir === path && (params.hidden || !f.name.startsWith(".")) && (params.all || !f.ignored));
+      return {
+        root: DEMO_AGENTS.find((a) => a.key === params.agent)?.cwd ?? "~/work/demo-app",
+        path,
+        entries: all
+          .sort((a, b) => Number(b.kind === "dir") - Number(a.kind === "dir") || a.name.localeCompare(b.name))
+          .map(({ dir: _d, body: _b, ...e }) => ({ ...e, path: path ? `${path}/${e.name}` : e.name, mtime: now - 30 * min })),
+        truncated: false,
+      };
+    }
+    if (method === "files.read") {
+      const hit = DEMO_FILES.find((f) => (f.dir ? `${f.dir}/${f.name}` : f.name) === params.path);
+      if (!hit || hit.kind !== "file") throw new Error("没有这个文件");
+      if (hit.private) throw new Error("这个文件可能含有密钥，不能查看");
+      const text = hit.body ?? "";
+      return { path: params.path, size: text.length, mtime: now - 30 * min, binary: false, truncated: false, offset: 0, bytes: text.length, text, language: hit.name.split(".").pop() };
     }
     if (method === "terminal.put") {
       return { paths: (params.files ?? []).map((f: any, i: number) => `/tmp/mock-${i}-${f.name}`) };
@@ -313,22 +390,16 @@ export const mockApi = {
   configView: (): AssistantConfigView => ({ ...demoConfig, providers: demoConfig.providers.map((p) => ({ ...p })), models: demoConfig.models.map((m) => ({ ...m })) }),
   saveConfig(patch: AssistantConfigChange): AssistantConfigView {
     if (patch.reset) {
-      demoConfig = {
-        rev: demoConfig.rev + 1,
-        name: "小羊",
-        providers: [{ id: "openai", label: "Demo Provider", protocol: "openai", baseUrl: "https://api.example.com/v1", auth: "bearer", key: { set: true, hint: "demo", from: "server" }, from: "server" }],
-        models: [{ provider: "openai", model: "gpt-demo" }],
-        voice: { provider: "openai-realtime", url: "wss://api.example.com/v1/realtime", model: "gpt-realtime", voice: "marin", speed: 1.0, key: { set: true, hint: "demo", from: "server" } },
-        edited: false,
-        warnings: [],
-      };
+      const base = demoAssistantConfig(demoConfig.rev + 1);
+      // Reset drops what apps added: only the server's provider stays.
+      demoConfig = { ...base, providers: base.providers.filter((p) => p.from === "server") };
       return mockApi.configView();
     }
     if (patch.name !== undefined) demoConfig.name = patch.name;
     for (const p of patch.providers ?? []) {
       const idx = demoConfig.providers.findIndex((x) => x.id === p.id);
-      if (p.reset && p.id === "openai") {
-        const orig = { id: "openai", label: "Demo Provider", protocol: "openai" as const, baseUrl: "https://api.example.com/v1", auth: "bearer" as const, key: { set: true, hint: "demo", from: "server" as const }, from: "server" as const };
+      if (p.reset && p.id === DEMO_SERVER_PROVIDER.id) {
+        const orig = { ...DEMO_SERVER_PROVIDER, key: { ...DEMO_SERVER_PROVIDER.key } };
         if (idx >= 0) demoConfig.providers[idx] = orig;
         else demoConfig.providers.unshift(orig);
         continue;
@@ -392,7 +463,30 @@ export const mockApi = {
     if (id.includes("mimo") || url.includes("xiaomimimo.com")) return ["mimo-v2.6-flash", "mimo-v2.6-pro"];
     if (id.includes("gemini") || (typeof provider !== "string" && provider.protocol === "gemini")) return ["gemini-2.5-flash", "gemini-2.5-pro"];
     if (id.includes("ollama") || (typeof provider !== "string" && provider.protocol === "ollama")) return ["qwen3:8b", "llama3.3"];
-    return ["gpt-demo", "gpt-demo-fast"];
+    return DEMO_MODEL_LISTS[id] ?? ["gpt-demo", "gpt-demo-fast"];
+  },
+  /** A demo speed test: plausible times, a 404 for a model the provider does not list, a key error without a key. */
+  async testModel(body: { provider: string | ProviderPatch; model: string }): Promise<{ ok: boolean; firstMs?: number; totalMs?: number; reply?: string; error?: string }> {
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const model = body.model.trim();
+    const id = typeof body.provider === "string" ? body.provider : body.provider.id;
+    const saved = demoConfig.providers.find((p) => p.id === id);
+    const keyed = typeof body.provider === "string" ? Boolean(saved?.key.set) : Boolean(body.provider.apiKey || saved?.key.set);
+    const free = typeof body.provider === "string" ? saved?.auth === "none" || saved?.protocol === "ollama" : body.provider.auth === "none" || body.provider.protocol === "ollama";
+    await wait(300);
+    if (typeof body.provider === "string" && !saved) return { ok: false, error: `没有叫 ${id} 的服务商。` };
+    if (!keyed && !free) return { ok: false, totalMs: 320, error: "HTTP 401: invalid api key" };
+    const list = DEMO_MODEL_LISTS[id];
+    if (list && !list.includes(model)) {
+      await wait(300);
+      return { ok: false, totalMs: 640, error: `服务商说没有这个模型：${model}（404）` };
+    }
+    const [first, total] = DEMO_SPEED[model] ?? [1400, 2300];
+    const jitter = () => 0.88 + Math.random() * 0.24;
+    const firstMs = Math.round(first * jitter());
+    const totalMs = Math.max(firstMs + 200, Math.round(total * jitter()));
+    await wait(Math.min(Math.round(totalMs / 3), 900));
+    return { ok: true, firstMs, totalMs, reply: "你好，我在。" };
   },
   voiceCatalog: () => ({ provider: "openai-realtime" as const, defaultVoice: "marin", voices: [...OPENAI_REALTIME_VOICES] }),
   prompts: (): PromptView[] => demoPrompts.map((p) => ({ ...p })),

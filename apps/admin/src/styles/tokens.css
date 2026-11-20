@@ -167,9 +167,11 @@
   50% { transform: scale(1.06); opacity: 1; }
 }
 
+/* The lift is a share of the sticker's own height, so it scales with the orb:
+   a fixed 4px pushed small orbs' stickers past the ring. */
 @keyframes mascotFloat {
-  0%, 100% { transform: translateY(0px); }
-  50% { transform: translateY(-4px); }
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3%); }
 }
 
 @keyframes eqPulse {

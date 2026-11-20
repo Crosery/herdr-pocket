@@ -34,16 +34,23 @@
 - 想从自己的 fork 更新：`HERDR_POCKET_REPO=<owner>/<repo> herdr-pocket update`；安装脚本同样认这个变量。
 - 查询 GitHub 有频率限制（未登录每小时 60 次），设置 `GITHUB_TOKEN` 可以放宽。
 
+电脑端还会查它依赖的 hc（herdr-core）、Herdr 桌面版和 uniflo 有没有新版本：启动后几分钟查一次，之后大约每天一次，只报告，不安装。hc 看 Herdr 发布服务器的 `core/latest.json`（设了 `HERDR_RELEASES_URL` 就用它），只有和正在运行的 hc 同一代（`generation`）的版本才算可更新；Herdr 桌面版装了才查 `app/latest.json`；uniflo 用它自己的 `uniflo update --check --json`。离线时保留上次的结果。每次的结果写进日志（`herdr-pocket logs --kind update`），`herdr-pocket status` 的 `upstream` 一行能看到。`update.checkTools: false` 可以关掉，详见[配置说明](../config.md#updates-of-hc-the-herdr-app-and-uniflo)。
+
 ### 中国大陆
 
-在中国大陆直连 GitHub 很慢或者连不上（2026-11 实测：直连下载 APK 约 100 KB/s，`herdr-pocket update` 直连失败），所以按设备时区判断，时区是中国大陆的（`Asia/Shanghai` 等；Windows 是“China Standard Time”）就先走镜像：
+在中国大陆直连 GitHub 很慢或者连不上（2026-11 实测：直连下载 APK 约 100 KB/s，`herdr-pocket update` 直连失败），所以先判断设备在哪个地区，再决定先找哪些下载源：
 
-- 发布文件（版本信息、发布包、APK）：先试 `ghfast.top`、`gh-proxy.com`，最后才直连 GitHub。其他地区反过来，直连失败才用镜像。
+- 地区按这个顺序定：先看 `HERDR_POCKET_MIRROR`（`1` 或 `cn` 先走镜像，`0` 或 `global` 先走 GitHub）；没设就看 `config.json` 里的 `update.region`（`cn`、`global`，`auto` 等于没写，见[配置说明](../config.md#computers-and-the-desktop-app-configjson)）；再没有就看时区，时区是中国大陆的（`Asia/Shanghai` 等；Windows 是“China Standard Time”）算中国大陆。电脑端、中转服务和安装脚本都按这个顺序。
+- 下载源的顺序：`update.mirrors` 里自己配的镜像排最前；中国大陆接着是 `ghfast.top`、`gh-proxy.com`、`cdn.gh-proxy.com`、`edgeone.gh-proxy.com`，最后才是 GitHub；其他地区 GitHub 在前，镜像在后。
+- 不是一个一个地试：查新版本时同时向所有源要最新 Release 的 `SHA256SUMS`，每个最多等 4 秒，第一个回答后其他的再等 150 ms，然后选最快的；两个源差不到 150 ms 时，排在前面的优先。选中的源记一天（`~/.local/state/herdr-pocket/sources.json`，Windows 在 `%LOCALAPPDATA%\herdr-pocket\sources.json`），这一天里查新版本和下载都先找它，下载失败再按上面的顺序换下一个。所有源都没在时限内回答时，才一个一个慢慢试，GitHub API 也在其中（中国大陆放最后，其他地区放最前）。
+- `herdr-pocket update --check` 会说地区是怎么定的、哪个源回答的、用了多久；`herdr-pocket update --probe` 当场把所有源测一遍，打印每个的用时，并记下最快的。
+- 电脑端自动查新版本：启动后 1 到 5 分钟查第一次，之后每隔 `update.checkIntervalHours`（默认 24 小时，前后随机差 10%，免得很多电脑同时查）。每次查的结果、来源和用时都写进日志（`herdr-pocket logs --kind update`）。设 `HERDR_POCKET_UPDATE_CHECK=0` 或 `update.autoCheck: false` 就不自动查。
+- 安装脚本（`install-host.sh`、`install-host.ps1`）下载前也会这样测一遍，但只用内置的镜像，不读 `update.mirrors`。
 - 版本信息读的是最新 Release 的 `SHA256SUMS`。镜像能转发这个文件，但转发不了 GitHub API。
-- 安装脚本要下载 Node 时，校验值总是取自 nodejs.org，Node 安装包本身先从 `npmmirror.com` 下载。
+- 安装脚本要下载 Node 时，校验值总是取自 nodejs.org，Node 安装包本身在中国大陆先从 `npmmirror.com` 下载。
 - 不管从哪里下载，都会核对 `SHA256SUMS`。手机端 Android 还会检查签名，只接受同一把密钥签名的更新包。
-- 服务器时区常常是 UTC：设 `HERDR_POCKET_MIRROR=1` 强制先走镜像，设成 `0` 则不用镜像。电脑端、中转服务和安装脚本都认这个变量。
-- 手机 App 只看手机的时区。这套逻辑从 0.1.4 起才有，0.1.3 及以前的 App 还是直连 GitHub。
+- 服务器时区常常是 UTC：设 `HERDR_POCKET_MIRROR=1` 强制先走镜像，设成 `0` 则先走 GitHub；也可以在 `config.json` 里写 `update.region`。
+- 手机 App 只看手机的时区，也不测速。这套逻辑从 0.1.4 起才有，0.1.3 及以前的 App 还是直连 GitHub。
 
 ## 发布步骤
 

@@ -159,6 +159,30 @@ test("fallback: a provider that stays silent past the first-token limit is skipp
   await assert.rejects(makeLlm({ targets: [t("slow", "/slow"), t("empty", "/empty")], firstByteMs: 150 })({ system: "s", messages: [{ role: "user", content: "hi" }], tools: [] }), { message: "empty:m: empty answer" });
 });
 
+test("reasoning without an answer fails the connectivity test and passes the original request to the next model", async () => {
+  handler = (path, _body, res) => {
+    if (path.startsWith("/reasoning/")) {
+      stream(res, [
+        { choices: [{ delta: { reasoning_content: "thinking" } }] },
+        { choices: [{ delta: { content: "\n" }, finish_reason: "length" }] },
+      ]);
+    } else {
+      stream(res, [{ choices: [{ delta: { content: "备用模型可以回复。" }, finish_reason: "stop" }] }]);
+    }
+  };
+  const first: LlmTarget = { provider: "mimo", protocol: "openai", baseUrl: `${base}/reasoning`, model: "first" };
+  const second = { ...first, baseUrl: `${base}/backup`, model: "backup" };
+  const ping = await testModel(first);
+  assert.equal(ping.ok, false);
+  assert.match(ping.error ?? "", /empty answer/);
+
+  const messages: Msg[] = [{ role: "user", content: "能试一下其他模型吗？" }];
+  const result = await makeLlm({ targets: [first, second] })({ system: "s", messages, tools: TOOLS });
+  assert.deepEqual(result.content, [{ type: "text", text: "备用模型可以回复。" }]);
+  assert.equal(seen.at(-1)!.body.model, "backup");
+  assert.deepEqual(seen.at(-1)!.body.messages.at(-1), messages[0]);
+});
+
 test("OpenAI Responses API: streams tool_call and text, lists models", async () => {
   seen.length = 0;
   handler = (path, _b, res) => {

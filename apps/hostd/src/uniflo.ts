@@ -19,6 +19,9 @@ export interface UnifloSession {
   usage?: { cost_usd?: number; last_context_tokens?: number; context_limit?: number; steps?: number };
 }
 
+/** Clock slack between a terminal's creation (hc) and a session's start (Uniflo), same machine. */
+const BORN_SLACK_MS = 2000;
+
 /** The parts of a session that change what agents show: a new one, its status, process or title. */
 const sessionSig = (s: UnifloSession): string => `${s.status}|${s.pid ?? ""}|${s.title ?? ""}|${s.parent ?? ""}`;
 
@@ -414,9 +417,25 @@ export class UnifloAdapter {
    *    one candidate session share that pair — never guess between several.
    * 3. Otherwise same harness + cwd + title (the terminal title a harness sets is
    *    its session title), again only when one agent and one session share it.
+   *
+   * Guesses 2 and 3 only consider sessions from the terminal's own lifetime
+   * (`created`: when the terminal was opened): a session that started after
+   * it, or was written to after it (a program that continued an older one).
+   * Without this a new agent in a folder showed the folder's previous
+   * conversation until its own session appeared.
    */
-  enrich(agents: Agent[], pids: Map<string, number | undefined>, hints: Map<string, string> = new Map()): Agent[] {
+  enrich(
+    agents: Agent[],
+    pids: Map<string, number | undefined>,
+    hints: Map<string, string> = new Map(),
+    created: Map<string, number> = new Map(),
+  ): Agent[] {
     if (!this.sessions.length) return agents;
+    const fits = (a: Agent, s: UnifloSession): boolean => {
+      const born = created.get(a.key);
+      if (!born) return true;
+      return (s.started_at ?? 0) >= born - BORN_SLACK_MS || s.updated_at > born;
+    };
     const byPid = new Map<number, UnifloSession>();
     for (const s of this.sessions) if (s.pid) byPid.set(s.pid, s);
     const used = new Set<string>();
@@ -456,7 +475,7 @@ export class UnifloAdapter {
       if (group.length !== 1) continue;
       const [h, cwd] = k.split("\u0000");
       const cands = this.sessions.filter(
-        (s) => s.harness === h && s.cwd === cwd && !used.has(s.key) && s.updated_at > weekAgo,
+        (s) => s.harness === h && s.cwd === cwd && !used.has(s.key) && s.updated_at > weekAgo && fits(group[0]!, s),
       );
       if (cands.length !== 1) continue;
       matched.set(group[0]!.key, cands[0]!);
@@ -469,7 +488,8 @@ export class UnifloAdapter {
       const h = harnessId(a.harness);
       if (left.some((b) => b !== a && harnessId(b.harness) === h && b.cwd === a.cwd && sameTitle(b.title, a.title))) continue;
       const cands = this.sessions.filter(
-        (s) => s.harness === h && s.cwd === a.cwd && !used.has(s.key) && s.updated_at > weekAgo && sameTitle(cleanTitle(s.title), a.title),
+        (s) =>
+          s.harness === h && s.cwd === a.cwd && !used.has(s.key) && s.updated_at > weekAgo && fits(a, s) && sameTitle(cleanTitle(s.title), a.title),
       );
       if (cands.length !== 1) continue;
       matched.set(a.key, cands[0]!);

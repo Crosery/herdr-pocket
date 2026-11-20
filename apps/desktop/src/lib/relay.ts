@@ -5,6 +5,7 @@ import {
   type DeviceKind,
   type JoinRequest,
   type PairCode,
+  type PairRequest,
   type PairResponse,
   type RpcError,
   type RpcMethod,
@@ -13,9 +14,11 @@ import {
   type ServerFrame,
 } from "@herdr-pocket/protocol";
 import { liveStore, settingsStore, updateSettings } from "./store";
-import { clearSession, defaultDeviceName, detectPlatform, pushSystemNotification, saveSession } from "./bridge";
+import { clearSession, defaultDeviceName, detectPlatform, getLocalPairCode, pushSystemNotification, saveSession, type LocalPairError } from "./bridge";
 import { isMockServer, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
+import { logger } from "./log";
+import { onNativeEvent } from "./native";
 
 export class RelayError extends Error {
   code: RpcError["code"];
@@ -56,18 +59,23 @@ export async function restRequest<T>(
       signal: abort.signal,
       headers: { ...headers, ...(init.headers as Record<string, string> | undefined) },
     });
-  } catch {
-    throw new RelayError("offline", `连不上 ${server.replace(/^https?:\/\//i, "")}，请检查服务器地址与网络`);
+  } catch (err) {
+    logger.warn("relay", `${init.method ?? "GET"} ${path} failed: ${(err as Error)?.name === "AbortError" ? "timeout" : String(err)}`);
+    throw new RelayError("offline", `连不上 ${server.replace(/^https?:\/\//i, "")}：检查地址是否写对、服务器是否在运行；公司网络可能需要代理`);
   } finally {
     clearTimeout(timer);
   }
   const body = (await res.json().catch(() => ({}))) as { error?: RpcError } & T;
   if (!res.ok) {
     const err = body.error;
+    logger.warn("relay", `${init.method ?? "GET"} ${path} -> HTTP ${res.status} ${err?.code ?? ""} ${err?.message ?? ""}`);
     throw new RelayError(err?.code ?? (res.status === 401 ? "unauthorized" : "internal"), err?.message ?? `HTTP ${res.status}`);
   }
   return body;
 }
+
+/** How a pair code reached this app; only the relay's log sees it (PairRequest.via). */
+export type PairVia = "local-login" | "link" | "typed" | "qr";
 
 export async function pairDevice(
   server: string,
@@ -75,13 +83,27 @@ export async function pairDevice(
   name: string,
   platform: string,
   previousToken?: string,
+  via: PairVia = "typed",
 ): Promise<PairResponse> {
   if (isMockServer(server)) return mockApi.pair(code, name, platform);
+  const req: PairRequest = { code: code.trim().toUpperCase(), name, kind: "viewer", platform, via };
   return restRequest<PairResponse>(server, "/v1/pair", {
     method: "POST",
     token: previousToken,
-    body: JSON.stringify({ code: code.trim().toUpperCase(), name, kind: "viewer", platform }),
+    body: JSON.stringify(req),
   });
+}
+
+type LinkState = ReturnType<typeof liveStore.get>["link"];
+
+/** Every change of the link state goes through here, so each transition is logged exactly once. */
+function setLink(next: LinkState, detail?: string): void {
+  const prev = liveStore.get().link;
+  if (prev === next) return;
+  liveStore.set({ link: next });
+  const line = `link ${prev} -> ${next}${detail ? ` (${detail})` : ""}`;
+  if (next === "online" || next === "connecting" || next === "idle") logger.info("link", line);
+  else logger.warn("link", line);
 }
 
 export async function createPairCode(server: string, token: string, kind?: DeviceKind): Promise<PairCode> {
@@ -119,6 +141,36 @@ export async function tokenStillValid(server: string, token: string): Promise<bo
   }
 }
 
+/** Ping cadence; the relay answers each ping with a pong. */
+const HEARTBEAT_MS = 20_000;
+/** Watchdog cadence (also how soon a hung connect or a dead socket is noticed). */
+const TICK_MS = 5_000;
+/** An open socket with no frame and no pong for this long is dead. */
+const SILENT_DEAD_MS = 2 * HEARTBEAT_MS;
+/** A watchdog tick this late means timers were throttled or the page was frozen, not that the link died. */
+const TIMER_GAP_MS = 3 * TICK_MS;
+const PONG_TIMEOUT_MS = 8_000;
+const WAKE_PONG_TIMEOUT_MS = 4_000;
+const CONNECT_TIMEOUT_MS = 12_000;
+const MAX_BACKOFF_MS = 15_000;
+
+/** Native "app://wake" (src-tauri/src/mainwin.rs): window focus/show, Dock reopen, network change. */
+const WAKE_EVENT = "app://wake";
+interface AppWake {
+  reason?: string;
+  /** Only with reason "network"; null when the system could not tell. */
+  online?: boolean | null;
+}
+
+/** Runs a callback that belongs to someone else; its exception must not stop the reconnect logic. */
+function safely(fn: () => void): void {
+  try {
+    fn();
+  } catch (err) {
+    logger.warn("relay", `listener failed: ${String(err)}`);
+  }
+}
+
 type StreamCb = (ev: any) => void;
 interface PendingRpc {
   resolve: (v: unknown) => void;
@@ -142,16 +194,52 @@ class SocketClient {
   private seq = 0;
   private backoff = 1000;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
-  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private tickTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   private welcomed = false;
   private seenNoticeIds = new Set<string>();
+  /** Last time anything arrived on the socket (frames and pongs alike). */
+  private lastSeen = 0;
+  private lastPing = 0;
+  private connectStartedAt = 0;
+  private attempt = 0;
+  private lastTick = Date.now();
+  /** When the current socket was first seen closing without its close event (0: not seen). */
+  private stuckSince = 0;
+  private readonly offWake: () => void;
+  private readonly onVisible = () => {
+    if (document.visibilityState === "visible") this.wake("window visible");
+  };
+  private readonly onFocus = () => this.wake("window focus");
+  private readonly onOnline = () => this.wake("network online");
+  private readonly onOffline = () => logger.warn("link", "network offline (system)");
 
   constructor(private server: string, readonly token: string) {
     this.open();
     this.openNotify();
-    this.pingTimer = setInterval(() => this.ping(), 20_000);
+    this.tickTimer = setInterval(() => this.tick(), TICK_MS);
+    // Timers can stall while the window is hidden (App Nap, WKWebView throttling): these
+    // events check the link again as soon as the app or the network comes back.
+    if (typeof window !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisible);
+      window.addEventListener("focus", this.onFocus);
+      window.addEventListener("online", this.onOnline);
+      window.addEventListener("offline", this.onOffline);
+    }
+    // The desktop app also tells us about Dock reopen and network changes the page cannot see.
+    this.offWake = onNativeEvent<AppWake>(WAKE_EVENT, (p) => this.onAppWake(p ?? {}));
+  }
+
+  private onAppWake(p: AppWake): void {
+    const reason = p.reason || "unknown";
+    if (reason === "network" && p.online === false) {
+      // Nothing to reconnect to yet; an open socket is probably dead, and a ping tells.
+      logger.warn("link", "app wake: network gone");
+      if (this.ws?.readyState === WebSocket.OPEN) this.ping(WAKE_PONG_TIMEOUT_MS, "network gone: no pong");
+      return;
+    }
+    this.wake(`app wake: ${reason}`);
   }
 
   private send(frame: ClientFrame): boolean {
@@ -162,17 +250,33 @@ class SocketClient {
 
   private open(): void {
     if (this.closed) return;
-    liveStore.set({ link: "connecting" });
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    this.attempt += 1;
+    this.connectStartedAt = Date.now();
+    this.stuckSince = 0;
+    setLink("connecting", `attempt ${this.attempt}`);
     this.welcomed = false;
-    const ws = new WebSocket(wsUrlFor(this.server, "/v1/ws", this.token));
+    logger.info("relay", `connecting to ${this.server} (attempt ${this.attempt})`);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsUrlFor(this.server, "/v1/ws", this.token));
+    } catch (err) {
+      // Without this the retry chain would end here: no socket, so no close event, no next try.
+      this.dropSocket(`cannot open socket: ${String(err)}`);
+      return;
+    }
     this.ws = ws;
     ws.onopen = () => {
       if (this.ws !== ws) return;
-      this.backoff = 1000;
+      this.lastSeen = Date.now();
       this.send({ type: "hello", version: PROTOCOL_VERSION, platform: detectPlatform() });
     };
     ws.onmessage = (ev) => {
       if (this.ws !== ws || typeof ev.data !== "string") return;
+      this.lastSeen = Date.now();
       try {
         this.onFrame(JSON.parse(ev.data) as ServerFrame);
       } catch {
@@ -181,36 +285,156 @@ class SocketClient {
     };
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;
-      this.ws = null;
-      this.clearPong();
-      for (const s of this.subs.values()) s.onState?.({ kind: "stale", error: "连接断开" });
-      for (const p of this.pending.values()) {
-        clearTimeout(p.timer);
-        p.reject(new RelayError("offline", "连接断开"));
+      this.dropSocket(`socket closed (code ${ev.code}${ev.reason ? `, ${ev.reason}` : ""})`, ev.code);
+    };
+  }
+
+  /**
+   * Forgets the current socket without waiting for its close event (a half-open socket can
+   * take minutes to report one), fails what was waiting on it and schedules the next try.
+   */
+  private dropSocket(reason: string, code?: number, retryNow = false): void {
+    const old = this.ws;
+    this.ws = null;
+    this.stuckSince = 0;
+    if (old) {
+      old.onopen = old.onmessage = old.onclose = old.onerror = null;
+      if (old.readyState === WebSocket.OPEN || old.readyState === WebSocket.CONNECTING) {
+        try {
+          old.close(4000, "reconnect");
+        } catch {
+          // already closing
+        }
       }
-      this.pending.clear();
-      if (this.closed) return;
-      if (ev.code === 4001) {
-        liveStore.set({ link: "unauthorized" });
-        return;
-      }
+    }
+    this.clearPong();
+    const subs = [...this.subs.values()];
+    const pending = [...this.pending.values()];
+    this.pending.clear();
+    // The next try is booked before anyone else's code runs, so nothing can end the chain.
+    if (!this.closed && code !== 4001) {
+      const delay = retryNow ? 0 : this.backoff;
+      if (this.retryTimer) clearTimeout(this.retryTimer);
+      this.retryTimer = setTimeout(() => this.open(), delay);
+      if (!retryNow) this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);
+      logger.warn("relay", `${reason}; reconnect in ${delay} ms`);
       if (!this.welcomed) {
         void tokenStillValid(this.server, this.token).then((ok) => {
           if (!ok && !this.closed) {
-            liveStore.set({ link: "unauthorized" });
+            setLink("unauthorized", "token no longer valid");
             this.closed = true;
           }
         });
       }
-      liveStore.set({ link: "offline" });
-      this.retryTimer = setTimeout(() => this.open(), this.backoff);
-      this.backoff = Math.min(this.backoff * 2, 15_000);
-    };
+    }
+    if (!this.closed) setLink(code === 4001 ? "unauthorized" : "offline", reason);
+    for (const s of subs) safely(() => s.onState?.({ kind: "stale", error: "连接断开" }));
+    for (const p of pending) {
+      clearTimeout(p.timer);
+      safely(() => p.reject(new RelayError("offline", "连接断开")));
+    }
+  }
+
+  /** Closes the socket and connects again now; `cause` is logged. */
+  private reconnect(cause: string): void {
+    if (this.closed || liveStore.get().link === "unauthorized") return;
+    logger.info("link", `reconnect: ${cause}`);
+    this.dropSocket(cause, undefined, true);
+    // If the link went silent, so did the notification socket, and nothing is ever sent on it.
+    this.recycleNotify();
+  }
+
+  /**
+   * Watchdog, every TICK_MS. It keeps the chain going: there is always either a socket being
+   * watched or a retry booked. A connect that hangs, a socket stuck closing, or an open socket
+   * with no frame or pong for two heartbeats is replaced instead of waiting for a close event.
+   */
+  private tick(): void {
+    if (this.closed) return;
+    const now = Date.now();
+    const gap = now - this.lastTick;
+    this.lastTick = now;
+    const ws = this.ws;
+    if (!ws) {
+      if (!this.retryTimer && liveStore.get().link !== "unauthorized") {
+        logger.warn("link", "watchdog: no socket and no retry booked");
+        this.open();
+      }
+      return;
+    }
+    if (ws.readyState === WebSocket.CONNECTING) {
+      if (now - this.connectStartedAt > CONNECT_TIMEOUT_MS) {
+        this.reconnect(`connect timed out after ${Math.round((now - this.connectStartedAt) / 1000)} s`);
+      }
+      return;
+    }
+    if (ws.readyState !== WebSocket.OPEN) {
+      // CLOSING or CLOSED with no close event yet: a half-open socket can stay like that for minutes.
+      if (!this.stuckSince) this.stuckSince = now;
+      else if (now - this.stuckSince >= TICK_MS) this.dropSocket(`socket stuck closing for ${Math.round((now - this.stuckSince) / 1000)} s`);
+      return;
+    }
+    if (gap > TIMER_GAP_MS) {
+      // Throttled or frozen timers (hidden window, App Nap): silence proves nothing, a ping does.
+      logger.info("link", `timers resumed after ${Math.round(gap / 1000)} s; checking the link`);
+      this.ping(WAKE_PONG_TIMEOUT_MS, `no pong after a ${Math.round(gap / 1000)} s timer gap`);
+      return;
+    }
+    if (!this.welcomed && now - this.connectStartedAt > CONNECT_TIMEOUT_MS) {
+      this.reconnect(`no welcome ${Math.round((now - this.connectStartedAt) / 1000)} s after connecting`);
+      return;
+    }
+    if (this.lastSeen && now - this.lastSeen > SILENT_DEAD_MS) {
+      this.reconnect(`no frame or pong for ${Math.round((now - this.lastSeen) / 1000)} s`);
+      return;
+    }
+    if (now - this.lastPing >= HEARTBEAT_MS) this.ping(PONG_TIMEOUT_MS, "pong timeout");
+  }
+
+  /** The app or the network came back: reconnect now, or prove an open link with a ping. */
+  private wake(cause: string): void {
+    if (this.closed) return;
+    const link = liveStore.get().link;
+    if (link === "unauthorized") return;
+    if (settingsStore.get().notifications && !this.notifyWs) this.openNotify();
+    const ws = this.ws;
+    if (ws?.readyState === WebSocket.OPEN) {
+      // One ping in flight is enough (focus and app wake usually arrive together).
+      if (this.pongTimer || Date.now() - this.lastPing < 2_000) return;
+      logger.debug("link", `${cause}: checking the link`);
+      this.ping(WAKE_PONG_TIMEOUT_MS, `${cause}: no pong`);
+      return;
+    }
+    if (ws?.readyState === WebSocket.CONNECTING && Date.now() - this.connectStartedAt < 5_000) return;
+    this.backoff = 1000;
+    this.reconnect(cause);
+  }
+
+  private recycleNotify(): void {
+    const old = this.notifyWs;
+    if (!old) return;
+    this.notifyWs = null;
+    old.onmessage = old.onclose = null;
+    try {
+      old.close(4000, "reconnect");
+    } catch {
+      // already closing
+    }
+    this.openNotify();
   }
 
   private openNotify(): void {
     if (this.closed || !settingsStore.get().notifications) return;
-    const ws = new WebSocket(wsUrlFor(this.server, `/v1/notify?since=${Date.now()}`, this.token));
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsUrlFor(this.server, `/v1/notify?since=${Date.now()}`, this.token));
+    } catch (err) {
+      logger.warn("relay", `cannot open the notification socket: ${String(err)}`);
+      setTimeout(() => {
+        if (!this.notifyWs) this.openNotify();
+      }, 5000);
+      return;
+    }
     this.notifyWs = ws;
     ws.onmessage = (ev) => {
       if (typeof ev.data !== "string") return;
@@ -243,7 +467,9 @@ class SocketClient {
     switch (f.type) {
       case "welcome":
         this.welcomed = true;
-        liveStore.set({ link: "online" });
+        setLink("online", `attempt ${this.attempt}, ${Date.now() - this.connectStartedAt} ms`);
+        this.backoff = 1000;
+        this.attempt = 0;
         void loadAssistant();
         for (const s of this.subs.values()) {
           this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
@@ -285,7 +511,10 @@ class SocketClient {
         if (!p) break;
         this.pending.delete(f.id);
         clearTimeout(p.timer);
-        if (f.error) p.reject(new RelayError(f.error.code, f.error.message));
+        if (f.error) {
+          logger.warn("rpc", `${f.id} ${f.error.code}: ${f.error.message}`);
+          p.reject(new RelayError(f.error.code, f.error.message));
+        }
         else p.resolve(f.result);
         break;
       }
@@ -303,21 +532,23 @@ class SocketClient {
         this.clearPong();
         break;
       case "error":
-        if (f.error.code === "unauthorized") liveStore.set({ link: "unauthorized" });
+        logger.warn("relay", `server error ${f.error.code}: ${f.error.message}`);
+        if (f.error.code === "unauthorized") setLink("unauthorized", "server said unauthorized");
         break;
       default:
         onAssistantFrame(f);
     }
   }
 
-  private ping(): void {
+  private ping(timeoutMs: number, cause: string): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    this.send({ type: "ping", t: Date.now() });
+    this.lastPing = Date.now();
+    this.send({ type: "ping", t: this.lastPing });
     if (!this.pongTimer) {
       this.pongTimer = setTimeout(() => {
         this.pongTimer = null;
-        this.ws?.close(4000, "pong timeout");
-      }, 6000);
+        this.reconnect(cause);
+      }, timeoutMs);
     }
   }
 
@@ -371,11 +602,25 @@ class SocketClient {
     }
   }
 
+  /** "立即重连": try now instead of waiting for the backoff. */
+  retryNow(): void {
+    this.backoff = 1000;
+    this.wake("user asked to reconnect");
+  }
+
   close(): void {
     this.closed = true;
     this.clearPong();
     if (this.retryTimer) clearTimeout(this.retryTimer);
-    if (this.pingTimer) clearInterval(this.pingTimer);
+    if (this.tickTimer) clearInterval(this.tickTimer);
+    this.offWake();
+    if (typeof window !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisible);
+      window.removeEventListener("focus", this.onFocus);
+      window.removeEventListener("online", this.onOnline);
+      window.removeEventListener("offline", this.onOffline);
+    }
+    if (this.ws) this.ws.onopen = this.ws.onmessage = this.ws.onclose = this.ws.onerror = null;
     this.ws?.close(1000, "bye");
     this.notifyWs?.close(1000, "bye");
     this.ws = null;
@@ -409,7 +654,8 @@ export function stopRelayLink(): void {
   activeClient?.close();
   activeClient = null;
   currentToken = null;
-  liveStore.set({ link: "idle", devices: {}, agents: {}, rev: liveStore.get().rev + 1 });
+  setLink("idle");
+  liveStore.set({ devices: {}, agents: {}, rev: liveStore.get().rev + 1 });
 }
 
 export function refreshNotifyChannel(): void {
@@ -420,11 +666,8 @@ export function pingRelay(): void {
   const s = settingsStore.get();
   if (s.server && isMockServer(s.server)) {
     mockApi.connect();
-  } else if (activeClient) {
-    // Re-open if offline
-    if (liveStore.get().link === "offline" && s.server && currentToken) {
-      startRelayLink(s.server, currentToken);
-    }
+  } else {
+    activeClient?.retryNow();
   }
 }
 
@@ -461,14 +704,20 @@ export function subscribeStream(
   return activeClient.subscribe(to, stream, params, onEvent, onState);
 }
 
-export async function completePairing(serverInput: string, code: string, customName?: string): Promise<void> {
+export async function completePairing(serverInput: string, code: string, customName?: string, via: PairVia = "typed"): Promise<void> {
   const server = normalizeServer(serverInput);
   if (!server) throw new RelayError("bad_request", "请填写服务器地址");
   if (!isMockServer(server) && !code.trim()) throw new RelayError("bad_request", "请填写配对码");
   const name = customName?.trim() || defaultDeviceName();
   const prevServer = settingsStore.get().server;
   const prevToken = prevServer === server ? currentToken ?? undefined : undefined;
-  const res = await pairDevice(server, code || "DEMO-0000", name, detectPlatform(), prevToken);
+  // Never the code or the token in the log: only how the code arrived.
+  logger.info("pair", `pairing "${name}" with ${server} via ${via}`);
+  const res = await pairDevice(server, code || "DEMO-0000", name, detectPlatform(), prevToken, via).catch((err: Error) => {
+    logger.warn("pair", `pairing via ${via} failed: ${err.message}`);
+    throw err;
+  });
+  logger.info("pair", `paired as ${res.device.id}`);
   await saveSession({
     server,
     token: res.token,
@@ -485,7 +734,35 @@ export async function completePairing(serverInput: string, code: string, customN
   startRelayLink(server, res.token);
 }
 
+/**
+ * Pairs this app through the computer's own herdr-pocket login: the daemon's device token
+ * asks its relay for a one-time viewer code, which then pairs this app like a typed code.
+ */
+export async function pairWithLocalHost(customName?: string): Promise<void> {
+  // The native side makes the code with the daemon's token; the token never comes here.
+  const local = await getLocalPairCode().catch((err: LocalPairError) => {
+    throw new RelayError(err.code === "unauthorized" || err.code === "offline" ? err.code : "internal", err.message);
+  });
+  const server = normalizeServer(local.server);
+  logger.info("pair", `using this computer's herdr-pocket login for ${server}`);
+  await completePairing(server, local.code, customName, "local-login");
+}
+
+/** pairWithLocalHost with a deadline, for the unattended first-launch attempt. */
+export async function pairWithLocalHostWithin(ms: number, customName?: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new RelayError("timeout", `${Math.round(ms / 1000)} 秒内没连上本机登录的服务器：检查网络后重试，或在下面手动连接`)), ms);
+  });
+  try {
+    await Promise.race([pairWithLocalHost(customName), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function signOut(): Promise<void> {
+  logger.info("pair", "signing out");
   const server = settingsStore.get().server;
   const deviceId = settingsStore.get().deviceId;
   const token = currentToken;

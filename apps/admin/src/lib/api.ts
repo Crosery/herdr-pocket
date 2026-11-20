@@ -1,4 +1,6 @@
-const BASE = location.pathname.replace(/\/admin\/?$/, "");
+// Strip the trailing slash too: at "/" a leftover slash would make "//admin-assets/…",
+// a protocol-relative URL to a host named "admin-assets".
+const BASE = location.pathname.replace(/\/admin\/?$/, "").replace(/\/+$/, "");
 const TOKEN_KEY = "herdr-pocket-admin";
 
 export function assetUrl(rel: string): string {

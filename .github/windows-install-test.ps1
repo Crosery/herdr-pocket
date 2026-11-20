@@ -60,5 +60,18 @@ Run $cmd service remove | Out-Null
 Check (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run").PSObject.Properties["HerdrPocket"]) "service remove drops the logon entry"
 Check (-not ((Run $cmd service status) -match "(?m)^service\s+running")) "the supervisor is gone"
 
+# The online path -From skips: config.json's region, the source race, the ordered fallback and the
+# SHA256SUMS check. This step needs the network and the latest published GitHub release (with its
+# SHA256SUMS): CI fails here when GitHub is down or a release is broken, whatever the change was.
+# -NoService, and hostd.json is there: no service, no registration. 6>&1 takes only Write-Host's
+# lines, so native stderr cannot stop 5.1 here.
+'{"update":{"region":"cn"}}' | Set-Content -Encoding ascii -LiteralPath (Join-Path $config "config.json")
+$online = & ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "..\scripts\install-host.ps1")))) -NoService 6>&1 | Out-String
+Write-Host $online
+Check ($online -match "download region: cn \(config\.json") "config.json's update.region picked the region"
+Check ($online -match "fastest download source: ") "the download sources were raced"
+Check ($online -match "downloading Herdr Pocket ") "the release came through the raced sources, checksum checked"
+Remove-Item -LiteralPath (Join-Path $config "config.json")
+
 Write-Host "--- service log"
 Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA "herdr-pocket\hostd.log") | Write-Host

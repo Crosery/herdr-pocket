@@ -1,12 +1,26 @@
 import {
   LATEST_SUMS_URL,
   RELEASE_REPO,
-  allReleaseSources,
+  SOURCE_PROBE_SLACK_MS,
+  SOURCE_PROBE_TIMEOUT_MS,
+  cachedWinner,
   compareVersions,
-  inMainlandChina,
+  decideRegion,
+  localTimeZone,
+  pickFastest,
   releaseFromSums,
+  sourceLabel,
+  sourcePrefixes,
+  sourceUrl,
+  withWinnerFirst,
   type PutFile,
+  type Region,
+  type RegionDecision,
+  type RegionSetting,
+  type SourceCache,
+  type SourceProbe,
 } from "@herdr-pocket/protocol";
+import { desktopSessionStore, type DesktopSessionStore } from "./sessionStore";
 
 declare const __POCKET_TARGET__: "desktop" | "harmony";
 declare const __APP_VERSION__: string;
@@ -21,11 +35,24 @@ export interface SavedSession {
   lastServer?: string;
 }
 
+/** A program this computer needs before its agents show up (see hostd_status in src-tauri). */
+export interface LocalDep {
+  id: "herdr" | "hc" | "herdr-pocket" | "uniflo";
+  found: boolean;
+  /** Agents still show up without it. */
+  optional: boolean;
+}
+
 export interface HostdLocalStatus {
+  /** hostd.json exists. */
   installed: boolean;
+  /** hostd.json has a server and a device token, so this computer is logged in. */
   configured: boolean;
   server?: string;
   deviceName?: string;
+  /** The daemon answers on its control socket; absent where that cannot be checked. */
+  running?: boolean;
+  deps: LocalDep[];
 }
 
 export interface HarmonyBridgeApi {
@@ -44,6 +71,8 @@ export interface HarmonyBridgeApi {
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown;
+    /** The desktop app's version, set by its native side (src-tauri/src/webdiag.rs). */
+    __POCKET_APP_VERSION__?: string;
     PocketHarmony?: HarmonyBridgeApi;
     __POCKET_SET_SAFE_AREA__?: (topPx: number, bottomPx: number) => void;
     __POCKET_OPEN_URL__?: (url: string) => void;
@@ -65,6 +94,10 @@ export function isHarmony(): boolean {
 export function appVersion(): string {
   const fromHarmony = window.PocketHarmony?.appVersion?.();
   if (fromHarmony && fromHarmony.trim()) return fromHarmony.trim();
+  // Desktop: the running app's own version (what Tauri's getVersion() returns), set by
+  // src-tauri/src/webdiag.rs before this page's scripts run.
+  const fromTauri = window.__POCKET_APP_VERSION__;
+  if (fromTauri && fromTauri.trim()) return fromTauri.trim();
   return typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.2.0";
 }
 
@@ -95,15 +128,26 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 
 const SESSION_KEY = "herdr-pocket-client-session-v1";
 
+/** Desktop: session.json through Rust only (see sessionStore.ts); browser and Harmony builds below. */
+let desktopStore: DesktopSessionStore<SavedSession> | null = null;
+function desktopSessions(): DesktopSessionStore<SavedSession> {
+  const log = (level: "info" | "warn") => (msg: string, data?: Record<string, unknown>) => {
+    void tauriInvoke("log_write", { level, kind: "pair.session", msg, data: data ?? null }).catch(() => undefined);
+  };
+  desktopStore ??= desktopSessionStore<SavedSession>({
+    load: () => tauriInvoke<SavedSession | null>("load_auth"),
+    save: (session) => tauriInvoke<void>("save_auth", { session }),
+    clear: () => tauriInvoke<void>("clear_auth"),
+    legacyGet: () => localStorage.getItem(SESSION_KEY),
+    legacyRemove: () => localStorage.removeItem(SESSION_KEY),
+    warn: log("warn"),
+    info: log("info"),
+  });
+  return desktopStore;
+}
+
 export async function loadSession(): Promise<SavedSession | null> {
-  if (isTauri()) {
-    try {
-      const s = await tauriInvoke<SavedSession | null>("load_auth");
-      if (s && s.server && s.token) return s;
-    } catch {
-      // Fall through to localStorage
-    }
-  }
+  if (isTauri()) return desktopSessions().load();
   if (window.PocketHarmony?.getPref) {
     try {
       const raw = window.PocketHarmony.getPref(SESSION_KEY);
@@ -121,13 +165,7 @@ export async function loadSession(): Promise<SavedSession | null> {
 }
 
 export async function saveSession(session: SavedSession): Promise<void> {
-  if (isTauri()) {
-    try {
-      await tauriInvoke("save_auth", { session });
-    } catch {
-      // Fallback below
-    }
-  }
+  if (isTauri()) return desktopSessions().save(session);
   const encoded = JSON.stringify(session);
   if (window.PocketHarmony?.setPref) {
     try {
@@ -144,13 +182,7 @@ export async function saveSession(session: SavedSession): Promise<void> {
 }
 
 export async function clearSession(): Promise<void> {
-  if (isTauri()) {
-    try {
-      await tauriInvoke("clear_auth");
-    } catch {
-      // ignore
-    }
-  }
+  if (isTauri()) return desktopSessions().clear();
   if (window.PocketHarmony?.deletePref) {
     try {
       window.PocketHarmony.deletePref(SESSION_KEY);
@@ -171,6 +203,33 @@ export async function getHostdStatus(): Promise<HostdLocalStatus | null> {
     return await tauriInvoke<HostdLocalStatus>("hostd_status");
   } catch {
     return null;
+  }
+}
+
+/** A one-time viewer pairing code made with this computer's herdr-pocket login. */
+export interface LocalPairCode {
+  /** The relay hostd.json points at, normalised like the app stores it. */
+  server: string;
+  code: string;
+  expiresAt: number;
+  link: string;
+}
+
+/** Rejects with an Error whose `code` is `not_logged_in`, `offline`, `unauthorized` or the relay's own code. */
+export type LocalPairError = Error & { code: string };
+
+/**
+ * Asks the relay this computer's herdr-pocket is logged in to for a viewer pairing code (desktop
+ * app only). The daemon's token is used inside the native side and never reaches this page.
+ */
+export async function getLocalPairCode(): Promise<LocalPairCode> {
+  if (!isTauri()) throw Object.assign(new Error("只有桌面应用能使用本机的 herdr-pocket 登录"), { code: "unsupported" });
+  try {
+    return await tauriInvoke<LocalPairCode>("hostd_local_pair_code");
+  } catch (err) {
+    const e = err as { code?: string; message?: string } | string;
+    if (typeof e === "string") throw Object.assign(new Error(e), { code: "internal" });
+    throw Object.assign(new Error(e?.message || "无法使用本机登录"), { code: e?.code || "internal" });
   }
 }
 
@@ -306,8 +365,21 @@ export interface ReleaseUpdateInfo {
   latest: string;
   hasUpdate: boolean;
   pageUrl: string;
+  /** The installer through the source that answered (a mirror or github.com). */
   downloadUrl: string;
+  region: Region;
+  regionReason: RegionDecision["reason"];
+  /** `github.com` or the mirror's host. */
+  source: string;
+  /** This check's race; absent when a remembered winner answered. */
+  probes?: SourceProbe[];
 }
+
+/**
+ * `"cn"`/`"global"` forces the region; an object passes what config.json says
+ * (`update.region`, `update.mirrors`). Without one, the desktop app reads config.json itself.
+ */
+export type UpdateCheckOptions = Region | { region?: Region; setting?: RegionSetting | string; mirrors?: string[] };
 
 async function detectMacArch(): Promise<"arm64" | "x64"> {
   if (isTauri()) {
@@ -338,46 +410,540 @@ function platformDownloadAsset(version: string, platform: PlatformKind, macArch:
   }
 }
 
-export async function checkReleaseUpdate(): Promise<ReleaseUpdateInfo> {
-  const china = inMainlandChina();
-  const sources = allReleaseSources(LATEST_SUMS_URL, china);
-  const fetchText = async (url: string): Promise<string> => {
-    const abort = new AbortController();
-    const t = setTimeout(() => abort.abort(), 8000);
+/** Writes one line to the desktop log file (and the relay, when it qualifies); no-op elsewhere. */
+function nativeLog(level: "debug" | "info" | "warn" | "error", kind: string, msg: string, data?: Record<string, unknown>): void {
+  if (!isTauri()) return;
+  void tauriInvoke("log_write", { level, kind, msg, data: data ?? null }).catch(() => {});
+}
+
+const SOURCE_CACHE_KEY = "herdr-pocket-sources";
+
+/** The last race's winner: the shared state folder in the desktop app (`sources.json`), localStorage elsewhere. */
+async function readSourceCache(): Promise<unknown> {
+  if (isTauri()) return tauriInvoke<unknown>("update_source_cache_read").catch(() => undefined);
+  try {
+    return JSON.parse(localStorage.getItem(SOURCE_CACHE_KEY) || "null");
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeSourceCache(cache: SourceCache): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("update_source_cache_write", { cache }).catch(() => {});
+    return;
+  }
+  try {
+    localStorage.setItem(SOURCE_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // A full storage only costs a race next time.
+  }
+}
+
+/** Region and own mirrors, in decideRegion's order: HERDR_POCKET_MIRROR, config.json, time zone. */
+async function updateRegion(opts?: UpdateCheckOptions): Promise<{ decision: RegionDecision; mirrors: string[] }> {
+  if (typeof opts === "string") return { decision: { region: opts, reason: "config", timeZone: localTimeZone() }, mirrors: [] };
+  let setting = opts?.setting;
+  let mirrors = opts?.mirrors;
+  let env: string | undefined;
+  if (isTauri()) {
+    env = (await tauriInvoke<{ mirror?: string }>("update_env").catch(() => ({ mirror: undefined }))).mirror;
+    if (setting === undefined || mirrors === undefined) {
+      const file = await tauriInvoke<{ raw?: { update?: { region?: unknown; mirrors?: unknown } } }>("config_load").catch(() => null);
+      const u = file?.raw?.update;
+      if (setting === undefined && typeof u?.region === "string") setting = u.region;
+      if (mirrors === undefined && Array.isArray(u?.mirrors)) mirrors = u.mirrors.filter((m): m is string => typeof m === "string");
+    }
+  }
+  if (opts?.region) return { decision: { region: opts.region, reason: "config", timeZone: localTimeZone() }, mirrors: mirrors ?? [] };
+  return { decision: decideRegion({ env, setting }), mirrors: mirrors ?? [] };
+}
+
+/** The listing's text. In the desktop app natively: github.com's redirect carries no CORS headers. */
+async function fetchListing(url: string, signal: AbortSignal, timeoutMs: number): Promise<string> {
+  if (!isTauri()) {
+    const res = await fetch(url, { signal, cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.text();
+  }
+  // The native request has its own timeout; an abort only stops waiting for it.
+  return new Promise<string>((resolve, reject) => {
+    const onAbort = () => reject(new Error("aborted"));
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    tauriInvoke<string>("update_fetch_sums", { url, timeoutMs }).then(
+      (t) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(t);
+      },
+      (e: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(new Error(errorText(e)));
+      },
+    );
+  });
+}
+
+async function fetchSums(url: string, signal: AbortSignal, timeoutMs = SOURCE_PROBE_TIMEOUT_MS): Promise<{ version: string }> {
+  // A mirror that answers with an error page is not an answer.
+  const parsed = releaseFromSums(await fetchListing(url, signal, timeoutMs));
+  if (!parsed) throw new Error("not a SHA256SUMS listing");
+  return parsed;
+}
+
+/** Every source at once; once one answers the others get the slack, then pickFastest decides. */
+async function raceSums(order: string[]): Promise<{ winner?: string; version?: string; probes: SourceProbe[] }> {
+  const probes: SourceProbe[] = [];
+  const versions = new Map<string, string>();
+  const ctls = order.map(() => new AbortController());
+  return new Promise((resolve) => {
+    let done = false;
+    let slack: ReturnType<typeof setTimeout> | undefined;
+    const t0 = Date.now();
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (slack) clearTimeout(slack);
+      ctls.forEach((c) => c.abort());
+      for (const s of order) if (!probes.some((p) => p.source === s)) probes.push({ source: s, ok: false, ms: Date.now() - t0, error: "slower than the winner" });
+      const winner = pickFastest(probes, order, SOURCE_PROBE_SLACK_MS);
+      resolve({ winner, version: winner === undefined ? undefined : versions.get(winner), probes });
+    };
+    if (!order.length) return finish();
+    order.forEach((source, i) => {
+      const ctl = ctls[i]!;
+      const timer = setTimeout(() => ctl.abort(), SOURCE_PROBE_TIMEOUT_MS);
+      const started = Date.now();
+      fetchSums(sourceUrl(source, LATEST_SUMS_URL), ctl.signal).then(
+        (r) => {
+          clearTimeout(timer);
+          if (done) return;
+          versions.set(source, r.version);
+          probes.push({ source, ok: true, ms: Date.now() - started });
+          if (probes.length === order.length) finish();
+          else slack ??= setTimeout(finish, SOURCE_PROBE_SLACK_MS);
+        },
+        (e: unknown) => {
+          clearTimeout(timer);
+          if (done) return;
+          const msg = ctl.signal.aborted ? `no answer within ${SOURCE_PROBE_TIMEOUT_MS} ms` : e instanceof Error ? e.message : String(e);
+          probes.push({ source, ok: false, ms: Date.now() - started, error: msg.slice(0, 160) });
+          if (probes.length === order.length) finish();
+        },
+      );
+    });
+  });
+}
+
+/**
+ * The newest release and where to download it. Region: HERDR_POCKET_MIRROR, then
+ * `update.region`, then the time zone. A remembered winner (24 h, shared with the CLI and
+ * daemon via sources.json) is asked first; otherwise all sources race and the winner is kept.
+ */
+export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<ReleaseUpdateInfo> {
+  const { decision, mirrors } = await updateRegion(opts);
+  const base = sourcePrefixes(decision.region, mirrors);
+  const cached = cachedWinner(await readSourceCache(), decision.region, base);
+  let source: string | undefined;
+  let version: string | undefined;
+  let probes: SourceProbe[] | undefined;
+
+  if (cached !== undefined) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
     try {
-      const res = await fetch(url, { signal: abort.signal, cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.text();
+      version = (await fetchSums(sourceUrl(cached, LATEST_SUMS_URL), ctl.signal, 8000)).version;
+      source = cached;
+    } catch (e) {
+      nativeLog("info", "update", "remembered source failed, racing again", { source: sourceLabel(cached), error: (e as Error).message });
     } finally {
       clearTimeout(t);
     }
-  };
-  const rawText = china
-    ? await Promise.any(sources.map(fetchText))
-    : await (async () => {
-        for (const u of sources) {
-          try {
-            return await fetchText(u);
-          } catch {
-            // next
-          }
-        }
-        throw new Error("检查更新失败，请检查网络连接");
-      })();
+  }
+  if (version === undefined) {
+    const race = await raceSums(withWinnerFirst(base, cached));
+    probes = race.probes;
+    for (const p of race.probes) {
+      nativeLog("debug", "update", "source probe", { source: sourceLabel(p.source), ok: p.ok, ms: p.ms, error: p.error });
+    }
+    if (race.winner === undefined || race.version === undefined) {
+      nativeLog("warn", "update", "no release source answered", { region: decision.region, sources: base.length });
+      throw new Error("检查更新失败，所有下载线路都没有响应，请检查网络连接");
+    }
+    source = race.winner;
+    version = race.version;
+    await writeSourceCache({ region: decision.region, winner: source, at: Date.now(), probes: race.probes });
+  }
+  const winner = source ?? "";
+  nativeLog("info", "update", "release source chosen", {
+    region: decision.region,
+    reason: decision.reason,
+    source: sourceLabel(winner),
+    remembered: probes === undefined,
+    latest: version,
+  });
 
-  const parsed = releaseFromSums(rawText);
-  if (!parsed) throw new Error("无法解析最新版本信息");
   const current = appVersion();
   const platform = detectPlatform();
   const macArch = platform === "macos" ? await detectMacArch() : "arm64";
-  const asset = platformDownloadAsset(parsed.version, platform, macArch);
-  const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${parsed.version}/${asset}`;
-  const downloadUrl = allReleaseSources(rawUrl, china)[0] ?? rawUrl;
+  const asset = platformDownloadAsset(version, platform, macArch);
+  const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${version}/${asset}`;
   return {
     current,
-    latest: parsed.version,
-    hasUpdate: compareVersions(parsed.version, current) > 0,
-    pageUrl: `https://github.com/${RELEASE_REPO}/releases/tag/v${parsed.version}`,
-    downloadUrl,
+    latest: version,
+    hasUpdate: compareVersions(version, current) > 0,
+    pageUrl: `https://github.com/${RELEASE_REPO}/releases/tag/v${version}`,
+    downloadUrl: sourceUrl(winner, rawUrl),
+    region: decision.region,
+    regionReason: decision.reason,
+    source: sourceLabel(winner),
+    probes,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Desktop-only native features (src-tauri). Outside Tauri each call is a no-op, answers
+// null/[] or rejects with a Chinese message, so web and HarmonyOS builds still work.
+// ---------------------------------------------------------------------------
+
+function rejectOutside(): Promise<never> {
+  return Promise.reject(new Error("这个功能需要 Herdr Pocket 桌面版"));
+}
+
+/** Subscribes to a Tauri event; returns an unsubscribe that is safe to call at any time. */
+function listenTauri<T>(name: string, cb: (payload: T) => void): () => void {
+  if (!isTauri()) return () => {};
+  let off: (() => void) | null = null;
+  let dead = false;
+  void import("@tauri-apps/api/event").then(({ listen }) =>
+    listen<T>(name, (e) => cb(e.payload)).then((un) => {
+      if (dead) un();
+      else off = un;
+    }),
+  );
+  return () => {
+    dead = true;
+    off?.();
+  };
+}
+
+function errorText(err: unknown): string {
+  return typeof err === "string" ? err : (err as Error)?.message || String(err);
+}
+
+async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (!isTauri()) return rejectOutside();
+  try {
+    return await tauriInvoke<T>(cmd, args);
+  } catch (err) {
+    throw new Error(errorText(err));
+  }
+}
+
+// Built-in browser -----------------------------------------------------------------------------------
+
+export interface BrowserRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrowserNavOp {
+  url?: string;
+  back?: true;
+  forward?: true;
+  reload?: true;
+  stop?: true;
+}
+
+export interface BrowserEvent {
+  id: string;
+  kind: "url" | "title" | "loading" | "loaded" | "error" | "download";
+  url?: string;
+  title?: string;
+  error?: string;
+  /** download: finished and where the file went. */
+  ok?: boolean;
+  path?: string;
+}
+
+/** Creates panel `id` at `rect`; for an id that is already open it only shows and moves it (no reload). */
+export function browserOpen(id: string, url: string, rect: BrowserRect): Promise<void> {
+  return call("browser_open", { id, url, rect });
+}
+
+/** Resolves even when the panel is not open (yet): the UI calls this on every resize. */
+export function browserSetBounds(id: string, rect: BrowserRect): Promise<void> {
+  return isTauri() ? call<void>("browser_set_bounds", { id, rect }).catch(() => {}) : Promise.resolve();
+}
+
+export function browserNavigate(id: string, op: BrowserNavOp): Promise<void> {
+  return call("browser_navigate", { id, op });
+}
+
+export function browserSetVisible(id: string, visible: boolean): Promise<void> {
+  return isTauri() ? call<void>("browser_set_visible", { id, visible }).catch(() => {}) : Promise.resolve();
+}
+
+export function browserClose(id: string): Promise<void> {
+  return isTauri() ? call<void>("browser_close", { id }).catch(() => {}) : Promise.resolve();
+}
+
+export function onBrowserEvent(cb: (e: BrowserEvent) => void): () => void {
+  return listenTauri<BrowserEvent>("browser://event", cb);
+}
+
+/** Clears the built-in browser's cookies, cache and storage; resolves to the bytes they took. */
+export function browserClearData(): Promise<number> {
+  return isTauri() ? call<number>("browser_clear_data") : Promise.resolve(0);
+}
+
+/**
+ * `persistent`: imported cookies and sign-ins survive a restart. `session` (macOS 11–13):
+ * they last until the last browser tab closes. null outside the desktop app.
+ */
+export async function browserStoreKind(): Promise<"persistent" | "session" | null> {
+  return isTauri() ? call<"persistent" | "session">("browser_store_kind").catch(() => null) : null;
+}
+
+// Cookie import from installed browsers --------------------------------------------
+
+export type CookieBrowser = "chrome" | "edge" | "brave" | "arc" | "chromium" | "vivaldi" | "safari";
+
+export interface CookieSource {
+  /** `<browser>:<profile folder>`, what listCookieDomains / importCookies take. */
+  id: string;
+  browser: CookieBrowser;
+  /** "Google Chrome · 个人" */
+  label: string;
+  /** The profile's display name. */
+  profile: string;
+  importable: boolean;
+  /** Chinese: the Keychain prompt to expect, quit the browser first, why it cannot be imported. */
+  note?: string;
+  /** Permission page that would unlock it (Safari: `fullDiskAccess`). */
+  settings?: "fullDiskAccess";
+}
+
+interface RawCookieSource {
+  id: CookieBrowser;
+  name: string;
+  profiles: Array<{ id: string; name: string }>;
+  importable: boolean;
+  note?: string;
+}
+
+/** Installed browsers and their profiles. Reads folder names only: nothing is decrypted, no prompt. */
+export async function listCookieSources(): Promise<CookieSource[]> {
+  if (!isTauri()) return [];
+  const raw = await call<RawCookieSource[]>("cookie_sources").catch(() => [] as RawCookieSource[]);
+  const out: CookieSource[] = [];
+  for (const s of raw) {
+    if (!s.profiles.length) {
+      out.push({ id: `${s.id}:`, browser: s.id, label: s.name, profile: "", importable: s.importable, note: s.note, settings: s.id === "safari" ? "fullDiskAccess" : undefined });
+      continue;
+    }
+    for (const p of s.profiles) {
+      out.push({
+        id: `${s.id}:${p.id}`,
+        browser: s.id,
+        label: s.profiles.length > 1 ? `${s.name} · ${p.name}` : s.name,
+        profile: p.name,
+        importable: s.importable,
+        note: s.note,
+      });
+    }
+  }
+  return out;
+}
+
+function splitSource(sourceId: string): { browser: string; profile: string } {
+  const at = sourceId.indexOf(":");
+  if (at <= 0 || at === sourceId.length - 1) throw new Error("请选择一个浏览器配置");
+  return { browser: sourceId.slice(0, at), profile: sourceId.slice(at + 1) };
+}
+
+/** Sites with cookies in that profile, most cookies first (at most 1000). Counts only, no values. */
+export async function listCookieDomains(sourceId: string): Promise<Array<{ domain: string; count: number }>> {
+  const { browser, profile } = splitSource(sourceId);
+  return call("cookie_domains", { browser, profile });
+}
+
+export interface CookieImportRequest {
+  sourceId: string;
+  /** Sites to bring over (a host such as `github.com` also takes its subdomains). `["*"]`: every site. */
+  domains?: string[];
+  /** Also session cookies (no expiry). Default false. */
+  includeSession?: boolean;
+}
+
+export interface CookieImportResult {
+  imported: number;
+  /** Expired, session (unless asked for), app-bound and undecryptable ones. */
+  skipped: number;
+  domains: string[];
+  warnings: Array<{ code: "app_bound" | "session" | "expired" | "other"; count: number }>;
+  /** Chinese summary from the importer, when there is something to say. */
+  note?: string;
+}
+
+interface RawImportResult {
+  imported: number;
+  expired: number;
+  session: number;
+  appBound: number;
+  failed: number;
+  domains: number;
+  note?: string;
+}
+
+/**
+ * Copies cookies for `domains` from an installed browser into the built-in browser (a panel
+ * must be open). Without `domains`, the sites open in the built-in browser's tabs.
+ * macOS asks once for the browser's Keychain item; Windows needs the browser quit.
+ */
+export async function importCookies(req: CookieImportRequest | { file: true }): Promise<CookieImportResult> {
+  if ("file" in req) throw new Error("暂不支持从文件导入 Cookie");
+  const { browser, profile } = splitSource(req.sourceId);
+  let domains = (req.domains ?? []).map((d) => d.trim()).filter(Boolean);
+  if (!domains.length) {
+    const panels = await call<Array<{ id: string; url: string }>>("browser_list").catch(() => []);
+    domains = [
+      ...new Set(
+        panels
+          .map((p) => {
+            try {
+              const u = new URL(p.url);
+              return u.protocol === "http:" || u.protocol === "https:" ? u.hostname : "";
+            } catch {
+              return "";
+            }
+          })
+          .filter(Boolean),
+      ),
+    ];
+  }
+  if (!domains.length) throw new Error("先在内置浏览器里打开要登录的网站，或选择要导入的网站");
+  const r = await call<RawImportResult>("cookie_import", { browser, profile, domains, includeSession: req.includeSession ?? false });
+  const warnings: CookieImportResult["warnings"] = [];
+  if (r.appBound) warnings.push({ code: "app_bound", count: r.appBound });
+  if (r.session) warnings.push({ code: "session", count: r.session });
+  if (r.expired) warnings.push({ code: "expired", count: r.expired });
+  if (r.failed) warnings.push({ code: "other", count: r.failed });
+  return { imported: r.imported, skipped: r.expired + r.session + r.appBound + r.failed, domains, warnings, note: r.note };
+}
+
+// Voice dictation --------------------------------------------------------------------------------------
+
+/** voice_status in src-tauri/src/voice/mod.rs. */
+export interface VoiceRuntime {
+  /** This build can dictate (macOS and Windows). */
+  supported: boolean;
+  enabled: boolean;
+  hotkey: string;
+  mode: string;
+  insert: string;
+  language: string;
+  kind?: "accelerator" | "modifier";
+  /** The hotkey is live. */
+  registered: boolean;
+  /** Why it is not live (syntax, taken by another app, permission), in Chinese. */
+  error?: string;
+  warning?: string;
+  /** Grant this first (`inputMonitoring`). */
+  needsPermission?: "inputMonitoring";
+  phase: "idle" | "recording" | "transcribing";
+  lastError?: string;
+}
+
+export interface VoiceEvent {
+  state: "idle" | "listening" | "transcribing" | "inserted" | "error";
+  /** listening: microphone level 0..1, about 15 times a second. */
+  level?: number;
+  elapsedMs?: number;
+  /** inserted: the recognised text. */
+  text?: string;
+  /** inserted: `app` means Herdr Pocket had the focus: put `text` into its message box. */
+  target?: "app" | "focused";
+  /** inserted: how it got there (`app`, `paste`, `type`, `clipboard`). */
+  method?: string;
+  error?: string;
+}
+
+export interface HotkeyCheck {
+  ok: boolean;
+  kind?: "accelerator" | "modifier";
+  error?: string;
+  warning?: string;
+  needsPermission?: "inputMonitoring";
+}
+
+export async function getVoiceRuntime(): Promise<VoiceRuntime | null> {
+  return isTauri() ? call<VoiceRuntime>("voice_status").catch(() => null) : null;
+}
+
+/** Dictation progress for the main window: state changes, the level meter, results and errors. */
+export function onVoiceEvent(cb: (e: VoiceEvent) => void): () => void {
+  if (!isTauri()) return () => {};
+  const phaseToState = { idle: "idle", recording: "listening", transcribing: "transcribing" } as const;
+  const offs = [
+    listenTauri<VoiceRuntime>("voice://state", (s) => cb({ state: phaseToState[s.phase] ?? "idle" })),
+    listenTauri<{ level: number; elapsedMs: number }>("voice://level", (l) => cb({ state: "listening", level: l.level, elapsedMs: l.elapsedMs })),
+    listenTauri<{ text: string; target: "app" | "focused"; method: string }>("voice://transcript", (t) =>
+      cb({ state: "inserted", text: t.text, target: t.target, method: t.method }),
+    ),
+    listenTauri<{ message: string }>("voice://error", (e) => cb({ state: "error", error: e.message })),
+  ];
+  return () => offs.forEach((off) => off());
+}
+
+/** Can `hotkey` be used (syntax, taken by another app, permission)? Does not change the setting. */
+export async function checkHotkey(hotkey: string): Promise<HotkeyCheck> {
+  return call("voice_check_hotkey", { hotkey });
+}
+
+/** The microphone button: start, stop or cancel a dictation without the hotkey. */
+export function voiceStart(): Promise<boolean> {
+  return isTauri() ? call<boolean>("voice_start") : Promise.resolve(false);
+}
+
+export function voiceStop(): Promise<boolean> {
+  return isTauri() ? call<boolean>("voice_stop") : Promise.resolve(false);
+}
+
+export function voiceCancel(): Promise<boolean> {
+  return isTauri() ? call<boolean>("voice_cancel") : Promise.resolve(false);
+}
+
+/** Re-reads config.json and retries the hotkey (after a permission was granted). */
+export function voiceReload(): Promise<boolean> {
+  return isTauri() ? call<boolean>("voice_reload") : Promise.resolve(false);
+}
+
+/** What the relay offers for dictation (GET /v1/transcribe), for Settings. */
+export async function getTranscribeInfo(): Promise<{ available: boolean; provider?: string; reason?: string; [k: string]: unknown } | null> {
+  return isTauri() ? call<{ available: boolean }>("voice_transcribe_info").catch(() => null) : null;
+}
+
+// Error logging ----------------------------------------------------------------------------------------
+
+let errorLoggingInstalled = false;
+
+/** Sends uncaught errors and unhandled rejections to the desktop log (redacted there). Call once at startup. */
+export function installErrorLogging(): void {
+  if (errorLoggingInstalled || !isTauri() || typeof window === "undefined") return;
+  errorLoggingInstalled = true;
+  let budget = 50;
+  const send = (msg: string, data: Record<string, unknown>) => {
+    if (budget-- <= 0) return;
+    nativeLog("error", "app.js", msg.slice(0, 500), data);
+  };
+  window.addEventListener("error", (e) => {
+    send(e.message || "script error", { source: e.filename ? e.filename.replace(/^.*\/(?=[^/]+$)/, "") : undefined, line: e.lineno, col: e.colno });
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e.reason as { message?: string; name?: string } | string | undefined;
+    send(typeof r === "string" ? r : r?.message || "unhandled rejection", { name: typeof r === "object" ? r?.name : undefined });
+  });
 }

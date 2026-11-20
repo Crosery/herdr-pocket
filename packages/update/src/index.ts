@@ -38,8 +38,23 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { RELEASE_REPO, apkAssetName, inMainlandChina, releaseFromSums, releaseSources } from "@herdr-pocket/protocol";
+import {
+  RELEASE_REPO,
+  apkAssetName,
+  releaseFromSums,
+  sourceLabel,
+  sourceUrl,
+  updateCheckDelays,
+  type RegionDecision,
+  type SourceProbe,
+} from "@herdr-pocket/protocol";
 import { extractTarGz, tarVersion } from "./untar.ts";
+import { currentClientConfig } from "./clientconfig.ts";
+import { currentRegion, planUrls, raceSources, sourcePlan, writeSourceCache } from "./sources.ts";
+
+export * from "./paths.ts";
+export * from "./clientconfig.ts";
+export * from "./sources.ts";
 
 const WINDOWS = process.platform === "win32";
 
@@ -114,54 +129,61 @@ export interface Release {
   assets: Record<string, string>;
   /** GitHub's source tarball of the tag, used when the bundle asset is missing. */
   tarball: string;
+  /** Where the answer came from (github.com, a mirror's host, or the API's host) and how long it took. */
+  via?: string;
+  ms?: number;
+  /** How it was found: the remembered source, a race of all of them, or one after the other. */
+  how?: "cached" | "race" | "fallback" | "api";
+  region?: RegionDecision;
+  probes?: SourceProbe[];
 }
 
-/**
- * Mirrors before GitHub: on in mainland China by this machine's time zone. A server often
- * runs on UTC, so HERDR_POCKET_MIRROR=1 turns them on (and =0 off) whatever the time zone.
- */
+/** Mirrors before GitHub: HERDR_POCKET_MIRROR, then `update.region` in config.json, then the time zone (mainland China). */
 export function mirrorsFirst(): boolean {
-  const v = process.env.HERDR_POCKET_MIRROR ?? "";
-  if (/^(1|true|on|yes)$/i.test(v)) return true;
-  if (/^(0|false|off|no)$/i.test(v)) return false;
-  return inMainlandChina();
-}
-
-/** Where to fetch a file from, in order: a github.com file also through the mirrors. */
-export function sourcesFor(url: string): string[] {
-  return url.startsWith("https://github.com/") ? releaseSources(url, mirrorsFirst()) : [url];
+  return currentRegion().region === "cn";
 }
 
 /**
- * The newest published release (GitHub skips drafts and pre-releases here). From the API,
- * or from the release's SHA256SUMS, which mirrors carry: in mainland China the mirrors are
- * asked first. A custom HERDR_POCKET_API is the only source asked.
+ * Where to fetch a file from, in order: a github.com file also through the mirrors, the source
+ * that won the last race first (see sources.ts), the region's order after it.
+ */
+export function sourcesFor(url: string): string[] {
+  return url.startsWith("https://github.com/") ? planUrls(sourcePlan(), url) : [url];
+}
+
+/**
+ * The newest published release (GitHub skips drafts and pre-releases here), from the release's
+ * SHA256SUMS, which mirrors carry. The source that won the last race is asked first; otherwise
+ * every source at once with a short timeout, and the fastest is remembered for a day. When none
+ * answers quickly: each in turn with a long timeout, and the GitHub API (first outside mainland
+ * China, last inside). A custom HERDR_POCKET_API is the only source asked.
  */
 export async function latestRelease(): Promise<Release> {
-  if (process.env.HERDR_POCKET_API) return latestFromApi();
-  const sums = sourcesFor(`https://github.com/${repo()}/releases/latest/download/${ASSETS.checksums}`).map((u) => () => latestFromSums(u));
-  if (mirrorsFirst() && sums.length > 1) {
+  const t0 = Date.now();
+  if (process.env.HERDR_POCKET_API) return { ...(await latestFromApi()), via: hostOf(apiBase()), ms: Date.now() - t0, how: "api" };
+  const url = `https://github.com/${repo()}/releases/latest/download/${ASSETS.checksums}`;
+  const plan = sourcePlan();
+  const region = plan.decision;
+  if (plan.cached !== undefined) {
     try {
-      return await Promise.any(sums.slice(0, -1).map((fn) => fn()));
+      const r = await latestFromSums(sourceUrl(plan.cached, url), AbortSignal.timeout(10_000));
+      return { ...r, via: sourceLabel(plan.cached), ms: Date.now() - t0, how: "cached", region };
     } catch {
-      // Fall through to GitHub API and direct download.
+      // The remembered source stopped answering: race them all again.
     }
-    const rest = [latestFromApi, sums[sums.length - 1]!];
-    let first: unknown;
-    for (const attempt of rest) {
-      try {
-        return await attempt();
-      } catch (e) {
-        first ??= e;
-      }
-    }
-    throw first;
   }
-  const tries = [latestFromApi, ...sums];
+  const race = await raceSources(plan.order, (p, signal) => latestFromSums(sourceUrl(p, url), signal));
+  if (race.winner !== undefined && race.value) {
+    writeSourceCache({ region: region.region, winner: race.winner, at: Date.now(), probes: race.probes });
+    return { ...race.value, via: sourceLabel(race.winner), ms: Date.now() - t0, how: "race", region, probes: race.probes };
+  }
+  const sums = plan.order.map((p) => async (): Promise<Release> => ({ ...(await latestFromSums(sourceUrl(p, url), AbortSignal.timeout(30_000))), via: sourceLabel(p) }));
+  const api = async (): Promise<Release> => ({ ...(await latestFromApi()), via: hostOf(apiBase()) });
+  const tries = region.region === "cn" ? [...sums, api] : [api, ...sums];
   let first: unknown;
   for (const attempt of tries) {
     try {
-      return await attempt();
+      return { ...(await attempt()), ms: Date.now() - t0, how: "fallback", region, probes: race.probes };
     } catch (e) {
       first ??= e;
     }
@@ -169,9 +191,17 @@ export async function latestRelease(): Promise<Release> {
   throw first;
 }
 
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
 /** The release a SHA256SUMS listing names (fetched from `url`, which may be a mirror). */
-async function latestFromSums(url: string): Promise<Release> {
-  const found = releaseFromSums(await fetchText(url, [url]));
+async function latestFromSums(url: string, signal?: AbortSignal): Promise<Release> {
+  const found = releaseFromSums(await fetchText(url, [url], signal));
   if (!found) throw new Error(`${url} is not a release checksum list`);
   const tag = `v${found.version}`;
   const file = (name: string) => `https://github.com/${repo()}/releases/download/${tag}/${name}`;
@@ -222,26 +252,68 @@ export async function checkForUpdate(current = VERSION): Promise<Check> {
   return { current, latest, newer: compareVersions(latest.version, current) > 0 };
 }
 
+/** A log line with what it is about; `level` defaults to info. */
+export type UpdateLog = (msg: string, data?: Record<string, unknown>, level?: "info" | "warn") => void;
+
+/** What one update check found, for logs: version, source, timing, region and each probe. */
+export function checkSummary(c: Check): Record<string, unknown> {
+  const l = c.latest;
+  return {
+    current: c.current,
+    latest: l.version,
+    newer: c.newer,
+    via: l.via,
+    ms: l.ms,
+    how: l.how,
+    region: l.region?.region,
+    regionBy: l.region?.reason,
+    ...(l.probes ? { probes: l.probes.map((p) => `${sourceLabel(p.source)}=${p.ok ? `${p.ms}ms` : `x(${p.error ?? "failed"})`}`).join(" ") } : {}),
+  };
+}
+
+/** Automatic checks are off with HERDR_POCKET_UPDATE_CHECK=0 or `update.autoCheck: false` in config.json. */
+export function autoCheckEnabled(): boolean {
+  if (/^(0|false|off|no)$/i.test(process.env.HERDR_POCKET_UPDATE_CHECK ?? "")) return false;
+  return currentClientConfig().config.update.autoCheck;
+}
+
 /**
- * Log a line when a newer release exists: first about a minute after start, then once a day.
- * HERDR_POCKET_UPDATE_CHECK=0 turns it off. Failures (offline, rate limit) stay quiet.
+ * Checks for a newer release now and then: first a few minutes after start, then every
+ * `update.checkIntervalHours` (default 24), both jittered so many computers do not ask at once.
+ * Each check is logged with the source that answered and how long it took; failures as warnings.
+ * HERDR_POCKET_UPDATE_CHECK=0 or `update.autoCheck: false` turns it off (the file is read again
+ * before each check).
  */
-export function watchForUpdates(log: (msg: string) => void, command: string, timing: { firstMs?: number; everyMs?: number } = {}): () => void {
+export function watchForUpdates(log: UpdateLog, command: string, timing: { firstMs?: number; everyMs?: number } = {}): () => void {
   if (/^(0|false|off|no)$/i.test(process.env.HERDR_POCKET_UPDATE_CHECK ?? "")) return () => {};
-  const check = () =>
+  let timer: NodeJS.Timeout | undefined;
+  let stopped = false;
+  const schedule = (ms: number) => {
+    if (stopped) return;
+    timer = setTimeout(run, ms);
+    timer.unref();
+  };
+  const next = () => timing.everyMs ?? updateCheckDelays(currentClientConfig().config.update.checkIntervalHours).everyMs;
+  const run = () => {
+    if (!autoCheckEnabled()) return schedule(next());
+    const t0 = Date.now();
     checkForUpdate().then(
       (c) => {
-        if (c.newer) log(`version ${c.latest.version} is out (this is ${c.current}): run \`${command}\` · ${c.latest.page}`);
+        const data = checkSummary(c);
+        if (c.newer) log(`update check: version ${c.latest.version} is out (this is ${c.current}): run \`${command}\` · ${c.latest.page}`, data);
+        else log(`update check: up to date (${c.current}) via ${c.latest.via ?? "?"} in ${c.latest.ms ?? Date.now() - t0} ms`, data);
+        schedule(next());
       },
-      () => {},
+      (e: unknown) => {
+        log(`update check failed after ${Date.now() - t0} ms: ${e instanceof Error ? e.message.split("\n")[0] : String(e)}`, { ms: Date.now() - t0, region: currentRegion().region }, "warn");
+        schedule(next());
+      },
     );
-  const first = setTimeout(check, timing.firstMs ?? 60_000);
-  const every = setInterval(check, timing.everyMs ?? 24 * 3600_000);
-  first.unref();
-  every.unref();
+  };
+  schedule(timing.firstMs ?? updateCheckDelays(24).firstMs);
   return () => {
-    clearTimeout(first);
-    clearInterval(every);
+    stopped = true;
+    if (timer) clearTimeout(timer);
   };
 }
 
@@ -445,9 +517,11 @@ export interface CommandInfo {
 }
 
 export const UPDATE_HELP = `  version [--check]   Print the version; --check also asks GitHub for the latest release.
-  update [--check] [--rollback] [--from <file|url>] [--force] [--no-restart]
+  update [--check] [--probe] [--rollback] [--from <file|url>] [--force] [--no-restart]
         Install the latest GitHub release next to this one, switch to it and restart the
-        service. --rollback switches back to the copy before the last update.`;
+        service. --rollback switches back to the copy before the last update.
+        --check only looks (and says which source answered, how fast); --probe races
+        every download source now and remembers the fastest for a day.`;
 
 export async function versionCommand(argv: string[], info: CommandInfo): Promise<void> {
   const { values } = parseArgs({ args: argv, options: { check: { type: "boolean", default: false } } });
@@ -460,12 +534,14 @@ export async function updateCommand(argv: string[], info: CommandInfo): Promise<
     args: argv,
     options: {
       check: { type: "boolean", default: false },
+      probe: { type: "boolean", default: false },
       rollback: { type: "boolean", default: false },
       from: { type: "string" },
       force: { type: "boolean", default: false },
       "no-restart": { type: "boolean", default: false },
     },
   });
+  if (values.probe) return printProbe();
   if (values.check) {
     console.log(`${info.bin} ${VERSION}`);
     return printCheck(info);
@@ -478,10 +554,44 @@ export async function updateCommand(argv: string[], info: CommandInfo): Promise<
   else console.log(`✓ ${r.from} → ${r.to}${r.restarted ? ` · restarted ${r.restarted}` : ""}`);
 }
 
+const REGION_WHY: Record<RegionDecision["reason"], string> = {
+  env: "HERDR_POCKET_MIRROR",
+  config: "update.region in config.json",
+  "time-zone": "time zone",
+  "locale-offset": "UTC+8 and a zh-CN locale",
+  default: "time zone",
+};
+
+function regionLine(d: RegionDecision): string {
+  return `region   ${d.region === "cn" ? "mainland China (mirrors first)" : "global (GitHub first)"} · by ${REGION_WHY[d.reason]}${d.timeZone ? ` · ${d.timeZone}` : ""}`;
+}
+
 async function printCheck(info: CommandInfo): Promise<void> {
   const c = await checkForUpdate();
-  if (c.newer) console.log(`newer release: ${c.latest.version} · ${c.latest.page}\nrun \`${info.bin} update\``);
-  else console.log(`up to date (latest release ${c.latest.version})`);
+  const l = c.latest;
+  if (c.newer) console.log(`newer release: ${l.version} · ${l.page}\nrun \`${info.bin} update\``);
+  else console.log(`up to date (latest release ${l.version})`);
+  if (l.region) console.log(regionLine(l.region));
+  console.log(`source   ${l.via ?? "?"}${l.ms !== undefined ? ` · ${l.ms} ms` : ""}${l.how ? ` · ${l.how === "cached" ? "remembered from the last race" : l.how}` : ""}`);
+}
+
+/** Races every source now, prints each one's time and remembers the winner. */
+async function printProbe(): Promise<void> {
+  const plan = sourcePlan();
+  console.log(regionLine(plan.decision));
+  const url = `https://github.com/${repo()}/releases/latest/download/${ASSETS.checksums}`;
+  const race = await raceSources(plan.order, (p, signal) => latestFromSums(sourceUrl(p, url), signal), { slackMs: 1500 });
+  for (const s of plan.order) {
+    const p = race.probes.find((x) => x.source === s);
+    const mark = s === race.winner ? "*" : " ";
+    console.log(`${mark} ${sourceLabel(s).padEnd(24)} ${p?.ok ? `${p.ms} ms` : `failed: ${p?.error ?? "?"}`}`);
+  }
+  if (race.winner === undefined) {
+    console.log("no source answered within the probe time; downloads fall back to each in turn.");
+    return;
+  }
+  writeSourceCache({ region: plan.decision.region, winner: race.winner, at: Date.now(), probes: race.probes });
+  console.log(`fastest: ${sourceLabel(race.winner)} (latest release ${race.value?.version ?? "?"}), used first for a day`);
 }
 
 // ---------------------------------------------------------------------------
@@ -625,10 +735,14 @@ async function fetchTo(src: string, file: string, want?: string, log: (m: string
   let first: unknown;
   for (const url of sourcesFor(src)) {
     try {
+      const t0 = Date.now();
       const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/octet-stream" }, signal: AbortSignal.timeout(10 * 60_000) });
       if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
       await pipeline(Readable.fromWeb(res.body as never), createWriteStream(file));
       await check();
+      const ms = Date.now() - t0;
+      const size = statSync(file).size;
+      log(`  downloaded ${Math.round(size / 1024)} KB via ${new URL(url).host} in ${(ms / 1000).toFixed(1)} s (${Math.round(size / 1024 / Math.max(ms / 1000, 0.001))} KB/s)`);
       return;
     } catch (e) {
       first ??= e;
@@ -638,11 +752,11 @@ async function fetchTo(src: string, file: string, want?: string, log: (m: string
   throw first;
 }
 
-async function fetchText(url: string, sources = sourcesFor(url)): Promise<string> {
+async function fetchText(url: string, sources = sourcesFor(url), signal?: AbortSignal): Promise<string> {
   let first: unknown;
   for (const u of sources) {
     try {
-      const res = await fetch(u, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(30_000) });
+      const res = await fetch(u, { headers: { "User-Agent": UA }, signal: signal ?? AbortSignal.timeout(30_000) });
       if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${u}`);
       return await res.text();
     } catch (e) {

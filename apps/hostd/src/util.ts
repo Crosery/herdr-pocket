@@ -14,6 +14,8 @@ export function run(cmd: string, args: string[], opts: { timeoutMs?: number; inp
         else resolve(stdout);
       },
     );
+    // A program that exits before reading its input closes the pipe: EPIPE then, which is not this call's failure.
+    child.stdin?.on("error", () => {});
     if (opts.input !== undefined) child.stdin?.end(opts.input);
   });
 }

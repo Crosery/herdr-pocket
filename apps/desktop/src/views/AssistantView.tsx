@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Bell, Check, ChevronRight, Mic, MicOff, Minimize2, Phone, PhoneOff, Send, Trash2, X } from "lucide-react";
 import type { AssistantItem } from "@herdr-pocket/protocol";
-import { EmptyState, PocketBadge, PocketButton, PocketCard, PocketIconButton, PocketModal, useToast } from "../components/PocketUI";
+import { EmptyState, PocketBadge, PocketButton, PocketCard, PocketIconButton, PocketModal, fs, useToast } from "../components/PocketUI";
 import { XiaoyangOrb, type MascotMood } from "../components/MascotAndVendor";
 import {
   assistantStore,
@@ -57,7 +57,8 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
 
   useEffect(() => {
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    // An empty thread shows the mascot from the top; pinning it to the bottom cut its head off.
+    if (el) el.scrollTop = items.length || busy ? el.scrollHeight : 0;
   }, [items.length, busy]);
 
   const inCall = callState.status === "connecting" || callState.status === "ready";
@@ -94,7 +95,7 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
       {/* Header */}
       <div className="between" style={{ padding: "12px 18px 8px", flexShrink: 0 }}>
         <div>
-          <h2 className="cute-font" style={{ margin: 0, fontSize: 24 }}>小羊</h2>
+          <h2 className="cute-font" style={{ margin: 0, fontSize: fs(24) }}>小羊</h2>
           <div className="faint">
             {busy ? (busyLabel || "正在思考…") : voice || isMockServer(server) ? "盯着所有电脑 · 文字与语音随时可用" : "盯着所有电脑"}
           </div>
@@ -123,7 +124,7 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
       {loaded && !ready && !isMockServer(server) ? (
         <div style={{ padding: "0 18px 8px" }}>
           <PocketCard soft>
-            <div className="faint">服务器上还没配置助理用的文字模型，可以在「设置 → 小羊配置」里添加后开聊。</div>
+            <div className="faint">服务器上还没配置助理用的文字模型，可以在「设置 → 小羊助理」里添加后开聊。</div>
           </PocketCard>
         </div>
       ) : null}
@@ -164,7 +165,7 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
           <div className="row">
             <XiaoyangOrb mood={callState.assistant === "speaking" ? "speaking" : "listening"} size={30} />
             <div>
-              <div style={{ fontWeight: 800, fontSize: 13 }}>和小羊通话中</div>
+              <div style={{ fontWeight: 800, fontSize: fs(13) }}>和小羊通话中</div>
               <div className="faint">{callState.status === "connecting" ? "正在接通…" : callState.task || "点击回到通话画面"}</div>
             </div>
           </div>
@@ -353,7 +354,7 @@ function AssistantBubble({
           ))}
         </div>
       ) : null}
-      <span className="faint num" style={{ fontSize: 11 }}>{fmtClock(item.ts)}</span>
+      <span className="faint num" style={{ fontSize: fs(11) }}>{fmtClock(item.ts)}</span>
     </div>
   );
 }
@@ -387,14 +388,14 @@ function CallOverlay({ onMinimize }: { onMinimize: () => void }) {
       <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 18, minHeight: 0 }}>
         <XiaoyangOrb mood={mood} size={136} />
         <div style={{ textAlign: "center" }}>
-          <h3 className="cute-font" style={{ margin: 0, fontSize: 24 }}>{statusText}</h3>
+          <h3 className="cute-font" style={{ margin: 0, fontSize: fs(24) }}>{statusText}</h3>
           <div className="row" style={{ justifyContent: "center", marginTop: 10, gap: 12 }}>
             <span className="faint">麦克风</span>
-            <div style={{ width: 70, height: 6, borderRadius: 99, background: "var(--surface-3)", overflow: "hidden" }}>
+            <div style={{ width: 70, height: 6, borderRadius: 99, background: "var(--line-pink)", overflow: "hidden" }}>
               <div style={{ width: `${Math.round(s.micLevel * 100)}%`, height: "100%", background: "var(--primary)" }} />
             </div>
             <span className="faint">声音</span>
-            <div style={{ width: 70, height: 6, borderRadius: 99, background: "var(--surface-3)", overflow: "hidden" }}>
+            <div style={{ width: 70, height: 6, borderRadius: 99, background: "var(--line-pink)", overflow: "hidden" }}>
               <div style={{ width: `${Math.round(s.outLevel * 100)}%`, height: "100%", background: "var(--lav)" }} />
             </div>
           </div>

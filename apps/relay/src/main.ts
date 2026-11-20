@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { Relay } from "./server.ts";
 import { describeSetup } from "./setup.ts";
 import { loadModelSetup } from "./config.ts";
+import { loadTranscribeSettings } from "./transcribe.ts";
 import { setTimeZone } from "./assistant/timezone.ts";
 import { usePromptDir } from "./assistant/prompts.ts";
 
@@ -25,6 +26,9 @@ if (models.errors.length) {
   for (const e of models.errors) console.error(`[relay] ${e}`);
   process.exit(1);
 }
+// Dictation (POST /v1/transcribe): its own POCKET_TRANSCRIBE_* service, else the voice/text providers' keys.
+const dictation = loadTranscribeSettings(env);
+for (const w of dictation.warnings) console.warn(`[relay] ${w}`);
 // Times the assistant says and reminders it takes are in this zone (POCKET_TIMEZONE, default Asia/Shanghai).
 setTimeZone(models.timeZone);
 // Optional: a private folder whose <id>.md files replace the shipped prompts, kept out of the repository.
@@ -50,6 +54,7 @@ const relay = new Relay({
   assistantConfirm: env.POCKET_ASSISTANT_CONFIRM === "always" ? "always" : "never",
   // Live voice; the key stays here and never reaches the phone.
   live: models.live,
+  transcribe: dictation.settings,
 });
 console.log(`[relay] assistant: ${models.summary.assistant.join(", ") || "off"}  voice: ${models.summary.voice ?? "off"}`);
 

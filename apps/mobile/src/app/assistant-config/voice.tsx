@@ -4,12 +4,13 @@
  */
 import { useEffect, useState } from "react";
 import { KeyboardAvoidingView, ScrollView, View } from "react-native";
-import { Button, IconButton, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { router, Stack } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { AssistantConfigView, VoiceOption, VoicePatch, VoiceProviderId } from "@herdr-pocket/protocol";
 import { Card, PageBackground } from "../../components/ui";
+import { PocketButton, RowAction } from "../../components/pocket";
 import { Row } from "../../components/rows";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Input, KeyField, LoadState, SaveBar, useLeaveGuard, WarningCard } from "../../components/configParts";
 import { changeConfig, flash, loadConfig, loadVoices, useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
@@ -17,7 +18,7 @@ import { useSettings } from "../../lib/store";
 import { isMockServer } from "../../lib/mock";
 import { isVoiceprintLegacy, voiceprintSupported } from "../../lib/voice";
 import { usePalette } from "../../theme/theme";
-import { fonts, radius, space } from "../../theme/tokens";
+import { fonts, space } from "../../theme/tokens";
 
 const WS = /^wss?:\/\/\S+$/i;
 const SPEED = { min: 0.5, max: 1.5, step: 0.1 };
@@ -149,7 +150,7 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
     setBusy(true);
     try {
       await changeConfig({ voice: { apiKey: null } });
-      setToast("已清除手机上设置的密钥");
+      setToast("已清除 App 里设的密钥");
     } catch (e) {
       setToast((e as Error).message);
     } finally {
@@ -207,31 +208,15 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
                 </Field>
                 <Field title="语速" hint={speed == null ? "现在用服务商默认的语速" : "1.0 是正常速度，0.5 到 1.5 之间"}>
                   <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-                    <IconButton
-                      icon="minus"
-                      mode="contained-tonal"
-                      size={20}
-                      disabled={shownSpeed <= SPEED.min}
-                      onPress={() => setSpeed(round1(Math.max(SPEED.min, shownSpeed - SPEED.step)))}
-                      accessibilityLabel="慢一点"
-                      style={{ margin: 0 }}
-                    />
+                    <RowAction icon="minus" disabled={shownSpeed <= SPEED.min} onPress={() => setSpeed(round1(Math.max(SPEED.min, shownSpeed - SPEED.step)))} a11y="慢一点" />
                     <View accessibilityLabel={speed == null ? "语速：默认" : `语速 ${speed.toFixed(1)} 倍`} style={{ minWidth: 76, alignItems: "center" }}>
                       <Text style={{ fontFamily: fonts.cute, fontSize: 22, lineHeight: 30, color: speed == null ? p.faint : p.ink }}>{speed == null ? "默认" : `${speed.toFixed(1)}×`}</Text>
                     </View>
-                    <IconButton
-                      icon="plus"
-                      mode="contained-tonal"
-                      size={20}
-                      disabled={shownSpeed >= SPEED.max}
-                      onPress={() => setSpeed(round1(Math.min(SPEED.max, shownSpeed + SPEED.step)))}
-                      accessibilityLabel="快一点"
-                      style={{ margin: 0 }}
-                    />
+                    <RowAction icon="plus" disabled={shownSpeed >= SPEED.max} onPress={() => setSpeed(round1(Math.min(SPEED.max, shownSpeed + SPEED.step)))} a11y="快一点" />
                     {speed != null ? (
-                      <Button mode="text" compact textColor={p.accentText} onPress={() => setSpeed(null)}>
+                      <PocketButton variant="text" size="sm" onPress={() => setSpeed(null)}>
                         用默认
-                      </Button>
+                      </PocketButton>
                     ) : null}
                   </View>
                 </Field>
@@ -248,15 +233,15 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
         </ScrollView>
 
         <SaveBar note="保存后从下一通电话开始用，所有手机都一样">
-          <Button mode="contained" disabled={!canSave} loading={busy} onPress={save} style={{ flex: 1, borderRadius: radius.pill }} contentStyle={{ height: 50 }} labelStyle={{ fontSize: 16 }}>
+          <PocketButton size="lg" grow disabled={!canSave} loading={busy} onPress={save}>
             保存
-          </Button>
+          </PocketButton>
         </SaveBar>
       </KeyboardAvoidingView>
 
       <ConfirmDialog
         visible={askClear}
-        title="清除手机上设置的密钥？"
+        title="清除 App 里设的密钥？"
         body="清除后改回用服务器上配的语音密钥；服务器上没有的话，电话会打不通。"
         action="清除"
         danger

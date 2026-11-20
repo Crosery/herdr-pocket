@@ -15,7 +15,8 @@ import type { Assistant } from "./assistant.ts";
 import { claimCall, releaseCall } from "./calls.ts";
 import { personaPrompt, voiceInstructions } from "./prompts.ts";
 import { CallTelemetry, RealtimeCall, type CallTelemetryOptions, type RealtimeConfig } from "./realtime.ts";
-import { clip } from "./speech.ts";
+import { CaptionPacer } from "./captions.ts";
+import { clip, taskTitle } from "./speech.ts";
 import { timeZone } from "./timezone.ts";
 
 export { endAllCalls } from "./calls.ts";
@@ -113,6 +114,7 @@ export function cleanPhoneMessage(msg: Record<string, unknown>, turnOf: (runId: 
 export class LiveCall {
   private upstream: WebSocket;
   private ended = false;
+  private captions = new CaptionPacer();
   private ready = false;
   /** Unique per call: transcript lines of two calls must never share an id (turn numbers restart at 1). */
   private id = randomUUID().slice(0, 8);
@@ -477,7 +479,18 @@ export class LiveCall {
       this.turns.set(d.run_id, d.turn_id);
       if (this.turns.size > 200) this.turns.delete(this.turns.keys().next().value!);
     }
-    if (msg.action && TO_PHONE.has(msg.action)) this.toPhone({ action: msg.action, data: d });
+    if (!msg.action || !TO_PHONE.has(msg.action)) return;
+    // The growing caption is paced (captions.ts); its final form or a cut replaces what waits.
+    const run = str(d.run_id) ? d.run_id : "";
+    if (msg.action === "output.transcript.updated") {
+      const action = msg.action;
+      this.captions.push(run, () => {
+        if (!this.ended) this.toPhone({ action, data: d });
+      });
+      return;
+    }
+    if (msg.action === "output.transcript.done" || msg.action === "response.interrupted") this.captions.cancel(run);
+    this.toPhone({ action: msg.action, data: d });
   }
 
   private lineKey(d: { run_id?: unknown; turn_id?: unknown }): string | undefined {
@@ -491,7 +504,7 @@ export class LiveCall {
     if (typeof id !== "string" || !id || this.tasks.has(id) || !objective.trim()) return;
     const ac = new AbortController();
     this.tasks.set(id, ac);
-    const title = clip(objective.replace(/\s+/g, " ").trim(), 40);
+    const title = taskTitle(objective);
     this.toPhone({ action: "relay.task", data: { id, title, status: "running" } });
     const context = Array.isArray(d.context) ? d.context.filter((c: any) => typeof c?.role === "string" && typeof c?.content === "string") : [];
     // No progress labels go upstream: they are no use for the answer and tempt the voice to narrate (4.2).
@@ -566,6 +579,7 @@ export class LiveCall {
     clearTimeout(this.attachTimer);
     clearInterval(this.keepalive);
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    this.captions.clear();
     this.detach();
     for (const ac of this.tasks.values()) ac.abort();
     this.tasks.clear();

@@ -1,12 +1,13 @@
 import { useMemo, useState } from "react";
-import { FlatList, View } from "react-native";
-import { Button, Dialog, IconButton, Menu, Portal, Text } from "react-native-paper";
+import { FlatList, Pressable, View } from "react-native";
+import { Text } from "react-native-paper";
 import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { Device } from "@herdr-pocket/protocol";
 import { ConnectionBanner } from "../../components/agents";
 import { Card, EmptyState, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
+import { PocketActionSheet, PocketButton, PocketDialog } from "../../components/pocket";
 import { useLive, useSettings } from "../../lib/store";
 import { loadToken } from "../../lib/auth";
 import { revokeDevice } from "../../lib/relay";
@@ -24,9 +25,8 @@ const PLATFORM_ICON: Record<string, "apple" | "linux" | "microsoft-windows" | "c
 };
 const PLATFORM_LABEL: Record<string, string> = { darwin: "macOS", linux: "Linux", win32: "Windows", ios: "iOS", android: "Android" };
 
-function DeviceRow({ d, isSelf, agentCount, onRevoke }: { d: Device; isSelf: boolean; agentCount: number; onRevoke: () => void }) {
+function DeviceRow({ d, isSelf, agentCount, onMore }: { d: Device; isSelf: boolean; agentCount: number; onMore: () => void }) {
   const p = usePalette();
-  const [menu, setMenu] = useState(false);
   const icon = PLATFORM_ICON[d.platform ?? ""] ?? (d.kind === "host" ? "laptop" : "cellphone");
   // A phone on the same network (or VPN) as the computer talks to it directly.
   const direct = useLive((x) => x.direct[d.id]);
@@ -61,22 +61,14 @@ function DeviceRow({ d, isSelf, agentCount, onRevoke }: { d: Device; isSelf: boo
       {isSelf ? (
         <View style={{ width: 44 }} />
       ) : (
-        <Menu
-          visible={menu}
-          onDismiss={() => setMenu(false)}
-          anchor={<IconButton icon="dots-vertical" accessibilityLabel={`${d.name} 的更多操作`} onPress={() => setMenu(true)} style={{ margin: 0 }} />}
-          contentStyle={{ backgroundColor: p.surface, borderRadius: radius.md }}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${d.name} 的更多操作`}
+          onPress={onMore}
+          style={({ pressed }) => ({ width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}
         >
-          <Menu.Item
-            leadingIcon="link-off"
-            title="移除这台设备"
-            titleStyle={{ color: p.error, fontFamily: fonts.bodySemi }}
-            onPress={() => {
-              setMenu(false);
-              onRevoke();
-            }}
-          />
-        </Menu>
+          <MaterialCommunityIcons name="dots-horizontal" size={22} color={p.muted} />
+        </Pressable>
       )}
     </Card>
   );
@@ -90,6 +82,7 @@ export default function DevicesScreen() {
   const self = useLive((s) => s.self);
   const server = useSettings((s) => s.server);
   const [target, setTarget] = useState<Device | null>(null);
+  const [more, setMore] = useState<Device | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -134,7 +127,7 @@ export default function DevicesScreen() {
             <SectionHeader title={item.title} />
           ) : (
             <View style={{ marginBottom: space.sm }}>
-              <DeviceRow d={item.d} isSelf={item.d.id === self?.id} agentCount={agents[item.d.id]?.length ?? 0} onRevoke={() => setTarget(item.d)} />
+              <DeviceRow d={item.d} isSelf={item.d.id === self?.id} agentCount={agents[item.d.id]?.length ?? 0} onMore={() => setMore(item.d)} />
             </View>
           )
         }
@@ -142,12 +135,12 @@ export default function DevicesScreen() {
           <View style={{ gap: space.lg }}>
             <PageTitle sub={`${list.length} 台设备，${online} 台在线`}>我的设备</PageTitle>
             <View style={{ flexDirection: "row", gap: space.sm }}>
-              <Button mode="contained" icon="qrcode-scan" onPress={() => router.push("/scan")} contentStyle={{ height: 50 }} style={{ flex: 1, borderRadius: radius.pill }} labelStyle={{ fontSize: 16 }}>
+              <PocketButton size="lg" grow icon="qrcode-scan" onPress={() => router.push("/scan")}>
                 扫一扫
-              </Button>
-              <Button mode="contained-tonal" icon="qrcode" onPress={() => router.push("/pair-new")} contentStyle={{ height: 50 }} style={{ flex: 1, borderRadius: radius.pill }} labelStyle={{ fontSize: 16 }}>
+              </PocketButton>
+              <PocketButton size="lg" grow variant="soft" icon="qrcode" onPress={() => router.push("/pair-new")}>
                 邀请设备
-              </Button>
+              </PocketButton>
             </View>
             <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 18, paddingHorizontal: space.xs }}>
               加电脑：在那台电脑上运行 herdr-pocket up，扫它显示的二维码。加手机：点“邀请设备”，让对方扫你的二维码。
@@ -157,25 +150,32 @@ export default function DevicesScreen() {
         ListEmptyComponent={<EmptyState mood="sleepy" title="还没有设备" body="用上面的“扫一扫”或“邀请设备”把电脑和手机加进来。" />}
         contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: space.sm, paddingBottom: space.xxl }}
       />
-      <Portal>
-        <Dialog visible={!!target} onDismiss={() => setTarget(null)} style={{ borderRadius: radius.xl, backgroundColor: p.surface }}>
-          <Dialog.Title style={{ fontFamily: fonts.cute, color: p.ink }}>移除“{target?.name}”？</Dialog.Title>
-          <Dialog.Content style={{ gap: space.sm }}>
-            <Text style={{ color: p.muted, lineHeight: 22 }}>
-              它会马上断开，授权作废，之后要重新配对才能再连上。{target?.kind === "host" ? "这台电脑上的 agent 也会从列表里消失。" : ""}
-            </Text>
-            {error ? <Text style={{ color: p.error }}>{error}</Text> : null}
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={() => setTarget(null)} textColor={p.ink}>
-              取消
-            </Button>
-            <Button textColor={p.error} loading={busy} onPress={revoke}>
-              移除并断开
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
+      <PocketActionSheet
+        visible={!!more}
+        onDismiss={() => setMore(null)}
+        title={more?.name ?? ""}
+        sub={more ? `${more.kind === "host" ? "电脑" : "手机或其他客户端"} · ${more.online ? "在线" : "离线"}` : undefined}
+        actions={
+          more
+            ? [
+                ...(more.kind === "host" ? [{ key: "show", label: "只看它的 agent", icon: "filter-variant" as const, onPress: () => router.navigate({ pathname: "/agents", params: { host: more.id } }) }] : []),
+                { key: "revoke", label: "移除这台设备", sub: "断开并作废授权", icon: "link-off" as const, danger: true, onPress: () => setTarget(more) },
+              ]
+            : []
+        }
+      />
+      <PocketDialog
+        visible={!!target}
+        onDismiss={() => setTarget(null)}
+        title={`移除“${target?.name ?? ""}”？`}
+        body={`它会马上断开，授权作废，之后要重新配对才能再连上。${target?.kind === "host" ? "这台电脑上的 agent 也会从列表里消失。" : ""}`}
+        actions={[
+          { label: "取消", onPress: () => setTarget(null), tone: "ghost" },
+          { label: "移除并断开", onPress: () => void revoke(), tone: "danger", loading: busy },
+        ]}
+      >
+        {error ? <Text style={{ color: p.error }}>{error}</Text> : null}
+      </PocketDialog>
     </PageBackground>
   );
 }

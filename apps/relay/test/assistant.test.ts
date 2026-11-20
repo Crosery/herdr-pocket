@@ -251,6 +251,8 @@ test("a finished turn wakes the assistant to look; what it found reaches the pus
       : undefined,
   );
   const phone = await pair("viewer", "Redmi 3");
+  // A notice can be the first item in the available history.
+  assert.equal((await api("/v1/assistant/thread", { method: "DELETE", token: phone.token })).status, 200);
   const p = await Sock.open("/v1/ws", phone.token);
   await p.next((f) => f.type === "snapshot");
   const push = await Sock.open("/v1/notify", phone.token);
@@ -300,8 +302,12 @@ test("a finished turn wakes the assistant to look; what it found reaches the pus
   script = () => text("行。");
   await api("/v1/assistant/messages", { token: phone.token, body: { text: "那让它把测试修了" } });
   await p.next((f) => f.type === "assistant_busy" && f.busy === false);
-  const history = seenRequests[seenRequests.length - 1]!.messages.map((m) => String(m.content)).join("\n");
-  assert.match(history, new RegExp(`（我主动告诉过你，关于 重构网关，key=${host.device.id}/hc:t5）重构网关说测试全过`));
+  const history = seenRequests[seenRequests.length - 1]!.messages;
+  const notice = history.at(-2)!;
+  assert.equal(notice.role, "assistant");
+  assert.match(String(notice.content), new RegExp(`（我主动告诉过你，关于 重构网关，key=${host.device.id}/hc:t5）重构网关说测试全过`));
+  assert.match(String(notice.content), /pnpm test 报了 2 个失败/);
+  assert.deepEqual(history.at(-1), { role: "user", content: "那让它把测试修了" });
 });
 
 test("what counts as stopped: short turns, the desk, subagents, watching, batches", async () => {

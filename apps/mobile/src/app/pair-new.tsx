@@ -1,7 +1,7 @@
 /** Invite: one QR + code that lets in a phone (scan it) or a computer (run the command). */
 import { useEffect, useRef, useState } from "react";
 import { ScrollView, Share, View } from "react-native";
-import { ActivityIndicator, Button, ProgressBar, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import QRCode from "react-native-qrcode-svg";
 import * as Clipboard from "expo-clipboard";
 import { router } from "expo-router";
@@ -12,6 +12,7 @@ import { loadToken } from "../lib/auth";
 import { friendlyError } from "../lib/session";
 import { useLive, useSettings } from "../lib/store";
 import { Card } from "../components/ui";
+import { PocketButton, PocketProgress, PocketSpinner } from "../components/pocket";
 import { Mascot, Sparkle } from "../components/Mascot";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space } from "../theme/tokens";
@@ -81,12 +82,12 @@ export default function InviteScreen() {
               ? "电脑已经登记，但还没上线。在那台电脑上运行 herdr-pocket up，它的 agent 才会出现在列表里。"
               : "电脑已经上线，它的 agent 会出现在列表里。"}
         </Text>
-        <Button mode="contained" onPress={() => router.back()} contentStyle={{ height: 48 }} style={{ borderRadius: radius.pill, marginTop: space.md, alignSelf: "stretch" }}>
+        <PocketButton size="lg" block onPress={() => router.back()} style={{ marginTop: space.md }}>
           完成
-        </Button>
-        <Button mode="text" textColor={p.accentText} onPress={() => m.mutate()}>
+        </PocketButton>
+        <PocketButton variant="text" onPress={() => m.mutate()}>
           再邀请一台
-        </Button>
+        </PocketButton>
       </View>
     );
   }
@@ -96,12 +97,12 @@ export default function InviteScreen() {
     <ScrollView style={{ backgroundColor: p.page }} contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: space.lg, gap: space.lg }}>
       <Card style={{ alignItems: "center", gap: space.lg, padding: space.xl, borderRadius: radius.xl }}>
         {m.isPending ? (
-          <ActivityIndicator style={{ marginVertical: 120 }} />
+          <PocketSpinner size={32} style={{ marginVertical: 120 }} />
         ) : m.isError ? (
           <View style={{ alignItems: "center", gap: space.md, paddingVertical: space.xxl }}>
             <Mascot mood="waiting" size={80} />
             <Text style={{ color: p.error, textAlign: "center" }}>{friendlyError(m.error)}</Text>
-            <Button textColor={p.accentText} onPress={() => m.mutate()}>再试一次</Button>
+            <PocketButton variant="text" onPress={() => m.mutate()}>再试一次</PocketButton>
           </View>
         ) : m.data ? (
           <>
@@ -121,16 +122,16 @@ export default function InviteScreen() {
                 <Text style={{ color: expired ? p.error : p.muted, fontSize: 13.5 }}>{expired ? "已过期" : "有效期，只能用一次"}</Text>
                 <Text style={{ fontFamily: fonts.cute, fontSize: 16, color: expired ? p.error : p.ink }}>{cd?.text}</Text>
               </View>
-              <ProgressBar progress={cd ? cd.ms / total : 0} color={brand.pink} style={{ height: 6, borderRadius: 3, backgroundColor: p.surface3 }} />
+              <PocketProgress progress={cd ? cd.ms / total : 0} color={brand.pink} />
             </View>
             {expired ? (
-              <Button mode="contained" icon="refresh" onPress={() => m.mutate()} style={{ borderRadius: radius.pill }}>
+              <PocketButton icon="refresh" onPress={() => m.mutate()}>
                 换一个新的
-              </Button>
+              </PocketButton>
             ) : (
-              <Button mode="contained-tonal" icon="share-variant" onPress={share} style={{ alignSelf: "stretch", borderRadius: radius.pill }} contentStyle={{ height: 46 }}>
+              <PocketButton variant="soft" size="lg" block icon="share-variant" onPress={share}>
                 把邀请链接发给自己的另一台设备
-              </Button>
+              </PocketButton>
             )}
           </>
         ) : null}
@@ -148,21 +149,16 @@ export default function InviteScreen() {
             </Text>
           </View>
           <View style={{ flexDirection: "row", gap: space.sm }}>
-            <Button
-              icon={copied ? "check" : "content-copy"}
-              mode="contained-tonal"
-              onPress={async () => {
+            <PocketButton variant="soft" grow icon={copied ? "check" : "content-copy"} onPress={async () => {
                 await Clipboard.setStringAsync(hostCmd);
                 setCopied(true);
                 setTimeout(() => setCopied(false), 1500);
-              }}
-              style={{ flex: 1, borderRadius: radius.pill }}
-            >
+              }}>
               {copied ? "已复制" : "复制命令"}
-            </Button>
-            <Button icon="qrcode-scan" mode="outlined" textColor={p.ink} onPress={() => router.replace("/scan")} style={{ flex: 1, borderRadius: radius.pill, borderColor: p.divider }}>
+            </PocketButton>
+            <PocketButton variant="ghost" grow icon="qrcode-scan" onPress={() => router.replace("/scan")}>
               去扫一扫
-            </Button>
+            </PocketButton>
           </View>
         </Card>
       ) : null}

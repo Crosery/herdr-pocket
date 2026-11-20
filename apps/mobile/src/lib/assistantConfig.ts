@@ -72,7 +72,7 @@ export const providerName = (p: Pick<ProviderView, "id" | "label"> | undefined, 
 /** "已设置 ··a1b2 · 服务器上的" / "未设置". */
 export function keyLine(k: KeyView): string {
   if (!k.set) return "未设置";
-  return `已设置${k.hint ? ` ··${k.hint}` : ""}${k.from === "phone" ? " · 手机上设的" : k.from === "server" ? " · 服务器上的" : ""}`;
+  return `已设置${k.hint ? ` ··${k.hint}` : ""}${k.from === "phone" ? " · App 里设的" : k.from === "server" ? " · 服务器上的" : ""}`;
 }
 
 /** "首字 1.8 秒 · 全部 2.4 秒". */

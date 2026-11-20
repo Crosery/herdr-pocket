@@ -1,7 +1,7 @@
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Image, Pressable, ScrollView, View, type NativeScrollEvent, type NativeSyntheticEvent, type ViewProps } from "react-native";
 import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flash-list";
-import { ActivityIndicator, Button, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
@@ -14,6 +14,7 @@ import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
 import { EmptyState, PocketToast, TypingDots } from "./ui";
+import { PocketButton, PocketSpinner } from "./pocket";
 import { Md } from "./md";
 import { ReplyDots, SendMark } from "./outbox";
 import { BusyMascot, Sparkle } from "./Mascot";
@@ -422,7 +423,7 @@ function ToolCard({ call: c, result, bare }: { call: ToolCall; result?: ToolResu
           {summary}
         </Text>
         {pending ? (
-          <ActivityIndicator size={12} />
+          <PocketSpinner size={12} />
         ) : (
           failed ? <MaterialCommunityIcons name="alert-circle" size={16} color={p.error} /> : <CuteIcon name="done" size={16} color={statusColors("working", p.dark).fg} fill={p.dark ? "transparent" : statusColors("working", p.dark).bg} strokeWidth={2.4} />
         )}
@@ -468,7 +469,7 @@ function ToolGroup({ items: tools }: { items: Extract<Row, { type: "tool" }>[] }
           {names}
         </Text>
         {failed ? <Text style={{ color: p.error, fontFamily: fonts.bodyBold, fontSize: 12 }}>{failed} 个失败</Text> : null}
-        {running.length ? <ActivityIndicator size={12} /> : failed ? null : <CuteIcon name="done" size={16} color={statusColors("working", p.dark).fg} fill={p.dark ? "transparent" : statusColors("working", p.dark).bg} strokeWidth={2.4} />}
+        {running.length ? <PocketSpinner size={12} /> : failed ? null : <CuteIcon name="done" size={16} color={statusColors("working", p.dark).fg} fill={p.dark ? "transparent" : statusColors("working", p.dark).bg} strokeWidth={2.4} />}
         <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-down"} size={16} color={p.faint} />
       </Pressable>
       {!open && current ? (
@@ -921,13 +922,13 @@ export function ChatView({
   if (sub && q.isLoading && !rows.length) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: space.sm }}>
-        <ActivityIndicator />
+        <PocketSpinner size={28} />
         <Text style={{ color: p.faint, fontSize: 12 }}>正在接收对话…</Text>
       </View>
     );
   }
   if (sub && q.isError && !rows.length) {
-    return <EmptyState mood="waiting" title="对话没加载出来" body={(q.error as Error).message} action={<Button textColor={p.accentText} onPress={() => q.refetch()}>再试一次</Button>} />;
+    return <EmptyState mood="waiting" title="对话没加载出来" body={(q.error as Error).message} action={<PocketButton variant="text" onPress={() => q.refetch()}>再试一次</PocketButton>} />;
   }
   if (sub && !rows.length) return <EmptyState mood="sleepy" title="还没有对话" />;
   const connectionNote = !linkOnline && streamState !== "live"
@@ -980,7 +981,7 @@ export function ChatView({
           ListFooterComponent={
             more ? (
               <View style={{ alignItems: "center", paddingVertical: space.md, minHeight: 40 }}>
-                {loadingOlder ? <ActivityIndicator size={16} /> : null}
+                {loadingOlder ? <PocketSpinner size={16} /> : null}
               </View>
             ) : rows.some((row) => row.type !== "pending") ? (
               <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingVertical: space.md }}>
@@ -993,10 +994,26 @@ export function ChatView({
           keyboardDismissMode="interactive"
           extraData={subCtx}
         />
+        {/* A new agent has no conversation until its first turn: say so instead of showing a blank page. */}
+        {!sub && !rows.length && !q.isLoading ? (
+          <View pointerEvents="none" style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: bottomInset, justifyContent: "center" }}>
+            <EmptyState
+              mood={working ? "default" : "waiting"}
+              title={working ? "它开始干活了" : "还没有对话"}
+              body={
+                working
+                  ? "第一条消息一到，就会出现在这里。"
+                  : waitingForSession
+                    ? "它刚开好，还在等第一句话。在下面说一句，对话就从这里开始。"
+                    : "在下面说一句，对话就会出现在这里。"
+              }
+            />
+          </View>
+        ) : null}
         <View pointerEvents="box-none" style={{ position: "absolute", right: space.lg, bottom: bottomInset + space.md, alignItems: "flex-end", gap: space.sm }}>
           {jumping ? (
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: p.surface, borderRadius: radius.pill, paddingHorizontal: space.md, minHeight: 36, borderWidth: 1, borderColor: p.divider }}>
-              <ActivityIndicator size={12} />
+              <PocketSpinner size={12} />
               <Text style={{ color: p.muted, fontSize: 12.5 }}>正在往前翻，已载入 {jumping.loaded} 条</Text>
             </View>
           ) : null}

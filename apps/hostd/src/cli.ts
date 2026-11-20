@@ -13,7 +13,9 @@ import { Host, HOSTD_VERSION } from "./host.ts";
 import { IS_WINDOWS } from "./platform.ts";
 import { lineSplitter } from "./util.ts";
 import { SERVICE_HELP, control as controlAt, serviceCommand } from "./winservice.ts";
-import { UPDATE_HELP, updateCommand, versionCommand, watchForUpdates } from "@herdr-pocket/update";
+import { UPDATE_HELP, currentRegion, updateCommand, versionCommand, watchForUpdates } from "@herdr-pocket/update";
+import { CONFIG_HELP, configCommand } from "./configcmd.ts";
+import { readUpstreamCache, upstreamCheckEnabled, upstreamLine, watchUpstream } from "./upstream.ts";
 
 const HELP = `herdr-pocket ${HOSTD_VERSION} — put this computer's herdr agents in your pocket
 
@@ -33,6 +35,9 @@ Setup
   status    Show login and connection state.
 ${SERVICE_HELP}
 
+Settings (config.json next to hostd.json, shared with the desktop app; docs/config.md)
+${CONFIG_HELP}
+
 Updates
 ${UPDATE_HELP}
 
@@ -49,7 +54,8 @@ Logs (what the relay, the computers and the phones recorded)
   logs [--since 1h] [--device <name|id>] [--kind <kind>] [--level warn|error]
        [--source relay|host|viewer] [--text <words>] [--limit N] [--follow] [--json]
         kinds: assistant (turns, tools), action, rpc, guard, live, wake, model,
-        device, settings, or what a computer/phone reported (hostd, rpc, link, js, ...).
+        device, settings, pair, transcribe, or what a computer/phone reported
+        (hostd, rpc, link, js, update, config, files, ...).
 `;
 
 async function main(): Promise<void> {
@@ -79,6 +85,8 @@ async function main(): Promise<void> {
       return talk(cmd, rest);
     case "logs":
       return logs(rest);
+    case "config":
+      return configCommand(rest, reportToRelay);
     case "version":
       return versionCommand(rest, { service: "host", bin: "herdr-pocket" });
     case "update":
@@ -264,6 +272,9 @@ async function status(): Promise<void> {
   const daemon = await control({ op: "state" }).catch(() => null);
   console.log(`daemon   ${daemon ? (daemon.connected ? "running, connected" : "running, reconnecting") : "not running"}`);
   if (daemon) console.log(`sources  ${daemon.sources.join(", ") || "none"} · ${daemon.local} local agents`);
+  // Newer hc / Herdr app / uniflo releases: the daemon's last check, else what it left in the state folder.
+  const cached = daemon?.tools ? undefined : readUpstreamCache();
+  console.log(`upstream ${upstreamLine(daemon?.tools ?? (cached ? { ...cached.have, latest: cached.latest } : undefined), upstreamCheckEnabled())}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +319,7 @@ async function runDaemon(argv: string[]): Promise<void> {
               connected: host.connected,
               sources: host.sources,
               local: host.agents.length,
+              tools: host.tools(),
               devices: [...host.devices.values()],
               agents,
             };
@@ -329,7 +341,14 @@ async function runDaemon(argv: string[]): Promise<void> {
   server.listen(CONTROL_SOCKET);
 
   await host.start();
-  watchForUpdates((m) => console.log(`[hostd] ${m}`), "herdr-pocket update");
+  const region = currentRegion();
+  host.note("info", "update", `downloads: region ${region.region} by ${region.reason}${region.timeZone ? ` (${region.timeZone})` : ""}`, { ...region });
+  watchForUpdates((m, data, level) => {
+    console.log(`[hostd] ${m}`);
+    host.note(level ?? "info", "update", m, data);
+  }, "herdr-pocket update");
+  // Report only: newer hc / Herdr app / uniflo releases, a few minutes after start, then daily.
+  watchUpstream(() => host.checkUpstream());
   const shutdown = () => {
     host.stop();
     server.close();
@@ -529,6 +548,25 @@ async function withDirect<T>(fn: (c: { state: State; call: (to: string, m: RpcMe
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * One line for the relay's log from this CLI (it runs apart from the daemon): best effort, a few
+ * seconds at most, never an error. Only when this computer is logged in.
+ */
+async function reportToRelay(level: "info" | "warn", msg: string, data: Record<string, unknown>): Promise<void> {
+  const cfg = loadConfig();
+  if (!cfg) return;
+  try {
+    await fetch(`${cfg.server.replace(/\/+$/, "")}/v1/logs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.token}` },
+      body: JSON.stringify({ entries: [{ ts: Date.now(), level, kind: "config", msg, data }] }),
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch {
+    /* offline: the setting is saved all the same */
+  }
+}
 
 async function http<T>(server: string, path: string, init: { token?: string; body?: unknown; method?: string }): Promise<T> {
   let res: Response;

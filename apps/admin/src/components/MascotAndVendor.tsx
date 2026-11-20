@@ -24,6 +24,9 @@ const MOOD_PATH: Record<MascotMood, string> = {
   idle: "call/idle.webp",
 };
 
+/** Square portrait art; the other moods are full-body transparent stickers shown whole. */
+const PORTRAIT_MOODS = new Set<MascotMood>(["default", "speaking", "listening", "idle"]);
+
 export function XiaoyangOrb({
   mood = "hello",
   size = 84,
@@ -56,7 +59,7 @@ export function XiaoyangOrb({
   return (
     <div
       ref={ref}
-      className="xiaoyang-orb"
+      className={PORTRAIT_MOODS.has(mood) ? "xiaoyang-orb portrait" : "xiaoyang-orb"}
       style={{ width: size, height: size }}
       onClick={handleClick}
       role={onClick ? "button" : undefined}
@@ -85,7 +88,6 @@ const SKY = { bg: "#D4EBFB", darkBg: "#243F55" };
 const BUTTER = { bg: "#FFF0B8", darkBg: "#4D4426" };
 const GREY = { bg: "#ECE8F1", darkBg: "#3A3446" };
 const ROSE = { bg: "#FFDDE7", darkBg: "#4E2C3A" };
-const FALLBACKS = [ROSE, SKY, MINT, PEACH] as const;
 
 const ALIASES: Record<string, string> = {
   "claude-code": "claude",
@@ -120,16 +122,36 @@ const LOOKS: Record<string, VendorLook> = {
   kimi: { label: "Kimi", ...SKY, sticker: "vendors/kimi.webp", glyph: "K" },
   opencode: { label: "OpenCode", ...SKY, sticker: "vendors/opencode.webp", glyph: "{ }", mono: true },
   pi: { label: "Pi", ...LAVENDER, sticker: "vendors/pi.webp", glyph: "π" },
-  omp: { label: "omp", ...LAVENDER, sticker: "vendors/pi.webp", glyph: "π" },
+  omp: { label: "omp", ...LAVENDER, sticker: "vendors/omp.webp", glyph: "π" },
   qwen: { label: "Qwen", ...ROSE, sticker: "vendors/qwen.webp", glyph: "Q" },
-  antigravity: { label: "Antigravity", ...SKY, glyph: "A" },
-  cline: { label: "Cline", ...GREY, glyph: "C" },
-  codebuddy: { label: "CodeBuddy", ...LAVENDER, glyph: "C" },
-  copilot: { label: "Copilot", ...GREY, glyph: "C" },
-  devin: { label: "Devin", ...MINT, glyph: "D" },
-  grok: { label: "Grok", ...GREY, glyph: "G" },
-  qoder: { label: "Qoder", ...MINT, glyph: "Q" },
-  openclaw: { label: "OpenClaw", ...ROSE, glyph: "O" },
+  antigravity: { label: "Antigravity", ...SKY, sticker: "vendors/antigravity.webp", glyph: "A" },
+  cline: { label: "Cline", ...GREY, sticker: "vendors/cline.webp", glyph: "C" },
+  codebuddy: { label: "CodeBuddy", ...LAVENDER, sticker: "vendors/codebuddy.webp", glyph: "C" },
+  commandcode: { label: "Command Code", ...GREY, sticker: "vendors/commandcode.webp", glyph: "⌘" },
+  copilot: { label: "Copilot", ...GREY, sticker: "vendors/copilot.webp", glyph: "C" },
+  devin: { label: "Devin", ...MINT, sticker: "vendors/devin.webp", glyph: "D" },
+  dsh: { label: "DeepSeek Harness", ...SKY, sticker: "vendors/dsh.webp", glyph: "D" },
+  grok: { label: "Grok", ...GREY, sticker: "vendors/grok.webp", glyph: "G" },
+  kilo: { label: "Kilo Code", ...BUTTER, sticker: "vendors/kilo.webp", glyph: "K" },
+  kiro: { label: "Kiro", ...LAVENDER, sticker: "vendors/kiro.webp", glyph: "K" },
+  mimocode: { label: "MiMo Code", ...PEACH, sticker: "vendors/mimocode.webp", glyph: "M" },
+  minimax: { label: "MiniMax Code", ...ROSE, sticker: "vendors/minimax.webp", glyph: "M" },
+  openclaw: { label: "OpenClaw", ...ROSE, sticker: "vendors/openclaw.webp", glyph: "O" },
+  qoder: { label: "Qoder", ...MINT, sticker: "vendors/qoder.webp", glyph: "Q" },
+  reasonix: { label: "Reasonix", ...SKY, sticker: "vendors/reasonix.webp", glyph: "R" },
+  roo: { label: "Roo Code", ...PEACH, sticker: "vendors/roo.webp", glyph: "R" },
+  zcode: { label: "ZCode", ...GREY, sticker: "vendors/zcode.webp", glyph: "Z" },
+  workbuddy: { label: "WorkBuddy", ...SKY, sticker: "vendors/workbuddy.webp", glyph: "W" },
+  factory: { label: "Factory Droid", ...PEACH, sticker: "vendors/factory.webp", glyph: "D" },
+  craft: { label: "Craft Agents", ...LAVENDER, sticker: "vendors/craft.webp", glyph: "C" },
+  crosery: { label: "Crosery Agent", ...ROSE, sticker: "vendors/crosery.webp", glyph: "C" },
+  prime: { label: "Prime Agent", ...GREY, sticker: "vendors/prime.webp", glyph: "P" },
+  kodu: { label: "Kodu", ...MINT, sticker: "vendors/kodu.webp", glyph: "K" },
+  amp: { label: "Amp", ...PEACH, sticker: "vendors/amp.webp", glyph: "A" },
+  crush: { label: "Crush", ...ROSE, sticker: "vendors/crush.webp", glyph: "C" },
+  goose: { label: "Goose", ...BUTTER, sticker: "vendors/goose.webp", glyph: "G" },
+  aider: { label: "Aider", ...MINT, sticker: "vendors/aider.webp", glyph: "A" },
+  iflow: { label: "iFlow", ...SKY, sticker: "vendors/iflow.webp", glyph: "i" },
 };
 
 export function resolveVendor(harness: string, isShell: boolean): VendorLook {
@@ -140,11 +162,11 @@ export function resolveVendor(harness: string, isShell: boolean): VendorLook {
   const id = ALIASES[raw] ?? raw;
   const known = LOOKS[id];
   if (known) return known;
-  let h = 0;
-  for (const ch of raw) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  // The generic sticker is always drawn here, so the tile takes its rose disc colour;
+  // any other colour shows in the rounded tile's corners.
   return {
     label: harness || "Agent",
-    ...FALLBACKS[h % FALLBACKS.length]!,
+    ...ROSE,
     sticker: "vendors/unknown.webp",
     glyph: (harness?.[0] ?? "?").toUpperCase(),
   };

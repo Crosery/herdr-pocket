@@ -20,7 +20,7 @@ import {
 } from "@herdr-pocket/protocol";
 import { HcAdapter, type AppNames } from "./hc.ts";
 import type { ScreenLines } from "./hcscreen.ts";
-import { HerdrApp, NoDesktopApp, checkFolder, herdrCommandArgs, installedLaunchers, launcherArgv, resumeArgv, withProgramPath } from "./create.ts";
+import { HerdrApp, NoDesktopApp, checkFolder, findPrograms, herdrCommandArgs, installedLaunchers, launcherArgv, resumeArgv, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { DirectServer, type DirectPeer } from "./direct.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
@@ -30,8 +30,13 @@ import { InputWaits } from "./waiting.ts";
 import { typeFirstTask, type TypeTaskOptions } from "./firsttask.ts";
 import { FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from "./put.ts";
 import { LogBuffer, clipChars, levelOf } from "./logbuf.ts";
-import type { HostConfig } from "./config.ts";
-import { VERSION } from "@herdr-pocket/update";
+import { CONFIG_DIR, type HostConfig } from "./config.ts";
+import { FilesError, listFiles, readFileSlice } from "./files.ts";
+import { run } from "./util.ts";
+import { changedKeys } from "./configcmd.ts";
+import { VERSION, clientConfigPath, readClientConfig, type LoadedClientConfig } from "@herdr-pocket/update";
+import { getConfigValue, type ClientConfig, type HostTools, type LogLevel, type UpstreamLatest } from "@herdr-pocket/protocol";
+import { checkUpstream, herdrAppVersion, readUpstreamCache, writeUpstreamCache, type UpstreamDeps } from "./upstream.ts";
 
 /** The repository version (root package.json), shared with the relay and the app. */
 export const HOSTD_VERSION = VERSION;
@@ -44,7 +49,7 @@ function callSummary(params: unknown, result?: unknown): Record<string, unknown>
   const out: Record<string, unknown> = {};
   if (params && typeof params === "object") {
     const p = params as Record<string, unknown>;
-    for (const k of ["agent", "launcher", "space", "spaceName", "tabName", "folder", "command", "session"]) if (typeof p[k] === "string") out[k] = p[k];
+    for (const k of ["agent", "launcher", "space", "spaceName", "tabName", "folder", "command", "session", "path"]) if (typeof p[k] === "string") out[k] = p[k];
     if (typeof p.text === "string") out.text = clipChars(p.text, 200);
     if (typeof p.task === "string") out.task = clipChars(p.task, 200);
     if (Array.isArray(p.keys)) out.keys = p.keys.slice(0, 16).join(" ");
@@ -155,6 +160,17 @@ export class Host {
   firstTaskOptions: TypeTaskOptions = {};
   /** Where pictures for agents of the herdr terminal app are kept (tests point it elsewhere). */
   filesDir = FILES_DIR;
+  /** Folders `files.list` / `files.read` never show: this computer's own settings, with its token. */
+  privateDirs = [CONFIG_DIR];
+  /** config.json as last read (logging settings; changes are logged). */
+  private settings: LoadedClientConfig;
+  private settingsStamp = "";
+  /** Versions of herdr, Uniflo (`--version`) and the Herdr app, looked up at start (again by the upstream check). */
+  private toolVersions: { herdr?: string; uniflo?: string; app?: string } = {};
+  /** Full paths of herdr and uniflo as findPrograms found them (a service's PATH is bare). */
+  private toolBins: { herdr?: string; uniflo?: string } = {};
+  /** Newer upstream releases, from `<state>/upstream.json` and the daily check (cli.ts schedules it). */
+  private upstream: UpstreamLatest | undefined;
 
   constructor(opts: HostOptions) {
     this.opts = opts;
@@ -162,8 +178,10 @@ export class Host {
     // Every plain line also goes to the relay's log, so trouble here can be seen from there.
     this.log = (m) => {
       out(m);
-      this.logs.push(levelOf(m), "hostd", m);
+      this.keep(levelOf(m), "hostd", m);
     };
+    this.settings = readClientConfig();
+    this.settingsStamp = this.stampOf(this.settings);
     this.deviceId = opts.config.deviceId;
     this.direct = new DirectServer({
       port: opts.config.directPort,
@@ -202,12 +220,42 @@ export class Host {
   }
 
   /** A structured line for the relay's log (not printed). */
-  note(level: "info" | "warn" | "error", kind: string, msg: string, data?: Record<string, unknown>): void {
+  note(level: LogLevel, kind: string, msg: string, data?: Record<string, unknown>): void {
+    this.keep(level, kind, msg, data);
+  }
+
+  /** Into the ring, unless below `logging.level` in config.json. */
+  private keep(level: LogLevel, kind: string, msg: string, data?: Record<string, unknown>): void {
+    const rank: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+    if (rank[level] < rank[this.settings.config.logging.level]) return;
     this.logs.push(level, kind, msg, data);
   }
 
-  /** Sends what the ring holds, at most a few batches at a time. */
+  private stampOf(c: LoadedClientConfig): string {
+    return JSON.stringify([c.exists, c.config, c.problems.map((p) => p.key + p.message)]);
+  }
+
+  /** Reads config.json again; a change (from the CLI or the desktop app) is logged with the keys it touched. */
+  checkSettings(): void {
+    const next = readClientConfig(this.settings.path);
+    const stamp = this.stampOf(next);
+    if (stamp === this.settingsStamp) return;
+    const keys = changedKeys(this.settings.config, next.config);
+    const prev = this.settings.config;
+    this.settings = next;
+    this.settingsStamp = stamp;
+    if (keys.length) {
+      const show = (c: ClientConfig, k: string) => JSON.stringify(getConfigValue(c, k));
+      this.note("info", "config", `config.json changed: ${keys.map((k) => `${k} ${show(prev, k)} -> ${show(next.config, k)}`).join(", ")}`, { keys: keys.join(",") });
+    }
+    const errors = next.problems.filter((p) => p.level === "error");
+    if (errors.length) this.note("warn", "config", `config.json has problems: ${errors.map((p) => `${p.key || "file"}: ${p.message}`).join("; ")}`);
+  }
+
+  /** Sends what the ring holds, at most a few batches at a time (none with `logging.upload: false`). */
   flushLogs(): void {
+    this.checkSettings();
+    if (!this.settings.config.logging.upload) return;
     for (let i = 0; i < 5 && this.logs.size && this.connected; i++) {
       const entries = this.logs.take(200);
       this.send({ type: "log", entries });
@@ -215,6 +263,16 @@ export class Host {
   }
 
   async start(): Promise<void> {
+    const cfg = this.settings;
+    const set = cfg.raw ? Object.entries(cfg.raw).filter(([k]) => k !== "version").length : 0;
+    this.note("info", "config", `config.json ${cfg.exists ? `read (${set} section(s) set)` : "not created, defaults"}: ${clientConfigPath()}`, {
+      level: cfg.config.logging.level,
+      upload: cfg.config.logging.upload,
+      region: cfg.config.update.region,
+    });
+    for (const p of cfg.problems.filter((x) => x.level === "error")) this.note("warn", "config", `config.json ${p.key || "file"}: ${p.message}`);
+    this.upstream = readUpstreamCache()?.latest;
+    void this.lookUpTools();
     await this.findSources();
     if (!this.sources.includes("hc") && !this.sources.includes("herdr")) {
       this.log("no herdr runtime found: start the herdr app (hc) or `herdr` first. Waiting anyway.");
@@ -339,12 +397,14 @@ export class Host {
     const id = this.deviceId;
     const pids = new Map<string, number | undefined>();
     const hints = new Map<string, string>();
+    const created = new Map<string, number>();
     const live = new Set<number>();
     const agents: Agent[] = [];
     for (const t of this.hc.terminals.values()) {
       const a = HcAdapter.toAgent(t, id, this.names);
       const pid = t.foreground?.pid;
       pids.set(a.key, pid);
+      if (t.created_ms) created.set(a.key, t.created_ms);
       if (pid) live.add(pid);
       const hint = a.isShell ? undefined : this.sessionHints.key(harnessId(a.harness), t.foreground?.argv, pid);
       if (hint) hints.set(a.key, hint);
@@ -352,7 +412,7 @@ export class Host {
     }
     this.sessionHints.prune(live);
     for (const info of this.herdr.agents) agents.push(HerdrAdapter.toAgent(info, id));
-    return this.waits.decorate(this.uniflo.enrich(agents, pids, hints));
+    return this.waits.decorate(this.uniflo.enrich(agents, pids, hints, created));
   }
 
   private publishNow(): void {
@@ -832,6 +892,64 @@ export class Host {
     if (!this.sources.includes("hc")) throw new RpcFailure("unsupported", "这台电脑没有装桌面 herdr");
   }
 
+  /** The file view's own refusals keep their code; anything else is an internal error. */
+  private async files<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      if (e instanceof FilesError) throw new RpcFailure(e.code, e.message);
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") throw new RpcFailure("not_found", "没有这个文件或目录");
+      if (code === "EACCES" || code === "EPERM") throw new RpcFailure("forbidden", "没有权限读它");
+      throw e;
+    }
+  }
+
+  /** herdr's and Uniflo's versions for host.info (hc's comes with its adapter). Missing programs stay out. */
+  private async lookUpTools(): Promise<void> {
+    // By full path, the way the person's terminal finds them: launchd's PATH has no ~/.cargo/bin (uniflo).
+    const bins = await findPrograms(["herdr", "uniflo"]);
+    this.toolBins = { ...(bins.get("herdr") ? { herdr: bins.get("herdr") } : {}), ...(bins.get("uniflo") ? { uniflo: bins.get("uniflo") } : {}) };
+    const version = async (bin: string | undefined) => {
+      if (!bin) return undefined;
+      try {
+        return (await run(bin, ["--version"], { timeoutMs: 5000 })).trim().split(/\s+/).pop() || undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const [herdr, uniflo, app] = await Promise.all([version(this.toolBins.herdr), version(this.toolBins.uniflo), herdrAppVersion()]);
+    this.toolVersions = { ...(herdr ? { herdr } : {}), ...(uniflo ? { uniflo } : {}), ...(app ? { app } : {}) };
+    this.note("info", "hostd", `tools: herdr ${herdr ?? "-"} · hc ${this.hc.version ?? "-"} · uniflo ${uniflo ?? "-"} · Herdr app ${app ?? "-"}`, this.toolVersions);
+  }
+
+  /** host.info `tools`, and the daemon's state for `herdr-pocket status`. */
+  tools(): HostTools {
+    return { ...this.toolVersions, ...(this.hc.version ? { hc: this.hc.version } : {}), ...(this.upstream ? { latest: this.upstream } : {}) };
+  }
+
+  /**
+   * One upstream check (see upstream.ts): the running core's version and generation, the Herdr
+   * app's version, then the release server and Uniflo. Logged as one `update` line; the answers
+   * go to `<state>/upstream.json`. Report only.
+   */
+  async checkUpstream(deps?: UpstreamDeps & { cachePath?: string; appVersion?: () => Promise<string | undefined> }): Promise<void> {
+    const hello = this.hc.version ? await this.hc.hello() : undefined;
+    const app = await (deps?.appVersion ?? herdrAppVersion)();
+    if (app) this.toolVersions.app = app;
+    else delete this.toolVersions.app;
+    const r = await checkUpstream(
+      { hc: this.hc.version, hcGeneration: hello?.generation, app, uniflo: this.toolVersions.uniflo, unifloBin: this.toolBins.uniflo },
+      this.upstream,
+      deps,
+    );
+    if (r.uniflo?.current) this.toolVersions.uniflo = r.uniflo.current;
+    this.upstream = r.latest;
+    const { latest, ...have } = this.tools();
+    writeUpstreamCache({ latest: latest ?? {}, have }, deps?.cachePath);
+    this.note(r.level, "update", r.message, { ...r.latest, ms: r.ms, asked: r.asked, answered: r.answered, ...(r.uniflo?.method ? { unifloMethod: r.uniflo.method } : {}), ...(hello?.generation !== undefined ? { hcGeneration: hello.generation } : {}) });
+  }
+
   private async installed(): Promise<string[]> {
     return (await this.launchers).map((l) => l.id);
   }
@@ -994,7 +1112,23 @@ export class Host {
       sources: this.sources,
       version: HOSTD_VERSION,
       hcVersion: this.hc.version,
+      tools: this.tools(),
+      files: true,
     }),
+    "files.list": async (p) => {
+      const a = this.resolve(p.agent);
+      const t0 = Date.now();
+      const r = await this.files(() => listFiles(a.cwd, p, { privateDirs: this.privateDirs }));
+      this.note("debug", "files", `files.list ${a.localId} "${r.path || "."}" ${r.entries.length}${r.truncated ? "+" : ""} entries ${Date.now() - t0}ms`, { agent: a.key });
+      return r;
+    },
+    "files.read": async (p) => {
+      const a = this.resolve(p.agent);
+      const t0 = Date.now();
+      const r = await this.files(() => readFileSlice(a.cwd, p, { privateDirs: this.privateDirs }));
+      this.note("debug", "files", `files.read ${a.localId} "${r.path}" ${r.bytes}/${r.size} bytes${r.binary ? " binary" : ""} ${Date.now() - t0}ms`, { agent: a.key });
+      return r;
+    },
     "agent.seen": async (p) => {
       this.writable();
       const a = this.resolve(p.agent);

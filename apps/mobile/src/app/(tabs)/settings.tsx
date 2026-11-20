@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AppState, Image, Pressable, ScrollView, View } from "react-native";
-import { ActivityIndicator, Button, Dialog, Portal, ProgressBar, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
@@ -9,6 +9,7 @@ import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
 import { Card, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
 import { Row, RowDivider as Divider, Toggle, type RowIcon as IconName } from "../../components/rows";
 import { ConfigSnackbar } from "../../components/configParts";
+import { PocketDialog, PocketProgress, PocketSpinner } from "../../components/pocket";
 import { Bow, Mascot } from "../../components/Mascot";
 import { useLive, useSettings, type ThemeMode } from "../../lib/store";
 import { signOut } from "../../lib/session";
@@ -216,22 +217,16 @@ export default function SettingsScreen() {
         </View>
       </ScrollView>
 
-      <Portal>
-        <Dialog visible={confirm} onDismiss={() => setConfirm(false)} style={{ borderRadius: radius.xl, backgroundColor: p.surface }}>
-          <Dialog.Title style={{ fontFamily: fonts.cute, color: p.ink }}>要重新配对吗？</Dialog.Title>
-          <Dialog.Content>
-            <Text style={{ color: p.muted, lineHeight: 22 }}>这台手机的授权会作废，并从设备列表里移除。服务器地址会保留，之后扫码或输入一个新的配对码就能连回来。</Text>
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={() => setConfirm(false)} textColor={p.ink}>
-              取消
-            </Button>
-            <Button textColor={p.error} onPress={leave}>
-              重新配对
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
+      <PocketDialog
+        visible={confirm}
+        onDismiss={() => setConfirm(false)}
+        title="要重新配对吗？"
+        body="这台手机的授权会作废，并从设备列表里移除。服务器地址会保留，之后扫码或输入一个新的配对码就能连回来。"
+        actions={[
+          { label: "取消", onPress: () => setConfirm(false), tone: "ghost" },
+          { label: "重新配对", onPress: () => void leave(), tone: "danger" },
+        ]}
+      />
       {/* A save made on a config screen just closed, or another phone's change. */}
       <ConfigSnackbar message={null} onDismiss={() => undefined} />
     </PageBackground>
@@ -437,7 +432,7 @@ function UpdateRow({ demo }: { demo: boolean }) {
   const badge = release && phase === "available" ? "更新" : phase === "ready" ? "安装" : null;
   const right =
     phase === "checking" || phase === "downloading" ? (
-      <ActivityIndicator size={18} />
+      <PocketSpinner size={18} />
     ) : badge ? (
       <View style={{ backgroundColor: p.primary, borderRadius: radius.pill, paddingHorizontal: 12, paddingVertical: 5 }}>
         <Text style={{ color: p.onPrimary, fontFamily: fonts.bodyBold, fontSize: 12.5 }}>{badge}</Text>
@@ -446,7 +441,7 @@ function UpdateRow({ demo }: { demo: boolean }) {
   return (
     <Row icon={release ? "cellphone-arrow-down" : "update"} title={release ? "有新版本" : "检查更新"} sub={sub} right={right} onPress={onPress}>
       {phase === "downloading" ? (
-        <ProgressBar progress={progress} color={p.primary} style={{ height: 6, borderRadius: 3, marginTop: space.sm, backgroundColor: p.surface3 }} />
+        <PocketProgress progress={progress} style={{ marginTop: space.sm }} />
       ) : release?.notes && phase === "available" ? (
         <Text numberOfLines={4} style={{ color: p.faint, fontSize: 12.5, lineHeight: 18, paddingTop: space.xs }}>
           {release.notes}

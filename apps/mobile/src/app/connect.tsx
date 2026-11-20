@@ -1,15 +1,17 @@
 import { useEffect, useState } from "react";
 import { AppState, KeyboardAvoidingView, Platform, Pressable, ScrollView, View } from "react-native";
-import { Button, HelperText, Text, TextInput } from "react-native-paper";
+import { Text } from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 import * as Clipboard from "expo-clipboard";
 import { parsePairInput } from "@herdr-pocket/protocol";
 import { Card, PageBackground, PairSuccess } from "../components/ui";
+import { PocketButton, PocketInput } from "../components/pocket";
 import { Mascot, Sparkle } from "../components/Mascot";
 import { usePalette } from "../theme/theme";
-import { fonts, radius, space } from "../theme/tokens";
+import { fonts, space } from "../theme/tokens";
 import { completePairing, defaultDeviceName, friendlyError } from "../lib/session";
 import { useSettings } from "../lib/store";
 
@@ -75,7 +77,6 @@ export default function ConnectScreen() {
     setInput(text);
   }
 
-  const inputTheme = { roundness: radius.md, colors: { background: p.surface2, outline: p.divider } };
   const line = { flexDirection: "row" as const, alignItems: "center" as const, gap: space.sm, minHeight: 32 };
 
   return (
@@ -107,12 +108,12 @@ export default function ConnectScreen() {
                 {bare(clip.server)} · <Text style={{ fontFamily: fonts.mono, color: p.ink }}>{clip.code}</Text>
               </Text>
               <View style={{ flexDirection: "row", gap: space.sm }}>
-                <Button mode="contained" icon="link-variant" onPress={() => pair(clip.server, clip.code)} loading={busy} disabled={busy} style={{ flex: 1, borderRadius: radius.pill }}>
+                <PocketButton grow icon="link-variant" onPress={() => pair(clip.server, clip.code)} loading={busy} disabled={busy}>
                   用它连接
-                </Button>
-                <Button mode="text" textColor={p.ink} onPress={() => setClipDismissed(clip.code)} disabled={busy}>
+                </PocketButton>
+                <PocketButton variant="ghost" onPress={() => setClipDismissed(clip.code)} disabled={busy}>
                   不用
-                </Button>
+                </PocketButton>
               </View>
             </Card>
           ) : null}
@@ -122,9 +123,9 @@ export default function ConnectScreen() {
             <Text style={{ color: p.muted, fontSize: 13.5, lineHeight: 20 }}>
               扫一下已连上的手机里“设备 → 邀请设备”的二维码，或电脑上 <Text style={{ fontFamily: fonts.mono, color: p.ink, fontSize: 13 }}>herdr-pocket pair</Text> 显示的二维码，一步连上。新服务器就扫它启动时显示的二维码。收到邀请链接的话，直接点开它。
             </Text>
-            <Button mode="contained" icon="qrcode-scan" onPress={() => router.push("/scan")} contentStyle={{ height: 50 }} style={{ borderRadius: radius.pill }} labelStyle={{ fontSize: 16 }}>
+            <PocketButton size="lg" icon="qrcode-scan" onPress={() => router.push("/scan")}>
               扫码配对
-            </Button>
+            </PocketButton>
 
             <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, marginTop: space.xs }}>
               <View style={{ flex: 1, height: 1, backgroundColor: p.divider }} />
@@ -132,20 +133,26 @@ export default function ConnectScreen() {
               <View style={{ flex: 1, height: 1, backgroundColor: p.divider }} />
             </View>
 
-            <TextInput
-              mode="outlined"
-              label="邀请链接或配对码"
-              placeholder="MEOW-4821"
+            <PocketInput
+              icon="key-variant"
+              accessibilityLabel="邀请链接或配对码"
+              placeholder="邀请链接或配对码"
               value={input}
               onChangeText={(t) => {
                 setInput(t);
                 setError(null);
               }}
               autoCapitalize="characters"
-              autoCorrect={false}
-              left={<TextInput.Icon icon="key-variant" />}
-              right={<TextInput.Icon icon="content-paste" accessibilityLabel="从剪贴板粘贴" onPress={paste} />}
-              theme={inputTheme}
+              trailing={
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="从剪贴板粘贴"
+                  onPress={paste}
+                  style={({ pressed }) => ({ width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}
+                >
+                  <MaterialCommunityIcons name="content-paste" size={20} color={p.accentText} />
+                </Pressable>
+              }
             />
 
             {parsed?.server ? (
@@ -157,9 +164,9 @@ export default function ConnectScreen() {
                 <Text style={{ color: p.faint, fontSize: 12 }}>来自链接</Text>
               </View>
             ) : editServer ? (
-              <TextInput
-                mode="outlined"
-                label="服务器地址"
+              <PocketInput
+                icon="server-network"
+                accessibilityLabel="服务器地址"
                 placeholder="https://pocket.example.com"
                 value={server}
                 onChangeText={(t) => {
@@ -167,10 +174,8 @@ export default function ConnectScreen() {
                   setError(null);
                 }}
                 autoCapitalize="none"
-                autoCorrect={false}
                 keyboardType="url"
-                left={<TextInput.Icon icon="server-network" />}
-                theme={inputTheme}
+                mono
               />
             ) : (
               <View style={line}>
@@ -185,7 +190,7 @@ export default function ConnectScreen() {
             )}
 
             {editName ? (
-              <TextInput mode="outlined" label="这台手机的名字" value={name} onChangeText={setName} left={<TextInput.Icon icon="cellphone" />} theme={inputTheme} />
+              <PocketInput icon="cellphone" accessibilityLabel="这台手机的名字" placeholder="这台手机的名字" value={name} onChangeText={setName} />
             ) : (
               <View style={line}>
                 <Text style={{ color: p.faint, fontSize: 13 }}>手机名</Text>
@@ -199,9 +204,10 @@ export default function ConnectScreen() {
             )}
 
             {error ? (
-              <HelperText type="error" visible style={{ paddingHorizontal: 0 }}>
-                {error}
-              </HelperText>
+              <View accessibilityRole="alert" style={{ flexDirection: "row", gap: 6, alignItems: "flex-start" }}>
+                <MaterialCommunityIcons name="alert-circle-outline" size={16} color={p.error} style={{ marginTop: 2 }} />
+                <Text style={{ flex: 1, color: p.error, fontSize: 13, lineHeight: 19 }}>{error}</Text>
+              </View>
             ) : needsServer ? (
               <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 18 }}>
                 只有配对码时还要填服务器地址，也就是电脑登记用的那个地址。扫码或粘贴邀请链接就不用填。
@@ -210,21 +216,14 @@ export default function ConnectScreen() {
               <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 18 }}>配对码长这样：MEOW-4821，10 分钟内有效，只能用一次。</Text>
             ) : null}
 
-            <Button
-              mode="contained-tonal"
-              onPress={() => parsed && pair(useServer, parsed.code)}
-              loading={busy}
-              disabled={busy || !ready}
-              contentStyle={{ height: 48 }}
-              style={{ borderRadius: radius.pill }}
-            >
+            <PocketButton variant="soft" size="lg" onPress={() => parsed && pair(useServer, parsed.code)} loading={busy} disabled={busy || !ready}>
               用配对码连接
-            </Button>
+            </PocketButton>
           </Card>
 
-          <Button mode="text" textColor={p.accentText} onPress={() => pair("mock://demo", "DEMO")} disabled={busy} compact>
+          <PocketButton variant="text" size="sm" onPress={() => pair("mock://demo", "DEMO")} disabled={busy} style={{ alignSelf: "center" }}>
             还没有服务器？先逛逛演示数据
-          </Button>
+          </PocketButton>
         </ScrollView>
       </KeyboardAvoidingView>
       {paired ? <PairSuccess sub="小羊开始帮你盯着啦" /> : null}

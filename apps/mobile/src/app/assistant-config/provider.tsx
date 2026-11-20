@@ -7,7 +7,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { KeyboardAvoidingView, Pressable, ScrollView, View } from "react-native";
-import { ActivityIndicator, Button, Switch, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -24,6 +24,9 @@ import {
 } from "@herdr-pocket/protocol";
 import { Card, EmptyState, PageBackground } from "../../components/ui";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Input, KeyField, LoadState, Pill, SaveBar, useLeaveGuard } from "../../components/configParts";
+import { PocketButton, PocketChip, PocketChips, PocketSpinner } from "../../components/pocket";
+import { Toggle } from "../../components/rows";
+import { modelErrorText } from "../../lib/modelErrors";
 import { changeConfig, flash, listProviderModels, loadConfig, PROTOCOL_LABEL, providerName, speedLine, testDraft, useAssistantConfig, useConfigWatch } from "../../lib/assistantConfig";
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space, statusColors } from "../../theme/tokens";
@@ -78,7 +81,6 @@ function deriveAutoId(presetId: string | null, label: string, baseUrl: string, e
 }
 
 export default function ProviderScreen() {
-  const p = usePalette();
   const params = useLocalSearchParams<{ id?: string }>();
   const editId = typeof params.id === "string" && params.id ? params.id : null;
   useConfigWatch("config");
@@ -99,7 +101,7 @@ export default function ProviderScreen() {
     return (
       <PageBackground>
         {header}
-        <EmptyState title="这个服务商不在了" body="可能刚被另一台手机删掉了。" mood="waiting" action={<Button textColor={p.accentText} onPress={() => router.back()}>回去看看</Button>} />
+        <EmptyState title="这个服务商不在了" body="可能刚被另一台手机删掉了。" mood="waiting" action={<PocketButton variant="soft" icon="arrow-left" onPress={() => router.back()}>回去看看</PocketButton>} />
       </PageBackground>
     );
   }
@@ -306,7 +308,7 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
     setBusy(true);
     try {
       await changeConfig({ providers: [{ id: pid, apiKey: null }] });
-      setToast("已清除手机上设置的密钥");
+      setToast("已清除 App 里设的密钥");
     } catch (e) {
       setToast((e as Error).message);
     } finally {
@@ -360,9 +362,9 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
                 </Text>
               </View>
               {config.edited ? (
-                <Button mode="contained-tonal" compact onPress={() => setAsk("resetProvider")} style={{ alignSelf: "flex-start", borderRadius: radius.pill }}>
+                <PocketButton size="sm" variant="ghost" icon="backup-restore" onPress={() => setAsk("resetProvider")} style={{ alignSelf: "flex-start" }}>
                   恢复此服务商的服务器设置
-                </Button>
+                </PocketButton>
               ) : null}
             </View>
           ) : null}
@@ -460,35 +462,42 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
                 <Text style={{ fontFamily: fonts.bodyBold, color: p.ink, fontSize: 15 }}>3. 选择与扫描模型</Text>
                 <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 18 }}>填好地址和密钥会自动拉取上游模型；点选后保存即可使用</Text>
               </View>
-              <Button mode="contained-tonal" compact disabled={!canScan || scanning} loading={scanning} onPress={() => void scanModels(false)} style={{ borderRadius: radius.pill }}>
+              <PocketButton size="sm" variant="soft" icon="magnify" disabled={!canScan || scanning} loading={scanning} onPress={() => void scanModels(false)}>
                 {scanning ? "扫描中" : "扫描模型"}
-              </Button>
+              </PocketButton>
             </View>
 
             {scanning && !scanned ? (
               <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingVertical: space.xs }}>
-                <ActivityIndicator size={14} />
+                <PocketSpinner size={14} />
                 <Text style={{ color: p.muted, fontSize: 13 }}>正在自动扫描上游可用模型…</Text>
               </View>
             ) : null}
 
-            {scanError ? <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 18 }}>自动扫描未取到列表（{scanError}），可直接手动填模型名。</Text> : null}
+            {scanError ? (
+              <View style={{ gap: 2 }}>
+                <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 18 }}>没扫到模型列表：{modelErrorText(scanError).title}。可以直接在下面手动填模型名。</Text>
+                <Text numberOfLines={2} style={{ color: p.faint, fontSize: 11.5, lineHeight: 16 }}>
+                  {scanError}
+                </Text>
+              </View>
+            ) : null}
 
             {scanned && scanned.length > 0 ? (
               <View style={{ gap: space.sm }}>
                 {scanned.length > 8 ? (
                   <Input value={filterText} onChangeText={setFilterText} placeholder={`搜索模型（共 ${scanned.length} 个）`} autoCapitalize="none" mono accessibilityLabel="搜索扫描到的模型" />
                 ) : null}
-                <Chips>
+                <PocketChips multi>
                   {filteredModels.slice(0, 36).map((m) => (
-                    <Chip key={m} on={selectedModels.includes(m)} onPress={() => toggleModel(m)} label={m} />
+                    <PocketChip key={m} multi mono on={selectedModels.includes(m)} onPress={() => toggleModel(m)} label={m} />
                   ))}
-                </Chips>
+                </PocketChips>
                 {filteredModels.length > 36 ? <Text style={{ color: p.faint, fontSize: 12 }}>仅显示前 36 个，可用上方输入框筛选更多</Text> : null}
               </View>
             ) : null}
 
-            <Field title="手动填写或补充模型名" right={manualModel.trim() ? <Button compact onPress={addManual}>加入</Button> : undefined}>
+            <Field title="手动填写或补充模型名" right={manualModel.trim() ? <PocketButton size="sm" variant="soft" icon="plus" onPress={addManual}>加入</PocketButton> : undefined}>
               <Input
                 value={manualModel}
                 onChangeText={(t) => {
@@ -512,7 +521,7 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
                 </View>
                 <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: space.sm }}>
                   <Text style={{ color: p.ink, fontSize: 13.5, flex: 1 }}>保存后设为主模型（第一位使用）</Text>
-                  <Switch value={makeMain} onValueChange={setMakeMain} />
+                  <Toggle label="保存后设为主模型" value={makeMain} onChange={setMakeMain} />
                 </View>
               </View>
             ) : null}
@@ -522,9 +531,9 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
                 <View style={{ flex: 1 }}>
                   <Input value={testWith} onChangeText={setTestWith} placeholder={chosenModels[0] ?? "比如 mimo-v2.6-flash"} autoCapitalize="none" mono accessibilityLabel="用哪个模型测" />
                 </View>
-                <Button mode="contained-tonal" icon="speedometer" disabled={!canTestNow} loading={test === "running"} onPress={runTest} style={{ borderRadius: radius.pill }}>
+                <PocketButton variant="soft" icon="speedometer" disabled={!canTestNow} loading={test === "running"} onPress={runTest}>
                   测一下
-                </Button>
+                </PocketButton>
               </View>
             </Field>
             {test && test !== "running" ? (
@@ -543,30 +552,37 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
               ) : (
                 <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 4 }}>
                   <MaterialCommunityIcons name="alert-circle-outline" size={16} color={p.error} style={{ marginTop: 2 }} />
-                  <Text style={{ flex: 1, color: p.error, fontSize: 13.5, lineHeight: 20 }}>没通：{test.error ?? "没有回话"}</Text>
+                  <View style={{ flex: 1, gap: 2 }}>
+                    <Text style={{ color: p.error, fontFamily: fonts.bodyBold, fontSize: 13.5, lineHeight: 20 }}>没通：{modelErrorText(test.error).title}</Text>
+                    {modelErrorText(test.error).detail ? (
+                      <Text numberOfLines={3} style={{ color: p.faint, fontSize: 12, lineHeight: 17 }}>
+                        {modelErrorText(test.error).detail}
+                      </Text>
+                    ) : null}
+                  </View>
                 </View>
               )
             ) : null}
           </Card>
 
           {current?.from === "phone" ? (
-            <Button mode="text" icon="trash-can-outline" textColor={p.error} disabled={busy} onPress={() => (users.length === config.models.length && !chosenModels.length ? setToast("小羊的模型都在用它：先在模型页加一个别的模型，再删它") : setAsk("remove"))} style={{ alignSelf: "center" }}>
+            <PocketButton variant="text" danger icon="trash-can-outline" disabled={busy} onPress={() => (users.length === config.models.length && !chosenModels.length ? setToast("小羊的模型都在用它：先在模型页加一个别的模型，再删它") : setAsk("remove"))} style={{ alignSelf: "center" }}>
               删掉这个服务商
-            </Button>
+            </PocketButton>
           ) : null}
           {error ? <Text style={{ color: p.error, lineHeight: 20, textAlign: "center" }}>{error}</Text> : null}
         </ScrollView>
 
         <SaveBar note={chosenModels.length ? `保存服务商并启用 ${chosenModels.length} 个模型` : editId ? "保存后马上生效，所有设备同步" : "填写完成点下方保存即可"}>
-          <Button mode="contained" disabled={!canSave} loading={busy} onPress={save} style={{ flex: 1, borderRadius: radius.pill }} contentStyle={{ height: 50 }} labelStyle={{ fontSize: 16 }}>
+          <PocketButton size="lg" grow disabled={!canSave} loading={busy} onPress={save}>
             {chosenModels.length ? (makeMain ? "保存并设为主模型" : "保存并启用模型") : editId ? "保存" : "添加"}
-          </Button>
+          </PocketButton>
         </SaveBar>
       </KeyboardAvoidingView>
 
       <ConfirmDialog
         visible={ask === "clearKey"}
-        title="清除手机上设置的密钥？"
+        title="清除 App 里设的密钥？"
         body={current?.from === "server" ? "清除后改回用服务器上配的密钥；服务器上没有的话，用它的模型会失败。" : "清除后它就没有密钥了，用它的模型会失败，直到再设一个。"}
         action="清除"
         danger
@@ -576,7 +592,7 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
       <ConfirmDialog
         visible={ask === "resetProvider"}
         title={`恢复「${pid}」的服务器设置？`}
-        body="这会撤销你在手机/控制台对这个服务商的地址和密钥修改，不会影响其他服务商或语音设置。"
+        body="这会撤销在 App 或控制台里对这个服务商的地址和密钥修改，不会影响其他服务商或语音设置。"
         action="恢复"
         onDismiss={() => setAsk(null)}
         onConfirm={resetServerProvider}

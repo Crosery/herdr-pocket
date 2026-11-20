@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ButtonHTMLAttributes,
@@ -15,6 +16,10 @@ import * as Switch from "@radix-ui/react-switch";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import { AlertCircle, Check, CheckCircle2, ChevronDown, PhoneOff, X } from "lucide-react";
 import { XiaoyangOrb, type MascotMood } from "./MascotAndVendor";
+import { createStore } from "../lib/store";
+
+/** How many dialogs are open: native layers drawn over the page (the embedded browser) hide meanwhile. */
+export const overlayStore = createStore<{ open: number }>({ open: 0 });
 
 interface ToastEntry {
   id: number;
@@ -150,6 +155,9 @@ export function PocketBadge({
   );
 }
 
+/** A font size that follows the text-size setting (--ts, set by App). */
+export const fs = (px: number): string => `calc(${px}px * var(--ts, 1))`;
+
 export function PocketInput({
   mono = false,
   className = "",
@@ -260,6 +268,11 @@ export function PocketModal({
   width?: number;
   children: ReactNode;
 }) {
+  useEffect(() => {
+    if (!open) return;
+    overlayStore.set((p) => ({ open: p.open + 1 }));
+    return () => overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
+  }, [open]);
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>

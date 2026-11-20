@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { KeyboardAvoidingView, View } from "react-native";
-import { ActivityIndicator, SegmentedButtons, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { Stack, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useHeaderHeight } from "expo-router/react-navigation";
@@ -10,6 +10,7 @@ import { ChatView } from "../../components/chat";
 import { Composer, InfoView, TerminalView } from "../../components/detail";
 import { Breadcrumb, SubagentList } from "../../components/subagents";
 import { EmptyState, HarnessAvatar, PageBackground, StatusPill } from "../../components/ui";
+import { PocketSegmented, PocketSpinner, type PocketIcon } from "../../components/pocket";
 import { useLive } from "../../lib/store";
 import { call, pingNow } from "../../lib/relay";
 import { Mascot } from "../../components/Mascot";
@@ -17,7 +18,7 @@ import { CuteIcon } from "../../components/icons";
 import { agentTitle, basename, money, relTime } from "../../lib/format";
 import { parseTrail, SUB_STATUS, type Crumb } from "../../lib/subnav";
 import { usePalette } from "../../theme/theme";
-import { agentStatusLabel, fonts, radius, space, statusColors, type Palette } from "../../theme/tokens";
+import { agentStatusLabel, fonts, radius, space, statusColors } from "../../theme/tokens";
 
 type Tab = "chat" | "terminal" | "subs" | "info";
 
@@ -64,7 +65,7 @@ export default function AgentDetail() {
         <Stack.Screen options={{ title: "" }} />
         <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: space.md }}>
           <Mascot mood="hello" size={120} />
-          <ActivityIndicator />
+          <PocketSpinner size={28} />
           <Text style={{ fontFamily: fonts.cute, fontSize: 20, color: p.ink }}>正在启动…</Text>
           <Text style={{ color: p.muted }}>电脑上的新终端打开后就会显示</Text>
         </View>
@@ -102,13 +103,14 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
   }, [agent.key, agent.deviceId, agent.status, agent.turn]);
 
   const meta = [agent.where, money(agent.costUsd)].filter(Boolean).join(" · ");
-  const buttons = [
+  const icons: Partial<Record<Tab, PocketIcon>> = { chat: "chat-processing-outline", terminal: "console", info: "information-outline" };
+  // Four tabs don't fit with icons on a phone; icons only when there are three.
+  const buttons = ([
     { value: "chat", label: "对话" },
     { value: "terminal", label: "终端" },
-    ...(subs > 0 ? [{ value: "subs", label: "子 agent" }] : []),
+    ...(subs > 0 ? [{ value: "subs" as const, label: "子 agent" }] : []),
     { value: "info", label: "信息" },
-  ];
-  const icons: Record<string, string> = { chat: "chat-processing-outline", terminal: "console", info: "information-outline" };
+  ] as { value: Tab; label: string }[]).map((b) => ({ ...b, icon: subs > 0 ? undefined : icons[b.value] }));
 
   return (
     <PageBackground>
@@ -126,14 +128,7 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
             </Text>
             <StatusPill status={agent.status} label={agentStatusLabel(agent)} compact />
           </View>
-          <SegmentedButtons
-            value={tab}
-            onValueChange={(v) => setTab(v as Tab)}
-            density="small"
-            // Four tabs don't fit with icons on a phone; icons only when there are three.
-            buttons={buttons.map((b) => ({ ...b, icon: subs > 0 ? undefined : icons[b.value], ...segmentLook(p, tab === b.value), labelStyle: { fontFamily: fonts.bodyBold, fontSize: subs > 0 ? 13 : 13.5 } }))}
-            style={{ backgroundColor: p.dark ? p.surface2 : "#FBE7EF", borderRadius: radius.pill }}
-          />
+          <PocketSegmented value={tab} onChange={setTab} segments={buttons} compact={subs > 0} />
         </View>
         <View style={{ flex: 1 }}>
           {tab === "chat" ? <ChatView agent={agent} active bottomInset={0} childCount={subs} /> : null}
@@ -195,15 +190,13 @@ function SubDetail({ agent, sub, trail }: { agent: Agent; sub: string; trail: Cr
           ) : null}
         </View>
         {kids > 0 ? (
-          <SegmentedButtons
+          <PocketSegmented
             value={tab}
-            onValueChange={(v) => setTab(v as "chat" | "subs")}
-            density="small"
-            buttons={[
-              { value: "chat", label: "对话", icon: "chat-processing-outline", ...segmentLook(p, tab === "chat"), labelStyle: { fontFamily: fonts.bodyBold } },
-              { value: "subs", label: `子 agent ${kids}`, icon: "source-branch", ...segmentLook(p, tab === "subs"), labelStyle: { fontFamily: fonts.bodyBold } },
+            onChange={setTab}
+            segments={[
+              { value: "chat", label: "对话", icon: "chat-processing-outline" },
+              { value: "subs", label: `子 agent ${kids}`, icon: "source-branch" },
             ]}
-            style={{ backgroundColor: p.dark ? p.surface2 : "#FBE7EF", borderRadius: radius.pill }}
           />
         ) : null}
       </View>
@@ -218,11 +211,4 @@ function SubDetail({ agent, sub, trail }: { agent: Agent; sub: string; trail: Cr
   );
 }
 
-/** The open tab is a white pill with pink text on a blush track; the rest stay quiet. */
-function segmentLook(p: Palette, on: boolean) {
-  return {
-    checkedColor: p.accentText,
-    uncheckedColor: p.ink,
-    style: { backgroundColor: on ? p.surface : "transparent", borderColor: p.dark ? p.surface3 : "#F6DDE8" },
-  };
-}
+

@@ -1,15 +1,16 @@
 /** Deep link target: herdrpocket://join?server=...&id=... — another device asks this phone to let it in. */
 import { useEffect, useState } from "react";
 import { View } from "react-native";
-import { ActivityIndicator, Button, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { router, useLocalSearchParams } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import type { Device, JoinRequest } from "@herdr-pocket/protocol";
 import { Card, PageBackground } from "../components/ui";
+import { PocketButton, PocketSpinner } from "../components/pocket";
 import { Mascot } from "../components/Mascot";
 import { usePalette } from "../theme/theme";
-import { fonts, radius, space } from "../theme/tokens";
+import { fonts, space } from "../theme/tokens";
 import { answerJoinRequest, getJoinRequest, normalizeServer } from "../lib/relay";
 import { loadToken } from "../lib/auth";
 import { isMockServer } from "../lib/mock";
@@ -83,9 +84,9 @@ export default function JoinScreen() {
           <Mascot mood="waiting" size={104} />
           <Text style={{ fontFamily: fonts.cute, fontSize: 22, color: p.ink, textAlign: "center" }}>{problem.title}</Text>
           <Text style={{ color: p.muted, textAlign: "center", lineHeight: 21 }}>{problem.body}</Text>
-          <Button mode="contained" onPress={problem.action?.go ?? done} style={{ borderRadius: radius.pill, marginTop: space.sm }}>
+          <PocketButton onPress={problem.action?.go ?? done} style={{ marginTop: space.sm }}>
             {problem.action?.label ?? "返回"}
-          </Button>
+          </PocketButton>
         </View>
       </PageBackground>
     );
@@ -100,9 +101,9 @@ export default function JoinScreen() {
           <Text style={{ color: p.muted, textAlign: "center", lineHeight: 21 }}>
             {joined.kind === "host" ? "它上线后，上面的 agent 会出现在列表里。" : "那台设备已经可以看到你的 agent 了。"}
           </Text>
-          <Button mode="contained" onPress={done} contentStyle={{ height: 48 }} style={{ borderRadius: radius.pill, marginTop: space.md, alignSelf: "stretch" }}>
+          <PocketButton size="lg" block onPress={done} style={{ marginTop: space.md }}>
             完成
-          </Button>
+          </PocketButton>
         </View>
       </PageBackground>
     );
@@ -112,7 +113,7 @@ export default function JoinScreen() {
     return (
       <PageBackground>
         <View style={center}>
-          <ActivityIndicator />
+          <PocketSpinner size={28} />
           <Text style={{ color: p.faint }}>正在读取加入请求…</Text>
         </View>
       </PageBackground>
@@ -144,12 +145,12 @@ export default function JoinScreen() {
         </Text>
         {error ? <Text style={{ color: p.error, textAlign: "center" }}>{error}</Text> : null}
         <View style={{ gap: space.sm }}>
-          <Button mode="contained" loading={busy === "allow"} disabled={!!busy} onPress={() => answer(true)} contentStyle={{ height: 52 }} style={{ borderRadius: radius.pill }} labelStyle={{ fontSize: 16 }}>
+          <PocketButton size="lg" loading={busy === "allow"} disabled={!!busy} onPress={() => answer(true)}>
             允许加入
-          </Button>
-          <Button mode="text" textColor={p.ink} loading={busy === "deny"} disabled={!!busy} onPress={() => answer(false)}>
+          </PocketButton>
+          <PocketButton variant="ghost" loading={busy === "deny"} disabled={!!busy} onPress={() => answer(false)}>
             拒绝
-          </Button>
+          </PocketButton>
         </View>
       </View>
     </PageBackground>

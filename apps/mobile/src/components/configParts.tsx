@@ -5,7 +5,7 @@
  */
 import { useCallback, useState, type ReactNode } from "react";
 import { Pressable, TextInput, View, type TextInputProps } from "react-native";
-import { ActivityIndicator, Button, Dialog, Portal, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { useIsFocused, usePreventRemove } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -13,6 +13,7 @@ import type { KeyView } from "@herdr-pocket/protocol";
 import { flash, keyLine, useAssistantConfig } from "../lib/assistantConfig";
 import { Mascot } from "./Mascot";
 import { PocketToast } from "./ui";
+import { PocketButton, PocketChip, PocketChips, PocketDialog, PocketSpinner } from "./pocket";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space, statusColors } from "../theme/tokens";
 
@@ -68,42 +69,11 @@ export function Input({ mono, style, onFocus, onBlur, ...rest }: TextInputProps 
 
 /** A pill to pick one of a few choices. */
 export function Chip({ on, label, onPress, icon, a11y, disabled }: { on: boolean; label: string; onPress: () => void; icon?: ReactNode; a11y?: string; disabled?: boolean }) {
-  const p = usePalette();
-  return (
-    <Pressable
-      accessibilityRole="radio"
-      accessibilityState={{ checked: on, disabled }}
-      accessibilityLabel={a11y ?? label}
-      disabled={disabled}
-      onPress={onPress}
-      style={({ pressed }) => ({
-        flexDirection: "row",
-        alignItems: "center",
-        gap: 6,
-        minHeight: 40,
-        paddingLeft: icon ? 10 : 14,
-        paddingRight: 14,
-        borderRadius: radius.pill,
-        borderWidth: 1,
-        borderColor: on ? p.accentText : p.divider,
-        backgroundColor: on ? p.accentContainer : pressed ? p.surface3 : p.surface,
-        opacity: disabled ? 0.5 : 1,
-      })}
-    >
-      {icon}
-      <Text numberOfLines={1} style={{ maxWidth: 220, color: p.ink, fontFamily: on ? fonts.bodyBold : fonts.bodySemi, fontSize: 13.5 }}>
-        {label}
-      </Text>
-    </Pressable>
-  );
+  return <PocketChip on={on} label={label} onPress={onPress} lead={icon} a11y={a11y} disabled={disabled} />;
 }
 
 export function Chips({ children }: { children: ReactNode }) {
-  return (
-    <View accessibilityRole="radiogroup" style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
-      {children}
-    </View>
-  );
+  return <PocketChips>{children}</PocketChips>;
 }
 
 export type PillTone = "primary" | "soft" | "lavender" | "plain" | "good";
@@ -194,7 +164,7 @@ export function KeyField({
       <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 18 }}>{hint}</Text>
       {current?.from === "phone" && onClearPhoneKey ? (
         <Pressable accessibilityRole="button" onPress={onClearPhoneKey} disabled={busy} hitSlop={8} style={{ alignSelf: "flex-start", minHeight: 36, justifyContent: "center", opacity: busy ? 0.5 : 1 }}>
-          <Text style={{ color: p.error, fontFamily: fonts.bodySemi, fontSize: 13.5 }}>清除手机上设置的密钥</Text>
+          <Text style={{ color: p.error, fontFamily: fonts.bodySemi, fontSize: 13.5 }}>清除 App 里设的密钥</Text>
         </Pressable>
       ) : null}
     </Field>
@@ -233,24 +203,17 @@ export function ConfirmDialog({
   onDismiss: () => void;
   cancel?: string;
 }) {
-  const p = usePalette();
   return (
-    <Portal>
-      <Dialog visible={visible} onDismiss={onDismiss} style={{ borderRadius: radius.xl, backgroundColor: p.surface }}>
-        <Dialog.Title style={{ fontFamily: fonts.cute, color: p.ink }}>{title}</Dialog.Title>
-        <Dialog.Content>
-          <Text style={{ color: p.muted, lineHeight: 22 }}>{body}</Text>
-        </Dialog.Content>
-        <Dialog.Actions>
-          <Button onPress={onDismiss} textColor={p.ink}>
-            {cancel}
-          </Button>
-          <Button textColor={danger ? p.error : p.accentText} onPress={onConfirm}>
-            {action}
-          </Button>
-        </Dialog.Actions>
-      </Dialog>
-    </Portal>
+    <PocketDialog
+      visible={visible}
+      onDismiss={onDismiss}
+      title={title}
+      body={body}
+      actions={[
+        { label: cancel, onPress: onDismiss, tone: "ghost" },
+        { label: action, onPress: onConfirm, tone: danger ? "danger" : "primary" },
+      ]}
+    />
   );
 }
 
@@ -279,14 +242,14 @@ export function ConfigSnackbar({ message, onDismiss, action, bottom = 0 }: { mes
 /** Loading, or why it could not load with a way to try again. */
 export function LoadState({ error, onRetry }: { error: string | null; onRetry: () => void }) {
   const p = usePalette();
-  if (!error) return <ActivityIndicator style={{ marginVertical: 120 }} />;
+  if (!error) return <PocketSpinner size={32} style={{ marginVertical: 120 }} />;
   return (
     <View style={{ alignItems: "center", gap: space.md, paddingVertical: space.xxxl, paddingHorizontal: space.xl }}>
       <Mascot mood="waiting" size={96} />
       <Text style={{ color: p.error, textAlign: "center", lineHeight: 21 }}>{error}</Text>
-      <Button textColor={p.accentText} onPress={onRetry}>
+      <PocketButton variant="soft" icon="refresh" onPress={onRetry}>
         再试一次
-      </Button>
+      </PocketButton>
     </View>
   );
 }

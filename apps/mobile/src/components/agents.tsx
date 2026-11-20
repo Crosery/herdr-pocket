@@ -58,6 +58,10 @@ type AgentRowProps = {
   deviceName?: string;
   /** Changes once a minute, so the "N 分钟前" line stays current while the agent itself does not change. */
   minute?: number;
+  /** The row sits under its space's header: the title goes without the "space ·" prefix. */
+  plainTitle?: boolean;
+  /** Long press: quick actions. Pass a stable function (the row does not re-render for it). */
+  onLongPress?: (a: Agent) => void;
 };
 
 /**
@@ -65,7 +69,7 @@ type AgentRowProps = {
  * something it shows changed (all Agent fields are plain values), or when the minute ticks.
  */
 function sameRow(a: AgentRowProps, b: AgentRowProps): boolean {
-  if (a.offline !== b.offline || a.deviceName !== b.deviceName || a.minute !== b.minute) return false;
+  if (a.offline !== b.offline || a.deviceName !== b.deviceName || a.minute !== b.minute || a.plainTitle !== b.plainTitle || a.onLongPress !== b.onLongPress) return false;
   if (a.agent === b.agent) return true;
   const x = a.agent as unknown as Record<string, unknown>;
   const y = b.agent as unknown as Record<string, unknown>;
@@ -73,17 +77,19 @@ function sameRow(a: AgentRowProps, b: AgentRowProps): boolean {
   return keys.length === Object.keys(y).length && keys.every((k) => x[k] === y[k]);
 }
 
-export const AgentRow = memo(function AgentRow({ agent, offline, deviceName }: AgentRowProps) {
+export const AgentRow = memo(function AgentRow({ agent, offline, deviceName, plainTitle, onLongPress }: AgentRowProps) {
   const p = usePalette();
   const sub = [harnessLook(agent.harness, agent.isShell).label, deviceName, agent.turn ? `第 ${agent.turn} 轮` : null]
     .filter(Boolean)
     .join(" · ");
   const needsYou = agent.status === "blocked" && !offline;
   const c = statusColors("blocked", p.dark);
+  const title = plainTitle ? agentTitle(agent) : spacedTitle(agent);
   return (
     <Card
       onPress={() => openAgent(agent.key)}
-      accessibilityLabel={`${spacedTitle(agent)}，${agent.harness}${offline ? "，电脑离线" : ""}`}
+      onLongPress={onLongPress ? () => onLongPress(agent) : undefined}
+      accessibilityLabel={`${title}，${harnessLook(agent.harness, agent.isShell).label}，${offline ? "电脑离线" : agentStatusLabel(agent)}${onLongPress ? "，长按有更多操作" : ""}`}
       style={{
         flexDirection: "row",
         alignItems: "center",
@@ -99,7 +105,7 @@ export const AgentRow = memo(function AgentRow({ agent, offline, deviceName }: A
       <HarnessAvatar harness={agent.harness} isShell={agent.isShell} dim={offline} size={48} />
       <View style={{ flex: 1, gap: 3 }}>
         <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 16, color: offline ? p.muted : p.ink }}>
-          {spacedTitle(agent)}
+          {title}
         </Text>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
           <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 13, color: offline ? p.faint : p.muted }}>

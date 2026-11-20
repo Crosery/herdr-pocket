@@ -94,6 +94,48 @@ export class HcAdapter extends EventEmitter {
     }
   }
 
+  /**
+   * The running core's own `hello` (version, protocol generation) over a connection of its own:
+   * the subscribed one answers nothing else. Refreshes `version` (after an `hc update`).
+   * Undefined when the core does not answer within `timeoutMs`.
+   */
+  hello(timeoutMs = 4000): Promise<{ version?: string; generation?: number } | undefined> {
+    return new Promise((resolve) => {
+      let child: ChildProcess;
+      try {
+        child = spawn(this.hcBin, ["connect"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+      } catch {
+        return resolve(undefined);
+      }
+      const done = (r: { version?: string; generation?: number } | undefined) => {
+        clearTimeout(timer);
+        child.kill();
+        resolve(r);
+      };
+      const timer = setTimeout(() => done(undefined), timeoutMs);
+      child.on("error", () => done(undefined));
+      child.on("exit", () => done(undefined));
+      child.stdin!.on("error", () => {});
+      child.stdout!.on(
+        "data",
+        lineSplitter((line) => {
+          let msg: any;
+          try {
+            msg = JSON.parse(line);
+          } catch {
+            return;
+          }
+          if (msg?.id !== 0) return;
+          const r = msg.result ?? {};
+          const version = typeof r.version === "string" ? r.version : undefined;
+          if (version) this.version = version;
+          done({ version, generation: typeof r.generation === "number" ? r.generation : undefined });
+        }),
+      );
+      child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "hello", params: {} })}\n`);
+    });
+  }
+
   start(): void {
     this.stopped = false;
     this.connect();

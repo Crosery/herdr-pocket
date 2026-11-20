@@ -1,0 +1,514 @@
+/* Settings as a modal frame over the window, after Herdr's (docs/design/desktop-v2.md, "设置").
+   Every rule is scoped to the frame so the narrow layout's settings page keeps its own look.
+   Sizes follow Herdr's settings frame: nav items 7/10 px, rows 12 px with a divider, body
+   padding 22/28 px, 12-13.5 px text. */
+
+.sf-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  background: rgba(24, 18, 32, 0.14);
+}
+
+[data-theme="dark"] .sf-backdrop {
+  background: rgba(0, 0, 0, 0.32);
+}
+
+.settings-frame {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 160;
+  width: clamp(640px, 56vw, 960px);
+  /* 66vh as in Herdr; never shorter than the section list (560) unless the window is. */
+  height: clamp(min(560px, calc(100vh - 48px)), 66vh, 760px);
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  display: flex;
+  overflow: hidden;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-lg);
+  font-size: calc(13.5px * var(--ts, 1));
+  line-height: 1.5;
+  outline: none;
+}
+
+.settings-frame[data-state="open"] {
+  animation: sf-in 0.12s var(--ease-out);
+}
+
+@keyframes sf-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-frame[data-state="open"] {
+    animation: none;
+  }
+}
+
+/* Section list -------------------------------------------------------------- */
+
+.settings-frame .sf-nav {
+  flex: 0 0 175px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  border-right: 1px solid var(--divider);
+}
+
+.settings-frame .sf-title {
+  margin: 0;
+  padding: 6px 10px 12px;
+  font-size: calc(16px * var(--ts, 1));
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.settings-frame .sf-nav-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-frame .sf-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: calc(13.5px * var(--ts, 1));
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.settings-frame .sf-nav-item svg {
+  flex-shrink: 0;
+  color: var(--faint);
+}
+
+.settings-frame .sf-nav-item:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+.settings-frame .sf-nav-item.active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.settings-frame .sf-nav-item.active svg {
+  color: var(--accent-text);
+}
+
+.settings-frame .sf-nav-item:focus-visible,
+.settings-frame .sf-outline-btn:focus-visible,
+.settings-frame .sf-close:focus-visible,
+.settings-frame .sf-icon-btn:focus-visible,
+.settings-frame .sf-stepper button:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-focus);
+}
+
+.settings-frame .sf-nav-sep {
+  flex-shrink: 0;
+  height: 1px;
+  margin: 6px 10px;
+  background: var(--divider);
+}
+
+.settings-frame .sf-update-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--primary);
+  flex-shrink: 0;
+}
+
+.settings-frame .sf-outline-btn {
+  flex-shrink: 0;
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--divider);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: calc(13px * var(--ts, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.settings-frame .sf-outline-btn:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.settings-frame .sf-outline-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Page ------------------------------------------------------------------------ */
+
+.settings-frame .sf-main {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+.settings-frame .sf-body {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  outline: none;
+}
+
+.settings-frame .sf-page {
+  padding: 22px 28px 28px;
+  container: sfpage / inline-size;
+}
+
+.settings-frame .sf-close {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  /* Solid, so rows scrolling under it stay readable instead of mixing with the ×. */
+  background: var(--surface);
+  color: var(--faint);
+  cursor: pointer;
+  z-index: 1;
+}
+
+.settings-frame .sf-close:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+.settings-frame .pane {
+  max-width: none;
+  margin: 0;
+}
+
+/* PaneTitle: the section list already says where you are; only the lead line shows. */
+.settings-frame .pane-head {
+  padding: 0 36px 2px 0;
+  font-size: calc(12.5px * var(--ts, 1));
+  line-height: 18px;
+}
+
+.settings-frame .pane-head h2 {
+  display: none;
+}
+
+.settings-frame .pane-head:not(:has(.faint)) {
+  display: none;
+}
+
+.settings-frame .set-heading {
+  padding: 24px 36px 8px 0;
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--faint);
+}
+
+.settings-frame .pane > .set-heading:first-child {
+  padding-top: 6px;
+}
+
+.settings-frame .pane-head + .set-heading {
+  padding-top: 16px;
+}
+
+.settings-frame .set-row {
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--divider);
+}
+
+.settings-frame .set-title {
+  font-size: calc(14px * var(--ts, 1));
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.settings-frame .set-about {
+  margin-top: 3px;
+  font-size: calc(12.5px * var(--ts, 1));
+  line-height: 18px;
+}
+
+/* Controls in Herdr's density, our colours. */
+.settings-frame .pk-btn {
+  border-radius: 8px;
+  font-weight: 600;
+}
+
+.settings-frame .pk-btn.sm {
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 7px;
+}
+
+.settings-frame .pk-btn.primary {
+  box-shadow: none;
+}
+
+.settings-frame .segmented {
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.settings-frame .segmented button {
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: calc(13px * var(--ts, 1));
+}
+
+.settings-frame .segmented button.active {
+  background: var(--surface);
+  color: var(--accent-text);
+  box-shadow: 0 0 0 1px var(--divider);
+}
+
+.settings-frame .segmented.wrap-ok {
+  border-radius: 10px;
+}
+
+.settings-frame .pk-switch {
+  width: 36px;
+  height: 20px;
+  padding: 2px;
+}
+
+.settings-frame .pk-switch-thumb {
+  width: 14px;
+  height: 14px;
+}
+
+.settings-frame .pk-switch[data-state="checked"] .pk-switch-thumb {
+  transform: translateX(16px);
+}
+
+.settings-frame .pk-select-trigger {
+  height: 30px;
+  min-width: 132px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: calc(13px * var(--ts, 1));
+}
+
+.settings-frame .pk-input,
+.settings-frame .pk-textarea {
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: calc(13.5px * var(--ts, 1));
+}
+
+/* Pieces of the frame's own panes. */
+.settings-frame .sf-stepper {
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid var(--divider);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.settings-frame .sf-stepper button {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: calc(15px * var(--ts, 1));
+  line-height: 1;
+  cursor: pointer;
+}
+
+.settings-frame .sf-stepper button:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+.settings-frame .sf-stepper button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.settings-frame .sf-stepper output {
+  width: 54px;
+  text-align: center;
+  font-size: calc(13px * var(--ts, 1));
+  font-weight: 600;
+}
+
+.settings-frame .sf-combo {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-frame .sf-keys {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.settings-frame .sf-kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid var(--divider);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: calc(12px * var(--ts, 1));
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.settings-frame .sf-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--faint);
+}
+
+.settings-frame .sf-dot.on {
+  background: var(--mint-text);
+}
+
+.settings-frame .sf-dot.busy {
+  background: var(--lav);
+}
+
+.settings-frame .sf-dot.off {
+  background: var(--blush-text);
+}
+
+.settings-frame .sf-icon-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--divider);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.settings-frame .sf-icon-btn:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+.settings-frame .sf-icon-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.settings-frame .sf-device {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.settings-frame .sf-device svg {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.settings-frame .sf-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 0 2px;
+}
+
+.settings-frame .sf-note {
+  padding: 10px 0;
+  font-size: calc(12.5px * var(--ts, 1));
+}
+
+.settings-frame .sf-block {
+  padding: 12px 0 4px;
+}
+
+.settings-frame .sf-block-lead {
+  padding-bottom: 8px;
+  font-size: calc(12.5px * var(--ts, 1));
+}
+
+/* A narrow page (the frame at its 640 px minimum): controls drop under their text.
+   A wider page keeps them on the right even where the window-width rule in app.css wraps. */
+@container sfpage (max-width: 420px) {
+  .settings-frame .set-row:has(.segmented),
+  .settings-frame .set-row:has(.sf-combo) {
+    flex-wrap: wrap;
+  }
+  .settings-frame .set-row:has(.segmented) .set-text,
+  .settings-frame .set-row:has(.sf-combo) .set-text {
+    flex-basis: 100%;
+  }
+  .settings-frame .set-row:has(.segmented) .set-control,
+  .settings-frame .set-row:has(.sf-combo) .set-control {
+    max-width: none;
+  }
+}
+
+@container sfpage (min-width: 420.02px) {
+  .settings-frame .set-row:has(.segmented:not(.wrap-ok)) {
+    flex-wrap: nowrap;
+  }
+  .settings-frame .set-row:has(.segmented:not(.wrap-ok)) .set-text {
+    flex-basis: auto;
+  }
+  .settings-frame .set-row:has(.segmented:not(.wrap-ok)) .set-control {
+    max-width: 60%;
+  }
+}

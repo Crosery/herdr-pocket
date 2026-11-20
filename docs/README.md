@@ -10,6 +10,7 @@
 - [Relay configuration](config.md) — text-model providers and fallback, voice providers, the optional config file.
 - [Design canvas](design/canvas.html) — interaction rationale and Android screen reference.
 - [Brand assets](brand/) — logo, adaptive icon, mascot, and stickers.
+- [Harness stickers](brand/harness-stickers.md) — the agent avatar set: source folder, every copy, the three mapping files, and how to add a harness.
 - [Screenshots](screenshots/) — demo-mode screens used by the README and the site (no real data).
 
 ## Contract ownership

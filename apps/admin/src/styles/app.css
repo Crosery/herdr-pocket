@@ -863,10 +863,11 @@ svg {
 }
 
 /* ---------------- Mascot & Vendor ---------------- */
+/* Mascot Orb: a soft halo and disc with the mascot inside. The image is
+   absolutely positioned so its percentage size resolves against the orb box;
+   as a grid item it followed the sticker's own aspect ratio and spilled out. */
 .xiaoyang-orb {
   position: relative;
-  display: grid;
-  place-items: center;
   flex-shrink: 0;
   cursor: pointer;
   user-select: none;
@@ -891,14 +892,26 @@ svg {
   background: linear-gradient(145deg, var(--accent-soft), var(--lav-soft));
 }
 
+/* Full-body transparent stickers stay whole inside the disc. 62% keeps every
+   frame of every sticker mood inside the ring's border at the top of the float,
+   for orbs from 48px up (checked against the mascot art). */
 .xiaoyang-orb img {
-  position: relative;
-  z-index: 1;
-  width: 78%;
-  height: 78%;
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 62%;
+  height: 62%;
+  object-fit: contain;
+  animation: mascotFloat 3.4s ease-in-out infinite;
+}
+
+/* Square portrait art is cropped to the disc, inside its 2px border. */
+.xiaoyang-orb.portrait img {
+  width: calc(80% - 4px);
+  height: calc(80% - 4px);
   border-radius: 50%;
   object-fit: cover;
-  animation: mascotFloat 3.4s ease-in-out infinite;
+  animation: none;
 }
 
 .vendor-avatar {

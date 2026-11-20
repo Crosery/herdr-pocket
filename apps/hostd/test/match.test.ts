@@ -242,3 +242,30 @@ test("herdr commands: only listed commands and arguments pass, programs by launc
   assert.deepEqual(parseDo('note\n{"ok":true}'), { ok: true });
   assert.throws(() => parseDo('{"error":"no space \\"x\\""}'), /no space/);
 });
+
+test("a new terminal is not given its folder's earlier conversation", () => {
+  const now = Date.now();
+  const hour = 3600_000;
+  const omp = HcAdapter.toAgent({ address: "t7", cwd: "/p/app", created_ms: now - 5_000, foreground: { argv: ["omp"], pid: 501 } }, "d");
+  const created = new Map([[omp.key, now - 5_000]]);
+  const pids = new Map([[omp.key, 501]]);
+  const u = new UnifloAdapter("http://127.0.0.1:9");
+  const old = { key: "omp:old", harness: "omp", cwd: "/p/app", title: "Earlier work", started_at: now - 30 * hour, updated_at: now - hour, status: "idle" } as UnifloSession;
+  u.sessions = [old];
+  // Before: the only session in the folder was taken for the new agent.
+  assert.equal(u.enrich([omp], pids)[0]!.sessionKey, "omp:old");
+  // Now: it predates the terminal, so the agent waits for its own session.
+  assert.equal(u.enrich([omp], pids, new Map(), created)[0]!.sessionKey, undefined);
+  // Its own session appears: that one, even with the old one still listed.
+  u.sessions = [old, { key: "omp:new", harness: "omp", cwd: "/p/app", started_at: now - 2_000, updated_at: now, status: "work" } as UnifloSession];
+  assert.equal(u.enrich([omp], pids, new Map(), created)[0]!.sessionKey, "omp:new");
+  // A program that continued the older session writes to it after the terminal opened: still found.
+  u.sessions = [{ ...old, updated_at: now - 1_000 }];
+  assert.equal(u.enrich([omp], pids, new Map(), created)[0]!.sessionKey, "omp:old");
+  // Same rule for the title guess.
+  const two = [omp, HcAdapter.toAgent({ address: "t8", cwd: "/p/app", title: "Other thing", foreground: { argv: ["omp"], pid: 502 } }, "d")];
+  const titled = HcAdapter.toAgent({ address: "t7", cwd: "/p/app", title: "Earlier work", created_ms: now - 5_000, foreground: { argv: ["omp"], pid: 501 } }, "d");
+  u.sessions = [old];
+  assert.equal(u.enrich([titled, two[1]!], pids, new Map(), created)[0]!.sessionKey, undefined);
+  assert.equal(u.enrich([titled, two[1]!], pids)[0]!.sessionKey, "omp:old");
+});

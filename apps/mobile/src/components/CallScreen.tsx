@@ -3,7 +3,7 @@
  * three buttons; plus the small bar that stands in for it while the person looks
  * at the chat during a call.
  */
-import { useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
 import { ActivityIndicator, BackHandler, Pressable, ScrollView, useWindowDimensions, View } from "react-native";
 import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -92,11 +92,9 @@ export function CallScreen({ name, onMinimize }: { name: string; onMinimize: () 
   const phase = usePhase();
   const muted = useVoice((s) => s.muted);
   const task = useVoice((s) => s.task);
-  const lines = useVoice((s) => s.lines);
   const clock = useCallClock();
   const notice = useCallNotice();
   const [captions, setCaptions] = useState(true);
-  const scroller = useRef<ComponentRef<typeof ScrollView>>(null);
 
   // Back leaves the call running and goes to the chat, like the button does.
   useEffect(() => {
@@ -137,26 +135,7 @@ export function CallScreen({ name, onMinimize }: { name: string; onMinimize: () 
       </Animated.View>
 
       <View style={{ flex: 1, paddingTop: space.md }}>
-        {captions ? (
-          lines.length ? (
-            <ScrollView
-              ref={scroller}
-              onContentSizeChange={() => scroller.current?.scrollToEnd({ animated: true })}
-              contentContainerStyle={{ paddingHorizontal: space.lg, paddingVertical: space.xs, gap: space.sm }}
-              showsVerticalScrollIndicator={false}
-            >
-              {lines.map((l, i) => (
-                <Caption key={l.id} line={l} recent={i >= lines.length - 2} />
-              ))}
-            </ScrollView>
-          ) : (
-            <View style={{ flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: space.xxl }}>
-              <Text style={{ color: p.muted, textAlign: "center", lineHeight: 22 }}>
-                {phase === "connecting" ? "接通后直接说话就行。" : "直接说话就行，比如“谁在等我”“帮我看看哪个跑完了”。"}
-              </Text>
-            </View>
-          )
-        ) : null}
+        {captions ? <CallCaptions connecting={phase === "connecting"} /> : null}
       </View>
 
       <View style={{ minHeight: 44, alignItems: "center", justifyContent: "center", paddingHorizontal: space.lg, paddingBottom: space.sm, gap: space.sm }}>
@@ -184,11 +163,50 @@ export function CallScreen({ name, onMinimize }: { name: string; onMinimize: () 
   );
 }
 
-function Caption({ line, recent }: { line: CallLine; recent: boolean }) {
+/**
+ * What is being said. Its own component: a caption grows several times a second
+ * while the voice speaks, and only this list needs to follow it, not the orb.
+ */
+function CallCaptions({ connecting }: { connecting: boolean }) {
+  const p = usePalette();
+  const lines = useVoice((s) => s.lines);
+  const scroller = useRef<ComponentRef<typeof ScrollView>>(null);
+  const shown = useRef(0);
+  if (!lines.length) {
+    return (
+      <View style={{ flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: space.xxl }}>
+        <Text style={{ color: p.muted, textAlign: "center", lineHeight: 22 }}>
+          {connecting ? "接通后直接说话就行。" : "直接说话就行，比如“谁在等我”“帮我看看哪个跑完了”。"}
+        </Text>
+      </View>
+    );
+  }
+  return (
+    <ScrollView
+      ref={scroller}
+      onContentSizeChange={() => {
+        // Glide to a new line; a line that only grew stays pinned to the bottom without
+        // starting another scroll animation over the one still running.
+        const added = lines.length !== shown.current;
+        shown.current = lines.length;
+        scroller.current?.scrollToEnd({ animated: added });
+      }}
+      contentContainerStyle={{ paddingHorizontal: space.lg, paddingVertical: space.xs, gap: space.sm }}
+      showsVerticalScrollIndicator={false}
+    >
+      {lines.map((l, i) => (
+        <Caption key={l.id} line={l} recent={i >= lines.length - 2} />
+      ))}
+    </ScrollView>
+  );
+}
+
+/** No layout animation: a growing caption would animate its box behind its own text on every update. */
+const Caption = memo(function Caption({ line, recent }: { line: CallLine; recent: boolean }) {
   const p = usePalette();
   if (line.role === "user") {
     return (
-      <Animated.View entering={FadeIn.duration(180)} layout={LinearTransition.duration(180)} style={{ alignSelf: "flex-end", maxWidth: "82%", opacity: recent ? 1 : 0.5, backgroundColor: p.surface3, borderRadius: radius.card, borderBottomRightRadius: 6, paddingHorizontal: space.md, paddingVertical: 8, borderWidth: 1, borderColor: p.divider }}>
+      <Animated.View entering={FadeIn.duration(180)} style={{ alignSelf: "flex-end", maxWidth: "82%", opacity: recent ? 1 : 0.5, backgroundColor: p.surface3, borderRadius: radius.card, borderBottomRightRadius: 6, paddingHorizontal: space.md, paddingVertical: 8, borderWidth: 1, borderColor: p.divider }}>
         <Text style={{ color: p.muted, fontSize: 14.5, lineHeight: 21 }}>{line.text}</Text>
       </Animated.View>
     );
@@ -196,13 +214,12 @@ function Caption({ line, recent }: { line: CallLine; recent: boolean }) {
   return (
     <Animated.View
       entering={FadeIn.duration(180)}
-      layout={LinearTransition.duration(180)}
       style={{ alignSelf: "flex-start", maxWidth: "90%", opacity: recent ? 1 : 0.5, backgroundColor: p.surface, borderRadius: radius.card, borderBottomLeftRadius: 6, paddingHorizontal: space.lg, paddingVertical: 11, elevation: p.dark || !recent ? 0 : 2, shadowColor: p.shadow, shadowOpacity: 0.12, shadowRadius: 10, shadowOffset: { width: 0, height: 4 } }}
     >
       <Text style={{ color: p.ink, fontSize: 16.5, lineHeight: 25, fontFamily: fonts.bodySemi }}>{line.text}</Text>
     </Animated.View>
   );
-}
+});
 
 /** Something the assistant brings up by itself mid-call (it also says it out loud). */
 function CallNotice({ notice, onOpen }: { notice: Notice; onOpen: () => void }) {

@@ -29,6 +29,8 @@ import {
   type AssistantConfigChange,
   type LogLevel,
   type VoiceProviderId,
+  TRANSCRIBE_LIMITS,
+  type TranscribeResult,
 } from "@herdr-pocket/protocol";
 import { VERSION } from "@herdr-pocket/update";
 import { Store } from "./store.ts";
@@ -41,6 +43,7 @@ import { isPromptId, promptView, promptViews, setPromptEdits } from "./assistant
 import { startCall, endAllCalls, type LiveConfig } from "./assistant/live.ts";
 import { EventLog, levelsFrom, parseSince, type EventInput } from "./eventlog.ts";
 import { adminPage, adminAsset } from "./admin.ts";
+import { TranscribeError, TranscribeLimiter, audioType, resolveTranscribe, transcribe, transcribeInfo, wavDurationMs, type TranscribeSettings, type TranscribeTarget } from "./transcribe.ts";
 
 export interface RelayOptions {
   dbPath: string;
@@ -62,6 +65,10 @@ export interface RelayOptions {
   assistantTiming?: Omit<AssistantOptions, "store" | "host" | "llm" | "model" | "name" | "voice" | "confirm">;
   /** Whether the assistant asks before acting until the app changes it (POCKET_ASSISTANT_CONFIRM). Default `never`. */
   assistantConfirm?: AssistantConfirm;
+  /** Dictation (POST /v1/transcribe): POCKET_TRANSCRIBE_* settings; otherwise the voice or text providers' (src/transcribe.ts). */
+  transcribe?: TranscribeSettings;
+  /** Per-device dictation limits (tests lower them). */
+  transcribeLimits?: { perMinute?: number; concurrent?: number };
 }
 
 interface Conn {
@@ -146,11 +153,13 @@ export class Relay {
   readonly config: ConfigStore;
   /** What is in force now. */
   private eff: EffectiveConfig;
+  private dictation: TranscribeLimiter;
 
   private opts: RelayOptions;
 
   constructor(opts: RelayOptions) {
     this.opts = opts;
+    this.dictation = new TranscribeLimiter(opts.transcribeLimits?.perMinute, opts.transcribeLimits?.concurrent);
     this.store = new Store(opts.dbPath);
     const journal = opts.log ?? ((m: string) => console.log(`[relay] ${m}`));
     this.events = new EventLog(this.store, { journal, deviceName: (id) => (id === "relay" ? "relay" : this.store.getDevice(id)?.name) });
@@ -358,6 +367,7 @@ export class Relay {
       const name = str(body?.name, 64)?.trim();
       const kind = body?.kind === "host" || body?.kind === "viewer" ? (body.kind as DeviceKind) : null;
       const platform = str(body?.platform, 32);
+      const via = str(body?.via, 24)?.replace(/[^a-z0-9-]/gi, "");
       if (!code || !name || !kind) {
         sendError(res, 400, "bad_request", "需要 code、name 和 kind（host 或 viewer）");
         return;
@@ -365,6 +375,7 @@ export class Relay {
       const row = this.store.consumePairCode(code, kind);
       if (typeof row === "string") {
         this.pairFailed(ip);
+        this.events.record({ kind: "pair", level: "warn", msg: `pairing ${kind} "${name}" refused: ${row}${via ? ` (via ${via})` : ""}`, data: { kind, platform, via, reason: row } });
         if (row === "wrong_kind") {
           sendError(
             res,
@@ -383,7 +394,15 @@ export class Relay {
       const previous = this.authenticate(req, url);
       if (previous && previous !== "admin" && previous.kind === kind) this.removeDevice(previous.id, "re-paired");
       const { device, token } = this.store.createDevice({ name: this.store.uniqueName(name), kind, platform });
+      const maker = row.createdBy === "admin" ? "admin" : row.createdBy ? (this.store.getDevice(row.createdBy)?.name ?? row.createdBy) : "setup code";
       this.log(`paired ${kind} "${name}" (${device.id})`);
+      this.events.record({
+        kind: "pair",
+        level: "info",
+        msg: `${kind} "${device.name}" paired with a code from ${maker}${via ? ` via ${via}` : ""}${previous && previous !== "admin" && previous.kind === kind ? ", replacing its old entry" : ""}`,
+        device: device.id,
+        data: { kind, platform, via, codeFrom: row.createdBy ?? "setup", replaced: previous && previous !== "admin" && previous.kind === kind ? previous.id : undefined },
+      });
       this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(device) });
       const out: PairResponse = { device: this.decorate(device), token };
       sendJson(res, 200, out);
@@ -481,6 +500,13 @@ export class Relay {
       const kind = body.kind === "host" || body.kind === "viewer" ? (body.kind as DeviceKind) : undefined;
       const ttlSec = typeof body.ttlSec === "number" ? body.ttlSec : undefined;
       const row = this.store.createPairCode({ kind, ttlSec, createdBy: auth === "admin" ? "admin" : auth.id });
+      this.events.record({
+        kind: "pair",
+        level: "info",
+        msg: `pair code for ${kind ?? "any device"} made by ${auth === "admin" ? "admin" : `${auth.kind} "${auth.name}"`}, valid ${Math.round((row.expiresAt - Date.now()) / 1000)} s`,
+        ...(auth === "admin" ? {} : { device: auth.id }),
+        data: { kind: kind ?? "any", ttlSec: Math.round((row.expiresAt - Date.now()) / 1000) },
+      });
       const link = pairLink(this.publicUrl(req), row.code);
       const qrSvg = await QRCode.toString(link, { type: "svg", margin: 1 }).catch(() => undefined);
       const out: PairCode & { qrSvg?: string } = { code: row.code, expiresAt: row.expiresAt, link, ...(qrSvg ? { qrSvg } : {}) };
@@ -534,6 +560,18 @@ export class Relay {
         sendJson(res, 200, { entries: this.events.query(this.logQuery(url.searchParams)) });
         return;
       }
+    }
+
+    if (path === "/v1/transcribe" && (req.method === "GET" || req.method === "POST")) {
+      // Dictation is for the person's own apps (phones, the desktop app), like the assistant.
+      if (!auth || auth === "admin" || auth.kind !== "viewer") {
+        sendError(res, 401, "unauthorized", "需要手机或桌面应用的设备令牌");
+        return;
+      }
+      const target = resolveTranscribe(this.opts.transcribe ?? {}, this.eff.targets, this.eff.live);
+      if (req.method === "GET") sendJson(res, 200, transcribeInfo(target));
+      else await this.handleTranscribe(req, res, url, auth, target);
+      return;
     }
 
     if (req.method === "GET" && path === "/v1/admin/overview") {
@@ -708,6 +746,74 @@ export class Relay {
       this.pending.set(id, { caller: { resolve: resolve as (v: unknown) => void, reject }, callerId: id, target: to, timer, method, from: "relay", params, t0 });
       this.send(target, { type: "rpc", id, from: "relay", method, params });
     });
+  }
+
+  /**
+   * One recording to text. Logged with sizes, timings and the service; never the audio or the text.
+   * Limits: TRANSCRIBE_LIMITS (size, length, per-device rate and parallel requests).
+   */
+  private async handleTranscribe(req: IncomingMessage, res: ServerResponse, url: URL, device: Device, target: TranscribeTarget | { reason: string }): Promise<void> {
+    const note = (level: LogLevel, msg: string, data?: Record<string, unknown>) => this.events.record({ kind: "transcribe", level, msg: `"${device.name}": ${msg}`, device: device.id, data });
+    const refuse = (status: number, code: RpcError["code"], message: string) => {
+      // The rest of a refused upload is not read: close the connection once the answer is out.
+      res.setHeader("Connection", "close");
+      res.on("finish", () => req.destroy());
+      sendError(res, status, code, message);
+    };
+    if ("reason" in target) {
+      note("info", `not available: ${target.reason}`);
+      refuse(503, "unsupported", target.reason);
+      return;
+    }
+    const type = audioType(req.headers["content-type"]);
+    if (!type) {
+      refuse(400, "bad_request", "需要录音本身作为请求体，Content-Type 是 audio/webm、audio/wav、audio/mp4 等");
+      return;
+    }
+    const declared = Number(req.headers["content-length"]);
+    if (declared > TRANSCRIBE_LIMITS.maxBytes) {
+      note("warn", `refused ${declared} bytes (over ${TRANSCRIBE_LIMITS.maxBytes})`);
+      refuse(413, "bad_request", `录音太大（最多 ${Math.round(TRANSCRIBE_LIMITS.maxBytes / 1024 / 1024)} MB）`);
+      return;
+    }
+    const release = this.dictation.take(device.id);
+    if (typeof release !== "function") {
+      note("warn", `rate limited: ${release.reason}`);
+      refuse(429, "forbidden", release.reason);
+      return;
+    }
+    const t0 = Date.now();
+    try {
+      const audio = await readBody(req, TRANSCRIBE_LIMITS.maxBytes);
+      if (!audio) {
+        note("warn", `refused an upload over ${TRANSCRIBE_LIMITS.maxBytes} bytes`);
+        refuse(413, "bad_request", `录音太大（最多 ${Math.round(TRANSCRIBE_LIMITS.maxBytes / 1024 / 1024)} MB）`);
+        return;
+      }
+      if (!audio.length) {
+        sendError(res, 400, "bad_request", "录音是空的");
+        return;
+      }
+      const clientMs = Number(url.searchParams.get("durationMs"));
+      const audioMs = wavDurationMs(audio) ?? (Number.isFinite(clientMs) && clientMs > 0 ? Math.round(clientMs) : undefined);
+      if (audioMs !== undefined && audioMs > TRANSCRIBE_LIMITS.maxSeconds * 1000) {
+        note("warn", `refused ${Math.round(audioMs / 1000)} s of audio (over ${TRANSCRIBE_LIMITS.maxSeconds} s)`);
+        sendError(res, 413, "bad_request", `录音太长（最多 ${TRANSCRIBE_LIMITS.maxSeconds} 秒）`);
+        return;
+      }
+      const language = url.searchParams.get("language")?.trim() || undefined;
+      const r = await transcribe(target, audio, type, { language });
+      const data = { provider: r.provider, model: r.model, type, bytes: audio.length, audioMs, ms: r.ms, totalMs: Date.now() - t0, chars: Array.from(r.text).length, language: r.language ?? "auto" };
+      note(r.ms > 8000 ? "warn" : "info", `${r.provider}/${r.model} ${Math.round(audio.length / 1024)} KB${audioMs !== undefined ? ` ${(audioMs / 1000).toFixed(1)} s` : ""} -> ${data.chars} chars in ${r.ms} ms`, data);
+      sendJson(res, 200, r satisfies TranscribeResult);
+    } catch (e) {
+      const status = e instanceof TranscribeError ? e.status : 500;
+      const message = e instanceof Error ? e.message : String(e);
+      note("warn", `${target.provider}/${target.model} failed after ${Date.now() - t0} ms: ${message}`, { provider: target.provider, model: target.model, status, ms: Date.now() - t0 });
+      sendError(res, status, status === 504 ? "timeout" : "internal", status === 500 ? "语音识别出错了" : message);
+    } finally {
+      release();
+    }
   }
 
   /** One line per forwarded call that changed something or failed; reads that work are not worth a row. */
@@ -1219,12 +1325,24 @@ function rpcSummary(method: string, params: unknown): Record<string, unknown> | 
   if (!params || typeof params !== "object") return undefined;
   const p = params as Record<string, unknown>;
   const out: Record<string, unknown> = {};
-  for (const k of ["agent", "launcher", "space", "spaceName", "tabName", "folder", "command", "session"]) if (typeof p[k] === "string") out[k] = p[k];
+  for (const k of ["agent", "launcher", "space", "spaceName", "tabName", "folder", "command", "session", "path"]) if (typeof p[k] === "string") out[k] = p[k];
   if (typeof p.text === "string") out.text = Array.from(p.text).slice(0, 200).join("");
   if (typeof p.task === "string") out.task = Array.from(p.task).slice(0, 200).join("");
   if (Array.isArray(p.keys)) out.keys = p.keys.slice(0, 16).join(" ");
   if (method === "herdr.command" && p.args && typeof p.args === "object") out.args = JSON.stringify(p.args).slice(0, 200);
   return Object.keys(out).length ? out : undefined;
+}
+
+/** The whole body, or null once it passes `max` bytes (the rest is not read). */
+async function readBody(req: IncomingMessage, max: number): Promise<Buffer | null> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > max) return null;
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks);
 }
 
 async function readJson(req: IncomingMessage, max = MAX_BODY): Promise<Record<string, unknown> | null> {

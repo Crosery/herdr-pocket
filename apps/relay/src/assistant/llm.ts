@@ -312,7 +312,11 @@ async function once(t: LlmTarget, cfg: LlmConfig, req: LlmRequest): Promise<LlmR
                 return readOpenai(events, t, req, stream);
             }
           })();
-    if (!gotContent) throw new LlmError(`${label}: empty answer`);
+    // Reasoning counts as stream activity, but a completed turn needs text or a tool call.
+    const usable = r.content.some((b) =>
+      (b.type === "text" && b.text.trim()) || (b.type === "tool_use" && req.tools.length > 0 && b.name.trim()),
+    );
+    if (!usable) throw new LlmError(`${label}: empty answer`);
     return r;
   } catch (e) {
     if (e instanceof LlmError) throw e;

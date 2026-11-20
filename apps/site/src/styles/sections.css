@@ -767,7 +767,7 @@
   flex: none;
   gap: 14px;
   padding: 8px 7px;
-  animation: marquee 46s linear infinite;
+  animation: marquee var(--marquee-dur, 46s) linear infinite;
 }
 .marquee:hover .marquee-track {
   animation-play-state: paused;

@@ -1,6 +1,6 @@
 [package]
 name = "herdr-pocket-desktop"
-version = "0.2.1"
+version = "0.2.2"
 description = "Herdr Pocket Desktop Client"
 authors = ["Herdr Pocket <noreply@users.noreply.github.com>"]
 homepage = "https://github.com/Crosery/herdr-pocket"
@@ -15,9 +15,76 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# Licenses of everything below: MIT and/or Apache-2.0 (objc2 family: also Zlib),
+# all compatible with AGPL-3.0-only.
 [dependencies]
-tauri = { version = "2", features = [] }
+# `unstable`: Window::add_child, for the browser panel inside the main window.
+# `macos-private-api`: a transparent dictation HUD (also `app.macOSPrivateApi` in tauri.conf.json).
+# `tray-icon`: config.json `general.closeToTray` (off by default; no icon unless it is on).
+tauri = { version = "2", features = ["unstable", "macos-private-api", "tray-icon"] }
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+regex = "1"
+log = "0.4"
+url = "2"
+# OS TLS (Security.framework / SChannel / OpenSSL on Linux) and the system proxy.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "system-proxy"] }
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+# Same version tauri uses for Webview::set_cookie.
+cookie = "0.18"
+# Chromium cookie decryption (pure Rust; the reader itself is macOS/Windows only).
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+sha2 = "0.10"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"
+# config.json `general.launchAtLogin` (macOS LaunchAgent, Windows Run key); off by default.
+tauri-plugin-autostart = "2"
+
+# Voice input exists on macOS and Windows only.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+cpal = "0.18"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+core-foundation = "0.10"
+core-graphics = "0.25"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "NSSound", "NSResponder", "NSWindow", "NSApplication"] }
+block2 = "0.6"
+# Already in the tree through wry; for WKWebsiteDataStore.removeDataStoreForIdentifier and
+# WKPreferences.inactiveSchedulingPolicy (macOS 14+).
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebsiteDataStore", "WKWebView", "WKWebViewConfiguration", "WKPreferences"] }
+security-framework = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_Pipes",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+  "Win32_System_Power",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Media_Audio",
+] }

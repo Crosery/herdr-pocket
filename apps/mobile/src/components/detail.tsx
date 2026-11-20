@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
 import { Image, Pressable, ScrollView, TextInput as RNTextInput, View, type TextStyle } from "react-native";
-import { ActivityIndicator, Button, Checkbox, Dialog, IconButton, List, Portal, ProgressBar, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -21,6 +21,7 @@ import { usePalette } from "../theme/theme";
 import { agentStatusLabel, fonts, radius, space, statusColors } from "../theme/tokens";
 import { TermKeyboard } from "./TermKeyboard";
 import { EmptyState, IconTile, PocketToast, SendPill } from "./ui";
+import { PocketButton, PocketCheck, PocketDialog, PocketProgress, PocketSpinner, RowAction, type PocketIcon } from "./pocket";
 
 // ---------------------------------------------------------------------------
 // Terminal
@@ -229,12 +230,12 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
   }, [follow, fontSize]);
 
   if (!view && q.isError) {
-    return <EmptyState mood="waiting" title="终端画面没拿到" body={(q.error as Error).message} action={<Button textColor={p.accentText} onPress={() => q.refetch()}>再试一次</Button>} />;
+    return <EmptyState mood="waiting" title="终端画面没拿到" body={(q.error as Error).message} action={<PocketButton variant="soft" icon="refresh" onPress={() => void q.refetch()}>再试一次</PocketButton>} />;
   }
   if (!view) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: space.sm }}>
-        <ActivityIndicator />
+        <PocketSpinner size={24} />
         <Text style={{ color: p.faint, fontSize: 12 }}>正在接收终端画面…</Text>
       </View>
     );
@@ -271,7 +272,7 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
           <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: shown === "live" ? "#5ED6A7" : shown === "stale" ? "#F0B85A" : "#E9819E" }} />
           <Text style={{ color: "#CFC5DA", fontSize: 10 }}>{shown === "live" ? "实时" : shown === "stale" ? "重连中" : shown === "connecting" ? "连接中" : "轮询"}</Text>
         </View>
-        {q.isFetching ? <ActivityIndicator size={12} color="#CFC5DA" style={{ marginRight: 8 }} /> : null}
+        {q.isFetching ? <PocketSpinner size={12} color="#CFC5DA" style={{ marginRight: 8 }} /> : null}
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={mode === "fit" ? "切换到正常字号，可以左右滑动" : "切换到适应宽度"}
@@ -286,17 +287,18 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
           <MaterialCommunityIcons name={mode === "fit" ? "arrow-expand-horizontal" : "format-size"} size={15} color="#EDE6F3" />
           <Text style={{ color: "#EDE6F3", fontSize: 12, fontFamily: fonts.bodySemi }}>{mode === "fit" ? "适应宽度" : `${fontSize} 号字`}</Text>
         </Pressable>
-        <IconButton
-          icon={copied ? "check" : "content-copy"}
-          size={18}
-          iconColor="#EDE6F3"
-          accessibilityLabel="复制终端内容"
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={copied ? "已复制" : "复制终端内容"}
           onPress={async () => {
             await Clipboard.setStringAsync(screen.plain());
             setCopied(true);
             setTimeout(() => setCopied(false), 1500);
           }}
-        />
+          style={({ pressed }) => ({ width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? "#3A3148" : "transparent" })}
+        >
+          <MaterialCommunityIcons name={copied ? "check" : "content-copy"} size={18} color="#EDE6F3" />
+        </Pressable>
       </View>
       <ScrollView
         ref={scroller}
@@ -524,39 +526,29 @@ function KeyLayoutDialog({ visible, onDismiss }: { visible: boolean; onDismiss: 
     save(order, layout.visible);
   };
   return (
-    <Portal>
-      <Dialog visible={visible} onDismiss={onDismiss} style={{ borderRadius: radius.xl, backgroundColor: p.surface, maxHeight: "80%" }}>
-        <Dialog.Title style={{ fontFamily: fonts.cute, color: p.ink }}>调整按键</Dialog.Title>
-        <Dialog.ScrollArea style={{ paddingHorizontal: 0 }}>
-          <ScrollView>
-            {layout.order.map((id, idx) => {
-              const k = byId.get(id)!;
-              const on = layout.visible.includes(id);
-              return (
-                <View key={id} style={{ flexDirection: "row", alignItems: "center", paddingLeft: space.lg, minHeight: 48 }}>
-                  <Checkbox.Android
-                    status={on ? "checked" : "unchecked"}
-                    onPress={() => save(layout.order, on ? layout.visible.filter((x) => x !== id) : [...layout.visible, id])}
-                    accessibilityLabel={`${on ? "隐藏" : "显示"} ${k.a11y}`}
-                  />
-                  <Text style={{ flex: 1, color: p.ink, fontFamily: k.mono ? fonts.mono : fonts.body, fontSize: 15 }}>{k.label}</Text>
-                  <IconButton icon="chevron-up" size={20} disabled={idx === 0} onPress={() => move(idx, -1)} accessibilityLabel={`${k.a11y} 上移`} />
-                  <IconButton icon="chevron-down" size={20} disabled={idx === layout.order.length - 1} onPress={() => move(idx, 1)} accessibilityLabel={`${k.a11y} 下移`} />
-                </View>
-              );
-            })}
-          </ScrollView>
-        </Dialog.ScrollArea>
-        <Dialog.Actions>
-          <Button textColor={p.ink} onPress={() => set({ termKeys: null })}>
-            恢复默认
-          </Button>
-          <Button textColor={p.accentText} onPress={onDismiss}>
-            好了
-          </Button>
-        </Dialog.Actions>
-      </Dialog>
-    </Portal>
+    <PocketDialog
+      visible={visible}
+      onDismiss={onDismiss}
+      title="调整按键"
+      scroll
+      actions={[
+        { label: "恢复默认", onPress: () => set({ termKeys: null }), tone: "ghost" },
+        { label: "好了", onPress: onDismiss },
+      ]}
+    >
+      {layout.order.map((id, idx) => {
+        const k = byId.get(id)!;
+        const on = layout.visible.includes(id);
+        return (
+          <View key={id} style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingLeft: space.sm, minHeight: 50 }}>
+            <PocketCheck checked={on} onChange={() => save(layout.order, on ? layout.visible.filter((x) => x !== id) : [...layout.visible, id])} label={`${on ? "隐藏" : "显示"} ${k.a11y}`} />
+            <Text style={{ flex: 1, color: p.ink, fontFamily: k.mono ? fonts.mono : fonts.body, fontSize: 15, paddingLeft: space.xs }}>{k.label}</Text>
+            <RowAction icon="arrow-up" disabled={idx === 0} onPress={() => move(idx, -1)} a11y={`${k.a11y} 上移`} />
+            <RowAction icon="arrow-down" disabled={idx === layout.order.length - 1} onPress={() => move(idx, 1)} a11y={`${k.a11y} 下移`} />
+          </View>
+        );
+      })}
+    </PocketDialog>
   );
 }
 
@@ -971,15 +963,15 @@ export function InfoView({ agent, bottomInset }: { agent: Agent; bottomInset: nu
   const ratio = agent.contextTokens && agent.contextLimit ? agent.contextTokens / agent.contextLimit : null;
   const row = (title: string, value: string | undefined | null, icon: string, mono = false) =>
     value ? (
-      <List.Item
-        key={title}
-        title={title}
-        description={value}
-        descriptionNumberOfLines={3}
-        titleStyle={{ fontSize: 13, color: p.muted }}
-        descriptionStyle={{ fontSize: 15, color: p.ink, fontFamily: mono ? fonts.mono : fonts.body }}
-        left={(props) => <List.Icon {...props} color={p.muted} icon={icon} />}
-      />
+      <View key={title} accessibilityLabel={`${title}：${value}`} style={{ flexDirection: "row", alignItems: "flex-start", gap: space.md, paddingHorizontal: space.lg, paddingVertical: space.sm + 2, minHeight: 56 }}>
+        <MaterialCommunityIcons name={icon as PocketIcon} size={22} color={p.muted} style={{ marginTop: 6 }} />
+        <View style={{ flex: 1, gap: 2 }}>
+          <Text style={{ fontSize: 13, color: p.muted }}>{title}</Text>
+          <Text selectable numberOfLines={3} style={{ fontSize: 15, color: p.ink, fontFamily: mono ? fonts.mono : fonts.body }}>
+            {value}
+          </Text>
+        </View>
+      </View>
     ) : null;
   return (
     <ScrollView contentContainerStyle={{ padding: space.lg, paddingBottom: bottomInset + space.xxl, gap: space.md }}>
@@ -991,7 +983,7 @@ export function InfoView({ agent, bottomInset }: { agent: Agent; bottomInset: nu
               {compactNum(agent.contextTokens)} / {compactNum(agent.contextLimit)}
             </Text>
           </View>
-          <ProgressBar progress={Math.min(1, ratio)} color={ratio > 0.8 ? p.error : p.lavender} style={{ height: 8, borderRadius: 4, backgroundColor: p.surface3 }} />
+          <PocketProgress progress={Math.min(1, ratio)} color={ratio > 0.8 ? p.error : p.lavender} height={8} />
         </View>
       ) : null}
       <View style={{ backgroundColor: p.surface, borderRadius: radius.card, overflow: "hidden", paddingVertical: space.xs }}>

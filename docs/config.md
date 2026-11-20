@@ -7,6 +7,8 @@ The relay has two model-backed parts:
 
 Keys stay on the relay. They are never sent to the phone, never shown by `/v1/health` or the admin page, and removed from upstream error messages before those are logged.
 
+Also on this page: [dictation](#dictation-speech-to-text) (speech to text for voice input on computers), and the [settings file of computers and the desktop app](#computers-and-the-desktop-app-configjson) (`config.json`, read by the `herdr-pocket` CLI and the desktop app; nothing in it reaches the relay).
+
 ## Where settings come from
 
 1. **Environment variables**, usually from `/etc/herdr-pocket/relay.env` (systemd) or `relay.env` next to the Docker Compose file. Template: [`deploy/relay.env.example`](../deploy/relay.env.example).
@@ -23,7 +25,7 @@ JSON values in an env file (`*_EXTRA_BODY`) go in single quotes: `POCKET_OPENAI_
 
 ### The model list
 
-`POCKET_ASSISTANT_MODELS` is a comma-separated list, tried in order. A model is skipped and the next one asked when its request fails, or when no first token arrives within `POCKET_ASSISTANT_FIRST_TOKEN_MS` (default 25 000 ms). One answer may take at most 120 s.
+`POCKET_ASSISTANT_MODELS` is a comma-separated list, tried in order. The relay tries the next model if the request fails, the stream ends without text or a tool call, or no first token arrives within `POCKET_ASSISTANT_FIRST_TOKEN_MS` (default 25 000 ms). Reasoning tokens count as stream activity. Each model request may take up to 120 s.
 
 Each entry is `provider:model`:
 
@@ -236,6 +238,28 @@ The shipped prompts are Markdown files in [`apps/relay/src/assistant/prompts/`](
 
 To keep your own wording out of this repository, put files with the same names in a folder of your own and point `POCKET_PROMPTS_DIR` at it: each `<id>.md` there replaces the shipped one (and is what 恢复默认 on the phone goes back to). Edits made on a phone are stored sealed in the database, never in the repository.
 
+## Dictation (speech to text)
+
+`POST /v1/transcribe` turns a recording into text for quick voice input in the desktop app (a global shortcut, then the text is pasted where you type). Any service with an OpenAI-compatible `/audio/transcriptions` endpoint works. Without settings of its own the relay reuses what it already has, read only:
+
+1. `POCKET_TRANSCRIBE_URL` (+ `POCKET_TRANSCRIBE_KEY`): a service of its own;
+2. else the OpenAI Realtime voice service (`POCKET_VOICE_PROVIDER=openai-realtime`, the `ga` dialect): its key and host, model `POCKET_VOICE_TRANSCRIBE_MODEL`;
+3. else the `openai` text provider's key (model `gpt-4o-mini-transcribe`), or the `siliconflow` one's (`FunAudioLLM/SenseVoiceSmall`).
+
+MOSS-Live alone does not give dictation: it has no separate speech-to-text endpoint that this relay knows of. A key only ever goes to the host it was configured for.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `POCKET_TRANSCRIBE_PROVIDER` | `auto` | `auto` (the order above), `off`, `voice` (only the realtime voice service), or a text provider id such as `openai`, `siliconflow` or one of your own |
+| `POCKET_TRANSCRIBE_URL` | | base URL of a service of its own; requests go to `<url>/audio/transcriptions` (http or https, e.g. a local Whisper server) |
+| `POCKET_TRANSCRIBE_KEY` | | its key; without one nothing is sent as a key |
+| `POCKET_TRANSCRIBE_AUTH` | `bearer` | `bearer`, `api-key` (an `api-key` header) or `none` |
+| `POCKET_TRANSCRIBE_MODEL` | per service | model name; required for a text provider other than `openai` and `siliconflow` |
+
+Requests: device token of a phone or the desktop app (computers and the admin token are refused); the body is the recording itself with its `Content-Type` (`audio/webm`, `audio/ogg`, `audio/wav`, `audio/mpeg`, `audio/mp4`, `audio/m4a`, `audio/flac`); `?language=zh|en|auto` and `&durationMs=`. Limits: 10 MB and 300 s per recording (a WAV's length is read from its header), 20 requests a minute and 2 at a time per device, 90 s for the service to answer. `GET /v1/transcribe` says whether dictation is available and with which service, or why not.
+
+The relay keeps neither the audio nor the text. Each request is one `transcribe` line in the log (`herdr-pocket logs --kind transcribe`): device, service and model, size, length, time taken and the number of characters, never the words.
+
 ## Health
 
 `GET /v1/health` (no auth) now also reports which services are configured, by name only:
@@ -245,6 +269,125 @@ To keep your own wording out of this repository, put files with the same names i
 ```
 
 `assistant` is empty and `voice` is `null` when they are off.
+
+## Computers and the desktop app: config.json
+
+One settings file per user, shared by the `herdr-pocket` CLI, its daemon and the desktop app (macOS, Windows, Linux). It sits next to the computer's login file:
+
+| OS | Path |
+|---|---|
+| macOS, Linux | `~/.config/herdr-pocket/config.json` |
+| Windows | `%APPDATA%\herdr-pocket\config.json` |
+| any, with `HERDR_POCKET_HOME` set | `$HERDR_POCKET_HOME/config.json` |
+
+`herdr-pocket config path` prints it. The file holds no secrets: the relay address and device token stay in `hostd.json` (written by `herdr-pocket login`, owner-only), the desktop app's own login in its session file. A key name that looks like a secret (`token`, `apiKey`, `password`, …) is reported as an error.
+
+Rules for the file:
+
+- Plain JSON, UTF-8, no comments: `{ "version": 1, "<section>": { "<key>": value } }`.
+- Every key is optional. A missing key, or a value that is wrong, means the default; `herdr-pocket config show` lists what is wrong. The file never stops a program from starting.
+- Programs write only the key that changed, keep keys they do not know (written by a newer version) and never lower `version`. Writes replace the file in one rename, so a reader never sees half of it, and leave it readable by its owner only (`600` on macOS and Linux). A file that is not valid JSON is never overwritten: fix it or delete it.
+- Which program writes what: keys read only by the app (see the table) are the desktop app's; `update.*` and `logging.level` / `logging.upload` are shared, and `herdr-pocket config` can set any key.
+- Environment variables win over the file where noted.
+- The daemon reads it again before each update check and every minute, and logs what changed (`config` lines in `herdr-pocket logs`).
+
+### Commands
+
+```sh
+herdr-pocket config path                   # where it is
+herdr-pocket config show [--all] [--json]  # what differs from the defaults, and problems
+herdr-pocket config get update.region
+herdr-pocket config set update.region cn
+herdr-pocket config set update.mirrors https://mirror.example.com/,https://other.example.com/
+herdr-pocket config unset update.region    # back to the default
+herdr-pocket config edit                   # $VISUAL / $EDITOR, else Notepad (Windows) or vi in a terminal
+herdr-pocket config keys                   # every key with its default
+```
+
+`set`, `unset` and `edit` also send one line to the relay's log when this computer is logged in (`kind config`, which key, old and new value); a file with mistakes is reported there too. Plain reads are not logged.
+
+### Keys
+
+Who reads it: CLI = `herdr-pocket` commands, daemon = `herdr-pocket run`, app = the desktop app.
+
+| Key | Default | Values | Read by | Meaning |
+|---|---|---|---|---|
+| `general.language` | `"zh-CN"` | `zh-CN`, `en` | app | language of the desktop app |
+| `general.theme` | `"system"` | `system`, `light`, `dark` | app | appearance |
+| `general.textScale` | `100` | 80–160 | app | text size of the desktop app, in percent |
+| `general.showShells` | `false` | boolean | app | list plain shells beside the agents |
+| `general.useLocalLogin` | `true` | boolean | app | when this computer's `herdr-pocket` is logged in, the app joins the same relay with it (it asks that login for a one-time pairing code and pairs as its own device) |
+| `general.launchAtLogin` | `false` | boolean | app | start the app when you log in |
+| `general.closeToTray` | `false` | boolean | app | closing the window keeps the app in the menu bar or tray; off, closing the window quits the app |
+| `general.notifications` | `true` | boolean | app | system notifications when an agent finishes or waits |
+| `update.region` | `"auto"` | `auto`, `cn`, `global` | CLI, daemon, app | where downloads come from first, see [Regions and download sources](#regions-and-download-sources). `HERDR_POCKET_MIRROR=1` / `0` wins |
+| `update.autoCheck` | `true` | boolean | CLI, daemon, app | look for a new release now and then. `HERDR_POCKET_UPDATE_CHECK=0` wins |
+| `update.checkIntervalHours` | `24` | 6–168 | daemon, app | hours between automatic checks, ±10% at random |
+| `update.mirrors` | `[]` | up to 20 prefixes | CLI, daemon, app | your own GitHub mirrors, e.g. `https://mirror.example.com/`: https, ending in `/`, put in front of a `https://github.com/…` address (plain `http://` only for `localhost` / `127.0.0.1`). Raced first, before the built-in ones |
+| `update.checkTools` | `true` | boolean | daemon | once a day, look for newer hc, Herdr app and uniflo releases; report only, see [Updates of hc, the Herdr app and uniflo](#updates-of-hc-the-herdr-app-and-uniflo). Off as well when `update.autoCheck` is off |
+| `logging.level` | `"info"` | `debug`, `info`, `warn`, `error` | daemon, app | lowest level kept and uploaded. `debug` adds every file-view request |
+| `logging.upload` | `true` | boolean | daemon, app | send this device's log lines to the relay, where `herdr-pocket logs` reads them |
+| `logging.keepDays` | `7` | 1–90 | app | days of local log files the desktop app keeps |
+| `voiceInput.enabled` | `true` | boolean | app | dictation with a global shortcut (needs [dictation](#dictation-speech-to-text) on the relay) |
+| `voiceInput.hotkey` | `"CommandOrControl+Shift+Space"` | a shortcut, or one modifier key | app | Either a shortcut with at least one modifier, or one modifier key alone (`RightOption`, `RightControl`, `RightCommand`, `RightShift`, `Fn`) held to talk. Shortcuts use the Tauri accelerator form (`CommandOrControl`, `Alt`/`Option`, `Shift`, `Super`, then a key such as `Space`, `D`, `F5`). `RightAlt` and `RightCtrl` are taken too and stored as `RightOption` and `RightControl`. See the notes below the table |
+| `voiceInput.mode` | `"hold"` | `hold`, `toggle` | app | `hold`: talk while the shortcut is held. `toggle`: press to start, again to stop |
+| `voiceInput.language` | `"auto"` | `auto` or a code (`zh`, `en`, …) | app | language hint for recognition |
+| `voiceInput.insert` | `"paste"` | `paste`, `type`, `clipboard` | app | where the text goes: pasted into the focused app, typed key by key, or only copied |
+| `voiceInput.maxSeconds` | `60` | 5–300 | app | a recording stops after this long |
+| `voiceInput.sounds` | `true` | boolean | app | a short sound when recording starts and stops |
+| `voiceInput.denoise` | `true` | boolean | nothing (reserved) | reserved for microphone noise suppression; nothing reads it yet, and the desktop app does not show it (its call noise suppression is a setting of its own) |
+| `browser.homePage` | `""` | empty or an http(s) address | app | what a new tab of the built-in browser opens |
+| `browser.searchEngine` | `"bing"` | `bing`, `google`, `baidu`, `duckduckgo` | app | for words typed into the address bar |
+| `browser.cookieImport` | `"ask"` | `ask`, `off` | app | `ask`: offer to import cookies from another installed browser (each import asks first). `off`: never read other browsers' cookies |
+| `browser.clearOnExit` | `false` | boolean | app | drop the built-in browser's cookies and cache on quit |
+| `files.showHidden` | `false` | boolean | app | list dot files in the file view |
+| `files.showIgnored` | `false` | boolean | app | list heavy generated folders (`node_modules`, `.git`, `dist`, `target`, …) |
+| `resources.lowPower` | `"auto"` | `auto`, `on`, `off` | app | slower polling and fewer animations: on battery (`auto`), always, or never |
+| `resources.memoryWarnMb` | `1024` | 256–16384 | app | warn when the desktop app uses more memory |
+| `resources.diskWarnGb` | `5` | 1–1000 | app | warn when free disk space falls below this |
+
+Notes on `voiceInput.hotkey`:
+
+- `RightCommand` and `Fn` exist on macOS only. The file belongs to one machine, so it takes them on any OS; the desktop app says so when it cannot register the key.
+- `Fn` on macOS also needs System Settings → Keyboard → "Press 🌐 key to" set to "Do Nothing"; otherwise macOS opens its own emoji picker or dictation.
+- On Windows keyboard layouts where the right Alt key is AltGr, `RightOption` (right Alt) types characters, so `RightControl` is the safer choice on Windows.
+
+Example:
+
+```json
+{
+  "version": 1,
+  "update": { "region": "cn", "mirrors": ["https://mirror.example.com/"] },
+  "voiceInput": { "hotkey": "Alt+Space", "mode": "toggle", "language": "zh" },
+  "files": { "showHidden": true }
+}
+```
+
+The schema (types, defaults, checks and the Chinese labels the app shows) is `CLIENT_CONFIG_KEYS` in [`packages/protocol/src/index.ts`](../packages/protocol/src/index.ts).
+
+### Regions and download sources
+
+Release files (update checks, the CLI bundle, installers, the Android APK) come from GitHub or from public mirrors put in front of its addresses. Which goes first depends on the region:
+
+1. `HERDR_POCKET_MIRROR`: `1` (or `cn`) mirrors first, `0` (or `global`) GitHub first;
+2. else `update.region` in `config.json`, unless it is `auto`;
+3. else the time zone: mainland China (`Asia/Shanghai`, `Asia/Urumqi`, … ; on runtimes that only report `UTC+8`, together with a `zh-CN` locale) means mirrors first, everywhere else GitHub first.
+
+The order is: your own `update.mirrors`, then for mainland China the built-in mirrors (`ghfast.top`, `gh-proxy.com`, `cdn.gh-proxy.com`, `edgeone.gh-proxy.com`) and GitHub last; elsewhere GitHub and then the mirrors.
+
+Sources are not simply tried in turn. An update check asks all of them at once for the small `SHA256SUMS` file of the latest release, 4 s each. Once one answers, the others get 150 ms more; the fastest wins, except that an earlier one in the order wins when it was at most 150 ms slower. The winner is remembered for a day in the state folder (`~/.local/state/herdr-pocket/sources.json`, `%LOCALAPPDATA%\herdr-pocket\sources.json`, or `$HERDR_POCKET_STATE`) and asked first for the next check and for downloads. When no source answers in time, each is tried in turn with a long timeout, and the GitHub API too (first outside mainland China, last inside). Whatever comes through a mirror is checked against `SHA256SUMS`.
+
+Automatic checks run a few minutes after the daemon starts, then every `update.checkIntervalHours`. Each is one `update` line in the log: the latest version, the source that answered, how long it took, how the source was chosen (remembered, race, one after another) and every source's time. `herdr-pocket update --check` asks now and prints the same. `herdr-pocket update --probe` races every source now, prints each one's time, and remembers the winner.
+
+### Updates of hc, the Herdr app and uniflo
+
+The daemon also looks for newer releases of the programs it works with, a few minutes after it starts and then about once a day (both jittered). It only reports; it never installs anything:
+
+- hc (herdr-core): `core/latest.json` on Herdr's release server, offered only when its `generation` is the one the running core speaks, as Herdr's own app does (`hc update` stays within a generation);
+- the Herdr app, only where it is installed (`/Applications/Herdr.app` or `~/Applications/Herdr.app` on macOS, `~/.local/share/herdr-app` on Linux, `%LOCALAPPDATA%\Programs\herdr-app` on Windows): `app/latest.json`;
+- uniflo: `uniflo update --check --json`, which asks crates.io itself (10 s).
+
+The release server is `HERDR_RELEASES_URL` if set (as for Herdr), else `https://releases.herdr.dev`; each request gets 4 s. Offline, the last answers stay. Each check is one `update` line in the log (`herdr-pocket logs --kind update`), and the answers are kept in the state folder (`upstream.json`). `herdr-pocket status` shows them, e.g. `upstream hc 0.1.21 → 0.1.22 可更新 · uniflo 0.2.8 (最新)`, or `未检查` before the first answer; phones and the desktop app get them in `host.info` (`tools.latest`). `update.checkTools: false`, `update.autoCheck: false` or `HERDR_POCKET_UPDATE_CHECK=0` turns it off.
 
 ## Sources
 

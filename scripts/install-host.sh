@@ -19,7 +19,9 @@
 # In mainland China (by the time zone) GitHub and nodejs.org are slow or out of reach, so
 # downloads go through mirrors first: ghfast.top / gh-proxy.com for the release, npmmirror.com
 # for Node. Checksums still decide. HERDR_POCKET_MIRROR=1 turns that on anywhere (a server
-# on UTC), =0 turns it off. From China, the script itself also comes through a mirror:
+# on UTC), =0 turns it off; so does "update": {"region": "cn"|"global"} in an existing
+# config.json (docs/config.md). Release sources are raced first and the fastest is used.
+# From China, the script itself also comes through a mirror:
 #   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.sh | bash -s -- ...
 #
 # Later: `herdr-pocket update` installs new releases, `herdr-pocket status` shows the state.
@@ -45,24 +47,69 @@ latest_tag() {
   case "$url" in */releases/tag/*) echo "${url##*/}" ;; *) echo "" ;; esac
 }
 
-# Mainland China by the time zone (TZ, /etc/localtime, /etc/timezone); HERDR_POCKET_MIRROR forces it.
+# Mainland China by the time zone (TZ, /etc/localtime, /etc/timezone); HERDR_POCKET_MIRROR forces
+# it, then `update.region` in config.json (the same order as `herdr-pocket`, docs/config.md).
 in_china() {
-  case "${HERDR_POCKET_MIRROR:-}" in 1 | true | on | yes) return 0 ;; 0 | false | off | no) return 1 ;; esac
+  REGION_WHY="HERDR_POCKET_MIRROR"
+  case "${HERDR_POCKET_MIRROR:-}" in 1 | true | on | yes | cn) return 0 ;; 0 | false | off | no | global) return 1 ;; esac
+  local cfg="${HERDR_POCKET_HOME:-$HOME/.config/herdr-pocket}/config.json" region=""
+  [ -f "$cfg" ] && region=$(tr -d '\n' <"$cfg" | sed -n 's/.*"region"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')
+  REGION_WHY="config.json update.region"
+  case "$region" in cn) return 0 ;; global) return 1 ;; esac
   local tz=${TZ:-}
   [ -n "$tz" ] || tz=$(readlink /etc/localtime 2>/dev/null || true)
   [ -n "$tz" ] || tz=$(cat /etc/timezone 2>/dev/null || true)
+  tz=${tz#*zoneinfo/}
+  REGION_WHY="time zone ${tz:-unknown}"
   case "$tz" in *Asia/Shanghai | *Asia/Chongqing | *Asia/Chungking | *Asia/Harbin | *Asia/Urumqi | *Asia/Kashgar | *PRC) return 0 ;; esac
   return 1
 }
-CHINA=0
-in_china && CHINA=1
+CHINA=0 REGION=global
+in_china && CHINA=1 REGION=cn
+say "download region: $REGION ($REGION_WHY)"
 
-# A github.com file from wherever answers first in order: the mirrors first in China, last elsewhere.
+# Release sources as prefixes put in front of a github.com address ("direct" is GitHub itself):
+# the mirrors first in China, last elsewhere (protocol `sourcePrefixes`).
+MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://cdn.gh-proxy.com/ https://edgeone.gh-proxy.com/"
+if [ "$CHINA" = 1 ]; then PREFIXES="$MIRRORS direct"; else PREFIXES="direct $MIRRORS"; fi
+
+# Asks every source at once for the latest release's small SHA256SUMS (4 s each) and puts the
+# fastest first; one earlier in the order wins when it was at most 0.15 s slower (protocol `pickFastest`).
+race_sources() {
+  local dir i=0 p best="" best_t="" t
+  dir=$(mktemp -d)
+  for p in $PREFIXES; do
+    i=$((i + 1))
+    (
+      u="https://github.com/$REPO/releases/latest/download/SHA256SUMS"
+      [ "$p" = direct ] || u="$p$u"
+      t=$(curl -fsSL --max-time 4 -o "$dir/$i" -w '%{time_total}' "$u" 2>/dev/null) && grep -q 'herdr-pocket-' "$dir/$i" && echo "$t" >"$dir/$i.t"
+    ) &
+  done
+  wait
+  i=0
+  for p in $PREFIXES; do
+    i=$((i + 1))
+    [ -s "$dir/$i.t" ] || continue
+    t=$(cat "$dir/$i.t")
+    if [ -z "$best" ] || awk -v a="$t" -v b="$best_t" 'BEGIN { exit !(a + 0.15 < b) }'; then
+      best=$p
+      best_t=$t
+    fi
+  done
+  rm -rf "$dir"
+  [ -n "$best" ] || return 0
+  say "fastest download source: $([ "$best" = direct ] && echo github.com || echo "${best#https://}") (${best_t}s)"
+  PREFIXES="$best $(for p in $PREFIXES; do [ "$p" = "$best" ] || printf '%s ' "$p"; done)"
+}
+
+# A github.com file from the first source that delivers, in PREFIXES order.
 # A source slower than 20 KB/s for 20 s gives way to the next.
 gh_fetch() {
-  local u sources="$1 https://ghfast.top/$1 https://gh-proxy.com/$1"
-  [ "$CHINA" = 1 ] && sources="https://ghfast.top/$1 https://gh-proxy.com/$1 $1"
-  for u in $sources; do
+  local p u
+  for p in $PREFIXES; do
+    u=$1
+    [ "$p" = direct ] || u="$p$1"
     curl -fsSL --retry 2 --connect-timeout 15 --speed-limit 20000 --speed-time 20 -o "$2" "$u" && return 0
   done
   return 1
@@ -123,6 +170,7 @@ install_bundle() {
   elif [ -n "$SOURCE" ]; then
     file=$SOURCE
   else
+    race_sources
     if [ -n "$VERSION" ]; then
       tag="v${VERSION#v}"
       gh_fetch "https://github.com/$REPO/releases/download/$tag/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null || rm -f "$tmp/SHA256SUMS"
@@ -252,6 +300,12 @@ exec "$NODE" --no-warnings "$DIR/current/apps/hostd/src/cli.ts" "\$@"
 EOF
 chmod 755 "$CMD"
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not on your PATH: add  export PATH=\"$BIN_DIR:\$PATH\"  to your shell profile" ;; esac
+
+# The agents come from herdr: without it this computer comes online with none.
+missing=""
+for tool in herdr hc; do have "$tool" || [ -x "$BIN_DIR/$tool" ] || missing="$missing $tool"; done
+[ -z "$missing" ] || warn "not installed yet:$missing. Install herdr (it provides hc) first, then your agents show up"
+have uniflo || warn "optional: Uniflo is not installed; install and start it to see full conversation history"
 
 # Register unless this computer already is (with the same relay).
 config="${HERDR_POCKET_HOME:-$HOME/.config/herdr-pocket}/hostd.json"

@@ -322,6 +322,38 @@ test("a setup the service refuses ends the call with a reason", async () => {
   assert.equal(err.data.message, "语音会话配置失败（invalid_value）");
 });
 
+test("a fast stream of caption pieces reaches the phone paced, newest text only, and nothing stale after the final caption", async () => {
+  const phone = await pair("viewer", "CaptionPacePhone");
+  const upstream = new Promise<Sock>((resolve) => rt.once("connection", (ws) => resolve(new Sock(ws))));
+  const call = await Sock.open("/v1/assistant/live", phone.token);
+  const up = await upstream;
+  await up.next((f) => f.type === "session.update");
+  up.send({ type: "session.updated", session: {} });
+  await call.next((f) => f.action === "relay.state" && f.data.state === "ready");
+
+  const updates = () => call.frames.filter((f) => f.action === "output.transcript.updated" && f.data.run_id === "a_pace");
+  up.send({ type: "response.created", response: { id: "resp_pace", status: "in_progress" } });
+  up.send({ type: "response.output_audio.delta", response_id: "resp_pace", item_id: "a_pace", delta: pcm(240, 200).toString("base64") });
+  const pieces = Array.from("五个在跑：小吹提醒那边在查页面简陋、功能没做完的事；模型渠道在查出图上游还有哪些模型。");
+  for (const ch of pieces) up.send({ type: "response.output_audio_transcript.delta", response_id: "resp_pace", item_id: "a_pace", delta: ch });
+  await sleep(80);
+  // The first piece shows at once; the rest wait for the pacing window instead of one frame each.
+  assert.equal(updates().length, 1);
+  await sleep(250);
+  assert.equal(updates().length, 2);
+  assert.equal(updates().at(-1)!.data.text, pieces.join(""));
+
+  // More pieces, then the final caption at once: the waiting update is dropped, not sent after it.
+  up.send({ type: "response.output_audio_transcript.delta", response_id: "resp_pace", item_id: "a_pace", delta: "创作平台" });
+  up.send({ type: "response.output_audio_transcript.delta", response_id: "resp_pace", item_id: "a_pace", delta: "在整理需求。" });
+  up.send({ type: "response.output_audio_transcript.done", response_id: "resp_pace", item_id: "a_pace", transcript: `${pieces.join("")}创作平台在整理需求。` });
+  await sleep(300);
+  const captions = call.frames.filter((f) => (f.action === "output.transcript.updated" || f.action === "output.transcript.done") && f.data.run_id === "a_pace");
+  assert.equal(captions.at(-1)!.action, "output.transcript.done");
+  assert.ok(updates().length <= 3, `got ${updates().length} caption updates`);
+  call.ws.close();
+});
+
 test("voice catalog endpoint lists selectable voices per provider", async () => {
   const phone = await pair("viewer", "VoiceCatalogPhone");
   const openai = await api("/v1/assistant/config/voices?provider=openai-realtime", { token: phone.token });

@@ -6,30 +6,10 @@ import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, posix, win32 } from "node:path";
+import { IS_WINDOWS, appData, localAppData, type Env } from "@herdr-pocket/update";
 
-export const IS_WINDOWS = process.platform === "win32";
-
-type Env = Record<string, string | undefined>;
-
-function appData(env: Env, home: string): string {
-  return env.APPDATA || win32.join(home, "AppData", "Roaming");
-}
-
-export function localAppData(env: Env = process.env, home = homedir()): string {
-  return env.LOCALAPPDATA || win32.join(home, "AppData", "Local");
-}
-
-/** Settings and the device token (hostd.json). */
-export function configDir(env: Env = process.env, windows = IS_WINDOWS, home = homedir()): string {
-  if (env.HERDR_POCKET_HOME) return env.HERDR_POCKET_HOME;
-  return windows ? win32.join(appData(env, home), "herdr-pocket") : posix.join(home, ".config", "herdr-pocket");
-}
-
-/** Things this computer keeps but never syncs: received pictures, the Windows service log. */
-export function stateDir(env: Env = process.env, windows = IS_WINDOWS, home = homedir()): string {
-  if (env.HERDR_POCKET_STATE) return env.HERDR_POCKET_STATE;
-  return windows ? win32.join(localAppData(env, home), "herdr-pocket") : posix.join(home, ".local", "state", "herdr-pocket");
-}
+// The folders live in the updater package, which the CLI and the updater share (one rule for both).
+export { IS_WINDOWS, configDir, localAppData, stateDir } from "@herdr-pocket/update";
 
 /**
  * The daemon's local control channel: a socket in the config folder, or on Windows a

@@ -437,7 +437,8 @@ export class Assistant {
         occasion: "text",
         onDraft: (text, steps) => this.put({ id: draftId, ts: this.now(), role: "assistant", text, steps, via: "text" }),
       });
-      const said = filterTalk(run.text) || "这句我没接住，你再说一遍？";
+      const said = filterTalk(run.text);
+      if (!said) throw new Error("model returned no displayable answer");
       this.put({ id: draftId, ts: this.now(), role: "assistant", text: said, steps: run.steps, via: "text" });
       this.event({
         kind: "assistant.turn",
@@ -447,7 +448,7 @@ export class Assistant {
     } catch (e) {
       // The raw error is for the log, not for the bubble.
       this.event({ kind: "assistant.turn", level: "error", msg: `text from ${who} failed after ${Date.now() - t0}ms: ${(e as Error).message.slice(0, 200)}`, data: { asked: clip(oneLine(asked), 200) } });
-      this.put({ id: draftId, ts: this.now(), role: "assistant", text: "刚才没成，模型那边没回我。再说一次试试。", error: true });
+      this.put({ id: draftId, ts: this.now(), role: "assistant", text: "你的消息收到了，但这次模型没能给出答复。", error: true });
     } finally {
       this.setBusy(false);
     }
@@ -498,7 +499,8 @@ export class Assistant {
       else if (it.action) pushAssistant(out, `${it.text ? `${it.text}\n` : ""}[操作 ${it.action.id}：${it.action.summary}；状态：${actionState(it.action.state)}${it.action.result ? `，${it.action.result}` : ""}]`);
       else if (it.text) pushAssistant(out, it.steps?.length ? `[已查：${it.steps.join("；")}]\n${it.text}` : it.text);
     }
-    while (out.length && out[0]!.role !== "user") out.shift();
+    // Some providers require a user message first. Keep leading notices in the assistant role.
+    if (out[0]?.role === "assistant") out.unshift({ role: "user", content: "[以下是此前的聊天记录。]" });
     if (!out.length) out.push({ role: "user", content: "你好" });
     return out;
   }
@@ -509,7 +511,8 @@ export class Assistant {
     if (!n) return `（我主动告诉过你）${it.text}`;
     const a = n.agent ? this.host.agents().find((x) => x.key === n.agent) : undefined;
     const handle = a ? this.handleOf(a) : n.title.split(" · ")[0];
-    return n.agent ? `（我主动告诉过你，关于 ${handle}，key=${n.agent}）${n.body || it.text}` : `（我主动告诉过你）${n.body || it.text}`;
+    const content = [n.body, n.details].filter(Boolean).join("\n") || it.text;
+    return n.agent ? `（我主动告诉过你，关于 ${handle}，key=${n.agent}）${content}` : `（我主动告诉过你）${content}`;
   }
 
   private async run(

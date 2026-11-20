@@ -1,11 +1,12 @@
 import { useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import { Button, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { router } from "expo-router";
 import * as Haptics from "expo-haptics";
 import { parseJoinLink, parsePairLink } from "@herdr-pocket/protocol";
 import { EmptyState, PageBackground } from "../components/ui";
+import { PocketButton } from "../components/pocket";
 import { usePalette } from "../theme/theme";
 import { radius, space } from "../theme/tokens";
 import { markScannedInvite } from "../lib/session";
@@ -25,9 +26,9 @@ export default function ScanScreen() {
           title="需要用一下相机"
           body="只用来扫二维码，不会拍照或录像。"
           action={
-            <Button mode="contained" onPress={requestPermission} style={{ borderRadius: radius.pill }}>
+            <PocketButton onPress={requestPermission}>
               允许使用相机
-            </Button>
+            </PocketButton>
           }
         />
       </PageBackground>

@@ -9,6 +9,10 @@ import { after, before, describe, test } from "node:test";
 import { allReleaseSources, inMainlandChina, releaseFromSums, releaseSources } from "@herdr-pocket/protocol";
 import { ASSETS, compareVersions, fileMentions, findLayout, latestRelease, linkTarget, readVersion, rollback, setLink, sourcesFor, sumFor, update } from "../src/index.ts";
 
+// Never read or write this machine's own config.json or remembered download source.
+process.env.HERDR_POCKET_HOME = mkdtempSync(join(tmpdir(), "hp-home-"));
+process.env.HERDR_POCKET_STATE = mkdtempSync(join(tmpdir(), "hp-state-"));
+
 /** Windows' own tar (bsdtar): Git's GNU tar on PATH reads `C:` in paths as a remote host. */
 const TAR = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
 

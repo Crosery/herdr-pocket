@@ -499,7 +499,11 @@ export interface RpcMethods {
   };
   "host.info": {
     params: Record<string, never>;
-    result: { name: string; platform: string; sources: AgentSource[]; version: string; hcVersion?: string };
+    /**
+     * `tools`: versions of the programs this host works with (see HostTools). `files`: this host
+     * answers `files.list` / `files.read`.
+     */
+    result: { name: string; platform: string; sources: AgentSource[]; version: string; hcVersion?: string; tools?: HostTools; files?: boolean };
   };
   /**
    * The person looked at this agent: a finished turn stops counting as "done"
@@ -544,7 +548,126 @@ export interface RpcMethods {
    * `unsupported`.
    */
   "harness.icons": { params: { ids: string[] }; result: { icons: Record<string, string> } };
+  /**
+   * Read-only file view of the agent's working folder (its `cwd`). `path` is relative to that
+   * folder, "/"-separated; "" (or none) is the folder itself. Nothing outside it is listed or read,
+   * symlinks included. Heavy generated folders (`FILES_IGNORED`) are listed with `ignored: true`
+   * only when `all` is set; dot files only with `hidden`. Folders first, then by name; at most
+   * `limit` entries (default `FILES_LIMITS.list`, max `FILES_LIMITS.listMax`). Older hosts answer
+   * `unsupported`; `not_found` when the agent has no working folder or the path is not there.
+   */
+  "files.list": {
+    params: { agent: string; path?: string; hidden?: boolean; all?: boolean; limit?: number };
+    /** `root`: the working folder as the computer names it (for display only). */
+    result: { root: string; path: string; entries: FileEntry[]; truncated: boolean };
+  };
+  /**
+   * One file of the agent's working folder (same rules as `files.list`). Text comes back as
+   * UTF-8 `text`, at most `maxBytes` (default `FILES_LIMITS.read`, max `FILES_LIMITS.readMax`) from
+   * `offset`, cut on a character boundary. A file with NUL bytes or invalid UTF-8 near its start
+   * is `binary`: no text; a picture (png, jpeg, gif, webp, bmp, ico) up to `FILES_LIMITS.image`
+   * comes as `base64` with its `mime`.
+   */
+  "files.read": {
+    params: { agent: string; path: string; maxBytes?: number; offset?: number };
+    result: {
+      path: string;
+      size: number;
+      mtime: number;
+      binary: boolean;
+      /** More of the file after what was sent; ask again with `offset` + the bytes received. */
+      truncated: boolean;
+      offset: number;
+      /** Bytes of the file this answer covers. */
+      bytes: number;
+      text?: string;
+      base64?: string;
+      mime?: string;
+      /** Highlighting hint from the extension: ts, tsx, py, rs, go, md, json, sh, ... */
+      language?: string;
+    };
+  };
 }
+
+/**
+ * Versions of the programs a host works with (`host.info` `tools`), each as the program itself
+ * says; missing when not installed. `herdr` is the herdr terminal UI, `app` the Herdr desktop app
+ * (dev.herdr.app): two programs with their own version numbers.
+ */
+export interface HostTools {
+  herdr?: string;
+  hc?: string;
+  uniflo?: string;
+  app?: string;
+  /** What hostd's daily check (`update.checkTools`) found upstream. Report only: nothing installs. */
+  latest?: UpstreamLatest;
+}
+
+/**
+ * The newest release each installed program can move to. hc: `core/latest.json` of the Herdr
+ * release server, only when its `generation` is the installed core's (`hc update` stays within a
+ * generation). app: `app/latest.json`. uniflo: `uniflo update --check`. A key is missing when that
+ * program is not installed or did not answer yet; an older answer is kept while offline.
+ */
+export interface UpstreamLatest {
+  hc?: string;
+  app?: string;
+  uniflo?: string;
+  /** When a check last got an answer (ms since epoch). */
+  checkedAt?: number;
+}
+
+/** One entry of `files.list`. */
+export interface FileEntry {
+  name: string;
+  /** Relative to the agent's working folder, "/"-separated: what `files.list` / `files.read` take. */
+  path: string;
+  /** `link`: a symlink that leads outside the folder or nowhere; it is not followed. */
+  kind: "file" | "dir" | "link";
+  /** Bytes, for files. */
+  size?: number;
+  /** Last change, epoch ms. */
+  mtime?: number;
+  /** A symlink to something inside the folder (followed; `kind` is what it points to). */
+  symlink?: boolean;
+  hidden?: boolean;
+  /** One of `FILES_IGNORED` (only listed with `all`). */
+  ignored?: boolean;
+  /** May hold keys (.env, .ssh, *.pem, ...): listed, but `files.read` and `files.list` refuse it (`forbidden`). */
+  private?: boolean;
+}
+
+/** Folders `files.list` leaves out unless asked: dependencies, VCS data, build output and caches. */
+export const FILES_IGNORED: readonly string[] = [
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  ".pnpm-store",
+  "bower_components",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".tox",
+  "target",
+  "dist",
+  "build",
+  ".next",
+  ".nuxt",
+  ".turbo",
+  ".cache",
+  ".gradle",
+  ".idea",
+  "Pods",
+  "DerivedData",
+  "coverage",
+];
+
+/** Sizes in entries and bytes. */
+export const FILES_LIMITS = { list: 500, listMax: 2000, read: 256 * 1024, readMax: 1024 * 1024, image: 1024 * 1024 } as const;
 
 export const HARNESS_ICON_MAX = 40;
 
@@ -914,6 +1037,42 @@ export interface ClientLogEntry {
   data?: Record<string, unknown>;
 }
 
+// Dictation (speech to text on the relay, for quick voice input on computers)
+//
+// GET  /v1/transcribe  (viewer)  -> TranscribeInfo   (whether the relay can do it, with which service)
+// POST /v1/transcribe  (viewer)  body: the recording, raw, with its Content-Type (one of
+//      TRANSCRIBE_FORMATS); query ?language=zh|en|auto&durationMs=<length the client measured>
+//      -> TranscribeResult.  400 empty or wrong type, 413 over TRANSCRIBE_LIMITS.maxBytes,
+//      429 over the per-device rate, 503 `unsupported` when no speech-to-text service is set up,
+//      502/504 when the service failed or did not answer. The relay keeps neither audio nor text.
+
+/** Audio types POST /v1/transcribe takes. */
+export const TRANSCRIBE_FORMATS: readonly string[] = ["audio/webm", "audio/ogg", "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp4", "audio/m4a", "audio/x-m4a", "audio/flac"];
+
+/** Per request and per device. */
+export const TRANSCRIBE_LIMITS = { maxBytes: 10 * 1024 * 1024, maxSeconds: 300, perMinute: 20, concurrent: 2 } as const;
+
+export interface TranscribeInfo {
+  available: boolean;
+  /** Service id (a provider id of the relay's settings), never a key or address. */
+  provider?: string;
+  model?: string;
+  /** Why it is not available, in Chinese for the settings screen. */
+  reason?: string;
+  maxBytes: number;
+  maxSeconds: number;
+  formats: readonly string[];
+}
+
+export interface TranscribeResult {
+  text: string;
+  provider: string;
+  model: string;
+  /** Time the service took. */
+  ms: number;
+  language?: string;
+}
+
 /** A stored log line, as GET /v1/logs returns it. */
 export interface LogEntry extends ClientLogEntry {
   id: number;
@@ -1270,6 +1429,11 @@ export interface PairRequest {
   name: string;
   kind: DeviceKind;
   platform?: string;
+  /**
+   * How the code reached this device, for the relay's log only: `local-login` (the desktop app
+   * asked this computer's logged-in herdr-pocket for it), `qr`, `link`, `typed`, `setup`, `cli`.
+   */
+  via?: string;
 }
 
 export interface PairResponse {
@@ -1510,6 +1674,480 @@ export function compareVersions(a: string, b: string): number {
   if (y.pre === undefined) return -1;
   // Numbers inside pre-release tags compare as numbers: rc.10 is after rc.9.
   return x.pre.localeCompare(y.pre, "en", { numeric: true });
+}
+
+// ---------------------------------------------------------------------------
+// Regions and download sources. Pure functions: the CLI, the host daemon, the install
+// scripts and the desktop app make the same decision from the same inputs.
+// ---------------------------------------------------------------------------
+
+/** `cn`: mainland China, where GitHub is slow or cut, so mirrors go first. `global`: everywhere else. */
+export type Region = "cn" | "global";
+/** The `update.region` setting: `auto` decides from the time zone. */
+export type RegionSetting = "auto" | Region;
+
+export interface RegionDecision {
+  region: Region;
+  /** What decided it: HERDR_POCKET_MIRROR, the config file, the IANA zone, UTC+8 with a zh-CN locale, or nothing matched. */
+  reason: "env" | "config" | "time-zone" | "locale-offset" | "default";
+  /** The zone that was looked at ("" when the runtime does not say). */
+  timeZone: string;
+}
+
+/** HERDR_POCKET_MIRROR: `1`/`true`/`on`/`yes`/`cn` mean mirrors first, `0`/`false`/`off`/`no`/`global` GitHub first. */
+export function regionFromEnv(value: string | undefined): Region | undefined {
+  const v = (value ?? "").trim();
+  if (/^(1|true|on|yes|cn)$/i.test(v)) return "cn";
+  if (/^(0|false|off|no|global)$/i.test(v)) return "global";
+  return undefined;
+}
+
+/**
+ * Which region this device downloads as. Order: the environment variable, then the config
+ * file's `update.region` (unless `auto`), then the time zone (same rule as `inMainlandChina`).
+ * Pass `timeZone`/`locale`/`utcOffsetMinutes` in tests; omitted ones come from the runtime.
+ */
+export function decideRegion(o: { env?: string; setting?: RegionSetting | string; timeZone?: string; locale?: string; utcOffsetMinutes?: number } = {}): RegionDecision {
+  const tz = o.timeZone ?? localTimeZone();
+  const fromEnv = regionFromEnv(o.env);
+  if (fromEnv) return { region: fromEnv, reason: "env", timeZone: tz };
+  if (o.setting === "cn" || o.setting === "global") return { region: o.setting, reason: "config", timeZone: tz };
+  if (CHINA_TIME_ZONES.has(tz)) return { region: "cn", reason: "time-zone", timeZone: tz };
+  if (inMainlandChina(tz, o.locale ?? (o.timeZone === undefined ? localLocale() : ""), o.utcOffsetMinutes ?? (o.timeZone === undefined ? -new Date().getTimezoneOffset() : 0))) {
+    return { region: "cn", reason: "locale-offset", timeZone: tz };
+  }
+  return { region: "global", reason: "default", timeZone: tz };
+}
+
+/** GitHub itself, in a list of source prefixes (a mirror is a prefix put in front of a github.com URL). */
+export const DIRECT_SOURCE = "";
+/** Each source's probe gets this long; the race is over once one answers. */
+export const SOURCE_PROBE_TIMEOUT_MS = 4000;
+/** A source within this much of the fastest counts as fast; the earlier one in region order wins then. */
+export const SOURCE_PROBE_SLACK_MS = 150;
+/** How long the winner of a race is used before the next race. */
+export const SOURCE_CACHE_TTL_MS = 24 * 3600_000;
+
+/** A mirror prefix as `update.mirrors` takes it: https (plain http only on this machine), ending in "/". */
+export function isMirrorPrefix(s: string): boolean {
+  return /^(?:https:\/\/[A-Za-z0-9.-]+|http:\/\/(?:localhost|127\.0\.0\.1))(?::\d+)?(?:\/[^\s?#]*)?\/$/.test(s);
+}
+
+/**
+ * Sources to try for a GitHub release file, best first: the person's own mirrors, then in
+ * mainland China the built-in mirrors before GitHub, elsewhere GitHub before them.
+ */
+export function sourcePrefixes(region: Region, extra: readonly string[] = []): string[] {
+  const own = [...new Set(extra.filter(isMirrorPrefix))];
+  const builtIn = [...RELEASE_MIRRORS, ...RELEASE_EXTRA_MIRRORS].filter((m) => !own.includes(m));
+  return region === "cn" ? [...own, ...builtIn, DIRECT_SOURCE] : [...own, DIRECT_SOURCE, ...builtIn];
+}
+
+/** A github.com URL through a source prefix. */
+export function sourceUrl(prefix: string, githubUrl: string): string {
+  return prefix + githubUrl;
+}
+
+/** Short name of a source for logs and settings screens: `github.com` or the mirror's host. */
+export function sourceLabel(prefix: string): string {
+  if (!prefix) return "github.com";
+  try {
+    return new URL(prefix).host;
+  } catch {
+    return prefix;
+  }
+}
+
+/** One source's answer in a race. `ms` is the time to a usable answer (or to the failure). */
+export interface SourceProbe {
+  source: string;
+  ok: boolean;
+  ms: number;
+  error?: string;
+}
+
+/**
+ * The winner of a race: the fastest source that answered, except that one earlier in
+ * `order` wins when it was at most `slackMs` slower (GitHub itself over a mirror elsewhere,
+ * a mirror over GitHub in mainland China). Undefined when none answered.
+ */
+export function pickFastest(probes: readonly SourceProbe[], order: readonly string[], slackMs = SOURCE_PROBE_SLACK_MS): string | undefined {
+  const ok = probes.filter((p) => p.ok);
+  if (!ok.length) return undefined;
+  const best = Math.min(...ok.map((p) => p.ms));
+  const rank = (s: string) => {
+    const i = order.indexOf(s);
+    return i < 0 ? order.length : i;
+  };
+  return ok.filter((p) => p.ms <= best + slackMs).sort((a, b) => rank(a.source) - rank(b.source) || a.ms - b.ms)[0]!.source;
+}
+
+/** `order` with `winner` moved to the front: the ordered fallback after a race. */
+export function withWinnerFirst(order: readonly string[], winner: string | undefined): string[] {
+  return winner === undefined || !order.includes(winner) ? [...order] : [winner, ...order.filter((s) => s !== winner)];
+}
+
+/** What a device remembers about its last race (the host keeps it in its state folder as `sources.json`). */
+export interface SourceCache {
+  region: Region;
+  winner: string;
+  /** When the race was run (epoch ms). */
+  at: number;
+  probes?: SourceProbe[];
+}
+
+/** The remembered winner, while it is fresh, for the same region and still one of `order`'s sources. */
+export function cachedWinner(cache: unknown, region: Region, order: readonly string[], now = Date.now(), ttlMs = SOURCE_CACHE_TTL_MS): string | undefined {
+  if (!cache || typeof cache !== "object") return undefined;
+  const c = cache as Partial<SourceCache>;
+  if (c.region !== region || typeof c.winner !== "string" || typeof c.at !== "number") return undefined;
+  if (now - c.at < 0 || now - c.at >= ttlMs || !order.includes(c.winner)) return undefined;
+  return c.winner;
+}
+
+/** `ms` moved by up to ±`fraction` at random, so many devices do not ask at the same moment. */
+export function withJitter(ms: number, fraction = 0.1, rand: () => number = Math.random): number {
+  return Math.max(0, Math.round(ms * (1 - fraction + 2 * fraction * rand())));
+}
+
+/** Low-frequency update checks: the first a few minutes after start, then every `hours` (6–168), both jittered. */
+export function updateCheckDelays(hours: number, rand: () => number = Math.random): { firstMs: number; everyMs: number } {
+  const h = Math.min(168, Math.max(6, Number.isFinite(hours) ? hours : 24));
+  return { firstMs: 60_000 + Math.round(rand() * 240_000), everyMs: withJitter(h * 3600_000, 0.1, rand) };
+}
+
+// ---------------------------------------------------------------------------
+// Client config file: one user-level file shared by the CLI (`herdr-pocket config`) and
+// the desktop app. docs/config.md documents every key.
+// ---------------------------------------------------------------------------
+
+/**
+ * `config.json` in the config folder, next to hostd.json: `~/.config/herdr-pocket/config.json`,
+ * `%APPDATA%\herdr-pocket\config.json` on Windows, `$HERDR_POCKET_HOME/config.json` when that is set.
+ * Plain JSON (no comments), UTF-8. Never secrets: tokens stay in hostd.json and the desktop's
+ * session file. Every key is optional; a missing or invalid value means its default. Writers change
+ * only the keys they set, keep keys they do not know (a newer client's), and always write `version`.
+ */
+export const CLIENT_CONFIG_FILE = "config.json";
+export const CLIENT_CONFIG_VERSION = 1;
+
+export interface ClientConfig {
+  version: number;
+  general: {
+    language: "zh-CN" | "en";
+    theme: "system" | "light" | "dark";
+    textScale: number;
+    showShells: boolean;
+    useLocalLogin: boolean;
+    launchAtLogin: boolean;
+    closeToTray: boolean;
+    notifications: boolean;
+  };
+  update: {
+    region: RegionSetting;
+    autoCheck: boolean;
+    checkIntervalHours: number;
+    mirrors: string[];
+    checkTools: boolean;
+  };
+  logging: {
+    level: LogLevel;
+    upload: boolean;
+    keepDays: number;
+  };
+  voiceInput: {
+    enabled: boolean;
+    hotkey: string;
+    mode: "hold" | "toggle";
+    language: string;
+    insert: "paste" | "type" | "clipboard";
+    maxSeconds: number;
+    sounds: boolean;
+    denoise: boolean;
+  };
+  browser: {
+    homePage: string;
+    searchEngine: "bing" | "google" | "baidu" | "duckduckgo";
+    cookieImport: "ask" | "off";
+    clearOnExit: boolean;
+  };
+  files: {
+    showHidden: boolean;
+    showIgnored: boolean;
+  };
+  resources: {
+    lowPower: "auto" | "on" | "off";
+    memoryWarnMb: number;
+    diskWarnGb: number;
+  };
+}
+
+export type ConfigValue = boolean | number | string | string[];
+/** Who reads a key: the `herdr-pocket` CLI, its daemon, the desktop app. */
+export type ConfigReader = "cli" | "hostd" | "desktop";
+
+export interface ConfigKeySpec {
+  /** `section.name`. */
+  key: string;
+  type: "boolean" | "integer" | "enum" | "string" | "list";
+  default: ConfigValue;
+  values?: readonly string[];
+  min?: number;
+  max?: number;
+  /** Extra check of a string (or of each list item). */
+  format?: "url" | "mirror" | "hotkey" | "language";
+  /** The programs that read the key. Empty: reserved, kept valid but read by nothing yet. */
+  usedBy: readonly ConfigReader[];
+  /** Label for settings screens (Chinese, like the rest of the UI). */
+  label: string;
+  /** One line in English; docs/config.md has the details. */
+  doc: string;
+  /** Environment variable that wins over the file, if any. */
+  env?: string;
+}
+
+const D: readonly ConfigReader[] = ["desktop"];
+const ALL: readonly ConfigReader[] = ["cli", "hostd", "desktop"];
+
+/** Every key of the file, in display order. */
+export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
+  { key: "general.language", type: "enum", values: ["zh-CN", "en"], default: "zh-CN", usedBy: D, label: "界面语言", doc: "Language of the desktop app." },
+  { key: "general.theme", type: "enum", values: ["system", "light", "dark"], default: "system", usedBy: D, label: "外观", doc: "Light, dark, or follow the system." },
+  { key: "general.textScale", type: "integer", min: 80, max: 160, default: 100, usedBy: D, label: "文字大小（%）", doc: "Text size of the desktop app in percent." },
+  { key: "general.showShells", type: "boolean", default: false, usedBy: D, label: "显示普通终端", doc: "List plain shells beside the agents." },
+  { key: "general.useLocalLogin", type: "boolean", default: true, usedBy: D, label: "使用本机 herdr-pocket 的登录", doc: "When this computer's herdr-pocket is logged in (hostd.json), the desktop app joins the same relay with it." },
+  { key: "general.launchAtLogin", type: "boolean", default: false, usedBy: D, label: "开机时启动", doc: "Start the desktop app when you log in." },
+  { key: "general.closeToTray", type: "boolean", default: false, usedBy: D, label: "关闭窗口后留在托盘", doc: "Closing the window keeps the app in the menu bar / tray. Off by default: closing the window quits the app." },
+  { key: "general.notifications", type: "boolean", default: true, usedBy: D, label: "系统通知", doc: "System notifications when an agent finishes or waits." },
+  { key: "update.region", type: "enum", values: ["auto", "cn", "global"], default: "auto", usedBy: ALL, label: "下载线路", doc: "auto: by time zone. cn: mirrors first. global: GitHub first.", env: "HERDR_POCKET_MIRROR" },
+  { key: "update.autoCheck", type: "boolean", default: true, usedBy: ALL, label: "自动检查更新", doc: "Look for a new release now and then.", env: "HERDR_POCKET_UPDATE_CHECK" },
+  { key: "update.checkIntervalHours", type: "integer", min: 6, max: 168, default: 24, usedBy: ALL, label: "检查间隔（小时）", doc: "Hours between automatic checks (jittered by ±10%)." },
+  { key: "update.mirrors", type: "list", format: "mirror", default: [], usedBy: ALL, label: "自定义镜像", doc: "Your own GitHub mirror prefixes (https://…/), raced before the built-in ones." },
+  { key: "update.checkTools", type: "boolean", default: true, usedBy: ["hostd"], label: "检查 hc、Herdr、uniflo 新版本", doc: "Once a day, look for newer hc, Herdr app and uniflo releases (report only; needs update.autoCheck)." },
+  { key: "logging.level", type: "enum", values: ["debug", "info", "warn", "error"], default: "info", usedBy: ALL, label: "日志级别", doc: "Lowest level written and uploaded." },
+  { key: "logging.upload", type: "boolean", default: true, usedBy: ["hostd", "desktop"], label: "上传日志到中转服务", doc: "Send this device's log lines to the relay (`herdr-pocket logs` reads them)." },
+  { key: "logging.keepDays", type: "integer", min: 1, max: 90, default: 7, usedBy: D, label: "本地日志保留天数", doc: "Days of local log files the desktop app keeps." },
+  { key: "voiceInput.enabled", type: "boolean", default: true, usedBy: D, label: "语音输入", doc: "Dictation with a global shortcut." },
+  { key: "voiceInput.hotkey", type: "string", format: "hotkey", default: "CommandOrControl+Shift+Space", usedBy: D, label: "语音输入快捷键", doc: "A shortcut with at least one modifier (Tauri accelerator syntax), or one modifier key alone (RightOption, RightControl, RightCommand, RightShift, Fn) held to talk." },
+  { key: "voiceInput.mode", type: "enum", values: ["hold", "toggle"], default: "hold", usedBy: D, label: "说话方式", doc: "hold: talk while the shortcut is held. toggle: press once to start, again to stop." },
+  { key: "voiceInput.language", type: "string", format: "language", default: "auto", usedBy: D, label: "识别语言", doc: "auto, or a language code such as zh or en." },
+  { key: "voiceInput.insert", type: "enum", values: ["paste", "type", "clipboard"], default: "paste", usedBy: D, label: "识别结果", doc: "paste: into the focused app. type: typed key by key. clipboard: only copied." },
+  { key: "voiceInput.maxSeconds", type: "integer", min: 5, max: 300, default: 60, usedBy: D, label: "单次最长（秒）", doc: "A recording stops after this long." },
+  { key: "voiceInput.sounds", type: "boolean", default: true, usedBy: D, label: "提示音", doc: "A short sound when recording starts and stops." },
+  // Reserved: nothing reads it yet (the desktop app's call noise suppression is its own setting).
+  { key: "voiceInput.denoise", type: "boolean", default: true, usedBy: [], label: "降噪", doc: "Reserved for noise suppression on the microphone; nothing reads it yet." },
+  { key: "browser.homePage", type: "string", format: "url", default: "", usedBy: D, label: "内置浏览器主页", doc: "Page a new browser tab opens; empty for a blank tab." },
+  { key: "browser.searchEngine", type: "enum", values: ["bing", "google", "baidu", "duckduckgo"], default: "bing", usedBy: D, label: "搜索引擎", doc: "Used for words typed into the address bar." },
+  { key: "browser.cookieImport", type: "enum", values: ["ask", "off"], default: "ask", usedBy: D, label: "从其他浏览器导入 Cookie", doc: "ask: offer it (each import asks first). off: never read other browsers' cookies." },
+  { key: "browser.clearOnExit", type: "boolean", default: false, usedBy: D, label: "退出时清除浏览数据", doc: "Drop the built-in browser's cookies and cache on quit." },
+  { key: "files.showHidden", type: "boolean", default: false, usedBy: D, label: "显示隐藏文件", doc: "List dot files in the file view." },
+  { key: "files.showIgnored", type: "boolean", default: false, usedBy: D, label: "显示 node_modules 等目录", doc: "List heavy generated folders (node_modules, .git, dist, …)." },
+  { key: "resources.lowPower", type: "enum", values: ["auto", "on", "off"], default: "auto", usedBy: D, label: "省电模式", doc: "auto: on battery. on: always. Slower polling, fewer animations." },
+  { key: "resources.memoryWarnMb", type: "integer", min: 256, max: 16384, default: 1024, usedBy: D, label: "内存提醒（MB）", doc: "Warn when the desktop app uses more memory than this." },
+  { key: "resources.diskWarnGb", type: "integer", min: 1, max: 1000, default: 5, usedBy: D, label: "磁盘空间提醒（GB）", doc: "Warn when free disk space falls below this." },
+];
+
+/** The file's sections, in order. */
+export const CLIENT_CONFIG_SECTIONS = ["general", "update", "logging", "voiceInput", "browser", "files", "resources"] as const;
+
+export interface ConfigProblem {
+  /** `section.name`, a section, or "" for the whole file. */
+  key: string;
+  level: "warn" | "error";
+  message: string;
+}
+
+export function configKeySpec(key: string): ConfigKeySpec | undefined {
+  return CLIENT_CONFIG_KEYS.find((s) => s.key === key);
+}
+
+export function defaultClientConfig(): ClientConfig {
+  const out: Record<string, unknown> = { version: CLIENT_CONFIG_VERSION };
+  for (const s of CLIENT_CONFIG_SECTIONS) out[s] = {};
+  for (const spec of CLIENT_CONFIG_KEYS) {
+    const [section, name] = spec.key.split(".") as [string, string];
+    (out[section] as Record<string, unknown>)[name] = Array.isArray(spec.default) ? [...spec.default] : spec.default;
+  }
+  return out as unknown as ClientConfig;
+}
+
+/**
+ * Modifier keys that work alone as a hold-to-talk key (Typeless / Doubao style). RightCommand and Fn
+ * exist on macOS only; the file is per machine, so any OS takes them and the desktop app refuses
+ * what its OS cannot register.
+ */
+export const HOTKEY_SOLO_KEYS: readonly string[] = ["RightOption", "RightControl", "RightCommand", "RightShift", "Fn"];
+const HOTKEY_SOLO_ALIASES: Record<string, string> = {
+  rightoption: "RightOption",
+  rightalt: "RightOption",
+  rightcontrol: "RightControl",
+  rightctrl: "RightControl",
+  rightcommand: "RightCommand",
+  rightshift: "RightShift",
+  fn: "Fn",
+};
+
+/** A hotkey as stored: a modifier key alone under its one name (RightAlt -> RightOption), a shortcut without spaces around "+". */
+export function normalizeHotkey(v: string): string {
+  const t = v.trim();
+  return HOTKEY_SOLO_ALIASES[t.toLowerCase()] ?? t.split("+").map((p) => p.trim()).join("+");
+}
+
+/** A value as it is stored: aliases replaced by their one name (only hotkeys have any). */
+export function normalizeConfigValue(spec: ConfigKeySpec, value: ConfigValue): ConfigValue {
+  return spec.format === "hotkey" && typeof value === "string" ? normalizeHotkey(value) : value;
+}
+
+const HOTKEY_MODIFIER = /^(CommandOrControl|CmdOrCtrl|CmdOrControl|Command|Cmd|Control|Ctrl|Alt|Option|AltGr|Shift|Super|Meta)$/i;
+const HOTKEY_KEY = /^([A-Z0-9]|F([1-9]|1[0-9]|2[0-4])|Space|Enter|Return|Tab|Backspace|Delete|Escape|Esc|Insert|Home|End|PageUp|PageDown|Up|Down|Left|Right|Plus|Minus|Equal|Comma|Period|Slash|Backslash|Semicolon|Quote|Backquote|BracketLeft|BracketRight|Key[A-Z]|Digit[0-9])$/i;
+
+function formatError(format: ConfigKeySpec["format"], v: string): string | undefined {
+  switch (format) {
+    case "url":
+      return v === "" || /^https?:\/\/\S+$/i.test(v) ? undefined : "needs an http(s):// address or nothing";
+    case "mirror":
+      return isMirrorPrefix(v) ? undefined : `${JSON.stringify(v)} is not a mirror prefix like https://mirror.example.com/`;
+    case "language":
+      return v === "auto" || /^[a-z]{2,3}(-[A-Za-z]{2,4})?$/.test(v) ? undefined : "needs auto or a language code such as zh or en";
+    case "hotkey": {
+      if (HOTKEY_SOLO_KEYS.includes(normalizeHotkey(v))) return undefined;
+      const parts = v.split("+").map((p) => p.trim());
+      const key = parts.pop() ?? "";
+      if (!parts.length || !parts.every((p) => HOTKEY_MODIFIER.test(p)) || !HOTKEY_KEY.test(key)) {
+        return "needs a shortcut with a modifier (CommandOrControl+Shift+Space) or one modifier key alone (RightOption, RightControl, RightCommand, RightShift, Fn)";
+      }
+      return undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** Why `value` cannot be stored under `spec`, or undefined when it can. */
+export function configValueError(spec: ConfigKeySpec, value: unknown): string | undefined {
+  switch (spec.type) {
+    case "boolean":
+      return typeof value === "boolean" ? undefined : "needs true or false";
+    case "integer":
+      if (typeof value !== "number" || !Number.isInteger(value)) return "needs a whole number";
+      if ((spec.min !== undefined && value < spec.min) || (spec.max !== undefined && value > spec.max)) return `needs ${spec.min}–${spec.max}`;
+      return undefined;
+    case "enum":
+      return typeof value === "string" && spec.values!.includes(value) ? undefined : `needs one of ${spec.values!.join(", ")}`;
+    case "string":
+      if (typeof value !== "string" || value.length > 500) return "needs a short text";
+      return formatError(spec.format, value);
+    case "list":
+      if (!Array.isArray(value) || value.length > 20 || !value.every((x) => typeof x === "string")) return "needs a list of up to 20 texts";
+      for (const x of value as string[]) {
+        const e = formatError(spec.format, x);
+        if (e) return e;
+      }
+      return undefined;
+  }
+}
+
+/** Typed text (the CLI's `config set`) as a value of `key`: true/false/on/off, numbers, comma lists or a JSON array. */
+export function parseConfigText(key: string, text: string): { value: ConfigValue } | { error: string } {
+  const spec = configKeySpec(key);
+  if (!spec) return { error: `unknown key ${key}` };
+  const t = text.trim();
+  let value: unknown = t;
+  if (spec.type === "boolean") value = /^(true|on|yes|1)$/i.test(t) ? true : /^(false|off|no|0)$/i.test(t) ? false : t;
+  else if (spec.type === "integer") value = /^-?\d+$/.test(t) ? Number(t) : t;
+  else if (spec.type === "list") {
+    if (t.startsWith("[")) {
+      try {
+        value = JSON.parse(t);
+      } catch {
+        return { error: "not a JSON array" };
+      }
+    } else value = t ? t.split(",").map((x) => x.trim()).filter(Boolean) : [];
+  } else if (spec.type === "string") value = text;
+  const error = configValueError(spec, value);
+  return error ? { error: `${key} ${error}` } : { value: normalizeConfigValue(spec, value as ConfigValue) };
+}
+
+const SECRET_NAME = /token|secret|password|passwd|api[-_]?key|private[-_]?key|credential/i;
+
+/** Keys anywhere in the file that look like they hold a secret. */
+function secretKeys(v: unknown, at: string, out: string[]): string[] {
+  if (!v || typeof v !== "object" || out.length > 20) return out;
+  for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+    const key = at ? `${at}.${k}` : k;
+    if (SECRET_NAME.test(k)) out.push(key);
+    else secretKeys(x, key, out);
+  }
+  return out;
+}
+
+/** The file's content as typed values: defaults for what is missing or wrong, and what was wrong. Never throws. */
+export function parseClientConfig(raw: unknown): { config: ClientConfig; problems: ConfigProblem[] } {
+  const config = defaultClientConfig() as unknown as Record<string, Record<string, unknown>> & { version: number };
+  const problems: ConfigProblem[] = [];
+  if (raw === undefined || raw === null) return { config: config as unknown as ClientConfig, problems };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    problems.push({ key: "", level: "error", message: "the file is not a JSON object; defaults are used" });
+    return { config: config as unknown as ClientConfig, problems };
+  }
+  const file = raw as Record<string, unknown>;
+  for (const key of secretKeys(file, "", [])) problems.push({ key, level: "error", message: "secrets do not belong in config.json (tokens stay in hostd.json)" });
+  const sections: readonly string[] = CLIENT_CONFIG_SECTIONS;
+  for (const [name, section] of Object.entries(file)) {
+    if (name === "version") {
+      if (typeof section === "number" && Number.isInteger(section) && section >= 1) config.version = section;
+      else problems.push({ key: "version", level: "warn", message: `version should be ${CLIENT_CONFIG_VERSION}` });
+      continue;
+    }
+    if (name === "$schema") continue;
+    if (!sections.includes(name)) {
+      problems.push({ key: name, level: "warn", message: "unknown section, kept as it is" });
+      continue;
+    }
+    if (!section || typeof section !== "object" || Array.isArray(section)) {
+      problems.push({ key: name, level: "error", message: "needs to be an object; defaults are used" });
+      continue;
+    }
+    for (const [k, v] of Object.entries(section as Record<string, unknown>)) {
+      const key = `${name}.${k}`;
+      const spec = configKeySpec(key);
+      if (!spec) {
+        problems.push({ key, level: "warn", message: "unknown key, kept as it is" });
+        continue;
+      }
+      const error = configValueError(spec, v);
+      if (error) problems.push({ key, level: "error", message: `${error}; the default (${JSON.stringify(spec.default)}) is used` });
+      else config[name]![k] = Array.isArray(v) ? [...v] : normalizeConfigValue(spec, v as ConfigValue);
+    }
+  }
+  if (config.version > CLIENT_CONFIG_VERSION) problems.push({ key: "version", level: "warn", message: `written by a newer version (${config.version}); keys this one does not know are kept` });
+  return { config: config as unknown as ClientConfig, problems };
+}
+
+export function getConfigValue(config: ClientConfig, key: string): ConfigValue | undefined {
+  const [section, name] = key.split(".");
+  return (config as unknown as Record<string, Record<string, ConfigValue> | undefined>)[section ?? ""]?.[name ?? ""];
+}
+
+/**
+ * The file's object with one key set (`value`) or removed (undefined: back to the default),
+ * everything else as it was, and `version` written. Validate first (`parseConfigText`, `configValueError`).
+ */
+export function withConfigValue(raw: unknown, key: string, value: ConfigValue | undefined): Record<string, unknown> {
+  const file: Record<string, unknown> = raw && typeof raw === "object" && !Array.isArray(raw) ? structuredClone(raw as Record<string, unknown>) : {};
+  const [section, name] = key.split(".") as [string, string];
+  const spec = configKeySpec(key);
+  if (spec && value !== undefined) value = normalizeConfigValue(spec, value);
+  const v = file.version;
+  const out: Record<string, unknown> = { version: typeof v === "number" && Number.isInteger(v) && v > CLIENT_CONFIG_VERSION ? v : CLIENT_CONFIG_VERSION };
+  for (const [k, x] of Object.entries(file)) if (k !== "version") out[k] = x;
+  const cur = out[section];
+  const sec: Record<string, unknown> = cur && typeof cur === "object" && !Array.isArray(cur) ? { ...(cur as Record<string, unknown>) } : {};
+  if (value === undefined) delete sec[name];
+  else sec[name] = Array.isArray(value) ? [...value] : value;
+  if (Object.keys(sec).length) out[section] = sec;
+  else delete out[section];
+  return out;
 }
 
 // ---------------------------------------------------------------------------

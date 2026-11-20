@@ -1,0 +1,830 @@
+/*
+ * Settings > 小羊助理 > 文字模型 (views/settings/ModelsSection.tsx, ProvidersSection.tsx).
+ * Mirrors the mobile model screen: numbered rail, one action per row, inline panels.
+ * Font sizes follow the text-size setting through --ts (set by App).
+ */
+
+/* Sub-tab bar: labels never break; a narrow window scrolls it sideways (QA U1). */
+.segmented.assistant-tabs {
+  display: flex;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.segmented.assistant-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.segmented.assistant-tabs button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-size: calc(12.5px * var(--ts, 1));
+}
+
+.mm-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+}
+
+.mm-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mm-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.mm-head-title {
+  margin: 0;
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+
+.mm-head-actions,
+.mm-panel-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mm-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: calc(13px * var(--ts, 1));
+  line-height: 1.55;
+}
+
+.mm-note.small {
+  color: var(--faint);
+  font-size: calc(12px * var(--ts, 1));
+}
+
+.mm-card {
+  background: var(--surface);
+  border: 1px solid var(--divider);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-sm);
+  padding: 6px 0;
+  min-width: 0;
+}
+
+.mm-list,
+.pv-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* One model: rail badge, the clickable text (runs the test), and its one action. */
+.mm-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: stretch;
+  column-gap: 10px;
+  padding: 0 14px;
+}
+
+.mm-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.mm-rail-line {
+  width: 2px;
+  flex: 1;
+  min-height: 6px;
+  background: var(--line-pink);
+  opacity: 0.6;
+}
+
+.mm-rail-line.none {
+  background: transparent;
+}
+
+.mm-badge {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: var(--accent-soft);
+  border: 1px solid var(--line-pink);
+  color: var(--accent-text);
+  font-family: var(--font-body);
+  font-weight: 800;
+  font-size: calc(13px * var(--ts, 1));
+  font-variant-numeric: tabular-nums;
+}
+
+.mm-badge.main {
+  background: var(--primary);
+  border-color: transparent;
+  color: var(--on-primary);
+  font-family: var(--font-cute);
+  font-size: calc(15px * var(--ts, 1));
+}
+
+.mm-row-main {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+  padding: 12px 6px;
+  margin: 2px 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mm-row-main:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.mm-row-main:disabled {
+  cursor: progress;
+}
+
+.mm-row-main:focus-visible,
+.mm-add-row:focus-visible,
+.pv-head:focus-visible,
+.mm-pick:focus-visible,
+.mm-chip:focus-visible,
+.mm-icon-btn:focus-visible,
+.mm-notice-undo:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-focus);
+}
+
+.mm-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mm-name {
+  font-weight: 800;
+  font-size: calc(14.5px * var(--ts, 1));
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.mm-sub {
+  max-width: 100%;
+  color: var(--muted);
+  font-size: calc(12.5px * var(--ts, 1));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mm-sub.gone {
+  color: var(--blush-text);
+}
+
+.mm-test {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 19px;
+  max-width: 100%;
+  font-size: calc(12.5px * var(--ts, 1));
+  line-height: 1.5;
+}
+
+.mm-test.idle {
+  color: var(--faint);
+}
+
+.mm-test.running {
+  color: var(--muted);
+}
+
+.mm-test.good {
+  color: var(--mint-text);
+}
+
+.mm-test.good strong {
+  font-size: calc(13.5px * var(--ts, 1));
+}
+
+.mm-test-rest {
+  color: var(--muted);
+}
+
+.mm-test.bad {
+  align-items: flex-start;
+  flex-wrap: nowrap;
+  color: var(--blush-text);
+}
+
+.mm-test.bad > svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+
+.mm-test-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.mm-test-title {
+  font-weight: 800;
+  font-size: calc(13px * var(--ts, 1));
+}
+
+/* What the provider said, under the plain-language reason. */
+.mm-test-detail {
+  color: var(--faint);
+  font-size: calc(11.5px * var(--ts, 1));
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.mm-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mm-icon-btn {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid var(--divider);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.mm-icon-btn:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--line-pink);
+}
+
+.mm-icon-btn.danger {
+  background: var(--blush-soft);
+  border-color: transparent;
+  color: var(--blush-text);
+}
+
+.mm-icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.mm-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 14px 18px;
+  color: var(--muted);
+  font-size: calc(13px * var(--ts, 1));
+}
+
+.mm-empty strong {
+  color: var(--blush-text);
+}
+
+/* The "添加模型" / "添加服务商" row at the foot of a card. */
+.mm-add-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: calc(100% - 12px);
+  margin: 4px 6px 0;
+  padding: 10px 8px;
+  border: 0;
+  border-top: 1px solid var(--divider);
+  border-radius: 0 0 var(--r-sm) var(--r-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pv-list .mm-add-row {
+  border-top: 0;
+  margin-top: 0;
+}
+
+.mm-add-row:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.mm-add-row:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.mm-add-icon,
+.pv-icon {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.mm-add-text,
+.pv-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.mm-add-title,
+.pv-title {
+  font-weight: 800;
+  font-size: calc(14px * var(--ts, 1));
+  color: var(--ink);
+}
+
+.mm-add-sub,
+.pv-sub {
+  color: var(--muted);
+  font-size: calc(12.5px * var(--ts, 1));
+}
+
+/* Saved / undo: stays in view at the foot of the pane while it is offered. */
+.mm-notice {
+  position: sticky;
+  bottom: 12px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  border-radius: var(--r-md);
+  background: var(--ink);
+  color: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: calc(13px * var(--ts, 1));
+  font-weight: 700;
+}
+
+.mm-notice > svg {
+  flex-shrink: 0;
+  color: var(--primary);
+}
+
+.mm-notice-undo {
+  border: 0;
+  border-radius: var(--r-pill);
+  padding: 5px 12px;
+  background: var(--primary);
+  color: var(--on-primary);
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.mm-notice-x {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+}
+
+.mm-suggest {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: var(--r-card);
+  border: 1.5px solid var(--primary);
+  background: var(--surface);
+}
+
+.mm-suggest-text {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  color: var(--ink);
+  font-size: calc(13.5px * var(--ts, 1));
+  line-height: 1.55;
+}
+
+.mm-suggest-text > svg {
+  flex-shrink: 0;
+  color: var(--mint-text);
+  margin-top: 1px;
+}
+
+/* Inline panels: add a model, add or change a provider. */
+.mm-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 6px 10px 4px;
+  padding: 14px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  border: 1px solid var(--divider);
+  min-width: 0;
+}
+
+.mm-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: calc(14.5px * var(--ts, 1));
+}
+
+.mm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mm-field-title {
+  font-weight: 800;
+  font-size: calc(13px * var(--ts, 1));
+  color: var(--ink);
+}
+
+.mm-field-hint {
+  color: var(--faint);
+  font-size: calc(12px * var(--ts, 1));
+  line-height: 1.5;
+}
+
+.mm-field-error {
+  color: var(--blush-text);
+  font-size: calc(12.5px * var(--ts, 1));
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.mm-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 6px 13px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--divider);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-weight: 700;
+  font-size: calc(13px * var(--ts, 1));
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.mm-chip.on {
+  background: var(--accent-soft);
+  border-color: var(--accent-text);
+  color: var(--accent-text);
+}
+
+.mm-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.mm-dot.ok {
+  background: var(--mint-text);
+}
+
+.mm-dot.bad {
+  background: var(--blush-text);
+}
+
+.segmented.mm-place {
+  display: flex;
+  max-width: 100%;
+  align-self: flex-start;
+}
+
+.segmented.mm-place button {
+  flex: 1 1 auto;
+  font-size: calc(12.5px * var(--ts, 1));
+}
+
+.mm-pick-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 300px;
+  overflow-y: auto;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--divider);
+  background: var(--surface);
+}
+
+.mm-pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 12px;
+  border: 0;
+  border-bottom: 1px solid var(--divider);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mm-pick:last-child {
+  border-bottom: 0;
+}
+
+.mm-pick:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.mm-pick.on {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.mm-pick:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mm-pick-name {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: calc(13px * var(--ts, 1));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-pick.on .mm-pick-name {
+  font-weight: 800;
+}
+
+.mm-pick-tag {
+  color: var(--faint);
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 700;
+}
+
+.mm-panel-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid var(--divider);
+}
+
+.mm-reset {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 16px;
+  flex-wrap: wrap;
+}
+
+.mm-reset-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 260px;
+  font-size: calc(12.5px * var(--ts, 1));
+  color: var(--muted);
+}
+
+.mm-reset-text strong {
+  color: var(--ink);
+  font-size: calc(14px * var(--ts, 1));
+}
+
+/* Providers */
+.pv-row + .pv-row {
+  border-top: 1px solid var(--divider);
+  margin: 0 14px;
+}
+
+.pv-row + .pv-row > .pv-head,
+.pv-row + .pv-row > .mm-add-row {
+  margin-left: -8px;
+  margin-right: -8px;
+  width: calc(100% + 16px);
+}
+
+.pv-row + .pv-row > .mm-panel {
+  margin-left: -4px;
+  margin-right: -4px;
+}
+
+.pv-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: calc(100% - 12px);
+  margin: 0 6px;
+  padding: 12px 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pv-head:hover {
+  background: var(--surface-2);
+}
+
+.pv-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.pv-key,
+.pv-used {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.pv-key.ok {
+  background: var(--mint-soft);
+  color: var(--mint-text);
+}
+
+.pv-key.bad {
+  background: var(--blush-soft);
+  color: var(--blush-text);
+}
+
+.pv-used {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.pv-used.none {
+  background: var(--idle-soft);
+  color: var(--idle-text);
+}
+
+.pv-url {
+  max-width: 100%;
+  padding-top: 2px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: calc(11.5px * var(--ts, 1));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pv-chev {
+  flex-shrink: 0;
+  margin-top: 10px;
+  color: var(--faint);
+  transition: transform 0.18s var(--ease-out);
+}
+
+.pv-row.open .pv-chev {
+  transform: rotate(180deg);
+}
+
+.pv-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.pv-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--divider);
+}
+
+.pv-chosen {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  font-size: calc(13px * var(--ts, 1));
+  color: var(--ink);
+}
+
+.mm-spin {
+  animation: mm-spin 0.9s linear infinite;
+}
+
+@keyframes mm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mm-spin {
+    animation: none;
+  }
+  .pv-chev {
+    transition: none;
+  }
+}
+
+.mm-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* Narrow panes (phone / HarmonyOS layout and small windows). */
+@media (max-width: 560px) {
+  .mm-row {
+    padding: 0 10px;
+    column-gap: 6px;
+  }
+  .mm-panel {
+    margin: 6px 6px 4px;
+    padding: 12px;
+  }
+  .pv-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mm-panel-foot {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .mm-panel-foot .mm-panel-buttons {
+    justify-content: flex-end;
+  }
+}

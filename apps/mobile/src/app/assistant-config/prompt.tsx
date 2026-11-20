@@ -6,12 +6,13 @@
  */
 import { useEffect, useState } from "react";
 import { Keyboard, KeyboardAvoidingView, TextInput, View } from "react-native";
-import { Button, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { PromptId, PromptView } from "@herdr-pocket/protocol";
 import { EmptyState, PageBackground } from "../../components/ui";
+import { PocketButton } from "../../components/pocket";
 import { ConfigSnackbar, ConfirmDialog, LoadState, SaveBar, useLeaveGuard } from "../../components/configParts";
 import { chars, loadPrompts, resetPrompt, savePrompt, useAssistantConfig, useConfigWatch } from "../../lib/assistantConfig";
 import { relTime } from "../../lib/format";
@@ -19,7 +20,6 @@ import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
 
 export default function PromptScreen() {
-  const p = usePalette();
   const params = useLocalSearchParams<{ id: string }>();
   const id = String(params.id ?? "") as PromptId;
   useConfigWatch("prompts");
@@ -39,7 +39,7 @@ export default function PromptScreen() {
     return (
       <PageBackground>
         {header}
-        <EmptyState title="没有这段提示词" body="服务器上可能已经没有它了。" mood="waiting" action={<Button textColor={p.accentText} onPress={() => router.back()}>回去</Button>} />
+        <EmptyState title="没有这段提示词" body="服务器上可能已经没有它了。" mood="waiting" action={<PocketButton variant="text" onPress={() => router.back()}>回去</PocketButton>} />
       </PageBackground>
     );
   }
@@ -175,27 +175,19 @@ function PromptEditor({ prompt }: { prompt: PromptView }) {
                 </Text>
               </View>
               <View style={{ flexDirection: "row", gap: space.sm, justifyContent: "flex-end" }}>
-                <Button
-                  compact
-                  textColor={p.ink}
-                  onPress={() => {
+                <PocketButton variant="ghost" size="sm" onPress={() => {
                     setText(newer.text);
                     setBase(newer.text);
                     setNewer(null);
-                  }}
-                >
+                  }}>
                   用它改的
-                </Button>
-                <Button
-                  compact
-                  textColor={p.accentText}
-                  onPress={() => {
+                </PocketButton>
+                <PocketButton variant="text" size="sm" onPress={() => {
                     setBase(newer.text);
                     setNewer(null);
-                  }}
-                >
+                  }}>
                   留着我的
-                </Button>
+                </PocketButton>
               </View>
             </View>
           ) : null}
@@ -225,20 +217,12 @@ function PromptEditor({ prompt }: { prompt: PromptView }) {
         </View>
 
         <SaveBar note={dirty ? "还没保存。保存后从下一条消息或下一通电话开始生效" : "保存后从下一条消息或下一通电话开始生效"} keyboardOpen={keyboard}>
-          <Button
-            mode="outlined"
-            textColor={p.ink}
-            disabled={!!busy || (!prompt.edited && sameAsDefault)}
-            loading={busy === "reset"}
-            onPress={() => setAskReset(true)}
-            style={{ borderRadius: radius.pill, borderColor: p.divider }}
-            contentStyle={{ height: 50 }}
-          >
+          <PocketButton variant="ghost" size="lg" disabled={!!busy || (!prompt.edited && sameAsDefault)} loading={busy === "reset"} onPress={() => setAskReset(true)}>
             恢复默认
-          </Button>
-          <Button mode="contained" disabled={!dirty || empty || !!busy} loading={busy === "save"} onPress={save} style={{ flex: 1, borderRadius: radius.pill }} contentStyle={{ height: 50 }} labelStyle={{ fontSize: 16 }}>
+          </PocketButton>
+          <PocketButton size="lg" grow disabled={!dirty || empty || !!busy} loading={busy === "save"} onPress={save}>
             保存
-          </Button>
+          </PocketButton>
         </SaveBar>
       </KeyboardAvoidingView>
 

@@ -7,11 +7,12 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, View } from "react-native";
-import { Button, ProgressBar, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { Stack } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { PocketNative, type VoiceTier } from "../../modules/pocket-native";
 import { Card, PageBackground } from "../components/ui";
+import { PocketButton, PocketProgress } from "../components/pocket";
 import { Row, RowDivider as Divider, Toggle } from "../components/rows";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Pill } from "../components/configParts";
 import { applog, uploadAppLog } from "../lib/applog";
@@ -584,9 +585,9 @@ export default function VoiceprintScreen() {
         <Card style={{ padding: space.lg, gap: space.md }}>
           <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: space.sm }}>
             <Text style={{ fontFamily: fonts.cute, fontSize: 18, color: p.ink }}>声纹模型档位</Text>
-            <Button mode="text" compact disabled={benchBusy || busy} loading={benchBusy} textColor={p.accentText} onPress={() => void runBenchmark()}>
+            <PocketButton variant="text" size="sm" disabled={benchBusy || busy} loading={benchBusy} onPress={() => void runBenchmark()}>
               {benchBusy ? "检测中" : "重测算力"}
-            </Button>
+            </PocketButton>
           </View>
 
           <View style={{ backgroundColor: p.surface2, borderRadius: radius.md, padding: space.md, gap: 4 }}>
@@ -691,10 +692,10 @@ export default function VoiceprintScreen() {
               <Text style={{ color: p.ink, fontSize: 14 }}>
                 正在准备{dlLabel}，{Math.round(dlProgress * 100)}%
               </Text>
-              <ProgressBar progress={dlProgress} color={p.primary} style={{ height: 8, borderRadius: 4, backgroundColor: p.surface3 }} />
-              <Button mode="text" textColor={p.muted} onPress={() => PocketNative?.cancelVoiceModel?.()} style={{ alignSelf: "flex-end" }}>
+              <PocketProgress progress={dlProgress} height={8} />
+              <PocketButton variant="ghost" onPress={() => PocketNative?.cancelVoiceModel?.()} style={{ alignSelf: "flex-end" }}>
                 取消下载
-              </Button>
+              </PocketButton>
             </View>
           ) : phase === "recording" || phase === "finishing" ? (
             <View style={{ gap: space.md }}>
@@ -712,24 +713,12 @@ export default function VoiceprintScreen() {
                 </Text>
               </View>
               <View style={{ flexDirection: "row", gap: space.sm }}>
-                <Button
-                  mode="outlined"
-                  disabled={phase === "finishing"}
-                  onPress={cancelEnroll}
-                  textColor={p.muted}
-                  style={{ flex: 1, borderRadius: radius.pill, borderColor: p.divider }}
-                >
+                <PocketButton variant="ghost" grow disabled={phase === "finishing"} onPress={cancelEnroll}>
                   取消
-                </Button>
-                <Button
-                  mode="contained"
-                  disabled={seconds < 3.8 || phase === "finishing"}
-                  loading={phase === "finishing"}
-                  onPress={finishEnroll}
-                  style={{ flex: 2, borderRadius: radius.pill }}
-                >
+                </PocketButton>
+                <PocketButton disabled={seconds < 3.8 || phase === "finishing"} loading={phase === "finishing"} onPress={finishEnroll} style={{ flex: 2 }}>
                   完成录入
-                </Button>
+                </PocketButton>
               </View>
             </View>
           ) : phase === "testing" ? (
@@ -782,9 +771,9 @@ export default function VoiceprintScreen() {
                   ) : null}
                 </View>
               ) : null}
-              <Button mode="contained-tonal" onPress={endTest} style={{ borderRadius: radius.pill }}>
+              <PocketButton variant="soft" onPress={endTest}>
                 结束测试
-              </Button>
+              </PocketButton>
             </View>
           ) : (
             <View style={{ gap: space.md }}>
@@ -809,7 +798,7 @@ export default function VoiceprintScreen() {
                   <Text style={{ color: p.ink, fontSize: 14, lineHeight: 21 }}>{SAMPLE_LINES[0]}</Text>
                 </View>
               )}
-              <Button mode="contained" onPress={beginEnroll} style={{ borderRadius: radius.pill }} contentStyle={{ height: 46 }}>
+              <PocketButton size="lg" onPress={beginEnroll}>
                 {enrollNeedDownload
                   ? legacy
                     ? "下载模型并重录"
@@ -819,17 +808,17 @@ export default function VoiceprintScreen() {
                     : voiceprint
                       ? "重新录制声纹"
                       : "录制我的声音"}
-              </Button>
+              </PocketButton>
               {voiceprint || legacy ? (
                 <View style={{ flexDirection: "row", gap: space.sm, justifyContent: "flex-end" }}>
                   {!legacy ? (
-                    <Button mode="contained-tonal" onPress={beginTest} style={{ flex: 1, borderRadius: radius.pill }}>
+                    <PocketButton variant="soft" grow onPress={beginTest}>
                       测一下效果
-                    </Button>
+                    </PocketButton>
                   ) : null}
-                  <Button mode="text" textColor={p.error} onPress={() => setAskClear(true)} style={{ borderRadius: radius.pill }}>
+                  <PocketButton variant="text" danger onPress={() => setAskClear(true)}>
                     清除声纹
-                  </Button>
+                  </PocketButton>
                 </View>
               ) : null}
             </View>

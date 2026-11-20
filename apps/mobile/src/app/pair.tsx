@@ -1,12 +1,13 @@
 /** Deep link target: herdrpocket://pair?server=...&code=... (also what the scanner opens for an invite QR). */
 import { useEffect, useRef, useState } from "react";
 import { View } from "react-native";
-import { ActivityIndicator, Button, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { router, useLocalSearchParams } from "expo-router";
 import { PageBackground, PairSuccess } from "../components/ui";
+import { PocketButton, PocketSpinner } from "../components/pocket";
 import { Mascot } from "../components/Mascot";
 import { usePalette } from "../theme/theme";
-import { fonts, radius, space } from "../theme/tokens";
+import { fonts, space } from "../theme/tokens";
 import { completePairing, defaultDeviceName, friendlyError, takeScannedInvite } from "../lib/session";
 import { normalizeServer } from "../lib/relay";
 import { isMockServer } from "../lib/mock";
@@ -61,12 +62,12 @@ export default function PairLinkScreen() {
               : `这台手机现在连着 ${bare(mine!)}。连到 ${bare(String(server))} 后，原来的连接会断开，那边的设备列表里也会移除这台手机。`}
           </Text>
           <View style={{ alignSelf: "stretch", gap: space.sm, marginTop: space.sm }}>
-            <Button mode="contained" onPress={() => setGo(true)} contentStyle={{ height: 50 }} style={{ borderRadius: radius.pill }} labelStyle={{ fontSize: 16 }}>
+            <PocketButton size="lg" onPress={() => setGo(true)}>
               {same ? "重新连接" : "换过去"}
-            </Button>
-            <Button mode="text" textColor={p.ink} onPress={back}>
+            </PocketButton>
+            <PocketButton variant="ghost" onPress={back}>
               不用了
-            </Button>
+            </PocketButton>
           </View>
         </View>
       </PageBackground>
@@ -81,16 +82,16 @@ export default function PairLinkScreen() {
           <>
             <Text style={{ fontFamily: fonts.cute, fontSize: 22, color: p.ink }}>配对没成功</Text>
             <Text style={{ color: p.faint, textAlign: "center" }}>{problem}</Text>
-            <Button mode="contained" icon="qrcode-scan" onPress={() => router.replace("/scan")} style={{ borderRadius: radius.pill }}>
+            <PocketButton icon="qrcode-scan" onPress={() => router.replace("/scan")}>
               重新扫码
-            </Button>
-            <Button mode="text" textColor={p.accentText} onPress={back}>
+            </PocketButton>
+            <PocketButton variant="text" onPress={back}>
               {mine ? "回到列表" : "手动输入配对码"}
-            </Button>
+            </PocketButton>
           </>
         ) : (
           <>
-            <ActivityIndicator />
+            <PocketSpinner size={28} />
             <Text style={{ fontFamily: fonts.cute, fontSize: 22, color: p.ink }}>正在配对…</Text>
             <Text style={{ color: p.faint }}>{bare(String(server ?? ""))}</Text>
           </>

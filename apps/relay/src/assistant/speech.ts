@@ -20,6 +20,19 @@ export function clip(s: string, n: number): string {
   return chars.length > n ? `${chars.slice(0, n).join("")}…` : s;
 }
 
+/**
+ * The "正在查" chip's text. The voice hands a task over as "我：<my words>。正在说的是：<what we
+ * talk about>"; the chip shows only the request, not the speaker label or the context.
+ */
+export function taskTitle(objective: string): string {
+  const all = oneLine(objective);
+  let s = all.replace(/^(?:我|用户)\s*[：:]\s*/, "");
+  const ctx = s.search(/[。．.，,；;\s]*[（(]?正在说的是/);
+  if (ctx > 0) s = s.slice(0, ctx);
+  s = s.replace(/[。．.，,；;\s]+$/, "");
+  return clip(s || all, 40);
+}
+
 /** The app speaks without emoji; models sometimes add them anyway. */
 export function noEmoji(s: string): string {
   return s.replace(/( ?)[\p{Extended_Pictographic}\u{FE0F}\u{200D}\u{20E3}\u{1F3FB}-\u{1F3FF}]+( ?)/gu, (_m, a: string, b: string) => (a && b ? " " : "")).trim();

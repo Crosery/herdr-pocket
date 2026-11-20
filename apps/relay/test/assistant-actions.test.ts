@@ -579,7 +579,8 @@ test("logs: phones and computers upload, tokens never stored, filters and follow
   await sleep(60);
 
   assert.equal((await api("/v1/logs")).status, 401);
-  const mine = (await api(`/v1/logs?device=${phone.device.id}`, { token: phone.token })).json.entries as LogEntry[];
+  // The relay also logs the pairing itself about this device; these are the lines the phone uploaded.
+  const mine = (await api(`/v1/logs?device=${phone.device.id}&source=viewer`, { token: phone.token })).json.entries as LogEntry[];
   assert.deepEqual(mine.map((e) => [e.source, e.kind, e.level]), [["viewer", "link", "warn"], ["viewer", "voice", "info"]]);
   assert.equal(mine[0]!.deviceName, "Phone L");
   assert.ok(!JSON.stringify(mine).includes(secret));

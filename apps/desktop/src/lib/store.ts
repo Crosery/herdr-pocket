@@ -17,6 +17,10 @@ export interface AppSettings {
   denoise: boolean;
   hostFilter: string | null;
   foldedGroups: string[];
+  /** Sidebar folded to its icon rail by the user (wide windows only; narrow ones fold on their own). */
+  sidebarCollapsed: boolean;
+  /** "done" once the first-run guide was finished or skipped; "later" when closed half way. */
+  onboarding: "new" | "later" | "done";
 }
 
 export interface LiveState {
@@ -47,6 +51,8 @@ function persistPrefs(s: AppSettings): void {
     denoise: s.denoise,
     hostFilter: s.hostFilter,
     foldedGroups: s.foldedGroups,
+    sidebarCollapsed: s.sidebarCollapsed,
+    onboarding: s.onboarding,
   });
   try {
     window.PocketHarmony?.setPref?.(PREF_KEY, payload);
@@ -98,6 +104,9 @@ export const settingsStore = createStore<AppSettings>({
   denoise: saved.denoise ?? true,
   hostFilter: saved.hostFilter ?? null,
   foldedGroups: saved.foldedGroups ?? [],
+  sidebarCollapsed: saved.sidebarCollapsed ?? false,
+  // Installs from before the guide existed already have a server: don't greet them as new.
+  onboarding: saved.onboarding ?? (saved.lastServer ? "done" : "new"),
 });
 
 export function updateSettings(patch: Partial<AppSettings>): void {

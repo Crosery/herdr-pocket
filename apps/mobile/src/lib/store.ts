@@ -46,8 +46,12 @@ interface SettingsState {
   showShells: boolean;
   /** Agent list device switcher: a host deviceId, or null for all hosts. */
   hostFilter: string | null;
-  /** Agent list groups the person folded (blocked / working / done / idle / offline). */
+  /** Agent list groups the person folded (status keys, or `space:<host>:<name>` in the space view). */
   foldedGroups: string[];
+  /** Agent list layout: one group per computer space, or one per status. */
+  agentGrouping: "space" | "status";
+  /** Computer the last agent was created on; the create sheet opens there when nothing else is asked for. */
+  lastCreateHost: string | null;
   /** Accessory key bar order/visibility (normalise with normalizeTermKeyLayout). */
   termKeys: TermKeyLayout | null;
   /** Terminal keyboard button opens the phone's own key panel ("pad") or the system input method. */
@@ -88,6 +92,8 @@ export const useSettings = create<SettingsState>()(
       showShells: false,
       hostFilter: null,
       foldedGroups: [],
+      agentGrouping: "space",
+      lastCreateHost: null,
       termKeys: null,
       termInput: "pad",
       termPadRow: 34,

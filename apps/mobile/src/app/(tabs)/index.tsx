@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, KeyboardAvoidingView, Pressable, TextInput, View } from "react-native";
-import { Button, Dialog, Portal, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { AssistantAction, AssistantItem } from "@herdr-pocket/protocol";
@@ -12,6 +12,7 @@ import { Md } from "../../components/md";
 import { CallBar, CallScreen } from "../../components/CallScreen";
 import { AgentLink, NoticeBubble } from "../../components/notice";
 import { RemindersSheet } from "../../components/reminders";
+import { PocketButton, PocketDialog } from "../../components/pocket";
 import { useFocusEffect } from "expo-router";
 import { clearAssistant, decideAction, loadAssistant, sendToAssistant, setAssistantWatching, useAssistant } from "../../lib/assistant";
 import { dismissCallMessage, startCall, useVoice } from "../../lib/voice";
@@ -180,32 +181,26 @@ export default function AssistantScreen() {
 
       {inCall && callOpen ? <CallScreen name={NAME} onMinimize={foldCall} /> : null}
 
-      <Portal>
-        <Dialog visible={confirmClear} onDismiss={() => setConfirmClear(false)} style={{ borderRadius: radius.xl, backgroundColor: p.surface }}>
-          <Dialog.Title style={{ fontFamily: fonts.cute, color: p.ink }}>开始新对话？</Dialog.Title>
-          <Dialog.Content>
-            <Text style={{ color: p.muted, lineHeight: 22 }}>聊天记录会清空，提醒不受影响。</Text>
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={() => setConfirmClear(false)} textColor={p.ink}>
-              取消
-            </Button>
-            <Button
-              textColor={p.accentText}
-              onPress={async () => {
-                setConfirmClear(false);
-                try {
-                  await clearAssistant();
-                } catch (e) {
-                  setToast((e as Error).message);
-                }
-              }}
-            >
-              清空
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
+      <PocketDialog
+        visible={confirmClear}
+        onDismiss={() => setConfirmClear(false)}
+        title="开始新对话？"
+        body="聊天记录会清空，提醒不受影响。"
+        actions={[
+          { label: "取消", onPress: () => setConfirmClear(false), tone: "ghost" },
+          {
+            label: "清空",
+            onPress: async () => {
+              setConfirmClear(false);
+              try {
+                await clearAssistant();
+              } catch (e) {
+                setToast((e as Error).message);
+              }
+            },
+          },
+        ]}
+      />
       <RemindersSheet visible={showReminders} reminders={reminders} name={NAME} onDismiss={() => setShowReminders(false)} />
 
       <PocketToast
@@ -387,12 +382,12 @@ function ActionCard({ item, onError }: { item: AssistantItem; onError: (m: strin
         <Text style={{ flex: 1, color: tone, fontSize: 12.5, fontFamily: fonts.bodySemi }}>{stateLine(a)}</Text>
         {pending ? (
           <>
-            <Button compact mode="text" textColor={p.muted} disabled={!!working} loading={working === "cancel"} onPress={() => void decide("cancel")}>
+            <PocketButton size="sm" variant="ghost" disabled={!!working} loading={working === "cancel"} onPress={() => void decide("cancel")}>
               取消
-            </Button>
-            <Button compact mode="contained" disabled={!!working} loading={working === "confirm"} onPress={() => void decide("confirm")} style={{ borderRadius: radius.pill }}>
+            </PocketButton>
+            <PocketButton size="sm" icon="check" disabled={!!working} loading={working === "confirm"} onPress={() => void decide("confirm")}>
               确认执行
-            </Button>
+            </PocketButton>
           </>
         ) : null}
       </View>

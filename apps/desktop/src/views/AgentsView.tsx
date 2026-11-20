@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   ChevronDown,
   ChevronRight,
+  FolderOpen,
   ImagePlus,
   Laptop,
   Menu,
@@ -37,16 +38,19 @@ import {
   PocketInput,
   PocketModal,
   PocketSelect,
+  fs,
   useToast,
 } from "../components/PocketUI";
 import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVendor";
 import { renderAnsiLines } from "../lib/ansi";
-import { encodeImageFiles } from "../lib/bridge";
+import { copyToClipboard, detectPlatform, encodeImageFiles } from "../lib/bridge";
+import { termKeyAction } from "../lib/termKeys";
 import { RichMarkdown, parseChoices } from "../lib/markdown";
 import { pingRelay, rpcCall, subscribeStream } from "../lib/relay";
 import {
   STATUS_LABEL,
   agentSpace,
+  agentTitle,
   allAgents,
   greeting,
   liveStore,
@@ -67,14 +71,219 @@ const GROUPS: { key: GroupKey; title: string }[] = [
 
 const byRecent = (x: Agent, y: Agent) => (y.statusSince ?? y.updatedAt) - (x.statusSince ?? x.updatedAt);
 
+const MAC = detectPlatform() === "macos";
+
+/** Shortens `s` to `max` characters with an ellipsis (placeholders cannot ellipsize in CSS). */
+function clip(s: string, max: number): string {
+  const chars = [...s];
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : s;
+}
+
+/** Text selected inside `box`, or "". */
+function termSelection(box: HTMLElement | null): string {
+  const sel = typeof window !== "undefined" ? window.getSelection() : null;
+  if (!box || !sel || sel.isCollapsed || !sel.anchorNode || !box.contains(sel.anchorNode)) return "";
+  return sel.toString();
+}
+
+type GroupMode = "space" | "status";
+const GROUP_MODE_KEY = "herdr-pocket-agents-group";
+const FOLDED_SPACES_KEY = "herdr-pocket-folded-spaces";
+const STATUS_RANK: Record<GroupKey, number> = { blocked: 0, working: 1, done: 2, idle: 3, offline: 4 };
+
+function readPref<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writePref(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Private mode or storage off: the choice lasts for this session only.
+  }
+}
+
+/** A stable colour slot (0-4) for a space badge. */
+function toneIndex(name: string): number {
+  let h = 0;
+  for (const ch of name) h = (h * 31 + ch.codePointAt(0)!) >>> 0;
+  return h % 5;
+}
+
+interface QuickMenuState {
+  agent: Agent;
+  x: number;
+  y: number;
+  /** Bottom sheet (long press, narrow windows) instead of a menu at the pointer. */
+  sheet: boolean;
+}
+
+const LONG_PRESS_MS = 500;
+
+function AgentRow({
+  agent,
+  offline,
+  selected,
+  dark,
+  sub,
+  onOpen,
+  onMenu,
+}: {
+  agent: Agent;
+  offline: boolean;
+  selected: boolean;
+  dark: boolean;
+  sub: string;
+  onOpen: () => void;
+  onMenu: (x: number, y: number, sheet: boolean) => void;
+}) {
+  const press = useRef<{ timer: number; x: number; y: number; fired: boolean } | null>(null);
+  const cancel = () => {
+    if (press.current) window.clearTimeout(press.current.timer);
+  };
+  const title = agentTitle(agent);
+  return (
+    <button
+      className={`agent-row${selected ? " selected" : ""}${agent.status === "blocked" && !offline ? " needs-you" : ""}`}
+      title={title}
+      onClick={() => {
+        if (press.current?.fired) {
+          press.current = null;
+          return;
+        }
+        onOpen();
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        cancel();
+        onMenu(e.clientX, e.clientY, false);
+      }}
+      onPointerDown={(e) => {
+        if (e.pointerType === "mouse") return;
+        const { clientX: x, clientY: y } = e;
+        cancel();
+        press.current = {
+          x,
+          y,
+          fired: false,
+          timer: window.setTimeout(() => {
+            if (press.current) press.current.fired = true;
+            onMenu(x, y, true);
+          }, LONG_PRESS_MS),
+        };
+      }}
+      onPointerMove={(e) => {
+        const p = press.current;
+        if (p && !p.fired && Math.hypot(e.clientX - p.x, e.clientY - p.y) > 8) cancel();
+      }}
+      onPointerUp={cancel}
+      onPointerCancel={cancel}
+    >
+      <VendorAvatar harness={agent.harness} isShell={agent.isShell} dark={dark} size={42} />
+      <div className="grow">
+        <div style={{ fontWeight: 800, fontSize: fs(14.5) }} className="truncate">
+          {title}
+        </div>
+        <div className="faint truncate">{sub}</div>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+        <PocketBadge tone={offline ? "neutral" : statusTone(agent.status)} pulse={!offline && (agent.status === "working" || agent.status === "blocked")}>
+          {offline ? "离线" : STATUS_LABEL[agent.status]}
+        </PocketBadge>
+        <span className="faint num" style={{ fontSize: fs(11.5) }}>{relTime(agent.statusSince ?? agent.updatedAt)}</span>
+      </div>
+    </button>
+  );
+}
+
+/** Quick actions for an agent row: a menu at the pointer, or a bottom sheet on touch / narrow windows. */
+function AgentQuickMenu({
+  state,
+  onClose,
+  onOpen,
+  onNewHere,
+  onCopyPath,
+}: {
+  state: QuickMenuState;
+  onClose: () => void;
+  onOpen: (tab: "chat" | "term") => void;
+  onNewHere: () => void;
+  onCopyPath: () => void;
+}) {
+  const space = agentSpace(state.agent);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("blur", onClose);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", onClose);
+    };
+  }, [onClose]);
+  const item = (label: string, fn: () => void, disabled = false) => (
+    <button
+      className="menu-item"
+      role="menuitem"
+      disabled={disabled}
+      onClick={() => {
+        onClose();
+        fn();
+      }}
+    >
+      {label}
+    </button>
+  );
+  const items = (
+    <>
+      {item("打开对话", () => onOpen("chat"))}
+      {item("看终端", () => onOpen("term"))}
+      {item(space ? `在「${space}」再开一个` : "在这台电脑再开一个", onNewHere)}
+      {item("复制文件夹路径", onCopyPath, !state.agent.cwd)}
+    </>
+  );
+  if (state.sheet) {
+    return (
+      <div className="sheet-backdrop" onPointerDown={(e) => e.target === e.currentTarget && onClose()}>
+        <div className="action-sheet" role="menu" aria-label={agentTitle(state.agent)}>
+          <div className="action-sheet-title truncate">{agentTitle(state.agent)}</div>
+          {items}
+          <button className="menu-item action-sheet-cancel" onClick={onClose}>
+            取消
+          </button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="ctx-backdrop" onPointerDown={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }}>
+      <div
+        className="ctx-menu"
+        role="menu"
+        style={{ left: Math.min(state.x, window.innerWidth - 200), top: Math.min(state.y, window.innerHeight - 190) }}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        {items}
+      </div>
+    </div>
+  );
+}
+
 export function AgentsView({
   mobileLayout,
   selectedKey,
   onSelectAgent,
+  onOpenWorkbench,
 }: {
   mobileLayout: boolean;
   selectedKey: string | null;
   onSelectAgent: (key: string | null) => void;
+  /** Opens the agent's working folder in the workbench. */
+  onOpenWorkbench?: (agentKey: string) => void;
 }) {
   const toast = useToast();
   const agentsMap = liveStore.use((s) => s.agents);
@@ -151,9 +360,81 @@ export function AgentsView({
     });
   };
 
-  const selectedAgent = useMemo(() => all.find((a) => a.key === selectedKey) ?? null, [all, selectedKey]);
+  // "按空间": computer, then space, the way the phone app groups them (mobile R25).
+  const [groupMode, setGroupModeState] = useState<GroupMode>(() => readPref<GroupMode>(GROUP_MODE_KEY, "space"));
+  const setGroupMode = (m: GroupMode) => {
+    setGroupModeState(m);
+    writePref(GROUP_MODE_KEY, m);
+  };
+  const [foldedSpaces, setFoldedSpaces] = useState<string[]>(() => readPref<string[]>(FOLDED_SPACES_KEY, []));
+  const toggleSpace = (id: string) => {
+    const next = foldedSpaces.includes(id) ? foldedSpaces.filter((x) => x !== id) : [...foldedSpaces, id];
+    setFoldedSpaces(next);
+    writePref(FOLDED_SPACES_KEY, next);
+  };
+  const groupOf = useCallback(
+    (a: Agent): GroupKey =>
+      !isOnline(a) ? "offline" : a.status === "blocked" || a.status === "working" || a.status === "done" ? a.status : "idle",
+    [isOnline],
+  );
+  const spaceGroups = useMemo(() => {
+    const byDevice = new Map<string, Map<string, Agent[]>>();
+    for (const a of inScope) {
+      if (q && ![spacedTitle(a), a.harness, a.where, a.cwd, a.preview].some((s) => s?.toLowerCase().includes(q))) continue;
+      if (statusFilter && groupOf(a) !== statusFilter) continue;
+      const perSpace = byDevice.get(a.deviceId) ?? new Map<string, Agent[]>();
+      const sp = agentSpace(a) ?? "";
+      perSpace.set(sp, [...(perSpace.get(sp) ?? []), a]);
+      byDevice.set(a.deviceId, perSpace);
+    }
+    const out = [...byDevice.entries()].map(([deviceId, perSpace]) => {
+      const groups = [...perSpace.entries()].map(([space, list]) => {
+        list.sort((x, y) => STATUS_RANK[groupOf(x)] - STATUS_RANK[groupOf(y)] || byRecent(x, y));
+        const tally = { blocked: 0, working: 0, done: 0 };
+        for (const a of list) {
+          const g = groupOf(a);
+          if (g === "blocked" || g === "working" || g === "done") tally[g]++;
+        }
+        const latest = Math.max(...list.map((a) => a.statusSince ?? a.updatedAt));
+        const id = `${deviceId}\u0000${space}`;
+        return { id, space, list, tally, latest, folded: !q && !statusFilter && foldedSpaces.includes(id) };
+      });
+      groups.sort((x, y) => y.tally.blocked - x.tally.blocked || y.latest - x.latest);
+      const device = devices[deviceId];
+      return {
+        deviceId,
+        name: device?.name ?? deviceId,
+        online: device?.online ?? false,
+        count: groups.reduce((n, g) => n + g.list.length, 0),
+        blocked: groups.reduce((n, g) => n + g.tally.blocked, 0),
+        groups,
+      };
+    });
+    return out.sort((x, y) => Number(y.online) - Number(x.online) || y.blocked - x.blocked || x.name.localeCompare(y.name));
+  }, [devices, foldedSpaces, groupOf, inScope, q, statusFilter]);
 
-  const headline = counts.blocked
+  const [createTarget, setCreateTarget] = useState<{ host: string | null; space: string | null }>({ host: null, space: null });
+  const openCreate = (host: string | null, space: string | null) => {
+    setCreateTarget({ host, space });
+    setCreateOpen(true);
+  };
+  const [menu, setMenu] = useState<QuickMenuState | null>(null);
+  const [detailTab, setDetailTab] = useState<{ key: string; tab: "chat" | "term" } | null>(null);
+  const [fabCompact, setFabCompact] = useState(false);
+  const lastScrollRef = useRef(0);
+
+  const openAgentAt = (key: string, tab: "chat" | "term") => {
+    setDetailTab({ key, tab });
+    onSelectAgent(key);
+  };
+
+  const selectedAgent = useMemo(() => all.find((a) => a.key === selectedKey) ?? null, [all, selectedKey]);
+  const onlyOfflineHosts = hosts.length > 0 && (hostFilter ? !hosts.find((h) => h.id === hostFilter)?.online : hosts.every((h) => !h.online));
+  const listEmpty = groupMode === "space" ? spaceGroups.length === 0 : sections.length === 0;
+
+  const headline = link === "online" && onlyOfflineHosts && !inScope.length
+    ? "电脑离线，暂时看不到 agent"
+    : counts.blocked
     ? `有 ${counts.blocked} 个 agent 在等你`
     : counts.working
       ? `${counts.working} 个 agent 正在忙`
@@ -161,24 +442,74 @@ export function AgentsView({
         ? "大家都忙完啦"
         : "大家都歇着呢";
 
+  const initialTab = detailTab && detailTab.key === selectedAgent?.key ? detailTab.tab : "chat";
+
   if (mobileLayout && selectedAgent) {
     return (
       <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
-        <AgentDetailPanel agent={selectedAgent} onBack={() => onSelectAgent(null)} mobile />
+        <AgentDetailPanel
+          key={`${selectedAgent.key}:${initialTab}`}
+          agent={selectedAgent}
+          initialTab={initialTab}
+          onBack={() => {
+            setDetailTab(null);
+            onSelectAgent(null);
+          }}
+          onOpenWorkbench={onOpenWorkbench}
+          mobile
+        />
       </div>
     );
   }
 
+  const quickActions = menu ? (
+    <AgentQuickMenu
+      state={menu}
+      onClose={() => setMenu(null)}
+      onOpen={(tab) => openAgentAt(menu.agent.key, tab)}
+      onNewHere={() => openCreate(menu.agent.deviceId, agentSpace(menu.agent) ?? null)}
+      onCopyPath={() => {
+        const path = menu.agent.cwd;
+        if (!path) return;
+        void copyToClipboard(path).then((ok) => toast(ok ? "文件夹路径已复制" : "复制失败", !ok));
+      }}
+    />
+  ) : null;
+
+  const rowFor = (agent: Agent, showSpace: boolean) => {
+    const offline = !isOnline(agent);
+    const sub = [
+      showSpace ? agentSpace(agent) : null,
+      // 按空间 already shows the computer as a header.
+      groupMode === "status" ? devices[agent.deviceId]?.name : null,
+      agent.turn ? `第 ${agent.turn} 轮` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return (
+      <AgentRow
+        key={agent.key}
+        agent={agent}
+        offline={offline}
+        selected={selectedKey === agent.key}
+        dark={dark}
+        sub={sub || agent.cwd || agent.harness}
+        onOpen={() => openAgentAt(agent.key, "chat")}
+        onMenu={(x, y, sheet) => setMenu({ agent, x, y, sheet: sheet || mobileLayout })}
+      />
+    );
+  };
+
   const listPane = (
     <div className="stack" style={{ gap: 12 }}>
       <div className="between">
-        <div className="row">
+        <div className="row" style={{ minWidth: 0 }}>
           <PocketIconButton tooltip="筛选电脑与空间" onClick={() => setDrawerOpen(true)}>
             <Menu size={17} />
           </PocketIconButton>
-          <div>
-            <h2 className="cute-font" style={{ margin: 0, fontSize: 22 }}>{greeting()}</h2>
-            <div className="faint">{headline}</div>
+          <div style={{ minWidth: 0 }}>
+            <h2 className="cute-font" style={{ margin: 0, fontSize: fs(22) }}>{greeting()}</h2>
+            <div className="faint truncate" title={headline}>{headline}</div>
           </div>
         </div>
         <div className="row" style={{ gap: 6 }}>
@@ -189,10 +520,10 @@ export function AgentsView({
             <Terminal size={16} />
           </PocketIconButton>
           {!mobileLayout ? (
-            <PocketIconButton tooltip="新建 Agent" onClick={() => setCreateOpen(true)}>
+            <PocketIconButton tooltip="新建 Agent" onClick={() => openCreate(hostFilter, activeSpace)}>
               <Plus size={17} />
             </PocketIconButton>
-          ) : (
+          ) : listEmpty ? null : (
             <XiaoyangOrb mood={counts.blocked ? "waiting" : counts.working ? "working" : "hello"} size={44} />
           )}
         </div>
@@ -214,11 +545,20 @@ export function AgentsView({
               className={`stat-tile ${item.tone}${active ? " active" : ""}`}
               onClick={() => setStatusFilter(active ? null : item.key)}
             >
-              <span style={{ fontSize: 12.5, fontWeight: 800 }}>{item.label}</span>
+              <span style={{ fontSize: fs(12.5), fontWeight: 800 }}>{item.label}</span>
               <span className="stat-tile-num num">{counts[item.key]}</span>
             </button>
           );
         })}
+      </div>
+
+      <div className="segmented group-toggle" role="tablist" aria-label="分组方式">
+        <button role="tab" aria-selected={groupMode === "space"} className={groupMode === "space" ? "active" : ""} onClick={() => setGroupMode("space")}>
+          按空间
+        </button>
+        <button role="tab" aria-selected={groupMode === "status"} className={groupMode === "status" ? "active" : ""} onClick={() => setGroupMode("status")}>
+          按状态
+        </button>
       </div>
 
       {/* Filter Tags */}
@@ -250,16 +590,32 @@ export function AgentsView({
       ) : null}
 
       {/* List */}
-      {sections.length === 0 ? (
+      {listEmpty ? (
         <EmptyState
           mood="sleepy"
-          title={link !== "online" ? "还在连服务器" : hosts.length === 0 ? "还没有电脑加入" : "这里空空的"}
+          title={
+            link !== "online"
+              ? "还在连服务器"
+              : hosts.length === 0
+                ? "还没有电脑加入"
+                : onlyOfflineHosts
+                  ? hostFilter || hosts.length === 1
+                    ? `${hosts.find((h) => h.id === (hostFilter ?? hosts[0]!.id))?.name ?? "这台电脑"}离线了`
+                    : "电脑都离线了"
+                  : q || statusFilter || activeSpace
+                    ? "没有符合条件的 agent"
+                    : "还没有 agent"
+          }
           body={
             link !== "online"
               ? "连上以后，各台电脑上的 agent 会出现在这里。"
               : hosts.length === 0
                 ? "在电脑上运行 herdr-pocket up，再到“设备”页扫码或配对。"
-                : "换个筛选条件试试，或者新建一个 agent。"
+                : onlyOfflineHosts
+                  ? "确认那台电脑开着、herdr-pocket 在运行；它重新上线后，agent 会自动出现在这里。"
+                  : q || statusFilter || activeSpace
+                    ? "换个筛选条件试试。"
+                    : "点“新建”在某台电脑上开一个 agent。"
           }
           action={
             <PocketButton size="sm" variant="soft" onClick={() => pingRelay()}>
@@ -268,6 +624,50 @@ export function AgentsView({
             </PocketButton>
           }
         />
+      ) : groupMode === "space" ? (
+        <div className="stack" style={{ gap: 12 }}>
+          {spaceGroups.map((dev) => (
+            <div key={dev.deviceId} className="stack" style={{ gap: 8 }}>
+              {spaceGroups.length > 1 ? (
+                <div className="computer-head">
+                  <Laptop size={15} />
+                  <span className="truncate">{dev.name}</span>
+                  <span className={`status-pip${dev.online ? " ok" : ""}`} aria-label={dev.online ? "在线" : "离线"} />
+                  <span className="faint num">{dev.count}</span>
+                </div>
+              ) : null}
+              {dev.groups.map((g) => {
+                const label = g.space || "未分空间";
+                return (
+                  <div key={g.id} className="stack" style={{ gap: 6 }}>
+                    <div className="space-head">
+                      <button className="space-head-main" aria-expanded={!g.folded} onClick={() => !q && !statusFilter && toggleSpace(g.id)}>
+                        <span className={`space-badge tone-${toneIndex(label)}`} aria-hidden>
+                          {[...label][0]?.toUpperCase()}
+                        </span>
+                        <span className="space-name truncate">{label}</span>
+                        <span className="faint num">{g.list.length}</span>
+                        <span className="space-dots" aria-label={`需要你 ${g.tally.blocked}，工作中 ${g.tally.working}，已完成 ${g.tally.done}`}>
+                          {g.tally.blocked ? <span className="space-dot blocked num">{g.tally.blocked}</span> : null}
+                          {g.tally.working ? <span className="space-dot working num">{g.tally.working}</span> : null}
+                          {g.tally.done ? <span className="space-dot done num">{g.tally.done}</span> : null}
+                        </span>
+                        <span className="grow" />
+                        {!q && !statusFilter ? g.folded ? <ChevronRight size={16} /> : <ChevronDown size={16} /> : null}
+                      </button>
+                      {g.space && dev.online ? (
+                        <PocketIconButton size="sm" className="space-add" tooltip={`在空间 ${g.space} 新建 agent`} onClick={() => openCreate(dev.deviceId, g.space)}>
+                          <Plus size={14} />
+                        </PocketIconButton>
+                      ) : null}
+                    </div>
+                    {g.folded ? null : g.list.map((agent) => rowFor(agent, false))}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
       ) : (
         <div className="stack" style={{ gap: 8 }}>
           {sections.map((sec) => (
@@ -277,38 +677,12 @@ export function AgentsView({
                 style={{ border: 0, background: "transparent", padding: "4px 4px", cursor: "pointer", color: "var(--muted)" }}
                 onClick={() => !q && !statusFilter && toggleGroup(sec.key)}
               >
-                <span style={{ fontWeight: 800, fontSize: 13 }}>
+                <span style={{ fontWeight: 800, fontSize: fs(13) }}>
                   {sec.title} <span className="faint num">{sec.count}</span>
                 </span>
                 {!q && !statusFilter ? (sec.folded ? <ChevronRight size={16} /> : <ChevronDown size={16} />) : null}
               </button>
-              {sec.data.map((agent) => {
-                const offline = !isOnline(agent);
-                const sub = [devices[agent.deviceId]?.name, agent.turn ? `第 ${agent.turn} 轮` : null].filter(Boolean).join(" · ");
-                return (
-                  <button
-                    key={agent.key}
-                    className={`agent-row${selectedKey === agent.key ? " selected" : ""}${agent.status === "blocked" && !offline ? " needs-you" : ""}`}
-                    onClick={() => onSelectAgent(agent.key)}
-                  >
-                    <VendorAvatar harness={agent.harness} isShell={agent.isShell} dark={dark} size={42} />
-                    <div className="grow">
-                      <div style={{ fontWeight: 800, fontSize: 14.5 }} className="truncate">
-                        {spacedTitle(agent)}
-                      </div>
-                      <div className="faint truncate">
-                        {sub || agent.cwd || agent.harness}
-                      </div>
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-                      <PocketBadge tone={offline ? "neutral" : statusTone(agent.status)} pulse={!offline && (agent.status === "working" || agent.status === "blocked")}>
-                        {offline ? "离线" : STATUS_LABEL[agent.status]}
-                      </PocketBadge>
-                      <span className="faint num" style={{ fontSize: 11.5 }}>{relTime(agent.statusSince ?? agent.updatedAt)}</span>
-                    </div>
-                  </button>
-                );
-              })}
+              {sec.data.map((agent) => rowFor(agent, true))}
             </div>
           ))}
         </div>
@@ -317,12 +691,28 @@ export function AgentsView({
   );
 
   return (
-    <div style={{ height: "100%", minHeight: 0 }}>
+    // A flex column, so the narrow list's .mobile-scroll (flex: 1) gets a height and actually scrolls.
+    <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
       {mobileLayout ? (
-        <div className="mobile-scroll">
+        <div
+          className="mobile-scroll has-fab"
+          onScroll={(e) => {
+            const top = e.currentTarget.scrollTop;
+            const delta = top - lastScrollRef.current;
+            if (Math.abs(delta) > 6) {
+              setFabCompact(delta > 0 && top > 24);
+              lastScrollRef.current = top;
+            }
+          }}
+        >
           {listPane}
-          <button className="fab-plus" aria-label="新建 Agent" onClick={() => setCreateOpen(true)}>
-            <Plus size={24} />
+          <button
+            className={`fab-new${fabCompact ? " compact" : ""}`}
+            aria-label="新建 Agent"
+            onClick={() => openCreate(hostFilter, activeSpace)}
+          >
+            <Plus size={20} />
+            <span className="fab-new-label">新建</span>
           </button>
         </div>
       ) : (
@@ -330,13 +720,16 @@ export function AgentsView({
           <div className="agents-col">{listPane}</div>
           <div className="detail-pane">
             {selectedAgent ? (
-              <AgentDetailPanel agent={selectedAgent} />
+              <AgentDetailPanel key={`${selectedAgent.key}:${initialTab}`} agent={selectedAgent} initialTab={initialTab} onOpenWorkbench={onOpenWorkbench} />
+            ) : listEmpty ? (
+              <div className="detail-hint faint">agent 出现后，点左侧任意一个在这里查看对话和终端。</div>
             ) : (
               <EmptyState mood="hello" title="选一个 Agent" body="点左侧任意 agent，在这里查看实时对话、终端输出、子 agent，或者发消息与图片。" />
             )}
           </div>
         </div>
       )}
+      {quickActions}
 
       {/* Filter Drawer Modal */}
       <PocketModal open={drawerOpen} onOpenChange={setDrawerOpen} title="按电脑或空间筛选" width={400}>
@@ -407,9 +800,10 @@ export function AgentsView({
         open={createOpen}
         onOpenChange={setCreateOpen}
         hosts={hosts}
-        defaultHost={hostFilter}
-        defaultSpace={activeSpace}
+        defaultHost={createTarget.host ?? hostFilter}
+        defaultSpace={createTarget.space ?? activeSpace}
         onCreated={(key) => {
+          setDetailTab(null);
           onSelectAgent(key);
           toast("已创建并打开 Agent");
         }}
@@ -418,17 +812,24 @@ export function AgentsView({
   );
 }
 
-function AgentDetailPanel({
+export function AgentDetailPanel({
   agent,
+  initialTab = "chat",
   onBack,
+  onOpenWorkbench,
   mobile = false,
+  embedded = false,
 }: {
   agent: Agent;
+  initialTab?: "chat" | "term";
   onBack?: () => void;
+  onOpenWorkbench?: (agentKey: string) => void;
   mobile?: boolean;
+  /** Inside a v3 pane: the pane header already shows harness, title and folder. */
+  embedded?: boolean;
 }) {
   const toast = useToast();
-  const [tab, setTab] = useState<"chat" | "term" | "subs">("chat");
+  const [tab, setTab] = useState<"chat" | "term" | "subs">(initialTab);
   const [events, setEvents] = useState<ConvEvent[]>([]);
   const [termLines, setTermLines] = useState<string[]>([]);
   const [subs, setSubs] = useState<SubSession[]>([]);
@@ -438,6 +839,8 @@ function AgentDetailPanel({
   const [sending, setSending] = useState(false);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const termScrollRef = useRef<HTMLDivElement>(null);
+  const pasteCatchRef = useRef<HTMLTextAreaElement>(null);
+  const pasteArmedRef = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -509,7 +912,8 @@ function AgentDetailPanel({
 
   useEffect(() => {
     const el = chatScrollRef.current;
-    if (el && tab === "chat") el.scrollTop = el.scrollHeight;
+    // Only a thread with messages sticks to the bottom; the empty state is read from the top.
+    if (el && tab === "chat") el.scrollTop = events.length ? el.scrollHeight : 0;
   }, [events.length, tab]);
 
   useEffect(() => {
@@ -580,8 +984,9 @@ function AgentDetailPanel({
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
       {/* Top Bar */}
-      <div className="between wrap" style={{ padding: "10px 14px", borderBottom: "1px solid var(--divider)", flexShrink: 0 }}>
-        <div className="row grow" style={{ minWidth: 0 }}>
+      <div className={`between wrap${embedded ? " detail-toolbar" : ""}`} style={embedded ? undefined : { padding: "10px 14px", borderBottom: "1px solid var(--divider)", flexShrink: 0, flexWrap: "wrap", rowGap: 8 }}>
+        {/* Narrow windows: the actions drop below the title instead of squeezing it to a few letters. */}
+        <div className="row" style={{ minWidth: 0, flex: "1 1 200px", display: embedded ? "none" : undefined }}>
           {mobile && onBack ? (
             <PocketIconButton size="sm" onClick={onBack} tooltip="返回">
               <ArrowLeft size={16} />
@@ -589,7 +994,7 @@ function AgentDetailPanel({
           ) : null}
           <VendorAvatar harness={agent.harness} isShell={agent.isShell} size={36} />
           <div className="grow">
-            <div style={{ fontWeight: 800, fontSize: 15 }} className="truncate">{spacedTitle(agent)}</div>
+            <div style={{ fontWeight: 800, fontSize: fs(15) }} className="truncate">{spacedTitle(agent)}</div>
             <div className="faint truncate">{agent.cwd || agent.where || agent.harness}</div>
           </div>
         </div>
@@ -602,6 +1007,11 @@ function AgentDetailPanel({
               <button className={tab === "subs" ? "active" : ""} onClick={() => setTab("subs")}>子 agent ({subs.length || agent.subagents})</button>
             ) : null}
           </div>
+          {onOpenWorkbench && agent.cwd && !agent.isShell ? (
+            <PocketIconButton size="sm" tooltip="在工作台看它的文件" onClick={() => onOpenWorkbench(agent.key)}>
+              <FolderOpen size={14} />
+            </PocketIconButton>
+          ) : null}
           <PocketIconButton
             size="sm"
             tooltip="中断当前轮 (Esc)"
@@ -644,10 +1054,10 @@ function AgentDetailPanel({
               if (ev.kind === "tool_call") {
                 return (
                   <details key={ev.id} className="pk-card soft" style={{ padding: "8px 12px" }}>
-                    <summary style={{ cursor: "pointer", fontWeight: 700, fontSize: 12.5 }}>
+                    <summary style={{ cursor: "pointer", fontWeight: 700, fontSize: fs(12.5) }}>
                       调用工具：<span className="mono">{ev.name}</span>
                     </summary>
-                    <pre className="mono" style={{ fontSize: 11.5, margin: "6px 0 0", overflowX: "auto" }}>
+                    <pre className="mono" style={{ fontSize: fs(11.5), margin: "6px 0 0", overflowX: "auto" }}>
                       {JSON.stringify(ev.input, null, 2)}
                     </pre>
                   </details>
@@ -656,10 +1066,10 @@ function AgentDetailPanel({
               if (ev.kind === "tool_result") {
                 return (
                   <details key={ev.id} className="pk-card soft" style={{ padding: "8px 12px" }}>
-                    <summary style={{ cursor: "pointer", fontWeight: 700, fontSize: 12.5, color: ev.is_error ? "var(--blush-text)" : "var(--mint-text)" }}>
+                    <summary style={{ cursor: "pointer", fontWeight: 700, fontSize: fs(12.5), color: ev.is_error ? "var(--blush-text)" : "var(--mint-text)" }}>
                       {ev.is_error ? "工具出错" : "工具返回"} {ev.name || ""}
                     </summary>
-                    <pre className="mono" style={{ fontSize: 11.5, margin: "6px 0 0", whiteSpace: "pre-wrap" }}>{ev.output}</pre>
+                    <pre className="mono" style={{ fontSize: fs(11.5), margin: "6px 0 0", whiteSpace: "pre-wrap" }}>{ev.output}</pre>
                   </details>
                 );
               }
@@ -675,38 +1085,60 @@ function AgentDetailPanel({
             ref={termScrollRef}
             tabIndex={0}
             className="term-box"
-            title="点击此处后可直接用键盘输入终端控制符"
+            title={MAC ? "点击此处后可直接用键盘输入终端控制符" : "点击此处后可直接用键盘输入；Ctrl+V 粘贴，选中文字后 Ctrl+C 复制"}
             onKeyDown={(e) => {
-              if (e.metaKey && (e.key === "c" || e.key === "v" || e.key === "k")) return;
-              const map: Record<string, string> = {
-                Enter: "\r",
-                Backspace: "\x7f",
-                Tab: "\t",
-                Escape: "\x1b",
-                ArrowUp: "\x1b[A",
-                ArrowDown: "\x1b[B",
-                ArrowRight: "\x1b[C",
-                ArrowLeft: "\x1b[D",
-              };
-              if (e.ctrlKey && e.key.length === 1) {
-                const code = e.key.toUpperCase().charCodeAt(0) - 64;
-                if (code >= 1 && code <= 26) {
+              const action = termKeyAction(e, MAC, termSelection(termScrollRef.current) !== "");
+              switch (action.kind) {
+                case "send":
                   e.preventDefault();
-                  void sendRawInput(String.fromCharCode(code));
+                  void sendRawInput(action.data);
                   return;
-                }
-              }
-              if (map[e.key]) {
-                e.preventDefault();
-                void sendRawInput(map[e.key]!);
-              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-                e.preventDefault();
-                void sendRawInput(e.key);
+                case "copy":
+                  e.preventDefault();
+                  void copyToClipboard(termSelection(termScrollRef.current));
+                  return;
+                case "paste":
+                  // The browser's own paste lands in the hidden box below, which forwards it;
+                  // reading the clipboard directly would need a permission prompt.
+                  pasteArmedRef.current = Date.now();
+                  pasteCatchRef.current?.focus();
+                  window.setTimeout(() => {
+                    if (!pasteArmedRef.current) return;
+                    pasteArmedRef.current = 0;
+                    termScrollRef.current?.focus();
+                    void navigator.clipboard
+                      ?.readText()
+                      .then((t) => (t ? sendRawInput(t) : undefined))
+                      .catch(() => toast("读不到剪贴板：在别处复制后再按 Ctrl+V，或用下方输入框发送", true));
+                  }, 250);
+                  return;
+                case "none":
+                  e.preventDefault();
+                  return;
+                case "native-copy":
+                case "pass":
+                  return;
               }
             }}
           >
             {renderAnsiLines(termLines)}
           </div>
+          <textarea
+            ref={pasteCatchRef}
+            className="paste-catch"
+            aria-hidden
+            tabIndex={-1}
+            onPaste={(e) => {
+              e.preventDefault();
+              const t = e.clipboardData?.getData("text/plain") ?? "";
+              pasteArmedRef.current = 0;
+              termScrollRef.current?.focus();
+              if (t) void sendRawInput(t);
+            }}
+            onBlur={(e) => {
+              e.currentTarget.value = "";
+            }}
+          />
           <div className="term-keybar">
             {[
               { label: "Esc", keys: ["esc"] },
@@ -803,7 +1235,7 @@ function AgentDetailPanel({
         </PocketIconButton>
         <textarea
           rows={1}
-          placeholder={`发给 ${agent.name || agent.title || agent.harness}…`}
+          placeholder={`发给 ${clip(agent.name || agent.title || agent.harness, 16)}`}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onPaste={(e) => {
@@ -841,7 +1273,7 @@ function AgentDetailPanel({
   );
 }
 
-function CreateAgentModal({
+export function CreateAgentModal({
   open,
   onOpenChange,
   hosts,

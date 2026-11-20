@@ -21,7 +21,9 @@
 # In mainland China (by the time zone) GitHub and nodejs.org are slow or out of reach, so
 # downloads go through mirrors first: ghfast.top / gh-proxy.com for the release, npmmirror.com
 # for Node. Checksums still decide. $env:HERDR_POCKET_MIRROR = "1" turns that on anywhere,
-# "0" turns it off. From China, fetch the script itself through a mirror too:
+# "0" turns it off; so does "update": {"region": "cn"|"global"} in an existing config.json
+# (docs/config.md). Release sources are raced first and the fastest is used.
+# From China, fetch the script itself through a mirror too:
 #   & ([scriptblock]::Create((irm https://ghfast.top/https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
 # Later: `herdr-pocket update` installs new releases, `herdr-pocket status` shows the state.
 
@@ -61,25 +63,84 @@ function Fetch([string]$url, [string]$out) {
   }
 }
 
-# Mainland China by the time zone; HERDR_POCKET_MIRROR forces it either way.
+# Mainland China by the time zone; HERDR_POCKET_MIRROR forces it either way, then `update.region`
+# in config.json (the same order as `herdr-pocket`, docs/config.md).
 function InChina {
   switch -regex ("$env:HERDR_POCKET_MIRROR") {
-    "^(1|true|on|yes)$" { return $true }
-    "^(0|false|off|no)$" { return $false }
+    "^(1|true|on|yes|cn)$" { $script:RegionWhy = "HERDR_POCKET_MIRROR"; return $true }
+    "^(0|false|off|no|global)$" { $script:RegionWhy = "HERDR_POCKET_MIRROR"; return $false }
+  }
+  $cfgDir = if ($env:HERDR_POCKET_HOME) { $env:HERDR_POCKET_HOME } else { Join-Path $env:APPDATA "herdr-pocket" }
+  $cfg = Join-Path $cfgDir "config.json"
+  if (Test-Path -LiteralPath $cfg) {
+    try {
+      $region = (Get-Content -Raw -Encoding UTF8 -LiteralPath $cfg | ConvertFrom-Json).update.region
+      $script:RegionWhy = "config.json update.region"
+      if ($region -eq "cn") { return $true }
+      if ($region -eq "global") { return $false }
+    } catch {
+      Warn "$cfg is not valid JSON; deciding by the time zone"
+    }
   }
   $tz = [TimeZoneInfo]::Local.Id
+  $script:RegionWhy = "time zone $tz"
   return ($tz -eq "China Standard Time") -or ($tz -in @("Asia/Shanghai", "Asia/Chongqing", "Asia/Chungking", "Asia/Harbin", "Asia/Urumqi", "Asia/Kashgar", "PRC"))
 }
 $China = InChina
+Say "download region: $(if ($China) { "cn" } else { "global" }) ($script:RegionWhy)"
 
-# A github.com file from the first source that delivers: the mirrors first in China, last elsewhere.
+# Release sources as prefixes put in front of a github.com address ("" is GitHub itself): the
+# mirrors first in China, last elsewhere (protocol `sourcePrefixes`, install-host.sh PREFIXES).
+$Mirrors = @("https://ghfast.top/", "https://gh-proxy.com/", "https://cdn.gh-proxy.com/", "https://edgeone.gh-proxy.com/")
+$script:Prefixes = if ($China) { @($Mirrors + @("")) } else { @(@("") + $Mirrors) }
+
+# Asks every source at once for the latest release's small SHA256SUMS (4 s each). Once one answers
+# the others get 150 ms more; the fastest goes first, and one earlier in the order wins when it was
+# at most 150 ms slower (protocol `pickFastest`). Nothing answered: the order stays as it is.
+function RaceSources {
+  $client = $null
+  try {
+    Add-Type -AssemblyName System.Net.Http
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromSeconds(4)
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd("herdr-pocket-installer")
+    $url = "https://github.com/$Repo/releases/latest/download/SHA256SUMS"
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $tasks = @($script:Prefixes | ForEach-Object { $client.GetStringAsync($_ + $url) })
+    $ms = @{}
+    $firstOk = -1
+    while ($clock.ElapsedMilliseconds -lt 4500 -and $ms.Count -lt $tasks.Count) {
+      for ($i = 0; $i -lt $tasks.Count; $i++) {
+        if ($ms.ContainsKey($i) -or -not $tasks[$i].IsCompleted) { continue }
+        $ms[$i] = $clock.ElapsedMilliseconds
+        if ($firstOk -lt 0 -and $tasks[$i].Status -eq "RanToCompletion") { $firstOk = $ms[$i] }
+      }
+      if ($firstOk -ge 0 -and $clock.ElapsedMilliseconds -ge $firstOk + 150) { break }
+      Start-Sleep -Milliseconds 25
+    }
+    $best = -1
+    for ($i = 0; $i -lt $tasks.Count; $i++) {
+      if (-not $ms.ContainsKey($i) -or $tasks[$i].Status -ne "RanToCompletion" -or $tasks[$i].Result -notmatch "herdr-pocket-") { continue }
+      if ($best -lt 0 -or $ms[$i] + 150 -lt $ms[$best]) { $best = $i }
+    }
+    if ($best -lt 0) { return }
+    $winner = $script:Prefixes[$best]
+    $label = if ($winner) { ([Uri]$winner).Host } else { "github.com" }
+    Say "fastest download source: $label ($($ms[$best]) ms)"
+    $script:Prefixes = @(@($winner) + @($script:Prefixes | Where-Object { $_ -ne $winner }))
+  } catch {
+    Warn "could not race the download sources ($($_.Exception.Message)); trying them in order"
+  } finally {
+    if ($client) { $client.Dispose() }
+  }
+}
+
+# A github.com file from the first source that delivers, in $script:Prefixes order.
 function GhFetch([string]$url, [string]$out) {
-  $sources = @($url, "https://ghfast.top/$url", "https://gh-proxy.com/$url")
-  if ($China) { $sources = @("https://ghfast.top/$url", "https://gh-proxy.com/$url", $url) }
   $last = $null
-  foreach ($u in $sources) {
+  foreach ($p in $script:Prefixes) {
     try {
-      Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $out -Headers @{ "User-Agent" = "herdr-pocket-installer" }
+      Invoke-WebRequest -UseBasicParsing -Uri ($p + $url) -OutFile $out -Headers @{ "User-Agent" = "herdr-pocket-installer" }
       return
     } catch {
       $last = $_
@@ -186,6 +247,7 @@ function InstallBundle {
     } else {
       $sumsFile = Join-Path $tmp "SHA256SUMS"
       $tag = ""
+      RaceSources
       if ($Version) {
         $tag = "v" + $Version.TrimStart("v")
         GhFetch "https://github.com/$Repo/releases/download/$tag/SHA256SUMS" $sumsFile

@@ -19,7 +19,8 @@ import type { EventInput } from "../eventlog.ts";
 import type { Assistant } from "./assistant.ts";
 import { claimCall, releaseCall } from "./calls.ts";
 import { personaPrompt, voiceInstructions } from "./prompts.ts";
-import { clip } from "./speech.ts";
+import { CaptionPacer } from "./captions.ts";
+import { clip, taskTitle } from "./speech.ts";
 
 export interface RealtimeConfig {
   provider: "openai-realtime";
@@ -783,6 +784,7 @@ interface Run {
 export class RealtimeCall {
   private upstream: WebSocket;
   private ended = false;
+  private captions = new CaptionPacer();
   private ready = false;
   /** Unique per call: transcript lines of two calls must never share an id (turn numbers restart at 1). */
   private id = randomUUID().slice(0, 8);
@@ -1149,7 +1151,7 @@ export class RealtimeCall {
         r.text += d.delta;
         if (!r.stopped && r.text.trim()) {
           if (this.isTurnAsrPending(r.turn)) r.deferredText = true;
-          else this.toPhone({ action: "output.transcript.updated", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
+          else this.caption(r);
         }
         return;
       }
@@ -1304,7 +1306,17 @@ export class RealtimeCall {
     this.asrHoldTimer = setTimeout(() => this.flushAsrHold(), ms);
   }
 
+  /** The growing caption, paced (captions.ts); checked again when it goes, since the answer may have ended or been cut by then. */
+  private caption(r: Run): void {
+    this.captions.push(r.id, () => {
+      if (this.ended || r.stopped || r.transcriptDone || !r.text.trim()) return;
+      if (this.isTurnAsrPending(r.turn)) r.deferredText = true;
+      else this.toPhone({ action: "output.transcript.updated", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
+    });
+  }
+
   private emitAssistantTranscriptDone(r: Run): void {
+    this.captions.cancel(r.id);
     this.toPhone({ action: "output.transcript.done", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
     this.assistant.voiceLine("assistant", r.text, `${this.id}-${r.id}`, this.assistantTs(r.turn));
     this.remember("assistant", r.text, Number(r.turn));
@@ -1323,7 +1335,10 @@ export class RealtimeCall {
       if (r.deferredText && !r.stopped && r.text.trim()) {
         r.deferredText = false;
         if (r.transcriptDone) this.emitAssistantTranscriptDone(r);
-        else this.toPhone({ action: "output.transcript.updated", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
+        else {
+          this.captions.cancel(r.id);
+          this.toPhone({ action: "output.transcript.updated", data: { text: r.text, run_id: r.id, turn_id: r.turn } });
+        }
       } else {
         r.deferredText = false;
       }
@@ -1377,7 +1392,7 @@ export class RealtimeCall {
     }
     const ac = new AbortController();
     this.tasks.set(callId, ac);
-    const title = clip(objective.replace(/\s+/g, " ").trim(), 40);
+    const title = taskTitle(objective);
     this.toPhone({ action: "relay.task", data: { id: callId, title, status: "running" } });
     this.assistant
       .delegate(objective, this.recent.map(({ role, content }) => ({ role, content })), ac.signal)
@@ -1456,6 +1471,7 @@ export class RealtimeCall {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.asrHoldTimer) clearTimeout(this.asrHoldTimer);
+    this.captions.clear();
     this.detach();
     for (const ac of this.tasks.values()) ac.abort();
     this.tasks.clear();

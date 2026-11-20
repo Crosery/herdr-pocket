@@ -1,5 +1,5 @@
 import { FlatList, Pressable, View } from "react-native";
-import { ActivityIndicator, Button, Text } from "react-native-paper";
+import { Text } from "react-native-paper";
 import { router } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
@@ -10,10 +10,10 @@ import { openSub, SUB_STATUS, subLabel, type Crumb } from "../lib/subnav";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space, statusColors } from "../theme/tokens";
 import { Card, EmptyState, HarnessAvatar } from "./ui";
+import { PocketButton, PocketSpinner } from "./pocket";
 
 /** Children of the agent's session (or of `sub`), newest first. Read-only; tap to open. */
 export function SubagentList({ agent, sub, trail, active, bottomInset }: { agent: Agent; sub?: string; trail: Crumb[]; active: boolean; bottomInset: number }) {
-  const p = usePalette();
   const q = useQuery({
     queryKey: ["session.children", agent.key, sub ?? null],
     queryFn: () => call(agent.deviceId, "session.children", { agent: agent.key, sub }),
@@ -23,12 +23,12 @@ export function SubagentList({ agent, sub, trail, active, bottomInset }: { agent
   if (q.isLoading) {
     return (
       <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
-        <ActivityIndicator />
+        <PocketSpinner size={28} />
       </View>
     );
   }
   if (q.isError) {
-    return <EmptyState mood="waiting" title="子 agent 列表没拿到" body={(q.error as Error).message} action={<Button textColor={p.accentText} onPress={() => q.refetch()}>再试一次</Button>} />;
+    return <EmptyState mood="waiting" title="子 agent 列表没拿到" body={(q.error as Error).message} action={<PocketButton variant="text" onPress={() => q.refetch()}>再试一次</PocketButton>} />;
   }
   const list = q.data?.sessions ?? [];
   return (
