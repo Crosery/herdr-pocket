@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Agent, ConvEvent } from "@herdr-pocket/protocol";
-import { askAgentBtw, buildBtwContext, preferredBinariesForHarness, type BtwRunnerRequest } from "../src/btw.ts";
+import { askAgentBtw, buildBtwCliArgs, buildBtwContext, preferredBinariesForHarness, type BtwRunnerRequest } from "../src/btw.ts";
 
 const baseAgent: Agent = {
   key: "dev-1/hc:t1",
@@ -57,8 +57,31 @@ test("askAgentBtw fetches up to 16 Uniflo events (~10k chars), uses ephemeral re
   assert.ok(calls[0]!.args.includes("-p"));
   assert.ok(calls[0]!.args.includes("--no-session"));
   assert.ok(calls[0]!.args.includes("--no-tools"));
+  assert.ok(calls[0]!.args.includes("--no-judge"));
+  assert.ok(calls[0]!.args.includes("--no-spotlight"));
+  assert.ok(calls[0]!.args.includes("--hide-thinking"));
   assert.ok(calls[0]!.args.includes("--cwd"));
   assert.ok(calls[0]!.args.includes("/tmp/demo-proj"));
+  assert.deepEqual(buildBtwCliArgs("omp", "hello", "/tmp/demo-proj"), [
+    "-p",
+    "--no-session",
+    "--no-tools",
+    "--no-judge",
+    "--no-spotlight",
+    "--hide-thinking",
+    "--cwd",
+    "/tmp/demo-proj",
+    "hello",
+  ]);
+  assert.deepEqual(buildBtwCliArgs("omp", "hello"), [
+    "-p",
+    "--no-session",
+    "--no-tools",
+    "--no-judge",
+    "--no-spotlight",
+    "--hide-thinking",
+    "hello",
+  ]);
   const promptArg = calls[0]!.args[calls[0]!.args.length - 1]!;
   assert.match(promptArg, /Check oauth callback/);
   assert.match(promptArg, /现在 auth 回调卡在哪里？/);

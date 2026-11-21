@@ -25,9 +25,11 @@ import {
   X,
 } from "lucide-react";
 import {
+  HARNESS_DEFAULT_THINKING_LEVELS,
   PUT_LIMITS,
   applyRows,
   buildHarnessSwitchCommands,
+  normalizeSwitchHarness,
   stripModelEffortSuffix,
   textWithFiles,
   type Agent,
@@ -983,7 +985,18 @@ export function AgentDetailPanel({
   const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
   const [modelMenuMode, setModelMenuMode] = useState<"model" | "thinking" | null>(null);
+  const hasReasoningEvents = useMemo(() => events.some((e) => e.kind === "reasoning"), [events]);
   const modelMeta = useAutoAgentModelMeta(agent);
+  const effectiveThinkingLevels = useMemo(() => {
+    if (modelMeta.thinkingLevels && modelMeta.thinkingLevels.length > 0) {
+      return modelMeta.thinkingLevels;
+    }
+    if (hasReasoningEvents && !agent.isShell) {
+      const defaults = HARNESS_DEFAULT_THINKING_LEVELS[normalizeSwitchHarness(agent.harness)];
+      return defaults ? [...defaults] : ["low", "medium", "high"];
+    }
+    return [];
+  }, [agent.harness, agent.isShell, hasReasoningEvents, modelMeta.thinkingLevels]);
   const applyModelMetaOverride = modelMeta.applyOverride;
   const [btwTurnsByAgent, setBtwTurnsByAgent] = useState<Record<string, BtwTurn[]>>({});
   const [chipDismissedPrefix, setChipDismissedPrefix] = useState<string | null>(null);
@@ -1698,23 +1711,51 @@ export function AgentDetailPanel({
         [targetKey]: [...(prev[targetKey] ?? []).slice(-5), pendingTurn],
       }));
       try {
-        const res = await executeAgentBtw(agent, question);
-        setBtwTurnsByAgent((prev) => ({
-          ...prev,
-          [targetKey]: (prev[targetKey] ?? []).map((t) =>
-            t.id === turnId
-              ? { ...t, status: "done", answer: res.answer, model: res.model, durationMs: res.durationMs }
-              : t,
-          ),
-        }));
+        const res = await executeAgentBtw(agent, question, {
+          onStream: (partialAnswer, streamModel) => {
+            setBtwTurnsByAgent((prev) => {
+              const list = prev[targetKey];
+              if (!list?.some((t) => t.id === turnId)) return prev;
+              return {
+                ...prev,
+                [targetKey]: list.map((t) =>
+                  t.id === turnId
+                    ? {
+                        ...t,
+                        status: "streaming",
+                        answer: partialAnswer,
+                        ...(streamModel ? { model: streamModel } : {}),
+                      }
+                    : t,
+                ),
+              };
+            });
+          },
+        });
+        setBtwTurnsByAgent((prev) => {
+          const list = prev[targetKey];
+          if (!list?.some((t) => t.id === turnId)) return prev;
+          return {
+            ...prev,
+            [targetKey]: list.map((t) =>
+              t.id === turnId
+                ? { ...t, status: "done", answer: res.answer, model: res.model, durationMs: res.durationMs }
+                : t,
+            ),
+          };
+        });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err ?? "旁路提问失败");
-        setBtwTurnsByAgent((prev) => ({
-          ...prev,
-          [targetKey]: (prev[targetKey] ?? []).map((t) =>
-            t.id === turnId ? { ...t, status: "error", error: msg } : t,
-          ),
-        }));
+        setBtwTurnsByAgent((prev) => {
+          const list = prev[targetKey];
+          if (!list?.some((t) => t.id === turnId)) return prev;
+          return {
+            ...prev,
+            [targetKey]: list.map((t) =>
+              t.id === turnId ? { ...t, status: "error", error: msg } : t,
+            ),
+          };
+        });
         toast(msg, true);
       }
     },
@@ -1754,17 +1795,32 @@ export function AgentDetailPanel({
     }
 
     if (!staged.length && /^\/usage$/i.test(raw)) {
-      if (!isOverride) setText("");
+      if (!isOverride) {
+        setText("");
+        setChipDismissedPrefix(null);
+      }
       openUsageView();
       return;
     }
-    if (!staged.length && /^\/(?:model|models)$/i.test(raw)) {
-      if (!isOverride) setText("");
+    if (
+      !staged.length &&
+      !agent.isShell &&
+      !activeSub &&
+      (/^\/(?:model|models)$/i.test(raw) ||
+        (normalizeSwitchHarness(agent.harness) === "omp" && /^\/switch$/i.test(raw)))
+    ) {
+      if (!isOverride) {
+        setText("");
+        setChipDismissedPrefix(null);
+      }
       setModelMenuMode("model");
       return;
     }
-    if (!staged.length && /^\/(?:effort|thinking)$/i.test(raw) && (modelMeta.thinkingLevels?.length ?? 0) > 0) {
-      if (!isOverride) setText("");
+    if (!staged.length && /^\/(?:effort|thinking)$/i.test(raw) && effectiveThinkingLevels.length > 0) {
+      if (!isOverride) {
+        setText("");
+        setChipDismissedPrefix(null);
+      }
       setModelMenuMode("thinking");
       return;
     }
@@ -1773,6 +1829,7 @@ export function AgentDetailPanel({
       clearComposerDraft(agent.key, { revoke: false });
       setTextState("");
       setAttachmentsState([]);
+      setChipDismissedPrefix(null);
     }
     stickRef.current = true;
     setAtBottom(true);
@@ -2549,7 +2606,7 @@ export function AgentDetailPanel({
                     <span className="truncate mono">{(modelMeta.currentModel || agent.model) ? (modelMeta.currentModel || agent.model)!.split("/").pop() : "切换模型"}</span>
                     <ChevronDown size={11} />
                   </button>
-                  {(modelMeta.thinkingLevels?.length ?? 0) > 0 ? (
+                  {effectiveThinkingLevels.length > 0 ? (
                     <button
                       ref={effortBtnRef}
                       type="button"

@@ -160,7 +160,16 @@ function buildBtwPrompt(agent: Agent, question: string, context: string): string
 export function buildBtwCliArgs(binary: BtwBinary, prompt: string, cwd?: string): string[] {
   switch (binary) {
     case "omp":
-      return ["-p", "--no-session", "--no-tools", ...(cwd ? ["--cwd", cwd] : []), prompt];
+      return [
+        "-p",
+        "--no-session",
+        "--no-tools",
+        "--no-judge",
+        "--no-spotlight",
+        "--hide-thinking",
+        ...(cwd ? ["--cwd", cwd] : []),
+        prompt,
+      ];
     case "claude":
       return ["-p", "--no-session-persistence", "--tools", "", prompt];
     case "codex":

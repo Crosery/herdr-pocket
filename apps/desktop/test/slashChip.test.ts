@@ -5,6 +5,7 @@ import {
   BUILTIN_SLASH,
   builtinSlashCommands,
   parseLeadingSlashToken,
+  slashCommandIconKind,
 } from "../src/lib/slashCommands.ts";
 
 test("parseLeadingSlashToken recognizes /btw, /dev, /commit, /review and /skills... chips", () => {
@@ -81,4 +82,28 @@ test("/btw is discovered across major harnesses and BUILTIN_SLASH", () => {
   assert.ok(BUILTIN_SLASH.some((c) => c.name === "/btw"));
   assert.ok(BUILTIN_SLASH.some((c) => c.name === "/commit"));
   assert.ok(BUILTIN_SLASH.some((c) => c.name === "/review"));
+});
+
+test("omp /model opens role panel while /switch parses provider/id, @role, and :thinking tokens", () => {
+  const omp = builtinSlashCommands("omp");
+  const modelCmd = omp.find((c) => c.name === "/model");
+  const switchCmd = omp.find((c) => c.name === "/switch");
+  assert.ok(modelCmd);
+  assert.equal(modelCmd.argHint, undefined);
+  assert.match(modelCmd.description, /角色模型/);
+
+  assert.ok(switchCmd);
+  assert.equal(switchCmd.argHint, "<selector[:level]>");
+  assert.match(switchCmd.description, /@role/);
+  assert.equal(slashCommandIconKind(switchCmd), "model");
+
+  const swModel = parseLeadingSlashToken("/switch provider/model-x:high", omp);
+  assert.ok(swModel);
+  assert.equal(swModel.command.name, "/switch");
+  assert.equal(swModel.rest, "provider/model-x:high");
+
+  const swRole = parseLeadingSlashToken("/switch @smol", omp);
+  assert.ok(swRole);
+  assert.equal(swRole.command.name, "/switch");
+  assert.equal(swRole.rest, "@smol");
 });

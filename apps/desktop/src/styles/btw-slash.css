@@ -1,7 +1,7 @@
 /* Integrated inline slash command chips, /btw sidechannel drawer, and desktop voice wake / SOTA strip */
 
 .composer-input-wrap:has(.composer-slash-chip) {
-  align-items: center;
+  align-items: flex-start;
   flex-wrap: wrap;
   gap: 6px;
 }
@@ -16,73 +16,45 @@
   flex: 0 0 auto;
   max-width: 100%;
   min-width: 0;
-  height: 28px;
+  height: 24px;
+  margin-top: 4px;
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 0 5px 0 4px;
-  border-radius: 999px;
+  padding: 0 7px;
+  border-radius: 7px;
   border: 1px solid var(--line-pink);
-  background: color-mix(in srgb, var(--accent-soft) 70%, var(--surface));
+  background: color-mix(in srgb, var(--accent-soft) 72%, var(--surface));
   color: var(--ink);
-  box-shadow: 0 1px 2px rgba(74, 59, 92, 0.06);
   user-select: none;
-  transition: border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
+  transition: border-color 0.14s ease, background 0.14s ease;
 }
 
 .composer-slash-chip[data-btw="true"] {
-  background: color-mix(in srgb, var(--lav-soft) 52%, var(--accent-soft));
-  border-color: color-mix(in srgb, var(--primary) 58%, var(--lav));
+  background: color-mix(in srgb, var(--lav-soft) 45%, var(--accent-soft));
+  border-color: color-mix(in srgb, var(--primary) 54%, var(--lav));
 }
 
 :root[data-theme="dark"] .composer-slash-chip {
-  background: color-mix(in srgb, var(--accent-soft) 68%, var(--surface-3));
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+  background: color-mix(in srgb, var(--accent-soft) 66%, var(--surface-3));
 }
 
 :root[data-theme="dark"] .composer-slash-chip[data-btw="true"] {
-  background: color-mix(in srgb, var(--lav-soft) 62%, var(--accent-soft));
+  background: color-mix(in srgb, var(--lav-soft) 56%, var(--accent-soft));
 }
 
 .composer-slash-ic {
   flex: none;
-  width: 20px;
-  height: 20px;
-  border-radius: 999px;
-  display: inline-grid;
-  place-items: center;
-  background: var(--accent-soft);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--accent-text);
 }
 
-.composer-slash-ic[data-cat="session"] {
-  background: color-mix(in srgb, var(--primary) 16%, var(--surface));
-  color: var(--accent-text);
-}
-
+.composer-slash-chip[data-btw="true"] .composer-slash-ic,
 .composer-slash-ic[data-cat="model"] {
-  background: color-mix(in srgb, #6366f1 16%, var(--surface));
-  color: #4f46e5;
+  color: var(--lav-text);
 }
-
-.composer-slash-ic[data-cat="code"] {
-  background: color-mix(in srgb, #10b981 17%, var(--surface));
-  color: #047857;
-}
-
-.composer-slash-ic[data-cat="skill"] {
-  background: color-mix(in srgb, #f59e0b 18%, var(--surface));
-  color: #b45309;
-}
-
-.composer-slash-ic[data-cat="custom"] {
-  background: color-mix(in srgb, #ec4899 16%, var(--surface));
-  color: var(--accent-text);
-}
-
-:root[data-theme="dark"] .composer-slash-ic[data-cat="model"] { color: #a5b4fc; }
-:root[data-theme="dark"] .composer-slash-ic[data-cat="code"] { color: #6ee7b7; }
-:root[data-theme="dark"] .composer-slash-ic[data-cat="skill"] { color: #fcd34d; }
 
 .composer-slash-name {
   flex: 0 1 auto;
@@ -93,25 +65,22 @@
   line-height: 1;
 }
 
-.composer-slash-hint {
+.composer-slash-sub {
   flex: none;
-  padding: 1px 6px;
-  border-radius: 999px;
-  border: 1px solid var(--divider);
-  background: var(--surface);
-  color: var(--accent-text);
-  font-size: calc(10.5px * var(--ts, 1));
-  font-weight: 700;
-  line-height: 1.35;
+  color: var(--muted);
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .composer-slash-x {
   flex: none;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   padding: 0;
   border: 0;
-  border-radius: 999px;
+  border-radius: 5px;
   background: transparent;
   color: var(--muted);
   display: inline-grid;
@@ -152,8 +121,8 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 8px 10px;
-  background: var(--surface-2);
+  padding: 7px 10px 7px 12px;
+  background: color-mix(in srgb, var(--accent-soft) 24%, var(--surface-2));
   border-bottom: 1px solid var(--divider);
   min-width: 0;
 }
@@ -173,6 +142,11 @@
   color: var(--ink);
 }
 
+.btw-drawer-heading {
+  flex: none;
+  white-space: nowrap;
+}
+
 .btw-drawer-badge {
   flex: none;
   width: 22px;
@@ -189,7 +163,7 @@
   align-items: center;
   gap: 4px;
   max-width: 170px;
-  padding: 2px 7px;
+  padding: 1.5px 7px;
   border-radius: 999px;
   border: 1px solid var(--divider);
   background: var(--surface);
@@ -248,8 +222,8 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 10px 12px;
-  max-height: min(300px, 42vh);
+  padding: 10px 14px 12px;
+  max-height: min(320px, 44vh);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -257,12 +231,13 @@
 .btw-turn {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding: 9px 11px;
-  border-radius: 12px;
-  border: 1px solid var(--divider);
-  background: var(--surface-2);
+  gap: 8px;
   min-width: 0;
+}
+
+.btw-turn + .btw-turn {
+  padding-top: 10px;
+  border-top: 1px solid var(--divider);
 }
 
 .btw-turn-head {
@@ -276,10 +251,27 @@
 .btw-turn-q {
   flex: 1 1 0;
   min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  padding: 5px 9px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent-soft) 32%, var(--surface-2));
   font-size: calc(12.5px * var(--ts, 1));
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.btw-turn-q-label {
+  flex: none;
   font-weight: 700;
   color: var(--accent-text);
-  line-height: 1.45;
+}
+
+.btw-turn-q-text {
+  min-width: 0;
+  font-weight: 600;
+  color: var(--ink);
   overflow-wrap: anywhere;
 }
 
@@ -288,14 +280,33 @@
   align-items: center;
   gap: 4px;
   flex: none;
+  padding-top: 2px;
 }
 
 .btw-turn-a {
   min-width: 0;
+  padding: 0 2px;
   font-size: calc(13px * var(--ts, 1));
-  line-height: 1.55;
+  line-height: 1.58;
   color: var(--ink);
   overflow-wrap: anywhere;
+}
+
+.btw-turn-a > :first-child {
+  margin-top: 0;
+}
+
+.btw-turn-a > :last-child {
+  margin-bottom: 0;
+}
+
+.btw-turn-streaming {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: calc(11.5px * var(--ts, 1));
+  color: var(--muted);
 }
 
 .btw-turn-loading {
@@ -304,7 +315,7 @@
   gap: 8px;
   font-size: calc(12.5px * var(--ts, 1));
   color: var(--muted);
-  padding: 2px 0;
+  padding: 2px;
 }
 
 /* Desktop Voice Wake Popover & SOTA ASR Strip --------------------------------------------------------- */

@@ -19,8 +19,8 @@ export interface ComposerSlashChipProps {
 }
 
 /**
- * Integrated inline pill inside `.composer-input-wrap` for a leading `/skill` or `/command`.
- * Reuses the functional category colors and Lucide icons from `SlashCommandPopup`.
+ * Integrated inline soft-pink token inside `.composer-input-wrap` for a leading `/skill` or `/command`.
+ * Aligns cleanly with line 1 of the composer textarea without nested pill chrome.
  */
 export function ComposerSlashChip({ command, onUnwrap, className = "" }: ComposerSlashChipProps) {
   const kind = slashCommandIconKind(command);
@@ -39,7 +39,7 @@ export function ComposerSlashChip({ command, onUnwrap, className = "" }: Compose
         <SlashKindIcon kind={kind} size={12} />
       </span>
       <span className="composer-slash-name mono truncate">{command.name}</span>
-      <span className="composer-slash-hint">{hint}</span>
+      <span className="composer-slash-sub" aria-hidden="true">· {hint}</span>
       <button
         type="button"
         className="composer-slash-x"
