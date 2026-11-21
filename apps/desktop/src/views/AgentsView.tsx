@@ -39,6 +39,7 @@ import {
   type ConvEvent,
   type Device,
   type LaunchOption,
+  type OmpModelRole,
   type SlashCommandItem,
   type SpaceInfo,
   type SubSession,
@@ -104,7 +105,7 @@ import {
 import { endWorkspaceDrag, hasWorkspaceDrag, readWorkspaceDrag } from "../lib/fileDrag";
 import { collectDroppedFilesSafe, readOsDraggedPaths, snapshotDroppedDataTransfer, stageOsDraggedItems } from "../lib/finderDrop";
 import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
-import { useAutoAgentModelMeta } from "../lib/modelCatalogClient";
+import { updateAgentRoleModel, useAutoAgentModelMeta } from "../lib/modelCatalogClient";
 import { openFileTab, openSubagentAside } from "../shell/shellStore";
 import { native } from "../lib/native";
 import { parseChoices } from "../lib/markdown";
@@ -985,8 +986,9 @@ export function AgentDetailPanel({
   const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
   const [modelMenuMode, setModelMenuMode] = useState<"model" | "thinking" | null>(null);
+  const [modelMenuOmpTab, setModelMenuOmpTab] = useState<"session" | "roles">("session");
   const hasReasoningEvents = useMemo(() => events.some((e) => e.kind === "reasoning"), [events]);
-  const modelMeta = useAutoAgentModelMeta(agent);
+  const modelMeta = useAutoAgentModelMeta(agent, { hasReasoningEvents });
   const effectiveThinkingLevels = useMemo(() => {
     if (modelMeta.thinkingLevels && modelMeta.thinkingLevels.length > 0) {
       return modelMeta.thinkingLevels;
@@ -1010,6 +1012,7 @@ export function AgentDetailPanel({
     setUsageReport(null);
     setUsageError(null);
     setModelMenuMode(null);
+    setModelMenuOmpTab("session");
     setChipDismissedPrefix(null);
   }, [agent.key]);
 
@@ -1607,8 +1610,14 @@ export function AgentDetailPanel({
           ? modelId
           : `思考等级 ${formatEffortLabel(thinkingLevel)}`;
 
+      const resolvedAlias =
+        modelId && normalizeSwitchHarness(agent.harness) === "omp" && modelId.startsWith("@")
+          ? modelMeta.modelRoles?.[modelId.slice(1).toLowerCase()]
+          : undefined;
+      const displayModel = resolvedAlias ? stripModelEffortSuffix(resolvedAlias) : modelId ? stripModelEffortSuffix(modelId) : undefined;
+
       applyModelMetaOverride({
-        ...(modelId ? { currentModel: stripModelEffortSuffix(modelId) } : {}),
+        ...(displayModel ? { currentModel: displayModel } : {}),
         ...(thinkingLevel ? { currentThinking: thinkingLevel } : {}),
       });
       stickRef.current = true;
@@ -1653,7 +1662,7 @@ export function AgentDetailPanel({
         setSending(false);
       }
     },
-    [agent, applyModelMetaOverride, toast],
+    [agent, applyModelMetaOverride, modelMeta.modelRoles, toast],
   );
 
   const applyModelSwitch = useCallback(
@@ -1670,10 +1679,31 @@ export function AgentDetailPanel({
     [runModelOrThinkingSwitch],
   );
 
+  const applyRoleModelSwitch = useCallback(
+    async (slot: OmpModelRole, modelId: string) => {
+      const clean = modelId.trim();
+      if (!clean) return;
+      applyModelMetaOverride({
+        modelRoles: { ...(modelMeta.modelRoles ?? {}), [slot]: clean },
+      });
+      try {
+        const res = await updateAgentRoleModel(agent, slot, clean);
+        if (res.modelRoles) {
+          applyModelMetaOverride({ modelRoles: res.modelRoles });
+        }
+        toast(res.note || `已更新 OMP 角色 ${slot} -> ${clean}`);
+      } catch (e) {
+        toast((e as Error).message || `更新角色 ${slot} 失败`, true);
+      }
+    },
+    [agent, applyModelMetaOverride, modelMeta.modelRoles, toast],
+  );
+
   const onModelsLoaded = useCallback((res: AgentModelsResult) => {
     applyModelMetaOverride({
       currentModel: res.currentModel || agent.model,
       currentThinking: res.currentThinking,
+      ...(res.modelRoles ? { modelRoles: res.modelRoles } : {}),
     });
   }, [agent.model, applyModelMetaOverride]);
 
@@ -1809,10 +1839,12 @@ export function AgentDetailPanel({
       (/^\/(?:model|models)$/i.test(raw) ||
         (normalizeSwitchHarness(agent.harness) === "omp" && /^\/switch$/i.test(raw)))
     ) {
+      const isOmpRoleCmd = normalizeSwitchHarness(agent.harness) === "omp" && /^\/(?:model|models)$/i.test(raw);
       if (!isOverride) {
         setText("");
         setChipDismissedPrefix(null);
       }
+      setModelMenuOmpTab(isOmpRoleCmd ? "roles" : "session");
       setModelMenuMode("model");
       return;
     }
@@ -1916,6 +1948,7 @@ export function AgentDetailPanel({
       if (allowAutoSend && /^\/(?:model|models)$/i.test(cmd.name)) {
         setText("");
         setAttachments([]);
+        setModelMenuOmpTab(normalizeSwitchHarness(agent.harness) === "omp" ? "roles" : "session");
         setModelMenuMode("model");
         return;
       }
@@ -2599,6 +2632,7 @@ export function AgentDetailPanel({
                     title={(modelMeta.currentModel || agent.model) ? `当前模型：${modelMeta.currentModel || agent.model}（点击切换）` : "切换模型 (/model)"}
                     onClick={() => {
                       setSlashDismissedFor(text);
+                      setModelMenuOmpTab("session");
                       setModelMenuMode((v) => (v === "model" ? null : "model"));
                     }}
                   >
@@ -2685,8 +2719,11 @@ export function AgentDetailPanel({
         fallbackAnchorRef={composerCardRef}
         currentModelHint={modelMeta.currentModel}
         currentThinkingHint={modelMeta.currentThinking}
+        hasReasoningEvents={hasReasoningEvents}
+        initialOmpTab={modelMenuOmpTab}
         onSelectModel={applyModelSwitch}
         onSelectThinking={applyThinkingSwitch}
+        onSelectRoleModel={(slot, id) => void applyRoleModelSwitch(slot, id)}
         onLoaded={onModelsLoaded}
       />
 

@@ -1,5 +1,7 @@
 import {
   OPENAI_REALTIME_VOICES,
+  normalizeSwitchHarness,
+  stripModelEffortSuffix,
   type Agent,
   type AssistantConfigChange,
   type AssistantConfigView,
@@ -96,6 +98,23 @@ const DEMO_AGENTS: Agent[] = [
     isShell: true,
     updatedAt: now,
   },
+  {
+    key: "dev-mac/hc:t5",
+    deviceId: "dev-mac",
+    source: "hc",
+    localId: "t5",
+    harness: "oh-my-pi",
+    title: "OMP 模型角色与思考适配",
+    where: "backend / models",
+    cwd: "~/work/demo-app",
+    status: "idle",
+    statusSince: now - 1 * min,
+    turn: 3,
+    model: "demo/mimo-v2.6-pro",
+    isShell: false,
+    sessionKey: "omp:demo-5",
+    updatedAt: now,
+  },
 ];
 
 const DEMO_EVENTS: Record<string, ConvEvent[]> = {
@@ -133,6 +152,11 @@ const DEMO_EVENTS: Record<string, ConvEvent[]> = {
     { id: "e31", session: "gemini:demo-3", ts: now - 20 * min, kind: "user_message", text: "把静态资源压到 10 MB 以内。" },
     { id: "e32", session: "gemini:demo-3", ts: now - 11 * min, kind: "assistant_message", text: "已完成压缩与校验：安装包体积从 18.4 MB 降至 7.9 MB，所有校验通过。" },
   ],
+  "dev-mac/hc:t5": [
+    { id: "e51", session: "omp:demo-5", ts: now - 6 * min, kind: "user_message", text: "确认一下 mimo-v2.6-pro 与 OMP /switch、/model 角色模型的配置情况。" },
+    { id: "e52", session: "omp:demo-5", ts: now - 5 * min, kind: "reasoning", text: "检查 ~/.omp/agent/config.yml 中的 modelRoles 与当前会话模型思考强度。" },
+    { id: "e53", session: "omp:demo-5", ts: now - 1 * min, kind: "assistant_message", text: "已读取本地模型与角色映射：`default` 使用 `demo/mimo-v2.6-pro`，支持 `/switch` 会话切换与 `/model` 角色分配。" },
+  ],
 };
 
 const DEMO_TERMINALS: Record<string, string[]> = {
@@ -162,6 +186,11 @@ const DEMO_TERMINALS: Record<string, string[]> = {
     "~/work/demo-app $ tail -f relay.log",
     "[info] listening on :7420",
     "[info] 2 hosts online",
+  ],
+  "dev-mac/hc:t5": [
+    "\x1b[38;5;212moh-my-pi\x1b[0m · demo/mimo-v2.6-pro · xhigh",
+    "~/work/demo-app",
+    "❯ ",
   ],
 };
 
@@ -255,6 +284,15 @@ const demoPrompts: PromptView[] = [
   { id: "base", title: "基础规则", about: "规定小羊的行为准则", group: "性格与规矩", slots: [{ slot: "{{name}}", means: "助理名字" }], text: "你是 {{name}}，负责照看所有电脑上的开发任务。", defaultText: "你是 {{name}}，负责照看所有电脑上的开发任务。", edited: false },
   { id: "persona", title: "说话风格", about: "口吻与长度约束", group: "性格与规矩", slots: [], text: "说话简洁自然，先说结论。", defaultText: "说话简洁自然，先说结论。", edited: false },
 ];
+
+const demoOmpModelRoles: Record<string, string> = {
+  default: "demo/mimo-v2.6-pro",
+  smol: "demo/gpt-6.2-sol-ultrafast",
+  slow: "demo/claude-opus-5-5",
+  plan: "demo/gpt-6.2-astra",
+  commit: "demo/gpt-6.2-sol-ultrafast",
+};
+const demoThinkingByAgent = new Map<string, string>();
 
 export const mockApi = {
   pair(_code: string, name: string, platform: string): PairResponse {
@@ -427,34 +465,61 @@ export const mockApi = {
     }
     if (method === "agent.models") {
       const a = DEMO_AGENTS.find((x) => x.key === params.agent);
-      const cur = a?.model ?? "claude-opus-5-5";
+      const isOmp = normalizeSwitchHarness(a?.harness ?? "") === "omp";
+      const cur = a?.model ?? (isOmp ? "demo/mimo-v2.6-pro" : "claude-opus-5-5");
+      const ompLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"];
       const pool = [
-        { id: "claude-opus-5-5", label: "Claude Opus 5.5", provider: "anthropic", contextWindow: 200_000, reasoning: true, thinkingLevels: ["low", "medium", "high", "xhigh", "max"], source: "recent" as const },
-        { id: "claude-sonnet-5", label: "Claude Sonnet 5", provider: "anthropic", contextWindow: 200_000, reasoning: true, thinkingLevels: ["low", "medium", "high"], source: "recent" as const },
-        { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", provider: "openai", contextWindow: 1_050_000, reasoning: true, thinkingLevels: ["low", "medium", "high", "xhigh"], source: "catalog" as const },
+        ...(isOmp
+          ? [
+              { id: "demo/mimo-v2.6-pro", label: "MiMo V2.6 Pro", provider: "demo", contextWindow: 256_000, reasoning: true, thinkingLevels: ompLevels, source: "current" as const },
+              { id: "demo/gpt-6.2-sol-ultrafast", label: "GPT-6.2 Sol Ultrafast", provider: "demo", contextWindow: 400_000, reasoning: true, thinkingLevels: ompLevels, source: "catalog" as const },
+            ]
+          : []),
+        { id: "claude-opus-5-5", label: "Claude Opus 5.5", provider: "anthropic", contextWindow: 200_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high", "xhigh", "max"], source: "recent" as const },
+        { id: "claude-sonnet-5", label: "Claude Sonnet 5", provider: "anthropic", contextWindow: 200_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high"], source: "recent" as const },
+        { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", provider: "openai", contextWindow: 1_050_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high", "xhigh"], source: "catalog" as const },
         { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon High", provider: "google", contextWindow: 1_048_576, reasoning: true, source: "catalog" as const },
-        { id: "deepseek-reasoner", label: "DeepSeek Reasoner", provider: "deepseek", contextWindow: 128_000, reasoning: true, thinkingLevels: ["low", "medium", "high"], source: "catalog" as const },
+        { id: "deepseek-reasoner", label: "DeepSeek Reasoner", provider: "deepseek", contextWindow: 128_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high"], source: "catalog" as const },
       ];
       const models = [
-        { id: cur, label: cur, contextWindow: 200_000, reasoning: true, thinkingLevels: ["low", "medium", "high", "xhigh", "max"], source: "current" as const },
+        { id: cur, label: cur, contextWindow: 200_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high", "xhigh", "max"], source: "current" as const },
         ...pool.filter((x) => x.id !== cur),
       ];
       return {
         harness: a?.harness ?? "claude-code",
         currentModel: cur,
-        currentThinking: "high",
-        thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+        currentThinking: demoThinkingByAgent.get(a?.key ?? "") ?? (isOmp ? "xhigh" : "high"),
+        thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high", "xhigh", "max"],
         canSwitchThinking: !a?.isShell,
         canSwitch: !a?.isShell,
+        ...(isOmp ? { modelRoles: { ...demoOmpModelRoles } } : {}),
         ...(a?.isShell ? { reason: "普通终端不支持切换模型" } : {}),
         models,
       };
     }
     if (method === "agent.setModel") {
+      const a = DEMO_AGENTS.find((x) => x.key === params.agent);
+      const cleanModel = typeof params.modelId === "string" ? params.modelId.trim() : undefined;
+      const cleanThinking = typeof params.thinkingLevel === "string" ? params.thinkingLevel.trim().toLowerCase() : undefined;
+      if (typeof params.roleSlot === "string" && cleanModel) {
+        const selector = cleanThinking ? `${stripModelEffortSuffix(cleanModel)}:${cleanThinking}` : cleanModel;
+        demoOmpModelRoles[params.roleSlot] = selector;
+        return {
+          ok: true as const,
+          modelRoles: { ...demoOmpModelRoles },
+          note: `已更新 OMP 角色 ${params.roleSlot} -> ${selector}`,
+        };
+      }
+      const resolvedModel = cleanModel?.startsWith("@")
+        ? demoOmpModelRoles[cleanModel.slice(1).toLowerCase()] ?? cleanModel
+        : cleanModel;
+      const nextBase = resolvedModel ? stripModelEffortSuffix(resolvedModel) : undefined;
+      if (a && nextBase) a.model = nextBase;
+      if (a && cleanThinking) demoThinkingByAgent.set(a.key, cleanThinking);
       return {
         ok: true as const,
-        ...(typeof params.modelId === "string" ? { currentModel: params.modelId } : {}),
-        ...(typeof params.thinkingLevel === "string" ? { currentThinking: params.thinkingLevel } : {}),
+        ...(nextBase ? { currentModel: nextBase } : {}),
+        ...(cleanThinking ? { currentThinking: cleanThinking } : {}),
       };
     }
     if (method === "agent.btw") {

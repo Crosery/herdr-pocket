@@ -889,8 +889,27 @@ impl Controller {
                     self.show_error("没有识别出文字，请再说一次", "");
                     return;
                 }
-                // INTEGRATION(voice-hud-perms): at merge time, when `hud::current_mode() == "assistant"`,
-                // spawn `hud::ask_assistant_from_hud(&app, &text)` and return early without pasting into target.
+                if hud::current_mode() == "assistant" {
+                    logging::info(
+                        "voice.session",
+                        "dictation routed to assistant hud",
+                        json!({
+                            "session": session,
+                            "chars": text.chars().count(),
+                            "audioMs": audio_ms,
+                            "waitMs": wait_ms,
+                            "serviceMs": t.ms,
+                            "model": t.model,
+                        }),
+                    );
+                    self.hide_at = None;
+                    self.publish(Some(None));
+                    let app = self.app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        hud::ask_assistant_from_hud(&app, &text).await;
+                    });
+                    return;
+                }
                 let chars = text.chars().count();
                 use tauri::Emitter;
                 let (method, note) = if target == Target::App {

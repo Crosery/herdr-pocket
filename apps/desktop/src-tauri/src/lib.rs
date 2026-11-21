@@ -703,6 +703,7 @@ pub fn run() {
             local_term::local_term_stat_image,
             drag_paths::read_os_drag_paths,
             local_models::local_agent_models,
+            local_models::local_set_omp_role_model,
             fonts::terminal_list_fonts,
             fonts::terminal_font_faces,
             fonts::terminal_font_bytes,
