@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { HERDR_COMMANDS, type HerdrCommand, type LaunchOption, type SpaceInfo } from "@herdr-pocket/protocol";
 import type { AppNames } from "./hc.ts";
 import { IS_WINDOWS, onPath, programName, windowsBins } from "./platform.ts";
@@ -223,12 +223,115 @@ export class NoDesktopApp extends Error {
 
 const notInstalled = (e: unknown) => (e as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 
+function defaultSharedJsonPath(): string {
+  const cfg = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config");
+  return join(cfg, "herdr-app", "shared.json");
+}
+
+function defaultDocsJsonPath(): string {
+  const state = process.env.XDG_STATE_HOME?.trim() || join(homedir(), ".local", "state");
+  return join(state, "herdr-core", "default", "docs.json");
+}
+
+function collectTerminalIdsFromRoot(node: unknown, out: string[] = []): string[] {
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const item of node) collectTerminalIdsFromRoot(item, out);
+    return out;
+  }
+  const rec = node as Record<string, unknown>;
+  if (typeof rec.terminal === "string" && rec.terminal.trim()) out.push(rec.terminal.trim());
+  if (typeof rec.terminalId === "string" && rec.terminalId.trim()) out.push(rec.terminalId.trim());
+  for (const key of ["content", "children", "left", "right", "first", "second", "tabs", "panes"]) {
+    if (key in rec && rec[key] !== undefined) collectTerminalIdsFromRoot(rec[key], out);
+  }
+  return out;
+}
+
 /** The desktop herdr app (`herdr-app`), driven through its own commands. */
 export class HerdrApp {
   private bin: string;
+  private sharedJsonPath: string;
+  private docsJsonPath: string;
 
-  constructor(bin = process.env.HERDR_APP_BIN ?? "herdr-app") {
+  constructor(
+    bin = process.env.HERDR_APP_BIN ?? "herdr-app",
+    opts?: { sharedJsonPath?: string; docsJsonPath?: string },
+  ) {
     this.bin = bin;
+    this.sharedJsonPath = opts?.sharedJsonPath ?? defaultSharedJsonPath();
+    this.docsJsonPath = opts?.docsJsonPath ?? defaultDocsJsonPath();
+  }
+
+  private readSpaceColors(): Record<string, string> {
+    try {
+      const raw = JSON.parse(readFileSync(this.sharedJsonPath, "utf8")) as { "space.colors"?: unknown };
+      const map = raw?.["space.colors"];
+      if (!map || typeof map !== "object" || Array.isArray(map)) return {};
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(map as Record<string, unknown>)) {
+        if (typeof v === "string" && v.trim()) out[k] = v.trim();
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  private readDocsWorktreeIds(): Set<string> {
+    const out = new Set<string>();
+    try {
+      const raw = JSON.parse(readFileSync(this.docsJsonPath, "utf8")) as Record<string, any>;
+      const docVal = raw?.["herdr-app"]?.value ?? raw?.docs?.["herdr-app"]?.value;
+      const list = Array.isArray(docVal?.spaces) ? docVal.spaces : [];
+      for (const s of list) {
+        if (s && typeof s.id === "string" && s.isWorktree) out.add(s.id);
+      }
+    } catch {
+      // ignore missing/invalid docs.json
+    }
+    return out;
+  }
+
+  /** Reads spaces, order, folders, and colors directly from Herdr's persisted docs.json + shared.json. */
+  spacesFromDocs(terminals?: ReadonlyMap<string, SpaceTerminalMeta>): SpaceInfo[] {
+    try {
+      const raw = JSON.parse(readFileSync(this.docsJsonPath, "utf8")) as Record<string, any>;
+      const docVal = raw?.["herdr-app"]?.value ?? raw?.docs?.["herdr-app"]?.value;
+      const list = Array.isArray(docVal?.spaces) ? docVal.spaces : [];
+      const activeSpaceId = typeof docVal?.activeSpaceId === "string" ? docVal.activeSpaceId : undefined;
+      const colors = this.readSpaceColors();
+      const out: SpaceInfo[] = [];
+      for (const s of list) {
+        if (!s || typeof s.id !== "string" || typeof s.name !== "string" || s.machine) continue;
+        const rawTabs = Array.isArray(s.tabs) ? s.tabs : [];
+        const synthTabs = rawTabs.map((t: any) => {
+          const directTerms = Array.isArray(t?.terminals)
+            ? t.terminals.map((x: any) => ({ terminal: typeof x?.terminal === "string" ? x.terminal : x?.id }))
+            : [];
+          if (directTerms.length > 0) return { terminals: directTerms };
+          const termIds = collectTerminalIdsFromRoot(t?.root);
+          return { terminals: termIds.map((id) => ({ terminal: id })) };
+        });
+        const folder = resolveSpaceFolder({ id: s.id, name: s.name, folder: s.folder, tabs: synthTabs }, terminals);
+        const termCount = synthTabs.reduce((n: number, t: { terminals: unknown[] }) => n + t.terminals.length, 0);
+        const color = colors[s.id] ?? colors[s.name] ?? (typeof s.color === "string" ? s.color : undefined);
+        const active = activeSpaceId === s.id || Boolean(s.active);
+        out.push({
+          id: s.id,
+          name: s.name,
+          ...(folder ? { folder } : {}),
+          tabs: rawTabs.length,
+          terminals: termCount,
+          ...(color ? { color } : {}),
+          ...(active ? { active: true } : {}),
+          ...(s.isWorktree ? { isWorktree: true } : {}),
+        });
+      }
+      return out;
+    } catch {
+      return [];
+    }
   }
 
   /** The window's spaces, tabs and terminals; throws when the window is not open. */
@@ -251,18 +354,28 @@ export class HerdrApp {
     return names;
   }
 
-  /** Spaces of this computer in the open window; throws when the window is not open. */
+  /** Spaces of this computer in the open window (exact Herdr App order + colors); throws when the window is not open. */
   async spaces(terminals?: ReadonlyMap<string, SpaceTerminalMeta>): Promise<SpaceInfo[]> {
     const ls = await this.ls();
+    const colors = this.readSpaceColors();
+    const worktrees = this.readDocsWorktreeIds();
     return ls.spaces
       .filter((s) => !s.machine)
-      .map((s) => ({
-        id: s.id,
-        name: s.name,
-        folder: resolveSpaceFolder(s, terminals),
-        tabs: s.tabs?.length ?? 0,
-        terminals: (s.tabs ?? []).reduce((n, t) => n + (t.terminals?.length ?? 0), 0),
-      }));
+      .map((s) => {
+        const extra = s as { active?: boolean; isWorktree?: boolean; color?: string };
+        const color = colors[s.id] ?? colors[s.name] ?? extra.color;
+        const isWorktree = Boolean(extra.isWorktree || worktrees.has(s.id));
+        return {
+          id: s.id,
+          name: s.name,
+          folder: resolveSpaceFolder(s, terminals),
+          tabs: s.tabs?.length ?? 0,
+          terminals: (s.tabs ?? []).reduce((n, t) => n + (t.terminals?.length ?? 0), 0),
+          ...(color ? { color } : {}),
+          ...(extra.active ? { active: true } : {}),
+          ...(isWorktree ? { isWorktree: true } : {}),
+        };
+      });
   }
 
   /**

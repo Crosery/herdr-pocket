@@ -6,18 +6,33 @@
 //! WebView's memory back.
 
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const LABEL: &str = "voice-hud";
-const WIDTH: f64 = 260.0;
-const HEIGHT: f64 = 64.0;
+const WIDTH: f64 = 436.0;
+const HEIGHT: f64 = 76.0;
 /// Closed after this long without a dictation.
 pub const IDLE_CLOSE: Duration = Duration::from_secs(180);
 
 static LATEST: Mutex<Option<Value>> = Mutex::new(None);
 static LAST_USE: Mutex<Option<Instant>> = Mutex::new(None);
+static LAST_INTERACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn sync_cursor_passthrough(app: &AppHandle, state: &Value) {
+    let interactive = state.get("state").and_then(Value::as_str) == Some("recording");
+    if LAST_INTERACTIVE.swap(interactive, Ordering::Relaxed) == interactive {
+        return;
+    }
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = app2.get_webview_window(LABEL) {
+            let _ = w.set_ignore_cursor_events(!interactive);
+        }
+    });
+}
 
 fn push(app: &AppHandle, state: &Value) {
     if let Some(w) = app.get_webview_window(LABEL) {
@@ -60,6 +75,17 @@ fn ensure(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         .focused(false)
         .focusable(false)
         .visible(false)
+        .on_navigation(|url| match url.as_str() {
+            "pocket-hud://stop" | "pocket-hud://stop/" => {
+                super::voice_stop();
+                false
+            }
+            "pocket-hud://cancel" | "pocket-hud://cancel/" => {
+                super::voice_cancel();
+                false
+            }
+            _ => true,
+        })
         .on_page_load(|w, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
                 if let Some(state) = LATEST.lock().ok().and_then(|g| g.clone()) {
@@ -94,9 +120,12 @@ pub fn show(app: &AppHandle, state: Value) {
     if let Ok(mut g) = LATEST.lock() {
         *g = Some(state.clone());
     }
+    sync_cursor_passthrough(app, &state);
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(w) = ensure(&app2) {
+            let interactive = LAST_INTERACTIVE.load(Ordering::Relaxed);
+            let _ = w.set_ignore_cursor_events(!interactive);
             if !w.is_visible().unwrap_or(false) {
                 place(&app2, &w);
                 let _ = w.show();
@@ -111,13 +140,16 @@ pub fn update(app: &AppHandle, state: Value) {
     if let Ok(mut g) = LATEST.lock() {
         *g = Some(state.clone());
     }
+    sync_cursor_passthrough(app, &state);
     push(app, &state);
 }
 
 pub fn hide(app: &AppHandle) {
+    LAST_INTERACTIVE.store(false, Ordering::Relaxed);
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(w) = app2.get_webview_window(LABEL) {
+            let _ = w.set_ignore_cursor_events(true);
             let _ = w.hide();
         }
     });

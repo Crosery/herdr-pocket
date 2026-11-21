@@ -11,7 +11,7 @@ import { defaultDeviceName, getHostdStatus, isTauri, type HostdLocalStatus } fro
 import { completePairing } from "../lib/relay";
 import { DEMO_URL, isMockServer } from "../lib/mock";
 import { assetUrl } from "../lib/bridge";
-import { TextScaleStepper } from "./settings/FramePanes";
+import { ChatDisplayModeControl, TextScaleStepper } from "./settings/FramePanes";
 import "../styles/welcome.css";
 import { liveStore, settingsStore, updateSettings } from "../lib/store";
 import { logger } from "../lib/log";
@@ -191,6 +191,15 @@ export function OnboardingView({
               <span className="wf-look-label">大小</span>
               <TextScaleStepper className="wf-stepper" />
             </div>
+            <div className="wf-look-row">
+              <span className="wf-look-label">对话展示</span>
+              <div className="stack" style={{ gap: 4 }}>
+                <ChatDisplayModeControl className="wf-seg" />
+                <div className="faint" style={{ fontSize: 12 }}>
+                  精简：思考与工具全折叠 · 标准：思考独立、工具归组 · 全展示：默认展开
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       ) : (
@@ -201,6 +210,10 @@ export function OnboardingView({
             <li><Check size={16} /> 直接回复、发指令、看终端，不用切回那台电脑</li>
             <li><Check size={16} /> 手机扫码就能随身查看，还能语音和小羊对话</li>
           </ul>
+          <div className="stack" style={{ gap: 6, width: "100%", maxWidth: 360 }}>
+            <div className="faint" style={{ fontSize: 12 }}>对话展示模式（可随时在设置中切换）</div>
+            <ChatDisplayModeControl className="wf-seg" />
+          </div>
           <div className="faint">接下来几步大约 2 分钟，每一步都能跳过，之后在“设置”里能重新打开。</div>
         </div>
       );

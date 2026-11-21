@@ -16,6 +16,7 @@ export type ShortcutId =
   | "prevTab"
   | "toggleSidebar"
   | "togglePanel"
+  | "toggleGit"
   | "assistant";
 
 export interface Shortcut {
@@ -36,6 +37,7 @@ export const SHORTCUTS: Shortcut[] = [
   { id: "prevTab", label: "上一个标签", keys: ["Mod", "Shift", "["] },
   { id: "toggleSidebar", label: "显示或隐藏侧栏", keys: ["Mod", "B"] },
   { id: "togglePanel", label: "显示或隐藏文件面板", keys: ["Mod", "J"] },
+  { id: "toggleGit", label: "显示或隐藏 Git 管理", keys: ["Mod", "Shift", "G"] },
   { id: "assistant", label: "打开小羊", keys: ["Mod", "Shift", "A"] },
 ];
 

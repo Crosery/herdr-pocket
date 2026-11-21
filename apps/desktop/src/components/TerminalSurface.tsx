@@ -8,6 +8,7 @@ import "@xterm/xterm/css/xterm.css";
 import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { copyToClipboard } from "../lib/bridge";
 import { setConfig, useClientConfig } from "../lib/config";
+import { hasWorkspaceDrag, readWorkspaceDrag, resolveDropPath } from "../lib/fileDrag";
 import {
   buildTerminalFontFamily,
   ensureFontCatalog,
@@ -760,6 +761,8 @@ export function TerminalSurface({
     let fallbackLines: string[] = [];
     const splitter = new KittyApcSplitter();
     const textDecoder = new TextDecoder("utf-8", { fatal: false });
+    let pendingBytes: Uint8Array[] = [];
+    let flushRaf = 0;
 
     const writeSegmented = (rawText: string) => {
       const segments = splitter.push(rawText);
@@ -957,6 +960,36 @@ export function TerminalSurface({
     let unsubLocalClose: (() => void) | null = null;
     let activeLocalConnId: string | null = null;
 
+    const flushPendingBytes = () => {
+      if (flushRaf) {
+        cancelAnimationFrame(flushRaf);
+        flushRaf = 0;
+      }
+      if (!pendingBytes.length) return;
+      const total = pendingBytes.reduce((sum, b) => sum + b.length, 0);
+      const merged = new Uint8Array(total);
+      let off = 0;
+      for (const chunk of pendingBytes) {
+        merged.set(chunk, off);
+        off += chunk.length;
+      }
+      pendingBytes = [];
+      if (alive) {
+        writeSegmented(textDecoder.decode(merged, { stream: true }));
+      }
+    };
+
+    const queueRawBytes = (bytes: Uint8Array) => {
+      if (!bytes.length) return;
+      pendingBytes.push(bytes);
+      if (!flushRaf) {
+        flushRaf = requestAnimationFrame(() => {
+          flushRaf = 0;
+          flushPendingBytes();
+        });
+      }
+    };
+
     const startRelayStream = () => {
       if (!alive || unsubRelay) return;
       unsubRelay = subscribeStream(
@@ -978,8 +1011,7 @@ export function TerminalSurface({
               if (fallbackLines.length) term.reset();
             }
             try {
-              const bytes = decodeBase64Bytes(ev.data);
-              writeSegmented(textDecoder.decode(bytes, { stream: true }));
+              queueRawBytes(decodeBase64Bytes(ev.data));
             } catch {
               /* ignore malformed chunk */
             }
@@ -1015,14 +1047,14 @@ export function TerminalSurface({
           if (!alive || e.payload.id !== connId) return;
           if (!sawRaw) sawRaw = true;
           try {
-            const bytes = decodeBase64Bytes(e.payload.data);
-            writeSegmented(textDecoder.decode(bytes, { stream: true }));
+            queueRawBytes(decodeBase64Bytes(e.payload.data));
           } catch {
             /* ignore malformed chunk */
           }
         });
         const offClose = await listen<LocalTermCloseEvent>("local-term://close", (e) => {
           if (e.payload.id !== connId) return;
+          flushPendingBytes();
           if (localConnRef.current === connId) localConnRef.current = null;
           if (activeLocalConnId === connId) activeLocalConnId = null;
           offData();
@@ -1082,6 +1114,11 @@ export function TerminalSurface({
       alive = false;
       window.clearTimeout(seedTimer);
       window.clearTimeout(resizeTimer);
+      if (flushRaf) {
+        cancelAnimationFrame(flushRaf);
+        flushRaf = 0;
+      }
+      pendingBytes = [];
       if (rafOverlay) cancelAnimationFrame(rafOverlay);
       ro.disconnect();
       unsubRelay?.();
@@ -1149,21 +1186,39 @@ export function TerminalSurface({
     return () => cancelAnimationFrame(id);
   }, [active, paintOverlays, syncResize]);
 
+  // Accept dictated text from desktop VoiceInput when this terminal pane is active.
+  useEffect(() => {
+    const onVoiceInput = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ text?: string }>).detail;
+      const text = detail?.text;
+      if (!text || !activeRef.current) return;
+      const hostEl = hostRef.current;
+      if (!hostEl || hostEl.offsetParent === null) return;
+      void sendInput(text);
+      requestAnimationFrame(() => termRef.current?.focus());
+    };
+    window.addEventListener("pocket:voice-term-input", onVoiceInput);
+    return () => window.removeEventListener("pocket:voice-term-input", onVoiceInput);
+  }, [sendInput]);
+
   const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
-    if (!e.dataTransfer?.types?.includes("Files")) return;
+    const isFiles = Boolean(e.dataTransfer?.types?.includes("Files"));
+    if (!isFiles && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     dragDepthRef.current += 1;
     setDragOver(true);
   };
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
-    if (!e.dataTransfer?.types?.includes("Files")) return;
+    const isFiles = Boolean(e.dataTransfer?.types?.includes("Files"));
+    if (!isFiles && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
   };
 
   const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    if (!e.dataTransfer?.types?.includes("Files")) return;
+    const isFiles = Boolean(e.dataTransfer?.types?.includes("Files"));
+    if (!isFiles && !hasWorkspaceDrag(e)) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragOver(false);
   };
@@ -1171,6 +1226,15 @@ export function TerminalSurface({
   const onDrop = (e: DragEvent<HTMLDivElement>) => {
     dragDepthRef.current = 0;
     setDragOver(false);
+    const wsItem = readWorkspaceDrag(e);
+    if (wsItem) {
+      e.preventDefault();
+      e.stopPropagation();
+      const targetPath = resolveDropPath(wsItem, agent.deviceId);
+      void sendInput(`${shellQuotePath(targetPath)} `);
+      requestAnimationFrame(() => termRef.current?.focus());
+      return;
+    }
     const files = e.dataTransfer?.files;
     if (!files?.length) return;
     e.preventDefault();

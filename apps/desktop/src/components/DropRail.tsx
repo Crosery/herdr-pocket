@@ -69,7 +69,7 @@ function DropLightbox({ item, onClose }: { item: StagedAttachment; onClose: () =
   }, [onClose]);
 
   useEffect(() => {
-    if (item.kind !== "text") return;
+    if (item.kind !== "text" || !item.file) return;
     let alive = true;
     setTextState({ status: "loading", text: "" });
     void item.file
@@ -147,9 +147,11 @@ function DropLightbox({ item, onClose }: { item: StagedAttachment; onClose: () =
 export function DropRail({
   items,
   onRemove,
+  onOpenFile,
 }: {
   items: readonly StagedAttachment[];
   onRemove: (id: string) => void;
+  onOpenFile?: (item: StagedAttachment) => void;
 }) {
   const [openId, setOpenId] = useState<string | null>(null);
   const overflow = useOverflowControls(items.length);
@@ -172,17 +174,24 @@ export function DropRail({
       >
         {items.map((item) => {
           const isVisual = (item.kind === "image" || item.kind === "video") && Boolean(item.previewUrl);
-          const badge = kindBadge(item.name);
-          const meta = [KIND_TEXT_ZH[item.kind], formatDropBytes(item.size)].filter(Boolean).join(" · ");
+          const badge = item.isDir ? "" : kindBadge(item.name);
+          const meta = item.isDir ? "文件夹" : [KIND_TEXT_ZH[item.kind], formatDropBytes(item.size)].filter(Boolean).join(" · ");
+          const openItem = () => {
+            if (item.hostRef && !item.isDir && onOpenFile) {
+              onOpenFile(item);
+              return;
+            }
+            if (item.file) setOpenId(item.id);
+          };
           return (
             <div key={item.id} className="hp-drop-item">
               {isVisual ? (
                 <button
                   type="button"
                   className="hp-drop-thumb"
-                  title={item.name}
+                  title={item.hostRef || item.name}
                   aria-label={`预览 ${item.name}`}
-                  onClick={() => setOpenId(item.id)}
+                  onClick={openItem}
                 >
                   {item.kind === "image" ? (
                     <img src={item.previewUrl} alt={item.name} />
@@ -199,9 +208,9 @@ export function DropRail({
                 <button
                   type="button"
                   className="hp-drop-doc"
-                  title={item.name}
-                  aria-label={`预览 ${item.name}`}
-                  onClick={() => setOpenId(item.id)}
+                  title={item.hostRef || item.name}
+                  aria-label={item.hostRef && !item.isDir ? `打开 ${item.name}` : `预览 ${item.name}`}
+                  onClick={openItem}
                 >
                   <span className="hp-drop-glyph" aria-hidden="true">
                     {badge ? <span className="hp-drop-badge">{badge}</span> : <Folder size={16} />}

@@ -480,9 +480,20 @@ impl Controller {
                 }
                 if self.hold_mode() {
                     if pressed {
-                        self.start(Via::Hold);
+                        if self.recording_via().is_some() {
+                            self.stop();
+                        } else {
+                            self.start(Via::Hold);
+                        }
                     } else if self.recording_via() == Some(Via::Hold) {
-                        self.stop();
+                        if self
+                            .recording_elapsed()
+                            .is_some_and(|d| d < Duration::from_millis(380))
+                        {
+                            self.promote_hold_to_toggle();
+                        } else {
+                            self.stop();
+                        }
                     }
                 } else if pressed {
                     if self.recording_via().is_some() {
@@ -614,6 +625,31 @@ impl Controller {
             #[cfg(any(target_os = "macos", windows))]
             Phase::Recording { via, .. } => Some(*via),
             _ => None,
+        }
+    }
+
+    fn recording_elapsed(&self) -> Option<Duration> {
+        match &self.phase {
+            #[cfg(any(target_os = "macos", windows))]
+            Phase::Recording { started, .. } => Some(started.elapsed()),
+            _ => None,
+        }
+    }
+
+    fn promote_hold_to_toggle(&mut self) {
+        #[cfg(any(target_os = "macos", windows))]
+        if let Phase::Recording { via, started, .. } = &mut self.phase {
+            *via = Via::Toggle;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            hud::update(
+                &self.app,
+                json!({
+                    "state": "recording",
+                    "level": 0,
+                    "elapsedMs": elapsed_ms,
+                    "hint": "再按快捷键或点 ✓ 完成",
+                }),
+            );
         }
     }
 
@@ -875,7 +911,7 @@ impl Controller {
                 );
                 self.hide_at = Some(
                     Instant::now()
-                        + Duration::from_millis(if note.is_some() { 3000 } else { 1200 }),
+                        + Duration::from_millis(if note.is_some() { 2400 } else { 680 }),
                 );
                 self.publish(Some(None));
             }

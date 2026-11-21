@@ -165,14 +165,15 @@ const DEMO_TERMINALS: Record<string, string[]> = {
   ],
 };
 
-const DEMO_FILES: Array<{ dir: string; name: string; kind: "file" | "dir"; size?: number; private?: boolean; ignored?: boolean; hidden?: boolean; body?: string }> = [
-  { dir: "", name: "src", kind: "dir" },
+const DEMO_FILES: Array<{ dir: string; name: string; kind: "file" | "dir"; size?: number; private?: boolean; ignored?: boolean; hidden?: boolean; gitStatus?: "M" | "A" | "D" | "R" | "U" | "?"; body?: string }> = [
+  { dir: "", name: "src", kind: "dir", gitStatus: "M" },
   { dir: "", name: "node_modules", kind: "dir", ignored: true },
   { dir: "", name: ".env", kind: "file", size: 120, private: true, hidden: true },
   {
     dir: "",
     name: "README.md",
     kind: "file",
+    gitStatus: "M",
     size: 220,
     body: "# demo-app\n\n演示用的小项目。\n\n## 开发\n\n- `pnpm install`\n- `pnpm dev`\n\n登录回调在 `src/auth/callback.ts`。\n",
   },
@@ -268,6 +269,13 @@ export const mockApi = {
       link: "online",
       devices: Object.fromEntries(DEMO_DEVICES.map((d) => [d.id, d])),
       agents,
+      spaces: {
+        "dev-mac": [
+          { id: "sp-1", name: "backend", folder: "~/work/demo-app", tabs: 3, terminals: 3, color: "ansi6", active: true },
+          { id: "sp-2", name: "release", folder: "~/repos/sample-cli", tabs: 1, terminals: 1, color: "ansi3" },
+          { id: "sp-3", name: "sandbox", folder: "~/scratch", tabs: 1, terminals: 0, color: "ansi5" },
+        ],
+      },
       rev: liveStore.get().rev + 1,
     });
   },
@@ -305,8 +313,9 @@ export const mockApi = {
     if (method === "spaces.list") {
       return {
         spaces: [
-          { id: "sp-1", name: "backend", folder: "~/work/demo-app", tabs: 3, terminals: 3 },
-          { id: "sp-2", name: "release", folder: "~/repos/sample-cli", tabs: 1, terminals: 1 },
+          { id: "sp-1", name: "backend", folder: "~/work/demo-app", tabs: 3, terminals: 3, color: "ansi6", active: true },
+          { id: "sp-2", name: "release", folder: "~/repos/sample-cli", tabs: 1, terminals: 1, color: "ansi3" },
+          { id: "sp-3", name: "sandbox", folder: "~/scratch", tabs: 1, terminals: 0, color: "ansi5" },
         ],
         launchers: [
           { id: "claude", label: "Claude Code", takesTask: true },
@@ -366,18 +375,174 @@ export const mockApi = {
       const parent = norm === "~" ? null : slash > 0 ? norm.slice(0, slash) : "~";
       return { path: norm, displayPath: norm, parent, entries: dirs[norm] ?? [] };
     }
+    if (method === "agent.commands") {
+      const a = DEMO_AGENTS.find((x) => x.key === params.agent);
+      return {
+        harness: a?.harness ?? "claude",
+        commands: [
+          { name: "/deploy", description: "部署到预发布环境并运行冒烟检查", argHint: "[env]", category: "custom", source: "project" },
+          { name: "/plan", description: "切换结构化分步规划视图", category: "skill", source: "user" },
+        ],
+      };
+    }
+    if (method === "agent.usage") {
+      const a = DEMO_AGENTS.find((x) => x.key === params.agent);
+      const activeModel = a?.model ?? "claude-opus-5-5";
+      return {
+        harness: a?.harness ?? "claude-code",
+        sessionKey: a?.sessionKey,
+        model: activeModel,
+        session: {
+          turns: 4,
+          steps: 18,
+          prompts: 4,
+          input: 141_017,
+          output: 26_551,
+          cacheRead: 530_620,
+          cacheWrite: 12_400,
+          reasoning: 1_840,
+          costUsd: 1.42,
+          unpricedSteps: 0,
+          contextTokens: 73_266,
+          contextLimit: 200_000,
+          contextPct: 36.63,
+        },
+        models: [
+          { model: activeModel, steps: 14, input: 118_000, output: 22_100, cacheRead: 490_000, cacheWrite: 12_400, costUsd: 1.31, unpricedSteps: 0 },
+          { model: "claude-haiku-5-5", steps: 4, input: 23_017, output: 4_451, cacheRead: 40_620, cacheWrite: 0, costUsd: 0.11, unpricedSteps: 0 },
+        ],
+        day24h: {
+          harness: { key: "claude", label: a?.harness ?? "claude-code", sessions: 6, steps: 84, prompts: 18, input: 320_000, output: 54_000, cacheRead: 1_900_000, cacheWrite: 45_000, costUsd: 4.86 },
+          total: { key: "total", label: "total", sessions: 11, steps: 142, prompts: 31, input: 580_000, output: 88_000, cacheRead: 2_840_000, cacheWrite: 62_000, costUsd: 8.15 },
+        },
+        day7d: {
+          harness: { key: "claude", label: a?.harness ?? "claude-code", sessions: 28, steps: 512, prompts: 109, input: 1_840_000, output: 310_000, cacheRead: 9_600_000, cacheWrite: 220_000, costUsd: 26.4 },
+          total: { key: "total", label: "total", sessions: 44, steps: 890, prompts: 192, input: 3_120_000, output: 495_000, cacheRead: 14_200_000, cacheWrite: 310_000, costUsd: 41.8 },
+        },
+        quotas: [
+          { provider: "anthropic", account: "us***@example.com", label: "5 小时滑动窗口", usedPct: 34.5, resetAt: Date.now() + 2 * 3_600_000 },
+          { provider: "anthropic", account: "us***@example.com", label: "7 天周额度", usedPct: 18.0, resetAt: Date.now() + 4 * 86_400_000 },
+        ],
+      };
+    }
+    if (method === "agent.models") {
+      const a = DEMO_AGENTS.find((x) => x.key === params.agent);
+      const cur = a?.model ?? "claude-opus-5-5";
+      const pool = [
+        { id: "claude-opus-5-5", label: "Claude Opus 5.5", provider: "anthropic", contextWindow: 200_000, reasoning: true, source: "recent" as const },
+        { id: "claude-sonnet-5", label: "Claude Sonnet 5", provider: "anthropic", contextWindow: 200_000, reasoning: true, source: "recent" as const },
+        { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", provider: "openai", contextWindow: 1_050_000, reasoning: true, source: "catalog" as const },
+        { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon High", provider: "google", contextWindow: 1_048_576, reasoning: true, source: "catalog" as const },
+        { id: "deepseek-reasoner", label: "DeepSeek Reasoner", provider: "deepseek", contextWindow: 128_000, reasoning: true, source: "catalog" as const },
+      ];
+      const models = [
+        { id: cur, label: cur, contextWindow: 200_000, reasoning: true, source: "current" as const },
+        ...pool.filter((x) => x.id !== cur),
+      ];
+      return {
+        harness: a?.harness ?? "claude-code",
+        currentModel: cur,
+        canSwitch: !a?.isShell,
+        ...(a?.isShell ? { reason: "普通终端不支持切换模型" } : {}),
+        models,
+      };
+    }
+    if (method === "git.status") {
+      const root = (typeof params.cwd === "string" && params.cwd.trim()) || "~/work/demo-app";
+      return {
+        isRepo: true,
+        root,
+        branch: "feat/oauth-guard",
+        upstream: "origin/feat/oauth-guard",
+        ahead: 1,
+        behind: 0,
+        branches: ["feat/oauth-guard", "main", "release/0.2"],
+        staged: [
+          { path: "src/auth/state.ts", status: "A", staged: true, additions: 28, deletions: 0 },
+        ],
+        unstaged: [
+          { path: "src/auth/callback.ts", status: "M", staged: false, additions: 14, deletions: 3 },
+          { path: "README.md", status: "M", staged: false, additions: 4, deletions: 1 },
+          { path: "notes/todo.md", status: "?", staged: false },
+        ],
+        repos: [
+          { root: "~/work/demo-app", name: "demo-app", branch: "feat/oauth-guard", upstream: "origin/feat/oauth-guard", ahead: 1, behind: 0, dirtyCount: 4 },
+          { root: "~/repos/sample-cli", name: "sample-cli", branch: "main", upstream: "origin/main", ahead: 0, behind: 1, dirtyCount: 0 },
+        ],
+      };
+    }
+    if (method === "git.diff") {
+      return {
+        path: params.path ?? "src/auth/callback.ts",
+        staged: Boolean(params.staged),
+        patch: [
+          `diff --git a/${params.path} b/${params.path}`,
+          `--- a/${params.path}`,
+          `+++ b/${params.path}`,
+          "@@ -12,6 +12,11 @@ export async function verifyOAuthCallback(req: Request) {",
+          "   const state = req.searchParams.get('state');",
+          "-  if (!state) throw new Error('missing state');",
+          "+  if (!state || !isValidPkceState(state)) {",
+          "+    throw new AuthError('invalid_state', 401);",
+          "+  }",
+          "+  await consumeStateToken(state);",
+          "   return exchangeCode(req);",
+          " }",
+        ].join("\n"),
+        additions: 4,
+        deletions: 1,
+      };
+    }
+    if (method === "git.log") {
+      return {
+        commits: [
+          { hash: "a1b2c3d4e5f6", shortHash: "a1b2c3d", subject: "feat(auth): enforce PKCE state signature", author: "crosery", dateMs: now - 18 * min, refs: "HEAD -> feat/oauth-guard" },
+          { hash: "9876543210fe", shortHash: "9876543", subject: "fix(relay): tighten socket pong timeout", author: "crosery", dateMs: now - 140 * min, refs: "main" },
+        ],
+      };
+    }
+    if (method === "git.stage" || method === "git.unstage" || method === "git.discard") {
+      return { ok: true };
+    }
+    if (method === "git.commit") {
+      return { hash: "f9e8d7c", subject: String(params.message ?? "").split("\n")[0] || "demo commit" };
+    }
+    if (method === "git.checkout") {
+      return { branch: String(params.branch ?? "main") };
+    }
+    if (method === "git.pull") {
+      return { summary: "Already up to date." };
+    }
+    if (method === "git.push") {
+      return { summary: "Everything up-to-date." };
+    }
     if (method === "terminal.put") {
       return { paths: (params.files ?? []).map((f: any, i: number) => `/tmp/mock-${i}-${f.name}`) };
     }
     if (method === "terminal.send") {
+      const textStr = String(params.text ?? "");
+      const modelMatch = /^\/model\s+(\S+)/i.exec(textStr.trim());
+      if (modelMatch) {
+        const targetAgent = DEMO_AGENTS.find((x) => x.key === params.agent);
+        if (targetAgent) {
+          targetAgent.model = modelMatch[1];
+          mockApi.connect();
+        }
+      }
       const prev = DEMO_EVENTS[params.agent] ?? [];
       DEMO_EVENTS[params.agent] = [
         ...prev,
-        { id: `u-${Date.now()}`, session: params.agent, ts: Date.now(), kind: "user_message", text: params.text },
-        { id: `a-${Date.now() + 1}`, session: params.agent, ts: Date.now() + 1, kind: "assistant_message", text: `（演示模式已收到：${params.text}）` },
+        { id: `u-${Date.now()}`, session: params.agent, ts: Date.now(), kind: "user_message", text: textStr },
+        {
+          id: `a-${Date.now() + 1}`,
+          session: params.agent,
+          ts: Date.now() + 1,
+          kind: "assistant_message",
+          text: modelMatch ? `（演示模式已切换模型为 \`${modelMatch[1]}\`）` : `（演示模式已收到：${textStr}）`,
+        },
       ];
       const term = DEMO_TERMINALS[params.agent] ?? [];
-      DEMO_TERMINALS[params.agent] = [...term, `> ${params.text}`, "\x1b[32m✓ 演示指令已送达\x1b[0m"];
+      DEMO_TERMINALS[params.agent] = [...term, `> ${textStr}`, "\x1b[32m✓ 演示指令已送达\x1b[0m"];
       return { ok: true };
     }
     if (method === "terminal.keys") {

@@ -1,4 +1,4 @@
-import type { Agent, ConvEvent, SessionHit, SessionInfo, SubSession, UsageRow } from "@herdr-pocket/protocol";
+import type { Agent, AgentUsageModelRow, ConvEvent, SessionHit, SessionInfo, SubSession, UsageRow } from "@herdr-pocket/protocol";
 import { cleanTitle } from "./util.ts";
 
 /** Subset of Uniflo schema v1 `Session` (crates/uniflo-schema/src/lib.rs). */
@@ -589,6 +589,104 @@ export class UnifloAdapter {
     const r = (await this.get(`/v1/usage?${query}`)) as { since?: number; rows?: Array<Record<string, unknown>>; totals?: Record<string, unknown> };
     const rows = (r.rows ?? []).map(toUsage).sort((a, b) => b.costUsd - a.costUsd);
     return { since: r.since ?? undefined, rows: rows.slice(0, 15), total: toUsage(r.totals ?? {}) };
+  }
+
+  /** Recent distinct model IDs used in the last 30 days, ordered by steps/usage. */
+  async recentModels(harness?: string): Promise<string[]> {
+    const query = new URLSearchParams({ group_by: "model", since: "30d" });
+    if (harness?.trim()) query.set("q", `h:${harness.trim()}`);
+    const r = (await this.get(`/v1/usage?${query}`)) as { rows?: Array<Record<string, unknown>> };
+    const rows = Array.isArray(r.rows) ? r.rows : [];
+    const sorted = [...rows].sort((a, b) => {
+      const sa = typeof a.steps === "number" ? a.steps : 0;
+      const sb = typeof b.steps === "number" ? b.steps : 0;
+      return sb - sa;
+    });
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const row of sorted) {
+      const id = String(row.key || row.label || "").trim();
+      if (!id || id === "(other)" || seen.has(id.toLowerCase())) continue;
+      seen.add(id.toLowerCase());
+      out.push(id);
+    }
+    return out;
+  }
+
+  /** Detailed token, cache, reasoning, context, and per-model breakdown for one Uniflo session key. */
+  async sessionUsage(sessionKey: string): Promise<{
+    turns: number;
+    steps: number;
+    prompts: number;
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning: number;
+    costUsd: number;
+    unpricedSteps: number;
+    contextTokens?: number;
+    contextLimit?: number;
+    contextPct?: number;
+    model?: string;
+    models: AgentUsageModelRow[];
+  }> {
+    const n = (obj: Record<string, unknown> | undefined, k: string) =>
+      typeof obj?.[k] === "number" && Number.isFinite(obj[k] as number) ? (obj[k] as number) : 0;
+    const optN = (obj: Record<string, unknown> | undefined, k: string) =>
+      typeof obj?.[k] === "number" && Number.isFinite(obj[k] as number) ? (obj[k] as number) : undefined;
+
+    const [detail, byModel] = await Promise.all([
+      this.get(`/v1/sessions/${encodeURIComponent(sessionKey)}/usage`) as Promise<{
+        totals?: Record<string, unknown>;
+        turns?: Array<Record<string, unknown>>;
+        steps?: Array<Record<string, unknown>>;
+      }>,
+      this.get(`/v1/usage?q=${encodeURIComponent(sessionKey)}&group_by=model`).catch(() => ({ rows: [] })) as Promise<{
+        rows?: Array<Record<string, unknown>>;
+      }>,
+    ]);
+
+    const totals = detail.totals ?? {};
+    const turns = Array.isArray(detail.turns) ? detail.turns : [];
+    const steps = Array.isArray(detail.steps) ? detail.steps : [];
+    const lastStep = steps.length > 0 ? steps[steps.length - 1] : undefined;
+    const prompts = turns.reduce((acc, t) => acc + n(t, "prompts"), 0);
+    const contextTokens = optN(totals, "last_context_tokens") ?? optN(lastStep, "context_tokens");
+    const contextLimit = optN(totals, "context_limit") ?? optN(lastStep, "context_limit");
+    const contextPct =
+      optN(lastStep, "context_pct") ??
+      (contextTokens !== undefined && contextLimit && contextLimit > 0 ? (contextTokens / contextLimit) * 100 : undefined);
+    const models: AgentUsageModelRow[] = (byModel.rows ?? [])
+      .map((r) => ({
+        model: String(r.label ?? r.key ?? "unknown"),
+        steps: n(r, "steps"),
+        input: n(r, "input"),
+        output: n(r, "output"),
+        cacheRead: n(r, "cache_read"),
+        cacheWrite: n(r, "cache_write"),
+        costUsd: n(r, "cost_usd"),
+        unpricedSteps: n(r, "unpriced_steps"),
+      }))
+      .sort((a, b) => b.costUsd - a.costUsd || b.steps - a.steps);
+
+    return {
+      turns: turns.length,
+      steps: n(totals, "steps") || steps.length,
+      prompts,
+      input: n(totals, "input"),
+      output: n(totals, "output"),
+      cacheRead: n(totals, "cache_read"),
+      cacheWrite: n(totals, "cache_write"),
+      reasoning: n(totals, "reasoning"),
+      costUsd: n(totals, "cost_usd"),
+      unpricedSteps: n(totals, "unpriced_steps"),
+      contextTokens,
+      contextLimit,
+      contextPct,
+      model: typeof lastStep?.model === "string" ? lastStep.model : models[0]?.model,
+      models,
+    };
   }
 
   /** The command that opens a session again, as Uniflo knows it for that program. */

@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
-import type { Agent, Device } from "@herdr-pocket/protocol";
+import type { Agent, ChatDisplayMode, Device } from "@herdr-pocket/protocol";
 import type { TermKeyLayout } from "./termkeys";
 
 export type ThemeMode = "system" | "light" | "dark";
@@ -43,6 +43,7 @@ interface SettingsState {
   deviceName: string | null;
   themeMode: ThemeMode;
   textScale: number;
+  chatDisplayMode: ChatDisplayMode;
   showShells: boolean;
   /** Agent list device switcher: a host deviceId, or null for all hosts. */
   hostFilter: string | null;
@@ -89,6 +90,7 @@ export const useSettings = create<SettingsState>()(
       deviceName: null,
       themeMode: "system",
       textScale: 1,
+      chatDisplayMode: "standard",
       showShells: false,
       hostFilter: null,
       foldedGroups: [],

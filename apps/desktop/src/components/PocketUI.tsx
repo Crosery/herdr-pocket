@@ -198,9 +198,42 @@ export function PocketSwitch({
   );
 }
 
+export function PocketCheckbox({
+  checked,
+  onCheckedChange,
+  disabled,
+  ariaLabel,
+  className = "",
+}: {
+  checked: boolean;
+  onCheckedChange: (next: boolean) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={checked}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      className={`pk-checkbox${checked ? " checked" : ""}${className ? ` ${className}` : ""}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (!disabled) onCheckedChange(!checked);
+      }}
+    >
+      {checked ? <Check size={11} strokeWidth={3} /> : null}
+    </button>
+  );
+}
+
 export interface SelectOption {
   value: string;
   label: string;
+  badge?: string;
+  tone?: "default" | "accent";
 }
 
 const EMPTY_SENTINEL = "__pk_empty__";
@@ -210,6 +243,9 @@ export function PocketSelect({
   onValueChange,
   options,
   placeholder = "请选择…",
+  size = "md",
+  prefixIcon,
+  mono = false,
   className,
   ariaLabel,
   disabled,
@@ -219,18 +255,39 @@ export function PocketSelect({
   onValueChange: (v: string) => void;
   options: SelectOption[];
   placeholder?: string;
+  size?: "sm" | "md";
+  prefixIcon?: ReactNode;
+  mono?: boolean;
   className?: string;
   ariaLabel?: string;
   disabled?: boolean;
   onCloseAutoFocus?: (event: Event) => void;
 }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    overlayStore.set((p) => ({ open: p.open + 1 }));
+    return () => overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
+  }, [open]);
+
   const safeValue = value === "" ? EMPTY_SENTINEL : value;
   const safeOptions = useMemo(
-    () => options.map((o) => ({ value: o.value === "" ? EMPTY_SENTINEL : o.value, raw: o.value, label: o.label })),
+    () =>
+      options.map((o) => ({
+        value: o.value === "" ? EMPTY_SENTINEL : o.value,
+        raw: o.value,
+        label: o.label,
+        badge: o.badge,
+        tone: o.tone,
+      })),
     [options],
   );
+  const selectedOpt = safeOptions.find((o) => o.value === safeValue);
+
   return (
     <Select.Root
+      open={open}
+      onOpenChange={setOpen}
       value={safeValue}
       disabled={disabled}
       onValueChange={(v) => {
@@ -239,15 +296,17 @@ export function PocketSelect({
       }}
     >
       <Select.Trigger
-        className={`pk-select-trigger${className ? ` ${className}` : ""}`}
+        className={`pk-select-trigger${size === "sm" ? " sm" : ""}${mono ? " mono" : ""}${className ? ` ${className}` : ""}`}
         aria-label={ariaLabel}
         disabled={disabled}
       >
+        {prefixIcon ? <span className="pk-select-prefix">{prefixIcon}</span> : null}
         <span className="pk-select-value">
           <Select.Value placeholder={placeholder} />
         </span>
+        {selectedOpt?.badge ? <span className="pk-select-trigger-badge mono">{selectedOpt.badge}</span> : null}
         <Select.Icon className="pk-select-icon">
-          <ChevronDown size={15} />
+          <ChevronDown size={size === "sm" ? 13 : 15} />
         </Select.Icon>
       </Select.Trigger>
       <Select.Portal>
@@ -261,9 +320,10 @@ export function PocketSelect({
           <Select.Viewport className="pk-select-viewport">
             {safeOptions.map((o) => (
               <Select.Item key={o.value} value={o.value} className="pk-select-item">
-                <span className="pk-select-item-text">
+                <span className={`pk-select-item-text${o.tone === "accent" ? " accent" : ""}${mono && o.tone !== "accent" ? " mono" : ""}`}>
                   <Select.ItemText>{o.label}</Select.ItemText>
                 </span>
+                {o.badge ? <span className="pk-select-item-badge mono">{o.badge}</span> : null}
                 <Select.ItemIndicator className="pk-select-item-check">
                   <Check size={14} />
                 </Select.ItemIndicator>

@@ -1,4 +1,5 @@
 import type { PutFile } from "@herdr-pocket/protocol";
+import { resolveDropPath, type WorkspaceDragItem } from "./fileDrag";
 
 export type DropKind = "image" | "video" | "audio" | "pdf" | "document" | "text" | "archive" | "file";
 
@@ -138,9 +139,30 @@ export interface StagedAttachment {
   mime: string;
   size: number;
   kind: DropKind;
-  put: PutFile;
-  file: File;
+  put?: PutFile;
+  file?: File;
+  hostRef?: string;
+  isDir?: boolean;
+  openPath?: string;
+  openAgentKey?: string;
   previewUrl?: string;
+}
+
+export function stageWorkspaceDragItem(item: WorkspaceDragItem, targetHostId: string): StagedAttachment {
+  const hostRef = resolveDropPath(item, targetHostId);
+  const mime = item.kind === "dir" ? "inode/directory" : mediaTypeFor(item.name) || "application/octet-stream";
+  return {
+    id: `att-${++seq}`,
+    sig: `ws:${item.agentKey}:${item.kind}:${item.relPath}`,
+    name: item.name,
+    mime,
+    size: 0,
+    kind: item.kind === "dir" ? "file" : dropKindOf(item.name, mime),
+    hostRef,
+    isDir: item.kind === "dir",
+    openPath: item.relPath,
+    openAgentKey: item.agentKey,
+  };
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -210,7 +232,7 @@ export async function prepareDroppedFiles(
   maxTotalBytes: number,
 ): Promise<{ added: StagedAttachment[]; notice?: string }> {
   const seen = new Set(existing.map((a) => a.sig));
-  let total = existing.reduce((sum, a) => sum + approxDecodedBytes(a.put.data), 0);
+  let total = existing.reduce((sum, a) => sum + (a.put ? approxDecodedBytes(a.put.data) : 0), 0);
   const added: StagedAttachment[] = [];
   let notice: string | undefined;
 

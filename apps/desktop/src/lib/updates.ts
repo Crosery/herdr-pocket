@@ -40,19 +40,39 @@ export interface UpdateState {
   progress: UpdateInstallProgress | null;
   installError: string | null;
   dismissedVersion: string | null;
+  minimized: boolean;
+  manualNotice: string | null;
 }
 
 const LAST_KEY = "herdr-pocket-update-checked-at";
+
+function readLastCheckedAt(): number | null {
+  try {
+    return typeof localStorage !== "undefined" ? Number(localStorage.getItem(LAST_KEY)) || null : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveLastCheckedAt(at: number): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(LAST_KEY, String(at));
+  } catch {
+    // ignore
+  }
+}
 
 export const updateStore = createStore<UpdateState>({
   checking: false,
   info: null,
   error: null,
-  checkedAt: Number(localStorage.getItem(LAST_KEY)) || null,
+  checkedAt: readLastCheckedAt(),
   installPhase: "idle",
   progress: null,
   installError: null,
   dismissedVersion: null,
+  minimized: false,
+  manualNotice: null,
 });
 
 let progressListenerInstalled = false;
@@ -124,13 +144,23 @@ export function lastSourceSentence(info: ReleaseUpdateInfo): string {
   return `上次检查走的是 ${info.source}`;
 }
 
+let manualNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+function showManualNotice(msg: string, durationMs = 4500): void {
+  if (manualNoticeTimer) clearTimeout(manualNoticeTimer);
+  updateStore.set({ manualNotice: msg });
+  manualNoticeTimer = setTimeout(() => {
+    manualNoticeTimer = null;
+    updateStore.set({ manualNotice: null });
+  }, durationMs);
+}
+
 export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Promise<ReleaseUpdateInfo | null> {
   ensureProgressListener();
   if (updateStore.get().checking) return updateStore.get().info;
   updateStore.set({
     checking: true,
     error: null,
-    ...(reason === "manual" ? { dismissedVersion: null } : {}),
+    ...(reason === "manual" ? { dismissedVersion: null, minimized: false, manualNotice: null } : {}),
   });
   const { region, mirrors } = clientConfigStore.get().config.update;
   try {
@@ -141,21 +171,34 @@ export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Pro
       forceRace: reason === "manual",
     });
     const at = Date.now();
-    localStorage.setItem(LAST_KEY, String(at));
+    saveLastCheckedAt(at);
     const prev = updateStore.get();
     const sameLatestReady = prev.info?.latest === info.latest && prev.installPhase === "ready";
+    const changedVersion = prev.info?.latest !== info.latest;
     updateStore.set({
       checking: false,
       info,
       checkedAt: at,
-      ...(sameLatestReady ? {} : prev.info?.latest !== info.latest ? { installPhase: "idle", progress: null, installError: null } : {}),
+      ...(changedVersion ? { minimized: false, installPhase: "idle", progress: null, installError: null } : sameLatestReady ? {} : {}),
     });
+    if (info.hasUpdate && !info.notes?.body) {
+      void fetchReleaseNotes().then((notes) => {
+        if (!notes) return;
+        updateStore.set((cur) => (cur.info && cur.info.latest === info.latest ? { ...cur, info: { ...cur.info, notes } } : cur));
+      });
+    }
+    if (reason === "manual" && !info.hasUpdate) {
+      showManualNotice(`当前已是最新版本 v${info.current}`);
+    }
     const probes = info.probes?.map((p) => `${sourceLabel(p.source) || p.source} ${p.ok ? `${p.ms} ms` : "failed"}`).join(", ");
     logger.info("update", `${reason} check: current ${info.current}, latest ${info.latest}${info.hasUpdate ? " (update available)" : ""}; region ${info.region} (${info.regionReason}), source ${info.source}${probes ? `; probes ${probes}` : ""}`);
     return info;
   } catch (e) {
     const msg = (e as Error).message || "检查更新失败";
     updateStore.set({ checking: false, error: `${msg}：检查网络，或把“下载线路”换一个再试` });
+    if (reason === "manual") {
+      showManualNotice(`检查更新失败：${msg}`, 5500);
+    }
     logger.warn("update", `${reason} check failed: ${msg}`);
     return null;
   }
@@ -249,15 +292,23 @@ export async function restartToApplyUpdate(): Promise<void> {
   }
 }
 
+export function minimizeUpdatePrompt(): void {
+  updateStore.set({ minimized: true });
+}
+
+export function restoreUpdatePrompt(): void {
+  updateStore.set({ minimized: false, dismissedVersion: null });
+}
+
 export function dismissUpdatePrompt(): void {
   const cur = updateStore.get();
   const latest = cur.info?.latest;
   if (!latest) return;
   if (cur.installPhase === "error") {
-    updateStore.set({ dismissedVersion: latest, installPhase: "idle", installError: null });
+    updateStore.set({ dismissedVersion: latest, minimized: false, installPhase: "idle", installError: null });
     return;
   }
-  updateStore.set({ dismissedVersion: latest });
+  updateStore.set({ dismissedVersion: latest, minimized: false });
 }
 
 export interface ReleaseNotes {
@@ -290,26 +341,65 @@ export async function fetchReleaseNotes(timeoutMs = 4000): Promise<ReleaseNotes 
   }
 }
 
-/** Startup check (after 6s) + background checks per `update.autoCheck` / `update.checkIntervalHours`, ±10% jitter. */
-export function startAutoUpdateChecks(): () => void {
+const RETRY_BACKOFF_MS = [30_000, 120_000, 600_000];
+const FOCUS_RECHECK_MS = 30 * 60_000;
+
+/** Startup check (after 4s, immune to unrelated config loads) + focus/wake re-checks + retry backoff. */
+export function startAutoUpdateChecks(
+  checkFn: (reason: "manual" | "auto" | "startup") => Promise<ReleaseUpdateInfo | null> = checkForUpdate,
+): () => void {
   ensureProgressListener();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let startupTimer: ReturnType<typeof setTimeout> | null = null;
-  let startupRan = false;
+  let startupDone = false;
+  let failStreak = 0;
+  let stopped = false;
+
+  const scheduleNext = (delayMs: number) => {
+    if (stopped) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      if (stopped || !clientConfigStore.get().config.update.autoCheck) return;
+      void checkFn("auto").then((res) => {
+        failStreak = res ? 0 : failStreak + 1;
+        plan();
+      });
+    }, Math.min(Math.max(10_000, delayMs), 2 ** 31 - 1));
+  };
+
+  let prevAuto = clientConfigStore.get().config.update.autoCheck;
+  let prevHours = clientConfigStore.get().config.update.checkIntervalHours;
 
   const plan = () => {
+    if (stopped) return;
     const { autoCheck, checkIntervalHours } = clientConfigStore.get().config.update;
-    if (timer) clearTimeout(timer);
-    timer = null;
-    if (startupTimer) clearTimeout(startupTimer);
-    startupTimer = null;
-    if (!autoCheck) return;
+    if (!autoCheck) {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (startupTimer) clearTimeout(startupTimer);
+      startupTimer = null;
+      return;
+    }
 
-    if (!startupRan) {
-      startupRan = true;
-      startupTimer = setTimeout(() => {
-        void checkForUpdate("startup").finally(plan);
-      }, 6_000);
+    if (!startupDone) {
+      if (!startupTimer) {
+        startupTimer = setTimeout(() => {
+          startupTimer = null;
+          startupDone = true;
+          if (stopped || !clientConfigStore.get().config.update.autoCheck) return;
+          void checkFn("startup").then((res) => {
+            failStreak = res ? 0 : failStreak + 1;
+            plan();
+          });
+        }, 4_000);
+      }
+      return;
+    }
+
+    if (failStreak > 0) {
+      const backoff = RETRY_BACKOFF_MS[Math.min(failStreak - 1, RETRY_BACKOFF_MS.length - 1)]!;
+      scheduleNext(backoff);
       return;
     }
 
@@ -317,16 +407,41 @@ export function startAutoUpdateChecks(): () => void {
     const last = updateStore.get().checkedAt ?? 0;
     const jitter = every * (Math.random() * 0.2 - 0.1);
     const wait = Math.max(60_000, last + every + jitter - Date.now());
-    timer = setTimeout(() => {
-      void checkForUpdate("auto").finally(plan);
-    }, Math.min(wait, 2 ** 31 - 1));
+    scheduleNext(wait);
+  };
+
+  const onFocusOrOnline = () => {
+    if (stopped || !clientConfigStore.get().config.update.autoCheck) return;
+    const last = updateStore.get().checkedAt ?? 0;
+    if (Date.now() - last > FOCUS_RECHECK_MS && !updateStore.get().checking) {
+      void checkFn("auto").then((res) => {
+        failStreak = res ? 0 : failStreak + 1;
+        plan();
+      });
+    }
   };
 
   plan();
-  const off = clientConfigStore.subscribe(plan);
+  const off = clientConfigStore.subscribe(() => {
+    const { autoCheck, checkIntervalHours } = clientConfigStore.get().config.update;
+    if (autoCheck !== prevAuto || checkIntervalHours !== prevHours) {
+      prevAuto = autoCheck;
+      prevHours = checkIntervalHours;
+      plan();
+    }
+  });
+  if (typeof window !== "undefined") {
+    window.addEventListener("focus", onFocusOrOnline);
+    window.addEventListener("online", onFocusOrOnline);
+  }
   return () => {
+    stopped = true;
     off();
     if (timer) clearTimeout(timer);
     if (startupTimer) clearTimeout(startupTimer);
+    if (typeof window !== "undefined") {
+      window.removeEventListener("focus", onFocusOrOnline);
+      window.removeEventListener("online", onFocusOrOnline);
+    }
   };
 }

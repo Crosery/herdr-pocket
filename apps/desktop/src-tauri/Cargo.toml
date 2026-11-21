@@ -1,6 +1,6 @@
 [package]
 name = "herdr-pocket-desktop"
-version = "0.2.4"
+version = "0.2.5"
 description = "Herdr Pocket Desktop Client"
 authors = ["Herdr Pocket <noreply@users.noreply.github.com>"]
 homepage = "https://github.com/Crosery/herdr-pocket"
@@ -64,7 +64,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 block2 = "0.6"
 # Already in the tree through wry; for WKWebsiteDataStore.removeDataStoreForIdentifier and
 # WKPreferences.inactiveSchedulingPolicy (macOS 14+).
-objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebsiteDataStore", "WKWebView", "WKWebViewConfiguration", "WKPreferences"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebsiteDataStore", "WKHTTPCookieStore", "WKWebView", "WKWebViewConfiguration", "WKPreferences"] }
 security-framework = "3"
 
 [target.'cfg(windows)'.dependencies]

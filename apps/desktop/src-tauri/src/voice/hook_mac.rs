@@ -88,6 +88,8 @@ pub fn start(key: ModKey, sink: impl Fn(KeyEvent) + Send + 'static) -> Result<Ho
                             } else {
                                 KeyEvent::ModUp
                             });
+                        } else if kc == 63 && code != 63 {
+                            // Ignore spurious Apple Silicon Fn (63) events around other hotkeys.
                         } else {
                             sink(KeyEvent::Other);
                         }

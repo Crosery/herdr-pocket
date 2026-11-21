@@ -5,6 +5,7 @@
  * embedded browser, cookie import and dictation go through native-engineer's ./bridge.
  * Outside Tauri every call answers "unsupported" instead of throwing, so each screen renders.
  */
+import type { RpcResult } from "@herdr-pocket/protocol";
 import * as bridge from "./bridge";
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -108,6 +109,13 @@ export interface LocalTermAttachResult {
   rows: number;
 }
 
+export interface LocalCreateShellResult {
+  terminal: string;
+  cwd: string;
+  cols: number;
+  rows: number;
+}
+
 export interface LocalTermDataEvent {
   id: string;
   data: string;
@@ -207,6 +215,24 @@ export const native = {
   uploadLogsNow: (): Promise<number> => (inTauri() ? invoke<number>("log_upload_now") : Promise.resolve(0)),
 
   // Local terminal direct `hc connect` bridge --------------------------------
+  localHostDeviceId: async (): Promise<string | null> =>
+    inTauri() ? invoke<string | null>("local_host_device_id").catch(() => null) : null,
+  localTermCreateShell: (params: {
+    cwd?: string;
+    cols: number;
+    rows: number;
+    display?: Record<string, unknown>;
+    spaceName?: string;
+  }): Promise<LocalCreateShellResult> =>
+    inTauri()
+      ? invoke<LocalCreateShellResult>("local_term_create_shell", {
+          cwd: params.cwd ?? null,
+          cols: params.cols,
+          rows: params.rows,
+          display: params.display ?? null,
+          spaceName: params.spaceName ?? null,
+        })
+      : Promise.reject(new Error("仅桌面端支持本地直连")),
   localTermAttach: (params: {
     id: string;
     terminal: string;
@@ -233,7 +259,32 @@ export const native = {
   terminalFontBytes: async (id: number): Promise<ArrayBuffer | null> =>
     inTauri() ? invoke<ArrayBuffer>("terminal_font_bytes", { id }).catch(() => null) : null,
 
-  // Native folder dialog -----------------------------------------------------
+  // Native folder/file dialog & local files ----------------------------------
   pickFolder: async (initialDir?: string): Promise<string | null> =>
     inTauri() ? invoke<string | null>("pick_folder", { initialDir: initialDir?.trim() || null }) : null,
+  pickFile: async (initialDir?: string): Promise<string | null> =>
+    inTauri() ? invoke<string | null>("pick_file", { initialDir: initialDir?.trim() || null }) : null,
+  localReadFile: async (params: {
+    cwd?: string;
+    path: string;
+    maxBytes?: number;
+  }): Promise<RpcResult<"files.read"> | null> =>
+    inTauri()
+      ? invoke<RpcResult<"files.read">>("local_read_file", {
+          cwd: params.cwd?.trim() || null,
+          path: params.path,
+          maxBytes: params.maxBytes ?? null,
+        })
+      : null,
+  /** Zero-copy local asset URL backed by Tauri's `pocket-local` custom URI scheme (Range streaming, main webview only). */
+  localFileStreamUrl: (path: string, cwd?: string): string | null => {
+    if (!inTauri() || !path.trim()) return null;
+    const origin =
+      bridge.detectPlatform() === "windows"
+        ? "http://pocket-local.localhost"
+        : "pocket-local://localhost";
+    const qs = new URLSearchParams({ path: path.trim() });
+    if (cwd?.trim()) qs.set("cwd", cwd.trim());
+    return `${origin}/file?${qs.toString()}`;
+  },
 };

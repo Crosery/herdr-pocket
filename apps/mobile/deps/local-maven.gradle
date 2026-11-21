@@ -1,7 +1,17 @@
-// Artifacts Gradle could not download on the build Mac (Java's TLS handshake to
-// Maven Central is cut there) are kept in deps/maven. Use with:
+// Artifacts Gradle could not download cleanly (including Maven Central / Gradle Plugin Portal
+// mirrors and animated-webp) are kept in deps/maven. Use with:
 //   ./gradlew assembleRelease -I ../deps/local-maven.gradle
 def localMaven = new File(buildscript.sourceFile.parentFile, "maven").toURI()
+beforeSettings { settings ->
+  settings.pluginManagement {
+    repositories {
+      maven { url = localMaven }
+      gradlePluginPortal()
+      mavenCentral()
+      google()
+    }
+  }
+}
 allprojects {
   repositories {
     maven { url = localMaven }

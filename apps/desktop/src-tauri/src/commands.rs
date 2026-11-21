@@ -372,11 +372,11 @@ fn format_picked_folder(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Opens the OS-native folder selection dialog (Finder sheet on macOS, Explorer on Windows).
-#[tauri::command]
-pub async fn pick_folder(
+/// Opens the OS-native folder or file selection dialog cleanly without duplicating platform code.
+async fn pick_os_path(
     app: AppHandle,
     initial_dir: Option<String>,
+    choose_dirs: bool,
 ) -> Result<Option<String>, String> {
     let start_dir = expand_initial_folder(initial_dir);
 
@@ -386,15 +386,15 @@ pub async fn pick_folder(
         app.run_on_main_thread(move || {
             let res = (|| -> Result<Option<String>, String> {
                 let Some(mtm) = objc2::MainThreadMarker::new() else {
-                    return Err("不在主线程上，无法打开目录选择器".into());
+                    return Err("不在主线程上，无法打开选择器".into());
                 };
                 use objc2_app_kit::NSOpenPanel;
                 use objc2_foundation::{NSString, NSURL};
 
                 let panel = NSOpenPanel::openPanel(mtm);
-                panel.setCanChooseDirectories(true);
-                panel.setCanChooseFiles(false);
-                panel.setCanCreateDirectories(true);
+                panel.setCanChooseDirectories(choose_dirs);
+                panel.setCanChooseFiles(!choose_dirs);
+                panel.setCanCreateDirectories(choose_dirs);
                 if let Some(dir) = &start_dir {
                     let s = NSString::from_str(&dir.to_string_lossy());
                     let url = NSURL::fileURLWithPath(&s);
@@ -404,18 +404,22 @@ pub async fn pick_folder(
                 if resp != 1 {
                     return Ok(None);
                 }
-                let picked = panel
-                    .URL()
-                    .and_then(|u| u.path())
-                    .map(|ns| format_picked_folder(std::path::Path::new(&ns.to_string())));
+                let picked = panel.URL().and_then(|u| u.path()).map(|ns| {
+                    let s = ns.to_string();
+                    if choose_dirs {
+                        format_picked_folder(std::path::Path::new(&s))
+                    } else {
+                        s
+                    }
+                });
                 Ok(picked)
             })();
             let _ = tx.send(res);
         })
-        .map_err(|e| format!("无法弹出目录选择框：{e}"))?;
+        .map_err(|e| format!("无法弹出选择框：{e}"))?;
 
         return tauri::async_runtime::spawn_blocking(move || {
-            rx.recv().map_err(|_| "目录选择框已关闭".to_string())?
+            rx.recv().map_err(|_| "选择框已关闭".to_string())?
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -464,7 +468,7 @@ pub async fn pick_folder(
                     &mut dlg,
                 );
                 if hr < 0 || dlg.is_null() {
-                    return Err(format!("打不开文件夹选择框 (0x{hr:08x})"));
+                    return Err(format!("打不开选择框 (0x{hr:08x})"));
                 }
                 let vtbl = *(dlg as *const *const *const c_void);
                 let release: unsafe extern "system" fn(*mut c_void) -> u32 =
@@ -482,7 +486,12 @@ pub async fn pick_folder(
 
                 let mut opts: u32 = 0;
                 if get_options(dlg, &mut opts) >= 0 {
-                    let _ = set_options(dlg, opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+                    let flags = if choose_dirs {
+                        opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM
+                    } else {
+                        (opts & !FOS_PICKFOLDERS) | FOS_FORCEFILESYSTEM
+                    };
+                    let _ = set_options(dlg, flags);
                 }
 
                 if let Some(dir) = start_dir {
@@ -511,11 +520,7 @@ pub async fn pick_folder(
                 let hr_show = show(dlg, null_mut());
                 if hr_show == HRESULT_CANCELLED || hr_show < 0 {
                     release(dlg);
-                    return if hr_show == HRESULT_CANCELLED {
-                        Ok(None)
-                    } else {
-                        Ok(None)
-                    };
+                    return Ok(None);
                 }
 
                 let mut item: *mut c_void = null_mut();
@@ -546,7 +551,11 @@ pub async fn pick_folder(
                 let picked = String::from_utf16_lossy(std::slice::from_raw_parts(psz, len));
                 CoTaskMemFree(psz as *const c_void);
                 let _ = PCWSTR::default();
-                Ok(Some(format_picked_folder(std::path::Path::new(&picked))))
+                Ok(Some(if choose_dirs {
+                    format_picked_folder(std::path::Path::new(&picked))
+                } else {
+                    picked
+                }))
             }
         })
         .await
@@ -560,40 +569,568 @@ pub async fn pick_folder(
             let start = start_dir
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "/".to_string());
-            if let Ok(out) = std::process::Command::new("zenity")
-                .args(["--file-selection", "--directory", "--filename", &format!("{}/", start.trim_end_matches('/'))])
-                .output()
-            {
+            let mut z_args = vec!["--file-selection"];
+            if choose_dirs {
+                z_args.push("--directory");
+            }
+            let filename_arg = format!("{}/", start.trim_end_matches('/'));
+            z_args.extend(["--filename", &filename_arg]);
+            if let Ok(out) = std::process::Command::new("zenity").args(&z_args).output() {
                 if out.status.success() {
                     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !s.is_empty() {
-                        return Ok(Some(format_picked_folder(std::path::Path::new(&s))));
+                        return Ok(Some(if choose_dirs {
+                            format_picked_folder(std::path::Path::new(&s))
+                        } else {
+                            s
+                        }));
                     }
                 }
                 return Ok(None);
             }
-            if let Ok(out) = std::process::Command::new("kdialog")
-                .args(["--getexistingdirectory", &start])
-                .output()
-            {
+            let k_flag = if choose_dirs { "--getexistingdirectory" } else { "--getopenfilename" };
+            if let Ok(out) = std::process::Command::new("kdialog").args([k_flag, &start]).output() {
                 if out.status.success() {
                     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !s.is_empty() {
-                        return Ok(Some(format_picked_folder(std::path::Path::new(&s))));
+                        return Ok(Some(if choose_dirs {
+                            format_picked_folder(std::path::Path::new(&s))
+                        } else {
+                            s
+                        }));
                     }
                 }
                 return Ok(None);
             }
-            Err("当前 Linux 环境未安装 zenity / kdialog，请改用右侧「浏览目录」".into())
+            Err("当前 Linux 环境未安装 zenity / kdialog".into())
         })
         .await
         .map_err(|e| e.to_string())?;
     }
 }
 
+/// Opens the OS-native folder selection dialog (Finder sheet on macOS, Explorer on Windows).
+#[tauri::command]
+pub async fn pick_folder(
+    app: AppHandle,
+    initial_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    pick_os_path(app, initial_dir, true).await
+}
+
+/// Opens the OS-native file selection dialog for previewing files in tabs or the built-in browser.
+#[tauri::command]
+pub async fn pick_file(
+    app: AppHandle,
+    initial_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    pick_os_path(app, initial_dir, false).await
+}
+
+const MAX_LOCAL_IMAGE_READ_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_LOCAL_MEDIA_READ_BYTES: u64 = 128 * 1024 * 1024;
+const DEFAULT_LOCAL_READ_BYTES: usize = 512 * 1024;
+const MAX_LOCAL_READ_BYTES: usize = 2 * 1024 * 1024;
+const SNIFF_LOCAL_BYTES: usize = 8192;
+
+pub(crate) struct ResolvedLocalFile {
+    pub canon: std::path::PathBuf,
+    pub display_path: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub ext: String,
+    pub language: Option<String>,
+}
+
+pub(crate) fn resolve_safe_local_file(
+    cwd: Option<&str>,
+    path: &str,
+) -> Result<ResolvedLocalFile, String> {
+    let raw_target = expand_home_path(path)?;
+    let cwd_expanded = cwd
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(expand_home_path)
+        .transpose()?;
+
+    let candidate = if raw_target.is_absolute() {
+        raw_target
+    } else if let Some(ref base) = cwd_expanded {
+        base.join(&raw_target)
+    } else if let Some(home) = crate::home_dir() {
+        home.join(&raw_target)
+    } else {
+        raw_target
+    };
+
+    let canon = fs::canonicalize(&candidate).map_err(|_| "没有这个文件或目录".to_string())?;
+    for comp in canon.components() {
+        if let std::path::Component::Normal(s) = comp {
+            if is_private_local_component(&s.to_string_lossy()) {
+                return Err("这个文件可能存有密钥，不在这里显示".into());
+            }
+        }
+    }
+    if let Some(cfg_dir) = crate::hostd_config_dir() {
+        let real_cfg = fs::canonicalize(&cfg_dir).unwrap_or(cfg_dir);
+        if canon.starts_with(&real_cfg) {
+            return Err("这是 herdr-pocket 自己的设置目录，不在这里显示".into());
+        }
+    }
+
+    let meta = fs::metadata(&canon).map_err(|e| format!("无法读取文件信息：{e}"))?;
+    if meta.is_dir() {
+        return Err("这是一个目录，无法当文件打开".into());
+    }
+    if !meta.is_file() {
+        return Err("这不是普通文件".into());
+    }
+
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let name = canon
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = canon
+        .extension()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let language = local_language(&name, &ext).map(ToString::to_string);
+
+    let display_path = cwd_expanded
+        .as_deref()
+        .and_then(|base| fs::canonicalize(base).ok())
+        .and_then(|real_cwd| {
+            canon.strip_prefix(&real_cwd).ok().map(|rel| {
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| canon.to_string_lossy().into_owned());
+
+    Ok(ResolvedLocalFile {
+        canon,
+        display_path,
+        size,
+        mtime,
+        ext,
+        language,
+    })
+}
+
+pub(crate) fn local_stream_mime(ext: &str) -> &'static str {
+    if ext == "svg" {
+        return "image/svg+xml";
+    }
+    if let Some(m) = local_image_mime(ext) {
+        return m;
+    }
+    if let Some((m, _)) = local_media_mime(ext) {
+        return m;
+    }
+    "application/octet-stream"
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFileSlice {
+    pub path: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub truncated: bool,
+    pub offset: u64,
+    pub bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+fn is_private_local_component(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        ".ssh"
+            | ".gnupg"
+            | ".aws"
+            | ".azure"
+            | ".kube"
+            | ".docker"
+            | ".password-store"
+            | ".netrc"
+            | ".pgpass"
+            | ".git-credentials"
+            | ".npmrc"
+            | ".pypirc"
+            | "keychains"
+            | "id_rsa"
+            | "id_rsa.pub"
+            | "id_dsa"
+            | "id_dsa.pub"
+            | "id_ecdsa"
+            | "id_ecdsa.pub"
+            | "id_ed25519"
+            | "id_ed25519.pub"
+    ) {
+        return true;
+    }
+    if lower == ".env"
+        || (lower.starts_with(".env.")
+            && !matches!(
+                lower.as_str(),
+                ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+            ))
+    {
+        return true;
+    }
+    matches!(
+        std::path::Path::new(&lower)
+            .extension()
+            .and_then(|s| s.to_str()),
+        Some("pem" | "key" | "p12" | "pfx" | "keystore" | "jks" | "kdbx")
+    )
+}
+
+fn expand_home_path(raw: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = raw.trim().strip_prefix("file://").unwrap_or(raw.trim());
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err("路径不对".into());
+    }
+    if trimmed == "~" {
+        return crate::home_dir().ok_or_else(|| "无法确定主目录".into());
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            trimmed.strip_prefix("~\\")
+        } else {
+            None
+        }
+    }) {
+        let home = crate::home_dir().ok_or_else(|| "无法确定主目录".to_string())?;
+        return Ok(home.join(rest));
+    }
+    Ok(std::path::PathBuf::from(trimmed))
+}
+
+fn local_image_mime(ext: &str) -> Option<&'static str> {
+    match ext {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "ico" => Some("image/x-icon"),
+        "avif" => Some("image/avif"),
+        _ => None,
+    }
+}
+
+fn local_media_mime(ext: &str) -> Option<(&'static str, &'static str)> {
+    match ext {
+        "pdf" => Some(("application/pdf", "pdf")),
+        "mp3" => Some(("audio/mpeg", "audio")),
+        "wav" => Some(("audio/wav", "audio")),
+        "ogg" => Some(("audio/ogg", "audio")),
+        "flac" => Some(("audio/flac", "audio")),
+        "m4a" => Some(("audio/mp4", "audio")),
+        "aac" => Some(("audio/aac", "audio")),
+        "opus" => Some(("audio/opus", "audio")),
+        "weba" => Some(("audio/webm", "audio")),
+        "mp4" => Some(("video/mp4", "video")),
+        "webm" => Some(("video/webm", "video")),
+        "mov" => Some(("video/quicktime", "video")),
+        "m4v" => Some(("video/x-m4v", "video")),
+        _ => None,
+    }
+}
+
+fn local_language(name: &str, ext: &str) -> Option<&'static str> {
+    match ext {
+        "ts" | "mts" | "cts" | "ets" => Some("ts"),
+        "tsx" => Some("tsx"),
+        "js" | "mjs" | "cjs" => Some("js"),
+        "jsx" => Some("jsx"),
+        "py" => Some("py"),
+        "rs" => Some("rs"),
+        "go" => Some("go"),
+        "java" => Some("java"),
+        "kt" | "kts" => Some("kt"),
+        "swift" => Some("swift"),
+        "c" | "h" => Some("c"),
+        "cc" | "cpp" | "cxx" | "hpp" => Some("cpp"),
+        "cs" => Some("cs"),
+        "rb" => Some("rb"),
+        "php" => Some("php"),
+        "lua" => Some("lua"),
+        "sh" | "bash" | "zsh" | "fish" => Some("sh"),
+        "ps1" => Some("ps1"),
+        "bat" | "cmd" => Some("bat"),
+        "md" | "markdown" => Some("md"),
+        "json" | "jsonc" | "json5" => Some("json"),
+        "yaml" | "yml" => Some("yaml"),
+        "toml" => Some("toml"),
+        "ini" => Some("ini"),
+        "xml" | "svg" => Some("xml"),
+        "html" | "htm" => Some("html"),
+        "css" => Some("css"),
+        "scss" => Some("scss"),
+        "less" => Some("less"),
+        "sql" => Some("sql"),
+        "vue" => Some("vue"),
+        "svelte" => Some("svelte"),
+        "dart" => Some("dart"),
+        "gradle" => Some("gradle"),
+        "txt" | "log" => Some("text"),
+        _ => match name.to_ascii_lowercase().as_str() {
+            "dockerfile" => Some("dockerfile"),
+            "makefile" => Some("makefile"),
+            "cmakelists.txt" => Some("cmake"),
+            _ => None,
+        },
+    }
+}
+
+fn looks_binary_local(head: &[u8]) -> bool {
+    if head.contains(&0) {
+        return true;
+    }
+    match std::str::from_utf8(head) {
+        Ok(_) => false,
+        Err(e) => {
+            // Trailing partial multi-byte UTF-8 sequence at sniff boundary is still valid UTF-8.
+            e.error_len().is_some()
+        }
+    }
+}
+
+fn utf8_prefix_len(buf: &[u8]) -> usize {
+    match std::str::from_utf8(buf) {
+        Ok(_) => buf.len(),
+        Err(e) => e.valid_up_to(),
+    }
+}
+
+pub(crate) fn read_local_file_sync(
+    cwd: Option<&str>,
+    path: &str,
+    max_bytes: Option<usize>,
+) -> Result<LocalFileSlice, String> {
+    use std::io::Read;
+
+    let resolved = resolve_safe_local_file(cwd, path)?;
+    let canon = resolved.canon;
+    let display_path = resolved.display_path;
+    let size = resolved.size;
+    let mtime = resolved.mtime;
+    let ext = resolved.ext;
+    let language = resolved.language;
+
+    if let Some(mime) = local_image_mime(&ext) {
+        if size > MAX_LOCAL_IMAGE_READ_BYTES {
+            return Ok(LocalFileSlice {
+                path: display_path,
+                size,
+                mtime,
+                binary: true,
+                kind: Some("image".into()),
+                truncated: true,
+                offset: 0,
+                bytes: 0,
+                text: None,
+                base64: None,
+                mime: Some(mime.into()),
+                language,
+            });
+        }
+        let bytes = fs::read(&canon).map_err(|e| format!("读取图片失败：{e}"))?;
+        let len = bytes.len();
+        return Ok(LocalFileSlice {
+            path: display_path,
+            size,
+            mtime,
+            binary: true,
+            kind: Some("image".into()),
+            truncated: false,
+            offset: 0,
+            bytes: len,
+            text: None,
+            base64: Some(crate::local_term::base64_encode(&bytes)),
+            mime: Some(mime.into()),
+            language,
+        });
+    }
+
+    if let Some((mime, kind)) = local_media_mime(&ext) {
+        if size > MAX_LOCAL_MEDIA_READ_BYTES {
+            return Ok(LocalFileSlice {
+                path: display_path,
+                size,
+                mtime,
+                binary: true,
+                kind: Some(kind.into()),
+                truncated: true,
+                offset: 0,
+                bytes: 0,
+                text: None,
+                base64: None,
+                mime: Some(mime.into()),
+                language,
+            });
+        }
+        let bytes = fs::read(&canon).map_err(|e| format!("读取媒体文件失败：{e}"))?;
+        let len = bytes.len();
+        return Ok(LocalFileSlice {
+            path: display_path,
+            size,
+            mtime,
+            binary: true,
+            kind: Some(kind.into()),
+            truncated: false,
+            offset: 0,
+            bytes: len,
+            text: None,
+            base64: Some(crate::local_term::base64_encode(&bytes)),
+            mime: Some(mime.into()),
+            language,
+        });
+    }
+
+    let mut file = fs::File::open(&canon).map_err(|e| format!("打不开文件：{e}"))?;
+    let want_sniff = (size as usize).min(SNIFF_LOCAL_BYTES);
+    let mut sniff_buf = vec![0u8; want_sniff];
+    if want_sniff > 0 {
+        let mut read_total = 0;
+        while read_total < want_sniff {
+            let n = file
+                .read(&mut sniff_buf[read_total..])
+                .map_err(|e| format!("读取文件失败：{e}"))?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        sniff_buf.truncate(read_total);
+        if looks_binary_local(&sniff_buf) {
+            return Ok(LocalFileSlice {
+                path: display_path,
+                size,
+                mtime,
+                binary: true,
+                kind: Some("binary".into()),
+                truncated: false,
+                offset: 0,
+                bytes: 0,
+                text: None,
+                base64: None,
+                mime: None,
+                language,
+            });
+        }
+    }
+
+    let limit = max_bytes
+        .unwrap_or(DEFAULT_LOCAL_READ_BYTES)
+        .clamp(4, MAX_LOCAL_READ_BYTES);
+    let want = ((size as usize).min(limit.saturating_add(4))).max(sniff_buf.len());
+    let mut buf = Vec::with_capacity(want);
+    buf.extend_from_slice(&sniff_buf);
+    while buf.len() < want {
+        let prev = buf.len();
+        let remaining = want - prev;
+        buf.resize(prev + remaining.min(64 * 1024), 0);
+        let n = file
+            .read(&mut buf[prev..])
+            .map_err(|e| format!("读取文件失败：{e}"))?;
+        buf.truncate(prev + n);
+        if n == 0 {
+            break;
+        }
+    }
+
+    let capped = buf.len().min(limit);
+    let valid_len = if (buf.len() as u64) < size || capped < buf.len() {
+        utf8_prefix_len(&buf[..capped])
+    } else {
+        capped
+    };
+    let text = String::from_utf8_lossy(&buf[..valid_len]).into_owned();
+    let truncated = (valid_len as u64) < size;
+
+    Ok(LocalFileSlice {
+        path: display_path,
+        size,
+        mtime,
+        binary: false,
+        kind: Some("text".into()),
+        truncated,
+        offset: 0,
+        bytes: valid_len,
+        text: Some(text),
+        base64: None,
+        mime: None,
+        language,
+    })
+}
+
+#[tauri::command]
+pub async fn local_read_file(
+    cwd: Option<String>,
+    path: String,
+    max_bytes: Option<usize>,
+) -> Result<LocalFileSlice, String> {
+    tauri::async_runtime::spawn_blocking(move || read_local_file_sync(cwd.as_deref(), &path, max_bytes))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_sums_url;
+    use super::{is_sums_url, read_local_file_sync};
+
+    #[test]
+    fn reads_local_text_image_and_blocks_private_files() {
+        let dir = std::env::temp_dir().join(format!("hp-cmd-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/hello.ts"), "export const n = 1;\n").unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(
+            dir.join("pic.png"),
+            [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+
+        let txt = read_local_file_sync(Some(&dir.to_string_lossy()), "src/hello.ts", None).unwrap();
+        assert_eq!(txt.path, "src/hello.ts");
+        assert_eq!(txt.language.as_deref(), Some("ts"));
+        assert_eq!(txt.text.as_deref(), Some("export const n = 1;\n"));
+        assert!(!txt.binary);
+
+        let img = read_local_file_sync(None, &dir.join("pic.png").to_string_lossy(), None).unwrap();
+        assert_eq!(img.mime.as_deref(), Some("image/png"));
+        assert!(img.binary);
+        assert!(img.base64.is_some());
+
+        assert!(read_local_file_sync(Some(&dir.to_string_lossy()), ".env", None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn only_the_release_listing_is_fetched() {

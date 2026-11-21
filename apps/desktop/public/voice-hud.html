@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Herdr Pocket 语音输入</title>
 <!--
-  The dictation HUD (src-tauri/src/voice/hud.rs). Standalone: no app bundle, no IPC.
-  Rust pushes the state with window.__hud(state):
+  The floating dictation HUD (src-tauri/src/voice/hud.rs). Strict CSP: zero inline JS.
+  States pushed via window.__hud(state):
     { state: "recording", level: 0..1, elapsedMs, hint?, sounds?, maxSeconds? }
     { state: "transcribing", sounds? }
     { state: "done", label, note?, chars? }
@@ -15,23 +15,34 @@
 -->
 <style>
   :root {
-    --pink: #ff8fb3;
-    --pink-deep: #ff7ea8;
+    --pink: #ff6ea4;
+    --pink-deep: #f05591;
+    --lav: #a78bfa;
     --accent-text: #b8336a;
-    --ink: #4a3b5c;
-    --muted: #8a7b9a;
-    --surface: rgba(255, 255, 255, 0.94);
-    --line: rgba(255, 126, 168, 0.34);
-    --danger: #e0456d;
+    --ink: #2c2038;
+    --muted: #786a88;
+    --surface: rgba(255, 252, 254, 0.88);
+    --border: rgba(255, 110, 164, 0.34);
+    --btn-bg: rgba(74, 59, 92, 0.08);
+    --btn-hover: rgba(74, 59, 92, 0.16);
+    --danger: #e13f68;
+    --ok: #10a37f;
+    --shadow: 0 10px 28px rgba(184, 51, 106, 0.2), 0 2px 8px rgba(24, 16, 36, 0.08);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --ink: #f3edf7;
-      --muted: #b9adc6;
-      --surface: rgba(39, 33, 47, 0.94);
-      --accent-text: #ffb3cb;
+      --ink: #f6effa;
+      --muted: #b4a7c5;
+      --accent-text: #ff9ec4;
+      --surface: rgba(28, 22, 37, 0.86);
+      --border: rgba(255, 130, 180, 0.3);
+      --btn-bg: rgba(255, 255, 255, 0.09);
+      --btn-hover: rgba(255, 255, 255, 0.18);
+      --danger: #ffa3af;
+      --shadow: 0 12px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.06);
     }
   }
+  * { box-sizing: border-box; }
   html, body {
     margin: 0;
     height: 100%;
@@ -45,35 +56,81 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
     color: var(--ink);
   }
   .hud {
-    box-sizing: border-box;
-    width: 248px;
-    height: 52px;
-    padding: 0 16px 0 12px;
+    position: relative;
+    width: 412px;
+    height: 54px;
+    padding: 0 12px;
     display: flex;
     align-items: center;
     gap: 10px;
     border-radius: 999px;
     background: var(--surface);
-    border: 1.5px solid var(--line);
-    box-shadow: 0 6px 18px rgba(184, 51, 106, 0.18);
+    -webkit-backdrop-filter: blur(22px) saturate(185%);
+    backdrop-filter: blur(22px) saturate(185%);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    overflow: hidden;
     opacity: 0;
-    transform: translateY(6px) scale(0.98);
-    transition: opacity 160ms ease-out, transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+    transform: translateY(8px) scale(0.96);
+    transition: opacity 150ms ease-out, transform 220ms cubic-bezier(0.22, 1, 0.36, 1), width 200ms ease;
   }
-  .hud.on { opacity: 1; transform: none; }
+  .hud.on { opacity: 1; transform: translateY(0) scale(1); }
+  .hud.done { width: 224px; }
+  .hud.transcribing { width: 248px; }
+  .hud.transcribing::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 1.5px;
+    border-radius: 999px;
+    background: conic-gradient(from var(--beam, 0deg), transparent 0deg, var(--pink) 80deg, var(--lav) 160deg, transparent 240deg);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    animation: beam-spin 1.5s linear infinite;
+    pointer-events: none;
+  }
+  @property --beam {
+    syntax: "<angle>";
+    inherits: false;
+    initial-value: 0deg;
+  }
+  @keyframes beam-spin {
+    to { --beam: 360deg; }
+  }
+  .progress-track {
+    position: absolute;
+    left: 18px;
+    right: 18px;
+    bottom: 0;
+    height: 2px;
+    border-radius: 2px;
+    overflow: hidden;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 160ms ease;
+  }
+  .hud.recording .progress-track { opacity: 1; }
+  .progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--pink), var(--lav));
+    transition: width 120ms linear;
+  }
   .dot {
     flex: none;
-    width: 28px;
-    height: 28px;
+    width: 32px;
+    height: 32px;
     border-radius: 50%;
-    background: var(--pink);
+    background: linear-gradient(135deg, #f05591, #c92f6d);
     display: grid;
     place-items: center;
     position: relative;
+    box-shadow: 0 3px 10px rgba(201, 47, 109, 0.35);
   }
   .dot::after {
     content: "";
@@ -83,70 +140,122 @@
     border: 2px solid var(--pink);
     opacity: 0;
   }
-  .recording .dot::after { animation: ring 1.2s ease-out infinite; }
-  @keyframes ring { from { opacity: 0.7; transform: scale(0.85); } to { opacity: 0; transform: scale(1.35); } }
-  .dot svg { width: 14px; height: 14px; fill: #fff; }
-  .error .dot { background: var(--danger); }
-  .error .dot::after { border-color: var(--danger); }
+  .recording .dot::after { animation: ring 1.25s cubic-bezier(0.2, 0.7, 0.3, 1) infinite; }
+  @keyframes ring {
+    0% { opacity: 0.65; transform: scale(0.86); }
+    100% { opacity: 0; transform: scale(1.32); }
+  }
+  .dot svg { width: 15px; height: 15px; fill: #fff; }
+  .done .dot { background: linear-gradient(135deg, #16b98d, var(--ok)); box-shadow: 0 3px 10px rgba(16, 163, 127, 0.3); }
+  .error .dot { background: var(--danger); box-shadow: 0 3px 10px rgba(225, 63, 104, 0.35); }
+  .cancelled .dot { background: var(--muted); box-shadow: none; }
   .bars {
     flex: none;
     display: flex;
     align-items: center;
-    gap: 3px;
-    height: 24px;
+    gap: 2.5px;
+    height: 28px;
+    padding: 0 2px;
   }
   .bars i {
     display: block;
-    width: 3px;
+    width: 2.5px;
     height: 4px;
-    border-radius: 2px;
-    background: var(--pink-deep);
-    transition: height 90ms linear;
+    border-radius: 999px;
+    background: linear-gradient(180deg, var(--pink), var(--lav));
+    transition: height 75ms cubic-bezier(0.22, 1, 0.36, 1), opacity 100ms ease;
+    opacity: 0.78;
   }
   .text { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
   .title {
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 700;
-    line-height: 17px;
+    line-height: 16px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .sub {
-    font-size: 11px;
-    line-height: 15px;
+    font-size: 10.5px;
+    line-height: 14px;
     color: var(--muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .error .title { color: var(--danger); white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: 12px; line-height: 15px; }
-  .time { flex: none; font-variant-numeric: tabular-nums; font-size: 12px; color: var(--accent-text); font-weight: 700; }
+  .error .title {
+    color: var(--danger);
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    font-size: 11.5px;
+    line-height: 14px;
+  }
+  .time {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    color: var(--accent-text);
+    font-weight: 700;
+  }
+  .actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .act-btn {
+    width: 28px;
+    height: 28px;
+    border: 0;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    padding: 0;
+    background: var(--btn-bg);
+    color: var(--muted);
+    transition: transform 100ms ease, background 120ms ease, color 120ms ease;
+  }
+  .act-btn:hover { background: var(--btn-hover); color: var(--ink); transform: scale(1.06); }
+  .act-btn:active { transform: scale(0.95); }
+  .act-btn.stop {
+    background: #d83b78;
+    color: #fff;
+  }
+  .act-btn.stop:hover { background: #be2e67; color: #fff; }
+  .act-btn svg { width: 13px; height: 13px; fill: currentColor; }
   .spin {
     width: 14px;
     height: 14px;
-    border: 2px solid rgba(255, 255, 255, 0.5);
+    border: 2px solid rgba(255, 255, 255, 0.45);
     border-top-color: #fff;
     border-radius: 50%;
-    animation: spin 0.8s linear infinite;
+    animation: spin 0.75s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   [hidden] { display: none !important; }
   @media (prefers-reduced-motion: reduce) {
-    .hud, .bars i { transition: none; }
-    .recording .dot::after, .spin { animation: none; }
+    .hud, .bars i, .progress-fill, .act-btn { transition: none; }
+    .recording .dot::after, .spin, .hud.transcribing::before { animation: none; }
   }
 </style>
 </head>
 <body>
 <div class="hud" id="hud" role="status" aria-live="polite">
   <div class="dot" id="dot"></div>
-  <div class="bars" id="bars" hidden></div>
   <div class="text">
     <div class="title" id="title">语音输入</div>
     <div class="sub" id="sub" hidden></div>
   </div>
+  <div class="bars" id="bars" hidden></div>
   <div class="time" id="time" hidden></div>
+  <div class="actions" id="actions" hidden>
+    <button type="button" class="act-btn" id="btnCancel" aria-label="取消语音" title="取消 (Esc)"></button>
+    <button type="button" class="act-btn stop" id="btnStop" aria-label="完成并填入" title="完成并填入"></button>
+  </div>
+  <div class="progress-track"><div class="progress-fill" id="progress"></div></div>
 </div>
 <script src="voice-hud.js"></script>
 </body>

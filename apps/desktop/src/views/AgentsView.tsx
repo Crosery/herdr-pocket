@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   Clock,
+  Cpu,
   Folder,
   FolderOpen,
   FolderTree,
@@ -21,17 +22,18 @@ import {
   Terminal,
   Trash2,
   X,
-  Zap,
 } from "lucide-react";
-import { IS_MAC } from "../shell/shortcuts";
 import {
   PUT_LIMITS,
+  applyRows,
   textWithFiles,
   type Agent,
   type AgentStatus,
+  type AgentUsageReport,
   type ConvEvent,
   type Device,
   type LaunchOption,
+  type SlashCommandItem,
   type SpaceInfo,
   type SubSession,
 } from "@herdr-pocket/protocol";
@@ -47,12 +49,26 @@ import {
   fs,
   useToast,
 } from "../components/PocketUI";
+import { AgentUsageCard } from "../components/AgentUsageCard";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DropRail } from "../components/DropRail";
+import { FolderExplorerModal, normalizeFolderKey } from "../components/FolderExplorerModal";
 import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVendor";
+import { ModelSwitchModal } from "../components/ModelSwitchModal";
+import { SlashCommandPopup } from "../components/SlashCommandPopup";
+import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
+import { VoiceMicButton } from "../components/VoiceInput";
 import { copyToClipboard } from "../lib/bridge";
 import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
+import {
+  builtinSlashCommands,
+  extractSlashQuery,
+  matchSlashCommands,
+  mergeSlashCommands,
+  type SlashCategory,
+} from "../lib/slashCommands";
+import { parseTerminalChatTranscript, shellTurnMatchesCommand } from "../lib/terminalChat";
 import {
   dismissOutgoingSend,
   enqueuePrompt,
@@ -63,15 +79,17 @@ import {
   removeQueuedPrompt,
   retryFailedSend,
   sendPromptNow,
-  steerComposerNow,
   steerQueuedPromptNow,
   useAgentChatQueue,
 } from "../lib/chatQueue";
 import { useComposerInput } from "../lib/composerKeys";
-import { prepareDroppedFiles, revokeAttachment, type StagedAttachment } from "../lib/dropPreview";
+import { prepareDroppedFiles, revokeAttachment, stageWorkspaceDragItem, type StagedAttachment } from "../lib/dropPreview";
+import { endWorkspaceDrag, hasWorkspaceDrag, readWorkspaceDrag } from "../lib/fileDrag";
 import { useLocalHostDeviceId } from "../lib/fonts";
+import { openFileTab, openSubagentAside } from "../shell/shellStore";
 import { native } from "../lib/native";
 import { parseChoices } from "../lib/markdown";
+import { openAgentFileTarget } from "../lib/openFileTarget";
 import { pingRelay, rpcCall, subscribeStream } from "../lib/relay";
 import {
   STATUS_LABEL,
@@ -854,6 +872,18 @@ function workedFor(ms: number): string {
   return remMin ? `已运行 ${hr} 小时 ${remMin} 分` : `已运行 ${hr} 小时`;
 }
 
+export interface SubagentHeadInfo {
+  trail: SubSession[];
+  rootSubs: SubSession[];
+  activeSubs: SubSession[];
+  knownCount: number;
+  onGoRoot: () => void;
+  onSelectCrumbIndex: (idx: number) => void;
+  onSelectSub: (s: SubSession, ancestors: SubSession[]) => void;
+  onOpenAside: (s: SubSession, ancestors: SubSession[]) => void;
+  onRefresh: () => void;
+}
+
 export function AgentDetailPanel({
   agent,
   initialTab = "chat",
@@ -861,6 +891,7 @@ export function AgentDetailPanel({
   onModeChange,
   onBack,
   onOpenWorkbench,
+  onSubHeadChange,
   mobile = false,
   embedded = false,
 }: {
@@ -870,17 +901,19 @@ export function AgentDetailPanel({
   onModeChange?: (mode: "chat" | "term") => void;
   onBack?: () => void;
   onOpenWorkbench?: (agentKey: string) => void;
+  onSubHeadChange?: (info: SubagentHeadInfo | null) => void;
   mobile?: boolean;
   /** Inside a v3 pane: the pane header already shows harness, title, folder, and mode switcher. */
   embedded?: boolean;
 }) {
   const toast = useToast();
   const hostOnline = liveStore.use((s) => s.devices[agent.deviceId]?.online ?? true);
-  const [tab, setTab] = useState<"chat" | "term" | "subs">(mode ?? initialTab);
-  const activeMode: "chat" | "term" | "subs" = mode ?? tab;
-  const selectMode = (m: "chat" | "term" | "subs") => {
+  const chatDisplayMode = settingsStore.use((s) => s.chatDisplayMode);
+  const [tab, setTab] = useState<"chat" | "term">(mode ?? initialTab);
+  const activeMode: "chat" | "term" = mode ?? tab;
+  const selectMode = (m: "chat" | "term") => {
     setTab(m);
-    if (m === "chat" || m === "term") onModeChange?.(m);
+    onModeChange?.(m);
   };
   const [termVisited, setTermVisited] = useState(activeMode === "term");
   useEffect(() => {
@@ -896,13 +929,34 @@ export function AgentDetailPanel({
   const [atBottom, setAtBottom] = useState(true);
   const [choiceLines, setChoiceLines] = useState<string[]>([]);
   const [subs, setSubs] = useState<SubSession[]>([]);
-  const [subModal, setSubModal] = useState<{ title: string; events: ConvEvent[] } | null>(null);
+  const [subTrail, setSubTrail] = useState<SubSession[]>([]);
+  const [activeChildSubs, setActiveChildSubs] = useState<SubSession[]>([]);
+  const [subEvents, setSubEvents] = useState<ConvEvent[]>([]);
+  const [shellRaw, setShellRaw] = useState("");
+  const [discoveredSlash, setDiscoveredSlash] = useState<SlashCommandItem[]>([]);
+  const [slashCategory, setSlashCategory] = useState<"all" | SlashCategory>("all");
+  const [slashIdx, setSlashIdx] = useState(0);
+  const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [sending, setSending] = useState(false);
+  const [killConfirmOpen, setKillConfirmOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [modelModalOpen, setModelModalOpen] = useState(false);
+
+  useEffect(() => {
+    setUsageOpen(false);
+    setUsageReport(null);
+    setUsageError(null);
+    setModelModalOpen(false);
+  }, [agent.key]);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const panelRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const initialPositionedRef = useRef(false);
@@ -913,12 +967,16 @@ export function AgentDetailPanel({
   const workingStartRef = useRef<number | null>(agent.status === "working" ? (agent.statusSince ?? Date.now()) : null);
   const streamLiveRef = useRef(false);
   const hadOpenRef = useRef(false);
+  const hasSubsRef = useRef(false);
+  hasSubsRef.current = Boolean(agent.subagents || subs.length);
   const sessionTrackRef = useRef<{ agentKey: string; sessionKey?: string }>({ agentKey: agent.key, sessionKey: agent.sessionKey });
   const dragDepthRef = useRef(0);
   const attachmentsRef = useRef<StagedAttachment[]>([]);
   attachmentsRef.current = attachments;
 
   const { queued, outgoing } = useAgentChatQueue(agent.key);
+  const activeSub = subTrail[subTrail.length - 1] ?? null;
+  const isPlainShellChat = Boolean(agent.isShell && !agent.sessionKey && !activeSub);
 
   useEffect(() => {
     return () => {
@@ -954,6 +1012,12 @@ export function AgentDetailPanel({
       setHasLoadedOlder(false);
       setChoiceLines([]);
       setSubs([]);
+      setSubTrail([]);
+      setActiveChildSubs([]);
+      setSubEvents([]);
+      setShellRaw("");
+      setDiscoveredSlash([]);
+      setSlashDismissedFor(null);
       stickRef.current = true;
       initialPositionedRef.current = false;
       prependAnchorRef.current = null;
@@ -973,7 +1037,7 @@ export function AgentDetailPanel({
       })
       .catch(() => {});
 
-    if (agent.subagents) {
+    if (agent.subagents || subs.length > 0) {
       void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
         .then((res) => {
           if (alive) setSubs(res.sessions);
@@ -1012,7 +1076,15 @@ export function AgentDetailPanel({
     );
 
     const pollTimer = window.setInterval(() => {
-      if (!alive || streamLiveRef.current || !agent.sessionKey) return;
+      if (!alive) return;
+      if (hasSubsRef.current) {
+        void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
+          .then((res) => {
+            if (alive) setSubs(res.sessions);
+          })
+          .catch(() => {});
+      }
+      if (streamLiveRef.current || !agent.sessionKey) return;
       void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 80 })
         .then((res) => {
           if (alive) setEvents((prevList) => mergeConvEvents(prevList, res.events));
@@ -1028,6 +1100,132 @@ export function AgentDetailPanel({
       unsubSession();
     };
   }, [agent.deviceId, agent.key, agent.sessionKey, agent.subagents]);
+
+  const activeSubKey = activeSub?.key;
+  useEffect(() => {
+    if (!activeSubKey) {
+      setSubEvents([]);
+      setActiveChildSubs([]);
+      return;
+    }
+    let alive = true;
+    let subLive = false;
+    setSubEvents([]);
+    setActiveChildSubs([]);
+
+    void rpcCall(agent.deviceId, "session.events", { agent: agent.key, sub: activeSubKey, limit: 200 })
+      .then((res) => {
+        if (alive) setSubEvents((prev) => mergeConvEvents(prev, res.events));
+      })
+      .catch(() => {});
+
+    void rpcCall(agent.deviceId, "session.children", { agent: agent.key, sub: activeSubKey })
+      .then((res) => {
+        if (alive) setActiveChildSubs(res.sessions);
+      })
+      .catch(() => {});
+
+    const unsubSub = subscribeStream(
+      agent.deviceId,
+      "session",
+      { agent: agent.key, sub: activeSubKey },
+      (ev) => {
+        if (!alive || !ev) return;
+        if ((ev.kind === "session" || ev.kind === "session_event") && ev.event) {
+          setSubEvents((prev) => mergeConvEvents(prev, [ev.event as ConvEvent]));
+        }
+      },
+      (st) => {
+        if (alive) subLive = st?.kind === "live";
+      },
+    );
+
+    const pollTimer = window.setInterval(() => {
+      if (!alive) return;
+      if (!subLive) {
+        void rpcCall(agent.deviceId, "session.events", { agent: agent.key, sub: activeSubKey, limit: 120 })
+          .then((res) => {
+            if (alive) setSubEvents((prev) => mergeConvEvents(prev, res.events));
+          })
+          .catch(() => {});
+      }
+      void rpcCall(agent.deviceId, "session.children", { agent: agent.key, sub: activeSubKey })
+        .then((res) => {
+          if (alive) setActiveChildSubs(res.sessions);
+        })
+        .catch(() => {});
+    }, 3_000);
+
+    return () => {
+      alive = false;
+      window.clearInterval(pollTimer);
+      unsubSub();
+    };
+  }, [activeSubKey, agent.deviceId, agent.key]);
+
+  useEffect(() => {
+    if (!isPlainShellChat || activeMode !== "chat") return;
+    let alive = true;
+    let live = false;
+    let lines: string[] = [];
+
+    const commit = (raw: string) => {
+      if (!alive) return;
+      lines = raw.split("\n");
+      setShellRaw(raw);
+    };
+
+    void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 220 })
+      .then((res) => commit(res.text || res.ansi || ""))
+      .catch(() => {});
+
+    const unsubTerm = subscribeStream(
+      agent.deviceId,
+      "terminal",
+      { agent: agent.key, lines: 220, rows: true },
+      (ev) => {
+        if (!alive || !ev) return;
+        if (ev.kind === "terminal" && ev.screen) {
+          commit(String(ev.screen.text || ev.screen.ansi || ""));
+        } else if (ev.kind === "terminal_rows") {
+          lines = applyRows(lines, ev);
+          setShellRaw(lines.join("\n"));
+        }
+      },
+      (st) => {
+        if (alive) live = st?.kind === "live";
+      },
+    );
+
+    const pollTimer = window.setInterval(() => {
+      if (!alive || live) return;
+      void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 220 })
+        .then((res) => commit(res.text || res.ansi || ""))
+        .catch(() => {});
+    }, 2_000);
+
+    return () => {
+      alive = false;
+      window.clearInterval(pollTimer);
+      unsubTerm();
+    };
+  }, [activeMode, agent.deviceId, agent.key, isPlainShellChat]);
+
+  useEffect(() => {
+    if (agent.isShell) {
+      setDiscoveredSlash([]);
+      return;
+    }
+    let alive = true;
+    void rpcCall(agent.deviceId, "agent.commands", { agent: agent.key })
+      .then((res) => {
+        if (alive) setDiscoveredSlash(res.commands);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [agent.cwd, agent.deviceId, agent.harness, agent.isShell, agent.key]);
 
   useEffect(() => {
     if (activeMode !== "chat" || agent.status !== "blocked") {
@@ -1046,17 +1244,128 @@ export function AgentDetailPanel({
   }, [activeMode, agent.deviceId, agent.key, agent.status, events.length]);
 
   const choices = useMemo(() => (activeMode === "chat" && choiceLines.length ? parseChoices(choiceLines) : []), [activeMode, choiceLines]);
-  const foldedRows = useMemo(() => foldConvEvents(events), [events]);
-  const subModalRows = useMemo(() => foldConvEvents(subModal?.events ?? []), [subModal]);
-  const reconciled = useMemo(
+  const displayedEvents = activeSub ? subEvents : events;
+  const shellChat = useMemo(() => (isPlainShellChat ? parseTerminalChatTranscript(shellRaw) : null), [isPlainShellChat, shellRaw]);
+  const foldedRows = useMemo(
+    () => (isPlainShellChat ? [] : foldConvEvents(displayedEvents, chatDisplayMode)),
+    [chatDisplayMode, displayedEvents, isPlainShellChat],
+  );
+  const convReconciled = useMemo(
     () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick),
     [agent.status, foldedRows, nowTick, outgoing],
   );
+  const reconciled = useMemo(() => {
+    if (!isPlainShellChat || !shellChat) return convReconciled;
+    const matchedIds: string[] = [];
+    const expiredIds: string[] = [];
+    const unmatched = outgoing.filter((item) => {
+      if (item.state === "sending" || item.state === "failed") return true;
+      const age = nowTick - item.ts;
+      const matched = shellChat.turns.some((t) => shellTurnMatchesCommand(t, item.text));
+      if (matched) {
+        matchedIds.push(item.id);
+        return false;
+      }
+      if (age > 4500) {
+        expiredIds.push(item.id);
+        return false;
+      }
+      return true;
+    });
+    return { unmatched, matchedIds, expiredIds, awaitingReply: false };
+  }, [convReconciled, isPlainShellChat, nowTick, outgoing, shellChat]);
+
+  const allSlashCommands = useMemo(
+    () => mergeSlashCommands(builtinSlashCommands(agent.harness, agent.isShell), discoveredSlash),
+    [agent.harness, agent.isShell, discoveredSlash],
+  );
+  const slashQuery = !agent.isShell && !activeSub ? extractSlashQuery(text) : null;
+  const matchedSlash = useMemo(
+    () => (slashQuery === null ? [] : matchSlashCommands(allSlashCommands, slashQuery, slashCategory)),
+    [allSlashCommands, slashCategory, slashQuery],
+  );
+  const slashOpen =
+    slashQuery !== null &&
+    slashDismissedFor !== text &&
+    (matchedSlash.length > 0 || slashCategory !== "all" || Boolean(slashQuery));
+
+  useEffect(() => {
+    setSlashIdx(0);
+  }, [slashQuery, slashCategory]);
 
   useEffect(() => {
     const toDrop = [...reconciled.matchedIds, ...reconciled.expiredIds];
     if (toDrop.length > 0) pruneOutgoingSends(agent.key, toDrop);
   }, [agent.key, reconciled.expiredIds, reconciled.matchedIds]);
+
+  const refreshRootSubs = useCallback(() => {
+    void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
+      .then((res) => setSubs(res.sessions))
+      .catch(() => {});
+  }, [agent.deviceId, agent.key]);
+
+  const selectSubInPlace = useCallback((s: SubSession, ancestors: SubSession[]) => {
+    setSubTrail([...ancestors, s]);
+    stickRef.current = true;
+    setAtBottom(true);
+  }, []);
+
+  const openSubAsideView = useCallback(
+    (s: SubSession, ancestors: SubSession[]) => {
+      openSubagentAside(agent.key, s, [...ancestors, s]);
+    },
+    [agent.key],
+  );
+
+  const selectCrumbIndex = useCallback((idx: number) => {
+    setSubTrail((prev) => prev.slice(0, idx + 1));
+    stickRef.current = true;
+    setAtBottom(true);
+  }, []);
+
+  const goRootSub = useCallback(() => {
+    setSubTrail([]);
+    stickRef.current = true;
+    setAtBottom(true);
+  }, []);
+
+  const knownSubCount = Math.max(agent.subagents ?? 0, subs.length);
+  useEffect(() => {
+    if (!embedded || !onSubHeadChange) return;
+    if (knownSubCount === 0 && subTrail.length === 0) {
+      onSubHeadChange(null);
+      return;
+    }
+    onSubHeadChange({
+      trail: subTrail,
+      rootSubs: subs,
+      activeSubs: activeChildSubs,
+      knownCount: knownSubCount,
+      onGoRoot: goRootSub,
+      onSelectCrumbIndex: selectCrumbIndex,
+      onSelectSub: selectSubInPlace,
+      onOpenAside: openSubAsideView,
+      onRefresh: refreshRootSubs,
+    });
+  }, [
+    activeChildSubs,
+    embedded,
+    goRootSub,
+    knownSubCount,
+    onSubHeadChange,
+    openSubAsideView,
+    refreshRootSubs,
+    selectCrumbIndex,
+    selectSubInPlace,
+    subTrail,
+    subs,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      onSubHeadChange?.(null);
+    };
+  }, [onSubHeadChange]);
 
   const activeToolLabel = useMemo(() => {
     for (let i = foldedRows.length - 1; i >= Math.max(0, foldedRows.length - 5); i -= 1) {
@@ -1073,14 +1382,19 @@ export function AgentDetailPanel({
     return null;
   }, [foldedRows]);
 
+  const hasAnyRenderedRows =
+    foldedRows.length > 0 ||
+    reconciled.unmatched.length > 0 ||
+    Boolean(shellChat && (shellChat.turns.length > 0 || shellChat.preambleLines.length > 0));
+
   const scrollToBottom = useCallback((smooth = false) => {
     stickRef.current = true;
     setAtBottom(true);
     const el = chatScrollRef.current;
     if (!el) return;
     if (smooth) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-    else el.scrollTop = events.length || reconciled.unmatched.length ? el.scrollHeight : 0;
-  }, [events.length, reconciled.unmatched.length]);
+    else el.scrollTop = hasAnyRenderedRows ? el.scrollHeight : 0;
+  }, [hasAnyRenderedRows]);
 
   const loadOlderEvents = useCallback(async () => {
     const cursor = olderCursor;
@@ -1118,7 +1432,7 @@ export function AgentDetailPanel({
     if (activeMode !== "chat") return;
     const el = chatScrollRef.current;
     if (!el) return;
-    const hasAnyRows = foldedRows.length > 0 || reconciled.unmatched.length > 0;
+    const hasAnyRows = hasAnyRenderedRows;
     if (prependAnchorRef.current) {
       const anchor = prependAnchorRef.current;
       prependAnchorRef.current = null;
@@ -1143,6 +1457,8 @@ export function AgentDetailPanel({
       prevScrollTopRef.current = el.scrollTop;
     }
     if (
+      !activeSub &&
+      !isPlainShellChat &&
       initialPositionedRef.current &&
       olderCursor &&
       !loadingOlder &&
@@ -1155,15 +1471,18 @@ export function AgentDetailPanel({
     }
   }, [
     activeMode,
+    activeSub,
     agent.status,
     foldedRows,
+    hasAnyRenderedRows,
+    isPlainShellChat,
     loadOlderError,
     loadOlderEvents,
     loadingOlder,
     olderCursor,
     reconciled.awaitingReply,
-    reconciled.unmatched.length,
     sending,
+    shellChat,
   ]);
 
   const onChatScroll = useCallback(() => {
@@ -1176,6 +1495,8 @@ export function AgentDetailPanel({
     stickRef.current = nearBottom;
     setAtBottom(nearBottom);
     if (
+      !activeSub &&
+      !isPlainShellChat &&
       initialPositionedRef.current &&
       olderCursor &&
       !loadingOlder &&
@@ -1185,31 +1506,60 @@ export function AgentDetailPanel({
     ) {
       void loadOlderEvents();
     }
-  }, [loadOlderError, loadOlderEvents, loadingOlder, olderCursor]);
+  }, [activeSub, isPlainShellChat, loadOlderError, loadOlderEvents, loadingOlder, olderCursor]);
 
-  const openSubSession = useCallback(
-    async (s: SubSession) => {
-      try {
-        const res = await rpcCall(agent.deviceId, "session.events", { agent: agent.key, sub: s.key, limit: 200 });
-        setSubModal({ title: s.title || s.preview || s.key, events: res.events });
-      } catch (e) {
-        toast((e as Error).message, true);
+  const openUsageView = useCallback(() => {
+    setUsageOpen(true);
+    setUsageLoading(true);
+    setUsageError(null);
+    void rpcCall(agent.deviceId, "agent.usage", { agent: agent.key })
+      .then((res) => setUsageReport(res))
+      .catch((e) => setUsageError((e as Error).message || "读取用量统计失败"))
+      .finally(() => setUsageLoading(false));
+  }, [agent.deviceId, agent.key]);
+
+  const applyModelSwitch = useCallback(
+    (modelId: string) => {
+      const clean = modelId.trim();
+      if (!clean) return;
+      const cmd = `/model ${clean}`;
+      stickRef.current = true;
+      setAtBottom(true);
+      if (agent.status === "working") {
+        enqueuePrompt(agent, cmd, []);
+        toast(`已加入排队：当前轮结束后切换为 ${clean}`);
+      } else {
+        setSending(true);
+        void sendPromptNow(agent, cmd, [])
+          .then(() => toast(`已发送模型切换指令：${clean}`))
+          .finally(() => setSending(false));
       }
     },
-    [agent.deviceId, agent.key, toast],
+    [agent, toast],
   );
 
   const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
 
-  const submitComposer = (mode: "auto" | "steer" = "auto", overrideText?: string) => {
+  const submitComposer = (overrideText?: string) => {
     const isOverride = overrideText !== undefined;
     const raw = (overrideText ?? text).trim();
     const staged = isOverride ? [] : attachments;
     const now = Date.now();
-    const sig = `${agent.key}\0${mode}\0${raw}\0${staged.length}`;
+    const sig = `${agent.key}\0${raw}\0${staged.length}`;
     if (!raw && staged.length === 0) return;
     if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 400) return;
     lastSendRef.current = { sig, at: now };
+
+    if (!staged.length && /^\/usage$/i.test(raw)) {
+      if (!isOverride) setText("");
+      openUsageView();
+      return;
+    }
+    if (!staged.length && /^\/(?:model|models)$/i.test(raw)) {
+      if (!isOverride) setText("");
+      setModelModalOpen(true);
+      return;
+    }
 
     if (!isOverride) {
       setText("");
@@ -1217,12 +1567,6 @@ export function AgentDetailPanel({
     }
     stickRef.current = true;
     setAtBottom(true);
-
-    if (mode === "steer") {
-      setSending(true);
-      void steerComposerNow(agent, raw, staged).finally(() => setSending(false));
-      return;
-    }
 
     if (agent.status === "working") {
       enqueuePrompt(agent, raw, staged);
@@ -1279,10 +1623,40 @@ export function AgentDetailPanel({
     });
   }, []);
 
-  const composer = useComposerInput(
-    text,
-    () => submitComposer("auto"),
-    agent.status === "working" ? () => submitComposer("steer") : undefined,
+  const composer = useComposerInput(text, () => submitComposer());
+
+  const pickSlashCommand = useCallback(
+    (cmd: SlashCommandItem, allowAutoSend: boolean) => {
+      setSlashDismissedFor(null);
+      if (allowAutoSend && /^\/usage$/i.test(cmd.name)) {
+        setText("");
+        setAttachments([]);
+        openUsageView();
+        return;
+      }
+      if (allowAutoSend && /^\/(?:model|models)$/i.test(cmd.name)) {
+        setText("");
+        setAttachments([]);
+        setModelModalOpen(true);
+        return;
+      }
+      if (allowAutoSend && !cmd.argHint) {
+        setText("");
+        setAttachments([]);
+        stickRef.current = true;
+        setAtBottom(true);
+        if (agent.status === "working") {
+          enqueuePrompt(agent, cmd.name, []);
+        } else {
+          setSending(true);
+          void sendPromptNow(agent, cmd.name, []).finally(() => setSending(false));
+        }
+        return;
+      }
+      setText(`${cmd.name} `);
+      requestAnimationFrame(() => composer.textareaRef.current?.focus());
+    },
+    [agent, composer.textareaRef, openUsageView],
   );
 
   useEffect(() => {
@@ -1306,7 +1680,7 @@ export function AgentDetailPanel({
 
   const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
     if (activeMode !== "chat") return;
-    if (!e.dataTransfer?.types?.includes("Files")) return;
+    if (!e.dataTransfer?.types?.includes("Files") && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     dragDepthRef.current += 1;
     setDragOver(true);
@@ -1314,14 +1688,14 @@ export function AgentDetailPanel({
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
     if (activeMode !== "chat") return;
-    if (!e.dataTransfer?.types?.includes("Files")) return;
+    if (!e.dataTransfer?.types?.includes("Files") && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
   };
 
   const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
     if (activeMode !== "chat") return;
-    if (!e.dataTransfer?.types?.includes("Files")) return;
+    if (!e.dataTransfer?.types?.includes("Files") && !hasWorkspaceDrag(e)) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragOver(false);
   };
@@ -1330,6 +1704,23 @@ export function AgentDetailPanel({
     if (activeMode !== "chat") return;
     dragDepthRef.current = 0;
     setDragOver(false);
+    const wsItem = readWorkspaceDrag(e);
+    if (wsItem) {
+      e.preventDefault();
+      e.stopPropagation();
+      endWorkspaceDrag();
+      const stagedItem = stageWorkspaceDragItem(wsItem, agent.deviceId);
+      setAttachments((prev) => {
+        if (prev.some((x) => x.sig === stagedItem.sig)) return prev;
+        if (prev.length >= PUT_LIMITS.files) {
+          toast(`一次最多附带 ${PUT_LIMITS.files} 个文件`, true);
+          return prev;
+        }
+        return [...prev, stagedItem];
+      });
+      requestAnimationFrame(() => composer.textareaRef.current?.focus());
+      return;
+    }
     const files = e.dataTransfer?.files;
     if (!files?.length) return;
     e.preventDefault();
@@ -1339,8 +1730,7 @@ export function AgentDetailPanel({
 
   const hasSending = sending || reconciled.unmatched.some((s) => s.state === "sending");
   const showEmptyState =
-    foldedRows.length === 0 &&
-    reconciled.unmatched.length === 0 &&
+    !hasAnyRenderedRows &&
     !loadingOlder &&
     agent.status !== "working" &&
     !reconciled.awaitingReply &&
@@ -1374,12 +1764,33 @@ export function AgentDetailPanel({
           </div>
 
           <div className="row" style={{ gap: 8 }}>
+            {activeSub ? (
+              <SubagentHeaderLineage
+                mainTitle={spacedTitle(agent)}
+                trail={subTrail}
+                rootSubs={subs}
+                activeSubs={activeChildSubs}
+                deviceId={agent.deviceId}
+                agentKey={agent.key}
+                onGoRoot={goRootSub}
+                onSelectCrumbIndex={selectCrumbIndex}
+                onSelectSub={selectSubInPlace}
+                onOpenAside={openSubAsideView}
+              />
+            ) : knownSubCount > 0 ? (
+              <SubagentCatalogTrigger
+                deviceId={agent.deviceId}
+                agentKey={agent.key}
+                knownCount={knownSubCount}
+                subs={subs}
+                onSelectSub={selectSubInPlace}
+                onOpenAside={openSubAsideView}
+                onRefresh={refreshRootSubs}
+              />
+            ) : null}
             <div className="segmented">
               <button className={activeMode === "chat" ? "active" : ""} onClick={() => selectMode("chat")}>对话</button>
               <button className={activeMode === "term" ? "active" : ""} onClick={() => selectMode("term")}>终端</button>
-              {agent.subagents || subs.length ? (
-                <button className={activeMode === "subs" ? "active" : ""} onClick={() => selectMode("subs")}>子 agent ({subs.length || agent.subagents})</button>
-              ) : null}
             </div>
             {onOpenWorkbench && agent.cwd && !agent.isShell ? (
               <PocketIconButton size="sm" tooltip="在工作台看它的文件" onClick={() => onOpenWorkbench(agent.key)}>
@@ -1396,12 +1807,7 @@ export function AgentDetailPanel({
             <PocketIconButton
               size="sm"
               tooltip="关闭终端"
-              onClick={() => {
-                if (!window.confirm("确定要关闭并结束这个终端吗？")) return;
-                void rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key })
-                  .then(() => onBack?.())
-                  .catch((e) => toast((e as Error).message, true));
-              }}
+              onClick={() => setKillConfirmOpen(true)}
             >
               <Trash2 size={14} />
             </PocketIconButton>
@@ -1422,16 +1828,16 @@ export function AgentDetailPanel({
               }
             }}
           >
-            {loadingOlder ? (
+            {!activeSub && !isPlainShellChat && loadingOlder ? (
               <div className="chat-top-status" role="status" aria-live="polite">
                 <span className="act-spin" aria-hidden />
                 <span>正在加载更早对话…</span>
               </div>
-            ) : loadOlderError && olderCursor ? (
+            ) : !activeSub && !isPlainShellChat && loadOlderError && olderCursor ? (
               <button type="button" className="chat-top-retry" onClick={() => void loadOlderEvents()}>
                 加载更早记录失败 · 点击重试
               </button>
-            ) : !olderCursor && hasLoadedOlder && foldedRows.length > 0 ? (
+            ) : !activeSub && !isPlainShellChat && !olderCursor && hasLoadedOlder && foldedRows.length > 0 ? (
               <div className="chat-start-sep">
                 <span>对话开头</span>
               </div>
@@ -1441,7 +1847,40 @@ export function AgentDetailPanel({
               <EmptyState mood="sleepy" title="还没有对话记录" body="在下方发一条消息，或点右上角切换到“终端”直接操作。" />
             ) : (
               <>
-                <ChatTimelineRows rows={foldedRows} subs={subs} onOpenSub={(s) => void openSubSession(s)} />
+                {isPlainShellChat && shellChat ? (
+                  <>
+                    {shellChat.preambleLines.length > 0 ? (
+                      <pre className="chat-shell-out mono">{shellChat.preambleLines.join("\n")}</pre>
+                    ) : null}
+                    {shellChat.turns.map((turn) => (
+                      <div key={turn.id} className="chat-shell-turn">
+                        <div className="bubble-row user">
+                          <div className="bubble user mono">
+                            <span className="chat-shell-prompt">{turn.prompt}</span> {turn.command}
+                          </div>
+                        </div>
+                        {turn.outputLines.length > 0 ? (
+                          <pre className="chat-shell-out mono">{turn.outputLines.join("\n")}</pre>
+                        ) : turn.completedEmpty ? (
+                          <div className="chat-shell-empty">✓ 已执行（无输出）</div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </>
+                ) : (
+                  <ChatTimelineRows
+                    rows={foldedRows}
+                    subs={activeSub ? activeChildSubs : subs}
+                    agentKey={agent.key}
+                    deviceId={agent.deviceId}
+                    cwd={agent.cwd}
+                    onOpenSub={(s) => selectSubInPlace(s, subTrail)}
+                    onOpenSubAside={(s) => openSubAsideView(s, subTrail)}
+                    onOpenFile={(target) => {
+                      openAgentFileTarget(agent, target);
+                    }}
+                  />
+                )}
                 {reconciled.unmatched.map((item) => (
                   <div key={item.id} className="bubble-row user">
                     {item.text ? <div className="bubble user">{item.text}</div> : null}
@@ -1524,7 +1963,7 @@ export function AgentDetailPanel({
             ) : null}
           </div>
 
-          {!atBottom && (foldedRows.length > 0 || reconciled.unmatched.length > 0) ? (
+          {!atBottom && hasAnyRenderedRows ? (
             <button type="button" className="chat-jump-bottom" onClick={() => scrollToBottom(true)}>
               <ArrowDown size={13} />
               <span>回到底部</span>
@@ -1539,26 +1978,8 @@ export function AgentDetailPanel({
         </div>
       ) : null}
 
-      {activeMode === "subs" ? (
-        <div className="chat-scroll">
-          {subs.map((s) => (
-            <PocketCard key={s.key} soft>
-              <div className="between">
-                <div className="grow">
-                  <div style={{ fontWeight: 800 }}>{s.title || s.preview || s.key}</div>
-                  <div className="faint">{s.harness} · {s.status}</div>
-                </div>
-                <PocketButton size="sm" variant="soft" onClick={() => void openSubSession(s)}>
-                  看对话
-                </PocketButton>
-              </div>
-            </PocketCard>
-          ))}
-        </div>
-      ) : null}
-
       {/* Quick Numbered Choices (Chat mode only) */}
-      {activeMode === "chat" && choices.length > 0 ? (
+      {activeMode === "chat" && !activeSub && choices.length > 0 ? (
         <div className="row wrap" style={{ padding: "4px 14px", gap: 6, flexShrink: 0 }}>
           {choices.map((c) => (
             <button
@@ -1572,9 +1993,46 @@ export function AgentDetailPanel({
         </div>
       ) : null}
 
-      {/* Composer (Chat mode only; Terminal mode stays clean & fullscreen) */}
-      {activeMode === "chat" ? (
-        <div className={`composer-card${dragOver ? " drop-over" : ""}`}>
+      {activeMode === "chat" && !activeSub && usageOpen ? (
+        <AgentUsageCard
+          agent={agent}
+          report={usageReport}
+          loading={usageLoading}
+          error={usageError}
+          onRefresh={openUsageView}
+          onClose={() => setUsageOpen(false)}
+          onOpenModelSwitch={() => setModelModalOpen(true)}
+          onRunInTerminal={() => {
+            setUsageOpen(false);
+            if (agent.status === "working") enqueuePrompt(agent, "/usage", []);
+            else void sendPromptNow(agent, "/usage", []);
+          }}
+        />
+      ) : null}
+
+      {/* Composer or Subagent Read-Only Footer */}
+      {activeMode === "chat" && activeSub ? (
+        <SubagentReadOnlyBar
+          current={activeSub}
+          onOpenAside={() => {
+            openSubAsideView(activeSub, subTrail.slice(0, -1));
+            goRootSub();
+          }}
+          onBackMain={goRootSub}
+        />
+      ) : activeMode === "chat" ? (
+        <div className={`composer-card${dragOver ? " drop-over" : ""}`} style={{ position: "relative" }}>
+          {slashOpen ? (
+            <SlashCommandPopup
+              commands={matchedSlash}
+              selectedIndex={slashIdx}
+              category={slashCategory}
+              onCategoryChange={setSlashCategory}
+              onHoverIndex={setSlashIdx}
+              onPick={(cmd) => pickSlashCommand(cmd, true)}
+              harnessLabel={agent.harness}
+            />
+          ) : null}
           {totalQueuedCount > 0 ? (
             <div className="composer-queue-shelf" aria-label="排队中的消息">
               <div className="composer-queue-head">
@@ -1677,17 +2135,81 @@ export function AgentDetailPanel({
               ) : null}
             </div>
           ) : null}
-          <DropRail items={attachments} onRemove={removeAttachment} />
-          <div className="composer-row">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            style={{ display: "none" }}
+            onChange={(e) => {
+              if (e.target.files?.length) void handleFiles(e.target.files);
+              e.target.value = "";
+            }}
+          />
+          <DropRail
+            items={attachments}
+            onRemove={removeAttachment}
+            onOpenFile={(item) => {
+              if (!item.openPath) return;
+              openFileTab(item.openAgentKey || agent.key, item.openPath, item.name, {
+                absPath: item.hostRef && item.hostRef.startsWith("/") ? item.hostRef : undefined,
+              });
+            }}
+          />
+          <div className="composer-input-wrap">
             <textarea
               {...composer.textareaProps}
+              onKeyDown={(e) => {
+                if (slashOpen && matchedSlash.length > 0 && !e.nativeEvent.isComposing) {
+                  if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setSlashIdx((i) => (i + 1) % matchedSlash.length);
+                    return;
+                  }
+                  if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setSlashIdx((i) => (i - 1 + matchedSlash.length) % matchedSlash.length);
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    setSlashDismissedFor(text);
+                    return;
+                  }
+                  if (e.key === "Tab") {
+                    e.preventDefault();
+                    const picked = matchedSlash[Math.min(slashIdx, matchedSlash.length - 1)];
+                    if (picked) pickSlashCommand(picked, false);
+                    return;
+                  }
+                  if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
+                    e.preventDefault();
+                    const picked = matchedSlash[Math.min(slashIdx, matchedSlash.length - 1)];
+                    if (picked) pickSlashCommand(picked, true);
+                    return;
+                  }
+                } else if (slashOpen && e.key === "Escape") {
+                  e.preventDefault();
+                  setSlashDismissedFor(text);
+                  return;
+                } else if (usageOpen && e.key === "Escape" && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  setUsageOpen(false);
+                  return;
+                }
+                composer.textareaProps.onKeyDown(e);
+              }}
               placeholder={
                 agent.status === "working"
-                  ? `继续输入将加入排队（Enter 排队 · ${IS_MAC ? "⌥Enter" : "Alt+Enter"} 立即打断发送）`
-                  : `发给 ${clip(agent.name || agent.title || agent.harness, 16)}（可拖入或粘贴图片/文件）`
+                  ? "继续输入将加入排队（Enter 加入排队）"
+                  : agent.isShell
+                    ? "输入终端命令按 Enter 执行…"
+                    : `发给 ${clip(agent.name || agent.title || agent.harness, 16)}（/ 命令 · 可拖入或粘贴文件）`
               }
               value={text}
-              onChange={(e) => setText(e.target.value)}
+              onChange={(e) => {
+                setSlashDismissedFor(null);
+                setText(e.target.value);
+              }}
               onPaste={(e) => {
                 const files = extractClipboardFiles(e.clipboardData);
                 if (files.length) {
@@ -1696,52 +2218,93 @@ export function AgentDetailPanel({
                 }
               }}
             />
-            {agent.status === "working" ? (
-              !text.trim() && attachments.length === 0 ? (
-                <PocketButton size="sm" variant="soft" className="composer-send" aria-label="中断当前轮" title="中断当前轮" onClick={interruptTurn}>
-                  <Square size={13} />
-                </PocketButton>
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    className="composer-steer-pill"
-                    title={`立即打断当前轮并发送 (${IS_MAC ? "⌥Enter" : "Alt+Enter"})`}
-                    onClick={() => submitComposer("steer")}
-                  >
-                    <Zap size={12} />
-                    <span>插队</span>
-                  </button>
+          </div>
+          <div className="composer-foot">
+            <div className="composer-tools">
+              <button
+                type="button"
+                className="composer-tool-btn"
+                aria-label="添加文件或图片"
+                title="添加文件或图片"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <Paperclip size={16} />
+              </button>
+              <VoiceMicButton />
+              {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
+                <button
+                  type="button"
+                  className="composer-model-btn"
+                  title={agent.model ? `当前模型：${agent.model}（点击切换）` : "切换模型 (/model)"}
+                  onClick={() => setModelModalOpen(true)}
+                >
+                  <Cpu size={13} />
+                  <span className="truncate mono">{agent.model ? agent.model.split("/").pop() : "切换模型"}</span>
+                  <ChevronDown size={11} />
+                </button>
+              ) : null}
+            </div>
+            <div className="composer-actions">
+              {agent.status === "working" ? (
+                !text.trim() && attachments.length === 0 ? (
+                  <PocketButton size="sm" variant="soft" className="composer-send" aria-label="中断当前轮" title="中断当前轮" onClick={interruptTurn}>
+                    <Square size={13} />
+                  </PocketButton>
+                ) : (
                   <PocketButton
                     size="sm"
                     className="composer-send"
                     aria-label="加入排队"
-                    title={`加入排队 (Enter) · ${IS_MAC ? "⌥Enter" : "Alt+Enter"} 立即打断发送`}
-                    onClick={() => submitComposer("auto")}
+                    title="加入排队 (Enter)"
+                    onClick={() => submitComposer()}
                   >
                     <Clock size={14} />
                   </PocketButton>
-                </>
-              )
-            ) : (
-              <PocketButton
-                size="sm"
-                className="composer-send"
-                aria-label="发送"
-                title="发送 (Enter)"
-                disabled={!text.trim() && attachments.length === 0}
-                onClick={() => submitComposer("auto")}
-              >
-                <Send size={14} />
-              </PocketButton>
-            )}
+                )
+              ) : (
+                <PocketButton
+                  size="sm"
+                  className="composer-send"
+                  aria-label="发送"
+                  title="发送 (Enter)"
+                  disabled={!text.trim() && attachments.length === 0}
+                  onClick={() => submitComposer()}
+                >
+                  <Send size={14} />
+                </PocketButton>
+              )}
+            </div>
           </div>
         </div>
       ) : null}
 
-      <PocketModal open={Boolean(subModal)} onOpenChange={(v) => !v && setSubModal(null)} title={subModal?.title || "子 Agent 对话"} width={620}>
-        <div className="stack" style={{ maxHeight: 420, overflowY: "auto" }}>
-          <ChatTimelineRows rows={subModalRows} subs={[]} />
+      <ModelSwitchModal
+        open={modelModalOpen}
+        onOpenChange={setModelModalOpen}
+        agent={agent}
+        onSelectModel={applyModelSwitch}
+      />
+
+      <PocketModal
+        open={killConfirmOpen}
+        onOpenChange={setKillConfirmOpen}
+        title="关闭终端"
+        subtitle="关闭后将终止该终端内正在运行的进程，未保存的进度会丢失。"
+        width={400}
+      >
+        <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
+          <PocketButton variant="ghost" onClick={() => setKillConfirmOpen(false)}>取消</PocketButton>
+          <PocketButton
+            variant="danger"
+            onClick={() => {
+              setKillConfirmOpen(false);
+              void rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key })
+                .then(() => onBack?.())
+                .catch((e) => toast((e as Error).message, true));
+            }}
+          >
+            关闭并结束
+          </PocketButton>
         </div>
       </PocketModal>
     </div>
@@ -1773,21 +2336,11 @@ export function CreateAgentModal({
   const [folders, setFolders] = useState<string[]>([]);
   const [spaceId, setSpaceId] = useState("");
   const [spaceName, setSpaceName] = useState(defaultSpace || "");
+  const [spaceNameTouched, setSpaceNameTouched] = useState(Boolean(defaultSpace));
   const [launcher, setLauncher] = useState("");
   const [folder, setFolder] = useState("");
   const [folderTouched, setFolderTouched] = useState(false);
   const [browseOpen, setBrowseOpen] = useState(false);
-  const [browseTarget, setBrowseTarget] = useState<string | undefined>(undefined);
-  const [showHidden, setShowHidden] = useState(false);
-  const [browseFilter, setBrowseFilter] = useState("");
-  const [browseLoading, setBrowseLoading] = useState(false);
-  const [browseError, setBrowseError] = useState<string | null>(null);
-  const [browseData, setBrowseData] = useState<{
-    path: string;
-    displayPath: string;
-    parent: string | null;
-    entries: Array<{ name: string; path: string }>;
-  } | null>(null);
   const [task, setTask] = useState("");
   const [busy, setBusy] = useState(false);
   const [spaceState, setSpaceState] = useState<{ loading: boolean; error: string | null; canCreate: boolean; reason?: string }>({
@@ -1801,11 +2354,10 @@ export function CreateAgentModal({
     const h = defaultHost || onlineHosts[0]?.id || hosts[0]?.id || "";
     setHostId(h);
     setSpaceName(defaultSpace || "");
+    setSpaceNameTouched(Boolean(defaultSpace));
     setTask("");
     setFolderTouched(false);
     setBrowseOpen(false);
-    setBrowseFilter("");
-    setBrowseError(null);
   }, [open, defaultHost, defaultSpace]);
 
   useEffect(() => {
@@ -1819,9 +2371,6 @@ export function CreateAgentModal({
     setFolder("");
     setFolderTouched(false);
     setBrowseOpen(false);
-    setBrowseTarget(undefined);
-    setBrowseData(null);
-    setBrowseError(null);
     setSpaceState({ loading: true, error: null, canCreate: true });
     void rpcCall(hostId, "spaces.list", {})
       .then((res) => {
@@ -1845,44 +2394,33 @@ export function CreateAgentModal({
     };
   }, [open, hostId, defaultSpace]);
 
-  useEffect(() => {
-    if (!open || !browseOpen || !hostId) return;
-    let cancelled = false;
-    setBrowseLoading(true);
-    setBrowseError(null);
-    void rpcCall(hostId, "folders.list", { path: browseTarget, hidden: showHidden })
-      .then((res) => {
-        if (!cancelled) setBrowseData(res);
-      })
-      .catch((e: Error) => {
-        if (!cancelled) setBrowseError(e.message || "无法读取目录");
-      })
-      .finally(() => {
-        if (!cancelled) setBrowseLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, browseOpen, hostId, browseTarget, showHidden]);
-
-  const filteredEntries = useMemo(() => {
-    const list = browseData?.entries ?? [];
-    const q = browseFilter.trim().toLowerCase();
-    return q ? list.filter((e) => e.name.toLowerCase().includes(q)) : list;
-  }, [browseData, browseFilter]);
+  const applyChosenFolder = (nextFolder: string, markTouched = true) => {
+    setFolder(nextFolder);
+    if (markTouched) setFolderTouched(true);
+    const norm = normalizeFolderKey(nextFolder);
+    if (!norm) return;
+    const matched = spaces.find((s) => s.folder && normalizeFolderKey(s.folder) === norm);
+    if (matched) {
+      setSpaceId(matched.id);
+    } else {
+      setSpaceId("");
+      if (!spaceNameTouched) {
+        const baseName = nextFolder.trim().replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+        if (baseName) setSpaceName(baseName);
+      }
+    }
+  };
 
   const pickSystemFolder = async () => {
     try {
       const picked = await native.pickFolder(folder.trim() || undefined);
-      if (picked) {
-        setFolder(picked);
-        setFolderTouched(true);
-        setBrowseOpen(false);
-      }
+      if (picked) applyChosenFolder(picked);
     } catch (e) {
       toast((e as Error).message, true);
     }
   };
+
+  const matchedSpaceObj = spaceId ? spaces.find((s) => s.id === spaceId) : undefined;
 
   const submit = async () => {
     if (!hostId || !launcher) return;
@@ -1906,290 +2444,142 @@ export function CreateAgentModal({
   };
 
   return (
-    <PocketModal open={open} onOpenChange={onOpenChange} title="新建 Agent" subtitle="在指定电脑和工作空间里启动一个新会话" width={540}>
-      <div className="stack">
-        {hosts.length > 0 ? (
-          <div>
-            <div className="faint" style={{ marginBottom: 4 }}>电脑</div>
-            <PocketSelect
-              value={hostId}
-              onValueChange={setHostId}
-              options={hosts.map((h) => ({ value: h.id, label: h.online ? h.name : `${h.name} (离线)` }))}
-            />
-          </div>
-        ) : null}
-
-        {spaceState.error ? (
-          <div className="faint" style={{ color: "var(--blush-text)", fontSize: 12.5 }}>{spaceState.error}</div>
-        ) : !spaceState.canCreate && spaceState.reason ? (
-          <div className="faint" style={{ color: "var(--blush-text)", fontSize: 12.5 }}>{spaceState.reason}</div>
-        ) : null}
-
-        {launchers.length > 0 ? (
-          <div>
-            <div className="faint" style={{ marginBottom: 4 }}>程序 / Harness</div>
-            <div className="row wrap" style={{ gap: 6 }}>
-              {launchers.map((l) => (
-                <PocketButton key={l.id} size="sm" variant={launcher === l.id ? "primary" : "ghost"} onClick={() => setLauncher(l.id)}>
-                  {l.label}
-                </PocketButton>
-              ))}
+    <>
+      <PocketModal open={open} onOpenChange={onOpenChange} title="新建 Agent" subtitle="选择工作目录后自动匹配已有空间（或新建命名空间）" width={540}>
+        <div className="stack">
+          {hosts.length > 0 ? (
+            <div>
+              <div className="faint" style={{ marginBottom: 4 }}>电脑</div>
+              <PocketSelect
+                value={hostId}
+                onValueChange={setHostId}
+                options={hosts.map((h) => ({ value: h.id, label: h.online ? h.name : `${h.name} (离线)` }))}
+              />
             </div>
-          </div>
-        ) : null}
+          ) : null}
 
-        {spaces.length > 0 ? (
+          {spaceState.error ? (
+            <div className="faint" style={{ color: "var(--blush-text)", fontSize: 12.5 }}>{spaceState.error}</div>
+          ) : !spaceState.canCreate && spaceState.reason ? (
+            <div className="faint" style={{ color: "var(--blush-text)", fontSize: 12.5 }}>{spaceState.reason}</div>
+          ) : null}
+
+          {launchers.length > 0 ? (
+            <div>
+              <div className="faint" style={{ marginBottom: 4 }}>程序 / Harness</div>
+              <div className="row wrap" style={{ gap: 6 }}>
+                {launchers.map((l) => (
+                  <PocketButton key={l.id} size="sm" variant={launcher === l.id ? "primary" : "ghost"} onClick={() => setLauncher(l.id)}>
+                    {l.label}
+                  </PocketButton>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
           <div>
-            <div className="faint" style={{ marginBottom: 4 }}>空间（留空或新建）</div>
-            <PocketSelect
-              value={spaceId}
-              onValueChange={(nextId) => {
-                setSpaceId(nextId);
-                if (!folderTouched) {
-                  const sp = spaces.find((s) => s.id === nextId);
-                  if (sp?.folder) setFolder(sp.folder);
-                }
-              }}
-              options={[{ value: "", label: "新建空间" }, ...spaces.map((s) => ({ value: s.id, label: s.name }))]}
-            />
-          </div>
-        ) : null}
-
-        {!spaceId ? (
-          <div>
-            <div className="faint" style={{ marginBottom: 4 }}>新空间名称</div>
-            <PocketInput placeholder="例如：backend" value={spaceName} onChange={(e) => setSpaceName(e.target.value)} />
-          </div>
-        ) : null}
-
-        <div>
-          <div className="faint" style={{ marginBottom: 4 }}>工作目录</div>
-          <div className="row wrap" style={{ gap: 6, alignItems: "center" }}>
-            <PocketInput
-              mono
-              style={{ flex: "1 1 200px", minWidth: 0 }}
-              placeholder="~/work/project"
-              value={folder}
-              onChange={(e) => {
-                setFolder(e.target.value);
-                setFolderTouched(true);
-              }}
-            />
-            {isLocalHost ? (
-              <PocketButton size="sm" variant="ghost" onClick={() => void pickSystemFolder()}>
-                <FolderOpen size={14} /> 选择文件夹…
+            <div className="between" style={{ marginBottom: 4, gap: 8 }}>
+              <span className="faint" style={{ flexShrink: 0 }}>工作目录</span>
+              {folder.trim() ? (
+                <span className="faint truncate" style={{ minWidth: 0, fontSize: 12, color: matchedSpaceObj ? "var(--mint-text)" : "var(--accent-text)" }}>
+                  {matchedSpaceObj ? `复用空间「${matchedSpaceObj.name}」· 新建 Tab` : `将新建空间「${spaceName.trim() || folder.trim().replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "新空间"}」`}
+                </span>
+              ) : null}
+            </div>
+            <div className="row wrap" style={{ gap: 6, alignItems: "center" }}>
+              <PocketInput
+                mono
+                style={{ flex: "1 1 200px", minWidth: 0 }}
+                placeholder="~/work/project"
+                value={folder}
+                onChange={(e) => applyChosenFolder(e.target.value)}
+              />
+              {isLocalHost ? (
+                <PocketButton size="sm" variant="ghost" onClick={() => void pickSystemFolder()}>
+                  <FolderOpen size={14} /> 访达
+                </PocketButton>
+              ) : null}
+              <PocketButton size="sm" variant="soft" onClick={() => setBrowseOpen(true)}>
+                <FolderTree size={14} /> 浏览目录…
               </PocketButton>
+            </div>
+
+            {folders.length > 0 ? (
+              <div className="row wrap" style={{ gap: 5, marginTop: 6 }}>
+                {folders.slice(0, 8).map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    className="term-key"
+                    style={
+                      normalizeFolderKey(folder) === normalizeFolderKey(f)
+                        ? { borderColor: "var(--line-pink)", color: "var(--accent-text)", background: "var(--accent-soft)", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }
+                        : { maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }
+                    }
+                    onClick={() => applyChosenFolder(f)}
+                  >
+                    {f}
+                  </button>
+                ))}
+              </div>
             ) : null}
-            <PocketButton
-              size="sm"
-              variant={browseOpen ? "soft" : "ghost"}
-              onClick={() => {
-                setBrowseOpen((prev) => {
-                  const next = !prev;
-                  if (next) {
-                    setBrowseTarget(folder.trim() || undefined);
-                    setBrowseFilter("");
-                    setBrowseError(null);
+          </div>
+
+          {spaces.length > 0 ? (
+            <div>
+              <div className="faint" style={{ marginBottom: 4 }}>所属空间（同目录自动复用，也可手动指定或新建）</div>
+              <PocketSelect
+                value={spaceId}
+                onValueChange={(nextId) => {
+                  setSpaceId(nextId);
+                  if (!folderTouched) {
+                    const sp = spaces.find((s) => s.id === nextId);
+                    if (sp?.folder) setFolder(sp.folder);
                   }
-                  return next;
-                });
-              }}
-            >
-              <FolderTree size={14} /> 浏览
+                }}
+                options={[{ value: "", label: "新建命名空间" }, ...spaces.map((s) => ({ value: s.id, label: s.folder ? `${s.name} (${s.folder})` : s.name }))]}
+              />
+            </div>
+          ) : null}
+
+          {!spaceId ? (
+            <div>
+              <div className="faint" style={{ marginBottom: 4 }}>新空间名称</div>
+              <PocketInput
+                placeholder="例如：backend"
+                value={spaceName}
+                onChange={(e) => {
+                  setSpaceName(e.target.value);
+                  setSpaceNameTouched(true);
+                }}
+              />
+            </div>
+          ) : null}
+
+          <div>
+            <div className="faint" style={{ marginBottom: 4 }}>第一条任务（可选）</div>
+            <PocketInput placeholder="要交给它做什么…" value={task} onChange={(e) => setTask(e.target.value)} />
+          </div>
+
+          <div className="row" style={{ justifyContent: "flex-end" }}>
+            <PocketButton variant="ghost" onClick={() => onOpenChange(false)}>取消</PocketButton>
+            <PocketButton variant="primary" disabled={busy || spaceState.loading || !spaceState.canCreate || !hostId || !launcher} onClick={() => void submit()}>
+              {busy ? "正在启动…" : "启动 Agent"}
             </PocketButton>
           </div>
-
-          {browseOpen ? (
-            <div
-              style={{
-                marginTop: 8,
-                padding: 10,
-                borderRadius: 12,
-                border: "1px solid var(--divider)",
-                background: "var(--surface-2, rgba(255, 113, 168, 0.04))",
-              }}
-            >
-              <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 8 }}>
-                <PocketButton
-                  size="sm"
-                  variant="ghost"
-                  disabled={!browseData?.parent || browseLoading}
-                  onClick={() => {
-                    if (browseData?.parent) {
-                      setBrowseTarget(browseData.parent);
-                      setBrowseFilter("");
-                    }
-                  }}
-                >
-                  <ArrowUp size={13} /> 上一级
-                </PocketButton>
-                <span
-                  className="mono faint"
-                  style={{
-                    flex: 1,
-                    minWidth: 0,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                    fontSize: 12,
-                  }}
-                  title={browseData?.path || ""}
-                >
-                  {browseLoading ? "加载中…" : browseData?.displayPath || browseData?.path || "—"}
-                </span>
-                <PocketButton
-                  size="sm"
-                  variant={showHidden ? "soft" : "ghost"}
-                  aria-pressed={showHidden}
-                  disabled={browseLoading}
-                  onClick={() => setShowHidden((h) => !h)}
-                >
-                  显示隐藏
-                </PocketButton>
-                <PocketButton
-                  size="sm"
-                  variant="primary"
-                  disabled={!browseData || browseLoading}
-                  onClick={() => {
-                    if (!browseData) return;
-                    setFolder(browseData.displayPath || browseData.path);
-                    setFolderTouched(true);
-                    setBrowseOpen(false);
-                  }}
-                >
-                  选此目录
-                </PocketButton>
-              </div>
-
-              <PocketInput
-                aria-label="筛选子目录"
-                placeholder="筛选子目录…"
-                value={browseFilter}
-                onChange={(e) => setBrowseFilter(e.target.value)}
-                style={{ marginBottom: 8 }}
-              />
-
-              {browseError ? (
-                <div className="row" style={{ gap: 8, alignItems: "center", justifyContent: "space-between", padding: "6px 4px" }}>
-                  <span className="faint" style={{ color: "var(--blush-text)" }}>{browseError}</span>
-                  <PocketButton
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => {
-                      setBrowseTarget(undefined);
-                      setBrowseFilter("");
-                    }}
-                  >
-                    回到主目录
-                  </PocketButton>
-                </div>
-              ) : (
-                <div style={{ maxHeight: 190, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
-                  {browseLoading && !browseData ? (
-                    <div className="faint" style={{ padding: "8px 4px" }}>正在读取目录…</div>
-                  ) : filteredEntries.length === 0 ? (
-                    <div className="faint" style={{ padding: "8px 4px" }}>
-                      {browseFilter.trim() ? "没有匹配的子目录" : "空目录"}
-                    </div>
-                  ) : (
-                    filteredEntries.map((entry) => (
-                      <div
-                        key={entry.path}
-                        className="row"
-                        style={{
-                          gap: 6,
-                          alignItems: "center",
-                          padding: "4px 6px",
-                          borderRadius: 8,
-                        }}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setBrowseTarget(entry.path);
-                            setBrowseFilter("");
-                          }}
-                          style={{
-                            flex: 1,
-                            minWidth: 0,
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 6,
-                            border: 0,
-                            background: "transparent",
-                            color: "var(--ink)",
-                            cursor: "pointer",
-                            textAlign: "left",
-                            padding: "2px 0",
-                          }}
-                          title={`打开 ${entry.path}`}
-                        >
-                          <Folder size={14} style={{ flexShrink: 0, color: "var(--accent-text)" }} />
-                          <span
-                            style={{
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {entry.name}
-                          </span>
-                        </button>
-                        <PocketButton
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => {
-                            setFolder(entry.path);
-                            setFolderTouched(true);
-                            setBrowseOpen(false);
-                          }}
-                        >
-                          选择
-                        </PocketButton>
-                      </div>
-                    ))
-                  )}
-                </div>
-              )}
-            </div>
-          ) : null}
-
-          {folders.length > 0 ? (
-            <div className="row wrap" style={{ gap: 5, marginTop: 6 }}>
-              {folders.slice(0, 8).map((f) => (
-                <button
-                  key={f}
-                  type="button"
-                  className="term-key"
-                  style={
-                    folder === f
-                      ? { borderColor: "var(--line-pink)", color: "var(--accent-text)", background: "var(--accent-soft)", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }
-                      : { maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }
-                  }
-                  onClick={() => {
-                    setFolder(f);
-                    setFolderTouched(true);
-                  }}
-                >
-                  {f}
-                </button>
-              ))}
-            </div>
-          ) : null}
         </div>
+      </PocketModal>
 
-        <div>
-          <div className="faint" style={{ marginBottom: 4 }}>第一条任务（可选）</div>
-          <PocketInput placeholder="要交给它做什么…" value={task} onChange={(e) => setTask(e.target.value)} />
-        </div>
-
-        <div className="row" style={{ justifyContent: "flex-end" }}>
-          <PocketButton variant="ghost" onClick={() => onOpenChange(false)}>取消</PocketButton>
-          <PocketButton variant="primary" disabled={busy || spaceState.loading || !spaceState.canCreate || !hostId || !launcher} onClick={() => void submit()}>
-            {busy ? "正在启动…" : "启动 Agent"}
-          </PocketButton>
-        </div>
-      </div>
-    </PocketModal>
+      <FolderExplorerModal
+        open={open && browseOpen}
+        onOpenChange={setBrowseOpen}
+        hostId={hostId}
+        isLocalHost={isLocalHost}
+        spaces={spaces}
+        recentFolders={folders}
+        initialPath={folder.trim() || undefined}
+        onSelect={(picked) => applyChosenFolder(picked)}
+      />
+    </>
   );
 }

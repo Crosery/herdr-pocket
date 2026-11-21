@@ -123,7 +123,80 @@ const BROWSERS: &[Browser] = &[
         win_dir: r"Vivaldi\User Data",
         keychain: ("Vivaldi Safe Storage", "Vivaldi"),
     },
+    Browser {
+        id: "chrome-canary",
+        name: "Chrome Canary",
+        mac_dir: "Google/Chrome Canary",
+        win_dir: r"Google\Chrome SxS\User Data",
+        keychain: ("Chrome Safe Storage", "Chrome"),
+    },
+    Browser {
+        id: "comet",
+        name: "Comet",
+        mac_dir: "Comet",
+        win_dir: r"Perplexity\Comet\User Data",
+        keychain: ("Comet Safe Storage", "Comet"),
+    },
+    Browser {
+        id: "helium",
+        name: "Helium",
+        mac_dir: "net.imput.helium",
+        win_dir: "",
+        keychain: ("Helium Safe Storage", "Helium"),
+    },
+    Browser {
+        id: "dia",
+        name: "Dia",
+        mac_dir: "Dia/User Data",
+        win_dir: "",
+        keychain: ("Dia Safe Storage", "Dia"),
+    },
+    Browser {
+        id: "tabbit",
+        name: "Tabbit",
+        mac_dir: "Tabbit",
+        win_dir: "",
+        keychain: ("Tabbit Safe Storage", "Tabbit"),
+    },
 ];
+
+fn firefox_profiles_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return home()
+            .map(|h| h.join("Library/Application Support/Firefox/Profiles"))
+            .filter(|p| p.is_dir());
+    }
+    #[cfg(windows)]
+    {
+        return std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|d| d.join(r"Mozilla\Firefox\Profiles"))
+            .filter(|p| p.is_dir());
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn firefox_profiles() -> Vec<(Profile, PathBuf)> {
+    let Some(dir) = firefox_profiles_dir() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let path = e.path();
+            let db = path.join("cookies.sqlite");
+            if path.is_dir() && db.is_file() {
+                let id = e.file_name().to_string_lossy().into_owned();
+                let name = id.split_once('.').map(|(_, n)| n.to_string()).unwrap_or_else(|| id.clone());
+                out.push((Profile { id, name }, db));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.name.cmp(&b.0.name).then_with(|| a.0.id.cmp(&b.0.id)));
+    out
+}
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -235,6 +308,16 @@ pub fn sources() -> Vec<Source> {
             note,
         });
     }
+    let ff = firefox_profiles();
+    if !ff.is_empty() {
+        out.push(Source {
+            id: "firefox",
+            name: "Firefox",
+            profiles: ff.into_iter().map(|(p, _)| p).collect(),
+            importable: cfg!(any(target_os = "macos", windows)),
+            note: Some("Firefox 的 Cookie 可直接导入，无需解锁钥匙串".into()),
+        });
+    }
     #[cfg(target_os = "macos")]
     if home().is_some_and(|h| h.join("Library/Containers/com.apple.Safari").exists()) {
         out.push(Source {
@@ -291,14 +374,20 @@ pub fn chrome_time_to_unix(us: i64) -> Option<i64> {
 /// Removes the SHA-256(host) prefix Chromium adds to plaintexts since cookie DB version 24.
 pub fn strip_host_hash(plain: Vec<u8>, host_key: &str, db_version: i64) -> Vec<u8> {
     use sha2::{Digest, Sha256};
-    if db_version >= 24
-        && plain.len() >= 32
-        && plain[..32] == Sha256::digest(host_key.as_bytes())[..]
-    {
-        plain[32..].to_vec()
-    } else {
-        plain
+    if db_version >= 24 && plain.len() >= 32 {
+        if plain[..32] == Sha256::digest(host_key.as_bytes())[..] {
+            return plain[32..].to_vec();
+        }
+        if std::str::from_utf8(&plain).is_err() && std::str::from_utf8(&plain[32..]).is_ok() {
+            return plain[32..].to_vec();
+        }
     }
+    plain
+}
+
+/// Google TLS-bound cookies (`SIDCC`) break or get rejected if copied into a different TLS stack.
+pub fn is_tls_bound_cookie(name: &str) -> bool {
+    matches!(name, "SIDCC" | "__Secure-1PSIDCC" | "__Secure-3PSIDCC")
 }
 
 /// macOS: AES-128-CBC, IV of 16 spaces, key = PBKDF2-HMAC-SHA1(password, "saltysalt", 1003).
@@ -311,7 +400,9 @@ pub fn mac_key(password: &[u8]) -> [u8; 16] {
 
 pub fn decrypt_cbc(key: &[u8; 16], value: &[u8]) -> Option<Vec<u8>> {
     use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-    let body = value.strip_prefix(b"v10")?;
+    let body = value
+        .strip_prefix(b"v10")
+        .or_else(|| value.strip_prefix(b"v11"))?;
     let iv = [b' '; 16];
     cbc::Decryptor::<aes::Aes128>::new(key.into(), &iv.into())
         .decrypt_padded_vec_mut::<Pkcs7>(body)
@@ -416,13 +507,65 @@ mod read {
                 format!("无法读取 {browser_name} 的 Cookie：{e}")
             });
         }
-        for ext in ["-wal", "-journal"] {
+        for ext in ["-wal", "-shm", "-journal"] {
             let side = PathBuf::from(format!("{}{ext}", src.display()));
             if side.is_file() {
                 let _ = std::fs::copy(&side, copy.dir.join(format!("Cookies{ext}")));
             }
         }
         Ok(copy)
+    }
+
+    pub fn open_firefox(profile: &str) -> Result<Copy, String> {
+        if profile.contains(['/', '\\']) || profile.contains("..") {
+            return Err("配置文件名称不对".into());
+        }
+        let (_, db_path) = firefox_profiles()
+            .into_iter()
+            .find(|(p, _)| p.id == profile)
+            .ok_or_else(|| format!("Firefox 的「{profile}」里没有 Cookie"))?;
+        copy_db(&db_path, "Firefox")
+    }
+
+    pub fn query_firefox(
+        db_path: &Path,
+        wanted: &[String],
+        include_session: bool,
+        now: i64,
+        result: &mut ImportResult,
+    ) -> Result<Vec<Plain>, String> {
+        let db = sqlite::Db::open(db_path)?;
+        let mut out = Vec::new();
+        db.prepare("SELECT host, name, value, path, expiry, isSecure, isHttpOnly, sameSite FROM moz_cookies")?
+            .each(|r| {
+                let host = r.text(0);
+                let name = r.text(1);
+                if !domain_matches(&host, wanted) || is_tls_bound_cookie(&name) {
+                    return;
+                }
+                let exp = r.int(4);
+                let expires = (exp > 0).then_some(exp);
+                if let Some(t) = expires {
+                    if t <= now {
+                        result.expired += 1;
+                        return;
+                    }
+                } else if !include_session {
+                    result.session += 1;
+                    return;
+                }
+                out.push(Plain {
+                    host_key: host,
+                    name,
+                    value: r.text(2),
+                    path: r.text(3),
+                    expires,
+                    secure: r.int(5) != 0,
+                    http_only: r.int(6) != 0,
+                    same_site: r.int(7),
+                });
+            })?;
+        Ok(out)
     }
 
     pub fn open(
@@ -441,6 +584,21 @@ mod read {
     }
 
     pub fn domains(browser_id: &str, profile: &str) -> Result<Vec<DomainCount>, String> {
+        if browser_id == "firefox" {
+            let copy = open_firefox(profile)?;
+            let db = sqlite::Db::open(&copy.db)?;
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            db.prepare("SELECT host FROM moz_cookies")?.each(|r| {
+                *counts.entry(base_domain(&r.text(0))).or_default() += 1;
+            })?;
+            let mut out: Vec<DomainCount> = counts
+                .into_iter()
+                .map(|(domain, count)| DomainCount { domain, count })
+                .collect();
+            out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.domain.cmp(&b.domain)));
+            out.truncate(1000);
+            return Ok(out);
+        }
         let (_, _, copy) = open(browser_id, profile)?;
         let db = sqlite::Db::open(&copy.db)?;
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -582,6 +740,11 @@ mod read {
         include_session: bool,
         result: &mut ImportResult,
     ) -> Result<Vec<Plain>, String> {
+        if browser_id == "firefox" {
+            let copy = open_firefox(profile)?;
+            let now = chrono::Utc::now().timestamp();
+            return query_firefox(&copy.db, wanted, include_session, now, result);
+        }
         let (b, user_data, copy) = open(browser_id, profile)?;
         let (version, rows) = query(&copy.db, wanted)?;
         // The copy goes before the Keychain prompt, which can wait on the person.
@@ -609,6 +772,9 @@ mod read {
     ) -> Result<Vec<Plain>, String> {
         let mut keep = Vec::new();
         for r in rows {
+            if is_tls_bound_cookie(&r.name) {
+                continue;
+            }
             match chrome_time_to_unix(r.expires_utc) {
                 Some(t) if t <= now => result.expired += 1,
                 None if !include_session => result.session += 1,
@@ -716,6 +882,132 @@ fn to_cookie(p: Plain) -> tauri::webview::Cookie<'static> {
     b.build()
 }
 
+#[cfg(target_os = "macos")]
+fn write_macos_persistent_cookies(
+    app: &tauri::AppHandle,
+    plains: Vec<Plain>,
+) -> Result<(usize, usize), String> {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{
+        ns_string, NSArray, NSDate, NSHTTPCookie, NSHTTPCookieDomain, NSHTTPCookieExpires,
+        NSHTTPCookieName, NSHTTPCookieOriginURL, NSHTTPCookiePath, NSHTTPCookiePropertyKey,
+        NSHTTPCookieSecure, NSHTTPCookieValue, NSHTTPCookieVersion, NSMutableDictionary, NSString,
+        NSURL, NSUUID,
+    };
+
+    if plains.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(usize, usize), String>>();
+    app.run_on_main_thread(move || {
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            let _ = tx.send(Err("无法切换到主线程写入 Cookie".into()));
+            return;
+        };
+        let store_id = NSUUID::from_bytes(crate::browser::DATA_STORE_ID);
+        let data_store = unsafe {
+            objc2_web_kit::WKWebsiteDataStore::dataStoreForIdentifier(&store_id, mtm)
+        };
+        let cookie_store = unsafe { data_store.httpCookieStore() };
+
+        let mut built: Vec<Retained<NSHTTPCookie>> = Vec::with_capacity(plains.len());
+        let mut failed = 0usize;
+
+        for p in plains {
+            let name_s = p.name;
+            let val_s = p.value;
+            let bare_host = p.host_key.trim_start_matches('.');
+            if name_s.is_empty() || bare_host.is_empty() {
+                failed += 1;
+                continue;
+            }
+            let is_host_prefix = name_s.starts_with("__Host-");
+            let path_s = if is_host_prefix || p.path.is_empty() {
+                "/"
+            } else {
+                p.path.as_str()
+            };
+            let name = NSString::from_str(&name_s);
+            let value = NSString::from_str(&val_s);
+            let path = NSString::from_str(path_s);
+
+            let props: Retained<NSMutableDictionary<NSHTTPCookiePropertyKey, AnyObject>> =
+                unsafe {
+                    NSMutableDictionary::from_slices(
+                        &[NSHTTPCookieName, NSHTTPCookieValue, NSHTTPCookiePath],
+                        &[&name, &value, &path],
+                    )
+                };
+
+            let host_only = is_host_prefix || !p.host_key.starts_with('.');
+            let mut set_origin = false;
+            if host_only {
+                let scheme = if is_host_prefix || p.secure { "https" } else { "http" };
+                let origin_str = format!(
+                    "{scheme}://{bare_host}{}",
+                    if path_s.starts_with('/') { path_s } else { "/" }
+                );
+                if let Some(url) = NSURL::URLWithString(&NSString::from_str(&origin_str)) {
+                    props.insert(unsafe { NSHTTPCookieOriginURL }, &*url);
+                    set_origin = true;
+                }
+            }
+            if !set_origin {
+                let dom = NSString::from_str(&p.host_key);
+                props.insert(unsafe { NSHTTPCookieDomain }, &*dom);
+            }
+
+            let secure_val = if is_host_prefix || p.secure {
+                ns_string!("TRUE")
+            } else {
+                ns_string!("FALSE")
+            };
+            props.insert(unsafe { NSHTTPCookieSecure }, secure_val);
+
+            let http_only_val = if p.http_only {
+                ns_string!("TRUE")
+            } else {
+                ns_string!("FALSE")
+            };
+            props.insert(ns_string!("HttpOnly"), http_only_val);
+
+            if let Some(t) = p.expires {
+                let dt = NSDate::dateWithTimeIntervalSince1970(t as f64);
+                props.insert(unsafe { NSHTTPCookieExpires }, &*dt);
+                props.insert(unsafe { NSHTTPCookieVersion }, ns_string!("0"));
+            }
+
+            if let Some(cookie) = unsafe { NSHTTPCookie::cookieWithProperties(&props) } {
+                built.push(cookie);
+            } else {
+                failed += 1;
+            }
+        }
+
+        if built.is_empty() {
+            let _ = tx.send(Ok((0, failed)));
+            return;
+        }
+        let imported = built.len();
+        let arr = NSArray::from_retained_slice(&built);
+        let tx_done = std::sync::Mutex::new(Some(tx));
+        let done = block2::RcBlock::new(move || {
+            if let Some(tx) = tx_done.lock().ok().and_then(|mut g| g.take()) {
+                let _ = tx.send(Ok((imported, failed)));
+            }
+        });
+        unsafe {
+            cookie_store.setCookies_completionHandler(&arr, Some(&done));
+        }
+    })
+    .map_err(|e| e.to_string())?;
+
+    rx.recv_timeout(std::time::Duration::from_secs(15))
+        .map_err(|_| "写入内置浏览器 Cookie 超时".to_string())?
+}
+
 /// Reads, decrypts and puts the cookies into the browser panel. Blocking: run off the main thread.
 pub fn import(
     app: &tauri::AppHandle,
@@ -741,7 +1033,17 @@ pub fn import(
     if wanted.is_empty() {
         return Err("请至少选择一个网站".into());
     }
-    let webview = crate::browser::webview(app).ok_or_else(|| "请先打开内置浏览器".to_string())?;
+    #[cfg(target_os = "macos")]
+    let use_persistent_mac_store = crate::browser::macos_major() >= 14;
+    #[cfg(not(target_os = "macos"))]
+    let use_persistent_mac_store = false;
+
+    let webview = if use_persistent_mac_store {
+        None
+    } else {
+        Some(crate::browser::webview(app).ok_or_else(|| "请先打开内置浏览器".to_string())?)
+    };
+
     let mut result = ImportResult {
         domains: wanted.len(),
         ..Default::default()
@@ -769,11 +1071,30 @@ pub fn import(
             return Err(e);
         }
     };
-    for p in plains {
-        match webview.set_cookie(to_cookie(p)) {
-            Ok(()) => result.imported += 1,
-            Err(_) => result.failed += 1,
+    #[cfg(target_os = "macos")]
+    if use_persistent_mac_store {
+        let (imported, failed) = write_macos_persistent_cookies(app, plains)?;
+        result.imported += imported;
+        result.failed += failed;
+    } else if let Some(wv) = webview {
+        for p in plains {
+            match wv.set_cookie(to_cookie(p)) {
+                Ok(()) => result.imported += 1,
+                Err(_) => result.failed += 1,
+            }
         }
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(wv) = webview {
+        for p in plains {
+            match wv.set_cookie(to_cookie(p)) {
+                Ok(()) => result.imported += 1,
+                Err(_) => result.failed += 1,
+            }
+        }
+    }
+    if result.imported > 0 {
+        crate::browser::reload_matching_panels(app, &wanted);
     }
     if result.app_bound > 0 {
         result.note = Some(format!("有 {} 个 Cookie 使用了浏览器的应用绑定加密，无法导入；这些网站请在内置浏览器里重新登录", result.app_bound));
@@ -812,7 +1133,7 @@ pub async fn cookie_import(
     domains: Vec<String>,
     include_session: Option<bool>,
 ) -> Result<ImportResult, String> {
-    let include_session = include_session.unwrap_or(false);
+    let include_session = include_session.unwrap_or(true);
     tauri::async_runtime::spawn_blocking(move || {
         import(&app, &browser, &profile, domains, include_session)
     })
@@ -838,9 +1159,18 @@ mod tests {
         enc.extend_from_slice(&ct);
         let out = decrypt_cbc(&key, &enc).unwrap();
         assert_eq!(strip_host_hash(out.clone(), host, 24), b"session-value");
+        // Non-UTF-8 32-byte digest prefix with unknown host still strips cleanly.
+        let mut alt_digest = vec![0xffu8; 32];
+        alt_digest.extend_from_slice(b"v11-cookie");
+        assert_eq!(strip_host_hash(alt_digest, ".other.com", 24), b"v11-cookie");
         // Older databases have no prefix: nothing is stripped.
         assert_eq!(strip_host_hash(out, host, 23).len(), 32 + 13);
+        let mut enc11 = b"v11".to_vec();
+        enc11.extend_from_slice(&ct);
+        assert!(decrypt_cbc(&key, &enc11).is_some());
         assert!(decrypt_cbc(&key, b"v11abc").is_none());
+        assert!(is_tls_bound_cookie("SIDCC"));
+        assert!(!is_tls_bound_cookie("SESSDATA"));
     }
 
     #[test]
@@ -1136,6 +1466,30 @@ mod tests {
             let tmp = copy.dir.clone();
             drop(copy);
             assert!(!tmp.exists(), "the private copy is removed");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn firefox_style_database() {
+            let dir = temp("firefox");
+            let db = dir.join("cookies.sqlite");
+            let now = 1_800_000_000i64;
+            let sql = format!(
+                "CREATE TABLE moz_cookies(host TEXT, name TEXT, value TEXT, path TEXT, expiry INTEGER, isSecure INTEGER, isHttpOnly INTEGER, sameSite INTEGER);
+                 INSERT INTO moz_cookies VALUES('.example.com','auth','ff-tok','/',{},1,1,1);
+                 INSERT INTO moz_cookies VALUES('.example.com','sess','ff-sess','/',0,1,1,1);
+                 INSERT INTO moz_cookies VALUES('.example.com','expired','gone','/',{},1,1,1);
+                 INSERT INTO moz_cookies VALUES('.example.com','SIDCC','skip-tls','/',{},1,1,1);",
+                now + 3600,
+                now - 10,
+                now + 3600
+            );
+            super::super::sqlite::Db::create(&db, &sql).unwrap();
+            let mut r = ImportResult::default();
+            let out = read::query_firefox(&db, &["example.com".into()], true, now, &mut r).unwrap();
+            let names: Vec<String> = out.into_iter().map(|p| p.name).collect();
+            assert_eq!(names, vec!["auth".to_string(), "sess".to_string()]);
+            assert_eq!(r.expired, 1);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

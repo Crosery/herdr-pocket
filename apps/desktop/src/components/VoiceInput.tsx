@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEv
 import { Keyboard, Mic, RefreshCw, ShieldCheck } from "lucide-react";
 import { configKeySpec, type TranscribeInfo } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketSelect, PocketSwitch, PocketTextarea, useToast } from "./PocketUI";
-import { copyToClipboard, detectPlatform } from "../lib/bridge";
+import { copyToClipboard, detectPlatform, voiceStart, voiceStop } from "../lib/bridge";
 import { native, type Permission, type PermissionKind, type Permissions, type VoiceEvent, type VoiceRuntime } from "../lib/native";
 import { setConfig, useClientConfig } from "../lib/config";
 import { getActiveToken, restRequest } from "../lib/relay";
@@ -323,7 +323,9 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
           <div className="set-title">识别服务</div>
           <div className="set-about">声音发给你的中转服务器转成文字，服务器不保存录音和文字。不能识别时，请服务器管理员在后台配置。</div>
         </div>
-        <PocketBadge tone={engine.tone}>{engine.text}</PocketBadge>
+        <div className="set-control">
+          <PocketBadge tone={engine.tone}>{engine.text}</PocketBadge>
+        </div>
       </div>
 
       <div className="set-row">
@@ -458,36 +460,149 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   );
 }
 
+let lastVoiceTarget: { el: HTMLInputElement | HTMLTextAreaElement; start: number | null; end: number | null } | null = null;
+let lastVoiceTerminal = false;
+let focusTrackerInstalled = false;
+
+function isTextEditableElement(el: Element | null): el is HTMLInputElement | HTMLTextAreaElement {
+  if (!el) return false;
+  if (el.tagName === "TEXTAREA") return !(el as HTMLTextAreaElement).readOnly && !(el as HTMLTextAreaElement).disabled;
+  if (el.tagName === "INPUT") {
+    const inp = el as HTMLInputElement;
+    return !inp.readOnly && !inp.disabled && /^(text|search|url|email|tel|password|)$/i.test(inp.type);
+  }
+  return false;
+}
+
+function installFocusTracker(): void {
+  if (focusTrackerInstalled || typeof document === "undefined") return;
+  focusTrackerInstalled = true;
+  const record = (target: EventTarget | null) => {
+    const el = target instanceof HTMLElement ? target : (document.activeElement as HTMLElement | null);
+    if (!el || el.closest("[data-voice-trigger]")) return;
+    if (el.closest(".xterm-helper-textarea, .tp-term-wrap")) {
+      lastVoiceTerminal = true;
+      lastVoiceTarget = null;
+      return;
+    }
+    if (isTextEditableElement(el)) {
+      lastVoiceTerminal = false;
+      lastVoiceTarget = { el, start: el.selectionStart, end: el.selectionEnd };
+    }
+  };
+  document.addEventListener("focusin", (e) => record(e.target), true);
+  document.addEventListener("keyup", (e) => record(e.target), true);
+  document.addEventListener("mouseup", (e) => record(e.target), true);
+}
+
+function setNativeControlValue(el: HTMLInputElement | HTMLTextAreaElement, text: string): void {
+  const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+  const start = el.selectionStart ?? lastVoiceTarget?.start ?? el.value.length;
+  const end = el.selectionEnd ?? lastVoiceTarget?.end ?? el.value.length;
+  const nextVal = `${el.value.slice(0, start)}${text}${el.value.slice(end)}`;
+  if (setter) setter.call(el, nextVal);
+  else el.value = nextVal;
+  el.focus();
+  const caret = start + text.length;
+  try {
+    el.setSelectionRange(caret, caret);
+  } catch {
+    /* some input types do not expose selection range */
+  }
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  if (lastVoiceTarget?.el === el) {
+    lastVoiceTarget.start = caret;
+    lastVoiceTarget.end = caret;
+  }
+}
+
 /**
- * Dictation finished while Herdr Pocket had the focus (target "app"): the text goes into the
- * focused text box here, like typing. It is never sent; with no text box it is copied instead.
+ * Dictation finished while Herdr Pocket had the focus (target "app"): inserts into the active
+ * or last focused composer/input/terminal; falls back to clipboard when none is available.
  */
 function insertIntoApp(text: string, onCopied: () => void): void {
-  const el = document.activeElement as HTMLElement | null;
-  const editable = el && (el.tagName === "TEXTAREA" || (el.tagName === "INPUT" && (el as HTMLInputElement).type === "text") || el.isContentEditable);
-  if (editable && document.execCommand("insertText", false, text)) return;
+  const active = document.activeElement as HTMLElement | null;
+  if (active?.closest(".xterm-helper-textarea, .tp-term-wrap") || (!isTextEditableElement(active) && !active?.isContentEditable && lastVoiceTerminal)) {
+    window.dispatchEvent(new CustomEvent("pocket:voice-term-input", { detail: { text } }));
+    return;
+  }
+  const target = isTextEditableElement(active)
+    ? active
+    : lastVoiceTarget?.el.isConnected
+      ? lastVoiceTarget.el
+      : null;
+  if (target) {
+    setNativeControlValue(target, text);
+    return;
+  }
+  if (active?.isContentEditable && document.execCommand("insertText", false, text)) return;
   void copyToClipboard(text).then((ok) => ok && onCopied());
 }
 
-/** In-app mirror of the native dictation HUD; renders nothing when idle. */
+/** Shared microphone toggle button rendered inside message composers. */
+export function VoiceMicButton({ className = "composer-tool-btn" }: { className?: string }) {
+  const voice = useClientConfig().voiceInput;
+  const [phase, setPhase] = useState<"listening" | "transcribing" | "idle">("idle");
+
+  useEffect(() => {
+    installFocusTracker();
+    return native.onVoiceEvent((e) => {
+      if (e.state === "listening") setPhase("listening");
+      else if (e.state === "transcribing") setPhase("transcribing");
+      else setPhase("idle");
+    });
+  }, []);
+
+  if (!native.available() || !native.voiceSupported() || !voice.enabled) return null;
+
+  const busy = phase === "listening" || phase === "transcribing";
+  const label =
+    phase === "listening"
+      ? "正在听，点击结束并填入文字"
+      : phase === "transcribing"
+        ? "正在识别语音…"
+        : `语音输入（${prettyHotkey(voice.hotkey)}）`;
+
+  return (
+    <button
+      type="button"
+      data-voice-trigger="true"
+      className={`${className}${busy ? " active" : ""}`}
+      aria-label={label}
+      aria-pressed={phase === "listening"}
+      title={label}
+      disabled={phase === "transcribing"}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={() => {
+        if (phase === "listening") void voiceStop();
+        else if (phase === "idle") void voiceStart();
+      }}
+    >
+      <Mic size={16} />
+    </button>
+  );
+}
+
+/** In-app mirror of the native dictation HUD (suppressed on Tauri desktop where floating capsule renders). */
 export function VoiceHud() {
   const hidden = useWindowHidden();
   const toast = useToast();
   const [ev, setEv] = useState<VoiceEvent>({ state: "idle" });
-  useEffect(
-    () =>
-      native.onVoiceEvent((e) => {
-        if (e.state === "inserted" && e.target === "app" && e.text) insertIntoApp(e.text, () => toast("识别结果已复制，点输入框粘贴"));
-        setEv(e);
-      }),
-    [toast],
-  );
+  useEffect(() => {
+    installFocusTracker();
+    return native.onVoiceEvent((e) => {
+      if (e.state === "inserted" && e.target === "app" && e.text) insertIntoApp(e.text, () => toast("识别结果已复制，点输入框粘贴"));
+      setEv(e);
+    });
+  }, [toast]);
   useEffect(() => {
     if (ev.state !== "inserted" && ev.state !== "error") return;
     const t = setTimeout(() => setEv({ state: "idle" }), ev.state === "error" ? 4000 : 1500);
     return () => clearTimeout(t);
   }, [ev]);
-  if (hidden || ev.state === "idle") return null;
+  // Native Tauri window displays the standalone glass floating HUD capsule; avoid double overlay.
+  if (native.available() || hidden || ev.state === "idle") return null;
   const text =
     ev.state === "listening"
       ? "在听…"

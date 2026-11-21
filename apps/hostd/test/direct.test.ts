@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
-import { DIRECT_FROM_HOST, DIRECT_FROM_PHONE, DIRECT_PATH, DirectCipher, directNonce, utf8Decode, utf8Encode, type DirectAead, type DirectOffer } from "@herdr-pocket/protocol";
+import { DIRECT_FROM_HOST, DIRECT_FROM_PHONE, DIRECT_PATH, DirectCipher, directNonce, jsChaCha20Poly1305, utf8Decode, utf8Encode, type DirectAead, type DirectOffer } from "@herdr-pocket/protocol";
 import { WebSocket } from "ws";
 import { Host } from "../src/host.ts";
 import { directAddrs, nodeAead } from "../src/direct.ts";
@@ -26,14 +26,28 @@ test("the computer's and the app's ChaCha20-Poly1305 open each other's frames, a
   const text = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
   const a = nodeAead.seal(key, nonce, utf8Encode(text));
   const b = nobleAead.seal(key, nonce, utf8Encode(text));
+  const c = jsChaCha20Poly1305.seal(key, nonce, utf8Encode(text));
   assert.deepEqual(Buffer.from(a), Buffer.from(b));
+  assert.deepEqual(Buffer.from(a), Buffer.from(c));
   assert.equal(Buffer.from(a.subarray(0, 8)).toString("hex"), "d31a8d34648e60db");
   assert.equal(utf8Decode(nobleAead.open(key, nonce, a)!), text);
+  assert.equal(utf8Decode(jsChaCha20Poly1305.open(key, nonce, a)!), text);
   assert.equal(utf8Decode(nodeAead.open(key, nonce, b)!), text);
+  assert.equal(utf8Decode(nodeAead.open(key, nonce, c)!), text);
   const bad = Uint8Array.from(a);
   bad[3]! ^= 1;
   assert.equal(nodeAead.open(key, nonce, bad), null);
   assert.equal(nobleAead.open(key, nonce, bad), null);
+  assert.equal(jsChaCha20Poly1305.open(key, nonce, bad), null);
+
+  for (const len of [0, 1, 15, 16, 17, 64, 1300]) {
+    const sample = Uint8Array.from({ length: len }, (_, i) => (i * 37 + 11) & 0xff);
+    const jsSealed = jsChaCha20Poly1305.seal(key, nonce, sample);
+    const nodeSealed = nodeAead.seal(key, nonce, sample);
+    assert.deepEqual(Buffer.from(jsSealed), Buffer.from(nodeSealed), `seal mismatch at length ${len}`);
+    assert.deepEqual(Buffer.from(jsChaCha20Poly1305.open(key, nonce, nodeSealed)!), Buffer.from(sample));
+    assert.deepEqual(Buffer.from(nodeAead.open(key, nonce, jsSealed)!), Buffer.from(sample));
+  }
 });
 
 test("frames carry their direction and count: the app's and the computer's ciphers talk, a replay does not open", () => {

@@ -17,7 +17,13 @@ const GENERIC_FAMILIES = new Set([
   "fantasy",
 ]);
 
-export const localHostIdStore = createStore<string | null>(null);
+function initialLocalHostId(): string | null {
+  if (typeof window === "undefined") return null;
+  const raw = window.__POCKET_LOCAL_HOST_ID__;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+}
+
+export const localHostIdStore = createStore<string | null>(initialLocalHostId());
 export const fontCatalogStore = createStore<FontCatalog | null>(null);
 
 let hostIdInflight: Promise<string | null> | null = null;
@@ -27,6 +33,18 @@ const loadedFamilies = new Set<string>();
 const loadedFaceIds = new Set<number>();
 const fontLoadInflight = new Map<string, Promise<boolean>>();
 
+export async function refreshLocalHostIdFast(force = false): Promise<string | null> {
+  const existing = localHostIdStore.get();
+  if (existing && !force) return existing;
+  if (!native.available()) return null;
+  const direct = (await native.localHostDeviceId())?.trim() || null;
+  if (direct) {
+    if (direct !== existing) localHostIdStore.set(direct);
+    return direct;
+  }
+  return ensureLocalHostDeviceId();
+}
+
 /** Fetches and caches this computer's local hostd deviceId when running inside Tauri. */
 export async function ensureLocalHostDeviceId(): Promise<string | null> {
   const existing = localHostIdStore.get();
@@ -34,9 +52,15 @@ export async function ensureLocalHostDeviceId(): Promise<string | null> {
   if (!native.available()) return null;
   if (hostIdInflight) return hostIdInflight;
 
-  hostIdInflight = getHostdStatus()
-    .then((status) => {
-      const id = status?.deviceId?.trim() || null;
+  hostIdInflight = native
+    .localHostDeviceId()
+    .then(async (fast) => {
+      const direct = fast?.trim() || null;
+      if (direct) return direct;
+      const status = await getHostdStatus().catch(() => null);
+      return status?.deviceId?.trim() || null;
+    })
+    .then((id) => {
       if (id) localHostIdStore.set(id);
       return id;
     })
@@ -52,6 +76,14 @@ export function useLocalHostDeviceId(): string | null {
   const deviceId = localHostIdStore.use((s) => s);
   useEffect(() => {
     void ensureLocalHostDeviceId();
+    if (typeof window === "undefined") return;
+    const onFocus = () => {
+      void refreshLocalHostIdFast(true);
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+    };
   }, []);
   return deviceId;
 }

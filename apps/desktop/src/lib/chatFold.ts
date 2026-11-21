@@ -1,4 +1,4 @@
-import { splitFiles, type ConvEvent } from "@herdr-pocket/protocol";
+import { splitFiles, type ChatDisplayMode, type ConvEvent } from "@herdr-pocket/protocol";
 
 export type ToolCallEvent = Extract<ConvEvent, { kind: "tool_call" }>;
 export type ToolResultEvent = Extract<ConvEvent, { kind: "tool_result" }>;
@@ -29,7 +29,7 @@ export interface ToolSeriesChip {
 export type ChatRow =
   | { kind: "user"; id: string; text: string; ts: number; injected?: string; attachedLines: string[]; attachedCount: number }
   | { kind: "assistant"; id: string; text: string; ts: number; partial?: boolean }
-  | { kind: "thinking"; id: string; text: string }
+  | { kind: "thinking"; id: string; text: string; defaultOpen?: boolean }
   | { kind: "system"; id: string; summary: string; text: string }
   | { kind: "tool"; id: string; step: ToolStep }
   | {
@@ -44,6 +44,7 @@ export type ChatRow =
       detailLine: string;
       activeStep?: ToolStep;
       series: ToolSeriesChip[];
+      defaultOpen?: boolean;
     }
   | { kind: "turn_end"; id: string; ts: number };
 
@@ -284,11 +285,14 @@ type Intermediate =
   | { kind: "system"; id: string; summary: string; text: string };
 
 /**
- * Pairs `tool_call` and `tool_result` by `call_id` and collapses consecutive non-message
- * execution steps (tool loops, reasoning, system notes) into ChatGPT-Desktop / Uniflo-style
- * single-line activity rows so high tool counts stay crisp, readable, and jank-free.
+ * Pairs `tool_call` and `tool_result` by `call_id` and formats non-message activity
+ * according to the selected `ChatDisplayMode`:
+ * - `"compact"`: folds reasoning, system notes, and tool runs into one compact activity row.
+ * - `"standard"` (default, matching Uniflo & mobile): keeps thinking blocks separate from tool runs
+ *   and groups 2+ consecutive tools into a single collapsible tool tab.
+ * - `"expanded"`: keeps thinking separate and opens thinking & multi-tool groups by default.
  */
-export function foldConvEvents(events: ConvEvent[]): ChatRow[] {
+export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "standard"): ChatRow[] {
   const rows: ChatRow[] = [];
   const stepByCallId = new Map<string, ToolStep>();
   let pending: Intermediate[] = [];
@@ -305,7 +309,13 @@ export function foldConvEvents(events: ConvEvent[]): ChatRow[] {
     }
     const firstId = pending[0]!.id;
     if (tools.length === 0) {
-      for (const item of pending) rows.push(item);
+      for (const item of pending) {
+        rows.push(
+          item.kind === "thinking"
+            ? { ...item, ...(mode === "expanded" ? { defaultOpen: true } : {}) }
+            : item,
+        );
+      }
     } else if (tools.length === 1 && thoughts.length === 0 && notes.length === 0) {
       rows.push({ kind: "tool", id: firstId, step: tools[0]! });
     } else {
@@ -315,6 +325,7 @@ export function foldConvEvents(events: ConvEvent[]): ChatRow[] {
         tools,
         thoughts,
         notes,
+        ...(mode === "expanded" ? { defaultOpen: true } : {}),
         ...buildGroupMeta(tools, thoughts, notes),
       });
     }
@@ -326,7 +337,12 @@ export function foldConvEvents(events: ConvEvent[]): ChatRow[] {
       case "user_message": {
         if (e.synthetic) {
           if (e.text.trim()) {
-            pending.push({ kind: "system", id: e.id, summary: systemSummary(e.text), text: e.text.trim() });
+            const note: Intermediate = { kind: "system", id: e.id, summary: systemSummary(e.text), text: e.text.trim() };
+            if (mode === "compact") pending.push(note);
+            else {
+              flushPending();
+              rows.push(note);
+            }
           }
           break;
         }
@@ -352,12 +368,29 @@ export function foldConvEvents(events: ConvEvent[]): ChatRow[] {
       }
       case "reasoning": {
         if (!e.text.trim()) break;
-        pending.push({ kind: "thinking", id: e.id, text: e.text.trim() });
+        const text = e.text.trim();
+        if (mode === "compact") {
+          pending.push({ kind: "thinking", id: e.id, text });
+        } else {
+          flushPending();
+          rows.push({ kind: "thinking", id: e.id, text, defaultOpen: mode === "expanded" });
+        }
         break;
       }
       case "system": {
         if (!e.text.trim()) break;
-        pending.push({ kind: "system", id: e.id, summary: e.summary?.trim() || systemSummary(e.text), text: e.text.trim() });
+        const note: Intermediate = {
+          kind: "system",
+          id: e.id,
+          summary: e.summary?.trim() || systemSummary(e.text),
+          text: e.text.trim(),
+        };
+        if (mode === "compact") {
+          pending.push(note);
+        } else {
+          flushPending();
+          rows.push(note);
+        }
         break;
       }
       case "tool_call": {

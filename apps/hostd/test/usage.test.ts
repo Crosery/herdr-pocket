@@ -1,0 +1,107 @@
+import assert from "node:assert/strict";
+import { beforeEach, test } from "node:test";
+import type { Agent } from "@herdr-pocket/protocol";
+import { clearUsageCachesForTest, getAgentUsageReport, parseOmpUsageJson } from "../src/usage.ts";
+
+const baseAgent: Agent = {
+  key: "dev-1/hc:t1",
+  deviceId: "dev-1",
+  source: "hc",
+  localId: "t1",
+  harness: "oh-my-pi",
+  title: "Test Session",
+  where: "backend",
+  cwd: "/tmp/proj",
+  status: "idle",
+  model: "gpt-6.2-astra",
+  sessionKey: "omp:abc",
+  isShell: false,
+  updatedAt: 1_700_000_000_000,
+};
+
+beforeEach(() => {
+  clearUsageCachesForTest();
+});
+
+test("getAgentUsageReport returns session breakdown, models, unpriced honesty, 24h/7d windows, and redacted omp quotas", async () => {
+  const report = await getAgentUsageReport(baseAgent, {
+    unifloReady: true,
+    uniflo: {
+      async sessionUsage() {
+        return {
+          turns: 3,
+          steps: 10,
+          prompts: 3,
+          input: 120_000,
+          output: 14_500,
+          cacheRead: 420_000,
+          cacheWrite: 0,
+          reasoning: 3_200,
+          costUsd: 1.42,
+          unpricedSteps: 2,
+          contextTokens: 73_266,
+          contextLimit: 200_000,
+          contextPct: 36.633,
+          model: "gpt-6.2-astra",
+          models: [
+            { model: "gpt-6.2-astra", steps: 8, input: 100_000, output: 12_000, cacheRead: 400_000, cacheWrite: 0, costUsd: 1.42, unpricedSteps: 0 },
+            { model: "gemini-4-flash", steps: 2, input: 20_000, output: 2_500, cacheRead: 20_000, cacheWrite: 0, costUsd: 0, unpricedSteps: 2 },
+          ],
+        };
+      },
+      async usage(since) {
+        return {
+          since: 0,
+          rows: [
+            { key: "oh-my-pi", label: "oh-my-pi", sessions: 2, steps: 25, prompts: 5, input: 300_000, output: 30_000, cacheRead: 800_000, cacheWrite: 0, costUsd: since === "24h" ? 2.5 : 9.8 },
+          ],
+          total: { key: "total", label: "total", sessions: 5, steps: 50, prompts: 10, input: 600_000, output: 60_000, cacheRead: 1_500_000, cacheWrite: 0, costUsd: since === "24h" ? 5.1 : 21.4 },
+        };
+      },
+    },
+    async readOmpQuotas() {
+      return parseOmpUsageJson(
+        JSON.stringify({
+          reports: [
+            {
+              provider: "anthropic",
+              account: "user@example.com",
+              windows: [
+                { label: "5h Window", usedPercent: 42.3, resetAt: 1_800_000_000 },
+              ],
+            },
+          ],
+        }),
+      );
+    },
+  });
+
+  assert.equal(report.session?.turns, 3);
+  assert.equal(report.session?.steps, 10);
+  assert.equal(report.session?.unpricedSteps, 2);
+  assert.equal(report.session?.contextLimit, 200_000);
+  assert.equal(report.models.length, 2);
+  assert.equal(report.day24h?.harness?.costUsd, 2.5);
+  assert.equal(report.day7d?.total.costUsd, 21.4);
+  assert.equal(report.quotas[0]?.provider, "anthropic");
+  assert.equal(report.quotas[0]?.account, "us***@example.com");
+  assert.equal(report.quotas[0]?.usedPct, 42.3);
+  assert.equal(report.quotas[0]?.resetAt, 1_800_000_000_000);
+});
+
+test("getAgentUsageReport falls back gracefully without Uniflo using agent snapshot fields", async () => {
+  const report = await getAgentUsageReport(
+    { ...baseAgent, sessionKey: undefined, costUsd: 0.75, contextTokens: 45_000 },
+    {
+      unifloReady: false,
+      async readOmpQuotas() {
+        return [];
+      },
+    },
+  );
+  assert.equal(report.session?.costUsd, 0.75);
+  assert.equal(report.session?.contextTokens, 45_000);
+  assert.equal(report.session?.contextLimit, undefined);
+  assert.deepEqual(report.models, []);
+  assert.equal(report.day24h, null);
+});

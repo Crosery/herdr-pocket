@@ -7,6 +7,7 @@ import { open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { FILES_IGNORED, FILES_LIMITS, type FileEntry, type RpcResult } from "@herdr-pocket/protocol";
+import { annotateEntriesGitStatus } from "./git.ts";
 
 export type FilesErrorCode = "bad_request" | "forbidden" | "not_found";
 
@@ -32,6 +33,24 @@ const IMAGE_MIME: Record<string, string> = {
   ico: "image/x-icon",
 };
 
+const MEDIA_MIME: Record<string, { mime: string; kind: "pdf" | "audio" | "video" }> = {
+  pdf: { mime: "application/pdf", kind: "pdf" },
+  mp3: { mime: "audio/mpeg", kind: "audio" },
+  wav: { mime: "audio/wav", kind: "audio" },
+  ogg: { mime: "audio/ogg", kind: "audio" },
+  flac: { mime: "audio/flac", kind: "audio" },
+  m4a: { mime: "audio/mp4", kind: "audio" },
+  aac: { mime: "audio/aac", kind: "audio" },
+  opus: { mime: "audio/opus", kind: "audio" },
+  weba: { mime: "audio/webm", kind: "audio" },
+  mp4: { mime: "video/mp4", kind: "video" },
+  webm: { mime: "video/webm", kind: "video" },
+  mov: { mime: "video/quicktime", kind: "video" },
+  m4v: { mime: "video/x-m4v", kind: "video" },
+};
+
+const MEDIA_MAX_BYTES = 64 * 1024 * 1024;
+
 const LANGUAGE: Record<string, string> = {
   ts: "ts", mts: "ts", cts: "ts", tsx: "tsx", js: "js", mjs: "js", cjs: "js", jsx: "jsx",
   py: "py", rs: "rs", go: "go", java: "java", kt: "kt", kts: "kt", swift: "swift", c: "c", h: "c",
@@ -49,9 +68,11 @@ const SNIFF_BYTES = 8192;
 export interface FilesOptions {
   /** Folders whose contents are never shown (this computer's herdr-pocket settings, with its token). */
   privateDirs?: string[];
+  /** Additional trusted base folders (e.g. ~/.local/state/herdr-core) readable by absolute/`~` path. */
+  extraRoots?: string[];
 }
 
-function inside(root: string, p: string): boolean {
+export function inside(root: string, p: string): boolean {
   const r = relative(root, p);
   return r === "" || (r !== ".." && !r.startsWith(`..${sep}`) && !isAbsolute(r));
 }
@@ -65,34 +86,91 @@ export function isPrivateName(name: string): boolean {
   return PRIVATE_NAME.test(name);
 }
 
-/** Real location of `rel` inside `root`, refusing anything that is not, or that is private. */
+function expandHome(p: string): string {
+  if (p === "~") return homedir();
+  if (p.startsWith("~/") || (sep === "\\" && p.startsWith("~\\"))) return join(homedir(), p.slice(2));
+  return p;
+}
+
+/** Real location of `rel` inside `root` (or `o.extraRoots`), refusing anything outside or private. */
 export async function resolveInside(root: string | undefined, rel: unknown, o: FilesOptions = {}): Promise<{ realRoot: string; real: string; rel: string }> {
-  if (!root || !isAbsolute(root)) throw new FilesError("not_found", "这个 agent 没有工作目录");
   if (rel !== undefined && typeof rel !== "string") throw new FilesError("bad_request", "path 要是文字");
   const raw = (rel ?? "").replace(/\\/g, "/");
   if (raw.length > 4096 || raw.includes("\0")) throw new FilesError("bad_request", "路径不对");
-  if (raw.startsWith("/") || /^[A-Za-z]:/.test(raw)) throw new FilesError("bad_request", "路径要相对于 agent 的工作目录");
+
+  const hasExtraRoots = Boolean(o.extraRoots?.length);
+  const looksAbsOrHome = raw.startsWith("/") || raw === "~" || raw.startsWith("~/") || /^[A-Za-z]:/.test(raw);
+  if (looksAbsOrHome && !hasExtraRoots) {
+    throw new FilesError("bad_request", "路径要相对于 agent 的工作目录");
+  }
+
+  let realRoot: string | null = null;
+  if (root && isAbsolute(root)) {
+    realRoot = await realpath(root).catch(() => null);
+  }
+  if (!realRoot && !hasExtraRoots) {
+    throw new FilesError("not_found", !root || !isAbsolute(root) ? "这个 agent 没有工作目录" : "agent 的工作目录已经不在了");
+  }
+
+  const resolvedExtras: string[] = [];
+  for (const extra of o.extraRoots ?? []) {
+    if (!extra) continue;
+    const expanded = expandHome(extra);
+    if (!isAbsolute(expanded)) continue;
+    const realExtra = await realpath(expanded).catch(() => null);
+    if (realExtra) resolvedExtras.push(realExtra);
+  }
+
+  if (looksAbsOrHome) {
+    const candidate = expandHome(raw);
+    if (!isAbsolute(candidate)) throw new FilesError("bad_request", "路径要相对于 agent 的工作目录");
+    let real: string;
+    try {
+      real = await realpath(candidate);
+    } catch {
+      throw new FilesError("not_found", "没有这个文件或目录");
+    }
+    const allowedRoots = [...(realRoot ? [realRoot] : []), ...resolvedExtras];
+    const matchedRoot = allowedRoots.find((base) => inside(base, real));
+    if (!matchedRoot) throw new FilesError("forbidden", "不能看工作目录以外的文件");
+    const relFromRoot = relative(matchedRoot, real).split(sep).filter(Boolean);
+    if (relFromRoot.some(isPrivateName) || isPrivateName(basename(real))) {
+      throw new FilesError("forbidden", "这个文件可能存有密钥，不在这里显示");
+    }
+    for (const dir of o.privateDirs ?? []) {
+      const realDir = await realpath(dir).catch(() => dir);
+      if (inside(realDir, real)) throw new FilesError("forbidden", "这是 herdr-pocket 自己的设置目录，不在这里显示");
+    }
+    return { realRoot: matchedRoot, real, rel: relFromRoot.join("/") || basename(real) };
+  }
+
+  if (!root || !isAbsolute(root)) throw new FilesError("not_found", "这个 agent 没有工作目录");
+  if (!realRoot) throw new FilesError("not_found", "agent 的工作目录已经不在了");
+
   const parts = raw.split("/").filter((p) => p && p !== ".");
   if (parts.includes("..")) throw new FilesError("forbidden", "不能看工作目录以外的文件");
   if (parts.some(isPrivateName)) throw new FilesError("forbidden", "这个文件可能存有密钥，不在这里显示");
-  let realRoot: string;
-  try {
-    realRoot = await realpath(root);
-  } catch {
-    throw new FilesError("not_found", "agent 的工作目录已经不在了");
-  }
   let real: string;
   try {
     real = await realpath(join(realRoot, ...parts));
   } catch {
     throw new FilesError("not_found", "没有这个文件或目录");
   }
-  if (!inside(realRoot, real)) throw new FilesError("forbidden", "这个链接指向工作目录以外，不能打开");
+  const matchedExtra = !inside(realRoot, real) ? resolvedExtras.find((base) => inside(base, real)) : undefined;
+  if (!inside(realRoot, real) && !matchedExtra) {
+    throw new FilesError("forbidden", "这个链接指向工作目录以外，不能打开");
+  }
+  if (matchedExtra) {
+    const extraParts = relative(matchedExtra, real).split(sep).filter(Boolean);
+    if (extraParts.some(isPrivateName)) {
+      throw new FilesError("forbidden", "这个文件可能存有密钥，不在这里显示");
+    }
+  }
   for (const dir of o.privateDirs ?? []) {
     const realDir = await realpath(dir).catch(() => dir);
     if (inside(realDir, real)) throw new FilesError("forbidden", "这是 herdr-pocket 自己的设置目录，不在这里显示");
   }
-  return { realRoot, real, rel: parts.join("/") };
+  return { realRoot: matchedExtra ?? realRoot, real, rel: matchedExtra ? (relative(matchedExtra, real).split(sep).join("/") || basename(real)) : parts.join("/") };
 }
 
 const byName = (a: string, b: string) => a.localeCompare(b, "en", { numeric: true, sensitivity: "base" }) || (a < b ? -1 : a > b ? 1 : 0);
@@ -145,6 +223,7 @@ export async function listFiles(
     }
     entries.push(e);
   }
+  await annotateEntriesGitStatus(realRoot, rel, entries).catch(() => {});
   return { root: realRoot, path: rel, entries, truncated: shown.length > limit };
 }
 
@@ -187,14 +266,21 @@ export async function readFileSlice(
   try {
     const mime = IMAGE_MIME[ext];
     if (mime) {
-      if (size > FILES_LIMITS.image) return { ...base, binary: true, truncated: true, offset: 0, bytes: 0, mime };
+      if (size > FILES_LIMITS.image) return { ...base, binary: true, kind: "image", truncated: true, offset: 0, bytes: 0, mime };
       const buf = Buffer.alloc(size);
       const { bytesRead } = await fh.read(buf, 0, size, 0);
-      return { ...base, binary: true, truncated: false, offset: 0, bytes: bytesRead, mime, base64: buf.subarray(0, bytesRead).toString("base64") };
+      return { ...base, binary: true, kind: "image", truncated: false, offset: 0, bytes: bytesRead, mime, base64: buf.subarray(0, bytesRead).toString("base64") };
+    }
+    const media = MEDIA_MIME[ext];
+    if (media) {
+      if (size > MEDIA_MAX_BYTES) return { ...base, binary: true, kind: media.kind, truncated: true, offset: 0, bytes: 0, mime: media.mime };
+      const buf = Buffer.alloc(size);
+      const { bytesRead } = await fh.read(buf, 0, size, 0);
+      return { ...base, binary: true, kind: media.kind, truncated: false, offset: 0, bytes: bytesRead, mime: media.mime, base64: buf.subarray(0, bytesRead).toString("base64") };
     }
     const sniff = Buffer.alloc(Math.min(SNIFF_BYTES, size));
     const sniffed = (await fh.read(sniff, 0, sniff.length, 0)).bytesRead;
-    if (looksBinary(sniff.subarray(0, sniffed))) return { ...base, binary: true, truncated: false, offset: 0, bytes: 0 };
+    if (looksBinary(sniff.subarray(0, sniffed))) return { ...base, binary: true, kind: "binary", truncated: false, offset: 0, bytes: 0 };
     const want = Math.min(maxBytes + 4, size - offset);
     const buf = Buffer.alloc(want);
     const got = (await fh.read(buf, 0, want, offset)).bytesRead;
@@ -206,7 +292,7 @@ export async function readFileSlice(
     if (offset - start + end < size) end = utf8Cut(buf, end);
     const bytes = end - start;
     const text = new TextDecoder("utf-8").decode(buf.subarray(start, end));
-    return { ...base, binary: false, truncated: offset + bytes < size, offset, bytes, text };
+    return { ...base, binary: false, kind: "text", truncated: offset + bytes < size, offset, bytes, text };
   } finally {
     await fh.close();
   }

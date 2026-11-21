@@ -453,6 +453,7 @@
 
 .settings-frame .sf-device {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 7px;
   min-width: 0;

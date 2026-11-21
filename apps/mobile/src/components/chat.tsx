@@ -4,13 +4,14 @@ import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flas
 import { Text } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
-import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
+import type { Agent, ChatDisplayMode, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { call, subscribe } from "../lib/relay";
 import { splitPictures } from "../lib/attach";
 import { followSends, forget } from "../lib/outbox";
 import { useLive, usePending, useSettings, type PendingSend } from "../lib/store";
 import { fixCjkEmphasis, hasList } from "../lib/markdown";
 import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
+import { parseTerminalChatTranscript, shellTurnMatchesCommand } from "../lib/terminalChat";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
 import { EmptyState, PocketToast, TypingDots } from "./ui";
@@ -35,18 +36,19 @@ type ToolResult = Extract<ConvEvent, { kind: "tool_result" }>;
 export type Row =
   | { type: "user"; id: string; text: string; ts: number; injected?: string; pictures?: string[] }
   | { type: "assistant"; id: string; text: string; ts: number }
-  | { type: "thinking"; id: string; text: string }
+  | { type: "thinking"; id: string; text: string; defaultOpen?: boolean }
   | { type: "tool"; id: string; call: ToolCall; result?: ToolResult }
-  /** A run of tool calls folded into one line. */
-  | { type: "tools"; id: string; items: Extract<Row, { type: "tool" }>[] }
+  /** A run of tool calls folded into one line (or combined with thoughts/notes in compact mode). */
+  | { type: "tools"; id: string; items: Extract<Row, { type: "tool" }>[]; thoughts?: string[]; notes?: Array<{ summary: string; text: string }>; defaultOpen?: boolean }
   /** Sent from this phone, not yet echoed by the session. */
   | { type: "pending"; id: string; text: string; ts: number; pictures?: string[]; send: PendingSend; agentKey: string }
   | { type: "turn_end"; id: string; ts: number }
   | { type: "system"; id: string; text: string; summary: string };
 
-export function foldEvents(events: ConvEvent[]): Row[] {
+export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standard"): Row[] {
   const rows: Row[] = [];
   const toolIndex = new Map<string, number>();
+  const defaultOpen = mode === "expanded";
   for (const e of events) {
     switch (e.kind) {
       case "user_message":
@@ -61,7 +63,7 @@ export function foldEvents(events: ConvEvent[]): Row[] {
         if (e.text.trim()) rows.push({ type: "assistant", id: e.id, text: e.text, ts: e.ts });
         break;
       case "reasoning":
-        if (e.text.trim()) rows.push({ type: "thinking", id: e.id, text: e.text });
+        if (e.text.trim()) rows.push({ type: "thinking", id: e.id, text: e.text, ...(defaultOpen ? { defaultOpen: true } : {}) });
         break;
       case "tool_call":
         toolIndex.set(e.call_id, rows.length);
@@ -83,26 +85,45 @@ export function foldEvents(events: ConvEvent[]): Row[] {
         break; // usage, turn_start: not shown
     }
   }
-  return groupTools(rows);
+  return groupTools(rows, mode);
 }
 
-/** Fold each run of two or more tool calls into one "tools" row so replies are not buried under tool cards. */
-function groupTools(rows: Row[]): Row[] {
+/** Fold runs of tool calls (and adjacent thinking/system rows when mode is compact). */
+function groupTools(rows: Row[], mode: ChatDisplayMode): Row[] {
   const out: Row[] = [];
-  let run: Extract<Row, { type: "tool" }>[] = [];
+  let pending: Array<Extract<Row, { type: "tool" | "thinking" | "system" }>> = [];
   const flush = () => {
-    if (run.length >= 2) out.push({ type: "tools", id: `g-${run[0]!.id}`, items: run });
-    else out.push(...run);
-    run = [];
+    if (!pending.length) return;
+    const tools = pending.filter((r): r is Extract<Row, { type: "tool" }> => r.type === "tool");
+    const thoughts = pending.filter((r): r is Extract<Row, { type: "thinking" }> => r.type === "thinking").map((r) => r.text);
+    const notes = pending
+      .filter((r): r is Extract<Row, { type: "system" }> => r.type === "system")
+      .map((r) => ({ summary: r.summary, text: r.text }));
+    if (tools.length === 0) {
+      out.push(...pending);
+    } else if (tools.length === 1 && thoughts.length === 0 && notes.length === 0) {
+      out.push(tools[0]!);
+    } else {
+      out.push({
+        type: "tools",
+        id: `g-${pending[0]!.id}`,
+        items: tools,
+        ...(thoughts.length ? { thoughts } : {}),
+        ...(notes.length ? { notes } : {}),
+        ...(mode === "expanded" ? { defaultOpen: true } : {}),
+      });
+    }
+    pending = [];
   };
   for (const r of rows) {
-    if (r.type === "tool") run.push(r);
-    else {
-      if (run.length) flush();
+    if (r.type === "tool" || (mode === "compact" && (r.type === "thinking" || r.type === "system"))) {
+      pending.push(r);
+    } else {
+      flush();
       out.push(r);
     }
   }
-  if (run.length) flush();
+  flush();
   return out;
 }
 
@@ -348,9 +369,12 @@ const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) 
   );
 });
 
-function ThinkingPill({ text }: { text: string }) {
+function ThinkingPill({ text, defaultOpen }: { text: string; defaultOpen?: boolean }) {
   const p = usePalette();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(Boolean(defaultOpen));
+  useEffect(() => {
+    setOpen(Boolean(defaultOpen));
+  }, [defaultOpen]);
   return (
     <Pressable
       accessibilityRole="button"
@@ -441,9 +465,12 @@ function ToolCard({ call: c, result, bare }: { call: ToolCall; result?: ToolResu
 }
 
 /** A run of tool calls on one line; tap to list them, tap one to see its input and output. */
-function ToolGroup({ items: tools }: { items: Extract<Row, { type: "tool" }>[] }) {
+function ToolGroup({ items: tools, thoughts, notes, defaultOpen }: { items: Extract<Row, { type: "tool" }>[]; thoughts?: string[]; notes?: Array<{ summary: string; text: string }>; defaultOpen?: boolean }) {
   const p = usePalette();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(Boolean(defaultOpen));
+  useEffect(() => {
+    setOpen(Boolean(defaultOpen));
+  }, [defaultOpen]);
   const subs = useContext(SubCtx);
   const failed = tools.filter((t) => t.result?.is_error).length;
   const running = tools.filter((t) => !t.result);
@@ -479,9 +506,15 @@ function ToolGroup({ items: tools }: { items: Extract<Row, { type: "tool" }>[] }
       ) : null}
       {!open && subs ? children.map((s) => <SubLink key={s.key} s={s} onPress={() => subs.open(s)} />) : null}
       {open ? (
-        <View style={{ paddingHorizontal: space.xs, paddingBottom: space.xs, gap: 2 }}>
+        <View style={{ paddingHorizontal: space.xs, paddingBottom: space.xs, gap: 4 }}>
+          {thoughts?.map((t, i) => (
+            <ThinkingPill key={`th-${i}`} text={t} />
+          ))}
           {tools.map((r) => (
             <ToolCard key={r.id} call={r.call} result={r.result} bare />
+          ))}
+          {notes?.map((n, i) => (
+            <FoldChip key={`nt-${i}`} label={n.summary} icon="information-outline" body={n.text} a11y={`系统提醒：${n.summary}`} />
           ))}
         </View>
       ) : null}
@@ -575,11 +608,11 @@ const renderRow: ListRenderItem<ListRow> = ({ item }) => {
     case "pending":
       return <UserBubble text={item.text} pictures={item.pictures} send={item.send} agentKey={item.agentKey} />;
     case "tools":
-      return <ToolGroup items={item.items} />;
+      return <ToolGroup items={item.items} thoughts={item.thoughts} notes={item.notes} defaultOpen={item.defaultOpen} />;
     case "assistant":
       return <AssistantBlock text={item.text} />;
     case "thinking":
-      return <ThinkingPill text={item.text} />;
+      return <ThinkingPill text={item.text} defaultOpen={item.defaultOpen} />;
     case "tool":
       return <ToolCard call={item.call} result={item.result} />;
     case "turn_end":
@@ -608,6 +641,158 @@ export function ChatView({
   /** Read a subagent session of this agent instead of its own. */
   sub?: string;
   /** Known number of children of the session on screen (enables `session.children`). */
+  childCount?: number;
+  trail?: Crumb[];
+}) {
+  if (agent.isShell && !agent.sessionKey && !sub) {
+    return <ShellChatView agent={agent} active={active} bottomInset={bottomInset} />;
+  }
+  return (
+    <SessionChatView
+      agent={agent}
+      active={active}
+      bottomInset={bottomInset}
+      sub={sub}
+      childCount={childCount}
+      trail={trail}
+    />
+  );
+}
+
+function ShellChatView({ agent, active, bottomInset }: { agent: Agent; active: boolean; bottomInset: number }) {
+  const p = usePalette();
+  const [liveScreen, setLiveScreen] = useState<string>("");
+  const sendsAll = usePending((s) => s.byAgent[agent.key]);
+  const patchSend = usePending((s) => s.update);
+  const hasRecentSend = Boolean(sendsAll?.some((s) => Date.now() - s.ts < 15_000));
+
+  const q = useQuery({
+    queryKey: ["terminal.read", agent.key],
+    queryFn: () => call(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 }),
+    enabled: active,
+    refetchInterval: active ? (hasRecentSend ? 1500 : 4000) : false,
+  });
+
+  useEffect(() => {
+    if (!active) return;
+    return subscribe(agent.deviceId, "terminal", { agent: agent.key, history: 180 }, (ev) => {
+      if (ev?.kind === "terminal" && ev.screen) {
+        const s = ev.screen as { text?: string; ansi?: string };
+        if (typeof s.text === "string" || typeof s.ansi === "string") {
+          setLiveScreen(s.text || s.ansi || "");
+        }
+      }
+    });
+  }, [active, agent.deviceId, agent.key]);
+
+  const rawText = liveScreen || q.data?.text || q.data?.ansi || "";
+  const parsed = useMemo(() => parseTerminalChatTranscript(rawText), [rawText]);
+
+  const matchedIds = useMemo(() => {
+    if (!sendsAll?.length || !parsed.turns.length) return [];
+    const hit: string[] = [];
+    for (const s of sendsAll) {
+      if (parsed.turns.some((t) => shellTurnMatchesCommand(t, s.text))) hit.push(s.id);
+    }
+    return hit;
+  }, [parsed.turns, sendsAll]);
+
+  useEffect(() => {
+    if (!matchedIds.length) return;
+    const matched = sendsAll?.filter((s) => matchedIds.includes(s.id) && s.state !== "sent") ?? [];
+    for (const m of matched) patchSend(agent.key, m.id, { state: "sent", error: undefined });
+    const dropIds = (sendsAll ?? [])
+      .filter((s) => matchedIds.includes(s.id) && parsed.turns.some((t) => shellTurnMatchesCommand(t, s.text) && (t.hasNextPrompt || t.outputLines.length > 0)))
+      .map((s) => s.id);
+    if (dropIds.length) forget(agent.key, dropIds);
+  }, [agent.key, matchedIds, parsed.turns, patchSend, sendsAll]);
+
+  const unmatchedPending = useMemo(
+    () => (sendsAll ?? []).filter((s) => !parsed.turns.some((t) => shellTurnMatchesCommand(t, s.text))),
+    [parsed.turns, sendsAll],
+  );
+
+  if (q.isLoading && !rawText) {
+    return (
+      <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: space.sm }}>
+        <PocketSpinner size={26} />
+        <Text style={{ color: p.faint, fontSize: 12 }}>正在读取终端输出…</Text>
+      </View>
+    );
+  }
+
+  return (
+    <ScrollView
+      contentContainerStyle={{
+        paddingHorizontal: space.lg,
+        paddingTop: space.md,
+        paddingBottom: bottomInset + space.xxl,
+        gap: space.md,
+        flexGrow: 1,
+      }}
+    >
+      {parsed.preambleLines.length > 0 ? (
+        <View style={{ backgroundColor: p.surface2, borderRadius: radius.md, borderWidth: 1, borderColor: p.divider, padding: space.md }}>
+          <Text selectable style={{ fontFamily: fonts.mono, fontSize: 12, lineHeight: 18, color: p.muted }}>
+            {parsed.preambleLines.join("\n")}
+          </Text>
+        </View>
+      ) : null}
+
+      {parsed.turns.map((turn) => (
+        <View key={turn.id} style={{ gap: space.xs }}>
+          <UserBubble text={turn.command} />
+          {turn.outputLines.length > 0 ? (
+            <View style={{ alignSelf: "stretch", backgroundColor: p.surface, borderRadius: radius.md, borderWidth: 1, borderColor: p.divider, paddingHorizontal: space.md, paddingVertical: space.sm }}>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                <Text selectable style={{ fontFamily: fonts.mono, fontSize: 12, lineHeight: 18, color: p.ink }}>
+                  {turn.outputLines.join("\n")}
+                </Text>
+              </ScrollView>
+            </View>
+          ) : turn.completedEmpty ? (
+            <View style={{ alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: p.surface2, borderRadius: radius.pill, paddingHorizontal: space.md, paddingVertical: 6, borderWidth: 1, borderColor: p.divider }}>
+              <CuteIcon name="done" size={14} color={statusColors("working", p.dark).fg} fill={p.dark ? "transparent" : statusColors("working", p.dark).bg} strokeWidth={2.4} />
+              <Text style={{ color: p.muted, fontSize: 12, fontFamily: fonts.bodySemi }}>已执行（无输出）</Text>
+            </View>
+          ) : (
+            <ReplyDots />
+          )}
+        </View>
+      ))}
+
+      {unmatchedPending.map((item) => (
+        <View key={item.id} style={{ gap: space.xs }}>
+          <UserBubble text={item.text} send={item} agentKey={agent.key} />
+          {item.state === "sent" ? <ReplyDots /> : null}
+        </View>
+      ))}
+
+      {!parsed.turns.length && !unmatchedPending.length ? (
+        <View style={{ flex: 1, justifyContent: "center" }}>
+          <EmptyState
+            mood="sleepy"
+            title="终端对话视图"
+            body="直接在这里输入终端命令（如 ls、pwd、git status），命令与输出结果会以对话气泡展示。"
+          />
+        </View>
+      ) : null}
+    </ScrollView>
+  );
+}
+
+function SessionChatView({
+  agent,
+  active,
+  bottomInset,
+  sub,
+  childCount,
+  trail = [],
+}: {
+  agent: Agent;
+  active: boolean;
+  bottomInset: number;
+  sub?: string;
   childCount?: number;
   trail?: Crumb[];
 }) {
@@ -729,7 +914,8 @@ export function ChatView({
     const t = setInterval(() => setNowTick(Date.now()), 5000);
     return () => clearInterval(t);
   }, [sendsAll?.length, agent.status]);
-  const folded = useMemo(() => foldEvents(events), [events]);
+  const chatDisplayMode = useSettings((s) => s.chatDisplayMode);
+  const folded = useMemo(() => foldEvents(events, chatDisplayMode), [events, chatDisplayMode]);
   const sends = useMemo(() => followSends(sendsAll ?? [], folded, { status: agent.status, queued: agent.queued }, nowTick), [sendsAll, folded, agent.status, agent.queued, nowTick]);
   useEffect(() => {
     for (const x of sends.patches) patchSend(agent.key, x.id, x.patch);

@@ -5,7 +5,7 @@ import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { PUT_LIMITS, type Agent, type TerminalStreamParams } from "@herdr-pocket/protocol";
+import { PUT_LIMITS, type Agent, type AgentModelsResult, type AgentUsageReport, type TerminalStreamParams } from "@herdr-pocket/protocol";
 import { call, subscribe, type RelayError } from "../lib/relay";
 import { addPictures, canPickImages, pickImages, type Attachment } from "../lib/attach";
 import {
@@ -14,7 +14,6 @@ import {
   moveMobileQueuedPromptToTop,
   popMobileQueuedPromptForEdit,
   removeMobileQueuedPrompt,
-  steerMobileComposerNow,
   steerMobileQueuedPromptNow,
   useMobileQueue,
 } from "../lib/chatQueue";
@@ -27,11 +26,76 @@ import { TERM_BG, TERM_FG } from "../lib/ansi";
 import { TermScreen, type ScreenView, type ShownRow } from "../lib/termscreen";
 import { harnessLook } from "../lib/harness";
 import { parseChoices, type Choice } from "../lib/choices";
+import { builtinSlashCommands, extractSlashQuery, matchSlashCommands, mergeSlashCommands, slashCommandIconKind, type SlashIconKind } from "../lib/slashCommands";
+
+function mobileSlashGlyph(kind: SlashIconKind): keyof typeof MaterialCommunityIcons.glyphMap {
+  switch (kind) {
+    case "usage":
+      return "gauge";
+    case "context":
+      return "layers-outline";
+    case "help":
+      return "help-circle-outline";
+    case "keyboard":
+      return "keyboard-outline";
+    case "status":
+      return "pulse";
+    case "clear":
+      return "eraser";
+    case "compact":
+      return "arrow-collapse-vertical";
+    case "new":
+      return "plus-circle-outline";
+    case "history":
+      return "history";
+    case "branch":
+      return "source-branch";
+    case "share":
+      return "share-variant-outline";
+    case "exit":
+      return "logout";
+    case "model":
+      return "cpu-64-bit";
+    case "speed":
+      return "lightning-bolt-outline";
+    case "shield":
+      return "shield-check-outline";
+    case "memory":
+      return "brain";
+    case "auth":
+      return "account-check-outline";
+    case "settings":
+      return "cog-outline";
+    case "plan":
+      return "compass-outline";
+    case "review":
+      return "magnify";
+    case "git":
+      return "source-commit";
+    case "mcp":
+      return "power-plug-outline";
+    case "browser":
+      return "web";
+    case "schedule":
+      return "clock-outline";
+    case "workspace":
+      return "folder-open-outline";
+    case "goal":
+      return "target";
+    case "agents":
+      return "robot-outline";
+    case "skill":
+      return "creation-outline";
+    case "custom":
+    default:
+      return "tune-variant";
+  }
+}
 import { usePalette } from "../theme/theme";
 import { agentStatusLabel, fonts, radius, space, statusColors } from "../theme/tokens";
 import { TermKeyboard } from "./TermKeyboard";
 import { EmptyState, IconTile, PocketToast, SendPill } from "./ui";
-import { PocketButton, PocketCheck, PocketDialog, PocketProgress, PocketSpinner, RowAction, type PocketIcon } from "./pocket";
+import { PocketButton, PocketCheck, PocketDialog, PocketInput, PocketProgress, PocketSpinner, RowAction, type PocketIcon } from "./pocket";
 
 // ---------------------------------------------------------------------------
 // Terminal
@@ -687,10 +751,43 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   const totalQueued = queued.length + hostHeldCount;
   const textScale = useSettings((x) => x.textScale);
   const [tuning, setTuning] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageData, setUsageData] = useState<AgentUsageReport | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [modelOpen, setModelOpen] = useState(false);
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelData, setModelData] = useState<AgentModelsResult | null>(null);
+  const [modelError, setModelError] = useState<string | null>(null);
+  const [modelFilter, setModelFilter] = useState("");
+
+  useEffect(() => {
+    setUsageOpen(false);
+    setUsageData(null);
+    setUsageError(null);
+    setModelOpen(false);
+    setModelData(null);
+    setModelError(null);
+    setModelFilter("");
+  }, [agent.key]);
   const termKeys = useSettings((x) => x.termKeys);
   const keys = useMemo(() => visibleTermKeys(normalizeTermKeyLayout(termKeys)), [termKeys]);
   const online = useLive((s) => s.devices[agent.deviceId]?.online ?? false);
   const coral = statusColors("blocked", p.dark).fg;
+  const slashQuery = mode === "chat" && !agent.isShell ? extractSlashQuery(text) : null;
+  const cmdQ = useQuery({
+    queryKey: ["agent.commands", agent.key],
+    queryFn: () => call(agent.deviceId, "agent.commands", { agent: agent.key }),
+    enabled: online && !agent.isShell && mode === "chat",
+    staleTime: 30_000,
+    retry: false,
+  });
+  const slashMatches = useMemo(() => {
+    if (slashQuery === null) return [];
+    const builtins = builtinSlashCommands(agent.harness, agent.isShell);
+    const merged = mergeSlashCommands(builtins, cmdQ.data?.commands ?? []);
+    return matchSlashCommands(merged, slashQuery);
+  }, [agent.harness, agent.isShell, cmdQ.data?.commands, slashQuery]);
 
   useEffect(() => {
     if (!online) return;
@@ -713,10 +810,62 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     }, 1000);
   }
 
+  const openUsageCard = useCallback(() => {
+    setUsageOpen(true);
+    setUsageLoading(true);
+    setUsageError(null);
+    void call(agent.deviceId, "agent.usage", { agent: agent.key })
+      .then((res) => setUsageData(res))
+      .catch((e) => setUsageError((e as Error).message || "读取用量失败"))
+      .finally(() => setUsageLoading(false));
+  }, [agent.deviceId, agent.key]);
+
+  const openModelPicker = useCallback(() => {
+    setModelOpen(true);
+    setModelFilter("");
+    setModelLoading(true);
+    setModelError(null);
+    void call(agent.deviceId, "agent.models", { agent: agent.key })
+      .then((res) => setModelData(res))
+      .catch((e) => setModelError((e as Error).message || "读取模型列表失败"))
+      .finally(() => setModelLoading(false));
+  }, [agent.deviceId, agent.key]);
+
+  function applyModelChoice(modelId: string) {
+    const clean = modelId.trim();
+    if (!clean) return;
+    setModelOpen(false);
+    const cmd = `/model ${clean}`;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+    if (agent.status === "working") {
+      enqueueMobilePrompt(agent, cmd, []);
+      setToast(`已加入排队：切换模型为 ${clean}`);
+      return;
+    }
+    void sendOut(agent, cmd, []).then((r) => {
+      if (r.ok) {
+        setToast(`已发送切换模型指令：${clean}`);
+        refreshSoon();
+      } else {
+        setToast(r.message);
+      }
+    });
+  }
+
   function send() {
     const t = text.trim();
     const pics = mode === "chat" ? pictures : [];
     if (!t && !pics.length) return;
+    if (mode === "chat" && !pics.length && /^\/usage$/i.test(t)) {
+      setText("");
+      openUsageCard();
+      return;
+    }
+    if (mode === "chat" && !pics.length && /^\/(?:model|models)$/i.test(t)) {
+      setText("");
+      openModelPicker();
+      return;
+    }
     const now = Date.now();
     const sig = `${agent.key}\0${t}\0${pics.map((x) => x.id).join(",")}`;
     if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 500) return;
@@ -733,19 +882,6 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
       if (r.ok) refreshSoon();
       // Beside the terminal there is no bubble to show the failure on.
       else if (mode === "terminal") setToast(r.message);
-    });
-  }
-
-  function steerFromComposer() {
-    const t = text.trim();
-    const pics = mode === "chat" ? pictures : [];
-    if ((!t && !pics.length) || !online || isSteering) return;
-    setText("");
-    if (pics.length) setPictures((cur) => cur.filter((x) => !pics.includes(x)));
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
-    void steerMobileComposerNow(agent, t, pics).then((r) => {
-      if (r.ok) refreshSoon();
-      else setToast(r.message);
     });
   }
 
@@ -1089,6 +1225,182 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
           </Text>
         </View>
       ) : null}
+      {mode === "chat" && usageOpen ? (
+        <View
+          accessibilityLabel="用量与上下文"
+          style={{
+            marginHorizontal: space.lg,
+            marginBottom: space.xs,
+            padding: space.md,
+            borderRadius: radius.card,
+            backgroundColor: p.surface,
+            borderWidth: 1,
+            borderColor: p.dark ? p.surface3 : "#FBE3EC",
+            gap: space.sm,
+          }}
+        >
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <MaterialCommunityIcons name="gauge" size={16} color={p.accentText} />
+            <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.ink, flex: 1 }}>
+              用量与上下文 · {usageData?.harness || agent.harness}
+            </Text>
+            <Pressable accessibilityRole="button" accessibilityLabel="刷新用量" onPress={openUsageCard} hitSlop={8} style={{ padding: 4 }}>
+              <MaterialCommunityIcons name="refresh" size={16} color={p.muted} />
+            </Pressable>
+            <Pressable accessibilityRole="button" accessibilityLabel="关闭用量卡片" onPress={() => setUsageOpen(false)} hitSlop={8} style={{ padding: 4 }}>
+              <MaterialCommunityIcons name="close" size={16} color={p.muted} />
+            </Pressable>
+          </View>
+          {usageError ? <Text style={{ fontSize: 12, color: p.error }}>{usageError}</Text> : null}
+          {usageLoading && !usageData ? (
+            <View style={{ paddingVertical: 8, alignItems: "center" }}>
+              <PocketSpinner size={18} />
+            </View>
+          ) : usageData ? (
+            <>
+              {(usageData.session?.contextTokens ?? agent.contextTokens) !== undefined ? (() => {
+                const ct = usageData.session?.contextTokens ?? agent.contextTokens ?? 0;
+                const cl = usageData.session?.contextLimit ?? agent.contextLimit;
+                const pct = usageData.session?.contextPct ?? (cl && cl > 0 ? (ct / cl) * 100 : undefined);
+                return (
+                  <View style={{ gap: 4 }}>
+                    <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+                      <Text style={{ fontSize: 12, color: p.muted }}>上下文窗口</Text>
+                      <Text style={{ fontFamily: fonts.mono, fontSize: 11.5, color: p.ink }}>
+                        {cl ? `${compactNum(ct)} / ${compactNum(cl)} · ${(pct ?? 0).toFixed(1)}%` : `${compactNum(ct)} tokens`}
+                      </Text>
+                    </View>
+                    {pct !== undefined ? <PocketProgress progress={pct / 100} height={6} /> : null}
+                  </View>
+                );
+              })() : null}
+              {usageData.session ? (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+                  <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                    <Text style={{ fontSize: 11, color: p.faint }}>累计费用</Text>
+                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                      {usageData.session.steps > 0 && usageData.session.unpricedSteps >= usageData.session.steps && usageData.session.costUsd === 0
+                        ? "未计价"
+                        : money(usageData.session.costUsd) ?? "$0.00"}
+                    </Text>
+                  </View>
+                  <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                    <Text style={{ fontSize: 11, color: p.faint }}>轮次与步数</Text>
+                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                      {`${usageData.session.turns} 轮 · ${usageData.session.steps} 步`}
+                    </Text>
+                  </View>
+                  <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                    <Text style={{ fontSize: 11, color: p.faint }}>输入 / 输出</Text>
+                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                      {`${compactNum(usageData.session.input)} / ${compactNum(usageData.session.output)}`}
+                    </Text>
+                  </View>
+                  <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                    <Text style={{ fontSize: 11, color: p.faint }}>缓存读取</Text>
+                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                      {compactNum(usageData.session.cacheRead)}
+                    </Text>
+                  </View>
+                </View>
+              ) : (
+                <Text style={{ fontSize: 12, color: p.faint }}>暂无详细会话统计</Text>
+              )}
+              {usageData.models.length > 0 ? (
+                <View style={{ gap: 3 }}>
+                  {usageData.models.slice(0, 4).map((m) => (
+                    <View key={m.model} style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                      <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.mono, fontSize: 11.5, color: p.ink }}>{m.model}</Text>
+                      <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>{m.steps} 步</Text>
+                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 11.5, color: p.accentText }}>
+                        {m.steps > 0 && m.unpricedSteps >= m.steps && m.costUsd === 0 ? "未计价" : money(m.costUsd) ?? "$0.00"}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              ) : null}
+              {usageData.day24h || usageData.day7d ? (
+                <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>
+                  {usageData.day24h ? `24h 合计 ${money(usageData.day24h.total.costUsd) ?? "$0.00"}  ` : ""}
+                  {usageData.day7d ? `7d 合计 ${money(usageData.day7d.total.costUsd) ?? "$0.00"}` : ""}
+                </Text>
+              ) : null}
+            </>
+          ) : null}
+        </View>
+      ) : null}
+      {mode === "chat" && slashQuery !== null && slashMatches.length > 0 ? (
+        <View
+          accessibilityLabel="斜杠命令推荐"
+          style={{
+            marginHorizontal: space.lg,
+            marginBottom: space.xs,
+            borderRadius: radius.card,
+            backgroundColor: p.surface,
+            borderWidth: 1,
+            borderColor: p.dark ? p.surface3 : "#FBE3EC",
+            maxHeight: 210,
+            overflow: "hidden",
+          }}
+        >
+          <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="always" contentContainerStyle={{ padding: space.xs, gap: 3 }}>
+            {slashMatches.slice(0, 12).map((cmd) => {
+              const glyph = mobileSlashGlyph(slashCommandIconKind(cmd));
+              return (
+                <Pressable
+                  key={`${cmd.name}-${cmd.source ?? "b"}`}
+                  accessibilityRole="button"
+                  accessibilityLabel={`${cmd.name}，${cmd.description}`}
+                  onPress={() => {
+                    if (/^\/usage$/i.test(cmd.name)) {
+                      setText("");
+                      openUsageCard();
+                      return;
+                    }
+                    if (/^\/(?:model|models)$/i.test(cmd.name)) {
+                      setText("");
+                      openModelPicker();
+                      return;
+                    }
+                    const needsArgs = Boolean(cmd.argHint) || ["/add", "/model", "/ask", "/architect", "/add-dir", "/goal"].includes(cmd.name);
+                    setText(needsArgs ? `${cmd.name} ` : cmd.name);
+                  }}
+                  style={({ pressed }) => ({
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 8,
+                    paddingHorizontal: space.sm,
+                    paddingVertical: 7,
+                    borderRadius: radius.sm,
+                    backgroundColor: pressed ? p.surface3 : "transparent",
+                  })}
+                >
+                  <View
+                    style={{
+                      width: 22,
+                      height: 22,
+                      borderRadius: 6,
+                      alignItems: "center",
+                      justifyContent: "center",
+                      backgroundColor: p.accentContainer,
+                    }}
+                  >
+                    <MaterialCommunityIcons name={glyph} size={13} color={p.accentText} />
+                  </View>
+                  <Text style={{ fontFamily: fonts.monoBold, fontSize: 13, color: p.accentText }}>{cmd.name}</Text>
+                  {cmd.argHint ? <Text style={{ fontFamily: fonts.mono, fontSize: 11.5, color: p.faint }}>{cmd.argHint}</Text> : null}
+                  <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: p.muted }}>{cmd.description}</Text>
+                  {cmd.source && cmd.source !== "builtin" ? (
+                    <View style={{ paddingHorizontal: 6, paddingVertical: 1, borderRadius: radius.pill, backgroundColor: p.accentContainer }}>
+                      <Text style={{ fontSize: 10.5, color: p.accentText }}>{cmd.source === "project" ? "项目" : "全局"}</Text>
+                    </View>
+                  ) : null}
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+        </View>
+      ) : null}
       {showInput ? (
       <View
         style={{
@@ -1117,13 +1429,13 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         <RNTextInput
           value={text}
           onChangeText={setText}
-          placeholder={!online ? "这台电脑离线了" : mode === "chat" ? (agent.status === "working" ? "正在忙，发送会排队（点插队可立即打断）" : "回它一句…") : "输入到终端，发送时带回车"}
+          placeholder={!online ? "这台电脑离线了" : mode === "chat" ? (agent.status === "working" ? "正在忙，发送会加入排队…" : agent.isShell ? "输入终端命令（如 ls、git status）…" : "回它一句（输入 / 调用命令）…") : "输入到终端，发送时带回车"}
           placeholderTextColor={p.faint}
           editable={online}
           multiline={mode === "chat"}
           autoFocus={mode === "terminal"}
-          autoCapitalize={mode === "terminal" ? "none" : undefined}
-          autoCorrect={mode === "chat"}
+          autoCapitalize={mode === "terminal" || agent.isShell || text.startsWith("/") ? "none" : undefined}
+          autoCorrect={mode === "chat" && !agent.isShell && !text.startsWith("/")}
           onSubmitEditing={mode === "terminal" ? send : undefined}
           style={
             mode === "chat"
@@ -1143,6 +1455,32 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
               a11y={extra ? "收起快捷按键" : "显示回车、Esc、方向键等快捷按键"}
             />
             <IconTile icon="image" size={42} disabled={!online || picking} onPress={attach} a11y="添加图片，和消息一起发给它" />
+            {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
+              <Pressable
+                disabled={!online}
+                onPress={openModelPicker}
+                accessibilityRole="button"
+                accessibilityLabel={agent.model ? `当前模型 ${agent.model}，点击切换` : "切换模型"}
+                style={({ pressed }) => ({
+                  height: 36,
+                  maxWidth: 150,
+                  paddingHorizontal: 10,
+                  borderRadius: 18,
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 4,
+                  backgroundColor: pressed ? p.surface3 : p.surface2,
+                  borderWidth: 1,
+                  borderColor: p.divider,
+                  opacity: online ? 1 : 0.45,
+                })}
+              >
+                <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
+                <Text numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 12, color: p.ink, flexShrink: 1 }}>
+                  {agent.model ? agent.model.split("/").pop() : "模型"}
+                </Text>
+              </Pressable>
+            ) : null}
             <View style={{ flex: 1 }} />
             {agent.status === "working" ? (
               !text.trim() && !pictures.length ? (
@@ -1168,47 +1506,24 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                   <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.accentText }}>停止</Text>
                 </Pressable>
               ) : (
-                <>
-                  <Pressable
-                    disabled={!online || isSteering}
-                    onPress={steerFromComposer}
-                    accessibilityRole="button"
-                    accessibilityLabel="立即打断当前轮并插队发送"
-                    style={({ pressed }) => ({
-                      height: 42,
-                      paddingHorizontal: 13,
-                      borderRadius: 21,
-                      flexDirection: "row",
-                      alignItems: "center",
-                      gap: 4,
-                      backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.surface3 : p.accentContainer,
-                      borderWidth: 1,
-                      borderColor: !online ? p.divider : p.primary,
-                      opacity: isSteering ? 0.55 : 1,
-                    })}
-                  >
-                    <MaterialCommunityIcons name="flash-outline" size={16} color={!online ? p.faint : p.accentText} />
-                    <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.accentText }}>插队</Text>
-                  </Pressable>
-                  <Pressable
-                    disabled={!online}
-                    onPress={send}
-                    accessibilityRole="button"
-                    accessibilityLabel="加入排队，当前轮结束后发送"
-                    style={({ pressed }) => ({
-                      height: 42,
-                      paddingHorizontal: 14,
-                      borderRadius: 21,
-                      flexDirection: "row",
-                      alignItems: "center",
-                      gap: 4,
-                      backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.primaryPressed : p.primary,
-                    })}
-                  >
-                    <MaterialCommunityIcons name="clock-outline" size={16} color={!online ? p.faint : p.onPrimary} />
-                    <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.onPrimary }}>排队</Text>
-                  </Pressable>
-                </>
+                <Pressable
+                  disabled={!online}
+                  onPress={send}
+                  accessibilityRole="button"
+                  accessibilityLabel="加入排队，当前轮结束后发送"
+                  style={({ pressed }) => ({
+                    height: 42,
+                    paddingHorizontal: 14,
+                    borderRadius: 21,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 4,
+                    backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.primaryPressed : p.primary,
+                  })}
+                >
+                  <MaterialCommunityIcons name="clock-outline" size={16} color={!online ? p.faint : p.onPrimary} />
+                  <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.onPrimary }}>排队</Text>
+                </Pressable>
               )
             ) : (
               <SendPill disabled={(!text.trim() && !pictures.length) || !online} onPress={send} />
@@ -1219,6 +1534,79 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         )}
       </View>
       ) : null}
+      <PocketDialog
+        visible={modelOpen}
+        onDismiss={() => setModelOpen(false)}
+        title="切换模型"
+        body={modelData?.currentModel || agent.model ? `当前模型：${modelData?.currentModel || agent.model}` : "选择或输入目标模型 ID"}
+        scroll
+        actions={[
+          ...(modelFilter.trim() && modelData?.canSwitch !== false
+            ? [{ label: `切换到 ${modelFilter.trim()}`, onPress: () => applyModelChoice(modelFilter.trim()) }]
+            : []),
+          { label: "取消", tone: "ghost" as const, onPress: () => setModelOpen(false) },
+        ]}
+      >
+        <View style={{ gap: space.sm, paddingBottom: space.xs }}>
+          {modelData && !modelData.canSwitch ? (
+            <Text style={{ fontSize: 13, color: p.error }}>{modelData.reason || "当前会话不支持切换模型"}</Text>
+          ) : null}
+          {modelError ? <Text style={{ fontSize: 13, color: p.error }}>{modelError}</Text> : null}
+          <PocketInput
+            mono
+            icon="magnify"
+            value={modelFilter}
+            onChangeText={setModelFilter}
+            placeholder="筛选或输入模型 ID…"
+            autoCapitalize="none"
+          />
+          {modelLoading && !modelData ? (
+            <View style={{ paddingVertical: 14, alignItems: "center" }}>
+              <PocketSpinner size={20} />
+            </View>
+          ) : (
+            <View style={{ gap: 6 }}>
+              {(modelData?.models ?? [])
+                .filter((m) => {
+                  const q = modelFilter.trim().toLowerCase();
+                  return !q || m.id.toLowerCase().includes(q) || m.label.toLowerCase().includes(q);
+                })
+                .map((m) => {
+                  const active = (modelData?.currentModel || agent.model)?.toLowerCase() === m.id.toLowerCase();
+                  return (
+                    <Pressable
+                      key={m.id}
+                      disabled={modelData?.canSwitch === false}
+                      onPress={() => applyModelChoice(m.id)}
+                      style={({ pressed }) => ({
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 8,
+                        paddingHorizontal: 10,
+                        paddingVertical: 9,
+                        borderRadius: radius.md,
+                        borderWidth: 1,
+                        borderColor: active ? p.primary : p.divider,
+                        backgroundColor: pressed ? p.surface3 : active ? p.accentContainer : p.surface2,
+                      })}
+                    >
+                      <MaterialCommunityIcons name="cpu-64-bit" size={16} color={active ? p.accentText : p.muted} />
+                      <View style={{ flex: 1 }}>
+                        <Text numberOfLines={1} style={{ fontFamily: fonts.monoBold, fontSize: 13, color: p.ink }}>{m.id}</Text>
+                        {m.label && m.label !== m.id ? (
+                          <Text numberOfLines={1} style={{ fontSize: 11.5, color: p.muted }}>{m.label}</Text>
+                        ) : null}
+                      </View>
+                      <Text style={{ fontSize: 11, color: p.muted }}>
+                        {m.source === "current" ? "当前" : m.source === "recent" ? "常用" : "目录"}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+            </View>
+          )}
+        </View>
+      </PocketDialog>
       <KeyLayoutDialog visible={tuning} onDismiss={() => setTuning(false)} />
       <PocketToast visible={!!toast} message={toast} tone="info" bottom={140} onDismiss={() => setToast(null)} />
     </View>

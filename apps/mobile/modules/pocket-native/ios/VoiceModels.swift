@@ -1,5 +1,4 @@
 import Foundation
-import onnxruntime_objc
 
 /// Reads top-level ONNX ModelProto `metadata_props` (field 14) without loading graph weights into heap.
 func parseOnnxCustomMetadata(atPath path: String) -> [String: String] {
@@ -153,7 +152,7 @@ final class VoiceModels {
   ) throws -> VoiceModels {
     let env = try ORTEnv(loggingLevel: .warning)
     func makeOpts(_ threads: Int32) throws -> ORTSessionOptions {
-      let opts = try ORTSessionOptions()
+      let opts = try ORTSessionOptions.create()
       try opts.setIntraOpNumThreads(threads)
       try opts.setGraphOptimizationLevel(.all)
       try opts.addConfigEntry(withKey: "session.intra_op.allow_spinning", value: "0")

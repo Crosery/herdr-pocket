@@ -79,13 +79,25 @@ async function deliverOutgoing(send: OutgoingSend): Promise<boolean> {
   try {
     let body = send.text;
     if (send.attachments.length > 0) {
-      const uploaded = await rpcCall(
-        send.deviceId,
-        "terminal.put",
-        { agent: send.agentKey, files: send.attachments.map((s) => s.put) },
-        30_000,
-      );
-      body = textWithFiles(send.text, uploaded.paths);
+      const toUpload = send.attachments.filter((s) => !s.hostRef && s.put);
+      const uploaded = toUpload.length
+        ? await rpcCall(
+            send.deviceId,
+            "terminal.put",
+            { agent: send.agentKey, files: toUpload.map((s) => s.put!) },
+            30_000,
+          )
+        : { paths: [] as string[] };
+      let uploadIdx = 0;
+      const paths: string[] = [];
+      for (const att of send.attachments) {
+        if (att.hostRef) {
+          paths.push(att.hostRef);
+        } else if (uploadIdx < uploaded.paths.length) {
+          paths.push(uploaded.paths[uploadIdx++]!);
+        }
+      }
+      body = textWithFiles(send.text, paths);
     }
     await rpcCall(send.deviceId, "terminal.send", {
       agent: send.agentKey,

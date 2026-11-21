@@ -167,7 +167,7 @@ jobs:
           else
             echo "::warning::ANDROID_KEYSTORE_BASE64 is not set: this APK is signed with the public debug key. Fine for testing; set the signing secrets before giving it to users."
           fi
-          ./gradlew assembleRelease --no-daemon -PreactNativeArchitectures=arm64-v8a -Pexpo.webp.animated=true "${signing[@]}"
+          ./gradlew assembleRelease --no-daemon -I ../deps/local-maven.gradle -PreactNativeArchitectures=arm64-v8a -Pexpo.webp.animated=true "${signing[@]}"
           mkdir -p "$GITHUB_WORKSPACE/dist"
           apk="$GITHUB_WORKSPACE/dist/herdr-pocket-$VERSION-android-arm64.apk"
           cp app/build/outputs/apk/release/app-release.apk "$apk"
@@ -213,6 +213,7 @@ jobs:
         run: |
           pnpm install --frozen-lockfile --ignore-workspace
           pnpm exec expo prebuild --platform ios --no-install
+          node scripts/stage-ios-onnxruntime.mjs
           cd ios && pod install
       - name: Archive unsigned IPA
         working-directory: apps/mobile/ios

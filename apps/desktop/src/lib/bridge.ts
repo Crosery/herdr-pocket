@@ -74,6 +74,8 @@ declare global {
     __TAURI_INTERNALS__?: unknown;
     /** The desktop app's version, set by its native side (src-tauri/src/webdiag.rs). */
     __POCKET_APP_VERSION__?: string;
+    /** This machine's hostd deviceId (if already logged in at launch), set by src-tauri/src/webdiag.rs. */
+    __POCKET_LOCAL_HOST_ID__?: string | null;
     PocketHarmony?: HarmonyBridgeApi;
     __POCKET_SET_SAFE_AREA__?: (topPx: number, bottomPx: number) => void;
     __POCKET_OPEN_URL__?: (url: string) => void;

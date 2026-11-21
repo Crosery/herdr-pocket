@@ -63,6 +63,7 @@ function applyFile(file: ConfigFileInfo | null, fromNative: boolean): void {
   if (s.notifications !== g.notifications) patch.notifications = g.notifications;
   if (s.showShells !== g.showShells) patch.showShells = g.showShells;
   if (Math.round(s.textScale * 100) !== g.textScale) patch.textScale = g.textScale / 100;
+  if (s.chatDisplayMode !== g.chatDisplayMode) patch.chatDisplayMode = g.chatDisplayMode;
   if (Object.keys(patch).length) {
     applying = true;
     try {
@@ -84,6 +85,7 @@ function mirroredSettings(): Array<[string, ConfigValue]> {
     ["general.notifications", s.notifications],
     ["general.showShells", s.showShells],
     ["general.textScale", Math.round(s.textScale * 100)],
+    ["general.chatDisplayMode", s.chatDisplayMode],
   ];
 }
 

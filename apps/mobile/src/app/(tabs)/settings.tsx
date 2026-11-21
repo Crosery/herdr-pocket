@@ -9,7 +9,7 @@ import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
 import { Card, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
 import { Row, RowDivider as Divider, Toggle, type RowIcon as IconName } from "../../components/rows";
 import { ConfigSnackbar } from "../../components/configParts";
-import { PocketDialog, PocketProgress, PocketSpinner } from "../../components/pocket";
+import { PocketDialog, PocketProgress, PocketSegmented, PocketSpinner } from "../../components/pocket";
 import { Bow, Mascot } from "../../components/Mascot";
 import { useLive, useSettings, type ThemeMode } from "../../lib/store";
 import { signOut } from "../../lib/session";
@@ -139,6 +139,8 @@ export default function SettingsScreen() {
           <Row icon="format-size" title="对话字号" sub="聊天和 agent 对话里文字的大小">
             <TextScaleChoice />
           </Row>
+          <Divider />
+          <ChatDisplayModeChoice />
         </Card>
 
         <SectionHeader title="助理提醒" />
@@ -242,6 +244,35 @@ function ThemeChoice() {
         <ThemeTile key={t.value} mode={t.value} label={t.label} selected={themeMode === t.value} onPress={() => set({ themeMode: t.value })} />
       ))}
     </View>
+  );
+}
+
+const CHAT_MODE_OPTIONS = [
+  { value: "compact", label: "精简" },
+  { value: "standard", label: "标准" },
+  { value: "expanded", label: "全展示" },
+] as const;
+
+const CHAT_MODE_SUB = {
+  compact: "精简：把思考过程和连续工具折叠为一条",
+  standard: "标准：文字思考独立成块，连续工具归到同一个标签",
+  expanded: "全展示：独立展示每次思考与各个工具调用",
+} as const;
+
+function ChatDisplayModeChoice() {
+  const mode = useSettings((x) => x.chatDisplayMode);
+  const set = useSettings((x) => x.set);
+  return (
+    <Row icon="view-agenda-outline" title="对话展示模式" sub={CHAT_MODE_SUB[mode]}>
+      <View style={{ paddingTop: space.sm }}>
+        <PocketSegmented
+          compact
+          segments={CHAT_MODE_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+          value={mode}
+          onChange={(v) => set({ chatDisplayMode: v as "compact" | "standard" | "expanded" })}
+        />
+      </View>
+    </Row>
   );
 }
 

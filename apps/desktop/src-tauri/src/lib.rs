@@ -170,11 +170,47 @@ pub(crate) fn hostd_config_dir() -> Option<PathBuf> {
     }
 }
 
+#[cfg(unix)]
+fn unix_passwd_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    let uid = unsafe { libc::geteuid() };
+    let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut buf = vec![0u8; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc == 0 && !result.is_null() && !pwd.pw_dir.is_null() {
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) }
+            .to_str()
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        return Some(PathBuf::from(dir));
+    }
+    None
+}
+
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    if let Some(h) = std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
-        .map(PathBuf::from)
+    {
+        return Some(PathBuf::from(h));
+    }
+    #[cfg(unix)]
+    {
+        unix_passwd_home()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 fn read_hostd_config(dir: &Path) -> Option<serde_json::Value> {
@@ -301,6 +337,14 @@ fn uniflo_running() -> bool {
 #[tauri::command]
 fn runtime_arch() -> &'static str {
     std::env::consts::ARCH
+}
+
+/// Reads this computer's hostd `deviceId` directly without blocking on socket/TCP probes.
+#[tauri::command]
+fn local_host_device_id() -> Option<String> {
+    let dir = hostd_config_dir()?;
+    let cfg = read_hostd_config(&dir)?;
+    config_str(&cfg, &["deviceId", "device_id"])
 }
 
 /// The socket probes block (up to 300 ms for Uniflo): they run on the blocking pool.
@@ -499,6 +543,7 @@ fn on_setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     perms::log_states("startup");
     voice::init(&handle);
     mainwin::init(&handle);
+    local_term::warmup(&handle);
     Ok(())
 }
 
@@ -546,15 +591,39 @@ fn on_quit(handle: &tauri::AppHandle, via: &str) {
 pub fn run() {
     let context = tauri::generate_context!();
     let version = context.package_info().version.to_string();
+    let local_host_id = local_host_device_id();
     let builder = tauri::Builder::default();
     // macOS only: Windows and Linux windows have no menu bar.
     #[cfg(target_os = "macos")]
     let builder = builder.menu(mainwin::app_menu);
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        "pocket-local",
+        |ctx, req, responder| {
+            if ctx.webview_label() != "main" {
+                let res = tauri::http::Response::builder()
+                    .status(403)
+                    .body(Vec::new())
+                    .unwrap();
+                responder.respond(res);
+                return;
+            }
+            let uri_str = req.uri().to_string();
+            let range_hdr = req
+                .headers()
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            tauri::async_runtime::spawn_blocking(move || {
+                let res = serve_pocket_local(&uri_str, range_hdr.as_deref());
+                responder.respond(res);
+            });
+        },
+    );
     let app = builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(voice::hotkey::plugin())
-        .plugin(webdiag::plugin(&version))
+        .plugin(webdiag::plugin(&version, local_host_id.as_deref()))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -567,6 +636,7 @@ pub fn run() {
             clear_auth,
             hostd_status,
             hostd_local_pair_code,
+            local_host_device_id,
             runtime_arch,
             commands::log_write,
             commands::log_info,
@@ -604,6 +674,7 @@ pub fn run() {
             cookies::cookie_sources,
             cookies::cookie_domains,
             cookies::cookie_import,
+            local_term::local_term_create_shell,
             local_term::local_term_attach,
             local_term::local_term_input,
             local_term::local_term_resize,
@@ -613,6 +684,8 @@ pub fn run() {
             fonts::terminal_font_faces,
             fonts::terminal_font_bytes,
             commands::pick_folder,
+            commands::pick_file,
+            commands::local_read_file,
             updater::update_fetch_github_latest,
             updater::update_download_and_stage,
             updater::update_restart_and_apply,
@@ -634,9 +707,148 @@ pub fn run() {
     });
 }
 
+const MAX_LOCAL_RANGE_CHUNK: u64 = 16 * 1024 * 1024;
+
+fn parse_byte_range(header: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') || total == 0 {
+        return Some(Err(()));
+    }
+    let (start_s, end_s) = spec.split_once('-')?;
+    let start_s = start_s.trim();
+    let end_s = end_s.trim();
+    if start_s.is_empty() {
+        let suffix: u64 = end_s.parse().ok()?;
+        if suffix == 0 {
+            return Some(Err(()));
+        }
+        let start = total.saturating_sub(suffix);
+        return Some(Ok((start, total - 1)));
+    }
+    let start: u64 = start_s.parse().ok()?;
+    if start >= total {
+        return Some(Err(()));
+    }
+    let end = if end_s.is_empty() {
+        (start + MAX_LOCAL_RANGE_CHUNK - 1).min(total - 1)
+    } else {
+        let parsed: u64 = end_s.parse().ok()?;
+        if parsed < start {
+            return Some(Err(()));
+        }
+        parsed.min(total - 1)
+    };
+    Some(Ok((start, end)))
+}
+
+fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Response<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let empty_err = |status: u16| {
+        tauri::http::Response::builder()
+            .status(status)
+            .header("cache-control", "no-store")
+            .body(Vec::new())
+            .unwrap()
+    };
+
+    let parsed = tauri::Url::parse(uri_str)
+        .or_else(|_| tauri::Url::parse(&format!("pocket-local://localhost{uri_str}")));
+    let Ok(url) = parsed else {
+        return empty_err(400);
+    };
+
+    let mut path_param: Option<String> = None;
+    let mut cwd_param: Option<String> = None;
+    for (k, v) in url.query_pairs() {
+        if k == "path" {
+            path_param = Some(v.into_owned());
+        } else if k == "cwd" {
+            cwd_param = Some(v.into_owned());
+        }
+    }
+    let Some(ref raw_path) = path_param else {
+        return empty_err(400);
+    };
+
+    let resolved = match commands::resolve_safe_local_file(cwd_param.as_deref(), raw_path) {
+        Ok(r) => r,
+        Err(msg) => {
+            let status = if msg.contains("密钥") || msg.contains("设置目录") {
+                403
+            } else {
+                404
+            };
+            return empty_err(status);
+        }
+    };
+
+    let mime = commands::local_stream_mime(&resolved.ext);
+    let total = resolved.size;
+    if total == 0 {
+        return tauri::http::Response::builder()
+            .status(200)
+            .header("content-type", mime)
+            .header("accept-ranges", "bytes")
+            .header("content-length", "0")
+            .header("cache-control", "private, max-age=60")
+            .body(Vec::new())
+            .unwrap();
+    }
+
+    if let Some(rh) = range_hdr {
+        if let Some(range_res) = parse_byte_range(rh, total) {
+            match range_res {
+                Ok((start, end)) => {
+                    let mut file = match fs::File::open(&resolved.canon) {
+                        Ok(f) => f,
+                        Err(_) => return empty_err(404),
+                    };
+                    if file.seek(SeekFrom::Start(start)).is_err() {
+                        return empty_err(500);
+                    }
+                    let want = end - start + 1;
+                    let mut buf = Vec::with_capacity((want as usize).min(4 * 1024 * 1024));
+                    if file.take(want).read_to_end(&mut buf).is_err() {
+                        return empty_err(500);
+                    }
+                    return tauri::http::Response::builder()
+                        .status(206)
+                        .header("content-type", mime)
+                        .header("accept-ranges", "bytes")
+                        .header("content-range", format!("bytes {start}-{end}/{total}"))
+                        .header("content-length", buf.len().to_string())
+                        .header("cache-control", "private, max-age=60")
+                        .body(buf)
+                        .unwrap();
+                }
+                Err(()) => {
+                    return tauri::http::Response::builder()
+                        .status(416)
+                        .header("content-range", format!("bytes */{total}"))
+                        .body(Vec::new())
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    let Ok(bytes) = fs::read(&resolved.canon) else {
+        return empty_err(404);
+    };
+    tauri::http::Response::builder()
+        .status(200)
+        .header("content-type", mime)
+        .header("accept-ranges", "bytes")
+        .header("content-length", bytes.len().to_string())
+        .header("cache-control", "private, max-age=60")
+        .body(bytes)
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hostd_pipe_name, offline_message, CmdError};
+    use super::{hostd_pipe_name, offline_message, parse_byte_range, CmdError};
 
     #[test]
     fn local_login_errors_show_no_secrets() {
@@ -680,5 +892,14 @@ mod tests {
             hostd_pipe_name(r"D:\Pocket Home"),
             r"\\.\pipe\herdr-pocket-hostd-7b2f6d134de49fff"
         );
+    }
+
+    #[test]
+    fn byte_range_parser_handles_open_suffix_and_invalid() {
+        assert_eq!(parse_byte_range("bytes=0-99", 500), Some(Ok((0, 99))));
+        assert_eq!(parse_byte_range("bytes=450-", 500), Some(Ok((450, 499))));
+        assert_eq!(parse_byte_range("bytes=-64", 500), Some(Ok((436, 499))));
+        assert_eq!(parse_byte_range("bytes=500-510", 500), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=10-5", 500), Some(Err(())));
     }
 }

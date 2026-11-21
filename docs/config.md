@@ -315,6 +315,7 @@ Who reads it: CLI = `herdr-pocket` commands, daemon = `herdr-pocket run`, app = 
 | `general.language` | `"zh-CN"` | `zh-CN`, `en` | app | language of the desktop app |
 | `general.theme` | `"system"` | `system`, `light`, `dark` | app | appearance |
 | `general.textScale` | `100` | 80–160 | app | text size of the desktop app, in percent |
+| `general.chatDisplayMode` | `"standard"` | `compact`, `standard`, `expanded` | app | conversation detail density (`compact`: merged activity groups; `standard`: separate thinking blocks + grouped tool tab; `expanded`: thinking & tool steps expanded) |
 | `general.showShells` | `false` | boolean | app | list plain shells beside the agents |
 | `general.useLocalLogin` | `true` | boolean | app | when this computer's `herdr-pocket` is logged in, the app joins the same relay with it (it asks that login for a one-time pairing code and pairs as its own device) |
 | `general.launchAtLogin` | `false` | boolean | app | start the app when you log in |

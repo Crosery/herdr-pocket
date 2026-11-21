@@ -1,36 +1,52 @@
-import { Suspense, lazy, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { ExternalLink, File, FileText, FolderTree, Globe, Laptop, Layers, MessageSquare, Mic, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
-import type { Agent } from "@herdr-pocket/protocol";
+import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { Copy, ExternalLink, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Mic, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, overlayStore, useToast } from "../components/PocketUI";
+import { ChatTimelineRows } from "../components/ChatTimeline";
+import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon } from "../components/MascotAndVendor";
 import { serverLabel } from "../components/Sidebar";
+import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
 import { prettyHotkey } from "../components/VoiceInput";
-import { AgentDetailPanel } from "../views/AgentsView";
-import { FileTree, FileViewer, WebPane } from "../views/WorkbenchView";
-import { copyToClipboard } from "../lib/bridge";
+import { AgentDetailPanel, type SubagentHeadInfo } from "../views/AgentsView";
+import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../views/WorkbenchView";
+import { copyToClipboard, voiceStart, voiceStop } from "../lib/bridge";
+import { restoreUpdatePrompt, updateStore } from "../lib/updates";
+import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
 import { useClientConfig } from "../lib/config";
+import { endPanelDrag, endTabDrag, endWorkspaceDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readPanelDrag, readTabDrag, readWorkspaceDrag, startPanelDrag, startTabDrag } from "../lib/fileDrag";
+import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
 import { native } from "../lib/native";
-import { pingRelay } from "../lib/relay";
+import { openAgentFileTarget } from "../lib/openFileTarget";
+import { pingRelay, rpcCall, subscribeStream } from "../lib/relay";
 import { agentSpace, agentTitle, allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
 import { homeFolder, listGroup } from "./agentInfo";
 import { StatusMark } from "./ShellSidebar";
 import {
+  activeTabIdForSpace,
   closeTab,
+  moveTab,
+  moveTabRelative,
   openAgentTab,
   openFileTab,
+  openSubagentAside,
   openWebTab,
   setActiveTab,
   setAgentTabMode,
   setPalette,
   setPanelWidth,
   setPeek,
+  setSelectedSpace,
   shellStore,
   showPanel,
   togglePanel,
   updateWebTab,
+  visibleTabsForSpace,
   type AgentPaneMode,
   type AgentTab,
+  type DiffTab,
+  type FileTab,
   type PanelId,
   type ShellTab,
 } from "./shellStore";
@@ -50,27 +66,73 @@ export function closeShellTab(tab: ShellTab): void {
 
 // Tabs bar ---------------------------------------------------------------------
 
-function TabChip({ tab, active, onMenu }: { tab: ShellTab; active: boolean; onMenu: (e: ReactMouseEvent, tab: ShellTab) => void }) {
+function TabChip({
+  tab,
+  index,
+  total,
+  active,
+  draggingId,
+  dropTarget,
+  setTabRef,
+  onDragStartTab,
+  onDragEndTab,
+  onDragOverTab,
+  onDropTab,
+  onMenu,
+}: {
+  tab: ShellTab;
+  index: number;
+  total: number;
+  active: boolean;
+  draggingId: string | null;
+  dropTarget: { id: string; side: "before" | "after" } | null;
+  setTabRef: (el: HTMLDivElement | null) => void;
+  onDragStartTab: (e: ReactDragEvent<HTMLDivElement>, id: string) => void;
+  onDragEndTab: () => void;
+  onDragOverTab: (e: ReactDragEvent<HTMLDivElement>, id: string) => void;
+  onDropTab: (e: ReactDragEvent<HTMLDivElement>, index: number) => void;
+  onMenu: (e: ReactMouseEvent, tab: ShellTab) => void;
+}) {
   const agent = useAgent(tab.kind === "agent" ? tab.agentKey : null);
   const devices = liveStore.use((s) => s.devices);
   const group = agent ? listGroup(agent, devices) : null;
   const title =
     tab.kind === "agent" ? (agent ? agentTitle(agent) : "已结束的 Agent") : tab.title === "about:blank" ? "新网页" : tab.title;
+  const side = dropTarget?.id === tab.id ? dropTarget.side : null;
   return (
     <div
+      ref={setTabRef}
       role="tab"
       aria-selected={active}
       tabIndex={active ? 0 : -1}
-      className={`v3-tab${active ? " active" : ""}${tab.kind === "agent" && !agent ? " gone" : ""}`}
-      title={tab.kind === "agent" ? (agent ? spacedTitle(agent) : title) : tab.kind === "file" ? tab.path : tab.url}
+      draggable={total > 1}
+      data-tauri-drag-region="false"
+      className={`v3-tab${active ? " active" : ""}${tab.kind === "agent" && !agent ? " gone" : ""}${draggingId === tab.id ? " dragging" : ""}${side ? ` drop-${side}` : ""}`}
+      title={
+        tab.kind === "agent"
+          ? agent
+            ? spacedTitle(agent)
+            : title
+          : tab.kind === "file"
+            ? tab.path
+            : tab.kind === "diff"
+              ? `${tab.path} (${tab.staged ? "已暂存" : "工作区"})`
+              : tab.url
+      }
       onClick={() => setActiveTab(tab.id)}
       onAuxClick={(e) => e.button === 1 && closeShellTab(tab)}
       onContextMenu={(e) => onMenu(e, tab)}
+      onDragStart={(e) => onDragStartTab(e, tab.id)}
+      onDragEnd={onDragEndTab}
+      onDragOver={(e) => onDragOverTab(e, tab.id)}
+      onDrop={(e) => onDropTab(e, index)}
     >
       {tab.kind === "agent" ? (
         agent ? <VendorIcon harness={agent.harness} isShell={agent.isShell} size={14} /> : <File size={14} />
       ) : tab.kind === "file" ? (
         <FileText size={14} />
+      ) : tab.kind === "diff" ? (
+        <GitBranch size={14} />
       ) : (
         <Globe size={14} />
       )}
@@ -135,17 +197,69 @@ function MenuItem({ label, keys, icon: Icon, onClick, disabled }: { label: strin
 export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTerminal: () => void; onNewAgent: () => void; padForLights: boolean }) {
   const toast = useToast();
   const tabs = shellStore.use((s) => s.tabs);
-  const active = shellStore.use((s) => s.active);
+  const rawActive = shellStore.use((s) => s.active);
+  const selectedSpace = shellStore.use((s) => s.selectedSpace);
+  const activeBySpace = shellStore.use((s) => s.activeBySpace);
   const panel = shellStore.use((s) => s.panel);
+  const agentsMap = liveStore.use((s) => s.agents);
   const homePage = useClientConfig().browser.homePage;
   const [menu, setMenu] = useState<{ x: number; y: number; tab: ShellTab } | null>(null);
   const [newMenu, setNewMenu] = useState<{ x: number; y: number } | null>(null);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; side: "before" | "after" } | null>(null);
+  const [fileDropOver, setFileDropOver] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const tabElsRef = useRef(new Map<string, HTMLDivElement>());
+  const prevRectsRef = useRef(new Map<string, number>());
+
+  const agentByKey = useMemo(() => new Map(allAgents(agentsMap).map((a) => [a.key, a] as const)), [agentsMap]);
+  const lookupAgent = useCallback((k: string) => agentByKey.get(k), [agentByKey]);
+  const visibleTabs = useMemo(
+    () => visibleTabsForSpace(tabs, selectedSpace, lookupAgent),
+    [lookupAgent, selectedSpace, tabs],
+  );
+  const active = useMemo(
+    () => activeTabIdForSpace({ tabs, active: rawActive, selectedSpace, activeBySpace }, lookupAgent),
+    [activeBySpace, lookupAgent, rawActive, selectedSpace, tabs],
+  );
+  const selSpaceLabel = useMemo(() => {
+    if (!selectedSpace) return null;
+    const [, sp] = selectedSpace.split("\u0000");
+    return sp || "未分空间";
+  }, [selectedSpace]);
 
   // Keep the active chip in view, as Herdr does.
   useEffect(() => {
     scrollRef.current?.querySelector<HTMLElement>(".v3-tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [active, tabs.length]);
+  }, [active, visibleTabs.length]);
+
+  // Smooth FLIP slide animation whenever visible tabs reorder or insert.
+  useLayoutEffect(() => {
+    const reduced = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const nextRects = new Map<string, number>();
+    for (const t of visibleTabs) {
+      const el = tabElsRef.current.get(t.id);
+      if (el) nextRects.set(t.id, el.getBoundingClientRect().left);
+    }
+    if (!reduced && prevRectsRef.current.size > 0) {
+      for (const t of visibleTabs) {
+        const el = tabElsRef.current.get(t.id);
+        const prevLeft = prevRectsRef.current.get(t.id);
+        const nextLeft = nextRects.get(t.id);
+        if (!el || prevLeft === undefined || nextLeft === undefined) continue;
+        const dx = prevLeft - nextLeft;
+        if (Math.abs(dx) < 1) continue;
+        el.style.transition = "none";
+        el.style.transform = `translateX(${dx}px)`;
+        el.getBoundingClientRect();
+        requestAnimationFrame(() => {
+          el.style.transition = "transform 180ms cubic-bezier(0.22, 1, 0.36, 1)";
+          el.style.transform = "";
+        });
+      }
+    }
+    prevRectsRef.current = nextRects;
+  }, [visibleTabs]);
 
   const panelBtn = (id: PanelId, label: string, Icon: typeof Plus, keys?: string) => (
     <button
@@ -159,8 +273,140 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
     </button>
   );
 
+  const onDragStartTab = (e: ReactDragEvent<HTMLDivElement>, id: string) => {
+    setDraggingId(id);
+    startTabDrag(e, id);
+  };
+
+  const onDragEndTab = () => {
+    setDraggingId(null);
+    setDropTarget(null);
+    endTabDrag();
+  };
+
+  const onDragOverTab = (e: ReactDragEvent<HTMLDivElement>, id: string) => {
+    if (hasWorkspaceDrag(e)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      setFileDropOver(true);
+      return;
+    }
+    if (!hasTabDrag(e) && !hasPanelDrag(e)) return;
+    if (id === draggingId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const rect = e.currentTarget.getBoundingClientRect();
+    const side: "before" | "after" = e.clientX - rect.left < rect.width / 2 ? "before" : "after";
+    setDropTarget((prev) => (prev?.id === id && prev.side === side ? prev : { id, side }));
+  };
+
+  const handleDropAt = (e: ReactDragEvent<HTMLDivElement>, targetTabId?: string, side?: "before" | "after") => {
+    setFileDropOver(false);
+    const wsItem = readWorkspaceDrag(e);
+    if (wsItem) {
+      e.preventDefault();
+      e.stopPropagation();
+      endWorkspaceDrag();
+      if (wsItem.kind === "file") {
+        openFileTab(wsItem.agentKey, wsItem.relPath, wsItem.name, { absPath: wsItem.absPath, spaceKey: selectedSpace });
+      } else {
+        toast("拖入文件可直接打开标签，文件夹请拖入对话输入框引用");
+      }
+      return;
+    }
+
+    const panelItem = readPanelDrag(e);
+    if (panelItem) {
+      e.preventDefault();
+      e.stopPropagation();
+      endPanelDrag();
+      setDropTarget(null);
+      let insertBeforeId: string | undefined;
+      if (targetTabId && side) {
+        const idx = tabs.findIndex((t) => t.id === targetTabId);
+        if (idx >= 0) {
+          insertBeforeId = side === "before" ? targetTabId : tabs[idx + 1]?.id;
+        }
+      }
+      if (panelItem.kind === "browser") {
+        openWebTab(panelItem.url, panelItem.title, {
+          spaceKey: panelItem.spaceKey ?? selectedSpace,
+          insertBeforeId,
+        });
+        if (shellStore.get().panel === "browser") showPanel(null);
+      } else if (panelItem.kind === "agent") {
+        openAgentTab(panelItem.agentKey);
+        if (targetTabId && side) {
+          moveTabRelative(`a:${panelItem.agentKey}`, targetTabId, side);
+        }
+      }
+      return;
+    }
+
+    const fromId = readTabDrag(e) ?? draggingId;
+    if (!fromId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (targetTabId && side) {
+      moveTabRelative(fromId, targetTabId, side);
+    } else if (visibleTabs.length > 0) {
+      moveTabRelative(fromId, visibleTabs[visibleTabs.length - 1]!.id, "after");
+    } else {
+      moveTab(fromId, tabs.length - 1);
+    }
+    onDragEndTab();
+  };
+
+  const onDropTab = (e: ReactDragEvent<HTMLDivElement>, targetIdx: number) => {
+    const target = visibleTabs[targetIdx];
+    const side = target && dropTarget?.id === target.id ? dropTarget.side : "before";
+    handleDropAt(e, target?.id, side);
+  };
+
+  const openPickedLocalFile = async () => {
+    const path = await native.pickFile();
+    if (!path) return;
+    const title = path.split(/[\\/]/).pop() || path;
+    openFileTab("local", path, title, { absPath: path, spaceKey: selectedSpace });
+  };
+
   return (
-    <div className={`v3-tabs${padForLights ? " lights" : ""}`} data-tauri-drag-region="deep">
+    <div
+      className={`v3-tabs${padForLights ? " lights" : ""}${fileDropOver ? " drop-over" : ""}`}
+      data-tauri-drag-region="deep"
+      onDragOver={(e) => {
+        if (hasWorkspaceDrag(e)) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+          setFileDropOver(true);
+        } else if (hasTabDrag(e) || hasPanelDrag(e)) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+        }
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setFileDropOver(false);
+          setDropTarget(null);
+        }
+      }}
+      onDrop={(e) => handleDropAt(e)}
+    >
+      {selSpaceLabel ? (
+        <span className="v3-space-scope-chip" data-tauri-drag-region="false" title={`当前仅显示空间「${selSpaceLabel}」的标签页`}>
+          <Layers size={11} />
+          <span className="truncate">{selSpaceLabel}</span>
+          <button
+            type="button"
+            className="v3-space-scope-x"
+            aria-label="显示全部空间的标签"
+            title="取消空间筛选，显示全部标签"
+            onClick={() => setSelectedSpace(null, lookupAgent)}
+          >
+            <X size={10} />
+          </button>
+        </span>
+      ) : null}
       <div
         ref={scrollRef}
         className="v3-tab-scroll"
@@ -170,8 +416,25 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
           if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY;
         }}
       >
-        {tabs.map((t) => (
-          <TabChip key={t.id} tab={t} active={t.id === active} onMenu={(e, tab) => (e.preventDefault(), setMenu({ x: e.clientX, y: e.clientY, tab }))} />
+        {visibleTabs.map((t, i) => (
+          <TabChip
+            key={t.id}
+            tab={t}
+            index={i}
+            total={visibleTabs.length}
+            active={t.id === active}
+            draggingId={draggingId}
+            dropTarget={dropTarget}
+            setTabRef={(el) => {
+              if (el) tabElsRef.current.set(t.id, el);
+              else tabElsRef.current.delete(t.id);
+            }}
+            onDragStartTab={onDragStartTab}
+            onDragEndTab={onDragEndTab}
+            onDragOverTab={onDragOverTab}
+            onDropTab={onDropTab}
+            onMenu={(e, tab) => (e.preventDefault(), setMenu({ x: e.clientX, y: e.clientY, tab }))}
+          />
         ))}
       </div>
       <button
@@ -188,6 +451,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       </button>
       <div className="v3-tabs-right">
         {panelBtn("files", "文件", FolderTree, shortcutText("togglePanel"))}
+        {panelBtn("git", "Git", GitBranch, shortcutText("toggleGit"))}
         {panelBtn("browser", "浏览器", Globe)}
         {panelBtn("assistant", "小羊", Sparkles, shortcutText("assistant"))}
       </div>
@@ -196,8 +460,11 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
         <Popup x={newMenu.x} y={newMenu.y} onClose={() => setNewMenu(null)}>
           <MenuItem label="新建终端" icon={Terminal} keys={shortcutText("newAgent")} onClick={() => (setNewMenu(null), onNewTerminal())} />
           <MenuItem label="新建 Agent…" icon={Plus} onClick={() => (setNewMenu(null), onNewAgent())} />
-          <MenuItem label="打开网页" icon={Globe} onClick={() => (setNewMenu(null), openWebTab(homePage || "about:blank"))} />
-          <MenuItem label="打开文件" icon={FolderTree} onClick={() => (setNewMenu(null), showPanel("files"))} />
+          <MenuItem label="打开网页" icon={Globe} onClick={() => (setNewMenu(null), openWebTab(homePage || "about:blank", undefined, { spaceKey: selectedSpace }))} />
+          {native.available() ? (
+            <MenuItem label="打开本地文件…" icon={FolderOpen} onClick={() => { setNewMenu(null); void openPickedLocalFile(); }} />
+          ) : null}
+          <MenuItem label="浏览工作区文件" icon={FolderTree} onClick={() => (setNewMenu(null), showPanel("files"))} />
         </Popup>
       ) : null}
       {menu ? (
@@ -205,23 +472,23 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
           <MenuItem label="关闭" keys={shortcutText("closeTab")} onClick={() => (setMenu(null), closeShellTab(menu.tab))} />
           <MenuItem
             label="关闭其他"
-            disabled={tabs.length < 2}
+            disabled={visibleTabs.length < 2}
             onClick={() => {
               setMenu(null);
-              for (const t of tabs) if (t.id !== menu.tab.id) closeShellTab(t);
+              for (const t of visibleTabs) if (t.id !== menu.tab.id) closeShellTab(t);
             }}
           />
           <MenuItem
             label="关闭右侧"
-            disabled={tabs.findIndex((t) => t.id === menu.tab.id) === tabs.length - 1}
+            disabled={visibleTabs.findIndex((t) => t.id === menu.tab.id) === visibleTabs.length - 1}
             onClick={() => {
               setMenu(null);
-              const i = tabs.findIndex((t) => t.id === menu.tab.id);
-              for (const t of tabs.slice(i + 1)) closeShellTab(t);
+              const i = visibleTabs.findIndex((t) => t.id === menu.tab.id);
+              for (const t of visibleTabs.slice(i + 1)) closeShellTab(t);
             }}
           />
           {menu.tab.kind !== "agent" ? <div className="menu-sep" /> : null}
-          {menu.tab.kind === "file" ? (
+          {menu.tab.kind === "file" || menu.tab.kind === "diff" ? (
             <MenuItem label="复制路径" onClick={() => (setMenu(null), void copyToClipboard((menu.tab as { path: string }).path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok)))} />
           ) : null}
           {menu.tab.kind === "web" ? (
@@ -271,53 +538,178 @@ function PaneHead({
   agent,
   mode,
   onModeChange,
+  subHead,
+  fileHead,
   onClose,
 }: {
   tab: ShellTab;
   agent: Agent | undefined;
   mode?: AgentPaneMode;
   onModeChange?: (m: AgentPaneMode) => void;
+  subHead?: SubagentHeadInfo | null;
+  fileHead?: FileViewerHeadState | null;
   onClose: () => void;
 }) {
+  const toast = useToast();
   const devices = liveStore.use((s) => s.devices);
   const group = agent ? listGroup(agent, devices) : null;
   let icon: React.ReactNode;
   let name: string;
   let sub: string;
+  let subTitle = "";
   if (tab.kind === "agent") {
     icon = agent ? <VendorIcon harness={agent.harness} isShell={agent.isShell} size={14} /> : <File size={14} />;
     name = agent ? spacedTitle(agent) : "这个 Agent 已经结束了";
     sub = agent ? homeFolder(agent.cwd) || agent.where || "" : "";
+    subTitle = sub;
   } else if (tab.kind === "file") {
     icon = <FileText size={14} />;
     name = tab.title;
-    sub = tab.path === tab.title ? "" : tab.path;
+    const normPath = tab.path.replace(/\\/g, "/");
+    const slash = normPath.lastIndexOf("/");
+    sub = slash > 0 ? normPath.slice(0, slash) : "";
+    subTitle = tab.absPath || tab.path;
+  } else if (tab.kind === "diff") {
+    icon = <GitBranch size={14} />;
+    name = tab.title;
+    sub = tab.commit ? `提交 ${tab.commit.slice(0, 7)}` : tab.staged ? "暂存区变更" : "工作区变更";
+    subTitle = tab.path;
   } else {
     icon = <Globe size={14} />;
     name = tab.title === "about:blank" ? "新网页" : tab.title;
     sub = tab.url === "about:blank" ? "" : tab.url;
+    subTitle = sub;
   }
+  const lineBadge =
+    tab.kind === "file" && tab.line
+      ? tab.endLine && tab.endLine !== tab.line
+        ? `L${tab.line}–${tab.endLine}`
+        : `L${tab.line}`
+      : null;
+  const sizeText =
+    tab.kind === "file" && fileHead && fileHead.size !== null
+      ? fileHead.size >= 1024
+        ? `${Math.round(fileHead.size / 1024)} KB`
+        : `${fileHead.size} B`
+      : null;
+  const inSubView = Boolean(tab.kind === "agent" && agent && subHead && subHead.trail.length > 0);
+  const previewToggleable = Boolean(tab.kind === "file" && (fileHead?.canPreview || fileHead?.isMd));
+
   return (
     <div className="v3-pane-head">
       {icon}
-      <span className="v3-pane-name truncate">{name}</span>
-      <span className="v3-pane-sub truncate" title={sub}>{sub}</span>
-      {group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
-      {group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
+      {inSubView && agent && subHead ? (
+        <SubagentHeaderLineage
+          mainTitle={name}
+          trail={subHead.trail}
+          rootSubs={subHead.rootSubs}
+          activeSubs={subHead.activeSubs}
+          deviceId={agent.deviceId}
+          agentKey={agent.key}
+          onGoRoot={subHead.onGoRoot}
+          onSelectCrumbIndex={subHead.onSelectCrumbIndex}
+          onSelectSub={subHead.onSelectSub}
+          onOpenAside={subHead.onOpenAside}
+        />
+      ) : (
+        <>
+          <span className="v3-pane-name truncate" title={subTitle || name}>{name}</span>
+          <span className="v3-pane-sub truncate" title={subTitle}>{sub}</span>
+        </>
+      )}
+      {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
+      {sizeText ? <span className="v3-pane-pill num">{sizeText}</span> : null}
+      {tab.kind === "agent" && agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
+        <SubagentCatalogTrigger
+          compact
+          deviceId={agent.deviceId}
+          agentKey={agent.key}
+          knownCount={subHead.knownCount}
+          subs={subHead.rootSubs}
+          onSelectSub={subHead.onSelectSub}
+          onOpenAside={subHead.onOpenAside}
+          onRefresh={subHead.onRefresh}
+        />
+      ) : null}
+      {tab.kind === "agent" && group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
+      {tab.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
       {tab.kind === "agent" && agent && mode && onModeChange ? <ModeSwitchIcons mode={mode} onModeChange={onModeChange} /> : null}
-      <button className="v3-icon-btn small hover-only" aria-label="关闭标签" title={`关闭标签（${shortcutText("closeTab")}）`} onClick={onClose}>
+      {previewToggleable && fileHead ? (
+        <div className="v3-mode-switch" role="group" aria-label="视图">
+          <button
+            type="button"
+            className={`v3-mode-btn v3-pane-mode-text${fileHead.preview ? " on" : ""}`}
+            aria-pressed={fileHead.preview}
+            onClick={() => fileHead.setPreview(true)}
+          >
+            {fileHead.previewLabel || "预览"}
+          </button>
+          <button
+            type="button"
+            className={`v3-mode-btn v3-pane-mode-text${!fileHead.preview ? " on" : ""}`}
+            aria-pressed={!fileHead.preview}
+            onClick={() => fileHead.setPreview(false)}
+          >
+            源码
+          </button>
+        </div>
+      ) : null}
+      {tab.kind === "file" ? (
+        <button
+          className="v3-icon-btn small"
+          aria-label="复制路径"
+          title={`复制路径（${tab.absPath || tab.path}）`}
+          onClick={() => {
+            void copyToClipboard(tab.absPath || tab.path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok));
+          }}
+        >
+          <Copy size={13} />
+        </button>
+      ) : null}
+      <button className="v3-icon-btn small" aria-label="关闭标签" title={`关闭标签（${shortcutText("closeTab")}）`} onClick={onClose}>
         <X size={13} />
       </button>
     </div>
   );
 }
 
+function FilePane({ tab, agent }: { tab: FileTab; agent: Agent | undefined }) {
+  const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
+  return (
+    <section className="v3-pane" aria-label={tab.title}>
+      <PaneHead tab={tab} agent={agent} fileHead={fileHead} onClose={() => closeShellTab(tab)} />
+      <div className="v3-pane-body">
+        <FileViewer key={tab.id} tab={tab} agent={agent} embedded onHeadState={setFileHead} />
+      </div>
+    </section>
+  );
+}
+
+function DiffPane({ tab }: { tab: DiffTab }) {
+  return (
+    <section className="v3-pane" aria-label={tab.title}>
+      <PaneHead tab={tab} agent={undefined} onClose={() => closeShellTab(tab)} />
+      <div className="v3-pane-body">
+        <DiffTabView key={tab.id} tab={tab} />
+      </div>
+    </section>
+  );
+}
+
 function AgentPane({ tab, agentKey }: { tab: AgentTab; agentKey: string }) {
   const agent = useAgent(agentKey);
   const mode = resolveAgentMode(tab.mode, agent);
+  const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
   return (
     <section className="v3-pane" aria-label={agent ? spacedTitle(agent) : "Agent"}>
-      <PaneHead tab={tab} agent={agent} mode={mode} onModeChange={(m) => setAgentTabMode(tab.id, m)} onClose={() => closeShellTab(tab)} />
+      <PaneHead
+        tab={tab}
+        agent={agent}
+        mode={mode}
+        subHead={subHead}
+        onModeChange={(m) => setAgentTabMode(tab.id, m)}
+        onClose={() => closeShellTab(tab)}
+      />
       <div className="v3-pane-body">
         {agent ? (
           <AgentDetailPanel
@@ -326,6 +718,7 @@ function AgentPane({ tab, agentKey }: { tab: AgentTab; agentKey: string }) {
             embedded
             mode={mode}
             onModeChange={(m) => setAgentTabMode(tab.id, m)}
+            onSubHeadChange={setSubHead}
             onBack={() => closeShellTab(tab)}
             onOpenWorkbench={() => showPanel("files")}
           />
@@ -344,6 +737,7 @@ function AgentPane({ tab, agentKey }: { tab: AgentTab; agentKey: string }) {
 
 function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; onNewAgent: () => void }) {
   const homePage = useClientConfig().browser.homePage;
+  const [dropOver, setDropOver] = useState(false);
   const rows: Array<{ label: string; keys?: string; run: () => void }> = [
     { label: "新建终端", keys: shortcutText("newAgent"), run: onNewTerminal },
     { label: "新建 Agent…", run: onNewAgent },
@@ -351,7 +745,29 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
     { label: "命令面板", keys: shortcutText("palette"), run: () => setPalette("command") },
   ];
   return (
-    <section className="v3-pane v3-pane-blank" aria-label="没有打开的标签">
+    <section
+      className={`v3-pane v3-pane-blank${dropOver ? " drop-over" : ""}`}
+      aria-label="没有打开的标签"
+      onDragOver={(e) => {
+        if (!hasWorkspaceDrag(e)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+        setDropOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropOver(false);
+      }}
+      onDrop={(e) => {
+        setDropOver(false);
+        const wsItem = readWorkspaceDrag(e);
+        if (!wsItem) return;
+        e.preventDefault();
+        endWorkspaceDrag();
+        if (wsItem.kind === "file") {
+          openFileTab(wsItem.agentKey, wsItem.relPath, wsItem.name, { absPath: wsItem.absPath });
+        }
+      }}
+    >
       <div className="v3-blank">
         <div className="v3-blank-mascot">
           <XiaoyangOrb mood="hello" size={72} />
@@ -373,7 +789,16 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
 
 export function ShellMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; onNewAgent: () => void }) {
   const tabs = shellStore.use((s) => s.tabs);
-  const activeId = shellStore.use((s) => s.active);
+  const rawActive = shellStore.use((s) => s.active);
+  const selectedSpace = shellStore.use((s) => s.selectedSpace);
+  const activeBySpace = shellStore.use((s) => s.activeBySpace);
+  const agentsMap = liveStore.use((s) => s.agents);
+  const agentByKey = useMemo(() => new Map(allAgents(agentsMap).map((a) => [a.key, a] as const)), [agentsMap]);
+  const lookupAgent = useCallback((k: string) => agentByKey.get(k), [agentByKey]);
+  const activeId = useMemo(
+    () => activeTabIdForSpace({ tabs, active: rawActive, selectedSpace, activeBySpace }, lookupAgent),
+    [activeBySpace, lookupAgent, rawActive, selectedSpace, tabs],
+  );
   const active = tabs.find((t) => t.id === activeId) ?? null;
   const fileAgent = useAgent(active?.kind === "file" ? active.agentKey : null);
 
@@ -381,14 +806,8 @@ export function ShellMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => 
     <div className="v3-main">
       {!active ? <EmptyMain onNewTerminal={onNewTerminal} onNewAgent={onNewAgent} /> : null}
       {active?.kind === "agent" ? <AgentPane key={active.id} tab={active} agentKey={active.agentKey} /> : null}
-      {active?.kind === "file" ? (
-        <section className="v3-pane" aria-label={active.title}>
-          <PaneHead tab={active} agent={undefined} onClose={() => closeShellTab(active)} />
-          <div className="v3-pane-body">
-            <FileViewer key={active.id} tab={active} agent={fileAgent} />
-          </div>
-        </section>
-      ) : null}
+      {active?.kind === "file" ? <FilePane key={active.id} tab={active} agent={fileAgent} /> : null}
+      {active?.kind === "diff" ? <DiffPane key={active.id} tab={active} /> : null}
       {/* Web pages stay mounted so their native views keep their pages. */}
       {tabs.map((t) =>
         t.kind === "web" ? (
@@ -406,7 +825,7 @@ export function ShellMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => 
 
 // Side panel -----------------------------------------------------------------------
 
-const PANEL_TITLE: Record<PanelId, string> = { files: "文件", browser: "浏览器", assistant: "小羊" };
+const PANEL_TITLE: Record<PanelId, string> = { files: "文件", git: "Git 管理", browser: "浏览器", assistant: "小羊", subagent: "子 Agent" };
 
 /** Resolves the Space and backing Agent for the right-hand Files panel without any Agent dropdown. */
 function useFilesTarget() {
@@ -461,6 +880,73 @@ function useFilesTarget() {
   return resolved;
 }
 
+function useGitTarget() {
+  const filesTarget = useFilesTarget();
+  const tabs = shellStore.use((s) => s.tabs);
+  const activeId = shellStore.use((s) => s.active);
+  const selectedSpace = shellStore.use((s) => s.selectedSpace);
+  const spacesMap = liveStore.use((s) => s.spaces);
+  const devices = liveStore.use((s) => s.devices);
+  const active = tabs.find((t) => t.id === activeId);
+
+  return useMemo(() => {
+    if (active?.kind === "diff") {
+      return {
+        deviceId: active.deviceId,
+        agent: filesTarget.agent,
+        cwd: active.cwd,
+        spaceName: active.cwd.split(/[\\/]/).filter(Boolean).pop() || "",
+        spaceKey: active.spaceKey ?? selectedSpace,
+      };
+    }
+    if (selectedSpace) {
+      const [devId, spName] = selectedSpace.split("\u0000") as [string, string];
+      const spInfo = (spacesMap[devId] ?? []).find((s) => s.name === spName);
+      if (filesTarget.fromSelectedSpace && filesTarget.agent?.cwd) {
+        return {
+          deviceId: filesTarget.agent.deviceId,
+          agent: filesTarget.agent,
+          cwd: filesTarget.agent.cwd,
+          spaceName: spName || filesTarget.spaceName,
+          spaceKey: selectedSpace,
+        };
+      }
+      if (spInfo?.folder) {
+        return {
+          deviceId: devId,
+          agent: undefined,
+          cwd: spInfo.folder,
+          spaceName: spInfo.name,
+          spaceKey: selectedSpace,
+        };
+      }
+    }
+    if (filesTarget.agent?.cwd) {
+      return {
+        deviceId: filesTarget.agent.deviceId,
+        agent: filesTarget.agent,
+        cwd: filesTarget.agent.cwd,
+        spaceName: filesTarget.spaceName,
+        spaceKey: selectedSpace,
+      };
+    }
+    for (const [devId, list] of Object.entries(spacesMap)) {
+      if (devices[devId]?.online === false) continue;
+      const hit = list.find((s) => s.folder);
+      if (hit) {
+        return {
+          deviceId: devId,
+          agent: undefined,
+          cwd: hit.folder,
+          spaceName: hit.name,
+          spaceKey: `${devId}\u0000${hit.name}`,
+        };
+      }
+    }
+    return { deviceId: undefined, agent: undefined, cwd: undefined, spaceName: "", spaceKey: selectedSpace };
+  }, [active, devices, filesTarget, selectedSpace, spacesMap]);
+}
+
 function FilesPanel({ agent, spaceName, fromSelectedSpace }: ReturnType<typeof useFilesTarget>) {
   if (!agent) {
     return (
@@ -480,16 +966,175 @@ function FilesPanel({ agent, spaceName, fromSelectedSpace }: ReturnType<typeof u
 
 const PANEL_WEB_ID = "panel-web";
 
-function BrowserPanel() {
+function BrowserPanel({
+  url,
+  onMetaChange,
+}: {
+  url: string;
+  onMetaChange: (meta: { url: string; title: string }) => void;
+}) {
   const homePage = useClientConfig().browser.homePage;
-  const [url, setUrl] = useState(homePage || "about:blank");
+  const [title, setTitle] = useState(url);
   return (
     <div className="v3-panel-web">
-      <WebPane tab={{ id: PANEL_WEB_ID, url: homePage || "about:blank" }} active onChange={(p) => p.url && setUrl(p.url)} />
-      <button className="v3-mini-btn v3-panel-web-pop" onClick={() => openWebTab(url, url)} title="在标签里打开这个网页">
+      <WebPane
+        tab={{ id: PANEL_WEB_ID, url: homePage || "about:blank" }}
+        active
+        onChange={(p) => {
+          const nextUrl = p.url ?? url;
+          const nextTitle = p.title ?? (p.url ? p.url : title);
+          if (p.title) setTitle(p.title);
+          onMetaChange({ url: nextUrl, title: nextTitle });
+        }}
+      />
+      <button
+        className="v3-mini-btn v3-panel-web-pop"
+        onClick={() => {
+          openWebTab(url, title || url);
+          showPanel(null);
+        }}
+        title="在顶部标签页打开此网页，或直接拖动标题栏放入"
+      >
         <SquareArrowOutUpRight size={12} />
-        <span>在标签中打开</span>
+        <span>放入标签栏</span>
       </button>
+    </div>
+  );
+}
+
+function SubagentAsidePanel() {
+  const aside = shellStore.use((s) => s.subagentAside);
+  const parentAgent = useAgent(aside?.agentKey);
+  const chatDisplayMode = settingsStore.use((s) => s.chatDisplayMode);
+  const [trail, setTrail] = useState<SubSession[]>(aside?.trail ?? []);
+  const [events, setEvents] = useState<ConvEvent[]>([]);
+  const [rootSubs, setRootSubs] = useState<SubSession[]>([]);
+  const [childSubs, setChildSubs] = useState<SubSession[]>([]);
+
+  useEffect(() => {
+    setTrail(aside?.trail ?? (aside?.sub ? [aside.sub] : []));
+  }, [aside]);
+
+  const current = trail[trail.length - 1] ?? aside?.sub ?? null;
+
+  useEffect(() => {
+    if (!parentAgent || !aside) return;
+    let alive = true;
+    void rpcCall(parentAgent.deviceId, "session.children", { agent: aside.agentKey })
+      .then((res) => {
+        if (alive) setRootSubs(res.sessions);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [aside, parentAgent]);
+
+  useEffect(() => {
+    if (!parentAgent || !aside || !current) {
+      setEvents([]);
+      setChildSubs([]);
+      return;
+    }
+    let alive = true;
+    let live = false;
+    setEvents([]);
+    setChildSubs([]);
+
+    void rpcCall(parentAgent.deviceId, "session.events", { agent: aside.agentKey, sub: current.key, limit: 200 })
+      .then((res) => {
+        if (alive) setEvents((prev) => mergeConvEvents(prev, res.events));
+      })
+      .catch(() => {});
+
+    void rpcCall(parentAgent.deviceId, "session.children", { agent: aside.agentKey, sub: current.key })
+      .then((res) => {
+        if (alive) setChildSubs(res.sessions);
+      })
+      .catch(() => {});
+
+    const unsub = subscribeStream(
+      parentAgent.deviceId,
+      "session",
+      { agent: aside.agentKey, sub: current.key },
+      (ev) => {
+        if (!alive || !ev) return;
+        if ((ev.kind === "session" || ev.kind === "session_event") && ev.event) {
+          setEvents((prev) => mergeConvEvents(prev, [ev.event as ConvEvent]));
+        }
+      },
+      (st) => {
+        if (alive) live = st?.kind === "live";
+      },
+    );
+
+    const timer = window.setInterval(() => {
+      if (!alive || live) return;
+      void rpcCall(parentAgent.deviceId, "session.events", { agent: aside.agentKey, sub: current.key, limit: 120 })
+        .then((res) => {
+          if (alive) setEvents((prev) => mergeConvEvents(prev, res.events));
+        })
+        .catch(() => {});
+    }, 3_000);
+
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+      unsub();
+    };
+  }, [aside, current, parentAgent]);
+
+  const foldedRows = useMemo(() => foldConvEvents(events, chatDisplayMode), [chatDisplayMode, events]);
+
+  if (!aside || !parentAgent || !current) {
+    return <div className="v3-empty-line">从对话里的子 Agent 树或工具卡片右上角点开后，可在这里并排查看运行记录。</div>;
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+      <div className="sub-aside-bar">
+        <SubagentHeaderLineage
+          mainTitle={spacedTitle(parentAgent)}
+          trail={trail}
+          rootSubs={rootSubs}
+          activeSubs={childSubs}
+          deviceId={parentAgent.deviceId}
+          agentKey={aside.agentKey}
+          onGoRoot={() => {
+            openAgentTab(aside.agentKey, "chat");
+            showPanel(null);
+          }}
+          onSelectCrumbIndex={(idx) => setTrail((prev) => prev.slice(0, idx + 1))}
+          onSelectSub={(s, anc) => setTrail([...anc, s])}
+          onOpenAside={(s, anc) => setTrail([...anc, s])}
+        />
+      </div>
+      <div className="chat-scroll agent-chat" style={{ flex: 1, minHeight: 0 }}>
+        {foldedRows.length === 0 ? (
+          <div className="v3-empty-line">正在同步子 Agent「{subLabel(current)}」的对白与工具步骤…</div>
+        ) : (
+          <ChatTimelineRows
+            rows={foldedRows}
+            subs={childSubs}
+            agentKey={parentAgent.key}
+            deviceId={parentAgent.deviceId}
+            cwd={parentAgent.cwd}
+            onOpenSub={(s) => setTrail((prev) => [...prev, s])}
+            onOpenSubAside={(s) => setTrail((prev) => [...prev, s])}
+            onOpenFile={(target) => {
+              openAgentFileTarget(parentAgent, target);
+            }}
+          />
+        )}
+      </div>
+      <SubagentReadOnlyBar
+        current={current}
+        inSidebar
+        onBackMain={() => {
+          openAgentTab(aside.agentKey, "chat");
+          showPanel(null);
+        }}
+      />
     </div>
   );
 }
@@ -497,8 +1142,15 @@ function BrowserPanel() {
 export function ShellPanel() {
   const panel = shellStore.use((s) => s.panel);
   const width = shellStore.use((s) => s.panelWidth);
+  const aside = shellStore.use((s) => s.subagentAside);
+  const homePage = useClientConfig().browser.homePage;
   const filesTarget = useFilesTarget();
+  const gitTarget = useGitTarget();
   const drag = useRef<{ x: number; w: number } | null>(null);
+  const [browserMeta, setBrowserMeta] = useState<{ url: string; title: string }>({
+    url: homePage || "about:blank",
+    title: "浏览器",
+  });
 
   // The browser panel's native view closes with the panel.
   useEffect(() => {
@@ -516,7 +1168,17 @@ export function ShellPanel() {
   const onUp = () => {
     drag.current = null;
   };
-  const showSpace = panel === "files" && Boolean(filesTarget.spaceName);
+  const subTitleText =
+    panel === "files" && filesTarget.spaceName
+      ? filesTarget.spaceName
+      : panel === "git" && gitTarget.spaceName
+        ? gitTarget.spaceName
+        : panel === "subagent" && aside
+          ? subLabel(aside.sub)
+          : panel === "browser"
+            ? "可拖到顶部标签栏"
+            : "";
+  const showSub = Boolean(subTitleText);
 
   return (
     <aside className="v3-panel" style={{ width }} aria-label={PANEL_TITLE[panel]}>
@@ -530,17 +1192,49 @@ export function ShellPanel() {
         onPointerUp={onUp}
         onDoubleClick={() => setPanelWidth(368)}
       />
-      <div className="v3-pane-head">
-        {panel === "files" ? <FolderTree size={14} /> : panel === "browser" ? <Globe size={14} /> : <Sparkles size={14} />}
-        <span className={`v3-pane-name${showSpace ? "" : " grow"}`}>{PANEL_TITLE[panel]}</span>
-        {showSpace ? <span className="v3-pane-sub grow truncate" title={filesTarget.spaceName}>{filesTarget.spaceName}</span> : null}
+      <div
+        className={`v3-pane-head${panel === "browser" ? " draggable" : ""}`}
+        draggable={panel === "browser"}
+        title={panel === "browser" ? "拖动标题栏到顶部标签栏，即可固定为标签页" : undefined}
+        onDragStart={(e) => {
+          if (panel !== "browser") return;
+          startPanelDrag(e, {
+            kind: "browser",
+            url: browserMeta.url || homePage || "about:blank",
+            title: browserMeta.title || browserMeta.url || "网页",
+          });
+        }}
+        onDragEnd={() => endPanelDrag()}
+      >
+        {panel === "files" ? (
+          <FolderTree size={14} />
+        ) : panel === "git" ? (
+          <GitBranch size={14} />
+        ) : panel === "browser" ? (
+          <Globe size={14} />
+        ) : panel === "subagent" ? (
+          <GitBranch size={14} />
+        ) : (
+          <Sparkles size={14} />
+        )}
+        <span className={`v3-pane-name${showSub ? "" : " grow"}`}>{PANEL_TITLE[panel]}</span>
+        {showSub ? <span className="v3-pane-sub grow truncate" title={subTitleText}>{subTitleText}</span> : null}
         <button className="v3-icon-btn small" aria-label="关闭面板" onClick={() => showPanel(null)}>
           <X size={13} />
         </button>
       </div>
       <div className={`v3-pane-body v3-panel-body ${panel}`}>
         {panel === "files" ? <FilesPanel {...filesTarget} /> : null}
-        {panel === "browser" ? <BrowserPanel /> : null}
+        {panel === "git" ? (
+          <GitPanel
+            deviceId={gitTarget.deviceId}
+            agent={gitTarget.agent}
+            initialCwd={gitTarget.cwd}
+            spaceKey={gitTarget.spaceKey}
+          />
+        ) : null}
+        {panel === "browser" ? <BrowserPanel url={browserMeta.url} onMetaChange={setBrowserMeta} /> : null}
+        {panel === "subagent" ? <SubagentAsidePanel /> : null}
         {panel === "assistant" ? (
           <Suspense fallback={<div className="v3-empty-line">正在打开小羊…</div>}>
             <AssistantView onOpenAgent={openAgentTab} />
@@ -553,6 +1247,41 @@ export function ShellPanel() {
 
 // Status bar -----------------------------------------------------------------------
 
+function UpdateStatusSegment() {
+  const st = updateStore.use((s) => s);
+  if (st.checking) {
+    return (
+      <span className="v3-status-item" title="正在检查新版本">
+        <span className="v3-spinner small" aria-hidden />
+        <span>检查更新…</span>
+      </span>
+    );
+  }
+  if (!st.info?.hasUpdate) return null;
+  const busy =
+    st.installPhase === "downloading" ||
+    st.installPhase === "verifying" ||
+    st.installPhase === "staging";
+  const pct = st.progress?.percent;
+  const label =
+    st.installPhase === "ready"
+      ? `v${st.info.latest} 已就绪 · 重启更新`
+      : busy
+        ? `更新中${pct !== null && pct !== undefined ? ` ${pct}%` : "…"}`
+        : `新版本 v${st.info.latest}`;
+  return (
+    <button
+      type="button"
+      className="v3-status-item v3-status-btn update-pill"
+      title={`查看更新 v${st.info.current} → v${st.info.latest}`}
+      onClick={() => restoreUpdatePrompt()}
+    >
+      <span className={`v3-dot ${st.installPhase === "ready" ? "ok" : "warn"}`} />
+      <span className="truncate">{label}</span>
+    </button>
+  );
+}
+
 export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) {
   const link = liveStore.use((s) => s.link);
   const devices = liveStore.use((s) => s.devices);
@@ -561,8 +1290,15 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   const showShells = settingsStore.use((s) => s.showShells);
   const activeTab = shellStore.use((s) => s.tabs.find((t) => t.id === s.active) ?? null);
   const selectedSpace = shellStore.use((s) => s.selectedSpace);
+  const localHostId = useLocalHostDeviceId();
   const voice = useClientConfig().voiceInput;
-  const agent = useAgent(activeTab && activeTab.kind !== "web" ? activeTab.agentKey : null);
+  const [voicePhase, setVoicePhase] = useState<"idle" | "listening" | "transcribing">("idle");
+  useEffect(() => native.onVoiceEvent((e) => {
+    if (e.state === "listening") setVoicePhase("listening");
+    else if (e.state === "transcribing") setVoicePhase("transcribing");
+    else setVoicePhase("idle");
+  }), []);
+  const agent = useAgent(activeTab && activeTab.kind !== "web" ? (activeTab.agentKey ?? null) : null);
 
   const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const blocked = all.filter((a) => listGroup(a, devices) === "blocked").length;
@@ -572,7 +1308,8 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
     ? devices[agent.deviceId]
     : validSpace && selDevice
       ? devices[selDevice]
-      : Object.values(devices).find((d) => d.kind === "host" && d.online);
+      : (localHostId && devices[localHostId]?.online ? devices[localHostId] : undefined) ?? Object.values(devices).find((d) => d.kind === "host" && d.online);
+  const hostLabel = host ? (localHostId && host.id === localHostId ? `本机 · ${host.name}` : host.name) : "还没有电脑";
   const space = agent ? agentSpace(agent) : validSpace ? (selSpace || "未分空间") : undefined;
   const demo = isMockServer(server);
 
@@ -591,9 +1328,16 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
 
   return (
     <footer className="v3-status">
-      <span className="v3-status-item" title={host ? (host.online ? `${host.name} 在线` : `${host.name} 离线`) : undefined}>
+      <span
+        className="v3-status-item"
+        title={
+          host
+            ? `${localHostId && host.id === localHostId ? "本机运行载体 · " : ""}${host.name} ${host.online ? "在线" : "离线"}`
+            : undefined
+        }
+      >
         <Laptop size={13} />
-        <span className="truncate">{host?.name ?? "还没有电脑"}</span>
+        <span className="truncate">{hostLabel}</span>
       </span>
       {space ? (
         <span className="v3-status-item" title="空间">
@@ -603,10 +1347,11 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
       ) : null}
       <span className="v3-status-item">
         <span className="v3-dot dim" />
-        <span>{all.length} 个 Agent</span>
-        {blocked ? <span className="v3-status-need">· {blocked} 个需要你</span> : null}
+        <span className="truncate">{all.length} 个 Agent</span>
+        {blocked ? <span className="v3-status-need truncate">· {blocked} 个需要你</span> : null}
       </span>
       <span className="grow" />
+      <UpdateStatusSegment />
       <button
         className="v3-status-item v3-status-btn"
         onClick={() => (!server || link === "unauthorized" ? onConnectRelay() : link === "online" ? undefined : pingRelay())}
@@ -616,12 +1361,28 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
         <span className="truncate">{linkText}</span>
       </button>
       {voice.enabled && native.voiceSupported() ? (
-        <span className="v3-status-item" title="语音输入">
+        <button
+          type="button"
+          data-voice-trigger="true"
+          className={`v3-status-item v3-status-btn${voicePhase !== "idle" ? " on" : ""}`}
+          title="点击直接开始或结束语音输入"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            if (voicePhase === "listening") void voiceStop();
+            else if (voicePhase === "idle") void voiceStart();
+          }}
+        >
           <Mic size={13} />
-          <span>{voice.mode === "toggle" ? "按" : "按住"} {prettyHotkey(voice.hotkey)} 说话</span>
-        </span>
+          <span className="truncate">
+            {voicePhase === "listening"
+              ? "正在听… 点此完成"
+              : voicePhase === "transcribing"
+                ? "正在识别…"
+                : `${voice.mode === "toggle" ? "按" : "按住"} ${prettyHotkey(voice.hotkey)} 说话`}
+          </span>
+        </button>
       ) : null}
-      <button className="v3-status-item v3-status-btn" onClick={() => setPalette("command")} title="打开命令面板">
+      <button className="v3-status-item v3-status-btn" style={{ flex: "none" }} onClick={() => setPalette("command")} title="打开命令面板">
         <span className="v3-keys-text">{comboText(SHORTCUTS[0]!.keys)}</span>
         <span>命令</span>
       </button>
@@ -636,8 +1397,10 @@ export function PeekOverlay() {
   const key = shellStore.use((s) => s.peek);
   const agent = useAgent(key);
   const [peekMode, setPeekMode] = useState<AgentPaneMode | undefined>(undefined);
+  const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
   useEffect(() => {
     setPeekMode(undefined);
+    setSubHead(null);
   }, [key]);
   useEffect(() => {
     if (!key) return;
@@ -651,13 +1414,44 @@ export function PeekOverlay() {
   }, [key]);
   if (!key) return null;
   const mode = resolveAgentMode(peekMode, agent);
+  const title = agent ? spacedTitle(agent) : "这个 Agent 已经结束了";
+  const inSubView = Boolean(agent && subHead && subHead.trail.length > 0);
   return (
     <div className="v3-peek-backdrop" onPointerDown={(e) => e.target === e.currentTarget && setPeek(null)}>
       <section className="v3-pane v3-peek" role="dialog" aria-label="预览 Agent">
         <div className="v3-pane-head">
           {agent ? <VendorIcon harness={agent.harness} isShell={agent.isShell} size={14} /> : null}
-          <span className="v3-pane-name truncate">{agent ? spacedTitle(agent) : "这个 Agent 已经结束了"}</span>
-          <span className="v3-pane-sub truncate">{agent ? homeFolder(agent.cwd) : ""}</span>
+          {inSubView && agent && subHead ? (
+            <SubagentHeaderLineage
+              mainTitle={title}
+              trail={subHead.trail}
+              rootSubs={subHead.rootSubs}
+              activeSubs={subHead.activeSubs}
+              deviceId={agent.deviceId}
+              agentKey={agent.key}
+              onGoRoot={subHead.onGoRoot}
+              onSelectCrumbIndex={subHead.onSelectCrumbIndex}
+              onSelectSub={subHead.onSelectSub}
+              onOpenAside={subHead.onOpenAside}
+            />
+          ) : (
+            <>
+              <span className="v3-pane-name truncate">{title}</span>
+              <span className="v3-pane-sub truncate">{agent ? homeFolder(agent.cwd) : ""}</span>
+            </>
+          )}
+          {agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
+            <SubagentCatalogTrigger
+              compact
+              deviceId={agent.deviceId}
+              agentKey={agent.key}
+              knownCount={subHead.knownCount}
+              subs={subHead.rootSubs}
+              onSelectSub={subHead.onSelectSub}
+              onOpenAside={subHead.onOpenAside}
+              onRefresh={subHead.onRefresh}
+            />
+          ) : null}
           {agent ? <ModeSwitchIcons mode={mode} onModeChange={setPeekMode} /> : null}
           {agent ? (
             <button className="v3-mini-btn" onClick={() => openAgentTab(agent.key, mode)}>
@@ -670,7 +1464,17 @@ export function PeekOverlay() {
           </button>
         </div>
         <div className="v3-pane-body">
-          {agent ? <AgentDetailPanel key={agent.key} agent={agent} embedded mode={mode} onModeChange={setPeekMode} onBack={() => setPeek(null)} /> : null}
+          {agent ? (
+            <AgentDetailPanel
+              key={agent.key}
+              agent={agent}
+              embedded
+              mode={mode}
+              onModeChange={setPeekMode}
+              onSubHeadChange={setSubHead}
+              onBack={() => setPeek(null)}
+            />
+          ) : null}
         </div>
       </section>
     </div>

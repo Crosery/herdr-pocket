@@ -34,7 +34,7 @@ const PREFIX: &str = "browser-";
 const MAX_PANELS: usize = 8;
 /// The panels' own WKWebsiteDataStore (macOS 14+); any fixed UUID works, it only has to stay the same.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const DATA_STORE_ID: [u8; 16] = [
+pub(crate) const DATA_STORE_ID: [u8; 16] = [
     0x6b, 0x2f, 0x0e, 0x4d, 0x93, 0x1a, 0x4c, 0x2b, 0x9e, 0x51, 0x7d, 0x30, 0xa4, 0x18, 0xc6, 0x57,
 ];
 /// Written when browsing data should go but no panel is open to clear it; done when the next one opens.
@@ -180,8 +180,42 @@ fn config_str(pointer: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Modern Chrome User-Agent so sites don't block embedded WKWebView/WebKit with "浏览器版本过低".
+fn modern_chrome_user_agent() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    }
+    #[cfg(windows)]
+    {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    }
+}
+
+/// Reloads open browser panels whose current host matches any imported cookie domain.
+pub fn reload_matching_panels(app: &AppHandle, wanted: &[String]) {
+    let all = wanted.iter().any(|w| w == "*");
+    for w in panels(app) {
+        let should_reload = if all {
+            true
+        } else if let Ok(u) = w.url() {
+            u.host_str()
+                .is_some_and(|host| crate::cookies::domain_matches(host, wanted))
+        } else {
+            false
+        };
+        if should_reload {
+            let _ = w.eval("window.location.reload()");
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn macos_major() -> isize {
+pub(crate) fn macos_major() -> isize {
     objc2_foundation::NSProcessInfo::processInfo()
         .operatingSystemVersion()
         .majorVersion
@@ -368,6 +402,8 @@ fn builder(app: &AppHandle, id: &str, label: &str, url: Url) -> WebviewBuilder<t
             }
             _ => true,
         })
+        .user_agent(modern_chrome_user_agent())
+        .initialization_script("if(!window.chrome){window.chrome={runtime:{}};}")
         .devtools(cfg!(debug_assertions));
     #[cfg(target_os = "macos")]
     {

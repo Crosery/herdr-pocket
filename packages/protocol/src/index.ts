@@ -113,6 +113,12 @@ export interface SpaceInfo {
   folder?: string;
   tabs: number;
   terminals: number;
+  /** Desktop Herdr App accent color token (e.g. `ansi1`..`ansi6` or hex), from `shared.json`. */
+  color?: string;
+  /** Whether this space is the active space in desktop Herdr App. */
+  active?: boolean;
+  /** Whether this space backs a git worktree in Herdr App. */
+  isWorktree?: boolean;
 }
 
 /** A program the phone may start on a computer (picked by id, never a command line). */
@@ -566,13 +572,13 @@ export interface RpcMethods {
     /** `root`: the working folder as the computer names it (for display only). */
     result: { root: string; path: string; entries: FileEntry[]; truncated: boolean };
   };
-  /**
-   * One file of the agent's working folder (same rules as `files.list`). Text comes back as
-   * UTF-8 `text`, at most `maxBytes` (default `FILES_LIMITS.read`, max `FILES_LIMITS.readMax`) from
-   * `offset`, cut on a character boundary. A file with NUL bytes or invalid UTF-8 near its start
-   * is `binary`: no text; a picture (png, jpeg, gif, webp, bmp, ico) up to `FILES_LIMITS.image`
-   * comes as `base64` with its `mime`.
-   */
+/**
+ * One file of the agent's working folder (same rules as `files.list`). Text comes back as
+ * UTF-8 `text`, at most `maxBytes` (default `FILES_LIMITS.read`, max `FILES_LIMITS.readMax`) from
+ * `offset`, cut on a character boundary. A file with NUL bytes or invalid UTF-8 near its start
+ * is `binary`: no text; rich media (image, pdf, audio, video) up to `FILES_LIMITS.image` comes
+ * as `base64` with its `mime` and `kind`.
+ */
   "files.read": {
     params: { agent: string; path: string; maxBytes?: number; offset?: number };
     result: {
@@ -580,6 +586,7 @@ export interface RpcMethods {
       size: number;
       mtime: number;
       binary: boolean;
+      kind?: "text" | "image" | "pdf" | "audio" | "video" | "binary";
       /** More of the file after what was sent; ask again with `offset` + the bytes received. */
       truncated: boolean;
       offset: number;
@@ -602,6 +609,186 @@ export interface RpcMethods {
       entries: Array<{ name: string; path: string }>;
     };
   };
+  /** Slash commands discovered for an agent's harness & workspace (built-ins merged on client or returned by hostd). */
+  "agent.commands": {
+    params: { agent: string };
+    result: { harness: string; commands: SlashCommandItem[] };
+  };
+  /** Live token usage, context pressure, model breakdown, and quota report for `/usage`. */
+  "agent.usage": {
+    params: { agent: string };
+    result: AgentUsageReport;
+  };
+  /** Discover available models for switching via `/model` or composer chip. */
+  "agent.models": {
+    params: { agent: string };
+    result: AgentModelsResult;
+  };
+  "git.status": {
+    params: { agent?: string; cwd?: string };
+    result: GitStatusResult;
+  };
+  "git.diff": {
+    params: { agent?: string; cwd?: string; path: string; staged?: boolean; commit?: string };
+    result: GitDiffResult;
+  };
+  "git.log": {
+    params: { agent?: string; cwd?: string; limit?: number };
+    result: { commits: GitCommitEntry[] };
+  };
+  "git.stage": {
+    params: { agent?: string; cwd?: string; paths: string[]; all?: boolean };
+    result: { ok: true };
+  };
+  "git.unstage": {
+    params: { agent?: string; cwd?: string; paths: string[]; all?: boolean };
+    result: { ok: true };
+  };
+  "git.discard": {
+    params: { agent?: string; cwd?: string; paths: string[]; untracked?: boolean };
+    result: { ok: true };
+  };
+  "git.commit": {
+    params: { agent?: string; cwd?: string; message: string };
+    result: { hash: string; subject: string };
+  };
+  "git.checkout": {
+    params: { agent?: string; cwd?: string; branch: string; create?: boolean };
+    result: { branch: string };
+  };
+  "git.pull": {
+    params: { agent?: string; cwd?: string };
+    result: { summary: string };
+  };
+  "git.push": {
+    params: { agent?: string; cwd?: string };
+    result: { summary: string };
+  };
+}
+
+export type GitFileStatusCode = "M" | "A" | "D" | "R" | "U" | "?";
+
+export interface GitFileChange {
+  path: string;
+  oldPath?: string;
+  status: GitFileStatusCode;
+  staged: boolean;
+  additions?: number;
+  deletions?: number;
+}
+
+export interface GitRepoSummary {
+  root: string;
+  name: string;
+  branch: string;
+  upstream?: string;
+  ahead: number;
+  behind: number;
+  dirtyCount: number;
+}
+
+export interface GitCommitEntry {
+  hash: string;
+  shortHash: string;
+  subject: string;
+  author: string;
+  dateMs: number;
+  refs?: string;
+}
+
+export interface GitStatusResult {
+  isRepo: boolean;
+  root?: string;
+  branch?: string;
+  upstream?: string;
+  ahead: number;
+  behind: number;
+  branches: string[];
+  staged: GitFileChange[];
+  unstaged: GitFileChange[];
+  repos: GitRepoSummary[];
+}
+
+export interface GitDiffResult {
+  path: string;
+  staged: boolean;
+  patch: string;
+  oldText?: string;
+  newText?: string;
+  additions: number;
+  deletions: number;
+  binary?: boolean;
+  truncated?: boolean;
+}
+
+export interface SlashCommandItem {
+  name: string;
+  description: string;
+  argHint?: string;
+  category?: "session" | "model" | "code" | "skill" | "custom";
+  source?: "builtin" | "project" | "user";
+}
+
+export interface AgentUsageModelRow {
+  model: string;
+  steps: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  costUsd: number;
+  unpricedSteps: number;
+}
+
+export interface AgentQuotaBar {
+  provider: string;
+  account?: string;
+  label: string;
+  usedPct: number;
+  resetAt?: number;
+  note?: string;
+}
+
+export interface AgentUsageReport {
+  harness: string;
+  sessionKey?: string;
+  model?: string;
+  session: {
+    turns: number;
+    steps: number;
+    prompts: number;
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning: number;
+    costUsd: number;
+    unpricedSteps: number;
+    contextTokens?: number;
+    contextLimit?: number;
+    contextPct?: number;
+  } | null;
+  models: AgentUsageModelRow[];
+  day24h: { harness?: UsageRow; total: UsageRow } | null;
+  day7d: { harness?: UsageRow; total: UsageRow } | null;
+  quotas: AgentQuotaBar[];
+}
+
+export interface AgentModelOption {
+  id: string;
+  label: string;
+  provider?: string;
+  contextWindow?: number;
+  reasoning?: boolean;
+  source: "current" | "recent" | "catalog";
+}
+
+export interface AgentModelsResult {
+  harness: string;
+  currentModel?: string;
+  canSwitch: boolean;
+  reason?: string;
+  models: AgentModelOption[];
 }
 
 /**
@@ -650,6 +837,8 @@ export interface FileEntry {
   ignored?: boolean;
   /** May hold keys (.env, .ssh, *.pem, ...): listed, but `files.read` and `files.list` refuse it (`forbidden`). */
   private?: boolean;
+  /** Git working-tree status badge (`U` > `M` > `A` > `D` > `R` > `?` propagated up to directories). */
+  gitStatus?: GitFileStatusCode;
 }
 
 /** Folders `files.list` leaves out unless asked: dependencies, VCS data, build output and caches. */
@@ -682,7 +871,7 @@ export const FILES_IGNORED: readonly string[] = [
 ];
 
 /** Sizes in entries and bytes. */
-export const FILES_LIMITS = { list: 500, listMax: 2000, read: 256 * 1024, readMax: 1024 * 1024, image: 1024 * 1024 } as const;
+export const FILES_LIMITS = { list: 500, listMax: 2000, read: 256 * 1024, readMax: 1024 * 1024, image: 64 * 1024 * 1024 } as const;
 
 export const HARNESS_ICON_MAX = 40;
 
@@ -1874,12 +2063,15 @@ export function updateCheckDelays(hours: number, rand: () => number = Math.rando
 export const CLIENT_CONFIG_FILE = "config.json";
 export const CLIENT_CONFIG_VERSION = 1;
 
+export type ChatDisplayMode = "compact" | "standard" | "expanded";
+
 export interface ClientConfig {
   version: number;
   general: {
     language: "zh-CN" | "en";
     theme: "system" | "light" | "dark";
     textScale: number;
+    chatDisplayMode: ChatDisplayMode;
     showShells: boolean;
     useLocalLogin: boolean;
     launchAtLogin: boolean;
@@ -1964,6 +2156,15 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "general.language", type: "enum", values: ["zh-CN", "en"], default: "zh-CN", usedBy: D, label: "界面语言", doc: "Language of the desktop app." },
   { key: "general.theme", type: "enum", values: ["system", "light", "dark"], default: "system", usedBy: D, label: "外观", doc: "Light, dark, or follow the system." },
   { key: "general.textScale", type: "integer", min: 80, max: 160, default: 100, usedBy: D, label: "文字大小（%）", doc: "Text size of the desktop app in percent." },
+  {
+    key: "general.chatDisplayMode",
+    type: "enum",
+    values: ["compact", "standard", "expanded"],
+    default: "standard",
+    usedBy: D,
+    label: "对话展示模式",
+    doc: "compact: fold thinking and consecutive tools together. standard: separate thinking blocks, fold consecutive tools into one group. expanded: show every thinking block and tool call.",
+  },
   { key: "general.showShells", type: "boolean", default: false, usedBy: D, label: "显示普通终端", doc: "List plain shells beside the agents." },
   { key: "general.useLocalLogin", type: "boolean", default: true, usedBy: D, label: "使用本机 herdr-pocket 的登录", doc: "When this computer's herdr-pocket is logged in (hostd.json), the desktop app joins the same relay with it." },
   { key: "general.launchAtLogin", type: "boolean", default: false, usedBy: D, label: "开机时启动", doc: "Start the desktop app when you log in." },
@@ -2285,6 +2486,150 @@ export function directNonce(from: number, n: number): Uint8Array {
   }
   return nonce;
 }
+
+function u32le(b: Uint8Array, o: number): number {
+  return (b[o]! | (b[o + 1]! << 8) | (b[o + 2]! << 16) | (b[o + 3]! << 24)) >>> 0;
+}
+
+function writeU32le(b: Uint8Array, o: number, v: number): void {
+  b[o] = v & 0xff;
+  b[o + 1] = (v >>> 8) & 0xff;
+  b[o + 2] = (v >>> 16) & 0xff;
+  b[o + 3] = (v >>> 24) & 0xff;
+}
+
+function rotl32(v: number, c: number): number {
+  return ((v << c) | (v >>> (32 - c))) >>> 0;
+}
+
+function qr(x: Uint32Array, a: number, b: number, c: number, d: number): void {
+  let xa = x[a]!;
+  let xb = x[b]!;
+  let xc = x[c]!;
+  let xd = x[d]!;
+  xa = (xa + xb) >>> 0; xd = rotl32(xd ^ xa, 16);
+  xc = (xc + xd) >>> 0; xb = rotl32(xb ^ xc, 12);
+  xa = (xa + xb) >>> 0; xd = rotl32(xd ^ xa, 8);
+  xc = (xc + xd) >>> 0; xb = rotl32(xb ^ xc, 7);
+  x[a] = xa; x[b] = xb; x[c] = xc; x[d] = xd;
+}
+
+function chacha20Block(key: Uint8Array, counter: number, nonce: Uint8Array, out: Uint8Array): void {
+  const init = new Uint32Array(16);
+  init[0] = 0x61707865;
+  init[1] = 0x3320646e;
+  init[2] = 0x79622d32;
+  init[3] = 0x6b206574;
+  for (let i = 0; i < 8; i++) init[4 + i] = u32le(key, i * 4);
+  init[12] = counter >>> 0;
+  init[13] = u32le(nonce, 0);
+  init[14] = u32le(nonce, 4);
+  init[15] = u32le(nonce, 8);
+
+  const w = new Uint32Array(init);
+  for (let i = 0; i < 10; i++) {
+    qr(w, 0, 4, 8, 12);
+    qr(w, 1, 5, 9, 13);
+    qr(w, 2, 6, 10, 14);
+    qr(w, 3, 7, 11, 15);
+    qr(w, 0, 5, 10, 15);
+    qr(w, 1, 6, 11, 12);
+    qr(w, 2, 7, 8, 13);
+    qr(w, 3, 4, 9, 14);
+  }
+  for (let i = 0; i < 16; i++) writeU32le(out, i * 4, (w[i]! + init[i]!) >>> 0);
+}
+
+function chacha20Xor(key: Uint8Array, nonce: Uint8Array, input: Uint8Array, out: Uint8Array): void {
+  const block = new Uint8Array(64);
+  let counter = 1;
+  for (let offset = 0; offset < input.length; offset += 64) {
+    chacha20Block(key, counter, nonce, block);
+    counter = (counter + 1) >>> 0;
+    const end = Math.min(64, input.length - offset);
+    for (let i = 0; i < end; i++) {
+      out[offset + i] = input[offset + i]! ^ block[i]!;
+    }
+  }
+}
+
+const POLY_P = (1n << 130n) - 5n;
+const POLY_HIBIT = 1n << 128n;
+
+function leBytesToBigInt(bytes: Uint8Array, offset: number, len: number): bigint {
+  let v = 0n;
+  for (let i = len - 1; i >= 0; i--) {
+    v = (v << 8n) | BigInt(bytes[offset + i]!);
+  }
+  return v;
+}
+
+function poly1305AeadTag(otk: Uint8Array, ciphertext: Uint8Array, ctLen: number): Uint8Array {
+  const rBytes = otk.slice(0, 16);
+  rBytes[3] = rBytes[3]! & 15;
+  rBytes[7] = rBytes[7]! & 15;
+  rBytes[11] = rBytes[11]! & 15;
+  rBytes[15] = rBytes[15]! & 15;
+  rBytes[4] = rBytes[4]! & 252;
+  rBytes[8] = rBytes[8]! & 252;
+  rBytes[12] = rBytes[12]! & 252;
+  const r = leBytesToBigInt(rBytes, 0, 16);
+  const s = leBytesToBigInt(otk, 16, 16);
+
+  let acc = 0n;
+  for (let offset = 0; offset < ctLen; offset += 16) {
+    const chunkLen = Math.min(16, ctLen - offset);
+    const n = leBytesToBigInt(ciphertext, offset, chunkLen) | POLY_HIBIT;
+    acc = ((acc + n) * r) % POLY_P;
+  }
+
+  // AEAD footer: le64(aadLen = 0) || le64(ctLen) as one 16-byte block.
+  const footer = new Uint8Array(16);
+  writeU32le(footer, 8, ctLen >>> 0);
+  writeU32le(footer, 12, Math.floor(ctLen / 0x1_0000_0000) >>> 0);
+  acc = ((acc + (leBytesToBigInt(footer, 0, 16) | POLY_HIBIT)) * r) % POLY_P;
+
+  const tagVal = (acc + s) & ((1n << 128n) - 1n);
+  const tag = new Uint8Array(16);
+  let cur = tagVal;
+  for (let i = 0; i < 16; i++) {
+    tag[i] = Number(cur & 0xffn);
+    cur >>= 8n;
+  }
+  return tag;
+}
+
+/**
+ * Pure TypeScript RFC 8439 ChaCha20-Poly1305 (empty AAD) for runtimes that omit native ChaCha20
+ * (such as WKWebView on macOS).
+ */
+export const jsChaCha20Poly1305: DirectAead = {
+  seal(key, nonce, plain) {
+    if (key.length !== 32 || nonce.length !== 12) {
+      throw new Error("ChaCha20-Poly1305 requires a 32-byte key and 12-byte nonce");
+    }
+    const otkBlock = new Uint8Array(64);
+    chacha20Block(key, 0, nonce, otkBlock);
+    const out = new Uint8Array(plain.length + 16);
+    chacha20Xor(key, nonce, plain, out);
+    const tag = poly1305AeadTag(otkBlock, out, plain.length);
+    out.set(tag, plain.length);
+    return out;
+  },
+  open(key, nonce, sealed) {
+    if (key.length !== 32 || nonce.length !== 12 || sealed.length < 16) return null;
+    const ctLen = sealed.length - 16;
+    const otkBlock = new Uint8Array(64);
+    chacha20Block(key, 0, nonce, otkBlock);
+    const expected = poly1305AeadTag(otkBlock, sealed, ctLen);
+    let diff = 0;
+    for (let i = 0; i < 16; i++) diff |= expected[i]! ^ sealed[ctLen + i]!;
+    if (diff !== 0) return null;
+    const plain = new Uint8Array(ctLen);
+    chacha20Xor(key, nonce, sealed.subarray(0, ctLen), plain);
+    return plain;
+  },
+};
 
 /**
  * One end of a direct link. Frames are JSON text, sealed as binary WebSocket messages. Nonces are not

@@ -1,4 +1,5 @@
 import { homedir, hostname, platform } from "node:os";
+import { join } from "node:path";
 import { WebSocket } from "ws";
 import {
   HARNESS_ICON_MAX,
@@ -34,6 +35,10 @@ import { FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from ".
 import { LogBuffer, clipChars, levelOf } from "./logbuf.ts";
 import { CONFIG_DIR, type HostConfig } from "./config.ts";
 import { FilesError, listFiles, listFolders, readFileSlice } from "./files.ts";
+import { getGitDiff, getGitLog, getGitStatus, gitCheckout, gitCommit, gitDiscard, gitPull, gitPush, gitStage, gitUnstage } from "./git.ts";
+import { scanAgentSlashCommands } from "./slash.ts";
+import { getAgentModels } from "./models.ts";
+import { getAgentUsageReport } from "./usage.ts";
 import { run } from "./util.ts";
 import { changedKeys } from "./configcmd.ts";
 import { VERSION, clientConfigPath, readClientConfig, type LoadedClientConfig } from "@herdr-pocket/update";
@@ -44,7 +49,23 @@ import { checkUpstream, herdrAppVersion, readUpstreamCache, writeUpstreamCache, 
 export const HOSTD_VERSION = VERSION;
 
 /** Calls that change something here: logged when they work too. */
-const MUTATING = new Set(["terminal.send", "terminal.keys", "terminal.put", "agent.create", "terminal.interrupt", "terminal.kill", "herdr.command", "sessions.resume"]);
+const MUTATING = new Set([
+  "terminal.send",
+  "terminal.keys",
+  "terminal.put",
+  "agent.create",
+  "terminal.interrupt",
+  "terminal.kill",
+  "herdr.command",
+  "sessions.resume",
+  "git.stage",
+  "git.unstage",
+  "git.discard",
+  "git.commit",
+  "git.checkout",
+  "git.pull",
+  "git.push",
+]);
 
 /** What a call was about, short: never more than 200 characters of anyone's message. */
 function callSummary(params: unknown, result?: unknown): Record<string, unknown> | undefined {
@@ -1084,13 +1105,16 @@ export class Host {
       else if (this.hc.terminals.size === 0) await this.hc.list().catch(() => undefined);
       try {
         spaces = await this.app.spaces(this.hc.terminals);
-        for (const s of spaces) {
-          if (s.folder) this.spaceFolders.set(s.id, s.folder);
-        }
       } catch (e) {
         // Without the desktop app (Windows, servers) new agents get terminals of their own.
         if (e instanceof NoDesktopApp) standalone = true;
-        else reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
+        else {
+          reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
+          spaces = this.app.spacesFromDocs(this.hc.terminals);
+        }
+      }
+      for (const s of spaces) {
+        if (s.folder) this.spaceFolders.set(s.id, s.folder);
       }
       return {
         spaces,
@@ -1192,13 +1216,85 @@ export class Host {
     "files.read": async (p) => {
       const a = this.resolve(p.agent);
       const t0 = Date.now();
-      const r = await this.files(() => readFileSlice(a.cwd, p, { privateDirs: this.privateDirs }));
+      const extraRoots = [this.filesDir, join(homedir(), ".local", "state", "herdr-core")];
+      const r = await this.files(() => readFileSlice(a.cwd, p, { privateDirs: this.privateDirs, extraRoots }));
       this.note("debug", "files", `files.read ${a.localId} "${r.path}" ${r.bytes}/${r.size} bytes${r.binary ? " binary" : ""} ${Date.now() - t0}ms`, { agent: a.key });
       return r;
     },
     "folders.list": async (p) => {
       const hidden = Boolean(p?.hidden);
       return this.files(() => listFolders(p?.path, hidden, { privateDirs: this.privateDirs }));
+    },
+    "agent.commands": async (p) => {
+      const a = this.resolve(p.agent);
+      const commands = a.isShell ? [] : await scanAgentSlashCommands(a.harness, a.cwd);
+      return { harness: a.harness, commands };
+    },
+    "agent.usage": async (p) => {
+      const a = this.resolve(p.agent);
+      const key = (await this.sessionOf(p.agent, undefined).catch(() => null)) ?? a.sessionKey;
+      return getAgentUsageReport(a, {
+        uniflo: this.uniflo,
+        unifloReady: this.sources.includes("uniflo"),
+        sessionKey: key ?? undefined,
+      });
+    },
+    "agent.models": async (p) => {
+      const a = this.resolve(p.agent);
+      return getAgentModels(a, {
+        uniflo: this.uniflo,
+        unifloReady: this.sources.includes("uniflo"),
+      });
+    },
+    "git.status": async (p) => {
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      return this.files(() => getGitStatus(dir, this.privateDirs));
+    },
+    "git.diff": async (p) => {
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      return this.files(() => getGitDiff(dir, p, this.privateDirs));
+    },
+    "git.log": async (p) => {
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      return { commits: await this.files(() => getGitLog(dir, p.limit, this.privateDirs)) };
+    },
+    "git.stage": async (p) => {
+      this.writable();
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      await this.files(() => gitStage(dir, p, this.privateDirs));
+      return { ok: true as const };
+    },
+    "git.unstage": async (p) => {
+      this.writable();
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      await this.files(() => gitUnstage(dir, p, this.privateDirs));
+      return { ok: true as const };
+    },
+    "git.discard": async (p) => {
+      this.writable();
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      await this.files(() => gitDiscard(dir, p, this.privateDirs));
+      return { ok: true as const };
+    },
+    "git.commit": async (p) => {
+      this.writable();
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      return this.files(() => gitCommit(dir, p.message, this.privateDirs));
+    },
+    "git.checkout": async (p) => {
+      this.writable();
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      return this.files(() => gitCheckout(dir, p, this.privateDirs));
+    },
+    "git.pull": async (p) => {
+      this.writable();
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      return this.files(() => gitPull(dir, this.privateDirs));
+    },
+    "git.push": async (p) => {
+      this.writable();
+      const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;
+      return this.files(() => gitPush(dir, this.privateDirs));
     },
     "agent.seen": async (p) => {
       this.writable();

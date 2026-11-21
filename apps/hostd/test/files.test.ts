@@ -124,3 +124,27 @@ test("reads text in pieces on character boundaries, flags binaries, sends small 
   assert.equal(looksBinary(Buffer.from("plain")), false);
   assert.ok(FILES_LIMITS.read < FILES_LIMITS.readMax);
 });
+
+test("extraRoots allows trusted absolute paths while still blocking private and outside files", async () => {
+  const attachments = join(dir, "herdr-attachments");
+  mkdirSync(attachments, { recursive: true });
+  writeFileSync(join(attachments, "shot.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1]));
+  writeFileSync(join(attachments, ".env"), "SECRET=1");
+
+  const img = await readFileSlice(root, { path: join(attachments, "shot.png") }, { extraRoots: [attachments], privateDirs: [settings] });
+  assert.equal(img.mime, "image/png");
+  assert.equal(img.bytes, 6);
+
+  await assert.rejects(
+    readFileSlice(root, { path: join(outside, "secret.txt") }, { extraRoots: [attachments], privateDirs: [settings] }),
+    (e) => code(e) === "forbidden",
+  );
+  await assert.rejects(
+    readFileSlice(root, { path: join(attachments, ".env") }, { extraRoots: [attachments], privateDirs: [settings] }),
+    (e) => code(e) === "forbidden",
+  );
+  await assert.rejects(
+    readFileSlice(root, { path: join(settings, "hostd.json") }, { extraRoots: [attachments], privateDirs: [settings] }),
+    (e) => code(e) === "forbidden",
+  );
+});

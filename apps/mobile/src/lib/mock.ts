@@ -503,6 +503,10 @@ function demoSend(key: string, text: string) {
     failedOnce.add(text);
     throw new Error("演示：这条故意没发出去，点重发");
   }
+  const modelMatch = /^\/model\s+(\S+)/i.exec(text.trim());
+  if (modelMatch) {
+    setAgent(key, { model: modelMatch[1] });
+  }
   const queueId = `mq${++queueSeq}`;
   later(120, () => queueSinks.get(key)?.forEach((sink) => sink({ kind: "queue", queueId, status: "sending", position: 0, at: now() })));
   later(450, () => queueSinks.get(key)?.forEach((sink) => sink({ kind: "queue", queueId, status: "sent", position: 0, at: now() })));
@@ -641,6 +645,76 @@ export function mockLink(): Link {
           // Placeholder shapes standing in for what a computer's Uniflo would send (not the real marks).
           const ids = (params as { ids?: string[] }).ids ?? [];
           return { icons: Object.fromEntries(ids.filter((id) => MOCK_MARKS[id]).map((id) => [id, MOCK_MARKS[id]!])) };
+        }
+        case "folders.list":
+          return { path: "~", displayPath: "~", parent: null, entries: [{ name: "code", path: "~/code" }] };
+        case "agent.commands": {
+          const a = agents.find((x) => x.key === p.agent);
+          return {
+            harness: a?.harness ?? "claude",
+            commands: [
+              { name: "/deploy", description: "部署并执行冒烟验证", category: "custom" as const, source: "project" as const },
+              { name: "/grill-me", description: "深度问答确认方案细节", category: "skill" as const, source: "user" as const },
+            ],
+          };
+        }
+        case "agent.usage": {
+          const a = agents.find((x) => x.key === p.agent);
+          const activeModel = a?.model ?? "claude-opus-5-5";
+          return {
+            harness: a?.harness ?? "claude-code",
+            sessionKey: a?.sessionKey,
+            model: activeModel,
+            session: {
+              turns: 4,
+              steps: 18,
+              prompts: 4,
+              input: 141_017,
+              output: 26_551,
+              cacheRead: 530_620,
+              cacheWrite: 12_400,
+              reasoning: 1_840,
+              costUsd: 1.42,
+              unpricedSteps: 0,
+              contextTokens: 73_266,
+              contextLimit: 200_000,
+              contextPct: 36.63,
+            },
+            models: [
+              { model: activeModel, steps: 14, input: 118_000, output: 22_100, cacheRead: 490_000, cacheWrite: 12_400, costUsd: 1.31, unpricedSteps: 0 },
+              { model: "claude-haiku-5-5", steps: 4, input: 23_017, output: 4_451, cacheRead: 40_620, cacheWrite: 0, costUsd: 0.11, unpricedSteps: 0 },
+            ],
+            day24h: {
+              harness: { key: "claude", label: a?.harness ?? "claude-code", sessions: 6, steps: 84, prompts: 18, input: 320_000, output: 54_000, cacheRead: 1_900_000, cacheWrite: 45_000, costUsd: 4.86 },
+              total: { key: "total", label: "total", sessions: 11, steps: 142, prompts: 31, input: 580_000, output: 88_000, cacheRead: 2_840_000, cacheWrite: 62_000, costUsd: 8.15 },
+            },
+            day7d: {
+              harness: { key: "claude", label: a?.harness ?? "claude-code", sessions: 28, steps: 512, prompts: 109, input: 1_840_000, output: 310_000, cacheRead: 9_600_000, cacheWrite: 220_000, costUsd: 26.4 },
+              total: { key: "total", label: "total", sessions: 44, steps: 890, prompts: 192, input: 3_120_000, output: 495_000, cacheRead: 14_200_000, cacheWrite: 310_000, costUsd: 41.8 },
+            },
+            quotas: [
+              { provider: "anthropic", account: "us***@example.com", label: "5 小时滑动窗口", usedPct: 34.5, resetAt: Date.now() + 2 * 3_600_000 },
+              { provider: "anthropic", account: "us***@example.com", label: "7 天周额度", usedPct: 18.0, resetAt: Date.now() + 4 * 86_400_000 },
+            ],
+          };
+        }
+        case "agent.models": {
+          const a = agents.find((x) => x.key === p.agent);
+          const cur = a?.model ?? "claude-opus-5-5";
+          const pool = [
+            { id: "claude-opus-5-5", label: "Claude Opus 5.5", provider: "anthropic", contextWindow: 200_000, reasoning: true, source: "recent" as const },
+            { id: "claude-sonnet-5", label: "Claude Sonnet 5", provider: "anthropic", contextWindow: 200_000, reasoning: true, source: "recent" as const },
+            { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", provider: "openai", contextWindow: 1_050_000, reasoning: true, source: "catalog" as const },
+            { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon High", provider: "google", contextWindow: 1_048_576, reasoning: true, source: "catalog" as const },
+            { id: "deepseek-reasoner", label: "DeepSeek Reasoner", provider: "deepseek", contextWindow: 128_000, reasoning: true, source: "catalog" as const },
+          ];
+          return {
+            harness: a?.harness ?? "claude-code",
+            currentModel: cur,
+            canSwitch: !a?.isShell,
+            ...(a?.isShell ? { reason: "普通终端不支持切换模型" } : {}),
+            models: [{ id: cur, label: cur, contextWindow: 200_000, reasoning: true, source: "current" as const }, ...pool.filter((x) => x.id !== cur)],
+          };
         }
         case "agent.seen":
           agents = agents.map((a) => (a.key === p.agent && a.status === "done" ? { ...a, status: "idle" } : a));

@@ -3,7 +3,7 @@
     "name": "Herdr Pocket",
     "slug": "herdr-pocket",
     "scheme": "herdrpocket",
-    "version": "0.2.4",
+    "version": "0.2.5",
     "orientation": "portrait",
     "icon": "./assets/brand/icon-1024.png",
     "userInterfaceStyle": "automatic",
@@ -18,7 +18,7 @@
           "audio"
         ]
       },
-      "buildNumber": "2004"
+      "buildNumber": "2005"
     },
     "android": {
       "package": "dev.crosery.herdrpocket",
@@ -89,7 +89,8 @@
         }
       ],
       "./plugins/withCleartext",
-      "./plugins/withAndroidBuild"
+      "./plugins/withAndroidBuild",
+      "./plugins/withIosOnnxRuntime"
     ],
     "experiments": {
       "typedRoutes": true

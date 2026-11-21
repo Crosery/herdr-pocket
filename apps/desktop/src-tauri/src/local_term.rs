@@ -8,9 +8,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 const KIND_DATA: u8 = 0;
@@ -22,11 +24,22 @@ const HEADER_LEN: usize = 9;
 
 const INITIAL_CREDIT_BYTES: u32 = 16 * 1024 * 1024;
 const CREDIT_ACK_STEP: usize = 4 * 1024 * 1024;
+const MAX_EARLY_FRAMES: usize = 4096;
+const MAX_EARLY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalAttachResult {
     pub channel: u32,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalCreateShellResult {
+    pub terminal: String,
+    pub cwd: String,
     pub cols: u16,
     pub rows: u16,
 }
@@ -147,6 +160,19 @@ struct Attachment {
     consumed: usize,
 }
 
+struct PreattachedChannel {
+    channel: u32,
+    cols: u16,
+    rows: u16,
+    created_at: Instant,
+}
+
+#[derive(Default)]
+struct EarlyBuffer {
+    bytes: usize,
+    frames: Vec<(u8, Vec<u8>)>,
+}
+
 struct SharedState {
     stdin: ChildStdin,
     child: Child,
@@ -154,7 +180,8 @@ struct SharedState {
     replies: HashMap<u64, ReplyTarget>,
     by_channel: HashMap<u32, String>,
     by_id: HashMap<String, Attachment>,
-    early: HashMap<u32, Vec<(u8, Vec<u8>)>>,
+    preattached: HashMap<String, PreattachedChannel>,
+    early: HashMap<u32, EarlyBuffer>,
     alive: bool,
 }
 
@@ -232,6 +259,7 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
         replies: HashMap::new(),
         by_channel: HashMap::new(),
         by_id: HashMap::new(),
+        preattached: HashMap::new(),
         early: HashMap::new(),
         alive: true,
     }));
@@ -306,9 +334,12 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                             _ => Action::None,
                         }
                     } else {
-                        let list = s.early.entry(channel).or_default();
-                        if list.len() < 256 {
-                            list.push((kind, payload));
+                        let buf = s.early.entry(channel).or_default();
+                        if buf.frames.len() < MAX_EARLY_FRAMES
+                            && buf.bytes.saturating_add(payload.len()) <= MAX_EARLY_BYTES
+                        {
+                            buf.bytes += payload.len();
+                            buf.frames.push((kind, payload));
                         }
                         Action::None
                     }
@@ -346,6 +377,7 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                         let _ = tx.send(Err("hc connect 已断开".into()));
                     }
                     s.by_channel.clear();
+                    s.preattached.clear();
                     s.early.clear();
                     s.by_id.drain().map(|(id, _)| id).collect()
                 } else {
@@ -383,6 +415,41 @@ fn ensure_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
     let created = spawn_client(app)?;
     *guard = Some(Arc::clone(&created));
     Ok(created)
+}
+
+pub fn warmup(app: &AppHandle) {
+    let app = app.clone();
+    let _ = thread::Builder::new()
+        .name("hc-warmup".into())
+        .spawn(move || {
+            let _ = ensure_client(&app);
+        });
+}
+
+fn expand_local_cwd(raw: Option<&str>) -> Result<String, String> {
+    let trimmed = raw.map(str::trim).unwrap_or("");
+    let path = if trimmed.is_empty() {
+        crate::home_dir().ok_or_else(|| "无法确定本机主目录".to_string())?
+    } else if trimmed == "~" {
+        crate::home_dir().ok_or_else(|| "无法确定本机主目录".to_string())?
+    } else if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            trimmed.strip_prefix("~\\")
+        } else {
+            None
+        }
+    }) {
+        crate::home_dir()
+            .ok_or_else(|| "无法确定本机主目录".to_string())?
+            .join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    let canon = std::fs::canonicalize(&path).map_err(|_| format!("本地文件夹不存在: {}", path.display()))?;
+    if !canon.is_dir() {
+        return Err(format!("目标不是文件夹: {}", canon.display()));
+    }
+    Ok(canon.to_string_lossy().into_owned())
 }
 
 fn call_channel0(client: &ClientHandle, method: &str, params: Value) -> Result<Value, String> {
@@ -423,6 +490,125 @@ fn call_channel0(client: &ClientHandle, method: &str, params: Value) -> Result<V
 }
 
 #[tauri::command]
+pub async fn local_term_create_shell(
+    app: AppHandle,
+    cwd: Option<String>,
+    cols: u16,
+    rows: u16,
+    display: Option<Value>,
+    space_name: Option<String>,
+) -> Result<LocalCreateShellResult, String> {
+    let c = clamp_cols(cols);
+    let r = clamp_rows(rows);
+    let sanitized_display = sanitize_display(display.as_ref());
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolved_cwd = expand_local_cwd(cwd.as_deref())?;
+        let client = ensure_client(&app)?;
+
+        let mut params = serde_json::Map::new();
+        params.insert("cwd".into(), json!(resolved_cwd));
+        params.insert("size".into(), json!({ "cols": c, "rows": r }));
+        params.insert("keep".into(), json!(true));
+        params.insert("no_parent".into(), json!(true));
+        if let Some(sp) = space_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            params.insert("labels".into(), json!({ "where": sp }));
+        }
+        if let Some(ref d) = sanitized_display {
+            params.insert("display".into(), d.clone());
+        }
+
+        let res = call_channel0(&client, "terminal.run", Value::Object(params))?;
+        let terminal = res
+            .get("address")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "hc terminal.run 缺少 address".to_string())?
+            .to_string();
+        let ret_cwd = res
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or(resolved_cwd);
+        let ret_cols = res
+            .get("cols")
+            .and_then(Value::as_u64)
+            .and_then(|v| u16::try_from(v).ok())
+            .unwrap_or(c);
+        let ret_rows = res
+            .get("rows")
+            .and_then(Value::as_u64)
+            .and_then(|v| u16::try_from(v).ok())
+            .unwrap_or(r);
+
+        // Immediately attach before startup shells/fastfetch emit Kitty APC sequences or prompt bytes.
+        let mut attach_params = serde_json::Map::new();
+        attach_params.insert("terminal".into(), json!(terminal));
+        attach_params.insert("cols".into(), json!(ret_cols));
+        attach_params.insert("rows".into(), json!(ret_rows));
+        attach_params.insert("history".into(), json!(4000));
+        attach_params.insert("observe".into(), json!(false));
+        if let Some(d) = sanitized_display {
+            attach_params.insert("display".into(), d);
+        }
+        if let Ok(att_res) = call_channel0(&client, "terminal.attach", Value::Object(attach_params)) {
+            if let Some(ch) = att_res
+                .get("channel")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+            {
+                let att_cols = att_res
+                    .pointer("/terminal/cols")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u16::try_from(v).ok())
+                    .unwrap_or(ret_cols);
+                let att_rows = att_res
+                    .pointer("/terminal/rows")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u16::try_from(v).ok())
+                    .unwrap_or(ret_rows);
+                if let Ok(mut s) = client.state.lock() {
+                    let stale_keys: Vec<String> = s
+                        .preattached
+                        .iter()
+                        .filter(|(_, p)| p.created_at.elapsed() >= Duration::from_secs(30))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for k in stale_keys {
+                        if let Some(old) = s.preattached.remove(&k) {
+                            s.early.remove(&old.channel);
+                            let _ = s.write_frame(old.channel, KIND_CLOSE, &[]);
+                        }
+                    }
+                    if let Some(old) = s.preattached.insert(
+                        terminal.clone(),
+                        PreattachedChannel {
+                            channel: ch,
+                            cols: att_cols,
+                            rows: att_rows,
+                            created_at: Instant::now(),
+                        },
+                    ) {
+                        s.early.remove(&old.channel);
+                        let _ = s.write_frame(old.channel, KIND_CLOSE, &[]);
+                    }
+                    let _ = s.write_frame(ch, KIND_CREDIT, &INITIAL_CREDIT_BYTES.to_le_bytes());
+                }
+            }
+        }
+
+        Ok(LocalCreateShellResult {
+            terminal,
+            cwd: ret_cwd,
+            cols: ret_cols,
+            rows: ret_rows,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn local_term_attach(
     app: AppHandle,
     id: String,
@@ -437,49 +623,107 @@ pub async fn local_term_attach(
     let sanitized_display = sanitize_display(display.as_ref());
     tauri::async_runtime::spawn_blocking(move || {
         let client = ensure_client(&app)?;
-        let mut params = serde_json::Map::new();
-        params.insert("terminal".into(), json!(terminal));
-        params.insert("cols".into(), json!(c));
-        params.insert("rows".into(), json!(r));
-        params.insert("history".into(), json!(history.min(10_000)));
-        params.insert("observe".into(), json!(false));
-        if let Some(d) = sanitized_display {
-            params.insert("display".into(), d);
-        }
 
-        let res = call_channel0(&client, "terminal.attach", Value::Object(params))?;
-        let channel = res
-            .get("channel")
-            .and_then(Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or_else(|| "hc terminal.attach 缺少 channel".to_string())?;
-        let ret_cols = res
-            .pointer("/terminal/cols")
-            .and_then(Value::as_u64)
-            .and_then(|v| u16::try_from(v).ok())
-            .unwrap_or(c);
-        let ret_rows = res
-            .pointer("/terminal/rows")
-            .and_then(Value::as_u64)
-            .and_then(|v| u16::try_from(v).ok())
-            .unwrap_or(r);
-
-        let early_frames = {
+        let adopted = {
             let mut s = client
                 .state
                 .lock()
                 .map_err(|_| "hc state lock poisoned".to_string())?;
-            s.by_channel.insert(channel, id.clone());
-            s.by_id.insert(
-                id.clone(),
-                Attachment {
-                    channel,
-                    consumed: 0,
-                },
-            );
-            let drained = s.early.remove(&channel).unwrap_or_default();
-            s.write_frame(channel, KIND_CREDIT, &INITIAL_CREDIT_BYTES.to_le_bytes())?;
-            drained
+            if let Some(pre) = s.preattached.remove(&terminal) {
+                if pre.created_at.elapsed() < Duration::from_secs(30) {
+                    s.by_channel.insert(pre.channel, id.clone());
+                    let drained = s
+                        .early
+                        .remove(&pre.channel)
+                        .map(|b| b.frames)
+                        .unwrap_or_default();
+                    let early_bytes: usize = drained
+                        .iter()
+                        .filter(|(k, _)| *k == KIND_DATA)
+                        .map(|(_, p)| p.len())
+                        .sum();
+                    s.by_id.insert(
+                        id.clone(),
+                        Attachment {
+                            channel: pre.channel,
+                            consumed: early_bytes,
+                        },
+                    );
+                    if let Some(ref d) = sanitized_display {
+                        if let Ok(bytes) = serde_json::to_vec(d) {
+                            let _ = s.write_frame(pre.channel, KIND_FACTS, &bytes);
+                        }
+                    }
+                    let (ret_cols, ret_rows) = if (c, r) != (pre.cols, pre.rows) {
+                        let size = encode_resize_payload(c, r);
+                        let _ = s.write_frame(pre.channel, KIND_RESIZE, &size);
+                        (c, r)
+                    } else {
+                        (pre.cols, pre.rows)
+                    };
+                    Some((pre.channel, ret_cols, ret_rows, drained))
+                } else {
+                    s.early.remove(&pre.channel);
+                    let _ = s.write_frame(pre.channel, KIND_CLOSE, &[]);
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let (channel, ret_cols, ret_rows, early_frames) = if let Some(hit) = adopted {
+            hit
+        } else {
+            let mut params = serde_json::Map::new();
+            params.insert("terminal".into(), json!(terminal));
+            params.insert("cols".into(), json!(c));
+            params.insert("rows".into(), json!(r));
+            params.insert("history".into(), json!(history.min(10_000)));
+            params.insert("observe".into(), json!(false));
+            if let Some(d) = sanitized_display {
+                params.insert("display".into(), d);
+            }
+
+            let res = call_channel0(&client, "terminal.attach", Value::Object(params))?;
+            let channel = res
+                .get("channel")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| "hc terminal.attach 缺少 channel".to_string())?;
+            let ret_cols = res
+                .pointer("/terminal/cols")
+                .and_then(Value::as_u64)
+                .and_then(|v| u16::try_from(v).ok())
+                .unwrap_or(c);
+            let ret_rows = res
+                .pointer("/terminal/rows")
+                .and_then(Value::as_u64)
+                .and_then(|v| u16::try_from(v).ok())
+                .unwrap_or(r);
+
+            let early_frames = {
+                let mut s = client
+                    .state
+                    .lock()
+                    .map_err(|_| "hc state lock poisoned".to_string())?;
+                s.by_channel.insert(channel, id.clone());
+                s.by_id.insert(
+                    id.clone(),
+                    Attachment {
+                        channel,
+                        consumed: 0,
+                    },
+                );
+                let drained = s
+                    .early
+                    .remove(&channel)
+                    .map(|b| b.frames)
+                    .unwrap_or_default();
+                s.write_frame(channel, KIND_CREDIT, &INITIAL_CREDIT_BYTES.to_le_bytes())?;
+                drained
+            };
+            (channel, ret_cols, ret_rows, early_frames)
         };
 
         let mut closed = false;
@@ -622,7 +866,7 @@ pub fn shutdown() {
 }
 
 const BLOCKED_IMAGE_COMPONENTS: [&str; 5] = [".ssh", ".gnupg", ".aws", ".kube", "keychains"];
-const MAX_LOCAL_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LOCAL_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 fn is_allowed_image_bytes(bytes: &[u8], file_name: &str) -> bool {
     if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {

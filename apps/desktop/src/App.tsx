@@ -16,6 +16,7 @@ import { OnboardingView, type OnboardStep } from "./views/OnboardingView";
 import type { SettingsSection } from "./views/SettingsView";
 import { assistantStore } from "./lib/assistant";
 import { detectPlatform, getHostdStatus, isTauri, loadSession } from "./lib/bridge";
+import { refreshLocalHostIdFast } from "./lib/fonts";
 import { startAutoUpdateChecks, updateStore } from "./lib/updates";
 import { completePairing, pairWithLocalHostWithin, pingRelay, signOut, startRelayLink, stopRelayLink } from "./lib/relay";
 import { allAgents, applyThemeAttribute, liveStore, settingsStore, spacedTitle, updateSettings } from "./lib/store";
@@ -144,6 +145,7 @@ function PocketAppShell() {
   // logged-in herdr-pocket on this computer is tried once with a deadline.
   useEffect(() => {
     let alive = true;
+    void refreshLocalHostIdFast();
     void (async () => {
       await startClientConfig();
       const s = await loadSession();

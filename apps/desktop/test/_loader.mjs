@@ -4,9 +4,22 @@ const protoUrl = new URL("../../../packages/protocol/src/index.ts", import.meta.
 register(
   "data:text/javascript," +
     encodeURIComponent(
-      `export function resolve(specifier, context, nextResolve) {
+      `export async function resolve(specifier, context, nextResolve) {
          if (specifier === "@herdr-pocket/protocol") return nextResolve(${JSON.stringify(protoUrl)}, context);
-         return nextResolve(specifier, context);
+         try {
+           return await nextResolve(specifier, context);
+         } catch (err) {
+           if (err && err.code === "ERR_MODULE_NOT_FOUND" && (specifier.startsWith("./") || specifier.startsWith("../")) && !/\\.[a-z]+$/i.test(specifier)) {
+             for (const ext of [".ts", ".tsx"]) {
+               try {
+                 return await nextResolve(specifier + ext, context);
+               } catch {
+                 // try next extension
+               }
+             }
+           }
+           throw err;
+         }
        }`,
     ),
 );

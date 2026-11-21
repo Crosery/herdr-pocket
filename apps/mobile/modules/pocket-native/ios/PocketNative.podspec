@@ -12,15 +12,18 @@ Pod::Spec.new do |s|
   s.static_framework = true
 
   s.dependency 'ExpoModulesCore'
-  s.dependency 'onnxruntime-objc', '~> 1.30.0'
+  s.dependency 'onnxruntime-c', '~> 1.30.0'
 
   s.frameworks = 'AVFoundation', 'PhotosUI', 'UserNotifications', 'Network'
-  s.source_files = '**/*.{h,m,swift}'
+  s.libraries = 'c++'
+  s.source_files = '**/*.{h,m,mm,swift}'
+  s.public_header_files = 'OrtBridge.h'
   s.resource_bundles = {
     'PocketNativeVoice' => ['Resources/voice/*.onnx']
   }
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
-    'SWIFT_COMPILATION_MODE' => 'wholemodule'
+    'SWIFT_COMPILATION_MODE' => 'wholemodule',
+    'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17'
   }
 end

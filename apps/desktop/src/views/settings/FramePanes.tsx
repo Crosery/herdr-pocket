@@ -6,7 +6,8 @@ import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { PermissionCards, prettyHotkey } from "../../components/VoiceInput";
 import { serverLabel } from "../../components/Sidebar";
 import { copyToClipboard } from "../../lib/bridge";
-import { buildTerminalFontFamily, ensureTerminalFontLoaded, useTerminalFontCatalog } from "../../lib/fonts";
+import { partitionDevices, type ClassifiedDevice } from "../../lib/deviceRole";
+import { buildTerminalFontFamily, ensureTerminalFontLoaded, useLocalHostDeviceId, useTerminalFontCatalog } from "../../lib/fonts";
 import { native, type LogFolderInfo, type Permissions } from "../../lib/native";
 import { setConfig, useClientConfig } from "../../lib/config";
 import { isMockServer } from "../../lib/mock";
@@ -61,6 +62,47 @@ function TextScaleRow() {
   return (
     <SetRow title="文字大小" about="只影响这台电脑上的桌面端，手机不变。">
       <TextScaleStepper />
+    </SetRow>
+  );
+}
+
+const CHAT_DISPLAY_OPTIONS = [
+  { value: "compact", label: "精简", note: "思考与工具折叠为单行" },
+  { value: "standard", label: "标准", note: "思考独立显示，工具自动归组" },
+  { value: "expanded", label: "全展示", note: "思考与工具默认展开" },
+] as const;
+
+export function ChatDisplayModeControl({ className = "segmented" }: { className?: string }) {
+  const toast = useToast();
+  const mode = useClientConfig().general.chatDisplayMode;
+  return (
+    <div className={className} role="radiogroup" aria-label="对话展示模式">
+      {CHAT_DISPLAY_OPTIONS.map((o) => {
+        const active = mode === o.value;
+        return (
+          <button
+            key={o.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            title={o.note}
+            className={active ? (className === "wf-seg" ? "on" : "active") : ""}
+            onClick={() => void setConfig("general.chatDisplayMode", o.value).catch((e: Error) => toast(e.message, true))}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+export function ChatDisplayModeRow() {
+  const mode = useClientConfig().general.chatDisplayMode;
+  const about = CHAT_DISPLAY_OPTIONS.find((o) => o.value === mode)?.note ?? "选择思考过程和工具调用的展示密度。";
+  return (
+    <SetRow title="对话展示模式" about={`${about}（精简：全折叠 · 标准：思考独立、工具归组 · 全展示：默认展开）`}>
+      <ChatDisplayModeControl />
     </SetRow>
   );
 }
@@ -329,6 +371,8 @@ export function LookPane() {
       <ThemeRow />
       <SetHeading>大小</SetHeading>
       <TextScaleRow />
+      <SetHeading>对话</SetHeading>
+      <ChatDisplayModeRow />
       <TerminalSettingsSection />
       <SetHeading>列表</SetHeading>
       <ConfigSwitch k="general.showShells" about="在 Agent 列表里也列出没跑 Agent 的普通终端。" />
@@ -412,31 +456,40 @@ export function KeyboardPane() {
   );
 }
 
-const DESKTOP_PLATFORM = /mac|darwin|win|linux/i;
-
-function DeviceRow({ d, me, agents, onRemove }: { d: Device; me: boolean; agents?: number; onRemove?: () => void }) {
-  const Icon = d.kind === "host" ? Laptop : DESKTOP_PLATFORM.test(d.platform ?? "") ? Monitor : Smartphone;
+function DeviceRow({
+  item,
+  agents,
+  onRemove,
+}: {
+  item: ClassifiedDevice;
+  agents?: number;
+  onRemove?: () => void;
+}) {
+  const { device: d, isCurrentDevice, isLocalHost, isExecutionHost, roleLabel, mergedViewer } = item;
+  const online = d.online || Boolean(mergedViewer?.online);
   const meta = [
     d.kind === "host" ? `${agents ?? 0} 个 Agent` : null,
     d.platform,
     d.version ? `v${d.version}` : null,
-    d.online ? "在线" : `上次 ${relTime(d.lastSeenAt)}`,
+    online ? "在线" : `上次 ${relTime(d.lastSeenAt)}`,
   ]
     .filter(Boolean)
     .join(" · ");
+  const roleTone = isLocalHost ? "mint" : isExecutionHost ? "lav" : "neutral";
   return (
     <SetRow
       title={
         <span className="sf-device">
-          <Icon size={15} />
+          {d.kind === "host" || isExecutionHost ? <Laptop size={15} /> : roleLabel.includes("控制端") && !roleLabel.includes("手机") && !roleLabel.includes("便携") ? <Monitor size={15} /> : <Smartphone size={15} />}
           <span className="truncate">{d.name}</span>
-          {me ? <PocketBadge tone="pink">这台设备</PocketBadge> : null}
+          {isCurrentDevice ? <PocketBadge tone="pink">当前设备 · 本机</PocketBadge> : null}
+          <PocketBadge tone={roleTone}>{roleLabel}</PocketBadge>
         </span>
       }
       about={meta}
     >
       <span className="sf-combo">
-        <span className={`sf-dot${d.online ? " on" : ""}`} aria-label={d.online ? "在线" : "离线"} />
+        <span className={`sf-dot${online ? " on" : ""}`} aria-label={online ? "在线" : "离线"} />
         {onRemove ? (
           <button className="sf-icon-btn" aria-label={`移除 ${d.name}`} title="移除授权" onClick={onRemove}>
             <Trash2 size={14} />
@@ -460,6 +513,7 @@ export function MachinesPane({
   const server = settingsStore.use((s) => s.server);
   const deviceName = settingsStore.use((s) => s.deviceName);
   const myId = settingsStore.use((s) => s.deviceId);
+  const localHostId = useLocalHostDeviceId();
   const link = liveStore.use((s) => s.link);
   const devices = liveStore.use((s) => s.devices);
   const agents = liveStore.use((s) => s.agents);
@@ -467,15 +521,16 @@ export function MachinesPane({
   const [removing, setRemoving] = useState<Device | null>(null);
   const status = linkLabel(link);
   const real = Boolean(server && !isMockServer(server));
-  const byName = (a: Device, b: Device) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name);
-  const hosts = Object.values(devices).filter((d) => d.kind === "host").sort(byName);
-  const viewers = Object.values(devices).filter((d) => d.kind === "viewer").sort(byName);
+  const { desktop, mobile } = useMemo(
+    () => partitionDevices(devices, { myId, localHostId }),
+    [devices, myId, localHostId],
+  );
 
   return (
     <div className="pane">
-      <PaneTitle title="电脑与中继" about="中转服务器让手机和各台电脑隔着网络也能互相找到；每台电脑上的 Agent 关掉窗口也照常运行。" />
+      <PaneTitle title="电脑与中继" about="桌面端是运行载体（可本地直连并与其他桌面端联调），手机端作为便携控制端可远程查看、交互并调度桌面端。" />
 
-      <SetHeading>这台电脑</SetHeading>
+      <SetHeading>当前设备 · 运行载体（本机）</SetHeading>
       <SetRow
         title={
           hostd === null
@@ -490,12 +545,12 @@ export function MachinesPane({
         }
         about={
           hostd === null
-            ? "只看别的电脑上的 Agent 时可以不管。"
+            ? "当前仅作为控制端连接其他桌面端；安装 herdr-pocket 后可把本机作为运行载体。"
             : hostd.configured
-              ? `连在 ${serverLabel(hostd.server ?? null)}，它的 Agent 会出现在 Pocket 里。`
+              ? `本机桌面端终端与文件优先走本地直连（${serverLabel(hostd.server ?? null)}），手机端和其他桌面端也可远程联调。`
               : hostd.installed
                 ? "在终端运行 herdr-pocket up 登录。"
-                : "要让它的 Agent 出现在 Pocket 里，下面标红的都要装好。"
+                : "要让本机的 Agent 出现在 Pocket 里，下面标红的都要装好。"
         }
       >
         <span className="sf-combo">
@@ -539,31 +594,42 @@ export function MachinesPane({
         ) : null}
       </div>
 
-      <SetHeading>手机和桌面端</SetHeading>
-      {viewers.length ? (
-        viewers.map((d) => <DeviceRow key={d.id} d={d} me={d.id === myId} onRemove={d.id === myId ? undefined : () => setRemoving(d)} />)
-      ) : (
-        <div className="faint sf-note">还没有手机连上来。</div>
-      )}
-      <div className="sf-actions">
-        <PocketButton size="sm" variant="soft" onClick={onPairPhone}>
-          <QrCode size={14} />
-          <span>扫码连接手机</span>
-        </PocketButton>
-      </div>
-
-      <SetHeading>电脑</SetHeading>
-      {hosts.length ? (
-        hosts.map((d) => (
-          <DeviceRow key={d.id} d={d} me={false} agents={agents[d.id]?.filter((a) => !a.isShell).length ?? 0} onRemove={() => setRemoving(d)} />
+      <SetHeading>桌面端 · 运行载体（可互相联调）</SetHeading>
+      {desktop.length ? (
+        desktop.map((item) => (
+          <DeviceRow
+            key={item.device.id}
+            item={item}
+            agents={item.device.kind === "host" ? agents[item.device.id]?.filter((a) => !a.isShell).length ?? 0 : undefined}
+            onRemove={item.isCurrentDevice ? undefined : () => setRemoving(item.device)}
+          />
         ))
       ) : (
-        <div className="faint sf-note">还没有电脑加入。</div>
+        <div className="faint sf-note">还没有桌面端运行载体加入。</div>
       )}
       <div className="sf-actions">
         <PocketButton size="sm" variant="ghost" onClick={onAddComputer}>
           <Plus size={14} />
           <span>添加电脑</span>
+        </PocketButton>
+      </div>
+
+      <SetHeading>移动端 · 便携控制</SetHeading>
+      {mobile.length ? (
+        mobile.map((item) => (
+          <DeviceRow
+            key={item.device.id}
+            item={item}
+            onRemove={item.isCurrentDevice ? undefined : () => setRemoving(item.device)}
+          />
+        ))
+      ) : (
+        <div className="faint sf-note">还没有手机端连上来；手机可查看并控制上面的桌面端运行载体。</div>
+      )}
+      <div className="sf-actions">
+        <PocketButton size="sm" variant="soft" onClick={onPairPhone}>
+          <QrCode size={14} />
+          <span>扫码连接手机</span>
         </PocketButton>
       </div>
 

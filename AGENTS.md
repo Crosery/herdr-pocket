@@ -15,7 +15,7 @@ The repository contains the shared wire contract, the relay, the computer host d
 - `apps/desktop`: React 19 + Tauri v2 cross-platform desktop app (macOS, Windows, Linux) and shared HarmonyOS web bundle; excluded from the root pnpm workspace.
 - `apps/harmony`: HarmonyOS NEXT Stage-Model ArkTS shell wrapping `apps/desktop` (`pnpm build:harmony`).
 - `deploy`: systemd, Caddy, launchd, and environment examples. Never put real tokens in these files.
-- `docs/design`, `docs/brand`, `apps/mobile/docs`: design source, brand assets, and emulator/phone evidence.
+- `docs/design`, `docs/brand`, `apps/mobile/docs`: design source (`docs/design/ui-component-rules.md` defines the mandatory UI primitive & visual guardrails), brand assets, and emulator/phone evidence.
 
 ## Commands
 
@@ -50,6 +50,7 @@ The host daemon reads local agents and publishes snapshots; terminal and convers
 ## Change rules
 
 - Keep mobile UI parity across Android, iOS, and HarmonyOS NEXT, and keep the existing pink, no-emoji UI language across mobile and desktop clients.
+- Before adding or editing UI views, form controls, dropdowns, modals, toolbars, or popups in `apps/desktop` or `apps/mobile`, read and follow `docs/design/ui-component-rules.md`: use Pocket primitives (`PocketSelect`, `PocketCheckbox`, `PocketSwitch`, `PocketModal`) — never native OS `<select>`, `<input type="checkbox">`, or `window.confirm` — and classify menu/command icons by function.
 - Preserve uncommitted work; do not reset, clean, stash, or commit unless explicitly requested.
 - Do not send text or keys to real agents during tests.
 - This repository is meant to be published: no real domains, IPs, machine names, project names, ids or tokens in tracked files; use placeholders such as `pocket.example.com`. The project's own public addresses are the exception: the GitHub repo (`RELEASE_REPO` in the protocol), its container image and the Android package id stay real, since in-app updates and installs depend on them.

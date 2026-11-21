@@ -13,6 +13,7 @@ import {
   setAssistantWatching,
 } from "../lib/assistant";
 import { RichMarkdown } from "../lib/markdown";
+import { VoiceMicButton } from "../components/VoiceInput";
 import { hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
 import { useComposerInput } from "../lib/composerKeys";
 import { isMockServer } from "../lib/mock";
@@ -186,22 +187,29 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
 
       {/* Composer */}
       <div className="composer-card">
-        <div className="composer-row">
+        <div className="composer-input-wrap">
           <textarea
             {...composer.textareaProps}
             placeholder="和小羊说点什么…"
             value={text}
             onChange={(e) => setText(e.target.value)}
           />
-          {!text.trim() && (voice || isMockServer(server)) && !inCall ? (
-            <PocketIconButton active className="composer-send" tooltip="语音通话" onClick={() => void startCall()}>
-              <Mic size={17} />
-            </PocketIconButton>
-          ) : (
-            <PocketButton size="sm" className="composer-send" disabled={!text.trim() || sending} onClick={() => void send(text)}>
-              <Send size={14} />
-            </PocketButton>
-          )}
+        </div>
+        <div className="composer-foot">
+          <div className="composer-tools">
+            <VoiceMicButton />
+          </div>
+          <div className="composer-actions">
+            {!text.trim() && (voice || isMockServer(server)) && !inCall ? (
+              <PocketIconButton active className="composer-send" tooltip="语音通话" onClick={() => void startCall()}>
+                <Phone size={15} />
+              </PocketIconButton>
+            ) : (
+              <PocketButton size="sm" className="composer-send" disabled={!text.trim() || sending} aria-label="发送" onClick={() => void send(text)}>
+                <Send size={14} />
+              </PocketButton>
+            )}
+          </div>
         </div>
       </div>
 

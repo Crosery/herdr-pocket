@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
-import { Check, Copy, Laptop, Plus, Smartphone, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Check, Copy, Laptop, Monitor, Plus, Smartphone, Trash2 } from "lucide-react";
 import type { Device, DeviceKind, PairCode } from "@herdr-pocket/protocol";
 import { EmptyState, PocketBadge, PocketButton, PocketCard, PocketIconButton, PocketModal, fs, useToast } from "../components/PocketUI";
 import { copyToClipboard } from "../lib/bridge";
+import { partitionDevices, type ClassifiedDevice } from "../lib/deviceRole";
+import { useLocalHostDeviceId } from "../lib/fonts";
 import { installHostCommand } from "../components/LocalHostDeps";
 import { createPairCode, getActiveToken, revokeDevice } from "../lib/relay";
 import { isMockServer } from "../lib/mock";
@@ -21,17 +23,72 @@ export function DevicesView({
   const devicesMap = liveStore.use((s) => s.devices);
   const agentsMap = liveStore.use((s) => s.agents);
   const myId = settingsStore.use((s) => s.deviceId);
+  const localHostId = useLocalHostDeviceId();
   const [inviteOpen, setInviteOpen] = useState(false);
   useEffect(() => {
     if (addHostNonce) setInviteOpen(true);
   }, [addHostNonce]);
   const [confirmRemove, setConfirmRemove] = useState<Device | null>(null);
 
-  const devices = Object.values(devicesMap).sort(
-    (a, b) => Number(a.kind !== "host") - Number(b.kind !== "host") || Number(b.online) - Number(a.online) || a.name.localeCompare(b.name),
+  const { desktop, mobile, desktopOnlineCount, mobileOnlineCount } = useMemo(
+    () => partitionDevices(devicesMap, { myId, localHostId }),
+    [devicesMap, myId, localHostId],
   );
-  const hosts = devices.filter((d) => d.kind === "host");
-  const viewers = devices.filter((d) => d.kind === "viewer");
+  const totalCount = desktop.length + mobile.length;
+
+  const renderCard = (item: ClassifiedDevice) => {
+    const d = item.device;
+    const isHost = d.kind === "host";
+    const count = isHost ? agentsMap[d.id]?.filter((a) => !a.isShell).length ?? 0 : 0;
+    const online = d.online || Boolean(item.mergedViewer?.online);
+    const isDesktopViewer = !isHost && /控制端|desktop|桌面/i.test(item.roleLabel) && !/手机/.test(item.roleLabel);
+    const Icon = isHost ? Laptop : isDesktopViewer ? Monitor : Smartphone;
+    const roleTone = item.isLocalHost ? "mint" : item.isExecutionHost ? "lav" : "neutral";
+    return (
+      <PocketCard key={d.id}>
+        <div className="device-card">
+          <div className="device-main">
+            <div className={`device-icon${online ? " on" : ""}`}>
+              <Icon size={20} />
+            </div>
+            <div className="device-text">
+              <div className="device-name-row">
+                <span className="device-name" title={d.name}>{d.name}</span>
+                {item.isCurrentDevice ? <PocketBadge tone="pink">当前设备 · 本机</PocketBadge> : null}
+                {item.isCurrentDevice && !isHost ? null : <PocketBadge tone={roleTone}>{item.roleLabel}</PocketBadge>}
+                <PocketBadge tone={online ? "mint" : "neutral"} pulse={online}>
+                  {online ? "在线" : "离线"}
+                </PocketBadge>
+              </div>
+              <div className="faint device-meta">
+                {[
+                  d.platform,
+                  d.version ? `v${d.version}` : null,
+                  isHost ? `${count} 个 Agent` : item.isCurrentDevice ? item.roleLabel : null,
+                  `最后活动 ${relTime(d.lastSeenAt)}`,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </div>
+            </div>
+          </div>
+
+          <div className="device-actions">
+            {isHost ? (
+              <PocketButton size="sm" variant="soft" onClick={() => onShowHostAgents(d.id)}>
+                看它的 Agents
+              </PocketButton>
+            ) : null}
+            {!item.isCurrentDevice ? (
+              <PocketIconButton size="sm" tooltip="移除授权" onClick={() => setConfirmRemove(d)}>
+                <Trash2 size={15} />
+              </PocketIconButton>
+            ) : null}
+          </div>
+        </div>
+      </PocketCard>
+    );
+  };
 
   return (
     <div className="main-scroll">
@@ -39,7 +96,9 @@ export function DevicesView({
         <div className="between wrap" style={{ gap: 10, flexWrap: "wrap" }}>
           <div style={{ flex: "1 1 220px", minWidth: 0 }}>
             <h2 className="cute-font" style={{ margin: 0, fontSize: fs(26) }}>设备管理</h2>
-            <div className="faint">在线电脑 {hosts.filter((h) => h.online).length}/{hosts.length} · 客户端 {viewers.filter((v) => v.online).length}/{viewers.length}</div>
+            <div className="faint">
+              桌面运行载体 {desktopOnlineCount}/{desktop.length} · 移动控制端 {mobileOnlineCount}/{mobile.length}
+            </div>
           </div>
           <div className="row wrap" style={{ gap: 8 }}>
             {onPairPhone ? (
@@ -55,53 +114,33 @@ export function DevicesView({
           </div>
         </div>
 
-        {devices.length === 0 ? (
+        {totalCount === 0 ? (
           <EmptyState mood="sleepy" title="还没有已配对设备" body="点“添加电脑”拿到安装命令，或点“扫码连接手机”。" />
         ) : (
-          <div className="stack" style={{ gap: 10 }}>
-            {devices.map((d) => {
-              const count = agentsMap[d.id]?.filter((a) => !a.isShell).length ?? 0;
-              const isHost = d.kind === "host";
-              const isMe = d.id === myId;
-              return (
-                <PocketCard key={d.id}>
-                  <div className="device-card">
-                    <div className="device-main">
-                      <div className={`device-icon${d.online ? " on" : ""}`}>
-                        {isHost ? <Laptop size={20} /> : <Smartphone size={20} />}
-                      </div>
-                      <div className="device-text">
-                        <div className="device-name-row">
-                          <span className="device-name" title={d.name}>{d.name}</span>
-                          {isMe ? <PocketBadge tone="pink">这台设备</PocketBadge> : null}
-                          <PocketBadge tone={d.online ? "mint" : "neutral"} pulse={d.online}>
-                            {d.online ? "在线" : "离线"}
-                          </PocketBadge>
-                        </div>
-                        <div className="faint device-meta">
-                          {[d.platform, d.version ? `v${d.version}` : null, isHost ? `${count} 个 Agent` : "控制器", `最后活动 ${relTime(d.lastSeenAt)}`]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </div>
-                      </div>
-                    </div>
+          <div className="stack" style={{ gap: 18 }}>
+            <div className="stack" style={{ gap: 10 }}>
+              <div className="device-section-head">
+                <span className="device-section-title">桌面端 · 运行载体</span>
+                <span className="faint device-section-sub">可直接运行终端/Agent 并本地直连，也可互相远程联调</span>
+              </div>
+              {desktop.length ? (
+                desktop.map(renderCard)
+              ) : (
+                <div className="faint device-section-empty">还没有桌面端加入。</div>
+              )}
+            </div>
 
-                    <div className="device-actions">
-                      {isHost ? (
-                        <PocketButton size="sm" variant="soft" onClick={() => onShowHostAgents(d.id)}>
-                          看它的 Agents
-                        </PocketButton>
-                      ) : null}
-                      {!isMe ? (
-                        <PocketIconButton size="sm" tooltip="移除授权" onClick={() => setConfirmRemove(d)}>
-                          <Trash2 size={15} />
-                        </PocketIconButton>
-                      ) : null}
-                    </div>
-                  </div>
-                </PocketCard>
-              );
-            })}
+            <div className="stack" style={{ gap: 10 }}>
+              <div className="device-section-head">
+                <span className="device-section-title">移动端 · 便携控制</span>
+                <span className="faint device-section-sub">随时随地查看消息、排队发送并控制任意在线桌面端</span>
+              </div>
+              {mobile.length ? (
+                mobile.map(renderCard)
+              ) : (
+                <div className="faint device-section-empty">还没有手机端加入，点右上角“扫码连接手机”即可控制桌面端。</div>
+              )}
+            </div>
           </div>
         )}
       </div>

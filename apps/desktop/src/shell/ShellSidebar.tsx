@@ -1,17 +1,20 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
 import { ChevronDown, ChevronRight, Eye, History, Laptop, PanelLeft, Plus, QrCode, Search, Server, Settings, X } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
 import { serverLabel } from "../components/Sidebar";
 import { assetUrl } from "../lib/bridge";
+import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
 import { pingRelay } from "../lib/relay";
 import { agentSpace, agentTitle, allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
 import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
+import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
 import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, tileLetter, toneIndex, type ListGroup } from "./agentInfo";
 import { openAgentTab, openSettingsFrame, setPalette, setPeek, setSelectedSpace, shellStore } from "./shellStore";
 import { shortcutText } from "./shortcuts";
+import { buildHostSpaces, spaceColorVars } from "./spaceSync";
 
 const FOLD_KEY = "herdr-pocket-v3-folded";
 const SORT_KEY = "herdr-pocket-v3-agent-sort";
@@ -58,9 +61,11 @@ export function ShellSidebar({
 }) {
   const agentsMap = liveStore.use((s) => s.agents);
   const devices = liveStore.use((s) => s.devices);
+  const spacesMap = liveStore.use((s) => s.spaces);
   const link = liveStore.use((s) => s.link);
   const server = settingsStore.use((s) => s.server);
   const showShells = settingsStore.use((s) => s.showShells);
+  const localHostId = useLocalHostDeviceId();
   const activeTab = shellStore.use((s) => s.tabs.find((t) => t.id === s.active) ?? null);
   const updateReady = updateStore.use((s) => Boolean(s.info?.hasUpdate));
   useVisibleTick(30_000); // re-render so the ages move
@@ -69,7 +74,8 @@ export function ShellSidebar({
   const [folded, setFolded] = useState<string[]>(() => readJson<string[]>(FOLD_KEY, []));
   const [sort, setSortState] = useState<"status" | "recent">(() => readJson(SORT_KEY, "status"));
   const spaceSel = shellStore.use((s) => s.selectedSpace);
-  const setSpaceSel = setSelectedSpace;
+  const allByKey = useMemo(() => new Map(Object.values(agentsMap).flat().map((a) => [a.key, a] as const)), [agentsMap]);
+  const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k));
 
   const toggleFold = (id: string) => {
     const next = folded.includes(id) ? folded.filter((x) => x !== id) : [...folded, id];
@@ -83,29 +89,24 @@ export function ShellSidebar({
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
 
-  // 空间: one block per computer (online first), its spaces under it, most urgent first.
+  // 空间: one block per computer (local/online first), spaces in exact Herdr App order with colors & 0-agent spaces.
   const machines = useMemo(() => {
     const ids = new Set<string>([...Object.values(devices).filter((d) => d.kind === "host").map((d) => d.id), ...agents.map((a) => a.deviceId)]);
     return [...ids]
       .map((id) => {
         const dev = devices[id];
-        const per = new Map<string, Agent[]>();
-        for (const a of agents) {
-          if (a.deviceId !== id) continue;
-          const sp = agentSpace(a) ?? "";
-          per.set(sp, [...(per.get(sp) ?? []), a]);
-        }
-        const spaces = [...per.entries()].map(([name, list]) => {
-          const groups = list.map((a) => listGroup(a, devices));
-          const blocked = groups.filter((g) => g === "blocked").length;
-          const best = groups.reduce<ListGroup>((b, g) => (GROUP_RANK[g] < GROUP_RANK[b] ? g : b), "offline");
-          return { id: `${id}\u0000${name}`, deviceId: id, name, count: list.length, blocked, best, latest: Math.max(...list.map(lastChange)) };
-        });
-        spaces.sort((x, y) => y.blocked - x.blocked || GROUP_RANK[x.best] - GROUP_RANK[y.best] || y.latest - x.latest);
-        return { id, name: dev?.name ?? id, online: dev?.online ?? false, spaces, count: spaces.reduce((n, s) => n + s.count, 0) };
+        const spaces = buildHostSpaces(id, spacesMap[id], agents, devices);
+        return {
+          id,
+          name: dev?.name ?? id,
+          online: dev?.online ?? false,
+          isLocal: Boolean(localHostId && id === localHostId),
+          spaces,
+          count: spaces.reduce((n, s) => n + s.count, 0),
+        };
       })
-      .sort((x, y) => Number(y.online) - Number(x.online) || x.name.localeCompare(y.name));
-  }, [agents, devices]);
+      .sort((x, y) => Number(y.isLocal) - Number(x.isLocal) || Number(y.online) - Number(x.online) || x.name.localeCompare(y.name));
+  }, [agents, devices, localHostId, spacesMap]);
 
   const selected = spaceSel && machines.some((m) => m.spaces.some((s) => s.id === spaceSel)) ? spaceSel : null;
   const [selDevice, selSpace] = selected ? (selected.split("\u0000") as [string, string]) : [null, null];
@@ -142,8 +143,12 @@ export function ShellSidebar({
         key={a.key}
         role="button"
         tabIndex={0}
+        draggable
+        data-tauri-drag-region="false"
         className={`v3-row v3-agent${a.key === activeAgentKey ? " selected" : ""}${g === "offline" ? " dim" : ""}`}
         title={collapsed ? label : undefined}
+        onDragStart={(e) => startPanelDrag(e, { kind: "agent", agentKey: a.key })}
+        onDragEnd={() => endPanelDrag()}
         onClick={() => openAgentTab(a.key)}
         onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), openAgentTab(a.key))}
       >
@@ -225,6 +230,7 @@ export function ShellSidebar({
                     <div className="v3-row v3-machine" onClick={() => toggleFold(m.id)}>
                       <Laptop size={13} />
                       <span className="truncate grow">{m.name}</span>
+                      {m.isLocal ? <span className="v3-local-pill">本机</span> : null}
                       {m.online ? (
                         <button
                           className="v3-icon-btn small hover-only"
@@ -245,25 +251,53 @@ export function ShellSidebar({
                     ? null
                     : m.spaces.map((s) => {
                         const label = s.name || "未分空间";
+                        const custom = spaceColorVars(s.color);
+                        const tileStyle = custom
+                          ? ({ "--sp-fg": custom.fg, "--sp-bg": custom.bg } as CSSProperties)
+                          : undefined;
                         return (
                           <div
                             key={s.id}
                             role="button"
                             tabIndex={0}
                             aria-pressed={selected === s.id}
-                            className={`v3-row v3-space${selected === s.id ? " selected" : ""}`}
-                            title={collapsed ? `${m.name} · ${label}` : undefined}
+                            className={`v3-row v3-space${s.count === 0 ? " empty" : ""}${selected === s.id ? " selected" : ""}`}
+                            title={collapsed ? `${m.name} · ${label}` : s.folder || undefined}
                             onClick={() => setSpaceSel(selected === s.id ? null : s.id)}
                             onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setSpaceSel(selected === s.id ? null : s.id))}
                           >
-                            <span className={`v3-tile tone-${toneIndex(label)}`} aria-hidden>
+                            <span
+                              className={`v3-tile${custom ? " custom" : ` tone-${toneIndex(label)}`}`}
+                              style={tileStyle}
+                              aria-hidden
+                            >
                               {tileLetter(label)}
                             </span>
                             {collapsed ? null : (
                               <>
                                 <span className="v3-row-label truncate">{label}</span>
+                                {m.online ? (
+                                  <button
+                                    type="button"
+                                    className="v3-icon-btn small hover-only"
+                                    aria-label={`在空间 ${label} 新建 Agent`}
+                                    title={`在空间 ${label} 新建 Agent`}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      onNewAgent(m.id, s.name || null);
+                                    }}
+                                  >
+                                    <Plus size={12} />
+                                  </button>
+                                ) : null}
                                 <span className="v3-count">{s.count}</span>
-                                {s.blocked ? <span className="v3-need">需要你</span> : <StatusMark group={s.best} />}
+                                {s.count === 0 ? (
+                                  <span className="v3-ring" aria-label="暂无运行中 Agent" />
+                                ) : s.blocked ? (
+                                  <span className="v3-need">需要你</span>
+                                ) : (
+                                  <StatusMark group={s.best} />
+                                )}
                               </>
                             )}
                           </div>

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { Agent, AgentStatus, Device } from "@herdr-pocket/protocol";
+import type { Agent, AgentStatus, ChatDisplayMode, Device, SpaceInfo } from "@herdr-pocket/protocol";
 import { STATUS_ORDER } from "@herdr-pocket/protocol";
 
 export type LinkStatus = "idle" | "connecting" | "online" | "offline" | "unauthorized";
@@ -12,6 +12,7 @@ export interface AppSettings {
   lastServer: string | null;
   theme: ThemeChoice;
   textScale: number;
+  chatDisplayMode: ChatDisplayMode;
   showShells: boolean;
   notifications: boolean;
   denoise: boolean;
@@ -27,6 +28,8 @@ export interface LiveState {
   link: LinkStatus;
   devices: Record<string, Device>;
   agents: Record<string, Agent[]>;
+  spaces: Record<string, SpaceInfo[]>;
+  direct: Record<string, string>;
   rev: number;
 }
 
@@ -46,6 +49,7 @@ function persistPrefs(s: AppSettings): void {
     lastServer: s.lastServer,
     theme: s.theme,
     textScale: s.textScale,
+    chatDisplayMode: s.chatDisplayMode,
     showShells: s.showShells,
     notifications: s.notifications,
     denoise: s.denoise,
@@ -71,7 +75,17 @@ export function createStore<T>(initial: T) {
   const listeners = new Set<() => void>();
   const get = () => state;
   const set = (patch: Partial<T> | ((prev: T) => T)) => {
-    const next = typeof patch === "function" ? patch(state) : { ...state, ...patch };
+    const next =
+      typeof patch === "function"
+        ? patch(state)
+        : state !== null &&
+            typeof state === "object" &&
+            !Array.isArray(state) &&
+            patch !== null &&
+            typeof patch === "object" &&
+            !Array.isArray(patch)
+          ? { ...state, ...patch }
+          : (patch as T);
     state = next;
     for (const l of listeners) l();
   };
@@ -99,6 +113,7 @@ export const settingsStore = createStore<AppSettings>({
   lastServer: saved.lastServer ?? null,
   theme: saved.theme ?? "system",
   textScale: saved.textScale ?? 1,
+  chatDisplayMode: saved.chatDisplayMode ?? "standard",
   showShells: saved.showShells ?? false,
   notifications: saved.notifications ?? true,
   denoise: saved.denoise ?? true,
@@ -135,6 +150,8 @@ export const liveStore = createStore<LiveState>({
   link: "idle",
   devices: {},
   agents: {},
+  spaces: {},
+  direct: {},
   rev: 0,
 });
 

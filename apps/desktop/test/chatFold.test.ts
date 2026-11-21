@@ -45,7 +45,7 @@ test("foldConvEvents: pairs tool_call + tool_result, collapses multi-tool runs, 
     { id: "c3", session: "s", ts: 7, kind: "tool_call", call_id: "call-3", name: "run_command", input: { CommandLine: "pnpm test" } },
   ];
 
-  const runningRows = foldConvEvents(runningEvents);
+  const runningRows = foldConvEvents(runningEvents, "compact");
   assert.equal(runningRows.length, 2);
   assert.equal(runningRows[0]?.kind, "user");
   if (runningRows[0]?.kind === "user") {
@@ -71,7 +71,7 @@ test("foldConvEvents: pairs tool_call + tool_result, collapses multi-tool runs, 
     { id: "c3r", session: "s", ts: 8, kind: "tool_result", call_id: "call-3", name: "run_command", output: "PASS", is_error: false },
     { id: "a1", session: "s", ts: 9, kind: "assistant_message", text: "全部完成" },
   ];
-  const completedRows = foldConvEvents(completedEvents);
+  const completedRows = foldConvEvents(completedEvents, "compact");
   assert.equal(completedRows.length, 3);
   if (completedRows[1]?.kind === "activity_group") {
     assert.equal(completedRows[1].running, false);

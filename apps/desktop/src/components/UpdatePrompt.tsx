@@ -1,7 +1,8 @@
-import { Download, RefreshCw, RotateCcw, Sparkles, X } from "lucide-react";
-import { isTauri, openExternalUrl } from "../lib/bridge";
+import { CheckCircle2, Download, Minimize2, RefreshCw, RotateCcw, Sparkles, X } from "lucide-react";
+import { openExternalUrl } from "../lib/bridge";
 import {
   dismissUpdatePrompt,
+  minimizeUpdatePrompt,
   restartToApplyUpdate,
   startUpdateDownload,
   updateStore,
@@ -26,13 +27,37 @@ function briefReleaseText(raw: string | undefined): string {
 }
 
 /**
- * Bottom-right desktop update notification card: prompts on new GitHub Releases,
- * streams & SHA-256 verifies installer assets natively, and offers one-click restart.
+ * Orca-style bottom-right desktop update notification card anchored above `.v3-status`,
+ * with minimize-to-status-bar, version delta chip, SHA-256 staging, and session reassurance copy.
  */
 export function UpdatePrompt() {
   const st = updateStore.use((s) => s);
   const viewingUpdatesPane = shellStore.use((s) => s.settings === "updates");
-  if (!isTauri() || viewingUpdatesPane || !st.info?.hasUpdate) return null;
+  if (viewingUpdatesPane) return null;
+
+  if (!st.info?.hasUpdate) {
+    if (!st.manualNotice) return null;
+    return (
+      <aside className="update-toast-card compact" role="status" aria-live="polite" aria-label="更新状态提示">
+        <div className="update-toast-head">
+          <CheckCircle2 size={16} style={{ color: "var(--mint-text)", flex: "none" }} />
+          <div className="update-toast-titles">
+            <div className="update-toast-title">{st.manualNotice}</div>
+          </div>
+          <button
+            type="button"
+            className="update-toast-close"
+            aria-label="关闭提示"
+            onClick={() => updateStore.set({ manualNotice: null })}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      </aside>
+    );
+  }
+
+  if (st.minimized) return null;
   if (st.dismissedVersion === st.info.latest && (st.installPhase === "idle" || st.installPhase === "ready")) return null;
 
   const info = st.info;
@@ -56,7 +81,7 @@ export function UpdatePrompt() {
   } else if (phase === "staging") {
     statusLine = st.progress?.message || "正在校验签名并准备更新包…";
   } else if (phase === "ready") {
-    statusLine = `v${info.latest} 已下载并校验通过，重启后完成替换`;
+    statusLine = `v${info.latest} 已下载并校验通过，重启即可完成更新`;
   } else if (phase === "restarting") {
     statusLine = "正在重启并安装新版本…";
   } else if (phase === "error") {
@@ -69,15 +94,27 @@ export function UpdatePrompt() {
         <XiaoyangOrb mood={phase === "ready" ? "hello" : busy ? "working" : "hello"} size={30} />
         <div className="update-toast-titles">
           <div className="update-toast-title">
-            {phase === "ready" ? `v${info.latest} 已就绪` : `发现新版本 v${info.latest}`}
+            {phase === "ready" ? `v${info.latest} 更新已就绪` : `发现新版本 v${info.latest}`}
           </div>
-          <div className="update-toast-sub">当前 v{info.current}</div>
+          <div className="update-toast-sub">
+            v{info.current} → v{info.latest}
+          </div>
         </div>
+        <button
+          type="button"
+          className="update-toast-close"
+          aria-label="收起到底部状态栏"
+          title="收起到底部状态栏"
+          onClick={() => minimizeUpdatePrompt()}
+        >
+          <Minimize2 size={13} />
+        </button>
         {!busy ? (
           <button
             type="button"
             className="update-toast-close"
-            aria-label="稍后提醒"
+            aria-label="忽略此版本"
+            title="暂时关闭提示"
             onClick={() => dismissUpdatePrompt()}
           >
             <X size={14} />
@@ -90,6 +127,8 @@ export function UpdatePrompt() {
           <div className="update-toast-notes-clamp">{summary}</div>
         </div>
       ) : null}
+
+      <div className="update-toast-reassure">重启更新后将自动恢复当前工作区，不会中断后台终端与 Agent</div>
 
       <div className={`update-toast-status${phase === "error" ? " error" : ""}`}>{statusLine}</div>
 
@@ -131,9 +170,9 @@ export function UpdatePrompt() {
           <>
             <PocketButton size="sm" variant="primary" onClick={() => void startUpdateDownload()}>
               <Download size={13} />
-              <span>立即下载更新</span>
+              <span>立即更新</span>
             </PocketButton>
-            <PocketButton size="sm" variant="ghost" onClick={() => dismissUpdatePrompt()}>
+            <PocketButton size="sm" variant="ghost" onClick={() => minimizeUpdatePrompt()}>
               <span>稍后</span>
             </PocketButton>
             <button

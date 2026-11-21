@@ -3,6 +3,7 @@ import {
   type ClientFrame,
   type Device,
   type DeviceKind,
+  type DirectOffer,
   type JoinRequest,
   type PairCode,
   type PairRequest,
@@ -13,6 +14,8 @@ import {
   type RpcResult,
   type ServerFrame,
 } from "@herdr-pocket/protocol";
+import { DirectError, DirectLink, SAFE_AGAIN } from "./direct";
+import { localHostIdStore, refreshLocalHostIdFast } from "./fonts";
 import { liveStore, settingsStore, updateSettings } from "./store";
 import { clearSession, defaultDeviceName, detectPlatform, getLocalPairCode, pushSystemNotification, saveSession, type LocalPairError } from "./bridge";
 import { isMockServer, mockApi } from "./mock";
@@ -184,6 +187,13 @@ interface Sub {
   params: unknown;
   onEvent: StreamCb;
   onState?: StreamCb;
+  via?: DirectLink;
+}
+
+interface DirectTryState {
+  busy: boolean;
+  next: number;
+  fails: number;
 }
 
 class SocketClient {
@@ -191,6 +201,11 @@ class SocketClient {
   private notifyWs: WebSocket | null = null;
   private pending = new Map<string, PendingRpc>();
   private subs = new Map<string, Sub>();
+  private direct = new Map<string, DirectLink>();
+  private directTry = new Map<string, DirectTryState>();
+  private spaceInflight = new Map<string, Promise<void>>();
+  private spaceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private spaceSig = new Map<string, string>();
   private seq = 0;
   private backoff = 1000;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -328,7 +343,9 @@ class SocketClient {
       }
     }
     if (!this.closed) setLink(code === 4001 ? "unauthorized" : "offline", reason);
-    for (const s of subs) safely(() => s.onState?.({ kind: "stale", error: "连接断开" }));
+    for (const s of subs) {
+      if (!s.via) safely(() => s.onState?.({ kind: "stale", error: "连接断开" }));
+    }
     for (const p of pending) {
       clearTimeout(p.timer);
       safely(() => p.reject(new RelayError("offline", "连接断开")));
@@ -397,6 +414,7 @@ class SocketClient {
     const link = liveStore.get().link;
     if (link === "unauthorized") return;
     if (settingsStore.get().notifications && !this.notifyWs) this.openNotify();
+    this.tryDirectAll(cause.includes("network") || cause.includes("wake"));
     const ws = this.ws;
     if (ws?.readyState === WebSocket.OPEN) {
       // One ping in flight is enough (focus and app wake usually arrive together).
@@ -472,8 +490,9 @@ class SocketClient {
         this.attempt = 0;
         void loadAssistant();
         for (const s of this.subs.values()) {
-          this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
+          if (!s.via) this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
         }
+        this.tryDirectAll(false);
         break;
       case "snapshot": {
         const devices: Record<string, Device> = {};
@@ -481,6 +500,13 @@ class SocketClient {
         const agents: Record<string, import("@herdr-pocket/protocol").Agent[]> = {};
         for (const a of f.agents) (agents[a.deviceId] ??= []).push(a);
         liveStore.set({ devices, agents, rev: liveStore.get().rev + 1 });
+        for (const d of f.devices) {
+          if (d.kind === "host" && !d.online) this.closeDirectFor(d.id);
+        }
+        this.tryDirectAll(true);
+        for (const d of f.devices) {
+          if (d.kind === "host" && d.online) this.scheduleSpacesRefresh(d.id, 0);
+        }
         break;
       }
       case "device":
@@ -489,14 +515,27 @@ class SocketClient {
           devices: { ...prev.devices, [f.device.id]: f.device },
           rev: prev.rev + 1,
         }));
+        if (f.device.kind === "host") {
+          if (f.device.online) {
+            this.tryDirect(f.device.id, true);
+            this.scheduleSpacesRefresh(f.device.id, 0);
+          } else {
+            this.closeDirectFor(f.device.id);
+          }
+        }
         break;
       case "device_removed":
+        this.closeDirectFor(f.id);
+        this.clearSpaceTimer(f.id);
+        this.spaceSig.delete(f.id);
         liveStore.set((prev) => {
           const devices = { ...prev.devices };
           delete devices[f.id];
           const agents = { ...prev.agents };
           delete agents[f.id];
-          return { ...prev, devices, agents, rev: prev.rev + 1 };
+          const spaces = { ...prev.spaces };
+          delete spaces[f.id];
+          return { ...prev, devices, agents, spaces, rev: prev.rev + 1 };
         });
         break;
       case "agents":
@@ -505,6 +544,9 @@ class SocketClient {
           agents: { ...prev.agents, [f.deviceId]: f.agents },
           rev: prev.rev + 1,
         }));
+        if (liveStore.get().devices[f.deviceId]?.online !== false) {
+          this.scheduleSpacesRefresh(f.deviceId, 500);
+        }
         break;
       case "rpc_result": {
         const p = this.pending.get(f.id);
@@ -559,7 +601,158 @@ class SocketClient {
     }
   }
 
-  call(to: string, method: RpcMethod, params: unknown, timeoutMs = 15_000): Promise<unknown> {
+  private openStream(s: Sub): void {
+    const sent = s.via
+      ? s.via.subscribe(s.id, s.stream, s.params)
+      : this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
+    if (!sent) s.onState?.({ kind: "stale", error: "连接断开" });
+  }
+
+  private rehome(to: string): void {
+    const link = this.direct.get(to);
+    const active = link?.open ? link : undefined;
+    for (const s of [...this.subs.values()]) {
+      if (s.to !== to || s.via === active) continue;
+      if (s.via) s.via.unsubscribe(s.id);
+      else if (this.ws?.readyState === WebSocket.OPEN) this.send({ type: "stream_unsubscribe", id: s.id, to });
+      this.subs.delete(s.id);
+      s.id = `s${++this.seq}`;
+      s.via = active;
+      this.subs.set(s.id, s);
+      this.openStream(s);
+    }
+  }
+
+  private clearSpaceTimer(hostId: string): void {
+    const t = this.spaceTimers.get(hostId);
+    if (t) {
+      clearTimeout(t);
+      this.spaceTimers.delete(hostId);
+    }
+  }
+
+  scheduleSpacesRefresh(hostId: string, delayMs = 0): void {
+    if (this.closed) return;
+    if (delayMs <= 0) {
+      this.clearSpaceTimer(hostId);
+      void this.refreshHostSpaces(hostId);
+      return;
+    }
+    if (this.spaceTimers.has(hostId)) return;
+    const t = setTimeout(() => {
+      this.spaceTimers.delete(hostId);
+      void this.refreshHostSpaces(hostId);
+    }, delayMs);
+    this.spaceTimers.set(hostId, t);
+  }
+
+  refreshHostSpaces(hostId: string): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    const inflight = this.spaceInflight.get(hostId);
+    if (inflight) return inflight;
+    const job = (this.call(hostId, "spaces.list", {}, 10_000) as Promise<RpcResult<"spaces.list">>)
+      .then((res) => {
+        if (this.closed || !Array.isArray(res?.spaces)) return;
+        const sig = JSON.stringify(res.spaces);
+        if (this.spaceSig.get(hostId) === sig) return;
+        this.spaceSig.set(hostId, sig);
+        liveStore.set((prev) => ({
+          ...prev,
+          spaces: { ...prev.spaces, [hostId]: res.spaces },
+          rev: prev.rev + 1,
+        }));
+      })
+      .catch(() => {
+        // Offline or older hostd: keep previous spaces safely.
+      })
+      .finally(() => {
+        this.spaceInflight.delete(hostId);
+      });
+    this.spaceInflight.set(hostId, job);
+    return job;
+  }
+
+  private closeDirectFor(to: string): void {
+    const link = this.direct.get(to);
+    if (link) {
+      link.close();
+    }
+  }
+
+  private tryDirectAll(now: boolean): void {
+    if (this.closed || this.ws?.readyState !== WebSocket.OPEN) return;
+    const localId = localHostIdStore.get();
+    for (const d of Object.values(liveStore.get().devices)) {
+      if (d.kind === "host" && d.online) {
+        this.tryDirect(d.id, now || (localId !== null && d.id === localId));
+      }
+    }
+  }
+
+  private tryDirect(to: string, now: boolean): void {
+    if (this.closed || this.ws?.readyState !== WebSocket.OPEN) return;
+    if (this.direct.get(to)?.open) return;
+    const t = this.directTry.get(to) ?? { busy: false, next: 0, fails: 0 };
+    this.directTry.set(to, t);
+    if (t.busy || t.next === Infinity || (!now && Date.now() < t.next)) return;
+    t.busy = true;
+    void (async () => {
+      try {
+        const localId = localHostIdStore.get() ?? (await refreshLocalHostIdFast());
+        const preferLoopback = localId !== null && localId === to;
+        const offer = (await this.relayCall(to, "direct.offer", {}, 8_000)) as DirectOffer;
+        if (this.closed) return;
+        const link = await DirectLink.open(
+          to,
+          offer,
+          {
+            onStream: (frame) => this.onFrame(frame),
+            onClose: (l) => this.directGone(l),
+          },
+          preferLoopback,
+        );
+        if (this.closed) {
+          link.close();
+          return;
+        }
+        t.fails = 0;
+        t.next = 0;
+        this.direct.set(to, link);
+        liveStore.set((prev) => ({ ...prev, direct: { ...prev.direct, [to]: link.addr } }));
+        logger.info("link", `direct link to ${liveStore.get().devices[to]?.name ?? to} via ${link.addr}`);
+        this.rehome(to);
+      } catch (e) {
+        t.fails += 1;
+        if (e instanceof RelayError && (e.code === "unsupported" || e.code === "forbidden")) {
+          t.next = Infinity;
+        } else {
+          const isLocal = localHostIdStore.get() === to;
+          const capMs = isLocal ? 15_000 : 5 * 60_000;
+          const baseMs = isLocal ? 2_000 : 15_000;
+          t.next = Date.now() + Math.min(capMs, baseMs * 2 ** Math.min(t.fails - 1, 5));
+        }
+      } finally {
+        t.busy = false;
+      }
+    })();
+  }
+
+  private directGone(link: DirectLink): void {
+    if (this.direct.get(link.to) !== link) return;
+    this.direct.delete(link.to);
+    liveStore.set((prev) => {
+      const direct = { ...prev.direct };
+      delete direct[link.to];
+      return { ...prev, direct };
+    });
+    if (this.closed) return;
+    logger.info("link", `direct link closed (${link.to}), using relay`);
+    const t = this.directTry.get(link.to);
+    if (t && t.next !== Infinity) t.next = Date.now() + 2_000;
+    this.rehome(link.to);
+  }
+
+  private relayCall(to: string, method: RpcMethod, params: unknown, timeoutMs = 15_000): Promise<unknown> {
     if (this.ws?.readyState !== WebSocket.OPEN) {
       return Promise.reject(new RelayError("offline", "当前未连上服务器"));
     }
@@ -578,16 +771,33 @@ class SocketClient {
     });
   }
 
+  call(to: string, method: RpcMethod, params: unknown, timeoutMs = 15_000): Promise<unknown> {
+    const link = this.direct.get(to);
+    if (!link?.open || method === "direct.offer") {
+      return this.relayCall(to, method, params, timeoutMs);
+    }
+    return link.call(method, params, timeoutMs).catch((err: unknown) => {
+      if (!(err instanceof DirectError)) throw err;
+      if ((err.code === "offline" || err.code === "timeout") && SAFE_AGAIN.has(method)) {
+        return this.relayCall(to, method, params, timeoutMs);
+      }
+      throw new RelayError(err.code, err.message);
+    });
+  }
+
   subscribe(to: string, stream: "terminal" | "session", params: unknown, onEvent: StreamCb, onState?: StreamCb): () => void {
     const id = `s${++this.seq}`;
-    const sub: Sub = { id, to, stream, params, onEvent, onState };
+    const link = this.direct.get(to);
+    const sub: Sub = { id, to, stream, params, onEvent, onState, via: link?.open ? link : undefined };
     this.subs.set(id, sub);
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.send({ type: "stream_subscribe", id, to, stream, params });
+    if (sub.via || this.ws?.readyState === WebSocket.OPEN) {
+      this.openStream(sub);
     }
     return () => {
-      this.subs.delete(id);
-      if (this.ws?.readyState === WebSocket.OPEN) {
+      const cur = this.subs.get(id);
+      if (cur === sub) this.subs.delete(id);
+      if (sub.via) sub.via.unsubscribe(id);
+      else if (this.ws?.readyState === WebSocket.OPEN) {
         this.send({ type: "stream_unsubscribe", id, to });
       }
     };
@@ -611,6 +821,10 @@ class SocketClient {
   close(): void {
     this.closed = true;
     this.clearPong();
+    for (const d of [...this.direct.values()]) d.close();
+    this.direct.clear();
+    for (const t of this.spaceTimers.values()) clearTimeout(t);
+    this.spaceTimers.clear();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.offWake();
@@ -655,7 +869,7 @@ export function stopRelayLink(): void {
   activeClient = null;
   currentToken = null;
   setLink("idle");
-  liveStore.set({ devices: {}, agents: {}, rev: liveStore.get().rev + 1 });
+  liveStore.set({ devices: {}, agents: {}, spaces: {}, direct: {}, rev: liveStore.get().rev + 1 });
 }
 
 export function refreshNotifyChannel(): void {
@@ -668,6 +882,20 @@ export function pingRelay(): void {
     mockApi.connect();
   } else {
     activeClient?.retryNow();
+  }
+}
+
+/** Re-fetches `spaces.list` for a specific online host or all online hosts into `liveStore.spaces`. */
+export function refreshHostSpaces(hostId?: string): void {
+  const s = settingsStore.get();
+  if (s.server && isMockServer(s.server)) return;
+  if (!activeClient) return;
+  if (hostId) {
+    activeClient.scheduleSpacesRefresh(hostId, 0);
+    return;
+  }
+  for (const d of Object.values(liveStore.get().devices)) {
+    if (d.kind === "host" && d.online) activeClient.scheduleSpacesRefresh(d.id, 0);
   }
 }
 
