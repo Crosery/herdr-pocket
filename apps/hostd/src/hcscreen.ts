@@ -477,17 +477,16 @@ export class HcScreens {
 
     let resolveFirstPaint!: () => void;
     let paintDone = false;
+    let paintTimer: NodeJS.Timeout | undefined;
     const donePaint = () => {
       if (paintDone) return;
       paintDone = true;
-      clearTimeout(paintTimer);
+      if (paintTimer) clearTimeout(paintTimer);
       resolveFirstPaint();
     };
     const firstPaint = new Promise<void>((resolve) => {
       resolveFirstPaint = resolve;
     });
-    const paintTimer = setTimeout(donePaint, 35);
-    paintTimer.unref?.();
 
     const entry: {
       channel: Promise<number>;
@@ -522,6 +521,10 @@ export class HcScreens {
       const credit = Buffer.alloc(4);
       credit.writeUInt32LE(64 * 1024 * 1024);
       this.send(ch, CREDIT, credit);
+      if (!paintDone) {
+        paintTimer = setTimeout(donePaint, 100);
+        paintTimer.unref?.();
+      }
       return ch;
     });
     entry.channel = channel;

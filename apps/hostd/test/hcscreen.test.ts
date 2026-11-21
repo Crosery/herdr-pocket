@@ -9,7 +9,7 @@ import { HcScreens } from "../src/hcscreen.ts";
 const SH = { skip: process.platform === "win32" && "shell-script fakes" };
 
 /** A framed `hc connect` stand-in: records attach params and the bytes typed on the stream. */
-function fakeHc(dir: string, firstPaint = "first paint"): { bin: string; typed: string; attaches: string } {
+function fakeHc(dir: string, firstPaint = "first paint", attachDelayMs = 0): { bin: string; typed: string; attaches: string } {
   const bin = join(dir, "hc");
   const typed = join(dir, "typed");
   const attaches = join(dir, "attaches");
@@ -36,8 +36,12 @@ process.stdin.on("data", (d) => {
     if (ch === 0) {
       const m = JSON.parse(p.toString());
       appendFileSync(${JSON.stringify(attaches)}, JSON.stringify(m.params) + "\\n");
-      process.stdout.write(frame(0, 0, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { channel: 7, automatic_input: true, terminal: { cols: m.params.cols, rows: m.params.rows } } }))));
-      process.stdout.write(frame(7, 0, Buffer.from(${JSON.stringify(firstPaint)})));
+      const sendAttach = () => {
+        process.stdout.write(frame(0, 0, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { channel: 7, automatic_input: true, terminal: { cols: m.params.cols, rows: m.params.rows } } }))));
+        process.stdout.write(frame(7, 0, Buffer.from(${JSON.stringify(firstPaint)})));
+      };
+      if (${attachDelayMs} > 0) setTimeout(sendAttach, ${attachDelayMs});
+      else sendAttach();
     } else if (ch === 7 && kind === 0) appendFileSync(${JSON.stringify(typed)}, p);
     else if (ch === 7 && kind === 2) appendFileSync(${JSON.stringify(typed)}, "<CLOSE>");
   }
@@ -87,5 +91,16 @@ test("paste wraps text with bracketed paste (?2004h) or plain text (?2004l) and 
     assert.equal(readFileSync(plain.typed, "utf8"), "line1\nline2\r");
   } finally {
     screensPlain.stop();
+  }
+
+  // Slow spawn/attach (>35ms) still waits for post-attach firstPaint and detects ?2004h cleanly.
+  const slow = fakeHc(mkdtempSync(join(tmpdir(), "hc-paste-slow-")), "\x1b[?2004h❯ ", 60);
+  const screensSlow = new HcScreens(slow.bin);
+  try {
+    await screensSlow.paste("t1", "继续", 120, 40, true);
+    await wait(50);
+    assert.equal(readFileSync(slow.typed, "utf8"), "\x1b[200~继续\x1b[201~\r");
+  } finally {
+    screensSlow.stop();
   }
 });
