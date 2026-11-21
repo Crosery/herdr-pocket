@@ -36,7 +36,9 @@ export const FRAME_SECTION_OF: Record<SettingsSection, FrameSection> = {
   about: "about",
 };
 
-export type AgentTab = { id: string; kind: "agent"; agentKey: string };
+export type AgentPaneMode = "chat" | "term";
+
+export type AgentTab = { id: string; kind: "agent"; agentKey: string; mode?: AgentPaneMode };
 export type FileTab = { id: string; kind: "file"; agentKey: string; path: string; title: string };
 export type WebTab = { id: string; kind: "web"; url: string; title: string };
 export type ShellTab = AgentTab | FileTab | WebTab;
@@ -47,6 +49,8 @@ export type PanelId = "files" | "browser" | "assistant";
 export interface ShellState {
   tabs: ShellTab[];
   active: string | null;
+  /** Sidebar Space filter (`${deviceId}\u0000${spaceName}`), or null when showing all spaces. */
+  selectedSpace: string | null;
   /** The side panel's section, or null when the panel is hidden. */
   panel: PanelId | null;
   panelWidth: number;
@@ -63,14 +67,26 @@ export const PANEL_DEFAULT = 368;
 export const PANEL_MIN = 280;
 export const PANEL_MAX = 900;
 
-function load(): Pick<ShellState, "tabs" | "active" | "panel" | "panelWidth"> {
+function load(): Pick<ShellState, "tabs" | "active" | "selectedSpace" | "panel" | "panelWidth"> {
   try {
     const raw = JSON.parse(localStorage.getItem(KEY) ?? "null") as Partial<ShellState> | null;
     if (raw && Array.isArray(raw.tabs)) {
-      const tabs = raw.tabs.filter((t): t is ShellTab => Boolean(t && typeof t.id === "string" && (t.kind === "agent" || t.kind === "file" || t.kind === "web")));
+      const tabs = raw.tabs
+        .filter((t): t is ShellTab => Boolean(t && typeof t.id === "string" && (t.kind === "agent" || t.kind === "file" || t.kind === "web")))
+        .map((t) =>
+          t.kind === "agent"
+            ? {
+                id: t.id,
+                kind: "agent" as const,
+                agentKey: t.agentKey,
+                ...(t.mode === "chat" || t.mode === "term" ? { mode: t.mode } : {}),
+              }
+            : t,
+        );
       return {
         tabs,
         active: tabs.some((t) => t.id === raw.active) ? raw.active! : (tabs[0]?.id ?? null),
+        selectedSpace: typeof raw.selectedSpace === "string" ? raw.selectedSpace : null,
         panel: raw.panel === "files" || raw.panel === "browser" || raw.panel === "assistant" ? raw.panel : null,
         panelWidth: clampPanel(Number(raw.panelWidth) || PANEL_DEFAULT),
       };
@@ -78,7 +94,7 @@ function load(): Pick<ShellState, "tabs" | "active" | "panel" | "panelWidth"> {
   } catch {
     // Unreadable: start empty.
   }
-  return { tabs: [], active: null, panel: null, panelWidth: PANEL_DEFAULT };
+  return { tabs: [], active: null, selectedSpace: null, panel: null, panelWidth: PANEL_DEFAULT };
 }
 
 export function clampPanel(px: number): number {
@@ -88,9 +104,9 @@ export function clampPanel(px: number): number {
 export const shellStore = createStore<ShellState>({ ...load(), settings: null, palette: false, peek: null });
 
 shellStore.subscribe(() => {
-  const { tabs, active, panel, panelWidth } = shellStore.get();
+  const { tabs, active, selectedSpace, panel, panelWidth } = shellStore.get();
   try {
-    localStorage.setItem(KEY, JSON.stringify({ tabs, active, panel, panelWidth }));
+    localStorage.setItem(KEY, JSON.stringify({ tabs, active, selectedSpace, panel, panelWidth }));
   } catch {
     // Storage off: tabs last for this session.
   }
@@ -98,13 +114,33 @@ shellStore.subscribe(() => {
 
 const set = shellStore.set;
 
+export function setSelectedSpace(selectedSpace: string | null): void {
+  set({ selectedSpace });
+}
+
 /** Opens the agent as a tab, or focuses its tab when it is already open. */
-export function openAgentTab(agentKey: string): void {
+export function openAgentTab(agentKey: string, mode?: AgentPaneMode): void {
   const s = shellStore.get();
-  const hit = s.tabs.find((t) => t.kind === "agent" && t.agentKey === agentKey);
-  if (hit) return set({ active: hit.id, peek: null });
-  const tab: AgentTab = { id: `a:${agentKey}`, kind: "agent", agentKey };
+  const hit = s.tabs.find((t): t is AgentTab => t.kind === "agent" && t.agentKey === agentKey);
+  if (hit) {
+    if (mode && hit.mode !== mode) {
+      return set({
+        tabs: s.tabs.map((t) => (t.id === hit.id && t.kind === "agent" ? { ...t, mode } : t)),
+        active: hit.id,
+        peek: null,
+      });
+    }
+    return set({ active: hit.id, peek: null });
+  }
+  const tab: AgentTab = { id: `a:${agentKey}`, kind: "agent", agentKey, ...(mode ? { mode } : {}) };
   set({ tabs: [...s.tabs, tab], active: tab.id, peek: null });
+}
+
+export function setAgentTabMode(tabId: string, mode: AgentPaneMode): void {
+  set((s) => ({
+    ...s,
+    tabs: s.tabs.map((t) => (t.id === tabId && t.kind === "agent" ? { ...t, mode } : t)),
+  }));
 }
 
 export function openFileTab(agentKey: string, path: string, title: string): void {

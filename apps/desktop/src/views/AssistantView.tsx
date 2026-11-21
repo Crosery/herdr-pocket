@@ -14,6 +14,7 @@ import {
 } from "../lib/assistant";
 import { RichMarkdown } from "../lib/markdown";
 import { hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
+import { useComposerInput } from "../lib/composerKeys";
 import { isMockServer } from "../lib/mock";
 import { liveStore, settingsStore } from "../lib/store";
 
@@ -83,6 +84,8 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
       setSending(false);
     }
   };
+
+  const composer = useComposerInput(text, () => void send(text));
 
   const startCall = async () => {
     setCallExpanded(true);
@@ -182,28 +185,24 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
       ) : null}
 
       {/* Composer */}
-      <div className="composer-bar">
-        <textarea
-          rows={1}
-          placeholder="和小羊说点什么…"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void send(text);
-            }
-          }}
-        />
-        {!text.trim() && (voice || isMockServer(server)) && !inCall ? (
-          <PocketIconButton active tooltip="语音通话" onClick={() => void startCall()}>
-            <Mic size={17} />
-          </PocketIconButton>
-        ) : (
-          <PocketButton size="sm" disabled={!text.trim() || sending} onClick={() => void send(text)}>
-            <Send size={14} />
-          </PocketButton>
-        )}
+      <div className="composer-card">
+        <div className="composer-row">
+          <textarea
+            {...composer.textareaProps}
+            placeholder="和小羊说点什么…"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+          />
+          {!text.trim() && (voice || isMockServer(server)) && !inCall ? (
+            <PocketIconButton active className="composer-send" tooltip="语音通话" onClick={() => void startCall()}>
+              <Mic size={17} />
+            </PocketIconButton>
+          ) : (
+            <PocketButton size="sm" className="composer-send" disabled={!text.trim() || sending} onClick={() => void send(text)}>
+              <Send size={14} />
+            </PocketButton>
+          )}
+        </div>
       </div>
 
       {/* Fullscreen Call View */}

@@ -113,7 +113,21 @@ const DEMO_EVENTS: Record<string, ConvEvent[]> = {
   ],
   "dev-mac/hc:t2": [
     { id: "e21", session: "codex:demo-2", ts: now - 9 * min, kind: "user_message", text: "跑一遍端到端测试并修掉超时的用例。" },
-    { id: "e22", session: "codex:demo-2", ts: now - 5 * min, kind: "assistant_message", text: "正在运行 `pnpm test` 并复查 mock socket 超时阈值…" },
+    { id: "e22", session: "codex:demo-2", ts: now - 8 * min, kind: "reasoning", text: "先读取 relay 和 stream 相关测试与超时配置，找出慢测试的根因。" },
+    { id: "e23", session: "codex:demo-2", ts: now - 7 * min, kind: "tool_call", call_id: "c21", name: "read_file", input: { path: "tests/relay.test.ts" } },
+    { id: "e24", session: "codex:demo-2", ts: now - 7 * min + 500, kind: "tool_result", call_id: "c21", name: "read_file", output: "184 lines read", is_error: false },
+    { id: "e25", session: "codex:demo-2", ts: now - 7 * min + 900, kind: "tool_call", call_id: "c22", name: "read_file", input: { path: "tests/stream.test.ts" } },
+    { id: "e26", session: "codex:demo-2", ts: now - 6 * min, kind: "tool_result", call_id: "c22", name: "read_file", output: "240 lines read", is_error: false },
+    { id: "e27", session: "codex:demo-2", ts: now - 6 * min + 500, kind: "tool_call", call_id: "c23", name: "read_file", input: { path: "src/socket.ts" } },
+    { id: "e28", session: "codex:demo-2", ts: now - 6 * min + 800, kind: "tool_result", call_id: "c23", name: "read_file", output: "312 lines read", is_error: false },
+    { id: "e29", session: "codex:demo-2", ts: now - 5 * min, kind: "tool_call", call_id: "c24", name: "run_command", input: { command: "pnpm test tests/relay.test.ts" } },
+    { id: "e30", session: "codex:demo-2", ts: now - 5 * min + 1500, kind: "tool_result", call_id: "c24", name: "run_command", output: "PASS 18/18", is_error: false },
+    { id: "e30b", session: "codex:demo-2", ts: now - 4 * min - 30_000, kind: "tool_call", call_id: "c25", name: "edit_file", input: { path: "src/socket.ts" } },
+    { id: "e30c", session: "codex:demo-2", ts: now - 4 * min - 20_000, kind: "tool_result", call_id: "c25", name: "edit_file", output: "updated reconnect timeout", is_error: false },
+    { id: "e30d", session: "codex:demo-2", ts: now - 4 * min - 10_000, kind: "tool_call", call_id: "c26", name: "run_command", input: { command: "pnpm test tests/stream.test.ts" } },
+    { id: "e30e", session: "codex:demo-2", ts: now - 4 * min, kind: "tool_result", call_id: "c26", name: "run_command", output: "PASS 24/24", is_error: false },
+    { id: "e30f", session: "codex:demo-2", ts: now - 3 * min, kind: "tool_call", call_id: "c27", name: "run_command", input: { command: "pnpm test" } },
+    { id: "e30g", session: "codex:demo-2", ts: now - 2 * min, kind: "assistant_message", text: "正在运行 `pnpm test` 复查 mock socket 超时阈值…" },
   ],
   "dev-linux/hc:t3": [
     { id: "e31", session: "gemini:demo-3", ts: now - 20 * min, kind: "user_message", text: "把静态资源压到 10 MB 以内。" },
@@ -348,23 +362,24 @@ export const mockApi = {
     if (method === "agent.create") {
       const id = `t${Date.now() % 10000}`;
       const key = `${to}/hc:${id}`;
+      const isShell = params.launcher === "shell";
       const ag: Agent = {
         key,
         deviceId: to,
         source: "hc",
         localId: id,
-        harness: params.launcher || "claude-code",
-        title: params.task || params.tabName || "新建 Agent",
+        harness: isShell ? "zsh" : params.launcher || "claude-code",
+        title: params.task || params.tabName || (isShell ? "终端" : "新建 Agent"),
         where: `${params.spaceName || "workspace"} / ${params.tabName || id}`,
         cwd: params.folder || "~/work/demo-app",
-        status: "working",
+        status: isShell ? "idle" : "working",
         statusSince: Date.now(),
-        isShell: params.launcher === "shell",
-        sessionKey: `demo:${id}`,
+        isShell,
+        sessionKey: isShell ? undefined : `demo:${id}`,
         updatedAt: Date.now(),
       };
       DEMO_AGENTS.unshift(ag);
-      DEMO_EVENTS[key] = params.task ? [{ id: `u-${Date.now()}`, session: ag.sessionKey!, ts: Date.now(), kind: "user_message", text: params.task }] : [];
+      DEMO_EVENTS[key] = !isShell && params.task ? [{ id: `u-${Date.now()}`, session: ag.sessionKey!, ts: Date.now(), kind: "user_message", text: params.task }] : [];
       DEMO_TERMINALS[key] = [`${ag.harness} · ${ag.cwd}`, params.task ? `$ ${params.task}` : "$ ready"];
       mockApi.connect();
       return { agent: key, space: params.space || "sp-new", terminal: id, task: "started" };

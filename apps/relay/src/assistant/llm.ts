@@ -283,6 +283,7 @@ async function once(t: LlmTarget, cfg: LlmConfig, req: LlmRequest): Promise<LlmR
           : {
               ...(t.extraBody?.reasoning_effort === undefined ? { reasoning_effort: "low" } : {}),
               ...(t.extraBody?.parallel_tool_calls === undefined ? { parallel_tool_calls: true } : {}),
+              ...(t.extraBody?.max_tokens === undefined && (req.maxTokens ?? 1200) < 2048 ? { max_tokens: 2048 } : {}),
             }
         : undefined;
       res = await fetchWithRootV1Fallback(`${base}/chat/completions`, base, "/chat/completions", {
@@ -316,7 +317,7 @@ async function once(t: LlmTarget, cfg: LlmConfig, req: LlmRequest): Promise<LlmR
     const usable = r.content.some((b) =>
       (b.type === "text" && b.text.trim()) || (b.type === "tool_use" && req.tools.length > 0 && b.name.trim()),
     );
-    if (!usable) throw new LlmError(`${label}: empty answer`);
+    if (!usable) throw new LlmError(r.stopReason === "max_tokens" ? `${label}: empty answer (hit max_tokens)` : `${label}: empty answer`);
     return r;
   } catch (e) {
     if (e instanceof LlmError) throw e;

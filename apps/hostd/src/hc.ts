@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { SHELL_HARNESSES, normalizeStatus, type Agent, type AgentStatus } from "@herdr-pocket/protocol";
+import { SHELL_HARNESSES, normalizeStatus, type Agent, type AgentStatus, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { base, cleanTitle, debounce, lineSplitter, run } from "./util.ts";
 import { HcScreens, type ScreenLines } from "./hcscreen.ts";
 import { defaultHcBin, programName } from "./platform.ts";
@@ -399,6 +399,29 @@ export class HcAdapter extends EventEmitter {
     } catch (e) {
       onError(e as Error);
       throw e;
+    }
+  }
+
+  async watchRaw(
+    address: string,
+    opts: { cols?: number; rows?: number; history?: number; display?: TerminalDisplay },
+    onData: (chunk: Buffer, cols: number, rows: number) => void,
+    onError: (e: Error) => void,
+  ): Promise<() => void> {
+    try {
+      return await this.screens.watchRaw(address, opts, onData, onError);
+    } catch (e) {
+      onError(e as Error);
+      throw e;
+    }
+  }
+
+  async resize(address: string, cols: number, rows: number, display?: TerminalDisplay): Promise<void> {
+    await this.screens.resize(address, cols, rows, display);
+    const t = this.terminals.get(address);
+    if (t) {
+      t.cols = cols;
+      t.rows = rows;
     }
   }
 

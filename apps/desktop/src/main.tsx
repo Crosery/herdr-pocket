@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles/tokens.css";
 import "./styles/app.css";
+import "./styles/drop-rail.css";
 import { App } from "./App";
 import { appVersion, detectPlatform, installErrorLogging } from "./lib/bridge";
 import { logger } from "./lib/log";

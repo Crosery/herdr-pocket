@@ -788,6 +788,39 @@
   font-size: var(--v3-small);
 }
 
+.v3-mode-switch {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--v3-hover);
+}
+
+.v3-mode-btn {
+  width: 22px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--v3-muted);
+  cursor: pointer;
+  padding: 0;
+}
+
+.v3-mode-btn:hover {
+  color: var(--v3-fg);
+}
+
+.v3-mode-btn.on {
+  background: var(--v3-raised);
+  color: var(--accent-text);
+  box-shadow: 0 0 0 1px var(--v3-border);
+}
+
 .v3-pane-body {
   flex: 1;
   min-height: 0;
@@ -934,12 +967,6 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
-}
-
-.v3-files-pick {
-  flex: none;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--v3-border);
 }
 
 .v3-files .tree {

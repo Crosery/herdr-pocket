@@ -112,3 +112,76 @@ test("unsubscribing while the watch is still starting stops it", async () => {
   assert.equal(watches[0]!.stopped, true);
   assert.ok(!sent.some((f) => f.type === "stream_open"));
 });
+
+test("a raw stream forwards PTY bytes as base64 terminal_data and forwards resize/input params", async () => {
+  const h = new Host({ config: { server: "http://127.0.0.1:9", token: "t", deviceId: "d", name: "test" }, log: () => {} });
+  const x = h as unknown as {
+    agents: unknown[];
+    send: (f: Frame) => void;
+    handleStreamSubscribe: (f: unknown) => Promise<void>;
+    handleRpc: (f: unknown, out: (res: unknown) => void) => Promise<void>;
+  };
+  x.agents = [{ key: "d/hc:t1", localId: "t1", source: "hc", deviceId: "d", status: "idle" }];
+  const sent: Frame[] = [];
+  x.send = (f) => sent.push(f);
+
+  let rawOpts: unknown = null;
+  let emitChunk!: (chunk: Buffer, cols: number, rows: number) => void;
+  h.hc.watchRaw = async (_address, opts, onData) => {
+    rawOpts = opts;
+    emitChunk = onData;
+    return () => {};
+  };
+
+  let resized: unknown = null;
+  h.hc.resize = async (address, cols, rows, display) => {
+    resized = { address, cols, rows, display };
+  };
+
+  let lastInput = "";
+  h.hc.input = async (_address, data) => {
+    lastInput = data;
+  };
+
+  await x.handleStreamSubscribe({
+    type: "stream_subscribe",
+    id: "raw1",
+    from: "desktop",
+    stream: "terminal",
+    params: { agent: "d/hc:t1", raw: true, cols: 120, rows: 36, display: { cell: [16, 32] } },
+  });
+  assert.deepEqual(rawOpts, { cols: 120, rows: 36, history: 2000, display: { cell: [16, 32] } });
+  emitChunk(Buffer.from("\x1b]66;s=2;Hi\x07"), 120, 36);
+  const rawEv = sent.find((f) => f.type === "stream_event" && f.id === "raw1")?.event;
+  assert.equal(rawEv.kind, "terminal_data");
+  assert.equal(rawEv.seq, 1);
+  assert.equal(Buffer.from(rawEv.data, "base64").toString("utf8"), "\x1b]66;s=2;Hi\x07");
+
+  const rpcReplies: unknown[] = [];
+  await x.handleRpc(
+    {
+      type: "rpc",
+      id: "r1",
+      from: "desktop",
+      method: "terminal.resize",
+      params: { agent: "d/hc:t1", cols: 100, rows: 40, display: { cell: [18, 36] } },
+    },
+    (r) => rpcReplies.push(r),
+  );
+  assert.deepEqual(resized, { address: "t1", cols: 100, rows: 40, display: { cell: [18, 36] } });
+  assert.deepEqual(rpcReplies[0], { type: "rpc_result", id: "r1", result: { ok: true } });
+
+  const largePaste = "x".repeat(16_384);
+  await x.handleRpc(
+    {
+      type: "rpc",
+      id: "r2",
+      from: "desktop",
+      method: "terminal.input",
+      params: { agent: "d/hc:t1", data: largePaste },
+    },
+    (r) => rpcReplies.push(r),
+  );
+  assert.equal(lastInput.length, 16_384);
+  assert.deepEqual(rpcReplies[1], { type: "rpc_result", id: "r2", result: { ok: true } });
+});

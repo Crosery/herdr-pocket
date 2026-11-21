@@ -802,6 +802,11 @@ test("what the assistant found when woken: four verdicts, an unknown first line,
   assert.equal(parseWake("结论：要你定。\n迁移脚本停了，问回滚用快照还是反向脚本。").verdict, "decide");
   assert.equal(parseWake("【没成】\n登录页没跑成，依赖装不上。").verdict, "failed");
   assert.deepEqual(parseWake("不用说"), { verdict: "skip", say: "", details: "" });
+  assert.deepEqual(parseWake("【结论】\n不用说\n【一句话】\n它只是把脚本放在输入框里。"), { verdict: "skip", say: "", details: "" });
+  assert.deepEqual(
+    parseWake("【结论】 要你定\n【一句话】 酒吧那边活基本干完了，卡在订阅欠费报错上。\n【细节】\n- 403 订阅报错"),
+    { verdict: "decide", say: "酒吧那边活基本干完了，卡在订阅欠费报错上。", details: "- 403 订阅报错" },
+  );
   assert.deepEqual(parseWake("它停在一半。\n---\n- 没跑测试"), { verdict: "stopped", say: "它停在一半。", details: "- 没跑测试" });
   // The sentence is capped at 60 characters, at a sentence end; what is cut joins the details.
   const out = parseWake(`成了\n${"前半句说了很多很多的话".repeat(4)}。${"后半句".repeat(8)}。`);
@@ -912,4 +917,48 @@ test("empty look promises trigger a same-turn nudge and read-only tools execute 
   assert.equal(peak, 2);
   asst.close();
   store.close();
+});
+
+test("woken inspection reads terminal fallback when current turn has no assistant_message and omits stale prior replies", async () => {
+  const { publish } = await fakeHost("Mac Term", (method) => {
+    if (method === "session.events") {
+      return {
+        sessionKey: "antigravity:t10",
+        more: false,
+        events: [
+          { id: "e1", session: "antigravity:t10", ts: 1, kind: "user_message", text: "旧问题" },
+          { id: "e2", session: "antigravity:t10", ts: 2, kind: "assistant_message", text: "上一轮的旧回答不应混进这一轮" },
+          { id: "e3", session: "antigravity:t10", ts: 3, kind: "user_message", text: "把终端打包问题修掉" },
+          { id: "e4", session: "antigravity:t10", ts: 4, kind: "tool_call", call_id: "c1", name: "run_command", input: { command: "pnpm tauri build" } },
+        ],
+      };
+    }
+    if (method === "terminal.read") {
+      return { text: "Bundling Herdr Pocket.app\nFinished 1 bundle" };
+    }
+    return undefined;
+  });
+  const phone = await pair("viewer", "Redmi Term");
+  const push = await Sock.open("/v1/notify", phone.token);
+  await push.next((f) => f.type === "hello");
+
+  let wokenReq: LlmRequest | undefined;
+  wake = (req) => {
+    wokenReq = req;
+    assert.ok((req.maxTokens ?? 0) >= 1200, "woken turns keep enough maxTokens headroom");
+    return text("成了\n打包脚本跑完了，桌面端安装包已经打好。\n---\n- 生成了 macOS .app 安装包");
+  };
+
+  publish([agent("t10", "working", "桌面端打包", ran(5 * 60_000))]);
+  await sleep(30);
+  publish([agent("t10", "done", "桌面端打包")]);
+  const notice = await push.next((f) => f.type === "notice");
+  assert.equal(notice.notice.title, "桌面端打包 · 跑完了");
+  assert.equal(notice.notice.verdict, "ok");
+  assert.equal(notice.notice.body, "打包脚本跑完了，桌面端安装包已经打好。");
+
+  const material = String(wokenReq!.messages[0]!.content);
+  assert.match(material, /我让它做的：\n把终端打包问题修掉/);
+  assert.doesNotMatch(material, /上一轮的旧回答/);
+  assert.match(material, /它的终端最后 40 行：\nBundling Herdr Pocket\.app/);
 });

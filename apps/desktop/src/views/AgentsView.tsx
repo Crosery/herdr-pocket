@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import {
+  ArrowDown,
   ArrowLeft,
   ChevronDown,
   ChevronRight,
   FolderOpen,
-  ImagePlus,
   Laptop,
   Menu,
   Plus,
@@ -18,14 +18,12 @@ import {
 } from "lucide-react";
 import {
   PUT_LIMITS,
-  applyRows,
   textWithFiles,
   type Agent,
   type AgentStatus,
   type ConvEvent,
   type Device,
   type LaunchOption,
-  type PutFile,
   type SpaceInfo,
   type SubSession,
 } from "@herdr-pocket/protocol";
@@ -41,11 +39,15 @@ import {
   fs,
   useToast,
 } from "../components/PocketUI";
+import { ChatTimelineRows } from "../components/ChatTimeline";
+import { DropRail } from "../components/DropRail";
 import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVendor";
-import { renderAnsiLines } from "../lib/ansi";
-import { copyToClipboard, detectPlatform, encodeImageFiles } from "../lib/bridge";
-import { termKeyAction } from "../lib/termKeys";
-import { RichMarkdown, parseChoices } from "../lib/markdown";
+import { TerminalSurface } from "../components/TerminalSurface";
+import { copyToClipboard } from "../lib/bridge";
+import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
+import { useComposerInput } from "../lib/composerKeys";
+import { prepareDroppedFiles, revokeAttachment, type StagedAttachment } from "../lib/dropPreview";
+import { parseChoices } from "../lib/markdown";
 import { pingRelay, rpcCall, subscribeStream } from "../lib/relay";
 import {
   STATUS_LABEL,
@@ -71,19 +73,10 @@ const GROUPS: { key: GroupKey; title: string }[] = [
 
 const byRecent = (x: Agent, y: Agent) => (y.statusSince ?? y.updatedAt) - (x.statusSince ?? x.updatedAt);
 
-const MAC = detectPlatform() === "macos";
-
 /** Shortens `s` to `max` characters with an ellipsis (placeholders cannot ellipsize in CSS). */
 function clip(s: string, max: number): string {
   const chars = [...s];
   return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : s;
-}
-
-/** Text selected inside `box`, or "". */
-function termSelection(box: HTMLElement | null): string {
-  const sel = typeof window !== "undefined" ? window.getSelection() : null;
-  if (!box || !sel || sel.isCollapsed || !sel.anchorNode || !box.contains(sel.anchorNode)) return "";
-  return sel.toString();
 }
 
 type GroupMode = "space" | "status";
@@ -812,9 +805,24 @@ export function AgentsView({
   );
 }
 
+function extractClipboardFiles(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  if (data.files && data.files.length > 0) return Array.from(data.files);
+  const out: File[] = [];
+  for (const item of Array.from(data.items ?? [])) {
+    if (item.kind === "file") {
+      const f = item.getAsFile();
+      if (f) out.push(f);
+    }
+  }
+  return out;
+}
+
 export function AgentDetailPanel({
   agent,
   initialTab = "chat",
+  mode,
+  onModeChange,
   onBack,
   onOpenWorkbench,
   mobile = false,
@@ -822,46 +830,77 @@ export function AgentDetailPanel({
 }: {
   agent: Agent;
   initialTab?: "chat" | "term";
+  mode?: "chat" | "term";
+  onModeChange?: (mode: "chat" | "term") => void;
   onBack?: () => void;
   onOpenWorkbench?: (agentKey: string) => void;
   mobile?: boolean;
-  /** Inside a v3 pane: the pane header already shows harness, title and folder. */
+  /** Inside a v3 pane: the pane header already shows harness, title, folder, and mode switcher. */
   embedded?: boolean;
 }) {
   const toast = useToast();
-  const [tab, setTab] = useState<"chat" | "term" | "subs">(initialTab);
+  const [tab, setTab] = useState<"chat" | "term" | "subs">(mode ?? initialTab);
+  const activeMode: "chat" | "term" | "subs" = mode ?? tab;
+  const selectMode = (m: "chat" | "term" | "subs") => {
+    setTab(m);
+    if (m === "chat" || m === "term") onModeChange?.(m);
+  };
+  const [termVisited, setTermVisited] = useState(activeMode === "term");
+  useEffect(() => {
+    if (activeMode === "term") setTermVisited(true);
+  }, [activeMode]);
+
   const [events, setEvents] = useState<ConvEvent[]>([]);
-  const [termLines, setTermLines] = useState<string[]>([]);
+  const [olderCursor, setOlderCursor] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [atBottom, setAtBottom] = useState(true);
+  const [choiceLines, setChoiceLines] = useState<string[]>([]);
   const [subs, setSubs] = useState<SubSession[]>([]);
   const [subModal, setSubModal] = useState<{ title: string; events: ConvEvent[] } | null>(null);
   const [text, setText] = useState("");
-  const [pendingImages, setPendingImages] = useState<PutFile[]>([]);
+  const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
+  const [dragOver, setDragOver] = useState(false);
   const [sending, setSending] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
-  const termScrollRef = useRef<HTMLDivElement>(null);
-  const pasteCatchRef = useRef<HTMLTextAreaElement>(null);
-  const pasteArmedRef = useRef(0);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const stickRef = useRef(true);
+  const streamLiveRef = useRef(false);
+  const hadOpenRef = useRef(false);
+  const scrollRafRef = useRef(0);
+  const sessionTrackRef = useRef<{ agentKey: string; sessionKey?: string }>({ agentKey: agent.key, sessionKey: agent.sessionKey });
+  const dragDepthRef = useRef(0);
+  const attachmentsRef = useRef<StagedAttachment[]>([]);
+  attachmentsRef.current = attachments;
+
+  useEffect(() => {
+    return () => {
+      for (const a of attachmentsRef.current) revokeAttachment(a);
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;
-    setEvents([]);
-    setTermLines(["正在加载终端…"]);
-    setSubs([]);
+    const prev = sessionTrackRef.current;
+    const sessionSwitched = prev.agentKey !== agent.key || (Boolean(prev.sessionKey) && Boolean(agent.sessionKey) && prev.sessionKey !== agent.sessionKey);
+    sessionTrackRef.current = { agentKey: agent.key, sessionKey: agent.sessionKey };
+    if (sessionSwitched) {
+      setEvents([]);
+      setOlderCursor(null);
+      setChoiceLines([]);
+      setSubs([]);
+      stickRef.current = true;
+      setAtBottom(true);
+    }
+    streamLiveRef.current = false;
+    hadOpenRef.current = false;
 
-    void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 80 })
+    void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 200 })
       .then((res) => {
-        if (alive) setEvents(res.events);
+        if (!alive) return;
+        setEvents((prevList) => mergeConvEvents(prevList, res.events));
+        setOlderCursor(res.more ? (res.nextBefore ?? null) : null);
       })
       .catch(() => {});
-
-    void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 160 })
-      .then((res) => {
-        if (alive) setTermLines((res.ansi || res.text || "").split("\n"));
-      })
-      .catch((e) => {
-        if (alive) setTermLines([`读取失败：${(e as Error).message}`]);
-      });
 
     if (agent.subagents) {
       void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
@@ -871,81 +910,168 @@ export function AgentDetailPanel({
         .catch(() => {});
     }
 
-    const unsubSession = subscribeStream(agent.deviceId, "session", { agent: agent.key }, (ev) => {
-      if (!alive || !ev) return;
-      if (ev.kind === "session_event" && ev.event) {
-        const nextEv = ev.event as ConvEvent;
-        setEvents((prev) => {
-          const i = prev.findIndex((x) => x.id === nextEv.id);
-          if (i >= 0) {
-            const copy = prev.slice();
-            copy[i] = nextEv;
-            return copy;
-          }
-          return [...prev, nextEv];
-        });
-      }
-    });
-
-    const unsubTerm = subscribeStream(
+    const unsubSession = subscribeStream(
       agent.deviceId,
-      "terminal",
-      { agent: agent.key, history: 160, rows: true },
+      "session",
+      { agent: agent.key },
       (ev) => {
         if (!alive || !ev) return;
-        if (ev.kind === "terminal" && ev.screen) {
-          setTermLines(String(ev.screen.ansi || ev.screen.text || "").split("\n"));
-        } else if (ev.kind === "terminal_rows") {
-          setTermLines((prev) => applyRows(prev, ev));
+        if ((ev.kind === "session" || ev.kind === "session_event") && ev.event) {
+          const nextEv = ev.event as ConvEvent;
+          setEvents((prevList) => mergeConvEvents(prevList, [nextEv]));
+        }
+      },
+      (st) => {
+        if (!alive) return;
+        if (st?.kind === "live") {
+          const reopened = hadOpenRef.current && !streamLiveRef.current;
+          hadOpenRef.current = true;
+          streamLiveRef.current = true;
+          if (reopened) {
+            void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 120 })
+              .then((res) => {
+                if (alive) setEvents((prevList) => mergeConvEvents(prevList, res.events));
+              })
+              .catch(() => {});
+          }
+        } else {
+          streamLiveRef.current = false;
         }
       },
     );
+
+    const pollTimer = window.setInterval(() => {
+      if (!alive || streamLiveRef.current || !agent.sessionKey) return;
+      void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 80 })
+        .then((res) => {
+          if (alive) setEvents((prevList) => mergeConvEvents(prevList, res.events));
+        })
+        .catch(() => {});
+    }, 3_000);
 
     void rpcCall(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {});
 
     return () => {
       alive = false;
+      window.clearInterval(pollTimer);
       unsubSession();
-      unsubTerm();
     };
-  }, [agent.deviceId, agent.key, agent.subagents]);
+  }, [agent.deviceId, agent.key, agent.sessionKey, agent.subagents]);
 
   useEffect(() => {
+    if (activeMode !== "chat" || agent.status !== "blocked") {
+      setChoiceLines([]);
+      return;
+    }
+    let alive = true;
+    void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 40 })
+      .then((res) => {
+        if (alive) setChoiceLines((res.ansi || res.text || "").split("\n"));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [activeMode, agent.deviceId, agent.key, agent.status, events.length]);
+
+  const scrollToBottom = useCallback((smooth = false) => {
+    stickRef.current = true;
+    setAtBottom(true);
     const el = chatScrollRef.current;
-    // Only a thread with messages sticks to the bottom; the empty state is read from the top.
-    if (el && tab === "chat") el.scrollTop = events.length ? el.scrollHeight : 0;
-  }, [events.length, tab]);
+    if (!el) return;
+    if (smooth) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    else el.scrollTop = events.length ? el.scrollHeight : 0;
+  }, [events.length]);
 
   useEffect(() => {
-    const el = termScrollRef.current;
-    if (el && tab === "term") el.scrollTop = el.scrollHeight;
-  }, [termLines.length, tab]);
+    if (activeMode !== "chat" || !stickRef.current) return;
+    if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current);
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = 0;
+      const el = chatScrollRef.current;
+      // Only a thread with messages sticks to the bottom; the empty state is read from the top.
+      if (el && stickRef.current) el.scrollTop = events.length ? el.scrollHeight : 0;
+    });
+    return () => {
+      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current);
+    };
+  }, [events, activeMode]);
 
-  const choices = useMemo(() => parseChoices(termLines), [termLines]);
+  const onChatScroll = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
+    stickRef.current = nearBottom;
+    setAtBottom(nearBottom);
+  }, []);
+
+  const loadOlderEvents = useCallback(async () => {
+    if (!olderCursor || loadingOlder) return;
+    setLoadingOlder(true);
+    const el = chatScrollRef.current;
+    const prevH = el?.scrollHeight ?? 0;
+    const prevTop = el?.scrollTop ?? 0;
+    try {
+      const res = await rpcCall(agent.deviceId, "session.events", { agent: agent.key, before: olderCursor, limit: 200 });
+      stickRef.current = false;
+      setAtBottom(false);
+      setEvents((prevList) => mergeConvEvents(prevList, res.events));
+      setOlderCursor(res.more ? (res.nextBefore ?? null) : null);
+      requestAnimationFrame(() => {
+        const nextEl = chatScrollRef.current;
+        if (!nextEl) return;
+        const delta = nextEl.scrollHeight - prevH;
+        nextEl.scrollTop = prevTop + Math.max(0, delta);
+      });
+    } catch (e) {
+      toast((e as Error).message, true);
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [agent.deviceId, agent.key, loadingOlder, olderCursor, toast]);
+
+  const choices = useMemo(() => (activeMode === "chat" && choiceLines.length ? parseChoices(choiceLines) : []), [activeMode, choiceLines]);
+  const foldedRows = useMemo(() => foldConvEvents(events), [events]);
+  const subModalRows = useMemo(() => foldConvEvents(subModal?.events ?? []), [subModal]);
+
+  const openSubSession = useCallback(
+    async (s: SubSession) => {
+      try {
+        const res = await rpcCall(agent.deviceId, "session.events", { agent: agent.key, sub: s.key, limit: 200 });
+        setSubModal({ title: s.title || s.preview || s.key, events: res.events });
+      } catch (e) {
+        toast((e as Error).message, true);
+      }
+    },
+    [agent.deviceId, agent.key, toast],
+  );
 
   const sendLockRef = useRef(false);
   const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
 
   const sendMessage = async (msgText?: string) => {
     const raw = (msgText ?? text).trim();
-    const pics = msgText === undefined ? pendingImages : [];
+    const staged = msgText === undefined ? attachments : [];
     const now = Date.now();
-    const sig = `${agent.key}\0${raw}\0${pics.length}`;
-    if ((!raw && pics.length === 0) || sendLockRef.current) return;
+    const sig = `${agent.key}\0${raw}\0${staged.length}`;
+    if ((!raw && staged.length === 0) || sendLockRef.current) return;
     if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 500) return;
     sendLockRef.current = true;
     lastSendRef.current = { sig, at: now };
     setSending(true);
     try {
       let body = raw;
-      if (pics.length > 0 && msgText === undefined) {
-        const uploaded = await rpcCall(agent.deviceId, "terminal.put", { agent: agent.key, files: pics }, 30_000);
+      if (staged.length > 0 && msgText === undefined) {
+        const uploaded = await rpcCall(agent.deviceId, "terminal.put", { agent: agent.key, files: staged.map((s) => s.put) }, 30_000);
         body = textWithFiles(raw, uploaded.paths);
       }
+      stickRef.current = true;
+      setAtBottom(true);
       await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: body, enter: true });
       if (msgText === undefined) {
         setText("");
-        setPendingImages([]);
+        for (const s of staged) revokeAttachment(s);
+        setAttachments([]);
       }
     } catch (e) {
       toast((e as Error).message, true);
@@ -963,203 +1089,177 @@ export function AgentDetailPanel({
     }
   };
 
-  const sendRawInput = async (data: string) => {
-    try {
-      await rpcCall(agent.deviceId, "terminal.input", { agent: agent.key, data });
-    } catch {
-      await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: data, enter: false }).catch(() => {});
-    }
+  const handleFiles = useCallback(
+    async (files: FileList | File[] | null) => {
+      const list = files ? Array.from(files) : [];
+      if (!list.length) return;
+      try {
+        const res = await prepareDroppedFiles(
+          attachmentsRef.current,
+          list,
+          PUT_LIMITS.files,
+          PUT_LIMITS.fileBytes,
+          PUT_LIMITS.totalBytes,
+        );
+        if (res.added.length) {
+          setAttachments((prev) => [...prev, ...res.added].slice(0, PUT_LIMITS.files));
+        }
+        if (res.notice) toast(res.notice, true);
+      } catch (e) {
+        toast((e as Error).message, true);
+      }
+    },
+    [toast],
+  );
+
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((prev) => {
+      const target = prev.find((x) => x.id === id);
+      if (target) revokeAttachment(target);
+      return prev.filter((x) => x.id !== id);
+    });
+  }, []);
+
+  const composer = useComposerInput(text, () => void sendMessage());
+
+  useEffect(() => {
+    const onWindowPaste = (e: ClipboardEvent) => {
+      if (activeMode !== "chat") return;
+      const root = panelRef.current;
+      if (!root || root.offsetParent === null) return;
+      const target = e.target as HTMLElement | null;
+      if (target === composer.textareaRef.current) return;
+      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT" || target.isContentEditable || target.closest(".term-box, .xterm, .tp-term"))) {
+        return;
+      }
+      const files = extractClipboardFiles(e.clipboardData);
+      if (!files.length) return;
+      e.preventDefault();
+      void handleFiles(files);
+    };
+    window.addEventListener("paste", onWindowPaste);
+    return () => window.removeEventListener("paste", onWindowPaste);
+  }, [activeMode, composer.textareaRef, handleFiles]);
+
+  const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
+    if (activeMode !== "chat") return;
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDragOver(true);
   };
 
-  const handleFiles = async (files: FileList | null) => {
-    if (!files || !files.length) return;
-    try {
-      const encoded = await encodeImageFiles(Array.from(files), PUT_LIMITS.files - pendingImages.length);
-      setPendingImages((prev) => [...prev, ...encoded].slice(0, PUT_LIMITS.files));
-    } catch (e) {
-      toast((e as Error).message, true);
-    }
+  const onDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (activeMode !== "chat") return;
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+
+  const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
+    if (activeMode !== "chat") return;
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragOver(false);
+  };
+
+  const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    if (activeMode !== "chat") return;
+    dragDepthRef.current = 0;
+    setDragOver(false);
+    const files = e.dataTransfer?.files;
+    if (!files?.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+    void handleFiles(files);
   };
 
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
-      {/* Top Bar */}
-      <div className={`between wrap${embedded ? " detail-toolbar" : ""}`} style={embedded ? undefined : { padding: "10px 14px", borderBottom: "1px solid var(--divider)", flexShrink: 0, flexWrap: "wrap", rowGap: 8 }}>
-        {/* Narrow windows: the actions drop below the title instead of squeezing it to a few letters. */}
-        <div className="row" style={{ minWidth: 0, flex: "1 1 200px", display: embedded ? "none" : undefined }}>
-          {mobile && onBack ? (
-            <PocketIconButton size="sm" onClick={onBack} tooltip="返回">
-              <ArrowLeft size={16} />
-            </PocketIconButton>
-          ) : null}
-          <VendorAvatar harness={agent.harness} isShell={agent.isShell} size={36} />
-          <div className="grow">
-            <div style={{ fontWeight: 800, fontSize: fs(15) }} className="truncate">{spacedTitle(agent)}</div>
-            <div className="faint truncate">{agent.cwd || agent.where || agent.harness}</div>
-          </div>
-        </div>
-
-        <div className="row" style={{ gap: 8 }}>
-          <div className="segmented">
-            <button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>对话</button>
-            <button className={tab === "term" ? "active" : ""} onClick={() => setTab("term")}>终端</button>
-            {agent.subagents || subs.length ? (
-              <button className={tab === "subs" ? "active" : ""} onClick={() => setTab("subs")}>子 agent ({subs.length || agent.subagents})</button>
+    <div
+      ref={panelRef}
+      style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      {/* Top Bar (standalone narrow/mobile view only; v3 panes use PaneHead top-right switch) */}
+      {!embedded ? (
+        <div className="between wrap" style={{ padding: "10px 14px", borderBottom: "1px solid var(--divider)", flexShrink: 0, flexWrap: "wrap", rowGap: 8 }}>
+          <div className="row" style={{ minWidth: 0, flex: "1 1 200px" }}>
+            {mobile && onBack ? (
+              <PocketIconButton size="sm" onClick={onBack} tooltip="返回">
+                <ArrowLeft size={16} />
+              </PocketIconButton>
             ) : null}
+            <VendorAvatar harness={agent.harness} isShell={agent.isShell} size={36} />
+            <div className="grow">
+              <div style={{ fontWeight: 800, fontSize: fs(15) }} className="truncate">{spacedTitle(agent)}</div>
+              <div className="faint truncate">{agent.cwd || agent.where || agent.harness}</div>
+            </div>
           </div>
-          {onOpenWorkbench && agent.cwd && !agent.isShell ? (
-            <PocketIconButton size="sm" tooltip="在工作台看它的文件" onClick={() => onOpenWorkbench(agent.key)}>
-              <FolderOpen size={14} />
+
+          <div className="row" style={{ gap: 8 }}>
+            <div className="segmented">
+              <button className={activeMode === "chat" ? "active" : ""} onClick={() => selectMode("chat")}>对话</button>
+              <button className={activeMode === "term" ? "active" : ""} onClick={() => selectMode("term")}>终端</button>
+              {agent.subagents || subs.length ? (
+                <button className={activeMode === "subs" ? "active" : ""} onClick={() => selectMode("subs")}>子 agent ({subs.length || agent.subagents})</button>
+              ) : null}
+            </div>
+            {onOpenWorkbench && agent.cwd && !agent.isShell ? (
+              <PocketIconButton size="sm" tooltip="在工作台看它的文件" onClick={() => onOpenWorkbench(agent.key)}>
+                <FolderOpen size={14} />
+              </PocketIconButton>
+            ) : null}
+            <PocketIconButton
+              size="sm"
+              tooltip="中断当前轮 (Esc)"
+              onClick={() => void rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) => toast((e as Error).message, true))}
+            >
+              <Square size={14} />
             </PocketIconButton>
-          ) : null}
-          <PocketIconButton
-            size="sm"
-            tooltip="中断当前轮 (Esc)"
-            onClick={() => void rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) => toast((e as Error).message, true))}
-          >
-            <Square size={14} />
-          </PocketIconButton>
-          <PocketIconButton
-            size="sm"
-            tooltip="关闭终端"
-            onClick={() => void rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key }).then(() => onBack?.()).catch((e) => toast((e as Error).message, true))}
-          >
-            <Trash2 size={14} />
-          </PocketIconButton>
-        </div>
-      </div>
-
-      {tab === "chat" ? (
-        <div ref={chatScrollRef} className="chat-scroll">
-          {events.length === 0 ? (
-            <EmptyState mood="sleepy" title="还没有对话记录" body="在下方发一条消息，或切换到“终端”直接看屏幕输出。" />
-          ) : (
-            events.map((ev) => {
-              if (ev.kind === "user_message") {
-                return (
-                  <div key={ev.id} className="bubble-row user">
-                    <div className="bubble user">{ev.text}</div>
-                  </div>
-                );
-              }
-              if (ev.kind === "assistant_message") {
-                return (
-                  <div key={ev.id} className="bubble-row assistant">
-                    <div className="bubble assistant">
-                      <RichMarkdown text={ev.text} />
-                    </div>
-                  </div>
-                );
-              }
-              if (ev.kind === "tool_call") {
-                return (
-                  <details key={ev.id} className="pk-card soft" style={{ padding: "8px 12px" }}>
-                    <summary style={{ cursor: "pointer", fontWeight: 700, fontSize: fs(12.5) }}>
-                      调用工具：<span className="mono">{ev.name}</span>
-                    </summary>
-                    <pre className="mono" style={{ fontSize: fs(11.5), margin: "6px 0 0", overflowX: "auto" }}>
-                      {JSON.stringify(ev.input, null, 2)}
-                    </pre>
-                  </details>
-                );
-              }
-              if (ev.kind === "tool_result") {
-                return (
-                  <details key={ev.id} className="pk-card soft" style={{ padding: "8px 12px" }}>
-                    <summary style={{ cursor: "pointer", fontWeight: 700, fontSize: fs(12.5), color: ev.is_error ? "var(--blush-text)" : "var(--mint-text)" }}>
-                      {ev.is_error ? "工具出错" : "工具返回"} {ev.name || ""}
-                    </summary>
-                    <pre className="mono" style={{ fontSize: fs(11.5), margin: "6px 0 0", whiteSpace: "pre-wrap" }}>{ev.output}</pre>
-                  </details>
-                );
-              }
-              return null;
-            })
-          )}
+            <PocketIconButton
+              size="sm"
+              tooltip="关闭终端"
+              onClick={() => void rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key }).then(() => onBack?.()).catch((e) => toast((e as Error).message, true))}
+            >
+              <Trash2 size={14} />
+            </PocketIconButton>
+          </div>
         </div>
       ) : null}
 
-      {tab === "term" ? (
-        <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-          <div
-            ref={termScrollRef}
-            tabIndex={0}
-            className="term-box"
-            title={MAC ? "点击此处后可直接用键盘输入终端控制符" : "点击此处后可直接用键盘输入；Ctrl+V 粘贴，选中文字后 Ctrl+C 复制"}
-            onKeyDown={(e) => {
-              const action = termKeyAction(e, MAC, termSelection(termScrollRef.current) !== "");
-              switch (action.kind) {
-                case "send":
-                  e.preventDefault();
-                  void sendRawInput(action.data);
-                  return;
-                case "copy":
-                  e.preventDefault();
-                  void copyToClipboard(termSelection(termScrollRef.current));
-                  return;
-                case "paste":
-                  // The browser's own paste lands in the hidden box below, which forwards it;
-                  // reading the clipboard directly would need a permission prompt.
-                  pasteArmedRef.current = Date.now();
-                  pasteCatchRef.current?.focus();
-                  window.setTimeout(() => {
-                    if (!pasteArmedRef.current) return;
-                    pasteArmedRef.current = 0;
-                    termScrollRef.current?.focus();
-                    void navigator.clipboard
-                      ?.readText()
-                      .then((t) => (t ? sendRawInput(t) : undefined))
-                      .catch(() => toast("读不到剪贴板：在别处复制后再按 Ctrl+V，或用下方输入框发送", true));
-                  }, 250);
-                  return;
-                case "none":
-                  e.preventDefault();
-                  return;
-                case "native-copy":
-                case "pass":
-                  return;
-              }
-            }}
-          >
-            {renderAnsiLines(termLines)}
-          </div>
-          <textarea
-            ref={pasteCatchRef}
-            className="paste-catch"
-            aria-hidden
-            tabIndex={-1}
-            onPaste={(e) => {
-              e.preventDefault();
-              const t = e.clipboardData?.getData("text/plain") ?? "";
-              pasteArmedRef.current = 0;
-              termScrollRef.current?.focus();
-              if (t) void sendRawInput(t);
-            }}
-            onBlur={(e) => {
-              e.currentTarget.value = "";
-            }}
-          />
-          <div className="term-keybar">
-            {[
-              { label: "Esc", keys: ["esc"] },
-              { label: "Tab", keys: ["tab"] },
-              { label: "Shift+Tab", keys: ["shift+tab"] },
-              { label: "↑", keys: ["up"] },
-              { label: "↓", keys: ["down"] },
-              { label: "←", keys: ["left"] },
-              { label: "→", keys: ["right"] },
-              { label: "Ctrl+C", keys: ["ctrl+c"] },
-              { label: "Enter", keys: ["enter"], accent: true },
-            ].map((k) => (
-              <button key={k.label} className={`term-key${k.accent ? " accent" : ""}`} onClick={() => void sendKeys(k.keys)}>
-                {k.label}
+      {activeMode === "chat" ? (
+        <div className="chat-scroll-wrap">
+          <div ref={chatScrollRef} className="chat-scroll" onScroll={onChatScroll}>
+            {olderCursor ? (
+              <button type="button" className="chat-load-more" disabled={loadingOlder} onClick={() => void loadOlderEvents()}>
+                {loadingOlder ? "正在加载…" : "加载更早对话"}
               </button>
-            ))}
+            ) : null}
+            {foldedRows.length === 0 ? (
+              <EmptyState mood="sleepy" title="还没有对话记录" body="在下方发一条消息，或点右上角切换到“终端”直接操作。" />
+            ) : (
+              <ChatTimelineRows rows={foldedRows} subs={subs} onOpenSub={(s) => void openSubSession(s)} />
+            )}
           </div>
+          {!atBottom && foldedRows.length > 0 ? (
+            <button type="button" className="chat-jump-bottom" onClick={() => scrollToBottom(true)}>
+              <ArrowDown size={13} />
+              <span>回到底部</span>
+            </button>
+          ) : null}
         </div>
       ) : null}
 
-      {tab === "subs" ? (
+      {termVisited ? (
+        <div style={{ flex: 1, minHeight: 0, display: activeMode === "term" ? "flex" : "none" }}>
+          <TerminalSurface agent={agent} active={activeMode === "term"} />
+        </div>
+      ) : null}
+
+      {activeMode === "subs" ? (
         <div className="chat-scroll">
           {subs.map((s) => (
             <PocketCard key={s.key} soft>
@@ -1168,18 +1268,7 @@ export function AgentDetailPanel({
                   <div style={{ fontWeight: 800 }}>{s.title || s.preview || s.key}</div>
                   <div className="faint">{s.harness} · {s.status}</div>
                 </div>
-                <PocketButton
-                  size="sm"
-                  variant="soft"
-                  onClick={async () => {
-                    try {
-                      const res = await rpcCall(agent.deviceId, "session.events", { agent: agent.key, sub: s.key, limit: 80 });
-                      setSubModal({ title: s.title || s.key, events: res.events });
-                    } catch (e) {
-                      toast((e as Error).message, true);
-                    }
-                  }}
-                >
+                <PocketButton size="sm" variant="soft" onClick={() => void openSubSession(s)}>
                   看对话
                 </PocketButton>
               </div>
@@ -1188,8 +1277,8 @@ export function AgentDetailPanel({
         </div>
       ) : null}
 
-      {/* Quick Numbered Choices */}
-      {choices.length > 0 ? (
+      {/* Quick Numbered Choices (Chat mode only) */}
+      {activeMode === "chat" && choices.length > 0 ? (
         <div className="row wrap" style={{ padding: "4px 14px", gap: 6, flexShrink: 0 }}>
           {choices.map((c) => (
             <button
@@ -1203,70 +1292,39 @@ export function AgentDetailPanel({
         </div>
       ) : null}
 
-      {/* Attached Images */}
-      {pendingImages.length > 0 ? (
-        <div className="row wrap" style={{ padding: "4px 16px", gap: 8, flexShrink: 0 }}>
-          {pendingImages.map((img, i) => (
-            <div key={i} className="row" style={{ background: "var(--surface-2)", padding: "4px 10px", borderRadius: 999, gap: 6 }}>
-              <span className="faint">{img.name}</span>
-              <button style={{ border: 0, background: "transparent", cursor: "pointer" }} onClick={() => setPendingImages((prev) => prev.filter((_, idx) => idx !== i))}>
-                <X size={13} />
-              </button>
-            </div>
-          ))}
+      {/* Composer (Chat mode only; Terminal mode stays clean & fullscreen) */}
+      {activeMode === "chat" ? (
+        <div className={`composer-card${dragOver ? " drop-over" : ""}`}>
+          <DropRail items={attachments} onRemove={removeAttachment} />
+          <div className="composer-row">
+            <textarea
+              {...composer.textareaProps}
+              placeholder={`发给 ${clip(agent.name || agent.title || agent.harness, 16)}（可拖入或粘贴图片/文件）`}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onPaste={(e) => {
+                const files = extractClipboardFiles(e.clipboardData);
+                if (files.length) {
+                  e.preventDefault();
+                  void handleFiles(files);
+                }
+              }}
+            />
+            <PocketButton
+              size="sm"
+              className="composer-send"
+              disabled={(!text.trim() && attachments.length === 0) || sending}
+              onClick={() => void sendMessage()}
+            >
+              <Send size={14} />
+            </PocketButton>
+          </div>
         </div>
       ) : null}
 
-      {/* Composer */}
-      <div className="composer-bar" style={{ flexShrink: 0 }}>
-        <input
-          ref={fileRef}
-          type="file"
-          accept="image/*"
-          multiple
-          hidden
-          onChange={(e) => {
-            void handleFiles(e.target.files);
-            e.target.value = "";
-          }}
-        />
-        <PocketIconButton size="sm" tooltip="发送图片" onClick={() => fileRef.current?.click()}>
-          <ImagePlus size={16} />
-        </PocketIconButton>
-        <textarea
-          rows={1}
-          placeholder={`发给 ${clip(agent.name || agent.title || agent.harness, 16)}`}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onPaste={(e) => {
-            if (e.clipboardData?.files?.length) {
-              e.preventDefault();
-              void handleFiles(e.clipboardData.files);
-            }
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-              e.preventDefault();
-              void sendMessage();
-            }
-          }}
-        />
-        <PocketButton size="sm" disabled={(!text.trim() && pendingImages.length === 0) || sending} onClick={() => void sendMessage()}>
-          <Send size={14} />
-        </PocketButton>
-      </div>
-
       <PocketModal open={Boolean(subModal)} onOpenChange={(v) => !v && setSubModal(null)} title={subModal?.title || "子 Agent 对话"} width={620}>
         <div className="stack" style={{ maxHeight: 420, overflowY: "auto" }}>
-          {(subModal?.events ?? []).map((ev) =>
-            ev.kind === "assistant_message" || ev.kind === "user_message" ? (
-              <div key={ev.id} className={`bubble-row ${ev.kind === "user_message" ? "user" : "assistant"}`}>
-                <div className={`bubble ${ev.kind === "user_message" ? "user" : "assistant"}`}>
-                  <RichMarkdown text={ev.text} />
-                </div>
-              </div>
-            ) : null,
-          )}
+          <ChatTimelineRows rows={subModalRows} subs={[]} />
         </div>
       </PocketModal>
     </div>

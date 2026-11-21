@@ -838,6 +838,7 @@ a {
   background: var(--primary);
   color: var(--on-primary);
   border-bottom-right-radius: 6px;
+  white-space: pre-wrap;
 }
 
 .bubble.assistant {
@@ -946,26 +947,52 @@ a {
   border-color: var(--line-pink);
 }
 
-.composer-bar {
+.composer-card {
+  flex-shrink: 0;
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
+  flex-direction: column;
   margin: 8px 14px 12px;
-  padding: 7px 8px 7px 14px;
+  padding: 8px 8px 8px 14px;
   border-radius: var(--r-xl);
   background: var(--surface-2);
   border: 1px solid var(--divider);
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
-.composer-bar textarea {
+.composer-card:focus-within {
+  border-color: var(--line-pink);
+}
+
+.composer-card.drop-over {
+  border-color: var(--primary);
+  border-style: dashed;
+  background: var(--accent-soft);
+}
+
+.composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.composer-row textarea {
   flex: 1;
+  min-width: 0;
   border: 0;
   background: transparent;
   outline: none;
   resize: none;
-  max-height: 110px;
-  padding: 4px 0;
-  line-height: 1.45;
+  height: 24px;
+  min-height: 24px;
+  max-height: 200px;
+  padding: 2px 0;
+  line-height: 1.5;
+  overflow-y: hidden;
+  box-sizing: border-box;
+}
+
+.composer-send {
+  flex: none;
 }
 
 /* Modal & Toast & Empty State */
@@ -2754,7 +2781,7 @@ a {
 }
 
 /* U5: one-line composer hint. */
-.composer-bar textarea::placeholder {
+.composer-row textarea::placeholder {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

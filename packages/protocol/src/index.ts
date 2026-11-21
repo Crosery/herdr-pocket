@@ -304,24 +304,23 @@ export type ConvEvent = EventBody & {
 // Files sent to an agent (terminal.put)
 // ---------------------------------------------------------------------------
 
-/** A picture sent from a phone, contents in base64. */
+/** A file or picture sent from a client, contents in base64. */
 export interface PutFile {
   /** Original file name; the host keeps a safe form of it. */
   name: string;
-  /** One of `PUT_LIMITS.mimes`. */
+  /** Media type (e.g. one of `PUT_LIMITS.mimes`, `application/pdf`, `video/mp4`, `text/markdown`). */
   mime: string;
   data: string;
 }
 
 /**
  * What one `terminal.put` may carry. The total stays well under the relay's
- * 8 MiB WebSocket frame once base64 has grown it by a third; phones shrink
- * pictures to a few hundred KB first.
+ * 8 MiB WebSocket frame once base64 has grown it by a third.
  */
 export const PUT_LIMITS = {
   files: 6,
   /** Bytes of one file, decoded. */
-  fileBytes: 3 * 1024 * 1024,
+  fileBytes: 5 * 1024 * 1024,
   /** Bytes of all files of one call, decoded. */
   totalBytes: 5 * 1024 * 1024,
   mimes: ["image/jpeg", "image/png", "image/webp", "image/gif"],
@@ -446,10 +445,16 @@ export interface RpcMethods {
    */
   "terminal.input": { params: { agent: string; data: string }; result: { ok: true } };
   /**
-   * Puts pictures beside the agent on its computer (like `hc put`) and says
+   * Resizes the attached terminal view (and optionally reports the viewer's cell size /
+   * theme colors so `hc` answers display queries accurately). Hosts before this call answer
+   * `unsupported`; viewers can ignore failures.
+   */
+  "terminal.resize": { params: { agent: string; cols: number; rows: number; display?: TerminalDisplay }; result: { ok: true } };
+  /**
+   * Puts files or pictures beside the agent on its computer (like `hc put`) and says
    * where each landed, in order. Nothing is typed: the caller names the paths
    * in a following `terminal.send` (see `textWithFiles`), and agents such as
-   * Claude Code and Codex read a picture from its path. Limits: `PUT_LIMITS`.
+   * Claude Code and Codex read files from their paths. Limits: `PUT_LIMITS`.
    * Hosts before this call answer `unsupported`.
    */
   "terminal.put": { params: { agent: string; files: PutFile[] }; result: { paths: string[] } };
@@ -1087,6 +1092,26 @@ export interface LogEntry extends ClientLogEntry {
 // Terminal stream
 // ---------------------------------------------------------------------------
 
+/** What a viewer's own terminal looks like, reported by the client to `hc` for display queries. */
+export interface TerminalDisplay {
+  fg?: string | null;
+  bg?: string | null;
+  cursor?: string | null;
+  /** Cell size in physical/CSS pixels: `[width, height]`. */
+  cell?: [number, number] | null;
+}
+
+/** Raw PTY bytes from a live terminal stream (`raw: true`), base64-encoded. */
+export interface TerminalDataEvent {
+  kind: "terminal_data";
+  seq: number;
+  /** Raw UTF-8 / VT bytes from the PTY stream, base64-encoded. */
+  data: string;
+  cols?: number;
+  rows?: number;
+  at: number;
+}
+
 /**
  * `stream_subscribe` params of `stream: "terminal"`. Hosts ignore fields they
  * do not know, so a viewer can always send all of them.
@@ -1097,15 +1122,23 @@ export interface TerminalStreamParams {
   history?: number;
   /**
    * Ask for `terminal_rows` events (only the lines that changed) instead of a
-   * whole `terminal` screen on every paint. Hosts before this ignore it and
-   * keep sending `terminal` events: a viewer that asks must take both.
+   * whole `terminal` screen on every paint (`rows: true`), or pass initial row count
+   * when `raw: true`. Hosts before this ignore it and keep sending `terminal` events.
    */
-  rows?: boolean;
+  rows?: boolean | number;
   /**
    * `false`: no screen at all, only `queue` notices (the message box needs no
    * picture). Hosts before this still send screens, which the viewer drops.
    */
   screen?: boolean;
+  /**
+   * `true`: stream raw PTY bytes (`TerminalDataEvent`) for native terminal emulators
+   * supporting Kitty graphics, text sizing and keyboard protocols. Older hosts ignore
+   * this and fall back to `terminal_rows` / `terminal`.
+   */
+  raw?: boolean;
+  cols?: number;
+  display?: TerminalDisplay;
 }
 
 /**
@@ -1250,7 +1283,7 @@ export type ServerFrame =
   /**
    * Incremental terminal/session update from a subscribed host. Terminal
    * streams carry `{ kind: "terminal", screen }` (a whole `terminal.read`
-   * result), `TerminalRowsEvent` when asked for, `queue` and `stale` notices.
+   * result), `TerminalRowsEvent`, `TerminalDataEvent` when `raw: true`, `queue` and `stale` notices.
    */
   | { type: "stream_event"; id: string; event: unknown }
   | { type: "pong"; t: number }
@@ -1880,6 +1913,13 @@ export interface ClientConfig {
     memoryWarnMb: number;
     diskWarnGb: number;
   };
+  terminal: {
+    fontFamily: string;
+    fontSize: number;
+    lineHeight: number;
+    fontWeight: number;
+    cursorBlink: boolean;
+  };
 }
 
 export type ConfigValue = boolean | number | string | string[];
@@ -1945,10 +1985,15 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "resources.lowPower", type: "enum", values: ["auto", "on", "off"], default: "auto", usedBy: D, label: "省电模式", doc: "auto: on battery. on: always. Slower polling, fewer animations." },
   { key: "resources.memoryWarnMb", type: "integer", min: 256, max: 16384, default: 1024, usedBy: D, label: "内存提醒（MB）", doc: "Warn when the desktop app uses more memory than this." },
   { key: "resources.diskWarnGb", type: "integer", min: 1, max: 1000, default: 5, usedBy: D, label: "磁盘空间提醒（GB）", doc: "Warn when free disk space falls below this." },
+  { key: "terminal.fontFamily", type: "string", default: "", usedBy: D, label: "终端字体", doc: "Monospace font family for the desktop terminal; empty uses the default stack." },
+  { key: "terminal.fontSize", type: "integer", min: 10, max: 28, default: 13, usedBy: D, label: "终端字号", doc: "Font size of the desktop terminal in pixels." },
+  { key: "terminal.lineHeight", type: "integer", min: 100, max: 200, default: 120, usedBy: D, label: "终端行高（%）", doc: "Line height of the desktop terminal in percent." },
+  { key: "terminal.fontWeight", type: "integer", min: 300, max: 700, default: 400, usedBy: D, label: "终端字重", doc: "Normal text weight of the desktop terminal (bold stays 700)." },
+  { key: "terminal.cursorBlink", type: "boolean", default: true, usedBy: D, label: "终端光标闪烁", doc: "Blink the cursor in the desktop terminal." },
 ];
 
 /** The file's sections, in order. */
-export const CLIENT_CONFIG_SECTIONS = ["general", "update", "logging", "voiceInput", "browser", "files", "resources"] as const;
+export const CLIENT_CONFIG_SECTIONS = ["general", "update", "logging", "voiceInput", "browser", "files", "resources", "terminal"] as const;
 
 export interface ConfigProblem {
   /** `section.name`, a section, or "" for the whole file. */

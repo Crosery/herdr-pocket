@@ -163,7 +163,7 @@ export function promisesLookWithoutTools(text: string): boolean {
   if (!s || s.length > 200) return false;
   return /(?:我先?|现在|这就|马上|我去|我来|帮你)(?:去|先|把|给)?[^。！？\n]{0,20}(?:看看|看下|看一眼|读一遍|读一下|查一下|查查|翻一下|翻翻)/.test(s);
 }
-const WAKE_ROUNDS = 3;
+const WAKE_ROUNDS = 4;
 const WAKE_CONCURRENCY = 2;
 const TOUCH_WINDOW_MS = 10 * 60_000;
 const HARNESS_NAMES: Record<string, string> = { "claude-code": "Claude Code", claude: "Claude Code", codex: "Codex", omp: "omp", opencode: "OpenCode", gemini: "Gemini" };
@@ -549,7 +549,7 @@ export class Assistant {
         system,
         messages,
         tools,
-        maxTokens: opts.occasion === "text" ? 1500 : opts.occasion === "call" ? 400 : 300,
+        maxTokens: opts.occasion === "text" ? 1500 : opts.occasion === "call" ? 400 : 1200,
         signal: opts.signal,
         onText: (d) => {
           live += d;
@@ -568,16 +568,20 @@ export class Assistant {
       text = textOf(res.content);
       const calls = res.content.filter((b): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use");
       if (!calls.length) {
-        if (!nudged && used.length === 0 && opts.occasion === "text" && tools.length > 0 && promisesLookWithoutTools(text)) {
+        if (!nudged && used.length === 0 && (opts.occasion === "text" || opts.occasion === "woken") && tools.length > 0 && promisesLookWithoutTools(text)) {
           nudged = true;
           this.event({
             kind: "guard",
             level: "info",
-            msg: `text: model promised a look without calling tools ("${clip(oneLine(text), 80)}"), nudging once`,
+            msg: `${opts.occasion}: model promised a look without calling tools ("${clip(oneLine(text), 80)}"), nudging once`,
           });
+          const nudge =
+            opts.occasion === "woken"
+              ? "（你刚才还没有调用工具。现在直接调用 read_agent 查看对话或终端，拿到结果后按“成了 / 要你定 / 没成 / 不用说”格式回。）"
+              : "（你刚才只说了要去查看，还没有调用任何工具。现在直接并行调用工具（如 read_agent / list_agents），拿到结果后再回答我。）";
           messages.push(
             { role: "assistant", content: text, ...(res.reasoning ? { reasoning: res.reasoning } : {}) },
-            { role: "user", content: "（你刚才只说了要去查看，还没有调用任何工具。现在直接并行调用工具（如 read_agent / list_agents），拿到结果后再回答我。）" },
+            { role: "user", content: nudge },
           );
           continue;
         }
@@ -1475,7 +1479,7 @@ export class Assistant {
     for (const r of watching) this.cancelReminder(r.id);
     const handle = this.handleOf(a);
     const material = await this.blockedMaterial(a, handle, watching);
-    const looked = material ? await this.look(material, false, this.opts.blockedWakeTimeoutMs ?? 8000) : null;
+    const looked = material ? await this.look(material, false, this.opts.blockedWakeTimeoutMs ?? 25_000) : null;
     // Approved at the desk while the assistant was looking: nothing left to tell.
     if (!watching.length && this.agentByKey(key)?.status !== "blocked") return;
     // Being asked for is always worth telling: "不用说" is not accepted here.
@@ -1516,7 +1520,7 @@ export class Assistant {
     for (const r of watching) this.cancelReminder(r.id);
     const handle = this.handleOf(a);
     const material = await this.finishedMaterial(a, handle, stop.ranMs, watching);
-    const looked = material ? await this.look(material, true, this.opts.wakeTimeoutMs ?? 20_000) : null;
+    const looked = material ? await this.look(material, true, this.opts.wakeTimeoutMs ?? 60_000) : null;
     if (looked?.verdict === "skip" && !watching.length) {
       this.event({ kind: "wake", msg: `looked at ${this.handleOf(a)}: nothing to tell`, data: { agent: stop.key } });
       return;
@@ -1544,7 +1548,7 @@ export class Assistant {
       const text = await this.lastWords(a);
       if (text) said.push({ handle: this.handleOf(a), text: clip(oneLine(text), 300) });
     }
-    const looked = said.length ? await this.look(wakeBatch(handles, said), true, this.opts.wakeTimeoutMs ?? 20_000) : null;
+    const looked = said.length ? await this.look(wakeBatch(handles, said), true, this.opts.wakeTimeoutMs ?? 60_000) : null;
     const told = looked && looked.verdict !== "skip" && looked.say ? looked : null;
     const say = told?.say ?? `${agents.length} 个停了：${handles.slice(0, 3).join("、")}。`;
     for (const a of agents) if (this.stillStopped(a.key)) this.reasons.set(a.key, say);
@@ -1615,25 +1619,50 @@ export class Assistant {
   }
 
   private async lastWords(a: Agent): Promise<string> {
-    const events = await this.recentEvents(a, 10);
+    const events = await this.recentEvents(a, 20);
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i]!;
       if (e.kind === "assistant_message" && e.text.trim()) return stripMd(e.text);
+    }
+    try {
+      const r = await this.host.call(a.deviceId, "terminal.read", { agent: a.key, lines: 15 }, 5000);
+      const clean = (r.text ?? "").split("\n").map((l) => l.trimEnd()).filter(Boolean).slice(-6).join("\n");
+      if (clean) return clip(clean, 300);
+    } catch {
+      /* host offline or unsupported */
     }
     return "";
   }
 
   /** What the turn was about and how it ended (5.5); null when there is nothing to read. */
   private async finishedMaterial(a: Agent, handle: string, ranMs: number, watching: Reminder[]): Promise<string | null> {
-    const events = await this.recentEvents(a, 40);
-    const asked = events.filter((e) => e.kind === "user_message" && !e.synthetic).pop();
-    const said = [...events].reverse().find((e) => e.kind === "assistant_message" && e.text.trim());
-    const failed = new Set(events.flatMap((e) => (e.kind === "tool_result" && e.is_error ? [e.call_id] : [])));
-    const did = events
+    const events = await this.recentEvents(a, 120);
+    let askedIdx = -1;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i]!;
+      if (ev.kind === "user_message" && !ev.synthetic) {
+        askedIdx = i;
+        break;
+      }
+    }
+    const asked = askedIdx >= 0 ? events[askedIdx] : undefined;
+    const turnEvents = askedIdx >= 0 ? events.slice(askedIdx + 1) : events;
+    const said = [...turnEvents].reverse().find((e) => e.kind === "assistant_message" && e.text.trim());
+    const failed = new Set(turnEvents.flatMap((e) => (e.kind === "tool_result" && e.is_error ? [e.call_id] : [])));
+    const did = turnEvents
       .flatMap((e) => (e.kind === "tool_call" ? [e] : []))
-      .slice(-8)
+      .slice(-10)
       .map((e) => `${failed.has(e.call_id) ? "[出错] " : ""}${e.name}：${clip(oneLine(toolInput(e.input)), 120)}`);
-    if (!said && !did.length) return null;
+    let terminal = "";
+    if (!said) {
+      try {
+        const r = await this.host.call(a.deviceId, "terminal.read", { agent: a.key, lines: 40 }, 6000);
+        terminal = tail((r.text ?? "").split("\n").map((l) => l.trimEnd()).join("\n").replace(/\n{3,}/g, "\n\n").trim(), 2500);
+      } catch {
+        /* host offline or unsupported */
+      }
+    }
+    if (!said && !did.length && !terminal) return null;
     const askedText = asked?.kind === "user_message" ? clip(asked.text.trim(), 600) : undefined;
     const spoken = asked?.kind === "user_message" ? this.relayedFrom(a.key, asked.text) : undefined;
     const first = a.preview && oneLine(a.preview).slice(0, 40) !== oneLine(askedText ?? "").slice(0, 40) ? clip(oneLine(a.preview), 200) : undefined;
@@ -1650,6 +1679,7 @@ export class Assistant {
       first,
       said: said?.kind === "assistant_message" ? headTail(said.text.trim(), 900, 500) : undefined,
       did: did.join("\n") || undefined,
+      terminal: terminal || undefined,
     });
   }
 

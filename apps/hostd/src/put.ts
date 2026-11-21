@@ -4,16 +4,36 @@ import { join } from "node:path";
 import { PUT_LIMITS } from "@herdr-pocket/protocol";
 import { stateDir } from "./platform.ts";
 
-/** A picture from a phone, checked: safe name, real bytes. */
+/** A file or picture from a client, checked: safe name, real bytes for raster images. */
 export interface CheckedFile {
   name: string;
   mime: string;
   bytes: Buffer;
 }
 
-const EXT: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif" };
+const RASTER_EXT: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+};
 
-/** First bytes of each accepted type: the name and the stated type are not trusted. */
+const FALLBACK_EXT: Record<string, string> = {
+  "application/pdf": "pdf",
+  "text/plain": "txt",
+  "text/markdown": "md",
+  "text/csv": "csv",
+  "application/json": "json",
+  "video/mp4": "mp4",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+  "image/svg+xml": "svg",
+  "application/zip": "zip",
+};
+
+const MIME_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i;
+
+/** First bytes of each checked raster image type: the name and the stated type are not trusted. */
 function looksLike(mime: string, b: Buffer): boolean {
   switch (mime) {
     case "image/jpeg":
@@ -31,49 +51,54 @@ function looksLike(mime: string, b: Buffer): boolean {
 
 /**
  * A name that is safe on disk and in a typed message: ASCII letters, digits,
- * `.`, `_`, `-`, at most 60 characters, ending in the extension of its type.
+ * `.`, `_`, `-`, at most 60 characters plus extension.
  */
 export function safeName(name: unknown, mime: string, index: number): string {
-  const ext = EXT[mime] ?? "bin";
   const base = typeof name === "string" ? (name.split(/[\\/]/).pop() ?? "") : "";
+  const rasterExt = RASTER_EXT[mime];
+  const rawExt = /\.([A-Za-z0-9]{1,10})$/.exec(base)?.[1]?.toLowerCase();
+  const ext = rasterExt ?? rawExt ?? FALLBACK_EXT[mime] ?? "bin";
   const stem = base
     .replace(/\.[^.]*$/, "")
     .replace(/[^A-Za-z0-9._-]+/g, "-")
     .replace(/^[.-]+|[.-]+$/g, "")
     .slice(0, 55);
-  return `${/[A-Za-z0-9]/.test(stem) ? stem : `image-${index + 1}`}.${ext}`;
+  const fallbackStem = rasterExt ? `image-${index + 1}` : `file-${index + 1}`;
+  return `${/[A-Za-z0-9]/.test(stem) ? stem : fallbackStem}.${ext}`;
 }
 
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 /**
- * Checks what a phone sent for `terminal.put`: one to `PUT_LIMITS.files`
- * pictures of an accepted type whose bytes really are that type, within the
- * size limits. Names come back safe and distinct. Throws a message for people.
+ * Checks what a client sent for `terminal.put`: one to `PUT_LIMITS.files`
+ * files within the size limits. Raster images have their magic bytes checked;
+ * all other valid MIME types preserve safe extensions. Throws a message for people.
  */
 export function checkFiles(files: unknown): CheckedFile[] {
-  if (!Array.isArray(files) || !files.length) throw new Error("没有收到图片");
-  if (files.length > PUT_LIMITS.files) throw new Error(`一次最多发 ${PUT_LIMITS.files} 张图片`);
+  if (!Array.isArray(files) || !files.length) throw new Error("没有收到文件");
+  if (files.length > PUT_LIMITS.files) throw new Error(`一次最多发 ${PUT_LIMITS.files} 个文件`);
   const out: CheckedFile[] = [];
   const names = new Set<string>();
   let total = 0;
   files.forEach((f, i) => {
     const file = (f && typeof f === "object" ? f : {}) as { name?: unknown; mime?: unknown; data?: unknown };
-    const mime = typeof file.mime === "string" ? file.mime.toLowerCase() : "";
-    if (!(PUT_LIMITS.mimes as readonly string[]).includes(mime)) throw new Error(`第 ${i + 1} 个文件不是 JPEG、PNG、WebP 或 GIF 图片`);
+    const rawMime = typeof file.mime === "string" ? file.mime.split(";")[0]!.trim().toLowerCase() : "";
+    const mime = rawMime || "application/octet-stream";
+    if (!MIME_RE.test(mime)) throw new Error(`第 ${i + 1} 个文件的类型格式不对`);
+    const isRaster = (PUT_LIMITS.mimes as readonly string[]).includes(mime);
     const data = typeof file.data === "string" ? file.data : "";
     // Base64 is a third larger than what it carries: anything longer is over the limit already.
     if (!data || data.length % 4 !== 0 || data.length > Math.ceil(PUT_LIMITS.fileBytes / 3) * 4 || !BASE64.test(data)) {
-      throw new Error(data.length > Math.ceil(PUT_LIMITS.fileBytes / 3) * 4 ? `第 ${i + 1} 张图片太大了` : `第 ${i + 1} 张图片的内容不对`);
+      throw new Error(data.length > Math.ceil(PUT_LIMITS.fileBytes / 3) * 4 ? `第 ${i + 1} 个文件太大了` : `第 ${i + 1} 个文件的内容不对`);
     }
     const bytes = Buffer.from(data, "base64");
-    if (bytes.length > PUT_LIMITS.fileBytes) throw new Error(`第 ${i + 1} 张图片太大了`);
-    if (!looksLike(mime, bytes)) throw new Error(`第 ${i + 1} 张图片的内容和类型对不上`);
+    if (bytes.length > PUT_LIMITS.fileBytes) throw new Error(`第 ${i + 1} 个文件太大了`);
+    if (isRaster && !looksLike(mime, bytes)) throw new Error(`第 ${i + 1} 张图片的内容和类型对不上`);
     total += bytes.length;
-    if (total > PUT_LIMITS.totalBytes) throw new Error(`图片加起来太大了，一次最多 ${Math.floor(PUT_LIMITS.totalBytes / 1024 / 1024)} MB`);
+    if (total > PUT_LIMITS.totalBytes) throw new Error(`文件加起来太大了，一次最多 ${Math.floor(PUT_LIMITS.totalBytes / 1024 / 1024)} MB`);
     const first = safeName(file.name, mime, i);
     let name = first;
-    for (let n = 2; names.has(name); n++) name = first.replace(/(\.[a-z]+)$/, `-${n}$1`);
+    for (let n = 2; names.has(name); n++) name = first.replace(/(\.[a-z0-9]+)$/, `-${n}$1`);
     names.add(name);
     out.push({ name, mime, bytes });
   });

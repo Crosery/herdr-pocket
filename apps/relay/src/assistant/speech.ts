@@ -149,18 +149,35 @@ const VERDICTS: Record<string, WakeVerdict> = { 成了: "ok", 要你定: "decide
  * the sentence itself (`stopped`).
  */
 export function parseWake(raw: string): { verdict: WakeVerdict; say: string; details: string } {
-  const [top, below] = atSeparator(noEmoji(raw));
+  const cleaned = noEmoji(raw)
+    .replace(/\r/g, "")
+    .replace(/(?:^|\n)\s*【?\s*结论\s*】?\s*[：:]?\s*/g, "\n")
+    .replace(/\s*【\s*一句话\s*】\s*[：:]?\s*/g, "\n")
+    .replace(/(?:^|\n)\s*一句话\s*[：:]\s*/g, "\n")
+    .replace(/(?:^|\n)\s*【?\s*细节\s*】?\s*[：:]?\s*/g, "\n---\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const [top, below] = atSeparator(cleaned);
   const lines = top
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
-  const first = (lines[0] ?? "").replace(/结论/g, "").replace(/[\s\p{P}\p{S}]/gu, "");
-  const known = VERDICTS[first];
-  const sentence = known ? lines.slice(1).join(" ") : lines.join(" ");
-  const [say, over] = cutAtSentence(filterTalk(speakable(sentence)), MAX_WAKE_SAY);
+  const firstRaw = lines[0] ?? "";
+  const firstNorm = firstRaw.replace(/[\s\p{P}\p{S}]/gu, "");
+  let known = VERDICTS[firstNorm];
+  let sentenceLines = known ? lines.slice(1) : lines;
+  if (!known && firstRaw) {
+    const m = /^(成了|要你定|没成|不用说)(?:[：:。\s]+(.*))?$/.exec(firstRaw.replace(/^[【\[]\s*|\s*[】\]]$/g, ""));
+    if (m) {
+      known = VERDICTS[m[1]!];
+      sentenceLines = [m[2]?.trim() ?? "", ...lines.slice(1)].filter(Boolean);
+    }
+  }
+  if (known === "skip") return { verdict: "skip", say: "", details: "" };
+  const [say, over] = cutAtSentence(filterTalk(speakable(sentenceLines.join(" "))), MAX_WAKE_SAY);
   const detailLines = [over, ...below.split("\n")]
     .map((l) => l.trim())
-    .filter(Boolean)
+    .filter((l) => l && l !== "---")
     .slice(0, 5);
   return { verdict: known ?? "stopped", say, details: clip(detailLines.join("\n"), MAX_WAKE_DETAILS) };
 }

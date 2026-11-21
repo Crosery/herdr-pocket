@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Copy, Laptop, Monitor, Plus, QrCode, RefreshCw, Server, Smartphone, Trash2, Upload } from "lucide-react";
 import { configKeySpec, type Device } from "@herdr-pocket/protocol";
-import { PocketBadge, PocketButton, useToast } from "../../components/PocketUI";
+import { PocketBadge, PocketButton, PocketInput, PocketSelect, useToast } from "../../components/PocketUI";
+import { buildTerminalFontFamily } from "../../components/TerminalSurface";
 import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { PermissionCards, prettyHotkey } from "../../components/VoiceInput";
 import { serverLabel } from "../../components/Sidebar";
@@ -64,6 +65,173 @@ function TextScaleRow() {
   );
 }
 
+const CANDIDATE_MONO_FONTS = [
+  "SF Mono",
+  "Menlo",
+  "Monaco",
+  "JetBrains Mono",
+  "JetBrainsMono Nerd Font",
+  "Fira Code",
+  "FiraCode Nerd Font",
+  "Cascadia Mono",
+  "Cascadia Code",
+  "Maple Mono",
+  "Maple Mono NF CN",
+  "Sarasa Mono SC",
+  "Source Code Pro",
+  "IBM Plex Mono",
+  "Iosevka",
+  "MesloLGS NF",
+  "Hack",
+  "Consolas",
+  "Ubuntu Mono",
+];
+
+let cachedInstalledFonts: string[] | null = null;
+
+function detectInstalledMonoFonts(): string[] {
+  if (cachedInstalledFonts) return cachedInstalledFonts;
+  if (typeof document === "undefined") return [];
+  try {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return [];
+    const sample = "mmmmmmmmmmlli12345汉字测试";
+    ctx.font = "48px monospace";
+    const baseMono = ctx.measureText(sample).width;
+    ctx.font = "48px sans-serif";
+    const baseSans = ctx.measureText(sample).width;
+    const found: string[] = [];
+    for (const font of CANDIDATE_MONO_FONTS) {
+      const q = JSON.stringify(font);
+      ctx.font = `48px ${q}, monospace`;
+      const wMono = ctx.measureText(sample).width;
+      ctx.font = `48px ${q}, sans-serif`;
+      const wSans = ctx.measureText(sample).width;
+      if (wMono !== baseMono || wSans !== baseSans) found.push(font);
+    }
+    cachedInstalledFonts = found;
+    return found;
+  } catch {
+    return [];
+  }
+}
+
+function ConfigIntStepper({
+  k,
+  label,
+  step,
+  unit = "",
+}: {
+  k: string;
+  label: string;
+  step: number;
+  unit?: string;
+}) {
+  const toast = useToast();
+  const cfg = useClientConfig();
+  const spec = configKeySpec(k);
+  const min = spec?.min ?? 0;
+  const max = spec?.max ?? 9999;
+  const val = Number((cfg.terminal as Record<string, unknown>)[k.split(".")[1]!] ?? spec?.default ?? min);
+  const apply = (next: number) => {
+    const clamped = Math.min(max, Math.max(min, next));
+    if (clamped !== val) void setConfig(k, clamped).catch((e: Error) => toast(e.message, true));
+  };
+  return (
+    <div className="sf-stepper" role="group" aria-label={label}>
+      <button aria-label={`减小${label}`} disabled={val <= min} onClick={() => apply(val - step)}>
+        −
+      </button>
+      <output className="num" aria-live="polite">
+        {val}
+        {unit}
+      </output>
+      <button aria-label={`增大${label}`} disabled={val >= max} onClick={() => apply(val + step)}>
+        +
+      </button>
+    </div>
+  );
+}
+
+export function TerminalSettingsSection() {
+  const toast = useToast();
+  const term = useClientConfig().terminal;
+  const installed = useMemo(() => detectInstalledMonoFonts(), []);
+  const [fontDraft, setFontDraft] = useState(term.fontFamily);
+
+  useEffect(() => {
+    setFontDraft(term.fontFamily);
+  }, [term.fontFamily]);
+
+  const commitFont = (nextRaw: string) => {
+    const next = nextRaw.trim();
+    if (next === term.fontFamily) return;
+    void setConfig("terminal.fontFamily", next).catch((e: Error) => toast(e.message, true));
+  };
+
+  const fontOptions = useMemo(() => {
+    const base = [{ value: "", label: "默认等宽字体" }, ...installed.map((f) => ({ value: f, label: f }))];
+    if (term.fontFamily && !installed.includes(term.fontFamily)) {
+      base.push({ value: term.fontFamily, label: `${term.fontFamily}（当前）` });
+    }
+    return base;
+  }, [installed, term.fontFamily]);
+
+  return (
+    <>
+      <SetHeading>终端</SetHeading>
+      <SetRow title="终端字体" about="可选择已安装的等宽字体，或直接输入字体名称；修改后立即应用到终端。">
+        <div className="sf-term-font-ctrl">
+          <PocketSelect
+            value={term.fontFamily}
+            options={fontOptions}
+            onValueChange={(v) => {
+              setFontDraft(v);
+              commitFont(v);
+            }}
+          />
+          <PocketInput
+            mono
+            value={fontDraft}
+            placeholder="自定义字体名（留空使用默认）"
+            aria-label="自定义终端字体"
+            onChange={(e) => setFontDraft(e.target.value)}
+            onBlur={() => commitFont(fontDraft)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitFont(fontDraft);
+              }
+            }}
+          />
+        </div>
+      </SetRow>
+      <div
+        className="sf-term-preview"
+        style={{
+          fontFamily: buildTerminalFontFamily(term.fontFamily),
+          fontSize: `${term.fontSize}px`,
+          lineHeight: term.lineHeight / 100,
+          fontWeight: term.fontWeight,
+        }}
+      >
+        ~/work/app $ pnpm dev · 中文对齐 0123 [] () =&gt; {"{}"}
+      </div>
+      <SetRow title="终端字号" about="终端标签页中的文字大小（10–28 px）。">
+        <ConfigIntStepper k="terminal.fontSize" label="终端字号" step={1} unit="px" />
+      </SetRow>
+      <SetRow title="终端行高" about="每行文字的垂直间距（100%–200%）。">
+        <ConfigIntStepper k="terminal.lineHeight" label="终端行高" step={5} unit="%" />
+      </SetRow>
+      <SetRow title="终端字重" about="常规文本粗细（300–700；粗体保持 700）。">
+        <ConfigIntStepper k="terminal.fontWeight" label="终端字重" step={100} />
+      </SetRow>
+      <ConfigSwitch k="terminal.cursorBlink" about="在终端模式里让光标闪烁。" />
+    </>
+  );
+}
+
 export function LookPane() {
   return (
     <div className="pane">
@@ -71,6 +239,7 @@ export function LookPane() {
       <ThemeRow />
       <SetHeading>大小</SetHeading>
       <TextScaleRow />
+      <TerminalSettingsSection />
       <SetHeading>列表</SetHeading>
       <ConfigSwitch k="general.showShells" about="在 Agent 列表里也列出没跑 Agent 的普通终端。" />
       <StartupRows />

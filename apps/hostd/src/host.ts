@@ -16,6 +16,8 @@ import {
   type RpcMethod,
   type RpcMethods,
   type ServerFrame,
+  type TerminalDataEvent,
+  type TerminalDisplay,
   type TerminalRowsEvent,
 } from "@herdr-pocket/protocol";
 import { HcAdapter, type AppNames } from "./hc.ts";
@@ -591,28 +593,52 @@ export class Host {
         let stop: () => void = () => undefined;
         // `screen: false`: only queue notices (they go to every terminal stream of the agent).
         if (p.screen !== false) {
-          const paint = this.terminalPainter(f.id, p.rows === true);
           const onError = (error: Error) => this.sendStream(f.id, { kind: "stale", message: error.message, at: Date.now() });
-          if (a.source === "hc") {
-            const history = Math.min(Math.max(Number(p.history ?? 120) || 120, 0), 600);
-            stop = await this.hc.watch(a.localId, history, paint, onError, { text: p.rows !== true });
+          if (p.raw === true && a.source === "hc") {
+            let seq = 0;
+            const cols = typeof p.cols === "number" && Number.isFinite(p.cols) ? p.cols : 80;
+            const rows = typeof p.rows === "number" && Number.isFinite(p.rows) ? p.rows : 24;
+            const history = Math.min(Math.max(Number(p.history ?? 2000) || 2000, 0), 4000);
+            const display = p.display && typeof p.display === "object" ? (p.display as TerminalDisplay) : undefined;
+            stop = await this.hc.watchRaw(
+              a.localId,
+              { cols, rows, history, display },
+              (chunk, curCols, curRows) => {
+                const ev: TerminalDataEvent = {
+                  kind: "terminal_data",
+                  seq: ++seq,
+                  data: chunk.toString("base64"),
+                  cols: curCols,
+                  rows: curRows,
+                  at: Date.now(),
+                };
+                this.sendStream(f.id, ev);
+              },
+              onError,
+            );
           } else {
-            let busy = false;
-            const tick = async () => {
-              if (busy) return;
-              busy = true;
-              try {
-                const r = a.source === "herdr" ? await this.herdr.read(a.localId, 400) : null;
-                if (r) paint({ lines: (r.ansi ?? r.text).split("\n"), text: r.text, cols: 0, rows: 0 });
-              } catch (e) {
-                onError(e as Error);
-              } finally {
-                busy = false;
-              }
-            };
-            const timer = setInterval(() => void tick(), 500);
-            void tick();
-            stop = () => clearInterval(timer);
+            const paint = this.terminalPainter(f.id, p.rows === true);
+            if (a.source === "hc") {
+              const history = Math.min(Math.max(Number(p.history ?? 120) || 120, 0), 600);
+              stop = await this.hc.watch(a.localId, history, paint, onError, { text: p.rows !== true });
+            } else {
+              let busy = false;
+              const tick = async () => {
+                if (busy) return;
+                busy = true;
+                try {
+                  const r = a.source === "herdr" ? await this.herdr.read(a.localId, 400) : null;
+                  if (r) paint({ lines: (r.ansi ?? r.text).split("\n"), text: r.text, cols: 0, rows: 0 });
+                } catch (e) {
+                  onError(e as Error);
+                } finally {
+                  busy = false;
+                }
+              };
+              const timer = setInterval(() => void tick(), 500);
+              void tick();
+              stop = () => clearInterval(timer);
+            }
           }
         }
         // Unsubscribed (or replaced) while the watch was starting.
@@ -991,9 +1017,23 @@ export class Host {
     "terminal.input": async (p) => {
       this.writable();
       const a = this.resolve(p.agent);
-      if (typeof p.data !== "string" || !p.data || p.data.length > 4096) throw new RpcFailure("bad_request", "data is required");
+      if (typeof p.data !== "string" || !p.data || p.data.length > 262_144) throw new RpcFailure("bad_request", "data is required");
       if (a.source !== "hc") throw new RpcFailure("unsupported", "这个 agent 不是桌面 herdr 开的，只能用输入框发送");
       await this.hc.input(a.localId, p.data);
+      return { ok: true as const };
+    },
+    "terminal.resize": async (p) => {
+      this.writable();
+      const a = this.resolve(p.agent);
+      const cols = Number(p.cols);
+      const rows = Number(p.rows);
+      if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols < 10 || cols > 500 || rows < 2 || rows > 200) {
+        throw new RpcFailure("bad_request", "cols and rows must be valid terminal dimensions");
+      }
+      if (a.source === "hc") {
+        const display = p.display && typeof p.display === "object" ? p.display : undefined;
+        await this.hc.resize(a.localId, Math.round(cols), Math.round(rows), display);
+      }
       return { ok: true as const };
     },
     "terminal.put": async (p) => {
@@ -1082,6 +1122,7 @@ export class Host {
         folder,
       );
       await Promise.all([this.hc.list(), this.refreshNames()]);
+      this.publishNow();
       const made = { agent: agentKey(this.deviceId, "hc", r.terminal), space: r.space, terminal: r.terminal };
       if (!task) return made;
       // `hc run` starts the bare program: the task is typed in like for any other.

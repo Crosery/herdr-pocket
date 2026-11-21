@@ -10,7 +10,7 @@ import { agentSpace, agentTitle, allAgents, liveStore, settingsStore, spacedTitl
 import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, tileLetter, toneIndex, type ListGroup } from "./agentInfo";
-import { openAgentTab, openSettingsFrame, setPalette, setPeek, shellStore } from "./shellStore";
+import { openAgentTab, openSettingsFrame, setPalette, setPeek, setSelectedSpace, shellStore } from "./shellStore";
 import { shortcutText } from "./shortcuts";
 
 const FOLD_KEY = "herdr-pocket-v3-folded";
@@ -68,7 +68,8 @@ export function ShellSidebar({
 
   const [folded, setFolded] = useState<string[]>(() => readJson<string[]>(FOLD_KEY, []));
   const [sort, setSortState] = useState<"status" | "recent">(() => readJson(SORT_KEY, "status"));
-  const [spaceSel, setSpaceSel] = useState<string | null>(null);
+  const spaceSel = shellStore.use((s) => s.selectedSpace);
+  const setSpaceSel = setSelectedSpace;
 
   const toggleFold = (id: string) => {
     const next = folded.includes(id) ? folded.filter((x) => x !== id) : [...folded, id];
@@ -197,7 +198,7 @@ export function ShellSidebar({
           {collapsed ? null : (
             <div className="v3-block-head">
               <span className="grow">空间</span>
-              <button className="v3-icon-btn small" aria-label="新建 Agent" title={`新建 Agent（${shortcutText("newAgent")}）`} onClick={() => onNewAgent(null, null)}>
+              <button className="v3-icon-btn small" aria-label="新建 Agent" title="新建 Agent…" onClick={() => onNewAgent(null, null)}>
                 <Plus size={14} />
               </button>
             </div>

@@ -1,13 +1,13 @@
 {
   "name": "@herdr-pocket/desktop",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.3",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
-    "test": "node --test \"test/*.test.ts\"",
+    "test": "node --import ./test/_loader.mjs --test \"test/*.test.ts\"",
     "build": "tsc --noEmit && vite build",
     "build:harmony": "tsc --noEmit && vite build --mode harmony --base ./ --outDir ../harmony/entry/src/main/resources/rawfile",
     "tauri": "tauri"
@@ -21,6 +21,10 @@
     "@tauri-apps/api": "^2.5.0",
     "@tauri-apps/plugin-notification": "^2.3.0",
     "@tauri-apps/plugin-opener": "^2.3.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-image": "^0.9.0",
+    "@xterm/addon-unicode11": "^0.9.0",
+    "@xterm/xterm": "^6.0.0",
     "lucide-react": "^0.511.0",
     "qrcode": "^1.5.4",
     "react": "^19.1.0",

@@ -15,6 +15,7 @@ import { refreshNotifyChannel, signOut } from "../../lib/relay";
 import { liveStore, relTime, settingsStore, updateSettings } from "../../lib/store";
 import { useWindowHidden } from "../../lib/layout";
 import { ConfigSelect, ConfigSwitch, PaneTitle, SetHeading, SetRow } from "./rows";
+import { TerminalSettingsSection } from "./FramePanes";
 import { ToolVersionsSection } from "./ToolVersions";
 
 const PLATFORM_LABEL: Record<string, string> = {
@@ -183,6 +184,7 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
         </div>
       </SetRow>
       <ConfigSwitch k="general.showShells" about="在 Agent 列表里也列出没跑 Agent 的普通终端。" />
+      {DESKTOP ? <TerminalSettingsSection /> : null}
       <StartupRows />
       <ConfigFileBlock />
       <GuideRow onReopenGuide={onReopenGuide} />

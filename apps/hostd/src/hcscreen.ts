@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import type { TerminalDisplay } from "@herdr-pocket/protocol";
 import { defaultHcBin } from "./platform.ts";
 import { Screen } from "./vt.ts";
 
@@ -6,7 +7,31 @@ import { Screen } from "./vt.ts";
 const DATA = 0;
 const CREDIT = 1;
 const CLOSE = 2;
+const RESIZE = 3;
+const FACTS = 5;
 const HEADER = 9;
+
+const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
+
+function clampInt(n: unknown, min: number, max: number, fallback: number): number {
+  const v = typeof n === "number" ? n : Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(v)));
+}
+
+function sanitizeDisplay(d?: TerminalDisplay): Record<string, unknown> | undefined {
+  if (!d || typeof d !== "object") return undefined;
+  const out: Record<string, unknown> = {};
+  if (typeof d.fg === "string" && HEX_COLOR.test(d.fg)) out.fg = d.fg;
+  if (typeof d.bg === "string" && HEX_COLOR.test(d.bg)) out.bg = d.bg;
+  if (typeof d.cursor === "string" && HEX_COLOR.test(d.cursor)) out.cursor = d.cursor;
+  if (Array.isArray(d.cell) && d.cell.length === 2) {
+    const w = clampInt(d.cell[0], 1, 200, 0);
+    const h = clampInt(d.cell[1], 1, 200, 0);
+    if (w > 0 && h > 0) out.cell = [w, h];
+  }
+  return Object.keys(out).length ? out : undefined;
+}
 
 function encode(channel: number, kind: number, payload: Buffer): Buffer {
   const h = Buffer.alloc(HEADER);
@@ -245,14 +270,188 @@ export class HcScreens {
   }
 
   private inputs = new Map<string, { channel: Promise<number>; timer?: NodeJS.Timeout }>();
+  private activeRaw = new Map<string, Set<{ channel: number; cols: number; rows: number }>>();
+
+  /**
+   * Attaches to a terminal and streams raw PTY/VT bytes (`TerminalDataEvent` upstream)
+   * with initial scrollback and optional viewer display facts, enabling Kitty graphics,
+   * text sizing (OSC 66), and keyboard protocol pass-through in desktop clients.
+   */
+  async watchRaw(
+    terminal: string,
+    opts: { cols?: number; rows?: number; history?: number; display?: TerminalDisplay },
+    onData: (chunk: Buffer, cols: number, rows: number) => void,
+    _onError: (error: Error) => void,
+  ): Promise<() => void> {
+    const reqCols = clampInt(opts.cols, 20, 500, 80);
+    const reqRows = clampInt(opts.rows, 5, 200, 24);
+    const history = clampInt(opts.history, 0, 4000, 2000);
+    const display = sanitizeDisplay(opts.display);
+    const r = await this.call("terminal.attach", {
+      terminal,
+      cols: reqCols,
+      rows: reqRows,
+      history,
+      observe: false,
+      ...(display ? { display } : {}),
+    });
+    const channel: number = r.channel;
+    let curCols: number = clampInt(r.terminal?.cols, 20, 500, reqCols);
+    let curRows: number = clampInt(r.terminal?.rows, 5, 200, reqRows);
+    const rawEntry = { channel, cols: curCols, rows: curRows };
+    let set = this.activeRaw.get(terminal);
+    if (!set) {
+      set = new Set();
+      this.activeRaw.set(terminal, set);
+    }
+    set.add(rawEntry);
+
+    let stopped = false;
+    let timer: NodeJS.Timeout | undefined;
+    let pending: Buffer[] = [];
+    let pendingBytes = 0;
+    let consumedBytes = 0;
+    let lastEmitAt = 0;
+    const MAX_CHUNK = 192 * 1024;
+
+    const flush = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      if (!pending.length || stopped) {
+        pending = [];
+        pendingBytes = 0;
+        return;
+      }
+      const combined = pending.length === 1 ? pending[0]! : Buffer.concat(pending, pendingBytes);
+      pending = [];
+      pendingBytes = 0;
+      lastEmitAt = Date.now();
+      for (let off = 0; off < combined.length; off += MAX_CHUNK) {
+        onData(combined.subarray(off, off + MAX_CHUNK), curCols, curRows);
+      }
+    };
+
+    const finish = () => {
+      if (stopped) return;
+      stopped = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      pending = [];
+      pendingBytes = 0;
+      const curSet = this.activeRaw.get(terminal);
+      if (curSet) {
+        curSet.delete(rawEntry);
+        if (!curSet.size) this.activeRaw.delete(terminal);
+      }
+      this.streams.delete(channel);
+      this.send(channel, CLOSE, Buffer.alloc(0));
+    };
+
+    const onFrame = (kind: number, payload: Buffer) => {
+      if (stopped) return;
+      if (kind === CLOSE) {
+        if (pending.length) flush();
+        finish();
+        return;
+      }
+      if (kind === RESIZE && payload.length >= 4) {
+        curCols = clampInt(payload.readUInt16LE(0), 20, 500, curCols);
+        curRows = clampInt(payload.readUInt16LE(2), 5, 200, curRows);
+        rawEntry.cols = curCols;
+        rawEntry.rows = curRows;
+        return;
+      }
+      if (kind !== DATA) return;
+      if (payload.length) {
+        pending.push(payload);
+        pendingBytes += payload.length;
+        consumedBytes += payload.length;
+        if (consumedBytes >= 4 * 1024 * 1024) {
+          const ack = Buffer.alloc(4);
+          ack.writeUInt32LE(consumedBytes);
+          consumedBytes = 0;
+          this.send(channel, CREDIT, ack);
+        }
+      }
+      const elapsed = Date.now() - lastEmitAt;
+      if (pendingBytes >= MAX_CHUNK || elapsed >= 12) {
+        flush();
+      } else if (!timer) {
+        timer = setTimeout(flush, 8);
+      }
+    };
+
+    this.streams.set(channel, onFrame);
+    for (const [kind, p] of this.early.get(channel) ?? []) onFrame(kind, p);
+    this.early.delete(channel);
+    const credit = Buffer.alloc(4);
+    credit.writeUInt32LE(16 * 1024 * 1024);
+    this.send(channel, CREDIT, credit);
+    return finish;
+  }
+
+  /** Resizes active raw attachments (or opens a brief attach) and updates display facts. */
+  async resize(terminal: string, cols: number, rows: number, display?: TerminalDisplay): Promise<void> {
+    const c = clampInt(cols, 20, 500, 80);
+    const r = clampInt(rows, 5, 200, 24);
+    const d = sanitizeDisplay(display);
+    const sizeBuf = Buffer.alloc(4);
+    sizeBuf.writeUInt16LE(c, 0);
+    sizeBuf.writeUInt16LE(r, 2);
+
+    const active = this.activeRaw.get(terminal);
+    if (active?.size) {
+      for (const entry of active) {
+        if (d) this.send(entry.channel, FACTS, Buffer.from(JSON.stringify(d)));
+        this.send(entry.channel, RESIZE, sizeBuf);
+        entry.cols = c;
+        entry.rows = r;
+      }
+      return;
+    }
+
+    const existingInput = this.inputs.get(terminal);
+    if (existingInput) {
+      const ch = await existingInput.channel;
+      if (d) this.send(ch, FACTS, Buffer.from(JSON.stringify(d)));
+      this.send(ch, RESIZE, sizeBuf);
+      return;
+    }
+
+    const res = await this.call("terminal.attach", {
+      terminal,
+      cols: c,
+      rows: r,
+      history: 0,
+      observe: false,
+      ...(d ? { display: d } : {}),
+    });
+    const ch: number = res.channel;
+    this.early.delete(ch);
+    this.streams.delete(ch);
+    if (d) this.send(ch, FACTS, Buffer.from(JSON.stringify(d)));
+    this.send(ch, CLOSE, Buffer.alloc(0));
+  }
 
   /**
    * Types into a terminal the way the person at it would: raw bytes on an
    * attached (not observing) stream, so text of any script arrives at once and
-   * in order. The stream is opened at the terminal's own size, so nothing is
-   * resized, and closed after a quiet while.
+   * in order. Reuses an open raw stream channel when attached.
    */
   async input(terminal: string, data: string, cols: number, rows: number): Promise<void> {
+    const active = this.activeRaw.get(terminal);
+    if (active?.size) {
+      let latest: { channel: number; cols: number; rows: number } | undefined;
+      for (const entry of active) latest = entry;
+      if (latest) {
+        this.send(latest.channel, DATA, Buffer.from(data, "utf8"));
+        return;
+      }
+    }
     let s = this.inputs.get(terminal);
     if (!s) {
       const channel = this.call("terminal.attach", { terminal, cols, rows, observe: false, resumed: true }).then((r) => {
@@ -290,6 +489,7 @@ export class HcScreens {
   stop(): void {
     for (const s of this.inputs.values()) clearTimeout(s.timer);
     this.inputs.clear();
+    this.activeRaw.clear();
     this.child?.kill();
   }
 }

@@ -1,0 +1,452 @@
+/* Chat timeline: grouped multi-tool activity rows & lazy-mounted step inspector. */
+
+.chat-load-more {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-load-more:hover:not(:disabled) {
+  border-color: var(--line-pink);
+  color: var(--accent-text);
+}
+
+.chat-load-more:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.chat-scroll-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-jump-bottom {
+  position: absolute;
+  right: 16px;
+  bottom: 12px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 600;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+
+.chat-jump-bottom:hover {
+  border-color: var(--primary);
+  color: var(--accent-text);
+}
+
+.act-group {
+  border: 1px solid var(--divider);
+  border-radius: 11px;
+  background: var(--surface-2);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.act-group.running {
+  border-color: color-mix(in srgb, var(--primary) 38%, var(--divider));
+}
+
+.act-group.error {
+  border-color: color-mix(in srgb, var(--blush-text) 38%, var(--divider));
+}
+
+.act-head-wrap {
+  display: flex;
+  align-items: center;
+  min-height: 36px;
+}
+
+.act-head-wrap:hover {
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+
+.act-head {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+}
+
+.act-status-ic {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--mint-text);
+}
+
+.act-group.running .act-status-ic {
+  color: var(--primary);
+}
+
+.act-group.error .act-status-ic {
+  color: var(--blush-text);
+}
+
+.act-spin {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.8px solid color-mix(in srgb, var(--primary) 24%, transparent);
+  border-top-color: var(--primary);
+  animation: act-spin 0.8s linear infinite;
+}
+
+@keyframes act-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.act-title {
+  flex: none;
+  font-size: calc(12.5px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.act-detail {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: calc(12px * var(--ts, 1));
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.act-series {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+}
+
+.act-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--divider);
+  font-family: var(--font-mono);
+  font-size: calc(11px * var(--ts, 1));
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.act-chip.running {
+  border-color: color-mix(in srgb, var(--primary) 45%, var(--divider));
+  color: var(--accent-text);
+}
+
+.act-chip.error {
+  border-color: color-mix(in srgb, var(--blush-text) 40%, var(--divider));
+  color: var(--blush-text);
+}
+
+.act-chev {
+  flex: none;
+  color: var(--faint);
+  transition: transform 0.14s ease;
+}
+
+.act-chev.open {
+  transform: rotate(90deg);
+}
+
+.act-body {
+  border-top: 1px solid var(--divider);
+  background: var(--surface);
+  max-height: 400px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.act-more-steps {
+  padding: 6px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--accent-text);
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 600;
+  text-align: center;
+  cursor: pointer;
+}
+
+.act-more-steps:hover {
+  background: var(--accent-soft);
+}
+
+.act-step + .act-step {
+  border-top: 1px solid color-mix(in srgb, var(--divider) 70%, transparent);
+}
+
+.act-step-wrap {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+}
+
+.act-step-wrap:hover {
+  background: var(--surface-2);
+}
+
+.act-step-row {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.act-step-ic {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.act-step-ic.read,
+.act-step-ic.search,
+.act-step-ic.web {
+  color: #3a77ad;
+  background: color-mix(in srgb, #3a77ad 12%, transparent);
+}
+
+.act-step-ic.edit {
+  color: #b4572e;
+  background: color-mix(in srgb, #b4572e 12%, transparent);
+}
+
+.act-step-ic.run {
+  color: var(--mint-text);
+  background: color-mix(in srgb, var(--mint-text) 12%, transparent);
+}
+
+.act-step-ic.agent {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+.act-step-name {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.act-step-target {
+  flex: 1 1 0;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: calc(11.5px * var(--ts, 1));
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.act-step-state {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: calc(11px * var(--ts, 1));
+  color: var(--mint-text);
+}
+
+.act-step-state.error {
+  color: var(--blush-text);
+}
+
+.act-step-state.running {
+  color: var(--primary);
+}
+
+.act-step-io {
+  padding: 6px 12px 10px 40px;
+  display: grid;
+  gap: 6px;
+  background: color-mix(in srgb, var(--surface-2) 65%, transparent);
+}
+
+.act-io-box {
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.act-io-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--divider);
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--faint);
+}
+
+.act-io-head.error {
+  color: var(--blush-text);
+}
+
+.act-io-box pre {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: calc(11.5px * var(--ts, 1));
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+  color: var(--ink);
+}
+
+.act-io-more {
+  border: 0;
+  background: transparent;
+  color: var(--accent-text);
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.act-thought {
+  border: 1px solid var(--divider);
+  border-radius: 9px;
+  background: var(--surface-2);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.act-thought summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: calc(12px * var(--ts, 1));
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+}
+
+.act-thought summary::-webkit-details-marker {
+  display: none;
+}
+
+.act-thought-body {
+  padding: 4px 12px 10px 26px;
+  border-top: 1px solid var(--divider);
+  font-size: calc(12px * var(--ts, 1));
+  line-height: 1.6;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.act-sub-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--divider));
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-turn-sep {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0;
+  color: var(--faint);
+  font-size: calc(11px * var(--ts, 1));
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-turn-sep::before,
+.chat-turn-sep::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--divider);
+}
+
+.chat-attach-note {
+  margin-top: 4px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: calc(11.5px * var(--ts, 1));
+}

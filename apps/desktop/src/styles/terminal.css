@@ -1,0 +1,80 @@
+/* Native interactive terminal viewport with Kitty graphics & text-sizing overlays. */
+
+.tp-term-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 6px 8px 6px 10px;
+  background: var(--tp-term-bg, #16141d);
+  outline: none;
+  overflow: hidden;
+}
+
+.tp-term-wrap.drop-over::after {
+  content: "松手将文件发送到终端";
+  position: absolute;
+  inset: 8px;
+  z-index: 12;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  border: 2px dashed var(--primary);
+  background: color-mix(in srgb, #16141d 84%, transparent);
+  color: #f9d7e5;
+  font-size: calc(13.5px * var(--ts, 1));
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.tp-term-host {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.tp-term-host .xterm {
+  height: 100%;
+  width: 100%;
+}
+
+.tp-term-host .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+
+.tp-term-host .xterm-screen {
+  position: relative;
+}
+
+.tp-term-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 4;
+}
+
+.tp-kitty-img {
+  position: absolute;
+  pointer-events: none;
+  user-select: none;
+  object-fit: contain;
+  object-position: left top;
+}
+
+.tp-osc66-run {
+  position: absolute;
+  pointer-events: none;
+  user-select: none;
+  white-space: pre;
+  overflow: visible;
+  display: flex;
+  align-items: center;
+  background: var(--tp-term-bg, #16141d);
+}

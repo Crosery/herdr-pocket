@@ -284,10 +284,11 @@ test("MiMo disables thinking on connectivity pings, enables reasoning_effort=low
 
   const llm = makeLlm({ targets: [target] });
   const msgs: Msg[] = [{ role: "user", content: "看下" }];
-  const r1 = await llm({ system: "s", messages: msgs, tools: TOOLS });
+  const r1 = await llm({ system: "s", messages: msgs, tools: TOOLS, maxTokens: 300 });
   assert.equal(seen[1]!.body.thinking, undefined);
   assert.equal(seen[1]!.body.reasoning_effort, "low");
   assert.equal(seen[1]!.body.parallel_tool_calls, true);
+  assert.equal(seen[1]!.body.max_tokens, 2048);
   assert.equal(r1.reasoning, "need to read first");
   msgs.push({ role: "assistant", content: r1.content, reasoning: r1.reasoning });
   msgs.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "tc_1", content: "ok" }] });

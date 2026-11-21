@@ -149,6 +149,7 @@ export function wakeFinished(m: {
   first?: string;
   said?: string;
   did?: string;
+  terminal?: string;
 }): string {
   return sections(
     [`[叫醒] ${m.handle} 停下来了。`, `程序：${m.harness} | 电脑：${m.device} | 这一轮跑了：${m.duration} | 还在跑的子 agent：${m.subagents} 个`, `key：${m.key}`],
@@ -159,6 +160,7 @@ export function wakeFinished(m: {
       ["最初的任务：", m.first],
       ["它最后说的：", m.said],
       ["它最后做的：", m.did],
+      ["它的终端最后 40 行：", m.terminal],
     ],
   );
 }

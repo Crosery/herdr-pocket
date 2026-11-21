@@ -15,7 +15,7 @@ const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
 const jpeg = (name = "IMG_0001.jpg") => ({ name, mime: "image/jpeg", data: JPEG.toString("base64") });
 
-test("terminal.put files: pictures only, real bytes, within the limits, safe distinct names", () => {
+test("terminal.put files: raster images checked by magic bytes, general media/files keep safe distinct extensions, limits enforced", () => {
   const ok = checkFiles([jpeg("照片 1.JPG"), { name: "../../etc/passwd.png", mime: "image/png", data: PNG.toString("base64") }, jpeg("照片 1.JPG")]);
   assert.deepEqual(
     ok.map((f) => [f.name, f.mime, f.bytes.length]),
@@ -30,11 +30,21 @@ test("terminal.put files: pictures only, real bytes, within the limits, safe dis
   assert.equal(safeName("...", "image/gif", 0), "image-1.gif");
   assert.equal(safeName("Screenshot 2026-11-14 at 10.00.00.png", "image/jpeg", 0), "Screenshot-2026-11-14-at-10.00.00.jpg");
 
+  // Non-image media and text/document files preserve extensions with digits too (e.g. .mp4).
+  const media = checkFiles([
+    { name: "brief.md", mime: "text/markdown", data: Buffer.from("# hi\n").toString("base64") },
+    { name: "metrics.csv", mime: "text/csv", data: Buffer.from("a,b\n1,2\n").toString("base64") },
+    { name: "报告.pdf", mime: "application/pdf", data: Buffer.from("%PDF-1.4").toString("base64") },
+    { name: "clip.mp4", mime: "video/mp4", data: Buffer.from("ftyp").toString("base64") },
+    { name: "clip.mp4", mime: "video/mp4", data: Buffer.from("ftyp").toString("base64") },
+  ]);
+  assert.deepEqual(media.map((m) => m.name), ["brief.md", "metrics.csv", "file-3.pdf", "clip.mp4", "clip-2.mp4"]);
+
   const refuses = (files: unknown, re: RegExp) => assert.throws(() => checkFiles(files), re);
-  refuses(undefined, /没有收到图片/);
-  refuses([], /没有收到图片/);
-  refuses(Array.from({ length: PUT_LIMITS.files + 1 }, () => jpeg()), /一次最多发 6 张/);
-  refuses([{ name: "a.pdf", mime: "application/pdf", data: JPEG.toString("base64") }], /不是 JPEG、PNG、WebP 或 GIF/);
+  refuses(undefined, /没有收到文件/);
+  refuses([], /没有收到文件/);
+  refuses(Array.from({ length: PUT_LIMITS.files + 1 }, () => jpeg()), /一次最多发 6 个文件/);
+  refuses([{ name: "a.txt", mime: "not a mime", data: Buffer.from("hi").toString("base64") }], /类型格式不对/);
   refuses([{ name: "a.png", mime: "image/png", data: JPEG.toString("base64") }], /内容和类型对不上/);
   refuses([{ name: "a.jpg", mime: "image/jpeg", data: "not base64!" }], /内容不对/);
   refuses([{ name: "a.jpg", mime: "image/jpeg", data: "" }], /内容不对/);
@@ -161,10 +171,12 @@ test("terminal.put: checked pictures land beside the agent; an old hc and bad fi
     got.push(`${address} ${basename(file)}`);
     return `/state/files/${address}/${basename(file)}`;
   };
-  assert.deepEqual(await put({ agent: "d/hc:t1", files: [jpeg("a.jpg"), jpeg("a.jpg")] }), { paths: ["/state/files/t1/a.jpg", "/state/files/t1/a-2.jpg"] });
-  assert.deepEqual(got, ["t1 a.jpg", "t1 a-2.jpg"]);
+  assert.deepEqual(await put({ agent: "d/hc:t1", files: [jpeg("a.jpg"), jpeg("a.jpg"), { name: "notes.md", mime: "text/markdown", data: "aGk=" }] }), {
+    paths: ["/state/files/t1/a.jpg", "/state/files/t1/a-2.jpg", "/state/files/t1/notes.md"],
+  });
+  assert.deepEqual(got, ["t1 a.jpg", "t1 a-2.jpg", "t1 notes.md"]);
 
-  await assert.rejects(put({ agent: "d/hc:t1", files: [{ name: "x", mime: "text/plain", data: "aGk=" }] }), (e: any) => e.code === "bad_request" && /不是 JPEG/.test(e.message));
+  await assert.rejects(put({ agent: "d/hc:t1", files: [{ name: "x.png", mime: "image/png", data: "aGk=" }] }), (e: any) => e.code === "bad_request" && /内容和类型对不上/.test(e.message));
   await assert.rejects(put({ agent: "d/hc:t9", files: [jpeg()] }), (e: any) => e.code === "not_found");
   h.hc.put = async () => {
     throw new Error("hc put failed: error: unrecognized subcommand 'put'");

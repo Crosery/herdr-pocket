@@ -30,7 +30,7 @@ export interface Shortcut {
 export const SHORTCUTS: Shortcut[] = [
   { id: "palette", label: "命令面板", keys: ["Mod", "P"], alt: [["Mod", "K"]] },
   { id: "settings", label: "设置", keys: ["Mod", ","] },
-  { id: "newAgent", label: "新建 Agent", keys: ["Mod", "T"] },
+  { id: "newAgent", label: "新建终端", keys: ["Mod", "T"] },
   { id: "closeTab", label: "关闭标签", keys: ["Mod", "W"] },
   { id: "nextTab", label: "下一个标签", keys: ["Mod", "Shift", "]"] },
   { id: "prevTab", label: "上一个标签", keys: ["Mod", "Shift", "["] },

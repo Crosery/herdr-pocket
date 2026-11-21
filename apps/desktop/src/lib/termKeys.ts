@@ -82,5 +82,5 @@ export function termKeyAction(e: TermKeyInput, mac: boolean, hasSelection: boole
 /** True when Ctrl+K came from a terminal box, which sends it on as ^K instead of opening the palette. */
 export function terminalOwnsCtrlK(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
-  return Boolean(el && typeof el.closest === "function" && el.closest(".term-box"));
+  return Boolean(el && typeof el.closest === "function" && el.closest(".term-box, .xterm, .tp-term"));
 }

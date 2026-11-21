@@ -20,15 +20,18 @@ import {
   Sparkles,
   SquareStack,
   Sun,
+  Terminal,
   X,
 } from "lucide-react";
+import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
 import { AddDeviceModal } from "../views/DevicesView";
 import { CreateAgentModal } from "../views/AgentsView";
 import { SettingsFrame } from "../views/settings/SettingsFrame";
 import { useClientConfig } from "../lib/config";
 import { useToast } from "../components/PocketUI";
-import { allAgents, liveStore, settingsStore, spacedTitle, updateSettings, agentTitle } from "../lib/store";
+import { rpcCall } from "../lib/relay";
+import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle, updateSettings, agentTitle } from "../lib/store";
 import { terminalOwnsCtrlK } from "../lib/termKeys";
 import { GROUP_RANK, lastChange, listGroup } from "./agentInfo";
 import { Palette, type PaletteItem } from "./Palette";
@@ -99,6 +102,80 @@ export function DesktopShell({
   const hosts = useMemo(() => Object.values(devices).filter((d) => d.kind === "host"), [devices]);
   const newAgent = useCallback((host: string | null = null, space: string | null = null) => setCreate({ host, space }), []);
 
+  const spawnTerminalNow = useCallback(
+    async (preferredHost: string | null = null, preferredSpace: string | null = null) => {
+      const { devices: devs, agents: agMap } = liveStore.get();
+      const all = allAgents(agMap);
+      const s = shellStore.get();
+      const activeTab = s.tabs.find((t) => t.id === s.active);
+      const activeAgent = activeTab && activeTab.kind !== "web" ? all.find((a) => a.key === activeTab.agentKey) : undefined;
+      const [selHost, selSpace] = s.selectedSpace ? (s.selectedSpace.split("\u0000") as [string, string]) : [null, null];
+
+      const isOnlineHost = (id: string | null | undefined): id is string =>
+        Boolean(id && devs[id]?.kind === "host" && devs[id]?.online);
+
+      const hostId =
+        (isOnlineHost(preferredHost) ? preferredHost : null) ??
+        (isOnlineHost(selHost) ? selHost : null) ??
+        (isOnlineHost(activeAgent?.deviceId) ? activeAgent!.deviceId : null) ??
+        Object.values(devs).find((d) => d.kind === "host" && d.online)?.id;
+
+      if (!hostId) {
+        toast("当前没有在线的电脑，无法新建终端", true);
+        return;
+      }
+
+      const spaceName =
+        preferredSpace ??
+        (selHost === hostId ? selSpace : null) ??
+        (activeAgent?.deviceId === hostId ? agentSpace(activeAgent) ?? null : null);
+
+      const folder =
+        (activeAgent?.deviceId === hostId && activeAgent.cwd ? activeAgent.cwd : undefined) ??
+        all.find((a) => a.deviceId === hostId && (!spaceName || (agentSpace(a) ?? "") === spaceName) && a.cwd)?.cwd;
+
+      try {
+        const spRes = await rpcCall(hostId, "spaces.list", {}, 6_000).catch(() => null);
+        const matchedSpace = spaceName ? spRes?.spaces.find((sp) => sp.name === spaceName) : spRes?.spaces[0];
+        const spaceId = matchedSpace?.id;
+        const resolvedFolder = folder || matchedSpace?.folder || spRes?.folders[0];
+        const created = await rpcCall(
+          hostId,
+          "agent.create",
+          {
+            space: spaceId || undefined,
+            folder: spaceId ? undefined : resolvedFolder || undefined,
+            launcher: "shell",
+          },
+          20_000,
+        );
+        liveStore.set((prev) => {
+          const list = prev.agents[hostId] ?? [];
+          if (list.some((a) => a.key === created.agent)) return prev;
+          const shellAgent: Agent = {
+            key: created.agent,
+            deviceId: hostId,
+            source: "hc",
+            localId: created.terminal,
+            harness: "zsh",
+            title: "终端",
+            where: matchedSpace?.name || spaceName || undefined,
+            cwd: resolvedFolder || undefined,
+            status: "idle",
+            statusSince: Date.now(),
+            isShell: true,
+            updatedAt: Date.now(),
+          };
+          return { ...prev, agents: { ...prev.agents, [hostId]: [shellAgent, ...list] }, rev: prev.rev + 1 };
+        });
+        openAgentTab(created.agent, "term");
+      } catch (e) {
+        toast((e as Error).message, true);
+      }
+    },
+    [toast],
+  );
+
   // The first time agents arrive with nothing open, open the most urgent one, so the work
   // area shows something useful. Closing every tab afterwards leaves it empty.
   const autoOpened = useRef(tabs.length > 0);
@@ -115,8 +192,9 @@ export function DesktopShell({
 
   const items = useMemo<PaletteItem[]>(() => {
     const list: PaletteItem[] = [];
+    const allByAgentKey = allAgents(agentsMap);
     for (const t of tabs) {
-      const a = t.kind === "agent" ? agents.find((x) => x.key === t.agentKey) : undefined;
+      const a = t.kind === "agent" ? allByAgentKey.find((x) => x.key === t.agentKey) : undefined;
       const label = t.kind === "agent" ? (a ? agentTitle(a) : "已结束的 Agent") : t.title === "about:blank" ? "新网页" : t.title;
       list.push({
         id: `tab:${t.id}`,
@@ -129,7 +207,8 @@ export function DesktopShell({
       });
     }
     list.push(
-      { id: "new-agent", group: "标签", label: "新建 Agent", keys: ["Mod", "T"], icon: Plus, terms: "new agent", run: () => newAgent() },
+      { id: "new-terminal", group: "标签", label: "新建终端", keys: ["Mod", "T"], icon: Terminal, terms: "new terminal shell 终端", run: () => void spawnTerminalNow() },
+      { id: "new-agent", group: "标签", label: "新建 Agent…", icon: Plus, terms: "new agent claude codex", run: () => newAgent() },
       { id: "new-web", group: "标签", label: "打开网页", icon: Globe, terms: "browser web", run: () => openWebTab(homePage || "about:blank") },
       { id: "close-tab", group: "标签", label: "关闭标签", keys: ["Mod", "W"], icon: X, run: () => closeActive() },
       { id: "next-tab", group: "标签", label: "下一个标签", keys: ["Mod", "Shift", "]"], run: () => cycleTab(1) },
@@ -178,7 +257,7 @@ export function DesktopShell({
     return list;
     // closeActive reads the store when it runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agents, collapsed, devices, homePage, isDark, newAgent, onConnectRelay, onPairPhone, onReopenGuide, onToggleSidebar, tabs]);
+  }, [agents, agentsMap, collapsed, devices, homePage, isDark, newAgent, onConnectRelay, onPairPhone, onReopenGuide, onToggleSidebar, spawnTerminalNow, tabs]);
 
   function closeActive() {
     const s = shellStore.get();
@@ -206,7 +285,7 @@ export function DesktopShell({
           else openSettingsFrame("look");
           break;
         case "newAgent":
-          newAgent();
+          void spawnTerminalNow();
           break;
         case "closeTab":
           closeActive();
@@ -230,7 +309,7 @@ export function DesktopShell({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [canToggleSidebar, newAgent, onToggleSidebar]);
+  }, [canToggleSidebar, onToggleSidebar, spawnTerminalNow]);
 
   return (
     <div className={`v3${collapsed ? " collapsed" : ""}`}>
@@ -243,9 +322,9 @@ export function DesktopShell({
         onNewAgent={newAgent}
       />
       <div className="v3-work">
-        <ShellTabs onNewAgent={() => newAgent()} padForLights={collapsed} />
+        <ShellTabs onNewTerminal={() => void spawnTerminalNow()} onNewAgent={() => newAgent()} padForLights={collapsed} />
         <div className="v3-body">
-          <ShellMain onNewAgent={() => newAgent()} />
+          <ShellMain onNewTerminal={() => void spawnTerminalNow()} onNewAgent={() => newAgent()} />
           <ShellPanel />
           <PeekOverlay />
         </div>
