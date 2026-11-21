@@ -230,7 +230,12 @@ class SocketClient {
   private readonly onOnline = () => this.wake("network online");
   private readonly onOffline = () => logger.warn("link", "network offline (system)");
 
-  constructor(private server: string, readonly token: string) {
+  private server: string;
+  readonly token: string;
+
+  constructor(server: string, token: string) {
+    this.server = server;
+    this.token = token;
     this.open();
     this.openNotify();
     this.tickTimer = setInterval(() => this.tick(), TICK_MS);

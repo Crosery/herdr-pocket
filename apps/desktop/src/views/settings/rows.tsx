@@ -75,7 +75,7 @@ export function ConfigSelect({
   const spec = configKeySpec(k);
   const raw = getConfigValue(cfg, k);
   const value = String(raw ?? "");
-  const numeric = spec?.type === "integer";
+  const numeric = spec?.type === "integer" || spec?.type === "number";
   const opts = options.some((o) => o.value === value) ? options : [...options, { value, label: value }];
   return (
     <SetRow title={spec?.label ?? k} about={about}>

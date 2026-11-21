@@ -5,9 +5,16 @@ import {
   shouldAutoDrainQueue,
   type OutgoingSendLike,
 } from "./chatQueueLogic";
-import { revokeAttachment, type StagedAttachment } from "./dropPreview";
+import {
+  hydrateAttachment,
+  revokeAttachment,
+  serializeAttachment,
+  type SerializedAttachment,
+  type StagedAttachment,
+} from "./dropPreview";
 import { rpcCall } from "./relay";
 import { allAgents, createStore, liveStore } from "./store";
+import { registerWorkspaceSection, scheduleWorkspacePersist } from "./workspacePersist";
 
 export { reconcileOutgoingSends, shouldAutoDrainQueue, type OutgoingSendLike };
 
@@ -36,6 +43,7 @@ interface ChatQueueState {
 const EMPTY_QUEUED: QueuedPrompt[] = [];
 const EMPTY_OUTGOING: OutgoingSend[] = [];
 const STEER_SETTLE_MS = 180;
+const INTERRUPTED_SEND_ERROR = "应用重启前发送中断，点击可重试";
 
 let idSeq = 0;
 const nextId = (prefix: string) => `${prefix}-${Date.now()}-${++idSeq}`;
@@ -45,34 +53,212 @@ export const chatQueueStore = createStore<ChatQueueState>({
   outgoingByAgent: {},
 });
 
+interface SerializedQueuedPrompt {
+  id: string;
+  agentKey: string;
+  deviceId: string;
+  text: string;
+  attachments: SerializedAttachment[];
+  createdAt: number;
+}
+
+interface SerializedOutgoingSend {
+  id: string;
+  agentKey: string;
+  deviceId: string;
+  text: string;
+  attachments: SerializedAttachment[];
+  attachedCount: number;
+  attachedNames: string[];
+  ts: number;
+  state: OutgoingSend["state"];
+  error?: string;
+}
+
+interface SerializedChatQueueState {
+  queuedByAgent: Record<string, SerializedQueuedPrompt[]>;
+  outgoingByAgent: Record<string, SerializedOutgoingSend[]>;
+}
+
+function bumpIdSeq(id: string): void {
+  const m = /^(?:q|out)-\d+-(\d+)$/.exec(id);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > idSeq) idSeq = n;
+  }
+}
+
+function parseSerializedAttachments(raw: unknown): StagedAttachment[] {
+  if (!Array.isArray(raw)) return [];
+  const out: StagedAttachment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Partial<SerializedAttachment>;
+    if (typeof rec.id !== "string" || typeof rec.name !== "string") continue;
+    out.push(hydrateAttachment(rec as SerializedAttachment));
+  }
+  return out;
+}
+
+function serializeChatQueue(): SerializedChatQueueState | undefined {
+  const state = chatQueueStore.get();
+  const queuedByAgent: Record<string, SerializedQueuedPrompt[]> = {};
+  for (const [key, list] of Object.entries(state.queuedByAgent)) {
+    if (!list.length) continue;
+    queuedByAgent[key] = list.map((item) => ({
+      ...item,
+      attachments: item.attachments.map(serializeAttachment),
+    }));
+  }
+  const outgoingByAgent: Record<string, SerializedOutgoingSend[]> = {};
+  for (const [key, list] of Object.entries(state.outgoingByAgent)) {
+    const keep = list.filter((item) => item.state !== "sent");
+    if (!keep.length) continue;
+    outgoingByAgent[key] = keep.map((item) => ({
+      ...item,
+      attachments: item.attachments.map(serializeAttachment),
+    }));
+  }
+  if (!Object.keys(queuedByAgent).length && !Object.keys(outgoingByAgent).length) {
+    return undefined;
+  }
+  return { queuedByAgent, outgoingByAgent };
+}
+
+function hydrateChatQueue(raw: unknown): void {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+  const obj = raw as Record<string, unknown>;
+  const queuedByAgent: Record<string, QueuedPrompt[]> = {};
+  if (obj.queuedByAgent && typeof obj.queuedByAgent === "object" && !Array.isArray(obj.queuedByAgent)) {
+    for (const [agentKey, list] of Object.entries(obj.queuedByAgent as Record<string, unknown>)) {
+      if (!Array.isArray(list)) continue;
+      const restored: QueuedPrompt[] = [];
+      for (const entry of list) {
+        if (!entry || typeof entry !== "object") continue;
+        const r = entry as Record<string, unknown>;
+        if (typeof r.id !== "string" || typeof r.deviceId !== "string" || typeof r.text !== "string") continue;
+        bumpIdSeq(r.id);
+        restored.push({
+          id: r.id,
+          agentKey: typeof r.agentKey === "string" ? r.agentKey : agentKey,
+          deviceId: r.deviceId,
+          text: r.text,
+          attachments: parseSerializedAttachments(r.attachments),
+          createdAt: typeof r.createdAt === "number" ? r.createdAt : Date.now(),
+        });
+      }
+      if (restored.length) queuedByAgent[agentKey] = restored;
+    }
+  }
+
+  const outgoingByAgent: Record<string, OutgoingSend[]> = {};
+  if (obj.outgoingByAgent && typeof obj.outgoingByAgent === "object" && !Array.isArray(obj.outgoingByAgent)) {
+    for (const [agentKey, list] of Object.entries(obj.outgoingByAgent as Record<string, unknown>)) {
+      if (!Array.isArray(list)) continue;
+      const restored: OutgoingSend[] = [];
+      for (const entry of list) {
+        if (!entry || typeof entry !== "object") continue;
+        const r = entry as Record<string, unknown>;
+        if (typeof r.id !== "string" || typeof r.deviceId !== "string" || typeof r.text !== "string") continue;
+        if (r.state === "sent") continue;
+        bumpIdSeq(r.id);
+        const attachments = parseSerializedAttachments(r.attachments);
+        const wasSending = r.state === "sending";
+        const attachedNames = Array.isArray(r.attachedNames)
+          ? r.attachedNames.filter((n): n is string => typeof n === "string")
+          : attachments.map((a) => a.name);
+        restored.push({
+          id: r.id,
+          agentKey: typeof r.agentKey === "string" ? r.agentKey : agentKey,
+          deviceId: r.deviceId,
+          text: r.text,
+          attachments,
+          attachedCount: typeof r.attachedCount === "number" ? r.attachedCount : attachments.length,
+          attachedNames,
+          ts: typeof r.ts === "number" ? r.ts : Date.now(),
+          state: "failed",
+          error: wasSending
+            ? INTERRUPTED_SEND_ERROR
+            : typeof r.error === "string" && r.error
+              ? r.error
+              : "发送失败",
+        });
+      }
+      if (restored.length) outgoingByAgent[agentKey] = restored;
+    }
+  }
+
+  const current = chatQueueStore.get();
+  for (const [k, list] of Object.entries(current.queuedByAgent)) {
+    if (!list.length) continue;
+    const seen = new Set((queuedByAgent[k] ?? []).map((x) => x.id));
+    queuedByAgent[k] = [...(queuedByAgent[k] ?? []), ...list.filter((x) => !seen.has(x.id))];
+  }
+  for (const [k, list] of Object.entries(current.outgoingByAgent)) {
+    if (!list.length) continue;
+    const seen = new Set((outgoingByAgent[k] ?? []).map((x) => x.id));
+    outgoingByAgent[k] = [...(outgoingByAgent[k] ?? []), ...list.filter((x) => !seen.has(x.id))];
+  }
+
+  chatQueueStore.set({ queuedByAgent, outgoingByAgent });
+}
+
+registerWorkspaceSection("chatQueue", {
+  serialize: serializeChatQueue,
+  hydrate: hydrateChatQueue,
+});
+
+export function resetChatQueueForTest(): void {
+  const cur = chatQueueStore.get();
+  for (const list of Object.values(cur.queuedByAgent)) {
+    for (const item of list) {
+      for (const a of item.attachments) revokeAttachment(a);
+    }
+  }
+  for (const list of Object.values(cur.outgoingByAgent)) {
+    for (const item of list) {
+      for (const a of item.attachments) revokeAttachment(a);
+    }
+  }
+  inFlightAgents.clear();
+  dispatchState.clear();
+  chatQueueStore.set({ queuedByAgent: {}, outgoingByAgent: {} });
+}
+
 function updateOutgoing(
   agentKey: string,
   updater: (prev: OutgoingSend[]) => OutgoingSend[],
 ): void {
+  let changed = false;
   chatQueueStore.set((state) => {
     const cur = state.outgoingByAgent[agentKey] ?? EMPTY_OUTGOING;
     const next = updater(cur);
     if (next === cur) return state;
+    changed = true;
     const nextMap = { ...state.outgoingByAgent };
     if (next.length === 0) delete nextMap[agentKey];
     else nextMap[agentKey] = next;
     return { ...state, outgoingByAgent: nextMap };
   });
+  if (changed) scheduleWorkspacePersist();
 }
 
 function updateQueued(
   agentKey: string,
   updater: (prev: QueuedPrompt[]) => QueuedPrompt[],
 ): void {
+  let changed = false;
   chatQueueStore.set((state) => {
     const cur = state.queuedByAgent[agentKey] ?? EMPTY_QUEUED;
     const next = updater(cur);
     if (next === cur) return state;
+    changed = true;
     const nextMap = { ...state.queuedByAgent };
     if (next.length === 0) delete nextMap[agentKey];
     else nextMap[agentKey] = next;
     return { ...state, queuedByAgent: nextMap };
   });
+  if (changed) scheduleWorkspacePersist();
 }
 
 async function deliverOutgoing(send: OutgoingSend): Promise<boolean> {

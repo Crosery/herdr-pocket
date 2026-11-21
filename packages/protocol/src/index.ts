@@ -2159,6 +2159,13 @@ export function pickFastest(probes: readonly SourceProbe[], order: readonly stri
   return ok.filter((p) => p.ms <= best + slackMs).sort((a, b) => rank(a.source) - rank(b.source) || a.ms - b.ms)[0]!.source;
 }
 
+export {
+  isRecommendedSourceForRegion,
+  orderWithPreferredSource,
+  pickLowestLatency,
+  resolvePreferredSource,
+} from "./updateSelect.ts";
+
 /** `order` with `winner` moved to the front: the ordered fallback after a race. */
 export function withWinnerFirst(order: readonly string[], winner: string | undefined): string[] {
   return winner === undefined || !order.includes(winner) ? [...order] : [winner, ...order.filter((s) => s !== winner)];
@@ -2187,10 +2194,10 @@ export function withJitter(ms: number, fraction = 0.1, rand: () => number = Math
   return Math.max(0, Math.round(ms * (1 - fraction + 2 * fraction * rand())));
 }
 
-/** Low-frequency update checks: the first a few minutes after start, then every `hours` (6–168), both jittered. */
+/** Periodic update checks: the first 15–60 s after start, then every `hours` (0.25–168), both jittered. */
 export function updateCheckDelays(hours: number, rand: () => number = Math.random): { firstMs: number; everyMs: number } {
-  const h = Math.min(168, Math.max(6, Number.isFinite(hours) ? hours : 24));
-  return { firstMs: 60_000 + Math.round(rand() * 240_000), everyMs: withJitter(h * 3600_000, 0.1, rand) };
+  const h = Math.min(168, Math.max(0.25, Number.isFinite(hours) ? hours : 0.5));
+  return { firstMs: 15_000 + Math.round(rand() * 45_000), everyMs: withJitter(h * 3600_000, 0.1, rand) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2225,6 +2232,7 @@ export interface ClientConfig {
   };
   update: {
     region: RegionSetting;
+    preferredSource: string;
     autoCheck: boolean;
     checkIntervalHours: number;
     mirrors: string[];
@@ -2276,13 +2284,13 @@ export type ConfigReader = "cli" | "hostd" | "desktop";
 export interface ConfigKeySpec {
   /** `section.name`. */
   key: string;
-  type: "boolean" | "integer" | "enum" | "string" | "list";
+  type: "boolean" | "integer" | "number" | "enum" | "string" | "list";
   default: ConfigValue;
   values?: readonly string[];
   min?: number;
   max?: number;
   /** Extra check of a string (or of each list item). */
-  format?: "url" | "mirror" | "hotkey" | "language";
+  format?: "url" | "mirror" | "sourceChoice" | "hotkey" | "language";
   /** The programs that read the key. Empty: reserved, kept valid but read by nothing yet. */
   usedBy: readonly ConfigReader[];
   /** Label for settings screens (Chinese, like the rest of the UI). */
@@ -2316,8 +2324,9 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "general.closeToTray", type: "boolean", default: false, usedBy: D, label: "关闭窗口后留在托盘", doc: "Closing the window keeps the app in the menu bar / tray. Off by default: closing the window quits the app." },
   { key: "general.notifications", type: "boolean", default: true, usedBy: D, label: "系统通知", doc: "System notifications when an agent finishes or waits." },
   { key: "update.region", type: "enum", values: ["auto", "cn", "global"], default: "auto", usedBy: ALL, label: "下载线路", doc: "auto: by time zone. cn: mirrors first. global: GitHub first.", env: "HERDR_POCKET_MIRROR" },
+  { key: "update.preferredSource", type: "string", format: "sourceChoice", default: "auto", usedBy: ALL, label: "首选镜像源", doc: "auto: recommend by time zone and pick lowest-latency reachable source. direct: GitHub directly. Or a mirror prefix URL." },
   { key: "update.autoCheck", type: "boolean", default: true, usedBy: ALL, label: "自动检查更新", doc: "Look for a new release now and then.", env: "HERDR_POCKET_UPDATE_CHECK" },
-  { key: "update.checkIntervalHours", type: "integer", min: 6, max: 168, default: 24, usedBy: ALL, label: "检查间隔（小时）", doc: "Hours between automatic checks (jittered by ±10%)." },
+  { key: "update.checkIntervalHours", type: "number", min: 0.25, max: 168, default: 0.5, usedBy: ALL, label: "自动检查频率", doc: "Hours between automatic checks (jittered by ±10%)." },
   { key: "update.mirrors", type: "list", format: "mirror", default: [], usedBy: ALL, label: "自定义镜像", doc: "Your own GitHub mirror prefixes (https://…/), raced before the built-in ones." },
   { key: "update.checkTools", type: "boolean", default: true, usedBy: ["hostd"], label: "检查 hc、Herdr、uniflo 新版本", doc: "Once a day, look for newer hc, Herdr app and uniflo releases (report only; needs update.autoCheck)." },
   { key: "logging.level", type: "enum", values: ["debug", "info", "warn", "error"], default: "info", usedBy: ALL, label: "日志级别", doc: "Lowest level written and uploaded." },
@@ -2408,6 +2417,10 @@ function formatError(format: ConfigKeySpec["format"], v: string): string | undef
       return v === "" || /^https?:\/\/\S+$/i.test(v) ? undefined : "needs an http(s):// address or nothing";
     case "mirror":
       return isMirrorPrefix(v) ? undefined : `${JSON.stringify(v)} is not a mirror prefix like https://mirror.example.com/`;
+    case "sourceChoice":
+      return v === "auto" || v === "direct" || isMirrorPrefix(v)
+        ? undefined
+        : `${JSON.stringify(v)} must be "auto", "direct", or a mirror prefix like https://mirror.example.com/`;
     case "language":
       return v === "auto" || /^[a-z]{2,3}(-[A-Za-z]{2,4})?$/.test(v) ? undefined : "needs auto or a language code such as zh or en";
     case "hotkey": {
@@ -2433,6 +2446,10 @@ export function configValueError(spec: ConfigKeySpec, value: unknown): string | 
       if (typeof value !== "number" || !Number.isInteger(value)) return "needs a whole number";
       if ((spec.min !== undefined && value < spec.min) || (spec.max !== undefined && value > spec.max)) return `needs ${spec.min}–${spec.max}`;
       return undefined;
+    case "number":
+      if (typeof value !== "number" || !Number.isFinite(value)) return "needs a number";
+      if ((spec.min !== undefined && value < spec.min) || (spec.max !== undefined && value > spec.max)) return `needs ${spec.min}–${spec.max}`;
+      return undefined;
     case "enum":
       return typeof value === "string" && spec.values!.includes(value) ? undefined : `needs one of ${spec.values!.join(", ")}`;
     case "string":
@@ -2456,6 +2473,7 @@ export function parseConfigText(key: string, text: string): { value: ConfigValue
   let value: unknown = t;
   if (spec.type === "boolean") value = /^(true|on|yes|1)$/i.test(t) ? true : /^(false|off|no|0)$/i.test(t) ? false : t;
   else if (spec.type === "integer") value = /^-?\d+$/.test(t) ? Number(t) : t;
+  else if (spec.type === "number") value = /^-?\d+(?:\.\d+)?$/.test(t) ? Number(t) : t;
   else if (spec.type === "list") {
     if (t.startsWith("[")) {
       try {

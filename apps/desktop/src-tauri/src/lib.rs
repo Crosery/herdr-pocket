@@ -23,6 +23,7 @@ mod resources;
 mod updater;
 mod voice;
 mod webdiag;
+mod workspace_state;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -691,6 +692,8 @@ pub fn run() {
             updater::update_fetch_github_latest,
             updater::update_download_and_stage,
             updater::update_restart_and_apply,
+            workspace_state::workspace_state_load,
+            workspace_state::workspace_state_save,
         ])
         .build(context)
         .expect("error while building Herdr Pocket desktop application");

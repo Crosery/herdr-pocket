@@ -1,8 +1,32 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { create } from "zustand";
-import { createJSONStorage, persist } from "zustand/middleware";
+import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
 import type { Agent, ChatDisplayMode, Device } from "@herdr-pocket/protocol";
 import type { TermKeyLayout } from "./termkeys";
+
+export const safeAsyncStorage: StateStorage = {
+  getItem: async (name) => {
+    try {
+      return await AsyncStorage.getItem(name);
+    } catch {
+      return null;
+    }
+  },
+  setItem: async (name, value) => {
+    try {
+      await AsyncStorage.setItem(name, value);
+    } catch {
+      /* ignore SQLite/CursorWindow quota errors */
+    }
+  },
+  removeItem: async (name) => {
+    try {
+      await AsyncStorage.removeItem(name);
+    } catch {
+      /* ignore */
+    }
+  },
+};
 
 export type ThemeMode = "system" | "light" | "dark";
 
@@ -208,27 +232,131 @@ interface PendingState {
   drop: (agentKey: string, ids: string[]) => void;
 }
 
-export const usePending = create<PendingState>()((set) => ({
-  byAgent: {},
-  add: (agentKey, text, pictures) => {
-    const id = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    set((s) => ({
-      byAgent: {
-        ...s.byAgent,
-        [agentKey]: [...(s.byAgent[agentKey] ?? []), { id, text, ts: Date.now(), pictures: pictures?.length ? pictures : undefined, state: "sending" as const }].slice(-20),
+const PENDING_PERSIST_MAX_CHARS = 1_500_000;
+const INTERRUPTED_PENDING_ERROR = "应用重启前结果待确认";
+
+function compactPendingByAgent(byAgent: Record<string, PendingSend[]>): Record<string, PendingSend[]> {
+  const out: Record<string, PendingSend[]> = {};
+  for (const [agentKey, list] of Object.entries(byAgent)) {
+    if (!Array.isArray(list)) continue;
+    const keep = list
+      .filter((item) => item && item.state !== "sent" && !item.echo)
+      .slice(-20)
+      .map((item) => ({ ...item }));
+    if (keep.length) out[agentKey] = keep;
+  }
+  if (JSON.stringify({ byAgent: out }).length <= PENDING_PERSIST_MAX_CHARS) {
+    return out;
+  }
+  // Strip inline picture URIs oldest-first so message text/state survives under Android CursorWindow limits.
+  const refs: Array<{ agentKey: string; item: PendingSend }> = [];
+  for (const [agentKey, list] of Object.entries(out)) {
+    for (const item of list) {
+      if (item.pictures?.length) refs.push({ agentKey, item });
+    }
+  }
+  refs.sort((a, b) => a.item.ts - b.item.ts);
+  for (const { item } of refs) {
+    delete item.pictures;
+    if (JSON.stringify({ byAgent: out }).length <= PENDING_PERSIST_MAX_CHARS) {
+      return out;
+    }
+  }
+  // Still over budget: trim oldest entries across agents.
+  const keys = Object.keys(out);
+  while (JSON.stringify({ byAgent: out }).length > PENDING_PERSIST_MAX_CHARS && keys.length) {
+    let oldestKey: string | null = null;
+    let oldestTs = Infinity;
+    for (const k of keys) {
+      const head = out[k]?.[0];
+      if (head && head.ts < oldestTs) {
+        oldestTs = head.ts;
+        oldestKey = k;
+      }
+    }
+    if (!oldestKey) break;
+    out[oldestKey]!.shift();
+    if (!out[oldestKey]!.length) {
+      delete out[oldestKey];
+      keys.splice(keys.indexOf(oldestKey), 1);
+    }
+  }
+  return out;
+}
+
+function rehydratePendingByAgent(byAgent: unknown): Record<string, PendingSend[]> {
+  if (!byAgent || typeof byAgent !== "object" || Array.isArray(byAgent)) return {};
+  const out: Record<string, PendingSend[]> = {};
+  for (const [agentKey, list] of Object.entries(byAgent as Record<string, unknown>)) {
+    if (!Array.isArray(list)) continue;
+    const restored: PendingSend[] = [];
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object") continue;
+      const item = raw as PendingSend;
+      if (typeof item.id !== "string" || typeof item.text !== "string") continue;
+      if (item.state === "sent" || item.echo) continue;
+      restored.push(
+        item.state === "sending"
+          ? { ...item, state: "uncertain", error: INTERRUPTED_PENDING_ERROR }
+          : item,
+      );
+    }
+    if (restored.length) out[agentKey] = restored.slice(-20);
+  }
+  return out;
+}
+
+export const usePending = create<PendingState>()(
+  persist(
+    (set) => ({
+      byAgent: {},
+      add: (agentKey, text, pictures) => {
+        const id = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        set((s) => ({
+          byAgent: {
+            ...s.byAgent,
+            [agentKey]: [
+              ...(s.byAgent[agentKey] ?? []),
+              {
+                id,
+                text,
+                ts: Date.now(),
+                pictures: pictures?.length ? pictures : undefined,
+                state: "sending" as const,
+              },
+            ].slice(-20),
+          },
+        }));
+        return id;
       },
-    }));
-    return id;
-  },
-  update: (agentKey, id, patch) =>
-    set((s) => {
-      const list = s.byAgent[agentKey];
-      if (!list?.some((x) => x.id === id)) return s;
-      return { byAgent: { ...s.byAgent, [agentKey]: list.map((x) => (x.id === id ? { ...x, ...patch } : x)) } };
+      update: (agentKey, id, patch) =>
+        set((s) => {
+          const list = s.byAgent[agentKey];
+          if (!list?.some((x) => x.id === id)) return s;
+          return {
+            byAgent: {
+              ...s.byAgent,
+              [agentKey]: list.map((x) => (x.id === id ? { ...x, ...patch } : x)),
+            },
+          };
+        }),
+      drop: (agentKey, ids) =>
+        set((s) => {
+          const left = (s.byAgent[agentKey] ?? []).filter((x) => !ids.includes(x.id));
+          const next = { ...s.byAgent };
+          if (left.length) next[agentKey] = left;
+          else delete next[agentKey];
+          return { byAgent: next };
+        }),
     }),
-  drop: (agentKey, ids) =>
-    set((s) => {
-      const left = (s.byAgent[agentKey] ?? []).filter((x) => !ids.includes(x.id));
-      return { byAgent: { ...s.byAgent, [agentKey]: left } };
-    }),
-}));
+    {
+      name: "hp.mobile.pending.v1",
+      storage: createJSONStorage(() => safeAsyncStorage),
+      partialize: (s) => ({ byAgent: compactPendingByAgent(s.byAgent) }),
+      onRehydrateStorage: () => (state) => {
+        if (!state) return;
+        state.byAgent = rehydratePendingByAgent(state.byAgent);
+      },
+    },
+  ),
+);

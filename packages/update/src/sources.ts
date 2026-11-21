@@ -5,10 +5,13 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  DIRECT_SOURCE,
   SOURCE_PROBE_SLACK_MS,
   SOURCE_PROBE_TIMEOUT_MS,
   cachedWinner,
   decideRegion,
+  isMirrorPrefix,
+  orderWithPreferredSource,
   pickFastest,
   sourcePrefixes,
   sourceUrl,
@@ -59,9 +62,19 @@ export function writeSourceCache(cache: SourceCache, path = sourceCachePath()): 
 
 export function sourcePlan(env: Env = process.env, now = Date.now()): SourcePlan {
   const decision = currentRegion(env);
-  const base = sourcePrefixes(decision.region, currentClientConfig().config.update.mirrors);
+  const { mirrors, preferredSource } = currentClientConfig().config.update;
+  const base = sourcePrefixes(decision.region, mirrors);
   const cached = cachedWinner(readSourceCache(sourceCachePath(env)), decision.region, base, now);
-  return { decision, order: withWinnerFirst(base, cached), cached };
+  if (preferredSource === "direct") {
+    return { decision, order: withWinnerFirst(base, DIRECT_SOURCE) };
+  }
+  if (isMirrorPrefix(preferredSource)) {
+    return {
+      decision,
+      order: withWinnerFirst([preferredSource, ...base.filter((x) => x !== preferredSource)], preferredSource),
+    };
+  }
+  return { decision, order: orderWithPreferredSource(base, preferredSource, cached), cached };
 }
 
 export interface RaceResult<T> {

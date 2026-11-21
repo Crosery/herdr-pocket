@@ -1,4 +1,11 @@
-import { RELEASE_REPO, decideRegion, sourceLabel, sourcePrefixes, type RegionDecision } from "@herdr-pocket/protocol";
+import {
+  RELEASE_REPO,
+  decideRegion,
+  sourceLabel,
+  sourcePrefixes,
+  type RegionDecision,
+  type SourceProbe,
+} from "@herdr-pocket/protocol";
 import {
   checkReleaseUpdate,
   downloadAndStageUpdate,
@@ -8,12 +15,15 @@ import {
   onUpdateProgress,
   openExternalUrl,
   platformAssetNameHint,
+  probeUpdateSources,
+  readCachedSourceProbes,
   restartAndApplyUpdate,
   type ReleaseUpdateInfo,
 } from "./bridge";
 import { clientConfigStore } from "./config";
 import { createStore } from "./store";
 import { logger } from "./log";
+import { flushWorkspaceStateNow } from "./workspacePersist";
 
 export type UpdateInstallPhase =
   | "idle"
@@ -34,6 +44,8 @@ export interface UpdateInstallProgress {
 
 export interface UpdateState {
   checking: boolean;
+  probing: boolean;
+  probes: SourceProbe[];
   info: ReleaseUpdateInfo | null;
   error: string | null;
   checkedAt: number | null;
@@ -55,6 +67,20 @@ function readLastCheckedAt(): number | null {
   }
 }
 
+function readSyncLocalProbes(): SourceProbe[] {
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const parsed = JSON.parse(localStorage.getItem("herdr-pocket-sources") || "null") as { probes?: unknown } | null;
+    if (!parsed || !Array.isArray(parsed.probes)) return [];
+    return parsed.probes.filter(
+      (p): p is SourceProbe =>
+        Boolean(p && typeof p === "object" && typeof (p as SourceProbe).source === "string" && typeof (p as SourceProbe).ok === "boolean" && typeof (p as SourceProbe).ms === "number"),
+    );
+  } catch {
+    return [];
+  }
+}
+
 function saveLastCheckedAt(at: number): void {
   try {
     if (typeof localStorage !== "undefined") localStorage.setItem(LAST_KEY, String(at));
@@ -65,6 +91,8 @@ function saveLastCheckedAt(at: number): void {
 
 export const updateStore = createStore<UpdateState>({
   checking: false,
+  probing: false,
+  probes: readSyncLocalProbes(),
   info: null,
   error: null,
   checkedAt: readLastCheckedAt(),
@@ -75,6 +103,16 @@ export const updateStore = createStore<UpdateState>({
   minimized: false,
   manualNotice: null,
 });
+
+function hydrateCachedProbes(): void {
+  if (typeof window === "undefined") return;
+  void readCachedSourceProbes().then((cached) => {
+    if (!cached?.probes.length) return;
+    updateStore.set((prev) => (prev.probes.length === 0 ? { ...prev, probes: cached.probes } : prev));
+  });
+}
+
+hydrateCachedProbes();
 
 let progressListenerInstalled = false;
 function ensureProgressListener(): void {
@@ -155,6 +193,57 @@ function showManualNotice(msg: string, durationMs = 4500): void {
   }, durationMs);
 }
 
+function mergeProbes(existing: SourceProbe[], incoming?: SourceProbe[]): SourceProbe[] {
+  if (!incoming?.length) return existing;
+  const prevBySource = new Map(existing.map((p) => [p.source, p]));
+  const next = new Map<string, SourceProbe>();
+  for (const p of existing) next.set(p.source, p);
+  for (const p of incoming) {
+    // Do not overwrite an actual latency measurement with a race-slack abort error.
+    if (!p.ok && p.error === "slower than the winner" && prevBySource.has(p.source)) {
+      continue;
+    }
+    next.set(p.source, p);
+  }
+  return [...next.values()];
+}
+
+export async function probeMirrorsNow(showToast = false): Promise<SourceProbe[]> {
+  if (updateStore.get().probing) return updateStore.get().probes;
+  updateStore.set({ probing: true });
+  try {
+    const { region, mirrors, preferredSource } = clientConfigStore.get().config.update;
+    const res = await probeUpdateSources({
+      setting: region,
+      mirrors: [...mirrors],
+      preferredSource,
+    });
+    updateStore.set({ probing: false, probes: res.probes });
+    const summary = res.probes
+      .map((p) => `${sourceLabel(p.source) || p.source} ${p.ok ? `${p.ms} ms` : "failed"}`)
+      .join(", ");
+    logger.info(
+      "update",
+      `mirror probe: region ${res.region}, winner ${res.winner !== undefined ? sourceLabel(res.winner) : "none"}; ${summary}`,
+    );
+    if (showToast) {
+      if (res.winner !== undefined) {
+        const hit = res.probes.find((p) => p.source === res.winner && p.ok);
+        showManualNotice(`测速完成：最快 ${sourceLabel(res.winner)}${hit ? `（${hit.ms} ms）` : ""}`);
+      } else {
+        showManualNotice("测速完成：当前没有可用线路，请检查网络", 5000);
+      }
+    }
+    return res.probes;
+  } catch (e) {
+    updateStore.set({ probing: false });
+    const msg = (e as Error).message || "测速失败";
+    logger.warn("update", `mirror probe failed: ${msg}`);
+    if (showToast) showManualNotice(`测速失败：${msg}`, 5000);
+    return updateStore.get().probes;
+  }
+}
+
 export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Promise<ReleaseUpdateInfo | null> {
   ensureProgressListener();
   if (updateStore.get().checking) return updateStore.get().info;
@@ -163,12 +252,13 @@ export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Pro
     error: null,
     ...(reason === "manual" ? { dismissedVersion: null, minimized: false, manualNotice: null } : {}),
   });
-  const { region, mirrors } = clientConfigStore.get().config.update;
+  const { region, mirrors, preferredSource } = clientConfigStore.get().config.update;
   try {
     // Manual clicks always race fresh sources; startup/background refreshes may reuse recent cache.
     const info = await checkReleaseUpdate({
       setting: region,
       mirrors: [...mirrors],
+      preferredSource,
       forceRace: reason === "manual",
     });
     const at = Date.now();
@@ -179,6 +269,7 @@ export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Pro
     updateStore.set({
       checking: false,
       info,
+      probes: mergeProbes(prev.probes, info.probes),
       checkedAt: at,
       ...(changedVersion ? { minimized: false, installPhase: "idle", progress: null, installError: null } : sameLatestReady ? {} : {}),
     });
@@ -240,8 +331,8 @@ export async function startUpdateDownload(): Promise<void> {
     let sha256 = info.sha256;
     const assetName = info.assetName || platformAssetNameHint(info.latest);
     if (!sha256) {
-      const { region, mirrors } = clientConfigStore.get().config.update;
-      const sums = await fetchVersionSums(info.latest, { setting: region, mirrors: [...mirrors] });
+      const { region, mirrors, preferredSource } = clientConfigStore.get().config.update;
+      const sums = await fetchVersionSums(info.latest, { setting: region, mirrors: [...mirrors], preferredSource });
       sha256 = sums?.[assetName];
       if (sha256) {
         updateStore.set((prev) => (prev.info ? { ...prev, info: { ...prev.info, sha256 } } : prev));
@@ -285,6 +376,7 @@ export async function restartToApplyUpdate(): Promise<void> {
   if (st.installPhase !== "ready") return;
   updateStore.set({ installPhase: "restarting", installError: null });
   try {
+    await flushWorkspaceStateNow().catch(() => {});
     await restartAndApplyUpdate();
   } catch (e) {
     const msg = (e as Error).message || "重启并安装更新失败";
@@ -333,8 +425,8 @@ export async function fetchReleaseNotes(timeoutMs = 4000, version?: string): Pro
   const target = (version || updateStore.get().info?.latest || "").trim().replace(/^v/i, "");
   if (target) {
     try {
-      const { region, mirrors } = clientConfigStore.get().config.update;
-      const mirrorNotes = await fetchVersionReleaseNotes(target, { setting: region, mirrors: [...mirrors] });
+      const { region, mirrors, preferredSource } = clientConfigStore.get().config.update;
+      const mirrorNotes = await fetchVersionReleaseNotes(target, { setting: region, mirrors: [...mirrors], preferredSource });
       if (mirrorNotes) {
         return {
           body: stripInstallFooter(mirrorNotes),
@@ -365,13 +457,20 @@ export async function fetchReleaseNotes(timeoutMs = 4000, version?: string): Pro
 }
 
 const RETRY_BACKOFF_MS = [30_000, 120_000, 600_000];
-const FOCUS_RECHECK_MS = 30 * 60_000;
+
+function focusRecheckMs(): number {
+  return Math.min(
+    10 * 60_000,
+    Math.max(60_000, clientConfigStore.get().config.update.checkIntervalHours * 3_600_000),
+  );
+}
 
 /** Startup check (after 4s, immune to unrelated config loads) + focus/wake re-checks + retry backoff. */
 export function startAutoUpdateChecks(
   checkFn: (reason: "manual" | "auto" | "startup") => Promise<ReleaseUpdateInfo | null> = checkForUpdate,
 ): () => void {
   ensureProgressListener();
+  hydrateCachedProbes();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let startupTimer: ReturnType<typeof setTimeout> | null = null;
   let startupDone = false;
@@ -429,14 +528,14 @@ export function startAutoUpdateChecks(
     const every = checkIntervalHours * 3_600_000;
     const last = updateStore.get().checkedAt ?? 0;
     const jitter = every * (Math.random() * 0.2 - 0.1);
-    const wait = Math.max(60_000, last + every + jitter - Date.now());
+    const wait = Math.max(15_000, last + every + jitter - Date.now());
     scheduleNext(wait);
   };
 
   const onFocusOrOnline = () => {
     if (stopped || !clientConfigStore.get().config.update.autoCheck) return;
     const last = updateStore.get().checkedAt ?? 0;
-    if (Date.now() - last > FOCUS_RECHECK_MS && !updateStore.get().checking) {
+    if (Date.now() - last > focusRecheckMs() && !updateStore.get().checking) {
       void checkFn("auto").then((res) => {
         failStreak = res ? 0 : failStreak + 1;
         plan();

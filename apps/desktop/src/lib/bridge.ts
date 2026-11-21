@@ -7,8 +7,10 @@ import {
   compareVersions,
   decideRegion,
   localTimeZone,
-  pickFastest,
+  orderWithPreferredSource,
+  pickLowestLatency,
   releaseFromSums,
+  resolvePreferredSource,
   sourceLabel,
   sourcePrefixes,
   sourceUrl,
@@ -95,11 +97,12 @@ export function isHarmony(): boolean {
 }
 
 export function appVersion(): string {
-  const fromHarmony = window.PocketHarmony?.appVersion?.();
+  const w = typeof window !== "undefined" ? window : undefined;
+  const fromHarmony = w?.PocketHarmony?.appVersion?.();
   if (fromHarmony && fromHarmony.trim()) return fromHarmony.trim();
   // Desktop: the running app's own version (what Tauri's getVersion() returns), set by
   // src-tauri/src/webdiag.rs before this page's scripts run.
-  const fromTauri = window.__POCKET_APP_VERSION__;
+  const fromTauri = w?.__POCKET_APP_VERSION__;
   if (fromTauri && fromTauri.trim()) return fromTauri.trim();
   return typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.2.0";
 }
@@ -426,7 +429,13 @@ export interface ReleaseUpdateInfo {
  */
 export type UpdateCheckOptions =
   | Region
-  | { region?: Region; setting?: RegionSetting | string; mirrors?: string[]; forceRace?: boolean };
+  | {
+      region?: Region;
+      setting?: RegionSetting | string;
+      mirrors?: string[];
+      preferredSource?: string;
+      forceRace?: boolean;
+    };
 
 async function detectMacArch(): Promise<"arm64" | "x64"> {
   if (isTauri()) {
@@ -494,23 +503,90 @@ async function writeSourceCache(cache: SourceCache): Promise<void> {
   }
 }
 
-/** Region and own mirrors, in decideRegion's order: HERDR_POCKET_MIRROR, config.json, time zone. */
-async function updateRegion(opts?: UpdateCheckOptions): Promise<{ decision: RegionDecision; mirrors: string[] }> {
-  if (typeof opts === "string") return { decision: { region: opts, reason: "config", timeZone: localTimeZone() }, mirrors: [] };
+export interface CachedSourceProbes {
+  region?: Region;
+  winner?: string;
+  at?: number;
+  probes: SourceProbe[];
+}
+
+export interface ProbeUpdateSourcesResult {
+  region: Region;
+  reason: RegionDecision["reason"];
+  timeZone: string;
+  recommendedOrder: string[];
+  winner?: string;
+  probes: SourceProbe[];
+}
+
+const FULL_PROBE_TIMEOUT_MS = 3500;
+
+/** Reads cached `probes` and `winner` from `sources.json` (or localStorage outside Tauri). */
+export async function readCachedSourceProbes(): Promise<CachedSourceProbes | null> {
+  const raw = await readSourceCache();
+  if (!raw || typeof raw !== "object") return null;
+  const c = raw as Partial<SourceCache>;
+  const probes = Array.isArray(c.probes)
+    ? c.probes.filter(
+        (p): p is SourceProbe =>
+          Boolean(
+            p &&
+              typeof p === "object" &&
+              typeof p.source === "string" &&
+              typeof p.ok === "boolean" &&
+              typeof p.ms === "number",
+          ),
+      )
+    : [];
+  if (!probes.length && typeof c.winner !== "string") return null;
+  return {
+    region: c.region === "cn" || c.region === "global" ? c.region : undefined,
+    winner: typeof c.winner === "string" ? c.winner : undefined,
+    at: typeof c.at === "number" ? c.at : undefined,
+    probes,
+  };
+}
+
+/** Region, own mirrors, and preferred source, in decideRegion's order: HERDR_POCKET_MIRROR, config.json, time zone. */
+async function updateRegion(
+  opts?: UpdateCheckOptions,
+): Promise<{ decision: RegionDecision; mirrors: string[]; preferredSource: string }> {
+  if (typeof opts === "string") {
+    return {
+      decision: { region: opts, reason: "config", timeZone: localTimeZone() },
+      mirrors: [],
+      preferredSource: "auto",
+    };
+  }
   let setting = opts?.setting;
   let mirrors = opts?.mirrors;
+  let preferredSource = opts?.preferredSource;
   let env: string | undefined;
   if (isTauri()) {
     env = (await tauriInvoke<{ mirror?: string }>("update_env").catch(() => ({ mirror: undefined }))).mirror;
-    if (setting === undefined || mirrors === undefined) {
-      const file = await tauriInvoke<{ raw?: { update?: { region?: unknown; mirrors?: unknown } } }>("config_load").catch(() => null);
+    if (setting === undefined || mirrors === undefined || preferredSource === undefined) {
+      const file = await tauriInvoke<{
+        raw?: { update?: { region?: unknown; mirrors?: unknown; preferredSource?: unknown } };
+      }>("config_load").catch(() => null);
       const u = file?.raw?.update;
       if (setting === undefined && typeof u?.region === "string") setting = u.region;
-      if (mirrors === undefined && Array.isArray(u?.mirrors)) mirrors = u.mirrors.filter((m): m is string => typeof m === "string");
+      if (mirrors === undefined && Array.isArray(u?.mirrors)) {
+        mirrors = u.mirrors.filter((m): m is string => typeof m === "string");
+      }
+      if (preferredSource === undefined && typeof u?.preferredSource === "string") {
+        preferredSource = u.preferredSource;
+      }
     }
   }
-  if (opts?.region) return { decision: { region: opts.region, reason: "config", timeZone: localTimeZone() }, mirrors: mirrors ?? [] };
-  return { decision: decideRegion({ env, setting }), mirrors: mirrors ?? [] };
+  const pref = resolvePreferredSource(preferredSource) !== undefined ? preferredSource! : "auto";
+  if (opts?.region) {
+    return {
+      decision: { region: opts.region, reason: "config", timeZone: localTimeZone() },
+      mirrors: mirrors ?? [],
+      preferredSource: pref,
+    };
+  }
+  return { decision: decideRegion({ env, setting }), mirrors: mirrors ?? [], preferredSource: pref };
 }
 
 /** The listing's text. In the desktop app natively: github.com's redirect carries no CORS headers. */
@@ -549,7 +625,7 @@ async function fetchSums(
   return parsed;
 }
 
-/** Every source at once; once one answers the others get the slack, then pickFastest decides. */
+/** Every source at once; once one answers the others get the slack, then pickLowestLatency decides. */
 async function raceSums(
   order: string[],
   pathUrl = LATEST_SUMS_URL,
@@ -567,7 +643,7 @@ async function raceSums(
       if (slack) clearTimeout(slack);
       ctls.forEach((c) => c.abort());
       for (const s of order) if (!probes.some((p) => p.source === s)) probes.push({ source: s, ok: false, ms: Date.now() - t0, error: "slower than the winner" });
-      const winner = pickFastest(probes, order, SOURCE_PROBE_SLACK_MS);
+      const winner = pickLowestLatency(probes, order);
       const picked = winner === undefined ? undefined : results.get(winner);
       resolve({ winner, version: picked?.version, sums: picked?.sums, probes });
     };
@@ -597,16 +673,70 @@ async function raceSums(
   });
 }
 
+/**
+ * Probes every candidate source in parallel (3500 ms per source, without aborting runner-ups)
+ * so all healthy mirrors report real ms latency, picks `pickLowestLatency`, and persists `sources.json`.
+ */
+export async function probeUpdateSources(opts?: UpdateCheckOptions): Promise<ProbeUpdateSourcesResult> {
+  const { decision, mirrors } = await updateRegion(opts);
+  const base = sourcePrefixes(decision.region, mirrors);
+  const probes = await Promise.all(
+    base.map(async (source): Promise<SourceProbe> => {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), FULL_PROBE_TIMEOUT_MS);
+      const started = Date.now();
+      try {
+        await fetchSums(sourceUrl(source, LATEST_SUMS_URL), ctl.signal, FULL_PROBE_TIMEOUT_MS);
+        return { source, ok: true, ms: Date.now() - started };
+      } catch (e) {
+        const msg = ctl.signal.aborted
+          ? `no answer within ${FULL_PROBE_TIMEOUT_MS} ms`
+          : e instanceof Error
+            ? e.message
+            : String(e);
+        return { source, ok: false, ms: Date.now() - started, error: msg.slice(0, 160) };
+      } finally {
+        clearTimeout(timer);
+      }
+    }),
+  );
+  const winner = pickLowestLatency(probes, base);
+  if (winner !== undefined) {
+    await writeSourceCache({
+      region: decision.region,
+      winner,
+      at: Date.now(),
+      probes,
+    });
+  }
+  for (const p of probes) {
+    nativeLog("debug", "update", "source latency probe", {
+      source: sourceLabel(p.source),
+      ok: p.ok,
+      ms: p.ms,
+      error: p.error,
+    });
+  }
+  return {
+    region: decision.region,
+    reason: decision.reason,
+    timeZone: decision.timeZone,
+    recommendedOrder: base,
+    winner,
+    probes,
+  };
+}
+
 /** Fetches SHA256SUMS for an explicit release tag when the cached latest mirror was stale. */
 export async function fetchVersionSums(
   version: string,
   opts?: UpdateCheckOptions,
 ): Promise<Record<string, string> | null> {
-  const { decision, mirrors } = await updateRegion(opts);
+  const { decision, mirrors, preferredSource } = await updateRegion(opts);
   const base = sourcePrefixes(decision.region, mirrors);
   const cached = cachedWinner(await readSourceCache(), decision.region, base);
   const taggedUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${version.trim().replace(/^v/i, "")}/SHA256SUMS`;
-  const race = await raceSums(withWinnerFirst(base, cached), taggedUrl);
+  const race = await raceSums(orderWithPreferredSource(base, preferredSource, cached), taggedUrl);
   return race.sums ?? null;
 }
 
@@ -620,11 +750,11 @@ export async function fetchVersionReleaseNotes(
 ): Promise<string | null> {
   const clean = version.trim().replace(/^v/i, "");
   if (!clean) return null;
-  const { decision, mirrors } = await updateRegion(opts);
+  const { decision, mirrors, preferredSource } = await updateRegion(opts);
   const base = sourcePrefixes(decision.region, mirrors);
   const cached = cachedWinner(await readSourceCache(), decision.region, base);
   const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${clean}/RELEASE-NOTES.md`;
-  for (const src of withWinnerFirst(base, cached)) {
+  for (const src of orderWithPreferredSource(base, preferredSource, cached)) {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 3000);
     try {
@@ -644,9 +774,10 @@ export async function fetchVersionReleaseNotes(
 
 /**
  * The newest release and where to download it. Region: HERDR_POCKET_MIRROR, then
- * `update.region`, then the time zone. A remembered winner (24 h, shared with the CLI and
- * daemon via sources.json) is asked first unless `forceRace` is set; GitHub Releases API
- * is queried in parallel in the desktop app so release notes, sizes, digests, and fresh tags arrive fast.
+ * `update.region`, then the time zone. When `update.preferredSource` pins `"direct"` or a
+ * mirror prefix, that source is tried first (falling back to others if it fails). Otherwise
+ * a remembered winner (24 h, shared via sources.json) is asked first unless `forceRace` is set;
+ * GitHub Releases API is queried in parallel in the desktop app.
  */
 export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<ReleaseUpdateInfo> {
   const forceRace = typeof opts === "object" && opts !== null && Boolean(opts.forceRace);
@@ -654,15 +785,41 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
     ? tauriInvoke<GithubLatestRelease>("update_fetch_github_latest", { timeoutMs: 4500 }).catch(() => null)
     : Promise.resolve(null);
 
-  const { decision, mirrors } = await updateRegion(opts);
+  const { decision, mirrors, preferredSource } = await updateRegion(opts);
   const base = sourcePrefixes(decision.region, mirrors);
-  const cached = cachedWinner(await readSourceCache(), decision.region, base);
+  const explicitSource = resolvePreferredSource(preferredSource);
+  const cached =
+    explicitSource === undefined ? cachedWinner(await readSourceCache(), decision.region, base) : undefined;
   let source: string | undefined;
   let version: string | undefined;
   let sumsMap: Record<string, string> | undefined;
   let probes: SourceProbe[] | undefined;
 
-  if (!forceRace && cached !== undefined) {
+  if (explicitSource !== undefined) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), SOURCE_PROBE_TIMEOUT_MS);
+    const started = Date.now();
+    try {
+      const hit = await fetchSums(sourceUrl(explicitSource, LATEST_SUMS_URL), ctl.signal, SOURCE_PROBE_TIMEOUT_MS);
+      version = hit.version;
+      sumsMap = hit.sums;
+      source = explicitSource;
+      probes = [{ source: explicitSource, ok: true, ms: Date.now() - started }];
+    } catch (e) {
+      const msg = ctl.signal.aborted
+        ? `no answer within ${SOURCE_PROBE_TIMEOUT_MS} ms`
+        : e instanceof Error
+          ? e.message
+          : String(e);
+      probes = [{ source: explicitSource, ok: false, ms: Date.now() - started, error: msg.slice(0, 160) }];
+      nativeLog("info", "update", "preferred source failed, falling back to race", {
+        source: sourceLabel(explicitSource),
+        error: msg,
+      });
+    } finally {
+      clearTimeout(t);
+    }
+  } else if (!forceRace && cached !== undefined) {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 2500);
     try {
@@ -671,14 +828,19 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
       sumsMap = hit.sums;
       source = cached;
     } catch (e) {
-      nativeLog("info", "update", "remembered source failed, racing again", { source: sourceLabel(cached), error: (e as Error).message });
+      nativeLog("info", "update", "remembered source failed, racing again", {
+        source: sourceLabel(cached),
+        error: (e as Error).message,
+      });
     } finally {
       clearTimeout(t);
     }
   }
   if (version === undefined) {
-    const race = await raceSums(withWinnerFirst(base, cached));
-    probes = race.probes;
+    const raceOrder =
+      explicitSource !== undefined ? base.filter((s) => s !== explicitSource) : withWinnerFirst(base, cached);
+    const race = await raceSums(raceOrder);
+    probes = probes ? [...probes, ...race.probes] : race.probes;
     for (const p of race.probes) {
       nativeLog("debug", "update", "source probe", { source: sourceLabel(p.source), ok: p.ok, ms: p.ms, error: p.error });
     }
@@ -686,7 +848,9 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
       source = race.winner;
       version = race.version;
       sumsMap = race.sums;
-      await writeSourceCache({ region: decision.region, winner: source, at: Date.now(), probes: race.probes });
+      if (explicitSource === undefined) {
+        await writeSourceCache({ region: decision.region, winner: source, at: Date.now(), probes });
+      }
     }
   }
 
@@ -719,7 +883,10 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
   const macArch = platform === "macos" ? await detectMacArch() : "arm64";
   const assetName = platformDownloadAsset(version, platform, macArch);
   const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${version}/${assetName}`;
-  const orderedSources = withWinnerFirst(base, winner);
+  const orderedSources =
+    explicitSource !== undefined && winner !== explicitSource
+      ? withWinnerFirst(base, winner)
+      : orderWithPreferredSource(base, preferredSource, winner);
   const downloadUrls = Array.from(new Set(orderedSources.map((s) => sourceUrl(s, rawUrl))));
 
   const ghMatch = gh && compareVersions(gh.version, version) === 0 ? gh : null;
@@ -763,6 +930,23 @@ export function restartAndApplyUpdate(): Promise<void> {
 
 export function onUpdateProgress(cb: (ev: UpdateProgressEvent) => void): () => void {
   return listenTauri<UpdateProgressEvent>("update://progress", cb);
+}
+
+/** Loads persisted workspace state JSON from `workspace-state.json` on Tauri desktop, else null. */
+export async function loadWorkspaceStateRaw(): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    const raw = await tauriInvoke<string | null>("workspace_state_load");
+    return typeof raw === "string" && raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Atomically writes workspace state JSON to `workspace-state.json` on Tauri desktop. */
+export async function saveWorkspaceStateRaw(raw: string): Promise<void> {
+  if (!isTauri()) return;
+  await tauriInvoke<void>("workspace_state_save", { raw });
 }
 
 // ---------------------------------------------------------------------------

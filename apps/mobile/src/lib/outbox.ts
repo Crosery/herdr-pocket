@@ -45,6 +45,30 @@ const early = new Map<string, QueueEvent>();
 const patch = (agentKey: string, id: string, p: Partial<Omit<PendingSend, "id">>) => usePending.getState().update(agentKey, id, p);
 const find = (agentKey: string, id: string) => usePending.getState().byAgent[agentKey]?.find((x) => x.id === id);
 
+function attachmentsFromDataUris(id: string, uris?: string[]): Attachment[] {
+  if (!uris?.length) return [];
+  const out: Attachment[] = [];
+  uris.forEach((uri, idx) => {
+    const m = /^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/i.exec(uri.trim());
+    if (!m) return;
+    const mime = m[1]!.toLowerCase();
+    const data = m[2]!;
+    const pad = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+    const bytes = Math.max(0, Math.floor((data.length * 3) / 4) - pad);
+    const ext = mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
+    out.push({
+      id: `${id}-att-${idx}`,
+      name: `image-${idx + 1}.${ext}`,
+      mime: mime as Attachment["mime"],
+      data,
+      width: 0,
+      height: 0,
+      bytes,
+    });
+  });
+  return out;
+}
+
 /** Shows the message at once, then sends it after any earlier ones to the same agent. */
 export function sendOut(agent: Agent, text: string, pictures: Attachment[] = []): Promise<SendResult> {
   const id = usePending.getState().add(agent.key, text, pictures.map((x) => `data:${x.mime};base64,${x.data}`));
@@ -61,6 +85,10 @@ export function resend(agentKey: string, id: string, allowDuplicate = false): Pr
     patch(agentKey, id, { error: "找不到这个 agent 了" });
     return Promise.resolve({ ok: false, message: "找不到这个 agent 了" });
   }
+  if (!keep.has(id) && x.pictures?.length) {
+    const restored = attachmentsFromDataUris(id, x.pictures);
+    if (restored.length) keep.set(id, restored);
+  }
   patch(agentKey, id, { state: "sending", ts: Date.now(), error: undefined, queueId: undefined, waiting: undefined, sentAt: undefined });
   return deliver(agent, id, x.text);
 }
@@ -74,7 +102,15 @@ export function forget(agentKey: string, ids: string[]) {
 function deliver(agent: Agent, id: string, text: string): Promise<SendResult> {
   const run = (lines.get(agent.key) ?? Promise.resolve()).then(async (): Promise<SendResult> => {
     try {
-      const { accepted } = await sendWithPictures(agent, text, keep.get(id) ?? []);
+      let pictures = keep.get(id);
+      if (!pictures?.length) {
+        const restored = attachmentsFromDataUris(id, find(agent.key, id)?.pictures);
+        if (restored.length) {
+          keep.set(id, restored);
+          pictures = restored;
+        }
+      }
+      const { accepted } = await sendWithPictures(agent, text, pictures ?? []);
       if (!accepted.queueId) keep.delete(id);
       const waiting = !!accepted.waiting;
       const behind = (accepted.position ?? 0) > 0;

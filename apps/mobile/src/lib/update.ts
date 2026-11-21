@@ -1,5 +1,5 @@
 /**
- * In-app update from GitHub Releases. Checks the latest release at most every 12 hours,
+ * In-app update from GitHub Releases. Checks the latest release at most every 30 minutes,
  * downloads its APK with progress and hands it to the system installer. Network trouble,
  * GitHub's rate limit and a release without an APK all stay quiet unless the person asked.
  * Demo mode never calls GitHub.
@@ -48,7 +48,7 @@ export const useUpdate = create<UpdateState>()(() => ({ phase: "idle", progress:
 /** In-app updates install the release APK: Android only. */
 export const updatesSupported = Platform.OS === "android";
 
-const CHECK_EVERY_MS = 12 * 3600_000;
+const CHECK_EVERY_MS = 30 * 60_000;
 const set = (patch: Partial<UpdateState>) => useUpdate.setState(patch);
 
 /** The installed version (the APK's versionName), e.g. "0.1.0". */
@@ -187,7 +187,7 @@ async function fetchFromApi(): Promise<Latest> {
 
 /**
  * `manual`: the person tapped "检查更新" and wants an answer. Otherwise this is the quiet
- * background check, which runs at most every 12 hours.
+ * background check, which runs at most every 30 minutes.
  */
 export async function checkForUpdate(manual = false): Promise<void> {
   const s = useSettings.getState();
@@ -209,7 +209,7 @@ export async function checkForUpdate(manual = false): Promise<void> {
   const latest = await fetchLatest();
   if (latest.kind === "unknown") {
     applog("info", "update", `update check failed: ${latest.why}`);
-    // Try again on the next start rather than in 12 hours.
+    // Try again on the next start rather than waiting 30 minutes.
     syncPhase(manual ? (latest.why === "limited" ? "GitHub 暂时不让查了，过一会儿再试" : "暂时连不上 GitHub，过会儿再试") : null);
     return;
   }
