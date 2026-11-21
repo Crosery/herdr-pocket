@@ -31,6 +31,8 @@ pub struct ModelOption {
     pub reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_levels: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_model_map: Option<BTreeMap<String, String>>,
     pub source: &'static str,
 }
 
@@ -160,16 +162,47 @@ pub fn strip_model_effort_suffix(raw: &str) -> (String, Option<String>) {
     (trimmed.to_string(), None)
 }
 
+fn has_boundary_after(s: &str, prefix_len: usize, allow_dot: bool) -> bool {
+    match s.as_bytes().get(prefix_len).copied() {
+        None => true,
+        Some(b'-' | b'_' | b'@' | b':') => true,
+        Some(b'.') if allow_dot => true,
+        _ => false,
+    }
+}
+
+fn starts_with_bound(s: &str, prefix: &str, allow_dot: bool) -> bool {
+    s.starts_with(prefix) && has_boundary_after(s, prefix.len(), allow_dot)
+}
+
 fn is_non_reasoning_model_name(model_id: &str) -> bool {
-    let leaf = model_id
-        .trim()
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let (base, _) = strip_model_effort_suffix(model_id);
+    let leaf = base.trim().rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    if leaf.is_empty() {
+        return false;
+    }
     if leaf.starts_with("gemini-1.5-")
-        || leaf.starts_with("gemini-2.0-")
+        || leaf.starts_with("gemini-1.0-")
+        || leaf == "gemini-pro"
+        || (leaf.starts_with("gemini-2.0-") && !leaf.starts_with("gemini-2.0-flash-thinking"))
+        || leaf == "gemma-3"
         || leaf.starts_with("gemma-3-")
+        || leaf.starts_with("gemma-2-")
+        || leaf == "gpt-4o"
+        || leaf.starts_with("gpt-4o-")
+        || leaf == "gpt-4.1"
+        || leaf.starts_with("gpt-4.1-")
+        || leaf == "gpt-4.5"
+        || leaf.starts_with("gpt-4.5-")
+        || leaf == "gpt-4"
+        || leaf.starts_with("gpt-4-")
+        || leaf == "gpt-3.5"
+        || leaf.starts_with("gpt-3.5-")
+        || leaf.starts_with("claude-3-5-")
+        || leaf.starts_with("claude-3.5-")
+        || starts_with_bound(&leaf, "claude-3-opus", false)
+        || starts_with_bound(&leaf, "claude-3-sonnet", false)
+        || starts_with_bound(&leaf, "claude-3-haiku", false)
     {
         return true;
     }
@@ -179,12 +212,198 @@ fn is_non_reasoning_model_name(model_id: &str) -> bool {
         "gpt-reserve",
         "kimi-for-coding-highspeed",
     ];
-    EXACT_OR_PREFIX.iter().any(|pat| {
-        leaf == *pat
-            || leaf.starts_with(&format!("{pat}-"))
-            || leaf.starts_with(&format!("{pat}:"))
-            || leaf.starts_with(&format!("{pat}@"))
-    })
+    EXACT_OR_PREFIX.iter().any(|pat| starts_with_bound(&leaf, pat, false))
+}
+
+fn contains_claude_ver(leaf: &str, a: char, b: char) -> bool {
+    if !leaf.starts_with("claude-") {
+        return false;
+    }
+    for sep in ['-', '.'] {
+        let needle = format!("-{a}{sep}{b}");
+        if let Some(pos) = leaf.find(&needle) {
+            if has_boundary_after(leaf, pos + needle.len(), false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn match_explicit_model_family_levels(base_model: &str) -> Option<Vec<String>> {
+    let leaf = base_model.trim().rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    if leaf.is_empty() || leaf.starts_with('@') {
+        return None;
+    }
+    let to_vec = |arr: &[&str]| arr.iter().map(|s| (*s).to_string()).collect::<Vec<String>>();
+
+    if leaf.starts_with("gpt-oss-") {
+        for suffix in ["-minimal", "-xhigh", "-medium", "-high", "-low", "-max"] {
+            if leaf.ends_with(suffix) {
+                return Some(vec![suffix[1..].to_string()]);
+            }
+        }
+    }
+
+    if starts_with_bound(&leaf, "gemini-4-neon", false)
+        || starts_with_bound(&leaf, "gemini-4-hydrogen", false)
+    {
+        return Some(to_vec(&["low", "medium", "high", "xhigh"]));
+    }
+    if starts_with_bound(&leaf, "gemini-4-carbon", false)
+        || starts_with_bound(&leaf, "gemini-4-argon", false)
+        || starts_with_bound(&leaf, "gemini-3.7", false)
+        || starts_with_bound(&leaf, "gemini-3.8", false)
+    {
+        return Some(to_vec(&["low", "medium", "high"]));
+    }
+    if starts_with_bound(&leaf, "gemini-2.5", false)
+        || starts_with_bound(&leaf, "gemini-live-2.5", false)
+    {
+        return Some(to_vec(&["minimal", "low", "medium", "high"]));
+    }
+    if starts_with_bound(&leaf, "gemini-3-flash", false)
+        || starts_with_bound(&leaf, "gemini-3.1-flash", false)
+        || starts_with_bound(&leaf, "gemini-3.5-flash", false)
+        || starts_with_bound(&leaf, "gemini-3.6-flash", false)
+    {
+        return Some(to_vec(&["minimal", "low", "medium", "high"]));
+    }
+    if starts_with_bound(&leaf, "gemini-3", true) {
+        return Some(to_vec(&["low", "high"]));
+    }
+    if starts_with_bound(&leaf, "gemma-4", true) {
+        return Some(to_vec(&["high"]));
+    }
+    if starts_with_bound(&leaf, "k3", true)
+        || starts_with_bound(&leaf, "kimi-k2-thinking", false)
+        || starts_with_bound(&leaf, "kimi-for-coding", false)
+    {
+        return Some(to_vec(&["low", "high", "max"]));
+    }
+    if contains_claude_ver(&leaf, '4', '6') {
+        return Some(to_vec(&["low", "medium", "high", "max"]));
+    }
+    if contains_claude_ver(&leaf, '4', '5')
+        || contains_claude_ver(&leaf, '5', '5')
+        || starts_with_bound(&leaf, "claude-3-7", false)
+        || starts_with_bound(&leaf, "claude-3.7", false)
+    {
+        return Some(to_vec(&["low", "medium", "high"]));
+    }
+    let is_gpt_5_2_plus = (leaf.starts_with("gpt-5.")
+        && leaf.as_bytes().get(6).map(|b| matches!(b, b'2'..=b'9')).unwrap_or(false)
+        && has_boundary_after(&leaf, 7, true))
+        || starts_with_bound(&leaf, "gpt-6", true)
+        || starts_with_bound(&leaf, "codex", true)
+        || leaf.contains("-codex")
+        || starts_with_bound(&leaf, "mimo-v2.6", true);
+    if is_gpt_5_2_plus {
+        return Some(to_vec(&["low", "medium", "high", "xhigh"]));
+    }
+    if starts_with_bound(&leaf, "o1", false)
+        || starts_with_bound(&leaf, "o3", false)
+        || starts_with_bound(&leaf, "o4-mini", false)
+        || starts_with_bound(&leaf, "gpt-5", false)
+        || starts_with_bound(&leaf, "gpt-5.0", false)
+        || starts_with_bound(&leaf, "gpt-5.1", false)
+        || starts_with_bound(&leaf, "gpt-5-mini", false)
+        || starts_with_bound(&leaf, "gpt-5-nano", false)
+    {
+        return Some(to_vec(&["low", "medium", "high"]));
+    }
+
+    None
+}
+
+pub fn infer_model_thinking_levels(
+    harness: &str,
+    model_id: Option<&str>,
+    reasoning: Option<bool>,
+    has_reasoning_events: bool,
+) -> Vec<String> {
+    let h_norm = normalize_harness(harness);
+    let fallback: Vec<String> = if let Some(defaults) = default_thinking_levels(&h_norm) {
+        defaults.iter().map(|s| (*s).to_string()).collect()
+    } else if has_reasoning_events || reasoning == Some(true) {
+        vec!["low".into(), "medium".into(), "high".into()]
+    } else {
+        Vec::new()
+    };
+
+    if reasoning == Some(false) && !has_reasoning_events {
+        return Vec::new();
+    }
+
+    let raw = model_id.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return fallback;
+    }
+    let (base, _) = strip_model_effort_suffix(raw);
+    if base.is_empty() || base.starts_with('@') {
+        return fallback;
+    }
+    if is_non_reasoning_model_name(&base) {
+        return if has_reasoning_events { fallback } else { Vec::new() };
+    }
+    if let Some(levels) = match_explicit_model_family_levels(&base) {
+        return levels;
+    }
+    fallback
+}
+
+fn effort_rank(level: &str) -> Option<i32> {
+    match level {
+        "off" | "none" => Some(0),
+        "minimal" | "min" => Some(1),
+        "low" => Some(2),
+        "medium" | "med" | "normal" | "smart" => Some(3),
+        "high" | "fast" => Some(4),
+        "xhigh" | "rush" => Some(5),
+        "max" => Some(6),
+        "ultra" => Some(7),
+        _ => None,
+    }
+}
+
+pub fn clamp_thinking_level(levels: &[String], candidate: Option<&str>) -> Option<String> {
+    if levels.is_empty() {
+        return None;
+    }
+    let clean = candidate.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+    let Some(c) = clean else {
+        return if levels.len() == 1 {
+            Some(levels[0].clone())
+        } else {
+            None
+        };
+    };
+    if let Some(exact) = levels.iter().find(|l| l.eq_ignore_ascii_case(&c)) {
+        return Some(exact.clone());
+    }
+    let Some(target_rank) = effort_rank(&c) else {
+        for pref in ["medium", "high", "low"] {
+            if let Some(hit) = levels.iter().find(|l| l.eq_ignore_ascii_case(pref)) {
+                return Some(hit.clone());
+            }
+        }
+        return Some(levels[0].clone());
+    };
+    let mut best_idx = 0usize;
+    let mut best_dist = i32::MAX;
+    let mut best_rank = -1i32;
+    for (i, lvl) in levels.iter().enumerate() {
+        let Some(r) = effort_rank(&lvl.to_ascii_lowercase()) else {
+            continue;
+        };
+        let dist = (r - target_rank).abs();
+        if dist < best_dist || (dist == best_dist && r > best_rank) {
+            best_dist = dist;
+            best_idx = i;
+            best_rank = r;
+        }
+    }
+    Some(levels[best_idx].clone())
 }
 
 fn infer_hyphen_effort(model_id: &str) -> Option<String> {
@@ -401,16 +620,38 @@ pub fn parse_omp_models_json(raw: &str) -> Vec<ModelOption> {
             context_window,
             reasoning,
             thinking_levels,
+            effort_model_map: None,
             source: "catalog",
         });
     }
     out
 }
 
+const AGY_EFFORT_ORDER: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
+fn split_agy_effort_stem(id: &str) -> Option<(String, String)> {
+    let low = id.to_ascii_lowercase();
+    for lvl in AGY_EFFORT_ORDER {
+        let suffix = format!("-{lvl}");
+        if low.ends_with(&suffix) && id.len() > suffix.len() {
+            let stem = &id[..id.len() - suffix.len()];
+            return Some((stem.to_string(), (*lvl).to_string()));
+        }
+    }
+    None
+}
+
 pub fn parse_agy_models_text(raw: &str) -> Vec<ModelOption> {
-    let mut out = Vec::new();
+    struct Entry {
+        id: String,
+        label: String,
+        stem: Option<String>,
+    }
+    let mut entries = Vec::new();
+    let mut groups: HashMap<String, HashMap<String, String>> = HashMap::new();
+
     for line in raw.lines() {
-        if out.len() >= MAX_MODELS {
+        if entries.len() >= MAX_MODELS {
             break;
         }
         let clean = line.trim();
@@ -430,17 +671,71 @@ pub fn parse_agy_models_text(raw: &str) -> Vec<ModelOption> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(id);
-        out.push(ModelOption {
-            id: id.to_string(),
-            label: label.to_string(),
-            provider: Some("antigravity".into()),
-            context_window: None,
-            reasoning: None,
-            thinking_levels: None,
-            source: "catalog",
-        });
+        if let Some((stem, effort)) = split_agy_effort_stem(id) {
+            let stem_key = stem.to_ascii_lowercase();
+            groups
+                .entry(stem_key)
+                .or_default()
+                .entry(effort)
+                .or_insert_with(|| id.to_string());
+            entries.push(Entry {
+                id: id.to_string(),
+                label: label.to_string(),
+                stem: Some(stem),
+            });
+        } else {
+            entries.push(Entry {
+                id: id.to_string(),
+                label: label.to_string(),
+                stem: None,
+            });
+        }
     }
-    out
+
+    entries
+        .into_iter()
+        .map(|e| {
+            let stem_key = e
+                .stem
+                .as_deref()
+                .unwrap_or(&e.id)
+                .to_ascii_lowercase();
+            if let Some(sibling_map) = groups.get(&stem_key) {
+                let mut thinking_levels = Vec::new();
+                let mut effort_model_map = BTreeMap::new();
+                for &lvl in AGY_EFFORT_ORDER {
+                    if let Some(target_id) = sibling_map.get(lvl) {
+                        thinking_levels.push(lvl.to_string());
+                        effort_model_map.insert(lvl.to_string(), target_id.clone());
+                    }
+                }
+                let has_levels = !thinking_levels.is_empty();
+                return ModelOption {
+                    id: e.id,
+                    label: e.label,
+                    provider: Some("antigravity".into()),
+                    context_window: None,
+                    reasoning: Some(has_levels),
+                    thinking_levels: if has_levels { Some(thinking_levels) } else { None },
+                    effort_model_map: if has_levels { Some(effort_model_map) } else { None },
+                    source: "catalog",
+                };
+            }
+
+            let inferred = infer_model_thinking_levels("antigravity", Some(&e.id), None, false);
+            let has_levels = !inferred.is_empty();
+            ModelOption {
+                id: e.id,
+                label: e.label,
+                provider: Some("antigravity".into()),
+                context_window: None,
+                reasoning: Some(has_levels),
+                thinking_levels: if has_levels { Some(inferred) } else { None },
+                effort_model_map: None,
+                source: "catalog",
+            }
+        })
+        .collect()
 }
 
 pub fn parse_opencode_models_text(raw: &str) -> Vec<ModelOption> {
@@ -464,6 +759,7 @@ pub fn parse_opencode_models_text(raw: &str) -> Vec<ModelOption> {
             context_window: None,
             reasoning: None,
             thinking_levels: None,
+            effort_model_map: None,
             source: "catalog",
         });
     }
@@ -520,6 +816,7 @@ pub fn parse_pi_models_text(raw: &str) -> Vec<ModelOption> {
             context_window,
             reasoning,
             thinking_levels: None,
+            effort_model_map: None,
             source: "catalog",
         });
     }
@@ -633,6 +930,7 @@ pub fn parse_omp_models_yml(raw: &str) -> Vec<ModelOption> {
             context_window: d.context_window,
             reasoning: d.reasoning,
             thinking_levels,
+            effort_model_map: None,
             source: "catalog",
         });
     };
@@ -1035,6 +1333,7 @@ fn parse_omp_config_yml_str(raw: &str) -> OmpConfigInfo {
                     context_window: None,
                     reasoning: None,
                     thinking_levels: None,
+                    effort_model_map: None,
                     source: "recent",
                 });
             }
@@ -1418,6 +1717,7 @@ fn read_omp_agent_db_models(home: &Path) -> Vec<ModelOption> {
                 context_window: None,
                 reasoning: None,
                 thinking_levels: None,
+                effort_model_map: None,
                 source: "recent",
             })
         })
@@ -1759,6 +2059,7 @@ fn read_local_configured(home: &Path) -> LocalConfigured {
                             context_window: None,
                             reasoning: None,
                             thinking_levels: None,
+                            effort_model_map: None,
                             source: "catalog",
                         });
                     }
@@ -1776,6 +2077,7 @@ fn read_local_configured(home: &Path) -> LocalConfigured {
                 context_window: None,
                 reasoning: None,
                 thinking_levels: None,
+                effort_model_map: None,
                 source: "catalog",
             });
         }
@@ -1803,6 +2105,7 @@ fn read_local_configured(home: &Path) -> LocalConfigured {
                     context_window: None,
                     reasoning: None,
                     thinking_levels: None,
+                    effort_model_map: None,
                     source: "catalog",
                 });
             }
@@ -1825,6 +2128,7 @@ fn read_local_configured(home: &Path) -> LocalConfigured {
                     context_window: None,
                     reasoning: None,
                     thinking_levels: None,
+                    effort_model_map: None,
                     source: "catalog",
                 });
             }
@@ -1864,6 +2168,7 @@ fn read_local_configured(home: &Path) -> LocalConfigured {
                     context_window: None,
                     reasoning: None,
                     thinking_levels: None,
+                    effort_model_map: None,
                     source: "catalog",
                 });
             }
@@ -1887,6 +2192,7 @@ fn read_local_configured(home: &Path) -> LocalConfigured {
                 context_window: None,
                 reasoning: None,
                 thinking_levels: None,
+                effort_model_map: None,
                 source: "catalog",
             });
         }
@@ -1904,6 +2210,7 @@ fn read_local_configured(home: &Path) -> LocalConfigured {
                 context_window: None,
                 reasoning: None,
                 thinking_levels: None,
+                effort_model_map: None,
                 source: "catalog",
             });
         }
@@ -1926,6 +2233,7 @@ fn fallback_presets(h_norm: &str) -> Vec<ModelOption> {
         context_window: None,
         reasoning,
         thinking_levels: None,
+        effort_model_map: None,
         source: "catalog",
     };
     match h_norm {
@@ -2101,12 +2409,73 @@ fn push_model_opt(
     merged.push(next);
 }
 
+fn prepend_omp_off(mut levels: Vec<String>) -> Vec<String> {
+    if !levels.iter().any(|l| l.eq_ignore_ascii_case("off")) {
+        levels.insert(0, "off".into());
+    }
+    levels
+}
+
+fn enrich_omp_yml_entry(mut y_item: ModelOption, cached_omp: &[ModelOption]) -> ModelOption {
+    if y_item.reasoning == Some(false)
+        || y_item
+            .thinking_levels
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    {
+        return y_item;
+    }
+    let cached_match = cached_omp
+        .iter()
+        .find(|c| c.id.eq_ignore_ascii_case(&y_item.id))
+        .or_else(|| {
+            if cached_omp.is_empty() {
+                None
+            } else {
+                find_catalog_match(&y_item.id, cached_omp)
+            }
+        });
+    if let Some(m) = cached_match {
+        if m.reasoning == Some(false) {
+            y_item.reasoning = Some(false);
+            return y_item;
+        }
+        if let Some(ref lvls) = m.thinking_levels {
+            if !lvls.is_empty() {
+                y_item.reasoning = y_item.reasoning.or(Some(true));
+                y_item.thinking_levels = Some(prepend_omp_off(lvls.clone()));
+                return y_item;
+            }
+        }
+    }
+    let inferred = infer_model_thinking_levels("oh-my-pi", Some(&y_item.id), y_item.reasoning, false);
+    if inferred.is_empty() {
+        y_item.reasoning = Some(false);
+    } else {
+        y_item.reasoning = y_item.reasoning.or(Some(true));
+        y_item.thinking_levels = Some(prepend_omp_off(inferred));
+    }
+    y_item
+}
+
 pub fn build_local_agent_models_with(
     harness: &str,
     current_model: Option<&str>,
     session_key: Option<&str>,
     home: Option<&Path>,
     use_cli: bool,
+) -> Value {
+    build_local_agent_models_with_catalog(harness, current_model, session_key, home, use_cli, None)
+}
+
+pub fn build_local_agent_models_with_catalog(
+    harness: &str,
+    current_model: Option<&str>,
+    session_key: Option<&str>,
+    home: Option<&Path>,
+    use_cli: bool,
+    cli_override: Option<Vec<ModelOption>>,
 ) -> Value {
     let h_norm = normalize_harness(harness);
     let local_cfg = home.map(read_local_configured).unwrap_or(LocalConfigured {
@@ -2128,7 +2497,9 @@ pub fn build_local_agent_models_with(
     } else {
         Vec::new()
     };
-    let cli_catalog = if use_cli {
+    let cli_catalog = if let Some(over) = cli_override {
+        over
+    } else if use_cli {
         match h_norm.as_str() {
             "omp" => {
                 if !yml_catalog.is_empty() || !omp_cfg.models.is_empty() || !db_models.is_empty() {
@@ -2202,13 +2573,32 @@ pub fn build_local_agent_models_with(
         .or_else(|| local_cfg.thinking_by_harness.get(&h_norm).cloned())
         .or_else(|| effective_model.as_deref().and_then(infer_hyphen_effort));
 
+    let raw_had_explicit_thinking: HashSet<String> = yml_catalog
+        .iter()
+        .filter(|y| {
+            y.thinking_levels
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        })
+        .map(|y| y.id.to_ascii_lowercase())
+        .collect();
+    let enriched_yml: Vec<ModelOption> = if h_norm == "omp" {
+        yml_catalog
+            .into_iter()
+            .map(|y| enrich_omp_yml_entry(y, &cli_catalog))
+            .collect()
+    } else {
+        yml_catalog
+    };
+
     let mut combined_catalog = cli_catalog;
     let mut cat_idx: HashMap<String, usize> = combined_catalog
         .iter()
         .enumerate()
         .map(|(i, c)| (c.id.to_ascii_lowercase(), i))
         .collect();
-    for y_item in yml_catalog {
+    for y_item in enriched_yml {
         let k = y_item.id.to_ascii_lowercase();
         if let Some(&idx) = cat_idx.get(&k) {
             let cur = &mut combined_catalog[idx];
@@ -2221,8 +2611,19 @@ pub fn build_local_agent_models_with(
             if cur.reasoning.is_none() {
                 cur.reasoning = y_item.reasoning;
             }
-            if cur.thinking_levels.is_none() && cur.reasoning != Some(false) {
-                cur.thinking_levels = y_item.thinking_levels;
+            if cur.reasoning != Some(false) {
+                if let Some(ref y_lvls) = y_item.thinking_levels {
+                    if !y_lvls.is_empty()
+                        && (cur
+                            .thinking_levels
+                            .as_ref()
+                            .map(|v| v.is_empty())
+                            .unwrap_or(true)
+                            || !raw_had_explicit_thinking.contains(&k))
+                    {
+                        cur.thinking_levels = Some(y_lvls.clone());
+                    }
+                }
             }
         } else {
             cat_idx.insert(k, combined_catalog.len());
@@ -2250,6 +2651,7 @@ pub fn build_local_agent_models_with(
                     context_window: None,
                     reasoning: None,
                     thinking_levels: None,
+                    effort_model_map: None,
                     source: "current",
                 },
                 false,
@@ -2325,6 +2727,18 @@ pub fn build_local_agent_models_with(
         }
     }
 
+    for item in &mut merged {
+        if item.thinking_levels.is_none() && item.reasoning != Some(false) {
+            let lvls = infer_model_thinking_levels(harness, Some(&item.id), item.reasoning, false);
+            if !lvls.is_empty() {
+                item.reasoning = item.reasoning.or(Some(true));
+                item.thinking_levels = Some(lvls);
+            } else if is_non_reasoning_model_name(&item.id) {
+                item.reasoning = Some(false);
+            }
+        }
+    }
+
     let current_opt = merged.first().filter(|m| m.source == "current");
     let final_model = current_opt
         .map(|m| m.id.clone())
@@ -2345,12 +2759,23 @@ pub fn build_local_agent_models_with(
             Some(levels)
         }
     } else {
-        default_thinking_levels(&h_norm)
-            .map(|lvls| lvls.iter().map(|s| (*s).to_string()).collect())
+        let lvls = infer_model_thinking_levels(
+            harness,
+            final_model.as_deref(),
+            current_opt.and_then(|m| m.reasoning),
+            false,
+        );
+        if lvls.is_empty() {
+            None
+        } else {
+            Some(lvls)
+        }
     };
 
     if is_non_reasoning {
         effective_thinking = None;
+    } else if let Some(ref lvls) = thinking_levels {
+        effective_thinking = clamp_thinking_level(lvls, effective_thinking.as_deref());
     }
 
     let mut result = serde_json::Map::new();
@@ -2765,8 +3190,24 @@ providers:
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert!(levels.contains(&"auto"));
-        assert!(levels.contains(&"xhigh"));
+        assert_eq!(levels, vec!["off", "low", "medium", "high", "xhigh"]);
+
+        let unknown_res = build_local_agent_models_with(
+            "omp",
+            Some("magpie/unknown-custom"),
+            None,
+            Some(&dir),
+            false,
+        );
+        let unknown_levels: Vec<&str> = unknown_res
+            .get("thinkingLevels")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(unknown_levels.contains(&"auto"));
+        assert!(unknown_levels.contains(&"xhigh"));
         assert_eq!(
             res.pointer("/modelRoles/default").and_then(Value::as_str),
             Some("magpie/crosery/gpt-6.2-astra-fast")
@@ -2791,6 +3232,167 @@ providers:
         assert!(saved_raw.contains("theme:\n  light: rose"));
 
         assert!(update_omp_role_model_in_home(&dir, "unknown_slot", "m1").is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_agy_models_with_sibling_effort_groups_and_effort_model_map() {
+        let raw = "\
+gemini-4-neon-high\tGemini 4 Neon (High)\n\
+gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)\n\
+gemini-4-neon-medium\tGemini 4 Neon (Medium)\n\
+gemini-4-neon-low\tGemini 4 Neon (Low)\n\
+gemini-4-carbon-medium\tGemini 4 Carbon (Medium)\n\
+gemini-4-carbon-high\tGemini 4 Carbon (High)\n\
+gemini-4-carbon-low\tGemini 4 Carbon (Low)\n\
+claude-opus-5-5-low\tClaude Opus 5.5 (Low)\n\
+claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)\n\
+claude-opus-5-5-high\tClaude Opus 5.5 (High)\n\
+gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n\
+gemini-pro-orchestrator\tOrchestrator (Carbon)\n\
+claude-3-5-sonnet\tClaude 3.5 Sonnet\n";
+
+        let parsed = parse_agy_models_text(raw);
+        let by_id: HashMap<&str, &ModelOption> =
+            parsed.iter().map(|m| (m.id.as_str(), m)).collect();
+
+        let neon = by_id.get("gemini-4-neon-high").unwrap();
+        assert_eq!(
+            neon.thinking_levels.as_deref(),
+            Some(&["low".into(), "medium".into(), "high".into(), "xhigh".into()][..])
+        );
+        let map = neon.effort_model_map.as_ref().unwrap();
+        assert_eq!(map.get("low").map(String::as_str), Some("gemini-4-neon-low"));
+        assert_eq!(map.get("medium").map(String::as_str), Some("gemini-4-neon-medium"));
+        assert_eq!(map.get("high").map(String::as_str), Some("gemini-4-neon-high"));
+        assert_eq!(map.get("xhigh").map(String::as_str), Some("gemini-4-neon-xhigh"));
+        assert_eq!(neon.reasoning, Some(true));
+
+        assert_eq!(
+            by_id.get("gemini-4-carbon-low").unwrap().thinking_levels.as_deref(),
+            Some(&["low".into(), "medium".into(), "high".into()][..])
+        );
+        assert_eq!(
+            by_id.get("claude-opus-5-5-high").unwrap().thinking_levels.as_deref(),
+            Some(&["low".into(), "medium".into(), "high".into()][..])
+        );
+        assert_eq!(
+            by_id.get("gpt-oss-120b-medium").unwrap().thinking_levels.as_deref(),
+            Some(&["medium".into()][..])
+        );
+        assert_eq!(
+            by_id.get("gemini-pro-orchestrator").unwrap().thinking_levels.as_deref(),
+            Some(&["low".into(), "medium".into(), "high".into(), "xhigh".into(), "max".into()][..])
+        );
+        assert_eq!(by_id.get("claude-3-5-sonnet").unwrap().reasoning, Some(false));
+        assert_eq!(by_id.get("claude-3-5-sonnet").unwrap().thinking_levels, None);
+
+        let json_str = serde_json::to_string(neon).unwrap();
+        assert!(json_str.contains("\"effortModelMap\""));
+    }
+
+    #[test]
+    fn infers_per_model_thinking_levels_and_enriches_omp_models_yml() {
+        assert_eq!(
+            infer_model_thinking_levels("claude", Some("claude-opus-4-6"), None, false),
+            vec!["low", "medium", "high", "max"]
+        );
+        assert_eq!(
+            infer_model_thinking_levels("claude", Some("claude-opus-4-5"), None, false),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(
+            infer_model_thinking_levels("gemini", Some("gemini-2.5-flash"), None, false),
+            vec!["minimal", "low", "medium", "high"]
+        );
+        assert_eq!(
+            infer_model_thinking_levels("gemini", Some("gemini-3.1-pro-preview"), None, false),
+            vec!["low", "high"]
+        );
+        assert_eq!(
+            infer_model_thinking_levels("omp", Some("google/gemma-4-26b-it"), None, false),
+            vec!["high"]
+        );
+        assert_eq!(
+            infer_model_thinking_levels("omp", Some("crosery/k3"), None, false),
+            vec!["low", "high", "max"]
+        );
+        assert_eq!(
+            infer_model_thinking_levels("codex", Some("gpt-5"), None, false),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(
+            infer_model_thinking_levels("codex", Some("gpt-5.4"), None, false),
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        assert!(infer_model_thinking_levels("claude", Some("gpt-4o"), None, false).is_empty());
+        assert!(infer_model_thinking_levels("gemini", Some("gemini-2.0-flash"), None, false).is_empty());
+        assert_eq!(
+            infer_model_thinking_levels("gemini", Some("gemini-2.0-flash-thinking-exp"), None, false),
+            vec!["low", "medium", "high"]
+        );
+
+        let dir = make_temp_dir("omp-yml-enrich");
+        let omp_dir = dir.join(".omp/agent");
+        fs::create_dir_all(&omp_dir).unwrap();
+        fs::write(
+            omp_dir.join("models.yml"),
+            "providers:\n  google:\n    models:\n      - id: gemini-2.5-flash\n        name: Gemini 2.5 Flash\n  magpie:\n    models:\n      - id: crosery/claude-opus-4-6\n        name: Claude Opus 4.6\n      - id: crosery/gpt-4o\n        name: GPT-4o\n",
+        )
+        .unwrap();
+
+        let cached_cli = vec![ModelOption {
+            id: "google/gemini-2.5-flash".into(),
+            label: "Gemini 2.5 Flash".into(),
+            provider: Some("google".into()),
+            context_window: None,
+            reasoning: Some(true),
+            thinking_levels: Some(vec!["minimal".into(), "low".into(), "medium".into(), "high".into()]),
+            effort_model_map: None,
+            source: "catalog",
+        }];
+
+        let flash_res = build_local_agent_models_with_catalog(
+            "omp",
+            Some("google/gemini-2.5-flash"),
+            None,
+            Some(&dir),
+            false,
+            Some(cached_cli),
+        );
+        let flash_lvls: Vec<&str> = flash_res["thinkingLevels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(flash_lvls, vec!["off", "minimal", "low", "medium", "high"]);
+
+        let claude_res = build_local_agent_models_with(
+            "omp",
+            Some("magpie/crosery/claude-opus-4-6"),
+            None,
+            Some(&dir),
+            false,
+        );
+        let claude_lvls: Vec<&str> = claude_res["thinkingLevels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(claude_lvls, vec!["off", "low", "medium", "high", "max"]);
+
+        let gpt4o_res = build_local_agent_models_with(
+            "omp",
+            Some("magpie/crosery/gpt-4o"),
+            None,
+            Some(&dir),
+            false,
+        );
+        assert_eq!(gpt4o_res.get("canSwitchThinking").and_then(Value::as_bool), Some(false));
+        assert!(gpt4o_res.get("thinkingLevels").is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

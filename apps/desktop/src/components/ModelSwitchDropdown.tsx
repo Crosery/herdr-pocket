@@ -4,8 +4,11 @@ import { Brain, Check, ChevronLeft, ChevronRight, Cpu, Search, SlidersHorizontal
 import {
   OMP_MODEL_ROLES,
   OMP_QUICK_ROLE_CHIPS,
+  clampThinkingLevel,
+  findModelOptionForModel,
   inferAgentModelAndThinking,
   normalizeSwitchHarness,
+  resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   type Agent,
   type AgentModelOption,
@@ -85,7 +88,7 @@ export interface ModelSwitchDropdownProps {
   hasReasoningEvents?: boolean;
   initialOmpTab?: "session" | "roles";
   onSelectModel: (modelId: string) => void;
-  onSelectThinking?: (thinkingLevel: string) => void;
+  onSelectThinking?: (thinkingLevel: string, effortModelId?: string) => void;
   onSelectRoleModel?: (slot: OmpModelRole, modelId: string) => void;
   onLoaded?: (res: AgentModelsResult) => void;
 }
@@ -259,28 +262,35 @@ export function ModelSwitchDropdown({
 
   const currentModelOpt = useMemo(
     () =>
-      (data?.models ?? []).find(
-        (m) => resolvedLookupModel && m.id.toLowerCase() === resolvedLookupModel.toLowerCase(),
-      ),
-    [data?.models, resolvedLookupModel],
+      findModelOptionForModel(data?.models, resolvedLookupModel, {
+        harness: agent.harness,
+        modelRoles: data?.modelRoles,
+      }),
+    [data?.models, data?.modelRoles, agent.harness, resolvedLookupModel],
   );
   const thinkingLevels = useMemo(() => {
     if (agent.isShell) return [];
     if (data) {
-      if (currentModelOpt?.reasoning === false && !hasReasoningEvents) return [];
-      const fromData = currentModelOpt?.thinkingLevels?.length
-        ? currentModelOpt.thinkingLevels
-        : data.thinkingLevels ?? [];
-      if (fromData.length > 0) return fromData;
-      if (hasReasoningEvents) return inferred.thinkingLevels ?? [];
-      return [];
+      return resolveThinkingLevelsForModel(
+        {
+          ...data,
+          models: data.models,
+          hasReasoningEvents,
+        },
+        currentModel,
+      );
     }
     return inferred.thinkingLevels ?? [];
-  }, [agent.isShell, data, currentModelOpt, hasReasoningEvents, inferred.thinkingLevels]);
+  }, [agent.isShell, data, currentModel, hasReasoningEvents, inferred.thinkingLevels]);
   const currentThinking =
     thinkingLevels.length === 0
       ? ""
-      : (currentThinkingHint || data?.currentThinking || inferred.currentThinking || "").toLowerCase();
+      : (
+          clampThinkingLevel(
+            thinkingLevels,
+            currentThinkingHint || data?.currentThinking || inferred.currentThinking,
+          ) ?? ""
+        ).toLowerCase();
 
   const filtered = useMemo(() => {
     const list = data?.models ?? [];
@@ -333,8 +343,12 @@ export function ModelSwitchDropdown({
   const commitThinking = (lvl: string) => {
     const clean = lvl.trim();
     if (!clean || !onSelectThinking) return;
-    patchCachedAgentModelMeta(agent.key, { currentThinking: clean });
-    onSelectThinking(clean);
+    const effortModel = currentModelOpt?.effortModelMap?.[clean.toLowerCase()];
+    patchCachedAgentModelMeta(agent.key, {
+      ...(effortModel ? { currentModel: effortModel } : {}),
+      currentThinking: clean,
+    });
+    onSelectThinking(clean, effortModel);
     onOpenChange(false);
   };
 

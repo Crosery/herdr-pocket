@@ -6,13 +6,15 @@ import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  HARNESS_DEFAULT_THINKING_LEVELS,
   OMP_MODEL_ROLES,
   OMP_QUICK_ROLE_CHIPS,
   PUT_LIMITS,
   buildHarnessSwitchCommands,
+  clampThinkingLevel,
+  findModelOptionForModel,
   inferAgentModelAndThinking,
   normalizeSwitchHarness,
+  resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
   type Agent,
@@ -884,26 +886,36 @@ export function Composer({
       ? stripModelEffortSuffix(modelData?.modelRoles?.[effectiveCurrentModel.slice(1).toLowerCase()] ?? effectiveCurrentModel)
       : effectiveCurrentModel;
   const effectiveModelOpt = useMemo(
-    () => (modelData?.models ?? []).find((m) => resolvedLookupModel && m.id.toLowerCase() === resolvedLookupModel.toLowerCase()),
-    [modelData?.models, resolvedLookupModel],
+    () =>
+      findModelOptionForModel(modelData?.models, resolvedLookupModel, {
+        harness: agent.harness,
+        modelRoles: modelData?.modelRoles,
+      }),
+    [modelData?.models, modelData?.modelRoles, agent.harness, resolvedLookupModel],
   );
   const effectiveThinkingLevels = useMemo(() => {
     if (agent.isShell) return [];
     if (modelData) {
-      if (effectiveModelOpt?.reasoning === false && !effectiveHasReasoning) return [];
-      const fromData = effectiveModelOpt?.thinkingLevels?.length ? effectiveModelOpt.thinkingLevels : (modelData.thinkingLevels ?? []);
-      if (fromData.length > 0) return fromData;
-      if (effectiveHasReasoning) {
-        return inferredMeta.thinkingLevels ?? [...(HARNESS_DEFAULT_THINKING_LEVELS[normalizeSwitchHarness(agent.harness)] ?? ["low", "medium", "high"])];
-      }
-      return [];
+      return resolveThinkingLevelsForModel(
+        {
+          ...modelData,
+          models: modelData.models,
+          hasReasoningEvents: effectiveHasReasoning,
+        },
+        effectiveCurrentModel,
+      );
     }
     return inferredMeta.thinkingLevels ?? [];
-  }, [agent.isShell, agent.harness, modelData, effectiveModelOpt, effectiveHasReasoning, inferredMeta.thinkingLevels]);
+  }, [agent.isShell, modelData, effectiveCurrentModel, effectiveHasReasoning, inferredMeta.thinkingLevels]);
   const effectiveCurrentThinking =
     effectiveThinkingLevels.length === 0
       ? ""
-      : (thinkingOverride || modelData?.currentThinking || inferredMeta.currentThinking || "").toLowerCase();
+      : (
+          clampThinkingLevel(
+            effectiveThinkingLevels,
+            thinkingOverride || modelData?.currentThinking || inferredMeta.currentThinking,
+          ) ?? ""
+        ).toLowerCase();
   useEffect(() => {
     if (!online || agent.isShell || (agent.source !== "hc" && agent.source !== "herdr")) return;
     let alive = true;
@@ -1022,7 +1034,17 @@ export function Composer({
         isOmp && cleanModel.startsWith("@")
           ? modelData?.modelRoles?.[cleanModel.slice(1).toLowerCase()]
           : undefined;
-      setModelOverride(stripModelEffortSuffix(resolvedAlias || cleanModel));
+      const nextModelRaw = resolvedAlias || cleanModel;
+      const nextModelClean = stripModelEffortSuffix(nextModelRaw);
+      setModelOverride(nextModelClean);
+      if (!cleanThinking) {
+        const catalog = modelData ?? fallbackModelData;
+        const nextLevels = resolveThinkingLevelsForModel(
+          { ...catalog, models: catalog.models, hasReasoningEvents: effectiveHasReasoning },
+          nextModelClean,
+        );
+        setThinkingOverride(clampThinkingLevel(nextLevels, effectiveCurrentThinking || undefined, nextModelRaw));
+      }
     }
     if (cleanThinking) setThinkingOverride(cleanThinking);
 
@@ -1102,7 +1124,11 @@ export function Composer({
   }
 
   function applyThinkingChoice(thinkingLevel: string) {
-    applyModelOrThinking({ thinkingLevel });
+    const effortModel = effectiveModelOpt?.effortModelMap?.[thinkingLevel.toLowerCase()];
+    applyModelOrThinking({
+      ...(effortModel ? { modelId: effortModel } : {}),
+      thinkingLevel,
+    });
   }
 
   function send() {
@@ -2224,7 +2250,7 @@ export function Composer({
                   disabled={!online}
                   onPress={() => (modelOpen === "model" ? setModelOpen(false) : openModelPicker("model"))}
                   accessibilityRole="button"
-                  accessibilityLabel={(modelOverride || agent.model) ? `当前模型 ${modelOverride || agent.model}，点击切换` : "切换模型"}
+                  accessibilityLabel={effectiveCurrentModel ? `当前模型 ${effectiveCurrentModel}，点击切换` : "切换模型"}
                   style={({ pressed }) => ({
                     height: 36,
                     maxWidth: 145,
@@ -2241,7 +2267,7 @@ export function Composer({
                 >
                   <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
                   <Text numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 12, color: modelOpen === "model" ? p.accentText : p.ink, flexShrink: 1 }}>
-                    {(modelOverride || agent.model) ? (modelOverride || agent.model)!.split("/").pop() : "模型"}
+                    {effectiveCurrentModel ? effectiveCurrentModel.split("/").pop() : "模型"}
                   </Text>
                   <MaterialCommunityIcons name={modelOpen === "model" ? "chevron-up" : "chevron-down"} size={13} color={modelOpen === "model" ? p.accentText : p.muted} />
                 </Pressable>

@@ -6,6 +6,8 @@ import {
   fetchAgentModelsWithFallback,
   getInitialAgentModelsSeed,
   invalidateModelCatalogCache,
+  patchCachedAgentModelMeta,
+  seedModelCatalogCacheForTest,
   updateAgentRoleModel,
 } from "../src/lib/modelCatalogClient.ts";
 
@@ -224,4 +226,84 @@ test("updateAgentRoleModel forwards roleSlot to agent.setModel RPC", async () =>
       modelId: "magpie/crosery/claude-opus-5",
     },
   ]);
+});
+
+test("patchCachedAgentModelMeta dynamically recomputes thinkingLevels, clamps currentThinking, and updates effortModelMap siblings", () => {
+  const agyAgent: Agent = {
+    ...baseAgent,
+    key: "dev-1/hc:agy-1",
+    harness: "antigravity",
+    model: "gemini-4-neon-high",
+  };
+
+  seedModelCatalogCacheForTest(agyAgent, {
+    harness: "antigravity",
+    currentModel: "gemini-4-neon-high",
+    currentThinking: "high",
+    thinkingLevels: ["low", "medium", "high", "xhigh"],
+    canSwitchThinking: true,
+    thinkingLabel: "思考等级",
+    canSwitch: true,
+    models: [
+      {
+        id: "gemini-4-neon-high",
+        label: "Gemini 4 Neon (High)",
+        reasoning: true,
+        thinkingLevels: ["low", "medium", "high", "xhigh"],
+        effortModelMap: {
+          low: "gemini-4-neon-low",
+          medium: "gemini-4-neon-medium",
+          high: "gemini-4-neon-high",
+          xhigh: "gemini-4-neon-xhigh",
+        },
+        source: "current",
+      },
+      {
+        id: "gemini-4-carbon-high",
+        label: "Gemini 4 Carbon (High)",
+        reasoning: true,
+        thinkingLevels: ["low", "medium", "high"],
+        source: "catalog",
+      },
+      {
+        id: "claude-opus-4-6",
+        label: "Claude Opus 4.6",
+        reasoning: true,
+        source: "catalog",
+      },
+      {
+        id: "gpt-4o",
+        label: "GPT-4o",
+        reasoning: false,
+        source: "catalog",
+      },
+    ],
+  });
+
+  // Switching to effortModelMap sibling updates both model & effort
+  patchCachedAgentModelMeta(agyAgent.key, { currentModel: "gemini-4-neon-xhigh", currentThinking: "xhigh" });
+  let snap = getInitialAgentModelsSeed(agyAgent);
+  assert.equal(snap.currentModel, "gemini-4-neon-xhigh");
+  assert.equal(snap.currentThinking, "xhigh");
+  assert.deepEqual(snap.thinkingLevels, ["low", "medium", "high", "xhigh"]);
+
+  // Switching to gemini-4-carbon-high narrows thinkingLevels and clamps xhigh -> high
+  patchCachedAgentModelMeta(agyAgent.key, { currentModel: "gemini-4-carbon-high" });
+  snap = getInitialAgentModelsSeed(agyAgent);
+  assert.equal(snap.currentModel, "gemini-4-carbon-high");
+  assert.equal(snap.currentThinking, "high");
+  assert.deepEqual(snap.thinkingLevels, ["low", "medium", "high"]);
+
+  // Switching to claude-opus-4-6 (even without pre-populated thinkingLevels on option) resolves family levels
+  patchCachedAgentModelMeta(agyAgent.key, { currentModel: "claude-opus-4-6", currentThinking: "max" });
+  snap = getInitialAgentModelsSeed(agyAgent);
+  assert.deepEqual(snap.thinkingLevels, ["low", "medium", "high", "max"]);
+  assert.equal(snap.currentThinking, "max");
+
+  // Switching to non-reasoning gpt-4o clears thinkingLevels & currentThinking
+  patchCachedAgentModelMeta(agyAgent.key, { currentModel: "gpt-4o" });
+  snap = getInitialAgentModelsSeed(agyAgent);
+  assert.equal(snap.thinkingLevels, undefined);
+  assert.equal(snap.canSwitchThinking, false);
+  assert.equal(snap.currentThinking, undefined);
 });

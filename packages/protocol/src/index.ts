@@ -796,6 +796,7 @@ export interface AgentModelOption {
   contextWindow?: number;
   reasoning?: boolean;
   thinkingLevels?: string[];
+  effortModelMap?: Partial<Record<AgentThinkingLevel, string>>;
   source: "current" | "recent" | "catalog";
 }
 
@@ -822,22 +823,38 @@ import {
   HARNESS_DEFAULT_THINKING_LEVELS,
   OMP_MODEL_ROLES,
   OMP_QUICK_ROLE_CHIPS,
+  clampThinkingLevel,
+  extractModelExplicitEffort,
+  findModelOptionForModel,
   inferAgentModelAndThinking,
+  inferModelThinkingLevels,
+  isNonReasoningModelName,
   normalizeSwitchHarness,
+  resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
+  type AgentThinkingLevel,
   type OmpModelRole,
+  type ResolveThinkingLevelsInput,
 } from "./modelsMeta.ts";
 
 export {
   HARNESS_DEFAULT_THINKING_LEVELS,
   OMP_MODEL_ROLES,
   OMP_QUICK_ROLE_CHIPS,
+  clampThinkingLevel,
+  extractModelExplicitEffort,
+  findModelOptionForModel,
   inferAgentModelAndThinking,
+  inferModelThinkingLevels,
+  isNonReasoningModelName,
   normalizeSwitchHarness,
+  resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
+  type AgentThinkingLevel,
   type OmpModelRole,
+  type ResolveThinkingLevelsInput,
 };
 
 /** Builds per-harness slash commands / keys to switch model and/or thinking effort cleanly. */

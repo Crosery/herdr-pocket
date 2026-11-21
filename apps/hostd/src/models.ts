@@ -15,15 +15,19 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
-  HARNESS_DEFAULT_THINKING_LEVELS,
   OMP_MODEL_ROLES,
   buildHarnessSwitchCommands,
+  clampThinkingLevel,
   inferAgentModelAndThinking,
+  inferModelThinkingLevels,
+  isNonReasoningModelName,
   normalizeSwitchHarness,
+  resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   type Agent,
   type AgentModelOption,
   type AgentModelsResult,
+  type AgentThinkingLevel,
   type OmpModelRole,
 } from "@herdr-pocket/protocol";
 import { findPrograms } from "./create.ts";
@@ -347,19 +351,67 @@ export function readOmpModelsYml(homeDir = homedir()): AgentModelOption[] {
   }
 }
 
-/** Parses `agy models` (`<id>\t<label>`) output. */
+const AGY_EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const AGY_EFFORT_SUFFIX_RE = /^(.+)-(minimal|low|medium|high|xhigh|max)$/i;
+
+/** Parses `agy models` (`<id>\t<label>`) output and groups sibling effort variants by stem. */
 export function parseAgyModelsText(raw: string): AgentModelOption[] {
-  const out: AgentModelOption[] = [];
+  const entries: Array<{ id: string; label: string; stem?: string }> = [];
+  const groups = new Map<string, Map<string, string>>();
+
   for (const line of raw.split(/\r?\n/)) {
     const clean = line.trim();
-    if (!clean || /^model\b/i.test(clean) && !clean.includes("\t")) continue;
+    if (!clean || (/^model\b/i.test(clean) && !clean.includes("\t"))) continue;
     const [idPart, labelPart] = clean.split("\t");
     const id = idPart?.trim();
     if (!id || /\s/.test(id)) continue;
     const label = labelPart?.trim() || id;
-    out.push({ id, label, provider: "antigravity", source: "catalog" });
+    const m = AGY_EFFORT_SUFFIX_RE.exec(id);
+    if (m?.[1] && m[2]) {
+      const stem = m[1].toLowerCase();
+      const effort = m[2].toLowerCase();
+      let map = groups.get(stem);
+      if (!map) {
+        map = new Map();
+        groups.set(stem, map);
+      }
+      if (!map.has(effort)) map.set(effort, id);
+      entries.push({ id, label, stem });
+    } else {
+      entries.push({ id, label });
+    }
   }
-  return out;
+
+  return entries.map((e) => {
+    const stemKey = e.stem ?? e.id.toLowerCase();
+    const siblingMap = groups.get(stemKey);
+    if (siblingMap && siblingMap.size > 0) {
+      const thinkingLevels = AGY_EFFORT_ORDER.filter((lvl) => siblingMap.has(lvl));
+      const effortModelMap: Partial<Record<AgentThinkingLevel, string>> = {};
+      for (const lvl of thinkingLevels) {
+        const target = siblingMap.get(lvl);
+        if (target) effortModelMap[lvl] = target;
+      }
+      return {
+        id: e.id,
+        label: e.label,
+        provider: "antigravity",
+        reasoning: thinkingLevels.length > 0,
+        ...(thinkingLevels.length > 0 ? { thinkingLevels: [...thinkingLevels], effortModelMap } : {}),
+        source: "catalog",
+      };
+    }
+
+    const inferred = inferModelThinkingLevels("antigravity", e.id);
+    return {
+      id: e.id,
+      label: e.label,
+      provider: "antigravity",
+      reasoning: inferred.length > 0,
+      ...(inferred.length > 0 ? { thinkingLevels: inferred } : {}),
+      source: "catalog",
+    };
+  });
 }
 
 function parseContextTokenUnit(raw: string | undefined): number | undefined {
@@ -1211,6 +1263,40 @@ export async function readSessionLiveModelAndThinking(opts: {
   };
 }
 
+function prependOmpOff(levels: readonly string[]): string[] {
+  return levels.some((l) => l.toLowerCase() === "off") ? [...levels] : ["off", ...levels];
+}
+
+function enrichOmpYmlEntry(
+  yItem: AgentModelOption,
+  cachedOmpCatalog: readonly AgentModelOption[],
+): AgentModelOption {
+  if (yItem.reasoning === false || yItem.thinkingLevels?.length) {
+    return yItem;
+  }
+  const exact = cachedOmpCatalog.find((c) => c.id.toLowerCase() === yItem.id.toLowerCase());
+  const cachedMatch = exact ?? (cachedOmpCatalog.length > 0 ? findCatalogMatch(yItem.id, cachedOmpCatalog) : undefined);
+  if (cachedMatch?.reasoning === false) {
+    return { ...yItem, reasoning: false };
+  }
+  if (cachedMatch?.thinkingLevels?.length) {
+    return {
+      ...yItem,
+      reasoning: yItem.reasoning ?? true,
+      thinkingLevels: prependOmpOff(cachedMatch.thinkingLevels),
+    };
+  }
+  const inferred = inferModelThinkingLevels("oh-my-pi", yItem.id, { reasoning: yItem.reasoning });
+  if (inferred.length === 0) {
+    return { ...yItem, reasoning: false };
+  }
+  return {
+    ...yItem,
+    reasoning: yItem.reasoning ?? true,
+    thinkingLevels: prependOmpOff(inferred),
+  };
+}
+
 export async function getAgentModels(
   agent: Agent,
   opts: {
@@ -1329,24 +1415,35 @@ export async function getAgentModels(
     inferred.currentThinking ||
     undefined;
 
+  const cachedOmpCatalog = hNorm === "omp" ? (catalog.length > 0 ? catalog : (cliCatalogCache.get("omp")?.models ?? [])) : [];
+  const rawHadExplicitThinking = new Set(
+    ymlCatalog.filter((y) => Boolean(y.thinkingLevels?.length)).map((y) => y.id.toLowerCase()),
+  );
+  const enrichedYmlCatalog = hNorm === "omp" ? ymlCatalog.map((y) => enrichOmpYmlEntry(y, cachedOmpCatalog)) : ymlCatalog;
+
   const combinedCatalog: AgentModelOption[] = catalog.map((c) => ({ ...c }));
   const catIdx = new Map<string, number>();
   for (let i = 0; i < combinedCatalog.length; i++) {
     catIdx.set(combinedCatalog[i]!.id.toLowerCase(), i);
   }
-  for (const yItem of ymlCatalog) {
-    const existingIdx = catIdx.get(yItem.id.toLowerCase());
+  for (const yItem of enrichedYmlCatalog) {
+    const yKey = yItem.id.toLowerCase();
+    const existingIdx = catIdx.get(yKey);
     if (existingIdx !== undefined) {
       const cur = combinedCatalog[existingIdx]!;
+      const shouldUseEnrichedThinking =
+        cur.reasoning !== false &&
+        Boolean(yItem.thinkingLevels?.length) &&
+        (!cur.thinkingLevels?.length || !rawHadExplicitThinking.has(yKey));
       combinedCatalog[existingIdx] = {
         ...cur,
         ...(cur.provider ? {} : yItem.provider ? { provider: yItem.provider } : {}),
         ...(cur.contextWindow ? {} : yItem.contextWindow ? { contextWindow: yItem.contextWindow } : {}),
         ...(cur.reasoning !== undefined ? {} : yItem.reasoning !== undefined ? { reasoning: yItem.reasoning } : {}),
-        ...(cur.thinkingLevels?.length || cur.reasoning === false ? {} : yItem.thinkingLevels?.length ? { thinkingLevels: yItem.thinkingLevels } : {}),
+        ...(shouldUseEnrichedThinking ? { thinkingLevels: yItem.thinkingLevels } : {}),
       };
     } else {
-      catIdx.set(yItem.id.toLowerCase(), combinedCatalog.length);
+      catIdx.set(yKey, combinedCatalog.length);
       combinedCatalog.push(yItem);
     }
   }
@@ -1424,28 +1521,38 @@ export async function getAgentModels(
     }
   }
 
-  const currentOpt = merged[0]?.source === "current" ? merged[0] : undefined;
-  const isNonReasoning =
-    !opts.hasReasoningEvents &&
-    (currentOpt?.reasoning === false ||
-      (currentOpt?.reasoning === undefined && inferred.thinkingLevels !== undefined && inferred.thinkingLevels.length === 0));
+  for (let i = 0; i < merged.length; i++) {
+    const item = merged[i]!;
+    if (item.thinkingLevels === undefined && item.reasoning !== false) {
+      const itemLevels = inferModelThinkingLevels(agent.harness, item.id, {
+        reasoning: item.reasoning,
+        hasReasoningEvents: i === 0 ? opts.hasReasoningEvents : undefined,
+      });
+      if (itemLevels.length > 0) {
+        merged[i] = { ...item, reasoning: item.reasoning ?? true, thinkingLevels: itemLevels };
+      } else if (!(i === 0 && opts.hasReasoningEvents) && isNonReasoningModelName(item.id)) {
+        merged[i] = { ...item, reasoning: false };
+      }
+    }
+  }
 
-  const defaultThinkingLevels = HARNESS_DEFAULT_THINKING_LEVELS[hNorm]
-    ? [...HARNESS_DEFAULT_THINKING_LEVELS[hNorm]]
-    : opts.hasReasoningEvents
-      ? ["low", "medium", "high"]
-      : undefined;
-  const thinkingLevels = isNonReasoning
-    ? undefined
-    : currentOpt?.thinkingLevels?.length
-      ? currentOpt.thinkingLevels
-      : defaultThinkingLevels;
-
-  if (isNonReasoning) currentThinking = undefined;
+  const finalModel = merged[0]?.source === "current" ? merged[0].id : currentModel;
+  const resolvedThinkingLevels = resolveThinkingLevelsForModel(
+    {
+      harness: agent.harness,
+      models: merged,
+      currentModel: finalModel,
+      modelRoles: hNorm === "omp" ? ompLocal.modelRoles : undefined,
+      hasReasoningEvents: opts.hasReasoningEvents,
+    },
+    finalModel,
+  );
+  const thinkingLevels = resolvedThinkingLevels.length > 0 ? resolvedThinkingLevels : undefined;
+  currentThinking = thinkingLevels ? clampThinkingLevel(thinkingLevels, currentThinking) : undefined;
 
   return {
     harness: agent.harness,
-    ...(merged[0]?.source === "current" ? { currentModel: merged[0].id } : currentModel ? { currentModel } : {}),
+    ...(finalModel ? { currentModel: finalModel } : {}),
     ...(currentThinking ? { currentThinking } : {}),
     ...(thinkingLevels?.length ? { thinkingLevels, canSwitchThinking: canSwitch, thinkingLabel: "思考等级" } : { canSwitchThinking: false }),
     canSwitch,
@@ -1503,6 +1610,7 @@ export interface SwitchTransport {
     keys: (localId: string, keys: string[]) => Promise<void>;
   };
   homeDir?: string;
+  agyCatalog?: AgentModelOption[];
 }
 
 /** Switches an active agent's model, thinking effort, or OMP role slot across all supported harnesses. */
@@ -1511,10 +1619,10 @@ export async function setAgentModelAndThinking(
   opts: { modelId?: string; thinkingLevel?: string; roleSlot?: OmpModelRole },
   transport: SwitchTransport,
 ): Promise<{ currentModel?: string; currentThinking?: string; modelRoles?: Record<string, string>; note?: string }> {
-  const modelId = opts.modelId?.trim() || undefined;
-  const thinkingLevel = opts.thinkingLevel?.trim().toLowerCase() || undefined;
+  const rawModelId = opts.modelId?.trim() || undefined;
+  const rawThinkingLevel = opts.thinkingLevel?.trim().toLowerCase() || undefined;
   const roleSlot = opts.roleSlot;
-  if (!modelId && !thinkingLevel && !roleSlot) throw new Error("需要指定模型或思考等级");
+  if (!rawModelId && !rawThinkingLevel && !roleSlot) throw new Error("需要指定模型或思考等级");
   if (agent.isShell || (agent.source !== "hc" && agent.source !== "herdr")) {
     throw new Error("当前会话不支持切换模型或思考等级");
   }
@@ -1526,15 +1634,50 @@ export async function setAgentModelAndThinking(
     if (hNorm !== "omp") {
       throw new Error("仅 OMP 会话支持角色模型配置");
     }
-    if (!modelId) {
+    if (!rawModelId) {
       throw new Error("设置角色模型需要指定模型 ID");
     }
-    const selector = thinkingLevel ? `${stripModelEffortSuffix(modelId)}:${thinkingLevel}` : modelId;
+    const selector = rawThinkingLevel ? `${stripModelEffortSuffix(rawModelId)}:${rawThinkingLevel}` : rawModelId;
     const modelRoles = updateOmpRoleModel(home, roleSlot, selector);
     return {
       modelRoles,
       note: `已更新 OMP 角色 ${roleSlot} -> ${selector}`,
     };
+  }
+
+  let modelId = rawModelId;
+  const thinkingLevel = rawThinkingLevel;
+
+  if (hNorm === "antigravity" && thinkingLevel) {
+    const baseCandidate = modelId || agent.model?.trim() || "";
+    const stemMatch = AGY_EFFORT_SUFFIX_RE.exec(baseCandidate);
+    const stem = stemMatch?.[1] || baseCandidate;
+    if (stem) {
+      const cachedAgy =
+        transport.agyCatalog ??
+        cliCatalogCache.get("antigravity")?.models ??
+        (stemMatch ? undefined : await getAgyCatalog().catch(() => []));
+      const targetLower = `${stem}-${thinkingLevel}`.toLowerCase();
+      const exactSibling = cachedAgy?.find((m) => m.id.toLowerCase() === targetLower);
+      const siblingId = exactSibling
+        ? exactSibling.id
+        : cachedAgy
+            ?.map((m) => m.effortModelMap?.[thinkingLevel as AgentThinkingLevel])
+            .find((v) => v?.toLowerCase() === targetLower);
+      if (siblingId) {
+        modelId = siblingId;
+      } else if (stemMatch && (!cachedAgy || cachedAgy.length === 0)) {
+        const allowed = inferModelThinkingLevels("antigravity", baseCandidate);
+        if (allowed.includes(thinkingLevel)) {
+          modelId = `${stem}-${thinkingLevel}`;
+        }
+      }
+    }
+  } else if (hNorm === "gemini" && thinkingLevel && !modelId && agent.model?.trim()) {
+    const baseAgentModel = agent.model.trim();
+    if (/-(low|medium|high)$/i.test(baseAgentModel) && ["low", "medium", "high"].includes(thinkingLevel)) {
+      modelId = baseAgentModel.replace(/-(low|medium|high)$/i, `-${thinkingLevel}`);
+    }
   }
 
   const plan = buildHarnessSwitchCommands(agent.harness, { modelId, thinkingLevel });
@@ -1684,6 +1827,10 @@ export async function setAgentModelAndThinking(
       if (split.id) resolvedModel = split.id;
       if (!resolvedThinking && split.effort) resolvedThinking = split.effort;
     }
+  }
+  if (!resolvedThinking && resolvedModel && (hNorm === "antigravity" || hNorm === "gemini")) {
+    const hm = AGY_EFFORT_SUFFIX_RE.exec(resolvedModel);
+    if (hm?.[2]) resolvedThinking = hm[2].toLowerCase();
   }
 
   return {

@@ -8,6 +8,7 @@ import {
   clearModelsCacheForTest,
   findCatalogMatch,
   getAgentModels,
+  parseAgyModelsText,
   parseOmpModelsJson,
   parseOmpModelsYml,
   readOmpLocalConfig,
@@ -546,7 +547,7 @@ test("getAgentModels returns immediately from models.yml/config.yml/agent.db wit
     assert.equal(res.currentModel, "magpie/crosery/mimo-v2.6-pro");
     assert.equal(res.currentThinking, "xhigh");
     assert.equal(res.canSwitchThinking, true);
-    assert.deepEqual(res.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]);
+    assert.deepEqual(res.thinkingLevels, ["off", "low", "medium", "high", "xhigh"]);
     assert.deepEqual(res.modelRoles, {
       default: "magpie/crosery/mimo-v2.6-pro",
       smol: "magpie/crosery/gpt-6.2-sol-ultrafast",
@@ -632,6 +633,175 @@ test("updateOmpRoleModel safely edits config.yml preserving comments/keys, and s
     assert.deepEqual(sent, ["/switch @slow"]);
     assert.equal(switchAliasRes.currentModel, "magpie/crosery/claude-opus-5");
     assert.equal(switchAliasRes.currentThinking, "xhigh");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("parseAgyModelsText groups effort-suffixed siblings with effortModelMap and exact ordered levels", () => {
+  const raw = [
+    "gemini-4-neon-high\tGemini 4 Neon (High)",
+    "gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)",
+    "gemini-4-neon-medium\tGemini 4 Neon (Medium)",
+    "gemini-4-neon-low\tGemini 4 Neon (Low)",
+    "gemini-4-carbon-medium\tGemini 4 Carbon (Medium)",
+    "gemini-4-carbon-high\tGemini 4 Carbon (High)",
+    "gemini-4-carbon-low\tGemini 4 Carbon (Low)",
+    "claude-opus-5-5-low\tClaude Opus 5.5 (Low)",
+    "claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)",
+    "claude-opus-5-5-high\tClaude Opus 5.5 (High)",
+    "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)",
+    "gemini-pro-orchestrator\tOrchestrator (Carbon)",
+    "claude-3-5-sonnet\tClaude 3.5 Sonnet",
+  ].join("\n");
+
+  const parsed = parseAgyModelsText(raw);
+  const byId = new Map(parsed.map((m) => [m.id, m]));
+
+  const neonHigh = byId.get("gemini-4-neon-high");
+  assert.deepEqual(neonHigh?.thinkingLevels, ["low", "medium", "high", "xhigh"]);
+  assert.deepEqual(neonHigh?.effortModelMap, {
+    low: "gemini-4-neon-low",
+    medium: "gemini-4-neon-medium",
+    high: "gemini-4-neon-high",
+    xhigh: "gemini-4-neon-xhigh",
+  });
+  assert.equal(neonHigh?.reasoning, true);
+
+  assert.deepEqual(byId.get("gemini-4-carbon-low")?.thinkingLevels, ["low", "medium", "high"]);
+  assert.deepEqual(byId.get("claude-opus-5-5-high")?.thinkingLevels, ["low", "medium", "high"]);
+  assert.deepEqual(byId.get("gpt-oss-120b-medium")?.thinkingLevels, ["medium"]);
+  assert.deepEqual(byId.get("gpt-oss-120b-medium")?.effortModelMap, { medium: "gpt-oss-120b-medium" });
+  assert.deepEqual(byId.get("gemini-pro-orchestrator")?.thinkingLevels, ["low", "medium", "high", "xhigh", "max"]);
+  assert.equal(byId.get("claude-3-5-sonnet")?.reasoning, false);
+  assert.equal(byId.get("claude-3-5-sonnet")?.thinkingLevels, undefined);
+});
+
+test("setAgentModelAndThinking switches antigravity sibling model and returns synced currentModel & currentThinking", async () => {
+  const sent: string[] = [];
+  const agyCatalog = parseAgyModelsText(
+    [
+      "gemini-4-neon-low\tGemini 4 Neon (Low)",
+      "gemini-4-neon-medium\tGemini 4 Neon (Medium)",
+      "gemini-4-neon-high\tGemini 4 Neon (High)",
+      "gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)",
+      "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)",
+    ].join("\n"),
+  );
+
+  const agyAgent: Agent = { ...hcAgent, harness: "antigravity", model: "gemini-4-neon-high" };
+  const res = await setAgentModelAndThinking(
+    agyAgent,
+    { thinkingLevel: "xhigh" },
+    {
+      agyCatalog,
+      hc: {
+        send: async (_addr, text) => { sent.push(text); },
+        input: async () => {},
+        keys: async () => {},
+        snapshotText: async () => "",
+      },
+    },
+  );
+  assert.deepEqual(sent, ["/model gemini-4-neon-xhigh", "/effort xhigh"]);
+  assert.equal(res.currentModel, "gemini-4-neon-xhigh");
+  assert.equal(res.currentThinking, "xhigh");
+
+  // Also works via stem fallback when catalog wasn't pre-populated
+  sent.length = 0;
+  const fallbackRes = await setAgentModelAndThinking(
+    { ...hcAgent, harness: "antigravity", model: "claude-opus-5-5-low" },
+    { thinkingLevel: "high" },
+    {
+      hc: {
+        send: async (_addr, text) => { sent.push(text); },
+        input: async () => {},
+        keys: async () => {},
+        snapshotText: async () => "",
+      },
+    },
+  );
+  assert.deepEqual(sent, ["/model claude-opus-5-5-high", "/effort high"]);
+  assert.equal(fallbackRes.currentModel, "claude-opus-5-5-high");
+  assert.equal(fallbackRes.currentThinking, "high");
+
+  // Selecting an effort-suffixed model without thinkingLevel syncs currentThinking
+  sent.length = 0;
+  const modelOnlyRes = await setAgentModelAndThinking(
+    agyAgent,
+    { modelId: "gemini-4-neon-low" },
+    {
+      agyCatalog,
+      hc: {
+        send: async (_addr, text) => { sent.push(text); },
+        input: async () => {},
+        keys: async () => {},
+        snapshotText: async () => "",
+      },
+    },
+  );
+  assert.deepEqual(sent, ["/model gemini-4-neon-low"]);
+  assert.equal(modelOnlyRes.currentModel, "gemini-4-neon-low");
+  assert.equal(modelOnlyRes.currentThinking, "low");
+});
+
+test("OMP models.yml enrichment uses cached omp models --json else inferModelThinkingLevels with prepended off", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pocket-omp-enrich-"));
+  try {
+    const ompAgentDir = join(dir, ".omp", "agent");
+    mkdirSync(ompAgentDir, { recursive: true });
+    writeFileSync(
+      join(ompAgentDir, "models.yml"),
+      [
+        "providers:",
+        "  google:",
+        "    models:",
+        "      - id: gemini-2.5-flash",
+        "        name: Gemini 2.5 Flash",
+        "      - id: gemini-1.5-flash",
+        "        name: Gemini 1.5 Flash",
+        "  magpie:",
+        "    models:",
+        "      - id: crosery/claude-opus-4-6",
+        "        name: Claude Opus 4.6",
+        "      - id: crosery/gpt-4o",
+        "        name: GPT-4o",
+      ].join("\n"),
+    );
+
+    const flashRes = await getAgentModels(
+      { ...hcAgent, model: "google/gemini-2.5-flash" },
+      {
+        homeDir: dir,
+        unifloReady: false,
+        async readCatalog() {
+          return [
+            {
+              id: "google/gemini-2.5-flash",
+              label: "Gemini 2.5 Flash",
+              provider: "google",
+              reasoning: true,
+              thinkingLevels: ["minimal", "low", "medium", "high"],
+              source: "catalog",
+            },
+          ];
+        },
+      },
+    );
+    assert.deepEqual(flashRes.thinkingLevels, ["off", "minimal", "low", "medium", "high"]);
+
+    const claudeRes = await getAgentModels(
+      { ...hcAgent, model: "magpie/crosery/claude-opus-4-6" },
+      { homeDir: dir, unifloReady: false, readCatalog: async () => [] },
+    );
+    assert.deepEqual(claudeRes.thinkingLevels, ["off", "low", "medium", "high", "max"]);
+
+    const nonReasonRes = await getAgentModels(
+      { ...hcAgent, model: "magpie/crosery/gpt-4o" },
+      { homeDir: dir, unifloReady: false, readCatalog: async () => [] },
+    );
+    assert.equal(nonReasonRes.canSwitchThinking, false);
+    assert.equal(nonReasonRes.thinkingLevels, undefined);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

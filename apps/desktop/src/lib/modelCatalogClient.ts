@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  HARNESS_DEFAULT_THINKING_LEVELS,
+  clampThinkingLevel,
+  findModelOptionForModel,
   inferAgentModelAndThinking,
   normalizeSwitchHarness,
+  resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
   type Agent,
@@ -104,6 +106,17 @@ export function invalidateModelCatalogCache(agentKey?: string): void {
   else modelsCache.clear();
 }
 
+/** Seeds a cached catalog entry (for unit tests exercising `patchCachedAgentModelMeta` / `useAutoAgentModelMeta`). */
+export function seedModelCatalogCacheForTest(agent: Agent, res: AgentModelsResult): void {
+  modelsCache.set(agent.key, {
+    at: Date.now(),
+    ttl: CACHE_TTL_MS,
+    model: agent.model ?? "",
+    sessionKey: agent.sessionKey ?? "",
+    res,
+  });
+}
+
 /** Optimistically updates cached model/thinking/role metadata after a user switch. */
 export function patchCachedAgentModelMeta(
   agentKey: string,
@@ -112,23 +125,31 @@ export function patchCachedAgentModelMeta(
   const entry = modelsCache.get(agentKey);
   if (!entry) return;
   const nextModel = patch.currentModel ? stripModelEffortSuffix(patch.currentModel) : entry.res.currentModel;
-  const nextThinking = patch.currentThinking?.trim().toLowerCase() || entry.res.currentThinking;
-  const matchedOpt = nextModel
-    ? entry.res.models.find((m) => m.id.toLowerCase() === nextModel.toLowerCase())
-    : undefined;
-  const isNonReasoning = matchedOpt?.reasoning === false;
   const nextRoles = patch.modelRoles
     ? { ...(entry.res.modelRoles ?? {}), ...patch.modelRoles }
     : entry.res.modelRoles;
+  const resolvedLevels = resolveThinkingLevelsForModel(
+    {
+      ...entry.res,
+      currentModel: nextModel,
+      modelRoles: nextRoles,
+    },
+    nextModel,
+  );
+  const nextThinking = patch.currentThinking
+    ? clampThinkingLevel(resolvedLevels, patch.currentThinking)
+    : clampThinkingLevel(
+        resolvedLevels,
+        entry.res.currentThinking,
+        patch.currentModel,
+      );
   entry.res = {
     ...entry.res,
     ...(nextModel ? { currentModel: nextModel } : {}),
-    ...(isNonReasoning
-      ? { currentThinking: undefined, thinkingLevels: undefined, canSwitchThinking: false }
-      : nextThinking
-        ? { currentThinking: nextThinking }
-        : {}),
-    ...(matchedOpt?.thinkingLevels?.length ? { thinkingLevels: matchedOpt.thinkingLevels, canSwitchThinking: entry.res.canSwitch } : {}),
+    currentThinking: nextThinking,
+    thinkingLevels: resolvedLevels.length ? resolvedLevels : undefined,
+    canSwitchThinking: resolvedLevels.length > 0 ? entry.res.canSwitch : false,
+    ...(resolvedLevels.length ? { thinkingLabel: entry.res.thinkingLabel || "思考等级" } : {}),
     ...(nextRoles ? { modelRoles: nextRoles } : {}),
   };
 }
@@ -150,11 +171,14 @@ function applyReasoningEventsFallback(
   hasReasoningEvents?: boolean,
 ): AgentModelsResult {
   if (!hasReasoningEvents || agent.isShell || res.thinkingLevels?.length) return res;
-  const hNorm = normalizeSwitchHarness(agent.harness);
-  const fallbackLevels = HARNESS_DEFAULT_THINKING_LEVELS[hNorm] ?? ["low", "medium", "high"];
+  const fallbackLevels = resolveThinkingLevelsForModel(
+    { ...res, harness: agent.harness, hasReasoningEvents: true },
+    res.currentModel,
+  );
+  if (fallbackLevels.length === 0) return res;
   return {
     ...res,
-    thinkingLevels: [...fallbackLevels],
+    thinkingLevels: fallbackLevels,
     canSwitchThinking: res.canSwitch,
     thinkingLabel: res.thinkingLabel || "思考等级",
   };
@@ -170,15 +194,43 @@ function mergeAgentModelsResults(primary: AgentModelsResult, secondary: AgentMod
       extra.push(m);
     }
   }
-  const thinkingLevels = primary.thinkingLevels?.length ? primary.thinkingLevels : secondary.thinkingLevels;
+  const models = [...primary.models, ...extra];
   const modelRoles = primary.modelRoles ?? secondary.modelRoles;
+  const currentModel = primary.currentModel ?? secondary.currentModel;
+  const matchedOpt = findModelOptionForModel(models, currentModel, {
+    harness: primary.harness,
+    modelRoles,
+  });
+  const thinkingLevels =
+    matchedOpt?.reasoning === false
+      ? []
+      : matchedOpt?.thinkingLevels?.length
+        ? [...matchedOpt.thinkingLevels]
+        : primary.currentModel && primary.thinkingLevels?.length
+          ? [...primary.thinkingLevels]
+          : resolveThinkingLevelsForModel(
+              {
+                harness: primary.harness,
+                models,
+                currentModel,
+                modelRoles,
+                thinkingLevels: secondary.thinkingLevels,
+              },
+              currentModel,
+            );
+  const currentThinking = clampThinkingLevel(
+    thinkingLevels,
+    primary.currentThinking ?? secondary.currentThinking,
+  );
   return {
     ...primary,
-    ...(thinkingLevels?.length
+    ...(currentModel ? { currentModel } : {}),
+    currentThinking,
+    ...(thinkingLevels.length
       ? { thinkingLevels, canSwitchThinking: primary.canSwitchThinking || primary.canSwitch, thinkingLabel: primary.thinkingLabel || secondary.thinkingLabel || "思考等级" }
-      : {}),
+      : { thinkingLevels: undefined, canSwitchThinking: false }),
     ...(modelRoles ? { modelRoles } : {}),
-    models: [...primary.models, ...extra],
+    models,
   };
 }
 
@@ -196,13 +248,32 @@ function normalizeLocalResultForAgent(
   const { modelRoles, ...rest } = raw;
   const isRemote = Boolean(opts?.isRemoteHost);
   const inferred = isRemote && agent.model ? inferAgentModelAndThinking(agent.harness, agent.model) : undefined;
+  const nextModel = inferred?.currentModel || raw.currentModel;
+  const nextLevels =
+    isRemote && agent.model
+      ? resolveThinkingLevelsForModel(
+          {
+            ...raw,
+            harness: agent.harness,
+            currentModel: nextModel,
+            modelRoles: undefined,
+          },
+          nextModel,
+        )
+      : (raw.thinkingLevels ?? []);
+  const nextThinking =
+    isRemote && agent.model
+      ? clampThinkingLevel(nextLevels, inferred?.currentThinking ?? raw.currentThinking, agent.model)
+      : raw.currentThinking;
   return {
     ...rest,
     ...(isRemote ? {} : modelRoles ? { modelRoles } : {}),
-    ...(inferred?.currentModel ? { currentModel: inferred.currentModel } : {}),
+    ...(nextModel ? { currentModel: nextModel } : {}),
+    ...(nextThinking ? { currentThinking: nextThinking } : { currentThinking: undefined }),
+    ...(nextLevels.length ? { thinkingLevels: nextLevels } : { thinkingLevels: undefined }),
     harness: agent.harness,
     canSwitch,
-    canSwitchThinking: canSwitch && Boolean(raw.thinkingLevels?.length),
+    canSwitchThinking: canSwitch && nextLevels.length > 0,
     ...(reason ? { reason } : {}),
   };
 }
@@ -498,6 +569,7 @@ export interface AutoAgentModelMeta {
   currentThinking?: string;
   thinkingLevels?: string[];
   models?: AgentModelOption[];
+  activeModelOption?: AgentModelOption;
   modelRoles?: Record<string, string>;
   canSwitch?: boolean;
   canSwitchThinking?: boolean;
@@ -533,6 +605,7 @@ export function useAutoAgentModelMeta(
     key: string;
     currentModel?: string;
     currentThinking?: string;
+    fallbackThinkingCandidate?: string;
     modelRoles?: Record<string, string>;
   } | null>(null);
 
@@ -565,16 +638,42 @@ export function useAutoAgentModelMeta(
   const applyOverride = useCallback(
     (patch: { currentModel?: string; currentThinking?: string; modelRoles?: Record<string, string> }) => {
       patchCachedAgentModelMeta(agent.key, patch);
-      setOverride((prev) => ({
-        key: agent.key,
-        currentModel: patch.currentModel ? stripModelEffortSuffix(patch.currentModel) : prev?.key === agent.key ? prev.currentModel : undefined,
-        currentThinking: patch.currentThinking?.trim().toLowerCase() || (prev?.key === agent.key ? prev.currentThinking : undefined),
-        modelRoles: patch.modelRoles
-          ? { ...(prev?.key === agent.key ? prev.modelRoles : undefined), ...patch.modelRoles }
-          : prev?.key === agent.key
-            ? prev.modelRoles
-            : undefined,
-      }));
+      setOverride((prev) => {
+        const sameKey = prev?.key === agent.key;
+        const nextModel = patch.currentModel
+          ? stripModelEffortSuffix(patch.currentModel)
+          : sameKey
+            ? prev.currentModel
+            : undefined;
+        const explicitThinking = patch.currentThinking?.trim().toLowerCase() || undefined;
+        const nextThinking = explicitThinking
+          ? explicitThinking
+          : patch.currentModel
+            ? undefined
+            : sameKey
+              ? prev.currentThinking
+              : undefined;
+        const nextFallbackCandidate = explicitThinking
+          ? undefined
+          : patch.currentModel
+            ? sameKey
+              ? (prev.currentThinking ?? prev.fallbackThinkingCandidate)
+              : undefined
+            : sameKey
+              ? prev.fallbackThinkingCandidate
+              : undefined;
+        return {
+          key: agent.key,
+          currentModel: nextModel,
+          currentThinking: nextThinking,
+          fallbackThinkingCandidate: nextFallbackCandidate,
+          modelRoles: patch.modelRoles
+            ? { ...(sameKey ? prev.modelRoles : undefined), ...patch.modelRoles }
+            : sameKey
+              ? prev.modelRoles
+              : undefined,
+        };
+      });
     },
     [agent.key],
   );
@@ -596,43 +695,49 @@ export function useAutoAgentModelMeta(
   const currentModel =
     activeOverride?.currentModel || activeFetched?.currentModel || inferred.currentModel || agent.model;
 
-  const matchedOption = currentModel && activeFetched
-    ? activeFetched.models.find((m) => m.id.toLowerCase() === currentModel.toLowerCase())
-    : undefined;
-
-  const thinkingLevels = activeFetched
-    ? matchedOption?.reasoning === false && !hasReasoningEvents
-      ? undefined
-      : matchedOption?.thinkingLevels?.length
-        ? matchedOption.thinkingLevels
-        : activeFetched.thinkingLevels?.length
-          ? activeFetched.thinkingLevels
-          : hasReasoningEvents
-            ? inferred.thinkingLevels
-            : undefined
-    : inferred.thinkingLevels?.length
-      ? inferred.thinkingLevels
-      : undefined;
-
-  const currentThinking =
-    thinkingLevels?.length === 0 || (activeFetched && !thinkingLevels?.length)
-      ? undefined
-      : activeOverride?.currentThinking || activeFetched?.currentThinking || inferred.currentThinking;
-
   const modelRoles =
     activeFetched?.modelRoles || activeOverride?.modelRoles
       ? { ...(activeFetched?.modelRoles ?? {}), ...(activeOverride?.modelRoles ?? {}) }
       : undefined;
 
+  const activeModelOption = findModelOptionForModel(activeFetched?.models, currentModel, {
+    harness: agent.harness,
+    modelRoles,
+  });
+
+  const thinkingLevels = activeFetched
+    ? resolveThinkingLevelsForModel(
+        {
+          ...activeFetched,
+          models: activeFetched.models,
+          modelRoles,
+          hasReasoningEvents,
+        },
+        currentModel,
+      )
+    : (inferred.thinkingLevels ?? []);
+
+  const currentThinking =
+    thinkingLevels.length === 0
+      ? undefined
+      : activeOverride?.currentThinking
+        ? clampThinkingLevel(thinkingLevels, activeOverride.currentThinking)
+        : clampThinkingLevel(
+            thinkingLevels,
+            activeOverride?.fallbackThinkingCandidate || activeFetched?.currentThinking || inferred.currentThinking,
+            activeOverride?.currentModel,
+          );
+
   const canSwitch = activeFetched?.canSwitch;
   const canSwitchThinking = activeFetched
-    ? activeFetched.canSwitchThinking || Boolean(hasReasoningEvents && activeFetched.canSwitch && thinkingLevels?.length)
+    ? (activeFetched.canSwitch && thinkingLevels.length > 0)
     : undefined;
 
   return {
     ...(currentModel ? { currentModel } : {}),
     ...(currentThinking ? { currentThinking } : {}),
-    ...(thinkingLevels?.length ? { thinkingLevels } : {}),
+    ...(thinkingLevels.length ? { thinkingLevels } : {}),
+    ...(activeModelOption ? { activeModelOption } : {}),
     ...(modelRoles ? { modelRoles } : {}),
     ...(activeFetched ? { models: activeFetched.models, canSwitch, canSwitchThinking } : {}),
     loaded: Boolean(activeFetched),
