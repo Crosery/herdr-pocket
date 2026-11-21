@@ -8,6 +8,7 @@ export interface UnifloSession {
   title?: string;
   cwd?: string;
   model?: string;
+  source?: string;
   preview?: string;
   updated_at: number;
   status: "idle" | "work";
@@ -562,6 +563,20 @@ export class UnifloAdapter {
 
   async info(key: string): Promise<SessionInfo> {
     return toInfo((await this.get(`/v1/sessions/${encodeURIComponent(key)}`)) as UnifloSession);
+  }
+
+  /** Returns the local transcript file path reported by Uniflo for `sessionKey`, if available. */
+  async sessionSourcePath(sessionKey: string): Promise<string | undefined> {
+    const cached =
+      this.sessions.find((s) => s.key === sessionKey)?.source ??
+      this.named.get(sessionKey)?.source;
+    if (typeof cached === "string" && cached.trim()) return cached.trim();
+    try {
+      const s = (await this.get(`/v1/sessions/${encodeURIComponent(sessionKey)}`)) as UnifloSession;
+      return typeof s?.source === "string" && s.source.trim() ? s.source.trim() : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Full-text search over every transcript; snippets come without highlight marks. */

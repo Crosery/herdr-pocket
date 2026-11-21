@@ -8,6 +8,7 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
     "noEmit": true,
     "paths": {
       "@herdr-pocket/protocol": ["../../packages/protocol/src/index.ts"]
