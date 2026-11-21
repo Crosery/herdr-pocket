@@ -4,12 +4,14 @@
  * in a visible local queue above the composer and auto-send once the turn finishes (or can
  * interrupt & steer immediately with one tap).
  */
+import { AppState } from "react-native";
 import { create } from "zustand";
+import { createJSONStorage, persist } from "zustand/middleware";
 import type { Agent } from "@herdr-pocket/protocol";
 import type { Attachment } from "./attach";
 import { sendOut, type SendResult } from "./outbox";
 import { call } from "./relay";
-import { useLive } from "./store";
+import { safeAsyncStorage, useLive } from "./store";
 
 export interface MobileQueuedPrompt {
   id: string;
@@ -33,66 +35,143 @@ interface MobileQueueState {
 
 const DRAIN_COOLDOWN_MS = 2500;
 const STEER_SETTLE_MS = 180;
+const QUEUE_PERSIST_MAX_CHARS = 1_500_000;
 
 let idSeq = 0;
 const nextId = () => `mq-${Date.now()}-${++idSeq}`;
 
-export const useMobileQueue = create<MobileQueueState>()((set, get) => ({
-  byAgent: {},
-  steering: {},
-  enqueue: (item) =>
-    set((s) => ({
-      byAgent: {
-        ...s.byAgent,
-        [item.agentKey]: [...(s.byAgent[item.agentKey] ?? []), item],
+function bumpSeqFromId(id: string): void {
+  const m = /^mq-\d+-(\d+)$/.exec(id);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > idSeq) idSeq = n;
+  }
+}
+
+function compactMobileQueue(byAgent: Record<string, MobileQueuedPrompt[]>): Record<string, MobileQueuedPrompt[]> {
+  const out: Record<string, MobileQueuedPrompt[]> = {};
+  for (const [agentKey, list] of Object.entries(byAgent)) {
+    if (!Array.isArray(list) || !list.length) continue;
+    out[agentKey] = list.map((item) => ({
+      ...item,
+      pictures: Array.isArray(item.pictures) ? item.pictures.map((p) => ({ ...p })) : [],
+    }));
+  }
+  if (JSON.stringify({ byAgent: out }).length <= QUEUE_PERSIST_MAX_CHARS) {
+    return out;
+  }
+  // Convert oversized picture payloads gracefully so queued prompts still survive restarts.
+  const withPics: Array<{ item: MobileQueuedPrompt }> = [];
+  for (const list of Object.values(out)) {
+    for (const item of list) {
+      if (item.pictures.length) withPics.push({ item });
+    }
+  }
+  withPics.sort((a, b) => a.item.createdAt - b.item.createdAt);
+  for (const { item } of withPics) {
+    item.pictures = [];
+    if (!item.text) {
+      item.text = "（原附带图片体积过大未持久化，请补充后发送）";
+    }
+    if (JSON.stringify({ byAgent: out }).length <= QUEUE_PERSIST_MAX_CHARS) {
+      return out;
+    }
+  }
+  const keys = Object.keys(out);
+  while (JSON.stringify({ byAgent: out }).length > QUEUE_PERSIST_MAX_CHARS && keys.length) {
+    let oldestKey: string | null = null;
+    let oldestAt = Infinity;
+    for (const k of keys) {
+      const head = out[k]?.[0];
+      if (head && head.createdAt < oldestAt) {
+        oldestAt = head.createdAt;
+        oldestKey = k;
+      }
+    }
+    if (!oldestKey) break;
+    out[oldestKey]!.shift();
+    if (!out[oldestKey]!.length) {
+      delete out[oldestKey];
+      keys.splice(keys.indexOf(oldestKey), 1);
+    }
+  }
+  return out;
+}
+
+export const useMobileQueue = create<MobileQueueState>()(
+  persist(
+    (set, get) => ({
+      byAgent: {},
+      steering: {},
+      enqueue: (item) =>
+        set((s) => ({
+          byAgent: {
+            ...s.byAgent,
+            [item.agentKey]: [...(s.byAgent[item.agentKey] ?? []), item],
+          },
+        })),
+      remove: (agentKey, id) =>
+        set((s) => {
+          const prev = s.byAgent[agentKey];
+          if (!prev) return s;
+          const next = prev.filter((x) => x.id !== id);
+          const map = { ...s.byAgent };
+          if (next.length) map[agentKey] = next;
+          else delete map[agentKey];
+          return { byAgent: map };
+        }),
+      moveToTop: (agentKey, id) =>
+        set((s) => {
+          const prev = s.byAgent[agentKey];
+          if (!prev) return s;
+          const idx = prev.findIndex((x) => x.id === id);
+          if (idx <= 0) return s;
+          const next = [prev[idx]!, ...prev.slice(0, idx), ...prev.slice(idx + 1)];
+          return { byAgent: { ...s.byAgent, [agentKey]: next } };
+        }),
+      pop: (agentKey, id) => {
+        const prev = get().byAgent[agentKey];
+        const target = prev?.find((x) => x.id === id) ?? null;
+        if (!target) return null;
+        get().remove(agentKey, id);
+        return target;
       },
-    })),
-  remove: (agentKey, id) =>
-    set((s) => {
-      const prev = s.byAgent[agentKey];
-      if (!prev) return s;
-      const next = prev.filter((x) => x.id !== id);
-      const map = { ...s.byAgent };
-      if (next.length) map[agentKey] = next;
-      else delete map[agentKey];
-      return { byAgent: map };
+      shiftNext: (agentKey) => {
+        const prev = get().byAgent[agentKey];
+        if (!prev?.length) return null;
+        const [head, ...rest] = prev;
+        set((s) => {
+          const map = { ...s.byAgent };
+          if (rest.length) map[agentKey] = rest;
+          else delete map[agentKey];
+          return { byAgent: map };
+        });
+        return head!;
+      },
+      setSteering: (agentKey, on) =>
+        set((s) => {
+          const next = { ...s.steering };
+          if (on) next[agentKey] = true;
+          else delete next[agentKey];
+          return { steering: next };
+        }),
     }),
-  moveToTop: (agentKey, id) =>
-    set((s) => {
-      const prev = s.byAgent[agentKey];
-      if (!prev) return s;
-      const idx = prev.findIndex((x) => x.id === id);
-      if (idx <= 0) return s;
-      const next = [prev[idx]!, ...prev.slice(0, idx), ...prev.slice(idx + 1)];
-      return { byAgent: { ...s.byAgent, [agentKey]: next } };
-    }),
-  pop: (agentKey, id) => {
-    const prev = get().byAgent[agentKey];
-    const target = prev?.find((x) => x.id === id) ?? null;
-    if (!target) return null;
-    get().remove(agentKey, id);
-    return target;
-  },
-  shiftNext: (agentKey) => {
-    const prev = get().byAgent[agentKey];
-    if (!prev?.length) return null;
-    const [head, ...rest] = prev;
-    set((s) => {
-      const map = { ...s.byAgent };
-      if (rest.length) map[agentKey] = rest;
-      else delete map[agentKey];
-      return { byAgent: map };
-    });
-    return head!;
-  },
-  setSteering: (agentKey, on) =>
-    set((s) => {
-      const next = { ...s.steering };
-      if (on) next[agentKey] = true;
-      else delete next[agentKey];
-      return { steering: next };
-    }),
-}));
+    {
+      name: "hp.mobile.queue.v1",
+      storage: createJSONStorage(() => safeAsyncStorage),
+      partialize: (s) => ({ byAgent: compactMobileQueue(s.byAgent) }),
+      onRehydrateStorage: () => (state) => {
+        if (!state) return;
+        for (const list of Object.values(state.byAgent)) {
+          for (const item of list) bumpSeqFromId(item.id);
+        }
+        if (watcherInstalled) {
+          setTimeout(runDrainTick, 0);
+        }
+      },
+    },
+  ),
+);
 
 const inFlight = new Set<string>();
 const dispatchState = new Map<string, { lastDispatchedAt: number; sawWorking: boolean }>();
@@ -215,5 +294,9 @@ export function ensureMobileQueueWatcher(): void {
   if (watcherInstalled) return;
   watcherInstalled = true;
   useLive.subscribe(runDrainTick);
+  AppState.addEventListener("change", (st) => {
+    if (st === "active") runDrainTick();
+  });
   setInterval(runDrainTick, 1000);
+  runDrainTick();
 }

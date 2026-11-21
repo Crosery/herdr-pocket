@@ -148,6 +148,56 @@ export interface StagedAttachment {
   previewUrl?: string;
 }
 
+export type SerializedAttachment = Omit<StagedAttachment, "file" | "previewUrl">;
+
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/** Strips runtime-only `file` and `previewUrl` fields so attachments serialize cleanly across restarts. */
+export function serializeAttachment(item: StagedAttachment): SerializedAttachment {
+  const { file: _file, previewUrl: _previewUrl, ...rest } = item;
+  return {
+    ...rest,
+    ...(rest.put ? { put: { ...rest.put } } : {}),
+  };
+}
+
+/** Restores a serialized attachment, recreating a `previewUrl` Object URL from base64 `put.data` when needed. */
+export function hydrateAttachment(s: SerializedAttachment): StagedAttachment {
+  const seqMatch = /^att-(\d+)$/.exec(s.id);
+  if (seqMatch) {
+    const n = Number(seqMatch[1]);
+    if (Number.isFinite(n) && n > seq) seq = n;
+  }
+  let previewUrl: string | undefined;
+  if (
+    needsObjectUrl(s.kind) &&
+    s.put?.data &&
+    typeof Blob !== "undefined" &&
+    typeof URL !== "undefined" &&
+    typeof URL.createObjectURL === "function"
+  ) {
+    try {
+      const bytes = base64ToBytes(s.put.data);
+      const mime = s.kind === "pdf" ? "application/pdf" : (s.put.mime || s.mime || "application/octet-stream");
+      previewUrl = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    } catch {
+      previewUrl = undefined;
+    }
+  }
+  return {
+    ...s,
+    ...(s.put ? { put: { ...s.put } } : {}),
+    ...(previewUrl ? { previewUrl } : {}),
+  };
+}
+
 export function stageWorkspaceDragItem(item: WorkspaceDragItem, targetHostId: string): StagedAttachment {
   const hostRef = resolveDropPath(item, targetHostId);
   const mime = item.kind === "dir" ? "inode/directory" : mediaTypeFor(item.name) || "application/octet-stream";

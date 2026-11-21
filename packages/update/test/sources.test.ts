@@ -15,6 +15,7 @@ import {
   parseClientConfig,
   parseConfigText,
   pickFastest,
+  pickLowestLatency,
   sourceLabel,
   sourcePrefixes,
   updateCheckDelays,
@@ -43,6 +44,8 @@ describe("config file schema", () => {
     const d = defaultClientConfig();
     assert.equal(d.version, 1);
     assert.equal(d.update.region, "auto");
+    assert.equal(d.update.preferredSource, "auto");
+    assert.equal(d.update.checkIntervalHours, 0.5);
     assert.deepEqual(d.update.mirrors, []);
     assert.equal(d.voiceInput.hotkey, "CommandOrControl+Shift+Space");
     assert.deepEqual([d.general.textScale, d.general.showShells, d.voiceInput.denoise], [100, false, true]);
@@ -60,19 +63,21 @@ describe("config file schema", () => {
   test("bad values fall back to defaults and are reported; unknown keys are kept; secrets are flagged", () => {
     const { config, problems } = parseClientConfig({
       version: 1,
-      update: { region: "mars", checkIntervalHours: 2, mirrors: ["https://m.example.com/"], future: 1 },
+      update: { region: "mars", preferredSource: "invalid", checkIntervalHours: 0.1, mirrors: ["https://m.example.com/"], future: 1 },
       voiceInput: { hotkey: "Space", maxSeconds: 90 },
       logging: { level: "debug" },
       relay: { token: "hp_xxx" },
     });
     assert.equal(config.update.region, "auto");
-    assert.equal(config.update.checkIntervalHours, 24);
+    assert.equal(config.update.preferredSource, "auto");
+    assert.equal(config.update.checkIntervalHours, 0.5);
     assert.deepEqual(config.update.mirrors, ["https://m.example.com/"]);
     assert.equal(config.voiceInput.hotkey, "CommandOrControl+Shift+Space");
     assert.equal(config.voiceInput.maxSeconds, 90);
     assert.equal(config.logging.level, "debug");
     const keys = problems.map((p) => `${p.level}:${p.key}`);
     assert.ok(keys.includes("error:update.region"));
+    assert.ok(keys.includes("error:update.preferredSource"));
     assert.ok(keys.includes("error:update.checkIntervalHours"));
     assert.ok(keys.includes("warn:update.future"));
     assert.ok(keys.includes("error:voiceInput.hotkey"));
@@ -84,8 +89,14 @@ describe("config file schema", () => {
 
   test("typed values: booleans, numbers, enums, lists, hotkeys, mirrors", () => {
     assert.deepEqual(parseConfigText("update.autoCheck", "off"), { value: false });
+    assert.deepEqual(parseConfigText("update.checkIntervalHours", "0.25"), { value: 0.25 });
+    assert.deepEqual(parseConfigText("update.checkIntervalHours", "0.5"), { value: 0.5 });
     assert.deepEqual(parseConfigText("update.checkIntervalHours", "48"), { value: 48 });
-    assert.ok("error" in parseConfigText("update.checkIntervalHours", "1"));
+    assert.ok("error" in parseConfigText("update.checkIntervalHours", "0.1"));
+    assert.deepEqual(parseConfigText("update.preferredSource", "auto"), { value: "auto" });
+    assert.deepEqual(parseConfigText("update.preferredSource", "direct"), { value: "direct" });
+    assert.deepEqual(parseConfigText("update.preferredSource", "https://ghfast.top/"), { value: "https://ghfast.top/" });
+    assert.ok("error" in parseConfigText("update.preferredSource", "https://ghfast.top"));
     assert.ok("error" in parseConfigText("update.region", "moon"));
     assert.deepEqual(parseConfigText("update.mirrors", "https://a.example.com/, https://b.example.com/x/"), { value: ["https://a.example.com/", "https://b.example.com/x/"] });
     assert.deepEqual(parseConfigText("update.mirrors", '["http://127.0.0.1:8080/"]'), { value: ["http://127.0.0.1:8080/"] });
@@ -188,6 +199,9 @@ describe("regions", () => {
     assert.equal(pickFastest([{ source: "c", ok: true, ms: 100 }, { source: "a", ok: true, ms: 900 }], order), "c");
     assert.equal(pickFastest([{ source: "c", ok: true, ms: 100 }, { source: "b", ok: true, ms: 200 }], order, 150), "b");
     assert.equal(pickFastest([{ source: "a", ok: false, ms: 10 }], order), undefined);
+    assert.equal(pickLowestLatency([{ source: "c", ok: true, ms: 100 }, { source: "b", ok: true, ms: 110 }], order), "b");
+    assert.equal(pickLowestLatency([{ source: "c", ok: true, ms: 100 }, { source: "b", ok: true, ms: 140 }], order), "c");
+    assert.equal(pickLowestLatency([{ source: "a", ok: false, ms: 10 }], order), undefined);
     assert.deepEqual(withWinnerFirst(order, "c"), ["c", "a", "b"]);
     assert.deepEqual(withWinnerFirst(order, "zz"), order);
     const now = 1_000_000;
@@ -201,9 +215,10 @@ describe("regions", () => {
   test("check timing is jittered and bounded", () => {
     assert.equal(withJitter(1000, 0.1, () => 0), 900);
     assert.equal(withJitter(1000, 0.1, () => 1), 1100);
-    const d = updateCheckDelays(1, () => 0.5);
-    assert.equal(d.everyMs, 6 * 3600_000, "at least 6 hours");
-    assert.ok(d.firstMs >= 60_000 && d.firstMs <= 300_000);
+    const d = updateCheckDelays(0.1, () => 0.5);
+    assert.equal(d.everyMs, 0.25 * 3600_000, "at least 0.25 hours");
+    assert.ok(d.firstMs >= 15_000 && d.firstMs <= 60_000);
+    assert.equal(updateCheckDelays(Number.NaN, () => 0.5).everyMs, 0.5 * 3600_000);
     assert.equal(updateCheckDelays(1000, () => 0.5).everyMs, 168 * 3600_000);
   });
 });
@@ -262,6 +277,17 @@ describe("race", () => {
       assert.equal(fromFile.decision.reason, "config");
       assert.equal(fromFile.order[0], "https://own.example.com/");
       assert.ok(existsSync(join(state, "sources.json")));
+
+      setClientConfigValue("update.preferredSource", "direct");
+      const directPlan = sourcePlan(process.env, Date.now() + 10_000);
+      assert.equal(directPlan.order[0], DIRECT_SOURCE);
+      assert.equal(directPlan.cached, undefined);
+
+      setClientConfigValue("update.preferredSource", "https://custom.example.com/");
+      const mirrorPlan = sourcePlan(process.env, Date.now() + 10_000);
+      assert.equal(mirrorPlan.order[0], "https://custom.example.com/");
+      assert.equal(mirrorPlan.order.filter((s) => s === "https://custom.example.com/").length, 1);
+      assert.equal(mirrorPlan.cached, undefined);
     } finally {
       delete process.env.HERDR_POCKET_MIRROR;
       rmSync(clientConfigPath(), { force: true });

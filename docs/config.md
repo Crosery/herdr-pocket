@@ -322,8 +322,9 @@ Who reads it: CLI = `herdr-pocket` commands, daemon = `herdr-pocket run`, app = 
 | `general.closeToTray` | `false` | boolean | app | closing the window keeps the app in the menu bar or tray; off, closing the window quits the app |
 | `general.notifications` | `true` | boolean | app | system notifications when an agent finishes or waits |
 | `update.region` | `"auto"` | `auto`, `cn`, `global` | CLI, daemon, app | where downloads come from first, see [Regions and download sources](#regions-and-download-sources). `HERDR_POCKET_MIRROR=1` / `0` wins |
+| `update.preferredSource` | `"auto"` | `"auto"`, `"direct"`, or a mirror prefix | CLI, daemon, app | `"auto"`: recommend by time zone and pick the lowest-latency reachable source. `"direct"`: try GitHub directly first. Or pin a specific mirror prefix (falls back to others if unreachable) |
 | `update.autoCheck` | `true` | boolean | CLI, daemon, app | look for a new release now and then. `HERDR_POCKET_UPDATE_CHECK=0` wins |
-| `update.checkIntervalHours` | `24` | 6–168 | daemon, app | hours between automatic checks, ±10% at random |
+| `update.checkIntervalHours` | `0.5` | 0.25–168 | daemon, app | hours between automatic checks (supports decimals such as `0.25` for 15 minutes and `0.5` for 30 minutes), ±10% at random |
 | `update.mirrors` | `[]` | up to 20 prefixes | CLI, daemon, app | your own GitHub mirrors, e.g. `https://mirror.example.com/`: https, ending in `/`, put in front of a `https://github.com/…` address (plain `http://` only for `localhost` / `127.0.0.1`). Raced first, before the built-in ones |
 | `update.checkTools` | `true` | boolean | daemon | once a day, look for newer hc, Herdr app and uniflo releases; report only, see [Updates of hc, the Herdr app and uniflo](#updates-of-hc-the-herdr-app-and-uniflo). Off as well when `update.autoCheck` is off |
 | `logging.level` | `"info"` | `debug`, `info`, `warn`, `error` | daemon, app | lowest level kept and uploaded. `debug` adds every file-view request |

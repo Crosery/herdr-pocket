@@ -1,7 +1,17 @@
 import { useEffect, useState } from "react";
 import { Copy, Download, ExternalLink, FileText, FolderOpen, LogOut, QrCode, RefreshCw, RotateCcw, Server, Trash2 } from "lucide-react";
-import { RELEASES_PAGE, RELEASE_REPO, configKeySpec, sourceLabel } from "@herdr-pocket/protocol";
-import { PocketBadge, PocketButton, PocketInput, PocketSwitch, PocketTextarea, useToast } from "../../components/PocketUI";
+import {
+  DIRECT_SOURCE,
+  RELEASES_PAGE,
+  RELEASE_REPO,
+  configKeySpec,
+  isMirrorPrefix,
+  isRecommendedSourceForRegion,
+  pickLowestLatency,
+  sourceLabel,
+  sourcePrefixes,
+} from "@herdr-pocket/protocol";
+import { PocketBadge, PocketButton, PocketInput, PocketSelect, PocketSwitch, PocketTextarea, useToast, type SelectOption } from "../../components/PocketUI";
 import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { CookieImportButton } from "../../components/CookieImport";
 import { serverLabel } from "../../components/Sidebar";
@@ -14,6 +24,7 @@ import {
   fetchReleaseNotes,
   lastSourceSentence,
   orderSentence,
+  probeMirrorsNow,
   regionReason,
   restartToApplyUpdate,
   sourceOrder,
@@ -406,6 +417,50 @@ export function UpdatesPane() {
       alive = false;
     };
   }, [latest, st.info?.notes]);
+  useEffect(() => {
+    if (updateStore.get().probes.length === 0 && !updateStore.get().probing) {
+      void probeMirrorsNow(false);
+    }
+  }, []);
+  const candidateSources = sourcePrefixes(decision.region, updateCfg.mirrors);
+  const ownCount = new Set(updateCfg.mirrors.filter(isMirrorPrefix)).size;
+  const fastestSource = pickLowestLatency(st.probes, candidateSources);
+  const fastestProbe =
+    fastestSource !== undefined ? st.probes.find((p) => p.source === fastestSource && p.ok) : undefined;
+  const fastestLabel = fastestProbe ? sourceLabel(fastestProbe.source) : "";
+  const fastestMs = fastestProbe?.ms;
+  const autoLabel =
+    "自动（按时区推荐并选最低延迟" +
+    (fastestLabel && fastestMs !== undefined ? ` · 当前 ${fastestLabel} ${fastestMs}ms` : "") +
+    "）";
+  const preferredValue = updateCfg.preferredSource || "auto";
+  const rawSourceOptions: SelectOption[] = [
+    { value: "auto", label: autoLabel },
+    ...candidateSources.map((s): SelectOption => {
+      const value = s === DIRECT_SOURCE ? "direct" : s;
+      const host = sourceLabel(s);
+      const probe = st.probes.find((p) => p.source === s);
+      const latencyText = !probe
+        ? st.probing
+          ? "测速中"
+          : "待测速"
+        : probe.ok
+          ? `${probe.ms} ms`
+          : probe.error === "slower than the winner"
+            ? "待测速"
+            : "不通";
+      const recommended = isRecommendedSourceForRegion(s, decision.region, candidateSources, ownCount);
+      const isFastest = fastestProbe !== undefined && fastestProbe.source === s;
+      return {
+        value,
+        label: `${host} · ${latencyText}${recommended ? " · 时区推荐" : ""}${isFastest ? " · 最快" : ""}`,
+        ...(isFastest ? { tone: "accent" as const } : {}),
+      };
+    }),
+  ];
+  const sourceOptions = rawSourceOptions.some((o) => o.value === preferredValue)
+    ? rawSourceOptions
+    : [...rawSourceOptions, { value: preferredValue, label: `${sourceLabel(preferredValue)}（已配置）` }];
   const pageUrl = st.info?.pageUrl || RELEASES_PAGE;
   const words = (r: "cn" | "global") => sourceOrder(r).slice(0, 2).join("、");
   const phase = st.installPhase;
@@ -510,7 +565,16 @@ export function UpdatesPane() {
       <ConfigSelect
         k="update.checkIntervalHours"
         about="自动检查的间隔。"
-        options={[6, 12, 24, 72, 168].map((h) => ({ value: String(h), label: h < 24 ? `${h} 小时` : `${h / 24} 天` }))}
+        options={[
+          { value: "0.25", label: "15 分钟" },
+          { value: "0.5", label: "30 分钟（默认）" },
+          { value: "1", label: "1 小时" },
+          { value: "2", label: "2 小时" },
+          { value: "6", label: "6 小时" },
+          { value: "12", label: "12 小时" },
+          { value: "24", label: "1 天" },
+          { value: "72", label: "3 天" },
+        ]}
       />
       <SetHeading>下载来源</SetHeading>
       <ConfigSelect
@@ -523,22 +587,44 @@ export function UpdatesPane() {
           { value: "global", label: `直连优先（${words("global")}）` },
         ]}
       />
-      {st.info ? (
-        <SetRow title="上次用的线路" about={lastSourceSentence(st.info)}>
-          {st.info.probes?.length ? (
-            <div className="source-list" style={{ justifyContent: "flex-end", marginTop: 0 }}>
-              {st.info.probes.map((p) => {
-                const label = sourceLabel(p.source) || p.source;
-                return (
-                  <span key={p.source || "direct"} className={`source-chip num${label === st.info!.source ? " used" : ""}`} title={p.error}>
-                    {label} {p.ok ? `${(p.ms / 1000).toFixed(1)} 秒` : "不通"}
-                  </span>
-                );
-              })}
-            </div>
-          ) : null}
-        </SetRow>
-      ) : null}
+      <SetRow
+        title="首选镜像源"
+        about={
+          st.info
+            ? `${lastSourceSentence(st.info)}；默认按时区推荐并选延迟最低的可用源。`
+            : "默认按时区推荐并选延迟最低的可用源；也可手动固定指定某条线路。"
+        }
+      >
+        <div className="row" style={{ gap: 8, alignItems: "center", justifyContent: "flex-end", minWidth: 0, maxWidth: "100%" }}>
+          <div style={{ flex: "1 1 auto", minWidth: 0 }}>
+            <PocketSelect
+              ariaLabel="首选镜像源"
+              value={preferredValue}
+              options={sourceOptions}
+              onValueChange={(v) => {
+                void setConfig("update.preferredSource", v).catch((e: Error) => toast(e.message, true));
+              }}
+            />
+          </div>
+          <PocketButton
+            size="sm"
+            variant="soft"
+            style={{ flexShrink: 0 }}
+            disabled={st.probing}
+            onClick={() =>
+              void probeMirrorsNow(true).then((probes) => {
+                const win = pickLowestLatency(probes, candidateSources);
+                const hit = win !== undefined ? probes.find((p) => p.source === win && p.ok) : undefined;
+                if (hit) toast(`测速完成：最快 ${sourceLabel(hit.source)}（${hit.ms} ms）`);
+                else toast("测速完成：当前没有可用线路", true);
+              })
+            }
+          >
+            <RefreshCw size={14} />
+            <span>{st.probing ? "测速中…" : "重新测速"}</span>
+          </PocketButton>
+        </div>
+      </SetRow>
       <MirrorsRow mirrors={updateCfg.mirrors} />
       <ToolVersionsSection />
     </div>

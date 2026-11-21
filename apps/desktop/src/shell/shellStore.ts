@@ -1,5 +1,6 @@
 import type { SubSession } from "@herdr-pocket/protocol";
 import { createStore } from "../lib/store";
+import { registerWorkspaceSection, scheduleWorkspacePersist } from "../lib/workspacePersist";
 import type { SettingsSection } from "../views/SettingsView";
 
 /**
@@ -160,45 +161,63 @@ export const PANEL_DEFAULT = 368;
 export const PANEL_MIN = 280;
 export const PANEL_MAX = 900;
 
-function load(): Pick<ShellState, "tabs" | "active" | "selectedSpace" | "activeBySpace" | "panel" | "panelWidth"> {
+type PersistedShellState = Pick<ShellState, "tabs" | "active" | "selectedSpace" | "activeBySpace" | "panel" | "panelWidth">;
+
+function normalizePersistedShellState(rawInput: unknown): PersistedShellState | null {
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) return null;
+  const raw = rawInput as Partial<ShellState>;
+  if (!Array.isArray(raw.tabs)) return null;
+  const tabs = raw.tabs
+    .filter((t): t is ShellTab =>
+      Boolean(
+        t &&
+          typeof t.id === "string" &&
+          (t.kind === "agent" || t.kind === "file" || t.kind === "web" || t.kind === "diff"),
+      ),
+    )
+    .map((t) =>
+      t.kind === "agent"
+        ? {
+            id: t.id,
+            kind: "agent" as const,
+            agentKey: t.agentKey,
+            ...(t.mode === "chat" || t.mode === "term" ? { mode: t.mode } : {}),
+          }
+        : t,
+    );
+  const activeBySpace =
+    raw.activeBySpace && typeof raw.activeBySpace === "object" && !Array.isArray(raw.activeBySpace)
+      ? raw.activeBySpace
+      : {};
+  const panel =
+    raw.panel === "files" || raw.panel === "git" || raw.panel === "browser" || raw.panel === "assistant"
+      ? raw.panel
+      : null;
+  return {
+    tabs,
+    active: tabs.some((t) => t.id === raw.active) ? raw.active! : (tabs[0]?.id ?? null),
+    selectedSpace: typeof raw.selectedSpace === "string" ? raw.selectedSpace : null,
+    activeBySpace,
+    panel,
+    panelWidth: clampPanel(Number(raw.panelWidth) || PANEL_DEFAULT),
+  };
+}
+
+function pickPersistedShellState(s: ShellState): PersistedShellState {
+  return {
+    tabs: s.tabs,
+    active: s.active,
+    selectedSpace: s.selectedSpace,
+    activeBySpace: s.activeBySpace,
+    panel: s.panel === "subagent" ? null : s.panel,
+    panelWidth: s.panelWidth,
+  };
+}
+
+function load(): PersistedShellState {
   try {
-    const raw = JSON.parse(localStorage.getItem(KEY) ?? "null") as Partial<ShellState> | null;
-    if (raw && Array.isArray(raw.tabs)) {
-      const tabs = raw.tabs
-        .filter((t): t is ShellTab =>
-          Boolean(
-            t &&
-              typeof t.id === "string" &&
-              (t.kind === "agent" || t.kind === "file" || t.kind === "web" || t.kind === "diff"),
-          ),
-        )
-        .map((t) =>
-          t.kind === "agent"
-            ? {
-                id: t.id,
-                kind: "agent" as const,
-                agentKey: t.agentKey,
-                ...(t.mode === "chat" || t.mode === "term" ? { mode: t.mode } : {}),
-              }
-            : t,
-        );
-      const activeBySpace =
-        raw.activeBySpace && typeof raw.activeBySpace === "object" && !Array.isArray(raw.activeBySpace)
-          ? raw.activeBySpace
-          : {};
-      const panel =
-        raw.panel === "files" || raw.panel === "git" || raw.panel === "browser" || raw.panel === "assistant"
-          ? raw.panel
-          : null;
-      return {
-        tabs,
-        active: tabs.some((t) => t.id === raw.active) ? raw.active! : (tabs[0]?.id ?? null),
-        selectedSpace: typeof raw.selectedSpace === "string" ? raw.selectedSpace : null,
-        activeBySpace,
-        panel,
-        panelWidth: clampPanel(Number(raw.panelWidth) || PANEL_DEFAULT),
-      };
-    }
+    const parsed = normalizePersistedShellState(JSON.parse(localStorage.getItem(KEY) ?? "null"));
+    if (parsed) return parsed;
   } catch {
     // Unreadable: start empty.
   }
@@ -217,23 +236,39 @@ export const shellStore = createStore<ShellState>({
   peek: null,
 });
 
+let lastPersistedJson = JSON.stringify(pickPersistedShellState(shellStore.get()));
+let dirtyBeforeHydrate = false;
+
 shellStore.subscribe(() => {
-  const { tabs, active, selectedSpace, activeBySpace, panel, panelWidth } = shellStore.get();
+  const persisted = pickPersistedShellState(shellStore.get());
+  const encoded = JSON.stringify(persisted);
+  if (encoded === lastPersistedJson) return;
+  lastPersistedJson = encoded;
+  dirtyBeforeHydrate = true;
   try {
-    localStorage.setItem(
-      KEY,
-      JSON.stringify({
-        tabs,
-        active,
-        selectedSpace,
-        activeBySpace,
-        panel: panel === "subagent" ? null : panel,
-        panelWidth,
-      }),
-    );
+    localStorage.setItem(KEY, encoded);
   } catch {
     // Storage off: tabs last for this session.
   }
+  scheduleWorkspacePersist();
+});
+
+registerWorkspaceSection("shellState", {
+  serialize: () => pickPersistedShellState(shellStore.get()),
+  hydrate: (raw) => {
+    const parsed = normalizePersistedShellState(raw);
+    if (!parsed) return;
+    const cur = shellStore.get();
+    if (dirtyBeforeHydrate && cur.tabs.length > 0) return;
+    const encoded = JSON.stringify(parsed);
+    lastPersistedJson = encoded;
+    shellStore.set((s) => ({ ...s, ...parsed }));
+    try {
+      localStorage.setItem(KEY, encoded);
+    } catch {
+      /* ignore */
+    }
+  },
 });
 
 const set = shellStore.set;
