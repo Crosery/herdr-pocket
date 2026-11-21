@@ -86,10 +86,12 @@ export class HcAdapter extends EventEmitter {
   private lastLine = 0;
 
   private hcBin: string;
+  private screens: HcScreens;
 
   constructor(hcBin = defaultHcBin()) {
     super();
     this.hcBin = hcBin;
+    this.screens = new HcScreens(hcBin);
   }
 
   async available(): Promise<boolean> {
@@ -385,8 +387,6 @@ export class HcAdapter extends EventEmitter {
     };
   }
 
-  private screens = new HcScreens();
-
   /**
    * Starts a program (empty argv: the shell) in a new terminal of hc's own, in `cwd`, and
    * returns its address. For computers without the desktop app; it belongs to no space.
@@ -462,7 +462,24 @@ export class HcAdapter extends EventEmitter {
         await new Promise((r) => setTimeout(r, 300));
         if (await this.panelOpen(address)) throw new Error("它开着一个面板，消息没送进去：先在终端里按 Esc 关掉再发");
       }
-      await run(this.hcBin, ["send", address, text]);
+    }
+    const t = this.terminals.get(address);
+    try {
+      await this.screens.paste(address, text, t?.cols || 80, t?.rows || 24, enter);
+      return;
+    } catch {
+      /* remote / non-attachable fallback below */
+    }
+    if (enter) {
+      try {
+        await run(this.hcBin, ["send", "--force", "--", address, text]);
+      } catch (err) {
+        if (/--force|unexpected argument/i.test((err as Error).message)) {
+          await run(this.hcBin, ["send", "--", address, text]);
+        } else {
+          throw err;
+        }
+      }
     } else {
       // Typing without Enter: one key per character keeps it literal.
       await run(this.hcBin, ["keys", address, ...[...text].map((c) => (c === " " ? "space" : c))]);

@@ -408,7 +408,7 @@ function waitMs(ms: number): Promise<void> {
 }
 
 export async function steerQueuedPromptNow(
-  agent: Pick<Agent, "key" | "deviceId">,
+  agent: Pick<Agent, "key" | "deviceId" | "status">,
   id: string,
 ): Promise<void> {
   if (inFlightAgents.has(agent.key)) return;
@@ -417,8 +417,10 @@ export async function steerQueuedPromptNow(
   dispatchState.delete(agent.key);
   inFlightAgents.add(agent.key);
   try {
-    await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
-    await waitMs(STEER_SETTLE_MS);
+    if (agent.status === "working") {
+      await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
+      await waitMs(STEER_SETTLE_MS);
+    }
     await sendPromptNow(agent, popped.text, popped.attachments);
   } finally {
     inFlightAgents.delete(agent.key);
@@ -426,7 +428,7 @@ export async function steerQueuedPromptNow(
 }
 
 export async function steerComposerNow(
-  agent: Pick<Agent, "key" | "deviceId">,
+  agent: Pick<Agent, "key" | "deviceId" | "status">,
   rawText: string,
   attachments: StagedAttachment[],
 ): Promise<void> {
@@ -436,8 +438,10 @@ export async function steerComposerNow(
   dispatchState.delete(agent.key);
   inFlightAgents.add(agent.key);
   try {
-    await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
-    await waitMs(STEER_SETTLE_MS);
+    if (agent.status === "working") {
+      await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
+      await waitMs(STEER_SETTLE_MS);
+    }
     await sendPromptNow(agent, clean, attachments);
   } finally {
     inFlightAgents.delete(agent.key);

@@ -97,7 +97,7 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
     lastSend &&
     now - lastSend.ts < AWAIT_REPLY_MS &&
     agentStatus !== "working" &&
-    agentStatus !== "blocked"
+    (agentStatus !== "blocked" || now - lastSend.ts < 15_000)
   ) {
     const matchedAt = matchedRowIdx.get(lastSend.id);
     const hasReplyAfter =

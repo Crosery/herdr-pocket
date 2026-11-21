@@ -22,12 +22,8 @@ import {
   checkForUpdate,
   currentRegion,
   fetchReleaseNotes,
-  lastSourceSentence,
-  orderSentence,
   probeMirrorsNow,
-  regionReason,
   restartToApplyUpdate,
-  sourceOrder,
   startUpdateDownload,
   updateStore,
   type ReleaseNotes,
@@ -67,13 +63,7 @@ function ConfigFileBlock() {
       <SetHeading>配置文件</SetHeading>
       <SetRow
         title="config.json"
-        about={
-          <>
-            <span className="mono wrap-anywhere">{path || "这个平台把这些设置存在应用自己的存储里"}</span>
-            <br />
-            命令行 herdr-pocket config 和桌面端读写同一个文件，手动改完立即生效。
-          </>
-        }
+        about={<span className="mono wrap-anywhere">{path || "本地配置"}</span>}
       >
         {path ? (
           <div className="row wrap" style={{ gap: 6, justifyContent: "flex-end" }}>
@@ -110,17 +100,6 @@ function ConfigFileBlock() {
       </SetRow>
       {error ? <div className="inline-alert">{error}</div> : null}
       {problems.length ? <div className="faint">{problems.map((p) => `${p.key || "文件"}：${p.message}`).join("；")}</div> : null}
-      <div className="where-settings">
-        <div>
-          <strong>存在这个文件里</strong>：外观与启动、更新、日志、语音输入、浏览器与文件、性能与资源。只在这台电脑生效，命令行也能改。
-        </div>
-        <div>
-          <strong>存在中转服务器上</strong>：小羊助理的模型、密钥、提示词和声音。手机和每台电脑看到的是同一份。
-        </div>
-        <div>
-          <strong>只在这个应用里</strong>：登录状态、窗口和侧栏的样子、新手引导进度。
-        </div>
-      </div>
     </>
   );
 }
@@ -130,7 +109,7 @@ export function ThemeRow() {
   const toast = useToast();
   const theme = useClientConfig().general.theme;
   return (
-    <SetRow title="外观" about="浅色、暗色，或跟随系统。">
+    <SetRow title="外观">
       <div className="segmented" role="radiogroup" aria-label="外观">
         {(
           [
@@ -163,9 +142,9 @@ export function StartupRows() {
   return (
     <>
       <SetHeading>启动与窗口</SetHeading>
-      <ConfigSwitch k="general.launchAtLogin" about="登录电脑后自动打开，在后台盯着 Agent。" />
-      <ConfigSwitch k="general.closeToTray" about="点关闭按钮时只隐藏窗口，图标留在菜单栏 / 托盘，通知照常。" />
-      <ConfigSwitch k="general.useLocalLogin" about="这台电脑的 herdr-pocket 已登录时，首次打开自动用它连上同一个中转服务器。" />
+      <ConfigSwitch k="general.launchAtLogin" about="开机自启" />
+      <ConfigSwitch k="general.closeToTray" about="关闭时留在托盘" />
+      <ConfigSwitch k="general.useLocalLogin" about="首次沿用本机登录" />
     </>
   );
 }
@@ -174,7 +153,7 @@ function GuideRow({ onReopenGuide }: { onReopenGuide: () => void }) {
   return (
     <>
       <SetHeading>新手引导</SetHeading>
-      <SetRow title="重新打开新手引导" about="一步步检查本机、连接中转服务器、扫码连接手机和设置语音输入。">
+      <SetRow title="重新打开新手引导" about="重走本机连接与语音配置">
         <PocketButton size="sm" variant="soft" onClick={onReopenGuide}>
           打开引导
         </PocketButton>
@@ -193,7 +172,7 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
       <PaneTitle title="通用" />
       <SetHeading>外观</SetHeading>
       <ThemeRow />
-      <SetRow title="文字大小" about={`当前 ${general.textScale}%，只影响这台电脑上的桌面端。`}>
+      <SetRow title="文字大小" about={`当前 ${general.textScale}%`}>
         <div className="segmented">
           {textPresets.map((pct) => (
             <button
@@ -207,7 +186,7 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
         </div>
       </SetRow>
       <ChatDisplayModeRow />
-      <ConfigSwitch k="general.showShells" about="在 Agent 列表里也列出没跑 Agent 的普通终端。" />
+      <ConfigSwitch k="general.showShells" about="列出普通 Shell 终端" />
       {DESKTOP ? <TerminalSettingsSection /> : null}
       <StartupRows />
       <ConfigFileBlock />
@@ -242,7 +221,7 @@ export function SignOutBlock() {
   return (
     <>
       <SetHeading>退出</SetHeading>
-      <SetRow title="退出并解绑这台设备" about="会从服务器的设备列表里移除这台设备；之后要重新连接。">
+      <SetRow title="退出并解绑这台设备" about="退出后需重新配对连接">
         <PocketButton size="sm" variant="danger" onClick={() => void signOut()}>
           <LogOut size={14} />
           <span>退出</span>
@@ -263,9 +242,9 @@ export function ConnectionPane({ onConnectRelay, onPairPhone }: { onConnectRelay
   const { tone: statusTone, text: statusText } = linkLabel(link);
   return (
     <div className="pane">
-      <PaneTitle title="连接" about="中转服务器让手机和各台电脑隔着网络也能互相找到。" />
+      <PaneTitle title="连接" />
       <SetHeading>中转服务器</SetHeading>
-      <SetRow title={serverLabel(server)} about={`这台设备在服务器上叫“${deviceName || "未命名"}”。`}>
+      <SetRow title={serverLabel(server)} about={`设备名：${deviceName || "未命名"}`}>
         <PocketBadge tone={statusTone} pulse={link === "connecting"}>
           {statusText}
         </PocketBadge>
@@ -298,13 +277,13 @@ export function ConnectionPane({ onConnectRelay, onPairPhone }: { onConnectRelay
 
       {hostd ? (
         <>
-          <SetHeading>这台电脑的 Agent</SetHeading>
+          <SetHeading>本机服务</SetHeading>
           <div className="faint" style={{ paddingBottom: 10 }}>
             {hostd.configured
-              ? `这台电脑已登录 herdr-pocket（${hostd.deviceName || "本机"} → ${serverLabel(hostd.server ?? null)}），它的 Agent 会出现在 Pocket 里。`
+              ? `已登录（${hostd.deviceName || "本机"} → ${serverLabel(hostd.server ?? null)}）`
               : hostd.installed
-                ? "找到了 herdr-pocket 的配置，但还没登录：在终端运行 herdr-pocket up。"
-                : "这台电脑还没接入：要让它的 Agent 出现在 Pocket 里，标红的都要装好。只看别的电脑可以不管。"}
+                ? "已安装，请在终端运行 herdr-pocket up 登录"
+                : "本机未接入，安装并登录后可作为运行主机"}
           </div>
           <LocalHostDeps status={hostd} server={server && !isMockServer(server) ? server : undefined} checking={checking} onRecheck={recheck} />
         </>
@@ -322,19 +301,19 @@ export function NotificationsPane() {
       <PaneTitle title="通知" />
       <ConfigSwitch
         k="general.notifications"
-        about="Agent 需要你或干完活时弹出系统通知。"
+        about="完成或需要确认时提醒"
         onChanged={(v) => {
           updateSettings({ notifications: v });
           void refreshNotifyChannel();
         }}
       />
-      <SetRow title="测试通知" about="没弹出来：到系统设置的“通知”里允许 Herdr Pocket。">
+      <SetRow title="测试通知">
         <PocketButton size="sm" variant="ghost" onClick={() => void pushSystemNotification("Herdr Pocket", "通知能正常弹出")}>
           发一条试试
         </PocketButton>
       </SetRow>
       <SetHeading>和小羊通话</SetHeading>
-      <SetRow title="通话降噪" about="通话时打开系统的回声消除和环境降噪，只影响这台设备。">
+      <SetRow title="通话降噪" about="系统回声消除与降噪">
         <PocketSwitch checked={denoise} onCheckedChange={(v) => updateSettings({ denoise: v })} label="通话降噪" />
       </SetRow>
     </div>
@@ -348,9 +327,9 @@ export function BrowserPane() {
   useEffect(() => setHome(cfg.browser.homePage), [cfg.browser.homePage]);
   return (
     <div className="pane">
-      <PaneTitle title="浏览器与文件" about="工作台里的内置浏览器和文件查看。" />
+      <PaneTitle title="浏览器与文件" />
       <SetHeading>内置浏览器</SetHeading>
-      <SetRow title="主页" about="新开网页标签时打开的地址，留空就是空白页。" stack>
+      <SetRow title="主页" about="留空为空白页" stack>
         <PocketInput
           value={home}
           placeholder="https://example.com"
@@ -366,7 +345,6 @@ export function BrowserPane() {
       </SetRow>
       <ConfigSelect
         k="browser.searchEngine"
-        about="地址栏里输入的不是网址时，用它来搜索。"
         options={[
           { value: "bing", label: "必应" },
           { value: "baidu", label: "百度" },
@@ -374,24 +352,24 @@ export function BrowserPane() {
           { value: "duckduckgo", label: "DuckDuckGo" },
         ]}
       />
-      <ConfigSwitch k="browser.clearOnExit" about="退出应用时清掉内置浏览器的 Cookie 和缓存。" />
+      <ConfigSwitch k="browser.clearOnExit" about="退出时清理 Cookie 与缓存" />
       <SetHeading>登录状态</SetHeading>
       <ConfigSelect
         k="browser.cookieImport"
-        about="从这台电脑的 Chrome、Edge、Safari 等读取 Cookie，免得在内置浏览器里重新登录。每次导入前都会先问你；Cookie 只存在本机。"
+        about="仅本地导入常用浏览器 Cookie"
         options={[
           { value: "ask", label: "需要时可以导入" },
           { value: "off", label: "从不读取" },
         ]}
       />
       {cfg.browser.cookieImport !== "off" ? (
-        <SetRow title="现在导入" about="导入后，内置浏览器里的网站会沿用那个浏览器的登录。">
+        <SetRow title="现在导入">
           <CookieImportButton />
         </SetRow>
       ) : null}
       <SetHeading>文件查看</SetHeading>
-      <ConfigSwitch k="files.showHidden" about="在文件树里显示以“.”开头的文件。" />
-      <ConfigSwitch k="files.showIgnored" about="显示 node_modules、.git、dist 这类很大的生成目录。" />
+      <ConfigSwitch k="files.showHidden" />
+      <ConfigSwitch k="files.showIgnored" about="显示 .git / node_modules" />
     </div>
   );
 }
@@ -429,18 +407,23 @@ export function UpdatesPane() {
     fastestSource !== undefined ? st.probes.find((p) => p.source === fastestSource && p.ok) : undefined;
   const fastestLabel = fastestProbe ? sourceLabel(fastestProbe.source) : "";
   const fastestMs = fastestProbe?.ms;
-  const autoLabel =
-    "自动（按时区推荐并选最低延迟" +
-    (fastestLabel && fastestMs !== undefined ? ` · 当前 ${fastestLabel} ${fastestMs}ms` : "") +
-    "）";
   const preferredValue = updateCfg.preferredSource || "auto";
   const rawSourceOptions: SelectOption[] = [
-    { value: "auto", label: autoLabel },
+    {
+      value: "auto",
+      label: fastestLabel ? `自动 · ${fastestLabel}` : "自动（时区推荐 · 最低延迟）",
+      ...(fastestMs !== undefined
+        ? { badge: `${fastestMs} ms` }
+        : st.probing
+          ? { badge: "测速中" }
+          : {}),
+      tone: "accent",
+    },
     ...candidateSources.map((s): SelectOption => {
       const value = s === DIRECT_SOURCE ? "direct" : s;
       const host = sourceLabel(s);
       const probe = st.probes.find((p) => p.source === s);
-      const latencyText = !probe
+      const badge = !probe
         ? st.probing
           ? "测速中"
           : "待测速"
@@ -453,7 +436,8 @@ export function UpdatesPane() {
       const isFastest = fastestProbe !== undefined && fastestProbe.source === s;
       return {
         value,
-        label: `${host} · ${latencyText}${recommended ? " · 时区推荐" : ""}${isFastest ? " · 最快" : ""}`,
+        label: `${host}${recommended ? " · 时区推荐" : ""}${isFastest ? " · 最快" : ""}`,
+        badge,
         ...(isFastest ? { tone: "accent" as const } : {}),
       };
     }),
@@ -462,7 +446,6 @@ export function UpdatesPane() {
     ? rawSourceOptions
     : [...rawSourceOptions, { value: preferredValue, label: `${sourceLabel(preferredValue)}（已配置）` }];
   const pageUrl = st.info?.pageUrl || RELEASES_PAGE;
-  const words = (r: "cn" | "global") => sourceOrder(r).slice(0, 2).join("、");
   const phase = st.installPhase;
   const busy =
     phase === "downloading" ||
@@ -561,10 +544,9 @@ export function UpdatesPane() {
           )}
         </div>
       ) : null}
-      <ConfigSwitch k="update.autoCheck" about="启动时及每隔一段时间自动检查 GitHub 新版本；发现新版本后在右下角弹出更新卡片，下载校验完成后一键重启更新。" />
+      <ConfigSwitch k="update.autoCheck" about="有新版本时右下角提示" />
       <ConfigSelect
         k="update.checkIntervalHours"
-        about="自动检查的间隔。"
         options={[
           { value: "0.25", label: "15 分钟" },
           { value: "0.5", label: "30 分钟（默认）" },
@@ -579,26 +561,24 @@ export function UpdatesPane() {
       <SetHeading>下载来源</SetHeading>
       <ConfigSelect
         k="update.region"
-        about={`现在${regionReason(decision)}，${orderSentence(decision.region)}。命令行和这台电脑的后台服务也用这一项。`}
+        about="按时区自动决定先后顺序"
         options={[
-          // With an explicit choice (or the env override) in force, "auto" would be decided by time zone.
-          { value: "auto", label: decision.reason === "env" || decision.reason === "config" ? "自动（按时区）" : `自动（现在：${decision.region === "cn" ? "镜像" : "直连"}优先）` },
-          { value: "cn", label: `镜像优先（${words("cn")}）` },
-          { value: "global", label: `直连优先（${words("global")}）` },
+          {
+            value: "auto",
+            label:
+              decision.reason === "env" || decision.reason === "config"
+                ? "按时区自动"
+                : `按时区自动（${decision.region === "cn" ? "镜像优先" : "直连优先"}）`,
+          },
+          { value: "cn", label: "镜像优先" },
+          { value: "global", label: "GitHub 直连优先" },
         ]}
       />
-      <SetRow
-        title="首选镜像源"
-        about={
-          st.info
-            ? `${lastSourceSentence(st.info)}；默认按时区推荐并选延迟最低的可用源。`
-            : "默认按时区推荐并选延迟最低的可用源；也可手动固定指定某条线路。"
-        }
-      >
+      <SetRow title="镜像源" about="时区推荐优先，自动选最低延迟">
         <div className="row" style={{ gap: 8, alignItems: "center", justifyContent: "flex-end", minWidth: 0, maxWidth: "100%" }}>
           <div style={{ flex: "1 1 auto", minWidth: 0 }}>
             <PocketSelect
-              ariaLabel="首选镜像源"
+              ariaLabel="镜像源"
               value={preferredValue}
               options={sourceOptions}
               onValueChange={(v) => {
@@ -621,7 +601,7 @@ export function UpdatesPane() {
             }
           >
             <RefreshCw size={14} />
-            <span>{st.probing ? "测速中…" : "重新测速"}</span>
+            <span>{st.probing ? "测速中" : "测速"}</span>
           </PocketButton>
         </div>
       </SetRow>
@@ -651,7 +631,7 @@ function MirrorsRow({ mirrors }: { mirrors: readonly string[] }) {
     }
   };
   return (
-    <SetRow title={configKeySpec("update.mirrors")?.label ?? "自定义镜像"} about="自己的 GitHub 镜像地址，一行一个（以 https:// 开头、/ 结尾），会排在内置线路前面一起测速。">
+    <SetRow title={configKeySpec("update.mirrors")?.label ?? "自定义镜像"} about="每行一个 https://.../，优先测速">
       <div className="stack" style={{ gap: 6, minWidth: 220 }}>
         <PocketTextarea rows={2} mono value={text} placeholder="https://mirror.example.com/" onChange={(e) => setText(e.target.value)} />
         {dirty ? (
@@ -698,7 +678,7 @@ export function PerformancePane() {
   const diskWarn = u?.diskFreeBytes !== undefined && u.diskFreeBytes < cfg.diskWarnGb * 1024 ** 3;
   return (
     <div className="pane">
-      <PaneTitle title="性能与资源" about="只在这个页面打开时每 5 秒看一次，关掉就停。" />
+      <PaneTitle title="性能与资源" />
       {polled && !u ? <div className="faint" style={{ padding: "8px 0" }}>当前版本或平台读不到资源占用。</div> : null}
       {u ? (
         <div className="meter-grid">
@@ -728,17 +708,17 @@ export function PerformancePane() {
       <SetHeading>省电</SetHeading>
       <ConfigSelect
         k="resources.lowPower"
-        about={`开启后放慢后台刷新、关掉动画。${u ? `现在${u.onBattery ? "用电池供电" : "接着电源"}${u.lowPower ? "，省电模式生效中" : ""}。` : ""}`}
+        about={u ? `当前${u.onBattery ? "电池" : "电源"}${u.lowPower ? " · 省电中" : ""}` : "自动省电"}
         options={[
           { value: "auto", label: "自动（用电池时开启）" },
           { value: "on", label: "一直开启" },
           { value: "off", label: "关闭" },
         ]}
       />
-      <ConfigSelect k="resources.memoryWarnMb" about="本应用用的内存超过它时提醒你。" options={[512, 1024, 2048, 4096].map((n) => ({ value: String(n), label: `${n} MB` }))} />
-      <ConfigSelect k="resources.diskWarnGb" about="磁盘剩余空间低于它时提醒你。" options={[1, 5, 10, 20, 50].map((n) => ({ value: String(n), label: `${n} GB` }))} />
+      <ConfigSelect k="resources.memoryWarnMb" options={[512, 1024, 2048, 4096].map((n) => ({ value: String(n), label: `${n} MB` }))} />
+      <ConfigSelect k="resources.diskWarnGb" options={[1, 5, 10, 20, 50].map((n) => ({ value: String(n), label: `${n} GB` }))} />
       <SetHeading>清理</SetHeading>
-      <SetRow title="清理缓存" about="删掉本应用的缓存和内置浏览器的数据（会退出内置浏览器里的登录），不影响设置和配对。">
+      <SetRow title="清理缓存" about="清除缓存与内置浏览器数据">
         <PocketButton
           size="sm"
           variant="ghost"
@@ -769,13 +749,13 @@ export function AboutPane({ onReopenGuide }: { onReopenGuide?: () => void } = {}
       <SetRow title={`Herdr Pocket v${appVersion()}`} about={`${PLATFORM_LABEL[detectPlatform()] ?? detectPlatform()} 版 · 开源许可 AGPL-3.0-only`} />
       <ConfigFileBlock />
       <SetHeading>链接</SetHeading>
-      <SetRow title="项目主页" about="源码、问题反馈和安装包。">
+      <SetRow title="项目主页">
         <PocketButton size="sm" variant="ghost" onClick={() => void openExternalUrl(repo)}>
           <ExternalLink size={14} />
           <span>打开</span>
         </PocketButton>
       </SetRow>
-      <SetRow title="配置项说明" about="config.json 每一项的含义和默认值。">
+      <SetRow title="配置项说明">
         <PocketButton size="sm" variant="ghost" onClick={() => void openExternalUrl(`${repo}/blob/main/docs/config.md`)}>
           <ExternalLink size={14} />
           <span>打开</span>

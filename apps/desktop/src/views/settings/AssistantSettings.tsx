@@ -118,9 +118,7 @@ export function AssistantSettings({ subTab, onSubTab }: { subTab: AssistantTab; 
           ))}
         </div>
         <div className="faint">
-          {subTab === "models"
-            ? "存在中转服务器上，所有手机和电脑共用；改了马上生效。"
-            : "这些设置保存在中转服务器上，所有手机和电脑共用；改完要点“保存”。"}
+          {subTab === "models" ? "多端同步，改完即时生效" : "多端同步，修改后请点击保存"}
         </div>
 
         {subTab === "models" ? (
@@ -164,7 +162,7 @@ export function AssistantSettings({ subTab, onSubTab }: { subTab: AssistantTab; 
                   }))}
                 />
                 <div className="faint" style={{ fontSize: fs(12), lineHeight: 1.5 }}>
-                  {activeVoicePreset.hint}（保存后与手机端实时同步；下方所有参数仍可自由微调。）
+                  {activeVoicePreset.hint}
                 </div>
               </div>
               <div className="stack" style={{ gap: 6 }}>

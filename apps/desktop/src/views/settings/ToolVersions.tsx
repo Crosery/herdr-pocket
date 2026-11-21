@@ -93,7 +93,7 @@ export function ToolVersionsSection() {
     <>
       <SetHeading>hc、Herdr 和 uniflo</SetHeading>
       {hosts.length === 0 ? (
-        <SetRow title="没有在线的电脑" about="电脑连上中转服务器后，这里会列出它装的版本。" />
+        <SetRow title="没有在线电脑" />
       ) : (
         hosts.map((h) => (
           <div key={h.id} className="tool-host">
@@ -105,7 +105,7 @@ export function ToolVersionsSection() {
       <ConfigSwitch
         k="update.checkTools"
         disabled={!autoCheck}
-        about={autoCheck ? "这台电脑的后台服务每天查一次，只提示，不会自动安装。" : "要先打开上面的“自动检查更新”。"}
+        about={autoCheck ? "每日检查版本并提示" : "需开启自动检查更新"}
       />
     </>
   );

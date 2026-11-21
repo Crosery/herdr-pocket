@@ -77,6 +77,7 @@ import {
 } from "../lib/slashCommands";
 import { parseTerminalChatTranscript, shellTurnMatchesCommand } from "../lib/terminalChat";
 import {
+  chatQueueStore,
   dismissOutgoingSend,
   enqueuePrompt,
   moveQueuedPromptToTop,
@@ -1783,7 +1784,19 @@ export function AgentDetailPanel({
     }
 
     setSending(true);
-    void sendPromptNow(agent, raw, staged).finally(() => setSending(false));
+    void sendPromptNow(agent, raw, staged)
+      .then((ok) => {
+        if (!ok) {
+          const list = chatQueueStore.get().outgoingByAgent[agent.key] ?? [];
+          for (let i = list.length - 1; i >= 0; i -= 1) {
+            if (list[i]?.state === "failed" && list[i]?.error) {
+              toast(list[i]!.error!, true);
+              break;
+            }
+          }
+        }
+      })
+      .finally(() => setSending(false));
   };
 
   const interruptTurn = () => {
@@ -2287,7 +2300,7 @@ export function AgentDetailPanel({
                   {!hostOnline
                     ? "电脑离线，上线后自动发送"
                     : agent.status === "blocked"
-                      ? "等待确认后继续"
+                      ? "等待确认，点「立即发送」可直接送入"
                       : "当前轮结束后依次自动发送"}
                 </span>
               </div>
@@ -2481,9 +2494,11 @@ export function AgentDetailPanel({
                     : COMPOSER_SLASH_CHIP_PLACEHOLDER
                   : agent.status === "working"
                     ? "继续输入将加入排队（Enter 加入排队，/btw 可旁路提问）"
-                    : agent.isShell
-                      ? "输入终端命令按 Enter 执行…"
-                      : `发给 ${clip(agent.name || agent.title || agent.harness, 16)}（/ 命令 · 可拖入或粘贴文件）`
+                    : agent.status === "blocked"
+                      ? "直接输入回复或指令（Enter 立即送入终端）"
+                      : agent.isShell
+                        ? "输入终端命令按 Enter 执行…"
+                        : `发给 ${clip(agent.name || agent.title || agent.harness, 16)}（/ 命令 · 可拖入或粘贴文件）`
               }
               value={composerInputValue}
               onChange={(e) => {

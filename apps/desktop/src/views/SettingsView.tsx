@@ -65,7 +65,7 @@ export function SettingsView({
       case "voice":
         return (
           <div className="pane">
-            <PaneTitle title="语音输入" about="在任何应用里按快捷键说话，文字自动打进光标处。" />
+            <PaneTitle title="语音输入" />
             <VoiceInputSetup />
           </div>
         );
@@ -74,7 +74,7 @@ export function SettingsView({
       case "assistant":
         return (
           <div className="pane">
-            <PaneTitle title="小羊助理" about="这些设置存在中转服务器上：手机和每台电脑看到的是同一份，改一处处处生效。" />
+            <PaneTitle title="小羊助理" about="多端共享配置" />
             <AssistantSettings subTab={assistantTab} onSubTab={setAssistantTab} />
           </div>
         );

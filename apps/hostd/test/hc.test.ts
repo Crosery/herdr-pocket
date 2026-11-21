@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HcAdapter } from "../src/hc.ts";
@@ -69,6 +69,77 @@ test("status follows the event stream even though the subscribed connection answ
     writeFileSync(listState, "seen");
     await hc.list();
     assert.equal(HcAdapter.status(hc.terminals.get("t1")!), "idle");
+  } finally {
+    hc.stop();
+  }
+});
+
+test("HcAdapter.send delivers immediately to blocked terminals via human stream or --force fallback", SH, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hc-send-blocked-"));
+  const bin = join(dir, "hc");
+  const argsLog = join(dir, "args.json");
+  const streamLog = join(dir, "stream.log");
+  writeFileSync(argsLog, "");
+  writeFileSync(streamLog, "");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "connect") {
+  const H = 9;
+  const frame = (ch, kind, p) => { const h = Buffer.alloc(H); h.writeUInt32LE(ch, 0); h[4] = kind; h.writeUInt32LE(p.length, 5); return Buffer.concat([h, p]); };
+  let buf = Buffer.alloc(0), framed = false, mode = "unknown";
+  process.stdin.on("data", (d) => {
+    buf = Buffer.concat([buf, d]);
+    if (!framed && mode === "unknown") {
+      const nl = buf.indexOf(10);
+      if (nl < 0) return;
+      const msg = JSON.parse(buf.subarray(0, nl).toString());
+      buf = buf.subarray(nl + 1);
+      if (msg.method === "hello" && msg.params?.framed) {
+        framed = true;
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 0, result: { features: ["framed"] } }) + "\\n");
+      } else {
+        process.exit(1);
+      }
+    }
+    while (framed && buf.length >= H) {
+      const ch = buf.readUInt32LE(0), kind = buf[4], len = buf.readUInt32LE(5);
+      if (buf.length < H + len) return;
+      const p = buf.subarray(H, H + len); buf = buf.subarray(H + len);
+      if (ch === 0) {
+        const m = JSON.parse(p.toString());
+        if (m.method === "terminal.attach" && m.params.terminal === "t-fail") {
+          process.stdout.write(frame(0, 0, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { message: "attach unavailable" } }))));
+        } else {
+          process.stdout.write(frame(0, 0, Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { channel: 9, terminal: { cols: 80, rows: 24 } } }))));
+          process.stdout.write(frame(9, 0, Buffer.from("\\x1b[?2004h❯ ")));
+        }
+      } else if (ch === 9 && kind === 0) {
+        appendFileSync(${JSON.stringify(streamLog)}, p);
+      }
+    }
+  });
+} else {
+  appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(args) + "\\n");
+}
+`,
+  );
+  chmodSync(bin, 0o755);
+
+  const hc = new HcAdapter(bin);
+  hc.terminals.set("t1", { address: "t1", status: { app: "claude-code", state: "blocked", msg: "误判需要你" }, cols: 100, rows: 30 });
+  hc.terminals.set("t-fail", { address: "t-fail", status: { app: "claude-code", state: "blocked" } });
+  try {
+    await hc.send("t1", "继续跑测试", true);
+    await wait(50);
+    assert.equal(readFileSync(streamLog, "utf8"), "\x1b[200~继续跑测试\x1b[201~\r");
+    assert.equal(readFileSync(argsLog, "utf8"), "", "blocked terminal uses stream without spawning hc send");
+
+    await hc.send("t-fail", "强制送入", true);
+    const cliArgs = readFileSync(argsLog, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(cliArgs, [["send", "--force", "--", "t-fail", "强制送入"]]);
   } finally {
     hc.stop();
   }

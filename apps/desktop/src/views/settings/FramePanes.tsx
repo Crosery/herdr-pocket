@@ -60,7 +60,7 @@ export function TextScaleStepper({ className = "sf-stepper" }: { className?: str
 
 function TextScaleRow() {
   return (
-    <SetRow title="文字大小" about="只影响这台电脑上的桌面端，手机不变。">
+    <SetRow title="文字大小" about="仅影响本机桌面端">
       <TextScaleStepper />
     </SetRow>
   );
@@ -99,9 +99,9 @@ export function ChatDisplayModeControl({ className = "segmented" }: { className?
 
 export function ChatDisplayModeRow() {
   const mode = useClientConfig().general.chatDisplayMode;
-  const about = CHAT_DISPLAY_OPTIONS.find((o) => o.value === mode)?.note ?? "选择思考过程和工具调用的展示密度。";
+  const about = CHAT_DISPLAY_OPTIONS.find((o) => o.value === mode)?.note ?? "控制思考与工具展示密度";
   return (
-    <SetRow title="对话展示模式" about={`${about}（精简：全折叠 · 标准：思考独立、工具归组 · 全展示：默认展开）`}>
+    <SetRow title="对话展示模式" about={about}>
       <ChatDisplayModeControl />
     </SetRow>
   );
@@ -271,10 +271,10 @@ export function TerminalSettingsSection() {
   }, [catalog, previewTick, term.fontFamily]);
 
   const fontAbout = fontMissing
-    ? `本机未找到“${term.fontFamily}”，当前已回退默认等宽字体；请确认字体家族名拼写。`
+    ? `未找到“${term.fontFamily}”，已回退默认等宽字体`
     : catalog?.herdrFont
-      ? `默认跟随 Herdr（${catalog.herdrFont}）；自动读取本机已安装等宽与 Nerd Font 字体。`
-      : "自动读取系统与用户已安装字体（含 Nerd Font）；修改后立即生效。";
+      ? `默认跟随 Herdr（${catalog.herdrFont}）`
+      : "自动读取本机等宽与 Nerd Font";
 
   return (
     <>
@@ -350,16 +350,16 @@ export function TerminalSettingsSection() {
           ? "~/work/app \ue0a0 main $ pnpm dev · 中文对齐 0123 [] () => {}"
           : "~/work/app $ pnpm dev · 中文对齐 0123 [] () => {}"}
       </div>
-      <SetRow title="终端字号" about="终端标签页中的文字大小（10–28 px）。">
+      <SetRow title="终端字号">
         <ConfigIntStepper k="terminal.fontSize" label="终端字号" step={1} unit="px" />
       </SetRow>
-      <SetRow title="终端行高" about="每行文字的垂直间距（100%–200%）。">
+      <SetRow title="终端行高">
         <ConfigIntStepper k="terminal.lineHeight" label="终端行高" step={5} unit="%" />
       </SetRow>
-      <SetRow title="终端字重" about="常规文本粗细（300–700；粗体保持 700）。">
+      <SetRow title="终端字重">
         <ConfigIntStepper k="terminal.fontWeight" label="终端字重" step={100} />
       </SetRow>
-      <ConfigSwitch k="terminal.cursorBlink" about="在终端模式里让光标闪烁。" />
+      <ConfigSwitch k="terminal.cursorBlink" />
     </>
   );
 }
@@ -375,7 +375,7 @@ export function LookPane() {
       <ChatDisplayModeRow />
       <TerminalSettingsSection />
       <SetHeading>列表</SetHeading>
-      <ConfigSwitch k="general.showShells" about="在 Agent 列表里也列出没跑 Agent 的普通终端。" />
+      <ConfigSwitch k="general.showShells" about="列出普通 Shell 终端" />
       <StartupRows />
     </div>
   );
@@ -402,10 +402,7 @@ export function KeyboardPane() {
 
   return (
     <div className="pane">
-      <PaneTitle
-        title="键盘"
-        about={IS_MAC ? "这些快捷键在 Herdr Pocket 窗口里有效。" : "这些快捷键在 Herdr Pocket 窗口里有效；Windows 和 Linux 上用 Ctrl 键。"}
-      />
+      <PaneTitle title="键盘" />
       <SetHeading>窗口</SetHeading>
       {SHORTCUTS.map((s) => (
         <SetRow key={s.id} title={s.label}>
@@ -420,17 +417,14 @@ export function KeyboardPane() {
           </span>
         </SetRow>
       ))}
-      <SetRow title="关闭弹窗" about="设置、命令面板和其他弹出的窗口。">
+      <SetRow title="关闭弹窗">
         <span className="sf-keys">
           <kbd className="sf-kbd">Esc</kbd>
         </span>
       </SetRow>
 
       <SetHeading>语音输入</SetHeading>
-      <SetRow
-        title="语音输入快捷键"
-        about={voice.enabled ? "在任何应用里按住说话，松开后文字打进光标处。" : "语音输入还没开启，到“语音输入”里打开。"}
-      >
+      <SetRow title="语音输入快捷键" about={voice.enabled ? "全局按住说话，松开上屏" : "未开启"}>
         <span className="sf-combo">
           {voice.hotkey ? (
             <span className="sf-keys">
@@ -528,29 +522,29 @@ export function MachinesPane({
 
   return (
     <div className="pane">
-      <PaneTitle title="电脑与中继" about="桌面端是运行载体（可本地直连并与其他桌面端联调），手机端作为便携控制端可远程查看、交互并调度桌面端。" />
+      <PaneTitle title="电脑与中继" />
 
-      <SetHeading>当前设备 · 运行载体（本机）</SetHeading>
+      <SetHeading>本机服务</SetHeading>
       <SetRow
         title={
           hostd === null
             ? checking
               ? "正在检查…"
-              : "读不到这台电脑的 herdr-pocket"
+              : "未检测到 herdr-pocket"
             : hostd.configured
-              ? `已登录 herdr-pocket（${hostd.deviceName || "本机"}）`
+              ? `已登录（${hostd.deviceName || "本机"}）`
               : hostd.installed
-                ? "装了 herdr-pocket，还没登录"
-                : "这台电脑还没接入"
+                ? "已安装，未登录"
+                : "本机未接入"
         }
         about={
           hostd === null
-            ? "当前仅作为控制端连接其他桌面端；安装 herdr-pocket 后可把本机作为运行载体。"
+            ? "仅作为控制端连接远程设备"
             : hostd.configured
-              ? `本机桌面端终端与文件优先走本地直连（${serverLabel(hostd.server ?? null)}），手机端和其他桌面端也可远程联调。`
+              ? `本机优先直连（${serverLabel(hostd.server ?? null)}）`
               : hostd.installed
-                ? "在终端运行 herdr-pocket up 登录。"
-                : "要让本机的 Agent 出现在 Pocket 里，下面标红的都要装好。"
+                ? "在终端运行 herdr-pocket up"
+                : "安装并登录后可作为运行主机"
         }
       >
         <span className="sf-combo">
@@ -594,7 +588,7 @@ export function MachinesPane({
         ) : null}
       </div>
 
-      <SetHeading>桌面端 · 运行载体（可互相联调）</SetHeading>
+      <SetHeading>桌面端</SetHeading>
       {desktop.length ? (
         desktop.map((item) => (
           <DeviceRow
@@ -605,7 +599,7 @@ export function MachinesPane({
           />
         ))
       ) : (
-        <div className="faint sf-note">还没有桌面端运行载体加入。</div>
+        <div className="faint sf-note">暂无已接入的桌面端</div>
       )}
       <div className="sf-actions">
         <PocketButton size="sm" variant="ghost" onClick={onAddComputer}>
@@ -614,7 +608,7 @@ export function MachinesPane({
         </PocketButton>
       </div>
 
-      <SetHeading>移动端 · 便携控制</SetHeading>
+      <SetHeading>移动端</SetHeading>
       {mobile.length ? (
         mobile.map((item) => (
           <DeviceRow
@@ -624,7 +618,7 @@ export function MachinesPane({
           />
         ))
       ) : (
-        <div className="faint sf-note">还没有手机端连上来；手机可查看并控制上面的桌面端运行载体。</div>
+        <div className="faint sf-note">暂无已配对的移动端</div>
       )}
       <div className="sf-actions">
         <PocketButton size="sm" variant="soft" onClick={onPairPhone}>
@@ -660,31 +654,30 @@ export function PrivacyPane() {
     void refreshPerms();
   }, [refreshPerms]);
   // "到 pocket.example.com，" with a real relay; "到你连接的中转服务器，" otherwise.
-  const relay = server && !isMockServer(server) ? ` ${serverLabel(server)}` : "你连接的中转服务器";
+  const relay = server && !isMockServer(server) ? ` ${serverLabel(server)}` : "中转服务器";
 
   return (
     <div className="pane">
-      <PaneTitle title="隐私" about="系统权限管理、以及哪些信息会离开这台电脑并发往何处。" />
+      <PaneTitle title="隐私" />
 
       <SetHeading>系统权限</SetHeading>
       <div className="sf-block">
-        <div className="faint sf-block-lead">语音输入与浏览器数据导入需要的系统权限，可直接跳转设置并拖入应用授权：</div>
         <PermissionCards perms={perms} checking={checkingPerms} onChanged={() => void refreshPerms()} singleKey={HOLD_KEYS.has(voice.hotkey ?? "")} />
       </div>
 
       <SetHeading>日志</SetHeading>
       <ConfigSwitch
         k="logging.upload"
-        about={`开启后，这台设备的日志每分钟传一次到${relay}，在任何设备或命令行 herdr-pocket logs 里都能查。令牌、密钥、Cookie 和配对码写进日志前就会被遮掉。`}
+        about={`每分钟脱敏上传至${relay}`}
       />
       {upload && folder?.queuedForRelay ? (
-        <SetRow title={`还有 ${folder.queuedForRelay} 行等着上传`} about="传不上去时会自动重试。">
+        <SetRow title={`待上传 ${folder.queuedForRelay} 行`}>
           <PocketButton
             size="sm"
             variant="ghost"
             onClick={async () => {
               const n = await native.uploadLogsNow();
-              toast(n ? `已上传 ${n} 行` : "现在传不上去，稍后会自动重试");
+              toast(n ? `已上传 ${n} 行` : "稍后自动重试");
               void native.logInfo().then(setFolder);
             }}
           >
@@ -693,18 +686,12 @@ export function PrivacyPane() {
           </PocketButton>
         </SetRow>
       ) : null}
-      <SetRow title="诊断包" about="“导出诊断”只在这台电脑上写一个文件，不会自动发给任何人；要不要发给维护者由你决定。" />
+      <SetRow title="诊断包" about="仅导出到本地，不会自动上传" />
 
-      <SetHeading>发到哪里</SetHeading>
-      <SetRow title="Agent 的对话和终端" about={`只经过${relay}，在你的手机和电脑之间转发。Herdr Pocket 没有别的服务器。`} />
-      <SetRow
-        title="和小羊说话"
-        about="中转服务器把你的话交给“小羊助理”里配置的模型服务商；小羊替你查看 Agent 时，读到的终端内容也会一起发过去。"
-      />
-      <SetRow title="语音输入" about="录音发给中转服务器转成文字，由它交给配置好的语音识别服务。" />
-      <SetRow title="检查更新" about="向 GitHub 或下载镜像询问最新版本，只读版本信息。" />
-      <SetRow title="内置浏览器" about="网页直接从各网站加载；导入的 Cookie 只存在这台电脑上。" />
-      <SetRow title="使用统计" about="不收集使用统计，也不接任何第三方分析服务。" />
+      <SetHeading>数据流向</SetHeading>
+      <SetRow title="对话与终端" about={`仅经${relay}加密转发`} />
+      <SetRow title="语音与小羊" about="转发至所配模型及语音服务商" />
+      <SetRow title="本地与统计" about="Cookie 仅存本机，无第三方统计" />
     </div>
   );
 }

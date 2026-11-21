@@ -237,8 +237,10 @@ async function interruptAndSend(agent: Agent, text: string, pictures: Attachment
   inFlight.add(agent.key);
   store.setSteering(agent.key, true);
   try {
-    await call(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => undefined);
-    await sleep(STEER_SETTLE_MS);
+    if (agent.status === "working") {
+      await call(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => undefined);
+      await sleep(STEER_SETTLE_MS);
+    }
     return await sendOut(agent, text, pictures);
   } finally {
     inFlight.delete(agent.key);

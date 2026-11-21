@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ExternalLink, Keyboard, Mic, RefreshCw, Settings2, ShieldCheck, Sparkles } from "lucide-react";
+import { ExternalLink, Keyboard, Mic, RefreshCw, Settings2, ShieldCheck } from "lucide-react";
 import { configKeySpec, type TranscribeInfo } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketSelect, PocketSwitch, PocketTextarea, useToast } from "./PocketUI";
 import { PermissionGuideModal } from "./PermissionGuideModal";
@@ -68,28 +68,28 @@ function acceleratorFrom(e: ReactKeyboardEvent): string | null {
 const PERMISSION_INFO: Record<PermissionKind, { title: string; why: string; how: string }> = {
   microphone: {
     title: "麦克风",
-    why: "听你说话。没有它，语音输入和小羊通话都用不了。",
-    how: MAC ? "系统设置 › 隐私与安全性 › 麦克风，打开 Herdr Pocket" : "设置 › 隐私和安全性 › 麦克风：打开“麦克风访问权限”和“让桌面应用访问你的麦克风”",
+    why: "用于语音输入与小羊通话",
+    how: MAC ? "系统设置 › 隐私与安全性 › 麦克风" : "设置 › 隐私和安全性 › 麦克风",
   },
   accessibility: {
     title: "辅助功能",
-    why: "把识别出的文字打进你正在用的应用（微信、浏览器、编辑器）。只复制到剪贴板可以不开。",
-    how: "系统设置 › 隐私与安全性 › 辅助功能，打开 Herdr Pocket",
+    why: "识别后自动上屏，仅复制可不开启",
+    how: "系统设置 › 隐私与安全性 › 辅助功能",
   },
   inputMonitoring: {
     title: "输入监控",
-    why: "只有“按住一个键说话”需要：用来知道你什么时候按下、松开这个键。用组合键可以不开。",
-    how: "系统设置 › 隐私与安全性 › 输入监控，打开 Herdr Pocket",
+    why: "仅单键按住说话需要",
+    how: "系统设置 › 隐私与安全性 › 输入监控",
   },
   keyboard: {
     title: "地球仪键（Fn）",
-    why: "用 Fn 说话时，系统不能再拿这个键切换输入法或弹出表情。",
-    how: "系统设置 › 键盘 › “按下地球仪键时”，选“不执行任何操作”",
+    why: "避免按 Fn 时误触发系统输入法或表情",
+    how: "系统设置 › 键盘 › 按下地球仪键时",
   },
   fullDiskAccess: {
     title: "完全磁盘访问",
-    why: "读取 Safari 的 Cookie 需要。",
-    how: "系统设置 › 隐私与安全性 › 完全磁盘访问权限，打开 Herdr Pocket",
+    why: "导入 Safari Cookie 需要",
+    how: "系统设置 › 隐私与安全性 › 完全磁盘访问权限",
   },
 };
 
@@ -298,6 +298,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   const [trial, setTrial] = useState("");
   const [hotkeyNote, setHotkeyNote] = useState<{ error?: boolean; text: string } | null>(null);
   const [keyboardGuideOpen, setKeyboardGuideOpen] = useState(false);
+  const [selectedAsrRec, setSelectedAsrRec] = useState(SOTA_ASR_RECOMMENDATIONS[0]?.id ?? "");
   const { info, error: infoError } = useTranscribeInfo();
   const singleKey = isModifierKey(cfg.hotkey);
 
@@ -384,7 +385,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       <div className="set-row">
         <div className="set-text">
           <div className="set-title">识别服务</div>
-          <div className="set-about">声音发给你的中转服务器转成文字，服务器不保存录音和文字。不能识别时，请服务器管理员在后台配置。</div>
+          <div className="set-about">经中转服务器识别，不留存录音</div>
         </div>
         <div className="set-control">
           <PocketBadge tone={engine.tone}>{engine.text}</PocketBadge>
@@ -392,33 +393,25 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       </div>
 
       {!compact ? (
-        <div className="voice-sota-strip" role="region" aria-label="桌面端 SOTA 语音与识别模型推荐">
-          <div className="voice-sota-head">
-            <span className="voice-sota-title">
-              <Sparkles size={13} />
-              <span>桌面端高阶 SOTA ASR / 实时语音模型（多端同步）</span>
-            </span>
-            <PocketButton size="sm" variant="soft" onClick={() => openSettingsFrame("assistant")}>
-              配置小羊模型与语音
+        <div className="set-row">
+          <div className="set-text">
+            <div className="set-title">推荐语音与识别模型</div>
+            <div className="set-about">云端实时语音与本机 Apple Silicon MLX 预设</div>
+          </div>
+          <div className="row" style={{ gap: 8, alignItems: "center", justifyContent: "flex-end", minWidth: 0, maxWidth: "100%" }}>
+            <PocketSelect
+              ariaLabel="推荐语音与识别模型"
+              value={selectedAsrRec}
+              onValueChange={setSelectedAsrRec}
+              options={SOTA_ASR_RECOMMENDATIONS.map((rec) => ({
+                value: rec.id,
+                label: `${rec.model} · ${rec.vendor}`,
+                badge: rec.badge,
+              }))}
+            />
+            <PocketButton size="sm" variant="soft" style={{ flexShrink: 0 }} onClick={() => openSettingsFrame("assistant")}>
+              去配置
             </PocketButton>
-          </div>
-          <div className="faint" style={{ lineHeight: 1.5 }}>
-            桌面端除云端高速接口外，还可对接本地 Apple Silicon MLX / LM Studio / Faster-Whisper 网关，与手机端共用同一套小羊配置：
-          </div>
-          <div className="voice-sota-grid">
-            {SOTA_ASR_RECOMMENDATIONS.map((rec) => (
-              <div key={rec.id} className="voice-sota-chip">
-                <div className="voice-sota-chip-top">
-                  <span className="voice-sota-model mono truncate" title={rec.model}>
-                    {rec.model}
-                  </span>
-                  <span className="voice-sota-badge">{rec.badge}</span>
-                </div>
-                <div className="voice-sota-note">
-                  {rec.vendor} · {rec.note}
-                </div>
-              </div>
-            ))}
           </div>
         </div>
       ) : null}
@@ -426,7 +419,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       <div className="set-row">
         <div className="set-text">
           <div className="set-title">{configKeySpec("voiceInput.enabled")?.label}</div>
-          <div className="set-about">开启后在后台注册快捷键；关掉就完全不监听。</div>
+          <div className="set-about">在后台监听全局快捷键</div>
         </div>
         <PocketSwitch checked={cfg.enabled} disabled={!editable} onCheckedChange={(v) => void set("enabled", v)} label="语音输入" />
       </div>
@@ -435,7 +428,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
         <div className="set-text">
           <div className="set-title">{configKeySpec("voiceInput.hotkey")?.label}</div>
           <div className="set-about">
-            推荐“按住一个键说话”：{MAC ? "右边的 Option 键" : "右边的 Ctrl 键"}平时几乎用不到，按住就说，松开就打字。
+            {MAC ? "推荐单按右 Option，按住说、松开上屏" : "推荐单按右 Ctrl，按住说、松开上屏"}
             {runtimeProblem ? <span className="err-text"> {runtimeProblem}</span> : null}
             {runtime?.warning && cfg.enabled ? <span className="faint"> {runtime.warning}</span> : null}
             {hotkeyNote ? <span className={hotkeyNote.error ? "err-text" : "faint"}> {hotkeyNote.text}</span> : null}
@@ -495,7 +488,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       <div className="set-row">
         <div className="set-text">
           <div className="set-title">{configKeySpec("voiceInput.mode")?.label}</div>
-          <div className="set-about">按住说话：按住快捷键说，松开结束。按一下：按一下开始，再按一下结束，适合说长段。</div>
+          <div className="set-about">按住松开即停，或点按开始/结束</div>
         </div>
         <div className="segmented">
           <button className={cfg.mode === "hold" ? "active" : ""} disabled={!editable} onClick={() => void set("mode", "hold")}>按住说话</button>
@@ -505,7 +498,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       <div className="set-row">
         <div className="set-text">
           <div className="set-title">{configKeySpec("voiceInput.insert")?.label}</div>
-          <div className="set-about">粘贴：直接出现在光标处（需要辅助功能权限）。逐字输入：不经过剪贴板，适合不让粘贴的输入框。只复制：放进剪贴板，自己粘贴。</div>
+          <div className="set-about">粘贴需辅助功能权限；逐字输入不占剪贴板</div>
         </div>
         <PocketSelect
           value={cfg.insert}
@@ -522,7 +515,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
           <div className="set-row">
             <div className="set-text">
               <div className="set-title">{configKeySpec("voiceInput.language")?.label}</div>
-              <div className="set-about">中英混说选“自动”。</div>
+              <div className="set-about">中英混说选“自动”</div>
             </div>
             <PocketSelect
               value={["auto", "zh", "en"].includes(cfg.language) ? cfg.language : "auto"}
@@ -537,7 +530,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
           <div className="set-row">
             <div className="set-text">
               <div className="set-title">{configKeySpec("voiceInput.maxSeconds")?.label}</div>
-              <div className="set-about">说到这么久会自动结束，5 到 300 秒。</div>
+              <div className="set-about">5–300 秒自动结束</div>
             </div>
             <PocketSelect
               value={String(cfg.maxSeconds)}
@@ -548,7 +541,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
           <div className="set-row">
             <div className="set-text">
               <div className="set-title">{configKeySpec("voiceInput.sounds")?.label}</div>
-              <div className="set-about">开始和结束时轻响一声。</div>
+              <div className="set-about">起止提示音</div>
             </div>
             <PocketSwitch checked={cfg.sounds} disabled={!editable} onCheckedChange={(v) => void set("sounds", v)} label="提示音" />
           </div>

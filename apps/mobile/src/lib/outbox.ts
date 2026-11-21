@@ -234,7 +234,7 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
 
   let awaiting = false;
   const last = sends.reduce<PendingSend | undefined>((a, x) => (!a || x.ts > a.ts ? x : a), undefined);
-  if (last && !drop.includes(last.id) && agent.status !== "working" && agent.status !== "blocked" && now - last.ts < AWAIT_MS) {
+  if (last && !drop.includes(last.id) && agent.status !== "working" && (agent.status !== "blocked" || now - last.ts < 15_000) && now - last.ts < AWAIT_MS) {
     const at = echoAt.get(last.id);
     const state = at !== undefined ? "sent" : shown.find((x) => x.id === last.id)?.state;
     if (state === "sent") {

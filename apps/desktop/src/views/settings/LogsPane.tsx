@@ -121,12 +121,11 @@ export function LogsPane() {
 
   return (
     <div className="pane">
-      <PaneTitle title="日志与诊断" about="出问题时，把“导出诊断包”的文件发给维护者。令牌、密钥和 Cookie 不会写进日志。" />
+      <PaneTitle title="日志与诊断" />
 
-      <SetHeading>这台设备</SetHeading>
+      <SetHeading>本机</SetHeading>
       <ConfigSelect
         k="logging.level"
-        about="低于这个级别的不记录。排查问题时临时改成“调试”。"
         options={[
           { value: "debug", label: "调试" },
           { value: "info", label: "信息" },
@@ -134,8 +133,8 @@ export function LogsPane() {
           { value: "error", label: "错误" },
         ]}
       />
-      <ConfigSwitch k="logging.upload" about="把这台设备的日志传到中转服务器，在任何设备或命令行 herdr-pocket logs 里都能查。" />
-      <ConfigSelect k="logging.keepDays" about="本机日志文件保留多久。" options={[3, 7, 14, 30].map((n) => ({ value: String(n), label: `${n} 天` }))} />
+      <ConfigSwitch k="logging.upload" about="脱敏同步到中转服务器" />
+      <ConfigSelect k="logging.keepDays" options={[3, 7, 14, 30].map((n) => ({ value: String(n), label: `${n} 天` }))} />
       {folder ? (
         <SetRow
           title="日志文件夹"
@@ -169,7 +168,7 @@ export function LogsPane() {
           </div>
         </SetRow>
       ) : null}
-      <SetRow title="导出诊断包" about="把日志、版本、平台、本机 herdr-pocket 状态和设置（不含密钥）打成一个文件，导出后会打开它所在的文件夹。">
+      <SetRow title="导出诊断包" about="含日志、版本与本机状态，不含密钥">
         <PocketButton
           size="sm"
           variant="soft"

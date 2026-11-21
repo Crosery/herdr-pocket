@@ -11,6 +11,14 @@ const RESIZE = 3;
 const FACTS = 5;
 const HEADER = 9;
 
+/** Decodes whether the terminal most recently enabled (`?2004h`) or disabled (`?2004l`) bracketed paste. */
+export function scanBracketedPaste(chunk: string, prev: boolean): boolean {
+  const onIdx = chunk.lastIndexOf("\x1b[?2004h");
+  const offIdx = chunk.lastIndexOf("\x1b[?2004l");
+  if (onIdx < 0 && offIdx < 0) return prev;
+  return onIdx > offIdx;
+}
+
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 
 function clampInt(n: unknown, min: number, max: number, fallback: number): number {
@@ -269,8 +277,14 @@ export class HcScreens {
     return finish;
   }
 
-  private inputs = new Map<string, { channel: Promise<number>; timer?: NodeJS.Timeout }>();
-  private activeRaw = new Map<string, Set<{ channel: number; cols: number; rows: number }>>();
+  private inputs = new Map<
+    string,
+    { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; timer?: NodeJS.Timeout }
+  >();
+  private activeRaw = new Map<
+    string,
+    Set<{ channel: number; cols: number; rows: number; bracketedPaste: boolean }>
+  >();
 
   /**
    * Attaches to a terminal and streams raw PTY/VT bytes (`TerminalDataEvent` upstream)
@@ -298,7 +312,7 @@ export class HcScreens {
     const channel: number = r.channel;
     let curCols: number = clampInt(r.terminal?.cols, 20, 500, reqCols);
     let curRows: number = clampInt(r.terminal?.rows, 5, 200, reqRows);
-    const rawEntry = { channel, cols: curCols, rows: curRows };
+    const rawEntry = { channel, cols: curCols, rows: curRows, bracketedPaste: false };
     let set = this.activeRaw.get(terminal);
     if (!set) {
       set = new Set();
@@ -367,6 +381,7 @@ export class HcScreens {
       }
       if (kind !== DATA) return;
       if (payload.length) {
+        rawEntry.bracketedPaste = scanBracketedPaste(payload.toString("utf8"), rawEntry.bracketedPaste);
         pending.push(payload);
         pendingBytes += payload.length;
         consumedBytes += payload.length;
@@ -437,6 +452,132 @@ export class HcScreens {
     this.send(ch, CLOSE, Buffer.alloc(0));
   }
 
+  private refreshInputIdleTimer(
+    terminal: string,
+    entry: { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; timer?: NodeJS.Timeout },
+    ch: number,
+  ): void {
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      if (this.inputs.get(terminal) !== entry) return;
+      this.inputs.delete(terminal);
+      this.streams.delete(ch);
+      this.send(ch, CLOSE, Buffer.alloc(0));
+    }, 20_000);
+    entry.timer.unref?.();
+  }
+
+  private openInputEntry(
+    terminal: string,
+    cols: number,
+    rows: number,
+  ): { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; timer?: NodeJS.Timeout } {
+    const existing = this.inputs.get(terminal);
+    if (existing) return existing;
+
+    let resolveFirstPaint!: () => void;
+    let paintDone = false;
+    const donePaint = () => {
+      if (paintDone) return;
+      paintDone = true;
+      clearTimeout(paintTimer);
+      resolveFirstPaint();
+    };
+    const firstPaint = new Promise<void>((resolve) => {
+      resolveFirstPaint = resolve;
+    });
+    const paintTimer = setTimeout(donePaint, 35);
+    paintTimer.unref?.();
+
+    const entry: {
+      channel: Promise<number>;
+      firstPaint: Promise<void>;
+      bracketedPaste: boolean;
+      timer?: NodeJS.Timeout;
+    } = {
+      channel: Promise.resolve(0),
+      firstPaint,
+      bracketedPaste: false,
+    };
+
+    const channel = this.call("terminal.attach", { terminal, cols, rows, observe: false, resumed: true }).then((r) => {
+      const ch: number = r.channel;
+      const onFrame = (kind: number, payload: Buffer) => {
+        if (kind === DATA) {
+          if (payload.length) {
+            entry.bracketedPaste = scanBracketedPaste(payload.toString("utf8"), entry.bracketedPaste);
+          }
+          donePaint();
+          return;
+        }
+        if (kind !== CLOSE) return;
+        donePaint();
+        this.streams.delete(ch);
+        clearTimeout(entry.timer);
+        if (this.inputs.get(terminal) === entry) this.inputs.delete(terminal);
+      };
+      this.streams.set(ch, onFrame);
+      for (const [k, p] of this.early.get(ch) ?? []) onFrame(k, p);
+      this.early.delete(ch);
+      const credit = Buffer.alloc(4);
+      credit.writeUInt32LE(64 * 1024 * 1024);
+      this.send(ch, CREDIT, credit);
+      return ch;
+    });
+    entry.channel = channel;
+    this.inputs.set(terminal, entry);
+    channel.catch(() => {
+      donePaint();
+      clearTimeout(entry.timer);
+      if (this.inputs.get(terminal) === entry) this.inputs.delete(terminal);
+    });
+    return entry;
+  }
+
+  /**
+   * Pastes structured chat text (optionally wrapped in bracketed paste when the terminal
+   * opted into `?2004h`) and presses Enter directly on the human input stream, so delivery
+   * never blocks on draft quiet timers or `"blocked"` (`需要你`) refusals.
+   */
+  async paste(terminal: string, text: string, cols: number, rows: number, enter = true): Promise<void> {
+    let ch: number;
+    let bracketedPaste = false;
+    let sharedEntry:
+      | { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; timer?: NodeJS.Timeout }
+      | undefined;
+
+    const active = this.activeRaw.get(terminal);
+    let latest: { channel: number; cols: number; rows: number; bracketedPaste: boolean } | undefined;
+    if (active?.size) {
+      for (const item of active) latest = item;
+    }
+    if (latest) {
+      ch = latest.channel;
+      bracketedPaste = latest.bracketedPaste;
+    } else {
+      sharedEntry = this.openInputEntry(terminal, cols, rows);
+      [ch] = await Promise.all([sharedEntry.channel, sharedEntry.firstPaint]);
+      bracketedPaste = sharedEntry.bracketedPaste;
+    }
+
+    const clean = text.replace(/\x1b\[20[01]~/g, "");
+    if (clean.length > 0) {
+      const payload = bracketedPaste
+        ? `\x1b[200~${clean.replace(/\r?\n/g, "\r")}\x1b[201~`
+        : clean.replace(/\r\n/g, "\n");
+      this.send(ch, DATA, Buffer.from(payload, "utf8"));
+    }
+    if (enter) {
+      if (clean.length > 0) {
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      this.send(ch, DATA, Buffer.from("\r", "utf8"));
+    }
+    if (sharedEntry) {
+      this.refreshInputIdleTimer(terminal, sharedEntry, ch);
+    }
+  }
+
   /**
    * Types into a terminal the way the person at it would: raw bytes on an
    * attached (not observing) stream, so text of any script arrives at once and
@@ -445,45 +586,17 @@ export class HcScreens {
   async input(terminal: string, data: string, cols: number, rows: number): Promise<void> {
     const active = this.activeRaw.get(terminal);
     if (active?.size) {
-      let latest: { channel: number; cols: number; rows: number } | undefined;
+      let latest: { channel: number; cols: number; rows: number; bracketedPaste: boolean } | undefined;
       for (const entry of active) latest = entry;
       if (latest) {
         this.send(latest.channel, DATA, Buffer.from(data, "utf8"));
         return;
       }
     }
-    let s = this.inputs.get(terminal);
-    if (!s) {
-      const channel = this.call("terminal.attach", { terminal, cols, rows, observe: false, resumed: true }).then((r) => {
-        const ch: number = r.channel;
-        // What it paints is not needed here; keep it flowing and drop it.
-        this.streams.set(ch, (kind) => {
-          if (kind !== CLOSE) return;
-          this.streams.delete(ch);
-          if (this.inputs.get(terminal)?.channel === channel) this.inputs.delete(terminal);
-        });
-        this.early.delete(ch);
-        const credit = Buffer.alloc(4);
-        credit.writeUInt32LE(64 * 1024 * 1024);
-        this.send(ch, CREDIT, credit);
-        return ch;
-      });
-      s = { channel };
-      this.inputs.set(terminal, s);
-      channel.catch(() => {
-        if (this.inputs.get(terminal)?.channel === channel) this.inputs.delete(terminal);
-      });
-    }
-    const entry = s;
+    const entry = this.openInputEntry(terminal, cols, rows);
     const ch = await entry.channel;
     this.send(ch, DATA, Buffer.from(data, "utf8"));
-    clearTimeout(entry.timer);
-    entry.timer = setTimeout(() => {
-      if (this.inputs.get(terminal) !== entry) return;
-      this.inputs.delete(terminal);
-      this.streams.delete(ch);
-      this.send(ch, CLOSE, Buffer.alloc(0));
-    }, 20_000);
+    this.refreshInputIdleTimer(terminal, entry, ch);
   }
 
   stop(): void {
