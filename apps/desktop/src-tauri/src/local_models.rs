@@ -1,0 +1,2220 @@
+//! Native desktop fallback for discovering local agent models, catalogs, and live thinking levels
+//! when a host daemon is older or lacks `agent.models` RPC support.
+
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
+
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(300);
+const MAX_MODELS: usize = 500;
+const SESSION_TAIL_BYTES: u64 = 128 * 1024;
+const CLI_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOption {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_levels: Option<Vec<String>>,
+    pub source: &'static str,
+}
+
+#[derive(Clone)]
+struct CachedCatalog {
+    at: Instant,
+    models: Vec<ModelOption>,
+}
+
+static CLI_CATALOG_CACHE: OnceLock<Mutex<HashMap<String, CachedCatalog>>> = OnceLock::new();
+
+fn cache_map() -> &'static Mutex<HashMap<String, CachedCatalog>> {
+    CLI_CATALOG_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn normalize_harness(raw: &str) -> String {
+    let h = raw.trim().to_ascii_lowercase();
+    if h.is_empty() {
+        return "generic".into();
+    }
+    if h.contains("claude")
+        || h == "crosery"
+        || h == "prime"
+        || h == "commandcode"
+        || h == "reasonix"
+    {
+        return "claude".into();
+    }
+    if h == "omp" || h.contains("oh-my-pi") {
+        return "omp".into();
+    }
+    if h == "pi" || h.contains("pi-mono") {
+        return "pi".into();
+    }
+    if h.contains("codex") {
+        return "codex".into();
+    }
+    if h.contains("antigravity") || h == "agy" {
+        return "antigravity".into();
+    }
+    if h.contains("gemini") {
+        return "gemini".into();
+    }
+    if h.contains("deepseek") || h == "dsh" {
+        return "dsh".into();
+    }
+    if h.contains("opencode") || h.contains("kilo") || h.contains("crush") {
+        return "opencode".into();
+    }
+    if h.contains("hermes") {
+        return "hermes".into();
+    }
+    if h.contains("grok") {
+        return "grok".into();
+    }
+    if h.contains("aider") {
+        return "aider".into();
+    }
+    if h.contains("factory") || h == "droid" {
+        return "factory".into();
+    }
+    if h.contains("cursor") {
+        return "cursor".into();
+    }
+    if h.contains("kimi") {
+        return "kimi".into();
+    }
+    if h.contains("qwen") {
+        return "qwen".into();
+    }
+    if h.contains("qoder") {
+        return "qoder".into();
+    }
+    if h.contains("codebuddy") {
+        return "codebuddy".into();
+    }
+    if h.contains("goose") {
+        return "goose".into();
+    }
+    if h == "amp" {
+        return "amp".into();
+    }
+    h
+}
+
+pub fn default_thinking_levels(h_norm: &str) -> Option<&'static [&'static str]> {
+    match h_norm {
+        "omp" | "pi" => Some(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "claude" => Some(&["low", "medium", "high", "xhigh", "max", "auto"]),
+        "codex" | "grok" => Some(&["low", "medium", "high", "xhigh"]),
+        "antigravity" => Some(&["low", "medium", "high", "xhigh", "max"]),
+        "opencode" => Some(&["low", "medium", "high", "max"]),
+        "hermes" => Some(&["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]),
+        "factory" => Some(&["normal", "fast"]),
+        "amp" => Some(&["smart", "rush"]),
+        "gemini" | "dsh" | "aider" | "cursor" | "kimi" | "qwen" | "qoder" | "codebuddy"
+        | "goose" => Some(&["low", "medium", "high"]),
+        _ => None,
+    }
+}
+
+pub fn strip_model_effort_suffix(raw: &str) -> (String, Option<String>) {
+    let trimmed = raw.trim();
+    if let Some(pos) = trimmed.rfind(':') {
+        let suffix = trimmed[pos + 1..].to_ascii_lowercase();
+        let is_effort = matches!(
+            suffix.as_str(),
+            "off"
+                | "none"
+                | "minimal"
+                | "min"
+                | "low"
+                | "medium"
+                | "med"
+                | "high"
+                | "xhigh"
+                | "max"
+                | "ultra"
+                | "auto"
+                | "default"
+        );
+        if is_effort && pos > 0 {
+            return (trimmed[..pos].to_string(), Some(suffix));
+        }
+    }
+    (trimmed.to_string(), None)
+}
+
+fn is_non_reasoning_model_name(model_id: &str) -> bool {
+    let leaf = model_id
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if leaf.starts_with("gemini-1.5-")
+        || leaf.starts_with("gemini-2.0-")
+        || leaf.starts_with("gemma-3-")
+    {
+        return true;
+    }
+    const EXACT_OR_PREFIX: &[&str] = &[
+        "mimo-v2.5-asr",
+        "mimo-v2.6-flash",
+        "mimo-v2.6-pro",
+        "codex-auto-review",
+        "gpt-reserve",
+        "gpt-6-chat-thinking",
+        "kimi-for-coding-highspeed",
+    ];
+    EXACT_OR_PREFIX.iter().any(|pat| {
+        leaf == *pat
+            || leaf.starts_with(&format!("{pat}-"))
+            || leaf.starts_with(&format!("{pat}:"))
+            || leaf.starts_with(&format!("{pat}@"))
+    })
+}
+
+fn infer_hyphen_effort(model_id: &str) -> Option<String> {
+    let low = model_id.trim().to_ascii_lowercase();
+    for suffix in ["-minimal", "-xhigh", "-medium", "-high", "-low"] {
+        if low.ends_with(suffix) {
+            return Some(suffix[1..].to_string());
+        }
+    }
+    None
+}
+
+fn find_program_with_extra_dirs(name: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = crate::find_program_path(name) {
+        return Some(p);
+    }
+    #[cfg(not(windows))]
+    if let Some(h) = home {
+        for sub in [".bun/bin", ".pi/agent/bin", ".npm-global/bin"] {
+            let cand = h.join(sub).join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    let _ = home;
+    None
+}
+
+fn run_cli_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.by_ref().take(6 * 1024 * 1024).read_to_end(&mut buf);
+        buf
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                break None;
+            }
+        }
+    };
+    let bytes = reader.join().unwrap_or_default();
+    if status.map(|s| s.success()).unwrap_or(false) {
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    } else {
+        None
+    }
+}
+
+fn cached_cli_catalog<F>(key: &str, loader: F) -> Vec<ModelOption>
+where
+    F: FnOnce() -> Vec<ModelOption>,
+{
+    if let Ok(guard) = cache_map().lock() {
+        if let Some(hit) = guard.get(key) {
+            if hit.at.elapsed() < CATALOG_CACHE_TTL {
+                return hit.models.clone();
+            }
+        }
+    }
+    let models: Vec<ModelOption> = loader().into_iter().take(MAX_MODELS).collect();
+    if !models.is_empty() {
+        if let Ok(mut guard) = cache_map().lock() {
+            guard.insert(
+                key.to_string(),
+                CachedCatalog {
+                    at: Instant::now(),
+                    models: models.clone(),
+                },
+            );
+        }
+        return models;
+    }
+    if let Ok(guard) = cache_map().lock() {
+        if let Some(hit) = guard.get(key) {
+            return hit.models.clone();
+        }
+    }
+    Vec::new()
+}
+
+fn extract_thinking_array(val: Option<&Value>) -> Option<Vec<String>> {
+    let v = val?;
+    let arr = if let Some(a) = v.as_array() {
+        a
+    } else if let Some(a) = v.get("efforts").and_then(Value::as_array) {
+        a
+    } else {
+        return None;
+    };
+    let list: Vec<String> = arr
+        .iter()
+        .filter_map(|x| x.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
+}
+
+pub fn parse_omp_models_json(raw: &str) -> Vec<ModelOption> {
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let rows = if let Some(a) = parsed.get("models").and_then(Value::as_array) {
+        a
+    } else if let Some(a) = parsed.as_array() {
+        a
+    } else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for item in rows {
+        if out.len() >= MAX_MODELS {
+            break;
+        }
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        if let Some(kind) = obj.get("kind").and_then(Value::as_str) {
+            if kind != "chat" {
+                continue;
+            }
+        }
+        let id = obj
+            .get("selector")
+            .and_then(Value::as_str)
+            .or_else(|| obj.get("id").and_then(Value::as_str))
+            .map(str::trim)
+            .unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        let label = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| obj.get("id").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id)
+            .to_string();
+        let provider = obj
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let context_window = obj
+            .get("contextWindow")
+            .and_then(Value::as_u64)
+            .filter(|&n| n > 0);
+        let reasoning = obj.get("reasoning").and_then(Value::as_bool);
+        let thinking_levels = if reasoning == Some(false) {
+            None
+        } else {
+            extract_thinking_array(obj.get("thinking"))
+        };
+        out.push(ModelOption {
+            id: id.to_string(),
+            label,
+            provider,
+            context_window,
+            reasoning,
+            thinking_levels,
+            source: "catalog",
+        });
+    }
+    out
+}
+
+pub fn parse_agy_models_text(raw: &str) -> Vec<ModelOption> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        if out.len() >= MAX_MODELS {
+            break;
+        }
+        let clean = line.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        if clean.to_ascii_lowercase().starts_with("model") && !clean.contains('\t') {
+            continue;
+        }
+        let mut parts = clean.splitn(2, '\t');
+        let id = parts.next().unwrap_or("").trim();
+        if id.is_empty() || id.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let label = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id);
+        out.push(ModelOption {
+            id: id.to_string(),
+            label: label.to_string(),
+            provider: Some("antigravity".into()),
+            context_window: None,
+            reasoning: None,
+            thinking_levels: None,
+            source: "catalog",
+        });
+    }
+    out
+}
+
+pub fn parse_opencode_models_text(raw: &str) -> Vec<ModelOption> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        if out.len() >= MAX_MODELS {
+            break;
+        }
+        let id = line.trim();
+        if id.is_empty() || id.starts_with('#') || id.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let (provider, label) = match id.split_once('/') {
+            Some((p, m)) if !p.is_empty() => (p, m),
+            _ => ("opencode", id),
+        };
+        out.push(ModelOption {
+            id: id.to_string(),
+            label: label.to_string(),
+            provider: Some(provider.to_string()),
+            context_window: None,
+            reasoning: None,
+            thinking_levels: None,
+            source: "catalog",
+        });
+    }
+    out
+}
+
+fn parse_context_unit(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_lowercase();
+    let (num_str, mult) = if let Some(n) = s.strip_suffix('m') {
+        (n, 1_000_000.0)
+    } else if let Some(n) = s.strip_suffix('k') {
+        (n, 1_000.0)
+    } else {
+        return None;
+    };
+    let n: f64 = num_str.parse().ok()?;
+    if n.is_finite() && n > 0.0 {
+        Some((n * mult).round() as u64)
+    } else {
+        None
+    }
+}
+
+pub fn parse_pi_models_text(raw: &str) -> Vec<ModelOption> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        if out.len() >= MAX_MODELS {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.to_ascii_lowercase().starts_with("provider")
+            || trimmed.chars().all(|c| c == '-' || c == '─')
+        {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        let provider = cols[0];
+        let model = cols[1];
+        let id = if model.contains('/') {
+            model.to_string()
+        } else {
+            format!("{provider}/{model}")
+        };
+        let context_window = cols.get(2).and_then(|c| parse_context_unit(c));
+        let reasoning = cols.get(4).map(|c| c.eq_ignore_ascii_case("yes"));
+        out.push(ModelOption {
+            id,
+            label: model.to_string(),
+            provider: Some(provider.to_string()),
+            context_window,
+            reasoning,
+            thinking_levels: None,
+            source: "catalog",
+        });
+    }
+    out
+}
+
+fn strip_yaml_scalar(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    if (s.starts_with('"') || s.starts_with('\'')) && s.len() >= 2 {
+        let q = s.chars().next().unwrap();
+        if let Some(end) = s[1..].find(q) {
+            return s[1..1 + end].trim().to_string();
+        }
+    }
+    if let Some(idx) = s.find(" #") {
+        s[..idx].trim().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn parse_yaml_inline_array(raw: &str) -> Option<Vec<String>> {
+    let s = strip_yaml_scalar(raw);
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return None;
+    }
+    let inner = s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = inner
+        .split(',')
+        .map(|p| strip_yaml_scalar(p).to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.is_empty() {
+        None
+    } else {
+        Some(items)
+    }
+}
+
+#[derive(Default)]
+struct YmlModelDraft {
+    id: Option<String>,
+    name: Option<String>,
+    kind: Option<String>,
+    context_window: Option<u64>,
+    reasoning: Option<bool>,
+    thinking_levels: Option<Vec<String>>,
+}
+
+/// Parses non-secret model entries (`provider`, `id`, `name`, `contextWindow`, `reasoning`,
+/// `thinking` / `thinking.efforts`) from `~/.omp/agent/models.yml`. Never reads or emits
+/// `auth`, `apiKey`, `token`, `secret`, `headers`, or `baseUrl`.
+pub fn parse_omp_models_yml(raw: &str) -> Vec<ModelOption> {
+    let mut out = Vec::new();
+    let mut in_providers = false;
+    let mut provider_indent: Option<usize> = None;
+    let mut current_provider = String::new();
+    let mut in_models = false;
+    let mut models_indent: usize = 0;
+    let mut item_indent: Option<usize> = None;
+    let mut draft: Option<YmlModelDraft> = None;
+    let mut in_thinking = false;
+    let mut thinking_indent: usize = 0;
+    let mut in_efforts = false;
+    let mut efforts_indent: usize = 0;
+    let mut ignored_indent: Option<usize> = None;
+
+    let flush = |draft_opt: &mut Option<YmlModelDraft>,
+                 provider: &str,
+                 out: &mut Vec<ModelOption>| {
+        let Some(d) = draft_opt.take() else {
+            return;
+        };
+        if provider.is_empty() || out.len() >= MAX_MODELS {
+            return;
+        }
+        if let Some(kind) = d.kind.as_deref() {
+            if kind != "chat" {
+                return;
+            }
+        }
+        let Some(raw_id) = d.id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let prefix = format!("{provider}/");
+        let id = if raw_id.starts_with(&prefix) {
+            raw_id.clone()
+        } else {
+            format!("{prefix}{raw_id}")
+        };
+        let label = d
+            .name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(raw_id);
+        let thinking_levels = if d.reasoning == Some(false) {
+            None
+        } else {
+            d.thinking_levels
+        };
+        out.push(ModelOption {
+            id,
+            label,
+            provider: Some(provider.to_string()),
+            context_window: d.context_window,
+            reasoning: d.reasoning,
+            thinking_levels,
+            source: "catalog",
+        });
+    };
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+
+        if indent == 0 {
+            flush(&mut draft, &current_provider, &mut out);
+            in_models = false;
+            in_thinking = false;
+            in_efforts = false;
+            ignored_indent = None;
+            current_provider.clear();
+            provider_indent = None;
+            let key = trimmed.split(':').next().unwrap_or("").trim();
+            in_providers = key == "providers"
+                && trimmed.contains(':')
+                && strip_yaml_scalar(trimmed.split_once(':').map(|x| x.1).unwrap_or("")).is_empty();
+            continue;
+        }
+
+        if !in_providers {
+            continue;
+        }
+
+        let p_indent = *provider_indent.get_or_insert(indent);
+        if indent == p_indent {
+            flush(&mut draft, &current_provider, &mut out);
+            in_models = false;
+            in_thinking = false;
+            in_efforts = false;
+            ignored_indent = None;
+            current_provider = if let Some((k, rest)) = trimmed.split_once(':') {
+                if strip_yaml_scalar(rest).is_empty() {
+                    strip_yaml_scalar(k)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            continue;
+        }
+
+        if current_provider.is_empty() {
+            continue;
+        }
+
+        if in_models && indent <= models_indent && !trimmed.starts_with('-') {
+            flush(&mut draft, &current_provider, &mut out);
+            in_models = false;
+            in_thinking = false;
+            in_efforts = false;
+            ignored_indent = None;
+        }
+
+        if !in_models {
+            if let Some((k, rest)) = trimmed.split_once(':') {
+                if k.trim() == "models" && strip_yaml_scalar(rest).is_empty() {
+                    in_models = true;
+                    models_indent = indent;
+                    item_indent = None;
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix('-') {
+            let rest = rest.trim_start();
+            if item_indent.is_none() || item_indent == Some(indent) {
+                flush(&mut draft, &current_provider, &mut out);
+                item_indent = Some(indent);
+                draft = Some(YmlModelDraft::default());
+                in_thinking = false;
+                in_efforts = false;
+                ignored_indent = None;
+                if !rest.is_empty() && !rest.starts_with('#') {
+                    if let Some((k, v)) = rest.split_once(':') {
+                        apply_yml_draft_prop(
+                            draft.as_mut().unwrap(),
+                            k.trim(),
+                            v,
+                            indent + 2,
+                            &mut in_thinking,
+                            &mut thinking_indent,
+                            &mut in_efforts,
+                            &mut efforts_indent,
+                            &mut ignored_indent,
+                        );
+                    }
+                }
+                continue;
+            }
+        }
+
+        let Some(ref mut d) = draft else {
+            continue;
+        };
+
+        if in_thinking && indent <= thinking_indent {
+            in_thinking = false;
+            in_efforts = false;
+        }
+        if in_efforts && indent <= efforts_indent && !trimmed.starts_with('-') {
+            in_efforts = false;
+        }
+        if let Some(ign) = ignored_indent {
+            if indent <= ign {
+                ignored_indent = None;
+            }
+        }
+
+        if in_thinking {
+            if let Some(item_raw) = trimmed.strip_prefix('-') {
+                let item = strip_yaml_scalar(item_raw).to_ascii_lowercase();
+                if !item.is_empty() {
+                    let list = d.thinking_levels.get_or_insert_with(Vec::new);
+                    if !list.contains(&item) {
+                        list.push(item);
+                    }
+                }
+                continue;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                if k.trim() == "efforts" {
+                    if let Some(arr) = parse_yaml_inline_array(v) {
+                        d.thinking_levels = Some(arr);
+                    } else if strip_yaml_scalar(v).is_empty() {
+                        in_efforts = true;
+                        efforts_indent = indent;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if ignored_indent.is_some() {
+            continue;
+        }
+
+        if let Some((k, v)) = trimmed.split_once(':') {
+            apply_yml_draft_prop(
+                d,
+                k.trim(),
+                v,
+                indent,
+                &mut in_thinking,
+                &mut thinking_indent,
+                &mut in_efforts,
+                &mut efforts_indent,
+                &mut ignored_indent,
+            );
+        }
+    }
+
+    flush(&mut draft, &current_provider, &mut out);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_yml_draft_prop(
+    d: &mut YmlModelDraft,
+    key: &str,
+    val_raw: &str,
+    indent: usize,
+    in_thinking: &mut bool,
+    thinking_indent: &mut usize,
+    in_efforts: &mut bool,
+    efforts_indent: &mut usize,
+    ignored_indent: &mut Option<usize>,
+) {
+    let val = strip_yaml_scalar(val_raw);
+    match key {
+        "id" => {
+            if !val.is_empty() {
+                d.id = Some(val);
+            }
+        }
+        "name" => {
+            if !val.is_empty() {
+                d.name = Some(val);
+            }
+        }
+        "kind" => {
+            if !val.is_empty() {
+                d.kind = Some(val.to_ascii_lowercase());
+            }
+        }
+        "contextWindow" => {
+            if let Ok(n) = val.parse::<u64>() {
+                if n > 0 {
+                    d.context_window = Some(n);
+                }
+            }
+        }
+        "reasoning" => {
+            if val.eq_ignore_ascii_case("true") {
+                d.reasoning = Some(true);
+            } else if val.eq_ignore_ascii_case("false") {
+                d.reasoning = Some(false);
+            }
+        }
+        "thinking" => {
+            if let Some(arr) = parse_yaml_inline_array(val_raw) {
+                d.thinking_levels = Some(arr);
+            } else if val.is_empty() {
+                *in_thinking = true;
+                *thinking_indent = indent;
+                *in_efforts = false;
+                *efforts_indent = 0;
+            } else {
+                d.thinking_levels = None;
+            }
+        }
+        _ => {
+            if val.is_empty() {
+                *ignored_indent = Some(indent);
+            }
+        }
+    }
+}
+
+struct ParsedSpeedMeta {
+    clean: String,
+    base_leaf: String,
+    tier: &'static str,
+    provider_base: String,
+    provider_segments: Vec<String>,
+}
+
+fn strip_speed_tier_from_provider(seg: &str) -> String {
+    if let Some(s) = seg.strip_suffix("-ultrafast") {
+        s.to_string()
+    } else if let Some(s) = seg.strip_suffix("-fast") {
+        s.to_string()
+    } else {
+        seg.to_string()
+    }
+}
+
+fn parse_speed_meta(raw: &str) -> ParsedSpeedMeta {
+    let (clean_orig, _) = strip_model_effort_suffix(raw);
+    let clean = clean_orig.trim().to_ascii_lowercase();
+    let segments: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+    let leaf = segments.last().copied().unwrap_or("");
+    let parent = if segments.len() >= 2 {
+        segments[segments.len() - 2]
+    } else {
+        ""
+    };
+    let provider_segments = segments[..segments.len().saturating_sub(1)]
+        .iter()
+        .map(|s| strip_speed_tier_from_provider(s))
+        .collect();
+
+    let (tier, base_leaf) = if let Some(b) = leaf.strip_suffix("-ultrafast") {
+        ("ultrafast", b.to_string())
+    } else if let Some(b) = leaf.strip_suffix("-fast") {
+        ("fast", b.to_string())
+    } else if parent.ends_with("-ultrafast") {
+        ("ultrafast", leaf.to_string())
+    } else if parent.ends_with("-fast") {
+        ("fast", leaf.to_string())
+    } else {
+        ("", leaf.to_string())
+    };
+
+    let provider_base = strip_speed_tier_from_provider(parent);
+    ParsedSpeedMeta {
+        clean,
+        base_leaf,
+        tier,
+        provider_base,
+        provider_segments,
+    }
+}
+
+pub fn find_catalog_match<'a>(
+    raw_id: &str,
+    catalog: &'a [ModelOption],
+) -> Option<&'a ModelOption> {
+    let q_meta = parse_speed_meta(raw_id);
+    if q_meta.clean.is_empty() {
+        return None;
+    }
+    if let Some(exact) = catalog
+        .iter()
+        .find(|c| c.id.eq_ignore_ascii_case(&q_meta.clean))
+    {
+        return Some(exact);
+    }
+    let suffix = format!("/{}", q_meta.clean);
+    if let Some(hit) = catalog
+        .iter()
+        .find(|c| c.id.to_ascii_lowercase().ends_with(&suffix))
+    {
+        return Some(hit);
+    }
+
+    let parsed: Vec<(&ModelOption, ParsedSpeedMeta)> = catalog
+        .iter()
+        .map(|c| (c, parse_speed_meta(&c.id)))
+        .collect();
+
+    if !q_meta.provider_base.is_empty() {
+        if let Some((c, _)) = parsed.iter().find(|(_, m)| {
+            m.base_leaf == q_meta.base_leaf
+                && m.tier == q_meta.tier
+                && m.provider_segments.contains(&q_meta.provider_base)
+        }) {
+            return Some(*c);
+        }
+    }
+
+    if let Some((c, _)) = parsed
+        .iter()
+        .find(|(_, m)| m.base_leaf == q_meta.base_leaf && m.tier == q_meta.tier)
+    {
+        return Some(*c);
+    }
+
+    if !q_meta.tier.is_empty() {
+        if !q_meta.provider_base.is_empty() {
+            if let Some((c, _)) = parsed.iter().find(|(_, m)| {
+                m.base_leaf == q_meta.base_leaf
+                    && m.provider_segments.contains(&q_meta.provider_base)
+            }) {
+                return Some(*c);
+            }
+        }
+        if let Some((c, _)) = parsed.iter().find(|(_, m)| m.base_leaf == q_meta.base_leaf) {
+            return Some(*c);
+        }
+    }
+
+    None
+}
+
+#[derive(Default)]
+struct OmpConfigInfo {
+    models: Vec<ModelOption>,
+    default_model: Option<String>,
+    default_thinking: Option<String>,
+}
+
+fn read_omp_config_yml(home: &Path) -> OmpConfigInfo {
+    let mut info = OmpConfigInfo::default();
+    let path = home.join(".omp").join("agent").join("config.yml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return info;
+    };
+    let mut in_roles = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 {
+            in_roles = false;
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let key = k.trim();
+                let val = strip_yaml_scalar(v);
+                if key == "defaultThinkingLevel" && !val.is_empty() {
+                    info.default_thinking = Some(val.to_ascii_lowercase());
+                } else if key == "modelRoles" && val.is_empty() {
+                    in_roles = true;
+                }
+            }
+            continue;
+        }
+        if in_roles {
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let role = k.trim();
+                let val = strip_yaml_scalar(v);
+                let (id, effort) = strip_model_effort_suffix(&val);
+                if id.is_empty() {
+                    continue;
+                }
+                let provider = id
+                    .split_once('/')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_else(|| "omp".into());
+                if role == "default" && info.default_model.is_none() {
+                    info.default_model = Some(id.clone());
+                    if info.default_thinking.is_none() {
+                        info.default_thinking = effort;
+                    }
+                }
+                info.models.push(ModelOption {
+                    id: id.clone(),
+                    label: id,
+                    provider: Some(provider),
+                    context_window: None,
+                    reasoning: None,
+                    thinking_levels: None,
+                    source: "recent",
+                });
+            }
+        }
+    }
+    info
+}
+
+fn read_omp_models_yml(home: &Path) -> Vec<ModelOption> {
+    let path = home.join(".omp").join("agent").join("models.yml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_omp_models_yml(&raw)
+}
+
+fn find_session_jsonl(home: &Path, h_norm: &str, session_key: &str) -> Option<PathBuf> {
+    let id = match session_key.split_once(':') {
+        Some((_, rest)) => rest.trim(),
+        None => session_key.trim(),
+    };
+    if id.len() < 4 {
+        return None;
+    }
+    let lower_id = id.to_ascii_lowercase();
+    let roots: Vec<PathBuf> = match h_norm {
+        "omp" => vec![home.join(".omp").join("agent").join("sessions")],
+        "pi" => vec![home.join(".pi").join("agent").join("sessions")],
+        "claude" => vec![home.join(".claude").join("projects")],
+        "codex" => vec![home.join(".codex").join("sessions")],
+        _ => vec![
+            home.join(".omp").join("agent").join("sessions"),
+            home.join(".pi").join("agent").join("sessions"),
+            home.join(".claude").join("projects"),
+            home.join(".codex").join("sessions"),
+        ],
+    };
+
+    let mut exact: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let mut prefix: Vec<(PathBuf, SystemTime)> = Vec::new();
+
+    fn walk(
+        dir: &Path,
+        depth: usize,
+        lower_id: &str,
+        exact: &mut Vec<(PathBuf, SystemTime)>,
+        prefix: &mut Vec<(PathBuf, SystemTime)>,
+    ) {
+        if depth > 4 || !dir.is_dir() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for ent in entries.flatten() {
+            let name = ent.file_name();
+            let name_s = name.to_string_lossy();
+            if name_s == ".git" || name_s == "node_modules" {
+                continue;
+            }
+            let path = ent.path();
+            if path.is_dir() {
+                walk(&path, depth + 1, lower_id, exact, prefix);
+                continue;
+            }
+            if !name_s.ends_with(".jsonl") || name_s == "changes.jsonl" {
+                continue;
+            }
+            let lower_name = name_s.to_ascii_lowercase();
+            let is_exact = lower_name == format!("{lower_id}.jsonl")
+                || lower_name.ends_with(&format!("_{lower_id}.jsonl"))
+                || lower_name.ends_with(&format!("-{lower_id}.jsonl"));
+            let is_prefix = !is_exact
+                && lower_id.len() >= 6
+                && (lower_name.starts_with(lower_id)
+                    || lower_name.contains(&format!("_{lower_id}"))
+                    || lower_name.contains(&format!("-{lower_id}")));
+            if !is_exact && !is_prefix {
+                continue;
+            }
+            let mtime = ent
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if is_exact {
+                exact.push((path, mtime));
+            } else {
+                prefix.push((path, mtime));
+            }
+        }
+    }
+
+    for root in roots {
+        walk(&root, 0, &lower_id, &mut exact, &mut prefix);
+    }
+    let pool = if !exact.is_empty() {
+        &mut exact
+    } else {
+        &mut prefix
+    };
+    pool.sort_by(|a, b| b.1.cmp(&a.1));
+    pool.first().map(|x| x.0.clone())
+}
+
+pub fn read_session_tail_model_and_thinking(
+    home: &Path,
+    h_norm: &str,
+    session_key: &str,
+) -> (Option<String>, Option<String>) {
+    let Some(path) = find_session_jsonl(home, h_norm, session_key) else {
+        return (None, None);
+    };
+    read_jsonl_tail(&path)
+}
+
+fn read_jsonl_tail(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(mut file) = File::open(path) else {
+        return (None, None);
+    };
+    let Ok(meta) = file.metadata() else {
+        return (None, None);
+    };
+    let size = meta.len();
+    if size == 0 {
+        return (None, None);
+    }
+    let start = size.saturating_sub(SESSION_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (None, None);
+    }
+    let mut buf = Vec::with_capacity((size - start) as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return (None, None);
+    }
+    let slice = if start > 0 {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(nl) => &buf[nl + 1..],
+            None => return (None, None),
+        }
+    } else {
+        &buf[..]
+    };
+    let text = String::from_utf8_lossy(slice);
+    let mut model: Option<String> = None;
+    let mut thinking: Option<String> = None;
+
+    for raw_line in text.lines().rev() {
+        let line = raw_line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let ev_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+
+        if thinking.is_none() {
+            let t = if ev_type == "thinking_level_change" {
+                obj.get("thinkingLevel")
+                    .or_else(|| obj.get("level"))
+                    .and_then(Value::as_str)
+            } else if let Some(tm) = obj.get("thinkingMetadata").and_then(Value::as_object) {
+                if tm.get("disabled").and_then(Value::as_bool) == Some(true) {
+                    Some("off")
+                } else {
+                    tm.get("level")
+                        .or_else(|| tm.get("effort"))
+                        .and_then(Value::as_str)
+                }
+            } else if let Some(s) = obj
+                .get("perTurnEffort")
+                .or_else(|| obj.get("effort"))
+                .and_then(Value::as_str)
+            {
+                Some(s)
+            } else if ev_type == "turn_context" {
+                obj.get("payload")
+                    .and_then(|p| {
+                        p.get("reasoning_effort")
+                            .or_else(|| p.get("effort"))
+                            .or_else(|| p.pointer("/collaboration_mode/settings/reasoning_effort"))
+                    })
+                    .and_then(Value::as_str)
+            } else {
+                obj.get("reasoning_effort")
+                    .or_else(|| obj.pointer("/payload/reasoning_effort"))
+                    .and_then(Value::as_str)
+            };
+            if let Some(tv) = t.map(str::trim).filter(|s| !s.is_empty()) {
+                thinking = Some(tv.to_ascii_lowercase());
+            }
+        }
+
+        if model.is_none() {
+            let m_raw: Option<String> = if ev_type == "model_change" {
+                if let Some(m) = obj
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(m.to_string())
+                } else if let Some(mid) = obj
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let prov = obj
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if !prov.is_empty() && !mid.starts_with(&format!("{prov}/")) {
+                        Some(format!("{prov}/{mid}"))
+                    } else {
+                        Some(mid.to_string())
+                    }
+                } else {
+                    None
+                }
+            } else if let Some(rm) = obj
+                .get("requestedModel")
+                .or_else(|| obj.pointer("/message/model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "<synthetic>")
+            {
+                Some(rm.to_string())
+            } else if ev_type == "turn_context" {
+                obj.get("payload")
+                    .and_then(|p| {
+                        p.get("model")
+                            .or_else(|| p.pointer("/collaboration_mode/settings/model"))
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+
+            if let Some(m_str) = m_raw {
+                let (base, effort) = strip_model_effort_suffix(&m_str);
+                if !base.is_empty() {
+                    model = Some(base);
+                    if thinking.is_none() {
+                        thinking = effort;
+                    }
+                }
+            }
+        }
+
+        if model.is_some() && thinking.is_some() {
+            break;
+        }
+    }
+
+    (model, thinking)
+}
+
+fn read_toml_quoted_value(raw: &str, key: &str) -> Option<String> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        let cleaned = strip_yaml_scalar(v);
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
+    None
+}
+
+fn read_simple_yaml_key(raw: &str, key: &str) -> Option<String> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        let cleaned = strip_yaml_scalar(v);
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
+    None
+}
+
+struct LocalConfigured {
+    models: Vec<ModelOption>,
+    thinking_by_harness: HashMap<String, String>,
+}
+
+fn read_local_configured(home: &Path) -> LocalConfigured {
+    let mut out = Vec::new();
+    let mut thinking_by_harness = HashMap::new();
+
+    if let Ok(raw) = fs::read_to_string(home.join(".claude").join("settings.json")) {
+        if let Ok(json) = serde_json::from_str::<Value>(&raw) {
+            if let Some(eff) = json
+                .get("effortLevel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                thinking_by_harness.insert("claude".into(), eff.to_ascii_lowercase());
+            }
+            let candidates = [
+                json.get("model"),
+                json.pointer("/env/ANTHROPIC_MODEL"),
+                json.pointer("/env/ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                json.pointer("/env/ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                json.pointer("/env/ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            ];
+            for cand in candidates.into_iter().flatten() {
+                if let Some(s) = cand.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    let low = s.to_ascii_lowercase();
+                    if !low.starts_with("sk-")
+                        && !low.starts_with("http://")
+                        && !low.starts_with("https://")
+                    {
+                        out.push(ModelOption {
+                            id: s.to_string(),
+                            label: s.to_string(),
+                            provider: Some("claude".into()),
+                            context_window: None,
+                            reasoning: None,
+                            thinking_levels: None,
+                            source: "catalog",
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(raw) = fs::read_to_string(home.join(".codex").join("config.toml")) {
+        if let Some(m) = read_toml_quoted_value(&raw, "model") {
+            out.push(ModelOption {
+                id: m.clone(),
+                label: m,
+                provider: Some("codex".into()),
+                context_window: None,
+                reasoning: None,
+                thinking_levels: None,
+                source: "catalog",
+            });
+        }
+        if let Some(e) = read_toml_quoted_value(&raw, "model_reasoning_effort") {
+            thinking_by_harness.insert("codex".into(), e.to_ascii_lowercase());
+        }
+    }
+
+    if let Ok(raw) = fs::read_to_string(
+        home.join(".config")
+            .join("opencode")
+            .join("opencode.json"),
+    ) {
+        if let Ok(json) = serde_json::from_str::<Value>(&raw) {
+            if let Some(m) = json
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                out.push(ModelOption {
+                    id: m.to_string(),
+                    label: m.to_string(),
+                    provider: Some("opencode".into()),
+                    context_window: None,
+                    reasoning: None,
+                    thinking_levels: None,
+                    source: "catalog",
+                });
+            }
+        }
+    }
+
+    if let Ok(raw) = fs::read_to_string(home.join(".gemini").join("settings.json")) {
+        if let Ok(json) = serde_json::from_str::<Value>(&raw) {
+            let model_name = json
+                .pointer("/model/name")
+                .or_else(|| json.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(m) = model_name {
+                out.push(ModelOption {
+                    id: m.to_string(),
+                    label: m.to_string(),
+                    provider: Some("gemini".into()),
+                    context_window: None,
+                    reasoning: None,
+                    thinking_levels: None,
+                    source: "catalog",
+                });
+            }
+            if let Some(think) = json
+                .pointer("/thinkingConfig/thinkingLevel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                thinking_by_harness.insert("gemini".into(), think.to_ascii_lowercase());
+            }
+        }
+    }
+
+    if let Ok(raw) = fs::read_to_string(home.join(".pi").join("agent").join("settings.json")) {
+        if let Ok(json) = serde_json::from_str::<Value>(&raw) {
+            if let Some(dm) = json
+                .get("defaultModel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let dp = json
+                    .get("defaultProvider")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("");
+                let id = if !dp.is_empty() && !dm.contains('/') {
+                    format!("{dp}/{dm}")
+                } else {
+                    dm.to_string()
+                };
+                out.push(ModelOption {
+                    id: id.clone(),
+                    label: id,
+                    provider: Some("pi".into()),
+                    context_window: None,
+                    reasoning: None,
+                    thinking_levels: None,
+                    source: "catalog",
+                });
+            }
+            if let Some(think) = json
+                .get("defaultThinkingLevel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                thinking_by_harness.insert("pi".into(), think.to_ascii_lowercase());
+            }
+        }
+    }
+
+    if let Ok(raw) = fs::read_to_string(home.join(".hermes").join("config.yaml")) {
+        if let Some(m) = read_simple_yaml_key(&raw, "default") {
+            out.push(ModelOption {
+                id: m.clone(),
+                label: m,
+                provider: Some("hermes".into()),
+                context_window: None,
+                reasoning: None,
+                thinking_levels: None,
+                source: "catalog",
+            });
+        }
+        if let Some(e) = read_simple_yaml_key(&raw, "reasoning_effort") {
+            thinking_by_harness.insert("hermes".into(), e.to_ascii_lowercase());
+        }
+    }
+
+    if let Ok(raw) = fs::read_to_string(home.join(".aider.conf.yml")) {
+        if let Some(m) = read_simple_yaml_key(&raw, "model") {
+            out.push(ModelOption {
+                id: m.clone(),
+                label: m,
+                provider: Some("aider".into()),
+                context_window: None,
+                reasoning: None,
+                thinking_levels: None,
+                source: "catalog",
+            });
+        }
+        if let Some(e) = read_simple_yaml_key(&raw, "reasoning-effort") {
+            thinking_by_harness.insert("aider".into(), e.to_ascii_lowercase());
+        }
+    }
+
+    LocalConfigured {
+        models: out,
+        thinking_by_harness,
+    }
+}
+
+fn fallback_presets(h_norm: &str) -> Vec<ModelOption> {
+    let mk = |id: &str, label: &str, provider: &str, reasoning: Option<bool>| ModelOption {
+        id: id.into(),
+        label: label.into(),
+        provider: Some(provider.into()),
+        context_window: None,
+        reasoning,
+        thinking_levels: None,
+        source: "catalog",
+    };
+    match h_norm {
+        "claude" => vec![
+            mk("default", "Default", "anthropic", None),
+            mk("opus", "Opus", "anthropic", None),
+            mk("sonnet", "Sonnet", "anthropic", None),
+            mk("haiku", "Haiku", "anthropic", None),
+            mk("opusplan", "Opus Plan", "anthropic", None),
+            mk("claude-opus-5-5", "Claude Opus 5.5", "anthropic", None),
+            mk("claude-sonnet-5", "Claude Sonnet 5", "anthropic", None),
+            mk("claude-haiku-5-5", "Claude Haiku 5.5", "anthropic", None),
+        ],
+        "codex" => vec![
+            mk("gpt-6.2-astra", "GPT-6.2 Astra", "openai", None),
+            mk("gpt-6.2-sol", "GPT-6.2 Sol", "openai", None),
+            mk("gpt-6-astra", "GPT-6 Astra", "openai", None),
+        ],
+        "gemini" => vec![
+            mk("gemini-3.5-pro", "Gemini 3.5 Pro", "google", None),
+            mk("gemini-3.8-flash-high", "Gemini 3.8 Flash High", "google", None),
+        ],
+        "antigravity" => vec![
+            mk("gemini-4-neon-high", "Gemini 4 Neon (High)", "google", None),
+            mk("gemini-4-carbon-high", "Gemini 4 Carbon (High)", "google", None),
+            mk("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)", "google", None),
+        ],
+        "dsh" => vec![
+            mk("deepseek-chat", "DeepSeek Chat", "deepseek", None),
+            mk("deepseek-reasoner", "DeepSeek Reasoner", "deepseek", Some(true)),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn get_omp_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
+    cached_cli_catalog("omp", || {
+        let Some(bin) = find_program_with_extra_dirs("omp", home) else {
+            return Vec::new();
+        };
+        if let Some(out) = run_cli_stdout(&bin, &["models", "--json"], CLI_TIMEOUT) {
+            let parsed = parse_omp_models_json(&out);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        if let Some(out) =
+            run_cli_stdout(&bin, &["models", "--json", "--no-extensions"], CLI_TIMEOUT)
+        {
+            return parse_omp_models_json(&out);
+        }
+        Vec::new()
+    })
+}
+
+fn get_pi_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
+    let pi = cached_cli_catalog("pi", || {
+        let Some(bin) = find_program_with_extra_dirs("pi", home) else {
+            return Vec::new();
+        };
+        run_cli_stdout(&bin, &["--list-models"], CLI_TIMEOUT)
+            .map(|out| parse_pi_models_text(&out))
+            .unwrap_or_default()
+    });
+    if pi.is_empty() {
+        get_omp_cli_catalog(home)
+    } else {
+        pi
+    }
+}
+
+fn get_agy_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
+    cached_cli_catalog("antigravity", || {
+        let Some(bin) = find_program_with_extra_dirs("agy", home) else {
+            return Vec::new();
+        };
+        run_cli_stdout(&bin, &["models"], CLI_TIMEOUT)
+            .map(|out| parse_agy_models_text(&out))
+            .unwrap_or_default()
+    })
+}
+
+fn get_opencode_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
+    cached_cli_catalog("opencode", || {
+        let Some(bin) = find_program_with_extra_dirs("opencode", home)
+            .or_else(|| find_program_with_extra_dirs("kilo", home))
+        else {
+            return Vec::new();
+        };
+        run_cli_stdout(&bin, &["models"], CLI_TIMEOUT)
+            .map(|out| parse_opencode_models_text(&out))
+            .unwrap_or_default()
+    })
+}
+
+fn push_model_opt(
+    opt: ModelOption,
+    prefer_upgrade: bool,
+    combined_catalog: &[ModelOption],
+    merged: &mut Vec<ModelOption>,
+    seen: &mut HashSet<String>,
+    aliases: &mut HashSet<String>,
+) {
+    if merged.len() >= MAX_MODELS {
+        return;
+    }
+    let clean = opt.id.trim().to_string();
+    let k = clean.to_ascii_lowercase();
+    if k.is_empty() || seen.contains(&k) || aliases.contains(&k) {
+        return;
+    }
+    if prefer_upgrade {
+        if let Some(cat_hit) = find_catalog_match(&clean, combined_catalog) {
+            let mk = cat_hit.id.to_ascii_lowercase();
+            if seen.contains(&mk) {
+                return;
+            }
+            seen.insert(mk);
+            aliases.insert(k);
+            let mut upgraded = cat_hit.clone();
+            upgraded.source = opt.source;
+            merged.push(upgraded);
+            return;
+        }
+    }
+    seen.insert(k);
+    let mut next = opt;
+    next.id = clean;
+    merged.push(next);
+}
+
+pub fn build_local_agent_models_with(
+    harness: &str,
+    current_model: Option<&str>,
+    session_key: Option<&str>,
+    home: Option<&Path>,
+    use_cli: bool,
+) -> Value {
+    let h_norm = normalize_harness(harness);
+    let local_cfg = home.map(read_local_configured).unwrap_or(LocalConfigured {
+        models: Vec::new(),
+        thinking_by_harness: HashMap::new(),
+    });
+    let omp_cfg = if h_norm == "omp" {
+        home.map(read_omp_config_yml).unwrap_or_default()
+    } else {
+        OmpConfigInfo::default()
+    };
+    let yml_catalog = if h_norm == "omp" {
+        home.map(read_omp_models_yml).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let cli_catalog = if use_cli {
+        match h_norm.as_str() {
+            "omp" => get_omp_cli_catalog(home),
+            "pi" => get_pi_cli_catalog(home),
+            "antigravity" => get_agy_cli_catalog(home),
+            "opencode" => get_opencode_cli_catalog(home),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let (live_model, live_thinking) = match (home, session_key) {
+        (Some(h), Some(sk)) if !sk.trim().is_empty() => {
+            read_session_tail_model_and_thinking(h, &h_norm, sk.trim())
+        }
+        _ => (None, None),
+    };
+
+    let raw_model = {
+        let arg_m = current_model.map(str::trim).unwrap_or("");
+        if let Some(ref lm) = live_model {
+            if !arg_m.is_empty()
+                && !lm.contains('/')
+                && arg_m
+                    .to_ascii_lowercase()
+                    .ends_with(&format!("/{}", lm.to_ascii_lowercase()))
+            {
+                arg_m.to_string()
+            } else {
+                lm.clone()
+            }
+        } else {
+            arg_m.to_string()
+        }
+    };
+
+    let (parsed_id, parsed_effort) = if raw_model.is_empty() {
+        (String::new(), None)
+    } else {
+        strip_model_effort_suffix(&raw_model)
+    };
+    let effective_model = if !parsed_id.is_empty() {
+        Some(parsed_id)
+    } else if h_norm == "omp" {
+        omp_cfg.default_model.clone()
+    } else {
+        None
+    };
+
+    let mut effective_thinking = parsed_effort
+        .or(live_thinking)
+        .or_else(|| {
+            if h_norm == "omp" {
+                omp_cfg.default_thinking.clone()
+            } else {
+                None
+            }
+        })
+        .or_else(|| local_cfg.thinking_by_harness.get(&h_norm).cloned())
+        .or_else(|| effective_model.as_deref().and_then(infer_hyphen_effort));
+
+    let mut combined_catalog = cli_catalog;
+    let mut cat_idx: HashMap<String, usize> = combined_catalog
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.to_ascii_lowercase(), i))
+        .collect();
+    for y_item in yml_catalog {
+        let k = y_item.id.to_ascii_lowercase();
+        if let Some(&idx) = cat_idx.get(&k) {
+            let cur = &mut combined_catalog[idx];
+            if cur.provider.is_none() {
+                cur.provider = y_item.provider;
+            }
+            if cur.context_window.is_none() {
+                cur.context_window = y_item.context_window;
+            }
+            if cur.reasoning.is_none() {
+                cur.reasoning = y_item.reasoning;
+            }
+            if cur.thinking_levels.is_none() && cur.reasoning != Some(false) {
+                cur.thinking_levels = y_item.thinking_levels;
+            }
+        } else {
+            cat_idx.insert(k, combined_catalog.len());
+            combined_catalog.push(y_item);
+        }
+    }
+
+    let mut merged: Vec<ModelOption> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut aliases: HashSet<String> = HashSet::new();
+
+    if let Some(ref cur_m) = effective_model {
+        if let Some(cat_hit) = find_catalog_match(cur_m, &combined_catalog) {
+            seen.insert(cat_hit.id.to_ascii_lowercase());
+            aliases.insert(cur_m.to_ascii_lowercase());
+            let mut cur = cat_hit.clone();
+            cur.source = "current";
+            merged.push(cur);
+        } else {
+            push_model_opt(
+                ModelOption {
+                    id: cur_m.clone(),
+                    label: cur_m.clone(),
+                    provider: None,
+                    context_window: None,
+                    reasoning: None,
+                    thinking_levels: None,
+                    source: "current",
+                },
+                false,
+                &combined_catalog,
+                &mut merged,
+                &mut seen,
+                &mut aliases,
+            );
+        }
+    }
+
+    if h_norm == "omp" {
+        for item in omp_cfg.models {
+            push_model_opt(
+                item,
+                true,
+                &combined_catalog,
+                &mut merged,
+                &mut seen,
+                &mut aliases,
+            );
+        }
+    }
+
+    for item in local_cfg.models {
+        if item.provider.as_deref().map(|p| p == h_norm).unwrap_or(true) {
+            push_model_opt(
+                item,
+                true,
+                &combined_catalog,
+                &mut merged,
+                &mut seen,
+                &mut aliases,
+            );
+        }
+    }
+
+    for item in &combined_catalog {
+        push_model_opt(
+            item.clone(),
+            false,
+            &combined_catalog,
+            &mut merged,
+            &mut seen,
+            &mut aliases,
+        );
+    }
+
+    if merged.len() < 5 {
+        let mut presets = fallback_presets(&h_norm);
+        if presets.is_empty() && merged.is_empty() {
+            presets = fallback_presets("claude");
+        }
+        for preset in presets {
+            push_model_opt(
+                preset,
+                false,
+                &combined_catalog,
+                &mut merged,
+                &mut seen,
+                &mut aliases,
+            );
+        }
+    }
+
+    let current_opt = merged.first().filter(|m| m.source == "current");
+    let final_model = current_opt
+        .map(|m| m.id.clone())
+        .or_else(|| effective_model.clone());
+    let is_non_reasoning = current_opt.and_then(|m| m.reasoning) == Some(false)
+        || (current_opt.and_then(|m| m.reasoning).is_none()
+            && final_model
+                .as_deref()
+                .map(is_non_reasoning_model_name)
+                .unwrap_or(false));
+
+    let thinking_levels: Option<Vec<String>> = if is_non_reasoning {
+        None
+    } else if let Some(levels) = current_opt.and_then(|m| m.thinking_levels.clone()) {
+        if levels.is_empty() {
+            None
+        } else {
+            Some(levels)
+        }
+    } else {
+        default_thinking_levels(&h_norm)
+            .map(|lvls| lvls.iter().map(|s| (*s).to_string()).collect())
+    };
+
+    if is_non_reasoning {
+        effective_thinking = None;
+    }
+
+    let mut result = serde_json::Map::new();
+    result.insert("harness".into(), Value::String(harness.to_string()));
+    if let Some(cm) = final_model {
+        result.insert("currentModel".into(), Value::String(cm));
+    }
+    if let Some(ct) = effective_thinking {
+        result.insert("currentThinking".into(), Value::String(ct));
+    }
+    if let Some(ref lvls) = thinking_levels {
+        if !lvls.is_empty() {
+            result.insert(
+                "thinkingLevels".into(),
+                Value::Array(lvls.iter().cloned().map(Value::String).collect()),
+            );
+            result.insert("canSwitchThinking".into(), Value::Bool(true));
+            result.insert("thinkingLabel".into(), Value::String("思考等级".into()));
+        } else {
+            result.insert("canSwitchThinking".into(), Value::Bool(false));
+        }
+    } else {
+        result.insert("canSwitchThinking".into(), Value::Bool(false));
+    }
+    result.insert("canSwitch".into(), Value::Bool(true));
+    result.insert(
+        "models".into(),
+        serde_json::to_value(&merged).unwrap_or_else(|_| Value::Array(Vec::new())),
+    );
+    Value::Object(result)
+}
+
+#[tauri::command]
+pub async fn local_agent_models(
+    harness: String,
+    current_model: Option<String>,
+    session_key: Option<String>,
+) -> Result<Value, String> {
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let home = crate::home_dir();
+        build_local_agent_models_with(
+            &harness,
+            current_model.as_deref(),
+            session_key.as_deref(),
+            home.as_deref(),
+            true,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-local-models-{prefix}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parses_omp_models_json_and_filters_non_chat() {
+        let raw = r#"{
+            "models": [
+                {
+                    "provider": "magpie",
+                    "kind": "chat",
+                    "id": "crosery/gpt-6.2-astra-fast",
+                    "selector": "magpie/crosery/gpt-6.2-astra-fast",
+                    "name": "GPT 6.2 Astra Fast",
+                    "contextWindow": 922000,
+                    "reasoning": true,
+                    "thinking": ["low", "medium", "high", "xhigh", "max"]
+                },
+                {
+                    "provider": "openai",
+                    "kind": "embedding",
+                    "id": "text-embedding-3"
+                },
+                {
+                    "provider": "google",
+                    "kind": "chat",
+                    "id": "gemini-1.5-flash",
+                    "selector": "google/gemini-1.5-flash",
+                    "name": "Gemini 1.5 Flash",
+                    "reasoning": false,
+                    "thinking": null
+                }
+            ]
+        }"#;
+        let parsed = parse_omp_models_json(raw);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "magpie/crosery/gpt-6.2-astra-fast");
+        assert_eq!(parsed[0].context_window, Some(922000));
+        assert_eq!(
+            parsed[0].thinking_levels.as_deref(),
+            Some(&["low".into(), "medium".into(), "high".into(), "xhigh".into(), "max".into()][..])
+        );
+        assert_eq!(parsed[1].reasoning, Some(false));
+        assert_eq!(parsed[1].thinking_levels, None);
+    }
+
+    #[test]
+    fn parses_omp_models_yml_without_leaking_secrets() {
+        let yml = r#"
+providers:
+  magpie:
+    api: openai-completions
+    auth: sk-secret-must-not-leak
+    apiKey: secret-api-key-999
+    token: tok-secret-123
+    baseUrl: http://127.0.0.1:3425/v1
+    headers:
+      Authorization: Bearer super-secret-header
+    models:
+      - contextWindow: 1000000
+        cost:
+          input: 4
+          output: 20
+        id: crosery/gpt-6.2-sol-ultrafast
+        name: GPT 6.2 Sol Ultrafast
+        reasoning: true
+        thinking:
+          efforts:
+            - low
+            - medium
+            - high
+            - max
+      - id: crosery/mimo-v2.5-asr
+        name: MiMo ASR
+        reasoning: false
+  crosery-ultrafast:
+    secret: hidden-secret
+    models:
+      - id: gpt-6.2-sol
+        name: Sol Ultrafast
+        reasoning: true
+        thinking: [low, high]
+"#;
+        let parsed = parse_omp_models_yml(yml);
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("sk-secret"));
+        assert!(!serialized.contains("secret-api-key-999"));
+        assert!(!serialized.contains("tok-secret-123"));
+        assert!(!serialized.contains("super-secret-header"));
+        assert!(!serialized.contains("hidden-secret"));
+        assert!(!serialized.contains("127.0.0.1"));
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].id, "magpie/crosery/gpt-6.2-sol-ultrafast");
+        assert_eq!(parsed[0].context_window, Some(1_000_000));
+        assert_eq!(
+            parsed[0].thinking_levels.as_deref(),
+            Some(&["low".into(), "medium".into(), "high".into(), "max".into()][..])
+        );
+        assert_eq!(parsed[1].reasoning, Some(false));
+        assert_eq!(parsed[1].thinking_levels, None);
+        assert_eq!(parsed[2].id, "crosery-ultrafast/gpt-6.2-sol");
+        assert_eq!(
+            parsed[2].thinking_levels.as_deref(),
+            Some(&["low".into(), "high".into()][..])
+        );
+    }
+
+    #[test]
+    fn matches_catalog_across_exact_suffix_and_fast_ultrafast_variants() {
+        let catalog = parse_omp_models_json(
+            r#"{
+                "models": [
+                    {
+                        "provider": "crosery-ultrafast",
+                        "kind": "chat",
+                        "id": "gpt-6.2-sol",
+                        "selector": "crosery-ultrafast/gpt-6.2-sol",
+                        "reasoning": true
+                    },
+                    {
+                        "provider": "magpie",
+                        "kind": "chat",
+                        "id": "crosery/gpt-6.2-astra-fast",
+                        "selector": "magpie/crosery/gpt-6.2-astra-fast",
+                        "reasoning": true
+                    }
+                ]
+            }"#,
+        );
+        assert_eq!(
+            find_catalog_match("magpie/crosery/gpt-6.2-astra-fast", &catalog).map(|m| m.id.as_str()),
+            Some("magpie/crosery/gpt-6.2-astra-fast")
+        );
+        assert_eq!(
+            find_catalog_match("crosery/gpt-6.2-astra-fast", &catalog).map(|m| m.id.as_str()),
+            Some("magpie/crosery/gpt-6.2-astra-fast")
+        );
+        assert_eq!(
+            find_catalog_match("crosery-fast/gpt-6.2-astra", &catalog).map(|m| m.id.as_str()),
+            Some("magpie/crosery/gpt-6.2-astra-fast")
+        );
+        assert_eq!(
+            find_catalog_match("gpt-6.2-sol-ultrafast", &catalog).map(|m| m.id.as_str()),
+            Some("crosery-ultrafast/gpt-6.2-sol")
+        );
+    }
+
+    #[test]
+    fn reads_local_omp_sessions_config_models_and_non_reasoning() {
+        let dir = make_temp_dir("omp-full");
+        fs::create_dir_all(dir.join(".omp/agent/sessions/-tmp-app")).unwrap();
+        fs::write(
+            dir.join(".omp/agent/config.yml"),
+            "defaultThinkingLevel: high\nmodelRoles:\n  default: magpie/crosery/gpt-6.2-astra-fast\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(".omp/agent/models.yml"),
+            r#"
+providers:
+  magpie:
+    auth: sk-never-leak
+    models:
+      - id: crosery/gpt-6.2-astra-fast
+        name: Astra Fast
+        reasoning: true
+        thinking:
+          efforts: [low, medium, high, xhigh, max]
+      - id: crosery/mimo-v2.5-asr
+        name: MiMo ASR
+        reasoning: false
+"#,
+        )
+        .unwrap();
+
+        let uuid = "01a1fe83-1f9a-73e1-92ca-7ff20d80c2be";
+        let sess_file = dir
+            .join(".omp/agent/sessions/-tmp-app")
+            .join(format!("2026-11-21T14-29-28Z_{uuid}.jsonl"));
+        let pad = serde_json::json!({ "type": "message", "text": "x".repeat(4000) }).to_string();
+        let mut lines = vec![
+            r#"{"type":"model_change","model":"magpie/crosery/claude-opus-5"}"#.to_string(),
+            r#"{"type":"thinking_level_change","thinkingLevel":"low"}"#.to_string(),
+        ];
+        for _ in 0..40 {
+            lines.push(pad.clone());
+        }
+        lines.push(r#"{"type":"model_change","model":"magpie/crosery/gpt-6.2-astra-fast"}"#.into());
+        lines.push(r#"{"type":"thinking_level_change","thinkingLevel":"max"}"#.into());
+        fs::write(&sess_file, lines.join("\n") + "\n").unwrap();
+
+        let res = build_local_agent_models_with(
+            "oh-my-pi",
+            Some("gpt-6.2-astra-fast"),
+            Some(&format!("omp:{uuid}")),
+            Some(&dir),
+            false,
+        );
+        assert_eq!(
+            res.get("currentModel").and_then(Value::as_str),
+            Some("magpie/crosery/gpt-6.2-astra-fast")
+        );
+        assert_eq!(
+            res.get("currentThinking").and_then(Value::as_str),
+            Some("max")
+        );
+        assert_eq!(
+            res.get("canSwitchThinking").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            res.get("thinkingLevels")
+                .and_then(Value::as_array)
+                .map(|a| a.len()),
+            Some(5)
+        );
+        assert!(!res.to_string().contains("sk-never-leak"));
+
+        let non_reason = build_local_agent_models_with(
+            "omp",
+            Some("magpie/crosery/mimo-v2.5-asr"),
+            None,
+            Some(&dir),
+            false,
+        );
+        assert_eq!(
+            non_reason.get("canSwitchThinking").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(non_reason.get("thinkingLevels").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_claude_codex_and_gemini_local_settings() {
+        let dir = make_temp_dir("multi-harness");
+        fs::create_dir_all(dir.join(".claude")).unwrap();
+        fs::create_dir_all(dir.join(".codex")).unwrap();
+        fs::create_dir_all(dir.join(".gemini")).unwrap();
+
+        fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"model":"claude-opus-5-5","effortLevel":"xhigh","env":{"ANTHROPIC_API_KEY":"sk-hidden"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join(".codex/config.toml"),
+            "model = \"gpt-6.2-sol\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(".gemini/settings.json"),
+            r#"{"model":{"name":"gemini-3.8-flash-high"},"thinkingConfig":{"thinkingLevel":"high"}}"#,
+        )
+        .unwrap();
+
+        let claude = build_local_agent_models_with("claude-code", None, None, Some(&dir), false);
+        assert_eq!(claude.get("currentThinking").and_then(Value::as_str), Some("xhigh"));
+        assert!(!claude.to_string().contains("sk-hidden"));
+
+        let codex = build_local_agent_models_with("codex", None, None, Some(&dir), false);
+        assert_eq!(codex.get("currentThinking").and_then(Value::as_str), Some("high"));
+        assert!(codex
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().any(|m| m.get("id").and_then(Value::as_str) == Some("gpt-6.2-sol")))
+            .unwrap_or(false));
+
+        let gemini = build_local_agent_models_with("gemini", None, None, Some(&dir), false);
+        assert_eq!(gemini.get("currentThinking").and_then(Value::as_str), Some("high"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

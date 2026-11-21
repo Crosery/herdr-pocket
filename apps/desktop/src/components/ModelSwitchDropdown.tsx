@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { Brain, Check, Cpu, Search } from "lucide-react";
-import type { Agent, AgentModelOption, AgentModelsResult } from "@herdr-pocket/protocol";
-import { rpcCall } from "../lib/relay";
+import { inferAgentModelAndThinking, type Agent, type AgentModelOption, type AgentModelsResult } from "@herdr-pocket/protocol";
+import { collectPeerModels, fetchAgentModelsWithFallback, patchCachedAgentModelMeta } from "../lib/modelCatalogClient";
 import { overlayStore } from "./PocketUI";
 
 function fmtContext(tokens?: number): string {
@@ -104,14 +104,15 @@ export function ModelSwitchDropdown({
     setError(null);
     let alive = true;
     setLoading(true);
-    rpcCall(agent.deviceId, "agent.models", { agent: agent.key })
+    fetchAgentModelsWithFallback(agent, collectPeerModels(agent))
       .then((res) => {
         if (!alive) return;
+        setError(null);
         setData(res);
         onLoaded?.(res);
       })
-      .catch((e) => {
-        if (alive) setError((e as Error).message || "读取模型列表失败");
+      .catch(() => {
+        if (alive) setError(null);
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -123,7 +124,7 @@ export function ModelSwitchDropdown({
       alive = false;
       cancelAnimationFrame(raf);
     };
-  }, [open, agent.deviceId, agent.key, mode]);
+  }, [open, agent.deviceId, agent.key, agent.harness, agent.model, agent.sessionKey, mode]);
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -180,17 +181,27 @@ export function ModelSwitchDropdown({
     };
   }, [open, onOpenChange, anchorRef]);
 
-  const currentModel = currentModelHint || data?.currentModel || agent.model;
-  const currentThinking = (currentThinkingHint || data?.currentThinking || "").toLowerCase();
+  const inferred = useMemo(
+    () => (agent.isShell ? {} : inferAgentModelAndThinking(agent.harness, currentModelHint || agent.model)),
+    [agent.isShell, agent.harness, currentModelHint, agent.model],
+  );
+  const currentModel = currentModelHint || data?.currentModel || inferred.currentModel || agent.model;
 
   const currentModelOpt = useMemo(
     () => (data?.models ?? []).find((m) => currentModel && m.id.toLowerCase() === currentModel.toLowerCase()),
     [data?.models, currentModel],
   );
-  const thinkingLevels = useMemo(
-    () => (currentModelOpt?.thinkingLevels?.length ? currentModelOpt.thinkingLevels : data?.thinkingLevels ?? []),
-    [currentModelOpt, data?.thinkingLevels],
-  );
+  const thinkingLevels = useMemo(() => {
+    if (data) {
+      if (currentModelOpt?.reasoning === false) return [];
+      return currentModelOpt?.thinkingLevels?.length ? currentModelOpt.thinkingLevels : data.thinkingLevels ?? [];
+    }
+    return inferred.thinkingLevels ?? [];
+  }, [data, currentModelOpt, inferred.thinkingLevels]);
+  const currentThinking =
+    thinkingLevels.length === 0
+      ? ""
+      : (currentThinkingHint || data?.currentThinking || inferred.currentThinking || "").toLowerCase();
 
   const filtered = useMemo(() => {
     const list = data?.models ?? [];
@@ -227,6 +238,7 @@ export function ModelSwitchDropdown({
   const commitModel = (id: string) => {
     const clean = id.trim();
     if (!clean) return;
+    patchCachedAgentModelMeta(agent.key, { currentModel: clean });
     onSelectModel(clean);
     onOpenChange(false);
   };
@@ -234,6 +246,7 @@ export function ModelSwitchDropdown({
   const commitThinking = (lvl: string) => {
     const clean = lvl.trim();
     if (!clean || !onSelectThinking) return;
+    patchCachedAgentModelMeta(agent.key, { currentThinking: clean });
     onSelectThinking(clean);
     onOpenChange(false);
   };
@@ -376,10 +389,12 @@ export function ModelSwitchDropdown({
       {error ? <div className="model-pop-note">{error}</div> : null}
 
       <div ref={listRef} className="model-pop-list" role="listbox" aria-label="可选模型列表">
-        {loading && !data ? (
+        {loading && !data && entries.length === 0 ? (
           <div className="usage-empty">正在读取可用模型…</div>
         ) : entries.length === 0 ? (
-          <div className="usage-empty">没有找到匹配的模型</div>
+          <div className="usage-empty">
+            {data?.canSwitch === false ? "没有找到匹配的模型" : "输入模型 ID 按回车即可切换"}
+          </div>
         ) : (
           entries.map((entry, idx) => {
             const isHi = idx === effectiveIdx;

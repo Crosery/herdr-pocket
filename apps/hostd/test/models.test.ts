@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, test } from "node:test";
 import type { Agent } from "@herdr-pocket/protocol";
-import { clearModelsCacheForTest, getAgentModels, parseOmpModelsJson, readOmpLocalConfig, setAgentModelAndThinking } from "../src/models.ts";
+import { clearModelsCacheForTest, findCatalogMatch, getAgentModels, parseOmpModelsJson, parseOmpModelsYml, readOmpLocalConfig, readSessionLiveModelAndThinking, setAgentModelAndThinking } from "../src/models.ts";
 import { buildHarnessSwitchCommands } from "@herdr-pocket/protocol";
 
 const hcAgent: Agent = {
@@ -125,7 +125,37 @@ test("parseOmpModelsJson extracts per-model thinking levels and retains >80 mode
     assert.equal(res.models.length, 120);
     assert.equal(res.currentModel, "magpie/model-99");
     assert.ok(res.models.some((m) => m.id === "magpie/model-119"));
-    assert.deepEqual(res.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    assert.equal(res.thinkingLevels, undefined);
+    assert.equal(res.canSwitchThinking, false);
+
+    const exactRes = await getAgentModels(
+      { ...hcAgent, model: "model-98" },
+      {
+        homeDir: emptyHome,
+        unifloReady: false,
+        async readCatalog() {
+          return parsed;
+        },
+      },
+    );
+    assert.equal(exactRes.currentModel, "magpie/model-98");
+    assert.deepEqual(exactRes.thinkingLevels, ["minimal", "low", "medium", "high"]);
+    assert.equal(exactRes.canSwitchThinking, true);
+
+    const fallbackReasoningRes = await getAgentModels(
+      { ...hcAgent, model: "magpie/unknown-reasoning" },
+      {
+        homeDir: emptyHome,
+        unifloReady: false,
+        async readCatalog() {
+          return [
+            { id: "magpie/unknown-reasoning", label: "Unknown Reasoning", provider: "magpie", reasoning: true, source: "catalog" },
+          ];
+        },
+      },
+    );
+    assert.deepEqual(fallbackReasoningRes.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    assert.equal(fallbackReasoningRes.canSwitchThinking, true);
   } finally {
     rmSync(emptyHome, { recursive: true, force: true });
   }
@@ -197,4 +227,240 @@ test("buildHarnessSwitchCommands & setAgentModelAndThinking dispatch right synta
   assert.deepEqual(sent, ["/switch magpie/crosery/gpt-6.2-sol-ultrafast:medium"]);
   assert.equal(res.currentModel, "magpie/crosery/gpt-6.2-sol-ultrafast");
   assert.equal(res.currentThinking, "medium");
+});
+
+test("parseOmpModelsYml extracts non-secret model definitions and drops all credentials", () => {
+  const yml = [
+    "providers:",
+    "  magpie:",
+    "    api: openai-completions",
+    "    auth: sk-secret-auth-token-must-never-leak",
+    "    apiKey: secret-api-key-123",
+    "    token: bearer-secret-token",
+    "    baseUrl: http://127.0.0.1:3425/v1",
+    "    headers:",
+    "      Authorization: Bearer top-secret-header",
+    "      X-Custom-Secret: should-not-appear",
+    "    models:",
+    "      - contextWindow: 922000",
+    "        cost:",
+    "          input: 8",
+    "          output: 40",
+    "        id: crosery/gpt-6.2-astra-fast",
+    "        name: GPT 6.2 Astra Fast",
+    "        reasoning: true",
+    "        thinking:",
+    "          efforts:",
+    "            - low",
+    "            - medium",
+    "            - high",
+    "            - xhigh",
+    "            - max",
+    "          mode: effort",
+    "      - id: crosery/mimo-v2.5-asr",
+    "        name: MiMo ASR",
+    "        reasoning: false",
+    "        thinking: null",
+    "      - id: custom-embed",
+    "        kind: embedding",
+    "  crosery-ultrafast:",
+    "    secret: ultra-secret",
+    "    models:",
+    "      - id: gpt-6.2-sol",
+    "        name: GPT 6.2 Sol Ultrafast",
+    "        reasoning: true",
+    "        thinking: [low, high, max]",
+  ].join("\n");
+
+  const parsed = parseOmpModelsYml(yml);
+  const serialized = JSON.stringify(parsed);
+  assert.ok(!serialized.includes("sk-secret-auth-token"));
+  assert.ok(!serialized.includes("secret-api-key-123"));
+  assert.ok(!serialized.includes("bearer-secret-token"));
+  assert.ok(!serialized.includes("top-secret-header"));
+  assert.ok(!serialized.includes("should-not-appear"));
+  assert.ok(!serialized.includes("ultra-secret"));
+  assert.ok(!serialized.includes("127.0.0.1"));
+
+  assert.equal(parsed.length, 3);
+  assert.deepEqual(parsed[0], {
+    id: "magpie/crosery/gpt-6.2-astra-fast",
+    label: "GPT 6.2 Astra Fast",
+    provider: "magpie",
+    contextWindow: 922000,
+    reasoning: true,
+    thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+    source: "catalog",
+  });
+  assert.deepEqual(parsed[1], {
+    id: "magpie/crosery/mimo-v2.5-asr",
+    label: "MiMo ASR",
+    provider: "magpie",
+    reasoning: false,
+    source: "catalog",
+  });
+  assert.deepEqual(parsed[2], {
+    id: "crosery-ultrafast/gpt-6.2-sol",
+    label: "GPT 6.2 Sol Ultrafast",
+    provider: "crosery-ultrafast",
+    reasoning: true,
+    thinkingLevels: ["low", "high", "max"],
+    source: "catalog",
+  });
+});
+
+test("findCatalogMatch resolves exact, suffix, and -fast / -ultrafast variants cleanly", () => {
+  const catalog = parseOmpModelsJson(
+    JSON.stringify({
+      models: [
+        { provider: "crosery-ultrafast", kind: "chat", id: "gpt-6.2-sol", selector: "crosery-ultrafast/gpt-6.2-sol", name: "Sol Ultrafast", reasoning: true, thinking: ["low", "high", "max"] },
+        { provider: "magpie", kind: "chat", id: "crosery/gpt-6.2-astra-fast", selector: "magpie/crosery/gpt-6.2-astra-fast", name: "Astra Fast", reasoning: true, thinking: ["low", "medium", "high", "xhigh", "max"] },
+        { provider: "magpie", kind: "chat", id: "crosery/gpt-6.2-sol-ultrafast", selector: "magpie/crosery/gpt-6.2-sol-ultrafast", name: "Magpie Sol Ultrafast", reasoning: true, thinking: ["low", "medium", "high", "xhigh", "max"] },
+      ],
+    }),
+  );
+
+  assert.equal(findCatalogMatch("magpie/crosery/gpt-6.2-astra-fast", catalog)?.id, "magpie/crosery/gpt-6.2-astra-fast");
+  assert.equal(findCatalogMatch("crosery/gpt-6.2-astra-fast", catalog)?.id, "magpie/crosery/gpt-6.2-astra-fast");
+  assert.equal(findCatalogMatch("crosery-fast/gpt-6.2-astra", catalog)?.id, "magpie/crosery/gpt-6.2-astra-fast");
+  assert.equal(findCatalogMatch("gpt-6.2-sol-ultrafast", catalog)?.id, "magpie/crosery/gpt-6.2-sol-ultrafast");
+  assert.equal(findCatalogMatch("crosery-ultrafast/gpt-6.2-sol", catalog)?.id, "crosery-ultrafast/gpt-6.2-sol");
+
+  // Also cross-matches provider-encoded tier when nested magpie entry isn't present
+  const onlyProviderTier = catalog.slice(0, 1);
+  assert.equal(findCatalogMatch("gpt-6.2-sol-ultrafast", onlyProviderTier)?.id, "crosery-ultrafast/gpt-6.2-sol");
+});
+
+test("readSessionLiveModelAndThinking tail-reads >128KB session logs for omp, claude, codex, and pi", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pocket-session-tail-"));
+  try {
+    // 1. OMP (>128KB noise + latest model_change & thinking_level_change)
+    const ompSessDir = join(dir, ".omp", "agent", "sessions", "-tmp-proj");
+    mkdirSync(ompSessDir, { recursive: true });
+    const ompUuid = "01a1fe83-1f9a-73e1-92ca-7ff20d80c2be";
+    const ompFile = join(ompSessDir, `2026-11-21T14-29-28-602Z_${ompUuid}.jsonl`);
+    const padLine = JSON.stringify({ type: "message", text: "x".repeat(4000) });
+    const ompLines = [
+      JSON.stringify({ type: "model_change", model: "magpie/crosery/claude-opus-5" }),
+      JSON.stringify({ type: "thinking_level_change", thinkingLevel: "low" }),
+      ...Array.from({ length: 40 }, () => padLine),
+      JSON.stringify({ type: "model_change", model: "magpie/crosery/gpt-6.2-astra-fast" }),
+      JSON.stringify({ type: "thinking_level_change", thinkingLevel: "max" }),
+    ];
+    writeFileSync(ompFile, ompLines.join("\n") + "\n");
+    const ompLive = await readSessionLiveModelAndThinking({ sessionKey: `omp:${ompUuid}`, homeDir: dir });
+    assert.deepEqual(ompLive, {
+      currentModel: "magpie/crosery/gpt-6.2-astra-fast",
+      currentThinking: "max",
+    });
+
+    // 2. Claude (thinkingMetadata + requestedModel + synthetic ignore)
+    const claudeDir = join(dir, ".claude", "projects", "-tmp-proj");
+    mkdirSync(claudeDir, { recursive: true });
+    const claudeUuid = "de58c9e0-c3fc-402b-9319-d3f927d00aea";
+    writeFileSync(
+      join(claudeDir, `${claudeUuid}.jsonl`),
+      [
+        JSON.stringify({ type: "user", thinkingMetadata: { level: "high" } }),
+        JSON.stringify({ type: "assistant", requestedModel: "claude-opus-5-5", effort: "xhigh" }),
+        JSON.stringify({ type: "assistant", message: { model: "<synthetic>" } }),
+      ].join("\n") + "\n",
+    );
+    const claudeLive = await readSessionLiveModelAndThinking({ sessionKey: `claude:${claudeUuid}`, homeDir: dir });
+    assert.deepEqual(claudeLive, {
+      currentModel: "claude-opus-5-5",
+      currentThinking: "xhigh",
+    });
+
+    // 3. Codex (turn_context reasoning_effort & model)
+    const codexDir = join(dir, ".codex", "sessions", "2026", "11", "21");
+    mkdirSync(codexDir, { recursive: true });
+    const codexUuid = "01a1ed06-9c54-7213-9349-ce8140f4cfe3";
+    writeFileSync(
+      join(codexDir, `rollout-2026-11-21T12-00-00-${codexUuid}.jsonl`),
+      JSON.stringify({
+        type: "turn_context",
+        payload: { model: "gpt-6.2-astra", reasoning_effort: "xhigh" },
+      }) + "\n",
+    );
+    const codexLive = await readSessionLiveModelAndThinking({ sessionKey: `codex:${codexUuid}`, homeDir: dir });
+    assert.deepEqual(codexLive, {
+      currentModel: "gpt-6.2-astra",
+      currentThinking: "xhigh",
+    });
+
+    // 4. PI (provider + modelId)
+    const piDir = join(dir, ".pi", "agent", "sessions", "-tmp-proj");
+    mkdirSync(piDir, { recursive: true });
+    const piUuid = "01a05750-c6e4-7f2e-831e-5cf4a840737a";
+    const piFile = join(piDir, `2026-11-21T10-00-00Z_${piUuid}.jsonl`);
+    writeFileSync(
+      piFile,
+      [
+        JSON.stringify({ type: "model_change", provider: "crosery", modelId: "gpt-5.6-luna" }),
+        JSON.stringify({ type: "thinking_level_change", thinkingLevel: "max" }),
+      ].join("\n") + "\n",
+    );
+    const piLive = await readSessionLiveModelAndThinking({ sessionSourcePath: piFile, homeDir: dir });
+    assert.deepEqual(piLive, {
+      currentModel: "crosery/gpt-5.6-luna",
+      currentThinking: "max",
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getAgentModels populates live thinking from session jsonl and disables thinking for reasoning===false models", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pocket-models-live-"));
+  try {
+    mkdirSync(join(dir, ".omp", "agent", "sessions", "-tmp-proj"), { recursive: true });
+    writeFileSync(
+      join(dir, ".omp", "agent", "models.yml"),
+      [
+        "providers:",
+        "  magpie:",
+        "    auth: sk-secret-do-not-expose",
+        "    models:",
+        "      - id: crosery/gpt-6.2-sol-ultrafast",
+        "        name: Sol Ultrafast",
+        "        reasoning: true",
+        "        thinking:",
+        "          efforts: [low, medium, high, max]",
+        "      - id: crosery/mimo-v2.5-asr",
+        "        name: MiMo ASR",
+        "        reasoning: false",
+      ].join("\n"),
+    );
+
+    const sessUuid = "01a1fe83-1f9a-73e1-92ca-7ff20d80c2be";
+    writeFileSync(
+      join(dir, ".omp", "agent", "sessions", "-tmp-proj", `2026-11-21T14-29-28Z_${sessUuid}.jsonl`),
+      [
+        JSON.stringify({ type: "model_change", model: "magpie/crosery/gpt-6.2-sol-ultrafast" }),
+        JSON.stringify({ type: "thinking_level_change", thinkingLevel: "max" }),
+      ].join("\n") + "\n",
+    );
+
+    const liveRes = await getAgentModels(
+      { ...hcAgent, model: "gpt-6.2-sol-ultrafast", sessionKey: `omp:${sessUuid}` },
+      { homeDir: dir, unifloReady: false, readCatalog: async () => [] },
+    );
+    assert.equal(liveRes.currentModel, "magpie/crosery/gpt-6.2-sol-ultrafast");
+    assert.equal(liveRes.currentThinking, "max");
+    assert.deepEqual(liveRes.thinkingLevels, ["low", "medium", "high", "max"]);
+    assert.equal(liveRes.canSwitchThinking, true);
+    assert.ok(!JSON.stringify(liveRes).includes("sk-secret-do-not-expose"));
+
+    const nonReasonRes = await getAgentModels(
+      { ...hcAgent, model: "magpie/crosery/mimo-v2.5-asr" },
+      { homeDir: dir, unifloReady: false, readCatalog: async () => [] },
+    );
+    assert.equal(nonReasonRes.currentModel, "magpie/crosery/mimo-v2.5-asr");
+    assert.equal(nonReasonRes.thinkingLevels, undefined);
+    assert.equal(nonReasonRes.canSwitchThinking, false);
+    assert.equal(nonReasonRes.currentThinking, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

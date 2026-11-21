@@ -13,6 +13,7 @@ mod cookies;
 mod diagnostics;
 mod drag_paths;
 mod fonts;
+mod local_models;
 mod local_term;
 mod logging;
 mod mainwin;
@@ -687,6 +688,7 @@ pub fn run() {
             local_term::local_term_read_image,
             local_term::local_term_stat_image,
             drag_paths::read_os_drag_paths,
+            local_models::local_agent_models,
             fonts::terminal_list_fonts,
             fonts::terminal_font_faces,
             fonts::terminal_font_bytes,

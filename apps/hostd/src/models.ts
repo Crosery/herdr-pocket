@@ -1,10 +1,23 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
+  HARNESS_DEFAULT_THINKING_LEVELS,
   buildHarnessSwitchCommands,
+  inferAgentModelAndThinking,
   normalizeSwitchHarness,
   stripModelEffortSuffix,
   type Agent,
@@ -19,32 +32,24 @@ const execFileAsync = promisify(execFile);
 
 const CATALOG_CACHE_MS = 5 * 60_000;
 const MAX_MODELS = 500;
+const SESSION_TAIL_BYTES = 128 * 1024;
 const cliCatalogCache = new Map<string, { at: number; models: AgentModelOption[] }>();
-
-const HARNESS_THINKING_LEVELS: Record<string, string[]> = {
-  omp: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-  pi: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-  claude: ["low", "medium", "high", "xhigh", "max", "auto"],
-  codex: ["low", "medium", "high", "xhigh"],
-  antigravity: ["low", "medium", "high", "xhigh", "max"],
-  gemini: ["low", "medium", "high"],
-  opencode: ["low", "medium", "high", "max"],
-  dsh: ["low", "medium", "high"],
-  hermes: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
-  grok: ["low", "medium", "high", "xhigh"],
-  aider: ["low", "medium", "high"],
-  factory: ["normal", "fast"],
-  amp: ["smart", "rush"],
-  cursor: ["low", "medium", "high"],
-  kimi: ["low", "medium", "high"],
-  qwen: ["low", "medium", "high"],
-  qoder: ["low", "medium", "high"],
-  codebuddy: ["low", "medium", "high"],
-  goose: ["low", "medium", "high"],
-};
 
 function normHarnessKey(raw: string): string {
   return normalizeSwitchHarness((harnessId(raw) ?? raw).trim());
+}
+
+function extractThinkingList(raw: unknown): string[] | undefined {
+  const arr = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" && Array.isArray((raw as { efforts?: unknown }).efforts)
+      ? (raw as { efforts: unknown[] }).efforts
+      : null;
+  if (!arr) return undefined;
+  const cleaned = arr
+    .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+    .map((v) => v.trim().toLowerCase());
+  return cleaned.length ? cleaned : undefined;
 }
 
 /** Parses `omp models --json` safely and extracts chat models plus per-model thinking levels. */
@@ -71,9 +76,7 @@ export function parseOmpModelsJson(raw: string): AgentModelOption[] {
     const provider = typeof item.provider === "string" && item.provider.trim() ? item.provider.trim() : undefined;
     const contextWindow = typeof item.contextWindow === "number" && item.contextWindow > 0 ? item.contextWindow : undefined;
     const reasoning = typeof item.reasoning === "boolean" ? item.reasoning : undefined;
-    const thinkingLevels = Array.isArray(item.thinking)
-      ? item.thinking.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim())
-      : undefined;
+    const thinkingLevels = reasoning === false ? undefined : extractThinkingList(item.thinking);
     out.push({
       id,
       label,
@@ -85,6 +88,259 @@ export function parseOmpModelsJson(raw: string): AgentModelOption[] {
     });
   }
   return out;
+}
+
+function stripYamlScalar(raw: string): string {
+  const s = raw.trim();
+  if (!s) return "";
+  if ((s.startsWith('"') && s.length >= 2) || (s.startsWith("'") && s.length >= 2)) {
+    const q = s[0]!;
+    const end = s.indexOf(q, 1);
+    if (end > 0) return s.slice(1, end).trim();
+  }
+  const commentIdx = s.search(/\s+#/);
+  return (commentIdx >= 0 ? s.slice(0, commentIdx) : s).trim();
+}
+
+function parseYamlInlineArray(raw: string): string[] | undefined {
+  const s = stripYamlScalar(raw);
+  if (!s.startsWith("[") || !s.endsWith("]")) return undefined;
+  const inner = s.slice(1, -1).trim();
+  if (!inner) return undefined;
+  const items = inner
+    .split(",")
+    .map((p) => stripYamlScalar(p).toLowerCase())
+    .filter(Boolean);
+  return items.length ? items : undefined;
+}
+
+/**
+ * Parses non-secret model entries (`provider`, `id`, `name`, `contextWindow`, `reasoning`, `thinking.efforts` / `thinking`)
+ * from `~/.omp/agent/models.yml`. Never reads or emits `auth`, `apiKey`, `token`, `secret`, `headers`, or URLs.
+ */
+export function parseOmpModelsYml(raw: string): AgentModelOption[] {
+  interface Draft {
+    id?: string;
+    name?: string;
+    kind?: string;
+    contextWindow?: number;
+    reasoning?: boolean;
+    thinkingLevels?: string[];
+  }
+
+  const out: AgentModelOption[] = [];
+  let inProviders = false;
+  let providerIndent = -1;
+  let currentProvider = "";
+  let inModels = false;
+  let modelsIndent = -1;
+  let itemIndent = -1;
+  let draft: Draft | null = null;
+  let inThinking = false;
+  let thinkingIndent = -1;
+  let inEfforts = false;
+  let effortsIndent = -1;
+  let ignoredIndent = -1;
+
+  const flush = () => {
+    if (!draft || !currentProvider) {
+      draft = null;
+      return;
+    }
+    if (draft.kind && draft.kind !== "chat") {
+      draft = null;
+      return;
+    }
+    const rawId = draft.id?.trim();
+    if (!rawId) {
+      draft = null;
+      return;
+    }
+    const prefix = `${currentProvider}/`;
+    const id = rawId.startsWith(prefix) ? rawId : `${prefix}${rawId}`;
+    const label = draft.name?.trim() || rawId;
+    const thinkingLevels = draft.reasoning === false ? undefined : draft.thinkingLevels;
+    out.push({
+      id,
+      label,
+      provider: currentProvider,
+      ...(draft.contextWindow ? { contextWindow: draft.contextWindow } : {}),
+      ...(draft.reasoning !== undefined ? { reasoning: draft.reasoning } : {}),
+      ...(thinkingLevels?.length ? { thinkingLevels } : {}),
+      source: "catalog",
+    });
+    draft = null;
+  };
+
+  const applyDraftProp = (key: string, valRaw: string, indent: number) => {
+    if (!draft) return;
+    const val = stripYamlScalar(valRaw);
+    switch (key) {
+      case "id":
+        if (val) draft.id = val;
+        return;
+      case "name":
+        if (val) draft.name = val;
+        return;
+      case "kind":
+        if (val) draft.kind = val.toLowerCase();
+        return;
+      case "contextWindow": {
+        const n = Number(val);
+        if (Number.isFinite(n) && n > 0) draft.contextWindow = Math.round(n);
+        return;
+      }
+      case "reasoning": {
+        const low = val.toLowerCase();
+        if (low === "true") draft.reasoning = true;
+        else if (low === "false") draft.reasoning = false;
+        return;
+      }
+      case "thinking": {
+        const inline = parseYamlInlineArray(valRaw);
+        if (inline) {
+          draft.thinkingLevels = inline;
+        } else if (!val) {
+          inThinking = true;
+          thinkingIndent = indent;
+          inEfforts = false;
+          effortsIndent = -1;
+        } else {
+          draft.thinkingLevels = undefined;
+        }
+        return;
+      }
+      default:
+        // Intentionally ignore non-whitelisted keys (including cost, input, auth, apiKey, token, secret, headers).
+        if (!val) ignoredIndent = indent;
+    }
+  };
+
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = line.search(/\S/);
+
+    if (indent === 0) {
+      flush();
+      inModels = false;
+      inThinking = false;
+      inEfforts = false;
+      ignoredIndent = -1;
+      currentProvider = "";
+      providerIndent = -1;
+      inProviders = /^providers\s*:\s*(?:#.*)?$/.test(trimmed);
+      continue;
+    }
+
+    if (!inProviders) continue;
+
+    if (providerIndent === -1) providerIndent = indent;
+    if (indent === providerIndent) {
+      flush();
+      inModels = false;
+      inThinking = false;
+      inEfforts = false;
+      ignoredIndent = -1;
+      const pm = /^([A-Za-z0-9._-]+|"[^"]+"|'[^']+')\s*:\s*(?:#.*)?$/.exec(trimmed);
+      currentProvider = pm ? stripYamlScalar(pm[1]!) : "";
+      continue;
+    }
+
+    if (!currentProvider) continue;
+
+    if (inModels && indent <= modelsIndent && !trimmed.startsWith("-")) {
+      flush();
+      inModels = false;
+      inThinking = false;
+      inEfforts = false;
+      ignoredIndent = -1;
+    }
+
+    if (!inModels) {
+      const mm = /^models\s*:\s*(.*)$/.exec(trimmed);
+      if (mm && !stripYamlScalar(mm[1] ?? "")) {
+        inModels = true;
+        modelsIndent = indent;
+        itemIndent = -1;
+      }
+      continue;
+    }
+
+    const listMatch = /^-\s*(.*)$/.exec(trimmed);
+    if (listMatch && (itemIndent === -1 || indent === itemIndent)) {
+      flush();
+      itemIndent = indent;
+      draft = {};
+      inThinking = false;
+      thinkingIndent = -1;
+      inEfforts = false;
+      effortsIndent = -1;
+      ignoredIndent = -1;
+      const rest = listMatch[1]!.trim();
+      if (rest && !rest.startsWith("#")) {
+        const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(rest);
+        if (kv) applyDraftProp(kv[1]!, kv[2] ?? "", indent + 2);
+      }
+      continue;
+    }
+
+    if (!draft) continue;
+
+    if (inThinking && indent <= thinkingIndent) {
+      inThinking = false;
+      inEfforts = false;
+      effortsIndent = -1;
+    }
+    if (inEfforts && indent <= effortsIndent && !trimmed.startsWith("-")) {
+      inEfforts = false;
+    }
+    if (ignoredIndent !== -1 && indent <= ignoredIndent) {
+      ignoredIndent = -1;
+    }
+
+    if (inThinking) {
+      if (listMatch) {
+        const item = stripYamlScalar(listMatch[1] ?? "").toLowerCase();
+        if (item) {
+          draft.thinkingLevels ??= [];
+          if (!draft.thinkingLevels.includes(item)) draft.thinkingLevels.push(item);
+        }
+        continue;
+      }
+      const em = /^efforts\s*:\s*(.*)$/.exec(trimmed);
+      if (em) {
+        const inline = parseYamlInlineArray(em[1] ?? "");
+        if (inline) {
+          draft.thinkingLevels = inline;
+        } else if (!stripYamlScalar(em[1] ?? "")) {
+          inEfforts = true;
+          effortsIndent = indent;
+        }
+        continue;
+      }
+      continue;
+    }
+
+    if (ignoredIndent !== -1) continue;
+
+    const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(trimmed);
+    if (kv) applyDraftProp(kv[1]!, kv[2] ?? "", indent);
+  }
+
+  flush();
+  return out.slice(0, MAX_MODELS);
+}
+
+/** Reads non-secret model definitions from `~/.omp/agent/models.yml` if present. */
+export function readOmpModelsYml(homeDir = homedir()): AgentModelOption[] {
+  const p = join(homeDir, ".omp", "agent", "models.yml");
+  if (!existsSync(p)) return [];
+  try {
+    return parseOmpModelsYml(readFileSync(p, "utf8"));
+  } catch {
+    return [];
+  }
 }
 
 /** Parses `agy models` (`<id>\t<label>`) output. */
@@ -478,18 +734,291 @@ const FALLBACK_PRESETS: Record<string, AgentModelOption[]> = {
 
 export interface ModelsUnifloLike {
   recentModels(harness?: string): Promise<string[]>;
+  sessionSourcePath?(sessionKey: string): Promise<string | undefined>;
 }
 
 export function clearModelsCacheForTest(): void {
   cliCatalogCache.clear();
 }
 
-function findCatalogMatch(rawId: string, catalog: readonly AgentModelOption[]): AgentModelOption | undefined {
-  const q = rawId.trim().toLowerCase();
+interface ParsedModelSpeedMeta {
+  clean: string;
+  baseLeaf: string;
+  tier: "" | "fast" | "ultrafast";
+  providerBase: string;
+  providerSegments: string[];
+}
+
+function parseModelSpeedMeta(raw: string): ParsedModelSpeedMeta {
+  const clean = stripModelEffortSuffix(raw).trim().toLowerCase();
+  const segments = clean.split("/").filter(Boolean);
+  const leaf = segments[segments.length - 1] ?? "";
+  const parentSeg = segments.length >= 2 ? segments[segments.length - 2]! : "";
+  const providerSegments = segments.slice(0, -1).map((s) => s.replace(/-(?:ultra)?fast$/i, ""));
+
+  let tier: "" | "fast" | "ultrafast" = "";
+  let baseLeaf = leaf;
+  if (leaf.endsWith("-ultrafast")) {
+    tier = "ultrafast";
+    baseLeaf = leaf.slice(0, -"-ultrafast".length);
+  } else if (leaf.endsWith("-fast")) {
+    tier = "fast";
+    baseLeaf = leaf.slice(0, -"-fast".length);
+  } else if (parentSeg.endsWith("-ultrafast")) {
+    tier = "ultrafast";
+  } else if (parentSeg.endsWith("-fast")) {
+    tier = "fast";
+  }
+
+  const providerBase = parentSeg.replace(/-(?:ultra)?fast$/i, "");
+  return { clean, baseLeaf, tier, providerBase, providerSegments };
+}
+
+export function findCatalogMatch(rawId: string, catalog: readonly AgentModelOption[]): AgentModelOption | undefined {
+  const qMeta = parseModelSpeedMeta(rawId);
+  const q = qMeta.clean;
   if (!q) return undefined;
+
   const exact = catalog.find((c) => c.id.toLowerCase() === q);
   if (exact) return exact;
-  return catalog.find((c) => c.id.toLowerCase().endsWith(`/${q}`));
+
+  const suffix = catalog.find((c) => c.id.toLowerCase().endsWith(`/${q}`));
+  if (suffix) return suffix;
+
+  const parsedCatalog = catalog.map((c) => ({ item: c, meta: parseModelSpeedMeta(c.id) }));
+
+  if (qMeta.providerBase) {
+    const provAndTier = parsedCatalog.find(
+      ({ meta }) =>
+        meta.baseLeaf === qMeta.baseLeaf &&
+        meta.tier === qMeta.tier &&
+        meta.providerSegments.includes(qMeta.providerBase),
+    );
+    if (provAndTier) return provAndTier.item;
+  }
+
+  const sameTier = parsedCatalog.find(({ meta }) => meta.baseLeaf === qMeta.baseLeaf && meta.tier === qMeta.tier);
+  if (sameTier) return sameTier.item;
+
+  if (qMeta.tier) {
+    if (qMeta.providerBase) {
+      const provBaseLeaf = parsedCatalog.find(
+        ({ meta }) => meta.baseLeaf === qMeta.baseLeaf && meta.providerSegments.includes(qMeta.providerBase),
+      );
+      if (provBaseLeaf) return provBaseLeaf.item;
+    }
+    const anyBaseLeaf = parsedCatalog.find(({ meta }) => meta.baseLeaf === qMeta.baseLeaf);
+    if (anyBaseLeaf) return anyBaseLeaf.item;
+  }
+
+  return undefined;
+}
+
+function sessionSearchRoots(homeDir: string, harnessHint: string): string[] {
+  const h = normHarnessKey(harnessHint);
+  const all = [
+    join(homeDir, ".omp", "agent", "sessions"),
+    join(homeDir, ".pi", "agent", "sessions"),
+    join(homeDir, ".claude", "projects"),
+    join(homeDir, ".codex", "sessions"),
+  ];
+  if (h === "omp") return [all[0]!];
+  if (h === "pi") return [all[1]!];
+  if (h === "claude") return [all[2]!];
+  if (h === "codex") return [all[3]!];
+  return all;
+}
+
+function findSessionJsonlPath(sessionKey: string, harnessHint: string, homeDir: string): string | undefined {
+  const colon = sessionKey.indexOf(":");
+  const prefix = colon >= 0 ? sessionKey.slice(0, colon).trim() : "";
+  const id = (colon >= 0 ? sessionKey.slice(colon + 1) : sessionKey).trim();
+  if (!id || id.length < 4) return undefined;
+
+  const exactMatches: Array<{ path: string; mtime: number }> = [];
+  const prefixMatches: Array<{ path: string; mtime: number }> = [];
+
+  const walk = (dir: string, depth: number) => {
+    if (depth > 4 || !existsSync(dir)) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (ent.name === ".git" || ent.name === "node_modules") continue;
+      const full = join(dir, ent.name);
+      if (ent.isDirectory()) {
+        walk(full, depth + 1);
+        continue;
+      }
+      if (!ent.name.endsWith(".jsonl") || ent.name === "changes.jsonl") continue;
+      const lowerName = ent.name.toLowerCase();
+      const lowerId = id.toLowerCase();
+      const isExact =
+        lowerName === `${lowerId}.jsonl` ||
+        lowerName.endsWith(`_${lowerId}.jsonl`) ||
+        lowerName.endsWith(`-${lowerId}.jsonl`);
+      const isPrefix =
+        !isExact &&
+        lowerId.length >= 6 &&
+        (lowerName.startsWith(lowerId) || lowerName.includes(`_${lowerId}`) || lowerName.includes(`-${lowerId}`));
+      if (!isExact && !isPrefix) continue;
+      try {
+        const mtime = statSync(full).mtimeMs;
+        (isExact ? exactMatches : prefixMatches).push({ path: full, mtime });
+      } catch {
+        /* ignore unreadable */
+      }
+    }
+  };
+
+  for (const root of sessionSearchRoots(homeDir, harnessHint || prefix)) {
+    walk(root, 0);
+  }
+  const pool = exactMatches.length ? exactMatches : prefixMatches;
+  if (!pool.length) return undefined;
+  pool.sort((a, b) => b.mtime - a.mtime);
+  return pool[0]!.path;
+}
+
+function readTailText(filePath: string, maxBytes = SESSION_TAIL_BYTES): string {
+  const fd = openSync(filePath, "r");
+  try {
+    const size = fstatSync(fd).size;
+    if (size <= 0) return "";
+    const start = Math.max(0, size - maxBytes);
+    const len = size - start;
+    const buf = Buffer.allocUnsafe(len);
+    const bytesRead = readSync(fd, buf, 0, len, start);
+    let text = buf.subarray(0, bytesRead).toString("utf8");
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      text = nl >= 0 ? text.slice(nl + 1) : "";
+    }
+    return text;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Tail-reads the newest ~128 KB of a live session `.jsonl` file backwards to extract the latest
+ * `thinking_level_change`, `model_change`, Claude effort/thinkingMetadata, or Codex `reasoning_effort`.
+ */
+export async function readSessionLiveModelAndThinking(opts: {
+  sessionKey?: string;
+  harness?: string;
+  homeDir?: string;
+  sessionSourcePath?: string;
+}): Promise<{ currentModel?: string; currentThinking?: string }> {
+  const home = opts.homeDir ?? homedir();
+  let filePath: string | undefined;
+  if (opts.sessionSourcePath?.trim()) {
+    try {
+      if (existsSync(opts.sessionSourcePath) && statSync(opts.sessionSourcePath).isFile()) {
+        filePath = opts.sessionSourcePath;
+      }
+    } catch {
+      /* fall back to session scan */
+    }
+  }
+  if (!filePath && opts.sessionKey?.trim()) {
+    filePath = findSessionJsonlPath(opts.sessionKey.trim(), opts.harness ?? "", home);
+  }
+  if (!filePath) return {};
+
+  let text = "";
+  try {
+    text = readTailText(filePath);
+  } catch {
+    return {};
+  }
+  if (!text) return {};
+
+  let currentModel: string | undefined;
+  let currentThinking: string | undefined;
+  const lines = text.split(/\r?\n/);
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const raw = lines[i]?.trim();
+    if (!raw || !raw.startsWith("{")) continue;
+    let obj: Record<string, any>;
+    try {
+      obj = JSON.parse(raw) as Record<string, any>;
+    } catch {
+      continue;
+    }
+
+    if (currentThinking === undefined) {
+      let t: string | undefined;
+      if (obj.type === "thinking_level_change") {
+        t = typeof obj.thinkingLevel === "string" ? obj.thinkingLevel : typeof obj.level === "string" ? obj.level : undefined;
+      } else if (obj.thinkingMetadata && typeof obj.thinkingMetadata === "object") {
+        if (obj.thinkingMetadata.disabled === true) {
+          t = "off";
+        } else if (typeof obj.thinkingMetadata.level === "string") {
+          t = obj.thinkingMetadata.level;
+        } else if (typeof obj.thinkingMetadata.effort === "string") {
+          t = obj.thinkingMetadata.effort;
+        }
+      } else if (typeof obj.perTurnEffort === "string") {
+        t = obj.perTurnEffort;
+      } else if (typeof obj.effort === "string") {
+        t = obj.effort;
+      } else if (obj.type === "turn_context" && obj.payload && typeof obj.payload === "object") {
+        t =
+          (typeof obj.payload.reasoning_effort === "string" && obj.payload.reasoning_effort) ||
+          (typeof obj.payload.effort === "string" && obj.payload.effort) ||
+          (typeof obj.payload.collaboration_mode?.settings?.reasoning_effort === "string" &&
+            obj.payload.collaboration_mode.settings.reasoning_effort) ||
+          undefined;
+      } else if (typeof obj.reasoning_effort === "string") {
+        t = obj.reasoning_effort;
+      } else if (typeof obj.payload?.reasoning_effort === "string") {
+        t = obj.payload.reasoning_effort;
+      }
+      if (t && t.trim()) currentThinking = t.trim().toLowerCase();
+    }
+
+    if (currentModel === undefined) {
+      let m: string | undefined;
+      if (obj.type === "model_change") {
+        if (typeof obj.model === "string" && obj.model.trim()) {
+          m = obj.model.trim();
+        } else if (typeof obj.modelId === "string" && obj.modelId.trim()) {
+          const mid = obj.modelId.trim();
+          const prov = typeof obj.provider === "string" ? obj.provider.trim() : "";
+          m = prov && !mid.startsWith(`${prov}/`) ? `${prov}/${mid}` : mid;
+        }
+      } else if (typeof obj.requestedModel === "string" && obj.requestedModel.trim() && obj.requestedModel !== "<synthetic>") {
+        m = obj.requestedModel.trim();
+      } else if (typeof obj.message?.model === "string" && obj.message.model.trim() && obj.message.model !== "<synthetic>") {
+        m = obj.message.model.trim();
+      } else if (obj.type === "turn_context" && obj.payload && typeof obj.payload === "object") {
+        const pm =
+          (typeof obj.payload.model === "string" && obj.payload.model) ||
+          (typeof obj.payload.collaboration_mode?.settings?.model === "string" && obj.payload.collaboration_mode.settings.model) ||
+          "";
+        if (pm.trim()) m = pm.trim();
+      }
+      if (m) {
+        const split = splitModelAndEffort(m);
+        if (split.id) {
+          currentModel = split.id;
+          if (currentThinking === undefined && split.effort) currentThinking = split.effort;
+        }
+      }
+    }
+
+    if (currentModel !== undefined && currentThinking !== undefined) break;
+  }
+
+  return {
+    ...(currentModel ? { currentModel } : {}),
+    ...(currentThinking ? { currentThinking } : {}),
+  };
 }
 
 export async function getAgentModels(
@@ -501,6 +1030,7 @@ export async function getAgentModels(
     homeDir?: string;
     currentModelOverride?: string;
     currentThinkingOverride?: string;
+    sessionSourcePath?: string;
   } = {},
 ): Promise<AgentModelsResult> {
   const canSwitch = !agent.isShell && (agent.source === "hc" || agent.source === "herdr");
@@ -513,12 +1043,16 @@ export async function getAgentModels(
   const hNorm = normHarnessKey(agent.harness);
   const hQuery = (harnessId(agent.harness) ?? agent.harness).trim();
   const uniflo = opts.unifloReady === false ? undefined : opts.uniflo;
-  const rawModel = opts.currentModelOverride?.trim() || agent.model?.trim() || "";
-  const parsedCurrent = rawModel ? splitModelAndEffort(rawModel) : { id: "", effort: undefined };
-
   const localCfg = readLocalConfiguredDetails(opts.homeDir);
 
-  const [harnessRecent, allRecent, catalog, ompLocal] = await Promise.all([
+  const sessionSourcePromise =
+    opts.sessionSourcePath !== undefined
+      ? Promise.resolve(opts.sessionSourcePath)
+      : uniflo?.sessionSourcePath && agent.sessionKey
+        ? uniflo.sessionSourcePath(agent.sessionKey).catch(() => undefined)
+        : Promise.resolve(undefined);
+
+  const [harnessRecent, allRecent, catalog, ompLocal, ymlCatalog, resolvedSourcePath] = await Promise.all([
     uniflo && hQuery ? uniflo.recentModels(hQuery).catch(() => []) : Promise.resolve([]),
     uniflo ? uniflo.recentModels().catch(() => []) : Promise.resolve([]),
     opts.readCatalog
@@ -533,22 +1067,68 @@ export async function getAgentModels(
               ? getOpencodeCatalog()
               : Promise.resolve([]),
     hNorm === "omp" ? readOmpLocalConfig(opts.homeDir) : Promise.resolve<{ models: AgentModelOption[]; defaultModel?: string; defaultThinking?: string }>({ models: [] }),
+    hNorm === "omp" ? Promise.resolve(readOmpModelsYml(opts.homeDir)) : Promise.resolve([]),
+    sessionSourcePromise,
   ]);
 
+  const liveSession =
+    agent.sessionKey || resolvedSourcePath
+      ? await readSessionLiveModelAndThinking({
+          sessionKey: agent.sessionKey,
+          harness: agent.harness,
+          homeDir: opts.homeDir,
+          sessionSourcePath: resolvedSourcePath,
+        })
+      : {};
+
+  let rawModel = opts.currentModelOverride?.trim() || "";
+  if (!rawModel) {
+    const agentM = agent.model?.trim() || "";
+    const liveM = liveSession.currentModel?.trim() || "";
+    if (liveM) {
+      rawModel =
+        agentM && !liveM.includes("/") && agentM.toLowerCase().endsWith(`/${liveM.toLowerCase()}`)
+          ? agentM
+          : liveM;
+    } else {
+      rawModel = agentM;
+    }
+  }
+  const parsedCurrent = rawModel ? splitModelAndEffort(rawModel) : { id: "", effort: undefined };
   const currentModel = parsedCurrent.id || (hNorm === "omp" ? ompLocal.defaultModel : undefined) || undefined;
+  const inferred = inferAgentModelAndThinking(agent.harness, currentModel);
+
   let currentThinking =
     opts.currentThinkingOverride?.trim().toLowerCase() ||
     parsedCurrent.effort ||
+    liveSession.currentThinking ||
     (hNorm === "omp" ? ompLocal.defaultThinking : undefined) ||
     localCfg.thinkingByHarness[hNorm] ||
+    inferred.currentThinking ||
     undefined;
 
-  if (!currentThinking && hNorm === "gemini" && currentModel) {
-    const gm = /-(low|medium|high)$/i.exec(currentModel);
-    if (gm?.[1]) currentThinking = gm[1].toLowerCase();
+  const combinedCatalog: AgentModelOption[] = catalog.map((c) => ({ ...c }));
+  const catIdx = new Map<string, number>();
+  for (let i = 0; i < combinedCatalog.length; i++) {
+    catIdx.set(combinedCatalog[i]!.id.toLowerCase(), i);
+  }
+  for (const yItem of ymlCatalog) {
+    const existingIdx = catIdx.get(yItem.id.toLowerCase());
+    if (existingIdx !== undefined) {
+      const cur = combinedCatalog[existingIdx]!;
+      combinedCatalog[existingIdx] = {
+        ...cur,
+        ...(cur.provider ? {} : yItem.provider ? { provider: yItem.provider } : {}),
+        ...(cur.contextWindow ? {} : yItem.contextWindow ? { contextWindow: yItem.contextWindow } : {}),
+        ...(cur.reasoning !== undefined ? {} : yItem.reasoning !== undefined ? { reasoning: yItem.reasoning } : {}),
+        ...(cur.thinkingLevels?.length || cur.reasoning === false ? {} : yItem.thinkingLevels?.length ? { thinkingLevels: yItem.thinkingLevels } : {}),
+      };
+    } else {
+      catIdx.set(yItem.id.toLowerCase(), combinedCatalog.length);
+      combinedCatalog.push(yItem);
+    }
   }
 
-  const combinedCatalog = [...catalog];
   const merged: AgentModelOption[] = [];
   const seen = new Set<string>();
   const bareAliasesSeen = new Set<string>();
@@ -623,10 +1203,20 @@ export async function getAgentModels(
   }
 
   const currentOpt = merged[0]?.source === "current" ? merged[0] : undefined;
-  const thinkingLevels =
-    currentOpt?.thinkingLevels?.length
+  const isNonReasoning =
+    currentOpt?.reasoning === false ||
+    (currentOpt?.reasoning === undefined && inferred.thinkingLevels !== undefined && inferred.thinkingLevels.length === 0);
+
+  const defaultThinkingLevels = HARNESS_DEFAULT_THINKING_LEVELS[hNorm]
+    ? [...HARNESS_DEFAULT_THINKING_LEVELS[hNorm]]
+    : undefined;
+  const thinkingLevels = isNonReasoning
+    ? undefined
+    : currentOpt?.thinkingLevels?.length
       ? currentOpt.thinkingLevels
-      : HARNESS_THINKING_LEVELS[hNorm] ?? undefined;
+      : defaultThinkingLevels;
+
+  if (isNonReasoning) currentThinking = undefined;
 
   return {
     harness: agent.harness,

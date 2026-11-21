@@ -812,38 +812,21 @@ export interface HarnessSwitchPlan {
   interactiveOnly?: boolean;
 }
 
-const EFFORT_SUFFIX_RE = /:(off|none|minimal|min|low|medium|med|high|xhigh|max|ultra|auto|default)$/i;
+import {
+  HARNESS_DEFAULT_THINKING_LEVELS,
+  inferAgentModelAndThinking,
+  normalizeSwitchHarness,
+  stripModelEffortSuffix,
+  synthesizeFallbackAgentModels,
+} from "./modelsMeta.ts";
 
-/** Strips a trailing `:effort` modifier (such as `:high`) from an omp/pi selector without disturbing tags like `:8b`. */
-export function stripModelEffortSuffix(modelId: string): string {
-  return modelId.trim().replace(EFFORT_SUFFIX_RE, "");
-}
-
-/** Normalizes any harness identifier into its canonical CLI/family key for model & effort switching. */
-export function normalizeSwitchHarness(raw: string): string {
-  const h = raw.trim().toLowerCase();
-  if (!h) return "generic";
-  if (h.includes("claude") || h === "crosery" || h === "prime" || h === "commandcode" || h === "reasonix") return "claude";
-  if (h === "omp" || h.includes("oh-my-pi")) return "omp";
-  if (h === "pi" || h.includes("pi-mono")) return "pi";
-  if (h.includes("codex")) return "codex";
-  if (h.includes("antigravity") || h === "agy") return "antigravity";
-  if (h.includes("gemini")) return "gemini";
-  if (h.includes("deepseek") || h === "dsh") return "dsh";
-  if (h.includes("opencode") || h.includes("kilo") || h.includes("crush")) return "opencode";
-  if (h.includes("hermes")) return "hermes";
-  if (h.includes("grok")) return "grok";
-  if (h.includes("aider")) return "aider";
-  if (h.includes("factory") || h === "droid") return "factory";
-  if (h.includes("cursor")) return "cursor";
-  if (h.includes("kimi")) return "kimi";
-  if (h.includes("qwen")) return "qwen";
-  if (h.includes("qoder")) return "qoder";
-  if (h.includes("codebuddy")) return "codebuddy";
-  if (h.includes("goose")) return "goose";
-  if (h === "amp") return "amp";
-  return h;
-}
+export {
+  HARNESS_DEFAULT_THINKING_LEVELS,
+  inferAgentModelAndThinking,
+  normalizeSwitchHarness,
+  stripModelEffortSuffix,
+  synthesizeFallbackAgentModels,
+};
 
 /** Builds per-harness slash commands / keys to switch model and/or thinking effort cleanly. */
 export function buildHarnessSwitchCommands(
