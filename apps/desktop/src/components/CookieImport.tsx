@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronLeft, Cookie, Search, ShieldCheck } from "lucide-react";
 import { PocketButton, PocketCheckbox, PocketInput, PocketModal, useToast } from "./PocketUI";
-import { native, type CookieImportResult, type CookieSource } from "../lib/native";
+import { PermissionGuideModal } from "./PermissionGuideModal";
+import { native, type CookieImportResult, type CookieSource, type Permissions } from "../lib/native";
 import { useClientConfig } from "../lib/config";
 import { logger } from "../lib/log";
 
@@ -49,6 +50,8 @@ export function CookieImportDialog({ open, onOpenChange, currentHost }: { open: 
   const [result, setResult] = useState<{ summary: string; notes: string[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [storeKind, setStoreKind] = useState<"persistent" | "session" | null>(null);
+  const [fdaGuideOpen, setFdaGuideOpen] = useState(false);
+  const [perms, setPerms] = useState<Permissions | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -57,9 +60,11 @@ export function CookieImportDialog({ open, onOpenChange, currentHost }: { open: 
     setResult(null);
     setError(null);
     setConfirmAll(false);
+    setFdaGuideOpen(false);
     if (!supported) return;
     void native.listCookieSources().then(setSources, () => setSources([]));
     void native.browserStoreKind().then(setStoreKind, () => setStoreKind(null));
+    void native.getPermissions().then(setPerms, () => setPerms(null));
   }, [open, supported]);
 
   const choose = (s: CookieSource) => {
@@ -190,8 +195,15 @@ export function CookieImportDialog({ open, onOpenChange, currentHost }: { open: 
                       选网站
                     </PocketButton>
                   ) : s.settings === "fullDiskAccess" ? (
-                    <PocketButton size="sm" variant="ghost" onClick={() => void native.openPermissionSettings("fullDiskAccess")}>
-                      打开权限设置
+                    <PocketButton
+                      size="sm"
+                      variant="soft"
+                      onClick={() => {
+                        setFdaGuideOpen(true);
+                        void native.openPermissionSettings("fullDiskAccess", true);
+                      }}
+                    >
+                      去开启权限
                     </PocketButton>
                   ) : null}
                 </div>
@@ -292,6 +304,20 @@ export function CookieImportDialog({ open, onOpenChange, currentHost }: { open: 
         ) : null}
         {error ? <div className="inline-alert">{error}</div> : null}
       </div>
+      <PermissionGuideModal
+        kind="fullDiskAccess"
+        open={fdaGuideOpen}
+        onOpenChange={setFdaGuideOpen}
+        perms={perms}
+        onRefresh={async () => {
+          const [nextPerms, nextSources] = await Promise.all([
+            native.getPermissions(),
+            native.listCookieSources().catch(() => sources ?? []),
+          ]);
+          if (nextPerms) setPerms(nextPerms);
+          setSources(nextSources);
+        }}
+      />
     </PocketModal>
   );
 }

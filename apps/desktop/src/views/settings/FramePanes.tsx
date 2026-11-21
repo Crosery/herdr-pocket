@@ -643,16 +643,34 @@ export function PrivacyPane() {
   const toast = useToast();
   const server = settingsStore.use((s) => s.server);
   const upload = useClientConfig().logging.upload;
+  const voice = useClientConfig().voiceInput;
   const [folder, setFolder] = useState<LogFolderInfo | null>(null);
+  const [perms, setPerms] = useState<Permissions | null>(null);
+  const [checkingPerms, setCheckingPerms] = useState(false);
+  const refreshPerms = useCallback(async () => {
+    setCheckingPerms(true);
+    try {
+      setPerms(await native.getPermissions());
+    } finally {
+      setCheckingPerms(false);
+    }
+  }, []);
   useEffect(() => {
     void native.logInfo().then(setFolder);
-  }, []);
+    void refreshPerms();
+  }, [refreshPerms]);
   // "到 pocket.example.com，" with a real relay; "到你连接的中转服务器，" otherwise.
   const relay = server && !isMockServer(server) ? ` ${serverLabel(server)}` : "你连接的中转服务器";
 
   return (
     <div className="pane">
-      <PaneTitle title="隐私" about="哪些东西会离开这台电脑，发到哪里。" />
+      <PaneTitle title="隐私" about="系统权限管理、以及哪些信息会离开这台电脑并发往何处。" />
+
+      <SetHeading>系统权限</SetHeading>
+      <div className="sf-block">
+        <div className="faint sf-block-lead">语音输入与浏览器数据导入需要的系统权限，可直接跳转设置并拖入应用授权：</div>
+        <PermissionCards perms={perms} checking={checkingPerms} onChanged={() => void refreshPerms()} singleKey={HOLD_KEYS.has(voice.hotkey ?? "")} />
+      </div>
 
       <SetHeading>日志</SetHeading>
       <ConfigSwitch

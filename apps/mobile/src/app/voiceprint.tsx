@@ -6,7 +6,7 @@
  * forwarding the original mixture when extraction is unavailable.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Pressable, ScrollView, View } from "react-native";
+import { Linking, Pressable, ScrollView, View } from "react-native";
 import { Text } from "react-native-paper";
 import { Stack } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -830,7 +830,14 @@ export default function VoiceprintScreen() {
         </Text>
 
         {error ? (
-          <Text style={{ color: p.error, fontSize: 13.5, lineHeight: 20, textAlign: "center" }}>{error}</Text>
+          <View style={{ gap: space.sm, alignItems: "center" }}>
+            <Text style={{ color: p.error, fontSize: 13.5, lineHeight: 20, textAlign: "center" }}>{error}</Text>
+            {error.includes("系统设置") ? (
+              <PocketButton size="sm" variant="soft" onPress={() => void Linking.openSettings()}>
+                打开系统设置
+              </PocketButton>
+            ) : null}
+          </View>
         ) : null}
       </ScrollView>
 

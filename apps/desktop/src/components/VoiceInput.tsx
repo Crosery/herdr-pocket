@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { Keyboard, Mic, RefreshCw, ShieldCheck } from "lucide-react";
+import { ExternalLink, Keyboard, Mic, RefreshCw, Settings2, ShieldCheck } from "lucide-react";
 import { configKeySpec, type TranscribeInfo } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketSelect, PocketSwitch, PocketTextarea, useToast } from "./PocketUI";
+import { PermissionGuideModal } from "./PermissionGuideModal";
 import { copyToClipboard, detectPlatform, voiceStart, voiceStop } from "../lib/bridge";
 import { native, type Permission, type PermissionKind, type Permissions, type VoiceEvent, type VoiceRuntime } from "../lib/native";
 import { setConfig, useClientConfig } from "../lib/config";
@@ -98,6 +99,16 @@ const PERM_LABEL: Record<Permission, { tone: "mint" | "blush" | "warn" | "neutra
   unknown: { tone: "neutral", text: "无法检测" },
 };
 
+const DEMO_PERMS: Permissions = {
+  platform: MAC ? "macos" : "windows",
+  microphone: "granted",
+  accessibility: "denied",
+  inputMonitoring: "granted",
+  fullDiskAccess: "denied",
+  appBundlePath: "/Applications/Herdr Pocket.app",
+  notes: [],
+};
+
 export function PermissionCards({
   perms,
   onChanged,
@@ -111,65 +122,113 @@ export function PermissionCards({
   singleKey?: boolean;
 }) {
   const toast = useToast();
+  const [guideKind, setGuideKind] = useState<PermissionKind | null>(null);
+  const effectivePerms = perms ?? (!native.available() ? DEMO_PERMS : null);
   const kinds: Array<"microphone" | "accessibility" | "inputMonitoring"> = MAC
-    ? ["microphone", "accessibility", ...(singleKey ? (["inputMonitoring"] as const) : [])]
+    ? ["microphone", "accessibility", "inputMonitoring"]
     : ["microphone"];
-  const open = async (k: PermissionKind, state: Permission) => {
+
+  const jumpAndGuide = async (k: PermissionKind, state: Permission) => {
+    setGuideKind(k);
+    if (!native.available()) return;
     try {
-      // Never asked: the system prompt is quicker than a trip to Settings.
-      if (state === "notDetermined") {
-        await native.requestPermission(k);
+      if (k === "microphone" && state === "notDetermined") {
+        const next = await native.requestPermission(k);
         onChanged();
-      } else {
-        await native.openPermissionSettings(k);
+        if (next.microphone === "granted") {
+          setGuideKind(null);
+          return;
+        }
       }
+      await native.openPermissionSettings(k, true);
+      onChanged();
     } catch (e) {
       toast((e as Error).message, true);
     }
   };
+
   return (
-    <div className="perm-grid">
-      {kinds.map((k) => {
-        const info = PERMISSION_INFO[k];
-        const state: Permission = perms ? perms[k] : "unknown";
-        if (state === "notApplicable") return null;
-        const label = PERM_LABEL[state];
-        const done = state === "granted";
-        return (
-          <div key={k} className={`perm-card${state === "denied" || state === "restricted" ? " warn" : ""}`}>
-            <div className="between" style={{ gap: 8 }}>
-              <div className="row" style={{ gap: 8, minWidth: 0 }}>
-                <ShieldCheck size={16} />
-                <strong>{info.title}</strong>
+    <>
+      <div className="perm-grid">
+        {kinds.map((k) => {
+          const info = PERMISSION_INFO[k];
+          const state: Permission = effectivePerms ? effectivePerms[k] : "unknown";
+          if (state === "notApplicable") return null;
+          const label = PERM_LABEL[state];
+          const done = state === "granted";
+          return (
+            <div key={k} className={`perm-card${state === "denied" || state === "restricted" ? " warn" : ""}`}>
+              <div className="between" style={{ gap: 8 }}>
+                <div className="row" style={{ gap: 8, minWidth: 0 }}>
+                  <ShieldCheck size={16} />
+                  <strong>{info.title}</strong>
+                </div>
+                <div className="row" style={{ gap: 6, flex: "none" }}>
+                  <PocketBadge tone={label.tone}>{label.text}</PocketBadge>
+                  {done ? (
+                    <button
+                      type="button"
+                      className="v3-icon-btn small"
+                      aria-label={`打开${info.title}授权引导`}
+                      title={`打开${info.title}授权引导与系统设置`}
+                      onClick={() => setGuideKind(k)}
+                    >
+                      <Settings2 size={13} />
+                    </button>
+                  ) : null}
+                </div>
               </div>
-              <PocketBadge tone={label.tone}>{label.text}</PocketBadge>
+              <div className="faint">
+                {info.why}
+                {k === "inputMonitoring" && !singleKey ? "（当前使用组合键可不开；改用右 Option / Fn 单键时开启）" : ""}
+              </div>
+              <button
+                type="button"
+                className="perm-path-link"
+                title="点击直达系统设置对应位置并查看拖拽引导"
+                onClick={() => void jumpAndGuide(k, state)}
+              >
+                <span className="truncate">{info.how}</span>
+                <ExternalLink size={12} style={{ flex: "none" }} />
+              </button>
+              {!done ? (
+                <div className="row wrap" style={{ gap: 6 }}>
+                  <PocketButton size="sm" variant="primary" onClick={() => void jumpAndGuide(k, state)}>
+                    <ExternalLink size={13} />
+                    <span>{state === "notDetermined" ? "去授权" : "去开启"}</span>
+                  </PocketButton>
+                  <PocketButton size="sm" variant="soft" onClick={() => setGuideKind(k)}>
+                    <span>{MAC ? "拖拽引导" : "查看引导"}</span>
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="ghost"
+                    disabled={checking}
+                    onClick={() => {
+                      // A permission granted just now: let the native side retry the hotkey too.
+                      void native.voiceReload().finally(onChanged);
+                    }}
+                  >
+                    <RefreshCw size={13} />
+                    <span>重新检测</span>
+                  </PocketButton>
+                </div>
+              ) : null}
             </div>
-            <div className="faint">{info.why}</div>
-            {!done ? <div className="perm-how">{info.how}</div> : null}
-            {!done && perms ? (
-              <div className="row wrap" style={{ gap: 6 }}>
-                <PocketButton size="sm" variant="primary" onClick={() => void open(k, state)}>
-                  {state === "notDetermined" ? "允许" : "去开启"}
-                </PocketButton>
-                <PocketButton
-                  size="sm"
-                  variant="ghost"
-                  disabled={checking}
-                  onClick={() => {
-                    // A permission granted just now: let the native side retry the hotkey too.
-                    void native.voiceReload().finally(onChanged);
-                  }}
-                >
-                  <RefreshCw size={13} />
-                  <span>我已开启，重新检测</span>
-                </PocketButton>
-              </div>
-            ) : null}
-          </div>
-        );
-      })}
-      {perms?.notes.length ? <div className="faint">{perms.notes.join(" ")}</div> : null}
-    </div>
+          );
+        })}
+        {effectivePerms?.notes.length ? <div className="faint">{effectivePerms.notes.join(" ")}</div> : null}
+      </div>
+      <PermissionGuideModal
+        kind={guideKind}
+        open={guideKind !== null}
+        onOpenChange={(o) => {
+          if (!o) setGuideKind(null);
+        }}
+        perms={effectivePerms}
+        onRefresh={onChanged}
+      />
+    </>
   );
 }
 
@@ -235,6 +294,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   const [checking, setChecking] = useState(false);
   const [trial, setTrial] = useState("");
   const [hotkeyNote, setHotkeyNote] = useState<{ error?: boolean; text: string } | null>(null);
+  const [keyboardGuideOpen, setKeyboardGuideOpen] = useState(false);
   const { info, error: infoError } = useTranscribeInfo();
   const singleKey = isModifierKey(cfg.hotkey);
 
@@ -377,11 +437,25 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       {fnTip ? (
         <div className="inline-alert">
           <span className="grow">用 Fn 说话前，先把“按下地球仪键时”改成“不执行任何操作”，否则按 Fn 会切换输入法或弹出表情。</span>
-          <PocketButton size="sm" variant="soft" onClick={() => void native.openPermissionSettings("keyboard")}>
-            打开键盘设置
+          <PocketButton
+            size="sm"
+            variant="soft"
+            onClick={() => {
+              setKeyboardGuideOpen(true);
+              void native.openPermissionSettings("keyboard", true);
+            }}
+          >
+            去调整设置
           </PocketButton>
         </div>
       ) : null}
+      <PermissionGuideModal
+        kind="keyboard"
+        open={keyboardGuideOpen}
+        onOpenChange={setKeyboardGuideOpen}
+        perms={perms}
+        onRefresh={refresh}
+      />
 
       <div className="set-row">
         <div className="set-text">

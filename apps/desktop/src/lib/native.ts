@@ -51,8 +51,10 @@ export interface Permissions {
   microphone: Permission;
   accessibility: Permission;
   inputMonitoring: Permission;
+  fullDiskAccess?: Permission;
   /** macOS: what the 🌐/Fn key does now; "none" is needed to use Fn as the dictation key. */
   fnKeyAction?: "none" | "inputSource" | "emoji" | "dictation" | "unknown";
+  appBundlePath?: string;
   notes: string[];
 }
 
@@ -197,7 +199,12 @@ export const native = {
   // Permissions ------------------------------------------------------------
   getPermissions: async (): Promise<Permissions | null> => (inTauri() ? invoke<Permissions>("permissions_status").catch(() => null) : null),
   requestPermission: (kind: PermissionKind): Promise<Permissions> => invoke<Permissions>("permission_request", { kind }),
-  openPermissionSettings: (kind: PermissionKind): Promise<void> => (inTauri() ? invoke("permission_open_settings", { kind }) : noop()),
+  openPermissionSettings: (kind: PermissionKind, register = false): Promise<void> =>
+    inTauri() ? invoke("permission_open_settings", { kind, register }) : noop(),
+  startAppBundleDrag: (): Promise<boolean> =>
+    inTauri() ? invoke<boolean>("permission_drag_app_bundle").catch(() => false) : Promise.resolve(false),
+  revealAppBundle: (): Promise<string | null> =>
+    inTauri() ? invoke<string>("permission_reveal_app_bundle").catch(() => null) : Promise.resolve(null),
 
   // Resources ----------------------------------------------------------------
   getResourceUsage: async (): Promise<ResourceUsage | null> => (inTauri() ? invoke<ResourceUsage>("resource_usage").catch(() => null) : null),

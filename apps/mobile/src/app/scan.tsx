@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { StyleSheet, View } from "react-native";
+import { Linking, StyleSheet, View } from "react-native";
 import { Text } from "react-native-paper";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { router } from "expo-router";
@@ -19,16 +19,24 @@ export default function ScanScreen() {
 
   if (!permission) return <PageBackground />;
   if (!permission.granted) {
+    const canAsk = permission.canAskAgain !== false;
     return (
       <PageBackground>
         <EmptyState
           mood="waiting"
           title="需要用一下相机"
-          body="只用来扫二维码，不会拍照或录像。"
+          body={canAsk ? "只用来扫二维码，不会拍照或录像。" : "请在系统设置中允许 Herdr Pocket 访问相机（只用来扫二维码）。"}
           action={
-            <PocketButton onPress={requestPermission}>
-              允许使用相机
-            </PocketButton>
+            <View style={{ gap: space.sm, alignItems: "center" }}>
+              <PocketButton onPress={canAsk ? requestPermission : () => void Linking.openSettings()}>
+                {canAsk ? "允许使用相机" : "去系统设置开启相机权限"}
+              </PocketButton>
+              {canAsk ? (
+                <PocketButton variant="soft" size="sm" onPress={() => void Linking.openSettings()}>
+                  打开系统设置
+                </PocketButton>
+              ) : null}
+            </View>
           }
         />
       </PageBackground>

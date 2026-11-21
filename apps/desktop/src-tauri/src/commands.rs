@@ -176,8 +176,18 @@ pub async fn permission_request(kind: String) -> Result<perms::Status, String> {
 }
 
 #[tauri::command]
-pub fn permission_open_settings(kind: String) -> Result<(), String> {
-    perms::open_settings(&kind)
+pub fn permission_open_settings(kind: String, register: Option<bool>) -> Result<(), String> {
+    perms::open_settings_and_register(&kind, register.unwrap_or(false))
+}
+
+#[tauri::command]
+pub fn permission_reveal_app_bundle() -> Result<String, String> {
+    perms::reveal_app_bundle()
+}
+
+#[tauri::command]
+pub fn permission_drag_app_bundle(app: AppHandle) -> Result<bool, String> {
+    perms::start_app_bundle_drag(&app)
 }
 
 #[tauri::command]

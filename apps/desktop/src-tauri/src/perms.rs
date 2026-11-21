@@ -33,15 +33,59 @@ pub struct Status {
     pub microphone: State,
     pub accessibility: State,
     pub input_monitoring: State,
+    pub full_disk_access: State,
     /// macOS: what the fn (globe) key does: `none`, `inputSource`, `emoji` or `dictation`
     /// (absent when the system never stored a choice, and on other systems).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fn_key_action: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_bundle_path: Option<String>,
     /// Chinese hints for the settings screen.
     pub notes: Vec<String>,
 }
 
 pub const KINDS: [&str; 3] = ["microphone", "accessibility", "inputMonitoring"];
+
+/// Walks `exe` ancestors for the enclosing `.app` bundle (preferring the outermost `.app` in dev/helper layouts).
+pub fn app_bundle_from_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut found: Option<std::path::PathBuf> = None;
+    for p in exe.ancestors() {
+        let is_app = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("app"));
+        if is_app {
+            found = Some(p.to_path_buf());
+        }
+    }
+    found
+}
+
+/// Resolves the running macOS `.app` bundle, falling back to `/Applications/Herdr Pocket.app` when running unpackaged in dev.
+pub fn current_app_bundle() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(app) = app_bundle_from_exe(&exe) {
+                return Some(app);
+            }
+            if let Ok(canon) = std::fs::canonicalize(&exe) {
+                if let Some(app) = app_bundle_from_exe(&canon) {
+                    return Some(app);
+                }
+            }
+        }
+        let installed = std::path::PathBuf::from("/Applications/Herdr Pocket.app");
+        if installed.exists() {
+            return Some(installed);
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -161,6 +205,32 @@ mod mac {
         }
     }
 
+    pub fn full_disk_access() -> State {
+        let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) else {
+            return State::Unknown;
+        };
+        let home = std::path::PathBuf::from(home);
+        let probes = [
+            home.join("Library/Safari"),
+            home.join("Library/Application Support/com.apple.TCC"),
+        ];
+        let mut saw_denied = false;
+        for p in &probes {
+            match std::fs::read_dir(p) {
+                Ok(_) => return State::Granted,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    saw_denied = true;
+                }
+                Err(_) => {}
+            }
+        }
+        if saw_denied {
+            State::Denied
+        } else {
+            State::Unknown
+        }
+    }
+
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         fn CFPreferencesCopyAppValue(
@@ -263,12 +333,14 @@ pub fn status() -> Status {
             microphone: mac::microphone(),
             accessibility: mac::accessibility(),
             input_monitoring: mac::input_monitoring(),
+            full_disk_access: mac::full_disk_access(),
             fn_key_action: mac::fn_key_action(),
+            app_bundle_path: current_app_bundle().map(|p| p.to_string_lossy().into_owned()),
             notes: vec![
                 "麦克风：录音时需要。".into(),
                 "辅助功能：把识别出的文字粘贴到正在使用的应用时需要。".into(),
                 "输入监控：只用一个修饰键（如右 Option、Fn）做快捷键时需要。".into(),
-                "在系统设置里打开开关后，如果仍不生效，请退出并重新打开 Herdr Pocket。".into(),
+                "若在系统设置里找不到开关，或开启后仍未生效，可直接把引导弹窗内的应用图标拖入系统设置列表。".into(),
             ],
         }
     }
@@ -279,7 +351,9 @@ pub fn status() -> Status {
             microphone: win::microphone(),
             accessibility: State::NotApplicable,
             input_monitoring: State::NotApplicable,
+            full_disk_access: State::NotApplicable,
             fn_key_action: None,
+            app_bundle_path: None,
             notes: vec![
                 "麦克风：在 设置 → 隐私和安全性 → 麦克风 里打开「允许应用访问麦克风」和「允许桌面应用访问麦克风」。".into(),
                 "以管理员身份运行的窗口（例如管理员终端）收不到快捷键和粘贴，这是 Windows 的安全限制；识别结果会留在剪贴板里。".into(),
@@ -293,7 +367,9 @@ pub fn status() -> Status {
             microphone: State::Unknown,
             accessibility: State::NotApplicable,
             input_monitoring: State::NotApplicable,
+            full_disk_access: State::NotApplicable,
             fn_key_action: None,
+            app_bundle_path: None,
             notes: vec!["Linux 版暂不支持全局语音输入。".into()],
         }
     }
@@ -371,9 +447,231 @@ pub fn settings_url(kind: &str) -> Option<&'static str> {
 }
 
 pub fn open_settings(kind: &str) -> Result<(), String> {
-    let url = settings_url(kind).ok_or_else(|| "这台电脑的系统没有对应的设置页".to_string())?;
-    logging::info("perm", format!("open settings for {kind}"), Value::Null);
-    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| format!("无法打开系统设置：{e}"))
+    open_settings_and_register(kind, false)
+}
+
+pub fn open_settings_and_register(kind: &str, register: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PROMPTED_AX: AtomicBool = AtomicBool::new(false);
+
+        if register {
+            match kind {
+                "accessibility" => {
+                    if mac::accessibility() != State::Granted && !PROMPTED_AX.swap(true, Ordering::Relaxed) {
+                        mac::request_accessibility();
+                    }
+                }
+                "inputMonitoring" => {
+                    if mac::input_monitoring() == State::NotDetermined {
+                        mac::request_input_monitoring();
+                    }
+                }
+                "microphone" => {
+                    if mac::microphone() == State::NotDetermined && mac::request_microphone() == State::Granted {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let url = settings_url(kind).ok_or_else(|| "这台电脑的系统没有对应的设置页".to_string())?;
+        logging::info(
+            "perm",
+            format!("open settings for {kind}"),
+            json!({ "register": register }),
+        );
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .status()
+            .map_err(|e| format!("无法打开系统设置：{e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        if kind == "keyboard" {
+            let fallback = "x-apple.systempreferences:com.apple.preference.keyboard";
+            if std::process::Command::new("/usr/bin/open")
+                .arg(fallback)
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return Ok(());
+            }
+        }
+        return Err("无法跳转到系统设置页面，请手动打开「系统设置」检查".into());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = register;
+        let url = settings_url(kind).ok_or_else(|| "这台电脑的系统没有对应的设置页".to_string())?;
+        logging::info("perm", format!("open settings for {kind}"), Value::Null);
+        tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| format!("无法打开系统设置：{e}"))
+    }
+}
+
+/// Reveals the current `.app` bundle in Finder (macOS) or Explorer (Windows) so the user can also drag it manually.
+pub fn reveal_app_bundle() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = current_app_bundle().ok_or_else(|| "未找到 Herdr Pocket.app 应用包".to_string())?;
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&bundle)
+            .status()
+            .map_err(|e| format!("无法打开 Finder：{e}"))?;
+        if !status.success() {
+            return Err("无法在 Finder 中显示 Herdr Pocket.app".into());
+        }
+        return Ok(bundle.to_string_lossy().into_owned());
+    }
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| format!("定位程序失败：{e}"))?;
+        let arg = format!("/select,{}", exe.to_string_lossy());
+        let _ = std::process::Command::new("explorer.exe").arg(arg).spawn();
+        return Ok(exe.to_string_lossy().into_owned());
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        Err("当前系统不支持定位应用包".into())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod mac_drag {
+    use super::current_app_bundle;
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::{
+        NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSDraggingSource,
+        NSEvent, NSEventModifierFlags, NSEventType, NSWindow, NSWorkspace,
+    };
+    use objc2_foundation::{
+        NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    };
+    use std::cell::RefCell;
+    use std::time::Duration;
+    use tauri::Manager;
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        struct PocketAppDragSource;
+
+        unsafe impl NSObjectProtocol for PocketAppDragSource {}
+
+        unsafe impl NSDraggingSource for PocketAppDragSource {
+            #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
+            fn __source_operation_mask(
+                &self,
+                _session: &NSDraggingSession,
+                context: NSDraggingContext,
+            ) -> NSDragOperation {
+                if context == NSDraggingContext::OutsideApplication {
+                    NSDragOperation::Copy | NSDragOperation::Link | NSDragOperation::Generic
+                } else {
+                    NSDragOperation::None
+                }
+            }
+        }
+    );
+
+    impl PocketAppDragSource {
+        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            let this = mtm.alloc::<Self>().set_ivars(());
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    thread_local! {
+        static ACTIVE_DRAG: RefCell<Option<(Retained<PocketAppDragSource>, Retained<NSDraggingSession>)>> = const { RefCell::new(None) };
+    }
+
+    pub fn start_app_bundle_drag(app: &tauri::AppHandle) -> Result<bool, String> {
+        let bundle = current_app_bundle().ok_or_else(|| "未找到 Herdr Pocket.app 应用包".to_string())?;
+        let bundle_str = bundle.to_string_lossy().into_owned();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<bool, String>>(1);
+        let handle = app.clone();
+        app.run_on_main_thread(move || {
+            let res = (|| -> Result<bool, String> {
+                if (NSEvent::pressedMouseButtons() & 1) == 0 {
+                    return Ok(false);
+                }
+                let mtm = MainThreadMarker::new().ok_or("必须在主线程发起拖拽")?;
+                let win = handle
+                    .get_webview_window("main")
+                    .ok_or("未找到主窗口")?;
+                let ns_ptr = win
+                    .ns_window()
+                    .map_err(|e| format!("获取窗口句柄失败：{e}"))?;
+                if ns_ptr.is_null() {
+                    return Err("主窗口尚未就绪".into());
+                }
+                let ns_win = unsafe { &*(ns_ptr as *const NSWindow) };
+                let content_view = ns_win.contentView().ok_or("窗口视图尚未就绪")?;
+                let ns_path = NSString::from_str(&bundle_str);
+                let file_url = NSURL::fileURLWithPath(&ns_path);
+                let drag_item = NSDraggingItem::initWithPasteboardWriter(
+                    mtm.alloc(),
+                    ProtocolObject::from_ref(&*file_url),
+                );
+                let icon = NSWorkspace::sharedWorkspace().iconForFile(&ns_path);
+                icon.setSize(NSSize::new(56.0, 56.0));
+                let win_loc = ns_win.mouseLocationOutsideOfEventStream();
+                let view_loc = content_view.convertPoint_fromView(win_loc, None);
+                let frame = NSRect::new(
+                    NSPoint::new(view_loc.x - 28.0, view_loc.y - 28.0),
+                    NSSize::new(56.0, 56.0),
+                );
+                unsafe {
+                    drag_item.setDraggingFrame_contents(frame, Some(icon.as_ref()));
+                }
+                let drag_event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                    NSEventType::LeftMouseDragged,
+                    win_loc,
+                    NSEventModifierFlags::empty(),
+                    0.0,
+                    ns_win.windowNumber(),
+                    None,
+                    0,
+                    1,
+                    1.0,
+                )
+                .ok_or("无法构造拖拽鼠标事件")?;
+                let source = PocketAppDragSource::new(mtm);
+                let items = NSArray::from_retained_slice(&[drag_item]);
+                let session = content_view.beginDraggingSessionWithItems_event_source(
+                    &items,
+                    &drag_event,
+                    ProtocolObject::from_ref(&*source),
+                );
+                ACTIVE_DRAG.with(|slot| {
+                    *slot.borrow_mut() = Some((source, session));
+                });
+                Ok(true)
+            })();
+            let _ = tx.send(res);
+        })
+        .map_err(|e| format!("调度主线程拖拽失败：{e}"))?;
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "启动拖拽超时".to_string())?
+    }
+}
+
+pub fn start_app_bundle_drag(app: &tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        mac_drag::start_app_bundle_drag(app)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(false)
+    }
 }
 
 pub fn snapshot_value() -> Value {
@@ -381,7 +679,37 @@ pub fn snapshot_value() -> Value {
 }
 
 fn states_value(s: &Status) -> Value {
-    json!({ "microphone": s.microphone, "accessibility": s.accessibility, "inputMonitoring": s.input_monitoring, "fnKey": s.fn_key_action })
+    json!({ "microphone": s.microphone, "accessibility": s.accessibility, "inputMonitoring": s.input_monitoring, "fullDiskAccess": s.full_disk_access, "fnKey": s.fn_key_action })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{app_bundle_from_exe, settings_url};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn app_bundle_resolution_prefers_outermost_app_bundle() {
+        assert_eq!(
+            app_bundle_from_exe(Path::new(
+                "/Applications/Herdr Pocket.app/Contents/MacOS/herdr-pocket-desktop"
+            )),
+            Some(PathBuf::from("/Applications/Herdr Pocket.app"))
+        );
+        assert_eq!(
+            app_bundle_from_exe(Path::new("/usr/local/bin/herdr-pocket-desktop")),
+            None
+        );
+    }
+
+    #[test]
+    fn settings_url_covers_all_supported_permission_kinds() {
+        if cfg!(target_os = "macos") {
+            for k in ["microphone", "accessibility", "inputMonitoring", "keyboard", "fullDiskAccess"] {
+                assert!(settings_url(k).is_some(), "missing macOS URL for {k}");
+            }
+        }
+        assert!(settings_url("nonexistent").is_none());
+    }
 }
 
 fn last_states() -> &'static std::sync::Mutex<Option<Value>> {

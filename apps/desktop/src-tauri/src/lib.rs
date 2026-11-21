@@ -650,6 +650,8 @@ pub fn run() {
             commands::permissions_status,
             commands::permission_request,
             commands::permission_open_settings,
+            commands::permission_reveal_app_bundle,
+            commands::permission_drag_app_bundle,
             commands::resource_usage,
             commands::clear_caches,
             commands::update_env,
