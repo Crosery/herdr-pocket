@@ -13,7 +13,7 @@
 pub mod hotkey;
 
 #[cfg(any(target_os = "macos", windows))]
-mod audio;
+pub(crate) mod audio;
 #[cfg(target_os = "macos")]
 mod hook_mac;
 #[cfg(windows)]
@@ -771,9 +771,10 @@ impl Controller {
             target,
             via,
         };
+        let dsp_badge = crate::voice_ai::active_hud_badge();
         hud::show(
             &self.app,
-            json!({ "state": "recording", "level": 0, "elapsedMs": 0, "hint": hint, "sounds": self.cfg.voice_sounds, "maxSeconds": self.cfg.voice_max_seconds }),
+            json!({ "state": "recording", "level": 0, "elapsedMs": 0, "hint": hint, "sounds": self.cfg.voice_sounds, "maxSeconds": self.cfg.voice_max_seconds, "dspBadge": dsp_badge }),
         );
         self.publish(None);
     }
@@ -811,12 +812,24 @@ impl Controller {
             self.show_error("没有听到声音，请检查麦克风", "silent recording");
             return;
         }
+        let (samples, dsp_badge) = match crate::voice_ai::process_recording(&samples) {
+            crate::voice_ai::ProcessOutcome::Accept { samples, dsp_badge } => (samples, dsp_badge),
+            crate::voice_ai::ProcessOutcome::RejectNonOwner { reason, score } => {
+                logging::info(
+                    "voice.session",
+                    "recording rejected by voiceprint filter",
+                    json!({ "session": self.session, "score": score }),
+                );
+                self.show_error(&reason, "voiceprint rejected");
+                return;
+            }
+        };
         let wav = audio::wav(&samples);
         let session = self.session;
         logging::info(
             "voice.session",
             "dictation recorded",
-            json!({ "session": session, "audioMs": audio_ms, "bytes": wav.len(), "peak": (peak * 100.0).round() / 100.0, "via": format!("{via:?}") }),
+            json!({ "session": session, "audioMs": audio_ms, "bytes": wav.len(), "peak": (peak * 100.0).round() / 100.0, "via": format!("{via:?}"), "dspBadge": dsp_badge }),
         );
         self.phase = Phase::Transcribing {
             session,
@@ -826,7 +839,7 @@ impl Controller {
         };
         hud::update(
             &self.app,
-            json!({ "state": "transcribing", "sounds": self.cfg.voice_sounds }),
+            json!({ "state": "transcribing", "sounds": self.cfg.voice_sounds, "dspBadge": dsp_badge }),
         );
         self.publish(None);
         let app = self.app.clone();
@@ -876,6 +889,8 @@ impl Controller {
                     self.show_error("没有识别出文字，请再说一次", "");
                     return;
                 }
+                // INTEGRATION(voice-hud-perms): at merge time, when `hud::current_mode() == "assistant"`,
+                // spawn `hud::ask_assistant_from_hud(&app, &text)` and return early without pasting into target.
                 let chars = text.chars().count();
                 use tauri::Emitter;
                 let (method, note) = if target == Target::App {

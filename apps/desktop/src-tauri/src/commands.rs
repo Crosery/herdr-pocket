@@ -1113,6 +1113,77 @@ pub async fn local_read_file(
         .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+pub fn voice_ai_state() -> crate::voice_ai::VoiceAiState {
+    crate::voice_ai::current_state()
+}
+
+#[tauri::command]
+pub fn voice_ai_set_config(
+    changes: crate::voice_ai::VoiceAiConfigPatch,
+) -> Result<crate::voice_ai::VoiceAiState, String> {
+    crate::voice_ai::set_config(changes)
+}
+
+#[tauri::command]
+pub async fn voice_ai_download(
+    app: AppHandle,
+    tier: String,
+) -> Result<crate::voice_ai::VoiceAiState, String> {
+    crate::voice_ai::download_tier(&app, &tier).await
+}
+
+#[tauri::command]
+pub fn voice_ai_cancel_download() -> bool {
+    crate::voice_ai::cancel_download()
+}
+
+#[tauri::command]
+pub async fn voice_ai_benchmark() -> Result<crate::voice_ai::VoiceAiBenchmarkResult, String> {
+    tauri::async_runtime::spawn_blocking(crate::voice_ai::benchmark_device)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn voice_ai_start_enroll(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::voice_ai::start_enroll(app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn voice_ai_finish_enroll() -> Result<crate::voice_ai::VoiceAiEnrollResult, String> {
+    tauri::async_runtime::spawn_blocking(crate::voice_ai::finish_enroll)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn voice_ai_cancel_enroll() -> bool {
+    crate::voice_ai::cancel_enroll()
+}
+
+#[tauri::command]
+pub fn voice_ai_clear_voiceprint() -> Result<crate::voice_ai::VoiceAiState, String> {
+    crate::voice_ai::clear_voiceprint()
+}
+
+#[tauri::command]
+pub async fn voice_ai_start_test(
+    app: AppHandle,
+    threshold: Option<f32>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::voice_ai::start_test(app, threshold))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn voice_ai_stop_test() -> bool {
+    crate::voice_ai::stop_test()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_sums_url, read_local_file_sync};

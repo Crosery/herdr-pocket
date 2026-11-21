@@ -191,3 +191,16 @@ export const SOTA_TEXT_PRESETS: readonly ProviderPresetItem[] = [
   { id: "lmstudio", label: "LM Studio 本地", protocol: "openai", baseUrl: "http://127.0.0.1:1234/v1", auth: "none" },
   { id: "mlx", label: "Apple Silicon MLX 本地", protocol: "openai", baseUrl: "http://127.0.0.1:8080/v1", auth: "none" },
 ] as const;
+
+export type VoiceAiTier = "auto" | "denoise" | "sv" | "tse";
+
+export const VOICEPRINT_SENSITIVITY_OPTIONS = [
+  { value: 0.33, label: "宽松", hint: "环境较吵或说话轻时用，不容易漏掉你的话" },
+  { value: 0.38, label: "标准", hint: "日常推荐，漏人和误拦都少" },
+  { value: 0.45, label: "严格", hint: "身边有声音很像的人时用，核对更严格" },
+] as const;
+
+export const VOICEPRINT_SAMPLE_LINES = [
+  "小羊，帮我看看哪几个任务跑完了，有卡住的再叫我。",
+  "今天先这样，等这个构建过了就发个新版本吧。",
+] as const;

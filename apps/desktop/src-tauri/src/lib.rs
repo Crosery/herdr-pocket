@@ -24,6 +24,7 @@ mod relaylog;
 mod resources;
 mod updater;
 mod voice;
+mod voice_ai;
 mod webdiag;
 mod workspace_state;
 
@@ -584,6 +585,7 @@ fn on_quit(handle: &tauri::AppHandle, via: &str) {
     }
     logging::info("app", "app quitting", json!({ "via": via }));
     local_term::shutdown();
+    voice_ai::shutdown();
     voice::shutdown(handle);
     browser::on_exit(handle);
     relaylog::upload_blocking(handle, Duration::from_millis(1500));
@@ -668,6 +670,17 @@ pub fn run() {
             voice::voice_cancel,
             voice::voice_reload,
             voice::voice_transcribe_info,
+            commands::voice_ai_state,
+            commands::voice_ai_set_config,
+            commands::voice_ai_download,
+            commands::voice_ai_cancel_download,
+            commands::voice_ai_benchmark,
+            commands::voice_ai_start_enroll,
+            commands::voice_ai_finish_enroll,
+            commands::voice_ai_cancel_enroll,
+            commands::voice_ai_clear_voiceprint,
+            commands::voice_ai_start_test,
+            commands::voice_ai_stop_test,
             browser::browser_open,
             browser::browser_set_bounds,
             browser::browser_navigate,

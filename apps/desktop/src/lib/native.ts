@@ -7,6 +7,7 @@
  */
 import type { AgentModelsResult, RpcResult } from "@herdr-pocket/protocol";
 import * as bridge from "./bridge";
+import type { VoiceAiTier } from "./voicePresets";
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const mod = await import("@tauri-apps/api/core");
@@ -141,6 +142,201 @@ export interface LocalTermCloseEvent {
   id: string;
 }
 
+export type { VoiceAiTier };
+
+export interface VoiceAiState {
+  supported: boolean;
+  activeEngine: string;
+  denoise: boolean;
+  enhanceVocal: boolean;
+  filter: boolean;
+  tier: VoiceAiTier;
+  recommendedTier: "denoise" | "sv" | "tse" | null;
+  recommendReason: string | null;
+  threshold: number;
+  firstSpeaker: boolean;
+  dpdfReady: boolean;
+  vadReady: boolean;
+  svReady: boolean;
+  tseReady: boolean;
+  svSizeMb: number;
+  tseSizeMb: number;
+  downloading: boolean;
+  progress: number;
+  dlLabel: string | null;
+  dlError: string | null;
+  enrolled: boolean;
+  enrollSeconds: number;
+  ortReady?: boolean;
+  ortVersion?: string | null;
+  prototypesCount?: number;
+  consistency?: number;
+  snrDb?: number | null;
+  hasSample?: boolean;
+}
+
+export interface VoiceAiConfigPatch {
+  denoise?: boolean;
+  enhanceVocal?: boolean;
+  filter?: boolean;
+  tier?: VoiceAiTier;
+  threshold?: number;
+  firstSpeaker?: boolean;
+}
+
+export interface VoiceAiProgressEvent {
+  downloading: boolean;
+  progress: number;
+  received: number;
+  total: number;
+  dlLabel?: string | null;
+  dlError?: string | null;
+  done?: boolean;
+}
+
+export interface VoiceAiBenchmarkResult {
+  recommendedTier: "denoise" | "sv" | "tse";
+  reason: string;
+  dpdfUs: number;
+  tseRtf: number;
+  cores: number;
+  ramMb: number;
+  ortReady: boolean;
+}
+
+export interface VoiceAiEnrollEvent {
+  level: number;
+  seconds: number;
+  full: boolean;
+}
+
+export interface VoiceAiEnrollResult {
+  seconds: number;
+  consistency: number;
+  lowest: number;
+  snrDb: number;
+  prototypesCount: number;
+  hasSample: boolean;
+  state: VoiceAiState;
+}
+
+export interface VoiceAiTestEvent {
+  level: number;
+  speaking: boolean;
+  score?: number;
+  rawScore?: number;
+  protoScore?: number;
+  pass?: boolean;
+  inferMs?: number;
+}
+
+const DEMO_VOICE_AI_KEY = "herdr-pocket-demo-voice-ai-v1";
+const demoProgressListeners = new Set<(e: VoiceAiProgressEvent) => void>();
+const demoEnrollListeners = new Set<(e: VoiceAiEnrollEvent) => void>();
+const demoTestListeners = new Set<(e: VoiceAiTestEvent) => void>();
+let demoDownloadTimer: ReturnType<typeof setInterval> | null = null;
+let demoEnrollTimer: ReturnType<typeof setInterval> | null = null;
+let demoEnrollSecs = 0;
+let demoTestTimer: ReturnType<typeof setInterval> | null = null;
+
+function defaultDemoVoiceAiState(): VoiceAiState {
+  return {
+    supported: true,
+    activeEngine: "onnx-dpdfnet",
+    denoise: true,
+    enhanceVocal: true,
+    filter: false,
+    tier: "auto",
+    recommendedTier: "sv",
+    recommendReason: "演示环境：降噪 1.4 ms/帧，推荐 68 MB 灵巧声纹门控",
+    threshold: 0.38,
+    firstSpeaker: true,
+    dpdfReady: true,
+    vadReady: true,
+    svReady: true,
+    tseReady: false,
+    svSizeMb: 68,
+    tseSizeMb: 142,
+    downloading: false,
+    progress: 0,
+    dlLabel: null,
+    dlError: null,
+    enrolled: false,
+    enrollSeconds: 0,
+    ortReady: true,
+    ortVersion: "1.21.0",
+    prototypesCount: 0,
+    consistency: 0,
+    snrDb: null,
+    hasSample: false,
+  };
+}
+
+function readDemoVoiceAiState(): VoiceAiState {
+  const base = defaultDemoVoiceAiState();
+  try {
+    const raw = typeof localStorage !== "undefined" ? localStorage.getItem(DEMO_VOICE_AI_KEY) : null;
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<VoiceAiState>;
+      return computeDemoEngine({ ...base, ...parsed, downloading: false, dlLabel: null, dlError: null });
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return base;
+}
+
+function computeDemoEngine(s: VoiceAiState): VoiceAiState {
+  const active =
+    !s.denoise && !s.enhanceVocal && !(s.filter && s.enrolled)
+      ? "off"
+      : s.tier === "tse" && s.tseReady && s.enrolled
+        ? "onnx-voxlock"
+        : "onnx-dpdfnet";
+  return { ...s, activeEngine: active };
+}
+
+let demoVoiceAiMem: VoiceAiState | null = null;
+
+function getDemoVoiceAi(): VoiceAiState {
+  demoVoiceAiMem ??= readDemoVoiceAiState();
+  return demoVoiceAiMem;
+}
+
+function setDemoVoiceAi(next: VoiceAiState): VoiceAiState {
+  const computed = computeDemoEngine(next);
+  demoVoiceAiMem = computed;
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(DEMO_VOICE_AI_KEY, JSON.stringify(computed));
+    }
+  } catch {
+    // ignore
+  }
+  return computed;
+}
+
+function stopDemoEnrollTimer(): void {
+  if (demoEnrollTimer) {
+    clearInterval(demoEnrollTimer);
+    demoEnrollTimer = null;
+  }
+}
+
+function stopDemoTestTimer(): void {
+  if (demoTestTimer) {
+    clearInterval(demoTestTimer);
+    demoTestTimer = null;
+  }
+}
+
+function stopDemoDownloadTimer(): void {
+  if (demoDownloadTimer) {
+    clearInterval(demoDownloadTimer);
+    demoDownloadTimer = null;
+  }
+}
+
 
 const noop = async () => {};
 const unsubscribeNoop = () => () => {};
@@ -209,6 +405,202 @@ export const native = {
   checkHotkey: (hotkey: string): Promise<HotkeyCheck | null> => (inTauri() ? bridge.checkHotkey(hotkey).catch(() => null) : Promise.resolve(null)),
   voiceReload: (): Promise<boolean> => bridge.voiceReload(),
   getTranscribeInfo: () => bridge.getTranscribeInfo(),
+
+  // Local SOTA Audio DSP & Voiceprint (src-tauri/src/voice_ai.rs + Demo Mode) ---
+  voiceAiState: async (): Promise<VoiceAiState> =>
+    inTauri() ? invoke<VoiceAiState>("voice_ai_state") : Promise.resolve(getDemoVoiceAi()),
+  voiceAiSetConfig: async (changes: VoiceAiConfigPatch): Promise<VoiceAiState> => {
+    if (inTauri()) return invoke<VoiceAiState>("voice_ai_set_config", { changes });
+    const cur = getDemoVoiceAi();
+    return setDemoVoiceAi({
+      ...cur,
+      ...(changes.denoise !== undefined ? { denoise: changes.denoise } : {}),
+      ...(changes.enhanceVocal !== undefined ? { enhanceVocal: changes.enhanceVocal } : {}),
+      ...(changes.filter !== undefined ? { filter: changes.filter } : {}),
+      ...(changes.tier !== undefined ? { tier: changes.tier } : {}),
+      ...(changes.threshold !== undefined ? { threshold: Math.min(0.8, Math.max(0.15, changes.threshold)) } : {}),
+      ...(changes.firstSpeaker !== undefined ? { firstSpeaker: changes.firstSpeaker } : {}),
+    });
+  },
+  voiceAiDownload: async (tier: "base" | "sv" | "tse"): Promise<VoiceAiState> => {
+    if (inTauri()) return invoke<VoiceAiState>("voice_ai_download", { tier });
+    stopDemoDownloadTimer();
+    const cur = getDemoVoiceAi();
+    const totalMb = tier === "tse" ? cur.tseSizeMb : tier === "sv" ? cur.svSizeMb : 10;
+    const total = totalMb * 1024 * 1024;
+    const dlLabel =
+      tier === "tse"
+        ? `旗舰声纹分离包（约 ${cur.tseSizeMb} MB）`
+        : tier === "sv"
+          ? `灵巧声纹模型（约 ${cur.svSizeMb} MB）`
+          : "基础降噪引擎 (DPDFNet + VAD)";
+    setDemoVoiceAi({ ...cur, downloading: true, progress: 0, dlLabel, dlError: null });
+    return new Promise<VoiceAiState>((resolve) => {
+      let step = 0;
+      const steps = 8;
+      demoDownloadTimer = setInterval(() => {
+        step += 1;
+        const prog = Math.min(1, step / steps);
+        const done = step >= steps;
+        const nextState = setDemoVoiceAi({
+          ...getDemoVoiceAi(),
+          downloading: !done,
+          progress: prog,
+          dlLabel: done ? null : dlLabel,
+          dlError: null,
+          ...(done ? { dpdfReady: true, vadReady: true } : {}),
+          ...(done && (tier === "sv" || tier === "tse") ? { svReady: true } : {}),
+          ...(done && tier === "tse" ? { tseReady: true } : {}),
+        });
+        const ev: VoiceAiProgressEvent = {
+          downloading: !done,
+          progress: prog,
+          received: Math.round(total * prog),
+          total,
+          dlLabel: done ? null : dlLabel,
+          dlError: null,
+          done,
+        };
+        demoProgressListeners.forEach((cb) => cb(ev));
+        if (done) {
+          stopDemoDownloadTimer();
+          resolve(nextState);
+        }
+      }, 90);
+    });
+  },
+  voiceAiCancelDownload: async (): Promise<boolean> => {
+    if (inTauri()) return invoke<boolean>("voice_ai_cancel_download");
+    stopDemoDownloadTimer();
+    const cur = getDemoVoiceAi();
+    setDemoVoiceAi({ ...cur, downloading: false, progress: 0, dlLabel: null });
+    demoProgressListeners.forEach((cb) =>
+      cb({ downloading: false, progress: 0, received: 0, total: 0, dlLabel: null, dlError: null, done: false }),
+    );
+    return true;
+  },
+  voiceAiBenchmark: async (): Promise<VoiceAiBenchmarkResult> => {
+    if (inTauri()) return invoke<VoiceAiBenchmarkResult>("voice_ai_benchmark");
+    await new Promise((r) => setTimeout(r, 240));
+    const cur = getDemoVoiceAi();
+    const rec: "sv" | "tse" = cur.tseReady ? "tse" : "sv";
+    const reason =
+      rec === "tse"
+        ? "演示环境：实测分离负载 42%（单帧降噪 1.38 ms），可流畅运行旗舰分离模型"
+        : "演示环境：实测降噪 1.38 ms/帧（8核），推荐 68 MB 灵巧声纹门控";
+    setDemoVoiceAi({ ...cur, recommendedTier: rec, recommendReason: reason });
+    return {
+      recommendedTier: rec,
+      reason,
+      dpdfUs: 1380,
+      tseRtf: 0.42,
+      cores: 8,
+      ramMb: 16384,
+      ortReady: true,
+    };
+  },
+  voiceAiStartEnroll: async (): Promise<void> => {
+    if (inTauri()) return invoke<void>("voice_ai_start_enroll");
+    stopDemoEnrollTimer();
+    stopDemoTestTimer();
+    demoEnrollSecs = 0;
+    demoEnrollTimer = setInterval(() => {
+      demoEnrollSecs = Math.min(20, demoEnrollSecs + 0.25);
+      const level = 0.28 + Math.abs(Math.sin(demoEnrollSecs * 3.1)) * 0.52;
+      demoEnrollListeners.forEach((cb) =>
+        cb({ level, seconds: Number(demoEnrollSecs.toFixed(2)), full: demoEnrollSecs >= 18 }),
+      );
+    }, 200);
+  },
+  voiceAiFinishEnroll: async (): Promise<VoiceAiEnrollResult> => {
+    if (inTauri()) return invoke<VoiceAiEnrollResult>("voice_ai_finish_enroll");
+    stopDemoEnrollTimer();
+    const secs = Math.max(6.2, demoEnrollSecs);
+    const next = setDemoVoiceAi({
+      ...getDemoVoiceAi(),
+      enrolled: true,
+      filter: true,
+      enrollSeconds: Number(secs.toFixed(1)),
+      prototypesCount: 4,
+      consistency: 0.91,
+      snrDb: 24.6,
+      hasSample: true,
+    });
+    return {
+      seconds: next.enrollSeconds,
+      consistency: 0.91,
+      lowest: 0.84,
+      snrDb: 24.6,
+      prototypesCount: 4,
+      hasSample: true,
+      state: next,
+    };
+  },
+  voiceAiCancelEnroll: async (): Promise<boolean> => {
+    if (inTauri()) return invoke<boolean>("voice_ai_cancel_enroll");
+    stopDemoEnrollTimer();
+    demoEnrollSecs = 0;
+    return true;
+  },
+  voiceAiClearVoiceprint: async (): Promise<VoiceAiState> => {
+    if (inTauri()) return invoke<VoiceAiState>("voice_ai_clear_voiceprint");
+    stopDemoEnrollTimer();
+    stopDemoTestTimer();
+    return setDemoVoiceAi({
+      ...getDemoVoiceAi(),
+      enrolled: false,
+      filter: false,
+      enrollSeconds: 0,
+      prototypesCount: 0,
+      consistency: 0,
+      snrDb: null,
+      hasSample: false,
+    });
+  },
+  voiceAiStartTest: async (threshold?: number): Promise<void> => {
+    if (inTauri()) return invoke<void>("voice_ai_start_test", { threshold: threshold ?? null });
+    stopDemoEnrollTimer();
+    stopDemoTestTimer();
+    const thr = threshold ?? getDemoVoiceAi().threshold;
+    let tick = 0;
+    demoTestTimer = setInterval(() => {
+      tick += 1;
+      const level = 0.25 + Math.abs(Math.sin(tick * 0.9)) * 0.55;
+      const ev: VoiceAiTestEvent =
+        tick >= 2
+          ? {
+              level,
+              speaking: true,
+              score: 0.92,
+              rawScore: 0.89,
+              protoScore: 0.94,
+              pass: 0.92 >= thr,
+              inferMs: 18,
+            }
+          : { level, speaking: true };
+      demoTestListeners.forEach((cb) => cb(ev));
+    }, 200);
+  },
+  voiceAiStopTest: async (): Promise<boolean> => {
+    if (inTauri()) return invoke<boolean>("voice_ai_stop_test");
+    stopDemoTestTimer();
+    return true;
+  },
+  onVoiceAiProgress: (cb: (e: VoiceAiProgressEvent) => void): (() => void) => {
+    if (inTauri()) return onNativeEvent<VoiceAiProgressEvent>("voice-ai://progress", cb);
+    demoProgressListeners.add(cb);
+    return () => demoProgressListeners.delete(cb);
+  },
+  onVoiceAiEnroll: (cb: (e: VoiceAiEnrollEvent) => void): (() => void) => {
+    if (inTauri()) return onNativeEvent<VoiceAiEnrollEvent>("voice-ai://enroll", cb);
+    demoEnrollListeners.add(cb);
+    return () => demoEnrollListeners.delete(cb);
+  },
+  onVoiceAiTest: (cb: (e: VoiceAiTestEvent) => void): (() => void) => {
+    if (inTauri()) return onNativeEvent<VoiceAiTestEvent>("voice-ai://test", cb);
+    demoTestListeners.add(cb);
+    return () => demoTestListeners.delete(cb);
+  },
 
   // Permissions ------------------------------------------------------------
   getPermissions: async (): Promise<Permissions | null> => (inTauri() ? invoke<Permissions>("permissions_status").catch(() => null) : null),

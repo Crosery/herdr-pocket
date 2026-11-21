@@ -1,17 +1,26 @@
-import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { ExternalLink, Keyboard, Mic, RefreshCw, Settings2, ShieldCheck } from "lucide-react";
 import { configKeySpec, type TranscribeInfo } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketSelect, PocketSwitch, PocketTextarea, useToast } from "./PocketUI";
 import { PermissionGuideModal } from "./PermissionGuideModal";
+import { VoiceprintModal } from "./VoiceprintModal";
 import { copyToClipboard, detectPlatform, voiceStart, voiceStop } from "../lib/bridge";
-import { native, type Permission, type PermissionKind, type Permissions, type VoiceEvent, type VoiceRuntime } from "../lib/native";
+import {
+  native,
+  type Permission,
+  type PermissionKind,
+  type Permissions,
+  type VoiceAiConfigPatch,
+  type VoiceAiState,
+  type VoiceAiTier,
+  type VoiceEvent,
+  type VoiceRuntime,
+} from "../lib/native";
 import { setConfig, useClientConfig } from "../lib/config";
 import { getActiveToken, restRequest } from "../lib/relay";
 import { isMockServer } from "../lib/mock";
 import { liveStore, settingsStore } from "../lib/store";
 import { useWindowHidden } from "../lib/layout";
-import { SOTA_ASR_RECOMMENDATIONS } from "../lib/voicePresets";
-import { openSettingsFrame } from "../shell/shellStore";
 import "../styles/btw-slash.css";
 
 const PLATFORM = detectPlatform();
@@ -131,20 +140,19 @@ export function PermissionCards({
     ? ["microphone", "accessibility", "inputMonitoring"]
     : ["microphone"];
 
-  const jumpAndGuide = async (k: PermissionKind, state: Permission) => {
-    setGuideKind(k);
-    if (!native.available()) return;
+  const openSettingsDirect = async (k: PermissionKind, state: Permission) => {
+    if (!native.available()) {
+      toast("请在桌面客户端中直达系统设置");
+      return;
+    }
     try {
       if (k === "microphone" && state === "notDetermined") {
         const next = await native.requestPermission(k);
-        onChanged();
-        if (next.microphone === "granted") {
-          setGuideKind(null);
-          return;
-        }
+        await native.voiceReload().finally(onChanged);
+        if (next.microphone === "granted") return;
       }
       await native.openPermissionSettings(k, true);
-      onChanged();
+      void native.voiceReload().finally(onChanged);
     } catch (e) {
       toast((e as Error).message, true);
     }
@@ -173,7 +181,7 @@ export function PermissionCards({
                       type="button"
                       className="v3-icon-btn small"
                       aria-label={`打开${info.title}授权引导`}
-                      title={`打开${info.title}授权引导与系统设置`}
+                      title={`打开${info.title}授权引导`}
                       onClick={() => setGuideKind(k)}
                     >
                       <Settings2 size={13} />
@@ -183,20 +191,20 @@ export function PermissionCards({
               </div>
               <div className="faint">
                 {info.why}
-                {k === "inputMonitoring" && !singleKey ? "（当前使用组合键可不开；改用右 Option / Fn 单键时开启）" : ""}
+                {k === "inputMonitoring" && !singleKey ? "（单键按住说话需要）" : ""}
               </div>
               <button
                 type="button"
                 className="perm-path-link"
-                title="点击直达系统设置对应位置并查看拖拽引导"
-                onClick={() => void jumpAndGuide(k, state)}
+                title="点击直达系统设置对应位置"
+                onClick={() => void openSettingsDirect(k, state)}
               >
                 <span className="truncate">{info.how}</span>
                 <ExternalLink size={12} style={{ flex: "none" }} />
               </button>
               {!done ? (
                 <div className="row wrap" style={{ gap: 6 }}>
-                  <PocketButton size="sm" variant="primary" onClick={() => void jumpAndGuide(k, state)}>
+                  <PocketButton size="sm" variant="primary" onClick={() => void openSettingsDirect(k, state)}>
                     <ExternalLink size={13} />
                     <span>{state === "notDetermined" ? "去授权" : "去开启"}</span>
                   </PocketButton>
@@ -298,17 +306,27 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   const [trial, setTrial] = useState("");
   const [hotkeyNote, setHotkeyNote] = useState<{ error?: boolean; text: string } | null>(null);
   const [keyboardGuideOpen, setKeyboardGuideOpen] = useState(false);
-  const [selectedAsrRec, setSelectedAsrRec] = useState(SOTA_ASR_RECOMMENDATIONS[0]?.id ?? "");
+  const [aiState, setAiState] = useState<VoiceAiState | null>(null);
+  const [vpModalOpen, setVpModalOpen] = useState(false);
+  const refreshingRef = useRef(false);
   const { info, error: infoError } = useTranscribeInfo();
   const singleKey = isModifierKey(cfg.hotkey);
 
   const refresh = useCallback(async () => {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
     setChecking(true);
     try {
-      const [p, r] = await Promise.all([native.getPermissions(), native.getVoiceRuntime()]);
+      const [p, r, ai] = await Promise.all([
+        native.getPermissions(),
+        native.getVoiceRuntime(),
+        native.voiceAiState().catch(() => null),
+      ]);
       setPerms(p);
       setRuntime(r);
+      if (ai) setAiState(ai);
     } finally {
+      refreshingRef.current = false;
       setChecking(false);
     }
   }, []);
@@ -316,6 +334,65 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    const syncOnReturn = () => {
+      void native.voiceReload().finally(refresh);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") syncOnReturn();
+    };
+    window.addEventListener("focus", syncOnReturn);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", syncOnReturn);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refresh]);
+
+  useEffect(() => {
+    return native.onVoiceAiProgress((ev) => {
+      setAiState((cur) =>
+        cur
+          ? {
+              ...cur,
+              downloading: ev.downloading,
+              progress: ev.progress,
+              dlLabel: ev.dlLabel ?? null,
+              dlError: ev.dlError ?? null,
+            }
+          : cur,
+      );
+      if (!ev.downloading && ev.done) {
+        void native.voiceAiState().then(setAiState);
+      }
+    });
+  }, []);
+
+  const updateAiConfig = async (patch: VoiceAiConfigPatch) => {
+    try {
+      const next = await native.voiceAiSetConfig(patch);
+      setAiState(next);
+    } catch (e) {
+      toast((e as Error).message, true);
+    }
+  };
+
+  const selectAiTier = async (nextTier: VoiceAiTier) => {
+    try {
+      const next = await native.voiceAiSetConfig({ tier: nextTier });
+      setAiState(next);
+      if (nextTier === "sv" && !next.svReady) {
+        setAiState(await native.voiceAiDownload("sv"));
+      } else if (nextTier === "tse" && (!next.svReady || !next.tseReady)) {
+        setAiState(await native.voiceAiDownload("tse"));
+      }
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (!/取消/.test(msg)) toast(msg, true);
+      void native.voiceAiState().then(setAiState);
+    }
+  };
 
   const set = async (key: string, value: boolean | number | string) => {
     try {
@@ -391,30 +468,6 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
           <PocketBadge tone={engine.tone}>{engine.text}</PocketBadge>
         </div>
       </div>
-
-      {!compact ? (
-        <div className="set-row">
-          <div className="set-text">
-            <div className="set-title">推荐语音与识别模型</div>
-            <div className="set-about">云端实时语音与本机 Apple Silicon MLX 预设</div>
-          </div>
-          <div className="row" style={{ gap: 8, alignItems: "center", justifyContent: "flex-end", minWidth: 0, maxWidth: "100%" }}>
-            <PocketSelect
-              ariaLabel="推荐语音与识别模型"
-              value={selectedAsrRec}
-              onValueChange={setSelectedAsrRec}
-              options={SOTA_ASR_RECOMMENDATIONS.map((rec) => ({
-                value: rec.id,
-                label: `${rec.model} · ${rec.vendor}`,
-                badge: rec.badge,
-              }))}
-            />
-            <PocketButton size="sm" variant="soft" style={{ flexShrink: 0 }} onClick={() => openSettingsFrame("assistant")}>
-              去配置
-            </PocketButton>
-          </div>
-        </div>
-      ) : null}
 
       <div className="set-row">
         <div className="set-text">
@@ -545,6 +598,129 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
             </div>
             <PocketSwitch checked={cfg.sounds} disabled={!editable} onCheckedChange={(v) => void set("sounds", v)} label="提示音" />
           </div>
+
+          {aiState ? (
+            <>
+              <div className="set-heading">本地音频增强与声纹</div>
+
+              <div className="set-row">
+                <div className="set-text">
+                  <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                    <span className="set-title">语音降噪与人声增强</span>
+                    <PocketBadge tone={aiState.ortReady && aiState.dpdfReady ? "mint" : "lav"}>
+                      {aiState.ortReady && aiState.dpdfReady ? "DPDFNet + Silero VAD" : "纯 Rust DSP"}
+                    </PocketBadge>
+                  </div>
+                  <div className="set-about">本地实时降噪与频段增强，不上传原始环境音</div>
+                </div>
+                <div className="set-control">
+                  <PocketSwitch
+                    checked={aiState.denoise}
+                    onCheckedChange={(v) => void updateAiConfig({ denoise: v })}
+                    label="语音降噪与人声增强"
+                  />
+                </div>
+              </div>
+
+              <div className="set-row">
+                <div className="set-text">
+                  <div className="set-title">人声清晰度增强</div>
+                  <div className="set-about">1.5–3.8 kHz 谐波增强与柔和限幅</div>
+                </div>
+                <div className="set-control">
+                  <PocketSwitch
+                    checked={aiState.enhanceVocal}
+                    onCheckedChange={(v) => void updateAiConfig({ enhanceVocal: v })}
+                    label="人声清晰度增强"
+                  />
+                </div>
+              </div>
+
+              <div className="set-row">
+                <div className="set-text">
+                  <div className="set-title">声纹与人声分离档位</div>
+                  <div className="set-about">
+                    {aiState.downloading
+                      ? `正在准备 ${aiState.dlLabel ?? "模型"} · ${Math.round(aiState.progress * 100)}%`
+                      : aiState.dlError
+                        ? aiState.dlError
+                        : aiState.recommendReason || "自动按本机算力匹配声纹模型"}
+                  </div>
+                </div>
+                <div className="set-control" style={{ gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <PocketSelect
+                    ariaLabel="声纹与人声分离档位"
+                    value={aiState.tier}
+                    disabled={aiState.downloading}
+                    onValueChange={(v) => void selectAiTier(v as VoiceAiTier)}
+                    options={[
+                      {
+                        value: "auto",
+                        label: "自动推荐",
+                        badge:
+                          aiState.recommendedTier === "tse"
+                            ? "旗舰"
+                            : aiState.recommendedTier === "sv"
+                              ? "灵巧"
+                              : undefined,
+                      },
+                      { value: "sv", label: "灵巧声纹 · ERes2NetV2", badge: `${aiState.svSizeMb} MB` },
+                      { value: "tse", label: "旗舰声纹分离 · VoxLock v2", badge: `${aiState.tseSizeMb} MB` },
+                      { value: "denoise", label: "仅降噪与人声增强" },
+                    ]}
+                  />
+                  {aiState.downloading ? (
+                    <PocketButton
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => void native.voiceAiCancelDownload().then(() => native.voiceAiState().then(setAiState))}
+                    >
+                      取消
+                    </PocketButton>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="set-row">
+                <div className="set-text">
+                  <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                    <span className="set-title">只认我的声音</span>
+                    <PocketBadge tone={aiState.enrolled ? (aiState.filter ? "mint" : "neutral") : "neutral"}>
+                      {aiState.enrolled
+                        ? aiState.filter
+                          ? `已开启 · ${aiState.enrollSeconds.toFixed(1)}s`
+                          : "已录入"
+                        : "未录入"}
+                    </PocketBadge>
+                  </div>
+                  <div className="set-about">仅保留本人声音，忽略周围旁人说话</div>
+                </div>
+                <div className="set-control" style={{ gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  {aiState.enrolled ? (
+                    <PocketSwitch
+                      checked={aiState.filter}
+                      onCheckedChange={(v) => void updateAiConfig({ filter: v })}
+                      label="只认我的声音"
+                    />
+                  ) : null}
+                  <PocketButton
+                    size="sm"
+                    variant={aiState.enrolled ? "soft" : "primary"}
+                    onClick={() => setVpModalOpen(true)}
+                  >
+                    {aiState.enrolled ? "管理声纹" : "录入与测试"}
+                  </PocketButton>
+                </div>
+              </div>
+
+              <VoiceprintModal
+                open={vpModalOpen}
+                onOpenChange={setVpModalOpen}
+                aiState={aiState}
+                onStateChange={setAiState}
+              />
+            </>
+          ) : null}
         </>
       ) : null}
 

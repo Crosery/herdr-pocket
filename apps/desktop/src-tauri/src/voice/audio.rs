@@ -101,6 +101,28 @@ impl Recording {
         self.shared.failed.load(Ordering::Relaxed)
     }
 
+    /// Current number of captured 16 kHz mono samples.
+    #[allow(dead_code)]
+    pub fn sample_len(&self) -> usize {
+        self.shared.samples.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Copies samples starting at `offset` without interrupting the active recording stream.
+    #[allow(dead_code)]
+    pub fn snapshot_from(&self, offset: usize) -> Vec<i16> {
+        self.shared
+            .samples
+            .lock()
+            .map(|s| {
+                if offset >= s.len() {
+                    Vec::new()
+                } else {
+                    s[offset..].to_vec()
+                }
+            })
+            .unwrap_or_default()
+    }
+
     /// Stops the microphone and returns the 16 kHz samples.
     pub fn finish(mut self) -> Vec<i16> {
         self.close();
