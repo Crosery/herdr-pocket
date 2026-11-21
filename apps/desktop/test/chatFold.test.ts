@@ -125,7 +125,8 @@ test("kittyProtocol: APC splitter across chunks, graphics headers, OSC 66 sizing
 
   const kb = new KittyKeyboardState();
   assert.equal(encodeKittyKey({ key: "Enter", shiftKey: false, altKey: false, ctrlKey: false, metaKey: false }, 0, 0, true), null);
-  assert.equal(encodeKittyKey({ key: "Enter", shiftKey: true, altKey: false, ctrlKey: false, metaKey: false }, 0, 0, true), "\x1b[27;2;13~");
+  assert.equal(encodeKittyKey({ key: "Enter", shiftKey: true, altKey: false, ctrlKey: false, metaKey: false }, 0, 0, true), "\x1b[13;2u");
+  assert.equal(encodeKittyKey({ key: "Enter", shiftKey: true, altKey: false, ctrlKey: false, metaKey: false }, 0, 0, true, false, true), "\x1b\r");
   kb.push(false, 1);
   assert.equal(
     encodeKittyKey({ key: "Enter", shiftKey: true, altKey: false, ctrlKey: false, metaKey: false }, kb.current(false), 0, true),

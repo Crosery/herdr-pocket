@@ -370,6 +370,7 @@ export function encodeKittyKey(
   modifyOtherKeys: number,
   mac: boolean,
   win32InputMode = false,
+  isShell = false,
 ): string | null {
   if (mac && e.metaKey) return null;
 
@@ -386,7 +387,8 @@ export function encodeKittyKey(
     if (modifyOtherKeys === 0) {
       if (e.key === "Enter" && modBits > 0) {
         if (e.altKey && !e.shiftKey && !e.ctrlKey) return "\x1b\r";
-        return `\x1b[27;${modBits + 1};13~`;
+        if (isShell) return "\x1b\r";
+        return `\x1b[${13};${modBits + 1}u`;
       }
       return null;
     }

@@ -627,7 +627,8 @@ export class Host {
         // `screen: false`: only queue notices (they go to every terminal stream of the agent).
         if (p.screen !== false) {
           const onError = (error: Error) => this.sendStream(f.id, { kind: "stale", message: error.message, at: Date.now() });
-          if (p.raw === true && a.source === "hc") {
+          const hcBacked = a.source === "hc" || (a.source === "herdr" && this.hc.terminals.has(a.localId));
+          if (p.raw === true && hcBacked) {
             let seq = 0;
             const cols = typeof p.cols === "number" && Number.isFinite(p.cols) ? p.cols : 80;
             const rows = typeof p.rows === "number" && Number.isFinite(p.rows) ? p.rows : 24;
@@ -1054,9 +1055,15 @@ export class Host {
       this.writable();
       const a = this.resolve(p.agent);
       if (typeof p.data !== "string" || !p.data || p.data.length > 262_144) throw new RpcFailure("bad_request", "data is required");
-      if (a.source !== "hc") throw new RpcFailure("unsupported", "这个 agent 不是桌面 herdr 开的，只能用输入框发送");
-      await this.hc.input(a.localId, p.data);
-      return { ok: true as const };
+      if (a.source === "hc" || (a.source === "herdr" && this.hc.terminals.has(a.localId))) {
+        await this.hc.input(a.localId, p.data);
+        return { ok: true as const };
+      }
+      if (a.source === "herdr" && (p.data === "\x1b[13;2u" || p.data === "\x1b[27;2;13~" || p.data === "\x1b\r")) {
+        await this.herdr.keys(a.localId, ["shift+enter"]);
+        return { ok: true as const };
+      }
+      throw new RpcFailure("unsupported", "这个 agent 不是桌面 herdr 开的，只能用输入框发送");
     },
     "terminal.resize": async (p) => {
       this.writable();
@@ -1066,7 +1073,7 @@ export class Host {
       if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols < 10 || cols > 500 || rows < 2 || rows > 200) {
         throw new RpcFailure("bad_request", "cols and rows must be valid terminal dimensions");
       }
-      if (a.source === "hc") {
+      if (a.source === "hc" || (a.source === "herdr" && this.hc.terminals.has(a.localId))) {
         const display = p.display && typeof p.display === "object" ? p.display : undefined;
         await this.hc.resize(a.localId, Math.round(cols), Math.round(rows), display);
       }

@@ -185,3 +185,78 @@ test("a raw stream forwards PTY bytes as base64 terminal_data and forwards resiz
   assert.equal(lastInput.length, 16_384);
   assert.deepEqual(rpcReplies[1], { type: "rpc_result", id: "r2", result: { ok: true } });
 });
+
+test("hc-backed herdr terminals route raw watch/input/resize through hc, and standalone herdr translates Shift+Enter", async () => {
+  const h = new Host({ config: { server: "http://127.0.0.1:9", token: "t", deviceId: "d", name: "test" }, log: () => {} });
+  const x = h as unknown as {
+    agents: unknown[];
+    send: (f: Frame) => void;
+    handleStreamSubscribe: (f: unknown) => Promise<void>;
+    handleRpc: (f: unknown, out: (res: unknown) => void) => Promise<void>;
+  };
+  h.hc.terminals.set("t2", { address: "t2", state: "live" });
+  x.agents = [
+    { key: "d/herdr:t2", localId: "t2", source: "herdr", deviceId: "d", status: "idle" },
+    { key: "d/herdr:h1", localId: "h1", source: "herdr", deviceId: "d", status: "idle" },
+  ];
+  const sent: Frame[] = [];
+  x.send = (f) => sent.push(f);
+
+  const watched: string[] = [];
+  h.hc.watchRaw = async (address) => {
+    watched.push(address);
+    return () => {};
+  };
+  const hcInputs: Array<{ address: string; data: string }> = [];
+  h.hc.input = async (address, data) => {
+    hcInputs.push({ address, data });
+  };
+  const hcResizes: Array<{ address: string; cols: number; rows: number }> = [];
+  h.hc.resize = async (address, cols, rows) => {
+    hcResizes.push({ address, cols, rows });
+  };
+  const herdrKeys: Array<{ localId: string; keys: string[] }> = [];
+  h.herdr.keys = async (localId, keys) => {
+    herdrKeys.push({ localId, keys });
+  };
+
+  await x.handleStreamSubscribe({
+    type: "stream_subscribe",
+    id: "raw-herdr",
+    from: "desktop",
+    stream: "terminal",
+    params: { agent: "d/herdr:t2", raw: true, cols: 100, rows: 30 },
+  });
+  assert.deepEqual(watched, ["t2"]);
+
+  const replies: Frame[] = [];
+  await x.handleRpc(
+    { type: "rpc", id: "hc-in", from: "desktop", method: "terminal.input", params: { agent: "d/herdr:t2", data: "\x1b[13;2u" } },
+    (r) => replies.push(r as Frame),
+  );
+  await x.handleRpc(
+    { type: "rpc", id: "hc-rs", from: "desktop", method: "terminal.resize", params: { agent: "d/herdr:t2", cols: 110, rows: 35 } },
+    (r) => replies.push(r as Frame),
+  );
+  assert.deepEqual(hcInputs, [{ address: "t2", data: "\x1b[13;2u" }]);
+  assert.deepEqual(hcResizes, [{ address: "t2", cols: 110, rows: 35 }]);
+
+  for (const [idx, seq] of ["\x1b[13;2u", "\x1b[27;2;13~", "\x1b\r"].entries()) {
+    await x.handleRpc(
+      { type: "rpc", id: `sh-${idx}`, from: "desktop", method: "terminal.input", params: { agent: "d/herdr:h1", data: seq } },
+      (r) => replies.push(r as Frame),
+    );
+  }
+  assert.deepEqual(herdrKeys, [
+    { localId: "h1", keys: ["shift+enter"] },
+    { localId: "h1", keys: ["shift+enter"] },
+    { localId: "h1", keys: ["shift+enter"] },
+  ]);
+
+  await x.handleRpc(
+    { type: "rpc", id: "bad-in", from: "desktop", method: "terminal.input", params: { agent: "d/herdr:h1", data: "raw" } },
+    (r) => replies.push(r as Frame),
+  );
+  const badReply = replies.find((r) => r.id === "bad-in");
+  assert.equal((badReply?.error as { code?: string } | undefined)?.code, "unsupported");
+});

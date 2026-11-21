@@ -11,6 +11,7 @@ mod commands;
 mod config;
 mod cookies;
 mod diagnostics;
+mod drag_paths;
 mod fonts;
 mod local_term;
 mod logging;
@@ -679,9 +680,13 @@ pub fn run() {
             local_term::local_term_create_shell,
             local_term::local_term_attach,
             local_term::local_term_input,
+            local_term::local_term_auto_input,
+            local_term::local_term_focus,
             local_term::local_term_resize,
             local_term::local_term_detach,
             local_term::local_term_read_image,
+            local_term::local_term_stat_image,
+            drag_paths::read_os_drag_paths,
             fonts::terminal_list_fonts,
             fonts::terminal_font_faces,
             fonts::terminal_font_bytes,

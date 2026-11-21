@@ -19,7 +19,9 @@ const KIND_DATA: u8 = 0;
 const KIND_CREDIT: u8 = 1;
 const KIND_CLOSE: u8 = 2;
 const KIND_RESIZE: u8 = 3;
+const KIND_FOCUS: u8 = 4;
 const KIND_FACTS: u8 = 5;
+const KIND_AUTOMATIC_INPUT: u8 = 6;
 const HEADER_LEN: usize = 9;
 
 const INITIAL_CREDIT_BYTES: u32 = 16 * 1024 * 1024;
@@ -158,12 +160,14 @@ enum ReplyTarget {
 struct Attachment {
     channel: u32,
     consumed: usize,
+    automatic_input: bool,
 }
 
 struct PreattachedChannel {
     channel: u32,
     cols: u16,
     rows: u16,
+    automatic_input: bool,
     created_at: Instant,
 }
 
@@ -182,6 +186,7 @@ struct SharedState {
     by_id: HashMap<String, Attachment>,
     preattached: HashMap<String, PreattachedChannel>,
     early: HashMap<u32, EarlyBuffer>,
+    supports_automatic_input: bool,
     alive: bool,
 }
 
@@ -251,6 +256,14 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
         let _ = child.kill();
         return Err(err_msg.to_string());
     }
+    let supports_automatic_input = parsed
+        .pointer("/result/features")
+        .and_then(Value::as_array)
+        .is_some_and(|features| {
+            features
+                .iter()
+                .any(|f| f.as_str() == Some("automatic_input"))
+        });
 
     let state = Arc::new(Mutex::new(SharedState {
         stdin,
@@ -261,6 +274,7 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
         by_id: HashMap::new(),
         preattached: HashMap::new(),
         early: HashMap::new(),
+        supports_automatic_input,
         alive: true,
     }));
     let handle = Arc::new(ClientHandle {
@@ -567,7 +581,12 @@ pub async fn local_term_create_shell(
                     .and_then(Value::as_u64)
                     .and_then(|v| u16::try_from(v).ok())
                     .unwrap_or(ret_rows);
+                let att_auto_input = att_res
+                    .get("automatic_input")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if let Ok(mut s) = client.state.lock() {
+                    let automatic_input = s.supports_automatic_input && att_auto_input;
                     let stale_keys: Vec<String> = s
                         .preattached
                         .iter()
@@ -586,6 +605,7 @@ pub async fn local_term_create_shell(
                             channel: ch,
                             cols: att_cols,
                             rows: att_rows,
+                            automatic_input,
                             created_at: Instant::now(),
                         },
                     ) {
@@ -647,6 +667,7 @@ pub async fn local_term_attach(
                         Attachment {
                             channel: pre.channel,
                             consumed: early_bytes,
+                            automatic_input: pre.automatic_input,
                         },
                     );
                     if let Some(ref d) = sanitized_display {
@@ -661,6 +682,7 @@ pub async fn local_term_attach(
                     } else {
                         (pre.cols, pre.rows)
                     };
+                    let _ = s.write_frame(pre.channel, KIND_FOCUS, &[1]);
                     Some((pre.channel, ret_cols, ret_rows, drained))
                 } else {
                     s.early.remove(&pre.channel);
@@ -701,18 +723,24 @@ pub async fn local_term_attach(
                 .and_then(Value::as_u64)
                 .and_then(|v| u16::try_from(v).ok())
                 .unwrap_or(r);
+            let att_auto_input = res
+                .get("automatic_input")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
 
             let early_frames = {
                 let mut s = client
                     .state
                     .lock()
                     .map_err(|_| "hc state lock poisoned".to_string())?;
+                let automatic_input = s.supports_automatic_input && att_auto_input;
                 s.by_channel.insert(channel, id.clone());
                 s.by_id.insert(
                     id.clone(),
                     Attachment {
                         channel,
                         consumed: 0,
+                        automatic_input,
                     },
                 );
                 let drained = s
@@ -721,6 +749,7 @@ pub async fn local_term_attach(
                     .map(|b| b.frames)
                     .unwrap_or_default();
                 s.write_frame(channel, KIND_CREDIT, &INITIAL_CREDIT_BYTES.to_le_bytes())?;
+                let _ = s.write_frame(channel, KIND_FOCUS, &[1]);
                 drained
             };
             (channel, ret_cols, ret_rows, early_frames)
@@ -832,6 +861,66 @@ pub async fn local_term_resize(
 }
 
 #[tauri::command]
+pub async fn local_term_focus(id: String, focused: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = {
+            let Ok(guard) = global_client().lock() else {
+                return Ok(());
+            };
+            match guard.as_ref().cloned() {
+                Some(c) => c,
+                None => return Ok(()),
+            }
+        };
+        let mut s = client
+            .state
+            .lock()
+            .map_err(|_| "hc state lock poisoned".to_string())?;
+        let Some(ch) = s.by_id.get(&id).map(|a| a.channel) else {
+            return Ok(());
+        };
+        s.write_frame(ch, KIND_FOCUS, &[u8::from(focused)])
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn local_term_auto_input(id: String, data: String) -> Result<(), String> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = {
+            let guard = global_client()
+                .lock()
+                .map_err(|_| "local_term lock poisoned".to_string())?;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "本地终端未连接".to_string())?
+        };
+        let mut s = client
+            .state
+            .lock()
+            .map_err(|_| "hc state lock poisoned".to_string())?;
+        let att = s
+            .by_id
+            .get(&id)
+            .ok_or_else(|| "本地终端通道已关闭".to_string())?;
+        let ch = att.channel;
+        let kind = if att.automatic_input {
+            KIND_AUTOMATIC_INPUT
+        } else {
+            KIND_DATA
+        };
+        s.write_frame(ch, kind, data.as_bytes())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn local_term_detach(id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let client = {
@@ -867,24 +956,18 @@ pub fn shutdown() {
 
 const BLOCKED_IMAGE_COMPONENTS: [&str; 5] = [".ssh", ".gnupg", ".aws", ".kube", "keychains"];
 const MAX_LOCAL_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+const IMAGE_STAGE_DIR_NAME: &str = "herdr-pocket-term-img";
 
-fn is_allowed_image_bytes(bytes: &[u8], file_name: &str) -> bool {
-    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
-        return true;
-    }
-    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        return true;
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return true;
-    }
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return true;
-    }
-    file_name.contains("tty-graphics-protocol")
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalImageStat {
+    pub url_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub mime: String,
 }
 
-fn read_local_image_bytes(path: &str) -> Result<Vec<u8>, String> {
+fn validate_local_image_path(path: &str) -> Result<(PathBuf, std::fs::Metadata), String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err("图片路径为空".into());
@@ -903,6 +986,149 @@ fn read_local_image_bytes(path: &str) -> Result<Vec<u8>, String> {
     if meta.len() == 0 || meta.len() > MAX_LOCAL_IMAGE_BYTES {
         return Err("图片大小超出限制".into());
     }
+    Ok((canon, meta))
+}
+
+fn sniff_jpeg_dimensions_64(head: &[u8]) -> (u32, u32) {
+    let mut i = 2;
+    while i + 1 < head.len() {
+        if head[i] != 0xff {
+            i += 1;
+            continue;
+        }
+        while i < head.len() && head[i] == 0xff {
+            i += 1;
+        }
+        if i >= head.len() {
+            break;
+        }
+        let marker = head[i];
+        i += 1;
+        // Standalone markers (TEM, RST0..RST7, SOI, EOI) carry no length field.
+        if matches!(marker, 0x00 | 0x01 | 0xd0..=0xd9) {
+            continue;
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+        ) {
+            if i + 7 <= head.len() {
+                let h = u16::from_be_bytes([head[i + 3], head[i + 4]]) as u32;
+                let w = u16::from_be_bytes([head[i + 5], head[i + 6]]) as u32;
+                return (w, h);
+            }
+            break;
+        }
+        if i + 2 <= head.len() {
+            let seg_len = u16::from_be_bytes([head[i], head[i + 1]]) as usize;
+            if seg_len < 2 {
+                break;
+            }
+            i += seg_len;
+        } else {
+            break;
+        }
+    }
+    (0, 0)
+}
+
+fn sniff_image_header_64(
+    head: &[u8],
+    file_name: &str,
+) -> Option<(&'static str, &'static str, u32, u32)> {
+    if head.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
+        let (w, h) = if head.len() >= 24 && &head[12..16] == b"IHDR" {
+            (
+                u32::from_be_bytes([head[16], head[17], head[18], head[19]]),
+                u32::from_be_bytes([head[20], head[21], head[22], head[23]]),
+            )
+        } else {
+            (0, 0)
+        };
+        return Some(("image/png", "png", w, h));
+    }
+    if head.starts_with(&[0xff, 0xd8, 0xff]) {
+        let (w, h) = sniff_jpeg_dimensions_64(head);
+        return Some(("image/jpeg", "jpg", w, h));
+    }
+    if head.len() >= 10 && (head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a")) {
+        let w = u16::from_le_bytes([head[6], head[7]]) as u32;
+        let h = u16::from_le_bytes([head[8], head[9]]) as u32;
+        return Some(("image/gif", "gif", w, h));
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        let (w, h) = if head.len() >= 30
+            && &head[12..16] == b"VP8 "
+            && head[23] == 0x9d
+            && head[24] == 0x01
+            && head[25] == 0x2a
+        {
+            (
+                (u16::from_le_bytes([head[26], head[27]]) & 0x3fff) as u32,
+                (u16::from_le_bytes([head[28], head[29]]) & 0x3fff) as u32,
+            )
+        } else if head.len() >= 25 && &head[12..16] == b"VP8L" && head[20] == 0x2f {
+            let bits = u32::from_le_bytes([head[21], head[22], head[23], head[24]]);
+            ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+        } else if head.len() >= 30 && &head[12..16] == b"VP8X" {
+            let w = 1 + (head[24] as u32 | ((head[25] as u32) << 8) | ((head[26] as u32) << 16));
+            let h = 1 + (head[27] as u32 | ((head[28] as u32) << 8) | ((head[29] as u32) << 16));
+            (w, h)
+        } else {
+            (0, 0)
+        };
+        return Some(("image/webp", "webp", w, h));
+    }
+    if file_name.contains("tty-graphics-protocol") {
+        return Some(("image/png", "png", 0, 0));
+    }
+    None
+}
+
+fn is_allowed_image_bytes(bytes: &[u8], file_name: &str) -> bool {
+    sniff_image_header_64(bytes, file_name).is_some()
+}
+
+fn stage_temp_image(file: &mut std::fs::File, ext: &str) -> Result<PathBuf, String> {
+    use std::io::{Seek, SeekFrom};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+    let stage_dir = std::env::temp_dir().join(IMAGE_STAGE_DIR_NAME);
+    std::fs::create_dir_all(&stage_dir).map_err(|e| format!("无法创建临时图片目录: {e}"))?;
+
+    let seq = NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed);
+    if seq % 32 == 0 {
+        if let Ok(entries) = std::fs::read_dir(&stage_dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if modified.elapsed().is_ok_and(|age| age > Duration::from_secs(3600)) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let staged_path = stage_dir.join(format!("img-{}-{ts}-{seq}.{ext}", std::process::id()));
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("无法重置图片读取偏移: {e}"))?;
+    let mut dst = std::fs::File::create(&staged_path)
+        .map_err(|e| format!("无法创建缓存图片: {e}"))?;
+    std::io::copy(file, &mut dst).map_err(|e| format!("缓存临时图片失败: {e}"))?;
+    Ok(staged_path)
+}
+
+fn read_local_image_bytes(path: &str) -> Result<Vec<u8>, String> {
+    let (canon, _) = validate_local_image_path(path)?;
     let bytes = std::fs::read(&canon).map_err(|e| format!("读取图片失败: {e}"))?;
     let file_name = canon
         .file_name()
@@ -919,11 +1145,52 @@ pub fn local_term_read_image(path: String) -> Result<tauri::ipc::Response, Strin
     Ok(tauri::ipc::Response::new(read_local_image_bytes(&path)?))
 }
 
+#[tauri::command]
+pub fn local_term_stat_image(
+    path: String,
+    delete_after: Option<bool>,
+) -> Result<LocalImageStat, String> {
+    let (canon, _) = validate_local_image_path(&path)?;
+    let mut file = std::fs::File::open(&canon).map_err(|e| format!("无法打开图片: {e}"))?;
+    let mut head = [0u8; 64];
+    let mut read_total = 0;
+    while read_total < head.len() {
+        let n = file
+            .read(&mut head[read_total..])
+            .map_err(|e| format!("读取图片头失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        read_total += n;
+    }
+    let file_name = canon
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (mime, ext, width, height) = sniff_image_header_64(&head[..read_total], &file_name)
+        .ok_or_else(|| "不支持的图片格式".to_string())?;
+
+    let url_path = if delete_after == Some(true) {
+        stage_temp_image(&mut file, ext)?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        canon.to_string_lossy().into_owned()
+    };
+
+    Ok(LocalImageStat {
+        url_path,
+        width,
+        height,
+        mime: mime.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        base64_encode, decode_header, encode_frame, encode_resize_payload, read_local_image_bytes,
-        sanitize_display,
+        base64_encode, decode_header, encode_frame, encode_resize_payload, local_term_stat_image,
+        read_local_image_bytes, sanitize_display, IMAGE_STAGE_DIR_NAME,
     };
     use serde_json::json;
 
@@ -978,6 +1245,87 @@ mod tests {
         let blocked = dir.join(".ssh").join("secret.png");
         std::fs::write(&blocked, &png_bytes).unwrap();
         assert!(read_local_image_bytes(&blocked.to_string_lossy()).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_term_stat_image_sniffs_headers_and_stages_temp_files() {
+        let dir = std::env::temp_dir().join(format!("herdr-pocket-stat-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".ssh")).unwrap();
+
+        // PNG 320x240
+        let png_path = dir.join("shot.png");
+        let mut png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&320u32.to_be_bytes());
+        png.extend_from_slice(&240u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        std::fs::write(&png_path, &png).unwrap();
+
+        let stat_png = local_term_stat_image(png_path.to_string_lossy().into_owned(), None).unwrap();
+        assert_eq!(stat_png.width, 320);
+        assert_eq!(stat_png.height, 240);
+        assert_eq!(stat_png.mime, "image/png");
+        assert_eq!(
+            std::path::Path::new(&stat_png.url_path),
+            std::fs::canonicalize(&png_path).unwrap()
+        );
+
+        // Staging delete_after = Some(true)
+        let stat_staged =
+            local_term_stat_image(png_path.to_string_lossy().into_owned(), Some(true)).unwrap();
+        assert_eq!(stat_staged.width, 320);
+        assert_eq!(stat_staged.height, 240);
+        assert_eq!(stat_staged.mime, "image/png");
+        assert!(stat_staged.url_path.contains(IMAGE_STAGE_DIR_NAME));
+        assert!(stat_staged.url_path.ends_with(".png"));
+        assert_eq!(std::fs::read(&stat_staged.url_path).unwrap(), png);
+        let _ = std::fs::remove_file(&stat_staged.url_path);
+
+        // GIF 640x480
+        let gif_path = dir.join("anim.gif");
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&640u16.to_le_bytes());
+        gif.extend_from_slice(&480u16.to_le_bytes());
+        gif.extend_from_slice(&[0u8; 6]);
+        std::fs::write(&gif_path, &gif).unwrap();
+        let stat_gif = local_term_stat_image(gif_path.to_string_lossy().into_owned(), None).unwrap();
+        assert_eq!((stat_gif.width, stat_gif.height, stat_gif.mime.as_str()), (640, 480, "image/gif"));
+
+        // JPEG SOF0 1024x768 within 64 bytes
+        let jpg_path = dir.join("photo.jpg");
+        let mut jpg = vec![0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08];
+        jpg.extend_from_slice(&768u16.to_be_bytes());
+        jpg.extend_from_slice(&1024u16.to_be_bytes());
+        jpg.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1, 0xff, 0xd9]);
+        std::fs::write(&jpg_path, &jpg).unwrap();
+        let stat_jpg = local_term_stat_image(jpg_path.to_string_lossy().into_owned(), None).unwrap();
+        assert_eq!((stat_jpg.width, stat_jpg.height, stat_jpg.mime.as_str()), (1024, 768, "image/jpeg"));
+
+        // WebP VP8 lossy 800x600
+        let webp_path = dir.join("pic.webp");
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&26u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBPVP8 ");
+        webp.extend_from_slice(&14u32.to_le_bytes());
+        webp.extend_from_slice(&[0, 0, 0, 0x9d, 0x01, 0x2a]);
+        webp.extend_from_slice(&800u16.to_le_bytes());
+        webp.extend_from_slice(&600u16.to_le_bytes());
+        std::fs::write(&webp_path, &webp).unwrap();
+        let stat_webp = local_term_stat_image(webp_path.to_string_lossy().into_owned(), None).unwrap();
+        assert_eq!((stat_webp.width, stat_webp.height, stat_webp.mime.as_str()), (800, 600, "image/webp"));
+
+        // Rejects blocked dirs and non-images
+        let blocked = dir.join(".ssh").join("secret.png");
+        std::fs::write(&blocked, &png).unwrap();
+        assert!(local_term_stat_image(blocked.to_string_lossy().into_owned(), None).is_err());
+
+        let txt = dir.join("plain.txt");
+        std::fs::write(&txt, b"not an image").unwrap();
+        assert!(local_term_stat_image(txt.to_string_lossy().into_owned(), None).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -16,12 +16,19 @@ function key(
   };
 }
 
-test("legacy mode encodes modified Enter sequences without altering plain Enter or macOS Cmd+Enter", () => {
-  assert.equal(encodeKittyKey(key("Enter", { shiftKey: true }), 0, 0, true), "\x1b[27;2;13~");
-  assert.equal(encodeKittyKey(key("Enter", { shiftKey: true }), 0, 0, false), "\x1b[27;2;13~");
-  assert.equal(encodeKittyKey(key("Enter", { ctrlKey: true }), 0, 0, true), "\x1b[27;5;13~");
-  assert.equal(encodeKittyKey(key("Enter", { ctrlKey: true, shiftKey: true }), 0, 0, true), "\x1b[27;6;13~");
+test("legacy mode encodes modified Enter sequences per shell vs agent TUI without altering plain Enter or macOS Cmd+Enter", () => {
+  // Coding agent TUIs (isShell = false) receive CSI u even before/without >1u so re-attached TUIs accept Shift+Enter newlines.
+  assert.equal(encodeKittyKey(key("Enter", { shiftKey: true }), 0, 0, true), "\x1b[13;2u");
+  assert.equal(encodeKittyKey(key("Enter", { shiftKey: true }), 0, 0, false), "\x1b[13;2u");
+  assert.equal(encodeKittyKey(key("Enter", { ctrlKey: true }), 0, 0, true), "\x1b[13;5u");
+  assert.equal(encodeKittyKey(key("Enter", { ctrlKey: true, shiftKey: true }), 0, 0, true), "\x1b[13;6u");
   assert.equal(encodeKittyKey(key("Enter", { altKey: true }), 0, 0, true), "\x1b\r");
+
+  // Shells (isShell = true) receive ESC CR so readline/zsh inserts a literal newline instead of "~".
+  assert.equal(encodeKittyKey(key("Enter", { shiftKey: true }), 0, 0, true, false, true), "\x1b\r");
+  assert.equal(encodeKittyKey(key("Enter", { ctrlKey: true }), 0, 0, false, false, true), "\x1b\r");
+  assert.equal(encodeKittyKey(key("Enter", { altKey: true }), 0, 0, true, false, true), "\x1b\r");
+
   assert.equal(encodeKittyKey(key("Enter"), 0, 0, true), null);
   assert.equal(encodeKittyKey(key("Enter", { metaKey: true }), 0, 0, true), null);
 });

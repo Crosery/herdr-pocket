@@ -8,7 +8,17 @@ import "@xterm/xterm/css/xterm.css";
 import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { copyToClipboard } from "../lib/bridge";
 import { setConfig, useClientConfig } from "../lib/config";
-import { hasWorkspaceDrag, readWorkspaceDrag, resolveDropPath } from "../lib/fileDrag";
+import {
+  endWorkspaceDrag,
+  hasWorkspaceDrag,
+  readWorkspaceDrag,
+  resolveDropPath,
+} from "../lib/fileDrag";
+import {
+  collectDroppedFilesSafe,
+  readOsDraggedPaths,
+  snapshotDroppedDataTransfer,
+} from "../lib/finderDrop";
 import {
   buildTerminalFontFamily,
   ensureFontCatalog,
@@ -44,6 +54,7 @@ interface KittyImageAsset {
   url: string;
   width: number;
   height: number;
+  needsMeasure?: boolean;
 }
 
 interface KittyPlacement {
@@ -161,6 +172,42 @@ async function decodeKittyAsset(cmd: KittyGfxCommand, rawBytes: Uint8Array, id: 
   return url ? { id, url, width: w, height: h } : null;
 }
 
+interface LocalImageStat {
+  urlPath: string;
+  width: number;
+  height: number;
+  mime: string;
+}
+
+async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(cmd, args);
+}
+
+async function localTermFocus(id: string, focused: boolean): Promise<void> {
+  if (!native.available()) return;
+  await invokeTauri<void>("local_term_focus", { id, focused }).catch(() => {});
+}
+
+async function localTermAutoInput(id: string, data: string): Promise<void> {
+  await invokeTauri<void>("local_term_auto_input", { id, data });
+}
+
+async function localTermStatImage(path: string, deleteAfter: boolean): Promise<LocalImageStat | null> {
+  if (!native.available()) return null;
+  return invokeTauri<LocalImageStat>("local_term_stat_image", { path, deleteAfter }).catch(() => null);
+}
+
+function revokeAssetUrl(url: string): void {
+  if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+}
+
+function hasDropFiles(dt: DataTransfer | null | undefined): boolean {
+  if (!dt?.types) return false;
+  const types = Array.from(dt.types);
+  return types.includes("Files") || types.includes("public.file-url");
+}
+
 function measureCellCss(hostEl: HTMLElement | null, term: XTerm): [number, number] {
   const screen = hostEl?.querySelector<HTMLElement>(".xterm-screen");
   if (screen && term.cols > 0 && term.rows > 0 && screen.clientWidth > 0 && screen.clientHeight > 0) {
@@ -199,6 +246,8 @@ export function TerminalSurface({
   const dragDepthRef = useRef(0);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const isShellRef = useRef(Boolean(agent.isShell));
+  isShellRef.current = Boolean(agent.isShell);
 
   const fontFamily = useMemo(() => buildTerminalFontFamily(termCfg.fontFamily, fontCatalog), [termCfg.fontFamily, fontCatalog]);
   const lineHeight = useMemo(() => Number((termCfg.lineHeight / 100).toFixed(2)), [termCfg.lineHeight]);
@@ -258,6 +307,23 @@ export function TerminalSurface({
       }
     },
     [agent.deviceId, agent.key],
+  );
+
+  const sendAutoInput = useCallback(
+    async (data: string) => {
+      if (!data) return;
+      const localConnId = localConnRef.current;
+      if (localConnId && native.available()) {
+        try {
+          await localTermAutoInput(localConnId, data);
+          return;
+        } catch {
+          if (localConnRef.current === localConnId) localConnRef.current = null;
+        }
+      }
+      await sendInput(data);
+    },
+    [sendInput],
   );
 
   const sendFilesToPty = useCallback(
@@ -368,6 +434,21 @@ export function TerminalSurface({
       img.style.width = `${Math.max(cellW, Math.round(p.cols * cellW))}px`;
       img.style.height = `${Math.max(cellH, Math.round(p.rows * cellH))}px`;
       img.style.zIndex = String(Math.max(1, 5 + p.zIndex));
+      if (asset.needsMeasure) {
+        img.onload = () => {
+          asset.needsMeasure = false;
+          if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+            asset.width = img.naturalWidth;
+            asset.height = img.naturalHeight;
+            const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+            const cellPxW = Math.max(1, cellW * dpr);
+            const cellPxH = Math.max(1, cellH * dpr);
+            p.cols = Math.max(1, Math.min(term.cols, Math.ceil(asset.width / cellPxW)));
+            p.rows = Math.max(1, Math.min(term.rows, Math.ceil(asset.height / cellPxH)));
+            requestAnimationFrame(paintOverlays);
+          }
+        };
+      }
       frag.appendChild(img);
     }
 
@@ -563,7 +644,7 @@ export function TerminalSurface({
       return true;
     });
     const dispCsiQuery = term.parser.registerCsiHandler({ prefix: "?", final: "u" }, () => {
-      void sendInput(`\x1b[?${kittyKeys.current(isAlt())}u`);
+      void sendAutoInput(`\x1b[?${kittyKeys.current(isAlt())}u`);
       return true;
     });
     const dispModifyOther = term.parser.registerCsiHandler({ prefix: ">", final: "m" }, (params) => {
@@ -593,6 +674,18 @@ export function TerminalSurface({
       return false;
     });
 
+    const textarea = term.textarea;
+    const onTermFocus = () => {
+      const localConnId = localConnRef.current;
+      if (localConnId) void localTermFocus(localConnId, true);
+    };
+    const onTermBlur = () => {
+      const localConnId = localConnRef.current;
+      if (localConnId) void localTermFocus(localConnId, false);
+    };
+    textarea?.addEventListener("focus", onTermFocus);
+    textarea?.addEventListener("blur", onTermBlur);
+
     // Key handling: preserve global app shortcuts (⌘T/⌘W/⌘P/...), Herdr macOS keys, and Kitty CSI u.
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
       if (e.type === "keyup") return true;
@@ -600,7 +693,14 @@ export function TerminalSurface({
         // Prevent xterm's CoreBrowserTerminal._keyPress from emitting a stray "\r" after modified Enter.
         if (
           (e.key === "Enter" && (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey)) ||
-          encodeKittyKey(e, kittyKeys.current(isAlt()), kittyKeys.modifyOtherKeys, IS_MAC, kittyKeys.win32InputMode) !== null
+          encodeKittyKey(
+            e,
+            kittyKeys.current(isAlt()),
+            kittyKeys.modifyOtherKeys,
+            IS_MAC,
+            kittyKeys.win32InputMode,
+            isShellRef.current,
+          ) !== null
         ) {
           e.preventDefault();
           return false;
@@ -707,7 +807,14 @@ export function TerminalSurface({
       }
 
       const kFlags = kittyKeys.current(isAlt());
-      const encoded = encodeKittyKey(e, kFlags, kittyKeys.modifyOtherKeys, IS_MAC, kittyKeys.win32InputMode);
+      const encoded = encodeKittyKey(
+        e,
+        kFlags,
+        kittyKeys.modifyOtherKeys,
+        IS_MAC,
+        kittyKeys.win32InputMode,
+        isShellRef.current,
+      );
       if (encoded) {
         void sendInput(encoded);
         return consume();
@@ -724,6 +831,7 @@ export function TerminalSurface({
     let nextImgId = 1;
     let chunkActive: { cmd: KittyGfxCommand; parts: string[]; anchor: KittyAnchor } | null = null;
     const kittyDimsById = new Map<number, { cols: number; rows: number }>();
+    const pendingKittyAssets = new Map<number, Promise<KittyImageAsset | null>>();
 
     const captureAnchor = (): KittyAnchor => {
       const buf = term.buffer.active;
@@ -752,6 +860,20 @@ export function TerminalSurface({
         kittyPlacementsRef.current.splice(0, kittyPlacementsRef.current.length - 200);
       }
       scheduleOverlay();
+    };
+
+    const storeKittyAsset = (imgId: number, asset: KittyImageAsset) => {
+      const prev = kittyAssetsRef.current.get(imgId);
+      if (prev) revokeAssetUrl(prev.url);
+      kittyAssetsRef.current.set(imgId, asset);
+      if (kittyAssetsRef.current.size > 64) {
+        const oldest = kittyAssetsRef.current.keys().next().value;
+        if (oldest !== undefined) {
+          const old = kittyAssetsRef.current.get(oldest);
+          if (old) revokeAssetUrl(old.url);
+          kittyAssetsRef.current.delete(oldest);
+        }
+      }
     };
 
     const resolvePlacementCells = (
@@ -820,6 +942,7 @@ export function TerminalSurface({
 
         if (cmd.action === "p" && cmd.id !== undefined) {
           const asset = kittyAssetsRef.current.get(cmd.id);
+          const pendingAsset = !asset ? pendingKittyAssets.get(cmd.id) : undefined;
           const known = kittyDimsById.get(cmd.id);
           const resolved = asset ? resolvePlacementCells(cmd, undefined, asset) : null;
           const cols = cmd.cols ?? known?.cols ?? resolved?.cols ?? 1;
@@ -850,6 +973,17 @@ export function TerminalSurface({
             term.write("", () => {
               if (termRef.current === term) pushPlacement(asset, cmd, anchor, cols, rows);
             });
+          } else if (pendingAsset) {
+            void pendingAsset.then((loaded) => {
+              if (!loaded || termRef.current !== term) return;
+              const dims = resolvePlacementCells(cmd, undefined, loaded);
+              const useCols = cmd.cols ?? known?.cols ?? dims.cols;
+              const useRows = cmd.rows ?? known?.rows ?? dims.rows;
+              if (anchor.colReady && anchor.rowReady) pushPlacement(loaded, cmd, anchor, useCols, useRows);
+              else term.write("", () => {
+                if (termRef.current === term) pushPlacement(loaded, cmd, anchor, useCols, useRows);
+              });
+            });
           }
           continue;
         }
@@ -878,13 +1012,16 @@ export function TerminalSurface({
 
         if (firstCmd.action === "q") {
           if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
-            void sendInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
+            void sendAutoInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
           }
           continue;
         }
 
         const isFileMedium = firstCmd.medium === "f" || firstCmd.medium === "t";
-        if ((firstCmd.medium !== "d" && !(isFileMedium && localConnRef.current)) || !fullB64) continue;
+        const canReadLocalFile =
+          Boolean(localConnRef.current) ||
+          (native.available() && localHostIdStore.get() === agent.deviceId);
+        if ((firstCmd.medium !== "d" && !(isFileMedium && canReadLocalFile)) || !fullB64) continue;
         const imgId = firstCmd.id ?? nextImgId++;
         let payloadBytes: Uint8Array;
         try {
@@ -929,26 +1066,9 @@ export function TerminalSurface({
           reservedInline = syncDims.colsKnown;
         }
 
-        const assetPromise =
-          firstCmd.medium === "d"
-            ? decodeKittyAsset(firstCmd, payloadBytes, imgId)
-            : native.localTermReadImage(new TextDecoder("utf-8").decode(payloadBytes).trim()).then((buf) =>
-                buf ? decodeKittyAsset(firstCmd, new Uint8Array(buf), imgId) : null,
-              );
-
-        void assetPromise.then((asset) => {
-          if (!asset || termRef.current !== term) return;
-          const prev = kittyAssetsRef.current.get(imgId);
-          if (prev) URL.revokeObjectURL(prev.url);
-          kittyAssetsRef.current.set(imgId, asset);
-          if (kittyAssetsRef.current.size > 64) {
-            const oldest = kittyAssetsRef.current.keys().next().value;
-            if (oldest !== undefined) {
-              const old = kittyAssetsRef.current.get(oldest);
-              if (old) URL.revokeObjectURL(old.url);
-              kittyAssetsRef.current.delete(oldest);
-            }
-          }
+        const finishAsset = (asset: KittyImageAsset) => {
+          if (termRef.current !== term) return;
+          storeKittyAsset(imgId, asset);
           const commit = () => {
             if (termRef.current !== term) return;
             const finalDims =
@@ -967,11 +1087,62 @@ export function TerminalSurface({
               pushPlacement(asset, firstCmd, anchor, finalDims.cols, finalDims.rows);
             }
             if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
-              void sendInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
+              void sendAutoInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
             }
           };
           if (anchor.colReady && anchor.rowReady) commit();
           else term.write("", commit);
+        };
+
+        // Fast synchronous path for `t=d` (`f=100` uncompressed PNG): zero `Image.onload` roundtrip.
+        if (firstCmd.medium === "d" && firstCmd.format === 100 && !firstCmd.compression) {
+          const pngDims = parsePngDimensions(payloadBytes);
+          const width = pngDims?.width ?? firstCmd.width;
+          const height = pngDims?.height ?? firstCmd.height;
+          if (width && height) {
+            const copy = payloadBytes.buffer.slice(
+              payloadBytes.byteOffset,
+              payloadBytes.byteOffset + payloadBytes.byteLength,
+            ) as ArrayBuffer;
+            const url = URL.createObjectURL(new Blob([copy], { type: "image/png" }));
+            finishAsset({ id: imgId, url, width, height });
+            continue;
+          }
+        }
+
+        const assetPromise: Promise<KittyImageAsset | null> =
+          firstCmd.medium === "d"
+            ? decodeKittyAsset(firstCmd, payloadBytes, imgId)
+            : (() => {
+                const decodedPath = new TextDecoder("utf-8").decode(payloadBytes).trim();
+                if (firstCmd.format === 100) {
+                  return localTermStatImage(decodedPath, firstCmd.medium === "t").then((stat) => {
+                    if (!stat) return null;
+                    const url = native.localFileStreamUrl(stat.urlPath);
+                    if (!url) return null;
+                    const measuredW = stat.width || firstCmd.width || 0;
+                    const measuredH = stat.height || firstCmd.height || 0;
+                    const needsMeasure = (!measuredW || !measuredH) && (!firstCmd.cols || !firstCmd.rows);
+                    return {
+                      id: imgId,
+                      url,
+                      width: measuredW || 64,
+                      height: measuredH || 64,
+                      needsMeasure,
+                    };
+                  });
+                }
+                return native
+                  .localTermReadImage(decodedPath)
+                  .then((buf) => (buf ? decodeKittyAsset(firstCmd, new Uint8Array(buf), imgId) : null));
+              })();
+
+        pendingKittyAssets.set(imgId, assetPromise);
+        void assetPromise.then((asset) => {
+          if (pendingKittyAssets.get(imgId) === assetPromise) {
+            pendingKittyAssets.delete(imgId);
+          }
+          if (asset) finishAsset(asset);
         });
       }
     };
@@ -1060,7 +1231,7 @@ export function TerminalSurface({
       }, 150);
     };
 
-    if (native.available() && agent.source === "hc" && agent.localId) {
+    if (native.available() && (agent.source === "hc" || agent.source === "herdr") && agent.localId) {
       void (async () => {
         const resolvedLocalId = localHostIdStore.get() ?? (await ensureLocalHostDeviceId());
         if (!alive) return;
@@ -1109,6 +1280,9 @@ export function TerminalSurface({
             history: 2000,
             display: currentDisplay(term) as unknown as Record<string, unknown>,
           });
+          if (alive) {
+            void localTermFocus(connId, activeRef.current);
+          }
         } catch {
           if (localConnRef.current === connId) localConnRef.current = null;
           if (activeLocalConnId === connId) activeLocalConnId = null;
@@ -1170,8 +1344,10 @@ export function TerminalSurface({
       dispDecRst.dispose();
       dispResetKeys.dispose();
       dispData.dispose();
+      textarea?.removeEventListener("focus", onTermFocus);
+      textarea?.removeEventListener("blur", onTermBlur);
       webglAddon?.dispose();
-      for (const a of assetsRefForCleanup.current.values()) URL.revokeObjectURL(a.url);
+      for (const a of assetsRefForCleanup.current.values()) revokeAssetUrl(a.url);
       assetsRefForCleanup.current.clear();
       kittyPlacementsRef.current = [];
       osc66Ref.current = [];
@@ -1206,6 +1382,10 @@ export function TerminalSurface({
 
   // Refocus and refit when switching back into Terminal mode.
   useEffect(() => {
+    const localConnId = localConnRef.current;
+    if (localConnId) {
+      void localTermFocus(localConnId, active);
+    }
     if (!active || !termRef.current) return;
     const id = requestAnimationFrame(() => {
       if (!termRef.current) return;
@@ -1232,23 +1412,20 @@ export function TerminalSurface({
   }, [sendInput]);
 
   const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
-    const isFiles = Boolean(e.dataTransfer?.types?.includes("Files"));
-    if (!isFiles && !hasWorkspaceDrag(e)) return;
+    if (!hasDropFiles(e.dataTransfer) && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     dragDepthRef.current += 1;
     setDragOver(true);
   };
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
-    const isFiles = Boolean(e.dataTransfer?.types?.includes("Files"));
-    if (!isFiles && !hasWorkspaceDrag(e)) return;
+    if (!hasDropFiles(e.dataTransfer) && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
   };
 
   const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    const isFiles = Boolean(e.dataTransfer?.types?.includes("Files"));
-    if (!isFiles && !hasWorkspaceDrag(e)) return;
+    if (!hasDropFiles(e.dataTransfer) && !hasWorkspaceDrag(e)) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragOver(false);
   };
@@ -1260,16 +1437,43 @@ export function TerminalSurface({
     if (wsItem) {
       e.preventDefault();
       e.stopPropagation();
+      endWorkspaceDrag();
       const targetPath = resolveDropPath(wsItem, agent.deviceId);
       void sendInput(`${shellQuotePath(targetPath)} `);
       requestAnimationFrame(() => termRef.current?.focus());
       return;
     }
-    const files = e.dataTransfer?.files;
-    if (!files?.length) return;
+    const dt = e.dataTransfer;
+    if (!dt) return;
+    const hasPayload = hasDropFiles(dt) || (dt.files?.length ?? 0) > 0 || (dt.items?.length ?? 0) > 0;
+    if (!hasPayload) return;
     e.preventDefault();
     e.stopPropagation();
-    void sendFilesToPty(files);
+
+    const snapshot = snapshotDroppedDataTransfer(dt);
+    void (async () => {
+      const localHostId =
+        localHostIdStore.get() ?? (native.available() ? await ensureLocalHostDeviceId() : null);
+      if (native.available() && localHostId === agent.deviceId) {
+        const osItems = await readOsDraggedPaths();
+        if (osItems.length > 0) {
+          await sendInput(`${osItems.map((it) => shellQuotePath(it.path)).join(" ")} `);
+          requestAnimationFrame(() => termRef.current?.focus());
+          return;
+        }
+      }
+      const safe = await collectDroppedFilesSafe(snapshot, { maxFiles: 6 });
+      if (safe.files.length > 0) {
+        await sendFilesToPty(safe.files);
+        if (safe.skippedDirs.length > 0) {
+          toast(`已跳过空文件夹：${safe.skippedDirs.join("、")}`, true);
+        }
+      } else if (safe.skippedDirs.length > 0 || safe.folderNames.length > 0) {
+        const names = (safe.skippedDirs.length ? safe.skippedDirs : safe.folderNames).join("、");
+        toast(`不支持直接上传空文件夹：${names}`, true);
+      }
+      requestAnimationFrame(() => termRef.current?.focus());
+    })();
   };
 
   return (
