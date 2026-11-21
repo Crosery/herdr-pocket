@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, test } from "node:test";
 import type { Agent } from "@herdr-pocket/protocol";
-import { clearModelsCacheForTest, findCatalogMatch, getAgentModels, parseOmpModelsJson, parseOmpModelsYml, readOmpLocalConfig, readSessionLiveModelAndThinking, setAgentModelAndThinking } from "../src/models.ts";
+import {
+  clearModelsCacheForTest,
+  findCatalogMatch,
+  getAgentModels,
+  parseOmpModelsJson,
+  parseOmpModelsYml,
+  readOmpLocalConfig,
+  readSessionLiveModelAndThinking,
+  setAgentModelAndThinking,
+  updateOmpRoleModel,
+} from "../src/models.ts";
 import { buildHarnessSwitchCommands } from "@herdr-pocket/protocol";
 
 const hcAgent: Agent = {
@@ -154,7 +164,7 @@ test("parseOmpModelsJson extracts per-model thinking levels and retains >80 mode
         },
       },
     );
-    assert.deepEqual(fallbackReasoningRes.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    assert.deepEqual(fallbackReasoningRes.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]);
     assert.equal(fallbackReasoningRes.canSwitchThinking, true);
   } finally {
     rmSync(emptyHome, { recursive: true, force: true });
@@ -460,6 +470,168 @@ test("getAgentModels populates live thinking from session jsonl and disables thi
     assert.equal(nonReasonRes.thinkingLevels, undefined);
     assert.equal(nonReasonRes.canSwitchThinking, false);
     assert.equal(nonReasonRes.currentThinking, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("getAgentModels returns immediately from models.yml/config.yml/agent.db without blocking on slow CLI, and exposes mimo-v2.6-pro thinking + modelRoles", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pocket-omp-fast-"));
+  try {
+    const ompAgentDir = join(dir, ".omp", "agent");
+    mkdirSync(ompAgentDir, { recursive: true });
+    writeFileSync(
+      join(ompAgentDir, "models.yml"),
+      [
+        "providers:",
+        "  magpie:",
+        "    models:",
+        "      - id: crosery/mimo-v2.6-pro",
+        "        name: MiMo V2.6 Pro",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(ompAgentDir, "config.yml"),
+      [
+        "defaultThinkingLevel: xhigh",
+        "modelRoles:",
+        "  default: magpie/crosery/mimo-v2.6-pro",
+        "  smol: magpie/crosery/gpt-6.2-sol-ultrafast",
+      ].join("\n"),
+    );
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(join(ompAgentDir, "agent.db"));
+    try {
+      db.exec("CREATE TABLE model_usage (model_key TEXT PRIMARY KEY, last_used_at INTEGER NOT NULL);");
+      db.prepare("INSERT INTO model_usage (model_key, last_used_at) VALUES (?, ?)").run(
+        "magpie/crosery/claude-opus-5",
+        1_700_000_000,
+      );
+    } finally {
+      db.close();
+    }
+
+    let bgStarted = false;
+    let releaseBg: (() => void) | undefined;
+    const bgPromise = new Promise<void>((resolve) => {
+      releaseBg = resolve;
+    });
+
+    const t0 = Date.now();
+    const res = await getAgentModels(
+      { ...hcAgent, model: "magpie/crosery/mimo-v2.6-pro" },
+      {
+        homeDir: dir,
+        unifloReady: false,
+        refreshOmpCatalog: async () => {
+          bgStarted = true;
+          await bgPromise;
+          return [
+            {
+              id: "magpie/crosery/gemini-4-neon",
+              label: "Gemini 4 Neon",
+              provider: "magpie",
+              reasoning: true,
+              source: "catalog",
+            },
+          ];
+        },
+      },
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 250, `expected instant return (<250ms), got ${elapsed}ms`);
+    assert.equal(bgStarted, true);
+
+    assert.equal(res.currentModel, "magpie/crosery/mimo-v2.6-pro");
+    assert.equal(res.currentThinking, "xhigh");
+    assert.equal(res.canSwitchThinking, true);
+    assert.deepEqual(res.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]);
+    assert.deepEqual(res.modelRoles, {
+      default: "magpie/crosery/mimo-v2.6-pro",
+      smol: "magpie/crosery/gpt-6.2-sol-ultrafast",
+    });
+    assert.ok(res.models.some((m) => m.id === "magpie/crosery/claude-opus-5"));
+
+    // Finish background refresh and verify subsequent call picks up cached CLI models
+    releaseBg?.();
+    await new Promise((r) => setTimeout(r, 20));
+    const res2 = await getAgentModels(
+      { ...hcAgent, model: "magpie/crosery/mimo-v2.6-pro" },
+      { homeDir: dir, unifloReady: false },
+    );
+    assert.ok(res2.models.some((m) => m.id === "magpie/crosery/gemini-4-neon"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateOmpRoleModel safely edits config.yml preserving comments/keys, and setAgentModelAndThinking handles roleSlot and @role switch", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pocket-omp-roles-"));
+  try {
+    const ompAgentDir = join(dir, ".omp", "agent");
+    mkdirSync(ompAgentDir, { recursive: true });
+    const cfgPath = join(ompAgentDir, "config.yml");
+    writeFileSync(
+      cfgPath,
+      [
+        "# User OMP settings",
+        "symbolPreset: minimal",
+        "modelRoles:",
+        "  # primary model comment",
+        "  default: magpie/crosery/gpt-6.2-astra-fast # keep comment",
+        "  smol: magpie/crosery/gpt-6.2-sol-ultrafast",
+        "theme:",
+        "  light: rose",
+        "  dark: noir",
+        "",
+      ].join("\n"),
+    );
+
+    const updated1 = updateOmpRoleModel(dir, "default", "magpie/crosery/mimo-v2.6-pro");
+    assert.equal(updated1.default, "magpie/crosery/mimo-v2.6-pro");
+    assert.equal(updated1.smol, "magpie/crosery/gpt-6.2-sol-ultrafast");
+
+    const updated2 = updateOmpRoleModel(dir, "plan", "magpie/crosery/claude-opus-5");
+    assert.equal(updated2.plan, "magpie/crosery/claude-opus-5");
+
+    const rawAfter = readFileSync(cfgPath, "utf8");
+    assert.ok(rawAfter.includes("# User OMP settings"));
+    assert.ok(rawAfter.includes("# primary model comment"));
+    assert.ok(rawAfter.includes("default: magpie/crosery/mimo-v2.6-pro # keep comment"));
+    assert.ok(rawAfter.includes("  plan: magpie/crosery/claude-opus-5"));
+    assert.ok(rawAfter.includes("theme:\n  light: rose\n  dark: noir"));
+
+    const sent: string[] = [];
+    const transport = {
+      homeDir: dir,
+      hc: {
+        send: async (_addr: string, text: string) => {
+          sent.push(text);
+        },
+        input: async () => {},
+        keys: async () => {},
+        snapshotText: async () => "",
+      },
+    };
+
+    const roleRes = await setAgentModelAndThinking(
+      { ...hcAgent, harness: "omp" },
+      { roleSlot: "slow", modelId: "magpie/crosery/claude-opus-5", thinkingLevel: "xhigh" },
+      transport,
+    );
+    assert.equal(sent.length, 0);
+    assert.equal(roleRes.modelRoles?.slow, "magpie/crosery/claude-opus-5:xhigh");
+    assert.ok(roleRes.note?.includes("slow"));
+
+    const switchAliasRes = await setAgentModelAndThinking(
+      { ...hcAgent, harness: "omp" },
+      { modelId: "@slow" },
+      transport,
+    );
+    assert.deepEqual(sent, ["/switch @slow"]);
+    assert.equal(switchAliasRes.currentModel, "magpie/crosery/claude-opus-5");
+    assert.equal(switchAliasRes.currentThinking, "xhigh");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -3,11 +3,23 @@ import type { Agent, AgentModelOption, AgentModelsResult } from "./index.ts";
 const EFFORT_SUFFIX_RE = /:(off|none|minimal|min|low|medium|med|high|xhigh|max|ultra|auto|default)$/i;
 const TRAILING_HYPHEN_EFFORT_RE = /-(minimal|low|medium|high|xhigh)$/i;
 const NON_REASONING_MODEL_RE =
-  /(?:^|\/)(?:gemini-(?:1\.5|2\.0)-|gemma-3-|(?:mimo-v2\.5-asr|mimo-v2\.6-(?:flash|pro)|codex-auto-review|gpt-reserve|gpt-6-chat-thinking|kimi-for-coding-highspeed)(?:$|[-:@]))/i;
+  /(?:^|\/)(?:gemini-(?:1\.5|2\.0)-|gemma-3-|(?:mimo-v2\.5-asr|codex-auto-review|gpt-reserve|kimi-for-coding-highspeed)(?:$|[-:@]))/i;
+
+/** Canonical OMP role slots configured under `modelRoles` in `~/.omp/agent/config.yml`. */
+export const OMP_MODEL_ROLES = ["default", "smol", "slow", "plan", "commit"] as const;
+export type OmpModelRole = (typeof OMP_MODEL_ROLES)[number];
+
+/** Quick role alias selectors supported by `omp`'s `/switch @<role>` command. */
+export const OMP_QUICK_ROLE_CHIPS: readonly Exclude<OmpModelRole, "commit">[] = [
+  "default",
+  "smol",
+  "slow",
+  "plan",
+];
 
 /** Canonical default thinking/reasoning effort levels supported per normalized harness family. */
 export const HARNESS_DEFAULT_THINKING_LEVELS: Record<string, readonly string[]> = {
-  omp: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  omp: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
   pi: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
   claude: ["low", "medium", "high", "xhigh", "max", "auto"],
   codex: ["low", "medium", "high", "xhigh"],
@@ -66,12 +78,18 @@ export function normalizeSwitchHarness(raw: string): string {
 export function inferAgentModelAndThinking(
   harness: string,
   rawModel?: string,
+  opts?: { hasReasoningEvents?: boolean },
 ): { currentModel?: string; currentThinking?: string; thinkingLevels?: string[] } {
   const hNorm = normalizeSwitchHarness(harness);
   const defaults = HARNESS_DEFAULT_THINKING_LEVELS[hNorm];
+  const fallbackLevels = defaults
+    ? [...defaults]
+    : opts?.hasReasoningEvents
+      ? ["low", "medium", "high"]
+      : undefined;
   const trimmed = rawModel?.trim() || "";
   if (!trimmed) {
-    return defaults ? { thinkingLevels: [...defaults] } : {};
+    return fallbackLevels ? { thinkingLevels: fallbackLevels } : {};
   }
 
   const base = stripModelEffortSuffix(trimmed);
@@ -80,7 +98,7 @@ export function inferAgentModelAndThinking(
       ? trimmed.slice(base.length + 1).toLowerCase()
       : undefined;
 
-  if (NON_REASONING_MODEL_RE.test(base)) {
+  if (!opts?.hasReasoningEvents && NON_REASONING_MODEL_RE.test(base)) {
     return { currentModel: base, thinkingLevels: [] };
   }
 
@@ -91,7 +109,7 @@ export function inferAgentModelAndThinking(
   }
 
   const currentThinking = colonEffort ?? hyphenEffort;
-  const thinkingLevels = defaults ? [...defaults] : undefined;
+  const thinkingLevels = fallbackLevels;
 
   return {
     currentModel: base,
@@ -162,6 +180,7 @@ const FALLBACK_MODEL_PRESETS: Record<string, readonly AgentModelOption[]> = {
 export function synthesizeFallbackAgentModels(
   agent: Pick<Agent, "harness" | "model" | "isShell" | "source">,
   peerModels: readonly string[] = [],
+  opts?: { hasReasoningEvents?: boolean },
 ): AgentModelsResult {
   const canSwitch = !agent.isShell && (agent.source === "hc" || agent.source === "herdr");
   const reason = agent.isShell
@@ -183,7 +202,9 @@ export function synthesizeFallbackAgentModels(
   }
 
   const hNorm = normalizeSwitchHarness(agent.harness);
-  const inferred = inferAgentModelAndThinking(agent.harness, agent.model);
+  const inferred = inferAgentModelAndThinking(agent.harness, agent.model, {
+    hasReasoningEvents: opts?.hasReasoningEvents,
+  });
   const models: AgentModelOption[] = [];
   const seen = new Set<string>();
 

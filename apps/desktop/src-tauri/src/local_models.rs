@@ -3,18 +3,20 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_MODELS: usize = 500;
 const SESSION_TAIL_BYTES: u64 = 128 * 1024;
-const CLI_TIMEOUT: Duration = Duration::from_secs(10);
+const CLI_TIMEOUT: Duration = Duration::from_secs(4);
+static OMP_CLI_REFRESHING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -116,7 +118,8 @@ pub fn normalize_harness(raw: &str) -> String {
 
 pub fn default_thinking_levels(h_norm: &str) -> Option<&'static [&'static str]> {
     match h_norm {
-        "omp" | "pi" => Some(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "omp" => Some(&["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]),
+        "pi" => Some(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
         "claude" => Some(&["low", "medium", "high", "xhigh", "max", "auto"]),
         "codex" | "grok" => Some(&["low", "medium", "high", "xhigh"]),
         "antigravity" => Some(&["low", "medium", "high", "xhigh", "max"]),
@@ -172,11 +175,8 @@ fn is_non_reasoning_model_name(model_id: &str) -> bool {
     }
     const EXACT_OR_PREFIX: &[&str] = &[
         "mimo-v2.5-asr",
-        "mimo-v2.6-flash",
-        "mimo-v2.6-pro",
         "codex-auto-review",
         "gpt-reserve",
-        "gpt-6-chat-thinking",
         "kimi-for-coding-highspeed",
     ];
     EXACT_OR_PREFIX.iter().any(|pat| {
@@ -214,7 +214,13 @@ fn find_program_with_extra_dirs(name: &str, home: Option<&Path>) -> Option<PathB
     None
 }
 
-fn run_cli_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+enum CliOutput {
+    Ok(String),
+    Failed,
+    TimedOut,
+}
+
+fn run_cli_stdout_status(bin: &Path, args: &[&str], timeout: Duration) -> CliOutput {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -226,19 +232,27 @@ fn run_cli_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
+    let Ok(mut child) = cmd.spawn() else {
+        return CliOutput::Failed;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return CliOutput::Failed;
+    };
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.by_ref().take(6 * 1024 * 1024).read_to_end(&mut buf);
         buf
     });
     let start = Instant::now();
+    let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) => {
                 if start.elapsed() >= timeout {
+                    timed_out = true;
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -252,10 +266,19 @@ fn run_cli_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String
         }
     };
     let bytes = reader.join().unwrap_or_default();
-    if status.map(|s| s.success()).unwrap_or(false) {
-        Some(String::from_utf8_lossy(&bytes).into_owned())
+    if timed_out {
+        CliOutput::TimedOut
+    } else if status.map(|s| s.success()).unwrap_or(false) {
+        CliOutput::Ok(String::from_utf8_lossy(&bytes).into_owned())
     } else {
-        None
+        CliOutput::Failed
+    }
+}
+
+fn run_cli_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    match run_cli_stdout_status(bin, args, timeout) {
+        CliOutput::Ok(s) => Some(s),
+        _ => None,
     }
 }
 
@@ -956,16 +979,13 @@ pub fn find_catalog_match<'a>(
 #[derive(Default)]
 struct OmpConfigInfo {
     models: Vec<ModelOption>,
+    roles: BTreeMap<String, String>,
     default_model: Option<String>,
     default_thinking: Option<String>,
 }
 
-fn read_omp_config_yml(home: &Path) -> OmpConfigInfo {
+fn parse_omp_config_yml_str(raw: &str) -> OmpConfigInfo {
     let mut info = OmpConfigInfo::default();
-    let path = home.join(".omp").join("agent").join("config.yml");
-    let Ok(raw) = fs::read_to_string(path) else {
-        return info;
-    };
     let mut in_roles = false;
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -990,6 +1010,10 @@ fn read_omp_config_yml(home: &Path) -> OmpConfigInfo {
             if let Some((k, v)) = trimmed.split_once(':') {
                 let role = k.trim();
                 let val = strip_yaml_scalar(v);
+                if val.is_empty() {
+                    continue;
+                }
+                info.roles.insert(role.to_string(), val.clone());
                 let (id, effort) = strip_model_effort_suffix(&val);
                 if id.is_empty() {
                     continue;
@@ -1017,6 +1041,387 @@ fn read_omp_config_yml(home: &Path) -> OmpConfigInfo {
         }
     }
     info
+}
+
+fn read_omp_config_yml(home: &Path) -> OmpConfigInfo {
+    let path = home.join(".omp").join("agent").join("config.yml");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return OmpConfigInfo::default();
+    };
+    parse_omp_config_yml_str(&raw)
+}
+
+#[allow(dead_code)]
+const OMP_MODEL_ROLES: &[&str] = &["default", "smol", "slow", "plan", "commit"];
+
+#[allow(dead_code)]
+fn format_yaml_scalar(val: &str) -> String {
+    let needs_quotes = val.contains(": ")
+        || val.contains('#')
+        || val.contains('"')
+        || val.contains('\'')
+        || val.contains('[')
+        || val.contains(']')
+        || val.contains('{')
+        || val.contains('}')
+        || val.starts_with(['-', '*', '&', '!', '%', '@', '?'])
+        || val.starts_with(char::is_whitespace)
+        || val.ends_with(char::is_whitespace);
+    if needs_quotes {
+        serde_json::to_string(val).unwrap_or_else(|_| format!("\"{val}\""))
+    } else {
+        val.to_string()
+    }
+}
+
+#[allow(dead_code)]
+fn extract_yaml_trailing_comment(val_raw: &str) -> &str {
+    let trimmed = val_raw.trim_start();
+    if trimmed.is_empty() {
+        return "";
+    }
+    if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+        let q = trimmed.chars().next().unwrap();
+        if let Some(end) = trimmed[1..].find(q) {
+            let rest = &trimmed[1 + end + 1..];
+            if let Some(idx) = rest.find('#') {
+                if rest[..idx].chars().all(char::is_whitespace) && idx > 0 {
+                    return rest;
+                }
+            }
+            return "";
+        }
+    }
+    if let Some(idx) = trimmed.find(" #") {
+        &trimmed[idx..]
+    } else {
+        ""
+    }
+}
+
+/// Safely updates `modelRoles.<slot>` in `~/.omp/agent/config.yml` while preserving comments,
+/// blank lines, indentation, and other top-level sections.
+#[allow(dead_code)]
+pub fn update_omp_role_model_in_home(
+    home: &Path,
+    role_slot: &str,
+    model_id: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    if !OMP_MODEL_ROLES.contains(&role_slot) {
+        return Err(format!("不支持的 OMP 角色槽位：{role_slot}"));
+    }
+    let clean_model = model_id.trim();
+    if clean_model.is_empty() || clean_model.contains('\n') || clean_model.contains('\r') {
+        return Err("角色模型 ID 无效".into());
+    }
+
+    let yml_path = home.join(".omp").join("agent").join("config.yml");
+    if let Some(parent) = yml_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("无法创建 OMP 配置目录：{e}"))?;
+    }
+    let formatted = format_yaml_scalar(clean_model);
+
+    if !yml_path.exists() {
+        let content = format!("modelRoles:\n  {role_slot}: {formatted}\n");
+        fs::write(&yml_path, content).map_err(|e| format!("写入 config.yml 失败：{e}"))?;
+        let mut map = BTreeMap::new();
+        map.insert(role_slot.to_string(), clean_model.to_string());
+        return Ok(map);
+    }
+
+    let raw = fs::read_to_string(&yml_path).map_err(|e| format!("读取 config.yml 失败：{e}"))?;
+    let eol = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    if raw.trim().is_empty() {
+        let content = format!("modelRoles:{eol}  {role_slot}: {formatted}{eol}");
+        fs::write(&yml_path, content).map_err(|e| format!("写入 config.yml 失败：{e}"))?;
+        let mut map = BTreeMap::new();
+        map.insert(role_slot.to_string(), clean_model.to_string());
+        return Ok(map);
+    }
+
+    let had_trailing_newline = raw.ends_with('\n');
+    let mut lines: Vec<String> = raw.split('\n').map(|s| s.strip_suffix('\r').unwrap_or(s).to_string()).collect();
+    if had_trailing_newline && lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+
+    let mut roles_header_idx: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let indent = line.len() - line.trim_start().len();
+        if indent != 0 {
+            continue;
+        }
+        if let Some((k, rest)) = line.split_once(':') {
+            if k.trim() == "modelRoles" {
+                let r_clean = strip_yaml_scalar(rest);
+                if r_clean.is_empty() || r_clean == "{}" {
+                    roles_header_idx = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(header_idx) = roles_header_idx {
+        if let Some((_, rest)) = lines[header_idx].split_once(':') {
+            if strip_yaml_scalar(rest) == "{}" {
+                let comment = rest.find('#').map(|idx| format!(" {}", &rest[idx..])).unwrap_or_default();
+                lines[header_idx] = format!("modelRoles:{comment}");
+            }
+        }
+
+        let mut child_indent = "  ".to_string();
+        let mut saw_child_indent = false;
+        let mut last_entry_idx = header_idx;
+        let mut replaced = false;
+
+        for i in (header_idx + 1)..lines.len() {
+            let line = lines[i].clone();
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent_len = line.len() - line.trim_start().len();
+            if indent_len == 0 {
+                break;
+            }
+            if !saw_child_indent {
+                child_indent = line[..indent_len].to_string();
+                saw_child_indent = true;
+            }
+            last_entry_idx = i;
+
+            if let Some((k, val_raw)) = trimmed.split_once(':') {
+                if k.trim() == role_slot {
+                    let trailing = extract_yaml_trailing_comment(val_raw);
+                    lines[i] = format!("{}{role_slot}: {formatted}{trailing}", &line[..indent_len]);
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+
+        if !replaced {
+            lines.insert(last_entry_idx + 1, format!("{child_indent}{role_slot}: {formatted}"));
+        }
+    } else {
+        if lines.last().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            lines.push(String::new());
+        }
+        lines.push("modelRoles:".into());
+        lines.push(format!("  {role_slot}: {formatted}"));
+    }
+
+    let mut next = lines.join(eol);
+    if had_trailing_newline {
+        next.push_str(eol);
+    }
+    fs::write(&yml_path, &next).map_err(|e| format!("写入 config.yml 失败：{e}"))?;
+    Ok(parse_omp_config_yml_str(&next).roles)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+mod omp_sqlite {
+    use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use std::path::Path;
+
+    const SQLITE_OK: c_int = 0;
+    const SQLITE_ROW: c_int = 100;
+    const SQLITE_OPEN_READONLY: c_int = 0x01;
+
+    #[cfg_attr(target_os = "macos", link(name = "sqlite3"))]
+    #[cfg_attr(windows, link(name = "winsqlite3"))]
+    extern "system" {
+        fn sqlite3_open_v2(
+            filename: *const c_char,
+            db: *mut *mut c_void,
+            flags: c_int,
+            vfs: *const c_char,
+        ) -> c_int;
+        fn sqlite3_close(db: *mut c_void) -> c_int;
+        fn sqlite3_busy_timeout(db: *mut c_void, ms: c_int) -> c_int;
+        fn sqlite3_prepare_v2(
+            db: *mut c_void,
+            sql: *const c_char,
+            n: c_int,
+            stmt: *mut *mut c_void,
+            tail: *mut *const c_char,
+        ) -> c_int;
+        fn sqlite3_step(stmt: *mut c_void) -> c_int;
+        fn sqlite3_finalize(stmt: *mut c_void) -> c_int;
+        fn sqlite3_column_text(stmt: *mut c_void, i: c_int) -> *const u8;
+        fn sqlite3_column_bytes(stmt: *mut c_void, i: c_int) -> c_int;
+        #[cfg(test)]
+        fn sqlite3_exec(
+            db: *mut c_void,
+            sql: *const c_char,
+            callback: *const c_void,
+            arg: *mut c_void,
+            errmsg: *mut *mut c_char,
+        ) -> c_int;
+    }
+
+    struct DbGuard(*mut c_void);
+    impl Drop for DbGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    sqlite3_close(self.0);
+                }
+            }
+        }
+    }
+
+    struct StmtGuard(*mut c_void);
+    impl Drop for StmtGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    sqlite3_finalize(self.0);
+                }
+            }
+        }
+    }
+
+    pub fn read_recent_model_keys(db_path: &Path) -> Vec<String> {
+        let Ok(c_path) = CString::new(db_path.to_string_lossy().as_bytes()) else {
+            return Vec::new();
+        };
+        let mut raw_db = std::ptr::null_mut();
+        let rc = unsafe {
+            sqlite3_open_v2(
+                c_path.as_ptr(),
+                &mut raw_db,
+                SQLITE_OPEN_READONLY,
+                std::ptr::null(),
+            )
+        };
+        let db = DbGuard(raw_db);
+        if rc != SQLITE_OK || db.0.is_null() {
+            return Vec::new();
+        }
+        unsafe {
+            sqlite3_busy_timeout(db.0, 50);
+        }
+        let Ok(sql) = CString::new(
+            "SELECT model_key FROM model_usage ORDER BY last_used_at DESC LIMIT 60",
+        ) else {
+            return Vec::new();
+        };
+        let mut raw_stmt = std::ptr::null_mut();
+        let prep_rc = unsafe {
+            sqlite3_prepare_v2(db.0, sql.as_ptr(), -1, &mut raw_stmt, std::ptr::null_mut())
+        };
+        let stmt = StmtGuard(raw_stmt);
+        if prep_rc != SQLITE_OK || stmt.0.is_null() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        loop {
+            let step_rc = unsafe { sqlite3_step(stmt.0) };
+            if step_rc != SQLITE_ROW {
+                break;
+            }
+            let ptr = unsafe { sqlite3_column_text(stmt.0, 0) };
+            let len = unsafe { sqlite3_column_bytes(stmt.0, 0) };
+            if ptr.is_null() || len <= 0 {
+                continue;
+            }
+            let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            if let Ok(s) = std::str::from_utf8(slice) {
+                let clean = s.trim();
+                if !clean.is_empty() {
+                    out.push(clean.to_string());
+                }
+            } else {
+                let s = CStr::from_bytes_until_nul(slice)
+                    .ok()
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !s.trim().is_empty() {
+                    out.push(s.trim().to_string());
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub fn create_db(db_path: &Path, sql: &str) -> Result<(), String> {
+        let c_path = CString::new(db_path.to_string_lossy().as_bytes()).map_err(|_| "bad path")?;
+        let mut raw_db = std::ptr::null_mut();
+        let rc = unsafe { sqlite3_open_v2(c_path.as_ptr(), &mut raw_db, 0x02 | 0x04, std::ptr::null()) };
+        let db = DbGuard(raw_db);
+        if rc != SQLITE_OK {
+            return Err(format!("open failed: {rc}"));
+        }
+        let c_sql = CString::new(sql).map_err(|_| "bad sql")?;
+        let rc2 = unsafe {
+            sqlite3_exec(
+                db.0,
+                c_sql.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc2 != SQLITE_OK {
+            return Err(format!("exec failed: {rc2}"));
+        }
+        Ok(())
+    }
+}
+
+fn read_omp_agent_db_models(home: &Path) -> Vec<ModelOption> {
+    let db_path = home.join(".omp").join("agent").join("agent.db");
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    let keys = omp_sqlite::read_recent_model_keys(&db_path);
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let keys: Vec<String> = {
+        let Some(sqlite_bin) = find_program_with_extra_dirs("sqlite3", Some(home)) else {
+            return Vec::new();
+        };
+        let path_str = db_path.to_string_lossy().into_owned();
+        run_cli_stdout(
+            &sqlite_bin,
+            &[
+                "-readonly",
+                "-noheader",
+                &path_str,
+                "SELECT model_key FROM model_usage ORDER BY last_used_at DESC LIMIT 60;",
+            ],
+            Duration::from_millis(800),
+        )
+        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+    };
+
+    keys.into_iter()
+        .filter_map(|raw_key| {
+            let (id, _) = strip_model_effort_suffix(&raw_key);
+            if id.is_empty() {
+                return None;
+            }
+            let provider = id
+                .split_once('/')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_else(|| "omp".into());
+            Some(ModelOption {
+                id: id.clone(),
+                label: id,
+                provider: Some(provider),
+                context_window: None,
+                reasoning: None,
+                thinking_levels: None,
+                source: "recent",
+            })
+        })
+        .collect()
 }
 
 fn read_omp_models_yml(home: &Path) -> Vec<ModelOption> {
@@ -1556,24 +1961,68 @@ fn fallback_presets(h_norm: &str) -> Vec<ModelOption> {
     }
 }
 
-fn get_omp_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
-    cached_cli_catalog("omp", || {
-        let Some(bin) = find_program_with_extra_dirs("omp", home) else {
-            return Vec::new();
-        };
-        if let Some(out) = run_cli_stdout(&bin, &["models", "--json"], CLI_TIMEOUT) {
+fn load_omp_cli_catalog_once(home: Option<&Path>) -> Vec<ModelOption> {
+    let Some(bin) = find_program_with_extra_dirs("omp", home) else {
+        return Vec::new();
+    };
+    match run_cli_stdout_status(&bin, &["models", "--json"], CLI_TIMEOUT) {
+        CliOutput::Ok(out) => {
             let parsed = parse_omp_models_json(&out);
             if !parsed.is_empty() {
                 return parsed;
             }
         }
-        if let Some(out) =
-            run_cli_stdout(&bin, &["models", "--json", "--no-extensions"], CLI_TIMEOUT)
-        {
-            return parse_omp_models_json(&out);
+        CliOutput::TimedOut => return Vec::new(),
+        CliOutput::Failed => {}
+    }
+    if let Some(out) = run_cli_stdout(&bin, &["models", "--json", "--no-extensions"], CLI_TIMEOUT) {
+        return parse_omp_models_json(&out);
+    }
+    Vec::new()
+}
+
+fn get_omp_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
+    cached_cli_catalog("omp", || load_omp_cli_catalog_once(home))
+}
+
+fn get_omp_cached_and_trigger_bg(home: Option<&Path>) -> Vec<ModelOption> {
+    let (cached_models, is_fresh) = if let Ok(guard) = cache_map().lock() {
+        if let Some(hit) = guard.get("omp") {
+            (hit.models.clone(), hit.at.elapsed() < CATALOG_CACHE_TTL)
+        } else {
+            (Vec::new(), false)
         }
-        Vec::new()
-    })
+    } else {
+        (Vec::new(), false)
+    };
+
+    if !is_fresh
+        && OMP_CLI_REFRESHING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        let home_owned = home.map(Path::to_path_buf);
+        std::thread::spawn(move || {
+            let models: Vec<ModelOption> = load_omp_cli_catalog_once(home_owned.as_deref())
+                .into_iter()
+                .take(MAX_MODELS)
+                .collect();
+            if !models.is_empty() {
+                if let Ok(mut guard) = cache_map().lock() {
+                    guard.insert(
+                        "omp".to_string(),
+                        CachedCatalog {
+                            at: Instant::now(),
+                            models,
+                        },
+                    );
+                }
+            }
+            OMP_CLI_REFRESHING.store(false, Ordering::SeqCst);
+        });
+    }
+
+    cached_models
 }
 
 fn get_pi_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
@@ -1674,9 +2123,20 @@ pub fn build_local_agent_models_with(
     } else {
         Vec::new()
     };
+    let db_models = if h_norm == "omp" {
+        home.map(read_omp_agent_db_models).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let cli_catalog = if use_cli {
         match h_norm.as_str() {
-            "omp" => get_omp_cli_catalog(home),
+            "omp" => {
+                if !yml_catalog.is_empty() || !omp_cfg.models.is_empty() || !db_models.is_empty() {
+                    get_omp_cached_and_trigger_bg(home)
+                } else {
+                    get_omp_cli_catalog(home)
+                }
+            }
             "pi" => get_pi_cli_catalog(home),
             "antigravity" => get_agy_cli_catalog(home),
             "opencode" => get_opencode_cli_catalog(home),
@@ -1693,7 +2153,7 @@ pub fn build_local_agent_models_with(
         _ => (None, None),
     };
 
-    let raw_model = {
+    let mut raw_model = {
         let arg_m = current_model.map(str::trim).unwrap_or("");
         if let Some(ref lm) = live_model {
             if !arg_m.is_empty()
@@ -1710,6 +2170,12 @@ pub fn build_local_agent_models_with(
             arg_m.to_string()
         }
     };
+    if h_norm == "omp" && raw_model.starts_with('@') {
+        let role_key = raw_model[1..].to_ascii_lowercase();
+        if let Some(target) = omp_cfg.roles.get(&role_key) {
+            raw_model = target.clone();
+        }
+    }
 
     let (parsed_id, parsed_effort) = if raw_model.is_empty() {
         (String::new(), None)
@@ -1797,6 +2263,16 @@ pub fn build_local_agent_models_with(
 
     if h_norm == "omp" {
         for item in omp_cfg.models {
+            push_model_opt(
+                item,
+                true,
+                &combined_catalog,
+                &mut merged,
+                &mut seen,
+                &mut aliases,
+            );
+        }
+        for item in db_models {
             push_model_opt(
                 item,
                 true,
@@ -1900,6 +2376,13 @@ pub fn build_local_agent_models_with(
         result.insert("canSwitchThinking".into(), Value::Bool(false));
     }
     result.insert("canSwitch".into(), Value::Bool(true));
+    if h_norm == "omp" && !omp_cfg.roles.is_empty() {
+        let mut roles_obj = serde_json::Map::new();
+        for (k, v) in omp_cfg.roles {
+            roles_obj.insert(k, Value::String(v));
+        }
+        result.insert("modelRoles".into(), Value::Object(roles_obj));
+    }
     result.insert(
         "models".into(),
         serde_json::to_value(&merged).unwrap_or_else(|_| Value::Array(Vec::new())),
@@ -1926,6 +2409,25 @@ pub async fn local_agent_models(
     .await
     .map_err(|e| e.to_string())?;
     Ok(res)
+}
+
+// Registered in lib.rs generate_handler![] during coordinator merge.
+#[allow(dead_code)]
+#[tauri::command]
+pub async fn local_set_omp_role_model(
+    role_slot: String,
+    model_id: String,
+) -> Result<Value, String> {
+    let roles = tauri::async_runtime::spawn_blocking(move || {
+        let home = crate::home_dir().ok_or_else(|| "无法获取用户目录".to_string())?;
+        update_omp_role_model_in_home(&home, &role_slot, &model_id)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(serde_json::json!({
+        "ok": true,
+        "modelRoles": roles,
+    }))
 }
 
 #[cfg(test)]
@@ -2214,6 +2716,81 @@ providers:
 
         let gemini = build_local_agent_models_with("gemini", None, None, Some(&dir), false);
         assert_eq!(gemini.get("currentThinking").and_then(Value::as_str), Some("high"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_mimo_v26_pro_auto_thinking_agent_db_and_updates_omp_roles_safely() {
+        let dir = make_temp_dir("omp-roles-db");
+        let omp_dir = dir.join(".omp/agent");
+        fs::create_dir_all(&omp_dir).unwrap();
+
+        let cfg_path = omp_dir.join("config.yml");
+        fs::write(
+            &cfg_path,
+            "# keep header comment\nsymbolPreset: minimal\nmodelRoles:\n  # role comment\n  default: magpie/crosery/gpt-6.2-astra-fast # keep inline\n  smol: magpie/crosery/gpt-6.2-sol-ultrafast\ntheme:\n  light: rose\n",
+        )
+        .unwrap();
+        fs::write(
+            omp_dir.join("models.yml"),
+            "providers:\n  magpie:\n    models:\n      - id: crosery/mimo-v2.6-pro\n        name: MiMo V2.6 Pro\n",
+        )
+        .unwrap();
+
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            omp_sqlite::create_db(
+                &omp_dir.join("agent.db"),
+                "CREATE TABLE model_usage (model_key TEXT PRIMARY KEY, last_used_at INTEGER NOT NULL); INSERT INTO model_usage (model_key, last_used_at) VALUES ('magpie/crosery/claude-opus-5', 1700000000);",
+            )
+            .unwrap();
+        }
+
+        let res = build_local_agent_models_with(
+            "omp",
+            Some("magpie/crosery/mimo-v2.6-pro"),
+            None,
+            Some(&dir),
+            false,
+        );
+        assert_eq!(
+            res.get("canSwitchThinking").and_then(Value::as_bool),
+            Some(true)
+        );
+        let levels: Vec<&str> = res
+            .get("thinkingLevels")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(levels.contains(&"auto"));
+        assert!(levels.contains(&"xhigh"));
+        assert_eq!(
+            res.pointer("/modelRoles/default").and_then(Value::as_str),
+            Some("magpie/crosery/gpt-6.2-astra-fast")
+        );
+        #[cfg(any(target_os = "macos", windows))]
+        assert!(res
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().any(|m| m.get("id").and_then(Value::as_str) == Some("magpie/crosery/claude-opus-5")))
+            .unwrap_or(false));
+
+        let updated = update_omp_role_model_in_home(&dir, "default", "magpie/crosery/mimo-v2.6-pro").unwrap();
+        assert_eq!(updated.get("default").map(String::as_str), Some("magpie/crosery/mimo-v2.6-pro"));
+        let updated2 = update_omp_role_model_in_home(&dir, "plan", "magpie/crosery/claude-opus-5").unwrap();
+        assert_eq!(updated2.get("plan").map(String::as_str), Some("magpie/crosery/claude-opus-5"));
+
+        let saved_raw = fs::read_to_string(&cfg_path).unwrap();
+        assert!(saved_raw.contains("# keep header comment"));
+        assert!(saved_raw.contains("# role comment"));
+        assert!(saved_raw.contains("  default: magpie/crosery/mimo-v2.6-pro # keep inline"));
+        assert!(saved_raw.contains("  plan: magpie/crosery/claude-opus-5"));
+        assert!(saved_raw.contains("theme:\n  light: rose"));
+
+        assert!(update_omp_role_model_in_home(&dir, "unknown_slot", "m1").is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

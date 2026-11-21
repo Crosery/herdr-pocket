@@ -55,15 +55,26 @@ test("inferAgentModelAndThinking detects colon effort, hyphen effort, non-reason
   });
 
   assert.deepEqual(inferAgentModelAndThinking("omp"), {
-    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
   });
 
   assert.deepEqual(inferAgentModelAndThinking("omp", "magpie/crosery/gpt-6.2-astra-fast"), {
     currentModel: "magpie/crosery/gpt-6.2-astra-fast",
-    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
   });
 
-  // Explicit non-reasoning models must return empty thinkingLevels
+  // mimo-v2.6-pro and gpt-6-chat-thinking are reasoning-capable models and must expose thinking levels
+  assert.deepEqual(inferAgentModelAndThinking("omp", "magpie/crosery/mimo-v2.6-pro"), {
+    currentModel: "magpie/crosery/mimo-v2.6-pro",
+    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
+  });
+  assert.deepEqual(inferAgentModelAndThinking("omp", "magpie/crosery/gpt-6-chat-thinking:high"), {
+    currentModel: "magpie/crosery/gpt-6-chat-thinking",
+    currentThinking: "high",
+    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
+  });
+
+  // Explicit non-reasoning models must return empty thinkingLevels unless reasoning events were emitted
   for (const nonReasoning of [
     "google/gemini-1.5-flash",
     "magpie/crosery/mimo-v2.5-asr",
@@ -74,6 +85,10 @@ test("inferAgentModelAndThinking detects colon effort, hyphen effort, non-reason
     assert.deepEqual(inferAgentModelAndThinking("omp", nonReasoning), {
       currentModel: nonReasoning,
       thinkingLevels: [],
+    });
+    assert.deepEqual(inferAgentModelAndThinking("omp", nonReasoning, { hasReasoningEvents: true }), {
+      currentModel: nonReasoning,
+      thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
     });
   }
 
@@ -99,7 +114,7 @@ test("synthesizeFallbackAgentModels merges current, peer models, and presets wit
   assert.equal(res.currentModel, "magpie/crosery/gpt-6.2-astra-fast");
   assert.equal(res.currentThinking, "xhigh");
   assert.equal(res.thinkingLabel, "思考等级");
-  assert.deepEqual(res.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  assert.deepEqual(res.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]);
   assert.equal(res.models[0]?.id, "magpie/crosery/gpt-6.2-astra-fast");
   assert.equal(res.models[0]?.source, "current");
   assert.ok(res.models.some((m) => m.id === "magpie/crosery/gpt-6.2-sol-ultrafast" && m.source === "recent"));

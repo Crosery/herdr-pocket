@@ -624,10 +624,10 @@ export interface RpcMethods {
     params: { agent: string };
     result: AgentModelsResult;
   };
-  /** Switch an agent's active model and/or thinking/reasoning effort level cleanly per harness. */
+  /** Switch an agent's active model, thinking/reasoning effort level, or OMP role slot cleanly per harness. */
   "agent.setModel": {
-    params: { agent: string; modelId?: string; thinkingLevel?: string };
-    result: { ok: true; currentModel?: string; currentThinking?: string; note?: string };
+    params: { agent: string; modelId?: string; thinkingLevel?: string; roleSlot?: OmpModelRole };
+    result: { ok: true; currentModel?: string; currentThinking?: string; modelRoles?: Record<string, string>; note?: string };
   };
   /** Sidechannel / bypass quick question against an agent's recent context without interrupting its turn. */
   "agent.btw": {
@@ -808,6 +808,7 @@ export interface AgentModelsResult {
   thinkingLabel?: string;
   canSwitch: boolean;
   reason?: string;
+  modelRoles?: Record<string, string>;
   models: AgentModelOption[];
 }
 
@@ -819,30 +820,39 @@ export interface HarnessSwitchPlan {
 
 import {
   HARNESS_DEFAULT_THINKING_LEVELS,
+  OMP_MODEL_ROLES,
+  OMP_QUICK_ROLE_CHIPS,
   inferAgentModelAndThinking,
   normalizeSwitchHarness,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
+  type OmpModelRole,
 } from "./modelsMeta.ts";
 
 export {
   HARNESS_DEFAULT_THINKING_LEVELS,
+  OMP_MODEL_ROLES,
+  OMP_QUICK_ROLE_CHIPS,
   inferAgentModelAndThinking,
   normalizeSwitchHarness,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
+  type OmpModelRole,
 };
 
 /** Builds per-harness slash commands / keys to switch model and/or thinking effort cleanly. */
 export function buildHarnessSwitchCommands(
   harness: string,
-  opts: { modelId?: string; thinkingLevel?: string },
+  opts: { modelId?: string; thinkingLevel?: string; roleSlot?: OmpModelRole },
 ): HarnessSwitchPlan {
   const h = normalizeSwitchHarness(harness);
   const model = opts.modelId?.trim() || "";
   const effort = opts.thinkingLevel?.trim() || "";
 
   if (h === "omp") {
+    if (opts.roleSlot) {
+      return { commands: [] };
+    }
     if (model && effort) {
       return { commands: [`/switch ${stripModelEffortSuffix(model)}:${effort}`] };
     }

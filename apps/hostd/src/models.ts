@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
   HARNESS_DEFAULT_THINKING_LEVELS,
+  OMP_MODEL_ROLES,
   buildHarnessSwitchCommands,
   inferAgentModelAndThinking,
   normalizeSwitchHarness,
@@ -23,6 +24,7 @@ import {
   type Agent,
   type AgentModelOption,
   type AgentModelsResult,
+  type OmpModelRole,
 } from "@herdr-pocket/protocol";
 import { findPrograms } from "./create.ts";
 import { endsInPanel } from "./hc.ts";
@@ -31,9 +33,11 @@ import { harnessId } from "./uniflo.ts";
 const execFileAsync = promisify(execFile);
 
 const CATALOG_CACHE_MS = 5 * 60_000;
+const OMP_CLI_TIMEOUT_MS = 4_000;
 const MAX_MODELS = 500;
 const SESSION_TAIL_BYTES = 128 * 1024;
 const cliCatalogCache = new Map<string, { at: number; models: AgentModelOption[] }>();
+let ompRefreshInflight: Promise<AgentModelOption[]> | null = null;
 
 function normHarnessKey(raw: string): string {
   return normalizeSwitchHarness((harnessId(raw) ?? raw).trim());
@@ -415,28 +419,54 @@ async function cachedCliCatalog(key: string, loader: () => Promise<AgentModelOpt
   return models.length ? models : (cached?.models ?? []);
 }
 
-async function getOmpCatalog(): Promise<AgentModelOption[]> {
-  return cachedCliCatalog("omp", async () => {
-    const found = await findPrograms(["omp"]);
-    const bin = found.get("omp");
-    if (!bin) return [];
-    // Keep extensions enabled so custom providers (e.g. crosery-fast / crosery-ultrafast) appear; fall back only on error.
-    try {
-      const { stdout } = await execFileAsync(bin, ["models", "--json"], {
-        timeout: 15_000,
-        maxBuffer: 6 * 1024 * 1024,
-      });
-      const parsed = parseOmpModelsJson(stdout);
-      if (parsed.length) return parsed;
-    } catch {
-      /* fallback below */
-    }
+async function loadOmpCliCatalogOnce(): Promise<AgentModelOption[]> {
+  const found = await findPrograms(["omp"]);
+  const bin = found.get("omp");
+  if (!bin) return [];
+  // Keep extensions enabled so custom providers appear; fall back to --no-extensions only on fast non-timeout errors.
+  try {
+    const { stdout } = await execFileAsync(bin, ["models", "--json"], {
+      timeout: OMP_CLI_TIMEOUT_MS,
+      maxBuffer: 6 * 1024 * 1024,
+    });
+    const parsed = parseOmpModelsJson(stdout);
+    if (parsed.length) return parsed;
+  } catch (err) {
+    const e = err as { killed?: boolean; signal?: string | null };
+    if (e?.killed || e?.signal) return [];
+  }
+  try {
     const { stdout } = await execFileAsync(bin, ["models", "--json", "--no-extensions"], {
-      timeout: 15_000,
+      timeout: OMP_CLI_TIMEOUT_MS,
       maxBuffer: 6 * 1024 * 1024,
     });
     return parseOmpModelsJson(stdout);
-  });
+  } catch {
+    return [];
+  }
+}
+
+function refreshOmpCatalogBackground(): Promise<AgentModelOption[]> {
+  if (ompRefreshInflight) return ompRefreshInflight;
+  ompRefreshInflight = loadOmpCliCatalogOnce()
+    .then((models) => {
+      if (models.length > 0) {
+        cliCatalogCache.set("omp", { at: Date.now(), models });
+      }
+      return models;
+    })
+    .catch(() => [])
+    .finally(() => {
+      ompRefreshInflight = null;
+    });
+  return ompRefreshInflight;
+}
+
+async function getOmpCatalog(): Promise<AgentModelOption[]> {
+  const cached = cliCatalogCache.get("omp");
+  if (cached && Date.now() - cached.at < CATALOG_CACHE_MS) return cached.models;
+  const models = await refreshOmpCatalogBackground();
+  return models.length ? models : (cached?.models ?? []);
 }
 
 async function getPiCatalog(): Promise<AgentModelOption[]> {
@@ -488,48 +518,207 @@ function splitModelAndEffort(raw: string): { id: string; effort?: string } {
   return { id: trimmed };
 }
 
+function extractYamlTrailingComment(valRaw: string): string {
+  const s = valRaw.trimStart();
+  if (!s) return "";
+  if (s.startsWith('"') || s.startsWith("'")) {
+    const q = s[0]!;
+    const end = s.indexOf(q, 1);
+    if (end > 0) {
+      const rest = s.slice(end + 1);
+      const cm = /^(\s+#.*)$/.exec(rest);
+      return cm?.[1] ?? "";
+    }
+  }
+  const idx = s.search(/\s+#/);
+  return idx >= 0 ? s.slice(idx) : "";
+}
+
+function formatYamlScalar(val: string): string {
+  if (/[:]\s|[#'"\[\]{}]|^[-*&!%@?]|\s$/.test(val) || /^\s/.test(val)) {
+    return JSON.stringify(val);
+  }
+  return val;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseOmpConfigYmlRaw(raw: string): {
+  modelRoles: Record<string, string>;
+  models: AgentModelOption[];
+  defaultModel?: string;
+  defaultThinking?: string;
+} {
+  const models: AgentModelOption[] = [];
+  const modelRoles: Record<string, string> = {};
+  let defaultModel: string | undefined;
+  let defaultThinking: string | undefined;
+
+  const thinkMatch = /^\s*defaultThinkingLevel\s*:\s*([^\r\n]+)/m.exec(raw);
+  if (thinkMatch?.[1]) {
+    const cleanThink = stripYamlScalar(thinkMatch[1]).toLowerCase();
+    if (cleanThink) defaultThinking = cleanThink;
+  }
+
+  const lines = raw.split(/\r?\n/);
+  let inRoles = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    if (/^modelRoles\s*:\s*(?:#.*)?$/.test(trimmed) && /^\S/.test(line)) {
+      inRoles = true;
+      continue;
+    }
+    if (inRoles) {
+      if (/^\S/.test(line)) {
+        inRoles = false;
+        continue;
+      }
+      const m = /^\s+([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line);
+      if (!m) continue;
+      const role = m[1]!;
+      const scalar = stripYamlScalar(m[2] ?? "");
+      if (!scalar) continue;
+      modelRoles[role] = scalar;
+      const { id, effort } = splitModelAndEffort(scalar);
+      if (!id) continue;
+      const provider = id.includes("/") ? id.split("/")[0] : "omp";
+      if (role === "default" && !defaultModel) {
+        defaultModel = id;
+        if (!defaultThinking && effort) defaultThinking = effort;
+      }
+      models.push({ id, label: id, provider, source: "recent" });
+    }
+  }
+
+  return { modelRoles, models, defaultModel, defaultThinking };
+}
+
+/**
+ * Safely updates `modelRoles.<slot>` in `~/.omp/agent/config.yml`, preserving all other keys,
+ * comments, blank lines, and indentation.
+ */
+export function updateOmpRoleModel(
+  homeDir: string,
+  roleSlot: OmpModelRole,
+  modelId: string,
+): Record<string, string> {
+  if (!OMP_MODEL_ROLES.includes(roleSlot)) {
+    throw new Error(`不支持的 OMP 角色槽位：${roleSlot}`);
+  }
+  const cleanModel = modelId.trim();
+  if (!cleanModel || /[\r\n]/.test(cleanModel)) {
+    throw new Error("角色模型 ID 无效");
+  }
+
+  const ymlPath = join(homeDir, ".omp", "agent", "config.yml");
+  mkdirSync(dirname(ymlPath), { recursive: true });
+  const formatted = formatYamlScalar(cleanModel);
+
+  if (!existsSync(ymlPath)) {
+    const content = `modelRoles:\n  ${roleSlot}: ${formatted}\n`;
+    writeFileSync(ymlPath, content, "utf8");
+    return { [roleSlot]: cleanModel };
+  }
+
+  const raw = readFileSync(ymlPath, "utf8");
+  if (!raw.trim()) {
+    const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+    const content = `modelRoles:${eol}  ${roleSlot}: ${formatted}${eol}`;
+    writeFileSync(ymlPath, content, "utf8");
+    return { [roleSlot]: cleanModel };
+  }
+
+  const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+  const hadTrailingNewline = raw.endsWith("\n");
+  const lines = raw.split(/\r?\n/);
+  if (hadTrailingNewline && lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  let rolesHeaderIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (/^modelRoles\s*:\s*(?:\{\s*\}\s*)?(?:#.*)?$/.test(line)) {
+      rolesHeaderIdx = i;
+      break;
+    }
+  }
+
+  if (rolesHeaderIdx >= 0) {
+    const headerLine = lines[rolesHeaderIdx]!;
+    if (/^modelRoles\s*:\s*\{\s*\}/.test(headerLine)) {
+      const commentIdx = headerLine.indexOf("#");
+      const comment = commentIdx >= 0 ? ` ${headerLine.slice(commentIdx)}` : "";
+      lines[rolesHeaderIdx] = `modelRoles:${comment}`;
+    }
+
+    let childIndent = "  ";
+    let sawChildIndent = false;
+    let lastEntryIdx = rolesHeaderIdx;
+    let replaced = false;
+    const slotRe = new RegExp(`^([ \\t]+)${escapeRegExp(roleSlot)}(\\s*:\\s*)(.*)$`);
+
+    for (let i = rolesHeaderIdx + 1; i < lines.length; i++) {
+      const line = lines[i]!;
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      if (/^\S/.test(line)) break;
+
+      const indentMatch = /^([ \t]+)/.exec(line);
+      if (indentMatch && !sawChildIndent) {
+        childIndent = indentMatch[1]!;
+        sawChildIndent = true;
+      }
+      lastEntryIdx = i;
+
+      const rm = slotRe.exec(line);
+      if (rm) {
+        const trailing = extractYamlTrailingComment(rm[3] ?? "");
+        lines[i] = `${rm[1]}${roleSlot}: ${formatted}${trailing}`;
+        replaced = true;
+        break;
+      }
+    }
+
+    if (!replaced) {
+      lines.splice(lastEntryIdx + 1, 0, `${childIndent}${roleSlot}: ${formatted}`);
+    }
+  } else {
+    if (lines.length > 0 && lines[lines.length - 1]!.trim() !== "") {
+      lines.push("");
+    }
+    lines.push("modelRoles:");
+    lines.push(`  ${roleSlot}: ${formatted}`);
+  }
+
+  const next = `${lines.join(eol)}${hadTrailingNewline ? eol : ""}`;
+  writeFileSync(ymlPath, next, "utf8");
+  return parseOmpConfigYmlRaw(next).modelRoles;
+}
+
 /** Reads `~/.omp/agent/config.yml` modelRoles + defaultThinkingLevel and `~/.omp/agent/agent.db` MRU selectors. */
 export async function readOmpLocalConfig(homeDir = homedir()): Promise<{
   models: AgentModelOption[];
+  modelRoles: Record<string, string>;
   defaultModel?: string;
   defaultThinking?: string;
 }> {
   const models: AgentModelOption[] = [];
+  let modelRoles: Record<string, string> = {};
   let defaultModel: string | undefined;
   let defaultThinking: string | undefined;
 
   const ymlPath = join(homeDir, ".omp", "agent", "config.yml");
   if (existsSync(ymlPath)) {
     try {
-      const raw = readFileSync(ymlPath, "utf8");
-      const thinkMatch = /^\s*defaultThinkingLevel\s*:\s*["']?([A-Za-z0-9_-]+)["']?/m.exec(raw);
-      if (thinkMatch?.[1]) defaultThinking = thinkMatch[1].trim().toLowerCase();
-
-      const lines = raw.split(/\r?\n/);
-      let inRoles = false;
-      for (const line of lines) {
-        if (/^modelRoles\s*:/.test(line)) {
-          inRoles = true;
-          continue;
-        }
-        if (inRoles) {
-          if (/^\S/.test(line)) {
-            inRoles = false;
-            continue;
-          }
-          const m = /^\s+([A-Za-z0-9_-]+)\s*:\s*["']?([^\s"']+)["']?/.exec(line);
-          if (!m) continue;
-          const role = m[1]!;
-          const { id, effort } = splitModelAndEffort(m[2]!);
-          if (!id) continue;
-          const provider = id.includes("/") ? id.split("/")[0] : "omp";
-          if (role === "default" && !defaultModel) {
-            defaultModel = id;
-            if (!defaultThinking && effort) defaultThinking = effort;
-          }
-          models.push({ id, label: id, provider, source: "recent" });
-        }
-      }
+      const parsed = parseOmpConfigYmlRaw(readFileSync(ymlPath, "utf8"));
+      modelRoles = parsed.modelRoles;
+      defaultModel = parsed.defaultModel;
+      defaultThinking = parsed.defaultThinking;
+      models.push(...parsed.models);
     } catch {
       /* ignore invalid yml */
     }
@@ -559,7 +748,7 @@ export async function readOmpLocalConfig(homeDir = homedir()): Promise<{
     }
   }
 
-  return { models, defaultModel, defaultThinking };
+  return { models, modelRoles, defaultModel, defaultThinking };
 }
 
 /** Reads only non-secret model ID and default thinking-level strings from local harness settings files. */
@@ -739,6 +928,7 @@ export interface ModelsUnifloLike {
 
 export function clearModelsCacheForTest(): void {
   cliCatalogCache.clear();
+  ompRefreshInflight = null;
 }
 
 interface ParsedModelSpeedMeta {
@@ -1027,10 +1217,12 @@ export async function getAgentModels(
     uniflo?: ModelsUnifloLike;
     unifloReady?: boolean;
     readCatalog?: () => Promise<AgentModelOption[]>;
+    refreshOmpCatalog?: () => Promise<AgentModelOption[]>;
     homeDir?: string;
     currentModelOverride?: string;
     currentThinkingOverride?: string;
     sessionSourcePath?: string;
+    hasReasoningEvents?: boolean;
   } = {},
 ): Promise<AgentModelsResult> {
   const canSwitch = !agent.isShell && (agent.source === "hc" || agent.source === "herdr");
@@ -1052,13 +1244,39 @@ export async function getAgentModels(
         ? uniflo.sessionSourcePath(agent.sessionKey).catch(() => undefined)
         : Promise.resolve(undefined);
 
-  const [harnessRecent, allRecent, catalog, ompLocal, ymlCatalog, resolvedSourcePath] = await Promise.all([
+  // Read local OMP config/models/agent.db first (<10ms) so configured OMP hosts never block 15-30s on CLI catalog.
+  const [ompLocal, ymlCatalog] =
+    hNorm === "omp"
+      ? await Promise.all([readOmpLocalConfig(opts.homeDir), Promise.resolve(readOmpModelsYml(opts.homeDir))])
+      : [{ models: [], modelRoles: {} as Record<string, string> }, [] as AgentModelOption[]];
+
+  const loadOmpCatalogFast = async (): Promise<AgentModelOption[]> => {
+    const cached = cliCatalogCache.get("omp");
+    const hasLocalModels = ymlCatalog.length > 0 || ompLocal.models.length > 0;
+    const triggerRefresh = async (): Promise<AgentModelOption[]> => {
+      if (!opts.refreshOmpCatalog) return refreshOmpCatalogBackground();
+      const loaded = await opts.refreshOmpCatalog();
+      if (loaded.length > 0) cliCatalogCache.set("omp", { at: Date.now(), models: loaded });
+      return loaded;
+    };
+    if (hasLocalModels) {
+      if (!cached || Date.now() - cached.at >= CATALOG_CACHE_MS) {
+        void triggerRefresh().catch(() => []);
+      }
+      return cached?.models ?? [];
+    }
+    if (cached && Date.now() - cached.at < CATALOG_CACHE_MS) return cached.models;
+    const loaded = await triggerRefresh().catch(() => []);
+    return loaded.length ? loaded : (cached?.models ?? []);
+  };
+
+  const [harnessRecent, allRecent, catalog, resolvedSourcePath] = await Promise.all([
     uniflo && hQuery ? uniflo.recentModels(hQuery).catch(() => []) : Promise.resolve([]),
     uniflo ? uniflo.recentModels().catch(() => []) : Promise.resolve([]),
     opts.readCatalog
       ? opts.readCatalog().catch(() => [])
       : hNorm === "omp"
-        ? getOmpCatalog()
+        ? loadOmpCatalogFast()
         : hNorm === "pi"
           ? getPiCatalog()
           : hNorm === "antigravity"
@@ -1066,8 +1284,6 @@ export async function getAgentModels(
             : hNorm === "opencode"
               ? getOpencodeCatalog()
               : Promise.resolve([]),
-    hNorm === "omp" ? readOmpLocalConfig(opts.homeDir) : Promise.resolve<{ models: AgentModelOption[]; defaultModel?: string; defaultThinking?: string }>({ models: [] }),
-    hNorm === "omp" ? Promise.resolve(readOmpModelsYml(opts.homeDir)) : Promise.resolve([]),
     sessionSourcePromise,
   ]);
 
@@ -1094,9 +1310,15 @@ export async function getAgentModels(
       rawModel = agentM;
     }
   }
+  if (hNorm === "omp" && rawModel.startsWith("@")) {
+    const roleTarget = ompLocal.modelRoles[rawModel.slice(1).toLowerCase()];
+    if (roleTarget) rawModel = roleTarget;
+  }
   const parsedCurrent = rawModel ? splitModelAndEffort(rawModel) : { id: "", effort: undefined };
   const currentModel = parsedCurrent.id || (hNorm === "omp" ? ompLocal.defaultModel : undefined) || undefined;
-  const inferred = inferAgentModelAndThinking(agent.harness, currentModel);
+  const inferred = inferAgentModelAndThinking(agent.harness, currentModel, {
+    hasReasoningEvents: opts.hasReasoningEvents,
+  });
 
   let currentThinking =
     opts.currentThinkingOverride?.trim().toLowerCase() ||
@@ -1204,12 +1426,15 @@ export async function getAgentModels(
 
   const currentOpt = merged[0]?.source === "current" ? merged[0] : undefined;
   const isNonReasoning =
-    currentOpt?.reasoning === false ||
-    (currentOpt?.reasoning === undefined && inferred.thinkingLevels !== undefined && inferred.thinkingLevels.length === 0);
+    !opts.hasReasoningEvents &&
+    (currentOpt?.reasoning === false ||
+      (currentOpt?.reasoning === undefined && inferred.thinkingLevels !== undefined && inferred.thinkingLevels.length === 0));
 
   const defaultThinkingLevels = HARNESS_DEFAULT_THINKING_LEVELS[hNorm]
     ? [...HARNESS_DEFAULT_THINKING_LEVELS[hNorm]]
-    : undefined;
+    : opts.hasReasoningEvents
+      ? ["low", "medium", "high"]
+      : undefined;
   const thinkingLevels = isNonReasoning
     ? undefined
     : currentOpt?.thinkingLevels?.length
@@ -1225,6 +1450,7 @@ export async function getAgentModels(
     ...(thinkingLevels?.length ? { thinkingLevels, canSwitchThinking: canSwitch, thinkingLabel: "思考等级" } : { canSwitchThinking: false }),
     canSwitch,
     ...(reason ? { reason } : {}),
+    ...(hNorm === "omp" && Object.keys(ompLocal.modelRoles).length > 0 ? { modelRoles: ompLocal.modelRoles } : {}),
     models: merged,
   };
 }
@@ -1279,21 +1505,38 @@ export interface SwitchTransport {
   homeDir?: string;
 }
 
-/** Switches an active agent's model and/or thinking effort across all supported harnesses. */
+/** Switches an active agent's model, thinking effort, or OMP role slot across all supported harnesses. */
 export async function setAgentModelAndThinking(
   agent: Agent,
-  opts: { modelId?: string; thinkingLevel?: string },
+  opts: { modelId?: string; thinkingLevel?: string; roleSlot?: OmpModelRole },
   transport: SwitchTransport,
-): Promise<{ currentModel?: string; currentThinking?: string; note?: string }> {
+): Promise<{ currentModel?: string; currentThinking?: string; modelRoles?: Record<string, string>; note?: string }> {
   const modelId = opts.modelId?.trim() || undefined;
   const thinkingLevel = opts.thinkingLevel?.trim().toLowerCase() || undefined;
-  if (!modelId && !thinkingLevel) throw new Error("需要指定模型或思考等级");
+  const roleSlot = opts.roleSlot;
+  if (!modelId && !thinkingLevel && !roleSlot) throw new Error("需要指定模型或思考等级");
   if (agent.isShell || (agent.source !== "hc" && agent.source !== "herdr")) {
     throw new Error("当前会话不支持切换模型或思考等级");
   }
 
   const hNorm = normHarnessKey(agent.harness);
   const home = transport.homeDir ?? homedir();
+
+  if (roleSlot) {
+    if (hNorm !== "omp") {
+      throw new Error("仅 OMP 会话支持角色模型配置");
+    }
+    if (!modelId) {
+      throw new Error("设置角色模型需要指定模型 ID");
+    }
+    const selector = thinkingLevel ? `${stripModelEffortSuffix(modelId)}:${thinkingLevel}` : modelId;
+    const modelRoles = updateOmpRoleModel(home, roleSlot, selector);
+    return {
+      modelRoles,
+      note: `已更新 OMP 角色 ${roleSlot} -> ${selector}`,
+    };
+  }
+
   const plan = buildHarnessSwitchCommands(agent.harness, { modelId, thinkingLevel });
 
   const sendLine = async (line: string) => {
@@ -1431,8 +1674,20 @@ export async function setAgentModelAndThinking(
     await sendKeys(chord);
   }
 
+  let resolvedModel = modelId ? (hNorm === "omp" ? stripModelEffortSuffix(modelId) : modelId) : undefined;
+  let resolvedThinking = thinkingLevel;
+  if (hNorm === "omp" && modelId?.startsWith("@")) {
+    const ompCfg = await readOmpLocalConfig(home);
+    const roleVal = ompCfg.modelRoles[modelId.slice(1).toLowerCase()];
+    if (roleVal) {
+      const split = splitModelAndEffort(roleVal);
+      if (split.id) resolvedModel = split.id;
+      if (!resolvedThinking && split.effort) resolvedThinking = split.effort;
+    }
+  }
+
   return {
-    ...(modelId ? { currentModel: hNorm === "omp" ? stripModelEffortSuffix(modelId) : modelId } : {}),
-    ...(thinkingLevel ? { currentThinking: thinkingLevel } : {}),
+    ...(resolvedModel ? { currentModel: resolvedModel } : {}),
+    ...(resolvedThinking ? { currentThinking: resolvedThinking } : {}),
   };
 }

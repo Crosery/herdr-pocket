@@ -1277,7 +1277,7 @@ export class Host {
       const a = this.resolve(p.agent);
       const res = await setAgentModelAndThinking(
         a,
-        { modelId: p.modelId, thinkingLevel: p.thinkingLevel },
+        { modelId: p.modelId, thinkingLevel: p.thinkingLevel, roleSlot: p.roleSlot },
         { hc: this.hc, herdr: this.herdr },
       );
       const prev = this.modelOverrides.get(a.key) ?? {};

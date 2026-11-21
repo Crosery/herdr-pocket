@@ -4,7 +4,9 @@ import type { Agent, AgentModelsResult } from "@herdr-pocket/protocol";
 import {
   collectPeerModels,
   fetchAgentModelsWithFallback,
+  getInitialAgentModelsSeed,
   invalidateModelCatalogCache,
+  updateAgentRoleModel,
 } from "../src/lib/modelCatalogClient.ts";
 
 const baseAgent: Agent = {
@@ -122,4 +124,104 @@ test("fetchAgentModelsWithFallback synthesizes fallback models on remote legacy 
   assert.equal(res.currentModel, "magpie/crosery/gpt-6.2-astra-fast");
   assert.ok(res.models.some((m) => m.id === "magpie/crosery/gpt-6.2-sol-ultrafast" && m.source === "recent"));
   assert.ok(!JSON.stringify(res).includes("unknown method"));
+});
+
+test("getInitialAgentModelsSeed provides immediate synchronous models and exposes thinking on hasReasoningEvents", () => {
+  const seed = getInitialAgentModelsSeed(
+    { ...baseAgent, model: "magpie/crosery/mimo-v2.5-asr" },
+    ["magpie/crosery/gpt-6.2-sol-ultrafast"],
+    { hasReasoningEvents: true },
+  );
+  assert.equal(seed.canSwitch, true);
+  assert.equal(seed.canSwitchThinking, true);
+  assert.ok((seed.thinkingLevels?.length ?? 0) > 0);
+  assert.ok(seed.models.length >= 2);
+});
+
+test("fetchAgentModelsWithFallback races/merges local_agent_models for slow remote omp hosts and updates when remote finishes", async () => {
+  const remoteAgent: Agent = { ...baseAgent, key: "remote-1/hc:t9", deviceId: "remote-1", model: "magpie/crosery/mimo-v2.6-pro" };
+  let capturedSessionKey: string | null = "not-called";
+  let releaseRemote: ((v: AgentModelsResult) => void) | undefined;
+  const remotePromise = new Promise<AgentModelsResult>((resolve) => {
+    releaseRemote = resolve;
+  });
+
+  const localRes: AgentModelsResult = {
+    harness: "oh-my-pi",
+    currentModel: "magpie/crosery/mimo-v2.6-pro",
+    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
+    canSwitchThinking: true,
+    canSwitch: true,
+    modelRoles: { default: "local-only-should-not-leak" },
+    models: [
+      { id: "magpie/crosery/mimo-v2.6-pro", label: "MiMo V2.6 Pro", reasoning: true, source: "current" },
+      { id: "magpie/crosery/gpt-6.2-astra-fast", label: "Astra Fast", reasoning: true, source: "catalog" },
+    ],
+  };
+
+  let lateUpdate: AgentModelsResult | null = null;
+  const res = await fetchAgentModelsWithFallback(remoteAgent, [], {
+    remoteRaceMs: 25,
+    onUpdate: (u) => {
+      lateUpdate = u;
+    },
+    deps: {
+      rpcCall: () => remotePromise,
+      isTauri: () => true,
+      getLocalHostId: async () => "local-desktop",
+      invokeLocalAgentModels: async (params) => {
+        capturedSessionKey = params.sessionKey;
+        return localRes;
+      },
+    },
+  });
+
+  // Remote host must not read local desktop's sessionKey or leak local modelRoles
+  assert.equal(capturedSessionKey, null);
+  assert.equal(res.modelRoles, undefined);
+  assert.ok(res.models.some((m) => m.id === "magpie/crosery/gpt-6.2-astra-fast"));
+
+  // Late remote completion merges remote modelRoles + models cleanly via onUpdate
+  releaseRemote?.({
+    harness: "oh-my-pi",
+    currentModel: "magpie/crosery/mimo-v2.6-pro",
+    currentThinking: "xhigh",
+    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
+    canSwitchThinking: true,
+    canSwitch: true,
+    modelRoles: { default: "remote/default-model", slow: "remote/slow-model" },
+    models: [
+      { id: "magpie/crosery/mimo-v2.6-pro", label: "MiMo V2.6 Pro", reasoning: true, source: "current" },
+      { id: "remote/only-model", label: "Remote Only", reasoning: true, source: "catalog" },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(lateUpdate);
+  assert.equal((lateUpdate as AgentModelsResult).modelRoles?.slow, "remote/slow-model");
+  assert.ok((lateUpdate as AgentModelsResult).models.some((m) => m.id === "remote/only-model"));
+  assert.ok((lateUpdate as AgentModelsResult).models.some((m) => m.id === "magpie/crosery/gpt-6.2-astra-fast"));
+});
+
+test("updateAgentRoleModel forwards roleSlot to agent.setModel RPC", async () => {
+  const sent: Array<Record<string, unknown>> = [];
+  const res = await updateAgentRoleModel(baseAgent, "plan", "magpie/crosery/claude-opus-5", {
+    deps: {
+      rpcCall: async (_deviceId, params) => {
+        sent.push(params);
+        return {
+          ok: true,
+          modelRoles: { plan: "magpie/crosery/claude-opus-5" },
+        };
+      },
+    },
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.modelRoles?.plan, "magpie/crosery/claude-opus-5");
+  assert.deepEqual(sent, [
+    {
+      agent: baseAgent.key,
+      roleSlot: "plan",
+      modelId: "magpie/crosery/claude-opus-5",
+    },
+  ]);
 });

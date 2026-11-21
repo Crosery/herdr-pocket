@@ -6,6 +6,9 @@ import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  HARNESS_DEFAULT_THINKING_LEVELS,
+  OMP_MODEL_ROLES,
+  OMP_QUICK_ROLE_CHIPS,
   PUT_LIMITS,
   buildHarnessSwitchCommands,
   inferAgentModelAndThinking,
@@ -15,6 +18,7 @@ import {
   type Agent,
   type AgentModelsResult,
   type AgentUsageReport,
+  type OmpModelRole,
   type TerminalStreamParams,
 } from "@herdr-pocket/protocol";
 import { call, subscribe, type RelayError } from "../lib/relay";
@@ -715,7 +719,19 @@ function useDirectTyping(agent: Agent, onError: (message: string, unsupported: b
  * `chat`: a message box (keys behind a toggle). `terminal`: the key bar only, so the screen gets the room;
  * the keyboard button types straight into the terminal (older hosts: a one-line box).
  */
-export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: Agent; bottomInset: number; mode: "chat" | "terminal"; onOpenTerminal?: () => void }) {
+export function Composer({
+  agent,
+  bottomInset,
+  mode,
+  onOpenTerminal,
+  hasReasoningEvents,
+}: {
+  agent: Agent;
+  bottomInset: number;
+  mode: "chat" | "terminal";
+  onOpenTerminal?: () => void;
+  hasReasoningEvents?: boolean;
+}) {
   const p = usePalette();
   const qc = useQueryClient();
   const [text, setTextState] = useState(() => getMobileDraft(agent.key).text);
@@ -790,6 +806,8 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   const [modelFilter, setModelFilter] = useState("");
   const [modelOverride, setModelOverride] = useState<string | undefined>(undefined);
   const [thinkingOverride, setThinkingOverride] = useState<string | undefined>(undefined);
+  const [ompTab, setOmpTab] = useState<"session" | "roles">("session");
+  const [editingRole, setEditingRole] = useState<OmpModelRole | null>(null);
 
   useEffect(() => {
     void hydrateMobileDrafts();
@@ -809,6 +827,8 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     setModelFilter("");
     setModelOverride(undefined);
     setThinkingOverride(undefined);
+    setOmpTab("session");
+    setEditingRole(null);
     return () => {
       unsub();
     };
@@ -817,6 +837,14 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   const keys = useMemo(() => visibleTermKeys(normalizeTermKeyLayout(termKeys)), [termKeys]);
   const online = useLive((s) => s.devices[agent.deviceId]?.online ?? false);
   const allAgentsByHost = useLive((s) => s.agents);
+  const isOmp = !agent.isShell && normalizeSwitchHarness(agent.harness) === "omp";
+  const effectiveHasReasoning = useMemo(() => {
+    if (hasReasoningEvents !== undefined) return hasReasoningEvents;
+    const queries = qc.getQueriesData<{ events?: Array<{ kind?: string }> }>({
+      queryKey: ["session.events", agent.key],
+    });
+    return queries.some(([, data]) => Array.isArray(data?.events) && data.events.some((e) => e.kind === "reasoning"));
+  }, [hasReasoningEvents, qc, agent.key, modelOpen]);
   const peerModels = useMemo(() => {
     const targetHarness = normalizeSwitchHarness(agent.harness);
     const allowCross = targetHarness === "omp" || targetHarness === "pi" || targetHarness === "opencode" || targetHarness === "hermes" || targetHarness === "aider" || targetHarness === "goose";
@@ -838,25 +866,40 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     return [...same, ...other];
   }, [allAgentsByHost, agent.harness, agent.model]);
   const inferredMeta = useMemo(
-    () => (agent.isShell ? {} : inferAgentModelAndThinking(agent.harness, modelOverride || agent.model)),
-    [agent.isShell, agent.harness, modelOverride, agent.model],
+    () =>
+      agent.isShell
+        ? {}
+        : inferAgentModelAndThinking(agent.harness, modelOverride || agent.model, {
+            hasReasoningEvents: effectiveHasReasoning,
+          }),
+    [agent.isShell, agent.harness, modelOverride, agent.model, effectiveHasReasoning],
   );
   const fallbackModelData = useMemo(
-    () => synthesizeFallbackAgentModels(agent, peerModels),
-    [agent.harness, agent.model, agent.isShell, agent.source, peerModels],
+    () => synthesizeFallbackAgentModels(agent, peerModels, { hasReasoningEvents: effectiveHasReasoning }),
+    [agent.harness, agent.model, agent.isShell, agent.source, peerModels, effectiveHasReasoning],
   );
   const effectiveCurrentModel = modelOverride || modelData?.currentModel || inferredMeta.currentModel || agent.model;
+  const resolvedLookupModel =
+    isOmp && effectiveCurrentModel?.startsWith("@")
+      ? stripModelEffortSuffix(modelData?.modelRoles?.[effectiveCurrentModel.slice(1).toLowerCase()] ?? effectiveCurrentModel)
+      : effectiveCurrentModel;
   const effectiveModelOpt = useMemo(
-    () => (modelData?.models ?? []).find((m) => effectiveCurrentModel && m.id.toLowerCase() === effectiveCurrentModel.toLowerCase()),
-    [modelData?.models, effectiveCurrentModel],
+    () => (modelData?.models ?? []).find((m) => resolvedLookupModel && m.id.toLowerCase() === resolvedLookupModel.toLowerCase()),
+    [modelData?.models, resolvedLookupModel],
   );
   const effectiveThinkingLevels = useMemo(() => {
+    if (agent.isShell) return [];
     if (modelData) {
-      if (effectiveModelOpt?.reasoning === false) return [];
-      return effectiveModelOpt?.thinkingLevels?.length ? effectiveModelOpt.thinkingLevels : (modelData.thinkingLevels ?? []);
+      if (effectiveModelOpt?.reasoning === false && !effectiveHasReasoning) return [];
+      const fromData = effectiveModelOpt?.thinkingLevels?.length ? effectiveModelOpt.thinkingLevels : (modelData.thinkingLevels ?? []);
+      if (fromData.length > 0) return fromData;
+      if (effectiveHasReasoning) {
+        return inferredMeta.thinkingLevels ?? [...(HARNESS_DEFAULT_THINKING_LEVELS[normalizeSwitchHarness(agent.harness)] ?? ["low", "medium", "high"])];
+      }
+      return [];
     }
     return inferredMeta.thinkingLevels ?? [];
-  }, [modelData, effectiveModelOpt, inferredMeta.thinkingLevels]);
+  }, [agent.isShell, agent.harness, modelData, effectiveModelOpt, effectiveHasReasoning, inferredMeta.thinkingLevels]);
   const effectiveCurrentThinking =
     effectiveThinkingLevels.length === 0
       ? ""
@@ -932,38 +975,55 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
       .finally(() => setUsageLoading(false));
   }, [agent.deviceId, agent.key]);
 
-  const openModelPicker = useCallback((panelMode: "model" | "thinking" = "model") => {
-    setModelOpen(panelMode);
-    setModelFilter("");
-    setModelLoading(true);
-    setModelError(null);
-    void call(agent.deviceId, "agent.models", { agent: agent.key })
-      .then((res) => {
-        setModelError(null);
-        if (res.models.length === 0) {
-          const synth = synthesizeFallbackAgentModels(agent, peerModels);
-          setModelData({
-            ...res,
-            models: synth.models,
-            ...(res.thinkingLevels?.length ? {} : synth.thinkingLevels?.length ? { thinkingLevels: synth.thinkingLevels, canSwitchThinking: res.canSwitch, thinkingLabel: "思考等级" } : {}),
-          });
-        } else {
-          setModelData(res);
-        }
-      })
-      .catch(() => {
-        setModelError(null);
-        setModelData((cur) => cur ?? synthesizeFallbackAgentModels(agent, peerModels));
-      })
-      .finally(() => setModelLoading(false));
-  }, [agent, peerModels]);
+  const openModelPicker = useCallback(
+    (panelMode: "model" | "thinking" = "model", nextOmpTab: "session" | "roles" = "session") => {
+      setModelOpen(panelMode);
+      setOmpTab(nextOmpTab);
+      setEditingRole(null);
+      setModelFilter("");
+      setModelLoading(true);
+      setModelError(null);
+      void call(agent.deviceId, "agent.models", { agent: agent.key })
+        .then((res) => {
+          setModelError(null);
+          if (res.models.length === 0) {
+            const synth = synthesizeFallbackAgentModels(agent, peerModels, {
+              hasReasoningEvents: effectiveHasReasoning,
+            });
+            setModelData({
+              ...res,
+              models: synth.models,
+              ...(res.thinkingLevels?.length
+                ? {}
+                : synth.thinkingLevels?.length
+                  ? { thinkingLevels: synth.thinkingLevels, canSwitchThinking: res.canSwitch, thinkingLabel: "思考等级" }
+                  : {}),
+            });
+          } else {
+            setModelData(res);
+          }
+        })
+        .catch(() => {
+          setModelError(null);
+          setModelData((cur) => cur ?? synthesizeFallbackAgentModels(agent, peerModels, { hasReasoningEvents: effectiveHasReasoning }));
+        })
+        .finally(() => setModelLoading(false));
+    },
+    [agent, peerModels, effectiveHasReasoning],
+  );
 
   function applyModelOrThinking(opts: { modelId?: string; thinkingLevel?: string }) {
     const cleanModel = opts.modelId?.trim();
     const cleanThinking = opts.thinkingLevel?.trim().toLowerCase();
     if (!cleanModel && !cleanThinking) return;
     setModelOpen(false);
-    if (cleanModel) setModelOverride(stripModelEffortSuffix(cleanModel));
+    if (cleanModel) {
+      const resolvedAlias =
+        isOmp && cleanModel.startsWith("@")
+          ? modelData?.modelRoles?.[cleanModel.slice(1).toLowerCase()]
+          : undefined;
+      setModelOverride(stripModelEffortSuffix(resolvedAlias || cleanModel));
+    }
     if (cleanThinking) setThinkingOverride(cleanThinking);
 
     const desc = cleanModel ?? `思考等级 ${cleanThinking}`;
@@ -1004,6 +1064,39 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
       });
   }
 
+  function applyRoleModelChoice(slot: OmpModelRole, modelId: string) {
+    const clean = modelId.trim();
+    if (!clean) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+    setModelData((cur) => {
+      const base = cur ?? fallbackModelData;
+      return {
+        ...base,
+        modelRoles: { ...(base.modelRoles ?? {}), [slot]: clean },
+      };
+    });
+    setEditingRole(null);
+    setModelFilter("");
+    void call(agent.deviceId, "agent.setModel", {
+      agent: agent.key,
+      roleSlot: slot,
+      modelId: clean,
+    })
+      .then((res) => {
+        if (res.modelRoles) {
+          setModelData((cur) => {
+            const base = cur ?? fallbackModelData;
+            return { ...base, modelRoles: res.modelRoles };
+          });
+        }
+        setToast(res.note || `已更新 ${slot} 角色 -> ${clean}`);
+      })
+      .catch((e: unknown) => {
+        const err = e as { message?: string };
+        setToast(err?.message || `更新角色 ${slot} 失败`);
+      });
+  }
+
   function applyModelChoice(modelId: string) {
     applyModelOrThinking({ modelId });
   }
@@ -1023,7 +1116,12 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     }
     if (mode === "chat" && !pics.length && /^\/(?:model|models)$/i.test(t)) {
       setText("");
-      openModelPicker("model");
+      openModelPicker("model", isOmp ? "roles" : "session");
+      return;
+    }
+    if (mode === "chat" && !pics.length && isOmp && /^\/switch$/i.test(t)) {
+      setText("");
+      openModelPicker("model", "session");
       return;
     }
     if (mode === "chat" && !pics.length && /^\/(?:effort|thinking)$/i.test(t) && effectiveThinkingLevels.length > 0) {
@@ -1527,7 +1625,12 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                     }
                     if (/^\/(?:model|models)$/i.test(cmd.name)) {
                       setText("");
-                      openModelPicker("model");
+                      openModelPicker("model", isOmp ? "roles" : "session");
+                      return;
+                    }
+                    if (isOmp && /^\/switch$/i.test(cmd.name)) {
+                      setText("");
+                      openModelPicker("model", "session");
                       return;
                     }
                     if (/^\/(?:effort|thinking)$/i.test(cmd.name) && effectiveThinkingLevels.length > 0) {
@@ -1646,6 +1749,13 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
           );
         }
 
+        const OMP_ROLE_LABELS: Record<OmpModelRole, string> = {
+          default: "主模型",
+          smol: "轻量快速",
+          slow: "深度慢想",
+          plan: "架构规划",
+          commit: "提交摘要",
+        };
         const q = modelFilter.trim().toLowerCase();
         const filteredModels = activeModelData.models.filter(
           (m) => !q || m.id.toLowerCase().includes(q) || m.label.toLowerCase().includes(q) || (m.provider?.toLowerCase().includes(q) ?? false),
@@ -1653,9 +1763,11 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         const trimmedFilter = modelFilter.trim();
         const exactMatch = trimmedFilter ? filteredModels.some((m) => m.id.toLowerCase() === trimmedFilter.toLowerCase()) : false;
         const canCustom = Boolean(trimmedFilter && !exactMatch && activeModelData.canSwitch !== false);
+        const showRoleOverview = isOmp && ompTab === "roles" && editingRole === null;
+        const roleTargetModel = editingRole ? activeModelData.modelRoles?.[editingRole] : undefined;
         return (
           <View
-            accessibilityLabel="切换模型下拉列表"
+            accessibilityLabel={isOmp && ompTab === "roles" ? "OMP 角色模型下拉列表" : "切换模型下拉列表"}
             style={{
               marginHorizontal: space.lg,
               marginBottom: space.xs,
@@ -1663,57 +1775,193 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
               backgroundColor: p.surface,
               borderWidth: 1,
               borderColor: p.dark ? p.surface3 : "#FBE3EC",
-              maxHeight: 260,
+              maxHeight: 310,
               overflow: "hidden",
             }}
           >
-            <View
-              style={{
-                flexDirection: "row",
-                alignItems: "center",
-                paddingHorizontal: space.sm,
-                height: 36,
-                borderBottomWidth: 1,
-                borderBottomColor: p.divider,
-                backgroundColor: p.surface2,
-                gap: 6,
-              }}
-            >
-              <MaterialCommunityIcons name="magnify" size={15} color={p.faint} />
-              <RNTextInput
-                value={modelFilter}
-                onChangeText={setModelFilter}
-                placeholder="筛选或输入模型 ID…"
-                placeholderTextColor={p.faint}
-                editable={activeModelData.canSwitch !== false}
-                autoCapitalize="none"
-                autoCorrect={false}
-                returnKeyType="go"
-                onSubmitEditing={() => {
-                  if (activeModelData.canSwitch === false) return;
-                  if (filteredModels.length > 0) applyModelChoice(filteredModels[0]!.id);
-                  else if (trimmedFilter) applyModelChoice(trimmedFilter);
-                }}
+            {isOmp ? (
+              <View
                 style={{
-                  flex: 1,
-                  fontFamily: fonts.mono,
-                  fontSize: 12.5,
-                  color: p.ink,
-                  paddingVertical: 4,
+                  flexDirection: "row",
+                  alignItems: "center",
+                  paddingHorizontal: space.xs,
+                  paddingVertical: 6,
+                  borderBottomWidth: 1,
+                  borderBottomColor: p.divider,
+                  backgroundColor: p.surface2,
+                  gap: 6,
                 }}
-                accessibilityLabel="筛选或输入模型 ID"
-              />
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="关闭模型列表"
-                onPress={() => setModelOpen(false)}
-                hitSlop={8}
-                style={{ padding: 4 }}
               >
-                <MaterialCommunityIcons name="close" size={15} color={p.muted} />
-              </Pressable>
-            </View>
-            {thinkingLevels.length > 0 && activeModelData.canSwitch !== false ? (
+                <View
+                  style={{
+                    flex: 1,
+                    flexDirection: "row",
+                    backgroundColor: p.surface3,
+                    borderRadius: radius.pill,
+                    padding: 2,
+                    borderWidth: 1,
+                    borderColor: p.divider,
+                  }}
+                >
+                  <Pressable
+                    accessibilityRole="tab"
+                    accessibilityState={{ selected: ompTab === "session" }}
+                    onPress={() => {
+                      setOmpTab("session");
+                      setEditingRole(null);
+                      setModelFilter("");
+                    }}
+                    style={{
+                      flex: 1,
+                      paddingVertical: 5,
+                      paddingHorizontal: 8,
+                      borderRadius: radius.pill,
+                      alignItems: "center",
+                      backgroundColor: ompTab === "session" ? p.surface : "transparent",
+                    }}
+                  >
+                    <Text
+                      numberOfLines={1}
+                      style={{
+                        fontFamily: fonts.bodyBold,
+                        fontSize: 11.5,
+                        color: ompTab === "session" ? p.accentText : p.muted,
+                      }}
+                    >
+                      会话模型 (/switch)
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    accessibilityRole="tab"
+                    accessibilityState={{ selected: ompTab === "roles" }}
+                    onPress={() => {
+                      setOmpTab("roles");
+                      setEditingRole(null);
+                      setModelFilter("");
+                    }}
+                    style={{
+                      flex: 1,
+                      paddingVertical: 5,
+                      paddingHorizontal: 8,
+                      borderRadius: radius.pill,
+                      alignItems: "center",
+                      backgroundColor: ompTab === "roles" ? p.surface : "transparent",
+                    }}
+                  >
+                    <Text
+                      numberOfLines={1}
+                      style={{
+                        fontFamily: fonts.bodyBold,
+                        fontSize: 11.5,
+                        color: ompTab === "roles" ? p.accentText : p.muted,
+                      }}
+                    >
+                      角色模型 (/model)
+                    </Text>
+                  </Pressable>
+                </View>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="关闭模型列表"
+                  onPress={() => setModelOpen(false)}
+                  hitSlop={8}
+                  style={{ padding: 4 }}
+                >
+                  <MaterialCommunityIcons name="close" size={15} color={p.muted} />
+                </Pressable>
+              </View>
+            ) : null}
+            {isOmp && ompTab === "roles" && editingRole !== null ? (
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  paddingHorizontal: space.sm,
+                  paddingVertical: 6,
+                  borderBottomWidth: 1,
+                  borderBottomColor: p.divider,
+                  backgroundColor: p.surface,
+                  gap: 8,
+                }}
+              >
+                <Pressable
+                  onPress={() => {
+                    setEditingRole(null);
+                    setModelFilter("");
+                  }}
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 3,
+                    paddingHorizontal: 8,
+                    paddingVertical: 3,
+                    borderRadius: radius.pill,
+                    backgroundColor: p.surface2,
+                    borderWidth: 1,
+                    borderColor: p.divider,
+                  }}
+                >
+                  <MaterialCommunityIcons name="chevron-left" size={14} color={p.ink} />
+                  <Text style={{ fontSize: 11.5, fontFamily: fonts.bodySemi, color: p.ink }}>返回</Text>
+                </Pressable>
+                <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.bodyBold, fontSize: 12, color: p.accentText }}>
+                  {`设置 ${editingRole} (${OMP_ROLE_LABELS[editingRole]})`}
+                </Text>
+              </View>
+            ) : null}
+            {!showRoleOverview ? (
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  paddingHorizontal: space.sm,
+                  height: 36,
+                  borderBottomWidth: 1,
+                  borderBottomColor: p.divider,
+                  backgroundColor: p.surface2,
+                  gap: 6,
+                }}
+              >
+                <MaterialCommunityIcons name="magnify" size={15} color={p.faint} />
+                <RNTextInput
+                  value={modelFilter}
+                  onChangeText={setModelFilter}
+                  placeholder={editingRole ? `筛选或输入 ${editingRole} 角色模型 ID…` : "筛选或输入模型 ID…"}
+                  placeholderTextColor={p.faint}
+                  editable={activeModelData.canSwitch !== false}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  returnKeyType="go"
+                  onSubmitEditing={() => {
+                    if (activeModelData.canSwitch === false) return;
+                    const targetId = filteredModels.length > 0 ? filteredModels[0]!.id : trimmedFilter;
+                    if (!targetId) return;
+                    if (editingRole) applyRoleModelChoice(editingRole, targetId);
+                    else applyModelChoice(targetId);
+                  }}
+                  style={{
+                    flex: 1,
+                    fontFamily: fonts.mono,
+                    fontSize: 12.5,
+                    color: p.ink,
+                    paddingVertical: 4,
+                  }}
+                  accessibilityLabel={editingRole ? `筛选或输入 ${editingRole} 角色模型 ID` : "筛选或输入模型 ID"}
+                />
+                {!isOmp ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="关闭模型列表"
+                    onPress={() => setModelOpen(false)}
+                    hitSlop={8}
+                    style={{ padding: 4 }}
+                  >
+                    <MaterialCommunityIcons name="close" size={15} color={p.muted} />
+                  </Pressable>
+                ) : null}
+              </View>
+            ) : null}
+            {ompTab === "session" && thinkingLevels.length > 0 && activeModelData.canSwitch !== false ? (
               <ScrollView
                 horizontal
                 showsHorizontalScrollIndicator={false}
@@ -1746,6 +1994,41 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                 })}
               </ScrollView>
             ) : null}
+            {isOmp && ompTab === "session" && activeModelData.canSwitch !== false ? (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                keyboardShouldPersistTaps="always"
+                contentContainerStyle={{ paddingHorizontal: space.sm, paddingVertical: 6, gap: 6, alignItems: "center" }}
+                style={{ maxHeight: 38, borderBottomWidth: 1, borderBottomColor: p.divider, backgroundColor: p.surface }}
+              >
+                <Text style={{ fontSize: 11, fontFamily: fonts.bodyBold, color: p.faint }}>角色</Text>
+                {OMP_QUICK_ROLE_CHIPS.map((slot) => {
+                  const assigned = activeModelData.modelRoles?.[slot];
+                  const assignedClean = assigned ? stripModelEffortSuffix(assigned).toLowerCase() : "";
+                  const active = Boolean(assignedClean && resolvedLookupModel && assignedClean === resolvedLookupModel.toLowerCase());
+                  return (
+                    <Pressable
+                      key={slot}
+                      onPress={() => applyModelChoice(`@${slot}`)}
+                      style={{
+                        height: 24,
+                        paddingHorizontal: 9,
+                        borderRadius: 12,
+                        justifyContent: "center",
+                        borderWidth: 1,
+                        borderColor: active ? p.primary : p.divider,
+                        backgroundColor: active ? p.accentContainer : p.surface2,
+                      }}
+                    >
+                      <Text style={{ fontSize: 11, fontFamily: fonts.monoBold, color: active ? p.accentText : p.muted }}>
+                        {`@${slot}`}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            ) : null}
             {!activeModelData.canSwitch ? (
               <View style={{ paddingHorizontal: space.sm, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: p.divider, backgroundColor: p.surface2 }}>
                 <Text style={{ fontSize: 11.5, color: p.error }}>{activeModelData.reason || "当前会话不支持切换模型"}</Text>
@@ -1757,7 +2040,43 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
               </View>
             ) : null}
             <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="always" contentContainerStyle={{ padding: space.xs, gap: 2 }}>
-              {modelLoading && !modelData && filteredModels.length === 0 ? (
+              {showRoleOverview ? (
+                OMP_MODEL_ROLES.map((slot) => {
+                  const assigned = activeModelData.modelRoles?.[slot];
+                  return (
+                    <Pressable
+                      key={slot}
+                      disabled={activeModelData.canSwitch === false}
+                      onPress={() => {
+                        setEditingRole(slot);
+                        setModelFilter("");
+                      }}
+                      style={({ pressed }) => ({
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 8,
+                        paddingHorizontal: space.sm,
+                        paddingVertical: 8,
+                        borderRadius: radius.sm,
+                        backgroundColor: pressed ? p.surface3 : "transparent",
+                        opacity: activeModelData.canSwitch === false ? 0.5 : 1,
+                      })}
+                    >
+                      <MaterialCommunityIcons name="tune-variant" size={14} color={p.accentText} />
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 12.5, color: p.ink }}>
+                          {`${slot} (${OMP_ROLE_LABELS[slot]})`}
+                        </Text>
+                        <Text numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 11, color: assigned ? p.accentText : p.faint }}>
+                          {assigned || "未配置（点击选择）"}
+                        </Text>
+                      </View>
+                      <Text style={{ fontSize: 10.5, color: p.muted }}>分配</Text>
+                      <MaterialCommunityIcons name="chevron-right" size={14} color={p.muted} />
+                    </Pressable>
+                  );
+                })
+              ) : modelLoading && !modelData && filteredModels.length === 0 ? (
                 <View style={{ paddingVertical: 14, alignItems: "center" }}>
                   <PocketSpinner size={18} />
                 </View>
@@ -1766,7 +2085,9 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
               ) : (
                 <>
                   {filteredModels.map((m) => {
-                    const active = Boolean(currentModel && currentModel.toLowerCase() === m.id.toLowerCase());
+                    const active = editingRole
+                      ? Boolean(roleTargetModel && m.id.toLowerCase() === stripModelEffortSuffix(roleTargetModel).toLowerCase())
+                      : Boolean(resolvedLookupModel && resolvedLookupModel.toLowerCase() === m.id.toLowerCase());
                     const ctxHint = m.contextWindow && Number.isFinite(m.contextWindow)
                       ? m.contextWindow >= 1_000_000
                         ? `${(m.contextWindow / 1_000_000).toFixed(m.contextWindow % 1_000_000 === 0 ? 0 : 1)}M`
@@ -1776,7 +2097,10 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                       <Pressable
                         key={m.id}
                         disabled={activeModelData.canSwitch === false}
-                        onPress={() => applyModelChoice(m.id)}
+                        onPress={() => {
+                          if (editingRole) applyRoleModelChoice(editingRole, m.id);
+                          else applyModelChoice(m.id);
+                        }}
                         style={({ pressed }) => ({
                           flexDirection: "row",
                           alignItems: "center",
@@ -1813,7 +2137,10 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                   {canCustom ? (
                     <Pressable
                       disabled={activeModelData.canSwitch === false}
-                      onPress={() => applyModelChoice(trimmedFilter)}
+                      onPress={() => {
+                        if (editingRole) applyRoleModelChoice(editingRole, trimmedFilter);
+                        else applyModelChoice(trimmedFilter);
+                      }}
                       style={({ pressed }) => ({
                         flexDirection: "row",
                         alignItems: "center",
@@ -1826,7 +2153,7 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                     >
                       <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
                       <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.monoBold, fontSize: 12.5, color: p.accentText }}>
-                        {`切换到 ${trimmedFilter}`}
+                        {editingRole ? `设为 ${editingRole}: ${trimmedFilter}` : `切换到 ${trimmedFilter}`}
                       </Text>
                       <Text style={{ fontSize: 10.5, color: p.muted }}>自定义</Text>
                     </Pressable>
