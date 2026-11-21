@@ -1,8 +1,15 @@
 import {
   OPENAI_REALTIME_VOICES,
+  clampThinkingLevel,
+  extractModelExplicitEffort,
+  findModelOptionForModel,
+  inferModelThinkingLevels,
   normalizeSwitchHarness,
+  resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   type Agent,
+  type AgentModelOption,
+  type AgentThinkingLevel,
   type AssistantConfigChange,
   type AssistantConfigView,
   type AssistantItem,
@@ -115,6 +122,23 @@ const DEMO_AGENTS: Agent[] = [
     sessionKey: "omp:demo-5",
     updatedAt: now,
   },
+  {
+    key: "dev-mac/hc:t6",
+    deviceId: "dev-mac",
+    source: "hc",
+    localId: "t6",
+    harness: "antigravity",
+    title: "动态思考等级与模型变体",
+    where: "backend / models",
+    cwd: "~/work/demo-app",
+    status: "idle",
+    statusSince: now - 2 * min,
+    turn: 2,
+    model: "gemini-4-neon-high",
+    isShell: false,
+    sessionKey: "agy:demo-6",
+    updatedAt: now,
+  },
 ];
 
 const DEMO_EVENTS: Record<string, ConvEvent[]> = {
@@ -157,6 +181,10 @@ const DEMO_EVENTS: Record<string, ConvEvent[]> = {
     { id: "e52", session: "omp:demo-5", ts: now - 5 * min, kind: "reasoning", text: "检查 ~/.omp/agent/config.yml 中的 modelRoles 与当前会话模型思考强度。" },
     { id: "e53", session: "omp:demo-5", ts: now - 1 * min, kind: "assistant_message", text: "已读取本地模型与角色映射：`default` 使用 `demo/mimo-v2.6-pro`，支持 `/switch` 会话切换与 `/model` 角色分配。" },
   ],
+  "dev-mac/hc:t6": [
+    { id: "e61", session: "agy:demo-6", ts: now - 5 * min, kind: "user_message", text: "检查 gemini-4-neon-high、claude-opus-5-5-high、gpt-oss-120b-medium 的思考等级映射。" },
+    { id: "e62", session: "agy:demo-6", ts: now - 2 * min, kind: "assistant_message", text: "当前模型 `gemini-4-neon-high` 仅展示实际支持的 `low / medium / high / xhigh` 四档思考等级。" },
+  ],
 };
 
 const DEMO_TERMINALS: Record<string, string[]> = {
@@ -189,6 +217,11 @@ const DEMO_TERMINALS: Record<string, string[]> = {
   ],
   "dev-mac/hc:t5": [
     "\x1b[38;5;212moh-my-pi\x1b[0m · demo/mimo-v2.6-pro · xhigh",
+    "~/work/demo-app",
+    "❯ ",
+  ],
+  "dev-mac/hc:t6": [
+    "\x1b[38;5;141mantigravity\x1b[0m · gemini-4-neon-high",
     "~/work/demo-app",
     "❯ ",
   ],
@@ -293,6 +326,77 @@ const demoOmpModelRoles: Record<string, string> = {
   commit: "demo/gpt-6.2-sol-ultrafast",
 };
 const demoThinkingByAgent = new Map<string, string>();
+
+function demoModelOpt(
+  harness: string,
+  id: string,
+  label: string,
+  provider: string,
+  contextWindow: number,
+  source: "current" | "recent" | "catalog",
+  extra?: Partial<AgentModelOption>,
+): AgentModelOption {
+  const levels = extra?.thinkingLevels ? [...extra.thinkingLevels] : inferModelThinkingLevels(harness, id);
+  return {
+    id,
+    label,
+    provider,
+    contextWindow,
+    reasoning: levels.length > 0,
+    ...(levels.length > 0 ? { thinkingLevels: levels } : {}),
+    source,
+    ...extra,
+  };
+}
+
+function buildDemoModelsPool(harness: string): AgentModelOption[] {
+  const hNorm = normalizeSwitchHarness(harness);
+  if (hNorm === "omp") {
+    return [
+      demoModelOpt(harness, "demo/mimo-v2.6-pro", "MiMo V2.6 Pro", "demo", 256_000, "recent"),
+      demoModelOpt(harness, "demo/gemini-2.5-pro", "Gemini 2.5 Pro", "google", 1_048_576, "catalog"),
+      demoModelOpt(harness, "demo/gemini-1.5-pro", "Gemini 1.5 Pro", "google", 2_000_000, "catalog"),
+      demoModelOpt(harness, "demo/gpt-6.2-sol-ultrafast", "GPT-6.2 Sol Ultrafast", "demo", 400_000, "catalog"),
+      demoModelOpt(harness, "claude-opus-5-5", "Claude Opus 5.5", "anthropic", 200_000, "recent"),
+      demoModelOpt(harness, "gpt-6.2-astra", "GPT-6.2 Astra", "openai", 1_050_000, "catalog"),
+    ];
+  }
+  if (hNorm === "antigravity") {
+    return [
+      demoModelOpt(harness, "gemini-4-neon-high", "Gemini 4 Neon", "google", 1_048_576, "recent", {
+        thinkingLevels: ["low", "medium", "high", "xhigh"],
+        effortModelMap: {
+          low: "gemini-4-neon-low",
+          medium: "gemini-4-neon-medium",
+          high: "gemini-4-neon-high",
+          xhigh: "gemini-4-neon-xhigh",
+        },
+      }),
+      demoModelOpt(harness, "claude-opus-5-5-high", "Claude Opus 5.5", "anthropic", 200_000, "recent", {
+        thinkingLevels: ["low", "medium", "high"],
+        effortModelMap: {
+          low: "claude-opus-5-5-low",
+          medium: "claude-opus-5-5-medium",
+          high: "claude-opus-5-5-high",
+        },
+      }),
+      demoModelOpt(harness, "gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", "openai", 128_000, "catalog", {
+        thinkingLevels: ["medium"],
+        effortModelMap: { medium: "gpt-oss-120b-medium" },
+      }),
+      demoModelOpt(harness, "gemini-2.5-pro", "Gemini 2.5 Pro", "google", 1_048_576, "catalog"),
+      demoModelOpt(harness, "gemini-1.5-pro", "Gemini 1.5 Pro", "google", 2_000_000, "catalog"),
+    ];
+  }
+  return [
+    demoModelOpt(harness, "claude-opus-5-5", "Claude Opus 5.5", "anthropic", 200_000, "recent"),
+    demoModelOpt(harness, "claude-sonnet-5", "Claude Sonnet 5", "anthropic", 200_000, "recent"),
+    demoModelOpt(harness, "gpt-6.2-astra", "GPT-6.2 Astra", "openai", 1_050_000, "catalog"),
+    demoModelOpt(harness, "gemini-2.5-pro", "Gemini 2.5 Pro", "google", 1_048_576, "catalog"),
+    demoModelOpt(harness, "gemini-1.5-pro", "Gemini 1.5 Pro", "google", 2_000_000, "catalog"),
+    demoModelOpt(harness, "deepseek-reasoner", "DeepSeek Reasoner", "deepseek", 128_000, "catalog"),
+  ];
+}
 
 export const mockApi = {
   pair(_code: string, name: string, platform: string): PairResponse {
@@ -465,32 +569,39 @@ export const mockApi = {
     }
     if (method === "agent.models") {
       const a = DEMO_AGENTS.find((x) => x.key === params.agent);
-      const isOmp = normalizeSwitchHarness(a?.harness ?? "") === "omp";
-      const cur = a?.model ?? (isOmp ? "demo/mimo-v2.6-pro" : "claude-opus-5-5");
-      const ompLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"];
-      const pool = [
-        ...(isOmp
-          ? [
-              { id: "demo/mimo-v2.6-pro", label: "MiMo V2.6 Pro", provider: "demo", contextWindow: 256_000, reasoning: true, thinkingLevels: ompLevels, source: "current" as const },
-              { id: "demo/gpt-6.2-sol-ultrafast", label: "GPT-6.2 Sol Ultrafast", provider: "demo", contextWindow: 400_000, reasoning: true, thinkingLevels: ompLevels, source: "catalog" as const },
-            ]
-          : []),
-        { id: "claude-opus-5-5", label: "Claude Opus 5.5", provider: "anthropic", contextWindow: 200_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high", "xhigh", "max"], source: "recent" as const },
-        { id: "claude-sonnet-5", label: "Claude Sonnet 5", provider: "anthropic", contextWindow: 200_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high"], source: "recent" as const },
-        { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", provider: "openai", contextWindow: 1_050_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high", "xhigh"], source: "catalog" as const },
-        { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon High", provider: "google", contextWindow: 1_048_576, reasoning: true, source: "catalog" as const },
-        { id: "deepseek-reasoner", label: "DeepSeek Reasoner", provider: "deepseek", contextWindow: 128_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high"], source: "catalog" as const },
-      ];
-      const models = [
-        { id: cur, label: cur, contextWindow: 200_000, reasoning: true, thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high", "xhigh", "max"], source: "current" as const },
-        ...pool.filter((x) => x.id !== cur),
-      ];
+      const harness = a?.harness ?? "claude-code";
+      const hNorm = normalizeSwitchHarness(harness);
+      const isOmp = hNorm === "omp";
+      const cur = a?.model ?? (isOmp ? "demo/mimo-v2.6-pro" : hNorm === "antigravity" ? "gemini-4-neon-high" : "claude-opus-5-5");
+      const pool = buildDemoModelsPool(harness);
+      const matched = findModelOptionForModel(pool, cur, { harness, modelRoles: isOmp ? demoOmpModelRoles : undefined });
+      const curEntry: AgentModelOption = matched
+        ? { ...matched, id: matched.effortModelMap ? matched.id : cur, source: "current" }
+        : demoModelOpt(harness, cur, cur, "custom", 200_000, "current");
+      const models = [curEntry, ...pool.filter((x) => x.id !== curEntry.id)];
+      const thinkingLevels = resolveThinkingLevelsForModel(
+        {
+          harness,
+          models,
+          currentModel: cur,
+          modelRoles: isOmp ? demoOmpModelRoles : undefined,
+        },
+        cur,
+      );
+      const currentThinking =
+        thinkingLevels.length > 0
+          ? clampThinkingLevel(
+              thinkingLevels,
+              demoThinkingByAgent.get(a?.key ?? "") ?? extractModelExplicitEffort(cur) ?? (isOmp ? "xhigh" : "high"),
+              cur,
+            )
+          : undefined;
       return {
-        harness: a?.harness ?? "claude-code",
+        harness,
         currentModel: cur,
-        currentThinking: demoThinkingByAgent.get(a?.key ?? "") ?? (isOmp ? "xhigh" : "high"),
-        thinkingLevels: isOmp ? ompLevels : ["low", "medium", "high", "xhigh", "max"],
-        canSwitchThinking: !a?.isShell,
+        ...(currentThinking ? { currentThinking } : {}),
+        thinkingLevels,
+        canSwitchThinking: !a?.isShell && thinkingLevels.length > 0,
         canSwitch: !a?.isShell,
         ...(isOmp ? { modelRoles: { ...demoOmpModelRoles } } : {}),
         ...(a?.isShell ? { reason: "普通终端不支持切换模型" } : {}),
@@ -499,6 +610,7 @@ export const mockApi = {
     }
     if (method === "agent.setModel") {
       const a = DEMO_AGENTS.find((x) => x.key === params.agent);
+      const harness = a?.harness ?? "claude-code";
       const cleanModel = typeof params.modelId === "string" ? params.modelId.trim() : undefined;
       const cleanThinking = typeof params.thinkingLevel === "string" ? params.thinkingLevel.trim().toLowerCase() : undefined;
       if (typeof params.roleSlot === "string" && cleanModel) {
@@ -510,16 +622,38 @@ export const mockApi = {
           note: `已更新 OMP 角色 ${params.roleSlot} -> ${selector}`,
         };
       }
-      const resolvedModel = cleanModel?.startsWith("@")
+      const pool = buildDemoModelsPool(harness);
+      let resolvedModel = cleanModel?.startsWith("@")
         ? demoOmpModelRoles[cleanModel.slice(1).toLowerCase()] ?? cleanModel
         : cleanModel;
-      const nextBase = resolvedModel ? stripModelEffortSuffix(resolvedModel) : undefined;
-      if (a && nextBase) a.model = nextBase;
-      if (a && cleanThinking) demoThinkingByAgent.set(a.key, cleanThinking);
+      if (!resolvedModel && cleanThinking && a?.model) {
+        const matched = findModelOptionForModel(pool, a.model, { harness });
+        const mapped = matched?.effortModelMap?.[cleanThinking as AgentThinkingLevel];
+        if (mapped) resolvedModel = mapped;
+      }
+      const nextModelForInfer = resolvedModel ?? a?.model;
+      const matchedOpt = findModelOptionForModel(pool, nextModelForInfer, { harness });
+      const levels = matchedOpt?.thinkingLevels
+        ? [...matchedOpt.thinkingLevels]
+        : inferModelThinkingLevels(harness, nextModelForInfer);
+      const clampedThinking =
+        levels.length > 0
+          ? clampThinkingLevel(
+              levels,
+              cleanThinking ?? extractModelExplicitEffort(resolvedModel) ?? demoThinkingByAgent.get(a?.key ?? ""),
+              nextModelForInfer,
+            )
+          : undefined;
+      const storedModel = resolvedModel ? stripModelEffortSuffix(resolvedModel) : undefined;
+      if (a && resolvedModel) a.model = matchedOpt?.effortModelMap ? resolvedModel : storedModel ?? resolvedModel;
+      if (a) {
+        if (clampedThinking) demoThinkingByAgent.set(a.key, clampedThinking);
+        else demoThinkingByAgent.delete(a.key);
+      }
       return {
         ok: true as const,
-        ...(nextBase ? { currentModel: nextBase } : {}),
-        ...(cleanThinking ? { currentThinking: cleanThinking } : {}),
+        ...(resolvedModel ? { currentModel: resolvedModel } : {}),
+        ...(clampedThinking ? { currentThinking: clampedThinking } : {}),
       };
     }
     if (method === "agent.btw") {

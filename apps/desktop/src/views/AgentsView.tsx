@@ -1675,8 +1675,8 @@ export function AgentDetailPanel({
   );
 
   const applyThinkingSwitch = useCallback(
-    (thinkingLevel: string) => {
-      void runModelOrThinkingSwitch({ thinkingLevel });
+    (thinkingLevel: string, effortModelId?: string) => {
+      void runModelOrThinkingSwitch({ ...(effortModelId ? { modelId: effortModelId } : {}), thinkingLevel });
     },
     [runModelOrThinkingSwitch],
   );
