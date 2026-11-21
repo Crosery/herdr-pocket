@@ -1,5 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Copy, ExternalLink, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Mic, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import { Copy, ExternalLink, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Mic, PhoneCall, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
@@ -10,6 +10,7 @@ import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar, sub
 import { prettyHotkey } from "../components/VoiceInput";
 import { AgentDetailPanel, type SubagentHeadInfo } from "../views/AgentsView";
 import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../views/WorkbenchView";
+import { assistantStore, loadAssistant } from "../lib/assistant";
 import { copyToClipboard, voiceStart, voiceStop } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
 import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
@@ -21,6 +22,7 @@ import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
 import { pingRelay, rpcCall, subscribeStream } from "../lib/relay";
 import { agentSpace, agentTitle, allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
+import { hangupVoiceCall, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
 import { homeFolder, listGroup } from "./agentInfo";
 import { StatusMark } from "./ShellSidebar";
 import {
@@ -30,6 +32,7 @@ import {
   moveTabRelative,
   openAgentTab,
   openFileTab,
+  openSettingsFrame,
   openSubagentAside,
   openWebTab,
   setActiveTab,
@@ -51,6 +54,7 @@ import {
   type ShellTab,
 } from "./shellStore";
 import { comboText, shortcutText, SHORTCUTS } from "./shortcuts";
+import "../styles/btw-slash.css";
 
 const AssistantView = lazy(() => import("../views/AssistantView").then((m) => ({ default: m.AssistantView })));
 
@@ -1283,21 +1287,29 @@ function UpdateStatusSegment() {
 }
 
 export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) {
+  const toast = useToast();
   const link = liveStore.use((s) => s.link);
   const devices = liveStore.use((s) => s.devices);
   const agentsMap = liveStore.use((s) => s.agents);
   const server = settingsStore.use((s) => s.server);
   const showShells = settingsStore.use((s) => s.showShells);
   const activeTab = shellStore.use((s) => s.tabs.find((t) => t.id === s.active) ?? null);
+  const panel = shellStore.use((s) => s.panel);
   const selectedSpace = shellStore.use((s) => s.selectedSpace);
   const localHostId = useLocalHostDeviceId();
   const voice = useClientConfig().voiceInput;
+  const callStatus = voiceCallStore.use((s) => s.status);
+  const assistantVoice = assistantStore.use((s) => s.voice);
   const [voicePhase, setVoicePhase] = useState<"idle" | "listening" | "transcribing">("idle");
+  const [voiceSetupHint, setVoiceSetupHint] = useState<string | null>(null);
   useEffect(() => native.onVoiceEvent((e) => {
     if (e.state === "listening") setVoicePhase("listening");
     else if (e.state === "transcribing") setVoicePhase("transcribing");
     else setVoicePhase("idle");
   }), []);
+  useEffect(() => {
+    if (assistantVoice) setVoiceSetupHint(null);
+  }, [assistantVoice]);
   const agent = useAgent(activeTab && activeTab.kind !== "web" ? (activeTab.agentKey ?? null) : null);
 
   const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
@@ -1325,6 +1337,80 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
           ? "授权失效，点这里重新连接"
           : "已断开，点这里重连";
   const linkTone = link === "online" ? "ok" : link === "connecting" ? "warn" : "off";
+
+  const liveCallActive = callStatus === "connecting" || callStatus === "ready";
+  const dictationReady = voice.enabled && native.voiceSupported();
+  const realtimeReady = assistantVoice || isMockServer(server);
+  const voiceButtonLabel =
+    voicePhase === "listening"
+      ? "正在听… 点此完成"
+      : voicePhase === "transcribing"
+        ? "正在识别…"
+        : liveCallActive
+          ? "小羊通话中 · 点此收起或挂断"
+          : realtimeReady
+            ? "唤醒小羊语音"
+            : dictationReady
+              ? `小羊语音 · ${voice.mode === "toggle" ? "按" : "按住"} ${prettyHotkey(voice.hotkey)}`
+              : "唤醒小羊语音";
+  const voiceButtonTitle =
+    voicePhase === "listening"
+      ? "正在语音听写，点击完成识别"
+      : voicePhase === "transcribing"
+        ? "正在识别语音…"
+        : liveCallActive
+          ? "小羊实时语音通话中：点击打开小羊面板，再次点击挂断"
+          : realtimeReady
+            ? `点击一键唤醒小羊实时语音通话${dictationReady ? ` · 全局语音输入快捷键 ${prettyHotkey(voice.hotkey)}` : ""}`
+            : dictationReady
+              ? `点击打开小羊面板并启动语音听写（可在设置中配置小羊实时语音）· 全局快捷键 ${prettyHotkey(voice.hotkey)}`
+              : "点击打开小羊助理，或配置小羊实时语音模型";
+
+  const handleVoiceTrigger = async () => {
+    if (voicePhase === "listening") {
+      await voiceStop();
+      return;
+    }
+    if (voicePhase === "transcribing") return;
+    if (liveCallActive) {
+      if (panel !== "assistant") showPanel("assistant");
+      else hangupVoiceCall();
+      return;
+    }
+
+    if (!assistantStore.get().loaded && server) {
+      await loadAssistant().catch(() => {});
+    }
+    const fresh = assistantStore.get();
+    showPanel("assistant");
+
+    if (fresh.voice || isMockServer(server)) {
+      setVoiceSetupHint(null);
+      const err = await startVoiceCall();
+      if (err) toast(err, true);
+      return;
+    }
+
+    if (dictationReady) {
+      const started = await voiceStart();
+      if (started) {
+        if (!fresh.ready) {
+          toast("已开启语音听写；可在设置 → 小羊助理配置实时语音模型");
+        }
+        return;
+      }
+      toast("无法开启麦克风听写，可配置小羊实时语音或检查麦克风权限", true);
+      setVoiceSetupHint("当前未配置小羊实时语音服务，且麦克风听写未启动。点击下方按钮一键配置 SOTA 实时语音模型。");
+      return;
+    }
+
+    toast("尚未配置小羊实时语音模型，点击右下角卡片一键去配置");
+    setVoiceSetupHint(
+      fresh.ready
+        ? "中转服务器尚未开启小羊实时语音（支持 OpenAI Realtime / Qwen3-Omni / MOSS-Live / 本地 MLX）。"
+        : "尚未配置小羊文字或实时语音模型，可在「设置 → 小羊助理」选择预设并保存。",
+    );
+  };
 
   return (
     <footer className="v3-status">
@@ -1360,28 +1446,62 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
         <span className={`v3-dot ${linkTone}`} />
         <span className="truncate">{linkText}</span>
       </button>
-      {voice.enabled && native.voiceSupported() ? (
+      <div className="voice-wake-anchor">
         <button
           type="button"
           data-voice-trigger="true"
-          className={`v3-status-item v3-status-btn${voicePhase !== "idle" ? " on" : ""}`}
-          title="点击直接开始或结束语音输入"
+          className={`v3-status-item v3-status-btn${voicePhase !== "idle" || liveCallActive ? " on" : ""}`}
+          title={voiceButtonTitle}
           onMouseDown={(e) => e.preventDefault()}
-          onClick={() => {
-            if (voicePhase === "listening") void voiceStop();
-            else if (voicePhase === "idle") void voiceStart();
-          }}
+          onClick={() => void handleVoiceTrigger()}
         >
-          <Mic size={13} />
-          <span className="truncate">
-            {voicePhase === "listening"
-              ? "正在听… 点此完成"
-              : voicePhase === "transcribing"
-                ? "正在识别…"
-                : `${voice.mode === "toggle" ? "按" : "按住"} ${prettyHotkey(voice.hotkey)} 说话`}
-          </span>
+          {liveCallActive ? <PhoneCall size={13} /> : <Mic size={13} />}
+          <span className="truncate">{voiceButtonLabel}</span>
         </button>
-      ) : null}
+        {voiceSetupHint ? (
+          <div className="voice-wake-pop" role="dialog" aria-label="配置小羊语音模型">
+            <div className="voice-wake-pop-head">
+              <span className="row" style={{ gap: 6 }}>
+                <Sparkles size={14} style={{ color: "var(--accent-text)" }} />
+                <span>唤醒小羊语音助理</span>
+              </span>
+              <button
+                type="button"
+                className="btw-icon-btn"
+                aria-label="关闭语音配置提示"
+                onClick={() => setVoiceSetupHint(null)}
+              >
+                <X size={13} />
+              </button>
+            </div>
+            <div className="voice-wake-pop-desc">{voiceSetupHint}</div>
+            <div className="row wrap" style={{ gap: 6, justifyContent: "flex-end" }}>
+              {native.voiceSupported() ? (
+                <PocketButton
+                  size="sm"
+                  variant="soft"
+                  onClick={() => {
+                    setVoiceSetupHint(null);
+                    openSettingsFrame("voice");
+                  }}
+                >
+                  语音输入设置
+                </PocketButton>
+              ) : null}
+              <PocketButton
+                size="sm"
+                variant="primary"
+                onClick={() => {
+                  setVoiceSetupHint(null);
+                  openSettingsFrame("assistant");
+                }}
+              >
+                去配置小羊语音模型
+              </PocketButton>
+            </div>
+          </div>
+        ) : null}
+      </div>
       <button className="v3-status-item v3-status-btn" style={{ flex: "none" }} onClick={() => setPalette("command")} title="打开命令面板">
         <span className="v3-keys-text">{comboText(SHORTCUTS[0]!.keys)}</span>
         <span>命令</span>

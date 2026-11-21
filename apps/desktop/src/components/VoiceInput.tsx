@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ExternalLink, Keyboard, Mic, RefreshCw, Settings2, ShieldCheck } from "lucide-react";
+import { ExternalLink, Keyboard, Mic, RefreshCw, Settings2, ShieldCheck, Sparkles } from "lucide-react";
 import { configKeySpec, type TranscribeInfo } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketSelect, PocketSwitch, PocketTextarea, useToast } from "./PocketUI";
 import { PermissionGuideModal } from "./PermissionGuideModal";
@@ -10,6 +10,9 @@ import { getActiveToken, restRequest } from "../lib/relay";
 import { isMockServer } from "../lib/mock";
 import { liveStore, settingsStore } from "../lib/store";
 import { useWindowHidden } from "../lib/layout";
+import { SOTA_ASR_RECOMMENDATIONS } from "../lib/voicePresets";
+import { openSettingsFrame } from "../shell/shellStore";
+import "../styles/btw-slash.css";
 
 const PLATFORM = detectPlatform();
 const MAC = PLATFORM === "macos";
@@ -387,6 +390,38 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
           <PocketBadge tone={engine.tone}>{engine.text}</PocketBadge>
         </div>
       </div>
+
+      {!compact ? (
+        <div className="voice-sota-strip" role="region" aria-label="桌面端 SOTA 语音与识别模型推荐">
+          <div className="voice-sota-head">
+            <span className="voice-sota-title">
+              <Sparkles size={13} />
+              <span>桌面端高阶 SOTA ASR / 实时语音模型（多端同步）</span>
+            </span>
+            <PocketButton size="sm" variant="soft" onClick={() => openSettingsFrame("assistant")}>
+              配置小羊模型与语音
+            </PocketButton>
+          </div>
+          <div className="faint" style={{ lineHeight: 1.5 }}>
+            桌面端除云端高速接口外，还可对接本地 Apple Silicon MLX / LM Studio / Faster-Whisper 网关，与手机端共用同一套小羊配置：
+          </div>
+          <div className="voice-sota-grid">
+            {SOTA_ASR_RECOMMENDATIONS.map((rec) => (
+              <div key={rec.id} className="voice-sota-chip">
+                <div className="voice-sota-chip-top">
+                  <span className="voice-sota-model mono truncate" title={rec.model}>
+                    {rec.model}
+                  </span>
+                  <span className="voice-sota-badge">{rec.badge}</span>
+                </div>
+                <div className="voice-sota-note">
+                  {rec.vendor} · {rec.note}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="set-row">
         <div className="set-text">

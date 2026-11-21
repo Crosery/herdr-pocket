@@ -24,6 +24,27 @@ const WS = /^wss?:\/\/\S+$/i;
 const SPEED = { min: 0.5, max: 1.5, step: 0.1 };
 const round1 = (n: number) => Math.round(n * 10) / 10;
 
+interface VoiceModelPreset {
+  id: string;
+  label: string;
+  provider: VoiceProviderId;
+  url: string;
+  model: string;
+  defaultVoice?: string;
+}
+
+const SOTA_VOICE_PRESETS: readonly VoiceModelPreset[] = [
+  { id: "gpt-realtime", label: "OpenAI gpt-realtime", provider: "openai-realtime", url: "wss://api.openai.com/v1/realtime", model: "gpt-realtime", defaultVoice: "marin" },
+  { id: "gpt-4o-realtime", label: "gpt-4o-realtime-preview", provider: "openai-realtime", url: "wss://api.openai.com/v1/realtime", model: "gpt-4o-realtime-preview", defaultVoice: "marin" },
+  { id: "gpt-4o-mini-realtime", label: "gpt-4o-mini-realtime", provider: "openai-realtime", url: "wss://api.openai.com/v1/realtime", model: "gpt-4o-mini-realtime-preview", defaultVoice: "marin" },
+  { id: "qwen3-omni", label: "阿里 Qwen3-Omni", provider: "openai-realtime", url: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime", model: "qwen3-omni-flash-realtime" },
+  { id: "step-audio-2", label: "阶跃 step-audio-2", provider: "openai-realtime", url: "wss://api.stepfun.com/v1/realtime", model: "step-audio-2" },
+  { id: "glm-realtime", label: "智谱 glm-realtime", provider: "openai-realtime", url: "wss://open.bigmodel.cn/api/paas/v4/realtime", model: "glm-realtime" },
+  { id: "gemini-live", label: "Gemini 2.5 Native Audio", provider: "openai-realtime", url: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent", model: "gemini-2.5-flash-native-audio-preview-12-2025" },
+  { id: "moss-live", label: "MOSS-Live 1.0", provider: "moss-live", url: "wss://api.mosi.cn/v1/realtime", model: "moss-live-1.0" },
+  { id: "mlx-local", label: "桌面本地 MLX", provider: "openai-realtime", url: "ws://127.0.0.1:8000/v1/realtime", model: "mlx-omni-realtime" },
+];
+
 export default function VoiceScreen() {
   useConfigWatch("config");
   const config = useAssistantConfig((s) => s.config);
@@ -101,6 +122,15 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
             : "未录声纹"
       }`;
 
+  /** Picking a SOTA preset fills provider, endpoint and model cleanly (synced with desktop). */
+  function applyPreset(preset: VoiceModelPreset) {
+    setProvider(preset.provider);
+    setUrl(preset.url);
+    setModel(preset.model);
+    if (preset.defaultVoice) setVoice(preset.defaultVoice);
+    else if (preset.provider === "moss-live" && voiceOptions.some((x) => x.id === voice.trim())) setVoice("");
+  }
+
   /** Picking another service starts from its own defaults: a MOSS address is no use to another service. */
   function pick(next: VoiceProviderId | null) {
     if (next === provider) return;
@@ -172,6 +202,15 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
                   <Chip key={x} on={provider === x} onPress={() => pick(x)} label={VOICE_LABEL[x]} />
                 ))}
                 <Chip on={provider === null} onPress={() => pick(null)} label="关闭" icon={<MaterialCommunityIcons name="phone-off-outline" size={16} color={p.muted} />} />
+              </Chips>
+            </Field>
+
+            <Field title="SOTA 实时语音模型预设" hint="一键填入旗舰云端或桌面本地实时语音端点（与桌面端预设同步）">
+              <Chips>
+                {SOTA_VOICE_PRESETS.map((preset) => {
+                  const active = provider === preset.provider && model.trim().toLowerCase() === preset.model.toLowerCase();
+                  return <Chip key={preset.id} on={active} onPress={() => applyPreset(preset)} label={preset.label} />;
+                })}
               </Chips>
             </Field>
 

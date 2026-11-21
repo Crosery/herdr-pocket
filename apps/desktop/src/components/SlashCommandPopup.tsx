@@ -34,8 +34,8 @@ import {
 import type { SlashCommandItem } from "@herdr-pocket/protocol";
 import { SLASH_CATEGORIES, slashCommandIconKind, type SlashCategory, type SlashIconKind } from "../lib/slashCommands";
 
-function SlashKindIcon({ kind }: { kind: SlashIconKind }) {
-  const s = 12;
+export function SlashKindIcon({ kind, size = 12 }: { kind: SlashIconKind; size?: number }) {
+  const s = size;
   switch (kind) {
     case "usage":
       return <Gauge size={s} />;

@@ -15,8 +15,14 @@ import { PocketButton, PocketInput, PocketSelect, PocketSwitch, useToast } from 
 import { fetchAssistantProviderModels, saveAssistantConfig } from "../../lib/assistant";
 import { modelErrorText } from "../../lib/modelErrors";
 import { relTime } from "../../lib/store";
+import { SOTA_TEXT_PRESETS } from "../../lib/voicePresets";
 import { keyState, MAX_MODELS, PROTOCOL_LABEL, providerName, speedLine, testDraft, testModel, URL_HINTS } from "./modelTests";
 import "../../styles/models.css";
+
+const ALL_PROVIDER_PRESETS: readonly ProviderPresetItem[] = [
+  ...PROVIDER_PRESETS,
+  ...SOTA_TEXT_PRESETS.filter((p) => !PROVIDER_PRESETS.some((x) => x.id === p.id)),
+];
 
 const ID = /^[a-z][a-z0-9-]{0,31}$/;
 const HTTP = /^https?:\/\/\S+$/i;
@@ -384,7 +390,7 @@ function ProviderEditor({ cfg, current, onClose }: { cfg: AssistantConfigView; c
         <div className="mm-field">
           <div className="mm-field-title">快速选平台（也可以选自定义）</div>
           <div className="mm-chips" role="radiogroup" aria-label="平台预设">
-            {PROVIDER_PRESETS.map((item) => (
+            {ALL_PROVIDER_PRESETS.map((item) => (
               <button key={item.id} type="button" role="radio" aria-checked={presetId === item.id} className={`mm-chip${presetId === item.id ? " on" : ""}`} onClick={() => applyPreset(item)}>
                 {item.label}
               </button>
@@ -425,7 +431,7 @@ function ProviderEditor({ cfg, current, onClose }: { cfg: AssistantConfigView; c
       </div>
 
       {keyFree && !current?.key.set ? (
-        <div className="mm-field-hint">Ollama 本地默认免密钥，填写地址即可直接扫描模型。</div>
+        <div className="mm-field-hint">本地推理服务（Ollama / LM Studio / MLX）默认免密钥，填写地址即可直接扫描模型。</div>
       ) : (
         <div className="mm-field">
           <label className="mm-field-title" htmlFor={`pv-key-${id}`}>

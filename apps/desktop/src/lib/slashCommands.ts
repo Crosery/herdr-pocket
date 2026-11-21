@@ -66,6 +66,7 @@ function withUsage(items: SlashCommandItem[]): SlashCommandItem[] {
 const CORE_SESSION: SlashCommandItem[] = [
   c("/help", "查看当前 Agent 支持的斜杠命令与快捷键", "session"),
   c("/usage", "查看当前会话、上下文占用与本机额度用量", "session"),
+  c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
   c("/clear", "清空当前会话上下文，开启全新一轮", "session"),
   c("/compact", "压缩并总结较早的对话上下文以释放额度", "session", "[focus]"),
   c("/status", "查看当前会话、模型、额度与连接状态", "session"),
@@ -116,6 +117,7 @@ const CODEX_COMMANDS: SlashCommandItem[] = [
 
 const GEMINI_COMMANDS: SlashCommandItem[] = withUsage([
   c("/help", "显示所有可用 Gemini CLI 斜杠命令", "session"),
+  c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
   c("/clear", "清空终端屏幕并开启新会话", "session"),
   c("/chat", "管理、保存或恢复对话检查点", "session", "list|save|resume"),
   c("/compress", "用摘要替换历史对话以节省上下文", "session"),
@@ -201,7 +203,7 @@ const OMP_COMMANDS: SlashCommandItem[] = withUsage([
   c("/trace", "查看本次会话 Trace 轨迹", "session"),
   c("/dump", "复制转录文本并导出请求 JSON", "session"),
   c("/copy", "选取并复制对话代码块或链接", "session"),
-  c("/btw", "旁路提问而不打断当前对话", "skill"),
+  c("/btw", "旁路提问而不打断当前对话", "skill", "<question>"),
   c("/tan", "在后台独立运行支线任务 Agent", "skill", "<task>"),
   c("/cleanse", "并行调用子 Agent 检查并修复项目诊断", "code"),
   c("/omfg", "生成规则阻止重复出现的不良行为", "model"),
@@ -217,6 +219,7 @@ const OMP_COMMANDS: SlashCommandItem[] = withUsage([
 
 const PI_COMMANDS: SlashCommandItem[] = withUsage([
   c("/help", "查看 Pi 命令与快捷键", "session"),
+  c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
   c("/usage", "查看会话用量、费用与上下文占比", "session"),
   c("/stats", "查看会话指标与耗时统计", "session"),
   c("/context", "检查上下文窗口内容明细", "session"),
@@ -258,7 +261,7 @@ const DSH_COMMANDS: SlashCommandItem[] = withUsage([
   c("/tree", "浏览会话家族树（回退/分叉/接管）", "session"),
   c("/fork", "分叉当前会话为可恢复副本", "session"),
   c("/export", "导出对话为 Markdown 文件", "session"),
-  c("/btw", "不打断主线快速旁路提问", "skill"),
+  c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
   c("/plan", "进入计划模式先评审方案", "code"),
   c("/goal", "设定持续推进的目标模式", "skill", "[goal]"),
   c("/team", "开启团队协作任务看板", "skill"),
@@ -293,6 +296,7 @@ const DSH_COMMANDS: SlashCommandItem[] = withUsage([
 
 const HERMES_COMMANDS: SlashCommandItem[] = withUsage([
   c("/help", "查看 Hermes 全部可用斜杠命令", "session"),
+  c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
   c("/usage", "查看 Token 用量、上下文压力与限额恢复", "session", "[reset]"),
   c("/insights", "查看近几日用量分析与费用洞察", "session", "[days]"),
   c("/subscription", "查看当前订阅方案与额度入口", "model"),
@@ -399,7 +403,7 @@ const GROK_COMMANDS: SlashCommandItem[] = withUsage([
   c("/mcps", "查看已连接的 MCP 服务", "code"),
   c("/config-agents", "管理预设子智能体与人格角色", "skill"),
   c("/personas", "切换对话与协作人格预设", "model"),
-  c("/btw", "不中断当前任务发起旁路提问", "skill"),
+  c("/btw", "不中断当前任务发起旁路提问", "skill", "<question>"),
   c("/theme", "切换 CLI 主题皮肤", "model"),
   c("/settings", "打开完整交互设置面板", "model"),
   c("/privacy", "配置数据留存与训练隐私选项", "model"),
@@ -421,7 +425,6 @@ const CODEBUDDY_COMMANDS: SlashCommandItem[] = [
   c("/fork", "分叉当前会话继续探索", "session"),
   c("/fork-bg", "复制会话到后台持续运行，主线程保持不变", "skill"),
   c("/background", "将当前会话切到后台运行", "skill"),
-  c("/btw", "不打断当前工作快速旁路咨询", "skill"),
   c("/goal", "持续工作直到达成验收条件", "skill", "<condition>"),
   c("/tasks", "查看并管理后台运行任务", "skill"),
   c("/todos", "展示当前会话待办清单", "session"),
@@ -444,6 +447,7 @@ const CODEBUDDY_COMMANDS: SlashCommandItem[] = [
 
 const OPENCODE_KILO_COMMANDS: SlashCommandItem[] = withUsage([
   c("/help", "查看所有斜杠命令", "session"),
+  c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
   c("/usage", "查看会话消耗与本机用量统计", "session"),
   c("/clear", "重置当前对话", "session"),
   c("/compact", "总结并压缩上下文", "session"),
@@ -960,6 +964,86 @@ export function extractSlashQuery(text: string): string | null {
   if (!trimmedLeft.startsWith("/")) return null;
   if (/\s/.test(trimmedLeft)) return null;
   return trimmedLeft.slice(1).toLowerCase();
+}
+
+export const BUILTIN_SLASH: readonly SlashCommandItem[] = (() => {
+  const byName = new Map<string, SlashCommandItem>();
+  const all = [
+    ...CORE_SESSION,
+    ...CLAUDE_COMMANDS,
+    ...OMP_COMMANDS,
+    ...ANTIGRAVITY_COMMANDS,
+    ...CODEX_COMMANDS,
+    ...GEMINI_COMMANDS,
+    ...DSH_COMMANDS,
+    ...HERMES_COMMANDS,
+    ...GROK_COMMANDS,
+    ...CODEBUDDY_COMMANDS,
+    ...PI_COMMANDS,
+    ...OPENCODE_KILO_COMMANDS,
+    ...CURSOR_COMMANDS,
+    ...QODER_QWEN_COMMANDS,
+    ...CLINE_ROO_COMMANDS,
+    ...AIDER_COMMANDS,
+    ...GOOSE_COMMANDS,
+    ...AMP_COMMANDS,
+    ...COPILOT_COMMANDS,
+    ...KIRO_COMMANDS,
+    ...KIMI_COMMANDS,
+    ...MIMOCODE_MINIMAX_ZCODE_COMMANDS,
+    ...FACTORY_COMMANDS,
+    ...GENERIC_AGENT_COMMANDS,
+  ];
+  for (const item of all) {
+    const k = item.name.toLowerCase();
+    if (!byName.has(k)) byName.set(k, item);
+  }
+  return [...byName.values()];
+})();
+
+export interface LeadingSlashToken {
+  command: SlashCommandItem;
+  rawToken: string;
+  rest: string;
+}
+
+const LEADING_SLASH_RE = /^[ \t]*(\/[A-Za-z0-9][A-Za-z0-9_.:-]*)(?:\r?\n|[ \t])([\s\S]*)$/;
+
+/**
+ * Recognizes when composer text starts with `<slashCmd> ` or `<slashCmd>\n`
+ * (e.g. `/btw `, `/dev `, `/commit `, `/review `) matching `knownCommands`
+ * or `BUILTIN_SLASH` / `/skills...` fallback, returning the matched item and trailing `rest`.
+ */
+export function parseLeadingSlashToken(
+  text: string,
+  knownCommands: readonly SlashCommandItem[] = [],
+): LeadingSlashToken | null {
+  const m = LEADING_SLASH_RE.exec(text);
+  if (!m) return null;
+  const rawToken = m[1]!;
+  const rest = m[2] ?? "";
+  const lower = rawToken.toLowerCase();
+
+  const fromKnown = knownCommands.find((item) => item.name.toLowerCase() === lower);
+  if (fromKnown) return { command: fromKnown, rawToken, rest };
+
+  const fromBuiltin = BUILTIN_SLASH.find((item) => item.name.toLowerCase() === lower);
+  if (fromBuiltin) return { command: fromBuiltin, rawToken, rest };
+
+  if (/^\/skills?(?::[a-z0-9_.:-]+)?$/i.test(rawToken)) {
+    return {
+      command: {
+        name: rawToken,
+        description: "调用或管理 Agent 技能",
+        category: "skill",
+        source: "user",
+      },
+      rawToken,
+      rest,
+    };
+  }
+
+  return null;
 }
 
 export function matchSlashCommands(
