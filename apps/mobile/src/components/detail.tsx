@@ -8,6 +8,16 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { PUT_LIMITS, type Agent, type TerminalStreamParams } from "@herdr-pocket/protocol";
 import { call, subscribe, type RelayError } from "../lib/relay";
 import { addPictures, canPickImages, pickImages, type Attachment } from "../lib/attach";
+import {
+  enqueueMobilePrompt,
+  ensureMobileQueueWatcher,
+  moveMobileQueuedPromptToTop,
+  popMobileQueuedPromptForEdit,
+  removeMobileQueuedPrompt,
+  steerMobileComposerNow,
+  steerMobileQueuedPromptNow,
+  useMobileQueue,
+} from "../lib/chatQueue";
 import { onQueueEvent, sendOut } from "../lib/outbox";
 import { chunks, typingDiff } from "../lib/typing";
 import { useLive, usePending, useSettings } from "../lib/store";
@@ -29,6 +39,7 @@ import { PocketButton, PocketCheck, PocketDialog, PocketProgress, PocketSpinner,
 
 const TERM_PAD = 12;
 const READ_SIZE = 12.5;
+const EMPTY_MOBILE_QUEUE: ReturnType<typeof useMobileQueue.getState>["byAgent"][string] = [];
 
 /** Per-font-size cell metrics, measured once from the real fonts (mono cell, CJK fallback glyph). */
 function useCellMetrics() {
@@ -667,6 +678,13 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   const [sending, setSending] = useState(false);
   /** This phone's messages that wait in the agent's input box: their bubbles say "排队中" already. */
   const mineWaiting = usePending((s) => (s.byAgent[agent.key] ?? []).filter((x) => x.state === "queued" && x.waiting && !x.echo).length);
+  useEffect(() => {
+    ensureMobileQueueWatcher();
+  }, []);
+  const queued = useMobileQueue((s) => s.byAgent[agent.key] ?? EMPTY_MOBILE_QUEUE);
+  const isSteering = useMobileQueue((s) => Boolean(s.steering[agent.key]));
+  const hostHeldCount = Math.max(0, (agent.queued ?? 0) - mineWaiting);
+  const totalQueued = queued.length + hostHeldCount;
   const textScale = useSettings((x) => x.textScale);
   const [tuning, setTuning] = useState(false);
   const termKeys = useSettings((x) => x.termKeys);
@@ -703,15 +721,46 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     const sig = `${agent.key}\0${t}\0${pics.map((x) => x.id).join(",")}`;
     if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 500) return;
     lastSendRef.current = { sig, at: now };
-    // The message shows in the conversation at once, with its own state; the box is free for the next one.
     setText("");
     if (pics.length) setPictures((cur) => cur.filter((x) => !pics.includes(x)));
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+    if (mode === "chat" && agent.status === "working") {
+      enqueueMobilePrompt(agent, t, pics);
+      return;
+    }
+    // The message shows in the conversation at once, with its own state; the box is free for the next one.
     void sendOut(agent, t, pics).then((r) => {
       if (r.ok) refreshSoon();
       // Beside the terminal there is no bubble to show the failure on.
       else if (mode === "terminal") setToast(r.message);
     });
+  }
+
+  function steerFromComposer() {
+    const t = text.trim();
+    const pics = mode === "chat" ? pictures : [];
+    if ((!t && !pics.length) || !online || isSteering) return;
+    setText("");
+    if (pics.length) setPictures((cur) => cur.filter((x) => !pics.includes(x)));
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
+    void steerMobileComposerNow(agent, t, pics).then((r) => {
+      if (r.ok) refreshSoon();
+      else setToast(r.message);
+    });
+  }
+
+  async function interruptCurrentTurn() {
+    if (!online || sending) return;
+    Haptics.selectionAsync().catch(() => undefined);
+    setSending(true);
+    try {
+      await call(agent.deviceId, "terminal.interrupt", { agent: agent.key });
+      refreshSoon();
+    } catch (e) {
+      setToast((e as Error).message);
+    } finally {
+      setSending(false);
+    }
   }
 
   async function attach() {
@@ -842,7 +891,163 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         </View>
       </View>
       ) : null}
-      {agent.queued && !(mode === "chat" && mineWaiting >= agent.queued) ? (
+      {mode === "chat" && totalQueued > 0 ? (
+        <View
+          accessibilityLiveRegion="polite"
+          accessibilityLabel={`排队中，共 ${totalQueued} 条`}
+          style={{
+            marginHorizontal: space.lg,
+            marginTop: space.xs,
+            paddingHorizontal: space.md,
+            paddingVertical: space.sm,
+            borderRadius: radius.card,
+            backgroundColor: p.surface,
+            borderWidth: 1,
+            borderColor: p.dark ? p.surface3 : "#FBE3EC",
+            gap: 6,
+          }}
+        >
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <Text style={{ fontFamily: fonts.bodyBold, fontSize: 12, color: p.accentText }}>
+              {`排队中 · ${totalQueued} 条`}
+            </Text>
+            <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 11.5, color: p.faint }}>
+              {!online ? "电脑离线，上线后自动发" : agent.status === "blocked" ? "等待确认后继续" : "本轮结束后依次自动发"}
+            </Text>
+          </View>
+          <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false} style={{ maxHeight: 156 }} contentContainerStyle={{ gap: 5 }} keyboardShouldPersistTaps="always">
+            {queued.map((q, idx) => (
+              <View
+                key={q.id}
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 6,
+                  paddingHorizontal: 8,
+                  paddingVertical: 5,
+                  borderRadius: radius.sm,
+                  backgroundColor: p.surface2,
+                }}
+              >
+                <View style={{ minWidth: 20, height: 20, paddingHorizontal: 5, borderRadius: 10, backgroundColor: p.accentContainer, alignItems: "center", justifyContent: "center" }}>
+                  <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11 }}>{idx + 1}</Text>
+                </View>
+                <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, color: p.ink }}>
+                  {q.text || "（仅图片）"}
+                </Text>
+                {q.pictures.length ? (
+                  <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: radius.pill, backgroundColor: p.surface, borderWidth: 1, borderColor: p.divider }}>
+                    <Text style={{ fontSize: 11, color: p.muted }}>{`+${q.pictures.length}图`}</Text>
+                  </View>
+                ) : null}
+                <Pressable
+                  disabled={!online || isSteering}
+                  accessibilityRole="button"
+                  accessibilityLabel="立即打断当前轮并插队发送"
+                  onPress={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
+                    void steerMobileQueuedPromptNow(agent, q.id).then((r) => {
+                      if (r.ok) refreshSoon();
+                      else setToast(r.message);
+                    });
+                  }}
+                  style={({ pressed }) => ({
+                    height: 26,
+                    paddingHorizontal: 9,
+                    borderRadius: radius.pill,
+                    backgroundColor: pressed ? p.surface3 : p.accentContainer,
+                    borderWidth: 1,
+                    borderColor: p.primary,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 3,
+                    opacity: !online || isSteering ? 0.45 : 1,
+                  })}
+                >
+                  <MaterialCommunityIcons name="flash-outline" size={13} color={p.accentText} />
+                  <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>插队</Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="编辑这条排队消息"
+                  hitSlop={4}
+                  onPress={() => {
+                    if (text.trim() || pictures.length) {
+                      enqueueMobilePrompt(agent, text, pictures);
+                    }
+                    const popped = popMobileQueuedPromptForEdit(agent.key, q.id);
+                    if (!popped) return;
+                    setText(popped.text);
+                    setPictures(popped.pictures);
+                  }}
+                  style={({ pressed }) => ({ width: 26, height: 26, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}
+                >
+                  <MaterialCommunityIcons name="pencil-outline" size={14} color={p.muted} />
+                </Pressable>
+                {idx > 0 ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="移到队列最前"
+                    hitSlop={4}
+                    onPress={() => moveMobileQueuedPromptToTop(agent.key, q.id)}
+                    style={({ pressed }) => ({ width: 26, height: 26, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}
+                  >
+                    <MaterialCommunityIcons name="arrow-up" size={14} color={p.muted} />
+                  </Pressable>
+                ) : null}
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="移除这条排队消息"
+                  hitSlop={4}
+                  onPress={() => removeMobileQueuedPrompt(agent.key, q.id)}
+                  style={({ pressed }) => ({ width: 26, height: 26, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}
+                >
+                  <MaterialCommunityIcons name="close" size={14} color={p.muted} />
+                </Pressable>
+              </View>
+            ))}
+            {hostHeldCount > 0 ? (
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 6,
+                  paddingHorizontal: 8,
+                  paddingVertical: 5,
+                  borderRadius: radius.sm,
+                  backgroundColor: p.surface2,
+                }}
+              >
+                <View style={{ paddingHorizontal: 6, height: 20, borderRadius: 10, backgroundColor: p.accentContainer, alignItems: "center", justifyContent: "center" }}>
+                  <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 10.5 }}>终端</Text>
+                </View>
+                <Text numberOfLines={1} style={{ flex: 1, fontSize: 12.5, color: p.ink }}>
+                  {`终端输入区排队 · ${hostHeldCount} 条${agent.queuedText ? `：${agent.queuedText}` : ""}`}
+                </Text>
+                {agent.source === "hc" && online ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="立即注入到当前轮"
+                    onPress={() => void press("alt+m")}
+                    style={({ pressed }) => ({
+                      height: 26,
+                      paddingHorizontal: 9,
+                      borderRadius: radius.pill,
+                      backgroundColor: pressed ? p.surface3 : p.accentContainer,
+                      borderWidth: 1,
+                      borderColor: p.primary,
+                      alignItems: "center",
+                      justifyContent: "center",
+                    })}
+                  >
+                    <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>立即注入</Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            ) : null}
+          </ScrollView>
+        </View>
+      ) : mode === "terminal" && agent.queued ? (
         <View
           accessibilityLiveRegion="polite"
           accessibilityLabel={`排队中，${agent.queued} 条消息在它的输入框里，这一轮完了才会处理`}
@@ -912,7 +1117,7 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         <RNTextInput
           value={text}
           onChangeText={setText}
-          placeholder={!online ? "这台电脑离线了" : mode === "chat" ? "回它一句…" : "输入到终端，发送时带回车"}
+          placeholder={!online ? "这台电脑离线了" : mode === "chat" ? (agent.status === "working" ? "正在忙，发送会排队（点插队可立即打断）" : "回它一句…") : "输入到终端，发送时带回车"}
           placeholderTextColor={p.faint}
           editable={online}
           multiline={mode === "chat"}
@@ -939,7 +1144,75 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
             />
             <IconTile icon="image" size={42} disabled={!online || picking} onPress={attach} a11y="添加图片，和消息一起发给它" />
             <View style={{ flex: 1 }} />
-            <SendPill disabled={(!text.trim() && !pictures.length) || !online} onPress={send} />
+            {agent.status === "working" ? (
+              !text.trim() && !pictures.length ? (
+                <Pressable
+                  disabled={!online || sending}
+                  onPress={() => void interruptCurrentTurn()}
+                  accessibilityRole="button"
+                  accessibilityLabel="停止当前轮"
+                  style={({ pressed }) => ({
+                    height: 42,
+                    paddingHorizontal: 14,
+                    borderRadius: 21,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 5,
+                    backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.surface3 : p.accentContainer,
+                    borderWidth: 1,
+                    borderColor: !online ? p.divider : p.primary,
+                    opacity: sending ? 0.55 : 1,
+                  })}
+                >
+                  <MaterialCommunityIcons name="stop" size={16} color={!online ? p.faint : p.accentText} />
+                  <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.accentText }}>停止</Text>
+                </Pressable>
+              ) : (
+                <>
+                  <Pressable
+                    disabled={!online || isSteering}
+                    onPress={steerFromComposer}
+                    accessibilityRole="button"
+                    accessibilityLabel="立即打断当前轮并插队发送"
+                    style={({ pressed }) => ({
+                      height: 42,
+                      paddingHorizontal: 13,
+                      borderRadius: 21,
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 4,
+                      backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.surface3 : p.accentContainer,
+                      borderWidth: 1,
+                      borderColor: !online ? p.divider : p.primary,
+                      opacity: isSteering ? 0.55 : 1,
+                    })}
+                  >
+                    <MaterialCommunityIcons name="flash-outline" size={16} color={!online ? p.faint : p.accentText} />
+                    <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.accentText }}>插队</Text>
+                  </Pressable>
+                  <Pressable
+                    disabled={!online}
+                    onPress={send}
+                    accessibilityRole="button"
+                    accessibilityLabel="加入排队，当前轮结束后发送"
+                    style={({ pressed }) => ({
+                      height: 42,
+                      paddingHorizontal: 14,
+                      borderRadius: 21,
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 4,
+                      backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.primaryPressed : p.primary,
+                    })}
+                  >
+                    <MaterialCommunityIcons name="clock-outline" size={16} color={!online ? p.faint : p.onPrimary} />
+                    <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.onPrimary }}>排队</Text>
+                  </Pressable>
+                </>
+              )
+            ) : (
+              <SendPill disabled={(!text.trim() && !pictures.length) || !online} onPress={send} />
+            )}
           </View>
         ) : (
           <SendPill disabled={!text.trim() || !online} onPress={send} />

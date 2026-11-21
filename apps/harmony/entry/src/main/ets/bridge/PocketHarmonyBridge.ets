@@ -9,7 +9,7 @@ export class PocketHarmonyBridge {
   private static instance: PocketHarmonyBridge | null = null;
   private context: common.UIAbilityContext | null = null;
   private pref: preferences.Preferences | null = null;
-  private versionName: string = '0.2.3';
+  private versionName: string = '0.2.4';
   private topDip: number = 0;
   private bottomDip: number = 0;
   private pendingUrl: string = '';

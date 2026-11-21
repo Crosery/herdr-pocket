@@ -11,6 +11,8 @@ mod commands;
 mod config;
 mod cookies;
 mod diagnostics;
+mod fonts;
+mod local_term;
 mod logging;
 mod mainwin;
 mod net;
@@ -18,6 +20,7 @@ mod perms;
 mod redact;
 mod relaylog;
 mod resources;
+mod updater;
 mod voice;
 mod webdiag;
 
@@ -49,6 +52,8 @@ pub struct HostdLocalStatus {
     pub configured: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
     /// Whether the daemon answers on its control socket; absent where that cannot be checked (Windows).
@@ -165,7 +170,7 @@ pub(crate) fn hostd_config_dir() -> Option<PathBuf> {
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
@@ -203,7 +208,7 @@ fn is_program(path: &Path) -> bool {
 
 /// A desktop app on macOS starts with launchd's short PATH, so this also looks where
 /// installers put command-line tools (`~/.local/bin` is where herdr and herdr-pocket go).
-fn find_program(name: &str) -> bool {
+pub(crate) fn find_program_path(name: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -228,8 +233,19 @@ fn find_program(name: &str) -> bool {
         .collect();
     #[cfg(not(windows))]
     let names: Vec<String> = vec![name.to_string()];
-    dirs.iter()
-        .any(|dir| names.iter().any(|n| is_program(&dir.join(n))))
+    for dir in dirs {
+        for n in &names {
+            let candidate = dir.join(n);
+            if is_program(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn find_program(name: &str) -> bool {
+    find_program_path(name).is_some()
 }
 
 /// The daemon's control pipe on Windows, as apps/hostd/src/platform.ts `controlAddress` names
@@ -333,6 +349,7 @@ pub(crate) fn hostd_status_now() -> HostdLocalStatus {
         .map(|s| net::safe_server(&s))
         .filter(|s| !s.is_empty());
     let token = cfg.as_ref().and_then(|c| config_str(c, &["token"]));
+    let device_id = cfg.as_ref().and_then(|c| config_str(c, &["deviceId"]));
     let device_name = cfg
         .as_ref()
         .and_then(|c| config_str(c, &["name", "deviceName"]));
@@ -364,6 +381,7 @@ pub(crate) fn hostd_status_now() -> HostdLocalStatus {
         // Same rule as the daemon's loadConfig(): it needs both to log in.
         configured: server.is_some() && token.is_some(),
         server,
+        device_id,
         device_name,
         running,
         deps,
@@ -517,6 +535,7 @@ fn on_quit(handle: &tauri::AppHandle, via: &str) {
         return;
     }
     logging::info("app", "app quitting", json!({ "via": via }));
+    local_term::shutdown();
     voice::shutdown(handle);
     browser::on_exit(handle);
     relaylog::upload_blocking(handle, Duration::from_millis(1500));
@@ -585,6 +604,18 @@ pub fn run() {
             cookies::cookie_sources,
             cookies::cookie_domains,
             cookies::cookie_import,
+            local_term::local_term_attach,
+            local_term::local_term_input,
+            local_term::local_term_resize,
+            local_term::local_term_detach,
+            local_term::local_term_read_image,
+            fonts::terminal_list_fonts,
+            fonts::terminal_font_faces,
+            fonts::terminal_font_bytes,
+            commands::pick_folder,
+            updater::update_fetch_github_latest,
+            updater::update_download_and_stage,
+            updater::update_restart_and_apply,
         ])
         .build(context)
         .expect("error while building Herdr Pocket desktop application");

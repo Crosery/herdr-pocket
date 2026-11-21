@@ -3,24 +3,40 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ImageAddon } from "@xterm/addon-image";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
-import { applyRows, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
+import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { copyToClipboard } from "../lib/bridge";
-import { useClientConfig } from "../lib/config";
+import { setConfig, useClientConfig } from "../lib/config";
+import {
+  buildTerminalFontFamily,
+  ensureFontCatalog,
+  ensureLocalHostDeviceId,
+  ensureTerminalFontLoaded,
+  fontCatalogStore,
+  localHostIdStore,
+  useLocalHostDeviceId,
+  useTerminalFontCatalog,
+} from "../lib/fonts";
 import {
   KittyApcSplitter,
   KittyKeyboardState,
   encodeKittyKey,
   parseKittyGfxCommand,
   parseOsc66,
+  parsePngDimensions,
   shellQuotePath,
   type KittyGfxCommand,
 } from "../lib/kittyProtocol";
+import { native, type LocalTermCloseEvent, type LocalTermDataEvent } from "../lib/native";
 import { rpcCall, subscribeStream } from "../lib/relay";
 import { settingsStore } from "../lib/store";
+import { openSettingsFrame } from "../shell/shellStore";
 import { IS_MAC, matchShortcut } from "../shell/shortcuts";
 import { useToast } from "./PocketUI";
 import "../styles/terminal.css";
+
+export { buildTerminalFontFamily };
 
 interface KittyImageAsset {
   id: number;
@@ -80,20 +96,6 @@ const BASE_THEME = {
   brightCyan: "#96eaf4",
   brightWhite: "#ffffff",
 } as const;
-
-export function buildTerminalFontFamily(customFamily: string): string {
-  const custom = customFamily.trim();
-  const fallback =
-    'ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Monaco, "Cascadia Mono", Consolas, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", monospace';
-  if (!custom) return fallback;
-  const formatted = custom
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => (/^[A-Za-z0-9_-]+$/.test(p) || /^["'].*["']$/.test(p) ? p : JSON.stringify(p)))
-    .join(", ");
-  return formatted ? `${formatted}, ${fallback}` : fallback;
-}
 
 function decodeBase64Bytes(b64: string): Uint8Array {
   const bin = atob(b64);
@@ -178,32 +180,80 @@ export function TerminalSurface({
   const toast = useToast();
   const termCfg = useClientConfig().terminal;
   const themeChoice = settingsStore.use((s) => s.theme);
+  useLocalHostDeviceId();
+  const fontCatalog = useTerminalFontCatalog();
   const hostRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const localConnRef = useRef<string | null>(null);
+  const relayPendingRef = useRef("");
+  const relayFlushingRef = useRef(false);
   const kittyKeysRef = useRef(new KittyKeyboardState());
   const osc66Ref = useRef<Osc66Run[]>([]);
   const kittyAssetsRef = useRef<Map<number, KittyImageAsset>>(new Map());
   const kittyPlacementsRef = useRef<KittyPlacement[]>([]);
   const [dragOver, setDragOver] = useState(false);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const dragDepthRef = useRef(0);
   const activeRef = useRef(active);
   activeRef.current = active;
 
-  const fontFamily = useMemo(() => buildTerminalFontFamily(termCfg.fontFamily), [termCfg.fontFamily]);
+  const fontFamily = useMemo(() => buildTerminalFontFamily(termCfg.fontFamily, fontCatalog), [termCfg.fontFamily, fontCatalog]);
   const lineHeight = useMemo(() => Number((termCfg.lineHeight / 100).toFixed(2)), [termCfg.lineHeight]);
+  const cellSizeRef = useRef<[number, number]>([
+    Math.max(5, termCfg.fontSize * 0.6),
+    Math.max(10, termCfg.fontSize * lineHeight),
+  ]);
+  const fontSizeRef = useRef(termCfg.fontSize);
+  fontSizeRef.current = termCfg.fontSize;
+
+  const refreshCachedCellSize = useCallback((term: XTerm): [number, number] => {
+    const next = measureCellCss(hostRef.current, term);
+    cellSizeRef.current = next;
+    return next;
+  }, []);
+
+  const adjustFontSize = useCallback((action: "in" | "out" | "reset") => {
+    const spec = configKeySpec("terminal.fontSize");
+    const min = spec?.min ?? 9;
+    const max = spec?.max ?? 24;
+    const def = Number(spec?.default ?? 13);
+    const cur = fontSizeRef.current;
+    const next = action === "reset" ? def : Math.min(max, Math.max(min, cur + (action === "in" ? 1 : -1)));
+    if (next !== cur) {
+      void setConfig("terminal.fontSize", next).catch(() => {});
+    }
+  }, []);
 
   const sendInput = useCallback(
     async (data: string) => {
       if (!data) return;
-      for (let off = 0; off < data.length; off += 16_384) {
-        const chunk = data.slice(off, off + 16_384);
+      const localConnId = localConnRef.current;
+      if (localConnId) {
         try {
-          await rpcCall(agent.deviceId, "terminal.input", { agent: agent.key, data: chunk });
+          await native.localTermInput(localConnId, data);
+          return;
         } catch {
-          await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: chunk, enter: false }).catch(() => {});
+          // If local attach closed unexpectedly, clear and fall through to relay queue.
+          if (localConnRef.current === localConnId) localConnRef.current = null;
         }
+      }
+      relayPendingRef.current += data;
+      if (relayFlushingRef.current) return;
+      relayFlushingRef.current = true;
+      try {
+        while (relayPendingRef.current.length > 0) {
+          const batch = relayPendingRef.current.slice(0, 16_384);
+          relayPendingRef.current = relayPendingRef.current.slice(batch.length);
+          try {
+            await rpcCall(agent.deviceId, "terminal.input", { agent: agent.key, data: batch });
+          } catch {
+            await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: batch, enter: false }).catch(() => {});
+          }
+        }
+      } finally {
+        relayFlushingRef.current = false;
       }
     },
     [agent.deviceId, agent.key],
@@ -237,16 +287,19 @@ export function TerminalSurface({
     [agent.deviceId, agent.key, sendInput, toast],
   );
 
-  const currentDisplay = useCallback((term: XTerm): TerminalDisplay => {
-    const [cw, ch] = measureCellCss(hostRef.current, term);
-    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-    return {
-      fg: TERM_FG,
-      bg: TERM_BG,
-      cursor: TERM_CURSOR,
-      cell: [Math.max(1, Math.round(cw * dpr)), Math.max(1, Math.round(ch * dpr))],
-    };
-  }, []);
+  const currentDisplay = useCallback(
+    (_term: XTerm): TerminalDisplay => {
+      const [cw, ch] = cellSizeRef.current;
+      const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+      return {
+        fg: TERM_FG,
+        bg: TERM_BG,
+        cursor: TERM_CURSOR,
+        cell: [Math.max(1, Math.round(cw * dpr)), Math.max(1, Math.round(ch * dpr))],
+      };
+    },
+    [],
+  );
 
   const syncResize = useCallback(
     (term: XTerm) => {
@@ -254,14 +307,21 @@ export function TerminalSurface({
         return;
       }
       fitRef.current?.fit();
+      refreshCachedCellSize(term);
+      const display = currentDisplay(term);
+      const localConnId = localConnRef.current;
+      if (localConnId) {
+        void native.localTermResize(localConnId, term.cols, term.rows, display as unknown as Record<string, unknown>).catch(() => {});
+        return;
+      }
       void rpcCall(agent.deviceId, "terminal.resize", {
         agent: agent.key,
         cols: term.cols,
         rows: term.rows,
-        display: currentDisplay(term),
+        display,
       }).catch(() => {});
     },
-    [agent.deviceId, agent.key, currentDisplay],
+    [agent.deviceId, agent.key, currentDisplay, refreshCachedCellSize],
   );
 
   const paintOverlays = useCallback(() => {
@@ -270,12 +330,17 @@ export function TerminalSurface({
     const hostEl = hostRef.current;
     if (!term || !overlay || !hostEl) return;
 
+    if (kittyPlacementsRef.current.length === 0 && osc66Ref.current.length === 0) {
+      if (overlay.childElementCount > 0) overlay.replaceChildren();
+      return;
+    }
+
     const screen = hostEl.querySelector<HTMLElement>(".xterm-screen");
     if (screen && overlay.parentElement !== screen) {
       screen.appendChild(overlay);
     }
 
-    const [cellW, cellH] = measureCellCss(hostEl, term);
+    const [cellW, cellH] = cellSizeRef.current;
     const buf = term.buffer.active;
     const curAlt = buf === term.buffer.alternate;
     const topY = buf.viewportY;
@@ -327,20 +392,34 @@ export function TerminalSurface({
     overlay.replaceChildren(frag);
   }, [fontFamily]);
 
-  // Keep overlay coordinates synchronized with live font changes.
+  // Keep font faces, texture atlas, and overlay coordinates synchronized with live font changes.
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
-    term.options.fontFamily = fontFamily;
-    term.options.fontSize = termCfg.fontSize;
-    term.options.lineHeight = lineHeight;
-    term.options.fontWeight = termCfg.fontWeight as 300 | 400 | 500 | 600 | 700;
-    term.options.fontWeightBold = Math.min(900, Math.max(700, termCfg.fontWeight + 200)) as 700 | 800 | 900;
-    term.options.cursorBlink = termCfg.cursorBlink;
-    term.clearTextureAtlas();
-    syncResize(term);
-    requestAnimationFrame(paintOverlays);
-  }, [fontFamily, lineHeight, paintOverlays, syncResize, termCfg.cursorBlink, termCfg.fontSize, termCfg.fontWeight, themeChoice]);
+    let cancelled = false;
+    const apply = (familyCss: string) => {
+      if (cancelled || termRef.current !== term) return;
+      term.options.fontFamily = familyCss;
+      term.options.fontSize = termCfg.fontSize;
+      term.options.lineHeight = lineHeight;
+      term.options.fontWeight = termCfg.fontWeight as 300 | 400 | 500 | 600 | 700;
+      term.options.fontWeightBold = Math.min(900, Math.max(700, termCfg.fontWeight + 200)) as 700 | 800 | 900;
+      term.options.cursorBlink = termCfg.cursorBlink;
+      term.clearTextureAtlas();
+      term.refresh(0, Math.max(0, term.rows - 1));
+      syncResize(term);
+      requestAnimationFrame(paintOverlays);
+    };
+    apply(fontFamily);
+    void ensureTerminalFontLoaded(termCfg.fontFamily, termCfg.fontWeight >= 600).then((loaded) => {
+      if (loaded && !cancelled && termRef.current === term) {
+        apply(buildTerminalFontFamily(termCfg.fontFamily, fontCatalogStore.get()));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [fontFamily, lineHeight, paintOverlays, syncResize, termCfg.cursorBlink, termCfg.fontFamily, termCfg.fontSize, termCfg.fontWeight, themeChoice]);
 
   useEffect(() => {
     const hostEl = hostRef.current;
@@ -387,9 +466,40 @@ export function TerminalSurface({
 
     term.open(hostEl);
     fitAddon.fit();
+    refreshCachedCellSize(term);
+
+    let webglAddon: WebglAddon | null = null;
+    try {
+      const gl = new WebglAddon();
+      gl.onContextLoss(() => {
+        gl.dispose();
+        if (webglAddon === gl) webglAddon = null;
+      });
+      term.loadAddon(gl);
+      webglAddon = gl;
+    } catch {
+      // Fallback cleanly to xterm default renderer when WebGL2 is unavailable.
+    }
+
+    // Ensure OS / Herdr / Nerd fonts load asynchronously right after opening.
+    void ensureFontCatalog().then(() => ensureTerminalFontLoaded(termCfg.fontFamily, termCfg.fontWeight >= 600)).then((loaded) => {
+      if (loaded && termRef.current === term) {
+        term.options.fontFamily = buildTerminalFontFamily(termCfg.fontFamily, fontCatalogStore.get());
+        term.clearTextureAtlas();
+        term.refresh(0, Math.max(0, term.rows - 1));
+        syncResize(term);
+      }
+    });
 
     let rafOverlay = 0;
     const scheduleOverlay = () => {
+      if (
+        kittyPlacementsRef.current.length === 0 &&
+        osc66Ref.current.length === 0 &&
+        (overlayRef.current?.childElementCount ?? 0) === 0
+      ) {
+        return;
+      }
       if (rafOverlay) return;
       rafOverlay = requestAnimationFrame(() => {
         rafOverlay = 0;
@@ -399,7 +509,6 @@ export function TerminalSurface({
 
     const dispScroll = term.onScroll(scheduleOverlay);
     const dispRender = term.onRender(scheduleOverlay);
-    const dispWrite = term.onWriteParsed(scheduleOverlay);
     const dispBuf = term.buffer.onBufferChange(() => {
       if (!isAlt()) {
         osc66Ref.current = osc66Ref.current.filter((r) => !r.alt);
@@ -499,6 +608,18 @@ export function TerminalSurface({
           term.selectAll();
           return false;
         }
+        if (e.key === "=" || e.key === "+") {
+          adjustFontSize("in");
+          return false;
+        }
+        if (e.key === "-") {
+          adjustFontSize("out");
+          return false;
+        }
+        if (e.key === "0") {
+          adjustFontSize("reset");
+          return false;
+        }
         // macOS terminal line-navigation & erase matching herdr-app/defaults/keys.macos.json
         if (e.key === "ArrowLeft") {
           void sendInput("\x01");
@@ -537,11 +658,23 @@ export function TerminalSurface({
           term.clearSelection();
           return false;
         }
-        if (e.shiftKey && lower === "c" && term.hasSelection()) {
-          void copyToClipboard(term.getSelection());
+        if (e.shiftKey && lower === "c") {
+          if (term.hasSelection()) void copyToClipboard(term.getSelection());
           return false;
         }
         if (lower === "v") return true;
+        if (e.key === "=" || e.key === "+") {
+          adjustFontSize("in");
+          return false;
+        }
+        if (e.key === "-") {
+          adjustFontSize("out");
+          return false;
+        }
+        if (e.key === "0") {
+          adjustFontSize("reset");
+          return false;
+        }
       }
 
       const kFlags = kittyKeys.current(isAlt());
@@ -558,120 +691,70 @@ export function TerminalSurface({
     });
 
     // Kitty Graphics APC command state
-    type KittyAnchor = { bufferY: number; col: number; alt: boolean };
+    type KittyAnchor = { bufferY: number; col: number; alt: boolean; colReady: boolean; rowReady: boolean };
     let nextImgId = 1;
     let chunkActive: { cmd: KittyGfxCommand; parts: string[]; anchor: KittyAnchor } | null = null;
+    const kittyDimsById = new Map<number, { cols: number; rows: number }>();
 
     const captureAnchor = (): KittyAnchor => {
       const buf = term.buffer.active;
-      return { bufferY: buf.baseY + buf.cursorY, col: buf.cursorX, alt: isAlt() };
+      return { bufferY: buf.baseY + buf.cursorY, col: buf.cursorX, alt: isAlt(), colReady: true, rowReady: true };
     };
 
-    const handleKittyCommand = (raw: string) => {
-      const cmd = parseKittyGfxCommand(raw);
-      if (cmd.action === "d") {
-        const d = (cmd.deleteWhat || "a").toLowerCase();
-        if (d === "a") kittyPlacementsRef.current = [];
-        else if (d === "i" && cmd.id !== undefined) {
-          kittyPlacementsRef.current = kittyPlacementsRef.current.filter((p) => p.imageId !== cmd.id);
-        } else if (d === "c") {
-          const cy = term.buffer.active.baseY + term.buffer.active.cursorY;
-          kittyPlacementsRef.current = kittyPlacementsRef.current.filter((p) => cy < p.bufferY || cy >= p.bufferY + p.rows);
-        }
-        scheduleOverlay();
-        return;
-      }
-
-      if (cmd.action === "p" && cmd.id !== undefined) {
-        const asset = kittyAssetsRef.current.get(cmd.id);
-        if (asset) placeAsset(asset, cmd, captureAnchor());
-        return;
-      }
-
-      if (cmd.more) {
-        if (!chunkActive) chunkActive = { cmd, parts: [cmd.payload], anchor: captureAnchor() };
-        else chunkActive.parts.push(cmd.payload);
-        return;
-      }
-
-      const firstCmd = chunkActive ? chunkActive.cmd : cmd;
-      const syncAnchor = chunkActive ? chunkActive.anchor : captureAnchor();
-      const fullB64 = chunkActive ? [...chunkActive.parts, cmd.payload].join("") : cmd.payload;
-      chunkActive = null;
-
-      if (firstCmd.action === "q") {
-        if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
-          void sendInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
-        }
-        return;
-      }
-
-      if (firstCmd.medium !== "d" || !fullB64) return;
-      const imgId = firstCmd.id ?? nextImgId++;
-      let rawBytes: Uint8Array;
-      try {
-        rawBytes = decodeBase64Bytes(fullB64);
-      } catch {
-        return;
-      }
-
-      let rowsReserved = false;
-      if (firstCmd.action === "T" && firstCmd.rows && firstCmd.cursorMovement === 0 && !firstCmd.unicodePlaceholder) {
-        const linesDown = Math.max(0, firstCmd.rows - 1);
-        if (linesDown > 0) term.write(`${"\n".repeat(linesDown)}\r`);
-        rowsReserved = true;
-      }
-
-      void decodeKittyAsset(firstCmd, rawBytes, imgId).then((asset) => {
-        if (!asset || termRef.current !== term) return;
-        const prev = kittyAssetsRef.current.get(imgId);
-        if (prev) URL.revokeObjectURL(prev.url);
-        kittyAssetsRef.current.set(imgId, asset);
-        if (kittyAssetsRef.current.size > 64) {
-          const oldest = kittyAssetsRef.current.keys().next().value;
-          if (oldest !== undefined) {
-            const old = kittyAssetsRef.current.get(oldest);
-            if (old) URL.revokeObjectURL(old.url);
-            kittyAssetsRef.current.delete(oldest);
-          }
-        }
-        if (firstCmd.action === "T") placeAsset(asset, firstCmd, syncAnchor, rowsReserved);
-        if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
-          void sendInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
-        }
-      });
-    };
-
-    const placeAsset = (asset: KittyImageAsset, cmd: KittyGfxCommand, anchor?: KittyAnchor, rowsReserved = false) => {
-      const [cellW, cellH] = measureCellCss(hostRef.current, term);
-      const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-      const cols = cmd.cols ?? Math.max(1, Math.min(term.cols, Math.ceil(asset.width / Math.max(1, cellW * dpr))));
-      const rows = cmd.rows ?? Math.max(1, Math.min(term.rows, Math.ceil(asset.height / Math.max(1, cellH * dpr))));
-      const buf = term.buffer.active;
-      const bufferY = anchor?.bufferY ?? (buf.baseY + buf.cursorY);
-      const col = anchor?.col ?? buf.cursorX;
-      const alt = anchor?.alt ?? isAlt();
+    const pushPlacement = (
+      asset: KittyImageAsset,
+      cmd: KittyGfxCommand,
+      anchor: KittyAnchor,
+      cols: number,
+      rows: number,
+    ) => {
       kittyPlacementsRef.current.push({
         key: `kp-${asset.id}-${Date.now()}-${kittyPlacementsRef.current.length}`,
-        alt,
+        alt: anchor.alt,
         imageId: asset.id,
         placementId: cmd.placementId ?? 1,
-        bufferY,
-        col,
+        bufferY: anchor.bufferY,
+        col: anchor.col,
         cols,
         rows,
         zIndex: cmd.zIndex,
       });
-      if (kittyPlacementsRef.current.length > 200) kittyPlacementsRef.current.splice(0, kittyPlacementsRef.current.length - 200);
-      if (!rowsReserved && cmd.cursorMovement === 0 && !cmd.unicodePlaceholder) {
-        // Reserve vertical rows below image like native Kitty so shell prompts don't overwrite the image.
-        const linesDown = Math.max(0, rows - 1);
-        if (linesDown > 0) term.write(`${"\n".repeat(linesDown)}\r`);
+      if (kittyPlacementsRef.current.length > 200) {
+        kittyPlacementsRef.current.splice(0, kittyPlacementsRef.current.length - 200);
       }
       scheduleOverlay();
     };
 
-    // PTY Stream + graceful fallback for mock/legacy hosts
+    const resolvePlacementCells = (
+      cmd: KittyGfxCommand,
+      rawBytes?: Uint8Array,
+      asset?: KittyImageAsset,
+    ): { cols: number; rows: number; colsKnown: boolean; rowsKnown: boolean } => {
+      const [cellW, cellH] = cellSizeRef.current;
+      const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+      const cellPxW = Math.max(1, cellW * dpr);
+      const cellPxH = Math.max(1, cellH * dpr);
+      let pxW = cmd.width;
+      let pxH = cmd.height;
+      if ((!pxW || !pxH) && asset) {
+        pxW = asset.width;
+        pxH = asset.height;
+      }
+      if ((!pxW || !pxH) && rawBytes && cmd.format === 100 && !cmd.compression) {
+        const png = parsePngDimensions(rawBytes);
+        if (png) {
+          pxW = png.width;
+          pxH = png.height;
+        }
+      }
+      const colsKnown = cmd.cols !== undefined || Boolean(pxW);
+      const rowsKnown = cmd.rows !== undefined || Boolean(pxH);
+      const cols = cmd.cols ?? (pxW ? Math.max(1, Math.min(term.cols, Math.ceil(pxW / cellPxW))) : 1);
+      const rows = cmd.rows ?? (pxH ? Math.max(1, Math.min(term.rows, Math.ceil(pxH / cellPxH))) : 1);
+      return { cols, rows, colsKnown, rowsKnown };
+    };
+
+    // PTY Stream: prefer direct `hc connect` for local mac/pc hc terminals, with Relay fallback.
     let alive = true;
     let sawRaw = false;
     let fallbackLines: string[] = [];
@@ -683,9 +766,182 @@ export function TerminalSurface({
       for (const seg of segments) {
         if (seg.kind === "vt") {
           term.write(seg.data);
-        } else {
-          term.write("", () => handleKittyCommand(seg.raw));
+          continue;
         }
+
+        const cmd = parseKittyGfxCommand(seg.raw);
+        if (cmd.action === "d") {
+          term.write("", () => {
+            const d = (cmd.deleteWhat || "a").toLowerCase();
+            if (d === "a") kittyPlacementsRef.current = [];
+            else if (d === "i" && cmd.id !== undefined) {
+              kittyPlacementsRef.current = kittyPlacementsRef.current.filter((p) => p.imageId !== cmd.id);
+            } else if (d === "c") {
+              const cy = term.buffer.active.baseY + term.buffer.active.cursorY;
+              kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
+                (p) => cy < p.bufferY || cy >= p.bufferY + p.rows,
+              );
+            }
+            scheduleOverlay();
+          });
+          continue;
+        }
+
+        if (cmd.action === "p" && cmd.id !== undefined) {
+          const asset = kittyAssetsRef.current.get(cmd.id);
+          const known = kittyDimsById.get(cmd.id);
+          const resolved = asset ? resolvePlacementCells(cmd, undefined, asset) : null;
+          const cols = cmd.cols ?? known?.cols ?? resolved?.cols ?? 1;
+          const rows = cmd.rows ?? known?.rows ?? resolved?.rows ?? 1;
+          const anchor: KittyAnchor = { bufferY: 0, col: 0, alt: false, colReady: false, rowReady: false };
+          term.write("", () => {
+            const a = captureAnchor();
+            anchor.col = a.col;
+            anchor.bufferY = a.bufferY;
+            anchor.alt = a.alt;
+            anchor.colReady = true;
+            anchor.rowReady = true;
+          });
+          if (cmd.cursorMovement === 0 && !cmd.unicodePlaceholder) {
+            const linesDown = Math.max(0, rows - 1);
+            if (linesDown > 0) {
+              anchor.rowReady = false;
+              term.write("\n".repeat(linesDown));
+              term.write("", () => {
+                const buf = term.buffer.active;
+                anchor.bufferY = Math.max(0, buf.baseY + buf.cursorY - linesDown);
+                anchor.rowReady = true;
+              });
+            }
+            if (cols > 0) term.write(`\x1b[${cols}C`);
+          }
+          if (asset) {
+            term.write("", () => {
+              if (termRef.current === term) pushPlacement(asset, cmd, anchor, cols, rows);
+            });
+          }
+          continue;
+        }
+
+        if (cmd.more) {
+          if (!chunkActive) {
+            const anchor: KittyAnchor = { bufferY: 0, col: 0, alt: false, colReady: false, rowReady: true };
+            chunkActive = { cmd, parts: [cmd.payload], anchor };
+            term.write("", () => {
+              const a = captureAnchor();
+              anchor.col = a.col;
+              anchor.bufferY = a.bufferY;
+              anchor.alt = a.alt;
+              anchor.colReady = true;
+            });
+          } else {
+            chunkActive.parts.push(cmd.payload);
+          }
+          continue;
+        }
+
+        const state = chunkActive;
+        const firstCmd = state ? state.cmd : cmd;
+        const fullB64 = state ? [...state.parts, cmd.payload].join("") : cmd.payload;
+        chunkActive = null;
+
+        if (firstCmd.action === "q") {
+          if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
+            void sendInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
+          }
+          continue;
+        }
+
+        const isFileMedium = firstCmd.medium === "f" || firstCmd.medium === "t";
+        if ((firstCmd.medium !== "d" && !(isFileMedium && localConnRef.current)) || !fullB64) continue;
+        const imgId = firstCmd.id ?? nextImgId++;
+        let payloadBytes: Uint8Array;
+        try {
+          payloadBytes = decodeBase64Bytes(fullB64);
+        } catch {
+          continue;
+        }
+
+        const syncDims =
+          firstCmd.medium === "d" ? resolvePlacementCells(firstCmd, payloadBytes) : resolvePlacementCells(firstCmd);
+        kittyDimsById.set(imgId, { cols: syncDims.cols, rows: syncDims.rows });
+        const anchor: KittyAnchor = state
+          ? state.anchor
+          : { bufferY: 0, col: 0, alt: false, colReady: false, rowReady: true };
+        if (!state) {
+          term.write("", () => {
+            const a = captureAnchor();
+            anchor.col = a.col;
+            anchor.bufferY = a.bufferY;
+            anchor.alt = a.alt;
+            anchor.colReady = true;
+          });
+        }
+
+        // Reserve rows & cursor advance synchronously inside writeSegmented so subsequent
+        // cursor-up sequences (e.g. fastfetch `\x1b[28A\x1b[57C`) run after row reservation.
+        let reservedInline = false;
+        if (firstCmd.action === "T" && firstCmd.cursorMovement === 0 && !firstCmd.unicodePlaceholder && syncDims.rowsKnown) {
+          const linesDown = Math.max(0, syncDims.rows - 1);
+          if (linesDown > 0) {
+            anchor.rowReady = false;
+            term.write("\n".repeat(linesDown));
+            term.write("", () => {
+              const buf = term.buffer.active;
+              anchor.bufferY = Math.max(0, buf.baseY + buf.cursorY - linesDown);
+              anchor.rowReady = true;
+            });
+          }
+          if (syncDims.colsKnown && syncDims.cols > 0) {
+            term.write(`\x1b[${syncDims.cols}C`);
+          }
+          reservedInline = syncDims.colsKnown;
+        }
+
+        const assetPromise =
+          firstCmd.medium === "d"
+            ? decodeKittyAsset(firstCmd, payloadBytes, imgId)
+            : native.localTermReadImage(new TextDecoder("utf-8").decode(payloadBytes).trim()).then((buf) =>
+                buf ? decodeKittyAsset(firstCmd, new Uint8Array(buf), imgId) : null,
+              );
+
+        void assetPromise.then((asset) => {
+          if (!asset || termRef.current !== term) return;
+          const prev = kittyAssetsRef.current.get(imgId);
+          if (prev) URL.revokeObjectURL(prev.url);
+          kittyAssetsRef.current.set(imgId, asset);
+          if (kittyAssetsRef.current.size > 64) {
+            const oldest = kittyAssetsRef.current.keys().next().value;
+            if (oldest !== undefined) {
+              const old = kittyAssetsRef.current.get(oldest);
+              if (old) URL.revokeObjectURL(old.url);
+              kittyAssetsRef.current.delete(oldest);
+            }
+          }
+          const commit = () => {
+            if (termRef.current !== term) return;
+            const finalDims =
+              firstCmd.cols && firstCmd.rows
+                ? { cols: syncDims.cols, rows: syncDims.rows }
+                : resolvePlacementCells(firstCmd, undefined, asset);
+            kittyDimsById.set(imgId, { cols: finalDims.cols, rows: finalDims.rows });
+            if (firstCmd.action === "T" && !firstCmd.unicodePlaceholder) {
+              if (!reservedInline && firstCmd.cursorMovement === 0) {
+                if (!syncDims.rowsKnown) {
+                  const linesDown = Math.max(0, finalDims.rows - 1);
+                  if (linesDown > 0) term.write("\n".repeat(linesDown));
+                }
+                if (finalDims.cols > 0) term.write(`\x1b[${finalDims.cols}C`);
+              }
+              pushPlacement(asset, firstCmd, anchor, finalDims.cols, finalDims.rows);
+            }
+            if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
+              void sendInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
+            }
+          };
+          if (anchor.colReady && anchor.rowReady) commit();
+          else term.write("", commit);
+        });
       }
     };
 
@@ -695,46 +951,117 @@ export function TerminalSurface({
       term.write(`\x1b[2J\x1b[H${lines.join("\r\n")}`);
     };
 
-    const unsub = subscribeStream(
-      agent.deviceId,
-      "terminal",
-      {
-        agent: agent.key,
-        raw: true,
-        cols: term.cols,
-        rows: term.rows,
-        history: 2000,
-        display: currentDisplay(term),
-      },
-      (ev) => {
-        if (!alive || !ev) return;
-        if (ev.kind === "terminal_data" && typeof ev.data === "string") {
-          if (!sawRaw) {
-            sawRaw = true;
-            if (fallbackLines.length) term.reset();
+    let unsubRelay: (() => void) | null = null;
+    let seedTimer = 0;
+    let unsubLocalData: (() => void) | null = null;
+    let unsubLocalClose: (() => void) | null = null;
+    let activeLocalConnId: string | null = null;
+
+    const startRelayStream = () => {
+      if (!alive || unsubRelay) return;
+      unsubRelay = subscribeStream(
+        agent.deviceId,
+        "terminal",
+        {
+          agent: agent.key,
+          raw: true,
+          cols: term.cols,
+          rows: term.rows,
+          history: 2000,
+          display: currentDisplay(term),
+        },
+        (ev) => {
+          if (!alive || !ev) return;
+          if (ev.kind === "terminal_data" && typeof ev.data === "string") {
+            if (!sawRaw) {
+              sawRaw = true;
+              if (fallbackLines.length) term.reset();
+            }
+            try {
+              const bytes = decodeBase64Bytes(ev.data);
+              writeSegmented(textDecoder.decode(bytes, { stream: true }));
+            } catch {
+              /* ignore malformed chunk */
+            }
+          } else if (ev.kind === "terminal" && ev.screen) {
+            writeFallbackScreen(String(ev.screen.ansi || ev.screen.text || "").split("\n"));
+          } else if (ev.kind === "terminal_rows") {
+            writeFallbackScreen(applyRows(fallbackLines, ev));
           }
+        },
+      );
+      seedTimer = window.setTimeout(() => {
+        if (!alive || sawRaw) return;
+        void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 })
+          .then((res) => {
+            if (alive && !sawRaw) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
+          })
+          .catch(() => {});
+      }, 150);
+    };
+
+    if (native.available() && agent.source === "hc" && agent.localId) {
+      void (async () => {
+        const resolvedLocalId = localHostIdStore.get() ?? (await ensureLocalHostDeviceId());
+        if (!alive) return;
+        if (!resolvedLocalId || resolvedLocalId !== agent.deviceId) {
+          startRelayStream();
+          return;
+        }
+        const connId = `${agent.localId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const { listen } = await import("@tauri-apps/api/event");
+        if (!alive) return;
+        const offData = await listen<LocalTermDataEvent>("local-term://data", (e) => {
+          if (!alive || e.payload.id !== connId) return;
+          if (!sawRaw) sawRaw = true;
           try {
-            const bytes = decodeBase64Bytes(ev.data);
+            const bytes = decodeBase64Bytes(e.payload.data);
             writeSegmented(textDecoder.decode(bytes, { stream: true }));
           } catch {
             /* ignore malformed chunk */
           }
-        } else if (ev.kind === "terminal" && ev.screen) {
-          writeFallbackScreen(String(ev.screen.ansi || ev.screen.text || "").split("\n"));
-        } else if (ev.kind === "terminal_rows") {
-          writeFallbackScreen(applyRows(fallbackLines, ev));
+        });
+        const offClose = await listen<LocalTermCloseEvent>("local-term://close", (e) => {
+          if (e.payload.id !== connId) return;
+          if (localConnRef.current === connId) localConnRef.current = null;
+          if (activeLocalConnId === connId) activeLocalConnId = null;
+          offData();
+          offClose();
+          unsubLocalData = null;
+          unsubLocalClose = null;
+          if (alive) startRelayStream();
+        });
+        if (!alive) {
+          offData();
+          offClose();
+          return;
         }
-      },
-    );
-
-    const seedTimer = window.setTimeout(() => {
-      if (!alive || sawRaw) return;
-      void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 })
-        .then((res) => {
-          if (alive && !sawRaw) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
-        })
-        .catch(() => {});
-    }, 150);
+        unsubLocalData = offData;
+        unsubLocalClose = offClose;
+        activeLocalConnId = connId;
+        localConnRef.current = connId;
+        try {
+          await native.localTermAttach({
+            id: connId,
+            terminal: agent.localId,
+            cols: term.cols,
+            rows: term.rows,
+            history: 2000,
+            display: currentDisplay(term) as unknown as Record<string, unknown>,
+          });
+        } catch {
+          if (localConnRef.current === connId) localConnRef.current = null;
+          if (activeLocalConnId === connId) activeLocalConnId = null;
+          offData();
+          offClose();
+          unsubLocalData = null;
+          unsubLocalClose = null;
+          if (alive) startRelayStream();
+        }
+      })();
+    } else {
+      startRelayStream();
+    }
 
     let resizeTimer = 0;
     const ro = new ResizeObserver(() => {
@@ -757,10 +1084,16 @@ export function TerminalSurface({
       window.clearTimeout(resizeTimer);
       if (rafOverlay) cancelAnimationFrame(rafOverlay);
       ro.disconnect();
-      unsub();
+      unsubRelay?.();
+      unsubLocalData?.();
+      unsubLocalClose?.();
+      if (activeLocalConnId) {
+        if (localConnRef.current === activeLocalConnId) localConnRef.current = null;
+        void native.localTermDetach(activeLocalConnId);
+      }
+      relayPendingRef.current = "";
       dispScroll.dispose();
       dispRender.dispose();
-      dispWrite.dispose();
       dispBuf.dispose();
       dispOsc66.dispose();
       dispCsiPush.dispose();
@@ -770,6 +1103,7 @@ export function TerminalSurface({
       dispModifyOther.dispose();
       dispResetKeys.dispose();
       dispData.dispose();
+      webglAddon?.dispose();
       for (const a of assetsRefForCleanup.current.values()) URL.revokeObjectURL(a.url);
       assetsRefForCleanup.current.clear();
       kittyPlacementsRef.current = [];
@@ -781,6 +1115,27 @@ export function TerminalSurface({
     // Intentionally mounts once per agent session key; live font/display props synchronize in separate effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.deviceId, agent.key]);
+
+  // Close context menu cleanly on outside pointer click, Escape, or blur.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if ((e.target as HTMLElement | null)?.closest("[data-term-ctx-menu]")) return;
+      setCtxMenu(null);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setCtxMenu(null);
+    };
+    const onBlur = () => setCtxMenu(null);
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [ctxMenu]);
 
   // Refocus and refit when switching back into Terminal mode.
   useEffect(() => {
@@ -826,7 +1181,15 @@ export function TerminalSurface({
   return (
     <div
       className={`tp-term-wrap${dragOver ? " drop-over" : ""}`}
-      onMouseDown={() => termRef.current?.focus()}
+      onMouseDown={() => {
+        if (ctxMenu) setCtxMenu(null);
+        termRef.current?.focus();
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setCtxMenu({ x: e.clientX, y: e.clientY });
+      }}
       onPasteCapture={(e) => {
         const files = e.clipboardData?.files;
         if (files && files.length > 0) {
@@ -842,6 +1205,103 @@ export function TerminalSurface({
     >
       <div ref={hostRef} className="tp-term-host" />
       <div ref={overlayRef} className="tp-term-overlay" aria-hidden />
+      {ctxMenu ? (
+        <div
+          className="ctx-menu"
+          data-term-ctx-menu
+          role="menu"
+          style={{
+            left: Math.min(ctxMenu.x, (typeof window !== "undefined" ? window.innerWidth : 800) - 190),
+            top: Math.min(ctxMenu.y, (typeof window !== "undefined" ? window.innerHeight : 600) - 270),
+            zIndex: 2300,
+          }}
+        >
+          <button
+            type="button"
+            className="menu-item"
+            disabled={!termRef.current?.hasSelection()}
+            onClick={() => {
+              const t = termRef.current;
+              if (t?.hasSelection()) {
+                void copyToClipboard(t.getSelection());
+                t.clearSelection();
+              }
+              setCtxMenu(null);
+            }}
+          >
+            复制
+          </button>
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => {
+              setCtxMenu(null);
+              void navigator.clipboard
+                ?.readText()
+                .then((text) => {
+                  if (text) void sendInput(text);
+                })
+                .catch(() => {});
+              termRef.current?.focus();
+            }}
+          >
+            粘贴
+          </button>
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => {
+              termRef.current?.clear();
+              setCtxMenu(null);
+              termRef.current?.focus();
+            }}
+          >
+            清屏
+          </button>
+          <div className="menu-sep" />
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => {
+              adjustFontSize("in");
+              setCtxMenu(null);
+            }}
+          >
+            放大字号
+          </button>
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => {
+              adjustFontSize("out");
+              setCtxMenu(null);
+            }}
+          >
+            缩小字号
+          </button>
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => {
+              adjustFontSize("reset");
+              setCtxMenu(null);
+            }}
+          >
+            重置字号
+          </button>
+          <div className="menu-sep" />
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => {
+              setCtxMenu(null);
+              openSettingsFrame("look");
+            }}
+          >
+            切换终端字体…
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

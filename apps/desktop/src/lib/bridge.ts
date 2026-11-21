@@ -49,6 +49,7 @@ export interface HostdLocalStatus {
   /** hostd.json has a server and a device token, so this computer is logged in. */
   configured: boolean;
   server?: string;
+  deviceId?: string;
   deviceName?: string;
   /** The daemon answers on its control socket; absent where that cannot be checked. */
   running?: boolean;
@@ -360,6 +361,43 @@ export async function encodeImageFiles(files: File[], maxCount = 6, maxSide = 12
   return out;
 }
 
+export interface ReleaseNotesInfo {
+  body: string;
+  url: string;
+  publishedAt: string;
+}
+
+export interface GithubReleaseAsset {
+  name: string;
+  size: number;
+  browserDownloadUrl: string;
+  sha256?: string;
+}
+
+export interface GithubLatestRelease {
+  version: string;
+  tagName: string;
+  htmlUrl: string;
+  publishedAt: string;
+  body: string;
+  assets: GithubReleaseAsset[];
+}
+
+export interface UpdateProgressEvent {
+  phase: "downloading" | "verifying" | "staging" | "ready" | "restarting" | "error";
+  version: string;
+  downloadedBytes: number;
+  totalBytes?: number;
+  percent?: number;
+  source?: string;
+  message?: string;
+}
+
+export interface StagedUpdateResult {
+  version: string;
+  ready: boolean;
+}
+
 export interface ReleaseUpdateInfo {
   current: string;
   latest: string;
@@ -367,6 +405,11 @@ export interface ReleaseUpdateInfo {
   pageUrl: string;
   /** The installer through the source that answered (a mirror or github.com). */
   downloadUrl: string;
+  assetName: string;
+  downloadUrls: string[];
+  sha256?: string;
+  assetSize?: number;
+  notes?: ReleaseNotesInfo | null;
   region: Region;
   regionReason: RegionDecision["reason"];
   /** `github.com` or the mirror's host. */
@@ -379,7 +422,9 @@ export interface ReleaseUpdateInfo {
  * `"cn"`/`"global"` forces the region; an object passes what config.json says
  * (`update.region`, `update.mirrors`). Without one, the desktop app reads config.json itself.
  */
-export type UpdateCheckOptions = Region | { region?: Region; setting?: RegionSetting | string; mirrors?: string[] };
+export type UpdateCheckOptions =
+  | Region
+  | { region?: Region; setting?: RegionSetting | string; mirrors?: string[]; forceRace?: boolean };
 
 async function detectMacArch(): Promise<"arm64" | "x64"> {
   if (isTauri()) {
@@ -392,6 +437,13 @@ async function detectMacArch(): Promise<"arm64" | "x64"> {
     }
   }
   return typeof navigator !== "undefined" && /intel|x86_64/i.test(navigator.userAgent) ? "x64" : "arm64";
+}
+
+export function platformAssetNameHint(version: string): string {
+  const platform = detectPlatform();
+  const macArch: "arm64" | "x64" =
+    typeof navigator !== "undefined" && /intel|x86_64/i.test(navigator.userAgent) ? "x64" : "arm64";
+  return platformDownloadAsset(version, platform, macArch);
 }
 
 function platformDownloadAsset(version: string, platform: PlatformKind, macArch: "arm64" | "x64"): string {
@@ -484,7 +536,11 @@ async function fetchListing(url: string, signal: AbortSignal, timeoutMs: number)
   });
 }
 
-async function fetchSums(url: string, signal: AbortSignal, timeoutMs = SOURCE_PROBE_TIMEOUT_MS): Promise<{ version: string }> {
+async function fetchSums(
+  url: string,
+  signal: AbortSignal,
+  timeoutMs = SOURCE_PROBE_TIMEOUT_MS,
+): Promise<{ version: string; sums: Record<string, string> }> {
   // A mirror that answers with an error page is not an answer.
   const parsed = releaseFromSums(await fetchListing(url, signal, timeoutMs));
   if (!parsed) throw new Error("not a SHA256SUMS listing");
@@ -492,9 +548,12 @@ async function fetchSums(url: string, signal: AbortSignal, timeoutMs = SOURCE_PR
 }
 
 /** Every source at once; once one answers the others get the slack, then pickFastest decides. */
-async function raceSums(order: string[]): Promise<{ winner?: string; version?: string; probes: SourceProbe[] }> {
+async function raceSums(
+  order: string[],
+  pathUrl = LATEST_SUMS_URL,
+): Promise<{ winner?: string; version?: string; sums?: Record<string, string>; probes: SourceProbe[] }> {
   const probes: SourceProbe[] = [];
-  const versions = new Map<string, string>();
+  const results = new Map<string, { version: string; sums: Record<string, string> }>();
   const ctls = order.map(() => new AbortController());
   return new Promise((resolve) => {
     let done = false;
@@ -507,18 +566,19 @@ async function raceSums(order: string[]): Promise<{ winner?: string; version?: s
       ctls.forEach((c) => c.abort());
       for (const s of order) if (!probes.some((p) => p.source === s)) probes.push({ source: s, ok: false, ms: Date.now() - t0, error: "slower than the winner" });
       const winner = pickFastest(probes, order, SOURCE_PROBE_SLACK_MS);
-      resolve({ winner, version: winner === undefined ? undefined : versions.get(winner), probes });
+      const picked = winner === undefined ? undefined : results.get(winner);
+      resolve({ winner, version: picked?.version, sums: picked?.sums, probes });
     };
     if (!order.length) return finish();
     order.forEach((source, i) => {
       const ctl = ctls[i]!;
       const timer = setTimeout(() => ctl.abort(), SOURCE_PROBE_TIMEOUT_MS);
       const started = Date.now();
-      fetchSums(sourceUrl(source, LATEST_SUMS_URL), ctl.signal).then(
+      fetchSums(sourceUrl(source, pathUrl), ctl.signal).then(
         (r) => {
           clearTimeout(timer);
           if (done) return;
-          versions.set(source, r.version);
+          results.set(source, r);
           probes.push({ source, ok: true, ms: Date.now() - started });
           if (probes.length === order.length) finish();
           else slack ??= setTimeout(finish, SOURCE_PROBE_SLACK_MS);
@@ -535,24 +595,46 @@ async function raceSums(order: string[]): Promise<{ winner?: string; version?: s
   });
 }
 
+/** Fetches SHA256SUMS for an explicit release tag when the cached latest mirror was stale. */
+export async function fetchVersionSums(
+  version: string,
+  opts?: UpdateCheckOptions,
+): Promise<Record<string, string> | null> {
+  const { decision, mirrors } = await updateRegion(opts);
+  const base = sourcePrefixes(decision.region, mirrors);
+  const cached = cachedWinner(await readSourceCache(), decision.region, base);
+  const taggedUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${version.trim().replace(/^v/i, "")}/SHA256SUMS`;
+  const race = await raceSums(withWinnerFirst(base, cached), taggedUrl);
+  return race.sums ?? null;
+}
+
 /**
  * The newest release and where to download it. Region: HERDR_POCKET_MIRROR, then
  * `update.region`, then the time zone. A remembered winner (24 h, shared with the CLI and
- * daemon via sources.json) is asked first; otherwise all sources race and the winner is kept.
+ * daemon via sources.json) is asked first unless `forceRace` is set; GitHub Releases API
+ * is queried in parallel in the desktop app so release notes, sizes, digests, and fresh tags arrive fast.
  */
 export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<ReleaseUpdateInfo> {
+  const forceRace = typeof opts === "object" && opts !== null && Boolean(opts.forceRace);
+  const ghPromise: Promise<GithubLatestRelease | null> = isTauri()
+    ? tauriInvoke<GithubLatestRelease>("update_fetch_github_latest", { timeoutMs: 4500 }).catch(() => null)
+    : Promise.resolve(null);
+
   const { decision, mirrors } = await updateRegion(opts);
   const base = sourcePrefixes(decision.region, mirrors);
   const cached = cachedWinner(await readSourceCache(), decision.region, base);
   let source: string | undefined;
   let version: string | undefined;
+  let sumsMap: Record<string, string> | undefined;
   let probes: SourceProbe[] | undefined;
 
-  if (cached !== undefined) {
+  if (!forceRace && cached !== undefined) {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 8000);
+    const t = setTimeout(() => ctl.abort(), 2500);
     try {
-      version = (await fetchSums(sourceUrl(cached, LATEST_SUMS_URL), ctl.signal, 8000)).version;
+      const hit = await fetchSums(sourceUrl(cached, LATEST_SUMS_URL), ctl.signal, 2500);
+      version = hit.version;
+      sumsMap = hit.sums;
       source = cached;
     } catch (e) {
       nativeLog("info", "update", "remembered source failed, racing again", { source: sourceLabel(cached), error: (e as Error).message });
@@ -566,14 +648,29 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
     for (const p of race.probes) {
       nativeLog("debug", "update", "source probe", { source: sourceLabel(p.source), ok: p.ok, ms: p.ms, error: p.error });
     }
-    if (race.winner === undefined || race.version === undefined) {
-      nativeLog("warn", "update", "no release source answered", { region: decision.region, sources: base.length });
-      throw new Error("检查更新失败，所有下载线路都没有响应，请检查网络连接");
+    if (race.winner !== undefined && race.version !== undefined) {
+      source = race.winner;
+      version = race.version;
+      sumsMap = race.sums;
+      await writeSourceCache({ region: decision.region, winner: source, at: Date.now(), probes: race.probes });
     }
-    source = race.winner;
-    version = race.version;
-    await writeSourceCache({ region: decision.region, winner: source, at: Date.now(), probes: race.probes });
   }
+
+  const gh = await ghPromise;
+  if (version === undefined) {
+    if (gh) {
+      version = gh.version;
+      source = "";
+    } else {
+      nativeLog("warn", "update", "no release source answered", { region: decision.region, sources: base.length });
+      throw new Error("检查更新失败，GitHub 与镜像线路均未响应，请检查网络连接");
+    }
+  } else if (gh && compareVersions(gh.version, version) > 0) {
+    // GitHub API has a newer release than a CDN mirror's cached /releases/latest redirect.
+    version = gh.version;
+    sumsMap = undefined;
+  }
+
   const winner = source ?? "";
   nativeLog("info", "update", "release source chosen", {
     region: decision.region,
@@ -586,19 +683,52 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
   const current = appVersion();
   const platform = detectPlatform();
   const macArch = platform === "macos" ? await detectMacArch() : "arm64";
-  const asset = platformDownloadAsset(version, platform, macArch);
-  const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${version}/${asset}`;
+  const assetName = platformDownloadAsset(version, platform, macArch);
+  const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${version}/${assetName}`;
+  const orderedSources = withWinnerFirst(base, winner);
+  const downloadUrls = Array.from(new Set(orderedSources.map((s) => sourceUrl(s, rawUrl))));
+
+  const ghMatch = gh && compareVersions(gh.version, version) === 0 ? gh : null;
+  const ghAsset = ghMatch?.assets.find((a) => a.name === assetName);
+  const sha256 = sumsMap?.[assetName] ?? ghAsset?.sha256;
+  const assetSize = ghAsset?.size || undefined;
+  const notes: ReleaseNotesInfo | null = ghMatch?.body
+    ? { body: ghMatch.body, url: ghMatch.htmlUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${version}`, publishedAt: ghMatch.publishedAt }
+    : null;
+
   return {
     current,
     latest: version,
     hasUpdate: compareVersions(version, current) > 0,
-    pageUrl: `https://github.com/${RELEASE_REPO}/releases/tag/v${version}`,
+    pageUrl: ghMatch?.htmlUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${version}`,
     downloadUrl: sourceUrl(winner, rawUrl),
+    assetName,
+    downloadUrls,
+    sha256,
+    assetSize,
+    notes,
     region: decision.region,
     regionReason: decision.reason,
     source: sourceLabel(winner),
     probes,
   };
+}
+
+export function downloadAndStageUpdate(params: {
+  version: string;
+  assetName: string;
+  urls: string[];
+  expectedSha256: string;
+}): Promise<StagedUpdateResult> {
+  return call<StagedUpdateResult>("update_download_and_stage", params);
+}
+
+export function restartAndApplyUpdate(): Promise<void> {
+  return call<void>("update_restart_and_apply");
+}
+
+export function onUpdateProgress(cb: (ev: UpdateProgressEvent) => void): () => void {
+  return listenTauri<UpdateProgressEvent>("update://progress", cb);
 }
 
 // ---------------------------------------------------------------------------

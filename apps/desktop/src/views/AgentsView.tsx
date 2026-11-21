@@ -1,12 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import {
   ArrowDown,
   ArrowLeft,
+  ArrowUp,
   ChevronDown,
   ChevronRight,
+  Clock,
+  Folder,
   FolderOpen,
+  FolderTree,
   Laptop,
   Menu,
+  Paperclip,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -15,7 +21,9 @@ import {
   Terminal,
   Trash2,
   X,
+  Zap,
 } from "lucide-react";
+import { IS_MAC } from "../shell/shortcuts";
 import {
   PUT_LIMITS,
   textWithFiles,
@@ -45,8 +53,24 @@ import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVe
 import { TerminalSurface } from "../components/TerminalSurface";
 import { copyToClipboard } from "../lib/bridge";
 import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
+import {
+  dismissOutgoingSend,
+  enqueuePrompt,
+  moveQueuedPromptToTop,
+  popQueuedPromptForEdit,
+  pruneOutgoingSends,
+  reconcileOutgoingSends,
+  removeQueuedPrompt,
+  retryFailedSend,
+  sendPromptNow,
+  steerComposerNow,
+  steerQueuedPromptNow,
+  useAgentChatQueue,
+} from "../lib/chatQueue";
 import { useComposerInput } from "../lib/composerKeys";
 import { prepareDroppedFiles, revokeAttachment, type StagedAttachment } from "../lib/dropPreview";
+import { useLocalHostDeviceId } from "../lib/fonts";
+import { native } from "../lib/native";
 import { parseChoices } from "../lib/markdown";
 import { pingRelay, rpcCall, subscribeStream } from "../lib/relay";
 import {
@@ -818,6 +842,18 @@ function extractClipboardFiles(data: DataTransfer | null): File[] {
   return out;
 }
 
+function workedFor(ms: number): string {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  if (sec < 5) return "刚开始";
+  if (sec < 60) return `已运行 ${sec} 秒`;
+  const min = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  if (min < 60) return `已运行 ${min} 分 ${remSec} 秒`;
+  const hr = Math.floor(min / 60);
+  const remMin = min % 60;
+  return remMin ? `已运行 ${hr} 小时 ${remMin} 分` : `已运行 ${hr} 小时`;
+}
+
 export function AgentDetailPanel({
   agent,
   initialTab = "chat",
@@ -839,6 +875,7 @@ export function AgentDetailPanel({
   embedded?: boolean;
 }) {
   const toast = useToast();
+  const hostOnline = liveStore.use((s) => s.devices[agent.deviceId]?.online ?? true);
   const [tab, setTab] = useState<"chat" | "term" | "subs">(mode ?? initialTab);
   const activeMode: "chat" | "term" | "subs" = mode ?? tab;
   const selectMode = (m: "chat" | "term" | "subs") => {
@@ -853,6 +890,9 @@ export function AgentDetailPanel({
   const [events, setEvents] = useState<ConvEvent[]>([]);
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [loadOlderError, setLoadOlderError] = useState(false);
+  const [hasLoadedOlder, setHasLoadedOlder] = useState(false);
+  const prevModeRef = useRef(activeMode);
   const [atBottom, setAtBottom] = useState(true);
   const [choiceLines, setChoiceLines] = useState<string[]>([]);
   const [subs, setSubs] = useState<SubSession[]>([]);
@@ -861,22 +901,45 @@ export function AgentDetailPanel({
   const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [sending, setSending] = useState(false);
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const panelRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
+  const initialPositionedRef = useRef(false);
+  const prependAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const inFlightCursorRef = useRef<string | null>(null);
+  const prevScrollTopRef = useRef(0);
+  const autoFillCountRef = useRef(0);
+  const workingStartRef = useRef<number | null>(agent.status === "working" ? (agent.statusSince ?? Date.now()) : null);
   const streamLiveRef = useRef(false);
   const hadOpenRef = useRef(false);
-  const scrollRafRef = useRef(0);
   const sessionTrackRef = useRef<{ agentKey: string; sessionKey?: string }>({ agentKey: agent.key, sessionKey: agent.sessionKey });
   const dragDepthRef = useRef(0);
   const attachmentsRef = useRef<StagedAttachment[]>([]);
   attachmentsRef.current = attachments;
+
+  const { queued, outgoing } = useAgentChatQueue(agent.key);
 
   useEffect(() => {
     return () => {
       for (const a of attachmentsRef.current) revokeAttachment(a);
     };
   }, []);
+
+  useEffect(() => {
+    if (agent.status === "working") {
+      if (workingStartRef.current === null) workingStartRef.current = agent.statusSince ?? Date.now();
+    } else {
+      workingStartRef.current = null;
+    }
+  }, [agent.key, agent.status, agent.statusSince]);
+
+  useEffect(() => {
+    if (agent.status !== "working" && outgoing.length === 0 && !sending) return;
+    setNowTick(Date.now());
+    const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [agent.status, outgoing.length, sending]);
 
   useEffect(() => {
     let alive = true;
@@ -886,9 +949,17 @@ export function AgentDetailPanel({
     if (sessionSwitched) {
       setEvents([]);
       setOlderCursor(null);
+      setLoadingOlder(false);
+      setLoadOlderError(false);
+      setHasLoadedOlder(false);
       setChoiceLines([]);
       setSubs([]);
       stickRef.current = true;
+      initialPositionedRef.current = false;
+      prependAnchorRef.current = null;
+      inFlightCursorRef.current = null;
+      prevScrollTopRef.current = 0;
+      autoFillCountRef.current = 0;
       setAtBottom(true);
     }
     streamLiveRef.current = false;
@@ -974,65 +1045,147 @@ export function AgentDetailPanel({
     };
   }, [activeMode, agent.deviceId, agent.key, agent.status, events.length]);
 
+  const choices = useMemo(() => (activeMode === "chat" && choiceLines.length ? parseChoices(choiceLines) : []), [activeMode, choiceLines]);
+  const foldedRows = useMemo(() => foldConvEvents(events), [events]);
+  const subModalRows = useMemo(() => foldConvEvents(subModal?.events ?? []), [subModal]);
+  const reconciled = useMemo(
+    () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick),
+    [agent.status, foldedRows, nowTick, outgoing],
+  );
+
+  useEffect(() => {
+    const toDrop = [...reconciled.matchedIds, ...reconciled.expiredIds];
+    if (toDrop.length > 0) pruneOutgoingSends(agent.key, toDrop);
+  }, [agent.key, reconciled.expiredIds, reconciled.matchedIds]);
+
+  const activeToolLabel = useMemo(() => {
+    for (let i = foldedRows.length - 1; i >= Math.max(0, foldedRows.length - 5); i -= 1) {
+      const r = foldedRows[i]!;
+      if (r.kind === "activity_group" && r.running) {
+        return r.activeStep
+          ? `${r.activeStep.name}${r.activeStep.summary ? ` · ${clip(r.activeStep.summary, 36)}` : ""}`
+          : "工具调用";
+      }
+      if (r.kind === "tool" && r.step.running) {
+        return `${r.step.name}${r.step.summary ? ` · ${clip(r.step.summary, 36)}` : ""}`;
+      }
+    }
+    return null;
+  }, [foldedRows]);
+
   const scrollToBottom = useCallback((smooth = false) => {
     stickRef.current = true;
     setAtBottom(true);
     const el = chatScrollRef.current;
     if (!el) return;
     if (smooth) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-    else el.scrollTop = events.length ? el.scrollHeight : 0;
-  }, [events.length]);
+    else el.scrollTop = events.length || reconciled.unmatched.length ? el.scrollHeight : 0;
+  }, [events.length, reconciled.unmatched.length]);
 
-  useEffect(() => {
-    if (activeMode !== "chat" || !stickRef.current) return;
-    if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current);
-    scrollRafRef.current = requestAnimationFrame(() => {
-      scrollRafRef.current = 0;
+  const loadOlderEvents = useCallback(async () => {
+    const cursor = olderCursor;
+    if (!cursor || inFlightCursorRef.current === cursor) return;
+    inFlightCursorRef.current = cursor;
+    const reqAgentKey = agent.key;
+    setLoadingOlder(true);
+    setLoadOlderError(false);
+    try {
+      const res = await rpcCall(agent.deviceId, "session.events", { agent: agent.key, before: cursor, limit: 200 });
+      if (sessionTrackRef.current.agentKey !== reqAgentKey) return;
       const el = chatScrollRef.current;
-      // Only a thread with messages sticks to the bottom; the empty state is read from the top.
-      if (el && stickRef.current) el.scrollTop = events.length ? el.scrollHeight : 0;
-    });
-    return () => {
-      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current);
-    };
-  }, [events, activeMode]);
+      prependAnchorRef.current = el ? { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop } : null;
+      stickRef.current = false;
+      setAtBottom(false);
+      setHasLoadedOlder(true);
+      setEvents((prevList) => mergeConvEvents(prevList, res.events));
+      const nextCursor =
+        !res.more || !res.nextBefore || res.nextBefore === cursor || res.events.length === 0
+          ? null
+          : res.nextBefore;
+      setOlderCursor(nextCursor);
+    } catch (e) {
+      setLoadOlderError(true);
+      toast((e as Error).message, true);
+    } finally {
+      if (inFlightCursorRef.current === cursor) inFlightCursorRef.current = null;
+      setLoadingOlder(false);
+    }
+  }, [agent.deviceId, agent.key, olderCursor, toast]);
+
+  useLayoutEffect(() => {
+    const justEnteredChat = prevModeRef.current !== "chat" && activeMode === "chat";
+    prevModeRef.current = activeMode;
+    if (activeMode !== "chat") return;
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const hasAnyRows = foldedRows.length > 0 || reconciled.unmatched.length > 0;
+    if (prependAnchorRef.current) {
+      const anchor = prependAnchorRef.current;
+      prependAnchorRef.current = null;
+      el.scrollTop = anchor.scrollTop + Math.max(0, el.scrollHeight - anchor.scrollHeight);
+      prevScrollTopRef.current = el.scrollTop;
+      return;
+    }
+    if (justEnteredChat && initialPositionedRef.current && !stickRef.current) {
+      el.scrollTop = prevScrollTopRef.current;
+      return;
+    }
+    if (!initialPositionedRef.current && hasAnyRows) {
+      el.scrollTop = el.scrollHeight;
+      prevScrollTopRef.current = el.scrollTop;
+      initialPositionedRef.current = true;
+      stickRef.current = true;
+      setAtBottom(true);
+      return;
+    }
+    if (stickRef.current) {
+      el.scrollTop = hasAnyRows || agent.status === "working" || reconciled.awaitingReply || sending ? el.scrollHeight : 0;
+      prevScrollTopRef.current = el.scrollTop;
+    }
+    if (
+      initialPositionedRef.current &&
+      olderCursor &&
+      !loadingOlder &&
+      !loadOlderError &&
+      el.scrollHeight <= el.clientHeight + 24 &&
+      autoFillCountRef.current < 3
+    ) {
+      autoFillCountRef.current += 1;
+      void loadOlderEvents();
+    }
+  }, [
+    activeMode,
+    agent.status,
+    foldedRows,
+    loadOlderError,
+    loadOlderEvents,
+    loadingOlder,
+    olderCursor,
+    reconciled.awaitingReply,
+    reconciled.unmatched.length,
+    sending,
+  ]);
 
   const onChatScroll = useCallback(() => {
     const el = chatScrollRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
+    const top = el.scrollTop;
+    const prevTop = prevScrollTopRef.current;
+    prevScrollTopRef.current = top;
+    const nearBottom = el.scrollHeight - top - el.clientHeight < 72;
     stickRef.current = nearBottom;
     setAtBottom(nearBottom);
-  }, []);
-
-  const loadOlderEvents = useCallback(async () => {
-    if (!olderCursor || loadingOlder) return;
-    setLoadingOlder(true);
-    const el = chatScrollRef.current;
-    const prevH = el?.scrollHeight ?? 0;
-    const prevTop = el?.scrollTop ?? 0;
-    try {
-      const res = await rpcCall(agent.deviceId, "session.events", { agent: agent.key, before: olderCursor, limit: 200 });
-      stickRef.current = false;
-      setAtBottom(false);
-      setEvents((prevList) => mergeConvEvents(prevList, res.events));
-      setOlderCursor(res.more ? (res.nextBefore ?? null) : null);
-      requestAnimationFrame(() => {
-        const nextEl = chatScrollRef.current;
-        if (!nextEl) return;
-        const delta = nextEl.scrollHeight - prevH;
-        nextEl.scrollTop = prevTop + Math.max(0, delta);
-      });
-    } catch (e) {
-      toast((e as Error).message, true);
-    } finally {
-      setLoadingOlder(false);
+    if (
+      initialPositionedRef.current &&
+      olderCursor &&
+      !loadingOlder &&
+      !loadOlderError &&
+      top <= 180 &&
+      (top < prevTop || top <= 64)
+    ) {
+      void loadOlderEvents();
     }
-  }, [agent.deviceId, agent.key, loadingOlder, olderCursor, toast]);
-
-  const choices = useMemo(() => (activeMode === "chat" && choiceLines.length ? parseChoices(choiceLines) : []), [activeMode, choiceLines]);
-  const foldedRows = useMemo(() => foldConvEvents(events), [events]);
-  const subModalRows = useMemo(() => foldConvEvents(subModal?.events ?? []), [subModal]);
+  }, [loadOlderError, loadOlderEvents, loadingOlder, olderCursor]);
 
   const openSubSession = useCallback(
     async (s: SubSession) => {
@@ -1046,39 +1199,45 @@ export function AgentDetailPanel({
     [agent.deviceId, agent.key, toast],
   );
 
-  const sendLockRef = useRef(false);
   const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
 
-  const sendMessage = async (msgText?: string) => {
-    const raw = (msgText ?? text).trim();
-    const staged = msgText === undefined ? attachments : [];
+  const submitComposer = (mode: "auto" | "steer" = "auto", overrideText?: string) => {
+    const isOverride = overrideText !== undefined;
+    const raw = (overrideText ?? text).trim();
+    const staged = isOverride ? [] : attachments;
     const now = Date.now();
-    const sig = `${agent.key}\0${raw}\0${staged.length}`;
-    if ((!raw && staged.length === 0) || sendLockRef.current) return;
-    if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 500) return;
-    sendLockRef.current = true;
+    const sig = `${agent.key}\0${mode}\0${raw}\0${staged.length}`;
+    if (!raw && staged.length === 0) return;
+    if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 400) return;
     lastSendRef.current = { sig, at: now };
-    setSending(true);
-    try {
-      let body = raw;
-      if (staged.length > 0 && msgText === undefined) {
-        const uploaded = await rpcCall(agent.deviceId, "terminal.put", { agent: agent.key, files: staged.map((s) => s.put) }, 30_000);
-        body = textWithFiles(raw, uploaded.paths);
-      }
-      stickRef.current = true;
-      setAtBottom(true);
-      await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: body, enter: true });
-      if (msgText === undefined) {
-        setText("");
-        for (const s of staged) revokeAttachment(s);
-        setAttachments([]);
-      }
-    } catch (e) {
-      toast((e as Error).message, true);
-    } finally {
-      sendLockRef.current = false;
-      setSending(false);
+
+    if (!isOverride) {
+      setText("");
+      setAttachments([]);
     }
+    stickRef.current = true;
+    setAtBottom(true);
+
+    if (mode === "steer") {
+      setSending(true);
+      void steerComposerNow(agent, raw, staged).finally(() => setSending(false));
+      return;
+    }
+
+    if (agent.status === "working") {
+      enqueuePrompt(agent, raw, staged);
+      requestAnimationFrame(() => composer.textareaRef.current?.focus());
+      return;
+    }
+
+    setSending(true);
+    void sendPromptNow(agent, raw, staged).finally(() => setSending(false));
+  };
+
+  const interruptTurn = () => {
+    void rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) =>
+      toast((e as Error).message, true),
+    );
   };
 
   const sendKeys = async (keys: string[]) => {
@@ -1120,7 +1279,11 @@ export function AgentDetailPanel({
     });
   }, []);
 
-  const composer = useComposerInput(text, () => void sendMessage());
+  const composer = useComposerInput(
+    text,
+    () => submitComposer("auto"),
+    agent.status === "working" ? () => submitComposer("steer") : undefined,
+  );
 
   useEffect(() => {
     const onWindowPaste = (e: ClipboardEvent) => {
@@ -1174,6 +1337,17 @@ export function AgentDetailPanel({
     void handleFiles(files);
   };
 
+  const hasSending = sending || reconciled.unmatched.some((s) => s.state === "sending");
+  const showEmptyState =
+    foldedRows.length === 0 &&
+    reconciled.unmatched.length === 0 &&
+    !loadingOlder &&
+    agent.status !== "working" &&
+    !reconciled.awaitingReply &&
+    !hasSending;
+  const totalQueuedCount = queued.length + (agent.queued ?? 0);
+  const runElapsed = workingStartRef.current ? workedFor(nowTick - workingStartRef.current) : "刚开始";
+
   return (
     <div
       ref={panelRef}
@@ -1214,15 +1388,20 @@ export function AgentDetailPanel({
             ) : null}
             <PocketIconButton
               size="sm"
-              tooltip="中断当前轮 (Esc)"
-              onClick={() => void rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) => toast((e as Error).message, true))}
+              tooltip="中断当前轮"
+              onClick={interruptTurn}
             >
               <Square size={14} />
             </PocketIconButton>
             <PocketIconButton
               size="sm"
               tooltip="关闭终端"
-              onClick={() => void rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key }).then(() => onBack?.()).catch((e) => toast((e as Error).message, true))}
+              onClick={() => {
+                if (!window.confirm("确定要关闭并结束这个终端吗？")) return;
+                void rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key })
+                  .then(() => onBack?.())
+                  .catch((e) => toast((e as Error).message, true));
+              }}
             >
               <Trash2 size={14} />
             </PocketIconButton>
@@ -1232,19 +1411,120 @@ export function AgentDetailPanel({
 
       {activeMode === "chat" ? (
         <div className="chat-scroll-wrap">
-          <div ref={chatScrollRef} className="chat-scroll" onScroll={onChatScroll}>
-            {olderCursor ? (
-              <button type="button" className="chat-load-more" disabled={loadingOlder} onClick={() => void loadOlderEvents()}>
-                {loadingOlder ? "正在加载…" : "加载更早对话"}
+          <div
+            ref={chatScrollRef}
+            className="chat-scroll agent-chat"
+            onScroll={onChatScroll}
+            onWheel={(e) => {
+              const el = chatScrollRef.current;
+              if (e.deltaY < 0 && el && initialPositionedRef.current && olderCursor && !loadingOlder && !loadOlderError && el.scrollTop <= 180) {
+                void loadOlderEvents();
+              }
+            }}
+          >
+            {loadingOlder ? (
+              <div className="chat-top-status" role="status" aria-live="polite">
+                <span className="act-spin" aria-hidden />
+                <span>正在加载更早对话…</span>
+              </div>
+            ) : loadOlderError && olderCursor ? (
+              <button type="button" className="chat-top-retry" onClick={() => void loadOlderEvents()}>
+                加载更早记录失败 · 点击重试
               </button>
+            ) : !olderCursor && hasLoadedOlder && foldedRows.length > 0 ? (
+              <div className="chat-start-sep">
+                <span>对话开头</span>
+              </div>
             ) : null}
-            {foldedRows.length === 0 ? (
+
+            {showEmptyState ? (
               <EmptyState mood="sleepy" title="还没有对话记录" body="在下方发一条消息，或点右上角切换到“终端”直接操作。" />
             ) : (
-              <ChatTimelineRows rows={foldedRows} subs={subs} onOpenSub={(s) => void openSubSession(s)} />
+              <>
+                <ChatTimelineRows rows={foldedRows} subs={subs} onOpenSub={(s) => void openSubSession(s)} />
+                {reconciled.unmatched.map((item) => (
+                  <div key={item.id} className="bubble-row user">
+                    {item.text ? <div className="bubble user">{item.text}</div> : null}
+                    {item.attachedCount > 0 ? (
+                      <div className="chat-attach-note row" style={{ gap: 5 }} title={item.attachedNames.join("\n")}>
+                        <Paperclip size={12} />
+                        <span>已附带 {item.attachedCount} 个文件/图片</span>
+                      </div>
+                    ) : null}
+                    {item.state === "sending" ? (
+                      <div className="bubble-send-meta">发送中…</div>
+                    ) : item.state === "failed" ? (
+                      <div className="bubble-send-meta error">
+                        <span>发送失败{item.error ? `：${clip(item.error, 40)}` : ""}</span>
+                        <button
+                          type="button"
+                          className="bubble-meta-btn primary"
+                          onClick={() => void retryFailedSend(item.id, agent.key)}
+                        >
+                          重发
+                        </button>
+                        <button
+                          type="button"
+                          className="bubble-meta-btn"
+                          onClick={() => dismissOutgoingSend(agent.key, item.id)}
+                        >
+                          删掉
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </>
             )}
+
+            {agent.status === "working" ? (
+              <div className="agent-run-card" role="status" aria-live="polite">
+                <XiaoyangOrb mood="working" size={30} />
+                <div className="agent-run-body">
+                  <div className="agent-run-title">
+                    <span>{activeToolLabel ? `正在执行 · ${activeToolLabel}` : "正在思考与处理"}</span>
+                    <span className="chat-typing-dots" aria-hidden>
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                  </div>
+                  <div className="agent-run-sub">{runElapsed}</div>
+                </div>
+                <button type="button" className="agent-stop-pill" onClick={interruptTurn} title="中断当前轮">
+                  <Square size={10} />
+                  <span>停止</span>
+                </button>
+              </div>
+            ) : hasSending || reconciled.awaitingReply ? (
+              <div className="agent-run-card" role="status" aria-live="polite">
+                <XiaoyangOrb mood="working" size={26} />
+                <div className="agent-run-body">
+                  <div className="agent-run-title">
+                    <span>{hasSending ? "正在发送…" : "已送达，等待响应…"}</span>
+                    <span className="chat-typing-dots" aria-hidden>
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ) : agent.status === "blocked" ? (
+              <div className="agent-run-card blocked" role="status" aria-live="polite">
+                <XiaoyangOrb mood="waiting" size={28} />
+                <div className="agent-run-body">
+                  <div className="agent-run-title">等待你的确认或输入</div>
+                  {agent.statusNote ? <div className="agent-run-sub">{clip(agent.statusNote, 48)}</div> : null}
+                </div>
+                <button type="button" className="agent-stop-pill" onClick={() => selectMode("term")}>
+                  切到终端处理
+                </button>
+              </div>
+            ) : null}
           </div>
-          {!atBottom && foldedRows.length > 0 ? (
+
+          {!atBottom && (foldedRows.length > 0 || reconciled.unmatched.length > 0) ? (
             <button type="button" className="chat-jump-bottom" onClick={() => scrollToBottom(true)}>
               <ArrowDown size={13} />
               <span>回到底部</span>
@@ -1295,11 +1575,117 @@ export function AgentDetailPanel({
       {/* Composer (Chat mode only; Terminal mode stays clean & fullscreen) */}
       {activeMode === "chat" ? (
         <div className={`composer-card${dragOver ? " drop-over" : ""}`}>
+          {totalQueuedCount > 0 ? (
+            <div className="composer-queue-shelf" aria-label="排队中的消息">
+              <div className="composer-queue-head">
+                <span className="composer-queue-title">排队中 · {totalQueuedCount} 条</span>
+                <span className="composer-queue-hint">
+                  {!hostOnline
+                    ? "电脑离线，上线后自动发送"
+                    : agent.status === "blocked"
+                      ? "等待确认后继续"
+                      : "当前轮结束后依次自动发送"}
+                </span>
+              </div>
+              {queued.map((q, idx) => (
+                <div key={q.id} className="composer-queue-item">
+                  <span className="composer-queue-idx">{idx + 1}</span>
+                  <span className="composer-queue-text" title={q.text}>
+                    {q.text || "（仅附件）"}
+                  </span>
+                  {q.attachments.length > 0 ? (
+                    <span className="composer-queue-att">+{q.attachments.length} 附件</span>
+                  ) : null}
+                  <div className="composer-queue-actions">
+                    <button
+                      type="button"
+                      className="composer-queue-steer"
+                      title="立即打断当前轮并发送"
+                      onClick={() => void steerQueuedPromptNow(agent, q.id)}
+                    >
+                      立即发送
+                    </button>
+                    <button
+                      type="button"
+                      className="composer-queue-ic"
+                      aria-label="编辑这条排队消息"
+                      title="放回输入框编辑"
+                      onClick={() => {
+                        if (text.trim() || attachments.length > 0) {
+                          enqueuePrompt(agent, text, attachments);
+                        }
+                        const popped = popQueuedPromptForEdit(agent.key, q.id);
+                        if (!popped) return;
+                        setText(popped.text);
+                        setAttachments(popped.attachments);
+                        requestAnimationFrame(() => composer.textareaRef.current?.focus());
+                      }}
+                    >
+                      <Pencil size={12} />
+                    </button>
+                    {idx > 0 ? (
+                      <button
+                        type="button"
+                        className="composer-queue-ic"
+                        aria-label="移到最前"
+                        title="移到队列最前"
+                        onClick={() => moveQueuedPromptToTop(agent.key, q.id)}
+                      >
+                        <ArrowUp size={12} />
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="composer-queue-ic"
+                      aria-label="移出排队"
+                      title="移除"
+                      onClick={() => removeQueuedPrompt(agent.key, q.id)}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {agent.queued ? (
+                <div className="composer-queue-item">
+                  <span className="composer-queue-idx">终端</span>
+                  <span className="composer-queue-text" title={agent.queuedText || ""}>
+                    终端输入区排队 · {agent.queued} 条{agent.queuedText ? `：${agent.queuedText}` : ""}
+                  </span>
+                  <div className="composer-queue-actions">
+                    {agent.source === "hc" ? (
+                      <button
+                        type="button"
+                        className="composer-queue-steer"
+                        title="立即注入到当前轮 (Alt+M)"
+                        onClick={() => void sendKeys(["alt+m"])}
+                      >
+                        立即注入
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="composer-queue-ic"
+                      aria-label="中断当前轮"
+                      title="中断当前轮"
+                      onClick={interruptTurn}
+                    >
+                      <Square size={11} />
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <DropRail items={attachments} onRemove={removeAttachment} />
           <div className="composer-row">
             <textarea
               {...composer.textareaProps}
-              placeholder={`发给 ${clip(agent.name || agent.title || agent.harness, 16)}（可拖入或粘贴图片/文件）`}
+              placeholder={
+                agent.status === "working"
+                  ? `继续输入将加入排队（Enter 排队 · ${IS_MAC ? "⌥Enter" : "Alt+Enter"} 立即打断发送）`
+                  : `发给 ${clip(agent.name || agent.title || agent.harness, 16)}（可拖入或粘贴图片/文件）`
+              }
               value={text}
               onChange={(e) => setText(e.target.value)}
               onPaste={(e) => {
@@ -1310,14 +1696,45 @@ export function AgentDetailPanel({
                 }
               }}
             />
-            <PocketButton
-              size="sm"
-              className="composer-send"
-              disabled={(!text.trim() && attachments.length === 0) || sending}
-              onClick={() => void sendMessage()}
-            >
-              <Send size={14} />
-            </PocketButton>
+            {agent.status === "working" ? (
+              !text.trim() && attachments.length === 0 ? (
+                <PocketButton size="sm" variant="soft" className="composer-send" aria-label="中断当前轮" title="中断当前轮" onClick={interruptTurn}>
+                  <Square size={13} />
+                </PocketButton>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="composer-steer-pill"
+                    title={`立即打断当前轮并发送 (${IS_MAC ? "⌥Enter" : "Alt+Enter"})`}
+                    onClick={() => submitComposer("steer")}
+                  >
+                    <Zap size={12} />
+                    <span>插队</span>
+                  </button>
+                  <PocketButton
+                    size="sm"
+                    className="composer-send"
+                    aria-label="加入排队"
+                    title={`加入排队 (Enter) · ${IS_MAC ? "⌥Enter" : "Alt+Enter"} 立即打断发送`}
+                    onClick={() => submitComposer("auto")}
+                  >
+                    <Clock size={14} />
+                  </PocketButton>
+                </>
+              )
+            ) : (
+              <PocketButton
+                size="sm"
+                className="composer-send"
+                aria-label="发送"
+                title="发送 (Enter)"
+                disabled={!text.trim() && attachments.length === 0}
+                onClick={() => submitComposer("auto")}
+              >
+                <Send size={14} />
+              </PocketButton>
+            )}
           </div>
         </div>
       ) : null}
@@ -1347,8 +1764,10 @@ export function CreateAgentModal({
   onCreated: (key: string) => void;
 }) {
   const toast = useToast();
+  const localHostId = useLocalHostDeviceId();
   const onlineHosts = hosts.filter((h) => h.online);
   const [hostId, setHostId] = useState(defaultHost || onlineHosts[0]?.id || "");
+  const isLocalHost = native.available() && Boolean(localHostId) && hostId === localHostId;
   const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
   const [launchers, setLaunchers] = useState<LaunchOption[]>([]);
   const [folders, setFolders] = useState<string[]>([]);
@@ -1356,29 +1775,114 @@ export function CreateAgentModal({
   const [spaceName, setSpaceName] = useState(defaultSpace || "");
   const [launcher, setLauncher] = useState("");
   const [folder, setFolder] = useState("");
+  const [folderTouched, setFolderTouched] = useState(false);
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const [browseTarget, setBrowseTarget] = useState<string | undefined>(undefined);
+  const [showHidden, setShowHidden] = useState(false);
+  const [browseFilter, setBrowseFilter] = useState("");
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseError, setBrowseError] = useState<string | null>(null);
+  const [browseData, setBrowseData] = useState<{
+    path: string;
+    displayPath: string;
+    parent: string | null;
+    entries: Array<{ name: string; path: string }>;
+  } | null>(null);
   const [task, setTask] = useState("");
   const [busy, setBusy] = useState(false);
+  const [spaceState, setSpaceState] = useState<{ loading: boolean; error: string | null; canCreate: boolean; reason?: string }>({
+    loading: false,
+    error: null,
+    canCreate: true,
+  });
 
   useEffect(() => {
     if (!open) return;
     const h = defaultHost || onlineHosts[0]?.id || hosts[0]?.id || "";
     setHostId(h);
-  }, [open, defaultHost]);
+    setSpaceName(defaultSpace || "");
+    setTask("");
+    setFolderTouched(false);
+    setBrowseOpen(false);
+    setBrowseFilter("");
+    setBrowseError(null);
+  }, [open, defaultHost, defaultSpace]);
 
   useEffect(() => {
     if (!open || !hostId) return;
+    let cancelled = false;
+    setSpaces([]);
+    setLaunchers([]);
+    setFolders([]);
+    setLauncher("");
+    setSpaceId("");
+    setFolder("");
+    setFolderTouched(false);
+    setBrowseOpen(false);
+    setBrowseTarget(undefined);
+    setBrowseData(null);
+    setBrowseError(null);
+    setSpaceState({ loading: true, error: null, canCreate: true });
     void rpcCall(hostId, "spaces.list", {})
       .then((res) => {
+        if (cancelled) return;
         setSpaces(res.spaces);
         setLaunchers(res.launchers);
         setFolders(res.folders);
         setLauncher(res.launchers[0]?.id ?? "");
-        setFolder(res.folders[0] ?? "");
         const matched = defaultSpace ? res.spaces.find((s) => s.name === defaultSpace) : undefined;
-        setSpaceId(matched?.id ?? res.spaces[0]?.id ?? "");
+        const initialSpace = matched ?? res.spaces[0];
+        setSpaceId(initialSpace?.id ?? "");
+        setFolder(initialSpace?.folder || res.folders[0] || "");
+        setSpaceState({ loading: false, error: null, canCreate: res.canCreate !== false, reason: res.reason });
       })
-      .catch(() => {});
-  }, [open, hostId]);
+      .catch((e: Error) => {
+        if (cancelled) return;
+        setSpaceState({ loading: false, error: e.message || "无法联系这台电脑", canCreate: false });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, hostId, defaultSpace]);
+
+  useEffect(() => {
+    if (!open || !browseOpen || !hostId) return;
+    let cancelled = false;
+    setBrowseLoading(true);
+    setBrowseError(null);
+    void rpcCall(hostId, "folders.list", { path: browseTarget, hidden: showHidden })
+      .then((res) => {
+        if (!cancelled) setBrowseData(res);
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setBrowseError(e.message || "无法读取目录");
+      })
+      .finally(() => {
+        if (!cancelled) setBrowseLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, browseOpen, hostId, browseTarget, showHidden]);
+
+  const filteredEntries = useMemo(() => {
+    const list = browseData?.entries ?? [];
+    const q = browseFilter.trim().toLowerCase();
+    return q ? list.filter((e) => e.name.toLowerCase().includes(q)) : list;
+  }, [browseData, browseFilter]);
+
+  const pickSystemFolder = async () => {
+    try {
+      const picked = await native.pickFolder(folder.trim() || undefined);
+      if (picked) {
+        setFolder(picked);
+        setFolderTouched(true);
+        setBrowseOpen(false);
+      }
+    } catch (e) {
+      toast((e as Error).message, true);
+    }
+  };
 
   const submit = async () => {
     if (!hostId || !launcher) return;
@@ -1402,7 +1906,7 @@ export function CreateAgentModal({
   };
 
   return (
-    <PocketModal open={open} onOpenChange={onOpenChange} title="新建 Agent" subtitle="在指定电脑和工作空间里启动一个新会话" width={480}>
+    <PocketModal open={open} onOpenChange={onOpenChange} title="新建 Agent" subtitle="在指定电脑和工作空间里启动一个新会话" width={540}>
       <div className="stack">
         {hosts.length > 0 ? (
           <div>
@@ -1413,6 +1917,12 @@ export function CreateAgentModal({
               options={hosts.map((h) => ({ value: h.id, label: h.online ? h.name : `${h.name} (离线)` }))}
             />
           </div>
+        ) : null}
+
+        {spaceState.error ? (
+          <div className="faint" style={{ color: "var(--blush-text)", fontSize: 12.5 }}>{spaceState.error}</div>
+        ) : !spaceState.canCreate && spaceState.reason ? (
+          <div className="faint" style={{ color: "var(--blush-text)", fontSize: 12.5 }}>{spaceState.reason}</div>
         ) : null}
 
         {launchers.length > 0 ? (
@@ -1433,7 +1943,13 @@ export function CreateAgentModal({
             <div className="faint" style={{ marginBottom: 4 }}>空间（留空或新建）</div>
             <PocketSelect
               value={spaceId}
-              onValueChange={setSpaceId}
+              onValueChange={(nextId) => {
+                setSpaceId(nextId);
+                if (!folderTouched) {
+                  const sp = spaces.find((s) => s.id === nextId);
+                  if (sp?.folder) setFolder(sp.folder);
+                }
+              }}
               options={[{ value: "", label: "新建空间" }, ...spaces.map((s) => ({ value: s.id, label: s.name }))]}
             />
           </div>
@@ -1448,11 +1964,215 @@ export function CreateAgentModal({
 
         <div>
           <div className="faint" style={{ marginBottom: 4 }}>工作目录</div>
-          <PocketInput placeholder="~/work/project" value={folder} onChange={(e) => setFolder(e.target.value)} />
+          <div className="row wrap" style={{ gap: 6, alignItems: "center" }}>
+            <PocketInput
+              mono
+              style={{ flex: "1 1 200px", minWidth: 0 }}
+              placeholder="~/work/project"
+              value={folder}
+              onChange={(e) => {
+                setFolder(e.target.value);
+                setFolderTouched(true);
+              }}
+            />
+            {isLocalHost ? (
+              <PocketButton size="sm" variant="ghost" onClick={() => void pickSystemFolder()}>
+                <FolderOpen size={14} /> 选择文件夹…
+              </PocketButton>
+            ) : null}
+            <PocketButton
+              size="sm"
+              variant={browseOpen ? "soft" : "ghost"}
+              onClick={() => {
+                setBrowseOpen((prev) => {
+                  const next = !prev;
+                  if (next) {
+                    setBrowseTarget(folder.trim() || undefined);
+                    setBrowseFilter("");
+                    setBrowseError(null);
+                  }
+                  return next;
+                });
+              }}
+            >
+              <FolderTree size={14} /> 浏览
+            </PocketButton>
+          </div>
+
+          {browseOpen ? (
+            <div
+              style={{
+                marginTop: 8,
+                padding: 10,
+                borderRadius: 12,
+                border: "1px solid var(--divider)",
+                background: "var(--surface-2, rgba(255, 113, 168, 0.04))",
+              }}
+            >
+              <div className="row wrap" style={{ gap: 6, alignItems: "center", marginBottom: 8 }}>
+                <PocketButton
+                  size="sm"
+                  variant="ghost"
+                  disabled={!browseData?.parent || browseLoading}
+                  onClick={() => {
+                    if (browseData?.parent) {
+                      setBrowseTarget(browseData.parent);
+                      setBrowseFilter("");
+                    }
+                  }}
+                >
+                  <ArrowUp size={13} /> 上一级
+                </PocketButton>
+                <span
+                  className="mono faint"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    fontSize: 12,
+                  }}
+                  title={browseData?.path || ""}
+                >
+                  {browseLoading ? "加载中…" : browseData?.displayPath || browseData?.path || "—"}
+                </span>
+                <PocketButton
+                  size="sm"
+                  variant={showHidden ? "soft" : "ghost"}
+                  aria-pressed={showHidden}
+                  disabled={browseLoading}
+                  onClick={() => setShowHidden((h) => !h)}
+                >
+                  显示隐藏
+                </PocketButton>
+                <PocketButton
+                  size="sm"
+                  variant="primary"
+                  disabled={!browseData || browseLoading}
+                  onClick={() => {
+                    if (!browseData) return;
+                    setFolder(browseData.displayPath || browseData.path);
+                    setFolderTouched(true);
+                    setBrowseOpen(false);
+                  }}
+                >
+                  选此目录
+                </PocketButton>
+              </div>
+
+              <PocketInput
+                aria-label="筛选子目录"
+                placeholder="筛选子目录…"
+                value={browseFilter}
+                onChange={(e) => setBrowseFilter(e.target.value)}
+                style={{ marginBottom: 8 }}
+              />
+
+              {browseError ? (
+                <div className="row" style={{ gap: 8, alignItems: "center", justifyContent: "space-between", padding: "6px 4px" }}>
+                  <span className="faint" style={{ color: "var(--blush-text)" }}>{browseError}</span>
+                  <PocketButton
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setBrowseTarget(undefined);
+                      setBrowseFilter("");
+                    }}
+                  >
+                    回到主目录
+                  </PocketButton>
+                </div>
+              ) : (
+                <div style={{ maxHeight: 190, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+                  {browseLoading && !browseData ? (
+                    <div className="faint" style={{ padding: "8px 4px" }}>正在读取目录…</div>
+                  ) : filteredEntries.length === 0 ? (
+                    <div className="faint" style={{ padding: "8px 4px" }}>
+                      {browseFilter.trim() ? "没有匹配的子目录" : "空目录"}
+                    </div>
+                  ) : (
+                    filteredEntries.map((entry) => (
+                      <div
+                        key={entry.path}
+                        className="row"
+                        style={{
+                          gap: 6,
+                          alignItems: "center",
+                          padding: "4px 6px",
+                          borderRadius: 8,
+                        }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBrowseTarget(entry.path);
+                            setBrowseFilter("");
+                          }}
+                          style={{
+                            flex: 1,
+                            minWidth: 0,
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                            border: 0,
+                            background: "transparent",
+                            color: "var(--ink)",
+                            cursor: "pointer",
+                            textAlign: "left",
+                            padding: "2px 0",
+                          }}
+                          title={`打开 ${entry.path}`}
+                        >
+                          <Folder size={14} style={{ flexShrink: 0, color: "var(--accent-text)" }} />
+                          <span
+                            style={{
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {entry.name}
+                          </span>
+                        </button>
+                        <PocketButton
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => {
+                            setFolder(entry.path);
+                            setFolderTouched(true);
+                            setBrowseOpen(false);
+                          }}
+                        >
+                          选择
+                        </PocketButton>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          ) : null}
+
           {folders.length > 0 ? (
             <div className="row wrap" style={{ gap: 5, marginTop: 6 }}>
-              {folders.slice(0, 4).map((f) => (
-                <button key={f} type="button" className="term-key" onClick={() => setFolder(f)}>{f}</button>
+              {folders.slice(0, 8).map((f) => (
+                <button
+                  key={f}
+                  type="button"
+                  className="term-key"
+                  style={
+                    folder === f
+                      ? { borderColor: "var(--line-pink)", color: "var(--accent-text)", background: "var(--accent-soft)", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }
+                      : { maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }
+                  }
+                  onClick={() => {
+                    setFolder(f);
+                    setFolderTouched(true);
+                  }}
+                >
+                  {f}
+                </button>
               ))}
             </div>
           ) : null}
@@ -1465,7 +2185,7 @@ export function CreateAgentModal({
 
         <div className="row" style={{ justifyContent: "flex-end" }}>
           <PocketButton variant="ghost" onClick={() => onOpenChange(false)}>取消</PocketButton>
-          <PocketButton variant="primary" disabled={busy || !hostId || !launcher} onClick={() => void submit()}>
+          <PocketButton variant="primary" disabled={busy || spaceState.loading || !spaceState.canCreate || !hostId || !launcher} onClick={() => void submit()}>
             {busy ? "正在启动…" : "启动 Agent"}
           </PocketButton>
         </div>

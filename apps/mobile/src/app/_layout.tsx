@@ -18,6 +18,7 @@ import { useAlertSync } from "../lib/alerts";
 import { IconTile } from "../components/ui";
 import { useHarnessIconSync } from "../lib/harnessRemote";
 import { syncNativeVoice } from "../lib/voice";
+import { ensureMobileQueueWatcher } from "../lib/chatQueue";
 
 SplashScreen.preventAutoHideAsync().catch(() => undefined);
 
@@ -53,6 +54,9 @@ function Navigator() {
   useRelayLink();
   useAlertSync();
   useHarnessIconSync();
+  useEffect(() => {
+    ensureMobileQueueWatcher();
+  }, []);
   return (
     <>
       <StatusBar style={p.dark ? "light" : "dark"} />

@@ -396,3 +396,28 @@ export function shellQuotePath(path: string): string {
   if (/^[A-Za-z0-9_./~:-]+$/.test(path)) return path;
   return `'${path.replace(/'/g, "'\\''")}'`;
 }
+
+/** Reads pixel dimensions from a PNG IHDR header, or null if bytes are not a valid PNG. */
+export function parsePngDimensions(bytes: Uint8Array): { width: number; height: number } | null {
+  if (bytes.length < 24) return null;
+  if (
+    bytes[0] !== 0x89 ||
+    bytes[1] !== 0x50 ||
+    bytes[2] !== 0x4e ||
+    bytes[3] !== 0x47 ||
+    bytes[4] !== 0x0d ||
+    bytes[5] !== 0x0a ||
+    bytes[6] !== 0x1a ||
+    bytes[7] !== 0x0a
+  ) {
+    return null;
+  }
+  if (bytes[12] !== 0x49 || bytes[13] !== 0x48 || bytes[14] !== 0x44 || bytes[15] !== 0x52) {
+    return null;
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const width = view.getUint32(16, false);
+  const height = view.getUint32(20, false);
+  if (width === 0 || height === 0) return null;
+  return { width, height };
+}

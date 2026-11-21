@@ -45,7 +45,25 @@
 
 .tp-term-host .xterm-viewport {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
+.tp-term-host .xterm-viewport::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.tp-term-host .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tp-term-host .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+}
+
+.tp-term-host .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.34);
 }
 
 .tp-term-host .xterm-screen {

@@ -335,7 +335,36 @@ export const mockApi = {
       if (!hit || hit.kind !== "file") throw new Error("没有这个文件");
       if (hit.private) throw new Error("这个文件可能含有密钥，不能查看");
       const text = hit.body ?? "";
-      return { path: params.path, size: text.length, mtime: now - 30 * min, binary: false, truncated: false, offset: 0, bytes: text.length, text, language: hit.name.split(".").pop() };
+      return {
+        path: params.path,
+        size: text.length,
+        mtime: now - 30 * min,
+        binary: false,
+        truncated: false,
+        offset: 0,
+        bytes: text.length,
+        text,
+        language: hit.name.split(".").pop(),
+      };
+    }
+    if (method === "folders.list") {
+      const req = (params.path ?? "").trim() || "~";
+      const dirs: Record<string, Array<{ name: string; path: string }>> = {
+        "~": [
+          { name: "work", path: "~/work" },
+          { name: "repos", path: "~/repos" },
+          { name: "tmp", path: "~/tmp" },
+        ],
+        "~/work": [
+          { name: "demo-app", path: "~/work/demo-app" },
+          { name: "herdr-pocket", path: "~/work/herdr-pocket" },
+        ],
+        "~/repos": [{ name: "sample-cli", path: "~/repos/sample-cli" }],
+      };
+      const norm = req.replace(/\/+$/, "") || "~";
+      const slash = norm.lastIndexOf("/");
+      const parent = norm === "~" ? null : slash > 0 ? norm.slice(0, slash) : "~";
+      return { path: norm, displayPath: norm, parent, entries: dirs[norm] ?? [] };
     }
     if (method === "terminal.put") {
       return { paths: (params.files ?? []).map((f: any, i: number) => `/tmp/mock-${i}-${f.name}`) };

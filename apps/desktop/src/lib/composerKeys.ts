@@ -7,7 +7,7 @@ import { useLayoutEffect, useRef, type CompositionEvent, type KeyboardEvent } fr
  */
 export const IME_GUARD_MS = 80;
 
-const MIN_TEXTAREA_PX = 24;
+const MIN_TEXTAREA_PX = 34;
 const MAX_TEXTAREA_PX = 200;
 
 export interface ComposerImeGate {
@@ -30,7 +30,7 @@ export interface ComposerEnterFacts {
   repeat?: boolean;
 }
 
-export type ComposerEnterAction = "submit" | "pass" | "swallow";
+export type ComposerEnterAction = "submit" | "steer" | "pass" | "swallow";
 
 /**
  * Pure decision for Enter inside a desktop composer textarea:
@@ -39,19 +39,22 @@ export type ComposerEnterAction = "submit" | "pass" | "swallow";
  * - Immediately after `compositionend` (< 80 ms, macOS WKWebView ordering quirk),
  *   swallow Enter without submitting (`"swallow"`).
  * - `Shift+Enter` inserts a newline (`"pass"`).
- * - Repeat `Enter`, `Alt+Enter`, or `Ctrl+Meta+Enter` swallow without submitting.
+ * - Repeat `Enter` or `Ctrl+Meta+Enter` swallow without submitting.
+ * - `Alt+Enter` returns `"steer"` when `allowSteer` is true, else `"swallow"`.
  * - Plain `Enter` or `Cmd/Ctrl+Enter` outside IME submits (`"submit"`).
  */
 export function composerEnterAction(
   event: ComposerEnterFacts,
   gate: ComposerImeGate,
   now = Date.now(),
+  allowSteer = false,
 ): ComposerEnterAction {
   if (event.key !== "Enter") return "pass";
   if (event.shiftKey) return "pass";
   if (event.isComposing || gate.composing || event.keyCode === 229) return "pass";
   if (gate.compositionEndedAt > 0 && now - gate.compositionEndedAt < IME_GUARD_MS) return "swallow";
   if (event.repeat) return "swallow";
+  if (event.altKey && !event.ctrlKey && !event.metaKey) return allowSteer ? "steer" : "swallow";
   if (event.altKey || (event.ctrlKey && event.metaKey)) return "swallow";
   return "submit";
 }
@@ -66,9 +69,9 @@ function resizeTextarea(el: HTMLTextAreaElement | null): void {
 }
 
 /**
- * Binds IME-safe Enter-to-send and auto-grow sizing to a composer `<textarea>`.
+ * Binds IME-safe Enter-to-send (and optional Alt+Enter steer submit) and auto-grow sizing to a composer `<textarea>`.
  */
-export function useComposerInput(value: string, onSubmit: () => void) {
+export function useComposerInput(value: string, onSubmit: () => void, onSteerSubmit?: () => void) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gateRef = useRef<ComposerImeGate>(createImeGate());
 
@@ -111,10 +114,13 @@ export function useComposerInput(value: string, onSubmit: () => void) {
         repeat: e.repeat,
       },
       gateRef.current,
+      Date.now(),
+      Boolean(onSteerSubmit),
     );
     if (action === "pass") return;
     e.preventDefault();
-    if (action === "submit") onSubmit();
+    if (action === "steer") onSteerSubmit?.();
+    else if (action === "submit") onSubmit();
   };
 
   return {

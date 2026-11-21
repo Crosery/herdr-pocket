@@ -72,3 +72,33 @@ test("files.list / files.read go through the agent's working folder; host.info s
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("folders.list expands ~, lists sorted directories, navigates parent, and guards private folders", async () => {
+  const { call } = host();
+  const root = mkdtempSync(join(tmpdir(), "hp-folders-"));
+  mkdirSync(join(root, "beta"));
+  mkdirSync(join(root, "alpha"));
+  mkdirSync(join(root, ".git-hidden"));
+  mkdirSync(join(root, ".ssh"));
+  mkdirSync(join(root, "node_modules"));
+  writeFileSync(join(root, "plain.txt"), "hi\n");
+  try {
+    const res = await call("folders.list", { path: root });
+    assert.deepEqual(
+      res.entries.map((e: { name: string }) => e.name),
+      ["alpha", "beta"],
+    );
+    assert.equal(typeof res.parent, "string");
+    const withHidden = await call("folders.list", { path: root, hidden: true });
+    assert.deepEqual(
+      withHidden.entries.map((e: { name: string }) => e.name),
+      [".git-hidden", "alpha", "beta", "node_modules"],
+    );
+    await assert.rejects(
+      call("folders.list", { path: join(root, ".ssh") }),
+      (e: Error & { code?: string }) => e.code === "forbidden",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

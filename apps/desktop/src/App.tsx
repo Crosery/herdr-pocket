@@ -8,6 +8,7 @@ import { DesktopShell } from "./shell/DesktopShell";
 import { FRAME_SECTION_OF, openSettingsFrame } from "./shell/shellStore";
 import { PairPhoneModal } from "./components/PairPhoneModal";
 import { ConnectRelayPanel, RELAY_EXPLAINER } from "./components/ConnectRelayPanel";
+import { UpdatePrompt } from "./components/UpdatePrompt";
 import { VoiceHud } from "./components/VoiceInput";
 import { AgentsView } from "./views/AgentsView";
 import { DevicesView } from "./views/DevicesView";
@@ -433,6 +434,7 @@ function PocketAppShell() {
         />
       ) : null}
       <VoiceHud />
+      <UpdatePrompt />
     </>
   );
 

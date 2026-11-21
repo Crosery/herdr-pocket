@@ -100,6 +100,30 @@ test("composerEnterAction: active IME composition and WKWebView post-composition
     composerEnterAction({ key: "a", shiftKey: false, altKey: false, ctrlKey: false, metaKey: false }, gate, 6000),
     "pass",
   );
+
+  // Alt+Enter triggers immediate steer send only when allowSteer=true, and still honors IME composition guard.
+  assert.equal(
+    composerEnterAction({ key: "Enter", shiftKey: false, altKey: true, ctrlKey: false, metaKey: false }, gate, 6000, true),
+    "steer",
+  );
+  assert.equal(
+    composerEnterAction(
+      { key: "Enter", shiftKey: false, altKey: true, ctrlKey: false, metaKey: false, isComposing: true },
+      gate,
+      6000,
+      true,
+    ),
+    "pass",
+  );
+  assert.equal(
+    composerEnterAction(
+      { key: "Enter", shiftKey: false, altKey: true, ctrlKey: false, metaKey: false },
+      justCommitted,
+      5005,
+      true,
+    ),
+    "swallow",
+  );
 });
 
 test("dropPreview: medium classification, MIME inference, extension badges, byte sizes and binary guard", () => {

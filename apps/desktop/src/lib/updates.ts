@@ -1,14 +1,45 @@
 import { RELEASE_REPO, decideRegion, sourceLabel, sourcePrefixes, type RegionDecision } from "@herdr-pocket/protocol";
-import { checkReleaseUpdate, type ReleaseUpdateInfo } from "./bridge";
+import {
+  checkReleaseUpdate,
+  downloadAndStageUpdate,
+  fetchVersionSums,
+  isTauri,
+  onUpdateProgress,
+  openExternalUrl,
+  platformAssetNameHint,
+  restartAndApplyUpdate,
+  type ReleaseUpdateInfo,
+} from "./bridge";
 import { clientConfigStore } from "./config";
 import { createStore } from "./store";
 import { logger } from "./log";
+
+export type UpdateInstallPhase =
+  | "idle"
+  | "downloading"
+  | "verifying"
+  | "staging"
+  | "ready"
+  | "restarting"
+  | "error";
+
+export interface UpdateInstallProgress {
+  downloadedBytes: number;
+  totalBytes: number | null;
+  percent: number | null;
+  source?: string;
+  message?: string;
+}
 
 export interface UpdateState {
   checking: boolean;
   info: ReleaseUpdateInfo | null;
   error: string | null;
   checkedAt: number | null;
+  installPhase: UpdateInstallPhase;
+  progress: UpdateInstallProgress | null;
+  installError: string | null;
+  dismissedVersion: string | null;
 }
 
 const LAST_KEY = "herdr-pocket-update-checked-at";
@@ -18,7 +49,39 @@ export const updateStore = createStore<UpdateState>({
   info: null,
   error: null,
   checkedAt: Number(localStorage.getItem(LAST_KEY)) || null,
+  installPhase: "idle",
+  progress: null,
+  installError: null,
+  dismissedVersion: null,
 });
+
+let progressListenerInstalled = false;
+function ensureProgressListener(): void {
+  if (progressListenerInstalled || !isTauri()) return;
+  progressListenerInstalled = true;
+  onUpdateProgress((ev) => {
+    const cur = updateStore.get();
+    if (cur.info && ev.version && ev.version !== cur.info.latest) return;
+    if (ev.phase === "error") {
+      updateStore.set({
+        installPhase: "error",
+        installError: ev.message || "更新下载失败",
+      });
+      return;
+    }
+    updateStore.set({
+      installPhase: ev.phase,
+      installError: null,
+      progress: {
+        downloadedBytes: ev.downloadedBytes,
+        totalBytes: ev.totalBytes ?? cur.progress?.totalBytes ?? null,
+        percent: ev.percent ?? cur.progress?.percent ?? null,
+        source: ev.source ?? cur.progress?.source,
+        message: ev.message,
+      },
+    });
+  });
+}
 
 /** Where downloads go first, from config.json `update.region` (auto = by time zone). */
 export function currentRegion(): RegionDecision {
@@ -61,16 +124,32 @@ export function lastSourceSentence(info: ReleaseUpdateInfo): string {
   return `上次检查走的是 ${info.source}`;
 }
 
-export async function checkForUpdate(reason: "manual" | "auto"): Promise<ReleaseUpdateInfo | null> {
+export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Promise<ReleaseUpdateInfo | null> {
+  ensureProgressListener();
   if (updateStore.get().checking) return updateStore.get().info;
-  updateStore.set({ checking: true, error: null });
+  updateStore.set({
+    checking: true,
+    error: null,
+    ...(reason === "manual" ? { dismissedVersion: null } : {}),
+  });
   const { region, mirrors } = clientConfigStore.get().config.update;
   try {
-    // The native side races the sources itself; downloadUrl already goes through the winner.
-    const info = await checkReleaseUpdate({ setting: region, mirrors: [...mirrors] });
+    // Manual clicks always race fresh sources; startup/background refreshes may reuse recent cache.
+    const info = await checkReleaseUpdate({
+      setting: region,
+      mirrors: [...mirrors],
+      forceRace: reason === "manual",
+    });
     const at = Date.now();
     localStorage.setItem(LAST_KEY, String(at));
-    updateStore.set({ checking: false, info, checkedAt: at });
+    const prev = updateStore.get();
+    const sameLatestReady = prev.info?.latest === info.latest && prev.installPhase === "ready";
+    updateStore.set({
+      checking: false,
+      info,
+      checkedAt: at,
+      ...(sameLatestReady ? {} : prev.info?.latest !== info.latest ? { installPhase: "idle", progress: null, installError: null } : {}),
+    });
     const probes = info.probes?.map((p) => `${sourceLabel(p.source) || p.source} ${p.ok ? `${p.ms} ms` : "failed"}`).join(", ");
     logger.info("update", `${reason} check: current ${info.current}, latest ${info.latest}${info.hasUpdate ? " (update available)" : ""}; region ${info.region} (${info.regionReason}), source ${info.source}${probes ? `; probes ${probes}` : ""}`);
     return info;
@@ -80,6 +159,105 @@ export async function checkForUpdate(reason: "manual" | "auto"): Promise<Release
     logger.warn("update", `${reason} check failed: ${msg}`);
     return null;
   }
+}
+
+export async function startUpdateDownload(): Promise<void> {
+  ensureProgressListener();
+  const st = updateStore.get();
+  const info = st.info;
+  if (!info?.hasUpdate) return;
+  if (
+    st.installPhase === "downloading" ||
+    st.installPhase === "verifying" ||
+    st.installPhase === "staging" ||
+    st.installPhase === "restarting"
+  ) {
+    return;
+  }
+
+  if (!isTauri()) {
+    await openExternalUrl(info.downloadUrl);
+    return;
+  }
+
+  updateStore.set({
+    installPhase: "downloading",
+    installError: null,
+    progress: {
+      downloadedBytes: 0,
+      totalBytes: info.assetSize ?? null,
+      percent: 0,
+      source: info.source,
+      message: "正在准备下载…",
+    },
+  });
+
+  try {
+    let sha256 = info.sha256;
+    const assetName = info.assetName || platformAssetNameHint(info.latest);
+    if (!sha256) {
+      const { region, mirrors } = clientConfigStore.get().config.update;
+      const sums = await fetchVersionSums(info.latest, { setting: region, mirrors: [...mirrors] });
+      sha256 = sums?.[assetName];
+      if (sha256) {
+        updateStore.set((prev) => (prev.info ? { ...prev, info: { ...prev.info, sha256 } } : prev));
+      }
+    }
+    if (!sha256) {
+      throw new Error("未获取到安装包 SHA-256 校验值（可能仍在发布上传中）");
+    }
+
+    const res = await downloadAndStageUpdate({
+      version: info.latest,
+      assetName,
+      urls: info.downloadUrls.length ? info.downloadUrls : [info.downloadUrl],
+      expectedSha256: sha256,
+    });
+    if (res.ready) {
+      updateStore.set({
+        installPhase: "ready",
+        installError: null,
+        progress: {
+          downloadedBytes: info.assetSize ?? 0,
+          totalBytes: info.assetSize ?? null,
+          percent: 100,
+          source: info.source,
+          message: "更新已准备就绪",
+        },
+      });
+    }
+  } catch (e) {
+    const msg = (e as Error).message || "下载或校验更新失败";
+    logger.warn("update", `download/stage failed: ${msg}`);
+    updateStore.set({
+      installPhase: "error",
+      installError: msg,
+    });
+  }
+}
+
+export async function restartToApplyUpdate(): Promise<void> {
+  const st = updateStore.get();
+  if (st.installPhase !== "ready") return;
+  updateStore.set({ installPhase: "restarting", installError: null });
+  try {
+    await restartAndApplyUpdate();
+  } catch (e) {
+    const msg = (e as Error).message || "重启并安装更新失败";
+    logger.warn("update", `restart/apply failed: ${msg}`);
+    updateStore.set({ installPhase: "error", installError: msg });
+  }
+}
+
+export function dismissUpdatePrompt(): void {
+  const cur = updateStore.get();
+  const latest = cur.info?.latest;
+  if (!latest) return;
+  if (cur.installPhase === "error") {
+    updateStore.set({ dismissedVersion: latest, installPhase: "idle", installError: null });
+    return;
+  }
+  updateStore.set({ dismissedVersion: latest });
 }
 
 export interface ReleaseNotes {
@@ -93,6 +271,8 @@ export interface ReleaseNotes {
  * from mainland China: a short wait, then null (the UI links to the release page instead).
  */
 export async function fetchReleaseNotes(timeoutMs = 4000): Promise<ReleaseNotes | null> {
+  const cached = updateStore.get().info?.notes;
+  if (cached?.body) return cached;
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), timeoutMs);
   try {
@@ -110,27 +290,43 @@ export async function fetchReleaseNotes(timeoutMs = 4000): Promise<ReleaseNotes 
   }
 }
 
-/** Background checks per `update.autoCheck` / `update.checkIntervalHours`, ±10% jitter. */
+/** Startup check (after 6s) + background checks per `update.autoCheck` / `update.checkIntervalHours`, ±10% jitter. */
 export function startAutoUpdateChecks(): () => void {
+  ensureProgressListener();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let startupTimer: ReturnType<typeof setTimeout> | null = null;
+  let startupRan = false;
+
   const plan = () => {
     const { autoCheck, checkIntervalHours } = clientConfigStore.get().config.update;
     if (timer) clearTimeout(timer);
     timer = null;
+    if (startupTimer) clearTimeout(startupTimer);
+    startupTimer = null;
     if (!autoCheck) return;
+
+    if (!startupRan) {
+      startupRan = true;
+      startupTimer = setTimeout(() => {
+        void checkForUpdate("startup").finally(plan);
+      }, 6_000);
+      return;
+    }
+
     const every = checkIntervalHours * 3_600_000;
     const last = updateStore.get().checkedAt ?? 0;
     const jitter = every * (Math.random() * 0.2 - 0.1);
-    // First look waits a minute so startup stays quiet.
     const wait = Math.max(60_000, last + every + jitter - Date.now());
     timer = setTimeout(() => {
       void checkForUpdate("auto").finally(plan);
     }, Math.min(wait, 2 ** 31 - 1));
   };
+
   plan();
   const off = clientConfigStore.subscribe(plan);
   return () => {
     off();
     if (timer) clearTimeout(timer);
+    if (startupTimer) clearTimeout(startupTimer);
   };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Copy, Download, ExternalLink, FileText, FolderOpen, LogOut, QrCode, RefreshCw, Server, Trash2 } from "lucide-react";
+import { Copy, Download, ExternalLink, FileText, FolderOpen, LogOut, QrCode, RefreshCw, RotateCcw, Server, Trash2 } from "lucide-react";
 import { RELEASES_PAGE, RELEASE_REPO, configKeySpec, sourceLabel } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketInput, PocketSwitch, PocketTextarea, useToast } from "../../components/PocketUI";
 import { LocalHostDeps } from "../../components/LocalHostDeps";
@@ -8,7 +8,19 @@ import { serverLabel } from "../../components/Sidebar";
 import { appVersion, copyToClipboard, detectPlatform, getHostdStatus, openExternalUrl, pushSystemNotification, type HostdLocalStatus } from "../../lib/bridge";
 import { native, type ResourceUsage } from "../../lib/native";
 import { clientConfigStore, setConfig, useClientConfig } from "../../lib/config";
-import { checkForUpdate, currentRegion, fetchReleaseNotes, lastSourceSentence, orderSentence, regionReason, sourceOrder, updateStore, type ReleaseNotes } from "../../lib/updates";
+import {
+  checkForUpdate,
+  currentRegion,
+  fetchReleaseNotes,
+  lastSourceSentence,
+  orderSentence,
+  regionReason,
+  restartToApplyUpdate,
+  sourceOrder,
+  startUpdateDownload,
+  updateStore,
+  type ReleaseNotes,
+} from "../../lib/updates";
 import { RichMarkdown } from "../../lib/markdown";
 import { isMockServer } from "../../lib/mock";
 import { refreshNotifyChannel, signOut } from "../../lib/relay";
@@ -382,47 +394,97 @@ export function UpdatesPane() {
   const latest = st.info?.hasUpdate ? st.info.latest : null;
   useEffect(() => {
     if (!latest) return;
+    if (st.info?.notes?.body) {
+      setNotes(st.info.notes);
+      return;
+    }
     let alive = true;
     setNotes("loading");
     void fetchReleaseNotes().then((n) => alive && setNotes(n));
     return () => {
       alive = false;
     };
-  }, [latest]);
+  }, [latest, st.info?.notes]);
   const pageUrl = st.info?.pageUrl || RELEASES_PAGE;
   const words = (r: "cn" | "global") => sourceOrder(r).slice(0, 2).join("、");
+  const phase = st.installPhase;
+  const busy =
+    phase === "downloading" ||
+    phase === "verifying" ||
+    phase === "staging" ||
+    phase === "restarting";
+  const pct = st.progress?.percent ?? null;
+
+  let statusAbout = "还没检查过";
+  if (st.checking) statusAbout = "正在向 GitHub 与镜像线路并发查询…";
+  else if (st.error) statusAbout = st.error;
+  else if (phase === "error" && st.installError) statusAbout = st.installError;
+  else if (phase === "ready" && st.info) statusAbout = `v${st.info.latest} 已下载并校验通过，点击右侧重启完成更新`;
+  else if (phase === "downloading" && st.progress) {
+    const dlMb = (st.progress.downloadedBytes / (1024 * 1024)).toFixed(1);
+    const totMb = st.progress.totalBytes ? ` / ${(st.progress.totalBytes / (1024 * 1024)).toFixed(1)} MB` : " MB";
+    statusAbout = `正在下载更新（${dlMb}${totMb}${pct !== null ? ` · ${pct}%` : ""}）`;
+  } else if (phase === "verifying") statusAbout = st.progress?.message || "正在校验 SHA-256…";
+  else if (phase === "staging") statusAbout = st.progress?.message || "正在校验签名并准备安装…";
+  else if (phase === "restarting") statusAbout = "正在重启并安装新版本…";
+  else if (st.info) {
+    statusAbout = st.info.hasUpdate
+      ? `发现新版本 v${st.info.latest}`
+      : `已是最新版本 v${st.info.latest}${st.checkedAt ? `（${relTime(st.checkedAt)}检查）` : ""}`;
+  } else if (st.checkedAt) {
+    statusAbout = `上次检查：${relTime(st.checkedAt)}`;
+  }
+
   return (
     <div className="pane">
       <PaneTitle title="更新" />
-      <SetRow
-        title={`当前版本 v${appVersion()}`}
-        about={
-          st.checking
-            ? "正在检查…"
-            : st.error
-              ? st.error
-              : st.info
-                ? st.info.hasUpdate
-                  ? `有新版本 v${st.info.latest}`
-                  : `已是最新版本${st.checkedAt ? `（${relTime(st.checkedAt)}检查）` : ""}`
-                : st.checkedAt
-                  ? `上次检查：${relTime(st.checkedAt)}`
-                  : "还没检查过"
-        }
-      >
+      <SetRow title={`当前版本 v${appVersion()}`} about={statusAbout}>
         <div className="row wrap" style={{ gap: 6, justifyContent: "flex-end" }}>
           {st.info?.hasUpdate ? (
-            <PocketButton size="sm" variant="primary" onClick={() => void openExternalUrl(st.info!.downloadUrl)}>
-              <Download size={14} />
-              <span>下载 v{st.info.latest}</span>
-            </PocketButton>
+            phase === "ready" ? (
+              <PocketButton size="sm" variant="primary" onClick={() => void restartToApplyUpdate()}>
+                <RotateCcw size={14} />
+                <span>立即重启并更新</span>
+              </PocketButton>
+            ) : busy ? (
+              <PocketButton size="sm" variant="soft" disabled>
+                <RefreshCw size={14} />
+                <span>{phase === "staging" ? "准备中…" : phase === "verifying" ? "校验中…" : phase === "restarting" ? "重启中…" : `下载中${pct !== null ? ` ${pct}%` : "…"}`}</span>
+              </PocketButton>
+            ) : phase === "error" ? (
+              <>
+                <PocketButton size="sm" variant="primary" onClick={() => void startUpdateDownload()}>
+                  <RefreshCw size={14} />
+                  <span>重试下载</span>
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onClick={() => void openExternalUrl(st.info!.downloadUrl)}>
+                  <ExternalLink size={14} />
+                  <span>浏览器下载</span>
+                </PocketButton>
+              </>
+            ) : (
+              <PocketButton size="sm" variant="primary" onClick={() => void startUpdateDownload()}>
+                <Download size={14} />
+                <span>立即下载更新 v{st.info.latest}</span>
+              </PocketButton>
+            )
           ) : null}
-          <PocketButton size="sm" variant="soft" disabled={st.checking} onClick={() => void checkForUpdate("manual").then((i) => i && !i.hasUpdate && toast("已是最新版本"))}>
+          <PocketButton size="sm" variant="soft" disabled={st.checking || busy} onClick={() => void checkForUpdate("manual").then((i) => i && !i.hasUpdate && toast("已是最新版本"))}>
             <RefreshCw size={14} />
             <span>{st.checking ? "检查中…" : "检查更新"}</span>
           </PocketButton>
         </div>
       </SetRow>
+      {phase === "downloading" || phase === "verifying" || phase === "staging" ? (
+        <div className="update-inline-progress" aria-hidden>
+          <div className="update-toast-track">
+            <div
+              className={`update-toast-fill${pct === null || phase !== "downloading" ? " pulse" : ""}`}
+              style={{ width: `${pct !== null ? Math.max(4, pct) : 100}%` }}
+            />
+          </div>
+        </div>
+      ) : null}
       {st.info?.hasUpdate ? (
         <div className="release-notes">
           {notes === "loading" ? (
@@ -443,7 +505,7 @@ export function UpdatesPane() {
           )}
         </div>
       ) : null}
-      <ConfigSwitch k="update.autoCheck" about="隔一段时间看看有没有新版本，有就在侧栏“设置”旁亮一个小点。" />
+      <ConfigSwitch k="update.autoCheck" about="启动时及每隔一段时间自动检查 GitHub 新版本；发现新版本后在右下角弹出更新卡片，下载校验完成后一键重启更新。" />
       <ConfigSelect
         k="update.checkIntervalHours"
         about="自动检查的间隔。"

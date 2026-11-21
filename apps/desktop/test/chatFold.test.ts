@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ConvEvent } from "@herdr-pocket/protocol";
-import { foldConvEvents, mergeConvEvents } from "../src/lib/chatFold.ts";
+import { foldConvEvents, mergeConvEvents, type ChatRow } from "../src/lib/chatFold.ts";
+import { reconcileOutgoingSends, shouldAutoDrainQueue, type OutgoingSendLike } from "../src/lib/chatQueueLogic.ts";
 import {
   KittyApcSplitter,
   KittyKeyboardState,
   encodeKittyKey,
   parseKittyGfxCommand,
   parseOsc66,
+  parsePngDimensions,
 } from "../src/lib/kittyProtocol.ts";
 
 test("mergeConvEvents: preserves reference identity when unchanged and sorts by numeric pos", () => {
@@ -134,4 +136,82 @@ test("kittyProtocol: APC splitter across chunks, graphics headers, OSC 66 sizing
   );
   kb.pop(false, 1);
   assert.equal(kb.current(false), 0);
+});
+
+test("parsePngDimensions reads IHDR width/height and rejects non-PNG bytes", () => {
+  const pngHeader = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x0d,
+    0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x02, 0x80, // 640
+    0x00, 0x00, 0x01, 0xe0, // 480
+  ]);
+  assert.deepEqual(parsePngDimensions(pngHeader), { width: 640, height: 480 });
+  assert.equal(parsePngDimensions(new Uint8Array([0x89, 0x50, 0x4e, 0x47])), null);
+  assert.equal(parsePngDimensions(new Uint8Array(24)), null);
+});
+
+test("chatQueue: reconcileOutgoingSends dedupes confirmed messages and tracks awaitingReply", () => {
+  const s1: OutgoingSendLike = {
+    id: "out-1",
+    text: "帮我检查一下",
+    attachedCount: 1,
+    ts: 100_000,
+    state: "sent",
+  };
+  const s2: OutgoingSendLike = {
+    id: "out-2",
+    text: "第二条还没入库",
+    attachedCount: 0,
+    ts: 102_000,
+    state: "sending",
+  };
+  const sErr: OutgoingSendLike = {
+    id: "out-3",
+    text: "失败消息",
+    attachedCount: 0,
+    ts: 103_000,
+    state: "failed",
+  };
+
+  const rows: ChatRow[] = [
+    {
+      kind: "user",
+      id: "u-1",
+      text: "帮我检查一下",
+      ts: 100_500,
+      attachedLines: ["/tmp/shot.png"],
+      attachedCount: 1,
+    },
+  ];
+
+  const r1 = reconcileOutgoingSends([s1, s2, sErr], rows, "idle", 105_000);
+  assert.deepEqual(r1.matchedIds, ["out-1"]);
+  assert.deepEqual(r1.expiredIds, []);
+  assert.deepEqual(
+    r1.unmatched.map((x) => x.id),
+    ["out-2", "out-3"],
+  );
+  assert.equal(r1.awaitingReply, true);
+
+  // Once the assistant answers after the latest send, awaitingReply clears.
+  const withReply: ChatRow[] = [
+    ...rows,
+    { kind: "user", id: "u-2", text: "第二条还没入库", ts: 102_200, attachedLines: [], attachedCount: 0 },
+    { kind: "assistant", id: "a-1", text: "好的", ts: 104_000 },
+  ];
+  const r2 = reconcileOutgoingSends([s1, s2], withReply, "done", 106_000);
+  assert.deepEqual(r2.matchedIds, ["out-1", "out-2"]);
+  assert.equal(r2.awaitingReply, false);
+});
+
+test("chatQueue: shouldAutoDrainQueue only drains when online idle/done after cooldown", () => {
+  assert.equal(shouldAutoDrainQueue("idle", true, 0, false, 10_000), true);
+  assert.equal(shouldAutoDrainQueue("done", true, 5_000, false, 10_000), true);
+  assert.equal(shouldAutoDrainQueue("working", true, 0, false, 10_000), false);
+  assert.equal(shouldAutoDrainQueue("blocked", true, 0, false, 10_000), false);
+  assert.equal(shouldAutoDrainQueue("unknown", true, 0, false, 10_000), false);
+  assert.equal(shouldAutoDrainQueue("idle", false, 0, false, 10_000), false);
+  assert.equal(shouldAutoDrainQueue("idle", true, 0, true, 10_000), false);
+  assert.equal(shouldAutoDrainQueue("done", true, 8_000, false, 10_000), false);
 });

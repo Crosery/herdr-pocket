@@ -1,6 +1,6 @@
 [package]
 name = "herdr-pocket-desktop"
-version = "0.2.3"
+version = "0.2.4"
 description = "Herdr Pocket Desktop Client"
 authors = ["Herdr Pocket <noreply@users.noreply.github.com>"]
 homepage = "https://github.com/Crosery/herdr-pocket"
@@ -60,7 +60,7 @@ core-foundation = "0.10"
 core-graphics = "0.25"
 objc2 = "0.6"
 objc2-foundation = "0.3"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "NSSound", "NSResponder", "NSWindow", "NSApplication"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "NSSound", "NSResponder", "NSWindow", "NSApplication", "NSOpenPanel", "NSSavePanel"] }
 block2 = "0.6"
 # Already in the tree through wry; for WKWebsiteDataStore.removeDataStoreForIdentifier and
 # WKPreferences.inactiveSchedulingPolicy (macOS 14+).
@@ -85,8 +85,11 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Power",
   "Win32_System_ProcessStatus",
   "Win32_System_Registry",
+  "Win32_System_Com",
   "Win32_System_Threading",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Media_Audio",
 ] }

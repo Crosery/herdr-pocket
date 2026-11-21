@@ -4,7 +4,8 @@
 // may hold keys are listed but never read, and so is this computer's own herdr-pocket folder.
 
 import { open, readdir, realpath, stat } from "node:fs/promises";
-import { extname, isAbsolute, join, relative, sep } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { FILES_IGNORED, FILES_LIMITS, type FileEntry, type RpcResult } from "@herdr-pocket/protocol";
 
 export type FilesErrorCode = "bad_request" | "forbidden" | "not_found";
@@ -220,4 +221,79 @@ export function looksBinary(head: Uint8Array): boolean {
   } catch {
     return true;
   }
+}
+
+const FOLDER_LIMIT = 200;
+
+function compactHome(p: string, home: string): string {
+  if (!home || home === "/" || home === "\\") return p;
+  if (p === home) return "~";
+  return p.startsWith(`${home}${sep}`) ? `~${sep}${p.slice(home.length + 1)}` : p;
+}
+
+/** Lists subdirectories inside `inputPath` (defaulting to the user's home directory) for folder picking. */
+export async function listFolders(
+  inputPath: unknown,
+  hidden = false,
+  o: FilesOptions = {},
+): Promise<RpcResult<"folders.list">> {
+  const home = await realpath(homedir()).catch(() => homedir());
+  let target = typeof inputPath === "string" ? inputPath.trim() : "";
+  if (!target || target === "~") target = home;
+  else if (target.startsWith("~/") || target.startsWith("~\\")) target = join(home, target.slice(2));
+  if (target.length > 4096 || target.includes("\0")) throw new FilesError("bad_request", "路径不对");
+
+  let real: string;
+  try {
+    real = await realpath(target);
+  } catch {
+    throw new FilesError("not_found", "没有这个目录");
+  }
+  const st = await stat(real).catch(() => null);
+  if (!st?.isDirectory()) throw new FilesError("bad_request", "这不是一个目录");
+
+  const resolvedPrivate = await Promise.all((o.privateDirs ?? []).map((dir) => realpath(dir).catch(() => dir)));
+  const isRestricted = (p: string): boolean => {
+    const parts = p.split(/[\\/]+/).filter(Boolean);
+    if (parts.some(isPrivateName)) return true;
+    return resolvedPrivate.some((dir) => inside(dir, p));
+  };
+  if (isRestricted(real)) throw new FilesError("forbidden", "这个目录可能存有密钥或私有配置，不能浏览");
+
+  let dirents;
+  try {
+    dirents = await readdir(real, { withFileTypes: true });
+  } catch (e) {
+    throw new FilesError("forbidden", `读不了这个目录（${(e as NodeJS.ErrnoException).code ?? "error"}）`);
+  }
+
+  const dirs: string[] = [];
+  for (const d of dirents) {
+    if (!hidden && (d.name.startsWith(".") || d.name === "node_modules")) continue;
+    if (isPrivateName(d.name)) continue;
+    const full = join(real, d.name);
+    let isDir = d.isDirectory();
+    if (d.isSymbolicLink()) {
+      const linkTarget = await realpath(full).catch(() => undefined);
+      if (!linkTarget || isRestricted(linkTarget)) continue;
+      const lst = await stat(linkTarget).catch(() => null);
+      isDir = Boolean(lst?.isDirectory());
+    }
+    if (isDir) dirs.push(d.name);
+  }
+  dirs.sort(byName);
+
+  const up = dirname(real);
+  const parent = up && up !== real ? compactHome(up, home) : null;
+  const displayPath = compactHome(real, home);
+
+  return {
+    path: displayPath,
+    displayPath,
+    parent,
+    entries: dirs.slice(0, FOLDER_LIMIT).map((name) => ({
+      name,
+      path: compactHome(join(real, name), home),
+    })),
+  };
 }

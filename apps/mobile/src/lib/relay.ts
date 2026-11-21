@@ -132,7 +132,7 @@ type Stream = { id: string; to: string; stream: "terminal" | "session"; params: 
 /** Reads that may simply be asked again through the relay when a direct link dies under them. */
 const SAFE_AGAIN = new Set<RpcMethod>([
   "agents.list", "terminal.read", "session.events", "session.children", "spaces.list", "host.info", "agent.seen",
-  "herdr.layout", "sessions.list", "sessions.search", "sessions.read", "sessions.usage", "harness.icons",
+  "herdr.layout", "folders.list", "sessions.list", "sessions.search", "sessions.read", "sessions.usage", "harness.icons",
 ]);
 
 /** React Native's WebSocket also takes request headers (the DOM typing doesn't know). */

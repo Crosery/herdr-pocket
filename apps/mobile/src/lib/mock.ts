@@ -585,6 +585,10 @@ export function mockLink(): Link {
           agents = agents.map((a) => (a.key === p.agent && a.status === "blocked" ? { ...a, status: "working", statusSince: now(), errored: undefined, statusNote: undefined } : a));
           publish();
           return { ok: true };
+        case "terminal.interrupt":
+          inTurn.delete(p.agent ?? "");
+          if (p.agent) setAgent(p.agent, { status: "idle", statusSince: now() });
+          return { ok: true };
         case "terminal.put": {
           // Like `hc put`: each picture lands in the terminal's own folder on its computer.
           const files = (p as { files?: { name?: string }[] }).files ?? [];

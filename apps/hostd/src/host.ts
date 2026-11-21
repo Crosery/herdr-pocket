@@ -22,7 +22,7 @@ import {
 } from "@herdr-pocket/protocol";
 import { HcAdapter, type AppNames } from "./hc.ts";
 import type { ScreenLines } from "./hcscreen.ts";
-import { HerdrApp, NoDesktopApp, checkFolder, findPrograms, herdrCommandArgs, installedLaunchers, launcherArgv, resumeArgv, withProgramPath } from "./create.ts";
+import { HerdrApp, NoDesktopApp, checkFolder, findPrograms, herdrCommandArgs, installedLaunchers, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { DirectServer, type DirectPeer } from "./direct.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
@@ -33,7 +33,7 @@ import { typeFirstTask, type TypeTaskOptions } from "./firsttask.ts";
 import { FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from "./put.ts";
 import { LogBuffer, clipChars, levelOf } from "./logbuf.ts";
 import { CONFIG_DIR, type HostConfig } from "./config.ts";
-import { FilesError, listFiles, readFileSlice } from "./files.ts";
+import { FilesError, listFiles, listFolders, readFileSlice } from "./files.ts";
 import { run } from "./util.ts";
 import { changedKeys } from "./configcmd.ts";
 import { VERSION, clientConfigPath, readClientConfig, type LoadedClientConfig } from "@herdr-pocket/update";
@@ -138,6 +138,8 @@ export class Host {
   private names: AppNames | undefined;
   private namesSig = "";
   private namesTimer: NodeJS.Timeout | null = null;
+  /** Resolved space folders cached from `spaces.list` so empty `agent.create` folder inherits live cwd. */
+  private spaceFolders = new Map<string, string>();
   /**
    * Sources that did not answer are looked for again this often. After a reboot or a login the
    * daemon can start before the herdr app or Uniflo; without this it would never read
@@ -865,14 +867,17 @@ export class Host {
     const out: string[] = [];
     const recent = [...this.uniflo.sessions].sort((a, b) => b.updated_at - a.updated_at).map((s) => s.cwd);
     for (const f of [...extra, ...this.agents.map((a) => a.cwd), ...recent]) {
-      if (!f || seen.has(f) || f === "/") continue;
-      seen.add(f);
+      if (!f || f === "/") continue;
+      let abs: string;
       try {
-        checkFolder(f);
+        abs = checkFolder(f);
       } catch {
         continue;
       }
-      out.push(f.startsWith(home) ? `~${f.slice(home.length)}` : f);
+      if (abs === "/" || seen.has(abs)) continue;
+      seen.add(abs);
+      const label = shortHome(abs, home);
+      if (label) out.push(label);
       if (out.length >= 16) break;
     }
     return out;
@@ -1076,8 +1081,12 @@ export class Host {
       let standalone = false;
       if (this.opts.readOnly) reason = "这台电脑开了只读模式";
       else if (!this.sources.includes("hc")) reason = "这台电脑没有装桌面 herdr";
+      else if (this.hc.terminals.size === 0) await this.hc.list().catch(() => undefined);
       try {
-        spaces = await this.app.spaces();
+        spaces = await this.app.spaces(this.hc.terminals);
+        for (const s of spaces) {
+          if (s.folder) this.spaceFolders.set(s.id, s.folder);
+        }
       } catch (e) {
         // Without the desktop app (Windows, servers) new agents get terminals of their own.
         if (e instanceof NoDesktopApp) standalone = true;
@@ -1106,6 +1115,23 @@ export class Host {
         throw new RpcFailure("bad_request", (e as Error).message);
       }
       if (!p.space && !folder) folder = checkFolder("~");
+      else if (p.space && !folder) {
+        let spaceFolder = this.spaceFolders.get(p.space);
+        if (!spaceFolder) {
+          const list = await this.app.spaces(this.hc.terminals).catch(() => []);
+          for (const s of list) {
+            if (s.folder) this.spaceFolders.set(s.id, s.folder);
+          }
+          spaceFolder = this.spaceFolders.get(p.space);
+        }
+        if (spaceFolder) {
+          try {
+            folder = checkFolder(spaceFolder);
+          } catch {
+            /* ignore if directory no longer exists */
+          }
+        }
+      }
       const task = str(p.task, 20_000);
       const r = await this.newTerminal(
         () =>
@@ -1170,6 +1196,10 @@ export class Host {
       this.note("debug", "files", `files.read ${a.localId} "${r.path}" ${r.bytes}/${r.size} bytes${r.binary ? " binary" : ""} ${Date.now() - t0}ms`, { agent: a.key });
       return r;
     },
+    "folders.list": async (p) => {
+      const hidden = Boolean(p?.hidden);
+      return this.files(() => listFolders(p?.path, hidden, { privateDirs: this.privateDirs }));
+    },
     "agent.seen": async (p) => {
       this.writable();
       const a = this.resolve(p.agent);
@@ -1213,7 +1243,7 @@ export class Host {
         .map((s) => ({
           id: s.id,
           name: s.name,
-          folder: s.folder,
+          folder: resolveSpaceFolder(s, this.hc.terminals),
           active: !!s.active,
           tabs: (s.tabs ?? []).map((t) => ({
             id: t.id ?? "",

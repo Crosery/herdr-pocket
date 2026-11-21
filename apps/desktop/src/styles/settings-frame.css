@@ -325,8 +325,8 @@
 }
 
 .settings-frame .pk-select-trigger {
-  height: 30px;
-  min-width: 132px;
+  height: 32px;
+  min-width: 140px;
   padding: 0 10px;
   border-radius: 7px;
   font-size: calc(13px * var(--ts, 1));
@@ -372,7 +372,8 @@
 }
 
 .settings-frame .sf-stepper output {
-  width: 54px;
+  min-width: 58px;
+  padding: 0 6px;
   text-align: center;
   font-size: calc(13px * var(--ts, 1));
   font-weight: 600;
@@ -494,7 +495,7 @@
 
 .sf-term-font-ctrl .pk-select-trigger,
 .sf-term-font-ctrl .pk-input {
-  width: 240px;
+  width: 256px;
   max-width: 100%;
 }
 
@@ -506,24 +507,33 @@
   background: #16141d;
   color: #f4eef8;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 /* A narrow page (the frame at its 640 px minimum): controls drop under their text.
    A wider page keeps them on the right even where the window-width rule in app.css wraps. */
 @container sfpage (max-width: 420px) {
   .settings-frame .set-row:has(.segmented),
-  .settings-frame .set-row:has(.sf-combo) {
+  .settings-frame .set-row:has(.sf-combo),
+  .settings-frame .set-row:has(.sf-term-font-ctrl),
+  .settings-frame .set-row:has(.pk-select-trigger) {
     flex-wrap: wrap;
   }
   .settings-frame .set-row:has(.segmented) .set-text,
-  .settings-frame .set-row:has(.sf-combo) .set-text {
+  .settings-frame .set-row:has(.sf-combo) .set-text,
+  .settings-frame .set-row:has(.sf-term-font-ctrl) .set-text,
+  .settings-frame .set-row:has(.pk-select-trigger) .set-text {
     flex-basis: 100%;
   }
   .settings-frame .set-row:has(.segmented) .set-control,
-  .settings-frame .set-row:has(.sf-combo) .set-control {
+  .settings-frame .set-row:has(.sf-combo) .set-control,
+  .settings-frame .set-row:has(.sf-term-font-ctrl) .set-control,
+  .settings-frame .set-row:has(.pk-select-trigger) .set-control {
     max-width: none;
+  }
+  .sf-term-font-ctrl {
+    align-items: flex-start;
   }
 }
 

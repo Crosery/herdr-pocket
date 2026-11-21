@@ -592,6 +592,16 @@ export interface RpcMethods {
       language?: string;
     };
   };
+  /** List subdirectories inside `path` (default user home) for selecting a working directory when creating an agent. */
+  "folders.list": {
+    params: { path?: string; hidden?: boolean };
+    result: {
+      path: string;
+      displayPath: string;
+      parent: string | null;
+      entries: Array<{ name: string; path: string }>;
+    };
+  };
 }
 
 /**

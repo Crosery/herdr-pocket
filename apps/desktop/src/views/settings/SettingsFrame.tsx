@@ -187,6 +187,12 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
         <Dialog.Content
           className="settings-frame"
           aria-describedby={undefined}
+          onEscapeKeyDown={(e) => {
+            const target = e.target as HTMLElement | null;
+            if (target?.dataset?.escapeLocal === "true") {
+              e.preventDefault();
+            }
+          }}
           onOpenAutoFocus={(e) => {
             // Start on the selected section, not on the first control of the page.
             e.preventDefault();

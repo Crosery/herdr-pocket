@@ -57,6 +57,8 @@ const KEY_ALIASES: Record<string, string> = {
   "ctrl+c": "ctrl+c",
   "ctrl+d": "ctrl+d",
   "ctrl+l": "ctrl+l",
+  "alt+m": "alt+m",
+  "alt+enter": "alt+enter",
 };
 
 /**

@@ -262,18 +262,24 @@ fn source_cache_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// What `update_fetch_sums` may fetch: the latest release's SHA256SUMS on github.com,
+/// What `update_fetch_sums` may fetch: the latest or tagged release's SHA256SUMS on github.com,
 /// directly or through a mirror prefix (https, or plain http on this machine).
 fn is_sums_url(url: &str) -> bool {
-    const SUFFIX: &str = "/releases/latest/download/SHA256SUMS";
+    const LATEST_SUFFIX: &str = "/releases/latest/download/SHA256SUMS";
+    const TAGGED_MARKER: &str = "/releases/download/v";
+    const TAGGED_SUFFIX: &str = "/SHA256SUMS";
     let Ok(u) = url::Url::parse(url) else {
         return false;
     };
     let local = matches!(u.host_str(), Some("localhost" | "127.0.0.1"));
-    (u.scheme() == "https" || (u.scheme() == "http" && local))
-        && url.ends_with(SUFFIX)
+    let scheme_ok = u.scheme() == "https" || (u.scheme() == "http" && local);
+    let path_ok = url.ends_with(LATEST_SUFFIX)
+        || (url.contains(TAGGED_MARKER) && url.ends_with(TAGGED_SUFFIX));
+    scheme_ok
+        && path_ok
         && url.contains("https://github.com/")
         && u.query().is_none()
+        && u.fragment().is_none()
 }
 
 /// The release listing, fetched natively: github.com's redirect has no CORS headers,
@@ -330,6 +336,261 @@ pub fn update_source_cache_write(cache: Value) -> Result<(), String> {
     config::write_atomic(&p, &data).map_err(|e| e.to_string())
 }
 
+fn expand_initial_folder(raw: Option<String>) -> Option<std::path::PathBuf> {
+    let trimmed = raw.as_deref()?.trim();
+    if trimmed.is_empty() {
+        return crate::home_dir();
+    }
+    let expanded = if trimmed == "~" {
+        crate::home_dir()?
+    } else if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        crate::home_dir()?.join(rest)
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+    if expanded.is_dir() {
+        Some(expanded)
+    } else {
+        expanded
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_path_buf())
+            .or_else(crate::home_dir)
+    }
+}
+
+fn format_picked_folder(path: &std::path::Path) -> String {
+    #[cfg(not(windows))]
+    if let Some(home) = crate::home_dir() {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// Opens the OS-native folder selection dialog (Finder sheet on macOS, Explorer on Windows).
+#[tauri::command]
+pub async fn pick_folder(
+    app: AppHandle,
+    initial_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    let start_dir = expand_initial_folder(initial_dir);
+
+    #[cfg(target_os = "macos")]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || {
+            let res = (|| -> Result<Option<String>, String> {
+                let Some(mtm) = objc2::MainThreadMarker::new() else {
+                    return Err("不在主线程上，无法打开目录选择器".into());
+                };
+                use objc2_app_kit::NSOpenPanel;
+                use objc2_foundation::{NSString, NSURL};
+
+                let panel = NSOpenPanel::openPanel(mtm);
+                panel.setCanChooseDirectories(true);
+                panel.setCanChooseFiles(false);
+                panel.setCanCreateDirectories(true);
+                if let Some(dir) = &start_dir {
+                    let s = NSString::from_str(&dir.to_string_lossy());
+                    let url = NSURL::fileURLWithPath(&s);
+                    panel.setDirectoryURL(Some(&url));
+                }
+                let resp = panel.runModal();
+                if resp != 1 {
+                    return Ok(None);
+                }
+                let picked = panel
+                    .URL()
+                    .and_then(|u| u.path())
+                    .map(|ns| format_picked_folder(std::path::Path::new(&ns.to_string())));
+                Ok(picked)
+            })();
+            let _ = tx.send(res);
+        })
+        .map_err(|e| format!("无法弹出目录选择框：{e}"))?;
+
+        return tauri::async_runtime::spawn_blocking(move || {
+            rx.recv().map_err(|_| "目录选择框已关闭".to_string())?
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = app;
+        return tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
+            use std::ffi::c_void;
+            use std::os::windows::ffi::OsStrExt;
+            use std::ptr::{null, null_mut};
+            use windows_sys::core::{GUID, HRESULT, PCWSTR, PWSTR};
+            use windows_sys::Win32::System::Com::{
+                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+            };
+            use windows_sys::Win32::UI::Shell::{
+                FileOpenDialog, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
+                SIGDN_FILESYSPATH,
+            };
+
+            const IID_IFILEOPENDIALOG: GUID = GUID::from_u128(0xd57c7288_d4ad_4768_be02_9d969532d960);
+            const IID_ISHELLITEM: GUID = GUID::from_u128(0x43826d1e_e718_42ee_bc55_a1e261c37bfe);
+            const HRESULT_CANCELLED: HRESULT = 0x800704C7u32 as i32;
+
+            unsafe {
+                let hr_init = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+                let uninit = hr_init >= 0;
+                struct Uninit(bool);
+                impl Drop for Uninit {
+                    fn drop(&mut self) {
+                        if self.0 {
+                            unsafe { CoUninitialize() };
+                        }
+                    }
+                }
+                let _guard = Uninit(uninit);
+
+                let mut dlg: *mut c_void = null_mut();
+                let hr = CoCreateInstance(
+                    &FileOpenDialog,
+                    null_mut(),
+                    CLSCTX_INPROC_SERVER,
+                    &IID_IFILEOPENDIALOG,
+                    &mut dlg,
+                );
+                if hr < 0 || dlg.is_null() {
+                    return Err(format!("打不开文件夹选择框 (0x{hr:08x})"));
+                }
+                let vtbl = *(dlg as *const *const *const c_void);
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(*vtbl.add(2));
+                let show: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+                    std::mem::transmute(*vtbl.add(3));
+                let set_options: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT =
+                    std::mem::transmute(*vtbl.add(9));
+                let get_options: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT =
+                    std::mem::transmute(*vtbl.add(10));
+                let set_folder: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT =
+                    std::mem::transmute(*vtbl.add(12));
+                let get_result: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
+                    std::mem::transmute(*vtbl.add(20));
+
+                let mut opts: u32 = 0;
+                if get_options(dlg, &mut opts) >= 0 {
+                    let _ = set_options(dlg, opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+                }
+
+                if let Some(dir) = start_dir {
+                    let wide: Vec<u16> = dir
+                        .as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    let mut folder_item: *mut c_void = null_mut();
+                    if SHCreateItemFromParsingName(
+                        wide.as_ptr(),
+                        null_mut(),
+                        &IID_ISHELLITEM,
+                        &mut folder_item,
+                    ) >= 0
+                        && !folder_item.is_null()
+                    {
+                        let _ = set_folder(dlg, folder_item);
+                        let ivtbl = *(folder_item as *const *const *const c_void);
+                        let irel: unsafe extern "system" fn(*mut c_void) -> u32 =
+                            std::mem::transmute(*ivtbl.add(2));
+                        irel(folder_item);
+                    }
+                }
+
+                let hr_show = show(dlg, null_mut());
+                if hr_show == HRESULT_CANCELLED || hr_show < 0 {
+                    release(dlg);
+                    return if hr_show == HRESULT_CANCELLED {
+                        Ok(None)
+                    } else {
+                        Ok(None)
+                    };
+                }
+
+                let mut item: *mut c_void = null_mut();
+                let hr_res = get_result(dlg, &mut item);
+                release(dlg);
+                if hr_res < 0 || item.is_null() {
+                    return Ok(None);
+                }
+
+                let ivtbl = *(item as *const *const *const c_void);
+                let irel: unsafe extern "system" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(*ivtbl.add(2));
+                let get_display_name: unsafe extern "system" fn(
+                    *mut c_void,
+                    i32,
+                    *mut PWSTR,
+                ) -> HRESULT = std::mem::transmute(*ivtbl.add(5));
+                let mut psz: PWSTR = null_mut();
+                let hr_name = get_display_name(item, SIGDN_FILESYSPATH, &mut psz);
+                irel(item);
+                if hr_name < 0 || psz.is_null() {
+                    return Ok(None);
+                }
+                let mut len = 0usize;
+                while *psz.add(len) != 0 {
+                    len += 1;
+                }
+                let picked = String::from_utf16_lossy(std::slice::from_raw_parts(psz, len));
+                CoTaskMemFree(psz as *const c_void);
+                let _ = PCWSTR::default();
+                Ok(Some(format_picked_folder(std::path::Path::new(&picked))))
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        let _ = app;
+        return tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
+            let start = start_dir
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            if let Ok(out) = std::process::Command::new("zenity")
+                .args(["--file-selection", "--directory", "--filename", &format!("{}/", start.trim_end_matches('/'))])
+                .output()
+            {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        return Ok(Some(format_picked_folder(std::path::Path::new(&s))));
+                    }
+                }
+                return Ok(None);
+            }
+            if let Ok(out) = std::process::Command::new("kdialog")
+                .args(["--getexistingdirectory", &start])
+                .output()
+            {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        return Ok(Some(format_picked_folder(std::path::Path::new(&s))));
+                    }
+                }
+                return Ok(None);
+            }
+            Err("当前 Linux 环境未安装 zenity / kdialog，请改用右侧「浏览目录」".into())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_sums_url;
@@ -337,8 +598,11 @@ mod tests {
     #[test]
     fn only_the_release_listing_is_fetched() {
         let gh = "https://github.com/owner/repo/releases/latest/download/SHA256SUMS";
+        let tagged = "https://github.com/owner/repo/releases/download/v0.2.4/SHA256SUMS";
         assert!(is_sums_url(gh));
+        assert!(is_sums_url(tagged));
         assert!(is_sums_url(&format!("https://mirror.example.com/{gh}")));
+        assert!(is_sums_url(&format!("https://mirror.example.com/{tagged}")));
         assert!(is_sums_url(&format!("http://localhost:8080/{gh}")));
         assert!(
             !is_sums_url(&format!("http://mirror.example.com/{gh}")),

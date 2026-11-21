@@ -154,6 +154,63 @@ export interface AppLs {
   }>;
 }
 
+/** Shortens paths inside `home` to `~` / `~/...` so folder chips stay concise and deduplicate cleanly. */
+export function shortHome(p: string | undefined, home = homedir()): string | undefined {
+  const clean = p?.trim();
+  if (!clean) return undefined;
+  const h = home.replace(/[\\/]+$/, "");
+  const c = clean.length > 1 && !/^[A-Za-z]:[\\/]?$/.test(clean) ? clean.replace(/[\\/]+$/, "") : clean;
+  if (c === h) return "~";
+  if (c.startsWith(`${h}/`) || (IS_WINDOWS && c.startsWith(`${h}\\`))) {
+    return `~${c.slice(h.length)}`;
+  }
+  return c;
+}
+
+const SHELL_BINS = new Set(["sh", "zsh", "bash", "fish", "pwsh", "powershell", "cmd"]);
+
+export type SpaceTerminalMeta = {
+  cwd?: string | null;
+  foreground?: { argv?: string[]; cwd?: string | null } | null;
+  status?: { app?: string | null } | null;
+  argv?: string[];
+};
+
+/**
+ * Resolves a space's real working folder from live terminals inside it (`hc`), because `herdr-app ls`
+ * keeps each space's initial creation-time `s.folder` (often `~` or `~/tmp`) even after moving into a repo.
+ */
+export function resolveSpaceFolder(
+  space: AppLs["spaces"][number],
+  terminals?: ReadonlyMap<string, SpaceTerminalMeta>,
+  home = homedir(),
+): string | undefined {
+  const counts = new Map<string, number>();
+  if (terminals?.size) {
+    for (const tab of space.tabs ?? []) {
+      for (const term of tab.terminals ?? []) {
+        if (!term.terminal) continue;
+        const t = terminals.get(term.terminal);
+        const rawCwd = (t?.foreground?.cwd || t?.cwd)?.trim();
+        if (!rawCwd || rawCwd === "/") continue;
+        const prog = (t?.status?.app || base(t?.foreground?.argv?.[0]) || base(t?.argv?.[0])).toLowerCase();
+        const isAgent = Boolean(prog) && !SHELL_BINS.has(prog);
+        const weight = (isAgent ? 2 : 1) + (tab.active ? 0.5 : 0);
+        counts.set(rawCwd, (counts.get(rawCwd) ?? 0) + weight);
+      }
+    }
+  }
+  for (const a of counts.keys()) {
+    for (const [b, scoreB] of counts.entries()) {
+      if (a !== b && a !== home && (b.startsWith(`${a}/`) || b.startsWith(`${a}\\`))) {
+        counts.set(a, counts.get(a)! + scoreB * 0.6);
+      }
+    }
+  }
+  const best = [...counts.entries()].sort((x, y) => y[1] - x[1] || x[0].length - y[0].length)[0]?.[0] ?? space.folder;
+  return shortHome(best, home);
+}
+
 /**
  * The desktop herdr app is not installed on this computer: herdr-core alone, as on Windows
  * (where herdr has no desktop app) or a server. Terminals are then started with `hc run`.
@@ -195,14 +252,14 @@ export class HerdrApp {
   }
 
   /** Spaces of this computer in the open window; throws when the window is not open. */
-  async spaces(): Promise<SpaceInfo[]> {
+  async spaces(terminals?: ReadonlyMap<string, SpaceTerminalMeta>): Promise<SpaceInfo[]> {
     const ls = await this.ls();
     return ls.spaces
       .filter((s) => !s.machine)
       .map((s) => ({
         id: s.id,
         name: s.name,
-        folder: s.folder,
+        folder: resolveSpaceFolder(s, terminals),
         tabs: s.tabs?.length ?? 0,
         terminals: (s.tabs ?? []).reduce((n, t) => n + (t.terminals?.length ?? 0), 0),
       }));

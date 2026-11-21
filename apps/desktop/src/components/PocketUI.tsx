@@ -210,11 +210,19 @@ export function PocketSelect({
   onValueChange,
   options,
   placeholder = "请选择…",
+  className,
+  ariaLabel,
+  disabled,
+  onCloseAutoFocus,
 }: {
   value: string;
   onValueChange: (v: string) => void;
   options: SelectOption[];
   placeholder?: string;
+  className?: string;
+  ariaLabel?: string;
+  disabled?: boolean;
+  onCloseAutoFocus?: (event: Event) => void;
 }) {
   const safeValue = value === "" ? EMPTY_SENTINEL : value;
   const safeOptions = useMemo(
@@ -224,24 +232,39 @@ export function PocketSelect({
   return (
     <Select.Root
       value={safeValue}
+      disabled={disabled}
       onValueChange={(v) => {
         const hit = safeOptions.find((o) => o.value === v);
         onValueChange(hit ? hit.raw : v === EMPTY_SENTINEL ? "" : v);
       }}
     >
-      <Select.Trigger className="pk-select-trigger">
-        <Select.Value placeholder={placeholder} />
-        <Select.Icon>
+      <Select.Trigger
+        className={`pk-select-trigger${className ? ` ${className}` : ""}`}
+        aria-label={ariaLabel}
+        disabled={disabled}
+      >
+        <span className="pk-select-value">
+          <Select.Value placeholder={placeholder} />
+        </span>
+        <Select.Icon className="pk-select-icon">
           <ChevronDown size={15} />
         </Select.Icon>
       </Select.Trigger>
       <Select.Portal>
-        <Select.Content className="pk-select-content" position="popper" sideOffset={6}>
+        <Select.Content
+          className="pk-select-content"
+          position="popper"
+          sideOffset={6}
+          collisionPadding={12}
+          onCloseAutoFocus={onCloseAutoFocus}
+        >
           <Select.Viewport className="pk-select-viewport">
             {safeOptions.map((o) => (
               <Select.Item key={o.value} value={o.value} className="pk-select-item">
-                <Select.ItemText>{o.label}</Select.ItemText>
-                <Select.ItemIndicator>
+                <span className="pk-select-item-text">
+                  <Select.ItemText>{o.label}</Select.ItemText>
+                </span>
+                <Select.ItemIndicator className="pk-select-item-check">
                   <Check size={14} />
                 </Select.ItemIndicator>
               </Select.Item>

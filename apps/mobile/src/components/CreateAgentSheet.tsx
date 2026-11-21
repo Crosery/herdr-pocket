@@ -2,7 +2,7 @@
  * "新建 agent / 新建空间" bottom sheet. Talks to the chosen host with `spaces.list` (read-only)
  * and `agent.create`; on success jumps to the new agent (which may take a moment to appear).
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, ScrollView, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router } from "expo-router";
@@ -72,6 +72,8 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
   const [spaceId, setSpaceId] = useState<string>(NEW);
   const [spaceName, setSpaceName] = useState("");
   const [folder, setFolder] = useState("");
+  const [folderTouched, setFolderTouched] = useState(false);
+  const initKeyRef = useRef<string>("");
   const [launcher, setLauncher] = useState<string | null>(null);
   const [task, setTask] = useState("");
   const [busy, setBusy] = useState(false);
@@ -87,10 +89,14 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
 
   // Reset when the sheet opens.
   useEffect(() => {
-    if (!visible) return;
+    if (!visible) {
+      initKeyRef.current = "";
+      return;
+    }
     setHost(pickHost());
     setSettled(false);
     setSpaceName("");
+    setFolderTouched(false);
     setTask("");
     setError(null);
     setBusy(false);
@@ -115,18 +121,28 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, auto, settled, canCreateByOrder]);
 
-  // Once spaces arrive: preselect the requested space, the space's folder, and a launcher.
+  // Once spaces arrive for the active host: initialize space, folder, and launcher once per host switch.
   useEffect(() => {
     const d = q.data;
-    if (!d || !visible) return;
+    if (!d || !visible || !host) return;
+    const initKey = `${host}:${target.spaceName ?? ""}`;
+    if (initKeyRef.current === initKey) {
+      if (!folderTouched && spaceId !== NEW) {
+        const spNow = d.spaces.find((s) => s.id === spaceId);
+        if (spNow?.folder) setFolder(spNow.folder);
+      }
+      return;
+    }
+    initKeyRef.current = initKey;
     const sp = target.spaceName ? d.spaces.find((s) => s.name === target.spaceName) : undefined;
     setSpaceId(sp ? sp.id : NEW);
     setFolder(sp?.folder ?? target.folder ?? "");
+    setFolderTouched(false);
     // Asked for a space this computer does not list: offer a new one under the same name, not a blank form.
     if (target.spaceName && !sp) setSpaceName(target.spaceName);
     setLauncher((l) => (l && d.launchers.some((x) => x.id === l) ? l : d.launchers[0]?.id ?? null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q.data, visible, target.spaceName]);
+  }, [q.data, visible, host, target.spaceName]);
 
   const d = q.data;
   // A computer without the desktop herdr (Windows): no spaces, just a terminal in a folder.
@@ -138,9 +154,16 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
   // Programs that can't take a task at start get it typed in once they're up, where the computer does that.
   const takesTask = !!launch && launch.id !== "shell" && (launch.takesTask || !!d?.typesTask);
   const folders = useMemo(() => {
-    const list = [...(d?.folders ?? [])];
-    if (chosenSpace?.folder && !list.includes(chosenSpace.folder)) list.unshift(chosenSpace.folder);
-    return list.slice(0, 8);
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const raw of [...(chosenSpace?.folder ? [chosenSpace.folder] : []), ...(d?.folders ?? [])]) {
+      const clean = raw.trim();
+      if (!clean || seen.has(clean)) continue;
+      seen.add(clean);
+      out.push(clean);
+      if (out.length >= 8) break;
+    }
+    return out;
   }, [d?.folders, chosenSpace?.folder]);
   const canSubmit = !!host && !!d?.canCreate && !!launcher && !busy;
 
@@ -246,6 +269,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
                   onPress={() => {
                     setSpaceId(NEW);
                     setFolder("");
+                    setFolderTouched(false);
                   }}
                   label="新建空间"
                   lead={<MaterialCommunityIcons name="plus" size={18} color={isNew ? p.accentText : p.ink} style={{ marginLeft: 4 }} />}
@@ -257,6 +281,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
                     onPress={() => {
                       setSpaceId(s.id);
                       setFolder(s.folder ?? "");
+                      setFolderTouched(false);
                     }}
                     label={s.name}
                     lead={<SpaceBadge name={s.name} size={26} />}
@@ -284,11 +309,29 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
             {folders.length ? (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.sm }}>
                 {folders.map((f) => (
-                  <Chip key={f} on={folder === f} onPress={() => setFolder(folder === f ? "" : f)} label={f} />
+                  <Chip
+                    key={f}
+                    on={folder.trim() === f}
+                    onPress={() => {
+                      setFolder(folder.trim() === f ? "" : f);
+                      setFolderTouched(true);
+                    }}
+                    label={f}
+                  />
                 ))}
               </ScrollView>
             ) : null}
-            <Input value={folder} onChangeText={setFolder} placeholder="~/work_file/项目" autoCapitalize="none" mono accessibilityLabel="文件夹路径" />
+            <Input
+              value={folder}
+              onChangeText={(v) => {
+                setFolder(v);
+                setFolderTouched(true);
+              }}
+              placeholder="~/work_file/项目"
+              autoCapitalize="none"
+              mono
+              accessibilityLabel="文件夹路径"
+            />
           </Field>
 
           <Field title="程序">

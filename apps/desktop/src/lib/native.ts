@@ -88,6 +88,35 @@ export interface LogFolderInfo {
   queuedForRelay: number;
 }
 
+export interface FontCatalog {
+  families: string[];
+  herdrFont?: string;
+  symbolsFont?: string;
+}
+
+export interface FontFaceMeta {
+  id: number;
+  family: string;
+  weight: number;
+  style: "normal" | "italic";
+  format: string;
+}
+
+export interface LocalTermAttachResult {
+  channel: number;
+  cols: number;
+  rows: number;
+}
+
+export interface LocalTermDataEvent {
+  id: string;
+  data: string;
+}
+
+export interface LocalTermCloseEvent {
+  id: string;
+}
+
 
 const noop = async () => {};
 const unsubscribeNoop = () => () => {};
@@ -176,4 +205,35 @@ export const native = {
   exportDiagnostics: (context?: Record<string, unknown>): Promise<string> => invoke<string>("log_export_diagnostics", { context: context ?? null }),
   /** Lines sent. */
   uploadLogsNow: (): Promise<number> => (inTauri() ? invoke<number>("log_upload_now") : Promise.resolve(0)),
+
+  // Local terminal direct `hc connect` bridge --------------------------------
+  localTermAttach: (params: {
+    id: string;
+    terminal: string;
+    cols: number;
+    rows: number;
+    history: number;
+    display?: Record<string, unknown>;
+  }): Promise<LocalTermAttachResult> =>
+    inTauri() ? invoke<LocalTermAttachResult>("local_term_attach", params) : Promise.reject(new Error("仅桌面端支持本地直连")),
+  localTermInput: (id: string, data: string): Promise<void> =>
+    inTauri() ? invoke<void>("local_term_input", { id, data }) : Promise.resolve(),
+  localTermResize: (id: string, cols: number, rows: number, display?: Record<string, unknown>): Promise<void> =>
+    inTauri() ? invoke<void>("local_term_resize", { id, cols, rows, display: display ?? null }) : Promise.resolve(),
+  localTermDetach: (id: string): Promise<void> =>
+    inTauri() ? invoke<void>("local_term_detach", { id }).catch(() => {}) : Promise.resolve(),
+  localTermReadImage: async (path: string): Promise<ArrayBuffer | null> =>
+    inTauri() ? invoke<ArrayBuffer>("local_term_read_image", { path }).catch(() => null) : null,
+
+  // System terminal fonts ----------------------------------------------------
+  terminalListFonts: async (): Promise<FontCatalog | null> =>
+    inTauri() ? invoke<FontCatalog>("terminal_list_fonts").catch(() => null) : null,
+  terminalFontFaces: async (family: string): Promise<FontFaceMeta[]> =>
+    inTauri() ? invoke<FontFaceMeta[]>("terminal_font_faces", { family }).catch(() => []) : [],
+  terminalFontBytes: async (id: number): Promise<ArrayBuffer | null> =>
+    inTauri() ? invoke<ArrayBuffer>("terminal_font_bytes", { id }).catch(() => null) : null,
+
+  // Native folder dialog -----------------------------------------------------
+  pickFolder: async (initialDir?: string): Promise<string | null> =>
+    inTauri() ? invoke<string | null>("pick_folder", { initialDir: initialDir?.trim() || null }) : null,
 };

@@ -1,7 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { HcTerminal } from "../src/hc.ts";
 import { Host } from "../src/host.ts";
+import { resolveSpaceFolder, shortHome } from "../src/create.ts";
 import { LOADING, QUESTION, typeFirstTask, type TypeTaskDeps } from "../src/firsttask.ts";
 
 /** A program starting in a terminal, on a clock the test moves; nothing real is touched. */
@@ -130,4 +134,65 @@ test("agent.create: a task for a program that takes none at start is typed in on
   assert.equal(offer.typesTask, true);
   assert.deepEqual(offer.launchers.map((l: { id: string }) => l.id), ["claude", "kimi", "shell"]);
   h.stop();
+});
+
+test("resolveSpaceFolder overrides stale herdr-app space folder with live terminal cwds and forwards it on empty agent.create", async () => {
+  const home = "/Users/demo";
+  const resolved = resolveSpaceFolder(
+    {
+      id: "sp1",
+      name: "herdr手机端",
+      folder: "/Users/demo/tmp",
+      tabs: [
+        { id: "tab1", terminals: [{ terminal: "t1" }] },
+        { id: "tab2", active: true, terminals: [{ terminal: "t2" }, { terminal: "t3" }] },
+      ],
+    },
+    new Map([
+      ["t1", { cwd: "/Users/demo/work_file/herdr-pocket/docs", argv: ["zsh"] }],
+      ["t2", { cwd: "/Users/demo/work_file/herdr-pocket", status: { app: "claude-code" } }],
+      ["t3", { cwd: "/Users/demo/work_file/herdr-pocket", argv: ["omp"] }],
+    ]),
+    home,
+  );
+  assert.equal(resolved, "~/work_file/herdr-pocket");
+
+  assert.equal(shortHome("/Users/demo", home), "~");
+  assert.equal(shortHome("/Users/demo/work/app/", home), "~/work/app");
+  assert.equal(
+    resolveSpaceFolder({ id: "sp2", name: "empty", folder: "/Users/demo/work_file/proj", tabs: [] }, new Map(), home),
+    "~/work_file/proj",
+  );
+
+  // Verify agent.create with an empty folder uses the space's live cwd instead of stale herdr-app folder.
+  const dir = mkdtempSync(join(tmpdir(), "hp-space-folder-"));
+  try {
+    const h = new Host({ config: { server: "http://127.0.0.1:9", token: "t", deviceId: "d", name: "test" }, log: () => {} });
+    const x = h as unknown as {
+      sources: string[];
+      launchersCache: unknown;
+      refreshNames(): Promise<void>;
+      handlers: Record<string, (p: unknown, from: string) => Promise<any>>;
+    };
+    x.sources = ["hc"];
+    x.launchersCache = { at: Date.now(), list: Promise.resolve([{ id: "claude", label: "Claude Code", takesTask: true }]) };
+    x.refreshNames = async () => {};
+    h.hc.list = async () => {};
+    h.hc.terminals.set("t7", { address: "t7", state: "live", cwd: dir, status: { app: "claude-code" } });
+    h.app.ls = async () => ({
+      spaces: [{ id: "sp1", name: "herdr手机端", folder: "/nonexistent/stale/tmp", tabs: [{ id: "tb1", terminals: [{ terminal: "t7" }] }] }],
+    });
+    const created: Array<Record<string, unknown>> = [];
+    h.app.create = async (o) => {
+      created.push(o);
+      return { space: "sp1", tab: "tb2", terminal: "t8" };
+    };
+    const listed = await x.handlers["spaces.list"]!({}, "relay");
+    assert.ok(listed.spaces[0].folder);
+    await x.handlers["agent.create"]!({ space: "sp1", launcher: "claude" }, "relay");
+    assert.equal(created[0]!.folder, dir);
+    h.stop();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

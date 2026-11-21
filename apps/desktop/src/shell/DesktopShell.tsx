@@ -254,6 +254,14 @@ export function DesktopShell({
         run: () => openSettingsFrame(f.id),
       });
     }
+    list.push({
+      id: "term-font",
+      group: "设置",
+      label: "切换终端字体与字号…",
+      icon: Terminal,
+      terms: "font terminal 字体 字号 终端",
+      run: () => openSettingsFrame("look"),
+    });
     return list;
     // closeActive reads the store when it runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
