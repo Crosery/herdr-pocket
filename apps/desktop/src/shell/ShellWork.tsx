@@ -507,7 +507,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
 // Panes ----------------------------------------------------------------------------
 
 function resolveAgentMode(tabMode: AgentPaneMode | undefined, agent: Agent | undefined): AgentPaneMode {
-  return tabMode ?? (agent?.isShell && !agent?.sessionKey ? "term" : "chat");
+  return tabMode ?? (agent?.isShell ? "term" : "chat");
 }
 
 function ModeSwitchIcons({ mode, onModeChange }: { mode: AgentPaneMode; onModeChange: (m: AgentPaneMode) => void }) {

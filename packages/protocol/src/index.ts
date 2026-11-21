@@ -629,6 +629,11 @@ export interface RpcMethods {
     params: { agent: string; modelId?: string; thinkingLevel?: string };
     result: { ok: true; currentModel?: string; currentThinking?: string; note?: string };
   };
+  /** Sidechannel / bypass quick question against an agent's recent context without interrupting its turn. */
+  "agent.btw": {
+    params: { agent: string; question: string };
+    result: { answer: string; model?: string; durationMs: number };
+  };
   /** Close a workspace / space (and its terminals) without deleting disk folders. */
   "space.delete": {
     params: { spaceId?: string; spaceName?: string };

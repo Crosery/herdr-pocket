@@ -54,7 +54,9 @@ import {
   useToast,
 } from "../components/PocketUI";
 import { AgentUsageCard } from "../components/AgentUsageCard";
+import { BtwSideDrawer, executeAgentBtw, type BtwTurn } from "../components/BtwSideDrawer";
 import { ChatTimelineRows } from "../components/ChatTimeline";
+import { COMPOSER_SLASH_CHIP_PLACEHOLDER, ComposerSlashChip } from "../components/ComposerSlashChip";
 import { DropRail } from "../components/DropRail";
 import { FolderExplorerModal, normalizeFolderKey } from "../components/FolderExplorerModal";
 import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVendor";
@@ -70,6 +72,7 @@ import {
   extractSlashQuery,
   matchSlashCommands,
   mergeSlashCommands,
+  parseLeadingSlashToken,
   type SlashCategory,
 } from "../lib/slashCommands";
 import { parseTerminalChatTranscript, shellTurnMatchesCommand } from "../lib/terminalChat";
@@ -93,9 +96,12 @@ import {
   getComposerDraft,
   setComposerDraftAttachments,
   setComposerDraftText,
+  subscribeComposerDrafts,
 } from "../lib/composerDrafts";
 import { endWorkspaceDrag, hasWorkspaceDrag, readWorkspaceDrag } from "../lib/fileDrag";
-import { useLocalHostDeviceId } from "../lib/fonts";
+import { collectDroppedFilesSafe, readOsDraggedPaths, snapshotDroppedDataTransfer, stageOsDraggedItems } from "../lib/finderDrop";
+import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
+import { useAutoAgentModelMeta } from "../lib/modelCatalogClient";
 import { openFileTab, openSubagentAside } from "../shell/shellStore";
 import { native } from "../lib/native";
 import { parseChoices } from "../lib/markdown";
@@ -976,11 +982,11 @@ export function AgentDetailPanel({
   const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
   const [modelMenuMode, setModelMenuMode] = useState<"model" | "thinking" | null>(null);
-  const [modelMeta, setModelMeta] = useState<{
-    currentModel?: string;
-    currentThinking?: string;
-    thinkingLevels?: string[];
-  }>({});
+  const modelMeta = useAutoAgentModelMeta(agent);
+  const applyModelMetaOverride = modelMeta.applyOverride;
+  const [btwTurnsByAgent, setBtwTurnsByAgent] = useState<Record<string, BtwTurn[]>>({});
+  const [chipDismissedPrefix, setChipDismissedPrefix] = useState<string | null>(null);
+  const btwTurns = btwTurnsByAgent[agent.key] ?? [];
 
   useEffect(() => {
     const draft = getComposerDraft(agent.key);
@@ -990,24 +996,16 @@ export function AgentDetailPanel({
     setUsageReport(null);
     setUsageError(null);
     setModelMenuMode(null);
-    setModelMeta({ currentModel: agent.model });
+    setChipDismissedPrefix(null);
+  }, [agent.key]);
 
-    if (agent.isShell || (agent.source !== "hc" && agent.source !== "herdr")) return;
-    let alive = true;
-    void rpcCall(agent.deviceId, "agent.models", { agent: agent.key })
-      .then((res) => {
-        if (!alive) return;
-        setModelMeta({
-          currentModel: res.currentModel || agent.model,
-          currentThinking: res.currentThinking,
-          thinkingLevels: res.thinkingLevels,
-        });
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [agent.key, agent.deviceId, agent.isShell, agent.source, agent.model]);
+  useEffect(() => {
+    return subscribeComposerDrafts(() => {
+      const draft = getComposerDraft(agent.key);
+      setTextState(draft.text);
+      setAttachmentsState(draft.attachments);
+    });
+  }, [agent.key]);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const panelRef = useRef<HTMLDivElement>(null);
   const composerCardRef = useRef<HTMLDivElement>(null);
@@ -1330,6 +1328,20 @@ export function AgentDetailPanel({
     () => mergeSlashCommands(builtinSlashCommands(agent.harness, agent.isShell), discoveredSlash),
     [agent.harness, agent.isShell, discoveredSlash],
   );
+  const rawLeadingSlash = !agent.isShell && !activeSub ? parseLeadingSlashToken(text, allSlashCommands) : null;
+  const leadingSlash =
+    rawLeadingSlash && chipDismissedPrefix?.toLowerCase() !== rawLeadingSlash.rawToken.toLowerCase()
+      ? rawLeadingSlash
+      : null;
+  const composerInputValue = leadingSlash ? leadingSlash.rest : text;
+  const isBtwDraft = !agent.isShell && !activeSub && attachments.length === 0 && /^\/btw(?:\s|$)/i.test(text.trim());
+
+  useEffect(() => {
+    if (chipDismissedPrefix && (!rawLeadingSlash || !text.trim())) {
+      setChipDismissedPrefix(null);
+    }
+  }, [chipDismissedPrefix, rawLeadingSlash, text]);
+
   const slashQuery = !agent.isShell && !activeSub ? extractSlashQuery(text) : null;
   const matchedSlash = useMemo(
     () => (slashQuery === null ? [] : matchSlashCommands(allSlashCommands, slashQuery, slashCategory)),
@@ -1581,11 +1593,10 @@ export function AgentDetailPanel({
           ? modelId
           : `思考等级 ${formatEffortLabel(thinkingLevel)}`;
 
-      setModelMeta((prev) => ({
-        ...prev,
+      applyModelMetaOverride({
         ...(modelId ? { currentModel: stripModelEffortSuffix(modelId) } : {}),
         ...(thinkingLevel ? { currentThinking: thinkingLevel } : {}),
-      }));
+      });
       stickRef.current = true;
       setAtBottom(true);
 
@@ -1607,11 +1618,10 @@ export function AgentDetailPanel({
           ...(modelId ? { modelId } : {}),
           ...(thinkingLevel ? { thinkingLevel } : {}),
         });
-        setModelMeta((prev) => ({
-          ...prev,
+        applyModelMetaOverride({
           ...(res.currentModel ? { currentModel: res.currentModel } : {}),
           ...(res.currentThinking ? { currentThinking: res.currentThinking } : {}),
-        }));
+        });
         toast(res.note || `已切换：${labelDesc}`);
       } catch (e) {
         const err = e as { code?: string; message?: string };
@@ -1629,7 +1639,7 @@ export function AgentDetailPanel({
         setSending(false);
       }
     },
-    [agent, toast],
+    [agent, applyModelMetaOverride, toast],
   );
 
   const applyModelSwitch = useCallback(
@@ -1647,12 +1657,68 @@ export function AgentDetailPanel({
   );
 
   const onModelsLoaded = useCallback((res: AgentModelsResult) => {
-    setModelMeta({
+    applyModelMetaOverride({
       currentModel: res.currentModel || agent.model,
       currentThinking: res.currentThinking,
-      thinkingLevels: res.thinkingLevels,
     });
-  }, [agent.model]);
+  }, [agent.model, applyModelMetaOverride]);
+
+  const dismissBtwTurn = useCallback((agentKey: string, turnId?: string) => {
+    setBtwTurnsByAgent((prev) => {
+      const list = prev[agentKey];
+      if (!list?.length) return prev;
+      if (!turnId) {
+        const next = { ...prev };
+        delete next[agentKey];
+        return next;
+      }
+      const filtered = list.filter((t) => t.id !== turnId);
+      if (filtered.length === 0) {
+        const next = { ...prev };
+        delete next[agentKey];
+        return next;
+      }
+      return { ...prev, [agentKey]: filtered };
+    });
+  }, []);
+
+  const runBtwQuestion = useCallback(
+    async (question: string) => {
+      const targetKey = agent.key;
+      const turnId = `btw-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const pendingTurn: BtwTurn = {
+        id: turnId,
+        question,
+        status: "loading",
+        createdAt: Date.now(),
+      };
+      setBtwTurnsByAgent((prev) => ({
+        ...prev,
+        [targetKey]: [...(prev[targetKey] ?? []).slice(-5), pendingTurn],
+      }));
+      try {
+        const res = await executeAgentBtw(agent, question);
+        setBtwTurnsByAgent((prev) => ({
+          ...prev,
+          [targetKey]: (prev[targetKey] ?? []).map((t) =>
+            t.id === turnId
+              ? { ...t, status: "done", answer: res.answer, model: res.model, durationMs: res.durationMs }
+              : t,
+          ),
+        }));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err ?? "旁路提问失败");
+        setBtwTurnsByAgent((prev) => ({
+          ...prev,
+          [targetKey]: (prev[targetKey] ?? []).map((t) =>
+            t.id === turnId ? { ...t, status: "error", error: msg } : t,
+          ),
+        }));
+        toast(msg, true);
+      }
+    },
+    [agent, toast],
+  );
 
   const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
 
@@ -1665,6 +1731,26 @@ export function AgentDetailPanel({
     if (!raw && staged.length === 0) return;
     if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 400) return;
     lastSendRef.current = { sig, at: now };
+
+    const btwMatch = !agent.isShell && !activeSub && !staged.length ? /^\/btw(?:\s+([\s\S]*))?$/i.exec(raw) : null;
+    if (btwMatch) {
+      const question = (btwMatch[1] ?? "").trim();
+      if (!question) {
+        toast("请在 /btw 后输入旁路提问内容", true);
+        if (!isOverride && !text.startsWith("/btw ")) setText("/btw ");
+        requestAnimationFrame(() => composer.textareaRef.current?.focus());
+        return;
+      }
+      if (!isOverride) {
+        clearComposerDraft(agent.key, { revoke: false });
+        setTextState("");
+        setAttachmentsState([]);
+        setChipDismissedPrefix(null);
+      }
+      void runBtwQuestion(question);
+      requestAnimationFrame(() => composer.textareaRef.current?.focus());
+      return;
+    }
 
     if (!staged.length && /^\/usage$/i.test(raw)) {
       if (!isOverride) setText("");
@@ -1745,11 +1831,12 @@ export function AgentDetailPanel({
     });
   }, []);
 
-  const composer = useComposerInput(text, () => submitComposer());
+  const composer = useComposerInput(composerInputValue, () => submitComposer());
 
   const pickSlashCommand = useCallback(
     (cmd: SlashCommandItem, allowAutoSend: boolean) => {
       setSlashDismissedFor(null);
+      setChipDismissedPrefix(null);
       if (allowAutoSend && /^\/usage$/i.test(cmd.name)) {
         setText("");
         setAttachments([]);
@@ -1762,7 +1849,7 @@ export function AgentDetailPanel({
         setModelMenuMode("model");
         return;
       }
-      if (allowAutoSend && !cmd.argHint) {
+      if (allowAutoSend && !cmd.argHint && !/^\/btw$/i.test(cmd.name)) {
         setText("");
         setAttachments([]);
         stickRef.current = true;
@@ -1826,6 +1913,7 @@ export function AgentDetailPanel({
     if (activeMode !== "chat") return;
     dragDepthRef.current = 0;
     setDragOver(false);
+    const snap = snapshotDroppedDataTransfer(e.dataTransfer);
     const wsItem = readWorkspaceDrag(e);
     if (wsItem) {
       e.preventDefault();
@@ -1843,11 +1931,36 @@ export function AgentDetailPanel({
       requestAnimationFrame(() => composer.textareaRef.current?.focus());
       return;
     }
-    const files = e.dataTransfer?.files;
-    if (!files?.length) return;
+    const hasDropPayload =
+      snap.entries.length > 0 ||
+      snap.files.length > 0 ||
+      Boolean(e.dataTransfer?.types?.includes("Files"));
+    if (!hasDropPayload) return;
     e.preventDefault();
     e.stopPropagation();
-    void handleFiles(files);
+
+    void (async () => {
+      if (native.available() && localHostIdStore.get() && localHostIdStore.get() === agent.deviceId) {
+        const osItems = await readOsDraggedPaths();
+        if (osItems.length > 0) {
+          const res = stageOsDraggedItems(attachmentsRef.current, osItems, PUT_LIMITS.files);
+          if (res.added.length > 0) {
+            setAttachments((prev) => [...prev, ...res.added].slice(0, PUT_LIMITS.files));
+          }
+          if (res.notice) toast(res.notice, true);
+          requestAnimationFrame(() => composer.textareaRef.current?.focus());
+          return;
+        }
+      }
+
+      const collected = await collectDroppedFilesSafe(snap, { maxFiles: PUT_LIMITS.files });
+      if (collected.files.length > 0) {
+        await handleFiles(collected.files);
+      } else if (collected.skippedDirs.length > 0) {
+        toast("当前连接不支持直接读取空文件夹或受限目录，请拖入具体文件", true);
+      }
+      requestAnimationFrame(() => composer.textareaRef.current?.focus());
+    })();
   };
 
   const hasSending = sending || reconciled.unmatched.some((s) => s.state === "sending");
@@ -2132,6 +2245,17 @@ export function AgentDetailPanel({
         />
       ) : null}
 
+      {activeMode === "chat" && !activeSub && btwTurns.length > 0 ? (
+        <BtwSideDrawer
+          turns={btwTurns}
+          agent={agent}
+          onDismiss={(turnId) => dismissBtwTurn(agent.key, turnId)}
+          onOpenFile={(target) => {
+            void openAgentFileTarget(agent, target);
+          }}
+        />
+      ) : null}
+
       {/* Composer or Subagent Read-Only Footer */}
       {activeMode === "chat" && activeSub ? (
         <SubagentReadOnlyBar
@@ -2278,6 +2402,20 @@ export function AgentDetailPanel({
             }}
           />
           <div className="composer-input-wrap">
+            {leadingSlash ? (
+              <ComposerSlashChip
+                command={leadingSlash.command}
+                onUnwrap={() => {
+                  if (!leadingSlash.rest) {
+                    setText(leadingSlash.rawToken);
+                    setSlashDismissedFor(leadingSlash.rawToken);
+                  } else {
+                    setChipDismissedPrefix(leadingSlash.rawToken);
+                  }
+                  requestAnimationFrame(() => composer.textareaRef.current?.focus());
+                }}
+              />
+            ) : null}
             <textarea
               {...composer.textareaProps}
               onKeyDown={(e) => {
@@ -2318,20 +2456,44 @@ export function AgentDetailPanel({
                   setUsageOpen(false);
                   return;
                 }
+                if (
+                  leadingSlash &&
+                  e.key === "Backspace" &&
+                  !e.nativeEvent.isComposing &&
+                  e.currentTarget.selectionStart === 0 &&
+                  e.currentTarget.selectionEnd === 0
+                ) {
+                  e.preventDefault();
+                  if (!leadingSlash.rest) {
+                    setText(leadingSlash.rawToken);
+                    setSlashDismissedFor(leadingSlash.rawToken);
+                  } else {
+                    setChipDismissedPrefix(leadingSlash.rawToken);
+                  }
+                  return;
+                }
                 composer.textareaProps.onKeyDown(e);
               }}
               placeholder={
-                agent.status === "working"
-                  ? "继续输入将加入排队（Enter 加入排队）"
-                  : agent.isShell
-                    ? "输入终端命令按 Enter 执行…"
-                    : `发给 ${clip(agent.name || agent.title || agent.harness, 16)}（/ 命令 · 可拖入或粘贴文件）`
+                leadingSlash
+                  ? /^\/btw$/i.test(leadingSlash.command.name)
+                    ? "输入旁路问题（只读上下文，不打断当前运行）…"
+                    : COMPOSER_SLASH_CHIP_PLACEHOLDER
+                  : agent.status === "working"
+                    ? "继续输入将加入排队（Enter 加入排队，/btw 可旁路提问）"
+                    : agent.isShell
+                      ? "输入终端命令按 Enter 执行…"
+                      : `发给 ${clip(agent.name || agent.title || agent.harness, 16)}（/ 命令 · 可拖入或粘贴文件）`
               }
-              value={text}
+              value={composerInputValue}
               onChange={(e) => {
                 setSlashDismissedFor(null);
-                if (e.target.value.startsWith("/") && modelMenuMode) setModelMenuMode(null);
-                setText(e.target.value);
+                if (leadingSlash) {
+                  setText(`${leadingSlash.rawToken} ${e.target.value}`);
+                } else {
+                  if (e.target.value.startsWith("/") && modelMenuMode) setModelMenuMode(null);
+                  setText(e.target.value);
+                }
               }}
               onPaste={(e) => {
                 const files = extractClipboardFiles(e.clipboardData);
@@ -2397,7 +2559,18 @@ export function AgentDetailPanel({
             </div>
             <div className="composer-actions">
               {agent.status === "working" ? (
-                !text.trim() && attachments.length === 0 ? (
+                isBtwDraft ? (
+                  <PocketButton
+                    size="sm"
+                    className="composer-send"
+                    aria-label="发送旁路提问"
+                    title="旁路提问，不打断当前轮 (Enter)"
+                    disabled={!/^\/btw\s+\S/i.test(text.trim())}
+                    onClick={() => submitComposer()}
+                  >
+                    <Send size={14} />
+                  </PocketButton>
+                ) : !text.trim() && attachments.length === 0 ? (
                   <PocketButton size="sm" variant="soft" className="composer-send" aria-label="中断当前轮" title="中断当前轮" onClick={interruptTurn}>
                     <Square size={13} />
                   </PocketButton>

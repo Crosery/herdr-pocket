@@ -40,6 +40,7 @@ export const SAFE_AGAIN = new Set<RpcMethod>([
   "agent.commands",
   "agent.usage",
   "agent.models",
+  "agent.btw",
   "git.status",
   "git.diff",
   "git.log",

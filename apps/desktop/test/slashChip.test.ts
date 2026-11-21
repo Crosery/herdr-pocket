@@ -67,7 +67,7 @@ test("parseLeadingSlashToken recognizes /btw, /dev, /commit, /review and /skills
   // Does NOT match while still typing without space/newline, mid-sentence, or Unix file paths
   assert.equal(parseLeadingSlashToken("/btw", known), null);
   assert.equal(parseLeadingSlashToken("hello /btw world", known), null);
-  assert.equal(parseLeadingSlashToken("/Users/crosery/work_file/herdr-pocket ", known), null);
+  assert.equal(parseLeadingSlashToken("/Users/demo/work/example-project ", known), null);
   assert.equal(parseLeadingSlashToken("/unknown-non-command test", []), null);
 });
 

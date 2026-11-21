@@ -577,7 +577,7 @@ export function mockLink(): Link {
   return {
     async call(_to: string, method: RpcMethod, params: unknown) {
       await new Promise((r) => setTimeout(r, 180));
-      const p = (params ?? {}) as { agent?: string; sub?: string; text?: string; keys?: string[]; before?: string; limit?: number; space?: string; spaceName?: string; spaceId?: string; folder?: string; launcher?: string; task?: string; modelId?: string; thinkingLevel?: string };
+      const p = (params ?? {}) as { agent?: string; sub?: string; text?: string; keys?: string[]; before?: string; limit?: number; space?: string; spaceName?: string; spaceId?: string; folder?: string; launcher?: string; task?: string; modelId?: string; thinkingLevel?: string; question?: string };
       switch (method) {
         case "agents.list":
           return { agents };
@@ -725,6 +725,15 @@ export function mockLink(): Link {
             ...(typeof p.modelId === "string" ? { currentModel: p.modelId } : {}),
             ...(typeof p.thinkingLevel === "string" ? { currentThinking: p.thinkingLevel } : {}),
           };
+        case "agent.btw": {
+          const a = agents.find((x) => x.key === p.agent);
+          const q = typeof p.question === "string" ? p.question.trim() : "";
+          return {
+            answer: `（演示旁路 /btw）已只读查看 ${a?.title || a?.harness || "Agent"}：${q}`,
+            model: a?.model ?? "demo-sidechannel",
+            durationMs: 38,
+          };
+        }
         case "space.delete":
           return { ok: true, closedTerminals: 0 };
         case "agent.seen":

@@ -457,6 +457,15 @@ export const mockApi = {
         ...(typeof params.thinkingLevel === "string" ? { currentThinking: params.thinkingLevel } : {}),
       };
     }
+    if (method === "agent.btw") {
+      const a = DEMO_AGENTS.find((x) => x.key === params.agent);
+      const q = typeof params.question === "string" ? params.question.trim() : "";
+      return {
+        answer: `（演示旁路 \`/btw\`）已只读查看 **${a?.title || a?.harness || "Agent"}** 最近上下文，不会向主终端输入。\n\n- 提问：${q}\n- 主会话状态：\`${a?.status ?? "idle"}\``,
+        model: a?.model ?? "demo-sidechannel",
+        durationMs: 42,
+      };
+    }
     if (method === "space.delete") {
       return { ok: true as const, closedTerminals: 0 };
     }

@@ -37,6 +37,7 @@ import { CONFIG_DIR, type HostConfig } from "./config.ts";
 import { FilesError, listFiles, listFolders, readFileSlice } from "./files.ts";
 import { getGitDiff, getGitLog, getGitStatus, gitCheckout, gitCommit, gitDiscard, gitPull, gitPush, gitStage, gitUnstage } from "./git.ts";
 import { scanAgentSlashCommands } from "./slash.ts";
+import { askAgentBtw } from "./btw.ts";
 import { getAgentModels, setAgentModelAndThinking } from "./models.ts";
 import { getAgentUsageReport } from "./usage.ts";
 import { run } from "./util.ts";
@@ -1286,6 +1287,14 @@ export class Host {
       };
       if (next.model || next.thinking) this.modelOverrides.set(a.key, next);
       return { ok: true as const, ...res };
+    },
+    "agent.btw": async (p) => {
+      const a = this.resolve(p.agent);
+      const question = typeof p.question === "string" ? p.question.trim() : "";
+      if (!question) throw new RpcFailure("bad_request", "question is required");
+      return askAgentBtw(a, question, {
+        uniflo: this.sources.includes("uniflo") ? this.uniflo : undefined,
+      });
     },
     "space.delete": async (p) => {
       this.writable();

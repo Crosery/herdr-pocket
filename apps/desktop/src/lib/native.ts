@@ -5,7 +5,7 @@
  * embedded browser, cookie import and dictation go through native-engineer's ./bridge.
  * Outside Tauri every call answers "unsupported" instead of throwing, so each screen renders.
  */
-import type { RpcResult } from "@herdr-pocket/protocol";
+import type { AgentModelsResult, RpcResult } from "@herdr-pocket/protocol";
 import * as bridge from "./bridge";
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -116,6 +116,20 @@ export interface LocalCreateShellResult {
   cwd: string;
   cols: number;
   rows: number;
+}
+
+export interface LocalImageStat {
+  urlPath: string;
+  width: number;
+  height: number;
+  mime: string;
+}
+
+export interface DraggedOsItemNative {
+  path: string;
+  name: string;
+  isDir: boolean;
+  size: number;
 }
 
 export interface LocalTermDataEvent {
@@ -251,12 +265,32 @@ export const native = {
     inTauri() ? invoke<LocalTermAttachResult>("local_term_attach", params) : Promise.reject(new Error("仅桌面端支持本地直连")),
   localTermInput: (id: string, data: string): Promise<void> =>
     inTauri() ? invoke<void>("local_term_input", { id, data }) : Promise.resolve(),
+  localTermAutoInput: (id: string, data: string): Promise<void> =>
+    inTauri() ? invoke<void>("local_term_auto_input", { id, data }) : Promise.resolve(),
+  localTermFocus: (id: string, focused: boolean): Promise<void> =>
+    inTauri() ? invoke<void>("local_term_focus", { id, focused }).catch(() => {}) : Promise.resolve(),
   localTermResize: (id: string, cols: number, rows: number, display?: Record<string, unknown>): Promise<void> =>
     inTauri() ? invoke<void>("local_term_resize", { id, cols, rows, display: display ?? null }) : Promise.resolve(),
   localTermDetach: (id: string): Promise<void> =>
     inTauri() ? invoke<void>("local_term_detach", { id }).catch(() => {}) : Promise.resolve(),
   localTermReadImage: async (path: string): Promise<ArrayBuffer | null> =>
     inTauri() ? invoke<ArrayBuffer>("local_term_read_image", { path }).catch(() => null) : null,
+  localTermStatImage: async (path: string, deleteAfter?: boolean): Promise<LocalImageStat | null> =>
+    inTauri()
+      ? invoke<LocalImageStat>("local_term_stat_image", { path, deleteAfter: deleteAfter ?? null }).catch(() => null)
+      : null,
+  localAgentModels: async (params: {
+    harness: string;
+    currentModel?: string;
+    sessionKey?: string;
+  }): Promise<AgentModelsResult | null> =>
+    inTauri()
+      ? invoke<AgentModelsResult>("local_agent_models", {
+          harness: params.harness,
+          currentModel: params.currentModel ?? null,
+          sessionKey: params.sessionKey ?? null,
+        }).catch(() => null)
+      : null,
 
   // System terminal fonts ----------------------------------------------------
   terminalListFonts: async (): Promise<FontCatalog | null> =>
@@ -294,4 +328,10 @@ export const native = {
     if (cwd?.trim()) qs.set("cwd", cwd.trim());
     return `${origin}/file?${qs.toString()}`;
   },
+  readOsDragPaths: async (): Promise<DraggedOsItemNative[]> =>
+    inTauri() ? invoke<DraggedOsItemNative[]>("read_os_drag_paths").catch(() => []) : [],
+  workspaceStateLoad: async (): Promise<string | null> =>
+    inTauri() ? invoke<string | null>("workspace_state_load").catch(() => null) : null,
+  workspaceStateSave: async (raw: string): Promise<void> =>
+    inTauri() ? invoke<void>("workspace_state_save", { raw }) : Promise.resolve(),
 };
