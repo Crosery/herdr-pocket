@@ -131,6 +131,7 @@ export function patchCachedAgentModelMeta(
   const resolvedLevels = resolveThinkingLevelsForModel(
     {
       ...entry.res,
+      models: Array.isArray(entry.res.models) ? entry.res.models : [],
       currentModel: nextModel,
       modelRoles: nextRoles,
     },
@@ -165,40 +166,53 @@ function isUnsupportedRpcError(err: unknown): boolean {
   );
 }
 
+function normalizeAgentModelsResult(
+  raw: AgentModelsResult,
+  agent: Pick<Agent, "harness">,
+): AgentModelsResult {
+  const models = Array.isArray(raw.models) ? raw.models : [];
+  const harness = typeof raw.harness === "string" && raw.harness.trim() ? raw.harness : agent.harness;
+  return raw.harness === harness && raw.models === models ? raw : { ...raw, harness, models };
+}
+
 function applyReasoningEventsFallback(
   res: AgentModelsResult,
   agent: Pick<Agent, "harness" | "isShell">,
   hasReasoningEvents?: boolean,
 ): AgentModelsResult {
-  if (!hasReasoningEvents || agent.isShell || res.thinkingLevels?.length) return res;
+  const normalized = normalizeAgentModelsResult(res, agent);
+  if (agent.isShell || normalized.thinkingLevels?.length) return normalized;
   const fallbackLevels = resolveThinkingLevelsForModel(
-    { ...res, harness: agent.harness, hasReasoningEvents: true },
-    res.currentModel,
+    { ...normalized, harness: normalized.harness || agent.harness, hasReasoningEvents },
+    normalized.currentModel,
   );
-  if (fallbackLevels.length === 0) return res;
+  if (fallbackLevels.length === 0) return normalized;
   return {
-    ...res,
+    ...normalized,
     thinkingLevels: fallbackLevels,
-    canSwitchThinking: res.canSwitch,
-    thinkingLabel: res.thinkingLabel || "思考等级",
+    canSwitchThinking: normalized.canSwitch,
+    thinkingLabel: normalized.thinkingLabel || "思考等级",
   };
 }
 
 function mergeAgentModelsResults(primary: AgentModelsResult, secondary: AgentModelsResult): AgentModelsResult {
-  const seen = new Set(primary.models.map((m) => m.id.toLowerCase()));
+  const primaryModels = Array.isArray(primary.models) ? primary.models : [];
+  const secondaryModels = Array.isArray(secondary.models) ? secondary.models : [];
+  const seen = new Set(primaryModels.map((m) => m.id.toLowerCase()));
   const extra: AgentModelOption[] = [];
-  for (const m of secondary.models) {
+  for (const m of secondaryModels) {
     const key = m.id.toLowerCase();
     if (!seen.has(key)) {
       seen.add(key);
       extra.push(m);
     }
   }
-  const models = [...primary.models, ...extra];
+  const models = [...primaryModels, ...extra];
+  const harness = primary.harness || secondary.harness;
   const modelRoles = primary.modelRoles ?? secondary.modelRoles;
   const currentModel = primary.currentModel ?? secondary.currentModel;
   const matchedOpt = findModelOptionForModel(models, currentModel, {
-    harness: primary.harness,
+    harness,
     modelRoles,
   });
   const thinkingLevels =
@@ -210,7 +224,7 @@ function mergeAgentModelsResults(primary: AgentModelsResult, secondary: AgentMod
           ? [...primary.thinkingLevels]
           : resolveThinkingLevelsForModel(
               {
-                harness: primary.harness,
+                harness,
                 models,
                 currentModel,
                 modelRoles,
@@ -224,6 +238,7 @@ function mergeAgentModelsResults(primary: AgentModelsResult, secondary: AgentMod
   );
   return {
     ...primary,
+    harness,
     ...(currentModel ? { currentModel } : {}),
     currentThinking,
     ...(thinkingLevels.length
@@ -245,7 +260,8 @@ function normalizeLocalResultForAgent(
     : agent.source === "uniflo"
       ? "历史只读会话无法直接切换模型"
       : raw.reason;
-  const { modelRoles, ...rest } = raw;
+  const { modelRoles, models: rawModels, ...rest } = raw;
+  const models = Array.isArray(rawModels) ? rawModels : [];
   const isRemote = Boolean(opts?.isRemoteHost);
   const inferred = isRemote && agent.model ? inferAgentModelAndThinking(agent.harness, agent.model) : undefined;
   const nextModel = inferred?.currentModel || raw.currentModel;
@@ -254,6 +270,7 @@ function normalizeLocalResultForAgent(
       ? resolveThinkingLevelsForModel(
           {
             ...raw,
+            models,
             harness: agent.harness,
             currentModel: nextModel,
             modelRoles: undefined,
@@ -267,6 +284,7 @@ function normalizeLocalResultForAgent(
       : raw.currentThinking;
   return {
     ...rest,
+    models,
     ...(isRemote ? {} : modelRoles ? { modelRoles } : {}),
     ...(nextModel ? { currentModel: nextModel } : {}),
     ...(nextThinking ? { currentThinking: nextThinking } : { currentThinking: undefined }),
@@ -419,7 +437,7 @@ export async function fetchAgentModelsWithFallback(
 
     if (!deps.isTauri()) {
       try {
-        const rpcRes = await rpcPromise;
+        const rpcRes = normalizeAgentModelsResult(await rpcPromise, agent);
         if (rpcRes.models.length === 0) {
           return applyReasoningEventsFallback(mergeAgentModelsResults(rpcRes, synth), agent, opts.hasReasoningEvents);
         }
@@ -451,7 +469,7 @@ export async function fetchAgentModelsWithFallback(
 
     if (!canRaceLocal) {
       try {
-        const rpcRes = await rpcPromise;
+        const rpcRes = normalizeAgentModelsResult(await rpcPromise, agent);
         if (rpcRes && (rpcRes.models.length > 0 || isRemoteHost)) {
           return applyReasoningEventsFallback(
             rpcRes.models.length === 0 ? mergeAgentModelsResults(rpcRes, synth) : rpcRes,
@@ -471,7 +489,7 @@ export async function fetchAgentModelsWithFallback(
 
     type RpcOutcome = { kind: "ok"; res: AgentModelsResult } | { kind: "err"; err: unknown } | { kind: "timeout" };
     const rpcSettled: Promise<RpcOutcome> = rpcPromise.then(
-      (res) => ({ kind: "ok", res }),
+      (res) => ({ kind: "ok", res: normalizeAgentModelsResult(res, agent) }),
       (err) => ({ kind: "err", err }),
     );
 
@@ -578,6 +596,102 @@ export interface AutoAgentModelMeta {
   applyOverride: (patch: { currentModel?: string; currentThinking?: string; modelRoles?: Record<string, string> }) => void;
 }
 
+const noopMeta = () => {};
+
+/** Pure computation backing `useAutoAgentModelMeta`, safe against partial/legacy host catalogs missing `.harness`. */
+export function computeAutoAgentModelMeta(
+  agent: Agent,
+  opts: {
+    fetched?: AgentModelsResult | null;
+    override?: {
+      currentModel?: string;
+      currentThinking?: string;
+      fallbackThinkingCandidate?: string;
+      modelRoles?: Record<string, string>;
+    } | null;
+    hasReasoningEvents?: boolean;
+    refresh?: () => void;
+    applyOverride?: AutoAgentModelMeta["applyOverride"];
+  } = {},
+): AutoAgentModelMeta {
+  const refresh = opts.refresh ?? noopMeta;
+  const applyOverride = opts.applyOverride ?? noopMeta;
+
+  if (agent.isShell) {
+    return {
+      currentModel: agent.model,
+      canSwitch: false,
+      canSwitchThinking: false,
+      loaded: true,
+      refresh,
+      applyOverride,
+    };
+  }
+
+  const activeFetched = opts.fetched ? normalizeAgentModelsResult(opts.fetched, agent) : null;
+  const activeOverride = opts.override ?? null;
+  const hasReasoningEvents = opts.hasReasoningEvents;
+  const inferred = inferAgentModelAndThinking(
+    agent.harness,
+    !activeFetched && activeOverride?.currentModel ? activeOverride.currentModel : agent.model,
+    { hasReasoningEvents },
+  );
+
+  const currentModel =
+    activeOverride?.currentModel || activeFetched?.currentModel || inferred.currentModel || agent.model;
+
+  const modelRoles =
+    activeFetched?.modelRoles || activeOverride?.modelRoles
+      ? { ...(activeFetched?.modelRoles ?? {}), ...(activeOverride?.modelRoles ?? {}) }
+      : undefined;
+
+  const activeModelOption = findModelOptionForModel(activeFetched?.models, currentModel, {
+    harness: activeFetched?.harness || agent.harness,
+    modelRoles,
+  });
+
+  const thinkingLevels = activeFetched
+    ? resolveThinkingLevelsForModel(
+        {
+          ...activeFetched,
+          harness: activeFetched.harness || agent.harness,
+          models: activeFetched.models,
+          modelRoles,
+          hasReasoningEvents,
+        },
+        currentModel,
+      )
+    : (inferred.thinkingLevels ?? []);
+
+  const currentThinking =
+    thinkingLevels.length === 0
+      ? undefined
+      : activeOverride?.currentThinking
+        ? clampThinkingLevel(thinkingLevels, activeOverride.currentThinking)
+        : clampThinkingLevel(
+            thinkingLevels,
+            activeOverride?.fallbackThinkingCandidate || activeFetched?.currentThinking || inferred.currentThinking,
+            activeOverride?.currentModel,
+          );
+
+  const canSwitch = activeFetched?.canSwitch;
+  const canSwitchThinking = activeFetched
+    ? Boolean(activeFetched.canSwitch) && thinkingLevels.length > 0
+    : undefined;
+
+  return {
+    ...(currentModel ? { currentModel } : {}),
+    ...(currentThinking ? { currentThinking } : {}),
+    ...(thinkingLevels.length ? { thinkingLevels } : {}),
+    ...(activeModelOption ? { activeModelOption } : {}),
+    ...(modelRoles ? { modelRoles } : {}),
+    ...(activeFetched ? { models: activeFetched.models, canSwitch, canSwitchThinking } : {}),
+    loaded: Boolean(activeFetched),
+    refresh,
+    applyOverride,
+  };
+}
+
 /**
  * React hook that synchronously provides inferred model/thinking metadata on mount (0ms wait)
  * and refreshes in the background via `fetchAgentModelsWithFallback` with 60s caching.
@@ -587,10 +701,6 @@ export function useAutoAgentModelMeta(
   opts?: { hasReasoningEvents?: boolean },
 ): AutoAgentModelMeta {
   const hasReasoningEvents = opts?.hasReasoningEvents;
-  const inferred = useMemo(
-    () => (agent.isShell ? {} : inferAgentModelAndThinking(agent.harness, agent.model, { hasReasoningEvents })),
-    [agent.isShell, agent.harness, agent.model, hasReasoningEvents],
-  );
 
   const [fetched, setFetched] = useState<{
     key: string;
@@ -678,70 +788,14 @@ export function useAutoAgentModelMeta(
     [agent.key],
   );
 
-  if (agent.isShell) {
-    return {
-      currentModel: agent.model,
-      canSwitch: false,
-      canSwitchThinking: false,
-      loaded: true,
-      refresh,
-      applyOverride,
-    };
-  }
-
   const activeFetched = fetched?.key === agent.key ? fetched.res : null;
   const activeOverride = override?.key === agent.key ? override : null;
 
-  const currentModel =
-    activeOverride?.currentModel || activeFetched?.currentModel || inferred.currentModel || agent.model;
-
-  const modelRoles =
-    activeFetched?.modelRoles || activeOverride?.modelRoles
-      ? { ...(activeFetched?.modelRoles ?? {}), ...(activeOverride?.modelRoles ?? {}) }
-      : undefined;
-
-  const activeModelOption = findModelOptionForModel(activeFetched?.models, currentModel, {
-    harness: agent.harness,
-    modelRoles,
-  });
-
-  const thinkingLevels = activeFetched
-    ? resolveThinkingLevelsForModel(
-        {
-          ...activeFetched,
-          models: activeFetched.models,
-          modelRoles,
-          hasReasoningEvents,
-        },
-        currentModel,
-      )
-    : (inferred.thinkingLevels ?? []);
-
-  const currentThinking =
-    thinkingLevels.length === 0
-      ? undefined
-      : activeOverride?.currentThinking
-        ? clampThinkingLevel(thinkingLevels, activeOverride.currentThinking)
-        : clampThinkingLevel(
-            thinkingLevels,
-            activeOverride?.fallbackThinkingCandidate || activeFetched?.currentThinking || inferred.currentThinking,
-            activeOverride?.currentModel,
-          );
-
-  const canSwitch = activeFetched?.canSwitch;
-  const canSwitchThinking = activeFetched
-    ? (activeFetched.canSwitch && thinkingLevels.length > 0)
-    : undefined;
-
-  return {
-    ...(currentModel ? { currentModel } : {}),
-    ...(currentThinking ? { currentThinking } : {}),
-    ...(thinkingLevels.length ? { thinkingLevels } : {}),
-    ...(activeModelOption ? { activeModelOption } : {}),
-    ...(modelRoles ? { modelRoles } : {}),
-    ...(activeFetched ? { models: activeFetched.models, canSwitch, canSwitchThinking } : {}),
-    loaded: Boolean(activeFetched),
+  return computeAutoAgentModelMeta(agent, {
+    fetched: activeFetched,
+    override: activeOverride,
+    hasReasoningEvents,
     refresh,
     applyOverride,
-  };
+  });
 }

@@ -77,9 +77,10 @@ test("inferAgentModelAndThinking detects colon effort, hyphen effort, per-model 
     thinkingLevels: ["low", "medium", "high", "xhigh"],
   });
 
-  // Explicit non-reasoning models must return empty thinkingLevels unless reasoning events were emitted
+  // Explicit non-reasoning models must always return empty thinkingLevels even when historical reasoning events exist
   for (const nonReasoning of [
     "google/gemini-1.5-flash",
+    "demo/gemini-1.5-pro",
     "google/gemini-2.0-flash",
     "openai/gpt-4o",
     "openai/gpt-4.1-mini",
@@ -95,9 +96,13 @@ test("inferAgentModelAndThinking detects colon effort, hyphen effort, per-model 
     });
     assert.deepEqual(inferAgentModelAndThinking("omp", nonReasoning, { hasReasoningEvents: true }), {
       currentModel: nonReasoning,
-      thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
+      thinkingLevels: [],
     });
   }
+
+  // Nullish harness values never throw
+  assert.equal(normalizeSwitchHarness(undefined as never), "generic");
+  assert.equal(normalizeSwitchHarness(null), "generic");
 
   // Preserves tags like :8b while stripping :high
   assert.equal(stripModelEffortSuffix("qwen3:8b"), "qwen3:8b");
@@ -181,6 +186,62 @@ test("resolveThinkingLevelsForModel & clampThinkingLevel dynamically track selec
   assert.equal(clampThinkingLevel(["low", "medium", "high", "xhigh"], "high", "gemini-4-neon-xhigh"), "xhigh");
   assert.equal(clampThinkingLevel(["medium"], "high"), "medium");
   assert.equal(clampThinkingLevel([], "high"), undefined);
+
+  // Historical hasReasoningEvents never re-enables thinking on explicit non-reasoning models, and missing harness never crashes
+  assert.deepEqual(
+    resolveThinkingLevelsForModel(
+      {
+        harness: "oh-my-pi",
+        currentModel: "demo/gemini-1.5-pro",
+        thinkingLevels: ["off", "low", "medium", "high", "xhigh"],
+        models: [
+          { id: "demo/gemini-1.5-pro", label: "Gemini 1.5 Pro", reasoning: false, source: "current" },
+          { id: "custom-no-think", label: "Custom No Think", thinkingLevels: [], source: "catalog" },
+        ],
+      },
+      "demo/gemini-1.5-pro",
+      { hasReasoningEvents: true },
+    ),
+    [],
+  );
+  assert.deepEqual(
+    resolveThinkingLevelsForModel(
+      {
+        harness: "oh-my-pi",
+        models: [{ id: "custom-no-think", label: "Custom No Think", thinkingLevels: [], source: "catalog" }],
+      },
+      "custom-no-think",
+      { hasReasoningEvents: true },
+    ),
+    [],
+  );
+  assert.deepEqual(
+    resolveThinkingLevelsForModel(
+      { harness: "oh-my-pi", models: [] },
+      "demo/gemini-1.5-pro",
+      { hasReasoningEvents: true },
+    ),
+    [],
+  );
+  assert.deepEqual(
+    resolveThinkingLevelsForModel(
+      { harness: "custom-cli", models: [{ id: "custom-private-model", label: "Custom Private", source: "current" }] },
+      "custom-private-model",
+      { hasReasoningEvents: true },
+    ),
+    ["low", "medium", "high"],
+  );
+  assert.deepEqual(
+    resolveThinkingLevelsForModel(
+      {
+        harness: undefined as never,
+        currentModel: "claude-opus-4-6",
+        models: [{ id: "claude-opus-4-6", label: "Claude Opus 4.6", reasoning: true, source: "current" }],
+      },
+      "claude-opus-4-6",
+    ),
+    ["low", "medium", "high", "max"],
+  );
 });
 
 test("synthesizeFallbackAgentModels merges current, peer models, and presets without errors", () => {

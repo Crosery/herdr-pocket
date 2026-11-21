@@ -25,7 +25,6 @@ import {
   X,
 } from "lucide-react";
 import {
-  HARNESS_DEFAULT_THINKING_LEVELS,
   PUT_LIMITS,
   applyRows,
   buildHarnessSwitchCommands,
@@ -990,15 +989,11 @@ export function AgentDetailPanel({
   const hasReasoningEvents = useMemo(() => events.some((e) => e.kind === "reasoning"), [events]);
   const modelMeta = useAutoAgentModelMeta(agent, { hasReasoningEvents });
   const effectiveThinkingLevels = useMemo(() => {
-    if (modelMeta.thinkingLevels && modelMeta.thinkingLevels.length > 0) {
-      return modelMeta.thinkingLevels;
+    if (agent.isShell || modelMeta.canSwitchThinking === false) {
+      return [];
     }
-    if (hasReasoningEvents && !agent.isShell) {
-      const defaults = HARNESS_DEFAULT_THINKING_LEVELS[normalizeSwitchHarness(agent.harness)];
-      return defaults ? [...defaults] : ["low", "medium", "high"];
-    }
-    return [];
-  }, [agent.harness, agent.isShell, hasReasoningEvents, modelMeta.thinkingLevels]);
+    return modelMeta.thinkingLevels ?? [];
+  }, [agent.isShell, modelMeta.canSwitchThinking, modelMeta.thinkingLevels]);
   const applyModelMetaOverride = modelMeta.applyOverride;
   const [btwTurnsByAgent, setBtwTurnsByAgent] = useState<Record<string, BtwTurn[]>>({});
   const [chipDismissedPrefix, setChipDismissedPrefix] = useState<string | null>(null);

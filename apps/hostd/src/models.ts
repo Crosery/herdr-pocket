@@ -1530,7 +1530,7 @@ export async function getAgentModels(
       });
       if (itemLevels.length > 0) {
         merged[i] = { ...item, reasoning: item.reasoning ?? true, thinkingLevels: itemLevels };
-      } else if (!(i === 0 && opts.hasReasoningEvents) && isNonReasoningModelName(item.id)) {
+      } else if (isNonReasoningModelName(item.id)) {
         merged[i] = { ...item, reasoning: false };
       }
     }

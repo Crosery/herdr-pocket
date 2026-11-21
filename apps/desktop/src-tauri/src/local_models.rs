@@ -331,7 +331,7 @@ pub fn infer_model_thinking_levels(
         Vec::new()
     };
 
-    if reasoning == Some(false) && !has_reasoning_events {
+    if reasoning == Some(false) {
         return Vec::new();
     }
 
@@ -344,7 +344,7 @@ pub fn infer_model_thinking_levels(
         return fallback;
     }
     if is_non_reasoning_model_name(&base) {
-        return if has_reasoning_events { fallback } else { Vec::new() };
+        return Vec::new();
     }
     if let Some(levels) = match_explicit_model_family_levels(&base) {
         return levels;
@@ -3393,6 +3393,13 @@ claude-3-5-sonnet\tClaude 3.5 Sonnet\n";
         );
         assert_eq!(gpt4o_res.get("canSwitchThinking").and_then(Value::as_bool), Some(false));
         assert!(gpt4o_res.get("thinkingLevels").is_none());
+
+        assert!(infer_model_thinking_levels("omp", Some("demo/gemini-1.5-pro"), None, true).is_empty());
+        assert!(infer_model_thinking_levels("omp", Some("custom-no-reason"), Some(false), true).is_empty());
+        assert_eq!(
+            infer_model_thinking_levels("custom-cli", Some("custom-private-model"), None, true),
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()],
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

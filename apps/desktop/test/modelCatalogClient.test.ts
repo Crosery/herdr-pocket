@@ -3,6 +3,7 @@ import { beforeEach, test } from "node:test";
 import type { Agent, AgentModelsResult } from "@herdr-pocket/protocol";
 import {
   collectPeerModels,
+  computeAutoAgentModelMeta,
   fetchAgentModelsWithFallback,
   getInitialAgentModelsSeed,
   invalidateModelCatalogCache,
@@ -128,16 +129,25 @@ test("fetchAgentModelsWithFallback synthesizes fallback models on remote legacy 
   assert.ok(!JSON.stringify(res).includes("unknown method"));
 });
 
-test("getInitialAgentModelsSeed provides immediate synchronous models and exposes thinking on hasReasoningEvents", () => {
-  const seed = getInitialAgentModelsSeed(
-    { ...baseAgent, model: "magpie/crosery/mimo-v2.5-asr" },
+test("getInitialAgentModelsSeed keeps explicit non-reasoning models disabled even with hasReasoningEvents, while rescuing unknown custom models", () => {
+  const nonReasonSeed = getInitialAgentModelsSeed(
+    { ...baseAgent, model: "demo/gemini-1.5-pro" },
     ["magpie/crosery/gpt-6.2-sol-ultrafast"],
     { hasReasoningEvents: true },
   );
-  assert.equal(seed.canSwitch, true);
-  assert.equal(seed.canSwitchThinking, true);
-  assert.ok((seed.thinkingLevels?.length ?? 0) > 0);
-  assert.ok(seed.models.length >= 2);
+  assert.equal(nonReasonSeed.canSwitch, true);
+  assert.equal(nonReasonSeed.canSwitchThinking, false);
+  assert.equal(nonReasonSeed.thinkingLevels, undefined);
+  assert.ok(nonReasonSeed.models.length >= 2);
+
+  const rescuedSeed = getInitialAgentModelsSeed(
+    { ...baseAgent, harness: "custom-cli", model: "custom-private-model" },
+    [],
+    { hasReasoningEvents: true },
+  );
+  assert.equal(rescuedSeed.canSwitch, true);
+  assert.equal(rescuedSeed.canSwitchThinking, true);
+  assert.deepEqual(rescuedSeed.thinkingLevels, ["low", "medium", "high"]);
 });
 
 test("fetchAgentModelsWithFallback races/merges local_agent_models for slow remote omp hosts and updates when remote finishes", async () => {
@@ -306,4 +316,93 @@ test("patchCachedAgentModelMeta dynamically recomputes thinkingLevels, clamps cu
   assert.equal(snap.thinkingLevels, undefined);
   assert.equal(snap.canSwitchThinking, false);
   assert.equal(snap.currentThinking, undefined);
+});
+
+test("fetchAgentModelsWithFallback and computeAutoAgentModelMeta survive legacy host RPC missing .harness", async () => {
+  const legacyRpcRes = {
+    // Intentionally omit `harness` (older hostd shape)
+    currentModel: "claude-opus-4-6",
+    currentThinking: "high",
+    canSwitch: true,
+    canSwitchThinking: true,
+    models: [
+      { id: "claude-opus-4-6", label: "Claude Opus 4.6", reasoning: true, source: "current" as const },
+    ],
+  } as unknown as AgentModelsResult;
+
+  const res = await fetchAgentModelsWithFallback(
+    { ...baseAgent, key: "legacy-1/hc:t1", harness: "claude-code", model: "claude-opus-4-6" },
+    [],
+    {
+      deps: {
+        rpcCall: async () => legacyRpcRes,
+        isTauri: () => false,
+        getLocalHostId: async () => null,
+        invokeLocalAgentModels: async () => {
+          throw new Error("unused");
+        },
+      },
+    },
+  );
+
+  assert.equal(res.harness, "claude-code");
+  assert.deepEqual(res.thinkingLevels, ["low", "medium", "high", "max"]);
+
+  const meta = computeAutoAgentModelMeta(
+    { ...baseAgent, key: "legacy-1/hc:t1", harness: "claude-code", model: "claude-opus-4-6" },
+    { fetched: legacyRpcRes, hasReasoningEvents: true },
+  );
+  assert.equal(meta.currentModel, "claude-opus-4-6");
+  assert.equal(meta.currentThinking, "high");
+  assert.equal(meta.canSwitchThinking, true);
+  assert.deepEqual(meta.thinkingLevels, ["low", "medium", "high", "max"]);
+});
+
+test("computeAutoAgentModelMeta clears thinkingLevels and hides switching when switching from reasoning model (with hasReasoningEvents) to gemini-1.5-pro", () => {
+  const ompAgent: Agent = {
+    ...baseAgent,
+    key: "dev-mac/hc:t5",
+    harness: "oh-my-pi",
+    model: "demo/mimo-v2.6-pro",
+  };
+  const fetched: AgentModelsResult = {
+    harness: "oh-my-pi",
+    currentModel: "demo/mimo-v2.6-pro",
+    currentThinking: "xhigh",
+    thinkingLevels: ["off", "low", "medium", "high", "xhigh"],
+    canSwitch: true,
+    canSwitchThinking: true,
+    models: [
+      {
+        id: "demo/mimo-v2.6-pro",
+        label: "MiMo V2.6 Pro",
+        reasoning: true,
+        thinkingLevels: ["off", "low", "medium", "high", "xhigh"],
+        source: "current",
+      },
+      {
+        id: "demo/gemini-1.5-pro",
+        label: "Gemini 1.5 Pro",
+        reasoning: false,
+        source: "catalog",
+      },
+    ],
+  };
+
+  const before = computeAutoAgentModelMeta(ompAgent, {
+    fetched,
+    hasReasoningEvents: true,
+  });
+  assert.equal(before.canSwitchThinking, true);
+  assert.deepEqual(before.thinkingLevels, ["off", "low", "medium", "high", "xhigh"]);
+
+  const after = computeAutoAgentModelMeta(ompAgent, {
+    fetched,
+    override: { currentModel: "demo/gemini-1.5-pro" },
+    hasReasoningEvents: true,
+  });
+  assert.equal(after.currentModel, "demo/gemini-1.5-pro");
+  assert.equal(after.thinkingLevels, undefined);
+  assert.equal(after.currentThinking, undefined);
+  assert.equal(after.canSwitchThinking, false);
 });

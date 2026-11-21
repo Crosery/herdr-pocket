@@ -899,14 +899,15 @@ export function Composer({
       return resolveThinkingLevelsForModel(
         {
           ...modelData,
-          models: modelData.models,
+          harness: modelData.harness || agent.harness,
+          models: Array.isArray(modelData.models) ? modelData.models : [],
           hasReasoningEvents: effectiveHasReasoning,
         },
         effectiveCurrentModel,
       );
     }
     return inferredMeta.thinkingLevels ?? [];
-  }, [agent.isShell, modelData, effectiveCurrentModel, effectiveHasReasoning, inferredMeta.thinkingLevels]);
+  }, [agent.isShell, agent.harness, modelData, effectiveCurrentModel, effectiveHasReasoning, inferredMeta.thinkingLevels]);
   const effectiveCurrentThinking =
     effectiveThinkingLevels.length === 0
       ? ""
@@ -1040,7 +1041,12 @@ export function Composer({
       if (!cleanThinking) {
         const catalog = modelData ?? fallbackModelData;
         const nextLevels = resolveThinkingLevelsForModel(
-          { ...catalog, models: catalog.models, hasReasoningEvents: effectiveHasReasoning },
+          {
+            ...catalog,
+            harness: catalog.harness || agent.harness,
+            models: Array.isArray(catalog.models) ? catalog.models : [],
+            hasReasoningEvents: effectiveHasReasoning,
+          },
           nextModelClean,
         );
         setThinkingOverride(clampThinkingLevel(nextLevels, effectiveCurrentThinking || undefined, nextModelRaw));

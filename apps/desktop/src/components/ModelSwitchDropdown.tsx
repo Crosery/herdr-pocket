@@ -274,14 +274,15 @@ export function ModelSwitchDropdown({
       return resolveThinkingLevelsForModel(
         {
           ...data,
-          models: data.models,
+          harness: data.harness || agent.harness,
+          models: Array.isArray(data.models) ? data.models : [],
           hasReasoningEvents,
         },
         currentModel,
       );
     }
     return inferred.thinkingLevels ?? [];
-  }, [agent.isShell, data, currentModel, hasReasoningEvents, inferred.thinkingLevels]);
+  }, [agent.isShell, agent.harness, data, currentModel, hasReasoningEvents, inferred.thinkingLevels]);
   const currentThinking =
     thinkingLevels.length === 0
       ? ""

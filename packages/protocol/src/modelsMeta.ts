@@ -96,13 +96,13 @@ export const HARNESS_DEFAULT_THINKING_LEVELS: Record<string, readonly string[]> 
 };
 
 /** Strips a trailing `:effort` modifier (such as `:high`) from an omp/pi selector without disturbing tags like `:8b`. */
-export function stripModelEffortSuffix(modelId: string): string {
-  return modelId.trim().replace(EFFORT_SUFFIX_RE, "");
+export function stripModelEffortSuffix(modelId?: string | null): string {
+  return (modelId ?? "").trim().replace(EFFORT_SUFFIX_RE, "");
 }
 
 /** Normalizes any harness identifier into its canonical CLI/family key for model & effort switching. */
-export function normalizeSwitchHarness(raw: string): string {
-  const h = raw.trim().toLowerCase();
+export function normalizeSwitchHarness(raw?: string | null): string {
+  const h = (raw ?? "").trim().toLowerCase();
   if (!h) return "generic";
   if (h.includes("claude") || h === "crosery" || h === "prime" || h === "commandcode" || h === "reasonix") return "claude";
   if (h === "omp" || h.includes("oh-my-pi")) return "omp";
@@ -127,8 +127,8 @@ export function normalizeSwitchHarness(raw: string): string {
 }
 
 /** Returns true when `modelId` matches an explicit non-reasoning model pattern. */
-export function isNonReasoningModelName(modelId: string): boolean {
-  const base = stripModelEffortSuffix(modelId.trim());
+export function isNonReasoningModelName(modelId?: string | null): boolean {
+  const base = stripModelEffortSuffix(modelId);
   return Boolean(base) && NON_REASONING_MODEL_RE.test(base);
 }
 
@@ -145,10 +145,11 @@ function matchExplicitModelFamilyLevels(baseModel: string): readonly string[] | 
 
 /**
  * Infers per-model thinking effort levels from the model family first, falling back to harness
- * defaults only when `modelId` is empty or unknown.
+ * defaults only when `modelId` is empty or unknown. Explicit non-reasoning models stay `[]`
+ * even when earlier session turns emitted reasoning events.
  */
 export function inferModelThinkingLevels(
-  harness: string,
+  harness?: string | null,
   modelId?: string,
   opts?: { hasReasoningEvents?: boolean; reasoning?: boolean },
 ): string[] {
@@ -160,7 +161,7 @@ export function inferModelThinkingLevels(
       ? ["low", "medium", "high"]
       : [];
 
-  if (opts?.reasoning === false && !opts?.hasReasoningEvents) {
+  if (opts?.reasoning === false) {
     return [];
   }
 
@@ -175,7 +176,7 @@ export function inferModelThinkingLevels(
   }
 
   if (NON_REASONING_MODEL_RE.test(base)) {
-    return opts?.hasReasoningEvents ? fallbackLevels : [];
+    return [];
   }
 
   const familyLevels = matchExplicitModelFamilyLevels(base);
@@ -228,7 +229,7 @@ export function findModelOptionForModel(
 }
 
 export interface ResolveThinkingLevelsInput {
-  harness: string;
+  harness?: string | null;
   models?: readonly AgentModelOption[];
   currentModel?: string;
   modelId?: string;
@@ -259,18 +260,23 @@ export function resolveThinkingLevelsForModel(
   }
 
   const matched = findModelOptionForModel(catalogOrOpts.models, clean, {
-    harness,
+    harness: harness ?? undefined,
     modelRoles: catalogOrOpts.modelRoles,
   });
 
   if (matched) {
-    if (matched.reasoning === false && !hasReasoningEvents) {
+    if (matched.reasoning === false || isNonReasoningModelName(matched.id)) {
       return [];
     }
-    if (matched.thinkingLevels?.length) {
-      return [...matched.thinkingLevels];
+    if (matched.thinkingLevels !== undefined) {
+      if (matched.thinkingLevels.length > 0) {
+        return [...matched.thinkingLevels];
+      }
+      if (matched.reasoning !== true) {
+        return [];
+      }
     }
-    if (matchExplicitModelFamilyLevels(matched.id) || (!hasReasoningEvents && isNonReasoningModelName(matched.id))) {
+    if (matchExplicitModelFamilyLevels(matched.id)) {
       return inferModelThinkingLevels(harness, matched.id, {
         hasReasoningEvents,
         reasoning: matched.reasoning,
@@ -286,7 +292,11 @@ export function resolveThinkingLevelsForModel(
     });
   }
 
-  if (!matchExplicitModelFamilyLevels(clean) && (hasReasoningEvents || !isNonReasoningModelName(clean))) {
+  if (isNonReasoningModelName(clean)) {
+    return [];
+  }
+
+  if (!matchExplicitModelFamilyLevels(clean)) {
     const catalogCur = catalogOrOpts.currentModel ? stripModelEffortSuffix(catalogOrOpts.currentModel).toLowerCase() : "";
     if (catalogCur && catalogCur === clean.toLowerCase() && catalogOrOpts.thinkingLevels?.length) {
       return [...catalogOrOpts.thinkingLevels];
@@ -351,7 +361,7 @@ export function clampThinkingLevel(
  * from a harness name and optional raw model string so UI controls can render with 0ms wait.
  */
 export function inferAgentModelAndThinking(
-  harness: string,
+  harness?: string | null,
   rawModel?: string,
   opts?: { hasReasoningEvents?: boolean },
 ): { currentModel?: string; currentThinking?: string; thinkingLevels?: string[] } {
@@ -369,7 +379,7 @@ export function inferAgentModelAndThinking(
       ? trimmed.slice(base.length + 1).toLowerCase()
       : undefined;
 
-  if (!opts?.hasReasoningEvents && NON_REASONING_MODEL_RE.test(base)) {
+  if (NON_REASONING_MODEL_RE.test(base)) {
     return { currentModel: base, thinkingLevels: [] };
   }
 

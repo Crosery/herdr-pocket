@@ -336,7 +336,13 @@ function demoModelOpt(
   source: "current" | "recent" | "catalog",
   extra?: Partial<AgentModelOption>,
 ): AgentModelOption {
-  const levels = extra?.thinkingLevels ? [...extra.thinkingLevels] : inferModelThinkingLevels(harness, id);
+  const rawLevels = extra?.thinkingLevels ? [...extra.thinkingLevels] : inferModelThinkingLevels(harness, id);
+  const levels =
+    normalizeSwitchHarness(harness) === "omp" &&
+    rawLevels.length > 0 &&
+    !rawLevels.some((l) => l.toLowerCase() === "off")
+      ? ["off", ...rawLevels]
+      : rawLevels;
   return {
     id,
     label,
@@ -633,9 +639,14 @@ export const mockApi = {
       }
       const nextModelForInfer = resolvedModel ?? a?.model;
       const matchedOpt = findModelOptionForModel(pool, nextModelForInfer, { harness });
-      const levels = matchedOpt?.thinkingLevels
-        ? [...matchedOpt.thinkingLevels]
-        : inferModelThinkingLevels(harness, nextModelForInfer);
+      const levels = resolveThinkingLevelsForModel(
+        {
+          harness,
+          models: pool,
+          currentModel: nextModelForInfer,
+        },
+        nextModelForInfer,
+      );
       const clampedThinking =
         levels.length > 0
           ? clampThinkingLevel(

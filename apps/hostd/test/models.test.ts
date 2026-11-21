@@ -802,6 +802,14 @@ test("OMP models.yml enrichment uses cached omp models --json else inferModelThi
     );
     assert.equal(nonReasonRes.canSwitchThinking, false);
     assert.equal(nonReasonRes.thinkingLevels, undefined);
+
+    const nonReasonWithHistoryRes = await getAgentModels(
+      { ...hcAgent, model: "demo/gemini-1.5-pro" },
+      { homeDir: dir, unifloReady: false, hasReasoningEvents: true, readCatalog: async () => [] },
+    );
+    assert.equal(nonReasonWithHistoryRes.canSwitchThinking, false);
+    assert.equal(nonReasonWithHistoryRes.thinkingLevels, undefined);
+    assert.equal(nonReasonWithHistoryRes.models[0]?.reasoning, false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
