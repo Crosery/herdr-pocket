@@ -33,8 +33,13 @@ export const TEXT_PRESETS: Record<string, TextPreset> = {
   volcengine: { label: "Volcengine Ark (Doubao)", protocol: "openai", baseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   openrouter: { label: "OpenRouter", protocol: "openai", baseUrl: "https://openrouter.ai/api/v1" },
   gemini: { label: "Google Gemini (OpenAI-compatible endpoint)", protocol: "openai", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai" },
+  stepfun: { label: "StepFun 阶跃星辰", protocol: "openai", baseUrl: "https://api.stepfun.com/v1" },
+  groq: { label: "Groq", protocol: "openai", baseUrl: "https://api.groq.com/openai/v1" },
+  xai: { label: "xAI", protocol: "openai", baseUrl: "https://api.x.ai/v1" },
   // From inside a container use http://host.docker.internal:11434/v1.
   ollama: { label: "Ollama (local)", protocol: "openai", baseUrl: "http://localhost:11434/v1", keyless: true },
+  lmstudio: { label: "LM Studio (local)", protocol: "openai", baseUrl: "http://127.0.0.1:1234/v1", keyless: true },
+  mlx: { label: "Apple Silicon MLX (local)", protocol: "openai", baseUrl: "http://127.0.0.1:8080/v1", keyless: true },
 };
 
 export const VOICE_PROVIDERS = ["moss-live", "openai-realtime"] as const;

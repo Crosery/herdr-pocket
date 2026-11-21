@@ -31,6 +31,18 @@ import { changeConfig, flash, listProviderModels, loadConfig, PROTOCOL_LABEL, pr
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space, statusColors } from "../../theme/tokens";
 
+const EXTRA_SOTA_PRESETS: readonly ProviderPresetItem[] = [
+  { id: "stepfun", label: "StepFun 阶跃星辰", protocol: "openai", baseUrl: "https://api.stepfun.com/v1", recommendedModel: "step-2-mini" },
+  { id: "groq", label: "Groq", protocol: "openai", baseUrl: "https://api.groq.com/openai/v1", recommendedModel: "llama-3.3-70b-versatile" },
+  { id: "xai", label: "xAI", protocol: "openai", baseUrl: "https://api.x.ai/v1", recommendedModel: "grok-3-fast" },
+  { id: "lmstudio", label: "LM Studio 本地", protocol: "openai", baseUrl: "http://127.0.0.1:1234/v1", auth: "none" },
+  { id: "mlx", label: "Apple Silicon MLX 本地", protocol: "openai", baseUrl: "http://127.0.0.1:8080/v1", auth: "none" },
+];
+const ALL_PRESETS: readonly ProviderPresetItem[] = [
+  ...PROVIDER_PRESETS,
+  ...EXTRA_SOTA_PRESETS.filter((item) => !PROVIDER_PRESETS.some((p) => p.id === item.id)),
+];
+
 const ID = /^[a-z][a-z0-9-]{0,31}$/;
 const HTTP = /^https?:\/\/\S+$/i;
 const PROTOCOLS: readonly ModelProtocol[] = ["openai", "openai-responses", "anthropic", "gemini", "ollama"];
@@ -373,7 +385,7 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
             <Card style={{ padding: space.lg, gap: space.md }}>
               <Field title="1. 快速选平台（也可以选自定义）" hint={`自动代号：${pid}（可在下方“更多设置”改）`}>
                 <Chips>
-                  {PROVIDER_PRESETS.map((item) => (
+                  {ALL_PRESETS.map((item) => (
                     <Chip key={item.id} on={presetId === item.id} onPress={() => applyPreset(item)} label={item.label} />
                   ))}
                   <Chip on={presetId === "custom"} onPress={() => applyPreset("custom")} label="自定义接口" />
@@ -408,10 +420,10 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
             <Field title="地址 (Base URL)" hint={`示例：${URL_HINT[protocol]}`} error={urlError}>
               <Input value={baseUrl} onChangeText={setBaseUrl} placeholder={URL_HINT[protocol]} autoCapitalize="none" keyboardType="url" mono accessibilityLabel="地址" />
             </Field>
-            {protocol === "ollama" && auth !== "bearer" ? (
+            {(protocol === "ollama" && auth !== "bearer") || auth === "none" ? (
               <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, backgroundColor: p.surface2, borderRadius: radius.md, padding: space.md }}>
                 <MaterialCommunityIcons name="check-circle-outline" size={18} color={good} />
-                <Text style={{ flex: 1, color: p.muted, fontSize: 13 }}>Ollama 本地默认免密钥，填写地址即可直接扫描模型。</Text>
+                <Text style={{ flex: 1, color: p.muted, fontSize: 13 }}>本地推理服务（Ollama / LM Studio / MLX）默认免密钥，填写地址即可直接扫描模型。</Text>
               </View>
             ) : (
               <KeyField value={apiKey} onChange={setApiKey} current={current?.key} onClearPhoneKey={() => setAsk("clearKey")} busy={busy} />

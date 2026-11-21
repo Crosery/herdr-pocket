@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { OPENAI_REALTIME_VOICES, type PromptId, type VoiceProviderId } from "@herdr-pocket/protocol";
 import {
   PocketBadge,
@@ -11,6 +11,7 @@ import {
   useToast,
 } from "../../components/PocketUI";
 import { assistantConfigStore, loadAssistantConfig, saveAssistantConfig, saveAssistantPrompt } from "../../lib/assistant";
+import { SOTA_VOICE_PRESETS, matchVoicePresetId } from "../../lib/voicePresets";
 import { ModelsSection } from "./ModelsSection";
 import { ProvidersSection, ResetSection } from "./ProvidersSection";
 import "../../styles/models.css";
@@ -36,7 +37,17 @@ export function AssistantSettings({ subTab, onSubTab }: { subTab: AssistantTab; 
   const [voiceModel, setVoiceModel] = useState("gpt-realtime");
   const [voiceId, setVoiceId] = useState("marin");
   const [voiceKey, setVoiceKey] = useState("");
+  const [customVoiceMode, setCustomVoiceMode] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState<{ id: PromptId; text: string } | null>(null);
+
+  const matchedVoicePreset = useMemo(
+    () => (customVoiceMode ? "custom" : matchVoicePresetId(voiceProvider, voiceUrl, voiceModel)),
+    [customVoiceMode, voiceModel, voiceProvider, voiceUrl],
+  );
+  const activeVoicePreset = useMemo(
+    () => SOTA_VOICE_PRESETS.find((p) => p.id === matchedVoicePreset) ?? SOTA_VOICE_PRESETS[SOTA_VOICE_PRESETS.length - 1]!,
+    [matchedVoicePreset],
+  );
 
   useEffect(() => {
     void loadAssistantConfig();
@@ -49,7 +60,27 @@ export function AssistantSettings({ subTab, onSubTab }: { subTab: AssistantTab; 
     setVoiceUrl(cfg.voice.url ?? "");
     setVoiceModel(cfg.voice.model ?? "gpt-realtime");
     setVoiceId(cfg.voice.voice ?? "marin");
+    setCustomVoiceMode(false);
   }, [cfg]);
+
+  const applyVoicePreset = (presetId: string) => {
+    const preset = SOTA_VOICE_PRESETS.find((p) => p.id === presetId);
+    if (!preset) return;
+    if (preset.id === "custom") {
+      setCustomVoiceMode(true);
+      if (voiceProvider === "off") setVoiceProvider("openai-realtime");
+      return;
+    }
+    setCustomVoiceMode(false);
+    setVoiceProvider(preset.provider);
+    setVoiceUrl(preset.url);
+    setVoiceModel(preset.model);
+    if (preset.defaultVoice) {
+      setVoiceId(preset.defaultVoice);
+    } else if (preset.provider === "moss-live" && OPENAI_REALTIME_VOICES.some((v) => v.id === voiceId)) {
+      setVoiceId("");
+    }
+  };
 
   const saveVoice = async () => {
     if (!cfg) return;
@@ -120,8 +151,26 @@ export function AssistantSettings({ subTab, onSubTab }: { subTab: AssistantTab; 
                 <PocketInput value={assistantName} onChange={(e) => setAssistantName(e.target.value)} />
               </div>
               <div className="stack" style={{ gap: 6 }}>
+                <label className="faint">SOTA 实时语音模型预设</label>
+                <PocketSelect
+                  ariaLabel="SOTA 实时语音模型预设"
+                  value={matchedVoicePreset}
+                  onValueChange={applyVoicePreset}
+                  options={SOTA_VOICE_PRESETS.map((p) => ({
+                    value: p.id,
+                    label: p.label,
+                    badge: p.badge,
+                    tone: p.local ? "accent" : "default",
+                  }))}
+                />
+                <div className="faint" style={{ fontSize: fs(12), lineHeight: 1.5 }}>
+                  {activeVoicePreset.hint}（保存后与手机端实时同步；下方所有参数仍可自由微调。）
+                </div>
+              </div>
+              <div className="stack" style={{ gap: 6 }}>
                 <label className="faint">实时语音协议</label>
                 <PocketSelect
+                  ariaLabel="实时语音协议"
                   value={voiceProvider}
                   onValueChange={(v) => setVoiceProvider(v as VoiceProviderId | "off")}
                   options={[
@@ -135,11 +184,26 @@ export function AssistantSettings({ subTab, onSubTab }: { subTab: AssistantTab; 
                 <>
                   <div className="stack" style={{ gap: 6 }}>
                     <label className="faint">WebSocket 接入地址</label>
-                    <PocketInput mono value={voiceUrl} onChange={(e) => setVoiceUrl(e.target.value)} placeholder="wss://api.example.com/v1/realtime" />
+                    <PocketInput
+                      mono
+                      value={voiceUrl}
+                      onChange={(e) => {
+                        setCustomVoiceMode(false);
+                        setVoiceUrl(e.target.value);
+                      }}
+                      placeholder="wss://api.example.com/v1/realtime"
+                    />
                   </div>
                   <div className="stack" style={{ gap: 6 }}>
                     <label className="faint">模型名称</label>
-                    <PocketInput mono value={voiceModel} onChange={(e) => setVoiceModel(e.target.value)} />
+                    <PocketInput
+                      mono
+                      value={voiceModel}
+                      onChange={(e) => {
+                        setCustomVoiceMode(false);
+                        setVoiceModel(e.target.value);
+                      }}
+                    />
                   </div>
                   {voiceProvider === "openai-realtime" ? (
                     <div className="stack" style={{ gap: 6 }}>

@@ -129,3 +129,24 @@ test("voice: POCKET_VOICE_* and the older POCKET_MOSS_* names; a MOSS key never 
   assert.equal(unknown.live, undefined);
   assert.ok(unknown.warnings.some((w) => /"something" is unknown/.test(w)));
 });
+
+test("SOTA cloud and keyless local text presets (stepfun, groq, xai, lmstudio, mlx) resolve cleanly", () => {
+  const s = loadModelSetup({
+    POCKET_ASSISTANT_MODELS: "stepfun:step-2-mini,groq:llama-3.3-70b-versatile,xai:grok-3-fast,lmstudio:qwen3-30b,mlx:qwen3-coder-30b",
+    POCKET_STEPFUN_API_KEY: "k-step",
+    POCKET_GROQ_API_KEY: "k-groq",
+    POCKET_XAI_API_KEY: "k-xai",
+  });
+  assert.deepEqual(s.errors, []);
+  assert.deepEqual(
+    s.assistant?.targets.map((t) => [t.provider, t.baseUrl, t.model, t.apiKey ?? null]),
+    [
+      ["stepfun", "https://api.stepfun.com/v1", "step-2-mini", "k-step"],
+      ["groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", "k-groq"],
+      ["xai", "https://api.x.ai/v1", "grok-3-fast", "k-xai"],
+      ["lmstudio", "http://127.0.0.1:1234/v1", "qwen3-30b", null],
+      ["mlx", "http://127.0.0.1:8080/v1", "qwen3-coder-30b", null],
+    ],
+  );
+  assert.deepEqual(s.summary.assistant, ["stepfun", "groq", "xai", "lmstudio", "mlx"]);
+});
