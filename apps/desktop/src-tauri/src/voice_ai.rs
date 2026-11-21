@@ -503,7 +503,7 @@ mod ort {
                 }
                 #[cfg(windows)]
                 unsafe {
-                    windows_sys::Win32::System::LibraryLoader::FreeLibrary(self.handle);
+                    windows_sys::Win32::Foundation::FreeLibrary(self.handle);
                 }
             }
         }
