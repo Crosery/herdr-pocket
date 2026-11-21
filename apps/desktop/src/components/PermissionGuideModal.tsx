@@ -48,64 +48,74 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
       return {
         title: "麦克风",
         breadcrumbs: ["系统设置", "隐私与安全性", "麦克风"],
-        why: "语音输入和小羊通话都需要访问麦克风。",
+        why: "用于语音输入与小羊实时通话。",
         actionLabel: "直达系统设置「麦克风」",
         dragSupported: true,
         steps: [
-          "点击下方按钮直接打开「系统设置 › 隐私与安全性 › 麦克风」。",
-          "在右侧列表找到 Herdr Pocket 并打开开关；若列表里没有，可直接把下方的应用图标拖进列表，或点应用内按钮触发一次授权。",
+          "打开系统设置「麦克风」并开启 Herdr Pocket 开关。",
+          "若列表里没有应用，按住下方卡片拖进右侧列表即可。",
         ],
       };
     case "accessibility":
       return {
         title: "辅助功能",
         breadcrumbs: ["系统设置", "隐私与安全性", "辅助功能"],
-        why: "识别完成后需要通过「辅助功能」把文字直接粘贴到微信、浏览器、编辑器等当前聚焦应用。",
+        why: "用于将识别文字直接粘贴到当前聚焦的应用。",
         actionLabel: "直达系统设置「辅助功能」",
         dragSupported: true,
         steps: [
-          "点击下方按钮直接打开「系统设置 › 隐私与安全性 › 辅助功能」。",
-          "把下方的「Herdr Pocket.app」卡片直接拖进右侧列表即可快速完成添加并开启；或选中旧记录点「−」移除后再拖入。",
+          "打开系统设置「辅助功能」并开启 Herdr Pocket 开关。",
+          "按住下方「Herdr Pocket.app」拖进右侧列表即可快速添加。",
         ],
       };
     case "inputMonitoring":
       return {
         title: "输入监控",
         breadcrumbs: ["系统设置", "隐私与安全性", "输入监控"],
-        why: "使用右 Option、Fn 等单个修饰键「按住说话」时，需要「输入监控」监听按下与松开事件。",
+        why: "用于监听右 Option、Fn 等单键按住说话。",
         actionLabel: "直达系统设置「输入监控」",
         dragSupported: true,
         steps: [
-          "点击下方按钮直接打开「系统设置 › 隐私与安全性 › 输入监控」。",
-          "按住下方的「Herdr Pocket.app」图标直接拖入右侧列表，或打开列表中的 Herdr Pocket 开关即可。",
+          "打开系统设置「输入监控」并开启 Herdr Pocket 开关。",
+          "按住下方「Herdr Pocket.app」拖进右侧列表即可快速添加。",
         ],
       };
     case "fullDiskAccess":
       return {
         title: "完全磁盘访问权限",
         breadcrumbs: ["系统设置", "隐私与安全性", "完全磁盘访问权限"],
-        why: "导入 Safari 浏览器已登录站点的 Cookie 时，macOS 要求先授予完全磁盘访问权限。",
+        why: "用于导入 Safari 已登录站点的 Cookie。",
         actionLabel: "直达系统设置「完全磁盘访问权限」",
         dragSupported: true,
         steps: [
-          "点击下方按钮直接打开「系统设置 › 隐私与安全性 › 完全磁盘访问权限」。",
-          "按住下方的「Herdr Pocket.app」卡片直接拖入右侧权限列表，系统会自动加入并可立即打开开关。",
+          "打开系统设置「完全磁盘访问权限」并开启开关。",
+          "按住下方「Herdr Pocket.app」拖进右侧列表即可快速添加。",
         ],
       };
     case "keyboard":
       return {
         title: "地球仪键（Fn）",
         breadcrumbs: ["系统设置", "键盘", "按下地球仪键时"],
-        why: "如果用 Fn 当作按住说话快捷键，需要避免系统同时把 Fn 当成切换输入法或弹出表情符号。",
+        why: "避免按 Fn 时同时触发系统输入法或表情面板。",
         actionLabel: "直达系统设置「键盘」",
         dragSupported: false,
         steps: [
-          "点击下方按钮直接打开「系统设置 › 键盘」。",
-          "将「按下地球仪键时」（Press 🌐 key to）切换为「不执行任何操作」（Do Nothing）。",
+          "打开「系统设置 › 键盘」，将「按下地球仪键时」改为「不执行任何操作」。",
         ],
-        settingTip: "修改后无需重启应用，下方状态会自动更新为已适配。",
+        settingTip: "修改后无需重启应用，状态会自动刷新。",
       };
   }
+}
+
+function anyPermissionGrantedTransition(prev: Permissions | null, next: Permissions): boolean {
+  if (!prev) return false;
+  return (
+    (prev.microphone !== "granted" && next.microphone === "granted") ||
+    (prev.accessibility !== "granted" && next.accessibility === "granted") ||
+    (prev.inputMonitoring !== "granted" && next.inputMonitoring === "granted") ||
+    (prev.fullDiskAccess !== "granted" && next.fullDiskAccess === "granted") ||
+    (prev.fnKeyAction !== "none" && next.fnKeyAction === "none")
+  );
 }
 
 export function permissionGranted(kind: PermissionKind, perms: Permissions | null): boolean {
@@ -147,7 +157,9 @@ export function PermissionGuideModal({
   const [rechecking, setRechecking] = useState(false);
   const pressOriginRef = useRef<{ x: number; y: number } | null>(null);
   const dragStartedRef = useRef(false);
-  const wasGrantedRef = useRef(false);
+  const prevPermsRef = useRef<Permissions | null>(perms);
+  const onRefreshRef = useRef(onRefresh);
+  onRefreshRef.current = onRefresh;
 
   useEffect(() => {
     setLivePerms(perms);
@@ -155,7 +167,7 @@ export function PermissionGuideModal({
 
   useEffect(() => {
     if (!open || !kind) return;
-    wasGrantedRef.current = permissionGranted(kind, perms);
+    prevPermsRef.current = perms;
   }, [open, kind]);
 
   useEffect(() => {
@@ -164,24 +176,29 @@ export function PermissionGuideModal({
     const poll = async () => {
       const next = await native.getPermissions();
       if (!alive || !next) return;
+      const prev = prevPermsRef.current;
+      prevPermsRef.current = next;
       setLivePerms(next);
-      const nowGranted = permissionGranted(kind, next);
-      if (nowGranted && !wasGrantedRef.current) {
-        wasGrantedRef.current = true;
+      if (anyPermissionGrantedTransition(prev, next)) {
         void native.voiceReload().finally(() => {
-          void onRefresh();
+          void onRefreshRef.current();
         });
       }
     };
     void poll();
     const timer = window.setInterval(() => {
       void poll();
-    }, 900);
+    }, 800);
+    const onFocus = () => {
+      void poll();
+    };
+    window.addEventListener("focus", onFocus);
     return () => {
       alive = false;
       window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
     };
-  }, [open, kind, onRefresh]);
+  }, [open, kind]);
 
   if (!kind) return null;
   const spec = permissionGuideSpec(kind);
@@ -196,10 +213,19 @@ export function PermissionGuideModal({
       return;
     }
     try {
-      await native.openPermissionSettings(kind, true);
+      // Only request OS prompt for microphone when undetermined; for Accessibility / Input Monitoring
+      // avoid popping a competing macOS modal alert over System Settings.
+      await native.openPermissionSettings(kind, kind === "microphone");
       const next = await native.getPermissions();
-      if (next) setLivePerms(next);
-      await onRefresh();
+      if (next) {
+        const prev = prevPermsRef.current;
+        prevPermsRef.current = next;
+        setLivePerms(next);
+        if (anyPermissionGrantedTransition(prev, next)) {
+          void native.voiceReload();
+        }
+      }
+      await onRefreshRef.current();
     } catch (e) {
       toast((e as Error).message || "无法打开系统设置", true);
     }
@@ -387,7 +413,7 @@ export function PermissionGuideModal({
               </PocketButton>
             </div>
             <div className="perm-guide-tip">
-              若系统设置列表中找不到 Herdr Pocket，或更新版本后开关已打开仍提示未允许：直接把上方「Herdr Pocket.app」拖入系统设置列表（或选中旧条目点「−」移除后再拖入）即可立即适配。
+              若列表已有 Herdr Pocket 仍显示未允许：关闭重开开关，或选中点「−」移除后重新拖入
             </div>
           </section>
         ) : (

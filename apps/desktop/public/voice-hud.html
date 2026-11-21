@@ -5,41 +5,48 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Herdr Pocket 语音输入</title>
 <!--
-  The floating dictation HUD (src-tauri/src/voice/hud.rs). Strict CSP: zero inline JS.
+  The floating dictation & Xiaoyang capsule (src-tauri/src/voice/hud.rs). Strict CSP: zero inline JS.
   States pushed via window.__hud(state):
-    { state: "recording", level: 0..1, elapsedMs, hint?, sounds?, maxSeconds? }
-    { state: "transcribing", sounds? }
-    { state: "done", label, note?, chars? }
-    { state: "error", message }
+    { state: "recording", level: 0..1, elapsedMs, mode?: "dictate"|"assistant", hint?, dspBadge?, sounds?, maxSeconds? }
+    { state: "transcribing", mode?: "dictate"|"assistant", label?, hint?, dspBadge?, sounds? }
+    { state: "done", label, note?, chars?, dspBadge? }
+    { state: "assistant_reply", question, answer, dspBadge?, error? }
+    { state: "error", message, dspBadge? }
     { state: "cancelled" }
 -->
 <style>
   :root {
     --pink: #ff6ea4;
-    --pink-deep: #f05591;
-    --lav: #a78bfa;
+    --pink-deep: #e84685;
+    --lav: #9f84f7;
+    --accent-soft: rgba(255, 110, 164, 0.14);
     --accent-text: #b8336a;
     --ink: #2c2038;
     --muted: #786a88;
-    --surface: rgba(255, 252, 254, 0.88);
+    --surface: rgba(255, 251, 254, 0.90);
+    --surface-sub: rgba(248, 241, 250, 0.72);
     --border: rgba(255, 110, 164, 0.34);
     --btn-bg: rgba(74, 59, 92, 0.08);
     --btn-hover: rgba(74, 59, 92, 0.16);
-    --danger: #e13f68;
+    --pill-bg: rgba(74, 59, 92, 0.06);
+    --danger: #d93861;
     --ok: #10a37f;
-    --shadow: 0 10px 28px rgba(184, 51, 106, 0.2), 0 2px 8px rgba(24, 16, 36, 0.08);
+    --shadow: 0 10px 28px rgba(184, 51, 106, 0.22), 0 2px 10px rgba(24, 16, 36, 0.08);
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --ink: #f6effa;
       --muted: #b4a7c5;
+      --accent-soft: rgba(255, 126, 178, 0.2);
       --accent-text: #ff9ec4;
-      --surface: rgba(28, 22, 37, 0.86);
-      --border: rgba(255, 130, 180, 0.3);
+      --surface: rgba(28, 22, 37, 0.88);
+      --surface-sub: rgba(44, 35, 58, 0.76);
+      --border: rgba(255, 130, 180, 0.32);
       --btn-bg: rgba(255, 255, 255, 0.09);
       --btn-hover: rgba(255, 255, 255, 0.18);
+      --pill-bg: rgba(255, 255, 255, 0.07);
       --danger: #ffa3af;
-      --shadow: 0 12px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.06);
+      --shadow: 0 12px 32px rgba(0, 0, 0, 0.52), 0 0 0 1px rgba(255, 255, 255, 0.06);
     }
   }
   * { box-sizing: border-box; }
@@ -56,31 +63,51 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", system-ui, sans-serif;
     color: var(--ink);
+  }
+  body.standalone-qa {
+    background: radial-gradient(circle at 50% 35%, rgba(255, 217, 232, 0.45), rgba(236, 228, 255, 0.38) 55%, rgba(247, 242, 255, 0.6));
+  }
+  @media (prefers-color-scheme: dark) {
+    body.standalone-qa {
+      background: radial-gradient(circle at 50% 35%, rgba(74, 36, 64, 0.48), rgba(30, 26, 38, 0.92));
+    }
   }
   .hud {
     position: relative;
-    width: 412px;
-    height: 54px;
-    padding: 0 12px;
+    width: 446px;
+    height: 56px;
+    padding: 0 11px;
     display: flex;
     align-items: center;
-    gap: 10px;
     border-radius: 999px;
     background: var(--surface);
-    -webkit-backdrop-filter: blur(22px) saturate(185%);
-    backdrop-filter: blur(22px) saturate(185%);
+    -webkit-backdrop-filter: blur(24px) saturate(185%);
+    backdrop-filter: blur(24px) saturate(185%);
     border: 1px solid var(--border);
     box-shadow: var(--shadow);
     overflow: hidden;
     opacity: 0;
     transform: translateY(8px) scale(0.96);
-    transition: opacity 150ms ease-out, transform 220ms cubic-bezier(0.22, 1, 0.36, 1), width 200ms ease;
+    transition: opacity 150ms ease-out, transform 220ms cubic-bezier(0.22, 1, 0.36, 1), width 200ms ease, height 200ms ease, border-radius 200ms ease;
   }
   .hud.on { opacity: 1; transform: translateY(0) scale(1); }
-  .hud.done { width: 224px; }
-  .hud.transcribing { width: 248px; }
+  .hud.done { width: 256px; height: 54px; }
+  .hud.done.has-dsp { width: 318px; }
+  .hud.transcribing { width: 282px; height: 54px; }
+  .hud.transcribing.has-dsp { width: 338px; }
+  .hud.error { width: 404px; height: 56px; }
+  .hud.cancelled { width: 214px; height: 54px; }
+  .hud.assistant_reply {
+    width: 448px;
+    height: 164px;
+    padding: 12px 14px;
+    border-radius: 22px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
   .hud.transcribing::before {
     content: "";
     position: absolute;
@@ -101,6 +128,13 @@
   }
   @keyframes beam-spin {
     to { --beam: 360deg; }
+  }
+  .compact-row {
+    width: 100%;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .progress-track {
     position: absolute;
@@ -123,14 +157,17 @@
   }
   .dot {
     flex: none;
-    width: 32px;
-    height: 32px;
+    width: 30px;
+    height: 30px;
     border-radius: 50%;
-    background: linear-gradient(135deg, #f05591, #c92f6d);
+    background: linear-gradient(135deg, var(--pink), var(--pink-deep));
     display: grid;
     place-items: center;
     position: relative;
-    box-shadow: 0 3px 10px rgba(201, 47, 109, 0.35);
+    box-shadow: 0 3px 10px rgba(201, 47, 109, 0.34);
+  }
+  .hud.mode-assistant .dot {
+    background: linear-gradient(135deg, var(--lav), var(--pink-deep));
   }
   .dot::after {
     content: "";
@@ -145,29 +182,26 @@
     0% { opacity: 0.65; transform: scale(0.86); }
     100% { opacity: 0; transform: scale(1.32); }
   }
-  .dot svg { width: 15px; height: 15px; fill: #fff; }
+  .dot svg { width: 14px; height: 14px; fill: #fff; }
   .done .dot { background: linear-gradient(135deg, #16b98d, var(--ok)); box-shadow: 0 3px 10px rgba(16, 163, 127, 0.3); }
   .error .dot { background: var(--danger); box-shadow: 0 3px 10px rgba(225, 63, 104, 0.35); }
   .cancelled .dot { background: var(--muted); box-shadow: none; }
-  .bars {
-    flex: none;
+  .text {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+  }
+  .title-row {
     display: flex;
     align-items: center;
-    gap: 2.5px;
-    height: 28px;
-    padding: 0 2px;
+    gap: 5px;
+    min-width: 0;
   }
-  .bars i {
-    display: block;
-    width: 2.5px;
-    height: 4px;
-    border-radius: 999px;
-    background: linear-gradient(180deg, var(--pink), var(--lav));
-    transition: height 75ms cubic-bezier(0.22, 1, 0.36, 1), opacity 100ms ease;
-    opacity: 0.78;
-  }
-  .text { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
   .title {
+    min-width: 0;
     font-size: 12.5px;
     font-weight: 700;
     line-height: 16px;
@@ -175,9 +209,21 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .dsp-pill {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font-size: 9.5px;
+    font-weight: 700;
+    line-height: 13px;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+  }
   .sub {
-    font-size: 10.5px;
-    line-height: 14px;
+    font-size: 10px;
+    line-height: 13px;
     color: var(--muted);
     white-space: nowrap;
     overflow: hidden;
@@ -192,22 +238,75 @@
     font-size: 11.5px;
     line-height: 14px;
   }
+  .mode-switch {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 999px;
+    background: var(--pill-bg);
+    border: 1px solid rgba(255, 110, 164, 0.16);
+  }
+  .mode-btn {
+    height: 22px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 10.5px;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 120ms ease, color 120ms ease, transform 90ms ease;
+  }
+  .mode-btn:hover { color: var(--ink); }
+  .mode-btn.active {
+    background: linear-gradient(135deg, var(--pink), var(--pink-deep));
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(232, 70, 133, 0.32);
+  }
+  .mode-btn[data-mode="assistant"].active {
+    background: linear-gradient(135deg, var(--lav), var(--pink-deep));
+  }
+  .bars {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 24px;
+    padding: 0 1px;
+  }
+  .bars i {
+    display: block;
+    width: 2.5px;
+    height: 4px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, var(--pink), var(--lav));
+    transition: height 75ms cubic-bezier(0.22, 1, 0.36, 1), opacity 100ms ease;
+    opacity: 0.78;
+  }
   .time {
     flex: none;
     font-variant-numeric: tabular-nums;
-    font-size: 11.5px;
+    font-size: 11px;
     color: var(--accent-text);
     font-weight: 700;
+    min-width: 26px;
+    text-align: right;
   }
   .actions {
     flex: none;
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
   }
   .act-btn {
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     border: 0;
     border-radius: 50%;
     display: grid;
@@ -221,39 +320,158 @@
   .act-btn:hover { background: var(--btn-hover); color: var(--ink); transform: scale(1.06); }
   .act-btn:active { transform: scale(0.95); }
   .act-btn.stop {
-    background: #d83b78;
+    background: linear-gradient(135deg, var(--pink), var(--pink-deep));
     color: #fff;
   }
-  .act-btn.stop:hover { background: #be2e67; color: #fff; }
-  .act-btn svg { width: 13px; height: 13px; fill: currentColor; }
+  .act-btn.stop:hover { filter: brightness(0.95); color: #fff; }
+  .act-btn svg { width: 12px; height: 12px; fill: currentColor; }
   .spin {
-    width: 14px;
-    height: 14px;
+    width: 13px;
+    height: 13px;
     border: 2px solid rgba(255, 255, 255, 0.45);
     border-top-color: #fff;
     border-radius: 50%;
     animation: spin 0.75s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Expanded Xiaoyang reply card ---------------------------------------- */
+  .reply-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+  .reply-head {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .reply-orb {
+    flex: none;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--lav), var(--pink-deep));
+    display: grid;
+    place-items: center;
+    box-shadow: 0 3px 10px rgba(159, 132, 247, 0.34);
+  }
+  .reply-orb svg { width: 14px; height: 14px; fill: #fff; }
+  .reply-meta {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .reply-title-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .reply-title {
+    font-size: 12.5px;
+    font-weight: 800;
+    color: var(--ink);
+  }
+  .reply-question {
+    font-size: 10.5px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .reply-actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .open-btn {
+    height: 26px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 120ms ease, transform 100ms ease;
+  }
+  .open-btn:hover { background: var(--btn-hover); color: var(--ink); }
+  .open-btn:active { transform: scale(0.97); }
+  .reply-body {
+    flex: 1 1 0;
+    min-height: 0;
+    padding: 8px 10px;
+    border-radius: 13px;
+    background: var(--surface-sub);
+    border: 1px solid rgba(255, 110, 164, 0.16);
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--ink);
+    overflow-y: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+    -webkit-user-select: text;
+    scrollbar-width: thin;
+  }
+  .reply-body.is-error { color: var(--danger); }
+
   [hidden] { display: none !important; }
   @media (prefers-reduced-motion: reduce) {
-    .hud, .bars i, .progress-fill, .act-btn { transition: none; }
+    .hud, .bars i, .progress-fill, .act-btn, .mode-btn { transition: none; }
     .recording .dot::after, .spin, .hud.transcribing::before { animation: none; }
   }
 </style>
 </head>
 <body>
 <div class="hud" id="hud" role="status" aria-live="polite">
-  <div class="dot" id="dot"></div>
-  <div class="text">
-    <div class="title" id="title">语音输入</div>
-    <div class="sub" id="sub" hidden></div>
+  <div class="compact-row" id="compactRow">
+    <div class="dot" id="dot"></div>
+    <div class="text">
+      <div class="title-row">
+        <div class="title" id="title">语音输入</div>
+        <span class="dsp-pill" id="dspBadge" hidden></span>
+      </div>
+      <div class="sub" id="sub" hidden></div>
+    </div>
+    <div class="mode-switch" id="modeSwitch" role="group" aria-label="语音模式" hidden>
+      <button type="button" class="mode-btn active" id="btnModeDictate" data-mode="dictate">语音输入</button>
+      <button type="button" class="mode-btn" id="btnModeAssistant" data-mode="assistant">问小羊</button>
+    </div>
+    <div class="bars" id="bars" hidden></div>
+    <div class="time" id="time" hidden></div>
+    <div class="actions" id="actions" hidden>
+      <button type="button" class="act-btn" id="btnCancel" aria-label="取消语音" title="取消 (Esc)"></button>
+      <button type="button" class="act-btn stop" id="btnStop" aria-label="完成并填入" title="完成并填入"></button>
+    </div>
   </div>
-  <div class="bars" id="bars" hidden></div>
-  <div class="time" id="time" hidden></div>
-  <div class="actions" id="actions" hidden>
-    <button type="button" class="act-btn" id="btnCancel" aria-label="取消语音" title="取消 (Esc)"></button>
-    <button type="button" class="act-btn stop" id="btnStop" aria-label="完成并填入" title="完成并填入"></button>
+  <div class="reply-wrap" id="replyWrap" hidden>
+    <div class="reply-head">
+      <div class="reply-orb" id="replyOrb"></div>
+      <div class="reply-meta">
+        <div class="reply-title-row">
+          <span class="reply-title" id="replyTitle">小羊回复</span>
+          <span class="dsp-pill" id="replyDspBadge" hidden></span>
+        </div>
+        <div class="reply-question" id="replyQuestion" hidden></div>
+      </div>
+      <div class="reply-actions">
+        <button type="button" class="open-btn" id="btnOpenAssistant">打开小羊</button>
+        <button type="button" class="act-btn" id="btnDismiss" aria-label="关闭小羊回复" title="关闭"></button>
+      </div>
+    </div>
+    <div class="reply-body" id="replyAnswer"></div>
   </div>
   <div class="progress-track"><div class="progress-fill" id="progress"></div></div>
 </div>

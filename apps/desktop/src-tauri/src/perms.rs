@@ -114,6 +114,11 @@ mod mac {
         fn IOHIDRequestAccess(request: u32) -> bool;
     }
 
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightListenEventAccess() -> bool;
+    }
+
     #[link(name = "AVFoundation", kind = "framework")]
     extern "C" {
         static AVMediaTypeAudio: &'static NSString;
@@ -175,6 +180,9 @@ mod mac {
 
     /// Shows the system dialog that leads to Settings → Accessibility.
     pub fn request_accessibility() -> State {
+        if unsafe { AXIsProcessTrusted() } {
+            return State::Granted;
+        }
         let key = unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) };
         let dict = CFDictionary::from_CFType_pairs(&[(
             key.as_CFType(),
@@ -189,16 +197,15 @@ mod mac {
 
     pub fn input_monitoring() -> State {
         // IOHIDAccessType: 0 granted, 1 denied, 2 unknown (never asked).
-        match unsafe { IOHIDCheckAccess(LISTEN_EVENT) } {
-            0 => State::Granted,
-            1 => State::Denied,
-            2 => State::NotDetermined,
-            _ => State::Unknown,
-        }
+        // On macOS 14/15, CGPreflightListenEventAccess() can report true even when
+        // IOHIDCheckAccess(LISTEN_EVENT) lags or disagrees, so accept either as Granted.
+        let hid = unsafe { IOHIDCheckAccess(LISTEN_EVENT) };
+        let cg = unsafe { CGPreflightListenEventAccess() };
+        super::resolve_input_monitoring(hid, cg)
     }
 
     pub fn request_input_monitoring() -> State {
-        if unsafe { IOHIDRequestAccess(LISTEN_EVENT) } {
+        if unsafe { IOHIDRequestAccess(LISTEN_EVENT) } || unsafe { CGPreflightListenEventAccess() } {
             State::Granted
         } else {
             input_monitoring()
@@ -546,11 +553,13 @@ mod mac_drag {
     use objc2::runtime::ProtocolObject;
     use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSDraggingSource,
-        NSEvent, NSEventModifierFlags, NSEventType, NSWindow, NSWorkspace,
+        NSApplication, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
+        NSDraggingSource, NSEvent, NSEventModifierFlags, NSEventType, NSPasteboardItem,
+        NSPasteboardTypeFileURL, NSWindow, NSWorkspace,
     };
     use objc2_foundation::{
-        NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+        NSArray, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
+        NSURL,
     };
     use std::cell::RefCell;
     use std::time::Duration;
@@ -614,10 +623,22 @@ mod mac_drag {
                 let content_view = ns_win.contentView().ok_or("窗口视图尚未就绪")?;
                 let ns_path = NSString::from_str(&bundle_str);
                 let file_url = NSURL::fileURLWithPath(&ns_path);
-                let drag_item = NSDraggingItem::initWithPasteboardWriter(
-                    mtm.alloc(),
-                    ProtocolObject::from_ref(&*file_url),
-                );
+                let drag_item = if let Some(abs_url) = file_url.absoluteString() {
+                    let pb_item = NSPasteboardItem::new();
+                    let file_url_uti = NSString::from_str("public.file-url");
+                    if !pb_item.setString_forType(&abs_url, &file_url_uti) {
+                        let _ = unsafe { pb_item.setString_forType(&abs_url, NSPasteboardTypeFileURL) };
+                    }
+                    NSDraggingItem::initWithPasteboardWriter(
+                        mtm.alloc(),
+                        ProtocolObject::from_ref(&*pb_item),
+                    )
+                } else {
+                    NSDraggingItem::initWithPasteboardWriter(
+                        mtm.alloc(),
+                        ProtocolObject::from_ref(&*file_url),
+                    )
+                };
                 let icon = NSWorkspace::sharedWorkspace().iconForFile(&ns_path);
                 icon.setSize(NSSize::new(56.0, 56.0));
                 let win_loc = ns_win.mouseLocationOutsideOfEventStream();
@@ -629,18 +650,29 @@ mod mac_drag {
                 unsafe {
                     drag_item.setDraggingFrame_contents(frame, Some(icon.as_ref()));
                 }
-                let drag_event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-                    NSEventType::LeftMouseDragged,
-                    win_loc,
-                    NSEventModifierFlags::empty(),
-                    0.0,
-                    ns_win.windowNumber(),
-                    None,
-                    0,
-                    1,
-                    1.0,
-                )
-                .ok_or("无法构造拖拽鼠标事件")?;
+                let current_mouse = NSApplication::sharedApplication(mtm)
+                    .currentEvent()
+                    .filter(|ev| {
+                        matches!(
+                            ev.r#type(),
+                            NSEventType::LeftMouseDown | NSEventType::LeftMouseDragged
+                        )
+                    });
+                let drag_event = match current_mouse {
+                    Some(ev) => ev,
+                    None => NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                        NSEventType::LeftMouseDragged,
+                        win_loc,
+                        NSEventModifierFlags::empty(),
+                        NSProcessInfo::processInfo().systemUptime(),
+                        ns_win.windowNumber(),
+                        None,
+                        0,
+                        1,
+                        1.0,
+                    )
+                    .ok_or("无法构造拖拽鼠标事件")?,
+                };
                 let source = PocketAppDragSource::new(mtm);
                 let items = NSArray::from_retained_slice(&[drag_item]);
                 let session = content_view.beginDraggingSessionWithItems_event_source(
@@ -659,6 +691,18 @@ mod mac_drag {
 
         rx.recv_timeout(Duration::from_secs(2))
             .map_err(|_| "启动拖拽超时".to_string())?
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn resolve_input_monitoring(hid_access: u32, cg_preflight: bool) -> State {
+    if hid_access == 0 || cg_preflight {
+        return State::Granted;
+    }
+    match hid_access {
+        1 => State::Denied,
+        2 => State::NotDetermined,
+        _ => State::Unknown,
     }
 }
 
@@ -684,7 +728,7 @@ fn states_value(s: &Status) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_bundle_from_exe, settings_url};
+    use super::{app_bundle_from_exe, resolve_input_monitoring, settings_url, State};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -709,6 +753,16 @@ mod tests {
             }
         }
         assert!(settings_url("nonexistent").is_none());
+    }
+
+    #[test]
+    fn input_monitoring_accepts_either_iokit_or_cg_preflight() {
+        assert_eq!(resolve_input_monitoring(0, false), State::Granted);
+        assert_eq!(resolve_input_monitoring(1, true), State::Granted);
+        assert_eq!(resolve_input_monitoring(2, true), State::Granted);
+        assert_eq!(resolve_input_monitoring(1, false), State::Denied);
+        assert_eq!(resolve_input_monitoring(2, false), State::NotDetermined);
+        assert_eq!(resolve_input_monitoring(99, false), State::Unknown);
     }
 }
 

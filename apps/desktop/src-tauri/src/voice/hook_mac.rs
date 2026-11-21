@@ -24,6 +24,13 @@ extern "C" {
     fn CGPreflightListenEventAccess() -> bool;
 }
 
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOHIDCheckAccess(request: u32) -> u32;
+}
+
+const LISTEN_EVENT: u32 = 1; // kIOHIDRequestTypeListenEvent
+
 /// The tap's mach port, to switch it back on when macOS disables it after a slow callback.
 static PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -68,7 +75,9 @@ impl Drop for Hook {
 pub fn start(key: ModKey, sink: impl Fn(KeyEvent) + Send + 'static) -> Result<Hook, String> {
     let (code, mask) =
         code_and_mask(key).ok_or_else(|| "这个按键在 macOS 上不能单独做快捷键".to_string())?;
-    if !unsafe { CGPreflightListenEventAccess() } {
+    let permitted =
+        unsafe { CGPreflightListenEventAccess() || IOHIDCheckAccess(LISTEN_EVENT) == 0 };
+    if !permitted {
         return Err("需要「输入监控」权限才能用单个修饰键做快捷键".into());
     }
     let (ready_tx, ready_rx) = mpsc::channel::<Result<usize, String>>();
