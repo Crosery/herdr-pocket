@@ -58,3 +58,13 @@ The host daemon reads local agents and publishes snapshots; terminal and convers
 - For cross-process changes, update protocol types, relay forwarding, host handler, mobile client, mock mode, and focused tests together.
 - For production deploy/restart, external messages, real-device installation, or credential changes, ask first unless the user explicitly authorized that exact action.
 - Prefer focused checks. Report actual checks and blockers; do not call a simulator result a real-phone result.
+
+## Release & tag rules
+
+Every version bump, git tag, and GitHub Release (`vX.Y.Z`) MUST follow this mandatory announcement workflow:
+
+1. **Commit detailed Chinese release notes first**: before creating any release tag, write a comprehensive Chinese release announcement at `docs/releases/vX.Y.Z.md` and commit it on `main`.
+2. **Required sections**: structure `docs/releases/vX.Y.Z.md` with clear headings (`更新亮点`, `新增功能`, `交互与体验优化`, `问题修复`, `多端与升级说明`) covering user-visible changes, supported platforms/harnesses, and upgrade impact. Keep public release notes free of private domains, IPs, local paths, tokens, or signing IDs.
+3. **Annotated tag from the announcement file**: always create the tag with `git tag -a vX.Y.Z -F docs/releases/vX.Y.Z.md` — never push a lightweight tag or a one-line tag message.
+4. **Ship `RELEASE-NOTES.md` and publish top-level notes**: `.github/workflows/release.yml` extracts `docs/releases/vX.Y.Z.md` (or the annotated tag body, failing if missing/empty), includes `RELEASE-NOTES.md` in `dist/` and `SHA256SUMS` so Mainland China mirrors can fetch notes without GitHub API, and places the announcement at the top of the GitHub Release body (updating notes even if a pre-created release already exists).
+5. **Post-publish verification**: after pushing the tag and completing CI/Release (including any notarized assets), verify `gh release view vX.Y.Z` displays the complete Chinese announcement at the top and all `CI` + `Release` workflow jobs pass 100% green.

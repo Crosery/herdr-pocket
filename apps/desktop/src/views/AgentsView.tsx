@@ -3,6 +3,7 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  Brain,
   ChevronDown,
   ChevronRight,
   Clock,
@@ -26,8 +27,11 @@ import {
 import {
   PUT_LIMITS,
   applyRows,
+  buildHarnessSwitchCommands,
+  stripModelEffortSuffix,
   textWithFiles,
   type Agent,
+  type AgentModelsResult,
   type AgentStatus,
   type AgentUsageReport,
   type ConvEvent,
@@ -54,7 +58,7 @@ import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DropRail } from "../components/DropRail";
 import { FolderExplorerModal, normalizeFolderKey } from "../components/FolderExplorerModal";
 import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVendor";
-import { ModelSwitchDropdown } from "../components/ModelSwitchDropdown";
+import { ModelSwitchDropdown, formatEffortLabel } from "../components/ModelSwitchDropdown";
 import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
@@ -84,6 +88,12 @@ import {
 } from "../lib/chatQueue";
 import { useComposerInput } from "../lib/composerKeys";
 import { prepareDroppedFiles, revokeAttachment, stageWorkspaceDragItem, type StagedAttachment } from "../lib/dropPreview";
+import {
+  clearComposerDraft,
+  getComposerDraft,
+  setComposerDraftAttachments,
+  setComposerDraftText,
+} from "../lib/composerDrafts";
 import { endWorkspaceDrag, hasWorkspaceDrag, readWorkspaceDrag } from "../lib/fileDrag";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { openFileTab, openSubagentAside } from "../shell/shellStore";
@@ -937,8 +947,27 @@ export function AgentDetailPanel({
   const [slashCategory, setSlashCategory] = useState<"all" | SlashCategory>("all");
   const [slashIdx, setSlashIdx] = useState(0);
   const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
-  const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
+  const [text, setTextState] = useState(() => getComposerDraft(agent.key).text);
+  const [attachments, setAttachmentsState] = useState<StagedAttachment[]>(() => getComposerDraft(agent.key).attachments);
+  const draftKeyRef = useRef(agent.key);
+  draftKeyRef.current = agent.key;
+
+  const setText = useCallback((next: string | ((prev: string) => string)) => {
+    setTextState((prev) => {
+      const resolved = typeof next === "function" ? next(prev) : next;
+      setComposerDraftText(draftKeyRef.current, resolved);
+      return resolved;
+    });
+  }, []);
+
+  const setAttachments = useCallback((next: StagedAttachment[] | ((prev: StagedAttachment[]) => StagedAttachment[])) => {
+    setAttachmentsState((prev) => {
+      const resolved = typeof next === "function" ? next(prev) : next;
+      setComposerDraftAttachments(draftKeyRef.current, resolved);
+      return resolved;
+    });
+  }, []);
+
   const [dragOver, setDragOver] = useState(false);
   const [sending, setSending] = useState(false);
   const [killConfirmOpen, setKillConfirmOpen] = useState(false);
@@ -946,18 +975,44 @@ export function AgentDetailPanel({
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [modelMenuMode, setModelMenuMode] = useState<"model" | "thinking" | null>(null);
+  const [modelMeta, setModelMeta] = useState<{
+    currentModel?: string;
+    currentThinking?: string;
+    thinkingLevels?: string[];
+  }>({});
 
   useEffect(() => {
+    const draft = getComposerDraft(agent.key);
+    setTextState(draft.text);
+    setAttachmentsState(draft.attachments);
     setUsageOpen(false);
     setUsageReport(null);
     setUsageError(null);
-    setModelMenuOpen(false);
-  }, [agent.key]);
+    setModelMenuMode(null);
+    setModelMeta({ currentModel: agent.model });
+
+    if (agent.isShell || (agent.source !== "hc" && agent.source !== "herdr")) return;
+    let alive = true;
+    void rpcCall(agent.deviceId, "agent.models", { agent: agent.key })
+      .then((res) => {
+        if (!alive) return;
+        setModelMeta({
+          currentModel: res.currentModel || agent.model,
+          currentThinking: res.currentThinking,
+          thinkingLevels: res.thinkingLevels,
+        });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [agent.key, agent.deviceId, agent.isShell, agent.source, agent.model]);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const panelRef = useRef<HTMLDivElement>(null);
   const composerCardRef = useRef<HTMLDivElement>(null);
   const modelBtnRef = useRef<HTMLButtonElement>(null);
+  const effortBtnRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
@@ -979,12 +1034,6 @@ export function AgentDetailPanel({
   const { queued, outgoing } = useAgentChatQueue(agent.key);
   const activeSub = subTrail[subTrail.length - 1] ?? null;
   const isPlainShellChat = Boolean(agent.isShell && !agent.sessionKey && !activeSub);
-
-  useEffect(() => {
-    return () => {
-      for (const a of attachmentsRef.current) revokeAttachment(a);
-    };
-  }, []);
 
   useEffect(() => {
     if (agent.status === "working") {
@@ -1520,25 +1569,90 @@ export function AgentDetailPanel({
       .finally(() => setUsageLoading(false));
   }, [agent.deviceId, agent.key]);
 
-  const applyModelSwitch = useCallback(
-    (modelId: string) => {
-      const clean = modelId.trim();
-      if (!clean) return;
-      const cmd = `/model ${clean}`;
+  const runModelOrThinkingSwitch = useCallback(
+    async (opts: { modelId?: string; thinkingLevel?: string }) => {
+      const modelId = opts.modelId?.trim() || undefined;
+      const thinkingLevel = opts.thinkingLevel?.trim().toLowerCase() || undefined;
+      if (!modelId && !thinkingLevel) return;
+
+      const labelDesc = modelId && thinkingLevel
+        ? `${modelId} · ${formatEffortLabel(thinkingLevel)}`
+        : modelId
+          ? modelId
+          : `思考等级 ${formatEffortLabel(thinkingLevel)}`;
+
+      setModelMeta((prev) => ({
+        ...prev,
+        ...(modelId ? { currentModel: stripModelEffortSuffix(modelId) } : {}),
+        ...(thinkingLevel ? { currentThinking: thinkingLevel } : {}),
+      }));
       stickRef.current = true;
       setAtBottom(true);
+
+      const plan = buildHarnessSwitchCommands(agent.harness, { modelId, thinkingLevel });
       if (agent.status === "working") {
-        enqueuePrompt(agent, cmd, []);
-        toast(`已加入排队：当前轮结束后切换为 ${clean}`);
-      } else {
-        setSending(true);
-        void sendPromptNow(agent, cmd, [])
-          .then(() => toast(`已发送模型切换指令：${clean}`))
-          .finally(() => setSending(false));
+        if (plan.commands.length > 0) {
+          for (const cmd of plan.commands) enqueuePrompt(agent, cmd, []);
+          toast(`已加入排队：当前轮结束后切换为 ${labelDesc}`);
+        } else {
+          toast(`当前轮进行中，请空闲后再切换 ${labelDesc}`, true);
+        }
+        return;
+      }
+
+      setSending(true);
+      try {
+        const res = await rpcCall(agent.deviceId, "agent.setModel", {
+          agent: agent.key,
+          ...(modelId ? { modelId } : {}),
+          ...(thinkingLevel ? { thinkingLevel } : {}),
+        });
+        setModelMeta((prev) => ({
+          ...prev,
+          ...(res.currentModel ? { currentModel: res.currentModel } : {}),
+          ...(res.currentThinking ? { currentThinking: res.currentThinking } : {}),
+        }));
+        toast(res.note || `已切换：${labelDesc}`);
+      } catch (e) {
+        const err = e as { code?: string; message?: string };
+        const unsupported =
+          err?.code === "unsupported" ||
+          err?.code === "bad_request" ||
+          /unknown|unsupported|不支持/i.test(err?.message ?? "");
+        if (unsupported && plan.commands.length > 0) {
+          for (const cmd of plan.commands) await sendPromptNow(agent, cmd, []);
+          toast(`已发送切换指令：${labelDesc}`);
+        } else {
+          toast(err?.message || "切换失败", true);
+        }
+      } finally {
+        setSending(false);
       }
     },
     [agent, toast],
   );
+
+  const applyModelSwitch = useCallback(
+    (modelId: string) => {
+      void runModelOrThinkingSwitch({ modelId });
+    },
+    [runModelOrThinkingSwitch],
+  );
+
+  const applyThinkingSwitch = useCallback(
+    (thinkingLevel: string) => {
+      void runModelOrThinkingSwitch({ thinkingLevel });
+    },
+    [runModelOrThinkingSwitch],
+  );
+
+  const onModelsLoaded = useCallback((res: AgentModelsResult) => {
+    setModelMeta({
+      currentModel: res.currentModel || agent.model,
+      currentThinking: res.currentThinking,
+      thinkingLevels: res.thinkingLevels,
+    });
+  }, [agent.model]);
 
   const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
 
@@ -1559,13 +1673,19 @@ export function AgentDetailPanel({
     }
     if (!staged.length && /^\/(?:model|models)$/i.test(raw)) {
       if (!isOverride) setText("");
-      setModelMenuOpen(true);
+      setModelMenuMode("model");
+      return;
+    }
+    if (!staged.length && /^\/(?:effort|thinking)$/i.test(raw) && (modelMeta.thinkingLevels?.length ?? 0) > 0) {
+      if (!isOverride) setText("");
+      setModelMenuMode("thinking");
       return;
     }
 
     if (!isOverride) {
-      setText("");
-      setAttachments([]);
+      clearComposerDraft(agent.key, { revoke: false });
+      setTextState("");
+      setAttachmentsState([]);
     }
     stickRef.current = true;
     setAtBottom(true);
@@ -1639,7 +1759,7 @@ export function AgentDetailPanel({
       if (allowAutoSend && /^\/(?:model|models)$/i.test(cmd.name)) {
         setText("");
         setAttachments([]);
-        setModelMenuOpen(true);
+        setModelMenuMode("model");
         return;
       }
       if (allowAutoSend && !cmd.argHint) {
@@ -2003,7 +2123,7 @@ export function AgentDetailPanel({
           error={usageError}
           onRefresh={openUsageView}
           onClose={() => setUsageOpen(false)}
-          onOpenModelSwitch={() => setModelMenuOpen(true)}
+          onOpenModelSwitch={() => setModelMenuMode("model")}
           onRunInTerminal={() => {
             setUsageOpen(false);
             if (agent.status === "working") enqueuePrompt(agent, "/usage", []);
@@ -2210,7 +2330,7 @@ export function AgentDetailPanel({
               value={text}
               onChange={(e) => {
                 setSlashDismissedFor(null);
-                if (e.target.value.startsWith("/") && modelMenuOpen) setModelMenuOpen(false);
+                if (e.target.value.startsWith("/") && modelMenuMode) setModelMenuMode(null);
                 setText(e.target.value);
               }}
               onPaste={(e) => {
@@ -2235,22 +2355,44 @@ export function AgentDetailPanel({
               </button>
               <VoiceMicButton />
               {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
-                <button
-                  ref={modelBtnRef}
-                  type="button"
-                  aria-haspopup="listbox"
-                  aria-expanded={modelMenuOpen}
-                  className={`composer-model-btn${modelMenuOpen ? " open" : ""}`}
-                  title={agent.model ? `当前模型：${agent.model}（点击切换）` : "切换模型 (/model)"}
-                  onClick={() => {
-                    setSlashDismissedFor(text);
-                    setModelMenuOpen((v) => !v);
-                  }}
-                >
-                  <Cpu size={13} />
-                  <span className="truncate mono">{agent.model ? agent.model.split("/").pop() : "切换模型"}</span>
-                  <ChevronDown size={11} />
-                </button>
+                <>
+                  <button
+                    ref={modelBtnRef}
+                    type="button"
+                    aria-haspopup="listbox"
+                    aria-expanded={modelMenuMode === "model"}
+                    className={`composer-model-btn${modelMenuMode === "model" ? " open" : ""}`}
+                    title={(modelMeta.currentModel || agent.model) ? `当前模型：${modelMeta.currentModel || agent.model}（点击切换）` : "切换模型 (/model)"}
+                    onClick={() => {
+                      setSlashDismissedFor(text);
+                      setModelMenuMode((v) => (v === "model" ? null : "model"));
+                    }}
+                  >
+                    <Cpu size={13} />
+                    <span className="truncate mono">{(modelMeta.currentModel || agent.model) ? (modelMeta.currentModel || agent.model)!.split("/").pop() : "切换模型"}</span>
+                    <ChevronDown size={11} />
+                  </button>
+                  {(modelMeta.thinkingLevels?.length ?? 0) > 0 ? (
+                    <button
+                      ref={effortBtnRef}
+                      type="button"
+                      aria-haspopup="listbox"
+                      aria-expanded={modelMenuMode === "thinking"}
+                      className={`composer-model-btn${modelMenuMode === "thinking" ? " open" : ""}`}
+                      title={modelMeta.currentThinking ? `思考等级：${formatEffortLabel(modelMeta.currentThinking)}（点击切换）` : "切换思考等级"}
+                      onClick={() => {
+                        setSlashDismissedFor(text);
+                        setModelMenuMode((v) => (v === "thinking" ? null : "thinking"));
+                      }}
+                    >
+                      <Brain size={13} />
+                      <span className="truncate">
+                        {modelMeta.currentThinking ? `思考 · ${formatEffortLabel(modelMeta.currentThinking)}` : "思考等级"}
+                      </span>
+                      <ChevronDown size={11} />
+                    </button>
+                  ) : null}
+                </>
               ) : null}
             </div>
             <div className="composer-actions">
@@ -2288,12 +2430,19 @@ export function AgentDetailPanel({
       ) : null}
 
       <ModelSwitchDropdown
-        open={modelMenuOpen}
-        onOpenChange={setModelMenuOpen}
+        open={modelMenuMode !== null}
+        mode={modelMenuMode ?? "model"}
+        onOpenChange={(v) => {
+          if (!v) setModelMenuMode(null);
+        }}
         agent={agent}
-        anchorRef={modelBtnRef}
+        anchorRef={modelMenuMode === "thinking" ? effortBtnRef : modelBtnRef}
         fallbackAnchorRef={composerCardRef}
+        currentModelHint={modelMeta.currentModel}
+        currentThinkingHint={modelMeta.currentThinking}
         onSelectModel={applyModelSwitch}
+        onSelectThinking={applyThinkingSwitch}
+        onLoaded={onModelsLoaded}
       />
 
       <PocketModal

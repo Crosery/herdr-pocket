@@ -33,6 +33,7 @@ const CSI_LETTER: Partial<Record<PadSpecial, string>> = { up: "A", down: "B", ri
 /** Bytes for a non-character key: Shift+Tab goes back (Claude Code's mode switch), Ctrl+arrow moves a word. */
 export function padSpecial(key: PadSpecial, mods: { ctrl?: boolean; shift?: boolean }): string {
   if (key === "tab" && mods.shift) return "\x1b[Z";
+  if (key === "enter" && mods.shift) return "\x1b[27;2;13~";
   const letter = CSI_LETTER[key];
   if (letter && (mods.ctrl || mods.shift)) return `\x1b[1;${mods.ctrl ? 5 : 2}${letter}`;
   return PAD_SEQ[key];

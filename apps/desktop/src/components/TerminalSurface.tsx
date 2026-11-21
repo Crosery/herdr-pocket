@@ -573,6 +573,18 @@ export function TerminalSurface({
       }
       return false;
     });
+    const dispDecSet = term.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
+      for (let i = 0; i < params.length; i++) {
+        if (numParam(params[i], -1) === 9001) kittyKeys.win32InputMode = true;
+      }
+      return false;
+    });
+    const dispDecRst = term.parser.registerCsiHandler({ prefix: "?", final: "l" }, (params) => {
+      for (let i = 0; i < params.length; i++) {
+        if (numParam(params[i], -1) === 9001) kittyKeys.win32InputMode = false;
+      }
+      return false;
+    });
     const dispResetKeys = term.parser.registerEscHandler({ final: "c" }, () => {
       kittyKeys.reset();
       osc66Ref.current = [];
@@ -583,11 +595,27 @@ export function TerminalSurface({
 
     // Key handling: preserve global app shortcuts (⌘T/⌘W/⌘P/...), Herdr macOS keys, and Kitty CSI u.
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
-      if (e.type !== "keydown") return true;
+      if (e.type === "keyup") return true;
+      if (e.type !== "keydown") {
+        // Prevent xterm's CoreBrowserTerminal._keyPress from emitting a stray "\r" after modified Enter.
+        if (
+          (e.key === "Enter" && (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey)) ||
+          encodeKittyKey(e, kittyKeys.current(isAlt()), kittyKeys.modifyOtherKeys, IS_MAC, kittyKeys.win32InputMode) !== null
+        ) {
+          e.preventDefault();
+          return false;
+        }
+        return true;
+      }
+      const consume = () => {
+        e.preventDefault();
+        return false;
+      };
       const appShortcut = matchShortcut(e);
       if (appShortcut) {
         // On Windows/Linux Ctrl+K stays inside the terminal; global handler honors terminalOwnsCtrlK.
         if (IS_MAC || appShortcut !== "palette" || e.key.toLowerCase() === "p") {
+          if (e.key === "Enter") e.preventDefault();
           return false;
         }
       }
@@ -599,7 +627,7 @@ export function TerminalSurface({
             void copyToClipboard(term.getSelection());
             term.clearSelection();
           }
-          return false;
+          return consume();
         }
         if (lower === "v") {
           // Allow WebKit native paste event to fire into capture listener / xterm textarea once.
@@ -607,48 +635,48 @@ export function TerminalSurface({
         }
         if (lower === "a") {
           term.selectAll();
-          return false;
+          return consume();
         }
         if (e.key === "=" || e.key === "+") {
           adjustFontSize("in");
-          return false;
+          return consume();
         }
         if (e.key === "-") {
           adjustFontSize("out");
-          return false;
+          return consume();
         }
         if (e.key === "0") {
           adjustFontSize("reset");
-          return false;
+          return consume();
         }
         // macOS terminal line-navigation & erase matching herdr-app/defaults/keys.macos.json
         if (e.key === "ArrowLeft") {
           void sendInput("\x01");
-          return false;
+          return consume();
         }
         if (e.key === "ArrowRight") {
           void sendInput("\x05");
-          return false;
+          return consume();
         }
         if (e.key === "Backspace") {
           void sendInput("\x15");
-          return false;
+          return consume();
         }
-        return false;
+        return consume();
       }
 
       if (IS_MAC && e.altKey && !e.metaKey && !e.ctrlKey) {
         if (e.key === "ArrowLeft") {
           void sendInput("\x1bb");
-          return false;
+          return consume();
         }
         if (e.key === "ArrowRight") {
           void sendInput("\x1bf");
-          return false;
+          return consume();
         }
         if (e.key === "Backspace") {
           void sendInput("\x17");
-          return false;
+          return consume();
         }
       }
 
@@ -657,32 +685,32 @@ export function TerminalSurface({
         if (lower === "c" && term.hasSelection()) {
           void copyToClipboard(term.getSelection());
           term.clearSelection();
-          return false;
+          return consume();
         }
         if (e.shiftKey && lower === "c") {
           if (term.hasSelection()) void copyToClipboard(term.getSelection());
-          return false;
+          return consume();
         }
         if (lower === "v") return true;
         if (e.key === "=" || e.key === "+") {
           adjustFontSize("in");
-          return false;
+          return consume();
         }
         if (e.key === "-") {
           adjustFontSize("out");
-          return false;
+          return consume();
         }
         if (e.key === "0") {
           adjustFontSize("reset");
-          return false;
+          return consume();
         }
       }
 
       const kFlags = kittyKeys.current(isAlt());
-      const encoded = encodeKittyKey(e, kFlags, kittyKeys.modifyOtherKeys, IS_MAC);
+      const encoded = encodeKittyKey(e, kFlags, kittyKeys.modifyOtherKeys, IS_MAC, kittyKeys.win32InputMode);
       if (encoded) {
         void sendInput(encoded);
-        return false;
+        return consume();
       }
       return true;
     });
@@ -1138,6 +1166,8 @@ export function TerminalSurface({
       dispCsiSet.dispose();
       dispCsiQuery.dispose();
       dispModifyOther.dispose();
+      dispDecSet.dispose();
+      dispDecRst.dispose();
       dispResetKeys.dispose();
       dispData.dispose();
       webglAddon?.dispose();

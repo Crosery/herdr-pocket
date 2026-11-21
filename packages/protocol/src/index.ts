@@ -624,6 +624,16 @@ export interface RpcMethods {
     params: { agent: string };
     result: AgentModelsResult;
   };
+  /** Switch an agent's active model and/or thinking/reasoning effort level cleanly per harness. */
+  "agent.setModel": {
+    params: { agent: string; modelId?: string; thinkingLevel?: string };
+    result: { ok: true; currentModel?: string; currentThinking?: string; note?: string };
+  };
+  /** Close a workspace / space (and its terminals) without deleting disk folders. */
+  "space.delete": {
+    params: { spaceId?: string; spaceName?: string };
+    result: { ok: true; closedTerminals: number };
+  };
   "git.status": {
     params: { agent?: string; cwd?: string };
     result: GitStatusResult;
@@ -780,15 +790,150 @@ export interface AgentModelOption {
   provider?: string;
   contextWindow?: number;
   reasoning?: boolean;
+  thinkingLevels?: string[];
   source: "current" | "recent" | "catalog";
 }
 
 export interface AgentModelsResult {
   harness: string;
   currentModel?: string;
+  currentThinking?: string;
+  thinkingLevels?: string[];
+  canSwitchThinking?: boolean;
+  thinkingLabel?: string;
   canSwitch: boolean;
   reason?: string;
   models: AgentModelOption[];
+}
+
+export interface HarnessSwitchPlan {
+  commands: string[];
+  keys?: string[][];
+  interactiveOnly?: boolean;
+}
+
+const EFFORT_SUFFIX_RE = /:(off|none|minimal|min|low|medium|med|high|xhigh|max|ultra|auto|default)$/i;
+
+/** Strips a trailing `:effort` modifier (such as `:high`) from an omp/pi selector without disturbing tags like `:8b`. */
+export function stripModelEffortSuffix(modelId: string): string {
+  return modelId.trim().replace(EFFORT_SUFFIX_RE, "");
+}
+
+/** Normalizes any harness identifier into its canonical CLI/family key for model & effort switching. */
+export function normalizeSwitchHarness(raw: string): string {
+  const h = raw.trim().toLowerCase();
+  if (!h) return "generic";
+  if (h.includes("claude") || h === "crosery" || h === "prime" || h === "commandcode" || h === "reasonix") return "claude";
+  if (h === "omp" || h.includes("oh-my-pi")) return "omp";
+  if (h === "pi" || h.includes("pi-mono")) return "pi";
+  if (h.includes("codex")) return "codex";
+  if (h.includes("antigravity") || h === "agy") return "antigravity";
+  if (h.includes("gemini")) return "gemini";
+  if (h.includes("deepseek") || h === "dsh") return "dsh";
+  if (h.includes("opencode") || h.includes("kilo") || h.includes("crush")) return "opencode";
+  if (h.includes("hermes")) return "hermes";
+  if (h.includes("grok")) return "grok";
+  if (h.includes("aider")) return "aider";
+  if (h.includes("factory") || h === "droid") return "factory";
+  if (h.includes("cursor")) return "cursor";
+  if (h.includes("kimi")) return "kimi";
+  if (h.includes("qwen")) return "qwen";
+  if (h.includes("qoder")) return "qoder";
+  if (h.includes("codebuddy")) return "codebuddy";
+  if (h.includes("goose")) return "goose";
+  if (h === "amp") return "amp";
+  return h;
+}
+
+/** Builds per-harness slash commands / keys to switch model and/or thinking effort cleanly. */
+export function buildHarnessSwitchCommands(
+  harness: string,
+  opts: { modelId?: string; thinkingLevel?: string },
+): HarnessSwitchPlan {
+  const h = normalizeSwitchHarness(harness);
+  const model = opts.modelId?.trim() || "";
+  const effort = opts.thinkingLevel?.trim() || "";
+
+  if (h === "omp") {
+    if (model && effort) {
+      return { commands: [`/switch ${stripModelEffortSuffix(model)}:${effort}`] };
+    }
+    const commands: string[] = [];
+    if (model) commands.push(`/switch ${model}`);
+    if (effort) commands.push(`/effort ${effort}`);
+    return { commands };
+  }
+
+  if (h === "pi") {
+    const commands: string[] = [];
+    if (model) commands.push(`/model ${stripModelEffortSuffix(model)}`);
+    if (effort) commands.push(`/thinking ${effort}`);
+    return { commands };
+  }
+
+  if (h === "gemini") {
+    const commands: string[] = [];
+    if (model) {
+      let target = model;
+      if (effort && /-(low|medium|high)$/i.test(target)) {
+        target = target.replace(/-(low|medium|high)$/i, `-${effort.toLowerCase()}`);
+      }
+      commands.push(`/model set ${target}`);
+    }
+    return { commands };
+  }
+
+  if (h === "claude" || h === "antigravity" || h === "grok") {
+    const commands: string[] = [];
+    if (model) commands.push(`/model ${model}`);
+    if (effort) commands.push(`/effort ${effort}`);
+    return { commands };
+  }
+
+  if (h === "hermes") {
+    const commands: string[] = [];
+    if (model) commands.push(`/model ${model}`);
+    if (effort) commands.push(`/reasoning ${effort}`);
+    return { commands };
+  }
+
+  if (h === "aider") {
+    const commands: string[] = [];
+    if (model) commands.push(`/model ${model}`);
+    if (effort) commands.push(`/reasoning-effort ${effort}`);
+    return { commands };
+  }
+
+  if (h === "factory") {
+    const commands: string[] = [];
+    if (effort) {
+      commands.push(effort.toLowerCase() === "fast" ? "/fast on" : "/fast off");
+    }
+    return { commands, ...(model ? { interactiveOnly: true } : {}) };
+  }
+
+  if (h === "opencode") {
+    return {
+      commands: [],
+      ...(effort ? { keys: [["ctrl+t"]] } : {}),
+      ...(model ? { interactiveOnly: true } : {}),
+    };
+  }
+
+  if (h === "codex" || h === "dsh") {
+    return { commands: [], interactiveOnly: true };
+  }
+
+  if (h === "amp") {
+    if (effort && (effort === "smart" || effort === "rush") && !model) {
+      return { commands: [`/model ${effort}`] };
+    }
+  }
+
+  const commands: string[] = [];
+  if (model) commands.push(`/model ${model}`);
+  if (effort) commands.push(`/effort ${effort}`);
+  return { commands };
 }
 
 /**

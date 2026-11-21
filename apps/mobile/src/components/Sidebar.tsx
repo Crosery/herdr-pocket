@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Animated, BackHandler, Easing, PanResponder, Pressable, ScrollView, useWindowDimensions, View } from "react-native";
 import { Text } from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { Agent, Device } from "@herdr-pocket/protocol";
@@ -31,6 +32,7 @@ export interface SidebarData {
   onSpace: (name: string | null) => void;
   onNewSpace: () => void;
   onNewInSpace: (name: string) => void;
+  onDeleteSpace?: (name: string) => void;
 }
 
 export function useSidebar() {
@@ -251,9 +253,16 @@ export function Sidebar({ s, d }: { s: ReturnType<typeof useSidebar>; d: Sidebar
                   count={n}
                   a11y={`空间 ${name}，${n} 个 agent`}
                   trailing={
-                    <Pressable accessibilityRole="button" accessibilityLabel={`在 ${name} 新建 agent`} onPress={() => d.onNewInSpace(name)} hitSlop={6} style={({ pressed }) => ({ width: 36, height: 36, marginRight: -6, borderRadius: 18, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}>
-                      <CuteIcon name="plus" size={17} color={p.muted} strokeWidth={2.4} />
-                    </Pressable>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 2, marginRight: -6 }}>
+                      <Pressable accessibilityRole="button" accessibilityLabel={`在 ${name} 新建 agent`} onPress={() => d.onNewInSpace(name)} hitSlop={6} style={({ pressed }) => ({ width: 32, height: 32, borderRadius: 16, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}>
+                        <CuteIcon name="plus" size={16} color={p.muted} strokeWidth={2.4} />
+                      </Pressable>
+                      {d.onDeleteSpace ? (
+                        <Pressable accessibilityRole="button" accessibilityLabel={`关闭空间 ${name}`} onPress={() => d.onDeleteSpace?.(name)} hitSlop={6} style={({ pressed }) => ({ width: 32, height: 32, borderRadius: 16, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : "transparent" })}>
+                          <MaterialCommunityIcons name="trash-can-outline" size={16} color={p.muted} />
+                        </Pressable>
+                      ) : null}
+                    </View>
                   }
                 />
               ))}

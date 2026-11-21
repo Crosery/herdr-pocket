@@ -5,18 +5,20 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useIsFocused, useLocalSearchParams, useNavigation, router } from "expo-router";
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
 import * as Clipboard from "expo-clipboard";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
+import { useQueryClient } from "@tanstack/react-query";
 import Animated, { useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
 import type { Agent, AgentStatus, Device } from "@herdr-pocket/protocol";
 import { AgentRow, ConnectionBanner, SpaceBadge } from "../../components/agents";
 import { EmptyState, HarnessAvatar, IconTile, PageBackground, PocketToast } from "../../components/ui";
-import { PocketActionSheet, PocketSearch, PocketSegmented, type SheetAction } from "../../components/pocket";
+import { PocketActionSheet, PocketDialog, PocketSearch, PocketSegmented, type SheetAction } from "../../components/pocket";
 import { LiveMascot } from "../../components/LiveMascot";
 import { CuteIcon } from "../../components/icons";
 import { Sidebar, useSidebar } from "../../components/Sidebar";
 import { CreateAgentSheet, type CreateTarget } from "../../components/CreateAgentSheet";
 import { allAgents, useLive, useSettings } from "../../lib/store";
 import { agentSpace, agentTitle, greeting } from "../../lib/format";
-import { pingNow } from "../../lib/relay";
+import { call, pingNow } from "../../lib/relay";
 import { usePalette } from "../../theme/theme";
 import { agentStatusLabel, fonts, radius, space, statusColors } from "../../theme/tokens";
 
@@ -194,7 +196,10 @@ export default function AgentsHub() {
   const [refreshing, setRefreshing] = useState(false);
   const [create, setCreate] = useState<CreateTarget | null>(null);
   const [menu, setMenu] = useState<Agent | null>(null);
+  const [deleteSpaceTarget, setDeleteSpaceTarget] = useState<{ host: string; name: string; count: number } | null>(null);
+  const [deletingSpace, setDeletingSpace] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const qc = useQueryClient();
   // The "新建" button slides away while the list scrolls down (it would cover rows and the spaces' own "+"),
   // and comes back as soon as the list moves up again.
   const fabAway = useSharedValue(0);
@@ -414,7 +419,27 @@ export default function AgentsHub() {
               {canFold ? <CuteIcon name={g.folded ? "chevronRight" : "chevronDown"} size={18} color={p.faint} /> : null}
             </Pressable>
             {g.offline ? null : (
-              <IconTile icon="plus" tone="soft" size={36} iconSize={18} onPress={() => setCreate({ host: g.host, spaceName: g.space })} a11y={g.space ? `在空间 ${g.space} 新建 agent` : "在这台电脑上新建 agent"} />
+              <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+                {g.space ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={`关闭空间 ${g.space}`}
+                    onPress={() => setDeleteSpaceTarget({ host: g.host, name: g.space!, count: g.total })}
+                    hitSlop={6}
+                    style={({ pressed }) => ({
+                      width: 34,
+                      height: 34,
+                      borderRadius: 17,
+                      alignItems: "center",
+                      justifyContent: "center",
+                      backgroundColor: pressed ? p.surface3 : "transparent",
+                    })}
+                  >
+                    <MaterialCommunityIcons name="trash-can-outline" size={17} color={p.muted} />
+                  </Pressable>
+                ) : null}
+                <IconTile icon="plus" tone="soft" size={36} iconSize={18} onPress={() => setCreate({ host: g.host, spaceName: g.space })} a11y={g.space ? `在空间 ${g.space} 新建 agent` : "在这台电脑上新建 agent"} />
+              </View>
             )}
           </View>
         );
@@ -598,7 +623,50 @@ export default function AgentsHub() {
             sidebar.hide();
             setCreate({ host: hostFilter, spaceName: name });
           },
+          onDeleteSpace: (name) => {
+            sidebar.hide();
+            const matchAgents = onHost.filter((a) => agentSpace(a) === name);
+            const targetHost = hostFilter ?? matchAgents[0]?.deviceId ?? hosts.find((h) => h.online)?.id;
+            if (!targetHost) {
+              setToast("找不到在线电脑，无法关闭空间");
+              return;
+            }
+            setDeleteSpaceTarget({ host: targetHost, name, count: matchAgents.length });
+          },
         }}
+      />
+      <PocketDialog
+        visible={!!deleteSpaceTarget}
+        onDismiss={() => { if (!deletingSpace) setDeleteSpaceTarget(null); }}
+        title={deleteSpaceTarget ? `关闭空间「${deleteSpaceTarget.name}」？` : ""}
+        body={
+          deleteSpaceTarget
+            ? `${deleteSpaceTarget.count > 0 ? `将关闭该空间并结束其中的 ${deleteSpaceTarget.count} 个运行中终端/Agent。` : "将移除该空间。"}磁盘上的文件夹与代码文件不会被删除。`
+            : undefined
+        }
+        actions={[
+          { label: "取消", tone: "ghost", disabled: deletingSpace, onPress: () => setDeleteSpaceTarget(null) },
+          {
+            label: "关闭空间",
+            tone: "danger",
+            loading: deletingSpace,
+            onPress: () => {
+              const tgt = deleteSpaceTarget;
+              if (!tgt || deletingSpace) return;
+              setDeletingSpace(true);
+              void call(tgt.host, "space.delete", { spaceName: tgt.name })
+                .then(() => {
+                  if (activeSpace === tgt.name) setSpaceFilter(null);
+                  setDeleteSpaceTarget(null);
+                  qc.invalidateQueries({ queryKey: ["spaces.list", tgt.host] });
+                  pingNow();
+                  setToast(`已关闭空间「${tgt.name}」`);
+                })
+                .catch((e) => setToast((e as Error).message || "关闭空间失败"))
+                .finally(() => setDeletingSpace(false));
+            },
+          },
+        ]}
       />
       <PocketActionSheet
         visible={!!menu}

@@ -428,6 +428,24 @@ export function closeTab(id: string): void {
   });
 }
 
+/** Closes tabs belonging to `spaceKey` and clears `selectedSpace` if active. */
+export function closeTabsForSpace(
+  spaceKey: string,
+  lookupAgent: (agentKey: string) => AgentSpaceRef | undefined,
+): void {
+  set((s) => {
+    const tabs = s.tabs.filter((t) => tabSpaceKey(t, lookupAgent) !== spaceKey);
+    const selectedSpace = s.selectedSpace === spaceKey ? null : s.selectedSpace;
+    const nextBySpace = { ...s.activeBySpace };
+    delete nextBySpace[spaceKey];
+    const activeStillThere = s.active && tabs.some((t) => t.id === s.active);
+    const active = activeStillThere
+      ? s.active
+      : activeTabIdForSpace({ tabs, active: null, selectedSpace, activeBySpace: nextBySpace }, lookupAgent);
+    return { ...s, tabs, active, selectedSpace, activeBySpace: nextBySpace };
+  });
+}
+
 export function setActiveTab(id: string): void {
   set((s) => {
     const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;

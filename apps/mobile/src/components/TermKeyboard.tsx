@@ -192,6 +192,27 @@ export function TermKeyboard({ onSend, onSystem, onClose }: { onSend: (data: str
           <MaterialCommunityIcons name="drag-horizontal-variant" size={20} color={drag != null ? p.accentText : p.faint} />
         </View>
         <ScrollView horizontal style={{ flex: 1 }} showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="always" contentContainerStyle={{ gap: 6, alignItems: "center" }}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="输入换行 (Shift+Enter)"
+            onPress={() => {
+              tap();
+              onSend("\x1b[27;2;13~");
+              setCtrl(false);
+              if (shift === "once") setShift("off");
+            }}
+            style={({ pressed }) => ({
+              height: 28,
+              paddingHorizontal: 11,
+              borderRadius: radius.pill,
+              justifyContent: "center",
+              borderWidth: 1,
+              borderColor: keyBorder,
+              backgroundColor: pressed ? p.accentContainer : p.surface,
+            })}
+          >
+            <Text style={{ fontFamily: fonts.bodySemi, fontSize: 12.5, color: p.accentText }}>换行</Text>
+          </Pressable>
           {PAD_SNIPPETS.map((s) => (
             <Pressable
               key={s}

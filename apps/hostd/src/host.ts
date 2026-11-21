@@ -1,4 +1,4 @@
-import { homedir, hostname, platform } from "node:os";
+import { homedir, hostname, platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket } from "ws";
 import {
@@ -37,7 +37,7 @@ import { CONFIG_DIR, type HostConfig } from "./config.ts";
 import { FilesError, listFiles, listFolders, readFileSlice } from "./files.ts";
 import { getGitDiff, getGitLog, getGitStatus, gitCheckout, gitCommit, gitDiscard, gitPull, gitPush, gitStage, gitUnstage } from "./git.ts";
 import { scanAgentSlashCommands } from "./slash.ts";
-import { getAgentModels } from "./models.ts";
+import { getAgentModels, setAgentModelAndThinking } from "./models.ts";
 import { getAgentUsageReport } from "./usage.ts";
 import { run } from "./util.ts";
 import { changedKeys } from "./configcmd.ts";
@@ -54,6 +54,8 @@ const MUTATING = new Set([
   "terminal.keys",
   "terminal.put",
   "agent.create",
+  "agent.setModel",
+  "space.delete",
   "terminal.interrupt",
   "terminal.kill",
   "herdr.command",
@@ -72,7 +74,7 @@ function callSummary(params: unknown, result?: unknown): Record<string, unknown>
   const out: Record<string, unknown> = {};
   if (params && typeof params === "object") {
     const p = params as Record<string, unknown>;
-    for (const k of ["agent", "launcher", "space", "spaceName", "tabName", "folder", "command", "session", "path"]) if (typeof p[k] === "string") out[k] = p[k];
+    for (const k of ["agent", "launcher", "space", "spaceId", "spaceName", "tabName", "folder", "command", "session", "path", "modelId", "thinkingLevel"]) if (typeof p[k] === "string") out[k] = p[k];
     if (typeof p.text === "string") out.text = clipChars(p.text, 200);
     if (typeof p.task === "string") out.task = clipChars(p.task, 200);
     if (Array.isArray(p.keys)) out.keys = p.keys.slice(0, 16).join(" ");
@@ -161,6 +163,8 @@ export class Host {
   private namesTimer: NodeJS.Timeout | null = null;
   /** Resolved space folders cached from `spaces.list` so empty `agent.create` folder inherits live cwd. */
   private spaceFolders = new Map<string, string>();
+  /** Optimistic current model / thinking overrides per agent after `agent.setModel`. */
+  private modelOverrides = new Map<string, { model?: string; thinking?: string }>();
   /**
    * Sources that did not answer are looked for again this often. After a reboot or a login the
    * daemon can start before the herdr app or Uniflo; without this it would never read
@@ -442,6 +446,12 @@ export class Host {
 
   private publishNow(): void {
     this.agents = this.collect();
+    if (this.modelOverrides.size) {
+      const live = new Set(this.agents.map((a) => a.key));
+      for (const k of this.modelOverrides.keys()) {
+        if (!live.has(k)) this.modelOverrides.delete(k);
+      }
+    }
     const data = JSON.stringify(this.agents.map((a) => ({ ...a, updatedAt: 0 })));
     if (data === this.lastPublished) return;
     this.lastPublished = data;
@@ -1216,8 +1226,13 @@ export class Host {
     "files.read": async (p) => {
       const a = this.resolve(p.agent);
       const t0 = Date.now();
-      const extraRoots = [this.filesDir, join(homedir(), ".local", "state", "herdr-core")];
-      const r = await this.files(() => readFileSlice(a.cwd, p, { privateDirs: this.privateDirs, extraRoots }));
+      const extraRoots = [this.filesDir, homedir(), tmpdir(), "/tmp"];
+      const privateDirs = [
+        ...this.privateDirs,
+        join(homedir(), ".agents", "crosery", "credentials"),
+        join(homedir(), "Library", "Keychains"),
+      ];
+      const r = await this.files(() => readFileSlice(a.cwd, p, { privateDirs, extraRoots }));
       this.note("debug", "files", `files.read ${a.localId} "${r.path}" ${r.bytes}/${r.size} bytes${r.binary ? " binary" : ""} ${Date.now() - t0}ms`, { agent: a.key });
       return r;
     },
@@ -1241,10 +1256,41 @@ export class Host {
     },
     "agent.models": async (p) => {
       const a = this.resolve(p.agent);
+      const ov = this.modelOverrides.get(a.key);
       return getAgentModels(a, {
         uniflo: this.uniflo,
         unifloReady: this.sources.includes("uniflo"),
+        currentModelOverride: ov?.model,
+        currentThinkingOverride: ov?.thinking,
       });
+    },
+    "agent.setModel": async (p) => {
+      this.writable();
+      const a = this.resolve(p.agent);
+      const res = await setAgentModelAndThinking(
+        a,
+        { modelId: p.modelId, thinkingLevel: p.thinkingLevel },
+        { hc: this.hc, herdr: this.herdr },
+      );
+      const prev = this.modelOverrides.get(a.key) ?? {};
+      const next = {
+        ...(res.currentModel ?? prev.model ? { model: res.currentModel ?? prev.model } : {}),
+        ...(res.currentThinking ?? prev.thinking ? { thinking: res.currentThinking ?? prev.thinking } : {}),
+      };
+      if (next.model || next.thinking) this.modelOverrides.set(a.key, next);
+      return { ok: true as const, ...res };
+    },
+    "space.delete": async (p) => {
+      this.writable();
+      if (this.hc.terminals.size === 0) await this.hc.list().catch(() => undefined);
+      const res = await this.app.deleteSpace(
+        { spaceId: p.spaceId, spaceName: p.spaceName },
+        this.hc,
+        { names: this.names, herdr: this.herdr },
+      );
+      await Promise.all([this.hc.list().catch(() => undefined), this.refreshNames().catch(() => undefined)]);
+      this.publishNow();
+      return { ok: true as const, closedTerminals: res.closedTerminals };
     },
     "git.status": async (p) => {
       const dir = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : p.agent ? this.resolve(p.agent).cwd : undefined;

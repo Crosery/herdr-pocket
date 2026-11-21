@@ -429,23 +429,36 @@ export const mockApi = {
       const a = DEMO_AGENTS.find((x) => x.key === params.agent);
       const cur = a?.model ?? "claude-opus-5-5";
       const pool = [
-        { id: "claude-opus-5-5", label: "Claude Opus 5.5", provider: "anthropic", contextWindow: 200_000, reasoning: true, source: "recent" as const },
-        { id: "claude-sonnet-5", label: "Claude Sonnet 5", provider: "anthropic", contextWindow: 200_000, reasoning: true, source: "recent" as const },
-        { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", provider: "openai", contextWindow: 1_050_000, reasoning: true, source: "catalog" as const },
+        { id: "claude-opus-5-5", label: "Claude Opus 5.5", provider: "anthropic", contextWindow: 200_000, reasoning: true, thinkingLevels: ["low", "medium", "high", "xhigh", "max"], source: "recent" as const },
+        { id: "claude-sonnet-5", label: "Claude Sonnet 5", provider: "anthropic", contextWindow: 200_000, reasoning: true, thinkingLevels: ["low", "medium", "high"], source: "recent" as const },
+        { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", provider: "openai", contextWindow: 1_050_000, reasoning: true, thinkingLevels: ["low", "medium", "high", "xhigh"], source: "catalog" as const },
         { id: "gemini-4-carbon-high", label: "Gemini 4 Carbon High", provider: "google", contextWindow: 1_048_576, reasoning: true, source: "catalog" as const },
-        { id: "deepseek-reasoner", label: "DeepSeek Reasoner", provider: "deepseek", contextWindow: 128_000, reasoning: true, source: "catalog" as const },
+        { id: "deepseek-reasoner", label: "DeepSeek Reasoner", provider: "deepseek", contextWindow: 128_000, reasoning: true, thinkingLevels: ["low", "medium", "high"], source: "catalog" as const },
       ];
       const models = [
-        { id: cur, label: cur, contextWindow: 200_000, reasoning: true, source: "current" as const },
+        { id: cur, label: cur, contextWindow: 200_000, reasoning: true, thinkingLevels: ["low", "medium", "high", "xhigh", "max"], source: "current" as const },
         ...pool.filter((x) => x.id !== cur),
       ];
       return {
         harness: a?.harness ?? "claude-code",
         currentModel: cur,
+        currentThinking: "high",
+        thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+        canSwitchThinking: !a?.isShell,
         canSwitch: !a?.isShell,
         ...(a?.isShell ? { reason: "普通终端不支持切换模型" } : {}),
         models,
       };
+    }
+    if (method === "agent.setModel") {
+      return {
+        ok: true as const,
+        ...(typeof params.modelId === "string" ? { currentModel: params.modelId } : {}),
+        ...(typeof params.thinkingLevel === "string" ? { currentThinking: params.thinkingLevel } : {}),
+      };
+    }
+    if (method === "space.delete") {
+      return { ok: true as const, closedTerminals: 0 };
     }
     if (method === "git.status") {
       const root = (typeof params.cwd === "string" && params.cwd.trim()) || "~/work/demo-app";

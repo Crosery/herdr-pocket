@@ -4805,3 +4805,74 @@ a {
 .composer-model-btn.open svg:last-child {
   transform: rotate(180deg);
 }
+
+.model-pop-head-title {
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.model-effort-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--surface);
+}
+
+.model-effort-label {
+  flex: none;
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 600;
+  color: var(--faint);
+}
+
+.model-effort-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.model-effort-chip {
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--muted);
+  font: inherit;
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.model-effort-chip:hover {
+  border-color: var(--line-pink);
+  color: var(--ink);
+}
+
+.model-effort-chip.on {
+  border-color: var(--primary);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.update-toast-notes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding-left: 14px;
+  max-height: 112px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.update-toast-note-line {
+  font-size: calc(11.5px * var(--ts, 1));
+  line-height: 1.45;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}

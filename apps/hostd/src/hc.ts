@@ -17,6 +17,7 @@ export interface HcTerminal {
   turn?: number;
   name?: string | null;
   labels?: Record<string, string>;
+  parent?: string | null;
   foreground?: { argv?: string[]; cwd?: string; pid?: number } | null;
   created_ms?: number;
   cols?: number;
@@ -52,11 +53,15 @@ const KEY_ALIASES: Record<string, string> = {
   right: "right",
   tab: "tab",
   "shift+tab": "shift+tab",
+  "shift+enter": "shift+enter",
   backspace: "backspace",
   space: "space",
   "ctrl+c": "ctrl+c",
   "ctrl+d": "ctrl+d",
   "ctrl+l": "ctrl+l",
+  "ctrl+t": "ctrl+t",
+  f2: "f2",
+  "shift+f2": "shift+f2",
   "alt+m": "alt+m",
   "alt+enter": "alt+enter",
 };
@@ -258,6 +263,27 @@ export class HcAdapter extends EventEmitter {
   async list(): Promise<void> {
     const r = await this.oneShot("terminal.list", {});
     if (r?.result?.terminals) this.setAll(r.result.terminals);
+  }
+
+  async docGet(name: string): Promise<{ value: unknown; version: number } | null> {
+    const r = await this.oneShot("doc.get", { name });
+    if (r?.error || !r?.result) return null;
+    return { value: r.result.value, version: Number(r.result.version ?? 0) };
+  }
+
+  async docSet(name: string, value: unknown, version: number): Promise<number | null> {
+    const r = await this.oneShot("doc.set", { name, value, version });
+    if (r?.error) throw new Error(r.error.message ?? "doc.set failed");
+    return typeof r?.result?.version === "number" ? r.result.version : null;
+  }
+
+  async snapshotText(address: string, lines = 0): Promise<string> {
+    try {
+      const s = await this.screens.snapshot(address, lines);
+      return s.text;
+    } catch {
+      return "";
+    }
   }
 
   /** One request on a short-lived `hc connect`. */

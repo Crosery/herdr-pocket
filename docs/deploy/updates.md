@@ -12,7 +12,13 @@
 |---|---|
 | `herdr-pocket-X.Y.Z.tar.gz` | 中转服务 + 电脑端的发布包，已带生产依赖，不分系统和 CPU。安装脚本和 `update` 用它 |
 | `herdr-pocket-X.Y.Z-android-arm64.apk` | Android App。App 内更新用它 |
-| `SHA256SUMS` | 上面两个文件的 SHA256，安装脚本和 `update` 下载后都会核对 |
+| `herdr-pocket-X.Y.Z-ios-unsigned.ipa` | iOS 未签名安装包（侧载使用） |
+| `herdr-pocket-X.Y.Z-harmony-unsigned.hap` | HarmonyOS NEXT 未签名安装包 |
+| `herdr-pocket-X.Y.Z-macos-{arm64,x64}.dmg` | macOS 桌面端安装包（Apple Silicon / Intel） |
+| `herdr-pocket-X.Y.Z-windows-x64-{setup.exe,.msi}` | Windows 桌面端安装包 |
+| `herdr-pocket-X.Y.Z-linux-x86_64.{AppImage,deb}` | Linux 桌面端安装包 |
+| `RELEASE-NOTES.md` | 该版本的中文详细更新公告，桌面端镜像线路可直接拉取展示 |
+| `SHA256SUMS` | 上述发布文件的 SHA256，安装脚本、桌面端和 `update` 下载后都会核对 |
 
 同时推送镜像 `ghcr.io/<owner>/herdr-pocket-relay:X.Y.Z`、`:X.Y` 和 `:latest`（amd64 + arm64）。带 `-rc.1` 这类后缀的标签发布为预发布，不打 `latest`，也不会被 `update` 选中。
 
@@ -52,14 +58,30 @@
 - 服务器时区常常是 UTC：设 `HERDR_POCKET_MIRROR=1` 强制先走镜像，设成 `0` 则先走 GitHub；也可以在 `config.json` 里写 `update.region`。
 - 手机 App 只看手机的时区，也不测速。这套逻辑从 0.1.4 起才有，0.1.3 及以前的 App 还是直连 GitHub。
 
-## 发布步骤
+## 发布步骤（强制包含更新公告）
+
+每次发版打 tag 时，**必须**随版本提交一份详细的中文更新公告并用它生成附注标签（annotated tag），确保 GitHub Release 页面和客户端应用内更新弹窗都能展示完整说明：
+
+1. 编写详细公告文件 `docs/releases/vX.Y.Z.md`，建议包含：
+   - `# Herdr Pocket vX.Y.Z 更新公告`
+   - `## 更新亮点`
+   - `## 新增功能`
+   - `## 交互与体验优化`
+   - `## 问题修复`
+   - `## 多端与升级说明`
+   > 公告内容面向用户，禁止写入私有域名、IP、本机路径、签名 ID 或敏感凭据。
+2. 同步版本号并提交公告与代码：
 
 ```sh
-node scripts/set-version.mjs 0.2.0      # 改版本号并提交
-git commit -am "release 0.2.0" && git tag v0.2.0 && git push && git push --tags
+node scripts/set-version.mjs X.Y.Z
+git add -A && git commit -m "release: vX.Y.Z"
+git tag -a vX.Y.Z -F docs/releases/vX.Y.Z.md
+git push origin main vX.Y.Z
 ```
 
-工作流会再按标签盖一次版本号，所以即使忘了第一步，构建出来的东西版本也是对的；但仓库里的版本号会落后，建议照做。已经存在的标签可以在 Actions 里手动运行 Release 重新构建（`workflow_dispatch`，填标签），文件会覆盖上传。
+3. 工作流 `.github/workflows/release.yml` 会读取 `docs/releases/vX.Y.Z.md`（若缺失则回退读取 `vX.Y.Z` 附注标签正文；若两者均为空或过短则直接失败阻断发布），生成 `dist/RELEASE-NOTES.md` 写入 `SHA256SUMS`，并将完整公告置顶写入 GitHub Release 说明（即使该标签对应的 Release 已提前创建，也会通过 `gh release edit` 同步更新说明）。
+4. 若本地额外构建并上传公证后的 macOS DMG，需一并更新该版本的 `SHA256SUMS`（覆盖含 `RELEASE-NOTES.md` 在内的全部资产），并用 `gh release view vX.Y.Z` 核对 Release 顶部公告与全部资产是否完整无误。
+5. 已经存在的标签可在 Actions 里手动运行 Release 重新构建（`workflow_dispatch`，填标签），产物和公告都会同步刷新。
 
 ## Android 签名
 

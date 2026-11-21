@@ -1,20 +1,21 @@
 import { useMemo, useState, type CSSProperties } from "react";
-import { ChevronDown, ChevronRight, Eye, History, Laptop, PanelLeft, Plus, QrCode, Search, Server, Settings, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, History, Laptop, PanelLeft, Plus, QrCode, Search, Server, Settings, Trash2, X } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
+import { PocketButton, PocketModal, useToast } from "../components/PocketUI";
 import { serverLabel } from "../components/Sidebar";
 import { assetUrl } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
-import { pingRelay } from "../lib/relay";
+import { pingRelay, refreshHostSpaces, rpcCall } from "../lib/relay";
 import { agentSpace, agentTitle, allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
 import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
 import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, tileLetter, toneIndex, type ListGroup } from "./agentInfo";
-import { openAgentTab, openSettingsFrame, setPalette, setPeek, setSelectedSpace, shellStore } from "./shellStore";
+import { closeTabsForSpace, openAgentTab, openSettingsFrame, setPalette, setPeek, setSelectedSpace, shellStore } from "./shellStore";
 import { shortcutText } from "./shortcuts";
-import { buildHostSpaces, spaceColorVars } from "./spaceSync";
+import { buildHostSpaces, spaceColorVars, type SidebarSpace } from "./spaceSync";
 
 const FOLD_KEY = "herdr-pocket-v3-folded";
 const SORT_KEY = "herdr-pocket-v3-agent-sort";
@@ -73,9 +74,56 @@ export function ShellSidebar({
 
   const [folded, setFolded] = useState<string[]>(() => readJson<string[]>(FOLD_KEY, []));
   const [sort, setSortState] = useState<"status" | "recent">(() => readJson(SORT_KEY, "status"));
+  const [deleteSpaceTarget, setDeleteSpaceTarget] = useState<SidebarSpace | null>(null);
+  const [deletingSpace, setDeletingSpace] = useState(false);
+  const toast = useToast();
   const spaceSel = shellStore.use((s) => s.selectedSpace);
   const allByKey = useMemo(() => new Map(Object.values(agentsMap).flat().map((a) => [a.key, a] as const)), [agentsMap]);
   const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k));
+
+  const confirmDeleteSpace = async () => {
+    const target = deleteSpaceTarget;
+    if (!target || deletingSpace) return;
+    setDeletingSpace(true);
+    try {
+      try {
+        await rpcCall(target.deviceId, "space.delete", {
+          ...(target.spaceId ? { spaceId: target.spaceId } : {}),
+          ...(target.name ? { spaceName: target.name } : {}),
+        });
+      } catch (e) {
+        const err = e as { code?: string; message?: string };
+        const fallback =
+          Boolean(target.spaceId) &&
+          (err?.code === "unsupported" || err?.code === "bad_request" || /unknown|unsupported|不支持/i.test(err?.message ?? ""));
+        if (!fallback) throw e;
+        await rpcCall(target.deviceId, "herdr.command", { command: "space.close", args: { id: target.spaceId! } });
+      }
+      closeTabsForSpace(target.id, (k) => allByKey.get(k));
+      const curSpaces = liveStore.get().spaces[target.deviceId] ?? [];
+      if (curSpaces.length > 0) {
+        liveStore.set((prev) => ({
+          ...prev,
+          spaces: {
+            ...prev.spaces,
+            [target.deviceId]: curSpaces.filter((sp) => (target.spaceId ? sp.id !== target.spaceId : sp.name !== target.name)),
+          },
+        }));
+      }
+      refreshHostSpaces(target.deviceId);
+      void rpcCall(target.deviceId, "agents.list", { includeShells: true })
+        .then((res) => {
+          liveStore.set((prev) => ({ ...prev, agents: { ...prev.agents, [target.deviceId]: res.agents } }));
+        })
+        .catch(() => {});
+      setDeleteSpaceTarget(null);
+      toast(`已关闭空间「${target.name || "空间"}」`);
+    } catch (e) {
+      toast((e as Error).message || "关闭空间失败", true);
+    } finally {
+      setDeletingSpace(false);
+    }
+  };
 
   const toggleFold = (id: string) => {
     const next = folded.includes(id) ? folded.filter((x) => x !== id) : [...folded, id];
@@ -264,6 +312,11 @@ export function ShellSidebar({
                             className={`v3-row v3-space${s.count === 0 ? " empty" : ""}${selected === s.id ? " selected" : ""}`}
                             title={collapsed ? `${m.name} · ${label}` : s.folder || undefined}
                             onClick={() => setSpaceSel(selected === s.id ? null : s.id)}
+                            onContextMenu={(e) => {
+                              if (!m.online || collapsed || (!s.spaceId && !s.name)) return;
+                              e.preventDefault();
+                              setDeleteSpaceTarget(s);
+                            }}
                             onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setSpaceSel(selected === s.id ? null : s.id))}
                           >
                             <span
@@ -277,18 +330,34 @@ export function ShellSidebar({
                               <>
                                 <span className="v3-row-label truncate">{label}</span>
                                 {m.online ? (
-                                  <button
-                                    type="button"
-                                    className="v3-icon-btn small hover-only"
-                                    aria-label={`在空间 ${label} 新建 Agent`}
-                                    title={`在空间 ${label} 新建 Agent`}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      onNewAgent(m.id, s.name || null);
-                                    }}
-                                  >
-                                    <Plus size={12} />
-                                  </button>
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="v3-icon-btn small hover-only"
+                                      aria-label={`在空间 ${label} 新建 Agent`}
+                                      title={`在空间 ${label} 新建 Agent`}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onNewAgent(m.id, s.name || null);
+                                      }}
+                                    >
+                                      <Plus size={12} />
+                                    </button>
+                                    {s.spaceId || s.name ? (
+                                      <button
+                                        type="button"
+                                        className="v3-icon-btn small hover-only danger"
+                                        aria-label={`关闭空间 ${label}`}
+                                        title={`关闭空间 ${label}`}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setDeleteSpaceTarget(s);
+                                        }}
+                                      >
+                                        <Trash2 size={12} />
+                                      </button>
+                                    ) : null}
+                                  </>
                                 ) : null}
                                 <span className="v3-count">{s.count}</span>
                                 {s.count === 0 ? (
@@ -382,6 +451,28 @@ export function ShellSidebar({
           {collapsed ? null : <span className="grow truncate">扫码连接手机</span>}
         </button>
       </div>
+      <PocketModal
+        open={deleteSpaceTarget !== null}
+        onOpenChange={(v) => {
+          if (!v && !deletingSpace) setDeleteSpaceTarget(null);
+        }}
+        title={`关闭空间「${deleteSpaceTarget?.name || "空间"}」？`}
+        subtitle={
+          deleteSpaceTarget
+            ? `${deleteSpaceTarget.count > 0 ? `将关闭该空间并结束其中的 ${deleteSpaceTarget.count} 个运行中终端/Agent。` : "将从列表移除该空空间。"}磁盘上的文件夹与代码文件不会被删除${deleteSpaceTarget.folder ? `（${deleteSpaceTarget.folder}）` : ""}。`
+            : undefined
+        }
+        width={420}
+      >
+        <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
+          <PocketButton variant="ghost" disabled={deletingSpace} onClick={() => setDeleteSpaceTarget(null)}>
+            取消
+          </PocketButton>
+          <PocketButton variant="danger" disabled={deletingSpace} onClick={() => void confirmDeleteSpace()}>
+            {deletingSpace ? "正在关闭…" : "关闭空间"}
+          </PocketButton>
+        </div>
+      </PocketModal>
     </aside>
   );
 }

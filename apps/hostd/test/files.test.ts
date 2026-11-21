@@ -148,3 +148,47 @@ test("extraRoots allows trusted absolute paths while still blocking private and 
     (e) => code(e) === "forbidden",
   );
 });
+
+test("home and tmpdir extraRoots read agent scratch images while blocking credentials and keychains", async () => {
+  const fakeHome = join(dir, "fake-home");
+  const fakeTmp = join(dir, "fake-tmp");
+  const brainDir = join(fakeHome, ".gemini", "antigravity-cli", "brain", "sess-1", "scratch", "qa-studio-visual");
+  const credDir = join(fakeHome, ".agents", "crosery", "credentials");
+  const keychainDir = join(fakeHome, "Library", "Keychains");
+  const sshDir = join(fakeHome, ".ssh");
+  mkdirSync(brainDir, { recursive: true });
+  mkdirSync(fakeTmp, { recursive: true });
+  mkdirSync(credDir, { recursive: true });
+  mkdirSync(keychainDir, { recursive: true });
+  mkdirSync(sshDir, { recursive: true });
+
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 3]);
+  writeFileSync(join(brainDir, "clean-desktop-light.png"), pngBytes);
+  writeFileSync(join(fakeTmp, "preview.png"), pngBytes);
+  writeFileSync(join(credDir, "token.json"), '{"secret":"x"}');
+  writeFileSync(join(keychainDir, "login.keychain-db"), "keychain");
+  writeFileSync(join(sshDir, "id_ed25519"), "PRIVATE KEY");
+  writeFileSync(join(fakeHome, ".env"), "API_KEY=123");
+
+  const opts = {
+    privateDirs: [settings, credDir, keychainDir],
+    extraRoots: [fakeHome, fakeTmp],
+  };
+
+  const brainImg = await readFileSlice(root, { path: join(brainDir, "clean-desktop-light.png") }, opts);
+  assert.equal(brainImg.kind, "image");
+  assert.equal(brainImg.mime, "image/png");
+  assert.equal(brainImg.bytes, pngBytes.length);
+
+  const tmpImg = await readFileSlice(root, { path: join(fakeTmp, "preview.png") }, opts);
+  assert.equal(tmpImg.kind, "image");
+
+  for (const secretPath of [
+    join(credDir, "token.json"),
+    join(keychainDir, "login.keychain-db"),
+    join(sshDir, "id_ed25519"),
+    join(fakeHome, ".env"),
+  ]) {
+    await assert.rejects(readFileSlice(root, { path: secretPath }, opts), (e) => code(e) === "forbidden");
+  }
+});

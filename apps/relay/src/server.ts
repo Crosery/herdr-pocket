@@ -91,7 +91,7 @@ interface Pending {
 }
 
 /** Calls that change something on a computer: logged even when they work. Typing keystrokes and "seen" marks are not. */
-const MUTATING = new Set(["terminal.send", "terminal.keys", "agent.create", "terminal.interrupt", "terminal.kill", "herdr.command", "sessions.resume"]);
+const MUTATING = new Set(["terminal.send", "terminal.keys", "agent.create", "agent.setModel", "space.delete", "terminal.interrupt", "terminal.kill", "herdr.command", "sessions.resume"]);
 /** Calls that may run longer than the usual RPC timeout: a new agent's first task is typed in once its program is up (hostd waits up to 45 s). */
 const SLOW_RPC_MS: Partial<Record<string, number>> = { "agent.create": 100_000 };
 /** Bodies of log uploads are larger than other requests. */
@@ -1325,7 +1325,7 @@ function rpcSummary(method: string, params: unknown): Record<string, unknown> | 
   if (!params || typeof params !== "object") return undefined;
   const p = params as Record<string, unknown>;
   const out: Record<string, unknown> = {};
-  for (const k of ["agent", "launcher", "space", "spaceName", "tabName", "folder", "command", "session", "path"]) if (typeof p[k] === "string") out[k] = p[k];
+  for (const k of ["agent", "launcher", "space", "spaceId", "spaceName", "tabName", "folder", "command", "session", "path", "modelId", "thinkingLevel"]) if (typeof p[k] === "string") out[k] = p[k];
   if (typeof p.text === "string") out.text = Array.from(p.text).slice(0, 200).join("");
   if (typeof p.task === "string") out.task = Array.from(p.task).slice(0, 200).join("");
   if (Array.isArray(p.keys)) out.keys = p.keys.slice(0, 16).join(" ");

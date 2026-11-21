@@ -1,9 +1,10 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { HerdrApp } from "../src/create.ts";
+import { HerdrApp, NoDesktopApp } from "../src/create.ts";
+import type { HcTerminal } from "../src/hc.ts";
 
 const tmp = mkdtempSync(join(tmpdir(), "herdr-pocket-spaces-"));
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -96,4 +97,109 @@ test("HerdrApp.spacesFromDocs resolves live terminal cwds when docs folder is ab
   assert.deepEqual(res, [
     { id: "sp9", name: "Nested", folder: "/Users/demo/repo", tabs: 1, terminals: 1, color: "#ec4899" },
   ]);
+});
+
+test("HerdrApp.deleteSpace closes via space.close when open, kills subagents, and never deletes disk folders", async () => {
+  const projDir = join(tmp, "repo-open");
+  mkdirSync(projDir, { recursive: true });
+  writeFileSync(join(projDir, "keep.txt"), "safe");
+
+  const app = new HerdrApp("herdr-app");
+  const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+  app.command = async (cmd, args) => {
+    calls.push({ cmd, args });
+    return null;
+  };
+
+  const killed: string[] = [];
+  const labeled: Array<{ addr: string; labels: Record<string, string> }> = [];
+  const terms = new Map<string, HcTerminal>([
+    ["t1", { address: "t1", cwd: projDir, labels: { "herdr.space": "sp1", "herdr.tab": "tb1" } }],
+    ["t1-sub", { address: "t1-sub", cwd: projDir, parent: "t1", labels: {} }],
+    ["t2", { address: "t2", cwd: "/tmp/other", labels: { "herdr.space": "sp2" } }],
+  ]);
+
+  const res = await app.deleteSpace(
+    { spaceId: "sp1", spaceName: "Work" },
+    {
+      terminals: terms,
+      kill: async (addr) => { killed.push(addr); },
+      label: async (addr, labels) => { labeled.push({ addr, labels }); },
+    },
+  );
+
+  assert.deepEqual(calls, [{ cmd: "space.close", args: { id: "sp1", confirmed: true } }]);
+  assert.deepEqual(killed.sort(), ["t1", "t1-sub"]);
+  assert.equal(res.closedTerminals, 2);
+  assert.equal(existsSync(join(projDir, "keep.txt")), true);
+  assert.equal(labeled.some((x) => x.addr === "t1" && x.labels["herdr.space"] === ""), true);
+});
+
+test("HerdrApp.deleteSpace falls back to doc.get/doc.set when Herdr window is closed", async () => {
+  const projDir = join(tmp, "repo-closed");
+  mkdirSync(projDir, { recursive: true });
+  const app = new HerdrApp("herdr-app");
+  app.command = async () => {
+    throw new NoDesktopApp();
+  };
+
+  let savedDoc: { name: string; version: number; value: any } | null = null;
+  const setDoc = (d: { name: string; version: number; value: any }) => { savedDoc = d; };
+  const killed: string[] = [];
+  const docState = {
+    version: 7,
+    value: {
+      activeSpaceId: "sp-del",
+      spaces: [
+        { id: "sp-del", name: "Del", folder: projDir, tabs: [{ id: "tb1", root: { content: { terminal: "t10" } } }] },
+        { id: "sp-keep", name: "Keep", folder: "/tmp/keep", tabs: [] },
+      ],
+    },
+  };
+
+  const res = await app.deleteSpace(
+    { spaceId: "sp-del", spaceName: "Del" },
+    {
+      terminals: new Map([
+        ["t10", { address: "t10", cwd: projDir, labels: { "herdr.space": "sp-del" } }],
+        ["t11", { address: "t11", cwd: "/tmp/keep", labels: { "herdr.space": "sp-keep" } }],
+      ]),
+      docGet: async () => docState,
+      docSet: async (name, value, version) => {
+        setDoc({ name, value, version });
+        return version + 1;
+      },
+      kill: async (addr) => { killed.push(addr); },
+    },
+  );
+
+  assert.ok(savedDoc);
+  const wrote = savedDoc as { name: string; version: number; value: any };
+  assert.equal(wrote.name, "herdr-app");
+  assert.equal(wrote.version, 7);
+  assert.deepEqual(wrote.value.spaces.map((s: any) => s.id), ["sp-keep"]);
+  assert.equal(wrote.value.activeSpaceId, "sp-keep");
+  assert.deepEqual(killed, ["t10"]);
+  assert.equal(res.closedTerminals, 1);
+  assert.equal(existsSync(projDir), true);
+});
+
+test("HerdrApp.deleteSpace cleans up standalone orphan space terminals by where prefix", async () => {
+  const app = new HerdrApp("herdr-app");
+  app.spaces = async () => {
+    throw new NoDesktopApp();
+  };
+  const killed: string[] = [];
+  const res = await app.deleteSpace(
+    { spaceName: "backend" },
+    {
+      terminals: new Map([
+        ["t21", { address: "t21", labels: { where: "backend / tab1" } }],
+        ["t22", { address: "t22", labels: { where: "frontend / tab1" } }],
+      ]),
+      kill: async (addr) => { killed.push(addr); },
+    },
+  );
+  assert.deepEqual(killed, ["t21"]);
+  assert.equal(res.closedTerminals, 1);
 });

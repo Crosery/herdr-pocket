@@ -284,6 +284,7 @@ export class KittyKeyboardState {
   private normal: number[] = [];
   private alt: number[] = [];
   modifyOtherKeys = 0;
+  win32InputMode = false;
 
   private stack(altScreen: boolean): number[] {
     return altScreen ? this.alt : this.normal;
@@ -319,7 +320,14 @@ export class KittyKeyboardState {
     this.normal = [];
     this.alt = [];
     this.modifyOtherKeys = 0;
+    this.win32InputMode = false;
   }
+}
+
+function encodeWin32Enter(shift: boolean, ctrl: boolean, alt: boolean): string {
+  const held = (shift ? 0x10 : 0) | (ctrl ? 0x08 : 0) | (alt ? 0x02 : 0);
+  const typed = ctrl ? 10 : 13;
+  return `\x1b[13;28;${typed};1;${held};1_\x1b[13;28;${typed};0;${held};1_`;
 }
 
 const KITTY_SPECIAL_CODES: Record<string, { code: number; final?: string; legacyCode?: number }> = {
@@ -352,20 +360,39 @@ const KITTY_SPECIAL_CODES: Record<string, { code: number; final?: string; legacy
 };
 
 /**
- * Encodes a keydown using the Kitty keyboard protocol (`CSI u`) or xterm `modifyOtherKeys`
- * when enhanced keyboard reporting is enabled (or `CSI u` applies unambiguously).
+ * Encodes a keydown using the Kitty keyboard protocol (`CSI u`), xterm `modifyOtherKeys`,
+ * Windows ConPTY `win32-input-mode` (`?9001h`), or legacy modified-Enter sequences (`CSI 27;mod;13~` / `ESC CR`).
  * Returns null if standard xterm legacy handling should proceed.
  */
-export function encodeKittyKey(e: TermKeyInput, flags: number, modifyOtherKeys: number, mac: boolean): string | null {
+export function encodeKittyKey(
+  e: TermKeyInput,
+  flags: number,
+  modifyOtherKeys: number,
+  mac: boolean,
+  win32InputMode = false,
+): string | null {
+  if (mac && e.metaKey) return null;
+
   const modBits =
     (e.shiftKey ? 1 : 0) +
     (e.altKey ? 2 : 0) +
     (e.ctrlKey ? 4 : 0) +
     (e.metaKey && !mac ? 8 : 0);
 
-  if (flags === 0 && modifyOtherKeys === 0) return null;
+  if (flags === 0) {
+    if (win32InputMode && e.key === "Enter" && modBits > 0) {
+      return encodeWin32Enter(e.shiftKey, e.ctrlKey, e.altKey);
+    }
+    if (modifyOtherKeys === 0) {
+      if (e.key === "Enter" && modBits > 0) {
+        if (e.altKey && !e.shiftKey && !e.ctrlKey) return "\x1b\r";
+        return `\x1b[27;${modBits + 1};13~`;
+      }
+      return null;
+    }
+  }
 
-  // With Kitty disambiguate (bit 1) or modifyOtherKeys, modified Enter/Tab/Escape/Backspace emit unambiguous CSI u.
+  // With Kitty disambiguate (bit 1) or modifyOtherKeys, modified Enter/Tab/Escape/Backspace emit unambiguous sequences.
   const special = KITTY_SPECIAL_CODES[e.key];
   if (special) {
     if (modBits === 0 && !(flags & 8)) return null;
@@ -375,6 +402,9 @@ export function encodeKittyKey(e: TermKeyInput, flags: number, modifyOtherKeys: 
     }
     if (special.final === "~") {
       return `\x1b[${special.code};${modParam}~`;
+    }
+    if (flags === 0 && modifyOtherKeys > 0) {
+      return `\x1b[27;${modParam};${special.code}~`;
     }
     return `\x1b[${special.code};${modParam}u`;
   }

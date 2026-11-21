@@ -343,9 +343,10 @@ test("MOSS-Live end-to-end telemetry: EventLog live.ai correlation, upstream pro
     assert.ok(!JSON.stringify(allLogs).includes("绝密助手回答片段"), "raw interrupted assistant transcript must never leak to EventLog");
 
     const aiLogs = (await api(`/v1/logs?kind=live.ai&device=${phone.device.id}`, { token: ADMIN })).json.entries as LogEntry[];
-    assert.ok(!JSON.stringify(aiLogs).includes("绝密私密口令"), "raw user transcript must never leak into live.ai telemetry");
-    assert.ok(!JSON.stringify(aiLogs).includes("9527"), "raw user transcript digits must never leak into live.ai telemetry");
-    assert.ok(!JSON.stringify(aiLogs).includes("绝密助手回答片段"), "raw assistant transcript must never leak into live.ai telemetry");
+    const sanitizedAiLogs = aiLogs.map(({ ts: _ts, id: _id, ...rest }) => rest);
+    assert.ok(!JSON.stringify(sanitizedAiLogs).includes("绝密私密口令"), "raw user transcript must never leak into live.ai telemetry");
+    assert.ok(!JSON.stringify(sanitizedAiLogs).includes("9527"), "raw user transcript digits must never leak into live.ai telemetry");
+    assert.ok(!JSON.stringify(sanitizedAiLogs).includes("绝密助手回答片段"), "raw assistant transcript must never leak into live.ai telemetry");
     assert.ok(!JSON.stringify(allLogs.filter((e) => e.kind !== "live.heard")).includes("绝密私密口令"));
     assert.ok(aiLogs.length >= 9, `expected >=9 live.ai events, got ${aiLogs.length}`);
     const callIds = new Set(aiLogs.map((e) => e.data?.callId).filter(Boolean));

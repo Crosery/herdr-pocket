@@ -82,6 +82,10 @@
   color: var(--v3-fg);
 }
 
+.v3-icon-btn.danger:hover {
+  color: var(--danger, #e11d48);
+}
+
 .v3-icon-btn:focus-visible,
 .v3-row:focus-visible,
 .v3-foot-row:focus-visible,

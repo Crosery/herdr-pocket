@@ -5,9 +5,10 @@ import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { PUT_LIMITS, type Agent, type AgentModelsResult, type AgentUsageReport, type TerminalStreamParams } from "@herdr-pocket/protocol";
+import { PUT_LIMITS, buildHarnessSwitchCommands, stripModelEffortSuffix, type Agent, type AgentModelsResult, type AgentUsageReport, type TerminalStreamParams } from "@herdr-pocket/protocol";
 import { call, subscribe, type RelayError } from "../lib/relay";
 import { addPictures, canPickImages, pickImages, type Attachment } from "../lib/attach";
+import { clearMobileDraft, getMobileDraft, hydrateMobileDrafts, onDraftsHydrated, setMobileDraftPictures, setMobileDraftText } from "../lib/drafts";
 import {
   enqueueMobilePrompt,
   ensureMobileQueueWatcher,
@@ -706,9 +707,25 @@ function useDirectTyping(agent: Agent, onError: (message: string, unsupported: b
 export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: Agent; bottomInset: number; mode: "chat" | "terminal"; onOpenTerminal?: () => void }) {
   const p = usePalette();
   const qc = useQueryClient();
-  const [text, setText] = useState("");
+  const [text, setTextState] = useState(() => getMobileDraft(agent.key).text);
   /** Pictures to go with the next message (chat only). */
-  const [pictures, setPictures] = useState<Attachment[]>([]);
+  const [pictures, setPicturesState] = useState<Attachment[]>(() => getMobileDraft(agent.key).pictures);
+  const draftKeyRef = useRef(agent.key);
+  draftKeyRef.current = agent.key;
+  const setText = useCallback((next: string | ((prev: string) => string)) => {
+    setTextState((prev) => {
+      const val = typeof next === "function" ? next(prev) : next;
+      setMobileDraftText(draftKeyRef.current, val);
+      return val;
+    });
+  }, []);
+  const setPictures = useCallback((next: Attachment[] | ((prev: Attachment[]) => Attachment[])) => {
+    setPicturesState((prev) => {
+      const val = typeof next === "function" ? next(prev) : next;
+      setMobileDraftPictures(draftKeyRef.current, val);
+      return val;
+    });
+  }, []);
   const [picking, setPicking] = useState(false);
   const [extra, setExtra] = useState(false);
   const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
@@ -755,13 +772,23 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageData, setUsageData] = useState<AgentUsageReport | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
-  const [modelOpen, setModelOpen] = useState(false);
+  const [modelOpen, setModelOpen] = useState<false | "model" | "thinking">(false);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelData, setModelData] = useState<AgentModelsResult | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
   const [modelFilter, setModelFilter] = useState("");
+  const [modelOverride, setModelOverride] = useState<string | undefined>(undefined);
+  const [thinkingOverride, setThinkingOverride] = useState<string | undefined>(undefined);
 
   useEffect(() => {
+    void hydrateMobileDrafts();
+    const unsub = onDraftsHydrated(() => {
+      const d = getMobileDraft(agent.key);
+      if (d.text) setTextState((cur) => cur || d.text);
+    });
+    const d = getMobileDraft(agent.key);
+    setTextState(d.text);
+    setPicturesState(d.pictures);
     setUsageOpen(false);
     setUsageData(null);
     setUsageError(null);
@@ -769,10 +796,27 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     setModelData(null);
     setModelError(null);
     setModelFilter("");
+    setModelOverride(undefined);
+    setThinkingOverride(undefined);
+    return () => {
+      unsub();
+    };
   }, [agent.key]);
   const termKeys = useSettings((x) => x.termKeys);
   const keys = useMemo(() => visibleTermKeys(normalizeTermKeyLayout(termKeys)), [termKeys]);
   const online = useLive((s) => s.devices[agent.deviceId]?.online ?? false);
+  useEffect(() => {
+    if (!online || agent.isShell || (agent.source !== "hc" && agent.source !== "herdr")) return;
+    let alive = true;
+    void call(agent.deviceId, "agent.models", { agent: agent.key })
+      .then((res) => {
+        if (alive) setModelData(res);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [online, agent.deviceId, agent.key, agent.isShell, agent.source]);
   const coral = statusColors("blocked", p.dark).fg;
   const slashQuery = mode === "chat" && !agent.isShell ? extractSlashQuery(text) : null;
   const cmdQ = useQuery({
@@ -820,8 +864,8 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
       .finally(() => setUsageLoading(false));
   }, [agent.deviceId, agent.key]);
 
-  const openModelPicker = useCallback(() => {
-    setModelOpen(true);
+  const openModelPicker = useCallback((panelMode: "model" | "thinking" = "model") => {
+    setModelOpen(panelMode);
     setModelFilter("");
     setModelLoading(true);
     setModelError(null);
@@ -831,25 +875,58 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
       .finally(() => setModelLoading(false));
   }, [agent.deviceId, agent.key]);
 
-  function applyModelChoice(modelId: string) {
-    const clean = modelId.trim();
-    if (!clean) return;
+  function applyModelOrThinking(opts: { modelId?: string; thinkingLevel?: string }) {
+    const cleanModel = opts.modelId?.trim();
+    const cleanThinking = opts.thinkingLevel?.trim().toLowerCase();
+    if (!cleanModel && !cleanThinking) return;
     setModelOpen(false);
-    const cmd = `/model ${clean}`;
+    if (cleanModel) setModelOverride(stripModelEffortSuffix(cleanModel));
+    if (cleanThinking) setThinkingOverride(cleanThinking);
+
+    const desc = cleanModel ?? `思考等级 ${cleanThinking}`;
+    const plan = buildHarnessSwitchCommands(agent.harness, { modelId: cleanModel, thinkingLevel: cleanThinking });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
     if (agent.status === "working") {
-      enqueueMobilePrompt(agent, cmd, []);
-      setToast(`已加入排队：切换模型为 ${clean}`);
+      if (plan.commands.length > 0) {
+        for (const cmd of plan.commands) enqueueMobilePrompt(agent, cmd, []);
+        setToast(`已加入排队：切换为 ${desc}`);
+      } else {
+        setToast(`当前轮进行中，空闲后再切换 ${desc}`);
+      }
       return;
     }
-    void sendOut(agent, cmd, []).then((r) => {
-      if (r.ok) {
-        setToast(`已发送切换模型指令：${clean}`);
+    void call(agent.deviceId, "agent.setModel", {
+      agent: agent.key,
+      ...(cleanModel ? { modelId: cleanModel } : {}),
+      ...(cleanThinking ? { thinkingLevel: cleanThinking } : {}),
+    })
+      .then((res) => {
+        if (res.currentModel) setModelOverride(res.currentModel);
+        if (res.currentThinking) setThinkingOverride(res.currentThinking);
+        setToast(res.note || `已切换：${desc}`);
         refreshSoon();
-      } else {
-        setToast(r.message);
-      }
-    });
+      })
+      .catch(async (e: unknown) => {
+        const err = e as { code?: string; message?: string };
+        const unsupported = err?.code === "unsupported" || err?.code === "bad_request" || /unknown|unsupported|不支持/i.test(err?.message ?? "");
+        if (unsupported && plan.commands.length > 0) {
+          for (const cmd of plan.commands) {
+            await sendOut(agent, cmd, []);
+          }
+          setToast(`已发送切换指令：${desc}`);
+          refreshSoon();
+        } else {
+          setToast(err?.message || "切换失败");
+        }
+      });
+  }
+
+  function applyModelChoice(modelId: string) {
+    applyModelOrThinking({ modelId });
+  }
+
+  function applyThinkingChoice(thinkingLevel: string) {
+    applyModelOrThinking({ thinkingLevel });
   }
 
   function send() {
@@ -863,15 +940,23 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
     }
     if (mode === "chat" && !pics.length && /^\/(?:model|models)$/i.test(t)) {
       setText("");
-      openModelPicker();
+      openModelPicker("model");
+      return;
+    }
+    if (mode === "chat" && !pics.length && /^\/(?:effort|thinking)$/i.test(t) && (modelData?.thinkingLevels?.length ?? 0) > 0) {
+      setText("");
+      openModelPicker("thinking");
       return;
     }
     const now = Date.now();
     const sig = `${agent.key}\0${t}\0${pics.map((x) => x.id).join(",")}`;
     if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 500) return;
     lastSendRef.current = { sig, at: now };
-    setText("");
-    if (pics.length) setPictures((cur) => cur.filter((x) => !pics.includes(x)));
+    clearMobileDraft(agent.key);
+    setTextState("");
+    if (pics.length) {
+      setPictures((cur) => cur.filter((x) => !pics.includes(x)));
+    }
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
     if (mode === "chat" && agent.status === "working") {
       enqueueMobilePrompt(agent, t, pics);
@@ -1359,7 +1444,12 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                     }
                     if (/^\/(?:model|models)$/i.test(cmd.name)) {
                       setText("");
-                      openModelPicker();
+                      openModelPicker("model");
+                      return;
+                    }
+                    if (/^\/(?:effort|thinking)$/i.test(cmd.name) && (modelData?.thinkingLevels?.length ?? 0) > 0) {
+                      setText("");
+                      openModelPicker("thinking");
                       return;
                     }
                     const needsArgs = Boolean(cmd.argHint) || ["/add", "/model", "/ask", "/architect", "/add-dir", "/goal"].includes(cmd.name);
@@ -1402,6 +1492,77 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         </View>
       ) : null}
       {mode === "chat" && modelOpen ? (() => {
+        const EFFORT_LABELS: Record<string, string> = {
+          off: "关闭", none: "关闭", minimal: "极简", min: "极简", low: "低", medium: "中", med: "中",
+          high: "高", xhigh: "超高", max: "最大", ultra: "极致", auto: "自动", normal: "标准", fast: "快速",
+          smart: "深度", rush: "极速",
+        };
+        const effortLabel = (lvl: string) => EFFORT_LABELS[lvl.toLowerCase()] ?? lvl;
+        const currentModel = modelOverride || modelData?.currentModel || agent.model;
+        const currentThinking = (thinkingOverride || modelData?.currentThinking || "").toLowerCase();
+        const curModelOpt = (modelData?.models ?? []).find((m) => currentModel && m.id.toLowerCase() === currentModel.toLowerCase());
+        const thinkingLevels = curModelOpt?.thinkingLevels?.length ? curModelOpt.thinkingLevels : (modelData?.thinkingLevels ?? []);
+
+        if (modelOpen === "thinking") {
+          return (
+            <View
+              accessibilityLabel="切换思考等级下拉列表"
+              style={{
+                marginHorizontal: space.lg,
+                marginBottom: space.xs,
+                borderRadius: radius.card,
+                backgroundColor: p.surface,
+                borderWidth: 1,
+                borderColor: p.dark ? p.surface3 : "#FBE3EC",
+                maxHeight: 236,
+                overflow: "hidden",
+              }}
+            >
+              <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: space.sm, height: 36, borderBottomWidth: 1, borderBottomColor: p.divider, backgroundColor: p.surface2, gap: 6 }}>
+                <MaterialCommunityIcons name="brain" size={15} color={p.accentText} />
+                <Text style={{ flex: 1, fontFamily: fonts.bodyBold, fontSize: 12.5, color: p.ink }}>切换思考等级</Text>
+                <Pressable accessibilityRole="button" accessibilityLabel="关闭思考等级列表" onPress={() => setModelOpen(false)} hitSlop={8} style={{ padding: 4 }}>
+                  <MaterialCommunityIcons name="close" size={15} color={p.muted} />
+                </Pressable>
+              </View>
+              <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="always" contentContainerStyle={{ padding: space.xs, gap: 2 }}>
+                {modelLoading && !modelData && thinkingLevels.length === 0 ? (
+                  <View style={{ paddingVertical: 14, alignItems: "center" }}><PocketSpinner size={18} /></View>
+                ) : thinkingLevels.length === 0 ? (
+                  <Text style={{ textAlign: "center", paddingVertical: 14, fontSize: 12.5, color: p.faint }}>当前模型不支持思考等级切换</Text>
+                ) : (
+                  thinkingLevels.map((lvl) => {
+                    const active = currentThinking === lvl.toLowerCase();
+                    return (
+                      <Pressable
+                        key={lvl}
+                        disabled={modelData?.canSwitch === false}
+                        onPress={() => applyThinkingChoice(lvl)}
+                        style={({ pressed }) => ({
+                          flexDirection: "row",
+                          alignItems: "center",
+                          gap: 8,
+                          paddingHorizontal: space.sm,
+                          paddingVertical: 8,
+                          borderRadius: radius.sm,
+                          backgroundColor: pressed ? p.surface3 : active ? p.accentContainer : "transparent",
+                        })}
+                      >
+                        <MaterialCommunityIcons name="brain" size={14} color={active ? p.accentText : p.muted} />
+                        <Text style={{ flex: 1, fontFamily: active ? fonts.bodyBold : fonts.bodySemi, fontSize: 13, color: active ? p.accentText : p.ink }}>
+                          {effortLabel(lvl)}
+                        </Text>
+                        <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>{lvl}</Text>
+                        {active ? <MaterialCommunityIcons name="check" size={14} color={p.accentText} /> : null}
+                      </Pressable>
+                    );
+                  })
+                )}
+              </ScrollView>
+            </View>
+          );
+        }
+
         const q = modelFilter.trim().toLowerCase();
         const filteredModels = (modelData?.models ?? []).filter(
           (m) => !q || m.id.toLowerCase().includes(q) || m.label.toLowerCase().includes(q) || (m.provider?.toLowerCase().includes(q) ?? false),
@@ -1409,7 +1570,6 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         const trimmedFilter = modelFilter.trim();
         const exactMatch = trimmedFilter ? filteredModels.some((m) => m.id.toLowerCase() === trimmedFilter.toLowerCase()) : false;
         const canCustom = Boolean(trimmedFilter && !exactMatch && modelData?.canSwitch !== false);
-        const currentModel = modelData?.currentModel || agent.model;
         return (
           <View
             accessibilityLabel="切换模型下拉列表"
@@ -1420,7 +1580,7 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
               backgroundColor: p.surface,
               borderWidth: 1,
               borderColor: p.dark ? p.surface3 : "#FBE3EC",
-              maxHeight: 236,
+              maxHeight: 260,
               overflow: "hidden",
             }}
           >
@@ -1470,6 +1630,39 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
                 <MaterialCommunityIcons name="close" size={15} color={p.muted} />
               </Pressable>
             </View>
+            {thinkingLevels.length > 0 && modelData?.canSwitch !== false ? (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                keyboardShouldPersistTaps="always"
+                contentContainerStyle={{ paddingHorizontal: space.sm, paddingVertical: 6, gap: 6, alignItems: "center" }}
+                style={{ maxHeight: 38, borderBottomWidth: 1, borderBottomColor: p.divider, backgroundColor: p.surface }}
+              >
+                <Text style={{ fontSize: 11, fontFamily: fonts.bodyBold, color: p.faint }}>思考</Text>
+                {thinkingLevels.map((lvl) => {
+                  const active = currentThinking === lvl.toLowerCase();
+                  return (
+                    <Pressable
+                      key={lvl}
+                      onPress={() => applyThinkingChoice(lvl)}
+                      style={{
+                        height: 24,
+                        paddingHorizontal: 9,
+                        borderRadius: 12,
+                        justifyContent: "center",
+                        borderWidth: 1,
+                        borderColor: active ? p.primary : p.divider,
+                        backgroundColor: active ? p.accentContainer : p.surface2,
+                      }}
+                    >
+                      <Text style={{ fontSize: 11, fontFamily: active ? fonts.bodyBold : fonts.bodySemi, color: active ? p.accentText : p.muted }}>
+                        {effortLabel(lvl)}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            ) : null}
             {modelData && !modelData.canSwitch ? (
               <View style={{ paddingHorizontal: space.sm, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: p.divider, backgroundColor: p.surface2 }}>
                 <Text style={{ fontSize: 11.5, color: p.error }}>{modelData.reason || "当前会话不支持切换模型"}</Text>
@@ -1616,31 +1809,59 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
             />
             <IconTile icon="image" size={42} disabled={!online || picking} onPress={attach} a11y="添加图片，和消息一起发给它" />
             {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
-              <Pressable
-                disabled={!online}
-                onPress={() => (modelOpen ? setModelOpen(false) : openModelPicker())}
-                accessibilityRole="button"
-                accessibilityLabel={agent.model ? `当前模型 ${agent.model}，点击切换` : "切换模型"}
-                style={({ pressed }) => ({
-                  height: 36,
-                  maxWidth: 165,
-                  paddingHorizontal: 10,
-                  borderRadius: 18,
-                  flexDirection: "row",
-                  alignItems: "center",
-                  gap: 4,
-                  backgroundColor: pressed ? p.surface3 : modelOpen ? p.accentContainer : p.surface2,
-                  borderWidth: 1,
-                  borderColor: modelOpen ? p.primary : p.divider,
-                  opacity: online ? 1 : 0.45,
-                })}
-              >
-                <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
-                <Text numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 12, color: modelOpen ? p.accentText : p.ink, flexShrink: 1 }}>
-                  {agent.model ? agent.model.split("/").pop() : "模型"}
-                </Text>
-                <MaterialCommunityIcons name={modelOpen ? "chevron-up" : "chevron-down"} size={13} color={modelOpen ? p.accentText : p.muted} />
-              </Pressable>
+              <>
+                <Pressable
+                  disabled={!online}
+                  onPress={() => (modelOpen === "model" ? setModelOpen(false) : openModelPicker("model"))}
+                  accessibilityRole="button"
+                  accessibilityLabel={(modelOverride || agent.model) ? `当前模型 ${modelOverride || agent.model}，点击切换` : "切换模型"}
+                  style={({ pressed }) => ({
+                    height: 36,
+                    maxWidth: 145,
+                    paddingHorizontal: 10,
+                    borderRadius: 18,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 4,
+                    backgroundColor: pressed ? p.surface3 : modelOpen === "model" ? p.accentContainer : p.surface2,
+                    borderWidth: 1,
+                    borderColor: modelOpen === "model" ? p.primary : p.divider,
+                    opacity: online ? 1 : 0.45,
+                  })}
+                >
+                  <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
+                  <Text numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 12, color: modelOpen === "model" ? p.accentText : p.ink, flexShrink: 1 }}>
+                    {(modelOverride || agent.model) ? (modelOverride || agent.model)!.split("/").pop() : "模型"}
+                  </Text>
+                  <MaterialCommunityIcons name={modelOpen === "model" ? "chevron-up" : "chevron-down"} size={13} color={modelOpen === "model" ? p.accentText : p.muted} />
+                </Pressable>
+                {(modelData?.thinkingLevels?.length ?? 0) > 0 ? (
+                  <Pressable
+                    disabled={!online}
+                    onPress={() => (modelOpen === "thinking" ? setModelOpen(false) : openModelPicker("thinking"))}
+                    accessibilityRole="button"
+                    accessibilityLabel="切换思考等级"
+                    style={({ pressed }) => ({
+                      height: 36,
+                      maxWidth: 96,
+                      paddingHorizontal: 9,
+                      borderRadius: 18,
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 4,
+                      backgroundColor: pressed ? p.surface3 : modelOpen === "thinking" ? p.accentContainer : p.surface2,
+                      borderWidth: 1,
+                      borderColor: modelOpen === "thinking" ? p.primary : p.divider,
+                      opacity: online ? 1 : 0.45,
+                    })}
+                  >
+                    <MaterialCommunityIcons name="brain" size={14} color={p.accentText} />
+                    <Text numberOfLines={1} style={{ fontFamily: fonts.bodySemi, fontSize: 11.5, color: modelOpen === "thinking" ? p.accentText : p.ink, flexShrink: 1 }}>
+                      {thinkingOverride || modelData?.currentThinking ? (thinkingOverride || modelData?.currentThinking) : "思考"}
+                    </Text>
+                  </Pressable>
+                ) : null}
+              </>
             ) : null}
             <View style={{ flex: 1 }} />
             {agent.status === "working" ? (

@@ -420,6 +420,11 @@ jobs:
       PRERELEASE: ${{ needs.meta.outputs.prerelease }}
       IMAGE: ${{ needs.image.outputs.image }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          path: repo-src
+          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           name: bundle
@@ -452,6 +457,21 @@ jobs:
               done
             fi
           fi
+      - name: Prepare release announcement
+        run: |
+          rm -f announcement.md
+          notes_file="repo-src/docs/releases/$TAG.md"
+          if [ -s "$notes_file" ]; then
+            cp "$notes_file" announcement.md
+          else
+            git -C repo-src tag -l --format='%(contents)' "$TAG" | sed '/^-----BEGIN PGP SIGNATURE-----$/,$d' > announcement.md
+          fi
+          bytes=$(wc -c < announcement.md | tr -d ' ')
+          if [ "${bytes:-0}" -lt 40 ]; then
+            echo "::error::Missing detailed release announcement in docs/releases/$TAG.md or annotated tag $TAG"
+            exit 1
+          fi
+          cp announcement.md dist/RELEASE-NOTES.md
       - run: |
           cd dist
           LC_ALL=C sha256sum -- * > SHA256SUMS
@@ -465,7 +485,9 @@ jobs:
           else
             mobile_line='- **Mobile clients**: Android (`.apk`), HarmonyOS NEXT (`.hap` unsigned)'
           fi
-          cat > notes.md <<EOF
+          cat announcement.md > notes.md
+          printf '\n\n---\n\n' >> notes.md
+          cat >> notes.md <<EOF
           Relay image: \`$IMAGE:$VERSION\` (also \`:latest\` for releases)
 
           - **Server**: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-relay.sh | sudo bash -s -- --domain pocket.example.com\`
@@ -478,6 +500,7 @@ jobs:
           [ "$PRERELEASE" = true ] && flags+=(--prerelease)
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "Herdr Pocket $VERSION" --notes-file notes.md
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "Herdr Pocket $VERSION" --notes-file notes.md --generate-notes "${flags[@]}"

@@ -2,6 +2,7 @@ import { RELEASE_REPO, decideRegion, sourceLabel, sourcePrefixes, type RegionDec
 import {
   checkReleaseUpdate,
   downloadAndStageUpdate,
+  fetchVersionReleaseNotes,
   fetchVersionSums,
   isTauri,
   onUpdateProgress,
@@ -182,7 +183,7 @@ export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Pro
       ...(changedVersion ? { minimized: false, installPhase: "idle", progress: null, installError: null } : sameLatestReady ? {} : {}),
     });
     if (info.hasUpdate && !info.notes?.body) {
-      void fetchReleaseNotes().then((notes) => {
+      void fetchReleaseNotes(4000, info.latest).then((notes) => {
         if (!notes) return;
         updateStore.set((cur) => (cur.info && cur.info.latest === info.latest ? { ...cur, info: { ...cur.info, notes } } : cur));
       });
@@ -317,13 +318,34 @@ export interface ReleaseNotes {
   publishedAt: string;
 }
 
+function stripInstallFooter(body: string): string {
+  const cut = body.search(/\r?\n---\r?\n+Relay image:/);
+  return (cut > 0 ? body.slice(0, cut) : body).trim();
+}
+
 /**
- * Release notes exist only in the GitHub API, which mirrors don't carry and which is often slow
- * from mainland China: a short wait, then null (the UI links to the release page instead).
+ * Prefers the release's mirrored RELEASE-NOTES.md asset (fast in Mainland China without GitHub API),
+ * then falls back to GitHub Releases API when needed.
  */
-export async function fetchReleaseNotes(timeoutMs = 4000): Promise<ReleaseNotes | null> {
+export async function fetchReleaseNotes(timeoutMs = 4000, version?: string): Promise<ReleaseNotes | null> {
   const cached = updateStore.get().info?.notes;
   if (cached?.body) return cached;
+  const target = (version || updateStore.get().info?.latest || "").trim().replace(/^v/i, "");
+  if (target) {
+    try {
+      const { region, mirrors } = clientConfigStore.get().config.update;
+      const mirrorNotes = await fetchVersionReleaseNotes(target, { setting: region, mirrors: [...mirrors] });
+      if (mirrorNotes) {
+        return {
+          body: stripInstallFooter(mirrorNotes),
+          url: updateStore.get().info?.pageUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${target}`,
+          publishedAt: "",
+        };
+      }
+    } catch {
+      // Fallback to GitHub API below
+    }
+  }
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), timeoutMs);
   try {
@@ -333,7 +355,8 @@ export async function fetchReleaseNotes(timeoutMs = 4000): Promise<ReleaseNotes 
     });
     if (!res.ok) return null;
     const j = (await res.json()) as { body?: string; html_url?: string; published_at?: string };
-    return j.body ? { body: j.body, url: j.html_url ?? "", publishedAt: j.published_at ?? "" } : null;
+    const cleanBody = j.body ? stripInstallFooter(j.body) : "";
+    return cleanBody ? { body: cleanBody, url: j.html_url ?? "", publishedAt: j.published_at ?? "" } : null;
   } catch {
     return null;
   } finally {

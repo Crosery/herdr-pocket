@@ -146,7 +146,7 @@ function parseDelimitedRows(raw: string, delimiter: string, maxRows = 500): { ro
 function fileError(e: unknown): string {
   const err = e as RelayError;
   if (err?.code === "unsupported") return "这台电脑的 herdr-pocket 版本太旧，还不能看文件：在那台电脑上运行 herdr-pocket update。";
-  if (err?.code === "forbidden") return "这个文件可能含有密钥（如 .env、私钥），为了安全不能查看。";
+  if (err?.code === "forbidden") return err.message || "这个文件可能含有密钥（如 .env、私钥），为了安全不能查看。";
   if (err?.code === "not_found") return "找不到了：可能已被删除或改名，刷新文件树再试。";
   if (err?.code === "bad_request") return err.message || "这个路径不能这样打开。";
   if (err?.code === "offline" || err?.code === "timeout") return `${err.message}：那台电脑可能离线了。`;

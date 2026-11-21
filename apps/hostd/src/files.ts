@@ -21,7 +21,7 @@ export class FilesError extends Error {
 
 /** Names of files and folders that hold keys or credentials: listed, never read or opened. */
 const PRIVATE_NAME =
-  /^(\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.password-store|\.netrc|\.pgpass|\.git-credentials|\.npmrc|\.pypirc|\.env(\.(?!example$|sample$|template$|dist$).+)?|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|.+\.(pem|key|p12|pfx|keystore|jks|kdbx))$/i;
+  /^(\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.password-store|\.netrc|\.pgpass|\.git-credentials|\.npmrc|\.pypirc|keychains|\.env(\.(?!example$|sample$|template$|dist$).+)?|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|.+\.(pem|key|p12|pfx|keystore|jks|kdbx))$/i;
 
 const IMAGE_MIME: Record<string, string> = {
   png: "image/png",

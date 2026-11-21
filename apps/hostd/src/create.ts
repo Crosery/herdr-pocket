@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { HERDR_COMMANDS, type HerdrCommand, type LaunchOption, type SpaceInfo } from "@herdr-pocket/protocol";
-import type { AppNames } from "./hc.ts";
+import type { AppNames, HcTerminal } from "./hc.ts";
 import { IS_WINDOWS, onPath, programName, windowsBins } from "./platform.ts";
 import { base, run } from "./util.ts";
 
@@ -422,6 +422,146 @@ export class HerdrApp {
   /** Runs one checked command (see `herdrCommandArgs`) and returns what the app answered. */
   async command(command: HerdrCommand, args: Record<string, unknown>): Promise<unknown> {
     return parseDo(await doCommand(this.bin, command, args));
+  }
+
+  /**
+   * Closes a space and ends its terminals (matching `herdr-app`'s `space.close`):
+   * uses `herdr-app do space.close` when open, falls back to mutating the `herdr-app`
+   * doc via `hc` when closed, and cleans up standalone orphan `hc` / `herdr` terminals.
+   * Never deletes any folders or files on disk.
+   */
+  async deleteSpace(
+    opts: { spaceId?: string; spaceName?: string },
+    hc: {
+      terminals: ReadonlyMap<string, HcTerminal>;
+      docGet?: (name: string) => Promise<{ value: unknown; version: number } | null>;
+      docSet?: (name: string, value: unknown, version: number) => Promise<number | null>;
+      kill: (address: string) => Promise<void>;
+      label?: (address: string, labels: Record<string, string>) => Promise<void>;
+    },
+    deps: {
+      names?: AppNames;
+      herdr?: {
+        agents: Array<{ workspace_id?: string }>;
+        call: (method: string, params: unknown) => Promise<unknown>;
+      };
+    } = {},
+  ): Promise<{ closedTerminals: number }> {
+    const reqId = opts.spaceId?.trim() || "";
+    const reqName = opts.spaceName?.trim() || "";
+    if (!reqId && !reqName) throw new Error("需要提供 spaceId 或 spaceName");
+
+    let targetId = reqId;
+    if (!targetId && reqName) {
+      const listed = await this.spaces(hc.terminals).catch(() => this.spacesFromDocs(hc.terminals));
+      const matched = listed.find((s) => s.name === reqName);
+      if (matched) targetId = matched.id;
+    }
+
+    const doomed = new Set<string>();
+    for (const [addr, t] of hc.terminals.entries()) {
+      if (targetId && t.labels?.["herdr.space"] === targetId) {
+        doomed.add(addr);
+      } else if (!targetId && reqName) {
+        const spName = t.labels?.["herdr.space"]
+          ? deps.names?.spaces.get(t.labels["herdr.space"])
+          : t.labels?.where?.split(" / ")[0]?.trim();
+        if (spName === reqName) doomed.add(addr);
+      }
+    }
+
+    let closedByApp = false;
+    if (targetId) {
+      try {
+        await this.command("space.close", { id: targetId, confirmed: true });
+        closedByApp = true;
+      } catch (e) {
+        const msg = (e as Error).message || "";
+        if (!(e instanceof NoDesktopApp) && !/没有打开|no herdr window|no window|not running/i.test(msg)) {
+          throw e;
+        }
+      }
+    }
+
+    if (!closedByApp && hc.docGet && hc.docSet) {
+      const doc = await hc.docGet("herdr-app").catch(() => null);
+      const val = doc?.value && typeof doc.value === "object" && !Array.isArray(doc.value)
+        ? (doc.value as Record<string, unknown>)
+        : null;
+      const list = Array.isArray(val?.spaces) ? (val!.spaces as Array<Record<string, unknown>>) : null;
+      if (val && list) {
+        const idx = list.findIndex((s) => {
+          if (!s || s.machine) return false;
+          if (targetId) return s.id === targetId;
+          return s.name === reqName;
+        });
+        if (idx >= 0) {
+          const removed = list[idx]!;
+          if (!targetId && typeof removed.id === "string") targetId = removed.id;
+          const tabs = Array.isArray(removed.tabs) ? removed.tabs : [];
+          for (const tab of tabs) {
+            if (!tab || typeof tab !== "object") continue;
+            const tRec = tab as Record<string, unknown>;
+            for (const id of collectTerminalIdsFromRoot(tRec.root)) doomed.add(id);
+            if (Array.isArray(tRec.terminals)) {
+              for (const x of tRec.terminals) {
+                const tid = typeof (x as any)?.terminal === "string" ? (x as any).terminal : (x as any)?.id;
+                if (typeof tid === "string" && tid.trim()) doomed.add(tid.trim());
+              }
+            }
+          }
+          if (targetId) {
+            for (const [addr, t] of hc.terminals.entries()) {
+              if (t.labels?.["herdr.space"] === targetId) doomed.add(addr);
+            }
+          }
+          const remaining = list.filter((_, i) => i !== idx);
+          const nextVal: Record<string, unknown> = { ...val, spaces: remaining };
+          if (typeof val.activeSpaceId === "string" && val.activeSpaceId === removed.id) {
+            const fallbackId = remaining.find((s) => s && !s.machine && typeof s.id === "string")?.id;
+            nextVal.activeSpaceId = typeof fallbackId === "string" ? fallbackId : null;
+          }
+          await hc.docSet("herdr-app", nextVal, doc!.version);
+        }
+      }
+    }
+
+    // Collect un-kept child sub-agents recursively (matching Herdr App window.rs)
+    let added = true;
+    while (added) {
+      added = false;
+      for (const [addr, t] of hc.terminals.entries()) {
+        if (doomed.has(addr)) continue;
+        if (t.parent && doomed.has(t.parent) && !t.labels?.["herdr.space"]) {
+          doomed.add(addr);
+          added = true;
+        }
+      }
+    }
+
+    let closedTerminals = doomed.size;
+    if (doomed.size > 0) {
+      await Promise.all(
+        [...doomed].map(async (addr) => {
+          // Clear space/tab labels first so Herdr.app reconcile() cannot resurrect the deleted space
+          if (hc.label) {
+            await hc.label(addr, { "herdr.space": "", "herdr.tab": "", where: "" }).catch(() => {});
+          }
+          await hc.kill(addr).catch(() => {});
+        }),
+      );
+    }
+
+    if (!closedByApp && !targetId && reqName && deps.herdr) {
+      const hasTuiWs = deps.herdr.agents.some((a) => a.workspace_id === reqName);
+      if (hasTuiWs) {
+        const count = deps.herdr.agents.filter((a) => a.workspace_id === reqName).length;
+        await deps.herdr.call("workspace.close", { workspace_id: reqName, close_group: true }).catch(() => {});
+        closedTerminals += count;
+      }
+    }
+
+    return { closedTerminals };
   }
 }
 

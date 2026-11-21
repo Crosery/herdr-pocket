@@ -16,14 +16,26 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function briefReleaseText(raw: string | undefined): string {
-  if (!raw) return "";
-  const lines = raw
-    .split(/\r?\n/)
-    .map((l) => l.replace(/^#+\s*/, "").replace(/^[-*]\s+/, "• ").trim())
-    .filter(Boolean);
-  const text = lines.slice(0, 3).join("  ");
-  return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+function extractReleaseHighlights(raw: string | undefined): string[] {
+  if (!raw) return [];
+  const items: string[] = [];
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line === "---" || line.startsWith("#")) continue;
+    if (/^(?:Relay image:|[-*]\s*\*\*(?:Server|Computer daemon|Mobile clients|Desktop clients|Update)\*\*:)/.test(line)) {
+      break;
+    }
+    const cleaned = line
+      .replace(/^[-*]\s+/, "")
+      .replace(/^\d+\.\s+/, "")
+      .replace(/\*\*(.+?)\*\*/g, "$1")
+      .replace(/`([^`]+)`/g, "$1")
+      .trim();
+    if (!cleaned) continue;
+    items.push(cleaned);
+    if (items.length >= 5) break;
+  }
+  return items;
 }
 
 /**
@@ -68,7 +80,7 @@ export function UpdatePrompt() {
     phase === "staging" ||
     phase === "restarting";
   const pct = st.progress?.percent ?? null;
-  const summary = briefReleaseText(info.notes?.body);
+  const highlights = extractReleaseHighlights(info.notes?.body);
 
   let statusLine = `来源：${info.source || "GitHub"}`;
   if (phase === "downloading") {
@@ -122,9 +134,15 @@ export function UpdatePrompt() {
         ) : null}
       </div>
 
-      {summary && phase === "idle" ? (
+      {highlights.length > 0 && phase === "idle" ? (
         <div className="update-toast-notes">
-          <div className="update-toast-notes-clamp">{summary}</div>
+          <ul className="update-toast-notes-list">
+            {highlights.map((line, i) => (
+              <li key={i} className="update-toast-note-line">
+                {line}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 

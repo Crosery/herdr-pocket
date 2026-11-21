@@ -262,19 +262,22 @@ fn source_cache_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// What `update_fetch_sums` may fetch: the latest or tagged release's SHA256SUMS on github.com,
-/// directly or through a mirror prefix (https, or plain http on this machine).
+/// What `update_fetch_sums` may fetch: the latest or tagged release's SHA256SUMS or RELEASE-NOTES.md
+/// on github.com, directly or through a mirror prefix (https, or plain http on this machine).
 fn is_sums_url(url: &str) -> bool {
-    const LATEST_SUFFIX: &str = "/releases/latest/download/SHA256SUMS";
+    const LATEST_SUFFIXES: [&str; 2] = [
+        "/releases/latest/download/SHA256SUMS",
+        "/releases/latest/download/RELEASE-NOTES.md",
+    ];
     const TAGGED_MARKER: &str = "/releases/download/v";
-    const TAGGED_SUFFIX: &str = "/SHA256SUMS";
+    const TAGGED_SUFFIXES: [&str; 2] = ["/SHA256SUMS", "/RELEASE-NOTES.md"];
     let Ok(u) = url::Url::parse(url) else {
         return false;
     };
     let local = matches!(u.host_str(), Some("localhost" | "127.0.0.1"));
     let scheme_ok = u.scheme() == "https" || (u.scheme() == "http" && local);
-    let path_ok = url.ends_with(LATEST_SUFFIX)
-        || (url.contains(TAGGED_MARKER) && url.ends_with(TAGGED_SUFFIX));
+    let path_ok = LATEST_SUFFIXES.iter().any(|s| url.ends_with(s))
+        || (url.contains(TAGGED_MARKER) && TAGGED_SUFFIXES.iter().any(|s| url.ends_with(s)));
     scheme_ok
         && path_ok
         && url.contains("https://github.com/")
@@ -1136,10 +1139,16 @@ mod tests {
     fn only_the_release_listing_is_fetched() {
         let gh = "https://github.com/owner/repo/releases/latest/download/SHA256SUMS";
         let tagged = "https://github.com/owner/repo/releases/download/v0.2.4/SHA256SUMS";
+        let notes_latest = "https://github.com/owner/repo/releases/latest/download/RELEASE-NOTES.md";
+        let notes_tagged = "https://github.com/owner/repo/releases/download/v0.2.8/RELEASE-NOTES.md";
         assert!(is_sums_url(gh));
         assert!(is_sums_url(tagged));
+        assert!(is_sums_url(notes_latest));
+        assert!(is_sums_url(notes_tagged));
         assert!(is_sums_url(&format!("https://mirror.example.com/{gh}")));
         assert!(is_sums_url(&format!("https://mirror.example.com/{tagged}")));
+        assert!(is_sums_url(&format!("https://mirror.example.com/{notes_latest}")));
+        assert!(is_sums_url(&format!("https://mirror.example.com/{notes_tagged}")));
         assert!(is_sums_url(&format!("http://localhost:8080/{gh}")));
         assert!(
             !is_sums_url(&format!("http://mirror.example.com/{gh}")),

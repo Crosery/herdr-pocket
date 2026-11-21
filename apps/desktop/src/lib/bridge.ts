@@ -611,6 +611,38 @@ export async function fetchVersionSums(
 }
 
 /**
+ * Fetches RELEASE-NOTES.md for a specific version through the fastest release source
+ * (including Mainland China mirrors, avoiding GitHub API rate/network blocks).
+ */
+export async function fetchVersionReleaseNotes(
+  version: string,
+  opts?: UpdateCheckOptions,
+): Promise<string | null> {
+  const clean = version.trim().replace(/^v/i, "");
+  if (!clean) return null;
+  const { decision, mirrors } = await updateRegion(opts);
+  const base = sourcePrefixes(decision.region, mirrors);
+  const cached = cachedWinner(await readSourceCache(), decision.region, base);
+  const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${clean}/RELEASE-NOTES.md`;
+  for (const src of withWinnerFirst(base, cached)) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 3000);
+    try {
+      const text = await fetchListing(sourceUrl(src, rawUrl), ctl.signal, 3000);
+      const trimmed = text.trim();
+      if (trimmed && !/^\s*<(?:!doctype|html)\b/i.test(trimmed)) {
+        return trimmed;
+      }
+    } catch {
+      // Try next mirror or GitHub source
+    } finally {
+      clearTimeout(t);
+    }
+  }
+  return null;
+}
+
+/**
  * The newest release and where to download it. Region: HERDR_POCKET_MIRROR, then
  * `update.region`, then the time zone. A remembered winner (24 h, shared with the CLI and
  * daemon via sources.json) is asked first unless `forceRace` is set; GitHub Releases API
