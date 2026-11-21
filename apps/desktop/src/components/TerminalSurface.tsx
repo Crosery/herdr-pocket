@@ -6,7 +6,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
-import { copyToClipboard } from "../lib/bridge";
+import { copyToClipboard, detectPlatform } from "../lib/bridge";
 import { setConfig, useClientConfig } from "../lib/config";
 import {
   endWorkspaceDrag,
@@ -37,10 +37,13 @@ import {
   collectVirtualSpriteBlocks,
   deleteKittyVirtualPlacements,
   encodeKittyKey,
+  encodeRgbaBmpV4,
   lookupKittyVirtualPlacement,
   parseKittyGfxCommand,
   parseOsc66,
   parsePngDimensions,
+  parsePocketMemPayload,
+  pocketTermImageUrl,
   registerKittyVirtualPlacement,
   shellQuotePath,
   shouldCreateCursorPlacement,
@@ -76,7 +79,17 @@ interface KittyPlacement {
   cols: number;
   rows: number;
   zIndex: number;
+  explicitCols?: number;
+  explicitRows?: number;
+  cropX?: number;
+  cropY?: number;
+  cropW?: number;
+  cropH?: number;
+  cellOffsetX?: number;
+  cellOffsetY?: number;
 }
+
+const IS_WINDOWS = detectPlatform() === "windows";
 
 interface Osc66Run {
   key: string;
@@ -137,6 +150,12 @@ async function decompressZlibIfNeeded(bytes: Uint8Array, compressed?: "z"): Prom
   }
 }
 
+function buildBmpBlobUrl(width: number, height: number, bytes: Uint8Array, format: 24 | 32): string | null {
+  const bmp = encodeRgbaBmpV4(width, height, bytes, format);
+  if (!bmp) return null;
+  return URL.createObjectURL(new Blob([bmp.buffer as ArrayBuffer], { type: "image/bmp" }));
+}
+
 async function decodeKittyAsset(cmd: KittyGfxCommand, rawBytes: Uint8Array, id: number): Promise<KittyImageAsset | null> {
   const bytes = await decompressZlibIfNeeded(rawBytes, cmd.compression);
   if (!bytes.length) return null;
@@ -145,6 +164,10 @@ async function decodeKittyAsset(cmd: KittyGfxCommand, rawBytes: Uint8Array, id: 
     const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
     const blob = new Blob([copy], { type: "image/png" });
     const url = URL.createObjectURL(blob);
+    const pngDims = parsePngDimensions(bytes);
+    if (pngDims) {
+      return { id, url, width: pngDims.width, height: pngDims.height };
+    }
     const dims = await new Promise<{ w: number; h: number }>((resolve) => {
       const img = new Image();
       img.onload = () => resolve({ w: img.naturalWidth || 64, h: img.naturalHeight || 64 });
@@ -156,28 +179,7 @@ async function decodeKittyAsset(cmd: KittyGfxCommand, rawBytes: Uint8Array, id: 
 
   const w = cmd.width ?? 0;
   const h = cmd.height ?? 0;
-  if (w <= 0 || h <= 0 || w * h > 4096 * 4096) return null;
-  const rgba = new Uint8ClampedArray(w * h * 4);
-  if (cmd.format === 32) {
-    rgba.set(bytes.subarray(0, rgba.length));
-  } else {
-    // f=24 (RGB -> RGBA)
-    for (let src = 0, dst = 0; dst < rgba.length && src + 2 < bytes.length; src += 3, dst += 4) {
-      rgba[dst] = bytes[src]!;
-      rgba[dst + 1] = bytes[src + 1]!;
-      rgba[dst + 2] = bytes[src + 2]!;
-      rgba[dst + 3] = 255;
-    }
-  }
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return null;
-  ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
-  const url = await new Promise<string | null>((resolve) => {
-    canvas.toBlob((blob) => resolve(blob ? URL.createObjectURL(blob) : null), "image/png");
-  });
+  const url = buildBmpBlobUrl(w, h, bytes, cmd.format === 24 ? 24 : 32);
   return url ? { id, url, width: w, height: h } : null;
 }
 
@@ -252,6 +254,9 @@ export function TerminalSurface({
   const kittyPlacementsRef = useRef<KittyPlacement[]>([]);
   const kittyVirtualDimsRef = useRef<Map<string, KittyVirtualPlacementDims>>(new Map());
   const kittyDimsByIdRef = useRef<Map<number, { cols: number; rows: number }>>(new Map());
+  const overlayNodesRef = useRef<Map<string, { kind: "img" | "clip" | "osc66"; el: HTMLElement; img?: HTMLImageElement; sig: string }>>(new Map());
+  const lastResizeSigRef = useRef("");
+  const placementSeqRef = useRef(0);
   const [dragOver, setDragOver] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const dragDepthRef = useRef(0);
@@ -366,7 +371,7 @@ export function TerminalSurface({
   );
 
   const currentDisplay = useCallback(
-    (_term: XTerm): TerminalDisplay => {
+    (_term: XTerm): TerminalDisplay & { cell: [number, number] } => {
       const [cw, ch] = cellSizeRef.current;
       const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
       return {
@@ -388,6 +393,9 @@ export function TerminalSurface({
       refreshCachedCellSize(term);
       const display = currentDisplay(term);
       const localConnId = localConnRef.current;
+      const sig = `${localConnId ?? "relay"}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}`;
+      if (lastResizeSigRef.current === sig) return;
+      lastResizeSigRef.current = sig;
       if (localConnId) {
         void native.localTermResize(localConnId, term.cols, term.rows, display as unknown as Record<string, unknown>).catch(() => {});
         return;
@@ -414,6 +422,7 @@ export function TerminalSurface({
       kittyAssetsRef.current.size === 0 &&
       osc66Ref.current.length === 0
     ) {
+      if (overlayNodesRef.current.size > 0) overlayNodesRef.current.clear();
       if (overlay.childElementCount > 0) overlay.replaceChildren();
       return;
     }
@@ -425,6 +434,7 @@ export function TerminalSurface({
 
     const [cellW, cellH] = measureCellCss(hostEl, term);
     cellSizeRef.current = [cellW, cellH];
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
     const buf = term.buffer.active;
     const curAlt = buf === term.buffer.alternate;
     const topY = buf.viewportY;
@@ -436,37 +446,183 @@ export function TerminalSurface({
       osc66Ref.current = osc66Ref.current.filter((r) => r.alt || r.bufferY >= Math.max(0, maxBufLines - 3000));
     }
 
-    const frag = document.createDocumentFragment();
+    const nodeMap = overlayNodesRef.current;
+    const seenKeys = new Set<string>();
+    const orderedEls: HTMLElement[] = [];
 
-    for (const p of kittyPlacementsRef.current) {
-      if (p.alt !== curAlt || p.bufferY + p.rows <= topY || p.bufferY >= botY) continue;
-      const asset = kittyAssetsRef.current.get(p.imageId);
-      if (!asset) continue;
+    const createKittyImg = (): HTMLImageElement => {
       const img = document.createElement("img");
       img.className = "tp-kitty-img";
-      img.src = asset.url;
       img.alt = "";
-      img.style.left = `${Math.round(p.col * cellW)}px`;
-      img.style.top = `${Math.round((p.bufferY - topY) * cellH)}px`;
-      img.style.width = `${Math.max(cellW, Math.round(p.cols * cellW))}px`;
-      img.style.height = `${Math.max(cellH, Math.round(p.rows * cellH))}px`;
-      img.style.zIndex = String(Math.max(1, 5 + p.zIndex));
+      img.decoding = "sync";
+      img.loading = "eager";
+      return img;
+    };
+
+    const bindMeasure = (img: HTMLImageElement, asset: KittyImageAsset, placement?: KittyPlacement) => {
       if (asset.needsMeasure) {
         img.onload = () => {
           asset.needsMeasure = false;
           if (img.naturalWidth > 0 && img.naturalHeight > 0) {
             asset.width = img.naturalWidth;
             asset.height = img.naturalHeight;
-            const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
-            const cellPxW = Math.max(1, cellW * dpr);
-            const cellPxH = Math.max(1, cellH * dpr);
-            p.cols = Math.max(1, Math.min(term.cols, Math.ceil(asset.width / cellPxW)));
-            p.rows = Math.max(1, Math.min(term.rows, Math.ceil(asset.height / cellPxH)));
+            if (placement) {
+              const cellPxW = Math.max(1, cellW * dpr);
+              const cellPxH = Math.max(1, cellH * dpr);
+              if (placement.explicitCols === undefined) {
+                placement.cols = Math.max(1, Math.min(term.cols, Math.ceil(asset.width / cellPxW)));
+              }
+              if (placement.explicitRows === undefined) {
+                placement.rows = Math.max(1, Math.min(term.rows, Math.ceil(asset.height / cellPxH)));
+              }
+            }
             requestAnimationFrame(paintOverlays);
           }
         };
+      } else if (img.onload) {
+        img.onload = null;
       }
-      frag.appendChild(img);
+    };
+
+    const upsertImgNode = (
+      key: string,
+      asset: KittyImageAsset,
+      left: number,
+      top: number,
+      width: number,
+      height: number,
+      zIndex: string,
+      placement?: KittyPlacement,
+    ) => {
+      const sig = `img|${asset.url}|${left}|${top}|${width}|${height}|${zIndex}|${asset.needsMeasure ? 1 : 0}`;
+      const existing = nodeMap.get(key);
+      if (existing && existing.kind === "img" && existing.img) {
+        if (existing.sig !== sig) {
+          if (existing.img.getAttribute("src") !== asset.url) existing.img.src = asset.url;
+          existing.img.style.left = `${left}px`;
+          existing.img.style.top = `${top}px`;
+          existing.img.style.width = `${width}px`;
+          existing.img.style.height = `${height}px`;
+          existing.img.style.zIndex = zIndex;
+          bindMeasure(existing.img, asset, placement);
+          existing.sig = sig;
+        }
+        seenKeys.add(key);
+        orderedEls.push(existing.el);
+        return;
+      }
+      const img = createKittyImg();
+      img.src = asset.url;
+      img.style.left = `${left}px`;
+      img.style.top = `${top}px`;
+      img.style.width = `${width}px`;
+      img.style.height = `${height}px`;
+      img.style.zIndex = zIndex;
+      bindMeasure(img, asset, placement);
+      nodeMap.set(key, { kind: "img", el: img, img, sig });
+      seenKeys.add(key);
+      orderedEls.push(img);
+    };
+
+    const upsertClipNode = (
+      key: string,
+      asset: KittyImageAsset,
+      clipLeft: number,
+      clipTop: number,
+      clipWidth: number,
+      clipHeight: number,
+      zIndex: string,
+      imgLeft: number,
+      imgTop: number,
+      imgWidth: number,
+      imgHeight: number,
+      placement?: KittyPlacement,
+    ) => {
+      const sig = `clip|${asset.url}|${clipLeft}|${clipTop}|${clipWidth}|${clipHeight}|${zIndex}|${imgLeft}|${imgTop}|${imgWidth}|${imgHeight}|${asset.needsMeasure ? 1 : 0}`;
+      const existing = nodeMap.get(key);
+      if (existing && existing.kind === "clip" && existing.img) {
+        if (existing.sig !== sig) {
+          existing.el.style.left = `${clipLeft}px`;
+          existing.el.style.top = `${clipTop}px`;
+          existing.el.style.width = `${clipWidth}px`;
+          existing.el.style.height = `${clipHeight}px`;
+          existing.el.style.zIndex = zIndex;
+          if (existing.img.getAttribute("src") !== asset.url) existing.img.src = asset.url;
+          existing.img.style.left = `${imgLeft}px`;
+          existing.img.style.top = `${imgTop}px`;
+          existing.img.style.width = `${imgWidth}px`;
+          existing.img.style.height = `${imgHeight}px`;
+          bindMeasure(existing.img, asset, placement);
+          existing.sig = sig;
+        }
+        seenKeys.add(key);
+        orderedEls.push(existing.el);
+        return;
+      }
+      const clip = document.createElement("div");
+      clip.className = "tp-kitty-clip";
+      clip.style.left = `${clipLeft}px`;
+      clip.style.top = `${clipTop}px`;
+      clip.style.width = `${clipWidth}px`;
+      clip.style.height = `${clipHeight}px`;
+      clip.style.zIndex = zIndex;
+      const img = createKittyImg();
+      img.src = asset.url;
+      img.style.left = `${imgLeft}px`;
+      img.style.top = `${imgTop}px`;
+      img.style.width = `${imgWidth}px`;
+      img.style.height = `${imgHeight}px`;
+      bindMeasure(img, asset, placement);
+      clip.appendChild(img);
+      nodeMap.set(key, { kind: "clip", el: clip, img, sig });
+      seenKeys.add(key);
+      orderedEls.push(clip);
+    };
+
+    for (const p of kittyPlacementsRef.current) {
+      if (p.alt !== curAlt || p.bufferY + p.rows <= topY || p.bufferY >= botY) continue;
+      const asset = kittyAssetsRef.current.get(p.imageId);
+      if (!asset) continue;
+      const key = `kp:${p.key}`;
+      const left = Math.round(p.col * cellW + (p.cellOffsetX ?? 0) / dpr);
+      const top = Math.round((p.bufferY - topY) * cellH + (p.cellOffsetY ?? 0) / dpr);
+      const boxW = Math.max(cellW, Math.round(p.cols * cellW));
+      const boxH = Math.max(cellH, Math.round(p.rows * cellH));
+      const zIndex = String(Math.max(1, 5 + p.zIndex));
+
+      const hasExplicitCrop =
+        !asset.needsMeasure &&
+        (p.cropX !== undefined || p.cropY !== undefined || p.cropW !== undefined || p.cropH !== undefined);
+      if (hasExplicitCrop && asset.width > 0 && asset.height > 0) {
+        const sx = Math.max(0, Math.min(asset.width - 1, p.cropX ?? 0));
+        const sy = Math.max(0, Math.min(asset.height - 1, p.cropY ?? 0));
+        const maxSw = Math.max(1, asset.width - sx);
+        const maxSh = Math.max(1, asset.height - sy);
+        const sw = Math.max(1, Math.min(maxSw, p.cropW && p.cropW > 0 ? p.cropW : maxSw));
+        const sh = Math.max(1, Math.min(maxSh, p.cropH && p.cropH > 0 ? p.cropH : maxSh));
+        if (sx > 0 || sy > 0 || sw < asset.width || sh < asset.height) {
+          const scale = Math.min(boxW / sw, boxH / sh);
+          const clipW = Math.min(boxW, Math.max(1, Math.round(sw * scale)));
+          const clipH = Math.min(boxH, Math.max(1, Math.round(sh * scale)));
+          upsertClipNode(
+            key,
+            asset,
+            left,
+            top,
+            clipW,
+            clipH,
+            zIndex,
+            -Math.round(sx * scale),
+            -Math.round(sy * scale),
+            Math.max(1, Math.round(asset.width * scale)),
+            Math.max(1, Math.round(asset.height * scale)),
+            p,
+          );
+          continue;
+        }
+      }
+
+      upsertImgNode(key, asset, left, top, boxW, boxH, zIndex, p);
     }
 
     if (kittyAssetsRef.current.size > 0 || kittyVirtualDimsRef.current.size > 0) {
@@ -518,6 +674,7 @@ export function TerminalSurface({
         return true;
       });
 
+      const kvOcc = new Map<string, number>();
       for (const block of virtualBlocks) {
         const asset = kittyAssetsRef.current.get(block.imageId);
         if (!asset) continue;
@@ -527,27 +684,17 @@ export function TerminalSurface({
         const fullRows = Math.max(vdims?.rows ?? fallbackDims?.rows ?? 0, block.startTileRow + block.rows, 1);
         const zIndex = String(Math.max(1, 5 + (vdims?.zIndex ?? 0)));
 
+        const baseKey = `kv:${block.imageId}:${block.placementId}:${block.startX}:${block.startTileCol}:${block.startAbsY - block.startTileRow}`;
+        const occ = kvOcc.get(baseKey) ?? 0;
+        kvOcc.set(baseKey, occ + 1);
+        const key = `${baseKey}:${occ}`;
+
         const visLeft = Math.round(block.startX * cellW);
         const visTop = Math.round((block.startAbsY - topY) * cellH);
         const visWidth = Math.max(1, Math.round(block.cols * cellW));
         const visHeight = Math.max(1, Math.round(block.rows * cellH));
         const fullWidth = Math.max(1, Math.round(fullCols * cellW));
         const fullHeight = Math.max(1, Math.round(fullRows * cellH));
-
-        const img = document.createElement("img");
-        img.className = "tp-kitty-img";
-        img.src = asset.url;
-        img.alt = "";
-        if (asset.needsMeasure) {
-          img.onload = () => {
-            asset.needsMeasure = false;
-            if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-              asset.width = img.naturalWidth;
-              asset.height = img.naturalHeight;
-              requestAnimationFrame(paintOverlays);
-            }
-          };
-        }
 
         const isCropped =
           block.startTileCol > 0 ||
@@ -556,50 +703,100 @@ export function TerminalSurface({
           block.rows < fullRows;
 
         if (isCropped) {
-          const clip = document.createElement("div");
-          clip.className = "tp-kitty-clip";
-          clip.style.left = `${visLeft}px`;
-          clip.style.top = `${visTop}px`;
-          clip.style.width = `${visWidth}px`;
-          clip.style.height = `${visHeight}px`;
-          clip.style.zIndex = zIndex;
-          img.style.left = `${-Math.round(block.startTileCol * cellW)}px`;
-          img.style.top = `${-Math.round(block.startTileRow * cellH)}px`;
-          img.style.width = `${fullWidth}px`;
-          img.style.height = `${fullHeight}px`;
-          clip.appendChild(img);
-          frag.appendChild(clip);
+          upsertClipNode(
+            key,
+            asset,
+            visLeft,
+            visTop,
+            visWidth,
+            visHeight,
+            zIndex,
+            -Math.round(block.startTileCol * cellW),
+            -Math.round(block.startTileRow * cellH),
+            fullWidth,
+            fullHeight,
+          );
         } else {
-          img.style.left = `${visLeft}px`;
-          img.style.top = `${visTop}px`;
-          img.style.width = `${fullWidth}px`;
-          img.style.height = `${fullHeight}px`;
-          img.style.zIndex = zIndex;
-          frag.appendChild(img);
+          upsertImgNode(key, asset, visLeft, visTop, fullWidth, fullHeight, zIndex);
         }
       }
     }
 
     const fs = term.options.fontSize ?? 13;
     const ff = term.options.fontFamily ?? fontFamily;
+    const fw = String(term.options.fontWeight ?? 400);
     for (const r of osc66Ref.current) {
       if (r.alt !== curAlt || r.bufferY < topY || r.bufferY >= botY) continue;
+      const key = `o66:${r.key}`;
+      const left = Math.round(r.col * cellW);
+      const top = Math.round((r.bufferY - topY) * cellH);
+      const minW = Math.round(r.widthCells * cellW);
+      const h = Math.round(r.scale * cellH);
+      const fSize = Number((fs * r.scale * r.ratio).toFixed(2));
+      const sig = `o66|${r.text}|${left}|${top}|${minW}|${h}|${ff}|${fSize}|${fw}`;
+      const existing = nodeMap.get(key);
+      if (existing && existing.kind === "osc66") {
+        if (existing.sig !== sig) {
+          existing.el.textContent = r.text;
+          existing.el.style.left = `${left}px`;
+          existing.el.style.top = `${top}px`;
+          existing.el.style.minWidth = `${minW}px`;
+          existing.el.style.height = `${h}px`;
+          existing.el.style.fontFamily = ff;
+          existing.el.style.fontSize = `${fSize}px`;
+          existing.el.style.fontWeight = fw;
+          existing.sig = sig;
+        }
+        seenKeys.add(key);
+        orderedEls.push(existing.el);
+        continue;
+      }
       const span = document.createElement("div");
       span.className = "tp-osc66-run";
       span.textContent = r.text;
-      span.style.left = `${Math.round(r.col * cellW)}px`;
-      span.style.top = `${Math.round((r.bufferY - topY) * cellH)}px`;
-      span.style.minWidth = `${Math.round(r.widthCells * cellW)}px`;
-      span.style.height = `${Math.round(r.scale * cellH)}px`;
+      span.style.left = `${left}px`;
+      span.style.top = `${top}px`;
+      span.style.minWidth = `${minW}px`;
+      span.style.height = `${h}px`;
       span.style.fontFamily = ff;
-      span.style.fontSize = `${Number((fs * r.scale * r.ratio).toFixed(2))}px`;
-      span.style.fontWeight = String(term.options.fontWeight ?? 400);
+      span.style.fontSize = `${fSize}px`;
+      span.style.fontWeight = fw;
       span.style.color = TERM_FG;
       span.style.lineHeight = "1";
-      frag.appendChild(span);
+      nodeMap.set(key, { kind: "osc66", el: span, sig });
+      seenKeys.add(key);
+      orderedEls.push(span);
     }
 
-    overlay.replaceChildren(frag);
+    for (const [key, entry] of nodeMap) {
+      if (!seenKeys.has(key)) {
+        nodeMap.delete(key);
+        if (entry.el.parentElement === overlay) entry.el.remove();
+      }
+    }
+
+    const children = overlay.children;
+    let sameOrder = children.length === orderedEls.length;
+    if (sameOrder) {
+      for (let i = 0; i < orderedEls.length; i++) {
+        if (children[i] !== orderedEls[i]) {
+          sameOrder = false;
+          break;
+        }
+      }
+    }
+    if (!sameOrder) {
+      for (let i = 0; i < orderedEls.length; i++) {
+        const wanted = orderedEls[i]!;
+        const current = overlay.children[i] ?? null;
+        if (current !== wanted) {
+          overlay.insertBefore(wanted, current);
+        }
+      }
+      while (overlay.childElementCount > orderedEls.length) {
+        overlay.lastElementChild?.remove();
+      }
+    }
   }, [fontFamily]);
 
   // Keep font faces, texture atlas, and overlay coordinates synchronized with live font changes.
@@ -702,25 +899,41 @@ export function TerminalSurface({
     });
 
     let rafOverlay = 0;
+    let overlayMicroQueued = false;
+    const hasOverlayContent = () =>
+      kittyPlacementsRef.current.length > 0 ||
+      kittyVirtualDimsRef.current.size > 0 ||
+      kittyAssetsRef.current.size > 0 ||
+      osc66Ref.current.length > 0 ||
+      (overlayRef.current?.childElementCount ?? 0) > 0;
+
     const scheduleOverlay = () => {
-      if (
-        kittyPlacementsRef.current.length === 0 &&
-        kittyVirtualDimsRef.current.size === 0 &&
-        kittyAssetsRef.current.size === 0 &&
-        osc66Ref.current.length === 0 &&
-        (overlayRef.current?.childElementCount ?? 0) === 0
-      ) {
-        return;
-      }
-      if (rafOverlay) return;
+      if (!hasOverlayContent()) return;
+      if (rafOverlay || overlayMicroQueued) return;
       rafOverlay = requestAnimationFrame(() => {
         rafOverlay = 0;
+        if (alive && termRef.current === term) paintOverlays();
+      });
+    };
+
+    const flushOverlaySoon = () => {
+      if (!hasOverlayContent()) return;
+      if (overlayMicroQueued) return;
+      overlayMicroQueued = true;
+      queueMicrotask(() => {
+        overlayMicroQueued = false;
+        if (!alive || termRef.current !== term) return;
+        if (rafOverlay) {
+          cancelAnimationFrame(rafOverlay);
+          rafOverlay = 0;
+        }
         paintOverlays();
       });
     };
 
     const dispScroll = term.onScroll(scheduleOverlay);
     const dispRender = term.onRender(scheduleOverlay);
+    const dispWriteParsed = term.onWriteParsed(flushOverlaySoon);
     const dispBuf = term.buffer.onBufferChange(() => {
       if (!isAlt()) {
         osc66Ref.current = osc66Ref.current.filter((r) => !r.alt);
@@ -793,6 +1006,27 @@ export function TerminalSurface({
     const dispDecRst = term.parser.registerCsiHandler({ prefix: "?", final: "l" }, (params) => {
       for (let i = 0; i < params.length; i++) {
         if (numParam(params[i], -1) === 9001) kittyKeys.win32InputMode = false;
+      }
+      return false;
+    });
+    const dispCsiWindowOps = term.parser.registerCsiHandler({ final: "t" }, (params) => {
+      const p0 = numParam(params[0], -1);
+      const p1 = numParam(params[1], 0);
+      if (p0 === 14 && p1 !== 2) {
+        refreshCachedCellSize(term);
+        const [cw, ch] = currentDisplay(term).cell;
+        void sendAutoInput(`\x1b[4;${Math.max(1, term.rows * ch)};${Math.max(1, term.cols * cw)}t`);
+        return true;
+      }
+      if (p0 === 16) {
+        refreshCachedCellSize(term);
+        const [cw, ch] = currentDisplay(term).cell;
+        void sendAutoInput(`\x1b[6;${ch};${cw}t`);
+        return true;
+      }
+      if (p0 === 18) {
+        void sendAutoInput(`\x1b[8;${term.rows};${term.cols}t`);
+        return true;
       }
       return false;
     });
@@ -977,26 +1211,47 @@ export function TerminalSurface({
       cols: number,
       rows: number,
     ) => {
-      kittyPlacementsRef.current.push({
-        key: `kp-${asset.id}-${Date.now()}-${kittyPlacementsRef.current.length}`,
+      const placementId = cmd.placementId ?? 1;
+      const next: KittyPlacement = {
+        key: `kp-${asset.id}-${placementId}-${placementSeqRef.current++}`,
         alt: anchor.alt,
         imageId: asset.id,
-        placementId: cmd.placementId ?? 1,
+        placementId,
         bufferY: anchor.bufferY,
         col: anchor.col,
         cols,
         rows,
         zIndex: cmd.zIndex,
-      });
+        explicitCols: cmd.cols,
+        explicitRows: cmd.rows,
+        cropX: cmd.cropX,
+        cropY: cmd.cropY,
+        cropW: cmd.cropW,
+        cropH: cmd.cropH,
+        cellOffsetX: cmd.cellOffsetX,
+        cellOffsetY: cmd.cellOffsetY,
+      };
+      if (cmd.placementId !== undefined && cmd.placementId > 0) {
+        const idx = kittyPlacementsRef.current.findIndex(
+          (p) => p.alt === anchor.alt && p.imageId === asset.id && p.placementId === placementId,
+        );
+        if (idx >= 0) {
+          next.key = kittyPlacementsRef.current[idx]!.key;
+          kittyPlacementsRef.current[idx] = next;
+          flushOverlaySoon();
+          return;
+        }
+      }
+      kittyPlacementsRef.current.push(next);
       if (kittyPlacementsRef.current.length > 200) {
         kittyPlacementsRef.current.splice(0, kittyPlacementsRef.current.length - 200);
       }
-      scheduleOverlay();
+      flushOverlaySoon();
     };
 
     const storeKittyAsset = (imgId: number, asset: KittyImageAsset) => {
       const prev = kittyAssetsRef.current.get(imgId);
-      if (prev) revokeAssetUrl(prev.url);
+      if (prev && prev.url !== asset.url) revokeAssetUrl(prev.url);
       kittyAssetsRef.current.set(imgId, asset);
       if (kittyAssetsRef.current.size > 64) {
         const oldest = kittyAssetsRef.current.keys().next().value;
@@ -1029,6 +1284,18 @@ export function TerminalSurface({
           pxW = png.width;
           pxH = png.height;
         }
+      }
+      const cropSx = Math.max(0, cmd.cropX ?? 0);
+      const cropSy = Math.max(0, cmd.cropY ?? 0);
+      if (cmd.cropW && cmd.cropW > 0) {
+        pxW = pxW ? Math.min(cmd.cropW, Math.max(1, pxW - cropSx)) : cmd.cropW;
+      } else if (pxW && cropSx > 0) {
+        pxW = Math.max(1, pxW - cropSx);
+      }
+      if (cmd.cropH && cmd.cropH > 0) {
+        pxH = pxH ? Math.min(cmd.cropH, Math.max(1, pxH - cropSy)) : cmd.cropH;
+      } else if (pxH && cropSy > 0) {
+        pxH = Math.max(1, pxH - cropSy);
       }
       const colsKnown = cmd.cols !== undefined || Boolean(pxW);
       const rowsKnown = cmd.rows !== undefined || Boolean(pxH);
@@ -1078,6 +1345,12 @@ export function TerminalSurface({
             const d = rawD.toLowerCase();
             if (d === "a") {
               kittyPlacementsRef.current = [];
+              kittyVirtualDimsRef.current.clear();
+              if (rawD === "A") {
+                for (const a of kittyAssetsRef.current.values()) revokeAssetUrl(a.url);
+                kittyAssetsRef.current.clear();
+                kittyDimsByIdRef.current.clear();
+              }
             } else if (d === "i" && cmd.id !== undefined) {
               kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
                 (p) => p.imageId !== cmd.id || (cmd.placementId !== undefined && p.placementId !== cmd.placementId),
@@ -1093,13 +1366,42 @@ export function TerminalSurface({
               kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
                 (p) => !(p.imageId === cmd.id && p.placementId === cmd.placementId),
               );
+              deleteKittyVirtualPlacements(kittyVirtualDimsRef.current, cmd.id, cmd.placementId);
+              if (rawD === "P") {
+                const stillUsed = kittyPlacementsRef.current.some((p) => p.imageId === cmd.id);
+                if (!stillUsed) {
+                  const prev = kittyAssetsRef.current.get(cmd.id);
+                  if (prev) revokeAssetUrl(prev.url);
+                  kittyAssetsRef.current.delete(cmd.id);
+                  kittyDimsByIdRef.current.delete(cmd.id);
+                }
+              }
             } else if (d === "c") {
-              const cy = term.buffer.active.baseY + term.buffer.active.cursorY;
-              kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
-                (p) => cy < p.bufferY || cy >= p.bufferY + p.rows,
-              );
+              const buf = term.buffer.active;
+              const cx = buf.cursorX;
+              const cy = buf.baseY + buf.cursorY;
+              const removedIds = new Set<number>();
+              kittyPlacementsRef.current = kittyPlacementsRef.current.filter((p) => {
+                const hit =
+                  cy >= p.bufferY &&
+                  cy < p.bufferY + p.rows &&
+                  cx >= p.col &&
+                  cx < p.col + p.cols;
+                if (hit) removedIds.add(p.imageId);
+                return !hit;
+              });
+              if (rawD === "C") {
+                for (const id of removedIds) {
+                  if (!kittyPlacementsRef.current.some((p) => p.imageId === id)) {
+                    const prev = kittyAssetsRef.current.get(id);
+                    if (prev) revokeAssetUrl(prev.url);
+                    kittyAssetsRef.current.delete(id);
+                    kittyDimsByIdRef.current.delete(id);
+                  }
+                }
+              }
             }
-            scheduleOverlay();
+            flushOverlaySoon();
           });
           continue;
         }
@@ -1111,6 +1413,11 @@ export function TerminalSurface({
           const resolved = asset ? resolvePlacementCells(cmd, undefined, asset) : null;
           const cols = cmd.cols ?? resolved?.cols ?? known?.cols ?? 1;
           const rows = cmd.rows ?? resolved?.rows ?? known?.rows ?? 1;
+          const replyPlaceOk = () => {
+            if (cmd.quiet === 0 && cmd.id !== undefined) {
+              void sendAutoInput(`\x1b_Gi=${cmd.id};OK\x1b\\`);
+            }
+          };
           if (!shouldCreateCursorPlacement(cmd)) {
             const targetId = cmd.id;
             registerKittyVirtualPlacement(
@@ -1121,7 +1428,8 @@ export function TerminalSurface({
               rows,
               cmd.zIndex,
             );
-            scheduleOverlay();
+            flushOverlaySoon();
+            if (asset) replyPlaceOk();
             if (!asset && pendingAsset) {
               void pendingAsset.then((loaded) => {
                 if (!loaded || termRef.current !== term) return;
@@ -1134,7 +1442,8 @@ export function TerminalSurface({
                   cmd.rows ?? dims.rows ?? known?.rows ?? 1,
                   cmd.zIndex,
                 );
-                scheduleOverlay();
+                flushOverlaySoon();
+                replyPlaceOk();
               });
             }
             continue;
@@ -1163,7 +1472,9 @@ export function TerminalSurface({
           }
           if (asset) {
             term.write("", () => {
-              if (termRef.current === term) pushPlacement(asset, cmd, anchor, cols, rows);
+              if (termRef.current !== term) return;
+              pushPlacement(asset, cmd, anchor, cols, rows);
+              replyPlaceOk();
             });
           } else if (pendingAsset) {
             void pendingAsset.then((loaded) => {
@@ -1171,10 +1482,16 @@ export function TerminalSurface({
               const dims = resolvePlacementCells(cmd, undefined, loaded);
               const useCols = cmd.cols ?? dims.cols ?? known?.cols ?? 1;
               const useRows = cmd.rows ?? dims.rows ?? known?.rows ?? 1;
-              if (anchor.colReady && anchor.rowReady) pushPlacement(loaded, cmd, anchor, useCols, useRows);
-              else term.write("", () => {
-                if (termRef.current === term) pushPlacement(loaded, cmd, anchor, useCols, useRows);
-              });
+              if (anchor.colReady && anchor.rowReady) {
+                pushPlacement(loaded, cmd, anchor, useCols, useRows);
+                replyPlaceOk();
+              } else {
+                term.write("", () => {
+                  if (termRef.current !== term) return;
+                  pushPlacement(loaded, cmd, anchor, useCols, useRows);
+                  replyPlaceOk();
+                });
+              }
             });
           }
           continue;
@@ -1211,21 +1528,31 @@ export function TerminalSurface({
           continue;
         }
 
+        const memRef = !firstCmd.compression && fullB64 ? parsePocketMemPayload(fullB64) : null;
         const isFileMedium = firstCmd.medium === "f" || firstCmd.medium === "t";
         const canReadLocalFile =
           Boolean(localConnRef.current) ||
-          (native.available() && localHostIdStore.get() === agent.deviceId);
-        if ((firstCmd.medium !== "d" && !(isFileMedium && canReadLocalFile)) || !fullB64) continue;
+          (native.available() && (localHostIdStore.get() === null || localHostIdStore.get() === agent.deviceId));
+        if (!memRef && ((firstCmd.medium !== "d" && !(isFileMedium && canReadLocalFile)) || !fullB64)) continue;
+
         const imgId = firstCmd.id ?? nextImgId++;
-        let payloadBytes: Uint8Array;
-        try {
-          payloadBytes = decodeBase64Bytes(fullB64);
-        } catch {
-          continue;
+        let payloadBytes: Uint8Array | null = null;
+        if (!memRef) {
+          try {
+            payloadBytes = decodeBase64Bytes(fullB64);
+          } catch {
+            continue;
+          }
         }
 
+        const dimCmd =
+          memRef && memRef.width > 0 && memRef.height > 0 && (!firstCmd.width || !firstCmd.height)
+            ? { ...firstCmd, width: memRef.width, height: memRef.height }
+            : firstCmd;
         const syncDims =
-          firstCmd.medium === "d" ? resolvePlacementCells(firstCmd, payloadBytes) : resolvePlacementCells(firstCmd);
+          !memRef && firstCmd.medium === "d" && payloadBytes
+            ? resolvePlacementCells(dimCmd, payloadBytes)
+            : resolvePlacementCells(dimCmd);
         kittyDimsByIdRef.current.set(imgId, { cols: syncDims.cols, rows: syncDims.rows });
         if (firstCmd.action === "T" && firstCmd.unicodePlaceholder) {
           registerKittyVirtualPlacement(
@@ -1236,7 +1563,7 @@ export function TerminalSurface({
             syncDims.rows,
             firstCmd.zIndex,
           );
-          scheduleOverlay();
+          flushOverlaySoon();
         }
         const anchor: KittyAnchor = state
           ? state.anchor
@@ -1300,10 +1627,10 @@ export function TerminalSurface({
                   finalDims.rows,
                   firstCmd.zIndex,
                 );
-                scheduleOverlay();
+                flushOverlaySoon();
               }
             } else if (kittyVirtualDimsRef.current.size > 0) {
-              scheduleOverlay();
+              flushOverlaySoon();
             }
             if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
               void sendAutoInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
@@ -1313,27 +1640,52 @@ export function TerminalSurface({
           else term.write("", commit);
         };
 
-        // Fast synchronous path for `t=d` (`f=100` uncompressed PNG): zero `Image.onload` roundtrip.
-        if (firstCmd.medium === "d" && firstCmd.format === 100 && !firstCmd.compression) {
-          const pngDims = parsePngDimensions(payloadBytes);
-          const width = pngDims?.width ?? firstCmd.width;
-          const height = pngDims?.height ?? firstCmd.height;
-          if (width && height) {
-            const copy = payloadBytes.buffer.slice(
-              payloadBytes.byteOffset,
-              payloadBytes.byteOffset + payloadBytes.byteLength,
-            ) as ArrayBuffer;
-            const url = URL.createObjectURL(new Blob([copy], { type: "image/png" }));
-            finishAsset({ id: imgId, url, width, height });
-            continue;
+        // Zero-copy Rust memory cache path (`pocket-mem:<id>/<W>x<H>`): <1ms synchronous handoff.
+        if (memRef) {
+          const w = memRef.width || firstCmd.width || 0;
+          const h = memRef.height || firstCmd.height || 0;
+          finishAsset({
+            id: imgId,
+            url: pocketTermImageUrl(memRef.id, IS_WINDOWS),
+            width: w || 64,
+            height: h || 64,
+            needsMeasure: w <= 0 || h <= 0,
+          });
+          continue;
+        }
+
+        // Fast synchronous paths for `t=d` without zlib: PNG header parse or uncompressed BMP v4 wrapper.
+        const rawData = payloadBytes!;
+        if (firstCmd.medium === "d" && !firstCmd.compression) {
+          if (firstCmd.format === 100) {
+            const pngDims = parsePngDimensions(rawData);
+            const width = pngDims?.width ?? firstCmd.width;
+            const height = pngDims?.height ?? firstCmd.height;
+            if (width && height) {
+              const copy = rawData.buffer.slice(
+                rawData.byteOffset,
+                rawData.byteOffset + rawData.byteLength,
+              ) as ArrayBuffer;
+              const url = URL.createObjectURL(new Blob([copy], { type: "image/png" }));
+              finishAsset({ id: imgId, url, width, height });
+              continue;
+            }
+          } else if (firstCmd.format === 32 || firstCmd.format === 24) {
+            const width = firstCmd.width ?? 0;
+            const height = firstCmd.height ?? 0;
+            const url = buildBmpBlobUrl(width, height, rawData, firstCmd.format === 24 ? 24 : 32);
+            if (url) {
+              finishAsset({ id: imgId, url, width, height });
+              continue;
+            }
           }
         }
 
         const assetPromise: Promise<KittyImageAsset | null> =
           firstCmd.medium === "d"
-            ? decodeKittyAsset(firstCmd, payloadBytes, imgId)
+            ? decodeKittyAsset(firstCmd, rawData, imgId)
             : (() => {
-                const decodedPath = new TextDecoder("utf-8").decode(payloadBytes).trim();
+                const decodedPath = new TextDecoder("utf-8").decode(rawData).trim();
                 if (firstCmd.format === 100) {
                   return localTermStatImage(decodedPath, firstCmd.medium === "t").then((stat) => {
                     if (!stat) return null;
@@ -1378,7 +1730,10 @@ export function TerminalSurface({
     let unsubLocalClose: (() => void) | null = null;
     let activeLocalConnId: string | null = null;
 
+    let flushMicroQueued = false;
+
     const flushPendingBytes = () => {
+      flushMicroQueued = false;
       if (flushRaf) {
         cancelAnimationFrame(flushRaf);
         flushRaf = 0;
@@ -1400,10 +1755,10 @@ export function TerminalSurface({
     const queueRawBytes = (bytes: Uint8Array) => {
       if (!bytes.length) return;
       pendingBytes.push(bytes);
-      if (!flushRaf) {
-        flushRaf = requestAnimationFrame(() => {
-          flushRaf = 0;
-          flushPendingBytes();
+      if (!flushMicroQueued && !flushRaf) {
+        flushMicroQueued = true;
+        queueMicrotask(() => {
+          if (flushMicroQueued) flushPendingBytes();
         });
       }
     };
@@ -1525,6 +1880,24 @@ export function TerminalSurface({
     });
     ro.observe(hostEl);
 
+    let unwatchDpr: (() => void) | null = null;
+    const watchDpr = () => {
+      unwatchDpr?.();
+      unwatchDpr = null;
+      if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+      const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      const onChange = () => {
+        if (!alive || termRef.current !== term) return;
+        lastResizeSigRef.current = "";
+        syncResize(term);
+        paintOverlays();
+        watchDpr();
+      };
+      mq.addEventListener?.("change", onChange, { once: true });
+      unwatchDpr = () => mq.removeEventListener?.("change", onChange);
+    };
+    watchDpr();
+
     if (activeRef.current) {
       requestAnimationFrame(() => term.focus());
     }
@@ -1535,12 +1908,15 @@ export function TerminalSurface({
       alive = false;
       window.clearTimeout(seedTimer);
       window.clearTimeout(resizeTimer);
+      flushMicroQueued = false;
+      overlayMicroQueued = false;
       if (flushRaf) {
         cancelAnimationFrame(flushRaf);
         flushRaf = 0;
       }
       pendingBytes = [];
       if (rafOverlay) cancelAnimationFrame(rafOverlay);
+      unwatchDpr?.();
       ro.disconnect();
       unsubRelay?.();
       unsubLocalData?.();
@@ -1549,9 +1925,11 @@ export function TerminalSurface({
         if (localConnRef.current === activeLocalConnId) localConnRef.current = null;
         void native.localTermDetach(activeLocalConnId);
       }
+      lastResizeSigRef.current = "";
       relayPendingRef.current = "";
       dispScroll.dispose();
       dispRender.dispose();
+      dispWriteParsed.dispose();
       dispBuf.dispose();
       dispOsc66.dispose();
       dispCsiPush.dispose();
@@ -1561,6 +1939,7 @@ export function TerminalSurface({
       dispModifyOther.dispose();
       dispDecSet.dispose();
       dispDecRst.dispose();
+      dispCsiWindowOps.dispose();
       dispResetKeys.dispose();
       dispData.dispose();
       textarea?.removeEventListener("focus", onTermFocus);
@@ -1568,6 +1947,7 @@ export function TerminalSurface({
       webglAddon?.dispose();
       for (const a of assetsRefForCleanup.current.values()) revokeAssetUrl(a.url);
       assetsRefForCleanup.current.clear();
+      overlayNodesRef.current.clear();
       kittyPlacementsRef.current = [];
       kittyVirtualDimsRef.current.clear();
       kittyDimsByIdRef.current.clear();
@@ -1609,6 +1989,7 @@ export function TerminalSurface({
       void localTermFocus(localConnId, active);
     }
     if (!active || !termRef.current) return;
+    lastResizeSigRef.current = "";
     const id = requestAnimationFrame(() => {
       if (!termRef.current) return;
       syncResize(termRef.current);

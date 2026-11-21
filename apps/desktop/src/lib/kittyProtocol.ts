@@ -32,7 +32,10 @@ export class KittyApcSplitter {
           this.pending = input.slice(tailHold);
         } else if (i < input.length) {
           if (this.pending) this.pending += input.slice(i);
-          else if (input.length - i <= 3 && (input.endsWith("\x1b") || input.endsWith("\x1b_"))) {
+          else if (
+            tailHold === i ||
+            (input.length - i <= 3 && (input.endsWith("\x1b") || input.endsWith("\x1b_") || input.endsWith("\x9f")))
+          ) {
             this.pending = input.slice(i);
           } else {
             out.push({ kind: "vt", data: input.slice(i) });
@@ -111,6 +114,8 @@ export interface KittyGfxCommand {
   cropH?: number;
   cropX?: number;
   cropY?: number;
+  cellOffsetX?: number;
+  cellOffsetY?: number;
   cursorMovement: 0 | 1;
   unicodePlaceholder: boolean;
   deleteWhat?: string;
@@ -136,6 +141,10 @@ export function parseKittyGfxCommand(raw: string): KittyGfxCommand {
     const n = Number.parseInt(v, 10);
     return Number.isFinite(n) ? n : undefined;
   };
+  const nonNegInt = (k: string): number | undefined => {
+    const n = int(k);
+    return n !== undefined && n >= 0 ? n : undefined;
+  };
   const a = kv.a;
   const action: KittyGfxCommand["action"] =
     a === "T" || a === "p" || a === "d" || a === "q" || a === "f" || a === "a" || a === "c" ? a : "t";
@@ -159,10 +168,12 @@ export function parseKittyGfxCommand(raw: string): KittyGfxCommand {
     height: int("v"),
     cols: int("c"),
     rows: int("r"),
-    cropW: int("w"),
-    cropH: int("h"),
-    cropX: int("x"),
-    cropY: int("y"),
+    cropW: nonNegInt("w"),
+    cropH: nonNegInt("h"),
+    cropX: nonNegInt("x"),
+    cropY: nonNegInt("y"),
+    cellOffsetX: nonNegInt("X"),
+    cellOffsetY: nonNegInt("Y"),
     cursorMovement: int("C") === 1 ? 1 : 0,
     unicodePlaceholder: int("U") === 1,
     deleteWhat: kv.d,
@@ -922,4 +933,101 @@ export function parsePngDimensions(bytes: Uint8Array): { width: number; height: 
   const height = view.getUint32(20, false);
   if (width === 0 || height === 0) return null;
   return { width, height };
+}
+
+export interface PocketMemRef {
+  id: string;
+  width: number;
+  height: number;
+}
+
+/** Parses synthetic Rust-cached `pocket-mem:<id>/<W>x<H>` APC payloads. */
+export function parsePocketMemPayload(payload: string): PocketMemRef | null {
+  if (!payload.startsWith("pocket-mem:")) return null;
+  const rest = payload.slice("pocket-mem:".length);
+  const slash = rest.indexOf("/");
+  if (slash <= 0) return null;
+  const id = rest.slice(0, slash);
+  if (!/^\d+$/.test(id)) return null;
+  const dims = rest.slice(slash + 1);
+  const xIdx = dims.indexOf("x");
+  if (xIdx <= 0) return null;
+  const widthStr = dims.slice(0, xIdx);
+  const heightStr = dims.slice(xIdx + 1);
+  if (!/^\d+$/.test(widthStr) || !/^\d+$/.test(heightStr)) return null;
+  const width = Number.parseInt(widthStr, 10);
+  const height = Number.parseInt(heightStr, 10);
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 0 || height < 0) {
+    return null;
+  }
+  return { id, width, height };
+}
+
+export function pocketTermImageUrl(memId: string, isWindows: boolean): string {
+  return isWindows
+    ? `http://pocket-local.localhost/term-img/${memId}`
+    : `pocket-local://localhost/term-img/${memId}`;
+}
+
+/**
+ * Encodes raw Kitty `f=32` (RGBA) or `f=24` (RGB) pixel buffers into an uncompressed
+ * 32-bit top-down `BITMAPV4HEADER` (`BI_BITFIELDS` RGBA) BMP in `<2ms` without canvas PNG encoding.
+ */
+export function encodeRgbaBmpV4(
+  width: number,
+  height: number,
+  bytes: Uint8Array,
+  format: 24 | 32,
+): Uint8Array | null {
+  if (
+    !Number.isInteger(width) ||
+    !Number.isInteger(height) ||
+    width <= 0 ||
+    height <= 0 ||
+    width > 16384 ||
+    height > 16384 ||
+    width * height > 4096 * 4096
+  ) {
+    return null;
+  }
+  const pixelCount = width * height;
+  const bmpDataBytes = pixelCount * 4;
+  const totalBytes = 122 + bmpDataBytes;
+  if (totalBytes > 0xffff_ffff) return null;
+  if (format === 32 && bytes.length < bmpDataBytes) return null;
+  if (format === 24 && bytes.length < pixelCount * 3) return null;
+
+  const out = new Uint8Array(totalBytes);
+  const view = new DataView(out.buffer);
+  out[0] = 0x42; // 'B'
+  out[1] = 0x4d; // 'M'
+  view.setUint32(2, totalBytes, true);
+  view.setUint32(10, 122, true); // bfOffBits
+  view.setUint32(14, 108, true); // bV4Size (BITMAPV4HEADER)
+  view.setInt32(18, width, true);
+  view.setInt32(22, -height, true); // negative => top-down scanline order
+  view.setUint16(26, 1, true); // bV4Planes
+  view.setUint16(28, 32, true); // bV4BitCount
+  view.setUint32(30, 3, true); // BI_BITFIELDS
+  view.setUint32(34, bmpDataBytes, true);
+  view.setInt32(38, 2835, true);
+  view.setInt32(42, 2835, true);
+  view.setUint32(54, 0x000000ff, true); // Red mask
+  view.setUint32(58, 0x0000ff00, true); // Green mask
+  view.setUint32(62, 0x00ff0000, true); // Blue mask
+  view.setUint32(66, 0xff000000, true); // Alpha mask
+  // Bytes 70..122 remain 0 (LCS_CALIBRATED_RGB = 0) for cross-engine alpha compatibility.
+
+  if (format === 32) {
+    out.set(bytes.subarray(0, bmpDataBytes), 122);
+  } else {
+    const rgbLen = pixelCount * 3;
+    for (let src = 0, dst = 122; src < rgbLen; src += 3, dst += 4) {
+      out[dst] = bytes[src]!;
+      out[dst + 1] = bytes[src + 1]!;
+      out[dst + 2] = bytes[src + 2]!;
+      out[dst + 3] = 255;
+    }
+  }
+  return out;
 }

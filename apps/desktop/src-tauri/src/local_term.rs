@@ -8,8 +8,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -174,6 +175,7 @@ struct PreattachedChannel {
 #[derive(Default)]
 struct EarlyBuffer {
     bytes: usize,
+    raw_bytes: usize,
     frames: Vec<(u8, Vec<u8>)>,
 }
 
@@ -288,6 +290,7 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
         .name("hc-framed-reader".into())
         .spawn(move || {
             let mut hdr = [0u8; HEADER_LEN];
+            let mut apc_parsers: HashMap<u32, ChannelApcStream> = HashMap::new();
             loop {
                 if reader.read_exact(&mut hdr).is_err() {
                     break;
@@ -318,6 +321,18 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                     continue;
                 }
 
+                let raw_len = payload.len();
+                let (out_payload, auto_replies) = if kind == KIND_DATA {
+                    let parser = apc_parsers.entry(channel).or_default();
+                    let res = parser.push(&payload);
+                    (res.out_bytes, res.auto_replies)
+                } else {
+                    if kind == KIND_CLOSE {
+                        apc_parsers.remove(&channel);
+                    }
+                    (payload, Vec::new())
+                };
+
                 enum Action {
                     EmitData(String, Vec<u8>, Option<usize>),
                     EmitClose(String),
@@ -325,11 +340,32 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                 }
                 let action = {
                     let Ok(mut s) = state.lock() else { break };
+                    if !auto_replies.is_empty() {
+                        let use_auto = s
+                            .by_channel
+                            .get(&channel)
+                            .and_then(|id| s.by_id.get(id))
+                            .map(|a| a.automatic_input)
+                            .unwrap_or_else(|| {
+                                s.preattached
+                                    .values()
+                                    .find(|p| p.channel == channel)
+                                    .is_some_and(|p| p.automatic_input)
+                            });
+                        let reply_kind = if use_auto {
+                            KIND_AUTOMATIC_INPUT
+                        } else {
+                            KIND_DATA
+                        };
+                        for reply in &auto_replies {
+                            let _ = s.write_frame(channel, reply_kind, reply);
+                        }
+                    }
                     if let Some(att_id) = s.by_channel.get(&channel).cloned() {
                         match kind {
                             KIND_DATA => {
                                 let credit_ack = s.by_id.get_mut(&att_id).and_then(|att| {
-                                    att.consumed += payload.len();
+                                    att.consumed += raw_len;
                                     if att.consumed >= CREDIT_ACK_STEP {
                                         let ack = att.consumed;
                                         att.consumed = 0;
@@ -338,7 +374,7 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                                         None
                                     }
                                 });
-                                Action::EmitData(att_id, payload, credit_ack)
+                                Action::EmitData(att_id, out_payload, credit_ack)
                             }
                             KIND_CLOSE => {
                                 s.by_channel.remove(&channel);
@@ -349,11 +385,14 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                         }
                     } else {
                         let buf = s.early.entry(channel).or_default();
+                        if kind == KIND_DATA {
+                            buf.raw_bytes += raw_len;
+                        }
                         if buf.frames.len() < MAX_EARLY_FRAMES
-                            && buf.bytes.saturating_add(payload.len()) <= MAX_EARLY_BYTES
+                            && buf.bytes.saturating_add(out_payload.len()) <= MAX_EARLY_BYTES
                         {
-                            buf.bytes += payload.len();
-                            buf.frames.push((kind, payload));
+                            buf.bytes += out_payload.len();
+                            buf.frames.push((kind, out_payload));
                         }
                         Action::None
                     }
@@ -652,21 +691,25 @@ pub async fn local_term_attach(
             if let Some(pre) = s.preattached.remove(&terminal) {
                 if pre.created_at.elapsed() < Duration::from_secs(30) {
                     s.by_channel.insert(pre.channel, id.clone());
-                    let drained = s
-                        .early
-                        .remove(&pre.channel)
-                        .map(|b| b.frames)
+                    let early = s.early.remove(&pre.channel);
+                    let (drained, early_raw_bytes) = early
+                        .map(|b| (b.frames, b.raw_bytes))
                         .unwrap_or_default();
-                    let early_bytes: usize = drained
-                        .iter()
-                        .filter(|(k, _)| *k == KIND_DATA)
-                        .map(|(_, p)| p.len())
-                        .sum();
+                    let consumed = if early_raw_bytes >= CREDIT_ACK_STEP {
+                        let _ = s.write_frame(
+                            pre.channel,
+                            KIND_CREDIT,
+                            &(early_raw_bytes as u32).to_le_bytes(),
+                        );
+                        0
+                    } else {
+                        early_raw_bytes
+                    };
                     s.by_id.insert(
                         id.clone(),
                         Attachment {
                             channel: pre.channel,
-                            consumed: early_bytes,
+                            consumed,
                             automatic_input: pre.automatic_input,
                         },
                     );
@@ -957,6 +1000,1144 @@ pub fn shutdown() {
 const BLOCKED_IMAGE_COMPONENTS: [&str; 5] = [".ssh", ".gnupg", ".aws", ".kube", "keychains"];
 const MAX_LOCAL_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 const IMAGE_STAGE_DIR_NAME: &str = "herdr-pocket-term-img";
+const MAX_MEM_TERM_IMAGES: usize = 64;
+const MAX_MEM_TERM_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SINGLE_APC_BYTES: usize = 96 * 1024 * 1024;
+
+struct MemTermImage {
+    mime: &'static str,
+    data: Arc<Vec<u8>>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct MemTermImageCache {
+    entries: HashMap<u64, MemTermImage>,
+    total_bytes: usize,
+    tick: u64,
+}
+
+fn mem_image_cache() -> &'static Mutex<MemTermImageCache> {
+    static CACHE: OnceLock<Mutex<MemTermImageCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(MemTermImageCache::default()))
+}
+
+static NEXT_MEM_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn insert_mem_image(mime: &'static str, data: Vec<u8>) -> Option<u64> {
+    if data.is_empty() || data.len() > MAX_MEM_TERM_BYTES {
+        return None;
+    }
+    let len = data.len();
+    let mut cache = mem_image_cache().lock().ok()?;
+    while cache.entries.len() >= MAX_MEM_TERM_IMAGES || cache.total_bytes + len > MAX_MEM_TERM_BYTES {
+        let Some((&lru_id, _)) = cache.entries.iter().min_by_key(|(_, v)| v.last_used) else {
+            break;
+        };
+        if let Some(removed) = cache.entries.remove(&lru_id) {
+            cache.total_bytes = cache.total_bytes.saturating_sub(removed.data.len());
+        }
+    }
+    cache.tick = cache.tick.wrapping_add(1);
+    let last_used = cache.tick;
+    let id = NEXT_MEM_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+    cache.total_bytes += len;
+    cache.entries.insert(
+        id,
+        MemTermImage {
+            mime,
+            data: Arc::new(data),
+            last_used,
+        },
+    );
+    Some(id)
+}
+
+pub fn get_mem_image(id: u64) -> Option<(&'static str, Arc<Vec<u8>>)> {
+    let mut cache = mem_image_cache().lock().ok()?;
+    cache.tick = cache.tick.wrapping_add(1);
+    let tick = cache.tick;
+    let entry = cache.entries.get_mut(&id)?;
+    entry.last_used = tick;
+    Some((entry.mime, Arc::clone(&entry.data)))
+}
+
+const fn make_b64_decode_table() -> [u8; 256] {
+    let mut t = [0xffu8; 256];
+    let mut i = b'A';
+    while i <= b'Z' {
+        t[i as usize] = i - b'A';
+        i += 1;
+    }
+    let mut i = b'a';
+    while i <= b'z' {
+        t[i as usize] = 26 + (i - b'a');
+        i += 1;
+    }
+    let mut i = b'0';
+    while i <= b'9' {
+        t[i as usize] = 52 + (i - b'0');
+        i += 1;
+    }
+    t[b'+' as usize] = 62;
+    t[b'/' as usize] = 63;
+    t[b'=' as usize] = 0xfd;
+    t[b' ' as usize] = 0xfe;
+    t[b'\t' as usize] = 0xfe;
+    t[b'\r' as usize] = 0xfe;
+    t[b'\n' as usize] = 0xfe;
+    t
+}
+
+static B64_DECODE_TABLE: [u8; 256] = make_b64_decode_table();
+
+pub fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity((input.len() / 4) * 3 + 3);
+    let mut i = 0usize;
+    while i + 4 <= input.len() {
+        let a = B64_DECODE_TABLE[input[i] as usize];
+        let b = B64_DECODE_TABLE[input[i + 1] as usize];
+        let c = B64_DECODE_TABLE[input[i + 2] as usize];
+        let d = B64_DECODE_TABLE[input[i + 3] as usize];
+        if (a | b | c | d) < 64 {
+            let v = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | (d as u32);
+            out.push((v >> 16) as u8);
+            out.push((v >> 8) as u8);
+            out.push(v as u8);
+            i += 4;
+        } else {
+            break;
+        }
+    }
+    let mut buf = [0u8; 4];
+    let mut count = 0usize;
+    let mut saw_pad = false;
+    while i < input.len() {
+        let code = B64_DECODE_TABLE[input[i] as usize];
+        i += 1;
+        if code == 0xfe {
+            continue;
+        }
+        if code == 0xff {
+            return None;
+        }
+        if code == 0xfd {
+            saw_pad = true;
+            if count == 0 || count == 1 {
+                return None;
+            }
+            if count == 2 {
+                let mut rest_pads = 1usize;
+                while i < input.len() {
+                    let c = B64_DECODE_TABLE[input[i] as usize];
+                    i += 1;
+                    if c == 0xfe {
+                        continue;
+                    }
+                    if c == 0xfd && rest_pads < 2 {
+                        rest_pads += 1;
+                    } else {
+                        return None;
+                    }
+                }
+                if rest_pads != 2 {
+                    return None;
+                }
+                out.push((buf[0] << 2) | (buf[1] >> 4));
+                return Some(out);
+            }
+            if count == 3 {
+                while i < input.len() {
+                    let c = B64_DECODE_TABLE[input[i] as usize];
+                    i += 1;
+                    if c != 0xfe {
+                        return None;
+                    }
+                }
+                out.push((buf[0] << 2) | (buf[1] >> 4));
+                out.push((buf[1] << 4) | (buf[2] >> 2));
+                return Some(out);
+            }
+            continue;
+        }
+        if saw_pad {
+            return None;
+        }
+        buf[count] = code;
+        count += 1;
+        if count == 4 {
+            let v = ((buf[0] as u32) << 18)
+                | ((buf[1] as u32) << 12)
+                | ((buf[2] as u32) << 6)
+                | (buf[3] as u32);
+            out.push((v >> 16) as u8);
+            out.push((v >> 8) as u8);
+            out.push(v as u8);
+            count = 0;
+        }
+    }
+    match count {
+        0 => Some(out),
+        1 => None,
+        2 => {
+            out.push((buf[0] << 2) | (buf[1] >> 4));
+            Some(out)
+        }
+        3 => {
+            out.push((buf[0] << 2) | (buf[1] >> 4));
+            out.push((buf[1] << 4) | (buf[2] >> 2));
+            Some(out)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Wraps raw Kitty `f=32` (RGBA) or `f=24` (RGB) pixels into a 122-byte
+/// `BITMAPV4HEADER` top-down 32-bit `BI_BITFIELDS` RGBA BMP with zero compression cost.
+pub fn build_bmp_v4_from_pixels(
+    width: u32,
+    height: u32,
+    format: u32,
+    pixels: &[u8],
+) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || width > 16384 || height > 16384 {
+        return None;
+    }
+    let pixel_count = (width as usize).checked_mul(height as usize)?;
+    let bmp_data_len = pixel_count.checked_mul(4)?;
+    let total_len = 122usize.checked_add(bmp_data_len)?;
+    if total_len > MAX_MEM_TERM_BYTES {
+        return None;
+    }
+    let total_u32 = u32::try_from(total_len).ok()?;
+    let data_u32 = u32::try_from(bmp_data_len).ok()?;
+    let width_i32 = i32::try_from(width).ok()?;
+    let neg_height_i32 = i32::try_from(height).ok()?.checked_neg()?;
+
+    match format {
+        32 => {
+            if pixels.len() < bmp_data_len {
+                return None;
+            }
+        }
+        24 => {
+            let rgb_len = pixel_count.checked_mul(3)?;
+            if pixels.len() < rgb_len {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+
+    let mut out = vec![0u8; 122];
+    out[0] = b'B';
+    out[1] = b'M';
+    out[2..6].copy_from_slice(&total_u32.to_le_bytes());
+    out[10..14].copy_from_slice(&122u32.to_le_bytes());
+    out[14..18].copy_from_slice(&108u32.to_le_bytes());
+    out[18..22].copy_from_slice(&width_i32.to_le_bytes());
+    out[22..26].copy_from_slice(&neg_height_i32.to_le_bytes());
+    out[26..28].copy_from_slice(&1u16.to_le_bytes());
+    out[28..30].copy_from_slice(&32u16.to_le_bytes());
+    out[30..34].copy_from_slice(&3u32.to_le_bytes());
+    out[34..38].copy_from_slice(&data_u32.to_le_bytes());
+    out[38..42].copy_from_slice(&2835i32.to_le_bytes());
+    out[42..46].copy_from_slice(&2835i32.to_le_bytes());
+    out[54..58].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
+    out[58..62].copy_from_slice(&0x0000_ff00u32.to_le_bytes());
+    out[62..66].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
+    out[66..70].copy_from_slice(&0xff00_0000u32.to_le_bytes());
+    // Bytes 70..122 stay 0 (LCS_CALIBRATED_RGB = 0) so macOS ImageIO, WebKit, and Chromium all preserve alpha.
+
+    out.reserve(bmp_data_len);
+    if format == 32 {
+        out.extend_from_slice(&pixels[..bmp_data_len]);
+    } else {
+        let rgb_len = pixel_count * 3;
+        for px in pixels[..rgb_len].chunks_exact(3) {
+            out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+    }
+    Some(out)
+}
+
+fn has_blocked_component(path: &Path) -> bool {
+    path.components().any(|comp| {
+        let name = comp.as_os_str().to_string_lossy().to_lowercase();
+        BLOCKED_IMAGE_COMPONENTS.contains(&name.as_str())
+    })
+}
+
+fn is_temp_path(path: &Path) -> bool {
+    if has_blocked_component(path) {
+        return false;
+    }
+    let env_tmp = std::env::temp_dir();
+    let env_tmp_canon = std::fs::canonicalize(&env_tmp).ok();
+    let mut roots: Vec<PathBuf> = vec![env_tmp];
+    if let Some(c) = env_tmp_canon {
+        roots.push(c);
+    }
+    #[cfg(unix)]
+    {
+        roots.push(PathBuf::from("/tmp"));
+        roots.push(PathBuf::from("/private/tmp"));
+        roots.push(PathBuf::from("/var/folders"));
+        roots.push(PathBuf::from("/private/var/folders"));
+    }
+    if roots.iter().any(|r| path.starts_with(r)) {
+        return true;
+    }
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        if has_blocked_component(&canon) {
+            return false;
+        }
+        return roots.iter().any(|r| canon.starts_with(r));
+    }
+    false
+}
+
+#[derive(Debug, Default)]
+pub struct ApcProcessResult {
+    pub out_bytes: Vec<u8>,
+    pub auto_replies: Vec<Vec<u8>>,
+}
+
+struct ParsedKittyHeader<'a> {
+    action: Option<&'a str>,
+    format: Option<u32>,
+    medium: Option<&'a str>,
+    compression: Option<&'a str>,
+    more: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+    id: Option<u32>,
+    image_number: Option<u32>,
+    quiet: u8,
+}
+
+fn parse_kitty_header(raw_header: &[u8]) -> ParsedKittyHeader<'_> {
+    let mut parsed = ParsedKittyHeader {
+        action: None,
+        format: None,
+        medium: None,
+        compression: None,
+        more: false,
+        width: None,
+        height: None,
+        id: None,
+        image_number: None,
+        quiet: 0,
+    };
+    let Ok(header_str) = std::str::from_utf8(raw_header) else {
+        return parsed;
+    };
+    for part in header_str.split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        match k {
+            "a" => parsed.action = Some(v),
+            "f" => parsed.format = v.parse::<u32>().ok(),
+            "t" => parsed.medium = Some(v),
+            "o" => parsed.compression = Some(v),
+            "m" => parsed.more = v == "1",
+            "s" => parsed.width = v.parse::<u32>().ok(),
+            "v" => parsed.height = v.parse::<u32>().ok(),
+            "i" => parsed.id = v.parse::<u32>().ok(),
+            "I" => parsed.image_number = v.parse::<u32>().ok(),
+            "q" => parsed.quiet = match v { "1" => 1, "2" => 2, _ => 0 },
+            _ => {}
+        }
+    }
+    parsed
+}
+
+struct ActiveChunkUpload {
+    action: String,
+    id: Option<u32>,
+    first_header: Vec<u8>,
+    format: Option<u32>,
+    medium: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    passthrough: bool,
+    raw_chunks: Vec<Vec<u8>>,
+    payload_parts: Vec<Vec<u8>>,
+    total_raw_bytes: usize,
+}
+
+#[derive(Default)]
+pub struct ChannelApcStream {
+    pending_prefix: Vec<u8>,
+    utf8_rem: u8,
+    in_apc: bool,
+    apc_prefix: Vec<u8>,
+    apc_buf: Vec<u8>,
+    apc_passthrough: bool,
+    chunked: Option<ActiveChunkUpload>,
+}
+
+fn trailing_utf8_remaining(bytes: &[u8]) -> u8 {
+    let n = bytes.len();
+    let mut back = 0usize;
+    while back < 3 && back < n {
+        let b = bytes[n - 1 - back];
+        if b < 0x80 {
+            return 0;
+        }
+        if (0xc2..=0xf4).contains(&b) {
+            let expected_cont = if b < 0xe0 {
+                1
+            } else if b < 0xf0 {
+                2
+            } else {
+                3
+            };
+            return (expected_cont as usize).saturating_sub(back) as u8;
+        }
+        if !(0x80..=0xbf).contains(&b) {
+            return 0;
+        }
+        back += 1;
+    }
+    0
+}
+
+fn is_utf8_continuation_before(slice: &[u8], min_idx: usize, pos: usize, prior_emitted: &[u8]) -> bool {
+    let get_back = |offset: usize| -> Option<u8> {
+        if pos >= min_idx + offset {
+            Some(slice[pos - offset])
+        } else {
+            let rem = offset - (pos - min_idx);
+            if rem <= prior_emitted.len() {
+                Some(prior_emitted[prior_emitted.len() - rem])
+            } else {
+                None
+            }
+        }
+    };
+    match get_back(1) {
+        Some(0xc3..=0xf4) => return true,
+        Some(0xc2) => return false, // 0xc2 0x9f is U+009F C1 APC!
+        Some(0x80..=0xbf) => {}
+        _ => return false,
+    }
+    match get_back(2) {
+        Some(0xe0..=0xf4) => return true,
+        Some(0x80..=0xbf) => {}
+        _ => return false,
+    }
+    matches!(get_back(3), Some(0xf0..=0xf4))
+}
+
+fn build_synthetic_apc(
+    orig_header: &[u8],
+    default_action: &str,
+    mem_id: u64,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let mut hdr = String::with_capacity(orig_header.len() + 32);
+    let mut has_action = false;
+    if let Ok(s) = std::str::from_utf8(orig_header) {
+        for part in s.split(',') {
+            if part.is_empty() {
+                continue;
+            }
+            let Some((k, _)) = part.split_once('=') else {
+                continue;
+            };
+            if k == "a" {
+                has_action = true;
+            }
+            if matches!(
+                k,
+                "a" | "i"
+                    | "I"
+                    | "p"
+                    | "c"
+                    | "r"
+                    | "x"
+                    | "y"
+                    | "w"
+                    | "h"
+                    | "X"
+                    | "Y"
+                    | "C"
+                    | "U"
+                    | "z"
+                    | "q"
+                    | "f"
+            ) {
+                if !hdr.is_empty() {
+                    hdr.push(',');
+                }
+                hdr.push_str(part);
+            }
+        }
+    }
+    if !has_action {
+        if !hdr.is_empty() {
+            hdr = format!("a={default_action},{hdr}");
+        } else {
+            hdr = format!("a={default_action}");
+        }
+    }
+    if !hdr.is_empty() {
+        hdr.push(',');
+    }
+    hdr.push_str("t=d,m=0");
+    if width > 0 && height > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(hdr, ",s={width},v={height}");
+    }
+    format!("\x1b_G{hdr};pocket-mem:{mem_id}/{width}x{height}\x1b\\").into_bytes()
+}
+
+fn decode_chunk_payloads(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+    if parts.len() == 1 {
+        return base64_decode(&parts[0]);
+    }
+    let has_mid_pad = parts
+        .iter()
+        .take(parts.len().saturating_sub(1))
+        .any(|p| p.contains(&b'='));
+    if !has_mid_pad {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mut combined = Vec::with_capacity(total);
+        for p in parts {
+            combined.extend_from_slice(p);
+        }
+        return base64_decode(&combined);
+    }
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(&base64_decode(p)?);
+    }
+    Some(out)
+}
+
+fn try_ingest_kitty_image(
+    hdr_bytes: &[u8],
+    default_action: &str,
+    format: Option<u32>,
+    medium: Option<&str>,
+    hdr_width: Option<u32>,
+    hdr_height: Option<u32>,
+    payload_parts: &[Vec<u8>],
+) -> Option<Vec<u8>> {
+    let med = medium.unwrap_or("d");
+    let mut unlink_after: Option<PathBuf> = None;
+    let mut file_name = String::new();
+    let raw_bytes = match med {
+        "d" => {
+            let bytes = decode_chunk_payloads(payload_parts)?;
+            if bytes.is_empty() || bytes.len() > MAX_MEM_TERM_BYTES {
+                return None;
+            }
+            bytes
+        }
+        "f" | "t" => {
+            let path_bytes = decode_chunk_payloads(payload_parts)?;
+            let path_str = std::str::from_utf8(&path_bytes)
+                .ok()?
+                .trim_end_matches('\0')
+                .trim();
+            if path_str.is_empty() {
+                return None;
+            }
+            let raw_path = PathBuf::from(path_str);
+            let (canon, _) = validate_local_image_path(path_str).ok()?;
+            file_name = canon
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let bytes = std::fs::read(&canon).ok()?;
+            if bytes.is_empty() || bytes.len() > MAX_MEM_TERM_BYTES {
+                return None;
+            }
+            if med == "t" && is_temp_path(&raw_path) && is_temp_path(&canon) {
+                if let Ok(meta) = std::fs::symlink_metadata(&raw_path) {
+                    if !meta.file_type().is_symlink() && meta.is_file() {
+                        unlink_after = Some(raw_path);
+                    }
+                } else {
+                    unlink_after = Some(canon);
+                }
+            }
+            bytes
+        }
+        _ => return None,
+    };
+
+    let (mime, final_bytes, w, h) = match format {
+        Some(100) => {
+            let sniff_slice = &raw_bytes[..raw_bytes.len().min(65536)];
+            let (mime, _, sw, sh) = sniff_image_header_64(sniff_slice, &file_name)?;
+            let w = if sw > 0 { sw } else { hdr_width.unwrap_or(0) };
+            let h = if sh > 0 { sh } else { hdr_height.unwrap_or(0) };
+            (mime, raw_bytes, w, h)
+        }
+        Some(32) => {
+            let w = hdr_width.filter(|&x| x > 0)?;
+            let h = hdr_height.filter(|&y| y > 0)?;
+            let bmp = build_bmp_v4_from_pixels(w, h, 32, &raw_bytes)?;
+            ("image/bmp", bmp, w, h)
+        }
+        Some(24) => {
+            let w = hdr_width.filter(|&x| x > 0)?;
+            let h = hdr_height.filter(|&y| y > 0)?;
+            let bmp = build_bmp_v4_from_pixels(w, h, 24, &raw_bytes)?;
+            ("image/bmp", bmp, w, h)
+        }
+        None => {
+            let sniff_slice = &raw_bytes[..raw_bytes.len().min(65536)];
+            if let Some((mime, _, sw, sh)) = sniff_image_header_64(sniff_slice, &file_name) {
+                let w = if sw > 0 { sw } else { hdr_width.unwrap_or(0) };
+                let h = if sh > 0 { sh } else { hdr_height.unwrap_or(0) };
+                (mime, raw_bytes, w, h)
+            } else if let (Some(w), Some(h)) = (hdr_width.filter(|&x| x > 0), hdr_height.filter(|&y| y > 0)) {
+                let bmp = build_bmp_v4_from_pixels(w, h, 32, &raw_bytes)?;
+                ("image/bmp", bmp, w, h)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let mem_id = insert_mem_image(mime, final_bytes)?;
+    if let Some(temp_path) = unlink_after {
+        let _ = std::fs::remove_file(temp_path);
+    }
+    Some(build_synthetic_apc(hdr_bytes, default_action, mem_id, w, h))
+}
+
+impl ChannelApcStream {
+    pub fn push(&mut self, bytes: &[u8]) -> ApcProcessResult {
+        let mut res = ApcProcessResult {
+            out_bytes: Vec::with_capacity(bytes.len()),
+            auto_replies: Vec::new(),
+        };
+        if bytes.is_empty() {
+            return res;
+        }
+
+        let mut i = 0usize;
+        if !self.in_apc && !self.pending_prefix.is_empty() {
+            let mut joined = Vec::with_capacity(self.pending_prefix.len() + 3);
+            joined.extend_from_slice(&self.pending_prefix);
+            let take = bytes.len().min(3);
+            joined.extend_from_slice(&bytes[..take]);
+            if joined.starts_with(b"\x1b_G") {
+                let need = 3 - self.pending_prefix.len();
+                self.pending_prefix.clear();
+                self.in_apc = true;
+                self.apc_prefix.clear();
+                self.apc_prefix.extend_from_slice(b"\x1b_G");
+                self.apc_buf.clear();
+                self.apc_passthrough = false;
+                i = need;
+            } else if joined.starts_with(b"\x9fG") {
+                let need = 2 - self.pending_prefix.len();
+                self.pending_prefix.clear();
+                self.in_apc = true;
+                self.apc_prefix.clear();
+                self.apc_prefix.extend_from_slice(b"\x9fG");
+                self.apc_buf.clear();
+                self.apc_passthrough = false;
+                i = need;
+            } else if joined.starts_with(b"\xc2\x9fG") {
+                let need = 3 - self.pending_prefix.len();
+                self.pending_prefix.clear();
+                self.in_apc = true;
+                self.apc_prefix.clear();
+                self.apc_prefix.extend_from_slice(b"\xc2\x9fG");
+                self.apc_buf.clear();
+                self.apc_passthrough = false;
+                i = need;
+            } else if joined == b"\x1b_" || joined == b"\xc2\x9f" {
+                self.pending_prefix = joined;
+                return res;
+            } else {
+                res.out_bytes.extend_from_slice(&self.pending_prefix);
+                self.utf8_rem = trailing_utf8_remaining(&self.pending_prefix);
+                self.pending_prefix.clear();
+            }
+        }
+
+        while i < bytes.len() {
+            if self.in_apc {
+                if self.apc_passthrough {
+                    if self.apc_buf.last() == Some(&b'\x1b') && bytes[i] == b'\\' {
+                        res.out_bytes.extend_from_slice(b"\x1b\\");
+                        self.apc_buf.clear();
+                        self.in_apc = false;
+                        self.apc_passthrough = false;
+                        i += 1;
+                        continue;
+                    }
+                    if self.apc_buf.last() == Some(&0xc2) && bytes[i] == 0x9c {
+                        res.out_bytes.extend_from_slice(&[0xc2, 0x9c]);
+                        self.apc_buf.clear();
+                        self.in_apc = false;
+                        self.apc_passthrough = false;
+                        i += 1;
+                        continue;
+                    }
+                    if !self.apc_buf.is_empty() {
+                        res.out_bytes.extend_from_slice(&self.apc_buf);
+                        self.apc_buf.clear();
+                    }
+                    if let Some(rel) = bytes[i..].iter().position(|&b| b == 0x07 || b == 0x1b || b == 0x9c) {
+                        let pos = i + rel;
+                        let b = bytes[pos];
+                        if b == 0x07 || b == 0x9c {
+                            res.out_bytes.extend_from_slice(&bytes[i..=pos]);
+                            self.in_apc = false;
+                            self.apc_passthrough = false;
+                            i = pos + 1;
+                        } else if pos + 1 < bytes.len() && bytes[pos + 1] == b'\\' {
+                            res.out_bytes.extend_from_slice(&bytes[i..=pos + 1]);
+                            self.in_apc = false;
+                            self.apc_passthrough = false;
+                            i = pos + 2;
+                        } else if pos + 1 == bytes.len() {
+                            res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                            self.apc_buf.push(0x1b);
+                            i = bytes.len();
+                        } else {
+                            res.out_bytes.extend_from_slice(&bytes[i..=pos]);
+                            i = pos + 1;
+                        }
+                    } else if bytes.ends_with(&[0xc2]) {
+                        res.out_bytes.extend_from_slice(&bytes[i..bytes.len() - 1]);
+                        self.apc_buf.push(0xc2);
+                        i = bytes.len();
+                    } else {
+                        res.out_bytes.extend_from_slice(&bytes[i..]);
+                        i = bytes.len();
+                    }
+                    continue;
+                }
+
+                // Check split terminator across frame boundary.
+                if self.apc_buf.last() == Some(&b'\x1b') && bytes[i] == b'\\' {
+                    self.apc_buf.pop();
+                    let content = std::mem::take(&mut self.apc_buf);
+                    let prefix = std::mem::take(&mut self.apc_prefix);
+                    self.in_apc = false;
+                    self.finish_apc(&prefix, &content, b"\x1b\\", &mut res);
+                    i += 1;
+                    continue;
+                }
+                if self.apc_buf.last() == Some(&0xc2) && bytes[i] == 0x9c {
+                    self.apc_buf.pop();
+                    let content = std::mem::take(&mut self.apc_buf);
+                    let prefix = std::mem::take(&mut self.apc_prefix);
+                    self.in_apc = false;
+                    self.finish_apc(&prefix, &content, &[0xc2, 0x9c], &mut res);
+                    i += 1;
+                    continue;
+                }
+
+                if let Some(rel) = bytes[i..].iter().position(|&b| b == 0x07 || b == 0x1b || b == 0x9c) {
+                    let pos = i + rel;
+                    let b = bytes[pos];
+                    if b == 0x07 {
+                        self.apc_buf.extend_from_slice(&bytes[i..pos]);
+                        let content = std::mem::take(&mut self.apc_buf);
+                        let prefix = std::mem::take(&mut self.apc_prefix);
+                        self.in_apc = false;
+                        self.finish_apc(&prefix, &content, b"\x07", &mut res);
+                        i = pos + 1;
+                    } else if b == 0x9c {
+                        self.apc_buf.extend_from_slice(&bytes[i..pos]);
+                        let suffix: &[u8] = if self.apc_buf.last() == Some(&0xc2) {
+                            self.apc_buf.pop();
+                            &[0xc2, 0x9c]
+                        } else {
+                            &[0x9c]
+                        };
+                        let content = std::mem::take(&mut self.apc_buf);
+                        let prefix = std::mem::take(&mut self.apc_prefix);
+                        self.in_apc = false;
+                        self.finish_apc(&prefix, &content, suffix, &mut res);
+                        i = pos + 1;
+                    } else if pos + 1 < bytes.len() && bytes[pos + 1] == b'\\' {
+                        self.apc_buf.extend_from_slice(&bytes[i..pos]);
+                        let content = std::mem::take(&mut self.apc_buf);
+                        let prefix = std::mem::take(&mut self.apc_prefix);
+                        self.in_apc = false;
+                        self.finish_apc(&prefix, &content, b"\x1b\\", &mut res);
+                        i = pos + 2;
+                    } else {
+                        self.apc_buf.extend_from_slice(&bytes[i..=pos]);
+                        i = pos + 1;
+                    }
+                } else {
+                    self.apc_buf.extend_from_slice(&bytes[i..]);
+                    i = bytes.len();
+                }
+
+                if self.in_apc && self.apc_buf.len() > MAX_SINGLE_APC_BYTES {
+                    self.flush_active_chunked(&mut res);
+                    res.out_bytes.extend_from_slice(&self.apc_prefix);
+                    res.out_bytes.extend_from_slice(&self.apc_buf);
+                    self.apc_prefix.clear();
+                    self.apc_buf.clear();
+                    self.apc_passthrough = true;
+                }
+                continue;
+            }
+
+            // Ground state: pass non-APC VT bytes straight through with zero buffering lag.
+            while i < bytes.len() && self.utf8_rem > 0 && (0x80..=0xbf).contains(&bytes[i]) {
+                res.out_bytes.push(bytes[i]);
+                i += 1;
+                self.utf8_rem -= 1;
+            }
+            if i < bytes.len() && self.utf8_rem > 0 {
+                self.utf8_rem = 0;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+
+            let Some(rel) = bytes[i..]
+                .iter()
+                .position(|&b| b == 0x1b || b == 0x9f || b == 0xc2)
+            else {
+                res.out_bytes.extend_from_slice(&bytes[i..]);
+                self.utf8_rem = trailing_utf8_remaining(&bytes[i..]);
+                break;
+            };
+            let pos = i + rel;
+            let b = bytes[pos];
+            if b == 0x1b {
+                if pos + 1 == bytes.len() {
+                    res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                    self.pending_prefix.push(0x1b);
+                    break;
+                }
+                if bytes[pos + 1] == b'_' {
+                    if pos + 2 == bytes.len() {
+                        res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                        self.pending_prefix.extend_from_slice(b"\x1b_");
+                        break;
+                    }
+                    if bytes[pos + 2] == b'G' {
+                        res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                        self.in_apc = true;
+                        self.apc_prefix.clear();
+                        self.apc_prefix.extend_from_slice(b"\x1b_G");
+                        self.apc_buf.clear();
+                        self.apc_passthrough = false;
+                        i = pos + 3;
+                        continue;
+                    }
+                    res.out_bytes.extend_from_slice(&bytes[i..=pos + 1]);
+                    self.utf8_rem = 0;
+                    i = pos + 2;
+                    continue;
+                }
+                res.out_bytes.extend_from_slice(&bytes[i..=pos]);
+                self.utf8_rem = 0;
+                i = pos + 1;
+            } else if b == 0xc2 {
+                if pos + 1 == bytes.len() {
+                    res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                    self.pending_prefix.push(0xc2);
+                    break;
+                }
+                if bytes[pos + 1] == 0x9f {
+                    if pos + 2 == bytes.len() {
+                        res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                        self.pending_prefix.extend_from_slice(&[0xc2, 0x9f]);
+                        break;
+                    }
+                    if bytes[pos + 2] == b'G' {
+                        res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                        self.in_apc = true;
+                        self.apc_prefix.clear();
+                        self.apc_prefix.extend_from_slice(b"\xc2\x9fG");
+                        self.apc_buf.clear();
+                        self.apc_passthrough = false;
+                        i = pos + 3;
+                        continue;
+                    }
+                    res.out_bytes.extend_from_slice(&bytes[i..=pos + 1]);
+                    self.utf8_rem = 0;
+                    i = pos + 2;
+                    continue;
+                }
+                res.out_bytes.extend_from_slice(&bytes[i..=pos + 1]);
+                self.utf8_rem = 0;
+                i = pos + 2;
+            } else {
+                // b == 0x9f
+                if is_utf8_continuation_before(bytes, i, pos, &res.out_bytes) {
+                    res.out_bytes.extend_from_slice(&bytes[i..=pos]);
+                    self.utf8_rem = trailing_utf8_remaining(&bytes[i..=pos]);
+                    i = pos + 1;
+                    continue;
+                }
+                if pos + 1 == bytes.len() {
+                    res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                    self.pending_prefix.push(0x9f);
+                    break;
+                }
+                if bytes[pos + 1] == b'G' {
+                    res.out_bytes.extend_from_slice(&bytes[i..pos]);
+                    self.in_apc = true;
+                    self.apc_prefix.clear();
+                    self.apc_prefix.extend_from_slice(b"\x9fG");
+                    self.apc_buf.clear();
+                    self.apc_passthrough = false;
+                    i = pos + 2;
+                    continue;
+                }
+                res.out_bytes.extend_from_slice(&bytes[i..=pos]);
+                self.utf8_rem = 0;
+                i = pos + 1;
+            }
+        }
+
+        res
+    }
+
+    fn flush_active_chunked(&mut self, res: &mut ApcProcessResult) {
+        if let Some(active) = self.chunked.take() {
+            if !active.passthrough {
+                for chunk in active.raw_chunks {
+                    res.out_bytes.extend_from_slice(&chunk);
+                }
+            }
+        }
+    }
+
+    fn finish_apc(
+        &mut self,
+        prefix: &[u8],
+        content: &[u8],
+        suffix: &[u8],
+        res: &mut ApcProcessResult,
+    ) {
+        let semi = content.iter().position(|&b| b == b';');
+        let (hdr_bytes, payload_bytes) = match semi {
+            Some(idx) => (&content[..idx], &content[idx + 1..]),
+            None => (content, &[][..]),
+        };
+        let hdr = parse_kitty_header(hdr_bytes);
+
+        let emit_raw = |out: &mut Vec<u8>| {
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(content);
+            out.extend_from_slice(suffix);
+        };
+
+        if let Some(mut active) = self.chunked.take() {
+            let is_cont = hdr.action.is_none()
+                || (hdr.action == Some(active.action.as_str())
+                    && active.id.is_some()
+                    && hdr.id == active.id);
+            if is_cont {
+                if active.passthrough {
+                    emit_raw(&mut res.out_bytes);
+                    if hdr.more {
+                        self.chunked = Some(active);
+                    }
+                    return;
+                }
+                let chunk_raw_len = prefix.len() + content.len() + suffix.len();
+                if active.total_raw_bytes + chunk_raw_len > MAX_SINGLE_APC_BYTES {
+                    for chunk in active.raw_chunks.drain(..) {
+                        res.out_bytes.extend_from_slice(&chunk);
+                    }
+                    emit_raw(&mut res.out_bytes);
+                    if hdr.more {
+                        active.passthrough = true;
+                        active.payload_parts.clear();
+                        self.chunked = Some(active);
+                    }
+                    return;
+                }
+                let mut raw = Vec::with_capacity(chunk_raw_len);
+                raw.extend_from_slice(prefix);
+                raw.extend_from_slice(content);
+                raw.extend_from_slice(suffix);
+                active.total_raw_bytes += raw.len();
+                active.raw_chunks.push(raw);
+                active.payload_parts.push(payload_bytes.to_vec());
+
+                if hdr.more {
+                    self.chunked = Some(active);
+                    return;
+                }
+
+                if let Some(synthetic) = try_ingest_kitty_image(
+                    &active.first_header,
+                    &active.action,
+                    active.format,
+                    active.medium.as_deref(),
+                    active.width,
+                    active.height,
+                    &active.payload_parts,
+                ) {
+                    res.out_bytes.extend_from_slice(&synthetic);
+                } else {
+                    for chunk in active.raw_chunks {
+                        res.out_bytes.extend_from_slice(&chunk);
+                    }
+                }
+                return;
+            }
+            if !active.passthrough {
+                for chunk in active.raw_chunks {
+                    res.out_bytes.extend_from_slice(&chunk);
+                }
+            }
+        }
+
+        // Probe unlink: `a=q` with `t=t`
+        if hdr.action == Some("q") && hdr.medium == Some("t") && !hdr.more {
+            if let Some(path_bytes) = base64_decode(payload_bytes) {
+                if let Ok(path_str) = std::str::from_utf8(&path_bytes) {
+                    let trimmed = path_str.trim_end_matches('\0').trim();
+                    if !trimmed.is_empty() {
+                        let raw_path = Path::new(trimmed);
+                        if is_temp_path(raw_path) {
+                            let unlinked = match std::fs::symlink_metadata(raw_path) {
+                                Ok(meta) if !meta.file_type().is_symlink() && meta.is_file() => {
+                                    std::fs::remove_file(raw_path).is_ok()
+                                }
+                                Ok(_) => false,
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                                Err(_) => false,
+                            };
+                            if unlinked {
+                                if hdr.quiet == 0 {
+                                    if let Some(id) = hdr.id {
+                                        res.auto_replies
+                                            .push(format!("\x1b_Gi={id};OK\x1b\\").into_bytes());
+                                    } else if let Some(num) = hdr.image_number {
+                                        res.auto_replies
+                                            .push(format!("\x1b_GI={num};OK\x1b\\").into_bytes());
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            emit_raw(&mut res.out_bytes);
+            return;
+        }
+
+        let is_upload_action = match hdr.action {
+            Some("t") | Some("T") => true,
+            None => {
+                !payload_bytes.is_empty()
+                    && (hdr.format.is_some()
+                        || hdr.medium.is_some()
+                        || (hdr.width.is_some() && hdr.height.is_some()))
+            }
+            Some(_) => false,
+        };
+        let eligible_medium = matches!(hdr.medium, None | Some("d") | Some("f") | Some("t"));
+        let eligible_format = matches!(hdr.format, None | Some(100) | Some(32) | Some(24));
+        let eligible_comp = hdr.compression.is_none();
+
+        if !is_upload_action || !eligible_medium || !eligible_format || !eligible_comp {
+            emit_raw(&mut res.out_bytes);
+            if hdr.more {
+                self.chunked = Some(ActiveChunkUpload {
+                    action: hdr.action.unwrap_or("t").to_string(),
+                    id: hdr.id,
+                    first_header: Vec::new(),
+                    format: hdr.format,
+                    medium: hdr.medium.map(str::to_string),
+                    width: hdr.width,
+                    height: hdr.height,
+                    passthrough: true,
+                    raw_chunks: Vec::new(),
+                    payload_parts: Vec::new(),
+                    total_raw_bytes: 0,
+                });
+            }
+            return;
+        }
+
+        let action_str = hdr.action.unwrap_or("t");
+        if hdr.more {
+            let dim_too_big = matches!(hdr.format, Some(24) | Some(32))
+                && hdr
+                    .width
+                    .zip(hdr.height)
+                    .and_then(|(w, h)| (w as usize).checked_mul(h as usize)?.checked_mul(4))
+                    .is_some_and(|n| n + 122 > MAX_MEM_TERM_BYTES);
+            if dim_too_big {
+                emit_raw(&mut res.out_bytes);
+                self.chunked = Some(ActiveChunkUpload {
+                    action: action_str.to_string(),
+                    id: hdr.id,
+                    first_header: Vec::new(),
+                    format: hdr.format,
+                    medium: hdr.medium.map(str::to_string),
+                    width: hdr.width,
+                    height: hdr.height,
+                    passthrough: true,
+                    raw_chunks: Vec::new(),
+                    payload_parts: Vec::new(),
+                    total_raw_bytes: 0,
+                });
+                return;
+            }
+            let raw_len = prefix.len() + content.len() + suffix.len();
+            let mut raw = Vec::with_capacity(raw_len);
+            raw.extend_from_slice(prefix);
+            raw.extend_from_slice(content);
+            raw.extend_from_slice(suffix);
+            self.chunked = Some(ActiveChunkUpload {
+                action: action_str.to_string(),
+                id: hdr.id,
+                first_header: hdr_bytes.to_vec(),
+                format: hdr.format,
+                medium: hdr.medium.map(str::to_string),
+                width: hdr.width,
+                height: hdr.height,
+                passthrough: false,
+                raw_chunks: vec![raw],
+                payload_parts: vec![payload_bytes.to_vec()],
+                total_raw_bytes: raw_len,
+            });
+            return;
+        }
+
+        let single_part = [payload_bytes.to_vec()];
+        if let Some(synthetic) = try_ingest_kitty_image(
+            hdr_bytes,
+            action_str,
+            hdr.format,
+            hdr.medium,
+            hdr.width,
+            hdr.height,
+            &single_part,
+        ) {
+            res.out_bytes.extend_from_slice(&synthetic);
+        } else {
+            emit_raw(&mut res.out_bytes);
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1328,5 +2509,208 @@ mod tests {
         assert!(local_term_stat_image(txt.to_string_lossy().into_owned(), None).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base64_decode_handles_fast_path_padding_and_whitespace() {
+        use super::base64_decode;
+        assert_eq!(base64_decode(b"").unwrap(), b"");
+        assert_eq!(base64_decode(b"Zg==").unwrap(), b"f");
+        assert_eq!(base64_decode(b"Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode(b"aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
+        assert_eq!(base64_decode(b"aGVs\nbG8g\r\nd29y\tbGQ=").unwrap(), b"hello world");
+        let raw: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
+        let enc = base64_encode(&raw);
+        assert_eq!(base64_decode(enc.as_bytes()).unwrap(), raw);
+        assert!(base64_decode(b"!!!").is_none());
+        assert!(base64_decode(b"A").is_none());
+    }
+
+    #[test]
+    fn bmp_v4_encoder_writes_122_byte_header_and_top_down_rgba_pixels() {
+        use super::build_bmp_v4_from_pixels;
+
+        let rgba = [255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 10, 20, 30, 0];
+        let bmp = build_bmp_v4_from_pixels(2, 2, 32, &rgba).unwrap();
+        assert_eq!(bmp.len(), 122 + 16);
+        assert_eq!(&bmp[0..2], b"BM");
+        assert_eq!(u32::from_le_bytes(bmp[2..6].try_into().unwrap()), 138);
+        assert_eq!(u32::from_le_bytes(bmp[10..14].try_into().unwrap()), 122);
+        assert_eq!(u32::from_le_bytes(bmp[14..18].try_into().unwrap()), 108);
+        assert_eq!(i32::from_le_bytes(bmp[18..22].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(bmp[22..26].try_into().unwrap()), -2);
+        assert_eq!(u16::from_le_bytes(bmp[28..30].try_into().unwrap()), 32);
+        assert_eq!(u32::from_le_bytes(bmp[30..34].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bmp[54..58].try_into().unwrap()), 0x0000_00ff);
+        assert_eq!(u32::from_le_bytes(bmp[58..62].try_into().unwrap()), 0x0000_ff00);
+        assert_eq!(u32::from_le_bytes(bmp[62..66].try_into().unwrap()), 0x00ff_0000);
+        assert_eq!(u32::from_le_bytes(bmp[66..70].try_into().unwrap()), 0xff00_0000);
+        assert_eq!(&bmp[122..], &rgba);
+
+        let rgb = [10, 20, 30, 40, 50, 60];
+        let bmp24 = build_bmp_v4_from_pixels(2, 1, 24, &rgb).unwrap();
+        assert_eq!(bmp24.len(), 122 + 8);
+        assert_eq!(i32::from_le_bytes(bmp24[22..26].try_into().unwrap()), -1);
+        assert_eq!(&bmp24[122..], &[10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn apc_stream_intercepts_chunked_f32_and_f100_across_frame_boundaries() {
+        use super::{get_mem_image, ChannelApcStream};
+
+        let rgba = vec![
+            255, 10, 20, 255, 30, 40, 50, 200,
+            60, 70, 80, 100, 90, 100, 110, 0,
+        ];
+        let b64 = base64_encode(&rgba);
+        let split_at = b64.len() / 2;
+        let stream_bytes = format!(
+            "hello \x1b_Ga=T,f=32,s=2,v=2,i=42,p=7,c=2,r=1,x=1,y=1,w=2,h=2,X=2,Y=3,C=1,U=0,z=-1,q=2,m=1;{}\x1b\\\
+             \x1b_Gm=0;{}\x1b\\ world",
+            &b64[..split_at],
+            &b64[split_at..],
+        );
+
+        // Feed 1 byte at a time to exercise every prefix, suffix, and frame split.
+        let mut parser = ChannelApcStream::default();
+        let mut out = Vec::new();
+        for b in stream_bytes.as_bytes().chunks(1) {
+            let res = parser.push(b);
+            assert!(res.auto_replies.is_empty());
+            out.extend_from_slice(&res.out_bytes);
+        }
+        let out_str = String::from_utf8(out).unwrap();
+        assert!(out_str.starts_with("hello \x1b_G"), "{out_str}");
+        assert!(out_str.ends_with(" world"), "{out_str}");
+        assert!(out_str.contains(";pocket-mem:"), "{out_str}");
+        assert!(out_str.contains("/2x2\x1b\\"), "{out_str}");
+        assert!(out_str.contains("a=T"));
+        assert!(out_str.contains("i=42"));
+        assert!(out_str.contains("p=7"));
+        assert!(out_str.contains("c=2,r=1"));
+        assert!(out_str.contains("X=2,Y=3"));
+        assert!(out_str.contains("C=1,U=0,z=-1,q=2"));
+        assert!(out_str.contains("t=d,m=0,s=2,v=2"));
+
+        let mem_part = out_str.split(";pocket-mem:").nth(1).unwrap();
+        let mem_id: u64 = mem_part.split('/').next().unwrap().parse().unwrap();
+        let (mime, cached) = get_mem_image(mem_id).unwrap();
+        assert_eq!(mime, "image/bmp");
+        assert_eq!(&cached[122..], rgba.as_slice());
+
+        // f=100 PNG via C1 \x9fG...\x9c and BEL \x1b_G...\x07
+        let mut png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&32u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let png_b64 = base64_encode(&png);
+        let mut c1_stream = Vec::new();
+        c1_stream.extend_from_slice(b"pre");
+        c1_stream.extend_from_slice(format!("\x1b_Ga=t,f=100,i=8;{png_b64}\x07").as_bytes());
+        c1_stream.extend_from_slice(&[0x9f, b'G']);
+        c1_stream.extend_from_slice(format!("a=T,f=100,i=9;{png_b64}").as_bytes());
+        c1_stream.push(0x9c);
+        c1_stream.extend_from_slice(b"post");
+
+        let mut parser2 = ChannelApcStream::default();
+        let mut out2 = Vec::new();
+        for chunk in c1_stream.chunks(3) {
+            out2.extend_from_slice(&parser2.push(chunk).out_bytes);
+        }
+        let out2_str = String::from_utf8(out2).unwrap();
+        assert!(out2_str.starts_with("pre\x1b_G"));
+        assert!(out2_str.contains("/64x32\x1b\\"));
+        assert!(out2_str.ends_with("post"));
+        let ids: Vec<u64> = out2_str
+            .split(";pocket-mem:")
+            .skip(1)
+            .map(|s| s.split('/').next().unwrap().parse::<u64>().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            let (m, bytes) = get_mem_image(id).unwrap();
+            assert_eq!(m, "image/png");
+            assert_eq!(bytes.as_slice(), png.as_slice());
+        }
+    }
+
+    #[test]
+    fn apc_stream_unlinks_probes_and_t_files_safely_and_preserves_utf8() {
+        use super::{get_mem_image, ChannelApcStream};
+
+        let dir = std::env::temp_dir().join(format!("herdr-apc-probe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Probe with q=2 (herdr FileTransport style): unlink + strip + no reply
+        let probe_q2 = dir.join("tty-graphics-protocol-probe-q2");
+        std::fs::write(&probe_q2, [0, 0, 0, 0]).unwrap();
+        let probe_q2_b64 = base64_encode(probe_q2.to_string_lossy().as_bytes());
+        let mut parser = ChannelApcStream::default();
+        let r1 = parser.push(format!("A\x1b_Ga=q,t=t,f=32,s=1,v=1,i=1,q=2;{probe_q2_b64}\x1b\\B").as_bytes());
+        assert_eq!(r1.out_bytes, b"AB");
+        assert!(r1.auto_replies.is_empty());
+        assert!(!probe_q2.exists());
+
+        // 2. Probe with q=0: unlink + strip + OK reply
+        let probe_q0 = dir.join("tty-graphics-protocol-probe-q0");
+        std::fs::write(&probe_q0, [0, 0, 0, 0]).unwrap();
+        let probe_q0_b64 = base64_encode(probe_q0.to_string_lossy().as_bytes());
+        let r2 = parser.push(format!("\x1b_Ga=q,t=t,f=32,s=1,v=1,i=55,q=0;{probe_q0_b64}\x1b\\").as_bytes());
+        assert!(r2.out_bytes.is_empty());
+        assert_eq!(r2.auto_replies, vec![b"\x1b_Gi=55;OK\x1b\\".to_vec()]);
+        assert!(!probe_q0.exists());
+
+        // 3. t=t temp image read into memory THEN unlinked; t=f kept on disk
+        let temp_rgba = dir.join("tty-graphics-protocol-1");
+        std::fs::write(&temp_rgba, [1, 2, 3, 255]).unwrap();
+        let temp_b64 = base64_encode(temp_rgba.to_string_lossy().as_bytes());
+        let r3 = parser.push(format!("\x1b_Ga=T,t=t,f=32,s=1,v=1,i=77,q=2;{temp_b64}\x1b\\").as_bytes());
+        assert!(!temp_rgba.exists(), "t=t file must be unlinked after ingest");
+        let r3_str = String::from_utf8(r3.out_bytes).unwrap();
+        let id3: u64 = r3_str.split(";pocket-mem:").nth(1).unwrap().split('/').next().unwrap().parse().unwrap();
+        assert_eq!(&get_mem_image(id3).unwrap().1[122..], &[1, 2, 3, 255]);
+
+        let perm_png = dir.join("keep.png");
+        let mut png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&12u32.to_be_bytes());
+        png.extend_from_slice(&16u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        std::fs::write(&perm_png, &png).unwrap();
+        let perm_b64 = base64_encode(perm_png.to_string_lossy().as_bytes());
+        let r4 = parser.push(format!("\x1b_Ga=T,t=f,f=100,i=78;{perm_b64}\x1b\\").as_bytes());
+        assert!(perm_png.exists(), "t=f file must stay on disk");
+        assert!(String::from_utf8(r4.out_bytes).unwrap().contains("/12x16\x1b\\"));
+
+        // 4. UTF-8 multi-byte sequences containing 0x9f (e.g. `ßG`, `🚀G`) and o=z / a=p / a=d pass untouched
+        let passthrough = "ßG 🚀G \x1b_Ga=T,o=z,f=32,s=1,v=1;eJw=\x1b\\ \x1b_Ga=p,i=77\x1b\\ \x1b_Ga=d,d=a\x1b\\";
+        let mut out_pt = Vec::new();
+        for ch in passthrough.as_bytes().chunks(1) {
+            out_pt.extend_from_slice(&parser.push(ch).out_bytes);
+        }
+        assert_eq!(out_pt, passthrough.as_bytes());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mem_image_cache_enforces_64_entry_lru_bound() {
+        use super::{get_mem_image, insert_mem_image};
+
+        let first = insert_mem_image("image/png", vec![1, 2, 3]).unwrap();
+        let mut ids = vec![first];
+        for i in 1..64 {
+            ids.push(insert_mem_image("image/png", vec![i as u8; 4]).unwrap());
+        }
+        // Touch `first` so it becomes MRU and `ids[1]` becomes LRU.
+        assert!(get_mem_image(first).is_some());
+        let extra = insert_mem_image("image/png", vec![99; 4]).unwrap();
+        assert!(get_mem_image(extra).is_some());
+        assert!(get_mem_image(first).is_some(), "MRU entry must survive eviction");
+        assert!(get_mem_image(ids[1]).is_none(), "LRU entry must be evicted at cap");
     }
 }

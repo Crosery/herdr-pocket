@@ -799,6 +799,37 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
         return empty_err(400);
     };
 
+    let term_img_id: Option<Option<u64>> = if url.host_str() == Some("term-img") {
+        let trimmed = url.path().trim_matches('/');
+        let raw = trimmed.strip_prefix("term-img/").unwrap_or(trimmed);
+        Some((!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| raw.parse::<u64>().ok())
+            .flatten())
+    } else if let Some(rest) = url.path().strip_prefix("/term-img/") {
+        let raw = rest.trim_matches('/');
+        Some((!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| raw.parse::<u64>().ok())
+            .flatten())
+    } else {
+        None
+    };
+
+    if let Some(id_opt) = term_img_id {
+        let Some(id) = id_opt else {
+            return empty_err(404);
+        };
+        let Some((mime, bytes)) = local_term::get_mem_image(id) else {
+            return empty_err(404);
+        };
+        return tauri::http::Response::builder()
+            .status(200)
+            .header("content-type", mime)
+            .header("content-length", bytes.len().to_string())
+            .header("cache-control", "public, max-age=3600, immutable")
+            .body((*bytes).clone())
+            .unwrap();
+    }
+
     let mut path_param: Option<String> = None;
     let mut cwd_param: Option<String> = None;
     for (k, v) in url.query_pairs() {
@@ -942,5 +973,38 @@ mod tests {
         assert_eq!(parse_byte_range("bytes=-64", 500), Some(Ok((436, 499))));
         assert_eq!(parse_byte_range("bytes=500-510", 500), Some(Err(())));
         assert_eq!(parse_byte_range("bytes=10-5", 500), Some(Err(())));
+    }
+
+    #[test]
+    fn serve_pocket_local_serves_term_img_from_memory_cache() {
+        let png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+        let id = crate::local_term::insert_mem_image("image/png", png.clone()).unwrap();
+
+        for uri in [
+            format!("pocket-local://localhost/term-img/{id}"),
+            format!("http://pocket-local.localhost/term-img/{id}"),
+            format!("pocket-local://term-img/{id}"),
+        ] {
+            let resp = super::serve_pocket_local(&uri, None);
+            assert_eq!(resp.status().as_u16(), 200, "uri={uri}");
+            assert_eq!(
+                resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+                Some("image/png")
+            );
+            assert_eq!(
+                resp.headers().get("content-length").and_then(|v| v.to_str().ok()),
+                Some("12")
+            );
+            assert_eq!(
+                resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+                Some("public, max-age=3600, immutable")
+            );
+            assert_eq!(resp.body(), &png);
+        }
+
+        let miss = super::serve_pocket_local("pocket-local://localhost/term-img/99999999", None);
+        assert_eq!(miss.status().as_u16(), 404);
+        let bad = super::serve_pocket_local("pocket-local://localhost/term-img/not-an-id", None);
+        assert_eq!(bad.status().as_u16(), 404);
     }
 }

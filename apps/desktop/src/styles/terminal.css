@@ -76,6 +76,7 @@
   pointer-events: none;
   overflow: hidden;
   z-index: 4;
+  contain: layout style;
 }
 
 .tp-kitty-clip {
@@ -83,6 +84,7 @@
   pointer-events: none;
   user-select: none;
   overflow: hidden;
+  contain: layout paint;
 }
 
 .tp-kitty-img {

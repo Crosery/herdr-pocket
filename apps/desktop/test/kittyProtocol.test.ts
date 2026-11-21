@@ -11,9 +11,12 @@ import {
   deleteKittyVirtualPlacements,
   encodeKittyKey,
   encodeKittySentinel,
+  encodeRgbaBmpV4,
   lookupKittyVirtualPlacement,
   parseKittyGfxCommand,
   parseOsc66,
+  parsePocketMemPayload,
+  pocketTermImageUrl,
   registerKittyVirtualPlacement,
   shouldCreateCursorPlacement,
   terminalTextColumns,
@@ -260,4 +263,92 @@ test("7x3 avatar grids keep column 7 text aligned with zero raw U+10EEEE and mer
   assert.equal(scrolledBlocks[0]!.startAbsY, 1);
   assert.equal(scrolledBlocks[0]!.rows, 2);
   assert.equal(scrolledBlocks[0]!.startTileRow, 1);
+});
+
+test("parsePocketMemPayload and pocketTermImageUrl resolve Rust zero-copy handles", () => {
+  assert.deepEqual(parsePocketMemPayload("pocket-mem:42/640x480"), {
+    id: "42",
+    width: 640,
+    height: 480,
+  });
+  assert.deepEqual(parsePocketMemPayload("pocket-mem:1/0x0"), {
+    id: "1",
+    width: 0,
+    height: 0,
+  });
+  assert.equal(parsePocketMemPayload("pocket-mem:/64x64"), null);
+  assert.equal(parsePocketMemPayload("pocket-mem:abc/64x64"), null);
+  assert.equal(parsePocketMemPayload("pocket-mem:7/64"), null);
+  assert.equal(parsePocketMemPayload("iVBORw0KGgo="), null);
+
+  assert.equal(pocketTermImageUrl("42", false), "pocket-local://localhost/term-img/42");
+  assert.equal(pocketTermImageUrl("42", true), "http://pocket-local.localhost/term-img/42");
+});
+
+test("parseKittyGfxCommand parses crop rect (x/y/w/h), sub-cell offsets (X/Y), and chunk split across \\x9f", () => {
+  const cmd = parseKittyGfxCommand(
+    "a=T,f=100,i=7,p=3,x=12,y=24,w=48,h=36,X=3,Y=5,c=4,r=2,C=1,z=-2,q=2;pocket-mem:9/128x128",
+  );
+  assert.equal(cmd.action, "T");
+  assert.equal(cmd.format, 100);
+  assert.equal(cmd.id, 7);
+  assert.equal(cmd.placementId, 3);
+  assert.equal(cmd.cropX, 12);
+  assert.equal(cmd.cropY, 24);
+  assert.equal(cmd.cropW, 48);
+  assert.equal(cmd.cropH, 36);
+  assert.equal(cmd.cellOffsetX, 3);
+  assert.equal(cmd.cellOffsetY, 5);
+  assert.equal(cmd.cols, 4);
+  assert.equal(cmd.rows, 2);
+  assert.equal(cmd.cursorMovement, 1);
+  assert.equal(cmd.zIndex, -2);
+  assert.equal(cmd.quiet, 2);
+  assert.equal(cmd.payload, "pocket-mem:9/128x128");
+
+  const splitter = new KittyApcSplitter();
+  const seg1 = splitter.push("hi\x9f");
+  const seg2 = splitter.push("Ga=T,i=1;pocket-mem:1/8x8\x9cdone");
+  assert.deepEqual(seg1, [{ kind: "vt", data: "hi" }]);
+  assert.deepEqual(seg2, [
+    { kind: "kitty", raw: "a=T,i=1;pocket-mem:1/8x8" },
+    { kind: "vt", data: "done" },
+  ]);
+});
+
+test("encodeRgbaBmpV4 builds 122-byte top-down BI_BITFIELDS RGBA BITMAPV4HEADER BMPs", () => {
+  const rgba = new Uint8Array([
+    10, 20, 30, 128,
+    40, 50, 60, 255,
+  ]);
+  const bmp32 = encodeRgbaBmpV4(2, 1, rgba, 32);
+  assert.ok(bmp32);
+  assert.equal(bmp32.length, 122 + 8);
+  const view32 = new DataView(bmp32.buffer, bmp32.byteOffset, bmp32.byteLength);
+  assert.equal(bmp32[0], 0x42);
+  assert.equal(bmp32[1], 0x4d);
+  assert.equal(view32.getUint32(2, true), 130);
+  assert.equal(view32.getUint32(10, true), 122);
+  assert.equal(view32.getUint32(14, true), 108);
+  assert.equal(view32.getInt32(18, true), 2);
+  assert.equal(view32.getInt32(22, true), -1);
+  assert.equal(view32.getUint16(28, true), 32);
+  assert.equal(view32.getUint32(30, true), 3);
+  assert.equal(view32.getUint32(54, true), 0x000000ff);
+  assert.equal(view32.getUint32(58, true), 0x0000ff00);
+  assert.equal(view32.getUint32(62, true), 0x00ff0000);
+  assert.equal(view32.getUint32(66, true), 0xff000000);
+  assert.equal(view32.getUint32(70, true), 0);
+  assert.deepEqual(Array.from(bmp32.subarray(122)), Array.from(rgba));
+
+  const rgb = new Uint8Array([1, 2, 3, 4, 5, 6]);
+  const bmp24 = encodeRgbaBmpV4(1, 2, rgb, 24);
+  assert.ok(bmp24);
+  assert.equal(bmp24.length, 122 + 8);
+  const view24 = new DataView(bmp24.buffer, bmp24.byteOffset, bmp24.byteLength);
+  assert.equal(view24.getInt32(18, true), 1);
+  assert.equal(view24.getInt32(22, true), -2);
+  assert.deepEqual(Array.from(bmp24.subarray(122)), [1, 2, 3, 255, 4, 5, 6, 255]);
+
+  assert.equal(encodeRgbaBmpV4(2, 2, rgba, 32), null);
 });
