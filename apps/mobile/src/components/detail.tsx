@@ -95,7 +95,7 @@ import { usePalette } from "../theme/theme";
 import { agentStatusLabel, fonts, radius, space, statusColors } from "../theme/tokens";
 import { TermKeyboard } from "./TermKeyboard";
 import { EmptyState, IconTile, PocketToast, SendPill } from "./ui";
-import { PocketButton, PocketCheck, PocketDialog, PocketInput, PocketProgress, PocketSpinner, RowAction, type PocketIcon } from "./pocket";
+import { PocketButton, PocketCheck, PocketDialog, PocketProgress, PocketSpinner, RowAction, type PocketIcon } from "./pocket";
 
 // ---------------------------------------------------------------------------
 // Terminal
@@ -1401,6 +1401,166 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
           </ScrollView>
         </View>
       ) : null}
+      {mode === "chat" && modelOpen ? (() => {
+        const q = modelFilter.trim().toLowerCase();
+        const filteredModels = (modelData?.models ?? []).filter(
+          (m) => !q || m.id.toLowerCase().includes(q) || m.label.toLowerCase().includes(q) || (m.provider?.toLowerCase().includes(q) ?? false),
+        );
+        const trimmedFilter = modelFilter.trim();
+        const exactMatch = trimmedFilter ? filteredModels.some((m) => m.id.toLowerCase() === trimmedFilter.toLowerCase()) : false;
+        const canCustom = Boolean(trimmedFilter && !exactMatch && modelData?.canSwitch !== false);
+        const currentModel = modelData?.currentModel || agent.model;
+        return (
+          <View
+            accessibilityLabel="切换模型下拉列表"
+            style={{
+              marginHorizontal: space.lg,
+              marginBottom: space.xs,
+              borderRadius: radius.card,
+              backgroundColor: p.surface,
+              borderWidth: 1,
+              borderColor: p.dark ? p.surface3 : "#FBE3EC",
+              maxHeight: 236,
+              overflow: "hidden",
+            }}
+          >
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                paddingHorizontal: space.sm,
+                height: 36,
+                borderBottomWidth: 1,
+                borderBottomColor: p.divider,
+                backgroundColor: p.surface2,
+                gap: 6,
+              }}
+            >
+              <MaterialCommunityIcons name="magnify" size={15} color={p.faint} />
+              <RNTextInput
+                value={modelFilter}
+                onChangeText={setModelFilter}
+                placeholder="筛选或输入模型 ID…"
+                placeholderTextColor={p.faint}
+                editable={modelData?.canSwitch !== false}
+                autoCapitalize="none"
+                autoCorrect={false}
+                returnKeyType="go"
+                onSubmitEditing={() => {
+                  if (modelData?.canSwitch === false) return;
+                  if (filteredModels.length > 0) applyModelChoice(filteredModels[0]!.id);
+                  else if (trimmedFilter) applyModelChoice(trimmedFilter);
+                }}
+                style={{
+                  flex: 1,
+                  fontFamily: fonts.mono,
+                  fontSize: 12.5,
+                  color: p.ink,
+                  paddingVertical: 4,
+                }}
+                accessibilityLabel="筛选或输入模型 ID"
+              />
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="关闭模型列表"
+                onPress={() => setModelOpen(false)}
+                hitSlop={8}
+                style={{ padding: 4 }}
+              >
+                <MaterialCommunityIcons name="close" size={15} color={p.muted} />
+              </Pressable>
+            </View>
+            {modelData && !modelData.canSwitch ? (
+              <View style={{ paddingHorizontal: space.sm, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: p.divider, backgroundColor: p.surface2 }}>
+                <Text style={{ fontSize: 11.5, color: p.error }}>{modelData.reason || "当前会话不支持切换模型"}</Text>
+              </View>
+            ) : null}
+            {modelError ? (
+              <View style={{ paddingHorizontal: space.sm, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: p.divider, backgroundColor: p.surface2 }}>
+                <Text style={{ fontSize: 11.5, color: p.error }}>{modelError}</Text>
+              </View>
+            ) : null}
+            <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="always" contentContainerStyle={{ padding: space.xs, gap: 2 }}>
+              {modelLoading && !modelData ? (
+                <View style={{ paddingVertical: 14, alignItems: "center" }}>
+                  <PocketSpinner size={18} />
+                </View>
+              ) : filteredModels.length === 0 && !canCustom ? (
+                <Text style={{ textAlign: "center", paddingVertical: 14, fontSize: 12.5, color: p.faint }}>没有找到匹配的模型</Text>
+              ) : (
+                <>
+                  {filteredModels.map((m) => {
+                    const active = Boolean(currentModel && currentModel.toLowerCase() === m.id.toLowerCase());
+                    const ctxHint = m.contextWindow && Number.isFinite(m.contextWindow)
+                      ? m.contextWindow >= 1_000_000
+                        ? `${(m.contextWindow / 1_000_000).toFixed(m.contextWindow % 1_000_000 === 0 ? 0 : 1)}M`
+                        : `${Math.round(m.contextWindow / 1_000)}k`
+                      : null;
+                    return (
+                      <Pressable
+                        key={m.id}
+                        disabled={modelData?.canSwitch === false}
+                        onPress={() => applyModelChoice(m.id)}
+                        style={({ pressed }) => ({
+                          flexDirection: "row",
+                          alignItems: "center",
+                          gap: 8,
+                          paddingHorizontal: space.sm,
+                          paddingVertical: 7,
+                          borderRadius: radius.sm,
+                          backgroundColor: pressed ? p.surface3 : active ? p.accentContainer : "transparent",
+                          opacity: modelData?.canSwitch === false ? 0.5 : 1,
+                        })}
+                      >
+                        <MaterialCommunityIcons name="cpu-64-bit" size={14} color={active ? p.accentText : p.muted} />
+                        <Text
+                          numberOfLines={1}
+                          style={{
+                            flex: 1,
+                            fontFamily: active ? fonts.monoBold : fonts.mono,
+                            fontSize: 12.5,
+                            color: active ? p.accentText : p.ink,
+                          }}
+                        >
+                          {m.id}
+                        </Text>
+                        {ctxHint ? (
+                          <Text style={{ fontFamily: fonts.mono, fontSize: 10.5, color: p.muted }}>{ctxHint}</Text>
+                        ) : null}
+                        <Text style={{ fontSize: 10.5, color: p.muted }}>
+                          {m.source === "current" ? "当前" : m.source === "recent" ? "常用" : "目录"}
+                        </Text>
+                        {active ? <MaterialCommunityIcons name="check" size={14} color={p.accentText} /> : null}
+                      </Pressable>
+                    );
+                  })}
+                  {canCustom ? (
+                    <Pressable
+                      disabled={modelData?.canSwitch === false}
+                      onPress={() => applyModelChoice(trimmedFilter)}
+                      style={({ pressed }) => ({
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 8,
+                        paddingHorizontal: space.sm,
+                        paddingVertical: 7,
+                        borderRadius: radius.sm,
+                        backgroundColor: pressed ? p.surface3 : "transparent",
+                      })}
+                    >
+                      <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
+                      <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.monoBold, fontSize: 12.5, color: p.accentText }}>
+                        {`切换到 ${trimmedFilter}`}
+                      </Text>
+                      <Text style={{ fontSize: 10.5, color: p.muted }}>自定义</Text>
+                    </Pressable>
+                  ) : null}
+                </>
+              )}
+            </ScrollView>
+          </View>
+        );
+      })() : null}
       {showInput ? (
       <View
         style={{
@@ -1458,27 +1618,28 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
             {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
               <Pressable
                 disabled={!online}
-                onPress={openModelPicker}
+                onPress={() => (modelOpen ? setModelOpen(false) : openModelPicker())}
                 accessibilityRole="button"
                 accessibilityLabel={agent.model ? `当前模型 ${agent.model}，点击切换` : "切换模型"}
                 style={({ pressed }) => ({
                   height: 36,
-                  maxWidth: 150,
+                  maxWidth: 165,
                   paddingHorizontal: 10,
                   borderRadius: 18,
                   flexDirection: "row",
                   alignItems: "center",
                   gap: 4,
-                  backgroundColor: pressed ? p.surface3 : p.surface2,
+                  backgroundColor: pressed ? p.surface3 : modelOpen ? p.accentContainer : p.surface2,
                   borderWidth: 1,
-                  borderColor: p.divider,
+                  borderColor: modelOpen ? p.primary : p.divider,
                   opacity: online ? 1 : 0.45,
                 })}
               >
                 <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
-                <Text numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 12, color: p.ink, flexShrink: 1 }}>
+                <Text numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 12, color: modelOpen ? p.accentText : p.ink, flexShrink: 1 }}>
                   {agent.model ? agent.model.split("/").pop() : "模型"}
                 </Text>
+                <MaterialCommunityIcons name={modelOpen ? "chevron-up" : "chevron-down"} size={13} color={modelOpen ? p.accentText : p.muted} />
               </Pressable>
             ) : null}
             <View style={{ flex: 1 }} />
@@ -1534,79 +1695,6 @@ export function Composer({ agent, bottomInset, mode, onOpenTerminal }: { agent: 
         )}
       </View>
       ) : null}
-      <PocketDialog
-        visible={modelOpen}
-        onDismiss={() => setModelOpen(false)}
-        title="切换模型"
-        body={modelData?.currentModel || agent.model ? `当前模型：${modelData?.currentModel || agent.model}` : "选择或输入目标模型 ID"}
-        scroll
-        actions={[
-          ...(modelFilter.trim() && modelData?.canSwitch !== false
-            ? [{ label: `切换到 ${modelFilter.trim()}`, onPress: () => applyModelChoice(modelFilter.trim()) }]
-            : []),
-          { label: "取消", tone: "ghost" as const, onPress: () => setModelOpen(false) },
-        ]}
-      >
-        <View style={{ gap: space.sm, paddingBottom: space.xs }}>
-          {modelData && !modelData.canSwitch ? (
-            <Text style={{ fontSize: 13, color: p.error }}>{modelData.reason || "当前会话不支持切换模型"}</Text>
-          ) : null}
-          {modelError ? <Text style={{ fontSize: 13, color: p.error }}>{modelError}</Text> : null}
-          <PocketInput
-            mono
-            icon="magnify"
-            value={modelFilter}
-            onChangeText={setModelFilter}
-            placeholder="筛选或输入模型 ID…"
-            autoCapitalize="none"
-          />
-          {modelLoading && !modelData ? (
-            <View style={{ paddingVertical: 14, alignItems: "center" }}>
-              <PocketSpinner size={20} />
-            </View>
-          ) : (
-            <View style={{ gap: 6 }}>
-              {(modelData?.models ?? [])
-                .filter((m) => {
-                  const q = modelFilter.trim().toLowerCase();
-                  return !q || m.id.toLowerCase().includes(q) || m.label.toLowerCase().includes(q);
-                })
-                .map((m) => {
-                  const active = (modelData?.currentModel || agent.model)?.toLowerCase() === m.id.toLowerCase();
-                  return (
-                    <Pressable
-                      key={m.id}
-                      disabled={modelData?.canSwitch === false}
-                      onPress={() => applyModelChoice(m.id)}
-                      style={({ pressed }) => ({
-                        flexDirection: "row",
-                        alignItems: "center",
-                        gap: 8,
-                        paddingHorizontal: 10,
-                        paddingVertical: 9,
-                        borderRadius: radius.md,
-                        borderWidth: 1,
-                        borderColor: active ? p.primary : p.divider,
-                        backgroundColor: pressed ? p.surface3 : active ? p.accentContainer : p.surface2,
-                      })}
-                    >
-                      <MaterialCommunityIcons name="cpu-64-bit" size={16} color={active ? p.accentText : p.muted} />
-                      <View style={{ flex: 1 }}>
-                        <Text numberOfLines={1} style={{ fontFamily: fonts.monoBold, fontSize: 13, color: p.ink }}>{m.id}</Text>
-                        {m.label && m.label !== m.id ? (
-                          <Text numberOfLines={1} style={{ fontSize: 11.5, color: p.muted }}>{m.label}</Text>
-                        ) : null}
-                      </View>
-                      <Text style={{ fontSize: 11, color: p.muted }}>
-                        {m.source === "current" ? "当前" : m.source === "recent" ? "常用" : "目录"}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-            </View>
-          )}
-        </View>
-      </PocketDialog>
       <KeyLayoutDialog visible={tuning} onDismiss={() => setTuning(false)} />
       <PocketToast visible={!!toast} message={toast} tone="info" bottom={140} onDismiss={() => setToast(null)} />
     </View>

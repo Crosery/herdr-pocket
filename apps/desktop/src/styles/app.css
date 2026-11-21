@@ -4638,100 +4638,139 @@ a {
   color: var(--faint);
 }
 
-.model-switch-list {
-  max-height: min(320px, 46vh);
-  overflow-y: auto;
+.model-pop {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 2px;
+  background: var(--surface);
+  border: 1px solid var(--divider);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
 }
 
-.model-switch-row {
+.model-pop-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--surface-2);
+}
+
+.model-pop-search-ic {
+  flex: none;
+  color: var(--faint);
+}
+
+.model-pop-input {
+  flex: 1 1 0;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: calc(12px * var(--ts, 1));
+  line-height: 1.4;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.model-pop-input::placeholder {
+  color: var(--faint);
+}
+
+.model-pop-note {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--blush-soft);
+  color: var(--blush-text);
+  font-size: calc(11.5px * var(--ts, 1));
+  line-height: 1.4;
+}
+
+.model-pop-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.model-pop-item {
   display: flex;
   align-items: center;
   gap: 8px;
   width: 100%;
   min-width: 0;
-  padding: 8px 10px;
-  border-radius: 9px;
-  border: 1px solid var(--divider);
-  background: var(--surface-2);
+  padding: 6px 9px;
+  border-radius: var(--r-sm);
+  border: 0;
+  background: transparent;
   color: var(--ink);
   text-align: left;
   font: inherit;
   cursor: pointer;
 }
 
-.model-switch-row:hover:not(:disabled),
-.model-switch-row.on:not(:disabled) {
-  border-color: var(--line-pink);
+.model-pop-item:hover:not(:disabled),
+.model-pop-item.on:not(:disabled) {
   background: var(--accent-soft);
+  color: var(--accent-text);
 }
 
-.model-switch-row.current {
-  border-color: var(--primary);
-}
-
-.model-switch-row:disabled {
+.model-pop-item:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
 
-.model-switch-ic {
+.model-pop-ic {
   flex: none;
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--accent-text);
-  display: inline-grid;
-  place-items: center;
-}
-
-.model-switch-main {
-  flex: 1 1 0;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.model-switch-id {
-  font-size: calc(12.5px * var(--ts, 1));
-  font-weight: 700;
-  color: var(--ink);
-}
-
-.model-switch-sub {
-  font-size: calc(11px * var(--ts, 1));
   color: var(--muted);
 }
 
-.model-switch-tags {
+.model-pop-item:hover:not(:disabled) .model-pop-ic,
+.model-pop-item.on:not(:disabled) .model-pop-ic,
+.model-pop-item.current .model-pop-ic {
+  color: var(--accent-text);
+}
+
+.model-pop-id {
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 600;
+}
+
+.model-pop-item.current .model-pop-id {
+  color: var(--accent-text);
+  font-weight: 700;
+}
+
+.model-pop-meta {
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   gap: 5px;
 }
 
-.model-tag {
+.model-pop-badge {
   font-size: calc(10.5px * var(--ts, 1));
   font-weight: 600;
   padding: 1px 6px;
   border-radius: 999px;
+  background: var(--surface-2);
   border: 1px solid var(--divider);
-  background: var(--surface);
   color: var(--muted);
+  line-height: 1.35;
 }
 
-.model-tag.src-current {
-  border-color: var(--line-pink);
-  background: var(--accent-soft);
+.model-pop-check {
+  flex-shrink: 0;
   color: var(--accent-text);
-}
-
-.model-tag.src-recent {
-  color: var(--ink);
 }
 
 .composer-model-btn {
@@ -4751,8 +4790,18 @@ a {
   cursor: pointer;
 }
 
-.composer-model-btn:hover {
+.composer-model-btn svg:last-child {
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+.composer-model-btn:hover,
+.composer-model-btn.open {
   border-color: var(--line-pink);
   background: var(--accent-soft);
   color: var(--accent-text);
+}
+
+.composer-model-btn.open svg:last-child {
+  transform: rotate(180deg);
 }

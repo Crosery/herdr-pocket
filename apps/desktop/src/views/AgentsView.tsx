@@ -54,7 +54,7 @@ import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DropRail } from "../components/DropRail";
 import { FolderExplorerModal, normalizeFolderKey } from "../components/FolderExplorerModal";
 import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVendor";
-import { ModelSwitchModal } from "../components/ModelSwitchModal";
+import { ModelSwitchDropdown } from "../components/ModelSwitchDropdown";
 import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
@@ -946,16 +946,18 @@ export function AgentDetailPanel({
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
-  const [modelModalOpen, setModelModalOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
 
   useEffect(() => {
     setUsageOpen(false);
     setUsageReport(null);
     setUsageError(null);
-    setModelModalOpen(false);
+    setModelMenuOpen(false);
   }, [agent.key]);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const panelRef = useRef<HTMLDivElement>(null);
+  const composerCardRef = useRef<HTMLDivElement>(null);
+  const modelBtnRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
@@ -1557,7 +1559,7 @@ export function AgentDetailPanel({
     }
     if (!staged.length && /^\/(?:model|models)$/i.test(raw)) {
       if (!isOverride) setText("");
-      setModelModalOpen(true);
+      setModelMenuOpen(true);
       return;
     }
 
@@ -1637,7 +1639,7 @@ export function AgentDetailPanel({
       if (allowAutoSend && /^\/(?:model|models)$/i.test(cmd.name)) {
         setText("");
         setAttachments([]);
-        setModelModalOpen(true);
+        setModelMenuOpen(true);
         return;
       }
       if (allowAutoSend && !cmd.argHint) {
@@ -2001,7 +2003,7 @@ export function AgentDetailPanel({
           error={usageError}
           onRefresh={openUsageView}
           onClose={() => setUsageOpen(false)}
-          onOpenModelSwitch={() => setModelModalOpen(true)}
+          onOpenModelSwitch={() => setModelMenuOpen(true)}
           onRunInTerminal={() => {
             setUsageOpen(false);
             if (agent.status === "working") enqueuePrompt(agent, "/usage", []);
@@ -2021,7 +2023,7 @@ export function AgentDetailPanel({
           onBackMain={goRootSub}
         />
       ) : activeMode === "chat" ? (
-        <div className={`composer-card${dragOver ? " drop-over" : ""}`} style={{ position: "relative" }}>
+        <div ref={composerCardRef} className={`composer-card${dragOver ? " drop-over" : ""}`} style={{ position: "relative" }}>
           {slashOpen ? (
             <SlashCommandPopup
               commands={matchedSlash}
@@ -2208,6 +2210,7 @@ export function AgentDetailPanel({
               value={text}
               onChange={(e) => {
                 setSlashDismissedFor(null);
+                if (e.target.value.startsWith("/") && modelMenuOpen) setModelMenuOpen(false);
                 setText(e.target.value);
               }}
               onPaste={(e) => {
@@ -2233,10 +2236,16 @@ export function AgentDetailPanel({
               <VoiceMicButton />
               {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
                 <button
+                  ref={modelBtnRef}
                   type="button"
-                  className="composer-model-btn"
+                  aria-haspopup="listbox"
+                  aria-expanded={modelMenuOpen}
+                  className={`composer-model-btn${modelMenuOpen ? " open" : ""}`}
                   title={agent.model ? `当前模型：${agent.model}（点击切换）` : "切换模型 (/model)"}
-                  onClick={() => setModelModalOpen(true)}
+                  onClick={() => {
+                    setSlashDismissedFor(text);
+                    setModelMenuOpen((v) => !v);
+                  }}
                 >
                   <Cpu size={13} />
                   <span className="truncate mono">{agent.model ? agent.model.split("/").pop() : "切换模型"}</span>
@@ -2278,10 +2287,12 @@ export function AgentDetailPanel({
         </div>
       ) : null}
 
-      <ModelSwitchModal
-        open={modelModalOpen}
-        onOpenChange={setModelModalOpen}
+      <ModelSwitchDropdown
+        open={modelMenuOpen}
+        onOpenChange={setModelMenuOpen}
         agent={agent}
+        anchorRef={modelBtnRef}
+        fallbackAnchorRef={composerCardRef}
         onSelectModel={applyModelSwitch}
       />
 

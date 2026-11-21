@@ -883,18 +883,85 @@ fn to_cookie(p: Plain) -> tauri::webview::Cookie<'static> {
 }
 
 #[cfg(target_os = "macos")]
+fn build_ns_http_cookie(p: Plain) -> Option<objc2::rc::Retained<objc2_foundation::NSHTTPCookie>> {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{
+        ns_string, NSDate, NSHTTPCookie, NSHTTPCookieDomain, NSHTTPCookieExpires, NSHTTPCookieName,
+        NSHTTPCookieOriginURL, NSHTTPCookiePath, NSHTTPCookiePropertyKey, NSHTTPCookieSecure,
+        NSHTTPCookieValue, NSHTTPCookieVersion, NSMutableDictionary, NSString, NSURL,
+    };
+
+    let name_s = p.name;
+    let val_s = p.value;
+    let bare_host = p.host_key.trim_start_matches('.');
+    if name_s.is_empty() || bare_host.is_empty() {
+        return None;
+    }
+    let is_host_prefix = name_s.starts_with("__Host-");
+    let path_s = if is_host_prefix || p.path.is_empty() {
+        "/"
+    } else {
+        p.path.as_str()
+    };
+    let name = NSString::from_str(&name_s);
+    let value = NSString::from_str(&val_s);
+    let path = NSString::from_str(path_s);
+
+    let props: Retained<NSMutableDictionary<NSHTTPCookiePropertyKey, AnyObject>> = unsafe {
+        NSMutableDictionary::from_slices(
+            &[NSHTTPCookieName, NSHTTPCookieValue, NSHTTPCookiePath],
+            &[&name, &value, &path],
+        )
+    };
+
+    let host_only = is_host_prefix || !p.host_key.starts_with('.');
+    let mut set_origin = false;
+    if host_only {
+        let scheme = if is_host_prefix || p.secure {
+            "https"
+        } else {
+            "http"
+        };
+        let origin_str = format!(
+            "{scheme}://{bare_host}{}",
+            if path_s.starts_with('/') { path_s } else { "/" }
+        );
+        if let Some(url) = NSURL::URLWithString(&NSString::from_str(&origin_str)) {
+            props.insert(unsafe { NSHTTPCookieOriginURL }, &*url);
+            set_origin = true;
+        }
+    }
+    if !set_origin {
+        let dom = NSString::from_str(&p.host_key);
+        props.insert(unsafe { NSHTTPCookieDomain }, &*dom);
+    }
+
+    if is_host_prefix || p.secure {
+        props.insert(unsafe { NSHTTPCookieSecure }, ns_string!("TRUE"));
+    }
+
+    if p.http_only {
+        props.insert(ns_string!("HttpOnly"), ns_string!("TRUE"));
+    }
+
+    if let Some(t) = p.expires {
+        let dt = NSDate::dateWithTimeIntervalSince1970(t as f64);
+        props.insert(unsafe { NSHTTPCookieExpires }, &*dt);
+        props.insert(unsafe { NSHTTPCookieVersion }, ns_string!("0"));
+    }
+
+    unsafe { NSHTTPCookie::cookieWithProperties(&props) }
+}
+
+#[cfg(target_os = "macos")]
 fn write_macos_persistent_cookies(
     app: &tauri::AppHandle,
     plains: Vec<Plain>,
 ) -> Result<(usize, usize), String> {
     use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2_foundation::{
-        ns_string, NSArray, NSDate, NSHTTPCookie, NSHTTPCookieDomain, NSHTTPCookieExpires,
-        NSHTTPCookieName, NSHTTPCookieOriginURL, NSHTTPCookiePath, NSHTTPCookiePropertyKey,
-        NSHTTPCookieSecure, NSHTTPCookieValue, NSHTTPCookieVersion, NSMutableDictionary, NSString,
-        NSURL, NSUUID,
-    };
+    use objc2::sel;
+    use objc2_foundation::{NSArray, NSHTTPCookie, NSObjectProtocol, NSUUID};
 
     if plains.is_empty() {
         return Ok((0, 0));
@@ -916,70 +983,7 @@ fn write_macos_persistent_cookies(
         let mut failed = 0usize;
 
         for p in plains {
-            let name_s = p.name;
-            let val_s = p.value;
-            let bare_host = p.host_key.trim_start_matches('.');
-            if name_s.is_empty() || bare_host.is_empty() {
-                failed += 1;
-                continue;
-            }
-            let is_host_prefix = name_s.starts_with("__Host-");
-            let path_s = if is_host_prefix || p.path.is_empty() {
-                "/"
-            } else {
-                p.path.as_str()
-            };
-            let name = NSString::from_str(&name_s);
-            let value = NSString::from_str(&val_s);
-            let path = NSString::from_str(path_s);
-
-            let props: Retained<NSMutableDictionary<NSHTTPCookiePropertyKey, AnyObject>> =
-                unsafe {
-                    NSMutableDictionary::from_slices(
-                        &[NSHTTPCookieName, NSHTTPCookieValue, NSHTTPCookiePath],
-                        &[&name, &value, &path],
-                    )
-                };
-
-            let host_only = is_host_prefix || !p.host_key.starts_with('.');
-            let mut set_origin = false;
-            if host_only {
-                let scheme = if is_host_prefix || p.secure { "https" } else { "http" };
-                let origin_str = format!(
-                    "{scheme}://{bare_host}{}",
-                    if path_s.starts_with('/') { path_s } else { "/" }
-                );
-                if let Some(url) = NSURL::URLWithString(&NSString::from_str(&origin_str)) {
-                    props.insert(unsafe { NSHTTPCookieOriginURL }, &*url);
-                    set_origin = true;
-                }
-            }
-            if !set_origin {
-                let dom = NSString::from_str(&p.host_key);
-                props.insert(unsafe { NSHTTPCookieDomain }, &*dom);
-            }
-
-            let secure_val = if is_host_prefix || p.secure {
-                ns_string!("TRUE")
-            } else {
-                ns_string!("FALSE")
-            };
-            props.insert(unsafe { NSHTTPCookieSecure }, secure_val);
-
-            let http_only_val = if p.http_only {
-                ns_string!("TRUE")
-            } else {
-                ns_string!("FALSE")
-            };
-            props.insert(ns_string!("HttpOnly"), http_only_val);
-
-            if let Some(t) = p.expires {
-                let dt = NSDate::dateWithTimeIntervalSince1970(t as f64);
-                props.insert(unsafe { NSHTTPCookieExpires }, &*dt);
-                props.insert(unsafe { NSHTTPCookieVersion }, ns_string!("0"));
-            }
-
-            if let Some(cookie) = unsafe { NSHTTPCookie::cookieWithProperties(&props) } {
+            if let Some(cookie) = build_ns_http_cookie(p) {
                 built.push(cookie);
             } else {
                 failed += 1;
@@ -991,20 +995,43 @@ fn write_macos_persistent_cookies(
             return;
         }
         let imported = built.len();
-        let arr = NSArray::from_retained_slice(&built);
-        let tx_done = std::sync::Mutex::new(Some(tx));
-        let done = block2::RcBlock::new(move || {
-            if let Some(tx) = tx_done.lock().ok().and_then(|mut g| g.take()) {
-                let _ = tx.send(Ok((imported, failed)));
+        // `setCookies:completionHandler:` was added on macOS 26 WebKit; macOS 14/15 only expose
+        // singular `setCookie:completionHandler:`, so probe before sending the plural selector.
+        if cookie_store.respondsToSelector(sel!(setCookies:completionHandler:)) {
+            let arr = NSArray::from_retained_slice(&built);
+            let tx_done = std::sync::Mutex::new(Some(tx));
+            let done = block2::RcBlock::new(move || {
+                if let Some(tx) = tx_done.lock().ok().and_then(|mut g| g.take()) {
+                    let _ = tx.send(Ok((imported, failed)));
+                }
+            });
+            unsafe {
+                cookie_store.setCookies_completionHandler(&arr, Some(&done));
             }
-        });
-        unsafe {
-            cookie_store.setCookies_completionHandler(&arr, Some(&done));
+        } else {
+            let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(imported));
+            let tx_done = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+            let done = block2::RcBlock::new({
+                let remaining = remaining.clone();
+                let tx_done = tx_done.clone();
+                move || {
+                    if remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        if let Some(tx) = tx_done.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = tx.send(Ok((imported, failed)));
+                        }
+                    }
+                }
+            });
+            for cookie in &built {
+                unsafe {
+                    cookie_store.setCookie_completionHandler(cookie, Some(&done));
+                }
+            }
         }
     })
     .map_err(|e| e.to_string())?;
 
-    rx.recv_timeout(std::time::Duration::from_secs(15))
+    rx.recv_timeout(std::time::Duration::from_secs(30))
         .map_err(|_| "写入内置浏览器 Cookie 超时".to_string())?
 }
 
@@ -1509,5 +1536,64 @@ mod tests {
         assert_eq!(base64_decode("RFBBUEk=").unwrap(), b"DPAPI");
         assert_eq!(base64_decode("aGVsbG8gd29ybGQ").unwrap(), b"hello world");
         assert!(base64_decode("!!").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_http_cookie_builder_and_selector_check() {
+        use objc2::ClassType;
+
+        let host_only = build_ns_http_cookie(Plain {
+            host_key: "example.com".into(),
+            name: "sid".into(),
+            value: "abc".into(),
+            path: "/app".into(),
+            expires: None,
+            secure: true,
+            http_only: true,
+            same_site: 1,
+        })
+        .expect("host-only cookie should build");
+        assert_eq!(host_only.domain().to_string(), "example.com");
+        assert_eq!(host_only.path().to_string(), "/app");
+        assert!(host_only.isSecure());
+        assert!(host_only.isHTTPOnly());
+        assert!(host_only.expiresDate().is_none());
+
+        let domain_cookie = build_ns_http_cookie(Plain {
+            host_key: ".example.com".into(),
+            name: "pref".into(),
+            value: "pink".into(),
+            path: "/".into(),
+            expires: Some(1_900_000_000),
+            secure: false,
+            http_only: false,
+            same_site: -1,
+        })
+        .expect("domain cookie should build");
+        assert_eq!(domain_cookie.domain().to_string(), ".example.com");
+        assert!(!domain_cookie.isSecure());
+        assert!(!domain_cookie.isHTTPOnly());
+        assert!(domain_cookie.expiresDate().is_some());
+
+        let host_prefix = build_ns_http_cookie(Plain {
+            host_key: ".example.com".into(),
+            name: "__Host-csrf".into(),
+            value: "tok".into(),
+            path: "/sub".into(),
+            expires: None,
+            secure: false,
+            http_only: true,
+            same_site: 2,
+        })
+        .expect("__Host- cookie should coerce path=/ and secure=true");
+        assert_eq!(host_prefix.path().to_string(), "/");
+        assert!(host_prefix.isSecure());
+
+        // Singular setCookie:completionHandler: is available since macOS 10.13 on WKHTTPCookieStore,
+        // whereas plural setCookies:completionHandler: only exists on macOS 26+.
+        assert!(objc2_web_kit::WKHTTPCookieStore::class()
+            .instance_method(objc2::sel!(setCookie:completionHandler:))
+            .is_some());
     }
 }
