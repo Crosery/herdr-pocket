@@ -327,3 +327,39 @@ if (args[0] === "connect") {
     hc.stop();
   }
 });
+
+test("HcAdapter.rm runs hc rm and ignores still-running/not-found errors", SH, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hc-rm-"));
+  const bin = join(dir, "hc");
+  const argsLog = join(dir, "args.log");
+  writeFileSync(argsLog, "");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(argsLog)}, JSON.stringify(args) + "\\n");
+if (args[1] === "t-fail") {
+  process.stderr.write("terminal t-fail is still running\\n");
+  process.exit(1);
+}
+`,
+  );
+  chmodSync(bin, 0o755);
+
+  const hc = new HcAdapter(bin);
+  try {
+    await hc.rm("t-ok");
+    await hc.rm("t-fail");
+    const calls = readFileSync(argsLog, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as string[]);
+    assert.deepEqual(calls, [
+      ["rm", "t-ok"],
+      ["rm", "t-fail"],
+    ]);
+  } finally {
+    hc.stop();
+  }
+});

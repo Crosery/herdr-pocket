@@ -550,6 +550,11 @@ export class HcAdapter extends EventEmitter {
     await run(this.hcBin, ["kill", address], { timeoutMs: 20_000 });
   }
 
+  /** Removes a finished terminal entry from herdr-core; ignores already-gone or still-running errors. */
+  async rm(address: string): Promise<void> {
+    await run(this.hcBin, ["rm", address], { timeoutMs: 10_000 }).catch(() => {});
+  }
+
   /** Sets labels on a terminal; herdr keeps what every client shares (seen, pin) there. */
   async label(address: string, labels: Record<string, string>): Promise<void> {
     await run(this.hcBin, ["label", address, ...Object.entries(labels).map(([k, v]) => `${k}=${v}`)], { timeoutMs: 10_000 });

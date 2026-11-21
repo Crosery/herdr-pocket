@@ -1381,9 +1381,32 @@ export class Host {
     "terminal.kill": async (p) => {
       this.writable();
       const a = this.resolve(p.agent);
+      if (a.source === "herdr") {
+        const info = this.herdr.find(a.localId);
+        if (!info?.pane_id) {
+          throw new RpcFailure("unsupported", "这个 agent 不是桌面 herdr 开的，从这里关不了");
+        }
+        try {
+          await this.herdr.call("pane.close", { pane_id: info.pane_id });
+        } catch {
+          throw new RpcFailure("unsupported", "当前 herdr 终端不支持从这里关闭");
+        }
+        this.herdr.agents = this.herdr.agents.filter((x) => x.terminal_id !== a.localId);
+        this.publishNow();
+        return { ok: true as const };
+      }
       if (a.source !== "hc") throw new RpcFailure("unsupported", "这个 agent 不是桌面 herdr 开的，从这里关不了");
-      await this.hc.kill(a.localId);
-      await this.hc.list();
+      if (!this.hc.terminals.has(a.localId)) await this.hc.list().catch(() => undefined);
+      try {
+        await this.app.closeAgentTerminal({ localId: a.localId }, this.hc, { herdr: this.herdr });
+      } catch {
+        await this.hc.label(a.localId, { "herdr.space": "", "herdr.tab": "", where: "" }).catch(() => {});
+        await this.hc.kill(a.localId);
+        await this.hc.rm(a.localId).catch(() => {});
+      }
+      this.hc.terminals.delete(a.localId);
+      await Promise.all([this.hc.list().catch(() => undefined), this.refreshNames().catch(() => undefined)]);
+      this.publishNow();
       return { ok: true as const };
     },
     "herdr.layout": async () => {

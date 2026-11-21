@@ -1,7 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Copy, ExternalLink, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Mic, PhoneCall, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import { Copy, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Mic, PhoneCall, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession, TranscribeInfo } from "@herdr-pocket/protocol";
-import { PocketButton, overlayStore, useToast } from "../components/PocketUI";
+import { PocketButton, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon } from "../components/MascotAndVendor";
@@ -20,8 +20,8 @@ import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
 import { native, onNativeEvent } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
-import { getActiveToken, pingRelay, restRequest, rpcCall, subscribeStream } from "../lib/relay";
-import { agentSpace, agentTitle, allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
+import { getActiveToken, pingRelay, refreshHostSpaces, restRequest, rpcCall, subscribeStream } from "../lib/relay";
+import { agentSpace, agentTitle, allAgents, createStore, findAgent, liveStore, settingsStore, spacedTitle } from "../lib/store";
 import { hangupVoiceCall, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
 import { homeFolder, listGroup } from "./agentInfo";
 import { StatusMark } from "./ShellSidebar";
@@ -62,10 +62,189 @@ function useAgent(key: string | null | undefined): Agent | undefined {
   return liveStore.use((s) => (key ? allAgents(s.agents).find((a) => a.key === key) : undefined));
 }
 
-/** Closes a tab; a web tab's native view goes with it. */
+/** Closes a tab in the UI only; a web tab's native view goes with it. */
 export function closeShellTab(tab: ShellTab): void {
   if (tab.kind === "web") void native.browserClose(tab.id);
   closeTab(tab.id);
+}
+
+type CloseConfirmState = {
+  tabs: ShellTab[];
+  busyAgents: Agent[];
+} | null;
+
+const closeConfirmStore = createStore<CloseConfirmState>(null);
+let reportCloseError: (message: string) => void = () => {};
+
+function isLiveTerminalAgent(agent: Agent | undefined): agent is Agent {
+  return Boolean(agent && (agent.source === "hc" || agent.source === "herdr"));
+}
+
+function isBusyAgent(agent: Agent): boolean {
+  return agent.status === "working" || agent.status === "blocked";
+}
+
+function removeAgentFromLiveStore(agent: Agent): void {
+  liveStore.set((prev) => {
+    const list = prev.agents[agent.deviceId];
+    if (!list || !list.some((a) => a.key === agent.key)) return prev;
+    return {
+      ...prev,
+      agents: {
+        ...prev.agents,
+        [agent.deviceId]: list.filter((a) => a.key !== agent.key),
+      },
+      rev: prev.rev + 1,
+    };
+  });
+}
+
+function restoreAgentToLiveStore(agent: Agent): void {
+  liveStore.set((prev) => {
+    const list = prev.agents[agent.deviceId] ?? [];
+    if (list.some((a) => a.key === agent.key)) return prev;
+    return {
+      ...prev,
+      agents: {
+        ...prev.agents,
+        [agent.deviceId]: [agent, ...list],
+      },
+      rev: prev.rev + 1,
+    };
+  });
+}
+
+function clearAgentOverlays(agentKey: string): void {
+  const s = shellStore.get();
+  if (s.peek === agentKey) setPeek(null);
+  if (s.subagentAside?.agentKey === agentKey) {
+    shellStore.set({
+      subagentAside: null,
+      ...(s.panel === "subagent" ? { panel: null } : {}),
+    });
+  }
+}
+
+function executeCloseTabs(tabs: ShellTab[], mode: "hideOnly" | "killLive"): void {
+  const killedKeys = new Set<string>();
+  const devicesToRefresh = new Set<string>();
+  for (const tab of tabs) {
+    const agent = mode === "killLive" && tab.kind === "agent" ? findAgent(tab.agentKey) : undefined;
+    closeShellTab(tab);
+    if (!isLiveTerminalAgent(agent) || killedKeys.has(agent.key)) continue;
+    killedKeys.add(agent.key);
+    removeAgentFromLiveStore(agent);
+    clearAgentOverlays(agent.key);
+    void rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key })
+      .then(() => {
+        if (!devicesToRefresh.has(agent.deviceId)) {
+          devicesToRefresh.add(agent.deviceId);
+          refreshHostSpaces(agent.deviceId);
+        }
+      })
+      .catch((err: unknown) => {
+        const code = (err as { code?: string } | null)?.code;
+        if (code === "not_found") {
+          refreshHostSpaces(agent.deviceId);
+          return;
+        }
+        restoreAgentToLiveStore(agent);
+        reportCloseError((err as Error)?.message || "关闭终端失败");
+      });
+  }
+}
+
+/**
+ * Closes multiple tabs with Herdr App parity:
+ * - File/diff/web/missing/`uniflo` tabs close in UI immediately.
+ * - Idle/done live agents close UI + optimistically leave sidebar + kill backend tab/terminal.
+ * - Any `working`/`blocked` live agent triggers the confirmation modal (`取消` / `仅收起标签` / `关闭并结束`).
+ */
+export function requestCloseShellTabs(tabs: ShellTab[]): void {
+  if (!tabs.length) return;
+  const busyAgents: Agent[] = [];
+  const seenBusy = new Set<string>();
+  for (const tab of tabs) {
+    if (tab.kind !== "agent") continue;
+    const agent = findAgent(tab.agentKey);
+    if (isLiveTerminalAgent(agent) && isBusyAgent(agent) && !seenBusy.has(agent.key)) {
+      seenBusy.add(agent.key);
+      busyAgents.push(agent);
+    }
+  }
+  if (busyAgents.length > 0) {
+    closeConfirmStore.set({ tabs, busyAgents });
+    return;
+  }
+  executeCloseTabs(tabs, "killLive");
+}
+
+/** Closes one tab with Herdr App parity (idle/done live agents kill tab & terminal; running/blocked prompt first). */
+export function requestCloseShellTab(tab: ShellTab): void {
+  requestCloseShellTabs([tab]);
+}
+
+function clipModalTitleName(name: string, max = 48): string {
+  return name.length > max ? `${name.slice(0, max)}…` : name;
+}
+
+function TabCloseConfirmModal() {
+  const confirm = closeConfirmStore.use((s) => s);
+  if (!confirm) return null;
+  const singleBusy = confirm.tabs.length === 1 && confirm.busyAgents.length === 1 ? confirm.busyAgents[0] : null;
+  let title: string;
+  let subtitle: string;
+  if (singleBusy) {
+    title = `关闭正在运行的标签「${clipModalTitleName(agentTitle(singleBusy))}」？`;
+    subtitle =
+      singleBusy.status === "blocked"
+        ? "该 Agent 正在等待你的回复或确认。你可以仅收起标签让它在后台继续，或直接关闭并结束终端进程。"
+        : "该 Agent 正在运行中。你可以仅收起标签让它在后台继续，或直接关闭并结束终端进程。";
+  } else if (confirm.busyAgents.length === 1) {
+    title = `关闭正在运行的标签「${clipModalTitleName(agentTitle(confirm.busyAgents[0]!), 32)}」及其他 ${confirm.tabs.length - 1} 个标签？`;
+    subtitle = "其中有 1 个 Agent 正在运行或等待回复：选择「仅收起标签」会保留进程在后台继续，选择「关闭并结束」将终止终端进程。";
+  } else {
+    title = `关闭 ${confirm.tabs.length} 个标签（含 ${confirm.busyAgents.length} 个运行中）？`;
+    subtitle = `其中 ${confirm.busyAgents.length} 个 Agent 正在运行或等待回复：选择「仅收起标签」会保留进程在后台继续，选择「关闭并结束」将终止终端进程。`;
+  }
+
+  return (
+    <PocketModal
+      open
+      onOpenChange={(open) => {
+        if (!open) closeConfirmStore.set(null);
+      }}
+      title={title}
+      subtitle={subtitle}
+      width={460}
+    >
+      <div className="row wrap" style={{ justifyContent: "flex-end", gap: 8 }}>
+        <PocketButton variant="ghost" onClick={() => closeConfirmStore.set(null)}>
+          取消
+        </PocketButton>
+        <PocketButton
+          variant="soft"
+          onClick={() => {
+            const pending = closeConfirmStore.get();
+            closeConfirmStore.set(null);
+            if (pending) executeCloseTabs(pending.tabs, "hideOnly");
+          }}
+        >
+          仅收起标签
+        </PocketButton>
+        <PocketButton
+          variant="danger"
+          onClick={() => {
+            const pending = closeConfirmStore.get();
+            closeConfirmStore.set(null);
+            if (pending) executeCloseTabs(pending.tabs, "killLive");
+          }}
+        >
+          关闭并结束
+        </PocketButton>
+      </div>
+    </PocketModal>
+  );
 }
 
 // Tabs bar ---------------------------------------------------------------------
@@ -124,7 +303,12 @@ function TabChip({
               : tab.url
       }
       onClick={() => setActiveTab(tab.id)}
-      onAuxClick={(e) => e.button === 1 && closeShellTab(tab)}
+      onAuxClick={(e) => {
+        if (e.button === 1) {
+          e.preventDefault();
+          requestCloseShellTab(tab);
+        }
+      }}
       onContextMenu={(e) => onMenu(e, tab)}
       onDragStart={(e) => onDragStartTab(e, tab.id)}
       onDragEnd={onDragEndTab}
@@ -150,7 +334,7 @@ function TabChip({
         title={`关闭（${shortcutText("closeTab")}）`}
         onClick={(e) => {
           e.stopPropagation();
-          closeShellTab(tab);
+          requestCloseShellTab(tab);
         }}
       >
         <X size={12} />
@@ -236,6 +420,13 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
   useEffect(() => {
     scrollRef.current?.querySelector<HTMLElement>(".v3-tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [active, visibleTabs.length]);
+
+  useEffect(() => {
+    reportCloseError = (msg) => toast(msg, true);
+    return () => {
+      reportCloseError = () => {};
+    };
+  }, [toast]);
 
   // Smooth FLIP slide animation whenever visible tabs reorder or insert.
   useLayoutEffect(() => {
@@ -471,35 +662,71 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
           <MenuItem label="浏览工作区文件" icon={FolderTree} onClick={() => (setNewMenu(null), showPanel("files"))} />
         </Popup>
       ) : null}
-      {menu ? (
-        <Popup x={menu.x} y={menu.y} onClose={() => setMenu(null)} width={190}>
-          <MenuItem label="关闭" keys={shortcutText("closeTab")} onClick={() => (setMenu(null), closeShellTab(menu.tab))} />
-          <MenuItem
-            label="关闭其他"
-            disabled={visibleTabs.length < 2}
-            onClick={() => {
-              setMenu(null);
-              for (const t of visibleTabs) if (t.id !== menu.tab.id) closeShellTab(t);
-            }}
-          />
-          <MenuItem
-            label="关闭右侧"
-            disabled={visibleTabs.findIndex((t) => t.id === menu.tab.id) === visibleTabs.length - 1}
-            onClick={() => {
-              setMenu(null);
-              const i = visibleTabs.findIndex((t) => t.id === menu.tab.id);
-              for (const t of visibleTabs.slice(i + 1)) closeShellTab(t);
-            }}
-          />
-          {menu.tab.kind !== "agent" ? <div className="menu-sep" /> : null}
-          {menu.tab.kind === "file" || menu.tab.kind === "diff" ? (
-            <MenuItem label="复制路径" onClick={() => (setMenu(null), void copyToClipboard((menu.tab as { path: string }).path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok)))} />
-          ) : null}
-          {menu.tab.kind === "web" ? (
-            <MenuItem label="复制网址" onClick={() => (setMenu(null), void copyToClipboard((menu.tab as { url: string }).url).then((ok) => toast(ok ? "网址已复制" : "复制失败", !ok)))} />
-          ) : null}
-        </Popup>
-      ) : null}
+      {menu ? (() => {
+        const menuAgent = menu.tab.kind === "agent" ? agentByKey.get(menu.tab.agentKey) : undefined;
+        const isLive = isLiveTerminalAgent(menuAgent);
+        const idx = visibleTabs.findIndex((t) => t.id === menu.tab.id);
+        const otherTabs = visibleTabs.filter((t) => t.id !== menu.tab.id);
+        const rightTabs = idx >= 0 ? visibleTabs.slice(idx + 1) : [];
+        return (
+          <Popup x={menu.x} y={menu.y} onClose={() => setMenu(null)} width={isLive ? 220 : 196}>
+            <MenuItem
+              label={isLive ? "关闭并结束" : "关闭"}
+              icon={X}
+              keys={shortcutText("closeTab")}
+              onClick={() => {
+                const target = menu.tab;
+                setMenu(null);
+                requestCloseShellTab(target);
+              }}
+            />
+            {isLive ? (
+              <MenuItem
+                label="仅从标签栏收起"
+                icon={EyeOff}
+                onClick={() => {
+                  const target = menu.tab;
+                  setMenu(null);
+                  closeShellTab(target);
+                }}
+              />
+            ) : null}
+            {isLive ? <div className="menu-sep" /> : null}
+            <MenuItem
+              label="关闭其他"
+              disabled={otherTabs.length === 0}
+              onClick={() => {
+                setMenu(null);
+                requestCloseShellTabs(otherTabs);
+              }}
+            />
+            <MenuItem
+              label="关闭右侧"
+              disabled={rightTabs.length === 0}
+              onClick={() => {
+                setMenu(null);
+                requestCloseShellTabs(rightTabs);
+              }}
+            />
+            {menu.tab.kind !== "agent" ? <div className="menu-sep" /> : null}
+            {menu.tab.kind === "file" || menu.tab.kind === "diff" ? (
+              <MenuItem
+                label="复制路径"
+                icon={Copy}
+                onClick={() => (setMenu(null), void copyToClipboard((menu.tab as { path: string }).path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok)))}
+              />
+            ) : null}
+            {menu.tab.kind === "web" ? (
+              <MenuItem
+                label="复制网址"
+                icon={Copy}
+                onClick={() => (setMenu(null), void copyToClipboard((menu.tab as { url: string }).url).then((ok) => toast(ok ? "网址已复制" : "复制失败", !ok)))}
+              />
+            ) : null}
+          </Popup>
+        );
+      })() : null}
+      <TabCloseConfirmModal />
     </div>
   );
 }
@@ -681,7 +908,7 @@ function FilePane({ tab, agent }: { tab: FileTab; agent: Agent | undefined }) {
   const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
   return (
     <section className="v3-pane" aria-label={tab.title}>
-      <PaneHead tab={tab} agent={agent} fileHead={fileHead} onClose={() => closeShellTab(tab)} />
+      <PaneHead tab={tab} agent={agent} fileHead={fileHead} onClose={() => requestCloseShellTab(tab)} />
       <div className="v3-pane-body">
         <FileViewer key={tab.id} tab={tab} agent={agent} embedded onHeadState={setFileHead} />
       </div>
@@ -692,7 +919,7 @@ function FilePane({ tab, agent }: { tab: FileTab; agent: Agent | undefined }) {
 function DiffPane({ tab }: { tab: DiffTab }) {
   return (
     <section className="v3-pane" aria-label={tab.title}>
-      <PaneHead tab={tab} agent={undefined} onClose={() => closeShellTab(tab)} />
+      <PaneHead tab={tab} agent={undefined} onClose={() => requestCloseShellTab(tab)} />
       <div className="v3-pane-body">
         <DiffTabView key={tab.id} tab={tab} />
       </div>
@@ -712,7 +939,7 @@ function AgentPane({ tab, agentKey }: { tab: AgentTab; agentKey: string }) {
         mode={mode}
         subHead={subHead}
         onModeChange={(m) => setAgentTabMode(tab.id, m)}
-        onClose={() => closeShellTab(tab)}
+        onClose={() => requestCloseShellTab(tab)}
       />
       <div className="v3-pane-body">
         {agent ? (
@@ -729,7 +956,7 @@ function AgentPane({ tab, agentKey }: { tab: AgentTab; agentKey: string }) {
         ) : (
           <div className="v3-pane-empty">
             <p>这个 Agent 已经结束，或者它的电脑离线了。</p>
-            <PocketButton size="sm" variant="soft" onClick={() => closeShellTab(tab)}>
+            <PocketButton size="sm" variant="soft" onClick={() => requestCloseShellTab(tab)}>
               关闭标签
             </PocketButton>
           </div>
@@ -816,7 +1043,7 @@ export function ShellMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => 
       {tabs.map((t) =>
         t.kind === "web" ? (
           <section key={t.id} className="v3-pane" aria-label={t.title} style={{ display: t.id === activeId ? undefined : "none" }}>
-            <PaneHead tab={t} agent={undefined} onClose={() => closeShellTab(t)} />
+            <PaneHead tab={t} agent={undefined} onClose={() => requestCloseShellTab(t)} />
             <div className="v3-pane-body">
               <WebPane tab={t} active={t.id === activeId} onChange={(patch) => updateWebTab(t.id, patch)} />
             </div>

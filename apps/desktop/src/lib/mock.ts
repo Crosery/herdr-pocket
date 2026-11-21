@@ -640,6 +640,30 @@ export const mockApi = {
     if (method === "terminal.input") {
       return { ok: true };
     }
+    if (method === "terminal.kill") {
+      const key = String(params?.agent ?? "");
+      const idx = DEMO_AGENTS.findIndex((x) => x.key === key || x.localId === key);
+      if (idx >= 0) {
+        const [removed] = DEMO_AGENTS.splice(idx, 1);
+        if (removed) {
+          delete DEMO_EVENTS[removed.key];
+          delete DEMO_TERMINALS[removed.key];
+        }
+        mockApi.connect();
+      } else {
+        liveStore.set((prev) => {
+          const nextAgents: Record<string, Agent[]> = {};
+          let changed = false;
+          for (const [devId, list] of Object.entries(prev.agents)) {
+            const filtered = list.filter((a) => a.key !== key && a.localId !== key);
+            if (filtered.length !== list.length) changed = true;
+            nextAgents[devId] = filtered;
+          }
+          return changed ? { ...prev, agents: nextAgents, rev: prev.rev + 1 } : prev;
+        });
+      }
+      return { ok: true };
+    }
     if (method === "agent.create") {
       const id = `t${Date.now() % 10000}`;
       const key = `${to}/hc:${id}`;

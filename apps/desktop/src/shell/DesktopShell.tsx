@@ -41,7 +41,7 @@ import { terminalOwnsCtrlK } from "../lib/termKeys";
 import { GROUP_RANK, lastChange, listGroup } from "./agentInfo";
 import { Palette, type PaletteItem } from "./Palette";
 import { ShellSidebar } from "./ShellSidebar";
-import { PeekOverlay, ShellMain, ShellPanel, ShellStatus, ShellTabs, closeShellTab } from "./ShellWork";
+import { PeekOverlay, ShellMain, ShellPanel, ShellStatus, ShellTabs, requestCloseShellTab } from "./ShellWork";
 import {
   activeTabIdForSpace,
   closeSettingsFrame,
@@ -377,7 +377,7 @@ export function DesktopShell({
     const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
     const activeId = activeTabIdForSpace(s, (k) => map.get(k));
     const t = s.tabs.find((x) => x.id === activeId);
-    if (t) closeShellTab(t);
+    if (t) requestCloseShellTab(t);
   }
 
   // Window shortcuts (shell/shortcuts.ts). On Windows a focused terminal box keeps its Ctrl keys.

@@ -248,6 +248,92 @@ function collectTerminalIdsFromRoot(node: unknown, out: string[] = []): string[]
   return out;
 }
 
+function isDoomedTerminalRec(rec: Record<string, unknown>, doomed: ReadonlySet<string>): boolean {
+  const tid =
+    typeof rec.terminal === "string"
+      ? rec.terminal.trim()
+      : typeof rec.terminalId === "string"
+        ? rec.terminalId.trim()
+        : "";
+  return Boolean(tid && doomed.has(tid));
+}
+
+function pruneRootNode(
+  node: unknown,
+  doomed: ReadonlySet<string>,
+): { node: unknown; changed: boolean } {
+  if (!node || typeof node !== "object") return { node, changed: false };
+  if (Array.isArray(node)) {
+    let changed = false;
+    const next: unknown[] = [];
+    for (const item of node) {
+      const res = pruneRootNode(item, doomed);
+      if (res.changed) changed = true;
+      if (res.node !== null) next.push(res.node);
+      else changed = true;
+    }
+    if (next.length === 0) return { node: null, changed: true };
+    return { node: changed ? next : node, changed };
+  }
+
+  const rec = node as Record<string, unknown>;
+  if (isDoomedTerminalRec(rec, doomed)) return { node: null, changed: true };
+  if (rec.content && typeof rec.content === "object" && !Array.isArray(rec.content)) {
+    if (isDoomedTerminalRec(rec.content as Record<string, unknown>, doomed)) {
+      return { node: null, changed: true };
+    }
+  }
+
+  let changed = false;
+  const copy: Record<string, unknown> = { ...rec };
+
+  for (const listKey of ["children", "panes", "tabs"] as const) {
+    if (!Array.isArray(rec[listKey])) continue;
+    const arr = rec[listKey] as unknown[];
+    const nextArr: unknown[] = [];
+    let listChanged = false;
+    for (const child of arr) {
+      const res = pruneRootNode(child, doomed);
+      if (res.changed) listChanged = true;
+      if (res.node !== null) nextArr.push(res.node);
+      else listChanged = true;
+    }
+    if (listChanged) {
+      changed = true;
+      if (nextArr.length === 0 && !rec.content && typeof rec.terminal !== "string" && typeof rec.terminalId !== "string") {
+        return { node: null, changed: true };
+      }
+      copy[listKey] = nextArr;
+    }
+  }
+
+  for (const [kA, kB] of [["first", "second"], ["left", "right"]] as const) {
+    if (kA in rec || kB in rec) {
+      const resA = rec[kA] !== undefined ? pruneRootNode(rec[kA], doomed) : { node: null, changed: false };
+      const resB = rec[kB] !== undefined ? pruneRootNode(rec[kB], doomed) : { node: null, changed: false };
+      if (resA.changed || resB.changed) {
+        changed = true;
+        if (resA.node === null && resB.node === null) return { node: null, changed: true };
+        if (resA.node === null) return { node: resB.node, changed: true };
+        if (resB.node === null) return { node: resA.node, changed: true };
+        copy[kA] = resA.node;
+        copy[kB] = resB.node;
+      }
+    }
+  }
+
+  if (rec.content !== undefined && typeof rec.content === "object") {
+    const res = pruneRootNode(rec.content, doomed);
+    if (res.changed) {
+      changed = true;
+      if (res.node === null) return { node: null, changed: true };
+      copy.content = res.node;
+    }
+  }
+
+  return { node: changed ? copy : node, changed };
+}
+
 /** The desktop herdr app (`herdr-app`), driven through its own commands. */
 export class HerdrApp {
   private bin: string;
@@ -562,6 +648,212 @@ export class HerdrApp {
     }
 
     return { closedTerminals };
+  }
+
+  /**
+   * Closes a single agent/terminal tab (matching `herdr-app`'s `tab.close` / `pane.close`):
+   * - Uses `herdr-app do tab.close` (or `pane.close` for shared split panes) when `Herdr.app` is open.
+   * - Falls back to mutating the `herdr-app` doc via `hc` when `Herdr.app` is closed, pruning `localId`
+   *   from split panes and removing empty tabs cleanly while updating `activeTabId`.
+   * - Recursively collects un-kept child sub-agents, clears `herdr.space`/`herdr.tab`/`where` labels
+   *   first so `Herdr.app reconcile()` cannot resurrect the closed tab, then runs `hc.kill` and `hc.rm`.
+   */
+  async closeAgentTerminal(
+    opts: { localId: string },
+    hc: {
+      terminals: ReadonlyMap<string, HcTerminal>;
+      docGet?: (name: string) => Promise<{ value: unknown; version: number } | null>;
+      docSet?: (name: string, value: unknown, version: number) => Promise<number | null>;
+      kill: (address: string) => Promise<void>;
+      rm?: (address: string) => Promise<void>;
+      label?: (address: string, labels: Record<string, string>) => Promise<void>;
+    },
+    _deps: {
+      herdr?: {
+        agents: Array<{ terminal_id?: string; pane_id?: string; workspace_id?: string; tab_id?: string }>;
+        call: (method: string, params: unknown) => Promise<unknown>;
+      };
+    } = {},
+  ): Promise<{ closedTab: boolean; closedTerminals: number }> {
+    const localId = opts.localId?.trim();
+    if (!localId) return { closedTab: false, closedTerminals: 0 };
+
+    const t = hc.terminals.get(localId);
+    const tabId = t?.labels?.["herdr.tab"]?.trim() || undefined;
+
+    // Collect un-kept child sub-agents recursively BEFORE checking whether another terminal shares `tabId`.
+    const doomed = new Set<string>([localId]);
+    let added = true;
+    while (added) {
+      added = false;
+      for (const [addr, term] of hc.terminals.entries()) {
+        if (doomed.has(addr)) continue;
+        if (term.parent && doomed.has(term.parent) && !term.labels?.["herdr.space"]) {
+          doomed.add(addr);
+          added = true;
+        }
+      }
+    }
+
+    const sharesTab = tabId
+      ? [...hc.terminals.entries()].some(([addr, term]) => !doomed.has(addr) && term.labels?.["herdr.tab"] === tabId)
+      : false;
+
+    let closedByApp = false;
+    let closedTab = false;
+    let appNotOpen = false;
+    const isWindowClosed = (e: unknown): boolean =>
+      e instanceof NoDesktopApp || /没有打开|no herdr window|no window|not running/i.test((e as Error)?.message || "");
+
+    if (tabId && !sharesTab) {
+      try {
+        await this.command("tab.close", { id: tabId, confirmed: true });
+        closedByApp = true;
+        closedTab = true;
+      } catch (e) {
+        if (isWindowClosed(e)) appNotOpen = true;
+        else throw e;
+      }
+    } else if (tabId && sharesTab) {
+      try {
+        const ls = await this.ls();
+        const tabRec = ls.spaces
+          .flatMap((s) => s.tabs ?? [])
+          .find((tb) => tb.id === tabId || tb.terminals?.some((x) => x.terminal === localId));
+        const paneId = tabRec?.terminals?.find((x) => x.terminal === localId)?.pane;
+        if (paneId) {
+          await this.command("pane.close", { pane: paneId });
+          closedByApp = true;
+          closedTab = false;
+        }
+      } catch (e) {
+        if (isWindowClosed(e)) appNotOpen = true;
+        else throw e;
+      }
+    } else {
+      appNotOpen = true;
+    }
+
+    if (!closedByApp && appNotOpen && hc.docGet && hc.docSet) {
+      const doc = await hc.docGet("herdr-app").catch(() => null);
+      const val =
+        doc?.value && typeof doc.value === "object" && !Array.isArray(doc.value)
+          ? (doc.value as Record<string, unknown>)
+          : null;
+      const spaces = Array.isArray(val?.spaces) ? (val!.spaces as Array<Record<string, unknown>>) : null;
+      if (val && spaces) {
+        let docChanged = false;
+        const removedTabIds = new Set<string>();
+        let globalFallbackTabId: string | null = null;
+
+        const nextSpaces = spaces.map((s) => {
+          if (!s || typeof s !== "object" || s.machine) return s;
+          const tabs = Array.isArray(s.tabs) ? (s.tabs as unknown[]) : null;
+          if (!tabs) return s;
+
+          let spaceChanged = false;
+          let firstRemovedIdx = -1;
+          const spaceRemovedTabIds = new Set<string>();
+          let removedActiveFlag = false;
+          const nextTabs: Array<Record<string, unknown>> = [];
+
+          for (let i = 0; i < tabs.length; i++) {
+            const tab = tabs[i];
+            if (!tab || typeof tab !== "object") {
+              continue;
+            }
+            const tRec = tab as Record<string, unknown>;
+            const hasRoot = tRec.root !== undefined && tRec.root !== null;
+            const hasTermsArray = Array.isArray(tRec.terminals);
+            const prunedRoot = hasRoot ? pruneRootNode(tRec.root, doomed) : { node: tRec.root, changed: false };
+            const nextTerms = hasTermsArray
+              ? (tRec.terminals as unknown[]).filter((x) => {
+                  const tid =
+                    typeof (x as any)?.terminal === "string"
+                      ? (x as any).terminal.trim()
+                      : typeof (x as any)?.id === "string"
+                        ? (x as any).id.trim()
+                        : "";
+                  return !(tid && doomed.has(tid));
+                })
+              : undefined;
+            const termsChanged = Boolean(hasTermsArray && nextTerms!.length !== (tRec.terminals as unknown[]).length);
+            const tabMatchesId = Boolean(tabId && tRec.id === tabId);
+            const tabTouched = tabMatchesId || prunedRoot.changed || termsChanged;
+
+            if (!tabTouched) {
+              nextTabs.push(tRec);
+              continue;
+            }
+
+            const rootEmpty = !hasRoot || prunedRoot.node === null;
+            const termsEmpty = !hasTermsArray || nextTerms!.length === 0;
+            if (rootEmpty && termsEmpty) {
+              spaceChanged = true;
+              docChanged = true;
+              closedTab = true;
+              if (firstRemovedIdx < 0) firstRemovedIdx = i;
+              if (typeof tRec.id === "string") {
+                spaceRemovedTabIds.add(tRec.id);
+                removedTabIds.add(tRec.id);
+              }
+              if (tRec.active === true) removedActiveFlag = true;
+              continue;
+            }
+
+            if (prunedRoot.changed || termsChanged) {
+              spaceChanged = true;
+              docChanged = true;
+              const nextTab: Record<string, unknown> = { ...tRec };
+              if (prunedRoot.changed) nextTab.root = prunedRoot.node;
+              if (termsChanged) nextTab.terminals = nextTerms;
+              nextTabs.push(nextTab);
+            } else {
+              nextTabs.push(tRec);
+            }
+          }
+
+          if (!spaceChanged) return s;
+
+          const fallbackTabIdx = nextTabs.length > 0 ? Math.min(Math.max(0, firstRemovedIdx), nextTabs.length - 1) : -1;
+          const fallbackTab = fallbackTabIdx >= 0 ? nextTabs[fallbackTabIdx] : undefined;
+          const fallbackTabId = typeof fallbackTab?.id === "string" ? fallbackTab.id : null;
+          if (globalFallbackTabId === null && fallbackTabId !== null) globalFallbackTabId = fallbackTabId;
+
+          const nextSpace: Record<string, unknown> = { ...s, tabs: nextTabs };
+          if (typeof s.activeTabId === "string" && spaceRemovedTabIds.has(s.activeTabId)) {
+            nextSpace.activeTabId = fallbackTabId;
+          }
+          if (removedActiveFlag && fallbackTab && !nextTabs.some((tb) => tb.active === true)) {
+            nextTabs[fallbackTabIdx] = { ...fallbackTab, active: true };
+          }
+          return nextSpace;
+        });
+
+        if (docChanged) {
+          const nextVal: Record<string, unknown> = { ...val, spaces: nextSpaces };
+          if (typeof val.activeTabId === "string" && removedTabIds.has(val.activeTabId)) {
+            nextVal.activeTabId = globalFallbackTabId;
+          }
+          await hc.docSet("herdr-app", nextVal, doc!.version);
+        }
+      }
+    }
+
+    // Clear space/tab labels FIRST so Herdr.app reconcile() cannot resurrect the closed tab.
+    if (hc.label) {
+      await Promise.all(
+        [...doomed].map((addr) => hc.label!(addr, { "herdr.space": "", "herdr.tab": "", where: "" }).catch(() => {})),
+      );
+    }
+    await Promise.all(
+      [...doomed].map(async (addr) => {
+        await hc.kill(addr).catch(() => {});
+        await hc.rm?.(addr).catch(() => {});
+      }),
+    );
+
+    return { closedTab, closedTerminals: doomed.size };
   }
 }
 
