@@ -30,14 +30,23 @@ import {
   useTerminalFontCatalog,
 } from "../lib/fonts";
 import {
+  KITTY_SENTINEL_PREFIX,
   KittyApcSplitter,
   KittyKeyboardState,
+  KittyUnicodePlaceholderRewriter,
+  collectVirtualSpriteBlocks,
+  deleteKittyVirtualPlacements,
   encodeKittyKey,
+  lookupKittyVirtualPlacement,
   parseKittyGfxCommand,
   parseOsc66,
   parsePngDimensions,
+  registerKittyVirtualPlacement,
   shellQuotePath,
+  shouldCreateCursorPlacement,
+  type KittyBufferCellSample,
   type KittyGfxCommand,
+  type KittyVirtualPlacementDims,
 } from "../lib/kittyProtocol";
 import { native, type LocalTermCloseEvent, type LocalTermDataEvent } from "../lib/native";
 import { rpcCall, subscribeStream } from "../lib/relay";
@@ -241,6 +250,8 @@ export function TerminalSurface({
   const osc66Ref = useRef<Osc66Run[]>([]);
   const kittyAssetsRef = useRef<Map<number, KittyImageAsset>>(new Map());
   const kittyPlacementsRef = useRef<KittyPlacement[]>([]);
+  const kittyVirtualDimsRef = useRef<Map<string, KittyVirtualPlacementDims>>(new Map());
+  const kittyDimsByIdRef = useRef<Map<number, { cols: number; rows: number }>>(new Map());
   const [dragOver, setDragOver] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const dragDepthRef = useRef(0);
@@ -397,7 +408,12 @@ export function TerminalSurface({
     const hostEl = hostRef.current;
     if (!term || !overlay || !hostEl) return;
 
-    if (kittyPlacementsRef.current.length === 0 && osc66Ref.current.length === 0) {
+    if (
+      kittyPlacementsRef.current.length === 0 &&
+      kittyVirtualDimsRef.current.size === 0 &&
+      kittyAssetsRef.current.size === 0 &&
+      osc66Ref.current.length === 0
+    ) {
       if (overlay.childElementCount > 0) overlay.replaceChildren();
       return;
     }
@@ -407,7 +423,8 @@ export function TerminalSurface({
       screen.appendChild(overlay);
     }
 
-    const [cellW, cellH] = cellSizeRef.current;
+    const [cellW, cellH] = measureCellCss(hostEl, term);
+    cellSizeRef.current = [cellW, cellH];
     const buf = term.buffer.active;
     const curAlt = buf === term.buffer.alternate;
     const topY = buf.viewportY;
@@ -450,6 +467,117 @@ export function TerminalSurface({
         };
       }
       frag.appendChild(img);
+    }
+
+    if (kittyAssetsRef.current.size > 0 || kittyVirtualDimsRef.current.size > 0) {
+      const scratch = buf.getNullCell();
+      let cachedAbsY = -1;
+      let cachedLine: ReturnType<typeof buf.getLine> | undefined;
+      const virtualBlocks = collectVirtualSpriteBlocks(topY, botY, term.cols, (absY, x, out: KittyBufferCellSample) => {
+        if (absY !== cachedAbsY) {
+          cachedAbsY = absY;
+          cachedLine = buf.getLine(absY);
+        }
+        if (!cachedLine) return false;
+        const cell = cachedLine.getCell(x, scratch);
+        if (!cell) return false;
+        const chars = cell.getChars();
+        if (!chars.startsWith(KITTY_SENTINEL_PREFIX)) return false;
+        out.chars = chars;
+        out.width = cell.getWidth();
+        if (cell.isFgRGB()) {
+          out.fgMode = "rgb";
+          out.fgColor = cell.getFgColor();
+        } else if (cell.isFgPalette()) {
+          out.fgMode = "palette";
+          out.fgColor = cell.getFgColor();
+        } else {
+          out.fgMode = "default";
+          out.fgColor = 0;
+        }
+        const rawCell = cell as unknown as {
+          hasExtendedAttrs?: () => number | boolean;
+          extended?: { underlineColor?: number };
+          isUnderlineColorDefault?: () => boolean;
+          isUnderlineColorRGB?: () => boolean;
+          isUnderlineColorPalette?: () => boolean;
+          getUnderlineColor?: () => number;
+        };
+        let placementId = 0;
+        if (
+          rawCell.hasExtendedAttrs?.() &&
+          rawCell.extended &&
+          rawCell.extended.underlineColor !== undefined &&
+          rawCell.extended.underlineColor !== -1 &&
+          !rawCell.isUnderlineColorDefault?.() &&
+          (rawCell.isUnderlineColorRGB?.() || rawCell.isUnderlineColorPalette?.())
+        ) {
+          placementId = rawCell.getUnderlineColor?.() ?? 0;
+        }
+        out.placementId = placementId;
+        return true;
+      });
+
+      for (const block of virtualBlocks) {
+        const asset = kittyAssetsRef.current.get(block.imageId);
+        if (!asset) continue;
+        const vdims = lookupKittyVirtualPlacement(kittyVirtualDimsRef.current, block.imageId, block.placementId);
+        const fallbackDims = kittyDimsByIdRef.current.get(block.imageId);
+        const fullCols = Math.max(vdims?.cols ?? fallbackDims?.cols ?? 0, block.startTileCol + block.cols, 1);
+        const fullRows = Math.max(vdims?.rows ?? fallbackDims?.rows ?? 0, block.startTileRow + block.rows, 1);
+        const zIndex = String(Math.max(1, 5 + (vdims?.zIndex ?? 0)));
+
+        const visLeft = Math.round(block.startX * cellW);
+        const visTop = Math.round((block.startAbsY - topY) * cellH);
+        const visWidth = Math.max(1, Math.round(block.cols * cellW));
+        const visHeight = Math.max(1, Math.round(block.rows * cellH));
+        const fullWidth = Math.max(1, Math.round(fullCols * cellW));
+        const fullHeight = Math.max(1, Math.round(fullRows * cellH));
+
+        const img = document.createElement("img");
+        img.className = "tp-kitty-img";
+        img.src = asset.url;
+        img.alt = "";
+        if (asset.needsMeasure) {
+          img.onload = () => {
+            asset.needsMeasure = false;
+            if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+              asset.width = img.naturalWidth;
+              asset.height = img.naturalHeight;
+              requestAnimationFrame(paintOverlays);
+            }
+          };
+        }
+
+        const isCropped =
+          block.startTileCol > 0 ||
+          block.startTileRow > 0 ||
+          block.cols < fullCols ||
+          block.rows < fullRows;
+
+        if (isCropped) {
+          const clip = document.createElement("div");
+          clip.className = "tp-kitty-clip";
+          clip.style.left = `${visLeft}px`;
+          clip.style.top = `${visTop}px`;
+          clip.style.width = `${visWidth}px`;
+          clip.style.height = `${visHeight}px`;
+          clip.style.zIndex = zIndex;
+          img.style.left = `${-Math.round(block.startTileCol * cellW)}px`;
+          img.style.top = `${-Math.round(block.startTileRow * cellH)}px`;
+          img.style.width = `${fullWidth}px`;
+          img.style.height = `${fullHeight}px`;
+          clip.appendChild(img);
+          frag.appendChild(clip);
+        } else {
+          img.style.left = `${visLeft}px`;
+          img.style.top = `${visTop}px`;
+          img.style.width = `${fullWidth}px`;
+          img.style.height = `${fullHeight}px`;
+          img.style.zIndex = zIndex;
+          frag.appendChild(img);
+        }
+      }
     }
 
     const fs = term.options.fontSize ?? 13;
@@ -577,6 +705,8 @@ export function TerminalSurface({
     const scheduleOverlay = () => {
       if (
         kittyPlacementsRef.current.length === 0 &&
+        kittyVirtualDimsRef.current.size === 0 &&
+        kittyAssetsRef.current.size === 0 &&
         osc66Ref.current.length === 0 &&
         (overlayRef.current?.childElementCount ?? 0) === 0
       ) {
@@ -670,6 +800,9 @@ export function TerminalSurface({
       kittyKeys.reset();
       osc66Ref.current = [];
       kittyPlacementsRef.current = [];
+      kittyVirtualDimsRef.current.clear();
+      kittyDimsByIdRef.current.clear();
+      placeholderRewriter.reset();
       scheduleOverlay();
       return false;
     });
@@ -830,7 +963,6 @@ export function TerminalSurface({
     type KittyAnchor = { bufferY: number; col: number; alt: boolean; colReady: boolean; rowReady: boolean };
     let nextImgId = 1;
     let chunkActive: { cmd: KittyGfxCommand; parts: string[]; anchor: KittyAnchor } | null = null;
-    const kittyDimsById = new Map<number, { cols: number; rows: number }>();
     const pendingKittyAssets = new Map<number, Promise<KittyImageAsset | null>>();
 
     const captureAnchor = (): KittyAnchor => {
@@ -900,8 +1032,21 @@ export function TerminalSurface({
       }
       const colsKnown = cmd.cols !== undefined || Boolean(pxW);
       const rowsKnown = cmd.rows !== undefined || Boolean(pxH);
-      const cols = cmd.cols ?? (pxW ? Math.max(1, Math.min(term.cols, Math.ceil(pxW / cellPxW))) : 1);
-      const rows = cmd.rows ?? (pxH ? Math.max(1, Math.min(term.rows, Math.ceil(pxH / cellPxH))) : 1);
+      let cols: number;
+      let rows: number;
+      if (cmd.cols !== undefined && cmd.rows !== undefined) {
+        cols = cmd.cols;
+        rows = cmd.rows;
+      } else if (cmd.cols !== undefined && pxW && pxH) {
+        cols = cmd.cols;
+        rows = Math.max(1, Math.min(term.rows, Math.round((cmd.cols * cellPxW * pxH) / (pxW * cellPxH))));
+      } else if (cmd.rows !== undefined && pxW && pxH) {
+        rows = cmd.rows;
+        cols = Math.max(1, Math.min(term.cols, Math.round((cmd.rows * cellPxH * pxW) / (pxH * cellPxW))));
+      } else {
+        cols = cmd.cols ?? (pxW ? Math.max(1, Math.min(term.cols, Math.ceil(pxW / cellPxW))) : 1);
+        rows = cmd.rows ?? (pxH ? Math.max(1, Math.min(term.rows, Math.ceil(pxH / cellPxH))) : 1);
+      }
       return { cols, rows, colsKnown, rowsKnown };
     };
 
@@ -910,6 +1055,7 @@ export function TerminalSurface({
     let sawRaw = false;
     let fallbackLines: string[] = [];
     const splitter = new KittyApcSplitter();
+    const placeholderRewriter = new KittyUnicodePlaceholderRewriter();
     const textDecoder = new TextDecoder("utf-8", { fatal: false });
     let pendingBytes: Uint8Array[] = [];
     let flushRaf = 0;
@@ -918,17 +1064,35 @@ export function TerminalSurface({
       const segments = splitter.push(rawText);
       for (const seg of segments) {
         if (seg.kind === "vt") {
-          term.write(seg.data);
+          const rewritten = placeholderRewriter.push(seg.data);
+          if (rewritten) term.write(rewritten);
           continue;
         }
+        const flushed = placeholderRewriter.flush();
+        if (flushed) term.write(flushed);
 
         const cmd = parseKittyGfxCommand(seg.raw);
         if (cmd.action === "d") {
           term.write("", () => {
-            const d = (cmd.deleteWhat || "a").toLowerCase();
-            if (d === "a") kittyPlacementsRef.current = [];
-            else if (d === "i" && cmd.id !== undefined) {
-              kittyPlacementsRef.current = kittyPlacementsRef.current.filter((p) => p.imageId !== cmd.id);
+            const rawD = cmd.deleteWhat || "a";
+            const d = rawD.toLowerCase();
+            if (d === "a") {
+              kittyPlacementsRef.current = [];
+            } else if (d === "i" && cmd.id !== undefined) {
+              kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
+                (p) => p.imageId !== cmd.id || (cmd.placementId !== undefined && p.placementId !== cmd.placementId),
+              );
+              deleteKittyVirtualPlacements(kittyVirtualDimsRef.current, cmd.id, cmd.placementId);
+              if (rawD === "I" && cmd.placementId === undefined) {
+                const prev = kittyAssetsRef.current.get(cmd.id);
+                if (prev) revokeAssetUrl(prev.url);
+                kittyAssetsRef.current.delete(cmd.id);
+                kittyDimsByIdRef.current.delete(cmd.id);
+              }
+            } else if (d === "p" && cmd.id !== undefined && cmd.placementId !== undefined) {
+              kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
+                (p) => !(p.imageId === cmd.id && p.placementId === cmd.placementId),
+              );
             } else if (d === "c") {
               const cy = term.buffer.active.baseY + term.buffer.active.cursorY;
               kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
@@ -943,10 +1107,38 @@ export function TerminalSurface({
         if (cmd.action === "p" && cmd.id !== undefined) {
           const asset = kittyAssetsRef.current.get(cmd.id);
           const pendingAsset = !asset ? pendingKittyAssets.get(cmd.id) : undefined;
-          const known = kittyDimsById.get(cmd.id);
+          const known = kittyDimsByIdRef.current.get(cmd.id);
           const resolved = asset ? resolvePlacementCells(cmd, undefined, asset) : null;
-          const cols = cmd.cols ?? known?.cols ?? resolved?.cols ?? 1;
-          const rows = cmd.rows ?? known?.rows ?? resolved?.rows ?? 1;
+          const cols = cmd.cols ?? resolved?.cols ?? known?.cols ?? 1;
+          const rows = cmd.rows ?? resolved?.rows ?? known?.rows ?? 1;
+          if (!shouldCreateCursorPlacement(cmd)) {
+            const targetId = cmd.id;
+            registerKittyVirtualPlacement(
+              kittyVirtualDimsRef.current,
+              targetId,
+              cmd.placementId,
+              cols,
+              rows,
+              cmd.zIndex,
+            );
+            scheduleOverlay();
+            if (!asset && pendingAsset) {
+              void pendingAsset.then((loaded) => {
+                if (!loaded || termRef.current !== term) return;
+                const dims = resolvePlacementCells(cmd, undefined, loaded);
+                registerKittyVirtualPlacement(
+                  kittyVirtualDimsRef.current,
+                  targetId,
+                  cmd.placementId,
+                  cmd.cols ?? dims.cols ?? known?.cols ?? 1,
+                  cmd.rows ?? dims.rows ?? known?.rows ?? 1,
+                  cmd.zIndex,
+                );
+                scheduleOverlay();
+              });
+            }
+            continue;
+          }
           const anchor: KittyAnchor = { bufferY: 0, col: 0, alt: false, colReady: false, rowReady: false };
           term.write("", () => {
             const a = captureAnchor();
@@ -956,7 +1148,7 @@ export function TerminalSurface({
             anchor.colReady = true;
             anchor.rowReady = true;
           });
-          if (cmd.cursorMovement === 0 && !cmd.unicodePlaceholder) {
+          if (cmd.cursorMovement === 0) {
             const linesDown = Math.max(0, rows - 1);
             if (linesDown > 0) {
               anchor.rowReady = false;
@@ -977,8 +1169,8 @@ export function TerminalSurface({
             void pendingAsset.then((loaded) => {
               if (!loaded || termRef.current !== term) return;
               const dims = resolvePlacementCells(cmd, undefined, loaded);
-              const useCols = cmd.cols ?? known?.cols ?? dims.cols;
-              const useRows = cmd.rows ?? known?.rows ?? dims.rows;
+              const useCols = cmd.cols ?? dims.cols ?? known?.cols ?? 1;
+              const useRows = cmd.rows ?? dims.rows ?? known?.rows ?? 1;
               if (anchor.colReady && anchor.rowReady) pushPlacement(loaded, cmd, anchor, useCols, useRows);
               else term.write("", () => {
                 if (termRef.current === term) pushPlacement(loaded, cmd, anchor, useCols, useRows);
@@ -990,15 +1182,17 @@ export function TerminalSurface({
 
         if (cmd.more) {
           if (!chunkActive) {
-            const anchor: KittyAnchor = { bufferY: 0, col: 0, alt: false, colReady: false, rowReady: true };
+            const anchor: KittyAnchor = { bufferY: 0, col: 0, alt: false, colReady: !shouldCreateCursorPlacement(cmd), rowReady: true };
             chunkActive = { cmd, parts: [cmd.payload], anchor };
-            term.write("", () => {
-              const a = captureAnchor();
-              anchor.col = a.col;
-              anchor.bufferY = a.bufferY;
-              anchor.alt = a.alt;
-              anchor.colReady = true;
-            });
+            if (shouldCreateCursorPlacement(cmd)) {
+              term.write("", () => {
+                const a = captureAnchor();
+                anchor.col = a.col;
+                anchor.bufferY = a.bufferY;
+                anchor.alt = a.alt;
+                anchor.colReady = true;
+              });
+            }
           } else {
             chunkActive.parts.push(cmd.payload);
           }
@@ -1032,11 +1226,22 @@ export function TerminalSurface({
 
         const syncDims =
           firstCmd.medium === "d" ? resolvePlacementCells(firstCmd, payloadBytes) : resolvePlacementCells(firstCmd);
-        kittyDimsById.set(imgId, { cols: syncDims.cols, rows: syncDims.rows });
+        kittyDimsByIdRef.current.set(imgId, { cols: syncDims.cols, rows: syncDims.rows });
+        if (firstCmd.action === "T" && firstCmd.unicodePlaceholder) {
+          registerKittyVirtualPlacement(
+            kittyVirtualDimsRef.current,
+            imgId,
+            firstCmd.placementId,
+            syncDims.cols,
+            syncDims.rows,
+            firstCmd.zIndex,
+          );
+          scheduleOverlay();
+        }
         const anchor: KittyAnchor = state
           ? state.anchor
-          : { bufferY: 0, col: 0, alt: false, colReady: false, rowReady: true };
-        if (!state) {
+          : { bufferY: 0, col: 0, alt: false, colReady: !shouldCreateCursorPlacement(firstCmd), rowReady: true };
+        if (!state && shouldCreateCursorPlacement(firstCmd)) {
           term.write("", () => {
             const a = captureAnchor();
             anchor.col = a.col;
@@ -1049,7 +1254,7 @@ export function TerminalSurface({
         // Reserve rows & cursor advance synchronously inside writeSegmented so subsequent
         // cursor-up sequences (e.g. fastfetch `\x1b[28A\x1b[57C`) run after row reservation.
         let reservedInline = false;
-        if (firstCmd.action === "T" && firstCmd.cursorMovement === 0 && !firstCmd.unicodePlaceholder && syncDims.rowsKnown) {
+        if (shouldCreateCursorPlacement(firstCmd) && firstCmd.action === "T" && firstCmd.cursorMovement === 0 && syncDims.rowsKnown) {
           const linesDown = Math.max(0, syncDims.rows - 1);
           if (linesDown > 0) {
             anchor.rowReady = false;
@@ -1075,16 +1280,30 @@ export function TerminalSurface({
               firstCmd.cols && firstCmd.rows
                 ? { cols: syncDims.cols, rows: syncDims.rows }
                 : resolvePlacementCells(firstCmd, undefined, asset);
-            kittyDimsById.set(imgId, { cols: finalDims.cols, rows: finalDims.rows });
-            if (firstCmd.action === "T" && !firstCmd.unicodePlaceholder) {
-              if (!reservedInline && firstCmd.cursorMovement === 0) {
-                if (!syncDims.rowsKnown) {
-                  const linesDown = Math.max(0, finalDims.rows - 1);
-                  if (linesDown > 0) term.write("\n".repeat(linesDown));
+            kittyDimsByIdRef.current.set(imgId, { cols: finalDims.cols, rows: finalDims.rows });
+            if (firstCmd.action === "T") {
+              if (shouldCreateCursorPlacement(firstCmd)) {
+                if (!reservedInline && firstCmd.cursorMovement === 0) {
+                  if (!syncDims.rowsKnown) {
+                    const linesDown = Math.max(0, finalDims.rows - 1);
+                    if (linesDown > 0) term.write("\n".repeat(linesDown));
+                  }
+                  if (finalDims.cols > 0) term.write(`\x1b[${finalDims.cols}C`);
                 }
-                if (finalDims.cols > 0) term.write(`\x1b[${finalDims.cols}C`);
+                pushPlacement(asset, firstCmd, anchor, finalDims.cols, finalDims.rows);
+              } else {
+                registerKittyVirtualPlacement(
+                  kittyVirtualDimsRef.current,
+                  imgId,
+                  firstCmd.placementId,
+                  finalDims.cols,
+                  finalDims.rows,
+                  firstCmd.zIndex,
+                );
+                scheduleOverlay();
               }
-              pushPlacement(asset, firstCmd, anchor, finalDims.cols, finalDims.rows);
+            } else if (kittyVirtualDimsRef.current.size > 0) {
+              scheduleOverlay();
             }
             if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
               void sendAutoInput(`\x1b_Gi=${firstCmd.id};OK\x1b\\`);
@@ -1350,6 +1569,9 @@ export function TerminalSurface({
       for (const a of assetsRefForCleanup.current.values()) revokeAssetUrl(a.url);
       assetsRefForCleanup.current.clear();
       kittyPlacementsRef.current = [];
+      kittyVirtualDimsRef.current.clear();
+      kittyDimsByIdRef.current.clear();
+      placeholderRewriter.reset();
       osc66Ref.current = [];
       term.dispose();
       if (termRef.current === term) termRef.current = null;

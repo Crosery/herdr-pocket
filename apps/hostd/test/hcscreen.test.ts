@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HcScreens } from "../src/hcscreen.ts";
+import { Screen, charWidth } from "../src/vt.ts";
 
 /** These fakes are shell scripts: Windows can't run them (CI there runs the rest). */
 const SH = { skip: process.platform === "win32" && "shell-script fakes" };
@@ -103,4 +104,34 @@ test("paste wraps text with bracketed paste (?2004h) or plain text (?2004l) and 
   } finally {
     screensSlow.stop();
   }
+});
+
+test("vt Screen treats U+10EEEE as width 1 and Kitty combining diacritics as width 0 without column drift", () => {
+  assert.equal(charWidth(0x10eeee), 1);
+  for (const cp of [0x0305, 0x030d, 0x0483, 0x1dc0, 0x20d0, 0xa8e0, 0xfe20, 0x10a0f, 0x1d185, 0x1d244]) {
+    assert.equal(charWidth(cp), 0, `expected zero width for U+${cp.toString(16)}`);
+  }
+
+  const ph = String.fromCodePoint(0x10eeee);
+  const d0 = String.fromCodePoint(0x0305);
+  const d30 = String.fromCodePoint(0x0483);
+  const d296 = String.fromCodePoint(0x1d244);
+
+  const screen = new Screen(24, 5);
+  // Emit a 7x3 avatar placeholder block using both BMP and astral Kitty diacritics, followed by column-7 labels.
+  screen.write(
+    [
+      `\x1b_Ga=p,U=1,q=2,i=9,c=7,r=3\x1b\\\x1b[38;2;0;0;9m${(ph + d0 + d30).repeat(7)}\x1b[39;59m coordinator`,
+      `\x1b[38;2;0;0;9m${(ph + d30 + d296).repeat(7)}\x1b[39;59m btw-slash`,
+      `\x1b[38;2;0;0;9m${(ph + d296 + d0).repeat(7)}\x1b[39;59m monitor`,
+    ].join("\r\n"),
+  );
+
+  const lines = screen.toText().split("\n");
+  assert.equal(lines.length, 3);
+  assert.ok(lines[0]!.endsWith(" coordinator"));
+  assert.ok(lines[1]!.endsWith(" btw-slash"));
+  assert.ok(lines[2]!.endsWith(" monitor"));
+  // Verify exact column index (7 placeholder cells + 1 space = index 8 in codepoints)
+  assert.equal([...lines[0]!.slice(0, lines[0]!.indexOf(" "))].filter((ch) => ch.codePointAt(0) === 0x10eeee).length, 7);
 });

@@ -78,6 +78,13 @@
   z-index: 4;
 }
 
+.tp-kitty-clip {
+  position: absolute;
+  pointer-events: none;
+  user-select: none;
+  overflow: hidden;
+}
+
 .tp-kitty-img {
   position: absolute;
   pointer-events: none;

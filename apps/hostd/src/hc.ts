@@ -24,13 +24,38 @@ export interface HcTerminal {
   rows?: number;
 }
 
+const VIEWER_SUBSCREEN_TAIL_PATTERNS: readonly RegExp[] = [
+  /\btab\s+switch\s+pane\b.*\besc\s+back\b/i,
+  /\besc\b[^\n]{0,16}?\b(?:to\s+)?(?:go\s+back|back|close|exit|return)\b/i,
+  /(?:按\s*|(?<![a-z0-9]))esc\s*(?:键)?\s*(?:返回|关闭|退出)/i,
+];
+
+const MODAL_PICKER_TAIL_PATTERNS: readonly RegExp[] = [
+  /\besc\b[^\n]{0,16}?\b(?:to\s+)?(?:cancel|dismiss)\b/i,
+  /(?:按\s*|(?<![a-z0-9]))esc\s*(?:键)?\s*取消/i,
+];
+
 /**
- * True when the bottom of a screen is a panel's footer ("Esc to cancel",
- * "Enter to confirm · Esc to exit"…), i.e. typed text would go into the panel.
+ * True when a full-screen interactive viewer/overlay (e.g. `/swarm board`,
+ * `/status`, `/usage` viewers) is open and captures input even while the agent
+ * is `"working"`. Explicitly never matches `"esc to interrupt"` or `"esc to cancel"`.
+ */
+export function isViewerSubscreen(screen: string): boolean {
+  if (/^Swarm board\b/m.test(screen)) return true;
+  const lines = screen.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.slice(0, 4).some((l) => /^Swarm board\b/.test(l))) return true;
+  const tail = lines.slice(-6);
+  return tail.some((l) => VIEWER_SUBSCREEN_TAIL_PATTERNS.some((re) => re.test(l)));
+}
+
+/**
+ * True when the screen shows a viewer sub-screen or modal picker footer
+ * ("Esc to cancel", "Enter to confirm · Esc to exit"…), i.e. typed text would go into the panel.
  */
 export function endsInPanel(screen: string): boolean {
-  const tail = screen.split("\n").map((l) => l.trim()).filter(Boolean).slice(-4);
-  return tail.some((l) => /\besc\b[^\n]{0,12}?\bto (cancel|close|exit|go back|dismiss)\b/i.test(l));
+  if (isViewerSubscreen(screen)) return true;
+  const tail = screen.split("\n").map((l) => l.trim()).filter(Boolean).slice(-6);
+  return tail.some((l) => MODAL_PICKER_TAIL_PATTERNS.some((re) => re.test(l)));
 }
 
 /** Space and tab names by id, as the desktop app (`herdr-app ls`) shows them. */
@@ -455,13 +480,15 @@ export class HcAdapter extends EventEmitter {
 
   async send(address: string, text: string, enter = true): Promise<void> {
     if (enter) {
-      // A panel (Claude Code's /status, /config, /model…) swallows pasted text
-      // and the message is lost. An idle program showing one gets Esc first.
-      if (await this.panelOpen(address)) {
+      // Panels (/status, /config, /model) and full-screen viewers (/swarm board)
+      // swallow pasted text; close up to 3 overlay levels with Esc before pasting.
+      let open = await this.panelOpen(address);
+      for (let attempt = 0; attempt < 3 && open; attempt++) {
         await run(this.hcBin, ["keys", address, "esc"]);
-        await new Promise((r) => setTimeout(r, 300));
-        if (await this.panelOpen(address)) throw new Error("它开着一个面板，消息没送进去：先在终端里按 Esc 关掉再发");
+        await new Promise((r) => setTimeout(r, 200));
+        open = await this.panelOpen(address);
       }
+      if (open) throw new Error("它开着一个面板，消息没送进去：先在终端里按 Esc 关掉再发");
     }
     const t = this.terminals.get(address);
     try {
@@ -487,15 +514,20 @@ export class HcAdapter extends EventEmitter {
   }
 
   /**
-   * True when an idle program shows a panel that Esc closes. Only idle/done:
-   * a blocked program's dialog (a permission question) is the person's to answer.
+   * True when a non-shell program shows a panel/viewer that Esc closes.
+   * Never touches `"blocked"` (a permission question belongs to the person); while
+   * `"working"`, only full-screen interactive viewers (`isViewerSubscreen`) are
+   * closed so normal `"esc to interrupt"` prompts are never interrupted.
    */
   private async panelOpen(address: string): Promise<boolean> {
     const t = this.terminals.get(address);
-    if (!t?.status || !["idle", "done"].includes(normalizeStatus(t.status.state))) return false;
+    const isShell = t ? !t.status && SHELL_HARNESSES.has(HcAdapter.harness(t).toLowerCase()) : false;
+    if (isShell) return false;
+    const st: AgentStatus = t ? HcAdapter.status(t) : "idle";
+    if (st !== "working" && st !== "idle" && st !== "done") return false;
     try {
       const s = await this.screens.snapshot(address, 0);
-      return endsInPanel(s.text);
+      return st === "working" ? isViewerSubscreen(s.text) : endsInPanel(s.text);
     } catch {
       return false;
     }

@@ -193,12 +193,482 @@ export interface Osc66Parsed {
 
 const KITTY_VIRTUAL_PLACEHOLDER = 0x10eeee;
 
-/** Approx terminal column width (handles wide CJK/Emoji and ignores Kitty virtual placeholder U+10EEEE). */
+/**
+ * Official 297-entry Kitty Unicode Placeholder row/column combining diacritics table
+ * (`rowcolumn-diacritics.txt`, ordered index 0..296).
+ */
+export const KITTY_PLACEHOLDER_DIACRITICS: readonly number[] = [
+  773, 781, 782, 784, 786, 829, 830, 831, 838, 842, 843, 844, 848, 849, 850, 855, 859,
+  867, 868, 869, 870, 871, 872, 873, 874, 875, 876, 877, 878, 879, 1155, 1156, 1157,
+  1158, 1159, 1426, 1427, 1428, 1429, 1431, 1432, 1433, 1436, 1437, 1438, 1439, 1440,
+  1441, 1448, 1449, 1451, 1452, 1455, 1476, 1552, 1553, 1554, 1555, 1556, 1557, 1558,
+  1559, 1623, 1624, 1625, 1626, 1627, 1629, 1630, 1750, 1751, 1752, 1753, 1754, 1755,
+  1756, 1759, 1760, 1761, 1762, 1764, 1767, 1768, 1771, 1772, 1840, 1842, 1843, 1845,
+  1846, 1850, 1853, 1855, 1856, 1857, 1859, 1861, 1863, 1865, 1866, 2027, 2028, 2029,
+  2030, 2031, 2032, 2033, 2035, 2070, 2071, 2072, 2073, 2075, 2076, 2077, 2078, 2079,
+  2080, 2081, 2082, 2083, 2085, 2086, 2087, 2089, 2090, 2091, 2092, 2093, 2385, 2387,
+  2388, 3970, 3971, 3974, 3975, 4957, 4958, 4959, 6109, 6458, 6679, 6773, 6774, 6775,
+  6776, 6777, 6778, 6779, 6780, 7019, 7021, 7022, 7023, 7024, 7025, 7026, 7027, 7376,
+  7377, 7378, 7386, 7387, 7392, 7616, 7617, 7619, 7620, 7621, 7622, 7623, 7624, 7625,
+  7627, 7628, 7633, 7634, 7635, 7636, 7637, 7638, 7639, 7640, 7641, 7642, 7643, 7644,
+  7645, 7646, 7647, 7648, 7649, 7650, 7651, 7652, 7653, 7654, 7678, 8400, 8401, 8404,
+  8405, 8406, 8407, 8411, 8412, 8417, 8423, 8425, 8432, 11503, 11504, 11505, 11744,
+  11745, 11746, 11747, 11748, 11749, 11750, 11751, 11752, 11753, 11754, 11755, 11756,
+  11757, 11758, 11759, 11760, 11761, 11762, 11763, 11764, 11765, 11766, 11767, 11768,
+  11769, 11770, 11771, 11772, 11773, 11774, 11775, 42607, 42620, 42621, 42736, 42737,
+  43232, 43233, 43234, 43235, 43236, 43237, 43238, 43239, 43240, 43241, 43242, 43243,
+  43244, 43245, 43246, 43247, 43248, 43249, 43696, 43698, 43699, 43703, 43704, 43710,
+  43711, 43713, 65056, 65057, 65058, 65059, 65060, 65061, 65062, 68111, 68152, 119173,
+  119174, 119175, 119176, 119177, 119210, 119211, 119212, 119213, 119362, 119363, 119364,
+];
+
+const KITTY_DIACRITIC_INDEX = new Map<number, number>(
+  KITTY_PLACEHOLDER_DIACRITICS.map((cp, idx) => [cp, idx]),
+);
+
+const KITTY_PLACEHOLDER_UTF16 = String.fromCodePoint(KITTY_VIRTUAL_PLACEHOLDER);
+
+/**
+ * 1-column-wide, zero-ink sentinel stored in xterm.js cells for `U+10EEEE` placeholders
+ * (`U+2800` Braille Pattern Blank + `U+200B` ZWSP, followed by 27 `U+200C`/`U+200D` payload bits).
+ */
+export const KITTY_SENTINEL_PREFIX = "\u2800\u200B";
+const SENTINEL_BIT0 = "\u200C";
+const SENTINEL_BIT1 = "\u200D";
+const SENTINEL_OMITTED = 0x1ff; // 511 (9 bits, outside 0..296)
+const SENTINEL_PAYLOAD_BITS = 27;
+
+export interface KittyPlaceholderCellMeta {
+  row?: number;
+  col?: number;
+  idMsb?: number;
+}
+
+function encode9Bits(val: number | undefined): string {
+  const n = val === undefined ? SENTINEL_OMITTED : Math.max(0, Math.min(KITTY_PLACEHOLDER_DIACRITICS.length - 1, val));
+  let out = "";
+  for (let b = 8; b >= 0; b--) {
+    out += (n >> b) & 1 ? SENTINEL_BIT1 : SENTINEL_BIT0;
+  }
+  return out;
+}
+
+function decode9Bits(s: string, offset: number): number | undefined | null {
+  let n = 0;
+  for (let i = 0; i < 9; i++) {
+    const ch = s[offset + i];
+    if (ch === SENTINEL_BIT0) n <<= 1;
+    else if (ch === SENTINEL_BIT1) n = (n << 1) | 1;
+    else return null;
+  }
+  if (n === SENTINEL_OMITTED) return undefined;
+  return n < KITTY_PLACEHOLDER_DIACRITICS.length ? n : null;
+}
+
+/** Encodes Kitty placeholder `(row, col, idMsb)` metadata into a 1-column zero-ink sentinel cell string. */
+export function encodeKittySentinel(meta: KittyPlaceholderCellMeta): string {
+  return KITTY_SENTINEL_PREFIX + encode9Bits(meta.row) + encode9Bits(meta.col) + encode9Bits(meta.idMsb);
+}
+
+/** Decodes `(row, col, idMsb)` from a Kitty placeholder sentinel cell string, or null if not a valid sentinel. */
+export function decodeKittySentinel(chars: string): KittyPlaceholderCellMeta | null {
+  if (!chars.startsWith(KITTY_SENTINEL_PREFIX) || chars.length < KITTY_SENTINEL_PREFIX.length + SENTINEL_PAYLOAD_BITS) {
+    return null;
+  }
+  const base = KITTY_SENTINEL_PREFIX.length;
+  const row = decode9Bits(chars, base);
+  if (row === null) return null;
+  const col = decode9Bits(chars, base + 9);
+  if (col === null) return null;
+  const idMsb = decode9Bits(chars, base + 18);
+  if (idMsb === null) return null;
+  return { row, col, idMsb };
+}
+
+/**
+ * Streaming VT rewriter that converts `U+10EEEE` + 0..3 Kitty row/col/idMsb combining diacritics
+ * into guaranteed 1-column, zero-ink sentinels (`\u2800\u200B...`) without breaking across
+ * UTF-16 surrogate boundaries or split chunks.
+ */
+export class KittyUnicodePlaceholderRewriter {
+  private pendingHighSurrogate = "";
+  private inPlaceholder = false;
+  private diacritics: number[] = [];
+
+  private emitPlaceholder(): string {
+    const [row, col, idMsb] = this.diacritics;
+    this.inPlaceholder = false;
+    this.diacritics.length = 0;
+    return encodeKittySentinel({ row, col, idMsb });
+  }
+
+  push(chunk: string): string {
+    if (!chunk) return "";
+
+    if (!this.inPlaceholder && !this.pendingHighSurrogate && !chunk.includes(KITTY_PLACEHOLDER_UTF16)) {
+      const last = chunk.charCodeAt(chunk.length - 1);
+      if (last >= 0xd800 && last <= 0xdbff) {
+        this.pendingHighSurrogate = chunk.slice(-1);
+        return chunk.slice(0, -1);
+      }
+      return chunk;
+    }
+
+    const input = this.pendingHighSurrogate ? this.pendingHighSurrogate + chunk : chunk;
+    this.pendingHighSurrogate = "";
+
+    let out = "";
+    let i = 0;
+    while (i < input.length) {
+      const code = input.charCodeAt(i);
+      let cp: number;
+      let step: number;
+      if (code >= 0xd800 && code <= 0xdbff) {
+        if (i + 1 >= input.length) {
+          this.pendingHighSurrogate = input[i]!;
+          break;
+        }
+        const low = input.charCodeAt(i + 1);
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          cp = ((code - 0xd800) << 10) + (low - 0xdc00) + 0x10000;
+          step = 2;
+        } else {
+          cp = code;
+          step = 1;
+        }
+      } else {
+        cp = code;
+        step = 1;
+      }
+
+      if (this.inPlaceholder) {
+        const idx = KITTY_DIACRITIC_INDEX.get(cp);
+        if (idx !== undefined && this.diacritics.length < 3) {
+          this.diacritics.push(idx);
+          i += step;
+          if (this.diacritics.length === 3) {
+            out += this.emitPlaceholder();
+          }
+          continue;
+        }
+        out += this.emitPlaceholder();
+      }
+
+      if (cp === KITTY_VIRTUAL_PLACEHOLDER) {
+        this.inPlaceholder = true;
+        this.diacritics.length = 0;
+        i += step;
+        continue;
+      }
+
+      out += input.slice(i, i + step);
+      i += step;
+    }
+
+    return out;
+  }
+
+  flush(): string {
+    let out = "";
+    if (this.inPlaceholder) {
+      out += this.emitPlaceholder();
+    }
+    if (this.pendingHighSurrogate) {
+      out += this.pendingHighSurrogate;
+      this.pendingHighSurrogate = "";
+    }
+    return out;
+  }
+
+  reset(): void {
+    this.pendingHighSurrogate = "";
+    this.inPlaceholder = false;
+    this.diacritics.length = 0;
+  }
+}
+
+export interface KittyVirtualPlacementDims {
+  cols: number;
+  rows: number;
+  zIndex: number;
+}
+
+/** True only for non-virtual (`U=0`) `a=T` / `a=p` placements anchored at the terminal cursor. */
+export function shouldCreateCursorPlacement(cmd: Pick<KittyGfxCommand, "action" | "unicodePlaceholder">): boolean {
+  return (cmd.action === "T" || cmd.action === "p") && !cmd.unicodePlaceholder;
+}
+
+/** Registers virtual (`U=1`) dimensions under both `${imageId}:${placementId}` and `${imageId}:0`. */
+export function registerKittyVirtualPlacement(
+  map: Map<string, KittyVirtualPlacementDims>,
+  imageId: number,
+  placementId: number | undefined,
+  cols: number,
+  rows: number,
+  zIndex = 0,
+): void {
+  const dims: KittyVirtualPlacementDims = { cols, rows, zIndex };
+  map.set(`${imageId}:${placementId ?? 0}`, dims);
+  map.set(`${imageId}:0`, dims);
+}
+
+/** Removes virtual (`U=1`) placement dimensions for `imageId` (or a single `placementId` when provided). */
+export function deleteKittyVirtualPlacements(
+  map: Map<string, KittyVirtualPlacementDims>,
+  imageId: number,
+  placementId?: number,
+): void {
+  if (placementId !== undefined) {
+    map.delete(`${imageId}:${placementId}`);
+    return;
+  }
+  const prefix = `${imageId}:`;
+  for (const key of map.keys()) {
+    if (key.startsWith(prefix)) map.delete(key);
+  }
+}
+
+export function lookupKittyVirtualPlacement(
+  map: Map<string, KittyVirtualPlacementDims>,
+  imageId: number,
+  placementId: number,
+): KittyVirtualPlacementDims | undefined {
+  return map.get(`${imageId}:${placementId}`) ?? map.get(`${imageId}:0`);
+}
+
+export interface KittyBufferCellSample {
+  chars: string;
+  width: number;
+  fgMode: "rgb" | "palette" | "default";
+  fgColor: number;
+  placementId: number;
+}
+
+export interface VirtualSpriteBlock {
+  imageId: number;
+  placementId: number;
+  startAbsY: number;
+  startX: number;
+  cols: number;
+  rows: number;
+  startTileCol: number;
+  startTileRow: number;
+}
+
+interface ActiveVirtualBlock extends VirtualSpriteBlock {
+  lastAbsY: number;
+  lastTileRow: number;
+}
+
+interface HorizontalVirtualRun {
+  absY: number;
+  startX: number;
+  len: number;
+  imageId: number;
+  placementId: number;
+  tileRow: number;
+  startTileCol: number;
+  lastTileCol: number;
+}
+
+/**
+ * Scans visible terminal rows (`topY .. botY - 1`), decodes Kitty sentinel cells, resolves omitted
+ * diacritic inheritance left-to-right, and merges contiguous cells into rectangular sprite blocks.
+ */
+export function collectVirtualSpriteBlocks(
+  topY: number,
+  botY: number,
+  cols: number,
+  readSentinelCell: (absY: number, x: number, out: KittyBufferCellSample) => boolean,
+): VirtualSpriteBlock[] {
+  const sample: KittyBufferCellSample = { chars: "", width: 1, fgMode: "default", fgColor: 0, placementId: 0 };
+  const completed: VirtualSpriteBlock[] = [];
+  let active: ActiveVirtualBlock[] = [];
+
+  const finalizeBlock = (blk: ActiveVirtualBlock): VirtualSpriteBlock => ({
+    imageId: blk.imageId,
+    placementId: blk.placementId,
+    startAbsY: blk.startAbsY,
+    startX: blk.startX,
+    cols: blk.cols,
+    rows: blk.rows,
+    startTileCol: blk.startTileCol,
+    startTileRow: blk.startTileRow,
+  });
+
+  for (let absY = topY; absY < botY; absY++) {
+    // Finalize any active block that did not continue onto the previous row.
+    if (active.length > 0) {
+      const nextActive: ActiveVirtualBlock[] = [];
+      for (const blk of active) {
+        if (blk.lastAbsY === absY - 1) nextActive.push(blk);
+        else completed.push(finalizeBlock(blk));
+      }
+      active = nextActive;
+    }
+
+    const rowRuns: HorizontalVirtualRun[] = [];
+    let currentRun: HorizontalVirtualRun | null = null;
+    let prevCell: { baseId: number; placementId: number; row: number; col: number; idMsb: number } | null = null;
+
+    const flushRun = () => {
+      if (currentRun) {
+        rowRuns.push(currentRun);
+        currentRun = null;
+      }
+    };
+
+    for (let x = 0; x < cols; x++) {
+      if (!readSentinelCell(absY, x, sample) || sample.width === 0) {
+        prevCell = null;
+        flushRun();
+        continue;
+      }
+
+      const meta = decodeKittySentinel(sample.chars);
+      if (!meta) {
+        prevCell = null;
+        flushRun();
+        continue;
+      }
+
+      const baseId = sample.fgMode === "default" ? 0 : sample.fgColor;
+      const placementId = sample.placementId;
+      const canInherit = prevCell !== null && prevCell.baseId === baseId && prevCell.placementId === placementId;
+
+      let tileRow: number;
+      let tileCol: number;
+      let idMsb: number;
+
+      if (meta.row === undefined) {
+        if (canInherit) {
+          tileRow = prevCell!.row;
+          tileCol = prevCell!.col + 1;
+          idMsb = prevCell!.idMsb;
+        } else {
+          tileRow = 0;
+          tileCol = 0;
+          idMsb = 0;
+        }
+      } else if (meta.col === undefined) {
+        if (canInherit && prevCell!.row === meta.row) {
+          tileRow = meta.row;
+          tileCol = prevCell!.col + 1;
+          idMsb = prevCell!.idMsb;
+        } else {
+          tileRow = meta.row;
+          tileCol = 0;
+          idMsb = 0;
+        }
+      } else if (meta.idMsb === undefined) {
+        if (canInherit && prevCell!.row === meta.row && prevCell!.col + 1 === meta.col) {
+          tileRow = meta.row;
+          tileCol = meta.col;
+          idMsb = prevCell!.idMsb;
+        } else {
+          tileRow = meta.row;
+          tileCol = meta.col;
+          idMsb = 0;
+        }
+      } else {
+        tileRow = meta.row;
+        tileCol = meta.col;
+        idMsb = meta.idMsb;
+      }
+
+      prevCell = { baseId, placementId, row: tileRow, col: tileCol, idMsb };
+      const imageId = baseId + (idMsb & 0xff) * 0x1000000;
+      if (imageId === 0) {
+        flushRun();
+        continue;
+      }
+
+      if (
+        currentRun &&
+        currentRun.startX + currentRun.len === x &&
+        currentRun.imageId === imageId &&
+        currentRun.placementId === placementId &&
+        currentRun.tileRow === tileRow &&
+        currentRun.lastTileCol + 1 === tileCol
+      ) {
+        currentRun.len += 1;
+        currentRun.lastTileCol = tileCol;
+      } else {
+        flushRun();
+        currentRun = {
+          absY,
+          startX: x,
+          len: 1,
+          imageId,
+          placementId,
+          tileRow,
+          startTileCol: tileCol,
+          lastTileCol: tileCol,
+        };
+      }
+    }
+    flushRun();
+
+    for (const run of rowRuns) {
+      let matched = false;
+      for (const blk of active) {
+        if (
+          blk.lastAbsY === absY - 1 &&
+          blk.imageId === run.imageId &&
+          blk.placementId === run.placementId &&
+          blk.startX === run.startX &&
+          blk.cols === run.len &&
+          blk.startTileCol === run.startTileCol &&
+          blk.lastTileRow + 1 === run.tileRow
+        ) {
+          blk.rows += 1;
+          blk.lastAbsY = absY;
+          blk.lastTileRow = run.tileRow;
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        active.push({
+          imageId: run.imageId,
+          placementId: run.placementId,
+          startAbsY: absY,
+          startX: run.startX,
+          cols: run.len,
+          rows: 1,
+          startTileCol: run.startTileCol,
+          startTileRow: run.tileRow,
+          lastAbsY: absY,
+          lastTileRow: run.tileRow,
+        });
+      }
+    }
+  }
+
+  for (const blk of active) {
+    completed.push(finalizeBlock(blk));
+  }
+  return completed;
+}
+
+/** Approx terminal column width (handles wide CJK/Emoji and treats Kitty U+10EEEE / sentinels as width 1). */
 export function terminalTextColumns(text: string): number {
   let cols = 0;
   for (const ch of text) {
     const cp = ch.codePointAt(0)!;
-    if (cp < 0x20 || cp === 0x200b || cp === 0x200d || (cp >= 0x300 && cp <= 0x36f) || (cp >= 0xfe00 && cp <= 0xfe0f)) {
+    if (
+      cp < 0x20 ||
+      cp === 0x200b ||
+      cp === 0x200c ||
+      cp === 0x200d ||
+      (cp >= 0x300 && cp <= 0x36f) ||
+      (cp >= 0xfe00 && cp <= 0xfe0f) ||
+      KITTY_DIACRITIC_INDEX.has(cp)
+    ) {
+      continue;
+    }
+    if (cp === KITTY_VIRTUAL_PLACEHOLDER || cp === 0x2800) {
+      cols += 1;
       continue;
     }
     if (
@@ -231,7 +701,7 @@ export function parseOsc66(data: string): Osc66Parsed | null {
   if (semi < 0) return null;
   const metaRaw = data.slice(0, semi);
   const text = data.slice(semi + 1);
-  if (!text) return null;
+  if (!text || text.includes(KITTY_SENTINEL_PREFIX)) return null;
   for (const ch of text) {
     if (ch.codePointAt(0) === KITTY_VIRTUAL_PLACEHOLDER) return null;
   }
