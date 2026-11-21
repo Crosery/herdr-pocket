@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const LABEL: &str = "voice-hud";
-const WIDTH: f64 = 468.0;
+const WIDTH: f64 = 560.0;
 const HEIGHT_COMPACT: f64 = 82.0;
 const HEIGHT_EXPANDED: f64 = 188.0;
 /// Closed after this long without a dictation.
@@ -99,6 +99,21 @@ fn push(app: &AppHandle, state: &Value) {
     }
 }
 
+fn centered_position(
+    area_x: i32,
+    area_y: i32,
+    area_w: u32,
+    area_h: u32,
+    scale: f64,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let x = f64::from(area_x) / scale + (f64::from(area_w) / scale - width) / 2.0;
+    let y = f64::from(area_y) / scale + f64::from(area_h) / scale - height - 96.0;
+    (x, y)
+}
+
 fn place(app: &AppHandle, w: &tauri::WebviewWindow, height: f64) {
     let monitor = app
         .cursor_position()
@@ -107,12 +122,15 @@ fn place(app: &AppHandle, w: &tauri::WebviewWindow, height: f64) {
         .or_else(|| app.primary_monitor().ok().flatten());
     if let Some(m) = monitor {
         let area = m.work_area();
-        let scale = m.scale_factor();
-        let x =
-            f64::from(area.position.x) / scale + (f64::from(area.size.width) / scale - WIDTH) / 2.0;
-        let y = f64::from(area.position.y) / scale + f64::from(area.size.height) / scale
-            - height
-            - 96.0;
+        let (x, y) = centered_position(
+            area.position.x,
+            area.position.y,
+            area.size.width,
+            area.size.height,
+            m.scale_factor(),
+            WIDTH,
+            height,
+        );
         let _ = w.set_position(tauri::LogicalPosition::new(x, y));
     }
 }
@@ -568,5 +586,17 @@ mod tests {
             ]
         });
         assert_eq!(extract_assistant_reply(&waiting, Some("u2"), 200), None);
+    }
+
+    #[test]
+    fn hud_width_and_centered_position_accommodate_recording_and_reply() {
+        assert_eq!(WIDTH, 560.0);
+        let (x, y) = centered_position(0, 50, 3024, 1914, 2.0, WIDTH, HEIGHT_COMPACT);
+        assert_eq!(x, (1512.0 - 560.0) / 2.0);
+        assert_eq!(y, 25.0 + 957.0 - HEIGHT_COMPACT - 96.0);
+
+        let (x2, y2) = centered_position(1920, 0, 1920, 1080, 1.0, WIDTH, HEIGHT_EXPANDED);
+        assert_eq!(x2, 1920.0 + (1920.0 - 560.0) / 2.0);
+        assert_eq!(y2, 1080.0 - HEIGHT_EXPANDED - 96.0);
     }
 }

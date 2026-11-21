@@ -1285,9 +1285,11 @@ export function AgentDetailPanel({
     let alive = true;
     void rpcCall(agent.deviceId, "agent.commands", { agent: agent.key })
       .then((res) => {
-        if (alive) setDiscoveredSlash(res.commands);
+        if (alive) setDiscoveredSlash(Array.isArray(res?.commands) ? res.commands : []);
       })
-      .catch(() => {});
+      .catch(() => {
+        if (alive) setDiscoveredSlash([]);
+      });
     return () => {
       alive = false;
     };

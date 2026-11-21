@@ -211,13 +211,38 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
               <span>导出诊断</span>
             </button>
           </nav>
-          <div className="sf-main">
-            <div className="sf-body" ref={bodyRef} role="region" aria-label={title} tabIndex={-1}>
-              <div className="sf-page">{pane}</div>
+          <div className="sf-main" style={{ flexDirection: "column" }}>
+            <div
+              style={{
+                flex: "0 0 auto",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                padding: "10px 14px 10px 28px",
+                borderBottom: "1px solid var(--divider)",
+                background: "var(--surface)",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: "calc(14px * var(--ts, 1))",
+                  fontWeight: 700,
+                  lineHeight: 1.4,
+                  color: "var(--ink)",
+                }}
+              >
+                {title}
+              </span>
+              <Dialog.Close className="sf-close" aria-label="关闭设置" style={{ position: "static" }}>
+                <X size={15} />
+              </Dialog.Close>
             </div>
-            <Dialog.Close className="sf-close" aria-label="关闭设置">
-              <X size={15} />
-            </Dialog.Close>
+            <div className="sf-body" ref={bodyRef} role="region" aria-label={title} tabIndex={-1} style={{ minHeight: 0 }}>
+              <div className="sf-page" style={{ paddingTop: 18 }}>
+                {pane}
+              </div>
+            </div>
           </div>
         </Dialog.Content>
       </Dialog.Portal>

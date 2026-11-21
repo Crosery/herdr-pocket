@@ -76,7 +76,8 @@
   }
   .hud {
     position: relative;
-    width: 446px;
+    width: 540px;
+    max-width: calc(100vw - 16px);
     height: 56px;
     padding: 0 11px;
     display: flex;
@@ -100,7 +101,8 @@
   .hud.error { width: 404px; height: 56px; }
   .hud.cancelled { width: 214px; height: 54px; }
   .hud.assistant_reply {
-    width: 448px;
+    width: 540px;
+    max-width: calc(100vw - 16px);
     height: 164px;
     padding: 12px 14px;
     border-radius: 22px;
@@ -134,7 +136,7 @@
     min-width: 0;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 7px;
   }
   .progress-track {
     position: absolute;
@@ -193,6 +195,9 @@
     flex-direction: column;
     justify-content: center;
     gap: 1px;
+  }
+  .hud.recording .text {
+    min-width: 155px;
   }
   .title-row {
     display: flex;
