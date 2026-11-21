@@ -81,6 +81,7 @@ jobs:
         run: |
           pnpm install --frozen-lockfile --ignore-workspace
           pnpm exec expo prebuild --platform ios --no-install
+          node scripts/stage-ios-onnxruntime.mjs
           cd ios && pod install
       # Release embeds the JS bundle, so the app runs without Metro. The simulator build is
       # signed "to run locally" (ad hoc, no team or certificate).
@@ -166,6 +167,7 @@ jobs:
         run: |
           pnpm install --frozen-lockfile --ignore-workspace
           pnpm exec expo prebuild --platform ios --no-install
+          node scripts/stage-ios-onnxruntime.mjs
           cd ios && pod install
       # Unsigned: it proves the device build compiles and links; installing it needs signing elsewhere.
       - name: Archive for devices, unsigned

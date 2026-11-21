@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 const VERSION = "1.30.0";
 const NUPKG_URL = `https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${VERSION}/microsoft.ml.onnxruntime.${VERSION}.nupkg`;
 const EXPECTED_SHA256 = "30df119bd9164eaa187666d93147448fdd4a9a1a3caf83f1505daf7af2d1c5d2";
+const STAGE_MARKER = `${EXPECTED_SHA256}:v2`;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const mobileRoot = resolve(__dirname, "..");
@@ -27,7 +28,7 @@ for (let i = 0; i < args.length; i++) {
 const markerPath = join(outDir, ".staged-sha256");
 if (
   existsSync(markerPath) &&
-  readFileSync(markerPath, "utf8").trim() === EXPECTED_SHA256 &&
+  readFileSync(markerPath, "utf8").trim() === STAGE_MARKER &&
   existsSync(join(outDir, "onnxruntime.xcframework")) &&
   existsSync(join(outDir, "onnxruntime-c.podspec.json"))
 ) {
@@ -95,7 +96,9 @@ try {
     name: "onnxruntime-c",
     version: VERSION,
     summary: "ONNX Runtime C/C++ Pod",
+    description: "A pod for the ONNX Runtime C/C++ library.",
     homepage: "https://github.com/microsoft/onnxruntime",
+    source: { http: NUPKG_URL },
     license: { type: "MIT", file: "LICENSE" },
     authors: { "ONNX Runtime": "onnxruntime@microsoft.com" },
     platforms: { ios: "15.1", osx: "14.0" },
@@ -105,13 +108,18 @@ try {
     ios: {
       frameworks: ["CoreFoundation", "Foundation", "Network", "Security", "SystemConfiguration", "UIKit"],
     },
+    osx: {
+      frameworks: ["CoreFoundation", "Foundation", "IOKit", "Network", "Security", "SystemConfiguration"],
+    },
     source_files: "Headers/*.h",
-    public_header_files: "Headers/*.h",
     preserve_paths: ["LICENSE"],
     libraries: "c++",
+    pod_target_xcconfig: {
+      OTHER_CPLUSPLUSFLAGS: "-fvisibility=hidden -fvisibility-inlines-hidden",
+    },
   };
   writeFileSync(join(outDir, "onnxruntime-c.podspec.json"), `${JSON.stringify(podspec, null, 2)}\n`);
-  writeFileSync(markerPath, `${EXPECTED_SHA256}\n`);
+  writeFileSync(markerPath, `${STAGE_MARKER}\n`);
   console.log(`[stage-ios-onnxruntime] Staged onnxruntime-c ${VERSION} -> ${outDir}`);
 } finally {
   rmSync(work, { recursive: true, force: true });

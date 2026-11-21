@@ -27,6 +27,7 @@ test("git status, numstat, files.list propagation, stage/unstage/diff/commit/che
   const repo = join(rootTmp, "app");
   mkdirSync(join(repo, "src"), { recursive: true });
   gitSync(repo, "init");
+  gitSync(repo, "config", "core.autocrlf", "false");
   gitSync(repo, "config", "user.name", "Tester");
   gitSync(repo, "config", "user.email", "tester@example.com");
   writeFileSync(join(repo, "src", "index.ts"), "export const a = 1;\n");

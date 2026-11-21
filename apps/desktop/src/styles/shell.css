@@ -283,8 +283,11 @@
 }
 
 :root[data-titlebar="overlay"] .v3.collapsed .v3-brand {
-  justify-content: flex-end;
-  padding-right: 6px;
+  height: auto;
+  min-height: 42px;
+  padding: 40px 6px 6px;
+  justify-content: center;
+  border-bottom: 1px solid var(--v3-border);
 }
 
 .v3-brand-name {
