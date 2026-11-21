@@ -576,6 +576,19 @@ fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     }
 }
 
+pub(crate) fn prepare_relaunch(handle: &tauri::AppHandle) {
+    logging::info(
+        "app",
+        "app relaunch requested",
+        json!({ "via": "permission" }),
+    );
+    local_term::shutdown();
+    voice_ai::shutdown();
+    voice::shutdown(handle);
+    browser::on_exit(handle);
+    logging::flush(Duration::from_millis(300));
+}
+
 /// Everything the app does on its way out, once, whichever quit path runs first. Bounded so
 /// quitting never hangs: the upload gets 1.5 s, the file flush 1 s.
 fn on_quit(handle: &tauri::AppHandle, via: &str) {
@@ -657,6 +670,8 @@ pub fn run() {
             commands::permission_open_settings,
             commands::permission_reveal_app_bundle,
             commands::permission_drag_app_bundle,
+            commands::reset_mac_permission,
+            commands::relaunch_app,
             commands::resource_usage,
             commands::clear_caches,
             commands::update_env,

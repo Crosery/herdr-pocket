@@ -191,6 +191,29 @@ pub fn permission_drag_app_bundle(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
+pub async fn reset_mac_permission(app: AppHandle, kind: String) -> Result<perms::Status, String> {
+    let app_for_task = app.clone();
+    let s = tauri::async_runtime::spawn_blocking(move || {
+        perms::reset_mac_permission(&app_for_task, &kind)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if perms::note_change(&s) {
+        crate::voice::config_changed(&app);
+    }
+    Ok(s)
+}
+
+#[tauri::command]
+pub fn relaunch_app(app: AppHandle) {
+    crate::prepare_relaunch(&app);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        app.restart();
+    });
+}
+
+#[tauri::command]
 pub async fn resource_usage(app: AppHandle) -> resources::Usage {
     let a = app.clone();
     tauri::async_runtime::spawn_blocking(move || resources::usage(&a))

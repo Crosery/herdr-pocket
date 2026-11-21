@@ -607,6 +607,27 @@ export const native = {
   requestPermission: (kind: PermissionKind): Promise<Permissions> => invoke<Permissions>("permission_request", { kind }),
   openPermissionSettings: (kind: PermissionKind, register = false): Promise<void> =>
     inTauri() ? invoke("permission_open_settings", { kind, register }) : noop(),
+  resetMacPermission: async (kind: PermissionKind): Promise<Permissions> => {
+    if (inTauri()) return invoke<Permissions>("reset_mac_permission", { kind });
+    const platform = bridge.detectPlatform();
+    const mac = platform === "macos";
+    return {
+      platform: platform === "windows" ? "windows" : platform === "linux" ? "linux" : "macos",
+      microphone: kind === "microphone" ? "notDetermined" : "granted",
+      accessibility: mac ? (kind === "accessibility" ? "notDetermined" : "denied") : "notApplicable",
+      inputMonitoring: mac ? (kind === "inputMonitoring" ? "notDetermined" : "denied") : "notApplicable",
+      fullDiskAccess: mac ? (kind === "fullDiskAccess" ? "notDetermined" : "denied") : "notApplicable",
+      appBundlePath: mac ? "/Applications/Herdr Pocket.app" : undefined,
+      notes: [],
+    };
+  },
+  relaunchApp: async (): Promise<boolean> => {
+    if (inTauri()) {
+      await invoke("relaunch_app");
+      return true;
+    }
+    return false;
+  },
   startAppBundleDrag: (): Promise<boolean> =>
     inTauri() ? invoke<boolean>("permission_drag_app_bundle").catch(() => false) : Promise.resolve(false),
   revealAppBundle: (): Promise<string | null> =>

@@ -1,5 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, CheckCircle2, ExternalLink, FolderOpen, GripVertical, Keyboard, RefreshCw, ShieldCheck } from "lucide-react";
+import {
+  ArrowRight,
+  CheckCircle2,
+  ExternalLink,
+  FolderOpen,
+  GripVertical,
+  Keyboard,
+  Power,
+  RefreshCw,
+  RotateCcw,
+  ShieldCheck,
+} from "lucide-react";
 import { detectPlatform } from "../lib/bridge";
 import { native, type Permission, type PermissionKind, type Permissions } from "../lib/native";
 import { XiaoyangOrb } from "./MascotAndVendor";
@@ -49,11 +60,11 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
         title: "麦克风",
         breadcrumbs: ["系统设置", "隐私与安全性", "麦克风"],
         why: "用于语音输入与小羊实时通话。",
-        actionLabel: "直达系统设置「麦克风」",
+        actionLabel: "打开系统设置「麦克风」",
         dragSupported: true,
         steps: [
           "打开系统设置「麦克风」并开启 Herdr Pocket 开关。",
-          "若列表里没有应用，按住下方卡片拖进右侧列表即可。",
+          "在列表开启开关；若列表为空，按住下方卡片拖进右侧列表即可。",
         ],
       };
     case "accessibility":
@@ -61,11 +72,11 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
         title: "辅助功能",
         breadcrumbs: ["系统设置", "隐私与安全性", "辅助功能"],
         why: "用于将识别文字直接粘贴到当前聚焦的应用。",
-        actionLabel: "直达系统设置「辅助功能」",
+        actionLabel: "打开系统设置「辅助功能」",
         dragSupported: true,
         steps: [
           "打开系统设置「辅助功能」并开启 Herdr Pocket 开关。",
-          "按住下方「Herdr Pocket.app」拖进右侧列表即可快速添加。",
+          "在列表开启开关；或按住下方「Herdr Pocket.app」拖进列表。",
         ],
       };
     case "inputMonitoring":
@@ -73,11 +84,11 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
         title: "输入监控",
         breadcrumbs: ["系统设置", "隐私与安全性", "输入监控"],
         why: "用于监听右 Option、Fn 等单键按住说话。",
-        actionLabel: "直达系统设置「输入监控」",
+        actionLabel: "打开系统设置「输入监控」",
         dragSupported: true,
         steps: [
           "打开系统设置「输入监控」并开启 Herdr Pocket 开关。",
-          "按住下方「Herdr Pocket.app」拖进右侧列表即可快速添加。",
+          "在列表开启开关；或按住下方「Herdr Pocket.app」拖进列表。",
         ],
       };
     case "fullDiskAccess":
@@ -85,11 +96,11 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
         title: "完全磁盘访问权限",
         breadcrumbs: ["系统设置", "隐私与安全性", "完全磁盘访问权限"],
         why: "用于导入 Safari 已登录站点的 Cookie。",
-        actionLabel: "直达系统设置「完全磁盘访问权限」",
+        actionLabel: "打开系统设置「完全磁盘访问权限」",
         dragSupported: true,
         steps: [
           "打开系统设置「完全磁盘访问权限」并开启开关。",
-          "按住下方「Herdr Pocket.app」拖进右侧列表即可快速添加。",
+          "在列表开启开关；或按住下方「Herdr Pocket.app」拖进列表。",
         ],
       };
     case "keyboard":
@@ -97,7 +108,7 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
         title: "地球仪键（Fn）",
         breadcrumbs: ["系统设置", "键盘", "按下地球仪键时"],
         why: "避免按 Fn 时同时触发系统输入法或表情面板。",
-        actionLabel: "直达系统设置「键盘」",
+        actionLabel: "打开系统设置「键盘」",
         dragSupported: false,
         steps: [
           "打开「系统设置 › 键盘」，将「按下地球仪键时」改为「不执行任何操作」。",
@@ -155,6 +166,8 @@ export function PermissionGuideModal({
   const [livePerms, setLivePerms] = useState<Permissions | null>(perms);
   const [dragging, setDragging] = useState(false);
   const [rechecking, setRechecking] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [relaunching, setRelaunching] = useState(false);
   const pressOriginRef = useRef<{ x: number; y: number } | null>(null);
   const dragStartedRef = useRef(false);
   const prevPermsRef = useRef<Permissions | null>(perms);
@@ -258,6 +271,44 @@ export function PermissionGuideModal({
     }
   };
 
+  const canResetMacTcc =
+    MAC && (kind === "accessibility" || kind === "inputMonitoring" || kind === "microphone");
+
+  const handleResetCache = async () => {
+    if (!canResetMacTcc) return;
+    setResetting(true);
+    try {
+      const next = await native.resetMacPermission(kind);
+      prevPermsRef.current = next;
+      setLivePerms(next);
+      if (!native.available()) {
+        toast(`演示模式：已重置「${spec.title}」权限缓存并重新登记`);
+      } else {
+        await native.voiceReload();
+        toast(`已重置「${spec.title}」旧权限缓存，请在系统设置重新开启开关`);
+      }
+      await onRefreshRef.current();
+    } catch (e) {
+      toast((e as Error).message || "重置权限缓存失败", true);
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  const handleRelaunch = async () => {
+    setRelaunching(true);
+    try {
+      const restarted = await native.relaunchApp();
+      if (!restarted) {
+        toast("演示模式无法重启进程；桌面端会立即重启应用使新权限生效");
+      }
+    } catch (e) {
+      toast((e as Error).message || "重启应用失败", true);
+    } finally {
+      setRelaunching(false);
+    }
+  };
+
   const resetPointerDrag = () => {
     pressOriginRef.current = null;
     dragStartedRef.current = false;
@@ -310,7 +361,7 @@ export function PermissionGuideModal({
         <section className="perm-step-card">
           <div className="perm-step-head">
             <span className="perm-step-num">1</span>
-            <span className="perm-step-title">一键直达对应系统设置页面</span>
+            <span className="perm-step-title">打开系统设置对应页</span>
           </div>
           <div className="perm-breadcrumb" aria-label="系统设置路径">
             {spec.breadcrumbs.map((seg, i) => (
@@ -322,10 +373,8 @@ export function PermissionGuideModal({
               </span>
             ))}
           </div>
-          <div className="faint" style={{ fontSize: "calc(12.5px * var(--ts, 1))", lineHeight: 1.5 }}>
-            {spec.steps[0]}
-          </div>
-          <div className="row wrap" style={{ gap: 8, marginTop: 2 }}>
+          <div className="perm-step-desc">{spec.steps[0]}</div>
+          <div className="perm-step-actions">
             <PocketButton size="sm" variant="primary" onClick={() => void handleOpenSettings()}>
               <ExternalLink size={13} />
               <span>{spec.actionLabel}</span>
@@ -341,11 +390,9 @@ export function PermissionGuideModal({
           <section className="perm-step-card">
             <div className="perm-step-head">
               <span className="perm-step-num">2</span>
-              <span className="perm-step-title">按住拖动应用到系统设置列表（快速适配）</span>
+              <span className="perm-step-title">打开开关或将下方 Herdr Pocket.app 卡片拖入列表</span>
             </div>
-            <div className="faint" style={{ fontSize: "calc(12.5px * var(--ts, 1))", lineHeight: 1.5 }}>
-              {spec.steps[1]}
-            </div>
+            <div className="perm-step-desc">{spec.steps[1]}</div>
             <div className="perm-drag-stage">
               <div
                 role="button"
@@ -406,14 +453,11 @@ export function PermissionGuideModal({
               </div>
             </div>
 
-            <div className="row wrap" style={{ gap: 8 }}>
+            <div className="perm-step-actions">
               <PocketButton size="sm" variant="soft" onClick={() => void handleRevealBundle()}>
                 <FolderOpen size={13} />
                 <span>在 Finder 中定位应用</span>
               </PocketButton>
-            </div>
-            <div className="perm-guide-tip">
-              若列表已有 Herdr Pocket 仍显示未允许：关闭重开开关，或选中点「−」移除后重新拖入
             </div>
           </section>
         ) : (
@@ -434,6 +478,34 @@ export function PermissionGuideModal({
             {spec.settingTip ? <div className="perm-guide-tip">{spec.settingTip}</div> : null}
           </section>
         )}
+
+        {MAC && kind !== "keyboard" ? (
+          <section className="perm-step-card">
+            <div className="perm-step-head">
+              <span className="perm-step-num">3</span>
+              <span className="perm-step-title">重置旧缓存并重启应用生效</span>
+            </div>
+            <div className="perm-step-desc">
+              {kind === "inputMonitoring"
+                ? "macOS 开启「输入监控」后需重启应用才会生效；若更新版本后仍显示待开启，可先重置权限缓存。"
+                : kind === "fullDiskAccess"
+                  ? "开启「完全磁盘访问权限」后，点击立即重启即可生效。"
+                  : "若列表中已打开开关但仍显示待开启，可重置旧版本权限缓存后重新开启，再重启应用。"}
+            </div>
+            <div className="perm-step-actions">
+              {canResetMacTcc ? (
+                <PocketButton size="sm" variant="soft" disabled={resetting} onClick={() => void handleResetCache()}>
+                  <RotateCcw size={13} />
+                  <span>{resetting ? "正在重置…" : "重置旧版本权限缓存"}</span>
+                </PocketButton>
+              ) : null}
+              <PocketButton size="sm" variant="primary" disabled={relaunching} onClick={() => void handleRelaunch()}>
+                <Power size={13} />
+                <span>{relaunching ? "正在重启…" : "立即重启应用生效"}</span>
+              </PocketButton>
+            </div>
+          </section>
+        ) : null}
 
         <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
           <PocketButton size="sm" variant={granted ? "primary" : "ghost"} onClick={() => onOpenChange(false)}>

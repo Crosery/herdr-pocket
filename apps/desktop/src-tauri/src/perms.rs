@@ -111,12 +111,12 @@ mod mac {
     #[link(name = "IOKit", kind = "framework")]
     extern "C" {
         fn IOHIDCheckAccess(request: u32) -> u32;
-        fn IOHIDRequestAccess(request: u32) -> bool;
     }
 
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGPreflightListenEventAccess() -> bool;
+        fn CGRequestListenEventAccess() -> bool;
     }
 
     #[link(name = "AVFoundation", kind = "framework")]
@@ -204,8 +204,13 @@ mod mac {
         super::resolve_input_monitoring(hid, cg)
     }
 
+    /// Registers the app in macOS System Settings → Privacy & Security → Input Monitoring
+    /// using CoreGraphics (`CGRequestListenEventAccess`).
     pub fn request_input_monitoring() -> State {
-        if unsafe { IOHIDRequestAccess(LISTEN_EVENT) } || unsafe { CGPreflightListenEventAccess() } {
+        if input_monitoring() == State::Granted {
+            return State::Granted;
+        }
+        if unsafe { CGRequestListenEventAccess() } {
             State::Granted
         } else {
             input_monitoring()
@@ -453,6 +458,45 @@ pub fn settings_url(kind: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(target_os = "macos")]
+static PROMPTED_AX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static PROMPTED_IM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Maps supported permission kinds to macOS `tccutil` service names (strict allowlist).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn mac_tcc_service(kind: &str) -> Option<&'static str> {
+    match kind {
+        "accessibility" => Some("Accessibility"),
+        "inputMonitoring" => Some("ListenEvent"),
+        "microphone" => Some("Microphone"),
+        _ => None,
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn format_tccutil_error(
+    service: &str,
+    bundle_id: &str,
+    code: Option<i32>,
+    stderr: &str,
+) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.contains("-10814") || trimmed.contains("No such bundle identifier") {
+        return format!(
+            "系统尚未登记应用标识（{bundle_id}），无法自动重置 {service} 缓存；请从“应用程序”打开 Herdr Pocket.app 后重试，或点引导中的「在 Finder 中定位应用」手动移除后重新拖入"
+        );
+    }
+    if trimmed.is_empty() {
+        format!(
+            "重置 {service} 权限缓存失败（退出码 {}）",
+            code.map_or_else(|| "未知".into(), |c| c.to_string())
+        )
+    } else {
+        format!("重置 {service} 权限缓存失败：{trimmed}")
+    }
+}
+
 pub fn open_settings(kind: &str) -> Result<(), String> {
     open_settings_and_register(kind, false)
 }
@@ -460,23 +504,34 @@ pub fn open_settings(kind: &str) -> Result<(), String> {
 pub fn open_settings_and_register(kind: &str, register: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static PROMPTED_AX: AtomicBool = AtomicBool::new(false);
+        use std::sync::atomic::Ordering;
 
         if register {
             match kind {
                 "accessibility" => {
-                    if mac::accessibility() != State::Granted && !PROMPTED_AX.swap(true, Ordering::Relaxed) {
-                        mac::request_accessibility();
+                    if mac::accessibility() == State::Granted {
+                        return Ok(());
+                    }
+                    if !PROMPTED_AX.swap(true, Ordering::Relaxed)
+                        && mac::request_accessibility() == State::Granted
+                    {
+                        return Ok(());
                     }
                 }
                 "inputMonitoring" => {
-                    if mac::input_monitoring() == State::NotDetermined {
-                        mac::request_input_monitoring();
+                    if mac::input_monitoring() == State::Granted {
+                        return Ok(());
+                    }
+                    if !PROMPTED_IM.swap(true, Ordering::Relaxed)
+                        && mac::request_input_monitoring() == State::Granted
+                    {
+                        return Ok(());
                     }
                 }
                 "microphone" => {
-                    if mac::microphone() == State::NotDetermined && mac::request_microphone() == State::Granted {
+                    if mac::microphone() == State::NotDetermined
+                        && mac::request_microphone() == State::Granted
+                    {
                         return Ok(());
                     }
                 }
@@ -515,6 +570,58 @@ pub fn open_settings_and_register(kind: &str, register: bool) -> Result<(), Stri
         let url = settings_url(kind).ok_or_else(|| "这台电脑的系统没有对应的设置页".to_string())?;
         logging::info("perm", format!("open settings for {kind}"), Value::Null);
         tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| format!("无法打开系统设置：{e}"))
+    }
+}
+
+/// Resets this app's macOS TCC entry for `kind` via `/usr/bin/tccutil reset <Service> <bundle_id>`,
+/// clears the per-session prompt guard, re-requests so macOS records the current binary signature,
+/// and opens the corresponding System Settings pane if still ungranted.
+pub fn reset_mac_permission(app: &tauri::AppHandle, kind: &str) -> Result<Status, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        let service = mac_tcc_service(kind)
+            .ok_or_else(|| format!("不支持重置该权限缓存：{kind}"))?;
+        let bundle_id = app.config().identifier.trim();
+        if bundle_id.is_empty() {
+            return Err("未找到应用标识符（bundle identifier）".into());
+        }
+        logging::info(
+            "perm",
+            format!("resetting macOS TCC permission for {kind}"),
+            json!({ "service": service, "bundleId": bundle_id }),
+        );
+        let output = std::process::Command::new("/usr/bin/tccutil")
+            .args(["reset", service, bundle_id])
+            .output()
+            .map_err(|e| format!("无法执行 tccutil 重置权限：{e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = format_tccutil_error(service, bundle_id, output.status.code(), &stderr);
+            logging::warn(
+                "perm",
+                format!("tccutil reset failed for {kind}"),
+                json!({ "service": service, "code": output.status.code(), "error": msg }),
+            );
+            return Err(msg);
+        }
+
+        match kind {
+            "accessibility" => PROMPTED_AX.store(false, Ordering::Relaxed),
+            "inputMonitoring" => PROMPTED_IM.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+
+        let after = request(kind)?;
+        if state_of(&after, kind) != State::Granted {
+            open_settings(kind)?;
+        }
+        Ok(after)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, kind);
+        Err("仅 macOS 支持重置系统权限缓存".into())
     }
 }
 
@@ -728,7 +835,10 @@ fn states_value(s: &Status) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_bundle_from_exe, resolve_input_monitoring, settings_url, State};
+    use super::{
+        app_bundle_from_exe, format_tccutil_error, mac_tcc_service, resolve_input_monitoring,
+        settings_url, State,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -763,6 +873,33 @@ mod tests {
         assert_eq!(resolve_input_monitoring(1, false), State::Denied);
         assert_eq!(resolve_input_monitoring(2, false), State::NotDetermined);
         assert_eq!(resolve_input_monitoring(99, false), State::Unknown);
+    }
+
+    #[test]
+    fn mac_tcc_service_maps_only_allowlisted_kinds() {
+        assert_eq!(mac_tcc_service("accessibility"), Some("Accessibility"));
+        assert_eq!(mac_tcc_service("inputMonitoring"), Some("ListenEvent"));
+        assert_eq!(mac_tcc_service("microphone"), Some("Microphone"));
+        assert_eq!(mac_tcc_service("fullDiskAccess"), None);
+        assert_eq!(mac_tcc_service("keyboard"), None);
+        assert_eq!(mac_tcc_service("all"), None);
+        assert_eq!(mac_tcc_service(""), None);
+    }
+
+    #[test]
+    fn format_tccutil_error_explains_unregistered_bundle_and_exit_codes() {
+        let missing = format_tccutil_error(
+            "ListenEvent",
+            "dev.crosery.herdrpocket.desktop",
+            Some(64),
+            "tccutil: No such bundle identifier \"dev.crosery.herdrpocket.desktop\": (OSStatus error -10814.)",
+        );
+        assert!(missing.contains("dev.crosery.herdrpocket.desktop"));
+        assert!(missing.contains("ListenEvent"));
+        assert!(missing.contains("在 Finder 中定位应用"));
+
+        let empty = format_tccutil_error("Accessibility", "dev.example.app", Some(1), "");
+        assert!(empty.contains("退出码 1"));
     }
 }
 
