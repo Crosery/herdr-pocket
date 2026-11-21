@@ -14,19 +14,89 @@ import {
 } from "../lib/assistant";
 import { RichMarkdown } from "../lib/markdown";
 import { VoiceMicButton } from "../components/VoiceInput";
-import { hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
+import { hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore, type VoiceCallState } from "../lib/voiceCall";
 import { useComposerInput } from "../lib/composerKeys";
 import { isMockServer } from "../lib/mock";
 import { liveStore, settingsStore } from "../lib/store";
+import "../styles/assistant-call.css";
 
 const SUGGESTIONS = ["谁在等我？", "大家都在忙什么？", "最近谁跑完了，结果怎么样？", "10 分钟后提醒我看一下进度"];
+
+export type CallStateView = VoiceCallState & { startedAt?: number | null };
+
+let fallbackCallStartedAt: number | null = null;
+
+/** Resolve call answer timestamp from VoiceCallState (or track ready-state start locally across drawer toggles). */
+export function resolveCallStartedAt(state: CallStateView, now = Date.now()): number | null {
+  if (typeof state.startedAt === "number" && Number.isFinite(state.startedAt)) {
+    fallbackCallStartedAt = state.startedAt;
+    return state.startedAt;
+  }
+  if (state.status === "ready") {
+    if (fallbackCallStartedAt === null) fallbackCallStartedAt = now;
+    return fallbackCallStartedAt;
+  }
+  if (state.status === "idle") {
+    fallbackCallStartedAt = null;
+  }
+  return null;
+}
+
+voiceCallStore.subscribe(() => {
+  resolveCallStartedAt(voiceCallStore.get() as CallStateView);
+});
+
+/** Format elapsed call time as mm:ss once the call is active. */
+export function formatCallDuration(startedAt: number | null | undefined, now = Date.now()): string {
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) return "";
+  const totalSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const mins = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+  const secs = String(totalSeconds % 60).padStart(2, "0");
+  return `${mins}:${secs}`;
+}
+
+export function formatCallMiniSub(state: Pick<CallStateView, "status" | "muted">, duration: string): string {
+  if (state.status === "connecting") return "正在接通…";
+  const label = state.muted ? "已静音" : "点此回到通话";
+  return duration ? `${duration} · ${label}` : label;
+}
+
+export function formatCallOverlayStatus(state: Pick<VoiceCallState, "status" | "task" | "assistant" | "muted">): string {
+  if (state.status === "connecting") return "正在接通小羊…";
+  const task = state.task?.trim();
+  if (task) return `正在处理：${task}`;
+  if (state.assistant === "speaking") return "小羊正在说…";
+  if (state.assistant === "thinking") return "小羊在想…";
+  if (state.muted) return "麦克风已静音";
+  return "我在听，直接说话就行";
+}
+
+function useCallClock(callState: CallStateView, enabled = true): string {
+  const startedAt = enabled ? resolveCallStartedAt(callState) : null;
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!enabled || startedAt === null) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [enabled, startedAt]);
+
+  return enabled ? formatCallDuration(startedAt, now) : "";
+}
 
 function fmtClock(ts: number): string {
   const d = new Date(ts);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => void }) {
+export function AssistantView({
+  onOpenAgent,
+  initialCallExpanded = true,
+}: {
+  onOpenAgent: (key: string) => void;
+  initialCallExpanded?: boolean;
+}) {
   const toast = useToast();
   const items = assistantStore.use((s) => s.items);
   const busy = assistantStore.use((s) => s.busy);
@@ -37,13 +107,13 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
   const reminders = assistantStore.use((s) => s.reminders);
   const link = liveStore.use((s) => s.link);
   const server = settingsStore.use((s) => s.server);
-  const callState = voiceCallStore.use((s) => s);
+  const callState = voiceCallStore.use((s) => s) as CallStateView;
 
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [showReminders, setShowReminders] = useState(false);
-  const [callExpanded, setCallExpanded] = useState(true);
+  const [callExpanded, setCallExpanded] = useState(initialCallExpanded);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -64,6 +134,7 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
   }, [items.length, busy]);
 
   const inCall = callState.status === "connecting" || callState.status === "ready";
+  const callDuration = useCallClock(callState, inCall);
   const sendLockRef = useRef(false);
   const lastSendRef = useRef<{ text: string; at: number } | null>(null);
 
@@ -94,39 +165,49 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
     if (err) toast(err, true);
   };
 
+  const headerSub = busy
+    ? busyLabel || "正在思考…"
+    : voice || isMockServer(server)
+      ? "盯着所有电脑 · 文字与语音随时可用"
+      : "盯着所有电脑";
+  const showCallBtn = (voice || isMockServer(server)) && !inCall;
+  const hasHeaderActions = reminders.length > 0 || showCallBtn || items.length > 0;
+
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
+    <div className="assistant-pane-root">
       {/* Header */}
-      <div className="between" style={{ padding: "12px 18px 8px", flexShrink: 0 }}>
-        <div>
-          <h2 className="cute-font" style={{ margin: 0, fontSize: fs(24) }}>小羊</h2>
-          <div className="faint">
-            {busy ? (busyLabel || "正在思考…") : voice || isMockServer(server) ? "盯着所有电脑 · 文字与语音随时可用" : "盯着所有电脑"}
+      <div className="assistant-pane-header">
+        <div className="assistant-pane-meta">
+          <h2 className="cute-font assistant-pane-title">小羊</h2>
+          <div className="faint assistant-pane-sub" title={headerSub}>
+            {headerSub}
           </div>
         </div>
-        <div className="row" style={{ gap: 8 }}>
-          {reminders.length > 0 ? (
-            <PocketButton size="sm" variant="soft" onClick={() => setShowReminders(true)}>
-              <Bell size={14} />
-              <span>提醒 {reminders.length}</span>
-            </PocketButton>
-          ) : null}
-          {(voice || isMockServer(server)) && !inCall ? (
-            <PocketButton size="sm" variant="primary" onClick={() => void startCall()}>
-              <Phone size={14} />
-              <span>打电话</span>
-            </PocketButton>
-          ) : null}
-          {items.length > 0 ? (
-            <PocketIconButton tooltip="清空对话" size="sm" onClick={() => setConfirmClear(true)}>
-              <Trash2 size={15} />
-            </PocketIconButton>
-          ) : null}
-        </div>
+        {hasHeaderActions ? (
+          <div className="assistant-pane-actions">
+            {reminders.length > 0 ? (
+              <PocketButton size="sm" variant="soft" onClick={() => setShowReminders(true)}>
+                <Bell size={14} />
+                <span>提醒 {reminders.length}</span>
+              </PocketButton>
+            ) : null}
+            {showCallBtn ? (
+              <PocketButton size="sm" variant="primary" onClick={() => void startCall()}>
+                <Phone size={14} />
+                <span>打电话</span>
+              </PocketButton>
+            ) : null}
+            {items.length > 0 ? (
+              <PocketIconButton tooltip="清空对话" size="sm" onClick={() => setConfirmClear(true)}>
+                <Trash2 size={15} />
+              </PocketIconButton>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       {loaded && !ready && !isMockServer(server) ? (
-        <div style={{ padding: "0 18px 8px" }}>
+        <div className="assistant-pane-notice">
           <PocketCard soft>
             <div className="faint">服务器上还没配置助理用的文字模型，可以在「设置 → 小羊助理」里添加后开聊。</div>
           </PocketCard>
@@ -165,24 +246,13 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
 
       {/* Folded Call Bar */}
       {inCall && !callExpanded ? (
-        <div className="call-mini-bar" onClick={() => setCallExpanded(true)}>
-          <div className="row">
-            <XiaoyangOrb mood={callState.assistant === "speaking" ? "speaking" : "listening"} size={30} />
-            <div>
-              <div style={{ fontWeight: 800, fontSize: fs(13) }}>和小羊通话中</div>
-              <div className="faint">{callState.status === "connecting" ? "正在接通…" : callState.task || "点击回到通话画面"}</div>
-            </div>
-          </div>
-          <div className="row" onClick={(e) => e.stopPropagation()}>
-            <PocketIconButton size="sm" active={callState.muted} onClick={() => setVoiceMuted(!callState.muted)} tooltip={callState.muted ? "取消静音" : "静音"}>
-              {callState.muted ? <MicOff size={15} /> : <Mic size={15} />}
-            </PocketIconButton>
-            <PocketButton size="sm" variant="danger" onClick={() => hangupVoiceCall()}>
-              <PhoneOff size={14} />
-              <span>挂断</span>
-            </PocketButton>
-          </div>
-        </div>
+        <CallMiniBar
+          callState={callState}
+          duration={callDuration}
+          onExpand={() => setCallExpanded(true)}
+          onToggleMute={() => setVoiceMuted(!callState.muted)}
+          onHangup={() => hangupVoiceCall()}
+        />
       ) : null}
 
       {/* Composer */}
@@ -213,9 +283,9 @@ export function AssistantView({ onOpenAgent }: { onOpenAgent: (key: string) => v
         </div>
       </div>
 
-      {/* Fullscreen Call View */}
+      {/* Scoped Call View */}
       {inCall && callExpanded ? (
-        <CallOverlay onMinimize={() => setCallExpanded(false)} />
+        <CallOverlay onMinimize={() => setCallExpanded(false)} callState={callState} duration={callDuration} />
       ) : null}
 
       <PocketModal open={confirmClear} onOpenChange={setConfirmClear} title="开始新对话？" subtitle="聊天记录会清空，已设好的提醒不受影响。" width={380}>
@@ -366,74 +436,166 @@ function AssistantBubble({
   );
 }
 
-function CallOverlay({ onMinimize }: { onMinimize: () => void }) {
-  const s = voiceCallStore.use((v) => v);
+export function CallMiniBar({
+  callState,
+  duration,
+  onExpand,
+  onToggleMute,
+  onHangup,
+}: {
+  callState: CallStateView;
+  duration: string;
+  onExpand: () => void;
+  onToggleMute: () => void;
+  onHangup: () => void;
+}) {
+  const subText = formatCallMiniSub(callState, duration);
+  const taskText = callState.task?.trim() || "";
+  const speaking = callState.assistant === "speaking" || callState.outLevel > 0.08;
+  const listeningActive = !callState.muted && callState.micLevel > 0.08;
+  const waveMode =
+    callState.status === "connecting"
+      ? "connecting"
+      : callState.muted && !speaking
+        ? "muted"
+        : speaking
+          ? "speaking"
+          : callState.status === "ready" && listeningActive
+            ? "active"
+            : "idle";
+
+  return (
+    <div className="call-mini-bar" onClick={onExpand}>
+      <div className="call-mini-head">
+        <div className="call-mini-ident">
+          <XiaoyangOrb mood={callState.assistant === "speaking" ? "speaking" : "listening"} size={28} />
+          <div className="call-mini-meta">
+            <div className="call-mini-title-row">
+              <span className="call-mini-title">和小羊通话中</span>
+              <span className={`call-mini-wave ${waveMode}`} aria-hidden="true">
+                <span />
+                <span />
+                <span />
+              </span>
+            </div>
+            <div className="call-mini-sub num" title={subText}>
+              {subText}
+            </div>
+          </div>
+        </div>
+        <div className="call-mini-actions" onClick={(e) => e.stopPropagation()}>
+          <PocketIconButton
+            size="sm"
+            active={callState.muted}
+            onClick={onToggleMute}
+            tooltip={callState.muted ? "取消静音" : "静音"}
+          >
+            {callState.muted ? <MicOff size={15} /> : <Mic size={15} />}
+          </PocketIconButton>
+          <PocketButton
+            size="sm"
+            variant="danger"
+            className="call-mini-hangup"
+            aria-label="挂断"
+            title="挂断"
+            onClick={onHangup}
+          >
+            <PhoneOff size={14} />
+            <span className="call-mini-hangup-label">挂断</span>
+          </PocketButton>
+        </div>
+      </div>
+      {taskText ? (
+        <div className="call-mini-task">
+          <span className="status-dot breathe call-mini-task-dot" aria-hidden="true" />
+          <span className="call-mini-task-text" title={callState.task ?? taskText}>
+            {taskText}
+          </span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function CallOverlay({
+  onMinimize,
+  callState: propState,
+  duration: propDuration,
+}: {
+  onMinimize: () => void;
+  callState?: CallStateView;
+  duration?: string;
+}) {
+  const storeState = voiceCallStore.use((v) => v) as CallStateView;
+  const s = propState ?? storeState;
+  const liveDuration = useCallClock(s, propDuration === undefined);
+  const duration = propDuration ?? liveDuration;
   const mood: MascotMood = s.assistant === "speaking" ? "speaking" : s.assistant === "thinking" ? "working" : "listening";
-  const statusText =
-    s.status === "connecting"
-      ? "正在接通小羊…"
-      : s.task
-        ? `正在处理：${s.task}`
-        : s.assistant === "speaking"
-          ? "小羊正在说…"
-          : s.assistant === "thinking"
-            ? "小羊在想…"
-            : s.muted
-              ? "麦克风已静音"
-              : "我在听，直接说话就行";
+  const statusText = formatCallOverlayStatus(s);
+  const micPct = Math.max(0, Math.min(100, Math.round(s.micLevel * 100)));
+  const outPct = Math.max(0, Math.min(100, Math.round(s.outLevel * 100)));
 
   return (
     <div className="call-overlay">
-      <div className="between">
-        <PocketIconButton onClick={onMinimize} tooltip="收起继续看消息">
+      <div className="between call-overlay-head">
+        <PocketIconButton className="call-overlay-minimize" onClick={onMinimize} tooltip="收起继续看消息">
           <Minimize2 size={17} />
         </PocketIconButton>
-        <div style={{ fontWeight: 800 }}>和小羊通话</div>
-        <div style={{ width: 38 }} />
+        <div className="call-overlay-heading">
+          <span className="call-overlay-title">和小羊通话</span>
+          {s.status === "ready" && duration ? <span className="call-overlay-clock num">{duration}</span> : null}
+        </div>
+        <div className="call-overlay-head-spacer" aria-hidden="true" />
       </div>
 
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 18, minHeight: 0 }}>
-        <XiaoyangOrb mood={mood} size={136} />
-        <div style={{ textAlign: "center" }}>
-          <h3 className="cute-font" style={{ margin: 0, fontSize: fs(24) }}>{statusText}</h3>
-          <div className="row" style={{ justifyContent: "center", marginTop: 10, gap: 12 }}>
-            <span className="faint">麦克风</span>
-            <div style={{ width: 70, height: 6, borderRadius: 99, background: "var(--line-pink)", overflow: "hidden" }}>
-              <div style={{ width: `${Math.round(s.micLevel * 100)}%`, height: "100%", background: "var(--primary)" }} />
+      <div className="call-overlay-stage">
+        <div className="call-overlay-orb">
+          <XiaoyangOrb mood={mood} size={136} />
+        </div>
+        <div className="call-overlay-status-wrap">
+          <h3 className="cute-font call-overlay-status" title={statusText}>
+            {statusText}
+          </h3>
+          <div className="call-overlay-meters">
+            <div className="call-overlay-meter">
+              <span className="faint">麦克风</span>
+              <div className="call-overlay-meter-track">
+                <div className="call-overlay-meter-fill mic" style={{ width: `${micPct}%` }} />
+              </div>
             </div>
-            <span className="faint">声音</span>
-            <div style={{ width: 70, height: 6, borderRadius: 99, background: "var(--line-pink)", overflow: "hidden" }}>
-              <div style={{ width: `${Math.round(s.outLevel * 100)}%`, height: "100%", background: "var(--lav)" }} />
+            <div className="call-overlay-meter">
+              <span className="faint">声音</span>
+              <div className="call-overlay-meter-track">
+                <div className="call-overlay-meter-fill out" style={{ width: `${outPct}%` }} />
+              </div>
             </div>
           </div>
         </div>
 
-        <div style={{ width: "100%", maxWidth: 520, maxHeight: 220, overflowY: "auto", padding: "8px 12px" }} className="stack">
-          {s.lines.slice(-6).map((l) => (
-            <div
-              key={l.id}
-              style={{
-                alignSelf: l.role === "user" ? "flex-end" : "flex-start",
-                maxWidth: "85%",
-                padding: "8px 12px",
-                borderRadius: 16,
-                background: l.role === "user" ? "var(--primary)" : "var(--surface)",
-                color: l.role === "user" ? "var(--on-primary)" : "var(--ink)",
-                border: l.role === "user" ? "none" : "1px solid var(--divider)",
-                opacity: l.final ? 1 : 0.78,
-              }}
-            >
-              {l.text}
-            </div>
-          ))}
-        </div>
+        {s.lines.length > 0 ? (
+          <div className="stack call-overlay-captions">
+            {s.lines.slice(-6).map((l) => (
+              <div
+                key={l.id}
+                className={`call-overlay-caption ${l.role === "user" ? "user" : "assistant"}${l.final ? "" : " interim"}`}
+              >
+                {l.text}
+              </div>
+            ))}
+          </div>
+        ) : null}
       </div>
 
-      <div className="row" style={{ justifyContent: "center", gap: 22 }}>
-        <PocketIconButton active={s.muted} onClick={() => setVoiceMuted(!s.muted)} tooltip={s.muted ? "取消静音" : "静音"}>
+      <div className="row call-overlay-controls">
+        <PocketIconButton
+          className="call-overlay-mute"
+          active={s.muted}
+          onClick={() => setVoiceMuted(!s.muted)}
+          tooltip={s.muted ? "取消静音" : "静音"}
+        >
           {s.muted ? <MicOff size={18} /> : <Mic size={18} />}
         </PocketIconButton>
-        <PocketButton variant="danger" size="lg" onClick={() => hangupVoiceCall()}>
+        <PocketButton className="call-overlay-hangup" variant="danger" size="lg" onClick={() => hangupVoiceCall()}>
           <PhoneOff size={17} />
           <span>挂断</span>
         </PocketButton>
