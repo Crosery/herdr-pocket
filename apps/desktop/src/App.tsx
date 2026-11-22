@@ -16,6 +16,7 @@ import { OnboardingView, type OnboardStep } from "./views/OnboardingView";
 import type { SettingsSection } from "./views/SettingsView";
 import { assistantStore } from "./lib/assistant";
 import { detectPlatform, getHostdStatus, isTauri, loadSession } from "./lib/bridge";
+import { native } from "./lib/native";
 import { ensureChatQueueWatcher } from "./lib/chatQueue";
 import { refreshLocalHostIdFast } from "./lib/fonts";
 import { hydrateWorkspaceState } from "./lib/workspacePersist";
@@ -26,7 +27,7 @@ import { useEnergyAttributes, useViewport } from "./lib/layout";
 import { clientConfigStore, startClientConfig } from "./lib/config";
 import { logger } from "./lib/log";
 import { terminalOwnsCtrlK } from "./lib/termKeys";
-import { dismissVoiceMessage, voiceCallStore } from "./lib/voiceCall";
+import { attachHudToVoiceCall, dismissVoiceMessage, hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore } from "./lib/voiceCall";
 
 // Heavy views load on first visit, not at startup.
 const AssistantView = lazy(() => import("./views/AssistantView").then((m) => ({ default: m.AssistantView })));
@@ -190,9 +191,28 @@ function PocketAppShell() {
 
   useEffect(() => {
     if (!callMessage) return;
-    toast(callMessage, { tone: callMessage === "挂断了" || callMessage === "通话结束了" ? "hangup" : "info" });
+    if (!/^(挂断了|通话结束了)$/.test(callMessage)) {
+      toast(callMessage, true);
+    }
     dismissVoiceMessage();
   }, [callMessage, toast]);
+
+  useEffect(() => {
+    return native.onVoiceCallCommand((cmd) => {
+      if (cmd.action === "start") {
+        const st = voiceCallStore.get();
+        if (st.status === "idle") {
+          void startVoiceCall({ showHud: Boolean(cmd.showHud ?? true), seq: cmd.seq });
+        } else if (cmd.showHud !== false && !st.hudShown) {
+          attachHudToVoiceCall(cmd.seq);
+        }
+      } else if (cmd.action === "hangup") {
+        hangupVoiceCall();
+      } else if (cmd.action === "toggle-mute") {
+        setVoiceMuted(!voiceCallStore.get().muted);
+      }
+    });
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

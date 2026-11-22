@@ -3,16 +3,14 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Herdr Pocket 语音输入</title>
+<title>Herdr Pocket · 小羊实时通话</title>
 <!--
-  The floating dictation & Xiaoyang capsule (src-tauri/src/voice/hud.rs). Strict CSP: zero inline JS.
+  Floating Xiaoyang realtime voice call capsule (src-tauri/src/voice/hud.rs). Strict CSP: zero inline JS.
   States pushed via window.__hud(state):
-    { state: "recording", level: 0..1, elapsedMs, mode?: "dictate"|"assistant", hint?, dspBadge?, sounds?, maxSeconds? }
-    { state: "transcribing", mode?: "dictate"|"assistant", label?, hint?, dspBadge?, sounds? }
-    { state: "done", label, note?, chars?, dspBadge? }
-    { state: "assistant_reply", question, answer, dspBadge?, error? }
-    { state: "error", message, dspBadge? }
-    { state: "cancelled" }
+    { state: "connecting", dspBadge?, muted?, sounds? }
+    { state: "active", phase?: "idle"|"thinking"|"speaking", muted?, level?, startedAt?, task?, caption?, dspBadge?, sounds? }
+    { state: "error", message, sounds? }
+    { state: "hidden" }
 -->
 <style>
   :root {
@@ -22,32 +20,67 @@
     --accent-soft: rgba(255, 110, 164, 0.14);
     --accent-text: #b8336a;
     --ink: #2c2038;
+    --ink-soft: #4e3f60;
     --muted: #786a88;
-    --surface: rgba(255, 251, 254, 0.90);
-    --surface-sub: rgba(248, 241, 250, 0.72);
+    --surface: rgba(255, 250, 253, 0.92);
     --border: rgba(255, 110, 164, 0.34);
     --btn-bg: rgba(74, 59, 92, 0.08);
-    --btn-hover: rgba(74, 59, 92, 0.16);
-    --pill-bg: rgba(74, 59, 92, 0.06);
+    --btn-border: rgba(74, 59, 92, 0.10);
+    --btn-hover: rgba(74, 59, 92, 0.15);
     --danger: #d93861;
-    --ok: #10a37f;
-    --shadow: 0 10px 28px rgba(184, 51, 106, 0.22), 0 2px 10px rgba(24, 16, 36, 0.08);
+    --danger-bg: rgba(217, 56, 97, 0.12);
+    --danger-border: rgba(217, 56, 97, 0.28);
+    --shadow: 0 10px 26px rgba(184, 51, 106, 0.20), 0 2px 10px rgba(24, 16, 36, 0.08);
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --ink: #f6effa;
+      --ink-soft: #dcd0eb;
       --muted: #b4a7c5;
-      --accent-soft: rgba(255, 126, 178, 0.2);
+      --accent-soft: rgba(255, 126, 178, 0.20);
       --accent-text: #ff9ec4;
-      --surface: rgba(28, 22, 37, 0.88);
-      --surface-sub: rgba(44, 35, 58, 0.76);
-      --border: rgba(255, 130, 180, 0.32);
+      --surface: rgba(26, 20, 35, 0.90);
+      --border: rgba(255, 130, 180, 0.34);
       --btn-bg: rgba(255, 255, 255, 0.09);
-      --btn-hover: rgba(255, 255, 255, 0.18);
-      --pill-bg: rgba(255, 255, 255, 0.07);
-      --danger: #ffa3af;
-      --shadow: 0 12px 32px rgba(0, 0, 0, 0.52), 0 0 0 1px rgba(255, 255, 255, 0.06);
+      --btn-border: rgba(255, 255, 255, 0.12);
+      --btn-hover: rgba(255, 255, 255, 0.17);
+      --danger: #ff92ab;
+      --danger-bg: rgba(255, 107, 145, 0.18);
+      --danger-border: rgba(255, 130, 165, 0.34);
+      --shadow: 0 12px 30px rgba(0, 0, 0, 0.54), 0 0 0 1px rgba(255, 255, 255, 0.06);
     }
+  }
+  html[data-theme="dark"] {
+    --ink: #f6effa;
+    --ink-soft: #dcd0eb;
+    --muted: #b4a7c5;
+    --accent-soft: rgba(255, 126, 178, 0.20);
+    --accent-text: #ff9ec4;
+    --surface: rgba(26, 20, 35, 0.90);
+    --border: rgba(255, 130, 180, 0.34);
+    --btn-bg: rgba(255, 255, 255, 0.09);
+    --btn-border: rgba(255, 255, 255, 0.12);
+    --btn-hover: rgba(255, 255, 255, 0.17);
+    --danger: #ff92ab;
+    --danger-bg: rgba(255, 107, 145, 0.18);
+    --danger-border: rgba(255, 130, 165, 0.34);
+    --shadow: 0 12px 30px rgba(0, 0, 0, 0.54), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  }
+  html[data-theme="light"] {
+    --ink: #2c2038;
+    --ink-soft: #4e3f60;
+    --muted: #786a88;
+    --accent-soft: rgba(255, 110, 164, 0.14);
+    --accent-text: #b8336a;
+    --surface: rgba(255, 250, 253, 0.92);
+    --border: rgba(255, 110, 164, 0.34);
+    --btn-bg: rgba(74, 59, 92, 0.08);
+    --btn-border: rgba(74, 59, 92, 0.10);
+    --btn-hover: rgba(74, 59, 92, 0.15);
+    --danger: #d93861;
+    --danger-bg: rgba(217, 56, 97, 0.12);
+    --danger-border: rgba(217, 56, 97, 0.28);
+    --shadow: 0 10px 26px rgba(184, 51, 106, 0.20), 0 2px 10px rgba(24, 16, 36, 0.08);
   }
   * { box-sizing: border-box; }
   html, body {
@@ -69,19 +102,23 @@
   body.standalone-qa {
     background: radial-gradient(circle at 50% 35%, rgba(255, 217, 232, 0.45), rgba(236, 228, 255, 0.38) 55%, rgba(247, 242, 255, 0.6));
   }
+  html[data-theme="dark"] body.standalone-qa {
+    background: radial-gradient(circle at 50% 35%, rgba(74, 36, 64, 0.48), rgba(30, 26, 38, 0.94));
+  }
   @media (prefers-color-scheme: dark) {
-    body.standalone-qa {
-      background: radial-gradient(circle at 50% 35%, rgba(74, 36, 64, 0.48), rgba(30, 26, 38, 0.92));
+    html:not([data-theme="light"]) body.standalone-qa {
+      background: radial-gradient(circle at 50% 35%, rgba(74, 36, 64, 0.48), rgba(30, 26, 38, 0.94));
     }
   }
   .hud {
     position: relative;
-    width: 540px;
+    width: 520px;
     max-width: calc(100vw - 16px);
-    height: 56px;
-    padding: 0 11px;
+    height: 60px;
+    padding: 0 12px;
     display: flex;
     align-items: center;
+    gap: 9px;
     border-radius: 999px;
     background: var(--surface);
     -webkit-backdrop-filter: blur(24px) saturate(185%);
@@ -91,26 +128,12 @@
     overflow: hidden;
     opacity: 0;
     transform: translateY(8px) scale(0.96);
-    transition: opacity 150ms ease-out, transform 220ms cubic-bezier(0.22, 1, 0.36, 1), width 200ms ease, height 200ms ease, border-radius 200ms ease;
+    transition: opacity 140ms ease-out, transform 200ms cubic-bezier(0.22, 1, 0.36, 1), width 180ms ease;
   }
   .hud.on { opacity: 1; transform: translateY(0) scale(1); }
-  .hud.done { width: 256px; height: 54px; }
-  .hud.done.has-dsp { width: 318px; }
-  .hud.transcribing { width: 282px; height: 54px; }
-  .hud.transcribing.has-dsp { width: 338px; }
-  .hud.error { width: 404px; height: 56px; }
-  .hud.cancelled { width: 214px; height: 54px; }
-  .hud.assistant_reply {
-    width: 540px;
-    max-width: calc(100vw - 16px);
-    height: 164px;
-    padding: 12px 14px;
-    border-radius: 22px;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 8px;
-  }
-  .hud.transcribing::before {
+  .hud.error { width: 460px; }
+  .hud.connecting::before,
+  .hud.phase-thinking::before {
     content: "";
     position: absolute;
     inset: 0;
@@ -120,7 +143,7 @@
     -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
     -webkit-mask-composite: xor;
     mask-composite: exclude;
-    animation: beam-spin 1.5s linear infinite;
+    animation: beam-spin 1.4s linear infinite;
     pointer-events: none;
   }
   @property --beam {
@@ -131,45 +154,33 @@
   @keyframes beam-spin {
     to { --beam: 360deg; }
   }
-  .compact-row {
-    width: 100%;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-  }
-  .progress-track {
-    position: absolute;
-    left: 18px;
-    right: 18px;
-    bottom: 0;
-    height: 2px;
-    border-radius: 2px;
-    overflow: hidden;
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 160ms ease;
-  }
-  .hud.recording .progress-track { opacity: 1; }
-  .progress-fill {
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(90deg, var(--pink), var(--lav));
-    transition: width 120ms linear;
-  }
   .dot {
     flex: none;
-    width: 30px;
-    height: 30px;
+    width: 34px;
+    height: 34px;
     border-radius: 50%;
     background: linear-gradient(135deg, var(--pink), var(--pink-deep));
     display: grid;
     place-items: center;
     position: relative;
-    box-shadow: 0 3px 10px rgba(201, 47, 109, 0.34);
+    box-shadow: 0 3px 10px rgba(201, 47, 109, 0.32);
+    transition: background 160ms ease, box-shadow 160ms ease;
   }
-  .hud.mode-assistant .dot {
+  .hud.phase-speaking .dot {
     background: linear-gradient(135deg, var(--lav), var(--pink-deep));
+    box-shadow: 0 3px 12px rgba(159, 132, 247, 0.38);
+  }
+  .hud.phase-thinking .dot,
+  .hud.connecting .dot {
+    background: linear-gradient(135deg, var(--lav), var(--pink));
+  }
+  .hud.is-muted .dot {
+    background: linear-gradient(135deg, #8e829c, #6f647d);
+    box-shadow: none;
+  }
+  .hud.error .dot {
+    background: var(--danger);
+    box-shadow: 0 3px 10px rgba(217, 56, 97, 0.35);
   }
   .dot::after {
     content: "";
@@ -179,103 +190,69 @@
     border: 2px solid var(--pink);
     opacity: 0;
   }
-  .recording .dot::after { animation: ring 1.25s cubic-bezier(0.2, 0.7, 0.3, 1) infinite; }
+  .hud.active:not(.is-muted) .dot::after {
+    animation: ring 1.35s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
+  }
+  .hud.phase-speaking .dot::after {
+    border-color: var(--lav);
+    animation: ring 0.95s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
+  }
   @keyframes ring {
     0% { opacity: 0.65; transform: scale(0.86); }
-    100% { opacity: 0; transform: scale(1.32); }
+    100% { opacity: 0; transform: scale(1.30); }
   }
-  .dot svg { width: 14px; height: 14px; fill: #fff; }
-  .done .dot { background: linear-gradient(135deg, #16b98d, var(--ok)); box-shadow: 0 3px 10px rgba(16, 163, 127, 0.3); }
-  .error .dot { background: var(--danger); box-shadow: 0 3px 10px rgba(225, 63, 104, 0.35); }
-  .cancelled .dot { background: var(--muted); box-shadow: none; }
+  .dot svg { width: 16px; height: 16px; fill: #fff; }
   .text {
     flex: 1 1 0;
     min-width: 0;
     display: flex;
     flex-direction: column;
     justify-content: center;
-    gap: 1px;
-  }
-  .hud.recording .text {
-    min-width: 155px;
+    gap: 2px;
   }
   .title-row {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 6px;
     min-width: 0;
   }
   .title {
     min-width: 0;
-    font-size: 12.5px;
+    font-size: 13px;
     font-weight: 700;
-    line-height: 16px;
+    line-height: 17px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .dsp-pill {
     flex: none;
-    padding: 1px 6px;
+    padding: 1px 7px;
     border-radius: 999px;
     background: var(--accent-soft);
     color: var(--accent-text);
-    font-size: 9.5px;
+    font-size: 10px;
     font-weight: 700;
-    line-height: 13px;
+    line-height: 14px;
     letter-spacing: 0.01em;
     white-space: nowrap;
   }
   .sub {
-    font-size: 10px;
-    line-height: 13px;
+    font-size: 11px;
+    line-height: 14px;
     color: var(--muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .error .title {
+  .hud.error .title {
     color: var(--danger);
     white-space: normal;
     display: -webkit-box;
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
-    font-size: 11.5px;
-    line-height: 14px;
-  }
-  .mode-switch {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-    padding: 2px;
-    border-radius: 999px;
-    background: var(--pill-bg);
-    border: 1px solid rgba(255, 110, 164, 0.16);
-  }
-  .mode-btn {
-    height: 22px;
-    padding: 0 8px;
-    border: 0;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--muted);
-    font: inherit;
-    font-size: 10.5px;
-    font-weight: 700;
-    line-height: 1;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background 120ms ease, color 120ms ease, transform 90ms ease;
-  }
-  .mode-btn:hover { color: var(--ink); }
-  .mode-btn.active {
-    background: linear-gradient(135deg, var(--pink), var(--pink-deep));
-    color: #fff;
-    box-shadow: 0 2px 8px rgba(232, 70, 133, 0.32);
-  }
-  .mode-btn[data-mode="assistant"].active {
-    background: linear-gradient(135deg, var(--lav), var(--pink-deep));
+    font-size: 12px;
+    line-height: 15px;
   }
   .bars {
     flex: none;
@@ -297,188 +274,97 @@
   .time {
     flex: none;
     font-variant-numeric: tabular-nums;
-    font-size: 11px;
+    font-size: 11.5px;
     color: var(--accent-text);
     font-weight: 700;
-    min-width: 26px;
+    min-width: 36px;
     text-align: right;
   }
   .actions {
     flex: none;
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 6px;
   }
   .act-btn {
-    width: 26px;
-    height: 26px;
-    border: 0;
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--btn-border);
     border-radius: 50%;
     display: grid;
     place-items: center;
     cursor: pointer;
     padding: 0;
     background: var(--btn-bg);
-    color: var(--muted);
-    transition: transform 100ms ease, background 120ms ease, color 120ms ease;
+    color: var(--ink-soft);
+    transition: transform 100ms ease, background 120ms ease, color 120ms ease, border-color 120ms ease;
   }
-  .act-btn:hover { background: var(--btn-hover); color: var(--ink); transform: scale(1.06); }
+  .act-btn:hover { background: var(--btn-hover); color: var(--ink); transform: scale(1.05); }
   .act-btn:active { transform: scale(0.95); }
-  .act-btn.stop {
-    background: linear-gradient(135deg, var(--pink), var(--pink-deep));
-    color: #fff;
+  .act-btn.is-muted {
+    background: var(--danger-bg);
+    color: var(--danger);
+    border-color: var(--danger-border);
   }
-  .act-btn.stop:hover { filter: brightness(0.95); color: #fff; }
-  .act-btn svg { width: 12px; height: 12px; fill: currentColor; }
+  .act-btn svg { width: 14px; height: 14px; fill: currentColor; }
+  .hangup-btn {
+    height: 30px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 700;
+    line-height: 1;
+    white-space: nowrap;
+    color: #fff;
+    background: linear-gradient(135deg, #ff5d8f, #d93861);
+    box-shadow: 0 2px 8px rgba(217, 56, 97, 0.30);
+    transition: transform 100ms ease, filter 120ms ease;
+  }
+  .hangup-btn:hover { filter: brightness(0.96); transform: scale(1.03); }
+  .hangup-btn:active { transform: scale(0.96); }
+  .hangup-btn svg { width: 13px; height: 13px; fill: currentColor; flex: none; }
   .spin {
-    width: 13px;
-    height: 13px;
-    border: 2px solid rgba(255, 255, 255, 0.45);
+    width: 15px;
+    height: 15px;
+    border: 2px solid rgba(255, 255, 255, 0.42);
     border-top-color: #fff;
     border-radius: 50%;
     animation: spin 0.75s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-
-  /* Expanded Xiaoyang reply card ---------------------------------------- */
-  .reply-wrap {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    width: 100%;
-    height: 100%;
-    min-height: 0;
-  }
-  .reply-head {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-  }
-  .reply-orb {
-    flex: none;
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    background: linear-gradient(135deg, var(--lav), var(--pink-deep));
-    display: grid;
-    place-items: center;
-    box-shadow: 0 3px 10px rgba(159, 132, 247, 0.34);
-  }
-  .reply-orb svg { width: 14px; height: 14px; fill: #fff; }
-  .reply-meta {
-    flex: 1 1 0;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-  .reply-title-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-  }
-  .reply-title {
-    font-size: 12.5px;
-    font-weight: 800;
-    color: var(--ink);
-  }
-  .reply-question {
-    font-size: 10.5px;
-    color: var(--muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .reply-actions {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .open-btn {
-    height: 26px;
-    padding: 0 10px;
-    border: 0;
-    border-radius: 999px;
-    background: var(--accent-soft);
-    color: var(--accent-text);
-    font: inherit;
-    font-size: 11px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: background 120ms ease, transform 100ms ease;
-  }
-  .open-btn:hover { background: var(--btn-hover); color: var(--ink); }
-  .open-btn:active { transform: scale(0.97); }
-  .reply-body {
-    flex: 1 1 0;
-    min-height: 0;
-    padding: 8px 10px;
-    border-radius: 13px;
-    background: var(--surface-sub);
-    border: 1px solid rgba(255, 110, 164, 0.16);
-    font-size: 12.5px;
-    line-height: 1.5;
-    color: var(--ink);
-    overflow-y: auto;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    user-select: text;
-    -webkit-user-select: text;
-    scrollbar-width: thin;
-  }
-  .reply-body.is-error { color: var(--danger); }
-
   [hidden] { display: none !important; }
   @media (prefers-reduced-motion: reduce) {
-    .hud, .bars i, .progress-fill, .act-btn, .mode-btn { transition: none; }
-    .recording .dot::after, .spin, .hud.transcribing::before { animation: none; }
+    .hud, .bars i, .act-btn, .hangup-btn, .dot { transition: none; }
+    .hud.active:not(.is-muted) .dot::after,
+    .hud.phase-speaking .dot::after,
+    .spin,
+    .hud.connecting::before,
+    .hud.phase-thinking::before { animation: none; }
   }
 </style>
 </head>
 <body>
 <div class="hud" id="hud" role="status" aria-live="polite">
-  <div class="compact-row" id="compactRow">
-    <div class="dot" id="dot"></div>
-    <div class="text">
-      <div class="title-row">
-        <div class="title" id="title">语音输入</div>
-        <span class="dsp-pill" id="dspBadge" hidden></span>
-      </div>
-      <div class="sub" id="sub" hidden></div>
+  <div class="dot" id="dot"></div>
+  <div class="text">
+    <div class="title-row">
+      <div class="title" id="title">正在接通小羊…</div>
+      <span class="dsp-pill" id="dspBadge" hidden></span>
     </div>
-    <div class="mode-switch" id="modeSwitch" role="group" aria-label="语音模式" hidden>
-      <button type="button" class="mode-btn active" id="btnModeDictate" data-mode="dictate">语音输入</button>
-      <button type="button" class="mode-btn" id="btnModeAssistant" data-mode="assistant">问小羊</button>
-    </div>
-    <div class="bars" id="bars" hidden></div>
-    <div class="time" id="time" hidden></div>
-    <div class="actions" id="actions" hidden>
-      <button type="button" class="act-btn" id="btnCancel" aria-label="取消语音" title="取消 (Esc)"></button>
-      <button type="button" class="act-btn stop" id="btnStop" aria-label="完成并填入" title="完成并填入"></button>
-    </div>
+    <div class="sub" id="sub">直接说话即可 · 再按快捷键挂断</div>
   </div>
-  <div class="reply-wrap" id="replyWrap" hidden>
-    <div class="reply-head">
-      <div class="reply-orb" id="replyOrb"></div>
-      <div class="reply-meta">
-        <div class="reply-title-row">
-          <span class="reply-title" id="replyTitle">小羊回复</span>
-          <span class="dsp-pill" id="replyDspBadge" hidden></span>
-        </div>
-        <div class="reply-question" id="replyQuestion" hidden></div>
-      </div>
-      <div class="reply-actions">
-        <button type="button" class="open-btn" id="btnOpenAssistant">打开小羊</button>
-        <button type="button" class="act-btn" id="btnDismiss" aria-label="关闭小羊回复" title="关闭"></button>
-      </div>
-    </div>
-    <div class="reply-body" id="replyAnswer"></div>
+  <div class="bars" id="bars"></div>
+  <div class="time" id="time">00:00</div>
+  <div class="actions" id="actions">
+    <button type="button" class="act-btn" id="btnMute" aria-label="静音" aria-pressed="false" title="静音"></button>
+    <button type="button" class="hangup-btn" id="btnHangup" aria-label="挂断" title="挂断"></button>
   </div>
-  <div class="progress-track"><div class="progress-fill" id="progress"></div></div>
 </div>
 <script src="voice-hud.js"></script>
 </body>

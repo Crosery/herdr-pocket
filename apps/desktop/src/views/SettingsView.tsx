@@ -22,7 +22,7 @@ export type SettingsSection =
 const SECTIONS: Array<{ id: SettingsSection; title: string; icon: ComponentType<{ size?: number }> }> = [
   { id: "general", title: "通用", icon: Settings2 },
   { id: "connection", title: "连接", icon: Link2 },
-  { id: "voice", title: "语音输入", icon: Mic },
+  { id: "voice", title: "语音唤醒与声纹", icon: Mic },
   { id: "notifications", title: "通知", icon: Bell },
   { id: "assistant", title: "小羊助理", icon: Sparkles },
   { id: "browser", title: "浏览器与文件", icon: AppWindow },
@@ -65,7 +65,7 @@ export function SettingsView({
       case "voice":
         return (
           <div className="pane">
-            <PaneTitle title="语音输入" />
+            <PaneTitle title="语音唤醒与声纹" about="全局快捷键一键发起或挂断小羊实时语音通话，并配置本地降噪与声纹识别" />
             <VoiceInputSetup />
           </div>
         );

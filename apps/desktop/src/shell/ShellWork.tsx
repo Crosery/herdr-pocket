@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Copy, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Mic, PhoneCall, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
-import type { Agent, ConvEvent, SubSession, TranscribeInfo } from "@herdr-pocket/protocol";
+import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
@@ -11,18 +11,18 @@ import { prettyHotkey } from "../components/VoiceInput";
 import { AgentDetailPanel, type SubagentHeadInfo } from "../views/AgentsView";
 import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../views/WorkbenchView";
 import { assistantStore, loadAssistant } from "../lib/assistant";
-import { copyToClipboard, voiceStart, voiceStop } from "../lib/bridge";
+import { copyToClipboard } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
 import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
 import { useClientConfig } from "../lib/config";
 import { endPanelDrag, endTabDrag, endWorkspaceDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readPanelDrag, readTabDrag, readWorkspaceDrag, startPanelDrag, startTabDrag } from "../lib/fileDrag";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
-import { native, onNativeEvent } from "../lib/native";
+import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
-import { getActiveToken, pingRelay, refreshHostSpaces, restRequest, rpcCall, subscribeStream } from "../lib/relay";
+import { pingRelay, refreshHostSpaces, rpcCall, subscribeStream } from "../lib/relay";
 import { agentSpace, agentTitle, allAgents, createStore, findAgent, liveStore, settingsStore, spacedTitle } from "../lib/store";
-import { hangupVoiceCall, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
+import { dismissVoiceMessage, hangupVoiceCall, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
 import { homeFolder, listGroup } from "./agentInfo";
 import { StatusMark } from "./ShellSidebar";
 import {
@@ -1526,63 +1526,11 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   const voice = useClientConfig().voiceInput;
   const callStatus = voiceCallStore.use((s) => s.status);
   const assistantVoice = assistantStore.use((s) => s.voice);
-  const [voicePhase, setVoicePhase] = useState<"idle" | "listening" | "transcribing">("idle");
   const [voiceSetupHint, setVoiceSetupHint] = useState<string | null>(null);
-  const [transcribeInfo, setTranscribeInfo] = useState<TranscribeInfo | null>(null);
-  const [voiceRuntimeSupported, setVoiceRuntimeSupported] = useState<boolean | null>(null);
-  useEffect(() => native.onVoiceEvent((e) => {
-    if (e.state === "listening") setVoicePhase("listening");
-    else if (e.state === "transcribing") setVoicePhase("transcribing");
-    else setVoicePhase("idle");
-  }), []);
-  useEffect(() => onNativeEvent("voice://open-assistant", () => {
-    showPanel("assistant");
-    void loadAssistant();
-  }), []);
+  const realtimeReady = Boolean(assistantVoice || (server && isMockServer(server)));
   useEffect(() => {
-    if (!native.voiceSupported()) {
-      setVoiceRuntimeSupported(false);
-      return;
-    }
-    let alive = true;
-    void native.getVoiceRuntime().then((rt) => {
-      if (alive && rt) setVoiceRuntimeSupported(rt.supported);
-    });
-    return () => {
-      alive = false;
-    };
-  }, []);
-  useEffect(() => {
-    const token = getActiveToken();
-    if (!server) {
-      setTranscribeInfo(null);
-      return;
-    }
-    if (isMockServer(server)) {
-      setTranscribeInfo({ available: true, provider: "demo", maxBytes: 0, maxSeconds: 60, formats: [] });
-      return;
-    }
-    if (!token) {
-      setTranscribeInfo(null);
-      return;
-    }
-    let alive = true;
-    const ask = native.available()
-      ? native.getTranscribeInfo().then((r) => (r as TranscribeInfo | null) ?? null)
-      : restRequest<TranscribeInfo>(server, "/v1/transcribe", { token, timeoutMs: 6000 }).catch(() => null);
-    void ask.then((r) => {
-      if (alive && r) setTranscribeInfo(r);
-    });
-    return () => {
-      alive = false;
-    };
-  }, [server, link === "online"]);
-  const desktopMicSupported = native.voiceSupported() && voiceRuntimeSupported !== false;
-  const dictationReady = desktopMicSupported && Boolean(transcribeInfo?.available || (server && isMockServer(server)));
-  const realtimeReady = assistantVoice || isMockServer(server);
-  useEffect(() => {
-    if (dictationReady || assistantVoice) setVoiceSetupHint(null);
-  }, [dictationReady, assistantVoice]);
+    if (realtimeReady) setVoiceSetupHint(null);
+  }, [realtimeReady]);
   const agent = useAgent(activeTab && activeTab.kind !== "web" ? (activeTab.agentKey ?? null) : null);
 
   const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
@@ -1612,83 +1560,40 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   const linkTone = link === "online" ? "ok" : link === "connecting" ? "warn" : "off";
 
   const liveCallActive = callStatus === "connecting" || callStatus === "ready";
-  const voiceButtonLabel =
-    voicePhase === "listening"
-      ? "正在听… 点此完成"
-      : voicePhase === "transcribing"
-        ? "正在识别…"
-        : liveCallActive
-          ? "小羊通话中 · 点此挂断"
-          : dictationReady
-            ? voice.enabled
-              ? `快速说话 · ${prettyHotkey(voice.hotkey)}`
-              : "快速说话"
-            : realtimeReady
-              ? "唤醒小羊语音"
-              : "快速说话";
-  const voiceButtonTitle =
-    voicePhase === "listening"
-      ? "正在语音听写，点击完成识别"
-      : voicePhase === "transcribing"
-        ? "正在识别语音…"
-        : liveCallActive
-          ? "小羊实时语音通话中，点击挂断"
-          : dictationReady
-            ? `点击唤起悬浮语音胶囊（也可按全局快捷键 ${prettyHotkey(voice.hotkey)}）`
-            : realtimeReady
-              ? "点击发起小羊实时语音通话"
-              : "点击快速说话或查看语音服务配置";
+  const voiceButtonLabel = liveCallActive
+    ? "小羊通话中 · 点此挂断"
+    : voice.enabled
+      ? `快速说话 · ${prettyHotkey(voice.hotkey)}`
+      : "快速说话";
+  const voiceButtonTitle = liveCallActive
+    ? "小羊实时语音通话中，点击挂断"
+    : voice.enabled
+      ? `点击唤起小羊实时语音通话（也可按全局快捷键 ${prettyHotkey(voice.hotkey)}）`
+      : "点击唤起小羊实时语音通话";
 
   const handleVoiceTrigger = async () => {
-    if (voicePhase === "listening") {
-      await voiceStop();
-      return;
-    }
-    if (voicePhase === "transcribing") return;
     if (liveCallActive) {
       hangupVoiceCall();
       return;
     }
-
-    let currentTranscribe = transcribeInfo;
-    if (!currentTranscribe && server && !isMockServer(server)) {
-      const token = getActiveToken();
-      if (native.available()) {
-        currentTranscribe = ((await native.getTranscribeInfo().catch(() => null)) as TranscribeInfo | null) ?? null;
-      } else if (token) {
-        currentTranscribe = await restRequest<TranscribeInfo>(server, "/v1/transcribe", { token, timeoutMs: 6000 }).catch(() => null);
-      }
-      if (currentTranscribe) setTranscribeInfo(currentTranscribe);
-    }
-
-    const canDictate = desktopMicSupported && Boolean(currentTranscribe?.available || (server && isMockServer(server)));
-    if (canDictate) {
-      setVoiceSetupHint(null);
-      const started = await voiceStart();
-      if (started) return;
-      toast("无法开启麦克风听写，请检查麦克风权限或音频设备", true);
-      setVoiceSetupHint("未能开启麦克风听写，请前往「设置 → 语音输入」检查麦克风权限与设备。");
+    if (!server) {
+      setVoiceSetupHint("还没有连接中转服务器，连接并配置小羊实时语音模型后即可一键通话。");
       return;
     }
-
-    if (!assistantStore.get().loaded && server) {
+    if (!isMockServer(server) && !assistantStore.get().loaded) {
       await loadAssistant().catch(() => {});
     }
     const fresh = assistantStore.get();
-    if (fresh.voice || (server && isMockServer(server) && !desktopMicSupported)) {
+    if (fresh.voice || isMockServer(server)) {
       setVoiceSetupHint(null);
-      const err = await startVoiceCall();
-      if (err) toast(err, true);
+      const err = await startVoiceCall({ showHud: true });
+      if (err) {
+        toast(err, true);
+        dismissVoiceMessage();
+      }
       return;
     }
-
-    const reason = currentTranscribe?.reason;
-    toast(reason || "尚未配置语音识别或小羊实时语音服务");
-    setVoiceSetupHint(
-      reason
-        ? `当前语音识别不可用（${reason}），且未开启小羊实时语音模型。`
-        : "中转服务器尚未配置语音识别（/v1/transcribe）或小羊实时语音模型，可在设置中查看或配置。",
-    );
+    setVoiceSetupHint("中转服务器尚未配置小羊实时语音模型，请前往「设置 › 小羊助理」完成配置后即可一键通话。");
   };
 
   return (
@@ -1729,7 +1634,7 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
         <button
           type="button"
           data-voice-trigger="true"
-          className={`v3-status-item v3-status-btn${voicePhase !== "idle" || liveCallActive ? " on" : ""}`}
+          className={`v3-status-item v3-status-btn${liveCallActive ? " on" : ""}`}
           title={voiceButtonTitle}
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => void handleVoiceTrigger()}
@@ -1738,11 +1643,11 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
           <span className="truncate">{voiceButtonLabel}</span>
         </button>
         {voiceSetupHint ? (
-          <div className="voice-wake-pop" role="dialog" aria-label="语音服务尚未就绪">
+          <div className="voice-wake-pop" role="dialog" aria-label="小羊语音尚未就绪">
             <div className="voice-wake-pop-head">
               <span className="row" style={{ gap: 6 }}>
                 <Sparkles size={14} style={{ color: "var(--accent-text)" }} />
-                <span>语音服务尚未就绪</span>
+                <span>小羊语音尚未就绪</span>
               </span>
               <button
                 type="button"
@@ -1764,7 +1669,7 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
                     openSettingsFrame("voice");
                   }}
                 >
-                  语音输入设置
+                  语音唤醒设置
                 </PocketButton>
               ) : null}
               <PocketButton
