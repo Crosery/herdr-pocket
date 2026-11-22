@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 import ts from "typescript";
 
 registerHooks({
@@ -38,7 +39,9 @@ const React = await import("react");
 const { renderToStaticMarkup } = await import("react-dom/server");
 const { configKeySpec } = await import("@herdr-pocket/protocol");
 const { ToastProvider } = await import("../src/components/PocketUI.tsx");
-const { PermissionCards, VoiceInputSetup } = await import("../src/components/VoiceInput.tsx");
+const { XiaoyangOrb, mascotAssetPath, resolveCallMascotMood } = await import("../src/components/MascotAndVendor.tsx");
+const { PermissionCards, VoiceHud, VoiceInputSetup } = await import("../src/components/VoiceInput.tsx");
+const { CallMiniBar, CallOverlay } = await import("../src/views/AssistantView.tsx");
 const { assistantStore } = await import("../src/lib/assistant.ts");
 const { DEMO_URL } = await import("../src/lib/mock.ts");
 const { settingsStore } = await import("../src/lib/store.ts");
@@ -58,6 +61,8 @@ const SETTINGS_VIEW_TSX = readFileSync(fileURLToPath(new URL("../src/views/Setti
 const SETTINGS_FRAME_TSX = readFileSync(fileURLToPath(new URL("../src/views/settings/SettingsFrame.tsx", import.meta.url)), "utf8");
 const APP_TSX = readFileSync(fileURLToPath(new URL("../src/App.tsx", import.meta.url)), "utf8");
 const SHELL_WORK_TSX = readFileSync(fileURLToPath(new URL("../src/shell/ShellWork.tsx", import.meta.url)), "utf8");
+const SHELL_SIDEBAR_TSX = readFileSync(fileURLToPath(new URL("../src/shell/ShellSidebar.tsx", import.meta.url)), "utf8");
+const SHELL_CSS = readFileSync(fileURLToPath(new URL("../src/styles/shell.css", import.meta.url)), "utf8");
 
 beforeEach(() => {
   hangupVoiceCall();
@@ -172,5 +177,262 @@ test("Settings, PermissionCards, composers, ShellWork, and App remove dictation 
     const src = readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
     assert.ok(!src.includes("语音输入"), `${rel} must not contain 语音输入`);
     assert.ok(!src.includes("按住说话"), `${rel} must not contain 按住说话`);
+  }
+});
+
+test("desktop ships all 6 animated call WebPs with ANIM headers and HUD resolves every state", () => {
+  const moods = ["connecting", "idle", "listening", "thinking", "speaking", "muted"] as const;
+  for (const mood of moods) {
+    const filePath = fileURLToPath(new URL(`../public/assets/call/${mood}.webp`, import.meta.url));
+    assert.ok(existsSync(filePath), `missing animated portrait: ${filePath}`);
+    const bytes = readFileSync(filePath);
+    assert.equal(bytes.subarray(0, 4).toString("ascii"), "RIFF", `${mood}.webp must have RIFF header`);
+    assert.equal(bytes.subarray(8, 12).toString("ascii"), "WEBP", `${mood}.webp must have WEBP signature`);
+    assert.ok(bytes.includes(Buffer.from("ANIM")), `${mood}.webp must contain ANIM chunk`);
+  }
+
+  assert.ok(HUD_HTML.includes('id="mascotOrb"'));
+  assert.ok(HUD_HTML.includes('id="mascotImg"'));
+  assert.ok(HUD_HTML.includes('src="assets/call/connecting.webp"'));
+  assert.ok(HUD_HTML.includes('id="mascotBadge"'));
+  assert.ok(!HUD_HTML.includes('class="dot"'));
+
+  for (const mood of moods) {
+    assert.ok(HUD_JS.includes(`assets/call/${mood}.webp`), `voice-hud.js must map/preload ${mood}.webp`);
+  }
+
+  // Exercise real voice-hud.js state machine, preloading, steady debounce, and non-restarting src mutations.
+  let now = 1_000_000;
+  let nextTimerId = 1;
+  const timers = new Map<number, { fn: () => void; at: number }>();
+  const srcWrites: string[] = [];
+  const preloadedUrls: string[] = [];
+  const makeEl = (id: string) => {
+    let srcVal = id === "mascotImg" ? "assets/call/connecting.webp" : "";
+    const el: Record<string, unknown> = {
+      id,
+      className: "",
+      hidden: id === "mascotBadge",
+      innerHTML: "",
+      textContent: "",
+      title: "",
+      style: {},
+      children: [],
+      attrs: {} as Record<string, string>,
+      classList: {
+        toggle: () => {},
+        add: () => {},
+        remove: () => {},
+      },
+      appendChild(child: unknown) {
+        (this.children as unknown[]).push(child);
+        return child;
+      },
+      addEventListener() {},
+      setAttribute(k: string, v: string) {
+        (this.attrs as Record<string, string>)[k] = v;
+      },
+    };
+    if (id === "mascotImg") {
+      Object.defineProperty(el, "src", {
+        get: () => srcVal,
+        set: (v: string) => {
+          srcWrites.push(v);
+          srcVal = v;
+        },
+      });
+    }
+    return el;
+  };
+  const els = new Map<string, ReturnType<typeof makeEl>>();
+  for (const id of ["hud", "mascotOrb", "mascotImg", "mascotBadge", "title", "dspBadge", "sub", "bars", "time", "actions", "btnMute", "btnHangup"]) {
+    els.set(id, makeEl(id));
+  }
+  const fakeWindow: Record<string, unknown> = {
+    location: { search: "" },
+    setInterval: () => 1,
+    clearInterval: () => {},
+    setTimeout: (fn: () => void, ms: number) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, at: now + ms });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      timers.delete(id);
+    },
+    requestAnimationFrame: () => 1,
+  };
+  const FakeDate = class extends Date {
+    static now() {
+      return now;
+    }
+  };
+  function FakeImage(this: { src?: string }) {
+    Object.defineProperty(this, "src", {
+      set: (v: string) => preloadedUrls.push(v),
+    });
+  }
+  const sandbox = {
+    window: fakeWindow,
+    document: {
+      getElementById: (id: string) => els.get(id) ?? null,
+      createElement: () => makeEl("child"),
+      body: { classList: { add: () => {} } },
+      documentElement: { setAttribute: () => {} },
+    },
+    Image: FakeImage,
+    Date: FakeDate,
+    URLSearchParams,
+  };
+  vm.runInNewContext(HUD_JS, sandbox);
+  const hudApi = fakeWindow.__hud as (s: Record<string, unknown>) => void;
+  const mascotImg = els.get("mascotImg")!;
+  const mascotBadge = els.get("mascotBadge")!;
+
+  assert.equal(preloadedUrls.length, 6);
+  for (const mood of moods) {
+    assert.ok(preloadedUrls.includes(`assets/call/${mood}.webp`), `expected preload for ${mood}.webp`);
+  }
+
+  hudApi({ state: "connecting", muted: false });
+  assert.equal(mascotImg.src, "assets/call/connecting.webp");
+  assert.equal(mascotBadge.hidden, false);
+  assert.match(String(mascotBadge.className), /is-connecting/);
+
+  hudApi({ state: "active", phase: "idle", muted: false, level: 0.2, startedAt: now });
+  assert.equal(mascotImg.src, "assets/call/listening.webp");
+  assert.equal(mascotBadge.hidden, true);
+
+  // Rapid meter frames while listening must NOT re-write mascotImg.src.
+  const writesBeforeMeters = srcWrites.length;
+  hudApi({ state: "active", phase: "idle", muted: false, level: 0.5, startedAt: now });
+  hudApi({ state: "active", phase: "idle", muted: false, level: 0.8, startedAt: now });
+  assert.equal(srcWrites.length, writesBeforeMeters);
+
+  // Active sub-phase transition obeys 450ms hold / 200ms settle steady debounce.
+  now += 100;
+  hudApi({ state: "active", phase: "speaking", muted: false, level: 0.6, startedAt: now });
+  assert.equal(mascotImg.src, "assets/call/listening.webp");
+  now += 200;
+  // Meter update during pending debounce must not cancel or reset the pending transition.
+  hudApi({ state: "active", phase: "speaking", muted: false, level: 0.7, startedAt: now });
+  assert.equal(mascotImg.src, "assets/call/listening.webp");
+  now += 200;
+  for (const [id, t] of [...timers.entries()]) {
+    if (t.at <= now) {
+      timers.delete(id);
+      t.fn();
+    }
+  }
+  assert.equal(mascotImg.src, "assets/call/speaking.webp");
+
+  now += 500;
+  hudApi({ state: "active", phase: "thinking", muted: false, level: 0.1, startedAt: now });
+  now += 250;
+  for (const [id, t] of [...timers.entries()]) {
+    if (t.at <= now) {
+      timers.delete(id);
+      t.fn();
+    }
+  }
+  assert.equal(mascotImg.src, "assets/call/thinking.webp");
+
+  hudApi({ state: "active", phase: "idle", muted: true, level: 0, startedAt: now });
+  assert.equal(mascotImg.src, "assets/call/muted.webp");
+  assert.equal(mascotBadge.hidden, false);
+  assert.match(String(mascotBadge.className), /is-muted/);
+
+  hudApi({ state: "error", message: "连接失败" });
+  assert.equal(mascotImg.src, "assets/call/idle.webp");
+  assert.equal(mascotBadge.hidden, false);
+  assert.match(String(mascotBadge.className), /is-error/);
+});
+
+test("XiaoyangOrb, AssistantView, ShellWork, VoiceHud, and ShellSidebar integrate portrait mascots and cleanup", () => {
+  for (const mood of ["connecting", "idle", "listening", "thinking", "speaking", "muted"] as const) {
+    assert.equal(mascotAssetPath(mood), `call/${mood}.webp`);
+    const orbHtml = renderToStaticMarkup(React.createElement(XiaoyangOrb, { mood, size: 32 }));
+    assert.match(orbHtml, /class="xiaoyang-orb portrait"/);
+    assert.ok(orbHtml.includes(`src="./assets/call/${mood}.webp"`), `XiaoyangOrb must render ${mood}.webp`);
+  }
+
+  assert.equal(resolveCallMascotMood({ status: "idle", assistant: "idle", muted: false }), "idle");
+  assert.equal(resolveCallMascotMood({ status: "connecting", assistant: "idle", muted: false }), "connecting");
+  assert.equal(resolveCallMascotMood({ status: "ready", assistant: "speaking", muted: true }), "speaking");
+  assert.equal(resolveCallMascotMood({ status: "ready", assistant: "thinking", muted: false }), "thinking");
+  assert.equal(resolveCallMascotMood({ status: "ready", assistant: "idle", muted: true }), "muted");
+  assert.equal(resolveCallMascotMood({ status: "ready", assistant: "idle", muted: false }), "listening");
+
+  const miniConnecting = renderToStaticMarkup(
+    React.createElement(
+      ToastProvider,
+      null,
+      React.createElement(CallMiniBar, {
+        callState: { ...voiceCallStore.get(), status: "connecting", muted: false, assistant: "idle" },
+        duration: "",
+        onExpand: () => {},
+        onToggleMute: () => {},
+        onHangup: () => {},
+      }),
+    ),
+  );
+  assert.ok(miniConnecting.includes('src="./assets/call/connecting.webp"'));
+  assert.ok(miniConnecting.includes("width:32px;height:32px"));
+
+  const overlayThinking = renderToStaticMarkup(
+    React.createElement(
+      ToastProvider,
+      null,
+      React.createElement(CallOverlay, {
+        onMinimize: () => {},
+        callState: { ...voiceCallStore.get(), status: "ready", muted: false, assistant: "thinking" },
+        duration: "00:12",
+      }),
+    ),
+  );
+  assert.ok(overlayThinking.includes('src="./assets/call/thinking.webp"'));
+
+  const overlayMuted = renderToStaticMarkup(
+    React.createElement(
+      ToastProvider,
+      null,
+      React.createElement(CallOverlay, {
+        onMinimize: () => {},
+        callState: { ...voiceCallStore.get(), status: "ready", muted: true, assistant: "idle" },
+        duration: "00:25",
+      }),
+    ),
+  );
+  assert.ok(overlayMuted.includes('src="./assets/call/muted.webp"'));
+
+  // AssistantView uses narrow selectors so micLevel/outLevel updates don't re-render the chat thread.
+  assert.ok(!ASSISTANT_TSX.includes("const callState = voiceCallStore.use((s) => s)"));
+  assert.ok(ASSISTANT_TSX.includes("voiceCallStore.use((s) => s.status)"));
+
+  // ShellWork bottom-right status trigger uses 18x18 Xiaoyang portrait avatar + narrow selectors.
+  assert.ok(SHELL_WORK_TSX.includes('className={`status-xiaoyang-avatar'));
+  assert.ok(SHELL_WORK_TSX.includes("resolveCallMascotMood"));
+  assert.ok(SHELL_WORK_TSX.includes("mascotAssetPath"));
+  assert.ok(SHELL_CSS.includes(".status-xiaoyang-avatar"));
+
+  // Sidebar removes hover Eye preview button and preserves row timestamp on hover.
+  assert.ok(!SHELL_SIDEBAR_TSX.includes("v3-peek-btn"));
+  assert.ok(!SHELL_SIDEBAR_TSX.includes("setPeek"));
+  assert.ok(!SHELL_CSS.includes("v3-peek-btn"));
+
+  // VoiceHud renders XiaoyangOrb on non-Tauri targets and returns null early on Tauri.
+  const prevWindow = (globalThis as { window?: unknown }).window;
+  try {
+    voiceCallStore.set({ status: "ready", hudShown: true, assistant: "thinking", muted: false });
+    (globalThis as { window?: unknown }).window = undefined;
+    const webHudHtml = renderToStaticMarkup(React.createElement(ToastProvider, null, React.createElement(VoiceHud)));
+    assert.ok(webHudHtml.includes('class="xiaoyang-orb portrait"'));
+    assert.ok(webHudHtml.includes('src="./assets/call/thinking.webp"'));
+
+    (globalThis as { window?: unknown }).window = { __TAURI_INTERNALS__: {} };
+    const tauriHudHtml = renderToStaticMarkup(React.createElement(VoiceHud));
+    assert.equal(tauriHudHtml, "");
+  } finally {
+    (globalThis as { window?: unknown }).window = prevWindow;
   }
 });

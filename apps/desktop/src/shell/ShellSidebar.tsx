@@ -1,5 +1,5 @@
 import { useMemo, useState, type CSSProperties } from "react";
-import { ChevronDown, ChevronRight, Eye, History, Laptop, PanelLeft, Plus, QrCode, Search, Server, Settings, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, History, Laptop, PanelLeft, Plus, QrCode, Search, Server, Settings, Trash2, X } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
 import { PocketButton, PocketModal, useToast } from "../components/PocketUI";
@@ -13,7 +13,7 @@ import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
 import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, tileLetter, toneIndex, type ListGroup } from "./agentInfo";
-import { closeTabsForSpace, openAgentTab, openSettingsFrame, setPalette, setPeek, setSelectedSpace, shellStore } from "./shellStore";
+import { closeTabsForSpace, openAgentTab, openSettingsFrame, setPalette, setSelectedSpace, shellStore } from "./shellStore";
 import { shortcutText } from "./shortcuts";
 import { buildHostSpaces, spaceColorVars, type SidebarSpace } from "./spaceSync";
 
@@ -207,17 +207,6 @@ export function ShellSidebar({
           <>
             <span className="v3-row-label truncate">{label}</span>
             <span className="v3-time">{shortAgo(lastChange(a), now)}</span>
-            <button
-              className="v3-peek-btn"
-              aria-label={`预览 ${label}`}
-              title="预览（不开标签）"
-              onClick={(e) => {
-                e.stopPropagation();
-                setPeek(a.key);
-              }}
-            >
-              <Eye size={13} />
-            </button>
             <StatusMark group={g} compact={sort === "status" && g === "blocked"} />
           </>
         )}
@@ -298,7 +287,7 @@ export function ShellSidebar({
                   {isFolded && !collapsed
                     ? null
                     : m.spaces.map((s) => {
-                        const label = s.name || "未分空间";
+                        const label = s.name;
                         const custom = spaceColorVars(s.color);
                         const tileStyle = custom
                           ? ({ "--sp-fg": custom.fg, "--sp-bg": custom.bg } as CSSProperties)
@@ -313,7 +302,7 @@ export function ShellSidebar({
                             title={collapsed ? `${m.name} · ${label}` : s.folder || undefined}
                             onClick={() => setSpaceSel(selected === s.id ? null : s.id)}
                             onContextMenu={(e) => {
-                              if (!m.online || collapsed || (!s.spaceId && !s.name)) return;
+                              if (!m.online || collapsed) return;
                               e.preventDefault();
                               setDeleteSpaceTarget(s);
                             }}
@@ -338,25 +327,23 @@ export function ShellSidebar({
                                       title={`在空间 ${label} 新建 Agent`}
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        onNewAgent(m.id, s.name || null);
+                                        onNewAgent(m.id, s.name);
                                       }}
                                     >
                                       <Plus size={12} />
                                     </button>
-                                    {s.spaceId || s.name ? (
-                                      <button
-                                        type="button"
-                                        className="v3-icon-btn small hover-only danger"
-                                        aria-label={`关闭空间 ${label}`}
-                                        title={`关闭空间 ${label}`}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setDeleteSpaceTarget(s);
-                                        }}
-                                      >
-                                        <Trash2 size={12} />
-                                      </button>
-                                    ) : null}
+                                    <button
+                                      type="button"
+                                      className="v3-icon-btn small hover-only danger"
+                                      aria-label={`关闭空间 ${label}`}
+                                      title={`关闭空间 ${label}`}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setDeleteSpaceTarget(s);
+                                      }}
+                                    >
+                                      <Trash2 size={12} />
+                                    </button>
                                   </>
                                 ) : null}
                                 <span className="v3-count">{s.count}</span>
@@ -387,7 +374,7 @@ export function ShellSidebar({
               <span className="grow">Agent</span>
               {selected ? (
                 <button className="v3-filter-chip" onClick={() => setSpaceSel(null)} title="显示全部空间的 Agent">
-                  <span className="truncate">{selSpace || "未分空间"}</span>
+                  <span className="truncate">{selSpace}</span>
                   <X size={11} />
                 </button>
               ) : null}

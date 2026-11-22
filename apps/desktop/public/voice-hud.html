@@ -30,6 +30,11 @@
     --danger: #d93861;
     --danger-bg: rgba(217, 56, 97, 0.12);
     --danger-border: rgba(217, 56, 97, 0.28);
+    --danger-solid: #d93861;
+    --orb-bg: radial-gradient(circle at 35% 30%, rgba(255, 227, 236, 0.96), rgba(241, 235, 255, 0.96));
+    --orb-shadow: 0 3px 10px rgba(184, 51, 106, 0.20), 0 1px 4px rgba(44, 32, 56, 0.08);
+    --badge-ring: #fffafd;
+    --muted-badge-bg: #6f647d;
     --shadow: 0 10px 26px rgba(184, 51, 106, 0.20), 0 2px 10px rgba(24, 16, 36, 0.08);
   }
   @media (prefers-color-scheme: dark) {
@@ -47,6 +52,11 @@
       --danger: #ff92ab;
       --danger-bg: rgba(255, 107, 145, 0.18);
       --danger-border: rgba(255, 130, 165, 0.34);
+      --danger-solid: #e34a73;
+      --orb-bg: radial-gradient(circle at 35% 30%, rgba(74, 43, 58, 0.96), rgba(53, 44, 74, 0.96));
+      --orb-shadow: 0 4px 14px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 130, 180, 0.16);
+      --badge-ring: #1a1423;
+      --muted-badge-bg: #584e68;
       --shadow: 0 12px 30px rgba(0, 0, 0, 0.54), 0 0 0 1px rgba(255, 255, 255, 0.06);
     }
   }
@@ -64,6 +74,11 @@
     --danger: #ff92ab;
     --danger-bg: rgba(255, 107, 145, 0.18);
     --danger-border: rgba(255, 130, 165, 0.34);
+    --danger-solid: #e34a73;
+    --orb-bg: radial-gradient(circle at 35% 30%, rgba(74, 43, 58, 0.96), rgba(53, 44, 74, 0.96));
+    --orb-shadow: 0 4px 14px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 130, 180, 0.16);
+    --badge-ring: #1a1423;
+    --muted-badge-bg: #584e68;
     --shadow: 0 12px 30px rgba(0, 0, 0, 0.54), 0 0 0 1px rgba(255, 255, 255, 0.06);
   }
   html[data-theme="light"] {
@@ -80,6 +95,11 @@
     --danger: #d93861;
     --danger-bg: rgba(217, 56, 97, 0.12);
     --danger-border: rgba(217, 56, 97, 0.28);
+    --danger-solid: #d93861;
+    --orb-bg: radial-gradient(circle at 35% 30%, rgba(255, 227, 236, 0.96), rgba(241, 235, 255, 0.96));
+    --orb-shadow: 0 3px 10px rgba(184, 51, 106, 0.20), 0 1px 4px rgba(44, 32, 56, 0.08);
+    --badge-ring: #fffafd;
+    --muted-badge-bg: #6f647d;
     --shadow: 0 10px 26px rgba(184, 51, 106, 0.20), 0 2px 10px rgba(24, 16, 36, 0.08);
   }
   * { box-sizing: border-box; }
@@ -112,13 +132,13 @@
   }
   .hud {
     position: relative;
-    width: 520px;
+    width: 522px;
     max-width: calc(100vw - 16px);
-    height: 60px;
-    padding: 0 12px;
+    height: 62px;
+    padding: 0 12px 0 10px;
     display: flex;
     align-items: center;
-    gap: 9px;
+    gap: 10px;
     border-radius: 999px;
     background: var(--surface);
     -webkit-backdrop-filter: blur(24px) saturate(185%);
@@ -154,54 +174,101 @@
   @keyframes beam-spin {
     to { --beam: 360deg; }
   }
-  .dot {
+  .mascot-orb {
+    width: 44px;
+    height: 44px;
     flex: none;
-    width: 34px;
-    height: 34px;
-    border-radius: 50%;
-    background: linear-gradient(135deg, var(--pink), var(--pink-deep));
-    display: grid;
-    place-items: center;
     position: relative;
-    box-shadow: 0 3px 10px rgba(201, 47, 109, 0.32);
-    transition: background 160ms ease, box-shadow 160ms ease;
+    border-radius: 50%;
+    border: 1.5px solid var(--border);
+    background: var(--orb-bg);
+    box-shadow: var(--orb-shadow);
+    transition: border-color 160ms ease, box-shadow 160ms ease;
   }
-  .hud.phase-speaking .dot {
-    background: linear-gradient(135deg, var(--lav), var(--pink-deep));
-    box-shadow: 0 3px 12px rgba(159, 132, 247, 0.38);
+  .mascot-img {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+    transition: filter 160ms ease, opacity 160ms ease;
   }
-  .hud.phase-thinking .dot,
-  .hud.connecting .dot {
-    background: linear-gradient(135deg, var(--lav), var(--pink));
+  .hud.phase-speaking .mascot-orb {
+    border-color: var(--lav);
+    box-shadow: 0 3px 14px rgba(159, 132, 247, 0.40);
   }
-  .hud.is-muted .dot {
-    background: linear-gradient(135deg, #8e829c, #6f647d);
+  .hud.phase-thinking .mascot-orb,
+  .hud.connecting .mascot-orb {
+    border-color: var(--lav);
+    box-shadow: 0 3px 12px rgba(159, 132, 247, 0.30);
+  }
+  .hud.is-muted .mascot-orb {
+    border-color: var(--muted);
     box-shadow: none;
   }
-  .hud.error .dot {
-    background: var(--danger);
-    box-shadow: 0 3px 10px rgba(217, 56, 97, 0.35);
+  .hud.is-muted .mascot-img {
+    filter: saturate(0.45) brightness(0.9);
+    opacity: 0.86;
   }
-  .dot::after {
+  .hud.error .mascot-orb {
+    border-color: var(--danger);
+    box-shadow: 0 3px 10px rgba(217, 56, 97, 0.34);
+  }
+  .hud.error .mascot-img {
+    filter: saturate(0.72);
+  }
+  .mascot-orb::after {
     content: "";
     position: absolute;
-    inset: -4px;
+    inset: -3px;
     border-radius: 50%;
-    border: 2px solid var(--pink);
+    border: 1.5px solid var(--pink);
     opacity: 0;
+    pointer-events: none;
   }
-  .hud.active:not(.is-muted) .dot::after {
-    animation: ring 1.35s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
+  .hud.active:not(.is-muted) .mascot-orb::after {
+    animation: ring 1.45s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
   }
-  .hud.phase-speaking .dot::after {
+  .hud.phase-speaking .mascot-orb::after {
     border-color: var(--lav);
     animation: ring 0.95s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
   }
   @keyframes ring {
-    0% { opacity: 0.65; transform: scale(0.86); }
-    100% { opacity: 0; transform: scale(1.30); }
+    0% { opacity: 0.68; transform: scale(0.92); }
+    100% { opacity: 0; transform: scale(1.18); }
   }
-  .dot svg { width: 16px; height: 16px; fill: #fff; }
+  .mascot-badge {
+    position: absolute;
+    right: -2px;
+    bottom: -2px;
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    border: 1.5px solid var(--badge-ring);
+    background: linear-gradient(135deg, var(--lav), var(--pink));
+    color: #fff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24);
+    z-index: 2;
+  }
+  .mascot-badge svg {
+    width: 10px;
+    height: 10px;
+    fill: currentColor;
+    display: block;
+  }
+  .mascot-badge.is-muted {
+    background: var(--muted-badge-bg);
+  }
+  .mascot-badge.is-error {
+    background: var(--danger-solid);
+  }
+  .mascot-badge .spin {
+    width: 9px;
+    height: 9px;
+    border-width: 1.6px;
+  }
   .text {
     flex: 1 1 0;
     min-width: 0;
@@ -340,9 +407,9 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   [hidden] { display: none !important; }
   @media (prefers-reduced-motion: reduce) {
-    .hud, .bars i, .act-btn, .hangup-btn, .dot { transition: none; }
-    .hud.active:not(.is-muted) .dot::after,
-    .hud.phase-speaking .dot::after,
+    .hud, .bars i, .act-btn, .hangup-btn, .mascot-orb, .mascot-img { transition: none; }
+    .hud.active:not(.is-muted) .mascot-orb::after,
+    .hud.phase-speaking .mascot-orb::after,
     .spin,
     .hud.connecting::before,
     .hud.phase-thinking::before { animation: none; }
@@ -351,7 +418,10 @@
 </head>
 <body>
 <div class="hud" id="hud" role="status" aria-live="polite">
-  <div class="dot" id="dot"></div>
+  <div class="mascot-orb" id="mascotOrb">
+    <img class="mascot-img" id="mascotImg" src="assets/call/connecting.webp" alt="小羊" />
+    <span class="mascot-badge" id="mascotBadge" hidden></span>
+  </div>
   <div class="text">
     <div class="title-row">
       <div class="title" id="title">正在接通小羊…</div>
