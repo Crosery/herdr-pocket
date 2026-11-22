@@ -1220,6 +1220,13 @@ pub async fn local_open_file(cwd: Option<String>, path: String) -> Result<(), St
 }
 
 #[tauri::command]
+pub async fn local_agent_btw(
+    req: crate::local_btw::LocalBtwRequest,
+) -> Result<crate::local_btw::LocalBtwResponse, String> {
+    crate::local_btw::run_local_agent_btw(req).await
+}
+
+#[tauri::command]
 pub fn voice_ai_state() -> crate::voice_ai::VoiceAiState {
     crate::voice_ai::current_state()
 }

@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { Bot, Check, ChevronDown, ChevronUp, Copy, Sparkles, X } from "lucide-react";
-import type { Agent } from "@herdr-pocket/protocol";
+import type { Agent, ConvEvent } from "@herdr-pocket/protocol";
 import { assistantStore, loadAssistant, sendToAssistant, type AssistantStoreState } from "../lib/assistant";
 import { copyToClipboard } from "../lib/bridge";
+import { ensureLocalHostDeviceId } from "../lib/fonts";
 import { RichMarkdown } from "../lib/markdown";
 import { isMockServer } from "../lib/mock";
+import { native, type LocalBtwRequest } from "../lib/native";
 import { RelayError, rpcCall } from "../lib/relay";
 import { canonicalHarnessId } from "../lib/slashCommands";
 import { settingsStore } from "../lib/store";
@@ -34,6 +36,9 @@ export interface BtwExecutionDeps {
   getAssistantState: () => AssistantStoreState;
   subscribeAssistant: typeof assistantStore.subscribe;
   getServer: () => string | null;
+  isTauri?: () => boolean;
+  getLocalHostId?: () => Promise<string | null>;
+  localAgentBtw?: (req: LocalBtwRequest) => Promise<BtwResponse>;
 }
 
 export interface ExecuteAgentBtwOptions {
@@ -61,11 +66,92 @@ type BtwRpcCall = (
 ) => Promise<{ answer?: string; model?: string; durationMs?: number }>;
 
 const ASSISTANT_SETTLE_MS = 150;
+const BTW_TRANSCRIPT_MAX_CHARS = 60_000;
 
 function isUnsupportedRpcError(err: unknown): boolean {
   if (err instanceof RelayError && err.code === "unsupported") return true;
   const msg = err instanceof Error ? err.message : String(err ?? "");
   return /unsupported|unknown method|method not found|未实现|不支持/i.test(msg);
+}
+
+function clipText(text: string, max: number): string {
+  const clean = text.trim();
+  if (clean.length <= max) return clean;
+  return `${clean.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function safeJsonString(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (v === null || v === undefined) return "";
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+function clipNewestChars(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const tail = text.slice(-Math.max(0, maxChars - 32));
+  return `[earlier conversation omitted]\n${tail}`;
+}
+
+function stripAnsiAndTail(raw: string, maxLines = 180): string {
+  if (!raw) return "";
+  const clean = raw
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\r/g, "");
+  const lines = clean
+    .split("\n")
+    .map((l) => l.replace(/\s+$/, ""))
+    .filter((l) => l.trim().length > 0);
+  return lines.slice(-maxLines).join("\n");
+}
+
+export function formatBtwTranscriptFromEvents(
+  events: readonly ConvEvent[],
+  _cwd?: string,
+  maxChars = BTW_TRANSCRIPT_MAX_CHARS,
+): string {
+  const lines: string[] = [];
+  for (const ev of events) {
+    if (ev.partial) continue;
+    if (ev.kind === "user_message" && !ev.synthetic && ev.text?.trim()) {
+      lines.push(`USER: ${clipText(ev.text, 4000)}`);
+    } else if (ev.kind === "assistant_message" && ev.text?.trim()) {
+      lines.push(`ASSISTANT: ${clipText(ev.text, 4000)}`);
+    } else if (ev.kind === "tool_call" && ev.name?.trim()) {
+      const detail = clipText(safeJsonString(ev.input), 300);
+      lines.push(detail ? `TOOL: ${ev.name} ${detail}` : `TOOL: ${ev.name}`);
+    } else if (ev.kind === "tool_result" && ev.is_error) {
+      lines.push("TOOL RESULT: failed");
+    }
+  }
+  const picked: string[] = [];
+  let size = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    size += line.length + 1;
+    if (size > maxChars) {
+      picked.push("[earlier conversation omitted]");
+      break;
+    }
+    picked.push(line);
+  }
+  return picked.reverse().join("\n");
+}
+
+function buildMetadataFallbackTranscript(agent: Agent): string {
+  return [
+    "Agent Metadata:",
+    `- Harness: ${agent.harness}`,
+    `- Status: ${agent.status}`,
+    `- Title: ${agent.title || agent.name || "(untitled)"}`,
+    `- Working Directory: ${agent.cwd || "(unknown)"}`,
+    `- Model: ${agent.model || "(unknown)"}`,
+    "(No session events or terminal output available yet.)",
+  ].join("\n");
 }
 
 /**
@@ -277,9 +363,44 @@ export async function executeAgentBtw(
     };
   }
 
+  const inTauri = (deps.isTauri ?? native.available)();
+  const runLocalBtw = deps.localAgentBtw ?? native.localAgentBtw;
+  const resolveLocalHostId = deps.getLocalHostId ?? ensureLocalHostDeviceId;
+
+  if (inTauri) {
+    const localHostId = await resolveLocalHostId().catch(() => null);
+    if (localHostId && localHostId === agent.deviceId) {
+      try {
+        const localRes = await runLocalBtw({
+          harness: agent.harness,
+          sessionKey: agent.sessionKey ?? null,
+          localId: agent.localId ?? null,
+          cwd: agent.cwd ?? null,
+          status: agent.status,
+          title: agent.title ?? agent.name ?? null,
+          model: agent.model ?? null,
+          question: cleanQuestion,
+          timeoutMs: Math.min(75_000, opts?.timeoutMs ?? 75_000),
+        });
+        if (localRes && typeof localRes.answer === "string" && localRes.answer.trim()) {
+          return {
+            answer: localRes.answer.trim(),
+            model: localRes.model,
+            durationMs:
+              typeof localRes.durationMs === "number"
+                ? localRes.durationMs
+                : Math.max(1, Date.now() - startedAt),
+          };
+        }
+      } catch {
+        // Fall through to hostd RPC (e.g. if CLI PATH differs between GUI .app and daemon).
+      }
+    }
+  }
+
   try {
     const rpc = deps.rpcCall as unknown as BtwRpcCall;
-    const res = await rpc(agent.deviceId, "agent.btw", { agent: agent.key, question: cleanQuestion }, 60_000);
+    const res = await rpc(agent.deviceId, "agent.btw", { agent: agent.key, question: cleanQuestion }, 90_000);
     if (res && typeof res.answer === "string" && res.answer.trim()) {
       return {
         answer: res.answer.trim(),
@@ -294,20 +415,75 @@ export async function executeAgentBtw(
     }
   }
 
+  const eventsRes = await deps
+    .rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 200 }, 15_000)
+    .catch(() => null);
+  let prefetchedContext = eventsRes?.events?.length
+    ? formatBtwTranscriptFromEvents(eventsRes.events, agent.cwd, BTW_TRANSCRIPT_MAX_CHARS)
+    : "";
+  if (prefetchedContext.length < 300) {
+    const termRes = await deps
+      .rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 180 }, 10_000)
+      .catch(() => null);
+    const rawTerm = termRes?.text || termRes?.ansi || "";
+    const tail = stripAnsiAndTail(rawTerm, 180);
+    if (tail) {
+      const snap = `[Recent Terminal Screen Snapshot]\n${tail}`;
+      prefetchedContext = prefetchedContext
+        ? clipNewestChars(`${prefetchedContext}\n\n${snap}`, BTW_TRANSCRIPT_MAX_CHARS)
+        : clipNewestChars(snap, BTW_TRANSCRIPT_MAX_CHARS);
+    }
+  }
+
+  if (inTauri) {
+    try {
+      const prebuiltTranscript = prefetchedContext || buildMetadataFallbackTranscript(agent);
+      const localRes = await runLocalBtw({
+        harness: agent.harness,
+        sessionKey: agent.sessionKey ?? null,
+        localId: agent.localId ?? null,
+        cwd: agent.cwd ?? null,
+        status: agent.status,
+        title: agent.title ?? agent.name ?? null,
+        model: agent.model ?? null,
+        prebuiltTranscript,
+        question: cleanQuestion,
+        timeoutMs: 75_000,
+      });
+      if (localRes && typeof localRes.answer === "string" && localRes.answer.trim()) {
+        return {
+          answer: localRes.answer.trim(),
+          model: localRes.model,
+          durationMs:
+            typeof localRes.durationMs === "number"
+              ? localRes.durationMs
+              : Math.max(1, Date.now() - startedAt),
+        };
+      }
+    } catch {
+      // Fall through to Relay Assistant fallback when local CLI fails or is absent.
+    }
+  }
+
   if (!deps.getAssistantState().loaded) {
     await deps.loadAssistant().catch(() => {});
   }
   const assistantState = deps.getAssistantState();
   if (assistantState.ready) {
     const beforeIds = new Set(assistantState.items.map((x) => x.id));
+    const inlinedContext = prefetchedContext ? clipNewestChars(prefetchedContext, 40_000) : "";
     const askPrompt = [
-      `请在完全不向目标 Agent 发送任何输入、不打断其运行的前提下，只读查看「${agent.title || agent.name || agent.harness}」（key: ${agent.key}）的近期对话或状态，直接回答我的旁路提问：`,
-      cleanQuestion,
+      `请在完全不向目标 Agent 发送任何输入、不打断其运行的前提下，只读依据以下已采集的上下文直接回答我的旁路提问（无需再次调用会话读取工具）：`,
+      `Agent：${agent.title || agent.name || agent.harness}（key: ${agent.key}，harness: ${agent.harness}，status: ${agent.status}）`,
+      inlinedContext
+        ? `<transcript>\n${inlinedContext}\n</transcript>`
+        : `（未采集到历史事件，请根据 Agent 状态简短说明或只读检查 ${agent.key}）`,
+      `我的旁路问题：\n${cleanQuestion}`,
     ].join("\n\n");
     const ac = new AbortController();
     const replyPromise = waitForAssistantBtwReply(beforeIds, startedAt, {
       onStream: opts?.onStream,
-      timeoutMs: opts?.timeoutMs,
+      timeoutMs: opts?.timeoutMs ?? 90_000,
       settleMs: opts?.settleMs,
       signal: ac.signal,
       getAssistantState: deps.getAssistantState,

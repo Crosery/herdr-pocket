@@ -56,16 +56,26 @@ const c = (
 });
 
 function withUsage(items: SlashCommandItem[]): SlashCommandItem[] {
-  if (items.some((x) => x.name === "/usage")) return items;
-  return [
-    c("/usage", "查看当前会话、上下文占用与本机额度用量", "session"),
-    ...items,
-  ];
+  let out = items;
+  if (!out.some((x) => x.name === "/btw")) {
+    out = [
+      c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
+      ...out,
+    ];
+  }
+  if (!out.some((x) => x.name === "/usage")) {
+    out = [
+      c("/usage", "查看当前会话、上下文占用与本机额度用量", "session"),
+      ...out,
+    ];
+  }
+  return out;
 }
 
 const CORE_SESSION: SlashCommandItem[] = [
   c("/help", "查看当前 Agent 支持的斜杠命令", "session"),
   c("/usage", "查看当前会话、上下文占用与本机额度用量", "session"),
+  c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
   c("/clear", "清空当前会话上下文，开启全新一轮", "session"),
   c("/compact", "压缩并总结较早对话释放上下文", "session", "[focus]"),
   c("/status", "查看会话、模型与额度状态", "session"),
@@ -164,7 +174,7 @@ const OMP_COMMANDS: SlashCommandItem[] = withUsage([
   c("/tools", "查看可见工具", "code"),
   c("/git", "查看 Git 改动与提交", "code"),
   c("/commit", "提交 Agent 改动", "code"),
-  c("/btw", "旁路提问", "skill"),
+  c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
   c("/tan", "后台运行支线 Agent", "skill"),
   c("/exit", "退出 omp", "session"),
 ]);
@@ -190,7 +200,6 @@ const DSH_COMMANDS: SlashCommandItem[] = withUsage([
   c("/rewind", "回退历史消息", "session"),
   c("/tree", "浏览会话分支树", "session"),
   c("/fork", "分叉当前会话", "session"),
-  c("/btw", "快速旁路提问", "skill"),
   c("/plan", "进入计划模式", "code"),
   c("/subagent", "查看与切换子智能体", "skill"),
   c("/team", "团队任务看板", "skill"),
@@ -253,7 +262,6 @@ const CODEBUDDY_COMMANDS: SlashCommandItem[] = [
   c("/branch", "创建对话分支", "session"),
   c("/fork-bg", "复制会话至后台运行", "skill"),
   c("/background", "切至后台会话", "skill"),
-  c("/btw", "旁路快速咨询", "skill"),
   c("/goal", "设定目标条件", "skill"),
   c("/tasks", "管理后台任务", "skill"),
   c("/permissions", "管理权限规则", "model"),
