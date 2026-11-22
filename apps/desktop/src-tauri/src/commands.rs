@@ -684,10 +684,11 @@ pub(crate) struct ResolvedLocalFile {
     pub language: Option<String>,
 }
 
-pub(crate) fn resolve_safe_local_file(
+fn resolve_safe_local_target_inner(
     cwd: Option<&str>,
     path: &str,
-) -> Result<ResolvedLocalFile, String> {
+    cfg_dir: Option<&std::path::Path>,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>, fs::Metadata), String> {
     let raw_target = expand_home_path(path)?;
     let cwd_expanded = cwd
         .map(str::trim)
@@ -713,14 +714,44 @@ pub(crate) fn resolve_safe_local_file(
             }
         }
     }
-    if let Some(cfg_dir) = crate::hostd_config_dir() {
-        let real_cfg = fs::canonicalize(&cfg_dir).unwrap_or(cfg_dir);
+    if let Some(cfg_dir) = cfg_dir {
+        let real_cfg = fs::canonicalize(cfg_dir).unwrap_or_else(|_| cfg_dir.to_path_buf());
         if canon.starts_with(&real_cfg) {
             return Err("这是 herdr-pocket 自己的设置目录，不在这里显示".into());
         }
     }
 
     let meta = fs::metadata(&canon).map_err(|e| format!("无法读取文件信息：{e}"))?;
+    Ok((canon, cwd_expanded, meta))
+}
+
+fn resolve_safe_local_reveal_target_with_cfg_dir(
+    cwd: Option<&str>,
+    path: &str,
+    cfg_dir: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    let (canon, _, meta) = resolve_safe_local_target_inner(cwd, path, cfg_dir)?;
+    if !meta.is_file() && !meta.is_dir() {
+        return Err("这不是普通文件或目录".into());
+    }
+    Ok(canon)
+}
+
+pub(crate) fn resolve_safe_local_reveal_target(
+    cwd: Option<&str>,
+    path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let cfg_dir = crate::hostd_config_dir();
+    resolve_safe_local_reveal_target_with_cfg_dir(cwd, path, cfg_dir.as_deref())
+}
+
+pub(crate) fn resolve_safe_local_file(
+    cwd: Option<&str>,
+    path: &str,
+) -> Result<ResolvedLocalFile, String> {
+    let cfg_dir = crate::hostd_config_dir();
+    let (canon, cwd_expanded, meta) =
+        resolve_safe_local_target_inner(cwd, path, cfg_dir.as_deref())?;
     if meta.is_dir() {
         return Err("这是一个目录，无法当文件打开".into());
     }
@@ -1142,6 +1173,52 @@ pub async fn local_read_file(
         .map_err(|e| e.to_string())?
 }
 
+fn opener_path_string(path: &std::path::Path) -> String {
+    let raw = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    raw
+}
+
+#[tauri::command]
+pub async fn local_reveal_in_folder(cwd: Option<String>, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let canon = resolve_safe_local_reveal_target(cwd.as_deref(), &path)?;
+        if canon.is_dir() {
+            return tauri_plugin_opener::open_path(opener_path_string(&canon), None::<&str>)
+                .map_err(|e| format!("无法打开所在目录：{e}"));
+        }
+        if let Err(reveal_err) = tauri_plugin_opener::reveal_item_in_dir(&canon) {
+            if let Some(parent) = canon.parent() {
+                return tauri_plugin_opener::open_path(opener_path_string(parent), None::<&str>)
+                    .map_err(|open_err| format!("无法打开所在目录：{open_err}"));
+            }
+            return Err(format!("无法在目录中显示文件：{reveal_err}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("无法打开所在目录：{e}"))?
+}
+
+#[tauri::command]
+pub async fn local_open_file(cwd: Option<String>, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let canon = resolve_safe_local_reveal_target(cwd.as_deref(), &path)?;
+        tauri_plugin_opener::open_path(opener_path_string(&canon), None::<&str>)
+            .map_err(|e| format!("无法用系统默认应用打开：{e}"))
+    })
+    .await
+    .map_err(|e| format!("无法用系统默认应用打开：{e}"))?
+}
+
 #[tauri::command]
 pub fn voice_ai_state() -> crate::voice_ai::VoiceAiState {
     crate::voice_ai::current_state()
@@ -1400,7 +1477,88 @@ pub async fn voice_call_dsp_close() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sums_url, process_pcm_bytes_with_processor, read_local_file_sync};
+    use super::{
+        is_sums_url, process_pcm_bytes_with_processor, read_local_file_sync,
+        resolve_safe_local_file, resolve_safe_local_reveal_target,
+        resolve_safe_local_reveal_target_with_cfg_dir,
+    };
+
+    #[test]
+    fn resolve_safe_local_reveal_target_accepts_files_and_dirs_and_blocks_private_paths() {
+        let base = std::env::temp_dir().join(format!("hp-cmd-reveal-{}", std::process::id()));
+        let cfg_dir =
+            std::env::temp_dir().join(format!("hp-cmd-reveal-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+        std::fs::create_dir_all(base.join("dist")).unwrap();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::create_dir_all(base.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+
+        std::fs::write(base.join("dist/app.ipa"), b"PK\x03\x04").unwrap();
+        std::fs::write(base.join("dist/installer.dmg"), b"koly").unwrap();
+        std::fs::write(base.join("src/hello.ts"), "export const ok = true;\n").unwrap();
+        std::fs::write(base.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(base.join(".env.local"), "SECRET=2\n").unwrap();
+        std::fs::write(base.join(".ssh/id_rsa"), "PRIVATE").unwrap();
+        std::fs::write(base.join(".ssh/config"), "Host *").unwrap();
+        std::fs::write(cfg_dir.join("hostd.json"), "{}").unwrap();
+
+        let cwd = base.to_string_lossy().into_owned();
+
+        let ipa = resolve_safe_local_reveal_target(Some(&cwd), "dist/app.ipa").unwrap();
+        assert_eq!(ipa, std::fs::canonicalize(base.join("dist/app.ipa")).unwrap());
+
+        let dmg = resolve_safe_local_reveal_target(Some(&cwd), "dist/installer.dmg").unwrap();
+        assert_eq!(
+            dmg,
+            std::fs::canonicalize(base.join("dist/installer.dmg")).unwrap()
+        );
+
+        let ts = resolve_safe_local_reveal_target(Some(&cwd), "src/hello.ts").unwrap();
+        assert_eq!(ts, std::fs::canonicalize(base.join("src/hello.ts")).unwrap());
+
+        let dir = resolve_safe_local_reveal_target(Some(&cwd), "dist").unwrap();
+        assert_eq!(dir, std::fs::canonicalize(base.join("dist")).unwrap());
+        assert!(resolve_safe_local_file(Some(&cwd), "dist").is_err());
+
+        let abs_ipa =
+            resolve_safe_local_reveal_target(None, &base.join("dist/app.ipa").to_string_lossy())
+                .unwrap();
+        assert_eq!(abs_ipa, ipa);
+
+        assert!(resolve_safe_local_reveal_target(Some(&cwd), ".env").is_err());
+        assert!(resolve_safe_local_reveal_target(Some(&cwd), ".env.local").is_err());
+        assert!(resolve_safe_local_reveal_target(Some(&cwd), ".ssh/id_rsa").is_err());
+        assert!(resolve_safe_local_reveal_target(Some(&cwd), ".ssh/config").is_err());
+        assert!(resolve_safe_local_reveal_target(Some(&cwd), ".ssh").is_err());
+        assert!(resolve_safe_local_reveal_target(Some(&cwd), "dist/missing.ipa").is_err());
+
+        let cfg_dir_err = resolve_safe_local_reveal_target_with_cfg_dir(
+            None,
+            &cfg_dir.to_string_lossy(),
+            Some(&cfg_dir),
+        )
+        .unwrap_err();
+        assert!(cfg_dir_err.contains("设置目录"), "{cfg_dir_err}");
+
+        let cfg_file_err = resolve_safe_local_reveal_target_with_cfg_dir(
+            None,
+            &cfg_dir.join("hostd.json").to_string_lossy(),
+            Some(&cfg_dir),
+        )
+        .unwrap_err();
+        assert!(cfg_file_err.contains("设置目录"), "{cfg_file_err}");
+
+        if let Some(real_cfg) = crate::hostd_config_dir().filter(|p| p.exists()) {
+            let err =
+                resolve_safe_local_reveal_target(None, &real_cfg.to_string_lossy()).unwrap_err();
+            assert!(err.contains("设置目录"), "{err}");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+    }
 
     #[test]
     fn reads_local_text_image_and_blocks_private_files() {

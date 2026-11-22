@@ -876,6 +876,32 @@
   color: var(--v3-dim);
 }
 
+.v3-pane-sub-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  max-width: fit-content;
+  margin-right: auto;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.14s var(--ease-out);
+}
+
+.v3-pane-sub-btn:hover {
+  color: var(--ink);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.v3-pane-sub-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-focus);
+  border-radius: 4px;
+}
+
 .v3-pane-off {
   flex: none;
   color: var(--v3-dim);

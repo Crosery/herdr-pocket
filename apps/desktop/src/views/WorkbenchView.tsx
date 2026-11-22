@@ -23,8 +23,16 @@ import type { Agent, FileEntry, RpcResult } from "@herdr-pocket/protocol";
 import { EmptyState, PocketButton, PocketInput, PocketSelect, overlayStore, useToast } from "../components/PocketUI";
 import { CookieImportButton } from "../components/CookieImport";
 import { RichMarkdown } from "../lib/markdown";
-import { copyToClipboard, openExternalUrl } from "../lib/bridge";
+import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge";
 import { ensureLocalHostDeviceId, localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
+import {
+  canActOnLocalFile,
+  openLocalFileDefault,
+  resolveLocalActionTarget,
+  revealInFolderLabel,
+  revealInFolderShortLabel,
+  revealLocalFile,
+} from "../lib/localFileActions";
 import { native } from "../lib/native";
 import { useClientConfig } from "../lib/config";
 import { openAgentFileTarget } from "../lib/openFileTarget";
@@ -361,6 +369,36 @@ export function FileViewer({
   const isStreamableBinary = isImageExt || isPdfExt || isAudioExt || isVideoExt;
   const isLocalOwner =
     native.available() && ((!agent && Boolean(tab.absPath)) || Boolean(agent && localId && localId === agent.deviceId));
+  const platform = detectPlatform();
+  const revealLabel = revealInFolderLabel(platform);
+  const revealShort = revealInFolderShortLabel(platform);
+  const canRevealLocal = canActOnLocalFile({
+    nativeAvailable: native.available(),
+    agentDeviceId: agent?.deviceId,
+    agentCwd: agent?.cwd,
+    localHostId: localId,
+    path: tab.path,
+    absPath: tab.absPath,
+  });
+  const localTarget = resolveLocalActionTarget({
+    path: tab.path,
+    absPath: tab.absPath,
+    agentCwd: agent?.cwd,
+  });
+  const handleRevealLocal = () => {
+    void revealLocalFile({
+      path: tab.path,
+      absPath: tab.absPath,
+      agentCwd: agent?.cwd,
+    }).catch((e: Error) => toast(e.message || "打开所在目录失败", true));
+  };
+  const handleOpenDefaultLocal = () => {
+    void openLocalFileDefault({
+      path: tab.path,
+      absPath: tab.absPath,
+      agentCwd: agent?.cwd,
+    }).catch((e: Error) => toast(e.message || "无法用系统默认应用打开", true));
+  };
   const localStreamUrl = useMemo(() => {
     if (!isLocalOwner || !isStreamableBinary || streamError) return null;
     return native.localFileStreamUrl(tab.absPath || tab.path, agent?.cwd);
@@ -489,6 +527,23 @@ export function FileViewer({
   const isAudio = data?.kind === "audio" || Boolean(data?.mime?.startsWith("audio/"));
   const isVideo = data?.kind === "video" || Boolean(data?.mime?.startsWith("video/"));
   const isImage = data?.kind === "image" || Boolean(data?.mime?.startsWith("image/"));
+  const binaryActions = canRevealLocal ? (
+    <div className="viewer-media-actions">
+      <PocketButton size="sm" variant="soft" onClick={handleRevealLocal}>
+        <FolderOpen size={13} />
+        <span>{revealLabel}</span>
+      </PocketButton>
+      <PocketButton size="sm" variant="ghost" onClick={handleOpenDefaultLocal}>
+        <ExternalLink size={13} />
+        <span>用系统默认应用打开</span>
+      </PocketButton>
+    </div>
+  ) : !native.available() && tab.absPath ? (
+    <PocketButton size="sm" variant="soft" onClick={() => void openExternalUrl(toFileUrl(tab.absPath!))}>
+      <ExternalLink size={13} />
+      <span>用系统默认应用打开</span>
+    </PocketButton>
+  ) : null;
 
   return (
     <div className="viewer">
@@ -502,7 +557,19 @@ export function FileViewer({
               <button className={!preview ? "active" : ""} onClick={() => setPreview(false)}>源码</button>
             </div>
           ) : null}
+          {canRevealLocal ? (
+            <button
+              type="button"
+              className="side-icon-btn"
+              aria-label={revealShort}
+              title={`${revealLabel}（${localTarget.path}）`}
+              onClick={handleRevealLocal}
+            >
+              <FolderOpen size={14} />
+            </button>
+          ) : null}
           <button
+            type="button"
             className="side-icon-btn"
             aria-label="复制路径"
             title="复制路径"
@@ -559,22 +626,12 @@ export function FileViewer({
             <div className="faint">
               这个{isPdf ? " PDF " : isAudio || isVideo ? "音视频" : "图片"}文件超过预览大小上限，无法直接内联加载。
             </div>
-            {tab.absPath ? (
-              <PocketButton size="sm" variant="soft" onClick={() => void openExternalUrl(toFileUrl(tab.absPath!))}>
-                <ExternalLink size={13} />
-                <span>用系统默认应用打开</span>
-              </PocketButton>
-            ) : null}
+            {binaryActions}
           </div>
         ) : data.binary ? (
           <div className="viewer-media">
             <div className="faint">这是二进制文件，没法按文字显示。</div>
-            {tab.absPath ? (
-              <PocketButton size="sm" variant="soft" onClick={() => void openExternalUrl(toFileUrl(tab.absPath!))}>
-                <ExternalLink size={13} />
-                <span>用系统默认应用打开</span>
-              </PocketButton>
-            ) : null}
+            {binaryActions}
           </div>
         ) : preview && isMd ? (
           <div className="viewer-md">
@@ -682,6 +739,7 @@ export function WebPane({
   /** Where URL and title changes go (the shell's tabs); the workbench's own tabs by default. */
   onChange?: (patch: { url?: string; title?: string }) => void;
 }) {
+  const toast = useToast();
   const update = (patch: { url?: string; title?: string }) =>
     onChange ? onChange(patch) : wb.set((s) => ({ ...s, tabs: s.tabs.map((t) => (t.id === tab.id && t.kind === "web" ? { ...t, ...patch } : t)) }));
   const engine = useClientConfig().browser.searchEngine;
@@ -694,6 +752,10 @@ export function WebPane({
   const supported = native.browserSupported();
   const localPath = useMemo(() => parseLocalFileAddress(tab.url), [tab.url]);
   const localTitle = localPath ? localPath.split(/[\\/]/).pop() || localPath : "";
+  const platform = detectPlatform();
+  const revealLabel = revealInFolderLabel(platform);
+  const revealShort = revealInFolderShortLabel(platform);
+  const canRevealLocalPath = native.available() && Boolean(localPath);
 
   useEffect(() => {
     const parsed = parseLocalFileAddress(tab.url);
@@ -802,7 +864,34 @@ export function WebPane({
             <FolderOpen size={15} />
           </button>
         ) : null}
-        <button type="button" className="side-icon-btn" aria-label="在系统浏览器打开" title="在系统默认程序打开" onClick={() => void openExternalUrl(localPath ? toFileUrl(localPath) : toUrl(address || tab.url, engine))}>
+        {canRevealLocalPath && localPath ? (
+          <button
+            type="button"
+            className="side-icon-btn"
+            aria-label={revealShort}
+            title={revealLabel}
+            onClick={() =>
+              void revealLocalFile({ path: localPath }).catch((e: Error) => toast(e.message || "打开所在目录失败", true))
+            }
+          >
+            <FolderOpen size={15} />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="side-icon-btn"
+          aria-label={localPath ? "用系统默认应用打开" : "在系统浏览器打开"}
+          title={localPath ? "用系统默认应用打开" : "在系统默认程序打开"}
+          onClick={() => {
+            if (localPath && native.available()) {
+              void openLocalFileDefault({ path: localPath }).catch((e: Error) =>
+                toast(e.message || "无法用系统默认应用打开", true),
+              );
+            } else {
+              void openExternalUrl(localPath ? toFileUrl(localPath) : toUrl(address || tab.url, engine));
+            }
+          }}
+        >
           <ExternalLink size={15} />
         </button>
         <CookieImportButton compact currentHost={hostOf(tab.url)} />

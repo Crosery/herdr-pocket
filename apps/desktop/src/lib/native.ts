@@ -763,6 +763,20 @@ export const native = {
           maxBytes: params.maxBytes ?? null,
         })
       : null,
+  localRevealInFolder: (params: { path: string; cwd?: string }): Promise<void> =>
+    inTauri()
+      ? invoke<void>("local_reveal_in_folder", {
+          cwd: params.cwd?.trim() || null,
+          path: params.path,
+        })
+      : Promise.reject(new Error("仅桌面端支持本地文件操作")),
+  localOpenFile: (params: { path: string; cwd?: string }): Promise<void> =>
+    inTauri()
+      ? invoke<void>("local_open_file", {
+          cwd: params.cwd?.trim() || null,
+          path: params.path,
+        })
+      : Promise.reject(new Error("仅桌面端支持本地文件操作")),
   /** Zero-copy local asset URL backed by Tauri's `pocket-local` custom URI scheme (Range streaming, main webview only). */
   localFileStreamUrl: (path: string, cwd?: string): string | null => {
     if (!inTauri() || !path.trim()) return null;
