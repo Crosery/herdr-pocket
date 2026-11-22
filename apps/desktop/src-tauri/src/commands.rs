@@ -671,6 +671,7 @@ pub async fn pick_file(
 
 const MAX_LOCAL_IMAGE_READ_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_LOCAL_MEDIA_READ_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_LOCAL_OFFICE_READ_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_LOCAL_READ_BYTES: usize = 512 * 1024;
 const MAX_LOCAL_READ_BYTES: usize = 2 * 1024 * 1024;
 const SNIFF_LOCAL_BYTES: usize = 8192;
@@ -811,7 +812,16 @@ pub(crate) fn local_stream_mime(ext: &str) -> &'static str {
     if let Some((m, _)) = local_media_mime(ext) {
         return m;
     }
-    "application/octet-stream"
+    if let Some((m, _)) = local_office_mime(ext) {
+        return m;
+    }
+    match ext {
+        "csv" => "text/csv; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
+        "psv" => "text/plain; charset=utf-8",
+        "json" | "jsonl" | "ndjson" => "application/json; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -832,6 +842,8 @@ pub struct LocalFileSlice {
     pub base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_html: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }
@@ -926,12 +938,63 @@ fn local_media_mime(ext: &str) -> Option<(&'static str, &'static str)> {
         "aac" => Some(("audio/aac", "audio")),
         "opus" => Some(("audio/opus", "audio")),
         "weba" => Some(("audio/webm", "audio")),
+        "aiff" | "aif" => Some(("audio/aiff", "audio")),
+        "caf" => Some(("audio/x-caf", "audio")),
         "mp4" => Some(("video/mp4", "video")),
         "webm" => Some(("video/webm", "video")),
         "mov" => Some(("video/quicktime", "video")),
         "m4v" => Some(("video/x-m4v", "video")),
+        "mkv" => Some(("video/x-matroska", "video")),
+        "avi" => Some(("video/x-msvideo", "video")),
+        "ogv" => Some(("video/ogg", "video")),
+        "mpg" | "mpeg" => Some(("video/mpeg", "video")),
         _ => None,
     }
+}
+
+fn local_office_mime(ext: &str) -> Option<(&'static str, &'static str)> {
+    match ext {
+        "docx" => Some((
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "document",
+        )),
+        "doc" => Some(("application/msword", "document")),
+        "rtf" => Some(("application/rtf", "document")),
+        "odt" => Some(("application/vnd.oasis.opendocument.text", "document")),
+        "xlsx" => Some((
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "spreadsheet",
+        )),
+        "xls" => Some(("application/vnd.ms-excel", "spreadsheet")),
+        "ods" => Some((
+            "application/vnd.oasis.opendocument.spreadsheet",
+            "spreadsheet",
+        )),
+        "pptx" => Some((
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "presentation",
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn convert_doc_with_textutil(path: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/textutil")
+        .args(["-convert", "html", "-stdout"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let html = String::from_utf8_lossy(&out.stdout).into_owned();
+    (!html.trim().is_empty()).then_some(html)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn convert_doc_with_textutil(_path: &std::path::Path) -> Option<String> {
+    None
 }
 
 fn local_language(name: &str, ext: &str) -> Option<&'static str> {
@@ -956,7 +1019,8 @@ fn local_language(name: &str, ext: &str) -> Option<&'static str> {
         "ps1" => Some("ps1"),
         "bat" | "cmd" => Some("bat"),
         "md" | "markdown" => Some("md"),
-        "json" | "jsonc" | "json5" => Some("json"),
+        "json" | "jsonc" | "json5" | "jsonl" | "ndjson" => Some("json"),
+        "csv" | "tsv" | "psv" => Some("csv"),
         "yaml" | "yml" => Some("yaml"),
         "toml" => Some("toml"),
         "ini" => Some("ini"),
@@ -1029,6 +1093,7 @@ pub(crate) fn read_local_file_sync(
                 text: None,
                 base64: None,
                 mime: Some(mime.into()),
+                preview_html: None,
                 language,
             });
         }
@@ -1046,6 +1111,7 @@ pub(crate) fn read_local_file_sync(
             text: None,
             base64: Some(crate::local_term::base64_encode(&bytes)),
             mime: Some(mime.into()),
+            preview_html: None,
             language,
         });
     }
@@ -1064,6 +1130,7 @@ pub(crate) fn read_local_file_sync(
                 text: None,
                 base64: None,
                 mime: Some(mime.into()),
+                preview_html: None,
                 language,
             });
         }
@@ -1081,6 +1148,57 @@ pub(crate) fn read_local_file_sync(
             text: None,
             base64: Some(crate::local_term::base64_encode(&bytes)),
             mime: Some(mime.into()),
+            preview_html: None,
+            language,
+        });
+    }
+
+    if let Some((mime, kind)) = local_office_mime(&ext) {
+        if size > MAX_LOCAL_OFFICE_READ_BYTES {
+            return Ok(LocalFileSlice {
+                path: display_path,
+                size,
+                mtime,
+                binary: true,
+                kind: Some(kind.into()),
+                truncated: true,
+                offset: 0,
+                bytes: 0,
+                text: None,
+                base64: None,
+                mime: Some(mime.into()),
+                preview_html: None,
+                language,
+            });
+        }
+        let bytes = fs::read(&canon).map_err(|e| format!("读取文档失败：{e}"))?;
+        let len = bytes.len();
+        let sniff_len = len.min(SNIFF_LOCAL_BYTES);
+        let text = if ext == "rtf" && !looks_binary_local(&bytes[..sniff_len]) {
+            let cap = len.min(MAX_LOCAL_READ_BYTES);
+            let valid = utf8_prefix_len(&bytes[..cap]);
+            Some(String::from_utf8_lossy(&bytes[..valid]).into_owned())
+        } else {
+            None
+        };
+        let preview_html = if matches!(ext.as_str(), "doc" | "rtf" | "odt") {
+            convert_doc_with_textutil(&canon)
+        } else {
+            None
+        };
+        return Ok(LocalFileSlice {
+            path: display_path,
+            size,
+            mtime,
+            binary: ext != "rtf" || text.is_none(),
+            kind: Some(kind.into()),
+            truncated: false,
+            offset: 0,
+            bytes: len,
+            text,
+            base64: Some(crate::local_term::base64_encode(&bytes)),
+            mime: Some(mime.into()),
+            preview_html,
             language,
         });
     }
@@ -1113,6 +1231,7 @@ pub(crate) fn read_local_file_sync(
                 text: None,
                 base64: None,
                 mime: None,
+                preview_html: None,
                 language,
             });
         }
@@ -1158,6 +1277,7 @@ pub(crate) fn read_local_file_sync(
         text: Some(text),
         base64: None,
         mime: None,
+        preview_html: None,
         language,
     })
 }

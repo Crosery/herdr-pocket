@@ -35,7 +35,7 @@ const KIND_BY_EXTENSION: Readonly<Record<string, DropKind>> = {
   rtf: "document", pages: "document", numbers: "document", key: "document", epub: "document",
 
   md: "text", markdown: "text", mdx: "text", txt: "text", log: "text", csv: "text",
-  tsv: "text", json: "text", jsonl: "text", yaml: "text", yml: "text", toml: "text",
+  tsv: "text", psv: "text", json: "text", jsonl: "text", ndjson: "text", yaml: "text", yml: "text", toml: "text",
   ini: "text", conf: "text", env: "text", xml: "text", html: "text", htm: "text",
   css: "text", scss: "text", less: "text", js: "text", mjs: "text", cjs: "text",
   jsx: "text", ts: "text", tsx: "text", vue: "text", svelte: "text", py: "text",
@@ -75,11 +75,20 @@ const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
 
   mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", aac: "audio/aac",
   flac: "audio/flac", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg",
-  aiff: "audio/aiff",
+  aiff: "audio/aiff", aif: "audio/aiff", caf: "audio/x-caf",
 
   pdf: "application/pdf",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  doc: "application/msword",
+  rtf: "application/rtf",
+  odt: "application/vnd.oasis.opendocument.text",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xls: "application/vnd.ms-excel",
+  ods: "application/vnd.oasis.opendocument.spreadsheet",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   md: "text/markdown", markdown: "text/markdown", txt: "text/plain", log: "text/plain",
-  csv: "text/csv", json: "application/json", yaml: "text/yaml", yml: "text/yaml",
+  csv: "text/csv", tsv: "text/tab-separated-values", psv: "text/plain",
+  json: "application/json", jsonl: "application/json", ndjson: "application/json", yaml: "text/yaml", yml: "text/yaml",
 };
 
 export function extensionOf(name: string): string {

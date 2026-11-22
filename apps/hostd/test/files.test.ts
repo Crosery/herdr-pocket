@@ -192,3 +192,43 @@ test("home and tmpdir extraRoots read agent scratch images while blocking creden
     await assert.rejects(readFileSlice(root, { path: secretPath }, opts), (e) => code(e) === "forbidden");
   }
 });
+
+test("supports expanded video, audio, csv and office document metadata cleanly", async () => {
+  writeFileSync(join(root, "clip.mkv"), Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+  writeFileSync(join(root, "sound.aiff"), Buffer.from("FORM....AIFF"));
+  writeFileSync(join(root, "report.docx"), Buffer.from("PK\x03\x04dummy"));
+  writeFileSync(join(root, "sheet.xlsx"), Buffer.from("PK\x03\x04dummy"));
+  writeFileSync(join(root, "deck.pptx"), Buffer.from("PK\x03\x04dummy"));
+  writeFileSync(join(root, "data.csv"), "a,b\n1,2\n");
+  writeFileSync(join(root, "note.rtf"), String.raw`{\rtf1\ansi Hello \b World\b0\par}`);
+
+  const mkv = await readFileSlice(root, { path: "clip.mkv" });
+  assert.deepEqual([mkv.kind, mkv.mime, mkv.binary], ["video", "video/x-matroska", true]);
+
+  const aiff = await readFileSlice(root, { path: "sound.aiff" });
+  assert.deepEqual([aiff.kind, aiff.mime, aiff.binary], ["audio", "audio/aiff", true]);
+
+  const docx = await readFileSlice(root, { path: "report.docx" });
+  assert.equal(docx.kind, "document");
+  assert.equal(docx.mime, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+  assert.equal(docx.binary, true);
+  assert.ok(docx.base64);
+
+  const xlsx = await readFileSlice(root, { path: "sheet.xlsx" });
+  assert.equal(xlsx.kind, "spreadsheet");
+  assert.equal(xlsx.binary, true);
+  assert.ok(xlsx.base64);
+
+  const pptx = await readFileSlice(root, { path: "deck.pptx" });
+  assert.equal(pptx.kind, "presentation");
+  assert.ok(pptx.base64);
+
+  const csv = await readFileSlice(root, { path: "data.csv" });
+  assert.equal(csv.language, "csv");
+  assert.equal(csv.binary, false);
+
+  const rtf = await readFileSlice(root, { path: "note.rtf" });
+  assert.equal(rtf.kind, "document");
+  assert.equal(rtf.binary, false);
+  assert.ok(rtf.text?.includes("Hello"));
+});

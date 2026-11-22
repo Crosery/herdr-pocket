@@ -21,9 +21,34 @@ import {
 } from "lucide-react";
 import type { Agent, FileEntry, RpcResult } from "@herdr-pocket/protocol";
 import { EmptyState, PocketButton, PocketInput, PocketSelect, overlayStore, useToast } from "../components/PocketUI";
+import { PocketAudioPlayer, PocketVideoPlayer } from "../components/PocketMediaPlayer";
+import {
+  PocketDataGrid,
+  PocketDocViewer,
+  PocketImageViewer,
+  PocketPdfViewer,
+  PocketPptxViewer,
+} from "../components/FilePreviewRenderers";
 import { CookieImportButton } from "../components/CookieImport";
 import { RichMarkdown } from "../lib/markdown";
 import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge";
+import {
+  decodeBase64Fast,
+  estimatePdfPages,
+  parseDelimitedTable,
+  parseDocxBuffer,
+  parseJsonTable,
+  parseLegacyDocFallback,
+  parseLegacyXlsBuffer,
+  parseOdsBuffer,
+  parseOdtBuffer,
+  parsePptxBuffer,
+  parseRtfText,
+  parseXlsxBuffer,
+  type DocPreviewData,
+  type SlidePreviewData,
+  type TablePreviewData,
+} from "../lib/filePreview";
 import { ensureLocalHostDeviceId, localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import {
   canActOnLocalFile,
@@ -96,59 +121,6 @@ function parseLocalFileAddress(raw: string): string | null {
 function toFileUrl(filePath: string): string {
   const norm = filePath.replace(/\\/g, "/");
   return `file://${norm.startsWith("/") ? "" : "/"}${encodeURI(norm)}`;
-}
-
-function parseDelimitedRows(raw: string, delimiter: string, maxRows = 500): { rows: string[][]; truncated: boolean } {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let inQuotes = false;
-  let i = 0;
-  while (i < raw.length) {
-    const ch = raw[i]!;
-    if (inQuotes) {
-      if (ch === '"') {
-        if (raw[i + 1] === '"') {
-          cell += '"';
-          i += 2;
-          continue;
-        }
-        inQuotes = false;
-      } else {
-        cell += ch;
-      }
-      i += 1;
-      continue;
-    }
-    if (ch === '"') {
-      inQuotes = true;
-      i += 1;
-      continue;
-    }
-    if (ch === delimiter) {
-      row.push(cell);
-      cell = "";
-      i += 1;
-      continue;
-    }
-    if (ch === "\n" || ch === "\r") {
-      if (ch === "\r" && raw[i + 1] === "\n") i += 1;
-      row.push(cell);
-      rows.push(row);
-      row = [];
-      cell = "";
-      i += 1;
-      if (rows.length >= maxRows) return { rows, truncated: i < raw.length };
-      continue;
-    }
-    cell += ch;
-    i += 1;
-  }
-  if (cell.length > 0 || row.length > 0) {
-    row.push(cell);
-    rows.push(row);
-  }
-  return { rows, truncated: false };
 }
 
 function fileError(e: unknown): string {
@@ -355,18 +327,32 @@ export function FileViewer({
   const [error, setError] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [streamError, setStreamError] = useState(false);
+  const [fetchedBytes, setFetchedBytes] = useState<Uint8Array | null>(null);
+  const [fetchedSize, setFetchedSize] = useState<number | null>(null);
   const localId = useLocalHostDeviceId();
   const isMd = /\.(md|markdown|mdx)$/i.test(tab.path);
   const isSvg = /\.svg$/i.test(tab.path);
   const isHtml = /\.html?$/i.test(tab.path);
-  const isCsv = /\.(csv|tsv)$/i.test(tab.path);
+  const isCsv = /\.(csv|tsv|psv)$/i.test(tab.path);
+  const isTsv = /\.tsv$/i.test(tab.path);
+  const isPsv = /\.psv$/i.test(tab.path);
+  const isJsonLines = /\.(jsonl|ndjson)$/i.test(tab.path);
   const isJson = /\.json$/i.test(tab.path);
-  const isDelimitedTsv = /\.tsv$/i.test(tab.path);
   const isImageExt = /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i.test(tab.path);
   const isPdfExt = /\.pdf$/i.test(tab.path);
-  const isAudioExt = /\.(mp3|wav|ogg|flac|m4a|aac|opus|weba)$/i.test(tab.path);
-  const isVideoExt = /\.(mp4|webm|mov|m4v)$/i.test(tab.path);
-  const isStreamableBinary = isImageExt || isPdfExt || isAudioExt || isVideoExt;
+  const isAudioExt = /\.(mp3|wav|ogg|flac|m4a|aac|opus|weba|aiff|aif|caf)$/i.test(tab.path);
+  const isVideoExt = /\.(mp4|webm|mov|m4v|mkv|avi|ogv|mpe?g)$/i.test(tab.path);
+  const isDocxExt = /\.docx$/i.test(tab.path);
+  const isDocExt = /\.doc$/i.test(tab.path);
+  const isRtfExt = /\.rtf$/i.test(tab.path);
+  const isOdtExt = /\.odt$/i.test(tab.path);
+  const isXlsxExt = /\.xlsx$/i.test(tab.path);
+  const isXlsExt = /\.xls$/i.test(tab.path);
+  const isOdsExt = /\.ods$/i.test(tab.path);
+  const isPptxExt = /\.pptx$/i.test(tab.path);
+  const isDirectStreamMedia = isImageExt || isAudioExt || isVideoExt;
+  const isDirectFetchBinary =
+    isPdfExt || isDocxExt || isOdtExt || isXlsxExt || isXlsExt || isOdsExt || isPptxExt;
   const isLocalOwner =
     native.available() && ((!agent && Boolean(tab.absPath)) || Boolean(agent && localId && localId === agent.deviceId));
   const platform = detectPlatform();
@@ -400,9 +386,9 @@ export function FileViewer({
     }).catch((e: Error) => toast(e.message || "无法用系统默认应用打开", true));
   };
   const localStreamUrl = useMemo(() => {
-    if (!isLocalOwner || !isStreamableBinary || streamError) return null;
+    if (!isLocalOwner || !(isDirectStreamMedia || isDirectFetchBinary) || streamError) return null;
     return native.localFileStreamUrl(tab.absPath || tab.path, agent?.cwd);
-  }, [agent?.cwd, isLocalOwner, isStreamableBinary, streamError, tab.absPath, tab.path]);
+  }, [agent?.cwd, isDirectFetchBinary, isDirectStreamMedia, isLocalOwner, streamError, tab.absPath, tab.path]);
 
   const prettyJson = useMemo(() => {
     if (!isJson || !text) return null;
@@ -414,32 +400,143 @@ export function FileViewer({
     }
   }, [isJson, text]);
 
-  const csvData = useMemo(() => {
-    if (!isCsv || !text) return null;
-    return parseDelimitedRows(text, isDelimitedTsv ? "\t" : ",", 500);
-  }, [isCsv, isDelimitedTsv, text]);
+  const textTableData = useMemo<TablePreviewData | null>(() => {
+    if (!text) return null;
+    if (isCsv) {
+      const delimiter = isTsv ? "\t" : isPsv ? "|" : undefined;
+      return parseDelimitedTable(text, delimiter, 100_000);
+    }
+    if (isJsonLines) return parseJsonTable(text, true, 50_000);
+    if (isJson) return parseJsonTable(text, false, 50_000);
+    return null;
+  }, [isCsv, isJson, isJsonLines, isPsv, isTsv, text]);
 
+  const rtfDocData = useMemo<DocPreviewData | null>(() => {
+    if (!isRtfExt || !text) return null;
+    return parseRtfText(text);
+  }, [isRtfExt, text]);
+
+  const isTextTable = Boolean(textTableData && (textTableData.sheets[0]?.rows.length ?? 0) > 0);
   const canPreviewText = Boolean(
     data?.text !== undefined &&
-      (isMd || isSvg || isHtml || (isCsv && Boolean(csvData?.rows.length)) || prettyJson !== null),
+      (isMd || isSvg || isHtml || isTextTable || Boolean(rtfDocData) || prettyJson !== null),
   );
-  const previewLabel = isCsv ? "表格" : prettyJson !== null ? "格式化" : "预览";
-  const defaultPreview = !tab.line && (isMd || isSvg || isCsv || isHtml);
+  const previewLabel = isTextTable ? "表格" : prettyJson !== null ? "格式化" : "预览";
+  const defaultPreview = !tab.line && (isMd || isSvg || isCsv || isHtml || isJsonLines || isRtfExt);
   const [preview, setPreview] = useState(() => defaultPreview);
   const targetLineRef = useRef<HTMLDivElement | null>(null);
   const headStateCbRef = useRef(onHeadState);
   headStateCbRef.current = onHeadState;
 
   useEffect(() => {
-    setPreview(!tab.line && (isMd || isSvg || isCsv || isHtml));
-  }, [isCsv, isHtml, isMd, isSvg, tab.line, tab.path]);
+    setPreview(!tab.line && (isMd || isSvg || isCsv || isHtml || isJsonLines || isRtfExt));
+  }, [isCsv, isHtml, isJsonLines, isMd, isRtfExt, isSvg, tab.line, tab.path]);
 
   useEffect(() => {
     setStreamError(false);
+    setFetchedBytes(null);
+    setFetchedSize(null);
   }, [agent?.key, tab.absPath, tab.path]);
 
+  // Decode remote or fallback base64 into Uint8Array once per read
+  const rawBinaryBytes = useMemo(() => {
+    if (fetchedBytes) return fetchedBytes;
+    if (!data?.base64) return null;
+    try {
+      return decodeBase64Fast(data.base64);
+    } catch {
+      return null;
+    }
+  }, [data?.base64, fetchedBytes]);
+
+  const [parsedDoc, setParsedDoc] = useState<DocPreviewData | null>(null);
+  const [parsedSheet, setParsedSheet] = useState<TablePreviewData | null>(null);
+  const [parsedSlides, setParsedSlides] = useState<SlidePreviewData | null>(null);
+  const [binaryParseErr, setBinaryParseErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setBinaryParseErr(null);
+    setParsedDoc((prev) => {
+      prev?.mediaUrls.forEach((u) => URL.revokeObjectURL(u));
+      return null;
+    });
+    setParsedSheet(null);
+    setParsedSlides((prev) => {
+      prev?.mediaUrls.forEach((u) => URL.revokeObjectURL(u));
+      return null;
+    });
+
+    if (!rawBinaryBytes) return;
+
+    const run = async () => {
+      try {
+        if (isXlsxExt) {
+          const parsed = await parseXlsxBuffer(rawBinaryBytes);
+          if (alive) setParsedSheet(parsed);
+        } else if (isXlsExt) {
+          const parsed = parseLegacyXlsBuffer(rawBinaryBytes);
+          if (alive) setParsedSheet(parsed);
+        } else if (isOdsExt) {
+          const parsed = await parseOdsBuffer(rawBinaryBytes);
+          if (alive) setParsedSheet(parsed);
+        } else if (isDocxExt) {
+          const parsed = await parseDocxBuffer(rawBinaryBytes);
+          if (!alive) {
+            parsed.mediaUrls.forEach((u) => URL.revokeObjectURL(u));
+            return;
+          }
+          setParsedDoc(parsed);
+        } else if (isOdtExt) {
+          const parsed = await parseOdtBuffer(rawBinaryBytes);
+          if (!alive) {
+            parsed.mediaUrls.forEach((u) => URL.revokeObjectURL(u));
+            return;
+          }
+          setParsedDoc(parsed);
+        } else if (isDocExt && !data?.previewHtml) {
+          const parsed = parseLegacyDocFallback(rawBinaryBytes);
+          if (alive) setParsedDoc(parsed);
+        } else if (isPptxExt) {
+          const parsed = await parsePptxBuffer(rawBinaryBytes);
+          if (!alive) {
+            parsed.mediaUrls.forEach((u) => URL.revokeObjectURL(u));
+            return;
+          }
+          setParsedSlides(parsed);
+        }
+      } catch (err) {
+        if (alive) setBinaryParseErr((err as Error).message || "文件解析失败");
+      }
+    };
+    void run();
+
+    return () => {
+      alive = false;
+    };
+  }, [data?.previewHtml, isDocExt, isDocxExt, isOdsExt, isOdtExt, isPptxExt, isXlsExt, isXlsxExt, rawBinaryBytes]);
+
+  useEffect(() => {
+    return () => {
+      parsedDoc?.mediaUrls.forEach((u) => URL.revokeObjectURL(u));
+    };
+  }, [parsedDoc]);
+
+  useEffect(() => {
+    return () => {
+      parsedSlides?.mediaUrls.forEach((u) => URL.revokeObjectURL(u));
+    };
+  }, [parsedSlides]);
+
   const blobUrl = useMemo(() => {
-    if (localStreamUrl || !data?.base64 || !data.mime) return null;
+    if (rawBinaryBytes && isPdfExt) {
+      const copy = rawBinaryBytes.buffer.slice(
+        rawBinaryBytes.byteOffset,
+        rawBinaryBytes.byteOffset + rawBinaryBytes.byteLength,
+      ) as ArrayBuffer;
+      return URL.createObjectURL(new Blob([copy], { type: "application/pdf" }));
+    }
+    if ((localStreamUrl && isDirectStreamMedia) || !data?.base64 || !data.mime) return null;
     if (
       data.mime.startsWith("image/") ||
       data.mime === "application/pdf" ||
@@ -447,70 +544,101 @@ export function FileViewer({
       data.mime.startsWith("video/")
     ) {
       try {
-        const bin = atob(data.base64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-        return URL.createObjectURL(new Blob([bytes], { type: data.mime }));
+        const bytes = decodeBase64Fast(data.base64);
+        const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+        return URL.createObjectURL(new Blob([copy], { type: data.mime }));
       } catch {
         return null;
       }
     }
     return null;
-  }, [data?.base64, data?.mime, localStreamUrl]);
+  }, [data?.base64, data?.mime, isDirectStreamMedia, isPdfExt, localStreamUrl, rawBinaryBytes]);
 
   useEffect(() => {
     if (!blobUrl) return;
     return () => URL.revokeObjectURL(blobUrl);
   }, [blobUrl]);
 
+  const pdfPageCount = useMemo(() => {
+    if (!isPdfExt || !rawBinaryBytes) return null;
+    return estimatePdfPages(rawBinaryBytes);
+  }, [isPdfExt, rawBinaryBytes]);
+
   const read = useCallback(
     async (offset: number) => {
       const localPathTarget = tab.absPath || tab.path;
+      const wantBytes = isCsv || isJsonLines || isJson ? 2 * 1024 * 1024 : undefined;
       let res: ReadResult | null = null;
       if (offset === 0 && native.available()) {
         if (!agent && tab.absPath) {
-          res = await native.localReadFile({ path: tab.absPath }).catch(() => null);
+          res = await native.localReadFile({ path: tab.absPath, maxBytes: wantBytes }).catch(() => null);
         } else if (agent) {
           const localId = localHostIdStore.get() ?? (await ensureLocalHostDeviceId());
           if (localId && localId === agent.deviceId) {
-            res = await native.localReadFile({ cwd: agent.cwd, path: localPathTarget }).catch(() => null);
+            res = await native.localReadFile({ cwd: agent.cwd, path: localPathTarget, maxBytes: wantBytes }).catch(() => null);
           }
         }
       }
       if (!res) {
         if (!agent) throw new Error("这个文件所在的 Agent 已经不在了。");
-        res = await rpcCall(agent.deviceId, "files.read", { agent: agent.key, path: tab.path, offset });
+        res = await rpcCall(agent.deviceId, "files.read", {
+          agent: agent.key,
+          path: tab.path,
+          offset,
+          ...(wantBytes ? { maxBytes: wantBytes } : {}),
+        });
       }
       setData(res);
       setText((prev) => (offset ? prev + (res.text ?? "") : (res.text ?? "")));
       return res;
     },
-    [agent, tab.absPath, tab.path],
+    [agent, isCsv, isJson, isJsonLines, tab.absPath, tab.path],
   );
 
   useEffect(() => {
     setData(null);
     setError(null);
     setText("");
-    if (localStreamUrl) return;
+    if (localStreamUrl && isDirectStreamMedia) return;
+    if (localStreamUrl && isDirectFetchBinary) {
+      let alive = true;
+      fetch(localStreamUrl)
+        .then(async (r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const lenHdr = r.headers.get("content-length");
+          const buf = await r.arrayBuffer();
+          if (!alive) return;
+          setFetchedSize(lenHdr ? Number.parseInt(lenHdr, 10) || buf.byteLength : buf.byteLength);
+          setFetchedBytes(new Uint8Array(buf));
+        })
+        .catch(() => {
+          if (!alive) return;
+          read(0).catch((e) => {
+            if (alive) setError(fileError(e));
+          });
+        });
+      return () => {
+        alive = false;
+      };
+    }
     if (!agent && !(tab.absPath && native.available())) {
       setError("这个文件所在的 Agent 已经不在了。");
       return;
     }
     read(0).catch((e) => setError(fileError(e)));
-  }, [agent, localStreamUrl, read, tab.absPath]);
+  }, [agent, isDirectFetchBinary, isDirectStreamMedia, localStreamUrl, read, tab.absPath]);
 
   useEffect(() => {
     headStateCbRef.current?.({
-      size: data?.size ?? null,
-      binary: Boolean(data?.binary),
+      size: data?.size ?? fetchedSize ?? null,
+      binary: Boolean(data?.binary || (isDirectFetchBinary && fetchedBytes)),
       isMd: isMd && data?.text !== undefined,
       canPreview: canPreviewText,
       previewLabel,
       preview,
       setPreview,
     });
-  }, [canPreviewText, data?.binary, data?.size, data?.text, isMd, preview, previewLabel]);
+  }, [canPreviewText, data?.binary, data?.size, data?.text, fetchedBytes, fetchedSize, isDirectFetchBinary, isMd, preview, previewLabel]);
 
   const shownText = preview && prettyJson !== null ? prettyJson : text;
   const codeLines = useMemo(() => (shownText ? shownText.split("\n") : []), [shownText]);
@@ -523,10 +651,31 @@ export function FileViewer({
 
   const hlStart = tab.line;
   const hlEnd = tab.endLine ?? tab.line;
-  const isPdf = data?.mime === "application/pdf" || /\.pdf$/i.test(tab.path);
+  const isPdf = data?.mime === "application/pdf" || isPdfExt;
   const isAudio = data?.kind === "audio" || Boolean(data?.mime?.startsWith("audio/"));
   const isVideo = data?.kind === "video" || Boolean(data?.mime?.startsWith("video/"));
   const isImage = data?.kind === "image" || Boolean(data?.mime?.startsWith("image/"));
+  const isSpreadsheet = data?.kind === "spreadsheet" || isXlsxExt || isXlsExt || isOdsExt;
+  const isRichDoc = data?.kind === "document" || isDocxExt || isDocExt || isOdtExt || isRtfExt;
+  const isPresentation = data?.kind === "presentation" || isPptxExt;
+
+  const compactExternalAction = canRevealLocal ? (
+    <PocketButton size="sm" variant="ghost" onClick={handleOpenDefaultLocal} title="用系统默认应用打开">
+      <ExternalLink size={12} />
+      <span>系统打开</span>
+    </PocketButton>
+  ) : !native.available() && tab.absPath ? (
+    <PocketButton
+      size="sm"
+      variant="ghost"
+      onClick={() => void openExternalUrl(toFileUrl(tab.absPath!))}
+      title="用系统默认应用打开"
+    >
+      <ExternalLink size={12} />
+      <span>系统打开</span>
+    </PocketButton>
+  ) : null;
+
   const binaryActions = canRevealLocal ? (
     <div className="viewer-media-actions">
       <PocketButton size="sm" variant="soft" onClick={handleRevealLocal}>
@@ -545,12 +694,21 @@ export function FileViewer({
     </PocketButton>
   ) : null;
 
+  const effectiveMediaSrc =
+    localStreamUrl && isDirectStreamMedia ? localStreamUrl : blobUrl;
+
   return (
     <div className="viewer">
       {!embedded ? (
         <div className="viewer-head">
           <span className="mono truncate grow" title={tab.absPath || tab.path}>{tab.path}</span>
-          {data ? <span className="faint num">{data.size >= 1024 ? `${Math.round(data.size / 1024)} KB` : `${data.size} B`}</span> : null}
+          {(data?.size ?? fetchedSize) !== null && (data?.size ?? fetchedSize) !== undefined ? (
+            <span className="faint num">
+              {(data?.size ?? fetchedSize)! >= 1024
+                ? `${Math.round((data?.size ?? fetchedSize)! / 1024)} KB`
+                : `${data?.size ?? fetchedSize} B`}
+            </span>
+          ) : null}
           {canPreviewText ? (
             <div className="segmented">
               <button className={preview ? "active" : ""} onClick={() => setPreview(true)}>{previewLabel}</button>
@@ -585,50 +743,71 @@ export function FileViewer({
       <div className="viewer-body">
         {error ? (
           <div className="inline-alert" style={{ margin: 16 }}>{error}</div>
-        ) : localStreamUrl && isPdfExt ? (
-          <iframe src={localStreamUrl} className="viewer-pdf-frame" title={tab.title} onError={() => setStreamError(true)} />
-        ) : localStreamUrl && isAudioExt ? (
+        ) : effectiveMediaSrc && (isVideo || isVideoExt) ? (
+          <PocketVideoPlayer
+            src={effectiveMediaSrc}
+            title={tab.title}
+            onError={localStreamUrl && isDirectStreamMedia ? () => setStreamError(true) : undefined}
+            extraActions={compactExternalAction}
+          />
+        ) : effectiveMediaSrc && (isAudio || isAudioExt) ? (
           <div className="viewer-media">
-            <div className="viewer-media-title truncate">{tab.title}</div>
-            <audio controls src={localStreamUrl} onError={() => setStreamError(true)} />
+            <PocketAudioPlayer
+              src={effectiveMediaSrc}
+              title={tab.title}
+              onError={localStreamUrl && isDirectStreamMedia ? () => setStreamError(true) : undefined}
+              extraActions={compactExternalAction}
+            />
           </div>
-        ) : localStreamUrl && isVideoExt ? (
-          <div className="viewer-media">
-            <video controls src={localStreamUrl} onError={() => setStreamError(true)} />
-          </div>
-        ) : localStreamUrl && isImageExt ? (
-          <div className="viewer-image">
-            <img src={localStreamUrl} alt={tab.title} onError={() => setStreamError(true)} />
-          </div>
-        ) : !data ? (
+        ) : effectiveMediaSrc && (isImage || isImageExt) ? (
+          <PocketImageViewer
+            src={effectiveMediaSrc}
+            alt={tab.title}
+            onError={localStreamUrl && isDirectStreamMedia ? () => setStreamError(true) : undefined}
+            actions={compactExternalAction}
+          />
+        ) : !data && !fetchedBytes ? (
           <div className="faint" style={{ padding: 16 }}>读取中…</div>
         ) : blobUrl && isPdf ? (
-          <iframe src={blobUrl} className="viewer-pdf-frame" title={tab.title} />
-        ) : blobUrl && isAudio ? (
+          <PocketPdfViewer
+            url={blobUrl}
+            pageCount={pdfPageCount}
+            title={tab.title}
+            actions={compactExternalAction}
+          />
+        ) : parsedSheet ? (
+          <PocketDataGrid data={parsedSheet} actions={compactExternalAction} />
+        ) : isRichDoc && (preview || !data?.text) && (parsedDoc || (isRtfExt && rtfDocData) || data?.previewHtml) ? (
+          <PocketDocViewer
+            doc={isRtfExt ? (rtfDocData ?? parsedDoc) : parsedDoc}
+            previewHtml={data?.previewHtml}
+            fileName={tab.title}
+            formatLabel={
+              isDocxExt ? "Word (.docx)" : isDocExt ? "Word (.doc)" : isOdtExt ? "OpenDocument (.odt)" : "RTF 文档"
+            }
+            actions={compactExternalAction}
+          />
+        ) : isPresentation && parsedSlides ? (
+          <PocketPptxViewer data={parsedSlides} actions={compactExternalAction} />
+        ) : binaryParseErr && !data?.text ? (
           <div className="viewer-media">
-            <div className="viewer-media-title truncate">{tab.title}</div>
-            <audio controls src={blobUrl} />
+            <div className="faint">无法直接解析该文件（{binaryParseErr}）。</div>
+            {binaryActions}
           </div>
-        ) : blobUrl && isVideo ? (
-          <div className="viewer-media">
-            <video controls src={blobUrl} />
-          </div>
-        ) : blobUrl && isImage ? (
-          <div className="viewer-image">
-            <img src={blobUrl} alt={tab.title} />
-          </div>
-        ) : data.base64 && data.mime ? (
-          <div className="viewer-image">
-            <img src={`data:${data.mime};base64,${data.base64}`} alt={tab.title} />
-          </div>
-        ) : data.binary && (isImage || isPdf || isAudio || isVideo) && data.truncated ? (
+        ) : data?.base64 && data.mime?.startsWith("image/") ? (
+          <PocketImageViewer
+            src={`data:${data.mime};base64,${data.base64}`}
+            alt={tab.title}
+            actions={compactExternalAction}
+          />
+        ) : data?.binary && (isImage || isPdf || isAudio || isVideo || isSpreadsheet || isRichDoc || isPresentation) && data.truncated ? (
           <div className="viewer-media">
             <div className="faint">
-              这个{isPdf ? " PDF " : isAudio || isVideo ? "音视频" : "图片"}文件超过预览大小上限，无法直接内联加载。
+              这个{isPdf ? " PDF " : isAudio || isVideo ? "音视频" : isSpreadsheet ? "表格" : isRichDoc || isPresentation ? "文档" : "图片"}文件超过预览大小上限，无法直接内联加载。
             </div>
             {binaryActions}
           </div>
-        ) : data.binary ? (
+        ) : data?.binary && !data.text ? (
           <div className="viewer-media">
             <div className="faint">这是二进制文件，没法按文字显示。</div>
             {binaryActions}
@@ -638,35 +817,15 @@ export function FileViewer({
             <RichMarkdown text={text} onOpenFile={(target) => void openAgentFileTarget(agent, target)} />
           </div>
         ) : preview && isSvg ? (
-          <div className="viewer-image">
-            <img src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(text)}`} alt={tab.title} />
-          </div>
+          <PocketImageViewer
+            src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(text)}`}
+            alt={tab.title}
+            actions={compactExternalAction}
+          />
         ) : preview && isHtml ? (
           <iframe sandbox="" srcDoc={text} className="viewer-html-frame" title={tab.title} />
-        ) : preview && isCsv && csvData && csvData.rows.length > 0 ? (
-          <div className="viewer-table-wrap">
-            <table className="viewer-table">
-              <thead>
-                <tr>
-                  {csvData.rows[0]!.map((col, ci) => (
-                    <th key={ci}>{col || `列 ${ci + 1}`}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {csvData.rows.slice(1).map((r, ri) => (
-                  <tr key={ri}>
-                    {csvData.rows[0]!.map((_, ci) => (
-                      <td key={ci}>{r[ci] ?? ""}</td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {csvData.truncated ? (
-              <div className="faint" style={{ padding: "8px 12px" }}>表格已截断，仅展示前 500 行；可切到“源码”查看原文。</div>
-            ) : null}
-          </div>
+        ) : preview && isTextTable && textTableData ? (
+          <PocketDataGrid data={textTableData} actions={compactExternalAction} />
         ) : hlStart !== undefined && codeLines.length <= 5000 ? (
           <div className="code-lines">
             {codeLines.map((lineText, idx) => {

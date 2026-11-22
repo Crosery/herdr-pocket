@@ -810,6 +810,7 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
         tauri::http::Response::builder()
             .status(status)
             .header("cache-control", "no-store")
+            .header("access-control-allow-origin", "*")
             .body(Vec::new())
             .unwrap()
     };
@@ -885,6 +886,11 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
             .header("accept-ranges", "bytes")
             .header("content-length", "0")
             .header("cache-control", "private, max-age=60")
+            .header("access-control-allow-origin", "*")
+            .header(
+                "access-control-expose-headers",
+                "content-length, content-range, accept-ranges, content-type",
+            )
             .body(Vec::new())
             .unwrap();
     }
@@ -912,6 +918,11 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
                         .header("content-range", format!("bytes {start}-{end}/{total}"))
                         .header("content-length", buf.len().to_string())
                         .header("cache-control", "private, max-age=60")
+                        .header("access-control-allow-origin", "*")
+                        .header(
+                            "access-control-expose-headers",
+                            "content-length, content-range, accept-ranges, content-type",
+                        )
                         .body(buf)
                         .unwrap();
                 }
@@ -919,6 +930,7 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
                     return tauri::http::Response::builder()
                         .status(416)
                         .header("content-range", format!("bytes */{total}"))
+                        .header("access-control-allow-origin", "*")
                         .body(Vec::new())
                         .unwrap();
                 }
@@ -935,6 +947,11 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
         .header("accept-ranges", "bytes")
         .header("content-length", bytes.len().to_string())
         .header("cache-control", "private, max-age=60")
+        .header("access-control-allow-origin", "*")
+        .header(
+            "access-control-expose-headers",
+            "content-length, content-range, accept-ranges, content-type",
+        )
         .body(bytes)
         .unwrap()
 }

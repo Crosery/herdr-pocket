@@ -3,11 +3,15 @@
 // real location (symlinks followed) and checked to be inside the folder's real location. Files that
 // may hold keys are listed but never read, and so is this computer's own herdr-pocket folder.
 
+import { execFile } from "node:child_process";
 import { open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
+import { promisify } from "node:util";
 import { FILES_IGNORED, FILES_LIMITS, type FileEntry, type RpcResult } from "@herdr-pocket/protocol";
 import { annotateEntriesGitStatus } from "./git.ts";
+
+const execFileAsync = promisify(execFile);
 
 export type FilesErrorCode = "bad_request" | "forbidden" | "not_found";
 
@@ -31,6 +35,7 @@ const IMAGE_MIME: Record<string, string> = {
   webp: "image/webp",
   bmp: "image/bmp",
   ico: "image/x-icon",
+  avif: "image/avif",
 };
 
 const MEDIA_MIME: Record<string, { mime: string; kind: "pdf" | "audio" | "video" }> = {
@@ -43,22 +48,42 @@ const MEDIA_MIME: Record<string, { mime: string; kind: "pdf" | "audio" | "video"
   aac: { mime: "audio/aac", kind: "audio" },
   opus: { mime: "audio/opus", kind: "audio" },
   weba: { mime: "audio/webm", kind: "audio" },
+  aiff: { mime: "audio/aiff", kind: "audio" },
+  aif: { mime: "audio/aiff", kind: "audio" },
+  caf: { mime: "audio/x-caf", kind: "audio" },
   mp4: { mime: "video/mp4", kind: "video" },
   webm: { mime: "video/webm", kind: "video" },
   mov: { mime: "video/quicktime", kind: "video" },
   m4v: { mime: "video/x-m4v", kind: "video" },
+  mkv: { mime: "video/x-matroska", kind: "video" },
+  avi: { mime: "video/x-msvideo", kind: "video" },
+  ogv: { mime: "video/ogg", kind: "video" },
+  mpg: { mime: "video/mpeg", kind: "video" },
+  mpeg: { mime: "video/mpeg", kind: "video" },
+};
+
+const OFFICE_MIME: Record<string, { mime: string; kind: "document" | "spreadsheet" | "presentation" }> = {
+  docx: { mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", kind: "document" },
+  doc: { mime: "application/msword", kind: "document" },
+  rtf: { mime: "application/rtf", kind: "document" },
+  odt: { mime: "application/vnd.oasis.opendocument.text", kind: "document" },
+  xlsx: { mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", kind: "spreadsheet" },
+  xls: { mime: "application/vnd.ms-excel", kind: "spreadsheet" },
+  ods: { mime: "application/vnd.oasis.opendocument.spreadsheet", kind: "spreadsheet" },
+  pptx: { mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation", kind: "presentation" },
 };
 
 const MEDIA_MAX_BYTES = 64 * 1024 * 1024;
+const OFFICE_MAX_BYTES = 32 * 1024 * 1024;
 
 const LANGUAGE: Record<string, string> = {
   ts: "ts", mts: "ts", cts: "ts", tsx: "tsx", js: "js", mjs: "js", cjs: "js", jsx: "jsx",
   py: "py", rs: "rs", go: "go", java: "java", kt: "kt", kts: "kt", swift: "swift", c: "c", h: "c",
   cc: "cpp", cpp: "cpp", cxx: "cpp", hpp: "cpp", cs: "cs", rb: "rb", php: "php", lua: "lua",
   sh: "sh", bash: "sh", zsh: "sh", fish: "sh", ps1: "ps1", bat: "bat", cmd: "bat",
-  md: "md", markdown: "md", json: "json", jsonc: "json", json5: "json", yaml: "yaml", yml: "yaml",
+  md: "md", markdown: "md", json: "json", jsonc: "json", json5: "json", jsonl: "json", ndjson: "json", yaml: "yaml", yml: "yaml",
   toml: "toml", ini: "ini", xml: "xml", html: "html", htm: "html", css: "css", scss: "scss", less: "less",
-  sql: "sql", vue: "vue", svelte: "svelte", ets: "ts", dart: "dart", gradle: "gradle", svg: "xml", txt: "text", log: "text",
+  sql: "sql", vue: "vue", svelte: "svelte", ets: "ts", dart: "dart", gradle: "gradle", svg: "xml", csv: "csv", tsv: "csv", psv: "csv", txt: "text", log: "text",
 };
 
 const LANGUAGE_BY_NAME: Record<string, string> = { dockerfile: "dockerfile", makefile: "makefile", "cmakelists.txt": "cmake" };
@@ -277,6 +302,43 @@ export async function readFileSlice(
       const buf = Buffer.alloc(size);
       const { bytesRead } = await fh.read(buf, 0, size, 0);
       return { ...base, binary: true, kind: media.kind, truncated: false, offset: 0, bytes: bytesRead, mime: media.mime, base64: buf.subarray(0, bytesRead).toString("base64") };
+    }
+    const office = OFFICE_MIME[ext];
+    if (office) {
+      if (size > OFFICE_MAX_BYTES) return { ...base, binary: true, kind: office.kind, truncated: true, offset: 0, bytes: 0, mime: office.mime };
+      const buf = Buffer.alloc(size);
+      const { bytesRead } = await fh.read(buf, 0, size, 0);
+      const slice = buf.subarray(0, bytesRead);
+      let text: string | undefined;
+      if (ext === "rtf" && !looksBinary(slice.subarray(0, Math.min(SNIFF_BYTES, slice.length)))) {
+        const cap = Math.min(bytesRead, maxBytes);
+        text = new TextDecoder("utf-8").decode(slice.subarray(0, utf8Cut(slice, cap)));
+      }
+      let previewHtml: string | undefined;
+      if (process.platform === "darwin" && (ext === "doc" || ext === "rtf" || ext === "odt")) {
+        try {
+          const { stdout } = await execFileAsync("/usr/bin/textutil", ["-convert", "html", "-stdout", real], {
+            timeout: 3500,
+            maxBuffer: 8 * 1024 * 1024,
+            encoding: "utf8",
+          });
+          if (typeof stdout === "string" && stdout.trim()) previewHtml = stdout;
+        } catch {
+          // Non-fatal: client falls back to pure-TS binary/RTF parser.
+        }
+      }
+      return {
+        ...base,
+        binary: ext !== "rtf" || text === undefined,
+        kind: office.kind,
+        truncated: false,
+        offset: 0,
+        bytes: bytesRead,
+        mime: office.mime,
+        base64: slice.toString("base64"),
+        ...(text !== undefined ? { text } : {}),
+        ...(previewHtml !== undefined ? { previewHtml } : {}),
+      };
     }
     const sniff = Buffer.alloc(Math.min(SNIFF_BYTES, size));
     const sniffed = (await fh.read(sniff, 0, sniff.length, 0)).bytesRead;

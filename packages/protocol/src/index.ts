@@ -588,7 +588,7 @@ export interface RpcMethods {
       size: number;
       mtime: number;
       binary: boolean;
-      kind?: "text" | "image" | "pdf" | "audio" | "video" | "binary";
+      kind?: "text" | "image" | "pdf" | "audio" | "video" | "document" | "spreadsheet" | "presentation" | "binary";
       /** More of the file after what was sent; ask again with `offset` + the bytes received. */
       truncated: boolean;
       offset: number;
@@ -597,6 +597,8 @@ export interface RpcMethods {
       text?: string;
       base64?: string;
       mime?: string;
+      /** Optional host-converted HTML preview (e.g. legacy `.doc` / `.rtf` via macOS textutil). */
+      previewHtml?: string;
       /** Highlighting hint from the extension: ts, tsx, py, rs, go, md, json, sh, ... */
       language?: string;
     };

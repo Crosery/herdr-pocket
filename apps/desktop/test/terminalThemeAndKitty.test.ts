@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { configKeySpec } from "@herdr-pocket/protocol";
 import {
@@ -212,4 +213,11 @@ test("deleteKittyPlacementsScoped d=i/I and d=p/P filter accurately and evict on
   const dpLower = deleteKittyPlacementsScoped(all, false, { deleteWhat: "p", id: 8, placementId: 1 }, 0, 0);
   assert.deepEqual(dpLower.placements, [p1a, p1b]);
   assert.deepEqual(dpLower.evictAssetIds, []);
+});
+
+test("TerminalSurface keeps customGlyphs enabled across both light and dark modes", () => {
+  const src = readFileSync(new URL("../src/components/TerminalSurface.tsx", import.meta.url), "utf8");
+  assert.ok(src.includes("customGlyphs: true"), "XTerm initialization must enable customGlyphs");
+  assert.ok(src.includes("term.options.customGlyphs = true"), "live option updates must keep customGlyphs enabled");
+  assert.equal(/customGlyphs\s*[:=]\s*(?:false|activeSpec\.mode)/.test(src), false);
 });

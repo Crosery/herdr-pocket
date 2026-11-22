@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronLeft, ChevronRight, Folder, Play, X } from "lucide-react";
 import { overlayStore } from "../components/PocketUI";
+import { PocketAudioPlayer, PocketVideoPlayer } from "./PocketMediaPlayer";
 import {
   KIND_TEXT_ZH,
   formatDropBytes,
@@ -95,17 +96,13 @@ function DropLightbox({ item, onClose }: { item: StagedAttachment; onClose: () =
     }
     if (item.kind === "video" && item.previewUrl) {
       return (
-        <video className="hp-drop-stage-video" src={item.previewUrl} controls autoPlay playsInline>
-          当前浏览器不支持播放这个视频。
-        </video>
+        <div className="hp-drop-stage-video" style={{ width: "min(960px, 90vw)", height: "min(72vh, 640px)", borderRadius: 12, overflow: "hidden" }}>
+          <PocketVideoPlayer src={item.previewUrl} title={item.name} autoPlay />
+        </div>
       );
     }
     if (item.kind === "audio" && item.previewUrl) {
-      return (
-        <audio className="hp-drop-stage-audio" src={item.previewUrl} controls autoPlay>
-          当前浏览器不支持播放这段音频。
-        </audio>
-      );
+      return <PocketAudioPlayer src={item.previewUrl} title={item.name} autoPlay />;
     }
     if (item.kind === "pdf" && item.previewUrl) {
       return <iframe className="hp-drop-stage-frame" src={item.previewUrl} title={item.name} />;

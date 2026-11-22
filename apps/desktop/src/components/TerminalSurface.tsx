@@ -884,7 +884,7 @@ export function TerminalSurface({
       term.options.fontWeight = termCfg.fontWeight as 300 | 400 | 500 | 600 | 700;
       term.options.fontWeightBold = Math.min(900, Math.max(700, termCfg.fontWeight + 200)) as 700 | 800 | 900;
       term.options.cursorBlink = termCfg.cursorBlink;
-      term.options.customGlyphs = activeSpec.mode === "dark";
+      term.options.customGlyphs = true;
       term.options.theme = activeSpec.theme;
       term.options.minimumContrastRatio = activeSpec.minimumContrastRatio;
       for (const entry of overlayNodesRef.current.values()) {
@@ -916,7 +916,7 @@ export function TerminalSurface({
       allowProposedApi: true,
       cursorBlink: termCfg.cursorBlink,
       cursorStyle: "block",
-      customGlyphs: activeSpec.mode === "dark",
+      customGlyphs: true,
       rescaleOverlappingGlyphs: true,
       fontFamily,
       fontSize: termCfg.fontSize,
@@ -971,17 +971,28 @@ export function TerminalSurface({
     refreshCachedCellSize(term);
 
     let webglAddon: WebglAddon | null = null;
-    try {
-      const gl = new WebglAddon();
-      gl.onContextLoss(() => {
-        gl.dispose();
-        if (webglAddon === gl) webglAddon = null;
-      });
-      term.loadAddon(gl);
-      webglAddon = gl;
-    } catch {
-      // Fallback cleanly to xterm default renderer when WebGL2 is unavailable.
-    }
+    let webglRetries = 0;
+    let webglRetryTimer = 0;
+    const mountWebgl = () => {
+      if (!alive || webglAddon || termRef.current !== term) return;
+      try {
+        const gl = new WebglAddon();
+        gl.onContextLoss(() => {
+          gl.dispose();
+          if (webglAddon === gl) webglAddon = null;
+          if (alive && webglRetries < 3) {
+            webglRetries += 1;
+            window.clearTimeout(webglRetryTimer);
+            webglRetryTimer = window.setTimeout(mountWebgl, 300);
+          }
+        });
+        term.loadAddon(gl);
+        webglAddon = gl;
+      } catch {
+        // Fallback cleanly to xterm default renderer when WebGL2 is unavailable.
+      }
+    };
+    mountWebgl();
 
     // Ensure OS / Herdr / Nerd fonts load asynchronously right after opening.
     void ensureFontCatalog().then(() => ensureTerminalFontLoaded(termCfg.fontFamily, termCfg.fontWeight >= 600)).then((loaded) => {
@@ -2151,6 +2162,7 @@ export function TerminalSurface({
       alive = false;
       window.clearTimeout(seedTimer);
       window.clearTimeout(resizeTimer);
+      window.clearTimeout(webglRetryTimer);
       flushMicroQueued = false;
       overlayMicroQueued = false;
       if (flushRaf) {
