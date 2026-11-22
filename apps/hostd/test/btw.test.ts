@@ -11,6 +11,7 @@ import {
   buildTranscript,
   CODEX_DISABLED_FEATURES,
   defaultRunner,
+  describeTool,
   framedQuestion,
   OMP_FORK_OPTIONS,
   OMP_RESULT_MARKER,
@@ -19,6 +20,7 @@ import {
   PI_ISOLATION_FLAGS,
   preferredBinariesForHarness,
   readJsonlTranscript,
+  resolveWindowsCmdJsTarget,
   SIDE_ANSWER_MAX_CHARS,
   sideAnswerPolicy,
   TERMINAL_IDENTITY_ENV,
@@ -584,20 +586,29 @@ test("defaultRunner avoids shell expansion, delivers stdin safely, enforces exit
   const graceStart = Date.now();
   const graceRes = await defaultRunner({
     binary: "claude",
-    binPath: "/bin/sh",
-    args: ["-c", "(sleep 10) >/dev/null 2>&1 & echo early-exit; exit 0"],
+    binPath: process.execPath,
+    args: [
+      "-e",
+      [
+        'const { spawn } = require("node:child_process");',
+        'const fs = require("node:fs");',
+        'spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { stdio: ["ignore", "inherit", "inherit"] });',
+        'fs.writeSync(1, "early-exit\\n");',
+        "process.exit(0);",
+      ].join(" "),
+    ],
     timeoutMs: 10_000,
     exitGraceMs: 80,
   });
   assert.equal(graceRes.timedOut, false);
   assert.ok(graceRes.stdout.includes("early-exit"));
-  assert.ok(Date.now() - graceStart < 2000);
+  assert.ok(Date.now() - graceStart < 2500);
 
   // 3. Timeout kills child process tree cleanly.
   const toRes = await defaultRunner({
     binary: "claude",
-    binPath: "/bin/sh",
-    args: ["-c", "sleep 10"],
+    binPath: process.execPath,
+    args: ["-e", "setTimeout(() => {}, 10000)"],
     timeoutMs: 60,
     exitGraceMs: 50,
   });
@@ -731,10 +742,10 @@ test("readJsonlTranscript parses Claude, OMP/Pi, and Codex JSONL formats and pi/
 
 test("defaultRunner executes real fake codex CLI end-to-end with stdin and JSONL parsing", async () => {
   await withTempDir("btw-real-spawn-", async (dir) => {
-    const fakeCodex = join(dir, "codex");
+    const fakeCodex = join(dir, "codex.cjs");
     writeFileSync(
       fakeCodex,
-      `#!${process.execPath}\nconst fs = require("node:fs");\nconst stdin = fs.readFileSync(0, "utf8");\nconsole.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: stdin.includes("REAL_SPAWN_SNAPSHOT") ? "spawn-ok" : "missing" } }));\n`,
+      `const fs = require("node:fs");\nconst stdin = fs.readFileSync(0, "utf8");\nconsole.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: stdin.includes("REAL_SPAWN_SNAPSHOT") ? "spawn-ok" : "missing" } }));\n`,
       { mode: 0o755 },
     );
 
@@ -750,6 +761,67 @@ test("defaultRunner executes real fake codex CLI end-to-end with stdin and JSONL
 
     assert.equal(res.answer, "spawn-ok");
     assert.equal(res.model, "codex");
+  });
+});
+
+test("describeTool normalizes Windows backslashes and drive-letter casing", () => {
+  assert.equal(
+    describeTool("Read", { file_path: "C:\\Users\\alice\\repo\\src\\main.ts" }, "C:\\Users\\alice\\repo").text,
+    "读取 src/main.ts",
+  );
+  assert.equal(
+    describeTool("Edit", { file_path: "c:\\Users\\alice\\repo\\apps\\app.ts" }, "C:\\Users\\alice\\repo").text,
+    "修改 apps/app.ts",
+  );
+  assert.equal(
+    describeTool("Read", { file_path: "D:\\work\\other\\sub\\file.ts" }, "C:\\Users\\alice\\repo").text,
+    "读取 …/sub/file.ts",
+  );
+});
+
+test("resolveWindowsCmdJsTarget unwraps npm/pnpm .cmd shims and defaultRunner runs JS entrypoints directly", async () => {
+  await withTempDir("btw-cmd-shim-", async (dir) => {
+    const pkgDir = join(dir, "node_modules", "@pkg");
+    mkdirSync(pkgDir, { recursive: true });
+    const cliPath = join(pkgDir, "cli.cjs");
+    writeFileSync(
+      cliPath,
+      'const fs = require("node:fs");\nconst stdin = fs.readFileSync(0, "utf8");\nconsole.log(JSON.stringify({ ok: stdin.includes("CMD_SNAP"), argv: process.argv.slice(2) }));\n',
+      "utf8",
+    );
+
+    const cmdPath = join(dir, "claude.cmd");
+    writeFileSync(
+      cmdPath,
+      '@ECHO off\r\nIF EXIST "%dp0%\\node.exe" (\r\n  "%dp0%\\node.exe" "%dp0%\\node_modules\\@pkg\\cli.cjs" %*\r\n) ELSE (\r\n  "%~dp0\\node_modules\\@pkg\\cli.cjs" %*\r\n)\r\n',
+      "utf8",
+    );
+
+    assert.equal(resolveWindowsCmdJsTarget(cmdPath), cliPath);
+    assert.equal(resolveWindowsCmdJsTarget(cliPath), null);
+
+    const brokenCmd = join(dir, "broken.cmd");
+    writeFileSync(brokenCmd, '"%dp0%\\node_modules\\missing\\cli.js" %*\r\n', "utf8");
+    assert.equal(resolveWindowsCmdJsTarget(brokenCmd), null);
+
+    const runRes = await defaultRunner({
+      binary: "claude",
+      binPath: cmdPath,
+      args: ["--flag", "val"],
+      stdin: "CMD_SNAP",
+    });
+    assert.equal(runRes.code, 0);
+    assert.deepEqual(JSON.parse(runRes.stdout.trim()), { ok: true, argv: ["--flag", "val"] });
+
+    await assert.rejects(
+      () =>
+        defaultRunner({
+          binary: "claude",
+          binPath: join(dir, "missing.cjs"),
+          args: [],
+        }),
+      (err: unknown) => (err as { code?: string }).code === "ENOENT",
+    );
   });
 });
 

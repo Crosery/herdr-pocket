@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { accessSync, closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { lstat, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, join, relative, resolve } from "node:path";
+import { delimiter, dirname, join, posix as posixPath, resolve } from "node:path";
 import type { Agent, ConvEvent } from "@herdr-pocket/protocol";
 import { findPrograms } from "./create.ts";
 import type { UnifloAdapter, UnifloSession } from "./uniflo.ts";
@@ -286,9 +286,67 @@ export function killProcessTree(pid: number, child?: { kill(signal?: NodeJS.Sign
   escalation.unref?.();
 }
 
+const WINDOWS_CMD_EXT_RE = /\.(?:cmd|bat)$/i;
+const WINDOWS_JS_ENTRY_RE = /\.(?:c|m)?js$/i;
+const WINDOWS_CMD_DP0_JS_RE = /"%(?:~)?dp0%[\\/]([^"\r\n]+?\.(?:c|m)?js)"|%(?:~)?dp0%[\\/]([^\s"\r\n]+?\.(?:c|m)?js)/gi;
+
 /**
- * Spawns a CLI without a shell, feeds `stdin`, enforces `timeoutMs` and a post-exit
- * `exitGraceMs` pipe drain, and kills the entire process group/tree on timeout or abort.
+ * Resolves an npm/pnpm `.cmd` or `.bat` wrapper on Windows to its underlying `.js`/`.cjs`/`.mjs`
+ * entrypoint relative to the wrapper directory (`%dp0%` / `%~dp0`), avoiding `cmd.exe` spawns.
+ */
+export function resolveWindowsCmdJsTarget(binPath: string): string | null {
+  if (!WINDOWS_CMD_EXT_RE.test(binPath)) return null;
+  let content = "";
+  let fd: number | null = null;
+  try {
+    fd = openSync(binPath, "r");
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size <= 0) return null;
+    const cap = Math.min(st.size, 8192);
+    const buf = Buffer.allocUnsafe(cap);
+    const bytesRead = readSync(fd, buf, 0, cap, 0);
+    content = buf.subarray(0, bytesRead).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore close failure
+      }
+    }
+  }
+
+  const dirs = [dirname(binPath)];
+  const realDir = safeRealpath(binPath);
+  if (realDir) {
+    const d = dirname(realDir);
+    if (d !== dirs[0]) dirs.push(d);
+  }
+
+  for (const match of content.matchAll(WINDOWS_CMD_DP0_JS_RE)) {
+    const rawRel = (match[1] ?? match[2] ?? "").replace(/\\/g, "/");
+    if (!rawRel) continue;
+    for (const baseDir of dirs) {
+      const candidate = resolve(baseDir, rawRel);
+      if (isRegularFile(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function windowsCandidateNames(base: string): string[] {
+  return process.platform === "win32" ? [`${base}.exe`, `${base}.cmd`, `${base}.bat`] : [base];
+}
+
+function makeEnoentError(binPath: string): Error & { code: string } {
+  return Object.assign(new Error(`spawn ${binPath} ENOENT`), { code: "ENOENT" });
+}
+
+/**
+ * Spawns a CLI without a shell (or routes npm `.cmd`/`.js` entrypoints through Node), feeds
+ * `stdin`, enforces `timeoutMs` and a post-exit `exitGraceMs` pipe drain, and kills the tree.
  */
 export function defaultRunner(req: BtwRunnerRequest, fallbackTimeoutMs = DEFAULT_TIMEOUT_MS): Promise<BtwRunnerResult> {
   const started = Date.now();
@@ -310,14 +368,35 @@ export function defaultRunner(req: BtwRunnerRequest, fallbackTimeoutMs = DEFAULT
 
   return new Promise((resolveRun, rejectRun) => {
     const spawnCwd = req.cwd && existsSync(req.cwd) ? req.cwd : undefined;
+    const resolvedBin = resolveWindowsCmdJsTarget(req.binPath) ?? req.binPath;
+    let execPath = resolvedBin;
+    let execArgs = req.args;
+    let useShell = false;
+
+    if (WINDOWS_JS_ENTRY_RE.test(resolvedBin)) {
+      if (!isRegularFile(resolvedBin)) {
+        rejectRun(makeEnoentError(resolvedBin));
+        return;
+      }
+      execPath = process.execPath;
+      execArgs = [resolvedBin, ...req.args];
+    } else if (process.platform === "win32" && WINDOWS_CMD_EXT_RE.test(resolvedBin)) {
+      if (!isRegularFile(resolvedBin)) {
+        rejectRun(makeEnoentError(resolvedBin));
+        return;
+      }
+      useShell = true;
+    }
+
     let child: ChildProcess;
     try {
-      child = spawn(req.binPath, req.args, {
+      child = spawn(execPath, execArgs, {
         ...(spawnCwd ? { cwd: spawnCwd } : {}),
         env: req.env ?? process.env,
         stdio: ["pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
         windowsHide: true,
+        ...(useShell ? { shell: true } : {}),
       });
     } catch (err) {
       rejectRun(err);
@@ -551,12 +630,19 @@ function fieldOf(input: unknown, ...names: string[]): string | null {
   return null;
 }
 
+function normalizeSlashes(p: string): string {
+  return p.replace(/\\/g, "/").replace(/^[A-Za-z]:(?=\/)/, (d) => d.toLowerCase());
+}
+
 function shortPath(path: string, cwd: string | null): string {
-  if (cwd && path.startsWith(cwd)) {
-    const rel = relative(cwd, path);
+  const normPath = normalizeSlashes(path);
+  const normCwd = cwd ? normalizeSlashes(cwd) : null;
+  if (normCwd && normPath.startsWith(normCwd)) {
+    const rel = posixPath.relative(normCwd, normPath);
     if (rel && !rel.startsWith("..")) return rel;
   }
-  return path.split("/").length > 3 ? `…/${path.split("/").slice(-2).join("/")}` : path;
+  const parts = path.replace(/\\/g, "/").split("/");
+  return parts.length > 3 ? `…/${parts.slice(-2).join("/")}` : path;
 }
 
 function patchPaths(text: string): string[] {
@@ -1320,20 +1406,23 @@ const NATIVE_CODEX_PACKAGES: Record<string, [string, string]> = {
   "darwin-x64": ["@openai/codex-darwin-x64", "x86_64-apple-darwin"],
   "linux-arm64": ["@openai/codex-linux-arm64", "aarch64-unknown-linux-musl"],
   "linux-x64": ["@openai/codex-linux-x64", "x86_64-unknown-linux-musl"],
+  "win32-x64": ["@openai/codex-win32-x64", "x86_64-pc-windows-msvc"],
+  "win32-arm64": ["@openai/codex-win32-arm64", "aarch64-pc-windows-msvc"],
 };
 
 function nativeCodexFromNpmEntry(entry: string): string | null {
   const pkg = NATIVE_CODEX_PACKAGES[`${process.platform}-${process.arch}`];
   if (!pkg) return null;
   const codexPkg = dirname(dirname(entry));
-  const tail = join(pkg[0], "vendor", pkg[1], "bin", "codex");
+  const binName = process.platform === "win32" ? "codex.exe" : "codex";
+  const tail = join(pkg[0], "vendor", pkg[1], "bin", binName);
   for (const cand of [join(codexPkg, "node_modules", tail), join(dirname(dirname(codexPkg)), tail)]) {
     if (isExecutableFile(cand)) return cand;
   }
   return null;
 }
 
-/** Resolves the native `codex` binary, skipping `cmux` wrappers and resolving npm `.js` shims. */
+/** Resolves the native `codex` binary, skipping `cmux` wrappers and resolving npm `.js`/`.cmd` shims. */
 export function resolveCodexBin(
   foundPath?: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -1342,9 +1431,12 @@ export function resolveCodexBin(
   const inspectCandidate = (cand: string): string | null => {
     const real = safeRealpath(cand) ?? cand;
     if (/cmux/i.test(real) || /cmux/i.test(cand)) return null;
-    if (real.endsWith(".js")) {
-      const native = nativeCodexFromNpmEntry(real);
+    const cmdJs = resolveWindowsCmdJsTarget(real) ?? resolveWindowsCmdJsTarget(cand);
+    const jsEntry = cmdJs ?? (WINDOWS_JS_ENTRY_RE.test(real) ? real : null);
+    if (jsEntry) {
+      const native = nativeCodexFromNpmEntry(jsEntry);
       if (native) return native;
+      if (cmdJs) return cmdJs;
     }
     return cand;
   };
@@ -1356,14 +1448,23 @@ export function resolveCodexBin(
   if (!scanPath) return foundPath ?? null;
 
   let fallback: string | null = null;
+  const names = windowsCandidateNames("codex");
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    const cand = join(dir, process.platform === "win32" ? "codex.exe" : "codex");
-    if (!isExecutableFile(cand)) continue;
-    const checked = inspectCandidate(cand);
-    if (checked) {
-      if (safeRealpath(cand)?.endsWith(".js")) return checked;
-      fallback ??= checked;
+    for (const name of names) {
+      const cand = join(dir, name);
+      if (!isExecutableFile(cand)) continue;
+      const checked = inspectCandidate(cand);
+      if (checked) {
+        const real = safeRealpath(cand);
+        if (
+          (real && WINDOWS_JS_ENTRY_RE.test(real)) ||
+          resolveWindowsCmdJsTarget(cand) !== null
+        ) {
+          return checked;
+        }
+        fallback ??= checked;
+      }
     }
   }
   return fallback ?? foundPath ?? null;
@@ -1810,22 +1911,31 @@ export function resolvePiBin(
   home = homedir(),
   scanPath = true,
 ): string | null {
+  const unwrapPi = (cand: string): string | null => {
+    const real = safeRealpath(cand);
+    if (real && WINDOWS_JS_ENTRY_RE.test(real)) return real;
+    return resolveWindowsCmdJsTarget(real ?? cand) ?? resolveWindowsCmdJsTarget(cand);
+  };
+
   if (foundPath) {
-    const real = safeRealpath(foundPath);
-    if (real && real.endsWith(".js")) return real;
+    const js = unwrapPi(foundPath);
+    if (js) return js;
     if (!scanPath) return foundPath;
   } else if (!scanPath) {
     return null;
   }
 
   let fallback: string | null = foundPath ?? null;
+  const names = windowsCandidateNames("pi");
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    const cand = join(dir, process.platform === "win32" ? "pi.exe" : "pi");
-    if (!isExecutableFile(cand)) continue;
-    const real = safeRealpath(cand);
-    if (real && real.endsWith(".js")) return real;
-    fallback ??= cand;
+    for (const name of names) {
+      const cand = join(dir, name);
+      if (!isExecutableFile(cand)) continue;
+      const js = unwrapPi(cand);
+      if (js) return js;
+      fallback ??= cand;
+    }
   }
 
   const fnmRoot = join(env.HOME ?? home, ".local", "share", "fnm", "node-versions");
