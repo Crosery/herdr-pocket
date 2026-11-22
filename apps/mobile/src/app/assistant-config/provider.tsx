@@ -6,7 +6,7 @@
  * - Pick one or multiple models + promote as main + speed-test + save in a single atomic request.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { KeyboardAvoidingView, Pressable, ScrollView, View } from "react-native";
+import { Pressable, ScrollView, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
@@ -25,6 +25,7 @@ import {
 import { Card, EmptyState, PageBackground } from "../../components/ui";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Input, KeyField, LoadState, Pill, SaveBar, useLeaveGuard } from "../../components/configParts";
 import { PocketButton, PocketChip, PocketChips, PocketSpinner } from "../../components/pocket";
+import { PocketKeyboardAvoidingView } from "../../components/PocketKeyboardAvoidingView";
 import { Toggle } from "../../components/rows";
 import { modelErrorText } from "../../lib/modelErrors";
 import { changeConfig, flash, listProviderModels, loadConfig, PROTOCOL_LABEL, providerName, speedLine, testDraft, useAssistantConfig, useConfigWatch } from "../../lib/assistantConfig";
@@ -363,7 +364,7 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
 
   return (
     <PageBackground>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding" keyboardVerticalOffset={headerHeight}>
+      <PocketKeyboardAvoidingView style={{ flex: 1 }} keyboardVerticalOffset={headerHeight}>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: space.lg, gap: space.lg, paddingBottom: space.xxxl }}>
           {current?.from === "server" ? (
             <View style={{ backgroundColor: p.lavenderContainer, borderRadius: radius.card, padding: space.md, gap: space.sm }}>
@@ -590,7 +591,7 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
             {chosenModels.length ? (makeMain ? "保存并设为主模型" : "保存并启用模型") : editId ? "保存" : "添加"}
           </PocketButton>
         </SaveBar>
-      </KeyboardAvoidingView>
+      </PocketKeyboardAvoidingView>
 
       <ConfirmDialog
         visible={ask === "clearKey"}

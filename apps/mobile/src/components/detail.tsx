@@ -17,6 +17,7 @@ import {
   inferAgentModelAndThinking,
   isNonReasoningModelName,
   normalizeSwitchHarness,
+  parseModelSwitchText,
   resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
@@ -32,11 +33,13 @@ import { call, subscribe, type RelayError } from "../lib/relay";
 import { addPictures, canPickImages, pickImages, type Attachment } from "../lib/attach";
 import { clearMobileDraft, getMobileDraft, hydrateMobileDrafts, onDraftsHydrated, setMobileDraftPictures, setMobileDraftText } from "../lib/drafts";
 import {
+  cancelMobilePendingSwitch,
   enqueueMobilePrompt,
   ensureMobileQueueWatcher,
   moveMobileQueuedPromptToTop,
   popMobileQueuedPromptForEdit,
   removeMobileQueuedPrompt,
+  scheduleMobilePendingSwitch,
   steerMobileQueuedPromptNow,
   useMobileQueue,
 } from "../lib/chatQueue";
@@ -885,6 +888,7 @@ export function Composer({
     ensureMobileQueueWatcher();
   }, []);
   const queued = useMobileQueue((s) => s.byAgent[agent.key] ?? EMPTY_MOBILE_QUEUE);
+  const pendingSwitch = useMobileQueue((s) => s.pendingSwitchByAgent[agent.key]);
   const isSteering = useMobileQueue((s) => Boolean(s.steering[agent.key]));
   const hostHeldCount = Math.max(0, (agent.queued ?? 0) - mineWaiting);
   const totalQueued = queued.length + hostHeldCount;
@@ -1183,18 +1187,19 @@ export function Composer({
     }
     if (cleanThinking) setThinkingOverride(cleanThinking);
 
-    const desc = cleanModel ?? `思考等级 ${cleanThinking}`;
+    const desc = [cleanModel, cleanThinking ? `思考 ${cleanThinking}` : undefined].filter(Boolean).join(" · ");
     const plan = buildHarnessSwitchCommands(agent.harness, { modelId: cleanModel, thinkingLevel: cleanThinking });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
     if (agent.status === "working") {
-      if (plan.commands.length > 0) {
-        for (const cmd of plan.commands) enqueueMobilePrompt(agent, cmd, []);
-        setToast(`已加入排队：切换为 ${desc}`);
-      } else {
-        setToast(`当前轮进行中，空闲后再切换 ${desc}`);
-      }
+      scheduleMobilePendingSwitch(agent, {
+        ...(cleanModel ? { modelId: cleanModel } : {}),
+        ...(cleanThinking ? { thinkingLevel: cleanThinking } : {}),
+        label: desc,
+      });
+      setToast(`本轮结束后将自动切换为 ${desc}`);
       return;
     }
+    cancelMobilePendingSwitch(agent.key);
     void call(agent.deviceId, "agent.setModel", {
       agent: agent.key,
       ...(cleanModel ? { modelId: cleanModel } : {}),
@@ -1211,9 +1216,9 @@ export function Composer({
         const unsupported = err?.code === "unsupported" || err?.code === "bad_request" || /unknown|unsupported|不支持/i.test(err?.message ?? "");
         if (unsupported && plan.commands.length > 0) {
           for (const cmd of plan.commands) {
-            await sendOut(agent, cmd, []);
+            await call(agent.deviceId, "terminal.send", { agent: agent.key, text: cmd, enter: true });
           }
-          setToast(`已发送切换指令：${desc}`);
+          setToast(`已下发切换指令：${desc}`);
           refreshSoon();
         } else {
           setToast(err?.message || "切换失败");
@@ -1570,6 +1575,15 @@ export function Composer({
       openModelPicker("thinking");
       return;
     }
+    if (mode === "chat" && !pics.length) {
+      const sw = parseModelSwitchText(t);
+      if (sw) {
+        clearMobileDraft(agent.key);
+        setTextState("");
+        applyModelOrThinking({ modelId: sw.model, thinkingLevel: sw.thinking });
+        return;
+      }
+    }
     const now = Date.now();
     const sig = `${agent.key}\0${t}\0${pics.map((x) => x.id).join(",")}`;
     if (lastSendRef.current && lastSendRef.current.sig === sig && now - lastSendRef.current.at < 500) return;
@@ -1677,7 +1691,7 @@ export function Composer({
   const padRight = horizontalPad(metrics.outerMargin, insets.right);
 
   return (
-    <View style={{ paddingBottom: (keyboardOpen ? 0 : bottomInset) + space.xs, paddingTop: space.xs }}>
+    <View style={{ flexShrink: 0, paddingBottom: (keyboardOpen ? 0 : bottomInset) + space.xs, paddingTop: space.xs }}>
       {mode === "terminal" && !boxOnly ? direct.input : null}
       {mode === "terminal" && direct.on ? (
         <View accessibilityLiveRegion="polite" style={{ marginLeft: padLeft, marginRight: padRight, marginBottom: space.xs, paddingLeft: space.md, paddingRight: 4, minHeight: 32, borderRadius: radius.pill, backgroundColor: p.accentContainer, flexDirection: "row", alignItems: "center", gap: 6 }}>
@@ -1738,6 +1752,51 @@ export function Composer({
           </Pressable>
         </View>
       </View>
+      ) : null}
+      {mode === "chat" && pendingSwitch ? (
+        <View
+          accessibilityLiveRegion="polite"
+          accessibilityLabel={`待切换模型：${pendingSwitch.label}`}
+          style={{
+            marginLeft: padLeft,
+            marginRight: padRight,
+            marginTop: space.xs,
+            paddingHorizontal: space.md,
+            paddingVertical: space.xs,
+            borderRadius: radius.card,
+            backgroundColor: p.surface,
+            borderWidth: 1,
+            borderColor: p.dark ? p.surface3 : "#FBE3EC",
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <MaterialCommunityIcons name="cpu-64-bit" size={16} color={p.accentText} />
+          <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: p.ink }}>
+            <Text style={{ fontFamily: fonts.bodyBold, color: p.accentText }}>本轮结束后切换 · </Text>
+            {pendingSwitch.label}
+          </Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="取消待切换模型"
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              cancelMobilePendingSwitch(agent.key);
+            }}
+            hitSlop={8}
+            style={({ pressed }) => ({
+              width: 28,
+              height: 28,
+              borderRadius: 14,
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: pressed ? p.surface3 : p.surface2,
+            })}
+          >
+            <MaterialCommunityIcons name="close" size={15} color={p.muted} />
+          </Pressable>
+        </View>
       ) : null}
       {mode === "chat" && totalQueued > 0 ? (
         <View

@@ -879,7 +879,7 @@ class WebVoiceSession {
         const decision = this.echoGate.evaluate({
           frameRms,
           outRms: this.sampleOutRms(),
-          speakerPlaying: this.playingSources.size > 0,
+          speakerPlaying: this.playingSources.size > 0 || this.speaking,
           lastSpeakerEndedAt: this.lastSpeakerEndedAt,
           aecMode: this.aecMode,
         });

@@ -8,7 +8,6 @@
 import { useState, type ComponentProps, type ReactNode } from "react";
 import {
   ActivityIndicator,
-  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
@@ -27,6 +26,7 @@ import { fonts, radius, space, type Palette } from "../theme/tokens";
 import { horizontalPad } from "../lib/layoutMetrics";
 import { useKeyboardState } from "../lib/useKeyboardState";
 import { CuteIcon } from "./icons";
+import { PocketKeyboardAvoidingView } from "./PocketKeyboardAvoidingView";
 import { IconTile } from "./ui";
 
 export type PocketIcon = ComponentProps<typeof MaterialCommunityIcons>["name"];
@@ -311,7 +311,7 @@ export function PocketSheet({
   const closedBottom = keyboardOpen ? 0 : insets.bottom;
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onDismiss} statusBarTranslucent navigationBarTranslucent>
-      <KeyboardAvoidingView behavior="padding" style={{ flex: 1, justifyContent: "flex-end" }}>
+      <PocketKeyboardAvoidingView insideModal style={{ flex: 1, justifyContent: "flex-end" }}>
         <Pressable accessibilityLabel="关闭" onPress={onDismiss} style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: SCRIM }} />
         <View accessibilityViewIsModal style={{ maxHeight, backgroundColor: p.page, borderTopLeftRadius: radius.xl, borderTopRightRadius: radius.xl, overflow: "hidden" }}>
           <View style={{ alignItems: "center", paddingTop: space.sm }}>
@@ -342,7 +342,7 @@ export function PocketSheet({
             <View style={{ paddingLeft: padLeft, paddingRight: padRight, paddingTop: space.sm, paddingBottom: closedBottom + space.md, gap: space.xs, borderTopWidth: 1, borderTopColor: p.divider }}>{footer}</View>
           ) : null}
         </View>
-      </KeyboardAvoidingView>
+      </PocketKeyboardAvoidingView>
     </Modal>
   );
 }

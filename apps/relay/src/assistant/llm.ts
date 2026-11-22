@@ -30,10 +30,14 @@ export interface LlmRequest {
   system: string;
   messages: Msg[];
   tools: ToolDef[];
+  /** Hint to disallow tool calls on the final synthesis turn while preserving tool declarations. */
+  toolChoice?: "auto" | "none";
   maxTokens?: number;
   signal?: AbortSignal;
   /** Streamed text of the current answer, as it arrives. */
   onText?: (delta: string) => void;
+  /** Called as reasoning/thinking deltas stream before text output. */
+  onReasoning?: () => void;
 }
 
 export interface LlmResult {
@@ -232,7 +236,7 @@ async function once(t: LlmTarget, cfg: LlmConfig, req: LlmRequest): Promise<LlmR
   let gotContent = false;
   const firstTimer = setTimeout(() => {
     if (!gotContent) ac.abort();
-  }, cfg.firstByteMs ?? 25_000);
+  }, cfg.firstByteMs ?? 15_000);
   const totalTimer = setTimeout(() => ac.abort(), cfg.totalMs ?? 120_000);
   const label = `${t.provider}:${t.model}`;
   const stream: Stream = { started: () => (gotContent = true) };
@@ -276,7 +280,7 @@ async function once(t: LlmTarget, cfg: LlmConfig, req: LlmRequest): Promise<LlmR
     } else {
       const isMimo = base.includes("xiaomimimo.com") || t.provider === "mimo";
       const autoExtra = isMimo
-        ? req.tools.length === 0
+        ? req.tools.length === 0 || req.toolChoice === "none"
           ? !t.extraBody || t.extraBody.thinking === undefined
             ? { thinking: { type: "disabled" } }
             : undefined
@@ -411,6 +415,8 @@ async function readAnthropic(events: AsyncGenerator<any>, t: LlmTarget, req: Llm
         if (d.delta?.type === "text_delta" && typeof d.delta.text === "string") {
           b.text += d.delta.text;
           req.onText?.(d.delta.text);
+        } else if (d.delta?.type === "thinking_delta" && typeof d.delta.thinking === "string") {
+          req.onReasoning?.();
         } else if (d.delta?.type === "input_json_delta" && typeof d.delta.partial_json === "string") {
           b.json += d.delta.partial_json;
         }
@@ -443,7 +449,10 @@ function openaiBody(t: LlmTarget, req: LlmRequest): Record<string, unknown> {
     [t.maxTokensField ?? "max_tokens"]: req.maxTokens ?? 1200,
     messages: [{ role: "system", content: req.system }, ...toOpenaiMessages(req.messages)],
     ...(req.tools.length
-      ? { tools: req.tools.map((x) => ({ type: "function", function: { name: x.name, description: x.description, parameters: x.input_schema } })) }
+      ? {
+          tools: req.tools.map((x) => ({ type: "function", function: { name: x.name, description: x.description, parameters: x.input_schema } })),
+          ...(req.toolChoice === "none" ? { tool_choice: "none" } : {}),
+        }
       : {}),
   };
 }
@@ -503,9 +512,11 @@ async function readOpenai(events: AsyncGenerator<any>, t: LlmTarget, req: LlmReq
     if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
       stream.started();
       reasoning += delta.reasoning_content;
+      req.onReasoning?.();
     } else if (typeof delta.reasoning === "string" && delta.reasoning) {
       stream.started();
       reasoning += delta.reasoning;
+      req.onReasoning?.();
     }
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
@@ -600,6 +611,7 @@ async function readResponses(events: AsyncGenerator<any>, t: LlmTarget, req: Llm
       req.onText?.(d.delta);
     } else if (d.type === "response.reasoning_summary_text.delta" || d.type === "response.reasoning_text.delta") {
       stream.started();
+      req.onReasoning?.();
     } else if (d.type === "response.output_item.added" && d.item?.type === "function_call") {
       stream.started();
       const key = String(d.item.id ?? d.output_index ?? callOrder.length);
@@ -696,6 +708,7 @@ async function readGemini(events: AsyncGenerator<any>, t: LlmTarget, req: LlmReq
     for (const part of parts) {
       if (part.thought) {
         stream.started();
+        req.onReasoning?.();
         continue;
       }
       if (typeof part.text === "string" && part.text) {
@@ -770,7 +783,10 @@ async function readOllama(events: AsyncGenerator<any>, t: LlmTarget, req: LlmReq
     if (d.error) throw new LlmError(`${t.provider}:${t.model}: ${scrub(String(d.error), t.apiKey)}`);
     const msg = d.message;
     if (msg) {
-      if (typeof msg.thinking === "string" && msg.thinking) stream.started();
+      if (typeof msg.thinking === "string" && msg.thinking) {
+        stream.started();
+        req.onReasoning?.();
+      }
       if (typeof msg.content === "string" && msg.content) {
         stream.started();
         text += msg.content;

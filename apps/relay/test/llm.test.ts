@@ -296,4 +296,13 @@ test("MiMo disables thinking on connectivity pings, enables reasoning_effort=low
   assert.deepEqual(r2.content, [{ type: "text", text: "全在跑" }]);
   const assistantTurn = seen[2]!.body.messages.find((m: any) => m.role === "assistant");
   assert.equal(assistantTurn.reasoning_content, "need to read first");
+
+  // toolChoice: "none" preserves declared tools while disabling MiMo thinking and firing onReasoning cleanly.
+  let reasoningTicks = 0;
+  await llm({ system: "s", messages: msgs, tools: TOOLS, toolChoice: "none", onReasoning: () => { reasoningTicks += 1; } });
+  const synthReq = seen.at(-1)!.body;
+  assert.equal(synthReq.tools.length, TOOLS.length);
+  assert.equal(synthReq.tool_choice, "none");
+  assert.deepEqual(synthReq.thinking, { type: "disabled" });
+  assert.equal(reasoningTicks, 0);
 });

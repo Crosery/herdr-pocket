@@ -352,3 +352,27 @@ test("encodeRgbaBmpV4 builds 122-byte top-down BI_BITFIELDS RGBA BITMAPV4HEADER 
 
   assert.equal(encodeRgbaBmpV4(2, 2, rgba, 32), null);
 });
+
+test("KittyApcSplitter handles ESC/_G/\\ splits across chunks in linear time", () => {
+  const s = new KittyApcSplitter();
+  assert.deepEqual(s.push("abc\x1b"), [{ kind: "vt", data: "abc" }]);
+  assert.deepEqual(s.push("_"), []);
+  assert.deepEqual(s.push("Ga=T;pay"), []);
+  assert.deepEqual(s.push("load\x1b"), []);
+  assert.deepEqual(s.push("\\tail\x1b_Xok"), [
+    { kind: "kitty", raw: "a=T;payload" },
+    { kind: "vt", data: "tail\x1b_Xok" },
+  ]);
+
+  // Large split APC should finish cleanly well under 50ms (O(N), no O(N^2) rescanning).
+  const payload = "A".repeat(256 * 1024);
+  const start = performance.now();
+  s.push("\x1b_Ga=T,m=1;");
+  for (let i = 0; i < 8; i++) s.push(payload);
+  const tail = s.push("end\x1b\\after");
+  const elapsed = performance.now() - start;
+  assert.equal(tail.length, 2);
+  assert.equal(tail[0]!.kind, "kitty");
+  assert.equal(tail[1]!.kind, "vt");
+  assert.ok(elapsed < 250, `expected fast O(N) APC scan, took ${elapsed.toFixed(1)}ms`);
+});

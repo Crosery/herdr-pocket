@@ -73,6 +73,11 @@
   position: relative;
 }
 
+.tp-term-host .xterm.xterm-cursor-pointer,
+.tp-term-host .xterm.xterm-cursor-pointer .xterm-screen {
+  cursor: pointer !important;
+}
+
 .tp-term-overlay {
   position: absolute;
   inset: 0;

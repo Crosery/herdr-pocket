@@ -48,11 +48,14 @@ export interface RealtimeConfig {
   refreshGapMs?: number;
   /** Max ms to hold assistant captions while waiting for the person's ASR of the same turn. */
   asrHoldMs?: number;
+  /** Force-commit a user turn if server_vad stays open without audible voice for this long. */
+  maxSpeechSilenceCommitMs?: number;
 }
 
 const PHONE_MIC_RATE = 16_000;
 const PHONE_SPEAKER_RATE = 48_000;
-const ATTACH_TIMEOUT_MS = 15_000;
+const ATTACH_TIMEOUT_MS = 10_000;
+const STUCK_VAD_COMMIT_MS = 12_000;
 const REFRESH_GAP_MS = 5000;
 const ASR_HOLD_MS = 900;
 const ASR_SPEECH_MAX_MS = 5000;
@@ -119,6 +122,17 @@ const cleanStr = (s: string, max: number): string => Array.from(s.replace(/\s+/g
 function rmsDbfs(sumSq: number, samples: number): number {
   if (samples <= 0 || sumSq <= 0) return SILENCE_DBFS;
   return round2(Math.max(SILENCE_DBFS, 20 * Math.log10(Math.sqrt(sumSq / samples) / FULL_SCALE)));
+}
+
+function pcm16RmsDbfs(buf: Buffer): number {
+  const samples = buf.length >> 1;
+  if (samples <= 0) return SILENCE_DBFS;
+  let sumSq = 0;
+  for (let i = 0; i < samples; i++) {
+    const v = buf.readInt16LE(i * 2);
+    sumSq += v * v;
+  }
+  return rmsDbfs(sumSq, samples);
 }
 
 function peakDbfs(peak: number): number {
@@ -807,6 +821,8 @@ export class RealtimeCall {
   private createQueued = false;
   private userSpeaking = false;
   private speechStoppedAt = 0;
+  private voiceHoldUntil = 0;
+  private vadCommitTimer: NodeJS.Timeout | null = null;
   private tasks = new Map<string, AbortController>();
   private seenCalls = new Set<string>();
   /** Notices to bring up as soon as nobody is speaking. */
@@ -851,7 +867,7 @@ export class RealtimeCall {
       handshakeTimeout: ATTACH_TIMEOUT_MS,
       maxPayload: 16 * 1024 * 1024,
     });
-    this.attachTimer = setTimeout(() => this.fail("语音服务没有及时响应"), ATTACH_TIMEOUT_MS + 5000);
+    this.attachTimer = setTimeout(() => this.fail("语音服务没有及时响应"), ATTACH_TIMEOUT_MS + 2000);
     this.keepalive = setInterval(() => {
       if (this.upstream.readyState === WebSocket.OPEN) this.upstream.ping();
     }, 25_000);
@@ -882,7 +898,15 @@ export class RealtimeCall {
         }
         const buf = asBuffer(data);
         this.telemetry.onRxPcm(buf);
-        const pcm = this.mic.push(buf);
+        const now = Date.now();
+        const dbfs = pcm16RmsDbfs(buf);
+        const openThresh = this.speaking ? -33 : -42;
+        if (dbfs >= openThresh) {
+          this.voiceHoldUntil = now + 360;
+        }
+        const passAudio = dbfs >= openThresh || (now < this.voiceHoldUntil && dbfs >= -48);
+        const gated = passAudio ? buf : Buffer.alloc(buf.length);
+        const pcm = this.mic.push(gated);
         if (pcm.length) this.up({ type: "input_audio_buffer.append", audio: pcm.toString("base64") });
         return;
       }
@@ -942,6 +966,10 @@ export class RealtimeCall {
     this.lastInstructions = this.instructions();
     this.lastPush = Date.now();
     const vad = c.vad ?? "server_vad";
+    const turnDetection =
+      vad === "server_vad"
+        ? { type: "server_vad", threshold: 0.65, prefix_padding_ms: 280, silence_duration_ms: 520, create_response: true, interrupt_response: true }
+        : { type: vad, create_response: true, interrupt_response: true };
     const session = this.ga
       ? {
           type: "realtime",
@@ -951,7 +979,7 @@ export class RealtimeCall {
             input: {
               format: { type: "audio/pcm", rate: c.inputRate ?? 24_000 },
               ...(c.noiseReduction ? { noise_reduction: { type: c.noiseReduction } } : {}),
-              turn_detection: { type: vad, create_response: true, interrupt_response: true },
+              turn_detection: turnDetection,
               ...(c.transcribeModel ? { transcription: { model: c.transcribeModel, ...(c.language ? { language: c.language } : {}) } } : {}),
             },
             output: {
@@ -1073,6 +1101,7 @@ export class RealtimeCall {
       case "input_audio_buffer.speech_started": {
         this.flushAsrHold();
         this.userSpeaking = true;
+        this.armVadCommitWatchdog();
         this.turn++;
         this.cap(this.speechAt, 50).set(this.turn, Date.now());
         if (this.cfg.transcribeModel) {
@@ -1094,6 +1123,7 @@ export class RealtimeCall {
         return;
       }
       case "input_audio_buffer.speech_stopped":
+        this.clearVadCommitWatchdog();
         this.userSpeaking = false;
         this.speechStoppedAt = Date.now();
         this.cap(this.speechAt, 50).set(this.turn, this.speechStoppedAt);
@@ -1306,6 +1336,39 @@ export class RealtimeCall {
     this.asrHoldTimer = setTimeout(() => this.flushAsrHold(), ms);
   }
 
+  private clearVadCommitWatchdog(): void {
+    if (this.vadCommitTimer) {
+      clearTimeout(this.vadCommitTimer);
+      this.vadCommitTimer = null;
+    }
+  }
+
+  private armVadCommitWatchdog(delayMs?: number): void {
+    this.clearVadCommitWatchdog();
+    const wait = delayMs ?? this.cfg.maxSpeechSilenceCommitMs ?? STUCK_VAD_COMMIT_MS;
+    if (wait <= 0) return;
+    this.vadCommitTimer = setTimeout(() => {
+      this.vadCommitTimer = null;
+      if (this.ended || !this.userSpeaking) return;
+      const now = Date.now();
+      if (now < this.voiceHoldUntil) {
+        this.armVadCommitWatchdog(Math.max(250, Math.min(1000, this.voiceHoldUntil - now)));
+        return;
+      }
+      this.log(`realtime: committing stuck VAD turn=${this.turn}`);
+      this.userSpeaking = false;
+      this.speechStoppedAt = now;
+      this.cap(this.speechAt, 50).set(this.turn, now);
+      if (this.asrPendingTurn === this.turn) this.armAsrHold(this.cfg.asrHoldMs ?? ASR_HOLD_MS);
+      this.telemetry.onSpeechStopped(this.turn);
+      this.up({ type: "input_audio_buffer.commit" });
+      if (!this.ga) this.respond();
+      if (this.pending.length || this.refreshWaiting) this.idleIn(AFTER_SPEECH_MS + 5);
+      this.toPhone({ action: "input.speech.stopped", data: { turn: this.turn } });
+    }, wait);
+    this.vadCommitTimer.unref?.();
+  }
+
   /** The growing caption, paced (captions.ts); checked again when it goes, since the answer may have ended or been cut by then. */
   private caption(r: Run): void {
     this.captions.push(r.id, () => {
@@ -1471,6 +1534,7 @@ export class RealtimeCall {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.asrHoldTimer) clearTimeout(this.asrHoldTimer);
+    this.clearVadCommitWatchdog();
     this.captions.clear();
     this.detach();
     for (const ac of this.tasks.values()) ac.abort();

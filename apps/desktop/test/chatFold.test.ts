@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ConvEvent } from "@herdr-pocket/protocol";
-import { foldConvEvents, mergeConvEvents, type ChatRow } from "../src/lib/chatFold.ts";
-import { reconcileOutgoingSends, shouldAutoDrainQueue, type OutgoingSendLike } from "../src/lib/chatQueueLogic.ts";
+import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../src/lib/chatFold.ts";
+import { interleaveOptimisticSends, reconcileOutgoingSends, shouldAutoDrainQueue, type OutgoingSendLike } from "../src/lib/chatQueueLogic.ts";
 import {
   KittyApcSplitter,
   KittyKeyboardState,
@@ -216,4 +216,135 @@ test("chatQueue: shouldAutoDrainQueue only drains when online idle/done after co
   assert.equal(shouldAutoDrainQueue("idle", false, 0, false, 10_000), false);
   assert.equal(shouldAutoDrainQueue("idle", true, 0, true, 10_000), false);
   assert.equal(shouldAutoDrainQueue("done", true, 8_000, false, 10_000), false);
+});
+
+test("mergeConvEvents (compareConvEvents): orders same-pos ids numerically, kind tie-breakers, and pos vs missing pos by ts", () => {
+  const events: ConvEvent[] = [
+    // Missing pos with later ts must come AFTER pos "3118048" with earlier ts (not lexicographical "3..." > "1795...").
+    { id: "late-no-pos", session: "s", ts: 1795_000_000_000, kind: "assistant_message", text: "after" },
+    { id: "s10:c10", session: "s", ts: 1700_000_000_000, pos: "3118048", kind: "tool_call", call_id: "c10", name: "read_file", input: {} },
+    { id: "s10:c0r", session: "s", ts: 1700_000_000_000, pos: "3118048", kind: "tool_result", call_id: "c0", name: "read_file", output: "ok" },
+    { id: "s10:c2", session: "s", ts: 1700_000_000_000, pos: "3118048", kind: "tool_call", call_id: "c2", name: "read_file", input: {} },
+    { id: "s10:a", session: "s", ts: 1700_000_000_000, pos: "3118048", kind: "assistant_message", text: "working" },
+    { id: "s10:c0", session: "s", ts: 1700_000_000_000, pos: "3118048", kind: "tool_call", call_id: "c0", name: "read_file", input: {} },
+    { id: "s10:r", session: "s", ts: 1700_000_000_000, pos: "3118048", kind: "reasoning", text: "think" },
+    { id: "eff#10", session: "s", ts: 1700_000_000_100, pos: "3118050", kind: "user_message", text: "item 10" },
+    { id: "eff#1", session: "s", ts: 1700_000_000_100, pos: "3118050", kind: "user_message", text: "item 1" },
+    { id: "eff#0", session: "s", ts: 1700_000_000_100, pos: "3118050", kind: "user_message", text: "item 0" },
+  ];
+
+  const sorted = mergeConvEvents([], events);
+  assert.deepEqual(
+    sorted.map((e) => e.id),
+    [
+      "s10:r",
+      "s10:a",
+      "s10:c0",
+      "s10:c2",
+      "s10:c10",
+      "s10:c0r",
+      "eff#0",
+      "eff#1",
+      "eff#10",
+      "late-no-pos",
+    ],
+  );
+});
+
+test("createBufferedEventMerger: holds pre-page SSE frames, coalesces post-page bursts, respects fallbackMs and dispose", async () => {
+  const batches: string[][] = [];
+  const merger = createBufferedEventMerger((evs) => {
+    batches.push(evs.map((e) => e.id));
+  }, 500);
+
+  merger.onStreamEvent({ id: "sse-1", session: "s", ts: 20, pos: "2", kind: "assistant_message", text: "reply" });
+  merger.onStreamEvent({ id: "sse-2", session: "s", ts: 30, pos: "3", kind: "turn_end" });
+  assert.equal(batches.length, 0);
+
+  merger.onInitialPage([{ id: "page-1", session: "s", ts: 10, pos: "1", kind: "user_message", text: "hi" }]);
+  assert.equal(batches.length, 1);
+  assert.deepEqual(batches[0], ["page-1", "sse-1", "sse-2"]);
+
+  // Rapid post-page events coalesce into a single 16ms batch.
+  merger.onStreamEvent({ id: "sse-3", session: "s", ts: 40, pos: "4", kind: "user_message", text: "next" });
+  merger.onStreamEvent({ id: "sse-4", session: "s", ts: 50, pos: "5", kind: "assistant_message", text: "ok" });
+  assert.equal(batches.length, 1);
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(batches.length, 2);
+  assert.deepEqual(batches[1], ["sse-3", "sse-4"]);
+  merger.dispose();
+
+  // Fallback timer flushes buffered SSE when initial page never arrives, and dispose cancels future work.
+  const fallbackBatches: string[][] = [];
+  const slowMerger = createBufferedEventMerger((evs) => {
+    fallbackBatches.push(evs.map((e) => e.id));
+  }, 30);
+  slowMerger.onStreamEvent({ id: "late-1", session: "s", ts: 10, kind: "user_message", text: "solo" });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(fallbackBatches, [["late-1"]]);
+
+  slowMerger.dispose();
+  slowMerger.onStreamEvent({ id: "after-dispose", session: "s", ts: 20, kind: "user_message", text: "ignored" });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(fallbackBatches.length, 1);
+});
+
+test("interleaveOptimisticSends: places unconfirmed send before SSE reply without crossing completed turn_end", () => {
+  const prevTurnEnd: ChatRow = { kind: "turn_end", id: "te-1", ts: 100_000 };
+  const replyRow: ChatRow = { kind: "assistant", id: "a-new", text: "新的回复", ts: 105_000 };
+  const rows: ChatRow[] = [
+    { kind: "user", id: "u-old", text: "上一轮问题", ts: 95_000, attachedLines: [], attachedCount: 0 },
+    { kind: "assistant", id: "a-old", text: "上一轮回答", ts: 98_000 },
+    prevTurnEnd,
+    // Simulate second-truncated transcript reply timestamp 500ms earlier than send.ts (within 1000ms slack).
+    { ...replyRow, ts: 104_000 },
+  ];
+  const pendingSend: OutgoingSendLike = {
+    id: "out-new",
+    text: "刚发的追问",
+    attachedCount: 0,
+    ts: 104_500,
+    state: "sent",
+  };
+
+  const timeline = interleaveOptimisticSends(rows, [pendingSend]);
+  assert.deepEqual(
+    timeline.map((item) => (item.kind === "row" ? item.row.id : `out:${item.send.id}`)),
+    ["u-old", "a-old", "te-1", "out:out-new", "a-new"],
+  );
+});
+
+test("foldConvEvents: coalesces Claude command XML, stdout, and effort switch into a single model_switch row", () => {
+  const events: ConvEvent[] = [
+    {
+      id: "m-1",
+      session: "s",
+      ts: 200_000,
+      kind: "system",
+      text: "<command-name>/model</command-name>\n<command-args>opus</command-args>",
+    },
+    {
+      id: "m-2",
+      session: "s",
+      ts: 200_200,
+      kind: "system",
+      text: "<local-command-stdout>Set model to opus</local-command-stdout>",
+    },
+    {
+      id: "m-3",
+      session: "s",
+      ts: 201_000,
+      kind: "user_message",
+      synthetic: true,
+      text: "/effort high",
+    },
+  ];
+
+  const rows = foldConvEvents(events, "standard");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.kind, "model_switch");
+  if (rows[0]?.kind === "model_switch") {
+    assert.equal(rows[0].model, "opus");
+    assert.equal(rows[0].thinking, "high");
+  }
 });

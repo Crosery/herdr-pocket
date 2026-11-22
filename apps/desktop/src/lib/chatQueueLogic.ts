@@ -19,13 +19,22 @@ function rowTs(row: ChatRow): number {
     case "user":
     case "assistant":
     case "turn_end":
-      return row.ts;
+    case "thinking":
+    case "system":
+    case "model_switch":
     case "tool":
-      return row.step.ts;
+      return row.ts;
     case "activity_group":
-      return row.tools[row.tools.length - 1]?.ts ?? row.tools[0]?.ts ?? 0;
+      return row.endTs;
+  }
+}
+
+function rowStartTs(row: ChatRow): number {
+  switch (row.kind) {
+    case "activity_group":
+      return row.ts;
     default:
-      return 0;
+      return rowTs(row);
   }
 }
 
@@ -102,12 +111,71 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
     const matchedAt = matchedRowIdx.get(lastSend.id);
     const hasReplyAfter =
       matchedAt !== undefined
-        ? rows.some((r, i) => i > matchedAt && r.kind !== "user" && r.kind !== "system")
-        : rows.some((r) => r.kind !== "user" && r.kind !== "system" && rowTs(r) >= lastSend.ts);
+        ? rows.some((r, i) => i > matchedAt && r.kind !== "user" && r.kind !== "system" && r.kind !== "model_switch")
+        : rows.some((r) => r.kind !== "user" && r.kind !== "system" && r.kind !== "model_switch" && rowTs(r) >= lastSend.ts);
     awaitingReply = !hasReplyAfter;
   }
 
   return { unmatched, matchedIds, expiredIds, awaitingReply };
+}
+
+export type TimelineItem<T extends OutgoingSendLike> =
+  | { kind: "row"; row: ChatRow }
+  | { kind: "outgoing"; send: T };
+
+/**
+ * Interleaves unconfirmed optimistic `outgoing` sends chronologically inside the active
+ * trailing segment (after the last persisted user turn) so short assistant replies over SSE
+ * never appear above a just-sent prompt whose persisted page-fetch is still in flight.
+ */
+export function interleaveOptimisticSends<T extends OutgoingSendLike>(
+  rows: ChatRow[],
+  unmatched: T[],
+): TimelineItem<T>[] {
+  if (!unmatched.length) {
+    return rows.map((row) => ({ kind: "row", row }));
+  }
+
+  let anchorIdx = -1;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    if (rows[i]!.kind === "user") {
+      anchorIdx = i;
+      break;
+    }
+  }
+
+  const sortedUnmatched = [...unmatched].sort((a, b) => a.ts - b.ts);
+  const firstSendTs = sortedUnmatched[0]!.ts;
+  // Never place a new optimistic send before an already-completed previous turn.
+  for (let i = rows.length - 1; i > anchorIdx; i -= 1) {
+    const r = rows[i]!;
+    if (r.kind === "turn_end" && r.ts <= firstSendTs) {
+      anchorIdx = i;
+      break;
+    }
+  }
+
+  const out: TimelineItem<T>[] = [];
+  for (let i = 0; i <= anchorIdx; i += 1) {
+    out.push({ kind: "row", row: rows[i]! });
+  }
+
+  let uIdx = 0;
+  for (let i = anchorIdx + 1; i < rows.length; i += 1) {
+    const row = rows[i]!;
+    const rTs = rowStartTs(row);
+    // Allow 1000ms slack for second-truncated transcript timestamps on the same computer.
+    while (uIdx < sortedUnmatched.length && (rTs === 0 || rTs >= sortedUnmatched[uIdx]!.ts - 1000)) {
+      out.push({ kind: "outgoing", send: sortedUnmatched[uIdx]! });
+      uIdx += 1;
+    }
+    out.push({ kind: "row", row });
+  }
+  while (uIdx < sortedUnmatched.length) {
+    out.push({ kind: "outgoing", send: sortedUnmatched[uIdx]! });
+    uIdx += 1;
+  }
+  return out;
 }
 
 /**

@@ -6,8 +6,15 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
-import { copyToClipboard, detectPlatform } from "../lib/bridge";
+import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge";
+import { openAgentFileTarget } from "../lib/openFileTarget";
 import { setConfig, useClientConfig } from "../lib/config";
+import {
+  findLinkAtCell,
+  findTerminalLinksForBufferLine,
+  findWordSelectionAtCell,
+  readLogicalLineText,
+} from "../lib/terminalLinks";
 import {
   endWorkspaceDrag,
   hasWorkspaceDrag,
@@ -60,7 +67,7 @@ import {
   resolveTerminalAppearance,
   type TerminalThemeSpec,
 } from "../lib/terminalTheme";
-import { openSettingsFrame } from "../shell/shellStore";
+import { openSettingsFrame, openWebTab } from "../shell/shellStore";
 import { IS_MAC, matchShortcut } from "../shell/shortcuts";
 import { useToast } from "./PocketUI";
 import "../styles/terminal.css";
@@ -134,13 +141,23 @@ function buildBmpBlobUrl(width: number, height: number, bytes: Uint8Array, forma
   return URL.createObjectURL(new Blob([bmp.buffer as ArrayBuffer], { type: "image/bmp" }));
 }
 
+function sniffImageMime(bytes: Uint8Array): string {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+    return "image/webp";
+  }
+  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return "image/gif";
+  if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d) return "image/bmp";
+  return "image/png";
+}
+
 async function decodeKittyAsset(cmd: KittyGfxCommand, rawBytes: Uint8Array, id: number): Promise<KittyImageAsset | null> {
   const bytes = await decompressZlibIfNeeded(rawBytes, cmd.compression);
   if (!bytes.length) return null;
 
   if (cmd.format === 100) {
     const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    const blob = new Blob([copy], { type: "image/png" });
+    const blob = new Blob([copy], { type: sniffImageMime(bytes) });
     const url = URL.createObjectURL(blob);
     const pngDims = parsePngDimensions(bytes);
     if (pngDims) {
@@ -254,12 +271,68 @@ export function TerminalSurface({
   const lastResizeSigRef = useRef("");
   const placementSeqRef = useRef(0);
   const [dragOver, setDragOver] = useState(false);
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{
+    x: number;
+    y: number;
+    link?: string;
+    isHttpLink?: boolean;
+    lineText?: string;
+  } | null>(null);
   const dragDepthRef = useRef(0);
+  const agentRef = useRef(agent);
+  agentRef.current = agent;
+  const hoveredOscLinkRef = useRef<string | null>(null);
+  const lastLinkOpenRef = useRef<{ text: string; at: number }>({ text: "", at: 0 });
   const activeRef = useRef(active);
   activeRef.current = active;
   const isShellRef = useRef(Boolean(agent.isShell));
   isShellRef.current = Boolean(agent.isShell);
+
+  const activateTerminalLink = useCallback((raw: string, preferInternalWeb = false) => {
+    const text = raw.trim();
+    if (!text) return;
+    const now = Date.now();
+    if (lastLinkOpenRef.current.text === text && now - lastLinkOpenRef.current.at < 180) return;
+    lastLinkOpenRef.current = { text, at: now };
+    if (/^https?:\/\//i.test(text)) {
+      if (preferInternalWeb) openWebTab(text);
+      else void openExternalUrl(text);
+      return;
+    }
+    if (/^mailto:/i.test(text)) {
+      void openExternalUrl(text);
+      return;
+    }
+    const opened = openAgentFileTarget(agentRef.current, text);
+    if (!opened && /^file:\/\//i.test(text)) {
+      void openExternalUrl(text);
+    }
+  }, []);
+
+  const resolvePointerCell = useCallback(
+    (
+      hostEl: HTMLElement,
+      term: XTerm,
+      clientX: number,
+      clientY: number,
+      clampToGrid = false,
+    ): { col: number; absRow: number; link: string | null } | null => {
+      const screen = hostEl.querySelector<HTMLElement>(".xterm-screen") ?? hostEl;
+      const rect = screen.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0 || term.cols <= 0 || term.rows <= 0) return null;
+      const rawX = clientX - rect.left;
+      const rawY = clientY - rect.top;
+      if (!clampToGrid && (rawX < 0 || rawY < 0 || rawX >= rect.width || rawY >= rect.height)) return null;
+      const clampedX = Math.max(0, Math.min(rect.width - 0.01, rawX));
+      const clampedY = Math.max(0, Math.min(rect.height - 0.01, rawY));
+      const col = Math.max(0, Math.min(term.cols - 1, Math.floor((clampedX / rect.width) * term.cols)));
+      const viewRow = Math.max(0, Math.min(term.rows - 1, Math.floor((clampedY / rect.height) * term.rows)));
+      const absRow = term.buffer.active.viewportY + viewRow;
+      const detected = findLinkAtCell(term.buffer.active, absRow, col)?.text ?? null;
+      return { col, absRow, link: detected ?? hoveredOscLinkRef.current };
+    },
+    [],
+  );
 
   const fontFamily = useMemo(() => buildTerminalFontFamily(termCfg.fontFamily, fontCatalog), [termCfg.fontFamily, fontCatalog]);
   const lineHeight = useMemo(() => Number((termCfg.lineHeight / 100).toFixed(2)), [termCfg.lineHeight]);
@@ -333,9 +406,9 @@ export function TerminalSurface({
           if (localConnRef.current === localConnId) localConnRef.current = null;
         }
       }
-      await sendInput(data);
+      await rpcCall(agent.deviceId, "terminal.input", { agent: agent.key, data, auto: true }).catch(() => {});
     },
-    [sendInput],
+    [agent.deviceId, agent.key],
   );
 
   const sendFilesToPty = useCallback(
@@ -811,6 +884,7 @@ export function TerminalSurface({
       term.options.fontWeight = termCfg.fontWeight as 300 | 400 | 500 | 600 | 700;
       term.options.fontWeightBold = Math.min(900, Math.max(700, termCfg.fontWeight + 200)) as 700 | 800 | 900;
       term.options.cursorBlink = termCfg.cursorBlink;
+      term.options.customGlyphs = activeSpec.mode === "dark";
       term.options.theme = activeSpec.theme;
       term.options.minimumContrastRatio = activeSpec.minimumContrastRatio;
       for (const entry of overlayNodesRef.current.values()) {
@@ -842,7 +916,7 @@ export function TerminalSurface({
       allowProposedApi: true,
       cursorBlink: termCfg.cursorBlink,
       cursorStyle: "block",
-      customGlyphs: true,
+      customGlyphs: activeSpec.mode === "dark",
       rescaleOverlappingGlyphs: true,
       fontFamily,
       fontSize: termCfg.fontSize,
@@ -854,6 +928,19 @@ export function TerminalSurface({
       macOptionIsMeta: true,
       macOptionClickForcesSelection: true,
       theme: activeSpec.theme,
+      linkHandler: {
+        allowNonHttpProtocols: true,
+        activate: (ev, text) => {
+          if (ev.button !== 0 || term.hasSelection()) return;
+          activateTerminalLink(text, ev.altKey);
+        },
+        hover: (_ev, text) => {
+          hoveredOscLinkRef.current = text;
+        },
+        leave: () => {
+          hoveredOscLinkRef.current = null;
+        },
+      },
       windowOptions: {
         getWinSizePixels: true,
         getCellSizePixels: true,
@@ -1050,6 +1137,151 @@ export function TerminalSurface({
       return false;
     });
 
+    const dispLinkProvider = term.registerLinkProvider({
+      provideLinks(bufferLineNumber, cb) {
+        const detected = findTerminalLinksForBufferLine(term.buffer.active, bufferLineNumber);
+        if (!detected.length) {
+          cb(undefined);
+          return;
+        }
+        cb(
+          detected.map((item) => ({
+            range: item.range,
+            text: item.text,
+            decorations: { pointerCursor: true, underline: true },
+            activate: (ev, text) => {
+              if (ev.button !== 0 || term.hasSelection()) return;
+              activateTerminalLink(text, ev.altKey);
+            },
+          })),
+        );
+      },
+    });
+
+    // Capture native macOS Edit->Copy (`Cmd+C`) DOM copy events when xterm holds a selection.
+    const onDocumentCopy = (e: ClipboardEvent) => {
+      if (!activeRef.current || !term.hasSelection()) return;
+      const domSel = window.getSelection();
+      const domText = domSel?.toString() ?? "";
+      if (domText && domSel?.anchorNode && !hostEl.contains(domSel.anchorNode)) return;
+      const sel = term.getSelection();
+      if (!sel) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.clipboardData?.setData("text/plain", sel);
+      void copyToClipboard(sel);
+    };
+    document.addEventListener("copy", onDocumentCopy, true);
+
+    // Bridge drag-to-select, double/triple-click, and clickable links when TUIs enable mouse reporting.
+    let activeDragCleanup: (() => void) | null = null;
+    let lastMouseHoverLink = false;
+    const onHostMouseMoveHover = (e: MouseEvent) => {
+      if (term.modes.mouseTrackingMode === "none") {
+        if (lastMouseHoverLink) {
+          lastMouseHoverLink = false;
+          term.element?.classList.remove("xterm-cursor-pointer");
+        }
+        return;
+      }
+      const cell = resolvePointerCell(hostEl, term, e.clientX, e.clientY, false);
+      const hasLink = Boolean(cell?.link);
+      if (hasLink !== lastMouseHoverLink) {
+        lastMouseHoverLink = hasLink;
+        term.element?.classList.toggle("xterm-cursor-pointer", hasLink);
+      }
+    };
+    const onHostMouseLeaveHover = () => {
+      if (lastMouseHoverLink) {
+        lastMouseHoverLink = false;
+        term.element?.classList.remove("xterm-cursor-pointer");
+      }
+    };
+    const onHostMouseDownCapture = (e: MouseEvent) => {
+      if (e.button !== 0 || e.ctrlKey || (IS_MAC ? e.altKey : e.shiftKey)) return;
+      if (term.modes.mouseTrackingMode === "none") return;
+      const startCell = resolvePointerCell(hostEl, term, e.clientX, e.clientY, false);
+      if (!startCell) return;
+
+      const clickedLink = startCell.link;
+      if (clickedLink) {
+        e.stopPropagation();
+        e.preventDefault();
+        term.focus();
+      } else if (!isShellRef.current && e.detail >= 2) {
+        e.stopPropagation();
+        e.preventDefault();
+        term.focus();
+        if (e.detail === 2) {
+          const word = findWordSelectionAtCell(term.buffer.active, startCell.absRow, startCell.col, term.cols);
+          if (word) term.select(word.col, word.row, word.length);
+        } else {
+          term.selectLines(startCell.absRow, startCell.absRow);
+        }
+        return;
+      }
+
+      if (e.detail >= 2 && clickedLink) {
+        const word = findWordSelectionAtCell(term.buffer.active, startCell.absRow, startCell.col, term.cols);
+        if (word) term.select(word.col, word.row, word.length);
+        return;
+      }
+
+      activeDragCleanup?.();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let draggingSelection = false;
+
+      const onWinMove = (mv: MouseEvent) => {
+        if (!draggingSelection && Math.hypot(mv.clientX - startX, mv.clientY - startY) < 5) return;
+        draggingSelection = true;
+        mv.stopPropagation();
+        mv.preventDefault();
+        const cur = resolvePointerCell(hostEl, term, mv.clientX, mv.clientY, true);
+        if (!cur) return;
+        const startOffset = startCell.absRow * term.cols + startCell.col;
+        const curOffset = cur.absRow * term.cols + cur.col;
+        const from = Math.min(startOffset, curOffset);
+        const to = Math.max(startOffset, curOffset);
+        const col0 = from % term.cols;
+        const row0 = Math.floor(from / term.cols);
+        const len = Math.max(1, to - from + 1);
+        term.select(col0, row0, len);
+      };
+
+      const finishDrag = (up: MouseEvent) => {
+        cleanup();
+        if (draggingSelection) {
+          up.stopPropagation();
+          up.preventDefault();
+          return;
+        }
+        if (clickedLink) {
+          up.stopPropagation();
+          up.preventDefault();
+          activateTerminalLink(clickedLink, up.altKey);
+        } else if (term.hasSelection()) {
+          term.clearSelection();
+        }
+      };
+
+      const cleanup = () => {
+        window.removeEventListener("mousemove", onWinMove, true);
+        window.removeEventListener("mouseup", finishDrag, true);
+        window.removeEventListener("blur", cleanup, true);
+        if (activeDragCleanup === cleanup) activeDragCleanup = null;
+      };
+
+      activeDragCleanup = cleanup;
+      window.addEventListener("mousemove", onWinMove, true);
+      window.addEventListener("mouseup", finishDrag, true);
+      window.addEventListener("blur", cleanup, true);
+    };
+
+    hostEl.addEventListener("mousemove", onHostMouseMoveHover);
+    hostEl.addEventListener("mouseleave", onHostMouseLeaveHover);
+    hostEl.addEventListener("mousedown", onHostMouseDownCapture, true);
+
     const textarea = term.textarea;
     const onTermFocus = () => {
       const localConnId = localConnRef.current;
@@ -1101,7 +1333,6 @@ export function TerminalSurface({
         if (lower === "c") {
           if (term.hasSelection()) {
             void copyToClipboard(term.getSelection());
-            term.clearSelection();
           }
           return consume();
         }
@@ -1160,7 +1391,6 @@ export function TerminalSurface({
         const lower = e.key.toLowerCase();
         if (lower === "c" && term.hasSelection()) {
           void copyToClipboard(term.getSelection());
-          term.clearSelection();
           return consume();
         }
         if (e.shiftKey && lower === "c") {
@@ -1521,7 +1751,12 @@ export function TerminalSurface({
         const canReadLocalFile =
           Boolean(localConnRef.current) ||
           (native.available() && (localHostIdStore.get() === null || localHostIdStore.get() === agent.deviceId));
-        if (!memRef && ((firstCmd.medium !== "d" && !(isFileMedium && canReadLocalFile)) || !fullB64)) continue;
+        if (!memRef && ((firstCmd.medium !== "d" && !(isFileMedium && canReadLocalFile)) || !fullB64)) {
+          if (firstCmd.quiet === 0 && firstCmd.id !== undefined) {
+            void sendAutoInput(`\x1b_Gi=${firstCmd.id};ENOENT:unsupported\x1b\\`);
+          }
+          continue;
+        }
 
         const imgId = firstCmd.id ?? nextImgId++;
         let payloadBytes: Uint8Array | null = null;
@@ -1654,7 +1889,7 @@ export function TerminalSurface({
                 rawData.byteOffset,
                 rawData.byteOffset + rawData.byteLength,
               ) as ArrayBuffer;
-              const url = URL.createObjectURL(new Blob([copy], { type: "image/png" }));
+              const url = URL.createObjectURL(new Blob([copy], { type: sniffImageMime(rawData) }));
               finishAsset({ id: imgId, url, width, height });
               continue;
             }
@@ -1753,6 +1988,14 @@ export function TerminalSurface({
 
     const startRelayStream = () => {
       if (!alive || unsubRelay) return;
+      const runFallbackRead = () => {
+        if (!alive || sawRaw) return;
+        void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 })
+          .then((res) => {
+            if (alive && !sawRaw) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
+          })
+          .catch(() => {});
+      };
       unsubRelay = subscribeStream(
         agent.deviceId,
         "terminal",
@@ -1761,12 +2004,16 @@ export function TerminalSurface({
           raw: true,
           cols: term.cols,
           rows: term.rows,
-          history: 2000,
+          history: 800,
           display: currentDisplay(term),
         },
         (ev) => {
           if (!alive || !ev) return;
           if (ev.kind === "terminal_data" && typeof ev.data === "string") {
+            if (seedTimer) {
+              clearTimeout(seedTimer);
+              seedTimer = 0;
+            }
             if (!sawRaw) {
               sawRaw = true;
               if (fallbackLines.length) term.reset();
@@ -1782,15 +2029,23 @@ export function TerminalSurface({
             writeFallbackScreen(applyRows(fallbackLines, ev));
           }
         },
+        (state: { kind?: string; result?: { raw?: boolean } } | undefined) => {
+          if (!alive || !state) return;
+          if (state.kind === "live" && state.result?.raw === true) {
+            if (seedTimer) {
+              clearTimeout(seedTimer);
+              seedTimer = 0;
+            }
+          } else if (state.kind === "error") {
+            if (seedTimer) {
+              clearTimeout(seedTimer);
+              seedTimer = 0;
+            }
+            runFallbackRead();
+          }
+        },
       );
-      seedTimer = window.setTimeout(() => {
-        if (!alive || sawRaw) return;
-        void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 })
-          .then((res) => {
-            if (alive && !sawRaw) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
-          })
-          .catch(() => {});
-      }, 150);
+      seedTimer = window.setTimeout(runFallbackRead, 1000);
     };
 
     if (native.available() && (agent.source === "hc" || agent.source === "herdr") && agent.localId) {
@@ -1929,7 +2184,13 @@ export function TerminalSurface({
       dispDecRst.dispose();
       dispCsiWindowOps.dispose();
       dispResetKeys.dispose();
+      dispLinkProvider.dispose();
       dispData.dispose();
+      document.removeEventListener("copy", onDocumentCopy, true);
+      activeDragCleanup?.();
+      hostEl.removeEventListener("mousemove", onHostMouseMoveHover);
+      hostEl.removeEventListener("mouseleave", onHostMouseLeaveHover);
+      hostEl.removeEventListener("mousedown", onHostMouseDownCapture, true);
       textarea?.removeEventListener("focus", onTermFocus);
       textarea?.removeEventListener("blur", onTermBlur);
       webglAddon?.dispose();
@@ -2077,7 +2338,18 @@ export function TerminalSurface({
       onContextMenu={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        setCtxMenu({ x: e.clientX, y: e.clientY });
+        const term = termRef.current;
+        const hostEl = hostRef.current;
+        const cell = term && hostEl ? resolvePointerCell(hostEl, term, e.clientX, e.clientY, false) : null;
+        const link = cell?.link || undefined;
+        const isHttpLink = Boolean(link && /^https?:\/\//i.test(link));
+        const lineText = term && cell ? readLogicalLineText(term.buffer.active, cell.absRow).trim() : "";
+        setCtxMenu({
+          x: e.clientX,
+          y: e.clientY,
+          ...(link ? { link, isHttpLink } : {}),
+          ...(lineText ? { lineText } : {}),
+        });
       }}
       onPasteCapture={(e) => {
         const files = e.clipboardData?.files;
@@ -2100,11 +2372,51 @@ export function TerminalSurface({
           data-term-ctx-menu
           role="menu"
           style={{
-            left: Math.min(ctxMenu.x, (typeof window !== "undefined" ? window.innerWidth : 800) - 190),
-            top: Math.min(ctxMenu.y, (typeof window !== "undefined" ? window.innerHeight : 600) - 270),
+            left: Math.min(ctxMenu.x, (typeof window !== "undefined" ? window.innerWidth : 800) - 210),
+            top: Math.min(ctxMenu.y, (typeof window !== "undefined" ? window.innerHeight : 600) - 360),
             zIndex: 2300,
           }}
         >
+          {ctxMenu.link ? (
+            <>
+              <button
+                type="button"
+                className="menu-item"
+                onClick={() => {
+                  const target = ctxMenu.link!;
+                  setCtxMenu(null);
+                  activateTerminalLink(target, false);
+                }}
+              >
+                {ctxMenu.isHttpLink ? "打开链接" : "打开文件"}
+              </button>
+              {ctxMenu.isHttpLink ? (
+                <button
+                  type="button"
+                  className="menu-item"
+                  onClick={() => {
+                    const target = ctxMenu.link!;
+                    setCtxMenu(null);
+                    activateTerminalLink(target, true);
+                  }}
+                >
+                  在内置浏览器打开
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="menu-item"
+                onClick={() => {
+                  const target = ctxMenu.link!;
+                  setCtxMenu(null);
+                  void copyToClipboard(target).then((ok) => toast(ok ? "已复制链接" : "复制失败", !ok));
+                }}
+              >
+                复制链接
+              </button>
+              <div className="menu-sep" />
+            </>
+          ) : null}
           <button
             type="button"
             className="menu-item"
@@ -2112,13 +2424,36 @@ export function TerminalSurface({
             onClick={() => {
               const t = termRef.current;
               if (t?.hasSelection()) {
-                void copyToClipboard(t.getSelection());
-                t.clearSelection();
+                void copyToClipboard(t.getSelection()).then((ok) => toast(ok ? "已复制" : "复制失败", !ok));
               }
               setCtxMenu(null);
             }}
           >
             复制
+          </button>
+          {ctxMenu.lineText ? (
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const line = ctxMenu.lineText!;
+                setCtxMenu(null);
+                void copyToClipboard(line).then((ok) => toast(ok ? "已复制当前行" : "复制失败", !ok));
+              }}
+            >
+              复制当前行
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="menu-item"
+            onClick={() => {
+              termRef.current?.selectAll();
+              setCtxMenu(null);
+              termRef.current?.focus();
+            }}
+          >
+            全选
           </button>
           <button
             type="button"

@@ -146,6 +146,35 @@ export function DesktopShell({
   const hosts = useMemo(() => Object.values(devices).filter((d) => d.kind === "host"), [devices]);
   const newAgent = useCallback((host: string | null = null, space: string | null = null) => setCreate({ host, space }), []);
 
+  // Keep space counts, tabs, and renames synced periodically with Herdr.app while the window is visible.
+  useEffect(() => {
+    const sync = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      refreshHostSpaces();
+    };
+    const timer = window.setInterval(sync, 10_000);
+    document.addEventListener("visibilitychange", sync);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", sync);
+    };
+  }, []);
+
+  // If incoming agents reference a space not yet in liveStore.spaces, refresh spaces for that host immediately.
+  useEffect(() => {
+    const spacesByHost = liveStore.get().spaces;
+    for (const [hostId, list] of Object.entries(agentsMap)) {
+      if (devices[hostId]?.online === false) continue;
+      const known = new Set((spacesByHost[hostId] ?? []).map((s) => s.name));
+      if (list.some((a) => {
+        const sp = agentSpace(a);
+        return Boolean(sp && !known.has(sp));
+      })) {
+        refreshHostSpaces(hostId);
+      }
+    }
+  }, [agentsMap, devices]);
+
   const spawnTerminalNow = useCallback(
     async (preferredHost: string | null = null, preferredSpace: string | null = null) => {
       const { devices: devs, agents: agMap } = liveStore.get();
@@ -181,7 +210,8 @@ export function DesktopShell({
         (activeAgent?.deviceId === hostId && activeAgent.cwd ? activeAgent.cwd : undefined) ??
         all.find((a) => a.deviceId === hostId && (!spaceName || (agentSpace(a) ?? "") === spaceName) && a.cwd)?.cwd;
 
-      const isLocal = isTauri() && Boolean(localHostId && hostId === localHostId);
+      const knownSpaces = liveStore.get().spaces[hostId] ?? [];
+      const isLocal = knownSpaces.length === 0 && isTauri() && Boolean(localHostId && hostId === localHostId);
       if (isLocal) {
         try {
           let resolvedFolder = folder;
@@ -259,6 +289,7 @@ export function DesktopShell({
           return { ...prev, agents: { ...prev.agents, [hostId]: [shellAgent, ...list] }, rev: prev.rev + 1 };
         });
         openAgentTab(created.agent, "term");
+        refreshHostSpaces(hostId);
       } catch (e) {
         toast((e as Error).message, true);
       }

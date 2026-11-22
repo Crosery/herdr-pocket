@@ -13,7 +13,7 @@ import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../view
 import { assistantStore, loadAssistant } from "../lib/assistant";
 import { assetUrl, copyToClipboard, detectPlatform } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
-import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
+import { createBufferedEventMerger, foldConvEvents, mergeConvEvents } from "../lib/chatFold";
 import { useClientConfig } from "../lib/config";
 import { endPanelDrag, endTabDrag, endWorkspaceDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readPanelDrag, readTabDrag, readWorkspaceDrag, startPanelDrag, startTabDrag } from "../lib/fileDrag";
 import { useLocalHostDeviceId } from "../lib/fonts";
@@ -1318,12 +1318,17 @@ function SubagentAsidePanel() {
     let live = false;
     setEvents([]);
     setChildSubs([]);
+    const merger = createBufferedEventMerger((batch) => {
+      if (alive) setEvents((prev) => mergeConvEvents(prev, batch));
+    });
 
     void rpcCall(parentAgent.deviceId, "session.events", { agent: aside.agentKey, sub: current.key, limit: 200 })
       .then((res) => {
-        if (alive) setEvents((prev) => mergeConvEvents(prev, res.events));
+        if (alive) merger.onInitialPage(res.events);
       })
-      .catch(() => {});
+      .catch(() => {
+        if (alive) merger.onInitialReady();
+      });
 
     void rpcCall(parentAgent.deviceId, "session.children", { agent: aside.agentKey, sub: current.key })
       .then((res) => {
@@ -1338,7 +1343,7 @@ function SubagentAsidePanel() {
       (ev) => {
         if (!alive || !ev) return;
         if ((ev.kind === "session" || ev.kind === "session_event") && ev.event) {
-          setEvents((prev) => mergeConvEvents(prev, [ev.event as ConvEvent]));
+          merger.onStreamEvent(ev.event as ConvEvent);
         }
       },
       (st) => {
@@ -1357,6 +1362,7 @@ function SubagentAsidePanel() {
 
     return () => {
       alive = false;
+      merger.dispose();
       window.clearInterval(timer);
       unsub();
     };

@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, KeyboardAvoidingView, Pressable, TextInput, useWindowDimensions, View } from "react-native";
+import { FlatList, Pressable, TextInput, useWindowDimensions, View } from "react-native";
 import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -12,6 +12,7 @@ import { Md } from "../../components/md";
 import { CallBar, CallScreen } from "../../components/CallScreen";
 import { AgentLink, NoticeBubble } from "../../components/notice";
 import { RemindersSheet } from "../../components/reminders";
+import { PocketKeyboardAvoidingView } from "../../components/PocketKeyboardAvoidingView";
 import { PocketButton, PocketDialog } from "../../components/pocket";
 import { useFocusEffect } from "expo-router";
 import { clearAssistant, decideAction, loadAssistant, sendToAssistant, setAssistantWatching, useAssistant } from "../../lib/assistant";
@@ -127,7 +128,7 @@ export default function AssistantScreen() {
 
   return (
     <PageBackground>
-      <View style={{ paddingTop: insets.top + space.md, paddingLeft: padLeft, paddingRight: padRight, paddingBottom: space.sm, flexDirection: "row", alignItems: "center", gap: space.md }}>
+      <View style={{ flexShrink: 0, paddingTop: insets.top + space.md, paddingLeft: padLeft, paddingRight: padRight, paddingBottom: space.sm, flexDirection: "row", alignItems: "center", gap: space.md }}>
         <Mascot mood={busy || inCall ? "hello" : "default"} size={46} />
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={{ fontFamily: fonts.cute, fontSize: 24, lineHeight: 32, color: p.ink }}>{NAME}</Text>
@@ -157,7 +158,7 @@ export default function AssistantScreen() {
         </Card>
       ) : null}
 
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding">
+      <PocketKeyboardAvoidingView style={{ flex: 1 }}>
         {/* The welcome sits outside the inverted list: inverted lists flip their empty view differently per platform. */}
         {loaded && !data.length && !busy ? (
           <Welcome onPick={(s) => void send(s)} voice={voice || isMockServer(server)} />
@@ -182,7 +183,7 @@ export default function AssistantScreen() {
           voice={voice || isMockServer(server)}
           inCall={inCall}
         />
-      </KeyboardAvoidingView>
+      </PocketKeyboardAvoidingView>
 
       {inCall && callOpen ? <CallScreen name={NAME} onMinimize={foldCall} /> : null}
 
@@ -460,6 +461,7 @@ function Composer({
   return (
     <View
       style={{
+        flexShrink: 0,
         flexDirection: "row",
         alignItems: "flex-end",
         gap: space.sm,

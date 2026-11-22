@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { Agent } from "@herdr-pocket/protocol";
 import { Host } from "../src/host.ts";
-import { UnifloAdapter } from "../src/uniflo.ts";
+import { cleanEvent, UnifloAdapter } from "../src/uniflo.ts";
 
 const S = "claude:aaaaaaaa-0000-0000-0000-000000000001";
 
@@ -211,5 +211,43 @@ test("UnifloAdapter.enrich populates model and thinkingLevel from s.source trans
     assert.equal(refreshed[0]?.thinkingLevel, "xhigh");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cleanEvent parses model switch XML commands and drops empty local-command-stdout noise", () => {
+  const modelCmd = cleanEvent({
+    id: "m1",
+    session: S,
+    ts: 1000,
+    kind: "user_message",
+    text: "<command-name>/model</command-name>\n<command-args>gpt-6.2-sol</command-args>",
+  });
+  assert.ok(modelCmd);
+  assert.equal(modelCmd.kind, "system");
+  if (modelCmd.kind === "system") {
+    assert.equal(modelCmd.subtype, "model_switch");
+    assert.equal(modelCmd.summary, "已切换模型为 gpt-6.2-sol");
+  }
+
+  const emptyStdout = cleanEvent({
+    id: "m2",
+    session: S,
+    ts: 1001,
+    kind: "user_message",
+    text: "<local-command-stdout>  \u001b[0m  </local-command-stdout>",
+  });
+  assert.equal(emptyStdout, null);
+
+  const otherCmd = cleanEvent({
+    id: "m3",
+    session: S,
+    ts: 1002,
+    kind: "user_message",
+    text: "<command-name>/compact</command-name>",
+  });
+  assert.ok(otherCmd);
+  assert.equal(otherCmd.kind, "system");
+  if (otherCmd.kind === "system") {
+    assert.equal(otherCmd.summary, "命令 /compact");
   }
 });

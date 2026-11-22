@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { KeyboardAvoidingView, View } from "react-native";
+import { View } from "react-native";
 import { Text } from "react-native-paper";
 import { Stack, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -8,6 +8,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { Agent } from "@herdr-pocket/protocol";
 import { ChatView } from "../../components/chat";
 import { Composer, InfoView, TerminalView } from "../../components/detail";
+import { PocketKeyboardAvoidingView } from "../../components/PocketKeyboardAvoidingView";
 import { Breadcrumb, SubagentList } from "../../components/subagents";
 import { EmptyState, HarnessAvatar, PageBackground, StatusPill } from "../../components/ui";
 import { PocketSegmented, PocketSpinner, type PocketIcon } from "../../components/pocket";
@@ -120,8 +121,8 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
     <PageBackground>
       {/* The title lives in the bar; one slim line of context below, so the conversation gets the screen. */}
       <Stack.Screen options={{ title: agentTitle(agent) }} />
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding" keyboardVerticalOffset={headerHeight}>
-        <View style={{ paddingLeft: padLeft, paddingRight: padRight, paddingTop: space.xs, gap: space.sm }}>
+      <PocketKeyboardAvoidingView style={{ flex: 1 }} keyboardVerticalOffset={headerHeight}>
+        <View style={{ flexShrink: 0, paddingLeft: padLeft, paddingRight: padRight, paddingTop: space.xs, gap: space.sm }}>
           <View style={{ flexDirection: "row", gap: space.sm, alignItems: "center", minHeight: 30 }}>
             <HarnessAvatar harness={agent.harness} isShell={agent.isShell} size={28} />
             <View style={{ flexShrink: 1, minWidth: 0, maxWidth: "48%" }}>
@@ -134,7 +135,7 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
           </View>
           <PocketSegmented value={tab} onChange={setTab} segments={buttons} compact={subs > 0} />
         </View>
-        <View style={{ flex: 1 }}>
+        <View style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
           {tab === "chat" ? <ChatView agent={agent} active bottomInset={0} childCount={subs} /> : null}
           {tab === "terminal" ? <TerminalView agent={agent} active /> : null}
           {tab === "subs" ? <SubagentList agent={agent} trail={[]} active bottomInset={insets.bottom} /> : null}
@@ -143,9 +144,9 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
         {tab === "chat" || tab === "terminal" ? (
           <Composer agent={agent} bottomInset={insets.bottom} mode={tab} onOpenTerminal={() => setTab("terminal")} />
         ) : (
-          <View style={{ height: insets.bottom }} />
+          <View style={{ height: insets.bottom, flexShrink: 0 }} />
         )}
-      </KeyboardAvoidingView>
+      </PocketKeyboardAvoidingView>
     </PageBackground>
   );
 }

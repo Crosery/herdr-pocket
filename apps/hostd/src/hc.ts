@@ -58,10 +58,22 @@ export function endsInPanel(screen: string): boolean {
   return tail.some((l) => MODAL_PICKER_TAIL_PATTERNS.some((re) => re.test(l)));
 }
 
+/** Per-terminal metadata reported by `herdr-app ls` / persisted `docs.json`. */
+export interface AppTerminalMeta {
+  spaceId: string;
+  spaceName: string;
+  tabId?: string;
+  tabName?: string;
+  app?: string | null;
+  status?: string | null;
+  name?: string | null;
+}
+
 /** Space and tab names by id, as the desktop app (`herdr-app ls`) shows them. */
 export interface AppNames {
   spaces: Map<string, string>;
   tabs: Map<string, string>;
+  terminals?: Map<string, AppTerminalMeta>;
 }
 
 /** Interpreters an agent program runs inside; their name says nothing about the agent. */
@@ -382,16 +394,32 @@ export class HcAdapter extends EventEmitter {
 
   /** "space / tab" with the names the desktop app shows now (renames included). */
   static where(t: HcTerminal, names?: AppNames): string | undefined {
+    const meta = names?.terminals?.get(t.address);
+    if (meta) {
+      return meta.tabName ? `${meta.spaceName} / ${meta.tabName}` : meta.spaceName;
+    }
     const label = t.labels?.where;
     const space = names?.spaces.get(t.labels?.["herdr.space"] ?? "");
-    if (!space) return label;
+    if (!space) {
+      const isStaleClosed =
+        Boolean(names?.terminals) &&
+        !t.labels?.["herdr.space"] &&
+        t.labels?.["herdr.seen"] !== undefined &&
+        !(typeof t.created_ms === "number" && Date.now() - t.created_ms < 15_000);
+      if (isStaleClosed) return undefined;
+      return label;
+    }
     const tab = names?.tabs.get(t.labels?.["herdr.tab"] ?? "") ?? label?.split(" / ").slice(1).join(" / ");
     return tab ? `${space} / ${tab}` : space;
   }
 
   static toAgent(t: HcTerminal, deviceId: string, names?: AppNames): Agent {
-    const harness = HcAdapter.harness(t);
-    const name = t.name?.trim() || undefined;
+    const meta = names?.terminals?.get(t.address);
+    let harness = HcAdapter.harness(t);
+    const metaApp = !t.status && SHELL_HARNESSES.has(harness.toLowerCase()) ? meta?.app?.trim() : undefined;
+    const restoredApp = metaApp && !SHELL_HARNESSES.has(metaApp.toLowerCase()) ? metaApp : undefined;
+    if (restoredApp) harness = restoredApp;
+    const name = t.name?.trim() || meta?.name?.trim() || undefined;
     return {
       key: `${deviceId}/hc:${t.address}`,
       deviceId,
@@ -407,7 +435,7 @@ export class HcAdapter extends EventEmitter {
       statusNote: HcAdapter.note(t),
       errored: ["error", "failed"].includes(t.status?.state?.toLowerCase() ?? "") || undefined,
       turn: t.turn,
-      isShell: !t.status && SHELL_HARNESSES.has(harness.toLowerCase()),
+      isShell: !t.status && !restoredApp && SHELL_HARNESSES.has(harness.toLowerCase()),
       updatedAt: t.status_ms ?? t.created_ms ?? Date.now(),
     };
   }
@@ -561,9 +589,9 @@ export class HcAdapter extends EventEmitter {
   }
 
   /** Types raw text at once (see HcScreens.input); the terminal keeps its size. */
-  async input(address: string, data: string): Promise<void> {
+  async input(address: string, data: string, auto = false): Promise<void> {
     const t = this.terminals.get(address);
-    await this.screens.input(address, data, t?.cols || 80, t?.rows || 24);
+    await this.screens.input(address, data, t?.cols || 80, t?.rows || 24, auto);
   }
 
   async keys(address: string, keys: string[]): Promise<void> {

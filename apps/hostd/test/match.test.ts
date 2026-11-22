@@ -208,6 +208,95 @@ test("uniflo matching: a unique harness+cwd+title pair is matched when several s
   assert.equal(out[2]!.sessionKey, undefined);
 });
 
+test("hc stopped-agent tabs listed by Herdr.app keep their app harness and tab placement", () => {
+  const names = {
+    spaces: new Map([["sp1", "SpaceA"]]),
+    tabs: new Map([["tb1", "Spec"]]),
+    terminals: new Map([
+      [
+        "t9",
+        {
+          spaceId: "sp1",
+          spaceName: "SpaceA",
+          tabId: "tb1",
+          tabName: "Spec",
+          app: "claude-code",
+          status: null,
+          name: "worker-1",
+        },
+      ],
+    ]),
+  };
+  const stopped = HcAdapter.toAgent(
+    {
+      address: "t9",
+      cwd: "/tmp/demo",
+      state: "live",
+      status: null,
+      argv: ["/bin/zsh", "-l"],
+      foreground: { argv: ["zsh"], cwd: "/tmp/demo", pid: 800 },
+      labels: { "herdr.space": "sp1", "herdr.tab": "tb1" },
+    },
+    "dev1",
+    names,
+  );
+  assert.equal(stopped.harness, "claude-code");
+  assert.equal(stopped.isShell, false);
+  assert.equal(stopped.name, "worker-1");
+  assert.equal(stopped.where, "SpaceA / Spec");
+});
+
+test("uniflo matching: concurrent antigravity terminals in same cwd with scrambled pids pair 1:1 by created_ms and status.msg", () => {
+  const u = new UnifloAdapter("http://127.0.0.1:1");
+  const base = Date.now() - 600_000;
+  const oldStarted = base - 5 * 3600_000;
+  u.sessions = [
+    session("agy:older", "antigravity", "/tmp/demo", {
+      pid: 12024,
+      title: "Older unrelated session",
+      started_at: oldStarted,
+      updated_at: base + 10_000,
+    }),
+    session("agy:s1", "antigravity", "/tmp/demo", {
+      pid: 9001,
+      title: "Alpha flow",
+      started_at: base + 22_000,
+      updated_at: base + 120_000,
+    }),
+    session("agy:s2", "antigravity", "/tmp/demo", {
+      pid: 9002,
+      title: "Beta layout",
+      started_at: base + 24_000,
+      updated_at: base + 120_000,
+    }),
+    session("agy:s3", "antigravity", "/tmp/demo", {
+      pid: 9003,
+      title: "Motion harness visual polish",
+      started_at: base + 73_000,
+      updated_at: base + 150_000,
+    }),
+  ];
+  const a1 = agent("t1", "antigravity", "/tmp/demo");
+  const a2 = agent("t2", "antigravity", "/tmp/demo");
+  // t3 has a PID misattributed by Uniflo to `agy:older` started 5h before t3 existed.
+  const a3 = agent("t3", "antigravity", "/tmp/demo");
+  const created = new Map([
+    [a1.key, base],
+    [a2.key, base + 2_000],
+    [a3.key, base + 51_000],
+  ]);
+  const pids = new Map([
+    [a1.key, 99001],
+    [a2.key, 99002],
+    [a3.key, 12024],
+  ]);
+  const out = u.enrich([a1, a2, a3], pids, new Map(), created);
+  assert.deepEqual(
+    out.map((a) => a.sessionKey),
+    ["agy:s1", "agy:s2", "agy:s3"],
+  );
+});
+
 test("herdr commands: only listed commands and arguments pass, programs by launcher id", async () => {
   const { herdrCommandArgs, resumeArgv, parseDo } = await import("../src/create.ts");
   const installed = ["claude", "shell"];

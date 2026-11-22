@@ -7,7 +7,7 @@
 import { AppState } from "react-native";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
-import type { Agent } from "@herdr-pocket/protocol";
+import { buildHarnessSwitchCommands, stripModelEffortSuffix, type Agent } from "@herdr-pocket/protocol";
 import type { Attachment } from "./attach";
 import { sendOut, type SendResult } from "./outbox";
 import { call } from "./relay";
@@ -22,10 +22,23 @@ export interface MobileQueuedPrompt {
   createdAt: number;
 }
 
+export interface MobilePendingSwitch {
+  agentKey: string;
+  deviceId: string;
+  harness: string;
+  modelId?: string;
+  thinkingLevel?: string;
+  label: string;
+  createdAt: number;
+}
+
 interface MobileQueueState {
   byAgent: Record<string, MobileQueuedPrompt[]>;
+  pendingSwitchByAgent: Record<string, MobilePendingSwitch>;
   steering: Record<string, boolean>;
   enqueue: (item: MobileQueuedPrompt) => void;
+  setPendingSwitch: (item: MobilePendingSwitch) => void;
+  clearPendingSwitch: (agentKey: string) => void;
   remove: (agentKey: string, id: string) => void;
   moveToTop: (agentKey: string, id: string) => void;
   pop: (agentKey: string, id: string) => MobileQueuedPrompt | null;
@@ -102,6 +115,7 @@ export const useMobileQueue = create<MobileQueueState>()(
   persist(
     (set, get) => ({
       byAgent: {},
+      pendingSwitchByAgent: {},
       steering: {},
       enqueue: (item) =>
         set((s) => ({
@@ -110,6 +124,20 @@ export const useMobileQueue = create<MobileQueueState>()(
             [item.agentKey]: [...(s.byAgent[item.agentKey] ?? []), item],
           },
         })),
+      setPendingSwitch: (item) =>
+        set((s) => ({
+          pendingSwitchByAgent: {
+            ...s.pendingSwitchByAgent,
+            [item.agentKey]: item,
+          },
+        })),
+      clearPendingSwitch: (agentKey) =>
+        set((s) => {
+          if (!s.pendingSwitchByAgent[agentKey]) return s;
+          const next = { ...s.pendingSwitchByAgent };
+          delete next[agentKey];
+          return { pendingSwitchByAgent: next };
+        }),
       remove: (agentKey, id) =>
         set((s) => {
           const prev = s.byAgent[agentKey];
@@ -159,7 +187,10 @@ export const useMobileQueue = create<MobileQueueState>()(
     {
       name: "hp.mobile.queue.v1",
       storage: createJSONStorage(() => safeAsyncStorage),
-      partialize: (s) => ({ byAgent: compactMobileQueue(s.byAgent) }),
+      partialize: (s) => ({
+        byAgent: compactMobileQueue(s.byAgent),
+        pendingSwitchByAgent: s.pendingSwitchByAgent,
+      }),
       onRehydrateStorage: () => (state) => {
         if (!state) return;
         for (const list of Object.values(state.byAgent)) {
@@ -194,6 +225,65 @@ export function enqueueMobilePrompt(
   };
   useMobileQueue.getState().enqueue(item);
   return item;
+}
+
+export function scheduleMobilePendingSwitch(
+  agent: Pick<Agent, "key" | "deviceId" | "harness">,
+  patch: { modelId?: string; thinkingLevel?: string; label?: string },
+): MobilePendingSwitch | null {
+  const modelId = patch.modelId?.trim() || undefined;
+  const thinkingLevel = patch.thinkingLevel?.trim().toLowerCase() || undefined;
+  if (!modelId && !thinkingLevel) return null;
+  const store = useMobileQueue.getState();
+  const prev = store.pendingSwitchByAgent[agent.key];
+  const nextModel = modelId ?? prev?.modelId;
+  const nextThinking = thinkingLevel ?? prev?.thinkingLevel;
+  const baseLabel = nextModel ? stripModelEffortSuffix(nextModel) : "";
+  const autoLabel = [baseLabel, nextThinking ? `思考 ${nextThinking}` : ""].filter(Boolean).join(" · ");
+  const label =
+    patch.label?.trim() && !(modelId && !thinkingLevel && prev?.thinkingLevel) && !(!modelId && thinkingLevel && prev?.modelId)
+      ? patch.label.trim()
+      : autoLabel || patch.label?.trim() || "模型配置";
+  const next: MobilePendingSwitch = {
+    agentKey: agent.key,
+    deviceId: agent.deviceId,
+    harness: agent.harness,
+    ...(nextModel ? { modelId: nextModel } : {}),
+    ...(nextThinking ? { thinkingLevel: nextThinking } : {}),
+    label,
+    createdAt: Date.now(),
+  };
+  store.setPendingSwitch(next);
+  return next;
+}
+
+export function cancelMobilePendingSwitch(agentKey: string): void {
+  useMobileQueue.getState().clearPendingSwitch(agentKey);
+}
+
+async function deliverMobilePendingSwitch(sw: MobilePendingSwitch): Promise<void> {
+  try {
+    await call(sw.deviceId, "agent.setModel", {
+      agent: sw.agentKey,
+      ...(sw.modelId ? { modelId: sw.modelId } : {}),
+      ...(sw.thinkingLevel ? { thinkingLevel: sw.thinkingLevel } : {}),
+    });
+  } catch (e: unknown) {
+    const err = e as { code?: string; message?: string };
+    const unsupported =
+      err?.code === "unsupported" ||
+      err?.code === "bad_request" ||
+      /unknown|unsupported|不支持/i.test(err?.message ?? "");
+    if (unsupported) {
+      const plan = buildHarnessSwitchCommands(sw.harness, {
+        modelId: sw.modelId,
+        thinkingLevel: sw.thinkingLevel,
+      });
+      for (const cmd of plan.commands) {
+        await call(sw.deviceId, "terminal.send", { agent: sw.agentKey, text: cmd, enter: true }).catch(() => undefined);
+      }
+    }
+  }
 }
 
 export function removeMobileQueuedPrompt(agentKey: string, id: string): void {
@@ -257,7 +347,7 @@ function runDrainTick(): void {
 
   for (const [key, track] of dispatchState) {
     const a = byKey.get(key);
-    const hasQueue = (qState.byAgent[key]?.length ?? 0) > 0;
+    const hasQueue = (qState.byAgent[key]?.length ?? 0) > 0 || Boolean(qState.pendingSwitchByAgent[key]);
     if (!a) {
       dispatchState.delete(key);
       continue;
@@ -272,8 +362,7 @@ function runDrainTick(): void {
     }
   }
 
-  for (const [key, queue] of Object.entries(qState.byAgent)) {
-    if (!queue.length) continue;
+  for (const [key, sw] of Object.entries(qState.pendingSwitchByAgent)) {
     const agent = byKey.get(key);
     if (!agent) continue;
     const online = Boolean(live.devices[agent.deviceId]?.online);
@@ -282,7 +371,29 @@ function runDrainTick(): void {
     const track = dispatchState.get(key);
     if (now - (track?.lastDispatchedAt ?? 0) < DRAIN_COOLDOWN_MS) continue;
 
-    const next = qState.shiftNext(key);
+    useMobileQueue.getState().clearPendingSwitch(key);
+    inFlight.add(key);
+    dispatchState.set(key, { lastDispatchedAt: now, sawWorking: false });
+    void deliverMobilePendingSwitch(sw).finally(() => {
+      inFlight.delete(key);
+      if ((useMobileQueue.getState().byAgent[key]?.length ?? 0) > 0) {
+        dispatchState.set(key, { lastDispatchedAt: Date.now() - DRAIN_COOLDOWN_MS + 300, sawWorking: false });
+      }
+    });
+  }
+
+  const nextQueueState = useMobileQueue.getState();
+  for (const [key, queue] of Object.entries(nextQueueState.byAgent)) {
+    if (!queue.length) continue;
+    const agent = byKey.get(key);
+    if (!agent) continue;
+    const online = Boolean(live.devices[agent.deviceId]?.online);
+    if (!online || inFlight.has(key) || nextQueueState.steering[key]) continue;
+    if (agent.status !== "idle" && agent.status !== "done") continue;
+    const track = dispatchState.get(key);
+    if (now - (track?.lastDispatchedAt ?? 0) < DRAIN_COOLDOWN_MS) continue;
+
+    const next = nextQueueState.shiftNext(key);
     if (!next) continue;
     inFlight.add(key);
     dispatchState.set(key, { lastDispatchedAt: now, sawWorking: false });

@@ -351,7 +351,8 @@ export class Host {
       this.hc.on("change", this.publish);
       this.hc.start();
       void this.refreshNames();
-      this.namesTimer = setInterval(() => void this.refreshNames(), 15_000);
+      this.namesTimer = setInterval(() => void this.refreshNames(), 4_000);
+      this.namesTimer.unref?.();
       added.push(`herdr GUI core (hc) ${this.hc.version ?? ""}`.trim());
     }
     if (herdr) {
@@ -414,10 +415,17 @@ export class Host {
     let names: AppNames;
     try {
       names = await this.app.names();
-    } catch {
-      return; // window closed: keep what we have, `where` labels cover the rest
+    } catch (e) {
+      if (e instanceof NoDesktopApp) return;
+      const fallback = this.app.namesFromDocs();
+      if (!fallback || (this.names && fallback.spaces.size === 0)) return;
+      names = fallback;
     }
-    const sig = JSON.stringify([[...names.spaces], [...names.tabs]]);
+    const sig = JSON.stringify([
+      [...names.spaces],
+      [...names.tabs],
+      [...(names.terminals?.entries() ?? [])],
+    ]);
     if (sig === this.namesSig) return;
     this.namesSig = sig;
     this.names = names;
@@ -429,13 +437,32 @@ export class Host {
     const pids = new Map<string, number | undefined>();
     const hints = new Map<string, string>();
     const created = new Map<string, number>();
+    const statusMsgs = new Map<string, string>();
     const live = new Set<number>();
     const agents: Agent[] = [];
+    const appTerms = this.names?.terminals;
+    const hasAppInventory = Boolean(appTerms && ((this.names?.spaces.size ?? 0) > 0 || appTerms.size > 0));
+    const appSpaceNames = hasAppInventory ? new Set(this.names!.spaces.values()) : null;
+    const now = Date.now();
     for (const t of this.hc.terminals.values()) {
+      if (hasAppInventory && appTerms) {
+        const inApp = appTerms.has(t.address);
+        const isChildOfOpen = Boolean(t.parent && appTerms.has(t.parent));
+        const isRecent = typeof t.created_ms === "number" && now - t.created_ms < 15_000;
+        const hasSpaceOrTabLabel = Boolean(t.labels?.["herdr.space"] || t.labels?.["herdr.tab"]);
+        const whereSpace = t.labels?.where?.split(" / ")[0]?.trim();
+        const claimsAppSpace = Boolean(whereSpace && appSpaceNames?.has(whereSpace));
+        // When Herdr.app closes a tab with `keep: true`, it clears `herdr.space`/`herdr.tab`
+        // while leaving `herdr.seen` or stale `where`; hide those detached ghosts.
+        if (!inApp && !isChildOfOpen && !isRecent && !hasSpaceOrTabLabel && (t.labels?.["herdr.seen"] !== undefined || claimsAppSpace)) {
+          continue;
+        }
+      }
       const a = HcAdapter.toAgent(t, id, this.names);
       const pid = t.foreground?.pid;
       pids.set(a.key, pid);
       if (t.created_ms) created.set(a.key, t.created_ms);
+      if (t.status?.msg?.trim()) statusMsgs.set(a.key, t.status.msg.trim());
       if (pid) live.add(pid);
       const hint = a.isShell ? undefined : this.sessionHints.key(harnessId(a.harness), t.foreground?.argv, pid);
       if (hint) hints.set(a.key, hint);
@@ -443,7 +470,7 @@ export class Host {
     }
     this.sessionHints.prune(live);
     for (const info of this.herdr.agents) agents.push(HerdrAdapter.toAgent(info, id));
-    return this.waits.decorate(this.uniflo.enrich(agents, pids, hints, created));
+    return this.waits.decorate(this.uniflo.enrich(agents, pids, hints, created, statusMsgs));
   }
 
   private publishNow(): void {
@@ -626,11 +653,13 @@ export class Host {
       if (reply) this.streamReply.set(f.id, reply);
       if (f.stream === "terminal") {
         let stop: () => void = () => undefined;
+        let openedRaw = false;
         // `screen: false`: only queue notices (they go to every terminal stream of the agent).
         if (p.screen !== false) {
           const onError = (error: Error) => this.sendStream(f.id, { kind: "stale", message: error.message, at: Date.now() });
           const hcBacked = a.source === "hc" || (a.source === "herdr" && this.hc.terminals.has(a.localId));
           if (p.raw === true && hcBacked) {
+            openedRaw = true;
             let seq = 0;
             const cols = typeof p.cols === "number" && Number.isFinite(p.cols) ? p.cols : 80;
             const rows = typeof p.rows === "number" && Number.isFinite(p.rows) ? p.rows : 24;
@@ -683,7 +712,7 @@ export class Host {
           return;
         }
         this.streamStops.set(f.id, stop);
-        out({ type: "stream_open", id: f.id, result: { kind: "terminal", agent: a.key } });
+        out({ type: "stream_open", id: f.id, result: { kind: "terminal", agent: a.key, ...(openedRaw ? { raw: true } : {}) } });
         return;
       }
       const sessionKey = await this.sessionOf(a.key, p.sub);
@@ -1058,7 +1087,7 @@ export class Host {
       const a = this.resolve(p.agent);
       if (typeof p.data !== "string" || !p.data || p.data.length > 262_144) throw new RpcFailure("bad_request", "data is required");
       if (a.source === "hc" || (a.source === "herdr" && this.hc.terminals.has(a.localId))) {
-        await this.hc.input(a.localId, p.data);
+        await this.hc.input(a.localId, p.data, Boolean(p.auto));
         return { ok: true as const };
       }
       if (a.source === "herdr" && (p.data === "\x1b[13;2u" || p.data === "\x1b[27;2;13~" || p.data === "\x1b\r")) {

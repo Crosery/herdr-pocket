@@ -9,76 +9,156 @@ export type VtOrKittySegment =
   | { kind: "kitty"; raw: string };
 
 /**
- * Stateful splitter that extracts Kitty graphics APC sequences (`ESC _ G ... ST/BEL`
+ * Stateful O(N) splitter that extracts Kitty graphics APC sequences (`ESC _ G ... ST/BEL`
  * or `0x9f G ...`) from raw VT text chunks without breaking sequences split across frames.
  */
 export class KittyApcSplitter {
-  private pending = "";
+  private pendingPrefix = "";
+  private inApc = false;
+  private apcPrefix = "";
+  private apcParts: string[] = [];
+  private apcLen = 0;
+  private apcTrailingEsc = false;
 
   push(chunk: string): VtOrKittySegment[] {
-    if (!chunk && !this.pending) return [];
-    const input = this.pending + chunk;
-    this.pending = "";
+    if (!chunk && !this.pendingPrefix && !this.inApc) return [];
     const out: VtOrKittySegment[] = [];
+    const pushVt = (s: string) => {
+      if (!s) return;
+      const last = out[out.length - 1];
+      if (last && last.kind === "vt") last.data += s;
+      else out.push({ kind: "vt", data: s });
+    };
+
     let i = 0;
 
-    while (i < input.length) {
-      const escIdx = findNextApcStart(input, i);
-      if (escIdx < 0) {
-        // Hold trailing incomplete ESC / ESC _ prefix in case the next chunk completes `_G`.
-        const tailHold = trailingEscPrefix(input, i);
-        if (tailHold > i) {
-          out.push({ kind: "vt", data: input.slice(i, tailHold) });
-          this.pending = input.slice(tailHold);
-        } else if (i < input.length) {
-          if (this.pending) this.pending += input.slice(i);
-          else if (
-            tailHold === i ||
-            (input.length - i <= 3 && (input.endsWith("\x1b") || input.endsWith("\x1b_") || input.endsWith("\x9f")))
-          ) {
-            this.pending = input.slice(i);
+    if (!this.inApc && this.pendingPrefix) {
+      const joined = this.pendingPrefix + chunk.slice(0, 3);
+      if (joined.startsWith("\x1b_G")) {
+        i = 3 - this.pendingPrefix.length;
+        this.pendingPrefix = "";
+        this.inApc = true;
+        this.apcPrefix = "\x1b_G";
+        this.apcParts = [];
+        this.apcLen = 0;
+        this.apcTrailingEsc = false;
+      } else if (joined.startsWith("\x9fG")) {
+        i = 2 - this.pendingPrefix.length;
+        this.pendingPrefix = "";
+        this.inApc = true;
+        this.apcPrefix = "\x9fG";
+        this.apcParts = [];
+        this.apcLen = 0;
+        this.apcTrailingEsc = false;
+      } else if (joined === "\x1b_") {
+        this.pendingPrefix = joined;
+        return out;
+      } else {
+        pushVt(this.pendingPrefix);
+        this.pendingPrefix = "";
+      }
+    }
+
+    while (i < chunk.length) {
+      if (!this.inApc) {
+        const escIdx = findNextApcStart(chunk, i);
+        if (escIdx < 0) {
+          const tailHold = trailingEscPrefix(chunk, i);
+          if (tailHold >= i) {
+            if (tailHold > i) pushVt(chunk.slice(i, tailHold));
+            this.pendingPrefix = chunk.slice(tailHold);
           } else {
-            out.push({ kind: "vt", data: input.slice(i) });
+            pushVt(chunk.slice(i));
           }
+          break;
         }
-        break;
-      }
-
-      if (escIdx > i) {
-        out.push({ kind: "vt", data: input.slice(i, escIdx) });
-      }
-
-      const start = input[escIdx] === "\x9f" ? escIdx + 2 : escIdx + 3; // after `\x9fG` or `\x1b_G`
-      const end = findApcEnd(input, start);
-      if (!end) {
-        // Guard against unbounded memory if a malformed APC never closes (> 24 MB).
-        if (input.length - escIdx > 24 * 1024 * 1024) {
-          out.push({ kind: "vt", data: input.slice(escIdx) });
+        if (escIdx > i) pushVt(chunk.slice(i, escIdx));
+        if (chunk[escIdx] === "\x9f") {
+          this.apcPrefix = "\x9fG";
+          i = escIdx + 2;
         } else {
-          this.pending = input.slice(escIdx);
+          this.apcPrefix = "\x1b_G";
+          i = escIdx + 3;
         }
+        this.inApc = true;
+        this.apcParts = [];
+        this.apcLen = 0;
+        this.apcTrailingEsc = false;
+        continue;
+      }
+
+      if (this.apcTrailingEsc) {
+        this.apcTrailingEsc = false;
+        if (chunk[i] === "\\") {
+          const raw = this.apcParts.length === 1 ? this.apcParts[0]! : this.apcParts.join("");
+          out.push({ kind: "kitty", raw });
+          this.inApc = false;
+          this.apcPrefix = "";
+          this.apcParts = [];
+          this.apcLen = 0;
+          i += 1;
+          continue;
+        }
+        this.apcParts.push("\x1b");
+        this.apcLen += 1;
+      }
+
+      const end = findApcEnd(chunk, i);
+      if (end) {
+        if (end.contentEnd > i) {
+          this.apcParts.push(chunk.slice(i, end.contentEnd));
+        }
+        const raw = this.apcParts.length === 1 ? this.apcParts[0]! : this.apcParts.join("");
+        out.push({ kind: "kitty", raw });
+        this.inApc = false;
+        this.apcPrefix = "";
+        this.apcParts = [];
+        this.apcLen = 0;
+        i = end.nextIdx;
+        continue;
+      }
+
+      const rem = chunk.length - i;
+      if (this.apcLen + rem > 24 * 1024 * 1024) {
+        pushVt(`${this.apcPrefix}${this.apcParts.join("")}${chunk.slice(i)}`);
+        this.reset();
         break;
       }
 
-      out.push({ kind: "kitty", raw: input.slice(start, end.contentEnd) });
-      i = end.nextIdx;
+      if (chunk.endsWith("\x1b") && chunk.length - 1 >= i) {
+        if (chunk.length - 1 > i) {
+          const seg = chunk.slice(i, chunk.length - 1);
+          this.apcParts.push(seg);
+          this.apcLen += seg.length;
+        }
+        this.apcTrailingEsc = true;
+      } else {
+        const seg = chunk.slice(i);
+        this.apcParts.push(seg);
+        this.apcLen += seg.length;
+      }
+      break;
     }
 
     return out;
   }
 
   reset(): void {
-    this.pending = "";
+    this.pendingPrefix = "";
+    this.inApc = false;
+    this.apcPrefix = "";
+    this.apcParts = [];
+    this.apcLen = 0;
+    this.apcTrailingEsc = false;
   }
 }
 
 function findNextApcStart(s: string, from: number): number {
-  for (let i = from; i < s.length; i++) {
-    const c = s[i];
-    if (c === "\x1b" && i + 2 < s.length && s[i + 1] === "_" && s[i + 2] === "G") return i;
-    if (c === "\x9f" && i + 1 < s.length && s[i + 1] === "G") return i;
-  }
-  return -1;
+  const a = s.indexOf("\x1b_G", from);
+  const b = s.indexOf("\x9fG", from);
+  if (a < 0) return b;
+  if (b < 0) return a;
+  return a < b ? a : b;
 }
 
 function trailingEscPrefix(s: string, minIdx: number): number {
@@ -89,12 +169,24 @@ function trailingEscPrefix(s: string, minIdx: number): number {
 }
 
 function findApcEnd(s: string, from: number): { contentEnd: number; nextIdx: number } | null {
-  for (let i = from; i < s.length; i++) {
-    const c = s[i];
-    if (c === "\x07" || c === "\x9c") return { contentEnd: i, nextIdx: i + 1 };
-    if (c === "\x1b" && i + 1 < s.length && s[i + 1] === "\\") return { contentEnd: i, nextIdx: i + 2 };
+  const iBel = s.indexOf("\x07", from);
+  const iC1 = s.indexOf("\x9c", from);
+  const iSt = s.indexOf("\x1b\\", from);
+  let best = -1;
+  let nextIdx = -1;
+  if (iBel >= 0) {
+    best = iBel;
+    nextIdx = iBel + 1;
   }
-  return null;
+  if (iC1 >= 0 && (best < 0 || iC1 < best)) {
+    best = iC1;
+    nextIdx = iC1 + 1;
+  }
+  if (iSt >= 0 && (best < 0 || iSt < best)) {
+    best = iSt;
+    nextIdx = iSt + 2;
+  }
+  return best >= 0 ? { contentEnd: best, nextIdx } : null;
 }
 
 export interface KittyGfxCommand {

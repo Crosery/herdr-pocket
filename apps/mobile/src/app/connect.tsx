@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AppState, KeyboardAvoidingView, Platform, Pressable, ScrollView, View } from "react-native";
+import { AppState, Platform, Pressable, ScrollView, View } from "react-native";
 import { Text } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
@@ -9,6 +9,7 @@ import * as Clipboard from "expo-clipboard";
 import { parsePairInput } from "@herdr-pocket/protocol";
 import { Card, PageBackground, PairSuccess } from "../components/ui";
 import { PocketButton, PocketInput } from "../components/pocket";
+import { PocketKeyboardAvoidingView } from "../components/PocketKeyboardAvoidingView";
 import { Mascot, Sparkle } from "../components/Mascot";
 import { usePalette } from "../theme/theme";
 import { fonts, space } from "../theme/tokens";
@@ -81,7 +82,7 @@ export default function ConnectScreen() {
 
   return (
     <PageBackground>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding">
+      <PocketKeyboardAvoidingView style={{ flex: 1 }}>
         <ScrollView
           keyboardShouldPersistTaps="handled"
           // On iOS the demo link at the end stays clear of the home indicator; Android keeps its spacing.
@@ -225,7 +226,7 @@ export default function ConnectScreen() {
             还没有服务器？先逛逛演示数据
           </PocketButton>
         </ScrollView>
-      </KeyboardAvoidingView>
+      </PocketKeyboardAvoidingView>
       {paired ? <PairSuccess sub="小羊开始帮你盯着啦" /> : null}
     </PageBackground>
   );

@@ -1,9 +1,11 @@
 import { strict as assert } from "node:assert";
 import { afterEach, beforeEach, test } from "node:test";
 import {
+  cancelPendingModelSwitch,
   chatQueueStore,
   enqueuePrompt,
   resetChatQueueForTest,
+  schedulePendingModelSwitch,
 } from "../src/lib/chatQueue.ts";
 import {
   getComposerDraft,
@@ -229,4 +231,38 @@ test("shellStore mirrors tabs and panel state into workspacePersist across resta
   assert.equal(shellStore.get().tabs.length, 1);
   assert.equal(shellStore.get().active, "a:host1/hc:t1");
   assert.equal(shellStore.get().panel, "files");
+});
+
+test("pendingSwitchByAgent coalesces model + thinking switches separately from queuedByAgent and persists across restart", async () => {
+  const agent = { key: "host1/hc:sw1", deviceId: "host1", harness: "claude" };
+
+  schedulePendingModelSwitch(agent, { modelId: "claude-sonnet-4-6" });
+  schedulePendingModelSwitch(agent, { thinkingLevel: "high" });
+
+  const state = chatQueueStore.get();
+  assert.equal(state.queuedByAgent[agent.key]?.length ?? 0, 0);
+  const sw = state.pendingSwitchByAgent[agent.key];
+  assert.ok(sw);
+  assert.equal(sw.modelId, "claude-sonnet-4-6");
+  assert.equal(sw.thinkingLevel, "high");
+  assert.match(sw.label, /claude-sonnet-4-6/);
+  assert.match(sw.label, /high/);
+
+  await flushWorkspaceStateNow();
+  const savedWorkspace = storage.get(WORKSPACE_STATE_KEY);
+  assert.ok(savedWorkspace);
+
+  resetChatQueueForTest();
+  resetWorkspacePersistForTest();
+  storage.clear();
+  storage.set(WORKSPACE_STATE_KEY, savedWorkspace);
+
+  await hydrateWorkspaceState();
+  const restored = chatQueueStore.get().pendingSwitchByAgent[agent.key];
+  assert.ok(restored);
+  assert.equal(restored.modelId, "claude-sonnet-4-6");
+  assert.equal(restored.thinkingLevel, "high");
+
+  cancelPendingModelSwitch(agent.key);
+  assert.equal(chatQueueStore.get().pendingSwitchByAgent[agent.key], undefined);
 });

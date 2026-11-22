@@ -3,6 +3,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   extractModelExplicitEffort,
+  formatModelSwitchSummary,
+  parseModelSwitchText,
   stripModelEffortSuffix,
   type Agent,
   type AgentUsageModelRow,
@@ -79,8 +81,31 @@ function toUsage(r: Record<string, unknown>): UsageRow {
 const INJECTED_TAG =
   /<(skill-recommendation|system-reminder|system|user-prompt-submit-hook|command-(?:name|message|args)|local-command-stdout|context|instructions)\b[^>]*>[\s\S]*?<\/\1>/g;
 
-/** One readable line for an injected block, e.g. `推荐技能 docs`. */
+const ANSI_CLEAN_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+function isEmptyLocalCommandStdout(raw: string): boolean {
+  const m = /^\s*<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*$/i.exec(raw);
+  if (!m) return false;
+  return !m[1]!.replace(ANSI_CLEAN_RE, "").trim();
+}
+
+/** One readable line for an injected block, e.g. `推荐技能 docs` or `已切换模型为 ...`. */
 export function summarizeInjected(text: string, subtype?: string): string {
+  const sw = parseModelSwitchText(text, subtype);
+  if (sw && (sw.model || sw.thinking)) return formatModelSwitchSummary(sw);
+
+  const cmd = /<command-name>\s*(\/?[\w:-]+)\s*<\/command-name>/i.exec(text);
+  if (cmd) {
+    const args = /<command-args>([\s\S]*?)<\/command-args>/i.exec(text)?.[1]?.replace(/\s+/g, " ").trim();
+    const label = args ? `命令 ${cmd[1]} ${args}` : `命令 ${cmd[1]}`;
+    return label.slice(0, 60);
+  }
+  const localOut = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/i.exec(text);
+  if (localOut) {
+    const body = localOut[1]!.replace(ANSI_CLEAN_RE, "").replace(/\s+/g, " ").trim();
+    return body ? `命令输出 · ${body.slice(0, 44)}` : "命令已执行";
+  }
+
   const skill = /<skill-recommendation\b[^>]*\bname="([^"]+)"/.exec(text);
   if (skill) return `推荐技能 ${skill[1]}`;
   if (/<system-reminder\b/.test(text)) return "系统提醒";
@@ -91,24 +116,64 @@ export function summarizeInjected(text: string, subtype?: string): string {
   return sub ? `${sub}${line ? ` · ${line.slice(0, 40)}` : ""}` : line.slice(0, 60) || "系统消息";
 }
 
+function finalizeSystemNote(
+  e: ConvEvent & Record<string, unknown>,
+  text: string,
+  subtype?: string,
+): ConvEvent | null {
+  if (!text || isEmptyLocalCommandStdout(text)) return null;
+  const sw = parseModelSwitchText(text, subtype);
+  if (sw) {
+    if (sw.model || sw.thinking) {
+      return {
+        ...e,
+        kind: "system",
+        text,
+        subtype: "model_switch",
+        summary: formatModelSwitchSummary(sw),
+      } as ConvEvent;
+    }
+    if (sw.ackOnly) return null;
+  }
+  return {
+    ...e,
+    kind: "system",
+    text,
+    ...(subtype ? { subtype } : {}),
+    summary: summarizeInjected(text, subtype),
+  } as ConvEvent;
+}
+
 /**
  * Separates what the person wrote and the agent said from what the harness injected.
- * Injected content is kept (folded) so nothing is lost; usage ticks are dropped.
+ * Injected content is kept (folded) so nothing is lost; usage ticks and empty command noise are dropped.
  */
-export function cleanEvent<E extends ConvEvent & Record<string, unknown>>(e: E): E | null {
+export function cleanEvent(e: ConvEvent & Record<string, unknown>): ConvEvent | null {
   if (e.kind === "usage") return null;
   if (e.kind === "system") {
     const text = typeof e.text === "string" ? e.text.trim() : "";
-    if (!text) return null;
-    return { ...e, text, summary: summarizeInjected(text, e.subtype as string | undefined) };
+    return finalizeSystemNote(e, text, e.subtype);
   }
   if (e.kind === "user_message" && typeof e.text === "string") {
-    if (e.synthetic) return { ...e, kind: "system", subtype: "synthetic", summary: summarizeInjected(e.text, "自动插入") } as E;
+    if (e.synthetic) return finalizeSystemNote(e, e.text.trim(), "自动插入");
     const blocks = e.text.match(INJECTED_TAG);
-    if (!blocks) return e;
+    if (!blocks) {
+      const sw = parseModelSwitchText(e.text);
+      if (sw && (sw.model || sw.thinking)) {
+        return {
+          ...e,
+          kind: "system",
+          text: e.text.trim(),
+          subtype: "model_switch",
+          summary: formatModelSwitchSummary(sw),
+        } as ConvEvent;
+      }
+      if (sw?.ackOnly) return null;
+      return e;
+    }
     const text = e.text.replace(INJECTED_TAG, "").replace(/\n{3,}/g, "\n\n").trim();
     const injected = blocks.join("\n\n");
-    if (!text) return { ...e, kind: "system", text: injected, summary: summarizeInjected(injected) } as E;
+    if (!text) return finalizeSystemNote(e, injected);
     return { ...e, text, injected };
   }
   return e;
@@ -577,6 +642,7 @@ export class UnifloAdapter {
     pids: Map<string, number | undefined>,
     hints: Map<string, string> = new Map(),
     created: Map<string, number> = new Map(),
+    statusMsgs: Map<string, string> = new Map(),
   ): Agent[] {
     if (!this.sessions.length) return agents;
     const fits = (a: Agent, s: UnifloSession): boolean => {
@@ -584,6 +650,19 @@ export class UnifloAdapter {
       if (!born) return true;
       return (s.started_at ?? 0) >= born - BORN_SLACK_MS || s.updated_at > born;
     };
+    const startedNearOrAfterBorn = (a: Agent, s: UnifloSession): boolean => {
+      const born = created.get(a.key);
+      if (!born || !s.started_at) return true;
+      return s.started_at >= born - 120_000;
+    };
+    const normStatusMsg = (raw: string | undefined): string =>
+      (raw ?? "")
+        .replace(/^[A-Za-z0-9_-]{1,24}:\s*/, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 48);
+    const normText = (raw: string | undefined): string => (raw ?? "").replace(/\s+/g, " ").trim();
+
     const byPid = new Map<number, UnifloSession>();
     for (const s of this.sessions) if (s.pid) byPid.set(s.pid, s);
     const used = new Set<string>();
@@ -604,9 +683,131 @@ export class UnifloAdapter {
       if (matched.has(a.key)) continue;
       const pid = pids.get(a.key);
       const s = pid ? byPid.get(pid) : undefined;
-      if (s) {
-        matched.set(a.key, s);
-        used.add(s.key);
+      if (!s || used.has(s.key)) continue;
+      const born = created.get(a.key);
+      const h = harnessId(a.harness);
+      // Do not blindly trust Uniflo's PID assignment when the session predates this terminal
+      // by more than 2 minutes (e.g. shared language-server trees in antigravity) or when
+      // a sibling agent in the same cwd opened tightly around s.started_at.
+      if (born && s.started_at) {
+        if (!startedNearOrAfterBorn(a, s)) {
+          const allowInteractiveResume =
+            h !== "antigravity" &&
+            s.updated_at > born &&
+            !agents.some(
+              (b) =>
+                b !== a &&
+                !matched.has(b.key) &&
+                harnessId(b.harness) === h &&
+                b.cwd === a.cwd &&
+                (created.get(b.key) ?? Infinity) <= s.started_at! + 120_000,
+            );
+          if (!allowInteractiveResume) continue;
+        }
+        if (h === "antigravity" && a.cwd) {
+          const siblingFitsBetter = agents.some((b) => {
+            if (b === a || matched.has(b.key)) return false;
+            if (harnessId(b.harness) !== h || b.cwd !== a.cwd) return false;
+            const bBorn = created.get(b.key);
+            if (!bBorn) return false;
+            const bInWindow = s.started_at! >= bBorn - 15_000 && s.started_at! <= bBorn + 180_000;
+            const myDiff = Math.abs(s.started_at! - born);
+            const bDiff = Math.abs(s.started_at! - bBorn);
+            return bInWindow && bDiff + 15_000 < myDiff;
+          });
+          if (siblingFitsBetter) continue;
+        }
+      }
+      matched.set(a.key, s);
+      used.add(s.key);
+    }
+
+    const weekAgo = Date.now() - 7 * 86400_000;
+
+    // Step 1.5a: Disambiguate same-(harness, cwd) agents by live status message snippet against title/preview.
+    const msgLeft = agents.filter((a) => !a.isShell && !matched.has(a.key) && a.cwd && harnessId(a.harness));
+    for (const a of msgLeft) {
+      const h = harnessId(a.harness);
+      const snip = normStatusMsg(statusMsgs.get(a.key));
+      if (snip.length < 10) continue;
+      if (msgLeft.some((b) => b !== a && harnessId(b.harness) === h && b.cwd === a.cwd && normStatusMsg(statusMsgs.get(b.key)) === snip)) {
+        continue;
+      }
+      const cands = this.sessions.filter((s) => {
+        if (s.harness !== h || s.cwd !== a.cwd || used.has(s.key) || s.updated_at <= weekAgo) return false;
+        if (!startedNearOrAfterBorn(a, s)) return false;
+        const t = normText(cleanTitle(s.title));
+        const p = normText(s.preview);
+        return (t.length >= 6 && (t.includes(snip) || snip.includes(t))) || (p.length >= 10 && p.includes(snip));
+      });
+      if (cands.length !== 1) continue;
+      matched.set(a.key, cands[0]!);
+      used.add(cands[0]!.key);
+    }
+
+    // Step 1.5b: 1:1 creation-time window pairing for concurrent agents in the same (harness, cwd).
+    const timeGroups = new Map<string, Agent[]>();
+    for (const a of agents) {
+      if (a.isShell || matched.has(a.key) || !a.cwd || !created.get(a.key)) continue;
+      const h = harnessId(a.harness);
+      if (!h) continue;
+      const k = `${h}\u0000${a.cwd}`;
+      timeGroups.set(k, [...(timeGroups.get(k) ?? []), a]);
+    }
+    for (const [k, rawGroup] of timeGroups) {
+      const [h, cwd] = k.split("\u0000");
+      const group = [...rawGroup].sort((x, y) => created.get(x.key)! - created.get(y.key)!);
+      const pool = this.sessions
+        .filter((s) => s.harness === h && s.cwd === cwd && !used.has(s.key) && s.updated_at > weekAgo && typeof s.started_at === "number" && s.started_at > 0)
+        .sort((x, y) => x.started_at! - y.started_at!);
+      if (!pool.length) continue;
+
+      const inWindow = (a: Agent, s: UnifloSession) => {
+        const born = created.get(a.key)!;
+        const st = s.started_at!;
+        return st >= born - 15_000 && st <= born + 180_000;
+      };
+
+      let remAgents = group.filter((a) => !matched.has(a.key));
+      let remSessions = pool.filter((s) => !used.has(s.key) && remAgents.some((a) => inWindow(a, s)));
+      let progress = true;
+      while (progress && remAgents.length && remSessions.length) {
+        progress = false;
+        for (const a of [...remAgents]) {
+          if (matched.has(a.key)) continue;
+          const cands = remSessions.filter((s) => !used.has(s.key) && inWindow(a, s));
+          if (cands.length === 1) {
+            const s = cands[0]!;
+            const rev = remAgents.filter((b) => !matched.has(b.key) && inWindow(b, s));
+            if (rev.length === 1 || remAgents.length === remSessions.length) {
+              matched.set(a.key, s);
+              used.add(s.key);
+              progress = true;
+            }
+          }
+        }
+        remAgents = remAgents.filter((a) => !matched.has(a.key));
+        remSessions = pool.filter((s) => !used.has(s.key) && remAgents.some((a) => inWindow(a, s)));
+      }
+
+      if (
+        remAgents.length >= 2 &&
+        remAgents.length === remSessions.length &&
+        remAgents.every((a, idx) => inWindow(a, remSessions[idx]!))
+      ) {
+        const baseOffset = remSessions[0]!.started_at! - created.get(remAgents[0]!.key)!;
+        const monotonicConsistent = remAgents.every((a, idx) => {
+          const s = remSessions[idx]!;
+          const deltaDiff = Math.abs(s.started_at! - created.get(a.key)! - baseOffset);
+          return deltaDiff <= 30_000;
+        });
+        if (monotonicConsistent) {
+          remAgents.forEach((a, idx) => {
+            const s = remSessions[idx]!;
+            matched.set(a.key, s);
+            used.add(s.key);
+          });
+        }
       }
     }
 
@@ -618,7 +819,6 @@ export class UnifloAdapter {
       const k = `${h}\u0000${a.cwd}`;
       groups.set(k, [...(groups.get(k) ?? []), a]);
     }
-    const weekAgo = Date.now() - 7 * 86400_000;
     for (const [k, group] of groups) {
       if (group.length !== 1) continue;
       const [h, cwd] = k.split("\u0000");

@@ -542,19 +542,28 @@ export class Assistant {
       }
       return { text: g.text, steps, tools: used, guard: g.fixed, notes };
     };
-    const answer = () => {
+    let currentRound = 0;
+    const answer = (override?: { toolChoice?: "auto" | "none" }) => {
       let live = "";
       let lastDraft = 0;
+      let notedReasoning = false;
       return this.llm!({
         system,
         messages,
         tools,
+        toolChoice: override?.toolChoice,
         maxTokens: opts.occasion === "text" ? 1500 : opts.occasion === "call" ? 400 : 1200,
         signal: opts.signal,
+        onReasoning: () => {
+          if (!live && !notedReasoning && opts.occasion === "text") {
+            notedReasoning = true;
+            this.setBusy(true, currentRound > 0 ? "在汇总" : "在思考");
+          }
+        },
         onText: (d) => {
           live += d;
           const t = this.now();
-          if (opts.onDraft && t - lastDraft > 250) {
+          if (opts.onDraft && t - lastDraft > 80) {
             lastDraft = t;
             opts.onDraft(live, steps);
           }
@@ -564,6 +573,7 @@ export class Assistant {
     let text = "";
     let nudged = false;
     for (let round = 0; round < rounds; round++) {
+      currentRound = round;
       const res = await answer();
       text = textOf(res.content);
       const calls = res.content.filter((b): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use");
@@ -637,8 +647,9 @@ export class Assistant {
     // declared (the history holds tool calls); a call the model still makes is not run.
     const results = messages[messages.length - 1]!.content as ContentBlock[];
     results.push({ type: "text", text: OUT_OF_ROUNDS[opts.occasion] });
+    currentRound = rounds;
     try {
-      const said = noEmoji(textOf((await answer()).content));
+      const said = noEmoji(textOf((await answer({ toolChoice: "none" })).content));
       this.event({ kind: "assistant.turn", level: "warn", msg: `${opts.occasion}: used all ${rounds} rounds, answered from what was found${said ? "" : " (empty)"}` });
       if (said) return finish(said);
     } catch (e) {

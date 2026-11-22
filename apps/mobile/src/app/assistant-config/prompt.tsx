@@ -5,7 +5,7 @@
  * plainly instead of being written over silently.
  */
 import { useState } from "react";
-import { KeyboardAvoidingView, TextInput, View } from "react-native";
+import { TextInput, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
@@ -13,6 +13,7 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { PromptId, PromptView } from "@herdr-pocket/protocol";
 import { EmptyState, PageBackground } from "../../components/ui";
 import { PocketButton } from "../../components/pocket";
+import { PocketKeyboardAvoidingView } from "../../components/PocketKeyboardAvoidingView";
 import { ConfigSnackbar, ConfirmDialog, LoadState, SaveBar, useLeaveGuard } from "../../components/configParts";
 import { chars, loadPrompts, resetPrompt, savePrompt, useAssistantConfig, useConfigWatch } from "../../lib/assistantConfig";
 import { relTime } from "../../lib/format";
@@ -126,7 +127,7 @@ function PromptEditor({ prompt }: { prompt: PromptView }) {
 
   return (
     <PageBackground>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding" keyboardVerticalOffset={headerHeight}>
+      <PocketKeyboardAvoidingView style={{ flex: 1 }} keyboardVerticalOffset={headerHeight}>
         <View style={{ flex: 1, paddingHorizontal: space.lg, paddingTop: space.md, paddingBottom: space.sm, gap: space.sm }}>
           {/* What it is and its placeholders; folded away while typing so the editor keeps the room. */}
           {!keyboard ? (
@@ -216,7 +217,7 @@ function PromptEditor({ prompt }: { prompt: PromptView }) {
             保存
           </PocketButton>
         </SaveBar>
-      </KeyboardAvoidingView>
+      </PocketKeyboardAvoidingView>
 
       <ConfirmDialog
         visible={askReset}

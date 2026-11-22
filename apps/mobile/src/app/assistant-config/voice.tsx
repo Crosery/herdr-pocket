@@ -3,7 +3,7 @@
  * voice and speed, and its key (write-only, like the model keys).
  */
 import { useEffect, useState } from "react";
-import { KeyboardAvoidingView, ScrollView, View } from "react-native";
+import { ScrollView, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router, Stack } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
@@ -11,6 +11,7 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { AssistantConfigView, VoiceOption, VoicePatch, VoiceProviderId } from "@herdr-pocket/protocol";
 import { Card, PageBackground } from "../../components/ui";
 import { PocketButton, RowAction } from "../../components/pocket";
+import { PocketKeyboardAvoidingView } from "../../components/PocketKeyboardAvoidingView";
 import { Row } from "../../components/rows";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Input, KeyField, LoadState, SaveBar, useLeaveGuard, WarningCard } from "../../components/configParts";
 import { changeConfig, flash, loadConfig, loadVoices, useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assistantConfig";
@@ -192,7 +193,7 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
 
   return (
     <PageBackground>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding" keyboardVerticalOffset={headerHeight}>
+      <PocketKeyboardAvoidingView style={{ flex: 1 }} keyboardVerticalOffset={headerHeight}>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: space.lg, gap: space.lg, paddingBottom: space.xxxl }}>
           {!switched ? <WarningCard lines={voiceWarnings} /> : null}
           <Card style={{ padding: space.lg, gap: space.lg }}>
@@ -276,7 +277,7 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
             保存
           </PocketButton>
         </SaveBar>
-      </KeyboardAvoidingView>
+      </PocketKeyboardAvoidingView>
 
       <ConfirmDialog
         visible={askClear}

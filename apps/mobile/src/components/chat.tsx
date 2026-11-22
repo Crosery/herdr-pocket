@@ -4,7 +4,15 @@ import { FlashList, type FlashListRef, type ListRenderItem } from "@shopify/flas
 import { Text } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useQuery } from "@tanstack/react-query";
-import type { Agent, ChatDisplayMode, ConvEvent, SubSession } from "@herdr-pocket/protocol";
+import {
+  compareConvEvents,
+  formatModelSwitchSummary,
+  parseModelSwitchEvent,
+  type Agent,
+  type ChatDisplayMode,
+  type ConvEvent,
+  type SubSession,
+} from "@herdr-pocket/protocol";
 import { call, subscribe } from "../lib/relay";
 import { splitPictures } from "../lib/attach";
 import { followSends, forget } from "../lib/outbox";
@@ -43,7 +51,32 @@ export type Row =
   /** Sent from this phone, not yet echoed by the session. */
   | { type: "pending"; id: string; text: string; ts: number; pictures?: string[]; send: PendingSend; agentKey: string }
   | { type: "turn_end"; id: string; ts: number }
+  | { type: "model_switch"; id: string; ts: number; label: string; model?: string; thinking?: string }
   | { type: "system"; id: string; text: string; summary: string };
+
+function pushModelSwitch(
+  rows: Row[],
+  id: string,
+  ts: number,
+  sw: { model?: string; thinking?: string; rawLabel?: string },
+): void {
+  const prev = rows[rows.length - 1];
+  if (prev?.type === "model_switch" && Math.abs(ts - prev.ts) <= 60_000) {
+    const model = sw.model ?? prev.model;
+    const thinking = sw.thinking ?? prev.thinking;
+    const label =
+      model || thinking
+        ? formatModelSwitchSummary({ model, thinking })
+        : sw.rawLabel ?? prev.label;
+    rows[rows.length - 1] = { ...prev, model, thinking, label, ts };
+    return;
+  }
+  const label =
+    sw.model || sw.thinking
+      ? formatModelSwitchSummary({ model: sw.model, thinking: sw.thinking })
+      : sw.rawLabel ?? "切换模型";
+  rows.push({ type: "model_switch", id, ts, label, model: sw.model, thinking: sw.thinking });
+}
 
 export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standard"): Row[] {
   const rows: Row[] = [];
@@ -51,14 +84,18 @@ export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standar
   const defaultOpen = mode === "expanded";
   for (const e of events) {
     switch (e.kind) {
-      case "user_message":
-        if (e.synthetic) {
+      case "user_message": {
+        const sw = parseModelSwitchEvent(e);
+        if (sw) {
+          pushModelSwitch(rows, e.id, e.ts, sw);
+        } else if (e.synthetic) {
           // Older hostd builds: harness-made "user" messages are system notes.
           if (e.text.trim()) rows.push({ type: "system", id: e.id, text: e.text, summary: systemSummary(e.text) });
         } else if (e.text.trim() || e.injected?.trim()) {
           rows.push({ type: "user", id: e.id, text: e.text, ts: e.ts, injected: e.injected?.trim() || undefined });
         }
         break;
+      }
       case "assistant_message":
         if (e.text.trim()) rows.push({ type: "assistant", id: e.id, text: e.text, ts: e.ts });
         break;
@@ -78,9 +115,24 @@ export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standar
       case "turn_end":
         if (rows.length && rows[rows.length - 1]?.type !== "turn_end") rows.push({ type: "turn_end", id: e.id, ts: e.ts });
         break;
-      case "system":
-        if (e.text.trim()) rows.push({ type: "system", id: e.id, text: e.text, summary: e.summary?.trim() || systemSummary(e.text) });
+      case "system": {
+        if (e.subtype === "model_switch") {
+          const sw = parseModelSwitchEvent(e);
+          if (sw) {
+            pushModelSwitch(rows, e.id, e.ts, sw);
+          } else if (e.summary?.trim() || e.text.trim()) {
+            pushModelSwitch(rows, e.id, e.ts, { rawLabel: e.summary?.trim() || e.text.trim() });
+          }
+          break;
+        }
+        const sw = parseModelSwitchEvent(e);
+        if (sw) {
+          pushModelSwitch(rows, e.id, e.ts, sw);
+        } else if (e.text.trim()) {
+          rows.push({ type: "system", id: e.id, text: e.text, summary: e.summary?.trim() || systemSummary(e.text) });
+        }
         break;
+      }
       default:
         break; // usage, turn_start: not shown
     }
@@ -342,29 +394,32 @@ const UserBubble = memo(function UserBubble({ text, injected, ts, send, agentKey
 const SubCtx = createContext<{ byCall: Map<string, SubSession>; open: (s: SubSession) => void } | null>(null);
 
 /** The agent's reply, always in full: folding it behind "展开全文" read as broken. */
-const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
+const AssistantBlock = memo(function AssistantBlock({ text, ts }: { text: string; ts?: number }) {
   const p = usePalette();
   const scale = useSettings((s) => s.textScale);
   const styles = mdStyles(p, scale);
   const md = useMemo(() => fixCjkEmphasis(text), [text]);
   return (
-    <View
-      style={{
-        alignSelf: "flex-start",
-        ...(hasList(md) ? { width: "94%" as const } : { maxWidth: "94%" as const }),
-        backgroundColor: p.surface,
-        borderRadius: radius.card,
-        borderBottomLeftRadius: 6,
-        paddingHorizontal: space.lg,
-        paddingVertical: space.xs,
-        elevation: p.dark ? 0 : 1,
-        shadowColor: p.shadow,
-        shadowOpacity: 0.1,
-        shadowRadius: 8,
-        shadowOffset: { width: 0, height: 3 },
-      }}
-    >
-      <Md style={styles}>{md}</Md>
+    <View style={{ alignItems: "flex-start", gap: 4 }}>
+      <View
+        style={{
+          alignSelf: "flex-start",
+          ...(hasList(md) ? { width: "94%" as const } : { maxWidth: "94%" as const }),
+          backgroundColor: p.surface,
+          borderRadius: radius.card,
+          borderBottomLeftRadius: 6,
+          paddingHorizontal: space.lg,
+          paddingVertical: space.xs,
+          elevation: p.dark ? 0 : 1,
+          shadowColor: p.shadow,
+          shadowOpacity: 0.1,
+          shadowRadius: 8,
+          shadowOffset: { width: 0, height: 3 },
+        }}
+      >
+        <Md style={styles}>{md}</Md>
+      </View>
+      {ts ? <Text style={{ color: p.faint, fontSize: 11, paddingLeft: 4 }}>{clock(ts)}</Text> : null}
     </View>
   );
 });
@@ -566,6 +621,36 @@ function TurnEnd({ ts }: { ts?: number }) {
   );
 }
 
+function ModelSwitchBanner({ label, ts }: { label: string; ts: number }) {
+  const p = usePalette();
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingVertical: 2 }}>
+      <View style={{ flex: 1, height: 1, backgroundColor: p.divider }} />
+      <View
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 5,
+          maxWidth: "82%",
+          backgroundColor: p.surface2,
+          borderWidth: 1,
+          borderColor: p.divider,
+          borderRadius: radius.pill,
+          paddingHorizontal: 10,
+          paddingVertical: 3,
+        }}
+      >
+        <MaterialCommunityIcons name="cpu-64-bit" size={13} color={p.muted} />
+        <Text numberOfLines={1} style={{ flexShrink: 1, color: p.ink, fontSize: 11.5, fontFamily: fonts.bodyBold }}>
+          {label}
+        </Text>
+        <Text style={{ color: p.faint, fontSize: 11, fontFamily: fonts.mono }}>{clock(ts)}</Text>
+      </View>
+      <View style={{ flex: 1, height: 1, backgroundColor: p.divider }} />
+    </View>
+  );
+}
+
 /**
  * The strip under the newest message: the working badge or the reply dots, then the space above the
  * composer. It is the list's first row (the list is inverted) rather than its header, so when it
@@ -610,13 +695,15 @@ const renderRow: ListRenderItem<ListRow> = ({ item }) => {
     case "tools":
       return <ToolGroup items={item.items} thoughts={item.thoughts} notes={item.notes} defaultOpen={item.defaultOpen} />;
     case "assistant":
-      return <AssistantBlock text={item.text} />;
+      return <AssistantBlock text={item.text} ts={item.ts} />;
     case "thinking":
       return <ThinkingPill text={item.text} defaultOpen={item.defaultOpen} />;
     case "tool":
       return <ToolCard call={item.call} result={item.result} />;
     case "turn_end":
       return <TurnEnd ts={item.ts} />;
+    case "model_switch":
+      return <ModelSwitchBanner label={item.label} ts={item.ts} />;
     case "system":
       return <FoldChip label={item.summary} icon="information-outline" body={item.text} a11y={`系统提醒：${item.summary}`} />;
   }
@@ -847,14 +934,43 @@ function SessionChatView({
   }
   const [attempt, setAttempt] = useState(0);
   const failures = useRef(0);
+  const hasPageDataRef = useRef(q.data !== undefined);
+  const flushBufferedRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    hasPageDataRef.current = q.data !== undefined;
+    if (q.data !== undefined) flushBufferedRef.current?.();
+  }, [conv, q.data]);
   useEffect(() => {
     if (!active) return;
     let opened = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    let pageSettled = hasPageDataRef.current;
+    let buffered: ConvEvent[] = [];
+    let bufferTimer: ReturnType<typeof setTimeout> | undefined;
+    const flushBuffer = () => {
+      clearTimeout(bufferTimer);
+      bufferTimer = undefined;
+      pageSettled = true;
+      if (buffered.length) {
+        const batch = buffered;
+        buffered = [];
+        setLiveEvents((old) => mergeEvents(old, batch));
+      }
+    };
+    flushBufferedRef.current = flushBuffer;
+    if (!pageSettled) {
+      // Wait briefly for the initial session.events page so replayed SSE frames merge in one ordered pass.
+      bufferTimer = setTimeout(flushBuffer, 1500);
+    }
     const stop = subscribe(agent.deviceId, "session", { agent: agent.key, sub }, (event) => {
       if (event?.kind === "session" && event.event) {
         const e = event.event as ConvEvent;
-        setLiveEvents((old) => mergeEvents(old, [e]));
+        if (!pageSettled) {
+          buffered.push(e);
+          if (hasPageDataRef.current) flushBuffer();
+        } else {
+          setLiveEvents((old) => mergeEvents(old, [e]));
+        }
         setStreamState("live");
       } else if (event?.kind === "stale") setStreamState("stale");
       else if (event?.kind === "alive") setStreamState("live");
@@ -878,6 +994,8 @@ function SessionChatView({
     });
     return () => {
       clearTimeout(retry);
+      clearTimeout(bufferTimer);
+      if (flushBufferedRef.current === flushBuffer) flushBufferedRef.current = null;
       stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1249,14 +1367,7 @@ function posOf(e: ConvEvent): bigint | null {
 function mergeEvents(old: ConvEvent[], add: ConvEvent[]): ConvEvent[] {
   const byId = new Map(old.map((e) => [e.id, e]));
   for (const e of add) byId.set(e.id, e);
-  return [...byId.values()]
-    .sort((a, b) => {
-      const ap = posOf(a);
-      const bp = posOf(b);
-      if (ap !== null && bp !== null) return ap < bp ? -1 : ap > bp ? 1 : 0;
-      return (a.pos ?? String(a.ts)).localeCompare(b.pos ?? String(b.ts));
-    })
-    .slice(-KEEP_EVENTS);
+  return [...byId.values()].sort(compareConvEvents).slice(-KEEP_EVENTS);
 }
 
 function workedFor(ms: number): string {

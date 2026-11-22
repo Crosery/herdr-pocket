@@ -162,7 +162,14 @@ test("an OpenAI Realtime voice call: same phone events as MOSS-Live, tasks throu
   assert.deepEqual(s.output_modalities, ["audio"]);
   assert.deepEqual(s.audio.input.format, { type: "audio/pcm", rate: 24000 });
   assert.deepEqual(s.audio.input.transcription, { model: "gpt-4o-mini-transcribe", language: "zh" });
-  assert.deepEqual(s.audio.input.turn_detection, { type: "server_vad", create_response: true, interrupt_response: true });
+  assert.deepEqual(s.audio.input.turn_detection, {
+    type: "server_vad",
+    threshold: 0.65,
+    prefix_padding_ms: 280,
+    silence_duration_ms: 520,
+    create_response: true,
+    interrupt_response: true,
+  });
   assert.deepEqual(s.audio.input.noise_reduction, { type: "near_field" });
   assert.deepEqual(s.audio.output, { format: { type: "audio/pcm", rate: 24000 }, voice: "marin" });
   assert.deepEqual(
@@ -532,5 +539,72 @@ test("ASR slower than hold timeout still flushes captions and keeps saved thread
     await call.next((f) => f.action === "relay.state" && f.data.state === "closed");
   } finally {
     await r2.close();
+  }
+});
+
+test("server silence gate zeroes quiet hiss and stuck-VAD watchdog commits after silence timeout", async () => {
+  const port = (rt.address() as { port: number }).port;
+  const r3 = new Relay({
+    dbPath: join(dir, "t-silence-gate.db"),
+    adminToken: ADMIN,
+    log: () => {},
+    llm,
+    live: {
+      provider: "openai-realtime",
+      url: `ws://127.0.0.1:${port}/v1/realtime`,
+      apiKey: "rt-test-key",
+      model: "gpt-realtime",
+      voice: "marin",
+      maxSpeechSilenceCommitMs: 120,
+    },
+  });
+  const base3 = `http://127.0.0.1:${await r3.listen(0, "127.0.0.1")}`;
+  try {
+    const api3 = async (path: string, init: { token?: string; body?: unknown } = {}) => {
+      const res = await fetch(base3 + path, {
+        method: init.body ? "POST" : "GET",
+        headers: { "Content-Type": "application/json", ...(init.token ? { Authorization: `Bearer ${init.token}` } : {}) },
+        body: init.body ? JSON.stringify(init.body) : undefined,
+      });
+      return (await res.json()) as any;
+    };
+    const code = (await api3("/v1/pair/codes", { token: ADMIN, body: { kind: "viewer" } })).code;
+    const phone = (await api3("/v1/pair", { body: { code, name: "GatePhone", kind: "viewer" } })) as { token: string };
+
+    const upstream = new Promise<Sock>((resolve) => rt.once("connection", (ws) => resolve(new Sock(ws))));
+    const ws = new WebSocket(`${base3.replace("http", "ws")}/v1/assistant/live?token=${encodeURIComponent(phone.token)}`);
+    const call = new Sock(ws);
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+    const up = await upstream;
+    await up.next((f) => f.type === "session.update");
+    up.send({ type: "session.updated", session: {} });
+    await call.next((f) => f.action === "relay.state" && f.data.state === "ready");
+
+    // -52 dBFS hiss (amp=82) while idle must be zeroed cleanly.
+    call.ws.send(pcm(320, 82));
+    const gatedHiss = Buffer.from((await up.next((f) => f.type === "input_audio_buffer.append")).audio, "base64");
+    assert.ok(samplesOf(gatedHiss).every((x) => x === 0));
+
+    // -40 dBFS noise (amp=327) while assistant response is active must be zeroed.
+    up.send({ type: "response.created", response: { id: "resp_gate", status: "in_progress" } });
+    await sleep(20);
+    call.ws.send(pcm(320, 327));
+    const gatedDuringSpeak = Buffer.from((await up.next((f) => f.type === "input_audio_buffer.append")).audio, "base64");
+    assert.ok(samplesOf(gatedDuringSpeak).every((x) => x === 0));
+    up.send({ type: "response.done", response: { id: "resp_gate", status: "completed" } });
+
+    // Stuck VAD turn commits automatically when speech_stopped never arrives within maxSpeechSilenceCommitMs.
+    up.send({ type: "input_audio_buffer.speech_started", item_id: "u_stuck", audio_start_ms: 0 });
+    await call.next((f) => f.action === "input.speech.started");
+    await up.next((f) => f.type === "input_audio_buffer.commit", 2000);
+    await call.next((f) => f.action === "input.speech.stopped", 2000);
+
+    call.send({ action: "relay.hangup" });
+    await call.next((f) => f.action === "relay.state" && f.data.state === "closed");
+  } finally {
+    await r3.close();
   }
 });

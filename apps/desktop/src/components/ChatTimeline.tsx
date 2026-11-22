@@ -4,6 +4,7 @@ import {
   Bot,
   Check,
   ChevronRight,
+  Cpu,
   FileEdit,
   FileText,
   GitBranch,
@@ -590,6 +591,11 @@ const UserRowItem = memo(function UserRowItem({
           {showInjected ? row.injected : "附加系统上下文（点击查看）"}
         </button>
       ) : null}
+      {row.ts > 0 ? (
+        <div className="bubble-time-meta" title={fullTimeTitle(row.ts, row.pos)}>
+          <span>{clockStr(row.ts)}</span>
+        </div>
+      ) : null}
     </div>
   );
 });
@@ -608,6 +614,7 @@ const AssistantRowItem = memo(function AssistantRowItem({
   onOpenFile?: (target: string) => void;
 }) {
   const imageTargets = useMemo(() => extractImageTargets([row.text]), [row.text]);
+  const shortModel = row.model ? shortModelLabel(row.model) : undefined;
   return (
     <div className="bubble-row assistant">
       <div className="bubble assistant">
@@ -620,14 +627,38 @@ const AssistantRowItem = memo(function AssistantRowItem({
         cwd={cwd}
         onOpenFile={onOpenFile}
       />
+      {row.ts > 0 || shortModel ? (
+        <div className="bubble-time-meta assistant" title={fullTimeTitle(row.ts, row.pos)}>
+          {row.ts > 0 ? <span>{clockStr(row.ts)}</span> : null}
+          {shortModel ? <span className="mono truncate">{shortModel}</span> : null}
+        </div>
+      ) : null}
     </div>
   );
 });
 
-const clockStr = (ts: number) => {
+/** Formats a local `HH:mm` clock label for message and turn timestamps. */
+export const clockStr = (ts: number): string => {
   const d = new Date(ts);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
+
+/** Formats full timestamp + monotonic event `pos` for hover tooltips. */
+export function fullTimeTitle(ts: number, pos?: string): string | undefined {
+  const parts: string[] = [];
+  if (ts > 0 && Number.isFinite(ts)) {
+    const d = new Date(ts);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    parts.push(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`);
+  }
+  if (pos) parts.push(`序号 #${pos}`);
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
+function shortModelLabel(raw: string): string {
+  const trimmed = raw.trim();
+  return trimmed.split("/").pop() || trimmed;
+}
 
 export const ChatTimelineRows = memo(function ChatTimelineRows({
   rows,
@@ -723,9 +754,19 @@ export const ChatTimelineRows = memo(function ChatTimelineRows({
                 <div className="act-thought-body">{row.text}</div>
               </details>
             );
+          case "model_switch":
+            return (
+              <div key={row.id} className="chat-model-switch-sep" title={fullTimeTitle(row.ts, row.pos)}>
+                <span className="chat-model-switch-pill">
+                  <Cpu size={12} />
+                  <span className="truncate">{row.label}</span>
+                  {row.ts > 0 ? <span className="chat-model-switch-time">{clockStr(row.ts)}</span> : null}
+                </span>
+              </div>
+            );
           case "turn_end":
             return (
-              <div key={row.id} className="chat-turn-sep">
+              <div key={row.id} className="chat-turn-sep" title={fullTimeTitle(row.ts, row.pos)}>
                 <span>这一轮结束 · {clockStr(row.ts)}</span>
               </div>
             );

@@ -29,6 +29,7 @@ import {
   applyRows,
   buildHarnessSwitchCommands,
   normalizeSwitchHarness,
+  parseModelSwitchText,
   stripModelEffortSuffix,
   textWithFiles,
   type Agent,
@@ -57,7 +58,7 @@ import {
 } from "../components/PocketUI";
 import { AgentUsageCard } from "../components/AgentUsageCard";
 import { BtwSideDrawer, executeAgentBtw, type BtwTurn } from "../components/BtwSideDrawer";
-import { ChatTimelineRows } from "../components/ChatTimeline";
+import { ChatTimelineRows, clockStr } from "../components/ChatTimeline";
 import { COMPOSER_SLASH_CHIP_PLACEHOLDER, ComposerSlashChip } from "../components/ComposerSlashChip";
 import { DropRail } from "../components/DropRail";
 import { FolderExplorerModal, normalizeFolderKey } from "../components/FolderExplorerModal";
@@ -67,7 +68,7 @@ import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
 import { copyToClipboard } from "../lib/bridge";
-import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
+import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../lib/chatFold";
 import {
   builtinSlashCommands,
   extractSlashQuery,
@@ -78,6 +79,7 @@ import {
 } from "../lib/slashCommands";
 import { parseTerminalChatTranscript, shellTurnMatchesCommand } from "../lib/terminalChat";
 import {
+  cancelPendingModelSwitch,
   chatQueueStore,
   dismissOutgoingSend,
   enqueuePrompt,
@@ -87,10 +89,13 @@ import {
   reconcileOutgoingSends,
   removeQueuedPrompt,
   retryFailedSend,
+  schedulePendingModelSwitch,
   sendPromptNow,
   steerQueuedPromptNow,
   useAgentChatQueue,
+  type OutgoingSend,
 } from "../lib/chatQueue";
+import { interleaveOptimisticSends } from "../lib/chatQueueLogic";
 import { useComposerInput } from "../lib/composerKeys";
 import { prepareDroppedFiles, revokeAttachment, stageWorkspaceDragItem, type StagedAttachment } from "../lib/dropPreview";
 import {
@@ -1040,7 +1045,7 @@ export function AgentDetailPanel({
   const attachmentsRef = useRef<StagedAttachment[]>([]);
   attachmentsRef.current = attachments;
 
-  const { queued, outgoing } = useAgentChatQueue(agent.key);
+  const { queued, outgoing, pendingSwitch } = useAgentChatQueue(agent.key);
   const activeSub = subTrail[subTrail.length - 1] ?? null;
   const isPlainShellChat = Boolean(agent.isShell && !agent.sessionKey && !activeSub);
 
@@ -1088,22 +1093,19 @@ export function AgentDetailPanel({
     }
     streamLiveRef.current = false;
     hadOpenRef.current = false;
+    const merger = createBufferedEventMerger((batch) => {
+      if (alive) setEvents((prevList) => mergeConvEvents(prevList, batch));
+    });
 
     void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 200 })
       .then((res) => {
         if (!alive) return;
-        setEvents((prevList) => mergeConvEvents(prevList, res.events));
+        merger.onInitialPage(res.events);
         setOlderCursor(res.more ? (res.nextBefore ?? null) : null);
       })
-      .catch(() => {});
-
-    if (agent.subagents || subs.length > 0) {
-      void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
-        .then((res) => {
-          if (alive) setSubs(res.sessions);
-        })
-        .catch(() => {});
-    }
+      .catch(() => {
+        if (alive) merger.onInitialReady();
+      });
 
     const unsubSession = subscribeStream(
       agent.deviceId,
@@ -1112,8 +1114,7 @@ export function AgentDetailPanel({
       (ev) => {
         if (!alive || !ev) return;
         if ((ev.kind === "session" || ev.kind === "session_event") && ev.event) {
-          const nextEv = ev.event as ConvEvent;
-          setEvents((prevList) => mergeConvEvents(prevList, [nextEv]));
+          merger.onStreamEvent(ev.event as ConvEvent);
         }
       },
       (st) => {
@@ -1156,10 +1157,24 @@ export function AgentDetailPanel({
 
     return () => {
       alive = false;
+      merger.dispose();
       window.clearInterval(pollTimer);
       unsubSession();
     };
-  }, [agent.deviceId, agent.key, agent.sessionKey, agent.subagents]);
+  }, [agent.deviceId, agent.key, agent.sessionKey]);
+
+  useEffect(() => {
+    if (!agent.subagents) return;
+    let alive = true;
+    void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
+      .then((res) => {
+        if (alive) setSubs(res.sessions);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [agent.deviceId, agent.key, agent.subagents]);
 
   const activeSubKey = activeSub?.key;
   useEffect(() => {
@@ -1172,12 +1187,17 @@ export function AgentDetailPanel({
     let subLive = false;
     setSubEvents([]);
     setActiveChildSubs([]);
+    const merger = createBufferedEventMerger((batch) => {
+      if (alive) setSubEvents((prev) => mergeConvEvents(prev, batch));
+    });
 
     void rpcCall(agent.deviceId, "session.events", { agent: agent.key, sub: activeSubKey, limit: 200 })
       .then((res) => {
-        if (alive) setSubEvents((prev) => mergeConvEvents(prev, res.events));
+        if (alive) merger.onInitialPage(res.events);
       })
-      .catch(() => {});
+      .catch(() => {
+        if (alive) merger.onInitialReady();
+      });
 
     void rpcCall(agent.deviceId, "session.children", { agent: agent.key, sub: activeSubKey })
       .then((res) => {
@@ -1192,7 +1212,7 @@ export function AgentDetailPanel({
       (ev) => {
         if (!alive || !ev) return;
         if ((ev.kind === "session" || ev.kind === "session_event") && ev.event) {
-          setSubEvents((prev) => mergeConvEvents(prev, [ev.event as ConvEvent]));
+          merger.onStreamEvent(ev.event as ConvEvent);
         }
       },
       (st) => {
@@ -1218,6 +1238,7 @@ export function AgentDetailPanel({
 
     return () => {
       alive = false;
+      merger.dispose();
       window.clearInterval(pollTimer);
       unsubSub();
     };
@@ -1336,6 +1357,21 @@ export function AgentDetailPanel({
     });
     return { unmatched, matchedIds, expiredIds, awaitingReply: false };
   }, [convReconciled, isPlainShellChat, nowTick, outgoing, shellChat]);
+
+  const timelineSegments = useMemo(() => {
+    const items = interleaveOptimisticSends(foldedRows, reconciled.unmatched);
+    const segs: Array<{ kind: "rows"; id: string; rows: ChatRow[] } | { kind: "outgoing"; send: OutgoingSend }> = [];
+    for (const item of items) {
+      if (item.kind === "outgoing") {
+        segs.push(item);
+      } else {
+        const last = segs[segs.length - 1];
+        if (last?.kind === "rows") last.rows.push(item.row);
+        else segs.push({ kind: "rows", id: `seg-${item.row.id}`, rows: [item.row] });
+      }
+    }
+    return segs;
+  }, [foldedRows, reconciled.unmatched]);
 
   const allSlashCommands = useMemo(
     () => mergeSlashCommands(builtinSlashCommands(agent.harness, agent.isShell), discoveredSlash),
@@ -1621,15 +1657,12 @@ export function AgentDetailPanel({
 
       const plan = buildHarnessSwitchCommands(agent.harness, { modelId, thinkingLevel });
       if (agent.status === "working") {
-        if (plan.commands.length > 0) {
-          for (const cmd of plan.commands) enqueuePrompt(agent, cmd, []);
-          toast(`已加入排队：当前轮结束后切换为 ${labelDesc}`);
-        } else {
-          toast(`当前轮进行中，请空闲后再切换 ${labelDesc}`, true);
-        }
+        schedulePendingModelSwitch(agent, { modelId, thinkingLevel, label: labelDesc });
+        toast(`本轮结束后将自动切换为 ${labelDesc}`);
         return;
       }
 
+      cancelPendingModelSwitch(agent.key);
       setSending(true);
       try {
         const res = await rpcCall(agent.deviceId, "agent.setModel", {
@@ -1649,8 +1682,10 @@ export function AgentDetailPanel({
           err?.code === "bad_request" ||
           /unknown|unsupported|不支持/i.test(err?.message ?? "");
         if (unsupported && plan.commands.length > 0) {
-          for (const cmd of plan.commands) await sendPromptNow(agent, cmd, []);
-          toast(`已发送切换指令：${labelDesc}`);
+          for (const cmd of plan.commands) {
+            await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: cmd, enter: true });
+          }
+          toast(`已切换：${labelDesc}`);
         } else {
           toast(err?.message || "切换失败", true);
         }
@@ -1851,6 +1886,20 @@ export function AgentDetailPanel({
       }
       setModelMenuMode("thinking");
       return;
+    }
+    if (!staged.length && !agent.isShell && !activeSub) {
+      const sw = parseModelSwitchText(raw);
+      if (sw && (sw.model || sw.thinking)) {
+        if (!isOverride) {
+          clearComposerDraft(agent.key, { revoke: false });
+          setTextState("");
+          setAttachmentsState([]);
+          setChipDismissedPrefix(null);
+        }
+        void runModelOrThinkingSwitch({ modelId: sw.model, thinkingLevel: sw.thinking });
+        requestAnimationFrame(() => composer.textareaRef.current?.focus());
+        return;
+      }
     }
 
     if (!isOverride) {
@@ -2200,53 +2249,80 @@ export function AgentDetailPanel({
                         ) : null}
                       </div>
                     ))}
+                    {reconciled.unmatched.map((item) => (
+                      <div key={item.id} className="bubble-row user">
+                        {item.text ? <div className="bubble user">{item.text}</div> : null}
+                        <div className={`bubble-send-meta${item.state === "failed" ? " error" : ""}`}>
+                          <span>
+                            {clockStr(item.ts)} · {item.state === "sending" ? "发送中…" : item.state === "failed" ? `发送失败${item.error ? `：${clip(item.error, 40)}` : ""}` : "等待终端显示…"}
+                          </span>
+                          {item.state === "failed" ? (
+                            <>
+                              <button type="button" className="bubble-meta-btn primary" onClick={() => void retryFailedSend(item.id, agent.key)}>重发</button>
+                              <button type="button" className="bubble-meta-btn" onClick={() => dismissOutgoingSend(agent.key, item.id)}>删掉</button>
+                            </>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))}
                   </>
                 ) : (
-                  <ChatTimelineRows
-                    rows={foldedRows}
-                    subs={activeSub ? activeChildSubs : subs}
-                    agentKey={agent.key}
-                    deviceId={agent.deviceId}
-                    cwd={agent.cwd}
-                    onOpenSub={(s) => selectSubInPlace(s, subTrail)}
-                    onOpenSubAside={(s) => openSubAsideView(s, subTrail)}
-                    onOpenFile={(target) => {
-                      openAgentFileTarget(agent, target);
-                    }}
-                  />
+                  timelineSegments.map((seg) =>
+                    seg.kind === "rows" ? (
+                      <ChatTimelineRows
+                        key={seg.id}
+                        rows={seg.rows}
+                        subs={activeSub ? activeChildSubs : subs}
+                        agentKey={agent.key}
+                        deviceId={agent.deviceId}
+                        cwd={agent.cwd}
+                        onOpenSub={(s) => selectSubInPlace(s, subTrail)}
+                        onOpenSubAside={(s) => openSubAsideView(s, subTrail)}
+                        onOpenFile={(target) => {
+                          openAgentFileTarget(agent, target);
+                        }}
+                      />
+                    ) : (
+                      <div key={seg.send.id} className="bubble-row user">
+                        {seg.send.text ? <div className="bubble user">{seg.send.text}</div> : null}
+                        {seg.send.attachedCount > 0 ? (
+                          <div className="chat-attach-note row" style={{ gap: 5 }} title={seg.send.attachedNames.join("\n")}>
+                            <Paperclip size={12} />
+                            <span>已附带 {seg.send.attachedCount} 个文件/图片</span>
+                          </div>
+                        ) : null}
+                        <div className={`bubble-send-meta${seg.send.state === "failed" ? " error" : ""}`}>
+                          <span>
+                            {clockStr(seg.send.ts)} ·{" "}
+                            {seg.send.state === "sending"
+                              ? "发送中…"
+                              : seg.send.state === "failed"
+                                ? `发送失败${seg.send.error ? `：${clip(seg.send.error, 40)}` : ""}`
+                                : "等待会话同步…"}
+                          </span>
+                          {seg.send.state === "failed" ? (
+                            <>
+                              <button
+                                type="button"
+                                className="bubble-meta-btn primary"
+                                onClick={() => void retryFailedSend(seg.send.id, agent.key)}
+                              >
+                                重发
+                              </button>
+                              <button
+                                type="button"
+                                className="bubble-meta-btn"
+                                onClick={() => dismissOutgoingSend(agent.key, seg.send.id)}
+                              >
+                                删掉
+                              </button>
+                            </>
+                          ) : null}
+                        </div>
+                      </div>
+                    ),
+                  )
                 )}
-                {reconciled.unmatched.map((item) => (
-                  <div key={item.id} className="bubble-row user">
-                    {item.text ? <div className="bubble user">{item.text}</div> : null}
-                    {item.attachedCount > 0 ? (
-                      <div className="chat-attach-note row" style={{ gap: 5 }} title={item.attachedNames.join("\n")}>
-                        <Paperclip size={12} />
-                        <span>已附带 {item.attachedCount} 个文件/图片</span>
-                      </div>
-                    ) : null}
-                    {item.state === "sending" ? (
-                      <div className="bubble-send-meta">发送中…</div>
-                    ) : item.state === "failed" ? (
-                      <div className="bubble-send-meta error">
-                        <span>发送失败{item.error ? `：${clip(item.error, 40)}` : ""}</span>
-                        <button
-                          type="button"
-                          className="bubble-meta-btn primary"
-                          onClick={() => void retryFailedSend(item.id, agent.key)}
-                        >
-                          重发
-                        </button>
-                        <button
-                          type="button"
-                          className="bubble-meta-btn"
-                          onClick={() => dismissOutgoingSend(agent.key, item.id)}
-                        >
-                          删掉
-                        </button>
-                      </div>
-                    ) : null}
-                  </div>
-                ))}
               </>
             )}
 
@@ -2377,6 +2453,24 @@ export function AgentDetailPanel({
               onPick={(cmd) => pickSlashCommand(cmd, true)}
               harnessLabel={agent.harness}
             />
+          ) : null}
+          {pendingSwitch ? (
+            <div className="composer-switch-banner" role="status" aria-live="polite">
+              <Cpu size={13} />
+              <span className="composer-switch-title">本轮结束后切换</span>
+              <span className="composer-switch-target mono truncate" title={pendingSwitch.label}>
+                {pendingSwitch.label}
+              </span>
+              <button
+                type="button"
+                className="composer-queue-ic"
+                aria-label="取消待切换模型"
+                title="取消待切换"
+                onClick={() => cancelPendingModelSwitch(agent.key)}
+              >
+                <X size={12} />
+              </button>
+            </div>
           ) : null}
           {totalQueuedCount > 0 ? (
             <div className="composer-queue-shelf" aria-label="排队中的消息">

@@ -1,6 +1,6 @@
 {
   "name": "@herdr-pocket/relay",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",

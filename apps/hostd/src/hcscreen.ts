@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { TerminalDisplay } from "@herdr-pocket/protocol";
+import { KittyHostStream } from "./kittyHost.ts";
 import { defaultHcBin } from "./platform.ts";
 import { Screen } from "./vt.ts";
 
@@ -9,6 +10,7 @@ const CREDIT = 1;
 const CLOSE = 2;
 const RESIZE = 3;
 const FACTS = 5;
+const AUTOMATIC_INPUT = 6;
 const HEADER = 9;
 
 /** Decodes whether the terminal most recently enabled (`?2004h`) or disabled (`?2004l`) bracketed paste. */
@@ -82,6 +84,7 @@ export class HcScreens {
   private replies = new Map<number, (msg: any) => void>();
   private streams = new Map<number, (kind: number, payload: Buffer) => void>();
   private early = new Map<number, Array<[number, Buffer]>>();
+  private supportsAutoInput = false;
 
   constructor(hcBin = defaultHcBin()) {
     this.hcBin = hcBin;
@@ -105,6 +108,8 @@ export class HcScreens {
             child.kill();
             return;
           }
+          const features = hello.result?.features;
+          this.supportsAutoInput = Array.isArray(features) && features.includes("automatic_input");
           framed = true;
           resolve();
         }
@@ -113,6 +118,7 @@ export class HcScreens {
       const lost = () => {
         this.child = null;
         this.ready = null;
+        this.supportsAutoInput = false;
         this.buf = Buffer.alloc(0);
         for (const r of this.replies.values()) r({ error: { message: "lost hc" } });
         this.replies.clear();
@@ -279,11 +285,11 @@ export class HcScreens {
 
   private inputs = new Map<
     string,
-    { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; timer?: NodeJS.Timeout }
+    { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; automaticInput: boolean; timer?: NodeJS.Timeout }
   >();
   private activeRaw = new Map<
     string,
-    Set<{ channel: number; cols: number; rows: number; bracketedPaste: boolean }>
+    Set<{ channel: number; cols: number; rows: number; bracketedPaste: boolean; automaticInput: boolean }>
   >();
 
   /**
@@ -310,9 +316,10 @@ export class HcScreens {
       ...(display ? { display } : {}),
     });
     const channel: number = r.channel;
+    const automaticInput = this.supportsAutoInput && Boolean(r.automatic_input);
     let curCols: number = clampInt(r.terminal?.cols, 20, 500, reqCols);
     let curRows: number = clampInt(r.terminal?.rows, 5, 200, reqRows);
-    const rawEntry = { channel, cols: curCols, rows: curRows, bracketedPaste: false };
+    const rawEntry = { channel, cols: curCols, rows: curRows, bracketedPaste: false, automaticInput };
     let set = this.activeRaw.get(terminal);
     if (!set) {
       set = new Set();
@@ -327,6 +334,7 @@ export class HcScreens {
     let consumedBytes = 0;
     let lastEmitAt = 0;
     const MAX_CHUNK = 192 * 1024;
+    const kittyStream = new KittyHostStream();
 
     const flush = () => {
       if (timer) {
@@ -381,9 +389,6 @@ export class HcScreens {
       }
       if (kind !== DATA) return;
       if (payload.length) {
-        rawEntry.bracketedPaste = scanBracketedPaste(payload.toString("utf8"), rawEntry.bracketedPaste);
-        pending.push(payload);
-        pendingBytes += payload.length;
         consumedBytes += payload.length;
         if (consumedBytes >= 4 * 1024 * 1024) {
           const ack = Buffer.alloc(4);
@@ -391,7 +396,20 @@ export class HcScreens {
           consumedBytes = 0;
           this.send(channel, CREDIT, ack);
         }
+        const processed = kittyStream.push(payload);
+        if (processed.autoReplies.length) {
+          const replyKind = automaticInput ? AUTOMATIC_INPUT : DATA;
+          for (const reply of processed.autoReplies) {
+            this.send(channel, replyKind, reply);
+          }
+        }
+        if (processed.outBytes.length) {
+          rawEntry.bracketedPaste = scanBracketedPaste(processed.outBytes.toString("utf8"), rawEntry.bracketedPaste);
+          pending.push(processed.outBytes);
+          pendingBytes += processed.outBytes.length;
+        }
       }
+      if (!pendingBytes) return;
       const elapsed = Date.now() - lastEmitAt;
       if (pendingBytes >= MAX_CHUNK || elapsed >= 12) {
         flush();
@@ -454,7 +472,7 @@ export class HcScreens {
 
   private refreshInputIdleTimer(
     terminal: string,
-    entry: { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; timer?: NodeJS.Timeout },
+    entry: { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; automaticInput: boolean; timer?: NodeJS.Timeout },
     ch: number,
   ): void {
     clearTimeout(entry.timer);
@@ -471,7 +489,7 @@ export class HcScreens {
     terminal: string,
     cols: number,
     rows: number,
-  ): { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; timer?: NodeJS.Timeout } {
+  ): { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; automaticInput: boolean; timer?: NodeJS.Timeout } {
     const existing = this.inputs.get(terminal);
     if (existing) return existing;
 
@@ -492,15 +510,18 @@ export class HcScreens {
       channel: Promise<number>;
       firstPaint: Promise<void>;
       bracketedPaste: boolean;
+      automaticInput: boolean;
       timer?: NodeJS.Timeout;
     } = {
       channel: Promise.resolve(0),
       firstPaint,
       bracketedPaste: false,
+      automaticInput: false,
     };
 
     const channel = this.call("terminal.attach", { terminal, cols, rows, observe: false, resumed: true }).then((r) => {
       const ch: number = r.channel;
+      entry.automaticInput = this.supportsAutoInput && Boolean(r.automatic_input);
       const onFrame = (kind: number, payload: Buffer) => {
         if (kind === DATA) {
           if (payload.length) {
@@ -546,11 +567,11 @@ export class HcScreens {
     let ch: number;
     let bracketedPaste = false;
     let sharedEntry:
-      | { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; timer?: NodeJS.Timeout }
+      | { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; automaticInput: boolean; timer?: NodeJS.Timeout }
       | undefined;
 
     const active = this.activeRaw.get(terminal);
-    let latest: { channel: number; cols: number; rows: number; bracketedPaste: boolean } | undefined;
+    let latest: { channel: number; cols: number; rows: number; bracketedPaste: boolean; automaticInput?: boolean } | undefined;
     if (active?.size) {
       for (const item of active) latest = item;
     }
@@ -585,20 +606,24 @@ export class HcScreens {
    * Types into a terminal the way the person at it would: raw bytes on an
    * attached (not observing) stream, so text of any script arrives at once and
    * in order. Reuses an open raw stream channel when attached.
+   * When `auto` is true and `hc` supports `AUTOMATIC_INPUT` on this channel,
+   * terminal protocol responses travel via `AUTOMATIC_INPUT (6)`.
    */
-  async input(terminal: string, data: string, cols: number, rows: number): Promise<void> {
+  async input(terminal: string, data: string, cols: number, rows: number, auto = false): Promise<void> {
     const active = this.activeRaw.get(terminal);
     if (active?.size) {
-      let latest: { channel: number; cols: number; rows: number; bracketedPaste: boolean } | undefined;
+      let latest: { channel: number; cols: number; rows: number; bracketedPaste: boolean; automaticInput: boolean } | undefined;
       for (const entry of active) latest = entry;
       if (latest) {
-        this.send(latest.channel, DATA, Buffer.from(data, "utf8"));
+        const kind = auto && latest.automaticInput ? AUTOMATIC_INPUT : DATA;
+        this.send(latest.channel, kind, Buffer.from(data, "utf8"));
         return;
       }
     }
     const entry = this.openInputEntry(terminal, cols, rows);
     const ch = await entry.channel;
-    this.send(ch, DATA, Buffer.from(data, "utf8"));
+    const kind = auto && entry.automaticInput ? AUTOMATIC_INPUT : DATA;
+    this.send(ch, kind, Buffer.from(data, "utf8"));
     this.refreshInputIdleTimer(terminal, entry, ch);
   }
 

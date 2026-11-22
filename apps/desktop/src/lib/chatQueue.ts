@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { textWithFiles, type Agent } from "@herdr-pocket/protocol";
+import { buildHarnessSwitchCommands, stripModelEffortSuffix, textWithFiles, type Agent } from "@herdr-pocket/protocol";
 import {
   reconcileOutgoingSends,
   shouldAutoDrainQueue,
@@ -35,13 +35,25 @@ export interface QueuedPrompt {
   createdAt: number;
 }
 
+export interface PendingModelSwitch {
+  agentKey: string;
+  deviceId: string;
+  harness: string;
+  modelId?: string;
+  thinkingLevel?: string;
+  label: string;
+  createdAt: number;
+}
+
 interface ChatQueueState {
   queuedByAgent: Record<string, QueuedPrompt[]>;
   outgoingByAgent: Record<string, OutgoingSend[]>;
+  pendingSwitchByAgent: Record<string, PendingModelSwitch>;
 }
 
 const EMPTY_QUEUED: QueuedPrompt[] = [];
 const EMPTY_OUTGOING: OutgoingSend[] = [];
+const DRAIN_COOLDOWN_MS = 3500;
 const STEER_SETTLE_MS = 180;
 const INTERRUPTED_SEND_ERROR = "应用重启前发送中断，点击可重试";
 
@@ -51,6 +63,7 @@ const nextId = (prefix: string) => `${prefix}-${Date.now()}-${++idSeq}`;
 export const chatQueueStore = createStore<ChatQueueState>({
   queuedByAgent: {},
   outgoingByAgent: {},
+  pendingSwitchByAgent: {},
 });
 
 interface SerializedQueuedPrompt {
@@ -78,6 +91,7 @@ interface SerializedOutgoingSend {
 interface SerializedChatQueueState {
   queuedByAgent: Record<string, SerializedQueuedPrompt[]>;
   outgoingByAgent: Record<string, SerializedOutgoingSend[]>;
+  pendingSwitchByAgent?: Record<string, PendingModelSwitch>;
 }
 
 function bumpIdSeq(id: string): void {
@@ -119,10 +133,20 @@ function serializeChatQueue(): SerializedChatQueueState | undefined {
       attachments: item.attachments.map(serializeAttachment),
     }));
   }
-  if (!Object.keys(queuedByAgent).length && !Object.keys(outgoingByAgent).length) {
+  const pendingSwitchByAgent: Record<string, PendingModelSwitch> = {};
+  for (const [key, sw] of Object.entries(state.pendingSwitchByAgent)) {
+    if (sw && (sw.modelId || sw.thinkingLevel)) {
+      pendingSwitchByAgent[key] = sw;
+    }
+  }
+  if (!Object.keys(queuedByAgent).length && !Object.keys(outgoingByAgent).length && !Object.keys(pendingSwitchByAgent).length) {
     return undefined;
   }
-  return { queuedByAgent, outgoingByAgent };
+  return {
+    queuedByAgent,
+    outgoingByAgent,
+    ...(Object.keys(pendingSwitchByAgent).length ? { pendingSwitchByAgent } : {}),
+  };
 }
 
 function hydrateChatQueue(raw: unknown): void {
@@ -188,6 +212,27 @@ function hydrateChatQueue(raw: unknown): void {
     }
   }
 
+  const pendingSwitchByAgent: Record<string, PendingModelSwitch> = {};
+  if (obj.pendingSwitchByAgent && typeof obj.pendingSwitchByAgent === "object" && !Array.isArray(obj.pendingSwitchByAgent)) {
+    for (const [agentKey, rawSw] of Object.entries(obj.pendingSwitchByAgent as Record<string, unknown>)) {
+      if (!rawSw || typeof rawSw !== "object") continue;
+      const r = rawSw as Record<string, unknown>;
+      if (typeof r.deviceId !== "string") continue;
+      const modelId = typeof r.modelId === "string" && r.modelId.trim() ? r.modelId.trim() : undefined;
+      const thinkingLevel = typeof r.thinkingLevel === "string" && r.thinkingLevel.trim() ? r.thinkingLevel.trim() : undefined;
+      if (!modelId && !thinkingLevel) continue;
+      pendingSwitchByAgent[agentKey] = {
+        agentKey: typeof r.agentKey === "string" ? r.agentKey : agentKey,
+        deviceId: r.deviceId,
+        harness: typeof r.harness === "string" ? r.harness : "",
+        ...(modelId ? { modelId } : {}),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+        label: typeof r.label === "string" && r.label.trim() ? r.label : [modelId, thinkingLevel].filter(Boolean).join(" · "),
+        createdAt: typeof r.createdAt === "number" ? r.createdAt : Date.now(),
+      };
+    }
+  }
+
   const current = chatQueueStore.get();
   for (const [k, list] of Object.entries(current.queuedByAgent)) {
     if (!list.length) continue;
@@ -199,8 +244,11 @@ function hydrateChatQueue(raw: unknown): void {
     const seen = new Set((outgoingByAgent[k] ?? []).map((x) => x.id));
     outgoingByAgent[k] = [...(outgoingByAgent[k] ?? []), ...list.filter((x) => !seen.has(x.id))];
   }
+  for (const [k, sw] of Object.entries(current.pendingSwitchByAgent)) {
+    pendingSwitchByAgent[k] = sw;
+  }
 
-  chatQueueStore.set({ queuedByAgent, outgoingByAgent });
+  chatQueueStore.set({ queuedByAgent, outgoingByAgent, pendingSwitchByAgent });
 }
 
 registerWorkspaceSection("chatQueue", {
@@ -222,7 +270,7 @@ export function resetChatQueueForTest(): void {
   }
   inFlightAgents.clear();
   dispatchState.clear();
-  chatQueueStore.set({ queuedByAgent: {}, outgoingByAgent: {} });
+  chatQueueStore.set({ queuedByAgent: {}, outgoingByAgent: {}, pendingSwitchByAgent: {} });
 }
 
 function updateOutgoing(
@@ -448,6 +496,83 @@ export async function steerComposerNow(
   }
 }
 
+export function schedulePendingModelSwitch(
+  agent: Pick<Agent, "key" | "deviceId" | "harness">,
+  patch: { modelId?: string; thinkingLevel?: string; label?: string },
+): PendingModelSwitch | null {
+  const modelId = patch.modelId?.trim() || undefined;
+  const thinkingLevel = patch.thinkingLevel?.trim().toLowerCase() || undefined;
+  if (!modelId && !thinkingLevel) return null;
+
+  let saved: PendingModelSwitch | null = null;
+  chatQueueStore.set((state) => {
+    const prev = state.pendingSwitchByAgent[agent.key];
+    const nextModel = modelId ?? prev?.modelId;
+    const nextThinking = thinkingLevel ?? prev?.thinkingLevel;
+    const baseLabel = nextModel ? stripModelEffortSuffix(nextModel) : "";
+    const autoLabel = [baseLabel, nextThinking ? `思考 ${nextThinking}` : ""].filter(Boolean).join(" · ");
+    const label =
+      patch.label?.trim() && !(modelId && !thinkingLevel && prev?.thinkingLevel) && !(!modelId && thinkingLevel && prev?.modelId)
+        ? patch.label.trim()
+        : autoLabel || patch.label?.trim() || "模型配置";
+    saved = {
+      agentKey: agent.key,
+      deviceId: agent.deviceId,
+      harness: agent.harness,
+      ...(nextModel ? { modelId: nextModel } : {}),
+      ...(nextThinking ? { thinkingLevel: nextThinking } : {}),
+      label,
+      createdAt: Date.now(),
+    };
+    return {
+      ...state,
+      pendingSwitchByAgent: {
+        ...state.pendingSwitchByAgent,
+        [agent.key]: saved,
+      },
+    };
+  });
+  scheduleWorkspacePersist();
+  return saved;
+}
+
+export function cancelPendingModelSwitch(agentKey: string): void {
+  let removed = false;
+  chatQueueStore.set((state) => {
+    if (!state.pendingSwitchByAgent[agentKey]) return state;
+    removed = true;
+    const next = { ...state.pendingSwitchByAgent };
+    delete next[agentKey];
+    return { ...state, pendingSwitchByAgent: next };
+  });
+  if (removed) scheduleWorkspacePersist();
+}
+
+async function deliverPendingModelSwitch(sw: PendingModelSwitch): Promise<void> {
+  try {
+    await rpcCall(sw.deviceId, "agent.setModel", {
+      agent: sw.agentKey,
+      ...(sw.modelId ? { modelId: sw.modelId } : {}),
+      ...(sw.thinkingLevel ? { thinkingLevel: sw.thinkingLevel } : {}),
+    });
+  } catch (e) {
+    const err = e as { code?: string; message?: string };
+    const unsupported =
+      err?.code === "unsupported" ||
+      err?.code === "bad_request" ||
+      /unknown|unsupported|不支持/i.test(err?.message ?? "");
+    if (unsupported) {
+      const plan = buildHarnessSwitchCommands(sw.harness, {
+        modelId: sw.modelId,
+        thinkingLevel: sw.thinkingLevel,
+      });
+      for (const cmd of plan.commands) {
+        await rpcCall(sw.deviceId, "terminal.send", { agent: sw.agentKey, text: cmd, enter: true }).catch(() => {});
+      }
+    }
+  }
+}
+
 const inFlightAgents = new Set<string>();
 const dispatchState = new Map<string, { lastDispatchedAt: number; sawWorking: boolean }>();
 let watcherInstalled = false;
@@ -461,7 +586,7 @@ function runQueueDrainTick(): void {
 
   for (const [key, track] of dispatchState) {
     const agent = byKey.get(key);
-    const hasQueue = (state.queuedByAgent[key]?.length ?? 0) > 0;
+    const hasQueue = (state.queuedByAgent[key]?.length ?? 0) > 0 || Boolean(state.pendingSwitchByAgent[key]);
     if (!agent) {
       dispatchState.delete(key);
       continue;
@@ -476,7 +601,27 @@ function runQueueDrainTick(): void {
     }
   }
 
-  for (const [key, queue] of Object.entries(state.queuedByAgent)) {
+  for (const [key, sw] of Object.entries(state.pendingSwitchByAgent)) {
+    const agent = byKey.get(key);
+    if (!agent) continue;
+    const online = Boolean(live.devices[agent.deviceId]?.online);
+    const track = dispatchState.get(key);
+    if (!shouldAutoDrainQueue(agent.status, online, track?.lastDispatchedAt ?? 0, inFlightAgents.has(key), now)) {
+      continue;
+    }
+    cancelPendingModelSwitch(key);
+    inFlightAgents.add(key);
+    dispatchState.set(key, { lastDispatchedAt: now, sawWorking: false });
+    void deliverPendingModelSwitch(sw).finally(() => {
+      inFlightAgents.delete(key);
+      if ((chatQueueStore.get().queuedByAgent[key]?.length ?? 0) > 0) {
+        dispatchState.set(key, { lastDispatchedAt: Date.now() - DRAIN_COOLDOWN_MS + 300, sawWorking: false });
+      }
+    });
+  }
+
+  const afterSwitchState = chatQueueStore.get();
+  for (const [key, queue] of Object.entries(afterSwitchState.queuedByAgent)) {
     if (!queue.length) continue;
     const agent = byKey.get(key);
     if (!agent) continue;
@@ -505,11 +650,13 @@ export function ensureChatQueueWatcher(): void {
 export function useAgentChatQueue(agentKey: string): {
   queued: QueuedPrompt[];
   outgoing: OutgoingSend[];
+  pendingSwitch: PendingModelSwitch | null;
 } {
   useEffect(() => {
     ensureChatQueueWatcher();
   }, []);
   const queued = chatQueueStore.use((s) => s.queuedByAgent[agentKey] ?? EMPTY_QUEUED);
   const outgoing = chatQueueStore.use((s) => s.outgoingByAgent[agentKey] ?? EMPTY_OUTGOING);
-  return { queued, outgoing };
+  const pendingSwitch = chatQueueStore.use((s) => s.pendingSwitchByAgent[agentKey] ?? null);
+  return { queued, outgoing, pendingSwitch };
 }

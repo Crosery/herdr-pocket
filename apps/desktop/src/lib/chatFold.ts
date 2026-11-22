@@ -1,4 +1,11 @@
-import { splitFiles, type ChatDisplayMode, type ConvEvent } from "@herdr-pocket/protocol";
+import {
+  compareConvEvents,
+  formatModelSwitchSummary,
+  parseModelSwitchEvent,
+  splitFiles,
+  type ChatDisplayMode,
+  type ConvEvent,
+} from "@herdr-pocket/protocol";
 
 export type ToolCallEvent = Extract<ConvEvent, { kind: "tool_call" }>;
 export type ToolResultEvent = Extract<ConvEvent, { kind: "tool_result" }>;
@@ -27,14 +34,18 @@ export interface ToolSeriesChip {
 }
 
 export type ChatRow =
-  | { kind: "user"; id: string; text: string; ts: number; injected?: string; attachedLines: string[]; attachedCount: number }
-  | { kind: "assistant"; id: string; text: string; ts: number; partial?: boolean }
-  | { kind: "thinking"; id: string; text: string; defaultOpen?: boolean }
-  | { kind: "system"; id: string; summary: string; text: string }
-  | { kind: "tool"; id: string; step: ToolStep }
+  | { kind: "user"; id: string; text: string; ts: number; pos?: string; injected?: string; attachedLines: string[]; attachedCount: number }
+  | { kind: "assistant"; id: string; text: string; ts: number; pos?: string; partial?: boolean; model?: string }
+  | { kind: "thinking"; id: string; text: string; ts: number; pos?: string; defaultOpen?: boolean }
+  | { kind: "system"; id: string; summary: string; text: string; ts: number; pos?: string }
+  | { kind: "model_switch"; id: string; label: string; model?: string; thinking?: string; ts: number; pos?: string }
+  | { kind: "tool"; id: string; ts: number; pos?: string; step: ToolStep }
   | {
       kind: "activity_group";
       id: string;
+      ts: number;
+      endTs: number;
+      pos?: string;
       tools: ToolStep[];
       thoughts: string[];
       notes: Array<{ summary: string; text: string }>;
@@ -46,13 +57,9 @@ export type ChatRow =
       series: ToolSeriesChip[];
       defaultOpen?: boolean;
     }
-  | { kind: "turn_end"; id: string; ts: number };
+  | { kind: "turn_end"; id: string; ts: number; pos?: string };
 
 const KEEP_EVENTS = 4000;
-
-function posOf(e: ConvEvent): bigint | null {
-  return e.pos && /^\d+$/.test(e.pos) ? BigInt(e.pos) : null;
-}
 
 function sameEvent(a: ConvEvent, b: ConvEvent): boolean {
   if (a === b) return true;
@@ -93,15 +100,93 @@ export function mergeConvEvents(prev: ConvEvent[], add: ConvEvent[]): ConvEvent[
     }
   }
   if (!changed) return prev;
-  return [...byId.values()]
-    .sort((a, b) => {
-      const ap = posOf(a);
-      const bp = posOf(b);
-      if (ap !== null && bp !== null) return ap < bp ? -1 : ap > bp ? 1 : 0;
-      const cmp = (a.pos ?? String(a.ts)).localeCompare(b.pos ?? String(b.ts));
-      return cmp !== 0 ? cmp : a.ts - b.ts;
-    })
-    .slice(-KEEP_EVENTS);
+  return [...byId.values()].sort(compareConvEvents).slice(-KEEP_EVENTS);
+}
+
+export interface BufferedEventMerger {
+  onInitialPage: (events: ConvEvent[]) => void;
+  onInitialReady: () => void;
+  onStreamEvent: (ev: ConvEvent) => void;
+  dispose: () => void;
+}
+
+/**
+ * Coordinates initial paged `session.events` fetch with live SSE `session` stream frames:
+ * holds early stream frames until the initial page lands (or `fallbackMs` elapses) and
+ * coalesces rapid live bursts into 16ms batches to prevent slice artifacts and re-render storms.
+ */
+export function createBufferedEventMerger(
+  applyMerge: (events: ConvEvent[]) => void,
+  fallbackMs = 1500,
+): BufferedEventMerger {
+  let pageReady = false;
+  let disposed = false;
+  let prePageBuffer: ConvEvent[] = [];
+  let liveBatch: ConvEvent[] = [];
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let fallbackTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+    fallbackTimer = null;
+    if (!disposed) onInitialReady();
+  }, fallbackMs);
+
+  const clearFallback = () => {
+    if (fallbackTimer !== null) {
+      clearTimeout(fallbackTimer);
+      fallbackTimer = null;
+    }
+  };
+
+  const onInitialPage = (events: ConvEvent[]) => {
+    if (disposed) return;
+    clearFallback();
+    pageReady = true;
+    const buffered = prePageBuffer;
+    prePageBuffer = [];
+    const combined = buffered.length ? [...events, ...buffered] : events;
+    applyMerge(combined);
+  };
+
+  const onInitialReady = () => {
+    if (disposed || pageReady) return;
+    clearFallback();
+    pageReady = true;
+    if (prePageBuffer.length) {
+      const combined = prePageBuffer;
+      prePageBuffer = [];
+      applyMerge(combined);
+    }
+  };
+
+  const onStreamEvent = (ev: ConvEvent) => {
+    if (disposed) return;
+    if (!pageReady) {
+      prePageBuffer.push(ev);
+      return;
+    }
+    liveBatch.push(ev);
+    if (flushTimer === null) {
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        if (disposed || !liveBatch.length) return;
+        const batch = liveBatch;
+        liveBatch = [];
+        applyMerge(batch);
+      }, 16);
+    }
+  };
+
+  const dispose = () => {
+    disposed = true;
+    clearFallback();
+    if (flushTimer !== null) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    prePageBuffer = [];
+    liveBatch = [];
+  };
+
+  return { onInitialPage, onInitialReady, onStreamEvent, dispose };
 }
 
 /** Classifies a tool name from any harness (Claude Code, Codex, Gemini, Uniflo, Pocket). */
@@ -280,9 +365,9 @@ function buildGroupMeta(
 }
 
 type Intermediate =
-  | { kind: "tool"; id: string; step: ToolStep }
-  | { kind: "thinking"; id: string; text: string }
-  | { kind: "system"; id: string; summary: string; text: string };
+  | { kind: "tool"; id: string; ts: number; pos?: string; step: ToolStep }
+  | { kind: "thinking"; id: string; text: string; ts: number; pos?: string }
+  | { kind: "system"; id: string; summary: string; text: string; ts: number; pos?: string };
 
 /**
  * Pairs `tool_call` and `tool_result` by `call_id` and formats non-message activity
@@ -307,7 +392,9 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
       else if (item.kind === "thinking") thoughts.push(item.text);
       else notes.push({ summary: item.summary, text: item.text });
     }
-    const firstId = pending[0]!.id;
+    const first = pending[0]!;
+    const last = pending[pending.length - 1]!;
+    const firstId = first.id;
     if (tools.length === 0) {
       for (const item of pending) {
         rows.push(
@@ -317,11 +404,14 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
         );
       }
     } else if (tools.length === 1 && thoughts.length === 0 && notes.length === 0) {
-      rows.push({ kind: "tool", id: firstId, step: tools[0]! });
+      rows.push({ kind: "tool", id: firstId, ts: first.ts, pos: first.pos, step: tools[0]! });
     } else {
       rows.push({
         kind: "activity_group",
         id: `grp-${firstId}`,
+        ts: first.ts,
+        endTs: Math.max(first.ts, last.ts),
+        pos: first.pos,
         tools,
         thoughts,
         notes,
@@ -333,11 +423,49 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
   };
 
   for (const e of events) {
+    const sw = parseModelSwitchEvent(e);
+    if (sw) {
+      flushPending();
+      if (sw.ackOnly && !sw.model && !sw.thinking) {
+        continue;
+      }
+      const prev = rows[rows.length - 1];
+      if (
+        prev?.kind === "model_switch" &&
+        Math.abs(e.ts - prev.ts) <= 15_000 &&
+        (sw.ackOnly || !(prev.model && sw.model && prev.model !== sw.model))
+      ) {
+        if (sw.model) prev.model = sw.model;
+        if (sw.thinking) prev.thinking = sw.thinking;
+        prev.ts = Math.max(prev.ts, e.ts);
+        if (e.pos && !prev.pos) prev.pos = e.pos;
+        prev.label = formatModelSwitchSummary({ model: prev.model, thinking: prev.thinking });
+      } else {
+        rows.push({
+          kind: "model_switch",
+          id: e.id,
+          label: formatModelSwitchSummary(sw),
+          ...(sw.model ? { model: sw.model } : {}),
+          ...(sw.thinking ? { thinking: sw.thinking } : {}),
+          ts: e.ts,
+          pos: e.pos,
+        });
+      }
+      continue;
+    }
+
     switch (e.kind) {
       case "user_message": {
         if (e.synthetic) {
           if (e.text.trim()) {
-            const note: Intermediate = { kind: "system", id: e.id, summary: systemSummary(e.text), text: e.text.trim() };
+            const note: Intermediate = {
+              kind: "system",
+              id: e.id,
+              summary: systemSummary(e.text),
+              text: e.text.trim(),
+              ts: e.ts,
+              pos: e.pos,
+            };
             if (mode === "compact") pending.push(note);
             else {
               flushPending();
@@ -354,6 +482,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           id: e.id,
           text: split.text || (split.count ? "" : e.text.trim()),
           ts: e.ts,
+          pos: e.pos,
           injected: e.injected?.trim() || undefined,
           attachedLines: split.lines,
           attachedCount: split.count,
@@ -363,17 +492,25 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
       case "assistant_message": {
         if (!e.text.trim()) break;
         flushPending();
-        rows.push({ kind: "assistant", id: e.id, text: e.text, ts: e.ts, partial: e.partial });
+        rows.push({
+          kind: "assistant",
+          id: e.id,
+          text: e.text,
+          ts: e.ts,
+          pos: e.pos,
+          partial: e.partial,
+          ...(e.model ? { model: e.model } : {}),
+        });
         break;
       }
       case "reasoning": {
         if (!e.text.trim()) break;
         const text = e.text.trim();
         if (mode === "compact") {
-          pending.push({ kind: "thinking", id: e.id, text });
+          pending.push({ kind: "thinking", id: e.id, text, ts: e.ts, pos: e.pos });
         } else {
           flushPending();
-          rows.push({ kind: "thinking", id: e.id, text, defaultOpen: mode === "expanded" });
+          rows.push({ kind: "thinking", id: e.id, text, ts: e.ts, pos: e.pos, defaultOpen: mode === "expanded" });
         }
         break;
       }
@@ -384,6 +521,8 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           id: e.id,
           summary: e.summary?.trim() || systemSummary(e.text),
           text: e.text.trim(),
+          ts: e.ts,
+          pos: e.pos,
         };
         if (mode === "compact") {
           pending.push(note);
@@ -406,7 +545,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           isError: false,
         };
         stepByCallId.set(e.call_id, step);
-        pending.push({ kind: "tool", id: e.id, step });
+        pending.push({ kind: "tool", id: e.id, ts: e.ts, pos: e.pos, step });
         break;
       }
       case "tool_result": {
@@ -431,14 +570,14 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
             isError: Boolean(e.is_error),
           };
           stepByCallId.set(e.call_id, step);
-          pending.push({ kind: "tool", id: e.id, step });
+          pending.push({ kind: "tool", id: e.id, ts: e.ts, pos: e.pos, step });
         }
         break;
       }
       case "turn_end": {
         flushPending();
         if (rows.length && rows[rows.length - 1]?.kind !== "turn_end") {
-          rows.push({ kind: "turn_end", id: e.id, ts: e.ts });
+          rows.push({ kind: "turn_end", id: e.id, ts: e.ts, pos: e.pos });
         }
         break;
       }

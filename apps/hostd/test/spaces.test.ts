@@ -203,3 +203,88 @@ test("HerdrApp.deleteSpace cleans up standalone orphan space terminals by where 
   assert.deepEqual(killed, ["t21"]);
   assert.equal(res.closedTerminals, 1);
 });
+
+test("HerdrApp.names + Host.collect exclude detached closed tabs and restore stopped agents", async () => {
+  const { Host } = await import("../src/host.ts");
+  const h = new Host({ config: { server: "http://127.0.0.1:9", token: "t", deviceId: "d", name: "test" }, log: () => {} });
+  const app = new HerdrApp("herdr-app");
+  app.ls = async () => ({
+    spaces: [
+      {
+        id: "sp1",
+        name: "SpaceA",
+        folder: "/tmp/demo",
+        tabs: [
+          {
+            id: "tb1",
+            name: "Tab1",
+            terminals: [{ terminal: "t_open", app: "claude-code", status: null, name: "Agent1" }],
+          },
+        ],
+      },
+      {
+        id: "sp_remote",
+        name: "RemoteSpace",
+        machine: "peer",
+        tabs: [{ id: "tb_r", name: "RemoteTab", terminals: [{ terminal: "t_remote", app: "codex" }] }],
+      },
+    ],
+  });
+  const names = await app.names();
+  assert.equal(names.terminals?.get("t_open")?.app, "claude-code");
+  assert.equal(names.terminals?.has("t_remote"), false);
+
+  const now = Date.now();
+  (h as unknown as { names: typeof names; hc: { terminals: Map<string, HcTerminal> } }).names = names;
+  (h as unknown as { hc: { terminals: Map<string, HcTerminal> } }).hc.terminals = new Map<string, HcTerminal>([
+    [
+      "t_open",
+      {
+        address: "t_open",
+        cwd: "/tmp/demo",
+        created_ms: now - 120_000,
+        foreground: { argv: ["zsh"] },
+        labels: { "herdr.space": "sp1", "herdr.tab": "tb1" },
+      },
+    ],
+    [
+      "t_closed_ghost",
+      {
+        address: "t_closed_ghost",
+        cwd: "/tmp/demo",
+        created_ms: now - 120_000,
+        status: { app: "codex", state: "idle" },
+        labels: { "herdr.seen": "2", where: "SpaceA / Closed" },
+      },
+    ],
+    [
+      "t_fresh",
+      {
+        address: "t_fresh",
+        cwd: "/tmp/demo",
+        created_ms: now - 1_000,
+        labels: { "herdr.seen": "1", where: "SpaceA / Starting" },
+      },
+    ],
+    [
+      "t_standalone",
+      {
+        address: "t_standalone",
+        cwd: "/tmp/other",
+        created_ms: now - 120_000,
+        status: { app: "omp", state: "working" },
+        labels: {},
+      },
+    ],
+  ]);
+
+  const collected = h.collect();
+  assert.deepEqual(
+    collected.map((a) => [a.localId, a.harness, a.isShell, a.where]),
+    [
+      ["t_open", "claude-code", false, "SpaceA / Tab1"],
+      ["t_fresh", "terminal", false, "SpaceA / Starting"],
+      ["t_standalone", "omp", false, undefined],
+    ],
+  );
+});

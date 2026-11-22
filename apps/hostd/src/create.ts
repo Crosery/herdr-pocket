@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { HERDR_COMMANDS, type HerdrCommand, type LaunchOption, type SpaceInfo } from "@herdr-pocket/protocol";
-import type { AppNames, HcTerminal } from "./hc.ts";
+import type { AppNames, AppTerminalMeta, HcTerminal } from "./hc.ts";
 import { IS_WINDOWS, onPath, programName, windowsBins } from "./platform.ts";
 import { base, run } from "./util.ts";
 
@@ -137,6 +137,22 @@ export function checkFolder(raw: unknown): string {
   return p;
 }
 
+export interface AppLsTerminal {
+  terminal?: string;
+  id?: string;
+  pane?: string;
+  status?: string | null;
+  app?: string | null;
+  name?: string | null;
+  sub_agents?: Array<{
+    terminal?: string;
+    id?: string;
+    status?: string | null;
+    app?: string | null;
+    name?: string | null;
+  }>;
+}
+
 export interface AppLs {
   spaces: Array<{
     id: string;
@@ -149,7 +165,7 @@ export interface AppLs {
       name?: string;
       active?: boolean;
       settled?: boolean;
-      terminals?: Array<{ terminal?: string; pane?: string; status?: string | null; app?: string | null; name?: string | null }>;
+      terminals?: AppLsTerminal[];
     }>;
   }>;
 }
@@ -430,14 +446,98 @@ export class HerdrApp {
     return ls;
   }
 
-  /** Space and tab names by id as the window shows them; throws when the window is not open. */
+  /** Space, tab, and terminal metadata by id as the open window shows them; throws when the window is not open. */
   async names(): Promise<AppNames> {
-    const names: AppNames = { spaces: new Map(), tabs: new Map() };
+    const spaces = new Map<string, string>();
+    const tabs = new Map<string, string>();
+    const terminals = new Map<string, AppTerminalMeta>();
     for (const s of (await this.ls()).spaces) {
-      if (s.id && s.name) names.spaces.set(s.id, s.name);
-      for (const t of s.tabs ?? []) if (t.id && t.name) names.tabs.set(t.id, t.name);
+      if (s.machine) continue;
+      if (s.id && s.name) spaces.set(s.id, s.name);
+      for (const t of s.tabs ?? []) {
+        if (t.id && t.name) tabs.set(t.id, t.name);
+        if (!s.id || !s.name) continue;
+        for (const term of t.terminals ?? []) {
+          const addr = (term.terminal ?? term.id)?.trim();
+          if (addr) {
+            terminals.set(addr, {
+              spaceId: s.id,
+              spaceName: s.name,
+              ...(t.id ? { tabId: t.id } : {}),
+              ...(t.name ? { tabName: t.name } : {}),
+              ...(term.app !== undefined ? { app: term.app } : {}),
+              ...(term.status !== undefined ? { status: term.status } : {}),
+              ...(term.name !== undefined ? { name: term.name } : {}),
+            });
+          }
+          for (const sub of term.sub_agents ?? []) {
+            const subAddr = (sub?.terminal ?? sub?.id)?.trim();
+            if (!subAddr) continue;
+            terminals.set(subAddr, {
+              spaceId: s.id,
+              spaceName: s.name,
+              ...(t.id ? { tabId: t.id } : {}),
+              ...(t.name ? { tabName: t.name } : {}),
+              ...(sub.app !== undefined ? { app: sub.app } : {}),
+              ...(sub.status !== undefined ? { status: sub.status } : {}),
+              ...(sub.name !== undefined ? { name: sub.name } : {}),
+            });
+          }
+        }
+      }
     }
-    return names;
+    return { spaces, tabs, terminals };
+  }
+
+  /** Fallback space, tab, and terminal names from persisted docs.json when the window is closed. */
+  namesFromDocs(): AppNames | null {
+    try {
+      const raw = JSON.parse(readFileSync(this.docsJsonPath, "utf8")) as Record<string, any>;
+      const docVal = raw?.["herdr-app"]?.value ?? raw?.docs?.["herdr-app"]?.value;
+      const list = Array.isArray(docVal?.spaces) ? docVal.spaces : null;
+      if (!list) return null;
+      const spaces = new Map<string, string>();
+      const tabs = new Map<string, string>();
+      const terminals = new Map<string, AppTerminalMeta>();
+      for (const s of list) {
+        if (!s || typeof s.id !== "string" || typeof s.name !== "string" || s.machine) continue;
+        spaces.set(s.id, s.name);
+        const rawTabs = Array.isArray(s.tabs) ? s.tabs : [];
+        for (const t of rawTabs) {
+          if (typeof t?.id === "string" && typeof t?.name === "string") tabs.set(t.id, t.name);
+          const tabId = typeof t?.id === "string" ? t.id : undefined;
+          const tabName = typeof t?.name === "string" ? t.name : undefined;
+          const directTerms = Array.isArray(t?.terminals) ? t.terminals : [];
+          if (directTerms.length > 0) {
+            for (const x of directTerms) {
+              const addr = (typeof x?.terminal === "string" ? x.terminal : typeof x?.id === "string" ? x.id : "").trim();
+              if (!addr) continue;
+              terminals.set(addr, {
+                spaceId: s.id,
+                spaceName: s.name,
+                ...(tabId ? { tabId } : {}),
+                ...(tabName ? { tabName } : {}),
+                ...(x?.app !== undefined ? { app: x.app } : {}),
+                ...(x?.status !== undefined ? { status: x.status } : {}),
+                ...(x?.name !== undefined ? { name: x.name } : {}),
+              });
+            }
+          } else {
+            for (const addr of collectTerminalIdsFromRoot(t?.root)) {
+              terminals.set(addr, {
+                spaceId: s.id,
+                spaceName: s.name,
+                ...(tabId ? { tabId } : {}),
+                ...(tabName ? { tabName } : {}),
+              });
+            }
+          }
+        }
+      }
+      return { spaces, tabs, terminals };
+    } catch {
+      return null;
+    }
   }
 
   /** Spaces of this computer in the open window (exact Herdr App order + colors); throws when the window is not open. */

@@ -451,7 +451,7 @@ export interface RpcMethods {
    * control bytes ("\r" Enter, "\x7f" Backspace). No queue, no Enter added.
    * Hosts before this call answer `unsupported`; fall back to `terminal.send`.
    */
-  "terminal.input": { params: { agent: string; data: string }; result: { ok: true } };
+  "terminal.input": { params: { agent: string; data: string; auto?: boolean }; result: { ok: true } };
   /**
    * Resizes the attached terminal view (and optionally reports the viewer's cell size /
    * theme colors so `hc` answers display queries accurately). Hosts before this call answer
@@ -2737,49 +2737,186 @@ function chacha20Xor(key: Uint8Array, nonce: Uint8Array, input: Uint8Array, out:
   }
 }
 
-const POLY_P = (1n << 130n) - 5n;
-const POLY_HIBIT = 1n << 128n;
-
-function leBytesToBigInt(bytes: Uint8Array, offset: number, len: number): bigint {
-  let v = 0n;
-  for (let i = len - 1; i >= 0; i--) {
-    v = (v << 8n) | BigInt(bytes[offset + i]!);
+function poly1305ToLimbs13(bytes: Uint8Array, offset: number, len: number, out: Uint32Array | Float64Array, addHibit: boolean): void {
+  // Pack up to 16 little-endian bytes (0..127 bits) + optional 2^128 bit into 10 x 13-bit limbs.
+  let b0 = 0;
+  let b1 = 0;
+  let b2 = 0;
+  let b3 = 0;
+  if (len >= 16) {
+    b0 = u32le(bytes, offset);
+    b1 = u32le(bytes, offset + 4);
+    b2 = u32le(bytes, offset + 8);
+    b3 = u32le(bytes, offset + 12);
+  } else {
+    if (len > 0) {
+      const end0 = Math.min(4, len);
+      for (let i = 0; i < end0; i++) b0 |= bytes[offset + i]! << (i * 8);
+    }
+    if (len > 4) {
+      const end1 = Math.min(8, len);
+      for (let i = 4; i < end1; i++) b1 |= bytes[offset + i]! << ((i - 4) * 8);
+    }
+    if (len > 8) {
+      const end2 = Math.min(12, len);
+      for (let i = 8; i < end2; i++) b2 |= bytes[offset + i]! << ((i - 8) * 8);
+    }
+    if (len > 12) {
+      const end3 = Math.min(16, len);
+      for (let i = 12; i < end3; i++) b3 |= bytes[offset + i]! << ((i - 12) * 8);
+    }
+    b0 >>>= 0;
+    b1 >>>= 0;
+    b2 >>>= 0;
+    b3 >>>= 0;
   }
-  return v;
+
+  out[0] = b0 & 0x1fff;
+  out[1] = (b0 >>> 13) & 0x1fff;
+  out[2] = ((b0 >>> 26) | (b1 << 6)) & 0x1fff;
+  out[3] = (b1 >>> 7) & 0x1fff;
+  out[4] = ((b1 >>> 20) | (b2 << 12)) & 0x1fff;
+  out[5] = (b2 >>> 1) & 0x1fff;
+  out[6] = (b2 >>> 14) & 0x1fff;
+  out[7] = ((b2 >>> 27) | (b3 << 5)) & 0x1fff;
+  out[8] = (b3 >>> 8) & 0x1fff;
+  out[9] = ((b3 >>> 21) & 0x07ff) | (addHibit ? 0x0800 : 0);
 }
 
 function poly1305AeadTag(otk: Uint8Array, ciphertext: Uint8Array, ctLen: number): Uint8Array {
-  const rBytes = otk.slice(0, 16);
-  rBytes[3] = rBytes[3]! & 15;
-  rBytes[7] = rBytes[7]! & 15;
-  rBytes[11] = rBytes[11]! & 15;
-  rBytes[15] = rBytes[15]! & 15;
-  rBytes[4] = rBytes[4]! & 252;
-  rBytes[8] = rBytes[8]! & 252;
-  rBytes[12] = rBytes[12]! & 252;
-  const r = leBytesToBigInt(rBytes, 0, 16);
-  const s = leBytesToBigInt(otk, 16, 16);
+  const rBytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) rBytes[i] = otk[i]!;
+  rBytes[3]! &= 15;
+  rBytes[7]! &= 15;
+  rBytes[11]! &= 15;
+  rBytes[15]! &= 15;
+  rBytes[4]! &= 252;
+  rBytes[8]! &= 252;
+  rBytes[12]! &= 252;
 
-  let acc = 0n;
+  const r = new Float64Array(10);
+  poly1305ToLimbs13(rBytes, 0, 16, r, false);
+  const r0 = r[0]!, r1 = r[1]!, r2 = r[2]!, r3 = r[3]!, r4 = r[4]!;
+  const r5 = r[5]!, r6 = r[6]!, r7 = r[7]!, r8 = r[8]!, r9 = r[9]!;
+  const s1 = r1 * 5, s2 = r2 * 5, s3 = r3 * 5, s4 = r4 * 5;
+  const s5 = r5 * 5, s6 = r6 * 5, s7 = r7 * 5, s8 = r8 * 5, s9 = r9 * 5;
+
+  let h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0, h5 = 0, h6 = 0, h7 = 0, h8 = 0, h9 = 0;
+  const block = new Uint32Array(10);
+
+  const mulBlock = () => {
+    const t0 = h0 + block[0]!;
+    const t1 = h1 + block[1]!;
+    const t2 = h2 + block[2]!;
+    const t3 = h3 + block[3]!;
+    const t4 = h4 + block[4]!;
+    const t5 = h5 + block[5]!;
+    const t6 = h6 + block[6]!;
+    const t7 = h7 + block[7]!;
+    const t8 = h8 + block[8]!;
+    const t9 = h9 + block[9]!;
+
+    const d0 = t0 * r0 + t1 * s9 + t2 * s8 + t3 * s7 + t4 * s6 + t5 * s5 + t6 * s4 + t7 * s3 + t8 * s2 + t9 * s1;
+    const d1 = t0 * r1 + t1 * r0 + t2 * s9 + t3 * s8 + t4 * s7 + t5 * s6 + t6 * s5 + t7 * s4 + t8 * s3 + t9 * s2;
+    const d2 = t0 * r2 + t1 * r1 + t2 * r0 + t3 * s9 + t4 * s8 + t5 * s7 + t6 * s6 + t7 * s5 + t8 * s4 + t9 * s3;
+    const d3 = t0 * r3 + t1 * r2 + t2 * r1 + t3 * r0 + t4 * s9 + t5 * s8 + t6 * s7 + t7 * s6 + t8 * s5 + t9 * s4;
+    const d4 = t0 * r4 + t1 * r3 + t2 * r2 + t3 * r1 + t4 * r0 + t5 * s9 + t6 * s8 + t7 * s7 + t8 * s6 + t9 * s5;
+    const d5 = t0 * r5 + t1 * r4 + t2 * r3 + t3 * r2 + t4 * r1 + t5 * r0 + t6 * s9 + t7 * s8 + t8 * s7 + t9 * s6;
+    const d6 = t0 * r6 + t1 * r5 + t2 * r4 + t3 * r3 + t4 * r2 + t5 * r1 + t6 * r0 + t7 * s9 + t8 * s8 + t9 * s7;
+    const d7 = t0 * r7 + t1 * r6 + t2 * r5 + t3 * r4 + t4 * r3 + t5 * r2 + t6 * r1 + t7 * r0 + t8 * s9 + t9 * s8;
+    const d8 = t0 * r8 + t1 * r7 + t2 * r6 + t3 * r5 + t4 * r4 + t5 * r3 + t6 * r2 + t7 * r1 + t8 * r0 + t9 * s9;
+    const d9 = t0 * r9 + t1 * r8 + t2 * r7 + t3 * r6 + t4 * r5 + t5 * r4 + t6 * r3 + t7 * r2 + t8 * r1 + t9 * r0;
+
+    let c: number;
+    let v = d0; c = Math.floor(v / 8192); h0 = v - c * 8192;
+    v = d1 + c; c = Math.floor(v / 8192); h1 = v - c * 8192;
+    v = d2 + c; c = Math.floor(v / 8192); h2 = v - c * 8192;
+    v = d3 + c; c = Math.floor(v / 8192); h3 = v - c * 8192;
+    v = d4 + c; c = Math.floor(v / 8192); h4 = v - c * 8192;
+    v = d5 + c; c = Math.floor(v / 8192); h5 = v - c * 8192;
+    v = d6 + c; c = Math.floor(v / 8192); h6 = v - c * 8192;
+    v = d7 + c; c = Math.floor(v / 8192); h7 = v - c * 8192;
+    v = d8 + c; c = Math.floor(v / 8192); h8 = v - c * 8192;
+    v = d9 + c; c = Math.floor(v / 8192); h9 = v - c * 8192;
+    h0 += c * 5; c = h0 >>> 13; h0 &= 8191; h1 += c;
+  };
+
   for (let offset = 0; offset < ctLen; offset += 16) {
-    const chunkLen = Math.min(16, ctLen - offset);
-    const n = leBytesToBigInt(ciphertext, offset, chunkLen) | POLY_HIBIT;
-    acc = ((acc + n) * r) % POLY_P;
+    poly1305ToLimbs13(ciphertext, offset, Math.min(16, ctLen - offset), block, true);
+    mulBlock();
   }
 
   // AEAD footer: le64(aadLen = 0) || le64(ctLen) as one 16-byte block.
   const footer = new Uint8Array(16);
   writeU32le(footer, 8, ctLen >>> 0);
   writeU32le(footer, 12, Math.floor(ctLen / 0x1_0000_0000) >>> 0);
-  acc = ((acc + (leBytesToBigInt(footer, 0, 16) | POLY_HIBIT)) * r) % POLY_P;
+  poly1305ToLimbs13(footer, 0, 16, block, true);
+  mulBlock();
 
-  const tagVal = (acc + s) & ((1n << 128n) - 1n);
+  // Final full carry & freeze mod (2^130 - 5).
+  let c = h0 >>> 13; h0 &= 8191; h1 += c;
+  c = h1 >>> 13; h1 &= 8191; h2 += c;
+  c = h2 >>> 13; h2 &= 8191; h3 += c;
+  c = h3 >>> 13; h3 &= 8191; h4 += c;
+  c = h4 >>> 13; h4 &= 8191; h5 += c;
+  c = h5 >>> 13; h5 &= 8191; h6 += c;
+  c = h6 >>> 13; h6 &= 8191; h7 += c;
+  c = h7 >>> 13; h7 &= 8191; h8 += c;
+  c = h8 >>> 13; h8 &= 8191; h9 += c;
+  c = h9 >>> 13; h9 &= 8191; h0 += c * 5;
+  c = h0 >>> 13; h0 &= 8191; h1 += c;
+  c = h1 >>> 13; h1 &= 8191; h2 += c;
+  c = h2 >>> 13; h2 &= 8191; h3 += c;
+  c = h3 >>> 13; h3 &= 8191; h4 += c;
+  c = h4 >>> 13; h4 &= 8191; h5 += c;
+  c = h5 >>> 13; h5 &= 8191; h6 += c;
+  c = h6 >>> 13; h6 &= 8191; h7 += c;
+  c = h7 >>> 13; h7 &= 8191; h8 += c;
+  c = h8 >>> 13; h8 &= 8191; h9 += c;
+  c = h9 >>> 13; h9 &= 8191; h0 += c * 5;
+  c = h0 >>> 13; h0 &= 8191; h1 += c;
+
+  let gc = 5;
+  const g0 = (h0 + gc) & 8191; gc = (h0 + gc) >>> 13;
+  const g1 = (h1 + gc) & 8191; gc = (h1 + gc) >>> 13;
+  const g2 = (h2 + gc) & 8191; gc = (h2 + gc) >>> 13;
+  const g3 = (h3 + gc) & 8191; gc = (h3 + gc) >>> 13;
+  const g4 = (h4 + gc) & 8191; gc = (h4 + gc) >>> 13;
+  const g5 = (h5 + gc) & 8191; gc = (h5 + gc) >>> 13;
+  const g6 = (h6 + gc) & 8191; gc = (h6 + gc) >>> 13;
+  const g7 = (h7 + gc) & 8191; gc = (h7 + gc) >>> 13;
+  const g8 = (h8 + gc) & 8191; gc = (h8 + gc) >>> 13;
+  const g9 = (h9 + gc) & 8191; gc = (h9 + gc) >>> 13;
+
+  const mask = -gc;
+  h0 = (h0 & ~mask) | (g0 & mask);
+  h1 = (h1 & ~mask) | (g1 & mask);
+  h2 = (h2 & ~mask) | (g2 & mask);
+  h3 = (h3 & ~mask) | (g3 & mask);
+  h4 = (h4 & ~mask) | (g4 & mask);
+  h5 = (h5 & ~mask) | (g5 & mask);
+  h6 = (h6 & ~mask) | (g6 & mask);
+  h7 = (h7 & ~mask) | (g7 & mask);
+  h8 = (h8 & ~mask) | (g8 & mask);
+  h9 = (h9 & ~mask) | (g9 & mask);
+
+  // Convert lowest 128 bits into 4 little-endian 32-bit words and add s = otk[16..32].
+  const f0 = (h0 | (h1 << 13) | (h2 << 26)) >>> 0;
+  const f1 = ((h2 >>> 6) | (h3 << 7) | (h4 << 20)) >>> 0;
+  const f2 = ((h4 >>> 12) | (h5 << 1) | (h6 << 14) | (h7 << 27)) >>> 0;
+  const f3 = ((h7 >>> 5) | (h8 << 8) | (h9 << 21)) >>> 0;
+
+  let carry = 0;
+  const sum0 = f0 + u32le(otk, 16) + carry; carry = sum0 >= 0x1_0000_0000 ? 1 : 0;
+  const sum1 = f1 + u32le(otk, 20) + carry; carry = sum1 >= 0x1_0000_0000 ? 1 : 0;
+  const sum2 = f2 + u32le(otk, 24) + carry; carry = sum2 >= 0x1_0000_0000 ? 1 : 0;
+  const sum3 = f3 + u32le(otk, 28) + carry;
+
   const tag = new Uint8Array(16);
-  let cur = tagVal;
-  for (let i = 0; i < 16; i++) {
-    tag[i] = Number(cur & 0xffn);
-    cur >>= 8n;
-  }
+  writeU32le(tag, 0, sum0 >>> 0);
+  writeU32le(tag, 4, sum1 >>> 0);
+  writeU32le(tag, 8, sum2 >>> 0);
+  writeU32le(tag, 12, sum3 >>> 0);
   return tag;
 }
 
@@ -2894,4 +3031,248 @@ export function utf8Decode(b: Uint8Array): string {
   }
   flush();
   return s;
+}
+
+// ---------------------------------------------------------------------------
+// Conversation Event Ordering & Model-Switch Parsing
+// ---------------------------------------------------------------------------
+
+const CONV_KIND_RANK: Record<string, number> = {
+  turn_start: 0,
+  user_message: 1,
+  system: 2,
+  reasoning: 3,
+  assistant_message: 4,
+  tool_call: 5,
+  tool_result: 6,
+  usage: 7,
+  turn_end: 8,
+};
+
+function parseConvPos(pos?: string): bigint | null {
+  if (!pos) return null;
+  const m = /^\s*(\d+)/.exec(pos);
+  return m ? BigInt(m[1]!) : null;
+}
+
+function parseConvEventStemAndSub(id: string): { stem: string; sub: number } | null {
+  const m = /^(.*?)(?::c|#)(\d+)$/i.exec(id);
+  if (!m) return null;
+  const sub = Number(m[2]);
+  return Number.isSafeInteger(sub) ? { stem: m[1]!, sub } : null;
+}
+
+/**
+ * Total, deterministic ordering over `ConvEvent` across live SSE frames and paged RPC fetches.
+ * Primary key: numeric byte-offset `pos` when both events have one; breaks same-record ties
+ * by same-stem block index (`#0 < #1 < #10`) and logical phase rank (`kind`).
+ * Falls back cleanly to numeric `ts` (never lexicographic `pos`-vs-`ts` `localeCompare`) when `pos` is absent.
+ */
+export function compareConvEvents(a: ConvEvent, b: ConvEvent): number {
+  const ap = parseConvPos(a.pos);
+  const bp = parseConvPos(b.pos);
+
+  if (ap !== null && bp !== null) {
+    if (ap !== bp) return ap < bp ? -1 : 1;
+
+    const aSub = parseConvEventStemAndSub(a.id);
+    const bSub = parseConvEventStemAndSub(b.id);
+    if (aSub && bSub && aSub.stem === bSub.stem && aSub.sub !== bSub.sub) {
+      return aSub.sub - bSub.sub;
+    }
+
+    const aRank = CONV_KIND_RANK[a.kind] ?? 99;
+    const bRank = CONV_KIND_RANK[b.kind] ?? 99;
+    if (aRank !== bRank) return aRank - bRank;
+
+    if (aSub && bSub && aSub.sub !== bSub.sub) {
+      return aSub.sub - bSub.sub;
+    }
+  } else {
+    const aTs = Number.isFinite(a.ts) ? a.ts : 0;
+    const bTs = Number.isFinite(b.ts) ? b.ts : 0;
+    if (aTs !== bTs) return aTs - bTs;
+    if (ap !== null && bp === null) return -1;
+    if (ap === null && bp !== null) return 1;
+  }
+
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+export interface ParsedModelSwitch {
+  model?: string;
+  thinking?: string;
+  /** True when the event is a CLI acknowledgement / stdout line that should coalesce or drop if empty. */
+  ackOnly?: boolean;
+}
+
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+const COMMAND_NAME_RE = /<command-name>\s*\/?(model|models|switch|effort|thinking)\s*<\/command-name>/i;
+const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/i;
+const LOCAL_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/i;
+const KNOWN_EFFORT_WORD_RE =
+  /^(?:off|none|minimal|min|low|medium|med|high|xhigh|max|ultra|auto|default|normal|fast|smart|rush)$/i;
+
+const SWITCH_EFFORT_LABELS: Record<string, string> = {
+  off: "关闭",
+  none: "关闭",
+  minimal: "极简",
+  min: "极简",
+  low: "低",
+  medium: "中",
+  med: "中",
+  high: "高",
+  xhigh: "超高",
+  max: "最大",
+  ultra: "极致",
+  auto: "自动",
+  default: "默认",
+  normal: "标准",
+  fast: "快速",
+  smart: "深度",
+  rush: "极速",
+};
+
+function splitModelSelector(raw: string): { model?: string; thinking?: string } {
+  const cleaned = raw.trim().replace(/^['"`]|['"`]$/g, "").trim();
+  if (!cleaned || /[<>]/.test(cleaned)) return {};
+  const thinking = extractModelExplicitEffort(cleaned);
+  const model = stripModelEffortSuffix(cleaned).trim() || cleaned;
+  return {
+    model,
+    ...(thinking ? { thinking: thinking.toLowerCase() } : {}),
+  };
+}
+
+function parseStdoutModelSwitch(stdoutBody: string): { model?: string; thinking?: string } {
+  const clean = stdoutBody.replace(ANSI_ESCAPE_RE, "").trim();
+  if (!clean) return {};
+  let model: string | undefined;
+  let thinking: string | undefined;
+
+  const modelMatch = /(?:Set model to|Switched(?: model)? to|Model set to)\s+([^\r\n(]+)/i.exec(clean);
+  if (modelMatch?.[1]) {
+    const parsed = splitModelSelector(modelMatch[1].replace(/[.。]+$/, ""));
+    model = parsed.model;
+    thinking = parsed.thinking;
+  }
+
+  const effortMatch = /(?:Set\s+)?(?:effort|thinking)(?:\s+level)?(?:\s+set)?\s+to\s+([a-z0-9_-]+)/i.exec(clean);
+  if (effortMatch?.[1] && KNOWN_EFFORT_WORD_RE.test(effortMatch[1])) {
+    thinking = effortMatch[1].toLowerCase();
+  }
+
+  return {
+    ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
+  };
+}
+
+/**
+ * Extracts structured model / thinking-effort changes from slash commands, Claude XML
+ * command blocks, or host-emitted `model_switch` system events. Returns `null` for ordinary prose.
+ */
+export function parseModelSwitchText(rawText: string, subtype?: string): ParsedModelSwitch | null {
+  const clean = rawText.replace(ANSI_ESCAPE_RE, "").trim();
+  if (!clean) return null;
+
+  const cmdMatch = COMMAND_NAME_RE.exec(clean);
+  if (cmdMatch) {
+    const cmd = cmdMatch[1]!.toLowerCase();
+    const argsRaw = COMMAND_ARGS_RE.exec(clean)?.[1]?.trim() ?? "";
+    const stdoutRaw = LOCAL_STDOUT_RE.exec(clean)?.[1] ?? "";
+    const fromStdout = stdoutRaw ? parseStdoutModelSwitch(stdoutRaw) : {};
+
+    if (cmd === "effort" || cmd === "thinking") {
+      const argEffort = argsRaw && !/[<>]/.test(argsRaw) ? argsRaw.toLowerCase() : undefined;
+      const thinking = argEffort ?? fromStdout.thinking;
+      if (thinking) return { ...(fromStdout.model ? { model: fromStdout.model } : {}), thinking };
+      return { ackOnly: true };
+    }
+
+    if (argsRaw) {
+      const split = splitModelSelector(argsRaw);
+      if (split.model || split.thinking) {
+        return {
+          ...(split.model ? { model: split.model } : fromStdout.model ? { model: fromStdout.model } : {}),
+          ...(split.thinking ? { thinking: split.thinking } : fromStdout.thinking ? { thinking: fromStdout.thinking } : {}),
+        };
+      }
+    }
+    if (fromStdout.model || fromStdout.thinking) {
+      return fromStdout;
+    }
+    return { ackOnly: true };
+  }
+
+  const stdoutOnly = LOCAL_STDOUT_RE.exec(clean);
+  if (stdoutOnly) {
+    const parsed = parseStdoutModelSwitch(stdoutOnly[1] ?? "");
+    return { ...parsed, ackOnly: true };
+  }
+
+  if (subtype === "model_switch" || subtype === "model_change" || subtype === "thinking_level_change") {
+    const fromStdout = parseStdoutModelSwitch(clean);
+    if (fromStdout.model || fromStdout.thinking) return fromStdout;
+    const cnMatch = /已切换模型为\s+([^\r\n·]+?)(?:\s*·\s*思考\s+(\S+))?$/.exec(clean);
+    if (cnMatch?.[1]) {
+      const parsed = splitModelSelector(cnMatch[1]);
+      return {
+        ...parsed,
+        ...(cnMatch[2] ? { thinking: cnMatch[2].trim().toLowerCase() } : parsed.thinking ? { thinking: parsed.thinking } : {}),
+      };
+    }
+    const singleToken = !/[\r\n\s]/.test(clean) ? splitModelSelector(clean) : {};
+    if (singleToken.model || singleToken.thinking) return singleToken;
+    return { ackOnly: true };
+  }
+
+  if (clean.startsWith("/") && !/[\r\n]/.test(clean)) {
+    const modelCmd = /^\/(?:model(?:\s+set)?|models|switch)\s+(\S[^\r\n]*)$/i.exec(clean);
+    if (modelCmd?.[1]) {
+      const arg = modelCmd[1].trim();
+      if (KNOWN_EFFORT_WORD_RE.test(arg) && /^\/model\s+/i.test(clean)) {
+        return { thinking: arg.toLowerCase() };
+      }
+      const split = splitModelSelector(arg);
+      if (split.model || split.thinking) return split;
+    }
+
+    const bareModelCmd = /^\/(?:model|models|switch)$/i.exec(clean);
+    if (bareModelCmd) {
+      return { ackOnly: true };
+    }
+
+    const effortCmd = /^\/(?:effort|thinking|reasoning|reasoning-effort)\s+([a-zA-Z0-9_-]+)$/i.exec(clean);
+    if (effortCmd?.[1] && KNOWN_EFFORT_WORD_RE.test(effortCmd[1])) {
+      return { thinking: effortCmd[1].toLowerCase() };
+    }
+  }
+
+  return null;
+}
+
+/** Extracts a `ParsedModelSwitch` from a `ConvEvent` (`user_message` or `system`) if applicable. */
+export function parseModelSwitchEvent(
+  e: Pick<ConvEvent, "kind"> & { text?: string; injected?: string; subtype?: string },
+): ParsedModelSwitch | null {
+  if (e.kind === "system") {
+    return typeof e.text === "string" ? parseModelSwitchText(e.text, e.subtype) : null;
+  }
+  if (e.kind === "user_message") {
+    const text = typeof e.text === "string" ? e.text.trim() : "";
+    const injected = typeof e.injected === "string" ? e.injected.trim() : "";
+    if (!text && injected) return parseModelSwitchText(injected);
+    if (text && !injected) return parseModelSwitchText(text);
+  }
+  return null;
+}
+
+/** Formats a user-facing single-line summary for a `model_switch` timeline pill. */
+export function formatModelSwitchSummary(sw: { model?: string; thinking?: string }): string {
+  const effort = sw.thinking ? (SWITCH_EFFORT_LABELS[sw.thinking.toLowerCase()] ?? sw.thinking) : undefined;
+  if (sw.model && effort) return `已切换模型为 ${sw.model} · 思考 ${effort}`;
+  if (sw.model) return `已切换模型为 ${sw.model}`;
+  if (effort) return `已切换思考等级为 ${effort}`;
+  return "已切换模型配置";
 }

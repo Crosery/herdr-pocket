@@ -303,6 +303,28 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                 if len > 0 && reader.read_exact(&mut payload).is_err() {
                     break;
                 }
+                if kind == KIND_DATA && channel != 0 {
+                    // Coalesce consecutive complete DATA frames already sitting in BufReader
+                    // on the same channel without blocking, reducing Tauri IPC & base64 chatter.
+                    while payload.len() < 256 * 1024 {
+                        let buf = reader.buffer();
+                        if buf.len() < HEADER_LEN {
+                            break;
+                        }
+                        let next_hdr: [u8; HEADER_LEN] = buf[..HEADER_LEN].try_into().unwrap();
+                        let (next_ch, next_kind, next_len) = decode_header(&next_hdr);
+                        if next_ch != channel
+                            || next_kind != KIND_DATA
+                            || next_len > 256 * 1024
+                            || payload.len() + next_len > 256 * 1024
+                            || buf.len() < HEADER_LEN + next_len
+                        {
+                            break;
+                        }
+                        payload.extend_from_slice(&buf[HEADER_LEN..HEADER_LEN + next_len]);
+                        reader.consume(HEADER_LEN + next_len);
+                    }
+                }
                 if channel == 0 {
                     if kind == KIND_DATA {
                         if let Ok(msg) = serde_json::from_slice::<Value>(&payload) {
