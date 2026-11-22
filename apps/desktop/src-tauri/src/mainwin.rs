@@ -177,7 +177,11 @@ pub fn apply_theme(app: &AppHandle) {
 /// "Throttle" keeps it running, slowed down (timers about every 2 s), for the main window
 /// only. Browser panels keep WebKit's default.
 #[cfg(target_os = "macos")]
-fn keep_page_running_when_hidden(app: &AppHandle) {
+fn set_main_inactive_policy(
+    app: &AppHandle,
+    policy: objc2_web_kit::WKInactiveSchedulingPolicy,
+    label: &'static str,
+) {
     if objc2_foundation::NSProcessInfo::processInfo()
         .operatingSystemVersion()
         .majorVersion
@@ -188,7 +192,7 @@ fn keep_page_running_when_hidden(app: &AppHandle) {
     let Some(webview) = app.get_webview("main") else {
         return;
     };
-    let _ = webview.with_webview(|pw| {
+    let _ = webview.with_webview(move |pw| {
         let p = pw.inner();
         if p.is_null() {
             return;
@@ -196,16 +200,46 @@ fn keep_page_running_when_hidden(app: &AppHandle) {
         // SAFETY: wry's WKWebView, on the main thread (with_webview runs there).
         let wk = unsafe { &*(p as *const objc2_web_kit::WKWebView) };
         let prefs = unsafe { wk.configuration().preferences() };
-        unsafe {
-            prefs.setInactiveSchedulingPolicy(objc2_web_kit::WKInactiveSchedulingPolicy::Throttle)
-        };
+        unsafe { prefs.setInactiveSchedulingPolicy(policy) };
         let now = unsafe { prefs.inactiveSchedulingPolicy() }.0;
         logging::info(
             "app.window",
             "hidden page scheduling set",
-            json!({ "policy": if now == 1 { "throttle" } else { "unchanged" } }),
+            json!({ "policy": label, "raw": now }),
         );
     });
+}
+
+#[cfg(target_os = "macos")]
+fn keep_page_running_when_hidden(app: &AppHandle) {
+    set_main_inactive_policy(
+        app,
+        objc2_web_kit::WKInactiveSchedulingPolicy::Throttle,
+        "throttle",
+    );
+}
+
+/// Keeps the main WebView unthrottled during a Xiaoyang realtime voice call even when hidden or
+/// occluded, then restores Throttle once the call ends.
+pub fn set_voice_call_active(app: &AppHandle, active: bool) {
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    if ACTIVE.swap(active, Ordering::SeqCst) == active {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (policy, label) = if active {
+            (objc2_web_kit::WKInactiveSchedulingPolicy::None, "none")
+        } else {
+            (
+                objc2_web_kit::WKInactiveSchedulingPolicy::Throttle,
+                "throttle",
+            )
+        };
+        set_main_inactive_policy(app, policy, label);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 }
 
 pub fn init(app: &AppHandle) {

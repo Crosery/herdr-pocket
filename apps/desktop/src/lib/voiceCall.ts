@@ -1,7 +1,9 @@
 import { createStore, settingsStore } from "./store";
+import { assistantStore, loadAssistant } from "./assistant";
 import { getActiveToken, wsUrlFor } from "./relay";
-import { requestMicrophonePermission } from "./bridge";
+import { detectPlatform, requestMicrophonePermission } from "./bridge";
 import { isMockServer } from "./mock";
+import { native, type VoiceHudSyncState } from "./native";
 
 export interface CallCaptionLine {
   id: string;
@@ -21,6 +23,8 @@ export interface VoiceCallState {
   outLevel: number;
   lines: CallCaptionLine[];
   task: string | null;
+  startedAt: number | null;
+  hudShown: boolean;
   message: string | null;
   error: string | null;
 }
@@ -33,6 +37,8 @@ export const voiceCallStore = createStore<VoiceCallState>({
   outLevel: 0,
   lines: [],
   task: null,
+  startedAt: null,
+  hudShown: false,
   message: null,
   error: null,
 });
@@ -64,6 +70,21 @@ function upsertCallLine(lines: CallCaptionLine[], line: CallCaptionLine, maxLine
   return [...lines, line].slice(-maxLines);
 }
 
+function base64ToUint8Array(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return bytes;
+}
+
+export function formatHudCaption(lines: CallCaptionLine[]): string {
+  const last = lines[lines.length - 1];
+  if (!last || !last.text.trim()) return "";
+  return `${last.role === "user" ? "你：" : "小羊："}${last.text.trim()}`;
+}
+
 interface PendingAudioRef {
   chunkId: string;
   runId: string;
@@ -90,13 +111,39 @@ class WebVoiceSession {
   private currentUserTurn: number | undefined;
   private callId = 0;
   private ended = false;
+  private reachedReady = false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private demoTimer: ReturnType<typeof setInterval> | null = null;
+  private unsubNativeMic: (() => void) | null = null;
+  private usedNativeMic = false;
+  private unsubHudSync: (() => void) | null = null;
+  private hudTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastHudKey = "";
+  private lastHudAt = 0;
 
-  constructor(private readonly mock: boolean) {}
+  constructor(
+    private readonly mock: boolean,
+    private hudShown: boolean,
+    private seq?: number,
+  ) {}
+
+  isHudShown(): boolean {
+    return this.hudShown;
+  }
+
+  attachHud(seq?: number): void {
+    if (this.ended) return;
+    this.hudShown = true;
+    if (seq !== undefined) this.seq = seq;
+    voiceCallStore.set({ hudShown: true });
+    this.startHudSync();
+    this.pushHudSync(true);
+  }
 
   async start(): Promise<string | null> {
     this.callId = Date.now();
     this.ended = false;
+    this.reachedReady = false;
     voiceCallStore.set({
       status: "connecting",
       muted: false,
@@ -105,56 +152,125 @@ class WebVoiceSession {
       outLevel: 0,
       lines: [],
       task: null,
+      startedAt: null,
+      hudShown: this.hudShown,
       message: null,
       error: null,
     });
 
-    if (this.mock) {
-      voiceCallStore.set({
-        status: "ready",
-        lines: [{ id: "mock-1", role: "assistant", text: "你好，这是演示模式的语音通话界面。", final: true, turn: 1 }],
-      });
-      return null;
+    if (this.hudShown) {
+      this.startHudSync();
+      this.pushHudSync(true);
     }
 
-    const okPerm = await requestMicrophonePermission();
-    if (!okPerm) {
-      this.cleanup("没有麦克风权限");
-      return "没有麦克风权限";
+    if (this.mock) {
+      this.reachedReady = true;
+      voiceCallStore.set({
+        status: "ready",
+        startedAt: Date.now(),
+        lines: [{ id: "mock-1", role: "assistant", text: "你好，这是演示模式的语音通话界面。", final: true, turn: 1 }],
+      });
+      let phase = 0;
+      const timer = setInterval(() => {
+        if (this.ended) return;
+        phase += 0.55;
+        const muted = voiceCallStore.get().muted;
+        voiceCallStore.set({ micLevel: muted ? 0 : Number((0.16 + Math.abs(Math.sin(phase)) * 0.34).toFixed(2)) });
+      }, 180);
+      if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
+        (timer as unknown as { unref: () => void }).unref();
+      }
+      this.demoTimer = timer;
+      return null;
     }
 
     const server = settingsStore.get().server;
     const token = getActiveToken();
     if (!server || !token) {
-      this.cleanup("还没连上服务器");
+      this.cleanup("还没连上服务器", true);
       return "还没连上服务器";
     }
 
-    try {
-      const denoise = settingsStore.get().denoise;
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: denoise,
-          autoGainControl: true,
-        },
+    if (!assistantStore.get().loaded) {
+      await loadAssistant().catch(() => {});
+    }
+    if (this.ended) return null;
+    if (assistantStore.get().loaded && !assistantStore.get().voice) {
+      const msg = "尚未配置小羊实时语音模型，请在「设置 › 小羊助理」配置";
+      this.cleanup(msg, true);
+      return msg;
+    }
+
+    const platform = detectPlatform();
+    const useNativeMic = native.available() && (platform === "macos" || platform === "windows");
+
+    if (useNativeMic) {
+      this.usedNativeMic = true;
+      this.unsubNativeMic = native.onVoiceCallMic((ev) => {
+        if (this.ended) return;
+        if (voiceCallStore.get().muted) {
+          voiceCallStore.set({ micLevel: 0 });
+          return;
+        }
+        const level = Math.max(0, Math.min(1, Number(ev.level) || 0));
+        voiceCallStore.set({ micLevel: level });
+        if (ev.pcmBase64 && this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(base64ToUint8Array(ev.pcmBase64));
+        }
       });
-    } catch {
-      this.cleanup("打不开麦克风");
-      return "打不开麦克风，请检查系统权限或设备连接";
+      try {
+        await native.voiceCallMicStart();
+      } catch (err) {
+        const msg = (err as Error)?.message || "打不开麦克风，请检查系统权限或设备连接";
+        this.cleanup(msg, true);
+        return msg;
+      }
+      if (this.ended) {
+        void native.voiceCallMicStop();
+        return null;
+      }
+    } else {
+      const okPerm = await requestMicrophonePermission();
+      if (!okPerm) {
+        this.cleanup("没有麦克风权限", true);
+        return "没有麦克风权限";
+      }
+      try {
+        const denoise = settingsStore.get().denoise;
+        this.stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: denoise,
+            autoGainControl: true,
+          },
+        });
+      } catch {
+        this.cleanup("打不开麦克风，请检查系统权限或设备连接", true);
+        return "打不开麦克风，请检查系统权限或设备连接";
+      }
+      if (this.ended) return null;
     }
 
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    this.ctx = new AudioCtx({ sampleRate: 48_000 });
-    await this.ctx.resume().catch(() => {});
+    if (AudioCtx) {
+      this.ctx = new AudioCtx({ sampleRate: 48_000 });
+      await this.ctx.resume().catch(() => {});
+    }
+    if (this.ended) return null;
 
     const ws = new WebSocket(wsUrlFor(server, "/v1/assistant/live", token));
     ws.binaryType = "arraybuffer";
     this.ws = ws;
 
     ws.onopen = () => {
-      this.setupMicCapture();
+      if (this.ended) {
+        ws.close(1000, "bye");
+        return;
+      }
+      if (!this.usedNativeMic) {
+        this.setupMicCapture();
+      }
       this.pingTimer = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
           this.sendJson({ action: "ping", timestamp: Date.now() });
@@ -170,12 +286,74 @@ class WebVoiceSession {
       }
     };
     ws.onclose = () => {
-      if (!this.ended) this.cleanup("通话结束了");
+      if (!this.ended) {
+        if (this.reachedReady) {
+          this.cleanup("通话结束了", false);
+        } else {
+          this.cleanup("小羊实时语音连接已断开，请检查中转服务与语音配置", true);
+        }
+      }
     };
     ws.onerror = () => {
-      if (!this.ended) this.cleanup("语音连接断开");
+      if (!this.ended) this.cleanup("语音连接断开", true);
     };
     return null;
+  }
+
+  private startHudSync(): void {
+    if (!native.available() || this.unsubHudSync) return;
+    this.lastHudKey = "";
+    this.lastHudAt = 0;
+    this.unsubHudSync = voiceCallStore.subscribe(() => {
+      if (this.ended || !this.hudShown) return;
+      const st = voiceCallStore.get();
+      if (st.status === "idle") return;
+      const caption = formatHudCaption(st.lines);
+      const key = JSON.stringify([st.status, st.assistant, st.muted, st.task, st.startedAt, caption]);
+      if (key !== this.lastHudKey) {
+        this.lastHudKey = key;
+        if (this.hudTimer) {
+          clearTimeout(this.hudTimer);
+          this.hudTimer = null;
+        }
+        this.lastHudAt = Date.now();
+        this.pushHudSync(false);
+        return;
+      }
+      const elapsed = Date.now() - this.lastHudAt;
+      if (elapsed >= 30) {
+        if (this.hudTimer) {
+          clearTimeout(this.hudTimer);
+          this.hudTimer = null;
+        }
+        this.lastHudAt = Date.now();
+        this.pushHudSync(false);
+      } else if (!this.hudTimer) {
+        this.hudTimer = setTimeout(() => {
+          this.hudTimer = null;
+          this.lastHudAt = Date.now();
+          this.pushHudSync(false);
+        }, 30 - elapsed);
+      }
+    });
+  }
+
+  private pushHudSync(open = false): void {
+    if (this.ended || !this.hudShown || !native.available()) return;
+    const st = voiceCallStore.get();
+    if (st.status === "idle") return;
+    const payload: VoiceHudSyncState = {
+      state: st.status === "connecting" ? "connecting" : "active",
+      ...(open ? { open: true } : {}),
+      ...(this.seq !== undefined ? { seq: this.seq } : {}),
+      phase: st.assistant,
+      muted: st.muted,
+      level: Math.max(st.micLevel, st.outLevel),
+      startedAt: st.startedAt,
+      task: st.task,
+      caption: formatHudCaption(st.lines),
+    };
+    void native.voiceHudSync(payload);
   }
 
   private setupMicCapture(): void {
@@ -250,8 +428,18 @@ class WebVoiceSession {
     switch (action) {
       case "relay.state": {
         const st = str("state");
-        if (st === "ready") voiceCallStore.set({ status: "ready" });
-        else if (st === "error" || st === "closed") this.cleanup(str("message") || "通话结束了");
+        if (st === "ready") {
+          this.reachedReady = true;
+          voiceCallStore.set((prev) => ({
+            ...prev,
+            status: "ready",
+            startedAt: prev.startedAt ?? Date.now(),
+          }));
+        } else if (st === "error") {
+          this.cleanup(str("message") || "小羊实时语音连接失败", true);
+        } else if (st === "closed") {
+          this.cleanup(str("message") || "通话结束了", false);
+        }
         break;
       }
       case "media.output.configured": {
@@ -365,6 +553,9 @@ class WebVoiceSession {
   private onBinary(buf: ArrayBuffer): void {
     const ref = this.contexts.shift();
     if (!ref || this.stoppedRuns.has(ref.runId) || !this.ctx) return;
+    if (this.ctx.state === "suspended") {
+      void this.ctx.resume().catch(() => {});
+    }
     const samples = Math.floor(buf.byteLength / 2);
     if (samples <= 0) return;
 
@@ -406,19 +597,56 @@ class WebVoiceSession {
   }
 
   setMuted(muted: boolean): void {
-    voiceCallStore.set({ muted });
+    voiceCallStore.set({ muted, ...(muted ? { micLevel: 0 } : {}) });
+    if (this.usedNativeMic) {
+      void native.voiceCallMicSetMuted(muted);
+    }
     this.sendJson({ action: "mic_state", enabled: !muted });
   }
 
   hangup(): void {
     this.sendJson({ action: "relay.hangup" });
-    this.cleanup("挂断了");
+    this.cleanup("挂断了", false);
   }
 
-  private cleanup(message?: string): void {
+  private cleanup(message?: string, isError = false): void {
     if (this.ended) return;
     this.ended = true;
-    if (this.pingTimer) clearInterval(this.pingTimer);
+    const wasHudShown = this.hudShown;
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    if (this.demoTimer) {
+      clearInterval(this.demoTimer);
+      this.demoTimer = null;
+    }
+    if (this.hudTimer) {
+      clearTimeout(this.hudTimer);
+      this.hudTimer = null;
+    }
+    this.unsubHudSync?.();
+    this.unsubHudSync = null;
+    this.unsubNativeMic?.();
+    this.unsubNativeMic = null;
+
+    if (this.usedNativeMic) {
+      this.usedNativeMic = false;
+      void native.voiceCallMicStop();
+    }
+
+    if (wasHudShown && native.available()) {
+      if (isError && message) {
+        void native.voiceHudSync({
+          state: "error",
+          message,
+          ...(this.seq !== undefined ? { seq: this.seq } : {}),
+        });
+      } else {
+        void native.voiceHudHide();
+      }
+    }
+
     try {
       this.ws?.close(1000, "bye");
     } catch {
@@ -447,6 +675,9 @@ class WebVoiceSession {
     this.silentGain = null;
     this.stream = null;
     this.ctx = null;
+    if (activeCall === this) {
+      activeCall = null;
+    }
     voiceCallStore.set({
       status: "idle",
       muted: false,
@@ -454,17 +685,29 @@ class WebVoiceSession {
       micLevel: 0,
       outLevel: 0,
       task: null,
+      startedAt: null,
+      hudShown: false,
       message: message ?? null,
+      error: isError && message ? message : null,
     });
   }
 }
 
 let activeCall: WebVoiceSession | null = null;
 
-export async function startVoiceCall(): Promise<string | null> {
-  if (activeCall) return null;
+export async function startVoiceCall(opts?: { showHud?: boolean; seq?: number }): Promise<string | null> {
+  if (activeCall) {
+    if (opts?.showHud && !activeCall.isHudShown()) {
+      activeCall.attachHud(opts.seq);
+    }
+    return null;
+  }
   const server = settingsStore.get().server;
-  const session = new WebVoiceSession(Boolean(server && isMockServer(server)));
+  const session = new WebVoiceSession(
+    Boolean(server && isMockServer(server)),
+    Boolean(opts?.showHud),
+    opts?.seq,
+  );
   activeCall = session;
   const err = await session.start();
   if (err && activeCall === session) {
@@ -473,13 +716,23 @@ export async function startVoiceCall(): Promise<string | null> {
   return err;
 }
 
+export function attachHudToVoiceCall(seq?: number): void {
+  activeCall?.attachHud(seq);
+}
+
 export function setVoiceMuted(muted: boolean): void {
   activeCall?.setMuted(muted);
 }
 
 export function hangupVoiceCall(): void {
-  activeCall?.hangup();
-  activeCall = null;
+  if (activeCall) {
+    const cur = activeCall;
+    activeCall = null;
+    cur.hangup();
+  } else if (voiceCallStore.get().hudShown) {
+    voiceCallStore.set({ hudShown: false, status: "idle" });
+    void native.voiceHudHide();
+  }
 }
 
 export function dismissVoiceMessage(): void {

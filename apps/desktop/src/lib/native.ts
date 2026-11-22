@@ -27,20 +27,24 @@ export interface Rect {
   height: number;
 }
 
-// Browser, cookie and dictation shapes are native-engineer's (lib/bridge.ts).
+// Browser, cookie and voice wake shapes are in ./bridge.
 export type {
   BrowserEvent,
   CookieBrowser as BrowserFamily,
   CookieImportResult,
   CookieSource,
   HotkeyCheck,
-  VoiceEvent,
+  VoiceCallCommand,
+  VoiceCallMicEvent,
+  VoiceHudSyncState,
   VoiceRuntime,
 } from "./bridge";
 type BrowserEvent = bridge.BrowserEvent;
 type CookieSource = bridge.CookieSource;
 type CookieImportResult = bridge.CookieImportResult;
-type VoiceEvent = bridge.VoiceEvent;
+type VoiceCallCommand = bridge.VoiceCallCommand;
+type VoiceCallMicEvent = bridge.VoiceCallMicEvent;
+type VoiceHudSyncState = bridge.VoiceHudSyncState;
 type VoiceRuntime = bridge.VoiceRuntime;
 type HotkeyCheck = bridge.HotkeyCheck;
 
@@ -398,13 +402,20 @@ export const native = {
     return bridge.importCookies(req);
   },
 
-  // Dictation runtime (lib/bridge.ts; its settings live in config.json) -------------
+  // Xiaoyang wake hotkey & live call HUD (lib/bridge.ts; settings live in config.json) -
   voiceSupported: (): boolean => inTauri(),
   getVoiceRuntime: (): Promise<VoiceRuntime | null> => bridge.getVoiceRuntime(),
-  onVoiceEvent: (cb: (e: VoiceEvent) => void): (() => void) => bridge.onVoiceEvent(cb),
+  onVoiceRuntimeState: (cb: (s: VoiceRuntime) => void): (() => void) => bridge.onVoiceRuntimeState(cb),
+  onVoiceError: (cb: (e: { message: string }) => void): (() => void) => bridge.onVoiceError(cb),
+  onVoiceCallCommand: (cb: (cmd: VoiceCallCommand) => void): (() => void) => bridge.onVoiceCallCommand(cb),
+  onVoiceCallMic: (cb: (ev: VoiceCallMicEvent) => void): (() => void) => bridge.onVoiceCallMic(cb),
   checkHotkey: (hotkey: string): Promise<HotkeyCheck | null> => (inTauri() ? bridge.checkHotkey(hotkey).catch(() => null) : Promise.resolve(null)),
   voiceReload: (): Promise<boolean> => bridge.voiceReload(),
-  getTranscribeInfo: () => bridge.getTranscribeInfo(),
+  voiceCallMicStart: (): Promise<void> => bridge.voiceCallMicStart(),
+  voiceCallMicStop: (): Promise<void> => bridge.voiceCallMicStop(),
+  voiceCallMicSetMuted: (muted: boolean): Promise<void> => bridge.voiceCallMicSetMuted(muted),
+  voiceHudSync: (state: VoiceHudSyncState): Promise<void> => bridge.voiceHudSync(state),
+  voiceHudHide: (): Promise<void> => bridge.voiceHudHide(),
 
   // Local SOTA Audio DSP & Voiceprint (src-tauri/src/voice_ai.rs + Demo Mode) ---
   voiceAiState: async (): Promise<VoiceAiState> =>

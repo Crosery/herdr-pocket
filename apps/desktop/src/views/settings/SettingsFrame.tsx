@@ -53,7 +53,7 @@ const HERDR_ORDER: Item[] = [
   { id: "privacy", title: "隐私", icon: Shield },
 ];
 const OURS: Item[] = [
-  { id: "voice", title: "语音输入", icon: Mic },
+  { id: "voice", title: "语音唤醒与声纹", icon: Mic },
   { id: "assistant", title: "小羊助理", icon: Sparkles },
   { id: "browser", title: "浏览器与文件", icon: AppWindow },
   { id: "performance", title: "性能与资源", icon: Cpu },
@@ -152,7 +152,7 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
       case "voice":
         return (
           <div className="pane">
-            <PaneTitle title="语音输入" about="在任何应用里按快捷键说话，文字自动打进光标处。" />
+            <PaneTitle title="语音唤醒与声纹" about="全局快捷键一键发起或挂断小羊实时语音通话，并配置本地降噪与声纹识别" />
             <VoiceInputSetup />
           </div>
         );

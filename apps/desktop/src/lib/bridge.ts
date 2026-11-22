@@ -1182,17 +1182,14 @@ export async function importCookies(req: CookieImportRequest | { file: true }): 
   return { imported: r.imported, skipped: r.expired + r.session + r.appBound + r.failed, domains, warnings, note: r.note };
 }
 
-// Voice dictation --------------------------------------------------------------------------------------
+// Xiaoyang wake hotkey & live call HUD ---------------------------------------------------------------
 
 /** voice_status in src-tauri/src/voice/mod.rs. */
 export interface VoiceRuntime {
-  /** This build can dictate (macOS and Windows). */
+  /** This build supports global wake hotkey (macOS and Windows). */
   supported: boolean;
   enabled: boolean;
   hotkey: string;
-  mode: string;
-  insert: string;
-  language: string;
   kind?: "accelerator" | "modifier";
   /** The hotkey is live. */
   registered: boolean;
@@ -1201,22 +1198,33 @@ export interface VoiceRuntime {
   warning?: string;
   /** Grant this first (`inputMonitoring`). */
   needsPermission?: "inputMonitoring";
-  phase: "idle" | "recording" | "transcribing";
+  phase: "idle" | "connecting" | "active";
   lastError?: string;
 }
 
-export interface VoiceEvent {
-  state: "idle" | "listening" | "transcribing" | "inserted" | "error";
-  /** listening: microphone level 0..1, about 15 times a second. */
+export interface VoiceCallCommand {
+  action: "start" | "hangup" | "toggle-mute";
+  showHud?: boolean;
+  seq?: number;
+}
+
+export interface VoiceCallMicEvent {
+  pcmBase64: string;
+  level: number;
+}
+
+export interface VoiceHudSyncState {
+  state: "connecting" | "active" | "error";
+  open?: boolean;
+  seq?: number;
+  phase?: "idle" | "thinking" | "speaking";
+  muted?: boolean;
   level?: number;
-  elapsedMs?: number;
-  /** inserted: the recognised text. */
-  text?: string;
-  /** inserted: `app` means Herdr Pocket had the focus: put `text` into its message box. */
-  target?: "app" | "focused";
-  /** inserted: how it got there (`app`, `paste`, `type`, `clipboard`). */
-  method?: string;
-  error?: string;
+  startedAt?: number | null;
+  task?: string | null;
+  caption?: string;
+  dspBadge?: string | null;
+  message?: string;
 }
 
 export interface HotkeyCheck {
@@ -1231,19 +1239,20 @@ export async function getVoiceRuntime(): Promise<VoiceRuntime | null> {
   return isTauri() ? call<VoiceRuntime>("voice_status").catch(() => null) : null;
 }
 
-/** Dictation progress for the main window: state changes, the level meter, results and errors. */
-export function onVoiceEvent(cb: (e: VoiceEvent) => void): () => void {
-  if (!isTauri()) return () => {};
-  const phaseToState = { idle: "idle", recording: "listening", transcribing: "transcribing" } as const;
-  const offs = [
-    listenTauri<VoiceRuntime>("voice://state", (s) => cb({ state: phaseToState[s.phase] ?? "idle" })),
-    listenTauri<{ level: number; elapsedMs: number }>("voice://level", (l) => cb({ state: "listening", level: l.level, elapsedMs: l.elapsedMs })),
-    listenTauri<{ text: string; target: "app" | "focused"; method: string }>("voice://transcript", (t) =>
-      cb({ state: "inserted", text: t.text, target: t.target, method: t.method }),
-    ),
-    listenTauri<{ message: string }>("voice://error", (e) => cb({ state: "error", error: e.message })),
-  ];
-  return () => offs.forEach((off) => off());
+export function onVoiceRuntimeState(cb: (s: VoiceRuntime) => void): () => void {
+  return listenTauri<VoiceRuntime>("voice://state", cb);
+}
+
+export function onVoiceError(cb: (e: { message: string }) => void): () => void {
+  return listenTauri<{ message: string }>("voice://error", cb);
+}
+
+export function onVoiceCallCommand(cb: (cmd: VoiceCallCommand) => void): () => void {
+  return listenTauri<VoiceCallCommand>("voice://call-command", cb);
+}
+
+export function onVoiceCallMic(cb: (ev: VoiceCallMicEvent) => void): () => void {
+  return listenTauri<VoiceCallMicEvent>("voice-call://mic", cb);
 }
 
 /** Can `hotkey` be used (syntax, taken by another app, permission)? Does not change the setting. */
@@ -1251,27 +1260,29 @@ export async function checkHotkey(hotkey: string): Promise<HotkeyCheck> {
   return call("voice_check_hotkey", { hotkey });
 }
 
-/** The microphone button: start, stop or cancel a dictation without the hotkey. */
-export function voiceStart(): Promise<boolean> {
-  return isTauri() ? call<boolean>("voice_start") : Promise.resolve(false);
-}
-
-export function voiceStop(): Promise<boolean> {
-  return isTauri() ? call<boolean>("voice_stop") : Promise.resolve(false);
-}
-
-export function voiceCancel(): Promise<boolean> {
-  return isTauri() ? call<boolean>("voice_cancel") : Promise.resolve(false);
-}
-
 /** Re-reads config.json and retries the hotkey (after a permission was granted). */
 export function voiceReload(): Promise<boolean> {
   return isTauri() ? call<boolean>("voice_reload") : Promise.resolve(false);
 }
 
-/** What the relay offers for dictation (GET /v1/transcribe), for Settings. */
-export async function getTranscribeInfo(): Promise<{ available: boolean; provider?: string; reason?: string; [k: string]: unknown } | null> {
-  return isTauri() ? call<{ available: boolean }>("voice_transcribe_info").catch(() => null) : null;
+export function voiceCallMicStart(): Promise<void> {
+  return call<void>("voice_call_mic_start");
+}
+
+export function voiceCallMicStop(): Promise<void> {
+  return isTauri() ? call<void>("voice_call_mic_stop").catch(() => {}) : Promise.resolve();
+}
+
+export function voiceCallMicSetMuted(muted: boolean): Promise<void> {
+  return isTauri() ? call<void>("voice_call_mic_set_muted", { muted }).catch(() => {}) : Promise.resolve();
+}
+
+export function voiceHudSync(state: VoiceHudSyncState): Promise<void> {
+  return isTauri() ? call<void>("voice_hud_sync", { state }).catch(() => {}) : Promise.resolve();
+}
+
+export function voiceHudHide(): Promise<void> {
+  return isTauri() ? call<void>("voice_hud_hide").catch(() => {}) : Promise.resolve();
 }
 
 // Error logging ----------------------------------------------------------------------------------------

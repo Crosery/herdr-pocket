@@ -3,17 +3,20 @@ import {
   ExternalLink,
   Keyboard,
   Mic,
-  MousePointerClick,
+  MicOff,
+  PhoneCall,
+  PhoneOff,
   Power,
   RefreshCw,
   RotateCcw,
   SlidersHorizontal,
 } from "lucide-react";
-import { configKeySpec, type TranscribeInfo } from "@herdr-pocket/protocol";
-import { PocketBadge, PocketButton, PocketSelect, PocketSwitch, PocketTextarea, useToast } from "./PocketUI";
+import { configKeySpec } from "@herdr-pocket/protocol";
+import { PocketBadge, PocketButton, PocketIconButton, PocketSelect, PocketSwitch, useToast } from "./PocketUI";
 import { PermissionGuideModal } from "./PermissionGuideModal";
 import { VoiceprintModal } from "./VoiceprintModal";
-import { copyToClipboard, detectPlatform, voiceStart, voiceStop } from "../lib/bridge";
+import { assistantStore, loadAssistant } from "../lib/assistant";
+import { detectPlatform } from "../lib/bridge";
 import {
   native,
   type Permission,
@@ -22,14 +25,13 @@ import {
   type VoiceAiConfigPatch,
   type VoiceAiState,
   type VoiceAiTier,
-  type VoiceEvent,
   type VoiceRuntime,
 } from "../lib/native";
 import { setConfig, useClientConfig } from "../lib/config";
-import { getActiveToken, restRequest } from "../lib/relay";
 import { isMockServer } from "../lib/mock";
-import { liveStore, settingsStore } from "../lib/store";
+import { settingsStore } from "../lib/store";
 import { useWindowHidden } from "../lib/layout";
+import { dismissVoiceMessage, hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
 import "../styles/btw-slash.css";
 
 const PLATFORM = detectPlatform();
@@ -50,7 +52,7 @@ export function prettyHotkey(accel: string | null | undefined): string {
   return parts.map((p) => word[p] ?? p).join(" + ");
 }
 
-/** One modifier held alone (voiceInput.hotkey); macOS reads these through Input Monitoring. */
+/** One modifier tapped alone (voiceInput.hotkey); macOS reads these through Input Monitoring. */
 const MODIFIER_KEYS: Array<{ value: string; label: string; mac: boolean; win: boolean }> = [
   { value: "RightOption", label: MAC ? "右 ⌥ Option" : "右 Alt", mac: true, win: false },
   { value: "RightControl", label: MAC ? "右 ⌃ Control" : "右 Ctrl", mac: true, win: true },
@@ -59,7 +61,7 @@ const MODIFIER_KEYS: Array<{ value: string; label: string; mac: boolean; win: bo
   { value: "Fn", label: "Fn（地球仪键）", mac: true, win: false },
 ];
 const DEFAULT_COMBO = "CommandOrControl+Shift+Space";
-/** Recommended hold-to-talk key: right Option on macOS; right Ctrl on Windows (right Alt is AltGr on many layouts). */
+/** Recommended wake key: right Option on macOS; right Ctrl on Windows (right Alt is AltGr on many layouts). */
 const RECOMMENDED_KEY = MAC ? "RightOption" : "RightControl";
 const isModifierKey = (v: string | null | undefined) => Boolean(v && MODIFIER_KEYS.some((m) => m.value === v));
 
@@ -86,17 +88,17 @@ function acceleratorFrom(e: ReactKeyboardEvent): string | null {
 const PERMISSION_INFO: Record<PermissionKind, { title: string; why: string; how: string }> = {
   microphone: {
     title: "麦克风",
-    why: MAC ? "用于语音输入与小羊实时通话" : "用于语音输入与小羊语音通话",
+    why: "用于与小羊实时语音通话和本地声纹降噪",
     how: MAC ? "系统设置 › 隐私与安全性 › 麦克风" : "设置 › 隐私和安全性 › 麦克风",
   },
   accessibility: {
     title: "辅助功能",
-    why: "识别后自动粘贴到当前应用，仅复制可不开启",
+    why: "无需开启",
     how: "系统设置 › 隐私与安全性 › 辅助功能",
   },
   inputMonitoring: {
     title: "输入监控",
-    why: "使用右 Option、Fn 等单键按住说话时需要",
+    why: "使用右 Option、Fn 等单键按一下唤醒小羊时需要",
     how: "系统设置 › 隐私与安全性 › 输入监控",
   },
   keyboard: {
@@ -123,18 +125,17 @@ const PERM_LABEL: Record<Permission, { tone: "mint" | "blush" | "warn" | "neutra
 const DEMO_PERMS: Permissions = {
   platform: MAC ? "macos" : "windows",
   microphone: "granted",
-  accessibility: "denied",
+  accessibility: "notApplicable",
   inputMonitoring: "notDetermined",
   fullDiskAccess: "denied",
   appBundlePath: "/Applications/Herdr Pocket.app",
   notes: [],
 };
 
-type MacRepairableKind = "accessibility" | "inputMonitoring";
+type MacRepairableKind = "inputMonitoring";
 
-function PermissionRowIcon({ kind }: { kind: "microphone" | "accessibility" | "inputMonitoring" }) {
+function PermissionRowIcon({ kind }: { kind: "microphone" | "inputMonitoring" }) {
   if (kind === "microphone") return <Mic size={16} />;
-  if (kind === "accessibility") return <MousePointerClick size={16} />;
   return <Keyboard size={16} />;
 }
 
@@ -147,7 +148,7 @@ export function PermissionCards({
   perms: Permissions | null;
   onChanged: () => void;
   checking: boolean;
-  /** The hotkey is one modifier held alone: Input Monitoring is needed (macOS). */
+  /** The hotkey is one modifier tapped alone: Input Monitoring is needed (macOS). */
   singleKey?: boolean;
 }) {
   const toast = useToast();
@@ -162,37 +163,27 @@ export function PermissionCards({
   }, [perms]);
 
   const effectivePerms = permsOverride ?? perms ?? (!native.available() ? DEMO_PERMS : null);
-  const kinds: Array<"microphone" | "accessibility" | "inputMonitoring"> = MAC
-    ? ["microphone", "accessibility", "inputMonitoring"]
+  const kinds: Array<"microphone" | "inputMonitoring"> = MAC
+    ? ["microphone", "inputMonitoring"]
     : ["microphone"];
 
   useEffect(() => {
     if (!effectivePerms) return;
     setPendingGrant((prev) => {
-      const next = { ...prev };
-      let changed = false;
-      if (prev.accessibility && effectivePerms.accessibility === "granted") {
-        delete next.accessibility;
-        changed = true;
-      }
       if (prev.inputMonitoring && effectivePerms.inputMonitoring === "granted") {
-        delete next.inputMonitoring;
-        changed = true;
+        return {};
       }
-      return changed ? next : prev;
+      return prev;
     });
   }, [effectivePerms]);
 
   useEffect(() => {
-    if (!MAC || !native.available()) return;
-    if (!pendingGrant.accessibility && !pendingGrant.inputMonitoring) return;
+    if (!MAC || !native.available() || !pendingGrant.inputMonitoring) return;
     let alive = true;
     const poll = async (forceRefresh = false) => {
       const next = await native.getPermissions();
       if (!alive || !next) return;
-      const grantedNow =
-        (pendingGrant.accessibility && next.accessibility === "granted") ||
-        (pendingGrant.inputMonitoring && next.inputMonitoring === "granted");
+      const grantedNow = next.inputMonitoring === "granted";
       if (grantedNow) {
         await native.voiceReload().catch(() => false);
       }
@@ -212,10 +203,10 @@ export function PermissionCards({
       window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [pendingGrant.accessibility, pendingGrant.inputMonitoring, onChanged]);
+  }, [pendingGrant.inputMonitoring, onChanged]);
 
-  const handleGrant = async (k: "microphone" | "accessibility" | "inputMonitoring", state: Permission) => {
-    if (MAC && (k === "accessibility" || k === "inputMonitoring")) {
+  const handleGrant = async (k: "microphone" | "inputMonitoring", state: Permission) => {
+    if (MAC && k === "inputMonitoring") {
       setPendingGrant((prev) => ({ ...prev, [k]: true }));
     }
     if (!native.available()) {
@@ -281,7 +272,7 @@ export function PermissionCards({
           if (state === "notApplicable") return null;
           const label = PERM_LABEL[state];
           const done = state === "granted";
-          const isMacRepairable = MAC && (k === "accessibility" || k === "inputMonitoring");
+          const isMacRepairable = MAC && k === "inputMonitoring";
           const showPendingBar = isMacRepairable && !done && Boolean(pendingGrant[k]);
           const optionalCombo = MAC && k === "inputMonitoring" && !singleKey;
           return (
@@ -342,11 +333,7 @@ export function PermissionCards({
                 <div className="perm-pending-bar">
                   <div className="perm-pending-status">
                     <span className="status-dot breathe" aria-hidden />
-                    <span>
-                      {k === "inputMonitoring"
-                        ? "已打开系统设置，开启开关后需重启应用生效…"
-                        : "已打开系统设置，开启开关后自动变绿…"}
-                    </span>
+                    <span>已打开系统设置，开启开关后需重启应用生效…</span>
                   </div>
                   <div className="perm-pending-actions">
                     <PocketButton
@@ -417,45 +404,21 @@ export function HotkeyRecorder({ value, onChange, disabled }: { value: string | 
   );
 }
 
-/** Can the relay turn speech into text (GET /v1/transcribe)? The desktop app asks natively. */
-function useTranscribeInfo(): { info: TranscribeInfo | null; error: string | null } {
-  const server = settingsStore.use((s) => s.server);
-  const link = liveStore.use((s) => s.link);
-  const [info, setInfo] = useState<TranscribeInfo | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    const token = getActiveToken();
-    if (!server || isMockServer(server) || !token) return;
-    let alive = true;
-    const ask = native.available()
-      ? native.getTranscribeInfo().then((r) => {
-          if (!r) throw new Error("没有拿到结果");
-          return r as unknown as TranscribeInfo;
-        })
-      : restRequest<TranscribeInfo>(server, "/v1/transcribe", { token, timeoutMs: 6000 });
-    ask.then((r) => alive && (setInfo(r), setError(null))).catch((e: Error) => alive && setError(e.message));
-    return () => {
-      alive = false;
-    };
-  }, [server, link === "online"]);
-  return { info, error };
-}
-
-/** Settings pane body and onboarding step for quick voice input (config.json voiceInput.*). */
+/** Settings pane body and onboarding step for Xiaoyang voice wake & local DSP (config.json voiceInput.*). */
 export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   const toast = useToast();
   const cfg = useClientConfig().voiceInput;
   const server = settingsStore.use((s) => s.server);
+  const assistantVoice = assistantStore.use((s) => s.voice);
+  const callStatus = voiceCallStore.use((s) => s.status);
   const [perms, setPerms] = useState<Permissions | null>(null);
   const [runtime, setRuntime] = useState<VoiceRuntime | null>(null);
   const [checking, setChecking] = useState(false);
-  const [trial, setTrial] = useState("");
   const [hotkeyNote, setHotkeyNote] = useState<{ error?: boolean; text: string } | null>(null);
   const [keyboardGuideOpen, setKeyboardGuideOpen] = useState(false);
   const [aiState, setAiState] = useState<VoiceAiState | null>(null);
   const [vpModalOpen, setVpModalOpen] = useState(false);
   const refreshingRef = useRef(false);
-  const { info, error: infoError } = useTranscribeInfo();
   const singleKey = isModifierKey(cfg.hotkey);
 
   const refresh = useCallback(async () => {
@@ -479,7 +442,10 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
 
   useEffect(() => {
     void refresh();
-  }, [refresh]);
+    if (server && !isMockServer(server) && !assistantStore.get().loaded) {
+      void loadAssistant().catch(() => {});
+    }
+  }, [refresh, server]);
 
   useEffect(() => {
     const syncOnReturn = () => {
@@ -560,74 +526,55 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
     await set("hotkey", value);
     const notes = [check?.warning, check?.needsPermission === "inputMonitoring" ? "还需要打开下面的“输入监控”权限。" : ""].filter(Boolean);
     setHotkeyNote(notes.length ? { text: notes.join(" ") } : null);
-    toast(`快捷键改成了 ${prettyHotkey(value)}`);
+    toast(`唤醒快捷键已设为 ${prettyHotkey(value)}`);
   };
 
   const supported = runtime ? runtime.supported : null;
   const editable = DESKTOP_VOICE;
-  const engine = !server
-    ? { tone: "neutral" as const, text: "连上中转服务器后可用" }
-    : isMockServer(server)
-      ? { tone: "neutral" as const, text: "演示模式不识别" }
-      : info?.available
-        ? { tone: "mint" as const, text: `可以识别 · ${info.provider ?? ""}${info.model ? ` / ${info.model}` : ""}` }
-        : info
-          ? { tone: "blush" as const, text: info.reason || "服务器还没配置语音识别" }
-          : infoError
-            ? { tone: "warn" as const, text: `查不到：${infoError}` }
-            : { tone: "neutral" as const, text: "检查中…" };
   const runtimeProblem = runtime && cfg.enabled ? runtime.error || runtime.lastError : null;
   const fnTip = MAC && cfg.hotkey === "Fn" && perms?.fnKeyAction && perms.fnKeyAction !== "none";
   const keys = MODIFIER_KEYS.filter((m) => (MAC ? m.mac : m.win));
+  const callActive = callStatus === "connecting" || callStatus === "ready";
+  const realtimeReady = Boolean(assistantVoice || (server && isMockServer(server)));
 
   return (
     <div className="stack" style={{ gap: compact ? 12 : 4 }}>
       {compact ? (
         <div className="muted">
-          和豆包、微信的语音输入一样：在任何应用里按住 <span className="kbd">{prettyHotkey(cfg.hotkey)}</span> 说话，松开后文字自动打进光标所在的位置。
+          在任何应用里按一下 <span className="kbd">{prettyHotkey(cfg.hotkey)}</span> 即可悬浮唤起小羊实时语音通话，再按一次挂断。
         </div>
       ) : null}
 
       {!DESKTOP_VOICE ? (
         <div className="inline-alert soft">
           <Mic size={16} />
-          <span>语音输入目前只支持 macOS 和 Windows 桌面版。</span>
+          <span>全局快捷键唤醒小羊目前只支持 macOS 和 Windows 桌面版。</span>
         </div>
       ) : !native.voiceSupported() ? (
         <div className="inline-alert soft">
           <Mic size={16} />
-          <span>语音输入需要 Herdr Pocket 桌面版；这里的设置会先保存。</span>
+          <span>全局快捷键唤醒小羊需要 Herdr Pocket 桌面版；这里的设置会先保存。</span>
         </div>
       ) : supported === false ? (
         <div className="inline-alert soft">
           <Mic size={16} />
-          <span>这台电脑的系统还不支持语音输入。</span>
+          <span>这台电脑的系统还不支持全局唤醒快捷键。</span>
         </div>
       ) : null}
 
       <div className="set-row">
         <div className="set-text">
-          <div className="set-title">识别服务</div>
-          <div className="set-about">经中转服务器识别，不留存录音</div>
+          <div className="set-title">{configKeySpec("voiceInput.enabled")?.label ?? "快捷键唤醒小羊"}</div>
+          <div className="set-about">在后台监听全局快捷键，按一下唤起或挂断小羊通话</div>
         </div>
-        <div className="set-control">
-          <PocketBadge tone={engine.tone}>{engine.text}</PocketBadge>
-        </div>
-      </div>
-
-      <div className="set-row">
-        <div className="set-text">
-          <div className="set-title">{configKeySpec("voiceInput.enabled")?.label}</div>
-          <div className="set-about">在后台监听全局快捷键</div>
-        </div>
-        <PocketSwitch checked={cfg.enabled} disabled={!editable} onCheckedChange={(v) => void set("enabled", v)} label="语音输入" />
+        <PocketSwitch checked={cfg.enabled} disabled={!editable} onCheckedChange={(v) => void set("enabled", v)} label="快捷键唤醒小羊" />
       </div>
 
       <div className="set-row column-row">
         <div className="set-text">
-          <div className="set-title">{configKeySpec("voiceInput.hotkey")?.label}</div>
+          <div className="set-title">{configKeySpec("voiceInput.hotkey")?.label ?? "唤醒快捷键"}</div>
           <div className="set-about">
-            {MAC ? "推荐单按右 Option，按住说、松开上屏" : "推荐单按右 Ctrl，按住说、松开上屏"}
+            {MAC ? "推荐单按右 Option（按一下开启对话，再按挂断）" : "推荐单按右 Ctrl（按一下开启对话，再按挂断）"}
             {runtimeProblem ? <span className="err-text"> {runtimeProblem}</span> : null}
             {runtime?.warning && cfg.enabled ? <span className="faint"> {runtime.warning}</span> : null}
             {hotkeyNote ? <span className={hotkeyNote.error ? "err-text" : "faint"}> {hotkeyNote.text}</span> : null}
@@ -640,7 +587,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
               disabled={!editable}
               onClick={() => !singleKey && void setHotkey(RECOMMENDED_KEY)}
             >
-              按住一个键
+              单按一个键
             </button>
             <button
               className={!singleKey ? "active" : ""}
@@ -663,7 +610,7 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       </div>
       {fnTip ? (
         <div className="inline-alert">
-          <span className="grow">用 Fn 说话前，先把“按下地球仪键时”改成“不执行任何操作”，否则按 Fn 会切换输入法或弹出表情。</span>
+          <span className="grow">用 Fn 键唤醒前，先把“按下地球仪键时”改成“不执行任何操作”，否则按 Fn 会切换输入法或弹出表情。</span>
           <PocketButton
             size="sm"
             variant="soft"
@@ -684,65 +631,49 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
         onRefresh={refresh}
       />
 
-      <div className="set-row">
-        <div className="set-text">
-          <div className="set-title">{configKeySpec("voiceInput.mode")?.label}</div>
-          <div className="set-about">按住松开即停，或点按开始/结束</div>
-        </div>
-        <div className="segmented">
-          <button className={cfg.mode === "hold" ? "active" : ""} disabled={!editable} onClick={() => void set("mode", "hold")}>按住说话</button>
-          <button className={cfg.mode === "toggle" ? "active" : ""} disabled={!editable} onClick={() => void set("mode", "toggle")}>按一下</button>
-        </div>
-      </div>
-      <div className="set-row">
-        <div className="set-text">
-          <div className="set-title">{configKeySpec("voiceInput.insert")?.label}</div>
-          <div className="set-about">粘贴需辅助功能权限；逐字输入不占剪贴板</div>
-        </div>
-        <PocketSelect
-          value={cfg.insert}
-          onValueChange={(v) => void set("insert", v)}
-          options={[
-            { value: "paste", label: "粘贴到光标处" },
-            { value: "type", label: "逐字输入" },
-            { value: "clipboard", label: "只复制" },
-          ]}
-        />
-      </div>
       {!compact ? (
         <>
           <div className="set-row">
             <div className="set-text">
-              <div className="set-title">{configKeySpec("voiceInput.language")?.label}</div>
-              <div className="set-about">中英混说选“自动”</div>
+              <div className="set-title">{configKeySpec("voiceInput.sounds")?.label ?? "通话提示音"}</div>
+              <div className="set-about">接通或出现提示时播放轻柔音效</div>
             </div>
-            <PocketSelect
-              value={["auto", "zh", "en"].includes(cfg.language) ? cfg.language : "auto"}
-              onValueChange={(v) => void set("language", v)}
-              options={[
-                { value: "auto", label: "自动" },
-                { value: "zh", label: "中文" },
-                { value: "en", label: "英文" },
-              ]}
-            />
+            <PocketSwitch checked={cfg.sounds} disabled={!editable} onCheckedChange={(v) => void set("sounds", v)} label="通话提示音" />
           </div>
+
           <div className="set-row">
             <div className="set-text">
-              <div className="set-title">{configKeySpec("voiceInput.maxSeconds")?.label}</div>
-              <div className="set-about">5–300 秒自动结束</div>
+              <div className="set-title">悬浮小羊通话</div>
+              <div className="set-about">
+                {callActive
+                  ? "正在与小羊实时通话中，可从悬浮胶囊或此处随时挂断"
+                  : realtimeReady
+                    ? "立即呼出悬浮胶囊并接通小羊实时语音"
+                    : "连上中转服务器并开启小羊实时语音模型后可用"}
+              </div>
             </div>
-            <PocketSelect
-              value={String(cfg.maxSeconds)}
-              onValueChange={(v) => void set("maxSeconds", Number(v))}
-              options={[...new Set([15, 30, 60, 120, 300, cfg.maxSeconds])].sort((a, b) => a - b).map((n) => ({ value: String(n), label: `${n} 秒` }))}
-            />
-          </div>
-          <div className="set-row">
-            <div className="set-text">
-              <div className="set-title">{configKeySpec("voiceInput.sounds")?.label}</div>
-              <div className="set-about">起止提示音</div>
+            <div className="set-control">
+              <PocketButton
+                size="sm"
+                variant={callActive ? "danger" : "primary"}
+                disabled={!callActive && !realtimeReady}
+                onClick={() => {
+                  if (callActive) {
+                    hangupVoiceCall();
+                  } else {
+                    void startVoiceCall({ showHud: true }).then((err) => {
+                      if (err) {
+                        toast(err, true);
+                        dismissVoiceMessage();
+                      }
+                    });
+                  }
+                }}
+              >
+                {callActive ? <PhoneOff size={14} /> : <PhoneCall size={14} />}
+                <span>{callActive ? "挂断通话" : "立即唤起小羊"}</span>
+              </PocketButton>
             </div>
-            <PocketSwitch checked={cfg.sounds} disabled={!editable} onCheckedChange={(v) => void set("sounds", v)} label="提示音" />
           </div>
 
           {aiState ? (
@@ -873,177 +804,48 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       <div className="set-heading">系统权限</div>
       {DESKTOP_VOICE && !perms && native.available() ? <div className="faint">没读到权限状态，按下面的路径手动检查。</div> : null}
       <PermissionCards perms={perms} checking={checking} singleKey={singleKey} onChanged={() => void refresh()} />
-
-      {native.voiceSupported() && supported !== false && cfg.enabled && !compact ? (
-        <>
-          <div className="set-heading">试一试</div>
-          <PocketTextarea rows={2} value={trial} onChange={(e) => setTrial(e.target.value)} placeholder={`点这里，然后按 ${prettyHotkey(cfg.hotkey)} 说一句话`} />
-        </>
-      ) : null}
     </div>
   );
 }
 
-let lastVoiceTarget: { el: HTMLInputElement | HTMLTextAreaElement; start: number | null; end: number | null } | null = null;
-let lastVoiceTerminal = false;
-let focusTrackerInstalled = false;
-
-function isTextEditableElement(el: Element | null): el is HTMLInputElement | HTMLTextAreaElement {
-  if (!el) return false;
-  if (el.tagName === "TEXTAREA") return !(el as HTMLTextAreaElement).readOnly && !(el as HTMLTextAreaElement).disabled;
-  if (el.tagName === "INPUT") {
-    const inp = el as HTMLInputElement;
-    return !inp.readOnly && !inp.disabled && /^(text|search|url|email|tel|password|)$/i.test(inp.type);
-  }
-  return false;
-}
-
-function installFocusTracker(): void {
-  if (focusTrackerInstalled || typeof document === "undefined") return;
-  focusTrackerInstalled = true;
-  const record = (target: EventTarget | null) => {
-    const el = target instanceof HTMLElement ? target : (document.activeElement as HTMLElement | null);
-    if (!el || el.closest("[data-voice-trigger]")) return;
-    if (el.closest(".xterm-helper-textarea, .tp-term-wrap")) {
-      lastVoiceTerminal = true;
-      lastVoiceTarget = null;
-      return;
-    }
-    if (isTextEditableElement(el)) {
-      lastVoiceTerminal = false;
-      lastVoiceTarget = { el, start: el.selectionStart, end: el.selectionEnd };
-    }
-  };
-  document.addEventListener("focusin", (e) => record(e.target), true);
-  document.addEventListener("keyup", (e) => record(e.target), true);
-  document.addEventListener("mouseup", (e) => record(e.target), true);
-}
-
-function setNativeControlValue(el: HTMLInputElement | HTMLTextAreaElement, text: string): void {
-  const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-  const start = el.selectionStart ?? lastVoiceTarget?.start ?? el.value.length;
-  const end = el.selectionEnd ?? lastVoiceTarget?.end ?? el.value.length;
-  const nextVal = `${el.value.slice(0, start)}${text}${el.value.slice(end)}`;
-  if (setter) setter.call(el, nextVal);
-  else el.value = nextVal;
-  el.focus();
-  const caret = start + text.length;
-  try {
-    el.setSelectionRange(caret, caret);
-  } catch {
-    /* some input types do not expose selection range */
-  }
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-  if (lastVoiceTarget?.el === el) {
-    lastVoiceTarget.start = caret;
-    lastVoiceTarget.end = caret;
-  }
-}
-
-/**
- * Dictation finished while Herdr Pocket had the focus (target "app"): inserts into the active
- * or last focused composer/input/terminal; falls back to clipboard when none is available.
- */
-function insertIntoApp(text: string, onCopied: () => void): void {
-  const active = document.activeElement as HTMLElement | null;
-  if (active?.closest(".xterm-helper-textarea, .tp-term-wrap") || (!isTextEditableElement(active) && !active?.isContentEditable && lastVoiceTerminal)) {
-    window.dispatchEvent(new CustomEvent("pocket:voice-term-input", { detail: { text } }));
-    return;
-  }
-  const target = isTextEditableElement(active)
-    ? active
-    : lastVoiceTarget?.el.isConnected
-      ? lastVoiceTarget.el
-      : null;
-  if (target) {
-    setNativeControlValue(target, text);
-    return;
-  }
-  if (active?.isContentEditable && document.execCommand("insertText", false, text)) return;
-  void copyToClipboard(text).then((ok) => ok && onCopied());
-}
-
-/** Shared microphone toggle button rendered inside message composers. */
-export function VoiceMicButton({ className = "composer-tool-btn" }: { className?: string }) {
-  const voice = useClientConfig().voiceInput;
-  const [phase, setPhase] = useState<"listening" | "transcribing" | "idle">("idle");
-
-  useEffect(() => {
-    installFocusTracker();
-    return native.onVoiceEvent((e) => {
-      if (e.state === "listening") setPhase("listening");
-      else if (e.state === "transcribing") setPhase("transcribing");
-      else setPhase("idle");
-    });
-  }, []);
-
-  if (!native.available() || !native.voiceSupported() || !voice.enabled) return null;
-
-  const busy = phase === "listening" || phase === "transcribing";
-  const label =
-    phase === "listening"
-      ? "正在听，点击结束并填入文字"
-      : phase === "transcribing"
-        ? "正在识别语音…"
-        : `语音输入（${prettyHotkey(voice.hotkey)}）`;
-
-  return (
-    <button
-      type="button"
-      data-voice-trigger="true"
-      className={`${className}${busy ? " active" : ""}`}
-      aria-label={label}
-      aria-pressed={phase === "listening"}
-      title={label}
-      disabled={phase === "transcribing"}
-      onMouseDown={(e) => e.preventDefault()}
-      onClick={() => {
-        if (phase === "listening") void voiceStop();
-        else if (phase === "idle") void voiceStart();
-      }}
-    >
-      <Mic size={16} />
-    </button>
-  );
-}
-
-/** In-app mirror of the native dictation HUD (suppressed on Tauri desktop where floating capsule renders). */
+/** In-app floating call capsule fallback for web / HarmonyOS builds (suppressed on Tauri desktop). */
 export function VoiceHud() {
   const hidden = useWindowHidden();
-  const toast = useToast();
-  const [ev, setEv] = useState<VoiceEvent>({ state: "idle" });
-  useEffect(() => {
-    installFocusTracker();
-    return native.onVoiceEvent((e) => {
-      if (e.state === "inserted" && e.target === "app" && e.text) insertIntoApp(e.text, () => toast("识别结果已复制，点输入框粘贴"));
-      setEv(e);
-    });
-  }, [toast]);
-  useEffect(() => {
-    if (ev.state !== "inserted" && ev.state !== "error") return;
-    const t = setTimeout(() => setEv({ state: "idle" }), ev.state === "error" ? 4000 : 1500);
-    return () => clearTimeout(t);
-  }, [ev]);
-  // Native Tauri window displays the standalone glass floating HUD capsule; avoid double overlay.
-  if (native.available() || hidden || ev.state === "idle") return null;
-  const text =
-    ev.state === "listening"
-      ? "在听…"
-      : ev.state === "transcribing"
-        ? "识别中…"
-        : ev.state === "inserted"
-          ? `已输入：${(ev.text ?? "").slice(0, 20)}${(ev.text ?? "").length > 20 ? "…" : ""}`
-          : ev.error || "没听清，再试一次";
+  const call = voiceCallStore.use((s) => s);
+
+  if (native.available() || hidden || !call.hudShown || call.status === "idle") return null;
+
+  const label =
+    call.status === "connecting"
+      ? "正在接通小羊…"
+      : call.muted && call.assistant !== "speaking"
+        ? "麦克风已静音"
+        : call.assistant === "speaking"
+          ? "小羊正在说…"
+          : call.assistant === "thinking"
+            ? "小羊在想…"
+            : "和小羊通话中";
+  const level = Math.max(0, Math.min(1, Math.max(call.micLevel, call.outLevel)));
+
   return (
-    <div className={`voice-hud ${ev.state}`} role="status" aria-live="polite">
-      <Mic size={15} />
-      {ev.state === "listening" ? (
-        <span className="hud-level" aria-hidden>
-          <span style={{ transform: `scaleX(${Math.max(0.08, Math.min(1, ev.level ?? 0))})` }} />
-        </span>
-      ) : null}
-      <span className="truncate">{text}</span>
+    <div className="voice-hud listening" role="status" aria-live="polite">
+      <PhoneCall size={15} />
+      <span className="truncate">{label}</span>
+      <span className="hud-level" aria-hidden>
+        <span style={{ transform: `scaleX(${Math.max(0.08, level)})` }} />
+      </span>
+      <PocketIconButton
+        size="sm"
+        active={call.muted}
+        tooltip={call.muted ? "取消静音" : "静音"}
+        onClick={() => setVoiceMuted(!call.muted)}
+      >
+        {call.muted ? <MicOff size={14} /> : <Mic size={14} />}
+      </PocketIconButton>
+      <PocketButton size="sm" variant="danger" onClick={() => hangupVoiceCall()}>
+        <PhoneOff size={13} />
+        <span>挂断</span>
+      </PocketButton>
     </div>
   );
 }

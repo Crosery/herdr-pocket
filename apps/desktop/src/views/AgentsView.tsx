@@ -66,7 +66,6 @@ import { ModelSwitchDropdown, formatEffortLabel } from "../components/ModelSwitc
 import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
-import { VoiceMicButton } from "../components/VoiceInput";
 import { copyToClipboard } from "../lib/bridge";
 import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
 import {
@@ -2617,7 +2616,6 @@ export function AgentDetailPanel({
               >
                 <Paperclip size={16} />
               </button>
-              <VoiceMicButton />
               {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
                 <>
                   <button

@@ -13,8 +13,7 @@ import {
   setAssistantWatching,
 } from "../lib/assistant";
 import { RichMarkdown } from "../lib/markdown";
-import { VoiceMicButton } from "../components/VoiceInput";
-import { hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore, type VoiceCallState } from "../lib/voiceCall";
+import { dismissVoiceMessage, hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore, type VoiceCallState } from "../lib/voiceCall";
 import { useComposerInput } from "../lib/composerKeys";
 import { isMockServer } from "../lib/mock";
 import { liveStore, settingsStore } from "../lib/store";
@@ -162,7 +161,10 @@ export function AssistantView({
   const startCall = async () => {
     setCallExpanded(true);
     const err = await startVoiceCall();
-    if (err) toast(err, true);
+    if (err) {
+      toast(err, true);
+      dismissVoiceMessage();
+    }
   };
 
   const headerSub = busy
@@ -220,7 +222,7 @@ export function AssistantView({
           <EmptyState
             mood="hello"
             title="我是小羊"
-            body={`你所有电脑上的 agent 我都盯着。问我谁在等你、谁跑完了，或者让我替你回一句${voice ? "；点右上角或麦克风可以直接语音通话" : ""}。`}
+            body={`你所有电脑上的 agent 我都盯着。问我谁在等你、谁跑完了，或者让我替你回一句${voice ? "；点右上角或输入框旁的电话按钮可以直接语音通话" : ""}。`}
             action={
               <div className="row wrap" style={{ justifyContent: "center", marginTop: 8 }}>
                 {SUGGESTIONS.map((s) => (
@@ -266,9 +268,7 @@ export function AssistantView({
           />
         </div>
         <div className="composer-foot">
-          <div className="composer-tools">
-            <VoiceMicButton />
-          </div>
+          <div className="composer-tools" />
           <div className="composer-actions">
             {!text.trim() && (voice || isMockServer(server)) && !inCall ? (
               <PocketIconButton active className="composer-send" tooltip="语音通话" onClick={() => void startCall()}>

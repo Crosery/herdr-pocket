@@ -1207,6 +1207,39 @@ pub fn voice_ai_stop_test() -> bool {
     crate::voice_ai::stop_test()
 }
 
+#[tauri::command]
+pub async fn voice_call_mic_start(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::voice::start_live_call_mic(&app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn voice_call_mic_stop(app: AppHandle) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        crate::voice::stop_live_call_mic();
+        if !crate::voice::is_call_active() {
+            crate::mainwin::set_voice_call_active(&app, false);
+        }
+    })
+    .await;
+}
+
+#[tauri::command]
+pub fn voice_call_mic_set_muted(muted: bool) {
+    crate::voice::set_live_call_mic_muted(muted);
+}
+
+#[tauri::command]
+pub fn voice_hud_sync(app: AppHandle, state: Value) {
+    crate::voice::sync_call_hud(&app, state);
+}
+
+#[tauri::command]
+pub fn voice_hud_hide(app: AppHandle) {
+    crate::voice::hide_call_hud(&app);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_sums_url, read_local_file_sync};
