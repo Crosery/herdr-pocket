@@ -1,8 +1,8 @@
 //! Desktop-local read-only `/btw` side-channel engine.
 //!
-//! Ported from `ibuki-agents` with added Antigravity transcript support, `hc read`
-//! screen tail fallback, multi-runner `TranscriptAdapter` cascade, and strict
-//! Windows + Unix cross-compilation compatibility (zero extra Cargo crates).
+//! Implements native non-persisting harness forks, Antigravity transcript
+//! support, `hc read` screen tail fallback, multi-runner `TranscriptAdapter`
+//! cascade, and Windows + Unix cross-compilation compatibility without extra Cargo crates.
 
 use crate::net;
 use serde::{Deserialize, Serialize};
