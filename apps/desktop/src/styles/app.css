@@ -4225,6 +4225,14 @@ a {
   text-align: center;
 }
 
+.viewer-media-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
 .viewer-media-title {
   max-width: 90%;
   font-size: calc(13px * var(--ts, 1));

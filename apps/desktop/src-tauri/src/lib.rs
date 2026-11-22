@@ -742,6 +742,8 @@ pub fn run() {
             commands::pick_folder,
             commands::pick_file,
             commands::local_read_file,
+            commands::local_reveal_in_folder,
+            commands::local_open_file,
             updater::update_fetch_github_latest,
             updater::update_download_and_stage,
             updater::update_restart_and_apply,

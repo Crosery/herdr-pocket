@@ -11,12 +11,13 @@ import { prettyHotkey } from "../components/VoiceInput";
 import { AgentDetailPanel, type SubagentHeadInfo } from "../views/AgentsView";
 import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../views/WorkbenchView";
 import { assistantStore, loadAssistant } from "../lib/assistant";
-import { assetUrl, copyToClipboard } from "../lib/bridge";
+import { assetUrl, copyToClipboard, detectPlatform } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
 import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
 import { useClientConfig } from "../lib/config";
 import { endPanelDrag, endTabDrag, endWorkspaceDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readPanelDrag, readTabDrag, readWorkspaceDrag, startPanelDrag, startTabDrag } from "../lib/fileDrag";
 import { useLocalHostDeviceId } from "../lib/fonts";
+import { canActOnLocalFile, revealInFolderLabel, revealInFolderShortLabel, revealLocalFile } from "../lib/localFileActions";
 import { isMockServer } from "../lib/mock";
 import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
@@ -783,7 +784,31 @@ function PaneHead({
 }) {
   const toast = useToast();
   const devices = liveStore.use((s) => s.devices);
+  const localHostId = useLocalHostDeviceId();
   const group = agent ? listGroup(agent, devices) : null;
+  const platform = detectPlatform();
+  const revealLabel = revealInFolderLabel(platform);
+  const revealShortLabel = revealInFolderShortLabel(platform);
+  const canRevealLocal =
+    tab.kind === "file" &&
+    canActOnLocalFile({
+      nativeAvailable: native.available(),
+      agentDeviceId: agent?.deviceId,
+      agentCwd: agent?.cwd,
+      localHostId,
+      path: tab.path,
+      absPath: tab.absPath,
+    });
+  const handleReveal =
+    tab.kind === "file"
+      ? () => {
+          void revealLocalFile({
+            path: tab.path,
+            absPath: tab.absPath,
+            agentCwd: agent?.cwd,
+          }).catch((e: Error) => toast(e.message || "打开所在目录失败", true));
+        }
+      : undefined;
   let icon: React.ReactNode;
   let name: string;
   let sub: string;
@@ -845,7 +870,18 @@ function PaneHead({
       ) : (
         <>
           <span className="v3-pane-name truncate" title={subTitle || name}>{name}</span>
-          <span className="v3-pane-sub truncate" title={subTitle}>{sub}</span>
+          {canRevealLocal && sub ? (
+            <button
+              type="button"
+              className="v3-pane-sub v3-pane-sub-btn truncate"
+              title={`${revealLabel}（${subTitle}）`}
+              onClick={handleReveal}
+            >
+              {sub}
+            </button>
+          ) : (
+            <span className="v3-pane-sub truncate" title={subTitle}>{sub}</span>
+          )}
         </>
       )}
       {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
@@ -884,6 +920,17 @@ function PaneHead({
             源码
           </button>
         </div>
+      ) : null}
+      {canRevealLocal ? (
+        <button
+          type="button"
+          className="v3-icon-btn small"
+          aria-label={revealShortLabel}
+          title={`${revealLabel}（${tab.absPath || tab.path}）`}
+          onClick={handleReveal}
+        >
+          <FolderOpen size={13} />
+        </button>
       ) : null}
       {tab.kind === "file" ? (
         <button
