@@ -13,6 +13,7 @@ mod cookies;
 mod diagnostics;
 mod drag_paths;
 mod fonts;
+mod local_btw;
 mod local_models;
 mod local_term;
 mod logging;
@@ -744,6 +745,7 @@ pub fn run() {
             commands::local_read_file,
             commands::local_reveal_in_folder,
             commands::local_open_file,
+            commands::local_agent_btw,
             updater::update_fetch_github_latest,
             updater::update_download_and_stage,
             updater::update_restart_and_apply,

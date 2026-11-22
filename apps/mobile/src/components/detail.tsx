@@ -22,9 +22,11 @@ import {
   type Agent,
   type AgentModelsResult,
   type AgentUsageReport,
+  type ConvEvent,
   type OmpModelRole,
   type TerminalStreamParams,
 } from "@herdr-pocket/protocol";
+import { loadAssistant, sendToAssistant, useAssistant } from "../lib/assistant";
 import { call, subscribe, type RelayError } from "../lib/relay";
 import { addPictures, canPickImages, pickImages, type Attachment } from "../lib/attach";
 import { clearMobileDraft, getMobileDraft, hydrateMobileDrafts, onDraftsHydrated, setMobileDraftPictures, setMobileDraftText } from "../lib/drafts";
@@ -124,6 +126,76 @@ import { PocketButton, PocketCheck, PocketDialog, PocketProgress, PocketSpinner,
 const TERM_PAD = 12;
 const READ_SIZE = 12.5;
 const EMPTY_MOBILE_QUEUE: ReturnType<typeof useMobileQueue.getState>["byAgent"][string] = [];
+
+interface MobileBtwCard {
+  id: string;
+  question: string;
+  status: "loading" | "streaming" | "done" | "error";
+  answer?: string;
+  error?: string;
+  model?: string;
+  durationMs?: number;
+}
+
+function formatBtwDuration(ms?: number): string | null {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return null;
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function clipBtwText(text: string, max: number): string {
+  const clean = text.trim();
+  if (clean.length <= max) return clean;
+  return `${clean.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function formatMobileBtwTranscript(events: readonly ConvEvent[], maxChars = 40_000): string {
+  const lines: string[] = [];
+  for (const ev of events) {
+    if (ev.partial) continue;
+    if (ev.kind === "user_message" && !ev.synthetic && ev.text?.trim()) {
+      lines.push(`USER: ${clipBtwText(ev.text, 4000)}`);
+    } else if (ev.kind === "assistant_message" && ev.text?.trim()) {
+      lines.push(`ASSISTANT: ${clipBtwText(ev.text, 4000)}`);
+    } else if (ev.kind === "tool_call" && ev.name?.trim()) {
+      let detail = "";
+      try {
+        detail = clipBtwText(typeof ev.input === "string" ? ev.input : JSON.stringify(ev.input ?? ""), 300);
+      } catch {
+        detail = "";
+      }
+      lines.push(detail ? `TOOL: ${ev.name} ${detail}` : `TOOL: ${ev.name}`);
+    } else if (ev.kind === "tool_result" && ev.is_error) {
+      lines.push("TOOL RESULT: failed");
+    }
+  }
+  const picked: string[] = [];
+  let size = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    size += line.length + 1;
+    if (size > maxChars) {
+      picked.push("[earlier conversation omitted]");
+      break;
+    }
+    picked.push(line);
+  }
+  return picked.reverse().join("\n");
+}
+
+function stripMobileAnsiTail(raw: string, maxLines = 180): string {
+  if (!raw) return "";
+  const clean = raw
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\r/g, "");
+  return clean
+    .split("\n")
+    .map((l) => l.replace(/\s+$/, ""))
+    .filter((l) => l.trim().length > 0)
+    .slice(-maxLines)
+    .join("\n");
+}
 
 /** Per-font-size cell metrics, measured once from the real fonts (mono cell, CJK fallback glyph). */
 function useCellMetrics() {
@@ -812,6 +884,19 @@ export function Composer({
   const [thinkingOverride, setThinkingOverride] = useState<string | undefined>(undefined);
   const [ompTab, setOmpTab] = useState<"session" | "roles">("session");
   const [editingRole, setEditingRole] = useState<OmpModelRole | null>(null);
+  const [btwCardsByAgent, setBtwCardsByAgent] = useState<Record<string, MobileBtwCard | undefined>>({});
+  const [btwCopiedId, setBtwCopiedId] = useState<string | null>(null);
+  const btwGenRef = useRef<Record<string, string>>({});
+  const btwCancelRef = useRef<Record<string, () => void>>({});
+  const activeBtwCard = mode === "chat" ? btwCardsByAgent[agent.key] : undefined;
+  const isBtwDraft = mode === "chat" && !pictures.length && /^\/btw(?:\s|$)/i.test(text.trim());
+
+  useEffect(() => {
+    return () => {
+      Object.values(btwCancelRef.current).forEach((cancel) => cancel());
+      btwCancelRef.current = {};
+    };
+  }, []);
 
   useEffect(() => {
     void hydrateMobileDrafts();
@@ -1162,10 +1247,290 @@ export function Composer({
     });
   }
 
+  const dismissBtwCard = useCallback((targetKey = agent.key) => {
+    btwCancelRef.current[targetKey]?.();
+    delete btwCancelRef.current[targetKey];
+    delete btwGenRef.current[targetKey];
+    setBtwCardsByAgent((prev) => {
+      if (!prev[targetKey]) return prev;
+      const next = { ...prev };
+      delete next[targetKey];
+      return next;
+    });
+  }, [agent.key]);
+
+  const runMobileBtw = useCallback(async (question: string) => {
+    const targetKey = agent.key;
+    const targetDevice = agent.deviceId;
+    const targetTitle = agent.title || agent.name || agent.harness;
+    const targetHarness = agent.harness;
+    const targetStatus = agent.status;
+    const startedAt = Date.now();
+    const reqId = `btw-${startedAt}-${Math.random().toString(36).slice(2, 7)}`;
+
+    btwCancelRef.current[targetKey]?.();
+    delete btwCancelRef.current[targetKey];
+    btwGenRef.current[targetKey] = reqId;
+
+    const isCurrent = () => btwGenRef.current[targetKey] === reqId;
+    const patchCard = (card: MobileBtwCard) => {
+      if (!isCurrent()) return;
+      setBtwCardsByAgent((prev) => ({ ...prev, [targetKey]: card }));
+    };
+
+    patchCard({ id: reqId, question, status: "loading" });
+
+    try {
+      const res = await call(targetDevice, "agent.btw", { agent: targetKey, question }, 90_000);
+      if (res && typeof res.answer === "string" && res.answer.trim()) {
+        patchCard({
+          id: reqId,
+          question,
+          status: "done",
+          answer: res.answer.trim(),
+          model: res.model,
+          durationMs: typeof res.durationMs === "number" ? res.durationMs : Math.max(1, Date.now() - startedAt),
+        });
+        return;
+      }
+      throw new Error("主机未返回旁路回答");
+    } catch (e: unknown) {
+      const err = e as { code?: string; message?: string };
+      const unsupported =
+        err?.code === "unsupported" ||
+        /unsupported|unknown method|method not found|未实现|不支持/i.test(err?.message ?? "");
+      if (!unsupported) {
+        patchCard({
+          id: reqId,
+          question,
+          status: "error",
+          error: err?.message || "旁路提问失败",
+        });
+        return;
+      }
+    }
+
+    const eventsRes = await call(targetDevice, "session.events", { agent: targetKey, limit: 200 }).catch(() => null);
+    let prefetched = eventsRes?.events?.length ? formatMobileBtwTranscript(eventsRes.events, 40_000) : "";
+    if (prefetched.length < 300) {
+      const termRes = await call(targetDevice, "terminal.read", { agent: targetKey, lines: 180 }).catch(() => null);
+      const tail = stripMobileAnsiTail(termRes?.text || termRes?.ansi || "", 180);
+      if (tail) {
+        const snap = `[Recent Terminal Screen Snapshot]\n${tail}`;
+        prefetched = prefetched ? `${prefetched}\n\n${snap}`.slice(-40_000) : snap.slice(-40_000);
+      }
+    }
+
+    if (!useAssistant.getState().loaded) {
+      await loadAssistant().catch(() => {});
+    }
+    const asst = useAssistant.getState();
+    if (!asst.ready) {
+      patchCard({
+        id: reqId,
+        question,
+        status: "error",
+        error: "当前主机版本暂不支持 agent.btw 旁路，且小羊文字助理未就绪。请升级主机 hostd 或先配置小羊文字模型。",
+      });
+      return;
+    }
+
+    const beforeIds = new Set(asst.items.map((x) => x.id));
+    const askPrompt = [
+      `请在完全不向目标 Agent 发送任何输入、不打断其运行的前提下，只读依据以下已采集的上下文直接回答我的旁路提问（无需再次调用读取工具）：`,
+      `Agent：${targetTitle}（key: ${targetKey}，harness: ${targetHarness}，status: ${targetStatus}）`,
+      prefetched
+        ? `<transcript>\n${prefetched}\n</transcript>`
+        : `（未能拉取到会话历史，请基于 Agent 当前状态或只读查询简短回答）`,
+      `我的旁路问题：\n${question}`,
+    ].join("\n\n");
+
+    let settled = false;
+    let unsub: (() => void) | null = null;
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastStreamed = "";
+    let sawBusy = false;
+    const initialErr = asst.error;
+
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (settleTimer) clearTimeout(settleTimer);
+      timeoutTimer = null;
+      settleTimer = null;
+      unsub?.();
+      unsub = null;
+      if (btwCancelRef.current[targetKey] === abortWait) {
+        delete btwCancelRef.current[targetKey];
+      }
+    };
+    const abortWait = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+    };
+    btwCancelRef.current[targetKey] = abortWait;
+
+    const findReply = (items: ReturnType<typeof useAssistant.getState>["items"]) =>
+      [...items]
+        .reverse()
+        .find(
+          (item) =>
+            item.role === "assistant" &&
+            !beforeIds.has(item.id) &&
+            item.ts >= startedAt - 2000 &&
+            (item.text.trim().length > 0 || Boolean(item.error)),
+        );
+
+    const check = () => {
+      if (settled || !isCurrent()) {
+        abortWait();
+        return;
+      }
+      const s = useAssistant.getState();
+      if (s.busy) sawBusy = true;
+      const reply = findReply(s.items);
+      if (reply) {
+        if (reply.error) {
+          settled = true;
+          cleanup();
+          patchCard({
+            id: reqId,
+            question,
+            status: "error",
+            error: reply.text.trim() || "小羊助理回答失败",
+          });
+          return;
+        }
+        if (reply.text !== lastStreamed) {
+          lastStreamed = reply.text;
+          patchCard({
+            id: reqId,
+            question,
+            status: "streaming",
+            answer: reply.text,
+            model: s.model ?? "小羊助理",
+          });
+          if (!s.busy && settleTimer) {
+            clearTimeout(settleTimer);
+            settleTimer = null;
+          }
+        }
+        if (s.busy) {
+          if (settleTimer) {
+            clearTimeout(settleTimer);
+            settleTimer = null;
+          }
+          return;
+        }
+        if (!settleTimer) {
+          settleTimer = setTimeout(() => {
+            settleTimer = null;
+            if (settled || !isCurrent()) return;
+            const latest = useAssistant.getState();
+            if (latest.busy) {
+              sawBusy = true;
+              return;
+            }
+            const finalReply = findReply(latest.items);
+            if (finalReply) {
+              settled = true;
+              cleanup();
+              if (finalReply.error) {
+                patchCard({
+                  id: reqId,
+                  question,
+                  status: "error",
+                  error: finalReply.text.trim() || "小羊助理回答失败",
+                });
+              } else {
+                patchCard({
+                  id: reqId,
+                  question,
+                  status: "done",
+                  answer: finalReply.text.trim(),
+                  model: latest.model ?? "小羊助理",
+                  durationMs: Math.max(1, Date.now() - startedAt),
+                });
+              }
+            }
+          }, 150);
+        }
+        return;
+      }
+      if (!s.busy && s.error && (sawBusy || s.error !== initialErr)) {
+        settled = true;
+        cleanup();
+        patchCard({
+          id: reqId,
+          question,
+          status: "error",
+          error: s.error,
+        });
+      }
+    };
+
+    unsub = useAssistant.subscribe(check);
+    timeoutTimer = setTimeout(() => {
+      if (settled) return;
+      void loadAssistant().finally(() => {
+        if (settled || !isCurrent()) return;
+        const latest = useAssistant.getState();
+        const finalReply = findReply(latest.items);
+        settled = true;
+        cleanup();
+        if (finalReply && !finalReply.error && !latest.busy) {
+          patchCard({
+            id: reqId,
+            question,
+            status: "done",
+            answer: finalReply.text.trim(),
+            model: latest.model ?? "小羊助理",
+            durationMs: Math.max(1, Date.now() - startedAt),
+          });
+        } else {
+          patchCard({
+            id: reqId,
+            question,
+            status: "error",
+            error: "等待小羊旁路回复超时，请稍后再试",
+          });
+        }
+      });
+    }, 90_000);
+
+    try {
+      await sendToAssistant(askPrompt);
+      check();
+    } catch (err: unknown) {
+      abortWait();
+      patchCard({
+        id: reqId,
+        question,
+        status: "error",
+        error: (err as Error)?.message || "发送旁路请求失败",
+      });
+    }
+  }, [agent.key, agent.deviceId, agent.title, agent.name, agent.harness, agent.status]);
+
   function send() {
     const t = text.trim();
     const pics = mode === "chat" ? pictures : [];
     if (!t && !pics.length) return;
+    const btwMatch = mode === "chat" && !pics.length ? /^\/btw(?:\s+([\s\S]*))?$/i.exec(t) : null;
+    if (btwMatch) {
+      const question = (btwMatch[1] ?? "").trim();
+      if (!question) {
+        setText("/btw ");
+        setToast("请在 /btw 后输入旁路问题");
+        return;
+      }
+      clearMobileDraft(agent.key);
+      setTextState("");
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+      void runMobileBtw(question);
+      return;
+    }
     if (mode === "chat" && !pics.length && /^\/usage$/i.test(t)) {
       setText("");
       openUsageCard();
@@ -1548,6 +1913,170 @@ export function Composer({
           </Text>
         </View>
       ) : null}
+      {mode === "chat" && activeBtwCard ? (() => {
+        const dur = formatBtwDuration(activeBtwCard.durationMs);
+        const hasAnswer = Boolean(activeBtwCard.answer && activeBtwCard.answer.trim().length > 0);
+        const isStreaming =
+          activeBtwCard.status === "streaming" ||
+          (activeBtwCard.status === "loading" && hasAnswer);
+        return (
+          <View
+            accessibilityLabel="旁路提问结果"
+            style={{
+              marginHorizontal: space.lg,
+              marginBottom: space.xs,
+              padding: space.md,
+              borderRadius: radius.card,
+              backgroundColor: p.surface,
+              borderWidth: 1,
+              borderColor: p.dark ? p.surface3 : "#FBE3EC",
+              gap: space.sm,
+            }}
+          >
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              <View
+                style={{
+                  width: 22,
+                  height: 22,
+                  borderRadius: 7,
+                  backgroundColor: p.accentContainer,
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <MaterialCommunityIcons name="robot-outline" size={13} color={p.accentText} />
+              </View>
+              <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13, color: p.ink }}>
+                旁路提问 /btw
+              </Text>
+              {activeBtwCard.model ? (
+                <View
+                  style={{
+                    maxWidth: 130,
+                    paddingHorizontal: 7,
+                    paddingVertical: 2,
+                    borderRadius: radius.pill,
+                    backgroundColor: p.lavenderContainer,
+                  }}
+                >
+                  <Text
+                    numberOfLines={1}
+                    style={{ fontFamily: fonts.mono, fontSize: 10.5, color: p.onLavender }}
+                  >
+                    {activeBtwCard.model}
+                  </Text>
+                </View>
+              ) : null}
+              {dur ? (
+                <View
+                  style={{
+                    paddingHorizontal: 6,
+                    paddingVertical: 2,
+                    borderRadius: radius.pill,
+                    backgroundColor: p.surface2,
+                    borderWidth: 1,
+                    borderColor: p.divider,
+                  }}
+                >
+                  <Text style={{ fontFamily: fonts.mono, fontSize: 10.5, color: p.muted }}>{dur}</Text>
+                </View>
+              ) : null}
+              <View style={{ flex: 1 }} />
+              {activeBtwCard.status === "done" && hasAnswer ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="复制旁路回答"
+                  hitSlop={8}
+                  style={{ padding: 4 }}
+                  onPress={async () => {
+                    const content = activeBtwCard.answer?.trim();
+                    if (!content) return;
+                    await Clipboard.setStringAsync(content);
+                    setBtwCopiedId(activeBtwCard.id);
+                    setTimeout(() => {
+                      setBtwCopiedId((cur) => (cur === activeBtwCard.id ? null : cur));
+                    }, 1500);
+                  }}
+                >
+                  <MaterialCommunityIcons
+                    name={btwCopiedId === activeBtwCard.id ? "check" : "content-copy"}
+                    size={15}
+                    color={btwCopiedId === activeBtwCard.id ? p.accentText : p.muted}
+                  />
+                </Pressable>
+              ) : null}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="关闭旁路卡片"
+                hitSlop={8}
+                style={{ padding: 4 }}
+                onPress={() => dismissBtwCard(agent.key)}
+              >
+                <MaterialCommunityIcons name="close" size={16} color={p.muted} />
+              </Pressable>
+            </View>
+
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "flex-start",
+                gap: 4,
+                paddingHorizontal: space.sm,
+                paddingVertical: 6,
+                borderRadius: radius.sm,
+                backgroundColor: p.surface2,
+              }}
+            >
+              <Text style={{ fontFamily: fonts.bodyBold, fontSize: 12.5, color: p.accentText }}>
+                问：
+              </Text>
+              <Text
+                selectable
+                style={{ flex: 1, fontFamily: fonts.bodySemi, fontSize: 12.5, lineHeight: 18, color: p.ink }}
+              >
+                {activeBtwCard.question}
+              </Text>
+            </View>
+
+            <ScrollView nestedScrollEnabled style={{ maxHeight: 200 }} keyboardShouldPersistTaps="handled">
+              {activeBtwCard.status === "error" ? (
+                <View style={{ padding: space.sm, borderRadius: radius.sm, backgroundColor: p.errorContainer }}>
+                  <Text selectable style={{ fontSize: 12.5, lineHeight: 18, color: p.error }}>
+                    {activeBtwCard.error || "旁路提问失败"}
+                  </Text>
+                </View>
+              ) : isStreaming ? (
+                <View style={{ gap: 6 }}>
+                  <Text
+                    selectable
+                    style={{ fontFamily: fonts.body, fontSize: 13.5 * textScale, lineHeight: 20, color: p.ink }}
+                  >
+                    {activeBtwCard.answer || ""}
+                  </Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <PocketSpinner size={13} />
+                    <Text style={{ fontSize: 11.5, color: p.muted }}>正在旁路流式输出…</Text>
+                  </View>
+                </View>
+              ) : activeBtwCard.status === "loading" ? (
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 }}>
+                  <PocketSpinner size={16} />
+                  <Text style={{ fontSize: 12.5, color: p.muted }}>
+                    正在只读旁路思考，主线对话不会被打断…
+                  </Text>
+                </View>
+              ) : (
+                <Text
+                  selectable
+                  style={{ fontFamily: fonts.body, fontSize: 13.5 * textScale, lineHeight: 20, color: p.ink }}
+                >
+                  {activeBtwCard.answer || ""}
+                </Text>
+              )}
+            </ScrollView>
+          </View>
+        );
+      })() : null}
       {mode === "chat" && usageOpen ? (
         <View
           accessibilityLabel="用量与上下文"
@@ -1695,7 +2224,7 @@ export function Composer({
                       openModelPicker("thinking");
                       return;
                     }
-                    const needsArgs = Boolean(cmd.argHint) || ["/add", "/model", "/ask", "/architect", "/add-dir", "/goal"].includes(cmd.name);
+                    const needsArgs = Boolean(cmd.argHint) || ["/btw", "/add", "/model", "/ask", "/architect", "/add-dir", "/goal"].includes(cmd.name);
                     setText(needsArgs ? `${cmd.name} ` : cmd.name);
                   }}
                   style={({ pressed }) => ({
@@ -2332,7 +2861,13 @@ export function Composer({
             ) : null}
             <View style={{ flex: 1 }} />
             {agent.status === "working" ? (
-              !text.trim() && !pictures.length ? (
+              isBtwDraft ? (
+                <SendPill
+                  disabled={!online || !/^\/btw\s+\S/i.test(text.trim())}
+                  onPress={send}
+                  a11y="发送旁路提问（不打断主线）"
+                />
+              ) : !text.trim() && !pictures.length ? (
                 <Pressable
                   disabled={!online || sending}
                   onPress={() => void interruptCurrentTurn()}

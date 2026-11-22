@@ -158,6 +158,25 @@ export interface VoiceCallDspChunk {
   level: number;
 }
 
+export interface LocalBtwRequest {
+  harness: string;
+  sessionKey?: string | null;
+  localId?: string | null;
+  cwd?: string | null;
+  status?: string | null;
+  title?: string | null;
+  model?: string | null;
+  prebuiltTranscript?: string | null;
+  question: string;
+  timeoutMs?: number | null;
+}
+
+export interface LocalBtwResult {
+  answer: string;
+  model?: string;
+  durationMs: number;
+}
+
 export type { VoiceAiTier };
 
 export interface VoiceAiState {
@@ -737,6 +756,10 @@ export const native = {
           sessionKey: params.sessionKey ?? null,
         }).catch(() => null)
       : null,
+  localAgentBtw: (req: LocalBtwRequest): Promise<LocalBtwResult> =>
+    inTauri()
+      ? invoke<LocalBtwResult>("local_agent_btw", { req })
+      : Promise.reject(new Error("仅桌面端支持本地旁路提问")),
 
   // System terminal fonts ----------------------------------------------------
   terminalListFonts: async (): Promise<FontCatalog | null> =>

@@ -56,11 +56,20 @@ const c = (
 });
 
 function withUsage(items: SlashCommandItem[]): SlashCommandItem[] {
-  if (items.some((x) => x.name === "/usage")) return items;
-  return [
-    c("/usage", "查看当前会话、上下文占用与本机额度用量", "session"),
-    ...items,
-  ];
+  let out = items;
+  if (!out.some((x) => x.name === "/btw")) {
+    out = [
+      c("/btw", "不打断主线快速旁路提问", "skill", "<question>"),
+      ...out,
+    ];
+  }
+  if (!out.some((x) => x.name === "/usage")) {
+    out = [
+      c("/usage", "查看当前会话、上下文占用与本机额度用量", "session"),
+      ...out,
+    ];
+  }
+  return out;
 }
 
 const CORE_SESSION: SlashCommandItem[] = [
