@@ -95,7 +95,13 @@ pub fn config_set(
     app: AppHandle,
     changes: Map<String, Value>,
 ) -> Result<config::ConfigFile, String> {
-    config::set(Some(&app), changes)
+    let had_changes = !changes.is_empty();
+    let res = config::set(Some(&app), changes)?;
+    if had_changes {
+        crate::voice::refresh_cached_voice_sounds();
+        crate::voice_ai::invalidate_hud_badge_cache();
+    }
+    Ok(res)
 }
 
 #[tauri::command]
@@ -1240,9 +1246,161 @@ pub fn voice_hud_hide(app: AppHandle) {
     crate::voice::hide_call_hud(&app);
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceCallDspInfo {
+    pub active: bool,
+    pub badge: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceCallDspChunk {
+    pub pcm_base64: String,
+    pub level: f32,
+}
+
+const MAX_DSP_INPUT_BYTES: usize = 320_000;
+
+static CALL_DSP_PROC: std::sync::OnceLock<
+    std::sync::Mutex<Option<crate::voice_ai::LiveCallProcessor>>,
+> = std::sync::OnceLock::new();
+static CALL_DSP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn call_dsp_cell() -> &'static std::sync::Mutex<Option<crate::voice_ai::LiveCallProcessor>> {
+    CALL_DSP_PROC.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub(crate) fn close_voice_call_dsp_sync() {
+    CALL_DSP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let prev = call_dsp_cell().lock().ok().and_then(|mut g| g.take());
+    drop(prev);
+}
+
+pub(crate) fn close_voice_call_dsp_bg() {
+    CALL_DSP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let prev = call_dsp_cell().lock().ok().and_then(|mut g| g.take());
+    if let Some(p) = prev {
+        std::thread::spawn(move || drop(p));
+    }
+}
+
+fn process_pcm_bytes_with_processor(
+    proc: Option<&mut crate::voice_ai::LiveCallProcessor>,
+    bytes: &[u8],
+) -> VoiceCallDspChunk {
+    let usable_bytes = bytes.len().min(MAX_DSP_INPUT_BYTES) & !1;
+    if usable_bytes == 0 {
+        return VoiceCallDspChunk {
+            pcm_base64: String::new(),
+            level: 0.0,
+        };
+    }
+    let samples: Vec<i16> = bytes[..usable_bytes]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    let out_samples: Vec<i16> = if let Some(p) = proc {
+        let mut out = Vec::with_capacity(samples.len());
+        let mut idx = 0usize;
+        while idx + 320 <= samples.len() {
+            let (frame, _lvl) = p.process_frame_320(&samples[idx..idx + 320]);
+            out.extend_from_slice(&frame);
+            idx += 320;
+        }
+        if idx < samples.len() {
+            let rem = samples.len() - idx;
+            let mut padded = [0i16; 320];
+            padded[..rem].copy_from_slice(&samples[idx..]);
+            let (frame, _lvl) = p.process_frame_320(&padded);
+            out.extend_from_slice(&frame[..rem]);
+        }
+        out
+    } else {
+        samples
+    };
+
+    let mut sq_sum = 0.0f64;
+    let mut out_bytes = Vec::with_capacity(out_samples.len() * 2);
+    for &s in &out_samples {
+        let f = f64::from(s) / 32768.0;
+        sq_sum += f * f;
+        out_bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    let raw_lvl = if out_samples.is_empty() {
+        0.0
+    } else {
+        ((sq_sum / (out_samples.len() as f64)).sqrt() as f32) * 4.0
+    };
+    let level = if raw_lvl.is_finite() {
+        raw_lvl.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    VoiceCallDspChunk {
+        pcm_base64: crate::local_term::base64_encode(&out_bytes),
+        level,
+    }
+}
+
+#[tauri::command]
+pub async fn voice_call_dsp_open() -> VoiceCallDspInfo {
+    let gen = CALL_DSP_GEN
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        .wrapping_add(1);
+    let prev = call_dsp_cell().lock().ok().and_then(|mut g| g.take());
+    let (active, proc_opt, badge) = tauri::async_runtime::spawn_blocking(move || {
+        drop(prev);
+        crate::voice_ai::voice_call_dsp_open_processor()
+    })
+    .await
+    .unwrap_or((false, None, None));
+
+    if CALL_DSP_GEN.load(std::sync::atomic::Ordering::SeqCst) != gen {
+        if let Some(p) = proc_opt {
+            std::thread::spawn(move || drop(p));
+        }
+        return VoiceCallDspInfo {
+            active: false,
+            badge: None,
+        };
+    }
+
+    if let Ok(mut guard) = call_dsp_cell().lock() {
+        *guard = proc_opt;
+    } else if let Some(p) = proc_opt {
+        std::thread::spawn(move || drop(p));
+    }
+    VoiceCallDspInfo { active, badge }
+}
+
+#[tauri::command]
+pub async fn voice_call_dsp_process(pcm_base64: String) -> Result<VoiceCallDspChunk, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = crate::local_term::base64_decode(pcm_base64.as_bytes())
+            .ok_or_else(|| "音频数据编码无效".to_string())?;
+        let mut guard = call_dsp_cell()
+            .lock()
+            .map_err(|_| "语音 DSP 处理器忙".to_string())?;
+        Ok(process_pcm_bytes_with_processor(guard.as_mut(), &bytes))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn voice_call_dsp_close() {
+    CALL_DSP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let prev = call_dsp_cell().lock().ok().and_then(|mut g| g.take());
+    if let Some(p) = prev {
+        let _ = tauri::async_runtime::spawn_blocking(move || drop(p)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_sums_url, read_local_file_sync};
+    use super::{is_sums_url, process_pcm_bytes_with_processor, read_local_file_sync};
 
     #[test]
     fn reads_local_text_image_and_blocks_private_files() {
@@ -1301,5 +1459,39 @@ mod tests {
         assert!(!is_sums_url(
             "file:///etc/releases/latest/download/SHA256SUMS"
         ));
+    }
+
+    #[test]
+    fn voice_call_dsp_process_handles_multiples_and_remainders_cleanly() {
+        let empty = process_pcm_bytes_with_processor(None, &[]);
+        assert!(empty.pcm_base64.is_empty());
+        assert_eq!(empty.level, 0.0);
+
+        let mut samples = Vec::with_capacity(960 + 80);
+        for i in 0..1040 {
+            let s = ((0.25 * (2.0 * std::f64::consts::PI * 600.0 * (i as f64) / 16000.0).sin())
+                * 32767.0) as i16;
+            samples.push(s);
+        }
+        let mut raw_bytes = Vec::with_capacity(samples.len() * 2 + 1);
+        for s in &samples {
+            raw_bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        // Trailing odd byte should be cleanly ignored without panicking.
+        raw_bytes.push(0x7f);
+
+        let mut proc = crate::voice_ai::LiveCallProcessor::with_config(
+            crate::voice_ai::VoiceAiConfig {
+                denoise: true,
+                enhance_vocal: false,
+                filter: false,
+                first_speaker: false,
+                ..Default::default()
+            },
+        );
+        let chunk = process_pcm_bytes_with_processor(Some(&mut proc), &raw_bytes);
+        let decoded = crate::local_term::base64_decode(chunk.pcm_base64.as_bytes()).unwrap();
+        assert_eq!(decoded.len(), samples.len() * 2);
+        assert!(chunk.level > 0.0 && chunk.level <= 1.0);
     }
 }
