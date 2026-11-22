@@ -605,12 +605,25 @@ fn on_quit(handle: &tauri::AppHandle, via: &str) {
     logging::flush(Duration::from_secs(1));
 }
 
+fn webview_permission_response(
+    label: &str,
+    kind: tauri::webview::PermissionKind,
+) -> tauri::webview::PermissionResponse {
+    if label == "main" && matches!(kind, tauri::webview::PermissionKind::Microphone) {
+        tauri::webview::PermissionResponse::Allow
+    } else {
+        tauri::webview::PermissionResponse::Default
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
     let version = context.package_info().version.to_string();
     let local_host_id = local_host_device_id();
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().on_permission_request(|webview, kind| {
+        webview_permission_response(webview.label(), kind)
+    });
     // macOS only: Windows and Linux windows have no menu bar.
     #[cfg(target_os = "macos")]
     let builder = builder.menu(mainwin::app_menu);
@@ -684,6 +697,9 @@ pub fn run() {
             commands::voice_call_mic_start,
             commands::voice_call_mic_stop,
             commands::voice_call_mic_set_muted,
+            commands::voice_call_dsp_open,
+            commands::voice_call_dsp_process,
+            commands::voice_call_dsp_close,
             commands::voice_hud_sync,
             commands::voice_hud_hide,
             commands::voice_ai_state,
@@ -1007,5 +1023,22 @@ mod tests {
         assert_eq!(miss.status().as_u16(), 404);
         let bad = super::serve_pocket_local("pocket-local://localhost/term-img/not-an-id", None);
         assert_eq!(bad.status().as_u16(), 404);
+    }
+
+    #[test]
+    fn main_webview_microphone_permission_is_allowed_and_others_default() {
+        use tauri::webview::{PermissionKind, PermissionResponse};
+        assert!(matches!(
+            super::webview_permission_response("main", PermissionKind::Microphone),
+            PermissionResponse::Allow
+        ));
+        assert!(matches!(
+            super::webview_permission_response("main", PermissionKind::Camera),
+            PermissionResponse::Default
+        ));
+        assert!(matches!(
+            super::webview_permission_response("browser-1", PermissionKind::Microphone),
+            PermissionResponse::Default
+        ));
     }
 }

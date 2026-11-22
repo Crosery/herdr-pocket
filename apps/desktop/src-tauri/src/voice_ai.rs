@@ -328,10 +328,48 @@ impl Default for DownloadSnapshot {
 }
 
 static CONFIG_CACHE: OnceLock<Mutex<Option<VoiceAiConfig>>> = OnceLock::new();
+static HUD_BADGE_CACHE: OnceLock<Mutex<HudBadgeCache>> = OnceLock::new();
+static HUD_BADGE_GEN: AtomicU64 = AtomicU64::new(0);
 static DL_STATUS: OnceLock<Mutex<DownloadSnapshot>> = OnceLock::new();
 static DL_CANCEL: AtomicBool = AtomicBool::new(false);
 static DL_GEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_DOWNLOAD: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct HudBadgeCache {
+    gen: u64,
+    value: Option<Option<String>>,
+}
+
+impl HudBadgeCache {
+    fn get_cached(&self, gen: u64) -> Option<Option<String>> {
+        if self.gen == gen {
+            self.value.clone()
+        } else {
+            None
+        }
+    }
+
+    fn store(&mut self, gen: u64, value: Option<String>) {
+        self.gen = gen;
+        self.value = Some(value);
+    }
+
+    fn invalidate(&mut self) {
+        self.value = None;
+    }
+}
+
+fn hud_badge_cache() -> &'static Mutex<HudBadgeCache> {
+    HUD_BADGE_CACHE.get_or_init(|| Mutex::new(HudBadgeCache::default()))
+}
+
+pub fn invalidate_hud_badge_cache() {
+    HUD_BADGE_GEN.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut guard) = hud_badge_cache().lock() {
+        guard.invalidate();
+    }
+}
 
 fn config_lock() -> &'static Mutex<Option<VoiceAiConfig>> {
     CONFIG_CACHE.get_or_init(|| Mutex::new(None))
@@ -402,6 +440,7 @@ pub fn save_config(cfg: &VoiceAiConfig) -> Result<(), String> {
     if let Ok(mut guard) = config_lock().lock() {
         *guard = Some(clean);
     }
+    invalidate_hud_badge_cache();
     Ok(())
 }
 
@@ -3452,6 +3491,7 @@ pub async fn download_tier(app: &AppHandle, tier: &str) -> Result<VoiceAiState, 
     impl Drop for Guard {
         fn drop(&mut self) {
             ACTIVE_DOWNLOAD.store(false, Ordering::SeqCst);
+            invalidate_hud_badge_cache();
         }
     }
     let _guard = Guard;
@@ -3627,6 +3667,7 @@ pub async fn download_tier(app: &AppHandle, tier: &str) -> Result<VoiceAiState, 
     }
 
     invalidate_live_model_cache();
+    invalidate_hud_badge_cache();
     emit_progress(
         app,
         &DownloadSnapshot {
@@ -3777,16 +3818,148 @@ pub fn set_config(patch: VoiceAiConfigPatch) -> Result<VoiceAiState, String> {
     Ok(current_state())
 }
 
+#[derive(Clone, Copy)]
+struct NeuralCapability {
+    ort_ready: bool,
+    dpdf_ready: bool,
+    sv_ready: bool,
+    tse_ready: bool,
+    owner_sample: bool,
+    has_dpdf: bool,
+    has_sv: bool,
+    want_tse: bool,
+}
+
+fn evaluate_neural_capability(cfg: &VoiceAiConfig, use_ort: bool) -> NeuralCapability {
+    if !use_ort {
+        return NeuralCapability {
+            ort_ready: false,
+            dpdf_ready: false,
+            sv_ready: false,
+            tse_ready: false,
+            owner_sample: false,
+            has_dpdf: false,
+            has_sv: false,
+            want_tse: false,
+        };
+    }
+    let ort_ready = discover_ort_library().is_some();
+    if !ort_ready {
+        return NeuralCapability {
+            ort_ready: false,
+            dpdf_ready: false,
+            sv_ready: false,
+            tse_ready: false,
+            owner_sample: false,
+            has_dpdf: false,
+            has_sv: false,
+            want_tse: false,
+        };
+    }
+    let dpdf_ready = discover_model_path(&DPDF_SPEC).is_some();
+    let sv_ready = discover_model_path(&SV_SPEC).is_some();
+    let tse_ready = discover_model_path(&VOXLOCK_ENROLL_SPEC).is_some()
+        && discover_model_path(&VOXLOCK_CHUNK_SPEC).is_some();
+    let owner_sample = has_owner_sample();
+
+    let tier = sanitize_tier(&cfg.tier);
+    let enrolled = cfg.voiceprint.as_ref().is_some_and(|v| {
+        cfg.filter && !v.embedding.is_empty() && v.model_version == VOICEPRINT_MODEL_VERSION
+    });
+
+    let effective_tier = match tier.as_str() {
+        "denoise" => "denoise",
+        "tse" => "tse",
+        "sv" => "sv",
+        _ => {
+            if enrolled
+                && tse_ready
+                && owner_sample
+                && cfg
+                    .recommended_tier
+                    .as_deref()
+                    .is_none_or(|r| r == "tse")
+            {
+                "tse"
+            } else {
+                "sv"
+            }
+        }
+    };
+
+    let first_lock_mode = effective_tier != "denoise" && !enrolled && cfg.first_speaker;
+    let want_identity = effective_tier != "denoise" && (enrolled || first_lock_mode);
+    let want_tse = effective_tier == "tse" && enrolled && tse_ready && owner_sample;
+    let has_sv = want_identity && sv_ready;
+    let has_dpdf = cfg.denoise && dpdf_ready;
+
+    NeuralCapability {
+        ort_ready,
+        dpdf_ready,
+        sv_ready,
+        tse_ready,
+        owner_sample,
+        has_dpdf,
+        has_sv,
+        want_tse,
+    }
+}
+
 pub fn active_hud_badge() -> Option<String> {
-    active_hud_badge_for_state(
-        &load_config(),
-        discover_ort_library().is_some(),
-        discover_model_path(&DPDF_SPEC).is_some(),
-        discover_model_path(&SV_SPEC).is_some(),
-        discover_model_path(&VOXLOCK_ENROLL_SPEC).is_some()
-            && discover_model_path(&VOXLOCK_CHUNK_SPEC).is_some(),
-        has_owner_sample(),
-    )
+    let gen = HUD_BADGE_GEN.load(Ordering::SeqCst);
+    if let Ok(guard) = hud_badge_cache().lock() {
+        if let Some(cached) = guard.get_cached(gen) {
+            return cached;
+        }
+    }
+    let cfg = load_config();
+    let cap = evaluate_neural_capability(&cfg, true);
+    let computed = active_hud_badge_for_state(
+        &cfg,
+        cap.ort_ready,
+        cap.dpdf_ready,
+        cap.sv_ready,
+        cap.tse_ready,
+        cap.owner_sample,
+    );
+    if HUD_BADGE_GEN.load(Ordering::SeqCst) == gen {
+        if let Ok(mut guard) = hud_badge_cache().lock() {
+            if HUD_BADGE_GEN.load(Ordering::SeqCst) == gen {
+                guard.store(gen, computed.clone());
+            }
+        }
+    }
+    computed
+}
+
+pub fn voice_call_dsp_open_processor() -> (bool, Option<LiveCallProcessor>, Option<String>) {
+    voice_call_dsp_open_processor_with(load_config(), true)
+}
+
+pub(crate) fn voice_call_dsp_open_processor_with(
+    mut cfg: VoiceAiConfig,
+    use_ort: bool,
+) -> (bool, Option<LiveCallProcessor>, Option<String>) {
+    let cap = evaluate_neural_capability(&cfg, use_ort);
+    let has_neural = cap.has_dpdf || cap.has_sv || cap.want_tse;
+    if !has_neural {
+        return (false, None, cfg.denoise.then(|| "回声消除 · 降噪".into()));
+    }
+    // Post-AEC safety: never boost speaker residual via VocalEnhancer behind WebRTC AEC.
+    cfg.enhance_vocal = false;
+    let proc = LiveCallProcessor::with_config_and_ort(cfg.clone(), use_ort);
+    if proc.denoiser.is_none() && !proc.has_sv && proc.tse.is_none() {
+        return (false, None, cfg.denoise.then(|| "回声消除 · 降噪".into()));
+    }
+    let badge = active_hud_badge_for_state(
+        &cfg,
+        cap.ort_ready,
+        cap.dpdf_ready,
+        cap.sv_ready,
+        cap.tse_ready,
+        cap.owner_sample,
+    );
+    (true, Some(proc), badge)
 }
 
 fn active_hud_badge_for_state(
@@ -4484,6 +4657,7 @@ pub fn cancel_enroll() -> bool {
 pub fn clear_voiceprint() -> Result<VoiceAiState, String> {
     lab::stop_all();
     delete_owner_sample();
+    invalidate_hud_badge_cache();
     let mut cfg = load_config();
     cfg.voiceprint = None;
     cfg.filter = false;
@@ -4702,6 +4876,7 @@ fn invalidate_live_model_cache() {
     if let Ok(mut guard) = live_model_cache().lock() {
         *guard = None;
     }
+    invalidate_hud_badge_cache();
 }
 
 fn cached_live_models(
@@ -6075,5 +6250,74 @@ mod tests {
             active_hud_badge_for_state(&cfg, true, true, true, true, true),
             None
         );
+    }
+
+    #[test]
+    fn hud_badge_cache_caches_results_and_invalidates_cleanly() {
+        let mut cache = HudBadgeCache::default();
+        let mut scans = 0usize;
+        let first = {
+            if let Some(v) = cache.get_cached(1) {
+                v
+            } else {
+                scans += 1;
+                let v = Some("DPDFNet 降噪".to_string());
+                cache.store(1, v.clone());
+                v
+            }
+        };
+        let second = {
+            if let Some(v) = cache.get_cached(1) {
+                v
+            } else {
+                scans += 1;
+                let v = Some("SHOULD_NOT_COMPUTE".to_string());
+                cache.store(1, v.clone());
+                v
+            }
+        };
+        assert_eq!(first.as_deref(), Some("DPDFNet 降噪"));
+        assert_eq!(second.as_deref(), Some("DPDFNet 降噪"));
+        assert_eq!(scans, 1);
+
+        cache.invalidate();
+        assert!(cache.get_cached(1).is_none());
+        let third = {
+            if let Some(v) = cache.get_cached(2) {
+                v
+            } else {
+                scans += 1;
+                let v = Some("VoxLock + DPDFNet".to_string());
+                cache.store(2, v.clone());
+                v
+            }
+        };
+        assert_eq!(third.as_deref(), Some("VoxLock + DPDFNet"));
+        assert_eq!(scans, 2);
+
+        // Also exercise the global active_hud_badge + invalidation path.
+        let b1 = active_hud_badge();
+        let b2 = active_hud_badge();
+        assert_eq!(b1, b2);
+        invalidate_hud_badge_cache();
+        let b3 = active_hud_badge();
+        assert_eq!(b1, b3);
+    }
+
+    #[test]
+    fn voice_call_dsp_open_processor_without_onnx_returns_aec_badge_only_when_denoise_enabled() {
+        let mut cfg = VoiceAiConfig::default();
+        cfg.denoise = true;
+        cfg.enhance_vocal = true;
+        let (active, proc_opt, badge) = voice_call_dsp_open_processor_with(cfg.clone(), false);
+        assert!(!active);
+        assert!(proc_opt.is_none());
+        assert_eq!(badge.as_deref(), Some("回声消除 · 降噪"));
+
+        cfg.denoise = false;
+        let (active2, proc_opt2, badge2) = voice_call_dsp_open_processor_with(cfg, false);
+        assert!(!active2);
+        assert!(proc_opt2.is_none());
+        assert_eq!(badge2, None);
     }
 }

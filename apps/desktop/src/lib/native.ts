@@ -146,6 +146,16 @@ export interface LocalTermCloseEvent {
   id: string;
 }
 
+export interface VoiceCallDspInfo {
+  active: boolean;
+  badge: string | null;
+}
+
+export interface VoiceCallDspChunk {
+  pcmBase64: string;
+  level: number;
+}
+
 export type { VoiceAiTier };
 
 export interface VoiceAiState {
@@ -414,6 +424,16 @@ export const native = {
   voiceCallMicStart: (): Promise<void> => bridge.voiceCallMicStart(),
   voiceCallMicStop: (): Promise<void> => bridge.voiceCallMicStop(),
   voiceCallMicSetMuted: (muted: boolean): Promise<void> => bridge.voiceCallMicSetMuted(muted),
+  voiceCallDspOpen: async (): Promise<VoiceCallDspInfo> =>
+    inTauri()
+      ? invoke<VoiceCallDspInfo>("voice_call_dsp_open").catch(() => ({ active: false, badge: null }))
+      : { active: false, badge: null },
+  voiceCallDspProcess: async (pcmBase64: string): Promise<VoiceCallDspChunk> =>
+    inTauri()
+      ? invoke<VoiceCallDspChunk>("voice_call_dsp_process", { pcmBase64 })
+      : { pcmBase64, level: 0 },
+  voiceCallDspClose: async (): Promise<void> =>
+    inTauri() ? invoke<void>("voice_call_dsp_close").catch(() => {}) : noop(),
   voiceHudSync: (state: VoiceHudSyncState): Promise<void> => bridge.voiceHudSync(state),
   voiceHudHide: (): Promise<void> => bridge.voiceHudHide(),
 

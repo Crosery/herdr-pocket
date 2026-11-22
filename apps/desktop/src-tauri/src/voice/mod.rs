@@ -22,7 +22,7 @@ mod hud;
 use crate::logging;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -44,6 +44,34 @@ const TAP_MS: u64 = 650;
 static CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+static CACHED_VOICE_SOUNDS: AtomicBool = AtomicBool::new(true);
+static CACHED_VOICE_SOUNDS_INIT: AtomicBool = AtomicBool::new(false);
+static LAST_SYNCED_PHASE: AtomicU8 = AtomicU8::new(SyncedPhase::Idle as u8);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum SyncedPhase {
+    Idle = 0,
+    Connecting = 1,
+    Active = 2,
+}
+
+fn should_notify_phase_change(last: &AtomicU8, next: SyncedPhase, force: bool) -> bool {
+    let prev = last.swap(next as u8, Ordering::SeqCst);
+    force || prev != next as u8
+}
+
+pub(crate) fn refresh_cached_voice_sounds() {
+    CACHED_VOICE_SOUNDS.store(crate::config::native().voice_sounds, Ordering::Relaxed);
+    CACHED_VOICE_SOUNDS_INIT.store(true, Ordering::Release);
+}
+
+fn cached_voice_sounds() -> bool {
+    if !CACHED_VOICE_SOUNDS_INIT.load(Ordering::Acquire) {
+        refresh_cached_voice_sounds();
+    }
+    CACHED_VOICE_SOUNDS.load(Ordering::Relaxed)
+}
 
 pub fn is_call_active() -> bool {
     CALL_ACTIVE.load(Ordering::SeqCst)
@@ -120,10 +148,13 @@ pub(crate) fn on_shortcut(shortcut: Shortcut, pressed: bool) {
 
 /// config.json changed: re-read the voice keys.
 pub fn config_changed(_app: &AppHandle) {
+    refresh_cached_voice_sounds();
+    crate::voice_ai::invalidate_hud_badge_cache();
     send(Msg::Reconfigure);
 }
 
 pub fn init(app: &AppHandle) {
+    refresh_cached_voice_sounds();
     let (tx, rx) = mpsc::channel();
     if let Ok(mut g) = sender().lock() {
         *g = Some(tx);
@@ -146,6 +177,7 @@ pub fn init(app: &AppHandle) {
 }
 
 pub fn shutdown(_app: &AppHandle) {
+    crate::commands::close_voice_call_dsp_sync();
     stop_live_call_mic();
     send(Msg::Shutdown);
 }
@@ -271,6 +303,7 @@ pub fn stop_live_call_mic() {
     mic_muted_flag().store(false, Ordering::Relaxed);
     #[cfg(any(target_os = "macos", windows))]
     drop_active_mic_stream();
+    crate::commands::close_voice_call_dsp_bg();
 }
 
 pub fn set_live_call_mic_muted(app: &AppHandle, muted: bool) {
@@ -290,6 +323,7 @@ pub fn set_live_call_mic_muted(app: &AppHandle, muted: bool) {
 pub fn hangup_from_hud(app: &AppHandle) {
     CALL_ACTIVE.store(false, Ordering::SeqCst);
     ACTIVE_CALL_SEQ.store(0, Ordering::SeqCst);
+    LAST_SYNCED_PHASE.store(SyncedPhase::Idle as u8, Ordering::SeqCst);
     #[cfg(any(target_os = "macos", windows))]
     hud::hide(app);
     stop_live_call_mic();
@@ -329,15 +363,14 @@ pub fn sync_call_hud(app: &AppHandle, mut state: Value) {
         crate::mainwin::set_voice_call_active(app, false);
         if let Some(obj) = state.as_object_mut() {
             if !obj.contains_key("sounds") {
-                obj.insert(
-                    "sounds".into(),
-                    Value::Bool(crate::config::native().voice_sounds),
-                );
+                obj.insert("sounds".into(), Value::Bool(cached_voice_sounds()));
             }
         }
         #[cfg(any(target_os = "macos", windows))]
         hud::show(app, state);
-        send(Msg::SetPhase("idle"));
+        if should_notify_phase_change(&LAST_SYNCED_PHASE, SyncedPhase::Idle, false) {
+            send(Msg::SetPhase("idle"));
+        }
         send(Msg::ScheduleHide { ms: 2800 });
         return;
     }
@@ -369,25 +402,25 @@ pub fn sync_call_hud(app: &AppHandle, mut state: Value) {
     }
 
     if let Some(obj) = state.as_object_mut() {
-        if obj.get("dspBadge").is_none_or(Value::is_null) {
+        if !obj.contains_key("dspBadge") {
             if let Some(badge) = crate::voice_ai::active_hud_badge() {
                 obj.insert("dspBadge".into(), Value::String(badge));
             }
         }
         if !obj.contains_key("sounds") {
-            obj.insert(
-                "sounds".into(),
-                Value::Bool(crate::config::native().voice_sounds),
-            );
+            obj.insert("sounds".into(), Value::Bool(cached_voice_sounds()));
         }
     }
 
-    send(Msg::CancelHide);
-    send(Msg::SetPhase(if kind == "connecting" {
-        "connecting"
+    let (next_phase, phase_str) = if kind == "connecting" {
+        (SyncedPhase::Connecting, "connecting")
     } else {
-        "active"
-    }));
+        (SyncedPhase::Active, "active")
+    };
+    if should_notify_phase_change(&LAST_SYNCED_PHASE, next_phase, open) {
+        send(Msg::CancelHide);
+        send(Msg::SetPhase(phase_str));
+    }
     #[cfg(any(target_os = "macos", windows))]
     {
         if open {
@@ -403,6 +436,7 @@ pub fn sync_call_hud(app: &AppHandle, mut state: Value) {
 pub fn hide_call_hud(app: &AppHandle) {
     CALL_ACTIVE.store(false, Ordering::SeqCst);
     ACTIVE_CALL_SEQ.store(0, Ordering::SeqCst);
+    LAST_SYNCED_PHASE.store(SyncedPhase::Idle as u8, Ordering::SeqCst);
     #[cfg(any(target_os = "macos", windows))]
     hud::hide(app);
     stop_live_call_mic();
@@ -496,6 +530,7 @@ impl Controller {
                 Some(Msg::Shutdown) => {
                     CALL_ACTIVE.store(false, Ordering::SeqCst);
                     ACTIVE_CALL_SEQ.store(0, Ordering::SeqCst);
+                    LAST_SYNCED_PHASE.store(SyncedPhase::Idle as u8, Ordering::SeqCst);
                     stop_live_call_mic();
                     #[cfg(any(target_os = "macos", windows))]
                     hud::hide(&self.app);
@@ -584,6 +619,7 @@ impl Controller {
 
     fn reconfigure(&mut self) {
         use tauri_plugin_global_shortcut::GlobalShortcutExt;
+        refresh_cached_voice_sounds();
         let cfg = crate::config::native();
         let same = self.spec.is_some()
             && cfg.voice_enabled == self.cfg.voice_enabled
@@ -704,8 +740,10 @@ impl Controller {
                 }
             }
             Msg::SetPhase(phase) => {
-                self.phase = phase;
-                self.publish(None);
+                if self.phase != phase {
+                    self.phase = phase;
+                    self.publish(None);
+                }
             }
             Msg::ScheduleHide { ms } => {
                 self.hide_at = Some(Instant::now() + Duration::from_millis(ms));
@@ -798,6 +836,7 @@ impl Controller {
         let seq = NEXT_CALL_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         ACTIVE_CALL_SEQ.store(seq, Ordering::SeqCst);
         CALL_ACTIVE.store(true, Ordering::SeqCst);
+        LAST_SYNCED_PHASE.store(SyncedPhase::Connecting as u8, Ordering::SeqCst);
         mic_muted_flag().store(false, Ordering::Relaxed);
         self.phase = "connecting";
 
@@ -828,6 +867,7 @@ impl Controller {
     fn end_call_from_hotkey(&mut self, via: &str) {
         CALL_ACTIVE.store(false, Ordering::SeqCst);
         ACTIVE_CALL_SEQ.store(0, Ordering::SeqCst);
+        LAST_SYNCED_PHASE.store(SyncedPhase::Idle as u8, Ordering::SeqCst);
         self.tap.reset();
         self.hide_at = None;
         self.phase = "idle";
@@ -852,6 +892,7 @@ impl Controller {
         }
         CALL_ACTIVE.store(false, Ordering::SeqCst);
         ACTIVE_CALL_SEQ.store(0, Ordering::SeqCst);
+        LAST_SYNCED_PHASE.store(SyncedPhase::Idle as u8, Ordering::SeqCst);
         self.phase = "idle";
         #[cfg(any(target_os = "macos", windows))]
         hud::show(
@@ -935,5 +976,21 @@ mod tests {
         let bytes2 = pack_pcm16_le(&loud);
         assert_eq!(bytes2.len(), 640);
         assert_eq!(&bytes2[0..2], &16_384i16.to_le_bytes());
+    }
+
+    #[test]
+    fn phase_change_dedup_suppresses_repeated_meter_syncs_unless_open_or_transitioning() {
+        let last = AtomicU8::new(SyncedPhase::Idle as u8);
+
+        assert!(should_notify_phase_change(&last, SyncedPhase::Connecting, true));
+        assert!(!should_notify_phase_change(&last, SyncedPhase::Connecting, false));
+        assert!(!should_notify_phase_change(&last, SyncedPhase::Connecting, false));
+
+        assert!(should_notify_phase_change(&last, SyncedPhase::Active, false));
+        assert!(!should_notify_phase_change(&last, SyncedPhase::Active, false));
+        assert!(should_notify_phase_change(&last, SyncedPhase::Active, true));
+
+        assert!(should_notify_phase_change(&last, SyncedPhase::Idle, false));
+        assert!(!should_notify_phase_change(&last, SyncedPhase::Idle, false));
     }
 }
