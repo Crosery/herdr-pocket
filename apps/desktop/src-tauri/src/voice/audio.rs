@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const RATE: u32 = 16_000;
+#[allow(dead_code)]
+pub const LIVE_FRAME_SAMPLES: usize = 320;
 
 /// Box-filter resampler: each output sample is the mean of the input samples it covers.
 /// Good enough for speech recognition, and cheap.
@@ -161,17 +163,20 @@ fn mono_from<T: Copy>(data: &[T], channels: usize, to_f32: impl Fn(T) -> f32, ou
     }
 }
 
-/// Opens the default input device and starts recording. Blocks until the stream runs (or fails).
-pub fn start(max_seconds: u32) -> Result<Recording, String> {
+fn spawn_cpal_capture<S>(
+    thread_name: &str,
+    failed: Arc<AtomicBool>,
+    on_chunk: S,
+) -> Result<(String, mpsc::Sender<()>, std::thread::JoinHandle<()>), String>
+where
+    S: FnMut(&[f32], &[i16]) + Send + 'static,
+{
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-    let shared = Arc::new(Shared::default());
     let (ready_tx, ready_rx) = mpsc::channel::<Result<String, String>>();
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let sh = shared.clone();
-    let max_samples = (RATE * max_seconds.max(1)) as usize;
     let thread = std::thread::Builder::new()
-        .name("pocket-mic".into())
+        .name(thread_name.into())
         .spawn(move || {
             let host = cpal::default_host();
             let Some(device) = host.default_input_device() else {
@@ -193,13 +198,13 @@ pub fn start(max_seconds: u32) -> Result<Recording, String> {
             let config: cpal::StreamConfig = supported.config();
             let channels = usize::from(config.channels.max(1));
             let rate = config.sample_rate;
-            let err_sh = sh.clone();
+            let err_flag = failed.clone();
             let on_err = move |_e: cpal::Error| {
-                err_sh.failed.store(true, Ordering::Relaxed);
+                err_flag.store(true, Ordering::Relaxed);
             };
             macro_rules! stream_of {
-                ($t:ty, $conv:expr) => {{
-                    let sh = sh.clone();
+                ($t:ty, $conv:expr, $cb:expr) => {{
+                    let mut cb = $cb;
                     let mut rs = Resampler::new(rate, RATE);
                     let mut mono = Vec::new();
                     let mut out = Vec::new();
@@ -207,16 +212,9 @@ pub fn start(max_seconds: u32) -> Result<Recording, String> {
                         config.clone(),
                         move |data: &[$t], _: &cpal::InputCallbackInfo| {
                             mono_from(data, channels, $conv, &mut mono);
-                            let lvl = mono.iter().fold(0f32, |m, s| m.max(s.abs()));
-                            sh.level.store(lvl.min(1.0).to_bits(), Ordering::Relaxed);
                             out.clear();
                             rs.push(&mono, &mut out);
-                            if let Ok(mut buf) = sh.samples.lock() {
-                                if buf.len() < max_samples {
-                                    let room = max_samples - buf.len();
-                                    buf.extend_from_slice(&out[..out.len().min(room)]);
-                                }
-                            }
+                            cb(&mono, &out);
                         },
                         on_err,
                         Some(Duration::from_secs(2)),
@@ -224,11 +222,15 @@ pub fn start(max_seconds: u32) -> Result<Recording, String> {
                 }};
             }
             let stream = match format {
-                cpal::SampleFormat::F32 => stream_of!(f32, |s: f32| s),
-                cpal::SampleFormat::I16 => stream_of!(i16, |s: i16| f32::from(s) / 32768.0),
-                cpal::SampleFormat::I32 => stream_of!(i32, |s: i32| s as f32 / 2_147_483_648.0),
+                cpal::SampleFormat::F32 => stream_of!(f32, |s: f32| s, on_chunk),
+                cpal::SampleFormat::I16 => {
+                    stream_of!(i16, |s: i16| f32::from(s) / 32768.0, on_chunk)
+                }
+                cpal::SampleFormat::I32 => {
+                    stream_of!(i32, |s: i32| s as f32 / 2_147_483_648.0, on_chunk)
+                }
                 cpal::SampleFormat::U16 => {
-                    stream_of!(u16, |s: u16| (f32::from(s) - 32768.0) / 32768.0)
+                    stream_of!(u16, |s: u16| (f32::from(s) - 32768.0) / 32768.0, on_chunk)
                 }
                 other => {
                     let _ = ready_tx.send(Err(format!("不支持的麦克风格式：{other:?}")));
@@ -253,12 +255,7 @@ pub fn start(max_seconds: u32) -> Result<Recording, String> {
         })
         .map_err(|e| e.to_string())?;
     match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(device)) => Ok(Recording {
-            shared,
-            stop: Some(stop_tx),
-            thread: Some(thread),
-            device,
-        }),
+        Ok(Ok(device)) => Ok((device, stop_tx, thread)),
         Ok(Err(e)) => {
             let _ = thread.join();
             Err(e)
@@ -266,6 +263,180 @@ pub fn start(max_seconds: u32) -> Result<Recording, String> {
         Err(_) => {
             let _ = stop_tx.send(());
             Err("麦克风没有响应".into())
+        }
+    }
+}
+
+/// Opens the default input device and starts recording. Blocks until the stream runs (or fails).
+pub fn start(max_seconds: u32) -> Result<Recording, String> {
+    let shared = Arc::new(Shared::default());
+    let failed = Arc::new(AtomicBool::new(false));
+    let max_samples = (RATE * max_seconds.max(1)) as usize;
+    let sh = shared.clone();
+    let fl = failed.clone();
+    let res = spawn_cpal_capture("pocket-mic", failed, move |mono, out| {
+        let lvl = mono.iter().fold(0f32, |m, s| m.max(s.abs()));
+        sh.level.store(lvl.min(1.0).to_bits(), Ordering::Relaxed);
+        if let Ok(mut buf) = sh.samples.lock() {
+            if buf.len() < max_samples {
+                let room = max_samples - buf.len();
+                buf.extend_from_slice(&out[..out.len().min(room)]);
+            }
+        }
+        if fl.load(Ordering::Relaxed) {
+            sh.failed.store(true, Ordering::Relaxed);
+        }
+    });
+    match res {
+        Ok((device, stop_tx, thread)) => Ok(Recording {
+            shared,
+            stop: Some(stop_tx),
+            thread: Some(thread),
+            device,
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct FrameBatcher320 {
+    buf: Vec<i16>,
+}
+
+#[allow(dead_code)]
+impl FrameBatcher320 {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(LIVE_FRAME_SAMPLES * 2),
+        }
+    }
+
+    pub fn push_with<P, F>(
+        &mut self,
+        samples: &[i16],
+        muted: bool,
+        mut process: P,
+        mut on_frame: F,
+    ) where
+        P: FnMut(&[i16]) -> ([i16; LIVE_FRAME_SAMPLES], f32),
+        F: FnMut(&[i16; LIVE_FRAME_SAMPLES], f32),
+    {
+        if muted {
+            self.buf.resize(self.buf.len() + samples.len(), 0);
+        } else {
+            self.buf.extend_from_slice(samples);
+        }
+        let mut offset = 0usize;
+        while self.buf.len().saturating_sub(offset) >= LIVE_FRAME_SAMPLES {
+            let frame = &self.buf[offset..offset + LIVE_FRAME_SAMPLES];
+            offset += LIVE_FRAME_SAMPLES;
+            if muted {
+                let silence = [0i16; LIVE_FRAME_SAMPLES];
+                on_frame(&silence, 0.0);
+            } else {
+                let (processed, level) = process(frame);
+                on_frame(&processed, level);
+            }
+        }
+        if offset > 0 {
+            self.buf.drain(..offset);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn pending_len(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+/// Active 16 kHz mono call microphone stream. Dropping stops the `cpal` stream
+/// cleanly, shutting off the OS microphone indicator.
+#[allow(dead_code)]
+pub struct LiveMicStream {
+    failed: Arc<AtomicBool>,
+    stop: Option<mpsc::Sender<()>>,
+    capture_thread: Option<std::thread::JoinHandle<()>>,
+    dsp_thread: Option<std::thread::JoinHandle<()>>,
+    pub device: String,
+}
+
+#[allow(dead_code)]
+impl LiveMicStream {
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    pub fn stop(mut self) {
+        self.close();
+    }
+
+    fn close(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+        if let Some(t) = self.capture_thread.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = self.dsp_thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for LiveMicStream {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Opens the default microphone, resamples to 16 kHz mono, batches 320-sample
+/// (20 ms) frames through `LiveCallProcessor`, and delivers enhanced PCM16 + RMS level.
+#[allow(dead_code)]
+pub fn start_live_call_mic<F>(
+    muted: Arc<AtomicBool>,
+    mut on_frame: F,
+) -> Result<LiveMicStream, String>
+where
+    F: FnMut(&[i16; 320], f32) + Send + 'static,
+{
+    let failed = Arc::new(AtomicBool::new(false));
+    let (pcm_tx, pcm_rx) = mpsc::sync_channel::<Vec<i16>>(256);
+    let dsp_muted = muted.clone();
+    let dsp_thread = std::thread::Builder::new()
+        .name("pocket-call-dsp".into())
+        .spawn(move || {
+            let mut processor = crate::voice_ai::LiveCallProcessor::new();
+            let mut batcher = FrameBatcher320::new();
+            while let Ok(chunk) = pcm_rx.recv() {
+                let is_muted = dsp_muted.load(Ordering::Relaxed);
+                batcher.push_with(
+                    &chunk,
+                    is_muted,
+                    |frame| processor.process_frame_320(frame),
+                    &mut on_frame,
+                );
+            }
+        })
+        .map_err(|e| e.to_string())?;
+
+    let cap = spawn_cpal_capture("pocket-call-mic", failed.clone(), move |_mono, out| {
+        if !out.is_empty() {
+            let _ = pcm_tx.try_send(out.to_vec());
+        }
+    });
+    match cap {
+        Ok((device, stop_tx, capture_thread)) => Ok(LiveMicStream {
+            failed,
+            stop: Some(stop_tx),
+            capture_thread: Some(capture_thread),
+            dsp_thread: Some(dsp_thread),
+            device,
+        }),
+        Err(e) => {
+            if e != "麦克风没有响应" {
+                let _ = dsp_thread.join();
+            }
+            Err(e)
         }
     }
 }
@@ -309,5 +480,138 @@ mod tests {
         let mut out = Vec::new();
         mono_from(&[1.0f32, 0.0, 0.5, 0.5], 2, |s| s, &mut out);
         assert_eq!(out, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn batches_arbitrary_chunks_into_exact_320_sample_frames() {
+        let mut batcher = FrameBatcher320::new();
+        let mut emitted = Vec::<([i16; 320], f32)>::new();
+
+        let chunk1: Vec<i16> = (0..100).collect();
+        batcher.push_with(
+            &chunk1,
+            false,
+            |f| (f.try_into().unwrap(), 0.25),
+            |f, lvl| emitted.push((*f, lvl)),
+        );
+        assert_eq!(emitted.len(), 0);
+        assert_eq!(batcher.pending_len(), 100);
+
+        let chunk2: Vec<i16> = (100..650).collect();
+        batcher.push_with(
+            &chunk2,
+            false,
+            |f| (f.try_into().unwrap(), 0.5),
+            |f, lvl| emitted.push((*f, lvl)),
+        );
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(batcher.pending_len(), 10);
+        assert_eq!(emitted[0].0[0], 0);
+        assert_eq!(emitted[0].0[319], 319);
+        assert_eq!(emitted[1].0[0], 320);
+        assert_eq!(emitted[1].0[319], 639);
+        assert_eq!(emitted[0].1, 0.5);
+
+        let chunk3: Vec<i16> = (650..960).collect();
+        batcher.push_with(
+            &chunk3,
+            false,
+            |f| (f.try_into().unwrap(), 0.75),
+            |f, lvl| emitted.push((*f, lvl)),
+        );
+        assert_eq!(emitted.len(), 3);
+        assert_eq!(batcher.pending_len(), 0);
+        assert_eq!(emitted[2].0[0], 640);
+        assert_eq!(emitted[2].0[319], 959);
+    }
+
+    #[test]
+    fn muted_frame_batcher_emits_silence_and_zero_level_and_recovers() {
+        let mut batcher = FrameBatcher320::new();
+        let mut emitted = Vec::<([i16; 320], f32)>::new();
+        let mut processor_calls = 0usize;
+
+        // Pre-fill 100 unmuted samples before muting.
+        let pre = vec![1234i16; 100];
+        batcher.push_with(
+            &pre,
+            false,
+            |_| {
+                processor_calls += 1;
+                ([1; 320], 0.9)
+            },
+            |f, lvl| emitted.push((*f, lvl)),
+        );
+        assert_eq!(emitted.len(), 0);
+
+        // Mute with 540 incoming samples -> emits 2 silent frames with level 0.0 without calling processor.
+        let loud = vec![9999i16; 540];
+        batcher.push_with(
+            &loud,
+            true,
+            |_| {
+                processor_calls += 1;
+                ([2; 320], 0.9)
+            },
+            |f, lvl| emitted.push((*f, lvl)),
+        );
+        assert_eq!(processor_calls, 0);
+        assert_eq!(emitted.len(), 2);
+        assert!(emitted.iter().all(|(f, lvl)| f.iter().all(|&s| s == 0) && *lvl == 0.0));
+
+        // Unmute with 320 samples -> processor resumes normally.
+        let resumed = vec![500i16; 320];
+        batcher.push_with(
+            &resumed,
+            false,
+            |f| {
+                processor_calls += 1;
+                (f.try_into().unwrap(), 0.42)
+            },
+            |f, lvl| emitted.push((*f, lvl)),
+        );
+        assert_eq!(processor_calls, 1);
+        assert_eq!(emitted.len(), 3);
+        assert_eq!(emitted[2].1, 0.42);
+    }
+
+    #[test]
+    fn resampler_and_batcher_emit_320_sample_frames_through_live_call_processor() {
+        let mut rs = Resampler::new(48_000, RATE);
+        let mut batcher = FrameBatcher320::new();
+        let mut proc = crate::voice_ai::LiveCallProcessor::with_config(
+            crate::voice_ai::VoiceAiConfig {
+                denoise: true,
+                enhance_vocal: true,
+                filter: false,
+                first_speaker: false,
+                ..Default::default()
+            },
+        );
+
+        let mut mono_48k = Vec::with_capacity(4_800);
+        for i in 0..4_800 {
+            mono_48k.push(
+                0.25 * (2.0 * std::f64::consts::PI * 600.0 * (i as f64) / 48_000.0).sin() as f32,
+            );
+        }
+        let mut pcm_16k = Vec::new();
+        rs.push(&mono_48k, &mut pcm_16k);
+        assert_eq!(pcm_16k.len(), 1_600);
+
+        let mut frames = 0usize;
+        let mut last_lvl = 0.0f32;
+        batcher.push_with(
+            &pcm_16k,
+            false,
+            |f| proc.process_frame_320(f),
+            |out, lvl| {
+                assert_eq!(out.len(), 320);
+                frames += 1;
+                last_lvl = lvl;
+            },
+        );
+        assert_eq!(frames, 5);
+        assert!(last_lvl > 0.0 && last_lvl <= 1.0, "unexpected level {last_lvl}");
     }
 }

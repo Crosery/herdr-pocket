@@ -13,8 +13,8 @@ import java.util.Locale
 object VoiceModelManager {
   const val VOICEPRINT_MODEL_VERSION = "eres2netv2-voxlock-v2"
 
-  const val SPEAKER_SIZE = 71_441_526L
-  const val SPEAKER_SHA256 = "bf1a75b9930474cf3389ef415e6e5d38ca96fea4a3a00f7e301d080a58ee2239"
+  const val SPEAKER_SIZE = 71_441_527L
+  const val SPEAKER_SHA256 = "eda0bf86422a9725a3523d5a1d3d75dedf340664e0ba65cfc1c7b2a78b6cf0b5"
 
   const val VOXLOCK_ENROLL_SIZE = 21_023_799L
   const val VOXLOCK_ENROLL_SHA256 = "81f305c9b7a32f13d1401f53bb4c6301826a607c9e807e60912f36ef1b9fae29"
@@ -24,7 +24,7 @@ object VoiceModelManager {
 
   const val SV_PACK_SIZE = SPEAKER_SIZE
   const val VOXLOCK_PACK_SIZE = VOXLOCK_ENROLL_SIZE + VOXLOCK_CHUNK_SIZE
-  const val MODEL_PACK_SIZE = SPEAKER_SIZE + VOXLOCK_ENROLL_SIZE + VOXLOCK_CHUNK_SIZE // 149_025_914L
+  const val MODEL_PACK_SIZE = SPEAKER_SIZE + VOXLOCK_ENROLL_SIZE + VOXLOCK_CHUNK_SIZE // 149_025_915L
 
   const val OWNER_SAMPLE_SAMPLES = 48_000
   const val OWNER_SAMPLE_BYTES = OWNER_SAMPLE_SAMPLES * 2
@@ -45,10 +45,11 @@ object VoiceModelManager {
     size = SPEAKER_SIZE,
     sha256 = SPEAKER_SHA256,
     urls = listOf(
+      "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+      "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://cdn.gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
-      "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
     ),
   )
