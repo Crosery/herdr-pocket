@@ -4,8 +4,8 @@
  * changes asks first. Another phone saving the same prompt meanwhile is said
  * plainly instead of being written over silently.
  */
-import { useEffect, useState } from "react";
-import { Keyboard, KeyboardAvoidingView, TextInput, View } from "react-native";
+import { useState } from "react";
+import { KeyboardAvoidingView, TextInput, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
@@ -16,6 +16,7 @@ import { PocketButton } from "../../components/pocket";
 import { ConfigSnackbar, ConfirmDialog, LoadState, SaveBar, useLeaveGuard } from "../../components/configParts";
 import { chars, loadPrompts, resetPrompt, savePrompt, useAssistantConfig, useConfigWatch } from "../../lib/assistantConfig";
 import { relTime } from "../../lib/format";
+import { useKeyboardState } from "../../lib/useKeyboardState";
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
 
@@ -67,17 +68,8 @@ function PromptEditor({ prompt }: { prompt: PromptView }) {
   const [busy, setBusy] = useState<"save" | "reset" | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [askReset, setAskReset] = useState(false);
-  const [keyboard, setKeyboard] = useState(false);
+  const { keyboardOpen: keyboard } = useKeyboardState();
   const [focused, setFocused] = useState(false);
-
-  useEffect(() => {
-    const show = Keyboard.addListener("keyboardDidShow", () => setKeyboard(true));
-    const hide = Keyboard.addListener("keyboardDidHide", () => setKeyboard(false));
-    return () => {
-      show.remove();
-      hide.remove();
-    };
-  }, []);
 
   // A new saved text (another phone's save): follow it quietly when nothing is being changed here, else say so.
   if (prompt.text !== seen) {

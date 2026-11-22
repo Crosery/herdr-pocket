@@ -24,6 +24,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space, type Palette } from "../theme/tokens";
+import { horizontalPad } from "../lib/layoutMetrics";
+import { useKeyboardState } from "../lib/useKeyboardState";
 import { CuteIcon } from "./icons";
 import { IconTile } from "./ui";
 
@@ -251,6 +253,7 @@ export function PocketSegmented<T extends string>({
             hitSlop={{ top: 3, bottom: 3 }}
             style={({ pressed }) => ({
               flex: 1,
+              minWidth: 0,
               flexDirection: "row",
               alignItems: "center",
               justifyContent: "center",
@@ -263,7 +266,7 @@ export function PocketSegmented<T extends string>({
             })}
           >
             {s.icon ? <MaterialCommunityIcons name={s.icon} size={16} color={on ? p.accentText : p.muted} /> : null}
-            <Text numberOfLines={1} style={{ color: on ? p.accentText : p.muted, fontFamily: fonts.bodyBold, fontSize: compact ? 13 : 13.5 }}>
+            <Text numberOfLines={1} style={{ flexShrink: 1, minWidth: 0, color: on ? p.accentText : p.muted, fontFamily: fonts.bodyBold, fontSize: compact ? 13 : 13.5 }}>
               {s.label}
             </Text>
           </Pressable>
@@ -302,6 +305,10 @@ export function PocketSheet({
 }) {
   const p = usePalette();
   const insets = useSafeAreaInsets();
+  const { keyboardOpen } = useKeyboardState();
+  const padLeft = horizontalPad(space.lg, insets.left);
+  const padRight = horizontalPad(space.lg, insets.right);
+  const closedBottom = keyboardOpen ? 0 : insets.bottom;
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onDismiss} statusBarTranslucent navigationBarTranslucent>
       <KeyboardAvoidingView behavior="padding" style={{ flex: 1, justifyContent: "flex-end" }}>
@@ -310,9 +317,9 @@ export function PocketSheet({
           <View style={{ alignItems: "center", paddingTop: space.sm }}>
             <View style={{ width: 40, height: 5, borderRadius: 3, backgroundColor: p.dark ? p.surface3 : "#EBD9E3" }} />
           </View>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingLeft: space.lg, paddingRight: space.md, paddingTop: space.sm, paddingBottom: space.xs }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingLeft: padLeft, paddingRight: horizontalPad(space.md, insets.right), paddingTop: space.sm, paddingBottom: space.xs }}>
             {lead}
-            <View style={{ flex: 1, gap: 2 }}>
+            <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
               <Text accessibilityRole="header" numberOfLines={1} style={{ fontFamily: fonts.cute, fontSize: 22, lineHeight: 30, color: p.ink }}>
                 {title}
               </Text>
@@ -325,14 +332,14 @@ export function PocketSheet({
             <IconTile icon="close" tone="plain" size={40} onPress={onDismiss} a11y="关闭" />
           </View>
           {scroll ? (
-            <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: space.lg, gap: space.lg, paddingBottom: footer ? space.lg : insets.bottom + space.lg }}>
+            <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingTop: space.lg, paddingLeft: padLeft, paddingRight: padRight, gap: space.lg, paddingBottom: footer ? space.lg : closedBottom + space.lg }}>
               {children}
             </ScrollView>
           ) : (
-            <View style={{ paddingBottom: footer ? 0 : insets.bottom }}>{children}</View>
+            <View style={{ paddingBottom: footer ? 0 : closedBottom }}>{children}</View>
           )}
           {footer ? (
-            <View style={{ paddingHorizontal: space.lg, paddingTop: space.sm, paddingBottom: insets.bottom + space.md, gap: space.xs, borderTopWidth: 1, borderTopColor: p.divider }}>{footer}</View>
+            <View style={{ paddingLeft: padLeft, paddingRight: padRight, paddingTop: space.sm, paddingBottom: closedBottom + space.md, gap: space.xs, borderTopWidth: 1, borderTopColor: p.divider }}>{footer}</View>
           ) : null}
         </View>
       </KeyboardAvoidingView>

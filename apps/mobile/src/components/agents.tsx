@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { Pressable, View } from "react-native";
 import { Text } from "react-native-paper";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { router } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { Agent, AgentStatus } from "@herdr-pocket/protocol";
@@ -8,6 +9,7 @@ import { usePalette } from "../theme/theme";
 import { agentStatusLabel, fonts, radius, space, spaceColors, statusColors } from "../theme/tokens";
 import { agentSpace, agentTitle, relTime, stableHash } from "../lib/format";
 import { harnessLook } from "../lib/harness";
+import { horizontalPad } from "../lib/layoutMetrics";
 import { Card, HarnessAvatar, StatusPill } from "./ui";
 import { useLive, type LinkStatus } from "../lib/store";
 import { signOut } from "../lib/session";
@@ -103,18 +105,18 @@ export const AgentRow = memo(function AgentRow({ agent, offline, deviceName, pla
       }}
     >
       <HarnessAvatar harness={agent.harness} isShell={agent.isShell} dim={offline} size={48} />
-      <View style={{ flex: 1, gap: 3 }}>
+      <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
         <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 16, color: offline ? p.muted : p.ink }}>
           {title}
         </Text>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-          <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 13, color: offline ? p.faint : p.muted }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, minWidth: 0 }}>
+          <Text numberOfLines={1} style={{ flexShrink: 1, minWidth: 0, fontSize: 13, color: offline ? p.faint : p.muted }}>
             {sub}
           </Text>
           {agent.subagents ? (
             <View
               accessibilityLabel={`${agent.subagents} 个子 agent${agent.subagentsWorking ? `，${agent.subagentsWorking} 个在忙` : ""}`}
-              style={{ flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: p.lavenderContainer, borderRadius: radius.pill, paddingHorizontal: 7, paddingVertical: 1 }}
+              style={{ flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: p.lavenderContainer, borderRadius: radius.pill, paddingHorizontal: 7, paddingVertical: 1 }}
             >
               {agent.subagentsWorking ? <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: statusColors("working", p.dark).fg }} /> : null}
               <Text style={{ color: p.ink, fontFamily: fonts.bodySemi, fontSize: 11.5 }}>子 agent {agent.subagents}</Text>
@@ -123,7 +125,7 @@ export const AgentRow = memo(function AgentRow({ agent, offline, deviceName, pla
           {offline ? null : <QueuedChip agent={agent} />}
         </View>
       </View>
-      <View style={{ alignItems: "flex-end", gap: 6 }}>
+      <View style={{ alignItems: "flex-end", flexShrink: 0, gap: 6 }}>
         {offline ? (
           <View style={{ backgroundColor: p.surface3, borderRadius: radius.pill, paddingHorizontal: 9, paddingVertical: 3 }}>
             <Text style={{ color: p.muted, fontFamily: fonts.bodyBold, fontSize: 12 }}>离线</Text>
@@ -191,6 +193,7 @@ const LINK_COPY: Record<LinkStatus, { text: string; icon: "wifi-off" | "sync" | 
 
 export function ConnectionBanner() {
   const p = usePalette();
+  const insets = useSafeAreaInsets();
   const link = useLive((s) => s.link);
   const copy = LINK_COPY[link];
   if (!copy) return null;
@@ -209,7 +212,8 @@ export function ConnectionBanner() {
         flexDirection: "row",
         alignItems: "center",
         gap: space.sm,
-        marginHorizontal: space.lg,
+        marginLeft: horizontalPad(space.lg, insets.left),
+        marginRight: horizontalPad(space.lg, insets.right),
         marginBottom: space.sm,
         paddingHorizontal: space.lg,
         paddingVertical: space.sm,

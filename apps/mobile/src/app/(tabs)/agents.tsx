@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { Pressable, RefreshControl, View, type NativeScrollEvent, type NativeSyntheticEvent } from "react-native";
+import { Pressable, RefreshControl, useWindowDimensions, View, type NativeScrollEvent, type NativeSyntheticEvent } from "react-native";
 import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useIsFocused, useLocalSearchParams, useNavigation, router } from "expo-router";
@@ -18,6 +18,7 @@ import { Sidebar, useSidebar } from "../../components/Sidebar";
 import { CreateAgentSheet, type CreateTarget } from "../../components/CreateAgentSheet";
 import { allAgents, useLive, useSettings } from "../../lib/store";
 import { agentSpace, agentTitle, greeting } from "../../lib/format";
+import { horizontalPad } from "../../lib/layoutMetrics";
 import { call, pingNow } from "../../lib/relay";
 import { usePalette } from "../../theme/theme";
 import { agentStatusLabel, fonts, radius, space, statusColors } from "../../theme/tokens";
@@ -77,13 +78,15 @@ function useMinute(active: boolean): number {
 /** One compact row of three counts (需要你 / 工作中 / 已完成); tap one to filter. */
 function StatRow({ counts, active, onPick }: { counts: Record<AgentStatus, number>; active: AgentStatus | null; onPick: (s: AgentStatus | null) => void }) {
   const p = usePalette();
+  const { width } = useWindowDimensions();
+  const narrow = width < 390;
   const items: { s: AgentStatus; label: string }[] = [
     { s: "blocked", label: "需要你" },
     { s: "working", label: "工作中" },
     { s: "done", label: "已完成" },
   ];
   return (
-    <View style={{ flexDirection: "row", gap: space.sm }}>
+    <View style={{ flexDirection: "row", gap: width < 360 ? 6 : space.sm }}>
       {items.map(({ s, label }) => {
         const c = statusColors(s, p.dark);
         const on = active === s;
@@ -96,8 +99,9 @@ function StatRow({ counts, active, onPick }: { counts: Record<AgentStatus, numbe
             onPress={() => onPick(on ? null : s)}
             style={({ pressed }) => ({
               flex: 1,
+              minWidth: 0,
               minHeight: 64,
-              paddingHorizontal: space.md,
+              paddingHorizontal: narrow ? 9 : space.md,
               paddingVertical: space.sm,
               borderRadius: radius.card,
               backgroundColor: c.bg,
@@ -110,13 +114,13 @@ function StatRow({ counts, active, onPick }: { counts: Record<AgentStatus, numbe
               transform: [{ scale: pressed ? 0.97 : 1 }],
             })}
           >
-            <View style={{ gap: 2, flexShrink: 1 }}>
+            <View style={{ gap: 2, flexShrink: 1, minWidth: 0 }}>
               <CuteIcon name={s === "blocked" ? "blocked" : s === "working" ? "working" : "done"} size={17} color={c.fg} fill={p.dark ? "transparent" : "#FFFFFF"} strokeWidth={2.3} />
-              <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 12.5, color: c.fg }}>
+              <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: narrow ? 12 : 12.5, color: c.fg }}>
                 {label}
               </Text>
             </View>
-            <Text style={{ fontFamily: fonts.cute, fontSize: 28, lineHeight: 34, color: c.fg }}>{counts[s]}</Text>
+            <Text style={{ flexShrink: 0, fontFamily: fonts.cute, fontSize: narrow ? 24 : 28, lineHeight: narrow ? 30 : 34, color: c.fg }}>{counts[s]}</Text>
           </Pressable>
         );
       })}
@@ -406,20 +410,20 @@ export default function AgentsHub() {
               accessibilityState={canFold ? { expanded: !g.folded } : undefined}
               accessibilityLabel={`空间 ${name}，${g.total} 个${summary ? `，${summary}` : ""}${canFold ? `，点按${g.folded ? "展开" : "收起"}` : ""}`}
               onPress={() => toggleFold(g.fold)}
-              style={({ pressed }) => ({ flex: 1, flexDirection: "row", alignItems: "center", gap: space.sm, minHeight: 44, paddingHorizontal: space.xs, borderRadius: radius.card, backgroundColor: pressed ? p.surface3 : "transparent", opacity: g.offline ? 0.7 : 1 })}
+              style={({ pressed }) => ({ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: space.sm, minHeight: 44, paddingHorizontal: space.xs, borderRadius: radius.card, backgroundColor: pressed ? p.surface3 : "transparent", opacity: g.offline ? 0.7 : 1 })}
             >
               {g.space ? <SpaceBadge name={g.space} size={24} /> : <CuteIcon name="terminal" size={20} color={p.muted} />}
-              <Text numberOfLines={1} style={{ flexShrink: 1, fontFamily: fonts.bodyBold, color: p.ink, fontSize: 15 }}>
+              <Text numberOfLines={1} style={{ flexShrink: 1, minWidth: 0, fontFamily: fonts.bodyBold, color: p.ink, fontSize: 15 }}>
                 {name}
               </Text>
               <Text style={{ color: p.faint, fontFamily: fonts.bodyBold, fontSize: 13 }}>{g.total}</Text>
-              <View style={{ flex: 1 }}>
+              <View style={{ flex: 1, minWidth: 0 }}>
                 <StatusDots counts={g.counts} />
               </View>
               {canFold ? <CuteIcon name={g.folded ? "chevronRight" : "chevronDown"} size={18} color={p.faint} /> : null}
             </Pressable>
             {g.offline ? null : (
-              <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+              <View style={{ flexShrink: 0, flexDirection: "row", alignItems: "center", gap: space.xs }}>
                 {g.space ? (
                   <Pressable
                     accessibilityRole="button"
@@ -470,8 +474,8 @@ export default function AgentsHub() {
       {/* Raised so the mascot's speech bubble draws over the stat cards below. */}
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, zIndex: 5, elevation: 5 }}>
         <IconTile icon="menu" tone="plain" size={44} onPress={sidebar.show} a11y="打开侧栏：电脑和空间" />
-        <View style={{ flex: 1, gap: 2 }}>
-          <Text style={{ fontFamily: fonts.cute, fontSize: 24, lineHeight: 32, color: p.ink }}>{greeting()}</Text>
+        <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+          <Text numberOfLines={1} style={{ fontFamily: fonts.cute, fontSize: 24, lineHeight: 32, color: p.ink }}>{greeting()}</Text>
           <Text numberOfLines={1} style={{ color: p.muted, fontSize: 13.5 }}>
             {headline}
           </Text>
@@ -551,6 +555,9 @@ export default function AgentsHub() {
       ]
     : [];
 
+  const padLeft = horizontalPad(space.lg, insets.left);
+  const padRight = horizontalPad(space.lg, insets.right);
+
   return (
     <PageBackground>
       <View style={{ paddingTop: insets.top + space.sm }}>
@@ -567,13 +574,13 @@ export default function AgentsHub() {
         drawDistance={500}
         onScroll={onScroll}
         scrollEventThrottle={64}
-        contentContainerStyle={{ paddingHorizontal: space.lg, paddingBottom: FAB + space.lg * 2, paddingTop: space.sm }}
+        contentContainerStyle={{ paddingLeft: padLeft, paddingRight: padRight, paddingBottom: FAB + space.lg * 2, paddingTop: space.sm }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[p.primary]} />}
         keyboardShouldPersistTaps="handled"
       />
 
       {/* One "新建" in the thumb zone, bottom right; it opens on the computer and space being viewed. */}
-      <Animated.View pointerEvents={fabHidden ? "none" : "auto"} style={[{ position: "absolute", right: space.lg, bottom: space.lg }, fabStyle]}>
+      <Animated.View pointerEvents={fabHidden ? "none" : "auto"} style={[{ position: "absolute", right: padRight, bottom: space.lg }, fabStyle]}>
         <Pressable
           accessibilityRole="button"
           accessibilityElementsHidden={fabHidden}

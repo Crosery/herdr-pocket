@@ -1,21 +1,22 @@
 import { useEffect } from "react";
-import { Platform, View } from "react-native";
-import { router, Stack } from "expo-router";
+import { Platform } from "react-native";
+import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as SplashScreen from "expo-splash-screen";
 import { useFonts } from "expo-font";
 import { Nunito_400Regular, Nunito_600SemiBold, Nunito_700Bold } from "@expo-google-fonts/nunito";
 import { ZCOOLKuaiLe_400Regular } from "@expo-google-fonts/zcool-kuaile";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ThemeRoot, usePalette } from "../theme/theme";
-import { useSettings } from "../lib/store";
+import { useAppToast, useSettings } from "../lib/store";
 import { loadToken } from "../lib/auth";
 import { startLink, stopLink } from "../lib/relay";
 import { isMockServer } from "../lib/mock";
 import { startAppLog } from "../lib/applog";
 import { fonts } from "../theme/tokens";
 import { useAlertSync } from "../lib/alerts";
-import { IconTile } from "../components/ui";
+import { PocketStackHeader, PocketToast } from "../components/ui";
 import { useHarnessIconSync } from "../lib/harnessRemote";
 import { syncNativeVoice } from "../lib/voice";
 import { ensureMobileQueueWatcher } from "../lib/chatQueue";
@@ -51,6 +52,12 @@ function useRelayLink() {
 
 function Navigator() {
   const p = usePalette();
+  const insets = useSafeAreaInsets();
+  const toastId = useAppToast((s) => s.id);
+  const toastMessage = useAppToast((s) => s.message);
+  const toastTone = useAppToast((s) => s.tone);
+  const toastDuration = useAppToast((s) => s.duration);
+  const dismissToast = useAppToast((s) => s.dismiss);
   useRelayLink();
   useAlertSync();
   useHarnessIconSync();
@@ -64,23 +71,11 @@ function Navigator() {
         screenOptions={{
           headerShadowVisible: false,
           headerTransparent: false,
-          headerStyle: { backgroundColor: p.pageTop },
-          headerTintColor: p.ink,
-          headerTitleStyle: { fontFamily: fonts.cute, color: p.ink, fontSize: 18 },
-          headerBackButtonDisplayMode: "minimal",
-          // The app's own back button instead of the system arrow.
-          headerLeft: ({ canGoBack }) =>
-            canGoBack ? (
-              <View style={{ marginRight: 10 }}>
-                <IconTile icon="back" tone="plain" size={40} onPress={() => router.back()} a11y="返回" />
-              </View>
-            ) : null,
+          header: (props) => <PocketStackHeader {...props} />,
           contentStyle: { backgroundColor: p.page },
-          // iOS takes the status bar from each screen, not from <StatusBar>: without these a page with a
-          // header follows the navigation theme (light) and one without follows the system, not the app's theme.
-          ...(Platform.OS === "ios"
-            ? { statusBarStyle: p.dark ? "light" : "dark", headerUserInterfaceStyle: p.dark ? "dark" : "light" }
-            : null),
+          // iOS takes the status bar from each screen, not from <StatusBar>: without this a page
+          // follows the system appearance instead of the app's own theme.
+          ...(Platform.OS === "ios" ? { statusBarStyle: p.dark ? "light" : "dark" } : null),
         }}
       >
         {/* Paused while an agent or another screen covers it: snapshots render it later, its animations stop. */}
@@ -93,6 +88,15 @@ function Navigator() {
         <Stack.Screen name="agent/[key]" options={{ title: "" }} />
         <Stack.Screen name="assistant" options={{ headerShown: false, animation: "none" }} />
       </Stack>
+      <PocketToast
+        key={toastId}
+        visible={!!toastMessage}
+        message={toastMessage}
+        tone={toastTone}
+        duration={toastDuration}
+        bottom={Math.max(86, insets.bottom + 72)}
+        onDismiss={dismissToast}
+      />
     </>
   );
 }

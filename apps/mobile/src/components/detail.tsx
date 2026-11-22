@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from "react";
-import { Image, Pressable, ScrollView, TextInput as RNTextInput, View, type TextStyle } from "react-native";
+import { Image, Pressable, ScrollView, TextInput as RNTextInput, useWindowDimensions, View, type TextStyle } from "react-native";
 import { Text } from "react-native-paper";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -115,6 +116,8 @@ function mobileSlashGlyph(kind: SlashIconKind): keyof typeof MaterialCommunityIc
 }
 import { usePalette } from "../theme/theme";
 import { agentStatusLabel, fonts, radius, space, statusColors } from "../theme/tokens";
+import { computeComposerBarMetrics, computePopupMaxHeight, horizontalPad } from "../lib/layoutMetrics";
+import { useKeyboardState } from "../lib/useKeyboardState";
 import { TermKeyboard } from "./TermKeyboard";
 import { EmptyState, IconTile, PocketToast, SendPill } from "./ui";
 import { PocketButton, PocketCheck, PocketDialog, PocketProgress, PocketSpinner, RowAction, type PocketIcon } from "./pocket";
@@ -268,6 +271,8 @@ type LiveState = "connecting" | "live" | "stale" | "error";
 
 export function TerminalView({ agent, active }: { agent: Agent; active: boolean }) {
   const p = usePalette();
+  const insets = useSafeAreaInsets();
+  const { width: winWidth } = useWindowDimensions();
   const scroller = useRef<ComponentRef<typeof ScrollView>>(null);
   const [follow, setFollow] = useState(true);
   const [copied, setCopied] = useState(false);
@@ -408,9 +413,12 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
     );
   }
   const empty = view.rows.length === 0;
+  const termBaseMargin = winWidth < 360 ? 10 : winWidth < 380 ? 12 : space.lg;
+  const termMarginL = horizontalPad(termBaseMargin, insets.left);
+  const termMarginR = horizontalPad(termBaseMargin, insets.right);
   return (
     <View
-      style={{ flex: 1, marginHorizontal: space.lg, marginTop: space.md, marginBottom: space.sm, borderRadius: radius.card, backgroundColor: TERM_BG, overflow: "hidden" }}
+      style={{ flex: 1, marginLeft: termMarginL, marginRight: termMarginR, marginTop: space.md, marginBottom: space.sm, borderRadius: radius.card, backgroundColor: TERM_BG, overflow: "hidden" }}
       onTouchStart={(e) => {
         const t = e.nativeEvent.touches;
         if (t.length === 2) pinch.current = { d: Math.hypot(t[0]!.pageX - t[1]!.pageX, t[0]!.pageY - t[1]!.pageY), size: fontSize };
@@ -430,42 +438,44 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
       }}
     >
       {probe}
-      <View style={{ flexDirection: "row", alignItems: "center", paddingLeft: space.lg, paddingRight: space.xs, minHeight: 44, backgroundColor: "#211B2C" }}>
-        <Text style={{ flex: 1, fontFamily: fonts.mono, fontSize: 12, color: "#CFC5DA" }} numberOfLines={1}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 6, paddingLeft: winWidth < 360 ? space.md : space.lg, paddingRight: space.xs, minHeight: 44, backgroundColor: "#211B2C" }}>
+        <Text style={{ flex: 1, minWidth: 0, fontFamily: fonts.mono, fontSize: 12, color: "#CFC5DA" }} numberOfLines={1}>
           {agent.localId} · {agent.where ?? agent.harness}
           {view.cols ? `  ${view.cols}×${view.height ?? view.rows.length}` : ""}
         </Text>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginRight: 4 }}>
-          <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: shown === "live" ? "#5ED6A7" : shown === "stale" ? "#F0B85A" : "#E9819E" }} />
-          <Text style={{ color: "#CFC5DA", fontSize: 10 }}>{shown === "live" ? "实时" : shown === "stale" ? "重连中" : shown === "connecting" ? "连接中" : "轮询"}</Text>
+        <View style={{ flexShrink: 0, flexDirection: "row", alignItems: "center" }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginRight: 4 }}>
+            <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: shown === "live" ? "#5ED6A7" : shown === "stale" ? "#F0B85A" : "#E9819E" }} />
+            <Text style={{ color: "#CFC5DA", fontSize: 10 }}>{shown === "live" ? "实时" : shown === "stale" ? "重连中" : shown === "connecting" ? "连接中" : "轮询"}</Text>
+          </View>
+          {q.isFetching ? <PocketSpinner size={12} color="#CFC5DA" style={{ marginRight: 8 }} /> : null}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={mode === "fit" ? "切换到正常字号，可以左右滑动" : "切换到适应宽度"}
+            onPress={() => {
+              if (mode === "fit") {
+                setZoom(READ_SIZE);
+                setMode("read");
+              } else setMode("fit");
+            }}
+            style={({ pressed }) => ({ flexDirection: "row", alignItems: "center", gap: 4, minHeight: 36, paddingHorizontal: 10, borderRadius: radius.pill, backgroundColor: pressed ? "#3A3148" : "#2C2439" })}
+          >
+            <MaterialCommunityIcons name={mode === "fit" ? "arrow-expand-horizontal" : "format-size"} size={15} color="#EDE6F3" />
+            <Text style={{ color: "#EDE6F3", fontSize: 12, fontFamily: fonts.bodySemi }}>{mode === "fit" ? "适应宽度" : `${fontSize} 号字`}</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={copied ? "已复制" : "复制终端内容"}
+            onPress={async () => {
+              await Clipboard.setStringAsync(screen.plain());
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            }}
+            style={({ pressed }) => ({ width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? "#3A3148" : "transparent" })}
+          >
+            <MaterialCommunityIcons name={copied ? "check" : "content-copy"} size={18} color="#EDE6F3" />
+          </Pressable>
         </View>
-        {q.isFetching ? <PocketSpinner size={12} color="#CFC5DA" style={{ marginRight: 8 }} /> : null}
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={mode === "fit" ? "切换到正常字号，可以左右滑动" : "切换到适应宽度"}
-          onPress={() => {
-            if (mode === "fit") {
-              setZoom(READ_SIZE);
-              setMode("read");
-            } else setMode("fit");
-          }}
-          style={({ pressed }) => ({ flexDirection: "row", alignItems: "center", gap: 4, minHeight: 36, paddingHorizontal: 10, borderRadius: radius.pill, backgroundColor: pressed ? "#3A3148" : "#2C2439" })}
-        >
-          <MaterialCommunityIcons name={mode === "fit" ? "arrow-expand-horizontal" : "format-size"} size={15} color="#EDE6F3" />
-          <Text style={{ color: "#EDE6F3", fontSize: 12, fontFamily: fonts.bodySemi }}>{mode === "fit" ? "适应宽度" : `${fontSize} 号字`}</Text>
-        </Pressable>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={copied ? "已复制" : "复制终端内容"}
-          onPress={async () => {
-            await Clipboard.setStringAsync(screen.plain());
-            setCopied(true);
-            setTimeout(() => setCopied(false), 1500);
-          }}
-          style={({ pressed }) => ({ width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? "#3A3148" : "transparent" })}
-        >
-          <MaterialCommunityIcons name={copied ? "check" : "content-copy"} size={18} color="#EDE6F3" />
-        </Pressable>
       </View>
       <ScrollView
         ref={scroller}
@@ -535,6 +545,8 @@ function WaitingCard({
   busy,
   compact,
   onOpenTerminal,
+  marginLeft = space.lg,
+  marginRight = space.lg,
 }: {
   agent: Agent;
   onKey: (key: string) => void;
@@ -542,6 +554,8 @@ function WaitingCard({
   busy: boolean;
   compact: boolean;
   onOpenTerminal?: () => void;
+  marginLeft?: number;
+  marginRight?: number;
 }) {
   const p = usePalette();
   const c = statusColors("blocked", p.dark);
@@ -550,33 +564,33 @@ function WaitingCard({
   if (agent.errored) {
     // Stopped on an error, not on a question: y / n mean nothing to it.
     return (
-      <View accessibilityLiveRegion="polite" style={{ marginHorizontal: space.lg, marginBottom: space.sm, backgroundColor: c.bg, borderRadius: radius.card, padding: space.md, gap: space.sm }}>
+      <View accessibilityLiveRegion="polite" style={{ marginLeft, marginRight, marginBottom: space.sm, backgroundColor: c.bg, borderRadius: radius.card, padding: space.md, gap: space.sm }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
           <MaterialCommunityIcons name="alert-circle-outline" size={18} color={c.fg} />
-          <Text style={{ flex: 1, fontFamily: fonts.cute, fontSize: 16, color: c.fg }}>它出错停下了</Text>
+          <Text style={{ flex: 1, minWidth: 0, fontFamily: fonts.cute, fontSize: 16, color: c.fg }}>它出错停下了</Text>
         </View>
         {agent.statusNote ? (
           <Text selectable numberOfLines={compact ? 2 : 6} style={{ fontFamily: fonts.body, fontSize: 13, lineHeight: 19, color: p.ink }}>
             {agent.statusNote}
           </Text>
         ) : null}
-        <View style={{ flexDirection: "row", gap: space.sm }}>
+        <View style={{ flexDirection: "row", gap: 6 }}>
           <Pressable
             disabled={busy}
             onPress={onRetry}
             accessibilityRole="button"
             accessibilityLabel="让它继续：发送“继续”"
-            style={({ pressed }) => ({ flex: 1, minHeight: 40, borderRadius: radius.pill, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.accentText : p.primary, opacity: busy ? 0.5 : 1 })}
+            style={({ pressed }) => ({ flex: 1, minWidth: 0, minHeight: 40, paddingHorizontal: 6, borderRadius: radius.pill, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.accentText : p.primary, opacity: busy ? 0.5 : 1 })}
           >
-            <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.onPrimary }}>让它继续</Text>
+            <Text numberOfLines={1} style={{ flexShrink: 1, fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.onPrimary }}>让它继续</Text>
           </Pressable>
           {!compact && onOpenTerminal ? (
             <Pressable
               onPress={onOpenTerminal}
               accessibilityRole="button"
-              style={({ pressed }) => ({ flex: 1, minHeight: 40, borderRadius: radius.pill, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : p.surface })}
+              style={({ pressed }) => ({ flex: 1, minWidth: 0, minHeight: 40, paddingHorizontal: 6, borderRadius: radius.pill, alignItems: "center", justifyContent: "center", backgroundColor: pressed ? p.surface3 : p.surface })}
             >
-              <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.ink }}>看终端</Text>
+              <Text numberOfLines={1} style={{ flexShrink: 1, fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.ink }}>看终端</Text>
             </Pressable>
           ) : null}
         </View>
@@ -603,7 +617,7 @@ function WaitingCard({
       })}
     >
       <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13, color: o.selected ? p.onPrimary : c.fg, minWidth: 14 }}>{o.key}</Text>
-      <Text numberOfLines={2} style={{ flex: 1, fontFamily: fonts.bodySemi, fontSize: 13.5, color: o.selected ? p.onPrimary : p.ink }}>
+      <Text numberOfLines={2} style={{ flex: 1, minWidth: 0, fontFamily: fonts.bodySemi, fontSize: 13.5, color: o.selected ? p.onPrimary : p.ink }}>
         {o.label}
       </Text>
     </Pressable>
@@ -617,7 +631,9 @@ function WaitingCard({
       accessibilityLabel={a11y}
       style={({ pressed }) => ({
         flex: 1,
+        minWidth: 0,
         minHeight: 40,
+        paddingHorizontal: 6,
         borderRadius: radius.pill,
         alignItems: "center",
         justifyContent: "center",
@@ -625,16 +641,16 @@ function WaitingCard({
         opacity: busy ? 0.5 : 1,
       })}
     >
-      <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: primary ? p.onPrimary : p.ink }}>{label}</Text>
+      <Text numberOfLines={1} style={{ flexShrink: 1, fontFamily: fonts.bodyBold, fontSize: 13, color: primary ? p.onPrimary : p.ink }}>{label}</Text>
     </Pressable>
   );
   return (
-    <View accessibilityLiveRegion="polite" style={{ marginHorizontal: space.lg, marginBottom: space.sm, backgroundColor: c.bg, borderRadius: radius.card, padding: space.md, gap: space.sm }}>
+    <View accessibilityLiveRegion="polite" style={{ marginLeft, marginRight, marginBottom: space.sm, backgroundColor: c.bg, borderRadius: radius.card, padding: space.md, gap: space.sm }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
         <MaterialCommunityIcons name="hand-wave-outline" size={18} color={c.fg} />
-        <Text style={{ flex: 1, fontFamily: fonts.cute, fontSize: 16, color: c.fg }}>它在等你回复</Text>
+        <Text style={{ flex: 1, minWidth: 0, fontFamily: fonts.cute, fontSize: 16, color: c.fg }}>它在等你回复</Text>
         {!compact && onOpenTerminal ? (
-          <Pressable hitSlop={8} accessibilityRole="button" onPress={onOpenTerminal}>
+          <Pressable hitSlop={8} accessibilityRole="button" onPress={onOpenTerminal} style={{ flexShrink: 0 }}>
             <Text style={{ color: c.fg, fontFamily: fonts.bodySemi, fontSize: 12.5 }}>看终端</Text>
           </Pressable>
         ) : null}
@@ -656,13 +672,13 @@ function WaitingCard({
       {choices.length ? (
         <View style={{ gap: 6 }}>
           {choices.slice(0, compact ? 4 : 9).map(choice)}
-          <View style={{ flexDirection: "row", gap: space.sm }}>
+          <View style={{ flexDirection: "row", gap: 6 }}>
             {answer("回车", "enter", "按回车选高亮的那项")}
             {answer("Esc", "esc", "按 Esc 取消")}
           </View>
         </View>
       ) : (
-        <View style={{ flexDirection: "row", gap: space.sm }}>
+        <View style={{ flexDirection: "row", gap: 6 }}>
           {answer("是 y", "y", `同意，发送 y 给 ${agent.harness}`, true)}
           {answer("否 n", "n", "拒绝，发送 n")}
           {answer("回车", "enter", "按回车确认当前选项")}
@@ -810,6 +826,9 @@ export function Composer({
 }) {
   const p = usePalette();
   const qc = useQueryClient();
+  const insets = useSafeAreaInsets();
+  const { width, height } = useWindowDimensions();
+  const { keyboardOpen, keyboardHeight } = useKeyboardState();
   const [text, setTextState] = useState(() => getMobileDraft(agent.key).text);
   /** Pictures to go with the next message (chat only). */
   const [pictures, setPicturesState] = useState<Attachment[]>(() => getMobileDraft(agent.key).pictures);
@@ -1652,29 +1671,34 @@ export function Composer({
     setPad(true);
   }
 
+  const metrics = computeComposerBarMetrics(width, textScale);
+  const popupMaxHeight = computePopupMaxHeight(height, keyboardHeight);
+  const padLeft = horizontalPad(metrics.outerMargin, insets.left);
+  const padRight = horizontalPad(metrics.outerMargin, insets.right);
+
   return (
-    <View style={{ paddingBottom: bottomInset + space.sm, paddingTop: space.xs }}>
+    <View style={{ paddingBottom: (keyboardOpen ? 0 : bottomInset) + space.xs, paddingTop: space.xs }}>
       {mode === "terminal" && !boxOnly ? direct.input : null}
       {mode === "terminal" && direct.on ? (
-        <View accessibilityLiveRegion="polite" style={{ marginHorizontal: space.lg, marginBottom: space.xs, paddingLeft: space.md, paddingRight: 4, minHeight: 32, borderRadius: radius.pill, backgroundColor: p.accentContainer, flexDirection: "row", alignItems: "center", gap: 6 }}>
+        <View accessibilityLiveRegion="polite" style={{ marginLeft: padLeft, marginRight: padRight, marginBottom: space.xs, paddingLeft: space.md, paddingRight: 4, minHeight: 32, borderRadius: radius.pill, backgroundColor: p.accentContainer, flexDirection: "row", alignItems: "center", gap: 6 }}>
           <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: p.primary }} />
-          <Text style={{ color: p.accentText, fontSize: 12.5, flex: 1 }} numberOfLines={1}>
+          <Text style={{ color: p.accentText, fontSize: 12.5, flex: 1, minWidth: 0 }} numberOfLines={1}>
             直接输入中，打的字会马上出现在终端里
           </Text>
           <Pressable
             accessibilityRole="button"
             accessibilityLabel="换回小键盘，占的地方更少"
             onPress={switchToPad}
-            style={({ pressed }) => ({ height: 26, paddingHorizontal: 10, borderRadius: radius.pill, justifyContent: "center", backgroundColor: pressed ? p.surface3 : p.surface })}
+            style={({ pressed }) => ({ flexShrink: 0, height: 26, paddingHorizontal: 10, borderRadius: radius.pill, justifyContent: "center", backgroundColor: pressed ? p.surface3 : p.surface })}
           >
             <Text style={{ fontFamily: fonts.bodySemi, fontSize: 12, color: p.accentText }}>小键盘</Text>
           </Pressable>
         </View>
       ) : null}
-      {agent.status === "blocked" && online ? <WaitingCard agent={agent} busy={sending} onKey={(k) => press(k)} onRetry={retry} compact={mode === "terminal"} onOpenTerminal={onOpenTerminal} /> : null}
+      {agent.status === "blocked" && online ? <WaitingCard agent={agent} busy={sending} onKey={(k) => press(k)} onRetry={retry} compact={mode === "terminal"} onOpenTerminal={onOpenTerminal} marginLeft={padLeft} marginRight={padRight} /> : null}
       {showKeys ? (
       <View style={{ flexDirection: "row", alignItems: "center" }}>
-      <ScrollView horizontal style={{ flex: 1 }} showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.sm, paddingLeft: space.lg, paddingRight: space.xs, paddingVertical: space.xs }} keyboardShouldPersistTaps="always">
+      <ScrollView horizontal style={{ flex: 1 }} showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.sm, paddingLeft: padLeft, paddingRight: space.xs, paddingVertical: space.xs }} keyboardShouldPersistTaps="always">
         {mode === "terminal" ? (
           <IconTile
             icon={(boxOnly ? extra : direct.on || padOpen) ? "keyboardDown" : "keyboard"}
@@ -1700,7 +1724,7 @@ export function Composer({
         ))}
 
       </ScrollView>
-        <View style={{ paddingRight: space.lg, paddingLeft: space.xs }}>
+        <View style={{ paddingRight: padRight, paddingLeft: space.xs }}>
         <Pressable
             disabled={!online}
             delayLongPress={500}
@@ -1720,7 +1744,8 @@ export function Composer({
           accessibilityLiveRegion="polite"
           accessibilityLabel={`排队中，共 ${totalQueued} 条`}
           style={{
-            marginHorizontal: space.lg,
+            marginLeft: padLeft,
+            marginRight: padRight,
             marginTop: space.xs,
             paddingHorizontal: space.md,
             paddingVertical: space.sm,
@@ -1732,14 +1757,14 @@ export function Composer({
           }}
         >
           <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-            <Text style={{ fontFamily: fonts.bodyBold, fontSize: 12, color: p.accentText }}>
+            <Text style={{ flexShrink: 0, fontFamily: fonts.bodyBold, fontSize: 12, color: p.accentText }}>
               {`排队中 · ${totalQueued} 条`}
             </Text>
-            <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: 11.5, color: p.faint }}>
+            <Text numberOfLines={1} style={{ flexShrink: 1, minWidth: 0, fontSize: 11.5, color: p.faint }}>
               {!online ? "电脑离线，上线后自动发" : agent.status === "blocked" ? "等待确认后继续" : "本轮结束后依次自动发"}
             </Text>
           </View>
-          <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false} style={{ maxHeight: 156 }} contentContainerStyle={{ gap: 5 }} keyboardShouldPersistTaps="always">
+          <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false} style={{ maxHeight: Math.min(156, popupMaxHeight) }} contentContainerStyle={{ gap: 5 }} keyboardShouldPersistTaps="always">
             {queued.map((q, idx) => (
               <View
                 key={q.id}
@@ -1756,7 +1781,7 @@ export function Composer({
                 <View style={{ minWidth: 20, height: 20, paddingHorizontal: 5, borderRadius: 10, backgroundColor: p.accentContainer, alignItems: "center", justifyContent: "center" }}>
                   <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11 }}>{idx + 1}</Text>
                 </View>
-                <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, color: p.ink }}>
+                <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontSize: 13, color: p.ink }}>
                   {q.text || "（仅图片）"}
                 </Text>
                 {q.pictures.length ? (
@@ -1845,7 +1870,7 @@ export function Composer({
                 <View style={{ paddingHorizontal: 6, height: 20, borderRadius: 10, backgroundColor: p.accentContainer, alignItems: "center", justifyContent: "center" }}>
                   <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 10.5 }}>终端</Text>
                 </View>
-                <Text numberOfLines={1} style={{ flex: 1, fontSize: 12.5, color: p.ink }}>
+                <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: p.ink }}>
                   {`终端输入区排队 · ${hostHeldCount} 条${agent.queuedText ? `：${agent.queuedText}` : ""}`}
                 </Text>
                 {agent.source === "hc" && online ? (
@@ -1875,10 +1900,10 @@ export function Composer({
         <View
           accessibilityLiveRegion="polite"
           accessibilityLabel={`排队中，${agent.queued} 条消息在它的输入框里，这一轮完了才会处理`}
-          style={{ marginHorizontal: space.lg, marginTop: space.xs, paddingHorizontal: space.md, minHeight: 30, borderRadius: radius.pill, backgroundColor: p.accentContainer, flexDirection: "row", alignItems: "center", gap: 6 }}
+          style={{ marginLeft: padLeft, marginRight: padRight, marginTop: space.xs, paddingHorizontal: space.md, minHeight: 30, borderRadius: radius.pill, backgroundColor: p.accentContainer, flexDirection: "row", alignItems: "center", gap: 6 }}
         >
           <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: p.primary }} />
-          <Text style={{ color: p.accentText, fontSize: 12.5, flex: 1 }} numberOfLines={1}>
+          <Text style={{ color: p.accentText, fontSize: 12.5, flex: 1, minWidth: 0 }} numberOfLines={1}>
             {`排队中 · ${agent.queued} 条在它输入框里，这一轮完了才会处理${agent.queuedText ? `：${agent.queuedText}` : ""}`}
           </Text>
         </View>
@@ -1888,7 +1913,7 @@ export function Composer({
       ) : null}
       {mode === "chat" && pictures.length ? (
         <View style={{ flexDirection: "row", alignItems: "center", marginTop: space.xs }}>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.md, paddingLeft: space.lg, paddingRight: space.sm, paddingTop: 8, paddingBottom: 2 }} keyboardShouldPersistTaps="always">
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.md, paddingLeft: padLeft, paddingRight: space.sm, paddingTop: 8, paddingBottom: 2 }} keyboardShouldPersistTaps="always">
             {pictures.map((x, i) => (
               <View key={x.id} style={{ width: 60, height: 60 }}>
                 <Image
@@ -1908,7 +1933,7 @@ export function Composer({
               </View>
             ))}
           </ScrollView>
-          <Text accessibilityLiveRegion="polite" style={{ color: p.muted, fontSize: 12, paddingRight: space.lg }}>
+          <Text accessibilityLiveRegion="polite" style={{ color: p.muted, fontSize: 12, paddingRight: padRight }}>
             {`${pictures.length}/${PUT_LIMITS.files}`}
           </Text>
         </View>
@@ -1923,7 +1948,8 @@ export function Composer({
           <View
             accessibilityLabel="旁路提问结果"
             style={{
-              marginHorizontal: space.lg,
+              marginLeft: padLeft,
+              marginRight: padRight,
               marginBottom: space.xs,
               padding: space.md,
               borderRadius: radius.card,
@@ -1934,86 +1960,94 @@ export function Composer({
             }}
           >
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-              <View
-                style={{
-                  width: 22,
-                  height: 22,
-                  borderRadius: 7,
-                  backgroundColor: p.accentContainer,
-                  alignItems: "center",
-                  justifyContent: "center",
-                }}
-              >
-                <MaterialCommunityIcons name="robot-outline" size={13} color={p.accentText} />
-              </View>
-              <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13, color: p.ink }}>
-                旁路提问 /btw
-              </Text>
-              {activeBtwCard.model ? (
+              <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }}>
                 <View
                   style={{
-                    maxWidth: 130,
-                    paddingHorizontal: 7,
-                    paddingVertical: 2,
-                    borderRadius: radius.pill,
-                    backgroundColor: p.lavenderContainer,
+                    width: 22,
+                    height: 22,
+                    flexShrink: 0,
+                    borderRadius: 7,
+                    backgroundColor: p.accentContainer,
+                    alignItems: "center",
+                    justifyContent: "center",
                   }}
                 >
-                  <Text
-                    numberOfLines={1}
-                    style={{ fontFamily: fonts.mono, fontSize: 10.5, color: p.onLavender }}
+                  <MaterialCommunityIcons name="robot-outline" size={13} color={p.accentText} />
+                </View>
+                <Text numberOfLines={1} style={{ flexShrink: 0, fontFamily: fonts.bodyBold, fontSize: 13, color: p.ink }}>
+                  旁路提问 /btw
+                </Text>
+                {activeBtwCard.model ? (
+                  <View
+                    style={{
+                      flexShrink: 1,
+                      minWidth: 0,
+                      maxWidth: 130,
+                      paddingHorizontal: 7,
+                      paddingVertical: 2,
+                      borderRadius: radius.pill,
+                      backgroundColor: p.lavenderContainer,
+                    }}
                   >
-                    {activeBtwCard.model}
-                  </Text>
-                </View>
-              ) : null}
-              {dur ? (
-                <View
-                  style={{
-                    paddingHorizontal: 6,
-                    paddingVertical: 2,
-                    borderRadius: radius.pill,
-                    backgroundColor: p.surface2,
-                    borderWidth: 1,
-                    borderColor: p.divider,
-                  }}
-                >
-                  <Text style={{ fontFamily: fonts.mono, fontSize: 10.5, color: p.muted }}>{dur}</Text>
-                </View>
-              ) : null}
-              <View style={{ flex: 1 }} />
-              {activeBtwCard.status === "done" && hasAnswer ? (
+                    <Text
+                      numberOfLines={1}
+                      ellipsizeMode="middle"
+                      style={{ flexShrink: 1, minWidth: 0, fontFamily: fonts.mono, fontSize: 10.5, color: p.onLavender }}
+                    >
+                      {activeBtwCard.model}
+                    </Text>
+                  </View>
+                ) : null}
+                {dur ? (
+                  <View
+                    style={{
+                      flexShrink: 0,
+                      paddingHorizontal: 6,
+                      paddingVertical: 2,
+                      borderRadius: radius.pill,
+                      backgroundColor: p.surface2,
+                      borderWidth: 1,
+                      borderColor: p.divider,
+                    }}
+                  >
+                    <Text style={{ fontFamily: fonts.mono, fontSize: 10.5, color: p.muted }}>{dur}</Text>
+                  </View>
+                ) : null}
+              </View>
+              <View style={{ flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 2 }}>
+                {activeBtwCard.status === "done" && hasAnswer ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="复制旁路回答"
+                    hitSlop={8}
+                    style={{ padding: 4 }}
+                    onPress={async () => {
+                      const content = activeBtwCard.answer?.trim();
+                      if (!content) return;
+                      await Clipboard.setStringAsync(content);
+                      setBtwCopiedId(activeBtwCard.id);
+                      setTimeout(() => {
+                        setBtwCopiedId((cur) => (cur === activeBtwCard.id ? null : cur));
+                      }, 1500);
+                    }}
+                  >
+                    <MaterialCommunityIcons
+                      name={btwCopiedId === activeBtwCard.id ? "check" : "content-copy"}
+                      size={15}
+                      color={btwCopiedId === activeBtwCard.id ? p.accentText : p.muted}
+                    />
+                  </Pressable>
+                ) : null}
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel="复制旁路回答"
+                  accessibilityLabel="关闭旁路卡片"
                   hitSlop={8}
                   style={{ padding: 4 }}
-                  onPress={async () => {
-                    const content = activeBtwCard.answer?.trim();
-                    if (!content) return;
-                    await Clipboard.setStringAsync(content);
-                    setBtwCopiedId(activeBtwCard.id);
-                    setTimeout(() => {
-                      setBtwCopiedId((cur) => (cur === activeBtwCard.id ? null : cur));
-                    }, 1500);
-                  }}
+                  onPress={() => dismissBtwCard(agent.key)}
                 >
-                  <MaterialCommunityIcons
-                    name={btwCopiedId === activeBtwCard.id ? "check" : "content-copy"}
-                    size={15}
-                    color={btwCopiedId === activeBtwCard.id ? p.accentText : p.muted}
-                  />
+                  <MaterialCommunityIcons name="close" size={16} color={p.muted} />
                 </Pressable>
-              ) : null}
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="关闭旁路卡片"
-                hitSlop={8}
-                style={{ padding: 4 }}
-                onPress={() => dismissBtwCard(agent.key)}
-              >
-                <MaterialCommunityIcons name="close" size={16} color={p.muted} />
-              </Pressable>
+              </View>
             </View>
 
             <View
@@ -2032,13 +2066,13 @@ export function Composer({
               </Text>
               <Text
                 selectable
-                style={{ flex: 1, fontFamily: fonts.bodySemi, fontSize: 12.5, lineHeight: 18, color: p.ink }}
+                style={{ flex: 1, minWidth: 0, fontFamily: fonts.bodySemi, fontSize: 12.5, lineHeight: 18, color: p.ink }}
               >
                 {activeBtwCard.question}
               </Text>
             </View>
 
-            <ScrollView nestedScrollEnabled style={{ maxHeight: 200 }} keyboardShouldPersistTaps="handled">
+            <ScrollView nestedScrollEnabled style={{ maxHeight: Math.min(200, popupMaxHeight) }} keyboardShouldPersistTaps="handled">
               {activeBtwCard.status === "error" ? (
                 <View style={{ padding: space.sm, borderRadius: radius.sm, backgroundColor: p.errorContainer }}>
                   <Text selectable style={{ fontSize: 12.5, lineHeight: 18, color: p.error }}>
@@ -2081,117 +2115,123 @@ export function Composer({
         <View
           accessibilityLabel="用量与上下文"
           style={{
-            marginHorizontal: space.lg,
+            marginLeft: padLeft,
+            marginRight: padRight,
             marginBottom: space.xs,
             padding: space.md,
             borderRadius: radius.card,
             backgroundColor: p.surface,
             borderWidth: 1,
             borderColor: p.dark ? p.surface3 : "#FBE3EC",
+            maxHeight: popupMaxHeight,
+            overflow: "hidden",
             gap: space.sm,
           }}
         >
           <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
             <MaterialCommunityIcons name="gauge" size={16} color={p.accentText} />
-            <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.ink, flex: 1 }}>
+            <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.ink, flex: 1, minWidth: 0 }}>
               用量与上下文 · {usageData?.harness || agent.harness}
             </Text>
-            <Pressable accessibilityRole="button" accessibilityLabel="刷新用量" onPress={openUsageCard} hitSlop={8} style={{ padding: 4 }}>
+            <Pressable accessibilityRole="button" accessibilityLabel="刷新用量" onPress={openUsageCard} hitSlop={8} style={{ flexShrink: 0, padding: 4 }}>
               <MaterialCommunityIcons name="refresh" size={16} color={p.muted} />
             </Pressable>
-            <Pressable accessibilityRole="button" accessibilityLabel="关闭用量卡片" onPress={() => setUsageOpen(false)} hitSlop={8} style={{ padding: 4 }}>
+            <Pressable accessibilityRole="button" accessibilityLabel="关闭用量卡片" onPress={() => setUsageOpen(false)} hitSlop={8} style={{ flexShrink: 0, padding: 4 }}>
               <MaterialCommunityIcons name="close" size={16} color={p.muted} />
             </Pressable>
           </View>
-          {usageError ? <Text style={{ fontSize: 12, color: p.error }}>{usageError}</Text> : null}
-          {usageLoading && !usageData ? (
-            <View style={{ paddingVertical: 8, alignItems: "center" }}>
-              <PocketSpinner size={18} />
-            </View>
-          ) : usageData ? (
-            <>
-              {(usageData.session?.contextTokens ?? agent.contextTokens) !== undefined ? (() => {
-                const ct = usageData.session?.contextTokens ?? agent.contextTokens ?? 0;
-                const cl = usageData.session?.contextLimit ?? agent.contextLimit;
-                const pct = usageData.session?.contextPct ?? (cl && cl > 0 ? (ct / cl) * 100 : undefined);
-                return (
-                  <View style={{ gap: 4 }}>
-                    <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-                      <Text style={{ fontSize: 12, color: p.muted }}>上下文窗口</Text>
-                      <Text style={{ fontFamily: fonts.mono, fontSize: 11.5, color: p.ink }}>
-                        {cl ? `${compactNum(ct)} / ${compactNum(cl)} · ${(pct ?? 0).toFixed(1)}%` : `${compactNum(ct)} tokens`}
+          <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="always" contentContainerStyle={{ gap: space.sm }}>
+            {usageError ? <Text style={{ fontSize: 12, color: p.error }}>{usageError}</Text> : null}
+            {usageLoading && !usageData ? (
+              <View style={{ paddingVertical: 8, alignItems: "center" }}>
+                <PocketSpinner size={18} />
+              </View>
+            ) : usageData ? (
+              <>
+                {(usageData.session?.contextTokens ?? agent.contextTokens) !== undefined ? (() => {
+                  const ct = usageData.session?.contextTokens ?? agent.contextTokens ?? 0;
+                  const cl = usageData.session?.contextLimit ?? agent.contextLimit;
+                  const pct = usageData.session?.contextPct ?? (cl && cl > 0 ? (ct / cl) * 100 : undefined);
+                  return (
+                    <View style={{ gap: 4 }}>
+                      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+                        <Text style={{ fontSize: 12, color: p.muted }}>上下文窗口</Text>
+                        <Text style={{ fontFamily: fonts.mono, fontSize: 11.5, color: p.ink }}>
+                          {cl ? `${compactNum(ct)} / ${compactNum(cl)} · ${(pct ?? 0).toFixed(1)}%` : `${compactNum(ct)} tokens`}
+                        </Text>
+                      </View>
+                      {pct !== undefined ? <PocketProgress progress={pct / 100} height={6} /> : null}
+                    </View>
+                  );
+                })() : null}
+                {usageData.session ? (
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+                    <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                      <Text style={{ fontSize: 11, color: p.faint }}>累计费用</Text>
+                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                        {usageData.session.steps > 0 && usageData.session.unpricedSteps >= usageData.session.steps && usageData.session.costUsd === 0
+                          ? "未计价"
+                          : money(usageData.session.costUsd) ?? "$0.00"}
                       </Text>
                     </View>
-                    {pct !== undefined ? <PocketProgress progress={pct / 100} height={6} /> : null}
-                  </View>
-                );
-              })() : null}
-              {usageData.session ? (
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
-                  <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
-                    <Text style={{ fontSize: 11, color: p.faint }}>累计费用</Text>
-                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
-                      {usageData.session.steps > 0 && usageData.session.unpricedSteps >= usageData.session.steps && usageData.session.costUsd === 0
-                        ? "未计价"
-                        : money(usageData.session.costUsd) ?? "$0.00"}
-                    </Text>
-                  </View>
-                  <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
-                    <Text style={{ fontSize: 11, color: p.faint }}>轮次与步数</Text>
-                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
-                      {`${usageData.session.turns} 轮 · ${usageData.session.steps} 步`}
-                    </Text>
-                  </View>
-                  <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
-                    <Text style={{ fontSize: 11, color: p.faint }}>输入 / 输出</Text>
-                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
-                      {`${compactNum(usageData.session.input)} / ${compactNum(usageData.session.output)}`}
-                    </Text>
-                  </View>
-                  <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
-                    <Text style={{ fontSize: 11, color: p.faint }}>缓存读取</Text>
-                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
-                      {compactNum(usageData.session.cacheRead)}
-                    </Text>
-                  </View>
-                </View>
-              ) : (
-                <Text style={{ fontSize: 12, color: p.faint }}>暂无详细会话统计</Text>
-              )}
-              {usageData.models.length > 0 ? (
-                <View style={{ gap: 3 }}>
-                  {usageData.models.slice(0, 4).map((m) => (
-                    <View key={m.model} style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-                      <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.mono, fontSize: 11.5, color: p.ink }}>{m.model}</Text>
-                      <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>{m.steps} 步</Text>
-                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 11.5, color: p.accentText }}>
-                        {m.steps > 0 && m.unpricedSteps >= m.steps && m.costUsd === 0 ? "未计价" : money(m.costUsd) ?? "$0.00"}
+                    <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                      <Text style={{ fontSize: 11, color: p.faint }}>轮次与步数</Text>
+                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                        {`${usageData.session.turns} 轮 · ${usageData.session.steps} 步`}
                       </Text>
                     </View>
-                  ))}
-                </View>
-              ) : null}
-              {usageData.day24h || usageData.day7d ? (
-                <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>
-                  {usageData.day24h ? `24h 合计 ${money(usageData.day24h.total.costUsd) ?? "$0.00"}  ` : ""}
-                  {usageData.day7d ? `7d 合计 ${money(usageData.day7d.total.costUsd) ?? "$0.00"}` : ""}
-                </Text>
-              ) : null}
-            </>
-          ) : null}
+                    <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                      <Text style={{ fontSize: 11, color: p.faint }}>输入 / 输出</Text>
+                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                        {`${compactNum(usageData.session.input)} / ${compactNum(usageData.session.output)}`}
+                      </Text>
+                    </View>
+                    <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                      <Text style={{ fontSize: 11, color: p.faint }}>缓存读取</Text>
+                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                        {compactNum(usageData.session.cacheRead)}
+                      </Text>
+                    </View>
+                  </View>
+                ) : (
+                  <Text style={{ fontSize: 12, color: p.faint }}>暂无详细会话统计</Text>
+                )}
+                {usageData.models.length > 0 ? (
+                  <View style={{ gap: 3 }}>
+                    {usageData.models.slice(0, 4).map((m) => (
+                      <View key={m.model} style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                        <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontFamily: fonts.mono, fontSize: 11.5, color: p.ink }}>{m.model}</Text>
+                        <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>{m.steps} 步</Text>
+                        <Text style={{ fontFamily: fonts.monoBold, fontSize: 11.5, color: p.accentText }}>
+                          {m.steps > 0 && m.unpricedSteps >= m.steps && m.costUsd === 0 ? "未计价" : money(m.costUsd) ?? "$0.00"}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
+                {usageData.day24h || usageData.day7d ? (
+                  <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>
+                    {usageData.day24h ? `24h 合计 ${money(usageData.day24h.total.costUsd) ?? "$0.00"}  ` : ""}
+                    {usageData.day7d ? `7d 合计 ${money(usageData.day7d.total.costUsd) ?? "$0.00"}` : ""}
+                  </Text>
+                ) : null}
+              </>
+            ) : null}
+          </ScrollView>
         </View>
       ) : null}
       {mode === "chat" && slashQuery !== null && slashMatches.length > 0 ? (
         <View
           accessibilityLabel="斜杠命令推荐"
           style={{
-            marginHorizontal: space.lg,
+            marginLeft: padLeft,
+            marginRight: padRight,
             marginBottom: space.xs,
             borderRadius: radius.card,
             backgroundColor: p.surface,
             borderWidth: 1,
             borderColor: p.dark ? p.surface3 : "#FBE3EC",
-            maxHeight: 210,
+            maxHeight: Math.min(210, popupMaxHeight),
             overflow: "hidden",
           }}
         >
@@ -2251,9 +2291,9 @@ export function Composer({
                   </View>
                   <Text style={{ fontFamily: fonts.monoBold, fontSize: 13, color: p.accentText }}>{cmd.name}</Text>
                   {cmd.argHint ? <Text style={{ fontFamily: fonts.mono, fontSize: 11.5, color: p.faint }}>{cmd.argHint}</Text> : null}
-                  <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: p.muted }}>{cmd.description}</Text>
+                  <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontSize: 12, color: p.muted }}>{cmd.description}</Text>
                   {cmd.source && cmd.source !== "builtin" ? (
-                    <View style={{ paddingHorizontal: 6, paddingVertical: 1, borderRadius: radius.pill, backgroundColor: p.accentContainer }}>
+                    <View style={{ flexShrink: 0, paddingHorizontal: 6, paddingVertical: 1, borderRadius: radius.pill, backgroundColor: p.accentContainer }}>
                       <Text style={{ fontSize: 10.5, color: p.accentText }}>{cmd.source === "project" ? "项目" : "全局"}</Text>
                     </View>
                   ) : null}
@@ -2280,13 +2320,14 @@ export function Composer({
             <View
               accessibilityLabel="切换思考等级下拉列表"
               style={{
-                marginHorizontal: space.lg,
+                marginLeft: padLeft,
+                marginRight: padRight,
                 marginBottom: space.xs,
                 borderRadius: radius.card,
                 backgroundColor: p.surface,
                 borderWidth: 1,
                 borderColor: p.dark ? p.surface3 : "#FBE3EC",
-                maxHeight: 236,
+                maxHeight: Math.min(236, popupMaxHeight),
                 overflow: "hidden",
               }}
             >
@@ -2355,13 +2396,14 @@ export function Composer({
           <View
             accessibilityLabel={isOmp && ompTab === "roles" ? "OMP 角色模型下拉列表" : "切换模型下拉列表"}
             style={{
-              marginHorizontal: space.lg,
+              marginLeft: padLeft,
+              marginRight: padRight,
               marginBottom: space.xs,
               borderRadius: radius.card,
               backgroundColor: p.surface,
               borderWidth: 1,
               borderColor: p.dark ? p.surface3 : "#FBE3EC",
-              maxHeight: 310,
+              maxHeight: popupMaxHeight,
               overflow: "hidden",
             }}
           >
@@ -2381,6 +2423,7 @@ export function Composer({
                 <View
                   style={{
                     flex: 1,
+                    minWidth: 0,
                     flexDirection: "row",
                     backgroundColor: p.surface3,
                     borderRadius: radius.pill,
@@ -2399,6 +2442,7 @@ export function Composer({
                     }}
                     style={{
                       flex: 1,
+                      minWidth: 0,
                       paddingVertical: 5,
                       paddingHorizontal: 8,
                       borderRadius: radius.pill,
@@ -2409,6 +2453,7 @@ export function Composer({
                     <Text
                       numberOfLines={1}
                       style={{
+                        flexShrink: 1,
                         fontFamily: fonts.bodyBold,
                         fontSize: 11.5,
                         color: ompTab === "session" ? p.accentText : p.muted,
@@ -2427,6 +2472,7 @@ export function Composer({
                     }}
                     style={{
                       flex: 1,
+                      minWidth: 0,
                       paddingVertical: 5,
                       paddingHorizontal: 8,
                       borderRadius: radius.pill,
@@ -2437,6 +2483,7 @@ export function Composer({
                     <Text
                       numberOfLines={1}
                       style={{
+                        flexShrink: 1,
                         fontFamily: fonts.bodyBold,
                         fontSize: 11.5,
                         color: ompTab === "roles" ? p.accentText : p.muted,
@@ -2703,6 +2750,7 @@ export function Composer({
                           numberOfLines={1}
                           style={{
                             flex: 1,
+                            minWidth: 0,
                             fontFamily: active ? fonts.monoBold : fonts.mono,
                             fontSize: 12.5,
                             color: active ? p.accentText : p.ink,
@@ -2738,7 +2786,7 @@ export function Composer({
                       })}
                     >
                       <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
-                      <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.monoBold, fontSize: 12.5, color: p.accentText }}>
+                      <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontFamily: fonts.monoBold, fontSize: 12.5, color: p.accentText }}>
                         {editingRole ? `设为 ${editingRole}: ${trimmedFilter}` : `切换到 ${trimmedFilter}`}
                       </Text>
                       <Text style={{ fontSize: 10.5, color: p.muted }}>自定义</Text>
@@ -2756,14 +2804,15 @@ export function Composer({
           // Chat: the words get the full width and a toolbar sits under them. Terminal box: one row.
           flexDirection: mode === "chat" ? "column" : "row",
           gap: mode === "chat" ? 2 : space.sm,
-          marginHorizontal: space.lg,
+          marginLeft: padLeft,
+          marginRight: padRight,
           marginTop: space.xs,
           backgroundColor: p.surface,
           borderRadius: radius.xl,
           // The send button stays at the bottom while a long line grows upward.
           alignItems: mode === "chat" ? "stretch" : "flex-end",
-          paddingLeft: mode === "chat" ? 6 : space.lg,
-          paddingRight: 6,
+          paddingLeft: mode === "chat" ? metrics.cardPadX : space.lg,
+          paddingRight: metrics.cardPadX,
           paddingTop: mode === "chat" ? 2 : 6,
           paddingBottom: 6,
           borderWidth: 1,
@@ -2790,131 +2839,173 @@ export function Composer({
             mode === "chat"
               ? // Grows to about six lines, then scrolls.
                 { fontFamily: fonts.body, fontSize: 15.5 * textScale, color: p.ink, minHeight: 44, maxHeight: Math.round(15.5 * textScale * 1.4 * 6) + 18, paddingHorizontal: 10, paddingTop: 10, paddingBottom: 8 }
-              : { flex: 1, fontFamily: fonts.mono, fontSize: 14, color: p.ink, maxHeight: 120, paddingVertical: 9 }
+              : { flex: 1, minWidth: 0, fontFamily: fonts.mono, fontSize: 14, color: p.ink, maxHeight: 120, paddingVertical: 9 }
           }
           accessibilityLabel="发送给 agent 的内容"
         />
         {mode === "chat" ? (
-          <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-            <IconTile
-              icon={extra ? "keyboardDown" : "keyboard"}
-              size={42}
-              active={extra}
-              onPress={() => setExtra((v) => !v)}
-              a11y={extra ? "收起快捷按键" : "显示回车、Esc、方向键等快捷按键"}
-            />
-            <IconTile icon="image" size={42} disabled={!online || picking} onPress={attach} a11y="添加图片，和消息一起发给它" />
-            {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
-              <>
-                <Pressable
-                  disabled={!online}
-                  onPress={() => (modelOpen === "model" ? setModelOpen(false) : openModelPicker("model"))}
-                  accessibilityRole="button"
-                  accessibilityLabel={effectiveCurrentModel ? `当前模型 ${effectiveCurrentModel}，点击切换` : "切换模型"}
-                  style={({ pressed }) => ({
-                    height: 36,
-                    maxWidth: 145,
-                    paddingHorizontal: 10,
-                    borderRadius: 18,
-                    flexDirection: "row",
-                    alignItems: "center",
-                    gap: 4,
-                    backgroundColor: pressed ? p.surface3 : modelOpen === "model" ? p.accentContainer : p.surface2,
-                    borderWidth: 1,
-                    borderColor: modelOpen === "model" ? p.primary : p.divider,
-                    opacity: online ? 1 : 0.45,
-                  })}
-                >
-                  <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
-                  <Text numberOfLines={1} style={{ fontFamily: fonts.mono, fontSize: 12, color: modelOpen === "model" ? p.accentText : p.ink, flexShrink: 1 }}>
-                    {effectiveCurrentModel ? effectiveCurrentModel.split("/").pop() : "模型"}
-                  </Text>
-                  <MaterialCommunityIcons name={modelOpen === "model" ? "chevron-up" : "chevron-down"} size={13} color={modelOpen === "model" ? p.accentText : p.muted} />
-                </Pressable>
-                {effectiveThinkingLevels.length > 0 ? (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: metrics.itemGap }}>
+            <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: metrics.itemGap }}>
+              <IconTile
+                icon={extra ? "keyboardDown" : "keyboard"}
+                size={metrics.iconBtnSize}
+                active={extra}
+                onPress={() => setExtra((v) => !v)}
+                a11y={extra ? "收起快捷按键" : "显示回车、Esc、方向键等快捷按键"}
+              />
+              <IconTile icon="image" size={metrics.iconBtnSize} disabled={!online || picking} onPress={attach} a11y="添加图片，和消息一起发给它" />
+              {!agent.isShell && (agent.source === "hc" || agent.source === "herdr") ? (
+                <>
                   <Pressable
                     disabled={!online}
-                    onPress={() => (modelOpen === "thinking" ? setModelOpen(false) : openModelPicker("thinking"))}
+                    onPress={() => (modelOpen === "model" ? setModelOpen(false) : openModelPicker("model"))}
                     accessibilityRole="button"
-                    accessibilityLabel="切换思考等级"
+                    accessibilityLabel={effectiveCurrentModel ? `当前模型 ${effectiveCurrentModel}，点击切换` : "切换模型"}
                     style={({ pressed }) => ({
-                      height: 36,
-                      maxWidth: 96,
-                      paddingHorizontal: 9,
-                      borderRadius: 18,
+                      flexShrink: 1,
+                      minWidth: metrics.modelMinW,
+                      maxWidth: metrics.modelMaxW,
+                      height: metrics.pillHeight,
+                      overflow: "hidden",
+                      paddingHorizontal: metrics.pillPadX,
+                      borderRadius: Math.round(metrics.pillHeight / 2),
                       flexDirection: "row",
                       alignItems: "center",
                       gap: 4,
-                      backgroundColor: pressed ? p.surface3 : modelOpen === "thinking" ? p.accentContainer : p.surface2,
+                      backgroundColor: pressed ? p.surface3 : modelOpen === "model" ? p.accentContainer : p.surface2,
                       borderWidth: 1,
-                      borderColor: modelOpen === "thinking" ? p.primary : p.divider,
+                      borderColor: modelOpen === "model" ? p.primary : p.divider,
                       opacity: online ? 1 : 0.45,
                     })}
                   >
-                    <MaterialCommunityIcons name="brain" size={14} color={p.accentText} />
-                    <Text numberOfLines={1} style={{ fontFamily: fonts.bodySemi, fontSize: 11.5, color: modelOpen === "thinking" ? p.accentText : p.ink, flexShrink: 1 }}>
-                      {effectiveCurrentThinking ? effectiveCurrentThinking : "思考"}
+                    {metrics.showModelIcon ? (
+                      <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} style={{ flexShrink: 0 }} />
+                    ) : null}
+                    <Text
+                      numberOfLines={1}
+                      ellipsizeMode="middle"
+                      style={{
+                        flexShrink: 1,
+                        minWidth: 0,
+                        fontFamily: fonts.mono,
+                        fontSize: width < 360 ? 11.5 : 12,
+                        color: modelOpen === "model" ? p.accentText : p.ink,
+                      }}
+                    >
+                      {effectiveCurrentModel ? effectiveCurrentModel.split("/").pop() : "模型"}
                     </Text>
+                    <MaterialCommunityIcons
+                      name={modelOpen === "model" ? "chevron-up" : "chevron-down"}
+                      size={13}
+                      color={modelOpen === "model" ? p.accentText : p.muted}
+                      style={{ flexShrink: 0 }}
+                    />
                   </Pressable>
-                ) : null}
-              </>
-            ) : null}
-            <View style={{ flex: 1 }} />
-            {agent.status === "working" ? (
-              isBtwDraft ? (
-                <SendPill
-                  disabled={!online || !/^\/btw\s+\S/i.test(text.trim())}
-                  onPress={send}
-                  a11y="发送旁路提问（不打断主线）"
-                />
-              ) : !text.trim() && !pictures.length ? (
-                <Pressable
-                  disabled={!online || sending}
-                  onPress={() => void interruptCurrentTurn()}
-                  accessibilityRole="button"
-                  accessibilityLabel="停止当前轮"
-                  style={({ pressed }) => ({
-                    height: 42,
-                    paddingHorizontal: 14,
-                    borderRadius: 21,
-                    flexDirection: "row",
-                    alignItems: "center",
-                    gap: 5,
-                    backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.surface3 : p.accentContainer,
-                    borderWidth: 1,
-                    borderColor: !online ? p.divider : p.primary,
-                    opacity: sending ? 0.55 : 1,
-                  })}
-                >
-                  <MaterialCommunityIcons name="stop" size={16} color={!online ? p.faint : p.accentText} />
-                  <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.accentText }}>停止</Text>
-                </Pressable>
+                  {effectiveThinkingLevels.length > 0 ? (
+                    <Pressable
+                      disabled={!online}
+                      onPress={() => (modelOpen === "thinking" ? setModelOpen(false) : openModelPicker("thinking"))}
+                      accessibilityRole="button"
+                      accessibilityLabel="切换思考等级"
+                      style={({ pressed }) => ({
+                        flexShrink: metrics.allowThinkingShrink ? 1 : 0,
+                        minWidth: metrics.allowThinkingShrink ? metrics.thinkingMinW : undefined,
+                        maxWidth: metrics.thinkingMaxW,
+                        height: metrics.pillHeight,
+                        overflow: "hidden",
+                        paddingHorizontal: metrics.pillPadX,
+                        borderRadius: Math.round(metrics.pillHeight / 2),
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 4,
+                        backgroundColor: pressed ? p.surface3 : modelOpen === "thinking" ? p.accentContainer : p.surface2,
+                        borderWidth: 1,
+                        borderColor: modelOpen === "thinking" ? p.primary : p.divider,
+                        opacity: online ? 1 : 0.45,
+                      })}
+                    >
+                      <MaterialCommunityIcons name="brain" size={14} color={p.accentText} style={{ flexShrink: 0 }} />
+                      <Text
+                        numberOfLines={1}
+                        style={{
+                          flexShrink: 1,
+                          minWidth: 0,
+                          fontFamily: fonts.bodySemi,
+                          fontSize: 11.5,
+                          color: modelOpen === "thinking" ? p.accentText : p.ink,
+                        }}
+                      >
+                        {effectiveCurrentThinking ? effectiveCurrentThinking : "思考"}
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                </>
+              ) : null}
+            </View>
+            <View style={{ flexShrink: 0 }}>
+              {agent.status === "working" ? (
+                isBtwDraft ? (
+                  <SendPill
+                    width={metrics.sendWidth}
+                    height={metrics.actionHeight}
+                    disabled={!online || !/^\/btw\s+\S/i.test(text.trim())}
+                    onPress={send}
+                    a11y="发送旁路提问（不打断主线）"
+                  />
+                ) : !text.trim() && !pictures.length ? (
+                  <Pressable
+                    disabled={!online || sending}
+                    onPress={() => void interruptCurrentTurn()}
+                    accessibilityRole="button"
+                    accessibilityLabel="停止当前轮"
+                    style={({ pressed }) => ({
+                      height: metrics.actionHeight,
+                      paddingHorizontal: metrics.actionPadX,
+                      borderRadius: Math.round(metrics.actionHeight / 2),
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 5,
+                      backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.surface3 : p.accentContainer,
+                      borderWidth: 1,
+                      borderColor: !online ? p.divider : p.primary,
+                      opacity: sending ? 0.55 : 1,
+                    })}
+                  >
+                    <MaterialCommunityIcons name="stop" size={16} color={!online ? p.faint : p.accentText} />
+                    <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.accentText }}>停止</Text>
+                  </Pressable>
+                ) : (
+                  <Pressable
+                    disabled={!online}
+                    onPress={send}
+                    accessibilityRole="button"
+                    accessibilityLabel="加入排队，当前轮结束后发送"
+                    style={({ pressed }) => ({
+                      height: metrics.actionHeight,
+                      paddingHorizontal: metrics.actionPadX,
+                      borderRadius: Math.round(metrics.actionHeight / 2),
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: 4,
+                      backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.primaryPressed : p.primary,
+                    })}
+                  >
+                    <MaterialCommunityIcons name="clock-outline" size={16} color={!online ? p.faint : p.onPrimary} />
+                    <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.onPrimary }}>排队</Text>
+                  </Pressable>
+                )
               ) : (
-                <Pressable
-                  disabled={!online}
+                <SendPill
+                  width={metrics.sendWidth}
+                  height={metrics.actionHeight}
+                  disabled={(!text.trim() && !pictures.length) || !online}
                   onPress={send}
-                  accessibilityRole="button"
-                  accessibilityLabel="加入排队，当前轮结束后发送"
-                  style={({ pressed }) => ({
-                    height: 42,
-                    paddingHorizontal: 14,
-                    borderRadius: 21,
-                    flexDirection: "row",
-                    alignItems: "center",
-                    gap: 4,
-                    backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.primaryPressed : p.primary,
-                  })}
-                >
-                  <MaterialCommunityIcons name="clock-outline" size={16} color={!online ? p.faint : p.onPrimary} />
-                  <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.onPrimary }}>排队</Text>
-                </Pressable>
-              )
-            ) : (
-              <SendPill disabled={(!text.trim() && !pictures.length) || !online} onPress={send} />
-            )}
+                />
+              )}
+            </View>
           </View>
         ) : (
-          <SendPill disabled={!text.trim() || !online} onPress={send} />
+          <SendPill width={metrics.sendWidth} height={metrics.actionHeight} disabled={!text.trim() || !online} onPress={send} />
         )}
       </View>
       ) : null}
@@ -2930,6 +3021,7 @@ export function Composer({
 
 export function InfoView({ agent, bottomInset }: { agent: Agent; bottomInset: number }) {
   const p = usePalette();
+  const insets = useSafeAreaInsets();
   const device = useLive((s) => s.devices[agent.deviceId]);
   const look = harnessLook(agent.harness, agent.isShell);
   const ratio = agent.contextTokens && agent.contextLimit ? agent.contextTokens / agent.contextLimit : null;
@@ -2937,7 +3029,7 @@ export function InfoView({ agent, bottomInset }: { agent: Agent; bottomInset: nu
     value ? (
       <View key={title} accessibilityLabel={`${title}：${value}`} style={{ flexDirection: "row", alignItems: "flex-start", gap: space.md, paddingHorizontal: space.lg, paddingVertical: space.sm + 2, minHeight: 56 }}>
         <MaterialCommunityIcons name={icon as PocketIcon} size={22} color={p.muted} style={{ marginTop: 6 }} />
-        <View style={{ flex: 1, gap: 2 }}>
+        <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
           <Text style={{ fontSize: 13, color: p.muted }}>{title}</Text>
           <Text selectable numberOfLines={3} style={{ fontSize: 15, color: p.ink, fontFamily: mono ? fonts.mono : fonts.body }}>
             {value}
@@ -2946,7 +3038,15 @@ export function InfoView({ agent, bottomInset }: { agent: Agent; bottomInset: nu
       </View>
     ) : null;
   return (
-    <ScrollView contentContainerStyle={{ padding: space.lg, paddingBottom: bottomInset + space.xxl, gap: space.md }}>
+    <ScrollView
+      contentContainerStyle={{
+        paddingTop: space.lg,
+        paddingLeft: horizontalPad(space.lg, insets.left),
+        paddingRight: horizontalPad(space.lg, insets.right),
+        paddingBottom: bottomInset + space.xxl,
+        gap: space.md,
+      }}
+    >
       {ratio != null ? (
         <View style={{ backgroundColor: p.surface, borderRadius: radius.card, padding: space.lg, gap: space.sm }}>
           <View style={{ flexDirection: "row", justifyContent: "space-between" }}>

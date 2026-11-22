@@ -1,8 +1,10 @@
 import { useEffect, useRef, type ReactNode } from "react";
-import { Image, Pressable, View, type StyleProp, type ViewStyle } from "react-native";
+import { Image, Pressable, useWindowDimensions, View, type StyleProp, type ViewStyle } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
+import type { NativeStackHeaderProps } from "expo-router/native-stack";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Text } from "react-native-paper";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Svg, { G, Path, SvgXml } from "react-native-svg";
 import Animated, { cancelAnimation, Easing, FadeInDown, FadeOut, useAnimatedStyle, useSharedValue, withRepeat, withSequence, withTiming, type SharedValue } from "react-native-reanimated";
 import type { AgentStatus } from "@herdr-pocket/protocol";
@@ -68,6 +70,7 @@ export function IconTile({
       style={({ pressed }) => ({
         width: size,
         height: size,
+        flexShrink: 0,
         borderRadius: shape === "round" ? size / 2 : Math.round(size * 0.36),
         alignItems: "center",
         justifyContent: "center",
@@ -97,8 +100,21 @@ function tileLook(p: ReturnType<typeof usePalette>, tone: TileTone, disabled?: b
 }
 
 /** The pink send button: a short pill with a paper plane. */
-export function SendPill({ onPress, disabled, a11y = "发送" }: { onPress: () => void; disabled?: boolean; a11y?: string }) {
+export function SendPill({
+  onPress,
+  disabled,
+  a11y = "发送",
+  width = 54,
+  height = 42,
+}: {
+  onPress: () => void;
+  disabled?: boolean;
+  a11y?: string;
+  width?: number;
+  height?: number;
+}) {
   const p = usePalette();
+  const iconSize = Math.round(height * 0.48);
   return (
     <Pressable
       accessibilityRole="button"
@@ -108,16 +124,17 @@ export function SendPill({ onPress, disabled, a11y = "发送" }: { onPress: () =
       onPress={onPress}
       hitSlop={4}
       style={({ pressed }) => ({
-        width: 54,
-        height: 42,
-        borderRadius: 21,
+        width,
+        height,
+        flexShrink: 0,
+        borderRadius: Math.round(height / 2),
         alignItems: "center",
         justifyContent: "center",
         backgroundColor: disabled ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.primaryPressed : p.primary,
         transform: [{ scale: pressed ? 0.94 : 1 }],
       })}
     >
-      <CuteIcon name="plane" size={20} color={disabled ? p.faint : p.onPrimary} fill={disabled ? "none" : p.dark ? "#FFD3E2" : "#FFFFFF"} strokeWidth={2} />
+      <CuteIcon name="plane" size={iconSize} color={disabled ? p.faint : p.onPrimary} fill={disabled ? "none" : p.dark ? "#FFD3E2" : "#FFFFFF"} strokeWidth={2} />
     </Pressable>
   );
 }
@@ -239,6 +256,7 @@ export function StatusPill({ status, compact, label = statusLabel[status] }: { s
       style={{
         flexDirection: "row",
         alignItems: "center",
+        flexShrink: 0,
         gap: 4,
         backgroundColor: c.bg,
         borderRadius: radius.pill,
@@ -409,10 +427,10 @@ export function PocketToast({
             elevation: p.dark ? 0 : 4,
           }}
         >
-          <View style={{ width: 24, height: 24, borderRadius: 12, backgroundColor: badgeBg, alignItems: "center", justifyContent: "center" }}>
+          <View style={{ width: 24, height: 24, borderRadius: 12, flexShrink: 0, backgroundColor: badgeBg, alignItems: "center", justifyContent: "center" }}>
             <CuteIcon name={badgeIcon} size={14} color={badgeColor} fill={badgeBg} />
           </View>
-          <Text numberOfLines={2} style={{ flexShrink: 1, color: p.ink, fontSize: 13.5, lineHeight: 19, fontFamily: fonts.bodySemi }}>
+          <Text numberOfLines={3} style={{ flexShrink: 1, minWidth: 0, color: p.ink, fontSize: 13.5, lineHeight: 19, fontFamily: fonts.bodySemi }}>
             {message}
           </Text>
           {action ? (
@@ -423,6 +441,7 @@ export function PocketToast({
                 onDismiss();
               }}
               style={({ pressed }) => ({
+                flexShrink: 0,
                 paddingHorizontal: 10,
                 paddingVertical: 4,
                 borderRadius: radius.pill,
@@ -434,6 +453,77 @@ export function PocketToast({
           ) : null}
         </Pressable>
       </Animated.View>
+    </View>
+  );
+}
+
+/**
+ * Custom native-stack header replacing native `UINavigationBar` items so iOS 26
+ * Liquid Glass never wraps our pastel `IconTile` back button in a second pill.
+ */
+export function PocketStackHeader({ back, options, navigation }: NativeStackHeaderProps) {
+  const p = usePalette();
+  const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const canGoBack = back != null;
+  const customLeft = options.headerLeft?.({
+    canGoBack,
+    tintColor: p.ink,
+    backgroundColor: p.pageTop,
+    label: back?.title,
+    href: back?.href,
+  });
+  const leftNode =
+    customLeft !== undefined ? (
+      customLeft
+    ) : canGoBack ? (
+      <IconTile icon="back" tone="plain" size={40} onPress={() => navigation.goBack()} a11y="返回" />
+    ) : null;
+
+  const titleText = typeof options.headerTitle === "string" ? options.headerTitle : (options.title ?? "");
+  const titleNode =
+    typeof options.headerTitle === "function" ? (
+      <View style={{ flex: 1, minWidth: 0 }}>
+        {options.headerTitle({ children: options.title ?? "", tintColor: p.ink })}
+      </View>
+    ) : (
+      <Text
+        numberOfLines={1}
+        style={{
+          flex: 1,
+          minWidth: 0,
+          fontFamily: fonts.cute,
+          fontSize: width < 360 ? 17.5 : 19,
+          lineHeight: 26,
+          color: p.ink,
+        }}
+      >
+        {titleText}
+      </Text>
+    );
+
+  const rightNode = options.headerRight?.({
+    canGoBack,
+    tintColor: p.ink,
+    backgroundColor: p.pageTop,
+  });
+
+  return (
+    <View
+      style={{
+        backgroundColor: p.pageTop,
+        paddingTop: insets.top + 4,
+        paddingBottom: 6,
+        paddingHorizontal: Math.max(space.lg, Math.max(insets.left, insets.right) + space.sm),
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 10,
+        minHeight: insets.top + 52,
+      }}
+    >
+      {leftNode}
+      {titleNode}
+      {rightNode ? <View style={{ flexShrink: 0 }}>{rightNode}</View> : null}
     </View>
   );
 }
