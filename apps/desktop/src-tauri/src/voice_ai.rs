@@ -37,12 +37,12 @@ const DEFAULT_THRESHOLD: f32 = 0.38;
 const OWNER_SAMPLE_LEN: usize = 48_000;
 
 const DPDF_SIZE: u64 = 8_791_035;
-const DPDF_SHA256: &str = "debaf0e8893479fca91b8b4c1eae8db195aa980ccc9012f5809fde2b738151a";
+const DPDF_SHA256: &str = "debaf0e8893479fca91b8b4c1eae8db195aa8980ccc9012f5809fde2b738151a";
 const VAD_SIZE: u64 = 643_854;
 const VAD_SHA256: &str = "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6";
 
-pub const SV_SIZE: u64 = 71_441_526;
-pub const SV_SHA256: &str = "bf1a75b9930474cf3389ef415e6e5d38ca96fea4a3a00f7e301d080a58ee2239";
+pub const SV_SIZE: u64 = 71_441_527;
+pub const SV_SHA256: &str = "eda0bf86422a9725a3523d5a1d3d75dedf340664e0ba65cfc1c7b2a78b6cf0b5";
 pub const VOXLOCK_ENROLL_SIZE: u64 = 21_023_799;
 pub const VOXLOCK_ENROLL_SHA256: &str =
     "81f305c9b7a32f13d1401f53bb4c6301826a607c9e807e60912f36ef1b9fae29";
@@ -96,11 +96,11 @@ const SV_SPEC: ModelSpec = ModelSpec {
     size: SV_SIZE,
     sha256: SV_SHA256,
     urls: &[
+        "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+        "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
         "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
         "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
         "https://cdn.gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
-        "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
-        "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
     ],
 };
@@ -126,6 +126,15 @@ const VOXLOCK_CHUNK_SPEC: ModelSpec = ModelSpec {
         "https://huggingface.co/arbazsiddiqui/voxlock/resolve/main/onnx/v2/chunk_int8.onnx",
     ],
 };
+
+#[cfg(test)]
+const ALL_MODEL_SPECS: &[ModelSpec] = &[
+    DPDF_SPEC,
+    VAD_SPEC,
+    SV_SPEC,
+    VOXLOCK_ENROLL_SPEC,
+    VOXLOCK_CHUNK_SPEC,
+];
 
 // ---------------------------------------------------------------------------
 // Public state & configuration types
@@ -697,17 +706,15 @@ mod ort {
         }
     }
 
-    pub struct Session {
+    struct SessionInner {
         rt: Arc<OrtRuntime>,
         raw: *mut OrtSession,
-        pub input_names: Vec<String>,
-        pub output_names: Vec<String>,
     }
 
-    unsafe impl Send for Session {}
-    unsafe impl Sync for Session {}
+    unsafe impl Send for SessionInner {}
+    unsafe impl Sync for SessionInner {}
 
-    impl Drop for Session {
+    impl Drop for SessionInner {
         fn drop(&mut self) {
             if !self.raw.is_null() {
                 unsafe {
@@ -717,6 +724,13 @@ mod ort {
                 }
             }
         }
+    }
+
+    #[derive(Clone)]
+    pub struct Session {
+        inner: Arc<SessionInner>,
+        pub input_names: Vec<String>,
+        pub output_names: Vec<String>,
     }
 
     struct OptionsGuard<'a> {
@@ -924,8 +938,10 @@ mod ort {
             rt.check_status(st)?;
 
             let mut sess = Self {
-                rt: rt.clone(),
-                raw: session_raw,
+                inner: Arc::new(SessionInner {
+                    rt: rt.clone(),
+                    raw: session_raw,
+                }),
                 input_names: Vec::new(),
                 output_names: Vec::new(),
             };
@@ -946,26 +962,29 @@ mod ort {
                 IDX_SESSION_GET_OUTPUT_NAME
             };
             let get_count: unsafe extern "system" fn(*const OrtSession, *mut usize) -> *mut OrtStatus =
-                unsafe { std::mem::transmute(self.rt.slot(count_idx)) };
+                unsafe { std::mem::transmute(self.inner.rt.slot(count_idx)) };
             let get_name: unsafe extern "system" fn(
                 *const OrtSession,
                 usize,
                 *mut OrtAllocator,
                 *mut *mut c_char,
-            ) -> *mut OrtStatus = unsafe { std::mem::transmute(self.rt.slot(name_idx)) };
+            ) -> *mut OrtStatus = unsafe { std::mem::transmute(self.inner.rt.slot(name_idx)) };
             let free_fn: unsafe extern "system" fn(*mut OrtAllocator, *mut c_void) -> *mut OrtStatus =
-                unsafe { std::mem::transmute(self.rt.slot(IDX_ALLOCATOR_FREE)) };
+                unsafe { std::mem::transmute(self.inner.rt.slot(IDX_ALLOCATOR_FREE)) };
 
             let mut n: usize = 0;
-            self.rt.check_status(unsafe { get_count(self.raw, &mut n) })?;
+            self.inner
+                .rt
+                .check_status(unsafe { get_count(self.inner.raw, &mut n) })?;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
                 let mut ptr: *mut c_char = std::ptr::null_mut();
-                self.rt
-                    .check_status(unsafe { get_name(self.raw, i, self.rt.allocator, &mut ptr) })?;
+                self.inner.rt.check_status(unsafe {
+                    get_name(self.inner.raw, i, self.inner.rt.allocator, &mut ptr)
+                })?;
                 if !ptr.is_null() {
                     let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
-                    let _ = unsafe { free_fn(self.rt.allocator, ptr.cast()) };
+                    let _ = unsafe { free_fn(self.inner.rt.allocator, ptr.cast()) };
                     out.push(s);
                 } else {
                     out.push(String::new());
@@ -1002,11 +1021,11 @@ mod ort {
                 *const *const c_char,
                 usize,
                 *mut *mut OrtValue,
-            ) -> *mut OrtStatus = unsafe { std::mem::transmute(self.rt.slot(IDX_RUN)) };
+            ) -> *mut OrtStatus = unsafe { std::mem::transmute(self.inner.rt.slot(IDX_RUN)) };
 
             let st = unsafe {
                 run_fn(
-                    self.raw,
+                    self.inner.raw,
                     std::ptr::null(),
                     in_ptrs.as_ptr(),
                     in_vals.as_ptr(),
@@ -1016,9 +1035,9 @@ mod ort {
                     out_vals.as_mut_ptr(),
                 )
             };
-            if let Err(e) = self.rt.check_status(st) {
+            if let Err(e) = self.inner.rt.check_status(st) {
                 let rel_val: unsafe extern "system" fn(*mut OrtValue) =
-                    unsafe { std::mem::transmute(self.rt.slot(IDX_RELEASE_VALUE)) };
+                    unsafe { std::mem::transmute(self.inner.rt.slot(IDX_RELEASE_VALUE)) };
                 for v in out_vals {
                     if !v.is_null() {
                         unsafe { rel_val(v) };
@@ -1029,7 +1048,7 @@ mod ort {
             Ok(out_vals
                 .into_iter()
                 .map(|raw| Value {
-                    rt: self.rt.clone(),
+                    rt: self.inner.rt.clone(),
                     raw,
                     _backing: None,
                 })
@@ -2235,9 +2254,9 @@ mod models {
     }
 
     /// Streaming DPDFNet-baseline (`dpdfnet_baseline.onnx`) 320-pt Vorbis STFT + 4% 5-hop dry blend.
-    pub struct Denoiser<'a> {
-        rt: &'a Arc<OrtRuntime>,
-        sess: &'a Session,
+    pub struct Denoiser {
+        rt: Arc<OrtRuntime>,
+        sess: Session,
         spec_in_name: String,
         state_in_name: String,
         spec_out_name: String,
@@ -2253,13 +2272,13 @@ mod models {
         dry_gain: f32,
     }
 
-    impl<'a> Denoiser<'a> {
+    impl Denoiser {
         pub const HOP: usize = 160;
         const N: usize = 320;
         const BINS: usize = 161;
         const MAX_DRY_BLEND: f32 = 0.04;
 
-        pub fn new(rt: &'a Arc<OrtRuntime>, sess: &'a Session, cfg: &DpdfConfig) -> Self {
+        pub fn new(rt: &Arc<OrtRuntime>, sess: &Session, cfg: &DpdfConfig) -> Self {
             let spec_in_name = sess
                 .input_names
                 .first()
@@ -2281,8 +2300,8 @@ mod models {
                 .cloned()
                 .unwrap_or_else(|| "state_out".into());
             Self {
-                rt,
-                sess,
+                rt: rt.clone(),
+                sess: sess.clone(),
                 spec_in_name,
                 state_in_name,
                 spec_out_name,
@@ -2327,9 +2346,9 @@ mod models {
                 spec[2 * k + 1] = im[k] as f32;
             }
 
-            let t_spec = Value::from_f32_vec(self.rt, spec, &[1, 1, Self::BINS as i64, 2])?;
+            let t_spec = Value::from_f32_vec(&self.rt, spec, &[1, 1, Self::BINS as i64, 2])?;
             let t_state =
-                Value::from_f32_vec(self.rt, self.state.clone(), &self.state_shape)?;
+                Value::from_f32_vec(&self.rt, self.state.clone(), &self.state_shape)?;
             let outs = self.sess.run(
                 &[
                     (&self.spec_in_name, &t_spec),
@@ -2403,20 +2422,20 @@ mod models {
         }
     }
 
-    pub struct Vad<'a> {
-        rt: &'a Arc<OrtRuntime>,
-        sess: &'a Session,
+    pub struct Vad {
+        rt: Arc<OrtRuntime>,
+        sess: Session,
         h: Vec<f32>,
         c: Vec<f32>,
     }
 
-    impl<'a> Vad<'a> {
+    impl Vad {
         pub const WINDOW: usize = 512;
 
-        pub fn new(rt: &'a Arc<OrtRuntime>, sess: &'a Session) -> Self {
+        pub fn new(rt: &Arc<OrtRuntime>, sess: &Session) -> Self {
             Self {
-                rt,
-                sess,
+                rt: rt.clone(),
+                sess: sess.clone(),
                 h: vec![0.0; 128],
                 c: vec![0.0; 128],
             }
@@ -2426,9 +2445,9 @@ mod models {
             let mut x = vec![0.0f32; Self::WINDOW];
             let n = w.len().min(Self::WINDOW);
             x[..n].copy_from_slice(&w[..n]);
-            let tx = Value::from_f32_vec(self.rt, x, &[1, Self::WINDOW as i64])?;
-            let th = Value::from_f32_vec(self.rt, self.h.clone(), &[2, 1, 64])?;
-            let tc = Value::from_f32_vec(self.rt, self.c.clone(), &[2, 1, 64])?;
+            let tx = Value::from_f32_vec(&self.rt, x, &[1, Self::WINDOW as i64])?;
+            let th = Value::from_f32_vec(&self.rt, self.h.clone(), &[2, 1, 64])?;
+            let tc = Value::from_f32_vec(&self.rt, self.c.clone(), &[2, 1, 64])?;
             let outs = self.sess.run(
                 &[("x", &tx), ("h", &th), ("c", &tc)],
                 &["prob", "new_h", "new_c"],
@@ -2440,16 +2459,16 @@ mod models {
         }
     }
 
-    pub struct Speaker<'a> {
-        rt: &'a Arc<OrtRuntime>,
-        sess: &'a Session,
+    pub struct Speaker {
+        rt: Arc<OrtRuntime>,
+        sess: Session,
         fbank: Fbank,
         in_name: String,
         out_name: String,
     }
 
-    impl<'a> Speaker<'a> {
-        pub fn new(rt: &'a Arc<OrtRuntime>, sess: &'a Session) -> Self {
+    impl Speaker {
+        pub fn new(rt: &Arc<OrtRuntime>, sess: &Session) -> Self {
             let in_name = sess
                 .input_names
                 .first()
@@ -2461,8 +2480,8 @@ mod models {
                 .cloned()
                 .unwrap_or_else(|| "embedding".into());
             Self {
-                rt,
-                sess,
+                rt: rt.clone(),
+                sess: sess.clone(),
                 fbank: Fbank::default(),
                 in_name,
                 out_name,
@@ -2472,7 +2491,7 @@ mod models {
         pub fn embed(&self, samples: &[f32]) -> Result<Vec<f32>, String> {
             let (frames, feats) = self.fbank.compute(samples);
             let tx =
-                Value::from_f32_vec(self.rt, feats, &[1, frames as i64, Fbank::BINS as i64])?;
+                Value::from_f32_vec(&self.rt, feats, &[1, frames as i64, Fbank::BINS as i64])?;
             let outs = self.sess.run(&[(&self.in_name, &tx)], &[&self.out_name])?;
             outs[0].to_f32_vec()
         }
@@ -2513,10 +2532,10 @@ mod models {
         }
     }
 
-    pub struct TargetExtractor<'a> {
-        rt: &'a Arc<OrtRuntime>,
-        sess: &'a Session,
-        enr: &'a VoxLockEnrollment,
+    pub struct TargetExtractor {
+        rt: Arc<OrtRuntime>,
+        sess: Session,
+        enr: Arc<VoxLockEnrollment>,
         h: Value,
         c: Value,
         pub k_frames: usize,
@@ -2528,7 +2547,7 @@ mod models {
         win_sq: [f32; 512],
     }
 
-    impl<'a> TargetExtractor<'a> {
+    impl TargetExtractor {
         pub const NFFT: usize = 512;
         pub const HOP: usize = 128;
         pub const OVERLAP_LEN: usize = 384;
@@ -2537,9 +2556,9 @@ mod models {
         const STATE_COUNT: usize = 6 * 32 * 256;
 
         pub fn new(
-            rt: &'a Arc<OrtRuntime>,
-            sess: &'a Session,
-            enr: &'a VoxLockEnrollment,
+            rt: &Arc<OrtRuntime>,
+            sess: &Session,
+            enr: &Arc<VoxLockEnrollment>,
         ) -> Result<Self, String> {
             let h = Value::from_f32_vec(rt, vec![0.0; Self::STATE_COUNT], &Self::STATE_SHAPE)?;
             let c = Value::from_f32_vec(rt, vec![0.0; Self::STATE_COUNT], &Self::STATE_SHAPE)?;
@@ -2549,9 +2568,9 @@ mod models {
                 *dst = (w * w) as f32;
             }
             Ok(Self {
-                rt,
-                sess,
-                enr,
+                rt: rt.clone(),
+                sess: sess.clone(),
+                enr: enr.clone(),
                 h,
                 c,
                 k_frames: 5,
@@ -2573,7 +2592,16 @@ mod models {
             }
         }
 
+        pub fn set_k_frames(&mut self, k: usize) {
+            self.k_frames = k.clamp(4, 8);
+        }
+
         pub fn step(&mut self, input: &[f32]) -> Result<(Vec<f32>, f64), String> {
+            let (tse, _raw, ms) = self.step_aligned(input)?;
+            Ok((tse, ms))
+        }
+
+        pub fn step_aligned(&mut self, input: &[f32]) -> Result<(Vec<f32>, Vec<f32>, f64), String> {
             let kf = self.k_frames;
             let step_samples = kf * Self::HOP;
             let ns = step_samples + Self::OVERLAP_LEN;
@@ -2605,7 +2633,7 @@ mod models {
 
             let t0 = Instant::now();
             let t_wav =
-                Value::from_f32_vec(self.rt, self.wav_buf[..ns].to_vec(), &[1, ns as i64])?;
+                Value::from_f32_vec(&self.rt, self.wav_buf[..ns].to_vec(), &[1, ns as i64])?;
             let mut outs = self.sess.run(
                 &[
                     ("wav", &t_wav),
@@ -2640,9 +2668,11 @@ mod models {
             let start_idx = if self.is_first { Self::REFLECT_PAD } else { 0 };
             let out_count = step_samples - start_idx;
             let mut tse_out = vec![0.0f32; out_count];
+            let mut raw_out = vec![0.0f32; out_count];
             for idx in 0..out_count {
                 let p = start_idx + idx;
                 tse_out[idx] = self.ola[p] / self.wsum[p].max(1e-8);
+                raw_out[idx] = self.wav_buf[p];
             }
 
             self.ola.copy_within(step_samples..step_samples + Self::OVERLAP_LEN, 0);
@@ -2653,7 +2683,7 @@ mod models {
             self.wsum[Self::OVERLAP_LEN..clear_end].fill(0.0);
 
             self.is_first = false;
-            Ok((tse_out, ms))
+            Ok((tse_out, raw_out, ms))
         }
 
         pub fn process_buffer(&mut self, clean_hpf: &[f32]) -> Result<Vec<f32>, String> {
@@ -2689,15 +2719,18 @@ const CHINA_MIRROR_PREFIXES: &[&str] = &[
     "https://cdn.gh-proxy.com/",
 ];
 
-const CHINA_MIRROR_HOSTS: &[&str] = &[
-    "ghfast.top",
-    "gh-proxy.com",
-    "cdn.gh-proxy.com",
-    "edgeone.gh-proxy.com",
+const CHINA_DIRECT_MIRROR_HOSTS: &[&str] = &[
     "hf-mirror.com",
     "mirrors.aliyun.com",
     "pypi.tuna.tsinghua.edu.cn",
     "registry.npmmirror.com",
+];
+
+const CHINA_PROXY_HOSTS: &[&str] = &[
+    "ghfast.top",
+    "gh-proxy.com",
+    "cdn.gh-proxy.com",
+    "edgeone.gh-proxy.com",
 ];
 
 const ORIGIN_HOSTS: &[&str] = &[
@@ -2779,7 +2812,8 @@ fn host_of(raw: &str) -> Option<String> {
 }
 
 pub fn order_urls_by_region(urls: &[&str], china: bool) -> Vec<String> {
-    let mut domestic = Vec::new();
+    let mut domestic_direct = Vec::new();
+    let mut domestic_proxies = Vec::new();
     let mut neutral = Vec::new();
     let mut global = Vec::new();
     let mut seen = HashSet::new();
@@ -2791,8 +2825,10 @@ pub fn order_urls_by_region(urls: &[&str], china: bool) -> Vec<String> {
         if DEAD_MIRROR_HOSTS.contains(&host.as_str()) {
             continue;
         }
-        if CHINA_MIRROR_HOSTS.contains(&host.as_str()) {
-            domestic.push(raw.to_string());
+        if CHINA_DIRECT_MIRROR_HOSTS.contains(&host.as_str()) {
+            domestic_direct.push(raw.to_string());
+        } else if CHINA_PROXY_HOSTS.contains(&host.as_str()) {
+            domestic_proxies.push(raw.to_string());
         } else if ORIGIN_HOSTS.contains(&host.as_str()) {
             global.push(raw.to_string());
         } else {
@@ -2800,9 +2836,9 @@ pub fn order_urls_by_region(urls: &[&str], china: bool) -> Vec<String> {
         }
     }
     if china {
-        [domestic, neutral, global].concat()
+        [domestic_direct, domestic_proxies, neutral, global].concat()
     } else {
-        [global, neutral, domestic].concat()
+        [global, neutral, domestic_direct, domestic_proxies].concat()
     }
 }
 
@@ -3069,6 +3105,7 @@ fn delete_owner_sample() {
     }
 }
 
+#[derive(Clone, Copy)]
 struct OrtWheelSpec {
     size: u64,
     sha256: &'static str,
@@ -3078,81 +3115,105 @@ struct OrtWheelSpec {
     urls: &'static [&'static str],
 }
 
+#[allow(dead_code)]
+const ORT_WHEEL_MACOS: OrtWheelSpec = OrtWheelSpec {
+    size: 33_658_780,
+    sha256: "893d67c68ca9e7a58202fa8d96061ed86a5815b0925b5a97aef27b8ba246a20b",
+    inner_lib: "onnxruntime/capi/libonnxruntime.1.21.0.dylib",
+    inner_extra: None,
+    target_name: "libonnxruntime.dylib",
+    urls: &[
+        "https://mirrors.aliyun.com/pypi/packages/ff/21/593c9bc56002a6d1ea7c2236f4a648e081ec37c8d51db2383a9e83a63325/onnxruntime-1.21.0-cp312-cp312-macosx_13_0_universal2.whl",
+        "https://pypi.tuna.tsinghua.edu.cn/packages/ff/21/593c9bc56002a6d1ea7c2236f4a648e081ec37c8d51db2383a9e83a63325/onnxruntime-1.21.0-cp312-cp312-macosx_13_0_universal2.whl",
+        "https://files.pythonhosted.org/packages/ff/21/593c9bc56002a6d1ea7c2236f4a648e081ec37c8d51db2383a9e83a63325/onnxruntime-1.21.0-cp312-cp312-macosx_13_0_universal2.whl",
+    ],
+};
+
+#[allow(dead_code)]
+const ORT_WHEEL_WIN_X64: OrtWheelSpec = OrtWheelSpec {
+    size: 11_760_975,
+    sha256: "7f801318476cd7003d636a5b392f7a37c08b6c8d2f829773f3c3887029e03f32",
+    inner_lib: "onnxruntime/capi/onnxruntime.dll",
+    inner_extra: Some("onnxruntime/capi/onnxruntime_providers_shared.dll"),
+    target_name: "onnxruntime.dll",
+    urls: &[
+        "https://mirrors.aliyun.com/pypi/packages/77/39/e83d56e3c215713b5263cb4d4f0c69e3964bba11634233d8ae04fc7e6bf3/onnxruntime-1.21.0-cp312-cp312-win_amd64.whl",
+        "https://pypi.tuna.tsinghua.edu.cn/packages/77/39/e83d56e3c215713b5263cb4d4f0c69e3964bba11634233d8ae04fc7e6bf3/onnxruntime-1.21.0-cp312-cp312-win_amd64.whl",
+        "https://files.pythonhosted.org/packages/77/39/e83d56e3c215713b5263cb4d4f0c69e3964bba11634233d8ae04fc7e6bf3/onnxruntime-1.21.0-cp312-cp312-win_amd64.whl",
+    ],
+};
+
+#[allow(dead_code)]
+const ORT_WHEEL_WIN_ARM64: OrtWheelSpec = OrtWheelSpec {
+    size: 12_270_275,
+    sha256: "e6214096e14b7b52e3bee1903dc12dc7ca09cb65e26664668a4620cc5e6f9a90",
+    inner_lib: "onnxruntime/capi/onnxruntime.dll",
+    inner_extra: Some("onnxruntime/capi/onnxruntime_providers_shared.dll"),
+    target_name: "onnxruntime.dll",
+    urls: &[
+        "https://mirrors.aliyun.com/pypi/packages/43/06/8b8ec6e9e6a474fcd5d772453f627ad4549dfe3ab8c0bf70af5afcde551b/onnxruntime-1.24.4-cp312-cp312-win_arm64.whl",
+        "https://pypi.tuna.tsinghua.edu.cn/packages/43/06/8b8ec6e9e6a474fcd5d772453f627ad4549dfe3ab8c0bf70af5afcde551b/onnxruntime-1.24.4-cp312-cp312-win_arm64.whl",
+        "https://files.pythonhosted.org/packages/43/06/8b8ec6e9e6a474fcd5d772453f627ad4549dfe3ab8c0bf70af5afcde551b/onnxruntime-1.24.4-cp312-cp312-win_arm64.whl",
+    ],
+};
+
+#[allow(dead_code)]
+const ORT_WHEEL_LINUX_X64: OrtWheelSpec = OrtWheelSpec {
+    size: 16_019_285,
+    sha256: "9a04aafb802c1e5573ba4552f8babcb5021b041eb4cfa802c9b7644ca3510eca",
+    inner_lib: "onnxruntime/capi/libonnxruntime.so.1.21.0",
+    inner_extra: Some("onnxruntime/capi/libonnxruntime_providers_shared.so"),
+    target_name: "libonnxruntime.so",
+    urls: &[
+        "https://mirrors.aliyun.com/pypi/packages/8b/08/eead6895ed83b56711ca6c0d31d82f109401b9937558b425509e497d6fb4/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "https://pypi.tuna.tsinghua.edu.cn/packages/8b/08/eead6895ed83b56711ca6c0d31d82f109401b9937558b425509e497d6fb4/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "https://files.pythonhosted.org/packages/8b/08/eead6895ed83b56711ca6c0d31d82f109401b9937558b425509e497d6fb4/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    ],
+};
+
+#[allow(dead_code)]
+const ORT_WHEEL_LINUX_ARM64: OrtWheelSpec = OrtWheelSpec {
+    size: 14_159_975,
+    sha256: "37b7445c920a96271a8dfa16855e258dc5599235b41c7bbde0d262d55bcc105f",
+    inner_lib: "onnxruntime/capi/libonnxruntime.so.1.21.0",
+    inner_extra: Some("onnxruntime/capi/libonnxruntime_providers_shared.so"),
+    target_name: "libonnxruntime.so",
+    urls: &[
+        "https://mirrors.aliyun.com/pypi/packages/4a/b4/33ec675a8ac150478091262824413e5d4acc359e029af87f9152e7c1c092/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+        "https://pypi.tuna.tsinghua.edu.cn/packages/4a/b4/33ec675a8ac150478091262824413e5d4acc359e029af87f9152e7c1c092/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+        "https://files.pythonhosted.org/packages/4a/b4/33ec675a8ac150478091262824413e5d4acc359e029af87f9152e7c1c092/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+    ],
+};
+
+#[cfg(test)]
+const ALL_ORT_WHEELS: &[OrtWheelSpec] = &[
+    ORT_WHEEL_MACOS,
+    ORT_WHEEL_WIN_X64,
+    ORT_WHEEL_WIN_ARM64,
+    ORT_WHEEL_LINUX_X64,
+    ORT_WHEEL_LINUX_ARM64,
+];
+
 fn ort_wheel_spec() -> Option<OrtWheelSpec> {
     #[cfg(target_os = "macos")]
     {
-        Some(OrtWheelSpec {
-            size: 33_658_780,
-            sha256: "893d67c68ca9e7a58202fa8d96061ed86a5815b0925b5a97aef27b8ba246a20b",
-            inner_lib: "onnxruntime/capi/libonnxruntime.1.21.0.dylib",
-            inner_extra: None,
-            target_name: "libonnxruntime.dylib",
-            urls: &[
-                "https://mirrors.aliyun.com/pypi/packages/ff/21/593c9bc56002a6d1ea7c2236f4a648e081ec37c8d51db2383a9e83a63325/onnxruntime-1.21.0-cp312-cp312-macosx_13_0_universal2.whl",
-                "https://pypi.tuna.tsinghua.edu.cn/packages/ff/21/593c9bc56002a6d1ea7c2236f4a648e081ec37c8d51db2383a9e83a63325/onnxruntime-1.21.0-cp312-cp312-macosx_13_0_universal2.whl",
-                "https://files.pythonhosted.org/packages/ff/21/593c9bc56002a6d1ea7c2236f4a648e081ec37c8d51db2383a9e83a63325/onnxruntime-1.21.0-cp312-cp312-macosx_13_0_universal2.whl",
-            ],
-        })
+        Some(ORT_WHEEL_MACOS)
     }
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
-        Some(OrtWheelSpec {
-            size: 11_760_975,
-            sha256: "7f801318476cd7003d636a5b392f7a37c08b6c8d2f829773f3c3887029e03f32",
-            inner_lib: "onnxruntime/capi/onnxruntime.dll",
-            inner_extra: Some("onnxruntime/capi/onnxruntime_providers_shared.dll"),
-            target_name: "onnxruntime.dll",
-            urls: &[
-                "https://mirrors.aliyun.com/pypi/packages/77/39/e83d56e3c215713b5263cb4d4f0c69e3964bba11634233d8ae04fc7e6bf3/onnxruntime-1.21.0-cp312-cp312-win_amd64.whl",
-                "https://pypi.tuna.tsinghua.edu.cn/packages/77/39/e83d56e3c215713b5263cb4d4f0c69e3964bba11634233d8ae04fc7e6bf3/onnxruntime-1.21.0-cp312-cp312-win_amd64.whl",
-                "https://files.pythonhosted.org/packages/77/39/e83d56e3c215713b5263cb4d4f0c69e3964bba11634233d8ae04fc7e6bf3/onnxruntime-1.21.0-cp312-cp312-win_amd64.whl",
-            ],
-        })
+        Some(ORT_WHEEL_WIN_X64)
     }
     #[cfg(all(windows, target_arch = "aarch64"))]
     {
-        Some(OrtWheelSpec {
-            size: 12_270_275,
-            sha256: "e6214096e14b7b52e3bee1903dc12dc7ca09cb65e26664668a4620cc5e6f9a90",
-            inner_lib: "onnxruntime/capi/onnxruntime.dll",
-            inner_extra: Some("onnxruntime/capi/onnxruntime_providers_shared.dll"),
-            target_name: "onnxruntime.dll",
-            urls: &[
-                "https://mirrors.aliyun.com/pypi/packages/43/06/8b8ec6e9e6a474fcd5d772453f627ad4549dfe3ab8c0bf70af5afcde551b/onnxruntime-1.24.4-cp312-cp312-win_arm64.whl",
-                "https://pypi.tuna.tsinghua.edu.cn/packages/43/06/8b8ec6e9e6a474fcd5d772453f627ad4549dfe3ab8c0bf70af5afcde551b/onnxruntime-1.24.4-cp312-cp312-win_arm64.whl",
-                "https://files.pythonhosted.org/packages/43/06/8b8ec6e9e6a474fcd5d772453f627ad4549dfe3ab8c0bf70af5afcde551b/onnxruntime-1.24.4-cp312-cp312-win_arm64.whl",
-            ],
-        })
+        Some(ORT_WHEEL_WIN_ARM64)
     }
     #[cfg(all(unix, not(target_os = "macos"), target_arch = "x86_64"))]
     {
-        Some(OrtWheelSpec {
-            size: 16_019_285,
-            sha256: "9a04aafb802c1e5573ba4552f8babcb5021b041eb4cfa802c9b7644ca3510eca",
-            inner_lib: "onnxruntime/capi/libonnxruntime.so.1.21.0",
-            inner_extra: Some("onnxruntime/capi/libonnxruntime_providers_shared.so"),
-            target_name: "libonnxruntime.so",
-            urls: &[
-                "https://mirrors.aliyun.com/pypi/packages/8b/08/eead6895ed83b56711ca6c0d31d82f109401b9937558b425509e497d6fb4/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-                "https://pypi.tuna.tsinghua.edu.cn/packages/8b/08/eead6895ed83b56711ca6c0d31d82f109401b9937558b425509e497d6fb4/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-                "https://files.pythonhosted.org/packages/8b/08/eead6895ed83b56711ca6c0d31d82f109401b9937558b425509e497d6fb4/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-            ],
-        })
+        Some(ORT_WHEEL_LINUX_X64)
     }
     #[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
     {
-        Some(OrtWheelSpec {
-            size: 14_159_975,
-            sha256: "37b7445c920a96271a8dfa16855e258dc5599235b41c7bbde0d262d55bcc105f",
-            inner_lib: "onnxruntime/capi/libonnxruntime.so.1.21.0",
-            inner_extra: Some("onnxruntime/capi/libonnxruntime_providers_shared.so"),
-            target_name: "libonnxruntime.so",
-            urls: &[
-                "https://mirrors.aliyun.com/pypi/packages/4a/b4/33ec675a8ac150478091262824413e5d4acc359e029af87f9152e7c1c092/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
-                "https://pypi.tuna.tsinghua.edu.cn/packages/4a/b4/33ec675a8ac150478091262824413e5d4acc359e029af87f9152e7c1c092/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
-                "https://files.pythonhosted.org/packages/4a/b4/33ec675a8ac150478091262824413e5d4acc359e029af87f9152e7c1c092/onnxruntime-1.21.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
-            ],
-        })
+        Some(ORT_WHEEL_LINUX_ARM64)
     }
     #[cfg(not(any(
         target_os = "macos",
@@ -3184,6 +3245,22 @@ fn emit_progress(app: &AppHandle, snap: &DownloadSnapshot, received: u64, total:
             "done": done,
         }),
     );
+}
+
+fn is_html_content_type(ct: &str) -> bool {
+    let lower = ct.to_ascii_lowercase();
+    lower.contains("text/html") || lower.contains("application/xhtml")
+}
+
+fn looks_like_html_prefix(chunk: &[u8]) -> bool {
+    let trimmed = chunk
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take(32)
+        .collect::<Vec<u8>>();
+    let s = String::from_utf8_lossy(&trimmed).to_ascii_lowercase();
+    s.starts_with("<!doctype html") || s.starts_with("<html")
 }
 
 async fn download_verified_file<F>(
@@ -3220,6 +3297,17 @@ where
             }
         };
 
+        if let Some(ct) = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        {
+            if is_html_content_type(ct) {
+                last_err = format!("镜像返回网页错误 ({ct})");
+                continue;
+            }
+        }
+
         let file = File::create(part_path).map_err(|e| format!("创建临时文件失败：{e}"))?;
         let mut writer = BufWriter::new(file);
         let mut hasher = Sha256::new();
@@ -3235,6 +3323,10 @@ where
             }
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
+                    if got == 0 && expected_size > 4096 && looks_like_html_prefix(&chunk) {
+                        stream_err = Some("镜像返回网页错误".into());
+                        break;
+                    }
                     got = got.saturating_add(chunk.len() as u64);
                     if got > MAX_MODEL_BYTES {
                         stream_err = Some("文件大小超出限制".into());
@@ -3530,6 +3622,7 @@ pub async fn download_tier(app: &AppHandle, tier: &str) -> Result<VoiceAiState, 
         completed_bytes += spec.size;
     }
 
+    invalidate_live_model_cache();
     emit_progress(
         app,
         &DownloadSnapshot {
@@ -3749,6 +3842,7 @@ pub fn benchmark_device() -> Result<VoiceAiBenchmarkResult, String> {
             if let (Some(te), Some(tc)) = (loaded.tse_enroll.as_ref(), loaded.tse_chunk.as_ref()) {
                 let dummy = vec![0.01f32; OWNER_SAMPLE_LEN];
                 if let Ok((enr, _)) = models::VoxLockEnrollment::compute(&loaded.rt, te, &dummy) {
+                    let enr = Arc::new(enr);
                     if let Ok(mut ext) = models::TargetExtractor::new(&loaded.rt, tc, &enr) {
                         let first = vec![0.01f32; ext.required_input_samples()];
                         let _ = ext.step(&first);
@@ -4360,6 +4454,7 @@ pub fn stop_test() -> bool {
 pub fn shutdown() {
     cancel_download();
     lab::stop_all();
+    invalidate_live_model_cache();
 }
 
 /// Processes a complete 16 kHz mono recording before WAV encoding & transcription.
@@ -4445,6 +4540,7 @@ pub fn process_recording_with_config(samples: &[i16], cfg: &VoiceAiConfig) -> Pr
             if let (Some(te), Some(tc)) = (m.tse_enroll.as_ref(), m.tse_chunk.as_ref()) {
                 if let Ok((enr, _)) = models::VoxLockEnrollment::compute(&m.rt, te, &owner_sample)
                 {
+                    let enr = Arc::new(enr);
                     if let Ok(mut ext) = models::TargetExtractor::new(&m.rt, tc, &enr) {
                         if let Ok(extracted) = ext.process_buffer(&audio_buf) {
                             let in_rms = dsp::rms(&audio_buf).max(1e-5);
@@ -4529,6 +4625,849 @@ fn extract_voiced_speech(clean_hpf: &[f32], m: &models::LoadedModels) -> Vec<f32
         voiced
     } else {
         clean_hpf.to_vec()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cached ORT sessions & real-time 16 kHz / 320-sample call processor
+// ---------------------------------------------------------------------------
+
+struct CachedLiveModels {
+    models: Arc<models::LoadedModels>,
+    dpdf_ready: bool,
+    vad_ready: bool,
+    sv_ready: bool,
+    tse_ready: bool,
+}
+
+static LIVE_MODEL_CACHE: OnceLock<Mutex<Option<CachedLiveModels>>> = OnceLock::new();
+
+fn live_model_cache() -> &'static Mutex<Option<CachedLiveModels>> {
+    LIVE_MODEL_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn invalidate_live_model_cache() {
+    if let Ok(mut guard) = live_model_cache().lock() {
+        *guard = None;
+    }
+}
+
+fn cached_live_models(
+    need_dpdf: bool,
+    need_vad: bool,
+    need_sv: bool,
+    need_tse: bool,
+) -> Option<Arc<models::LoadedModels>> {
+    discover_ort_library()?;
+    let want_dpdf = need_dpdf && discover_model_path(&DPDF_SPEC).is_some();
+    let want_vad = need_vad && discover_model_path(&VAD_SPEC).is_some();
+    let want_sv = need_sv && discover_model_path(&SV_SPEC).is_some();
+    let want_tse = need_tse
+        && discover_model_path(&VOXLOCK_ENROLL_SPEC).is_some()
+        && discover_model_path(&VOXLOCK_CHUNK_SPEC).is_some();
+    if !want_dpdf && !want_vad && !want_sv && !want_tse {
+        return None;
+    }
+
+    let mut guard = live_model_cache().lock().ok()?;
+    if let Some(ref c) = *guard {
+        let satisfied = (!want_dpdf || c.dpdf_ready)
+            && (!want_vad || c.vad_ready)
+            && (!want_sv || c.sv_ready)
+            && (!want_tse || c.tse_ready);
+        if satisfied {
+            return Some(c.models.clone());
+        }
+    }
+
+    let prev_dpdf = guard.as_ref().is_some_and(|c| c.dpdf_ready);
+    let prev_vad = guard.as_ref().is_some_and(|c| c.vad_ready);
+    let prev_sv = guard.as_ref().is_some_and(|c| c.sv_ready);
+    let prev_tse = guard.as_ref().is_some_and(|c| c.tse_ready);
+    let loaded = Arc::new(
+        models::open_models(
+            want_dpdf || prev_dpdf,
+            want_vad || prev_vad,
+            want_sv || prev_sv,
+            want_tse || prev_tse,
+        )
+        .ok()?,
+    );
+    *guard = Some(CachedLiveModels {
+        models: loaded.clone(),
+        dpdf_ready: loaded.dpdf.is_some(),
+        vad_ready: loaded.vad.is_some(),
+        sv_ready: loaded.speaker.is_some(),
+        tse_ready: loaded.tse_enroll.is_some() && loaded.tse_chunk.is_some(),
+    });
+    Some(loaded)
+}
+
+#[inline]
+fn rms_level(samples: &[f32]) -> f32 {
+    let lvl = dsp::rms(samples) * 4.0;
+    if lvl.is_finite() {
+        lvl.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+struct SvJob {
+    slice: Vec<f32>,
+    is_end: bool,
+}
+
+struct SvResult {
+    emb: Vec<f32>,
+    used_samples: usize,
+    is_end: bool,
+}
+
+struct SvTracker {
+    enrolled: Option<Vec<f32>>,
+    prototypes: Vec<Vec<f32>>,
+    first_lock_mode: bool,
+    threshold: f32,
+    session_emb: Option<Vec<f32>>,
+    sv_confirmed_non_owner: bool,
+}
+
+impl SvTracker {
+    fn new(
+        enrolled: Option<&VoiceprintRecord>,
+        first_lock_mode: bool,
+        threshold: f32,
+    ) -> Self {
+        let centroid = enrolled.map(|v| dsp::normalize_embedding(&v.embedding));
+        let prototypes = enrolled
+            .map(|v| {
+                v.prototypes
+                    .iter()
+                    .map(|p| dsp::normalize_embedding(p))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            enrolled: centroid,
+            prototypes,
+            first_lock_mode,
+            threshold: clamp_threshold(threshold),
+            session_emb: None,
+            sv_confirmed_non_owner: false,
+        }
+    }
+
+    fn apply_result(
+        &mut self,
+        raw_emb: &[f32],
+        used_samples: usize,
+        is_end: bool,
+        speaking: bool,
+        tse_active: bool,
+        smoothed_tse_atten_db: f64,
+    ) {
+        let norm = dsp::normalize_embedding(raw_emb);
+        if norm.is_empty() {
+            return;
+        }
+        let req = if is_end {
+            self.threshold - 0.03
+        } else {
+            self.threshold - 0.01
+        };
+
+        if let Some(ref enrolled) = self.enrolled {
+            let sv = dsp::score_voiceprint(&norm, enrolled, &self.prototypes);
+            let effective_score = if let Some(ref sess) = self.session_emb {
+                let sess_cos = dsp::cosine(&norm, sess);
+                if sv.blended >= self.threshold - 0.12 {
+                    sv.blended.max(0.65 * sv.blended + 0.35 * sess_cos)
+                } else {
+                    sv.blended
+                }
+            } else {
+                sv.blended
+            };
+            if effective_score >= req {
+                self.sv_confirmed_non_owner = false;
+                if used_samples >= VOICE_RATE * 3 / 5
+                    && sv.blended >= (self.threshold + 0.08).max(0.46)
+                    && !(tse_active && smoothed_tse_atten_db < -6.0)
+                {
+                    self.update_session_ema(&norm);
+                }
+            } else if speaking {
+                self.sv_confirmed_non_owner = true;
+            }
+            return;
+        }
+
+        if self.first_lock_mode {
+            if let Some(ref sess) = self.session_emb {
+                let sc = dsp::cosine(&norm, sess);
+                if sc >= req {
+                    self.sv_confirmed_non_owner = false;
+                    if used_samples >= VOICE_RATE * 3 / 5
+                        && sc >= (self.threshold + 0.08).max(0.46)
+                        && !(tse_active && smoothed_tse_atten_db < -6.0)
+                    {
+                        self.update_session_ema(&norm);
+                    }
+                } else if speaking {
+                    self.sv_confirmed_non_owner = true;
+                }
+            } else {
+                self.sv_confirmed_non_owner = false;
+                if used_samples >= VOICE_RATE * 3 / 5 || is_end {
+                    self.session_emb = Some(norm);
+                }
+            }
+        }
+    }
+
+    fn update_session_ema(&mut self, emb: &[f32]) {
+        if let Some(ref cur) = self.session_emb {
+            if cur.len() == emb.len() {
+                let blended: Vec<f32> = cur
+                    .iter()
+                    .zip(emb.iter())
+                    .map(|(&c, &e)| 0.80 * c + 0.20 * e)
+                    .collect();
+                self.session_emb = Some(dsp::normalize_embedding(&blended));
+                return;
+            }
+        }
+        self.session_emb = Some(emb.to_vec());
+    }
+}
+
+struct TseRingBuffers {
+    in_ring: Vec<f32>,
+    in_read: usize,
+    out_tse: Vec<f32>,
+    out_raw: Vec<f32>,
+    out_read: usize,
+    bypassed: bool,
+    stopped: bool,
+    slow_steps: usize,
+}
+
+struct TseRing {
+    shared: Arc<Mutex<TseRingBuffers>>,
+    wake: Arc<std::sync::Condvar>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TseRing {
+    const PREBUFFER_SAMPLES: usize = 896;
+
+    fn start(mut ext: models::TargetExtractor) -> Self {
+        let shared = Arc::new(Mutex::new(TseRingBuffers {
+            in_ring: Vec::with_capacity(4096),
+            in_read: 0,
+            out_tse: vec![0.0; Self::PREBUFFER_SAMPLES],
+            out_raw: vec![0.0; Self::PREBUFFER_SAMPLES],
+            out_read: 0,
+            bypassed: false,
+            stopped: false,
+            slow_steps: 0,
+        }));
+        let wake = Arc::new(std::sync::Condvar::new());
+        let sh = shared.clone();
+        let wk = wake.clone();
+
+        let worker = std::thread::Builder::new()
+            .name("pocket-live-tse".into())
+            .spawn(move || loop {
+                let input_slice = {
+                    let mut guard = match sh.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    loop {
+                        if guard.stopped || guard.bypassed {
+                            return;
+                        }
+                        let need = ext.required_input_samples();
+                        if guard.in_ring.len() - guard.in_read >= need {
+                            let start = guard.in_read;
+                            let slice = guard.in_ring[start..start + need].to_vec();
+                            guard.in_read += need;
+                            if guard.in_read >= 4096 && guard.in_read * 2 >= guard.in_ring.len() {
+                                let drain_n = guard.in_read;
+                                guard.in_ring.drain(..drain_n);
+                                guard.in_read = 0;
+                            }
+                            break slice;
+                        }
+                        guard = match wk.wait(guard) {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                    }
+                };
+
+                let cur_k = ext.k_frames;
+                let step_res = ext.step_aligned(&input_slice);
+
+                let mut guard = match sh.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                if guard.stopped {
+                    return;
+                }
+                match step_res {
+                    Ok((tse_audio, raw_audio, ms)) => {
+                        let budget_ms = if cur_k <= 5 { 38.0 } else { 60.0 };
+                        if ms > budget_ms {
+                            guard.slow_steps += 1;
+                            if guard.slow_steps >= 3 {
+                                guard.slow_steps = 0;
+                                if cur_k <= 5 {
+                                    ext.set_k_frames(8);
+                                } else {
+                                    guard.bypassed = true;
+                                    return;
+                                }
+                            }
+                        } else {
+                            guard.slow_steps = 0;
+                        }
+                        guard.out_tse.extend_from_slice(&tse_audio);
+                        guard.out_raw.extend_from_slice(&raw_audio);
+                    }
+                    Err(_) => {
+                        guard.bypassed = true;
+                        return;
+                    }
+                }
+            })
+            .ok();
+
+        Self {
+            shared,
+            wake,
+            worker,
+        }
+    }
+
+    fn push_and_pop_320(
+        &self,
+        hpf_320: &[f32; 320],
+        out_tse: &mut [f32; 320],
+        out_raw: &mut [f32; 320],
+    ) -> bool {
+        let mut guard = match self.shared.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if guard.bypassed {
+            return false;
+        }
+        guard.in_ring.extend_from_slice(hpf_320);
+        self.wake.notify_one();
+
+        let avail = guard.out_tse.len() - guard.out_read;
+        if avail < 320 {
+            return false;
+        }
+        let start = guard.out_read;
+        out_tse.copy_from_slice(&guard.out_tse[start..start + 320]);
+        out_raw.copy_from_slice(&guard.out_raw[start..start + 320]);
+        guard.out_read += 320;
+        if guard.out_read >= 4096 && guard.out_read * 2 >= guard.out_tse.len() {
+            let r = guard.out_read;
+            guard.out_tse.drain(..r);
+            guard.out_raw.drain(..r);
+            guard.out_read = 0;
+        }
+        true
+    }
+}
+
+impl Drop for TseRing {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.stopped = true;
+            self.wake.notify_all();
+        }
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub struct LiveCallProcessor {
+    cfg: VoiceAiConfig,
+    hpf80: dsp::HighPass80,
+    denoiser: Option<models::Denoiser>,
+    noise_gate: dsp::SpectralNoiseGate,
+    enhancer: dsp::VocalEnhancer,
+    hpf64: dsp::HighPass64,
+    vad: Option<models::Vad>,
+    vad_boost: dsp::QuietVadBoost,
+    vad_accum: Vec<f32>,
+    clean_speech_buf: Vec<f32>,
+    has_sv: bool,
+    sv_tracker: SvTracker,
+    sv_tx: Option<std::sync::mpsc::Sender<SvJob>>,
+    sv_rx: Option<std::sync::mpsc::Receiver<SvResult>>,
+    sv_worker: Option<std::thread::JoinHandle<()>>,
+    sv_in_flight: bool,
+    speaking: bool,
+    start_run: usize,
+    sil_run: usize,
+    utt_voiced_w: usize,
+    since_check_w: usize,
+    early_tried: bool,
+    full_tried: bool,
+    last_vad_prob: f32,
+    tse: Option<TseRing>,
+    smoothed_tse_atten_db: f64,
+    suppressing_residual: bool,
+    gate_phase: usize,
+}
+
+#[allow(dead_code)]
+impl LiveCallProcessor {
+    const START_PROB: f32 = 0.45;
+    const SPEECH_PROB: f32 = 0.35;
+    const START_WINDOWS: usize = 3;
+    const END_WINDOWS: usize = 12;
+    const EARLY_VOICED_W: usize = 13;
+    const FULL_VOICED_W: usize = 26;
+    const RECHECK_STEP_W: usize = 20;
+    const MIN_END_VOICED_W: usize = 8;
+    const MAX_CLEAN_SPEECH_SAMPLES: usize = VOICE_RATE * 3 / 2;
+    const RAMP_SAMPLES: usize = 256;
+
+    pub fn new() -> Self {
+        Self::with_config(load_config())
+    }
+
+    pub fn with_config(cfg: VoiceAiConfig) -> Self {
+        Self::with_config_and_ort(cfg, true)
+    }
+
+    fn with_config_and_ort(mut cfg: VoiceAiConfig, use_ort: bool) -> Self {
+        cfg.tier = sanitize_tier(&cfg.tier);
+        cfg.threshold = clamp_threshold(cfg.threshold);
+
+        let raw_enrolled = cfg
+            .voiceprint
+            .as_ref()
+            .filter(|v| {
+                cfg.filter && !v.embedding.is_empty() && v.model_version == VOICEPRINT_MODEL_VERSION
+            })
+            .cloned();
+
+        let tse_files_ready = use_ort
+            && discover_model_path(&VOXLOCK_ENROLL_SPEC).is_some()
+            && discover_model_path(&VOXLOCK_CHUNK_SPEC).is_some()
+            && has_owner_sample();
+        let effective_tier = if cfg.tier == "denoise" {
+            "denoise"
+        } else if cfg.tier == "tse" {
+            "tse"
+        } else if cfg.tier == "sv" {
+            "sv"
+        } else if raw_enrolled.is_some()
+            && tse_files_ready
+            && cfg
+                .recommended_tier
+                .as_deref()
+                .is_none_or(|r| r == "tse")
+        {
+            "tse"
+        } else {
+            "sv"
+        };
+
+        let enrolled = if effective_tier != "denoise" {
+            raw_enrolled
+        } else {
+            None
+        };
+        let first_lock_mode =
+            effective_tier != "denoise" && enrolled.is_none() && cfg.first_speaker;
+        let want_identity = enrolled.is_some() || first_lock_mode;
+        let want_tse = effective_tier == "tse" && enrolled.is_some() && tse_files_ready;
+
+        let loaded = if use_ort && (cfg.denoise || want_identity || want_tse) {
+            cached_live_models(cfg.denoise, want_identity || want_tse, want_identity, want_tse)
+        } else {
+            None
+        };
+
+        let denoiser = if cfg.denoise {
+            loaded.as_ref().and_then(|m| {
+                m.dpdf
+                    .as_ref()
+                    .zip(m.dpdf_cfg.as_ref())
+                    .map(|(sess, dcfg)| models::Denoiser::new(&m.rt, sess, dcfg))
+            })
+        } else {
+            None
+        };
+
+        let vad = if want_identity || want_tse {
+            loaded
+                .as_ref()
+                .and_then(|m| m.vad.as_ref().map(|sess| models::Vad::new(&m.rt, sess)))
+        } else {
+            None
+        };
+
+        let tse = if want_tse {
+            loaded.as_ref().and_then(|m| {
+                let te = m.tse_enroll.as_ref()?;
+                let tc = m.tse_chunk.as_ref()?;
+                let sample = load_owner_sample()?;
+                let (enr, _) = models::VoxLockEnrollment::compute(&m.rt, te, &sample).ok()?;
+                let ext = models::TargetExtractor::new(&m.rt, tc, &Arc::new(enr)).ok()?;
+                Some(TseRing::start(ext))
+            })
+        } else {
+            None
+        };
+
+        let mut has_sv = false;
+        let mut sv_tx = None;
+        let mut sv_rx = None;
+        let mut sv_worker = None;
+        if want_identity {
+            if let Some(ref m) = loaded {
+                if let Some(sp_sess) = m.speaker.as_ref() {
+                    let speaker = models::Speaker::new(&m.rt, sp_sess);
+                    let (job_tx, job_rx) = std::sync::mpsc::channel::<SvJob>();
+                    let (res_tx, res_rx) = std::sync::mpsc::channel::<SvResult>();
+                    if let Ok(handle) = std::thread::Builder::new()
+                        .name("pocket-live-sv".into())
+                        .spawn(move || {
+                            while let Ok(job) = job_rx.recv() {
+                                let used_samples = job.slice.len();
+                                if let Ok(emb) = speaker.embed(&job.slice) {
+                                    let _ = res_tx.send(SvResult {
+                                        emb,
+                                        used_samples,
+                                        is_end: job.is_end,
+                                    });
+                                } else {
+                                    let _ = res_tx.send(SvResult {
+                                        emb: Vec::new(),
+                                        used_samples,
+                                        is_end: job.is_end,
+                                    });
+                                }
+                            }
+                        })
+                    {
+                        has_sv = true;
+                        sv_tx = Some(job_tx);
+                        sv_rx = Some(res_rx);
+                        sv_worker = Some(handle);
+                    }
+                }
+            }
+        }
+
+        let sv_tracker = SvTracker::new(enrolled.as_ref(), first_lock_mode, cfg.threshold);
+
+        Self {
+            cfg,
+            hpf80: dsp::HighPass80::default(),
+            denoiser,
+            noise_gate: dsp::SpectralNoiseGate::default(),
+            enhancer: dsp::VocalEnhancer::default(),
+            hpf64: dsp::HighPass64::default(),
+            vad,
+            vad_boost: dsp::QuietVadBoost::default(),
+            vad_accum: Vec::with_capacity(models::Vad::WINDOW + 320),
+            clean_speech_buf: Vec::with_capacity(Self::MAX_CLEAN_SPEECH_SAMPLES + models::Vad::WINDOW),
+            has_sv,
+            sv_tracker,
+            sv_tx,
+            sv_rx,
+            sv_worker,
+            sv_in_flight: false,
+            speaking: false,
+            start_run: 0,
+            sil_run: 0,
+            utt_voiced_w: 0,
+            since_check_w: 0,
+            early_tried: false,
+            full_tried: false,
+            last_vad_prob: 0.0,
+            tse,
+            smoothed_tse_atten_db: 0.0,
+            suppressing_residual: false,
+            gate_phase: Self::RAMP_SAMPLES,
+        }
+    }
+
+    pub fn process_frame_320(&mut self, pcm320: &[i16]) -> ([i16; 320], f32) {
+        let mut in_f32 = [0.0f32; 320];
+        let n = pcm320.len().min(320);
+        for i in 0..n {
+            in_f32[i] = f32::from(pcm320[i]) / 32768.0;
+        }
+
+        if !self.cfg.denoise && !self.cfg.enhance_vocal && !self.has_sv {
+            let mut out_pcm = [0i16; 320];
+            out_pcm[..n].copy_from_slice(&pcm320[..n]);
+            return (out_pcm, rms_level(&in_f32));
+        }
+
+        self.poll_sv_results();
+        let mut clean_hpf = [0.0f32; 320];
+        self.hpf64.process_slice(&in_f32, &mut clean_hpf);
+        if self.has_sv || self.tse.is_some() {
+            self.feed_clean_vad(&clean_hpf);
+        }
+
+        let mut audio_buf = in_f32;
+        self.hpf80.process_in_place(&mut audio_buf);
+
+        let mut raw_aligned = audio_buf;
+        let tse_in = audio_buf;
+        let used_tse = if let Some(ref tse) = self.tse {
+            tse.push_and_pop_320(&tse_in, &mut audio_buf, &mut raw_aligned)
+        } else {
+            false
+        };
+        if used_tse && self.last_vad_prob >= Self::SPEECH_PROB {
+            let raw_rms = dsp::rms(&raw_aligned);
+            if raw_rms > 0.012 {
+                let tse_rms = dsp::rms(&audio_buf);
+                let hop_atten = 20.0
+                    * (f64::from(tse_rms.max(1e-5)) / f64::from(raw_rms.max(1e-5))).log10();
+                self.smoothed_tse_atten_db =
+                    0.78 * self.smoothed_tse_atten_db + 0.22 * hop_atten;
+            }
+        } else if !used_tse {
+            self.smoothed_tse_atten_db = 0.0;
+        }
+
+        if self.cfg.denoise {
+            let mut denoised = [0.0f32; 320];
+            let mut used_dpdf = false;
+            if let Some(ref mut d) = self.denoiser {
+                if d.hop(&audio_buf[..160], &mut denoised[..160]).is_ok()
+                    && d.hop(&audio_buf[160..320], &mut denoised[160..320]).is_ok()
+                {
+                    used_dpdf = true;
+                }
+            }
+            if !used_dpdf {
+                self.noise_gate
+                    .process_hop(&audio_buf[..160], &mut denoised[..160]);
+                self.noise_gate
+                    .process_hop(&audio_buf[160..320], &mut denoised[160..320]);
+            }
+            audio_buf = denoised;
+        }
+
+        if self.cfg.enhance_vocal {
+            self.enhancer.process_in_place(&mut audio_buf);
+        } else if self.cfg.denoise {
+            for s in &mut audio_buf {
+                *s = dsp::soft_limit(*s);
+            }
+        }
+
+        self.update_residual_gate(used_tse);
+        self.apply_residual_gate(&mut audio_buf);
+
+        let mut out_pcm = [0i16; 320];
+        for (dst, &s) in out_pcm.iter_mut().zip(audio_buf.iter()) {
+            let clamped = if s.is_finite() { s } else { 0.0 };
+            *dst = (clamped * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+        }
+        (out_pcm, rms_level(&audio_buf))
+    }
+
+    fn feed_clean_vad(&mut self, clean_hpf: &[f32; 320]) {
+        self.vad_accum.extend_from_slice(clean_hpf);
+        while self.vad_accum.len() >= models::Vad::WINDOW {
+            let win: Vec<f32> = self.vad_accum.drain(..models::Vad::WINDOW).collect();
+            let mut boosted = [0.0f32; models::Vad::WINDOW];
+            self.vad_boost.prepare(&win, &mut boosted);
+            let p = if let Some(ref mut vad) = self.vad {
+                vad.prob(&boosted).unwrap_or(0.0)
+            } else if dsp::rms(&win) > 0.012 {
+                0.8
+            } else {
+                0.1
+            };
+            self.last_vad_prob = p;
+            let is_voiced = p >= Self::SPEECH_PROB;
+            if is_voiced {
+                self.clean_speech_buf.extend_from_slice(&win);
+                if self.clean_speech_buf.len() > Self::MAX_CLEAN_SPEECH_SAMPLES {
+                    let drop_n = self.clean_speech_buf.len() - Self::MAX_CLEAN_SPEECH_SAMPLES;
+                    self.clean_speech_buf.drain(..drop_n);
+                }
+            }
+
+            let mut just_ended = false;
+            if !self.speaking {
+                self.start_run = if p >= Self::START_PROB {
+                    self.start_run + 1
+                } else {
+                    0
+                };
+                if self.start_run >= Self::START_WINDOWS {
+                    self.speaking = true;
+                    self.sil_run = 0;
+                    self.utt_voiced_w = usize::from(is_voiced);
+                    self.since_check_w = 0;
+                    self.early_tried = false;
+                    self.full_tried = false;
+                    self.sv_tracker.sv_confirmed_non_owner = false;
+                }
+            } else if is_voiced {
+                self.sil_run = 0;
+                self.utt_voiced_w += 1;
+                self.since_check_w += 1;
+            } else {
+                self.sil_run += 1;
+                if self.sil_run >= Self::END_WINDOWS {
+                    self.speaking = false;
+                    self.start_run = 0;
+                    just_ended = true;
+                }
+            }
+
+            if !self.has_sv {
+                if just_ended {
+                    self.clean_speech_buf.clear();
+                }
+                continue;
+            }
+
+            if self.speaking && !self.sv_in_flight {
+                if !self.early_tried && self.utt_voiced_w >= Self::EARLY_VOICED_W {
+                    self.early_tried = true;
+                    self.launch_sv_check(VOICE_RATE * 3 / 5, false);
+                } else if !self.full_tried && self.utt_voiced_w >= Self::FULL_VOICED_W {
+                    self.full_tried = true;
+                    self.launch_sv_check(VOICE_RATE, false);
+                } else if self.full_tried && self.since_check_w >= Self::RECHECK_STEP_W {
+                    self.launch_sv_check(Self::MAX_CLEAN_SPEECH_SAMPLES, false);
+                }
+            } else if just_ended {
+                if !self.sv_in_flight && !self.full_tried && self.utt_voiced_w >= Self::MIN_END_VOICED_W
+                {
+                    self.launch_sv_check(VOICE_RATE, true);
+                }
+                self.suppressing_residual = false;
+                self.sv_tracker.sv_confirmed_non_owner = false;
+                self.clean_speech_buf.clear();
+            }
+        }
+    }
+
+    fn launch_sv_check(&mut self, max_samples: usize, is_end: bool) {
+        let Some(ref tx) = self.sv_tx else {
+            return;
+        };
+        let take_len = self.clean_speech_buf.len().min(max_samples);
+        if take_len < VOICE_RATE / 5 {
+            return;
+        }
+        let start = self.clean_speech_buf.len() - take_len;
+        let slice = self.clean_speech_buf[start..].to_vec();
+        if tx.send(SvJob { slice, is_end }).is_ok() {
+            self.sv_in_flight = true;
+            self.since_check_w = 0;
+        }
+    }
+
+    fn poll_sv_results(&mut self) {
+        let Some(ref rx) = self.sv_rx else {
+            return;
+        };
+        while let Ok(res) = rx.try_recv() {
+            self.sv_in_flight = false;
+            if res.emb.is_empty() {
+                continue;
+            }
+            self.sv_tracker.apply_result(
+                &res.emb,
+                res.used_samples,
+                res.is_end,
+                self.speaking,
+                self.tse.is_some(),
+                self.smoothed_tse_atten_db,
+            );
+        }
+    }
+
+    fn update_residual_gate(&mut self, used_tse: bool) {
+        if !self.has_sv {
+            self.suppressing_residual = false;
+            return;
+        }
+        if !self.speaking || !self.sv_tracker.sv_confirmed_non_owner {
+            self.suppressing_residual = false;
+            return;
+        }
+        if used_tse {
+            if self.suppressing_residual {
+                if self.smoothed_tse_atten_db >= -7.5 {
+                    self.suppressing_residual = false;
+                }
+            } else if self.smoothed_tse_atten_db < -9.0 {
+                self.suppressing_residual = true;
+            }
+        } else {
+            self.suppressing_residual = true;
+        }
+    }
+
+    fn apply_residual_gate(&mut self, audio_buf: &mut [f32; 320]) {
+        if !self.suppressing_residual && self.gate_phase >= Self::RAMP_SAMPLES {
+            return;
+        }
+        for sample in audio_buf.iter_mut() {
+            if self.suppressing_residual {
+                if self.gate_phase > 0 {
+                    self.gate_phase -= 1;
+                }
+            } else if self.gate_phase < Self::RAMP_SAMPLES {
+                self.gate_phase += 1;
+            }
+            let gain = if self.gate_phase >= Self::RAMP_SAMPLES {
+                1.0
+            } else if self.gate_phase == 0 {
+                0.0
+            } else {
+                0.5 - 0.5
+                    * (std::f32::consts::PI * (self.gate_phase as f32)
+                        / (Self::RAMP_SAMPLES as f32))
+                        .cos()
+            };
+            *sample *= gain;
+        }
+    }
+}
+
+impl Default for LiveCallProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LiveCallProcessor {
+    fn drop(&mut self) {
+        drop(self.sv_tx.take());
+        if let Some(handle) = self.sv_worker.take() {
+            let _ = handle.join();
+        }
+        self.tse.take();
     }
 }
 
@@ -4782,5 +5721,252 @@ mod tests {
         let silence = [0.0f32; 512];
         let p = vad.prob(&silence).expect("run Silero VAD");
         assert!((0.0..=1.0).contains(&p));
+    }
+
+    fn is_valid_sha256_hex(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    #[test]
+    fn model_specs_and_ort_wheels_have_valid_64_char_lowercase_sha256() {
+        for spec in ALL_MODEL_SPECS {
+            assert!(spec.size > 0, "empty size for {}", spec.file_name);
+            assert!(
+                is_valid_sha256_hex(spec.sha256),
+                "invalid sha256 for {}: {}",
+                spec.file_name,
+                spec.sha256
+            );
+            assert!(!spec.urls.is_empty(), "empty urls for {}", spec.file_name);
+        }
+
+        for wheel in ALL_ORT_WHEELS {
+            assert!(wheel.size > 0, "empty wheel size for {}", wheel.target_name);
+            assert!(
+                is_valid_sha256_hex(wheel.sha256),
+                "invalid wheel sha256 for {}: {}",
+                wheel.target_name,
+                wheel.sha256
+            );
+            assert!(!wheel.urls.is_empty(), "empty wheel urls for {}", wheel.target_name);
+        }
+        if let Some(cur) = ort_wheel_spec() {
+            assert!(is_valid_sha256_hex(cur.sha256));
+        }
+
+        let sv_hf_mirror = SV_SPEC
+            .urls
+            .iter()
+            .position(|u| u.contains("hf-mirror.com"))
+            .expect("SV_SPEC missing hf-mirror");
+        let sv_hf_origin = SV_SPEC
+            .urls
+            .iter()
+            .position(|u| u.contains("huggingface.co"))
+            .expect("SV_SPEC missing huggingface");
+        let sv_ghfast = SV_SPEC
+            .urls
+            .iter()
+            .position(|u| u.contains("ghfast.top"))
+            .expect("SV_SPEC missing ghfast.top");
+        assert!(sv_hf_mirror < sv_ghfast);
+        assert!(sv_hf_origin < sv_ghfast);
+
+        let mixed = &[
+            "https://ghfast.top/https://github.com/foo/bar.onnx",
+            "https://gh-proxy.com/https://github.com/foo/bar.onnx",
+            "https://hf-mirror.com/foo/bar.onnx",
+            "https://github.com/foo/bar.onnx",
+        ];
+        let cn = expand_github_mirrors(mixed, true);
+        let cn_hf = cn.iter().position(|u| u.contains("hf-mirror.com")).unwrap();
+        let cn_proxy = cn.iter().position(|u| u.contains("ghfast.top")).unwrap();
+        assert!(cn_hf < cn_proxy, "expected hf-mirror before ghfast in cn: {cn:?}");
+
+        assert!(is_html_content_type("text/html; charset=utf-8"));
+        assert!(is_html_content_type("Application/XHTML+XML"));
+        assert!(!is_html_content_type("application/octet-stream"));
+        assert!(looks_like_html_prefix(b"  <!DOCTYPE html><html>"));
+        assert!(!looks_like_html_prefix(b"\x08\x08\x12\x02pt"));
+    }
+
+    #[test]
+    fn bundled_dpdf_and_vad_models_match_file_sha256_and_size() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mobile/modules/pocket-native/ios/Resources/voice");
+        for spec in [DPDF_SPEC, VAD_SPEC] {
+            let path = dir.join(spec.file_name);
+            let meta = fs::metadata(&path).expect("bundled model file missing");
+            assert_eq!(meta.len(), spec.size, "size mismatch for {}", spec.file_name);
+            let digest = file_sha256(&path).expect("sha256 failed");
+            assert_eq!(digest, spec.sha256, "sha256 mismatch for {}", spec.file_name);
+        }
+    }
+
+    #[test]
+    fn live_call_processor_pure_rust_dsp_filters_rumble_enhances_speech_and_clamps_peak() {
+        let mut proc = LiveCallProcessor::with_config_and_ort(VoiceAiConfig::default(), false);
+        let silence = [0i16; 320];
+        for _ in 0..8 {
+            let (out, lvl) = proc.process_frame_320(&silence);
+            assert_eq!(out.len(), 320);
+            assert!(lvl < 0.01, "expected near-zero level on silence, got {lvl}");
+        }
+
+        // Low-frequency 30 Hz rumble should be strongly attenuated by HighPass80 + noise gate.
+        let mut no_agc_cfg = VoiceAiConfig::default();
+        no_agc_cfg.enhance_vocal = false;
+        let mut proc_hpf = LiveCallProcessor::with_config_and_ort(no_agc_cfg, false);
+        let mut rumble = [0i16; 320];
+        let mut last_rumble_lvl = 1.0f32;
+        for f in 0..20 {
+            for (i, s) in rumble.iter_mut().enumerate() {
+                let idx = f * 320 + i;
+                let v = 0.35 * (2.0 * PI * 30.0 * (idx as f64) / 16000.0).sin();
+                *s = (v * 32767.0) as i16;
+            }
+            let (_out, lvl) = proc_hpf.process_frame_320(&rumble);
+            last_rumble_lvl = lvl;
+        }
+        assert!(
+            last_rumble_lvl < 0.15,
+            "expected 30Hz rumble attenuation (HPF80 + noise gate), got level {last_rumble_lvl}"
+        );
+
+        let mut last_full_rumble_lvl = 1.0f32;
+        for f in 0..20 {
+            for (i, s) in rumble.iter_mut().enumerate() {
+                let idx = f * 320 + i;
+                let v = 0.35 * (2.0 * PI * 30.0 * (idx as f64) / 16000.0).sin();
+                *s = (v * 32767.0) as i16;
+            }
+            let (_out, lvl) = proc.process_frame_320(&rumble);
+            last_full_rumble_lvl = lvl;
+        }
+        assert!(
+            last_full_rumble_lvl < 0.50,
+            "expected 30Hz rumble attenuated well below raw 0.99 level, got {last_full_rumble_lvl}"
+        );
+
+        // Hot speech-band signal should stay preserved and peak-limited <= 0.92.
+        let mut proc_hot = LiveCallProcessor::with_config_and_ort(VoiceAiConfig::default(), false);
+        let mut hot = [0i16; 320];
+        let mut peak_i16 = 0i16;
+        let mut speech_lvl = 0.0f32;
+        for f in 0..15 {
+            for (i, s) in hot.iter_mut().enumerate() {
+                let idx = f * 320 + i;
+                let v = (2.0 * PI * 900.0 * (idx as f64) / 16000.0).sin();
+                *s = (v * 32767.0) as i16;
+            }
+            let (out, lvl) = proc_hot.process_frame_320(&hot);
+            speech_lvl = lvl;
+            for &x in &out {
+                peak_i16 = peak_i16.max(x.saturating_abs());
+            }
+        }
+        assert!(speech_lvl > 0.2 && speech_lvl <= 1.0, "level={speech_lvl}");
+        assert!(
+            f32::from(peak_i16) / 32768.0 <= 0.93,
+            "expected soft-limited peak <= 0.92, got {}",
+            f32::from(peak_i16) / 32768.0
+        );
+    }
+
+    #[test]
+    fn live_call_processor_smoothly_attenuates_non_owner_and_supports_first_speaker_lock() {
+        let mut cfg = VoiceAiConfig::default();
+        cfg.denoise = false;
+        cfg.enhance_vocal = false;
+        cfg.filter = true;
+        cfg.threshold = 0.40;
+        cfg.voiceprint = Some(VoiceprintRecord {
+            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            prototypes: vec![vec![1.0, 0.0, 0.0, 0.0]],
+            model_version: VOICEPRINT_MODEL_VERSION.into(),
+            has_sample: false,
+            route: None,
+            snr_db: None,
+            seconds: 5.0,
+            consistency: 0.9,
+            lowest: 0.85,
+            created_at: 0,
+        });
+
+        let mut proc = LiveCallProcessor::with_config_and_ort(cfg, false);
+        proc.has_sv = true;
+        proc.speaking = true;
+
+        let mut tone = [0i16; 320];
+        for (i, s) in tone.iter_mut().enumerate() {
+            *s = (0.45 * (2.0 * PI * 600.0 * (i as f64) / 16000.0).sin() * 32767.0) as i16;
+        }
+
+        // Owner passes -> unattenuated (warm up HPF80 for one frame first, then check steady phase).
+        proc.sv_tracker
+            .apply_result(&[0.98, 0.1, 0.0, 0.0], 16_000, false, true, false, 0.0);
+        let _ = proc.process_frame_320(&tone);
+        let (owner_out, owner_lvl) = proc.process_frame_320(&tone);
+        assert!(owner_lvl > 0.3, "expected owner level > 0.3, got {owner_lvl}");
+
+        // Non-owner rejected -> smooth ramp down across first frame, then muted on next frame.
+        proc.sv_tracker
+            .apply_result(&[0.0, 1.0, 0.0, 0.0], 16_000, false, true, false, 0.0);
+        let (ramp_out, _) = proc.process_frame_320(&tone);
+        // First sample should stay continuous with steady-state HPF80 owner_out[0] (~1.0 gain, no click).
+        assert!(
+            (ramp_out[0] - owner_out[0]).abs() < 250,
+            "expected smooth start of attenuation: got {}, expected ~{}",
+            ramp_out[0],
+            owner_out[0]
+        );
+        assert_eq!(ramp_out[300], 0, "expected tail of 320-sample frame fully attenuated");
+
+        let (muted_out, muted_lvl) = proc.process_frame_320(&tone);
+        assert!(muted_out.iter().all(|&s| s == 0));
+        assert_eq!(muted_lvl, 0.0);
+
+        // Owner returns -> smooth ramp back up.
+        proc.sv_tracker
+            .apply_result(&[1.0, 0.0, 0.0, 0.0], 16_000, false, true, false, 0.0);
+        let _ = proc.process_frame_320(&tone);
+        let (_, recovered_lvl) = proc.process_frame_320(&tone);
+        assert!(recovered_lvl > 0.3, "expected recovered owner level, got {recovered_lvl}");
+
+        // First-speaker lock mode: locks onto initial speaker, rejects second speaker.
+        let mut tracker = SvTracker::new(None, true, 0.40);
+        tracker.apply_result(&[0.0, 1.0, 0.0, 0.0], 9_600, false, true, false, 0.0);
+        assert!(tracker.session_emb.is_some());
+        assert!(!tracker.sv_confirmed_non_owner);
+
+        tracker.apply_result(&[0.0, 0.99, 0.1, 0.0], 16_000, false, true, false, 0.0);
+        assert!(!tracker.sv_confirmed_non_owner);
+
+        tracker.apply_result(&[1.0, 0.0, 0.0, 0.0], 16_000, false, true, false, 0.0);
+        assert!(tracker.sv_confirmed_non_owner);
+    }
+
+    #[test]
+    fn live_call_processor_streams_with_real_ort_when_available() {
+        let Some(_) = discover_ort_library() else {
+            return;
+        };
+        let Some(_) = discover_model_path(&DPDF_SPEC) else {
+            return;
+        };
+        let mut proc = LiveCallProcessor::with_config(VoiceAiConfig::default());
+        let mut frame = [0i16; 320];
+        let mut last_lvl = 0.0f32;
+        for f in 0..10 {
+            for (i, s) in frame.iter_mut().enumerate() {
+                let idx = f * 320 + i;
+                let v = 0.18 * (2.0 * PI * 440.0 * (idx as f64) / 16000.0).sin();
+                *s = (v * 32767.0) as i16;
+            }
+            let (out, lvl) = proc.process_frame_320(&frame);
+            assert_eq!(out.len(), 320);
+            last_lvl = lvl;
+        }
+        assert!(last_lvl > 0.0 && last_lvl <= 1.0, "unexpected ORT level {last_lvl}");
     }
 }

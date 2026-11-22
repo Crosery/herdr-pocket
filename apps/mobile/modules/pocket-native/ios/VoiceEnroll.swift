@@ -332,14 +332,14 @@ enum VoiceModelManager {
   private static let eres2netSpec = ModelSpec(
     fileName: "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
     stampName: "eres2netv2.ok",
-    size: 71_441_526,
-    sha256: "bf1a75b9930474cf3389ef415e6e5d38ca96fea4a3a00f7e301d080a58ee2239",
+    size: 71_441_527,
+    sha256: "eda0bf86422a9725a3523d5a1d3d75dedf340664e0ba65cfc1c7b2a78b6cf0b5",
     urls: [
+      "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
+      "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://cdn.gh-proxy.com/https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
-      "https://hf-mirror.com/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
-      "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx",
     ]
   )
@@ -367,8 +367,8 @@ enum VoiceModelManager {
   )
 
   private static let allSpecs: [ModelSpec] = [eres2netSpec, voxlockEnrollSpec, voxlockChunkSpec]
-  static let svSize: Int64 = eres2netSpec.size // 71_441_526
-  static let speakerSize: Int64 = 149_025_914
+  static let svSize: Int64 = eres2netSpec.size // 71_441_527
+  static let speakerSize: Int64 = 149_025_915
 
   private static let lock = NSLock()
   private static var activeToken: FastDownloader.CancelToken?
