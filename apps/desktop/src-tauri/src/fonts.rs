@@ -14,12 +14,23 @@ use std::sync::{Mutex, OnceLock};
 
 const MAX_FONT_FILE_BYTES: u64 = 48 * 1024 * 1024;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HerdrTerminalPrefs {
+    pub font: Option<String>,
+    pub font_size: Option<u16>,
+    pub line_height: Option<u16>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FontCatalog {
     pub families: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub herdr_font: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr_font_size: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr_line_height: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbols_font: Option<String>,
 }
@@ -96,9 +107,128 @@ fn font_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn read_herdr_app_font() -> Option<String> {
-    let home = crate::home_dir()?;
-    let path = home.join(".config").join("herdr-app").join("settings.json");
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else {
+            match ch {
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '#' => return &line[..idx],
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
+fn parse_toml_string(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let parsed = serde_json::from_str::<String>(s)
+            .ok()
+            .unwrap_or_else(|| s[1..s.len() - 1].to_string());
+        let trimmed = parsed.trim();
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        let trimmed = s[1..s.len() - 1].trim();
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    None
+}
+
+pub fn parse_herdr_terminal_toml(toml_str: &str) -> HerdrTerminalPrefs {
+    let mut out = HerdrTerminalPrefs::default();
+    let mut in_terminal = false;
+
+    for raw_line in toml_str.lines() {
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            if !line.starts_with("[[") && line.ends_with(']') {
+                let section = line[1..line.len() - 1].trim();
+                in_terminal = section == "terminal";
+            } else {
+                in_terminal = false;
+            }
+            continue;
+        }
+        if !in_terminal {
+            continue;
+        }
+        let Some((raw_key, raw_val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        let val = raw_val.trim();
+        match key {
+            "family" => {
+                if let Some(fam) = parse_toml_string(val) {
+                    out.font = Some(fam);
+                }
+            }
+            "size" => {
+                if let Ok(v) = val.parse::<f64>() {
+                    if v.is_finite() {
+                        let rounded = v.round();
+                        if (10.0..=28.0).contains(&rounded) {
+                            out.font_size = Some((rounded as u16).clamp(10, 28));
+                        }
+                    }
+                }
+            }
+            "line_height" => {
+                if let Ok(v) = val.parse::<f64>() {
+                    if v.is_finite() && (1.0..=2.0).contains(&v) {
+                        out.line_height = Some(((v * 100.0).round() as u16).clamp(100, 200));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn merge_herdr_prefs(dst: &mut HerdrTerminalPrefs, src: HerdrTerminalPrefs) {
+    if dst.font.is_none() {
+        dst.font = src.font;
+    }
+    if dst.font_size.is_none() {
+        dst.font_size = src.font_size;
+    }
+    if dst.line_height.is_none() {
+        dst.line_height = src.line_height;
+    }
+}
+
+fn read_legacy_herdr_app_font(path: &Path) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     v.get("font")
@@ -106,6 +236,46 @@ fn read_herdr_app_font() -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
+}
+
+pub fn read_herdr_terminal_prefs_in(
+    herdr_dir: Option<&Path>,
+    legacy_settings: Option<&Path>,
+) -> HerdrTerminalPrefs {
+    let mut prefs = HerdrTerminalPrefs::default();
+    if let Some(dir) = herdr_dir {
+        if let Ok(raw) = fs::read_to_string(dir.join("config-gpui.local.toml")) {
+            merge_herdr_prefs(&mut prefs, parse_herdr_terminal_toml(&raw));
+        }
+        if let Ok(raw) = fs::read_to_string(dir.join("config-gpui.toml")) {
+            merge_herdr_prefs(&mut prefs, parse_herdr_terminal_toml(&raw));
+        }
+    }
+    if prefs.font.is_none() {
+        if let Some(path) = legacy_settings {
+            prefs.font = read_legacy_herdr_app_font(path);
+        }
+    }
+    prefs
+}
+
+fn herdr_config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let non_empty = match xdg.to_str() {
+            Some(s) => !s.trim().is_empty(),
+            None => !xdg.is_empty(),
+        };
+        if non_empty {
+            return Some(PathBuf::from(xdg).join("herdr"));
+        }
+    }
+    crate::home_dir().map(|h| h.join(".config").join("herdr"))
+}
+
+fn read_herdr_terminal_prefs() -> HerdrTerminalPrefs {
+    let herdr_dir = herdr_config_dir();
+    let legacy = crate::home_dir().map(|h| h.join(".config").join("herdr-app").join("settings.json"));
+    read_herdr_terminal_prefs_in(herdr_dir.as_deref(), legacy.as_deref())
 }
 
 fn be_u16(b: &[u8]) -> u16 {
@@ -552,10 +722,12 @@ fn extract_ttc_face(file_bytes: &[u8], index: u32) -> Result<Vec<u8>, String> {
 #[tauri::command]
 pub async fn terminal_list_fonts() -> Result<FontCatalog, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let herdr_font = read_herdr_app_font();
+        let prefs = read_herdr_terminal_prefs();
         ensure_cache(|c| FontCatalog {
             families: c.families.clone(),
-            herdr_font,
+            herdr_font: prefs.font,
+            herdr_font_size: prefs.font_size,
+            herdr_line_height: prefs.line_height,
             symbols_font: c.symbols_font.clone(),
         })
     })
@@ -628,7 +800,185 @@ pub async fn terminal_font_bytes(id: usize) -> Result<tauri::ipc::Response, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{is_selectable_mono_family, name_looks_mono, parse_name_table};
+    use super::{
+        is_selectable_mono_family, name_looks_mono, parse_herdr_terminal_toml, parse_name_table,
+        read_herdr_terminal_prefs_in, HerdrTerminalPrefs,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "herdr-pocket-fonts-test-{prefix}-{}-{n}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp test dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn herdr_toml_parses_terminal_section_and_ignores_comments() {
+        let toml = r#"
+# Top-level comment
+[terminal] # section comment
+# family = "DejaVu Sans Mono"
+# line_height = 1.8
+family = "Maple Mono NF CN" # active font
+size = 14
+line_height = 1.3 # active line height
+"#;
+        let prefs = parse_herdr_terminal_toml(toml);
+        assert_eq!(
+            prefs,
+            HerdrTerminalPrefs {
+                font: Some("Maple Mono NF CN".to_string()),
+                font_size: Some(14),
+                line_height: Some(130),
+            }
+        );
+
+        let single_quoted = r#"
+[terminal]
+family = 'JetBrains Mono #1' # comment after quote containing #
+size = 15.6
+line_height = 1.45
+"#;
+        let prefs2 = parse_herdr_terminal_toml(single_quoted);
+        assert_eq!(
+            prefs2,
+            HerdrTerminalPrefs {
+                font: Some("JetBrains Mono #1".to_string()),
+                font_size: Some(16),
+                line_height: Some(145),
+            }
+        );
+
+        let out_of_range = r#"
+[terminal]
+family = ""
+size = 99
+line_height = 3.5
+"#;
+        assert_eq!(
+            parse_herdr_terminal_toml(out_of_range),
+            HerdrTerminalPrefs::default()
+        );
+    }
+
+    #[test]
+    fn herdr_toml_does_not_leak_other_sections_into_terminal() {
+        let toml = r#"
+family = "TopLevelShouldNotLeak"
+
+[sidebar]
+family = "Other"
+size = 18
+line_height = 1.6
+
+[terminal.foo]
+family = "NestedShouldNotLeak"
+size = 20
+line_height = 1.5
+
+[tabs]
+family = "TabFont"
+
+[ui]
+family = "UiFont"
+
+[terminal]
+family = "Maple Mono NF CN"
+
+[[terminal.rules]]
+family = "RuleFont"
+size = 22
+"#;
+        let prefs = parse_herdr_terminal_toml(toml);
+        assert_eq!(
+            prefs,
+            HerdrTerminalPrefs {
+                font: Some("Maple Mono NF CN".to_string()),
+                font_size: None,
+                line_height: None,
+            }
+        );
+    }
+
+    #[test]
+    fn herdr_local_toml_overrides_base_per_field_and_falls_back_to_legacy_font() {
+        let root = TestDir::new("override");
+        let herdr_dir = root.0.join("herdr");
+        fs::create_dir_all(&herdr_dir).unwrap();
+        let legacy = root.0.join("herdr-app").join("settings.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+
+        fs::write(
+            herdr_dir.join("config-gpui.toml"),
+            r#"
+[terminal]
+family = "Fira Code"
+size = 15
+line_height = 1.35
+"#,
+        )
+        .unwrap();
+        fs::write(
+            herdr_dir.join("config-gpui.local.toml"),
+            r#"
+[terminal]
+family = "Maple Mono NF CN"
+# size = 16
+# line_height = 1.4
+"#,
+        )
+        .unwrap();
+        fs::write(&legacy, r#"{"font":"Legacy Mono"}"#).unwrap();
+
+        let merged = read_herdr_terminal_prefs_in(Some(&herdr_dir), Some(&legacy));
+        assert_eq!(
+            merged,
+            HerdrTerminalPrefs {
+                font: Some("Maple Mono NF CN".to_string()),
+                font_size: Some(15),
+                line_height: Some(135),
+            }
+        );
+
+        // When neither TOML sets `family`, fall back to legacy settings.json `"font"` while preserving TOML size/line_height.
+        fs::remove_file(herdr_dir.join("config-gpui.local.toml")).unwrap();
+        fs::write(
+            herdr_dir.join("config-gpui.toml"),
+            r#"
+[terminal]
+# family = "CommentedOut"
+size = 14
+line_height = 1.3
+"#,
+        )
+        .unwrap();
+        let fallback = read_herdr_terminal_prefs_in(Some(&herdr_dir), Some(&legacy));
+        assert_eq!(
+            fallback,
+            HerdrTerminalPrefs {
+                font: Some("Legacy Mono".to_string()),
+                font_size: Some(14),
+                line_height: Some(130),
+            }
+        );
+    }
 
     #[test]
     fn mono_name_heuristic_matches_terminal_fonts() {

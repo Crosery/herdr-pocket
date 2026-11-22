@@ -38,6 +38,7 @@ import { refreshHostSpaces, rpcCall } from "../lib/relay";
 import { checkForUpdate } from "../lib/updates";
 import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle, updateSettings, agentTitle } from "../lib/store";
 import { terminalOwnsCtrlK } from "../lib/termKeys";
+import { getTerminalThemeSpec, resolveTerminalAppearance } from "../lib/terminalTheme";
 import { GROUP_RANK, lastChange, listGroup } from "./agentInfo";
 import { Palette, type PaletteItem } from "./Palette";
 import { ShellSidebar } from "./ShellSidebar";
@@ -82,26 +83,29 @@ function measureTerminalGrid(): {
   display: Record<string, unknown>;
 } {
   const termCfg = clientConfigStore.get().config.terminal;
-  const fs = Math.max(9, Number(termCfg.fontSize) || 13);
-  const lh = Math.max(1.0, (Number(termCfg.lineHeight) || 135) / 100);
+  const fs = Math.max(9, Number(termCfg.fontSize) || 14);
+  const lh = Math.max(1.0, (Number(termCfg.lineHeight) || 132) / 100);
   const cellW = Math.max(5, Math.round(fs * 0.6));
   const cellH = Math.max(10, Math.round(fs * lh));
   const pane =
-    (document.querySelector(".v3-main .term-host") as HTMLElement | null) ??
+    (document.querySelector(".v3-main .tp-term-host") as HTMLElement | null) ??
     (document.querySelector(".v3-main") as HTMLElement | null);
   const rect = pane?.getBoundingClientRect();
-  const availW = Math.max(320, (rect?.width ?? window.innerWidth - 300) - 24);
-  const availH = Math.max(180, (rect?.height ?? window.innerHeight - 100) - 42);
+  const availW = Math.max(320, (rect?.width ?? window.innerWidth - 300) - 36);
+  const availH = Math.max(180, (rect?.height ?? window.innerHeight - 100) - 70);
   const cols = Math.min(500, Math.max(40, Math.floor(availW / cellW)));
   const rows = Math.min(200, Math.max(12, Math.floor(availH / cellH)));
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+  const systemDark =
+    typeof window !== "undefined" && Boolean(window.matchMedia?.("(prefers-color-scheme: dark)")?.matches);
+  const activeSpec = getTerminalThemeSpec(resolveTerminalAppearance(settingsStore.get().theme, systemDark));
   return {
     cols,
     rows,
     display: {
-      fg: "#f4eef8",
-      bg: "#16141d",
-      cursor: "#ff71a8",
+      fg: activeSpec.fg,
+      bg: activeSpec.bg,
+      cursor: activeSpec.cursor,
       cell: [Math.max(1, Math.round(cellW * dpr)), Math.max(1, Math.round(cellH * dpr))],
     },
   };

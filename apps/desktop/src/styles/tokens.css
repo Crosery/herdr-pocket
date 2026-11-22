@@ -106,6 +106,13 @@
   --idle-text: #716782;
   --idle-soft: #F2EFF5;
 
+  --tp-term-bg: #ffffff;
+  --tp-term-fg: #1f2328;
+  --tp-term-scroll: rgba(74, 59, 92, 0.16);
+  --tp-term-scroll-hover: rgba(74, 59, 92, 0.30);
+  --tp-term-drop-bg: rgba(255, 246, 249, 0.88);
+  --tp-term-drop-fg: #4a3b5c;
+
   --shadow-sm: 0 2px 6px rgba(74, 59, 92, 0.05), 0 8px 20px -10px rgba(229, 138, 174, 0.24);
   --shadow: 0 2px 8px rgba(74, 59, 92, 0.04), 0 18px 40px -16px rgba(229, 138, 174, 0.30);
   --shadow-lg: 0 8px 30px rgba(74, 59, 92, 0.08), 0 32px 64px -24px rgba(190, 96, 148, 0.38);
@@ -158,6 +165,13 @@
 
   --idle-text: #BDB3CC;
   --idle-soft: #2E2936;
+
+  --tp-term-bg: #16141d;
+  --tp-term-fg: #f4eef8;
+  --tp-term-scroll: rgba(255, 255, 255, 0.18);
+  --tp-term-scroll-hover: rgba(255, 255, 255, 0.34);
+  --tp-term-drop-bg: rgba(22, 20, 29, 0.84);
+  --tp-term-drop-fg: #f9d7e5;
 
   --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.28), 0 8px 20px -10px rgba(0, 0, 0, 0.45);
   --shadow: 0 4px 14px rgba(0, 0, 0, 0.28), 0 22px 44px -18px rgba(0, 0, 0, 0.62);

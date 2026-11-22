@@ -54,6 +54,12 @@ import {
 import { native, type LocalTermCloseEvent, type LocalTermDataEvent } from "../lib/native";
 import { rpcCall, subscribeStream } from "../lib/relay";
 import { settingsStore } from "../lib/store";
+import {
+  deleteKittyPlacementsScoped,
+  getTerminalThemeSpec,
+  resolveTerminalAppearance,
+  type TerminalThemeSpec,
+} from "../lib/terminalTheme";
 import { openSettingsFrame } from "../shell/shellStore";
 import { IS_MAC, matchShortcut } from "../shell/shortcuts";
 import { useToast } from "./PocketUI";
@@ -102,34 +108,6 @@ interface Osc66Run {
   verticalAlign: 0 | 1 | 2;
   text: string;
 }
-
-const TERM_BG = "#16141d";
-const TERM_FG = "#f4eef8";
-const TERM_CURSOR = "#ff71a8";
-
-const BASE_THEME = {
-  background: TERM_BG,
-  foreground: TERM_FG,
-  cursor: TERM_CURSOR,
-  cursorAccent: "#16141d",
-  selectionBackground: "rgba(255, 113, 168, 0.28)",
-  black: "#252131",
-  red: "#ff6b8b",
-  green: "#6be0a6",
-  yellow: "#f6c96b",
-  blue: "#7ab8ff",
-  magenta: "#eb8eff",
-  cyan: "#6fdce8",
-  white: "#ece5f5",
-  brightBlack: "#7b7391",
-  brightRed: "#ff8ba3",
-  brightGreen: "#8eedbc",
-  brightYellow: "#ffe08f",
-  brightBlue: "#9ecbff",
-  brightMagenta: "#f3b0ff",
-  brightCyan: "#96eaf4",
-  brightWhite: "#ffffff",
-} as const;
 
 function decodeBase64Bytes(b64: string): Uint8Array {
   const bin = atob(b64);
@@ -224,8 +202,8 @@ function measureCellCss(hostEl: HTMLElement | null, term: XTerm): [number, numbe
   if (screen && term.cols > 0 && term.rows > 0 && screen.clientWidth > 0 && screen.clientHeight > 0) {
     return [screen.clientWidth / term.cols, screen.clientHeight / term.rows];
   }
-  const fs = term.options.fontSize ?? 13;
-  const lh = term.options.lineHeight ?? 1.2;
+  const fs = term.options.fontSize ?? 14;
+  const lh = term.options.lineHeight ?? 1.32;
   return [Math.max(5, fs * 0.6), Math.max(10, fs * lh)];
 }
 
@@ -239,6 +217,24 @@ export function TerminalSurface({
   const toast = useToast();
   const termCfg = useClientConfig().terminal;
   const themeChoice = settingsStore.use((s) => s.theme);
+  const [systemDark, setSystemDark] = useState<boolean>(() =>
+    typeof window !== "undefined" && Boolean(window.matchMedia?.("(prefers-color-scheme: dark)")?.matches),
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    setSystemDark(mq.matches);
+    const onChange = (ev: MediaQueryListEvent) => setSystemDark(ev.matches);
+    mq.addEventListener?.("change", onChange);
+    return () => mq.removeEventListener?.("change", onChange);
+  }, []);
+  const activeSpec = useMemo<TerminalThemeSpec>(
+    () => getTerminalThemeSpec(resolveTerminalAppearance(themeChoice, systemDark)),
+    [themeChoice, systemDark],
+  );
+  const activeSpecRef = useRef<TerminalThemeSpec>(activeSpec);
+  activeSpecRef.current = activeSpec;
+
   useLocalHostDeviceId();
   const fontCatalog = useTerminalFontCatalog();
   const hostRef = useRef<HTMLDivElement>(null);
@@ -282,9 +278,9 @@ export function TerminalSurface({
 
   const adjustFontSize = useCallback((action: "in" | "out" | "reset") => {
     const spec = configKeySpec("terminal.fontSize");
-    const min = spec?.min ?? 9;
-    const max = spec?.max ?? 24;
-    const def = Number(spec?.default ?? 13);
+    const min = spec?.min ?? 10;
+    const max = spec?.max ?? 28;
+    const def = Number(spec?.default ?? 14);
     const cur = fontSizeRef.current;
     const next = action === "reset" ? def : Math.min(max, Math.max(min, cur + (action === "in" ? 1 : -1)));
     if (next !== cur) {
@@ -374,10 +370,11 @@ export function TerminalSurface({
     (_term: XTerm): TerminalDisplay & { cell: [number, number] } => {
       const [cw, ch] = cellSizeRef.current;
       const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+      const spec = activeSpecRef.current;
       return {
-        fg: TERM_FG,
-        bg: TERM_BG,
-        cursor: TERM_CURSOR,
+        fg: spec.fg,
+        bg: spec.bg,
+        cursor: spec.cursor,
         cell: [Math.max(1, Math.round(cw * dpr)), Math.max(1, Math.round(ch * dpr))],
       };
     },
@@ -393,7 +390,7 @@ export function TerminalSurface({
       refreshCachedCellSize(term);
       const display = currentDisplay(term);
       const localConnId = localConnRef.current;
-      const sig = `${localConnId ?? "relay"}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}`;
+      const sig = `${localConnId ?? "relay"}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}@${display.bg}`;
       if (lastResizeSigRef.current === sig) return;
       lastResizeSigRef.current = sig;
       if (localConnId) {
@@ -722,9 +719,10 @@ export function TerminalSurface({
       }
     }
 
-    const fs = term.options.fontSize ?? 13;
+    const fs = term.options.fontSize ?? 14;
     const ff = term.options.fontFamily ?? fontFamily;
     const fw = String(term.options.fontWeight ?? 400);
+    const fg = activeSpecRef.current.fg;
     for (const r of osc66Ref.current) {
       if (r.alt !== curAlt || r.bufferY < topY || r.bufferY >= botY) continue;
       const key = `o66:${r.key}`;
@@ -733,7 +731,7 @@ export function TerminalSurface({
       const minW = Math.round(r.widthCells * cellW);
       const h = Math.round(r.scale * cellH);
       const fSize = Number((fs * r.scale * r.ratio).toFixed(2));
-      const sig = `o66|${r.text}|${left}|${top}|${minW}|${h}|${ff}|${fSize}|${fw}`;
+      const sig = `o66|${r.text}|${left}|${top}|${minW}|${h}|${ff}|${fSize}|${fw}|${fg}`;
       const existing = nodeMap.get(key);
       if (existing && existing.kind === "osc66") {
         if (existing.sig !== sig) {
@@ -745,6 +743,7 @@ export function TerminalSurface({
           existing.el.style.fontFamily = ff;
           existing.el.style.fontSize = `${fSize}px`;
           existing.el.style.fontWeight = fw;
+          existing.el.style.color = fg;
           existing.sig = sig;
         }
         seenKeys.add(key);
@@ -761,7 +760,7 @@ export function TerminalSurface({
       span.style.fontFamily = ff;
       span.style.fontSize = `${fSize}px`;
       span.style.fontWeight = fw;
-      span.style.color = TERM_FG;
+      span.style.color = fg;
       span.style.lineHeight = "1";
       nodeMap.set(key, { kind: "osc66", el: span, sig });
       seenKeys.add(key);
@@ -799,7 +798,7 @@ export function TerminalSurface({
     }
   }, [fontFamily]);
 
-  // Keep font faces, texture atlas, and overlay coordinates synchronized with live font changes.
+  // Keep font faces, theme colors, texture atlas, and overlay coordinates synchronized with live changes.
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
@@ -812,6 +811,13 @@ export function TerminalSurface({
       term.options.fontWeight = termCfg.fontWeight as 300 | 400 | 500 | 600 | 700;
       term.options.fontWeightBold = Math.min(900, Math.max(700, termCfg.fontWeight + 200)) as 700 | 800 | 900;
       term.options.cursorBlink = termCfg.cursorBlink;
+      term.options.theme = activeSpec.theme;
+      term.options.minimumContrastRatio = activeSpec.minimumContrastRatio;
+      for (const entry of overlayNodesRef.current.values()) {
+        if (entry.kind === "osc66") {
+          entry.el.style.color = activeSpec.fg;
+        }
+      }
       term.clearTextureAtlas();
       term.refresh(0, Math.max(0, term.rows - 1));
       syncResize(term);
@@ -826,7 +832,7 @@ export function TerminalSurface({
     return () => {
       cancelled = true;
     };
-  }, [fontFamily, lineHeight, paintOverlays, syncResize, termCfg.cursorBlink, termCfg.fontFamily, termCfg.fontSize, termCfg.fontWeight, themeChoice]);
+  }, [activeSpec, fontFamily, lineHeight, paintOverlays, syncResize, termCfg.cursorBlink, termCfg.fontFamily, termCfg.fontSize, termCfg.fontWeight]);
 
   useEffect(() => {
     const hostEl = hostRef.current;
@@ -835,17 +841,19 @@ export function TerminalSurface({
     const term = new XTerm({
       allowProposedApi: true,
       cursorBlink: termCfg.cursorBlink,
-      cursorStyle: "bar",
+      cursorStyle: "block",
+      customGlyphs: true,
+      rescaleOverlappingGlyphs: true,
       fontFamily,
       fontSize: termCfg.fontSize,
       lineHeight,
       fontWeight: termCfg.fontWeight as 300 | 400 | 500 | 600 | 700,
       fontWeightBold: Math.min(900, Math.max(700, termCfg.fontWeight + 200)) as 700 | 800 | 900,
       scrollback: 3000,
-      minimumContrastRatio: 1,
+      minimumContrastRatio: activeSpec.minimumContrastRatio,
       macOptionIsMeta: true,
       macOptionClickForcesSelection: true,
-      theme: BASE_THEME,
+      theme: activeSpec.theme,
       windowOptions: {
         getWinSizePixels: true,
         getCellSizePixels: true,
@@ -890,11 +898,12 @@ export function TerminalSurface({
 
     // Ensure OS / Herdr / Nerd fonts load asynchronously right after opening.
     void ensureFontCatalog().then(() => ensureTerminalFontLoaded(termCfg.fontFamily, termCfg.fontWeight >= 600)).then((loaded) => {
-      if (loaded && termRef.current === term) {
+      if (loaded && alive && termRef.current === term) {
         term.options.fontFamily = buildTerminalFontFamily(termCfg.fontFamily, fontCatalogStore.get());
         term.clearTextureAtlas();
         term.refresh(0, Math.max(0, term.rows - 1));
         syncResize(term);
+        requestAnimationFrame(paintOverlays);
       }
     });
 
@@ -1341,65 +1350,44 @@ export function TerminalSurface({
         const cmd = parseKittyGfxCommand(seg.raw);
         if (cmd.action === "d") {
           term.write("", () => {
+            const buf = term.buffer.active;
+            const curAlt = buf === term.buffer.alternate;
             const rawD = cmd.deleteWhat || "a";
             const d = rawD.toLowerCase();
-            if (d === "a") {
-              kittyPlacementsRef.current = [];
-              kittyVirtualDimsRef.current.clear();
+            const res = deleteKittyPlacementsScoped(
+              kittyPlacementsRef.current,
+              curAlt,
+              cmd,
+              buf.cursorX,
+              buf.baseY + buf.cursorY,
+            );
+            kittyPlacementsRef.current = res.placements;
+
+            let evictedVirtualIds: number[] = [];
+            if (!curAlt && res.clearedActiveAll) {
               if (rawD === "A") {
-                for (const a of kittyAssetsRef.current.values()) revokeAssetUrl(a.url);
-                kittyAssetsRef.current.clear();
-                kittyDimsByIdRef.current.clear();
-              }
-            } else if (d === "i" && cmd.id !== undefined) {
-              kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
-                (p) => p.imageId !== cmd.id || (cmd.placementId !== undefined && p.placementId !== cmd.placementId),
-              );
-              deleteKittyVirtualPlacements(kittyVirtualDimsRef.current, cmd.id, cmd.placementId);
-              if (rawD === "I" && cmd.placementId === undefined) {
-                const prev = kittyAssetsRef.current.get(cmd.id);
-                if (prev) revokeAssetUrl(prev.url);
-                kittyAssetsRef.current.delete(cmd.id);
-                kittyDimsByIdRef.current.delete(cmd.id);
-              }
-            } else if (d === "p" && cmd.id !== undefined && cmd.placementId !== undefined) {
-              kittyPlacementsRef.current = kittyPlacementsRef.current.filter(
-                (p) => !(p.imageId === cmd.id && p.placementId === cmd.placementId),
-              );
-              deleteKittyVirtualPlacements(kittyVirtualDimsRef.current, cmd.id, cmd.placementId);
-              if (rawD === "P") {
-                const stillUsed = kittyPlacementsRef.current.some((p) => p.imageId === cmd.id);
-                if (!stillUsed) {
-                  const prev = kittyAssetsRef.current.get(cmd.id);
-                  if (prev) revokeAssetUrl(prev.url);
-                  kittyAssetsRef.current.delete(cmd.id);
-                  kittyDimsByIdRef.current.delete(cmd.id);
+                const keepIds = new Set(res.placements.map((p) => p.imageId));
+                const vIds = new Set<number>();
+                for (const key of kittyVirtualDimsRef.current.keys()) {
+                  const id = Number.parseInt(key.split(":")[0] ?? "", 10);
+                  if (Number.isFinite(id) && !keepIds.has(id)) vIds.add(id);
                 }
+                evictedVirtualIds = Array.from(vIds);
               }
-            } else if (d === "c") {
-              const buf = term.buffer.active;
-              const cx = buf.cursorX;
-              const cy = buf.baseY + buf.cursorY;
-              const removedIds = new Set<number>();
-              kittyPlacementsRef.current = kittyPlacementsRef.current.filter((p) => {
-                const hit =
-                  cy >= p.bufferY &&
-                  cy < p.bufferY + p.rows &&
-                  cx >= p.col &&
-                  cx < p.col + p.cols;
-                if (hit) removedIds.add(p.imageId);
-                return !hit;
-              });
-              if (rawD === "C") {
-                for (const id of removedIds) {
-                  if (!kittyPlacementsRef.current.some((p) => p.imageId === id)) {
-                    const prev = kittyAssetsRef.current.get(id);
-                    if (prev) revokeAssetUrl(prev.url);
-                    kittyAssetsRef.current.delete(id);
-                    kittyDimsByIdRef.current.delete(id);
-                  }
-                }
+              kittyVirtualDimsRef.current.clear();
+            } else if ((d === "i" || d === "p") && cmd.id !== undefined) {
+              deleteKittyVirtualPlacements(kittyVirtualDimsRef.current, cmd.id, cmd.placementId);
+              if (rawD === "I" && cmd.placementId === undefined && !res.placements.some((p) => p.imageId === cmd.id)) {
+                evictedVirtualIds = [cmd.id];
               }
+            }
+
+            const evictIds = new Set([...res.evictAssetIds, ...evictedVirtualIds]);
+            for (const id of evictIds) {
+              const prev = kittyAssetsRef.current.get(id);
+              if (prev) revokeAssetUrl(prev.url);
+              kittyAssetsRef.current.delete(id);
+              kittyDimsByIdRef.current.delete(id);
             }
             flushOverlaySoon();
           });

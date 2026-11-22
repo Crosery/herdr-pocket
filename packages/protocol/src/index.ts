@@ -2372,8 +2372,8 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "resources.memoryWarnMb", type: "integer", min: 256, max: 16384, default: 1024, usedBy: D, label: "内存提醒（MB）", doc: "Warn when the desktop app uses more memory than this." },
   { key: "resources.diskWarnGb", type: "integer", min: 1, max: 1000, default: 5, usedBy: D, label: "磁盘空间提醒（GB）", doc: "Warn when free disk space falls below this." },
   { key: "terminal.fontFamily", type: "string", default: "", usedBy: D, label: "终端字体", doc: "Monospace font family for the desktop terminal; empty uses the default stack." },
-  { key: "terminal.fontSize", type: "integer", min: 10, max: 28, default: 13, usedBy: D, label: "终端字号", doc: "Font size of the desktop terminal in pixels." },
-  { key: "terminal.lineHeight", type: "integer", min: 100, max: 200, default: 120, usedBy: D, label: "终端行高（%）", doc: "Line height of the desktop terminal in percent." },
+  { key: "terminal.fontSize", type: "integer", min: 10, max: 28, default: 14, usedBy: D, label: "终端字号", doc: "Font size of the desktop terminal in pixels." },
+  { key: "terminal.lineHeight", type: "integer", min: 100, max: 200, default: 132, usedBy: D, label: "终端行高（%）", doc: "Line height of the desktop terminal in percent." },
   { key: "terminal.fontWeight", type: "integer", min: 300, max: 700, default: 400, usedBy: D, label: "终端字重", doc: "Normal text weight of the desktop terminal (bold stays 700)." },
   { key: "terminal.cursorBlink", type: "boolean", default: true, usedBy: D, label: "终端光标闪烁", doc: "Blink the cursor in the desktop terminal." },
 ];
