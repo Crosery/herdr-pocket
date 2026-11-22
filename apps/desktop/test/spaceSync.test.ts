@@ -53,3 +53,25 @@ test("buildHostSpaces preserves exact Herdr order, empty spaces, colors, and app
     ],
   );
 });
+
+test("buildHostSpaces omits unassigned or unnamed spaces instead of creating an empty-name row", () => {
+  const hostSpaces: SpaceInfo[] = [
+    { id: "sp-empty-name", name: "   ", folder: "/tmp", tabs: 1, terminals: 1 },
+    { id: "sp-real", name: "Workspace", folder: "/work", tabs: 1, terminals: 1, color: "ansi2" },
+  ];
+  const hostAgents: Agent[] = [
+    mkAgent("u1", "", "working"),
+    mkAgent("u2", "   ", "blocked"),
+    mkAgent("u3", " / tab1", "idle"),
+    mkAgent("r1", "Workspace / tab1", "idle"),
+  ];
+  const res = buildHostSpaces("mac1", hostSpaces, hostAgents, devices);
+  assert.deepEqual(
+    res.map((s) => ({ name: s.name, count: s.count })),
+    [{ name: "Workspace", count: 1 }],
+  );
+  assert.equal(
+    res.some((s) => !s.name.trim()),
+    false,
+  );
+});

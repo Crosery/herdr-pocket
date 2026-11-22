@@ -53,7 +53,8 @@ export function buildHostSpaces(
   const per = new Map<string, Agent[]>();
   for (const a of hostAgents) {
     if (a.deviceId !== hostId) continue;
-    const sp = agentSpace(a) ?? "";
+    const sp = agentSpace(a)?.trim() ?? "";
+    if (!sp) continue;
     const list = per.get(sp);
     if (list) list.push(a);
     else per.set(sp, [a]);
@@ -63,8 +64,10 @@ export function buildHostSpaces(
   const consumed = new Set<string>();
 
   for (const sp of hostSpaces ?? []) {
-    const list = per.get(sp.name) ?? [];
-    if (per.has(sp.name)) consumed.add(sp.name);
+    const name = sp.name.trim();
+    if (!name) continue;
+    const list = per.get(name) ?? [];
+    if (per.has(name)) consumed.add(name);
     const groups = list.map((a) => listGroup(a, devices));
     const blocked = groups.filter((g) => g === "blocked").length;
     const best = list.length
@@ -74,10 +77,10 @@ export function buildHostSpaces(
         : "idle";
     const latest = list.length ? Math.max(...list.map(lastChange)) : 0;
     out.push({
-      id: `${hostId}\u0000${sp.name}`,
+      id: `${hostId}\u0000${name}`,
       deviceId: hostId,
       spaceId: sp.id,
-      name: sp.name,
+      name,
       folder: sp.folder,
       color: sp.color,
       active: sp.active,
@@ -91,7 +94,7 @@ export function buildHostSpaces(
 
   const orphans: SidebarSpace[] = [];
   for (const [name, list] of per.entries()) {
-    if (consumed.has(name)) continue;
+    if (!name.trim() || consumed.has(name)) continue;
     const groups = list.map((a) => listGroup(a, devices));
     const blocked = groups.filter((g) => g === "blocked").length;
     const best = groups.reduce<ListGroup>((b, g) => (GROUP_RANK[g] < GROUP_RANK[b] ? g : b), "offline");

@@ -1,17 +1,17 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Copy, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Mic, PhoneCall, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import { Copy, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
-import { XiaoyangOrb, VendorIcon } from "../components/MascotAndVendor";
+import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood } from "../components/MascotAndVendor";
 import { serverLabel } from "../components/Sidebar";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
 import { prettyHotkey } from "../components/VoiceInput";
 import { AgentDetailPanel, type SubagentHeadInfo } from "../views/AgentsView";
 import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../views/WorkbenchView";
 import { assistantStore, loadAssistant } from "../lib/assistant";
-import { copyToClipboard } from "../lib/bridge";
+import { assetUrl, copyToClipboard } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
 import { foldConvEvents, mergeConvEvents } from "../lib/chatFold";
 import { useClientConfig } from "../lib/config";
@@ -1525,6 +1525,8 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   const localHostId = useLocalHostDeviceId();
   const voice = useClientConfig().voiceInput;
   const callStatus = voiceCallStore.use((s) => s.status);
+  const callAssistant = voiceCallStore.use((s) => s.assistant);
+  const callMuted = voiceCallStore.use((s) => s.muted);
   const assistantVoice = assistantStore.use((s) => s.voice);
   const [voiceSetupHint, setVoiceSetupHint] = useState<string | null>(null);
   const realtimeReady = Boolean(assistantVoice || (server && isMockServer(server)));
@@ -1560,6 +1562,11 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   const linkTone = link === "online" ? "ok" : link === "connecting" ? "warn" : "off";
 
   const liveCallActive = callStatus === "connecting" || callStatus === "ready";
+  const callMood = resolveCallMascotMood({
+    status: callStatus,
+    assistant: callAssistant,
+    muted: callMuted,
+  });
   const voiceButtonLabel = liveCallActive
     ? "小羊通话中 · 点此挂断"
     : voice.enabled
@@ -1639,7 +1646,11 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => void handleVoiceTrigger()}
         >
-          {liveCallActive ? <PhoneCall size={13} /> : <Mic size={13} />}
+          <img
+            className={`status-xiaoyang-avatar${callMood === "muted" ? " is-muted" : ""}`}
+            src={assetUrl(mascotAssetPath(callMood))}
+            alt=""
+          />
           <span className="truncate">{voiceButtonLabel}</span>
         </button>
         {voiceSetupHint ? (

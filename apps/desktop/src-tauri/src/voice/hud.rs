@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const LABEL: &str = "voice-hud";
-const WIDTH: f64 = 540.0;
-const HEIGHT: f64 = 84.0;
+const WIDTH: f64 = 548.0;
+const HEIGHT: f64 = 88.0;
 /// Closed after this long idle.
 pub const IDLE_CLOSE: Duration = Duration::from_secs(180);
 
@@ -267,14 +267,14 @@ mod tests {
 
     #[test]
     fn hud_dimensions_and_centered_position_fit_glass_capsule() {
-        assert_eq!(WIDTH, 540.0);
-        assert_eq!(HEIGHT, 84.0);
+        assert_eq!(WIDTH, 548.0);
+        assert_eq!(HEIGHT, 88.0);
         let (x, y) = centered_position(0, 50, 3024, 1914, 2.0, WIDTH, HEIGHT);
-        assert_eq!(x, (1512.0 - 540.0) / 2.0);
+        assert_eq!(x, (1512.0 - 548.0) / 2.0);
         assert_eq!(y, 25.0 + 957.0 - HEIGHT - 96.0);
 
         let (x2, y2) = centered_position(1920, 0, 1920, 1080, 1.0, WIDTH, HEIGHT);
-        assert_eq!(x2, 1920.0 + (1920.0 - 540.0) / 2.0);
+        assert_eq!(x2, 1920.0 + (1920.0 - 548.0) / 2.0);
         assert_eq!(y2, 1080.0 - HEIGHT - 96.0);
     }
 }

@@ -9,6 +9,9 @@ export type MascotMood =
   | "sleepy"
   | "yay"
   | "default"
+  | "connecting"
+  | "thinking"
+  | "muted"
   | "speaking"
   | "listening"
   | "idle";
@@ -20,13 +23,43 @@ const MOOD_PATH: Record<MascotMood, string> = {
   sleepy: "mascot/sleepy.webp",
   yay: "mascot/yay.webp",
   default: "mascot/default.webp",
+  connecting: "call/connecting.webp",
+  thinking: "call/thinking.webp",
+  muted: "call/muted.webp",
   speaking: "call/speaking.webp",
   listening: "call/listening.webp",
   idle: "call/idle.webp",
 };
 
 /** Square portrait art; the other moods are full-body transparent stickers shown whole. */
-const PORTRAIT_MOODS = new Set<MascotMood>(["default", "speaking", "listening", "idle"]);
+const PORTRAIT_MOODS = new Set<MascotMood>([
+  "default",
+  "connecting",
+  "thinking",
+  "muted",
+  "speaking",
+  "listening",
+  "idle",
+]);
+
+/** Returns the asset relative path for a Xiaoyang mascot mood. */
+export function mascotAssetPath(mood: MascotMood): string {
+  return MOOD_PATH[mood];
+}
+
+/** Maps live voice call state into the matching Xiaoyang call portrait mood. */
+export function resolveCallMascotMood(state: {
+  status: "idle" | "connecting" | "ready";
+  assistant: "idle" | "thinking" | "speaking";
+  muted: boolean;
+}): MascotMood {
+  if (state.status === "idle") return "idle";
+  if (state.status === "connecting") return "connecting";
+  if (state.assistant === "speaking") return "speaking";
+  if (state.assistant === "thinking") return "thinking";
+  if (state.muted) return "muted";
+  return "listening";
+}
 
 export function XiaoyangOrb({
   mood = "hello",

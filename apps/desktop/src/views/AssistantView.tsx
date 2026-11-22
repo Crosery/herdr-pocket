@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Bell, Check, ChevronRight, Mic, MicOff, Minimize2, Phone, PhoneOff, Send, Trash2, X } from "lucide-react";
 import type { AssistantItem } from "@herdr-pocket/protocol";
 import { EmptyState, PocketBadge, PocketButton, PocketCard, PocketIconButton, PocketModal, fs, useToast } from "../components/PocketUI";
-import { XiaoyangOrb, type MascotMood } from "../components/MascotAndVendor";
+import { XiaoyangOrb, resolveCallMascotMood } from "../components/MascotAndVendor";
 import {
   assistantStore,
   clearAssistantThread,
@@ -26,7 +26,7 @@ export type CallStateView = VoiceCallState & { startedAt?: number | null };
 let fallbackCallStartedAt: number | null = null;
 
 /** Resolve call answer timestamp from VoiceCallState (or track ready-state start locally across drawer toggles). */
-export function resolveCallStartedAt(state: CallStateView, now = Date.now()): number | null {
+export function resolveCallStartedAt(state: { status: VoiceCallState["status"]; startedAt?: number | null }, now = Date.now()): number | null {
   if (typeof state.startedAt === "number" && Number.isFinite(state.startedAt)) {
     fallbackCallStartedAt = state.startedAt;
     return state.startedAt;
@@ -70,8 +70,8 @@ export function formatCallOverlayStatus(state: Pick<VoiceCallState, "status" | "
   return "我在听，直接说话就行";
 }
 
-function useCallClock(callState: CallStateView, enabled = true): string {
-  const startedAt = enabled ? resolveCallStartedAt(callState) : null;
+function useCallClock(status: VoiceCallState["status"], startedAtRaw: number | null | undefined, enabled = true): string {
+  const startedAt = enabled ? resolveCallStartedAt({ status, startedAt: startedAtRaw }) : null;
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -106,7 +106,9 @@ export function AssistantView({
   const reminders = assistantStore.use((s) => s.reminders);
   const link = liveStore.use((s) => s.link);
   const server = settingsStore.use((s) => s.server);
-  const callState = voiceCallStore.use((s) => s) as CallStateView;
+  const callStatus = voiceCallStore.use((s) => s.status);
+  const callMuted = voiceCallStore.use((s) => s.muted);
+  const callStartedAt = voiceCallStore.use((s) => (s as CallStateView).startedAt ?? null);
 
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -132,8 +134,8 @@ export function AssistantView({
     if (el) el.scrollTop = items.length || busy ? el.scrollHeight : 0;
   }, [items.length, busy]);
 
-  const inCall = callState.status === "connecting" || callState.status === "ready";
-  const callDuration = useCallClock(callState, inCall);
+  const inCall = callStatus === "connecting" || callStatus === "ready";
+  const callDuration = useCallClock(callStatus, callStartedAt, inCall);
   const sendLockRef = useRef(false);
   const lastSendRef = useRef<{ text: string; at: number } | null>(null);
 
@@ -249,10 +251,9 @@ export function AssistantView({
       {/* Folded Call Bar */}
       {inCall && !callExpanded ? (
         <CallMiniBar
-          callState={callState}
           duration={callDuration}
           onExpand={() => setCallExpanded(true)}
-          onToggleMute={() => setVoiceMuted(!callState.muted)}
+          onToggleMute={() => setVoiceMuted(!callMuted)}
           onHangup={() => hangupVoiceCall()}
         />
       ) : null}
@@ -285,7 +286,7 @@ export function AssistantView({
 
       {/* Scoped Call View */}
       {inCall && callExpanded ? (
-        <CallOverlay onMinimize={() => setCallExpanded(false)} callState={callState} duration={callDuration} />
+        <CallOverlay onMinimize={() => setCallExpanded(false)} duration={callDuration} />
       ) : null}
 
       <PocketModal open={confirmClear} onOpenChange={setConfirmClear} title="开始新对话？" subtitle="聊天记录会清空，已设好的提醒不受影响。" width={380}>
@@ -437,38 +438,53 @@ function AssistantBubble({
 }
 
 export function CallMiniBar({
-  callState,
+  callState: propState,
   duration,
   onExpand,
   onToggleMute,
   onHangup,
 }: {
-  callState: CallStateView;
+  callState?: CallStateView;
   duration: string;
   onExpand: () => void;
   onToggleMute: () => void;
   onHangup: () => void;
 }) {
-  const subText = formatCallMiniSub(callState, duration);
-  const taskText = callState.task?.trim() || "";
-  const speaking = callState.assistant === "speaking" || callState.outLevel > 0.08;
-  const listeningActive = !callState.muted && callState.micLevel > 0.08;
+  const storeStatus = voiceCallStore.use((s) => s.status);
+  const storeMuted = voiceCallStore.use((s) => s.muted);
+  const storeAssistant = voiceCallStore.use((s) => s.assistant);
+  const storeTask = voiceCallStore.use((s) => s.task);
+  const storeMicLevel = voiceCallStore.use((s) => s.micLevel);
+  const storeOutLevel = voiceCallStore.use((s) => s.outLevel);
+
+  const status = propState ? propState.status : storeStatus;
+  const muted = propState ? propState.muted : storeMuted;
+  const assistant = propState ? propState.assistant : storeAssistant;
+  const task = propState ? propState.task : storeTask;
+  const micLevel = propState ? propState.micLevel : storeMicLevel;
+  const outLevel = propState ? propState.outLevel : storeOutLevel;
+
+  const subText = formatCallMiniSub({ status, muted }, duration);
+  const taskText = task?.trim() || "";
+  const speaking = assistant === "speaking" || outLevel > 0.08;
+  const listeningActive = !muted && micLevel > 0.08;
   const waveMode =
-    callState.status === "connecting"
+    status === "connecting"
       ? "connecting"
-      : callState.muted && !speaking
+      : muted && !speaking
         ? "muted"
         : speaking
           ? "speaking"
-          : callState.status === "ready" && listeningActive
+          : status === "ready" && listeningActive
             ? "active"
             : "idle";
+  const mood = resolveCallMascotMood({ status, assistant, muted });
 
   return (
     <div className="call-mini-bar" onClick={onExpand}>
       <div className="call-mini-head">
         <div className="call-mini-ident">
-          <XiaoyangOrb mood={callState.assistant === "speaking" ? "speaking" : "listening"} size={28} />
+          <XiaoyangOrb mood={mood} size={32} />
           <div className="call-mini-meta">
             <div className="call-mini-title-row">
               <span className="call-mini-title">和小羊通话中</span>
@@ -486,11 +502,11 @@ export function CallMiniBar({
         <div className="call-mini-actions" onClick={(e) => e.stopPropagation()}>
           <PocketIconButton
             size="sm"
-            active={callState.muted}
+            active={muted}
             onClick={onToggleMute}
-            tooltip={callState.muted ? "取消静音" : "静音"}
+            tooltip={muted ? "取消静音" : "静音"}
           >
-            {callState.muted ? <MicOff size={15} /> : <Mic size={15} />}
+            {muted ? <MicOff size={15} /> : <Mic size={15} />}
           </PocketIconButton>
           <PocketButton
             size="sm"
@@ -508,7 +524,7 @@ export function CallMiniBar({
       {taskText ? (
         <div className="call-mini-task">
           <span className="status-dot breathe call-mini-task-dot" aria-hidden="true" />
-          <span className="call-mini-task-text" title={callState.task ?? taskText}>
+          <span className="call-mini-task-text" title={task ?? taskText}>
             {taskText}
           </span>
         </div>
@@ -528,9 +544,9 @@ export function CallOverlay({
 }) {
   const storeState = voiceCallStore.use((v) => v) as CallStateView;
   const s = propState ?? storeState;
-  const liveDuration = useCallClock(s, propDuration === undefined);
+  const liveDuration = useCallClock(s.status, s.startedAt, propDuration === undefined);
   const duration = propDuration ?? liveDuration;
-  const mood: MascotMood = s.assistant === "speaking" ? "speaking" : s.assistant === "thinking" ? "working" : "listening";
+  const mood = resolveCallMascotMood(s);
   const statusText = formatCallOverlayStatus(s);
   const micPct = Math.max(0, Math.min(100, Math.round(s.micLevel * 100)));
   const outPct = Math.max(0, Math.min(100, Math.round(s.outLevel * 100)));

@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { configKeySpec } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketIconButton, PocketSelect, PocketSwitch, useToast } from "./PocketUI";
+import { XiaoyangOrb, resolveCallMascotMood } from "./MascotAndVendor";
 import { PermissionGuideModal } from "./PermissionGuideModal";
 import { VoiceprintModal } from "./VoiceprintModal";
 import { assistantStore, loadAssistant } from "../lib/assistant";
@@ -808,39 +809,50 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   );
 }
 
-/** In-app floating call capsule fallback for web / HarmonyOS builds (suppressed on Tauri desktop). */
-export function VoiceHud() {
-  const hidden = useWindowHidden();
-  const call = voiceCallStore.use((s) => s);
+function WebVoiceHudLevel() {
+  const micLevel = voiceCallStore.use((s) => s.micLevel);
+  const outLevel = voiceCallStore.use((s) => s.outLevel);
+  const level = Math.max(0, Math.min(1, Math.max(micLevel, outLevel)));
+  return (
+    <span className="hud-level" aria-hidden>
+      <span style={{ transform: `scaleX(${Math.max(0.08, level)})` }} />
+    </span>
+  );
+}
 
-  if (native.available() || hidden || !call.hudShown || call.status === "idle") return null;
+function WebVoiceHud() {
+  const hidden = useWindowHidden();
+  const status = voiceCallStore.use((s) => s.status);
+  const hudShown = voiceCallStore.use((s) => s.hudShown);
+  const muted = voiceCallStore.use((s) => s.muted);
+  const assistant = voiceCallStore.use((s) => s.assistant);
+
+  if (hidden || !hudShown || status === "idle") return null;
 
   const label =
-    call.status === "connecting"
+    status === "connecting"
       ? "正在接通小羊…"
-      : call.muted && call.assistant !== "speaking"
+      : muted && assistant !== "speaking"
         ? "麦克风已静音"
-        : call.assistant === "speaking"
+        : assistant === "speaking"
           ? "小羊正在说…"
-          : call.assistant === "thinking"
+          : assistant === "thinking"
             ? "小羊在想…"
             : "和小羊通话中";
-  const level = Math.max(0, Math.min(1, Math.max(call.micLevel, call.outLevel)));
+  const mood = resolveCallMascotMood({ status, assistant, muted });
 
   return (
     <div className="voice-hud listening" role="status" aria-live="polite">
-      <PhoneCall size={15} />
+      <XiaoyangOrb mood={mood} size={28} />
       <span className="truncate">{label}</span>
-      <span className="hud-level" aria-hidden>
-        <span style={{ transform: `scaleX(${Math.max(0.08, level)})` }} />
-      </span>
+      <WebVoiceHudLevel />
       <PocketIconButton
         size="sm"
-        active={call.muted}
-        tooltip={call.muted ? "取消静音" : "静音"}
-        onClick={() => setVoiceMuted(!call.muted)}
+        active={muted}
+        tooltip={muted ? "取消静音" : "静音"}
+        onClick={() => setVoiceMuted(!muted)}
       >
-        {call.muted ? <MicOff size={14} /> : <Mic size={14} />}
+        {muted ? <MicOff size={14} /> : <Mic size={14} />}
       </PocketIconButton>
       <PocketButton size="sm" variant="danger" onClick={() => hangupVoiceCall()}>
         <PhoneOff size={13} />
@@ -848,4 +860,10 @@ export function VoiceHud() {
       </PocketButton>
     </div>
   );
+}
+
+/** In-app floating call capsule fallback for web / HarmonyOS builds (suppressed on Tauri desktop). */
+export function VoiceHud() {
+  if (native.available()) return null;
+  return <WebVoiceHud />;
 }
