@@ -9,10 +9,12 @@ import {
   OMP_MODEL_ROLES,
   OMP_QUICK_ROLE_CHIPS,
   PUT_LIMITS,
+  applyTerminalModelFallback,
   buildHarnessSwitchCommands,
   clampThinkingLevel,
   findModelOptionForModel,
   inferAgentModelAndThinking,
+  isNonReasoningModelName,
   normalizeSwitchHarness,
   resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
@@ -873,12 +875,17 @@ export function Composer({
         ? {}
         : inferAgentModelAndThinking(agent.harness, modelOverride || agent.model, {
             hasReasoningEvents: effectiveHasReasoning,
+            thinkingLevel: modelOverride ? undefined : agent.thinkingLevel,
           }),
-    [agent.isShell, agent.harness, modelOverride, agent.model, effectiveHasReasoning],
+    [agent.isShell, agent.harness, modelOverride, agent.model, agent.thinkingLevel, effectiveHasReasoning],
   );
   const fallbackModelData = useMemo(
-    () => synthesizeFallbackAgentModels(agent, peerModels, { hasReasoningEvents: effectiveHasReasoning }),
-    [agent.harness, agent.model, agent.isShell, agent.source, peerModels, effectiveHasReasoning],
+    () =>
+      synthesizeFallbackAgentModels(agent, peerModels, {
+        hasReasoningEvents: effectiveHasReasoning,
+        thinkingLevel: agent.thinkingLevel,
+      }),
+    [agent.harness, agent.model, agent.thinkingLevel, agent.isShell, agent.source, peerModels, effectiveHasReasoning],
   );
   const effectiveCurrentModel = modelOverride || modelData?.currentModel || inferredMeta.currentModel || agent.model;
   const resolvedLookupModel =
@@ -914,33 +921,70 @@ export function Composer({
       : (
           clampThinkingLevel(
             effectiveThinkingLevels,
-            thinkingOverride || modelData?.currentThinking || inferredMeta.currentThinking,
+            thinkingOverride || modelData?.currentThinking || inferredMeta.currentThinking || agent.thinkingLevel,
           ) ?? ""
         ).toLowerCase();
+
+  const loadModelsWithTerminalFallback = useCallback(async (): Promise<AgentModelsResult> => {
+    const synth = synthesizeFallbackAgentModels(agent, peerModels, {
+      hasReasoningEvents: effectiveHasReasoning,
+      thinkingLevel: agent.thinkingLevel,
+    });
+    let base: AgentModelsResult;
+    try {
+      const res = await call(agent.deviceId, "agent.models", { agent: agent.key });
+      if (res.models.length === 0) {
+        base = {
+          ...res,
+          models: synth.models,
+          ...(res.thinkingLevels?.length
+            ? {}
+            : synth.thinkingLevels?.length
+              ? { thinkingLevels: synth.thinkingLevels, canSwitchThinking: res.canSwitch, thinkingLabel: "思考等级" }
+              : {}),
+        };
+      } else {
+        base = res;
+      }
+    } catch {
+      base = synth;
+    }
+
+    const harness = base.harness || agent.harness;
+    const baseModels = Array.isArray(base.models) ? base.models : [];
+    const curModel = base.currentModel?.trim() || "";
+    const matchedCur = curModel
+      ? findModelOptionForModel(baseModels, curModel, { harness, modelRoles: base.modelRoles })
+      : undefined;
+    const curNonReasoning =
+      matchedCur?.reasoning === false ||
+      (matchedCur?.thinkingLevels !== undefined && matchedCur.thinkingLevels.length === 0) ||
+      (curModel ? isNonReasoningModelName(curModel) : false);
+    const missingModel = !curModel;
+    const missingThinking = !base.currentThinking?.trim() && !curNonReasoning;
+    if ((missingModel || missingThinking) && (agent.source === "hc" || agent.source === "herdr") && !agent.isShell) {
+      const termRes = await call(agent.deviceId, "terminal.read", { agent: agent.key, lines: 24 }).catch(() => null);
+      const screenText = termRes?.text || termRes?.ansi || "";
+      if (screenText.trim()) {
+        return applyTerminalModelFallback(base, harness, screenText, {
+          thinkingLevel: agent.thinkingLevel,
+          hasReasoningEvents: effectiveHasReasoning,
+        });
+      }
+    }
+    return base;
+  }, [agent, peerModels, effectiveHasReasoning]);
+
   useEffect(() => {
     if (!online || agent.isShell || (agent.source !== "hc" && agent.source !== "herdr")) return;
     let alive = true;
-    void call(agent.deviceId, "agent.models", { agent: agent.key })
-      .then((res) => {
-        if (!alive) return;
-        if (res.models.length === 0) {
-          const synth = synthesizeFallbackAgentModels(agent, peerModels);
-          setModelData({
-            ...res,
-            models: synth.models,
-            ...(res.thinkingLevels?.length ? {} : synth.thinkingLevels?.length ? { thinkingLevels: synth.thinkingLevels, canSwitchThinking: res.canSwitch, thinkingLabel: "思考等级" } : {}),
-          });
-        } else {
-          setModelData(res);
-        }
-      })
-      .catch(() => {
-        if (alive) setModelData((cur) => cur ?? synthesizeFallbackAgentModels(agent, peerModels));
-      });
+    void loadModelsWithTerminalFallback().then((res) => {
+      if (alive) setModelData(res);
+    });
     return () => {
       alive = false;
     };
-  }, [online, agent.deviceId, agent.key, agent.harness, agent.model, agent.isShell, agent.source]);
+  }, [online, agent.deviceId, agent.key, agent.harness, agent.model, agent.thinkingLevel, agent.isShell, agent.source, loadModelsWithTerminalFallback]);
   const coral = statusColors("blocked", p.dark).fg;
   const slashQuery = mode === "chat" && !agent.isShell ? extractSlashQuery(text) : null;
   const cmdQ = useQuery({
@@ -996,33 +1040,14 @@ export function Composer({
       setModelFilter("");
       setModelLoading(true);
       setModelError(null);
-      void call(agent.deviceId, "agent.models", { agent: agent.key })
+      void loadModelsWithTerminalFallback()
         .then((res) => {
           setModelError(null);
-          if (res.models.length === 0) {
-            const synth = synthesizeFallbackAgentModels(agent, peerModels, {
-              hasReasoningEvents: effectiveHasReasoning,
-            });
-            setModelData({
-              ...res,
-              models: synth.models,
-              ...(res.thinkingLevels?.length
-                ? {}
-                : synth.thinkingLevels?.length
-                  ? { thinkingLevels: synth.thinkingLevels, canSwitchThinking: res.canSwitch, thinkingLabel: "思考等级" }
-                  : {}),
-            });
-          } else {
-            setModelData(res);
-          }
-        })
-        .catch(() => {
-          setModelError(null);
-          setModelData((cur) => cur ?? synthesizeFallbackAgentModels(agent, peerModels, { hasReasoningEvents: effectiveHasReasoning }));
+          setModelData(res);
         })
         .finally(() => setModelLoading(false));
     },
-    [agent, peerModels, effectiveHasReasoning],
+    [loadModelsWithTerminalFallback],
   );
 
   function applyModelOrThinking(opts: { modelId?: string; thinkingLevel?: string }) {

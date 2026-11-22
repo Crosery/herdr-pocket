@@ -363,14 +363,22 @@ export function clampThinkingLevel(
 export function inferAgentModelAndThinking(
   harness?: string | null,
   rawModel?: string,
-  opts?: { hasReasoningEvents?: boolean },
+  opts?: { hasReasoningEvents?: boolean; thinkingLevel?: string },
 ): { currentModel?: string; currentThinking?: string; thinkingLevels?: string[] } {
   const hNorm = normalizeSwitchHarness(harness);
   const hasKnownHarness = Boolean(HARNESS_DEFAULT_THINKING_LEVELS[hNorm]);
+  const explicitOptThinking = opts?.thinkingLevel?.trim().toLowerCase() || undefined;
   const trimmed = rawModel?.trim() || "";
   if (!trimmed) {
     const fallbackLevels = inferModelThinkingLevels(harness, undefined, opts);
-    return fallbackLevels.length ? { thinkingLevels: fallbackLevels } : {};
+    const currentThinking =
+      fallbackLevels.length > 0
+        ? clampThinkingLevel(fallbackLevels, explicitOptThinking)
+        : explicitOptThinking;
+    return {
+      ...(currentThinking ? { currentThinking } : {}),
+      ...(fallbackLevels.length ? { thinkingLevels: fallbackLevels } : {}),
+    };
   }
 
   const base = stripModelEffortSuffix(trimmed);
@@ -396,7 +404,7 @@ export function inferAgentModelAndThinking(
       : hasKnownHarness || opts?.hasReasoningEvents || Boolean(matchExplicitModelFamilyLevels(base))
         ? levels
         : undefined;
-  const rawThinking = colonEffort ?? hyphenEffort;
+  const rawThinking = colonEffort ?? hyphenEffort ?? explicitOptThinking;
   const currentThinking =
     thinkingLevels && thinkingLevels.length > 0
       ? clampThinkingLevel(thinkingLevels, rawThinking, trimmed)
@@ -469,9 +477,9 @@ const FALLBACK_MODEL_PRESETS: Record<string, readonly AgentModelOption[]> = {
  * `unsupported` / `unknown method agent.models`, merging current model, peer models, and presets.
  */
 export function synthesizeFallbackAgentModels(
-  agent: Pick<Agent, "harness" | "model" | "isShell" | "source">,
+  agent: Pick<Agent, "harness" | "model" | "thinkingLevel" | "isShell" | "source">,
   peerModels: readonly string[] = [],
-  opts?: { hasReasoningEvents?: boolean },
+  opts?: { hasReasoningEvents?: boolean; thinkingLevel?: string },
 ): AgentModelsResult {
   const canSwitch = !agent.isShell && (agent.source === "hc" || agent.source === "herdr");
   const reason = agent.isShell
@@ -493,8 +501,10 @@ export function synthesizeFallbackAgentModels(
   }
 
   const hNorm = normalizeSwitchHarness(agent.harness);
+  const optThinking = opts?.thinkingLevel?.trim() || agent.thinkingLevel?.trim() || undefined;
   const inferred = inferAgentModelAndThinking(agent.harness, agent.model, {
     hasReasoningEvents: opts?.hasReasoningEvents,
+    thinkingLevel: optThinking,
   });
   const models: AgentModelOption[] = [];
   const seen = new Set<string>();
@@ -559,7 +569,7 @@ export function synthesizeFallbackAgentModels(
     },
     inferred.currentModel,
   );
-  const currentThinking = clampThinkingLevel(resolvedLevels, inferred.currentThinking, agent.model);
+  const currentThinking = clampThinkingLevel(resolvedLevels, inferred.currentThinking ?? optThinking, agent.model);
 
   return {
     harness: agent.harness,
@@ -571,5 +581,607 @@ export function synthesizeFallbackAgentModels(
     canSwitch,
     ...(reason ? { reason } : {}),
     models,
+  };
+}
+
+const ANSI_OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const ANSI_CSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const ANSI_ESC_RE = /\x1b[@-Z\\-_]/g;
+const TERMINAL_PUA_RE = /[\uE000-\uF8FF\uFE0E\uFE0F\u200B-\u200D\uFEFF]|\p{Private_Use}/gu;
+
+const TERMINAL_EFFORT_ALIASES: Record<string, string> = {
+  off: "off",
+  none: "none",
+  minimal: "minimal",
+  min: "minimal",
+  low: "low",
+  lo: "low",
+  medium: "medium",
+  med: "medium",
+  high: "high",
+  hi: "high",
+  xhigh: "xhigh",
+  xhi: "xhigh",
+  max: "max",
+  ultra: "ultra",
+  auto: "auto",
+  default: "default",
+  normal: "normal",
+  fast: "fast",
+  smart: "smart",
+  rush: "rush",
+};
+
+const AGY_MODE_WORDS = new Set(["auto", "plan", "ask", "code", "agent", "build", "chat", "edit", "yolo"]);
+
+function stripAnsiEscapes(raw: string): string {
+  return raw
+    .replace(/\r/g, "")
+    .replace(ANSI_OSC_RE, "")
+    .replace(ANSI_CSI_RE, "")
+    .replace(ANSI_ESC_RE, "");
+}
+
+function stripTerminalIcons(raw: string): string {
+  return raw.replace(TERMINAL_PUA_RE, " ");
+}
+
+function parseTerminalEffortToken(raw: string, opts?: { allowAuto?: boolean }): string | undefined {
+  let clean = stripTerminalIcons(raw)
+    .replace(/^(?:thinking|effort|reasoning)\s*[:=]\s*/i, "")
+    .trim();
+  const paren = /^\(([^()]+)\)$/.exec(clean);
+  if (paren?.[1]) clean = paren[1].trim();
+  clean = clean.toLowerCase();
+  if (!clean) return undefined;
+  const mapped = TERMINAL_EFFORT_ALIASES[clean];
+  if (!mapped) return undefined;
+  if (opts?.allowAuto === false && mapped === "auto") return undefined;
+  return mapped;
+}
+
+function looseMatchKey(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function toModelSlug(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/g, "-")
+    .replace(/\.-|-\./g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "");
+}
+
+function isNonModelStatusSegment(seg: string): boolean {
+  const s = seg.trim();
+  if (!s) return true;
+  if (/^(?:~\/|\/|\.\/|\.\.\/|[a-z]:\\)/i.test(s)) return true;
+  if (/^\([^()]+\)$/.test(s)) return true;
+  if (/^\$[\d.,]+$/.test(s)) return true;
+  if (/^\d+(?:\.\d+)?%$/.test(s)) return true;
+  if (/^\d+(?:\.\d+)?[kmgt]?\s*\/\s*\d+(?:\.\d+)?[kmgt]?(?:\s*\([^)]*\))?$/i.test(s)) return true;
+  if (/^\d+(?:\.\d+)?\s*(?:ms|s|m|tok|tokens|ctx|left)\b/i.test(s)) return true;
+  if (/^(?:esc|tab|ctrl|shift|enter)\b/i.test(s)) return true;
+  return false;
+}
+
+function looksLikeModelDisplayOrId(seg: string): boolean {
+  const s = seg.trim();
+  if (!s || isNonModelStatusSegment(s)) return false;
+  if (s.includes("/")) return /^[a-z0-9._-]+(?:\/[a-z0-9._:-]+)+$/i.test(s);
+  return /(?:gpt|claude|opus|sonnet|haiku|gemini|gemma|deepseek|mimo|kimi|qwen|grok|llama|mistral|codex|orchestrator|worker|o[134](?:\b|-)|k3\b)/i.test(
+    s,
+  );
+}
+
+function matchCatalogOption(
+  catalog: readonly AgentModelOption[] | undefined,
+  displayOrId: string,
+  opts?: { effort?: string; providerHint?: string },
+): AgentModelOption | undefined {
+  if (!catalog?.length) return undefined;
+  const trimmed = displayOrId.trim();
+  if (!trimmed) return undefined;
+
+  const rawLow = trimmed.toLowerCase();
+  const slug = toModelSlug(trimmed);
+  const loose = looseMatchKey(trimmed);
+  if (!loose) return undefined;
+
+  const effort = opts?.effort?.trim().toLowerCase();
+  const slugWithEffort = effort && slug && !slug.endsWith(`-${effort}`) ? `${slug}-${effort}` : "";
+  const looseWithEffort = effort ? looseMatchKey(`${trimmed} ${effort}`) : "";
+  const prov = opts?.providerHint?.trim().toLowerCase();
+
+  let best: AgentModelOption | undefined;
+  let bestScore = 0;
+
+  for (const opt of catalog) {
+    const idLow = opt.id.toLowerCase();
+    const idLeaf = idLow.split("/").pop() ?? idLow;
+    const idLoose = looseMatchKey(opt.id);
+    const leafLoose = looseMatchKey(idLeaf);
+    const labelLow = opt.label.trim().toLowerCase();
+    const labelLoose = looseMatchKey(opt.label);
+    const provMatches = prov
+      ? opt.provider?.toLowerCase() === prov || idLow.startsWith(`${prov}/`) || idLow.includes(`/${prov}/`)
+      : false;
+
+    let score = 0;
+    if (slugWithEffort && idLow === slugWithEffort) {
+      score = 100;
+    } else if (idLow === rawLow || (slug && idLow === slug)) {
+      score = 95;
+    } else if (prov && idLow === `${prov}/${slug}`) {
+      score = 94;
+    } else if (looseWithEffort && labelLoose === looseWithEffort) {
+      score = 90;
+    } else if (labelLow === rawLow || labelLoose === loose) {
+      score = provMatches ? 88 : 78;
+    } else if (provMatches && (leafLoose === loose || (looseWithEffort && leafLoose === looseWithEffort))) {
+      score = 86;
+    } else if (leafLoose === loose || (looseWithEffort && leafLoose === looseWithEffort)) {
+      score = 72;
+    } else if (idLoose === loose || (looseWithEffort && idLoose === looseWithEffort)) {
+      score = 70;
+    } else if (loose.includes("-") && (leafLoose.endsWith(`-${loose}`) || labelLoose.endsWith(`-${loose}`))) {
+      score = 62;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = opt;
+    }
+  }
+
+  if (!best) return undefined;
+  if (effort && best.effortModelMap?.[effort]) {
+    const targetId = best.effortModelMap[effort]!;
+    return catalog.find((m) => m.id.toLowerCase() === targetId.toLowerCase()) ?? { ...best, id: targetId };
+  }
+  return best;
+}
+
+function splitStatusColumnsAndSegments(line: string): string[][] {
+  const noIcons = stripTerminalIcons(line)
+    .replace(/\s*([·•|])\s*/g, " $1 ")
+    .trim();
+  if (!noIcons) return [];
+  const cols = noIcons
+    .split(/ {4,}|\t+/)
+    .map((c) => c.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  return cols.map((col) =>
+    col
+      .split(/\s*[·•|]\s*/)
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
+function parseAntigravityStatusLine(
+  line: string,
+  catalog?: readonly AgentModelOption[],
+): { currentModel?: string; currentThinking?: string } | null {
+  for (const segs of splitStatusColumnsAndSegments(line)) {
+    if (segs.length === 0) continue;
+    let start = 0;
+    while (start < segs.length && (AGY_MODE_WORDS.has(segs[start]!.toLowerCase()) || isNonModelStatusSegment(segs[start]!))) {
+      start++;
+    }
+    const body = segs.slice(start);
+    if (body.length === 0) continue;
+
+    let effort: string | undefined;
+    const nonEffort: string[] = [];
+    for (let i = 0; i < body.length; i++) {
+      const seg = body[i]!;
+      const eff = i > 0 ? parseTerminalEffortToken(seg, { allowAuto: false }) : undefined;
+      if (eff && !effort) {
+        effort = eff;
+      } else if (!isNonModelStatusSegment(seg)) {
+        nonEffort.push(seg);
+      }
+    }
+
+    const candidate = nonEffort[0];
+    if (!candidate) continue;
+
+    let display = candidate;
+    if (!effort) {
+      const parenEff = /^(.+?)\s*\((minimal|min|low|medium|med|high|xhigh|xhi|max)\)$/i.exec(candidate);
+      if (parenEff?.[1] && parenEff[2]) {
+        const parsedEff = parseTerminalEffortToken(parenEff[2], { allowAuto: false });
+        if (parsedEff) {
+          display = parenEff[1].trim();
+          effort = parsedEff;
+        }
+      }
+    }
+
+    const catalogHit = matchCatalogOption(catalog, display, { effort });
+    if (!catalogHit && start === 0 && !effort && !looksLikeModelDisplayOrId(display)) {
+      continue;
+    }
+
+    if (catalogHit) {
+      const resolvedThinking = effort ?? extractModelExplicitEffort(catalogHit.id);
+      return {
+        currentModel: catalogHit.id,
+        ...(resolvedThinking ? { currentThinking: resolvedThinking } : {}),
+      };
+    }
+
+    const slug = toModelSlug(display);
+    if (!slug) continue;
+    const currentModel = effort && !slug.endsWith(`-${effort}`) ? `${slug}-${effort}` : slug;
+    const resolvedThinking = effort ?? extractModelExplicitEffort(currentModel);
+    return {
+      currentModel,
+      ...(resolvedThinking ? { currentThinking: resolvedThinking } : {}),
+    };
+  }
+  return null;
+}
+
+function parseOmpStatusLine(
+  line: string,
+  catalog?: readonly AgentModelOption[],
+): { currentModel?: string; currentThinking?: string } | null {
+  for (const segs of splitStatusColumnsAndSegments(line)) {
+    if (segs.length === 0) continue;
+
+    let effort: string | undefined;
+    const candidateIndices: number[] = [];
+    let hasStatusMetric = false;
+
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]!;
+      const eff = i >= 1 ? parseTerminalEffortToken(seg, { allowAuto: true }) : undefined;
+      if (eff && !effort) {
+        effort = eff;
+        continue;
+      }
+      if (isNonModelStatusSegment(seg)) {
+        hasStatusMetric = true;
+        continue;
+      }
+      candidateIndices.push(i);
+    }
+
+    if (candidateIndices.length === 0) continue;
+
+    const extractInlineEffort = (raw: string): { clean: string; effort?: string } => {
+      const base = stripModelEffortSuffix(raw);
+      if (base !== raw && raw.length > base.length + 1) {
+        return { clean: base, effort: raw.slice(base.length + 1).toLowerCase() };
+      }
+      return { clean: raw };
+    };
+
+    const isProvToken = (s: string) =>
+      /^[a-z0-9][a-z0-9._-]{1,30}$/i.test(s) &&
+      !looksLikeModelDisplayOrId(s) &&
+      !parseTerminalEffortToken(s, { allowAuto: true }) &&
+      !isNonModelStatusSegment(s);
+
+    let bestCatalogHit: { opt: AgentModelOption; eff?: string } | undefined;
+    for (const idx of candidateIndices) {
+      const rawSeg = segs[idx]!;
+      const { clean, effort: inlineEff } = extractInlineEffort(rawSeg);
+      const adjPrev = idx > 0 ? segs[idx - 1]! : undefined;
+      const adjNext = idx + 1 < segs.length ? segs[idx + 1]! : undefined;
+      const provHint =
+        adjNext && isProvToken(adjNext)
+          ? adjNext
+          : adjPrev && isProvToken(adjPrev)
+            ? adjPrev
+            : undefined;
+      const hit = matchCatalogOption(catalog, clean, {
+        effort: effort ?? inlineEff,
+        providerHint: provHint,
+      });
+      if (hit) {
+        bestCatalogHit = { opt: hit, eff: effort ?? inlineEff };
+        break;
+      }
+    }
+
+    if (bestCatalogHit) {
+      const finalEff = bestCatalogHit.eff ?? extractModelExplicitEffort(bestCatalogHit.opt.id);
+      return {
+        currentModel: bestCatalogHit.opt.id,
+        ...(finalEff ? { currentThinking: finalEff } : {}),
+      };
+    }
+
+    for (const idx of candidateIndices) {
+      const rawSeg = segs[idx]!;
+      const { clean, effort: inlineEff } = extractInlineEffort(rawSeg);
+      const finalEff = effort ?? inlineEff;
+      if (!looksLikeModelDisplayOrId(clean) && !(finalEff && candidateIndices.length <= 2 && idx === 0 && (segs.length >= 2 || hasStatusMetric))) {
+        continue;
+      }
+      const slug = toModelSlug(clean);
+      if (!slug) continue;
+      const adjNext = idx + 1 < segs.length ? segs[idx + 1]! : undefined;
+      const adjPrev = idx > 0 ? segs[idx - 1]! : undefined;
+      const provHint =
+        adjNext && isProvToken(adjNext)
+          ? adjNext.toLowerCase()
+          : adjPrev && isProvToken(adjPrev)
+            ? adjPrev.toLowerCase()
+            : undefined;
+      const currentModel = provHint && !slug.includes("/") ? `${provHint}/${slug}` : slug;
+      return {
+        currentModel,
+        ...(finalEff ? { currentThinking: finalEff } : {}),
+      };
+    }
+  }
+  return null;
+}
+
+function normalizeClaudeBracketModel(
+  inner: string,
+  catalog?: readonly AgentModelOption[],
+): { model?: string; effort?: string } {
+  let clean = inner.replace(/\([^)]*(?:context|ctx|token)[^)]*\)/gi, "").trim();
+  if (!clean) return {};
+
+  let effort: string | undefined;
+  const parts = clean.split(/\s*[|·•]\s*/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length >= 2) {
+    const tailEff = parseTerminalEffortToken(parts[parts.length - 1]!, { allowAuto: true });
+    if (tailEff) {
+      effort = tailEff;
+      clean = parts.slice(0, -1).join(" ").trim();
+    }
+  }
+
+  const catalogHit = matchCatalogOption(catalog, clean, { effort });
+  if (catalogHit) {
+    return { model: catalogHit.id, ...(effort ? { effort } : {}) };
+  }
+
+  const famVer = /^(?:claude[\s-]+)?(opus|sonnet|haiku)[\s-]+(\d+(?:[.-]\d+)?)$/i.exec(clean);
+  if (famVer?.[1] && famVer[2]) {
+    return {
+      model: `claude-${famVer[1].toLowerCase()}-${famVer[2].replace(/\./g, "-")}`,
+      ...(effort ? { effort } : {}),
+    };
+  }
+  const famOnly = /^(?:claude[\s-]+)?(opus|sonnet|haiku)$/i.exec(clean);
+  if (famOnly?.[1]) {
+    return { model: famOnly[1].toLowerCase(), ...(effort ? { effort } : {}) };
+  }
+  if (/^claude-[a-z0-9.-]+$/i.test(clean)) {
+    return { model: clean.toLowerCase(), ...(effort ? { effort } : {}) };
+  }
+  return {};
+}
+
+function parseClaudeStatusLine(
+  line: string,
+  catalog?: readonly AgentModelOption[],
+): { currentModel?: string; currentThinking?: string } | null {
+  const cleanLine = stripTerminalIcons(line).replace(/\s+/g, " ").trim();
+  if (!cleanLine) return null;
+
+  const extractLineEffort = (): string | undefined => {
+    const labeled = /\b(?:effort|thinking)\s*[:=]\s*(minimal|min|low|lo|medium|med|high|hi|xhigh|xhi|max|auto)\b/i.exec(cleanLine);
+    if (labeled?.[1]) return parseTerminalEffortToken(labeled[1], { allowAuto: true });
+    const suffixEff = /\b(minimal|low|medium|high|xhigh|max)\s+effort\b/i.exec(cleanLine);
+    if (suffixEff?.[1]) return parseTerminalEffortToken(suffixEff[1], { allowAuto: false });
+    for (const segs of splitStatusColumnsAndSegments(line)) {
+      if (segs.length < 2) continue;
+      for (const seg of segs) {
+        const eff = parseTerminalEffortToken(seg, { allowAuto: true });
+        if (eff) return eff;
+      }
+    }
+    return undefined;
+  };
+
+  for (const m of cleanLine.matchAll(/\[([^\[\]]{2,64})\]/g)) {
+    const parsed = normalizeClaudeBracketModel(m[1]!, catalog);
+    if (parsed.model) {
+      const eff = parsed.effort ?? extractLineEffort();
+      return {
+        currentModel: parsed.model,
+        ...(eff ? { currentThinking: eff } : {}),
+      };
+    }
+  }
+
+  for (const segs of splitStatusColumnsAndSegments(line)) {
+    for (const seg of segs) {
+      if (/^claude-[a-z0-9._-]+$/i.test(seg)) {
+        const hit = matchCatalogOption(catalog, seg);
+        const eff = extractLineEffort() ?? extractModelExplicitEffort(hit?.id ?? seg);
+        return {
+          currentModel: hit?.id ?? seg.toLowerCase(),
+          ...(eff ? { currentThinking: eff } : {}),
+        };
+      }
+      if (segs.length >= 2) {
+        const parsed = normalizeClaudeBracketModel(seg, catalog);
+        if (parsed.model) {
+          const eff = parsed.effort ?? extractLineEffort();
+          return {
+            currentModel: parsed.model,
+            ...(eff ? { currentThinking: eff } : {}),
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function parseCodexOrGeminiStatusLine(
+  hNorm: string,
+  line: string,
+  catalog?: readonly AgentModelOption[],
+): { currentModel?: string; currentThinking?: string } | null {
+  const cleanLine = stripTerminalIcons(line).replace(/\s+/g, " ").trim();
+  if (!cleanLine) return null;
+
+  if (hNorm === "codex") {
+    const m = /\b((?:gpt-[a-z0-9._-]+|o[134](?:-[a-z0-9._-]+)?|codex-[a-z0-9._-]+))\b(?:\s*(?:\(([^)]+)\)|[·•|]?\s*(minimal|min|low|lo|medium|med|high|hi|xhigh|xhi|max)\b))?/i.exec(
+      cleanLine,
+    );
+    if (m?.[1]) {
+      const rawId = m[1];
+      const eff = parseTerminalEffortToken(m[2] ?? m[3] ?? "", { allowAuto: false }) ?? extractModelExplicitEffort(rawId);
+      const hit = matchCatalogOption(catalog, rawId, { effort: eff });
+      return {
+        currentModel: hit?.id ?? rawId.toLowerCase(),
+        ...(eff ? { currentThinking: eff } : {}),
+      };
+    }
+  }
+
+  if (hNorm === "gemini") {
+    const m = /\b(gemini-[a-z0-9._-]+)\b/i.exec(cleanLine);
+    if (m?.[1]) {
+      const rawId = m[1];
+      let eff = extractModelExplicitEffort(rawId);
+      if (!eff) {
+        for (const segs of splitStatusColumnsAndSegments(line)) {
+          if (segs.length < 2) continue;
+          for (const seg of segs) {
+            const e = parseTerminalEffortToken(seg, { allowAuto: false });
+            if (e) {
+              eff = e;
+              break;
+            }
+          }
+          if (eff) break;
+        }
+      }
+      const hit = matchCatalogOption(catalog, rawId, { effort: eff });
+      return {
+        currentModel: hit?.id ?? rawId.toLowerCase(),
+        ...(eff ? { currentThinking: eff } : {}),
+      };
+    }
+  }
+
+  return parseOmpStatusLine(line, catalog);
+}
+
+/**
+ * Parses live model ID and thinking effort from the bottom ~16 non-empty lines of a terminal screen
+ * (scanning bottom-up so the active status bar wins over stale scrollback).
+ */
+export function parseTerminalModelAndThinking(
+  harness: string | null | undefined,
+  screenText: string,
+  catalog?: readonly AgentModelOption[],
+): { currentModel?: string; currentThinking?: string } {
+  if (!screenText) return {};
+  const stripped = stripAnsiEscapes(screenText);
+  const nonEmptyLines = stripped
+    .split("\n")
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim().length > 0 && !/^[\s─━═\-_|│┌┐└┘├┤┬┴┼╭╮╰╯]+$/.test(l.trim()))
+    .slice(-16);
+
+  if (nonEmptyLines.length === 0) return {};
+  const hNorm = normalizeSwitchHarness(harness);
+
+  for (let i = nonEmptyLines.length - 1; i >= 0; i--) {
+    const line = nonEmptyLines[i]!;
+    let parsed: { currentModel?: string; currentThinking?: string } | null = null;
+    if (hNorm === "antigravity") {
+      parsed = parseAntigravityStatusLine(line, catalog);
+    } else if (hNorm === "omp" || hNorm === "pi") {
+      parsed = parseOmpStatusLine(line, catalog);
+    } else if (hNorm === "claude") {
+      parsed = parseClaudeStatusLine(line, catalog);
+    } else if (hNorm === "codex" || hNorm === "gemini") {
+      parsed = parseCodexOrGeminiStatusLine(hNorm, line, catalog);
+    } else {
+      parsed =
+        parseClaudeStatusLine(line, catalog) ??
+        parseAntigravityStatusLine(line, catalog) ??
+        parseOmpStatusLine(line, catalog);
+    }
+    if (parsed?.currentModel) {
+      return parsed;
+    }
+  }
+
+  return {};
+}
+
+/**
+ * Merges live model and thinking effort parsed from `screenText` into an existing `AgentModelsResult`
+ * when `currentModel` or `currentThinking` is still missing, updating `models` and `thinkingLevels`.
+ */
+export function applyTerminalModelFallback(
+  base: AgentModelsResult,
+  harness: string,
+  screenText: string,
+  opts?: { thinkingLevel?: string; hasReasoningEvents?: boolean },
+): AgentModelsResult {
+  if (!screenText.trim()) return base;
+  const models = Array.isArray(base.models) ? base.models : [];
+  const effectiveHarness = base.harness || harness;
+  const parsed = parseTerminalModelAndThinking(effectiveHarness, screenText, models);
+  if (!parsed.currentModel && !parsed.currentThinking) return base;
+
+  const curModel = base.currentModel?.trim() || "";
+  const rawResolvedModel = curModel || parsed.currentModel;
+  const matchedOpt = rawResolvedModel
+    ? findModelOptionForModel(models, rawResolvedModel, {
+        harness: effectiveHarness,
+        modelRoles: base.modelRoles,
+      })
+    : undefined;
+  const nextModel = matchedOpt?.id ?? rawResolvedModel;
+
+  const nextModels = [...models];
+  if (nextModel && !nextModels.some((m) => m.id.toLowerCase() === nextModel.toLowerCase())) {
+    nextModels.unshift({ id: nextModel, label: nextModel, source: "current" });
+  }
+
+  const nextLevels = resolveThinkingLevelsForModel(
+    {
+      ...base,
+      harness: effectiveHarness,
+      models: nextModels,
+      currentModel: nextModel,
+      hasReasoningEvents: opts?.hasReasoningEvents,
+    },
+    nextModel,
+  );
+  const rawThinking =
+    base.currentThinking?.trim().toLowerCase() ||
+    parsed.currentThinking ||
+    opts?.thinkingLevel?.trim().toLowerCase() ||
+    extractModelExplicitEffort(nextModel);
+  const nextThinking =
+    nextLevels.length > 0 ? clampThinkingLevel(nextLevels, rawThinking, nextModel) : undefined;
+
+  return {
+    ...base,
+    ...(nextModel ? { currentModel: nextModel } : {}),
+    ...(nextThinking ? { currentThinking: nextThinking } : {}),
+    ...(nextLevels.length > 0
+      ? {
+          thinkingLevels: nextLevels,
+          canSwitchThinking: base.canSwitch,
+          thinkingLabel: base.thinkingLabel || "思考等级",
+        }
+      : { thinkingLevels: undefined, canSwitchThinking: false }),
+    models: nextModels,
   };
 }

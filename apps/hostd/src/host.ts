@@ -1270,6 +1270,7 @@ export class Host {
         unifloReady: this.sources.includes("uniflo"),
         currentModelOverride: ov?.model,
         currentThinkingOverride: ov?.thinking,
+        readTerminalTail: a.source === "hc" && !a.isShell ? () => this.hc.snapshotText(a.localId, 20) : undefined,
       });
     },
     "agent.setModel": async (p) => {

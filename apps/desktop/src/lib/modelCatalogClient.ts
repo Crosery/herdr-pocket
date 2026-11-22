@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
+  applyTerminalModelFallback,
   clampThinkingLevel,
   findModelOptionForModel,
   inferAgentModelAndThinking,
+  isNonReasoningModelName,
   normalizeSwitchHarness,
   resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
@@ -24,6 +26,7 @@ interface CacheEntry {
   at: number;
   ttl: number;
   model: string;
+  thinkingLevel: string;
   sessionKey: string;
   res: AgentModelsResult;
 }
@@ -42,6 +45,7 @@ export interface ModelCatalogDeps {
     currentModel: string | null;
     sessionKey: string | null;
   }) => Promise<AgentModelsResult>;
+  readTerminal: (deviceId: string, agentKey: string) => Promise<string | null>;
 }
 
 const defaultDeps: ModelCatalogDeps = {
@@ -54,6 +58,15 @@ const defaultDeps: ModelCatalogDeps = {
   invokeLocalAgentModels: async (params) => {
     const mod = await import("@tauri-apps/api/core");
     return mod.invoke<AgentModelsResult>("local_agent_models", params);
+  },
+  readTerminal: async (deviceId, agentKey) => {
+    try {
+      const { rpcCall } = await import("./relay");
+      const res = await rpcCall(deviceId, "terminal.read", { agent: agentKey, lines: 24 });
+      return res?.text || res?.ansi || "";
+    } catch {
+      return null;
+    }
   },
 };
 
@@ -91,6 +104,7 @@ function getCachedEntry(agent: Agent): AgentModelsResult | null {
   if (!entry) return null;
   if (
     entry.model !== (agent.model ?? "") ||
+    entry.thinkingLevel !== (agent.thinkingLevel ?? "").trim().toLowerCase() ||
     entry.sessionKey !== (agent.sessionKey ?? "") ||
     Date.now() - entry.at >= entry.ttl
   ) {
@@ -112,6 +126,7 @@ export function seedModelCatalogCacheForTest(agent: Agent, res: AgentModelsResul
     at: Date.now(),
     ttl: CACHE_TTL_MS,
     model: agent.model ?? "",
+    thinkingLevel: (agent.thinkingLevel ?? "").trim().toLowerCase(),
     sessionKey: agent.sessionKey ?? "",
     res,
   });
@@ -177,19 +192,30 @@ function normalizeAgentModelsResult(
 
 function applyReasoningEventsFallback(
   res: AgentModelsResult,
-  agent: Pick<Agent, "harness" | "isShell">,
+  agent: Pick<Agent, "harness" | "isShell" | "thinkingLevel">,
   hasReasoningEvents?: boolean,
 ): AgentModelsResult {
   const normalized = normalizeAgentModelsResult(res, agent);
-  if (agent.isShell || normalized.thinkingLevels?.length) return normalized;
-  const fallbackLevels = resolveThinkingLevelsForModel(
-    { ...normalized, harness: normalized.harness || agent.harness, hasReasoningEvents },
-    normalized.currentModel,
-  );
-  if (fallbackLevels.length === 0) return normalized;
+  if (agent.isShell) return normalized;
+  const levels = normalized.thinkingLevels?.length
+    ? normalized.thinkingLevels
+    : resolveThinkingLevelsForModel(
+        { ...normalized, harness: normalized.harness || agent.harness, hasReasoningEvents },
+        normalized.currentModel,
+      );
+  if (levels.length === 0) return normalized;
+  const filledThinking =
+    normalized.currentThinking ??
+    (agent.thinkingLevel?.trim() ? clampThinkingLevel(levels, agent.thinkingLevel) : undefined);
+  if (normalized.thinkingLevels?.length) {
+    return filledThinking && filledThinking !== normalized.currentThinking
+      ? { ...normalized, currentThinking: filledThinking }
+      : normalized;
+  }
   return {
     ...normalized,
-    thinkingLevels: fallbackLevels,
+    ...(filledThinking ? { currentThinking: filledThinking } : {}),
+    thinkingLevels: levels,
     canSwitchThinking: normalized.canSwitch,
     thinkingLabel: normalized.thinkingLabel || "思考等级",
   };
@@ -263,30 +289,55 @@ function normalizeLocalResultForAgent(
   const { modelRoles, models: rawModels, ...rest } = raw;
   const models = Array.isArray(rawModels) ? rawModels : [];
   const isRemote = Boolean(opts?.isRemoteHost);
-  const inferred = isRemote && agent.model ? inferAgentModelAndThinking(agent.harness, agent.model) : undefined;
-  const nextModel = inferred?.currentModel || raw.currentModel;
-  const nextLevels =
-    isRemote && agent.model
+  if (isRemote) {
+    // Discard another computer's live state; only reuse its static model catalog.
+    const targetClean = agent.model ? stripModelEffortSuffix(agent.model).toLowerCase() : "";
+    const catalogOnlyModels = models.map((m) =>
+      m.source === "current" && (!targetClean || m.id.toLowerCase() !== targetClean)
+        ? { ...m, source: "catalog" as const }
+        : m,
+    );
+    const inferred =
+      agent.model || agent.thinkingLevel
+        ? inferAgentModelAndThinking(agent.harness, agent.model, { thinkingLevel: agent.thinkingLevel })
+        : undefined;
+    const nextModel = inferred?.currentModel;
+    const nextLevels = nextModel
       ? resolveThinkingLevelsForModel(
           {
-            ...raw,
-            models,
             harness: agent.harness,
+            models: catalogOnlyModels,
             currentModel: nextModel,
-            modelRoles: undefined,
           },
           nextModel,
         )
-      : (raw.thinkingLevels ?? []);
-  const nextThinking =
-    isRemote && agent.model
-      ? clampThinkingLevel(nextLevels, inferred?.currentThinking ?? raw.currentThinking, agent.model)
-      : raw.currentThinking;
+      : [];
+    const nextThinking = clampThinkingLevel(
+      nextLevels,
+      inferred?.currentThinking ?? agent.thinkingLevel,
+      agent.model,
+    );
+    return {
+      harness: agent.harness,
+      models: catalogOnlyModels,
+      ...(nextModel ? { currentModel: nextModel } : {}),
+      ...(nextThinking ? { currentThinking: nextThinking } : {}),
+      ...(nextLevels.length
+        ? { thinkingLevels: nextLevels, thinkingLabel: raw.thinkingLabel || "思考等级" }
+        : {}),
+      canSwitch,
+      canSwitchThinking: canSwitch && nextLevels.length > 0,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
+  const nextLevels = raw.thinkingLevels ?? [];
+  const nextThinking = raw.currentThinking ?? (nextLevels.length ? clampThinkingLevel(nextLevels, agent.thinkingLevel, agent.model) : undefined);
   return {
     ...rest,
     models,
-    ...(isRemote ? {} : modelRoles ? { modelRoles } : {}),
-    ...(nextModel ? { currentModel: nextModel } : {}),
+    ...(modelRoles ? { modelRoles } : {}),
+    ...(raw.currentModel ? { currentModel: raw.currentModel } : {}),
     ...(nextThinking ? { currentThinking: nextThinking } : { currentThinking: undefined }),
     ...(nextLevels.length ? { thinkingLevels: nextLevels } : { thinkingLevels: undefined }),
     harness: agent.harness,
@@ -312,7 +363,10 @@ export function getInitialAgentModelsSeed(
   if (cached) {
     return applyReasoningEventsFallback(cached, agent, opts?.hasReasoningEvents);
   }
-  return synthesizeFallbackAgentModels(agent, peerModels, opts);
+  return synthesizeFallbackAgentModels(agent, peerModels, {
+    ...opts,
+    thinkingLevel: agent.thinkingLevel,
+  });
 }
 
 /**
@@ -386,11 +440,46 @@ export async function updateAgentRoleModel(
   }
 }
 
+async function enrichResultFromTerminalTail(
+  res: AgentModelsResult,
+  agent: Agent,
+  deps: ModelCatalogDeps,
+  hasReasoningEvents?: boolean,
+): Promise<AgentModelsResult> {
+  if (agent.isShell || (agent.source !== "hc" && agent.source !== "herdr")) {
+    return res;
+  }
+  const models = Array.isArray(res.models) ? res.models : [];
+  const harness = res.harness || agent.harness;
+  const curModel = res.currentModel?.trim() || "";
+  const matchedCur = curModel
+    ? findModelOptionForModel(models, curModel, { harness, modelRoles: res.modelRoles })
+    : undefined;
+  const curNonReasoning =
+    matchedCur?.reasoning === false ||
+    (matchedCur?.thinkingLevels !== undefined && matchedCur.thinkingLevels.length === 0) ||
+    (curModel ? isNonReasoningModelName(curModel) : false);
+  const curThinking = res.currentThinking?.trim().toLowerCase() || "";
+  if (curModel && (curThinking || curNonReasoning)) {
+    return res;
+  }
+
+  const screenText = await deps.readTerminal(agent.deviceId, agent.key).catch(() => null);
+  if (!screenText?.trim()) {
+    return res;
+  }
+  return applyTerminalModelFallback(res, harness, screenText, {
+    thinkingLevel: agent.thinkingLevel,
+    hasReasoningEvents,
+  });
+}
+
 /**
  * Fetches an agent's model catalog & live thinking state with full multi-layer fallback:
  * 1. Remote/host `agent.models` RPC
  * 2. Native desktop Tauri `local_agent_models` race/merge (~800ms for omp/pi or on failure)
- * 3. Client-side `synthesizeFallbackAgentModels` using peer models & harness presets
+ * 3. Live `terminal.read` footer parsing (`parseTerminalModelAndThinking`) when model/thinking is still missing
+ * 4. Client-side `synthesizeFallbackAgentModels` using peer models & harness presets
  * Never surfaces `unknown method agent.models` errors.
  */
 export async function fetchAgentModelsWithFallback(
@@ -414,7 +503,7 @@ export async function fetchAgentModelsWithFallback(
     if (cached) return applyReasoningEventsFallback(cached, agent, opts.hasReasoningEvents);
   }
 
-  const reqKey = `${agent.deviceId}\0${agent.key}\0${agent.model ?? ""}\0${agent.sessionKey ?? ""}`;
+  const reqKey = `${agent.deviceId}\0${agent.key}\0${agent.model ?? ""}\0${agent.thinkingLevel ?? ""}\0${agent.sessionKey ?? ""}`;
   if (!opts.force && useDefaultDeps) {
     const existing = inflightRequests.get(reqKey);
     if (existing) {
@@ -422,7 +511,11 @@ export async function fetchAgentModelsWithFallback(
     }
   }
 
-  const deps: ModelCatalogDeps = { ...defaultDeps, ...opts.deps };
+  const deps: ModelCatalogDeps = {
+    ...defaultDeps,
+    ...(opts.deps ? { readTerminal: async () => null } : {}),
+    ...opts.deps,
+  };
   const hNorm = normalizeSwitchHarness(agent.harness);
   const canRaceLocal = deps.isTauri() && (hNorm === "omp" || hNorm === "pi");
   const raceMs = Math.max(0, opts.remoteRaceMs ?? REMOTE_RACE_MS);
@@ -432,20 +525,24 @@ export async function fetchAgentModelsWithFallback(
   const task = (async (): Promise<AgentModelsResult> => {
     const synth = synthesizeFallbackAgentModels(agent, peerModels, {
       hasReasoningEvents: opts.hasReasoningEvents,
+      thinkingLevel: agent.thinkingLevel,
     });
     const rpcPromise = deps.rpcCall(agent.deviceId, agent.key);
 
     if (!deps.isTauri()) {
+      let base: AgentModelsResult;
       try {
         const rpcRes = normalizeAgentModelsResult(await rpcPromise, agent);
-        if (rpcRes.models.length === 0) {
-          return applyReasoningEventsFallback(mergeAgentModelsResults(rpcRes, synth), agent, opts.hasReasoningEvents);
-        }
-        return applyReasoningEventsFallback(rpcRes, agent, opts.hasReasoningEvents);
-      } catch {
-        usedTransientLocal = true;
-        return synth;
+        base = applyReasoningEventsFallback(
+          rpcRes.models.length === 0 ? mergeAgentModelsResults(rpcRes, synth) : rpcRes,
+          agent,
+          opts.hasReasoningEvents,
+        );
+      } catch (err) {
+        if (!isUnsupportedRpcError(err)) usedTransientLocal = true;
+        base = synth;
       }
+      return enrichResultFromTerminalTail(base, agent, deps, opts.hasReasoningEvents);
     }
 
     const localId = await deps.getLocalHostId().catch(() => null);
@@ -468,23 +565,36 @@ export async function fetchAgentModelsWithFallback(
     };
 
     if (!canRaceLocal) {
+      let rpcRes: AgentModelsResult | null = null;
       try {
-        const rpcRes = normalizeAgentModelsResult(await rpcPromise, agent);
-        if (rpcRes && (rpcRes.models.length > 0 || isRemoteHost)) {
-          return applyReasoningEventsFallback(
-            rpcRes.models.length === 0 ? mergeAgentModelsResults(rpcRes, synth) : rpcRes,
-            agent,
-            opts.hasReasoningEvents,
-          );
-        }
+        rpcRes = normalizeAgentModelsResult(await rpcPromise, agent);
       } catch (err) {
         if (!isUnsupportedRpcError(err)) usedTransientLocal = true;
       }
-      if (!isRemoteHost) {
-        const localNorm = await loadLocalNormalized();
-        if (localNorm) return applyReasoningEventsFallback(localNorm, agent, opts.hasReasoningEvents);
+
+      if (rpcRes && rpcRes.models.length > 0) {
+        return enrichResultFromTerminalTail(
+          applyReasoningEventsFallback(rpcRes, agent, opts.hasReasoningEvents),
+          agent,
+          deps,
+          opts.hasReasoningEvents,
+        );
       }
-      return synth;
+
+      const localNorm = await loadLocalNormalized();
+      const base = rpcRes
+        ? localNorm
+          ? mergeAgentModelsResults(mergeAgentModelsResults(rpcRes, localNorm), synth)
+          : mergeAgentModelsResults(rpcRes, synth)
+        : localNorm
+          ? mergeAgentModelsResults(localNorm, synth)
+          : synth;
+      return enrichResultFromTerminalTail(
+        applyReasoningEventsFallback(base, agent, opts.hasReasoningEvents),
+        agent,
+        deps,
+        opts.hasReasoningEvents,
+      );
     }
 
     type RpcOutcome = { kind: "ok"; res: AgentModelsResult } | { kind: "err"; err: unknown } | { kind: "timeout" };
@@ -502,7 +612,12 @@ export async function fetchAgentModelsWithFallback(
     });
 
     if (outcome.kind === "ok" && outcome.res.models.length > 0) {
-      return applyReasoningEventsFallback(outcome.res, agent, opts.hasReasoningEvents);
+      return enrichResultFromTerminalTail(
+        applyReasoningEventsFallback(outcome.res, agent, opts.hasReasoningEvents),
+        agent,
+        deps,
+        opts.hasReasoningEvents,
+      );
     }
 
     if (outcome.kind === "err" && !isUnsupportedRpcError(outcome.err)) {
@@ -515,7 +630,12 @@ export async function fetchAgentModelsWithFallback(
       const winner = await Promise.race([rpcSettled, localPromise]);
 
       if (winner.kind === "ok" && winner.res.models.length > 0) {
-        return applyReasoningEventsFallback(winner.res, agent, opts.hasReasoningEvents);
+        return enrichResultFromTerminalTail(
+          applyReasoningEventsFallback(winner.res, agent, opts.hasReasoningEvents),
+          agent,
+          deps,
+          opts.hasReasoningEvents,
+        );
       }
 
       const localNorm = winner.kind === "local" ? winner.localNorm : await loadLocalNormalized();
@@ -523,41 +643,48 @@ export async function fetchAgentModelsWithFallback(
         ? applyReasoningEventsFallback(mergeAgentModelsResults(localNorm, synth), agent, opts.hasReasoningEvents)
         : synth;
 
-      void rpcSettled.then((late) => {
-        if (late.kind !== "ok") return;
-        const mergedLate = applyReasoningEventsFallback(
-          mergeAgentModelsResults(late.res, baseResult),
-          agent,
-          opts.hasReasoningEvents,
-        );
+      void rpcSettled.then(async (late) => {
+        const mergedLate =
+          late.kind === "ok"
+            ? applyReasoningEventsFallback(
+                mergeAgentModelsResults(late.res, baseResult),
+                agent,
+                opts.hasReasoningEvents,
+              )
+            : baseResult;
+        const finalLate = await enrichResultFromTerminalTail(mergedLate, agent, deps, opts.hasReasoningEvents);
+        if (late.kind !== "ok" && finalLate === baseResult) return;
         if (useDefaultDeps) {
           modelsCache.set(agent.key, {
             at: Date.now(),
-            ttl: mergedLate.models.length > 0 ? CACHE_TTL_MS : TRANSIENT_FALLBACK_TTL_MS,
+            ttl: finalLate.models.length > 0 ? CACHE_TTL_MS : TRANSIENT_FALLBACK_TTL_MS,
             model: agent.model ?? "",
+            thinkingLevel: (agent.thinkingLevel ?? "").trim().toLowerCase(),
             sessionKey: agent.sessionKey ?? "",
-            res: mergedLate,
+            res: finalLate,
           });
         }
-        opts.onUpdate?.(mergedLate);
+        opts.onUpdate?.(finalLate);
       });
 
       return baseResult;
     }
 
     const localNorm = await loadLocalNormalized();
-    if (localNorm) {
-      const merged = outcome.kind === "ok"
-        ? mergeAgentModelsResults(outcome.res, localNorm)
-        : mergeAgentModelsResults(localNorm, synth);
-      return applyReasoningEventsFallback(merged, agent, opts.hasReasoningEvents);
-    }
+    const base = localNorm
+      ? outcome.kind === "ok"
+        ? mergeAgentModelsResults(mergeAgentModelsResults(outcome.res, localNorm), synth)
+        : mergeAgentModelsResults(localNorm, synth)
+      : outcome.kind === "ok"
+        ? mergeAgentModelsResults(outcome.res, synth)
+        : synth;
 
-    if (outcome.kind === "ok") {
-      return applyReasoningEventsFallback(mergeAgentModelsResults(outcome.res, synth), agent, opts.hasReasoningEvents);
-    }
-
-    return synth;
+    return enrichResultFromTerminalTail(
+      applyReasoningEventsFallback(base, agent, opts.hasReasoningEvents),
+      agent,
+      deps,
+      opts.hasReasoningEvents,
+    );
   })();
 
   if (useDefaultDeps) {
@@ -570,6 +697,7 @@ export async function fetchAgentModelsWithFallback(
         at: Date.now(),
         ttl: !usedTransientLocal && result.models.length > 0 ? CACHE_TTL_MS : TRANSIENT_FALLBACK_TTL_MS,
         model: agent.model ?? "",
+        thinkingLevel: (agent.thinkingLevel ?? "").trim().toLowerCase(),
         sessionKey: agent.sessionKey ?? "",
         res: result,
       });
@@ -610,6 +738,7 @@ export function computeAutoAgentModelMeta(
       modelRoles?: Record<string, string>;
     } | null;
     hasReasoningEvents?: boolean;
+    thinkingLevel?: string;
     refresh?: () => void;
     applyOverride?: AutoAgentModelMeta["applyOverride"];
   } = {},
@@ -631,10 +760,11 @@ export function computeAutoAgentModelMeta(
   const activeFetched = opts.fetched ? normalizeAgentModelsResult(opts.fetched, agent) : null;
   const activeOverride = opts.override ?? null;
   const hasReasoningEvents = opts.hasReasoningEvents;
+  const explicitThinkingLevel = opts.thinkingLevel?.trim() || agent.thinkingLevel?.trim() || undefined;
   const inferred = inferAgentModelAndThinking(
     agent.harness,
     !activeFetched && activeOverride?.currentModel ? activeOverride.currentModel : agent.model,
-    { hasReasoningEvents },
+    { hasReasoningEvents, thinkingLevel: explicitThinkingLevel },
   );
 
   const currentModel =
@@ -670,7 +800,10 @@ export function computeAutoAgentModelMeta(
         ? clampThinkingLevel(thinkingLevels, activeOverride.currentThinking)
         : clampThinkingLevel(
             thinkingLevels,
-            activeOverride?.fallbackThinkingCandidate || activeFetched?.currentThinking || inferred.currentThinking,
+            activeOverride?.fallbackThinkingCandidate ||
+              activeFetched?.currentThinking ||
+              inferred.currentThinking ||
+              explicitThinkingLevel,
             activeOverride?.currentModel,
           );
 
@@ -698,9 +831,10 @@ export function computeAutoAgentModelMeta(
  */
 export function useAutoAgentModelMeta(
   agent: Agent,
-  opts?: { hasReasoningEvents?: boolean },
+  opts?: { hasReasoningEvents?: boolean; thinkingLevel?: string },
 ): AutoAgentModelMeta {
   const hasReasoningEvents = opts?.hasReasoningEvents;
+  const thinkingLevel = opts?.thinkingLevel ?? agent.thinkingLevel;
 
   const [fetched, setFetched] = useState<{
     key: string;
@@ -738,7 +872,7 @@ export function useAutoAgentModelMeta(
     return () => {
       alive = false;
     };
-  }, [agent.key, agent.deviceId, agent.harness, agent.model, agent.sessionKey, agent.source, agent.isShell, hasReasoningEvents, rev]);
+  }, [agent.key, agent.deviceId, agent.harness, agent.model, agent.thinkingLevel, agent.sessionKey, agent.source, agent.isShell, hasReasoningEvents, rev]);
 
   const refresh = useCallback(() => {
     invalidateModelCatalogCache(agent.key);
@@ -795,6 +929,7 @@ export function useAutoAgentModelMeta(
     fetched: activeFetched,
     override: activeOverride,
     hasReasoningEvents,
+    thinkingLevel,
     refresh,
     applyOverride,
   });

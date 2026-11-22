@@ -84,6 +84,8 @@ export interface Agent {
   /** Matching Uniflo session key, when found (enables the chat view). */
   sessionKey?: string;
   model?: string;
+  /** Current thinking/reasoning effort inferred from the matched session, when known. */
+  thinkingLevel?: string;
   /** First human prompt of the matched session. */
   preview?: string;
   costUsd?: number;
@@ -823,6 +825,7 @@ import {
   HARNESS_DEFAULT_THINKING_LEVELS,
   OMP_MODEL_ROLES,
   OMP_QUICK_ROLE_CHIPS,
+  applyTerminalModelFallback,
   clampThinkingLevel,
   extractModelExplicitEffort,
   findModelOptionForModel,
@@ -830,6 +833,7 @@ import {
   inferModelThinkingLevels,
   isNonReasoningModelName,
   normalizeSwitchHarness,
+  parseTerminalModelAndThinking,
   resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
@@ -842,6 +846,7 @@ export {
   HARNESS_DEFAULT_THINKING_LEVELS,
   OMP_MODEL_ROLES,
   OMP_QUICK_ROLE_CHIPS,
+  applyTerminalModelFallback,
   clampThinkingLevel,
   extractModelExplicitEffort,
   findModelOptionForModel,
@@ -849,6 +854,7 @@ export {
   inferModelThinkingLevels,
   isNonReasoningModelName,
   normalizeSwitchHarness,
+  parseTerminalModelAndThinking,
   resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,

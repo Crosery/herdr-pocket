@@ -1,4 +1,17 @@
-import type { Agent, AgentUsageModelRow, ConvEvent, SessionHit, SessionInfo, SubSession, UsageRow } from "@herdr-pocket/protocol";
+import { closeSync, existsSync, fstatSync, openSync, readSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import {
+  extractModelExplicitEffort,
+  stripModelEffortSuffix,
+  type Agent,
+  type AgentUsageModelRow,
+  type ConvEvent,
+  type SessionHit,
+  type SessionInfo,
+  type SubSession,
+  type UsageRow,
+} from "@herdr-pocket/protocol";
 import { cleanTitle } from "./util.ts";
 
 /** Subset of Uniflo schema v1 `Session` (crates/uniflo-schema/src/lib.rs). */
@@ -155,6 +168,139 @@ export function harnessId(name: string | undefined): string | undefined {
   return name ? (HARNESS_ALIAS[name] ?? name) : undefined;
 }
 
+const DEFAULT_TRANSCRIPT_TAIL_BYTES = 64 * 1024;
+const MAX_TRANSCRIPT_META_CACHE = 500;
+
+function resolveTranscriptPath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return join(homedir(), trimmed.slice(2));
+  }
+  return trimmed;
+}
+
+/**
+ * Tail-reads the last ~`maxBytes` of a JSONL session transcript backwards to recover the latest
+ * active model ID and thinking effort (supporting OMP, Claude, Codex, Pi, Gemini, and Antigravity).
+ */
+export function readJsonlModelAndThinkingTail(
+  rawPath: string,
+  maxBytes = DEFAULT_TRANSCRIPT_TAIL_BYTES,
+): { model?: string; thinkingLevel?: string } {
+  const filePath = resolveTranscriptPath(rawPath);
+  if (!filePath) return {};
+
+  let text = "";
+  try {
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) return {};
+    const fd = openSync(filePath, "r");
+    try {
+      const size = fstatSync(fd).size;
+      if (size <= 0) return {};
+      const start = Math.max(0, size - maxBytes);
+      const len = size - start;
+      const buf = Buffer.allocUnsafe(len);
+      const bytesRead = readSync(fd, buf, 0, len, start);
+      text = buf.subarray(0, bytesRead).toString("utf8");
+      if (start > 0) {
+        const nl = text.indexOf("\n");
+        text = nl >= 0 ? text.slice(nl + 1) : "";
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return {};
+  }
+  if (!text) return {};
+
+  let model: string | undefined;
+  let thinkingLevel: string | undefined;
+  const lines = text.split(/\r?\n/);
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const raw = lines[i]?.trim();
+    if (!raw || !raw.startsWith("{")) continue;
+    let obj: Record<string, any>;
+    try {
+      obj = JSON.parse(raw) as Record<string, any>;
+    } catch {
+      continue;
+    }
+
+    if (thinkingLevel === undefined) {
+      let t: string | undefined;
+      if (obj.type === "thinking_level_change") {
+        t = typeof obj.thinkingLevel === "string" ? obj.thinkingLevel : typeof obj.level === "string" ? obj.level : undefined;
+      } else if (obj.thinkingMetadata && typeof obj.thinkingMetadata === "object") {
+        if (obj.thinkingMetadata.disabled === true) {
+          t = "off";
+        } else if (typeof obj.thinkingMetadata.level === "string") {
+          t = obj.thinkingMetadata.level;
+        } else if (typeof obj.thinkingMetadata.effort === "string") {
+          t = obj.thinkingMetadata.effort;
+        }
+      } else if (typeof obj.perTurnEffort === "string") {
+        t = obj.perTurnEffort;
+      } else if (typeof obj.effort === "string") {
+        t = obj.effort;
+      } else if ((obj.type === "turn_context" || obj.type === "turn_start") && obj.payload && typeof obj.payload === "object") {
+        t =
+          (typeof obj.payload.reasoning_effort === "string" && obj.payload.reasoning_effort) ||
+          (typeof obj.payload.effort === "string" && obj.payload.effort) ||
+          (typeof obj.payload.collaboration_mode?.settings?.reasoning_effort === "string" &&
+            obj.payload.collaboration_mode.settings.reasoning_effort) ||
+          undefined;
+      } else if (typeof obj.reasoning_effort === "string") {
+        t = obj.reasoning_effort;
+      } else if (typeof obj.payload?.reasoning_effort === "string") {
+        t = obj.payload.reasoning_effort;
+      }
+      if (t && t.trim()) thinkingLevel = t.trim().toLowerCase();
+    }
+
+    if (model === undefined) {
+      let m: string | undefined;
+      if (obj.type === "model_change") {
+        if (typeof obj.model === "string" && obj.model.trim() && obj.model.trim() !== "<synthetic>") {
+          m = obj.model.trim();
+        } else if (typeof obj.modelId === "string" && obj.modelId.trim() && obj.modelId.trim() !== "<synthetic>") {
+          const mid = obj.modelId.trim();
+          const prov = typeof obj.provider === "string" ? obj.provider.trim() : "";
+          m = prov && !mid.startsWith(`${prov}/`) ? `${prov}/${mid}` : mid;
+        }
+      } else if (typeof obj.requestedModel === "string" && obj.requestedModel.trim() && obj.requestedModel.trim() !== "<synthetic>") {
+        m = obj.requestedModel.trim();
+      } else if (typeof obj.message?.model === "string" && obj.message.model.trim() && obj.message.model.trim() !== "<synthetic>") {
+        m = obj.message.model.trim();
+      } else if ((obj.type === "turn_context" || obj.type === "turn_start") && obj.payload && typeof obj.payload === "object") {
+        const pm =
+          (typeof obj.payload.model === "string" && obj.payload.model) ||
+          (typeof obj.payload.collaboration_mode?.settings?.model === "string" && obj.payload.collaboration_mode.settings.model) ||
+          "";
+        if (pm.trim() && pm.trim() !== "<synthetic>") m = pm.trim();
+      } else if (typeof obj.model === "string" && obj.model.trim() && obj.model.trim() !== "<synthetic>") {
+        m = obj.model.trim();
+      }
+      if (m) {
+        const clean = stripModelEffortSuffix(m);
+        const explicitEffort = extractModelExplicitEffort(m);
+        if (clean) {
+          model = clean;
+          if (thinkingLevel === undefined && explicitEffort) thinkingLevel = explicitEffort;
+        }
+      }
+    }
+
+    if (model !== undefined && thinkingLevel !== undefined) break;
+  }
+
+  return {
+    ...(model ? { model } : {}),
+    ...(thinkingLevel ? { thinkingLevel } : {}),
+  };
+}
+
 /**
  * Reads the local Uniflo daemon (read-only) to turn raw terminals into
  * readable conversations: title, model, cost and the event timeline.
@@ -185,6 +331,7 @@ export class UnifloAdapter {
   private lastRefresh = 0;
   private refreshing = false;
   private refreshAgain = false;
+  private transcriptMetaCache = new Map<string, { updatedAt: number; model?: string; thinkingLevel?: string }>();
 
   constructor(base = process.env.UNIFLO_URL ?? "http://127.0.0.1:7311", token = process.env.UNIFLO_TOKEN) {
     this.base = base.replace(/\/+$/, "");
@@ -501,6 +648,24 @@ export class UnifloAdapter {
       const s = matched.get(a.key);
       if (!s) return a;
       const kids = this.childCounts.get(s.key);
+      let meta = this.transcriptMetaCache.get(s.key);
+      if (s.source?.trim()) {
+        if (!meta || meta.updatedAt !== s.updated_at) {
+          const read = readJsonlModelAndThinkingTail(s.source);
+          meta = { updatedAt: s.updated_at, ...read };
+          if (this.transcriptMetaCache.has(s.key)) {
+            this.transcriptMetaCache.delete(s.key);
+          } else if (this.transcriptMetaCache.size >= MAX_TRANSCRIPT_META_CACHE) {
+            const oldestKey = this.transcriptMetaCache.keys().next().value;
+            if (oldestKey !== undefined) this.transcriptMetaCache.delete(oldestKey);
+          }
+          this.transcriptMetaCache.set(s.key, meta);
+        }
+      } else {
+        meta = undefined;
+      }
+      const model = s.model ?? meta?.model;
+      const thinkingLevel = meta?.thinkingLevel ?? (model ? extractModelExplicitEffort(model) : undefined);
       // Status stays exactly what herdr shows (the phone must match the desktop
       // app); the transcript only adds title, preview, model and cost.
       return {
@@ -509,7 +674,8 @@ export class UnifloAdapter {
         sessionKey: s.key,
         // A name given in herdr wins over the session title.
         title: a.name ? a.title : (cleanTitle(s.title) ?? a.title),
-        model: s.model,
+        model,
+        ...(thinkingLevel ? { thinkingLevel } : {}),
         preview: s.preview ? s.preview.slice(0, 200) : undefined,
         costUsd: s.usage?.cost_usd,
         contextTokens: s.usage?.last_context_tokens,

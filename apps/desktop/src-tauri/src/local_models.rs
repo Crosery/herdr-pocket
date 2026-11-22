@@ -692,6 +692,7 @@ pub fn parse_agy_models_text(raw: &str) -> Vec<ModelOption> {
         }
     }
 
+    let entry_count = entries.len();
     entries
         .into_iter()
         .map(|e| {
@@ -718,6 +719,19 @@ pub fn parse_agy_models_text(raw: &str) -> Vec<ModelOption> {
                     reasoning: Some(has_levels),
                     thinking_levels: if has_levels { Some(thinking_levels) } else { None },
                     effort_model_map: if has_levels { Some(effort_model_map) } else { None },
+                    source: "catalog",
+                };
+            }
+
+            if entry_count >= 3 {
+                return ModelOption {
+                    id: e.id,
+                    label: e.label,
+                    provider: Some("antigravity".into()),
+                    context_window: None,
+                    reasoning: Some(false),
+                    thinking_levels: None,
+                    effort_model_map: None,
                     source: "catalog",
                 };
             }
@@ -1732,13 +1746,64 @@ fn read_omp_models_yml(home: &Path) -> Vec<ModelOption> {
     parse_omp_models_yml(&raw)
 }
 
+fn find_antigravity_transcript(home: &Path, id: &str) -> Option<PathBuf> {
+    let brain_dir = home.join(".gemini").join("antigravity-cli").join("brain");
+    let direct = brain_dir
+        .join(id)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl");
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let Ok(entries) = fs::read_dir(&brain_dir) else {
+        return None;
+    };
+    let lower_id = id.to_ascii_lowercase();
+    let mut matches: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = ent.file_name().to_string_lossy().to_ascii_lowercase();
+        let is_match =
+            dir_name == lower_id || (lower_id.len() >= 6 && dir_name.starts_with(&lower_id));
+        if !is_match {
+            continue;
+        }
+        let cand = path
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        if cand.is_file() {
+            let mtime = cand
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            matches.push((cand, mtime));
+        }
+    }
+    matches.sort_by(|a, b| b.1.cmp(&a.1));
+    matches.first().map(|x| x.0.clone())
+}
+
 fn find_session_jsonl(home: &Path, h_norm: &str, session_key: &str) -> Option<PathBuf> {
-    let id = match session_key.split_once(':') {
-        Some((_, rest)) => rest.trim(),
-        None => session_key.trim(),
+    let (prefix, id) = match session_key.split_once(':') {
+        Some((p, rest)) => (p.trim(), rest.trim()),
+        None => ("", session_key.trim()),
     };
     if id.len() < 4 {
         return None;
+    }
+    if h_norm == "antigravity"
+        || prefix.eq_ignore_ascii_case("antigravity")
+        || prefix.eq_ignore_ascii_case("agy")
+    {
+        if let Some(hit) = find_antigravity_transcript(home, id) {
+            return Some(hit);
+        }
     }
     let lower_id = id.to_ascii_lowercase();
     let roots: Vec<PathBuf> = match h_norm {
@@ -1755,14 +1820,14 @@ fn find_session_jsonl(home: &Path, h_norm: &str, session_key: &str) -> Option<Pa
     };
 
     let mut exact: Vec<(PathBuf, SystemTime)> = Vec::new();
-    let mut prefix: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let mut prefix_matches: Vec<(PathBuf, SystemTime)> = Vec::new();
 
     fn walk(
         dir: &Path,
         depth: usize,
         lower_id: &str,
         exact: &mut Vec<(PathBuf, SystemTime)>,
-        prefix: &mut Vec<(PathBuf, SystemTime)>,
+        prefix_matches: &mut Vec<(PathBuf, SystemTime)>,
     ) {
         if depth > 4 || !dir.is_dir() {
             return;
@@ -1778,7 +1843,7 @@ fn find_session_jsonl(home: &Path, h_norm: &str, session_key: &str) -> Option<Pa
             }
             let path = ent.path();
             if path.is_dir() {
-                walk(&path, depth + 1, lower_id, exact, prefix);
+                walk(&path, depth + 1, lower_id, exact, prefix_matches);
                 continue;
             }
             if !name_s.ends_with(".jsonl") || name_s == "changes.jsonl" {
@@ -1804,21 +1869,23 @@ fn find_session_jsonl(home: &Path, h_norm: &str, session_key: &str) -> Option<Pa
             if is_exact {
                 exact.push((path, mtime));
             } else {
-                prefix.push((path, mtime));
+                prefix_matches.push((path, mtime));
             }
         }
     }
 
     for root in roots {
-        walk(&root, 0, &lower_id, &mut exact, &mut prefix);
+        walk(&root, 0, &lower_id, &mut exact, &mut prefix_matches);
     }
     let pool = if !exact.is_empty() {
         &mut exact
     } else {
-        &mut prefix
+        &mut prefix_matches
     };
     pool.sort_by(|a, b| b.1.cmp(&a.1));
-    pool.first().map(|x| x.0.clone())
+    pool.first()
+        .map(|x| x.0.clone())
+        .or_else(|| find_antigravity_transcript(home, id))
 }
 
 pub fn read_session_tail_model_and_thinking(
@@ -1892,7 +1959,7 @@ fn read_jsonl_tail(path: &Path) -> (Option<String>, Option<String>) {
                 .and_then(Value::as_str)
             {
                 Some(s)
-            } else if ev_type == "turn_context" {
+            } else if ev_type == "turn_context" || ev_type == "turn_start" {
                 obj.get("payload")
                     .and_then(|p| {
                         p.get("reasoning_effort")
@@ -1916,14 +1983,14 @@ fn read_jsonl_tail(path: &Path) -> (Option<String>, Option<String>) {
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty() && *s != "<synthetic>")
                 {
                     Some(m.to_string())
                 } else if let Some(mid) = obj
                     .get("modelId")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty() && *s != "<synthetic>")
                 {
                     let prov = obj
                         .get("provider")
@@ -1946,7 +2013,7 @@ fn read_jsonl_tail(path: &Path) -> (Option<String>, Option<String>) {
                 .filter(|s| !s.is_empty() && *s != "<synthetic>")
             {
                 Some(rm.to_string())
-            } else if ev_type == "turn_context" {
+            } else if ev_type == "turn_context" || ev_type == "turn_start" {
                 obj.get("payload")
                     .and_then(|p| {
                         p.get("model")
@@ -1954,8 +2021,15 @@ fn read_jsonl_tail(path: &Path) -> (Option<String>, Option<String>) {
                     })
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty() && *s != "<synthetic>")
                     .map(str::to_string)
+            } else if let Some(tm) = obj
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "<synthetic>")
+            {
+                Some(tm.to_string())
             } else {
                 None
             };
@@ -1963,10 +2037,10 @@ fn read_jsonl_tail(path: &Path) -> (Option<String>, Option<String>) {
             if let Some(m_str) = m_raw {
                 let (base, effort) = strip_model_effort_suffix(&m_str);
                 if !base.is_empty() {
-                    model = Some(base);
                     if thinking.is_none() {
-                        thinking = effort;
+                        thinking = effort.or_else(|| infer_hyphen_effort(&base));
                     }
+                    model = Some(base);
                 }
             }
         }
@@ -3251,6 +3325,7 @@ claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)\n\
 claude-opus-5-5-high\tClaude Opus 5.5 (High)\n\
 gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n\
 gemini-pro-orchestrator\tOrchestrator (Carbon)\n\
+gemini-flash-worker-agy\tFlash Worker (Agy)\n\
 claude-3-5-sonnet\tClaude 3.5 Sonnet\n";
 
         let parsed = parse_agy_models_text(raw);
@@ -3282,14 +3357,75 @@ claude-3-5-sonnet\tClaude 3.5 Sonnet\n";
             Some(&["medium".into()][..])
         );
         assert_eq!(
-            by_id.get("gemini-pro-orchestrator").unwrap().thinking_levels.as_deref(),
-            Some(&["low".into(), "medium".into(), "high".into(), "xhigh".into(), "max".into()][..])
+            by_id.get("gemini-pro-orchestrator").unwrap().reasoning,
+            Some(false)
+        );
+        assert_eq!(
+            by_id.get("gemini-pro-orchestrator").unwrap().thinking_levels,
+            None
+        );
+        assert_eq!(
+            by_id.get("gemini-flash-worker-agy").unwrap().reasoning,
+            Some(false)
+        );
+        assert_eq!(
+            by_id.get("gemini-flash-worker-agy").unwrap().thinking_levels,
+            None
         );
         assert_eq!(by_id.get("claude-3-5-sonnet").unwrap().reasoning, Some(false));
         assert_eq!(by_id.get("claude-3-5-sonnet").unwrap().thinking_levels, None);
 
         let json_str = serde_json::to_string(neon).unwrap();
         assert!(json_str.contains("\"effortModelMap\""));
+    }
+
+    #[test]
+    fn reads_antigravity_transcript_jsonl_with_planner_response_model_and_effort() {
+        let dir = make_temp_dir("agy-transcript");
+        let uuid = "74bb761a-1234-4567-89ab-cdef01234567";
+        let logs_dir = dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(uuid)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::write(
+            logs_dir.join("transcript.jsonl"),
+            "{\"type\":\"USER_INPUT\",\"content\":\"hello\"}\n{\"type\":\"PLANNER_RESPONSE\",\"model\":\"gemini-4-neon-high\",\"content\":\"world\"}\n",
+        )
+        .unwrap();
+
+        let (live_m, live_t) =
+            read_session_tail_model_and_thinking(&dir, "antigravity", &format!("antigravity:{uuid}"));
+        assert_eq!(live_m.as_deref(), Some("gemini-4-neon-high"));
+        assert_eq!(live_t.as_deref(), Some("high"));
+
+        let res = build_local_agent_models_with_catalog(
+            "antigravity",
+            None,
+            Some(&format!("antigravity:{uuid}")),
+            Some(&dir),
+            false,
+            Some(parse_agy_models_text(
+                "gemini-4-neon-low\tGemini 4 Neon (Low)\ngemini-4-neon-medium\tGemini 4 Neon (Medium)\ngemini-4-neon-high\tGemini 4 Neon (High)\ngemini-4-neon-xhigh\tGemini 4 Neon (XHigh)\n",
+            )),
+        );
+        assert_eq!(
+            res.get("currentModel").and_then(Value::as_str),
+            Some("gemini-4-neon-high")
+        );
+        assert_eq!(
+            res.get("currentThinking").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            res.get("canSwitchThinking").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

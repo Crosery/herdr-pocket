@@ -6,6 +6,7 @@ import {
   inferAgentModelAndThinking,
   inferModelThinkingLevels,
   normalizeSwitchHarness,
+  parseTerminalModelAndThinking,
   resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
@@ -285,4 +286,132 @@ test("synthesizeFallbackAgentModels merges current, peer models, and presets wit
   assert.equal(shell.canSwitch, false);
   assert.equal(shell.canSwitchThinking, false);
   assert.ok(shell.reason?.includes("普通终端"));
+});
+
+test("inferAgentModelAndThinking & synthesizeFallbackAgentModels honor explicit thinkingLevel when model lacks suffix", () => {
+  assert.deepEqual(
+    inferAgentModelAndThinking("claude-code", "claude-opus-4-6", { thinkingLevel: "max" }),
+    {
+      currentModel: "claude-opus-4-6",
+      currentThinking: "max",
+      thinkingLevels: ["low", "medium", "high", "max"],
+    },
+  );
+  assert.deepEqual(
+    inferAgentModelAndThinking("antigravity", undefined, { thinkingLevel: "high" }),
+    {
+      currentThinking: "high",
+      thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+    },
+  );
+
+  const synth = synthesizeFallbackAgentModels({
+    harness: "claude-code",
+    model: "claude-opus-4-6",
+    thinkingLevel: "max",
+    isShell: false,
+    source: "hc",
+  });
+  assert.equal(synth.currentModel, "claude-opus-4-6");
+  assert.equal(synth.currentThinking, "max");
+  assert.deepEqual(synth.thinkingLevels, ["low", "medium", "high", "max"]);
+});
+
+test("parseTerminalModelAndThinking parses Antigravity, OMP, Claude Code, Codex, and Gemini CLI footers cleanly", () => {
+  const agyCatalog = [
+    {
+      id: "gemini-4-neon-low",
+      label: "Gemini 4 Neon (Low)",
+      reasoning: true,
+      thinkingLevels: ["low", "medium", "high", "xhigh"],
+      source: "catalog" as const,
+    },
+    {
+      id: "gemini-4-neon-high",
+      label: "Gemini 4 Neon (High)",
+      reasoning: true,
+      thinkingLevels: ["low", "medium", "high", "xhigh"],
+      effortModelMap: {
+        low: "gemini-4-neon-low",
+        medium: "gemini-4-neon-medium",
+        high: "gemini-4-neon-high",
+        xhigh: "gemini-4-neon-xhigh",
+      },
+      source: "catalog" as const,
+    },
+    {
+      id: "gemini-pro-orchestrator",
+      label: "Orchestrator (Carbon)",
+      reasoning: false,
+      source: "catalog" as const,
+    },
+  ];
+
+  assert.deepEqual(
+    parseTerminalModelAndThinking(
+      "antigravity",
+      "\x1b[2m────────────────────\x1b[0m\n  \x1b[36mauto\x1b[0m · Gemini 4 Neon · \x1b[1mhigh\x1b[0m                  18% ctx\n",
+      agyCatalog,
+    ),
+    { currentModel: "gemini-4-neon-high", currentThinking: "high" },
+  );
+
+  assert.deepEqual(
+    parseTerminalModelAndThinking("antigravity", "auto · Gemini 4 Neon · high\n"),
+    { currentModel: "gemini-4-neon-high", currentThinking: "high" },
+  );
+
+  assert.deepEqual(
+    parseTerminalModelAndThinking("antigravity", "plan · Orchestrator (Carbon)\n", agyCatalog),
+    { currentModel: "gemini-pro-orchestrator" },
+  );
+
+  const ompCatalog = [
+    { id: "openai/gpt-6.2-sol", label: "GPT-6.2 Sol", provider: "openai", reasoning: true, source: "catalog" as const },
+    { id: "crosery/gpt-6.2-sol", label: "GPT-6.2 Sol", provider: "crosery", reasoning: true, source: "catalog" as const },
+  ];
+  assert.deepEqual(
+    parseTerminalModelAndThinking(
+      "oh-my-pi",
+      " GPT-6.2 Sol · crosery · 󰪥 xhi · 14k/1M (1%)\n",
+      ompCatalog,
+    ),
+    { currentModel: "crosery/gpt-6.2-sol", currentThinking: "xhigh" },
+  );
+  assert.deepEqual(
+    parseTerminalModelAndThinking("omp", "GPT-6.2 Sol · crosery · 󰪥 xhi · 󰵗 ~/work\n"),
+    { currentModel: "crosery/gpt-6.2-sol", currentThinking: "xhigh" },
+  );
+
+  assert.deepEqual(
+    parseTerminalModelAndThinking("claude-code", "  [Opus 5.5]                   ~/work/app\n"),
+    { currentModel: "claude-opus-5-5" },
+  );
+  assert.deepEqual(
+    parseTerminalModelAndThinking("claude-code", "  [Sonnet 4.6 (1M context)] · high\n"),
+    { currentModel: "claude-sonnet-4-6", currentThinking: "high" },
+  );
+
+  assert.deepEqual(
+    parseTerminalModelAndThinking("codex", "gpt-5.3-codex xhigh · 96% context left\n"),
+    { currentModel: "gpt-5.3-codex", currentThinking: "xhigh" },
+  );
+  assert.deepEqual(
+    parseTerminalModelAndThinking("gemini", "gemini-2.5-pro · high\n"),
+    { currentModel: "gemini-2.5-pro", currentThinking: "high" },
+  );
+
+  // Bottom-up scan picks the newest footer over stale scrollback, and ignores normal prose
+  assert.deepEqual(
+    parseTerminalModelAndThinking(
+      "antigravity",
+      "auto · Gemini 4 Neon · low\nsome output line\nauto · Gemini 4 Neon · xhigh\n",
+      agyCatalog,
+    ),
+    { currentModel: "gemini-4-neon-xhigh", currentThinking: "xhigh" },
+  );
+  assert.deepEqual(
+    parseTerminalModelAndThinking("claude-code", "We should use high effort on this task.\n"),
+    {},
+  );
 });
