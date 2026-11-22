@@ -119,6 +119,7 @@ export class Host {
   /** Session ids running agents name themselves (Claude Code registry, `--resume <id>`). */
   sessionHints = new SessionHints();
   app = new HerdrApp();
+  btwAsk = askAgentBtw;
   private launchersCache: { at: number; list: ReturnType<typeof installedLaunchers> } | null = null;
   /** Installed programs, re-checked every 10 minutes so a newly installed agent shows up without a restart. */
   private get launchers(): ReturnType<typeof installedLaunchers> {
@@ -1293,8 +1294,14 @@ export class Host {
       const a = this.resolve(p.agent);
       const question = typeof p.question === "string" ? p.question.trim() : "";
       if (!question) throw new RpcFailure("bad_request", "question is required");
-      return askAgentBtw(a, question, {
+      return this.btwAsk(a, question, {
         uniflo: this.sources.includes("uniflo") ? this.uniflo : undefined,
+        readTerminalTail: a.localId
+          ? () =>
+              a.source === "herdr" && !this.hc.terminals.has(a.localId!) && this.sources.includes("herdr")
+                ? this.herdr.read(a.localId!, 180).then((r) => r.text).catch(() => "")
+                : this.hc.snapshotText(a.localId!, 180)
+          : undefined,
       });
     },
     "space.delete": async (p) => {
