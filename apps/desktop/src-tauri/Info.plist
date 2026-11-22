@@ -7,7 +7,7 @@
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.developer-tools</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>语音输入（按快捷键说话转文字）和与小羊助理实时语音通话时需要访问麦克风；只在你按下快捷键或开始通话时录音。</string>
+  <string>与小羊助理实时语音通话以及录制个人声纹时需要访问麦克风；只在你主动开启通话或录入声纹时采集音频。</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>

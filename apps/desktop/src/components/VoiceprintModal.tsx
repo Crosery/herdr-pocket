@@ -396,7 +396,7 @@ export function VoiceprintModal({
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontWeight: 700, fontSize: fs(13.5) }}>只认我的声音</div>
                 <div className="faint" style={{ fontSize: fs(12) }}>
-                  语音输入时忽略旁人说话，仅保留本人声纹
+                  通话时忽略旁人说话，仅保留本人声纹
                 </div>
               </div>
               <PocketSwitch

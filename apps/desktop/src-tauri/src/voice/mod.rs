@@ -159,127 +159,27 @@ fn mic_muted_flag() -> &'static Arc<AtomicBool> {
     FLAG.get_or_init(|| Arc::new(AtomicBool::new(false)))
 }
 
-#[cfg(any(target_os = "macos", windows))]
-struct LiveCallMicHandle {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
+static MIC_GEN: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(target_os = "macos", windows))]
-impl LiveCallMicHandle {
-    fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", windows))]
-impl Drop for LiveCallMicHandle {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", windows))]
-fn mic_handle_cell() -> &'static Mutex<Option<LiveCallMicHandle>> {
-    static CELL: OnceLock<Mutex<Option<LiveCallMicHandle>>> = OnceLock::new();
+fn mic_handle_cell() -> &'static Mutex<Option<audio::LiveMicStream>> {
+    static CELL: OnceLock<Mutex<Option<audio::LiveMicStream>>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn pcm16_to_le_bytes_and_level(frame: &[i16]) -> (Vec<u8>, f32) {
-    if frame.is_empty() {
-        return (Vec::new(), 0.0);
-    }
-    let mut sq = 0.0f64;
+fn pack_pcm16_le(frame: &[i16]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(frame.len() * 2);
     for &s in frame {
-        let f = f64::from(s) / 32768.0;
-        sq += f * f;
         bytes.extend_from_slice(&s.to_le_bytes());
     }
-    let rms = (sq / frame.len() as f64).sqrt() as f32;
-    let level = (rms * 4.2).min(1.0);
-    (bytes, level)
+    bytes
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn spawn_live_call_mic_adapter(
-    app: AppHandle,
-    muted: Arc<AtomicBool>,
-) -> Result<LiveCallMicHandle, String> {
-    // MERGE-NOTE(@verifier-code-r3): When `voice-sha-stream` merges `audio::start_live_call_mic`,
-    // replace `audio::start(3600)` + polling loop below with:
-    //   let stream = audio::start_live_call_mic(muted.clone(), move |frame, level| {
-    //       if muted.load(Ordering::Relaxed) { return; }
-    //       let mut bytes = Vec::with_capacity(640);
-    //       for &s in frame { bytes.extend_from_slice(&s.to_le_bytes()); }
-    //       let b64 = crate::local_term::base64_encode(&bytes);
-    //       let _ = app.emit_to("main", CALL_MIC_EVENT, json!({ "pcmBase64": b64, "level": level }));
-    //   })?;
-    let rec = audio::start(3600)?;
-    let device = rec.device.clone();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_flag = stop.clone();
-    let thread = std::thread::Builder::new()
-        .name("pocket-call-mic".into())
-        .spawn(move || {
-            let mut offset = 0usize;
-            let mut pending: Vec<i16> = Vec::with_capacity(640);
-            let mut was_muted = false;
-            while !stop_flag.load(Ordering::Relaxed) {
-                if rec.failed() {
-                    logging::warn("voice.call", "live call mic stream failed", Value::Null);
-                    break;
-                }
-                let chunk = rec.snapshot_from(offset);
-                if !chunk.is_empty() {
-                    offset += chunk.len();
-                    pending.extend_from_slice(&chunk);
-                }
-                let is_muted = muted.load(Ordering::Relaxed);
-                if is_muted {
-                    pending.clear();
-                    if !was_muted {
-                        was_muted = true;
-                        let _ = app.emit_to(
-                            "main",
-                            CALL_MIC_EVENT,
-                            json!({ "pcmBase64": "", "level": 0.0f32 }),
-                        );
-                    }
-                } else {
-                    was_muted = false;
-                    while pending.len() >= 320 {
-                        let frame: Vec<i16> = pending.drain(..320).collect();
-                        let (bytes, level) = pcm16_to_le_bytes_and_level(&frame);
-                        let b64 = crate::local_term::base64_encode(&bytes);
-                        let _ = app.emit_to(
-                            "main",
-                            CALL_MIC_EVENT,
-                            json!({ "pcmBase64": b64, "level": level }),
-                        );
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            drop(rec);
-        })
-        .map_err(|e| e.to_string())?;
-    logging::info(
-        "voice.call",
-        "native call mic started",
-        json!({ "device": device }),
-    );
-    Ok(LiveCallMicHandle {
-        stop,
-        thread: Some(thread),
-    })
+fn drop_active_mic_stream() {
+    let stream = mic_handle_cell().lock().ok().and_then(|mut g| g.take());
+    drop(stream);
 }
 
 pub fn start_live_call_mic(app: &AppHandle) -> Result<(), String> {
@@ -290,7 +190,8 @@ pub fn start_live_call_mic(app: &AppHandle) -> Result<(), String> {
     }
     #[cfg(any(target_os = "macos", windows))]
     {
-        stop_live_call_mic();
+        let gen = MIC_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        drop_active_mic_stream();
         #[cfg(target_os = "macos")]
         {
             use crate::perms::State;
@@ -319,28 +220,67 @@ pub fn start_live_call_mic(app: &AppHandle) -> Result<(), String> {
                 );
             }
         }
-        let muted = mic_muted_flag().clone();
-        muted.store(false, Ordering::Relaxed);
-        crate::mainwin::set_voice_call_active(app, true);
-        let handle = spawn_live_call_mic_adapter(app.clone(), muted)?;
-        if let Ok(mut g) = mic_handle_cell().lock() {
-            *g = Some(handle);
+        if MIC_GEN.load(Ordering::SeqCst) != gen {
+            return Ok(());
         }
+        let muted = mic_muted_flag().clone();
+        let cb_muted = muted.clone();
+        let app_emit = app.clone();
+        let mut was_muted = false;
+        let stream = audio::start_live_call_mic(muted, move |frame: &[i16; 320], level: f32| {
+            if cb_muted.load(Ordering::Relaxed) {
+                if !was_muted {
+                    was_muted = true;
+                    let _ = app_emit.emit_to(
+                        "main",
+                        CALL_MIC_EVENT,
+                        json!({ "pcmBase64": "", "level": 0.0f32 }),
+                    );
+                }
+                return;
+            }
+            was_muted = false;
+            let bytes = pack_pcm16_le(frame);
+            let b64 = crate::local_term::base64_encode(&bytes);
+            let _ = app_emit.emit_to(
+                "main",
+                CALL_MIC_EVENT,
+                json!({ "pcmBase64": b64, "level": level }),
+            );
+        })?;
+        if MIC_GEN.load(Ordering::SeqCst) != gen {
+            drop(stream);
+            return Ok(());
+        }
+        let device = stream.device.clone();
+        if let Ok(mut g) = mic_handle_cell().lock() {
+            *g = Some(stream);
+        }
+        crate::mainwin::set_voice_call_active(app, true);
+        logging::info(
+            "voice.call",
+            "native call mic started",
+            json!({ "device": device }),
+        );
         Ok(())
     }
 }
 
 pub fn stop_live_call_mic() {
+    MIC_GEN.fetch_add(1, Ordering::SeqCst);
+    mic_muted_flag().store(false, Ordering::Relaxed);
     #[cfg(any(target_os = "macos", windows))]
-    if let Ok(mut g) = mic_handle_cell().lock() {
-        if let Some(h) = g.take() {
-            h.stop();
-        }
-    }
+    drop_active_mic_stream();
 }
 
-pub fn set_live_call_mic_muted(muted: bool) {
+pub fn set_live_call_mic_muted(app: &AppHandle, muted: bool) {
     mic_muted_flag().store(muted, Ordering::Relaxed);
+    #[cfg(any(target_os = "macos", windows))]
+    if CALL_ACTIVE.load(Ordering::SeqCst) {
+        hud::set_muted(app, muted);
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = app;
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +798,7 @@ impl Controller {
         let seq = NEXT_CALL_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         ACTIVE_CALL_SEQ.store(seq, Ordering::SeqCst);
         CALL_ACTIVE.store(true, Ordering::SeqCst);
+        mic_muted_flag().store(false, Ordering::Relaxed);
         self.phase = "connecting";
 
         let dsp_badge = crate::voice_ai::active_hud_badge();
@@ -984,16 +925,15 @@ mod tests {
 
     #[cfg(any(target_os = "macos", windows))]
     #[test]
-    fn pcm16_frame_packs_little_endian_and_computes_level() {
+    fn pcm16_frame_packs_little_endian() {
         let frame = [0i16; 320];
-        let (bytes, level) = pcm16_to_le_bytes_and_level(&frame);
+        let bytes = pack_pcm16_le(&frame);
         assert_eq!(bytes.len(), 640);
-        assert_eq!(level, 0.0);
+        assert!(bytes.iter().all(|&b| b == 0));
 
         let loud = [16_384i16; 320];
-        let (bytes2, level2) = pcm16_to_le_bytes_and_level(&loud);
+        let bytes2 = pack_pcm16_le(&loud);
         assert_eq!(bytes2.len(), 640);
         assert_eq!(&bytes2[0..2], &16_384i16.to_le_bytes());
-        assert!(level2 > 0.9 && level2 <= 1.0, "got {level2}");
     }
 }

@@ -156,4 +156,21 @@ test("Settings, PermissionCards, composers, ShellWork, and App remove dictation 
   assert.ok(SHELL_WORK_TSX.includes("小羊通话中 · 点此挂断"));
   assert.ok(!SHELL_WORK_TSX.includes("voiceStart"));
   assert.ok(!SHELL_WORK_TSX.includes("getTranscribeInfo"));
+
+  for (const rel of [
+    "../src/shell/DesktopShell.tsx",
+    "../src/views/OnboardingView.tsx",
+    "../src/views/settings/FramePanes.tsx",
+    "../src/components/PermissionGuideModal.tsx",
+    "../src/components/VoiceprintModal.tsx",
+    "../src/components/VoiceInput.tsx",
+    "../src/views/SettingsView.tsx",
+    "../src/views/settings/SettingsFrame.tsx",
+    "../src-tauri/Info.plist",
+    "../src-tauri/src/perms.rs",
+  ]) {
+    const src = readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+    assert.ok(!src.includes("语音输入"), `${rel} must not contain 语音输入`);
+    assert.ok(!src.includes("按住说话"), `${rel} must not contain 按住说话`);
+  }
 });

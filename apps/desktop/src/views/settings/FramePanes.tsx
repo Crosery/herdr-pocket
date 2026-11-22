@@ -423,8 +423,8 @@ export function KeyboardPane() {
         </span>
       </SetRow>
 
-      <SetHeading>语音输入</SetHeading>
-      <SetRow title="语音输入快捷键" about={voice.enabled ? "全局按住说话，松开上屏" : "未开启"}>
+      <SetHeading>语音唤醒与声纹</SetHeading>
+      <SetRow title="唤醒快捷键" about={voice.enabled ? "全局按一下唤醒小羊实时通话，再按挂断" : "未开启"}>
         <span className="sf-combo">
           {voice.hotkey ? (
             <span className="sf-keys">
@@ -440,11 +440,11 @@ export function KeyboardPane() {
       </SetRow>
       {perms ? (
         <div className="sf-block">
-          <div className="faint sf-block-lead">语音输入要用到这些系统权限：</div>
+          <div className="faint sf-block-lead">小羊语音唤醒与通话要用到这些系统权限：</div>
           <PermissionCards perms={perms} checking={checking} onChanged={() => void refresh()} singleKey={HOLD_KEYS.has(voice.hotkey ?? "")} />
         </div>
       ) : (
-        <div className="faint sf-note">在桌面版里，这里会列出语音输入要用的系统权限，并带你去打开。</div>
+        <div className="faint sf-note">在桌面版里，这里会列出小羊语音唤醒与通话要用的系统权限，并带你去打开。</div>
       )}
     </div>
   );

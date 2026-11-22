@@ -24,7 +24,7 @@ const TITLES: Record<OnboardStep, string> = {
   local: "检查这台电脑",
   relay: "连接中转服务器",
   phone: "扫码连接手机",
-  voice: "语音输入（可选）",
+  voice: "语音唤醒与声纹（可选）",
   done: "都准备好了",
 };
 
@@ -329,7 +329,7 @@ export function OnboardingView({
         { label: "这台电脑", ok: Boolean(local?.configured), note: local?.configured ? "已登录" : "未登录，只查看别的电脑" },
         { label: "中转服务器", ok: connected, note: connected ? serverLabel(server) : "未连接" },
         { label: "手机", ok: Boolean(phoneName), note: phoneName ?? (skipped.has("phone") ? "已跳过，随时可在侧栏扫码连接" : "随时可在侧栏扫码连接") },
-        { label: "语音输入", ok: !skipped.has("voice"), note: skipped.has("voice") ? "已跳过，可在 设置 › 语音输入 开启" : "可在 设置 › 语音输入 调整" },
+        { label: "语音唤醒与声纹", ok: !skipped.has("voice"), note: skipped.has("voice") ? "已跳过，可在 设置 › 语音唤醒与声纹 开启" : "可在 设置 › 语音唤醒与声纹 调整" },
       ];
       body = (
         <div className="stack" style={{ gap: 14 }}>

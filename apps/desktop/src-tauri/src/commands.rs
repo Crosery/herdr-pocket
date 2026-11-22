@@ -1226,8 +1226,8 @@ pub async fn voice_call_mic_stop(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn voice_call_mic_set_muted(muted: bool) {
-    crate::voice::set_live_call_mic_muted(muted);
+pub fn voice_call_mic_set_muted(app: AppHandle, muted: bool) {
+    crate::voice::set_live_call_mic_muted(&app, muted);
 }
 
 #[tauri::command]

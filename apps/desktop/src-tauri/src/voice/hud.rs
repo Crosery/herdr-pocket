@@ -180,6 +180,33 @@ pub fn update(app: &AppHandle, state: Value) {
     }
 }
 
+/// Updates the mute indicator (and zeroes the meter when muted) on an active HUD immediately.
+pub fn set_muted(app: &AppHandle, muted: bool) {
+    let next = {
+        let Ok(mut g) = LATEST.lock() else {
+            return;
+        };
+        let Some(state) = g.as_mut() else {
+            return;
+        };
+        if !is_interactive_state(state) {
+            return;
+        }
+        if let Some(obj) = state.as_object_mut() {
+            obj.insert("muted".into(), Value::Bool(muted));
+            if muted {
+                obj.insert("level".into(), Value::from(0.0f64));
+            }
+        }
+        state.clone()
+    };
+    if let Some(w) = app.get_webview_window(LABEL) {
+        if w.is_visible().unwrap_or(false) {
+            push(app, &next);
+        }
+    }
+}
+
 /// Hides the HUD immediately (`0ms`) and resets its rendered state.
 pub fn hide(app: &AppHandle) {
     LAST_INTERACTIVE.store(false, Ordering::Relaxed);

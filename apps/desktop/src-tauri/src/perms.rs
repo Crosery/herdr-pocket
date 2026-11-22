@@ -349,9 +349,8 @@ pub fn status() -> Status {
             fn_key_action: mac::fn_key_action(),
             app_bundle_path: current_app_bundle().map(|p| p.to_string_lossy().into_owned()),
             notes: vec![
-                "麦克风：录音时需要。".into(),
-                "辅助功能：把识别出的文字粘贴到正在使用的应用时需要。".into(),
-                "输入监控：只用一个修饰键（如右 Option、Fn）做快捷键时需要。".into(),
+                "麦克风：与小羊实时语音通话和录制声纹时需要。".into(),
+                "输入监控：只用一个修饰键（如右 Option、Fn）做小羊唤醒快捷键时需要。".into(),
                 "若在系统设置里找不到开关，或开启后仍未生效，可直接把引导弹窗内的应用图标拖入系统设置列表。".into(),
             ],
         }
@@ -368,7 +367,7 @@ pub fn status() -> Status {
             app_bundle_path: None,
             notes: vec![
                 "麦克风：在 设置 → 隐私和安全性 → 麦克风 里打开「允许应用访问麦克风」和「允许桌面应用访问麦克风」。".into(),
-                "以管理员身份运行的窗口（例如管理员终端）收不到快捷键和粘贴，这是 Windows 的安全限制；识别结果会留在剪贴板里。".into(),
+                "以管理员身份运行的窗口（例如管理员终端）在失焦状态下可能收不到全局唤醒快捷键，这是 Windows 的安全限制。".into(),
             ],
         }
     }
@@ -382,7 +381,7 @@ pub fn status() -> Status {
             full_disk_access: State::NotApplicable,
             fn_key_action: None,
             app_bundle_path: None,
-            notes: vec!["Linux 版暂不支持全局语音输入。".into()],
+            notes: vec!["Linux 版暂不支持全局小羊唤醒快捷键。".into()],
         }
     }
 }

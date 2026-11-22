@@ -295,6 +295,7 @@ pub struct VoiceAiEnrollResult {
     pub state: VoiceAiState,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ProcessOutcome {
     Accept {
@@ -1841,6 +1842,7 @@ pub mod dsp {
             }
         }
 
+        #[cfg_attr(not(test), allow(dead_code))]
         pub fn process_buffer(&mut self, samples: &[f32]) -> Vec<f32> {
             let mut out = vec![0.0f32; samples.len()];
             let mut in_hop = [0.0f32; Self::HOP];
@@ -2405,6 +2407,7 @@ mod models {
             Ok(())
         }
 
+        #[cfg_attr(not(test), allow(dead_code))]
         pub fn process_buffer(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
             let mut out = vec![0.0f32; input.len()];
             let mut in_hop = [0.0f32; Self::HOP];
@@ -2686,6 +2689,7 @@ mod models {
             Ok((tse_out, raw_out, ms))
         }
 
+        #[cfg_attr(not(test), allow(dead_code))]
         pub fn process_buffer(&mut self, clean_hpf: &[f32]) -> Result<Vec<f32>, String> {
             if clean_hpf.is_empty() {
                 return Ok(Vec::new());
@@ -3774,38 +3778,83 @@ pub fn set_config(patch: VoiceAiConfigPatch) -> Result<VoiceAiState, String> {
 }
 
 pub fn active_hud_badge() -> Option<String> {
-    let cfg = load_config();
+    active_hud_badge_for_state(
+        &load_config(),
+        discover_ort_library().is_some(),
+        discover_model_path(&DPDF_SPEC).is_some(),
+        discover_model_path(&SV_SPEC).is_some(),
+        discover_model_path(&VOXLOCK_ENROLL_SPEC).is_some()
+            && discover_model_path(&VOXLOCK_CHUNK_SPEC).is_some(),
+        has_owner_sample(),
+    )
+}
+
+fn active_hud_badge_for_state(
+    cfg: &VoiceAiConfig,
+    ort_ready: bool,
+    dpdf_ready: bool,
+    sv_ready: bool,
+    tse_ready: bool,
+    owner_sample: bool,
+) -> Option<String> {
     let enrolled = cfg
         .voiceprint
         .as_ref()
-        .is_some_and(|v| !v.embedding.is_empty() && v.model_version == VOICEPRINT_MODEL_VERSION);
-    let sv_active = (cfg.filter && enrolled) || cfg.first_speaker;
-    let ort_ready = discover_ort_library().is_some();
-    let dpdf_ready = discover_model_path(&DPDF_SPEC).is_some();
-    let sv_ready = discover_model_path(&SV_SPEC).is_some();
-    let tse_ready = discover_model_path(&VOXLOCK_ENROLL_SPEC).is_some()
-        && discover_model_path(&VOXLOCK_CHUNK_SPEC).is_some();
+        .is_some_and(|v| cfg.filter && !v.embedding.is_empty() && v.model_version == VOICEPRINT_MODEL_VERSION);
 
-    if !cfg.denoise && !cfg.enhance_vocal && !(sv_active && ort_ready && sv_ready) {
+    let effective_tier = match cfg.tier.as_str() {
+        "denoise" => "denoise",
+        "tse" => "tse",
+        "sv" => "sv",
+        _ => {
+            if enrolled
+                && ort_ready
+                && tse_ready
+                && owner_sample
+                && cfg
+                    .recommended_tier
+                    .as_deref()
+                    .is_none_or(|r| r == "tse")
+            {
+                "tse"
+            } else {
+                "sv"
+            }
+        }
+    };
+
+    let first_lock_mode = effective_tier != "denoise" && !enrolled && cfg.first_speaker;
+    let want_identity = effective_tier != "denoise" && (enrolled || first_lock_mode);
+    let want_tse = effective_tier == "tse" && enrolled && ort_ready && tse_ready && owner_sample;
+    let has_sv = want_identity && ort_ready && sv_ready;
+    let has_dpdf = cfg.denoise && ort_ready && dpdf_ready;
+
+    if !cfg.denoise && !cfg.enhance_vocal && !has_sv && !want_tse {
         return None;
     }
 
-    let effective_tier = if cfg.tier == "auto" {
-        cfg.recommended_tier.as_deref().unwrap_or("sv")
-    } else {
-        cfg.tier.as_str()
-    };
-
-    if ort_ready && dpdf_ready {
-        if effective_tier == "tse" && tse_ready && enrolled && has_owner_sample() {
+    if has_dpdf {
+        if want_tse {
             return Some("VoxLock + DPDFNet".into());
         }
-        if sv_active && sv_ready && enrolled && cfg.filter {
+        if has_sv {
             return Some("DPDFNet + 声纹".into());
         }
-        if cfg.denoise {
-            return Some("DPDFNet 降噪".into());
-        }
+        return Some("DPDFNet 降噪".into());
+    }
+    if want_tse {
+        return Some(if cfg.denoise || cfg.enhance_vocal {
+            "VoxLock + DSP".into()
+        } else {
+            "VoxLock 声纹".into()
+        });
+    }
+    if has_sv {
+        return Some(if cfg.denoise || cfg.enhance_vocal {
+            "DSP + 声纹".into()
+        } else {
+            "声纹锁定".into()
+        });
     }
     if cfg.denoise || cfg.enhance_vocal {
         return Some("本地 DSP 降噪".into());
@@ -4458,11 +4507,13 @@ pub fn shutdown() {
 }
 
 /// Processes a complete 16 kHz mono recording before WAV encoding & transcription.
+#[allow(dead_code)]
 pub fn process_recording(samples: &[i16]) -> ProcessOutcome {
     let cfg = load_config();
     process_recording_with_config(samples, &cfg)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn process_recording_with_config(samples: &[i16], cfg: &VoiceAiConfig) -> ProcessOutcome {
     if samples.is_empty() {
         return ProcessOutcome::Accept {
@@ -4607,6 +4658,7 @@ pub fn process_recording_with_config(samples: &[i16], cfg: &VoiceAiConfig) -> Pr
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_voiced_speech(clean_hpf: &[f32], m: &models::LoadedModels) -> Vec<f32> {
     let Some(vad_sess) = m.vad.as_ref() else {
         return clean_hpf.to_vec();
@@ -5215,7 +5267,7 @@ impl LiveCallProcessor {
             in_f32[i] = f32::from(pcm320[i]) / 32768.0;
         }
 
-        if !self.cfg.denoise && !self.cfg.enhance_vocal && !self.has_sv {
+        if !self.cfg.denoise && !self.cfg.enhance_vocal && !self.has_sv && self.tse.is_none() {
             let mut out_pcm = [0i16; 320];
             out_pcm[..n].copy_from_slice(&pcm320[..n]);
             return (out_pcm, rms_level(&in_f32));
@@ -5968,5 +6020,60 @@ mod tests {
             last_lvl = lvl;
         }
         assert!(last_lvl > 0.0 && last_lvl <= 1.0, "unexpected ORT level {last_lvl}");
+    }
+
+    #[test]
+    fn active_hud_badge_matches_configured_engine_and_tier() {
+        let mut cfg = VoiceAiConfig::default();
+        cfg.denoise = true;
+        cfg.enhance_vocal = true;
+        assert_eq!(
+            active_hud_badge_for_state(&cfg, false, false, false, false, false).as_deref(),
+            Some("本地 DSP 降噪")
+        );
+        assert_eq!(
+            active_hud_badge_for_state(&cfg, true, true, false, false, false).as_deref(),
+            Some("DPDFNet 降噪")
+        );
+
+        cfg.first_speaker = true;
+        assert_eq!(
+            active_hud_badge_for_state(&cfg, true, true, true, false, false).as_deref(),
+            Some("DPDFNet + 声纹")
+        );
+
+        cfg.tier = "denoise".into();
+        assert_eq!(
+            active_hud_badge_for_state(&cfg, true, true, true, false, false).as_deref(),
+            Some("DPDFNet 降噪")
+        );
+
+        cfg.tier = "auto".into();
+        cfg.filter = true;
+        cfg.voiceprint = Some(VoiceprintRecord {
+            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            prototypes: vec![vec![1.0, 0.0, 0.0, 0.0]],
+            model_version: VOICEPRINT_MODEL_VERSION.into(),
+            has_sample: true,
+            route: None,
+            snr_db: None,
+            seconds: 4.0,
+            consistency: 0.9,
+            lowest: 0.85,
+            created_at: 0,
+        });
+        assert_eq!(
+            active_hud_badge_for_state(&cfg, true, true, true, true, true).as_deref(),
+            Some("VoxLock + DPDFNet")
+        );
+
+        cfg.denoise = false;
+        cfg.enhance_vocal = false;
+        cfg.first_speaker = false;
+        cfg.filter = false;
+        assert_eq!(
+            active_hud_badge_for_state(&cfg, true, true, true, true, true),
+            None
+        );
     }
 }

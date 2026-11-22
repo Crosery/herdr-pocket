@@ -598,7 +598,7 @@ class WebVoiceSession {
 
   setMuted(muted: boolean): void {
     voiceCallStore.set({ muted, ...(muted ? { micLevel: 0 } : {}) });
-    if (this.usedNativeMic) {
+    if (this.usedNativeMic || native.available()) {
       void native.voiceCallMicSetMuted(muted);
     }
     this.sendJson({ action: "mic_state", enabled: !muted });

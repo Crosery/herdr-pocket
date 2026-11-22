@@ -68,7 +68,7 @@ const FRAME_ITEMS: Array<{ id: FrameSection; label: string; icon: PaletteItem["i
   { id: "alerts", label: "提醒", icon: Bell },
   { id: "updates", label: "更新", icon: RefreshCw },
   { id: "privacy", label: "隐私", icon: Shield },
-  { id: "voice", label: "语音输入", icon: Mic },
+  { id: "voice", label: "语音唤醒与声纹", icon: Mic },
   { id: "assistant", label: "小羊助理", icon: Sparkles },
   { id: "browser", label: "浏览器与文件", icon: Globe },
   { id: "performance", label: "性能与资源", icon: Cpu },

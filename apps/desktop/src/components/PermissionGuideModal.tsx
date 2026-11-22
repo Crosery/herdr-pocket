@@ -44,7 +44,7 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
     return {
       title: "麦克风",
       breadcrumbs: ["Windows 设置", "隐私和安全性", "麦克风"],
-      why: "录音进行语音输入和小羊语音通话都需要麦克风权限。",
+      why: "与小羊实时语音通话和本地声纹降噪都需要麦克风权限。",
       actionLabel: "直达系统设置「麦克风」",
       dragSupported: false,
       steps: [
@@ -59,7 +59,7 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
       return {
         title: "麦克风",
         breadcrumbs: ["系统设置", "隐私与安全性", "麦克风"],
-        why: "用于语音输入与小羊实时通话。",
+        why: "用于与小羊实时语音通话和本地声纹降噪。",
         actionLabel: "打开系统设置「麦克风」",
         dragSupported: true,
         steps: [
@@ -83,7 +83,7 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
       return {
         title: "输入监控",
         breadcrumbs: ["系统设置", "隐私与安全性", "输入监控"],
-        why: "用于监听右 Option、Fn 等单键按住说话。",
+        why: "用于监听右 Option、Fn 等单键按一下唤醒小羊。",
         actionLabel: "打开系统设置「输入监控」",
         dragSupported: true,
         steps: [

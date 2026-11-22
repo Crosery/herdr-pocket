@@ -47,6 +47,7 @@ impl Resampler {
 }
 
 /// A 16 kHz mono 16-bit WAV file.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn wav(samples: &[i16]) -> Vec<u8> {
     let data_len = (samples.len() * 2) as u32;
     let mut out = Vec::with_capacity(44 + data_len as usize);
@@ -69,6 +70,7 @@ pub fn wav(samples: &[i16]) -> Vec<u8> {
 }
 
 /// Loudest sample, 0..1.
+#[allow(dead_code)]
 pub fn peak(samples: &[i16]) -> f32 {
     samples
         .iter()
@@ -91,10 +93,12 @@ pub struct Recording {
     shared: Arc<Shared>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    #[allow(dead_code)]
     pub device: String,
 }
 
 impl Recording {
+    #[allow(dead_code)]
     pub fn level(&self) -> f32 {
         f32::from_bits(self.shared.level.load(Ordering::Relaxed))
     }
