@@ -652,6 +652,7 @@ test("parseAgyModelsText groups effort-suffixed siblings with effortModelMap and
     "claude-opus-5-5-high\tClaude Opus 5.5 (High)",
     "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)",
     "gemini-pro-orchestrator\tOrchestrator (Carbon)",
+    "gemini-flash-worker-agy\tFlash Worker (Agy)",
     "claude-3-5-sonnet\tClaude 3.5 Sonnet",
   ].join("\n");
 
@@ -672,7 +673,10 @@ test("parseAgyModelsText groups effort-suffixed siblings with effortModelMap and
   assert.deepEqual(byId.get("claude-opus-5-5-high")?.thinkingLevels, ["low", "medium", "high"]);
   assert.deepEqual(byId.get("gpt-oss-120b-medium")?.thinkingLevels, ["medium"]);
   assert.deepEqual(byId.get("gpt-oss-120b-medium")?.effortModelMap, { medium: "gpt-oss-120b-medium" });
-  assert.deepEqual(byId.get("gemini-pro-orchestrator")?.thinkingLevels, ["low", "medium", "high", "xhigh", "max"]);
+  assert.equal(byId.get("gemini-pro-orchestrator")?.reasoning, false);
+  assert.equal(byId.get("gemini-pro-orchestrator")?.thinkingLevels, undefined);
+  assert.equal(byId.get("gemini-flash-worker-agy")?.reasoning, false);
+  assert.equal(byId.get("gemini-flash-worker-agy")?.thinkingLevels, undefined);
   assert.equal(byId.get("claude-3-5-sonnet")?.reasoning, false);
   assert.equal(byId.get("claude-3-5-sonnet")?.thinkingLevels, undefined);
 });
@@ -810,6 +814,86 @@ test("OMP models.yml enrichment uses cached omp models --json else inferModelThi
     assert.equal(nonReasonWithHistoryRes.canSwitchThinking, false);
     assert.equal(nonReasonWithHistoryRes.thinkingLevels, undefined);
     assert.equal(nonReasonWithHistoryRes.models[0]?.reasoning, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readSessionLiveModelAndThinking and getAgentModels recover Antigravity PLANNER_RESPONSE transcript and readTerminalTail fallback", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pocket-agy-transcript-"));
+  try {
+    const agyUuid = "74bb761a-1234-4567-89ab-cdef01234567";
+    const transcriptDir = join(dir, ".gemini", "antigravity-cli", "brain", agyUuid, ".system_generated", "logs");
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(
+      join(transcriptDir, "transcript.jsonl"),
+      [
+        JSON.stringify({ type: "USER_INPUT", content: "hi" }),
+        JSON.stringify({ type: "PLANNER_RESPONSE", model: "gemini-4-neon-high", content: "hello" }),
+      ].join("\n") + "\n",
+    );
+
+    const live = await readSessionLiveModelAndThinking({
+      sessionKey: `antigravity:${agyUuid}`,
+      harness: "antigravity",
+      homeDir: dir,
+    });
+    assert.deepEqual(live, {
+      currentModel: "gemini-4-neon-high",
+      currentThinking: "high",
+    });
+
+    const agyCatalog = parseAgyModelsText(
+      [
+        "gemini-4-neon-low\tGemini 4 Neon (Low)",
+        "gemini-4-neon-medium\tGemini 4 Neon (Medium)",
+        "gemini-4-neon-high\tGemini 4 Neon (High)",
+        "gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)",
+        "gemini-pro-orchestrator\tOrchestrator (Carbon)",
+      ].join("\n"),
+    );
+
+    let termCalledForTranscript = false;
+    const fromTranscript = await getAgentModels(
+      {
+        ...hcAgent,
+        harness: "antigravity",
+        model: undefined,
+        sessionKey: `antigravity:${agyUuid}`,
+      },
+      {
+        homeDir: dir,
+        unifloReady: false,
+        readCatalog: async () => agyCatalog,
+        readTerminalTail: async () => {
+          termCalledForTranscript = true;
+          return "";
+        },
+      },
+    );
+    assert.equal(termCalledForTranscript, false);
+    assert.equal(fromTranscript.currentModel, "gemini-4-neon-high");
+    assert.equal(fromTranscript.currentThinking, "high");
+    assert.deepEqual(fromTranscript.thinkingLevels, ["low", "medium", "high", "xhigh"]);
+
+    // When neither agent.model nor liveSession has model/thinking, readTerminalTail rescues it
+    const fromTerminal = await getAgentModels(
+      {
+        ...hcAgent,
+        harness: "antigravity",
+        model: undefined,
+        sessionKey: undefined,
+      },
+      {
+        homeDir: dir,
+        unifloReady: false,
+        readCatalog: async () => agyCatalog,
+        readTerminalTail: async () => "────────────────\n  auto · Gemini 4 Neon · xhigh\n",
+      },
+    );
+    assert.equal(fromTerminal.currentModel, "gemini-4-neon-xhigh");
+    assert.equal(fromTerminal.currentThinking, "xhigh");
+    assert.deepEqual(fromTerminal.thinkingLevels, ["low", "medium", "high", "xhigh"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

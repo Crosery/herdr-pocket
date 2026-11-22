@@ -986,7 +986,7 @@ export function AgentDetailPanel({
   const [modelMenuMode, setModelMenuMode] = useState<"model" | "thinking" | null>(null);
   const [modelMenuOmpTab, setModelMenuOmpTab] = useState<"session" | "roles">("session");
   const hasReasoningEvents = useMemo(() => events.some((e) => e.kind === "reasoning"), [events]);
-  const modelMeta = useAutoAgentModelMeta(agent, { hasReasoningEvents });
+  const modelMeta = useAutoAgentModelMeta(agent, { hasReasoningEvents, thinkingLevel: agent.thinkingLevel });
   const effectiveThinkingLevels = useMemo(() => {
     if (agent.isShell || modelMeta.canSwitchThinking === false) {
       return [];
@@ -1698,10 +1698,10 @@ export function AgentDetailPanel({
   const onModelsLoaded = useCallback((res: AgentModelsResult) => {
     applyModelMetaOverride({
       currentModel: res.currentModel || agent.model,
-      currentThinking: res.currentThinking,
+      currentThinking: res.currentThinking || agent.thinkingLevel,
       ...(res.modelRoles ? { modelRoles: res.modelRoles } : {}),
     });
-  }, [agent.model, applyModelMetaOverride]);
+  }, [agent.model, agent.thinkingLevel, applyModelMetaOverride]);
 
   const dismissBtwTurn = useCallback((agentKey: string, turnId?: string) => {
     setBtwTurnsByAgent((prev) => {
@@ -2635,26 +2635,29 @@ export function AgentDetailPanel({
                     <span className="truncate mono">{(modelMeta.currentModel || agent.model) ? (modelMeta.currentModel || agent.model)!.split("/").pop() : "切换模型"}</span>
                     <ChevronDown size={11} />
                   </button>
-                  {effectiveThinkingLevels.length > 0 ? (
-                    <button
-                      ref={effortBtnRef}
-                      type="button"
-                      aria-haspopup="listbox"
-                      aria-expanded={modelMenuMode === "thinking"}
-                      className={`composer-model-btn${modelMenuMode === "thinking" ? " open" : ""}`}
-                      title={modelMeta.currentThinking ? `思考等级：${formatEffortLabel(modelMeta.currentThinking)}（点击切换）` : "切换思考等级"}
-                      onClick={() => {
-                        setSlashDismissedFor(text);
-                        setModelMenuMode((v) => (v === "thinking" ? null : "thinking"));
-                      }}
-                    >
-                      <Brain size={13} />
-                      <span className="truncate">
-                        {modelMeta.currentThinking ? `思考 · ${formatEffortLabel(modelMeta.currentThinking)}` : "思考等级"}
-                      </span>
-                      <ChevronDown size={11} />
-                    </button>
-                  ) : null}
+                  {effectiveThinkingLevels.length > 0 ? (() => {
+                    const displayThinking = modelMeta.currentThinking || agent.thinkingLevel;
+                    return (
+                      <button
+                        ref={effortBtnRef}
+                        type="button"
+                        aria-haspopup="listbox"
+                        aria-expanded={modelMenuMode === "thinking"}
+                        className={`composer-model-btn${modelMenuMode === "thinking" ? " open" : ""}`}
+                        title={displayThinking ? `思考等级：${formatEffortLabel(displayThinking)}（点击切换）` : "切换思考等级"}
+                        onClick={() => {
+                          setSlashDismissedFor(text);
+                          setModelMenuMode((v) => (v === "thinking" ? null : "thinking"));
+                        }}
+                      >
+                        <Brain size={13} />
+                        <span className="truncate">
+                          {displayThinking ? `思考 · ${formatEffortLabel(displayThinking)}` : "思考等级"}
+                        </span>
+                        <ChevronDown size={11} />
+                      </button>
+                    );
+                  })() : null}
                 </>
               ) : null}
             </div>
@@ -2712,8 +2715,8 @@ export function AgentDetailPanel({
         agent={agent}
         anchorRef={modelMenuMode === "thinking" ? effortBtnRef : modelBtnRef}
         fallbackAnchorRef={composerCardRef}
-        currentModelHint={modelMeta.currentModel}
-        currentThinkingHint={modelMeta.currentThinking}
+        currentModelHint={modelMeta.currentModel || agent.model}
+        currentThinkingHint={modelMeta.currentThinking || agent.thinkingLevel}
         hasReasoningEvents={hasReasoningEvents}
         initialOmpTab={modelMenuOmpTab}
         onSelectModel={applyModelSwitch}

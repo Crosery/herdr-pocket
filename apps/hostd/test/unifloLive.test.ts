@@ -1,7 +1,11 @@
 import { strict as assert } from "node:assert";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import type { Agent } from "@herdr-pocket/protocol";
 import { Host } from "../src/host.ts";
 import { UnifloAdapter } from "../src/uniflo.ts";
 
@@ -148,4 +152,64 @@ test("a conversation stream sends a pushed event at once and does not send it ag
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(u.pages(), n);
   assert.equal(events().length, 2);
+});
+
+test("UnifloAdapter.enrich populates model and thinkingLevel from s.source transcript when s.model is undefined and refreshes on updated_at", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pocket-uniflo-enrich-"));
+  try {
+    const transcript = join(dir, "transcript.jsonl");
+    writeFileSync(
+      transcript,
+      [
+        JSON.stringify({ type: "USER_INPUT", content: "hello" }),
+        JSON.stringify({ type: "PLANNER_RESPONSE", model: "gemini-4-neon-high", content: "world" }),
+      ].join("\n") + "\n",
+    );
+
+    const now = Date.now();
+    const adapter = new UnifloAdapter("http://127.0.0.1:9");
+    adapter.sessions = [
+      {
+        key: "antigravity:74bb761a-1234-4567-89ab-cdef01234567",
+        harness: "antigravity",
+        cwd: "/tmp/proj",
+        model: undefined,
+        source: transcript,
+        updated_at: now,
+        status: "idle",
+      },
+    ];
+
+    const baseAgent: Agent = {
+      key: "d/hc:t1s",
+      deviceId: "d",
+      source: "hc",
+      localId: "t1s",
+      harness: "antigravity",
+      cwd: "/tmp/proj",
+      status: "idle",
+      isShell: false,
+      updatedAt: now - 50,
+    };
+
+    const enriched1 = adapter.enrich([baseAgent], new Map());
+    assert.equal(enriched1[0]?.model, "gemini-4-neon-high");
+    assert.equal(enriched1[0]?.thinkingLevel, "high");
+
+    // Updated file with same updated_at stays cached, then refreshes once updated_at advances
+    writeFileSync(
+      transcript,
+      JSON.stringify({ type: "PLANNER_RESPONSE", model: "gemini-4-neon-xhigh", content: "next" }) + "\n",
+    );
+    const cached = adapter.enrich([baseAgent], new Map());
+    assert.equal(cached[0]?.model, "gemini-4-neon-high");
+    assert.equal(cached[0]?.thinkingLevel, "high");
+
+    adapter.sessions[0]!.updated_at = now + 100;
+    const refreshed = adapter.enrich([baseAgent], new Map());
+    assert.equal(refreshed[0]?.model, "gemini-4-neon-xhigh");
+    assert.equal(refreshed[0]?.thinkingLevel, "xhigh");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

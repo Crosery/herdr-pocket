@@ -406,3 +406,153 @@ test("computeAutoAgentModelMeta clears thinkingLevels and hides switching when s
   assert.equal(after.currentThinking, undefined);
   assert.equal(after.canSwitchThinking, false);
 });
+
+test("fetchAgentModelsWithFallback recovers Antigravity and OMP model+thinking from terminal.read on remote legacy hosts without leaking local live state", async () => {
+  const remoteAgyAgent: Agent = {
+    key: "remote-mac/hc:t1s",
+    deviceId: "remote-mac",
+    source: "hc",
+    localId: "t1s",
+    harness: "antigravity",
+    status: "idle",
+    isShell: false,
+    updatedAt: 1_700_000_000_000,
+  };
+
+  let capturedSessionKey: string | null = "not-called";
+  const agyRes = await fetchAgentModelsWithFallback(remoteAgyAgent, [], {
+    deps: {
+      rpcCall: async () => {
+        throw Object.assign(new Error("unknown method agent.models"), { code: "unsupported" });
+      },
+      isTauri: () => true,
+      getLocalHostId: async () => "local-desktop",
+      invokeLocalAgentModels: async (params) => {
+        capturedSessionKey = params.sessionKey;
+        return {
+          harness: "antigravity",
+          currentModel: "local-only-model-should-not-leak",
+          currentThinking: "low",
+          canSwitch: true,
+          canSwitchThinking: true,
+          models: [
+            {
+              id: "gemini-4-neon-low",
+              label: "Gemini 4 Neon (Low)",
+              reasoning: true,
+              thinkingLevels: ["low", "medium", "high", "xhigh"],
+              source: "current",
+            },
+            {
+              id: "gemini-4-neon-high",
+              label: "Gemini 4 Neon (High)",
+              reasoning: true,
+              thinkingLevels: ["low", "medium", "high", "xhigh"],
+              effortModelMap: {
+                low: "gemini-4-neon-low",
+                medium: "gemini-4-neon-medium",
+                high: "gemini-4-neon-high",
+                xhigh: "gemini-4-neon-xhigh",
+              },
+              source: "catalog",
+            },
+          ],
+        };
+      },
+      readTerminal: async () => "────────────────────\n  auto · Gemini 4 Neon · high                  12% ctx\n",
+    },
+  });
+
+  assert.equal(capturedSessionKey, null);
+  assert.equal(agyRes.currentModel, "gemini-4-neon-high");
+  assert.equal(agyRes.currentThinking, "high");
+  assert.deepEqual(agyRes.thinkingLevels, ["low", "medium", "high", "xhigh"]);
+  assert.equal(agyRes.canSwitch, true);
+  assert.equal(agyRes.canSwitchThinking, true);
+
+  // If terminal is empty on remote host, local machine's currentModel/currentThinking must NEVER leak
+  const emptyTermRes = await fetchAgentModelsWithFallback(remoteAgyAgent, [], {
+    deps: {
+      rpcCall: async () => {
+        throw Object.assign(new Error("unknown method agent.models"), { code: "unsupported" });
+      },
+      isTauri: () => true,
+      getLocalHostId: async () => "local-desktop",
+      invokeLocalAgentModels: async () => ({
+        harness: "antigravity",
+        currentModel: "local-only-model-should-not-leak",
+        currentThinking: "low",
+        canSwitch: true,
+        models: [
+          {
+            id: "local-only-model-should-not-leak",
+            label: "Local Only",
+            reasoning: true,
+            source: "current",
+          },
+        ],
+      }),
+      readTerminal: async () => "",
+    },
+  });
+  assert.equal(emptyTermRes.currentModel, undefined);
+  assert.equal(emptyTermRes.currentThinking, undefined);
+  assert.equal(
+    emptyTermRes.models.some((m) => m.source === "current"),
+    false,
+  );
+
+  // Remote legacy OMP host recovers crosery/gpt-6.2-sol + xhigh from OMP terminal footer
+  const remoteOmpAgent: Agent = {
+    key: "remote-mac/hc:t2",
+    deviceId: "remote-mac",
+    source: "hc",
+    localId: "t2",
+    harness: "oh-my-pi",
+    status: "idle",
+    isShell: false,
+    updatedAt: 1_700_000_000_000,
+  };
+  const ompRes = await fetchAgentModelsWithFallback(remoteOmpAgent, [], {
+    deps: {
+      rpcCall: async () => {
+        throw Object.assign(new Error("unknown method agent.models"), { code: "unsupported" });
+      },
+      isTauri: () => true,
+      getLocalHostId: async () => "local-desktop",
+      invokeLocalAgentModels: async () => ({
+        harness: "oh-my-pi",
+        currentModel: "magpie/local-default",
+        currentThinking: "low",
+        modelRoles: { default: "magpie/local-default" },
+        canSwitch: true,
+        models: [],
+      }),
+      readTerminal: async () => " GPT-6.2 Sol · crosery · 󰪥 xhi · 14k/1M (1%)\n",
+    },
+  });
+  assert.equal(ompRes.modelRoles, undefined);
+  assert.equal(ompRes.currentModel, "crosery/gpt-6.2-sol");
+  assert.equal(ompRes.currentThinking, "xhigh");
+  assert.deepEqual(ompRes.thinkingLevels, ["low", "medium", "high", "xhigh"]);
+});
+
+test("getInitialAgentModelsSeed and computeAutoAgentModelMeta preserve agent.thinkingLevel", () => {
+  const claudeAgent: Agent = {
+    ...baseAgent,
+    key: "dev-1/hc:claude-1",
+    harness: "claude-code",
+    model: "claude-opus-4-6",
+    thinkingLevel: "max",
+  };
+
+  const seed = getInitialAgentModelsSeed(claudeAgent, []);
+  assert.equal(seed.currentModel, "claude-opus-4-6");
+  assert.equal(seed.currentThinking, "max");
+  assert.deepEqual(seed.thinkingLevels, ["low", "medium", "high", "max"]);
+
+  const meta = computeAutoAgentModelMeta(claudeAgent);
+  assert.equal(meta.currentModel, "claude-opus-4-6");
+  assert.equal(meta.currentThinking, "max");
+  assert.deepEqual(meta.thinkingLevels, ["low", "medium", "high", "max"]);
+});

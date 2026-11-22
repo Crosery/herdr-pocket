@@ -1,13 +1,9 @@
 import { execFile } from "node:child_process";
 import {
-  closeSync,
   existsSync,
-  fstatSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
-  readSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -18,10 +14,12 @@ import {
   OMP_MODEL_ROLES,
   buildHarnessSwitchCommands,
   clampThinkingLevel,
+  extractModelExplicitEffort,
   inferAgentModelAndThinking,
   inferModelThinkingLevels,
   isNonReasoningModelName,
   normalizeSwitchHarness,
+  parseTerminalModelAndThinking,
   resolveThinkingLevelsForModel,
   stripModelEffortSuffix,
   type Agent,
@@ -32,7 +30,7 @@ import {
 } from "@herdr-pocket/protocol";
 import { findPrograms } from "./create.ts";
 import { endsInPanel } from "./hc.ts";
-import { harnessId } from "./uniflo.ts";
+import { harnessId, readJsonlModelAndThinkingTail } from "./uniflo.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -398,6 +396,16 @@ export function parseAgyModelsText(raw: string): AgentModelOption[] {
         provider: "antigravity",
         reasoning: thinkingLevels.length > 0,
         ...(thinkingLevels.length > 0 ? { thinkingLevels: [...thinkingLevels], effortModelMap } : {}),
+        source: "catalog",
+      };
+    }
+
+    if (entries.length >= 3) {
+      return {
+        id: e.id,
+        label: e.label,
+        provider: "antigravity",
+        reasoning: false,
         source: "catalog",
       };
     }
@@ -1071,11 +1079,52 @@ function sessionSearchRoots(homeDir: string, harnessHint: string): string[] {
   return all;
 }
 
+function findAntigravityTranscriptPath(id: string, homeDir: string): string | undefined {
+  const brainDir = join(homeDir, ".gemini", "antigravity-cli", "brain");
+  const direct = join(brainDir, id, ".system_generated", "logs", "transcript.jsonl");
+  try {
+    if (existsSync(direct) && statSync(direct).isFile()) return direct;
+  } catch {
+    /* ignore */
+  }
+  if (!existsSync(brainDir)) return undefined;
+  let entries;
+  try {
+    entries = readdirSync(brainDir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  const lowerId = id.toLowerCase();
+  const matches: Array<{ path: string; mtime: number }> = [];
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    const lowerDir = ent.name.toLowerCase();
+    const isMatch = lowerDir === lowerId || (lowerId.length >= 6 && lowerDir.startsWith(lowerId));
+    if (!isMatch) continue;
+    const cand = join(brainDir, ent.name, ".system_generated", "logs", "transcript.jsonl");
+    try {
+      const st = statSync(cand);
+      if (st.isFile()) matches.push({ path: cand, mtime: st.mtimeMs });
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!matches.length) return undefined;
+  matches.sort((a, b) => b.mtime - a.mtime);
+  return matches[0]!.path;
+}
+
 function findSessionJsonlPath(sessionKey: string, harnessHint: string, homeDir: string): string | undefined {
   const colon = sessionKey.indexOf(":");
   const prefix = colon >= 0 ? sessionKey.slice(0, colon).trim() : "";
   const id = (colon >= 0 ? sessionKey.slice(colon + 1) : sessionKey).trim();
   if (!id || id.length < 4) return undefined;
+
+  const hNorm = normHarnessKey(harnessHint || prefix);
+  if (hNorm === "antigravity" || prefix.toLowerCase() === "antigravity" || prefix.toLowerCase() === "agy") {
+    const agyHit = findAntigravityTranscriptPath(id, homeDir);
+    if (agyHit) return agyHit;
+  }
 
   const exactMatches: Array<{ path: string; mtime: number }> = [];
   const prefixMatches: Array<{ path: string; mtime: number }> = [];
@@ -1120,34 +1169,16 @@ function findSessionJsonlPath(sessionKey: string, harnessHint: string, homeDir: 
     walk(root, 0);
   }
   const pool = exactMatches.length ? exactMatches : prefixMatches;
-  if (!pool.length) return undefined;
-  pool.sort((a, b) => b.mtime - a.mtime);
-  return pool[0]!.path;
-}
-
-function readTailText(filePath: string, maxBytes = SESSION_TAIL_BYTES): string {
-  const fd = openSync(filePath, "r");
-  try {
-    const size = fstatSync(fd).size;
-    if (size <= 0) return "";
-    const start = Math.max(0, size - maxBytes);
-    const len = size - start;
-    const buf = Buffer.allocUnsafe(len);
-    const bytesRead = readSync(fd, buf, 0, len, start);
-    let text = buf.subarray(0, bytesRead).toString("utf8");
-    if (start > 0) {
-      const nl = text.indexOf("\n");
-      text = nl >= 0 ? text.slice(nl + 1) : "";
-    }
-    return text;
-  } finally {
-    closeSync(fd);
+  if (pool.length) {
+    pool.sort((a, b) => b.mtime - a.mtime);
+    return pool[0]!.path;
   }
+  return findAntigravityTranscriptPath(id, homeDir);
 }
 
 /**
  * Tail-reads the newest ~128 KB of a live session `.jsonl` file backwards to extract the latest
- * `thinking_level_change`, `model_change`, Claude effort/thinkingMetadata, or Codex `reasoning_effort`.
+ * `thinking_level_change`, `model_change`, Antigravity `PLANNER_RESPONSE`, Claude effort/thinkingMetadata, or Codex `reasoning_effort`.
  */
 export async function readSessionLiveModelAndThinking(opts: {
   sessionKey?: string;
@@ -1158,9 +1189,11 @@ export async function readSessionLiveModelAndThinking(opts: {
   const home = opts.homeDir ?? homedir();
   let filePath: string | undefined;
   if (opts.sessionSourcePath?.trim()) {
+    const src = opts.sessionSourcePath.trim();
+    const resolved = src.startsWith("~/") || src.startsWith("~\\") ? join(home, src.slice(2)) : src;
     try {
-      if (existsSync(opts.sessionSourcePath) && statSync(opts.sessionSourcePath).isFile()) {
-        filePath = opts.sessionSourcePath;
+      if (existsSync(resolved) && statSync(resolved).isFile()) {
+        filePath = resolved;
       }
     } catch {
       /* fall back to session scan */
@@ -1171,95 +1204,10 @@ export async function readSessionLiveModelAndThinking(opts: {
   }
   if (!filePath) return {};
 
-  let text = "";
-  try {
-    text = readTailText(filePath);
-  } catch {
-    return {};
-  }
-  if (!text) return {};
-
-  let currentModel: string | undefined;
-  let currentThinking: string | undefined;
-  const lines = text.split(/\r?\n/);
-
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const raw = lines[i]?.trim();
-    if (!raw || !raw.startsWith("{")) continue;
-    let obj: Record<string, any>;
-    try {
-      obj = JSON.parse(raw) as Record<string, any>;
-    } catch {
-      continue;
-    }
-
-    if (currentThinking === undefined) {
-      let t: string | undefined;
-      if (obj.type === "thinking_level_change") {
-        t = typeof obj.thinkingLevel === "string" ? obj.thinkingLevel : typeof obj.level === "string" ? obj.level : undefined;
-      } else if (obj.thinkingMetadata && typeof obj.thinkingMetadata === "object") {
-        if (obj.thinkingMetadata.disabled === true) {
-          t = "off";
-        } else if (typeof obj.thinkingMetadata.level === "string") {
-          t = obj.thinkingMetadata.level;
-        } else if (typeof obj.thinkingMetadata.effort === "string") {
-          t = obj.thinkingMetadata.effort;
-        }
-      } else if (typeof obj.perTurnEffort === "string") {
-        t = obj.perTurnEffort;
-      } else if (typeof obj.effort === "string") {
-        t = obj.effort;
-      } else if (obj.type === "turn_context" && obj.payload && typeof obj.payload === "object") {
-        t =
-          (typeof obj.payload.reasoning_effort === "string" && obj.payload.reasoning_effort) ||
-          (typeof obj.payload.effort === "string" && obj.payload.effort) ||
-          (typeof obj.payload.collaboration_mode?.settings?.reasoning_effort === "string" &&
-            obj.payload.collaboration_mode.settings.reasoning_effort) ||
-          undefined;
-      } else if (typeof obj.reasoning_effort === "string") {
-        t = obj.reasoning_effort;
-      } else if (typeof obj.payload?.reasoning_effort === "string") {
-        t = obj.payload.reasoning_effort;
-      }
-      if (t && t.trim()) currentThinking = t.trim().toLowerCase();
-    }
-
-    if (currentModel === undefined) {
-      let m: string | undefined;
-      if (obj.type === "model_change") {
-        if (typeof obj.model === "string" && obj.model.trim()) {
-          m = obj.model.trim();
-        } else if (typeof obj.modelId === "string" && obj.modelId.trim()) {
-          const mid = obj.modelId.trim();
-          const prov = typeof obj.provider === "string" ? obj.provider.trim() : "";
-          m = prov && !mid.startsWith(`${prov}/`) ? `${prov}/${mid}` : mid;
-        }
-      } else if (typeof obj.requestedModel === "string" && obj.requestedModel.trim() && obj.requestedModel !== "<synthetic>") {
-        m = obj.requestedModel.trim();
-      } else if (typeof obj.message?.model === "string" && obj.message.model.trim() && obj.message.model !== "<synthetic>") {
-        m = obj.message.model.trim();
-      } else if (obj.type === "turn_context" && obj.payload && typeof obj.payload === "object") {
-        const pm =
-          (typeof obj.payload.model === "string" && obj.payload.model) ||
-          (typeof obj.payload.collaboration_mode?.settings?.model === "string" && obj.payload.collaboration_mode.settings.model) ||
-          "";
-        if (pm.trim()) m = pm.trim();
-      }
-      if (m) {
-        const split = splitModelAndEffort(m);
-        if (split.id) {
-          currentModel = split.id;
-          if (currentThinking === undefined && split.effort) currentThinking = split.effort;
-        }
-      }
-    }
-
-    if (currentModel !== undefined && currentThinking !== undefined) break;
-  }
-
+  const tail = readJsonlModelAndThinkingTail(filePath, SESSION_TAIL_BYTES);
   return {
-    ...(currentModel ? { currentModel } : {}),
-    ...(currentThinking ? { currentThinking } : {}),
+    ...(tail.model ? { currentModel: tail.model } : {}),
+    ...(tail.thinkingLevel ? { currentThinking: tail.thinkingLevel } : {}),
   };
 }
 
@@ -1304,6 +1252,7 @@ export async function getAgentModels(
     unifloReady?: boolean;
     readCatalog?: () => Promise<AgentModelOption[]>;
     refreshOmpCatalog?: () => Promise<AgentModelOption[]>;
+    readTerminalTail?: () => Promise<string>;
     homeDir?: string;
     currentModelOverride?: string;
     currentThinkingOverride?: string;
@@ -1383,38 +1332,6 @@ export async function getAgentModels(
         })
       : {};
 
-  let rawModel = opts.currentModelOverride?.trim() || "";
-  if (!rawModel) {
-    const agentM = agent.model?.trim() || "";
-    const liveM = liveSession.currentModel?.trim() || "";
-    if (liveM) {
-      rawModel =
-        agentM && !liveM.includes("/") && agentM.toLowerCase().endsWith(`/${liveM.toLowerCase()}`)
-          ? agentM
-          : liveM;
-    } else {
-      rawModel = agentM;
-    }
-  }
-  if (hNorm === "omp" && rawModel.startsWith("@")) {
-    const roleTarget = ompLocal.modelRoles[rawModel.slice(1).toLowerCase()];
-    if (roleTarget) rawModel = roleTarget;
-  }
-  const parsedCurrent = rawModel ? splitModelAndEffort(rawModel) : { id: "", effort: undefined };
-  const currentModel = parsedCurrent.id || (hNorm === "omp" ? ompLocal.defaultModel : undefined) || undefined;
-  const inferred = inferAgentModelAndThinking(agent.harness, currentModel, {
-    hasReasoningEvents: opts.hasReasoningEvents,
-  });
-
-  let currentThinking =
-    opts.currentThinkingOverride?.trim().toLowerCase() ||
-    parsedCurrent.effort ||
-    liveSession.currentThinking ||
-    (hNorm === "omp" ? ompLocal.defaultThinking : undefined) ||
-    localCfg.thinkingByHarness[hNorm] ||
-    inferred.currentThinking ||
-    undefined;
-
   const cachedOmpCatalog = hNorm === "omp" ? (catalog.length > 0 ? catalog : (cliCatalogCache.get("omp")?.models ?? [])) : [];
   const rawHadExplicitThinking = new Set(
     ymlCatalog.filter((y) => Boolean(y.thinkingLevels?.length)).map((y) => y.id.toLowerCase()),
@@ -1447,6 +1364,61 @@ export async function getAgentModels(
       combinedCatalog.push(yItem);
     }
   }
+
+  let rawModel = opts.currentModelOverride?.trim() || "";
+  if (!rawModel) {
+    const agentM = agent.model?.trim() || "";
+    const liveM = liveSession.currentModel?.trim() || "";
+    if (liveM) {
+      rawModel =
+        agentM && !liveM.includes("/") && agentM.toLowerCase().endsWith(`/${liveM.toLowerCase()}`)
+          ? agentM
+          : liveM;
+    } else {
+      rawModel = agentM;
+    }
+  }
+  if (hNorm === "omp" && rawModel.startsWith("@")) {
+    const roleTarget = ompLocal.modelRoles[rawModel.slice(1).toLowerCase()];
+    if (roleTarget) rawModel = roleTarget;
+  }
+  const parsedCurrent = rawModel ? splitModelAndEffort(rawModel) : { id: "", effort: undefined };
+  let liveModel = parsedCurrent.id || undefined;
+  const liveExplicitEffort = rawModel ? extractModelExplicitEffort(rawModel) : undefined;
+  let liveThinking =
+    opts.currentThinkingOverride?.trim().toLowerCase() ||
+    parsedCurrent.effort ||
+    liveSession.currentThinking ||
+    agent.thinkingLevel?.trim().toLowerCase() ||
+    liveExplicitEffort ||
+    undefined;
+
+  const liveOpt = liveModel ? findCatalogMatch(liveModel, combinedCatalog) : undefined;
+  const liveIsNonReasoning =
+    liveOpt?.reasoning === false ||
+    (liveOpt !== undefined && liveOpt.thinkingLevels !== undefined && liveOpt.thinkingLevels.length === 0) ||
+    (liveModel ? isNonReasoningModelName(liveModel) : false);
+
+  if (!agent.isShell && opts.readTerminalTail && (!liveModel || (!liveThinking && !liveIsNonReasoning))) {
+    const screenText = await opts.readTerminalTail().catch(() => "");
+    if (screenText) {
+      const termParsed = parseTerminalModelAndThinking(agent.harness, screenText, combinedCatalog);
+      if (!liveModel && termParsed.currentModel) liveModel = termParsed.currentModel;
+      if (!liveThinking && termParsed.currentThinking) liveThinking = termParsed.currentThinking;
+    }
+  }
+
+  const currentModel = liveModel || (hNorm === "omp" ? ompLocal.defaultModel : undefined) || undefined;
+  const inferred = inferAgentModelAndThinking(agent.harness, currentModel, {
+    hasReasoningEvents: opts.hasReasoningEvents,
+  });
+
+  let currentThinking =
+    liveThinking ||
+    (hNorm === "omp" ? ompLocal.defaultThinking : undefined) ||
+    localCfg.thinkingByHarness[hNorm] ||
+    inferred.currentThinking ||
+    undefined;
 
   const merged: AgentModelOption[] = [];
   const seen = new Set<string>();
