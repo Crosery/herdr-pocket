@@ -3,7 +3,7 @@
  * and `agent.create`; on success jumps to the new agent (which may take a moment to appear).
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, ScrollView, View } from "react-native";
+import { ScrollView, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router } from "expo-router";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -11,7 +11,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import type { Device } from "@herdr-pocket/protocol";
 import { call, type RelayError } from "../lib/relay";
 import { harnessLook } from "../lib/harness";
-import { useSettings } from "../lib/store";
+import { showAppToast, useSettings } from "../lib/store";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space } from "../theme/tokens";
 import { HarnessAvatar } from "./ui";
@@ -188,7 +188,12 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
       );
       useSettings.getState().set({ lastCreateHost: host });
       onDismiss();
-      if (res.task === "failed") Alert.alert("开好了，但第一句话没交给它", res.taskNote ?? "它现在空着，没在做这件事。");
+      if (res.task === "failed") {
+        showAppToast(`开好了，但第一句话没交给它：${res.taskNote ?? "它现在空着，没在做这件事。"}`, {
+          tone: "error",
+          duration: 4200,
+        });
+      }
       router.push({ pathname: "/agent/[key]", params: { key: res.agent, tab: "chat", fresh: String(Date.now()) } });
     } catch (e) {
       const err = e as RelayError;
@@ -247,7 +252,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
       ) : q.isError ? (
         <View style={{ flexDirection: "row", gap: space.sm, alignItems: "center", backgroundColor: p.errorContainer, borderRadius: radius.md, padding: space.md }}>
           <MaterialCommunityIcons name="alert-circle-outline" size={18} color={p.error} />
-          <Text style={{ flex: 1, color: p.error, fontSize: 13.5, lineHeight: 19 }}>{(q.error as Error).message}</Text>
+          <Text style={{ flex: 1, minWidth: 0, color: p.error, fontSize: 13.5, lineHeight: 19 }}>{(q.error as Error).message}</Text>
           <PocketButton size="sm" variant="ghost" onPress={() => void q.refetch()}>
             再试
           </PocketButton>
@@ -257,7 +262,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
           {!d.canCreate ? (
             <View style={{ flexDirection: "row", gap: space.sm, alignItems: "center", backgroundColor: p.errorContainer, borderRadius: radius.md, padding: space.md }}>
               <MaterialCommunityIcons name="information-outline" size={18} color={p.error} />
-              <Text style={{ flex: 1, color: p.error, fontSize: 13.5 }}>{d.reason ?? "这台电脑现在不能新建。"}</Text>
+              <Text style={{ flex: 1, minWidth: 0, color: p.error, fontSize: 13.5 }}>{d.reason ?? "这台电脑现在不能新建。"}</Text>
             </View>
           ) : null}
 

@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FlatList, KeyboardAvoidingView, Pressable, TextInput, View } from "react-native";
+import { FlatList, KeyboardAvoidingView, Pressable, TextInput, useWindowDimensions, View } from "react-native";
 import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -18,7 +18,9 @@ import { clearAssistant, decideAction, loadAssistant, sendToAssistant, setAssist
 import { dismissCallMessage, startCall, useVoice } from "../../lib/voice";
 import { findAgent, useLive, useSettings } from "../../lib/store";
 import { fixCjkEmphasis, hasList } from "../../lib/markdown";
+import { computeComposerBarMetrics, horizontalPad } from "../../lib/layoutMetrics";
 import { isMockServer } from "../../lib/mock";
+import { useKeyboardState } from "../../lib/useKeyboardState";
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
 
@@ -120,15 +122,18 @@ export default function AssistantScreen() {
             : "连接中…"
         : "等网络恢复";
 
+  const padLeft = horizontalPad(space.lg, insets.left);
+  const padRight = horizontalPad(space.lg, insets.right);
+
   return (
     <PageBackground>
-      <View style={{ paddingTop: insets.top + space.md, paddingHorizontal: space.lg, paddingBottom: space.sm, flexDirection: "row", alignItems: "center", gap: space.md }}>
+      <View style={{ paddingTop: insets.top + space.md, paddingLeft: padLeft, paddingRight: padRight, paddingBottom: space.sm, flexDirection: "row", alignItems: "center", gap: space.md }}>
         <Mascot mood={busy || inCall ? "hello" : "default"} size={46} />
-        <View style={{ flex: 1 }}>
+        <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={{ fontFamily: fonts.cute, fontSize: 24, lineHeight: 32, color: p.ink }}>{NAME}</Text>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
             <BreathingDot color={busy || inCall ? p.primary : link === "online" || isMockServer(server) ? "#3FB68B" : p.faint} active={busy || inCall} size={7} />
-            <Text style={{ color: p.muted, fontSize: 13 }}>{status}</Text>
+            <Text numberOfLines={1} style={{ flexShrink: 1, color: p.muted, fontSize: 13 }}>{status}</Text>
           </View>
         </View>
         <View>
@@ -143,11 +148,11 @@ export default function AssistantScreen() {
       </View>
 
       {error ? (
-        <Card flat style={{ marginHorizontal: space.lg, padding: space.md, backgroundColor: p.errorContainer }}>
+        <Card flat style={{ marginLeft: padLeft, marginRight: padRight, padding: space.md, backgroundColor: p.errorContainer }}>
           <Text style={{ color: p.error, fontSize: 13.5 }}>{error}</Text>
         </Card>
       ) : loaded && !ready && !isMockServer(server) ? (
-        <Card flat style={{ marginHorizontal: space.lg, padding: space.md, backgroundColor: p.accentContainer }}>
+        <Card flat style={{ marginLeft: padLeft, marginRight: padRight, padding: space.md, backgroundColor: p.accentContainer }}>
           <Text style={{ color: p.ink, fontSize: 13.5 }}>服务器上还没配置助理用的模型，配好后就能聊了。</Text>
         </Card>
       ) : null}
@@ -163,7 +168,7 @@ export default function AssistantScreen() {
             inverted
             keyExtractor={(it) => it.id}
             keyboardShouldPersistTaps="handled"
-            contentContainerStyle={{ paddingHorizontal: space.lg, paddingVertical: space.md, gap: space.md, flexGrow: 1 }}
+            contentContainerStyle={{ paddingLeft: padLeft, paddingRight: padRight, paddingVertical: space.md, gap: space.md, flexGrow: 1 }}
             renderItem={renderItem}
             ListHeaderComponent={busy ? <Thinking label={busyLabel} /> : undefined}
           />
@@ -361,7 +366,7 @@ function ActionCard({ item, onError }: { item: AssistantItem; onError: (m: strin
     <Card style={{ padding: space.md, gap: space.sm, borderWidth: pending ? 1.5 : 0, borderColor: p.primary }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
         <MaterialCommunityIcons name={icon} size={18} color={p.ink} />
-        <View style={{ flex: 1 }}>
+        <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={{ fontFamily: fonts.bodyBold, color: p.ink }}>{head}</Text>
           {where ? (
             <Text numberOfLines={1} style={{ color: p.faint, fontSize: 12 }}>
@@ -378,17 +383,17 @@ function ActionCard({ item, onError }: { item: AssistantItem; onError: (m: strin
         </View>
       ) : null}
       {send && a.said ? <SaidLine said={a.said} /> : null}
-      <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-        <Text style={{ flex: 1, color: tone, fontSize: 12.5, fontFamily: fonts.bodySemi }}>{stateLine(a)}</Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm }}>
+        <Text style={{ flexGrow: 1, flexShrink: 1, minWidth: 120, color: tone, fontSize: 12.5, fontFamily: fonts.bodySemi }}>{stateLine(a)}</Text>
         {pending ? (
-          <>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flexShrink: 0, marginLeft: "auto" }}>
             <PocketButton size="sm" variant="ghost" disabled={!!working} loading={working === "cancel"} onPress={() => void decide("cancel")}>
               取消
             </PocketButton>
             <PocketButton size="sm" icon="check" disabled={!!working} loading={working === "confirm"} onPress={() => void decide("confirm")}>
               确认执行
             </PocketButton>
-          </>
+          </View>
         ) : null}
       </View>
       {agent ? <AgentLink agentKey={agent.key} /> : null}
@@ -443,16 +448,24 @@ function Composer({
   inCall: boolean;
 }) {
   const p = usePalette();
+  const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const textScale = useSettings((x) => x.textScale);
+  const { keyboardOpen } = useKeyboardState();
   const [text, setText] = useState("");
   const empty = !text.trim();
+  const metrics = computeComposerBarMetrics(width, textScale);
+  const padLeft = horizontalPad(metrics.outerMargin, insets.left);
+  const padRight = horizontalPad(metrics.outerMargin, insets.right);
   return (
     <View
       style={{
         flexDirection: "row",
         alignItems: "flex-end",
         gap: space.sm,
-        marginHorizontal: space.lg,
-        marginBottom: space.sm,
+        marginLeft: padLeft,
+        marginRight: padRight,
+        marginBottom: keyboardOpen ? space.xs : space.sm,
         backgroundColor: p.surface,
         borderRadius: radius.xl,
         paddingLeft: space.lg,
@@ -471,13 +484,26 @@ function Composer({
         placeholder={`和${NAME}说点什么…`}
         placeholderTextColor={p.faint}
         multiline
-        style={{ flex: 1, fontFamily: fonts.body, fontSize: 15.5, color: p.ink, maxHeight: 120, paddingVertical: 9 }}
+        style={{
+          flex: 1,
+          minWidth: 0,
+          fontFamily: fonts.body,
+          fontSize: 15.5 * textScale,
+          color: p.ink,
+          maxHeight: Math.max(120, Math.round(15.5 * textScale * 1.4 * 5) + 18),
+          paddingVertical: 9,
+        }}
         accessibilityLabel={`发给${NAME}的消息`}
       />
       {empty && voice && !inCall ? (
-        <IconTile icon="mic" tone="primary" size={42} onPress={onCall} a11y={`和${NAME}语音通话`} />
+        <IconTile icon="mic" tone="primary" size={metrics.actionHeight} onPress={onCall} a11y={`和${NAME}语音通话`} />
       ) : (
-        <SendPill disabled={empty || sending} onPress={() => void onSend(text).then((sent) => sent && setText(""))} />
+        <SendPill
+          width={metrics.sendWidth}
+          height={metrics.actionHeight}
+          disabled={empty || sending}
+          onPress={() => void onSend(text).then((sent) => sent && setText(""))}
+        />
       )}
     </View>
   );

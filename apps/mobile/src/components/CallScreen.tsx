@@ -12,6 +12,7 @@ import { router } from "expo-router";
 import Animated, { FadeIn, FadeInDown, FadeOut, LinearTransition } from "react-native-reanimated";
 import type { Notice } from "@herdr-pocket/protocol";
 import { callPhase, hangup, toggleMute, useVoice, type CallLine, type CallPhase } from "../lib/voice";
+import { computeCallControlsGap, horizontalPad } from "../lib/layoutMetrics";
 import { useAssistant } from "../lib/assistant";
 import { findAgent } from "../lib/store";
 import { usePalette } from "../theme/theme";
@@ -107,12 +108,15 @@ export function CallScreen({ name, onMinimize }: { name: string; onMinimize: () 
 
   const orb = Math.round(Math.min(width * (captions ? 0.68 : 0.82), height * (captions ? 0.34 : 0.44), 340));
   const accent = phase === "muted" || phase === "connecting" ? p.muted : p.accentText;
+  const padLeft = horizontalPad(space.lg, insets.left);
+  const padRight = horizontalPad(space.lg, insets.right);
+  const controlsGap = computeCallControlsGap(Math.max(0, width - Math.max(0, padLeft + padRight - space.lg * 2)));
 
   return (
     <LinearGradient colors={[p.pageTop, p.pageBottom]} style={{ position: "absolute", left: 0, right: 0, top: 0, bottom: 0, paddingTop: insets.top + space.md, paddingBottom: space.lg }}>
-      <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: space.lg }}>
+      <View style={{ flexDirection: "row", alignItems: "center", paddingLeft: padLeft, paddingRight: padRight }}>
         <RoundButton icon="chevronDown" label="收起通话，回到聊天" onPress={onMinimize} />
-        <View style={{ flex: 1, alignItems: "center" }}>
+        <View style={{ flex: 1, minWidth: 0, alignItems: "center", paddingHorizontal: space.xs }}>
           <View
             accessibilityLabel={phase === "connecting" ? "正在接通" : `通话中 ${clock}`}
             style={{ flexDirection: "row", alignItems: "center", gap: 7, backgroundColor: phase === "connecting" ? p.lavenderContainer : p.dark ? "#1F3A33" : "#DDF5EE", borderRadius: radius.pill, paddingHorizontal: 14, paddingVertical: 7 }}
@@ -135,10 +139,10 @@ export function CallScreen({ name, onMinimize }: { name: string; onMinimize: () 
       </Animated.View>
 
       <View style={{ flex: 1, paddingTop: space.md }}>
-        {captions ? <CallCaptions connecting={phase === "connecting"} /> : null}
+        {captions ? <CallCaptions connecting={phase === "connecting"} padLeft={padLeft} padRight={padRight} /> : null}
       </View>
 
-      <View style={{ minHeight: 44, alignItems: "center", justifyContent: "center", paddingHorizontal: space.lg, paddingBottom: space.sm, gap: space.sm }}>
+      <View style={{ minHeight: 44, alignItems: "center", justifyContent: "center", paddingLeft: padLeft, paddingRight: padRight, paddingBottom: space.sm, gap: space.sm }}>
         {notice ? <CallNotice notice={notice} onOpen={onMinimize} /> : null}
         {task ? (
           <Animated.View
@@ -154,7 +158,7 @@ export function CallScreen({ name, onMinimize }: { name: string; onMinimize: () 
         ) : null}
       </View>
 
-      <View style={{ flexDirection: "row", justifyContent: "center", alignItems: "flex-start", gap: space.xxxl + space.sm, paddingBottom: Math.max(insets.bottom, space.sm) }}>
+      <View style={{ flexDirection: "row", justifyContent: "center", alignItems: "flex-start", gap: controlsGap, paddingLeft: padLeft, paddingRight: padRight, paddingBottom: Math.max(insets.bottom, space.sm) }}>
         <CallButton icon={muted ? "micOff" : "mic"} label={muted ? "取消静音" : "静音"} onPress={toggleMute} active={muted} />
         <CallButton icon="hangup" label="挂断" onPress={hangup} big />
         <CallButton icon="keyboard" label="打字" onPress={onMinimize} />
@@ -167,14 +171,14 @@ export function CallScreen({ name, onMinimize }: { name: string; onMinimize: () 
  * What is being said. Its own component: a caption grows several times a second
  * while the voice speaks, and only this list needs to follow it, not the orb.
  */
-function CallCaptions({ connecting }: { connecting: boolean }) {
+function CallCaptions({ connecting, padLeft, padRight }: { connecting: boolean; padLeft: number; padRight: number }) {
   const p = usePalette();
   const lines = useVoice((s) => s.lines);
   const scroller = useRef<ComponentRef<typeof ScrollView>>(null);
   const shown = useRef(0);
   if (!lines.length) {
     return (
-      <View style={{ flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: space.xxl }}>
+      <View style={{ flex: 1, alignItems: "center", justifyContent: "center", paddingLeft: Math.max(space.xxl, padLeft), paddingRight: Math.max(space.xxl, padRight) }}>
         <Text style={{ color: p.muted, textAlign: "center", lineHeight: 22 }}>
           {connecting ? "接通后直接说话就行。" : "直接说话就行，比如“谁在等我”“帮我看看哪个跑完了”。"}
         </Text>
@@ -191,7 +195,7 @@ function CallCaptions({ connecting }: { connecting: boolean }) {
         shown.current = lines.length;
         scroller.current?.scrollToEnd({ animated: added });
       }}
-      contentContainerStyle={{ paddingHorizontal: space.lg, paddingVertical: space.xs, gap: space.sm }}
+      contentContainerStyle={{ paddingLeft: padLeft, paddingRight: padRight, paddingVertical: space.xs, gap: space.sm }}
       showsVerticalScrollIndicator={false}
     >
       {lines.map((l, i) => (
@@ -312,6 +316,7 @@ function CallButton({ icon, label, onPress, big, active }: { icon: CuteIconName;
 /** The call, folded into one line above the composer while the chat is in view. */
 export function CallBar({ name, onExpand }: { name: string; onExpand: () => void }) {
   const p = usePalette();
+  const insets = useSafeAreaInsets();
   const phase = usePhase();
   const muted = useVoice((s) => s.muted);
   const task = useVoice((s) => s.task);
@@ -321,12 +326,24 @@ export function CallBar({ name, onExpand }: { name: string; onExpand: () => void
       accessibilityRole="button"
       accessibilityLabel={`通话中，${phaseText(phase, name, !!task)}。点一下回到通话`}
       onPress={onExpand}
-      style={{ flexDirection: "row", alignItems: "center", gap: space.md, marginHorizontal: space.lg, marginBottom: space.sm, backgroundColor: p.accentContainer, borderRadius: radius.xl, paddingLeft: 6, paddingRight: 6, paddingVertical: 6 }}
+      style={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: space.md,
+        marginLeft: horizontalPad(space.lg, insets.left),
+        marginRight: horizontalPad(space.lg, insets.right),
+        marginBottom: space.sm,
+        backgroundColor: p.accentContainer,
+        borderRadius: radius.xl,
+        paddingLeft: 6,
+        paddingRight: 6,
+        paddingVertical: 6,
+      }}
     >
       <View style={{ width: 42, height: 42, borderRadius: 21, overflow: "hidden", borderWidth: 2, borderColor: p.surface }}>
         <CallFace phase={phase} size={38} />
       </View>
-      <View style={{ flex: 1 }}>
+      <View style={{ flex: 1, minWidth: 0 }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
           <Text numberOfLines={1} style={{ flexShrink: 1, fontFamily: fonts.bodyBold, color: p.ink, fontSize: 14 }}>
             {phaseText(phase, name, !!task)}

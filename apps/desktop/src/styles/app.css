@@ -1274,15 +1274,23 @@ a {
   justify-content: space-between;
   gap: 8px;
   min-height: 32px;
+  min-width: 0;
   padding-top: 2px;
 }
 
-.composer-tools,
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
 .composer-actions {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
+  flex: none;
 }
 
 .composer-tool-btn {
@@ -4931,6 +4939,9 @@ a {
   gap: 5px;
   height: 26px;
   max-width: 200px;
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
   padding: 0 8px;
   border-radius: 999px;
   border: 1px solid var(--divider);
@@ -4940,6 +4951,14 @@ a {
   font-size: calc(11.5px * var(--ts, 1));
   font-weight: 600;
   cursor: pointer;
+}
+
+.composer-model-btn svg {
+  flex-shrink: 0;
+}
+
+.composer-model-btn .truncate {
+  min-width: 0;
 }
 
 .composer-model-btn svg:last-child {
@@ -4956,6 +4975,28 @@ a {
 
 .composer-model-btn.open svg:last-child {
   transform: rotate(180deg);
+}
+
+@media (max-width: 520px) {
+  .composer-card {
+    margin: 6px 10px 8px;
+    padding: 8px 10px 6px;
+  }
+  .composer-foot {
+    gap: 6px;
+  }
+  .composer-tools {
+    gap: 4px;
+  }
+  .composer-tool-btn {
+    width: 28px;
+    height: 28px;
+  }
+  .composer-model-btn {
+    max-width: 148px;
+    padding: 0 7px;
+    gap: 4px;
+  }
 }
 
 .model-pop-head-title {

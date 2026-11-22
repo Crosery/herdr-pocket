@@ -13,6 +13,7 @@ import { loadToken } from "../../lib/auth";
 import { revokeDevice } from "../../lib/relay";
 import { friendlyError } from "../../lib/session";
 import { relTime } from "../../lib/format";
+import { horizontalPad } from "../../lib/layoutMetrics";
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
 
@@ -43,9 +44,9 @@ function DeviceRow({ d, isSelf, agentCount, onMore }: { d: Device; isSelf: boole
         <MaterialCommunityIcons name={icon} size={21} color={p.ink} />
         <View style={{ position: "absolute", right: -1, bottom: -1, width: 12, height: 12, borderRadius: 6, borderWidth: 2, borderColor: p.surface, backgroundColor: d.online ? "#3FB68B" : p.faint }} />
       </View>
-      <View style={{ flex: 1, gap: 3 }}>
+      <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-          <Text numberOfLines={1} style={{ flexShrink: 1, fontFamily: fonts.bodyBold, fontSize: 16, color: d.online ? p.ink : p.muted }}>
+          <Text numberOfLines={1} style={{ flexShrink: 1, minWidth: 0, fontFamily: fonts.bodyBold, fontSize: 16, color: d.online ? p.ink : p.muted }}>
             {d.name}
           </Text>
           {isSelf ? (
@@ -148,7 +149,7 @@ export default function DevicesScreen() {
           </View>
         }
         ListEmptyComponent={<EmptyState mood="sleepy" title="还没有设备" body="用上面的“扫一扫”或“邀请设备”把电脑和手机加进来。" />}
-        contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: space.sm, paddingBottom: space.xxl }}
+        contentContainerStyle={{ paddingLeft: horizontalPad(space.lg, insets.left), paddingRight: horizontalPad(space.lg, insets.right), paddingTop: space.sm, paddingBottom: space.xxl }}
       />
       <PocketActionSheet
         visible={!!more}

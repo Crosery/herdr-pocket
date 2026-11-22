@@ -1,5 +1,5 @@
 import type { ComponentProps, ReactNode } from "react";
-import { Platform, Pressable, View } from "react-native";
+import { Platform, Pressable, useWindowDimensions, View } from "react-native";
 import { Text } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import Animated, { interpolateColor, useAnimatedStyle, useDerivedValue, withTiming } from "react-native-reanimated";
@@ -38,20 +38,21 @@ export function Row({
   children?: ReactNode;
 }) {
   const p = usePalette();
+  const { width } = useWindowDimensions();
   const fg = tone === "error" ? p.error : p.accentText;
   const body = (
     <View style={{ paddingHorizontal: space.lg, paddingVertical: space.md, opacity: dim ? 0.55 : 1 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, minHeight: 44 }}>
-        <View style={{ width: 40, height: 40, borderRadius: radius.sm, backgroundColor: tone === "error" ? p.errorContainer : p.accentContainer, alignItems: "center", justifyContent: "center" }}>
+        <View style={{ width: 40, height: 40, flexShrink: 0, borderRadius: radius.sm, backgroundColor: tone === "error" ? p.errorContainer : p.accentContainer, alignItems: "center", justifyContent: "center" }}>
           <MaterialCommunityIcons name={icon} size={21} color={fg} />
         </View>
-        <View style={{ flex: 1, gap: 2 }}>
+        <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
           <Text style={{ fontFamily: fonts.bodyBold, fontSize: 15.5, color: tone === "error" ? p.error : p.ink }}>{title}</Text>
           {sub ? <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 17 }}>{sub}</Text> : null}
         </View>
         {right ?? (onPress ? <MaterialCommunityIcons name="chevron-right" size={22} color={p.faint} /> : null)}
       </View>
-      {children ? <View style={{ paddingLeft: 40 + space.md }}>{children}</View> : null}
+      {children ? <View style={{ paddingLeft: width < 390 ? 4 : 40 + space.md }}>{children}</View> : null}
     </View>
   );
   if (!onPress) return body;

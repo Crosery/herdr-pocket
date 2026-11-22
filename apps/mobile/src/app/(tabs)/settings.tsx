@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AppState, Image, Pressable, ScrollView, View } from "react-native";
+import { AppState, Image, Pressable, ScrollView, useWindowDimensions, View } from "react-native";
 import { Text } from "react-native-paper";
 import { router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -19,6 +19,7 @@ import { useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assis
 import { alertsInBackground, alertsSupported, askNotificationPermission, refreshAlertState, useAlerts } from "../../lib/alerts";
 import { checkForUpdate, currentVersion, downloadUpdate, installUpdate, resumeInstallIfAllowed, updatesSupported, useNewRelease, useUpdate } from "../../lib/update";
 import { isVoiceprintLegacy, syncNativeVoice, voiceprintSupported } from "../../lib/voice";
+import { horizontalPad } from "../../lib/layoutMetrics";
 import { PocketNative } from "../../../modules/pocket-native";
 import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
@@ -66,6 +67,8 @@ export default function SettingsScreen() {
 
   const demo = isMockServer(server);
   const linkColor = link === "online" ? "#3FB68B" : link === "connecting" ? p.lavender : p.error;
+  const padLeft = horizontalPad(space.lg, insets.left);
+  const padRight = horizontalPad(space.lg, insets.right);
 
   async function leave() {
     setConfirm(false);
@@ -75,7 +78,7 @@ export default function SettingsScreen() {
 
   return (
     <PageBackground>
-      <ScrollView contentContainerStyle={{ paddingTop: insets.top + space.xl, paddingHorizontal: space.lg, paddingBottom: space.xxxl }}>
+      <ScrollView contentContainerStyle={{ paddingTop: insets.top + space.xl, paddingLeft: padLeft, paddingRight: padRight, paddingBottom: space.xxxl }}>
         <PageTitle sub="让小羊更合你心意">设置</PageTitle>
 
         {/* This phone: who it is, where it is connected, how the line is. */}
@@ -97,7 +100,7 @@ export default function SettingsScreen() {
             end={{ x: 1, y: 1 }}
             style={{ borderRadius: radius.xl, padding: space.lg, flexDirection: "row", alignItems: "center", gap: space.lg, overflow: "hidden" }}
           >
-            <View style={{ width: 84, height: 84, borderRadius: 42, backgroundColor: p.surface, padding: 3 }}>
+            <View style={{ width: 84, height: 84, flexShrink: 0, borderRadius: 42, backgroundColor: p.surface, padding: 3 }}>
               {link === "online" || demo ? (
                 <Image source={PORTRAIT} style={{ width: 78, height: 78, borderRadius: 39 }} accessibilityLabel="小羊" />
               ) : (
@@ -106,7 +109,7 @@ export default function SettingsScreen() {
                 </View>
               )}
             </View>
-            <View style={{ flex: 1, gap: 5, paddingRight: 34 }}>
+            <View style={{ flex: 1, minWidth: 0, gap: 5, paddingRight: 34 }}>
               <Text numberOfLines={1} style={{ fontFamily: fonts.cute, fontSize: 21, lineHeight: 28, color: p.ink }}>
                 {deviceName ?? "这台手机"}
               </Text>
@@ -236,10 +239,11 @@ export default function SettingsScreen() {
 }
 
 function ThemeChoice() {
+  const { width } = useWindowDimensions();
   const themeMode = useSettings((x) => x.themeMode);
   const set = useSettings((x) => x.set);
   return (
-    <View accessibilityRole="radiogroup" style={{ flexDirection: "row", gap: space.md, paddingTop: space.md }}>
+    <View accessibilityRole="radiogroup" style={{ flexDirection: "row", flexWrap: "wrap", gap: width < 360 ? space.sm : space.md, paddingTop: space.md }}>
       {THEMES.map((t) => (
         <ThemeTile key={t.value} mode={t.value} label={t.label} selected={themeMode === t.value} onPress={() => set({ themeMode: t.value })} />
       ))}
@@ -279,11 +283,12 @@ function ChatDisplayModeChoice() {
 /** The four sizes and a sample bubble in the chosen one. */
 function TextScaleChoice() {
   const p = usePalette();
+  const { width } = useWindowDimensions();
   const textScale = useSettings((x) => x.textScale);
   const set = useSettings((x) => x.set);
   return (
     <>
-      <View accessibilityRole="radiogroup" style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingTop: space.md }}>
+      <View accessibilityRole="radiogroup" style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: width < 360 ? space.sm : space.md, paddingTop: space.md }}>
         {SCALES.map((x) => {
           const on = textScale === x.value;
           return (
@@ -302,7 +307,7 @@ function TextScaleChoice() {
       </View>
       <View style={{ flexDirection: "row", alignItems: "flex-end", gap: space.sm, paddingTop: space.md }}>
         <Mascot size={30} />
-        <View style={{ flexShrink: 1, backgroundColor: p.surface3, borderRadius: radius.md, borderBottomLeftRadius: 5, paddingHorizontal: space.md, paddingVertical: 7 }}>
+        <View style={{ flexShrink: 1, minWidth: 0, backgroundColor: p.surface3, borderRadius: radius.md, borderBottomLeftRadius: 5, paddingHorizontal: space.md, paddingVertical: 7 }}>
           <Text style={{ color: p.ink, fontSize: 15.5 * textScale, lineHeight: 22 * textScale }}>迁移脚本跑完了，测试全过。</Text>
         </View>
       </View>

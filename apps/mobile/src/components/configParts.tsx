@@ -11,6 +11,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import type { KeyView } from "@herdr-pocket/protocol";
 import { flash, keyLine, useAssistantConfig } from "../lib/assistantConfig";
+import { useKeyboardState } from "../lib/useKeyboardState";
 import { Mascot } from "./Mascot";
 import { PocketToast } from "./ui";
 import { PocketButton, PocketChip, PocketChips, PocketDialog, PocketSpinner } from "./pocket";
@@ -175,8 +176,10 @@ export function KeyField({
 export function SaveBar({ children, note, keyboardOpen }: { children: ReactNode; note?: string; keyboardOpen?: boolean }) {
   const p = usePalette();
   const insets = useSafeAreaInsets();
+  const { keyboardOpen: detectedKeyboardOpen } = useKeyboardState();
+  const open = keyboardOpen ?? detectedKeyboardOpen;
   return (
-    <View style={{ paddingHorizontal: space.lg, paddingTop: space.sm, paddingBottom: (keyboardOpen ? 0 : insets.bottom) + space.md, gap: space.xs, borderTopWidth: 1, borderTopColor: p.divider, backgroundColor: p.page }}>
+    <View style={{ paddingHorizontal: space.lg, paddingTop: space.sm, paddingBottom: (open ? 0 : insets.bottom) + space.md, gap: space.xs, borderTopWidth: 1, borderTopColor: p.divider, backgroundColor: p.page }}>
       {note ? <Text style={{ color: p.faint, fontSize: 12, textAlign: "center" }}>{note}</Text> : null}
       <View style={{ flexDirection: "row", gap: space.sm }}>{children}</View>
     </View>

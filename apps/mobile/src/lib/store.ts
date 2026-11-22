@@ -360,3 +360,34 @@ export const usePending = create<PendingState>()(
     },
   ),
 );
+
+export type AppToastTone = "hangup" | "info" | "error";
+
+interface AppToastState {
+  id: number;
+  message: string | null;
+  tone: AppToastTone;
+  duration?: number;
+  show: (message: string, opts?: { tone?: AppToastTone; duration?: number }) => void;
+  dismiss: () => void;
+}
+
+/** App-wide transient feedback banner for actions that dismiss sheets or switch routes. */
+export const useAppToast = create<AppToastState>()((set) => ({
+  id: 0,
+  message: null,
+  tone: "info",
+  duration: undefined,
+  show: (message, opts) =>
+    set((s) => ({
+      id: s.id + 1,
+      message,
+      tone: opts?.tone ?? "info",
+      duration: opts?.duration,
+    })),
+  dismiss: () => set({ message: null, duration: undefined }),
+}));
+
+export function showAppToast(message: string, opts?: { tone?: AppToastTone; duration?: number }): void {
+  useAppToast.getState().show(message, opts);
+}
