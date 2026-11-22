@@ -731,6 +731,54 @@ export class UnifloAdapter {
     return toInfo((await this.get(`/v1/sessions/${encodeURIComponent(key)}`)) as UnifloSession);
   }
 
+  /**
+   * Returns Uniflo session metadata for `key` (exact or short prefix), checking
+   * local caches first and fetching `/v1/sessions/...` (with `/v1/sessions?q=...`
+   * fallback) on demand. Returns `null` gracefully when offline or not found.
+   */
+  async getSessionMeta(key: string): Promise<UnifloSession | null> {
+    const trimmed = key.trim();
+    if (!trimmed) return null;
+    const colon = trimmed.indexOf(":");
+    const short = colon >= 0 ? trimmed.length - colon - 1 < 32 : trimmed.length < 32;
+    const hit = (x: UnifloSession) => x.key === trimmed || (short && x.key.startsWith(trimmed));
+
+    const cached = this.sessions.find(hit) ?? this.named.get(trimmed) ?? [...this.named.values()].find(hit);
+    if (cached) return cached;
+
+    try {
+      const exact = (await this.get(`/v1/sessions/${encodeURIComponent(trimmed)}`)) as UnifloSession | undefined;
+      if (exact && typeof exact.key === "string") {
+        this.named.set(trimmed, exact);
+        if (exact.key !== trimmed) this.named.set(exact.key, exact);
+        return exact;
+      }
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      const code = (err as { cause?: { code?: string } } | undefined)?.cause?.code;
+      if (name === "TimeoutError" || name === "AbortError" || code === "ECONNREFUSED") {
+        return null;
+      }
+    }
+
+    const query = colon >= 0 ? trimmed.slice(colon + 1).trim() : trimmed;
+    if (!query) return null;
+    try {
+      const q = new URLSearchParams({ q: query, limit: "10" });
+      const list = (await this.get(`/v1/sessions?${q}`)) as UnifloSession[] | undefined;
+      const matches = Array.isArray(list) ? list.filter(hit) : [];
+      const found = matches.find((x) => x.key === trimmed) ?? (matches.length === 1 ? matches[0] : undefined);
+      if (found) {
+        this.named.set(trimmed, found);
+        if (found.key !== trimmed) this.named.set(found.key, found);
+        return found;
+      }
+    } catch {
+      /* uniflo offline or unreachable */
+    }
+    return null;
+  }
+
   /** Returns the local transcript file path reported by Uniflo for `sessionKey`, if available. */
   async sessionSourcePath(sessionKey: string): Promise<string | undefined> {
     const cached =
