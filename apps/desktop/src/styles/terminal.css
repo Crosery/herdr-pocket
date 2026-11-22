@@ -7,7 +7,7 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  padding: 6px 8px 6px 10px;
+  padding: 14px 18px;
   background: var(--tp-term-bg, #16141d);
   outline: none;
   overflow: hidden;
@@ -22,8 +22,8 @@
   place-items: center;
   border-radius: 10px;
   border: 2px dashed var(--primary);
-  background: color-mix(in srgb, #16141d 84%, transparent);
-  color: #f9d7e5;
+  background: var(--tp-term-drop-bg, rgba(22, 20, 29, 0.84));
+  color: var(--tp-term-drop-fg, #f9d7e5);
   font-size: calc(13.5px * var(--ts, 1));
   font-weight: 700;
   pointer-events: none;
@@ -45,7 +45,7 @@
 
 .tp-term-host .xterm-viewport {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+  scrollbar-color: var(--tp-term-scroll, rgba(255, 255, 255, 0.18)) transparent;
 }
 
 .tp-term-host .xterm-viewport::-webkit-scrollbar {
@@ -58,12 +58,12 @@
 }
 
 .tp-term-host .xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.18);
+  background: var(--tp-term-scroll, rgba(255, 255, 255, 0.18));
   border-radius: 999px;
 }
 
 .tp-term-host .xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.34);
+  background: var(--tp-term-scroll-hover, rgba(255, 255, 255, 0.34));
 }
 
 .tp-term-host .xterm-screen {

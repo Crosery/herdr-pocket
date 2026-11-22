@@ -99,6 +99,8 @@ export interface LogFolderInfo {
 export interface FontCatalog {
   families: string[];
   herdrFont?: string;
+  herdrFontSize?: number;
+  herdrLineHeight?: number;
   symbolsFont?: string;
 }
 
