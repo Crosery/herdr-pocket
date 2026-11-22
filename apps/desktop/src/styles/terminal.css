@@ -41,9 +41,12 @@
 .tp-term-host .xterm {
   height: 100%;
   width: 100%;
+  background-color: var(--tp-term-bg, #16141d);
 }
 
+.tp-term-host .xterm .xterm-viewport,
 .tp-term-host .xterm-viewport {
+  background-color: var(--tp-term-bg, #16141d);
   scrollbar-width: thin;
   scrollbar-color: var(--tp-term-scroll, rgba(255, 255, 255, 0.18)) transparent;
 }

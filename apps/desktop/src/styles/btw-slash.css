@@ -170,8 +170,20 @@
   color: var(--muted);
   font-size: calc(10.8px * var(--ts, 1));
   font-weight: 600;
+  white-space: nowrap;
   flex: 0 1 auto;
   min-width: 0;
+}
+
+.btw-pill.truncate {
+  display: inline-block;
+  vertical-align: middle;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btw-pill.mono:not(.truncate) {
+  flex-shrink: 0;
 }
 
 .btw-pill.pink {
