@@ -379,6 +379,7 @@ export class HerdrApp {
   private bin: string;
   private sharedJsonPath: string;
   private docsJsonPath: string;
+  execWrapper?: string;
 
   constructor(
     bin = process.env.HERDR_APP_BIN ?? "herdr-app",
@@ -626,7 +627,7 @@ export class HerdrApp {
     terminal: string;
   }> {
     const args: Record<string, unknown> = {};
-    if (o.argv.length) args.argv = o.argv;
+    if (o.argv.length) args.argv = this.execWrapper ? [this.execWrapper, ...o.argv] : o.argv;
     if (o.task) args.task = o.task;
     if (o.folder) args.folder = o.folder;
     let cmd: string;

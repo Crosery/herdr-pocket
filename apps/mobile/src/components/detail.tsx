@@ -1631,20 +1631,6 @@ export function Composer({
     });
   }
 
-  async function interruptCurrentTurn() {
-    if (!online || sending) return;
-    Haptics.selectionAsync().catch(() => undefined);
-    setSending(true);
-    try {
-      await call(agent.deviceId, "terminal.interrupt", { agent: agent.key });
-      refreshSoon();
-    } catch (e) {
-      setToast((e as Error).message);
-    } finally {
-      setSending(false);
-    }
-  }
-
   async function attach() {
     if (!canPickImages()) return setToast("这个版本的 App 还不能选图片，更新 App 后再试");
     const room = PUT_LIMITS.files - pictures.length;
@@ -3100,65 +3086,24 @@ export function Composer({
               ) : null}
             </View>
             <View style={{ flexShrink: 0 }}>
-              {agent.status === "working" ? (
-                isBtwDraft ? (
-                  <SendPill
-                    width={metrics.sendWidth}
-                    height={metrics.actionHeight}
-                    disabled={!online || !/^\/btw\s+\S/i.test(text.trim())}
-                    onPress={send}
-                    a11y="发送旁路提问（不打断主线）"
-                  />
-                ) : !text.trim() && !pictures.length ? (
-                  <Pressable
-                    disabled={!online || sending}
-                    onPress={() => void interruptCurrentTurn()}
-                    accessibilityRole="button"
-                    accessibilityLabel="停止当前轮"
-                    style={({ pressed }) => ({
-                      height: metrics.actionHeight,
-                      paddingHorizontal: metrics.actionPadX,
-                      borderRadius: Math.round(metrics.actionHeight / 2),
-                      flexDirection: "row",
-                      alignItems: "center",
-                      gap: 5,
-                      backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.surface3 : p.accentContainer,
-                      borderWidth: 1,
-                      borderColor: !online ? p.divider : p.primary,
-                      opacity: sending ? 0.55 : 1,
-                    })}
-                  >
-                    <MaterialCommunityIcons name="stop" size={16} color={!online ? p.faint : p.accentText} />
-                    <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.accentText }}>停止</Text>
-                  </Pressable>
-                ) : (
-                  <Pressable
-                    disabled={!online}
-                    onPress={send}
-                    accessibilityRole="button"
-                    accessibilityLabel="加入排队，当前轮结束后发送"
-                    style={({ pressed }) => ({
-                      height: metrics.actionHeight,
-                      paddingHorizontal: metrics.actionPadX,
-                      borderRadius: Math.round(metrics.actionHeight / 2),
-                      flexDirection: "row",
-                      alignItems: "center",
-                      gap: 4,
-                      backgroundColor: !online ? (p.dark ? p.surface2 : "#F6EFF4") : pressed ? p.primaryPressed : p.primary,
-                    })}
-                  >
-                    <MaterialCommunityIcons name="clock-outline" size={16} color={!online ? p.faint : p.onPrimary} />
-                    <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: !online ? p.faint : p.onPrimary }}>排队</Text>
-                  </Pressable>
-                )
-              ) : (
-                <SendPill
-                  width={metrics.sendWidth}
-                  height={metrics.actionHeight}
-                  disabled={(!text.trim() && !pictures.length) || !online}
-                  onPress={send}
-                />
-              )}
+              <SendPill
+                width={metrics.sendWidth}
+                height={metrics.actionHeight}
+                disabled={
+                  !online ||
+                  (isBtwDraft
+                    ? !/^\/btw\s+\S/i.test(text.trim())
+                    : !text.trim() && !pictures.length)
+                }
+                onPress={send}
+                a11y={
+                  isBtwDraft
+                    ? "发送旁路提问（不打断主线）"
+                    : agent.status === "working"
+                      ? "发送（运行中将自动排队）"
+                      : "发送"
+                }
+              />
             </View>
           </View>
         ) : (

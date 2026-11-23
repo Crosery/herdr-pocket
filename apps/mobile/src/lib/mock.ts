@@ -16,14 +16,28 @@ import {
   type ConvEvent,
   type Device,
   type DeviceKind,
+  type FileEntry,
+  type HostPortalCapabilities,
+  type HostToolId,
+  type HostTools,
   type JoinRequest,
   type Notice,
   type PairCode,
   type PairResponse,
+  type PortalFileTicket,
+  type PortalFramePayload,
+  type PortalInputAction,
+  type PortalItem,
+  type PortalKind,
+  type PortalStreamEvent,
+  type RemoteWindowInfo,
   type RpcMethod,
+  type StreamKind,
   type SubSession,
   type TerminalRowsEvent,
   type TerminalStreamParams,
+  type ToolUpdateItemResult,
+  type ToolUpdateJobSnapshot,
 } from "@herdr-pocket/protocol";
 import { useLive, useSettings } from "./store";
 import { isWide } from "./ansi";
@@ -570,6 +584,85 @@ export function mockLink(): Link {
   }, 350);
   // Gentle liveliness: the working agent's turn ticks. The perf demo sends every agent anew, as a relay snapshot does.
   const perf = perfDemo();
+  const demoToolsByHost: Record<string, HostTools> = {
+    [HOST_A]: {
+      app: "0.9.4",
+      herdr: "0.6.2",
+      hc: "0.6.2",
+      uniflo: "1.3.0",
+      latest: { app: "0.9.5", herdr: "0.6.3", hc: "0.7.0", uniflo: "1.3.0", hostd: "0.2.25", checkedAt: now() - 4 * MIN },
+    },
+    [HOST_B]: {
+      hc: "0.7.0",
+      uniflo: "1.2.1",
+      latest: { hc: "0.7.0", uniflo: "1.3.0", hostd: "0.2.25", checkedAt: now() - 12 * MIN },
+    },
+  };
+  const demoToolJobs: Record<string, ToolUpdateJobSnapshot> = {};
+  const firstMacAgent = agents.find((a) => a.deviceId === HOST_A);
+  const demoPortals: PortalItem[] = [
+    ...(firstMacAgent
+      ? [
+          {
+            id: "ptl-m-oauth",
+            hostId: HOST_A,
+            agentKey: firstMacAgent.key,
+            terminalId: firstMacAgent.localId,
+            kind: "browser" as PortalKind,
+            title: "GitHub OAuth 登录授权 · 127.0.0.1:8787",
+            subtitle: "http://127.0.0.1:8787/oauth/callback?provider=github",
+            url: "http://127.0.0.1:8787/oauth/callback?provider=github",
+            canInteract: true,
+            transportHint: "p2p" as const,
+            width: 960,
+            height: 600,
+            createdAt: now() - 2 * MIN,
+            updatedAt: now() - 10_000,
+          },
+        ]
+      : []),
+  ];
+  const portalWatchers = new Set<{ hostId: string; agentKey?: string; portalId?: string; onEvent: (e: any) => void }>();
+  let portalSeq = 1;
+  let frameSeq = 1;
+  const MOCK_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const emitPortal = (action: "opened" | "updated" | "closed", item: PortalItem) => {
+    const ev: PortalStreamEvent = { kind: "portal_event", action, item, at: now() };
+    for (const w of portalWatchers) {
+      if (w.hostId !== item.hostId) continue;
+      if (w.agentKey && item.agentKey && w.agentKey !== item.agentKey) continue;
+      if (w.portalId && w.portalId !== item.id) continue;
+      w.onEvent(ev);
+    }
+  };
+  const capsForHost = (hostId: string): HostPortalCapabilities =>
+    hostId === HOST_B
+      ? {
+          platform: "linux",
+          sessionType: "wayland-wlroots",
+          desktopEnv: "Hyprland",
+          canListWindows: true,
+          canCaptureWindow: true,
+          canCaptureScreen: true,
+          canInjectInput: true,
+          hasCdpBrowser: true,
+          directPort: null,
+        }
+      : {
+          platform: "darwin",
+          sessionType: "macos",
+          desktopEnv: "Aqua",
+          canListWindows: true,
+          canCaptureWindow: true,
+          canCaptureScreen: true,
+          canInjectInput: true,
+          hasCdpBrowser: true,
+          directPort: null,
+        };
+  const ensureHostTools = (hostId: string): HostTools => {
+    const cur = (demoToolsByHost[hostId] ??= { hc: "0.7.0", uniflo: "1.3.0", latest: { hc: "0.7.0", uniflo: "1.3.0", hostd: "0.2.25", checkedAt: now() } });
+    return { ...cur, latest: cur.latest ? { ...cur.latest } : undefined };
+  };
   const tick = setInterval(() => {
     agents = agents.map((a) => (a.status === "working" ? { ...a, updatedAt: now() } : perf ? { ...a } : a));
     publish();
@@ -639,8 +732,18 @@ export function mockLink(): Link {
           const task = p.task ? (launcher.id === "shell" ? ("failed" as const) : launcher.takesTask ? ("started" as const) : ("typed" as const)) : undefined;
           return { agent: a.key, space: sp?.id ?? "w-new", terminal: localId, task, taskNote: task === "failed" ? "终端不接任务" : undefined };
         }
-        case "host.info":
-          return { name: "demo", platform: "darwin", sources: ["hc"], version: "0.1.0" };
+        case "host.info": {
+          const d = devices.find((x) => x.id === _to);
+          return {
+            name: d?.name ?? "demo",
+            platform: d?.platform ?? "darwin",
+            sources: d?.sources ?? ["hc"],
+            version: d?.version ?? "0.2.25",
+            tools: ensureHostTools(_to),
+            files: true,
+            portal: capsForHost(_to),
+          };
+        }
         case "harness.icons": {
           // Placeholder shapes standing in for what a computer's Uniflo would send (not the real marks).
           const ids = (params as { ids?: string[] }).ids ?? [];
@@ -740,12 +843,193 @@ export function mockLink(): Link {
           agents = agents.map((a) => (a.key === p.agent && a.status === "done" ? { ...a, status: "idle" } : a));
           publish();
           return { ok: true };
+        case "tools.check": {
+          const t = ensureHostTools(_to);
+          t.latest = {
+            ...(t.latest ?? {}),
+            ...(t.hc ? { hc: t.latest?.hc ?? t.hc } : {}),
+            ...(t.herdr ? { herdr: t.latest?.herdr ?? t.herdr } : {}),
+            ...(t.app ? { app: t.latest?.app ?? t.app } : {}),
+            ...(t.uniflo ? { uniflo: t.latest?.uniflo ?? t.uniflo } : {}),
+            hostd: "0.2.25",
+            checkedAt: now(),
+          };
+          demoToolsByHost[_to] = t;
+          return { tools: ensureHostTools(_to), hostVersion: "0.2.25" };
+        }
+        case "tools.update": {
+          const raw = (params ?? {}) as { targets?: HostToolId[] };
+          const tools = demoToolsByHost[_to] ?? ensureHostTools(_to);
+          const valid: HostToolId[] = ["hc", "herdr", "app", "uniflo", "hostd"];
+          const targets = Array.isArray(raw.targets) && raw.targets.length
+            ? raw.targets.filter((x): x is HostToolId => valid.includes(x))
+            : (valid.filter((id) => id !== "hostd" && Boolean(tools[id])) as HostToolId[]);
+          const completed: ToolUpdateItemResult[] = targets.map((id) => {
+            if (id === "hostd") {
+              return { id, ok: true, status: "up_to_date", fromVersion: "0.2.25", toVersion: "0.2.25", message: "Pocket 守护进程已是最新 0.2.25" };
+            }
+            const cur = tools[id];
+            const nxt = tools.latest?.[id] ?? cur;
+            if (cur && nxt && cur !== nxt) {
+              tools[id] = nxt;
+              return { id, ok: true, status: "updated", fromVersion: cur, toVersion: nxt, message: `已更新到 ${nxt}` };
+            }
+            return { id, ok: true, status: "up_to_date", fromVersion: cur, toVersion: nxt ?? cur, message: `${id} 已是最新版本` };
+          });
+          demoToolsByHost[_to] = tools;
+          const job: ToolUpdateJobSnapshot = {
+            jobId: `tu-m-${now().toString(36)}`,
+            running: false,
+            targets,
+            completed,
+            tools: ensureHostTools(_to),
+            hostVersion: "0.2.25",
+            startedAt: now(),
+            finishedAt: now(),
+          };
+          demoToolJobs[_to] = job;
+          return job;
+        }
+        case "tools.updateStatus":
+          return demoToolJobs[_to] ?? null;
+        case "files.readChunk": {
+          const text = "export const demo = true;\n";
+          return {
+            path: String((params as { path?: string })?.path ?? "src/index.ts"),
+            size: text.length,
+            mtime: now() - 10 * MIN,
+            offset: 0,
+            bytes: text.length,
+            eof: true,
+            mime: "text/plain; charset=utf-8",
+            base64: "ZXhwb3J0IGNvbnN0IGRlbW8gPSB0cnVlOwo=",
+          };
+        }
+        case "portal.list": {
+          const rp = (params ?? {}) as { agent?: string; includeWindows?: boolean };
+          const items = demoPortals
+            .filter((it) => it.hostId === _to && (!rp.agent || !it.agentKey || it.agentKey === rp.agent))
+            .sort((a, b) => b.updatedAt - a.updatedAt);
+          const windows: RemoteWindowInfo[] | undefined = rp.includeWindows
+            ? [{ id: "screen:0", appName: "Remote Display", title: "主屏幕", bounds: { x: 0, y: 0, width: 1440, height: 900 }, isScreen: true }]
+            : undefined;
+          return { items, ...(windows ? { windows } : {}), capabilities: capsForHost(_to) };
+        }
+        case "portal.open": {
+          const rp = (params ?? {}) as { agent?: string; kind?: PortalKind; target?: string; url?: string; windowId?: string; title?: string };
+          const kind: PortalKind = rp.kind ?? "browser";
+          const url = rp.url ?? (kind === "browser" ? rp.target || "http://127.0.0.1:8787/oauth" : undefined);
+          const item: PortalItem = {
+            id: `ptl-m-${++portalSeq}`,
+            hostId: _to,
+            ...(rp.agent ? { agentKey: rp.agent } : {}),
+            kind,
+            title: rp.title?.trim() || (kind === "browser" ? url || "远程浏览器" : kind === "window" ? "远程窗口" : rp.target || "远程文件"),
+            subtitle: url || rp.target,
+            ...(rp.target ? { targetPath: rp.target } : {}),
+            ...(kind === "reveal" ? { parentDir: "docs", highlightName: (rp.target || "README.md").split("/").pop() } : {}),
+            ...(url ? { url } : {}),
+            ...(rp.windowId ? { windowId: rp.windowId } : {}),
+            canInteract: kind === "browser" || kind === "window",
+            transportHint: "p2p",
+            width: 960,
+            height: 600,
+            createdAt: now(),
+            updatedAt: now(),
+          };
+          demoPortals.unshift(item);
+          emitPortal("opened", item);
+          const ticket: PortalFileTicket | undefined =
+            kind === "file" || kind === "html" || kind === "reveal"
+              ? { token: `m-${item.id}`, entryPath: "README.md", port: null, addrs: [], expiresAt: now() + 30 * MIN, mime: "text/plain; charset=utf-8", size: 128, isDir: false }
+              : undefined;
+          return { item, ...(ticket ? { ticket } : {}) };
+        }
+        case "portal.close": {
+          const portalId = String((params as { portalId?: string })?.portalId ?? "");
+          const idx = demoPortals.findIndex((it) => it.id === portalId);
+          if (idx >= 0) {
+            const [rem] = demoPortals.splice(idx, 1);
+            if (rem) emitPortal("closed", rem);
+          }
+          return { ok: true };
+        }
+        case "portal.frame": {
+          const portalId = String((params as { portalId?: string })?.portalId ?? "");
+          const item = demoPortals.find((it) => it.id === portalId) ?? null;
+          if (!item || (item.kind !== "browser" && item.kind !== "window")) return { frame: null, item };
+          const frame: PortalFramePayload = {
+            portalId: item.id,
+            seq: frameSeq++,
+            mime: "image/png",
+            data: MOCK_PNG_B64,
+            width: 960,
+            height: 600,
+            ...(item.url ? { url: item.url } : {}),
+            title: item.title,
+            canGoBack: item.kind === "browser",
+            canGoForward: false,
+            at: now(),
+          };
+          return { frame, item };
+        }
+        case "portal.input": {
+          const rp = (params ?? {}) as { portalId?: string; input?: PortalInputAction };
+          const item = demoPortals.find((it) => it.id === rp.portalId);
+          if (!item) throw new Error("回传窗口不存在");
+          if (rp.input?.type === "navigate" && rp.input.action === "goto" && rp.input.url) {
+            item.url = rp.input.url;
+            item.subtitle = rp.input.url;
+            item.updatedAt = now();
+            emitPortal("updated", item);
+          }
+          return { ok: true, ...(item.url ? { url: item.url } : {}), title: item.title };
+        }
+        case "portal.fileTicket":
+          return { token: `m-tok-${now().toString(36)}`, entryPath: "README.md", port: null, addrs: [], expiresAt: now() + 30 * MIN, mime: "text/plain; charset=utf-8", size: 128, isDir: false } satisfies PortalFileTicket;
+        case "portal.dirList": {
+          const entries: FileEntry[] = [
+            { name: "src", path: "src", kind: "dir", mtime: now() - 10 * MIN },
+            { name: "README.md", path: "README.md", kind: "file", size: 512, mtime: now() - 10 * MIN },
+            { name: "oauth-flow.svg", path: "docs/oauth-flow.svg", kind: "file", size: 320, mtime: now() - 10 * MIN },
+          ];
+          return { dirPath: "~/code/chord-book", parentDir: "~/code", highlightName: "README.md", entries, truncated: false };
+        }
+        case "portal.bundleHtml":
+          return { html: "<!doctype html><html><body><h2>Demo HTML</h2></body></html>", title: "index.html" };
         default:
           throw new Error("unsupported");
       }
     },
-    subscribe(_to: string, stream: "terminal" | "session", params: unknown, onEvent: (event: any) => void, onState?: (event: any) => void) {
+    subscribe(_to: string, stream: StreamKind, params: unknown, onEvent: (event: any) => void, onState?: (event: any) => void) {
       onState?.({ status: "open", result: { kind: stream } });
+      if (stream === "portal") {
+        const rp = (params ?? {}) as { portalId?: string; agent?: string };
+        const w = { hostId: _to, agentKey: rp.agent, portalId: rp.portalId, onEvent };
+        portalWatchers.add(w);
+        if (rp.portalId) {
+          const item = demoPortals.find((it) => it.id === rp.portalId);
+          if (item && (item.kind === "browser" || item.kind === "window")) {
+            onEvent({
+              kind: "portal_frame",
+              portalId: item.id,
+              seq: frameSeq++,
+              mime: "image/png",
+              data: MOCK_PNG_B64,
+              width: 960,
+              height: 600,
+              ...(item.url ? { url: item.url } : {}),
+              title: item.title,
+              canGoBack: item.kind === "browser",
+              canGoForward: false,
+              at: now(),
+            } satisfies PortalStreamEvent);
+          }
+        }
+        return () => {
+          portalWatchers.delete(w);
+        };
+      }
       const p = (params ?? {}) as Partial<TerminalStreamParams> & { sub?: string };
       if (stream === "terminal") {
         // Queue marks for the bubbles of messages sent from here.

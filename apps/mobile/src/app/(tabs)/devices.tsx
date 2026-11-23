@@ -8,6 +8,7 @@ import type { Device } from "@herdr-pocket/protocol";
 import { ConnectionBanner } from "../../components/agents";
 import { Card, EmptyState, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
 import { PocketActionSheet, PocketButton, PocketDialog } from "../../components/pocket";
+import { HostToolsSheet } from "../../components/HostToolsSheet";
 import { useLive, useSettings } from "../../lib/store";
 import { loadToken } from "../../lib/auth";
 import { revokeDevice } from "../../lib/relay";
@@ -84,6 +85,7 @@ export default function DevicesScreen() {
   const server = useSettings((s) => s.server);
   const [target, setTarget] = useState<Device | null>(null);
   const [more, setMore] = useState<Device | null>(null);
+  const [toolsHost, setToolsHost] = useState<Device | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -159,12 +161,18 @@ export default function DevicesScreen() {
         actions={
           more
             ? [
-                ...(more.kind === "host" ? [{ key: "show", label: "只看它的 agent", icon: "filter-variant" as const, onPress: () => router.navigate({ pathname: "/agents", params: { host: more.id } }) }] : []),
+                ...(more.kind === "host"
+                  ? [
+                      { key: "show", label: "只看它的 agent", icon: "filter-variant" as const, onPress: () => router.navigate({ pathname: "/agents", params: { host: more.id } }) },
+                      { key: "tools", label: "查看与更新组件", sub: "直接更新 hc、Herdr、uniflo 与守护进程", icon: "update" as const, onPress: () => setToolsHost(more) },
+                    ]
+                  : []),
                 { key: "revoke", label: "移除这台设备", sub: "断开并作废授权", icon: "link-off" as const, danger: true, onPress: () => setTarget(more) },
               ]
             : []
         }
       />
+      <HostToolsSheet visible={!!toolsHost} host={toolsHost} onDismiss={() => setToolsHost(null)} />
       <PocketDialog
         visible={!!target}
         onDismiss={() => setTarget(null)}

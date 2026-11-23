@@ -91,9 +91,9 @@ interface Pending {
 }
 
 /** Calls that change something on a computer: logged even when they work. Typing keystrokes and "seen" marks are not. */
-const MUTATING = new Set(["terminal.send", "terminal.keys", "agent.create", "agent.setModel", "space.delete", "terminal.interrupt", "terminal.kill", "herdr.command", "herdr.doc.set", "sessions.resume"]);
+const MUTATING = new Set(["terminal.send", "terminal.keys", "agent.create", "agent.setModel", "space.delete", "terminal.interrupt", "terminal.kill", "herdr.command", "herdr.doc.set", "sessions.resume", "tools.update"]);
 /** Calls that may run longer than the usual RPC timeout: a new agent's first task is typed in once its program is up (hostd waits up to 45 s). */
-const SLOW_RPC_MS: Partial<Record<string, number>> = { "agent.create": 100_000, "agent.btw": 65_000 };
+const SLOW_RPC_MS: Partial<Record<string, number>> = { "agent.create": 100_000, "agent.btw": 65_000, "tools.update": 180_000 };
 /** Bodies of log uploads are larger than other requests. */
 const MAX_LOG_BODY = 512 * 1024;
 const STARTED = Date.now();
@@ -1145,7 +1145,11 @@ export class Relay {
 
   private routeStreamSubscribe(caller: Conn, frame: Extract<ClientFrame, { type: "stream_subscribe" }>): void {
     const fail = (error: RpcError) => this.send(caller, { type: "stream_open", id: frame.id, error });
-    if (typeof frame.id !== "string" || typeof frame.to !== "string" || (frame.stream !== "terminal" && frame.stream !== "session")) {
+    if (
+      typeof frame.id !== "string" ||
+      typeof frame.to !== "string" ||
+      (frame.stream !== "terminal" && frame.stream !== "session" && frame.stream !== "portal")
+    ) {
       fail({ code: "bad_request", message: "stream_subscribe 需要 id、to、stream" });
       return;
     }

@@ -1,19 +1,38 @@
 import { createElement, useEffect } from "react";
-import { settingsStore } from "../lib/store";
-import { IS_MAC } from "./shortcuts";
+import { createStore, settingsStore } from "../lib/store";
+import {
+  chordFromModifierEvent,
+  chordOfKeys,
+  IS_MAC,
+  SHORTCUTS,
+  shortcutText,
+  type ShortcutId,
+  type ShortcutModifierChord,
+} from "./shortcuts";
 
-const HOLD_DELAY_MS = 320;
+const HOLD_DELAY_MS = 260;
 
-function isPrimaryModifierOnly(e: KeyboardEvent): boolean {
-  if (IS_MAC) {
-    return e.key === "Meta" && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
-  }
-  return e.key === "Control" && e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+export const modifierChordStore = createStore<ShortcutModifierChord | null>(null);
+
+export function useActiveModifierChord(): ShortcutModifierChord | null {
+  return modifierChordStore.use((s) => s);
+}
+
+function isModifierKeyName(key: string): boolean {
+  return key === "Meta" || key === "Control" || key === "Alt" || key === "Shift";
+}
+
+function inferChordFromText(text: string): ShortcutModifierChord {
+  if (/(?:⌥⇧|Alt\+Shift)/i.test(text)) return "Mod+Alt+Shift";
+  if (/(?:⇧|Shift)/i.test(text)) return "Mod+Shift";
+  if (/(?:⌥|Alt)/i.test(text)) return "Mod+Alt";
+  return "Mod";
 }
 
 /**
- * Shows cmux-style floating shortcut badges across window landmarks when holding
- * the primary modifier (⌘ on macOS, Ctrl elsewhere) alone for 320ms.
+ * Progressive cmux-style modifier hold hints:
+ * holding ⌘ shows ⌘-level hints; adding ⇧ or ⌥ while still holding ⌘ swaps live
+ * to the deeper chord layer (⌘⇧ / ⌘⌥ / ⌘⌥⇧) and updates the guide HUD.
  */
 export function useModifierHoldHints(): void {
   const enabled = settingsStore.use((s) => s.showModifierHoldHints);
@@ -22,17 +41,22 @@ export function useModifierHoldHints(): void {
     if (typeof document === "undefined" || typeof window === "undefined") return;
     if (!enabled) {
       delete document.documentElement.dataset.shortcutHints;
+      if (modifierChordStore.get() !== null) modifierChordStore.set(null);
       return;
     }
 
     let timer: number | null = null;
-    let shown = false;
+    let activeChord: ShortcutModifierChord | null = null;
+    let pendingChord: ShortcutModifierChord | null = null;
 
-    const setShown = (next: boolean) => {
-      if (shown === next) return;
-      shown = next;
-      if (next) document.documentElement.dataset.shortcutHints = "true";
+    const applyChord = (next: ShortcutModifierChord | null) => {
+      if (activeChord === next) return;
+      activeChord = next;
+      if (next) document.documentElement.dataset.shortcutHints = next;
       else delete document.documentElement.dataset.shortcutHints;
+      if (modifierChordStore.get() !== next) {
+        modifierChordStore.set(next);
+      }
     };
 
     const cancel = () => {
@@ -40,34 +64,51 @@ export function useModifierHoldHints(): void {
         window.clearTimeout(timer);
         timer = null;
       }
-      setShown(false);
+      pendingChord = null;
+      applyChord(null);
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat && timer !== null) return;
-      if (isPrimaryModifierOnly(e)) {
-        const hasDialog = Boolean(document.querySelector("[role=dialog][data-state=open]"));
-        if (hasDialog) {
-          cancel();
-          return;
-        }
-        if (timer === null && !shown) {
-          timer = window.setTimeout(() => {
-            timer = null;
-            if (!document.querySelector("[role=dialog][data-state=open]")) {
-              setShown(true);
-            }
-          }, HOLD_DELAY_MS);
-        }
+      const hasDialog = Boolean(document.querySelector("[role=dialog][data-state=open]"));
+      if (hasDialog) {
+        cancel();
         return;
       }
-      // Any second modifier or chord key dismisses hold hints immediately.
-      cancel();
+      if (!isModifierKeyName(e.key)) {
+        cancel();
+        return;
+      }
+      const next = chordFromModifierEvent(e);
+      if (!next) {
+        cancel();
+        return;
+      }
+      pendingChord = next;
+      if (activeChord !== null) {
+        // Already open: step smoothly between Mod <-> Mod+Shift <-> Mod+Alt <-> Mod+Alt+Shift.
+        applyChord(next);
+        return;
+      }
+      if (e.repeat && timer !== null) return;
+      if (timer === null) {
+        timer = window.setTimeout(() => {
+          timer = null;
+          if (!document.querySelector("[role=dialog][data-state=open]") && pendingChord) {
+            applyChord(pendingChord);
+          }
+        }, HOLD_DELAY_MS);
+      }
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
-      if (IS_MAC ? !e.metaKey || e.key === "Meta" : !e.ctrlKey || e.key === "Control") {
+      const remaining = chordFromModifierEvent(e);
+      if (!remaining || (IS_MAC ? e.key === "Meta" : e.key === "Control")) {
         cancel();
+        return;
+      }
+      pendingChord = remaining;
+      if (activeChord !== null) {
+        applyChord(remaining);
       }
     };
 
@@ -96,23 +137,31 @@ export function useModifierHoldHints(): void {
 
 export type SpatialHintCorner = "tr" | "br" | "center" | "right";
 
-/** Pure CSS-toggled floating keycap badge (`[data-shortcut-hints="true"]` reveals it with zero layout shift). */
+/** Pure CSS-toggled floating keycap badge matching `[data-shortcut-hints="<chord>"]`. */
 export function SpatialHint({
   text,
+  shortcut,
+  chord,
   corner = "tr",
   className = "",
 }: {
-  text: string;
+  text?: string;
+  shortcut?: ShortcutId;
+  chord?: ShortcutModifierChord;
   corner?: SpatialHintCorner;
   className?: string;
 }) {
-  if (!text) return null;
+  const displayText = text ?? (shortcut ? shortcutText(shortcut) : "");
+  if (!displayText) return null;
+  const def = shortcut ? SHORTCUTS.find((x) => x.id === shortcut) : undefined;
+  const resolvedChord = chord ?? (def ? chordOfKeys(def.keys) ?? inferChordFromText(displayText) : inferChordFromText(displayText));
   return createElement(
     "kbd",
     {
       className: `v3-spatial-hint pos-${corner}${className ? ` ${className}` : ""}`,
+      "data-chord": resolvedChord,
       "aria-hidden": "true",
     },
-    text,
+    displayText,
   );
 }

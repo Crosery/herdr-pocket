@@ -7,6 +7,7 @@ import {
   ChevronRight,
   Columns2,
   Copy,
+  Download,
   ExternalLink,
   File,
   FileText,
@@ -65,7 +66,8 @@ import {
 import { native } from "../lib/native";
 import { useClientConfig } from "../lib/config";
 import { openAgentFileTarget } from "../lib/openFileTarget";
-import { rpcCall, RelayError } from "../lib/relay";
+import { buildPortalP2pUrl } from "../lib/portalClient";
+import { getDirectEndpoint, rpcCall, RelayError } from "../lib/relay";
 import { allAgents, createStore, liveStore, spacedTitle } from "../lib/store";
 import { shellStore, updateResolvedFilePanePath } from "../shell/shellStore";
 import { useWindowHidden } from "../lib/layout";
@@ -597,7 +599,11 @@ export function FileViewer({
   const [fetchedSize, setFetchedSize] = useState<number | null>(null);
   const [capHtmlUrl, setCapHtmlUrl] = useState<string | null>(null);
   const [capHtmlResolvedFor, setCapHtmlResolvedFor] = useState<string | null>(null);
+  const [remoteBundledHtml, setRemoteBundledHtml] = useState<string | null>(null);
+  const [p2pStreamUrl, setP2pStreamUrl] = useState<string | null>(null);
+  const [p2pResolvedFor, setP2pResolvedFor] = useState<string | null>(null);
   const localId = useLocalHostDeviceId();
+  const directAddrForHost = liveStore.use((s) => (agent?.deviceId ? s.direct[agent.deviceId] : undefined));
   const agentRef = useRef(agent);
   agentRef.current = agent;
   const agentKey = agent?.key;
@@ -700,6 +706,64 @@ export function FileViewer({
       alive = false;
     };
   }, [agentCwd, htmlTargetKey, isHtml, isLocalOwner, localTargetPath]);
+
+  const remoteP2pKey =
+    !isLocalOwner &&
+    !streamError &&
+    agentDeviceId &&
+    agentKey &&
+    (isDirectStreamMedia || isDirectFetchBinary || isHtml) &&
+    (Boolean(directAddrForHost) || Boolean(getDirectEndpoint(agentDeviceId)))
+      ? `${agentKey}\u0000${tab.absPath || tab.path}`
+      : null;
+
+  useEffect(() => {
+    if (!remoteP2pKey || !agentDeviceId || !agentKey) {
+      setP2pStreamUrl(null);
+      setP2pResolvedFor(null);
+      return;
+    }
+    let alive = true;
+    void rpcCall(agentDeviceId, "portal.fileTicket", {
+      agent: agentKey,
+      path: tab.absPath || tab.path,
+      ...(agentCwd ? { cwd: agentCwd } : {}),
+    })
+      .then((ticket) => {
+        if (!alive) return;
+        const p2pUrl = !ticket.isDir ? buildPortalP2pUrl(agentDeviceId, ticket) : null;
+        setP2pStreamUrl(p2pUrl);
+        setP2pResolvedFor(remoteP2pKey);
+        if (ticket.size > 0) setFetchedSize((prev) => prev ?? ticket.size);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setP2pStreamUrl(null);
+        setP2pResolvedFor(remoteP2pKey);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [agentCwd, agentDeviceId, agentKey, remoteP2pKey, tab.absPath, tab.path]);
+
+  useEffect(() => {
+    setRemoteBundledHtml(null);
+    if (isLocalOwner || !isHtml || !agentDeviceId || !agentKey) return;
+    if (remoteP2pKey && (p2pResolvedFor !== remoteP2pKey || p2pStreamUrl)) return;
+    let alive = true;
+    void rpcCall(agentDeviceId, "portal.bundleHtml", {
+      agent: agentKey,
+      path: tab.absPath || tab.path,
+      ...(agentCwd ? { cwd: agentCwd } : {}),
+    })
+      .then((r) => {
+        if (alive && r?.html) setRemoteBundledHtml(r.html);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [agentCwd, agentDeviceId, agentKey, isHtml, isLocalOwner, p2pResolvedFor, p2pStreamUrl, remoteP2pKey, tab.absPath, tab.path]);
 
   const prettyJson = useMemo(() => {
     if (!isJson || !text) return null;
@@ -900,6 +964,37 @@ export function FileViewer({
           offset,
           ...(wantBytes ? { maxBytes: wantBytes } : {}),
         });
+        if (res.truncated && res.binary && offset === 0 && (res.size ?? 0) > 0 && res.size <= 32 * 1024 * 1024) {
+          // Stream large remote PDF/Office files via chunked RPC when P2P HTTP is unavailable.
+          const chunks: Uint8Array[] = [];
+          let chunkOff = 0;
+          let totalGot = 0;
+          let eof = false;
+          while (!eof && chunkOff < res.size) {
+            const c = await rpcCall(curAgent.deviceId, "files.readChunk", {
+              agent: curAgent.key,
+              path: tab.path,
+              offset: chunkOff,
+              length: 1024 * 1024,
+            });
+            if (!c.bytes) break;
+            const part = decodeBase64Fast(c.base64);
+            chunks.push(part);
+            totalGot += part.byteLength;
+            chunkOff = c.offset + c.bytes;
+            eof = c.eof;
+          }
+          if (chunks.length > 0) {
+            const merged = new Uint8Array(totalGot);
+            let pos = 0;
+            for (const ch of chunks) {
+              merged.set(ch, pos);
+              pos += ch.byteLength;
+            }
+            setFetchedSize(res.size);
+            setFetchedBytes(merged);
+          }
+        }
       }
       if (offset === 0) {
         loadedInfoRef.current = {
@@ -933,10 +1028,11 @@ export function FileViewer({
     setData(null);
     setError(null);
     setText("");
-    if (localStreamUrl && isDirectStreamMedia) return;
-    if (localStreamUrl && isDirectFetchBinary) {
+    const activeDirectUrl = localStreamUrl || p2pStreamUrl;
+    if (activeDirectUrl && isDirectStreamMedia) return;
+    if (activeDirectUrl && isDirectFetchBinary) {
       let alive = true;
-      fetch(localStreamUrl)
+      fetch(activeDirectUrl)
         .then(async (r) => {
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
           const lenHdr = r.headers.get("content-length");
@@ -960,7 +1056,7 @@ export function FileViewer({
       return;
     }
     read(0).catch((e) => setError(fileError(e)));
-  }, [agentDeviceId, agentKey, isDirectFetchBinary, isDirectStreamMedia, localStreamUrl, read, tab.absPath, tab.path]);
+  }, [agentDeviceId, agentKey, isDirectFetchBinary, isDirectStreamMedia, localStreamUrl, p2pStreamUrl, read, tab.absPath, tab.path]);
 
   useEffect(() => {
     headStateCbRef.current?.({
@@ -993,6 +1089,64 @@ export function FileViewer({
   const isRichDoc = data?.kind === "document" || isDocxExt || isDocExt || isOdtExt || isRtfExt;
   const isPresentation = data?.kind === "presentation" || isPptxExt;
 
+  const handleDownloadRemote = () => {
+    const filename = tab.title || tab.path.split("/").pop() || "download";
+    const triggerUrl = (u: string) => {
+      const a = document.createElement("a");
+      a.href = u;
+      a.download = filename;
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    };
+    if (blobUrl) {
+      triggerUrl(blobUrl);
+      return;
+    }
+    if (p2pStreamUrl) {
+      void fetch(p2pStreamUrl)
+        .then((r) => r.blob())
+        .then((b) => {
+          const obj = URL.createObjectURL(b);
+          triggerUrl(obj);
+          setTimeout(() => URL.revokeObjectURL(obj), 10_000);
+        })
+        .catch(() => triggerUrl(p2pStreamUrl));
+      return;
+    }
+    if (text || data?.text !== undefined) {
+      const obj = URL.createObjectURL(new Blob([text || data?.text || ""], { type: "text/plain;charset=utf-8" }));
+      triggerUrl(obj);
+      setTimeout(() => URL.revokeObjectURL(obj), 10_000);
+      return;
+    }
+    if (agent) {
+      void rpcCall(agent.deviceId, "portal.fileTicket", {
+        agent: agent.key,
+        path: tab.absPath || tab.path,
+        ...(agent.cwd ? { cwd: agent.cwd } : {}),
+      })
+        .then(async (ticket) => {
+          const directUrl = !ticket.isDir ? buildPortalP2pUrl(agent.deviceId, ticket) : null;
+          if (directUrl) {
+            const resp = await fetch(directUrl);
+            const blob = await resp.blob();
+            const obj = URL.createObjectURL(blob);
+            triggerUrl(obj);
+            setTimeout(() => URL.revokeObjectURL(obj), 10_000);
+            return;
+          }
+          const c = await rpcCall(agent.deviceId, "files.readChunk", { agent: agent.key, path: tab.path, offset: 0, length: 2 * 1024 * 1024 });
+          const bytes = decodeBase64Fast(c.base64);
+          const obj = URL.createObjectURL(new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], { type: c.mime }));
+          triggerUrl(obj);
+          setTimeout(() => URL.revokeObjectURL(obj), 10_000);
+        })
+        .catch((e: Error) => toast(e.message || "下载失败", true));
+    }
+  };
+
   const compactExternalAction = canRevealLocal ? (
     <>
       <PocketButton size="sm" variant="ghost" onClick={handleOpenBuiltinBrowserLocal} title="用内置浏览器打开">
@@ -1008,6 +1162,11 @@ export function FileViewer({
         <span>{platform === "macos" ? "访达" : "目录"}</span>
       </PocketButton>
     </>
+  ) : agent ? (
+    <PocketButton size="sm" variant="ghost" onClick={handleDownloadRemote} title="通过 P2P 或中继下载到本地">
+      <Download size={12} />
+      <span>下载</span>
+    </PocketButton>
   ) : !native.available() && tab.absPath ? (
     <PocketButton
       size="sm"
@@ -1035,6 +1194,11 @@ export function FileViewer({
         <span>用系统默认应用打开</span>
       </PocketButton>
     </div>
+  ) : agent ? (
+    <PocketButton size="sm" variant="soft" onClick={handleDownloadRemote}>
+      <Download size={13} />
+      <span>下载到本地</span>
+    </PocketButton>
   ) : !native.available() && tab.absPath ? (
     <PocketButton size="sm" variant="soft" onClick={() => void openExternalUrl(toFileUrl(tab.absPath!))}>
       <ExternalLink size={13} />
@@ -1042,12 +1206,18 @@ export function FileViewer({
     </PocketButton>
   ) : null;
 
+  const remoteDirectMedia = !isLocalOwner && isDirectStreamMedia ? p2pStreamUrl : null;
   const effectiveMediaSrc =
-    localStreamUrl && isDirectStreamMedia ? localStreamUrl : blobUrl;
+    (localStreamUrl || remoteDirectMedia) && isDirectStreamMedia ? (localStreamUrl || remoteDirectMedia) : blobUrl;
+  const remoteHtmlUrl = !isLocalOwner && isHtml ? p2pStreamUrl : null;
+  const activeHtmlUrl = capHtmlUrl || remoteHtmlUrl;
   const isFullFrameBody =
     !error &&
-    Boolean(data || fetchedBytes) &&
-    ((preview && isHtml && (htmlTargetKey === null || capHtmlResolvedFor === htmlTargetKey)) ||
+    Boolean(data || fetchedBytes || effectiveMediaSrc || remoteHtmlUrl) &&
+    ((preview &&
+      isHtml &&
+      (htmlTargetKey === null || capHtmlResolvedFor === htmlTargetKey) &&
+      (remoteP2pKey === null || p2pResolvedFor === remoteP2pKey)) ||
       Boolean(blobUrl && isPdf));
 
   return (
@@ -1098,6 +1268,16 @@ export function FileViewer({
                 <FolderOpen size={14} />
               </button>
             </>
+          ) : agent ? (
+            <button
+              type="button"
+              className="side-icon-btn"
+              aria-label="下载到本地"
+              title="下载到本地"
+              onClick={handleDownloadRemote}
+            >
+              <Download size={14} />
+            </button>
           ) : null}
           <button
             type="button"
@@ -1139,7 +1319,7 @@ export function FileViewer({
             onError={localStreamUrl && isDirectStreamMedia ? () => setStreamError(true) : undefined}
             actions={compactExternalAction}
           />
-        ) : !data && !fetchedBytes ? (
+        ) : !data && !fetchedBytes && !(preview && isHtml && activeHtmlUrl) ? (
           <div className="faint" style={{ padding: 16 }}>读取中…</div>
         ) : blobUrl && isPdf ? (
           <PocketPdfViewer
@@ -1196,17 +1376,23 @@ export function FileViewer({
             actions={compactExternalAction}
           />
         ) : preview && isHtml ? (
-          htmlTargetKey !== null && capHtmlResolvedFor !== htmlTargetKey ? (
+          (htmlTargetKey !== null && capHtmlResolvedFor !== htmlTargetKey) ||
+          (remoteP2pKey !== null && p2pResolvedFor !== remoteP2pKey) ? (
             <div className="faint" style={{ padding: 16 }}>读取中…</div>
-          ) : capHtmlUrl ? (
+          ) : activeHtmlUrl ? (
             <iframe
               sandbox="allow-scripts allow-same-origin"
-              src={capHtmlUrl}
+              src={activeHtmlUrl}
               className="viewer-html-frame"
               title={tab.title}
             />
           ) : (
-            <iframe sandbox="allow-scripts" srcDoc={text} className="viewer-html-frame" title={tab.title} />
+            <iframe
+              sandbox="allow-scripts"
+              srcDoc={remoteBundledHtml || text}
+              className="viewer-html-frame"
+              title={tab.title}
+            />
           )
         ) : preview && isTextTable && textTableData ? (
           <PocketDataGrid data={textTableData} actions={compactExternalAction} />

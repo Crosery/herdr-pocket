@@ -19,6 +19,7 @@ mod local_term;
 mod logging;
 mod mainwin;
 mod net;
+mod notch;
 mod perms;
 mod redact;
 mod relaylog;
@@ -586,6 +587,7 @@ pub(crate) fn prepare_relaunch(handle: &tauri::AppHandle) {
     local_term::shutdown();
     voice_ai::shutdown();
     voice::shutdown(handle);
+    notch::shutdown(handle);
     browser::on_exit(handle);
     logging::flush(Duration::from_millis(300));
 }
@@ -601,6 +603,7 @@ fn on_quit(handle: &tauri::AppHandle, via: &str) {
     local_term::shutdown();
     voice_ai::shutdown();
     voice::shutdown(handle);
+    notch::shutdown(handle);
     browser::on_exit(handle);
     relaylog::upload_blocking(handle, Duration::from_millis(1500));
     logging::flush(Duration::from_secs(1));
@@ -718,6 +721,8 @@ pub fn run() {
             commands::voice_call_dsp_close,
             commands::voice_hud_sync,
             commands::voice_hud_hide,
+            commands::notch_sync,
+            commands::notch_focus_main,
             commands::voice_ai_state,
             commands::voice_ai_set_config,
             commands::voice_ai_download,

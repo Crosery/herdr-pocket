@@ -30,11 +30,16 @@ export function releasesUrl(env: NodeJS.ProcessEnv = process.env): string {
   return (env.HERDR_RELEASES_URL || "https://releases.herdr.dev").replace(/\/+$/, "");
 }
 
+export function herdrTuiUrl(env: NodeJS.ProcessEnv = process.env): string {
+  return (env.HERDR_TUI_RELEASES_URL || "https://herdr.dev").replace(/\/+$/, "");
+}
+
 /** What is installed here; `hcGeneration` comes from the running core's `hello`. */
 export interface InstalledTools {
   hc?: string;
   hcGeneration?: number;
   app?: string;
+  herdr?: string;
   uniflo?: string;
   /** Where uniflo was found (findPrograms): launchd's PATH lacks ~/.cargo/bin. Default "uniflo". */
   unifloBin?: string;
@@ -122,6 +127,19 @@ async function appAnswer(have: InstalledTools, deps: Required<Pick<UpstreamDeps,
   }
 }
 
+async function herdrAnswer(have: InstalledTools, deps: Required<Pick<UpstreamDeps, "fetchText">>, base: string): Promise<Answer> {
+  const name = "herdr";
+  try {
+    const j = JSON.parse(await deps.fetchText(`${base}/latest.json`, UPSTREAM_REQUEST_MS));
+    const raw = typeof j?.version === "string" ? j.version : typeof j?.tag_name === "string" ? j.tag_name : undefined;
+    const v = raw ? raw.replace(/^v/i, "").trim() : undefined;
+    if (!v) return { note: `${name} ${have.herdr} (latest.json names no version)` };
+    return { latest: v, note: found(name, have.herdr!, v) };
+  } catch (e) {
+    return { note: `${name} ${have.herdr} (no answer: ${why(e)})` };
+  }
+}
+
 async function unifloAnswer(have: InstalledTools, deps: Required<Pick<UpstreamDeps, "runCheck">>): Promise<Answer & { current?: string; method?: string }> {
   const name = "uniflo";
   try {
@@ -143,17 +161,21 @@ export async function checkUpstream(have: InstalledTools, previous: UpstreamLate
   const now = deps.now ?? Date.now;
   const d = { fetchText: deps.fetchText ?? fetchText, runCheck: deps.runCheck ?? runCheck };
   const base = releasesUrl(deps.env);
+  const tuiBase = herdrTuiUrl(deps.env);
   const t0 = now();
-  const [hc, app, uniflo] = await Promise.all([
+  const [hc, app, herdr, uniflo] = await Promise.all([
     have.hc ? hcAnswer(have, d, base) : undefined,
     have.app ? appAnswer(have, d, base) : undefined,
+    have.herdr ? herdrAnswer(have, d, tuiBase) : undefined,
     have.uniflo ? unifloAnswer(have, d) : undefined,
   ]);
   const latest: UpstreamLatest = { ...previous };
-  const keys = [["hc", hc], ["app", app], ["uniflo", uniflo]] as const;
+  const keys = [["hc", hc], ["app", app], ["herdr", herdr], ["uniflo", uniflo]] as const;
   for (const [k, a] of keys) {
-    if (!a) delete latest[k]; // not installed (any more)
-    else if (a.latest) latest[k] = a.latest;
+    if (!a) {
+      if (k !== "herdr") delete latest[k]; // preserve compatibility; clear removed tools
+      else if (!have.herdr) delete latest.herdr;
+    } else if (a.latest) latest[k] = a.latest;
   }
   const asked = keys.filter(([, a]) => a).length;
   const answered = keys.filter(([, a]) => a?.latest).length;
@@ -298,6 +320,10 @@ export function upstreamLine(tools: HostTools | undefined, enabled = true): stri
     if (!latest) parts.push(`${name} ${have} (未检查)`);
     else if (compareVersions(latest, have) > 0) parts.push(`${name} ${have} → ${latest} 可更新`);
     else parts.push(`${name} ${have} (最新)`);
+  }
+  if (tools?.herdr && l.herdr) {
+    if (compareVersions(l.herdr, tools.herdr) > 0) parts.push(`herdr ${tools.herdr} → ${l.herdr} 可更新`);
+    else parts.push(`herdr ${tools.herdr} (最新)`);
   }
   return parts.join(" · ") || "未装 hc、Herdr app、uniflo";
 }

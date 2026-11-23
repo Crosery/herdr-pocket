@@ -5,9 +5,10 @@ import { Stack, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useHeaderHeight } from "expo-router/react-navigation";
 import { useQuery } from "@tanstack/react-query";
-import type { Agent } from "@herdr-pocket/protocol";
+import type { Agent, PortalItem } from "@herdr-pocket/protocol";
 import { ChatView } from "../../components/chat";
 import { Composer, InfoView, TerminalView } from "../../components/detail";
+import { MobilePortalBanner, MobilePortalModal, useAgentPortals } from "../../components/MobilePortalModal";
 import { PocketKeyboardAvoidingView } from "../../components/PocketKeyboardAvoidingView";
 import { Breadcrumb, SubagentList } from "../../components/subagents";
 import { EmptyState, HarnessAvatar, PageBackground, StatusPill } from "../../components/ui";
@@ -93,6 +94,9 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
   const [tab, setTab] = useState<Tab>(initialTab ?? (agent.isShell ? "terminal" : "chat"));
   const [chatVisited, setChatVisited] = useState(tab === "chat");
   const [termVisited, setTermVisited] = useState(tab === "terminal");
+  const { items: portalItems, refresh: refreshPortals } = useAgentPortals(agent.deviceId, agent.key);
+  const [portalOpen, setPortalOpen] = useState(false);
+  const [portalFocus, setPortalFocus] = useState<PortalItem | null>(null);
   useEffect(() => {
     if (tab === "chat") setChatVisited(true);
     else if (tab === "terminal") setTermVisited(true);
@@ -153,6 +157,14 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
           </View>
           <PocketSegmented value={tab} onChange={setTab} segments={buttons} compact={subs > 0} />
         </View>
+        <MobilePortalBanner
+          agent={agent}
+          items={portalItems}
+          onOpenModal={(item) => {
+            setPortalFocus(item ?? null);
+            setPortalOpen(true);
+          }}
+        />
         <View style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
           {chatVisited ? (
             <View style={{ flex: 1, display: tab === "chat" ? "flex" : "none" }}>
@@ -173,6 +185,14 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
           <View style={{ height: insets.bottom, flexShrink: 0 }} />
         )}
       </PocketKeyboardAvoidingView>
+      <MobilePortalModal
+        visible={portalOpen}
+        agent={agent}
+        items={portalItems}
+        initialItem={portalFocus}
+        onDismiss={() => setPortalOpen(false)}
+        onChanged={refreshPortals}
+      />
     </PageBackground>
   );
 }

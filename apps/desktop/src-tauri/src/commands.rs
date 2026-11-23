@@ -1852,6 +1852,16 @@ pub fn voice_hud_hide(app: AppHandle) {
     crate::voice::hide_call_hud(&app);
 }
 
+#[tauri::command]
+pub fn notch_sync(app: AppHandle, state: Value) {
+    crate::notch::sync(&app, state);
+}
+
+#[tauri::command]
+pub fn notch_focus_main(app: AppHandle) {
+    crate::mainwin::show_main(&app, "notch.focus");
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceCallDspInfo {

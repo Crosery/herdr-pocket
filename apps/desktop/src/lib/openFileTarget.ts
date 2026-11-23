@@ -19,7 +19,7 @@ const KNOWN_FILE_EXTS = new Set([
   "json", "jsonc", "json5", "yaml", "yml", "toml", "ini", "conf", "xml",
   "html", "htm", "css", "scss", "less", "sql", "vue", "svelte", "ets", "dart", "gradle",
   "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif", "svg",
-  "pdf", "lock", "diff", "patch",
+  "pdf", "doc", "docx", "rtf", "odt", "xls", "xlsx", "ods", "pptx", "lock", "diff", "patch",
   "ipa", "apk", "hap", "dmg", "pkg", "msi", "exe", "deb", "rpm", "appimage",
   "zip", "tar", "gz", "tgz", "xz", "zst", "7z", "rar", "wasm", "bin",
   "mp3", "wav", "m4a", "mp4", "mov", "webm",

@@ -5,7 +5,7 @@
  * (ChaCha20-Poly1305, see the protocol's DirectCipher). Whatever fails here falls back to the relay.
  */
 import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
-import { DIRECT_FROM_PHONE, DIRECT_PATH, DirectCipher, type DirectAead, type DirectOffer, type RpcError, type RpcMethod } from "@herdr-pocket/protocol";
+import { DIRECT_FROM_PHONE, DIRECT_PATH, DirectCipher, type DirectAead, type DirectOffer, type RpcError, type RpcMethod, type StreamKind } from "@herdr-pocket/protocol";
 
 const aead: DirectAead = {
   seal: (key, nonce, plain) => chacha20poly1305(key, nonce).encrypt(plain),
@@ -64,6 +64,7 @@ export class DirectLink {
   readonly to: string;
   /** The address that answered first. */
   readonly addr: string;
+  readonly port: number;
   private ws: WebSocket;
   private cipher: DirectCipher;
   private handlers: DirectHandlers;
@@ -73,9 +74,10 @@ export class DirectLink {
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
 
-  private constructor(to: string, addr: string, ws: WebSocket, cipher: DirectCipher, handlers: DirectHandlers) {
+  private constructor(to: string, addr: string, port: number, ws: WebSocket, cipher: DirectCipher, handlers: DirectHandlers) {
     this.to = to;
     this.addr = addr;
+    this.port = port;
     this.ws = ws;
     this.cipher = cipher;
     this.handlers = handlers;
@@ -145,7 +147,7 @@ export class DirectLink {
           done = true;
           clearTimeout(timer);
           for (const w of tries) if (w !== ws) w.close();
-          resolve(new DirectLink(to, addr, ws, cipher, handlers));
+          resolve(new DirectLink(to, addr, offer.port, ws, cipher, handlers));
         };
         ws.onerror = () => fail("连不上");
         ws.onclose = () => fail("连不上");
@@ -199,7 +201,7 @@ export class DirectLink {
     });
   }
 
-  subscribe(id: string, stream: "terminal" | "session", params: unknown): boolean {
+  subscribe(id: string, stream: StreamKind, params: unknown): boolean {
     return this.send({ type: "stream_subscribe", id, to: this.to, stream, params });
   }
 

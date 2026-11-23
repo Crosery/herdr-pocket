@@ -278,6 +278,107 @@ async function loadSingleFontFamily(family: string, preferBold: boolean): Promis
   return task;
 }
 
+export const DEFAULT_UI_BODY_STACK =
+  '"Nunito", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif';
+export const DEFAULT_UI_CUTE_STACK =
+  '"Pocket Digits", "ZCOOL KuaiLe", "Nunito", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif';
+
+const CANDIDATE_UI_FONTS = [
+  "PingFang SC",
+  "HarmonyOS Sans SC",
+  "MiSans",
+  "LXGW WenKai",
+  "Source Han Sans SC",
+  "Noto Sans SC",
+  "SF Pro Text",
+  "Inter",
+  "Nunito",
+  "Microsoft YaHei UI",
+  "Segoe UI",
+];
+
+let cachedUiFallbackFonts: string[] | null = null;
+
+/** Browser / HarmonyOS fallback list of installed UI fonts when native catalog is unavailable. */
+export function detectInstalledUiFonts(): string[] {
+  if (cachedUiFallbackFonts) return cachedUiFallbackFonts;
+  if (typeof document === "undefined") return [];
+  try {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return [];
+    const sample = "Herdr Pocket 简体中文 012345 ABCDE";
+    ctx.font = "48px sans-serif";
+    const baseSans = ctx.measureText(sample).width;
+    ctx.font = "48px monospace";
+    const baseMono = ctx.measureText(sample).width;
+    const found: string[] = [];
+    for (const font of CANDIDATE_UI_FONTS) {
+      const q = JSON.stringify(font);
+      ctx.font = `48px ${q}, sans-serif`;
+      const wSans = ctx.measureText(sample).width;
+      ctx.font = `48px ${q}, monospace`;
+      const wMono = ctx.measureText(sample).width;
+      if (wSans !== baseSans || wMono !== baseMono) found.push(font);
+    }
+    cachedUiFallbackFonts = found;
+    return found;
+  } catch {
+    return [];
+  }
+}
+
+/** Builds `--font-body` with user-chosen global UI fonts first, keeping CJK and system sans fallbacks. */
+export function buildUiFontFamily(customFamily: string): string {
+  const customList = splitFontFamilies(customFamily);
+  if (customList.length === 0) return DEFAULT_UI_BODY_STACK;
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const clean = raw.trim().replace(/^["']|["']$/g, "");
+    if (!clean) return;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    parts.push(quoteCssFont(clean));
+  };
+  for (const f of customList) push(f);
+  for (const f of splitFontFamilies(DEFAULT_UI_BODY_STACK)) push(f);
+  return parts.join(", ");
+}
+
+/** Builds `--font-cute`, keeping `"Pocket Digits"` numeric styling while honoring user's UI font. */
+export function buildCuteFontFamily(customFamily: string): string {
+  const customList = splitFontFamilies(customFamily);
+  if (customList.length === 0) return DEFAULT_UI_CUTE_STACK;
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const clean = raw.trim().replace(/^["']|["']$/g, "");
+    if (!clean) return;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    parts.push(quoteCssFont(clean));
+  };
+  push("Pocket Digits");
+  for (const f of customList) push(f);
+  for (const f of splitFontFamilies(DEFAULT_UI_CUTE_STACK)) push(f);
+  return parts.join(", ");
+}
+
+/** Loads user-chosen global UI font files into `document.fonts` via FontFace inside Tauri WKWebView. */
+export async function ensureUiFontLoaded(customFamily: string): Promise<boolean> {
+  if (!native.available() || typeof document === "undefined" || typeof FontFace === "undefined") {
+    return false;
+  }
+  const families = splitFontFamilies(customFamily);
+  if (families.length === 0) return false;
+  await ensureFontCatalog();
+  const results = await Promise.all(families.map((fam) => loadSingleFontFamily(fam, true)));
+  return results.some(Boolean);
+}
+
 /**
  * Loads OS font files into `document.fonts` via FontFace so WKWebView's privacy
  * font restriction does not block user-installed fonts (~/Library/Fonts/*, Nerd Fonts).

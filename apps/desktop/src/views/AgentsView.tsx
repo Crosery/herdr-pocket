@@ -6,7 +6,6 @@ import {
   Brain,
   ChevronDown,
   ChevronRight,
-  Clock,
   Cpu,
   Folder,
   FolderOpen,
@@ -17,6 +16,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  ScreenShare,
   Search,
   Send,
   Square,
@@ -64,6 +64,8 @@ import { BtwSideDrawer, executeAgentBtw, type BtwTurn } from "../components/BtwS
 import { ChatTimelineRows, CommandResultCard, InlineImageStrip, clockStr } from "../components/ChatTimeline";
 import { COMPOSER_SLASH_CHIP_PLACEHOLDER, ComposerSlashChip } from "../components/ComposerSlashChip";
 import { DropRail } from "../components/DropRail";
+import { PortalViewerModal } from "../components/PortalViewerModal";
+import { SessionPortalPiP } from "../components/SessionPortalPiP";
 import { FolderExplorerModal, normalizeFolderKey } from "../components/FolderExplorerModal";
 import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVendor";
 import { ModelSwitchDropdown, formatEffortLabel } from "../components/ModelSwitchDropdown";
@@ -117,11 +119,15 @@ import { endWorkspaceDrag, hasPaneDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDr
 import { collectDroppedFilesSafe, readOsDraggedPaths, snapshotDroppedDataTransfer, stageOsDraggedItems } from "../lib/finderDrop";
 import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import { updateAgentRoleModel, useAutoAgentModelMeta } from "../lib/modelCatalogClient";
+import { SpaceTileIcon } from "../shell/spaceIcon";
 import { openFileTab, openSubagentAside, shellStore } from "../shell/shellStore";
+import { shortcutText } from "../shell/shortcuts";
+import { SpatialHint } from "../shell/useModifierHoldHints";
 import { logAction } from "../lib/log";
 import { native } from "../lib/native";
 import { RichMarkdown, parseChoices } from "../lib/markdown";
 import { openAgentFileTarget } from "../lib/openFileTarget";
+import { ingestPortalStreamEvent } from "../lib/portalClient";
 import { pingRelay, rpcCall, subscribeStream } from "../lib/relay";
 import {
   STATUS_LABEL,
@@ -173,13 +179,6 @@ function writePref(key: string, value: unknown): void {
   } catch {
     // Private mode or storage off: the choice lasts for this session only.
   }
-}
-
-/** A stable colour slot (0-4) for a space badge. */
-function toneIndex(name: string): number {
-  let h = 0;
-  for (const ch of name) h = (h * 31 + ch.codePointAt(0)!) >>> 0;
-  return h % 5;
 }
 
 interface QuickMenuState {
@@ -709,9 +708,12 @@ export function AgentsView({
                   <div key={g.id} className="stack" style={{ gap: 6 }}>
                     <div className="space-head">
                       <button className="space-head-main" aria-expanded={!g.folded} onClick={() => !q && !statusFilter && toggleSpace(g.id)}>
-                        <span className={`space-badge tone-${toneIndex(label)}`} aria-hidden>
-                          {[...label][0]?.toUpperCase()}
-                        </span>
+                        <SpaceTileIcon
+                          spaceKey={`${dev.deviceId}\u0000${label}`}
+                          name={label}
+                          blocked={g.tally.blocked > 0}
+                          size="md"
+                        />
                         <span className="space-name truncate">{label}</span>
                         <span className="faint num">{g.list.length}</span>
                         <span className="space-dots" aria-label={`需要你 ${g.tally.blocked}，工作中 ${g.tally.working}，已完成 ${g.tally.done}`}>
@@ -1015,6 +1017,8 @@ export function AgentDetailPanel({
   const [dragOver, setDragOver] = useState(false);
   const [sending, setSending] = useState(false);
   const [killConfirmOpen, setKillConfirmOpen] = useState(false);
+  const [portalModalOpen, setPortalModalOpen] = useState(false);
+  const [activePortalId, setActivePortalId] = useState<string | null>(null);
   const [usageOpen, setUsageOpen] = useState(false);
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(null);
@@ -1365,6 +1369,8 @@ export function AgentDetailPanel({
         } else if (ev.kind === "terminal_rows") {
           lines = applyRows(lines, ev);
           setShellRaw(lines.join("\n"));
+        } else if (ev.kind === "portal_event") {
+          ingestPortalStreamEvent(ev);
         }
       },
       (st) => {
@@ -1801,7 +1807,8 @@ export function AgentDetailPanel({
     terminalQueuedItems.length,
   ]);
 
-  const onChatScroll = useCallback(() => {
+  const chatScrollRafRef = useRef<number>(0);
+  const runChatScroll = useCallback(() => {
     const el = chatScrollRef.current;
     if (!el) return;
     const top = el.scrollTop;
@@ -1824,6 +1831,23 @@ export function AgentDetailPanel({
       void loadOlderEvents();
     }
   }, [activeSub, isPlainShellChat, loadOlderError, loadOlderEvents, loadingOlder, olderCursor]);
+
+  const onChatScroll = useCallback(() => {
+    if (chatScrollRafRef.current) return;
+    chatScrollRafRef.current = requestAnimationFrame(() => {
+      chatScrollRafRef.current = 0;
+      runChatScroll();
+    });
+  }, [runChatScroll]);
+
+  useEffect(() => {
+    return () => {
+      if (chatScrollRafRef.current) {
+        cancelAnimationFrame(chatScrollRafRef.current);
+        chatScrollRafRef.current = 0;
+      }
+    };
+  }, []);
 
   const openUsageView = useCallback(() => {
     setUsageOpen(true);
@@ -2213,6 +2237,10 @@ export function AgentDetailPanel({
         case "interruptAgent":
           interruptTurn();
           break;
+        case "openPortalLauncher":
+          setActivePortalId(null);
+          setPortalModalOpen(true);
+          break;
       }
     };
     window.addEventListener("pocket:agent-action", onAgentAction);
@@ -2425,7 +2453,7 @@ export function AgentDetailPanel({
   return (
     <div
       ref={panelRef}
-      style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}
+      style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0, position: "relative" }}
       onDragEnter={onDragEnter}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
@@ -2472,7 +2500,7 @@ export function AgentDetailPanel({
                 onRefresh={refreshRootSubs}
               />
             ) : null}
-            <div className="segmented">
+            <div className="segmented has-hint" title={`切换对话 / 终端视图（${shortcutText("togglePaneMode")}）`}>
               <button className={activeMode === "chat" ? "active" : ""} onClick={() => selectMode("chat")}>对话</button>
               <button
                 className={activeMode === "term" ? "active" : ""}
@@ -2490,6 +2518,7 @@ export function AgentDetailPanel({
                   <span className="term-attn-dot" aria-hidden />
                 ) : null}
               </button>
+              <SpatialHint shortcut="togglePaneMode" corner="tr" />
             </div>
             {onOpenWorkbench && agent.cwd && !agent.isShell ? (
               <PocketIconButton size="sm" tooltip="在工作台看它的文件" onClick={() => onOpenWorkbench(agent.key)}>
@@ -2498,11 +2527,24 @@ export function AgentDetailPanel({
             ) : null}
             <PocketIconButton
               size="sm"
-              tooltip="中断当前轮"
-              onClick={interruptTurn}
+              tooltip="跨端窗口、浏览器与文件回传"
+              onClick={() => {
+                setActivePortalId(null);
+                setPortalModalOpen(true);
+              }}
             >
-              <Square size={14} />
+              <ScreenShare size={14} />
             </PocketIconButton>
+            <span className="has-hint" style={{ position: "relative", display: "inline-flex" }}>
+              <PocketIconButton
+                size="sm"
+                tooltip={`中断当前轮（${shortcutText("interruptAgent")}）`}
+                onClick={interruptTurn}
+              >
+                <Square size={14} />
+              </PocketIconButton>
+              <SpatialHint shortcut="interruptAgent" corner="tr" />
+            </span>
             <PocketIconButton
               size="sm"
               tooltip="关闭终端"
@@ -2690,26 +2732,34 @@ export function AgentDetailPanel({
             </>
           )}
 
-          {isTurnBusy ? (
-            <div className="agent-run-card" role="status" aria-live="polite">
-              <XiaoyangOrb mood="working" size={30} />
-              <div className="agent-run-body">
-                <div className="agent-run-title">
-                  <span>{activeToolLabel ? `正在执行 · ${activeToolLabel}` : "正在思考与处理"}</span>
-                  <span className="chat-typing-dots" aria-hidden>
-                    <span />
-                    <span />
-                    <span />
-                  </span>
+          {isTurnBusy ? (() => {
+            const lastFolded = foldedRows[foldedRows.length - 1];
+            const hasInlineRunning = Boolean(
+              lastFolded &&
+                ((lastFolded.kind === "activity_group" && lastFolded.running) ||
+                  (lastFolded.kind === "tool" && lastFolded.step.running)),
+            );
+            return (
+              <div className="agent-run-card" role="status" aria-live="polite">
+                <XiaoyangOrb mood="working" size={30} />
+                <div className="agent-run-body">
+                  <div className="agent-run-title">
+                    <span>{hasInlineRunning ? "正在运行" : activeToolLabel ? `正在执行 · ${activeToolLabel}` : "正在思考与处理"}</span>
+                    <span className="chat-typing-dots" aria-hidden>
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                  </div>
+                  <div className="agent-run-sub">{runElapsed}</div>
                 </div>
-                <div className="agent-run-sub">{runElapsed}</div>
+                <button type="button" className="agent-stop-pill" onClick={interruptTurn} title="中断当前轮">
+                  <Square size={10} />
+                  <span>停止</span>
+                </button>
               </div>
-              <button type="button" className="agent-stop-pill" onClick={interruptTurn} title="中断当前轮">
-                <Square size={10} />
-                <span>停止</span>
-              </button>
-            </div>
-          ) : (hasSending || reconciled.awaitingReply) && reconciled.unmatched.length === 0 ? (
+            );
+          })() : (hasSending || reconciled.awaitingReply) && reconciled.unmatched.length === 0 ? (
             <div className="agent-run-card" role="status" aria-live="polite">
               <XiaoyangOrb mood="working" size={26} />
               <div className="agent-run-body">
@@ -3107,7 +3157,7 @@ export function AgentDetailPanel({
                     ? "输入旁路问题（只读上下文，不打断当前运行）…"
                     : COMPOSER_SLASH_CHIP_PLACEHOLDER
                   : isTurnBusy
-                    ? "Enter 加入排队 · ⌘Enter 插队发送（不打断）· /btw 旁路提问"
+                    ? "发送消息（运行中将自动排队 · /btw 旁路提问）"
                     : agent.status === "blocked"
                       ? "直接输入回复或指令（Enter 立即送入终端）"
                       : agent.isShell
@@ -3151,8 +3201,8 @@ export function AgentDetailPanel({
                     type="button"
                     aria-haspopup="listbox"
                     aria-expanded={modelMenuMode === "model"}
-                    className={`composer-model-btn${modelMenuMode === "model" ? " open" : ""}`}
-                    title={(modelMeta.currentModel || agent.model) ? `当前模型：${modelMeta.currentModel || agent.model}（点击切换）` : "切换模型 (/model)"}
+                    className={`composer-model-btn has-hint${modelMenuMode === "model" ? " open" : ""}`}
+                    title={(modelMeta.currentModel || agent.model) ? `当前模型：${modelMeta.currentModel || agent.model}（点击切换 · ${shortcutText("openModelPicker")}）` : `切换模型 (/model · ${shortcutText("openModelPicker")})`}
                     onClick={() => {
                       setSlashDismissedFor(text);
                       setModelMenuOmpTab("session");
@@ -3162,6 +3212,7 @@ export function AgentDetailPanel({
                     <Cpu size={13} />
                     <span className="truncate mono">{(modelMeta.currentModel || agent.model) ? (modelMeta.currentModel || agent.model)!.split("/").pop() : "切换模型"}</span>
                     <ChevronDown size={11} />
+                    <SpatialHint shortcut="openModelPicker" corner="tr" />
                   </button>
                   {effectiveThinkingLevels.length > 0 ? (() => {
                     const displayThinking = modelMeta.currentThinking || agent.thinkingLevel;
@@ -3171,8 +3222,8 @@ export function AgentDetailPanel({
                         type="button"
                         aria-haspopup="listbox"
                         aria-expanded={modelMenuMode === "thinking"}
-                        className={`composer-model-btn${modelMenuMode === "thinking" ? " open" : ""}`}
-                        title={displayThinking ? `思考等级：${formatEffortLabel(displayThinking)}（点击切换）` : "切换思考等级"}
+                        className={`composer-model-btn has-hint${modelMenuMode === "thinking" ? " open" : ""}`}
+                        title={displayThinking ? `思考等级：${formatEffortLabel(displayThinking)}（点击切换 · ${shortcutText("openThinkingPicker")}）` : `切换思考等级（${shortcutText("openThinkingPicker")}）`}
                         onClick={() => {
                           setSlashDismissedFor(text);
                           setModelMenuMode((v) => (v === "thinking" ? null : "thinking"));
@@ -3183,6 +3234,7 @@ export function AgentDetailPanel({
                           {displayThinking ? `思考 · ${formatEffortLabel(displayThinking)}` : "思考等级"}
                         </span>
                         <ChevronDown size={11} />
+                        <SpatialHint shortcut="openThinkingPicker" corner="tr" />
                       </button>
                     );
                   })() : null}
@@ -3190,55 +3242,16 @@ export function AgentDetailPanel({
               ) : null}
             </div>
             <div className="composer-actions">
-              {isTurnBusy ? (
-                isBtwDraft ? (
-                  <PocketButton
-                    size="sm"
-                    className="composer-send"
-                    aria-label="发送旁路提问"
-                    title="旁路提问，不打断当前轮 (Enter)"
-                    disabled={!/^\/btw\s+\S/i.test(text.trim())}
-                    onClick={() => submitComposer()}
-                  >
-                    <Send size={14} />
-                  </PocketButton>
-                ) : !text.trim() && attachments.length === 0 ? (
-                  <PocketButton size="sm" variant="soft" className="composer-send" aria-label="中断当前轮" title="中断当前轮" onClick={interruptTurn}>
-                    <Square size={13} />
-                  </PocketButton>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      className="composer-steer-pill"
-                      title="不打断当前轮，直接插队发送 (⌘Enter / Alt+Enter)"
-                      onClick={() => steerComposer()}
-                    >
-                      插队
-                    </button>
-                    <PocketButton
-                      size="sm"
-                      className="composer-send"
-                      aria-label="加入排队"
-                      title="加入排队 (Enter)"
-                      onClick={() => submitComposer()}
-                    >
-                      <Clock size={14} />
-                    </PocketButton>
-                  </>
-                )
-              ) : (
-                <PocketButton
-                  size="sm"
-                  className="composer-send"
-                  aria-label="发送"
-                  title="发送 (Enter)"
-                  disabled={!text.trim() && attachments.length === 0}
-                  onClick={() => submitComposer()}
-                >
-                  <Send size={14} />
-                </PocketButton>
-              )}
+              <PocketButton
+                size="sm"
+                className="composer-send"
+                aria-label={isBtwDraft ? "发送旁路提问" : isTurnBusy ? "发送（运行中将自动排队）" : "发送"}
+                title={isBtwDraft ? "旁路提问，不打断当前轮 (Enter)" : isTurnBusy ? "发送或加入排队 (Enter)" : "发送 (Enter)"}
+                disabled={isBtwDraft ? !/^\/btw\s+\S/i.test(text.trim()) : !text.trim() && attachments.length === 0}
+                onClick={() => submitComposer()}
+              >
+                <Send size={14} />
+              </PocketButton>
             </div>
           </div>
         </div>
@@ -3285,6 +3298,24 @@ export function AgentDetailPanel({
           </PocketButton>
         </div>
       </PocketModal>
+
+      <SessionPortalPiP
+        agent={agent}
+        visible={visible}
+        onExpandPortal={(pid) => {
+          setActivePortalId(pid);
+          setPortalModalOpen(true);
+        }}
+      />
+
+      <PortalViewerModal
+        open={portalModalOpen}
+        onOpenChange={setPortalModalOpen}
+        hostId={agent.deviceId}
+        agent={agent}
+        activePortalId={activePortalId}
+        onSelectPortalId={setActivePortalId}
+      />
     </div>
   );
 }

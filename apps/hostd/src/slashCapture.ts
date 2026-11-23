@@ -1,5 +1,5 @@
 import { isCommandErrorOutput, isDismissedCommandOutput, type Agent } from "@herdr-pocket/protocol";
-import { endsInPanel } from "./hc.ts";
+import { endsInPanel, isInteractiveApprovalOrQuestion } from "./hc.ts";
 
 export type SlashTerminalClass = "viewer" | "interactive" | "normal";
 
@@ -155,12 +155,13 @@ export async function sendAndCaptureSlashCommand(
 
   let after = before;
   let last = "";
-  for (const delay of [180, 220, 260]) {
+  for (const delay of [180, 220, 300, 420, 550]) {
     await wait(delay);
     const snap = await transport.snapshotText(localId, 60).catch(() => "");
     if (snap && snap !== before) {
       after = snap;
-      if (snap === last) break;
+      const loading = /\b(?:loading|fetching|refreshing)\b|正在(?:加载|获取|拉取)/i.test(snap) && !endsInPanel(snap);
+      if (snap === last && !loading) break;
       last = snap;
     }
   }
@@ -187,7 +188,8 @@ export async function sendAndCaptureSlashCommand(
 
   let panelState: SlashCaptureResult["panelState"] = "none";
   if (isPanel) {
-    if (kind === "viewer") {
+    // Chat UI must never strand the underlying terminal in a non-input modal/picker screen.
+    if (!isInteractiveApprovalOrQuestion(after)) {
       await closeViewer();
       panelState = "closed";
     } else {

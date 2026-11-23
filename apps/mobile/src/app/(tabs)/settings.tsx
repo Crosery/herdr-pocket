@@ -10,6 +10,7 @@ import { Card, PageBackground, PageTitle, SectionHeader } from "../../components
 import { Row, RowDivider as Divider, Toggle, type RowIcon as IconName } from "../../components/rows";
 import { ConfigSnackbar } from "../../components/configParts";
 import { PocketDialog, PocketProgress, PocketSegmented, PocketSpinner } from "../../components/pocket";
+import { HostToolsSheet } from "../../components/HostToolsSheet";
 import { Bow, Mascot } from "../../components/Mascot";
 import { useLive, useSettings, type ThemeMode } from "../../lib/store";
 import { signOut } from "../../lib/session";
@@ -48,6 +49,7 @@ export default function SettingsScreen() {
   const link = useLive((x) => x.link);
   const rtt = useLive((x) => x.rttMs);
   const [confirm, setConfirm] = useState(false);
+  const [hostToolsOpen, setHostToolsOpen] = useState(false);
   const askFirst = useAssistant((x) => x.confirm);
   const assistantLoaded = useAssistant((x) => x.loaded);
   const [askError, setAskError] = useState<string | null>(null);
@@ -207,6 +209,13 @@ export default function SettingsScreen() {
           ) : (
             <Row icon="update" title="当前版本" sub={`v${currentVersion()}；iOS 版不在 App 里更新`} />
           )}
+          <Divider />
+          <Row
+            icon="laptop"
+            title="电脑端组件更新"
+            sub="查看并直接更新已连接电脑上的 hc、Herdr、uniflo 与守护进程"
+            onPress={() => setHostToolsOpen(true)}
+          />
         </Card>
 
         <View style={{ alignItems: "center", gap: 6, paddingTop: space.xxxl }}>
@@ -234,6 +243,7 @@ export default function SettingsScreen() {
       />
       {/* A save made on a config screen just closed, or another phone's change. */}
       <ConfigSnackbar message={null} onDismiss={() => undefined} />
+      <HostToolsSheet visible={hostToolsOpen} onDismiss={() => setHostToolsOpen(false)} />
     </PageBackground>
   );
 }

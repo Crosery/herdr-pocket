@@ -1,6 +1,6 @@
-import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { Suspense, lazy, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, Keyboard, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, Search, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import { AlertTriangle, Bell, Check, ChevronDown, Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, HelpCircle, Keyboard, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, ScreenShare, Search, ShieldAlert, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
@@ -14,17 +14,27 @@ import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../view
 import { assistantStore, loadAssistant } from "../lib/assistant";
 import { assetUrl, copyToClipboard, detectPlatform, isTauri } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
+import {
+  ATTENTION_CATEGORY_META,
+  attentionStore,
+  clearAllAttentionItems,
+  dismissAttentionItem,
+  jumpToAttentionAgent,
+  jumpToNextAttentionItem,
+  type AttentionCategory,
+} from "../lib/attentionCenter";
 import { createBufferedEventMerger, foldConvEvents, mergeConvEvents } from "../lib/chatFold";
 import { useClientConfig } from "../lib/config";
 import { endPaneDrag, endPanelDrag, endTabDrag, endWorkspaceDrag, hasPaneDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readPaneDrag, readPanelDrag, readTabDrag, readWorkspaceDrag, startPaneDrag, startPanelDrag, startTabDrag } from "../lib/fileDrag";
 import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import { canActOnLocalFile, isAbsoluteOrHomePath, openLocalFileDefault, openLocalFileInBuiltinBrowser, revealInFolderLabel, revealInFolderShortLabel, revealLocalFile } from "../lib/localFileActions";
 import { isMockServer } from "../lib/mock";
-import { beginSplitMotion, SPLIT_MOTION_MS } from "./splitMotion";
+import { collapsedEntryUnitRect, easeOutQuart, lerpUnitRect, SPLIT_MOTION_MS, unitRectToCss } from "./splitMotion";
+import { type CssRect, type UnitRect } from "./splitTree";
 import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
 import { pingRelay, refreshHostSpaces, rpcCall, subscribeStream } from "../lib/relay";
-import { agentSpace, agentTitle, allAgents, createStore, findAgent, liveStore, settingsStore, spacedTitle } from "../lib/store";
+import { agentSpace, agentTitle, allAgents, createStore, findAgent, liveStore, lookupAgentByKey, settingsStore, spacedTitle } from "../lib/store";
 import { dismissVoiceMessage, hangupVoiceCall, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
 import { homeFolder, listGroup } from "./agentInfo";
 import { formatHerdrTabLabel } from "./herdrDoc";
@@ -76,14 +86,14 @@ import {
   type SplitLeafNode,
   type SplitSashLayout,
 } from "./shellStore";
-import { shortcutText } from "./shortcuts";
+import { shortcutText, type ShortcutId } from "./shortcuts";
 import { SpatialHint } from "./useModifierHoldHints";
 import "../styles/btw-slash.css";
 
 const AssistantView = lazy(() => import("../views/AssistantView").then((m) => ({ default: m.AssistantView })));
 
 function useAgent(key: string | null | undefined): Agent | undefined {
-  return liveStore.use((s) => (key ? allAgents(s.agents).find((a) => a.key === key) : undefined));
+  return liveStore.use((s) => lookupAgentByKey(s.agents, key));
 }
 
 /** Closes a tab in the UI only; any web pane native views inside go with it. */
@@ -368,7 +378,7 @@ function contentTitle(content: PaneContent, agent: Agent | undefined): string {
   return content.title;
 }
 
-function TabChip({
+const TabChip = memo(function TabChip({
   tab,
   index,
   total,
@@ -407,7 +417,6 @@ function TabChip({
 }) {
   const agentsMap = liveStore.use((s) => s.agents);
   const devices = liveStore.use((s) => s.devices);
-  const all = useMemo(() => allAgents(agentsMap), [agentsMap]);
   const leaves = useMemo(() => tabLeaves(tab), [tab]);
   const primary = focusedLeafOfTab(tab);
   const primaryContent = primary.content;
@@ -417,22 +426,21 @@ function TabChip({
   );
   const leadContent = leadLeaf.content;
   const agent = useMemo(
-    () => (leadContent.kind === "agent" ? all.find((a) => a.key === leadContent.agentKey) : undefined),
-    [all, leadContent],
+    () => (leadContent.kind === "agent" ? lookupAgentByKey(agentsMap, leadContent.agentKey) : undefined),
+    [agentsMap, leadContent],
   );
   const group = useMemo(() => {
     let best: ReturnType<typeof listGroup> | null = null;
     const rank = { blocked: 4, working: 3, done: 2, idle: 1, offline: 0 };
     for (const leaf of leaves) {
       if (leaf.content.kind !== "agent") continue;
-      const ak = leaf.content.agentKey;
-      const a = all.find((x) => x.key === ak);
+      const a = lookupAgentByKey(agentsMap, leaf.content.agentKey);
       if (!a) continue;
       const g = listGroup(a, devices);
       if (!best || rank[g] > rank[best]) best = g;
     }
     return best;
-  }, [all, devices, leaves]);
+  }, [agentsMap, devices, leaves]);
   const title = contentTitle(primaryContent, agent);
   const primaryProgram = leadContent.kind === "agent"
     ? (agent ? (agent.isShell ? "Terminal" : resolveVendor(agent.harness, false).label) : "已结束的 Agent")
@@ -537,6 +545,7 @@ function TabChip({
         corner="right"
         className="v3-tab-hint"
       />
+      {active ? <SpatialHint shortcut="closeWholeTab" corner="right" /> : null}
       <button
         className="v3-tab-x"
         aria-label={`关闭 ${title}`}
@@ -550,7 +559,7 @@ function TabChip({
       </button>
     </div>
   );
-}
+});
 
 function Popup({ x, y, onClose, children, width = 220 }: { x: number; y: number; onClose: () => void; children: React.ReactNode; width?: number }) {
   useEffect(() => {
@@ -1457,6 +1466,25 @@ function PaneHead({
               {isFocused ? <SpatialHint text={shortcutText("togglePaneMode")} corner="tr" /> : null}
             </button>
           ) : null}
+          {content.kind === "agent" && agent ? (
+            <button
+              type="button"
+              className="v3-icon-btn small"
+              aria-label="跨端窗口、浏览器与文件回传"
+              title="跨端窗口、浏览器与文件回传（P2P）"
+              onClick={() => {
+                if (typeof window !== "undefined") {
+                  window.dispatchEvent(
+                    new CustomEvent("pocket:agent-action", {
+                      detail: { agentKey: agent.key, action: "openPortalLauncher" },
+                    }),
+                  );
+                }
+              }}
+            >
+              <ScreenShare size={13} />
+            </button>
+          ) : null}
           {content.kind === "agent" && agent && mode === "term" ? (
             <button
               type="button"
@@ -1508,12 +1536,13 @@ function PaneHead({
           {isSplit || isZoomed ? (
             <button
               type="button"
-              className={`v3-icon-btn small${isZoomed ? " on" : ""}`}
+              className={`v3-icon-btn small has-hint${isZoomed ? " on" : ""}`}
               aria-label={isZoomed ? "还原分屏布局" : "最大化此分屏"}
               title={`${isZoomed ? "还原分屏布局" : "最大化此分屏"}（${shortcutText("zoomPane")}）`}
               onClick={onToggleZoom}
             >
               {isZoomed ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+              {isFocused ? <SpatialHint shortcut="zoomPane" corner="tr" /> : null}
             </button>
           ) : null}
           <button
@@ -1525,6 +1554,7 @@ function PaneHead({
           >
             <X size={13} />
             {isFocused ? <SpatialHint text={shortcutText("closeTab")} corner="tr" /> : null}
+            {isFocused && isSplit ? <SpatialHint shortcut="unsplitTab" corner="tr" /> : null}
           </button>
         </div>
       </div>
@@ -1686,10 +1716,26 @@ function SplitSash({
   onDraggingChange?: (dragging: boolean) => void;
 }) {
   const dragRef = useRef<{ lastPos: number; spanPx: number } | null>(null);
+  const pendingDeltaRef = useRef(0);
+  const rafIdRef = useRef(0);
   const [dragging, setDragging] = useState(false);
+
+  const flushDragDelta = useCallback(() => {
+    rafIdRef.current = 0;
+    const d = dragRef.current;
+    const delta = pendingDeltaRef.current;
+    pendingDeltaRef.current = 0;
+    if (!d || Math.abs(delta) < 0.25) return;
+    resizeTabSplit(tabId, sash.branchId, sash.index, delta / d.spanPx);
+  }, [sash.branchId, sash.index, tabId]);
 
   useEffect(() => {
     return () => {
+      if (rafIdRef.current) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = 0;
+      }
+      pendingDeltaRef.current = 0;
       if (dragRef.current) {
         dragRef.current = null;
         onDraggingChange?.(false);
@@ -1700,6 +1746,10 @@ function SplitSash({
 
   const endDrag = () => {
     if (!dragRef.current) return;
+    if (rafIdRef.current) {
+      cancelAnimationFrame(rafIdRef.current);
+      flushDragDelta();
+    }
     dragRef.current = null;
     setDragging(false);
     onDraggingChange?.(false);
@@ -1722,6 +1772,7 @@ function SplitSash({
         const totalPx = sash.axis === "row" ? (rect?.width ?? window.innerWidth) : (rect?.height ?? window.innerHeight);
         const spanPx = Math.max(140, totalPx * Math.max(0.1, sash.branchSpanScale));
         dragRef.current = { lastPos: sash.axis === "row" ? e.clientX : e.clientY, spanPx };
+        pendingDeltaRef.current = 0;
         setDragging(true);
         onDraggingChange?.(true);
         overlayStore.set((p) => ({ open: p.open + 1 }));
@@ -1732,14 +1783,29 @@ function SplitSash({
         if (!d) return;
         const pos = sash.axis === "row" ? e.clientX : e.clientY;
         const deltaPx = pos - d.lastPos;
-        if (Math.abs(deltaPx) < 1) return;
+        if (Math.abs(deltaPx) < 0.5) return;
         d.lastPos = pos;
-        resizeTabSplit(tabId, sash.branchId, sash.index, deltaPx / d.spanPx);
+        pendingDeltaRef.current += deltaPx;
+        if (!rafIdRef.current) {
+          rafIdRef.current = requestAnimationFrame(flushDragDelta);
+        }
       }}
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
     />
   );
+}
+
+function directionalShortcutsForSibling(
+  focusedUnit: UnitRect,
+  siblingUnit: UnitRect,
+): [ShortcutId, ShortcutId] {
+  const dx = siblingUnit.x + siblingUnit.w / 2 - (focusedUnit.x + focusedUnit.w / 2);
+  const dy = siblingUnit.y + siblingUnit.h / 2 - (focusedUnit.y + focusedUnit.h / 2);
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0 ? ["focusPaneRight", "swapPaneRight"] : ["focusPaneLeft", "swapPaneLeft"];
+  }
+  return dy >= 0 ? ["focusPaneDown", "swapPaneDown"] : ["focusPaneUp", "swapPaneUp"];
 }
 
 function SplitPaneSlot({
@@ -1749,9 +1815,10 @@ function SplitPaneSlot({
   isSplit,
   isFocused,
   isZoomed,
+  focusedUnit,
   tabActive,
-  splitEnter,
   draggingPaneId,
+  slotRef,
   onDraggingPaneChange,
   onSplitNewTerminal,
 }: {
@@ -1761,9 +1828,10 @@ function SplitPaneSlot({
   isSplit: boolean;
   isFocused: boolean;
   isZoomed: boolean;
+  focusedUnit?: UnitRect | null;
   tabActive: boolean;
-  splitEnter?: "right" | "down" | "in";
   draggingPaneId: string | null;
+  slotRef?: (el: HTMLDivElement | null) => void;
   onDraggingPaneChange: (paneId: string | null) => void;
   onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
 }) {
@@ -1874,7 +1942,7 @@ function SplitPaneSlot({
         });
         if (shellStore.get().panel === "browser") showPanel(null);
       } else if (panelItem.kind === "agent") {
-        const targetAgent = allAgents(agentsMap).find((a) => a.key === panelItem.agentKey);
+        const targetAgent = lookupAgentByKey(agentsMap, panelItem.agentKey);
         splitTabPane(
           tabId,
           leaf.id,
@@ -1909,10 +1977,15 @@ function SplitPaneSlot({
     }
   };
 
+  const navPair =
+    isSplit && !isFocused && !isZoomed && focusedUnit && visible
+      ? directionalShortcutsForSibling(focusedUnit, item.unit)
+      : null;
+
   return (
     <div
+      ref={slotRef}
       className="v3-split-slot"
-      data-split-enter={splitEnter}
       style={visible ? css : { ...css, display: "none" }}
       onPointerDownCapture={() => {
         if (!isFocused) focusTabPane(tabId, leaf.id);
@@ -2017,6 +2090,12 @@ function SplitPaneSlot({
         {dropZone && draggingPaneId !== leaf.id ? (
           <div className="v3-split-drop-preview" data-zone={dropZone} aria-hidden />
         ) : null}
+        {navPair ? (
+          <>
+            <SpatialHint shortcut={navPair[0]} corner="center" className="v3-pane-nav-hint" />
+            <SpatialHint shortcut={navPair[1]} corner="center" className="v3-pane-nav-hint" />
+          </>
+        ) : null}
       </section>
     </div>
   );
@@ -2099,47 +2178,97 @@ function TabStage({
     [splitLayout.leaves],
   );
   const focusedId = focusedLeafOfTab(tab).id;
+  const focusedUnit = useMemo(
+    () => splitLayout.leaves.find((x) => x.leaf.id === focusedId)?.unit ?? null,
+    [focusedId, splitLayout.leaves],
+  );
   const isSplit = splitLayout.leaves.length > 1;
   const zoomedId = tab.split?.zoomedPaneId ?? null;
   const [sashDragging, setSashDragging] = useState(false);
-  const [splitEnters, setSplitEnters] = useState<Record<string, "right" | "down" | "in">>({});
-  const prevLeafMapRef = useRef<Map<string, { left: string; top: string }> | null>(null);
-  const splitEnterTimerRef = useRef<number | null>(null);
+  const prevUnitsRef = useRef<Map<string, UnitRect> | null>(null);
+  const prevFocusedIdRef = useRef<string | null>(null);
+  const slotElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const motionRafRef = useRef<number>(0);
 
   useLayoutEffect(() => {
-    const prev = prevLeafMapRef.current;
-    const next = new Map<string, { left: string; top: string }>();
+    const prevUnits = prevUnitsRef.current;
+    const prevFocusedId = prevFocusedIdRef.current;
+    const nextUnits = new Map<string, UnitRect>();
     for (const item of splitLayout.leaves) {
-      next.set(item.leaf.id, { left: item.css.left, top: item.css.top });
+      nextUnits.set(item.leaf.id, item.unit);
     }
-    prevLeafMapRef.current = next;
-    if (!prev || sashDragging || prev.size === next.size) return;
-    beginSplitMotion(SPLIT_MOTION_MS + 25);
-    if (next.size > prev.size) {
-      const added: Record<string, "right" | "down" | "in"> = {};
-      for (const item of splitLayout.leaves) {
-        if (prev.has(item.leaf.id)) continue;
-        added[item.leaf.id] = item.css.left !== "0%" ? "right" : item.css.top !== "0%" ? "down" : "in";
-      }
-      if (Object.keys(added).length > 0) {
-        setSplitEnters(added);
-        if (splitEnterTimerRef.current) window.clearTimeout(splitEnterTimerRef.current);
-        splitEnterTimerRef.current = window.setTimeout(() => {
-          splitEnterTimerRef.current = null;
-          setSplitEnters({});
-        }, SPLIT_MOTION_MS + 35);
-      }
-    }
-  }, [sashDragging, splitLayout.leaves]);
+    prevUnitsRef.current = nextUnits;
+    prevFocusedIdRef.current = focusedId;
 
-  useEffect(() => {
-    return () => {
-      if (splitEnterTimerRef.current) {
-        window.clearTimeout(splitEnterTimerRef.current);
-        splitEnterTimerRef.current = null;
-      }
+    if (motionRafRef.current) {
+      cancelAnimationFrame(motionRafRef.current);
+      motionRafRef.current = 0;
+    }
+    const stageEl = stageRef.current;
+    if (stageEl) delete stageEl.dataset.splitAnimating;
+
+    const reducedMotion =
+      typeof window !== "undefined" &&
+      Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+    if (!stageEl || !prevUnits || sashDragging || zoomedId || reducedMotion || prevUnits.size === nextUnits.size) {
+      return;
+    }
+
+    const prevFocusedUnit = prevFocusedId ? prevUnits.get(prevFocusedId) : undefined;
+    const tracks: Array<{ el: HTMLDivElement; from: UnitRect; to: UnitRect; finalCss: CssRect }> = [];
+    for (const item of splitLayout.leaves) {
+      if (!item.visible) continue;
+      const el = slotElsRef.current.get(item.leaf.id);
+      if (!el) continue;
+      const from = prevUnits.get(item.leaf.id) ?? collapsedEntryUnitRect(item.unit, prevFocusedUnit);
+      tracks.push({ el, from, to: item.unit, finalCss: item.css });
+    }
+    if (!tracks.length) return;
+
+    const applyRect = (el: HTMLDivElement, css: CssRect) => {
+      el.style.left = css.left;
+      el.style.top = css.top;
+      el.style.width = css.width;
+      el.style.height = css.height;
     };
-  }, []);
+
+    stageEl.dataset.splitAnimating = "true";
+    // Paint t=0 synchronously before browser composite so there is zero 1-frame snap.
+    for (const tr of tracks) {
+      applyRect(tr.el, unitRectToCss(tr.from));
+    }
+
+    const startTime = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const step = (now: number) => {
+      const elapsed = Math.max(0, now - startTime);
+      const t = Math.min(1, elapsed / SPLIT_MOTION_MS);
+      const eased = easeOutQuart(t);
+      if (t >= 1) {
+        motionRafRef.current = 0;
+        for (const tr of tracks) {
+          applyRect(tr.el, tr.finalCss);
+        }
+        delete stageEl.dataset.splitAnimating;
+        return;
+      }
+      for (const tr of tracks) {
+        applyRect(tr.el, unitRectToCss(lerpUnitRect(tr.from, tr.to, eased)));
+      }
+      motionRafRef.current = requestAnimationFrame(step);
+    };
+    motionRafRef.current = requestAnimationFrame(step);
+
+    return () => {
+      if (motionRafRef.current) {
+        cancelAnimationFrame(motionRafRef.current);
+        motionRafRef.current = 0;
+      }
+      for (const tr of tracks) {
+        applyRect(tr.el, tr.finalCss);
+      }
+      delete stageEl.dataset.splitAnimating;
+    };
+  }, [focusedId, sashDragging, splitLayout.leaves, zoomedId]);
 
   return (
     <div ref={stageRef} className="v3-split-stage" data-sash-dragging={sashDragging ? "true" : "false"}>
@@ -2152,9 +2281,13 @@ function TabStage({
           isSplit={isSplit}
           isFocused={item.leaf.id === focusedId}
           isZoomed={zoomedId === item.leaf.id}
+          focusedUnit={focusedUnit}
           tabActive={tabActive}
-          splitEnter={splitEnters[item.leaf.id]}
           draggingPaneId={draggingPaneId}
+          slotRef={(el) => {
+            if (el) slotElsRef.current.set(item.leaf.id, el);
+            else slotElsRef.current.delete(item.leaf.id);
+          }}
           onDraggingPaneChange={onDraggingPaneChange}
           onSplitNewTerminal={onSplitNewTerminal}
         />
@@ -2807,6 +2940,29 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
 
   const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const blocked = all.filter((a) => listGroup(a, devices) === "blocked").length;
+  const attentionItems = attentionStore.use((s) => s.items);
+  const [ovisOpen, setOvisOpen] = useState(false);
+  const [ovisFilter, setOvisFilter] = useState<"all" | AttentionCategory>("all");
+  const ovisAnchorRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!ovisOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (!ovisAnchorRef.current?.contains(e.target as Node | null)) setOvisOpen(false);
+    };
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOvisOpen(false);
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("keydown", onEsc, true);
+    return () => {
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("keydown", onEsc, true);
+    };
+  }, [ovisOpen]);
+  const filteredOvisItems = useMemo(
+    () => (ovisFilter === "all" ? attentionItems : attentionItems.filter((i) => i.category === ovisFilter)),
+    [attentionItems, ovisFilter],
+  );
   const [selDevice, selSpace] = selectedSpace ? (selectedSpace.split("\u0000") as [string, string]) : [null, null];
   const validSpace = Boolean(
     selectedSpace &&
@@ -2900,21 +3056,127 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
       <span className="v3-status-item">
         <span className="v3-dot dim" />
         <span className="truncate">{all.length} 个 Agent</span>
-        {blocked ? (
+        <div ref={ovisAnchorRef} className="v3-ovis-anchor">
           <button
             type="button"
-            className="v3-status-btn v3-status-need has-hint truncate"
-            title={`跳转到下一个需要你的 Agent（${shortcutText("jumpUrgent")}）`}
-            onClick={() => {
-              if (typeof window !== "undefined") {
-                window.dispatchEvent(new CustomEvent("pocket:jump-urgent"));
-              }
-            }}
+            className={`v3-status-btn has-hint truncate${attentionItems.length > 0 || blocked > 0 ? " v3-status-need" : ""}`}
+            title={`打开 Ovis 提醒队列（${shortcutText("jumpUrgent")} 跳转下一条）`}
+            onClick={() => setOvisOpen((v) => !v)}
           >
-            <span>· {blocked} 个需要你</span>
+            <Bell size={12} />
+            <span>
+              {attentionItems.length > 0
+                ? `${attentionItems.length} 条待处理`
+                : blocked > 0
+                  ? `${blocked} 个需要你`
+                  : "提醒"}
+            </span>
             <SpatialHint text={shortcutText("jumpUrgent")} corner="tr" />
           </button>
-        ) : null}
+          {ovisOpen ? (
+            <div className="v3-ovis-popover" role="dialog" aria-label="Ovis 分类提醒队列">
+              <div className="v3-ovis-head">
+                <span>Ovis 待处理队列（{attentionItems.length}）</span>
+                <button
+                  type="button"
+                  className="btw-icon-btn"
+                  aria-label="关闭提醒列表"
+                  onClick={() => setOvisOpen(false)}
+                >
+                  <X size={13} />
+                </button>
+              </div>
+              <div className="v3-ovis-filters">
+                {(
+                  [
+                    ["all", "全部"],
+                    ["approval", "审批"],
+                    ["question", "提问"],
+                    ["error", "异常"],
+                    ["completed", "完成"],
+                  ] as const
+                ).map(([cat, label]) => {
+                  const cnt = cat === "all" ? attentionItems.length : attentionItems.filter((x) => x.category === cat).length;
+                  if (cat !== "all" && cnt === 0) return null;
+                  return (
+                    <button
+                      key={cat}
+                      type="button"
+                      className={`v3-ovis-chip${ovisFilter === cat ? " active" : ""}`}
+                      onClick={() => setOvisFilter(cat)}
+                    >
+                      {label} {cnt}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="v3-ovis-list">
+                {filteredOvisItems.length === 0 ? (
+                  <div className="v3-ovis-empty">当前没有待处理的审批、提问、报错或完成提醒。</div>
+                ) : (
+                  filteredOvisItems.map((item) => (
+                    <div key={item.id} className="v3-ovis-card">
+                      <button
+                        type="button"
+                        className="v3-ovis-card-main"
+                        onClick={() => {
+                          setOvisOpen(false);
+                          jumpToAttentionAgent(item.agentKey);
+                        }}
+                      >
+                        <div className="v3-ovis-card-top">
+                          <span className={`v3-droplet-tag is-${item.category}`}>
+                            {item.category === "approval" ? (
+                              <ShieldAlert size={11} />
+                            ) : item.category === "question" ? (
+                              <HelpCircle size={11} />
+                            ) : item.category === "error" ? (
+                              <AlertTriangle size={11} />
+                            ) : (
+                              <Check size={11} />
+                            )}
+                            <span>{ATTENTION_CATEGORY_META[item.category].label}</span>
+                          </span>
+                          <span className="v3-ovis-card-title truncate">{item.title}</span>
+                        </div>
+                        <div className="v3-ovis-card-sub truncate">{item.subtitle}</div>
+                      </button>
+                      <button
+                        type="button"
+                        className="btw-icon-btn"
+                        aria-label={`忽略 ${item.title}`}
+                        onClick={() => dismissAttentionItem(item.id)}
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+              {attentionItems.length > 0 ? (
+                <div className="v3-ovis-foot">
+                  <PocketButton
+                    size="sm"
+                    variant="soft"
+                    onClick={() => {
+                      setOvisOpen(false);
+                      jumpToNextAttentionItem();
+                    }}
+                  >
+                    跳转下一条（{shortcutText("jumpUrgent")}）
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => clearAllAttentionItems()}
+                  >
+                    全部已读
+                  </PocketButton>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
       </span>
       <span className="grow" />
       <UpdateStatusSegment />

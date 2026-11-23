@@ -256,6 +256,7 @@ export class HcScreens {
       quiet = setTimeout(done, Math.max(quietMs, 600)); // first paint may take a moment
     });
     this.send(channel, CLOSE, Buffer.alloc(0));
+    this.knownBracketedPaste.set(terminal, Boolean(screen.bracketedPaste));
     return {
       ansi: screen.toAnsi(history),
       text: screen.toText(history),
@@ -325,6 +326,7 @@ export class HcScreens {
     return finish;
   }
 
+  private readonly knownBracketedPaste = new Map<string, boolean>();
   private inputs = new Map<
     string,
     { channel: Promise<number>; firstPaint: Promise<void>; bracketedPaste: boolean; automaticInput: boolean; timer?: NodeJS.Timeout }
@@ -447,6 +449,7 @@ export class HcScreens {
         }
         if (processed.outBytes.length) {
           rawEntry.bracketedPaste = scanBracketedPaste(processed.outBytes.toString("utf8"), rawEntry.bracketedPaste);
+          this.knownBracketedPaste.set(terminal, rawEntry.bracketedPaste);
           pending.push(processed.outBytes);
           pendingBytes += processed.outBytes.length;
         }
@@ -557,7 +560,7 @@ export class HcScreens {
     } = {
       channel: Promise.resolve(0),
       firstPaint,
-      bracketedPaste: false,
+      bracketedPaste: this.knownBracketedPaste.get(terminal) ?? false,
       automaticInput: false,
     };
 
@@ -568,6 +571,7 @@ export class HcScreens {
         if (kind === DATA) {
           if (payload.length) {
             entry.bracketedPaste = scanBracketedPaste(payload.toString("utf8"), entry.bracketedPaste);
+            this.knownBracketedPaste.set(terminal, entry.bracketedPaste);
           }
           donePaint();
           return;
@@ -626,7 +630,11 @@ export class HcScreens {
       bracketedPaste = sharedEntry.bracketedPaste;
     }
 
-    const clean = text.replace(/\x1b\[20[01]~/g, "");
+    // Strip bracketed-paste spoofing tokens and raw C0 control bytes (Esc, Ctrl+O, etc.)
+    // while keeping tabs and newlines intact so Chat UI pastes can never switch TUI modes.
+    const clean = text
+      .replace(/\x1b\[20[01]~/g, "")
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
     if (clean.length > 0) {
       const payload = bracketedPaste
         ? `\x1b[200~${clean.replace(/\r?\n/g, "\r")}\x1b[201~`

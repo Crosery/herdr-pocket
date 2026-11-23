@@ -560,6 +560,9 @@ mod ort {
 
     impl SharedLib {
         fn open(path: &Path) -> Result<Self, String> {
+            verify_downloaded_ort_before_open(path)?;
+            #[cfg(target_os = "macos")]
+            strip_macos_quarantine(path);
             #[cfg(unix)]
             {
                 use std::os::unix::ffi::OsStrExt;
@@ -573,6 +576,14 @@ mod ort {
                     } else {
                         unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned()
                     };
+                    logging::warn(
+                        "voice.ai",
+                        "dlopen onnxruntime failed",
+                        serde_json::json!({ "path": path.display().to_string(), "error": msg }),
+                    );
+                    if msg.contains("different Team IDs") || msg.contains("not valid for use in process") {
+                        return Err("当前桌面端安装包签名授权未放行外置 ONNX 运行库（Team ID 受限），请升级至最新正式版桌面端后重试".into());
+                    }
                     return Err(format!("加载 ONNX Runtime 失败 ({}): {msg}", path.display()));
                 }
                 Ok(Self { handle: h })
@@ -3421,7 +3432,66 @@ where
     Err(last_err)
 }
 
+const ORT_SHA_SIDECAR: &str = ".libonnxruntime.sha256";
+
+fn file_sha256_hex(path: &Path) -> Result<String, String> {
+    let mut f = File::open(path).map_err(|e| format!("读取运行库失败：{e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| format!("校验运行库失败：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+#[cfg(target_os = "macos")]
+fn strip_macos_quarantine(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    if let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) {
+        unsafe {
+            libc::removexattr(cpath.as_ptr(), c"com.apple.quarantine".as_ptr(), 0);
+        }
+    }
+}
+
+fn verify_downloaded_ort_at(dir: &Path, path: &Path) -> Result<(), String> {
+    if path.parent() != Some(dir) {
+        return Ok(());
+    }
+    let sidecar = dir.join(ORT_SHA_SIDECAR);
+    if !sidecar.is_file() {
+        return Ok(());
+    }
+    let expected = fs::read_to_string(&sidecar)
+        .map_err(|e| format!("读取 ONNX Runtime 校验文件失败：{e}"))?;
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("ONNX Runtime 校验摘要格式无效，请重新下载语音模型".into());
+    }
+    let actual = file_sha256_hex(path)?;
+    if actual != expected {
+        return Err("ONNX Runtime 动态库完整性校验未通过，请重新下载语音模型".into());
+    }
+    Ok(())
+}
+
+fn verify_downloaded_ort_before_open(path: &Path) -> Result<(), String> {
+    let Some(dir) = models_dir() else {
+        return Ok(());
+    };
+    verify_downloaded_ort_at(&dir, path)
+}
+
 fn extract_ort_from_wheel(whl_path: &Path, dir: &Path, spec: &OrtWheelSpec) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
     let tmp_dir = dir.join(".ort-extract");
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建解压目录失败：{e}"))?;
@@ -3465,6 +3535,11 @@ fn extract_ort_from_wheel(whl_path: &Path, dir: &Path, spec: &OrtWheelSpec) -> R
     let dst_main = dir.join(spec.target_name);
     let _ = fs::remove_file(&dst_main);
     fs::rename(&extracted_main, &dst_main).map_err(|e| format!("移动运行库失败：{e}"))?;
+    #[cfg(target_os = "macos")]
+    strip_macos_quarantine(&dst_main);
+    let sha = file_sha256_hex(&dst_main)?;
+    config::write_atomic(&dir.join(ORT_SHA_SIDECAR), format!("{sha}\n").as_bytes())
+        .map_err(|e| format!("写入运行库校验摘要失败：{e}"))?;
 
     if let Some(extra) = spec.inner_extra {
         let extracted_extra = tmp_dir.join(extra);
@@ -3473,6 +3548,8 @@ fn extract_ort_from_wheel(whl_path: &Path, dir: &Path, spec: &OrtWheelSpec) -> R
                 let dst_extra = dir.join(fname);
                 let _ = fs::remove_file(&dst_extra);
                 let _ = fs::rename(&extracted_extra, &dst_extra);
+                #[cfg(target_os = "macos")]
+                strip_macos_quarantine(&dst_extra);
             }
         }
     }
@@ -6319,5 +6396,25 @@ mod tests {
         assert!(!active2);
         assert!(proc_opt2.is_none());
         assert_eq!(badge2, None);
+    }
+
+    #[test]
+    fn entitlements_allow_verified_external_onnxruntime_and_sidecar_check_blocks_tampering() {
+        let plist = include_str!("../entitlements.plist");
+        assert!(plist.contains("com.apple.security.cs.disable-library-validation"));
+        assert!(plist.contains("<true/>"));
+
+        let tmp = std::env::temp_dir().join(format!("hp-ort-check-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let lib = tmp.join("libonnxruntime.dylib");
+        fs::write(&lib, b"valid-ort-binary").unwrap();
+        let sha = file_sha256_hex(&lib).unwrap();
+        fs::write(tmp.join(ORT_SHA_SIDECAR), format!("{sha}\n")).unwrap();
+        assert!(verify_downloaded_ort_at(&tmp, &lib).is_ok());
+
+        fs::write(&lib, b"tampered-ort-binary").unwrap();
+        assert!(verify_downloaded_ort_at(&tmp, &lib).is_err());
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

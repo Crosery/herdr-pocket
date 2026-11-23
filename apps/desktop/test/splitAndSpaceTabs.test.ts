@@ -366,6 +366,10 @@ test("canActOnLocalFile handles local agents/missing localHostId and Finder labe
   );
   assert.equal(
     canActOnLocalFile({ nativeAvailable: true, agentDeviceId: "h1", localHostId: null, path: "demo.html", absPath: "/tmp/demo.html" }),
+    false,
+  );
+  assert.equal(
+    canActOnLocalFile({ nativeAvailable: true, agentDeviceId: "h1", localHostId: "h1", path: "demo.html", absPath: "/tmp/demo.html" }),
     true,
   );
   assert.equal(
@@ -742,7 +746,7 @@ test("markdown viewer scales fluidly across ultrawide/narrow viewports and suppo
   const shellCss = readFileSync(resolve(testDir, "../src/styles/shell.css"), "utf8");
   assert.equal(shellCss.includes("@container (max-width: 680px)"), true);
   assert.equal(shellCss.includes(".v3-tab-layer.is-hidden"), true);
-  assert.equal(shellCss.includes("v3SplitEnterRight"), true);
+  assert.equal(shellCss.includes('data-split-animating="true"'), true);
 
   const mdSrc = readFileSync(resolve(testDir, "../src/lib/markdown.tsx"), "utf8");
   assert.equal(mdSrc.includes("md-alert-${kind}"), true);

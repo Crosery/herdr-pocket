@@ -164,7 +164,7 @@ pub fn apply_theme(app: &AppHandle) {
         "dark" => Some(Theme::Dark),
         _ => None,
     };
-    for label in ["main", "voice-hud"] {
+    for label in ["main", "voice-hud", "notch-hud"] {
         if let Some(w) = app.get_window(label) {
             let _ = w.set_theme(theme);
         }
@@ -211,6 +211,69 @@ fn set_main_inactive_policy(
 }
 
 #[cfg(target_os = "macos")]
+pub fn apply_frame_rate_policy(app: &AppHandle) {
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{msg_send, sel, ClassType};
+    use objc2_foundation::{NSArray, NSObjectProtocol, NSProcessInfo, NSString};
+
+    let is_low_power = match config::native().low_power.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => NSProcessInfo::processInfo().isLowPowerModeEnabled(),
+    };
+    let Some(webview) = app.get_webview("main") else {
+        return;
+    };
+    let _ = webview.with_webview(move |pw| {
+        let p = pw.inner();
+        if p.is_null() {
+            return;
+        }
+        // SAFETY: wry's WKWebView on the main thread (with_webview dispatches there).
+        let wk = unsafe { &*(p as *const objc2_web_kit::WKWebView) };
+        let prefs = unsafe { wk.configuration().preferences() };
+        let prefs_cls = objc2_web_kit::WKPreferences::class();
+        let has_features: Bool =
+            unsafe { msg_send![prefs_cls, respondsToSelector: sel!(_features)] };
+        if !has_features.as_bool() {
+            return;
+        }
+        let features: Option<objc2::rc::Retained<NSArray<AnyObject>>> =
+            unsafe { msg_send![prefs_cls, _features] };
+        let Some(features) = features else {
+            return;
+        };
+        if !prefs.respondsToSelector(sel!(_setEnabled:forFeature:)) {
+            return;
+        }
+        let target_key = "PreferPageRenderingUpdatesNear60FPSEnabled";
+        let mut applied = false;
+        for feat in features.iter() {
+            let has_key: Bool = unsafe { msg_send![&*feat, respondsToSelector: sel!(key)] };
+            if !has_key.as_bool() {
+                continue;
+            }
+            let key: Option<objc2::rc::Retained<NSString>> = unsafe { msg_send![&*feat, key] };
+            if key.as_ref().is_some_and(|k| k.to_string() == target_key) {
+                let enable_60 = Bool::new(is_low_power);
+                let _: () = unsafe { msg_send![&*prefs, _setEnabled: enable_60, forFeature: &*feat] };
+                applied = true;
+                break;
+            }
+        }
+        logging::info(
+            "app.window",
+            "frame rate policy set",
+            json!({
+                "lowPower": is_low_power,
+                "capNear60Fps": applied && is_low_power,
+                "featureFound": applied
+            }),
+        );
+    });
+}
+
+#[cfg(target_os = "macos")]
 fn keep_page_running_when_hidden(app: &AppHandle) {
     set_main_inactive_policy(
         app,
@@ -245,7 +308,10 @@ pub fn set_voice_call_active(app: &AppHandle, active: bool) {
 pub fn init(app: &AppHandle) {
     let _ = app_cell().set(app.clone());
     #[cfg(target_os = "macos")]
-    keep_page_running_when_hidden(app);
+    {
+        keep_page_running_when_hidden(app);
+        apply_frame_rate_policy(app);
+    }
     fit_on_start(app);
     apply_theme(app);
     sync_tray(app);
@@ -326,6 +392,8 @@ fn watch_occlusion(app: &AppHandle) {
 /// config.json changed.
 pub fn config_changed(app: &AppHandle) {
     apply_theme(app);
+    #[cfg(target_os = "macos")]
+    apply_frame_rate_policy(app);
     sync_tray(app);
     sync_autostart(app);
 }

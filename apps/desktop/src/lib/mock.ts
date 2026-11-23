@@ -17,14 +17,28 @@ import {
   type ConvEvent,
   type Device,
   type DeviceKind,
+  type FileEntry,
   type HerdrDoc,
+  type HostPortalCapabilities,
+  type HostToolId,
+  type HostTools,
   type PairCode,
   type PairResponse,
+  type PortalFileTicket,
+  type PortalFramePayload,
+  type PortalInputAction,
+  type PortalItem,
+  type PortalKind,
+  type PortalStreamEvent,
   type PromptId,
   type PromptView,
   type ProviderPatch,
+  type RemoteWindowInfo,
   type RpcMethod,
+  type StreamKind,
   type SubSession,
+  type ToolUpdateItemResult,
+  type ToolUpdateJobSnapshot,
 } from "@herdr-pocket/protocol";
 import { liveStore } from "./store";
 
@@ -541,6 +555,277 @@ function demoSpacesForHost(hostId: string) {
   }));
 }
 
+const DEMO_HOST_TOOLS_STATE: Record<string, HostTools> = {
+  "dev-mac": {
+    app: "0.9.4",
+    herdr: "0.6.2",
+    hc: "0.6.2",
+    uniflo: "1.3.0",
+    latest: {
+      app: "0.9.5",
+      herdr: "0.6.3",
+      hc: "0.7.0",
+      uniflo: "1.3.0",
+      hostd: "0.2.25",
+      checkedAt: now - 3 * 60 * min,
+    },
+  },
+  "dev-linux": {
+    hc: "0.7.0",
+    uniflo: "1.2.1",
+    latest: {
+      hc: "0.7.0",
+      uniflo: "1.3.0",
+      hostd: "0.2.25",
+      checkedAt: now - 15 * min,
+    },
+  },
+};
+
+function demoEnsureHostTools(hostId: string): HostTools {
+  const existing = DEMO_HOST_TOOLS_STATE[hostId];
+  if (existing) {
+    return { ...existing, latest: existing.latest ? { ...existing.latest } : undefined };
+  }
+  const created: HostTools = {
+    hc: "0.7.0",
+    uniflo: "1.3.0",
+    latest: { hc: "0.7.0", uniflo: "1.3.0", checkedAt: Date.now() },
+  };
+  DEMO_HOST_TOOLS_STATE[hostId] = created;
+  return { ...created, latest: { ...created.latest } };
+}
+
+const demoToolJobs: Record<string, ToolUpdateJobSnapshot> = {};
+let demoPortalSeq = 10;
+let demoFrameSeq = 1;
+
+function demoCapabilities(hostId: string): HostPortalCapabilities {
+  if (hostId === "dev-linux") {
+    return {
+      platform: "linux",
+      sessionType: "wayland-wlroots",
+      desktopEnv: "Hyprland",
+      canListWindows: true,
+      canCaptureWindow: true,
+      canCaptureScreen: true,
+      canInjectInput: true,
+      hasCdpBrowser: true,
+      directPort: null,
+    };
+  }
+  return {
+    platform: "darwin",
+    sessionType: "macos",
+    desktopEnv: "Aqua",
+    canListWindows: true,
+    canCaptureWindow: true,
+    canCaptureScreen: true,
+    canInjectInput: true,
+    hasCdpBrowser: true,
+    directPort: null,
+  };
+}
+
+function demoWindowsForHost(hostId: string): RemoteWindowInfo[] {
+  if (hostId === "dev-linux") {
+    return [
+      { id: "screen:0", appName: "Hyprland Display", title: "主显示器 2560x1440", bounds: { x: 0, y: 0, width: 2560, height: 1440 }, isScreen: true },
+      { id: "win:chromium-1", appName: "Chromium", title: "OAuth Authorization - Chromium", bounds: { x: 80, y: 60, width: 1180, height: 820 }, pid: 2410 },
+      { id: "win:dolphin-1", appName: "Dolphin", title: "sample-cli / dist", bounds: { x: 180, y: 120, width: 920, height: 640 }, pid: 2480 },
+    ];
+  }
+  return [
+    { id: "screen:0", appName: "macOS Display", title: "内建视网膜显示器", bounds: { x: 0, y: 0, width: 1728, height: 1117 }, isScreen: true },
+    { id: "win:chrome-1", appName: "Google Chrome", title: "GitHub OAuth 登录授权", bounds: { x: 120, y: 90, width: 1140, height: 780 }, pid: 4120 },
+    { id: "win:finder-1", appName: "Finder", title: "docs — external-delivery-sequence.html", bounds: { x: 220, y: 140, width: 880, height: 560 }, pid: 418 },
+  ];
+}
+
+const demoPortals: PortalItem[] = [
+  {
+    id: "ptl-demo-oauth",
+    hostId: "dev-mac",
+    agentKey: "dev-mac/hc:t2",
+    terminalId: "t2",
+    kind: "browser",
+    title: "GitHub OAuth 登录授权 · 127.0.0.1:8787",
+    subtitle: "http://127.0.0.1:8787/oauth/callback?provider=github",
+    url: "http://127.0.0.1:8787/oauth/callback?provider=github",
+    canInteract: true,
+    transportHint: "p2p",
+    width: 960,
+    height: 600,
+    createdAt: now - 2 * min,
+    updatedAt: now - 10_000,
+  },
+  {
+    id: "ptl-demo-reveal",
+    hostId: "dev-mac",
+    agentKey: "dev-mac/hc:t1",
+    terminalId: "t1",
+    kind: "reveal",
+    title: "external-delivery-sequence.html",
+    subtitle: "定位文件：external-delivery-sequence.html",
+    targetPath: "docs/external-delivery-sequence.html",
+    parentDir: "docs",
+    highlightName: "external-delivery-sequence.html",
+    mime: "text/html",
+    size: 280,
+    canInteract: false,
+    transportHint: "p2p",
+    createdAt: now - 3 * min,
+    updatedAt: now - 20_000,
+  },
+];
+
+// Minimal 1x1 PNG fallback for Node unit tests when canvas is unavailable.
+const FALLBACK_PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+function renderDemoFramePngBase64(item: PortalItem): { data: string; width: number; height: number } {
+  if (typeof document === "undefined") {
+    return { data: FALLBACK_PNG_B64, width: 960, height: 600 };
+  }
+  try {
+    const w = 960;
+    const h = 600;
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return { data: FALLBACK_PNG_B64, width: w, height: h };
+
+    ctx.fillStyle = "#fff9fb";
+    ctx.fillRect(0, 0, w, h);
+
+    // Window header chrome
+    ctx.fillStyle = "#fce7f3";
+    ctx.fillRect(0, 0, w, 52);
+    ctx.fillStyle = "#f472b6";
+    ctx.beginPath();
+    ctx.arc(28, 26, 7, 0, Math.PI * 2);
+    ctx.arc(52, 26, 7, 0, Math.PI * 2);
+    ctx.arc(76, 26, 7, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#831843";
+    ctx.font = "600 18px sans-serif";
+    ctx.fillText(item.title || "Remote Return Channel", 110, 32);
+
+    // URL / subtitle bar
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(48, 86, w - 96, 46);
+    ctx.strokeStyle = "#f9a8d4";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(48, 86, w - 96, 46);
+    ctx.fillStyle = "#6b7280";
+    ctx.font = "15px monospace";
+    ctx.fillText((item.url || item.targetPath || "p2p://remote-surface").slice(0, 72), 68, 114);
+
+    // Center card
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(140, 175, w - 280, 300);
+    ctx.strokeStyle = "#fbcfe8";
+    ctx.strokeRect(140, 175, w - 280, 300);
+
+    ctx.fillStyle = "#9d174d";
+    ctx.font = "700 24px sans-serif";
+    ctx.fillText(item.kind === "browser" ? "Remote OAuth / Browser Session" : "Remote OS Window Capture", 220, 250);
+
+    ctx.fillStyle = "#4b5563";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("Transport: P2P Direct Link · Interactive Pointer & Keyboard Enabled", 220, 298);
+
+    ctx.fillStyle = "#ec4899";
+    ctx.fillRect(220, 348, 220, 48);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "600 16px sans-serif";
+    ctx.fillText("Continue / Authorize", 252, 378);
+
+    const url = canvas.toDataURL("image/png");
+    const b64 = url.split(",")[1];
+    if (b64) return { data: b64, width: w, height: h };
+  } catch {
+    // fallback below
+  }
+  return { data: FALLBACK_PNG_B64, width: 960, height: 600 };
+}
+
+type MockPortalWatcher = {
+  to: string;
+  agent?: string;
+  portalId?: string;
+  onEvent: (ev: PortalStreamEvent) => void;
+};
+const demoPortalWatchers = new Set<MockPortalWatcher>();
+
+function emitMockPortalEvent(action: "opened" | "updated" | "closed", item: PortalItem): void {
+  const ev: PortalStreamEvent = { kind: "portal_event", action, item, at: Date.now() };
+  for (const w of demoPortalWatchers) {
+    if (w.to !== item.hostId) continue;
+    if (w.agent && item.agentKey && w.agent !== item.agentKey) continue;
+    if (w.portalId && w.portalId !== item.id) continue;
+    w.onEvent(ev);
+  }
+}
+
+function demoPortalDirList(rawPath: string, highlightName?: string): {
+  dirPath: string;
+  parentDir: string | null;
+  highlightName?: string;
+  entries: FileEntry[];
+  truncated: boolean;
+} {
+  let clean = rawPath.replace(/\\/g, "/").trim();
+  clean = clean.replace(/^~\/work\/demo-app\/?/, "").replace(/^\/+|\/+$/g, "");
+  if (clean === "~" || clean === "~/work" || clean === "~/work/demo-app") clean = "";
+  const hitFile = DEMO_FILES.find((f) => {
+    const fp = f.dir ? `${f.dir}/${f.name}` : f.name;
+    return fp === clean && f.kind === "file";
+  });
+  let derivedHighlight = highlightName;
+  if (hitFile) {
+    derivedHighlight = hitFile.name;
+    clean = hitFile.dir;
+  }
+  const entries: FileEntry[] = DEMO_FILES.filter((f) => f.dir === clean && !f.ignored && !f.private)
+    .sort((a, b) => Number(b.kind === "dir") - Number(a.kind === "dir") || a.name.localeCompare(b.name))
+    .map(({ dir: _d, body: _b, ...e }) => ({
+      ...e,
+      path: clean ? `${clean}/${e.name}` : e.name,
+      mtime: now - 30 * min,
+    }));
+  const slash = clean.lastIndexOf("/");
+  const parentDir = !clean ? null : slash > 0 ? clean.slice(0, slash) : "";
+  return {
+    dirPath: clean || "~/work/demo-app",
+    parentDir,
+    ...(derivedHighlight ? { highlightName: derivedHighlight } : {}),
+    entries,
+    truncated: false,
+  };
+}
+
+function demoFindFile(reqPath: string) {
+  const fullPath = (f: (typeof DEMO_FILES)[number]) => (f.dir ? `${f.dir}/${f.name}` : f.name);
+  const req = reqPath.replace(/\\/g, "/").replace(/^~\/work\/demo-app\/?/, "").replace(/^\.\//, "").replace(/^\/+/, "");
+  let hit = DEMO_FILES.find((f) => fullPath(f) === req);
+  if (!hit && req && !/^(\/|~\/|\.\.\/)/.test(req)) {
+    const suffix = `/${req}`;
+    hit = DEMO_FILES.find(
+      (f) => f.kind === "file" && !f.ignored && !f.private && (fullPath(f) === req || fullPath(f).endsWith(suffix)),
+    );
+  }
+  return hit;
+}
+
+function demoBytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]!);
+  return btoa(bin);
+}
+
 export const mockApi = {
   pair(_code: string, name: string, platform: string): PairResponse {
     const me: Device = { id: "dev-viewer", name, kind: "viewer", platform, online: true, createdAt: Date.now(), lastSeenAt: Date.now() };
@@ -568,12 +853,16 @@ export const mockApi = {
   async call(to: string, method: RpcMethod, params: any): Promise<any> {
     if (method === "host.info") {
       const d = DEMO_DEVICES.find((x) => x.id === to);
-      // One computer with a checked, partly outdated set and one that has not checked yet.
-      const tools =
-        to === "dev-mac"
-          ? { app: "0.9.4", herdr: "0.6.2", hc: "0.6.2", uniflo: "1.3.0", latest: { app: "0.9.4", hc: "0.7.0", uniflo: "1.3.0", checkedAt: Date.now() - 3 * 60 * min } }
-          : { hc: "0.7.0", uniflo: "1.2.1" };
-      return { name: d?.name ?? "demo", platform: d?.platform ?? "darwin", sources: ["hc", "uniflo"], version: d?.version ?? "0.2.0", tools, files: true };
+      const tools = demoEnsureHostTools(to);
+      return {
+        name: d?.name ?? "demo",
+        platform: d?.platform ?? "darwin",
+        sources: ["hc", "uniflo"],
+        version: d?.version ?? "0.2.25",
+        tools,
+        files: true,
+        portal: demoCapabilities(to),
+      };
     }
     if (method === "terminal.read") {
       const lines = DEMO_TERMINALS[params.agent] ?? ["(demo terminal)"];
@@ -1175,7 +1464,272 @@ export const mockApi = {
       if (changed) mockApi.connect();
       return { ok: true };
     }
+    if (method === "tools.check") {
+      const tools = DEMO_HOST_TOOLS_STATE[to] ?? demoEnsureHostTools(to);
+      tools.latest = {
+        ...(tools.latest ?? {}),
+        ...(tools.hc ? { hc: tools.latest?.hc ?? tools.hc } : {}),
+        ...(tools.herdr ? { herdr: tools.latest?.herdr ?? tools.herdr } : {}),
+        ...(tools.app ? { app: tools.latest?.app ?? tools.app } : {}),
+        ...(tools.uniflo ? { uniflo: tools.latest?.uniflo ?? tools.uniflo } : {}),
+        hostd: "0.2.25",
+        checkedAt: Date.now(),
+      };
+      DEMO_HOST_TOOLS_STATE[to] = tools;
+      return { tools: demoEnsureHostTools(to), hostVersion: "0.2.25" };
+    }
+    if (method === "tools.update") {
+      const tools = DEMO_HOST_TOOLS_STATE[to] ?? demoEnsureHostTools(to);
+      const validIds: HostToolId[] = ["hc", "herdr", "app", "uniflo", "hostd"];
+      const reqTargets: HostToolId[] =
+        Array.isArray(params?.targets) && params.targets.length > 0
+          ? params.targets.filter((x: unknown): x is HostToolId => validIds.includes(x as HostToolId))
+          : (validIds.filter((id) => id !== "hostd" && Boolean(tools[id])) as HostToolId[]);
+      const startedAt = Date.now();
+      const completed: ToolUpdateItemResult[] = reqTargets.map((id) => {
+        if (id === "hostd") {
+          return {
+            id,
+            ok: true,
+            status: "up_to_date",
+            fromVersion: "0.2.25",
+            toVersion: "0.2.25",
+            message: "Pocket 守护进程已是最新 0.2.25",
+          };
+        }
+        const cur = tools[id];
+        const next = tools.latest?.[id] ?? cur;
+        if (cur && next && cur !== next) {
+          tools[id] = next;
+          return {
+            id,
+            ok: true,
+            status: "updated",
+            fromVersion: cur,
+            toVersion: next,
+            message: `已更新到 ${next}`,
+          };
+        }
+        return {
+          id,
+          ok: true,
+          status: "up_to_date",
+          fromVersion: cur,
+          toVersion: next ?? cur,
+          message: `${id} 已是最新版本`,
+        };
+      });
+      const snap: ToolUpdateJobSnapshot = {
+        jobId: `tu-demo-${Date.now().toString(36)}`,
+        running: false,
+        targets: reqTargets,
+        completed,
+        tools: demoEnsureHostTools(to),
+        hostVersion: "0.2.25",
+        startedAt,
+        finishedAt: Date.now(),
+      };
+      demoToolJobs[to] = snap;
+      return snap;
+    }
+    if (method === "tools.updateStatus") {
+      return demoToolJobs[to] ?? null;
+    }
+    if (method === "files.readChunk") {
+      const hit = demoFindFile(String(params?.path ?? ""));
+      if (!hit || hit.kind !== "file") throw new Error("没有这个文件");
+      if (hit.private) throw new Error("禁止读取可能包含密钥的私有文件");
+      const text = hit.body ?? "";
+      const encoded = new TextEncoder().encode(text);
+      const offset = Math.max(0, Math.min(encoded.length, Number(params?.offset ?? 0) || 0));
+      const length = Math.max(1, Number(params?.length ?? 65536) || 65536);
+      const slice = encoded.subarray(offset, Math.min(encoded.length, offset + length));
+      const fullPath = hit.dir ? `${hit.dir}/${hit.name}` : hit.name;
+      return {
+        path: fullPath,
+        size: encoded.length,
+        mtime: now - 30 * min,
+        offset,
+        bytes: slice.length,
+        eof: offset + slice.length >= encoded.length,
+        mime: hit.name.endsWith(".svg") ? "image/svg+xml" : hit.name.endsWith(".html") ? "text/html; charset=utf-8" : "text/plain; charset=utf-8",
+        base64: demoBytesToBase64(slice),
+      };
+    }
+    if (method === "portal.list") {
+      const agentFilter = typeof params?.agent === "string" ? params.agent : undefined;
+      const items = demoPortals
+        .filter((p) => p.hostId === to && (!agentFilter || !p.agentKey || p.agentKey === agentFilter))
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+      return {
+        items,
+        ...(params?.includeWindows ? { windows: demoWindowsForHost(to) } : {}),
+        capabilities: demoCapabilities(to),
+      };
+    }
+    if (method === "portal.open") {
+      const kind = (params?.kind as PortalKind) || "browser";
+      const target = typeof params?.target === "string" ? params.target.trim() : undefined;
+      const url = typeof params?.url === "string" ? params.url.trim() : kind === "browser" ? target || "http://127.0.0.1:8787/auth" : undefined;
+      const windowId = kind === "window" ? String(params?.windowId || "screen:0") : undefined;
+      const id = `ptl-demo-${++demoPortalSeq}`;
+      const hitFile = target ? demoFindFile(target) : undefined;
+      const resolvedPath = hitFile ? (hitFile.dir ? `${hitFile.dir}/${hitFile.name}` : hitFile.name) : target;
+      const ts = Date.now();
+      const item: PortalItem = {
+        id,
+        hostId: to,
+        ...(typeof params?.agent === "string" ? { agentKey: params.agent } : {}),
+        kind,
+        title:
+          (typeof params?.title === "string" && params.title.trim()) ||
+          (kind === "browser"
+            ? url || "远程浏览器"
+            : kind === "window"
+              ? demoWindowsForHost(to).find((w) => w.id === windowId)?.title || "远程桌面窗口"
+              : resolvedPath?.split("/").pop() || "跨端回传"),
+        subtitle: kind === "browser" ? url : resolvedPath,
+        ...(resolvedPath ? { targetPath: resolvedPath } : {}),
+        ...(kind === "reveal"
+          ? {
+              parentDir: hitFile ? hitFile.dir || "docs" : "docs",
+              highlightName: hitFile?.name || resolvedPath?.split("/").pop(),
+            }
+          : {}),
+        ...(url ? { url } : {}),
+        ...(windowId ? { windowId } : {}),
+        ...(kind === "html" ? { mime: "text/html" } : {}),
+        canInteract: kind === "browser" || kind === "window",
+        transportHint: "p2p",
+        width: 960,
+        height: 600,
+        createdAt: ts,
+        updatedAt: ts,
+      };
+      demoPortals.unshift(item);
+      emitMockPortalEvent("opened", item);
+      let ticket: PortalFileTicket | undefined;
+      if (kind === "file" || kind === "html" || kind === "reveal") {
+        ticket = {
+          token: `demo-tok-${id}`,
+          entryPath: hitFile?.name || "README.md",
+          port: null,
+          addrs: [],
+          expiresAt: ts + 30 * 60_000,
+          mime: kind === "html" ? "text/html; charset=utf-8" : "text/plain; charset=utf-8",
+          size: hitFile?.size ?? 256,
+          isDir: false,
+        };
+      }
+      return { item, ...(ticket ? { ticket } : {}) };
+    }
+    if (method === "portal.close") {
+      const idx = demoPortals.findIndex((p) => p.id === params?.portalId);
+      if (idx >= 0) {
+        const [removed] = demoPortals.splice(idx, 1);
+        if (removed) emitMockPortalEvent("closed", removed);
+      }
+      return { ok: true };
+    }
+    if (method === "portal.frame") {
+      const item = demoPortals.find((p) => p.id === params?.portalId) ?? null;
+      if (!item || (item.kind !== "browser" && item.kind !== "window")) {
+        return { frame: null, item };
+      }
+      const rendered = renderDemoFramePngBase64(item);
+      const frame: PortalFramePayload = {
+        portalId: item.id,
+        seq: demoFrameSeq++,
+        mime: "image/png",
+        data: rendered.data,
+        width: rendered.width,
+        height: rendered.height,
+        ...(item.url ? { url: item.url } : {}),
+        title: item.title,
+        canGoBack: item.kind === "browser",
+        canGoForward: false,
+        at: Date.now(),
+      };
+      return { frame, item };
+    }
+    if (method === "portal.input") {
+      const item = demoPortals.find((p) => p.id === params?.portalId);
+      if (!item) throw new Error("回传窗口不存在或已关闭");
+      const input = params?.input as PortalInputAction | undefined;
+      if (input?.type === "navigate" && input.action === "goto" && input.url) {
+        item.url = input.url;
+        item.subtitle = input.url;
+        item.updatedAt = Date.now();
+        emitMockPortalEvent("updated", item);
+      }
+      return { ok: true, ...(item.url ? { url: item.url } : {}), title: item.title };
+    }
+    if (method === "portal.fileTicket") {
+      const hit = demoFindFile(String(params?.path ?? ""));
+      return {
+        token: `demo-tok-${Date.now().toString(36)}`,
+        entryPath: hit?.name || String(params?.path ?? "README.md"),
+        port: null,
+        addrs: [],
+        expiresAt: Date.now() + 30 * 60_000,
+        mime: hit?.name.endsWith(".html") ? "text/html; charset=utf-8" : "text/plain; charset=utf-8",
+        size: hit?.size ?? 256,
+        isDir: hit?.kind === "dir",
+      } satisfies PortalFileTicket;
+    }
+    if (method === "portal.dirList") {
+      const item = params?.portalId ? demoPortals.find((p) => p.id === params.portalId) : undefined;
+      return demoPortalDirList(String(params?.path ?? item?.parentDir ?? ""), item?.highlightName);
+    }
+    if (method === "portal.bundleHtml") {
+      const hit = demoFindFile(String(params?.path ?? ""));
+      const html =
+        hit?.body ??
+        "<!doctype html><html><body style='font-family:system-ui;padding:20px'><h2>Demo HTML Portal</h2><p>Inline cross-device HTML bundle preview.</p></body></html>";
+      return { html, title: hit?.name || "index.html" };
+    }
     return { ok: true };
+  },
+  subscribe(
+    to: string,
+    stream: StreamKind,
+    params: any,
+    onEvent: (event: any) => void,
+    onState?: (event: any) => void,
+  ): () => void {
+    if (stream === "portal") {
+      const agent = typeof params?.agent === "string" ? params.agent : undefined;
+      const portalId = typeof params?.portalId === "string" ? params.portalId : undefined;
+      const watcher: MockPortalWatcher = { to, agent, portalId, onEvent };
+      demoPortalWatchers.add(watcher);
+      const items = demoPortals.filter((p) => p.hostId === to && (!agent || !p.agentKey || p.agentKey === agent));
+      onState?.({ kind: "live", result: { items } });
+      if (portalId) {
+        const target = demoPortals.find((p) => p.id === portalId);
+        if (target && (target.kind === "browser" || target.kind === "window")) {
+          const rendered = renderDemoFramePngBase64(target);
+          onEvent({
+            kind: "portal_frame",
+            portalId: target.id,
+            seq: demoFrameSeq++,
+            mime: "image/png",
+            data: rendered.data,
+            width: rendered.width,
+            height: rendered.height,
+            ...(target.url ? { url: target.url } : {}),
+            title: target.title,
+            canGoBack: target.kind === "browser",
+            canGoForward: false,
+            at: Date.now(),
+          } satisfies PortalStreamEvent);
+        }
+      }
+      return () => {
+        demoPortalWatchers.delete(watcher);
+      };
+    }
+    onState?.({ kind: "live" });
+    return () => {};
   },
   assistantState: (): AssistantState => ({ ...demoAssistantState, items: [...demoAssistantState.items] }),
   say(text: string): AssistantItem {

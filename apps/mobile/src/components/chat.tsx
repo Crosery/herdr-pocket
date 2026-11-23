@@ -286,7 +286,7 @@ function groupTools(rows: Row[], mode: ChatDisplayMode): Row[] {
     pending = [];
   };
   for (const r of rows) {
-    if (r.type === "tool" || (mode !== "expanded" && (r.type === "thinking" || r.type === "system"))) {
+    if (r.type === "tool" || (mode !== "expanded" && r.type === "system") || (mode === "compact" && r.type === "thinking")) {
       pending.push(r);
     } else {
       flush();
@@ -816,7 +816,17 @@ function ModelSwitchBanner({ label, ts }: { label: string; ts: number }) {
  * composer. It is the list's first row (the list is inverted) rather than its header, so when it
  * changes the rows are laid out again like for any other row, and a reader's place is kept across it.
  */
-type EndRow = { type: "end"; id: string; working: boolean; since?: number; now: number; awaiting: boolean; inset: number };
+type EndRow = {
+  type: "end";
+  id: string;
+  working: boolean;
+  since?: number;
+  now: number;
+  awaiting: boolean;
+  inset: number;
+  onStop?: () => void;
+  stopping?: boolean;
+};
 type ListRow = Row | EndRow;
 const END_ID = "\u0000end";
 
@@ -929,7 +939,7 @@ const renderRow: ListRenderItem<ListRow> = ({ item }) => {
     case "end":
       return (
         <View style={{ paddingBottom: item.inset }}>
-          {item.working ? <WorkingBadge since={item.since} now={item.now} /> : item.awaiting ? <ReplyDots /> : null}
+          {item.working ? <WorkingBadge since={item.since} now={item.now} onStop={item.onStop} stopping={item.stopping} /> : item.awaiting ? <ReplyDots /> : null}
         </View>
       );
     case "user":
@@ -1364,9 +1374,27 @@ function SessionChatView({
     [folded, sends, agent.key, capturedCommands, terminalQueuedItems],
   );
   const working = !sub && agent.status === "working";
+  const [stopping, setStopping] = useState(false);
+  const stopTurn = useCallback(() => {
+    if (stopping) return;
+    setStopping(true);
+    void call(agent.deviceId, "terminal.interrupt", { agent: agent.key })
+      .catch(() => undefined)
+      .finally(() => setStopping(false));
+  }, [agent.deviceId, agent.key, stopping]);
   const end = useMemo(
-    (): EndRow => ({ type: "end", id: END_ID, working, since: agent.statusSince, now: working ? nowTick : 0, awaiting: !working && !!sends.awaiting, inset: bottomInset + space.md }),
-    [working, agent.statusSince, nowTick, sends.awaiting, bottomInset],
+    (): EndRow => ({
+      type: "end",
+      id: END_ID,
+      working,
+      since: agent.statusSince,
+      now: working ? nowTick : 0,
+      awaiting: !working && !!sends.awaiting,
+      inset: bottomInset + space.md,
+      onStop: !sub ? stopTurn : undefined,
+      stopping,
+    }),
+    [working, agent.statusSince, nowTick, sends.awaiting, bottomInset, sub, stopTurn, stopping],
   );
   const more = olderCursor === undefined ? q.data?.more : olderCursor !== null;
 
@@ -1689,7 +1717,17 @@ function workedFor(ms: number): string {
 }
 
 /** Under the newest message while the agent works: the busy mascot on a soft card, and for how long. */
-function WorkingBadge({ since, now }: { since?: number; now: number }) {
+function WorkingBadge({
+  since,
+  now,
+  onStop,
+  stopping,
+}: {
+  since?: number;
+  now: number;
+  onStop?: () => void;
+  stopping?: boolean;
+}) {
   const p = usePalette();
   const c = statusColors("working", p.dark);
   return (
@@ -1702,7 +1740,7 @@ function WorkingBadge({ since, now }: { since?: number; now: number }) {
           backgroundColor: p.surface,
           borderRadius: radius.card,
           paddingLeft: space.sm,
-          paddingRight: space.lg,
+          paddingRight: onStop ? space.sm : space.lg,
           paddingVertical: 6,
           borderWidth: 1,
           borderColor: p.dark ? p.surface3 : "#F6DDE8",
@@ -1722,6 +1760,31 @@ function WorkingBadge({ since, now }: { since?: number; now: number }) {
         <View style={{ marginLeft: space.xs }}>
           <TypingDots color={c.fg} />
         </View>
+        {onStop ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="停止当前轮"
+            disabled={stopping}
+            onPress={onStop}
+            hitSlop={6}
+            style={({ pressed }) => ({
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 3,
+              paddingHorizontal: 9,
+              paddingVertical: 4,
+              borderRadius: radius.pill,
+              backgroundColor: pressed ? p.surface3 : p.accentContainer,
+              borderWidth: 1,
+              borderColor: p.primary,
+              opacity: stopping ? 0.55 : 1,
+              marginLeft: space.xs,
+            })}
+          >
+            <MaterialCommunityIcons name="stop" size={13} color={p.accentText} />
+            <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>停止</Text>
+          </Pressable>
+        ) : null}
       </View>
     </View>
   );

@@ -7,6 +7,7 @@ import {
   type RpcError,
   type RpcMethod,
   type ServerFrame,
+  type StreamKind,
 } from "@herdr-pocket/protocol";
 
 export class DirectError extends Error {
@@ -45,6 +46,14 @@ export const SAFE_AGAIN = new Set<RpcMethod>([
   "git.status",
   "git.diff",
   "git.log",
+  "tools.check",
+  "tools.updateStatus",
+  "files.readChunk",
+  "portal.list",
+  "portal.frame",
+  "portal.fileTicket",
+  "portal.dirList",
+  "portal.bundleHtml",
 ]);
 
 export interface DirectHandlers {
@@ -159,6 +168,7 @@ function dialCandidate(
 export class DirectLink {
   readonly to: string;
   readonly addr: string;
+  readonly port: number;
   private ws: WebSocket;
   private cipher: DirectCipher;
   private handlers: DirectHandlers;
@@ -171,12 +181,14 @@ export class DirectLink {
   private constructor(
     to: string,
     addr: string,
+    port: number,
     ws: WebSocket,
     cipher: DirectCipher,
     handlers: DirectHandlers,
   ) {
     this.to = to;
     this.addr = addr;
+    this.port = port;
     this.ws = ws;
     this.cipher = cipher;
     this.handlers = handlers;
@@ -213,7 +225,7 @@ export class DirectLink {
       try {
         const timeoutMs = addr === "127.0.0.1" ? DIAL_LOCAL_MS : DIAL_REMOTE_MS;
         const win = await dialCandidate(addr, offer.port, offer.ticket, key, timeoutMs);
-        return new DirectLink(to, win.addr, win.ws, win.cipher, handlers);
+        return new DirectLink(to, win.addr, offer.port, win.ws, win.cipher, handlers);
       } catch (err) {
         lastErr = err as Error;
       }
@@ -298,7 +310,7 @@ export class DirectLink {
     });
   }
 
-  subscribe(id: string, stream: "terminal" | "session", params: unknown): boolean {
+  subscribe(id: string, stream: StreamKind, params: unknown): boolean {
     return this.send({ type: "stream_subscribe", id, to: this.to, stream, params });
   }
 

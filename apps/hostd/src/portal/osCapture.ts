@@ -1,0 +1,973 @@
+import { execFile } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type {
+  HostPortalCapabilities,
+  PortalDisplaySession,
+  PortalInputAction,
+  RemoteWindowInfo,
+} from "@herdr-pocket/protocol";
+import { stateDir } from "@herdr-pocket/update";
+
+export interface CaptureExecResult {
+  code: number | null;
+  stdout: Buffer;
+  stderr: string;
+}
+
+export interface OsCaptureDeps {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  uid?: () => number;
+  hasCmd?: (cmd: string) => boolean;
+  pathExists?: (p: string) => boolean;
+  readDir?: (p: string) => string[];
+  execBin?: (cmd: string, args: string[], timeoutMs?: number, env?: NodeJS.ProcessEnv) => Promise<CaptureExecResult>;
+}
+
+const commandCache = new Map<string, boolean>();
+
+function defaultHasCmd(cmd: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (cmd.includes("/")) return existsSync(cmd);
+  const key = `${process.platform}:${env.PATH ?? ""}:${cmd}`;
+  const cached = commandCache.get(key);
+  if (cached !== undefined) return cached;
+  const sep = process.platform === "win32" ? ";" : ":";
+  const dirs = (env.PATH ?? "").split(sep).filter(Boolean);
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ".com", ""] : [""];
+  let found = false;
+  for (const d of dirs) {
+    for (const ext of exts) {
+      if (existsSync(join(d, cmd + ext))) {
+        found = true;
+        break;
+      }
+    }
+    if (found) break;
+  }
+  commandCache.set(key, found);
+  return found;
+}
+
+function defaultExecBin(
+  cmd: string,
+  args: string[],
+  timeoutMs = 6000,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<CaptureExecResult> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      cmd,
+      args,
+      { timeout: timeoutMs, encoding: "buffer", windowsHide: true, maxBuffer: 12 * 1024 * 1024, env },
+      (err, stdout, stderr) => {
+        const outBuf = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? "");
+        const errStr = Buffer.isBuffer(stderr) ? stderr.toString("utf8") : String(stderr ?? "");
+        if (!err) {
+          resolve({ code: 0, stdout: outBuf, stderr: errStr });
+          return;
+        }
+        const code = (err as { code?: unknown }).code;
+        if (typeof code === "number" && !(err as { killed?: boolean }).killed) {
+          resolve({ code, stdout: outBuf, stderr: errStr });
+        } else {
+          reject(err);
+        }
+      },
+    );
+  });
+}
+
+/** Resolves X11 / Wayland GUI environment even when hostd was started by systemd without GUI vars. */
+export function resolveLinuxGuiEnv(deps: OsCaptureDeps = {}): NodeJS.ProcessEnv {
+  const baseEnv: NodeJS.ProcessEnv = { ...(deps.env ?? process.env) };
+  if (baseEnv.WAYLAND_DISPLAY || baseEnv.DISPLAY) return baseEnv;
+  const uid = deps.uid?.() ?? (typeof process.getuid === "function" ? process.getuid() : 1000);
+  const runtimeDir = baseEnv.XDG_RUNTIME_DIR || `/run/user/${uid}`;
+  const pathExists = deps.pathExists ?? existsSync;
+  const readDir =
+    deps.readDir ??
+    ((p: string) => {
+      try {
+        const fs = require("node:fs") as typeof import("node:fs");
+        return fs.readdirSync(p);
+      } catch {
+        return [];
+      }
+    });
+
+  if (pathExists(runtimeDir)) {
+    baseEnv.XDG_RUNTIME_DIR = runtimeDir;
+    const files = readDir(runtimeDir);
+    const waylandSock = files.find((f) => /^wayland-\d+$/.test(f));
+    if (waylandSock) {
+      baseEnv.WAYLAND_DISPLAY = waylandSock;
+      baseEnv.XDG_SESSION_TYPE ||= "wayland";
+    }
+  }
+  const x11Dir = "/tmp/.X11-unix";
+  if (!baseEnv.DISPLAY && pathExists(x11Dir)) {
+    const xFiles = readDir(x11Dir);
+    const xSock = xFiles.find((f) => /^X\d+$/.test(f));
+    if (xSock) {
+      baseEnv.DISPLAY = `:${xSock.slice(1)}`;
+      baseEnv.XDG_SESSION_TYPE ||= "x11";
+    }
+  }
+  return baseEnv;
+}
+
+export function detectPortalSession(deps: OsCaptureDeps = {}): {
+  platform: NodeJS.Platform;
+  sessionType: PortalDisplaySession;
+  desktopEnv?: string;
+  env: NodeJS.ProcessEnv;
+} {
+  const plat = deps.platform ?? process.platform;
+  const rawEnv = deps.env ?? process.env;
+  if (plat === "darwin") {
+    return { platform: plat, sessionType: "macos", desktopEnv: "Aqua", env: rawEnv };
+  }
+  if (plat === "win32") {
+    return { platform: plat, sessionType: "win32", desktopEnv: "Windows", env: rawEnv };
+  }
+
+  const env = resolveLinuxGuiEnv(deps);
+  const desktop = (env.XDG_CURRENT_DESKTOP || env.DESKTOP_SESSION || "").trim();
+  const desktopLower = desktop.toLowerCase();
+  const sessType = (env.XDG_SESSION_TYPE || "").toLowerCase();
+  const hasWayland = Boolean(env.WAYLAND_DISPLAY) || sessType === "wayland";
+  const hasX11 = Boolean(env.DISPLAY) || sessType === "x11";
+
+  if (hasWayland) {
+    if (
+      env.HYPRLAND_INSTANCE_SIGNATURE ||
+      env.SWAYSOCK ||
+      /(?:sway|hyprland|river|wayfire|niri|wlroots|labwc)/.test(desktopLower)
+    ) {
+      return { platform: plat, sessionType: "wayland-wlroots", desktopEnv: desktop || "wlroots", env };
+    }
+    if (env.KDE_FULL_SESSION || /kde|plasma|kwin/.test(desktopLower)) {
+      return { platform: plat, sessionType: "wayland-kde", desktopEnv: desktop || "KDE Plasma", env };
+    }
+    if (/gnome|ubuntu|zorin|pop/.test(desktopLower)) {
+      return { platform: plat, sessionType: "wayland-gnome", desktopEnv: desktop || "GNOME", env };
+    }
+    return { platform: plat, sessionType: "wayland-other", desktopEnv: desktop || "Wayland", env };
+  }
+
+  if (hasX11) {
+    return { platform: plat, sessionType: "x11", desktopEnv: desktop || "X11", env };
+  }
+
+  return { platform: plat, sessionType: "headless", desktopEnv: desktop || undefined, env };
+}
+
+export function computeCapabilities(opts: {
+  deps?: OsCaptureDeps;
+  hasCdpBrowser: boolean;
+  directPort?: number | null;
+}): HostPortalCapabilities {
+  const deps = opts.deps ?? {};
+  const info = detectPortalSession(deps);
+  const hasCmd = (c: string) => (deps.hasCmd ?? ((cmd) => defaultHasCmd(cmd, info.env)))(c);
+  const notes: string[] = [];
+
+  if (info.sessionType === "macos") {
+    return {
+      platform: info.platform,
+      sessionType: info.sessionType,
+      desktopEnv: info.desktopEnv,
+      canListWindows: true,
+      canCaptureWindow: true,
+      canCaptureScreen: true,
+      canInjectInput: true,
+      hasCdpBrowser: opts.hasCdpBrowser,
+      directPort: opts.directPort ?? null,
+    };
+  }
+
+  if (info.sessionType === "win32") {
+    return {
+      platform: info.platform,
+      sessionType: info.sessionType,
+      desktopEnv: info.desktopEnv,
+      canListWindows: true,
+      canCaptureWindow: true,
+      canCaptureScreen: true,
+      canInjectInput: true,
+      hasCdpBrowser: opts.hasCdpBrowser,
+      directPort: opts.directPort ?? null,
+    };
+  }
+
+  if (info.sessionType === "x11") {
+    const canList = hasCmd("wmctrl") || hasCmd("xdotool") || hasCmd("xwininfo");
+    const canCapWin = hasCmd("maim") || hasCmd("import") || hasCmd("ffmpeg") || hasCmd("scrot") || hasCmd("xwd");
+    const canInput = hasCmd("xdotool") || hasCmd("xte");
+    if (!canCapWin) notes.push("安装 maim、imagemagick(import) 或 ffmpeg 后支持 X11 窗口抓屏");
+    if (!canInput) notes.push("安装 xdotool 后支持 X11 远控鼠标与键盘输入");
+    return {
+      platform: info.platform,
+      sessionType: info.sessionType,
+      desktopEnv: info.desktopEnv,
+      canListWindows: canList,
+      canCaptureWindow: canCapWin,
+      canCaptureScreen: canCapWin,
+      canInjectInput: canInput,
+      hasCdpBrowser: opts.hasCdpBrowser,
+      directPort: opts.directPort ?? null,
+      ...(notes.length ? { notes } : {}),
+    };
+  }
+
+  if (info.sessionType === "wayland-wlroots") {
+    const canList = hasCmd("hyprctl") || hasCmd("swaymsg") || (Boolean(info.env.DISPLAY) && hasCmd("wmctrl"));
+    const canCap = hasCmd("grim");
+    const canInput = hasCmd("ydotool") || hasCmd("wlrctl") || (Boolean(info.env.DISPLAY) && hasCmd("xdotool"));
+    if (!canCap) notes.push("安装 grim 后支持 Sway/Hyprland 窗口与桌面抓屏");
+    if (!canInput) notes.push("安装 ydotool 或 wlrctl 后支持 Wayland wlroots 远程鼠标键盘输入");
+    return {
+      platform: info.platform,
+      sessionType: info.sessionType,
+      desktopEnv: info.desktopEnv,
+      canListWindows: canList,
+      canCaptureWindow: canCap,
+      canCaptureScreen: canCap,
+      canInjectInput: canInput,
+      hasCdpBrowser: opts.hasCdpBrowser,
+      directPort: opts.directPort ?? null,
+      ...(notes.length ? { notes } : {}),
+    };
+  }
+
+  if (info.sessionType === "wayland-kde") {
+    const canList = hasCmd("kdotool") || (Boolean(info.env.DISPLAY) && hasCmd("wmctrl"));
+    const canCap = hasCmd("spectacle") || hasCmd("grim") || (Boolean(info.env.DISPLAY) && (hasCmd("maim") || hasCmd("import")));
+    const canInput = hasCmd("ydotool") || (Boolean(info.env.DISPLAY) && hasCmd("xdotool"));
+    if (!canCap) notes.push("安装 spectacle 后支持 KDE Wayland 抓屏");
+    if (!canInput) notes.push("安装 ydotool (与 ydotoold) 后支持 KDE Wayland 原生输入");
+    return {
+      platform: info.platform,
+      sessionType: info.sessionType,
+      desktopEnv: info.desktopEnv,
+      canListWindows: canList,
+      canCaptureWindow: canCap,
+      canCaptureScreen: canCap,
+      canInjectInput: canInput,
+      hasCdpBrowser: opts.hasCdpBrowser,
+      directPort: opts.directPort ?? null,
+      ...(notes.length ? { notes } : {}),
+    };
+  }
+
+  if (info.sessionType === "wayland-gnome") {
+    const canList = hasCmd("gdbus") || (Boolean(info.env.DISPLAY) && hasCmd("wmctrl"));
+    const canCap = hasCmd("gnome-screenshot") || hasCmd("gdbus") || (Boolean(info.env.DISPLAY) && (hasCmd("maim") || hasCmd("import")));
+    const canInput = hasCmd("ydotool") || (Boolean(info.env.DISPLAY) && hasCmd("xdotool"));
+    if (!canCap) notes.push("安装 gnome-screenshot 后支持 GNOME Wayland 抓屏");
+    if (!canInput) notes.push("安装 ydotool (与 ydotoold) 后支持 GNOME Wayland 原生输入");
+    return {
+      platform: info.platform,
+      sessionType: info.sessionType,
+      desktopEnv: info.desktopEnv,
+      canListWindows: canList,
+      canCaptureWindow: canCap,
+      canCaptureScreen: canCap,
+      canInjectInput: canInput,
+      hasCdpBrowser: opts.hasCdpBrowser,
+      directPort: opts.directPort ?? null,
+      ...(notes.length ? { notes } : {}),
+    };
+  }
+
+  if (info.sessionType === "wayland-other") {
+    const canCap = hasCmd("grim") || (Boolean(info.env.DISPLAY) && (hasCmd("maim") || hasCmd("import") || hasCmd("ffmpeg")));
+    const canInput = hasCmd("ydotool") || (Boolean(info.env.DISPLAY) && hasCmd("xdotool"));
+    notes.push("检测到自定义 Wayland 合成器；安装 grim / ydotool 或开启 XWayland 可获得最佳兼容性");
+    return {
+      platform: info.platform,
+      sessionType: info.sessionType,
+      desktopEnv: info.desktopEnv,
+      canListWindows: Boolean(info.env.DISPLAY) && hasCmd("wmctrl"),
+      canCaptureWindow: canCap,
+      canCaptureScreen: canCap,
+      canInjectInput: canInput,
+      hasCdpBrowser: opts.hasCdpBrowser,
+      directPort: opts.directPort ?? null,
+      notes,
+    };
+  }
+
+  notes.push("当前 Linux 无图形会话 (Headless)，浏览器 OAuth 与文件/HTML 预览仍可通过内置远端浏览器与 P2P 正常回传");
+  return {
+    platform: info.platform,
+    sessionType: "headless",
+    desktopEnv: info.desktopEnv,
+    canListWindows: false,
+    canCaptureWindow: false,
+    canCaptureScreen: false,
+    canInjectInput: false,
+    hasCdpBrowser: opts.hasCdpBrowser,
+    directPort: opts.directPort ?? null,
+    notes,
+  };
+}
+
+// --- Windows persistent/inline Win32 C# helper -------------------------------------------
+
+const WIN32_PS_LIST = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public class HpWinList {
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  public static string Dump() {
+    var sb = new StringBuilder("[");
+    bool first = true;
+    EnumWindows((h, _) => {
+      if (!IsWindowVisible(h)) return true;
+      int len = GetWindowTextLength(h);
+      if (len <= 0) return true;
+      var title = new StringBuilder(len + 1);
+      GetWindowText(h, title, title.Capacity);
+      RECT r;
+      if (!GetWindowRect(h, out r)) return true;
+      int w = r.Right - r.Left, ht = r.Bottom - r.Top;
+      if (w < 80 || ht < 60) return true;
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      string proc = "";
+      try { proc = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch {}
+      if (!first) sb.Append(",");
+      first = false;
+      sb.AppendFormat("{{\\"id\\":\\"{0}\\",\\"appName\\":\\"{1}\\",\\"title\\":\\"{2}\\",\\"pid\\":{3},\\"bounds\\":{{\\"x\\":{4},\\"y\\":{5},\\"width\\":{6},\\"height\\":{7}}}}}",
+        h.ToInt64(),
+        proc.Replace("\\\\","\\\\\\\\").Replace("\\"","\\\\\\""),
+        title.ToString().Replace("\\\\","\\\\\\\\").Replace("\\"","\\\\\\""),
+        pid, r.Left, r.Top, w, ht);
+      return true;
+    }, IntPtr.Zero);
+    sb.Append("]");
+    return sb.ToString();
+  }
+}
+"@
+[HpWinList]::Dump()
+`;
+
+function buildWin32CaptureScript(windowId: string, outPath: string): string {
+  const isScreen = windowId.startsWith("screen:");
+  const escOut = outPath.replace(/'/g, "''");
+  const hwnd = isScreen ? "0" : String(Number(windowId) || 0);
+  return `
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition @"
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+public class HpWinCap {
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  public static string Capture(long hwndVal, string outPath) {
+    int x = 0, y = 0, w = 0, h = 0;
+    Bitmap bmp = null;
+    if (hwndVal > 0) {
+      RECT r;
+      if (!GetWindowRect(new IntPtr(hwndVal), out r)) throw new Exception("window gone");
+      x = r.Left; y = r.Top; w = Math.Max(1, r.Right - r.Left); h = Math.Max(1, r.Bottom - r.Top);
+      bmp = new Bitmap(w, h);
+      using (var g = Graphics.FromImage(bmp)) {
+        IntPtr hdc = g.GetHdc();
+        bool ok = PrintWindow(new IntPtr(hwndVal), hdc, 2);
+        g.ReleaseHdc(hdc);
+        if (!ok) { g.CopyFromScreen(x, y, 0, 0, new Size(w, h)); }
+      }
+    } else {
+      var b = System.Windows.Forms.Screen.PrimaryScreen.Bounds;
+      w = b.Width; h = b.Height;
+      bmp = new Bitmap(w, h);
+      using (var g = Graphics.FromImage(bmp)) { g.CopyFromScreen(b.Left, b.Top, 0, 0, b.Size); }
+    }
+    var enc = ImageCodecInfo.GetImageEncoders();
+    ImageCodecInfo jpg = enc[1];
+    foreach (var c in enc) if (c.MimeType == "image/jpeg") { jpg = c; break; }
+    var ep = new EncoderParameters(1);
+    ep.Param[0] = new EncoderParameter(Encoder.Quality, 72L);
+    bmp.Save(outPath, jpg, ep);
+    bmp.Dispose();
+    return w + "x" + h;
+  }
+}
+"@ -ReferencedAssemblies System.Drawing,System.Windows.Forms
+[HpWinCap]::Capture(${hwnd}, '${escOut}')
+`;
+}
+
+// --- macOS Swift helper (optional, compiled once if swiftc exists; pure JXA/screencapture fallback) ---
+
+const MAC_SWIFT_SRC = `
+import AppKit
+import CoreGraphics
+import Foundation
+
+let args = CommandLine.arguments
+if args.count >= 2 && args[1] == "list" {
+  let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+  let info = (CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]) ?? []
+  var out: [[String: Any]] = []
+  for w in info {
+    guard let wid = w[kCGWindowNumber as String] as? Int,
+          let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
+          let owner = w[kCGWindowOwnerName as String] as? String,
+          let b = w[kCGWindowBounds as String] as? [String: Any],
+          let bw = b["Width"] as? Double, let bh = b["Height"] as? Double,
+          bw >= 100, bh >= 80 else { continue }
+    let title = (w[kCGWindowName as String] as? String) ?? ""
+    if owner == "Window Server" || owner == "Dock" { continue }
+    let pid = (w[kCGWindowOwnerPID as String] as? Int) ?? 0
+    let bx = (b["X"] as? Double) ?? 0
+    let by = (b["Y"] as? Double) ?? 0
+    out.append([
+      "id": String(wid),
+      "appName": owner,
+      "title": title.isEmpty ? owner : title,
+      "pid": pid,
+      "bounds": ["x": Int(bx), "y": Int(by), "width": Int(bw), "height": Int(bh)]
+    ])
+  }
+  let data = try JSONSerialization.data(withJSONObject: out)
+  FileHandle.standardOutput.write(data)
+} else if args.count >= 6 && args[1] == "click" {
+  let x = Double(args[2]) ?? 0
+  let y = Double(args[3]) ?? 0
+  let btn = args[4]
+  let count = Int(args[5]) ?? 1
+  if args.count >= 7, let pid = Int32(args[6]), pid > 0 {
+    NSRunningApplication(processIdentifier: pid)?.activate(options: .activateIgnoringOtherApps)
+  }
+  let pt = CGPoint(x: x, y: y)
+  let mouseTypeDown: CGEventType = btn == "right" ? .rightMouseDown : .leftMouseDown
+  let mouseTypeUp: CGEventType = btn == "right" ? .rightMouseUp : .leftMouseUp
+  let cgBtn: CGMouseButton = btn == "right" ? .right : .left
+  let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left)
+  move?.post(tap: .cghidEventTap)
+  for c in 1...max(1, count) {
+    let down = CGEvent(mouseEventSource: nil, mouseType: mouseTypeDown, mouseCursorPosition: pt, mouseButton: cgBtn)
+    let up = CGEvent(mouseEventSource: nil, mouseType: mouseTypeUp, mouseCursorPosition: pt, mouseButton: cgBtn)
+    down?.setIntegerValueField(.mouseEventClickState, value: Int64(c))
+    up?.setIntegerValueField(.mouseEventClickState, value: Int64(c))
+    down?.post(tap: .cghidEventTap)
+    up?.post(tap: .cghidEventTap)
+  }
+} else if args.count >= 4 && args[1] == "scroll" {
+  let dy = Int32(args[2]) ?? 0
+  let dx = Int32(args[3]) ?? 0
+  let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
+  ev?.post(tap: .cghidEventTap)
+} else if args.count >= 3 && args[1] == "text" {
+  let str = args[2]
+  if args.count >= 4, let pid = Int32(args[3]), pid > 0 {
+    NSRunningApplication(processIdentifier: pid)?.activate(options: .activateIgnoringOtherApps)
+  }
+  let utf16 = Array(str.utf16)
+  let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)
+  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+  down?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
+  up?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
+  down?.post(tap: .cghidEventTap)
+  up?.post(tap: .cghidEventTap)
+}
+`;
+
+export class OsCaptureDriver {
+  private deps: OsCaptureDeps;
+  private macHelperBin: string | null = null;
+  private macHelperTried = false;
+
+  constructor(deps: OsCaptureDeps = {}) {
+    this.deps = deps;
+  }
+
+  private exec(cmd: string, args: string[], timeoutMs = 6000, env?: NodeJS.ProcessEnv): Promise<CaptureExecResult> {
+    return (this.deps.execBin ?? defaultExecBin)(cmd, args, timeoutMs, env);
+  }
+
+  private hasCmd(cmd: string, env: NodeJS.ProcessEnv): boolean {
+    return (this.deps.hasCmd ?? ((c) => defaultHasCmd(c, env)))(cmd);
+  }
+
+  private async ensureMacHelper(): Promise<string | null> {
+    if (this.macHelperBin && existsSync(this.macHelperBin)) return this.macHelperBin;
+    if (this.macHelperTried) return null;
+    this.macHelperTried = true;
+    const binDir = join(stateDir(), "bin");
+    const binPath = join(binDir, "hp-mac-portal");
+    if (existsSync(binPath)) {
+      this.macHelperBin = binPath;
+      return binPath;
+    }
+    if (!this.hasCmd("swiftc", process.env)) return null;
+    try {
+      mkdirSync(binDir, { recursive: true });
+      const srcPath = join(binDir, "hp-mac-portal.swift");
+      writeFileSync(srcPath, MAC_SWIFT_SRC);
+      const r = await this.exec("swiftc", ["-O", srcPath, "-o", binPath], 30_000);
+      if (r.code === 0 && existsSync(binPath)) {
+        this.macHelperBin = binPath;
+        return binPath;
+      }
+    } catch {
+      // fall back to screencapture + osascript
+    }
+    return null;
+  }
+
+  async listWindows(): Promise<RemoteWindowInfo[]> {
+    const info = detectPortalSession(this.deps);
+    if (info.sessionType === "macos") {
+      const helper = await this.ensureMacHelper();
+      if (helper) {
+        try {
+          const r = await this.exec(helper, ["list"], 4000);
+          if (r.code === 0) {
+            const list = JSON.parse(r.stdout.toString("utf8")) as RemoteWindowInfo[];
+            return [
+              { id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true },
+              ...list,
+            ];
+          }
+        } catch {
+          // fallback below
+        }
+      }
+      // Pure JXA fallback listing front processes
+      try {
+        const jxa = `
+          var se = Application("System Events");
+          var out = [];
+          for (var p of se.applicationProcesses.whose({backgroundOnly: false})()) {
+            try {
+              var name = p.name();
+              var pid = p.unixId();
+              var wins = p.windows();
+              for (var i = 0; i < wins.length; i++) {
+                var w = wins[i];
+                var pos = w.position();
+                var sz = w.size();
+                out.push({ id: "jxa:" + pid + ":" + i, appName: name, title: w.name() || name, pid: pid, bounds: { x: pos[0], y: pos[1], width: sz[0], height: sz[1] } });
+              }
+            } catch (e) {}
+          }
+          JSON.stringify(out);
+        `;
+        const r = await this.exec("osascript", ["-l", "JavaScript", "-e", jxa], 4000);
+        if (r.code === 0) {
+          const list = JSON.parse(r.stdout.toString("utf8")) as RemoteWindowInfo[];
+          return [{ id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true }, ...list];
+        }
+      } catch {
+        // ignore
+      }
+      return [{ id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true }];
+    }
+
+    if (info.sessionType === "win32") {
+      try {
+        const r = await this.exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", WIN32_PS_LIST], 7000);
+        if (r.code === 0) {
+          const list = JSON.parse(r.stdout.toString("utf8")) as RemoteWindowInfo[];
+          return [{ id: "screen:0", appName: "Windows 桌面", title: "主屏幕", isScreen: true }, ...list];
+        }
+      } catch {
+        // ignore
+      }
+      return [{ id: "screen:0", appName: "Windows 桌面", title: "主屏幕", isScreen: true }];
+    }
+
+    if (info.sessionType === "headless") return [];
+
+    const out: RemoteWindowInfo[] = [
+      { id: "screen:0", appName: `${info.desktopEnv || "Linux"} 桌面`, title: "整个屏幕", isScreen: true },
+    ];
+
+    if (info.sessionType === "wayland-wlroots") {
+      if (info.env.HYPRLAND_INSTANCE_SIGNATURE && this.hasCmd("hyprctl", info.env)) {
+        const r = await this.exec("hyprctl", ["clients", "-j"], 3000, info.env).catch(() => null);
+        if (r?.code === 0) {
+          const items = JSON.parse(r.stdout.toString("utf8")) as any[];
+          for (const c of items) {
+            if (!c?.size?.[0] || !c?.size?.[1]) continue;
+            out.push({
+              id: `hypr:${String(c.address ?? c.pid)}`,
+              appName: String(c.class || c.initialClass || "App"),
+              title: String(c.title || c.class || "Window"),
+              pid: typeof c.pid === "number" ? c.pid : undefined,
+              bounds: { x: Number(c.at?.[0] ?? 0), y: Number(c.at?.[1] ?? 0), width: Number(c.size[0]), height: Number(c.size[1]) },
+            });
+          }
+          return out;
+        }
+      }
+      if (info.env.SWAYSOCK && this.hasCmd("swaymsg", info.env)) {
+        const r = await this.exec("swaymsg", ["-t", "get_tree"], 3000, info.env).catch(() => null);
+        if (r?.code === 0) {
+          const tree = JSON.parse(r.stdout.toString("utf8")) as any;
+          const walk = (n: any) => {
+            if (!n) return;
+            if ((n.type === "con" || n.type === "floating_con") && n.name && n.rect?.width > 60 && n.rect?.height > 40 && n.pid) {
+              out.push({
+                id: `sway:${n.id}`,
+                appName: String(n.app_id || n.window_properties?.class || "Wayland"),
+                title: String(n.name),
+                pid: Number(n.pid),
+                bounds: { x: n.rect.x, y: n.rect.y, width: n.rect.width, height: n.rect.height },
+              });
+            }
+            for (const c of [...(n.nodes ?? []), ...(n.floating_nodes ?? [])]) walk(c);
+          };
+          walk(tree);
+          return out;
+        }
+      }
+    }
+
+    if (info.sessionType === "wayland-gnome" && this.hasCmd("gdbus", info.env)) {
+      const r = await this.exec(
+        "gdbus",
+        ["call", "--session", "--dest", "org.gnome.Shell", "--object-path", "/org/gnome/Shell/Introspect", "--method", "org.gnome.Shell.Introspect.GetWindows"],
+        3000,
+        info.env,
+      ).catch(() => null);
+      if (r?.code === 0) {
+        const text = r.stdout.toString("utf8");
+        const matches = [...text.matchAll(/uint64\s+(\d+).*?'title':\s*<'([^']*)'>.*?'app-id':\s*<'([^']*)'>/gs)];
+        for (const m of matches) {
+          out.push({ id: `gnome:${m[1]}`, appName: m[3] || "GNOME", title: m[2] || m[3] || "Window" });
+        }
+      }
+    }
+
+    // X11 / XWayland window enumeration via wmctrl -lpG
+    if (info.env.DISPLAY && this.hasCmd("wmctrl", info.env)) {
+      const r = await this.exec("wmctrl", ["-lpG"], 3000, info.env).catch(() => null);
+      if (r?.code === 0) {
+        for (const line of r.stdout.toString("utf8").split("\n")) {
+          const m = /^(0x[0-9a-f]+)\s+-?\d+\s+(\d+)\s+(-?\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+\S+\s+(.*)$/i.exec(line.trim());
+          if (!m) continue;
+          const [, wid, pidStr, x, y, w, h, title] = m;
+          if (Number(w) < 80 || Number(h) < 60) continue;
+          out.push({
+            id: wid!,
+            appName: "X11",
+            title: title?.trim() || wid!,
+            pid: Number(pidStr) || undefined,
+            bounds: { x: Number(x), y: Number(y), width: Number(w), height: Number(h) },
+          });
+        }
+      }
+    } else if (info.env.DISPLAY && this.hasCmd("xwininfo", info.env)) {
+      const r = await this.exec("xwininfo", ["-root", "-tree"], 3000, info.env).catch(() => null);
+      if (r?.code === 0) {
+        for (const line of r.stdout.toString("utf8").split("\n")) {
+          const m = /^\s*(0x[0-9a-f]+)\s+"([^"]+)":.*?\s+(\d+)x(\d+)\+(-?\d+)\+(-?\d+)/i.exec(line);
+          if (!m) continue;
+          const [, wid, title, w, h, x, y] = m;
+          if (Number(w) < 80 || Number(h) < 60) continue;
+          out.push({
+            id: wid!,
+            appName: "X11",
+            title: title || wid!,
+            bounds: { x: Number(x), y: Number(y), width: Number(w), height: Number(h) },
+          });
+        }
+      }
+    }
+
+    return out;
+  }
+
+  async captureWindow(windowId: string): Promise<{ mime: "image/jpeg" | "image/png"; data: string; width: number; height: number; bounds?: RemoteWindowInfo["bounds"]; pid?: number } | null> {
+    const info = detectPortalSession(this.deps);
+    const list = await this.listWindows().catch(() => []);
+    const target = list.find((w) => w.id === windowId);
+    const bounds = target?.bounds;
+
+    if (info.sessionType === "macos") {
+      const tmp = join(tmpdir(), `hp-cap-${process.pid}-${Date.now()}.jpg`);
+      try {
+        const args = windowId !== "screen:0" && /^\d+$/.test(windowId)
+          ? ["-x", "-o", "-l", windowId, "-t", "jpg", tmp]
+          : ["-x", "-t", "jpg", tmp];
+        const r = await this.exec("/usr/sbin/screencapture", args, 5000);
+        if (r.code === 0 && existsSync(tmp)) {
+          const buf = readFileSync(tmp);
+          return {
+            mime: "image/jpeg",
+            data: buf.toString("base64"),
+            width: bounds?.width ?? 1280,
+            height: bounds?.height ?? 800,
+            bounds,
+            pid: target?.pid,
+          };
+        }
+      } finally {
+        rmSync(tmp, { force: true });
+      }
+      return null;
+    }
+
+    if (info.sessionType === "win32") {
+      const tmp = join(tmpdir(), `hp-cap-${process.pid}-${Date.now()}.jpg`);
+      try {
+        const script = buildWin32CaptureScript(windowId, tmp);
+        const r = await this.exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], 7000);
+        if (r.code === 0 && existsSync(tmp)) {
+          const dims = /(\d+)x(\d+)/.exec(r.stdout.toString("utf8"));
+          const buf = readFileSync(tmp);
+          return {
+            mime: "image/jpeg",
+            data: buf.toString("base64"),
+            width: dims ? Number(dims[1]) : (bounds?.width ?? 1280),
+            height: dims ? Number(dims[2]) : (bounds?.height ?? 800),
+            bounds,
+            pid: target?.pid,
+          };
+        }
+      } finally {
+        rmSync(tmp, { force: true });
+      }
+      return null;
+    }
+
+    if (info.sessionType === "headless") return null;
+
+    if (info.sessionType === "wayland-wlroots" && this.hasCmd("grim", info.env)) {
+      const args =
+        bounds && windowId !== "screen:0"
+          ? ["-g", `${bounds.x},${bounds.y} ${bounds.width}x${bounds.height}`, "-t", "jpeg", "-q", "74", "-"]
+          : ["-t", "jpeg", "-q", "74", "-"];
+      const r = await this.exec("grim", args, 5000, info.env).catch(() => null);
+      if (r?.code === 0 && r.stdout.length > 0) {
+        return {
+          mime: "image/jpeg",
+          data: r.stdout.toString("base64"),
+          width: bounds?.width ?? 1280,
+          height: bounds?.height ?? 800,
+          bounds,
+          pid: target?.pid,
+        };
+      }
+    }
+
+    if (info.sessionType === "wayland-kde" && this.hasCmd("spectacle", info.env)) {
+      const tmp = join(tmpdir(), `hp-kde-${process.pid}-${Date.now()}.jpg`);
+      try {
+        const args = windowId !== "screen:0" ? ["-b", "-n", "-a", "-o", tmp] : ["-b", "-n", "-f", "-o", tmp];
+        const r = await this.exec("spectacle", args, 5000, info.env).catch(() => null);
+        if (r?.code === 0 && existsSync(tmp)) {
+          const buf = readFileSync(tmp);
+          return { mime: "image/jpeg", data: buf.toString("base64"), width: bounds?.width ?? 1280, height: bounds?.height ?? 800, bounds, pid: target?.pid };
+        }
+      } finally {
+        rmSync(tmp, { force: true });
+      }
+    }
+
+    if (info.sessionType === "wayland-gnome" && this.hasCmd("gnome-screenshot", info.env)) {
+      const tmp = join(tmpdir(), `hp-gnome-${process.pid}-${Date.now()}.png`);
+      try {
+        const args = windowId !== "screen:0" ? ["-w", "-f", tmp] : ["-f", tmp];
+        const r = await this.exec("gnome-screenshot", args, 5000, info.env).catch(() => null);
+        if (r?.code === 0 && existsSync(tmp)) {
+          const buf = readFileSync(tmp);
+          return { mime: "image/png", data: buf.toString("base64"), width: bounds?.width ?? 1280, height: bounds?.height ?? 800, bounds, pid: target?.pid };
+        }
+      } finally {
+        rmSync(tmp, { force: true });
+      }
+    }
+
+    // X11 / XWayland capture chain: maim -> imagemagick import -> scrot -> ffmpeg
+    if (info.env.DISPLAY) {
+      const isWin = windowId !== "screen:0" && /^0x[0-9a-f]+$/i.test(windowId);
+      if (this.hasCmd("maim", info.env)) {
+        const args = isWin ? ["-i", windowId, "-f", "jpg"] : ["-f", "jpg"];
+        const r = await this.exec("maim", args, 5000, info.env).catch(() => null);
+        if (r?.code === 0 && r.stdout.length > 0) {
+          return { mime: "image/jpeg", data: r.stdout.toString("base64"), width: bounds?.width ?? 1280, height: bounds?.height ?? 800, bounds, pid: target?.pid };
+        }
+      }
+      if (this.hasCmd("import", info.env)) {
+        const args = ["-silent", "-window", isWin ? windowId : "root", "-quality", "75", "jpeg:-"];
+        const r = await this.exec("import", args, 5000, info.env).catch(() => null);
+        if (r?.code === 0 && r.stdout.length > 0) {
+          return { mime: "image/jpeg", data: r.stdout.toString("base64"), width: bounds?.width ?? 1280, height: bounds?.height ?? 800, bounds, pid: target?.pid };
+        }
+      }
+      if (this.hasCmd("scrot", info.env)) {
+        const tmp = join(tmpdir(), `hp-x11-${process.pid}-${Date.now()}.jpg`);
+        try {
+          const r = await this.exec("scrot", ["-q", "75", "-o", tmp], 5000, info.env).catch(() => null);
+          if (r?.code === 0 && existsSync(tmp)) {
+            const buf = readFileSync(tmp);
+            return { mime: "image/jpeg", data: buf.toString("base64"), width: bounds?.width ?? 1280, height: bounds?.height ?? 800, bounds, pid: target?.pid };
+          }
+        } finally {
+          rmSync(tmp, { force: true });
+        }
+      }
+      if (this.hasCmd("ffmpeg", info.env)) {
+        const args = [
+          "-y",
+          "-loglevel",
+          "error",
+          "-f",
+          "x11grab",
+          ...(isWin ? ["-window_id", windowId] : []),
+          "-i",
+          info.env.DISPLAY,
+          "-frames:v",
+          "1",
+          "-f",
+          "image2pipe",
+          "-vcodec",
+          "mjpeg",
+          "pipe:1",
+        ];
+        const r = await this.exec("ffmpeg", args, 5000, info.env).catch(() => null);
+        if (r?.code === 0 && r.stdout.length > 0) {
+          return { mime: "image/jpeg", data: r.stdout.toString("base64"), width: bounds?.width ?? 1280, height: bounds?.height ?? 800, bounds, pid: target?.pid };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  async injectInput(windowId: string, input: PortalInputAction): Promise<void> {
+    const info = detectPortalSession(this.deps);
+    const list = await this.listWindows().catch(() => []);
+    const target = list.find((w) => w.id === windowId);
+    const bounds = target?.bounds ?? { x: 0, y: 0, width: 1280, height: 800 };
+    const absPoint = (nx: number, ny: number) => ({
+      x: Math.round(bounds.x + Math.min(1, Math.max(0, nx)) * bounds.width),
+      y: Math.round(bounds.y + Math.min(1, Math.max(0, ny)) * bounds.height),
+    });
+
+    if (info.sessionType === "macos") {
+      const helper = await this.ensureMacHelper();
+      const pid = target?.pid ?? 0;
+      if (helper) {
+        if (input.type === "pointer" && (input.action === "click" || input.action === "dblclick" || input.action === "up")) {
+          const { x, y } = absPoint(input.nx, input.ny);
+          const count = input.action === "dblclick" ? "2" : "1";
+          await this.exec(helper, ["click", String(x), String(y), input.button ?? "left", count, ...(pid ? [String(pid)] : [])], 3000);
+          return;
+        }
+        if (input.type === "wheel") {
+          await this.exec(helper, ["scroll", String(Math.round(-input.deltaY / 10)), String(Math.round(-input.deltaX / 10))], 3000);
+          return;
+        }
+        if (input.type === "text") {
+          await this.exec(helper, ["text", input.text, ...(pid ? [String(pid)] : [])], 3000);
+          return;
+        }
+      }
+      // JXA fallback for key/text
+      if (input.type === "text" || input.type === "key") {
+        const text = input.type === "text" ? input.text : input.key;
+        const esc = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        await this.exec("osascript", ["-l", "JavaScript", "-e", `Application("System Events").keystroke("${esc}")`], 3000).catch(() => {});
+      }
+      return;
+    }
+
+    if (info.sessionType === "win32") {
+      if (input.type === "pointer" && (input.action === "click" || input.action === "dblclick" || input.action === "up")) {
+        const { x, y } = absPoint(input.nx, input.ny);
+        const hwnd = target && !target.isScreen ? Number(target.id) || 0 : 0;
+        const ps = `
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public class HpWinIn {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint data, UIntPtr extra);
+}
+"@
+${hwnd > 0 ? `[HpWinIn]::SetForegroundWindow([IntPtr]${hwnd}) | Out-Null` : ""}
+[HpWinIn]::SetCursorPos(${x}, ${y}) | Out-Null
+[HpWinIn]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+[HpWinIn]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+${input.action === "dblclick" ? "[HpWinIn]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero); [HpWinIn]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)" : ""}
+`;
+        await this.exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], 4000).catch(() => {});
+        return;
+      }
+      if (input.type === "text") {
+        const esc = input.text.replace(/'/g, "''").replace(/([+^%~(){}[\]])/g, "{$1}");
+        await this.exec(
+          "powershell.exe",
+          ["-NoProfile", "-NonInteractive", "-Command", `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${esc}')`],
+          4000,
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    // Linux X11 & Wayland
+    if (info.sessionType === "x11" || (info.env.DISPLAY && this.hasCmd("xdotool", info.env) && !this.hasCmd("ydotool", info.env))) {
+      if (!this.hasCmd("xdotool", info.env)) return;
+      const isWin = windowId !== "screen:0" && /^0x[0-9a-f]+$/i.test(windowId);
+      if (isWin) {
+        await this.exec("xdotool", ["windowactivate", windowId], 2000, info.env).catch(() => {});
+      }
+      if (input.type === "pointer") {
+        const { x, y } = absPoint(input.nx, input.ny);
+        const btn = input.button === "right" ? "3" : input.button === "middle" ? "2" : "1";
+        await this.exec("xdotool", ["mousemove", "--sync", String(x), String(y)], 2000, info.env).catch(() => {});
+        if (input.action === "click" || input.action === "up") {
+          await this.exec("xdotool", ["click", btn], 2000, info.env).catch(() => {});
+        } else if (input.action === "dblclick") {
+          await this.exec("xdotool", ["click", "--repeat", "2", "--delay", "60", btn], 2000, info.env).catch(() => {});
+        }
+      } else if (input.type === "wheel") {
+        const dir = input.deltaY > 0 ? "5" : "4";
+        await this.exec("xdotool", ["click", "--repeat", "3", dir], 2000, info.env).catch(() => {});
+      } else if (input.type === "text") {
+        await this.exec("xdotool", ["type", "--delay", "0", "--", input.text], 3000, info.env).catch(() => {});
+      } else if (input.type === "key") {
+        const keyMap: Record<string, string> = { Enter: "Return", Backspace: "BackSpace", Escape: "Escape", ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right", Tab: "Tab", " ": "space" };
+        const xKey = keyMap[input.key] ?? input.key;
+        await this.exec("xdotool", ["key", xKey], 2000, info.env).catch(() => {});
+      }
+      return;
+    }
+
+    if (this.hasCmd("ydotool", info.env)) {
+      if (input.type === "pointer") {
+        const { x, y } = absPoint(input.nx, input.ny);
+        await this.exec("ydotool", ["mousemove", "--absolute", "-x", String(x), "-y", String(y)], 2000, info.env).catch(() => {});
+        if (input.action === "click" || input.action === "up") {
+          const btnHex = input.button === "right" ? "0xC1" : "0xC0";
+          await this.exec("ydotool", ["click", btnHex], 2000, info.env).catch(() => {});
+        }
+      } else if (input.type === "text") {
+        await this.exec("ydotool", ["type", input.text], 3000, info.env).catch(() => {});
+      }
+    }
+  }
+}

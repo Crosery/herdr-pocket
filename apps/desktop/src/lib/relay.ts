@@ -13,6 +13,7 @@ import {
   type RpcParams,
   type RpcResult,
   type ServerFrame,
+  type StreamKind,
 } from "@herdr-pocket/protocol";
 import { DirectError, DirectLink, SAFE_AGAIN } from "./direct";
 import { localHostIdStore, refreshLocalHostIdFast } from "./fonts";
@@ -183,7 +184,7 @@ interface PendingRpc {
 interface Sub {
   id: string;
   to: string;
-  stream: "terminal" | "session";
+  stream: StreamKind;
   params: unknown;
   onEvent: StreamCb;
   onState?: StreamCb;
@@ -796,7 +797,12 @@ class SocketClient {
     });
   }
 
-  subscribe(to: string, stream: "terminal" | "session", params: unknown, onEvent: StreamCb, onState?: StreamCb): () => void {
+  directEndpoint(to: string): { addr: string; port: number } | null {
+    const link = this.direct.get(to);
+    return link?.open ? { addr: link.addr, port: link.port } : null;
+  }
+
+  subscribe(to: string, stream: StreamKind, params: unknown, onEvent: StreamCb, onState?: StreamCb): () => void {
     const id = `s${++this.seq}`;
     const link = this.direct.get(to);
     const sub: Sub = { id, to, stream, params, onEvent, onState, via: link?.open ? link : undefined };
@@ -924,17 +930,20 @@ export async function rpcCall<M extends RpcMethod>(
   return activeClient.call(to, method, params, timeoutMs) as Promise<RpcResult<M>>;
 }
 
+export function getDirectEndpoint(to: string): { addr: string; port: number } | null {
+  return activeClient?.directEndpoint(to) ?? null;
+}
+
 export function subscribeStream(
   to: string,
-  stream: "terminal" | "session",
+  stream: StreamKind,
   params: unknown,
   onEvent: StreamCb,
   onState?: StreamCb,
 ): () => void {
   const server = settingsStore.get().server;
   if (server && isMockServer(server)) {
-    onState?.({ kind: "live" });
-    return () => {};
+    return mockApi.subscribe(to, stream, params, onEvent, onState);
   }
   if (!activeClient) {
     onState?.({ kind: "stale", error: "未连接" });

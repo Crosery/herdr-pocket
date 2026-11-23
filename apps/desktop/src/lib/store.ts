@@ -177,12 +177,27 @@ export function allAgents(byHost: Record<string, Agent[]>): Agent[] {
   return out;
 }
 
-export function findAgent(key: string): Agent | undefined {
-  for (const list of Object.values(liveStore.get().agents)) {
+/** O(1)-host-indexed lookup of a single agent key without flattening/sorting all hosts. */
+export function lookupAgentByKey(
+  byHost: Record<string, Agent[]>,
+  key: string | null | undefined,
+): Agent | undefined {
+  if (!key) return undefined;
+  const slash = key.indexOf("/");
+  if (slash > 0) {
+    const host = key.slice(0, slash);
+    const hit = byHost[host]?.find((a) => a.key === key);
+    if (hit) return hit;
+  }
+  for (const list of Object.values(byHost)) {
     const hit = list.find((a) => a.key === key);
     if (hit) return hit;
   }
   return undefined;
+}
+
+export function findAgent(key: string): Agent | undefined {
+  return lookupAgentByKey(liveStore.get().agents, key);
 }
 
 export function agentTitle(a: Pick<Agent, "name" | "title" | "localId" | "harness">): string {

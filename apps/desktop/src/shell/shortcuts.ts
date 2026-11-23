@@ -237,6 +237,83 @@ export function matchesCombo(e: KeyboardEvent, keys: string[]): boolean {
   return e.key.toLowerCase() === key.toLowerCase();
 }
 
+export type ShortcutModifierChord = "Mod" | "Mod+Shift" | "Mod+Alt" | "Mod+Alt+Shift";
+
+/** Returns the primary modifier chord prefix of a combo (null for non-Mod / Ctrl combos on Mac). */
+export function chordOfKeys(keys: string[]): ShortcutModifierChord | null {
+  if (!keys.includes("Mod") || keys.includes("Ctrl")) return null;
+  const hasAlt = keys.includes("Alt");
+  const hasShift = keys.includes("Shift");
+  if (hasAlt && hasShift) return "Mod+Alt+Shift";
+  if (hasAlt) return "Mod+Alt";
+  if (hasShift) return "Mod+Shift";
+  return "Mod";
+}
+
+/** Resolves the currently held modifier chord from a DOM keyboard event. */
+export function chordFromModifierEvent(
+  e: Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey">,
+  isMac = IS_MAC,
+): ShortcutModifierChord | null {
+  const modHeld = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  if (!modHeld) return null;
+  if (e.altKey && e.shiftKey) return "Mod+Alt+Shift";
+  if (e.altKey) return "Mod+Alt";
+  if (e.shiftKey) return "Mod+Shift";
+  return "Mod";
+}
+
+export function trailingKeyChip(keys: string[], isMac = IS_MAC): string {
+  const last = keys[keys.length - 1];
+  if (!last) return "";
+  return (isMac ? MAC_GLYPH[last] : OTHER_GLYPH[last]) ?? last;
+}
+
+export function shortcutsForChord(
+  chord: ShortcutModifierChord,
+): Array<{ shortcut: Shortcut; keys: string[]; actionChip: string }> {
+  const out: Array<{ shortcut: Shortcut; keys: string[]; actionChip: string }> = [];
+  for (const shortcut of SHORTCUTS) {
+    const matched =
+      chordOfKeys(shortcut.keys) === chord
+        ? shortcut.keys
+        : shortcut.alt?.find((combo) => chordOfKeys(combo) === chord);
+    if (!matched) continue;
+    out.push({ shortcut, keys: matched, actionChip: trailingKeyChip(matched) });
+  }
+  return out;
+}
+
+export function nextModifierSteps(
+  chord: ShortcutModifierChord,
+  isMac = IS_MAC,
+): Array<{ addChip: string; targetChord: ShortcutModifierChord; count: number; sampleLabels: string[] }> {
+  const shiftChip = isMac ? "⇧" : "Shift";
+  const altChip = isMac ? "⌥" : "Alt";
+  const candidates: Array<{ addChip: string; targetChord: ShortcutModifierChord }> =
+    chord === "Mod"
+      ? [
+          { addChip: shiftChip, targetChord: "Mod+Shift" },
+          { addChip: altChip, targetChord: "Mod+Alt" },
+        ]
+      : chord === "Mod+Shift"
+        ? [{ addChip: altChip, targetChord: "Mod+Alt+Shift" }]
+        : chord === "Mod+Alt"
+          ? [{ addChip: shiftChip, targetChord: "Mod+Alt+Shift" }]
+          : [];
+  return candidates
+    .map(({ addChip, targetChord }) => {
+      const items = shortcutsForChord(targetChord);
+      return {
+        addChip,
+        targetChord,
+        count: items.length,
+        sampleLabels: items.slice(0, 3).map((x) => x.shortcut.label),
+      };
+    })
+    .filter((step) => step.count > 0);
+}
+
 export function matchShortcut(e: KeyboardEvent): ShortcutId | null {
   for (const s of SHORTCUTS) {
     if (s.helpOnly) continue;

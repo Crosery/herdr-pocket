@@ -50,7 +50,7 @@ export function canActOnLocalFile(opts: LocalFileActionOptions): boolean {
     return isAbsoluteOrHomePath(target) || Boolean(opts.agentCwd?.trim());
   }
   if (!opts.localHostId) {
-    return Boolean(opts.absPath?.trim() && isAbsoluteOrHomePath(opts.absPath)) || isAbsoluteOrHomePath(opts.path);
+    return false;
   }
   return opts.agentDeviceId === opts.localHostId;
 }

@@ -29,12 +29,13 @@ import {
   type ReleaseNotes,
 } from "../../lib/updates";
 import { RichMarkdown } from "../../lib/markdown";
+import { triggerDemoAttentionPreview } from "../../lib/attentionCenter";
 import { isMockServer } from "../../lib/mock";
 import { refreshNotifyChannel, signOut } from "../../lib/relay";
 import { liveStore, relTime, settingsStore, updateSettings } from "../../lib/store";
 import { useWindowHidden } from "../../lib/layout";
 import { ConfigSelect, ConfigSwitch, PaneTitle, SetHeading, SetRow } from "./rows";
-import { ChatDisplayModeRow, TerminalSettingsSection } from "./FramePanes";
+import { ChatDisplayModeRow, TerminalSettingsSection, UiFontSettingsSection } from "./FramePanes";
 import { ToolVersionsSection } from "./ToolVersions";
 
 const PLATFORM_LABEL: Record<string, string> = {
@@ -185,6 +186,7 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
           ))}
         </div>
       </SetRow>
+      <UiFontSettingsSection />
       <ChatDisplayModeRow />
       <ConfigSwitch k="general.showShells" about="列出普通 Shell 终端" />
       {DESKTOP ? <TerminalSettingsSection /> : null}
@@ -309,6 +311,10 @@ export function NotificationsPane() {
           void refreshNotifyChannel();
         }}
       />
+      <ConfigSwitch
+        k="general.dynamicIsland"
+        about="在 macOS 屏幕顶部刘海 / 菜单栏中央联动显示灵动岛提醒与快速跳转"
+      />
       <SetRow title="提示音" about="后台 Agent 需要你确认或长任务完成时播放轻柔提示音">
         <PocketSwitch checked={alertSound} onCheckedChange={(v) => updateSettings({ alertSound: v })} label="提示音" />
       </SetRow>
@@ -318,6 +324,11 @@ export function NotificationsPane() {
           onCheckedChange={(v) => updateSettings({ alertChimeOnlyLongTasks: v })}
           label="仅长耗时任务完成时响铃"
         />
+      </SetRow>
+      <SetRow title="灵动岛与提醒预览" about="触发示例审批、提问与完成提醒，预览顶部灵动岛与窗口内提醒队列">
+        <PocketButton size="sm" variant="soft" onClick={() => triggerDemoAttentionPreview()}>
+          预览提醒效果
+        </PocketButton>
       </SetRow>
       <SetRow title="测试通知">
         <PocketButton size="sm" variant="ghost" onClick={() => void pushSystemNotification("Herdr Pocket", "通知能正常弹出")}>

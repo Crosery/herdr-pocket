@@ -13,12 +13,13 @@ import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle } from "..
 import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
-import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, tileLetter, toneIndex, type ListGroup } from "./agentInfo";
+import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, type ListGroup } from "./agentInfo";
 import { pullHostDocNow } from "./herdrDocSync";
+import { SPACE_ICON_PRESETS, SpaceTileIcon, setCustomSpaceIcon, spaceIconStore } from "./spaceIcon";
 import { activeTabIdForSpace, closeTabsForSpace, focusedLeafOfTab, openAgentTab, openSettingsFrame, renameSpaceInShellStore, setPalette, setSelectedSpace, shellStore, splitActivePaneWithContent, tabLeaves } from "./shellStore";
 import { shortcutText } from "./shortcuts";
 import { SpatialHint } from "./useModifierHoldHints";
-import { buildHostSpaces, spaceColorVars, type SidebarSpace } from "./spaceSync";
+import { buildHostSpaces, type SidebarSpace } from "./spaceSync";
 
 const FOLD_KEY = "herdr-pocket-v3-folded";
 const SORT_KEY = "herdr-pocket-v3-agent-sort";
@@ -100,6 +101,7 @@ export function ShellSidebar({
   const [renamingSpace, setRenamingSpace] = useState(false);
   const [spaceMenu, setSpaceMenu] = useState<{ x: number; y: number; space: SidebarSpace } | null>(null);
   const [agentMenu, setAgentMenu] = useState<{ x: number; y: number; agent: Agent } | null>(null);
+  const customSpaceIcons = spaceIconStore.use((m) => m);
   const toast = useToast();
   const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k), spacesMap);
 
@@ -444,10 +446,6 @@ export function ShellSidebar({
                     ? null
                     : m.spaces.map((s) => {
                         const label = s.name;
-                        const custom = spaceColorVars(s.color);
-                        const tileStyle = custom
-                          ? ({ "--sp-fg": custom.fg, "--sp-bg": custom.bg } as CSSProperties)
-                          : undefined;
                         return (
                           <div
                             key={s.id}
@@ -465,13 +463,16 @@ export function ShellSidebar({
                             }}
                             onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setSpaceSel(s.id))}
                           >
-                            <span
-                              className={`v3-tile${custom ? " custom" : ` tone-${toneIndex(label)}`}`}
-                              style={tileStyle}
-                              aria-hidden
-                            >
-                              {tileLetter(label)}
-                            </span>
+                            <SpaceTileIcon
+                              spaceKey={s.id}
+                              name={label}
+                              folder={s.folder}
+                              isWorktree={s.isWorktree}
+                              color={s.color}
+                              selected={selected === s.id}
+                              blocked={s.blocked > 0}
+                              size="sm"
+                            />
                             {collapsed ? null : (
                               <>
                                 <span className="v3-row-label truncate">{label}</span>
@@ -729,9 +730,9 @@ export function ShellSidebar({
               role="menu"
               data-tauri-drag-region="false"
               style={{
-                left: Math.max(8, Math.min(spaceMenu.x, window.innerWidth - 212 - 8)),
-                top: Math.max(8, Math.min(spaceMenu.y, window.innerHeight - 210)),
-                width: 212,
+                left: Math.max(8, Math.min(spaceMenu.x, window.innerWidth - 228 - 8)),
+                top: Math.max(8, Math.min(spaceMenu.y, window.innerHeight - 300)),
+                width: 228,
               }}
               onPointerDown={(e) => e.stopPropagation()}
             >
@@ -761,6 +762,45 @@ export function ShellSidebar({
                 <Plus size={14} />
                 <span className="grow">新建 Agent…</span>
               </button>
+              <div className="menu-sep" />
+              <div className="v3-space-icon-picker">
+                <div className="v3-space-icon-head">
+                  <span>空间图标</span>
+                  {customSpaceIcons[spaceMenu.space.id] ? (
+                    <button
+                      type="button"
+                      className="v3-space-icon-reset"
+                      onClick={() => {
+                        setCustomSpaceIcon(spaceMenu.space.id, null);
+                        setSpaceMenu(null);
+                      }}
+                    >
+                      自动
+                    </button>
+                  ) : null}
+                </div>
+                <div className="v3-space-icon-grid">
+                  {SPACE_ICON_PRESETS.slice(0, 12).map((p) => {
+                    const Icon = p.Icon;
+                    const active = customSpaceIcons[spaceMenu.space.id] === p.id;
+                    return (
+                      <button
+                        key={p.id}
+                        type="button"
+                        className={`v3-space-icon-opt${active ? " on" : ""}`}
+                        title={p.label}
+                        aria-label={p.label}
+                        onClick={() => {
+                          setCustomSpaceIcon(spaceMenu.space.id, p.id);
+                          setSpaceMenu(null);
+                        }}
+                      >
+                        <Icon size={13} strokeWidth={2} />
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
               <div className="menu-sep" />
               <button
                 type="button"

@@ -1,13 +1,13 @@
 {
   "name": "@herdr-pocket/desktop",
   "private": true,
-  "version": "0.2.24",
+  "version": "0.2.25",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
-    "test": "node --import ./test/_loader.mjs --test \"test/*.test.ts\"",
+    "test": "node --import ./test/_loader.mjs --test --test-concurrency=4 \"test/*.test.ts\"",
     "build": "tsc --noEmit && vite build",
     "build:harmony": "tsc --noEmit && vite build --mode harmony --base ./ --outDir ../harmony/entry/src/main/resources/rawfile",
     "tauri": "tauri"

@@ -512,6 +512,20 @@
   scrollbar-width: thin;
 }
 
+.sf-ui-preview {
+  margin: 6px 0 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: calc(13px * var(--ts, 1));
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
 /* A narrow page (the frame at its 640 px minimum): controls drop under their text.
    A wider page keeps them on the right even where the window-width rule in app.css wraps. */
 @container sfpage (max-width: 420px) {

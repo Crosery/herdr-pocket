@@ -459,13 +459,21 @@ test("detectDismissableSubscreen enforces Hard Veto, handles working (esc to can
     { kind: "pager", dismissKey: "q", dismissAlias: "q", reason: "pager" },
   );
 
-  // Claude Code detailed transcript viewer closes via Ctrl+O (\x0f).
+  // Claude Code detailed transcript viewer exits safely via Esc (never toggles Ctrl+O \x0f),
+  // and if an active composer prompt (`❯ `) is visible, scrollback noise never triggers dismissal.
   assert.deepEqual(
     detectDismissableSubscreen({
       screen: "Showing detailed transcript\n• Tool call output...\nctrl+o to collapse",
       status: "idle",
     }),
-    { kind: "viewer", dismissKey: "\x0f", dismissAlias: "ctrl+o", reason: "transcript" },
+    { kind: "viewer", dismissKey: "\x1b", dismissAlias: "esc", reason: "transcript" },
+  );
+  assert.equal(
+    detectDismissableSubscreen({
+      screen: "Showing detailed transcript\nctrl+o to collapse\nSettings Status Usage\n❯ \nshift+tab to cycle",
+      status: "idle",
+    }),
+    null,
   );
 
   // HcAdapter.toAgent exposes structured statusKind only when blocked.
@@ -479,4 +487,27 @@ test("detectDismissableSubscreen enforces Hard Veto, handles working (esc to can
     "d1",
   );
   assert.equal(idleWithKind.statusKind, undefined);
+});
+
+test("dismissSubscreens inspects visible viewport only (history=0) and stops if screen is unchanged", async () => {
+  const historyArgs: number[] = [];
+  const rawInputs: string[] = [];
+  const snapshotMock = {
+    async snapshot(_address: string, history = 0) {
+      historyArgs.push(history);
+      return { text: "Showing detailed transcript\nctrl+o to collapse", cols: 80, rows: 24, altScreen: false };
+    },
+    async input(_address: string, data: string) {
+      rawInputs.push(data);
+    },
+  };
+  const hc = new HcAdapter("nonexistent-hc-bin");
+  (hc as any).screens = snapshotMock;
+  (hc as any).terminals.set("t1", { address: "t1", cols: 80, rows: 24, status: { app: "claude-code", state: "idle" } });
+
+  const res = await hc.dismissSubscreens("t1");
+  assert.equal(res, "blocked");
+  assert.ok(historyArgs.length >= 2 && historyArgs.every((h) => h === 0));
+  // Raw input must send Esc (\x1b), never Ctrl+O (\x0f), and abort on the first unchanged pass.
+  assert.deepEqual(rawInputs, ["\x1b"]);
 });

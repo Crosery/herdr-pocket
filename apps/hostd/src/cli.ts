@@ -16,6 +16,7 @@ import { SERVICE_HELP, control as controlAt, serviceCommand } from "./winservice
 import { UPDATE_HELP, currentRegion, updateCommand, versionCommand, watchForUpdates } from "@herdr-pocket/update";
 import { CONFIG_HELP, configCommand } from "./configcmd.ts";
 import { readUpstreamCache, upstreamCheckEnabled, upstreamLine, watchUpstream } from "./upstream.ts";
+import { readHookConfig } from "./portal/shims.ts";
 
 const HELP = `herdr-pocket ${HOSTD_VERSION} — put this computer's herdr agents in your pocket
 
@@ -85,6 +86,8 @@ async function main(): Promise<void> {
       return talk(cmd, rest);
     case "logs":
       return logs(rest);
+    case "open":
+      return openPortalCli(rest);
     case "config":
       return configCommand(rest, reportToRelay);
     case "version":
@@ -636,6 +639,26 @@ function ago(ms: number): string {
   if (s < 5400) return `${Math.round(s / 60)} min ago`;
   if (s < 129600) return `${Math.round(s / 3600)} h ago`;
   return `${Math.round(s / 86400)} d ago`;
+}
+
+async function openPortalCli(argv: string[]): Promise<void> {
+  const hook = readHookConfig();
+  if (!hook) fail("hostd portal hook is not running.");
+  const res = await fetch(`http://127.0.0.1:${hook.port}/open`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-portal-secret": hook.secret },
+    body: JSON.stringify({
+      tool: "herdr-pocket-open",
+      argv,
+      cwd: process.cwd(),
+      terminalId: process.env.HERDR_POCKET_TERMINAL || undefined,
+      ppid: process.ppid,
+    }),
+    signal: AbortSignal.timeout(5000),
+  });
+  const j = (await res.json()) as { handled?: boolean; id?: string };
+  if (!j.handled) fail("unable to open portal target.");
+  console.log(j.id ?? "ok");
 }
 
 function fail(msg: string): never {

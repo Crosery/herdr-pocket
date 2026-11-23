@@ -53,6 +53,7 @@ import { isTauri } from "../lib/bridge";
 import { logAction } from "../lib/log";
 import { localHostIdStore, refreshLocalHostIdFast } from "../lib/fonts";
 import { native } from "../lib/native";
+import { jumpToNextAttentionItem, startAttentionCenter } from "../lib/attentionCenter";
 import { refreshHostSpaces, rpcCall } from "../lib/relay";
 import { checkForUpdate } from "../lib/updates";
 import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle, updateSettings, agentTitle } from "../lib/store";
@@ -60,6 +61,7 @@ import { terminalOwnsCtrlK } from "../lib/termKeys";
 import { getTerminalThemeSpec, resolveTerminalAppearance } from "../lib/terminalTheme";
 import { GROUP_RANK, lastChange, listGroup } from "./agentInfo";
 import { flushHostNow, pullHostDocNow, registerPendingSplitPlacement, syncHostNow, useHerdrDocSync } from "./herdrDocSync";
+import { ModifierChordHud } from "./ModifierChordHud";
 import { Palette, type PaletteItem } from "./Palette";
 import { ShortcutHelpModal } from "./ShortcutHelpModal";
 import { ShellSidebar } from "./ShellSidebar";
@@ -148,6 +150,9 @@ function measureTerminalGrid(splitDirection?: SplitDirection): {
   };
 }
 
+// Cache transient Herdr.app GUI unavailability so local splits don't pay RPC timeouts repeatedly.
+let herdrAppSplitSkipUntil = 0;
+
 /**
  * Desktop shell v3 (R36): Herdr's window skeleton with our colours and words.
  * sidebar 268 (rail 44) | tabs 42 / body (padding 8, gap 8: pane + panel 368) / status 28.
@@ -183,6 +188,7 @@ export function DesktopShell({
 
   useModifierHoldHints();
   useHerdrDocSync();
+  useEffect(() => startAttentionCenter(), []);
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const hosts = useMemo(() => Object.values(devices).filter((d) => d.kind === "host"), [devices]);
@@ -389,7 +395,8 @@ export function DesktopShell({
       };
 
       // Path 1: When splitting an existing synced Herdr pane, delegate directly to Herdr.app (`pane.split`)
-      // so both local Mac and remote Mac split inside the exact tab in Herdr.app instead of creating a new tab!
+      // so both local Mac and remote Mac split inside the exact tab in Herdr.app instead of creating a new tab.
+      const isLocalDesktop = isTauri() && native.available() && Boolean(localHostId && hostId === localHostId);
       const canUseHerdrPaneSplit = Boolean(
         splitTarget &&
           targetTab &&
@@ -398,7 +405,8 @@ export function DesktopShell({
           activeAgent?.source === "hc" &&
           activeAgent.deviceId === hostId &&
           !targetLeaf.id.startsWith("p0:") &&
-          !targetLeaf.id.startsWith("p-"),
+          !targetLeaf.id.startsWith("p-") &&
+          !(isLocalDesktop && Date.now() < herdrAppSplitSkipUntil),
       );
       if (canUseHerdrPaneSplit && splitTarget && targetTab && targetLeaf) {
         try {
@@ -409,7 +417,7 @@ export function DesktopShell({
               command: "pane.split",
               args: { pane: targetLeaf.id, direction: splitTarget.direction },
             },
-            10_000,
+            isLocalDesktop ? 900 : 10_000,
           );
           const payload = (cmdRes?.result ?? {}) as { terminal?: unknown; pane?: unknown };
           const rawTerm = typeof payload.terminal === "string" ? payload.terminal.trim() : "";
@@ -423,11 +431,10 @@ export function DesktopShell({
             return;
           }
         } catch {
+          if (isLocalDesktop) herdrAppSplitSkipUntil = Date.now() + 15_000;
           // Herdr.app window may be closed on that computer; fall through cleanly to direct hc/agent.create below.
         }
       }
-
-      const isLocalDesktop = isTauri() && native.available() && Boolean(localHostId && hostId === localHostId);
       const tryLocalShellCreate = async (): Promise<boolean> => {
         if (!isLocalDesktop) return false;
         try {
@@ -942,12 +949,13 @@ export function DesktopShell({
   }
 
   function jumpUrgentAgent() {
+    if (jumpToNextAttentionItem()) return;
     const live = liveStore.get();
     const list = allAgents(live.agents)
       .filter((a) => a.status === "blocked")
       .sort((a, b) => lastChange(b) - lastChange(a));
     if (!list.length) {
-      toast("当前没有待确认或需要输入的 Agent");
+      toast("当前没有待处理的审批、提问、报错或完成提醒");
       return;
     }
     const ref = currentFocusedPane();
@@ -1234,6 +1242,7 @@ export function DesktopShell({
       </div>
 
       <Palette mode={palette} onClose={() => setPalette(false)} items={items} />
+      <ModifierChordHud />
       <PocketDroplet />
       <ShortcutHelpModal open={helpOpen} onOpenChange={setHelpOpen} />
       <SettingsFrame

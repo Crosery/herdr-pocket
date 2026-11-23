@@ -25,6 +25,8 @@ pub struct HerdrTerminalPrefs {
 #[serde(rename_all = "camelCase")]
 pub struct FontCatalog {
     pub families: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ui_families: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub herdr_font: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,6 +65,7 @@ struct FontCache {
     faces: Vec<ScannedFace>,
     by_family_lower: HashMap<String, Vec<usize>>,
     families: Vec<String>,
+    ui_families: Vec<String>,
     symbols_font: Option<String>,
 }
 
@@ -411,6 +414,30 @@ pub fn is_selectable_mono_family(family: &str, is_mono: bool) -> bool {
     )
 }
 
+pub fn is_selectable_ui_family(family: &str) -> bool {
+    let clean = family.trim();
+    if clean.is_empty() || clean.starts_with('.') {
+        return false;
+    }
+    let lower = clean.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "apple braille"
+            | "lastresort"
+            | "apple symbols"
+            | "apple color emoji"
+            | "symbols nerd font"
+            | "symbols nerd font mono"
+            | "webdings"
+            | "wingdings"
+            | "wingdings 2"
+            | "wingdings 3"
+            | "zapf dingbats"
+            | "gb18030 bitmap"
+            | "stixnonunicode"
+    )
+}
+
 #[derive(Debug, Clone)]
 struct TableDirEntry {
     tag: [u8; 4],
@@ -629,6 +656,7 @@ fn build_cache() -> FontCache {
     }
 
     let mut mono_families: BTreeMap<String, String> = BTreeMap::new();
+    let mut ui_family_map: BTreeMap<String, String> = BTreeMap::new();
     let mut by_family_lower: HashMap<String, Vec<usize>> = HashMap::new();
     let mut faces = Vec::with_capacity(raw.len());
     let mut symbols_font: Option<(u8, String)> = None;
@@ -645,6 +673,11 @@ fn build_cache() -> FontCache {
                 .entry(key.clone())
                 .or_insert_with(|| face.family.clone());
         }
+        if is_selectable_ui_family(&face.family) {
+            ui_family_map
+                .entry(key.clone())
+                .or_insert_with(|| face.family.clone());
+        }
         let sym_rank = symbols_font_priority(&key);
         if sym_rank > 0 && symbols_font.as_ref().is_none_or(|(best, _)| sym_rank > *best) {
             symbols_font = Some((sym_rank, face.family.clone()));
@@ -655,11 +688,14 @@ fn build_cache() -> FontCache {
 
     let mut families: Vec<String> = mono_families.into_values().collect();
     families.sort_by_key(|s| s.to_ascii_lowercase());
+    let mut ui_families: Vec<String> = ui_family_map.into_values().collect();
+    ui_families.sort_by_key(|s| s.to_ascii_lowercase());
 
     FontCache {
         faces,
         by_family_lower,
         families,
+        ui_families,
         symbols_font: symbols_font.map(|(_, f)| f),
     }
 }
@@ -734,6 +770,7 @@ pub async fn terminal_list_fonts() -> Result<FontCatalog, String> {
         let prefs = read_herdr_terminal_prefs();
         ensure_cache(|c| FontCatalog {
             families: c.families.clone(),
+            ui_families: c.ui_families.clone(),
             herdr_font: prefs.font,
             herdr_font_size: prefs.font_size,
             herdr_line_height: prefs.line_height,

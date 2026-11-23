@@ -7,7 +7,15 @@ import { PermissionCards, prettyHotkey } from "../../components/VoiceInput";
 import { serverLabel } from "../../components/Sidebar";
 import { copyToClipboard } from "../../lib/bridge";
 import { partitionDevices, type ClassifiedDevice } from "../../lib/deviceRole";
-import { buildTerminalFontFamily, ensureTerminalFontLoaded, useLocalHostDeviceId, useTerminalFontCatalog } from "../../lib/fonts";
+import {
+  buildTerminalFontFamily,
+  buildUiFontFamily,
+  detectInstalledUiFonts,
+  ensureTerminalFontLoaded,
+  ensureUiFontLoaded,
+  useLocalHostDeviceId,
+  useTerminalFontCatalog,
+} from "../../lib/fonts";
 import { native, type LogFolderInfo, type Permissions } from "../../lib/native";
 import { setConfig, useClientConfig } from "../../lib/config";
 import { isMockServer } from "../../lib/mock";
@@ -198,30 +206,41 @@ function ConfigIntStepper({
 
 const CUSTOM_FONT_VALUE = "__custom__";
 
-export function TerminalSettingsSection() {
-  const toast = useToast();
-  const term = useClientConfig().terminal;
-  const catalog = useTerminalFontCatalog();
-  const webFallback = useMemo(() => detectInstalledMonoFonts(), []);
-  const installed = useMemo(
-    () => (catalog?.families && catalog.families.length > 0 ? catalog.families : webFallback),
-    [catalog, webFallback],
-  );
+function FontFamilyPicker({
+  title,
+  about,
+  ariaLabel,
+  customAriaLabel,
+  defaultLabel,
+  value,
+  installed,
+  loadFont,
+  onSave,
+}: {
+  title: string;
+  about: string;
+  ariaLabel: string;
+  customAriaLabel: string;
+  defaultLabel: string;
+  value: string;
+  installed: string[];
+  loadFont: (family: string) => Promise<boolean>;
+  onSave: (next: string) => void;
+}) {
   const isUnlistedCustom = useMemo(
-    () => Boolean(term.fontFamily) && !installed.some((f) => f.toLowerCase() === term.fontFamily.toLowerCase()),
-    [installed, term.fontFamily],
+    () => Boolean(value) && !installed.some((f) => f.toLowerCase() === value.toLowerCase()),
+    [installed, value],
   );
   const [customMode, setCustomMode] = useState(false);
-  const [fontDraft, setFontDraft] = useState(term.fontFamily);
-  const [fontMissing, setFontMissing] = useState(false);
-  const [previewTick, setPreviewTick] = useState(0);
+  const [draft, setDraft] = useState(value);
+  const [missing, setMissing] = useState(false);
   const customInputRef = useRef<HTMLInputElement | null>(null);
   const focusCustomOnCloseRef = useRef(false);
   const skipBlurCommitRef = useRef(false);
 
   useEffect(() => {
-    setFontDraft(term.fontFamily);
-  }, [term.fontFamily]);
+    setDraft(value);
+  }, [value]);
 
   useEffect(() => {
     if (!customMode) return;
@@ -231,112 +250,186 @@ export function TerminalSettingsSection() {
 
   useEffect(() => {
     let cancelled = false;
-    void ensureTerminalFontLoaded(term.fontFamily, term.fontWeight >= 600).then((loaded) => {
+    void loadFont(value).then((loaded) => {
       if (cancelled) return;
-      if (loaded) setPreviewTick((t) => t + 1);
-      setFontMissing(Boolean(native.available() && term.fontFamily.trim() && !loaded));
+      setMissing(Boolean(native.available() && value.trim() && !loaded));
     });
     return () => {
       cancelled = true;
     };
-  }, [term.fontFamily, term.fontWeight, catalog?.herdrFont, catalog?.symbolsFont]);
+  }, [loadFont, value]);
 
   const commitFont = (nextRaw: string) => {
     const next = nextRaw.trim();
     const matchedInstalled = installed.some((f) => f.toLowerCase() === next.toLowerCase());
     if (!next || matchedInstalled) setCustomMode(false);
-    if (next === term.fontFamily) return;
-    void ensureTerminalFontLoaded(next, term.fontWeight >= 600).then((loaded) => {
-      if (loaded) setPreviewTick((t) => t + 1);
-      setFontMissing(Boolean(native.available() && next && !loaded));
+    if (next === value) return;
+    void loadFont(next).then((loaded) => {
+      setMissing(Boolean(native.available() && next && !loaded));
     });
-    void setConfig("terminal.fontFamily", next).catch((e: Error) => toast(e.message, true));
+    onSave(next);
   };
 
   const showCustomInput = customMode || isUnlistedCustom;
-  const selectValue = showCustomInput ? CUSTOM_FONT_VALUE : term.fontFamily;
+  const selectValue = showCustomInput ? CUSTOM_FONT_VALUE : value;
 
-  const fontOptions = useMemo(() => {
-    const defaultLabel = catalog?.herdrFont ? `默认（${catalog.herdrFont}）` : "默认等宽字体";
-    return [
+  const options = useMemo(
+    () => [
       { value: "", label: defaultLabel },
       ...installed.map((f) => ({ value: f, label: f })),
       { value: CUSTOM_FONT_VALUE, label: "自定义字体…" },
-    ];
-  }, [catalog?.herdrFont, installed]);
+    ],
+    [defaultLabel, installed],
+  );
+
+  return (
+    <SetRow title={title} about={missing ? `未找到“${value}”，已回退默认栈` : about}>
+      <div className="sf-term-font-ctrl">
+        <PocketSelect
+          ariaLabel={ariaLabel}
+          value={selectValue}
+          options={options}
+          onCloseAutoFocus={(e) => {
+            if (!focusCustomOnCloseRef.current) return;
+            focusCustomOnCloseRef.current = false;
+            e.preventDefault();
+            window.setTimeout(() => customInputRef.current?.focus(), 20);
+          }}
+          onValueChange={(v) => {
+            if (v === CUSTOM_FONT_VALUE) {
+              focusCustomOnCloseRef.current = true;
+              setCustomMode(true);
+              return;
+            }
+            focusCustomOnCloseRef.current = false;
+            setCustomMode(false);
+            setDraft(v);
+            commitFont(v);
+          }}
+        />
+        {showCustomInput ? (
+          <input
+            ref={customInputRef}
+            className="pk-input"
+            data-escape-local="true"
+            value={draft}
+            placeholder="输入字体名，回车生效"
+            aria-label={customAriaLabel}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={() => {
+              if (skipBlurCommitRef.current) {
+                skipBlurCommitRef.current = false;
+                return;
+              }
+              commitFont(draft);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitFont(draft);
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                e.nativeEvent.stopImmediatePropagation?.();
+                skipBlurCommitRef.current = true;
+                setDraft(value);
+                if (!isUnlistedCustom) setCustomMode(false);
+                customInputRef.current?.blur();
+              }
+            }}
+          />
+        ) : null}
+      </div>
+    </SetRow>
+  );
+}
+
+export function UiFontSettingsSection() {
+  const toast = useToast();
+  const fontFamily = useClientConfig().general.fontFamily;
+  const catalog = useTerminalFontCatalog();
+  const webFallback = useMemo(() => detectInstalledUiFonts(), []);
+  const installed = useMemo(
+    () => (catalog?.uiFamilies && catalog.uiFamilies.length > 0 ? catalog.uiFamilies : webFallback),
+    [catalog?.uiFamilies, webFallback],
+  );
+  const [previewTick, setPreviewTick] = useState(0);
+  const loadUiFont = useCallback(async (fam: string) => {
+    const ok = await ensureUiFontLoaded(fam);
+    if (ok) setPreviewTick((t) => t + 1);
+    return ok;
+  }, []);
+  const previewFamily = useMemo(() => {
+    void previewTick;
+    return buildUiFontFamily(fontFamily);
+  }, [fontFamily, previewTick]);
+
+  return (
+    <>
+      <FontFamilyPicker
+        title="界面字体"
+        about="全局作用于侧栏、对话与面板"
+        ariaLabel="界面字体"
+        customAriaLabel="自定义界面字体"
+        defaultLabel="默认（Nunito + 系统界面字体）"
+        value={fontFamily}
+        installed={installed}
+        loadFont={loadUiFont}
+        onSave={(next) => {
+          void setConfig("general.fontFamily", next).catch((e: Error) => toast(e.message, true));
+        }}
+      />
+      <div className="sf-ui-preview" style={{ fontFamily: previewFamily }}>
+        Herdr Pocket · 空间、对话与面板全局字体预览 0123 ABC
+      </div>
+    </>
+  );
+}
+
+export function TerminalSettingsSection() {
+  const toast = useToast();
+  const term = useClientConfig().terminal;
+  const catalog = useTerminalFontCatalog();
+  const webFallback = useMemo(() => detectInstalledMonoFonts(), []);
+  const installed = useMemo(
+    () => (catalog?.families && catalog.families.length > 0 ? catalog.families : webFallback),
+    [catalog, webFallback],
+  );
+  const [previewTick, setPreviewTick] = useState(0);
+  const loadTermFont = useCallback(
+    async (fam: string) => {
+      const ok = await ensureTerminalFontLoaded(fam, term.fontWeight >= 600);
+      if (ok) setPreviewTick((t) => t + 1);
+      return ok;
+    },
+    [term.fontWeight],
+  );
 
   const previewFamily = useMemo(() => {
     void previewTick;
     return buildTerminalFontFamily(term.fontFamily, catalog);
   }, [catalog, previewTick, term.fontFamily]);
 
-  const fontAbout = fontMissing
-    ? `未找到“${term.fontFamily}”，已回退默认等宽字体`
-    : catalog?.herdrFont
-      ? `默认跟随 Herdr（${catalog.herdrFont}）`
-      : "自动读取本机等宽与 Nerd Font";
+  const fontAbout = catalog?.herdrFont
+    ? `默认跟随 Herdr（${catalog.herdrFont}）`
+    : "自动读取本机等宽与 Nerd Font";
 
   return (
     <>
       <SetHeading>终端</SetHeading>
-      <SetRow title="终端字体" about={fontAbout}>
-        <div className="sf-term-font-ctrl">
-          <PocketSelect
-            ariaLabel="终端字体"
-            value={selectValue}
-            options={fontOptions}
-            onCloseAutoFocus={(e) => {
-              if (!focusCustomOnCloseRef.current) return;
-              focusCustomOnCloseRef.current = false;
-              e.preventDefault();
-              window.setTimeout(() => customInputRef.current?.focus(), 20);
-            }}
-            onValueChange={(v) => {
-              if (v === CUSTOM_FONT_VALUE) {
-                focusCustomOnCloseRef.current = true;
-                setCustomMode(true);
-                return;
-              }
-              focusCustomOnCloseRef.current = false;
-              setCustomMode(false);
-              setFontDraft(v);
-              commitFont(v);
-            }}
-          />
-          {showCustomInput ? (
-            <input
-              ref={customInputRef}
-              className="pk-input mono"
-              data-escape-local="true"
-              value={fontDraft}
-              placeholder="输入字体名，回车生效"
-              aria-label="自定义终端字体"
-              onChange={(e) => setFontDraft(e.target.value)}
-              onBlur={() => {
-                if (skipBlurCommitRef.current) {
-                  skipBlurCommitRef.current = false;
-                  return;
-                }
-                commitFont(fontDraft);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  commitFont(fontDraft);
-                } else if (e.key === "Escape") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  e.nativeEvent.stopImmediatePropagation?.();
-                  skipBlurCommitRef.current = true;
-                  setFontDraft(term.fontFamily);
-                  if (!isUnlistedCustom) setCustomMode(false);
-                  customInputRef.current?.blur();
-                }
-              }}
-            />
-          ) : null}
-        </div>
-      </SetRow>
+      <FontFamilyPicker
+        title="终端字体"
+        about={fontAbout}
+        ariaLabel="终端字体"
+        customAriaLabel="自定义终端字体"
+        defaultLabel={catalog?.herdrFont ? `默认（${catalog.herdrFont}）` : "默认等宽字体"}
+        value={term.fontFamily}
+        installed={installed}
+        loadFont={loadTermFont}
+        onSave={(next) => {
+          void setConfig("terminal.fontFamily", next).catch((e: Error) => toast(e.message, true));
+        }}
+      />
       <div
         className="sf-term-preview"
         style={{
@@ -369,8 +462,9 @@ export function LookPane() {
     <div className="pane">
       <SetHeading>主题</SetHeading>
       <ThemeRow />
-      <SetHeading>大小</SetHeading>
+      <SetHeading>大小与字体</SetHeading>
       <TextScaleRow />
+      <UiFontSettingsSection />
       <SetHeading>对话</SetHeading>
       <ChatDisplayModeRow />
       <TerminalSettingsSection />

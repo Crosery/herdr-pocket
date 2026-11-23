@@ -19,6 +19,7 @@ import {
   type RpcMethod,
   type RpcMethods,
   type ServerFrame,
+  type StreamKind,
   type TerminalDataEvent,
   type TerminalDisplay,
   type TerminalRowsEvent,
@@ -28,7 +29,9 @@ import { sendAndCaptureSlashCommand } from "./slashCapture.ts";
 import type { ScreenLines } from "./hcscreen.ts";
 import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, findPrograms, herdrCommandArgs, installedLaunchers, isHerdrWindowClosedError, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
-import { DirectServer, type DirectPeer } from "./direct.ts";
+import { DirectServer, directAddrs, type DirectPeer } from "./direct.ts";
+import { PortalManager } from "./portal/index.ts";
+import { ToolUpdateManager } from "./toolUpdate.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
 import { SessionHints } from "./sessionhint.ts";
 import { base, debounce } from "./util.ts";
@@ -37,6 +40,7 @@ import { typeFirstTask, type TypeTaskOptions } from "./firsttask.ts";
 import { FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from "./put.ts";
 import { LogBuffer, clipChars, levelOf } from "./logbuf.ts";
 import { CONFIG_DIR, type HostConfig } from "./config.ts";
+import { defaultHcBin } from "./platform.ts";
 import { FilesError, listFiles, listFolders, readFileSlice } from "./files.ts";
 import { getGitDiff, getGitLog, getGitStatus, gitCheckout, gitCommit, gitDiscard, gitPull, gitPush, gitStage, gitUnstage } from "./git.ts";
 import { scanAgentSlashCommands } from "./slash.ts";
@@ -72,6 +76,9 @@ const MUTATING = new Set([
   "git.checkout",
   "git.pull",
   "git.push",
+  "tools.update",
+  "portal.open",
+  "portal.close",
 ]);
 
 /** What a call was about, short: never more than 200 characters of anyone's message. */
@@ -148,11 +155,13 @@ export class Host {
   private calls = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
   private callSeq = 0;
   private streamStops = new Map<string, () => void>();
-  private streamMeta = new Map<string, { from: string; kind: "terminal" | "session"; agent: string }>();
+  private streamMeta = new Map<string, { from: string; kind: StreamKind; agent: string }>();
   /** Streams opened over a direct link answer there, not through the relay. */
   private streamReply = new Map<string, (f: ClientFrame) => void>();
   /** Phones connected straight to this computer (see direct.ts). */
   direct: DirectServer;
+  portal: PortalManager;
+  toolUpdater: ToolUpdateManager;
   private sendQueues = new Map<string, Array<{ id: string; text: string; enter: boolean; delivery?: "auto" | "steer" }>>();
   private queueSeq = 0;
   private subscreenByAgent = new Map<string, "viewer" | "pager">();
@@ -222,11 +231,75 @@ export class Host {
     this.settings = readClientConfig();
     this.settingsStamp = this.stampOf(this.settings);
     this.deviceId = opts.config.deviceId;
+    this.portal = new PortalManager({
+      hostId: () => this.deviceId,
+      getAgents: () => this.agents,
+      getTerminals: () => this.hc.terminals,
+      getFilesOptions: () => ({
+        privateDirs: [
+          ...this.privateDirs,
+          join(homedir(), ".agents", "crosery", "credentials"),
+          join(homedir(), "Library", "Keychains"),
+        ],
+        extraRoots: [this.filesDir, homedir(), tmpdir(), "/tmp"],
+      }),
+      getDirectInfo: () => ({
+        port: this.direct.port,
+        addrs: directAddrs(),
+        connectedCount: this.direct.connected().length,
+      }),
+      hasRemoteViewers: () => {
+        if (this.direct.connected().length > 0) return true;
+        if (this.streamMeta.size > 0) return true;
+        for (const d of this.devices.values()) {
+          if (d.kind === "viewer" && d.online) return true;
+        }
+        return false;
+      },
+      onPortalEvent: (ev) => {
+        if (ev.kind !== "portal_event") return;
+        const targetAgent = ev.item.agentKey;
+        if (!targetAgent) return;
+        for (const [id, meta] of this.streamMeta) {
+          if (meta.kind === "terminal" && meta.agent === targetAgent) {
+            this.sendStream(id, ev);
+          }
+        }
+      },
+    });
+    this.toolUpdater = new ToolUpdateManager({
+      hostVersion: HOSTD_VERSION,
+      hcBin: () => defaultHcBin(),
+      hc: this.hc,
+      app: this.app,
+      getTools: () => this.tools(),
+      setToolVersion: (id, ver) => {
+        if (id === "hc") {
+          this.hc.version = ver;
+        } else if (ver) {
+          this.toolVersions[id] = ver;
+        } else {
+          delete this.toolVersions[id];
+        }
+      },
+      setLatestVersion: (id, ver) => {
+        if (ver) {
+          this.upstream = { ...(this.upstream ?? {}), [id]: ver };
+        }
+      },
+      refreshUpstream: () => this.checkUpstream(),
+      getToolBin: (id) => this.toolBins[id],
+      setToolBin: (id, bin) => {
+        this.toolBins[id] = bin;
+      },
+      log: (m) => this.log(m),
+    });
     this.direct = new DirectServer({
       port: opts.config.directPort,
       hostId: () => this.deviceId,
       onFrame: (peer, f) => this.onDirectFrame(peer, f),
       onClose: (peer) => this.stopStreams((id) => id.startsWith(peer.tag)),
+      onHttpRequest: (req, res) => this.portal.tickets.handleHttpRequest(req, res),
       log: (m) => this.log(m),
     });
   }
@@ -248,7 +321,7 @@ export class Host {
     if (f.type === "ping") peer.send({ type: "pong", t: f.t });
     else if (f.type === "rpc" && id && typeof f.method === "string") {
       void this.handleRpc({ type: "rpc", id, from: peer.deviceId, method: f.method as RpcMethod, params: f.params }, (x) => peer.send(x));
-    } else if (f.type === "stream_subscribe" && id && (f.stream === "terminal" || f.stream === "session")) {
+    } else if (f.type === "stream_subscribe" && id && (f.stream === "terminal" || f.stream === "session" || f.stream === "portal")) {
       const reply = (x: ClientFrame) => peer.send("id" in x && typeof x.id === "string" ? { ...x, id: x.id.slice(peer.tag.length) } : x);
       void this.handleStreamSubscribe({ type: "stream_subscribe", id: peer.tag + id, from: peer.deviceId, stream: f.stream, params: f.params }, reply);
     } else if (f.type === "stream_unsubscribe" && id) this.stopStream(peer.tag + id);
@@ -324,6 +397,8 @@ export class Host {
     this.logTimer.unref?.();
     this.screenQueueTimer = setInterval(() => void this.refreshScreenQueues(), this.screenQueueMs);
     this.screenQueueTimer.unref?.();
+    const hook = await this.portal.startHookAndShims().catch(() => null);
+    if (hook?.execWrapper) this.app.execWrapper = hook.execWrapper;
     await this.startDirect();
     this.connect();
   }
@@ -414,6 +489,7 @@ export class Host {
     this.hc.stop();
     this.herdr.stop();
     this.uniflo.stop();
+    this.portal.stop();
     this.direct.stop();
     for (const stop of this.streamStops.values()) stop();
     this.streamStops.clear();
@@ -678,6 +754,31 @@ export class Host {
     const p = (f.params ?? {}) as Record<string, unknown>;
     const agentName = p.agent;
     try {
+      if (f.stream === "portal") {
+        const agentObj = typeof agentName === "string" && agentName ? this.resolve(agentName) : undefined;
+        const prev = this.streamMeta.get(f.id);
+        if (prev && prev.from !== f.from) throw new RpcFailure("bad_request", "重复的流 id");
+        if (prev) this.stopStream(f.id);
+        const meta = { from: f.from, kind: "portal" as StreamKind, agent: agentObj?.key ?? "" };
+        this.streamMeta.set(f.id, meta);
+        if (reply) this.streamReply.set(f.id, reply);
+        const stop = this.portal.subscribe(
+          f.id,
+          {
+            ...(typeof p.portalId === "string" && p.portalId ? { portalId: p.portalId } : {}),
+            ...(agentObj ? { agent: agentObj.key } : {}),
+            ...(typeof p.fps === "number" ? { fps: p.fps } : {}),
+          },
+          (ev) => this.sendStream(f.id, ev),
+        );
+        this.streamStops.set(f.id, stop);
+        out({
+          type: "stream_open",
+          id: f.id,
+          result: { kind: "portal", items: this.portal.listPortals(agentObj?.key) },
+        });
+        return;
+      }
       const a = this.resolve(agentName);
       const prev = this.streamMeta.get(f.id);
       if (prev && prev.from !== f.from) throw new RpcFailure("bad_request", "重复的流 id");
@@ -769,6 +870,9 @@ export class Host {
           liveAt.delete(old);
         }
         this.sendStream(f.id, { kind: "session", event: e, at: Date.now() });
+        if (fromLive && e.kind === "tool_call") {
+          this.portal.inspectToolCallForPortal(a, e.name, e.input);
+        }
       };
       let busy = false;
       let again = false;
@@ -985,6 +1089,7 @@ export class Host {
                 changed = true;
               }
             }
+            this.portal.inspectScreenForOAuth(a, text);
             const sub = this.hc.detectSubscreenFromSnapshot(a.localId, { text, altScreen: snap?.altScreen });
             if (sub) {
               if (this.subscreenByAgent.get(a.key) !== sub) {
@@ -1104,7 +1209,8 @@ export class Host {
     }
     try {
       const resolvedCwd = folder ?? checkFolder("~");
-      const terminal = await this.hc.spawnTerminal(argv, resolvedCwd);
+      const portalEnv = this.portal.isHookRunning() ? this.portal.childEnv() : undefined;
+      const terminal = portalEnv ? await this.hc.spawnTerminal(argv, resolvedCwd, portalEnv) : await this.hc.spawnTerminal(argv, resolvedCwd);
       if (closedDoc) {
         const placed = await this.app.createInDocWhenWindowClosed(
           {
@@ -1176,7 +1282,14 @@ export class Host {
     if (app) this.toolVersions.app = app;
     else delete this.toolVersions.app;
     const r = await checkUpstream(
-      { hc: this.hc.version, hcGeneration: hello?.generation, app, uniflo: this.toolVersions.uniflo, unifloBin: this.toolBins.uniflo },
+      {
+        hc: this.hc.version,
+        hcGeneration: hello?.generation,
+        app,
+        ...(this.toolVersions.herdr ? { herdr: this.toolVersions.herdr } : {}),
+        uniflo: this.toolVersions.uniflo,
+        unifloBin: this.toolBins.uniflo,
+      },
       this.upstream,
       deps,
     );
@@ -1826,6 +1939,98 @@ export class Host {
       const r = await this.newTerminal(() => this.app.open({ space, folder, argv }), withProgramPath(argv), folder, { space });
       await Promise.all([this.hc.list(), this.refreshNames()]);
       return { agent: agentKey(this.deviceId, "hc", r.terminal), space: r.space, terminal: r.terminal };
+    },
+    "tools.check": async () => this.toolUpdater.checkNow(),
+    "tools.update": async (p) => {
+      this.writable();
+      return this.toolUpdater.startOrJoinUpdate({ targets: p?.targets, waitMs: p?.waitMs });
+    },
+    "tools.updateStatus": async (p) => this.toolUpdater.getStatus(p?.jobId),
+    "files.readChunk": async (p) => {
+      const a = p.agent ? this.resolve(p.agent) : undefined;
+      return this.files(() =>
+        this.portal.readChunk({
+          agentCwd: a?.cwd,
+          path: p.path,
+          cwd: p.cwd,
+          offset: p.offset,
+          length: p.length,
+        }),
+      );
+    },
+    "portal.list": async (p) => {
+      const a = p.agent ? this.resolve(p.agent) : undefined;
+      const [windows, capabilities] = await Promise.all([
+        p.includeWindows ? this.portal.listWindows() : Promise.resolve(undefined),
+        this.portal.capabilities(),
+      ]);
+      return {
+        items: this.portal.listPortals(a?.key),
+        ...(windows ? { windows } : {}),
+        capabilities,
+      };
+    },
+    "portal.open": async (p) => {
+      this.writable();
+      const a = p.agent ? this.resolve(p.agent) : undefined;
+      return this.files(() =>
+        this.portal.openPortal({
+          agentKey: a?.key,
+          kind: p.kind,
+          target: p.target,
+          url: p.url,
+          windowId: p.windowId,
+          reveal: p.reveal,
+          title: p.title,
+        }),
+      );
+    },
+    "portal.close": async (p) => {
+      this.writable();
+      if (typeof p.portalId !== "string" || !p.portalId) throw new RpcFailure("bad_request", "portalId is required");
+      this.portal.closePortal(p.portalId);
+      return { ok: true as const };
+    },
+    "portal.frame": async (p) => {
+      if (typeof p.portalId !== "string" || !p.portalId) throw new RpcFailure("bad_request", "portalId is required");
+      return this.portal.captureFrame(p.portalId);
+    },
+    "portal.input": async (p) => {
+      this.writable();
+      if (typeof p.portalId !== "string" || !p.portalId || !p.input) throw new RpcFailure("bad_request", "portalId and input are required");
+      const r = await this.portal.sendInput(p.portalId, p.input);
+      return { ok: true as const, ...r };
+    },
+    "portal.fileTicket": async (p) => {
+      const a = p.agent ? this.resolve(p.agent) : undefined;
+      return this.files(() =>
+        this.portal.issueFileTicket({
+          agentCwd: a?.cwd,
+          path: p.path,
+          cwd: p.cwd,
+        }),
+      );
+    },
+    "portal.dirList": async (p) => {
+      const a = p.agent ? this.resolve(p.agent) : undefined;
+      return this.files(() =>
+        this.portal.dirList({
+          portalId: p.portalId,
+          agentCwd: a?.cwd,
+          path: p.path,
+          hidden: p.hidden,
+        }),
+      );
+    },
+    "portal.bundleHtml": async (p) => {
+      const a = p.agent ? this.resolve(p.agent) : undefined;
+      return this.files(() =>
+        this.portal.bundleHtml({
+          agentCwd: a?.cwd,
+          path: p.path,
+          cwd: p.cwd,
+        }),
+      );
     },
   };
 }

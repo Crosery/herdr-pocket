@@ -1,0 +1,392 @@
+import { useEffect, useState } from "react";
+import {
+  DIRECT_PORTAL_FS_PREFIX,
+  type HostPortalCapabilities,
+  type PortalFileTicket,
+  type PortalFramePayload,
+  type PortalInputAction,
+  type PortalItem,
+  type PortalKind,
+  type PortalStreamEvent,
+  type RemoteWindowInfo,
+} from "@herdr-pocket/protocol";
+import { getDirectEndpoint, rpcCall, subscribeStream } from "./relay";
+import { liveStore } from "./store";
+
+export function encodePortalRelPath(rel: string): string {
+  return rel
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+}
+
+export function buildPortalP2pUrl(
+  hostId: string,
+  ticket: Pick<PortalFileTicket, "token" | "entryPath" | "port" | "addrs">,
+  directOverride?: { addr: string; port: number } | null,
+): string | null {
+  const endpoint = directOverride !== undefined ? directOverride : getDirectEndpoint(hostId);
+  const storeAddr = liveStore.get().direct[hostId];
+  const addr = endpoint?.addr ?? storeAddr ?? ticket.addrs[0];
+  const port = endpoint?.port ?? ticket.port;
+  // Require an active P2P session unless ticket explicitly targets loopback.
+  if (!endpoint && !storeAddr) return null;
+  if (!addr || !port) return null;
+  const host = addr.includes(":") ? `[${addr}]` : addr;
+  const path = ticket.entryPath ? `/${encodePortalRelPath(ticket.entryPath)}` : "/";
+  return `http://${host}:${port}${DIRECT_PORTAL_FS_PREFIX}/${encodeURIComponent(ticket.token)}${path}`;
+}
+
+export function buildPortalP2pSiblingUrl(baseEntryUrl: string, siblingName: string): string {
+  const idx = baseEntryUrl.lastIndexOf("/");
+  if (idx < 0) return baseEntryUrl;
+  return `${baseEntryUrl.slice(0, idx + 1)}${encodeURIComponent(siblingName)}`;
+}
+
+/**
+ * Maps viewer client coordinates `(clientX, clientY)` onto `[0, 1]` coordinates of the
+ * remote image rendered with `object-fit: contain` inside `(rectWidth x rectHeight)`.
+ */
+export function mapContainedPointer(opts: {
+  clientX: number;
+  clientY: number;
+  rectLeft: number;
+  rectTop: number;
+  rectWidth: number;
+  rectHeight: number;
+  imageWidth?: number;
+  imageHeight?: number;
+}): { nx: number; ny: number } {
+  const { clientX, clientY, rectLeft, rectTop, rectWidth, rectHeight, imageWidth, imageHeight } = opts;
+  if (rectWidth <= 0 || rectHeight <= 0) return { nx: 0.5, ny: 0.5 };
+  let drawLeft = 0;
+  let drawTop = 0;
+  let drawW = rectWidth;
+  let drawH = rectHeight;
+  if (imageWidth && imageHeight && imageWidth > 0 && imageHeight > 0) {
+    const imgAspect = imageWidth / imageHeight;
+    const boxAspect = rectWidth / rectHeight;
+    if (boxAspect > imgAspect) {
+      drawH = rectHeight;
+      drawW = rectHeight * imgAspect;
+      drawLeft = (rectWidth - drawW) / 2;
+    } else {
+      drawW = rectWidth;
+      drawH = rectWidth / imgAspect;
+      drawTop = (rectHeight - drawH) / 2;
+    }
+  }
+  const rx = clientX - rectLeft - drawLeft;
+  const ry = clientY - rectTop - drawTop;
+  return {
+    nx: Math.min(1, Math.max(0, rx / Math.max(1, drawW))),
+    ny: Math.min(1, Math.max(0, ry / Math.max(1, drawH))),
+  };
+}
+
+interface PortalState {
+  itemsById: Record<string, PortalItem>;
+  framesById: Record<string, PortalFramePayload>;
+  ticketsById: Record<string, PortalFileTicket>;
+  capsByHost: Record<string, HostPortalCapabilities>;
+  windowsByHost: Record<string, RemoteWindowInfo[]>;
+  dismissedIds: Record<string, true>;
+}
+
+const initialState: PortalState = {
+  itemsById: {},
+  framesById: {},
+  ticketsById: {},
+  capsByHost: {},
+  windowsByHost: {},
+  dismissedIds: {},
+};
+
+let state: PortalState = initialState;
+const listeners = new Set<() => void>();
+
+function setState(updater: (prev: PortalState) => PortalState): void {
+  state = updater(state);
+  for (const fn of listeners) fn();
+}
+
+export const portalStore = {
+  get: () => state,
+  subscribe: (fn: () => void) => {
+    listeners.add(fn);
+    return () => {
+      listeners.delete(fn);
+    };
+  },
+  use<T>(selector: (s: PortalState) => T): T {
+    const [val, setVal] = useState(() => selector(state));
+    useEffect(() => {
+      setVal(selector(state));
+      return portalStore.subscribe(() => {
+        setVal((prev) => {
+          const next = selector(state);
+          return Object.is(prev, next) ? prev : next;
+        });
+      });
+    }, []);
+    return val;
+  },
+};
+
+export function ingestPortalStreamEvent(ev: unknown): void {
+  if (!ev || typeof ev !== "object") return;
+  const e = ev as Partial<PortalStreamEvent>;
+  if (e.kind === "portal_event" && e.item) {
+    const item = e.item;
+    if (e.action === "closed") {
+      setState((prev) => {
+        if (!prev.itemsById[item.id] && !prev.framesById[item.id]) return prev;
+        const itemsById = { ...prev.itemsById };
+        delete itemsById[item.id];
+        const framesById = { ...prev.framesById };
+        delete framesById[item.id];
+        const ticketsById = { ...prev.ticketsById };
+        delete ticketsById[item.id];
+        return { ...prev, itemsById, framesById, ticketsById };
+      });
+    } else {
+      setState((prev) => {
+        const dismissedIds = { ...prev.dismissedIds };
+        if (e.action === "opened") delete dismissedIds[item.id];
+        return {
+          ...prev,
+          itemsById: { ...prev.itemsById, [item.id]: item },
+          dismissedIds,
+        };
+      });
+    }
+    return;
+  }
+  if (e.kind === "portal_frame" && e.portalId && e.data) {
+    const frame = e as PortalFramePayload;
+    setState((prev) => {
+      const cur = prev.framesById[frame.portalId];
+      if (cur && cur.seq >= frame.seq && cur.at >= frame.at) return prev;
+      const existing = prev.itemsById[frame.portalId];
+      const nextItem = existing
+        ? {
+            ...existing,
+            ...(frame.url ? { url: frame.url } : {}),
+            ...(frame.title ? { title: frame.title } : {}),
+            width: frame.width,
+            height: frame.height,
+            updatedAt: frame.at,
+          }
+        : undefined;
+      return {
+        ...prev,
+        framesById: { ...prev.framesById, [frame.portalId]: frame },
+        ...(nextItem ? { itemsById: { ...prev.itemsById, [frame.portalId]: nextItem } } : {}),
+      };
+    });
+  }
+}
+
+export function dismissPortalInUi(portalId: string): void {
+  setState((prev) => ({
+    ...prev,
+    dismissedIds: { ...prev.dismissedIds, [portalId]: true },
+  }));
+}
+
+export async function refreshHostPortals(
+  hostId: string,
+  agentKey?: string,
+  includeWindows = false,
+): Promise<{ items: PortalItem[]; windows?: RemoteWindowInfo[]; capabilities: HostPortalCapabilities }> {
+  const res = await rpcCall(hostId, "portal.list", {
+    ...(agentKey ? { agent: agentKey } : {}),
+    includeWindows,
+  });
+  setState((prev) => {
+    const nextItems = { ...prev.itemsById };
+    if (agentKey) {
+      for (const [id, it] of Object.entries(nextItems)) {
+        if (it.hostId === hostId && it.agentKey === agentKey && !res.items.some((x) => x.id === id)) {
+          delete nextItems[id];
+        }
+      }
+    } else {
+      for (const [id, it] of Object.entries(nextItems)) {
+        if (it.hostId === hostId && !res.items.some((x) => x.id === id)) {
+          delete nextItems[id];
+        }
+      }
+    }
+    for (const item of res.items) {
+      nextItems[item.id] = item;
+    }
+    return {
+      ...prev,
+      itemsById: nextItems,
+      capsByHost: { ...prev.capsByHost, [hostId]: res.capabilities },
+      ...(res.windows ? { windowsByHost: { ...prev.windowsByHost, [hostId]: res.windows } } : {}),
+    };
+  });
+  return res;
+}
+
+export async function openPortalSurface(
+  hostId: string,
+  params: { agent?: string; kind: PortalKind; target?: string; url?: string; windowId?: string; reveal?: boolean; title?: string },
+): Promise<{ item: PortalItem; ticket?: PortalFileTicket }> {
+  const res = await rpcCall(hostId, "portal.open", params, 20_000);
+  setState((prev) => {
+    const dismissedIds = { ...prev.dismissedIds };
+    delete dismissedIds[res.item.id];
+    return {
+      ...prev,
+      itemsById: { ...prev.itemsById, [res.item.id]: res.item },
+      ...(res.ticket ? { ticketsById: { ...prev.ticketsById, [res.item.id]: res.ticket } } : {}),
+      dismissedIds,
+    };
+  });
+  return res;
+}
+
+export async function closePortalSurface(hostId: string, portalId: string): Promise<void> {
+  await rpcCall(hostId, "portal.close", { portalId }).catch(() => {});
+  setState((prev) => {
+    const itemsById = { ...prev.itemsById };
+    delete itemsById[portalId];
+    const framesById = { ...prev.framesById };
+    delete framesById[portalId];
+    const ticketsById = { ...prev.ticketsById };
+    delete ticketsById[portalId];
+    return { ...prev, itemsById, framesById, ticketsById };
+  });
+}
+
+export async function capturePortalFrameOnce(hostId: string, portalId: string): Promise<PortalFramePayload | null> {
+  const res = await rpcCall(hostId, "portal.frame", { portalId }, 12_000);
+  if (res.item) {
+    setState((prev) => ({
+      ...prev,
+      itemsById: { ...prev.itemsById, [res.item!.id]: res.item! },
+    }));
+  }
+  if (res.frame) {
+    ingestPortalStreamEvent({ kind: "portal_frame", ...res.frame });
+  }
+  return res.frame;
+}
+
+export async function sendPortalInput(
+  hostId: string,
+  portalId: string,
+  input: PortalInputAction,
+): Promise<{ url?: string; title?: string }> {
+  const res = await rpcCall(hostId, "portal.input", { portalId, input }, 10_000);
+  if (res.url || res.title) {
+    setState((prev) => {
+      const existing = prev.itemsById[portalId];
+      if (!existing) return prev;
+      return {
+        ...prev,
+        itemsById: {
+          ...prev.itemsById,
+          [portalId]: {
+            ...existing,
+            ...(res.url ? { url: res.url } : {}),
+            ...(res.title ? { title: res.title } : {}),
+            updatedAt: Date.now(),
+          },
+        },
+      };
+    });
+  }
+  return res;
+}
+
+export function subscribeAgentPortalUpdates(hostId: string, agentKey: string): () => void {
+  let alive = true;
+  let streamFailed = false;
+  void refreshHostPortals(hostId, agentKey, false).catch(() => {});
+
+  const unsub = subscribeStream(
+    hostId,
+    "portal",
+    { agent: agentKey },
+    (ev) => {
+      if (alive) ingestPortalStreamEvent(ev);
+    },
+    (st) => {
+      if (!alive) return;
+      if (st?.kind === "error") streamFailed = true;
+      if (st?.kind === "live" && Array.isArray(st.result?.items)) {
+        for (const item of st.result.items as PortalItem[]) {
+          ingestPortalStreamEvent({ kind: "portal_event", action: "updated", item, at: Date.now() });
+        }
+      }
+    },
+  );
+
+  // Light recovery poll in case an older relay rejects `stream: "portal"`
+  const timer = window.setInterval(() => {
+    if (!alive) return;
+    if (streamFailed) {
+      void refreshHostPortals(hostId, agentKey, false).catch(() => {});
+    }
+  }, 5000);
+
+  return () => {
+    alive = false;
+    window.clearInterval(timer);
+    unsub();
+  };
+}
+
+export function subscribePortalFrames(
+  hostId: string,
+  portalId: string,
+  fps = 12,
+): () => void {
+  let alive = true;
+  let streamLive = false;
+  let lastStreamFrameAt = 0;
+  let busy = false;
+
+  void capturePortalFrameOnce(hostId, portalId).catch(() => {});
+
+  const unsub = subscribeStream(
+    hostId,
+    "portal",
+    { portalId, fps },
+    (ev) => {
+      if (!alive) return;
+      if (ev?.kind === "portal_frame" && ev.portalId === portalId) {
+        lastStreamFrameAt = Date.now();
+      }
+      ingestPortalStreamEvent(ev);
+    },
+    (st) => {
+      if (alive && st?.kind === "live") streamLive = true;
+      if (alive && st?.kind === "error") streamLive = false;
+    },
+  );
+
+  const pollInterval = Math.max(120, Math.round(1000 / Math.max(1, Math.min(8, fps))));
+  const timer = window.setInterval(() => {
+    if (!alive || busy) return;
+    if (streamLive && Date.now() - lastStreamFrameAt < 1200) return;
+    busy = true;
+    void capturePortalFrameOnce(hostId, portalId)
+      .catch(() => {})
+      .finally(() => {
+        busy = false;
+      });
+  }, pollInterval);
+
+  return () => {
+    alive = false;
+    window.clearInterval(timer);
+    unsub();
+  };
+}

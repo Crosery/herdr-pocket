@@ -13,6 +13,7 @@ import {
   type RpcParams,
   type RpcResult,
   type ServerFrame,
+  type StreamKind,
 } from "@herdr-pocket/protocol";
 import { useLive } from "./store";
 import { isMockServer, mockLink, mockApi } from "./mock";
@@ -33,7 +34,8 @@ export class RelayError extends Error {
 export type StreamEvent = (event: any) => void;
 export interface Link {
   call(to: string, method: RpcMethod, params: unknown, timeoutMs: number): Promise<unknown>;
-  subscribe(to: string, stream: "terminal" | "session", params: unknown, onEvent: StreamEvent, onState?: StreamEvent): () => void;
+  subscribe(to: string, stream: StreamKind, params: unknown, onEvent: StreamEvent, onState?: StreamEvent): () => void;
+  directEndpoint?(to: string): { addr: string; port: number } | null;
   ping(): void;
   close(): void;
 }
@@ -127,12 +129,13 @@ export async function revokeDevice(server: string, token: string, id: string): P
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; method?: string; to?: string };
 /** `via`: the direct link carrying it; none means the relay. */
-type Stream = { id: string; to: string; stream: "terminal" | "session"; params: unknown; onEvent: StreamEvent; onState?: StreamEvent; via?: DirectLink };
+type Stream = { id: string; to: string; stream: StreamKind; params: unknown; onEvent: StreamEvent; onState?: StreamEvent; via?: DirectLink };
 
 /** Reads that may simply be asked again through the relay when a direct link dies under them. */
 const SAFE_AGAIN = new Set<RpcMethod>([
   "agents.list", "terminal.read", "session.events", "session.children", "spaces.list", "host.info", "agent.seen",
   "herdr.layout", "folders.list", "sessions.list", "sessions.search", "sessions.read", "sessions.usage", "harness.icons",
+  "tools.check", "tools.updateStatus", "files.readChunk", "portal.list", "portal.frame", "portal.fileTicket", "portal.dirList", "portal.bundleHtml",
 ]);
 
 /** React Native's WebSocket also takes request headers (the DOM typing doesn't know). */
@@ -364,7 +367,7 @@ class SocketLink implements Link {
     return `s${Date.now().toString(36)}${(this.seq++).toString(36)}`;
   }
 
-  subscribe(to: string, stream: "terminal" | "session", params: unknown, onEvent: StreamEvent, onState?: StreamEvent): () => void {
+  subscribe(to: string, stream: StreamKind, params: unknown, onEvent: StreamEvent, onState?: StreamEvent): () => void {
     const link = this.direct.get(to);
     const entry: Stream = { id: this.streamId(), to, stream, params, onEvent, onState, via: link?.open ? link : undefined };
     this.streams.set(entry.id, entry);
@@ -374,6 +377,11 @@ class SocketLink implements Link {
       if (entry.via) entry.via.unsubscribe(entry.id);
       else this.send({ type: "stream_unsubscribe", id: entry.id, to });
     };
+  }
+
+  directEndpoint(to: string): { addr: string; port: number } | null {
+    const link = this.direct.get(to);
+    return link?.open ? { addr: link.addr, port: link.port } : null;
   }
 
   private openStream(s: Stream) {
@@ -515,12 +523,16 @@ export function stopLink() {
   useLive.getState().reset();
 }
 
-export function subscribe(to: string, stream: "terminal" | "session", params: unknown, onEvent: StreamEvent, onState?: StreamEvent): () => void {
+export function subscribe(to: string, stream: StreamKind, params: unknown, onEvent: StreamEvent, onState?: StreamEvent): () => void {
   if (!current) {
     onState?.({ status: "error", message: "还没连上服务器" });
     return () => undefined;
   }
   return current.subscribe(to, stream, params, onEvent, onState);
+}
+
+export function getDirectEndpoint(to: string): { addr: string; port: number } | null {
+  return current?.directEndpoint?.(to) ?? null;
 }
 
 export function pingNow() {

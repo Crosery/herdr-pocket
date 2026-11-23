@@ -92,15 +92,27 @@ export function endsInPanel(screen: string): boolean {
 
 export interface SubscreenDetection {
   kind: "viewer" | "pager";
-  dismissKey: "\x1b" | "q" | "\x0f";
-  dismissAlias: "esc" | "q" | "ctrl+o";
+  dismissKey: "\x1b" | "q";
+  dismissAlias: "esc" | "q";
   reason: string;
+}
+
+const ACTIVE_INPUT_PROMPT_RE = /^(?:[❯›>](?:\s|$).*|.*\bshift\+tab\s+to\s+cycle\b.*|.*\?\s+for\s+shortcuts\b.*)$/i;
+
+/**
+ * True when the tail of the visible viewport shows an active chat composer prompt
+ * (`❯ `, `shift+tab to cycle`, `? for shortcuts`). Scrollback lines above an active
+ * prompt must never be mistaken for a modal blocker.
+ */
+export function hasActiveInputPrompt(screen: string): boolean {
+  const tail = screen.split("\n").map((l) => l.trim()).filter(Boolean).slice(-6);
+  return tail.some((l) => ACTIVE_INPUT_PROMPT_RE.test(l));
 }
 
 /**
  * Detects non-input TUI subscreens (`/usage`, `/status`, `Swarm board`, transcript overlays,
- * and `less`/`man`/`more` pagers) while obeying the Hard Veto for `"blocked"` / approval prompts
- * and normal working turns (`(esc to cancel)` / `(esc to interrupt)`).
+ * and `less`/`man`/`more` pagers) while obeying the Hard Veto for `"blocked"` / approval prompts,
+ * normal working turns (`(esc to cancel)` / `(esc to interrupt)`), and active input prompts.
  */
 export function detectDismissableSubscreen(opts: {
   screen: string;
@@ -112,6 +124,9 @@ export function detectDismissableSubscreen(opts: {
 }): SubscreenDetection | null {
   if (opts.status === "blocked" || opts.statusKind) return null;
   if (isInteractiveApprovalOrQuestion(opts.screen)) return null;
+  if (!opts.altScreen && !/^Swarm board\b/m.test(opts.screen) && hasActiveInputPrompt(opts.screen)) {
+    return null;
+  }
 
   const lines = opts.screen.split("\n").map((l) => l.trim()).filter(Boolean);
   const head = lines.slice(0, 6);
@@ -121,8 +136,10 @@ export function detectDismissableSubscreen(opts: {
   if (tail.some((l) => PAGER_TAIL_RE.test(l)) && (PAGER_PROCS.has(fg) || opts.altScreen || /\btranscript\b/i.test([...head, ...tail].join(" ")))) {
     return { kind: "pager", dismissKey: "q", dismissAlias: "q", reason: "pager" };
   }
-  if ([...head, ...tail].some((l) => TRANSCRIPT_CTRL_O_RE.test(l))) {
-    return { kind: "viewer", dismissKey: "\x0f", dismissAlias: "ctrl+o", reason: "transcript" };
+  if (tail.some((l) => TRANSCRIPT_CTRL_O_RE.test(l)) || head.some((l) => TRANSCRIPT_CTRL_O_RE.test(l))) {
+    // Exit detailed transcript with Esc (idempotent exit) rather than toggling Ctrl+O (\x0f),
+    // so an ambiguous or transitioning viewport can never toggle INTO non-input transcript mode.
+    return { kind: "viewer", dismissKey: "\x1b", dismissAlias: "esc", reason: "transcript" };
   }
   if (isViewerSubscreen(opts.screen)) {
     return { kind: "viewer", dismissKey: "\x1b", dismissAlias: "esc", reason: "viewer" };
@@ -583,9 +600,10 @@ export class HcAdapter extends EventEmitter {
    * Starts a program (empty argv: the shell) in a new terminal of hc's own, in `cwd`, and
    * returns its address. For computers without the desktop app; it belongs to no space.
    */
-  async spawnTerminal(argv: string[], cwd: string): Promise<string> {
+  async spawnTerminal(argv: string[], cwd: string, env?: Record<string, string>): Promise<string> {
     const out = await run(this.hcBin, ["run", "--bg", "--no-parent", "--no-notify", "--json", "--cwd", cwd, ...(argv.length ? ["--", ...argv] : [])], {
       timeoutMs: 30_000,
+      ...(env ? { env: { ...process.env, ...env } } : {}),
     });
     const line = out.trim().split("\n").pop() ?? "";
     let address: unknown;
@@ -689,7 +707,8 @@ export class HcAdapter extends EventEmitter {
 
     let firstClosed: "viewer" | "pager" | null = null;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const snap = await this.screens.snapshot(address, 24).catch((): ScreenSnapshot | null => null);
+      // Snapshot strictly the visible viewport (history = 0) so old scrollback never triggers dismissal.
+      const snap = await this.screens.snapshot(address, 0).catch((): ScreenSnapshot | null => null);
       if (!snap) return firstClosed ?? "none";
       const det = detectDismissableSubscreen({
         screen: snap.text,
@@ -712,14 +731,19 @@ export class HcAdapter extends EventEmitter {
           sentRaw = false;
         }
       }
-      const afterRaw = sentRaw ? await this.screens.snapshot(address, 24).catch((): ScreenSnapshot | null => null) : null;
+      const afterRaw = sentRaw ? await this.screens.snapshot(address, 0).catch((): ScreenSnapshot | null => null) : null;
       if (!afterRaw || afterRaw.text === snap.text) {
         await run(this.hcBin, ["keys", address, det.dismissAlias]).catch(() => {});
         await new Promise((r) => setTimeout(r, 120));
+        const afterKeys = await this.screens.snapshot(address, 0).catch((): ScreenSnapshot | null => null);
+        // Stop retrying if an ambiguous transcript/modal screen didn't respond (prevents Esc-Esc rewind/Vim transitions).
+        if ((!afterKeys || afterKeys.text === snap.text) && (det.reason === "transcript" || det.reason === "modal_picker")) {
+          break;
+        }
       }
     }
 
-    const remaining = await this.screens.snapshot(address, 24).catch((): ScreenSnapshot | null => null);
+    const remaining = await this.screens.snapshot(address, 0).catch((): ScreenSnapshot | null => null);
     if (remaining) {
       const still = detectDismissableSubscreen({
         screen: remaining.text,
@@ -751,7 +775,7 @@ export class HcAdapter extends EventEmitter {
 
   /** Helper exposing current subscreen kind directly from an attached snapshot. */
   async detectSubscreen(address: string): Promise<"viewer" | "pager" | null> {
-    const snap = await this.screens.snapshot(address, 24).catch((): ScreenSnapshot | null => null);
+    const snap = await this.screens.snapshot(address, 0).catch((): ScreenSnapshot | null => null);
     return snap ? this.detectSubscreenFromSnapshot(address, snap) : null;
   }
 

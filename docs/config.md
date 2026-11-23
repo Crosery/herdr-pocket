@@ -315,12 +315,14 @@ Who reads it: CLI = `herdr-pocket` commands, daemon = `herdr-pocket run`, app = 
 | `general.language` | `"zh-CN"` | `zh-CN`, `en` | app | language of the desktop app |
 | `general.theme` | `"system"` | `system`, `light`, `dark` | app | appearance |
 | `general.textScale` | `100` | 80–160 | app | text size of the desktop app, in percent |
+| `general.fontFamily` | `""` | font family name | app | global UI font family of the desktop app (empty: default stack) |
 | `general.chatDisplayMode` | `"standard"` | `compact`, `standard`, `expanded` | app | conversation detail density (`compact`: merged activity groups; `standard`: separate thinking blocks + grouped tool tab; `expanded`: thinking & tool steps expanded) |
 | `general.showShells` | `false` | boolean | app | list plain shells beside the agents |
 | `general.useLocalLogin` | `true` | boolean | app | when this computer's `herdr-pocket` is logged in, the app joins the same relay with it (it asks that login for a one-time pairing code and pairs as its own device) |
 | `general.launchAtLogin` | `false` | boolean | app | start the app when you log in |
 | `general.closeToTray` | `false` | boolean | app | closing the window keeps the app in the menu bar or tray; off, closing the window quits the app |
 | `general.notifications` | `true` | boolean | app | system notifications when an agent finishes or waits |
+| `general.dynamicIsland` | `true` | boolean | app | show categorized reminders and quick jump in the macOS Dynamic Island / top capsule |
 | `update.region` | `"auto"` | `auto`, `cn`, `global` | CLI, daemon, app | where downloads come from first, see [Regions and download sources](#regions-and-download-sources). `HERDR_POCKET_MIRROR=1` / `0` wins |
 | `update.preferredSource` | `"auto"` | `"auto"`, `"direct"`, or a mirror prefix | CLI, daemon, app | `"auto"`: recommend by time zone and pick the lowest-latency reachable source. `"direct"`: try GitHub directly first. Or pin a specific mirror prefix (falls back to others if unreachable) |
 | `update.autoCheck` | `true` | boolean | CLI, daemon, app | look for a new release now and then. `HERDR_POCKET_UPDATE_CHECK=0` wins |

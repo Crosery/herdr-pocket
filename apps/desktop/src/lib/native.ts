@@ -98,6 +98,7 @@ export interface LogFolderInfo {
 
 export interface FontCatalog {
   families: string[];
+  uiFamilies?: string[];
   herdrFont?: string;
   herdrFontSize?: number;
   herdrLineHeight?: number;
@@ -463,6 +464,10 @@ export const native = {
     inTauri() ? invoke<void>("voice_call_dsp_close").catch(() => {}) : noop(),
   voiceHudSync: (state: VoiceHudSyncState): Promise<void> => bridge.voiceHudSync(state),
   voiceHudHide: (): Promise<void> => bridge.voiceHudHide(),
+  notchSync: async (state: Record<string, unknown>): Promise<void> =>
+    inTauri() ? invoke<void>("notch_sync", { state }).catch(() => {}) : noop(),
+  notchFocusMain: async (): Promise<void> =>
+    inTauri() ? invoke<void>("notch_focus_main").catch(() => {}) : noop(),
 
   // Local SOTA Audio DSP & Voiceprint (src-tauri/src/voice_ai.rs + Demo Mode) ---
   voiceAiState: async (): Promise<VoiceAiState> =>

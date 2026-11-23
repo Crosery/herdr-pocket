@@ -9,7 +9,7 @@
  * refused before the WebSocket opens.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { networkInterfaces } from "node:os";
 import type { Duplex } from "node:stream";
 import { DIRECT_FROM_HOST, DIRECT_PATH, DirectCipher, type DirectAead, type DirectOffer } from "@herdr-pocket/protocol";
@@ -52,6 +52,7 @@ export interface DirectServerOptions {
   hostId: () => string;
   onFrame: (peer: DirectPeer, frame: Record<string, unknown>) => void;
   onClose: (peer: DirectPeer) => void;
+  onHttpRequest?: (req: IncomingMessage, res: ServerResponse) => boolean | Promise<boolean>;
   log?: (msg: string) => void;
 }
 
@@ -84,7 +85,23 @@ export class DirectServer {
 
   async start(): Promise<void> {
     const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
-    const http = createServer((_req, res) => {
+    const http = createServer((req, res) => {
+      if (this.opts.onHttpRequest) {
+        void Promise.resolve(this.opts.onHttpRequest(req, res))
+          .then((handled) => {
+            if (!handled && !res.writableEnded) {
+              res.statusCode = 404;
+              res.end();
+            }
+          })
+          .catch(() => {
+            if (!res.writableEnded) {
+              res.statusCode = 500;
+              res.end();
+            }
+          });
+        return;
+      }
       res.statusCode = 404;
       res.end();
     });

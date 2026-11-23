@@ -18,7 +18,12 @@ import { assistantStore } from "./lib/assistant";
 import { detectPlatform, getHostdStatus, isTauri, loadSession } from "./lib/bridge";
 import { native } from "./lib/native";
 import { ensureChatQueueWatcher } from "./lib/chatQueue";
-import { refreshLocalHostIdFast } from "./lib/fonts";
+import {
+  buildCuteFontFamily,
+  buildUiFontFamily,
+  ensureUiFontLoaded,
+  refreshLocalHostIdFast,
+} from "./lib/fonts";
 import { hydrateWorkspaceState } from "./lib/workspacePersist";
 import { startAutoUpdateChecks, updateStore } from "./lib/updates";
 import { completePairing, pairWithLocalHostWithin, pingRelay, signOut, startRelayLink, stopRelayLink } from "./lib/relay";
@@ -59,6 +64,7 @@ function PocketAppShell() {
   const server = settingsStore.use((s) => s.server);
   const theme = settingsStore.use((s) => s.theme);
   const textScale = settingsStore.use((s) => s.textScale);
+  const uiFontFamily = clientConfigStore.use((s) => s.config.general.fontFamily);
   const collapsedPref = settingsStore.use((s) => s.sidebarCollapsed);
   const onboarding = settingsStore.use((s) => s.onboarding);
   const link = liveStore.use((s) => s.link);
@@ -102,6 +108,30 @@ function PocketAppShell() {
   useEffect(() => {
     document.documentElement.style.setProperty("--ts", String(textScale || 1));
   }, [textScale]);
+
+  // Global UI font family reaches body, headers, sidebar, chat, and modals through --font-body / --font-cute.
+  useEffect(() => {
+    const clean = uiFontFamily.trim();
+    const rootStyle = document.documentElement.style;
+    if (!clean) {
+      rootStyle.removeProperty("--font-body");
+      rootStyle.removeProperty("--font-cute");
+      return;
+    }
+    let cancelled = false;
+    const apply = () => {
+      if (cancelled) return;
+      rootStyle.setProperty("--font-body", buildUiFontFamily(clean));
+      rootStyle.setProperty("--font-cute", buildCuteFontFamily(clean));
+    };
+    apply();
+    void ensureUiFontLoaded(clean).then((loaded) => {
+      if (loaded && !cancelled) apply();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [uiFontFamily]);
 
   useEffect(() => {
     if (boot !== "ready") return;

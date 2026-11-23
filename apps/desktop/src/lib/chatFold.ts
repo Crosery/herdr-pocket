@@ -372,6 +372,8 @@ function buildGroupMeta(
     headline = `已调用 ${tools.length} 个工具`;
   } else if (thoughts.length > 0 && notes.length === 0) {
     headline = `思考与分析（${thoughts.length} 段）`;
+  } else if (thoughts.length === 0 && notes.length > 0) {
+    headline = `状态与重试记录（${notes.length} 条）`;
   } else {
     headline = `思考与记录（${thoughts.length + notes.length}）`;
   }
@@ -385,6 +387,8 @@ function buildGroupMeta(
     detailLine = thoughts.length > 0 ? `${catSummary} · ${thoughts.length} 段思考` : catSummary;
   } else if (latestThought) {
     detailLine = clipChars(latestThought, 48);
+  } else if (notes.length > 0) {
+    detailLine = notes[notes.length - 1]!.summary;
   }
 
   return { running, failedCount, headline, detailLine, activeStep, series, ...(latestThought ? { latestThought } : {}) };
@@ -409,9 +413,10 @@ type Intermediate =
 /**
  * Pairs `tool_call` and `tool_result` by `call_id` and formats non-message activity
  * according to the selected `ChatDisplayMode`:
- * - `"standard"` (default, Ovis / t3code progressive fold): folds contiguous thinking,
- *   visible system notes, and tool runs chronologically into one cohesive `activity_group`.
- * - `"compact"`: same chronological progressive fold with compact defaults.
+ * - `"standard"` (default): keeps each thinking block standalone (collapsed by default) and
+ *   folds contiguous tool runs or repeated retry/system notices.
+ * - `"compact"`: folds contiguous thinking, visible system notes, and tool runs chronologically
+ *   into a single cohesive `activity_group`.
  * - `"expanded"`: keeps every thinking block, system note, and tool group separate & open.
  */
 export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "standard"): ChatRow[] {
@@ -445,7 +450,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
       if (only.kind === "thinking") {
         rows.push({ ...only, ...(mode === "expanded" ? { defaultOpen: true } : {}) });
       }
-    } else if (tools.length === 0 && thoughts.length === 0) {
+    } else if (tools.length === 0 && thoughts.length === 0 && (notes.length <= 1 || mode === "expanded")) {
       for (const item of pending) rows.push(item);
     } else if (mode === "expanded" && tools.length === 0) {
       for (const item of pending) {
@@ -612,11 +617,18 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
       case "reasoning": {
         if (!e.text.trim()) break;
         const text = e.text.trim();
-        if (mode !== "expanded") {
+        if (mode === "compact") {
           pending.push({ kind: "thinking", id: e.id, text, ts: e.ts, pos: e.pos });
         } else {
           flushPending();
-          rows.push({ kind: "thinking", id: e.id, text, ts: e.ts, pos: e.pos, defaultOpen: true });
+          rows.push({
+            kind: "thinking",
+            id: e.id,
+            text,
+            ts: e.ts,
+            pos: e.pos,
+            defaultOpen: mode === "expanded",
+          });
         }
         break;
       }

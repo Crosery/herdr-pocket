@@ -59,6 +59,7 @@ import { currentRegion, planUrls, raceSources, sourcePlan, writeSourceCache } fr
 export * from "./paths.ts";
 export * from "./clientconfig.ts";
 export * from "./sources.ts";
+export { extractTarGz, tarVersion } from "./untar.ts";
 
 const WINDOWS = process.platform === "win32";
 

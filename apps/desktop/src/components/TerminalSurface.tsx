@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent } from "react";
 import { ChevronDown, ChevronUp, X } from "lucide-react";
 import { Terminal as XTerm, type IMarker } from "@xterm/xterm";
-import { beginSplitMotion, isSplitMotionActive, onSplitMotionSettled } from "../shell/splitMotion";
+import { proposeGridFast } from "../shell/splitMotion";
 import { FitAddon } from "@xterm/addon-fit";
 import { ImageAddon } from "@xterm/addon-image";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
@@ -67,6 +67,7 @@ import {
 } from "../lib/kittyProtocol";
 import { logAction, logger } from "../lib/log";
 import { native, type LocalTermCloseEvent, type LocalTermSizeEvent } from "../lib/native";
+import { ingestPortalStreamEvent } from "../lib/portalClient";
 import { rpcCall, subscribeStream } from "../lib/relay";
 import { settingsStore } from "../lib/store";
 import {
@@ -537,18 +538,8 @@ export function TerminalSurface({
     [],
   );
 
-  const syncResize = useCallback(
+  const flushPtyResize = useCallback(
     (term: XTerm, forceReclaim = false) => {
-      if (!activeRef.current || !hostRef.current || hostRef.current.clientWidth <= 0 || hostRef.current.clientHeight <= 0) {
-        return;
-      }
-      if (externalSizeOverrideRef.current && !forceReclaim && !paneOwnsFocus()) {
-        return;
-      }
-      externalSizeOverrideRef.current = false;
-      fitRef.current?.fit();
-      refreshCachedCellSize(term);
-      centerScreenVerticalGap(hostRef.current, term);
       const display = currentDisplay(term);
       const localConnId = localConnRef.current;
       if (forceReclaim) lastResizeSigRef.current = "";
@@ -571,7 +562,24 @@ export function TerminalSurface({
         display,
       }).catch(() => {});
     },
-    [agent.deviceId, agent.key, currentDisplay, paneOwnsFocus, refreshCachedCellSize],
+    [agent.deviceId, agent.key, currentDisplay],
+  );
+
+  const syncResize = useCallback(
+    (term: XTerm, forceReclaim = false) => {
+      if (!activeRef.current || !hostRef.current || hostRef.current.clientWidth <= 0 || hostRef.current.clientHeight <= 0) {
+        return;
+      }
+      if (externalSizeOverrideRef.current && !forceReclaim && !paneOwnsFocus()) {
+        return;
+      }
+      externalSizeOverrideRef.current = false;
+      fitRef.current?.fit();
+      refreshCachedCellSize(term);
+      centerScreenVerticalGap(hostRef.current, term);
+      flushPtyResize(term, forceReclaim);
+    },
+    [flushPtyResize, paneOwnsFocus, refreshCachedCellSize],
   );
 
   const paintOverlays = useCallback(() => {
@@ -2681,6 +2689,8 @@ export function TerminalSurface({
             writeFallbackScreen(String(ev.screen.ansi || ev.screen.text || "").split("\n"));
           } else if (ev.kind === "terminal_rows") {
             writeFallbackScreen(applyRows(fallbackLines, ev));
+          } else if (ev.kind === "portal_event") {
+            ingestPortalStreamEvent(ev);
           }
         },
         (state: { kind?: string; result?: { raw?: boolean } } | undefined) => {
@@ -2863,26 +2873,59 @@ export function TerminalSurface({
 
     let resizeRaf = 0;
     let resizeSettleTimer = 0;
-    let cancelMotionSettle: (() => void) | null = null;
-    const ro = new ResizeObserver(() => {
+    let lastPtySyncAt = 0;
+    let pendingRectW = 0;
+    let pendingRectH = 0;
+    const applyLiveResize = (rectW: number, rectH: number) => {
+      if (!alive || !activeRef.current || !hostRef.current) return;
+      const w = rectW > 0 ? rectW : hostRef.current.clientWidth;
+      const h = rectH > 0 ? rectH : hostRef.current.clientHeight;
+      if (w <= 0 || h <= 0) return;
+      if (externalSizeOverrideRef.current && !paneOwnsFocus()) return;
+      externalSizeOverrideRef.current = false;
+
+      if (cellSizeRef.current[0] <= 1 || cellSizeRef.current[1] <= 1) {
+        refreshCachedCellSize(term);
+      }
+      const [cw, ch] = cellSizeRef.current;
+      const grid = proposeGridFast(w, h, cw, ch);
+      if (!grid) {
+        syncResize(term);
+        return;
+      }
+      if (grid.cols !== term.cols || grid.rows !== term.rows) {
+        term.resize(grid.cols, grid.rows);
+      }
+      centerScreenVerticalGap(hostRef.current, term);
+      paintOverlays();
+
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (now - lastPtySyncAt >= 55) {
+        lastPtySyncAt = now;
+        flushPtyResize(term);
+      }
+    };
+
+    const ro = new ResizeObserver((entries) => {
+      const last = entries[entries.length - 1];
+      if (last) {
+        pendingRectW = last.contentRect.width;
+        pendingRectH = last.contentRect.height;
+      }
+      if (!resizeRaf) {
+        resizeRaf = requestAnimationFrame(() => {
+          resizeRaf = 0;
+          applyLiveResize(pendingRectW, pendingRectH);
+        });
+      }
       if (resizeSettleTimer) window.clearTimeout(resizeSettleTimer);
       resizeSettleTimer = window.setTimeout(() => {
         resizeSettleTimer = 0;
-        if (resizeRaf) cancelAnimationFrame(resizeRaf);
-        resizeRaf = requestAnimationFrame(() => {
-          resizeRaf = 0;
-          if (!alive) return;
-          if (isSplitMotionActive()) {
-            cancelMotionSettle?.();
-            cancelMotionSettle = onSplitMotionSettled(() => {
-              cancelMotionSettle = null;
-              if (alive) syncResize(term);
-            });
-            return;
-          }
-          syncResize(term);
-        });
-      }, 90);
+        if (!alive) return;
+        applyLiveResize(hostRef.current?.clientWidth ?? pendingRectW, hostRef.current?.clientHeight ?? pendingRectH);
+        lastPtySyncAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+        flushPtyResize(term);
+      }, 110);
     });
     ro.observe(hostEl);
 
@@ -2917,8 +2960,6 @@ export function TerminalSurface({
       window.clearTimeout(flushTimer);
       window.clearTimeout(orphanNudgeTimer);
       onMissingVirtualAssetRef.current = null;
-      cancelMotionSettle?.();
-      cancelMotionSettle = null;
       clearOverlaysRef.current = null;
       if (resizeSettleTimer) window.clearTimeout(resizeSettleTimer);
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
@@ -3025,7 +3066,6 @@ export function TerminalSurface({
     }
     if (!active || !termRef.current) return;
     const term = termRef.current;
-    let cancelSettle: (() => void) | null = null;
     lastActivateAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (externalSizeOverrideRef.current) {
       lastResizeSigRef.current = "";
@@ -3034,18 +3074,11 @@ export function TerminalSurface({
       const prevConn = localConnRef.current;
       syncResize(term, true);
       term.focus();
-      if (localConnRef.current === prevConn) {
-        if (externalSizeOverrideRef.current) {
-          externalSizeOverrideRef.current = false;
-        }
-        cancelSettle = onSplitMotionSettled(() => {
-          if (termRef.current === term) syncResize(term, true);
-        });
+      if (localConnRef.current === prevConn && externalSizeOverrideRef.current) {
+        externalSizeOverrideRef.current = false;
       }
     } else {
-      cancelSettle = onSplitMotionSettled(() => {
-        if (termRef.current === term) syncResize(term);
-      });
+      syncResize(term);
     }
     term.refresh(0, Math.max(0, term.rows - 1));
     paintOverlays();
@@ -3055,7 +3088,6 @@ export function TerminalSurface({
       }
     });
     return () => {
-      cancelSettle?.();
       cancelAnimationFrame(id);
     };
   }, [active, focused, paintOverlays, syncResize]);

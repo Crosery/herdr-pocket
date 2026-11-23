@@ -858,7 +858,173 @@ export interface RpcMethods {
     params: { agent?: string; cwd?: string };
     result: { summary: string };
   };
+  "tools.check": {
+    params: Record<string, never>;
+    result: { tools: HostTools; hostVersion: string };
+  };
+  "tools.update": {
+    params: { targets?: HostToolId[]; waitMs?: number };
+    result: ToolUpdateJobSnapshot;
+  };
+  "tools.updateStatus": {
+    params: { jobId?: string };
+    result: ToolUpdateJobSnapshot | null;
+  };
+  "files.readChunk": {
+    params: { agent?: string; path: string; cwd?: string; offset?: number; length?: number };
+    result: { path: string; size: number; mtime: number; offset: number; bytes: number; eof: boolean; mime: string; base64: string };
+  };
+  "portal.list": {
+    params: { agent?: string; includeWindows?: boolean };
+    result: { items: PortalItem[]; windows?: RemoteWindowInfo[]; capabilities: HostPortalCapabilities };
+  };
+  "portal.open": {
+    params: { agent?: string; kind: PortalKind; target?: string; url?: string; windowId?: string; reveal?: boolean; title?: string };
+    result: { item: PortalItem; ticket?: PortalFileTicket };
+  };
+  "portal.close": {
+    params: { portalId: string };
+    result: { ok: true };
+  };
+  "portal.frame": {
+    params: { portalId: string; maxWidth?: number; quality?: number };
+    result: { frame: PortalFramePayload | null; item: PortalItem | null };
+  };
+  "portal.input": {
+    params: { portalId: string; input: PortalInputAction };
+    result: { ok: true; url?: string; title?: string };
+  };
+  "portal.fileTicket": {
+    params: { agent?: string; path: string; cwd?: string; portalId?: string };
+    result: PortalFileTicket;
+  };
+  "portal.dirList": {
+    params: { portalId?: string; agent?: string; path: string; hidden?: boolean };
+    result: { dirPath: string; parentDir: string | null; highlightName?: string; entries: FileEntry[]; truncated: boolean };
+  };
+  "portal.bundleHtml": {
+    params: { agent?: string; path: string; cwd?: string; portalId?: string };
+    result: { html: string; title: string };
+  };
 }
+
+export type HostToolId = "app" | "herdr" | "hc" | "uniflo" | "hostd";
+
+export interface ToolUpdateItemResult {
+  id: HostToolId;
+  ok: boolean;
+  status: "updated" | "up_to_date" | "restarting" | "failed";
+  fromVersion?: string;
+  toVersion?: string;
+  message: string;
+}
+
+export interface ToolUpdateJobSnapshot {
+  jobId: string;
+  running: boolean;
+  targets: HostToolId[];
+  completed: ToolUpdateItemResult[];
+  current?: HostToolId;
+  tools: HostTools;
+  hostVersion: string;
+  startedAt: number;
+  finishedAt?: number;
+}
+
+export type PortalKind = "file" | "html" | "reveal" | "browser" | "window";
+
+export type PortalDisplaySession =
+  | "macos"
+  | "win32"
+  | "x11"
+  | "wayland-wlroots"
+  | "wayland-kde"
+  | "wayland-gnome"
+  | "wayland-other"
+  | "headless";
+
+export interface HostPortalCapabilities {
+  platform: string;
+  sessionType: PortalDisplaySession;
+  desktopEnv?: string;
+  canListWindows: boolean;
+  canCaptureWindow: boolean;
+  canCaptureScreen: boolean;
+  canInjectInput: boolean;
+  hasCdpBrowser: boolean;
+  directPort?: number | null;
+  notes?: string[];
+}
+
+export interface RemoteWindowInfo {
+  id: string;
+  appName: string;
+  title: string;
+  bounds?: { x: number; y: number; width: number; height: number };
+  pid?: number;
+  isScreen?: boolean;
+}
+
+export interface PortalItem {
+  id: string;
+  hostId: string;
+  agentKey?: string;
+  terminalId?: string;
+  kind: PortalKind;
+  title: string;
+  subtitle?: string;
+  targetPath?: string;
+  parentDir?: string;
+  highlightName?: string;
+  url?: string;
+  windowId?: string;
+  mime?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  canInteract: boolean;
+  transportHint?: "p2p" | "relay";
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PortalFileTicket {
+  token: string;
+  entryPath: string;
+  port: number | null;
+  addrs: string[];
+  expiresAt: number;
+  mime: string;
+  size: number;
+  isDir: boolean;
+}
+
+export interface PortalFramePayload {
+  portalId: string;
+  seq: number;
+  mime: "image/jpeg" | "image/png" | "image/webp";
+  data: string;
+  width: number;
+  height: number;
+  url?: string;
+  title?: string;
+  canGoBack?: boolean;
+  canGoForward?: boolean;
+  at: number;
+}
+
+export type PortalStreamEvent =
+  | { kind: "portal_event"; action: "opened" | "updated" | "closed"; item: PortalItem; at: number }
+  | ({ kind: "portal_frame" } & PortalFramePayload);
+
+export type PortalInputAction =
+  | { type: "pointer"; action: "move" | "down" | "up" | "click" | "dblclick"; nx: number; ny: number; button?: "left" | "right" | "middle" }
+  | { type: "wheel"; nx: number; ny: number; deltaX: number; deltaY: number }
+  | { type: "key"; key: string; modifiers?: string[] }
+  | { type: "text"; text: string }
+  | { type: "navigate"; action: "goto" | "back" | "forward" | "reload"; url?: string };
+
+export const DIRECT_PORTAL_FS_PREFIX = "/v1/portal-fs";
 
 export type GitFileStatusCode = "M" | "A" | "D" | "R" | "U" | "?";
 
@@ -1157,7 +1323,9 @@ export interface HostTools {
 export interface UpstreamLatest {
   hc?: string;
   app?: string;
+  herdr?: string;
   uniflo?: string;
+  hostd?: string;
   /** When a check last got an answer (ms since epoch). */
   checkedAt?: number;
 }
@@ -1782,6 +1950,8 @@ export function applyRows(prev: readonly string[], change: RowsChange): string[]
 // WebSocket frames (JSON text frames, one message each)
 // ---------------------------------------------------------------------------
 
+export type StreamKind = "terminal" | "session" | "portal";
+
 /** Client (host or viewer) -> relay. */
 export type ClientFrame =
   /** First frame from a host: what it can do. */
@@ -1793,7 +1963,7 @@ export type ClientFrame =
   /** Host answers an rpc it received. */
   | { type: "rpc_result"; id: string; result?: unknown; error?: RpcError }
   /** Start a long-lived host stream; `id` is scoped to the viewer connection. */
-  | { type: "stream_subscribe"; id: string; to?: string; from?: string; stream: "terminal" | "session"; params: unknown }
+  | { type: "stream_subscribe"; id: string; to?: string; from?: string; stream: StreamKind; params: unknown }
   | { type: "stream_unsubscribe"; id: string; to?: string; from?: string }
   /** Host -> relay stream lifecycle and data frames. */
   | { type: "stream_open"; id: string; result?: unknown; error?: RpcError }
@@ -1815,7 +1985,7 @@ export type ServerFrame =
   | { type: "rpc"; id: string; from: string; method: RpcMethod; params: unknown }
   | { type: "rpc_result"; id: string; result?: unknown; error?: RpcError }
   /** Stream subscription forwarded to a host. */
-  | { type: "stream_subscribe"; id: string; from: string; stream: "terminal" | "session"; params: unknown }
+  | { type: "stream_subscribe"; id: string; from: string; stream: StreamKind; params: unknown }
   | { type: "stream_unsubscribe"; id: string; from: string }
   /**
    * A host has accepted a stream subscription. With `error` after it was
@@ -2572,12 +2742,14 @@ export interface ClientConfig {
     language: "zh-CN" | "en";
     theme: "system" | "light" | "dark";
     textScale: number;
+    fontFamily: string;
     chatDisplayMode: ChatDisplayMode;
     showShells: boolean;
     useLocalLogin: boolean;
     launchAtLogin: boolean;
     closeToTray: boolean;
     notifications: boolean;
+    dynamicIsland: boolean;
   };
   update: {
     region: RegionSetting;
@@ -2658,6 +2830,7 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "general.language", type: "enum", values: ["zh-CN", "en"], default: "zh-CN", usedBy: D, label: "界面语言", doc: "Language of the desktop app." },
   { key: "general.theme", type: "enum", values: ["system", "light", "dark"], default: "system", usedBy: D, label: "外观", doc: "Light, dark, or follow the system." },
   { key: "general.textScale", type: "integer", min: 80, max: 160, default: 100, usedBy: D, label: "文字大小（%）", doc: "Text size of the desktop app in percent." },
+  { key: "general.fontFamily", type: "string", default: "", usedBy: D, label: "界面字体", doc: "Global UI font family of the desktop app; empty uses the default stack." },
   {
     key: "general.chatDisplayMode",
     type: "enum",
@@ -2672,6 +2845,7 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "general.launchAtLogin", type: "boolean", default: false, usedBy: D, label: "开机时启动", doc: "Start the desktop app when you log in." },
   { key: "general.closeToTray", type: "boolean", default: false, usedBy: D, label: "关闭窗口后留在托盘", doc: "Closing the window keeps the app in the menu bar / tray. Off by default: closing the window quits the app." },
   { key: "general.notifications", type: "boolean", default: true, usedBy: D, label: "系统通知", doc: "System notifications when an agent finishes or waits." },
+  { key: "general.dynamicIsland", type: "boolean", default: true, usedBy: D, label: "灵动岛与顶部提醒胶囊", doc: "Show live agent reminders and quick jump in the macOS Dynamic Island / top capsule." },
   { key: "update.region", type: "enum", values: ["auto", "cn", "global"], default: "auto", usedBy: ALL, label: "下载线路", doc: "auto: by time zone. cn: mirrors first. global: GitHub first.", env: "HERDR_POCKET_MIRROR" },
   { key: "update.preferredSource", type: "string", format: "sourceChoice", default: "auto", usedBy: ALL, label: "首选镜像源", doc: "auto: recommend by time zone and pick lowest-latency reachable source. direct: GitHub directly. Or a mirror prefix URL." },
   { key: "update.autoCheck", type: "boolean", default: true, usedBy: ALL, label: "自动检查更新", doc: "Look for a new release now and then.", env: "HERDR_POCKET_UPDATE_CHECK" },

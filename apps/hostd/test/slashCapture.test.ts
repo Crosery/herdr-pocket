@@ -163,14 +163,15 @@ test("sendAndCaptureSlashCommand captures TUI viewer panels and auto-dismisses w
       },
       keys: async (_id, k) => {
         keysPicker.push(k);
+        pickerScreen = "❯ ";
       },
     },
     "t1",
     { harness: "claude-code", isShell: false },
     "/config",
   );
-  assert.equal(pickerRes?.panelState, "interactive_open");
-  assert.equal(keysPicker.length, 0);
+  assert.equal(pickerRes?.panelState, "closed");
+  assert.deepEqual(keysPicker, [["esc"]]);
 
   // Prefers fast dismissSubscreens over raw keys when available.
   let dismissedFast = false;
