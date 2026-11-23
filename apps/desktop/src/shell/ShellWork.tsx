@@ -1,7 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Copy, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
-import { PocketButton, PocketModal, overlayStore, useToast } from "../components/PocketUI";
+import { PocketButton, PocketErrorBoundary, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood } from "../components/MascotAndVendor";
@@ -957,7 +957,9 @@ function FilePane({ tab, agent }: { tab: FileTab; agent: Agent | undefined }) {
     <section className="v3-pane" aria-label={tab.title}>
       <PaneHead tab={tab} agent={agent} fileHead={fileHead} onClose={() => requestCloseShellTab(tab)} />
       <div className="v3-pane-body">
-        <FileViewer key={tab.id} tab={tab} agent={agent} embedded onHeadState={setFileHead} />
+        <PocketErrorBoundary resetKey={tab.id} title="文件预览加载出错">
+          <FileViewer key={tab.id} tab={tab} agent={agent} embedded onHeadState={setFileHead} />
+        </PocketErrorBoundary>
       </div>
     </section>
   );
@@ -968,7 +970,9 @@ function DiffPane({ tab }: { tab: DiffTab }) {
     <section className="v3-pane" aria-label={tab.title}>
       <PaneHead tab={tab} agent={undefined} onClose={() => requestCloseShellTab(tab)} />
       <div className="v3-pane-body">
-        <DiffTabView key={tab.id} tab={tab} />
+        <PocketErrorBoundary resetKey={tab.id} title="差异对比加载出错">
+          <DiffTabView key={tab.id} tab={tab} />
+        </PocketErrorBoundary>
       </div>
     </section>
   );
@@ -989,25 +993,27 @@ function AgentPane({ tab, agentKey }: { tab: AgentTab; agentKey: string }) {
         onClose={() => requestCloseShellTab(tab)}
       />
       <div className="v3-pane-body">
-        {agent ? (
-          <AgentDetailPanel
-            key={agent.key}
-            agent={agent}
-            embedded
-            mode={mode}
-            onModeChange={(m) => setAgentTabMode(tab.id, m)}
-            onSubHeadChange={setSubHead}
-            onBack={() => closeShellTab(tab)}
-            onOpenWorkbench={() => showPanel("files")}
-          />
-        ) : (
-          <div className="v3-pane-empty">
-            <p>这个 Agent 已经结束，或者它的电脑离线了。</p>
-            <PocketButton size="sm" variant="soft" onClick={() => requestCloseShellTab(tab)}>
-              关闭标签
-            </PocketButton>
-          </div>
-        )}
+        <PocketErrorBoundary resetKey={tab.id} title="会话视图加载出错">
+          {agent ? (
+            <AgentDetailPanel
+              key={agent.key}
+              agent={agent}
+              embedded
+              mode={mode}
+              onModeChange={(m) => setAgentTabMode(tab.id, m)}
+              onSubHeadChange={setSubHead}
+              onBack={() => closeShellTab(tab)}
+              onOpenWorkbench={() => showPanel("files")}
+            />
+          ) : (
+            <div className="v3-pane-empty">
+              <p>这个 Agent 已经结束，或者它的电脑离线了。</p>
+              <PocketButton size="sm" variant="soft" onClick={() => requestCloseShellTab(tab)}>
+                关闭标签
+              </PocketButton>
+            </div>
+          )}
+        </PocketErrorBoundary>
       </div>
     </section>
   );

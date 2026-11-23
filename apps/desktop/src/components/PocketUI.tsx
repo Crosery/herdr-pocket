@@ -1,4 +1,5 @@
 import {
+  Component,
   createContext,
   useCallback,
   useContext,
@@ -6,6 +7,7 @@ import {
   useMemo,
   useState,
   type ButtonHTMLAttributes,
+  type ErrorInfo,
   type InputHTMLAttributes,
   type ReactNode,
   type TextareaHTMLAttributes,
@@ -16,6 +18,7 @@ import * as Switch from "@radix-ui/react-switch";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import { AlertCircle, Check, CheckCircle2, ChevronDown, PhoneOff, X } from "lucide-react";
 import { XiaoyangOrb, type MascotMood } from "./MascotAndVendor";
+import { logger } from "../lib/log";
 import { createStore } from "../lib/store";
 
 /** How many dialogs are open: native layers drawn over the page (the embedded browser) hide meanwhile. */
@@ -398,4 +401,47 @@ export function EmptyState({
       {action}
     </div>
   );
+}
+
+/** Isolates a crashing subtree so one view or tab error never blanks the entire desktop shell. */
+export class PocketErrorBoundary extends Component<
+  { children: ReactNode; resetKey?: string | number | null; title?: string },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error): { error: Error } {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo): void {
+    const loc = info.componentStack ? ` | ${info.componentStack.trim().split("\n")[0]?.trim() ?? ""}` : "";
+    logger.error("app.boundary", `${error.name}: ${error.message}${loc}`);
+  }
+
+  componentDidUpdate(prevProps: { resetKey?: string | number | null }): void {
+    if (this.state.error && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ error: null });
+    }
+  }
+
+  render(): ReactNode {
+    if (this.state.error) {
+      return (
+        <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+          <EmptyState
+            mood="sleepy"
+            title={this.props.title ?? "当前视图渲染出错"}
+            body={this.state.error.message}
+            action={
+              <PocketButton size="sm" variant="soft" onClick={() => this.setState({ error: null })}>
+                重新加载视图
+              </PocketButton>
+            }
+          />
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }

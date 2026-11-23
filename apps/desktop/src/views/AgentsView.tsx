@@ -49,6 +49,7 @@ import {
   PocketBadge,
   PocketButton,
   PocketCard,
+  PocketErrorBoundary,
   PocketIconButton,
   PocketInput,
   PocketModal,
@@ -2384,7 +2385,9 @@ export function AgentDetailPanel({
 
       {termVisited ? (
         <div style={{ flex: 1, minHeight: 0, display: activeMode === "term" ? "flex" : "none" }}>
-          <TerminalSurface agent={agent} active={activeMode === "term"} />
+          <PocketErrorBoundary resetKey={`${agent.key}:${activeMode}`} title="终端视图加载出错">
+            <TerminalSurface agent={agent} active={activeMode === "term"} />
+          </PocketErrorBoundary>
         </div>
       ) : null}
 

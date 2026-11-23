@@ -1,6 +1,8 @@
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { test } from "node:test";
+import ts from "typescript";
 import { configKeySpec } from "@herdr-pocket/protocol";
 import {
   deleteKittyPlacementsScoped,
@@ -220,4 +222,40 @@ test("TerminalSurface keeps customGlyphs enabled across both light and dark mode
   assert.ok(src.includes("customGlyphs: true"), "XTerm initialization must enable customGlyphs");
   assert.ok(src.includes("term.options.customGlyphs = true"), "live option updates must keep customGlyphs enabled");
   assert.equal(/customGlyphs\s*[:=]\s*(?:false|activeSpec\.mode)/.test(src), false);
+});
+
+test("TerminalSurface has zero forward references to block-scoped let/const declarations (TDZ guard)", () => {
+  const cfgPath = new URL("../tsconfig.json", import.meta.url).pathname;
+  const termPath = new URL("../src/components/TerminalSurface.tsx", import.meta.url).pathname;
+  const cfg = ts.readConfigFile(cfgPath, ts.sys.readFile);
+  const parsed = ts.parseJsonConfigFileContent(cfg.config, ts.sys, dirname(cfgPath));
+  const program = ts.createProgram(parsed.fileNames, parsed.options);
+  const checker = program.getTypeChecker();
+  const sf = program.getSourceFile(termPath);
+  assert.ok(sf, "TerminalSurface.tsx must exist in tsconfig program");
+
+  const forwardRefs: string[] = [];
+  const visit = (node: ts.Node) => {
+    if (ts.isIdentifier(node)) {
+      const sym = checker.getSymbolAtLocation(node);
+      const decl = sym?.valueDeclaration;
+      if (
+        decl &&
+        decl.getSourceFile() === sf &&
+        ts.isVariableDeclaration(decl) &&
+        decl.parent &&
+        ts.isVariableDeclarationList(decl.parent) &&
+        (decl.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
+        node.pos < decl.pos
+      ) {
+        const refPos = sf.getLineAndCharacterOfPosition(node.getStart());
+        const declPos = sf.getLineAndCharacterOfPosition(decl.getStart());
+        forwardRefs.push(`line ${refPos.line + 1} refs "${node.text}" before decl at line ${declPos.line + 1}`);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+
+  assert.deepEqual(forwardRefs, [], `Found TDZ forward references:\n${forwardRefs.join("\n")}`);
 });

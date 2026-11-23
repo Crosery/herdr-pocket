@@ -1,7 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { AppWindow, Bot, Laptop, MessageSquare, Moon, QrCode, Server, Settings, Sun } from "lucide-react";
 import { parsePairLink } from "@herdr-pocket/protocol";
-import { PocketButton, PocketInput, PocketModal, ToastProvider, useToast } from "./components/PocketUI";
+import { PocketButton, PocketErrorBoundary, PocketInput, PocketModal, ToastProvider, useToast } from "./components/PocketUI";
 import { XiaoyangOrb } from "./components/MascotAndVendor";
 import type { NavItem } from "./components/Sidebar";
 import { DesktopShell } from "./shell/DesktopShell";
@@ -538,7 +538,9 @@ function TitlebarStrip() {
 export function App() {
   return (
     <ToastProvider>
-      <PocketAppShell />
+      <PocketErrorBoundary title="界面渲染出错">
+        <PocketAppShell />
+      </PocketErrorBoundary>
     </ToastProvider>
   );
 }

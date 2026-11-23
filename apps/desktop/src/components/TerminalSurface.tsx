@@ -912,6 +912,15 @@ export function TerminalSurface({
     const hostEl = hostRef.current;
     if (!hostEl) return;
 
+    let alive = true;
+    let sawRaw = false;
+    let fallbackLines: string[] = [];
+    const splitter = new KittyApcSplitter();
+    const placeholderRewriter = new KittyUnicodePlaceholderRewriter();
+    const textDecoder = new TextDecoder("utf-8", { fatal: false });
+    let pendingBytes: Uint8Array[] = [];
+    let flushRaf = 0;
+
     const term = new XTerm({
       allowProposedApi: true,
       cursorBlink: termCfg.cursorBlink,
@@ -960,6 +969,10 @@ export function TerminalSurface({
     term.loadAddon(unicode11);
     term.unicode.activeVersion = "11";
     term.loadAddon(imageAddon);
+
+    const isAlt = () => term.buffer.active === term.buffer.alternate;
+    const numParam = (p: number | number[] | undefined, def = 0): number =>
+      typeof p === "number" ? p : Array.isArray(p) ? (p[0] ?? def) : def;
 
     termRef.current = term;
     fitRef.current = fitAddon;
@@ -1077,10 +1090,6 @@ export function TerminalSurface({
     });
 
     // Kitty Keyboard Protocol CSI handlers (`> flags u`, `< n u`, `= flags ; mode u`, `? u`)
-    const isAlt = () => term.buffer.active === term.buffer.alternate;
-    const numParam = (p: number | number[] | undefined, def = 0): number =>
-      typeof p === "number" ? p : Array.isArray(p) ? (p[0] ?? def) : def;
-
     const dispCsiPush = term.parser.registerCsiHandler({ prefix: ">", final: "u" }, (params) => {
       kittyKeys.push(isAlt(), numParam(params[0], 0));
       return true;
@@ -1260,6 +1269,8 @@ export function TerminalSurface({
         term.select(col0, row0, len);
       };
 
+      let cleanup: () => void = () => {};
+
       const finishDrag = (up: MouseEvent) => {
         cleanup();
         if (draggingSelection) {
@@ -1276,7 +1287,7 @@ export function TerminalSurface({
         }
       };
 
-      const cleanup = () => {
+      cleanup = () => {
         window.removeEventListener("mousemove", onWinMove, true);
         window.removeEventListener("mouseup", finishDrag, true);
         window.removeEventListener("blur", cleanup, true);
@@ -1568,15 +1579,6 @@ export function TerminalSurface({
     };
 
     // PTY Stream: prefer direct `hc connect` for local mac/pc hc terminals, with Relay fallback.
-    let alive = true;
-    let sawRaw = false;
-    let fallbackLines: string[] = [];
-    const splitter = new KittyApcSplitter();
-    const placeholderRewriter = new KittyUnicodePlaceholderRewriter();
-    const textDecoder = new TextDecoder("utf-8", { fatal: false });
-    let pendingBytes: Uint8Array[] = [];
-    let flushRaf = 0;
-
     const writeSegmented = (rawText: string) => {
       const segments = splitter.push(rawText);
       for (const seg of segments) {
