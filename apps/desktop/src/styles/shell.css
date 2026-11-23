@@ -993,15 +993,6 @@
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.12s ease;
-}
-
-.v3-pane-head:hover .v3-pane-actions,
-.v3-pane-head:focus-within .v3-pane-actions {
-  opacity: 1;
-  pointer-events: auto;
 }
 
 .v3-pane-head > svg {

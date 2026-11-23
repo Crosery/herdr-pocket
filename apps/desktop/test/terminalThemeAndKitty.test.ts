@@ -235,6 +235,14 @@ test("TerminalSurface subscribes to local-term://size and fonts.ts prefers 1-cel
   assert.ok(idxSymbolsMono >= 0 && idxJbMono > idxSymbolsMono && idxJbProp > idxJbMono, "Mono Nerd fonts must precede proportional JetBrainsMono Nerd Font");
 });
 
+test("pane header action toolbar (.v3-pane-actions) remains visible by default", () => {
+  const css = readFileSync(new URL("../src/styles/shell.css", import.meta.url), "utf8");
+  const match = css.match(/\.v3-pane-actions\s*\{([^}]*)\}/);
+  assert.ok(match, "shell.css must define .v3-pane-actions");
+  assert.equal(/opacity\s*:\s*0/.test(match[1]!), false, ".v3-pane-actions must not hide with opacity: 0");
+  assert.equal(/pointer-events\s*:\s*none/.test(match[1]!), false, ".v3-pane-actions must remain clickable by default");
+});
+
 test("Touched desktop UI & sync modules have zero forward references to block-scoped let/const declarations (TDZ guard)", () => {
   const cfgPath = new URL("../tsconfig.json", import.meta.url).pathname;
   const targets = [
