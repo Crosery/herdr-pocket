@@ -81,7 +81,7 @@ export function clearPendingSplitPlacements(): void {
 }
 
 export interface HerdrDocSyncController {
-  syncHost: (hostId: string) => Promise<void>;
+  syncHost: (hostId: string, opts?: { forcePull?: boolean }) => Promise<void>;
   syncAllOnlineHosts: () => Promise<void>;
   handleShellChange: (state?: ShellState) => void;
   flushHost: (hostId: string) => Promise<void>;
@@ -300,8 +300,15 @@ export function createHerdrDocSyncController(
     }
   };
 
-  const syncHost = async (hostId: string): Promise<void> => {
+  const syncHost = async (hostId: string, opts?: { forcePull?: boolean }): Promise<void> => {
     const slot = ensureSlot(hostId);
+    if (opts?.forcePull) {
+      if (slot.debounceTimer) {
+        clearTimeout(slot.debounceTimer);
+        slot.debounceTimer = null;
+      }
+      slot.dirty = false;
+    }
     if (slot.inflight || slot.blocked) return;
     if (slot.dirty) {
       await flushHost(hostId);
@@ -426,6 +433,11 @@ function getSharedController(): HerdrDocSyncController {
 /** Pulls the latest `herdr-app` layout doc for `hostId` right away (for example after `herdr.command pane.split`). */
 export function syncHostNow(hostId: string): Promise<void> {
   return getSharedController().syncHost(hostId);
+}
+
+/** Forces an authoritative inbound pull of `herdr-app` doc for `hostId` (used after host-side `agent.create`). */
+export function pullHostDocNow(hostId: string): Promise<void> {
+  return getSharedController().syncHost(hostId, { forcePull: true });
 }
 
 /** Flushes local `herdr-app` doc changes for `hostId` without waiting for the debounce timer. */

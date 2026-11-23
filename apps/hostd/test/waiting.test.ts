@@ -1,10 +1,15 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
-import type { Agent, ConvEvent } from "@herdr-pocket/protocol";
+import { extractTerminalQueuedMessages, type Agent, type ConvEvent } from "@herdr-pocket/protocol";
 import { InputWaits } from "../src/waiting.ts";
+import { readJsonlModelAndThinkingTail } from "../src/uniflo.ts";
+import { HcAdapter } from "../src/hc.ts";
 import { LogBuffer, levelOf } from "../src/logbuf.ts";
 import { Host } from "../src/host.ts";
 
@@ -132,6 +137,136 @@ test("terminal.send to a working agent says it waits, the agent carries it, and 
     const failed = frames.filter((f) => f.type === "log").flatMap((f) => f.entries).find((e: any) => /^agent\.create from assistant failed/.test(e.msg));
     assert.equal(failed.level, "warn");
     assert.equal(failed.data.launcher, "claude");
+  } finally {
+    h.stop();
+    for (const c of wss.clients) c.terminate();
+    wss.close();
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("extractTerminalQueuedMessages parses queued prompts across agy, claude, codex/omp without false positives", () => {
+  const agyScreen = [
+    "  Working on your task...",
+    "  ▸ regular markdown bullet inside output",
+    "────────────────────────────────────",
+    "  ▸ 看看能不能加个啥子东西 (alt+m to send immediately)",
+    "  ▸ 第二条长消息换",
+    "    行了 (alt+m to send immediately)",
+    "> ",
+  ].join("\n");
+  assert.deepEqual(extractTerminalQueuedMessages(agyScreen, "antigravity"), [
+    "看看能不能加个啥子东西",
+    "第二条长消息换 行了",
+  ]);
+
+  const claudeScreen = [
+    "✻ Working (12s · esc to interrupt)",
+    "────────────────────────────────────",
+    "> 先跑一遍全量单测",
+    "> 再看下桌面端闪屏问题",
+    "  Press up to edit queued messages",
+    "────────────────────────────────────",
+    "❯ ",
+  ].join("\n");
+  assert.deepEqual(extractTerminalQueuedMessages(claudeScreen, "claude-code"), [
+    "先跑一遍全量单测",
+    "再看下桌面端闪屏问题",
+  ]);
+
+  const ompScreen = [
+    "Queued: check build output before pushing",
+    "Steer (next): prioritize hostd tests",
+    "Follow-up: update release notes",
+  ].join("\n");
+  assert.deepEqual(extractTerminalQueuedMessages(ompScreen, "omp"), [
+    "check build output before pushing",
+    "prioritize hostd tests",
+    "update release notes",
+  ]);
+});
+
+test("InputWaits.decorate merges and deduplicates transcript, screen, and host waits cleanly", () => {
+  const w = new InputWaits();
+  w.add("d/hc:t1", "q1", "看看能不能加个啥子东西", 1000);
+  w.setScreenQueued("d/hc:t1", ["看看能不能加个啥子东西", "终端直接敲的第二条"]);
+  const [decorated] = w.decorate([
+    agent("working", { queuedItems: ["Claude JSONL queued item", "看看能不能加个啥子东西"] }),
+  ]);
+  assert.equal(decorated!.queued, 3);
+  assert.deepEqual(decorated!.queuedItems, [
+    "Claude JSONL queued item",
+    "看看能不能加个啥子东西",
+    "终端直接敲的第二条",
+  ]);
+});
+
+test("readJsonlModelAndThinkingTail reconstructs pending Claude queue-operation entries", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hp-queue-jsonl-"));
+  const file = join(dir, "session.jsonl");
+  try {
+    const lines = [
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", content: "first prompt" }),
+      JSON.stringify({ type: "queue-operation", operation: "dequeue", content: "first prompt" }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "first prompt" } }),
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", content: "<task-notification>bg done</task-notification>" }),
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", content: "will be removed" }),
+      JSON.stringify({ type: "queue-operation", operation: "remove", content: "will be removed" }),
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", content: "still waiting in queue" }),
+      JSON.stringify({ type: "assistant", message: { model: "claude-opus-4-6" } }),
+    ];
+    writeFileSync(file, `${lines.join("\n")}\n`, "utf8");
+    const meta = readJsonlModelAndThinkingTail(file);
+    assert.equal(meta.model, "claude-opus-4-6");
+    assert.deepEqual(meta.queuedItems, ["still waiting in queue"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agent.seen RPC refreshes hc.list, labels herdr.seen, and publishes idle state", async () => {
+  const frames: any[] = [];
+  const wss = new WebSocketServer({ noServer: true });
+  const server = createServer();
+  server.on("upgrade", (req, socket, head) => wss.handleUpgrade(req, socket, head, (ws) => ws.on("message", (d) => frames.push(JSON.parse(d.toString())))));
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const h = new Host({ config: { server: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, token: "t", deviceId: "d", name: "test" }, log: () => {} });
+  const labelsSet: Array<{ addr: string; labels: Record<string, string> }> = [];
+  h.hc.terminals.set("t99", {
+    address: "t99",
+    status: { app: "antigravity", state: "done" },
+    turn: 7,
+    labels: {},
+  } as any);
+  h.hc.label = async (addr: string, labels: Record<string, string>) => {
+    labelsSet.push({ addr, labels });
+    const term = h.hc.terminals.get(addr);
+    if (term) term.labels = { ...term.labels, ...labels };
+  };
+  h.hc.list = async () => {};
+  (h as unknown as { collect: () => Agent[] }).collect = () => {
+    const t = h.hc.terminals.get("t99")!;
+    return [agent(HcAdapter.status(t as any), { key: "d/hc:t99", localId: "t99", turn: t.turn })];
+  };
+  h.agents = (h as unknown as { collect: () => Agent[] }).collect();
+  try {
+    (h as unknown as { connect(): void }).connect();
+    for (let i = 0; i < 100 && !h.connected; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(h.agents[0]?.status, "done");
+    await (h as unknown as { handleRpc(f: unknown): Promise<void> }).handleRpc({
+      type: "rpc",
+      id: "seen1",
+      from: "relay",
+      method: "agent.seen",
+      params: { agent: "d/hc:t99" },
+    });
+    assert.deepEqual(labelsSet, [{ addr: "t99", labels: { "herdr.seen": "7" } }]);
+    for (let i = 0; i < 50 && frames.filter((f) => f.type === "agents").pop()?.agents?.[0]?.status !== "idle"; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const published = frames.filter((f) => f.type === "agents").pop();
+    assert.equal(published?.agents?.[0]?.status, "idle");
   } finally {
     h.stop();
     for (const c of wss.clients) c.terminate();

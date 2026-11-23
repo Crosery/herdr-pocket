@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
-import { Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, Search, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import { ChevronDown, Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, Search, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
@@ -57,6 +57,7 @@ import {
   showPanel,
   splitActivePaneWithContent,
   splitTabPane,
+  stableSplitLeafKeys,
   swapTabPanes,
   tabLeaves,
   tabRootNode,
@@ -71,6 +72,7 @@ import {
   type ShellTab,
   type SplitDirection,
   type SplitLeafLayout,
+  type SplitLeafNode,
   type SplitSashLayout,
 } from "./shellStore";
 import { comboText, shortcutText, SHORTCUTS } from "./shortcuts";
@@ -880,15 +882,28 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       </div>
       <button
         className="v3-icon-btn"
-        aria-label="新建"
-        title="新建终端、Agent、网页或文件"
+        aria-label="新建终端"
+        title={`新建终端（${shortcutText("newAgent")}）· 右键查看更多`}
+        onClick={onNewTerminal}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          const r = e.currentTarget.getBoundingClientRect();
+          setNewMenu({ x: r.left, y: r.bottom + 4 });
+        }}
+      >
+        <Plus size={16} />
+      </button>
+      <button
+        className="v3-icon-btn small"
+        aria-label="更多新建选项"
+        title="新建终端、Agent、网页或文件…"
         onClick={(e) => {
           const r = e.currentTarget.getBoundingClientRect();
           setNewMenu(newMenu ? null : { x: r.left, y: r.bottom + 4 });
         }}
         onPointerDown={(e) => e.stopPropagation()}
       >
-        <Plus size={16} />
+        <ChevronDown size={13} />
       </button>
       <div className="v3-tabs-right">
         {panelBtn("files", "文件", FolderTree, shortcutText("togglePanel"))}
@@ -1332,6 +1347,8 @@ function PaneHead({
       <div className="v3-pane-right">
         {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
         {sizeText ? <span className="v3-pane-pill num">{sizeText}</span> : null}
+        {content.kind === "agent" && group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
+        {content.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
         {content.kind === "agent" && agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
           <SubagentCatalogTrigger
             compact
@@ -1344,8 +1361,6 @@ function PaneHead({
             onRefresh={subHead.onRefresh}
           />
         ) : null}
-        {content.kind === "agent" && group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
-        {content.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
         {previewToggleable && fileHead ? (
           <div className="v3-mode-switch" role="group" aria-label="视图">
             <button
@@ -1689,6 +1704,7 @@ function SplitSash({
 
 function SplitPaneSlot({
   tabId,
+  paneKey,
   item,
   isSplit,
   isFocused,
@@ -1699,6 +1715,7 @@ function SplitPaneSlot({
   onSplitNewTerminal,
 }: {
   tabId: string;
+  paneKey: string;
   item: SplitLeafLayout;
   isSplit: boolean;
   isFocused: boolean;
@@ -1907,18 +1924,18 @@ function SplitPaneSlot({
         ) : null}
         <div className="v3-pane-body">
           {content.kind === "file" ? (
-            <PocketErrorBoundary resetKey={leaf.id} title="文件预览加载出错">
-              <FileViewer key={leaf.id} tab={content} agent={agent} embedded onHeadState={setFileHead} />
+            <PocketErrorBoundary resetKey={paneKey} title="文件预览加载出错">
+              <FileViewer key={paneKey} tab={content} agent={agent} embedded onHeadState={setFileHead} />
             </PocketErrorBoundary>
           ) : content.kind === "diff" ? (
-            <PocketErrorBoundary resetKey={leaf.id} title="差异对比加载出错">
+            <PocketErrorBoundary resetKey={paneKey} title="差异对比加载出错">
               <DiffTabView
-                key={leaf.id}
+                key={paneKey}
                 tab={{ id: leaf.id, ...content }}
               />
             </PocketErrorBoundary>
           ) : content.kind === "web" ? (
-            <PocketErrorBoundary resetKey={leaf.id} title="网页加载出错">
+            <PocketErrorBoundary resetKey={paneKey} title="网页加载出错">
               <WebPane
                 key={content.webId}
                 tab={{ id: content.webId, url: content.url }}
@@ -1928,7 +1945,7 @@ function SplitPaneSlot({
               />
             </PocketErrorBoundary>
           ) : (
-            <PocketErrorBoundary resetKey={`${content.agentKey}:${leaf.id}`} title="会话视图加载出错">
+            <PocketErrorBoundary resetKey={paneKey} title="会话视图加载出错">
               {agent ? (
                 <AgentDetailPanel
                   key={agent.key}
@@ -2033,14 +2050,19 @@ function TabStage({
     () => computeSplitLayout(tabRootNode(tab), tab.split?.zoomedPaneId),
     [tab],
   );
+  const slotKeys = useMemo(
+    () => stableSplitLeafKeys(splitLayout.leaves.map((x) => x.leaf)),
+    [splitLayout.leaves],
+  );
   const focusedId = focusedLeafOfTab(tab).id;
   const isSplit = splitLayout.leaves.length > 1;
   const zoomedId = tab.split?.zoomedPaneId ?? null;
   return (
     <div ref={stageRef} className="v3-split-stage">
-      {splitLayout.leaves.map((item) => (
+      {splitLayout.leaves.map((item, idx) => (
         <SplitPaneSlot
-          key={item.leaf.id}
+          key={slotKeys[idx]!}
+          paneKey={slotKeys[idx]!}
           tabId={tab.id}
           item={item}
           isSplit={isSplit}
@@ -2132,7 +2154,7 @@ export function ShellMain({
         const isTabActive = t.id === active?.id;
         return (
           <div
-            key={t.id}
+            key={t.mountKey ?? t.id}
             style={isTabActive ? { display: "contents" } : { display: "none" }}
             aria-hidden={!isTabActive}
           >
@@ -2881,6 +2903,8 @@ export function PeekOverlay() {
   const agent = useAgent(key);
   const [peekMode, setPeekMode] = useState<AgentPaneMode | undefined>(undefined);
   const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
+  const subHeadRef = useRef<SubagentHeadInfo | null>(null);
+  subHeadRef.current = subHead;
   useEffect(() => {
     setPeekMode(undefined);
     setSubHead(null);
@@ -2888,7 +2912,17 @@ export function PeekOverlay() {
   useEffect(() => {
     if (!key) return;
     overlayStore.set((p) => ({ open: p.open + 1 }));
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && setPeek(null);
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const curSub = subHeadRef.current;
+      if (curSub && curSub.trail.length > 0) {
+        e.preventDefault();
+        if (curSub.trail.length > 1) curSub.onSelectCrumbIndex(curSub.trail.length - 2);
+        else curSub.onGoRoot();
+        return;
+      }
+      setPeek(null);
+    };
     window.addEventListener("keydown", esc);
     return () => {
       window.removeEventListener("keydown", esc);

@@ -235,15 +235,18 @@ test("TerminalSurface subscribes to local-term://size and fonts.ts prefers 1-cel
   assert.ok(idxSymbolsMono >= 0 && idxJbMono > idxSymbolsMono && idxJbProp > idxJbMono, "Mono Nerd fonts must precede proportional JetBrainsMono Nerd Font");
 });
 
-test("pane header right group (.v3-pane-right) stays flush right and .v3-pane-actions collapses without phantom width until hover", () => {
+test("pane header right group (.v3-pane-right) stays flush right and .v3-pane-actions never jumps horizontally on hover", () => {
   const css = readFileSync(new URL("../src/styles/shell.css", import.meta.url), "utf8");
   const rightMatch = css.match(/\.v3-pane-right\s*\{([^}]*)\}/);
   assert.ok(rightMatch, "shell.css must define .v3-pane-right");
   assert.match(rightMatch[1]!, /margin-left\s*:\s*auto/);
   assert.match(rightMatch[1]!, /justify-content\s*:\s*flex-end/);
-  assert.equal(/opacity\s*:\s*0/.test(css.match(/\.v3-pane-actions\s*\{([^}]*)\}/)?.[1] ?? ""), false, ".v3-pane-actions must not leave an invisible gap with opacity: 0");
-  assert.match(css, /@media\s*\(hover:\s*hover\)[\s\S]*?\.v3-pane-actions\s*\{\s*display\s*:\s*none;/);
-  assert.match(css, /\.v3-pane-head:hover\s+\.v3-pane-actions[\s\S]*?display\s*:\s*inline-flex;/);
+  const actionsBody = css.match(/\.v3-pane-actions\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.match(actionsBody, /display\s*:\s*inline-flex/);
+  assert.equal(/opacity\s*:\s*0(?![.\d])/.test(actionsBody), false, ".v3-pane-actions must not hide completely with opacity: 0");
+  assert.match(actionsBody, /opacity\s*:\s*0\.72/);
+  assert.match(css, /\.v3-pane-head:hover\s+\.v3-pane-actions[\s\S]*?opacity\s*:\s*1\s*;/);
+  assert.equal(/@media\s*\(hover:\s*hover\)[\s\S]*?\.v3-pane-actions\s*\{\s*display\s*:\s*none;/.test(css), false);
 });
 
 test("Touched desktop UI & sync modules have zero forward references to block-scoped let/const declarations (TDZ guard)", () => {

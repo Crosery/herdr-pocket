@@ -1,7 +1,9 @@
 import { useState, type ReactNode } from "react";
 import { Check, Copy, FileText } from "lucide-react";
 import { copyToClipboard, openExternalUrl } from "./bridge";
-import { looksLikeClickableFilePath } from "./openFileTarget";
+import { hasFileJumpModifier, looksLikeClickableFilePath } from "./openFileTarget";
+
+export { hasFileJumpModifier };
 
 export interface ChoiceOption {
   key: string;
@@ -72,16 +74,34 @@ function renderInline(text: string, onOpenFile?: (target: string) => void): Reac
       const inner = full.slice(1, -1);
       if (onOpenFile && looksLikeClickableFilePath(inner)) {
         out.push(
-          <button
+          <code
             key={idx++}
-            type="button"
+            role="link"
+            tabIndex={0}
             className="md-code md-file-chip"
-            title={`在标签页打开 ${inner}`}
-            onClick={() => onOpenFile(inner)}
+            title={`按住 Ctrl 点击打开 ${inner}`}
+            onClick={(e) => {
+              if (!hasFileJumpModifier(e)) return;
+              e.preventDefault();
+              e.stopPropagation();
+              onOpenFile(inner);
+            }}
+            onContextMenu={(e) => {
+              if (!e.ctrlKey) return;
+              e.preventDefault();
+              e.stopPropagation();
+              onOpenFile(inner);
+            }}
+            onKeyDown={(e) => {
+              if ((e.key === "Enter" || e.key === " ") && hasFileJumpModifier(e)) {
+                e.preventDefault();
+                onOpenFile(inner);
+              }
+            }}
           >
             <FileText size={11} />
             <span>{inner}</span>
-          </button>,
+          </code>,
         );
       } else {
         out.push(
@@ -110,24 +130,44 @@ function renderInline(text: string, onOpenFile?: (target: string) => void): Reac
         );
       } else if (onOpenFile && looksLikeClickableFilePath(target)) {
         out.push(
-          <button
+          <a
             key={idx++}
-            type="button"
+            href={target}
             className="md-file-link"
-            title={`在标签页打开 ${target}`}
-            onClick={() => onOpenFile(target)}
+            title={`按住 Ctrl 点击打开 ${target}`}
+            onClick={(e) => {
+              e.preventDefault();
+              if (!hasFileJumpModifier(e)) return;
+              e.stopPropagation();
+              onOpenFile(target);
+            }}
+            onContextMenu={(e) => {
+              if (!e.ctrlKey) return;
+              e.preventDefault();
+              e.stopPropagation();
+              onOpenFile(target);
+            }}
           >
             {label}
-          </button>,
+          </a>,
         );
       } else {
         out.push(
           <a
             key={idx++}
             href={target}
+            title={onOpenFile ? `按住 Ctrl 点击打开 ${target}` : undefined}
             onClick={(e) => {
               e.preventDefault();
+              if (!hasFileJumpModifier(e)) return;
+              e.stopPropagation();
               if (onOpenFile) onOpenFile(target);
+            }}
+            onContextMenu={(e) => {
+              if (!e.ctrlKey || !onOpenFile) return;
+              e.preventDefault();
+              e.stopPropagation();
+              onOpenFile(target);
             }}
           >
             {label}

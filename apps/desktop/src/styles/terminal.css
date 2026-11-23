@@ -85,6 +85,9 @@
   height: 100%;
   width: 100%;
   background-color: var(--tp-term-bg, #17191d);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  -webkit-font-smoothing: antialiased;
 }
 
 .tp-term-host .xterm .xterm-viewport,

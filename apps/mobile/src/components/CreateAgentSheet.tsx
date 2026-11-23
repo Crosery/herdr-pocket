@@ -140,11 +140,16 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
     setFolderTouched(false);
     // Asked for a space this computer does not list: offer a new one under the same name, not a blank form.
     if (target.spaceName && !sp) setSpaceName(target.spaceName);
-    setLauncher((l) => (l && d.launchers.some((x) => x.id === l) ? l : d.launchers[0]?.id ?? null));
+    const preferred = d.launchers.find((x) => x.id === "shell")?.id ?? d.launchers[0]?.id ?? null;
+    setLauncher((l) => (l && d.launchers.some((x) => x.id === l) ? l : preferred));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q.data, visible, host, target.spaceName]);
 
   const d = q.data;
+  const orderedLaunchers = useMemo(
+    () => [...(d?.launchers ?? [])].sort((a, b) => Number(b.id === "shell") - Number(a.id === "shell")),
+    [d?.launchers],
+  );
   // A computer without the desktop herdr (Windows): no spaces, just a terminal in a folder.
   const standalone = !!d?.standalone;
   const isNew = spaceId === NEW && !standalone;
@@ -194,7 +199,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
           duration: 4200,
         });
       }
-      router.push({ pathname: "/agent/[key]", params: { key: res.agent, tab: "chat", fresh: String(Date.now()) } });
+      router.push({ pathname: "/agent/[key]", params: { key: res.agent, tab: launcher === "shell" ? "terminal" : "chat", fresh: String(Date.now()) } });
     } catch (e) {
       const err = e as RelayError;
       // It may well be open already: say so, so nobody taps again and gets two.
@@ -216,7 +221,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
         {busy && takesTask && task.trim() && !launch?.takesTask ? "等它启动好再把第一句话打进去，可能要半分钟到一分钟" : standalone ? "建好后，在电脑上用 hc attach 可以接手它" : "建好后，电脑上的 herdr 会自动切到这个空间"}
       </Text>
       <PocketButton size="lg" block icon="plus" disabled={!canSubmit} loading={busy} onPress={submit}>
-        {isNew ? "新建空间并启动" : "新建 agent"}
+        {isNew ? (launcher === "shell" ? "新建空间并打开终端" : "新建空间并启动") : (launcher === "shell" ? "打开终端" : "新建 agent")}
       </PocketButton>
     </>
   );
@@ -341,7 +346,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
 
           <Field title="程序">
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
-              {d.launchers.map((l) => (
+              {orderedLaunchers.map((l) => (
                 <Chip
                   key={l.id}
                   on={launcher === l.id}

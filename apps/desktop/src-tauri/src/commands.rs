@@ -1188,17 +1188,28 @@ pub(crate) fn issue_local_preview_url(cwd: Option<&str>, path: &str) -> Result<S
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "文件名无效".to_string())?;
-    let token = next_cap_token();
-    {
+    let token = {
         let mut guard = cap_registry().lock().map_err(|_| "注册表锁定失败".to_string())?;
-        if guard.order.len() >= 512 {
-            if let Some(old) = guard.order.pop_front() {
-                guard.entries.remove(&old);
+        if let Some((existing, _)) = guard
+            .entries
+            .iter()
+            .find(|(_, (r, c))| r == &root_dir && c == &resolved.canon)
+        {
+            existing.clone()
+        } else {
+            let tok = next_cap_token();
+            if guard.order.len() >= 512 {
+                if let Some(old) = guard.order.pop_front() {
+                    guard.entries.remove(&old);
+                }
             }
+            guard.order.push_back(tok.clone());
+            guard
+                .entries
+                .insert(tok.clone(), (root_dir, resolved.canon));
+            tok
         }
-        guard.order.push_back(token.clone());
-        guard.entries.insert(token.clone(), (root_dir, resolved.canon));
-    }
+    };
     let origin = if cfg!(target_os = "windows") {
         "http://pocket-local.localhost"
     } else {
@@ -1993,8 +2004,8 @@ pub async fn voice_call_dsp_close() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_sums_url, process_pcm_bytes_with_processor, read_local_file_sync,
-        resolve_safe_local_file, resolve_safe_local_reveal_target,
+        is_sums_url, issue_local_preview_url, process_pcm_bytes_with_processor,
+        read_local_file_sync, resolve_safe_local_file, resolve_safe_local_reveal_target,
         resolve_safe_local_reveal_target_with_cfg_dir,
     };
 
@@ -2200,5 +2211,26 @@ mod tests {
         let decoded = crate::local_term::base64_decode(chunk.pcm_base64.as_bytes()).unwrap();
         assert_eq!(decoded.len(), samples.len() * 2);
         assert!(chunk.level > 0.0 && chunk.level <= 1.0);
+    }
+
+    #[test]
+    fn issue_local_preview_url_reuses_token_for_same_html_file() {
+        let dir = std::env::temp_dir().join(format!("hp-cap-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let html_file = dir.join("preview.html");
+        std::fs::write(&html_file, "<h1>hi</h1>").unwrap();
+        let u1 = issue_local_preview_url(
+            Some(dir.to_str().unwrap()),
+            "preview.html",
+        )
+        .unwrap();
+        let u2 = issue_local_preview_url(
+            None,
+            html_file.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(u1, u2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

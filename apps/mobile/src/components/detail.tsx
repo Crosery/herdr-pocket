@@ -19,6 +19,7 @@ import {
   normalizeSwitchHarness,
   parseModelSwitchText,
   resolveThinkingLevelsForModel,
+  sameMessage,
   stripModelEffortSuffix,
   synthesizeFallbackAgentModels,
   type Agent,
@@ -891,7 +892,15 @@ export function Composer({
   const pendingSwitch = useMobileQueue((s) => s.pendingSwitchByAgent[agent.key]);
   const isSteering = useMobileQueue((s) => Boolean(s.steering[agent.key]));
   const hostHeldCount = Math.max(0, (agent.queued ?? 0) - mineWaiting);
-  const totalQueued = queued.length + hostHeldCount;
+  const rawTerminalQueued = agent.queuedItems?.length
+    ? agent.queuedItems
+    : hostHeldCount > 0 && agent.queuedText
+      ? [agent.queuedText]
+      : [];
+  const terminalQueuedItems = rawTerminalQueued.filter(
+    (item) => item.trim() && !queued.some((q) => sameMessage(item, q.text)),
+  );
+  const totalQueued = queued.length + Math.max(hostHeldCount, terminalQueuedItems.length);
   const textScale = useSettings((x) => x.textScale);
   const [tuning, setTuning] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
@@ -1914,7 +1923,48 @@ export function Composer({
                 </Pressable>
               </View>
             ))}
-            {hostHeldCount > 0 ? (
+            {terminalQueuedItems.length > 0 ? (
+              terminalQueuedItems.map((qText, idx) => (
+                <View
+                  key={`m-term-q-${idx}-${qText.slice(0, 20)}`}
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 6,
+                    paddingHorizontal: 8,
+                    paddingVertical: 5,
+                    borderRadius: radius.sm,
+                    backgroundColor: p.surface2,
+                  }}
+                >
+                  <View style={{ paddingHorizontal: 6, height: 20, borderRadius: 10, backgroundColor: p.accentContainer, alignItems: "center", justifyContent: "center" }}>
+                    <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 10.5 }}>终端</Text>
+                  </View>
+                  <Text numberOfLines={2} style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: p.ink }}>
+                    {qText}
+                  </Text>
+                  {agent.source === "hc" && online && idx === 0 ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel="立即注入到当前轮"
+                      onPress={() => void press("alt+m")}
+                      style={({ pressed }) => ({
+                        height: 26,
+                        paddingHorizontal: 9,
+                        borderRadius: radius.pill,
+                        backgroundColor: pressed ? p.surface3 : p.accentContainer,
+                        borderWidth: 1,
+                        borderColor: p.primary,
+                        alignItems: "center",
+                        justifyContent: "center",
+                      })}
+                    >
+                      <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>立即注入</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              ))
+            ) : hostHeldCount > 0 ? (
               <View
                 style={{
                   flexDirection: "row",

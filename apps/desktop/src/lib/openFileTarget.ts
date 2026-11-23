@@ -162,10 +162,23 @@ export function openAgentFileTarget(agent: Pick<Agent, "key" | "cwd"> | undefine
   if (!agent) return false;
   const parsed = parseFileTarget(raw, agent.cwd);
   if (!parsed) return false;
+  if (typeof document !== "undefined" && !document.querySelector(".v3") && typeof window !== "undefined") {
+    window.dispatchEvent(
+      new CustomEvent("pocket:open-mobile-file", {
+        detail: { agentKey: agent.key, path: parsed.path, title: parsed.title },
+      }),
+    );
+    return true;
+  }
   openFileTab(agent.key, parsed.path, parsed.title, {
     absPath: parsed.absPath,
     line: parsed.line,
     endLine: parsed.endLine,
   });
   return true;
+}
+
+/** Requires Ctrl (or Cmd on macOS) before clicking inline file links to jump. */
+export function hasFileJumpModifier(ev: { ctrlKey?: boolean; metaKey?: boolean }): boolean {
+  return Boolean(ev.ctrlKey || ev.metaKey);
 }

@@ -116,6 +116,7 @@ export class HcScreens {
         this.drain();
       });
       const lost = () => {
+        if (this.child !== child) return;
         this.child = null;
         this.ready = null;
         this.supportsAutoInput = false;
@@ -127,9 +128,18 @@ export class HcScreens {
         this.early.clear();
         if (!framed) reject(new Error("hc connect exited"));
       };
+      child.stdin?.on("error", () => lost());
       child.on("exit", lost);
       child.on("error", lost);
-      child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "hello", params: { framed: true } })}\n`);
+      if (child.stdin && !child.stdin.destroyed && child.stdin.writable) {
+        try {
+          child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "hello", params: { framed: true } })}\n`, (err) => {
+            if (err) lost();
+          });
+        } catch {
+          lost();
+        }
+      }
     });
     return this.ready;
   }
@@ -163,7 +173,30 @@ export class HcScreens {
   }
 
   private send(channel: number, kind: number, payload: Buffer): void {
-    this.child?.stdin?.write(encode(channel, kind, payload));
+    const child = this.child;
+    const stdin = child?.stdin;
+    if (!child || !stdin || stdin.destroyed || !stdin.writable) return;
+    try {
+      stdin.write(encode(channel, kind, payload), (err) => {
+        if (err && this.child === child) {
+          this.child = null;
+          this.ready = null;
+          this.supportsAutoInput = false;
+          this.buf = Buffer.alloc(0);
+          for (const r of this.replies.values()) r({ error: { message: "lost hc" } });
+          this.replies.clear();
+          for (const s of this.streams.values()) s(CLOSE, Buffer.alloc(0));
+          this.streams.clear();
+          this.early.clear();
+        }
+      });
+    } catch {
+      if (this.child === child) {
+        this.child = null;
+        this.ready = null;
+        this.supportsAutoInput = false;
+      }
+    }
   }
 
   private async call(method: string, params: unknown, timeoutMs = 8000): Promise<any> {

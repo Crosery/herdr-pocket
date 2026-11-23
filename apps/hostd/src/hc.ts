@@ -203,6 +203,7 @@ export class HcAdapter extends EventEmitter {
     const child = spawn(this.hcBin, ["connect"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     this.child = child;
     this.lastLine = Date.now();
+    child.stdin?.on("error", () => {});
     child.stdout!.on(
       "data",
       lineSplitter((line) => this.onLine(line)),
@@ -229,7 +230,9 @@ export class HcAdapter extends EventEmitter {
 
   private request(method: string, params: unknown, timeoutMs = 15_000): Promise<any> {
     const child = this.child;
-    if (!child?.stdin?.writable) return Promise.resolve({ error: { message: "not connected" } });
+    if (!child?.stdin || child.stdin.destroyed || !child.stdin.writable) {
+      return Promise.resolve({ error: { message: "not connected" } });
+    }
     const id = this.nextId++;
     return new Promise((resolve) => {
       const t = setTimeout(() => {
@@ -240,7 +243,19 @@ export class HcAdapter extends EventEmitter {
         clearTimeout(t);
         resolve(msg);
       });
-      child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      try {
+        child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`, (err) => {
+          if (err && this.waiting.has(id)) {
+            clearTimeout(t);
+            this.waiting.delete(id);
+            resolve({ error: { message: err.message } });
+          }
+        });
+      } catch (err) {
+        clearTimeout(t);
+        this.waiting.delete(id);
+        resolve({ error: { message: (err as Error).message } });
+      }
     });
   }
 
@@ -377,9 +392,20 @@ export class HcAdapter extends EventEmitter {
           }
         }),
       );
+      child.stdin?.on("error", (e) => finish({ error: { message: e.message } }));
       child.on("error", (e) => finish({ error: { message: e.message } }));
       child.on("exit", () => finish({ error: { message: "hc connect exited" } }));
-      child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);
+      if (child.stdin && !child.stdin.destroyed && child.stdin.writable) {
+        try {
+          child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`, (e) => {
+            if (e) finish({ error: { message: e.message } });
+          });
+        } catch (e) {
+          finish({ error: { message: (e as Error).message } });
+        }
+      } else {
+        finish({ error: { message: "hc stdin not writable" } });
+      }
     });
   }
 

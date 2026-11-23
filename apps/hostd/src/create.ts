@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -12,6 +13,7 @@ import { base, run } from "./util.ts";
  * so a viewer token cannot run arbitrary programs on this computer.
  */
 export const LAUNCHERS: Array<LaunchOption & { argv: string[] }> = [
+  { id: "shell", label: "终端", argv: [], takesTask: false },
   { id: "claude", label: "Claude Code", argv: ["claude"], takesTask: true },
   { id: "codex", label: "Codex", argv: ["codex"], takesTask: true },
   { id: "omp", label: "omp", argv: ["omp"], takesTask: true },
@@ -34,7 +36,6 @@ export const LAUNCHERS: Array<LaunchOption & { argv: string[] }> = [
   { id: "aider", label: "Aider", argv: ["aider"], takesTask: false },
   { id: "iflow", label: "iFlow", argv: ["iflow"], takesTask: false },
   { id: "cline", label: "Cline", argv: ["cline"], takesTask: false },
-  { id: "shell", label: "终端", argv: [], takesTask: false },
 ];
 
 /** Where each program was last found: launching by full path works whatever PATH the desktop app has. */
@@ -237,6 +238,29 @@ export class NoDesktopApp extends Error {
   }
 }
 
+export function isHerdrWindowClosedError(e: unknown): boolean {
+  if (e instanceof NoDesktopApp) return false;
+  const msg = (e as Error | undefined)?.message ?? "";
+  return /没有打开|no herdr window|no window|not running/i.test(msg);
+}
+
+export function docSpaceDisplayName(
+  space: { id?: string; name?: unknown; folder?: unknown },
+  fallbackFolder?: string,
+): string {
+  const direct = typeof space.name === "string" ? space.name.trim() : "";
+  if (direct) return direct;
+  const rawFolder =
+    (typeof space.folder === "string" && space.folder.trim() ? space.folder.trim() : "") ||
+    (fallbackFolder?.trim() || "");
+  if (rawFolder) {
+    const expanded = rawFolder === "~" ? homedir() : rawFolder;
+    const b = base(expanded).trim();
+    if (b) return b;
+  }
+  return typeof space.id === "string" ? space.id : "";
+}
+
 const notInstalled = (e: unknown) => (e as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
 
 function defaultSharedJsonPath(): string {
@@ -431,12 +455,13 @@ export class HerdrApp {
           return { terminals: termIds.map((id) => ({ terminal: id })) };
         });
         const folder = resolveSpaceFolder({ id: s.id, name: s.name, folder: s.folder, tabs: synthTabs }, terminals);
+        const name = docSpaceDisplayName(s, folder);
         const termCount = synthTabs.reduce((n: number, t: { terminals: unknown[] }) => n + t.terminals.length, 0);
-        const color = colors[s.id] ?? colors[s.name] ?? (typeof s.color === "string" ? s.color : undefined);
+        const color = colors[s.id] ?? colors[name] ?? colors[s.name] ?? (typeof s.color === "string" ? s.color : undefined);
         const active = activeSpaceId === s.id || Boolean(s.active);
         out.push({
           id: s.id,
-          name: s.name,
+          name,
           ...(folder ? { folder } : {}),
           tabs: rawTabs.length,
           terminals: termCount,
@@ -516,7 +541,8 @@ export class HerdrApp {
       const terminals = new Map<string, AppTerminalMeta>();
       for (const s of list) {
         if (!s || typeof s.id !== "string" || typeof s.name !== "string" || s.machine) continue;
-        spaces.set(s.id, s.name);
+        const spaceName = docSpaceDisplayName(s);
+        spaces.set(s.id, spaceName);
         const rawTabs = Array.isArray(s.tabs) ? s.tabs : [];
         for (const t of rawTabs) {
           if (typeof t?.id === "string" && typeof t?.name === "string") tabs.set(t.id, t.name);
@@ -529,7 +555,7 @@ export class HerdrApp {
               if (!addr) continue;
               terminals.set(addr, {
                 spaceId: s.id,
-                spaceName: s.name,
+                spaceName,
                 ...(tabId ? { tabId } : {}),
                 ...(tabName ? { tabName } : {}),
                 ...(x?.app !== undefined ? { app: x.app } : {}),
@@ -541,7 +567,7 @@ export class HerdrApp {
             for (const addr of collectTerminalIdsFromRoot(t?.root)) {
               terminals.set(addr, {
                 spaceId: s.id,
-                spaceName: s.name,
+                spaceName,
                 ...(tabId ? { tabId } : {}),
                 ...(tabName ? { tabName } : {}),
               });
@@ -623,6 +649,160 @@ export class HerdrApp {
   /** Runs one checked command (see `herdrCommandArgs`) and returns what the app answered. */
   async command(command: HerdrCommand, args: Record<string, unknown>): Promise<unknown> {
     return parseDo(await doCommand(this.bin, command, args));
+  }
+
+  /**
+   * Inserts a newly spawned terminal directly into the `"herdr-app"` doc when `Herdr.app`
+   * is installed but its window is closed, matching `deleteSpace` and `closeAgentTerminal`.
+   */
+  async createInDocWhenWindowClosed(
+    opts: {
+      space?: string;
+      spaceName?: string;
+      tabName?: string;
+      folder?: string;
+      terminal: string;
+      initialDoc?: { value: unknown; version: number } | null;
+    },
+    hc: {
+      docGet?: (name: string) => Promise<{ value: unknown; version: number } | null>;
+      docSet?: (name: string, value: unknown, version: number) => Promise<number | null>;
+      label?: (address: string, labels: Record<string, string>) => Promise<void>;
+    },
+  ): Promise<{ space: string; tab: string; spaceName: string }> {
+    const doc = opts.initialDoc ?? (await hc.docGet?.("herdr-app").catch(() => null)) ?? null;
+    const val =
+      doc?.value && typeof doc.value === "object" && !Array.isArray(doc.value)
+        ? (doc.value as Record<string, unknown>)
+        : null;
+    const spaces = Array.isArray(val?.spaces) ? ([...val!.spaces] as Array<Record<string, unknown>>) : null;
+    if (!val || !spaces || !hc.docSet) {
+      throw new Error("桌面 herdr 没有打开，先在电脑上打开它");
+    }
+
+    const usedIds = new Set<string>();
+    for (const sp of spaces) {
+      if (sp && typeof sp.id === "string") usedIds.add(sp.id);
+      if (Array.isArray(sp?.tabs)) {
+        for (const tb of sp.tabs) {
+          if (tb && typeof (tb as any).id === "string") usedIds.add((tb as any).id);
+        }
+      }
+    }
+    const freshHexId = (prefix: string, bytes: number): string => {
+      let candidate = `${prefix}${randomBytes(bytes).toString("hex")}`;
+      while (usedIds.has(candidate)) {
+        candidate = `${prefix}${randomBytes(bytes).toString("hex")}`;
+      }
+      usedIds.add(candidate);
+      return candidate;
+    };
+
+    const reqId = opts.space?.trim() || "";
+    const reqName = opts.spaceName?.trim() || "";
+    let idx = spaces.findIndex((s) => {
+      if (!s || s.machine) return false;
+      if (reqId) return s.id === reqId;
+      if (reqName) return docSpaceDisplayName(s) === reqName;
+      return false;
+    });
+
+    if (idx < 0) {
+      const spId = reqId || freshHexId("sp", 16);
+      const spName = reqName || base(opts.folder ?? "") || "";
+      spaces.push({
+        id: spId,
+        name: spName,
+        folder: opts.folder ?? "",
+        tabs: [],
+      });
+      idx = spaces.length - 1;
+    }
+
+    const target = { ...spaces[idx]! };
+    const spaceId = typeof target.id === "string" && target.id ? target.id : freshHexId("sp", 16);
+    target.id = spaceId;
+    const tabId = freshHexId("tb", 4);
+    const paneId = freshHexId("p", 3);
+    const tabName = opts.tabName?.trim() || "";
+    const newTab: Record<string, unknown> = {
+      id: tabId,
+      name: tabName,
+      root: {
+        id: paneId,
+        type: "block",
+        content: { terminal: opts.terminal },
+      },
+    };
+    const prevTabs = Array.isArray(target.tabs) ? (target.tabs as Array<Record<string, unknown>>) : [];
+    target.tabs = [...prevTabs, newTab];
+    target.activeTabId = tabId;
+    spaces[idx] = target;
+
+    const nextVal: Record<string, unknown> = {
+      ...val,
+      spaces,
+      activeSpaceId: spaceId,
+    };
+    await hc.docSet("herdr-app", nextVal, doc!.version);
+
+    const resolvedSpaceName = docSpaceDisplayName(target, opts.folder);
+    const where = resolvedSpaceName ? (tabName ? `${resolvedSpaceName} / ${tabName}` : resolvedSpaceName) : "";
+    await hc
+      .label?.(opts.terminal, {
+        "herdr.space": spaceId,
+        "herdr.tab": tabId,
+        ...(where ? { where } : {}),
+      })
+      .catch(() => {});
+
+    return { space: spaceId, tab: tabId, spaceName: resolvedSpaceName };
+  }
+
+  /**
+   * Renames a space directly inside the `"herdr-app"` doc when `Herdr.app` window is closed,
+   * matching `herdr-app do space.rename` (an empty string restores folder-based naming).
+   */
+  async renameSpaceWhenWindowClosed(
+    opts: { id: string; name: string },
+    hc: {
+      terminals: ReadonlyMap<string, HcTerminal>;
+      docGet?: (name: string) => Promise<{ value: unknown; version: number } | null>;
+      docSet?: (name: string, value: unknown, version: number) => Promise<number | null>;
+      label?: (address: string, labels: Record<string, string>) => Promise<void>;
+    },
+  ): Promise<{ id: string; name: string }> {
+    const spaceId = opts.id?.trim();
+    if (!spaceId) throw new Error("id 要填 id");
+    const doc = (await hc.docGet?.("herdr-app").catch(() => null)) ?? null;
+    const val =
+      doc?.value && typeof doc.value === "object" && !Array.isArray(doc.value)
+        ? (doc.value as Record<string, unknown>)
+        : null;
+    const spaces = Array.isArray(val?.spaces) ? ([...val!.spaces] as Array<Record<string, unknown>>) : null;
+    if (!val || !spaces || !hc.docSet) {
+      throw new Error("桌面 herdr 没有打开，先在电脑上打开它");
+    }
+    const idx = spaces.findIndex((s) => s && !s.machine && s.id === spaceId);
+    if (idx < 0) throw new Error("找不到这个空间");
+
+    const updatedSpace = { ...spaces[idx]!, name: opts.name.trim() };
+    spaces[idx] = updatedSpace;
+    await hc.docSet("herdr-app", { ...val, spaces }, doc!.version);
+
+    const resolvedName = docSpaceDisplayName(updatedSpace);
+    const labelUpdates: Array<Promise<void>> = [];
+    for (const [addr, term] of hc.terminals.entries()) {
+      if (term.labels?.["herdr.space"] !== spaceId) continue;
+      const oldWhere = term.labels?.where ?? "";
+      const slash = oldWhere.indexOf(" / ");
+      const nextWhere = slash >= 0 ? `${resolvedName}${oldWhere.slice(slash)}` : resolvedName;
+      if (hc.label) {
+        labelUpdates.push(hc.label(addr, { where: nextWhere }).catch(() => {}));
+      }
+    }
+    if (labelUpdates.length > 0) await Promise.all(labelUpdates);
+    return { id: spaceId, name: resolvedName };
   }
 
   /**

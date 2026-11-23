@@ -1,10 +1,15 @@
 import { strict as assert } from "node:assert";
-import { homedir } from "node:os";
-import { test } from "node:test";
-import { NoDesktopApp } from "../src/create.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+import { HerdrApp, NoDesktopApp } from "../src/create.ts";
 import { Host } from "../src/host.ts";
 
 type Handlers = Record<string, (p: unknown, from: string) => Promise<any>>;
+
+const tmpDir = mkdtempSync(join(tmpdir(), "herdr-pocket-nodesktop-"));
+after(() => rmSync(tmpDir, { recursive: true, force: true }));
 
 /** A host on a computer with herdr-core but no desktop app (Windows, a server). */
 function headless() {
@@ -20,12 +25,17 @@ function headless() {
     ]),
   };
   h.firstTaskOptions = { minMs: 0, stableMs: 20, pollMs: 5, timeoutMs: 3000 };
+  h.app = new HerdrApp("herdr-app", {
+    docsJsonPath: join(tmpDir, "missing-docs.json"),
+    sharedJsonPath: join(tmpDir, "missing-shared.json"),
+  });
   h.app.ls = async () => {
     throw new NoDesktopApp();
   };
   h.app.create = async () => {
     throw new NoDesktopApp();
   };
+  h.hc.docGet = async () => null;
   const started: Array<{ argv: string[]; cwd: string }> = [];
   const typed: string[] = [];
   h.hc.spawnTerminal = async (argv, cwd) => {
@@ -72,7 +82,7 @@ test("agent.create without a folder opens in the home folder; the shell gets no 
   h.stop();
 });
 
-test("a closed desktop window is still reported, not worked around", async () => {
+test("a closed desktop window without a herdr-app doc is still reported, not worked around", async () => {
   const { h, call, started } = headless();
   h.app.ls = async () => {
     throw new Error("herdr-app ls failed: no herdr window");
@@ -85,5 +95,57 @@ test("a closed desktop window is still reported, not worked around", async () =>
   assert.equal(r.standalone, undefined);
   await assert.rejects(call("agent.create", { launcher: "kimi" }), (e: any) => e.code === "unsupported" && /没有打开/.test(e.message));
   assert.equal(started.length, 0);
+  h.stop();
+});
+
+test("a closed desktop window with an active herdr-app doc allows creating a shell in an unnamed empty Space", async () => {
+  const { h, call, started } = headless();
+  const saved: Array<{ name: string; version: number; value: any }> = [];
+  const labeled: Array<{ addr: string; labels: Record<string, string> }> = [];
+  const docValue = {
+    activeSpaceId: "sp-other",
+    spaces: [
+      { id: "sp-other", name: "Other", folder: homedir(), tabs: [{ id: "tb0", name: "1", root: { id: "p0", type: "block", content: { terminal: "t0" } } }] },
+      { id: "sp-empty", name: "", folder: join(homedir(), "work_file", "geek_main"), tabs: [] },
+    ],
+  };
+  h.app.spacesFromDocs = () => [
+    { id: "sp-other", name: "Other", folder: homedir(), tabs: 1, terminals: 1, active: true },
+    { id: "sp-empty", name: "geek_main", folder: join(homedir(), "work_file", "geek_main"), tabs: 0, terminals: 0 },
+  ];
+  h.app.ls = async () => {
+    throw new Error("herdr-app ls failed: no herdr window");
+  };
+  h.app.create = async () => {
+    throw new Error("桌面 herdr 没有打开，先在电脑上打开它");
+  };
+  h.hc.docGet = async () => ({ version: 4, value: JSON.parse(JSON.stringify(docValue)) });
+  h.hc.docSet = async (name, value, version) => {
+    saved.push({ name, value, version });
+    return version + 1;
+  };
+  h.hc.label = async (addr, labels) => {
+    labeled.push({ addr, labels });
+  };
+
+  const list = await call("spaces.list", {});
+  assert.equal(list.canCreate, true);
+  assert.equal(list.reason, undefined);
+  assert.equal(list.spaces[1].name, "geek_main");
+
+  const created = await call("agent.create", { space: "sp-empty", launcher: "shell", folder: homedir() });
+  assert.equal(started.length, 1);
+  assert.equal(created.agent, "d/hc:t9");
+  assert.equal(created.space, "sp-empty");
+  assert.ok(created.tab);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0]!.version, 4);
+  const emptySpace = saved[0]!.value.spaces[1];
+  assert.equal(emptySpace.tabs.length, 1);
+  assert.equal(emptySpace.tabs[0].id, created.tab);
+  assert.equal(emptySpace.tabs[0].root.content.terminal, "t9");
+  assert.deepEqual(labeled, [
+    { addr: "t9", labels: { "herdr.space": "sp-empty", "herdr.tab": created.tab, where: "geek_main" } },
+  ]);
   h.stop();
 });

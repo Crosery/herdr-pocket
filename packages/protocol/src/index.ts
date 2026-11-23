@@ -100,6 +100,8 @@ export interface Agent {
    * ends). Absent or 0 when nothing is waiting.
    */
   queued?: number;
+  /** Individual message texts waiting in the terminal program's input queue (FIFO). */
+  queuedItems?: string[];
   /** The oldest waiting message, clipped. */
   queuedText?: string;
   /** When the oldest waiting message was typed in (epoch ms). */
@@ -457,6 +459,114 @@ export function sameMessage(said: string, sent: string, hasFiles?: boolean): boo
   return true;
 }
 
+const ANSI_ESCAPE_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]/g;
+const ALT_M_QUEUE_HINT_RE = /\s*\((?:alt\+m\b[^)]*|option\+m\b[^)]*)\)\s*$/i;
+const QUEUE_TRAILER_HINT_RE = /\s*\((?:esc to (?:cancel|clear)|tab to edit)\)\s*$/i;
+const CLAUDE_QUEUE_HINT_RE = /^\s*Press\s+(?:up|↑)\s+to\s+(?:edit|select)\s+(?:a\s+)?queued\s+messages?\b/i;
+const QUEUE_SECTION_HEAD_RE = /^\s*(?:[▸▶•‣›>]\s*)?(?:Queued(?:\s+messages?)?|Steer\s+queue|Follow-?up\s+queue|排队中的消息)\s*[:：]?\s*$/i;
+const INLINE_QUEUE_TAG_RE = /^\s*(?:[▸▶•‣›>]\s*)?(?:Queued(?:\s+message)?|Steer(?:\s*\(next\))?|Follow-?up(?:\s+message)?)\s*[:：]\s*(.+)$/i;
+const TUI_DIVIDER_OR_CHROME_RE = /^[─━═┄┈\-_=│┃┌┐└┘├┤┬┴┼╭╮╰╯▸▶•‣›❯$%#\s]+$/;
+const TUI_FOOTER_RE = /(?:for shortcuts|esc to interrupt|ctrl\+c to|context left|\b\d+%\s+context\b)/i;
+
+function normalizeQueuePreview(raw: string): string {
+  const clean = raw.replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  return clean.length > 1000 ? `${clean.slice(0, 1000)}…` : clean;
+}
+
+/**
+ * Extracts message texts currently waiting inside a coding-agent TUI queue
+ * (Antigravity `▸ ... (alt+m to send immediately)`, Claude Code `Press up to edit queued messages`,
+ * and Codex/OMP/Pi/OpenCode `Queued:` / `Steer:` / `Follow-up:` preview rows).
+ */
+export function extractTerminalQueuedMessages(screen: string, _harness?: string): string[] {
+  if (!screen) return [];
+  const plain = screen.replace(/\r\n?/g, "\n").replace(ANSI_ESCAPE_RE, "");
+  const allLines = plain.split("\n");
+  while (allLines.length > 0 && !allLines[allLines.length - 1]!.trim()) allLines.pop();
+  if (!allLines.length) return [];
+
+  const tail = allLines.slice(-45);
+  const tailStartIdx = Math.max(0, tail.length - 30);
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const clean = normalizeQueuePreview(raw.replace(ALT_M_QUEUE_HINT_RE, "").replace(QUEUE_TRAILER_HINT_RE, ""));
+    if (!clean || TUI_DIVIDER_OR_CHROME_RE.test(clean) || TUI_FOOTER_RE.test(clean)) return;
+    if (seen.has(clean)) return;
+    seen.add(clean);
+    found.push(clean);
+  };
+
+  // 1. Antigravity (`agy`) & Alt+M queued bullets (`▸ <msg> (alt+m to send immediately)`), allowing 1-2 line wraps.
+  for (let i = 0; i < tail.length; i += 1) {
+    const line = tail[i]!.trim();
+    if (!line) continue;
+    if (ALT_M_QUEUE_HINT_RE.test(line)) {
+      const stripped = line.replace(ALT_M_QUEUE_HINT_RE, "").replace(/^\s*[▸▶•‣]\s+/, "").trim();
+      if (stripped) push(stripped);
+      continue;
+    }
+    if (/^[▸▶]\s+\S/.test(line)) {
+      let combined = line.replace(/^[▸▶]\s+/, "").trim();
+      for (let look = 1; look <= 2 && i + look < tail.length; look += 1) {
+        const nextLine = tail[i + look]!.trim();
+        if (!nextLine || TUI_DIVIDER_OR_CHROME_RE.test(nextLine) || /^[▸▶]\s+/.test(nextLine)) break;
+        combined = `${combined} ${nextLine}`;
+        if (ALT_M_QUEUE_HINT_RE.test(nextLine)) {
+          push(combined);
+          i += look;
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. Claude Code queued message block above `Press up to edit/select queued message(s)`.
+  for (let i = 0; i < tail.length; i += 1) {
+    if (!CLAUDE_QUEUE_HINT_RE.test(tail[i]!)) continue;
+    const collected: string[] = [];
+    let blankRun = 0;
+    for (let k = i - 1; k >= Math.max(0, i - 12); k -= 1) {
+      const t = tail[k]!.trim();
+      if (!t) {
+        blankRun += 1;
+        if (collected.length > 0 && blankRun > 0) break;
+        continue;
+      }
+      blankRun = 0;
+      if (TUI_DIVIDER_OR_CHROME_RE.test(t) || TUI_FOOTER_RE.test(t) || CLAUDE_QUEUE_HINT_RE.test(t)) break;
+      if (QUEUE_SECTION_HEAD_RE.test(t)) break;
+      if (/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✻✽✢●]\s+/.test(t)) break;
+      const itemText = t.replace(/^(?:[▸▶•‣›>❯]\s+|\d+[.)]\s+)/, "").trim();
+      if (itemText) collected.unshift(itemText);
+    }
+    for (const item of collected) push(item);
+  }
+
+  // 3. Explicit queue headers (`Queued messages:` / `Steer queue:`) and single-line `Queued:` / `Steer:` / `Follow-up:` tags.
+  for (let i = tailStartIdx; i < tail.length; i += 1) {
+    const line = tail[i]!.trim();
+    if (!line) continue;
+    if (QUEUE_SECTION_HEAD_RE.test(line)) {
+      for (let k = i + 1; k < Math.min(tail.length, i + 10); k += 1) {
+        const sub = tail[k]!.trim();
+        if (!sub || TUI_DIVIDER_OR_CHROME_RE.test(sub) || TUI_FOOTER_RE.test(sub) || CLAUDE_QUEUE_HINT_RE.test(sub)) break;
+        if (/^[❯›>]\s*$/.test(sub)) break;
+        const itemText = sub.replace(/^(?:[▸▶•‣›>]\s+|\d+[.)]\s+)/, "").trim();
+        if (itemText) push(itemText);
+      }
+      continue;
+    }
+    const inlineMatch = INLINE_QUEUE_TAG_RE.exec(line);
+    if (inlineMatch?.[1]) {
+      push(inlineMatch[1]);
+    }
+  }
+
+  return found.slice(0, 20);
+}
+
 // ---------------------------------------------------------------------------
 // RPC methods a host serves (callable by viewers and by other hosts)
 // ---------------------------------------------------------------------------
@@ -527,7 +637,7 @@ export interface RpcMethods {
   /** What can be created on this computer: spaces, programs, suggested folders. */
   "spaces.list": {
     params: Record<string, never>;
-    /** `canCreate` false with `reason` when the desktop herdr window is closed or the host is read-only. */
+    /** `canCreate` false with `reason` when the desktop herdr window is closed without an active doc or the host is read-only. */
     result: {
       spaces: SpaceInfo[];
       launchers: LaunchOption[];
@@ -549,7 +659,7 @@ export interface RpcMethods {
    */
   "agent.create": {
     params: { space?: string; spaceName?: string; tabName?: string; folder?: string; launcher: string; task?: string };
-    result: { agent: string; space: string; terminal: string; task?: FirstTask; taskNote?: string };
+    result: { agent: string; space: string; tab?: string; terminal: string; task?: FirstTask; taskNote?: string };
   };
   "host.info": {
     params: Record<string, never>;
@@ -3156,7 +3266,6 @@ export interface ParsedModelSwitch {
   ackOnly?: boolean;
 }
 
-const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 const COMMAND_NAME_RE = /<command-name>\s*\/?(model|models|switch|effort|thinking)\s*<\/command-name>/i;
 const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/i;
 const LOCAL_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/i;

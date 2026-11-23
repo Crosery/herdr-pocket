@@ -1,14 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent } from "react";
 import { ChevronDown, ChevronUp, X } from "lucide-react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ImageAddon } from "@xterm/addon-image";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge";
-import { openAgentFileTarget } from "../lib/openFileTarget";
+import { hasFileJumpModifier, openAgentFileTarget } from "../lib/openFileTarget";
 import { setConfig, useClientConfig } from "../lib/config";
 import {
   findLinkAtCell,
@@ -285,6 +284,7 @@ export function TerminalSurface({
   const kittyDimsByIdRef = useRef<Map<number, { cols: number; rows: number }>>(new Map());
   const overlayNodesRef = useRef<Map<string, { kind: "img" | "clip" | "osc66"; el: HTMLElement; img?: HTMLImageElement; sig: string }>>(new Map());
   const lastResizeSigRef = useRef("");
+  const appliedVisualSigRef = useRef("");
   const ptySizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const externalSizeOverrideRef = useRef(false);
   const reattachLocalRef = useRef<(() => void) | null>(null);
@@ -310,6 +310,7 @@ export function TerminalSurface({
   agentRef.current = agent;
   const hoveredOscLinkRef = useRef<string | null>(null);
   const lastLinkOpenRef = useRef<{ text: string; at: number }>({ text: "", at: 0 });
+  const ctrlLinkConsumedAtRef = useRef(0);
   const activeRef = useRef(active);
   activeRef.current = active;
   const focusedRef = useRef(focused);
@@ -941,6 +942,12 @@ export function TerminalSurface({
     }
   }, [fontFamily]);
 
+  const visualSig = useCallback(
+    (familyCss: string) =>
+      `${familyCss}|${termCfg.fontSize}|${lineHeight}|${termCfg.fontWeight}|${termCfg.cursorBlink ? 1 : 0}|${activeSpec.fg}|${activeSpec.bg}|${activeSpec.cursor}|${activeSpec.minimumContrastRatio}`,
+    [activeSpec.bg, activeSpec.cursor, activeSpec.fg, activeSpec.minimumContrastRatio, lineHeight, termCfg.cursorBlink, termCfg.fontSize, termCfg.fontWeight],
+  );
+
   // Keep font faces, theme colors, texture atlas, and overlay coordinates synchronized with live changes.
   useEffect(() => {
     const term = termRef.current;
@@ -948,6 +955,9 @@ export function TerminalSurface({
     let cancelled = false;
     const apply = (familyCss: string) => {
       if (cancelled || termRef.current !== term) return;
+      const nextSig = visualSig(familyCss);
+      if (appliedVisualSigRef.current === nextSig) return;
+      appliedVisualSigRef.current = nextSig;
       term.options.fontFamily = familyCss;
       term.options.fontSize = termCfg.fontSize;
       term.options.lineHeight = lineHeight;
@@ -962,7 +972,7 @@ export function TerminalSurface({
           entry.el.style.color = activeSpec.fg;
         }
       }
-      term.clearTextureAtlas();
+      term.clearTextureAtlas?.();
       term.refresh(0, Math.max(0, term.rows - 1));
       syncResize(term);
       requestAnimationFrame(paintOverlays);
@@ -976,7 +986,7 @@ export function TerminalSurface({
     return () => {
       cancelled = true;
     };
-  }, [activeSpec, fontFamily, lineHeight, paintOverlays, syncResize, termCfg.cursorBlink, termCfg.fontFamily, termCfg.fontSize, termCfg.fontWeight]);
+  }, [activeSpec, fontFamily, lineHeight, paintOverlays, syncResize, termCfg.cursorBlink, termCfg.fontFamily, termCfg.fontSize, termCfg.fontWeight, visualSig]);
 
   useEffect(() => {
     const hostEl = hostRef.current;
@@ -1010,7 +1020,7 @@ export function TerminalSurface({
       linkHandler: {
         allowNonHttpProtocols: true,
         activate: (ev, text) => {
-          if (ev.button !== 0 || term.hasSelection()) return;
+          if (ev.button !== 0 || !hasFileJumpModifier(ev) || term.hasSelection()) return;
           activateTerminalLink(text, ev.altKey);
         },
         hover: (_ev, text) => {
@@ -1050,43 +1060,32 @@ export function TerminalSurface({
     kittyKeys.reset();
 
     term.open(hostEl);
+    appliedVisualSigRef.current = visualSig(fontFamily);
     fitAddon.fit();
     refreshCachedCellSize(term);
     centerScreenVerticalGap(hostEl, term);
     bracketedPasteRef.current = false;
 
-    let webglAddon: WebglAddon | null = null;
-    let webglRetries = 0;
-    let webglRetryTimer = 0;
-    const mountWebgl = () => {
-      if (!alive || webglAddon || termRef.current !== term) return;
-      try {
-        const gl = new WebglAddon();
-        gl.onContextLoss(() => {
-          gl.dispose();
-          if (webglAddon === gl) webglAddon = null;
-          if (alive && webglRetries < 3) {
-            webglRetries += 1;
-            window.clearTimeout(webglRetryTimer);
-            webglRetryTimer = window.setTimeout(mountWebgl, 300);
-          }
-        });
-        term.loadAddon(gl);
-        webglAddon = gl;
-      } catch {
-        // Fallback cleanly to xterm default renderer when WebGL2 is unavailable.
-      }
-    };
-    mountWebgl();
+    // Render with xterm's DOM renderer (+ ImageAddon) instead of WKWebView WebGL2 so
+    // shared TextureAtlas corruption and hidden-tab context drops cannot garble or blank terminals.
 
-    // Ensure OS / Herdr / Nerd fonts load asynchronously right after opening.
+    // Ensure OS / Herdr / Nerd fonts load asynchronously right after opening without flashing an already-ready atlas.
+    const fontWeightSpec = termCfg.fontWeight >= 600 ? 600 : 400;
+    const wasFontReady =
+      typeof document !== "undefined" &&
+      Boolean(document.fonts?.check?.(`${fontWeightSpec} ${termCfg.fontSize}px ${fontFamily}`));
     void ensureFontCatalog().then(() => ensureTerminalFontLoaded(termCfg.fontFamily, termCfg.fontWeight >= 600)).then((loaded) => {
       if (loaded && alive && termRef.current === term) {
-        term.options.fontFamily = buildTerminalFontFamily(termCfg.fontFamily, fontCatalogStore.get());
-        term.clearTextureAtlas();
-        term.refresh(0, Math.max(0, term.rows - 1));
-        syncResize(term);
-        requestAnimationFrame(paintOverlays);
+        const nextFamily = buildTerminalFontFamily(termCfg.fontFamily, fontCatalogStore.get());
+        const nextSig = visualSig(nextFamily);
+        if (!wasFontReady || appliedVisualSigRef.current !== nextSig) {
+          appliedVisualSigRef.current = nextSig;
+          term.options.fontFamily = nextFamily;
+          term.clearTextureAtlas?.();
+          term.refresh(0, Math.max(0, term.rows - 1));
+          syncResize(term);
+          requestAnimationFrame(paintOverlays);
+        }
       }
     });
 
@@ -1259,9 +1258,9 @@ export function TerminalSurface({
           detected.map((item) => ({
             range: item.range,
             text: item.text,
-            decorations: { pointerCursor: true, underline: true },
+            decorations: { pointerCursor: false, underline: true },
             activate: (ev, text) => {
-              if (ev.button !== 0 || term.hasSelection()) return;
+              if (ev.button !== 0 || !hasFileJumpModifier(ev) || term.hasSelection()) return;
               activateTerminalLink(text, ev.altKey, item.range.start.y - 1);
             },
           })),
@@ -1290,11 +1289,11 @@ export function TerminalSurface({
       if (sel) void copyToClipboard(sel);
     };
 
-    // Bridge drag-to-select, double/triple-click, Shift-override, copy-on-select, and clickable links.
+    // Bridge drag-to-select, double/triple-click, Shift-override, copy-on-select, and Ctrl/Cmd+Click links.
     let activeDragCleanup: (() => void) | null = null;
     let lastMouseHoverLink = false;
     const onHostMouseMoveHover = (e: MouseEvent) => {
-      if (term.modes.mouseTrackingMode === "none") {
+      if (!hasFileJumpModifier(e)) {
         if (lastMouseHoverLink) {
           lastMouseHoverLink = false;
           term.element?.classList.remove("xterm-cursor-pointer");
@@ -1302,10 +1301,16 @@ export function TerminalSurface({
         return;
       }
       const cell = resolvePointerCell(hostEl, term, e.clientX, e.clientY, false);
-      const hasLink = Boolean(cell?.link);
+      const hasLink = Boolean(cell?.link || hoveredOscLinkRef.current);
       if (hasLink !== lastMouseHoverLink) {
         lastMouseHoverLink = hasLink;
         term.element?.classList.toggle("xterm-cursor-pointer", hasLink);
+      }
+    };
+    const onModifierKeyUp = (e: KeyboardEvent) => {
+      if ((e.key === "Control" || e.key === "Meta") && !hasFileJumpModifier(e) && lastMouseHoverLink) {
+        lastMouseHoverLink = false;
+        term.element?.classList.remove("xterm-cursor-pointer");
       }
     };
     const onHostMouseLeaveHover = () => {
@@ -1315,6 +1320,29 @@ export function TerminalSurface({
       }
     };
     const onHostMouseDownCapture = (e: MouseEvent) => {
+      if (e.button === 0 && hasFileJumpModifier(e)) {
+        const modCell = resolvePointerCell(hostEl, term, e.clientX, e.clientY, false);
+        const modLink = modCell?.link || hoveredOscLinkRef.current;
+        if (modLink) {
+          e.stopPropagation();
+          e.preventDefault();
+          ctrlLinkConsumedAtRef.current = Date.now();
+          term.focus();
+          const startX = e.clientX;
+          const startY = e.clientY;
+          const absRow = modCell?.absRow;
+          const onModUp = (up: MouseEvent) => {
+            window.removeEventListener("mouseup", onModUp, true);
+            if (Math.hypot(up.clientX - startX, up.clientY - startY) < 5) {
+              up.stopPropagation();
+              up.preventDefault();
+              activateTerminalLink(modLink, up.altKey, absRow);
+            }
+          };
+          window.addEventListener("mouseup", onModUp, true);
+          return;
+        }
+      }
       if (e.button !== 0 || e.ctrlKey || (IS_MAC && e.altKey)) return;
       if (term.modes.mouseTrackingMode === "none") {
         window.addEventListener("mouseup", () => queueMicrotask(copyCurrentSelection), { once: true });
@@ -1324,12 +1352,7 @@ export function TerminalSurface({
       if (!startCell) return;
 
       const bypassTuiMouse = e.shiftKey;
-      const clickedLink = startCell.link;
-      if (clickedLink) {
-        e.stopPropagation();
-        e.preventDefault();
-        term.focus();
-      } else if (!isShellRef.current && e.detail >= 2) {
+      if (!isShellRef.current && e.detail >= 2) {
         e.stopPropagation();
         e.preventDefault();
         term.focus();
@@ -1348,15 +1371,6 @@ export function TerminalSurface({
         e.stopPropagation();
         e.preventDefault();
         term.focus();
-      }
-
-      if (e.detail >= 2 && clickedLink) {
-        const word = findWordSelectionAtCell(term.buffer.active, startCell.absRow, startCell.col, term.cols);
-        if (word) {
-          term.select(word.col, word.row, word.length);
-          copyCurrentSelection();
-        }
-        return;
       }
 
       activeDragCleanup?.();
@@ -1391,11 +1405,7 @@ export function TerminalSurface({
           copyCurrentSelection();
           return;
         }
-        if (clickedLink) {
-          up.stopPropagation();
-          up.preventDefault();
-          activateTerminalLink(clickedLink, up.altKey, startCell.absRow);
-        } else if (term.hasSelection()) {
+        if (term.hasSelection()) {
           term.clearSelection();
         }
       };
@@ -1430,6 +1440,7 @@ export function TerminalSurface({
     hostEl.addEventListener("mouseleave", onHostMouseLeaveHover);
     hostEl.addEventListener("mousedown", onHostMouseDownCapture, true);
     hostEl.addEventListener("wheel", onHostWheel, { passive: false });
+    window.addEventListener("keyup", onModifierKeyUp, true);
 
     const reclaimFocusAndSize = () => {
       const localConnId = localConnRef.current;
@@ -2178,6 +2189,12 @@ export function TerminalSurface({
     };
 
     const waitLayoutAndFonts = async () => {
+      if (hostEl.clientWidth > 0 && hostEl.clientHeight > 0 && fontCatalogStore.get() !== null) {
+        fitAddon.fit();
+        refreshCachedCellSize(term);
+        centerScreenVerticalGap(hostEl, term);
+        return;
+      }
       if (hostEl.clientWidth <= 0 || hostEl.clientHeight <= 0) {
         await new Promise<void>((r) => {
           requestAnimationFrame(() => r());
@@ -2255,7 +2272,7 @@ export function TerminalSurface({
           }
         },
       );
-      seedTimer = window.setTimeout(runFallbackRead, 1000);
+      seedTimer = window.setTimeout(runFallbackRead, 150);
     };
 
     let triggerLocalReattach: (() => void) | null = null;
@@ -2296,20 +2313,19 @@ export function TerminalSurface({
             return;
           }
           const dims = fitAddon.proposeDimensions();
-          if (dims && dims.cols > 0 && dims.rows > 0 && (dims.cols !== reqCols || dims.rows !== reqRows) && attempt < 2) {
-            activeLocalConnId = null;
-            if (localConnRef.current === connId) localConnRef.current = null;
-            void native.localTermDetach(connId);
+          if (dims && dims.cols > 0 && dims.rows > 0 && (dims.cols !== reqCols || dims.rows !== reqRows)) {
             fitAddon.fit();
             refreshCachedCellSize(term);
             centerScreenVerticalGap(hostEl, term);
-            term.reset();
-            return connectLocal(attempt + 1);
+            syncResize(term, true);
           }
           ptySizeRef.current = { cols: attRes.cols, rows: attRes.rows };
           const display = currentDisplay(term);
           if (attRes.cols !== term.cols || attRes.rows !== term.rows) {
-            if (!paneOwnsFocus()) {
+            const ownsInitialSize =
+              paneOwnsFocus() ||
+              (activeRef.current && focusedRef.current && (typeof document === "undefined" || document.hasFocus()));
+            if (!ownsInitialSize) {
               externalSizeOverrideRef.current = true;
               term.resize(attRes.cols, attRes.rows);
               refreshCachedCellSize(term);
@@ -2457,7 +2473,6 @@ export function TerminalSurface({
       alive = false;
       window.clearTimeout(seedTimer);
       window.clearTimeout(flushTimer);
-      window.clearTimeout(webglRetryTimer);
       if (resizeSettleTimer) window.clearTimeout(resizeSettleTimer);
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
       flushMicroQueued = false;
@@ -2506,10 +2521,10 @@ export function TerminalSurface({
       hostEl.removeEventListener("mouseleave", onHostMouseLeaveHover);
       hostEl.removeEventListener("mousedown", onHostMouseDownCapture, true);
       hostEl.removeEventListener("wheel", onHostWheel);
+      window.removeEventListener("keyup", onModifierKeyUp, true);
       textarea?.removeEventListener("focus", onTermFocus);
       textarea?.removeEventListener("blur", onTermBlur);
       window.removeEventListener("focus", onWindowFocus);
-      webglAddon?.dispose();
       for (const a of assetsRefForCleanup.current.values()) revokeAssetUrl(a.url);
       assetsRefForCleanup.current.clear();
       overlayNodesRef.current.clear();
@@ -2547,29 +2562,34 @@ export function TerminalSurface({
     };
   }, [ctxMenu]);
 
-  // Refocus and refit when switching back into Terminal mode or focusing this split pane.
-  useEffect(() => {
+  // Refocus, refit, and repaint synchronously before browser paint when switching back into Terminal mode or focusing this split pane.
+  useLayoutEffect(() => {
     const localConnId = localConnRef.current;
     if (localConnId) {
       void localTermFocus(localConnId, active && focused);
     }
     if (!active || !termRef.current) return;
+    const term = termRef.current;
     lastResizeSigRef.current = "";
-    const id = requestAnimationFrame(() => {
-      if (!termRef.current) return;
-      if (focusedRef.current) {
-        const prevConn = localConnRef.current;
-        termRef.current.focus();
-        if (localConnRef.current === prevConn) {
-          if (externalSizeOverrideRef.current) {
-            externalSizeOverrideRef.current = false;
-          }
-          syncResize(termRef.current, true);
+    if (focusedRef.current) {
+      const prevConn = localConnRef.current;
+      term.focus();
+      if (localConnRef.current === prevConn) {
+        if (externalSizeOverrideRef.current) {
+          externalSizeOverrideRef.current = false;
         }
-      } else {
-        syncResize(termRef.current);
+        syncResize(term, true);
       }
-      paintOverlays();
+    } else {
+      syncResize(term);
+    }
+    term.refresh(0, Math.max(0, term.rows - 1));
+    paintOverlays();
+    const id = requestAnimationFrame(() => {
+      if (termRef.current === term) {
+        term.refresh(0, Math.max(0, term.rows - 1));
+        paintOverlays();
+      }
     });
     return () => cancelAnimationFrame(id);
   }, [active, focused, paintOverlays, syncResize]);
@@ -2740,7 +2760,13 @@ export function TerminalSurface({
         const term = termRef.current;
         const hostEl = hostRef.current;
         const cell = term && hostEl ? resolvePointerCell(hostEl, term, e.clientX, e.clientY, false) : null;
-        const link = cell?.link || undefined;
+        const link = cell?.link || hoveredOscLinkRef.current || undefined;
+        if (Date.now() - ctrlLinkConsumedAtRef.current < 400 || (e.ctrlKey && link)) {
+          if (e.ctrlKey && link && Date.now() - ctrlLinkConsumedAtRef.current >= 400) {
+            activateTerminalLink(link, e.altKey, cell?.absRow);
+          }
+          return;
+        }
         const isHttpLink = Boolean(link && /^https?:\/\//i.test(link));
         const lineText = term && cell ? readLogicalLineText(term.buffer.active, cell.absRow).trim() : "";
         setCtxMenu({

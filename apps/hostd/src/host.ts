@@ -5,6 +5,7 @@ import {
   HARNESS_ICON_MAX,
   PROTOCOL_VERSION,
   agentKey,
+  extractTerminalQueuedMessages,
   parseAgentKey,
   rowsChange,
   type Agent,
@@ -24,7 +25,7 @@ import {
 } from "@herdr-pocket/protocol";
 import { HcAdapter, type AppNames } from "./hc.ts";
 import type { ScreenLines } from "./hcscreen.ts";
-import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, findPrograms, herdrCommandArgs, installedLaunchers, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
+import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, findPrograms, herdrCommandArgs, installedLaunchers, isHerdrWindowClosedError, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { DirectServer, type DirectPeer } from "./direct.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
@@ -184,6 +185,9 @@ export class Host {
   /** Text typed into busy agents that their programs have not taken yet. */
   waits = new InputWaits();
   private waitTimer: NodeJS.Timeout | null = null;
+  private screenQueueTimer: NodeJS.Timeout | null = null;
+  screenQueueMs = 2500;
+  private refreshingScreenQueues = false;
   /** This computer's own log lines, uploaded to the relay every minute. */
   logs = new LogBuffer();
   private logTimer: NodeJS.Timeout | null = null;
@@ -316,6 +320,8 @@ export class Host {
     }
     this.logTimer = setInterval(() => this.flushLogs(), this.logEveryMs);
     this.logTimer.unref?.();
+    this.screenQueueTimer = setInterval(() => void this.refreshScreenQueues(), this.screenQueueMs);
+    this.screenQueueTimer.unref?.();
     await this.startDirect();
     this.connect();
   }
@@ -401,6 +407,7 @@ export class Host {
     if (this.sourceTimer) clearInterval(this.sourceTimer);
     if (this.logTimer) clearInterval(this.logTimer);
     if (this.waitTimer) clearInterval(this.waitTimer);
+    if (this.screenQueueTimer) clearInterval(this.screenQueueTimer);
     this.flushLogs();
     this.hc.stop();
     this.herdr.stop();
@@ -880,8 +887,14 @@ export class Host {
       if (busy) return;
       busy = true;
       try {
-        const screen = async (a: Agent) =>
-          a.source === "hc" && !this.sendQueues.has(a.key) ? (await this.hc.read(a.localId, 0)).text : undefined;
+        const screen = async (a: Agent) => {
+          if (a.source !== "hc" || this.sendQueues.has(a.key)) return undefined;
+          const text = (await this.hc.read(a.localId, 0)).text;
+          if (!a.isShell && (a.status === "working" || a.status === "blocked")) {
+            this.waits.setScreenQueued(a.key, extractTerminalQueuedMessages(text, a.harness));
+          }
+          return text;
+        };
         if (await this.waits.settle(this.agents, async (key) => (await this.uniflo.events(key, 15)).events, Date.now(), screen)) this.publish();
       } finally {
         busy = false;
@@ -892,6 +905,39 @@ export class Host {
       }
     }, 3000);
     this.waitTimer.unref?.();
+  }
+
+  /** Scans working/blocked TUI screens so queued messages typed directly in the terminal show in Chat UI. */
+  private async refreshScreenQueues(): Promise<void> {
+    if (this.stopped || this.refreshingScreenQueues) return;
+    if (!this.agents.length) return;
+    const active = this.agents.filter(
+      (a) => !a.isShell && a.source === "hc" && (a.status === "working" || a.status === "blocked") && !this.sendQueues.has(a.key),
+    );
+    const activeKeys = new Set(active.map((a) => a.key));
+    let changed = this.waits.pruneScreenQueued(activeKeys);
+    if (!active.length) {
+      if (changed) this.publish();
+      return;
+    }
+    this.refreshingScreenQueues = true;
+    try {
+      await Promise.all(
+        active.map(async (a) => {
+          try {
+            const { text } = await this.hc.read(a.localId, 60);
+            if (this.waits.setScreenQueued(a.key, extractTerminalQueuedMessages(text, a.harness))) {
+              changed = true;
+            }
+          } catch {
+            /* ignore transient read errors for closing terminals */
+          }
+        }),
+      );
+      if (changed) this.publish();
+    } finally {
+      this.refreshingScreenQueues = false;
+    }
   }
 
   /** A caller's name for the log. */
@@ -972,14 +1018,41 @@ export class Host {
     viaApp: () => Promise<{ space: string; tab: string; terminal: string }>,
     argv: string[],
     folder: string | undefined,
+    docFallbackOpts?: { space?: string; spaceName?: string; tabName?: string },
   ): Promise<{ space: string; tab: string; terminal: string; direct: boolean }> {
+    let closedDoc: { value: unknown; version: number } | null = null;
     try {
       return { ...(await viaApp()), direct: false };
     } catch (e) {
-      if (!(e instanceof NoDesktopApp)) throw new RpcFailure("unsupported", (e as Error).message);
+      if (e instanceof NoDesktopApp) {
+        // Standalone herdr-core (Windows / servers) without a desktop app.
+      } else if (isHerdrWindowClosedError(e)) {
+        const doc = await this.hc.docGet("herdr-app").catch(() => null);
+        const val = doc?.value;
+        if (!val || typeof val !== "object" || Array.isArray(val) || !Array.isArray((val as { spaces?: unknown }).spaces)) {
+          throw new RpcFailure("unsupported", (e as Error).message);
+        }
+        closedDoc = doc;
+      } else {
+        throw new RpcFailure("unsupported", (e as Error).message);
+      }
     }
     try {
-      const terminal = await this.hc.spawnTerminal(argv, folder ?? checkFolder("~"));
+      const resolvedCwd = folder ?? checkFolder("~");
+      const terminal = await this.hc.spawnTerminal(argv, resolvedCwd);
+      if (closedDoc) {
+        const placed = await this.app.createInDocWhenWindowClosed(
+          {
+            ...docFallbackOpts,
+            folder: resolvedCwd,
+            terminal,
+            initialDoc: closedDoc,
+          },
+          this.hc,
+        );
+        this.note("info", "create", `herdr window closed: started ${argv[0] ? base(argv[0]) : "a shell"} as ${terminal} in doc space ${placed.space}`);
+        return { space: placed.space, tab: placed.tab, terminal, direct: true };
+      }
       this.note("info", "create", `no desktop herdr here: started ${argv[0] ? base(argv[0]) : "a shell"} as ${terminal} with hc run`);
       return { space: "", tab: "", terminal, direct: true };
     } catch (e) {
@@ -1162,8 +1235,15 @@ export class Host {
         // Without the desktop app (Windows, servers) new agents get terminals of their own.
         if (e instanceof NoDesktopApp) standalone = true;
         else {
-          reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
           spaces = this.app.spacesFromDocs(this.hc.terminals);
+          const doc = await this.hc.docGet("herdr-app").catch(() => null);
+          const docVal = doc?.value;
+          const hasHerdrDoc =
+            spaces.length > 0 ||
+            Boolean(docVal && typeof docVal === "object" && !Array.isArray(docVal) && Array.isArray((docVal as { spaces?: unknown }).spaces));
+          if (!hasHerdrDoc) {
+            reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
+          }
         }
       }
       for (const s of spaces) {
@@ -1195,7 +1275,7 @@ export class Host {
       else if (p.space && !folder) {
         let spaceFolder = this.spaceFolders.get(p.space);
         if (!spaceFolder) {
-          const list = await this.app.spaces(this.hc.terminals).catch(() => []);
+          const list = await this.app.spaces(this.hc.terminals).catch(() => this.app.spacesFromDocs(this.hc.terminals));
           for (const s of list) {
             if (s.folder) this.spaceFolders.set(s.id, s.folder);
           }
@@ -1223,10 +1303,20 @@ export class Host {
           }),
         launcherArgv(launcher.id),
         folder,
+        {
+          space: str(p.space, 100),
+          spaceName: str(p.spaceName, 60),
+          tabName: str(p.tabName, 60),
+        },
       );
       await Promise.all([this.hc.list(), this.refreshNames()]);
       this.publishNow();
-      const made = { agent: agentKey(this.deviceId, "hc", r.terminal), space: r.space, terminal: r.terminal };
+      const made = {
+        agent: agentKey(this.deviceId, "hc", r.terminal),
+        space: r.space,
+        ...(r.tab ? { tab: r.tab } : {}),
+        terminal: r.terminal,
+      };
       if (!task) return made;
       // `hc run` starts the bare program: the task is typed in like for any other.
       if (launcher.takesTask && !r.direct) return { ...made, task: "started" as const };
@@ -1403,11 +1493,18 @@ export class Host {
     "agent.seen": async (p) => {
       this.writable();
       const a = this.resolve(p.agent);
-      const t = a.source === "hc" ? this.hc.terminals.get(a.localId) : undefined;
-      // Same mark the desktop app leaves when the person looks at a finished turn.
-      if (t && typeof t.turn === "number" && HcAdapter.status(t) === "done") {
-        await this.hc.label(a.localId, { "herdr.seen": String(t.turn) });
-        await this.hc.list();
+      if (a.source === "hc") {
+        let t = this.hc.terminals.get(a.localId);
+        if (!t || typeof t.turn !== "number" || HcAdapter.status(t) !== "done") {
+          await this.hc.list();
+          t = this.hc.terminals.get(a.localId);
+        }
+        // Same mark the desktop app leaves when the person looks at a finished turn.
+        if (t && typeof t.turn === "number" && HcAdapter.status(t) === "done") {
+          await this.hc.label(a.localId, { "herdr.seen": String(t.turn) });
+          await this.hc.list();
+          this.publishNow();
+        }
       }
       return { ok: true as const };
     },
@@ -1568,9 +1665,21 @@ export class Host {
       try {
         result = await this.app.command(checked.command, checked.args);
       } catch (e) {
-        throw new RpcFailure("unsupported", (e as Error).message);
+        if (checked.command === "space.rename" && isHerdrWindowClosedError(e)) {
+          try {
+            result = await this.app.renameSpaceWhenWindowClosed(
+              { id: String(checked.args.id), name: String(checked.args.name ?? "") },
+              this.hc,
+            );
+          } catch (fallbackErr) {
+            throw new RpcFailure("unsupported", (fallbackErr as Error).message);
+          }
+        } else {
+          throw new RpcFailure("unsupported", (e as Error).message);
+        }
       }
       await Promise.all([this.hc.list(), this.refreshNames()]);
+      this.publishNow();
       return { ok: true as const, result: result ?? undefined };
     },
     "sessions.list": async (p, from) => {
@@ -1625,7 +1734,7 @@ export class Host {
         throw new RpcFailure("unsupported", (e as Error).message);
       }
       const space = typeof p.space === "string" && p.space ? p.space.slice(0, 100) : undefined;
-      const r = await this.newTerminal(() => this.app.open({ space, folder, argv }), withProgramPath(argv), folder);
+      const r = await this.newTerminal(() => this.app.open({ space, folder, argv }), withProgramPath(argv), folder, { space });
       await Promise.all([this.hc.list(), this.refreshNames()]);
       return { agent: agentKey(this.deviceId, "hc", r.terminal), space: r.space, terminal: r.terminal };
     },

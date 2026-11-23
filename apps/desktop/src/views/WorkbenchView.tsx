@@ -81,11 +81,21 @@ interface WorkbenchState {
   active: string | null;
   agent: string | null;
   treeOpen: boolean;
+  history: string[];
+  returnAgentByTab: Record<string, string>;
 }
 
 /** Lives for the app's lifetime so tabs survive switching pages. */
-const wb = createStore<WorkbenchState>({ tabs: [], active: null, agent: null, treeOpen: true });
+const wb = createStore<WorkbenchState>({ tabs: [], active: null, agent: null, treeOpen: true, history: [], returnAgentByTab: {} });
 let tabSeq = 0;
+
+function pushWbHistory(history: string[], fromId: string | null, toId: string): string[] {
+  const base = history.filter((id) => id !== toId);
+  if (fromId && fromId !== toId) {
+    return [...base.filter((id) => id !== fromId), fromId, toId].slice(-64);
+  }
+  return [...base, toId].slice(-64);
+}
 
 const SEARCH: Record<string, string> = {
   bing: "https://www.bing.com/search?q=",
@@ -138,24 +148,68 @@ function fileError(e: unknown): string {
   return (e as Error)?.message || "读取失败";
 }
 
-function openTab(tab: WbTab): void {
+function openTab(tab: WbTab, opts?: { fromAgentKey?: string }): void {
   wb.set((s) => {
     const same = s.tabs.find((t) => (t.kind === "file" && tab.kind === "file" ? t.agent === tab.agent && t.path === tab.path : false));
-    if (same) return { ...s, active: same.id };
-    return { ...s, tabs: [...s.tabs, tab], active: tab.id };
+    const targetId = same ? same.id : tab.id;
+    const nextTabs = same ? s.tabs : [...s.tabs, tab];
+    const nextReturn = { ...s.returnAgentByTab };
+    if (opts?.fromAgentKey) {
+      nextReturn[targetId] = opts.fromAgentKey;
+    } else if (nextReturn[targetId]) {
+      delete nextReturn[targetId];
+    }
+    return {
+      ...s,
+      tabs: nextTabs,
+      active: targetId,
+      history: pushWbHistory(s.history, s.active, targetId),
+      returnAgentByTab: nextReturn,
+    };
   });
 }
 
+export function openWorkbenchFileFromAgent(agentKey: string, path: string, title: string): void {
+  openTab({ id: `file-${++tabSeq}`, kind: "file", agent: agentKey, path, title }, { fromAgentKey: agentKey });
+}
+
 function closeTabs(ids: string[]): void {
+  const idSet = new Set(ids);
   for (const id of ids) {
     const t = wb.get().tabs.find((x) => x.id === id);
     if (t?.kind === "web") void native.browserClose(t.id);
   }
+  let backToAgentKey: string | undefined;
   wb.set((s) => {
-    const tabs = s.tabs.filter((t) => !ids.includes(t.id));
-    const active = s.active && ids.includes(s.active) ? (tabs[tabs.length - 1]?.id ?? null) : s.active;
-    return { ...s, tabs, active };
+    const wasActiveId = s.active && idSet.has(s.active) ? s.active : null;
+    backToAgentKey = wasActiveId ? s.returnAgentByTab[wasActiveId] : undefined;
+    const tabs = s.tabs.filter((t) => !idSet.has(t.id));
+    const tabSet = new Set(tabs.map((t) => t.id));
+    const history = s.history.filter((id) => tabSet.has(id));
+    const nextReturn: Record<string, string> = {};
+    for (const [k, v] of Object.entries(s.returnAgentByTab)) {
+      if (tabSet.has(k)) nextReturn[k] = v;
+    }
+    let active = s.active && tabSet.has(s.active) ? s.active : null;
+    if (wasActiveId) {
+      let fromHist: string | null = null;
+      for (let k = history.length - 1; k >= 0; k -= 1) {
+        if (tabSet.has(history[k]!)) {
+          fromHist = history[k]!;
+          break;
+        }
+      }
+      if (!fromHist) {
+        const closedIdx = s.tabs.findIndex((t) => t.id === wasActiveId);
+        fromHist = tabs[Math.min(Math.max(0, closedIdx), tabs.length - 1)]?.id ?? null;
+      }
+      active = fromHist;
+    }
+    return { ...s, tabs, active, history, returnAgentByTab: nextReturn };
   });
+  if (backToAgentKey && typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("pocket:workbench-back-to-agent", { detail: { agentKey: backToAgentKey } }));
+  }
 }
 
 export function newWebTab(url: string): void {
@@ -542,7 +596,16 @@ export function FileViewer({
   const [fetchedBytes, setFetchedBytes] = useState<Uint8Array | null>(null);
   const [fetchedSize, setFetchedSize] = useState<number | null>(null);
   const [capHtmlUrl, setCapHtmlUrl] = useState<string | null>(null);
+  const [capHtmlResolvedFor, setCapHtmlResolvedFor] = useState<string | null>(null);
   const localId = useLocalHostDeviceId();
+  const agentRef = useRef(agent);
+  agentRef.current = agent;
+  const agentKey = agent?.key;
+  const agentDeviceId = agent?.deviceId;
+  const agentCwd = agent?.cwd;
+  const dataRef = useRef(data);
+  dataRef.current = data;
+  const loadedInfoRef = useRef<{ agentKey: string; reqPath: string; resolvedPath?: string; streamUrl: string | null } | null>(null);
   const isMd = /\.(md|markdown|mdx)$/i.test(tab.path);
   const isSvg = /\.svg$/i.test(tab.path);
   const isHtml = /\.html?$/i.test(tab.path);
@@ -607,30 +670,36 @@ export function FileViewer({
     }).catch((e: Error) => toast(e.message || "无法用内置浏览器打开", true));
   };
   const isRelWorkspaceTarget = !/^(\/|~\/|~|[A-Za-z]:[\\/])/.test(tab.path);
-  const localTargetPath = agent?.cwd && isRelWorkspaceTarget ? tab.path : tab.absPath || tab.path;
+  const localTargetPath = agentCwd && isRelWorkspaceTarget ? tab.path : tab.absPath || tab.path;
   const localStreamUrl = useMemo(() => {
     if (!isLocalOwner || !(isDirectStreamMedia || isDirectFetchBinary) || streamError) return null;
-    return native.localFileStreamUrl(localTargetPath, agent?.cwd);
-  }, [agent?.cwd, isDirectFetchBinary, isDirectStreamMedia, isLocalOwner, localTargetPath, streamError]);
+    return native.localFileStreamUrl(localTargetPath, agentCwd);
+  }, [agentCwd, isDirectFetchBinary, isDirectStreamMedia, isLocalOwner, localTargetPath, streamError]);
 
+  const htmlTargetKey = isLocalOwner && isHtml ? `${agentCwd ?? ""}\u0000${tab.path}` : null;
   useEffect(() => {
-    if (!isLocalOwner || !isHtml) {
+    if (!isLocalOwner || !isHtml || !htmlTargetKey) {
       setCapHtmlUrl(null);
+      setCapHtmlResolvedFor(null);
       return;
     }
     let alive = true;
     void native
-      .registerLocalPreviewUrl(localTargetPath, agent?.cwd)
+      .registerLocalPreviewUrl(localTargetPath, agentCwd)
       .then((u) => {
-        if (alive) setCapHtmlUrl(u);
+        if (!alive) return;
+        setCapHtmlUrl((prev) => (prev === u ? prev : u));
+        setCapHtmlResolvedFor(htmlTargetKey);
       })
       .catch(() => {
-        if (alive) setCapHtmlUrl(null);
+        if (!alive) return;
+        setCapHtmlUrl(null);
+        setCapHtmlResolvedFor(htmlTargetKey);
       });
     return () => {
       alive = false;
     };
-  }, [agent?.cwd, isHtml, isLocalOwner, localTargetPath]);
+  }, [agentCwd, htmlTargetKey, isHtml, isLocalOwner, localTargetPath]);
 
   const prettyJson = useMemo(() => {
     if (!isJson || !text) return null;
@@ -678,7 +747,7 @@ export function FileViewer({
     setStreamError(false);
     setFetchedBytes(null);
     setFetchedSize(null);
-  }, [agent?.key, tab.absPath, tab.path]);
+  }, [agentKey, tab.absPath, tab.path]);
 
   // Decode remote or fallback base64 into Uint8Array once per read
   const rawBinaryBytes = useMemo(() => {
@@ -808,40 +877,59 @@ export function FileViewer({
 
   const read = useCallback(
     async (offset: number) => {
+      const curAgent = agentRef.current;
       const isRelWorkspace = !/^(\/|~\/|~|[A-Za-z]:[\\/])/.test(tab.path);
-      const localPathTarget = agent?.cwd && isRelWorkspace ? tab.path : tab.absPath || tab.path;
+      const localPathTarget = curAgent?.cwd && isRelWorkspace ? tab.path : tab.absPath || tab.path;
       const wantBytes = isCsv || isJsonLines || isJson ? 2 * 1024 * 1024 : undefined;
       let res: ReadResult | null = null;
       if (offset === 0 && native.available()) {
-        if (!agent && tab.absPath) {
+        if (!curAgent && tab.absPath) {
           res = await native.localReadFile({ path: tab.absPath, maxBytes: wantBytes }).catch(() => null);
-        } else if (agent) {
+        } else if (curAgent) {
           const localId = localHostIdStore.get() ?? (await ensureLocalHostDeviceId());
-          if (localId && localId === agent.deviceId) {
-            res = await native.localReadFile({ cwd: agent.cwd, path: localPathTarget, maxBytes: wantBytes }).catch(() => null);
+          if (localId && localId === curAgent.deviceId) {
+            res = await native.localReadFile({ cwd: curAgent.cwd, path: localPathTarget, maxBytes: wantBytes }).catch(() => null);
           }
         }
       }
       if (!res) {
-        if (!agent) throw new Error("这个文件所在的 Agent 已经不在了。");
-        res = await rpcCall(agent.deviceId, "files.read", {
-          agent: agent.key,
+        if (!curAgent) throw new Error("这个文件所在的 Agent 已经不在了。");
+        res = await rpcCall(curAgent.deviceId, "files.read", {
+          agent: curAgent.key,
           path: tab.path,
           offset,
           ...(wantBytes ? { maxBytes: wantBytes } : {}),
         });
       }
-      if (offset === 0 && agent && res.path && res.path !== tab.path && isRelWorkspace) {
-        updateResolvedFilePanePath(agent.key, tab.path, res.path, agent.cwd);
+      if (offset === 0) {
+        loadedInfoRef.current = {
+          agentKey: curAgent?.key ?? "",
+          reqPath: tab.path,
+          resolvedPath: res.path,
+          streamUrl: localStreamUrl ?? null,
+        };
+      }
+      if (offset === 0 && curAgent && res.path && res.path !== tab.path && isRelWorkspace) {
+        updateResolvedFilePanePath(curAgent.key, tab.path, res.path, curAgent.cwd);
       }
       setData(res);
       setText((prev) => (offset ? prev + (res.text ?? "") : (res.text ?? "")));
       return res;
     },
-    [agent, isCsv, isJson, isJsonLines, tab.absPath, tab.path],
+    [agentCwd, agentDeviceId, agentKey, isCsv, isJson, isJsonLines, localStreamUrl, tab.absPath, tab.path],
   );
 
   useEffect(() => {
+    const prev = loadedInfoRef.current;
+    const sameLoadedFile =
+      Boolean(prev) &&
+      prev!.agentKey === (agentKey ?? "") &&
+      prev!.streamUrl === (localStreamUrl ?? null) &&
+      (prev!.reqPath === tab.path || (Boolean(prev!.resolvedPath) && prev!.resolvedPath === tab.path)) &&
+      Boolean(dataRef.current);
+    if (sameLoadedFile) return;
+
+    loadedInfoRef.current = null;
     setData(null);
     setError(null);
     setText("");
@@ -867,12 +955,12 @@ export function FileViewer({
         alive = false;
       };
     }
-    if (!agent && !(tab.absPath && native.available())) {
+    if (!agentKey && !(tab.absPath && native.available())) {
       setError("这个文件所在的 Agent 已经不在了。");
       return;
     }
     read(0).catch((e) => setError(fileError(e)));
-  }, [agent, isDirectFetchBinary, isDirectStreamMedia, localStreamUrl, read, tab.absPath]);
+  }, [agentDeviceId, agentKey, isDirectFetchBinary, isDirectStreamMedia, localStreamUrl, read, tab.absPath, tab.path]);
 
   useEffect(() => {
     headStateCbRef.current?.({
@@ -956,6 +1044,11 @@ export function FileViewer({
 
   const effectiveMediaSrc =
     localStreamUrl && isDirectStreamMedia ? localStreamUrl : blobUrl;
+  const isFullFrameBody =
+    !error &&
+    Boolean(data || fetchedBytes) &&
+    ((preview && isHtml && (htmlTargetKey === null || capHtmlResolvedFor === htmlTargetKey)) ||
+      Boolean(blobUrl && isPdf));
 
   return (
     <div className="viewer">
@@ -1020,7 +1113,7 @@ export function FileViewer({
           </button>
         </div>
       ) : null}
-      <div className="viewer-body">
+      <div className={`viewer-body${isFullFrameBody ? " is-frame" : ""}`}>
         {error ? (
           <div className="inline-alert" style={{ margin: 16 }}>{error}</div>
         ) : effectiveMediaSrc && (isVideo || isVideoExt) ? (
@@ -1103,7 +1196,9 @@ export function FileViewer({
             actions={compactExternalAction}
           />
         ) : preview && isHtml ? (
-          capHtmlUrl ? (
+          htmlTargetKey !== null && capHtmlResolvedFor !== htmlTargetKey ? (
+            <div className="faint" style={{ padding: 16 }}>读取中…</div>
+          ) : capHtmlUrl ? (
             <iframe
               sandbox="allow-scripts allow-same-origin"
               src={capHtmlUrl}
@@ -1480,7 +1575,18 @@ export function WorkbenchView({ agentKey, mobileLayout }: { agentKey: string | n
             </button>
           ) : null}
           {mobileLayout && active ? (
-            <button className="side-icon-btn" aria-label="返回文件" onClick={() => wb.set((s) => ({ ...s, active: null, treeOpen: true }))}>
+            <button
+              className="side-icon-btn"
+              aria-label="返回"
+              onClick={() => {
+                const s = wb.get();
+                if (s.active && (s.returnAgentByTab[s.active] || s.history.some((id) => id !== s.active && s.tabs.some((t) => t.id === id)))) {
+                  closeTabs([s.active]);
+                  return;
+                }
+                wb.set((cur) => ({ ...cur, active: null, treeOpen: true }));
+              }}
+            >
               <ArrowLeft size={15} />
             </button>
           ) : null}
@@ -1491,7 +1597,7 @@ export function WorkbenchView({ agentKey, mobileLayout }: { agentKey: string | n
                 role="tab"
                 aria-selected={t.id === state.active}
                 className={`wb-tab${t.id === state.active ? " active" : ""}${t.pinned ? " pinned" : ""}`}
-                onClick={() => wb.set((s) => ({ ...s, active: t.id }))}
+                onClick={() => wb.set((s) => ({ ...s, active: t.id, history: pushWbHistory(s.history, s.active, t.id) }))}
                 onAuxClick={(e) => e.button === 1 && !t.pinned && closeTabs([t.id])}
                 onContextMenu={(e) => onTabMenu(e, t)}
                 title={t.kind === "file" ? t.path : t.url}

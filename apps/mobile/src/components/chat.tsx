@@ -8,6 +8,7 @@ import {
   compareConvEvents,
   formatModelSwitchSummary,
   parseModelSwitchEvent,
+  sameMessage,
   type Agent,
   type ChatDisplayMode,
   type ConvEvent,
@@ -50,6 +51,7 @@ export type Row =
   | { type: "tools"; id: string; items: Extract<Row, { type: "tool" }>[]; thoughts?: string[]; notes?: Array<{ summary: string; text: string }>; defaultOpen?: boolean }
   /** Sent from this phone, not yet echoed by the session. */
   | { type: "pending"; id: string; text: string; ts: number; pictures?: string[]; send: PendingSend; agentKey: string }
+  | { type: "terminal_queued"; id: string; text: string }
   | { type: "turn_end"; id: string; ts: number }
   | { type: "model_switch"; id: string; ts: number; label: string; model?: string; thinking?: string }
   | { type: "system"; id: string; text: string; summary: string };
@@ -357,7 +359,7 @@ function FoldChip({ label, icon, body, align = "center", a11y }: { label: string
 }
 
 /** `send`: sent from this phone and not in the conversation yet; its state shows under the bubble. */
-const UserBubble = memo(function UserBubble({ text, injected, ts, send, agentKey, pictures }: { text: string; injected?: string; ts?: number; send?: PendingSend; agentKey?: string; pictures?: string[] }) {
+const UserBubble = memo(function UserBubble({ text, injected, ts, send, agentKey, pictures, badge }: { text: string; injected?: string; ts?: number; send?: PendingSend; agentKey?: string; pictures?: string[]; badge?: string }) {
   const p = usePalette();
   const scale = useSettings((s) => s.textScale);
   // Picture paths sent with a message (and Claude Code's [Image #n] marks) fold into a chip.
@@ -383,6 +385,8 @@ const UserBubble = memo(function UserBubble({ text, injected, ts, send, agentKey
       {injected ? <FoldChip label="附加内容" icon="paperclip" body={injected} align="flex-end" a11y="这条消息的附加内容" /> : null}
       {send && agentKey ? (
         <SendMark send={send} agentKey={agentKey} time={clock(send.ts)} />
+      ) : badge ? (
+        <Text style={{ color: p.accentText, fontSize: 11 }}>{badge}</Text>
       ) : ts ? (
         <Text style={{ color: p.faint, fontSize: 11 }}>{clock(ts)}</Text>
       ) : null}
@@ -692,6 +696,8 @@ const renderRow: ListRenderItem<ListRow> = ({ item }) => {
       return <UserBubble text={item.text} injected={item.injected} ts={item.ts} pictures={item.pictures} />;
     case "pending":
       return <UserBubble text={item.text} pictures={item.pictures} send={item.send} agentKey={item.agentKey} />;
+    case "terminal_queued":
+      return <UserBubble text={item.text} badge="终端排队中 · 本轮结束后自动处理" />;
     case "tools":
       return <ToolGroup items={item.items} thoughts={item.thoughts} notes={item.notes} defaultOpen={item.defaultOpen} />;
     case "assistant":
@@ -1040,6 +1046,22 @@ function SessionChatView({
     if (sends.drop.length) forget(agent.key, sends.drop);
   }, [sends, patchSend, agent.key]);
 
+  const rawTerminalQueued = useMemo(
+    () =>
+      sub
+        ? []
+        : agent.queuedItems?.length
+          ? agent.queuedItems
+          : agent.queued && agent.queuedText
+            ? [agent.queuedText]
+            : [],
+    [sub, agent.queued, agent.queuedItems, agent.queuedText],
+  );
+  const terminalQueuedItems = useMemo(
+    () => rawTerminalQueued.filter((t) => t.trim() && !(sendsAll ?? []).some((x) => !x.echo && sameMessage(t, x.text))),
+    [rawTerminalQueued, sendsAll],
+  );
+
   // Inverted list: newest first. The session's copy of a message from this phone keeps its bubble's key.
   const rows = useMemo(
     () =>
@@ -1049,8 +1071,9 @@ function SessionChatView({
           return r.type === "user" && x ? { ...r, id: x.id, pictures: x.pictures } : r;
         }),
         ...sends.shown.map((x): Row => ({ type: "pending", id: x.id, text: x.text, ts: x.ts, pictures: x.pictures, send: x, agentKey: agent.key })),
+        ...terminalQueuedItems.map((text, idx): Row => ({ type: "terminal_queued", id: `term-q-${idx}-${text.slice(0, 24)}`, text })),
       ].reverse(),
-    [folded, sends, agent.key],
+    [folded, sends, agent.key, terminalQueuedItems],
   );
   const working = !sub && agent.status === "working";
   const end = useMemo(

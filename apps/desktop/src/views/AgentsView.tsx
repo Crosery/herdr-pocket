@@ -30,6 +30,7 @@ import {
   buildHarnessSwitchCommands,
   normalizeSwitchHarness,
   parseModelSwitchText,
+  sameMessage,
   stripModelEffortSuffix,
   textWithFiles,
   type Agent,
@@ -112,7 +113,7 @@ import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import { updateAgentRoleModel, useAutoAgentModelMeta } from "../lib/modelCatalogClient";
 import { openFileTab, openSubagentAside } from "../shell/shellStore";
 import { native } from "../lib/native";
-import { parseChoices } from "../lib/markdown";
+import { RichMarkdown, parseChoices } from "../lib/markdown";
 import { openAgentFileTarget } from "../lib/openFileTarget";
 import { pingRelay, rpcCall, subscribeStream } from "../lib/relay";
 import {
@@ -861,10 +862,11 @@ export function AgentsView({
         hosts={hosts}
         defaultHost={createTarget.host ?? hostFilter}
         defaultSpace={createTarget.space ?? activeSpace}
-        onCreated={(key) => {
-          setDetailTab(null);
-          onSelectAgent(key);
-          toast("已创建并打开 Agent");
+        onCreated={(info) => {
+          if (info.spaceName) setSpaceFilter(info.spaceName);
+          setDetailTab({ key: info.agentKey, tab: "term" });
+          onSelectAgent(info.agentKey);
+          toast(info.launcher === "shell" ? "已创建并打开终端" : "已创建并打开 Agent");
         }}
       />
     </div>
@@ -1160,8 +1162,6 @@ export function AgentDetailPanel({
         .catch(() => {});
     }, 3_000);
 
-    void rpcCall(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {});
-
     return () => {
       alive = false;
       merger.dispose();
@@ -1169,6 +1169,36 @@ export function AgentDetailPanel({
       unsubSession();
     };
   }, [agent.deviceId, agent.key, agent.sessionKey]);
+
+  const lastSeenMarkRef = useRef<string | null>(null);
+  const wasVisibleForSeenRef = useRef(false);
+  const isActivelyViewed = visible && (!embedded || focused);
+  useEffect(() => {
+    const justBecameViewed = isActivelyViewed && !wasVisibleForSeenRef.current;
+    wasVisibleForSeenRef.current = isActivelyViewed;
+    if (!isActivelyViewed || agent.status !== "done") {
+      if (agent.status !== "done") lastSeenMarkRef.current = null;
+      return;
+    }
+    const mark = `${agent.key}:${agent.turn ?? ""}`;
+    if (lastSeenMarkRef.current === mark && !justBecameViewed) return;
+    lastSeenMarkRef.current = mark;
+    liveStore.set((prev) => {
+      const list = prev.agents[agent.deviceId];
+      if (!list?.some((a) => a.key === agent.key && a.status === "done")) return prev;
+      return {
+        ...prev,
+        agents: {
+          ...prev.agents,
+          [agent.deviceId]: list.map((a) =>
+            a.key === agent.key && a.status === "done" ? { ...a, status: "idle" } : a,
+          ),
+        },
+        rev: prev.rev + 1,
+      };
+    });
+    void rpcCall(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {});
+  }, [agent.deviceId, agent.key, agent.status, agent.turn, isActivelyViewed]);
 
   useEffect(() => {
     if (!agent.subagents) return;
@@ -1501,9 +1531,32 @@ export function AgentDetailPanel({
     return null;
   }, [foldedRows]);
 
+  const rawTerminalQueued = useMemo(
+    () =>
+      activeSub
+        ? []
+        : agent.queuedItems?.length
+          ? agent.queuedItems
+          : agent.queued && agent.queuedText
+            ? [agent.queuedText]
+            : [],
+    [activeSub, agent.queued, agent.queuedItems, agent.queuedText],
+  );
+  const terminalQueuedItems = useMemo(
+    () =>
+      rawTerminalQueued.filter(
+        (qText) =>
+          qText.trim() &&
+          !reconciled.unmatched.some((u) => sameMessage(qText, u.text)) &&
+          !queued.some((q) => sameMessage(qText, q.text)),
+      ),
+    [queued, rawTerminalQueued, reconciled.unmatched],
+  );
+
   const hasAnyRenderedRows =
     foldedRows.length > 0 ||
     reconciled.unmatched.length > 0 ||
+    terminalQueuedItems.length > 0 ||
     Boolean(shellChat && (shellChat.turns.length > 0 || shellChat.preambleLines.length > 0));
 
   const scrollToBottom = useCallback((smooth = false) => {
@@ -1602,6 +1655,7 @@ export function AgentDetailPanel({
     reconciled.awaitingReply,
     sending,
     shellChat,
+    terminalQueuedItems.length,
   ]);
 
   const onChatScroll = useCallback(() => {
@@ -2139,7 +2193,7 @@ export function AgentDetailPanel({
     agent.status !== "working" &&
     !reconciled.awaitingReply &&
     !hasSending;
-  const totalQueuedCount = queued.length + (agent.queued ?? 0);
+  const totalQueuedCount = queued.length + (terminalQueuedItems.length || (agent.queued ?? 0));
   const runElapsed = workingStartRef.current ? workedFor(nowTick - workingStartRef.current) : "刚开始";
 
   return (
@@ -2392,6 +2446,29 @@ export function AgentDetailPanel({
                 </button>
               </div>
             ) : null}
+
+            {!activeSub && terminalQueuedItems.length > 0
+              ? terminalQueuedItems.map((qText, idx) => (
+                  <div key={`term-q-${idx}-${qText.slice(0, 24)}`} className="bubble-row user queued-terminal">
+                    <div className="bubble user">
+                      <RichMarkdown text={qText} onOpenFile={(target) => openAgentFileTarget(agent, target)} />
+                    </div>
+                    <div className="bubble-send-meta">
+                      <span>终端排队中 · 本轮结束后自动处理</span>
+                      {agent.source === "hc" && idx === 0 ? (
+                        <button
+                          type="button"
+                          className="bubble-meta-btn primary"
+                          title="立即注入到当前轮 (Alt+M)"
+                          onClick={() => void sendKeys(["alt+m"])}
+                        >
+                          立即注入
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ))
+              : null}
           </div>
 
           {!atBottom && hasAnyRenderedRows ? (
@@ -2566,7 +2643,37 @@ export function AgentDetailPanel({
                   </div>
                 </div>
               ))}
-              {agent.queued ? (
+              {terminalQueuedItems.length > 0 ? (
+                terminalQueuedItems.map((qText, idx) => (
+                  <div key={`shelf-term-q-${idx}-${qText.slice(0, 24)}`} className="composer-queue-item">
+                    <span className="composer-queue-idx">终端</span>
+                    <span className="composer-queue-text" title={qText}>
+                      {qText}
+                    </span>
+                    <div className="composer-queue-actions">
+                      {agent.source === "hc" && idx === 0 ? (
+                        <button
+                          type="button"
+                          className="composer-queue-steer"
+                          title="立即注入到当前轮 (Alt+M)"
+                          onClick={() => void sendKeys(["alt+m"])}
+                        >
+                          立即注入
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="composer-queue-ic"
+                        aria-label="中断当前轮"
+                        title="中断当前轮"
+                        onClick={interruptTurn}
+                      >
+                        <Square size={11} />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              ) : agent.queued ? (
                 <div className="composer-queue-item">
                   <span className="composer-queue-idx">终端</span>
                   <span className="composer-queue-text" title={agent.queuedText || ""}>
@@ -2868,12 +2975,24 @@ export function AgentDetailPanel({
   );
 }
 
+export interface CreatedAgentInfo {
+  agentKey: string;
+  terminalId?: string;
+  hostId: string;
+  spaceId?: string;
+  tabId?: string;
+  spaceName?: string;
+  folder?: string;
+  launcher: string;
+}
+
 export function CreateAgentModal({
   open,
   onOpenChange,
   hosts,
   defaultHost,
   defaultSpace,
+  preferNewSpace = false,
   onCreated,
 }: {
   open: boolean;
@@ -2881,7 +3000,8 @@ export function CreateAgentModal({
   hosts: Device[];
   defaultHost: string | null;
   defaultSpace: string | null;
-  onCreated: (key: string) => void;
+  preferNewSpace?: boolean;
+  onCreated: (info: CreatedAgentInfo) => void;
 }) {
   const toast = useToast();
   const localHostId = useLocalHostDeviceId();
@@ -2932,14 +3052,20 @@ export function CreateAgentModal({
     void rpcCall(hostId, "spaces.list", {})
       .then((res) => {
         if (cancelled) return;
+        const sortedLaunchers = [...res.launchers].sort((a, b) => Number(b.id === "shell") - Number(a.id === "shell"));
         setSpaces(res.spaces);
-        setLaunchers(res.launchers);
+        setLaunchers(sortedLaunchers);
         setFolders(res.folders);
-        setLauncher(res.launchers[0]?.id ?? "");
+        setLauncher(sortedLaunchers.find((l) => l.id === "shell")?.id ?? sortedLaunchers[0]?.id ?? "");
         const matched = defaultSpace ? res.spaces.find((s) => s.name === defaultSpace) : undefined;
-        const initialSpace = matched ?? res.spaces[0];
-        setSpaceId(initialSpace?.id ?? "");
-        setFolder(initialSpace?.folder || res.folders[0] || "");
+        if (preferNewSpace && !defaultSpace) {
+          setSpaceId("");
+          setFolder("");
+        } else {
+          const initialSpace = matched ?? res.spaces[0];
+          setSpaceId(initialSpace?.id ?? "");
+          setFolder(initialSpace?.folder || res.folders[0] || "");
+        }
         setSpaceState({ loading: false, error: null, canCreate: res.canCreate !== false, reason: res.reason });
       })
       .catch((e: Error) => {
@@ -2949,7 +3075,7 @@ export function CreateAgentModal({
     return () => {
       cancelled = true;
     };
-  }, [open, hostId, defaultSpace]);
+  }, [open, hostId, defaultSpace, preferNewSpace]);
 
   const applyChosenFolder = (nextFolder: string, markTouched = true) => {
     setFolder(nextFolder);
@@ -2983,16 +3109,28 @@ export function CreateAgentModal({
     if (!hostId || !launcher) return;
     setBusy(true);
     try {
+      const cleanFolder = folder.trim();
+      const folderBase = cleanFolder.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+      const resolvedSpaceName = matchedSpaceObj?.name || spaceName.trim() || folderBase || "workspace";
       const res = await rpcCall(hostId, "agent.create", {
         space: spaceId || undefined,
         spaceName: spaceId ? undefined : spaceName.trim() || undefined,
-        folder: folder.trim() || undefined,
+        folder: cleanFolder || undefined,
         launcher,
-        task: task.trim() || undefined,
+        task: launcher !== "shell" && task.trim() ? task.trim() : undefined,
       }, 30_000);
       onOpenChange(false);
       setTask("");
-      onCreated(res.agent);
+      onCreated({
+        agentKey: res.agent,
+        terminalId: res.terminal,
+        hostId,
+        spaceId: res.space || spaceId || undefined,
+        tabId: res.tab || undefined,
+        spaceName: resolvedSpaceName,
+        folder: cleanFolder || matchedSpaceObj?.folder || undefined,
+        launcher,
+      });
     } catch (e) {
       toast((e as Error).message, true);
     } finally {
@@ -3000,9 +3138,22 @@ export function CreateAgentModal({
     }
   };
 
+  const isCreatingSpace = preferNewSpace || !spaceId;
+  const isShellLauncher = launcher === "shell";
+
   return (
     <>
-      <PocketModal open={open} onOpenChange={onOpenChange} title="新建 Agent" subtitle="选择工作目录后自动匹配已有空间（或新建命名空间）" width={540}>
+      <PocketModal
+        open={open}
+        onOpenChange={onOpenChange}
+        title={isCreatingSpace ? "新建空间" : "新建终端 / Agent"}
+        subtitle={
+          isCreatingSpace
+            ? "选择工作目录并创建新空间，默认直接进入终端（也可切换启动指定 Agent）"
+            : "选择工作目录后自动匹配已有空间（或新建命名空间）"
+        }
+        width={540}
+      >
         <div className="stack">
           {hosts.length > 0 ? (
             <div>
@@ -3113,15 +3264,23 @@ export function CreateAgentModal({
             </div>
           ) : null}
 
-          <div>
-            <div className="faint" style={{ marginBottom: 4 }}>第一条任务（可选）</div>
-            <PocketInput placeholder="要交给它做什么…" value={task} onChange={(e) => setTask(e.target.value)} />
-          </div>
+          {!isShellLauncher ? (
+            <div>
+              <div className="faint" style={{ marginBottom: 4 }}>第一条任务（可选）</div>
+              <PocketInput placeholder="要交给它做什么…" value={task} onChange={(e) => setTask(e.target.value)} />
+            </div>
+          ) : null}
 
           <div className="row" style={{ justifyContent: "flex-end" }}>
             <PocketButton variant="ghost" onClick={() => onOpenChange(false)}>取消</PocketButton>
             <PocketButton variant="primary" disabled={busy || spaceState.loading || !spaceState.canCreate || !hostId || !launcher} onClick={() => void submit()}>
-              {busy ? "正在启动…" : "启动 Agent"}
+              {busy
+                ? "正在打开…"
+                : !spaceId && isShellLauncher
+                  ? "创建空间并打开终端"
+                  : isShellLauncher
+                    ? "打开终端"
+                    : "启动 Agent"}
             </PocketButton>
           </div>
         </div>

@@ -5,6 +5,7 @@ import {
   extractModelExplicitEffort,
   formatModelSwitchSummary,
   parseModelSwitchText,
+  sameMessage,
   stripModelEffortSuffix,
   type Agent,
   type AgentUsageModelRow,
@@ -244,14 +245,34 @@ function resolveTranscriptPath(rawPath: string): string {
   return trimmed;
 }
 
+function extractTranscriptMessageText(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
+      parts.push(b.text.trim());
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+function isSyntheticQueueText(text: string): boolean {
+  if (!text) return true;
+  if (/^<task-notification\b/i.test(text)) return true;
+  return false;
+}
+
 /**
- * Tail-reads the last ~`maxBytes` of a JSONL session transcript backwards to recover the latest
- * active model ID and thinking effort (supporting OMP, Claude, Codex, Pi, Gemini, and Antigravity).
+ * Reads the trailing slice of a session JSONL file (`model`, `thinkingLevel`,
+ * and any still-pending `queue-operation` entries not yet dequeued/committed).
  */
 export function readJsonlModelAndThinkingTail(
   rawPath: string,
   maxBytes = DEFAULT_TRANSCRIPT_TAIL_BYTES,
-): { model?: string; thinkingLevel?: string } {
+): { model?: string; thinkingLevel?: string; queuedItems?: string[] } {
   const filePath = resolveTranscriptPath(rawPath);
   if (!filePath) return {};
 
@@ -360,9 +381,57 @@ export function readJsonlModelAndThinkingTail(
     if (model !== undefined && thinkingLevel !== undefined) break;
   }
 
+  let queuedItems: string[] | undefined;
+  if (text.includes('"queue-operation"')) {
+    const queue: string[] = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      const raw = lines[i]?.trim();
+      if (!raw || !raw.startsWith("{")) continue;
+      if (queue.length === 0 && !raw.includes('"queue-operation"')) continue;
+      let obj: Record<string, any>;
+      try {
+        obj = JSON.parse(raw) as Record<string, any>;
+      } catch {
+        continue;
+      }
+      if (obj.type === "queue-operation") {
+        const op = typeof obj.operation === "string" ? obj.operation : "";
+        const content = extractTranscriptMessageText(obj.content);
+        if (op === "enqueue") {
+          if (content && !isSyntheticQueueText(content)) queue.push(content);
+        } else if (op === "dequeue" || op === "pop") {
+          if (content) {
+            const idx = queue.findIndex((q) => q === content || sameMessage(q, content));
+            if (idx >= 0) queue.splice(idx, 1);
+            else queue.shift();
+          } else {
+            queue.shift();
+          }
+        } else if (op === "remove") {
+          if (content) {
+            const idx = queue.findLastIndex((q) => q === content || sameMessage(q, content));
+            if (idx >= 0) queue.splice(idx, 1);
+          } else {
+            queue.pop();
+          }
+        } else if (op === "popAll" || op === "clear") {
+          queue.length = 0;
+        }
+      } else if (obj.type === "user" && !obj.isMeta && !obj.isSidechain && queue.length > 0) {
+        const userText = extractTranscriptMessageText(obj.message?.content ?? obj.content);
+        if (userText && !isSyntheticQueueText(userText)) {
+          const idx = queue.findIndex((q) => q === userText || sameMessage(q, userText));
+          if (idx >= 0) queue.splice(idx, 1);
+        }
+      }
+    }
+    if (queue.length > 0) queuedItems = queue.slice(-20);
+  }
+
   return {
     ...(model ? { model } : {}),
     ...(thinkingLevel ? { thinkingLevel } : {}),
+    ...(queuedItems ? { queuedItems } : {}),
   };
 }
 
@@ -396,7 +465,7 @@ export class UnifloAdapter {
   private lastRefresh = 0;
   private refreshing = false;
   private refreshAgain = false;
-  private transcriptMetaCache = new Map<string, { updatedAt: number; model?: string; thinkingLevel?: string }>();
+  private transcriptMetaCache = new Map<string, { updatedAt: number; mtimeMs?: number; size?: number; model?: string; thinkingLevel?: string; queuedItems?: string[] }>();
 
   constructor(base = process.env.UNIFLO_URL ?? "http://127.0.0.1:7311", token = process.env.UNIFLO_TOKEN) {
     this.base = base.replace(/\/+$/, "");
@@ -850,9 +919,25 @@ export class UnifloAdapter {
       const kids = this.childCounts.get(s.key);
       let meta = this.transcriptMetaCache.get(s.key);
       if (s.source?.trim()) {
-        if (!meta || meta.updatedAt !== s.updated_at) {
+        let mtimeMs: number | undefined;
+        let size: number | undefined;
+        if (a.status === "working" || a.status === "blocked") {
+          const resolvedSource = resolveTranscriptPath(s.source);
+          if (resolvedSource) {
+            try {
+              const st = statSync(resolvedSource);
+              mtimeMs = st.mtimeMs;
+              size = st.size;
+            } catch {
+              /* ignore stat race */
+            }
+          }
+        }
+        const statChanged =
+          mtimeMs !== undefined && size !== undefined && meta !== undefined && (meta.mtimeMs !== mtimeMs || meta.size !== size);
+        if (!meta || meta.updatedAt !== s.updated_at || statChanged) {
           const read = readJsonlModelAndThinkingTail(s.source);
-          meta = { updatedAt: s.updated_at, ...read };
+          meta = { updatedAt: s.updated_at, mtimeMs, size, ...read };
           if (this.transcriptMetaCache.has(s.key)) {
             this.transcriptMetaCache.delete(s.key);
           } else if (this.transcriptMetaCache.size >= MAX_TRANSCRIPT_META_CACHE) {
@@ -866,8 +951,9 @@ export class UnifloAdapter {
       }
       const model = s.model ?? meta?.model;
       const thinkingLevel = meta?.thinkingLevel ?? (model ? extractModelExplicitEffort(model) : undefined);
+      const queuedItems = (a.status === "working" || a.status === "blocked") && meta?.queuedItems?.length ? meta.queuedItems : undefined;
       // Status stays exactly what herdr shows (the phone must match the desktop
-      // app); the transcript only adds title, preview, model and cost.
+      // app); the transcript only adds title, preview, model, cost, and transcript queue items.
       return {
         ...a,
         statusSince: a.statusSince ?? s.status_since,
@@ -876,6 +962,7 @@ export class UnifloAdapter {
         title: a.name ? a.title : (cleanTitle(s.title) ?? a.title),
         model,
         ...(thinkingLevel ? { thinkingLevel } : {}),
+        ...(queuedItems ? { queuedItems, queued: queuedItems.length, queuedText: Array.from(queuedItems[0]!).length > 80 ? `${Array.from(queuedItems[0]!).slice(0, 80).join("")}…` : queuedItems[0]! } : {}),
         preview: s.preview ? s.preview.slice(0, 200) : undefined,
         costUsd: s.usage?.cost_usd,
         contextTokens: s.usage?.last_context_tokens,

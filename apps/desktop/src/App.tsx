@@ -233,6 +233,32 @@ function PocketAppShell() {
   }, []);
 
   useEffect(() => {
+    const onOpenMobileFile = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ agentKey?: string; path?: string; title?: string }>).detail;
+      if (!detail?.agentKey || !detail.path) return;
+      const agentKey = detail.agentKey;
+      const path = detail.path;
+      const title = detail.title || path;
+      void import("./views/WorkbenchView").then((m) => {
+        m.openWorkbenchFileFromAgent(agentKey, path, title);
+        setWorkbenchAgent(agentKey);
+        setTab("workbench");
+      });
+    };
+    const onBackToAgent = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ agentKey?: string }>).detail;
+      if (detail?.agentKey) setSelectedAgent(detail.agentKey);
+      setTab("agents");
+    };
+    window.addEventListener("pocket:open-mobile-file", onOpenMobileFile);
+    window.addEventListener("pocket:workbench-back-to-agent", onBackToAgent);
+    return () => {
+      window.removeEventListener("pocket:open-mobile-file", onOpenMobileFile);
+      window.removeEventListener("pocket:workbench-back-to-agent", onBackToAgent);
+    };
+  }, []);
+
+  useEffect(() => {
     if (cmdOpen) setCmdIndex(0);
   }, [cmdOpen]);
 

@@ -122,7 +122,7 @@ function makeAgents(): Agent[] {
     }),
     ag(HOST_A, "t4f", "claude-code", "working", "桌宠动画改用 Rust 渲染", "桌面宠物 / 1", "/Users/me/code/desk-pet", 40_000, {
       sessionKey: "claude:demo-2", model: "claude-opus-5-5", turn: 20, costUsd: 0.92, contextTokens: 64_200, contextLimit: 1_000_000,
-      queued: 1, queuedText: "渲染完了顺便把帧率打到日志里", queuedSince: now() - 25_000,
+      queued: 1, queuedText: "渲染完了顺便把帧率打到日志里", queuedItems: ["渲染完了顺便把帧率打到日志里"], queuedSince: now() - 25_000,
     }),
     ag(HOST_A, "t4m", "omp", "working", "博客平台 登录鉴权重构", "博客平台 / 1", "/Users/me/code/blog-platform", 3 * MIN, { sessionKey: "omp:demo-3", model: "gpt-5.5", turn: 2 }),
     ag(HOST_A, "t4q", "omp", "done", "notes-cli 0.2.8 发布检查", "notes-cli / 1", "/Users/me/code/notes-cli", 25 * MIN, { sessionKey: "omp:demo-4", turn: 6 }),
@@ -533,12 +533,12 @@ function screen(agent: string | undefined) {
 }
 
 const LAUNCHERS = [
+  { id: "shell", label: "终端", takesTask: false },
   { id: "claude", label: "Claude Code", takesTask: true },
   { id: "codex", label: "Codex", takesTask: true },
   { id: "omp", label: "omp", takesTask: true },
   { id: "opencode", label: "OpenCode", takesTask: true },
   { id: "gemini", label: "Gemini", takesTask: true },
-  { id: "shell", label: "终端", takesTask: false },
 ];
 const DEMO_SPACES = [
   { id: "w1", name: "和弦本", folder: "~/code/chord-book", tabs: 1, terminals: 1 },

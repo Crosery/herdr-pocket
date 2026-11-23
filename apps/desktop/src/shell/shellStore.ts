@@ -103,6 +103,7 @@ export const FRAME_SECTION_OF: Record<SettingsSection, FrameSection> = {
 export type AgentPaneMode = "chat" | "term";
 
 interface TabSplitFields {
+  mountKey?: string;
   primaryPaneId?: string;
   split?: TabSplitState;
   docHostId?: string;
@@ -154,12 +155,49 @@ export interface AgentSpaceRef {
 }
 
 export const ALL_SPACES_KEY = "__all__";
+const MAX_SPACE_NAV_HISTORY = 64;
 
 const focusHistoryByTab = new Map<string, string[]>();
 
 function recordPaneFocus(tabId: string, paneId: string): void {
   const prev = focusHistoryByTab.get(tabId) ?? [];
   focusHistoryByTab.set(tabId, [...prev.filter((x) => x !== paneId), paneId]);
+}
+
+function pushSpaceNavHistory(
+  prevMap: Record<string, string[]> | undefined,
+  scopeKey: string,
+  fromTabId: string | null | undefined,
+  toTabId: string,
+): Record<string, string[]> {
+  const base = (prevMap?.[scopeKey] ?? []).filter((id) => id !== toTabId);
+  if (fromTabId && fromTabId !== toTabId) {
+    const withoutFrom = base.filter((id) => id !== fromTabId);
+    return {
+      ...(prevMap ?? {}),
+      [scopeKey]: [...withoutFrom, fromTabId, toTabId].slice(-MAX_SPACE_NAV_HISTORY),
+    };
+  }
+  return {
+    ...(prevMap ?? {}),
+    [scopeKey]: [...base, toTabId].slice(-MAX_SPACE_NAV_HISTORY),
+  };
+}
+
+function removeTabIdsFromNavHistory(
+  prevMap: Record<string, string[]> | undefined,
+  removedIds: ReadonlySet<string>,
+): Record<string, string[]> {
+  const next: Record<string, string[]> = {};
+  for (const [k, list] of Object.entries(prevMap ?? {})) {
+    const filtered: string[] = [];
+    for (const id of list) {
+      if (removedIds.has(id) || filtered[filtered.length - 1] === id) continue;
+      filtered.push(id);
+    }
+    if (filtered.length > 0) next[k] = filtered;
+  }
+  return next;
 }
 
 function spaceNameFromWhere(where?: string): string {
@@ -345,6 +383,10 @@ export interface ShellState {
   selectedSpace: string | null;
   /** Remembered active tab per space (`ALL_SPACES_KEY` for unfiltered view). */
   activeBySpace: Record<string, string | null>;
+  /** Per-space tab navigation history stack so closing a jumped-to file/image returns strictly one level back. */
+  navHistoryBySpace?: Record<string, string[]>;
+  /** Transient map from opened preview tab ID -> agent key shown in PeekOverlay before opening. */
+  peekReturnByTab?: Record<string, string>;
   /** The side panel's section, or null when the panel is hidden. */
   panel: PanelId | null;
   /** Remembered side panel section per space (`ALL_SPACES_KEY` for unfiltered view). */
@@ -365,10 +407,14 @@ export const PANEL_DEFAULT = 368;
 export const PANEL_MIN = 280;
 export const PANEL_MAX = 900;
 
-type PersistedShellState = Pick<ShellState, "tabs" | "active" | "selectedSpace" | "activeBySpace" | "panel" | "panelBySpace" | "panelWidth">;
+type PersistedShellState = Pick<
+  ShellState,
+  "tabs" | "active" | "selectedSpace" | "activeBySpace" | "navHistoryBySpace" | "panel" | "panelBySpace" | "panelWidth"
+>;
 
 function docFieldsOfTab(t: Partial<TabSplitFields>): Partial<TabSplitFields> {
   return {
+    ...(typeof t.mountKey === "string" && t.mountKey ? { mountKey: t.mountKey } : {}),
     ...(typeof t.docHostId === "string" && t.docHostId ? { docHostId: t.docHostId } : {}),
     ...(typeof t.docSpaceId === "string" && t.docSpaceId ? { docSpaceId: t.docSpaceId } : {}),
     ...(typeof t.docSpaceName === "string" ? { docSpaceName: t.docSpaceName } : {}),
@@ -426,6 +472,25 @@ function normalizePersistedShellState(rawInput: unknown): PersistedShellState | 
     raw.activeBySpace && typeof raw.activeBySpace === "object" && !Array.isArray(raw.activeBySpace)
       ? raw.activeBySpace
       : {};
+  const validTabIds = new Set(tabs.map((t) => t.id));
+  const navHistoryBySpace: Record<string, string[]> = {};
+  if (raw.navHistoryBySpace && typeof raw.navHistoryBySpace === "object" && !Array.isArray(raw.navHistoryBySpace)) {
+    for (const [k, v] of Object.entries(raw.navHistoryBySpace)) {
+      if (!Array.isArray(v)) continue;
+      const seen = new Set<string>();
+      const cleanedRev: string[] = [];
+      for (let idx = v.length - 1; idx >= 0; idx -= 1) {
+        const id = v[idx];
+        if (typeof id === "string" && validTabIds.has(id) && !seen.has(id)) {
+          seen.add(id);
+          cleanedRev.push(id);
+        }
+      }
+      if (cleanedRev.length > 0) {
+        navHistoryBySpace[k] = cleanedRev.reverse().slice(-MAX_SPACE_NAV_HISTORY);
+      }
+    }
+  }
   const panel =
     raw.panel === "files" || raw.panel === "git" || raw.panel === "browser" || raw.panel === "assistant"
       ? raw.panel
@@ -443,6 +508,7 @@ function normalizePersistedShellState(rawInput: unknown): PersistedShellState | 
     active: tabs.some((t) => t.id === raw.active) ? raw.active! : (tabs[0]?.id ?? null),
     selectedSpace: typeof raw.selectedSpace === "string" ? raw.selectedSpace : null,
     activeBySpace,
+    navHistoryBySpace,
     panel,
     panelBySpace,
     panelWidth: clampPanel(Number(raw.panelWidth) || PANEL_DEFAULT),
@@ -455,6 +521,7 @@ function pickPersistedShellState(s: ShellState): PersistedShellState {
     active: s.active,
     selectedSpace: s.selectedSpace,
     activeBySpace: s.activeBySpace,
+    navHistoryBySpace: s.navHistoryBySpace ?? {},
     panel: s.panel === "subagent" ? null : s.panel,
     panelBySpace: s.panelBySpace ?? {},
     panelWidth: s.panelWidth,
@@ -468,7 +535,16 @@ function load(): PersistedShellState {
   } catch {
     // Unreadable: start empty.
   }
-  return { tabs: [], active: null, selectedSpace: null, activeBySpace: {}, panel: null, panelBySpace: {}, panelWidth: PANEL_DEFAULT };
+  return {
+    tabs: [],
+    active: null,
+    selectedSpace: null,
+    activeBySpace: {},
+    navHistoryBySpace: {},
+    panel: null,
+    panelBySpace: {},
+    panelWidth: PANEL_DEFAULT,
+  };
 }
 
 export function clampPanel(px: number): number {
@@ -477,6 +553,7 @@ export function clampPanel(px: number): number {
 
 export const shellStore = createStore<ShellState>({
   ...load(),
+  peekReturnByTab: {},
   subagentAside: null,
   settings: null,
   palette: false,
@@ -667,12 +744,48 @@ function applyRootToTab(
   return { ...tab, ...docFields, split };
 }
 
+function activationTransition(
+  s: ShellState,
+  targetId: string,
+  targetSpace: string | null,
+  lookup: (k: string) => AgentSpaceRef | undefined,
+  spacesMap: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>,
+  opts?: { capturePeek?: boolean; baseActiveBySpace?: Record<string, string | null> },
+): Pick<ShellState, "active" | "activeBySpace" | "navHistoryBySpace" | "peek" | "peekReturnByTab"> {
+  const scopeKey = targetSpace ?? ALL_SPACES_KEY;
+  const activeMap = opts?.baseActiveBySpace ?? s.activeBySpace;
+  const prevDisplayed = activeTabIdForSpace(
+    { tabs: s.tabs, active: s.active, selectedSpace: targetSpace, activeBySpace: activeMap },
+    lookup,
+    spacesMap,
+  );
+  const navHistoryBySpace = pushSpaceNavHistory(s.navHistoryBySpace, scopeKey, prevDisplayed, targetId);
+  let peekReturnByTab = s.peekReturnByTab ?? {};
+  if (opts?.capturePeek && s.peek) {
+    peekReturnByTab = { ...peekReturnByTab, [targetId]: s.peek };
+  } else if (peekReturnByTab[targetId]) {
+    const next = { ...peekReturnByTab };
+    delete next[targetId];
+    peekReturnByTab = next;
+  }
+  return {
+    active: targetId,
+    activeBySpace: { ...activeMap, [scopeKey]: targetId },
+    navHistoryBySpace,
+    peek: null,
+    peekReturnByTab,
+  };
+}
+
 function focusTabAndLeaf(
   s: ShellState,
   tab: ShellTab,
   leafId: string,
-  scopeKey: string,
+  targetSpace: string | null,
+  lookup: (k: string) => AgentSpaceRef | undefined,
+  spacesMap: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>,
   updateLeaf?: (c: PaneContent) => PaneContent,
+  opts?: { capturePeek?: boolean; baseActiveBySpace?: Record<string, string | null> },
 ): ShellState {
   recordPaneFocus(tab.id, leafId);
   const nextTabs = s.tabs.map((t) => {
@@ -684,9 +797,7 @@ function focusTabAndLeaf(
   return {
     ...s,
     tabs: nextTabs,
-    active: tab.id,
-    activeBySpace: { ...s.activeBySpace, [scopeKey]: tab.id },
-    peek: null,
+    ...activationTransition(s, tab.id, targetSpace, lookup, spacesMap, opts),
   };
 }
 
@@ -722,20 +833,37 @@ export function openAgentTab(
     lookupAgent?: (key: string) => AgentSpaceRef | undefined;
     spacesMap?: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>;
     followSpace?: boolean;
+    docMeta?: {
+      docHostId: string;
+      docSpaceId?: string;
+      docSpaceName?: string;
+      docTabId?: string;
+    };
   },
 ): void {
   const s = shellStore.get();
   const lookup = opts?.lookupAgent ?? makeLiveAgentLookup();
   const spacesMap = opts?.spacesMap ?? liveStore.get().spaces;
   const agent = lookup(agentKey);
-  const hit = findTabWithLeaf(s.tabs, (c) => c.kind === "agent" && c.agentKey === agentKey);
+  const docCanonicalId =
+    opts?.docMeta?.docHostId && opts.docMeta.docSpaceId && opts.docMeta.docTabId
+      ? syncedHerdrTabId(opts.docMeta.docHostId, opts.docMeta.docSpaceId, opts.docMeta.docTabId)
+      : null;
+  const hit =
+    findTabWithLeaf(s.tabs, (c) => c.kind === "agent" && c.agentKey === agentKey) ??
+    (docCanonicalId ? findTabWithLeaf(s.tabs, (c) => c.kind === "agent" && s.tabs.some((t) => t.id === docCanonicalId && tabLeaves(t).some((l) => l.content === c))) : null);
 
   let nextSpace = s.selectedSpace;
   if (opts?.followSpace !== false) {
     const hitSpace = hit ? tabSpaceKey(hit.tab, lookup, spacesMap) : null;
-    const agentSpace = agent ? resolveAgentSpaceKey(agent, spacesMap) : null;
+    const docMetaSpace =
+      opts?.docMeta?.docHostId && opts.docMeta.docSpaceName !== undefined
+        ? `${opts.docMeta.docHostId}\u0000${opts.docMeta.docSpaceName}`
+        : null;
+    const resolvedAgentSpace = agent ? resolveAgentSpaceKey(agent, spacesMap) : null;
     if (hasNonEmptySpaceName(hitSpace)) nextSpace = hitSpace;
-    else if (hasNonEmptySpaceName(agentSpace)) nextSpace = agentSpace;
+    else if (hasNonEmptySpaceName(docMetaSpace)) nextSpace = docMetaSpace;
+    else if (hasNonEmptySpaceName(resolvedAgentSpace)) nextSpace = resolvedAgentSpace;
   }
 
   let activeBySpace = s.activeBySpace;
@@ -745,29 +873,44 @@ export function openAgentTab(
     const prevActive = s.active && prevVisible.some((t) => t.id === s.active) ? s.active : prevVisible[0]?.id ?? null;
     activeBySpace = { ...s.activeBySpace, [prevScope]: prevActive };
   }
-  const nextScope = nextSpace ?? ALL_SPACES_KEY;
   const panelPatch = spacePanelTransition(s, nextSpace);
 
   if (hit) {
     const nextState = focusTabAndLeaf(
-      { ...s, selectedSpace: nextSpace, activeBySpace },
+      s,
       hit.tab,
       hit.leaf.id,
-      nextScope,
+      nextSpace,
+      lookup,
+      spacesMap,
       mode && hit.leaf.content.kind === "agent" && hit.leaf.content.mode !== mode
         ? (c) => (c.kind === "agent" ? { ...c, mode } : c)
         : undefined,
+      { baseActiveBySpace: activeBySpace },
     );
     set({ ...nextState, selectedSpace: nextSpace, ...panelPatch });
     return;
   }
-  const tab: AgentTab = { id: `a:${agentKey}`, kind: "agent", agentKey, ...(mode ? { mode } : {}) };
+
+  const docFields: Partial<TabSplitFields> = opts?.docMeta?.docHostId
+    ? {
+        docHostId: opts.docMeta.docHostId,
+        ...(opts.docMeta.docSpaceId ? { docSpaceId: opts.docMeta.docSpaceId } : {}),
+        ...(opts.docMeta.docSpaceName !== undefined ? { docSpaceName: opts.docMeta.docSpaceName } : {}),
+        ...(opts.docMeta.docTabId ? { docTabId: opts.docMeta.docTabId } : {}),
+      }
+    : {};
+  const tab: AgentTab = {
+    id: docCanonicalId ?? `a:${agentKey}`,
+    kind: "agent",
+    agentKey,
+    ...(mode ? { mode } : {}),
+    ...docFields,
+  };
   set({
     tabs: [...s.tabs, tab],
     selectedSpace: nextSpace,
-    active: tab.id,
-    activeBySpace: { ...activeBySpace, [nextScope]: tab.id },
-    peek: null,
+    ...activationTransition(s, tab.id, nextSpace, lookup, spacesMap, { baseActiveBySpace: activeBySpace }),
     ...panelPatch,
   });
 }
@@ -799,13 +942,14 @@ export function openFileTab(
 ): void {
   const s = shellStore.get();
   const id = `f:${agentKey}:${path}`;
-  const agentSpaceRef = opts?.spaceKey === undefined ? makeLiveAgentLookup()(agentKey) : undefined;
-  const resolvedAgentSpace = agentSpaceRef ? resolveAgentSpaceKey(agentSpaceRef, liveStore.get().spaces) : null;
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
+  const agentSpaceRef = opts?.spaceKey === undefined ? lookup(agentKey) : undefined;
+  const resolvedAgentSpace = agentSpaceRef ? resolveAgentSpaceKey(agentSpaceRef, spacesMap) : null;
   const scope =
     opts?.spaceKey !== undefined
       ? opts.spaceKey
       : (s.selectedSpace ?? (hasNonEmptySpaceName(resolvedAgentSpace) ? resolvedAgentSpace : null));
-  const scopeMapKey = scope ?? ALL_SPACES_KEY;
   const patch = {
     ...(opts?.absPath ? { absPath: opts.absPath } : {}),
     ...(opts?.line !== undefined ? { line: opts.line } : {}),
@@ -819,16 +963,18 @@ export function openFileTab(
         s,
         hit.tab,
         hit.leaf.id,
-        scopeMapKey,
+        scope,
+        lookup,
+        spacesMap,
         Object.keys(patch).length ? (c) => (c.kind === "file" ? { ...c, ...patch } : c) : undefined,
+        { capturePeek: true },
       ),
     );
     return;
   }
   set({
     tabs: [...s.tabs, { id, kind: "file", agentKey, path, title, ...patch }],
-    active: id,
-    activeBySpace: { ...s.activeBySpace, [scopeMapKey]: id },
+    ...activationTransition(s, id, scope, lookup, spacesMap, { capturePeek: true }),
   });
 }
 
@@ -920,13 +1066,14 @@ export function openDiffTab(opts: {
 }): void {
   const s = shellStore.get();
   const id = `d:${opts.deviceId}:${opts.cwd}:${opts.commit ? opts.commit : opts.staged ? "staged" : "work"}:${opts.path}`;
-  const diffAgentRef = opts.spaceKey === undefined && opts.agentKey ? makeLiveAgentLookup()(opts.agentKey) : undefined;
-  const resolvedAgentSpace = diffAgentRef ? resolveAgentSpaceKey(diffAgentRef, liveStore.get().spaces) : null;
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
+  const diffAgentRef = opts.spaceKey === undefined && opts.agentKey ? lookup(opts.agentKey) : undefined;
+  const resolvedAgentSpace = diffAgentRef ? resolveAgentSpaceKey(diffAgentRef, spacesMap) : null;
   const scope =
     opts.spaceKey !== undefined
       ? opts.spaceKey
       : (s.selectedSpace ?? (hasNonEmptySpaceName(resolvedAgentSpace) ? resolvedAgentSpace : null));
-  const scopeMapKey = scope ?? ALL_SPACES_KEY;
   const title = opts.path.split(/[\\/]/).pop() || opts.path;
   const hit = findTabWithLeaf(
     s.tabs,
@@ -939,7 +1086,7 @@ export function openDiffTab(opts: {
       (c.commit ?? "") === (opts.commit ?? ""),
   );
   if (hit) {
-    set(focusTabAndLeaf(s, hit.tab, hit.leaf.id, scopeMapKey));
+    set(focusTabAndLeaf(s, hit.tab, hit.leaf.id, scope, lookup, spacesMap, undefined, { capturePeek: true }));
     return;
   }
   const tab: DiffTab = {
@@ -956,16 +1103,16 @@ export function openDiffTab(opts: {
   };
   set({
     tabs: [...s.tabs, tab],
-    active: id,
-    activeBySpace: { ...s.activeBySpace, [scopeMapKey]: id },
+    ...activationTransition(s, id, scope, lookup, spacesMap, { capturePeek: true }),
   });
 }
 
 export function openWebTab(url: string, title?: string, opts?: { spaceKey?: string | null; insertBeforeId?: string }): void {
   const s = shellStore.get();
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
   const id = `w:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
   const spaceKey = opts?.spaceKey !== undefined ? opts.spaceKey : s.selectedSpace;
-  const scopeKey = spaceKey ?? ALL_SPACES_KEY;
   const nextTab: WebTab = { id, kind: "web", url, title: title || url || "新网页", ...(spaceKey ? { spaceKey } : {}) };
   let tabs = [...s.tabs, nextTab];
   if (opts?.insertBeforeId) {
@@ -974,7 +1121,10 @@ export function openWebTab(url: string, title?: string, opts?: { spaceKey?: stri
       tabs = [...s.tabs.slice(0, idx), nextTab, ...s.tabs.slice(idx)];
     }
   }
-  set({ tabs, active: id, activeBySpace: { ...s.activeBySpace, [scopeKey]: id } });
+  set({
+    tabs,
+    ...activationTransition(s, id, spaceKey, lookup, spacesMap, { capturePeek: true }),
+  });
 }
 
 export function updateWebTab(id: string, patch: Partial<Pick<WebTab, "url" | "title">>): void {
@@ -1003,19 +1153,85 @@ export function closeTab(id: string): void {
   const s = shellStore.get();
   const i = s.tabs.findIndex((t) => t.id === id);
   if (i < 0) return;
-  const tabs = s.tabs.filter((t) => t.id !== id);
+
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
   const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
-  const active = s.active === id ? (tabs[i]?.id ?? tabs[i - 1]?.id ?? null) : s.active;
+  const curDisplayed = activeTabIdForSpace(s, lookup, spacesMap);
+  const wasDisplayed = curDisplayed === id || s.active === id;
+
+  const visibleBefore = visibleTabsForSpace(s.tabs, s.selectedSpace, lookup, spacesMap);
+  const tabs = s.tabs.filter((t) => t.id !== id);
+  const visibleAfter = visibleTabsForSpace(tabs, s.selectedSpace, lookup, spacesMap);
+  const nextNavHistory = removeTabIdsFromNavHistory(s.navHistoryBySpace, new Set([id]));
+
+  let nextActive: string | null;
+  if (!wasDisplayed) {
+    nextActive =
+      (s.active && visibleAfter.some((t) => t.id === s.active) ? s.active : null) ??
+      (curDisplayed && visibleAfter.some((t) => t.id === curDisplayed) ? curDisplayed : null) ??
+      visibleAfter[0]?.id ??
+      null;
+  } else {
+    const visibleAfterSet = new Set(visibleAfter.map((t) => t.id));
+    let fromHist: string | null = null;
+    const scopeHist = nextNavHistory[scopeKey] ?? [];
+    for (let k = scopeHist.length - 1; k >= 0; k -= 1) {
+      const candidate = scopeHist[k]!;
+      if (visibleAfterSet.has(candidate)) {
+        fromHist = candidate;
+        break;
+      }
+    }
+    if (fromHist) {
+      nextActive = fromHist;
+    } else {
+      const visIdx = visibleBefore.findIndex((t) => t.id === id);
+      const fallbackIdx = visIdx >= 0 ? Math.min(visIdx, visibleAfter.length - 1) : 0;
+      nextActive = visibleAfter[fallbackIdx]?.id ?? null;
+    }
+  }
+
+  const nextBySpace: Record<string, string | null> = {};
+  for (const [k, v] of Object.entries(s.activeBySpace)) {
+    if (v !== id) {
+      nextBySpace[k] = v;
+      continue;
+    }
+    const targetSpace = k === ALL_SPACES_KEY ? null : k;
+    const spVis = visibleTabsForSpace(tabs, targetSpace, lookup, spacesMap);
+    const spVisSet = new Set(spVis.map((t) => t.id));
+    const spHist = nextNavHistory[k] ?? [];
+    let spPick: string | null = null;
+    for (let m = spHist.length - 1; m >= 0; m -= 1) {
+      if (spVisSet.has(spHist[m]!)) {
+        spPick = spHist[m]!;
+        break;
+      }
+    }
+    nextBySpace[k] = spPick ?? spVis[0]?.id ?? null;
+  }
+  nextBySpace[scopeKey] = nextActive;
+
+  const restorePeek = wasDisplayed ? s.peekReturnByTab?.[id] : undefined;
+  const nextPeekReturn = { ...(s.peekReturnByTab ?? {}) };
+  delete nextPeekReturn[id];
+
   set({
     tabs,
-    active,
-    activeBySpace: { ...s.activeBySpace, [scopeKey]: active },
+    active: nextActive,
+    activeBySpace: nextBySpace,
+    navHistoryBySpace: nextNavHistory,
+    peekReturnByTab: nextPeekReturn,
+    ...(restorePeek ? { peek: restorePeek } : {}),
   });
 }
 
 // Split-pane actions (Herdr parity) ------------------------------------------------
 
 export function focusTabPane(tabId: string, paneId: string): void {
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
   set((s) => {
     const tab = s.tabs.find((t) => t.id === tabId);
     if (!tab) return s;
@@ -1025,18 +1241,20 @@ export function focusTabPane(tabId: string, paneId: string): void {
     if (s.active === tabId && (!tab.split || (tab.split.focusedPaneId === paneId && !tab.split.zoomedPaneId))) {
       return s;
     }
-    const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
     const nextTabs = s.tabs.map((t) => {
       if (t.id !== tabId) return t;
       const root = tabRootNode(t);
       const keepZoom = t.split?.zoomedPaneId === paneId ? paneId : null;
       return applyRootToTab(t, root, paneId, keepZoom);
     });
+    const navPatch =
+      s.active !== tabId
+        ? activationTransition(s, tabId, s.selectedSpace, lookup, spacesMap)
+        : { active: tabId, activeBySpace: { ...s.activeBySpace, [s.selectedSpace ?? ALL_SPACES_KEY]: tabId } };
     return {
       ...s,
       tabs: nextTabs,
-      active: tabId,
-      activeBySpace: { ...s.activeBySpace, [scopeKey]: tabId },
+      ...navPatch,
     };
   });
 }
@@ -1075,6 +1293,8 @@ export function splitTabPane(
 ): string | null {
   const newPaneId = opts?.newPaneId?.trim() || makeSplitId("p");
   let inserted = false;
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
   set((s) => {
     const tab = s.tabs.find((t) => t.id === tabId);
     if (!tab) return s;
@@ -1095,6 +1315,7 @@ export function splitTabPane(
     const targetHost = tab.docHostId || agentHost;
     const canDedupeOnHost = Boolean(dedupeKey && agentHost && targetHost === agentHost);
     const nextTabs: ShellTab[] = [];
+    const removedIds = new Set<string>();
     for (const t of s.tabs) {
       if (t.id === tabId) {
         nextTabs.push(applyRootToTab(t, nextRoot, newPaneId, null));
@@ -1103,17 +1324,28 @@ export function splitTabPane(
       if (canDedupeOnHost && dedupeKey && (!t.docHostId || t.docHostId === targetHost)) {
         const pruned = pruneAgentFromTab(t, dedupeKey);
         if (pruned) nextTabs.push(pruned);
+        else removedIds.add(t.id);
         continue;
       }
       nextTabs.push(t);
     }
-    const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
+    const baseState = removedIds.size
+      ? { ...s, navHistoryBySpace: removeTabIdsFromNavHistory(s.navHistoryBySpace, removedIds) }
+      : s;
+    const navPatch =
+      s.active !== tabId
+        ? activationTransition(baseState, tabId, s.selectedSpace, lookup, spacesMap)
+        : {
+            active: tabId,
+            activeBySpace: { ...s.activeBySpace, [s.selectedSpace ?? ALL_SPACES_KEY]: tabId },
+            navHistoryBySpace: baseState.navHistoryBySpace,
+            peek: null as string | null,
+            peekReturnByTab: s.peekReturnByTab ?? {},
+          };
     return {
-      ...s,
+      ...baseState,
       tabs: nextTabs,
-      active: tabId,
-      activeBySpace: { ...s.activeBySpace, [scopeKey]: tabId },
-      peek: null,
+      ...navPatch,
     };
   });
   return inserted ? newPaneId : null;
@@ -1122,8 +1354,8 @@ export function splitTabPane(
 export function splitActivePaneWithContent(direction: SplitDirection, content: PaneContent): void {
   const s = shellStore.get();
   const lookup = makeLiveAgentLookup();
-  const activeId = activeTabIdForSpace(s, lookup, liveStore.get().spaces) ?? s.active;
-  const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
+  const spacesMap = liveStore.get().spaces;
+  const activeId = activeTabIdForSpace(s, lookup, spacesMap) ?? s.active;
   if (activeId && s.tabs.some((t) => t.id === activeId)) {
     splitTabPane(activeId, null, direction, content, { dedupeOtherTabs: content.kind === "agent" });
     return;
@@ -1134,9 +1366,7 @@ export function splitActivePaneWithContent(direction: SplitDirection, content: P
   set({
     ...s,
     tabs: [...s.tabs, nextTab],
-    active: id,
-    activeBySpace: { ...s.activeBySpace, [scopeKey]: id },
-    peek: null,
+    ...activationTransition(s, id, s.selectedSpace, lookup, spacesMap),
   });
 }
 
@@ -1300,6 +1530,8 @@ export function detachPaneToTab(
   opts?: { insertBeforeTabId?: string },
 ): string | null {
   let createdId: string | null = null;
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
   set((s) => {
     const tab = s.tabs.find((t) => t.id === tabId);
     if (!tab) return s;
@@ -1334,12 +1566,10 @@ export function detachPaneToTab(
       : tabIdx + 1;
     const bounded = insertIdx >= 0 ? insertIdx : updated.length;
     const nextTabs = [...updated.slice(0, bounded), newTab, ...updated.slice(bounded)];
-    const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
     return {
       ...s,
       tabs: nextTabs,
-      active: newId,
-      activeBySpace: { ...s.activeBySpace, [scopeKey]: newId },
+      ...activationTransition(s, newId, s.selectedSpace, lookup, spacesMap),
     };
   });
   return createdId;
@@ -1394,6 +1624,8 @@ export function mergeTabIntoSplit(
   direction: SplitDirection,
 ): void {
   if (fromTabId === toTabId) return;
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
   set((s) => {
     const fromTab = s.tabs.find((t) => t.id === fromTabId);
     const toTab = s.tabs.find((t) => t.id === toTabId);
@@ -1409,11 +1641,15 @@ export function mergeTabIntoSplit(
     recordPaneFocus(toTabId, insertLeaf.id);
 
     const nextTabs: ShellTab[] = [];
+    const removedIds = new Set<string>();
     for (const t of s.tabs) {
       if (t.id === fromTabId) {
         if (fromLeaves.length > 1) {
           const remainRoot = removeSplitLeaf(tabRootNode(t), insertLeaf.id);
           if (remainRoot) nextTabs.push(applyRootToTab(t, remainRoot));
+          else removedIds.add(t.id);
+        } else {
+          removedIds.add(t.id);
         }
         continue;
       }
@@ -1423,12 +1659,13 @@ export function mergeTabIntoSplit(
       }
       nextTabs.push(t);
     }
-    const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
+    const baseState = removedIds.size
+      ? { ...s, navHistoryBySpace: removeTabIdsFromNavHistory(s.navHistoryBySpace, removedIds) }
+      : s;
     return {
-      ...s,
+      ...baseState,
       tabs: nextTabs,
-      active: toTabId,
-      activeBySpace: { ...s.activeBySpace, [scopeKey]: toTabId },
+      ...activationTransition(baseState, toTabId, s.selectedSpace, lookup, spacesMap),
     };
   });
 }
@@ -1439,15 +1676,34 @@ export function closeTabsForSpace(
   lookupAgent: (agentKey: string) => AgentSpaceRef | undefined,
 ): void {
   set((s) => {
-    const tabs = s.tabs.filter((t) => tabSpaceKey(t, lookupAgent) !== spaceKey);
+    const removedIds = new Set<string>();
+    const tabs = s.tabs.filter((t) => {
+      if (tabSpaceKey(t, lookupAgent) === spaceKey) {
+        removedIds.add(t.id);
+        return false;
+      }
+      return true;
+    });
     const selectedSpace = s.selectedSpace === spaceKey ? null : s.selectedSpace;
     const nextBySpace = { ...s.activeBySpace };
     delete nextBySpace[spaceKey];
+    const nextNavHistory = removeTabIdsFromNavHistory(s.navHistoryBySpace, removedIds);
+    delete nextNavHistory[spaceKey];
+    const nextPeekReturn = { ...(s.peekReturnByTab ?? {}) };
+    for (const rid of removedIds) delete nextPeekReturn[rid];
     const activeStillThere = s.active && tabs.some((t) => t.id === s.active);
     const active = activeStillThere
       ? s.active
       : activeTabIdForSpace({ tabs, active: null, selectedSpace, activeBySpace: nextBySpace }, lookupAgent);
-    return { ...s, tabs, active, selectedSpace, activeBySpace: nextBySpace };
+    return {
+      ...s,
+      tabs,
+      active,
+      selectedSpace,
+      activeBySpace: nextBySpace,
+      navHistoryBySpace: nextNavHistory,
+      peekReturnByTab: nextPeekReturn,
+    };
   });
 }
 
@@ -1465,13 +1721,11 @@ export function setActiveTab(id: string): void {
       const prevActive = s.active && prevVisible.some((t) => t.id === s.active) ? s.active : prevVisible[0]?.id ?? null;
       nextBySpace = { ...s.activeBySpace, [prevScope]: prevActive };
     }
-    const scopeKey = nextSpace ?? ALL_SPACES_KEY;
     const panelPatch = spacePanelTransition(s, nextSpace);
     return {
       ...s,
       selectedSpace: nextSpace,
-      active: id,
-      activeBySpace: { ...nextBySpace, [scopeKey]: id },
+      ...activationTransition(s, id, nextSpace, lookup, spacesMap, { baseActiveBySpace: nextBySpace }),
       ...panelPatch,
     };
   });
@@ -1484,8 +1738,9 @@ export function cycleTab(step: 1 | -1, visibleTabs?: ShellTab[]): void {
   if (!list.length) return;
   const i = Math.max(0, list.findIndex((t) => t.id === s.active));
   const nextId = list[(i + step + list.length) % list.length]!.id;
-  const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
-  set({ active: nextId, activeBySpace: { ...s.activeBySpace, [scopeKey]: nextId } });
+  set({
+    ...activationTransition(s, nextId, s.selectedSpace, makeLiveAgentLookup(), liveStore.get().spaces),
+  });
 }
 
 /** Shows the panel at `id`, or hides it when `id` is already showing. */
@@ -1577,6 +1832,7 @@ function resolveDocSpaceName(
   convertedLeaves: readonly SplitLeafNode[],
   lookupAgent: (agentKey: string) => AgentSpaceRef | undefined,
   hostSpaces?: readonly Pick<SpaceInfo, "id" | "name" | "folder">[],
+  prevSpaceName?: string,
 ): string {
   const direct = space.name?.trim();
   if (direct) return direct;
@@ -1589,7 +1845,108 @@ function resolveDocSpaceName(
     if (sp) return sp;
   }
   const base = (space.folder ?? "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop()?.trim();
-  return base || "";
+  return base || prevSpaceName?.trim() || "";
+}
+
+/**
+ * Updates `docSpaceName`, `selectedSpace`, and per-space state maps cleanly when a Space is renamed.
+ */
+export function renameSpaceInShellStore(
+  hostId: string,
+  spaceId: string | undefined,
+  oldName: string,
+  newName: string,
+): void {
+  const cleanHost = hostId.trim();
+  const cleanOld = oldName.trim();
+  const cleanNew = newName.trim();
+  if (!cleanHost || !cleanNew) return;
+  const oldKey = `${cleanHost}\u0000${cleanOld}`;
+  const newKey = `${cleanHost}\u0000${cleanNew}`;
+  set((s) => {
+    let changed = false;
+    const updateLeafSpaceKey = (node: SplitNode): { node: SplitNode; touched: boolean } => {
+      if (node.type === "leaf") {
+        if (node.content.kind !== "agent" && node.content.spaceKey === oldKey && oldKey !== newKey) {
+          return { node: { ...node, content: { ...node.content, spaceKey: newKey } }, touched: true };
+        }
+        return { node, touched: false };
+      }
+      let anyTouched = false;
+      const children = node.children.map((ch) => {
+        const res = updateLeafSpaceKey(ch);
+        if (res.touched) anyTouched = true;
+        return res.node;
+      });
+      return anyTouched ? { node: { ...node, children }, touched: true } : { node, touched: false };
+    };
+
+    const nextTabs = s.tabs.map((t) => {
+      let next = t;
+      let tabTouched = false;
+      const matchesDocSpace =
+        Boolean(spaceId && t.docHostId === cleanHost && t.docSpaceId === spaceId) ||
+        Boolean(t.docHostId === cleanHost && t.docSpaceName === cleanOld);
+      if (matchesDocSpace && next.docSpaceName !== cleanNew) {
+        next = { ...next, docSpaceName: cleanNew };
+        tabTouched = true;
+      }
+      if (oldKey !== newKey) {
+        if (next.kind !== "agent" && next.spaceKey === oldKey) {
+          next = { ...next, spaceKey: newKey };
+          tabTouched = true;
+        }
+        if (next.split) {
+          const walked = updateLeafSpaceKey(next.split.root);
+          if (walked.touched) {
+            next = { ...next, split: { ...next.split, root: walked.node } };
+            tabTouched = true;
+          }
+        }
+      }
+      if (tabTouched) changed = true;
+      return next;
+    });
+
+    let selectedSpace = s.selectedSpace;
+    let activeBySpace = s.activeBySpace;
+    let panelBySpace = s.panelBySpace;
+    let navHistoryBySpace = s.navHistoryBySpace;
+
+    if (cleanOld && oldKey !== newKey) {
+      if (s.selectedSpace === oldKey) {
+        selectedSpace = newKey;
+        changed = true;
+      }
+      if (Object.hasOwn(s.activeBySpace, oldKey)) {
+        activeBySpace = { ...s.activeBySpace, [newKey]: s.activeBySpace[oldKey] ?? null };
+        delete activeBySpace[oldKey];
+        changed = true;
+      }
+      if (s.panelBySpace && Object.hasOwn(s.panelBySpace, oldKey)) {
+        panelBySpace = { ...s.panelBySpace, [newKey]: s.panelBySpace[oldKey] ?? null };
+        delete panelBySpace[oldKey];
+        changed = true;
+      }
+      if (s.navHistoryBySpace && Object.hasOwn(s.navHistoryBySpace, oldKey)) {
+        const merged = [...(s.navHistoryBySpace[newKey] ?? []), ...s.navHistoryBySpace[oldKey]!];
+        navHistoryBySpace = { ...s.navHistoryBySpace, [newKey]: merged.slice(-MAX_SPACE_NAV_HISTORY) };
+        delete navHistoryBySpace[oldKey];
+        changed = true;
+      }
+    }
+
+    return changed
+      ? {
+          ...s,
+          tabs: nextTabs,
+          selectedSpace,
+          activeBySpace,
+          ...(panelBySpace ? { panelBySpace } : {}),
+          ...(navHistoryBySpace ? { navHistoryBySpace } : {}),
+        }
+      : s;
+  });
 }
 
 /**
@@ -1654,28 +2011,35 @@ export function reconcileHostHerdrDoc(
         if (!converted) continue;
 
         const convertedLeaves = listLeaves(converted);
-        const resolvedSpaceName = resolveDocSpaceName(space, convertedLeaves, lookupAgent, hostSpaces);
-        const docFields: TabSplitFields = {
-          docHostId: hostId,
-          docSpaceId: space.id,
-          docSpaceName: resolvedSpaceName,
-          docTabId: docTab.id,
-          docTabName: docTab.name ?? "",
-        };
+        const resolvedSpaceName = resolveDocSpaceName(space, convertedLeaves, lookupAgent, hostSpaces, prev?.docSpaceName);
 
         let absorbedFocusLeafId: string | null = null;
+        let absorbedMountKey: string | undefined;
         for (const leaf of convertedLeaves) {
           if (leaf.content.kind !== "agent") continue;
           const standalone = standaloneByAgentKey.get(leaf.content.agentKey);
           if (standalone) {
             absorbedStandaloneIds.add(standalone.id);
             idRemap.set(standalone.id, canonicalId);
+            absorbedMountKey = absorbedMountKey ?? standalone.mountKey ?? standalone.id;
             if (s.active === standalone.id) absorbedFocusLeafId = leaf.id;
             if (!prev && standalone.kind === "agent" && standalone.mode) {
               leaf.content = { ...leaf.content, mode: standalone.mode };
             }
           }
         }
+        const resolvedMountKey =
+          prev?.mountKey ??
+          (prev && prev.id !== canonicalId ? prev.id : undefined) ??
+          absorbedMountKey;
+        const docFields: TabSplitFields = {
+          ...(resolvedMountKey && resolvedMountKey !== canonicalId ? { mountKey: resolvedMountKey } : {}),
+          docHostId: hostId,
+          docSpaceId: space.id,
+          docSpaceName: resolvedSpaceName,
+          docTabId: docTab.id,
+          docTabName: docTab.name ?? "",
+        };
 
         // Preserve mixed Pocket-only panes (`file`/`diff`/`web`) inside this tab if the hc skeleton hasn't changed.
         if (prev) {
@@ -1751,13 +2115,45 @@ export function reconcileHostHerdrDoc(
       return nextTabs.some((t) => t.id === mapped) ? mapped : null;
     };
 
-    const nextActive = remapId(s.active) ?? nextTabs[0]?.id ?? null;
+    const mergedSpacesMap = hostSpaces
+      ? { ...liveStore.get().spaces, [hostId]: hostSpaces }
+      : liveStore.get().spaces;
+    const visibleNext = visibleTabsForSpace(nextTabs, s.selectedSpace, lookupAgent, mergedSpacesMap);
+    const remappedActive = remapId(s.active);
+    const nextActive =
+      (remappedActive && (!s.selectedSpace || visibleNext.some((t) => t.id === remappedActive))
+        ? remappedActive
+        : null) ??
+      visibleNext[0]?.id ??
+      null;
     const nextBySpace: Record<string, string | null> = {};
     for (const [k, v] of Object.entries(s.activeBySpace)) {
       nextBySpace[k] = remapId(v);
     }
+    const nextNavHistory: Record<string, string[]> = {};
+    for (const [k, list] of Object.entries(s.navHistoryBySpace ?? {})) {
+      const mappedList: string[] = [];
+      for (const rawId of list) {
+        const mapped = remapId(rawId);
+        if (mapped && mappedList[mappedList.length - 1] !== mapped) {
+          mappedList.push(mapped);
+        }
+      }
+      if (mappedList.length > 0) nextNavHistory[k] = mappedList.slice(-MAX_SPACE_NAV_HISTORY);
+    }
+    const nextPeekReturn: Record<string, string> = {};
+    for (const [tabId, agentKey] of Object.entries(s.peekReturnByTab ?? {})) {
+      const mapped = remapId(tabId);
+      if (mapped) nextPeekReturn[mapped] = agentKey;
+    }
 
-    if (JSON.stringify(nextTabs) === JSON.stringify(s.tabs) && nextActive === s.active) {
+    if (
+      JSON.stringify(nextTabs) === JSON.stringify(s.tabs) &&
+      nextActive === s.active &&
+      JSON.stringify(nextBySpace) === JSON.stringify(s.activeBySpace) &&
+      JSON.stringify(nextNavHistory) === JSON.stringify(s.navHistoryBySpace ?? {}) &&
+      JSON.stringify(nextPeekReturn) === JSON.stringify(s.peekReturnByTab ?? {})
+    ) {
       return s;
     }
 
@@ -1766,10 +2162,34 @@ export function reconcileHostHerdrDoc(
       tabs: nextTabs,
       active: nextActive,
       activeBySpace: nextBySpace,
+      navHistoryBySpace: nextNavHistory,
+      peekReturnByTab: nextPeekReturn,
     };
   });
 }
 
 function makeFallbackAgentKey(hostId: string, docTabId: string): string {
   return `${hostId}/hc:${docTabId}`;
+}
+
+/**
+ * Produces stable React keys per leaf content identity so converting `1 pane <-> N panes`
+ * or `p0:...` placeholder IDs into synced Herdr block IDs never unmounts running terminals.
+ */
+export function stableSplitLeafKeys(leaves: readonly SplitLeafNode[]): string[] {
+  const seen = new Map<string, number>();
+  return leaves.map((leaf) => {
+    const c = leaf.content;
+    const base =
+      c.kind === "agent"
+        ? `agent:${c.agentKey}`
+        : c.kind === "web"
+          ? `web:${c.webId}`
+          : c.kind === "file"
+            ? `file:${c.agentKey}:${c.path}`
+            : `diff:${c.deviceId}:${c.cwd}:${c.commit || (c.staged ? "staged" : "work")}:${c.path}`;
+    const occ = seen.get(base) ?? 0;
+    seen.set(base, occ + 1);
+    return occ === 0 ? base : `${base}#${occ}`;
+  });
 }

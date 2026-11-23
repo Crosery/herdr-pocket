@@ -1,20 +1,21 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, ChevronRight, Columns2, History, Laptop, PanelLeft, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Columns2, History, Laptop, PanelLeft, Pencil, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Terminal, Trash2 } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
-import { PocketButton, PocketModal, overlayStore, useToast } from "../components/PocketUI";
+import { PocketButton, PocketInput, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { serverLabel } from "../components/Sidebar";
 import { assetUrl } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
 import { pingRelay, refreshHostSpaces, rpcCall } from "../lib/relay";
-import { allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
+import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
 import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
 import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, tileLetter, toneIndex, type ListGroup } from "./agentInfo";
-import { closeTabsForSpace, focusedLeafOfTab, openAgentTab, openSettingsFrame, setPalette, setSelectedSpace, shellStore, splitActivePaneWithContent, tabLeaves } from "./shellStore";
+import { pullHostDocNow } from "./herdrDocSync";
+import { activeTabIdForSpace, closeTabsForSpace, focusedLeafOfTab, openAgentTab, openSettingsFrame, renameSpaceInShellStore, setPalette, setSelectedSpace, shellStore, splitActivePaneWithContent, tabLeaves } from "./shellStore";
 import { shortcutText } from "./shortcuts";
 import { buildHostSpaces, spaceColorVars, type SidebarSpace } from "./spaceSync";
 
@@ -53,6 +54,8 @@ export function ShellSidebar({
   onConnectRelay,
   onPairPhone,
   onNewAgent,
+  onNewSpace,
+  onNewTerminal,
 }: {
   collapsed: boolean;
   canToggle: boolean;
@@ -60,6 +63,8 @@ export function ShellSidebar({
   onConnectRelay: () => void;
   onPairPhone: () => void;
   onNewAgent: (host: string | null, space: string | null) => void;
+  onNewSpace: (host: string | null) => void;
+  onNewTerminal: (host: string | null, space: string | null) => void;
 }) {
   const agentsMap = liveStore.use((s) => s.agents);
   const devices = liveStore.use((s) => s.devices);
@@ -68,7 +73,19 @@ export function ShellSidebar({
   const server = settingsStore.use((s) => s.server);
   const showShells = settingsStore.use((s) => s.showShells);
   const localHostId = useLocalHostDeviceId();
-  const activeTab = shellStore.use((s) => s.tabs.find((t) => t.id === s.active) ?? null);
+  const tabs = shellStore.use((s) => s.tabs);
+  const rawActive = shellStore.use((s) => s.active);
+  const spaceSel = shellStore.use((s) => s.selectedSpace);
+  const activeBySpace = shellStore.use((s) => s.activeBySpace);
+  const allByKey = useMemo(() => new Map(Object.values(agentsMap).flat().map((a) => [a.key, a] as const)), [agentsMap]);
+  const activeTab = useMemo(() => {
+    const id = activeTabIdForSpace(
+      { tabs, active: rawActive, selectedSpace: spaceSel, activeBySpace },
+      (k) => allByKey.get(k),
+      spacesMap,
+    );
+    return id ? (tabs.find((t) => t.id === id) ?? null) : null;
+  }, [activeBySpace, allByKey, rawActive, spaceSel, spacesMap, tabs]);
   const updateReady = updateStore.use((s) => Boolean(s.info?.hasUpdate));
   useVisibleTick(30_000); // re-render so the ages move
   const now = Date.now();
@@ -77,15 +94,20 @@ export function ShellSidebar({
   const [sort, setSortState] = useState<"status" | "recent">(() => readJson(SORT_KEY, "status"));
   const [deleteSpaceTarget, setDeleteSpaceTarget] = useState<SidebarSpace | null>(null);
   const [deletingSpace, setDeletingSpace] = useState(false);
+  const [renameSpaceTarget, setRenameSpaceTarget] = useState<SidebarSpace | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renamingSpace, setRenamingSpace] = useState(false);
+  const [spaceMenu, setSpaceMenu] = useState<{ x: number; y: number; space: SidebarSpace } | null>(null);
   const [agentMenu, setAgentMenu] = useState<{ x: number; y: number; agent: Agent } | null>(null);
   const toast = useToast();
-  const spaceSel = shellStore.use((s) => s.selectedSpace);
-  const allByKey = useMemo(() => new Map(Object.values(agentsMap).flat().map((a) => [a.key, a] as const)), [agentsMap]);
   const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k), spacesMap);
 
   useEffect(() => {
-    if (!agentMenu) return;
-    const off = () => setAgentMenu(null);
+    if (!agentMenu && !spaceMenu) return;
+    const off = () => {
+      setAgentMenu(null);
+      setSpaceMenu(null);
+    };
     const esc = (ev: KeyboardEvent) => ev.key === "Escape" && off();
     window.addEventListener("pointerdown", off);
     window.addEventListener("blur", off);
@@ -97,7 +119,55 @@ export function ShellSidebar({
       window.removeEventListener("keydown", esc);
       overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
     };
-  }, [agentMenu]);
+  }, [agentMenu, spaceMenu]);
+
+  const confirmRenameSpace = async () => {
+    const target = renameSpaceTarget;
+    if (!target || renamingSpace || !target.spaceId) return;
+    setRenamingSpace(true);
+    const trimmed = renameDraft.trim();
+    const folderBase = (target.folder ?? "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || target.name;
+    try {
+      const res = await rpcCall(target.deviceId, "herdr.command", {
+        command: "space.rename",
+        args: { id: target.spaceId, name: trimmed },
+      });
+      const returnedName =
+        res?.result && typeof (res.result as { name?: unknown }).name === "string"
+          ? ((res.result as { name: string }).name.trim() || "")
+          : "";
+      const nextName = returnedName || trimmed || folderBase || target.name;
+      liveStore.set((prev) => {
+        const curSpaces = prev.spaces[target.deviceId] ?? [];
+        const nextSpaces = curSpaces.map((sp) =>
+          sp.id === target.spaceId ? { ...sp, name: nextName } : sp,
+        );
+        const curAgents = prev.agents[target.deviceId] ?? [];
+        const nextAgents = curAgents.map((ag) => {
+          const spName = agentSpace(ag)?.trim() ?? "";
+          if (spName !== target.name) return ag;
+          const oldWhere = ag.where ?? "";
+          const slash = oldWhere.indexOf(" / ");
+          const nextWhere = slash >= 0 ? `${nextName}${oldWhere.slice(slash)}` : nextName;
+          return { ...ag, where: nextWhere };
+        });
+        return {
+          ...prev,
+          spaces: { ...prev.spaces, [target.deviceId]: nextSpaces },
+          agents: { ...prev.agents, [target.deviceId]: nextAgents },
+        };
+      });
+      renameSpaceInShellStore(target.deviceId, target.spaceId, target.name, nextName);
+      void pullHostDocNow(target.deviceId);
+      refreshHostSpaces(target.deviceId);
+      setRenameSpaceTarget(null);
+      toast(trimmed ? `已重命名为「${nextName}」` : `已恢复默认名称「${nextName}」`);
+    } catch (e) {
+      toast((e as Error).message || "重命名空间失败", true);
+    } finally {
+      setRenamingSpace(false);
+    }
+  };
 
   const confirmDeleteSpace = async () => {
     const target = deleteSpaceTarget;
@@ -285,7 +355,7 @@ export function ShellSidebar({
           {collapsed ? null : (
             <div className="v3-block-head">
               <span className="grow">空间</span>
-              <button className="v3-icon-btn small" aria-label="新建 Agent" title="新建 Agent…" onClick={() => onNewAgent(null, null)}>
+              <button className="v3-icon-btn small" aria-label="新建空间" title="新建空间…" onClick={() => onNewSpace(null)}>
                 <Plus size={14} />
               </button>
             </div>
@@ -316,10 +386,11 @@ export function ShellSidebar({
                       {m.online ? (
                         <button
                           className="v3-icon-btn small hover-only"
-                          aria-label={`在 ${m.name} 新建 Agent`}
+                          aria-label={`在 ${m.name} 新建空间`}
+                          title={`在 ${m.name} 新建空间…`}
                           onClick={(e) => {
                             e.stopPropagation();
-                            onNewAgent(m.id, null);
+                            onNewSpace(m.id);
                           }}
                         >
                           <Plus size={13} />
@@ -349,7 +420,8 @@ export function ShellSidebar({
                             onContextMenu={(e) => {
                               if (!m.online || collapsed) return;
                               e.preventDefault();
-                              setDeleteSpaceTarget(s);
+                              setAgentMenu(null);
+                              setSpaceMenu({ x: e.clientX, y: e.clientY, space: s });
                             }}
                             onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setSpaceSel(s.id))}
                           >
@@ -368,11 +440,11 @@ export function ShellSidebar({
                                     <button
                                       type="button"
                                       className="v3-icon-btn small hover-only"
-                                      aria-label={`在空间 ${label} 新建 Agent`}
-                                      title={`在空间 ${label} 新建 Agent`}
+                                      aria-label={`在空间 ${label} 新建终端`}
+                                      title={`在空间 ${label} 新建终端`}
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        onNewAgent(m.id, s.name);
+                                        onNewTerminal(m.id, s.name);
                                       }}
                                     >
                                       <Plus size={12} />
@@ -478,6 +550,47 @@ export function ShellSidebar({
         </button>
       </div>
       <PocketModal
+        open={renameSpaceTarget !== null}
+        onOpenChange={(v) => {
+          if (!v && !renamingSpace) setRenameSpaceTarget(null);
+        }}
+        title="重命名空间"
+        subtitle={
+          renameSpaceTarget?.folder
+            ? `工作目录：${renameSpaceTarget.folder}。留空保存将恢复按文件夹自动命名。`
+            : "输入新的空间名称；留空保存将恢复按文件夹自动命名。"
+        }
+        width={420}
+      >
+        <div className="stack">
+          <PocketInput
+            autoFocus
+            maxLength={60}
+            placeholder={
+              (renameSpaceTarget?.folder ?? "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() ||
+              renameSpaceTarget?.name ||
+              "空间名称"
+            }
+            value={renameDraft}
+            onChange={(e) => setRenameDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void confirmRenameSpace();
+              }
+            }}
+          />
+          <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
+            <PocketButton variant="ghost" disabled={renamingSpace} onClick={() => setRenameSpaceTarget(null)}>
+              取消
+            </PocketButton>
+            <PocketButton variant="primary" disabled={renamingSpace} onClick={() => void confirmRenameSpace()}>
+              {renamingSpace ? "正在保存…" : "保存"}
+            </PocketButton>
+          </div>
+        </div>
+      </PocketModal>
+      <PocketModal
         open={deleteSpaceTarget !== null}
         onOpenChange={(v) => {
           if (!v && !deletingSpace) setDeleteSpaceTarget(null);
@@ -558,6 +671,80 @@ export function ShellSidebar({
               >
                 <Rows2 size={14} />
                 <span className="grow">向下分屏打开</span>
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
+      {spaceMenu && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="ctx-menu v3-popup"
+              role="menu"
+              data-tauri-drag-region="false"
+              style={{
+                left: Math.max(8, Math.min(spaceMenu.x, window.innerWidth - 212 - 8)),
+                top: Math.max(8, Math.min(spaceMenu.y, window.innerHeight - 210)),
+                width: 212,
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  const target = spaceMenu.space;
+                  setSpaceMenu(null);
+                  onNewTerminal(target.deviceId, target.name);
+                }}
+              >
+                <Terminal size={14} />
+                <span className="grow">新建终端</span>
+              </button>
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  const target = spaceMenu.space;
+                  setSpaceMenu(null);
+                  onNewAgent(target.deviceId, target.name);
+                }}
+              >
+                <Plus size={14} />
+                <span className="grow">新建 Agent…</span>
+              </button>
+              <div className="menu-sep" />
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                disabled={!spaceMenu.space.spaceId}
+                onClick={() => {
+                  const target = spaceMenu.space;
+                  setSpaceMenu(null);
+                  setRenameDraft(target.name);
+                  setRenameSpaceTarget(target);
+                }}
+              >
+                <Pencil size={14} />
+                <span className="grow">重命名空间…</span>
+              </button>
+              <div className="menu-sep" />
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                style={{ color: "var(--blush-text)" }}
+                onClick={() => {
+                  const target = spaceMenu.space;
+                  setSpaceMenu(null);
+                  setDeleteSpaceTarget(target);
+                }}
+              >
+                <Trash2 size={14} />
+                <span className="grow">关闭空间…</span>
               </button>
             </div>,
             document.body,

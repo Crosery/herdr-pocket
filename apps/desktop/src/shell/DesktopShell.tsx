@@ -42,7 +42,7 @@ import { AddDeviceModal } from "../views/DevicesView";
 import { CreateAgentModal } from "../views/AgentsView";
 import { SettingsFrame } from "../views/settings/SettingsFrame";
 import { useClientConfig, clientConfigStore } from "../lib/config";
-import { useToast } from "../components/PocketUI";
+import { overlayStore, useToast } from "../components/PocketUI";
 import { isTauri } from "../lib/bridge";
 import { localHostIdStore, refreshLocalHostIdFast } from "../lib/fonts";
 import { native } from "../lib/native";
@@ -52,7 +52,7 @@ import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle, updateSet
 import { terminalOwnsCtrlK } from "../lib/termKeys";
 import { getTerminalThemeSpec, resolveTerminalAppearance } from "../lib/terminalTheme";
 import { GROUP_RANK, lastChange, listGroup } from "./agentInfo";
-import { flushHostNow, registerPendingSplitPlacement, syncHostNow, useHerdrDocSync } from "./herdrDocSync";
+import { flushHostNow, pullHostDocNow, registerPendingSplitPlacement, syncHostNow, useHerdrDocSync } from "./herdrDocSync";
 import { Palette, type PaletteItem } from "./Palette";
 import { ShellSidebar } from "./ShellSidebar";
 import { PeekOverlay, ShellMain, ShellPanel, ShellStatus, ShellTabs, requestClosePane, requestCloseShellTab } from "./ShellWork";
@@ -67,6 +67,7 @@ import {
   openAgentTab,
   openSettingsFrame,
   openWebTab,
+  renameSpaceInShellStore,
   setActiveTab,
   setPalette,
   setSelectedSpace,
@@ -164,14 +165,31 @@ export function DesktopShell({
   const showShells = settingsStore.use((s) => s.showShells);
   const theme = settingsStore.use((s) => s.theme);
   const homePage = useClientConfig().browser.homePage;
-  const [create, setCreate] = useState<{ host: string | null; space: string | null } | null>(null);
+  const [create, setCreate] = useState<{ host: string | null; space: string | null; preferNewSpace?: boolean } | null>(null);
   const [addComputer, setAddComputer] = useState(false);
 
   useHerdrDocSync();
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const hosts = useMemo(() => Object.values(devices).filter((d) => d.kind === "host"), [devices]);
-  const newAgent = useCallback((host: string | null = null, space: string | null = null) => setCreate({ host, space }), []);
+  const newSpace = useCallback((host?: string | null) => {
+    setCreate({ host: host ?? null, space: null, preferNewSpace: true });
+  }, []);
+  const newAgent = useCallback((host?: string | null, space?: string | null) => {
+    if (host !== undefined || space !== undefined) {
+      setCreate({ host: host ?? null, space: space ?? null });
+      return;
+    }
+    const sel = shellStore.get().selectedSpace;
+    if (sel) {
+      const sep = sel.indexOf("\u0000");
+      const selHost = sep >= 0 ? sel.slice(0, sep) : null;
+      const selSpace = sep >= 0 ? sel.slice(sep + 1) : sel;
+      setCreate({ host: selHost || null, space: selSpace || null });
+    } else {
+      setCreate({ host: null, space: null });
+    }
+  }, []);
 
   // Keep space counts, tabs, and renames synced periodically with Herdr.app while the window is visible.
   useEffect(() => {
@@ -216,7 +234,7 @@ export function DesktopShell({
       const activeSpaceTabId = activeTabIdForSpace(s, lookup, spMap);
       const targetTab = splitTarget
         ? s.tabs.find((t) => t.id === splitTarget.tabId)
-        : s.tabs.find((t) => t.id === (activeSpaceTabId ?? s.active));
+        : (activeSpaceTabId ? s.tabs.find((t) => t.id === activeSpaceTabId) : undefined);
       const targetLeaf = targetTab
         ? (splitTarget?.paneId
             ? tabLeaves(targetTab).find((l) => l.id === splitTarget.paneId)
@@ -235,8 +253,11 @@ export function DesktopShell({
 
       const hostId =
         (isOnlineHost(preferredHost) ? preferredHost : null) ??
-        (isOnlineHost(activeAgent?.deviceId) ? activeAgent!.deviceId : null) ??
-        (isOnlineHost(selHost) ? selHost : null) ??
+        (splitTarget
+          ? (isOnlineHost(activeAgent?.deviceId) ? activeAgent!.deviceId : null) ??
+            (isOnlineHost(selHost) ? selHost : null)
+          : (isOnlineHost(selHost) ? selHost : null) ??
+            (isOnlineHost(activeAgent?.deviceId) ? activeAgent!.deviceId : null)) ??
         Object.values(devs).find((d) => d.kind === "host" && d.online)?.id ??
         (isTauri() && localHostId ? localHostId : undefined);
 
@@ -245,29 +266,39 @@ export function DesktopShell({
         return;
       }
 
-      const spaceName =
-        preferredSpace ??
-        (activeAgent?.deviceId === hostId ? agentSpace(activeAgent) ?? null : null) ??
-        (targetTab?.docHostId === hostId && targetTab.docSpaceName ? targetTab.docSpaceName : null) ??
-        (selHost === hostId ? selSpace : null);
+      const spaceName = splitTarget
+        ? preferredSpace ??
+          (activeAgent?.deviceId === hostId ? agentSpace(activeAgent) ?? null : null) ??
+          (targetTab?.docHostId === hostId && targetTab.docSpaceName ? targetTab.docSpaceName : null) ??
+          (selHost === hostId ? selSpace : null)
+        : preferredSpace ??
+          (selHost === hostId ? selSpace : null) ??
+          (activeAgent?.deviceId === hostId ? agentSpace(activeAgent) ?? null : null) ??
+          (targetTab?.docHostId === hostId && targetTab.docSpaceName ? targetTab.docSpaceName : null);
 
       const hostSpacesList = liveStore.get().spaces[hostId] ?? [];
-      const matchedKnownSpace =
-        (targetTab?.docHostId === hostId && targetTab.docSpaceId
-          ? hostSpacesList.find((sp) => sp.id === targetTab.docSpaceId)
-          : undefined) ??
-        (spaceName ? hostSpacesList.find((sp) => sp.name === spaceName) : hostSpacesList.find((sp) => sp.active) ?? hostSpacesList[0]);
+      const matchedKnownSpace = splitTarget
+        ? (targetTab?.docHostId === hostId && targetTab.docSpaceId
+            ? hostSpacesList.find((sp) => sp.id === targetTab.docSpaceId)
+            : undefined) ??
+          (spaceName
+            ? hostSpacesList.find((sp) => sp.name === spaceName)
+            : hostSpacesList.find((sp) => sp.active) ?? hostSpacesList[0])
+        : spaceName
+          ? hostSpacesList.find((sp) => sp.name === spaceName)
+          : hostSpacesList.find((sp) => sp.active) ?? hostSpacesList[0];
 
       const folder =
         (activeAgent?.deviceId === hostId && activeAgent.cwd ? activeAgent.cwd : undefined) ??
-        all.find((a) => a.deviceId === hostId && (!spaceName || (agentSpace(a) ?? "") === spaceName) && a.cwd)?.cwd ??
-        matchedKnownSpace?.folder;
+        matchedKnownSpace?.folder ??
+        all.find((a) => a.deviceId === hostId && (!spaceName || (agentSpace(a) ?? "") === spaceName) && a.cwd)?.cwd;
 
       const placePane = (
         key: string,
         resolvedSpaceName?: string,
         newPaneId?: string,
         localIdHint?: string,
+        docMeta?: { spaceId?: string; tabId?: string },
       ) => {
         if (splitTarget && targetTab) {
           const termId = localIdHint || key.slice(`${hostId}/hc:`.length);
@@ -300,7 +331,19 @@ export function DesktopShell({
               setSelectedSpace(targetSpaceKey, lookup, liveStore.get().spaces);
             }
           }
-          openAgentTab(key, "term", { followSpace: true });
+          openAgentTab(key, "term", {
+            followSpace: true,
+            ...(docMeta?.spaceId
+              ? {
+                  docMeta: {
+                    docHostId: hostId,
+                    docSpaceId: docMeta.spaceId,
+                    docSpaceName: resolvedSpaceName ?? "",
+                    ...(docMeta.tabId ? { docTabId: docMeta.tabId } : {}),
+                  },
+                }
+              : {}),
+          });
         }
       };
 
@@ -382,6 +425,10 @@ export function DesktopShell({
             resolvedFolder = resolvedFolder || spMatch?.folder;
             spaceId = spaceId || spMatch?.id;
           }
+          const localDocTabId =
+            !splitTarget && spaceId
+              ? `tb${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+              : undefined;
           const grid = measureTerminalGrid(splitTarget?.direction);
           const created = await native.localTermCreateShell({
             cwd: resolvedFolder || undefined,
@@ -390,11 +437,20 @@ export function DesktopShell({
             display: grid.display,
             spaceName: spaceName || undefined,
             spaceId: spaceId || undefined,
-            tabId: splitTarget ? targetTab?.docTabId : undefined,
+            tabId: splitTarget ? targetTab?.docTabId : localDocTabId,
           });
           const key = `${hostId}/hc:${created.terminal}`;
           addOptimisticShell(key, created.terminal, spaceName || undefined, created.cwd || resolvedFolder || undefined);
-          placePane(key, spaceName || undefined, undefined, created.terminal);
+          placePane(
+            key,
+            spaceName || undefined,
+            undefined,
+            created.terminal,
+            spaceId ? { spaceId, ...(localDocTabId ? { tabId: localDocTabId } : {}) } : undefined,
+          );
+          if (!splitTarget && spaceId) {
+            void flushHostNow(hostId);
+          }
           refreshHostSpaces(hostId);
           return true;
         } catch {
@@ -410,16 +466,18 @@ export function DesktopShell({
 
       try {
         const spRes = await rpcCall(hostId, "spaces.list", {}, 6_000).catch(() => null);
+        const spacesForMatch = spRes?.spaces?.length ? spRes.spaces : hostSpacesList;
         const matchedSpace = spaceName
-          ? spRes?.spaces.find((sp) => sp.name === spaceName)
-          : spRes?.spaces.find((sp) => sp.active) ?? spRes?.spaces[0];
-        const spaceId = matchedSpace?.id;
+          ? spacesForMatch.find((sp) => sp.name === spaceName)
+          : (matchedKnownSpace ?? spacesForMatch.find((sp) => sp.active) ?? spacesForMatch[0]);
+        const spaceId = matchedSpace?.id ?? matchedKnownSpace?.id;
         const resolvedFolder = folder || matchedSpace?.folder || spRes?.folders[0];
         const created = await rpcCall(
           hostId,
           "agent.create",
           {
             space: spaceId || undefined,
+            ...(!spaceId && spaceName ? { spaceName } : {}),
             folder: spaceId ? undefined : resolvedFolder || undefined,
             launcher: "shell",
           },
@@ -427,7 +485,11 @@ export function DesktopShell({
         );
         const resolvedWhere = matchedSpace?.name || spaceName || undefined;
         addOptimisticShell(created.agent, created.terminal, resolvedWhere, resolvedFolder || undefined);
-        placePane(created.agent, resolvedWhere, undefined, created.terminal);
+        placePane(created.agent, resolvedWhere, undefined, created.terminal, {
+          spaceId: created.space || spaceId,
+          ...(created.tab ? { tabId: created.tab } : {}),
+        });
+        void pullHostDocNow(hostId);
         refreshHostSpaces(hostId);
       } catch (e) {
         if (isLocalDesktop && (await tryLocalShellCreate())) return;
@@ -450,6 +512,17 @@ export function DesktopShell({
         Boolean(spacesMap[selHost]?.some((sp) => sp.name === selName)) ||
         all.some((a) => a.deviceId === selHost && (agentSpace(a) ?? "") === selName);
       if (stillExists) return;
+      const prevDocSpaceIds = new Set(
+        shellStore
+          .get()
+          .tabs.filter((t) => t.docHostId === selHost && t.docSpaceName === selName && t.docSpaceId)
+          .map((t) => t.docSpaceId!),
+      );
+      const renamedSpace = spacesMap[selHost]?.find((sp) => sp.id && prevDocSpaceIds.has(sp.id) && sp.name);
+      if (renamedSpace) {
+        setSelectedSpace(`${selHost}\u0000${renamedSpace.name}`, (k) => agentByKey.get(k), spacesMap);
+        return;
+      }
     }
 
     const localId = localHostIdStore.get();
@@ -800,6 +873,28 @@ export function DesktopShell({
     if (t) requestCloseShellTab(t);
   }
 
+  // Track Ctrl/Cmd modifier state for click-to-jump file links.
+  useEffect(() => {
+    const sync = (active: boolean) => {
+      document.documentElement.dataset.linkMod = active ? "true" : "false";
+    };
+    const onKeyEvent = (e: KeyboardEvent) => sync(e.ctrlKey || e.metaKey);
+    const onMoveEvent = (e: MouseEvent) => sync(e.ctrlKey || e.metaKey);
+    const onBlur = () => sync(false);
+    sync(false);
+    window.addEventListener("keydown", onKeyEvent, true);
+    window.addEventListener("keyup", onKeyEvent, true);
+    window.addEventListener("mousemove", onMoveEvent, { passive: true });
+    window.addEventListener("blur", onBlur);
+    return () => {
+      delete document.documentElement.dataset.linkMod;
+      window.removeEventListener("keydown", onKeyEvent, true);
+      window.removeEventListener("keyup", onKeyEvent, true);
+      window.removeEventListener("mousemove", onMoveEvent);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
   // Window shortcuts (shell/shortcuts.ts). On Windows a focused terminal box keeps bare Ctrl+letter keys.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -815,6 +910,23 @@ export function DesktopShell({
           setActiveTab(picked.id);
         }
         return;
+      }
+      if (e.key === "Escape" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.defaultPrevented) {
+        const tgt = e.target as HTMLElement | null;
+        const inEditable = Boolean(tgt && (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.isContentEditable));
+        const s = shellStore.get();
+        const dialogUp = Boolean(document.querySelector("[role=dialog][data-state=open]"));
+        if (!inEditable && !dialogUp && overlayStore.get().open === 0 && !s.settings && !s.palette && !s.peek) {
+          const ref = currentFocusedPane();
+          if (ref && tabLeaves(ref.tab).length === 1) {
+            const leaf = focusedLeafOfTab(ref.tab);
+            if (leaf.content.kind === "file" || leaf.content.kind === "diff") {
+              e.preventDefault();
+              requestClosePane(ref.tab.id, ref.paneId);
+              return;
+            }
+          }
+        }
       }
       const id = matchShortcut(e);
       if (!id) return;
@@ -935,6 +1047,8 @@ export function DesktopShell({
         onConnectRelay={onConnectRelay}
         onPairPhone={onPairPhone}
         onNewAgent={newAgent}
+        onNewSpace={newSpace}
+        onNewTerminal={(h, sp) => void spawnTerminalNow(h, sp)}
       />
       <div className="v3-work">
         <ShellTabs onNewTerminal={() => void spawnTerminalNow()} onNewAgent={() => newAgent()} padForLights={collapsed} />
@@ -968,10 +1082,90 @@ export function DesktopShell({
         hosts={hosts}
         defaultHost={create?.host ?? null}
         defaultSpace={create?.space ?? null}
-        onCreated={(key) => {
-          openAgentTab(key);
-          refreshHostSpaces();
-          toast("已创建并打开 Agent");
+        preferNewSpace={Boolean(create?.preferNewSpace)}
+        onCreated={(info) => {
+          const isShell = info.launcher === "shell";
+          const folderBase = (info.folder ?? "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+          const resolvedSpaceName = info.spaceName?.trim() || folderBase || "workspace";
+          const localId = info.terminalId || info.agentKey.split("/").pop()?.replace(/^hc:/, "") || info.agentKey;
+          liveStore.set((prev) => {
+            const curAgents = prev.agents[info.hostId] ?? [];
+            const nextAgents = curAgents.some((a) => a.key === info.agentKey)
+              ? curAgents
+              : [
+                  {
+                    key: info.agentKey,
+                    deviceId: info.hostId,
+                    source: "hc" as const,
+                    localId,
+                    harness: isShell ? "zsh" : info.launcher,
+                    title: isShell ? "终端" : "新建 Agent",
+                    where: resolvedSpaceName,
+                    cwd: info.folder,
+                    status: isShell ? ("idle" as const) : ("working" as const),
+                    statusSince: Date.now(),
+                    isShell,
+                    updatedAt: Date.now(),
+                  },
+                  ...curAgents,
+                ];
+            const curSpaces = prev.spaces[info.hostId] ?? [];
+            const hasSpace = curSpaces.some(
+              (sp) => (info.spaceId && sp.id === info.spaceId) || sp.name === resolvedSpaceName,
+            );
+            const nextSpaces = hasSpace
+              ? curSpaces.map((sp) => ({
+                  ...sp,
+                  active: (info.spaceId && sp.id === info.spaceId) || sp.name === resolvedSpaceName,
+                }))
+              : [
+                  ...curSpaces.map((sp) => ({ ...sp, active: false })),
+                  {
+                    id: info.spaceId || `sp-opt-${Date.now().toString(36)}`,
+                    name: resolvedSpaceName,
+                    ...(info.folder ? { folder: info.folder } : {}),
+                    tabs: 1,
+                    terminals: 1,
+                    active: true,
+                  },
+                ];
+            return {
+              ...prev,
+              agents: { ...prev.agents, [info.hostId]: nextAgents },
+              spaces: { ...prev.spaces, [info.hostId]: nextSpaces },
+              rev: prev.rev + 1,
+            };
+          });
+          const targetSpaceKey = `${info.hostId}\u0000${resolvedSpaceName}`;
+          const lookupNow = (k: string) => liveStore.get().agents[info.hostId]?.find((a) => a.key === k);
+          if (shellStore.get().selectedSpace !== targetSpaceKey) {
+            setSelectedSpace(targetSpaceKey, lookupNow, liveStore.get().spaces);
+          }
+          openAgentTab(info.agentKey, "term", {
+            followSpace: true,
+            lookupAgent: lookupNow,
+            ...(info.spaceId
+              ? {
+                  docMeta: {
+                    docHostId: info.hostId,
+                    docSpaceId: info.spaceId,
+                    docSpaceName: resolvedSpaceName,
+                    ...(info.tabId ? { docTabId: info.tabId } : {}),
+                  },
+                }
+              : {}),
+          });
+          void pullHostDocNow(info.hostId);
+          void rpcCall(info.hostId, "spaces.list", {})
+            .then((res) => {
+              liveStore.set((prev) => ({ ...prev, spaces: { ...prev.spaces, [info.hostId]: res.spaces } }));
+              const serverSpace = info.spaceId ? res.spaces.find((sp) => sp.id === info.spaceId) : undefined;
+              if (serverSpace && serverSpace.name && serverSpace.name !== resolvedSpaceName) {
+                renameSpaceInShellStore(info.hostId, serverSpace.id, resolvedSpaceName, serverSpace.name);
+              }
+            })
+            .catch(() => {});
+          toast(isShell ? "已创建并打开终端" : "已创建并在终端中启动 Agent");
         }}
       />
       <AddDeviceModal open={addComputer} onOpenChange={setAddComputer} />

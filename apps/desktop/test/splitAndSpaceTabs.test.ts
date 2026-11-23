@@ -1,9 +1,12 @@
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { afterEach, test } from "node:test";
+import { fileURLToPath } from "node:url";
 import type { Agent, Device, HerdrDoc, SpaceInfo } from "@herdr-pocket/protocol";
 import { liveStore } from "../src/lib/store.ts";
 import { canActOnLocalFile, revealInFolderLabel } from "../src/lib/localFileActions.ts";
+import { hasFileJumpModifier } from "../src/lib/openFileTarget.ts";
 import { tierFor } from "../src/lib/layout.ts";
 import { extractHostHerdrDoc, formatHerdrTabLabel, splitNodeToHerdrRoot } from "../src/shell/herdrDoc.ts";
 import {
@@ -14,17 +17,22 @@ import {
 } from "../src/shell/herdrDocSync.ts";
 import {
   activeTabIdForSpace,
+  closeTab,
+  closeTabPane,
   openAgentTab,
   openDiffTab,
   openFileTab,
   openWebTab,
   reconcileHostHerdrDoc,
   refreshHostDocSpaceNames,
+  renameSpaceInShellStore,
   setActiveTab,
+  setPeek,
   setSelectedSpace,
   shellStore,
   splitActivePaneWithContent,
   splitTabPane,
+  stableSplitLeafKeys,
   tabLeaves,
   togglePanel,
   visibleTabsForSpace,
@@ -37,7 +45,10 @@ function resetStores(): void {
     active: null,
     selectedSpace: null,
     activeBySpace: {},
+    navHistoryBySpace: {},
+    peekReturnByTab: {},
     panel: null,
+    panelBySpace: {},
     panelWidth: 368,
     subagentAside: null,
     settings: null,
@@ -376,4 +387,337 @@ test("Keep-alive ShellMain, TerminalSurface no-reattach focus/size sync, ResizeO
   assert.match(appSrc, /useViewportTier\(\)/);
   // Outside Tauri, < 860px collapses to mobile tier as documented.
   assert.equal(tierFor(780), "mobile");
+});
+
+test("Empty Space keeps active=null across reconcileHostHerdrDoc and openAgentTab with docMeta attaches to empty Space immediately", () => {
+  resetStores();
+  const h1 = "h1";
+  const spaces: SpaceInfo[] = [
+    { id: "sp-other", name: "测试", folder: "~/other", tabs: 1, terminals: 1, active: true },
+    { id: "sp-empty", name: "geek_main", folder: "~/work_file/geek_main", tabs: 0, terminals: 0, active: false },
+  ];
+  const existingAgents: Agent[] = [
+    { key: "h1/hc:t1", deviceId: h1, source: "hc", localId: "t1", harness: "claude-code", where: "测试 / 1", status: "idle", isShell: false, updatedAt: 1 },
+  ];
+  liveStore.set({
+    agents: { h1: existingAgents },
+    spaces: { h1: spaces },
+  });
+
+  // Select empty 0-tab Space `geek_main`.
+  setSelectedSpace("h1\u0000geek_main");
+  assert.equal(shellStore.get().active, null);
+
+  // Reconciling a host doc with tabs in `sp-other` and 0 tabs in `sp-empty` MUST NOT leak `sp-other`'s tab into `active`.
+  reconcileHostHerdrDoc(h1, {
+    spaces: [
+      { id: "sp-other", name: "测试", folder: "~/other", tabs: [{ id: "tb1", name: "1", root: { id: "p1", type: "block", content: { terminal: "t1" } } }] },
+      { id: "sp-empty", name: "", folder: "~/work_file/geek_main", tabs: [] },
+    ],
+  }, undefined, spaces);
+  assert.equal(shellStore.get().selectedSpace, "h1\u0000geek_main");
+  assert.equal(shellStore.get().active, null);
+  assert.deepEqual(
+    visibleTabsForSpace(shellStore.get().tabs, shellStore.get().selectedSpace, (k) => existingAgents.find((a) => a.key === k), liveStore.get().spaces),
+    [],
+  );
+
+  // Creating a shell in empty Space passes docMeta (`docSpaceId`, `docSpaceName`, `docTabId`) -> immediately visible in `geek_main`.
+  openAgentTab("h1/hc:t2", "term", {
+    followSpace: true,
+    docMeta: { docHostId: h1, docSpaceId: "sp-empty", docSpaceName: "geek_main", docTabId: "tb-new" },
+  });
+  const s = shellStore.get();
+  assert.equal(s.selectedSpace, "h1\u0000geek_main");
+  assert.equal(s.active, "ht:h1:sp-empty:tb-new");
+  const vis = visibleTabsForSpace(s.tabs, s.selectedSpace, (k) => existingAgents.find((a) => a.key === k), liveStore.get().spaces);
+  assert.deepEqual(vis.map((t) => t.id), ["ht:h1:sp-empty:tb-new"]);
+});
+
+test("Closing image/file previews pops strictly one level back within the active Space and restores PeekOverlay", () => {
+  resetStores();
+  const h1 = "h1";
+  const agents: Agent[] = [
+    { key: "h1/hc:t1", deviceId: h1, source: "hc", localId: "t1", harness: "claude-code", where: "work / T1", cwd: "~/work", status: "idle", isShell: false, updatedAt: 1 },
+    { key: "h1/hc:t2", deviceId: h1, source: "hc", localId: "t2", harness: "codex", where: "work / T2", cwd: "~/work", status: "idle", isShell: false, updatedAt: 2 },
+    { key: "h1/hc:t3", deviceId: h1, source: "hc", localId: "t3", harness: "gemini-cli", where: "work / T3", cwd: "~/work", status: "idle", isShell: false, updatedAt: 3 },
+    { key: "h1/hc:t4", deviceId: h1, source: "hc", localId: "t4", harness: "zsh", where: "work / T4", cwd: "~/work", status: "idle", isShell: true, updatedAt: 4 },
+    { key: "h1/hc:b1", deviceId: h1, source: "hc", localId: "b1", harness: "claude-code", where: "other / B1", cwd: "~/other", status: "idle", isShell: false, updatedAt: 5 },
+  ];
+  const spaces: SpaceInfo[] = [
+    { id: "sp-w", name: "work", folder: "~/work", tabs: 4, terminals: 4, active: true },
+    { id: "sp-o", name: "other", folder: "~/other", tabs: 1, terminals: 1, active: false },
+  ];
+  liveStore.set({ agents: { h1 }, spaces: { h1: spaces } });
+
+  reconcileHostHerdrDoc(h1, {
+    spaces: [
+      {
+        id: "sp-w",
+        name: "work",
+        folder: "~/work",
+        tabs: [
+          { id: "tb1", name: "T1", root: { id: "p1", type: "block", content: { terminal: "t1" } } },
+          { id: "tb2", name: "T2", root: { id: "p2", type: "block", content: { terminal: "t2" } } },
+          { id: "tb3", name: "T3", root: { id: "p3", type: "block", content: { terminal: "t3" } } },
+          { id: "tb4", name: "T4", root: { id: "p4", type: "block", content: { terminal: "t4" } } },
+        ],
+      },
+      {
+        id: "sp-o",
+        name: "other",
+        folder: "~/other",
+        tabs: [{ id: "tb-o1", name: "B1", root: { id: "po1", type: "block", content: { terminal: "b1" } } }],
+      },
+    ],
+  }, undefined, spaces);
+
+  setSelectedSpace("h1\u0000work");
+  setActiveTab("ht:h1:sp-w:tb2");
+
+  // 1) Multi-level navigation from T2 -> spec.md -> diagram.png -> zoom.png returns strictly 1 level on each close!
+  openFileTab("h1/hc:t2", "spec.md", "spec.md", { absPath: "/tmp/work/spec.md" });
+  openFileTab("h1/hc:t2", "diagram.png", "diagram.png", { absPath: "/tmp/work/diagram.png" });
+  openFileTab("h1/hc:t2", "zoom.png", "zoom.png", { absPath: "/tmp/work/zoom.png" });
+
+  assert.equal(shellStore.get().active, "f:h1/hc:t2:zoom.png");
+  closeTab("f:h1/hc:t2:zoom.png");
+  assert.equal(shellStore.get().active, "f:h1/hc:t2:diagram.png");
+  closeTab("f:h1/hc:t2:diagram.png");
+  assert.equal(shellStore.get().active, "f:h1/hc:t2:spec.md");
+  closeTab("f:h1/hc:t2:spec.md");
+  assert.equal(shellStore.get().active, "ht:h1:sp-w:tb2");
+
+  // 2) Re-opening existing preview from T3 returns to T3 (even if opened when another tab previously created it).
+  openFileTab("h1/hc:t2", "shot.png", "shot.png");
+  setActiveTab("ht:h1:sp-w:tb3");
+  openFileTab("h1/hc:t2", "shot.png", "shot.png");
+  assert.equal(shellStore.get().active, "f:h1/hc:t2:shot.png");
+  closeTab("f:h1/hc:t2:shot.png");
+  assert.equal(shellStore.get().active, "ht:h1:sp-w:tb3");
+
+  // 3) Opening an image inside PeekOverlay hides PeekOverlay and closing the image restores PeekOverlay.
+  setPeek("h1/hc:t4");
+  openFileTab("h1/hc:t4", "peek.png", "peek.png");
+  assert.equal(shellStore.get().peek, null);
+  assert.equal(shellStore.get().active, "f:h1/hc:t4:peek.png");
+  closeTab("f:h1/hc:t4:peek.png");
+  assert.equal(shellStore.get().active, "ht:h1:sp-w:tb3");
+  assert.equal(shellStore.get().peek, "h1/hc:t4");
+  setPeek(null);
+
+  // 4) reconcileHostHerdrDoc absorbing a standalone tab (`a:...` -> `ht:...`) remaps navHistoryBySpace cleanly.
+  const freshAgent: Agent = {
+    key: "h1/hc:t5",
+    deviceId: h1,
+    source: "hc",
+    localId: "t5",
+    harness: "codex",
+    where: "work",
+    cwd: "~/work",
+    status: "idle",
+    isShell: false,
+    updatedAt: 6,
+  };
+  liveStore.set({ ...liveStore.get(), agents: { h1: [...agents, freshAgent] } });
+  openAgentTab("h1/hc:t5", "term");
+  openFileTab("h1/hc:t5", "after.png", "after.png");
+  reconcileHostHerdrDoc(h1, {
+    spaces: [
+      {
+        id: "sp-w",
+        name: "work",
+        folder: "~/work",
+        tabs: [
+          { id: "tb1", name: "T1", root: { id: "p1", type: "block", content: { terminal: "t1" } } },
+          { id: "tb2", name: "T2", root: { id: "p2", type: "block", content: { terminal: "t2" } } },
+          { id: "tb3", name: "T3", root: { id: "p3", type: "block", content: { terminal: "t3" } } },
+          { id: "tb4", name: "T4", root: { id: "p4", type: "block", content: { terminal: "t4" } } },
+          { id: "tb5", name: "T5", root: { id: "p5", type: "block", content: { terminal: "t5" } } },
+        ],
+      },
+      {
+        id: "sp-o",
+        name: "other",
+        folder: "~/other",
+        tabs: [{ id: "tb-o1", name: "B1", root: { id: "po1", type: "block", content: { terminal: "b1" } } }],
+      },
+    ],
+  }, undefined, spaces);
+  closeTab("f:h1/hc:t5:after.png");
+  assert.equal(shellStore.get().active, "ht:h1:sp-w:tb5");
+});
+
+test("split pane and synced-tab reconciliation preserve mountKey and stable leaf keys to avoid terminal flash", () => {
+  const h1 = "h1";
+  const spaces: SpaceInfo[] = [
+    { id: "sp-new", name: "fresh-proj", folder: "~/work/fresh-proj", tabs: 1, terminals: 1, active: true },
+    { id: "sp-old", name: "old-proj", folder: "~/work/old-proj", tabs: 1, terminals: 1 },
+  ];
+  const agents: Agent[] = [
+    { key: "h1/hc:t1", deviceId: h1, source: "hc", localId: "t1", harness: "zsh", where: "fresh-proj", cwd: "~/work/fresh-proj", status: "idle", isShell: true, updatedAt: 10 },
+    { key: "h1/hc:t2", deviceId: h1, source: "hc", localId: "t2", harness: "zsh", where: "fresh-proj", cwd: "~/work/fresh-proj", status: "idle", isShell: true, updatedAt: 9 },
+  ];
+  liveStore.set({
+    link: "online",
+    devices: { h1: { id: h1, name: "mac", kind: "host", platform: "darwin", online: true, createdAt: 1, lastSeenAt: 1 } },
+    agents: { h1: agents },
+    spaces: { h1: spaces },
+    direct: {},
+    rev: 1,
+  });
+
+  // 1) New Space creation focuses the new Space directly in terminal mode (`"term"`).
+  setSelectedSpace(`${h1}\u0000fresh-proj`);
+  openAgentTab("h1/hc:t1", "term", {
+    followSpace: true,
+    docMeta: { docHostId: h1, docSpaceId: "sp-new", docSpaceName: "fresh-proj", docTabId: "tb-fresh" },
+  });
+  let tab = shellStore.get().tabs.find((t) => t.id === "ht:h1:sp-new:tb-fresh")!;
+  assert.ok(tab);
+  assert.equal(tab.kind === "agent" ? tab.mode : undefined, "term");
+  assert.equal(shellStore.get().selectedSpace, `${h1}\u0000fresh-proj`);
+
+  const preSyncMountKey = tab.mountKey ?? tab.id;
+  const preSplitLeafKeys = stableSplitLeafKeys(tabLeaves(tab));
+  assert.deepEqual(preSplitLeafKeys, ["agent:h1/hc:t1"]);
+
+  // 2) Reconciling with HerdrDoc assigns a real block id (`p1`) instead of `p0:...` without changing mountKey or leaf key.
+  reconcileHostHerdrDoc(h1, {
+    spaces: [
+      { id: "sp-new", name: "fresh-proj", folder: "~/work/fresh-proj", tabs: [{ id: "tb-fresh", name: "", root: { id: "p1", type: "block", content: { terminal: "t1" } } }] },
+    ],
+  }, undefined, spaces);
+  tab = shellStore.get().tabs.find((t) => t.id === "ht:h1:sp-new:tb-fresh")!;
+  assert.equal(tab.mountKey ?? tab.id, preSyncMountKey);
+  assert.deepEqual(stableSplitLeafKeys(tabLeaves(tab)), preSplitLeafKeys);
+
+  // 3) Splitting 1 pane -> 2 panes -> 3 panes and collapsing back keeps pane 1's key 100% invariant.
+  splitTabPane(tab.id, "p1", "right", { kind: "agent", agentKey: "h1/hc:t2", mode: "term" }, { newPaneId: "p2" });
+  tab = shellStore.get().tabs.find((t) => t.id === "ht:h1:sp-new:tb-fresh")!;
+  assert.equal(tab.mountKey ?? tab.id, preSyncMountKey);
+  assert.deepEqual(stableSplitLeafKeys(tabLeaves(tab)), ["agent:h1/hc:t1", "agent:h1/hc:t2"]);
+
+  // Simulate Herdr.app re-wrapping `p1` under a new split node ID during pane.split sync.
+  reconcileHostHerdrDoc(h1, {
+    spaces: [
+      {
+        id: "sp-new",
+        name: "fresh-proj",
+        folder: "~/work/fresh-proj",
+        tabs: [
+          {
+            id: "tb-fresh",
+            name: "",
+            root: {
+              id: "s1",
+              type: "row",
+              children: [
+                { id: "p1_rebuilt", type: "block", size: { weight: 0.5 }, content: { terminal: "t1" } },
+                { id: "p2_rebuilt", type: "block", size: { weight: 0.5 }, content: { terminal: "t2" } },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  }, undefined, spaces);
+  tab = shellStore.get().tabs.find((t) => t.id === "ht:h1:sp-new:tb-fresh")!;
+  assert.equal(tab.mountKey ?? tab.id, preSyncMountKey);
+  assert.deepEqual(stableSplitLeafKeys(tabLeaves(tab)), ["agent:h1/hc:t1", "agent:h1/hc:t2"]);
+
+  // Closing the second pane keeps pane 1's mountKey & key stable.
+  closeTabPane(tab.id, "p2_rebuilt");
+  tab = shellStore.get().tabs.find((t) => t.id === "ht:h1:sp-new:tb-fresh")!;
+  assert.equal(tab.mountKey ?? tab.id, preSyncMountKey);
+  assert.deepEqual(stableSplitLeafKeys(tabLeaves(tab)), ["agent:h1/hc:t1"]);
+});
+
+test("renameSpaceInShellStore migrates selectedSpace, activeBySpace, panelBySpace, navHistoryBySpace, and docSpaceName atomically", () => {
+  const h1 = "h1";
+  const oldSpaceKey = `${h1}\u0000alpha`;
+  const newSpaceKey = `${h1}\u0000renamed-alpha`;
+  const agents: Agent[] = [
+    { key: "h1/hc:t1", deviceId: h1, source: "hc", localId: "t1", harness: "zsh", where: "alpha", cwd: "~/work/alpha", status: "idle", isShell: true, updatedAt: 10 },
+  ];
+  liveStore.set({
+    link: "online",
+    devices: { h1: { id: h1, name: "mac", kind: "host", platform: "darwin", online: true, createdAt: 1, lastSeenAt: 1 } },
+    agents: { h1: agents },
+    spaces: { h1: [{ id: "sp-a", name: "alpha", folder: "~/work/alpha", tabs: 1, terminals: 1, active: true }] },
+    direct: {},
+    rev: 1,
+  });
+
+  reconcileHostHerdrDoc(h1, {
+    spaces: [
+      { id: "sp-a", name: "alpha", folder: "~/work/alpha", tabs: [{ id: "tb1", name: "", root: { id: "p1", type: "block", content: { terminal: "t1" } } }] },
+    ],
+  });
+  setSelectedSpace(oldSpaceKey);
+  togglePanel("files");
+  openFileTab("h1/hc:t1", "README.md", "README.md", { spaceKey: oldSpaceKey });
+
+  renameSpaceInShellStore(h1, "sp-a", "alpha", "renamed-alpha");
+
+  const st = shellStore.get();
+  assert.equal(st.selectedSpace, newSpaceKey);
+  assert.equal(st.activeBySpace[oldSpaceKey], undefined);
+  assert.equal(st.activeBySpace[newSpaceKey], "f:h1/hc:t1:README.md");
+  assert.equal(st.panelBySpace?.[oldSpaceKey], undefined);
+  assert.equal(st.panelBySpace?.[newSpaceKey], "files");
+  assert.equal(st.navHistoryBySpace?.[oldSpaceKey], undefined);
+  assert.deepEqual(st.navHistoryBySpace?.[newSpaceKey], ["ht:h1:sp-a:tb1", "f:h1/hc:t1:README.md"]);
+  assert.equal(st.tabs.find((t) => t.id === "ht:h1:sp-a:tb1")?.docSpaceName, "renamed-alpha");
+  const fileTab = st.tabs.find((t) => t.id === "f:h1/hc:t1:README.md");
+  assert.equal(fileTab?.kind === "file" ? fileTab.spaceKey : undefined, newSpaceKey);
+});
+
+test("terminal stability and pane-header hover guards prevent WebGL garbling and subagent jump", () => {
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const termSrc = readFileSync(resolve(testDir, "../src/components/TerminalSurface.tsx"), "utf8");
+  assert.equal(termSrc.includes("@xterm/addon-webgl"), false, "WebGL addon must remain disabled to prevent WKWebView glyph corruption");
+  assert.equal(termSrc.includes("useLayoutEffect("), true, "TerminalSurface should use useLayoutEffect for synchronous tab-switch repaint");
+  assert.equal(termSrc.includes("term.reset();\n            return connectLocal"), false, "connectLocal size drift should resize in place instead of term.reset()");
+
+  const shellCss = readFileSync(resolve(testDir, "../src/styles/shell.css"), "utf8");
+  const paneActionsBlock = /\.v3-pane-actions\s*\{[\s\S]*?\}/.exec(shellCss)?.[0] ?? "";
+  assert.equal(paneActionsBlock.includes("display: inline-flex"), true);
+  assert.equal(shellCss.includes(".v3-pane-actions {\n    display: none;"), false, "hover must not flip display:none -> inline-flex");
+
+  const shellWork = readFileSync(resolve(testDir, "../src/shell/ShellWork.tsx"), "utf8");
+  const paneRightIdx = shellWork.indexOf('<div className="v3-pane-right">');
+  const paneRightEnd = shellWork.indexOf("<div className=\"v3-pane-actions\">", paneRightIdx);
+  const paneRightSlice = shellWork.slice(paneRightIdx, paneRightEnd);
+  const statusIdx = paneRightSlice.indexOf("<StatusMark");
+  const subTriggerIdx = paneRightSlice.indexOf("<SubagentCatalogTrigger");
+  assert.ok(statusIdx >= 0 && subTriggerIdx > statusIdx, "StatusMark must precede SubagentCatalogTrigger in PaneHead");
+
+  const mockSrc = readFileSync(resolve(testDir, "../src/lib/mock.ts"), "utf8");
+  assert.equal(mockSrc.includes('method === "agent.seen"'), true, "desktop mock mode should handle agent.seen done->idle transition");
+
+  const inSplitBlock = /\.v3-row\.in-split\s*\{[\s\S]*?\}/.exec(shellCss)?.[0] ?? "";
+  assert.equal(inSplitBlock.includes("background: transparent"), true, ".v3-row.in-split must not paint a second pink row selection");
+  const sidebarSrc = readFileSync(resolve(testDir, "../src/shell/ShellSidebar.tsx"), "utf8");
+  assert.equal(sidebarSrc.includes("activeTabIdForSpace("), true, "ShellSidebar must scope activeTab via activeTabIdForSpace");
+  const desktopShellSrc = readFileSync(resolve(testDir, "../src/shell/DesktopShell.tsx"), "utf8");
+  assert.equal(desktopShellSrc.includes('leaf.content.kind === "file" || leaf.content.kind === "diff"'), true, "Escape should close standalone file/diff preview tabs single-level");
+});
+
+test("file links require Ctrl/Cmd modifier and HTML FileViewer stays scroll-stable across agent ticks", () => {
+  assert.equal(hasFileJumpModifier({ ctrlKey: false, metaKey: false }), false);
+  assert.equal(hasFileJumpModifier({ ctrlKey: true, metaKey: false }), true);
+  assert.equal(hasFileJumpModifier({ ctrlKey: false, metaKey: true }), true);
+
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const termSrc = readFileSync(resolve(testDir, "../src/components/TerminalSurface.tsx"), "utf8");
+  assert.equal(termSrc.includes("hasFileJumpModifier(ev)"), true);
+  assert.equal(termSrc.includes("pointerCursor: false"), true);
+
+  const wbSrc = readFileSync(resolve(testDir, "../src/views/WorkbenchView.tsx"), "utf8");
+  const fvStart = wbSrc.indexOf("export function FileViewer(");
+  const fvEnd = wbSrc.indexOf("// Browser pane", fvStart);
+  const fvSlice = wbSrc.slice(fvStart, fvEnd > fvStart ? fvEnd : undefined);
+  assert.equal(/,\s*\[agent\s*(?:,|\])/.test(fvSlice), false, "FileViewer hooks must depend on primitive agent fields, not object identity");
+  assert.equal(fvSlice.includes("capHtmlResolvedFor"), true, "HTML viewer must resolve capability URL before mounting iframe");
 });

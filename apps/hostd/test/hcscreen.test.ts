@@ -135,3 +135,22 @@ test("vt Screen treats U+10EEEE as width 1 and Kitty combining diacritics as wid
   // Verify exact column index (7 placeholder cells + 1 space = index 8 in codepoints)
   assert.equal([...lines[0]!.slice(0, lines[0]!.indexOf(" "))].filter((ch) => ch.codePointAt(0) === 0x10eeee).length, 7);
 });
+
+test("HcScreens swallows EPIPE / broken child stdin errors cleanly without crashing hostd", SH, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hc-epipe-"));
+  const bin = join(dir, "hc");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+process.stdin.destroy();
+process.exit(0);
+`,
+  );
+  chmodSync(bin, 0o755);
+  const screens = new HcScreens(bin);
+  try {
+    await assert.rejects(screens.resize("t1", 80, 24), /exited|lost hc|failed/i);
+  } finally {
+    screens.stop();
+  }
+});

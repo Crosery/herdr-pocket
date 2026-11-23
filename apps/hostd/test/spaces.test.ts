@@ -365,3 +365,112 @@ test("Host herdr.doc.get, herdr.doc.set CAS, and herdr.layout fallback when Herd
   assert.equal(layout.spaces.length, 1);
   assert.deepEqual(layout.spaces[0]!.tabs[0]!.terminals.map((t) => t.terminal), ["t1", "t2"]);
 });
+
+test("HerdrApp.spacesFromDocs and namesFromDocs derive folder-basename display names when docs.json space name is empty", () => {
+  const docsDir = join(tmp, "docs-unnamed");
+  mkdirSync(docsDir, { recursive: true });
+  const docsPath = join(docsDir, "docs.json");
+  const sharedPath = join(docsDir, "shared.json");
+  writeFileSync(sharedPath, JSON.stringify({}));
+  writeFileSync(
+    docsPath,
+    JSON.stringify({
+      "herdr-app": {
+        version: 2,
+        value: {
+          spaces: [
+            { id: "sp-u1", name: "", folder: "/Users/demo/work_file/geek_main", tabs: [] },
+            {
+              id: "sp-u2",
+              name: "",
+              folder: "/Users/demo/work_file/crosery_bentch_mark",
+              tabs: [{ id: "tb-u2", name: "Main", root: { id: "p-u2", type: "block", content: { terminal: "t-u2" } } }],
+            },
+          ],
+        },
+      },
+    }),
+  );
+
+  const app = new HerdrApp("herdr-app", { sharedJsonPath: sharedPath, docsJsonPath: docsPath });
+  const fromDocs = app.spacesFromDocs();
+  assert.deepEqual(
+    fromDocs.map((s) => ({ id: s.id, name: s.name, tabs: s.tabs })),
+    [
+      { id: "sp-u1", name: "geek_main", tabs: 0 },
+      { id: "sp-u2", name: "crosery_bentch_mark", tabs: 1 },
+    ],
+  );
+  const names = app.namesFromDocs();
+  assert.ok(names);
+  assert.equal(names.spaces.get("sp-u1"), "geek_main");
+  assert.equal(names.terminals?.get("t-u2")?.spaceName, "crosery_bentch_mark");
+});
+
+test("LAUNCHERS puts terminal shell first and Host herdr.command space.rename updates docs & labels even when window is closed", async () => {
+  const { LAUNCHERS } = await import("../src/create.ts");
+  assert.equal(LAUNCHERS[0]?.id, "shell");
+
+  const { Host } = await import("../src/host.ts");
+  const h = new Host({ config: { server: "http://127.0.0.1:9", token: "t", deviceId: "d", name: "test" }, log: () => {} });
+  h.sources = ["hc"];
+  h.deviceId = "d";
+
+  let docVersion = 5;
+  let storedDoc: Record<string, unknown> = {
+    spaces: [
+      {
+        id: "sp1",
+        name: "work",
+        folder: "/tmp/my-repo",
+        tabs: [{ id: "tb1", name: "Tab1", root: { id: "p1", type: "block", content: { terminal: "t1" } } }],
+      },
+    ],
+  };
+
+  h.app = new HerdrApp("herdr-app");
+  h.app.command = async () => {
+    throw new Error("桌面 herdr 没有打开，先在电脑上打开它");
+  };
+  h.app.ls = async () => {
+    throw new Error("桌面 herdr 没有打开，先在电脑上打开它");
+  };
+
+  const labeled: Array<{ addr: string; labels: Record<string, string> }> = [];
+  h.hc.terminals = new Map<string, HcTerminal>([
+    ["t1", { address: "t1", cwd: "/tmp/my-repo", labels: { "herdr.space": "sp1", where: "work / Tab1" } }],
+  ]);
+  h.hc.list = async () => {};
+  h.hc.docGet = async () => ({ value: storedDoc, version: docVersion });
+  h.hc.docSet = async (_name, val, ver) => {
+    assert.equal(ver, docVersion);
+    docVersion += 1;
+    storedDoc = val as Record<string, unknown>;
+    return docVersion;
+  };
+  h.hc.label = async (addr, labels) => {
+    labeled.push({ addr, labels });
+    const term = h.hc.terminals.get(addr);
+    if (term) term.labels = { ...(term.labels ?? {}), ...labels };
+  };
+
+  const handlers = (h as unknown as {
+    handlers: {
+      "herdr.command": (p: { command: string; args?: Record<string, unknown> }, from: string) => Promise<{ ok: boolean; result?: { id: string; name: string } }>;
+    };
+  }).handlers;
+
+  const renamed = await handlers["herdr.command"]({ command: "space.rename", args: { id: "sp1", name: "  Custom Name  " } }, "phone1");
+  assert.equal(renamed.ok, true);
+  assert.deepEqual(renamed.result, { id: "sp1", name: "Custom Name" });
+  assert.equal((storedDoc.spaces as Array<{ name: string }>)[0]!.name, "Custom Name");
+  assert.equal(h.hc.terminals.get("t1")?.labels?.where, "Custom Name / Tab1");
+  assert.deepEqual(labeled[0], { addr: "t1", labels: { where: "Custom Name / Tab1" } });
+
+  // Empty name resets back to folder basename ("my-repo").
+  const reset = await handlers["herdr.command"]({ command: "space.rename", args: { id: "sp1", name: "" } }, "phone1");
+  assert.equal(reset.ok, true);
+  assert.deepEqual(reset.result, { id: "sp1", name: "my-repo" });
+  assert.equal((storedDoc.spaces as Array<{ name: string }>)[0]!.name, "");
+  assert.equal(h.hc.terminals.get("t1")?.labels?.where, "my-repo / Tab1");
+});

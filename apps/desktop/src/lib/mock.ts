@@ -72,6 +72,10 @@ const DEMO_AGENTS: Agent[] = [
     turn: 2,
     subagents: 2,
     subagentsWorking: 1,
+    queued: 1,
+    queuedText: "顺便检查边界用例并补充集成测试",
+    queuedItems: ["顺便检查边界用例并补充集成测试"],
+    queuedSince: now - 25_000,
     isShell: false,
     sessionKey: "codex:demo-2",
     updatedAt: now,
@@ -144,7 +148,7 @@ const DEMO_AGENTS: Agent[] = [
 
 const DEMO_EVENTS: Record<string, ConvEvent[]> = {
   "dev-mac/hc:t1": [
-    { id: "e1", session: "claude:demo-1", ts: now - 8 * min, kind: "user_message", text: "检查一下 OAuth 回调校验，并准备迁移脚本。" },
+    { id: "e1", session: "claude:demo-1", ts: now - 8 * min, kind: "user_message", text: "检查一下 OAuth 回调校验，并对照架构图 `docs/oauth-flow.svg`。\n[Image #1] docs/oauth-flow.svg" },
     { id: "e2", session: "claude:demo-1", ts: now - 6 * min, kind: "tool_call", call_id: "c1", name: "read_file", input: { path: "src/auth/callback.ts" } },
     { id: "e3", session: "claude:demo-1", ts: now - 5 * min, kind: "tool_result", call_id: "c1", name: "read_file", output: "已读取 142 行代码。", is_error: false },
     {
@@ -156,7 +160,7 @@ const DEMO_EVENTS: Record<string, ConvEvent[]> = {
     },
   ],
   "dev-mac/hc:t2": [
-    { id: "e21", session: "codex:demo-2", ts: now - 9 * min, kind: "user_message", text: "跑一遍端到端测试并修掉超时的用例。" },
+    { id: "e21", session: "codex:demo-2", ts: now - 9 * min, kind: "user_message", text: "跑一遍端到端测试并修掉超时的用例，顺便核对 `README.md` 和流程图 `docs/oauth-flow.svg`。\n[Image #1] docs/oauth-flow.svg" },
     { id: "e22", session: "codex:demo-2", ts: now - 8 * min, kind: "reasoning", text: "先读取 relay 和 stream 相关测试与超时配置，找出慢测试的根因。" },
     { id: "e23", session: "codex:demo-2", ts: now - 7 * min, kind: "tool_call", call_id: "c21", name: "read_file", input: { path: "tests/relay.test.ts" } },
     { id: "e24", session: "codex:demo-2", ts: now - 7 * min + 500, kind: "tool_result", call_id: "c21", name: "read_file", output: "184 lines read", is_error: false },
@@ -236,6 +240,13 @@ const DEMO_FILES: Array<{ dir: string; name: string; kind: "file" | "dir"; size?
   { dir: "", name: ".env", kind: "file", size: 120, private: true, hidden: true },
   {
     dir: "docs",
+    name: "oauth-flow.svg",
+    kind: "file",
+    size: 360,
+    body: '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="160" viewBox="0 0 320 160"><rect width="320" height="160" rx="12" fill="#fdf2f7" stroke="#f0b6cf"/><text x="160" y="76" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#9d174d">OAuth PKCE Flow</text><text x="160" y="102" text-anchor="middle" font-family="monospace" font-size="12" fill="#be185d">callback.ts -> token verify</text></svg>',
+  },
+  {
+    dir: "docs",
     name: "external-delivery-sequence.html",
     kind: "file",
     size: 280,
@@ -246,8 +257,8 @@ const DEMO_FILES: Array<{ dir: string; name: string; kind: "file" | "dir"; size?
     name: "README.md",
     kind: "file",
     gitStatus: "M",
-    size: 220,
-    body: "# demo-app\n\n演示用的小项目。\n\n## 开发\n\n- `pnpm install`\n- `pnpm dev`\n\n登录回调在 `src/auth/callback.ts`。\n",
+    size: 250,
+    body: "# demo-app\n\n演示用的小项目。\n\n## 开发\n\n- `pnpm install`\n- `pnpm dev`\n\n登录回调在 `src/auth/callback.ts`，流程示意图在 `docs/oauth-flow.svg`。\n",
   },
   { dir: "", name: "package.json", kind: "file", size: 160, body: '{\n  "name": "demo-app",\n  "private": true,\n  "scripts": {\n    "dev": "vite",\n    "test": "vitest run"\n  }\n}\n' },
   { dir: "src", name: "auth", kind: "dir" },
@@ -478,6 +489,36 @@ const demoHerdrDocs: Record<string, { value: HerdrDoc; version: number }> = {
   },
 };
 
+const DEMO_SPACE_COLORS: Record<string, string> = {
+  "sp-1": "ansi6",
+  "sp-2": "ansi3",
+  "sp-3": "ansi5",
+  "sp-lin-1": "ansi3",
+};
+
+function countDocRootTerminals(node: any): number {
+  if (!node || typeof node !== "object") return 0;
+  if (node.type === "block") return node.content?.terminal ? 1 : 0;
+  if (Array.isArray(node.children)) {
+    return node.children.reduce((n: number, c: any) => n + countDocRootTerminals(c), 0);
+  }
+  return 0;
+}
+
+function demoSpacesForHost(hostId: string) {
+  const entry = demoHerdrDocs[hostId];
+  if (!entry) return [];
+  return entry.value.spaces.map((sp, i) => ({
+    id: sp.id,
+    name: sp.name,
+    folder: sp.folder,
+    tabs: sp.tabs.length,
+    terminals: sp.tabs.reduce((n, tb) => n + countDocRootTerminals(tb.root), 0),
+    ...(DEMO_SPACE_COLORS[sp.id] ? { color: DEMO_SPACE_COLORS[sp.id] } : {}),
+    ...(i === 0 ? { active: true } : {}),
+  }));
+}
+
 export const mockApi = {
   pair(_code: string, name: string, platform: string): PairResponse {
     const me: Device = { id: "dev-viewer", name, kind: "viewer", platform, online: true, createdAt: Date.now(), lastSeenAt: Date.now() };
@@ -492,14 +533,8 @@ export const mockApi = {
       devices: Object.fromEntries(DEMO_DEVICES.map((d) => [d.id, d])),
       agents,
       spaces: {
-        "dev-mac": [
-          { id: "sp-1", name: "backend", folder: "~/work/demo-app", tabs: 3, terminals: 3, color: "ansi6", active: true },
-          { id: "sp-2", name: "release", folder: "~/repos/sample-cli", tabs: 0, terminals: 0, color: "ansi3" },
-          { id: "sp-3", name: "sandbox", folder: "~/scratch", tabs: 0, terminals: 0, color: "ansi5" },
-        ],
-        "dev-linux": [
-          { id: "sp-lin-1", name: "release", folder: "~/repos/sample-cli", tabs: 1, terminals: 1, color: "ansi3", active: true },
-        ],
+        "dev-mac": demoSpacesForHost("dev-mac"),
+        "dev-linux": demoSpacesForHost("dev-linux"),
       },
       rev: liveStore.get().rev + 1,
     });
@@ -537,16 +572,12 @@ export const mockApi = {
     }
     if (method === "spaces.list") {
       return {
-        spaces: [
-          { id: "sp-1", name: "backend", folder: "~/work/demo-app", tabs: 3, terminals: 3, color: "ansi6", active: true },
-          { id: "sp-2", name: "release", folder: "~/repos/sample-cli", tabs: 1, terminals: 1, color: "ansi3" },
-          { id: "sp-3", name: "sandbox", folder: "~/scratch", tabs: 1, terminals: 0, color: "ansi5" },
-        ],
+        spaces: demoSpacesForHost(to),
         launchers: [
+          { id: "shell", label: "终端", takesTask: false },
           { id: "claude", label: "Claude Code", takesTask: true },
           { id: "codex", label: "Codex", takesTask: true },
           { id: "gemini", label: "Gemini CLI", takesTask: true },
-          { id: "shell", label: "普通终端", takesTask: false },
         ],
         folders: ["~/work/demo-app", "~/repos/sample-cli"],
         canCreate: true,
@@ -691,6 +722,28 @@ export const mockApi = {
       DEMO_TERMINALS[key] = [`zsh · ${hitFolder}`, `${hitFolder} $ `];
       mockApi.connect();
       return { ok: true, result: { pane: newPaneId, terminal: termId } };
+    }
+    if (method === "herdr.command" && params?.command === "space.rename") {
+      const spaceId = String(params?.args?.id ?? "").trim();
+      const rawName = String(params?.args?.name ?? "").trim();
+      const entry = demoHerdrDocs[to];
+      const sp = entry?.value.spaces.find((s) => s.id === spaceId);
+      if (!sp || !entry) throw new Error("找不到这个空间");
+      const autoName = (sp.folder || "").replace(/[\\/]+$/, "").split("/").filter(Boolean).pop() || sp.id;
+      const nextName = rawName || autoName;
+      const oldName = sp.name;
+      sp.name = nextName;
+      entry.version += 1;
+      for (const ag of DEMO_AGENTS) {
+        if (ag.deviceId !== to || !ag.where) continue;
+        if (ag.where === oldName) {
+          ag.where = nextName;
+        } else if (oldName && ag.where.startsWith(`${oldName} / `)) {
+          ag.where = `${nextName}${ag.where.slice(oldName.length)}`;
+        }
+      }
+      mockApi.connect();
+      return { ok: true, result: { id: sp.id, name: nextName } };
     }
     if (method === "folders.list") {
       const req = (params.path ?? "").trim() || "~";
@@ -865,7 +918,30 @@ export const mockApi = {
       };
     }
     if (method === "space.delete") {
-      return { ok: true as const, closedTerminals: 0 };
+      const entry = demoHerdrDocs[to];
+      const reqId = typeof params?.spaceId === "string" ? params.spaceId : "";
+      const reqName = typeof params?.spaceName === "string" ? params.spaceName : "";
+      let closedTerminals = 0;
+      if (entry) {
+        const sp = entry.value.spaces.find((s) => (reqId ? s.id === reqId : s.name === reqName));
+        if (sp) {
+          entry.value.spaces = entry.value.spaces.filter((s) => s.id !== sp.id);
+          entry.version += 1;
+          const spName = sp.name;
+          for (let i = DEMO_AGENTS.length - 1; i >= 0; i -= 1) {
+            const ag = DEMO_AGENTS[i]!;
+            const agSp = ag.where?.split(" / ")[0]?.trim() ?? "";
+            if (ag.deviceId === to && agSp === spName) {
+              DEMO_AGENTS.splice(i, 1);
+              delete DEMO_EVENTS[ag.key];
+              delete DEMO_TERMINALS[ag.key];
+              closedTerminals += 1;
+            }
+          }
+          mockApi.connect();
+        }
+      }
+      return { ok: true as const, closedTerminals };
     }
     if (method === "git.status") {
       const root = (typeof params.cwd === "string" && params.cwd.trim()) || "~/work/demo-app";
@@ -1018,9 +1094,31 @@ export const mockApi = {
       return { ok: true };
     }
     if (method === "agent.create") {
-      const id = `t${Date.now() % 10000}`;
+      const id = `t${++mockTermSeq}`;
+      const newTabId = `tb${++mockTermSeq}`;
+      const newPaneId = `p${++mockPaneSeq}`;
       const key = `${to}/hc:${id}`;
       const isShell = params.launcher === "shell";
+      const docEntry = (demoHerdrDocs[to] ??= { value: { spaces: [] }, version: 1 });
+      let targetSpace =
+        (params.space ? docEntry.value.spaces.find((sp) => sp.id === params.space) : undefined) ??
+        (params.spaceName ? docEntry.value.spaces.find((sp) => sp.name === params.spaceName) : undefined);
+      if (!targetSpace) {
+        const spId = params.space || `sp-${++mockTermSeq}`;
+        const spFolder = params.folder || "~/work/demo-app";
+        const spName = params.spaceName || spFolder.split("/").filter(Boolean).pop() || "workspace";
+        targetSpace = { id: spId, name: spName, folder: spFolder, tabs: [] };
+        docEntry.value.spaces.push(targetSpace);
+      }
+      targetSpace.tabs.push({
+        id: newTabId,
+        name: params.tabName || "",
+        root: { id: newPaneId, type: "block", content: { terminal: id } },
+      });
+      docEntry.version += 1;
+
+      const resolvedCwd = params.folder || targetSpace.folder || "~/work/demo-app";
+      const tabLabel = params.tabName || `${targetSpace.tabs.length}`;
       const ag: Agent = {
         key,
         deviceId: to,
@@ -1028,8 +1126,8 @@ export const mockApi = {
         localId: id,
         harness: isShell ? "zsh" : params.launcher || "claude-code",
         title: params.task || params.tabName || (isShell ? "终端" : "新建 Agent"),
-        where: `${params.spaceName || "workspace"} / ${params.tabName || id}`,
-        cwd: params.folder || "~/work/demo-app",
+        where: `${targetSpace.name} / ${tabLabel}`,
+        cwd: resolvedCwd,
         status: isShell ? "idle" : "working",
         statusSince: Date.now(),
         isShell,
@@ -1040,7 +1138,20 @@ export const mockApi = {
       DEMO_EVENTS[key] = !isShell && params.task ? [{ id: `u-${Date.now()}`, session: ag.sessionKey!, ts: Date.now(), kind: "user_message", text: params.task }] : [];
       DEMO_TERMINALS[key] = [`${ag.harness} · ${ag.cwd}`, params.task ? `$ ${params.task}` : "$ ready"];
       mockApi.connect();
-      return { agent: key, space: params.space || "sp-new", terminal: id, task: "started" };
+      return { agent: key, space: targetSpace.id, tab: newTabId, terminal: id, task: "started" };
+    }
+    if (method === "agent.seen") {
+      const reqKey = String(params?.agent ?? "");
+      let changed = false;
+      for (const a of DEMO_AGENTS) {
+        if ((a.key === reqKey || a.localId === reqKey) && a.status === "done") {
+          a.status = "idle";
+          a.updatedAt = Date.now();
+          changed = true;
+        }
+      }
+      if (changed) mockApi.connect();
+      return { ok: true };
     }
     return { ok: true };
   },

@@ -968,7 +968,7 @@
   transform: translateX(-50%);
   z-index: 7;
   width: 28px;
-  height: 16px;
+  height: 11px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1055,6 +1055,15 @@
   display: inline-flex;
   align-items: center;
   gap: 2px;
+  opacity: 0.72;
+  transition: opacity 0.14s ease;
+}
+
+.v3-pane-head:hover .v3-pane-actions,
+.v3-pane:has(> .v3-pane-grip:hover) .v3-pane-actions,
+.v3-pane-actions:focus-within,
+.v3-pane-head[data-menu-open="true"] .v3-pane-actions {
+  opacity: 1;
 }
 
 .v3-pane-tool-btn {
@@ -1082,18 +1091,7 @@
   border-color: color-mix(in srgb, var(--v3-accent) 45%, var(--v3-border));
 }
 
-@media (hover: hover) {
-  .v3-pane-actions {
-    display: none;
-  }
-
-  .v3-pane-head:hover .v3-pane-actions,
-  .v3-pane:has(> .v3-pane-grip:hover) .v3-pane-actions,
-  .v3-pane-actions:focus-within,
-  .v3-pane-head[data-menu-open="true"] .v3-pane-actions {
-    display: inline-flex;
-  }
-}
+/* Pane action icons stay visible at subtle opacity so hovering never shifts sibling pills or triggers. */
 
 .v3-pane-head > svg {
   flex: none;
@@ -1118,7 +1116,22 @@
 }
 
 .v3-row.in-split {
-  background: color-mix(in srgb, var(--v3-selected) 52%, transparent);
+  background: transparent;
+}
+
+.v3-row.in-split:hover {
+  background: var(--v3-hover);
+}
+
+.v3-row.in-split::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 7px;
+  bottom: 7px;
+  width: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--v3-accent) 48%, transparent);
 }
 
 .v3-pane-name.grow {

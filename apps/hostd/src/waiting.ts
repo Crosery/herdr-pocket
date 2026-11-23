@@ -30,8 +30,48 @@ export interface InputWaitsOptions {
 
 const fold = (s: string) => s.replace(/\s+/g, "");
 
+function formatWaitPreview(raw: string): string {
+  const { text, count } = splitFiles(raw);
+  const words = text.replace(/\s+/g, " ").trim();
+  return count ? [words, `图片 ×${count}`].filter(Boolean).join(" · ") : words;
+}
+
+function sameQueuedPreview(a: string, b: string): boolean {
+  if (a === b || sameMessage(a, b)) return true;
+  const fa = fold(splitFiles(a).text || a);
+  const fb = fold(splitFiles(b).text || b);
+  if (!fa || !fb) return false;
+  if (fa === fb) return true;
+  if ((a.endsWith("…") || a.endsWith("...")) && fb.startsWith(fa.replace(/(?:\.\.\.|…)+$/, ""))) return true;
+  if ((b.endsWith("…") || b.endsWith("...")) && fa.startsWith(fb.replace(/(?:\.\.\.|…)+$/, ""))) return true;
+  return false;
+}
+
+function mergeQueuedLists(...lists: ReadonlyArray<ReadonlyArray<string> | undefined>): string[] {
+  const out: string[] = [];
+  for (const list of lists) {
+    if (!list?.length) continue;
+    for (const raw of list) {
+      const clean = raw.replace(/\s+/g, " ").trim();
+      if (!clean) continue;
+      const existingIdx = out.findIndex((item) => sameQueuedPreview(item, clean));
+      if (existingIdx >= 0) {
+        const prev = out[existingIdx]!;
+        if ((prev.endsWith("…") || prev.endsWith("...")) && !clean.endsWith("…") && !clean.endsWith("...") && clean.length > prev.length) {
+          out[existingIdx] = clean;
+        }
+        continue;
+      }
+      out.push(clean);
+      if (out.length >= 20) return out;
+    }
+  }
+  return out;
+}
+
 export class InputWaits {
   private byAgent = new Map<string, Waiting[]>();
+  private screenQueued = new Map<string, string[]>();
   private opts: InputWaitsOptions;
 
   constructor(opts: InputWaitsOptions = {}) {
@@ -54,17 +94,47 @@ export class InputWaits {
     return this.byAgent.get(agentKey) ?? [];
   }
 
+  setScreenQueued(agentKey: string, items: string[]): boolean {
+    const clean = items.map((x) => x.replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 20);
+    const prev = this.screenQueued.get(agentKey);
+    if (clean.length === 0) {
+      if (!prev) return false;
+      this.screenQueued.delete(agentKey);
+      return true;
+    }
+    if (prev && prev.length === clean.length && prev.every((v, i) => v === clean[i])) return false;
+    this.screenQueued.set(agentKey, clean);
+    return true;
+  }
+
+  pruneScreenQueued(activeKeys: Set<string>): boolean {
+    let changed = false;
+    for (const key of [...this.screenQueued.keys()]) {
+      if (!activeKeys.has(key)) {
+        this.screenQueued.delete(key);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
   /** The agents with their `queued` fields set (or cleared). */
   decorate(agents: Agent[]): Agent[] {
     return agents.map((a) => {
       const list = this.byAgent.get(a.key);
-      if (!list?.length) return a;
-      const first = list[0]!;
-      // Pictures go in as paths on this computer: the preview names them, not where they are.
-      const { text, count } = splitFiles(first.text);
-      const words = text.replace(/\s+/g, " ").trim();
-      const preview = count ? [words, `图片 ×${count}`].filter(Boolean).join(" · ") : words;
-      return { ...a, queued: list.length, queuedText: Array.from(preview).length > 80 ? `${Array.from(preview).slice(0, 80).join("")}…` : preview, queuedSince: first.at };
+      const waitTexts = list?.length ? list.map((w) => formatWaitPreview(w.text)).filter(Boolean) : undefined;
+      const screenList = a.status === "working" || a.status === "blocked" ? this.screenQueued.get(a.key) : undefined;
+      const items = mergeQueuedLists(a.queuedItems, waitTexts, screenList);
+      if (!items.length && !list?.length) return a;
+      const first = list?.[0];
+      const head = items[0] ?? (first ? formatWaitPreview(first.text) : "");
+      return {
+        ...a,
+        queued: Math.max(items.length, list?.length ?? 0),
+        ...(items.length ? { queuedItems: items } : {}),
+        queuedText: Array.from(head).length > 80 ? `${Array.from(head).slice(0, 80).join("")}…` : head,
+        ...(first?.at !== undefined ? { queuedSince: first.at } : a.queuedSince !== undefined ? { queuedSince: a.queuedSince } : {}),
+      };
     });
   }
 
