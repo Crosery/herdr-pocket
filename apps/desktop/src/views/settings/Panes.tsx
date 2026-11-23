@@ -296,6 +296,8 @@ export function ConnectionPane({ onConnectRelay, onPairPhone }: { onConnectRelay
 
 export function NotificationsPane() {
   const denoise = settingsStore.use((s) => s.denoise);
+  const alertSound = settingsStore.use((s) => s.alertSound);
+  const alertChimeOnlyLongTasks = settingsStore.use((s) => s.alertChimeOnlyLongTasks);
   return (
     <div className="pane">
       <PaneTitle title="通知" />
@@ -307,6 +309,16 @@ export function NotificationsPane() {
           void refreshNotifyChannel();
         }}
       />
+      <SetRow title="提示音" about="后台 Agent 需要你确认或长任务完成时播放轻柔提示音">
+        <PocketSwitch checked={alertSound} onCheckedChange={(v) => updateSettings({ alertSound: v })} label="提示音" />
+      </SetRow>
+      <SetRow title="仅长耗时任务完成时响铃" about="超过 45 秒完成的任务才播放完成提示音（阻塞确认始终响铃）">
+        <PocketSwitch
+          checked={alertChimeOnlyLongTasks}
+          onCheckedChange={(v) => updateSettings({ alertChimeOnlyLongTasks: v })}
+          label="仅长耗时任务完成时响铃"
+        />
+      </SetRow>
       <SetRow title="测试通知">
         <PocketButton size="sm" variant="ghost" onClick={() => void pushSystemNotification("Herdr Pocket", "通知能正常弹出")}>
           发一条试试

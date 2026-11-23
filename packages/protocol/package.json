@@ -1,6 +1,6 @@
 {
   "name": "@herdr-pocket/protocol",
-  "version": "0.2.23",
+  "version": "0.2.24",
   "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",

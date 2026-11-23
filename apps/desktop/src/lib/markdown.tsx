@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Check, Copy, FileText } from "lucide-react";
+import { AlertCircle, Check, Copy, FileText, Info, Sparkles } from "lucide-react";
 import { copyToClipboard, openExternalUrl } from "./bridge";
 import { hasFileJumpModifier, looksLikeClickableFilePath } from "./openFileTarget";
 
@@ -295,13 +295,42 @@ export function RichMarkdown({
         quoteLines.push(lines[j]!.replace(/^\s*>\s?/, ""));
         j++;
       }
-      blocks.push(
-        <blockquote key={k++} className="md-quote">
-          {quoteLines.map((ql, qi) => (
-            <div key={qi}>{ql.trim() ? renderInline(ql, onOpenFile) : <div style={{ height: 4 }} />}</div>
-          ))}
-        </blockquote>,
-      );
+      const alertMatch = quoteLines.length > 0 ? /^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$/i.exec(quoteLines[0]!) : null;
+      if (alertMatch) {
+        const kind = alertMatch[1]!.toLowerCase() as "note" | "tip" | "important" | "warning" | "caution";
+        const meta = {
+          note: { label: "说明", Icon: Info },
+          tip: { label: "提示", Icon: Sparkles },
+          important: { label: "重要", Icon: AlertCircle },
+          warning: { label: "注意", Icon: AlertCircle },
+          caution: { label: "警告", Icon: AlertCircle },
+        }[kind];
+        const bodyLines = [...(alertMatch[2]?.trim() ? [alertMatch[2].trim()] : []), ...quoteLines.slice(1)];
+        const AlertIcon = meta.Icon;
+        blocks.push(
+          <div key={k++} className={`md-alert md-alert-${kind}`} role="note">
+            <div className="md-alert-head">
+              <AlertIcon size={13} />
+              <span>{meta.label}</span>
+            </div>
+            {bodyLines.length > 0 ? (
+              <div className="md-alert-body">
+                {bodyLines.map((ql, qi) => (
+                  <div key={qi}>{ql.trim() ? renderInline(ql, onOpenFile) : <div style={{ height: 4 }} />}</div>
+                ))}
+              </div>
+            ) : null}
+          </div>,
+        );
+      } else {
+        blocks.push(
+          <blockquote key={k++} className="md-quote">
+            {quoteLines.map((ql, qi) => (
+              <div key={qi}>{ql.trim() ? renderInline(ql, onOpenFile) : <div style={{ height: 4 }} />}</div>
+            ))}
+          </blockquote>,
+        );
+      }
       i = j - 1;
       continue;
     }

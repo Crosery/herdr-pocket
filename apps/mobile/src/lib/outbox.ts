@@ -6,7 +6,8 @@
  * retry). Sends to one agent go out one after another in the order written, so
  * a message with pictures is never overtaken by a quicker one after it.
  */
-import type { Agent } from "@herdr-pocket/protocol";
+import { create } from "zustand";
+import { matchesOptimisticCommand, type Agent } from "@herdr-pocket/protocol";
 import { sameMessage, sendWithPictures, type Attachment } from "./attach";
 import { RelayError } from "./relay";
 import { findAgent, usePending, type PendingSend, type SendState } from "./store";
@@ -42,6 +43,55 @@ const lines = new Map<string, Promise<unknown>>();
 /** Queue events that arrived before the send's own answer, by queue id. */
 const early = new Map<string, QueueEvent>();
 
+export interface CapturedMobileCommand {
+  id: string;
+  agentKey: string;
+  command: string;
+  output: string;
+  isError: boolean;
+  panelState: "none" | "closed" | "interactive_open";
+  ts: number;
+}
+
+const EMPTY_CAPTURED_MOBILE: CapturedMobileCommand[] = [];
+
+export const useCapturedCommands = create<{
+  byAgent: Record<string, CapturedMobileCommand[]>;
+  add: (entry: CapturedMobileCommand) => void;
+  dismiss: (agentKey: string, id: string) => void;
+  markPanelClosed: (agentKey: string, id: string) => void;
+}>((set) => ({
+  byAgent: {},
+  add: (entry) =>
+    set((s) => ({
+      byAgent: {
+        ...s.byAgent,
+        [entry.agentKey]: [...(s.byAgent[entry.agentKey] ?? EMPTY_CAPTURED_MOBILE), entry].slice(-12),
+      },
+    })),
+  dismiss: (agentKey, id) =>
+    set((s) => {
+      const cur = s.byAgent[agentKey];
+      if (!cur) return s;
+      const next = cur.filter((c) => c.id !== id);
+      const map = { ...s.byAgent };
+      if (next.length) map[agentKey] = next;
+      else delete map[agentKey];
+      return { byAgent: map };
+    }),
+  markPanelClosed: (agentKey, id) =>
+    set((s) => {
+      const cur = s.byAgent[agentKey];
+      if (!cur) return s;
+      return {
+        byAgent: {
+          ...s.byAgent,
+          [agentKey]: cur.map((c) => (c.id === id ? { ...c, panelState: "closed" } : c)),
+        },
+      };
+    }),
+}));
+
 const patch = (agentKey: string, id: string, p: Partial<Omit<PendingSend, "id">>) => usePending.getState().update(agentKey, id, p);
 const find = (agentKey: string, id: string) => usePending.getState().byAgent[agentKey]?.find((x) => x.id === id);
 
@@ -70,10 +120,10 @@ function attachmentsFromDataUris(id: string, uris?: string[]): Attachment[] {
 }
 
 /** Shows the message at once, then sends it after any earlier ones to the same agent. */
-export function sendOut(agent: Agent, text: string, pictures: Attachment[] = []): Promise<SendResult> {
+export function sendOut(agent: Agent, text: string, pictures: Attachment[] = [], delivery: "auto" | "steer" = "auto"): Promise<SendResult> {
   const id = usePending.getState().add(agent.key, text, pictures.map((x) => `data:${x.mime};base64,${x.data}`));
   if (pictures.length) keep.set(id, pictures);
-  return deliver(agent, id, text);
+  return deliver(agent, id, text, delivery);
 }
 
 /** Resends a message in place. An unconfirmed send needs explicit consent to risk a duplicate. */
@@ -90,7 +140,7 @@ export function resend(agentKey: string, id: string, allowDuplicate = false): Pr
     if (restored.length) keep.set(id, restored);
   }
   patch(agentKey, id, { state: "sending", ts: Date.now(), error: undefined, queueId: undefined, waiting: undefined, sentAt: undefined });
-  return deliver(agent, id, x.text);
+  return deliver(agent, id, x.text, "auto");
 }
 
 /** Takes messages off the screen (and their kept pictures). */
@@ -99,7 +149,7 @@ export function forget(agentKey: string, ids: string[]) {
   usePending.getState().drop(agentKey, ids);
 }
 
-function deliver(agent: Agent, id: string, text: string): Promise<SendResult> {
+function deliver(agent: Agent, id: string, text: string, delivery: "auto" | "steer" = "auto"): Promise<SendResult> {
   const run = (lines.get(agent.key) ?? Promise.resolve()).then(async (): Promise<SendResult> => {
     try {
       let pictures = keep.get(id);
@@ -110,8 +160,22 @@ function deliver(agent: Agent, id: string, text: string): Promise<SendResult> {
           pictures = restored;
         }
       }
-      const { accepted } = await sendWithPictures(agent, text, pictures ?? []);
+      const { accepted } = await sendWithPictures(agent, text, pictures ?? [], delivery);
       if (!accepted.queueId) keep.delete(id);
+      const cap = accepted.commandCapture;
+      if (cap && (cap.output || cap.panelState === "interactive_open")) {
+        useCapturedCommands.getState().add({
+          id: `cap-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          agentKey: agent.key,
+          command: cap.command || text.trim(),
+          output: cap.output ?? "",
+          isError: Boolean(cap.isError),
+          panelState: cap.panelState ?? "none",
+          ts: Date.now(),
+        });
+        forget(agent.key, [id]);
+        return { ok: true };
+      }
       const waiting = !!accepted.waiting;
       const behind = (accepted.position ?? 0) > 0;
       // Older computers send no queue events: accepted is as far as the phone can follow.
@@ -167,6 +231,8 @@ export interface ConvRow {
   type: string;
   id: string;
   text?: string;
+  summary?: string;
+  label?: string;
   ts?: number;
 }
 
@@ -207,12 +273,28 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
   // Confirmed sends claim first. Ambiguous sends can still have a transcript echo.
   const open = sends.filter((x) => !x.echo && x.state !== "failed").sort((a, b) => Number(a.state === "uncertain") - Number(b.state === "uncertain") || a.ts - b.ts);
   for (const x of open) {
-    const hit = users.find(({ r, i }) => !claimed.has(i) && (r.ts ?? 0) >= x.ts - ECHO_SLACK_MS && sameMessage(r.text ?? "", x.text, !!x.pictures?.length));
-    if (!hit) continue;
-    claimed.add(hit.i);
-    echoes.set(hit.r.id, x);
-    echoAt.set(x.id, hit.i);
-    patches.push({ id: x.id, patch: { echo: hit.r.id, state: "sent", error: undefined } });
+    const isSlash = x.text.trim().startsWith("/");
+    let hitIdx = users.findIndex(({ r, i }) => !claimed.has(i) && (r.ts ?? 0) >= x.ts - ECHO_SLACK_MS && sameMessage(r.text ?? "", x.text, !!x.pictures?.length));
+    let matchedRowIdx = hitIdx >= 0 ? users[hitIdx]!.i : -1;
+    if (matchedRowIdx < 0 && isSlash) {
+      matchedRowIdx = rows.findIndex(
+        (r, i) =>
+          !claimed.has(i) &&
+          ((r.ts ?? 0) === 0 || (r.ts ?? 0) >= x.ts - ECHO_SLACK_MS) &&
+          matchesOptimisticCommand(x.text, {
+            kind: r.type,
+            summary: r.summary,
+            text: r.text,
+            label: r.label,
+          }),
+      );
+    }
+    if (matchedRowIdx < 0) continue;
+    const hitRow = rows[matchedRowIdx]!;
+    claimed.add(matchedRowIdx);
+    echoes.set(hitRow.id, x);
+    echoAt.set(x.id, matchedRowIdx);
+    patches.push({ id: x.id, patch: { echo: hitRow.id, state: "sent", error: undefined } });
   }
 
   const shown: PendingSend[] = [];
@@ -228,7 +310,8 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
       continue;
     }
     const since = x.state === "sent" ? (x.sentAt ?? x.ts) : x.ts;
-    if (now - since > TTL[x.state]) drop.push(x.id);
+    const ttlMs = x.state === "sent" && x.text.trim().startsWith("/") ? 8_000 : TTL[x.state];
+    if (now - since > ttlMs) drop.push(x.id);
     else shown.push(x);
   }
 
@@ -238,8 +321,12 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
     const at = echoAt.get(last.id);
     const state = at !== undefined ? "sent" : shown.find((x) => x.id === last.id)?.state;
     if (state === "sent") {
-      // A reply is anything the agent wrote or did after the message (or, not matched yet, after it was sent).
-      awaiting = !rows.some((r, i) => r.type !== "user" && r.type !== "system" && (at !== undefined ? i > at : (r.ts ?? 0) >= last.ts));
+      if (last.text.trim().startsWith("/") && at !== undefined) {
+        awaiting = false;
+      } else {
+        // A reply is anything the agent wrote or did after the message (or, not matched yet, after it was sent).
+        awaiting = !rows.some((r, i) => r.type !== "user" && r.type !== "system" && r.type !== "model_switch" && (at !== undefined ? i > at : (r.ts ?? 0) >= last.ts));
+      }
     }
   }
   return { shown, echoes, drop, patches, awaiting };

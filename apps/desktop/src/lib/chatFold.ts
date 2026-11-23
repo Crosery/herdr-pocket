@@ -1,7 +1,11 @@
 import {
   compareConvEvents,
   formatModelSwitchSummary,
+  isCommandErrorOutput,
+  isDismissedCommandOutput,
+  parseLocalCommandOutputTag,
   parseModelSwitchEvent,
+  parseSlashCommandTag,
   splitFiles,
   type ChatDisplayMode,
   type ConvEvent,
@@ -33,11 +37,27 @@ export interface ToolSeriesChip {
   error: boolean;
 }
 
+export type TurnEntry =
+  | { kind: "thinking"; id: string; text: string; ts: number }
+  | { kind: "tool"; id: string; step: ToolStep; ts: number }
+  | { kind: "note"; id: string; summary: string; text: string; ts: number };
+
 export type ChatRow =
   | { kind: "user"; id: string; text: string; ts: number; pos?: string; injected?: string; attachedLines: string[]; attachedCount: number }
   | { kind: "assistant"; id: string; text: string; ts: number; pos?: string; partial?: boolean; model?: string }
   | { kind: "thinking"; id: string; text: string; ts: number; pos?: string; defaultOpen?: boolean }
   | { kind: "system"; id: string; summary: string; text: string; ts: number; pos?: string }
+  | {
+      kind: "command_result";
+      id: string;
+      command: string;
+      text: string;
+      isError: boolean;
+      panelState?: "none" | "closed" | "interactive_open";
+      ts: number;
+      pos?: string;
+    }
+  | { kind: "compact_notice"; id: string; summary: string; text: string; ts: number; pos?: string }
   | { kind: "model_switch"; id: string; label: string; model?: string; thinking?: string; ts: number; pos?: string }
   | { kind: "tool"; id: string; ts: number; pos?: string; step: ToolStep }
   | {
@@ -49,6 +69,8 @@ export type ChatRow =
       tools: ToolStep[];
       thoughts: string[];
       notes: Array<{ summary: string; text: string }>;
+      entries: TurnEntry[];
+      latestThought?: string;
       running: boolean;
       failedCount: number;
       headline: string;
@@ -56,6 +78,7 @@ export type ChatRow =
       activeStep?: ToolStep;
       series: ToolSeriesChip[];
       defaultOpen?: boolean;
+      hasFollowingAssistant?: boolean;
     }
   | { kind: "turn_end"; id: string; ts: number; pos?: string };
 
@@ -73,7 +96,7 @@ function sameEvent(a: ConvEvent, b: ConvEvent): boolean {
     case "reasoning":
       return (b.kind === a.kind) && a.text === b.text;
     case "system":
-      return b.kind === "system" && a.text === b.text && a.summary === b.summary;
+      return b.kind === "system" && a.subtype === b.subtype && a.text === b.text && a.summary === b.summary;
     case "tool_call":
       return b.kind === "tool_call" && a.name === b.name && a.call_id === b.call_id && JSON.stringify(a.input) === JSON.stringify(b.input);
     case "tool_result":
@@ -319,12 +342,13 @@ function buildGroupMeta(
   notes: Array<{ summary: string; text: string }>,
 ): Pick<
   Extract<ChatRow, { kind: "activity_group" }>,
-  "running" | "failedCount" | "headline" | "detailLine" | "activeStep" | "series"
+  "running" | "failedCount" | "headline" | "detailLine" | "activeStep" | "series" | "latestThought"
 > {
   const runningSteps = tools.filter((t) => t.running);
   const failedCount = tools.filter((t) => t.isError).length;
   const activeStep = runningSteps[runningSteps.length - 1];
   const running = runningSteps.length > 0;
+  const latestThought = thoughts.length > 0 ? thoughts[thoughts.length - 1] : undefined;
 
   const seriesMap = new Map<string, ToolSeriesChip>();
   for (const t of tools) {
@@ -346,6 +370,8 @@ function buildGroupMeta(
     headline = tools.length > 1 ? `正在${verb} · 已调用 ${tools.length} 个工具` : `正在${verb}`;
   } else if (tools.length > 0) {
     headline = `已调用 ${tools.length} 个工具`;
+  } else if (thoughts.length > 0 && notes.length === 0) {
+    headline = `思考与分析（${thoughts.length} 段）`;
   } else {
     headline = `思考与记录（${thoughts.length + notes.length}）`;
   }
@@ -356,12 +382,23 @@ function buildGroupMeta(
   } else if (failedCount > 0) {
     detailLine = catSummary ? `${catSummary} · ${failedCount} 个失败` : `${failedCount} 个失败`;
   } else if (catSummary) {
-    detailLine = catSummary;
-  } else if (thoughts.length) {
-    detailLine = clipChars(thoughts[thoughts.length - 1]!, 48);
+    detailLine = thoughts.length > 0 ? `${catSummary} · ${thoughts.length} 段思考` : catSummary;
+  } else if (latestThought) {
+    detailLine = clipChars(latestThought, 48);
   }
 
-  return { running, failedCount, headline, detailLine, activeStep, series };
+  return { running, failedCount, headline, detailLine, activeStep, series, ...(latestThought ? { latestThought } : {}) };
+}
+
+const NOISY_SYSTEM_SUBTYPES = new Set(["reminder", "自动插入", "system_message", "developer"]);
+const NOISY_SYSTEM_PREFIX_RE =
+  /^\s*(?:<(?:SYSTEM_MESSAGE|ephemeral_message|session_context|INSTRUCTIONS|system-reminder|environment_context)\b|Base directory for this skill:\s+\S|\[Image:\s*original\b[^\]]*\]\s*$)/i;
+
+function isHiddenSystemNoise(text: string, subtype?: string): boolean {
+  const sub = subtype?.trim().toLowerCase();
+  if (sub && NOISY_SYSTEM_SUBTYPES.has(sub)) return true;
+  if (subtype === "自动插入") return true;
+  return NOISY_SYSTEM_PREFIX_RE.test(text);
 }
 
 type Intermediate =
@@ -372,10 +409,10 @@ type Intermediate =
 /**
  * Pairs `tool_call` and `tool_result` by `call_id` and formats non-message activity
  * according to the selected `ChatDisplayMode`:
- * - `"compact"`: folds reasoning, system notes, and tool runs into one compact activity row.
- * - `"standard"` (default, matching Uniflo & mobile): keeps thinking blocks separate from tool runs
- *   and groups 2+ consecutive tools into a single collapsible tool tab.
- * - `"expanded"`: keeps thinking separate and opens thinking & multi-tool groups by default.
+ * - `"standard"` (default, Ovis / t3code progressive fold): folds contiguous thinking,
+ *   visible system notes, and tool runs chronologically into one cohesive `activity_group`.
+ * - `"compact"`: same chronological progressive fold with compact defaults.
+ * - `"expanded"`: keeps every thinking block, system note, and tool group separate & open.
  */
 export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "standard"): ChatRow[] {
   const rows: ChatRow[] = [];
@@ -387,21 +424,32 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
     const tools: ToolStep[] = [];
     const thoughts: string[] = [];
     const notes: Array<{ summary: string; text: string }> = [];
+    const entries: TurnEntry[] = [];
     for (const item of pending) {
-      if (item.kind === "tool") tools.push(item.step);
-      else if (item.kind === "thinking") thoughts.push(item.text);
-      else notes.push({ summary: item.summary, text: item.text });
+      if (item.kind === "tool") {
+        tools.push(item.step);
+        entries.push({ kind: "tool", id: item.id, step: item.step, ts: item.ts });
+      } else if (item.kind === "thinking") {
+        thoughts.push(item.text);
+        entries.push({ kind: "thinking", id: item.id, text: item.text, ts: item.ts });
+      } else {
+        notes.push({ summary: item.summary, text: item.text });
+        entries.push({ kind: "note", id: item.id, summary: item.summary, text: item.text, ts: item.ts });
+      }
     }
     const first = pending[0]!;
     const last = pending[pending.length - 1]!;
     const firstId = first.id;
-    if (tools.length === 0) {
+    if (tools.length === 0 && thoughts.length === 1 && notes.length === 0) {
+      const only = pending[0]!;
+      if (only.kind === "thinking") {
+        rows.push({ ...only, ...(mode === "expanded" ? { defaultOpen: true } : {}) });
+      }
+    } else if (tools.length === 0 && thoughts.length === 0) {
+      for (const item of pending) rows.push(item);
+    } else if (mode === "expanded" && tools.length === 0) {
       for (const item of pending) {
-        rows.push(
-          item.kind === "thinking"
-            ? { ...item, ...(mode === "expanded" ? { defaultOpen: true } : {}) }
-            : item,
-        );
+        rows.push(item.kind === "thinking" ? { ...item, defaultOpen: true } : item);
       }
     } else if (tools.length === 1 && thoughts.length === 0 && notes.length === 0) {
       rows.push({ kind: "tool", id: firstId, ts: first.ts, pos: first.pos, step: tools[0]! });
@@ -415,6 +463,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
         tools,
         thoughts,
         notes,
+        entries,
         ...(mode === "expanded" ? { defaultOpen: true } : {}),
         ...buildGroupMeta(tools, thoughts, notes),
       });
@@ -422,9 +471,65 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
     pending = [];
   };
 
-  for (const e of events) {
+  const lookaheadCommandOutcome = (idx: number): "error" | "dismissed" | "output" | "model_switch" | null => {
+    const cur = events[idx]!;
+    for (let j = idx + 1; j < events.length; j += 1) {
+      const next = events[j]!;
+      if (Math.abs(next.ts - cur.ts) > 15_000) break;
+      if (
+        next.kind === "assistant_message" ||
+        next.kind === "tool_call" ||
+        (next.kind === "user_message" && !next.synthetic)
+      ) {
+        break;
+      }
+      if (next.kind !== "system") continue;
+      const parsedOut = parseLocalCommandOutputTag(next.text);
+      const cleanBody = (parsedOut?.body ?? next.text).trim();
+      if (!cleanBody) continue;
+      if (isDismissedCommandOutput(cleanBody)) return "dismissed";
+      if (next.subtype === "command_error" || parsedOut?.isError || isCommandErrorOutput(cleanBody)) {
+        return "error";
+      }
+      const nextSw = parseModelSwitchEvent(next);
+      if (nextSw && (nextSw.model || nextSw.thinking || nextSw.ackOnly)) return "model_switch";
+      if (next.subtype === "command_output" || parsedOut) return "output";
+    }
+    return null;
+  };
+
+  for (let i = 0; i < events.length; i += 1) {
+    const e = events[i]!;
+    if (e.kind === "system") {
+      const parsedOut = parseLocalCommandOutputTag(e.text);
+      const cleanBody = (parsedOut?.body ?? e.text).trim();
+      if (!cleanBody || isDismissedCommandOutput(cleanBody)) {
+        continue;
+      }
+      if (mode !== "expanded" && isHiddenSystemNoise(cleanBody, e.subtype)) {
+        continue;
+      }
+    }
+
+    const cmdTag = e.kind === "system" ? parseSlashCommandTag(e.text) : null;
+    if (e.kind === "system" && (e.subtype === "command" || cmdTag)) {
+      const nextOutcome = lookaheadCommandOutcome(i);
+      if (nextOutcome === "error" || nextOutcome === "dismissed" || nextOutcome === "output" || nextOutcome === "model_switch") {
+        // Defer cleanly to the following command output / error / dismissal / model_switch event.
+        if (nextOutcome === "model_switch" && parseModelSwitchEvent(e)) {
+          // Allow `/model ...` + `<local-command-stdout>` / `/effort` coalescing as usual.
+        } else {
+          continue;
+        }
+      }
+    }
+
     const sw = parseModelSwitchEvent(e);
     if (sw) {
+      const nextOutcome = lookaheadCommandOutcome(i);
+      if (nextOutcome === "error" || nextOutcome === "dismissed") {
+        continue;
+      }
       flushPending();
       if (sw.ackOnly && !sw.model && !sw.thinking) {
         continue;
@@ -457,16 +562,17 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
     switch (e.kind) {
       case "user_message": {
         if (e.synthetic) {
-          if (e.text.trim()) {
+          const trimmed = e.text.trim();
+          if (trimmed && (mode === "expanded" || !isHiddenSystemNoise(trimmed, "自动插入"))) {
             const note: Intermediate = {
               kind: "system",
               id: e.id,
-              summary: systemSummary(e.text),
-              text: e.text.trim(),
+              summary: systemSummary(trimmed),
+              text: trimmed,
               ts: e.ts,
               pos: e.pos,
             };
-            if (mode === "compact") pending.push(note);
+            if (mode !== "expanded") pending.push(note);
             else {
               flushPending();
               rows.push(note);
@@ -506,16 +612,46 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
       case "reasoning": {
         if (!e.text.trim()) break;
         const text = e.text.trim();
-        if (mode === "compact") {
+        if (mode !== "expanded") {
           pending.push({ kind: "thinking", id: e.id, text, ts: e.ts, pos: e.pos });
         } else {
           flushPending();
-          rows.push({ kind: "thinking", id: e.id, text, ts: e.ts, pos: e.pos, defaultOpen: mode === "expanded" });
+          rows.push({ kind: "thinking", id: e.id, text, ts: e.ts, pos: e.pos, defaultOpen: true });
         }
         break;
       }
       case "system": {
         if (!e.text.trim()) break;
+        const parsedOut = parseLocalCommandOutputTag(e.text);
+        const cleanBody = (parsedOut?.body ?? e.text).trim();
+        if (!cleanBody || isDismissedCommandOutput(cleanBody)) break;
+        const subLower = e.subtype?.trim().toLowerCase();
+        if (subLower === "compact" || subLower === "checkpoint" || subLower === "compact_boundary") {
+          flushPending();
+          rows.push({
+            kind: "compact_notice",
+            id: e.id,
+            summary: e.summary?.trim() || "上下文已压缩",
+            text: cleanBody,
+            ts: e.ts,
+            pos: e.pos,
+          });
+          break;
+        }
+        if (e.subtype === "command_output" || e.subtype === "command_error" || parsedOut) {
+          flushPending();
+          const isError = e.subtype === "command_error" || Boolean(parsedOut?.isError) || isCommandErrorOutput(cleanBody);
+          rows.push({
+            kind: "command_result",
+            id: e.id,
+            command: e.summary?.trim() || (isError ? "命令失败" : "命令输出"),
+            text: cleanBody,
+            isError,
+            ts: e.ts,
+            pos: e.pos,
+          });
+          break;
+        }
         const note: Intermediate = {
           kind: "system",
           id: e.id,
@@ -524,7 +660,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           ts: e.ts,
           pos: e.pos,
         };
-        if (mode === "compact") {
+        if (mode !== "expanded") {
           pending.push(note);
         } else {
           flushPending();
@@ -587,9 +723,16 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
   }
 
   flushPending();
-  for (const r of rows) {
-    if (r.kind === "activity_group" && r.running) {
-      Object.assign(r, buildGroupMeta(r.tools, r.thoughts, r.notes));
+  let sawAssistantAfter = false;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const r = rows[i]!;
+    if (r.kind === "assistant") {
+      sawAssistantAfter = true;
+    } else if (r.kind === "activity_group") {
+      if (r.running) {
+        Object.assign(r, buildGroupMeta(r.tools, r.thoughts, r.notes));
+      }
+      r.hasFollowingAssistant = sawAssistantAfter && !r.running;
     }
   }
   return rows;

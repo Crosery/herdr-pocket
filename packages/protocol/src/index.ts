@@ -67,12 +67,15 @@ export interface Agent {
   where?: string;
   cwd?: string;
   status: AgentStatus;
+  statusKind?: "permission" | "question" | "auth";
   statusSince?: number;
   /**
    * What the program says about a `blocked` state, when it says something,
    * e.g. its error message. Older hosts never send it.
    */
   statusNote?: string;
+  /** Active non-input terminal subscreen hint detected by hostd. */
+  subscreen?: "viewer" | "pager" | null;
   /**
    * The program stopped on an error (a model or connection failure) rather than
    * on a question. `status` is `blocked` then, so older apps still flag it.
@@ -586,14 +589,28 @@ export interface RpcMethods {
   };
   /** Paste text and press Enter (like `hc send`). */
   "terminal.send": {
-    params: { agent: string; text: string; enter?: boolean };
+    params: { agent: string; text: string; enter?: boolean; delivery?: "auto" | "steer" };
     /**
      * Accepted into the ordered input queue; `position=0` means sent.
      * `agentStatus`: the agent's status when the text arrived. `waiting`: it was
      * in a turn, so its program holds the text until the turn ends (the agent's
      * `queued` counts these). Older hosts send neither.
+     * `commandCapture`: present when a TUI-local slash command (e.g. `/status`, `/help`)
+     * rendered directly onto the terminal screen rather than writing to the transcript.
      */
-    result: { ok: true; queueId?: string; position?: number; agentStatus?: AgentStatus; waiting?: boolean };
+    result: {
+      ok: true;
+      queueId?: string;
+      position?: number;
+      agentStatus?: AgentStatus;
+      waiting?: boolean;
+      commandCapture?: {
+        command: string;
+        output?: string;
+        isError?: boolean;
+        panelState?: "none" | "closed" | "interactive_open";
+      };
+    };
   };
   /** Press keys: enter, esc, up, down, tab, ctrl+c, y, n ... */
   "terminal.keys": { params: { agent: string; keys: string[] }; result: { ok: true } };
@@ -2127,6 +2144,157 @@ export function releaseAssetUrl(version: string, name: string): string {
 /** The newest release's checksum list; GitHub redirects it to the current release's copy. */
 export const LATEST_SUMS_URL = `https://github.com/${RELEASE_REPO}/releases/latest/download/SHA256SUMS`;
 
+/** Per-channel release manifest shipped alongside `SHA256SUMS` (mirror-friendly, decoupled per platform). */
+export const LATEST_MANIFEST_URL = `https://github.com/${RELEASE_REPO}/releases/latest/download/RELEASE-MANIFEST.json`;
+
+export type ReleaseChannelId =
+  | "android-arm64"
+  | "ios-arm64"
+  | "harmonyos-arm64"
+  | "macos-arm64"
+  | "macos-x64"
+  | "windows-x64-setup"
+  | "windows-x64-msi"
+  | "linux-x64-appimage"
+  | "linux-x64-deb"
+  | "bundle";
+
+export interface ReleaseChannelEntry {
+  version: string;
+  tag: string;
+  fileName: string;
+  sha256: string;
+  size?: number;
+  updatedAt?: string;
+}
+
+export interface ReleaseManifest {
+  schema: 1;
+  releaseVersion: string;
+  updatedAt: string;
+  channels: Partial<Record<ReleaseChannelId, ReleaseChannelEntry>>;
+}
+
+const RELEASE_CHANNEL_SUFFIX_RULES: Array<[RegExp, ReleaseChannelId]> = [
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-android-arm64\.apk$/, "android-arm64"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-ios-arm64\.ipa$/, "ios-arm64"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-harmonyos-arm64\.hap$/, "harmonyos-arm64"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-macos-arm64\.dmg$/, "macos-arm64"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-macos-x64\.dmg$/, "macos-x64"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-windows-x64-setup\.exe$/, "windows-x64-setup"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-windows-x64\.msi$/, "windows-x64-msi"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-linux-x64\.AppImage$/, "linux-x64-appimage"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-linux-x64\.deb$/, "linux-x64-deb"],
+  [/^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\.tar\.gz$/, "bundle"],
+];
+
+const VALID_CHANNEL_IDS = new Set<ReleaseChannelId>(RELEASE_CHANNEL_SUFFIX_RULES.map(([, id]) => id));
+const SEMVER_STR_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const HEX64_RE = /^[0-9a-f]{64}$/i;
+
+/** Maps a standard release asset filename to its `ReleaseChannelId` and clean version string. */
+export function channelFromAssetName(fileName: string): { channel: ReleaseChannelId; version: string } | null {
+  const name = fileName.trim().split("/").pop() ?? "";
+  for (const [re, channel] of RELEASE_CHANNEL_SUFFIX_RULES) {
+    const m = re.exec(name);
+    if (m?.[1]) return { channel, version: m[1] };
+  }
+  return null;
+}
+
+/** Validates and parses a fetched `RELEASE-MANIFEST.json` body (rejecting mirror HTML/error pages). */
+export function parseReleaseManifest(raw: string): ReleaseManifest | null {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("{")) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+  if (obj.schema !== 1) return null;
+  const releaseVersion = typeof obj.releaseVersion === "string" ? obj.releaseVersion.trim().replace(/^v/i, "") : "";
+  if (!SEMVER_STR_RE.test(releaseVersion)) return null;
+  const updatedAt = typeof obj.updatedAt === "string" ? obj.updatedAt : "";
+  const rawChannels = obj.channels;
+  if (!rawChannels || typeof rawChannels !== "object" || Array.isArray(rawChannels)) return null;
+
+  const channels: Partial<Record<ReleaseChannelId, ReleaseChannelEntry>> = {};
+  for (const [key, val] of Object.entries(rawChannels as Record<string, unknown>)) {
+    if (!VALID_CHANNEL_IDS.has(key as ReleaseChannelId)) continue;
+    if (!val || typeof val !== "object" || Array.isArray(val)) continue;
+    const item = val as Record<string, unknown>;
+    const version = typeof item.version === "string" ? item.version.trim().replace(/^v/i, "") : "";
+    const fileName = typeof item.fileName === "string" ? item.fileName.trim() : "";
+    const sha256 = typeof item.sha256 === "string" ? item.sha256.trim().toLowerCase() : "";
+    const tag = typeof item.tag === "string" && item.tag.trim() ? item.tag.trim() : `v${version}`;
+    if (!SEMVER_STR_RE.test(version) || !HEX64_RE.test(sha256) || !fileName.startsWith("herdr-pocket-") || /[\\/]/.test(fileName)) {
+      continue;
+    }
+    const size = typeof item.size === "number" && Number.isFinite(item.size) && item.size > 0 ? item.size : undefined;
+    const itemUpdated = typeof item.updatedAt === "string" && item.updatedAt ? item.updatedAt : undefined;
+    channels[key as ReleaseChannelId] = {
+      version,
+      tag,
+      fileName,
+      sha256,
+      ...(size !== undefined ? { size } : {}),
+      ...(itemUpdated ? { updatedAt: itemUpdated } : {}),
+    };
+  }
+  return { schema: 1, releaseVersion, updatedAt, channels };
+}
+
+/** Resolves a single platform/architecture channel entry from a parsed `ReleaseManifest`. */
+export function resolveChannelFromManifest(
+  manifest: ReleaseManifest | null | undefined,
+  channel: ReleaseChannelId,
+): ReleaseChannelEntry | null {
+  if (!manifest) return null;
+  return manifest.channels[channel] ?? null;
+}
+
+/** Builds a merged `ReleaseManifest` by carrying forward unchanged channels from `previous` and updating newly built assets from `sums`. */
+export function buildReleaseManifest(params: {
+  releaseVersion: string;
+  sums: Record<string, string>;
+  sizes?: Record<string, number>;
+  previous?: ReleaseManifest | null;
+  updatedAt?: string;
+}): ReleaseManifest {
+  const cleanRelease = params.releaseVersion.trim().replace(/^v/i, "");
+  const nowIso = params.updatedAt ?? new Date().toISOString();
+  const channels: Partial<Record<ReleaseChannelId, ReleaseChannelEntry>> = {};
+  if (params.previous?.channels) {
+    for (const [k, v] of Object.entries(params.previous.channels)) {
+      if (v) channels[k as ReleaseChannelId] = { ...v };
+    }
+  }
+  for (const [rawName, rawHash] of Object.entries(params.sums)) {
+    const fileName = rawName.trim().split("/").pop() ?? "";
+    const info = channelFromAssetName(fileName);
+    const sha256 = rawHash.trim().toLowerCase();
+    if (!info || !HEX64_RE.test(sha256)) continue;
+    const size = params.sizes?.[fileName];
+    channels[info.channel] = {
+      version: info.version,
+      tag: `v${info.version}`,
+      fileName,
+      sha256,
+      ...(typeof size === "number" && Number.isFinite(size) && size > 0 ? { size } : {}),
+      updatedAt: nowIso,
+    };
+  }
+  return {
+    schema: 1,
+    releaseVersion: cleanRelease,
+    updatedAt: nowIso,
+    channels,
+  };
+}
+
 /**
  * Time zones of mainland China. GitHub downloads crawl there (about 100 KB/s for the APK,
  * measured 2026-11), so release files come through a mirror first.
@@ -3267,10 +3435,102 @@ export interface ParsedModelSwitch {
 }
 
 const COMMAND_NAME_RE = /<command-name>\s*\/?(model|models|switch|effort|thinking)\s*<\/command-name>/i;
+const ANY_COMMAND_NAME_RE = /<command-name>\s*(\/?[^\s<]+)\s*<\/command-name>/i;
 const COMMAND_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/i;
-const LOCAL_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/i;
+const LOCAL_STDOUT_RE = /^\s*(?:<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*)+$/i;
+const LOCAL_STDERR_RE = /^\s*(?:<local-command-stderr>([\s\S]*?)<\/local-command-stderr>\s*)+$/i;
+const INLINE_LOCAL_STDOUT_RE = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/i;
 const KNOWN_EFFORT_WORD_RE =
   /^(?:off|none|minimal|min|low|medium|med|high|xhigh|max|ultra|auto|default|normal|fast|smart|rush)$/i;
+const COMMAND_ERROR_RE =
+  /(?:^|\b)(?:error:|unknown model|not available|is not supported|unsupported (?:model|effort|thinking)|invalid (?:model|effort|thinking)|failed to (?:set|switch)|does not exist|unrecognized command|unknown command|no such model|permission denied|disabled\.)/i;
+const COMMAND_DISMISSED_RE =
+  /^(?:cancelled|canceled|(?:status|help|model|config|usage|effort)\s+dialog\s+dismissed\.?|no change\.?)$/i;
+const MODEL_ACK_ONLY_RE = /^(?:kept model as\b|model unchanged\b|already using\b)/i;
+
+/** Returns true when local command or TUI output reports a model/effort/command failure. */
+export function isCommandErrorOutput(body: string): boolean {
+  const clean = body.replace(ANSI_ESCAPE_RE, "").trim();
+  if (!clean) return false;
+  return COMMAND_ERROR_RE.test(clean);
+}
+
+/** Returns true when a TUI modal/command output only acknowledges cancellation or dismissal. */
+export function isDismissedCommandOutput(body: string): boolean {
+  const clean = body.replace(ANSI_ESCAPE_RE, "").trim();
+  if (!clean) return false;
+  return COMMAND_DISMISSED_RE.test(clean);
+}
+
+/** Extracts `<command-name>` and `<command-args>` from an injected command echo block. */
+export function parseSlashCommandTag(rawText: string): { name: string; args: string; full: string } | null {
+  const m = ANY_COMMAND_NAME_RE.exec(rawText);
+  if (!m?.[1]) return null;
+  const rawName = m[1].trim();
+  const name = rawName.startsWith("/") ? rawName : `/${rawName}`;
+  const args = COMMAND_ARGS_RE.exec(rawText)?.[1]?.replace(/\s+/g, " ").trim() ?? "";
+  return { name, args, full: args ? `${name} ${args}` : name };
+}
+
+/** Extracts clean text and error flag from `<local-command-stdout>` / `<local-command-stderr>` XML blocks. */
+export function parseLocalCommandOutputTag(rawText: string): { body: string; isError: boolean } | null {
+  const trimmed = rawText.trim();
+  const errMatch = LOCAL_STDERR_RE.exec(trimmed);
+  if (errMatch) {
+    const body = errMatch[1]!.replace(ANSI_ESCAPE_RE, "").trim();
+    return { body, isError: true };
+  }
+  const outMatch = LOCAL_STDOUT_RE.exec(trimmed);
+  if (outMatch) {
+    const body = outMatch[1]!.replace(ANSI_ESCAPE_RE, "").trim();
+    return { body, isError: isCommandErrorOutput(body) };
+  }
+  return null;
+}
+
+/** Whether an optimistic slash send matches an incoming timeline row (`user`, `system` command, `model_switch`, or `command_result`). */
+export function matchesOptimisticCommand(
+  sentText: string,
+  candidate: { kind: string; subtype?: string; summary?: string; text?: string; label?: string },
+): boolean {
+  const trimmed = sentText.trim();
+  if (!trimmed.startsWith("/")) return false;
+  const parts = trimmed.split(/\s+/);
+  const cmdName = (parts[0] ?? "").toLowerCase();
+  const cmdArgs = parts.slice(1).join(" ").trim();
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  const targetFull = norm(trimmed);
+
+  if (candidate.kind === "model_switch" || candidate.subtype === "model_switch") {
+    if (cmdName === "/model" || cmdName === "/models" || cmdName === "/switch" || cmdName === "/effort" || cmdName === "/thinking") {
+      if (!cmdArgs) return true;
+      const hay = norm(`${candidate.label ?? ""} ${candidate.summary ?? ""} ${candidate.text ?? ""}`);
+      if (hay.includes(cmdArgs.toLowerCase())) return true;
+      // Effort words translate in UI summary (e.g. `high` -> `高`, `xhigh` -> `超高`).
+      if (cmdName === "/effort" || cmdName === "/thinking") {
+        const cn = SWITCH_EFFORT_LABELS[cmdArgs.toLowerCase()];
+        if (cn && hay.includes(cn.toLowerCase())) return true;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  if (candidate.kind === "system" || candidate.kind === "command_result") {
+    const text = candidate.text ?? "";
+    const tag = parseSlashCommandTag(text);
+    if (tag) {
+      if (norm(tag.full) === targetFull) return true;
+      if (tag.name.toLowerCase() === cmdName && (!cmdArgs || tag.args.toLowerCase() === cmdArgs.toLowerCase())) return true;
+    }
+    const sum = norm((candidate.summary ?? "").replace(/^命令\s+/, "").replace(/^已取消\s+/, ""));
+    if (sum === targetFull || sum === cmdName) return true;
+    if (candidate.subtype === "command_error" || candidate.subtype === "command_output" || candidate.subtype === "command") {
+      if (sum.startsWith(cmdName)) return true;
+    }
+  }
+  return false;
+}
 
 const SWITCH_EFFORT_LABELS: Record<string, string> = {
   off: "关闭",
@@ -3339,7 +3599,9 @@ export function parseModelSwitchText(rawText: string, subtype?: string): ParsedM
   if (cmdMatch) {
     const cmd = cmdMatch[1]!.toLowerCase();
     const argsRaw = COMMAND_ARGS_RE.exec(clean)?.[1]?.trim() ?? "";
-    const stdoutRaw = LOCAL_STDOUT_RE.exec(clean)?.[1] ?? "";
+    const stdoutRaw = INLINE_LOCAL_STDOUT_RE.exec(clean)?.[1] ?? "";
+    const hasErr = Boolean(LOCAL_STDERR_RE.exec(clean)) || isCommandErrorOutput(stdoutRaw) || isDismissedCommandOutput(stdoutRaw);
+    if (hasErr) return null;
     const fromStdout = stdoutRaw ? parseStdoutModelSwitch(stdoutRaw) : {};
 
     if (cmd === "effort" || cmd === "thinking") {
@@ -3366,8 +3628,14 @@ export function parseModelSwitchText(rawText: string, subtype?: string): ParsedM
 
   const stdoutOnly = LOCAL_STDOUT_RE.exec(clean);
   if (stdoutOnly) {
-    const parsed = parseStdoutModelSwitch(stdoutOnly[1] ?? "");
-    return { ...parsed, ackOnly: true };
+    const inner = stdoutOnly[1]!.replace(ANSI_ESCAPE_RE, "").trim();
+    if (!inner || isCommandErrorOutput(inner)) return null;
+    if (isDismissedCommandOutput(inner)) return { ackOnly: true };
+    const parsed = parseStdoutModelSwitch(inner);
+    if (parsed.model || parsed.thinking || MODEL_ACK_ONLY_RE.test(inner)) {
+      return { ...parsed, ackOnly: true };
+    }
+    return null;
   }
 
   if (subtype === "model_switch" || subtype === "model_change" || subtype === "thinking_level_change") {

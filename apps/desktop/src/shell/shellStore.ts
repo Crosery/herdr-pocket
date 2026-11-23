@@ -1,4 +1,5 @@
 import type { HerdrDoc, SpaceInfo, SubSession } from "@herdr-pocket/protocol";
+import { logAction } from "../lib/log";
 import { allAgents, createStore, liveStore } from "../lib/store";
 import { registerWorkspaceSection, scheduleWorkspacePersist } from "../lib/workspacePersist";
 import type { SettingsSection } from "../views/SettingsView";
@@ -633,6 +634,13 @@ export function setSelectedSpace(
       nextVisible[0]?.id ??
       null;
     const panelPatch = spacePanelTransition(s, selectedSpace);
+    if (s.selectedSpace !== selectedSpace) {
+      logAction("ui", "ui.space", {
+        allSpaces: selectedSpace === null,
+        visibleTabs: nextVisible.length,
+        hasActive: Boolean(nextActive),
+      });
+    }
     return {
       ...s,
       selectedSpace,
@@ -889,6 +897,10 @@ export function openAgentTab(
       { baseActiveBySpace: activeBySpace },
     );
     set({ ...nextState, selectedSpace: nextSpace, ...panelPatch });
+    logAction("ui", "ui.tab.focus", {
+      kind: hit.tab.kind,
+      mode: mode ?? (hit.leaf.content.kind === "agent" ? hit.leaf.content.mode : undefined),
+    });
     return;
   }
 
@@ -907,6 +919,7 @@ export function openAgentTab(
     ...(mode ? { mode } : {}),
     ...docFields,
   };
+  logAction("ui", "ui.tab.open", { kind: "agent", mode: mode ?? "default", tabsAfter: s.tabs.length + 1 });
   set({
     tabs: [...s.tabs, tab],
     selectedSpace: nextSpace,
@@ -1153,6 +1166,11 @@ export function closeTab(id: string): void {
   const s = shellStore.get();
   const i = s.tabs.findIndex((t) => t.id === id);
   if (i < 0) return;
+  logAction("ui", "ui.tab.close", {
+    kind: s.tabs[i]!.kind,
+    panes: tabPaneCount(s.tabs[i]!),
+    totalTabsBefore: s.tabs.length,
+  });
 
   const lookup = makeLiveAgentLookup();
   const spacesMap = liveStore.get().spaces;
@@ -1310,6 +1328,11 @@ export function splitTabPane(
       content,
     });
     inserted = true;
+    logAction("ui", "ui.split.open", {
+      direction,
+      contentKind: content.kind,
+      leavesAfter: listLeaves(nextRoot).length,
+    });
     const dedupeKey = opts?.dedupeOtherTabs && content.kind === "agent" ? content.agentKey : null;
     const agentHost = dedupeKey ? dedupeKey.split("/")[0] : "";
     const targetHost = tab.docHostId || agentHost;
@@ -1409,6 +1432,9 @@ export function closeTabPane(tabId: string, paneId: string): void {
     tab.split?.zoomedPaneId && tab.split.zoomedPaneId !== paneId && remaining.some((l) => l.id === tab.split!.zoomedPaneId)
       ? tab.split.zoomedPaneId
       : null;
+  logAction("ui", "ui.split.close", {
+    remainingLeaves: remaining.length,
+  });
   set({
     ...s,
     tabs: s.tabs.map((t) => (t.id === tabId ? applyRootToTab(t, nextRoot, nextFocus, nextZoom) : t)),
@@ -1722,6 +1748,12 @@ export function setActiveTab(id: string): void {
       nextBySpace = { ...s.activeBySpace, [prevScope]: prevActive };
     }
     const panelPatch = spacePanelTransition(s, nextSpace);
+    if (s.active !== id && target) {
+      logAction("ui", "ui.tab.switch", {
+        kind: target.kind,
+        spaceChanged: nextSpace !== s.selectedSpace,
+      });
+    }
     return {
       ...s,
       selectedSpace: nextSpace,
@@ -1784,6 +1816,7 @@ export function closeSettingsFrame(): void {
 }
 
 export function setPalette(open: false | "command" | "jump"): void {
+  if (open) logAction("ui", "ui.palette", { mode: open });
   set({ palette: open });
 }
 

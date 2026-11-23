@@ -37,6 +37,7 @@ import {
   cancelMobilePendingSwitch,
   enqueueMobilePrompt,
   ensureMobileQueueWatcher,
+  interruptAndSendMobileQueuedPrompt,
   moveMobileQueuedPromptToTop,
   popMobileQueuedPromptForEdit,
   removeMobileQueuedPrompt,
@@ -954,6 +955,11 @@ export function Composer({
       unsub();
     };
   }, [agent.key]);
+
+  useEffect(() => {
+    setModelOverride(undefined);
+    setThinkingOverride(undefined);
+  }, [agent.key, agent.model]);
   const termKeys = useSettings((x) => x.termKeys);
   const keys = useMemo(() => visibleTermKeys(normalizeTermKeyLayout(termKeys)), [termKeys]);
   const online = useLive((s) => s.devices[agent.deviceId]?.online ?? false);
@@ -1171,6 +1177,8 @@ export function Composer({
     const cleanModel = opts.modelId?.trim();
     const cleanThinking = opts.thinkingLevel?.trim().toLowerCase();
     if (!cleanModel && !cleanThinking) return;
+    const prevModelOverride = modelOverride;
+    const prevThinkingOverride = thinkingOverride;
     setModelOpen(false);
     if (cleanModel) {
       const resolvedAlias =
@@ -1222,14 +1230,22 @@ export function Composer({
       })
       .catch(async (e: unknown) => {
         const err = e as { code?: string; message?: string };
-        const unsupported = err?.code === "unsupported" || err?.code === "bad_request" || /unknown|unsupported|不支持/i.test(err?.message ?? "");
-        if (unsupported && plan.commands.length > 0) {
-          for (const cmd of plan.commands) {
-            await call(agent.deviceId, "terminal.send", { agent: agent.key, text: cmd, enter: true });
+        const rpcUnsupported = err?.code === "unsupported";
+        if (rpcUnsupported && plan.commands.length > 0) {
+          try {
+            for (const cmd of plan.commands) {
+              await call(agent.deviceId, "terminal.send", { agent: agent.key, text: cmd, enter: true });
+            }
+            setToast(`已下发切换指令：${desc}`);
+            refreshSoon();
+          } catch (fallbackErr) {
+            setModelOverride(prevModelOverride);
+            setThinkingOverride(prevThinkingOverride);
+            setToast((fallbackErr as Error).message || "切换失败");
           }
-          setToast(`已下发切换指令：${desc}`);
-          refreshSoon();
         } else {
+          setModelOverride(prevModelOverride);
+          setThinkingOverride(prevThinkingOverride);
           setToast(err?.message || "切换失败");
         }
       });
@@ -1849,10 +1865,16 @@ export function Composer({
                 <View style={{ minWidth: 20, height: 20, paddingHorizontal: 5, borderRadius: 10, backgroundColor: p.accentContainer, alignItems: "center", justifyContent: "center" }}>
                   <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11 }}>{idx + 1}</Text>
                 </View>
+                {q.pictures[0] ? (
+                  <Image
+                    source={{ uri: `data:${q.pictures[0].mime};base64,${q.pictures[0].data}` }}
+                    style={{ width: 24, height: 24, borderRadius: 5, backgroundColor: p.surface3 }}
+                  />
+                ) : null}
                 <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontSize: 13, color: p.ink }}>
                   {q.text || "（仅图片）"}
                 </Text>
-                {q.pictures.length ? (
+                {q.pictures.length > 1 ? (
                   <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: radius.pill, backgroundColor: p.surface, borderWidth: 1, borderColor: p.divider }}>
                     <Text style={{ fontSize: 11, color: p.muted }}>{`+${q.pictures.length}图`}</Text>
                   </View>
@@ -1860,7 +1882,7 @@ export function Composer({
                 <Pressable
                   disabled={!online || isSteering}
                   accessibilityRole="button"
-                  accessibilityLabel="立即打断当前轮并插队发送"
+                  accessibilityLabel="不打断当前轮插队发送"
                   onPress={() => {
                     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
                     void steerMobileQueuedPromptNow(agent, q.id).then((r) => {
@@ -1884,6 +1906,32 @@ export function Composer({
                   <MaterialCommunityIcons name="flash-outline" size={13} color={p.accentText} />
                   <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>插队</Text>
                 </Pressable>
+                {agent.status === "working" ? (
+                  <Pressable
+                    disabled={!online || isSteering}
+                    accessibilityRole="button"
+                    accessibilityLabel="打断当前轮并立即发送"
+                    onPress={() => {
+                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => undefined);
+                      void interruptAndSendMobileQueuedPrompt(agent, q.id).then((r) => {
+                        if (r.ok) refreshSoon();
+                        else setToast(r.message);
+                      });
+                    }}
+                    style={({ pressed }) => ({
+                      height: 26,
+                      paddingHorizontal: 8,
+                      borderRadius: radius.pill,
+                      backgroundColor: pressed ? p.surface3 : p.surface,
+                      borderWidth: 1,
+                      borderColor: p.divider,
+                      justifyContent: "center",
+                      opacity: !online || isSteering ? 0.45 : 1,
+                    })}
+                  >
+                    <Text style={{ color: p.muted, fontFamily: fonts.bodySemi, fontSize: 11.5 }}>打断</Text>
+                  </Pressable>
+                ) : null}
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="编辑这条排队消息"

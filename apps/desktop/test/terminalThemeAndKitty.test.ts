@@ -5,7 +5,15 @@ import { test } from "node:test";
 import ts from "typescript";
 import { configKeySpec } from "@herdr-pocket/protocol";
 import {
+  clearKittyVirtualPlacementsForScreen,
+  lookupKittyVirtualPlacement,
+  registerKittyVirtualPlacement,
+  type KittyVirtualPlacementDims,
+} from "../src/lib/kittyProtocol";
+import {
   deleteKittyPlacementsScoped,
+  erasePlacementsInDisplay,
+  erasePlacementsInLine,
   getTerminalThemeSpec,
   resolveTerminalAppearance,
 } from "../src/lib/terminalTheme";
@@ -178,6 +186,7 @@ test("deleteKittyPlacementsScoped d=i/I and d=p/P filter accurately and evict on
   // d=i without id is a no-op.
   assert.deepEqual(deleteKittyPlacementsScoped(all, false, { deleteWhat: "i" }, 0, 0), {
     placements: all,
+    removed: [],
     evictAssetIds: [],
     clearedActiveAll: false,
   });
@@ -300,4 +309,62 @@ test("Touched desktop UI & sync modules have zero forward references to block-sc
   }
 
   assert.deepEqual(forwardRefs, [], `Found TDZ forward references:\n${forwardRefs.join("\n")}`);
+});
+
+test("deleteKittyPlacementsScoped handles d=n/z/x/y/q/r scopes and erase helpers clear overlapped regions", () => {
+  const base = [
+    { ...makePlacement({ imageId: 10, alt: false, bufferY: 12, col: 4, cols: 4, rows: 3 }), imageNumber: 77, zIndex: 2 },
+    { ...makePlacement({ imageId: 12, alt: false, bufferY: 16, col: 10, cols: 3, rows: 2 }), imageNumber: 88, zIndex: 5 },
+    { ...makePlacement({ imageId: 14, alt: false, bufferY: 2, col: 0, cols: 2, rows: 2 }), imageNumber: 99, zIndex: 0 },
+  ];
+
+  // d=q with viewBaseY=10 and cell (6, 4) -> buffer col 5, row 13 (1-based cropX=6, cropY=4)
+  const qRes = deleteKittyPlacementsScoped(base, false, { deleteWhat: "q", cropX: 6, cropY: 4 }, 0, 10, 10);
+  assert.deepEqual(qRes.removed.map((x) => x.imageId), [10]);
+
+  const nRes = deleteKittyPlacementsScoped(base, false, { deleteWhat: "n", imageNumber: 88 }, 0, 10, 10);
+  assert.deepEqual(nRes.removed.map((x) => x.imageId), [12]);
+
+  const zRes = deleteKittyPlacementsScoped(base, false, { deleteWhat: "z", zIndex: 5 }, 0, 10, 10);
+  assert.deepEqual(zRes.removed.map((x) => x.imageId), [12]);
+
+  const xRes = deleteKittyPlacementsScoped(base, false, { deleteWhat: "x", cropX: 11 }, 0, 10, 10);
+  assert.deepEqual(xRes.removed.map((x) => x.imageId), [12]);
+
+  const yRes = deleteKittyPlacementsScoped(base, false, { deleteWhat: "y", cropY: 13 }, 0, 10, 0);
+  assert.deepEqual(yRes.removed.map((x) => x.imageId), [10]);
+
+  const rRes = deleteKittyPlacementsScoped(base, false, { deleteWhat: "r", cropX: 10, cropY: 12 }, 0, 10, 0);
+  assert.deepEqual(rRes.removed.map((x) => x.imageId), [10, 12]);
+
+  // CSI J (ED): Ps=2 clears viewport [10..34) while keeping scrollback id=14; Ps=3 clears scrollback only
+  const ed2 = erasePlacementsInDisplay(base, 2, 10, 24, 15, 0, 80, false);
+  assert.deepEqual(ed2.kept.map((x) => x.imageId), [14]);
+  const ed3 = erasePlacementsInDisplay(base, 3, 10, 24, 15, 0, 80, false);
+  assert.deepEqual(ed3.removed.map((x) => x.imageId), [14]);
+
+  // CSI K / X: cursor at (row=13, col=6) hits id=10 [col 4..8, row 12..15)
+  const el0 = erasePlacementsInLine(base, 0, 13, 6, null, false);
+  assert.deepEqual(el0.removed.map((x) => x.imageId), [10]);
+  const ech = erasePlacementsInLine(base, 0, 13, 6, 2, false);
+  assert.deepEqual(ech.removed.map((x) => x.imageId), [10]);
+});
+
+test("clearKittyVirtualPlacementsForScreen isolates alt vs main screen and terminal.css layers z<0 underlay beneath text", () => {
+  const vmap = new Map<string, KittyVirtualPlacementDims>();
+  registerKittyVirtualPlacement(vmap, 100, 1, 20, 12, -1, true);
+  registerKittyVirtualPlacement(vmap, 200, 1, 10, 6, 0, false);
+
+  assert.equal(lookupKittyVirtualPlacement(vmap, 100, 1, true)?.cols, 20);
+  assert.equal(lookupKittyVirtualPlacement(vmap, 200, 1, false)?.cols, 10);
+
+  clearKittyVirtualPlacementsForScreen(vmap, true);
+  assert.equal(lookupKittyVirtualPlacement(vmap, 100, 1, true), undefined);
+  assert.equal(lookupKittyVirtualPlacement(vmap, 200, 1, false)?.cols, 10);
+
+  const termCss = readFileSync(new URL("../src/styles/terminal.css", import.meta.url), "utf8");
+  const zUnder = Number(termCss.match(/\.tp-term-underlay\s*\{[^}]*z-index:\s*(\d+)/)?.[1] ?? -1);
+  const zRows = Number(termCss.match(/\.tp-term-host\s+\.xterm-rows\s*\{[^}]*z-index:\s*(\d+)/)?.[1] ?? -1);
+  const zOver = Number(termCss.match(/\.tp-term-overlay\s*\{[^}]*z-index:\s*(\d+)/)?.[1] ?? -1);
+  assert.ok(zUnder > 0 && zUnder < zRows && zRows < zOver, `expected underlay (${zUnder}) < rows (${zRows}) < overlay (${zOver})`);
 });

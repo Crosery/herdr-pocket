@@ -87,6 +87,7 @@ export class Screen {
   private top = 0;
   private bottom: number;
   private alt: Cell[][] | null = null;
+  private _bracketedPaste = false;
   private pending = "";
   private wrapNext = false;
   private maxScrollback: number;
@@ -97,6 +98,14 @@ export class Screen {
     this.bottom = this.rows - 1;
     this.maxScrollback = maxScrollback;
     this.grid = this.blankGrid();
+  }
+
+  get isAltScreen(): boolean {
+    return this.alt !== null;
+  }
+
+  get bracketedPaste(): boolean {
+    return this._bracketedPaste;
   }
 
   private blankRow(): Cell[] {
@@ -268,7 +277,11 @@ export class Screen {
     // Preserve pending line wrap across SGR (`m`) and DEC private mode toggles (`?2026h/l`, `?25l/h`).
     if (priv === "?") {
       if (final === "h" || final === "l") {
-        for (const m of nums) if (m === 1049 || m === 1047 || m === 47) this.altScreen(final === "h");
+        const on = final === "h";
+        for (const m of nums) {
+          if (m === 1049 || m === 1047 || m === 47) this.altScreen(on);
+          else if (m === 2004) this._bracketedPaste = on;
+        }
       }
       return;
     }

@@ -7,6 +7,8 @@
 #   herdr-pocket-X.Y.Z-windows-x64-setup.exe      Windows desktop NSIS installer
 #   herdr-pocket-X.Y.Z-windows-x64.msi            Windows desktop MSI installer
 #   herdr-pocket-X.Y.Z-linux-x64.{deb,AppImage}   Linux desktop packages
+#   RELEASE-NOTES.md                              Chinese release announcement
+#   RELEASE-MANIFEST.json                         per-channel version/asset/sha256 manifest
 #   SHA256SUMS                                    checksums of all artifacts
 #   ghcr.io/<owner>/herdr-pocket-relay:X.Y.Z, :X.Y and :latest
 name: Release
@@ -19,6 +21,10 @@ on:
       tag:
         description: Existing tag to build again, e.g. v0.2.0
         required: true
+      channels:
+        description: Channels to build (auto, all, or comma list e.g. desktop,android)
+        required: false
+        default: auto
 
 permissions:
   contents: read
@@ -29,14 +35,22 @@ concurrency:
 jobs:
   meta:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+      CHANNELS: ${{ inputs.channels || 'auto' }}
     outputs:
       tag: ${{ steps.v.outputs.tag }}
       version: ${{ steps.v.outputs.version }}
       prerelease: ${{ steps.v.outputs.prerelease }}
+      build_bundle: ${{ steps.ch.outputs.build_bundle }}
+      build_image: ${{ steps.ch.outputs.build_image }}
+      build_android: ${{ steps.ch.outputs.build_android }}
+      build_ios: ${{ steps.ch.outputs.build_ios }}
+      build_harmony: ${{ steps.ch.outputs.build_harmony }}
+      build_desktop: ${{ steps.ch.outputs.build_desktop }}
     steps:
       - id: v
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           version="${TAG#v}"
           if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -50,9 +64,37 @@ jobs:
             echo "version=$version"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.v.outputs.tag }}
+          fetch-depth: 0
+      - id: prev
+        run: |
+          prev_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=10" --jq '[.[] | select(.draft == false and .tag_name != env.TAG)][0].tag_name // ""' || true)
+          rm -f prev-manifest.json prev.sums
+          if [ -n "$prev_tag" ]; then
+            if gh release download "$prev_tag" --repo "$GITHUB_REPOSITORY" --pattern "RELEASE-MANIFEST.json" --output prev-manifest.json 2>/dev/null; then
+              echo "Loaded RELEASE-MANIFEST.json from $prev_tag"
+            elif gh release download "$prev_tag" --repo "$GITHUB_REPOSITORY" --pattern "SHA256SUMS" --output prev.sums 2>/dev/null; then
+              node scripts/build-release-manifest.mjs --version "${prev_tag#v}" --prev-sums prev.sums --out prev-manifest.json
+              echo "Synthesized prev-manifest.json from $prev_tag SHA256SUMS"
+            fi
+          fi
+      - id: ch
+        run: |
+          node scripts/detect-release-channels.mjs \
+            --tag "${{ steps.v.outputs.tag }}" \
+            --channels "$CHANNELS" \
+            --prev-manifest prev-manifest.json | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prev-manifest
+          path: prev-manifest.json
+          if-no-files-found: ignore
 
   bundle:
     needs: meta
+    if: needs.meta.outputs.build_bundle == 'true'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.meta.outputs.version }}
@@ -80,6 +122,7 @@ jobs:
 
   image:
     needs: meta
+    if: needs.meta.outputs.build_image == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -123,6 +166,7 @@ jobs:
 
   android:
     needs: meta
+    if: needs.meta.outputs.build_android == 'true'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.meta.outputs.version }}
@@ -188,6 +232,7 @@ jobs:
 
   ios:
     needs: meta
+    if: needs.meta.outputs.build_ios == 'true'
     runs-on: macos-26
     timeout-minutes: 75
     env:
@@ -242,6 +287,7 @@ jobs:
 
   harmony:
     needs: meta
+    if: needs.meta.outputs.build_harmony == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -292,6 +338,7 @@ jobs:
 
   desktop:
     needs: meta
+    if: needs.meta.outputs.build_desktop == 'true'
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -404,11 +451,11 @@ jobs:
     if: >-
       always() &&
       needs.meta.result == 'success' &&
-      needs.bundle.result == 'success' &&
-      needs.image.result == 'success' &&
-      needs.android.result == 'success' &&
-      needs.harmony.result == 'success' &&
-      needs.desktop.result == 'success' &&
+      (needs.bundle.result == 'success' || needs.bundle.result == 'skipped') &&
+      (needs.image.result == 'success' || needs.image.result == 'skipped') &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+      (needs.harmony.result == 'success' || needs.harmony.result == 'skipped') &&
+      (needs.desktop.result == 'success' || needs.desktop.result == 'skipped') &&
       (needs.ios.result == 'success' || needs.ios.result == 'failure' || needs.ios.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
@@ -418,18 +465,21 @@ jobs:
       TAG: ${{ needs.meta.outputs.tag }}
       VERSION: ${{ needs.meta.outputs.version }}
       PRERELEASE: ${{ needs.meta.outputs.prerelease }}
-      IMAGE: ${{ needs.image.outputs.image }}
+      IMAGE: ${{ needs.image.outputs.image || format('ghcr.io/{0}/herdr-pocket-relay', github.repository_owner) }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.meta.outputs.tag }}
           path: repo-src
           fetch-depth: 0
+      - run: mkdir -p dist
       - uses: actions/download-artifact@v8
+        if: needs.bundle.result == 'success'
         with:
           name: bundle
           path: dist
       - uses: actions/download-artifact@v8
+        if: needs.android.result == 'success'
         with:
           name: apk
           path: dist
@@ -439,14 +489,21 @@ jobs:
           name: ios
           path: dist
       - uses: actions/download-artifact@v8
+        if: needs.harmony.result == 'success'
         with:
           name: harmony
           path: dist
       - uses: actions/download-artifact@v8
+        if: needs.desktop.result == 'success'
         with:
           pattern: desktop-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: prev-manifest
+          path: prev-manifest
       - name: Preserve pre-uploaded notarized macOS DMGs
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -472,7 +529,18 @@ jobs:
             exit 1
           fi
           cp announcement.md dist/RELEASE-NOTES.md
-      - run: |
+      - name: Build per-channel RELEASE-MANIFEST.json & SHA256SUMS
+        run: |
+          prev_flag=""
+          if [ -s prev-manifest/prev-manifest.json ]; then
+            prev_flag="prev-manifest/prev-manifest.json"
+          fi
+          node repo-src/scripts/build-release-manifest.mjs \
+            --version "$VERSION" \
+            --dist dist \
+            ${prev_flag:+--prev "$prev_flag"} \
+            --out dist/RELEASE-MANIFEST.json
+          cat dist/RELEASE-MANIFEST.json
           cd dist
           LC_ALL=C sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
@@ -488,7 +556,7 @@ jobs:
           cat announcement.md > notes.md
           printf '\n\n---\n\n' >> notes.md
           cat >> notes.md <<EOF
-          Relay image: \`$IMAGE:$VERSION\` (also \`:latest\` for releases)
+          Relay image: \`${IMAGE,,}:$VERSION\` (per-channel metadata in \`RELEASE-MANIFEST.json\`)
 
           - **Server**: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-relay.sh | sudo bash -s -- --domain pocket.example.com\`
           - **Computer daemon**: \`curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-host.sh | bash -s -- --server https://pocket.example.com\` (Windows: \`install-host.ps1\`)
@@ -500,7 +568,7 @@ jobs:
           [ "$PRERELEASE" = true ] && flags+=(--prerelease)
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "Herdr Pocket $VERSION" --notes-file notes.md
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --title "Herdr Pocket $VERSION" --notes-file notes.md
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "Herdr Pocket $VERSION" --notes-file notes.md --generate-notes "${flags[@]}"

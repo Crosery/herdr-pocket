@@ -79,6 +79,13 @@
   min-width: 0;
   width: 100%;
   height: 100%;
+  transition: opacity 70ms ease-out;
+}
+.tp-term-host[data-ready="false"] {
+  opacity: 0;
+}
+.tp-term-host[data-ready="true"] {
+  opacity: 1;
 }
 
 .tp-term-host .xterm {
@@ -119,9 +126,23 @@
   position: relative;
 }
 
+.tp-term-host .xterm-rows {
+  position: relative;
+  z-index: 2;
+}
+
 .tp-term-host .xterm.xterm-cursor-pointer,
 .tp-term-host .xterm.xterm-cursor-pointer .xterm-screen {
   cursor: pointer !important;
+}
+
+.tp-term-underlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 1;
+  contain: layout style;
 }
 
 .tp-term-overlay {

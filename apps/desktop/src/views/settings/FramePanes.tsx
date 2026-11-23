@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Laptop, Monitor, Plus, QrCode, RefreshCw, Server, Smartphone, Trash2, Upload } from "lucide-react";
 import { configKeySpec, type Device } from "@herdr-pocket/protocol";
-import { PocketBadge, PocketButton, PocketInput, PocketSelect, useToast } from "../../components/PocketUI";
+import { PocketBadge, PocketButton, PocketInput, PocketSelect, PocketSwitch, useToast } from "../../components/PocketUI";
 import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { PermissionCards, prettyHotkey } from "../../components/VoiceInput";
 import { serverLabel } from "../../components/Sidebar";
@@ -12,7 +12,7 @@ import { native, type LogFolderInfo, type Permissions } from "../../lib/native";
 import { setConfig, useClientConfig } from "../../lib/config";
 import { isMockServer } from "../../lib/mock";
 import { pingRelay } from "../../lib/relay";
-import { liveStore, relTime, settingsStore } from "../../lib/store";
+import { liveStore, relTime, settingsStore, updateSettings } from "../../lib/store";
 import { IS_MAC, SHORTCUTS, keyChips } from "../../shell/shortcuts";
 import { openSettingsFrame } from "../../shell/shellStore";
 import { RemoveDeviceDialog } from "../DevicesView";
@@ -386,6 +386,7 @@ const HOLD_KEYS = new Set(["RightOption", "RightControl", "RightCommand", "Right
 
 export function KeyboardPane() {
   const voice = useClientConfig().voiceInput;
+  const showHoldHints = settingsStore.use((s) => s.showModifierHoldHints);
   const [perms, setPerms] = useState<Permissions | null>(null);
   const [checking, setChecking] = useState(false);
   const refresh = useCallback(async () => {
@@ -403,9 +404,19 @@ export function KeyboardPane() {
   return (
     <div className="pane">
       <PaneTitle title="键盘" />
-      <SetHeading>窗口</SetHeading>
+      <SetHeading>按键提示与窗口快捷键</SetHeading>
+      <SetRow
+        title={`按住 ${IS_MAC ? "⌘" : "Ctrl"} 显示快捷键角标`}
+        about="按住不动 0.3 秒在标签、分屏和侧栏上标出可用热键"
+      >
+        <PocketSwitch
+          checked={showHoldHints}
+          onCheckedChange={(v) => updateSettings({ showModifierHoldHints: v })}
+          label={`按住 ${IS_MAC ? "⌘" : "Ctrl"} 显示快捷键角标`}
+        />
+      </SetRow>
       {SHORTCUTS.map((s) => (
-        <SetRow key={s.id} title={s.label}>
+        <SetRow key={s.id} title={s.label} about={s.when}>
           <span className="sf-combo">
             <Keys keys={s.keys} />
             {s.alt?.map((k, i) => (

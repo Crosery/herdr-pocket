@@ -722,6 +722,7 @@ export interface AutoAgentModelMeta {
   loaded: boolean;
   refresh: () => void;
   applyOverride: (patch: { currentModel?: string; currentThinking?: string; modelRoles?: Record<string, string> }) => void;
+  clearOverride: () => void;
 }
 
 const noopMeta = () => {};
@@ -741,10 +742,12 @@ export function computeAutoAgentModelMeta(
     thinkingLevel?: string;
     refresh?: () => void;
     applyOverride?: AutoAgentModelMeta["applyOverride"];
+    clearOverride?: AutoAgentModelMeta["clearOverride"];
   } = {},
 ): AutoAgentModelMeta {
   const refresh = opts.refresh ?? noopMeta;
   const applyOverride = opts.applyOverride ?? noopMeta;
+  const clearOverride = opts.clearOverride ?? noopMeta;
 
   if (agent.isShell) {
     return {
@@ -754,6 +757,7 @@ export function computeAutoAgentModelMeta(
       loaded: true,
       refresh,
       applyOverride,
+      clearOverride,
     };
   }
 
@@ -822,6 +826,7 @@ export function computeAutoAgentModelMeta(
     loaded: Boolean(activeFetched),
     refresh,
     applyOverride,
+    clearOverride,
   };
 }
 
@@ -847,6 +852,7 @@ export function useAutoAgentModelMeta(
 
   const [override, setOverride] = useState<{
     key: string;
+    baseModel?: string;
     currentModel?: string;
     currentThinking?: string;
     fallbackThinkingCandidate?: string;
@@ -854,6 +860,16 @@ export function useAutoAgentModelMeta(
   } | null>(null);
 
   const [rev, setRev] = useState(0);
+
+  useEffect(() => {
+    setOverride((prev) => {
+      if (!prev || prev.key !== agent.key) return prev;
+      if (agent.model && prev.baseModel && agent.model !== prev.baseModel) {
+        return null;
+      }
+      return prev;
+    });
+  }, [agent.key, agent.model]);
 
   useEffect(() => {
     if (agent.isShell) return;
@@ -908,6 +924,7 @@ export function useAutoAgentModelMeta(
               : undefined;
         return {
           key: agent.key,
+          baseModel: agent.model,
           currentModel: nextModel,
           currentThinking: nextThinking,
           fallbackThinkingCandidate: nextFallbackCandidate,
@@ -919,8 +936,14 @@ export function useAutoAgentModelMeta(
         };
       });
     },
-    [agent.key],
+    [agent.key, agent.model],
   );
+
+  const clearOverride = useCallback(() => {
+    invalidateModelCatalogCache(agent.key);
+    setOverride((prev) => (prev?.key === agent.key ? null : prev));
+    setRev((n) => n + 1);
+  }, [agent.key]);
 
   const activeFetched = fetched?.key === agent.key ? fetched.res : null;
   const activeOverride = override?.key === agent.key ? override : null;
@@ -932,5 +955,6 @@ export function useAutoAgentModelMeta(
     thinkingLevel,
     refresh,
     applyOverride,
+    clearOverride,
   });
 }

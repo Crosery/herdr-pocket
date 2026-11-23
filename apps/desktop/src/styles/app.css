@@ -1148,6 +1148,56 @@ a {
   color: var(--muted);
 }
 
+.md-alert {
+  --md-alert-color: var(--accent-text);
+  --md-alert-bg: color-mix(in srgb, var(--accent-soft) 45%, transparent);
+  margin: 8px 0;
+  padding: 10px 14px;
+  border-left: 3px solid var(--md-alert-color);
+  border-radius: 0 10px 10px 0;
+  background: var(--md-alert-bg);
+}
+
+.md-alert-note {
+  --md-alert-color: var(--accent-text);
+  --md-alert-bg: color-mix(in srgb, var(--accent-soft) 45%, transparent);
+}
+
+.md-alert-tip {
+  --md-alert-color: var(--mint-text);
+  --md-alert-bg: color-mix(in srgb, var(--mint-soft) 58%, transparent);
+}
+
+.md-alert-important {
+  --md-alert-color: var(--primary);
+  --md-alert-bg: color-mix(in srgb, var(--accent-soft) 55%, transparent);
+}
+
+.md-alert-warning {
+  --md-alert-color: var(--warn-text);
+  --md-alert-bg: color-mix(in srgb, var(--warn-soft) 62%, transparent);
+}
+
+.md-alert-caution {
+  --md-alert-color: var(--blush-text);
+  --md-alert-bg: color-mix(in srgb, var(--blush-soft) 62%, transparent);
+}
+
+.md-alert-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  font-size: calc(12.5px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--md-alert-color);
+}
+
+.md-alert-body {
+  color: var(--ink);
+  line-height: 1.65;
+}
+
 .md-table-wrap {
   margin: 6px 0;
   overflow-x: auto;
@@ -1163,8 +1213,10 @@ a {
 
 .md-table th,
 .md-table td {
-  padding: 6px 10px;
+  padding: 7px 12px;
   border-bottom: 1px solid var(--divider);
+  vertical-align: top;
+  line-height: 1.6;
 }
 
 .md-table tr:last-child td {
@@ -1175,6 +1227,13 @@ a {
   font-weight: 700;
   background: var(--surface-2);
   color: var(--ink);
+  word-break: keep-all;
+  white-space: nowrap;
+}
+
+.md-table .md-file-chip,
+.md-table code {
+  white-space: nowrap;
 }
 
 .term-box {
@@ -1712,6 +1771,7 @@ a {
 }
 
 .segmented button {
+  position: relative;
   border: 0;
   background: transparent;
   padding: 5px 13px;
@@ -3198,9 +3258,12 @@ a {
 
 .viewer {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  container-type: inline-size;
+  container-name: fileviewer;
 }
 
 .viewer-head {
@@ -3301,8 +3364,43 @@ a {
 }
 
 .viewer-md {
-  padding: 16px 22px;
-  max-width: 860px;
+  width: 100%;
+  max-width: clamp(920px, 88cqi, 2240px);
+  margin: 0 auto;
+  padding: clamp(14px, 1.8cqi, 28px) clamp(16px, 2.8cqi, 48px) 44px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.viewer-md h1,
+.viewer-md h2,
+.viewer-md h3,
+.viewer-md h4 {
+  margin: 20px 0 8px;
+  line-height: 1.35;
+  color: var(--ink);
+}
+
+.viewer-md > :first-child {
+  margin-top: 0;
+}
+
+.viewer-md h1 {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--divider);
+}
+
+@container fileviewer (max-width: 960px) {
+  .viewer-md {
+    max-width: 100%;
+    padding: 14px 18px 28px;
+  }
+}
+
+@container fileviewer (max-width: 520px) {
+  .viewer-md {
+    padding: 12px 12px 22px;
+  }
 }
 
 .viewer-image {

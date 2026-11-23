@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ConvEvent } from "@herdr-pocket/protocol";
 import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../src/lib/chatFold.ts";
-import { interleaveOptimisticSends, reconcileOutgoingSends, shouldAutoDrainQueue, type OutgoingSendLike } from "../src/lib/chatQueueLogic.ts";
+import {
+  interleaveOptimisticSends,
+  isAgentTurnBusy,
+  reconcileOutgoingSends,
+  shouldAutoDrainQueue,
+  type OutgoingSendLike,
+} from "../src/lib/chatQueueLogic.ts";
 import {
   KittyApcSplitter,
   KittyKeyboardState,
@@ -347,4 +353,78 @@ test("foldConvEvents: coalesces Claude command XML, stdout, and effort switch in
     assert.equal(rows[0].model, "opus");
     assert.equal(rows[0].thinking, "high");
   }
+});
+
+test("foldConvEvents: suppresses system reminders in standard mode, turns failed /model into command_result, and respects expanded mode", () => {
+  const events: ConvEvent[] = [
+    { id: "r-1", session: "s", ts: 10_000, kind: "system", subtype: "reminder", text: "<system-reminder>internal note</system-reminder>", summary: "系统提醒" },
+    { id: "c-1", session: "s", ts: 11_000, kind: "system", subtype: "command", text: "<command-name>/model nonexistent</command-name>" },
+    { id: "c-2", session: "s", ts: 11_100, kind: "system", subtype: "command_error", summary: "/model nonexistent", text: 'Error: Model "nonexistent" is not available.' },
+    { id: "c-3", session: "s", ts: 12_000, kind: "system", subtype: "command_output", summary: "/cost", text: "Total cost: $0.05" },
+  ];
+
+  const std = foldConvEvents(events, "standard");
+  assert.equal(std.some((r) => r.kind === "system"), false);
+  assert.equal(std.some((r) => r.kind === "model_switch"), false);
+  const cmdRows = std.filter((r) => r.kind === "command_result");
+  assert.equal(cmdRows.length, 2);
+  assert.equal(cmdRows[0]?.kind === "command_result" ? cmdRows[0].isError : false, true);
+  assert.equal(cmdRows[1]?.kind === "command_result" ? cmdRows[1].command : "", "/cost");
+
+  const noisyEvents: ConvEvent[] = [
+    { id: "n-1", session: "s", ts: 100, kind: "system", subtype: "system_message", text: "<SYSTEM_MESSAGE>hidden</SYSTEM_MESSAGE>" },
+    { id: "n-2", session: "s", ts: 101, kind: "system", subtype: "developer", text: "<session_context>cwd=/repo</session_context>" },
+    { id: "n-3", session: "s", ts: 102, kind: "system", subtype: "compact_boundary", text: "compacted" },
+  ];
+  const filtered = foldConvEvents(noisyEvents, "standard");
+  assert.deepEqual(filtered.map((r) => r.kind), ["compact_notice"]);
+
+  const exp = foldConvEvents(events, "expanded");
+  assert.equal(exp.some((r) => r.kind === "system"), true);
+});
+
+test("chatQueueLogic: slash commands reconcile via command_result, expire at 8s, and do not cross newer turns", () => {
+  const send: OutgoingSendLike = { id: "s1", text: "/cost", attachedCount: 0, ts: 100_000, state: "sent" };
+  const cmdRow: ChatRow = { kind: "command_result", id: "cmd1", command: "/cost", text: "Total cost: $0.01", isError: false, ts: 100_500 };
+  const matched = reconcileOutgoingSends([send], [cmdRow], "idle", 101_000);
+  assert.deepEqual(matched.matchedIds, ["s1"]);
+  assert.equal(matched.awaitingReply, false);
+
+  const expired = reconcileOutgoingSends([send], [], "idle", 109_000);
+  assert.deepEqual(expired.expiredIds, ["s1"]);
+
+  // Newer user turn at ts=110_000 must stay AFTER unmatched earlier slash send at ts=100_000
+  const rows: ChatRow[] = [
+    { kind: "user", id: "u1", text: "earlier prompt", ts: 90_000, attachedLines: [], attachedCount: 0 },
+    { kind: "assistant", id: "a1", text: "earlier reply", ts: 95_000 },
+    { kind: "turn_end", id: "te1", ts: 99_000 },
+    { kind: "user", id: "u2", text: "newer prompt", ts: 110_000, attachedLines: [], attachedCount: 0 },
+    { kind: "assistant", id: "a2", text: "newer reply", ts: 112_000 },
+  ];
+  const timeline = interleaveOptimisticSends(rows, [send]);
+  assert.deepEqual(
+    timeline.map((x) => (x.kind === "row" ? x.row.id : `out:${x.send.id}`)),
+    ["u1", "a1", "te1", "out:s1", "u2", "a2"],
+  );
+});
+
+test("chatQueueLogic: isAgentTurnBusy detects running tools on status flicker and keeps queued_terminal at bottom", () => {
+  const runningToolRow: ChatRow = {
+    kind: "tool",
+    id: "t1",
+    ts: 100_000,
+    step: { id: "t1", callId: "c1", name: "Bash", category: "run", input: {}, summary: "pnpm test", ts: 100_000, running: true, isError: false },
+  };
+  assert.equal(isAgentTurnBusy("idle", [runningToolRow]), true);
+  assert.equal(isAgentTurnBusy("working", []), true);
+  assert.equal(isAgentTurnBusy("idle", [{ kind: "assistant", id: "a1", text: "done", ts: 102_000 }]), false);
+
+  const qtSend: OutgoingSendLike = { id: "qt-1", text: "下一个任务", attachedCount: 0, ts: 99_500, state: "queued_terminal" };
+  const rec = reconcileOutgoingSends([qtSend], [runningToolRow], "idle", 103_000);
+  assert.equal(rec.awaitingReply, false);
+  const segs = interleaveOptimisticSends([runningToolRow], rec.unmatched);
+  assert.deepEqual(
+    segs.map((x) => (x.kind === "row" ? x.row.id : `out:${x.send.id}`)),
+    ["t1", "out:qt-1"],
+  );
 });

@@ -1,4 +1,4 @@
-import { sameMessage, type AgentStatus } from "@herdr-pocket/protocol";
+import { matchesOptimisticCommand, sameMessage, type AgentStatus } from "@herdr-pocket/protocol";
 import type { ChatRow } from "./chatFold";
 
 export interface OutgoingSendLike {
@@ -6,11 +6,25 @@ export interface OutgoingSendLike {
   text: string;
   attachedCount: number;
   ts: number;
-  state: "sending" | "sent" | "failed";
+  state: "sending" | "sent" | "queued_terminal" | "failed";
+}
+
+/** True when the agent is actively executing or streaming a tool/activity turn. */
+export function isAgentTurnBusy(status: AgentStatus | undefined, rows: readonly ChatRow[]): boolean {
+  if (status === "working") return true;
+  for (let i = rows.length - 1; i >= Math.max(0, rows.length - 3); i -= 1) {
+    const r = rows[i];
+    if (!r) continue;
+    if (r.kind === "assistant" || r.kind === "turn_end" || r.kind === "user") break;
+    if (r.kind === "activity_group" && r.running) return true;
+    if (r.kind === "tool" && r.step.running) return true;
+  }
+  return false;
 }
 
 const ECHO_SLACK_MS = 60_000;
 const SENT_TTL_MS = 3 * 60_000;
+const SLASH_SENT_TTL_MS = 8_000;
 const AWAIT_REPLY_MS = 60_000;
 const DRAIN_COOLDOWN_MS = 3500;
 
@@ -21,6 +35,8 @@ function rowTs(row: ChatRow): number {
     case "turn_end":
     case "thinking":
     case "system":
+    case "command_result":
+    case "compact_notice":
     case "model_switch":
     case "tool":
       return row.ts;
@@ -75,20 +91,42 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
       continue;
     }
 
-    const hit = users.find(
+    const isSlash = send.text.trim().startsWith("/");
+    let hitIdx = -1;
+    const userHit = users.find(
       ({ r, i }) =>
         !claimed.has(i) &&
         (r.ts ?? 0) >= send.ts - ECHO_SLACK_MS &&
         sameMessage(transcriptForm(r), send.text, send.attachedCount > 0),
     );
-    if (hit) {
-      claimed.add(hit.i);
+    if (userHit) {
+      hitIdx = userHit.i;
+    } else if (isSlash) {
+      hitIdx = rows.findIndex((r, i) => {
+        if (claimed.has(i)) return false;
+        const ts = rowTs(r);
+        if (ts > 0 && ts < send.ts - ECHO_SLACK_MS) return false;
+        return matchesOptimisticCommand(send.text, {
+          kind: r.kind,
+          summary: r.kind === "system" ? r.summary : r.kind === "command_result" ? r.command : undefined,
+          text:
+            r.kind === "user" || r.kind === "system" || r.kind === "command_result" || r.kind === "compact_notice"
+              ? r.text
+              : undefined,
+          label: r.kind === "model_switch" ? r.label : undefined,
+        });
+      });
+    }
+
+    if (hitIdx >= 0) {
+      claimed.add(hitIdx);
       matchedIds.push(send.id);
-      matchedRowIdx.set(send.id, hit.i);
+      matchedRowIdx.set(send.id, hitIdx);
       continue;
     }
 
-    if (send.state === "sent" && now - send.ts > SENT_TTL_MS) {
+    const ttlMs = isSlash ? SLASH_SENT_TTL_MS : SENT_TTL_MS;
+    if ((send.state === "sent" || send.state === "queued_terminal") && now - send.ts > ttlMs) {
       expiredIds.push(send.id);
       continue;
     }
@@ -102,18 +140,25 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
     (best, cur) => (!best || cur.ts > best.ts ? cur : best),
     undefined,
   );
+  const busyNow = isAgentTurnBusy(agentStatus, rows);
   if (
     lastSend &&
+    lastSend.state !== "queued_terminal" &&
+    !busyNow &&
     now - lastSend.ts < AWAIT_REPLY_MS &&
-    agentStatus !== "working" &&
     (agentStatus !== "blocked" || now - lastSend.ts < 15_000)
   ) {
     const matchedAt = matchedRowIdx.get(lastSend.id);
-    const hasReplyAfter =
-      matchedAt !== undefined
-        ? rows.some((r, i) => i > matchedAt && r.kind !== "user" && r.kind !== "system" && r.kind !== "model_switch")
-        : rows.some((r) => r.kind !== "user" && r.kind !== "system" && r.kind !== "model_switch" && rowTs(r) >= lastSend.ts);
-    awaitingReply = !hasReplyAfter;
+    const isSlashLast = lastSend.text.trim().startsWith("/");
+    if (isSlashLast && matchedAt !== undefined) {
+      awaitingReply = false;
+    } else {
+      const hasReplyAfter =
+        matchedAt !== undefined
+          ? rows.some((r, i) => i > matchedAt && r.kind !== "user" && r.kind !== "system" && r.kind !== "model_switch")
+          : rows.some((r) => r.kind !== "user" && r.kind !== "system" && r.kind !== "model_switch" && rowTs(r) >= lastSend.ts);
+      awaitingReply = !hasReplyAfter;
+    }
   }
 
   return { unmatched, matchedIds, expiredIds, awaitingReply };
@@ -123,10 +168,15 @@ export type TimelineItem<T extends OutgoingSendLike> =
   | { kind: "row"; row: ChatRow }
   | { kind: "outgoing"; send: T };
 
+function isRunningRow(row: ChatRow): boolean {
+  return (row.kind === "activity_group" && row.running) || (row.kind === "tool" && row.step.running);
+}
+
 /**
  * Interleaves unconfirmed optimistic `outgoing` sends chronologically inside the active
  * trailing segment (after the last persisted user turn) so short assistant replies over SSE
  * never appear above a just-sent prompt whose persisted page-fetch is still in flight.
+ * Terminal-queued sends always stay at the very bottom after active turns.
  */
 export function interleaveOptimisticSends<T extends OutgoingSendLike>(
   rows: ChatRow[],
@@ -136,20 +186,22 @@ export function interleaveOptimisticSends<T extends OutgoingSendLike>(
     return rows.map((row) => ({ kind: "row", row }));
   }
 
-  let anchorIdx = -1;
-  for (let i = rows.length - 1; i >= 0; i -= 1) {
-    if (rows[i]!.kind === "user") {
-      anchorIdx = i;
-      break;
-    }
+  const activeSends = unmatched.filter((s) => s.state !== "queued_terminal").sort((a, b) => a.ts - b.ts);
+  const tailQueuedSends = unmatched.filter((s) => s.state === "queued_terminal").sort((a, b) => a.ts - b.ts);
+
+  if (!activeSends.length) {
+    return [
+      ...rows.map((row) => ({ kind: "row" as const, row })),
+      ...tailQueuedSends.map((send) => ({ kind: "outgoing" as const, send })),
+    ];
   }
 
-  const sortedUnmatched = [...unmatched].sort((a, b) => a.ts - b.ts);
-  const firstSendTs = sortedUnmatched[0]!.ts;
-  // Never place a new optimistic send before an already-completed previous turn.
-  for (let i = rows.length - 1; i > anchorIdx; i -= 1) {
+  const firstSendTs = activeSends[0]!.ts;
+
+  let anchorIdx = -1;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
     const r = rows[i]!;
-    if (r.kind === "turn_end" && r.ts <= firstSendTs) {
+    if ((r.kind === "user" || r.kind === "turn_end" || r.kind === "command_result") && rowTs(r) <= firstSendTs) {
       anchorIdx = i;
       break;
     }
@@ -164,16 +216,20 @@ export function interleaveOptimisticSends<T extends OutgoingSendLike>(
   for (let i = anchorIdx + 1; i < rows.length; i += 1) {
     const row = rows[i]!;
     const rTs = rowStartTs(row);
+    const allowAtZero = rTs === 0 && !isRunningRow(row);
     // Allow 1000ms slack for second-truncated transcript timestamps on the same computer.
-    while (uIdx < sortedUnmatched.length && (rTs === 0 || rTs >= sortedUnmatched[uIdx]!.ts - 1000)) {
-      out.push({ kind: "outgoing", send: sortedUnmatched[uIdx]! });
+    while (uIdx < activeSends.length && (allowAtZero || (rTs > 0 && rTs >= activeSends[uIdx]!.ts - 1000))) {
+      out.push({ kind: "outgoing", send: activeSends[uIdx]! });
       uIdx += 1;
     }
     out.push({ kind: "row", row });
   }
-  while (uIdx < sortedUnmatched.length) {
-    out.push({ kind: "outgoing", send: sortedUnmatched[uIdx]! });
+  while (uIdx < activeSends.length) {
+    out.push({ kind: "outgoing", send: activeSends[uIdx]! });
     uIdx += 1;
+  }
+  for (const qSend of tailQueuedSends) {
+    out.push({ kind: "outgoing", send: qSend });
   }
   return out;
 }

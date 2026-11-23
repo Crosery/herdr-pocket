@@ -633,8 +633,14 @@ pub fn run() {
         |ctx, req, responder| {
             let uri_str = req.uri().to_string();
             let label = ctx.webview_label();
-            let is_cap = tauri::Url::parse(&uri_str)
+            let parsed_uri = tauri::Url::parse(&uri_str).ok();
+            let is_cap = parsed_uri
+                .as_ref()
                 .map(|u| u.path().starts_with("/cap/"))
+                .unwrap_or(false);
+            let is_mem_term_img = parsed_uri
+                .as_ref()
+                .map(|u| u.path().starts_with("/term-img/") || u.host_str() == Some("term-img"))
                 .unwrap_or(false);
             let allowed = label == "main" || (is_cap && label.starts_with("browser-"));
             if !allowed {
@@ -650,6 +656,10 @@ pub fn run() {
                 .get("range")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
+            if is_mem_term_img {
+                responder.respond(serve_pocket_local(&uri_str, range_hdr.as_deref()));
+                return;
+            }
             tauri::async_runtime::spawn_blocking(move || {
                 let res = serve_pocket_local(&uri_str, range_hdr.as_deref());
                 responder.respond(res);

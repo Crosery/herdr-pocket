@@ -1,6 +1,7 @@
 import { lstatSync, readFileSync, realpathSync, statSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { inflateRawSync, inflateSync } from "node:zlib";
 
 export interface KittyHostProcessResult {
   outBytes: Buffer;
@@ -17,6 +18,8 @@ interface ParsedKittyHeader {
   height?: number;
   id?: number;
   imageNumber?: number;
+  dataSize?: number;
+  dataOffset?: number;
   quiet: number;
   rawPairs: string[];
 }
@@ -25,11 +28,14 @@ interface ActiveFileUpload {
   firstHeaderRaw: string;
   action: string;
   medium: string;
+  compression?: string;
   format?: number;
   id?: number;
   imageNumber?: number;
   width?: number;
   height?: number;
+  dataSize?: number;
+  dataOffset?: number;
   quiet: number;
   rawPairs: string[];
   rawChunks: Buffer[];
@@ -168,6 +174,12 @@ function parseKittyHeader(rawHeader: string): ParsedKittyHeader {
         break;
       case "I":
         parsed.imageNumber = parseUint(v);
+        break;
+      case "S":
+        parsed.dataSize = parseUint(v);
+        break;
+      case "O":
+        parsed.dataOffset = parseUint(v);
         break;
       case "q": {
         const q = parseUint(v);
@@ -312,8 +324,27 @@ function inlineFileToDirectApcs(upload: ActiveFileUpload): { out: Buffer; ok: bo
   } catch {
     return { out: Buffer.alloc(0), ok: false };
   }
+  const offset = upload.dataOffset ?? 0;
+  if (offset > fileBytes.length) return { out: Buffer.alloc(0), ok: false };
+  const end = upload.dataSize !== undefined ? Math.min(fileBytes.length, offset + upload.dataSize) : fileBytes.length;
+  fileBytes = fileBytes.subarray(offset, end);
   if (!fileBytes.length || fileBytes.length > MAX_HOST_IMAGE_BYTES) {
     return { out: Buffer.alloc(0), ok: false };
+  }
+
+  if (upload.compression === "z") {
+    try {
+      fileBytes = inflateSync(fileBytes, { maxOutputLength: MAX_HOST_IMAGE_BYTES });
+    } catch {
+      try {
+        fileBytes = inflateRawSync(fileBytes, { maxOutputLength: MAX_HOST_IMAGE_BYTES });
+      } catch {
+        return { out: Buffer.alloc(0), ok: false };
+      }
+    }
+    if (!fileBytes.length || fileBytes.length > MAX_HOST_IMAGE_BYTES) {
+      return { out: Buffer.alloc(0), ok: false };
+    }
   }
 
   let width = upload.width ?? 0;
@@ -347,7 +378,7 @@ function inlineFileToDirectApcs(upload: ActiveFileUpload): { out: Buffer; ok: bo
 
   const keptPairs = upload.rawPairs.filter((p) => {
     const k = p.slice(0, p.indexOf("="));
-    return k !== "t" && k !== "f" && k !== "q" && k !== "m" && k !== "s" && k !== "v";
+    return k !== "t" && k !== "f" && k !== "q" && k !== "m" && k !== "s" && k !== "v" && k !== "o" && k !== "S" && k !== "O";
   });
   keptPairs.push("t=d", `f=${outFmt}`, "q=2");
   if (width > 0) keptPairs.push(`s=${width}`);
@@ -815,16 +846,19 @@ export class KittyHostStream {
       hdr.action === "t" ||
       (!hdr.action && payload.length > 0 && (hdr.format !== undefined || hdr.medium !== undefined || (hdr.width !== undefined && hdr.height !== undefined)));
 
-    if (isUploadAction && (hdr.medium === "f" || hdr.medium === "t") && !hdr.compression) {
+    if (isUploadAction && (hdr.medium === "f" || hdr.medium === "t") && (!hdr.compression || hdr.compression === "z")) {
       const upload: ActiveFileUpload = {
         firstHeaderRaw: hdrRaw,
         action: hdr.action ?? "t",
         medium: hdr.medium,
+        compression: hdr.compression,
         format: hdr.format,
         id: hdr.id,
         imageNumber: hdr.imageNumber,
         width: hdr.width,
         height: hdr.height,
+        dataSize: hdr.dataSize,
+        dataOffset: hdr.dataOffset,
         quiet: hdr.quiet,
         rawPairs: hdr.rawPairs,
         rawChunks: [prefix, content, suffix],

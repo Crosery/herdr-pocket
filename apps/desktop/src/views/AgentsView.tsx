@@ -56,11 +56,12 @@ import {
   PocketModal,
   PocketSelect,
   fs,
+  overlayStore,
   useToast,
 } from "../components/PocketUI";
 import { AgentUsageCard } from "../components/AgentUsageCard";
 import { BtwSideDrawer, executeAgentBtw, type BtwTurn } from "../components/BtwSideDrawer";
-import { ChatTimelineRows, clockStr } from "../components/ChatTimeline";
+import { ChatTimelineRows, CommandResultCard, InlineImageStrip, clockStr } from "../components/ChatTimeline";
 import { COMPOSER_SLASH_CHIP_PLACEHOLDER, ComposerSlashChip } from "../components/ComposerSlashChip";
 import { DropRail } from "../components/DropRail";
 import { FolderExplorerModal, normalizeFolderKey } from "../components/FolderExplorerModal";
@@ -83,8 +84,11 @@ import { parseTerminalChatTranscript, shellTurnMatchesCommand } from "../lib/ter
 import {
   cancelPendingModelSwitch,
   chatQueueStore,
+  closeInteractiveCommandPanel,
+  dismissCapturedCommand,
   dismissOutgoingSend,
   enqueuePrompt,
+  interruptAndSendQueuedPrompt,
   moveQueuedPromptToTop,
   popQueuedPromptForEdit,
   pruneOutgoingSends,
@@ -93,11 +97,13 @@ import {
   retryFailedSend,
   schedulePendingModelSwitch,
   sendPromptNow,
+  steerComposerNow,
   steerQueuedPromptNow,
   useAgentChatQueue,
+  type CapturedCommandEntry,
   type OutgoingSend,
 } from "../lib/chatQueue";
-import { interleaveOptimisticSends } from "../lib/chatQueueLogic";
+import { interleaveOptimisticSends, isAgentTurnBusy } from "../lib/chatQueueLogic";
 import { useComposerInput } from "../lib/composerKeys";
 import { prepareDroppedFiles, revokeAttachment, stageWorkspaceDragItem, type StagedAttachment } from "../lib/dropPreview";
 import {
@@ -111,7 +117,8 @@ import { endWorkspaceDrag, hasPaneDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDr
 import { collectDroppedFilesSafe, readOsDraggedPaths, snapshotDroppedDataTransfer, stageOsDraggedItems } from "../lib/finderDrop";
 import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import { updateAgentRoleModel, useAutoAgentModelMeta } from "../lib/modelCatalogClient";
-import { openFileTab, openSubagentAside } from "../shell/shellStore";
+import { openFileTab, openSubagentAside, shellStore } from "../shell/shellStore";
+import { logAction } from "../lib/log";
 import { native } from "../lib/native";
 import { RichMarkdown, parseChoices } from "../lib/markdown";
 import { openAgentFileTarget } from "../lib/openFileTarget";
@@ -508,7 +515,7 @@ export function AgentsView({
     return (
       <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
         <AgentDetailPanel
-          key={`${selectedAgent.key}:${initialTab}`}
+          key={selectedAgent.key}
           agent={selectedAgent}
           initialTab={initialTab}
           onBack={() => {
@@ -780,7 +787,7 @@ export function AgentsView({
           <div className="agents-col">{listPane}</div>
           <div className="detail-pane">
             {selectedAgent ? (
-              <AgentDetailPanel key={`${selectedAgent.key}:${initialTab}`} agent={selectedAgent} initialTab={initialTab} onOpenWorkbench={onOpenWorkbench} />
+              <AgentDetailPanel key={selectedAgent.key} agent={selectedAgent} initialTab={initialTab} onOpenWorkbench={onOpenWorkbench} />
             ) : listEmpty ? (
               <div className="detail-hint faint">agent 出现后，点左侧任意一个在这里查看对话和终端。</div>
             ) : (
@@ -939,18 +946,33 @@ export function AgentDetailPanel({
   visible?: boolean;
 }) {
   const toast = useToast();
+  const localHostId = useLocalHostDeviceId();
   const hostOnline = liveStore.use((s) => s.devices[agent.deviceId]?.online ?? true);
   const chatDisplayMode = settingsStore.use((s) => s.chatDisplayMode);
   const [tab, setTab] = useState<"chat" | "term">(mode ?? initialTab);
+  useEffect(() => {
+    if (mode === undefined) setTab(initialTab);
+  }, [initialTab, mode]);
   const activeMode: "chat" | "term" = mode ?? tab;
   const selectMode = (m: "chat" | "term") => {
+    if (m !== activeMode) {
+      logAction("ui", "ui.mode", { mode: m });
+    }
     setTab(m);
     onModeChange?.(m);
   };
   const [termVisited, setTermVisited] = useState(activeMode === "term");
   useEffect(() => {
-    if (activeMode === "term") setTermVisited(true);
-  }, [activeMode]);
+    if (activeMode === "term") {
+      setTermVisited(true);
+      return;
+    }
+    if (!termVisited && visible && agent.source === "hc" && localHostId === agent.deviceId) {
+      // Idle pre-warm for local terminals makes Chat <-> Terminal switches instantaneous without mount flicker.
+      const timer = window.setTimeout(() => setTermVisited(true), 180);
+      return () => window.clearTimeout(timer);
+    }
+  }, [activeMode, agent.deviceId, agent.source, localHostId, termVisited, visible]);
 
   const [events, setEvents] = useState<ConvEvent[]>([]);
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
@@ -1008,6 +1030,7 @@ export function AgentDetailPanel({
     return modelMeta.thinkingLevels ?? [];
   }, [agent.isShell, modelMeta.canSwitchThinking, modelMeta.thinkingLevels]);
   const applyModelMetaOverride = modelMeta.applyOverride;
+  const clearModelMetaOverride = modelMeta.clearOverride;
   const [btwTurnsByAgent, setBtwTurnsByAgent] = useState<Record<string, BtwTurn[]>>({});
   const [chipDismissedPrefix, setChipDismissedPrefix] = useState<string | null>(null);
   const btwTurns = btwTurnsByAgent[agent.key] ?? [];
@@ -1049,12 +1072,37 @@ export function AgentDetailPanel({
   const hadOpenRef = useRef(false);
   const hasSubsRef = useRef(false);
   hasSubsRef.current = Boolean(agent.subagents || subs.length);
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const subLiveRef = useRef(false);
   const sessionTrackRef = useRef<{ agentKey: string; sessionKey?: string }>({ agentKey: agent.key, sessionKey: agent.sessionKey });
   const dragDepthRef = useRef(0);
   const attachmentsRef = useRef<StagedAttachment[]>([]);
   attachmentsRef.current = attachments;
 
-  const { queued, outgoing, pendingSwitch } = useAgentChatQueue(agent.key);
+  const overlayOpenCount = overlayStore.use((s) => s.open);
+  const settingsOpen = Boolean(shellStore.use((s) => s.settings));
+  const paletteOpen = Boolean(shellStore.use((s) => s.palette));
+  const [unreadCount, setUnreadCount] = useState(0);
+  const lastTrackedRowIdRef = useRef<string | null>(null);
+  const [winFocused, setWinFocused] = useState(
+    () => typeof document === "undefined" || (document.visibilityState === "visible" && document.hasFocus()),
+  );
+  useEffect(() => {
+    const sync = () => {
+      setWinFocused(typeof document === "undefined" || (document.visibilityState === "visible" && document.hasFocus()));
+    };
+    window.addEventListener("focus", sync);
+    window.addEventListener("blur", sync);
+    document.addEventListener("visibilitychange", sync);
+    return () => {
+      window.removeEventListener("focus", sync);
+      window.removeEventListener("blur", sync);
+      document.removeEventListener("visibilitychange", sync);
+    };
+  }, []);
+
+  const { queued, outgoing, pendingSwitch, captured } = useAgentChatQueue(agent.key);
   const activeSub = subTrail[subTrail.length - 1] ?? null;
   const isPlainShellChat = Boolean(agent.isShell && !agent.sessionKey && !activeSub);
 
@@ -1099,6 +1147,8 @@ export function AgentDetailPanel({
       prevScrollTopRef.current = 0;
       autoFillCountRef.current = 0;
       setAtBottom(true);
+      setUnreadCount(0);
+      lastTrackedRowIdRef.current = null;
     }
     streamLiveRef.current = false;
     hadOpenRef.current = false;
@@ -1146,7 +1196,8 @@ export function AgentDetailPanel({
     );
 
     const pollTimer = window.setInterval(() => {
-      if (!alive) return;
+      if (!alive || !visibleRef.current) return;
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       if (hasSubsRef.current) {
         void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
           .then((res) => {
@@ -1173,10 +1224,11 @@ export function AgentDetailPanel({
   const lastSeenMarkRef = useRef<string | null>(null);
   const wasVisibleForSeenRef = useRef(false);
   const isActivelyViewed = visible && (!embedded || focused);
+  const canMarkSeen = isActivelyViewed && atBottom && overlayOpenCount === 0 && !settingsOpen && !paletteOpen && winFocused;
   useEffect(() => {
-    const justBecameViewed = isActivelyViewed && !wasVisibleForSeenRef.current;
-    wasVisibleForSeenRef.current = isActivelyViewed;
-    if (!isActivelyViewed || agent.status !== "done") {
+    const justBecameViewed = canMarkSeen && !wasVisibleForSeenRef.current;
+    wasVisibleForSeenRef.current = canMarkSeen;
+    if (!canMarkSeen || agent.status !== "done") {
       if (agent.status !== "done") lastSeenMarkRef.current = null;
       return;
     }
@@ -1198,7 +1250,7 @@ export function AgentDetailPanel({
       };
     });
     void rpcCall(agent.deviceId, "agent.seen", { agent: agent.key }).catch(() => {});
-  }, [agent.deviceId, agent.key, agent.status, agent.turn, isActivelyViewed]);
+  }, [agent.deviceId, agent.key, agent.status, agent.turn, canMarkSeen]);
 
   useEffect(() => {
     if (!agent.subagents) return;
@@ -1253,12 +1305,16 @@ export function AgentDetailPanel({
         }
       },
       (st) => {
-        if (alive) subLive = st?.kind === "live";
+        if (alive) {
+          subLive = st?.kind === "live";
+          subLiveRef.current = subLive;
+        }
       },
     );
 
     const pollTimer = window.setInterval(() => {
-      if (!alive) return;
+      if (!alive || !visibleRef.current) return;
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       if (!subLive) {
         void rpcCall(agent.deviceId, "session.events", { agent: agent.key, sub: activeSubKey, limit: 120 })
           .then((res) => {
@@ -1275,6 +1331,7 @@ export function AgentDetailPanel({
 
     return () => {
       alive = false;
+      subLiveRef.current = false;
       merger.dispose();
       window.clearInterval(pollTimer);
       unsubSub();
@@ -1316,7 +1373,8 @@ export function AgentDetailPanel({
     );
 
     const pollTimer = window.setInterval(() => {
-      if (!alive || live) return;
+      if (!alive || live || !visibleRef.current) return;
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 220 })
         .then((res) => commit(res.text || res.ansi || ""))
         .catch(() => {});
@@ -1328,6 +1386,43 @@ export function AgentDetailPanel({
       unsubTerm();
     };
   }, [activeMode, agent.deviceId, agent.key, isPlainShellChat]);
+
+  const prevPollVisibleRef = useRef(visible);
+  useEffect(() => {
+    const wasVisible = prevPollVisibleRef.current;
+    prevPollVisibleRef.current = visible;
+    if (!visible || wasVisible) return;
+    let alive = true;
+    if (!streamLiveRef.current && agent.sessionKey) {
+      void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 80 })
+        .then((res) => {
+          if (alive) setEvents((prevList) => mergeConvEvents(prevList, res.events));
+        })
+        .catch(() => {});
+    }
+    if (hasSubsRef.current) {
+      void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
+        .then((res) => {
+          if (alive) setSubs(res.sessions);
+        })
+        .catch(() => {});
+    }
+    if (activeSubKey && !subLiveRef.current) {
+      void rpcCall(agent.deviceId, "session.events", { agent: agent.key, sub: activeSubKey, limit: 120 })
+        .then((res) => {
+          if (alive) setSubEvents((prev) => mergeConvEvents(prev, res.events));
+        })
+        .catch(() => {});
+      void rpcCall(agent.deviceId, "session.children", { agent: agent.key, sub: activeSubKey })
+        .then((res) => {
+          if (alive) setActiveChildSubs(res.sessions);
+        })
+        .catch(() => {});
+    }
+    return () => {
+      alive = false;
+    };
+  }, [activeSubKey, agent.deviceId, agent.key, agent.sessionKey, visible]);
 
   useEffect(() => {
     if (agent.isShell) {
@@ -1370,6 +1465,7 @@ export function AgentDetailPanel({
     () => (isPlainShellChat ? [] : foldConvEvents(displayedEvents, chatDisplayMode)),
     [chatDisplayMode, displayedEvents, isPlainShellChat],
   );
+  const isTurnBusy = useMemo(() => isAgentTurnBusy(agent.status, foldedRows), [agent.status, foldedRows]);
   const convReconciled = useMemo(
     () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick),
     [agent.status, foldedRows, nowTick, outgoing],
@@ -1397,18 +1493,37 @@ export function AgentDetailPanel({
 
   const timelineSegments = useMemo(() => {
     const items = interleaveOptimisticSends(foldedRows, reconciled.unmatched);
-    const segs: Array<{ kind: "rows"; id: string; rows: ChatRow[] } | { kind: "outgoing"; send: OutgoingSend }> = [];
+    const sortedCaps = !isPlainShellChat && !activeSub ? [...captured].sort((a, b) => a.ts - b.ts) : [];
+    const segs: Array<
+      | { kind: "rows"; id: string; rows: ChatRow[] }
+      | { kind: "outgoing"; send: OutgoingSend }
+      | { kind: "captured"; cap: CapturedCommandEntry }
+    > = [];
+    const rowEndTs = (r: ChatRow) => (r.kind === "activity_group" ? r.endTs : r.ts);
+    let cIdx = 0;
+    const pushRow = (row: ChatRow) => {
+      const last = segs[segs.length - 1];
+      if (last?.kind === "rows") last.rows.push(row);
+      else segs.push({ kind: "rows", id: `seg-${row.id}`, rows: [row] });
+    };
     for (const item of items) {
+      const itemTs = item.kind === "outgoing" ? item.send.ts : rowEndTs(item.row);
+      while (cIdx < sortedCaps.length && (itemTs === 0 || sortedCaps[cIdx]!.ts <= itemTs)) {
+        segs.push({ kind: "captured", cap: sortedCaps[cIdx]! });
+        cIdx += 1;
+      }
       if (item.kind === "outgoing") {
         segs.push(item);
       } else {
-        const last = segs[segs.length - 1];
-        if (last?.kind === "rows") last.rows.push(item.row);
-        else segs.push({ kind: "rows", id: `seg-${item.row.id}`, rows: [item.row] });
+        pushRow(item.row);
       }
     }
+    while (cIdx < sortedCaps.length) {
+      segs.push({ kind: "captured", cap: sortedCaps[cIdx]! });
+      cIdx += 1;
+    }
     return segs;
-  }, [foldedRows, reconciled.unmatched]);
+  }, [activeSub, captured, foldedRows, isPlainShellChat, reconciled.unmatched]);
 
   const allSlashCommands = useMemo(
     () => mergeSlashCommands(builtinSlashCommands(agent.harness, agent.isShell), discoveredSlash),
@@ -1556,12 +1671,14 @@ export function AgentDetailPanel({
   const hasAnyRenderedRows =
     foldedRows.length > 0 ||
     reconciled.unmatched.length > 0 ||
+    captured.length > 0 ||
     terminalQueuedItems.length > 0 ||
     Boolean(shellChat && (shellChat.turns.length > 0 || shellChat.preambleLines.length > 0));
 
   const scrollToBottom = useCallback((smooth = false) => {
     stickRef.current = true;
     setAtBottom(true);
+    setUnreadCount(0);
     const el = chatScrollRef.current;
     if (!el) return;
     if (smooth) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
@@ -1598,12 +1715,36 @@ export function AgentDetailPanel({
     }
   }, [agent.deviceId, agent.key, olderCursor, toast]);
 
+  useEffect(() => {
+    const tail = captured.length ? `cap:${captured[captured.length - 1]!.id}` : foldedRows.length ? `row:${foldedRows[foldedRows.length - 1]!.id}` : null;
+    if (!tail) {
+      lastTrackedRowIdRef.current = null;
+      return;
+    }
+    if (atBottom) {
+      lastTrackedRowIdRef.current = tail;
+      if (unreadCount !== 0) setUnreadCount(0);
+      return;
+    }
+    const prevTail = lastTrackedRowIdRef.current;
+    if (prevTail && prevTail !== tail && initialPositionedRef.current) {
+      setUnreadCount((c) => Math.min(99, c + 1));
+    }
+    lastTrackedRowIdRef.current = tail;
+  }, [atBottom, captured, foldedRows, unreadCount]);
+
   useLayoutEffect(() => {
     const justEnteredChat = prevModeRef.current !== "chat" && activeMode === "chat";
     prevModeRef.current = activeMode;
     if (activeMode !== "chat") return;
     const el = chatScrollRef.current;
     if (!el) return;
+    const hasSelectionInside = () => {
+      if (typeof window === "undefined") return false;
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed) return false;
+      return el.contains(sel.anchorNode) || el.contains(sel.focusNode);
+    };
     const hasAnyRows = hasAnyRenderedRows;
     if (prependAnchorRef.current) {
       const anchor = prependAnchorRef.current;
@@ -1622,9 +1763,10 @@ export function AgentDetailPanel({
       initialPositionedRef.current = true;
       stickRef.current = true;
       setAtBottom(true);
+      setUnreadCount(0);
       return;
     }
-    if (stickRef.current) {
+    if (stickRef.current && !hasSelectionInside()) {
       el.scrollTop = hasAnyRows || agent.status === "working" || reconciled.awaitingReply || sending ? el.scrollHeight : 0;
       prevScrollTopRef.current = el.scrollTop;
     }
@@ -1645,6 +1787,7 @@ export function AgentDetailPanel({
     activeMode,
     activeSub,
     agent.status,
+    captured,
     foldedRows,
     hasAnyRenderedRows,
     isPlainShellChat,
@@ -1667,6 +1810,7 @@ export function AgentDetailPanel({
     const nearBottom = el.scrollHeight - top - el.clientHeight < 72;
     stickRef.current = nearBottom;
     setAtBottom(nearBottom);
+    if (nearBottom) setUnreadCount(0);
     if (
       !activeSub &&
       !isPlainShellChat &&
@@ -1724,6 +1868,11 @@ export function AgentDetailPanel({
       }
 
       cancelPendingModelSwitch(agent.key);
+      logAction("model", "model.switch", {
+        harness: agent.harness,
+        hasModel: Boolean(modelId),
+        hasThinking: Boolean(thinkingLevel),
+      });
       setSending(true);
       try {
         const res = await rpcCall(agent.deviceId, "agent.setModel", {
@@ -1738,23 +1887,26 @@ export function AgentDetailPanel({
         toast(res.note || `已切换：${labelDesc}`);
       } catch (e) {
         const err = e as { code?: string; message?: string };
-        const unsupported =
-          err?.code === "unsupported" ||
-          err?.code === "bad_request" ||
-          /unknown|unsupported|不支持/i.test(err?.message ?? "");
-        if (unsupported && plan.commands.length > 0) {
-          for (const cmd of plan.commands) {
-            await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: cmd, enter: true });
+        const rpcUnsupported = err?.code === "unsupported";
+        if (rpcUnsupported && plan.commands.length > 0) {
+          try {
+            for (const cmd of plan.commands) {
+              await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: cmd, enter: true });
+            }
+            toast(`已切换：${labelDesc}`);
+          } catch (fallbackErr) {
+            clearModelMetaOverride();
+            toast((fallbackErr as Error).message || "切换失败", true);
           }
-          toast(`已切换：${labelDesc}`);
         } else {
+          clearModelMetaOverride();
           toast(err?.message || "切换失败", true);
         }
       } finally {
         setSending(false);
       }
     },
-    [agent, applyModelMetaOverride, modelMeta.modelRoles, toast],
+    [agent, applyModelMetaOverride, clearModelMetaOverride, modelMeta.modelRoles, toast],
   );
 
   const applyModelSwitch = useCallback(
@@ -1886,7 +2038,12 @@ export function AgentDetailPanel({
 
   const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
   const submitComposerRef = useRef<(overrideText?: string) => void>(() => {});
-  const composer = useComposerInput(composerInputValue, () => submitComposerRef.current());
+  const steerComposerRef = useRef<() => void>(() => {});
+  const composer = useComposerInput(
+    composerInputValue,
+    () => submitComposerRef.current(),
+    isTurnBusy && !isBtwDraft ? () => steerComposerRef.current() : undefined,
+  );
 
   const submitComposer = (overrideText?: string) => {
     const isOverride = overrideText !== undefined;
@@ -1974,7 +2131,13 @@ export function AgentDetailPanel({
     stickRef.current = true;
     setAtBottom(true);
 
-    if (agent.status === "working") {
+    logAction("chat", "chat.send", {
+      slash: raw.startsWith("/"),
+      chars: raw.length,
+      files: staged.length,
+    });
+
+    if (isTurnBusy) {
       enqueuePrompt(agent, raw, staged);
       requestAnimationFrame(() => composer.textareaRef.current?.focus());
       return;
@@ -1997,11 +2160,64 @@ export function AgentDetailPanel({
   };
   submitComposerRef.current = submitComposer;
 
-  const interruptTurn = () => {
+  const steerComposer = () => {
+    const raw = text.trim();
+    const staged = attachments;
+    if (!raw && staged.length === 0) return;
+    clearComposerDraft(agent.key, { revoke: false });
+    setTextState("");
+    setAttachmentsState([]);
+    setChipDismissedPrefix(null);
+    stickRef.current = true;
+    setAtBottom(true);
+    logAction("chat", "chat.steer", {
+      slash: raw.startsWith("/"),
+      chars: raw.length,
+      files: staged.length,
+    });
+    setSending(true);
+    void steerComposerNow(agent, raw, staged).finally(() => setSending(false));
+    requestAnimationFrame(() => composer.textareaRef.current?.focus());
+  };
+  steerComposerRef.current = steerComposer;
+
+  const interruptTurn = useCallback(() => {
     void rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) =>
       toast((e as Error).message, true),
     );
-  };
+  }, [agent.deviceId, agent.key, toast]);
+
+  useEffect(() => {
+    const onAgentAction = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ agentKey?: string; action?: string }>).detail;
+      if (!detail || detail.agentKey !== agent.key || !visibleRef.current) return;
+      if (embedded && !focused) return;
+      switch (detail.action) {
+        case "focusComposer":
+          if (activeMode !== "chat") selectMode("chat");
+          requestAnimationFrame(() => composer.textareaRef.current?.focus());
+          break;
+        case "openModelPicker":
+          if (activeMode !== "chat") selectMode("chat");
+          setModelMenuOmpTab(normalizeSwitchHarness(agent.harness) === "omp" ? "roles" : "session");
+          setModelMenuMode("model");
+          break;
+        case "openThinkingPicker":
+          if (activeMode !== "chat") selectMode("chat");
+          setModelMenuMode(effectiveThinkingLevels.length > 0 ? "thinking" : "model");
+          break;
+        case "openUsageCard":
+          if (activeMode !== "chat") selectMode("chat");
+          openUsageView();
+          break;
+        case "interruptAgent":
+          interruptTurn();
+          break;
+      }
+    };
+    window.addEventListener("pocket:agent-action", onAgentAction);
+    return () => window.removeEventListener("pocket:agent-action", onAgentAction);
+  });
 
   const sendKeys = async (keys: string[]) => {
     try {
@@ -2048,9 +2264,19 @@ export function AgentDetailPanel({
     const wasFocused = prevFocusedRef.current;
     prevFocusedRef.current = focused;
     if (embedded && focused && !wasFocused && activeMode === "chat") {
-      requestAnimationFrame(() => composer.textareaRef.current?.focus());
+      requestAnimationFrame(() => composer.textareaRef.current?.focus({ preventScroll: true }));
     }
   }, [activeMode, composer.textareaRef, embedded, focused]);
+
+  const prevModeForFocusRef = useRef(activeMode);
+
+  useEffect(() => {
+    const prevMode = prevModeForFocusRef.current;
+    prevModeForFocusRef.current = activeMode;
+    if (prevMode === "term" && activeMode === "chat" && focused && visible && !activeSub) {
+      requestAnimationFrame(() => composer.textareaRef.current?.focus({ preventScroll: true }));
+    }
+  }, [activeMode, activeSub, composer.textareaRef, focused, visible]);
 
   const pickSlashCommand = useCallback(
     (cmd: SlashCommandItem, allowAutoSend: boolean) => {
@@ -2074,7 +2300,7 @@ export function AgentDetailPanel({
         setAttachments([]);
         stickRef.current = true;
         setAtBottom(true);
-        if (agent.status === "working") {
+        if (isTurnBusy) {
           enqueuePrompt(agent, cmd.name, []);
         } else {
           setSending(true);
@@ -2085,7 +2311,7 @@ export function AgentDetailPanel({
       setText(`${cmd.name} `);
       requestAnimationFrame(() => composer.textareaRef.current?.focus());
     },
-    [agent, composer.textareaRef, openUsageView],
+    [agent, composer.textareaRef, isTurnBusy, openUsageView],
   );
 
   useEffect(() => {
@@ -2248,7 +2474,22 @@ export function AgentDetailPanel({
             ) : null}
             <div className="segmented">
               <button className={activeMode === "chat" ? "active" : ""} onClick={() => selectMode("chat")}>对话</button>
-              <button className={activeMode === "term" ? "active" : ""} onClick={() => selectMode("term")}>终端</button>
+              <button
+                className={activeMode === "term" ? "active" : ""}
+                title={
+                  agent.subscreen
+                    ? "终端正打开子面板（发消息将自动返回）"
+                    : agent.status === "blocked"
+                      ? "终端正等待确认或输入"
+                      : undefined
+                }
+                onClick={() => selectMode("term")}
+              >
+                终端
+                {Boolean(agent.subscreen) || agent.status === "blocked" ? (
+                  <span className="term-attn-dot" aria-hidden />
+                ) : null}
+              </button>
             </div>
             {onOpenWorkbench && agent.cwd && !agent.isShell ? (
               <PocketIconButton size="sm" tooltip="在工作台看它的文件" onClick={() => onOpenWorkbench(agent.key)}>
@@ -2273,94 +2514,139 @@ export function AgentDetailPanel({
         </div>
       ) : null}
 
-      {activeMode === "chat" ? (
-        <div className="chat-scroll-wrap">
-          <div
-            ref={chatScrollRef}
-            className="chat-scroll agent-chat"
-            onScroll={onChatScroll}
-            onWheel={(e) => {
-              const el = chatScrollRef.current;
-              if (e.deltaY < 0 && el && initialPositionedRef.current && olderCursor && !loadingOlder && !loadOlderError && el.scrollTop <= 180) {
-                void loadOlderEvents();
-              }
-            }}
-          >
-            {!activeSub && !isPlainShellChat && loadingOlder ? (
-              <div className="chat-top-status" role="status" aria-live="polite">
-                <span className="act-spin" aria-hidden />
-                <span>正在加载更早对话…</span>
-              </div>
-            ) : !activeSub && !isPlainShellChat && loadOlderError && olderCursor ? (
-              <button type="button" className="chat-top-retry" onClick={() => void loadOlderEvents()}>
-                加载更早记录失败 · 点击重试
-              </button>
-            ) : !activeSub && !isPlainShellChat && !olderCursor && hasLoadedOlder && foldedRows.length > 0 ? (
-              <div className="chat-start-sep">
-                <span>对话开头</span>
-              </div>
-            ) : null}
+      <div className="chat-scroll-wrap" style={{ display: activeMode === "chat" ? undefined : "none" }}>
+        <div
+          ref={chatScrollRef}
+          className="chat-scroll agent-chat"
+          onScroll={onChatScroll}
+          onWheel={(e) => {
+            const el = chatScrollRef.current;
+            if (e.deltaY < 0 && el && initialPositionedRef.current && olderCursor && !loadingOlder && !loadOlderError && el.scrollTop <= 180) {
+              void loadOlderEvents();
+            }
+          }}
+        >
+          {!activeSub && !isPlainShellChat && loadingOlder ? (
+            <div className="chat-top-status" role="status" aria-live="polite">
+              <span className="act-spin" aria-hidden />
+              <span>正在加载更早对话…</span>
+            </div>
+          ) : !activeSub && !isPlainShellChat && loadOlderError && olderCursor ? (
+            <button type="button" className="chat-top-retry" onClick={() => void loadOlderEvents()}>
+              加载更早记录失败 · 点击重试
+            </button>
+          ) : !activeSub && !isPlainShellChat && !olderCursor && hasLoadedOlder && foldedRows.length > 0 ? (
+            <div className="chat-start-sep">
+              <span>对话开头</span>
+            </div>
+          ) : null}
 
-            {showEmptyState ? (
-              <EmptyState mood="sleepy" title="还没有对话记录" body="在下方发一条消息，或点右上角切换到“终端”直接操作。" />
-            ) : (
-              <>
-                {isPlainShellChat && shellChat ? (
-                  <>
-                    {shellChat.preambleLines.length > 0 ? (
-                      <pre className="chat-shell-out mono">{shellChat.preambleLines.join("\n")}</pre>
-                    ) : null}
-                    {shellChat.turns.map((turn) => (
-                      <div key={turn.id} className="chat-shell-turn">
-                        <div className="bubble-row user">
-                          <div className="bubble user mono">
-                            <span className="chat-shell-prompt">{turn.prompt}</span> {turn.command}
-                          </div>
+          {showEmptyState ? (
+            <EmptyState mood="sleepy" title="还没有对话记录" body="在下方发一条消息，或点右上角切换到“终端”直接操作。" />
+          ) : (
+            <>
+              {isPlainShellChat && shellChat ? (
+                <>
+                  {shellChat.preambleLines.length > 0 ? (
+                    <pre className="chat-shell-out mono">{shellChat.preambleLines.join("\n")}</pre>
+                  ) : null}
+                  {shellChat.turns.map((turn) => (
+                    <div key={turn.id} className="chat-shell-turn">
+                      <div className="bubble-row user">
+                        <div className="bubble user mono">
+                          <span className="chat-shell-prompt">{turn.prompt}</span> {turn.command}
                         </div>
-                        {turn.outputLines.length > 0 ? (
-                          <pre className="chat-shell-out mono">{turn.outputLines.join("\n")}</pre>
-                        ) : turn.completedEmpty ? (
-                          <div className="chat-shell-empty">✓ 已执行（无输出）</div>
+                      </div>
+                      {turn.outputLines.length > 0 ? (
+                        <pre className="chat-shell-out mono">{turn.outputLines.join("\n")}</pre>
+                      ) : turn.completedEmpty ? (
+                        <div className="chat-shell-empty">✓ 已执行（无输出）</div>
+                      ) : null}
+                    </div>
+                  ))}
+                  {reconciled.unmatched.map((item) => (
+                    <div key={item.id} className="bubble-row user">
+                      {item.text ? <div className="bubble user">{item.text}</div> : null}
+                      <div className={`bubble-send-meta${item.state === "failed" ? " error" : ""}`}>
+                        <span>
+                          {clockStr(item.ts)} · {item.state === "sending" ? "发送中…" : item.state === "failed" ? `发送失败${item.error ? `：${clip(item.error, 40)}` : ""}` : "等待终端显示…"}
+                        </span>
+                        {item.state === "failed" ? (
+                          <>
+                            <button type="button" className="bubble-meta-btn primary" onClick={() => void retryFailedSend(item.id, agent.key)}>重发</button>
+                            <button type="button" className="bubble-meta-btn" onClick={() => dismissOutgoingSend(agent.key, item.id)}>删掉</button>
+                          </>
                         ) : null}
                       </div>
-                    ))}
-                    {reconciled.unmatched.map((item) => (
-                      <div key={item.id} className="bubble-row user">
-                        {item.text ? <div className="bubble user">{item.text}</div> : null}
-                        <div className={`bubble-send-meta${item.state === "failed" ? " error" : ""}`}>
-                          <span>
-                            {clockStr(item.ts)} · {item.state === "sending" ? "发送中…" : item.state === "failed" ? `发送失败${item.error ? `：${clip(item.error, 40)}` : ""}` : "等待终端显示…"}
-                          </span>
-                          {item.state === "failed" ? (
-                            <>
-                              <button type="button" className="bubble-meta-btn primary" onClick={() => void retryFailedSend(item.id, agent.key)}>重发</button>
-                              <button type="button" className="bubble-meta-btn" onClick={() => dismissOutgoingSend(agent.key, item.id)}>删掉</button>
-                            </>
-                          ) : null}
-                        </div>
-                      </div>
-                    ))}
-                  </>
-                ) : (
-                  timelineSegments.map((seg) =>
-                    seg.kind === "rows" ? (
-                      <ChatTimelineRows
-                        key={seg.id}
-                        rows={seg.rows}
-                        subs={activeSub ? activeChildSubs : subs}
-                        agentKey={agent.key}
-                        deviceId={agent.deviceId}
-                        cwd={agent.cwd}
-                        onOpenSub={(s) => selectSubInPlace(s, subTrail)}
-                        onOpenSubAside={(s) => openSubAsideView(s, subTrail)}
-                        onOpenFile={(target) => {
-                          openAgentFileTarget(agent, target);
-                        }}
-                      />
-                    ) : (
+                    </div>
+                  ))}
+                </>
+              ) : (
+                timelineSegments.map((seg) =>
+                  seg.kind === "rows" ? (
+                    <ChatTimelineRows
+                      key={seg.id}
+                      rows={seg.rows}
+                      subs={activeSub ? activeChildSubs : subs}
+                      agentKey={agent.key}
+                      deviceId={agent.deviceId}
+                      cwd={agent.cwd}
+                      onOpenSub={(s) => selectSubInPlace(s, subTrail)}
+                      onOpenSubAside={(s) => openSubAsideView(s, subTrail)}
+                      onOpenFile={(target) => {
+                        openAgentFileTarget(agent, target);
+                      }}
+                      onSwitchToTerminal={() => selectMode("term")}
+                      onDismissCommandPanel={() => void sendKeys(["esc"])}
+                    />
+                  ) : seg.kind === "captured" ? (
+                    <CommandResultCard
+                      key={seg.cap.id}
+                      command={seg.cap.command}
+                      text={seg.cap.output}
+                      isError={seg.cap.isError}
+                      panelState={seg.cap.panelState}
+                      ts={seg.cap.ts}
+                      onSwitchToTerminal={() => selectMode("term")}
+                      onDismissPanel={() => void closeInteractiveCommandPanel(agent, seg.cap.id)}
+                      onDismissCard={() => dismissCapturedCommand(agent.key, seg.cap.id)}
+                    />
+                  ) : (() => {
+                    const imgAtts = seg.send.attachments.filter((a) => a.kind === "image" && a.previewUrl);
+                    const fileAtts = seg.send.attachments.filter((a) => !(a.kind === "image" && a.previewUrl));
+                    return (
                       <div key={seg.send.id} className="bubble-row user">
                         {seg.send.text ? <div className="bubble user">{seg.send.text}</div> : null}
-                        {seg.send.attachedCount > 0 ? (
+                        {seg.send.uploadedPaths?.length && !imgAtts.length ? (
+                          <InlineImageStrip
+                            targets={seg.send.uploadedPaths}
+                            agentKey={agent.key}
+                            deviceId={agent.deviceId}
+                            cwd={agent.cwd}
+                            onOpenFile={(target) => openAgentFileTarget(agent, target)}
+                          />
+                        ) : imgAtts.length > 0 ? (
+                          <div className="chat-img-strip-inline">
+                            {imgAtts.map((att) => (
+                              <img
+                                key={att.id}
+                                src={att.previewUrl}
+                                alt={att.name}
+                                className="chat-img-strip-thumb"
+                              />
+                            ))}
+                          </div>
+                        ) : null}
+                        {fileAtts.length > 0 ? (
+                          <div className="chat-att-list" title={fileAtts.map((a) => a.name).join("\n")}>
+                            {fileAtts.map((att) => (
+                              <span key={att.id} className="chat-attach-note row" style={{ gap: 5 }}>
+                                <Paperclip size={11} />
+                                <span className="truncate">{att.name}</span>
+                              </span>
+                            ))}
+                          </div>
+                        ) : seg.send.attachedCount > 0 && imgAtts.length === 0 && !(seg.send.uploadedPaths?.length) ? (
                           <div className="chat-attach-note row" style={{ gap: 5 }} title={seg.send.attachedNames.join("\n")}>
                             <Paperclip size={12} />
                             <span>已附带 {seg.send.attachedCount} 个文件/图片</span>
@@ -2373,7 +2659,9 @@ export function AgentDetailPanel({
                               ? "发送中…"
                               : seg.send.state === "failed"
                                 ? `发送失败${seg.send.error ? `：${clip(seg.send.error, 40)}` : ""}`
-                                : "等待会话同步…"}
+                                : seg.send.state === "queued_terminal"
+                                  ? "终端排队中 · 本轮结束后自动处理"
+                                  : "等待会话同步…"}
                           </span>
                           {seg.send.state === "failed" ? (
                             <>
@@ -2395,94 +2683,94 @@ export function AgentDetailPanel({
                           ) : null}
                         </div>
                       </div>
-                    ),
-                  )
-                )}
-              </>
-            )}
+                    );
+                  })(),
+                )
+              )}
+            </>
+          )}
 
-            {agent.status === "working" ? (
-              <div className="agent-run-card" role="status" aria-live="polite">
-                <XiaoyangOrb mood="working" size={30} />
-                <div className="agent-run-body">
-                  <div className="agent-run-title">
-                    <span>{activeToolLabel ? `正在执行 · ${activeToolLabel}` : "正在思考与处理"}</span>
-                    <span className="chat-typing-dots" aria-hidden>
-                      <span />
-                      <span />
-                      <span />
-                    </span>
-                  </div>
-                  <div className="agent-run-sub">{runElapsed}</div>
+          {isTurnBusy ? (
+            <div className="agent-run-card" role="status" aria-live="polite">
+              <XiaoyangOrb mood="working" size={30} />
+              <div className="agent-run-body">
+                <div className="agent-run-title">
+                  <span>{activeToolLabel ? `正在执行 · ${activeToolLabel}` : "正在思考与处理"}</span>
+                  <span className="chat-typing-dots" aria-hidden>
+                    <span />
+                    <span />
+                    <span />
+                  </span>
                 </div>
-                <button type="button" className="agent-stop-pill" onClick={interruptTurn} title="中断当前轮">
-                  <Square size={10} />
-                  <span>停止</span>
-                </button>
+                <div className="agent-run-sub">{runElapsed}</div>
               </div>
-            ) : hasSending || reconciled.awaitingReply ? (
-              <div className="agent-run-card" role="status" aria-live="polite">
-                <XiaoyangOrb mood="working" size={26} />
-                <div className="agent-run-body">
-                  <div className="agent-run-title">
-                    <span>{hasSending ? "正在发送…" : "已送达，等待响应…"}</span>
-                    <span className="chat-typing-dots" aria-hidden>
-                      <span />
-                      <span />
-                      <span />
-                    </span>
-                  </div>
+              <button type="button" className="agent-stop-pill" onClick={interruptTurn} title="中断当前轮">
+                <Square size={10} />
+                <span>停止</span>
+              </button>
+            </div>
+          ) : (hasSending || reconciled.awaitingReply) && reconciled.unmatched.length === 0 ? (
+            <div className="agent-run-card" role="status" aria-live="polite">
+              <XiaoyangOrb mood="working" size={26} />
+              <div className="agent-run-body">
+                <div className="agent-run-title">
+                  <span>{hasSending ? "正在发送…" : "已送达，等待响应…"}</span>
+                  <span className="chat-typing-dots" aria-hidden>
+                    <span />
+                    <span />
+                    <span />
+                  </span>
                 </div>
               </div>
-            ) : agent.status === "blocked" ? (
-              <div className="agent-run-card blocked" role="status" aria-live="polite">
-                <XiaoyangOrb mood="waiting" size={28} />
-                <div className="agent-run-body">
-                  <div className="agent-run-title">等待你的确认或输入</div>
-                  {agent.statusNote ? <div className="agent-run-sub">{clip(agent.statusNote, 48)}</div> : null}
-                </div>
-                <button type="button" className="agent-stop-pill" onClick={() => selectMode("term")}>
-                  切到终端处理
-                </button>
+            </div>
+          ) : agent.status === "blocked" ? (
+            <div className="agent-run-card blocked" role="status" aria-live="polite">
+              <XiaoyangOrb mood="waiting" size={28} />
+              <div className="agent-run-body">
+                <div className="agent-run-title">等待你的确认或输入</div>
+                {agent.statusNote ? <div className="agent-run-sub">{clip(agent.statusNote, 48)}</div> : null}
               </div>
-            ) : null}
-
-            {!activeSub && terminalQueuedItems.length > 0
-              ? terminalQueuedItems.map((qText, idx) => (
-                  <div key={`term-q-${idx}-${qText.slice(0, 24)}`} className="bubble-row user queued-terminal">
-                    <div className="bubble user">
-                      <RichMarkdown text={qText} onOpenFile={(target) => openAgentFileTarget(agent, target)} />
-                    </div>
-                    <div className="bubble-send-meta">
-                      <span>终端排队中 · 本轮结束后自动处理</span>
-                      {agent.source === "hc" && idx === 0 ? (
-                        <button
-                          type="button"
-                          className="bubble-meta-btn primary"
-                          title="立即注入到当前轮 (Alt+M)"
-                          onClick={() => void sendKeys(["alt+m"])}
-                        >
-                          立即注入
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
-                ))
-              : null}
-          </div>
-
-          {!atBottom && hasAnyRenderedRows ? (
-            <button type="button" className="chat-jump-bottom" onClick={() => scrollToBottom(true)}>
-              <ArrowDown size={13} />
-              <span>回到底部</span>
-            </button>
+              <button type="button" className="agent-stop-pill" onClick={() => selectMode("term")}>
+                切到终端处理
+              </button>
+            </div>
           ) : null}
+
+          {!activeSub && terminalQueuedItems.length > 0
+            ? terminalQueuedItems.map((qText, idx) => (
+                <div key={`term-q-${idx}-${qText.slice(0, 24)}`} className="bubble-row user queued-terminal">
+                  <div className="bubble user">
+                    <RichMarkdown text={qText} onOpenFile={(target) => openAgentFileTarget(agent, target)} />
+                  </div>
+                  <div className="bubble-send-meta">
+                    <span>终端排队中 · 本轮结束后自动处理</span>
+                    {agent.source === "hc" && idx === 0 ? (
+                      <button
+                        type="button"
+                        className="bubble-meta-btn primary"
+                        title="立即注入到当前轮 (Alt+M)"
+                        onClick={() => void sendKeys(["alt+m"])}
+                      >
+                        立即注入
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ))
+            : null}
         </div>
-      ) : null}
+
+        {!atBottom && hasAnyRenderedRows ? (
+          <button type="button" className="chat-jump-bottom" onClick={() => scrollToBottom(true)}>
+            <ArrowDown size={13} />
+            <span>{unreadCount > 0 ? `${unreadCount} 条新消息` : "回到底部"}</span>
+          </button>
+        ) : null}
+      </div>
 
       {termVisited ? (
         <div style={{ flex: 1, minHeight: 0, display: activeMode === "term" ? "flex" : "none" }}>
-          <PocketErrorBoundary resetKey={`${agent.key}:${activeMode}`} title="终端视图加载出错">
+          <PocketErrorBoundary resetKey={agent.key} title="终端视图加载出错">
             <TerminalSurface agent={agent} active={visible && activeMode === "term"} focused={focused && visible} />
           </PocketErrorBoundary>
         </div>
@@ -2584,65 +2872,81 @@ export function AgentDetailPanel({
                       : "当前轮结束后依次自动发送"}
                 </span>
               </div>
-              {queued.map((q, idx) => (
-                <div key={q.id} className="composer-queue-item">
-                  <span className="composer-queue-idx">{idx + 1}</span>
-                  <span className="composer-queue-text" title={q.text}>
-                    {q.text || "（仅附件）"}
-                  </span>
-                  {q.attachments.length > 0 ? (
-                    <span className="composer-queue-att">+{q.attachments.length} 附件</span>
-                  ) : null}
-                  <div className="composer-queue-actions">
-                    <button
-                      type="button"
-                      className="composer-queue-steer"
-                      title="立即打断当前轮并发送"
-                      onClick={() => void steerQueuedPromptNow(agent, q.id)}
-                    >
-                      立即发送
-                    </button>
-                    <button
-                      type="button"
-                      className="composer-queue-ic"
-                      aria-label="编辑这条排队消息"
-                      title="放回输入框编辑"
-                      onClick={() => {
-                        if (text.trim() || attachments.length > 0) {
-                          enqueuePrompt(agent, text, attachments);
-                        }
-                        const popped = popQueuedPromptForEdit(agent.key, q.id);
-                        if (!popped) return;
-                        setText(popped.text);
-                        setAttachments(popped.attachments);
-                        requestAnimationFrame(() => composer.textareaRef.current?.focus());
-                      }}
-                    >
-                      <Pencil size={12} />
-                    </button>
-                    {idx > 0 ? (
+              {queued.map((q, idx) => {
+                const imgAtts = q.attachments.filter((a) => a.kind === "image" && a.previewUrl);
+                return (
+                  <div key={q.id} className="composer-queue-item">
+                    <span className="composer-queue-idx">{idx + 1}</span>
+                    {imgAtts.slice(0, 2).map((att) => (
+                      <img key={att.id} src={att.previewUrl} alt={att.name} className="composer-queue-thumb" />
+                    ))}
+                    <span className="composer-queue-text" title={q.text}>
+                      {q.text || "（仅附件）"}
+                    </span>
+                    {q.attachments.length > imgAtts.length ? (
+                      <span className="composer-queue-att">+{q.attachments.length - imgAtts.length} 附件</span>
+                    ) : null}
+                    <div className="composer-queue-actions">
+                      <button
+                        type="button"
+                        className="composer-queue-steer"
+                        title="不打断当前轮，直接插队发送"
+                        onClick={() => void steerQueuedPromptNow(agent, q.id)}
+                      >
+                        插队
+                      </button>
+                      {isTurnBusy ? (
+                        <button
+                          type="button"
+                          className="composer-queue-steer subtle"
+                          title="打断当前轮并立即发送"
+                          onClick={() => void interruptAndSendQueuedPrompt(agent, q.id)}
+                        >
+                          打断
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         className="composer-queue-ic"
-                        aria-label="移到最前"
-                        title="移到队列最前"
-                        onClick={() => moveQueuedPromptToTop(agent.key, q.id)}
+                        aria-label="编辑这条排队消息"
+                        title="放回输入框编辑"
+                        onClick={() => {
+                          if (text.trim() || attachments.length > 0) {
+                            enqueuePrompt(agent, text, attachments);
+                          }
+                          const popped = popQueuedPromptForEdit(agent.key, q.id);
+                          if (!popped) return;
+                          setText(popped.text);
+                          setAttachments(popped.attachments);
+                          requestAnimationFrame(() => composer.textareaRef.current?.focus());
+                        }}
                       >
-                        <ArrowUp size={12} />
+                        <Pencil size={12} />
                       </button>
-                    ) : null}
-                    <button
-                      type="button"
-                      className="composer-queue-ic"
-                      aria-label="移出排队"
-                      title="移除"
-                      onClick={() => removeQueuedPrompt(agent.key, q.id)}
-                    >
-                      <X size={12} />
-                    </button>
+                      {idx > 0 ? (
+                        <button
+                          type="button"
+                          className="composer-queue-ic"
+                          aria-label="移到最前"
+                          title="移到队列最前"
+                          onClick={() => moveQueuedPromptToTop(agent.key, q.id)}
+                        >
+                          <ArrowUp size={12} />
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="composer-queue-ic"
+                        aria-label="移出排队"
+                        title="移除"
+                        onClick={() => removeQueuedPrompt(agent.key, q.id)}
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               {terminalQueuedItems.length > 0 ? (
                 terminalQueuedItems.map((qText, idx) => (
                   <div key={`shelf-term-q-${idx}-${qText.slice(0, 24)}`} className="composer-queue-item">
@@ -2802,8 +3106,8 @@ export function AgentDetailPanel({
                   ? /^\/btw$/i.test(leadingSlash.command.name)
                     ? "输入旁路问题（只读上下文，不打断当前运行）…"
                     : COMPOSER_SLASH_CHIP_PLACEHOLDER
-                  : agent.status === "working"
-                    ? "继续输入将加入排队（Enter 加入排队，/btw 可旁路提问）"
+                  : isTurnBusy
+                    ? "Enter 加入排队 · ⌘Enter 插队发送（不打断）· /btw 旁路提问"
                     : agent.status === "blocked"
                       ? "直接输入回复或指令（Enter 立即送入终端）"
                       : agent.isShell
@@ -2886,7 +3190,7 @@ export function AgentDetailPanel({
               ) : null}
             </div>
             <div className="composer-actions">
-              {agent.status === "working" ? (
+              {isTurnBusy ? (
                 isBtwDraft ? (
                   <PocketButton
                     size="sm"
@@ -2903,15 +3207,25 @@ export function AgentDetailPanel({
                     <Square size={13} />
                   </PocketButton>
                 ) : (
-                  <PocketButton
-                    size="sm"
-                    className="composer-send"
-                    aria-label="加入排队"
-                    title="加入排队 (Enter)"
-                    onClick={() => submitComposer()}
-                  >
-                    <Clock size={14} />
-                  </PocketButton>
+                  <>
+                    <button
+                      type="button"
+                      className="composer-steer-pill"
+                      title="不打断当前轮，直接插队发送 (⌘Enter / Alt+Enter)"
+                      onClick={() => steerComposer()}
+                    >
+                      插队
+                    </button>
+                    <PocketButton
+                      size="sm"
+                      className="composer-send"
+                      aria-label="加入排队"
+                      title="加入排队 (Enter)"
+                      onClick={() => submitComposer()}
+                    >
+                      <Clock size={14} />
+                    </PocketButton>
+                  </>
                 )
               ) : (
                 <PocketButton

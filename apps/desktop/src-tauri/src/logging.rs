@@ -152,6 +152,15 @@ fn relay_worthy(level: Level, kind: &str) -> bool {
             | "browser"
             | "cookie"
             | "perm"
+            | "ui"
+            | "chat"
+            | "model"
+            | "term"
+            | "agent"
+            | "files"
+            | "relay"
+            | "startup"
+            | "onboarding"
     )
 }
 

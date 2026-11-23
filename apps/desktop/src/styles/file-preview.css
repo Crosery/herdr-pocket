@@ -228,10 +228,12 @@ tr.pk-grid-spacer td {
   overflow: auto;
   padding: 18px 20px 32px;
   background: var(--page);
+  container-type: inline-size;
 }
 
 .pk-doc-paper {
-  max-width: 820px;
+  width: 100%;
+  max-width: clamp(820px, 86cqi, 1760px);
   margin: 0 auto;
   padding: 30px 36px;
   border-radius: 14px;
@@ -242,6 +244,13 @@ tr.pk-grid-spacer td {
   line-height: 1.72;
   font-size: calc(14px * var(--ts, 1));
   overflow-wrap: anywhere;
+}
+
+@container (max-width: 600px) {
+  .pk-doc-paper {
+    padding: 18px 16px;
+    border-radius: 10px;
+  }
 }
 
 .pk-doc-h {
@@ -345,7 +354,8 @@ tr.pk-grid-spacer td {
 }
 
 .pk-slides-stack {
-  max-width: 860px;
+  width: 100%;
+  max-width: clamp(860px, 86cqi, 1800px);
   margin: 0 auto;
   display: flex;
   flex-direction: column;

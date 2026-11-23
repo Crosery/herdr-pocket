@@ -1,6 +1,6 @@
 [package]
 name = "herdr-pocket-desktop"
-version = "0.2.23"
+version = "0.2.24"
 description = "Herdr Pocket Desktop Client"
 authors = ["Herdr Pocket <noreply@users.noreply.github.com>"]
 homepage = "https://github.com/Crosery/herdr-pocket"
@@ -30,6 +30,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 regex = "1"
 log = "0.4"
 url = "2"
+flate2 = "1"
 # OS TLS (Security.framework / SChannel / OpenSSL on Linux) and the system proxy.
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "system-proxy"] }
 tokio = { version = "1", features = ["time", "sync", "macros"] }

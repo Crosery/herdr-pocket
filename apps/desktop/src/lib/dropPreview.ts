@@ -1,5 +1,6 @@
 import type { PutFile } from "@herdr-pocket/protocol";
 import { resolveDropPath, type WorkspaceDragItem } from "./fileDrag";
+import { native } from "./native";
 
 export type DropKind = "image" | "video" | "audio" | "pdf" | "document" | "text" | "archive" | "file";
 
@@ -200,6 +201,11 @@ export function hydrateAttachment(s: SerializedAttachment): StagedAttachment {
       previewUrl = undefined;
     }
   }
+  if (!previewUrl && s.kind === "image" && !s.isDir && s.hostRef?.startsWith("/")) {
+    previewUrl =
+      native.localFileStreamUrl(s.hostRef) ??
+      `pocket-local://localhost/file?${new URLSearchParams({ path: s.hostRef }).toString()}`;
+  }
   return {
     ...s,
     ...(s.put ? { put: { ...s.put } } : {}),
@@ -364,5 +370,5 @@ export async function prepareDroppedFiles(
 }
 
 export function revokeAttachment(item: StagedAttachment): void {
-  if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  if (item.previewUrl?.startsWith("blob:")) URL.revokeObjectURL(item.previewUrl);
 }

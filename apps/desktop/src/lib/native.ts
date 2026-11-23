@@ -697,8 +697,8 @@ export const native = {
   clearCaches: (): Promise<number> => (inTauri() ? invoke<number>("clear_caches") : Promise.resolve(0)),
 
   // Logs -------------------------------------------------------------------
-  writeLog: (level: string, kind: string, msg: string): Promise<void> =>
-    inTauri() ? invoke<void>("log_write", { level, kind, msg, data: null }).catch(() => {}) : noop(),
+  writeLog: (level: string, kind: string, msg: string, data?: Record<string, unknown>): Promise<void> =>
+    inTauri() ? invoke<void>("log_write", { level, kind, msg, data: data ?? null }).catch(() => {}) : noop(),
   logInfo: async (): Promise<LogFolderInfo | null> => (inTauri() ? invoke<LogFolderInfo | null>("log_info").catch(() => null) : null),
   openLogFolder: (): Promise<void> => (inTauri() ? invoke("log_open_folder") : noop()),
   /** Path of the written diagnostics file. */

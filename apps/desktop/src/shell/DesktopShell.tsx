@@ -6,8 +6,10 @@ import {
   ArrowRight,
   ArrowUp,
   ArrowUpDown,
+  BarChart2,
   Bell,
   BookOpen,
+  Bot,
   Columns2,
   Cpu,
   Equal,
@@ -16,9 +18,12 @@ import {
   Globe,
   Info,
   Keyboard,
+  Layers,
   Maximize2,
+  MessageSquare,
   Mic,
   Moon,
+  OctagonX,
   Palette as PaletteIcon,
   PanelLeft,
   Plus,
@@ -38,12 +43,14 @@ import {
 } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
+import { PocketDroplet } from "../components/PocketDroplet";
 import { AddDeviceModal } from "../views/DevicesView";
 import { CreateAgentModal } from "../views/AgentsView";
 import { SettingsFrame } from "../views/settings/SettingsFrame";
 import { useClientConfig, clientConfigStore } from "../lib/config";
 import { overlayStore, useToast } from "../components/PocketUI";
 import { isTauri } from "../lib/bridge";
+import { logAction } from "../lib/log";
 import { localHostIdStore, refreshLocalHostIdFast } from "../lib/fonts";
 import { native } from "../lib/native";
 import { refreshHostSpaces, rpcCall } from "../lib/relay";
@@ -54,6 +61,7 @@ import { getTerminalThemeSpec, resolveTerminalAppearance } from "../lib/terminal
 import { GROUP_RANK, lastChange, listGroup } from "./agentInfo";
 import { flushHostNow, pullHostDocNow, registerPendingSplitPlacement, syncHostNow, useHerdrDocSync } from "./herdrDocSync";
 import { Palette, type PaletteItem } from "./Palette";
+import { ShortcutHelpModal } from "./ShortcutHelpModal";
 import { ShellSidebar } from "./ShellSidebar";
 import { PeekOverlay, ShellMain, ShellPanel, ShellStatus, ShellTabs, requestClosePane, requestCloseShellTab } from "./ShellWork";
 import {
@@ -70,6 +78,7 @@ import {
   renameSpaceInShellStore,
   setActiveTab,
   setPalette,
+  setPaneAgentMode,
   setSelectedSpace,
   shellStore,
   splitTabPane,
@@ -77,11 +86,14 @@ import {
   tabLeaves,
   togglePanel,
   toggleZoomTabPane,
+  unsplitTabToTabs,
   visibleTabsForSpace,
   type FrameSection,
   type SplitDirection,
 } from "./shellStore";
 import { IS_MAC, matchShortcut } from "./shortcuts";
+import { buildHostSpaces } from "./spaceSync";
+import { useModifierHoldHints } from "./useModifierHoldHints";
 import "../styles/shell.css";
 
 const FRAME_ITEMS: Array<{ id: FrameSection; label: string; icon: PaletteItem["icon"] }> = [
@@ -167,7 +179,9 @@ export function DesktopShell({
   const homePage = useClientConfig().browser.homePage;
   const [create, setCreate] = useState<{ host: string | null; space: string | null; preferNewSpace?: boolean } | null>(null);
   const [addComputer, setAddComputer] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
+  useModifierHoldHints();
   useHerdrDocSync();
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
@@ -608,9 +622,14 @@ export function DesktopShell({
     }
     list.push(
       { id: "new-terminal", group: "标签", label: "新建终端", keys: ["Mod", "T"], icon: Terminal, terms: "new terminal shell 终端", run: () => void spawnTerminalNow() },
-      { id: "new-agent", group: "标签", label: "新建 Agent…", icon: Plus, terms: "new agent claude codex", run: () => newAgent() },
+      { id: "new-agent", group: "标签", label: "新建 Agent…", keys: ["Mod", "N"], icon: Plus, terms: "new agent claude codex", run: () => newAgent() },
+      { id: "new-space", group: "空间", label: "新建工作空间…", keys: ["Mod", "Shift", "N"], icon: Layers, terms: "space workspace new 空间", run: () => newSpace() },
+      { id: "prev-space", group: "空间", label: "切换到上一个空间", keys: ["Mod", "Alt", "["], icon: Layers, terms: "space prev 空间", run: () => cycleSpace(-1) },
+      { id: "next-space", group: "空间", label: "切换到下一个空间", keys: ["Mod", "Alt", "]"], icon: Layers, terms: "space next 空间", run: () => cycleSpace(1) },
+      { id: "all-spaces", group: "空间", label: "显示全部空间", keys: ["Mod", "Alt", "0"], icon: Layers, terms: "space all 全部空间", run: () => setSelectedSpace(null) },
       { id: "new-web", group: "标签", label: "打开网页", icon: Globe, terms: "browser web", run: () => openWebTab(homePage || "about:blank") },
-      { id: "close-tab", group: "标签", label: "关闭标签", keys: ["Mod", "W"], icon: X, run: () => closeActive() },
+      { id: "close-tab", group: "标签", label: "关闭当前分屏或标签", keys: ["Mod", "W"], icon: X, run: () => closeActive() },
+      { id: "close-whole-tab", group: "标签", label: "关闭整个标签页", keys: ["Mod", "Shift", "W"], icon: X, run: () => closeWholeActiveTab() },
       { id: "next-tab", group: "标签", label: "下一个标签", keys: ["Mod", "Shift", "]"], run: () => cycleTab(1, currentVisibleTabs()) },
       { id: "prev-tab", group: "标签", label: "上一个标签", keys: ["Mod", "Shift", "["], run: () => cycleTab(-1, currentVisibleTabs()) },
       {
@@ -647,6 +666,7 @@ export function DesktopShell({
         id: "pane-equalize",
         group: "分屏",
         label: "均分当前标签的分屏尺寸",
+        keys: ["Mod", "Alt", "="],
         icon: Equal,
         terms: "equalize split balance 均分",
         run: () => {
@@ -666,15 +686,15 @@ export function DesktopShell({
         },
       },
       {
-        id: "pane-close",
+        id: "pane-unsplit",
         group: "分屏",
-        label: "关闭当前分屏",
-        keys: ["Mod", "Shift", "W"],
-        icon: X,
-        terms: "close pane 关闭分屏",
+        label: "将当前标签的所有分屏拆为独立标签",
+        keys: ["Mod", "Alt", "Shift", "W"],
+        icon: SquareArrowOutUpRight,
+        terms: "unsplit split panes tabs 拆分全部",
         run: () => {
           const ref = currentFocusedPane();
-          if (ref) requestClosePane(ref.tab.id, ref.paneId);
+          if (ref) unsplitTabToTabs(ref.tab.id);
         },
       },
       {
@@ -790,9 +810,18 @@ export function DesktopShell({
       },
       { id: "panel-files", group: "面板", label: "显示或隐藏文件", keys: ["Mod", "J"], icon: FolderTree, terms: "files", run: () => togglePanel("files") },
       { id: "panel-git", group: "面板", label: "显示或隐藏 Git 管理", keys: ["Mod", "Shift", "G"], icon: GitBranch, terms: "git diff commit branch", run: () => togglePanel("git") },
-      { id: "panel-browser", group: "面板", label: "显示或隐藏浏览器", icon: Globe, run: () => togglePanel("browser") },
+      { id: "panel-browser", group: "面板", label: "显示或隐藏浏览器", keys: ["Mod", "Alt", "B"], icon: Globe, run: () => togglePanel("browser") },
       { id: "panel-assistant", group: "面板", label: "和小羊说话", keys: ["Mod", "Shift", "A"], icon: Sparkles, terms: "assistant 助理", run: () => togglePanel("assistant") },
       { id: "sidebar", group: "面板", label: collapsed ? "展开侧栏" : "收起侧栏", keys: ["Mod", "B"], icon: PanelLeft, run: onToggleSidebar },
+      { id: "shortcut-help", group: "应用", label: "快捷键指南与帮助", keys: ["Mod", "/"], icon: Keyboard, terms: "shortcut help keymap 快捷键", run: () => setHelpOpen(true) },
+      { id: "jump-agent", group: "应用", label: "快速跳转到 Agent 或标签", keys: ["Mod", "O"], icon: Search, terms: "jump switch agent 跳转", run: () => setPalette("jump") },
+      { id: "jump-urgent", group: "应用", label: "跳转到下一个需要你的 Agent", keys: ["Mod", "Shift", "U"], icon: Bell, terms: "urgent blocked waiting 阻塞 需要你", run: () => jumpUrgentAgent() },
+      { id: "agent-toggle-mode", group: "Agent", label: "切换当前 Agent 对话 / 终端视图", keys: ["Mod", "E"], icon: MessageSquare, terms: "chat terminal mode toggle 切换视图", run: () => toggleFocusedAgentMode() },
+      { id: "agent-focus-composer", group: "Agent", label: "聚焦对话输入框", keys: ["Mod", "L"], icon: MessageSquare, terms: "focus composer input 输入框", run: () => dispatchFocusedAgentAction("focusComposer") },
+      { id: "agent-model", group: "Agent", label: "切换当前 Agent 模型", keys: ["Mod", "Alt", "M"], icon: Bot, terms: "model switch 模型", run: () => dispatchFocusedAgentAction("openModelPicker") },
+      { id: "agent-thinking", group: "Agent", label: "调整思考强度", keys: ["Mod", "Alt", "T"], icon: Cpu, terms: "thinking effort 思考", run: () => dispatchFocusedAgentAction("openThinkingPicker") },
+      { id: "agent-usage", group: "Agent", label: "查看会话用量统计", keys: ["Mod", "Alt", "U"], icon: BarChart2, terms: "usage cost 费用 用量", run: () => dispatchFocusedAgentAction("openUsageCard") },
+      { id: "agent-interrupt", group: "Agent", label: "中断当前 Agent 回复", keys: ["Mod", "."], icon: OctagonX, terms: "stop interrupt cancel 停止 中断", run: () => dispatchFocusedAgentAction("interruptAgent") },
       { id: "check-update", group: "应用", label: "检查软件更新", icon: RefreshCw, terms: "update upgrade 更新 版本", run: () => void checkForUpdate("manual") },
     );
     for (const a of [...agents].sort((x, y) => GROUP_RANK[listGroup(x, devices)] - GROUP_RANK[listGroup(y, devices)] || lastChange(y) - lastChange(x))) {
@@ -814,6 +843,7 @@ export function DesktopShell({
         id: "theme",
         group: "操作",
         label: isDark ? "切换到浅色" : "切换到暗色",
+        keys: ["Mod", "Shift", "L"],
         icon: isDark ? Sun : Moon,
         terms: "theme dark light 外观",
         run: () => updateSettings({ theme: isDark ? "light" : "dark" }),
@@ -865,13 +895,93 @@ export function DesktopShell({
     void spawnTerminalNow(null, null, ref ? { tabId: ref.tab.id, paneId: ref.paneId, direction } : undefined);
   }
 
-  function closeActive() {
-    const s = shellStore.get();
-    const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
-    const activeId = activeTabIdForSpace(s, (k) => map.get(k), liveStore.get().spaces);
-    const t = s.tabs.find((x) => x.id === activeId);
-    if (t) requestCloseShellTab(t);
+  function toggleFocusedAgentMode() {
+    const ref = currentFocusedPane();
+    if (!ref) return;
+    const leaf = focusedLeafOfTab(ref.tab);
+    if (leaf.content.kind !== "agent") return;
+    const cur = leaf.content.mode ?? "term";
+    const next = cur === "chat" ? "term" : "chat";
+    logAction("ui", "ui.mode", { mode: next, via: "shortcut" });
+    setPaneAgentMode(ref.tab.id, ref.paneId, next);
   }
+
+  function dispatchFocusedAgentAction(
+    action: "focusComposer" | "openModelPicker" | "openThinkingPicker" | "openUsageCard" | "interruptAgent",
+  ) {
+    const ref = currentFocusedPane();
+    if (!ref) return;
+    const content = focusedLeafOfTab(ref.tab).content;
+    if (content.kind === "agent" && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("pocket:agent-action", { detail: { agentKey: content.agentKey, action } }));
+    }
+  }
+
+  function cycleSpace(step: 1 | -1) {
+    const live = liveStore.get();
+    const visible = allAgents(live.agents).filter((a) => settingsStore.get().showShells || !a.isShell);
+    const ordered: string[] = [];
+    const seen = new Set<string>();
+    const hostsList = Object.values(live.devices)
+      .filter((d) => d.kind === "host")
+      .sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
+    for (const h of hostsList) {
+      for (const sp of buildHostSpaces(h.id, live.spaces[h.id], visible, live.devices)) {
+        if (!seen.has(sp.id)) {
+          seen.add(sp.id);
+          ordered.push(sp.id);
+        }
+      }
+    }
+    if (!ordered.length) return;
+    const cur = shellStore.get().selectedSpace;
+    const idx = cur ? ordered.indexOf(cur) : -1;
+    const nextIdx = idx < 0 ? (step > 0 ? 0 : ordered.length - 1) : (idx + step + ordered.length) % ordered.length;
+    const lookup = new Map(allAgents(live.agents).map((x) => [x.key, x] as const));
+    setSelectedSpace(ordered[nextIdx]!, (k) => lookup.get(k), live.spaces);
+  }
+
+  function jumpUrgentAgent() {
+    const live = liveStore.get();
+    const list = allAgents(live.agents)
+      .filter((a) => a.status === "blocked")
+      .sort((a, b) => lastChange(b) - lastChange(a));
+    if (!list.length) {
+      toast("当前没有待确认或需要输入的 Agent");
+      return;
+    }
+    const ref = currentFocusedPane();
+    const curKey = ref && focusedLeafOfTab(ref.tab).content.kind === "agent"
+      ? (focusedLeafOfTab(ref.tab).content as { agentKey: string }).agentKey
+      : null;
+    const curIdx = curKey ? list.findIndex((a) => a.key === curKey) : -1;
+    const picked = list[(curIdx + 1) % list.length]!;
+    openAgentTab(picked.key);
+  }
+
+  function closeActive() {
+    const ref = currentFocusedPane();
+    if (ref) requestClosePane(ref.tab.id, ref.paneId);
+  }
+
+  function closeWholeActiveTab() {
+    const ref = currentFocusedPane();
+    if (ref) requestCloseShellTab(ref.tab);
+  }
+
+  const jumpUrgentRef = useRef(jumpUrgentAgent);
+  jumpUrgentRef.current = jumpUrgentAgent;
+
+  useEffect(() => {
+    const onToggleHelp = () => setHelpOpen((prev) => !prev);
+    const onJumpUrgent = () => jumpUrgentRef.current();
+    window.addEventListener("pocket:toggle-shortcut-help", onToggleHelp);
+    window.addEventListener("pocket:jump-urgent", onJumpUrgent);
+    return () => {
+      window.removeEventListener("pocket:toggle-shortcut-help", onToggleHelp);
+      window.removeEventListener("pocket:jump-urgent", onJumpUrgent);
+    };
+  }, []);
 
   // Track Ctrl/Cmd modifier state for click-to-jump file links.
   useEffect(() => {
@@ -879,18 +989,15 @@ export function DesktopShell({
       document.documentElement.dataset.linkMod = active ? "true" : "false";
     };
     const onKeyEvent = (e: KeyboardEvent) => sync(e.ctrlKey || e.metaKey);
-    const onMoveEvent = (e: MouseEvent) => sync(e.ctrlKey || e.metaKey);
     const onBlur = () => sync(false);
     sync(false);
     window.addEventListener("keydown", onKeyEvent, true);
     window.addEventListener("keyup", onKeyEvent, true);
-    window.addEventListener("mousemove", onMoveEvent, { passive: true });
     window.addEventListener("blur", onBlur);
     return () => {
       delete document.documentElement.dataset.linkMod;
       window.removeEventListener("keydown", onKeyEvent, true);
       window.removeEventListener("keyup", onKeyEvent, true);
-      window.removeEventListener("mousemove", onMoveEvent);
       window.removeEventListener("blur", onBlur);
     };
   }, []);
@@ -904,9 +1011,10 @@ export function DesktopShell({
         const dialogUp = Boolean(document.querySelector("[role=dialog][data-state=open]")) && !s.settings && !s.palette;
         if (dialogUp || s.settings || s.palette) return;
         const vis = currentVisibleTabs();
-        const picked = vis[Number(e.key) - 1];
+        const picked = e.key === "9" ? vis[vis.length - 1] : vis[Number(e.key) - 1];
         if (picked) {
           e.preventDefault();
+          logAction("ui", "ui.shortcut", { id: e.key === "9" ? "jumpLastTab" : "jumpTabRange", slot: Number(e.key) });
           setActiveTab(picked.id);
         }
         return;
@@ -930,13 +1038,77 @@ export function DesktopShell({
       }
       const id = matchShortcut(e);
       if (!id) return;
-      if (!IS_MAC && !e.shiftKey && !e.altKey && terminalOwnsCtrlK(e.target)) return;
+      if (!IS_MAC && !e.shiftKey && !e.altKey && /^[a-z]$/i.test(e.key) && terminalOwnsCtrlK(e.target)) return;
       const s = shellStore.get();
-      // Another dialog on top (pairing, a confirm): only the palette and settings toggles pass.
+      // Another dialog on top (pairing, a confirm): only the palette, help, and settings toggles pass.
       const dialogUp = Boolean(document.querySelector("[role=dialog][data-state=open]")) && !s.settings && !s.palette;
-      if (dialogUp && id !== "palette" && id !== "settings") return;
+      if (dialogUp && id !== "palette" && id !== "settings" && id !== "shortcutHelp") return;
       e.preventDefault();
+      logAction("ui", "ui.shortcut", { id });
       switch (id) {
+        case "shortcutHelp":
+          setHelpOpen((prev) => !prev);
+          break;
+        case "jumpAgent":
+          setPalette(s.palette === "jump" ? false : "jump");
+          break;
+        case "jumpUrgent":
+          jumpUrgentRef.current();
+          break;
+        case "toggleTheme": {
+          const curDark = document.documentElement.getAttribute("data-theme") === "dark";
+          updateSettings({ theme: curDark ? "light" : "dark" });
+          break;
+        }
+        case "newSpace":
+          newSpace();
+          break;
+        case "prevSpace":
+          cycleSpace(-1);
+          break;
+        case "nextSpace":
+          cycleSpace(1);
+          break;
+        case "allSpaces":
+          setSelectedSpace(null);
+          break;
+        case "newAgentDialog":
+          newAgent();
+          break;
+        case "closeWholeTab":
+          closeWholeActiveTab();
+          break;
+        case "equalizeSplits": {
+          const ref = currentFocusedPane();
+          if (ref) equalizeTabSplits(ref.tab.id);
+          break;
+        }
+        case "unsplitTab": {
+          const ref = currentFocusedPane();
+          if (ref) unsplitTabToTabs(ref.tab.id);
+          break;
+        }
+        case "toggleBrowser":
+          togglePanel("browser");
+          break;
+        case "togglePaneMode":
+          toggleFocusedAgentMode();
+          break;
+        case "focusComposer":
+          dispatchFocusedAgentAction("focusComposer");
+          break;
+        case "openModelPicker":
+          dispatchFocusedAgentAction("openModelPicker");
+          break;
+        case "openThinkingPicker":
+          dispatchFocusedAgentAction("openThinkingPicker");
+          break;
+        case "openUsageCard":
+          dispatchFocusedAgentAction("openUsageCard");
+          break;
+        case "interruptAgent":
+          dispatchFocusedAgentAction("interruptAgent");
+          break;
         case "terminalSearch": {
           const ref = currentFocusedPane();
           const content = ref ? focusedLeafOfTab(ref.tab).content : null;
@@ -970,11 +1142,6 @@ export function DesktopShell({
         case "splitDown":
           splitFocusedTerminal("down");
           break;
-        case "closePane": {
-          const ref = currentFocusedPane();
-          if (ref) requestClosePane(ref.tab.id, ref.paneId);
-          break;
-        }
         case "zoomPane": {
           const ref = currentFocusedPane();
           if (ref) toggleZoomTabPane(ref.tab.id, ref.paneId);
@@ -1036,7 +1203,7 @@ export function DesktopShell({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [canToggleSidebar, onToggleSidebar, spawnTerminalNow]);
+  }, [canToggleSidebar, newAgent, newSpace, onToggleSidebar, spawnTerminalNow]);
 
   return (
     <div className={`v3${collapsed ? " collapsed" : ""}`}>
@@ -1067,6 +1234,8 @@ export function DesktopShell({
       </div>
 
       <Palette mode={palette} onClose={() => setPalette(false)} items={items} />
+      <PocketDroplet />
+      <ShortcutHelpModal open={helpOpen} onOpenChange={setHelpOpen} />
       <SettingsFrame
         onPairPhone={onPairPhone}
         onConnectRelay={onConnectRelay}

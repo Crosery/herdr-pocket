@@ -57,6 +57,8 @@ export interface ScreenSnapshot {
   text: string;
   cols: number;
   rows: number;
+  altScreen?: boolean;
+  bracketedPaste?: boolean;
 }
 
 /** One paint of a watched terminal: the `ansi` of a snapshot as its lines. */
@@ -254,7 +256,14 @@ export class HcScreens {
       quiet = setTimeout(done, Math.max(quietMs, 600)); // first paint may take a moment
     });
     this.send(channel, CLOSE, Buffer.alloc(0));
-    return { ansi: screen.toAnsi(history), text: screen.toText(history), cols, rows };
+    return {
+      ansi: screen.toAnsi(history),
+      text: screen.toText(history),
+      cols,
+      rows,
+      altScreen: screen.isAltScreen,
+      bracketedPaste: screen.bracketedPaste,
+    };
   }
 
   /**
@@ -626,7 +635,7 @@ export class HcScreens {
     }
     if (enter) {
       if (clean.length > 0) {
-        await new Promise((r) => setTimeout(r, 30));
+        await new Promise((r) => setTimeout(r, 140));
       }
       this.send(ch, DATA, Buffer.from("\r", "utf8"));
     }

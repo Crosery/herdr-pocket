@@ -24,6 +24,7 @@ import {
   type TerminalRowsEvent,
 } from "@herdr-pocket/protocol";
 import { HcAdapter, type AppNames } from "./hc.ts";
+import { sendAndCaptureSlashCommand } from "./slashCapture.ts";
 import type { ScreenLines } from "./hcscreen.ts";
 import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, findPrograms, herdrCommandArgs, installedLaunchers, isHerdrWindowClosedError, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
@@ -152,8 +153,9 @@ export class Host {
   private streamReply = new Map<string, (f: ClientFrame) => void>();
   /** Phones connected straight to this computer (see direct.ts). */
   direct: DirectServer;
-  private sendQueues = new Map<string, Array<{ id: string; text: string; enter: boolean }>>();
+  private sendQueues = new Map<string, Array<{ id: string; text: string; enter: boolean; delivery?: "auto" | "steer" }>>();
   private queueSeq = 0;
+  private subscreenByAgent = new Map<string, "viewer" | "pager">();
   private stopped = false;
   private backoff = 1000;
   /** How often the relay link is pinged; a ping still unanswered at the next one drops the link. */
@@ -169,7 +171,7 @@ export class Host {
   /** Resolved space folders cached from `spaces.list` so empty `agent.create` folder inherits live cwd. */
   private spaceFolders = new Map<string, string>();
   /** Optimistic current model / thinking overrides per agent after `agent.setModel`. */
-  private modelOverrides = new Map<string, { model?: string; thinking?: string }>();
+  private modelOverrides = new Map<string, { model?: string; thinking?: string; setAt?: number }>();
   /**
    * Sources that did not answer are looked for again this often. After a reboot or a login the
    * daemon can start before the herdr app or Uniflo; without this it would never read
@@ -482,15 +484,36 @@ export class Host {
     }
     this.sessionHints.prune(live);
     for (const info of this.herdr.agents) agents.push(HerdrAdapter.toAgent(info, id));
-    return this.waits.decorate(this.uniflo.enrich(agents, pids, hints, created, statusMsgs));
+    const enriched = this.waits.decorate(this.uniflo.enrich(agents, pids, hints, created, statusMsgs));
+    if (!this.subscreenByAgent.size) return enriched;
+    const liveKeys = new Set(enriched.map((a) => a.key));
+    for (const k of [...this.subscreenByAgent.keys()]) {
+      if (!liveKeys.has(k)) this.subscreenByAgent.delete(k);
+    }
+    return enriched.map((a) => {
+      if (a.status === "blocked" || a.statusKind) {
+        this.subscreenByAgent.delete(a.key);
+        return a;
+      }
+      const sub = this.subscreenByAgent.get(a.key);
+      return sub ? { ...a, subscreen: sub } : a;
+    });
   }
 
   private publishNow(): void {
     this.agents = this.collect();
     if (this.modelOverrides.size) {
-      const live = new Set(this.agents.map((a) => a.key));
-      for (const k of this.modelOverrides.keys()) {
-        if (!live.has(k)) this.modelOverrides.delete(k);
+      const byKey = new Map(this.agents.map((a) => [a.key, a] as const));
+      for (const [k, ov] of this.modelOverrides.entries()) {
+        const liveAgent = byKey.get(k);
+        if (!liveAgent) {
+          this.modelOverrides.delete(k);
+          continue;
+        }
+        // Expire optimistic model override once Uniflo observes a newer authoritative turn after `setAt`.
+        if (ov.setAt && liveAgent.updatedAt > ov.setAt + 2500 && liveAgent.model && ov.model && liveAgent.model !== ov.model) {
+          this.modelOverrides.delete(k);
+        }
       }
     }
     const data = JSON.stringify(this.agents.map((a) => ({ ...a, updatedAt: 0 })));
@@ -849,11 +872,25 @@ export class Host {
     }
   }
 
-  private enqueueSend(a: Agent, text: string, enter: boolean): { id: string; position: number } {
+  private enqueueSend(
+    a: Agent,
+    text: string,
+    enter: boolean,
+    delivery: "auto" | "steer" = "auto",
+  ): { id: string; position: number } {
     const id = `q${Date.now().toString(36)}${(++this.queueSeq).toString(36)}`;
     const q = this.sendQueues.get(a.key) ?? [];
-    const position = q.length;
-    q.push({ id, text, enter });
+    let position = q.length;
+    if (delivery === "steer" && q.length > 0) {
+      // Insert soft-steer right behind the currently draining head so it cuts ahead without killing the turn.
+      q.splice(1, 0, { id, text, enter, delivery });
+      position = 1;
+      for (let i = 2; i < q.length; i++) {
+        this.queueEvent(a.key, { queueId: q[i]!.id, status: "queued", position: i });
+      }
+    } else {
+      q.push({ id, text, enter, delivery });
+    }
     this.sendQueues.set(a.key, q);
     this.queueEvent(a.key, { queueId: id, status: "queued", position });
     if (q.length === 1) void this.drainSendQueue(a);
@@ -869,6 +906,7 @@ export class Host {
       try {
         if (a.source === "hc") await this.hc.send(a.localId, item.text, item.enter);
         else await this.herdr.send(a.localId, item.text, item.enter);
+        if (this.subscreenByAgent.delete(a.key)) this.publish();
         this.queueEvent(a.key, { queueId: item.id, status: "sent", position: 0 });
       } catch (e) {
         this.queueEvent(a.key, { queueId: item.id, status: "failed", position: 0, message: (e as Error).message });
@@ -907,26 +945,53 @@ export class Host {
     this.waitTimer.unref?.();
   }
 
-  /** Scans working/blocked TUI screens so queued messages typed directly in the terminal show in Chat UI. */
+  /** Scans working/blocked TUI screens so queued messages and subscreens stay synced to Chat UI. */
   private async refreshScreenQueues(): Promise<void> {
     if (this.stopped || this.refreshingScreenQueues) return;
     if (!this.agents.length) return;
-    const active = this.agents.filter(
-      (a) => !a.isShell && a.source === "hc" && (a.status === "working" || a.status === "blocked") && !this.sendQueues.has(a.key),
+    const subscribedTermAgents = new Set<string>();
+    for (const meta of this.streamMeta.values()) {
+      if (meta.kind === "terminal") subscribedTermAgents.add(meta.agent);
+    }
+    const inspectable = this.agents.filter(
+      (a) =>
+        !a.isShell &&
+        a.source === "hc" &&
+        !this.sendQueues.has(a.key) &&
+        (a.status === "working" || a.status === "blocked" || subscribedTermAgents.has(a.key) || this.subscreenByAgent.has(a.key)),
     );
-    const activeKeys = new Set(active.map((a) => a.key));
+    const activeKeys = new Set(inspectable.filter((a) => a.status === "working" || a.status === "blocked").map((a) => a.key));
     let changed = this.waits.pruneScreenQueued(activeKeys);
-    if (!active.length) {
+    const inspectableKeys = new Set(inspectable.map((a) => a.key));
+    for (const k of [...this.subscreenByAgent.keys()]) {
+      if (!inspectableKeys.has(k)) {
+        this.subscreenByAgent.delete(k);
+        changed = true;
+      }
+    }
+    if (!inspectable.length) {
       if (changed) this.publish();
       return;
     }
     this.refreshingScreenQueues = true;
     try {
       await Promise.all(
-        active.map(async (a) => {
+        inspectable.map(async (a) => {
           try {
-            const { text } = await this.hc.read(a.localId, 60);
-            if (this.waits.setScreenQueued(a.key, extractTerminalQueuedMessages(text, a.harness))) {
+            const snap = await this.hc.snapshotWithMeta(a.localId, 60);
+            const text = snap?.text ?? (await this.hc.read(a.localId, 60)).text;
+            if (a.status === "working" || a.status === "blocked") {
+              if (this.waits.setScreenQueued(a.key, extractTerminalQueuedMessages(text, a.harness))) {
+                changed = true;
+              }
+            }
+            const sub = this.hc.detectSubscreenFromSnapshot(a.localId, { text, altScreen: snap?.altScreen });
+            if (sub) {
+              if (this.subscreenByAgent.get(a.key) !== sub) {
+                this.subscreenByAgent.set(a.key, sub);
+                changed = true;
+              }
+            } else if (this.subscreenByAgent.delete(a.key)) {
               changed = true;
             }
           } catch {
@@ -1141,7 +1206,30 @@ export class Host {
       const a = this.resolve(p.agent);
       if (typeof p.text !== "string" || p.text.length > 20_000) throw new RpcFailure("bad_request", "text is required");
       const status = a.status;
-      const queued = this.enqueueSend(a, p.text, p.enter !== false);
+      const shouldCaptureSlash =
+        p.enter !== false &&
+        status !== "working" &&
+        a.source === "hc" &&
+        !a.isShell &&
+        p.text.trim().startsWith("/");
+      if (shouldCaptureSlash) {
+        const commandCapture = await sendAndCaptureSlashCommand(this.hc, a.localId, a, p.text);
+        if (commandCapture?.panelState === "interactive_open") {
+          this.subscreenByAgent.set(a.key, "viewer");
+          this.publish();
+        } else if (this.subscreenByAgent.delete(a.key)) {
+          this.publish();
+        }
+        return {
+          ok: true as const,
+          position: 0,
+          agentStatus: status,
+          waiting: false,
+          ...(commandCapture ? { commandCapture } : {}),
+        };
+      }
+      const delivery = p.delivery === "steer" ? "steer" : "auto";
+      const queued = this.enqueueSend(a, p.text, p.enter !== false, delivery);
       // In a turn, the program keeps typed text in its input box until the turn ends.
       const waiting = p.enter !== false && status === "working";
       if (waiting) {
@@ -1410,6 +1498,7 @@ export class Host {
       const next = {
         ...(res.currentModel ?? prev.model ? { model: res.currentModel ?? prev.model } : {}),
         ...(res.currentThinking ?? prev.thinking ? { thinking: res.currentThinking ?? prev.thinking } : {}),
+        setAt: Date.now(),
       };
       if (next.model || next.thinking) this.modelOverrides.set(a.key, next);
       return { ok: true as const, ...res };

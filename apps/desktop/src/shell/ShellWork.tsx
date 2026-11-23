@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, Search, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import { ChevronDown, Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, Keyboard, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, Search, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
@@ -20,6 +20,7 @@ import { endPaneDrag, endPanelDrag, endTabDrag, endWorkspaceDrag, hasPaneDrag, h
 import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import { canActOnLocalFile, isAbsoluteOrHomePath, openLocalFileDefault, openLocalFileInBuiltinBrowser, revealInFolderLabel, revealInFolderShortLabel, revealLocalFile } from "../lib/localFileActions";
 import { isMockServer } from "../lib/mock";
+import { beginSplitMotion, SPLIT_MOTION_MS } from "./splitMotion";
 import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
 import { pingRelay, refreshHostSpaces, rpcCall, subscribeStream } from "../lib/relay";
@@ -75,7 +76,8 @@ import {
   type SplitLeafNode,
   type SplitSashLayout,
 } from "./shellStore";
-import { comboText, shortcutText, SHORTCUTS } from "./shortcuts";
+import { shortcutText } from "./shortcuts";
+import { SpatialHint } from "./useModifierHoldHints";
 import "../styles/btw-slash.css";
 
 const AssistantView = lazy(() => import("../views/AssistantView").then((m) => ({ default: m.AssistantView })));
@@ -530,10 +532,15 @@ function TabChip({
       {group === "working" ? <span className="v3-spinner small" aria-label="运行中" /> : null}
       {group === "blocked" ? <span className="v3-dot blocked" aria-label="需要你" /> : null}
       {group === "done" ? <span className="v3-dot done" aria-label="已完成" /> : null}
+      <SpatialHint
+        text={index < 8 ? String(index + 1) : total >= 9 && index === total - 1 ? "9" : ""}
+        corner="right"
+        className="v3-tab-hint"
+      />
       <button
         className="v3-tab-x"
         aria-label={`关闭 ${title}`}
-        title={`关闭（${shortcutText("closeTab")}）`}
+        title={`关闭整个标签（${shortcutText("closeWholeTab")}）`}
         onClick={(e) => {
           e.stopPropagation();
           requestCloseShellTab(tab);
@@ -687,13 +694,14 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
 
   const panelBtn = (id: PanelId, label: string, Icon: typeof Plus, keys?: string) => (
     <button
-      className={`v3-panel-btn${panel === id ? " on" : ""}`}
+      className={`v3-panel-btn has-hint${panel === id ? " on" : ""}`}
       aria-pressed={panel === id}
       title={keys ? `${label}（${keys}）` : label}
       onClick={() => togglePanel(id)}
     >
       <Icon size={14} />
       <span>{label}</span>
+      {keys ? <SpatialHint text={keys} corner="tr" /> : null}
     </button>
   );
 
@@ -881,7 +889,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
         ))}
       </div>
       <button
-        className="v3-icon-btn"
+        className="v3-icon-btn has-hint"
         aria-label="新建终端"
         title={`新建终端（${shortcutText("newAgent")}）· 右键查看更多`}
         onClick={onNewTerminal}
@@ -892,6 +900,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
         }}
       >
         <Plus size={16} />
+        <SpatialHint text={shortcutText("newAgent")} corner="tr" />
       </button>
       <button
         className="v3-icon-btn small"
@@ -908,7 +917,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       <div className="v3-tabs-right">
         {panelBtn("files", "文件", FolderTree, shortcutText("togglePanel"))}
         {panelBtn("git", "Git", GitBranch, shortcutText("toggleGit"))}
-        {panelBtn("browser", "浏览器", Globe)}
+        {panelBtn("browser", "浏览器", Globe, shortcutText("toggleBrowser"))}
         {panelBtn("assistant", "小羊", Sparkles, shortcutText("assistant"))}
       </div>
 
@@ -953,7 +962,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
             <MenuItem
               label={isLive ? "关闭并结束" : "关闭"}
               icon={X}
-              keys={shortcutText("closeTab")}
+              keys={shortcutText(isMultiPane ? "closeWholeTab" : "closeTab")}
               onClick={() => {
                 const target = menu.tab;
                 setMenu(null);
@@ -1129,7 +1138,15 @@ function resolveAgentMode(tabMode: AgentPaneMode | undefined, _agent: Agent | un
   return tabMode ?? "term";
 }
 
-function ModeSwitchIcons({ mode, onModeChange }: { mode: AgentPaneMode; onModeChange: (m: AgentPaneMode) => void }) {
+function ModeSwitchIcons({
+  mode,
+  onModeChange,
+  termAttention = false,
+}: {
+  mode: AgentPaneMode;
+  onModeChange: (m: AgentPaneMode) => void;
+  termAttention?: boolean;
+}) {
   return (
     <div className="v3-mode-switch" role="group" aria-label="视图模式">
       <button
@@ -1147,10 +1164,11 @@ function ModeSwitchIcons({ mode, onModeChange }: { mode: AgentPaneMode; onModeCh
         className={`v3-mode-btn${mode === "term" ? " on" : ""}`}
         aria-pressed={mode === "term"}
         aria-label="终端模式"
-        title="终端模式"
+        title={termAttention ? "终端模式（当前有子面板或等待输入）" : "终端模式"}
         onClick={() => onModeChange("term")}
       >
         <Terminal size={13} />
+        {termAttention ? <span className="term-attn-dot" aria-hidden /> : null}
       </button>
     </div>
   );
@@ -1166,6 +1184,7 @@ function PaneHead({
   subHead,
   fileHead,
   isSplit,
+  isFocused = true,
   isZoomed,
   onDraggingPaneChange,
   onSplitNewTerminal,
@@ -1183,6 +1202,7 @@ function PaneHead({
   subHead?: SubagentHeadInfo | null;
   fileHead?: FileViewerHeadState | null;
   isSplit: boolean;
+  isFocused?: boolean;
   isZoomed: boolean;
   onDraggingPaneChange: (paneId: string | null) => void;
   onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
@@ -1417,12 +1437,24 @@ function PaneHead({
           {content.kind === "agent" && agent && mode && onModeChange ? (
             <button
               type="button"
-              className="v3-icon-btn small"
+              className="v3-icon-btn small has-hint"
               aria-label={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
-              title={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
+              title={`${
+                oppositeMode === "chat"
+                  ? "切换到对话视图"
+                  : agent.subscreen
+                    ? "切换到终端视图（终端正打开子面板，发消息将自动返回）"
+                    : agent.status === "blocked"
+                      ? "切换到终端视图（终端正等待输入）"
+                      : "切换到终端视图"
+              }（${shortcutText("togglePaneMode")}）`}
               onClick={() => onModeChange(oppositeMode)}
             >
               {oppositeMode === "chat" ? <MessageSquare size={13} /> : <Terminal size={13} />}
+              {oppositeMode === "term" && (Boolean(agent.subscreen) || agent.status === "blocked") ? (
+                <span className="term-attn-dot" aria-hidden />
+              ) : null}
+              {isFocused ? <SpatialHint text={shortcutText("togglePaneMode")} corner="tr" /> : null}
             </button>
           ) : null}
           {content.kind === "agent" && agent && mode === "term" ? (
@@ -1455,21 +1487,23 @@ function PaneHead({
           ) : null}
           <button
             type="button"
-            className="v3-icon-btn small"
+            className="v3-icon-btn small has-hint"
             aria-label="向右分屏"
             title={`向右分屏（${shortcutText("splitRight")}）`}
             onClick={() => onSplitNewTerminal(tabId, paneId, "right")}
           >
             <Columns2 size={13} />
+            {isFocused ? <SpatialHint text={shortcutText("splitRight")} corner="tr" /> : null}
           </button>
           <button
             type="button"
-            className="v3-icon-btn small"
+            className="v3-icon-btn small has-hint"
             aria-label="向下分屏"
             title={`向下分屏（${shortcutText("splitDown")}）`}
             onClick={() => onSplitNewTerminal(tabId, paneId, "down")}
           >
             <Rows2 size={13} />
+            {isFocused ? <SpatialHint text={shortcutText("splitDown")} corner="tr" /> : null}
           </button>
           {isSplit || isZoomed ? (
             <button
@@ -1484,12 +1518,13 @@ function PaneHead({
           ) : null}
           <button
             type="button"
-            className="v3-icon-btn small"
+            className="v3-icon-btn small has-hint"
             aria-label={isSplit ? "关闭此分屏" : "关闭标签"}
-            title={isSplit ? `关闭此分屏（${shortcutText("closePane")}）` : `关闭标签（${shortcutText("closeTab")}）`}
+            title={`${isSplit ? "关闭此分屏" : "关闭标签"}（${shortcutText("closeTab")}）`}
             onClick={onClose}
           >
             <X size={13} />
+            {isFocused ? <SpatialHint text={shortcutText("closeTab")} corner="tr" /> : null}
           </button>
         </div>
       </div>
@@ -1605,7 +1640,7 @@ function PaneHead({
           <MenuItem
             label={isSplit ? "关闭此分屏" : "关闭标签"}
             icon={X}
-            keys={isSplit ? shortcutText("closePane") : shortcutText("closeTab")}
+            keys={shortcutText("closeTab")}
             onClick={() => {
               setPaneMenu(null);
               onClose();
@@ -1643,10 +1678,12 @@ function SplitSash({
   tabId,
   sash,
   stageRef,
+  onDraggingChange,
 }: {
   tabId: string;
   sash: SplitSashLayout;
   stageRef: React.RefObject<HTMLDivElement | null>;
+  onDraggingChange?: (dragging: boolean) => void;
 }) {
   const dragRef = useRef<{ lastPos: number; spanPx: number } | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -1655,15 +1692,17 @@ function SplitSash({
     return () => {
       if (dragRef.current) {
         dragRef.current = null;
+        onDraggingChange?.(false);
         overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
       }
     };
-  }, []);
+  }, [onDraggingChange]);
 
   const endDrag = () => {
     if (!dragRef.current) return;
     dragRef.current = null;
     setDragging(false);
+    onDraggingChange?.(false);
     overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
   };
 
@@ -1684,6 +1723,7 @@ function SplitSash({
         const spanPx = Math.max(140, totalPx * Math.max(0.1, sash.branchSpanScale));
         dragRef.current = { lastPos: sash.axis === "row" ? e.clientX : e.clientY, spanPx };
         setDragging(true);
+        onDraggingChange?.(true);
         overlayStore.set((p) => ({ open: p.open + 1 }));
         e.currentTarget.setPointerCapture(e.pointerId);
       }}
@@ -1710,6 +1750,7 @@ function SplitPaneSlot({
   isFocused,
   isZoomed,
   tabActive,
+  splitEnter,
   draggingPaneId,
   onDraggingPaneChange,
   onSplitNewTerminal,
@@ -1721,6 +1762,7 @@ function SplitPaneSlot({
   isFocused: boolean;
   isZoomed: boolean;
   tabActive: boolean;
+  splitEnter?: "right" | "down" | "in";
   draggingPaneId: string | null;
   onDraggingPaneChange: (paneId: string | null) => void;
   onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
@@ -1870,6 +1912,7 @@ function SplitPaneSlot({
   return (
     <div
       className="v3-split-slot"
+      data-split-enter={splitEnter}
       style={visible ? css : { ...css, display: "none" }}
       onPointerDownCapture={() => {
         if (!isFocused) focusTabPane(tabId, leaf.id);
@@ -1893,6 +1936,7 @@ function SplitPaneSlot({
           subHead={subHead}
           fileHead={fileHead}
           isSplit={isSplit}
+          isFocused={isFocused}
           isZoomed={isZoomed}
           onDraggingPaneChange={onDraggingPaneChange}
           onModeChange={content.kind === "agent" ? (m) => setPaneAgentMode(tabId, leaf.id, m) : undefined}
@@ -2030,7 +2074,7 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
   );
 }
 
-const MAX_KEPT_AGENT_TABS = 12;
+const MAX_KEPT_AGENT_TABS = 6;
 
 function TabStage({
   tab,
@@ -2057,8 +2101,48 @@ function TabStage({
   const focusedId = focusedLeafOfTab(tab).id;
   const isSplit = splitLayout.leaves.length > 1;
   const zoomedId = tab.split?.zoomedPaneId ?? null;
+  const [sashDragging, setSashDragging] = useState(false);
+  const [splitEnters, setSplitEnters] = useState<Record<string, "right" | "down" | "in">>({});
+  const prevLeafMapRef = useRef<Map<string, { left: string; top: string }> | null>(null);
+  const splitEnterTimerRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    const prev = prevLeafMapRef.current;
+    const next = new Map<string, { left: string; top: string }>();
+    for (const item of splitLayout.leaves) {
+      next.set(item.leaf.id, { left: item.css.left, top: item.css.top });
+    }
+    prevLeafMapRef.current = next;
+    if (!prev || sashDragging || prev.size === next.size) return;
+    beginSplitMotion(SPLIT_MOTION_MS + 25);
+    if (next.size > prev.size) {
+      const added: Record<string, "right" | "down" | "in"> = {};
+      for (const item of splitLayout.leaves) {
+        if (prev.has(item.leaf.id)) continue;
+        added[item.leaf.id] = item.css.left !== "0%" ? "right" : item.css.top !== "0%" ? "down" : "in";
+      }
+      if (Object.keys(added).length > 0) {
+        setSplitEnters(added);
+        if (splitEnterTimerRef.current) window.clearTimeout(splitEnterTimerRef.current);
+        splitEnterTimerRef.current = window.setTimeout(() => {
+          splitEnterTimerRef.current = null;
+          setSplitEnters({});
+        }, SPLIT_MOTION_MS + 35);
+      }
+    }
+  }, [sashDragging, splitLayout.leaves]);
+
+  useEffect(() => {
+    return () => {
+      if (splitEnterTimerRef.current) {
+        window.clearTimeout(splitEnterTimerRef.current);
+        splitEnterTimerRef.current = null;
+      }
+    };
+  }, []);
+
   return (
-    <div ref={stageRef} className="v3-split-stage">
+    <div ref={stageRef} className="v3-split-stage" data-sash-dragging={sashDragging ? "true" : "false"}>
       {splitLayout.leaves.map((item, idx) => (
         <SplitPaneSlot
           key={slotKeys[idx]!}
@@ -2069,6 +2153,7 @@ function TabStage({
           isFocused={item.leaf.id === focusedId}
           isZoomed={zoomedId === item.leaf.id}
           tabActive={tabActive}
+          splitEnter={splitEnters[item.leaf.id]}
           draggingPaneId={draggingPaneId}
           onDraggingPaneChange={onDraggingPaneChange}
           onSplitNewTerminal={onSplitNewTerminal}
@@ -2076,7 +2161,7 @@ function TabStage({
       ))}
       {tabActive
         ? splitLayout.sashes.map((sash) => (
-            <SplitSash key={sash.id} tabId={tab.id} sash={sash} stageRef={stageRef} />
+            <SplitSash key={sash.id} tabId={tab.id} sash={sash} stageRef={stageRef} onDraggingChange={setSashDragging} />
           ))
         : null}
     </div>
@@ -2155,7 +2240,7 @@ export function ShellMain({
         return (
           <div
             key={t.mountKey ?? t.id}
-            style={isTabActive ? { display: "contents" } : { display: "none" }}
+            className={isTabActive ? "v3-tab-layer is-active" : "v3-tab-layer is-hidden"}
             aria-hidden={!isTabActive}
           >
             <TabStage
@@ -2815,7 +2900,21 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
       <span className="v3-status-item">
         <span className="v3-dot dim" />
         <span className="truncate">{all.length} 个 Agent</span>
-        {blocked ? <span className="v3-status-need truncate">· {blocked} 个需要你</span> : null}
+        {blocked ? (
+          <button
+            type="button"
+            className="v3-status-btn v3-status-need has-hint truncate"
+            title={`跳转到下一个需要你的 Agent（${shortcutText("jumpUrgent")}）`}
+            onClick={() => {
+              if (typeof window !== "undefined") {
+                window.dispatchEvent(new CustomEvent("pocket:jump-urgent"));
+              }
+            }}
+          >
+            <span>· {blocked} 个需要你</span>
+            <SpatialHint text={shortcutText("jumpUrgent")} corner="tr" />
+          </button>
+        ) : null}
       </span>
       <span className="grow" />
       <UpdateStatusSegment />
@@ -2887,9 +2986,26 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
           </div>
         ) : null}
       </div>
-      <button className="v3-status-item v3-status-btn" style={{ flex: "none" }} onClick={() => setPalette("command")} title="打开命令面板">
-        <span className="v3-keys-text">{comboText(SHORTCUTS[0]!.keys)}</span>
+      <button
+        type="button"
+        className="v3-status-item v3-status-btn has-hint"
+        style={{ flex: "none" }}
+        onClick={() => {
+          if (typeof window !== "undefined") {
+            window.dispatchEvent(new CustomEvent("pocket:toggle-shortcut-help"));
+          }
+        }}
+        title={`快捷键指南（${shortcutText("shortcutHelp")}）`}
+      >
+        <Keyboard size={13} />
+        <span className="v3-keys-text">{shortcutText("shortcutHelp")}</span>
+        <span>快捷键</span>
+        <SpatialHint text={shortcutText("shortcutHelp")} corner="tr" />
+      </button>
+      <button className="v3-status-item v3-status-btn has-hint" style={{ flex: "none" }} onClick={() => setPalette("command")} title="打开命令面板">
+        <span className="v3-keys-text">{shortcutText("palette")}</span>
         <span>命令</span>
+        <SpatialHint text={shortcutText("palette")} corner="tr" />
       </button>
     </footer>
   );
@@ -2969,7 +3085,13 @@ export function PeekOverlay() {
               onRefresh={subHead.onRefresh}
             />
           ) : null}
-          {agent ? <ModeSwitchIcons mode={mode} onModeChange={setPeekMode} /> : null}
+          {agent ? (
+            <ModeSwitchIcons
+              mode={mode}
+              onModeChange={setPeekMode}
+              termAttention={Boolean(agent.subscreen) || agent.status === "blocked"}
+            />
+          ) : null}
           {agent ? (
             <button className="v3-mini-btn" onClick={() => openAgentTab(agent.key, mode)}>
               <ExternalLink size={12} />

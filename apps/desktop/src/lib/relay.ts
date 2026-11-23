@@ -470,7 +470,13 @@ class SocketClient {
             if (first) this.seenNoticeIds.delete(first);
           }
           if (settingsStore.get().notifications) {
-            void pushSystemNotification(msg.notice.title, msg.notice.body);
+            const winActive =
+              typeof document !== "undefined" &&
+              document.visibilityState === "visible" &&
+              document.hasFocus();
+            if (!winActive) {
+              void pushSystemNotification(msg.notice.title, msg.notice.body);
+            }
           }
         }
       } catch {

@@ -98,6 +98,24 @@ describe("versions", () => {
     }
   });
 
+  test("sumFor also parses RELEASE-MANIFEST.json entries for carried-forward bundles", () => {
+    const h = "c".repeat(64);
+    const manifestJson = JSON.stringify({
+      schema: 1,
+      releaseVersion: "0.2.25",
+      updatedAt: "2026-11-23T10:00:00Z",
+      channels: {
+        bundle: {
+          version: "0.2.24",
+          tag: "v0.2.24",
+          fileName: "herdr-pocket-0.2.24.tar.gz",
+          sha256: h,
+        },
+      },
+    });
+    assert.equal(sumFor(manifestJson, "herdr-pocket-0.2.24.tar.gz"), h);
+  });
+
   test("an unmanaged copy explains how it is updated", () => {
     const dir = mkdtempSync(join(tmpdir(), "hp-layout-"));
     mkdirSync(join(dir, ".git"));

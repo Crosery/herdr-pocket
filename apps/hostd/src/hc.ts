@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { SHELL_HARNESSES, normalizeStatus, type Agent, type AgentStatus, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { base, cleanTitle, debounce, lineSplitter, run } from "./util.ts";
-import { HcScreens, type ScreenLines } from "./hcscreen.ts";
+import { HcScreens, type ScreenLines, type ScreenSnapshot } from "./hcscreen.ts";
 import { defaultHcBin, programName } from "./platform.ts";
 
 /** Subset of a herdr-core (`hc`) terminal object we rely on. */
@@ -11,14 +11,14 @@ export interface HcTerminal {
   argv?: string[];
   cwd?: string | null;
   state?: string; // live | finished
-  status?: { app?: string; state?: string; msg?: string } | null;
+  status?: { app?: string; state?: string; kind?: string | null; msg?: string } | null;
   status_ms?: number | null;
   title?: string | null;
   turn?: number;
   name?: string | null;
   labels?: Record<string, string>;
   parent?: string | null;
-  foreground?: { argv?: string[]; cwd?: string; pid?: number } | null;
+  foreground?: { argv?: string[]; name?: string | null; cwd?: string; pid?: number } | null;
   created_ms?: number;
   cols?: number;
   rows?: number;
@@ -35,17 +35,46 @@ const MODAL_PICKER_TAIL_PATTERNS: readonly RegExp[] = [
   /(?:按\s*|(?<![a-z0-9]))esc\s*(?:键)?\s*取消/i,
 ];
 
+const INTERACTIVE_APPROVAL_RE =
+  /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow)|would you like to|allow (?:once|always|execution|this tool)|allow tool execution|permission required|approve|reject|yes,?\s*(?:and\s+)?(?:proceed|allow|don't ask again)|press (?:a )?number to choose|\[y\/n\]|\(y\/n\)|chat about this|type your(?: own)? answer|enter to submit answer)\b|是否允许|允许执行|是否继续|按数字选择|输入.{0,8}回答|确认执行|授权确认/i;
+
+const WORKING_INLINE_HINT_RE =
+  /\(\s*(?:[^()]*[•·]\s*)?esc\s+(?:to\s+)?(?:cancel|interrupt)\s*\)\s*$|\(\s*按\s*esc\s*(?:键)?\s*(?:取消|中断)\s*\)\s*$/i;
+
+const WORKING_SPINNER_PREFIX_RE = /^\s*[✢✶✳✻✽⠋-⣿•]/;
+
+const PAGER_TAIL_RE =
+  /^(?::|\(END\)|.*\s\(END\)|--More--(?:\s*\(\d+%\))?|lines \d+-\d+(?:\/\d+)?(?:\s*\(END\))?|.*\bpress\s+q\s+to\s+quit\b.*|.*\bq\s+(?:to\s+)?(?:quit|close|exit)\b.*\b(?:transcript|pager|manual)\b.*|\btranscript\b.*\bq\s+to\s+(?:quit|exit|return)\b.*)$/i;
+
+const PAGER_PROCS = new Set(["less", "man", "more", "git-pager", "delta"]);
+const TRANSCRIPT_CTRL_O_RE = /\bctrl\+o\s+to\s+(?:collapse|hide|exit|return)\b|\bshowing\s+detailed\s+transcript\b/i;
+const TABBED_VIEWER_HEADER_RE = /(?:^|\s)(?:Settings\s+Status\s+(?:Config|Usage)|Status\s+Config\s+Usage)(?:\s|$)/i;
+
+/**
+ * Hard Veto: returns true when the visible terminal screen is waiting on a
+ * human approval, permission decision, auth check, or question picker.
+ */
+export function isInteractiveApprovalOrQuestion(screen: string): boolean {
+  const tail = screen.split("\n").map((l) => l.trim()).filter(Boolean).slice(-14).join("\n");
+  return INTERACTIVE_APPROVAL_RE.test(tail);
+}
+
 /**
  * True when a full-screen interactive viewer/overlay (e.g. `/swarm board`,
  * `/status`, `/usage` viewers) is open and captures input even while the agent
  * is `"working"`. Explicitly never matches `"esc to interrupt"` or `"esc to cancel"`.
  */
 export function isViewerSubscreen(screen: string): boolean {
+  if (isInteractiveApprovalOrQuestion(screen)) return false;
   if (/^Swarm board\b/m.test(screen)) return true;
   const lines = screen.split("\n").map((l) => l.trim()).filter(Boolean);
   if (lines.slice(0, 4).some((l) => /^Swarm board\b/.test(l))) return true;
+  if (lines.slice(0, 8).some((l) => TABBED_VIEWER_HEADER_RE.test(l)) && !/shift\+tab\s+to\s+cycle/i.test(lines.slice(-4).join("\n"))) {
+    return true;
+  }
   const tail = lines.slice(-6);
-  return tail.some((l) => VIEWER_SUBSCREEN_TAIL_PATTERNS.some((re) => re.test(l)));
+  if (tail.some((l) => TRANSCRIPT_CTRL_O_RE.test(l)) || lines.slice(0, 4).some((l) => TRANSCRIPT_CTRL_O_RE.test(l))) return true;
+  return tail.some((l) => !WORKING_INLINE_HINT_RE.test(l) && VIEWER_SUBSCREEN_TAIL_PATTERNS.some((re) => re.test(l)));
 }
 
 /**
@@ -55,7 +84,53 @@ export function isViewerSubscreen(screen: string): boolean {
 export function endsInPanel(screen: string): boolean {
   if (isViewerSubscreen(screen)) return true;
   const tail = screen.split("\n").map((l) => l.trim()).filter(Boolean).slice(-6);
-  return tail.some((l) => MODAL_PICKER_TAIL_PATTERNS.some((re) => re.test(l)));
+  return tail.some((l) => {
+    if (WORKING_INLINE_HINT_RE.test(l) || WORKING_SPINNER_PREFIX_RE.test(l)) return false;
+    return MODAL_PICKER_TAIL_PATTERNS.some((re) => re.test(l));
+  });
+}
+
+export interface SubscreenDetection {
+  kind: "viewer" | "pager";
+  dismissKey: "\x1b" | "q" | "\x0f";
+  dismissAlias: "esc" | "q" | "ctrl+o";
+  reason: string;
+}
+
+/**
+ * Detects non-input TUI subscreens (`/usage`, `/status`, `Swarm board`, transcript overlays,
+ * and `less`/`man`/`more` pagers) while obeying the Hard Veto for `"blocked"` / approval prompts
+ * and normal working turns (`(esc to cancel)` / `(esc to interrupt)`).
+ */
+export function detectDismissableSubscreen(opts: {
+  screen: string;
+  altScreen?: boolean;
+  status: AgentStatus;
+  statusKind?: Agent["statusKind"];
+  fgName?: string | null;
+  argv0?: string | null;
+}): SubscreenDetection | null {
+  if (opts.status === "blocked" || opts.statusKind) return null;
+  if (isInteractiveApprovalOrQuestion(opts.screen)) return null;
+
+  const lines = opts.screen.split("\n").map((l) => l.trim()).filter(Boolean);
+  const head = lines.slice(0, 6);
+  const tail = lines.slice(-6);
+  const fg = (opts.fgName?.trim() || programName(base(opts.argv0 ?? undefined)) || "").toLowerCase();
+
+  if (tail.some((l) => PAGER_TAIL_RE.test(l)) && (PAGER_PROCS.has(fg) || opts.altScreen || /\btranscript\b/i.test([...head, ...tail].join(" ")))) {
+    return { kind: "pager", dismissKey: "q", dismissAlias: "q", reason: "pager" };
+  }
+  if ([...head, ...tail].some((l) => TRANSCRIPT_CTRL_O_RE.test(l))) {
+    return { kind: "viewer", dismissKey: "\x0f", dismissAlias: "ctrl+o", reason: "transcript" };
+  }
+  if (isViewerSubscreen(opts.screen)) {
+    return { kind: "viewer", dismissKey: "\x1b", dismissAlias: "esc", reason: "viewer" };
+  }
+  if (opts.status !== "working" && endsInPanel(opts.screen)) {
+    return { kind: "viewer", dismissKey: "\x1b", dismissAlias: "esc", reason: "modal_picker" };
+  }
+  return null;
 }
 
 /** Per-terminal metadata reported by `herdr-app ls` / persisted `docs.json`. */
@@ -96,7 +171,9 @@ const KEY_ALIASES: Record<string, string> = {
   "ctrl+c": "ctrl+c",
   "ctrl+d": "ctrl+d",
   "ctrl+l": "ctrl+l",
+  "ctrl+o": "ctrl+o",
   "ctrl+t": "ctrl+t",
+  q: "q",
   f2: "f2",
   "shift+f2": "shift+f2",
   "alt+m": "alt+m",
@@ -439,6 +516,13 @@ export class HcAdapter extends EventEmitter {
     return Number.isFinite(seen) && typeof t.turn === "number" && seen >= t.turn ? "idle" : "done";
   }
 
+  /** Structured prompt kind while `"blocked"` (`permission` / `question` / `auth`). */
+  static statusKind(t: HcTerminal): Agent["statusKind"] {
+    if (HcAdapter.status(t) !== "blocked") return undefined;
+    const raw = t.status?.kind?.toLowerCase();
+    return raw === "permission" || raw === "question" || raw === "auth" ? raw : undefined;
+  }
+
   /** What the program says while it waits for a person (an error or a question), clipped. */
   static note(t: HcTerminal): string | undefined {
     if (HcAdapter.status(t) !== "blocked") return undefined;
@@ -485,6 +569,7 @@ export class HcAdapter extends EventEmitter {
       where: HcAdapter.where(t, names),
       cwd: t.foreground?.cwd ?? t.cwd ?? undefined,
       status: HcAdapter.status(t),
+      statusKind: HcAdapter.statusKind(t),
       statusSince: t.status_ms ?? undefined,
       statusNote: HcAdapter.note(t),
       errored: ["error", "failed"].includes(t.status?.state?.toLowerCase() ?? "") || undefined,
@@ -562,15 +647,12 @@ export class HcAdapter extends EventEmitter {
 
   async send(address: string, text: string, enter = true): Promise<void> {
     if (enter) {
-      // Panels (/status, /config, /model) and full-screen viewers (/swarm board)
-      // swallow pasted text; close up to 3 overlay levels with Esc before pasting.
-      let open = await this.panelOpen(address);
-      for (let attempt = 0; attempt < 3 && open; attempt++) {
-        await run(this.hcBin, ["keys", address, "esc"]);
-        await new Promise((r) => setTimeout(r, 200));
-        open = await this.panelOpen(address);
+      // Panels (/status, /config, /usage), full-screen viewers (/swarm board, transcripts),
+      // and OS pagers (less/man) swallow pasted text; close up to 3 overlay levels quickly.
+      const dismissed = await this.dismissSubscreens(address);
+      if (dismissed === "blocked") {
+        throw new Error("它开着一个面板，消息没送进去：先在终端里按 Esc 或 q 关掉再发");
       }
-      if (open) throw new Error("它开着一个面板，消息没送进去：先在终端里按 Esc 关掉再发");
     }
     const t = this.terminals.get(address);
     try {
@@ -596,23 +678,85 @@ export class HcAdapter extends EventEmitter {
   }
 
   /**
-   * True when a non-shell program shows a panel/viewer that Esc closes.
-   * Never touches `"blocked"` (a permission question belongs to the person); while
-   * `"working"`, only full-screen interactive viewers (`isViewerSubscreen`) are
-   * closed so normal `"esc to interrupt"` prompts are never interrupted.
+   * Detects and dismisses up to 3 layers of non-input subscreens (`/status`, `/usage`,
+   * `Swarm board`, transcript viewers, `less`/`man`) via fast raw input before falling back
+   * to `hc keys`. Never sends anything into `"blocked"` / approval prompts or working turns.
    */
-  private async panelOpen(address: string): Promise<boolean> {
+  async dismissSubscreens(address: string): Promise<"viewer" | "pager" | "none" | "blocked"> {
     const t = this.terminals.get(address);
     const isShell = t ? !t.status && SHELL_HARNESSES.has(HcAdapter.harness(t).toLowerCase()) : false;
-    if (isShell) return false;
-    const st: AgentStatus = t ? HcAdapter.status(t) : "idle";
-    if (st !== "working" && st !== "idle" && st !== "done") return false;
-    try {
-      const s = await this.screens.snapshot(address, 0);
-      return st === "working" ? isViewerSubscreen(s.text) : endsInPanel(s.text);
-    } catch {
-      return false;
+    if (isShell) return "none";
+
+    let firstClosed: "viewer" | "pager" | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const snap = await this.screens.snapshot(address, 24).catch((): ScreenSnapshot | null => null);
+      if (!snap) return firstClosed ?? "none";
+      const det = detectDismissableSubscreen({
+        screen: snap.text,
+        altScreen: snap.altScreen,
+        status: t ? HcAdapter.status(t) : "idle",
+        statusKind: t ? HcAdapter.statusKind(t) : undefined,
+        fgName: t?.foreground?.name,
+        argv0: t?.foreground?.argv?.[0] ?? t?.argv?.[0],
+      });
+      if (!det) return firstClosed ?? "none";
+      if (!firstClosed) firstClosed = det.kind;
+
+      let sentRaw = false;
+      if (t) {
+        try {
+          await this.screens.input(address, det.dismissKey, t.cols || 80, t.rows || 24, false);
+          sentRaw = true;
+          await new Promise((r) => setTimeout(r, 90));
+        } catch {
+          sentRaw = false;
+        }
+      }
+      const afterRaw = sentRaw ? await this.screens.snapshot(address, 24).catch((): ScreenSnapshot | null => null) : null;
+      if (!afterRaw || afterRaw.text === snap.text) {
+        await run(this.hcBin, ["keys", address, det.dismissAlias]).catch(() => {});
+        await new Promise((r) => setTimeout(r, 120));
+      }
     }
+
+    const remaining = await this.screens.snapshot(address, 24).catch((): ScreenSnapshot | null => null);
+    if (remaining) {
+      const still = detectDismissableSubscreen({
+        screen: remaining.text,
+        altScreen: remaining.altScreen,
+        status: t ? HcAdapter.status(t) : "idle",
+        statusKind: t ? HcAdapter.statusKind(t) : undefined,
+        fgName: t?.foreground?.name,
+        argv0: t?.foreground?.argv?.[0] ?? t?.argv?.[0],
+      });
+      if (still) return "blocked";
+    }
+    return firstClosed ?? "none";
+  }
+
+  detectSubscreenFromSnapshot(address: string, snap: { text: string; altScreen?: boolean }): "viewer" | "pager" | null {
+    const t = this.terminals.get(address);
+    const isShell = t ? !t.status && SHELL_HARNESSES.has(HcAdapter.harness(t).toLowerCase()) : false;
+    if (isShell) return null;
+    const det = detectDismissableSubscreen({
+      screen: snap.text,
+      altScreen: snap.altScreen,
+      status: t ? HcAdapter.status(t) : "idle",
+      statusKind: t ? HcAdapter.statusKind(t) : undefined,
+      fgName: t?.foreground?.name,
+      argv0: t?.foreground?.argv?.[0] ?? t?.argv?.[0],
+    });
+    return det?.kind ?? null;
+  }
+
+  /** Helper exposing current subscreen kind directly from an attached snapshot. */
+  async detectSubscreen(address: string): Promise<"viewer" | "pager" | null> {
+    const snap = await this.screens.snapshot(address, 24).catch((): ScreenSnapshot | null => null);
+    return snap ? this.detectSubscreenFromSnapshot(address, snap) : null;
+  }
+
+  async snapshotWithMeta(address: string, lines = 60): Promise<ScreenSnapshot | null> {
+    return this.screens.snapshot(address, lines).catch((): ScreenSnapshot | null => null);
   }
 
   /** Presses the program's stop key and says what happened (hc watches for an effect). */

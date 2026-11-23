@@ -15,6 +15,8 @@ import {
   registerPendingSplitPlacement,
   type HerdrDocTransport,
 } from "../src/shell/herdrDocSync.ts";
+import { IS_MAC, formatEventKeyTokens, matchShortcut } from "../src/shell/shortcuts.ts";
+import { beginSplitMotion, isSplitMotionActive, onSplitMotionSettled } from "../src/shell/splitMotion.ts";
 import {
   activeTabIdForSpace,
   closeTab,
@@ -378,7 +380,8 @@ test("Keep-alive ShellMain, TerminalSurface no-reattach focus/size sync, ResizeO
   const appSrc = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/styles/shell.css", import.meta.url), "utf8");
 
-  assert.match(shellSrc, /MAX_KEPT_AGENT_TABS\s*=\s*12/);
+  assert.match(shellSrc, /MAX_KEPT_AGENT_TABS\s*=\s*6/);
+  assert.match(shellSrc, /v3-tab-layer/);
   assert.match(shellSrc, /v3-pane-tool-btn/);
   assert.match(css, /\.v3-tab\s*\{[\s\S]*min-width:\s*78px;[\s\S]*max-width:\s*210px;/);
   assert.match(css, /@media \(hover: hover\)[\s\S]*\.v3-tab:not\(\.active\):not\(:hover\):not\(:focus-within\) \.v3-tab-x/);
@@ -720,4 +723,66 @@ test("file links require Ctrl/Cmd modifier and HTML FileViewer stays scroll-stab
   const fvSlice = wbSrc.slice(fvStart, fvEnd > fvStart ? fvEnd : undefined);
   assert.equal(/,\s*\[agent\s*(?:,|\])/.test(fvSlice), false, "FileViewer hooks must depend on primitive agent fields, not object identity");
   assert.equal(fvSlice.includes("capHtmlResolvedFor"), true, "HTML viewer must resolve capability URL before mounting iframe");
+});
+
+test("markdown viewer scales fluidly across ultrawide/narrow viewports and supports GFM alerts", () => {
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const appCss = readFileSync(resolve(testDir, "../src/styles/app.css"), "utf8");
+  const viewerBlock = /\.viewer\s*\{[\s\S]*?\}/.exec(appCss)?.[0] ?? "";
+  assert.equal(viewerBlock.includes("container-type: inline-size"), true);
+  const viewerMdBlock = /\.viewer-md\s*\{[\s\S]*?\}/.exec(appCss)?.[0] ?? "";
+  assert.equal(viewerMdBlock.includes("clamp(920px, 88cqi, 2240px)"), true);
+  assert.equal(viewerMdBlock.includes("margin: 0 auto"), true);
+  assert.equal(appCss.includes(".md-alert-tip"), true);
+  assert.equal(appCss.includes(".md-table .md-file-chip"), true);
+
+  const fpCss = readFileSync(resolve(testDir, "../src/styles/file-preview.css"), "utf8");
+  assert.equal(fpCss.includes("clamp(820px, 86cqi, 1760px)"), true);
+
+  const shellCss = readFileSync(resolve(testDir, "../src/styles/shell.css"), "utf8");
+  assert.equal(shellCss.includes("@container (max-width: 680px)"), true);
+  assert.equal(shellCss.includes(".v3-tab-layer.is-hidden"), true);
+  assert.equal(shellCss.includes("v3SplitEnterRight"), true);
+
+  const mdSrc = readFileSync(resolve(testDir, "../src/lib/markdown.tsx"), "utf8");
+  assert.equal(mdSrc.includes("md-alert-${kind}"), true);
+});
+
+test("shortcuts table matches Mod+/, Mod+., Mod+E, Mod+Alt+=, Mod+Shift+U and splitMotion defers settle callbacks", async () => {
+  const mkEvent = (opts: { key: string; code?: string; altKey?: boolean; shiftKey?: boolean }) =>
+    ({
+      key: opts.key,
+      code: opts.code ?? "",
+      metaKey: IS_MAC,
+      ctrlKey: !IS_MAC,
+      altKey: Boolean(opts.altKey),
+      shiftKey: Boolean(opts.shiftKey),
+    }) as KeyboardEvent;
+
+  assert.equal(matchShortcut(mkEvent({ key: "/", code: "Slash" })), "shortcutHelp");
+  assert.equal(matchShortcut(mkEvent({ key: ".", code: "Period" })), "interruptAgent");
+  assert.equal(matchShortcut(mkEvent({ key: "e" })), "togglePaneMode");
+  assert.equal(matchShortcut(mkEvent({ key: "=", code: "Equal", altKey: true })), "equalizeSplits");
+  assert.equal(matchShortcut(mkEvent({ key: "u", shiftKey: true })), "jumpUrgent");
+  assert.deepEqual(formatEventKeyTokens(mkEvent({ key: "/", code: "Slash" })), ["Mod", "/"]);
+
+  const prevWindow = (globalThis as { window?: unknown }).window;
+  try {
+    (globalThis as { window?: unknown }).window = {
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    };
+    beginSplitMotion(35);
+    assert.equal(isSplitMotionActive(), true);
+    let settled = false;
+    onSplitMotionSettled(() => {
+      settled = true;
+    });
+    assert.equal(settled, false);
+    await new Promise((r) => setTimeout(r, 70));
+    assert.equal(isSplitMotionActive(), false);
+    assert.equal(settled, true);
+  } finally {
+    (globalThis as { window?: unknown }).window = prevWindow;
+  }
 });

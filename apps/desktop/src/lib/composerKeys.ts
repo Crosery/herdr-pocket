@@ -41,7 +41,7 @@ export type ComposerEnterAction = "submit" | "steer" | "pass" | "swallow";
  * - `Shift+Enter` inserts a newline (`"pass"`).
  * - Repeat `Enter` or `Ctrl+Meta+Enter` swallow without submitting.
  * - `Alt+Enter` returns `"steer"` when `allowSteer` is true, else `"swallow"`.
- * - Plain `Enter` or `Cmd/Ctrl+Enter` outside IME submits (`"submit"`).
+ * - `Cmd/Ctrl+Enter` returns `"steer"` when `allowSteer` is true, else `"submit"`.
  */
 export function composerEnterAction(
   event: ComposerEnterFacts,
@@ -54,8 +54,10 @@ export function composerEnterAction(
   if (event.isComposing || gate.composing || event.keyCode === 229) return "pass";
   if (gate.compositionEndedAt > 0 && now - gate.compositionEndedAt < IME_GUARD_MS) return "swallow";
   if (event.repeat) return "swallow";
-  if (event.altKey && !event.ctrlKey && !event.metaKey) return allowSteer ? "steer" : "swallow";
-  if (event.altKey || (event.ctrlKey && event.metaKey)) return "swallow";
+  if (event.ctrlKey && event.metaKey) return "swallow";
+  if (event.altKey && (event.ctrlKey || event.metaKey)) return "swallow";
+  if (event.altKey) return allowSteer ? "steer" : "swallow";
+  if (allowSteer && (event.metaKey || event.ctrlKey)) return "steer";
   return "submit";
 }
 

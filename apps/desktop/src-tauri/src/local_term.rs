@@ -1633,6 +1633,8 @@ struct ParsedKittyHeader<'a> {
     height: Option<u32>,
     id: Option<u32>,
     image_number: Option<u32>,
+    data_size: Option<usize>,
+    data_offset: Option<usize>,
     quiet: u8,
 }
 
@@ -1647,6 +1649,8 @@ fn parse_kitty_header(raw_header: &[u8]) -> ParsedKittyHeader<'_> {
         height: None,
         id: None,
         image_number: None,
+        data_size: None,
+        data_offset: None,
         quiet: 0,
     };
     let Ok(header_str) = std::str::from_utf8(raw_header) else {
@@ -1669,6 +1673,8 @@ fn parse_kitty_header(raw_header: &[u8]) -> ParsedKittyHeader<'_> {
             "v" => parsed.height = v.parse::<u32>().ok(),
             "i" => parsed.id = v.parse::<u32>().ok(),
             "I" => parsed.image_number = v.parse::<u32>().ok(),
+            "S" => parsed.data_size = v.parse::<usize>().ok(),
+            "O" => parsed.data_offset = v.parse::<usize>().ok(),
             "q" => parsed.quiet = match v { "1" => 1, "2" => 2, _ => 0 },
             _ => {}
         }
@@ -1679,15 +1685,162 @@ fn parse_kitty_header(raw_header: &[u8]) -> ParsedKittyHeader<'_> {
 struct ActiveChunkUpload {
     action: String,
     id: Option<u32>,
+    image_number: Option<u32>,
     first_header: Vec<u8>,
     format: Option<u32>,
     medium: Option<String>,
+    compression: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    data_size: Option<usize>,
+    data_offset: Option<usize>,
+    quiet: u8,
     passthrough: bool,
     raw_chunks: Vec<Vec<u8>>,
     payload_parts: Vec<Vec<u8>>,
     total_raw_bytes: usize,
+}
+
+fn format_kitty_reply(id: Option<u32>, image_number: Option<u32>, status: &str) -> Option<Vec<u8>> {
+    match (id, image_number) {
+        (Some(i), Some(n)) => Some(format!("\x1b_Gi={i},I={n};{status}\x1b\\").into_bytes()),
+        (Some(i), None) => Some(format!("\x1b_Gi={i};{status}\x1b\\").into_bytes()),
+        (None, Some(n)) => Some(format!("\x1b_GI={n};{status}\x1b\\").into_bytes()),
+        (None, None) => None,
+    }
+}
+
+fn slice_payload_range(
+    mut bytes: Vec<u8>,
+    data_offset: Option<usize>,
+    data_size: Option<usize>,
+) -> Option<Vec<u8>> {
+    let offset = data_offset.unwrap_or(0);
+    if offset > bytes.len() {
+        return None;
+    }
+    let avail = bytes.len() - offset;
+    let take_len = data_size.unwrap_or(avail).min(avail);
+    if take_len == 0 || take_len > MAX_MEM_TERM_BYTES {
+        return None;
+    }
+    if offset == 0 && take_len == bytes.len() {
+        return Some(bytes);
+    }
+    let end = offset + take_len;
+    bytes.copy_within(offset..end, 0);
+    bytes.truncate(take_len);
+    Some(bytes)
+}
+
+fn decompress_kitty_zlib(bytes: &[u8]) -> Option<Vec<u8>> {
+    let cap = (MAX_MEM_TERM_BYTES + 1) as u64;
+    let mut out = Vec::new();
+    let mut z = flate2::read::ZlibDecoder::new(bytes).take(cap);
+    if z.read_to_end(&mut out).is_ok() && !out.is_empty() && out.len() <= MAX_MEM_TERM_BYTES {
+        return Some(out);
+    }
+    out.clear();
+    let mut raw_deflate = flate2::read::DeflateDecoder::new(bytes).take(cap);
+    if raw_deflate.read_to_end(&mut out).is_ok() && !out.is_empty() && out.len() <= MAX_MEM_TERM_BYTES {
+        return Some(out);
+    }
+    None
+}
+
+#[cfg(unix)]
+fn normalize_shm_cstr(raw: &str) -> Option<std::ffi::CString> {
+    let trimmed = raw.trim_end_matches('\0').trim();
+    let bare = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    if bare.is_empty() || bare.len() > 255 || bare.contains('/') || bare.contains('\0') {
+        return None;
+    }
+    std::ffi::CString::new(format!("/{bare}")).ok()
+}
+
+#[cfg(unix)]
+fn probe_and_unlink_shm(raw: &str) -> bool {
+    let Some(cstr) = normalize_shm_cstr(raw) else {
+        return false;
+    };
+    let fd = unsafe { libc::shm_open(cstr.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return false;
+    }
+    unsafe {
+        libc::close(fd);
+        libc::shm_unlink(cstr.as_ptr());
+    }
+    true
+}
+
+#[cfg(unix)]
+fn read_and_unlink_shm(
+    raw: &str,
+    data_offset: Option<usize>,
+    data_size: Option<usize>,
+) -> Option<Vec<u8>> {
+    let cstr = normalize_shm_cstr(raw)?;
+    let fd = unsafe { libc::shm_open(cstr.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return None;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let stat_ok = unsafe { libc::fstat(fd, &mut st) } == 0;
+    let file_len = if stat_ok {
+        usize::try_from(st.st_size).ok()
+    } else {
+        None
+    };
+    let Some(file_len) = file_len.filter(|&n| n > 0 && n <= MAX_MEM_TERM_BYTES) else {
+        unsafe {
+            libc::close(fd);
+            libc::shm_unlink(cstr.as_ptr());
+        }
+        return None;
+    };
+    let offset = data_offset.unwrap_or(0);
+    if offset >= file_len {
+        unsafe {
+            libc::close(fd);
+            libc::shm_unlink(cstr.as_ptr());
+        }
+        return None;
+    }
+    let avail = file_len - offset;
+    let take_len = data_size.unwrap_or(avail).min(avail);
+    if take_len == 0 || take_len > MAX_MEM_TERM_BYTES {
+        unsafe {
+            libc::close(fd);
+            libc::shm_unlink(cstr.as_ptr());
+        }
+        return None;
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            file_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    let out = if ptr != libc::MAP_FAILED {
+        let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
+        let copied = mapped[offset..offset + take_len].to_vec();
+        unsafe {
+            libc::munmap(ptr, file_len);
+        }
+        Some(copied)
+    } else {
+        None
+    };
+    unsafe {
+        libc::close(fd);
+        libc::shm_unlink(cstr.as_ptr());
+    }
+    out
 }
 
 #[derive(Default)]
@@ -1760,9 +1913,11 @@ fn build_synthetic_apc(
     mem_id: u64,
     width: u32,
     height: u32,
+    force_quiet2: bool,
 ) -> Vec<u8> {
     let mut hdr = String::with_capacity(orig_header.len() + 32);
     let mut has_action = false;
+    let mut saw_quiet = false;
     if let Ok(s) = std::str::from_utf8(orig_header) {
         for part in s.split(',') {
             if part.is_empty() {
@@ -1796,9 +1951,23 @@ fn build_synthetic_apc(
                 if !hdr.is_empty() {
                     hdr.push(',');
                 }
-                hdr.push_str(part);
+                if k == "q" && force_quiet2 {
+                    saw_quiet = true;
+                    hdr.push_str("q=2");
+                } else {
+                    if k == "q" {
+                        saw_quiet = true;
+                    }
+                    hdr.push_str(part);
+                }
             }
         }
+    }
+    if force_quiet2 && !saw_quiet {
+        if !hdr.is_empty() {
+            hdr.push(',');
+        }
+        hdr.push_str("q=2");
     }
     if !has_action {
         if !hdr.is_empty() {
@@ -1841,25 +2010,27 @@ fn decode_chunk_payloads(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_ingest_kitty_image(
     hdr_bytes: &[u8],
     default_action: &str,
     format: Option<u32>,
     medium: Option<&str>,
+    compression: Option<&str>,
     hdr_width: Option<u32>,
     hdr_height: Option<u32>,
+    data_offset: Option<usize>,
+    data_size: Option<usize>,
+    force_quiet2: bool,
     payload_parts: &[Vec<u8>],
 ) -> Option<Vec<u8>> {
     let med = medium.unwrap_or("d");
     let mut unlink_after: Option<PathBuf> = None;
     let mut file_name = String::new();
-    let raw_bytes = match med {
+    let encoded_bytes = match med {
         "d" => {
             let bytes = decode_chunk_payloads(payload_parts)?;
-            if bytes.is_empty() || bytes.len() > MAX_MEM_TERM_BYTES {
-                return None;
-            }
-            bytes
+            slice_payload_range(bytes, data_offset, data_size)?
         }
         "f" | "t" => {
             let path_bytes = decode_chunk_payloads(payload_parts)?;
@@ -1877,9 +2048,6 @@ fn try_ingest_kitty_image(
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let bytes = std::fs::read(&canon).ok()?;
-            if bytes.is_empty() || bytes.len() > MAX_MEM_TERM_BYTES {
-                return None;
-            }
             if med == "t" && is_temp_path(&raw_path) && is_temp_path(&canon) {
                 if let Ok(meta) = std::fs::symlink_metadata(&raw_path) {
                     if !meta.file_type().is_symlink() && meta.is_file() {
@@ -1889,9 +2057,27 @@ fn try_ingest_kitty_image(
                     unlink_after = Some(canon);
                 }
             }
-            bytes
+            slice_payload_range(bytes, data_offset, data_size)?
+        }
+        #[cfg(unix)]
+        "s" => {
+            let name_bytes = decode_chunk_payloads(payload_parts)?;
+            let name_str = std::str::from_utf8(&name_bytes).ok()?;
+            read_and_unlink_shm(name_str, data_offset, data_size)?
         }
         _ => return None,
+    };
+
+    let raw_bytes = match compression {
+        None => encoded_bytes,
+        Some("z") => {
+            let decompressed = decompress_kitty_zlib(&encoded_bytes)?;
+            if decompressed.is_empty() || decompressed.len() > MAX_MEM_TERM_BYTES {
+                return None;
+            }
+            decompressed
+        }
+        Some(_) => return None,
     };
 
     let (mime, final_bytes, w, h) = match format {
@@ -1934,7 +2120,14 @@ fn try_ingest_kitty_image(
     if let Some(temp_path) = unlink_after {
         let _ = std::fs::remove_file(temp_path);
     }
-    Some(build_synthetic_apc(hdr_bytes, default_action, mem_id, w, h))
+    Some(build_synthetic_apc(
+        hdr_bytes,
+        default_action,
+        mem_id,
+        w,
+        h,
+        force_quiet2,
+    ))
 }
 
 impl ChannelApcStream {
@@ -2263,8 +2456,10 @@ impl ChannelApcStream {
         if let Some(mut active) = self.chunked.take() {
             let is_cont = hdr.action.is_none()
                 || (hdr.action == Some(active.action.as_str())
-                    && active.id.is_some()
-                    && hdr.id == active.id);
+                    && ((active.id.is_some() && hdr.id == active.id)
+                        || (active.id.is_none()
+                            && active.image_number.is_some()
+                            && hdr.image_number == active.image_number)));
             if is_cont {
                 if active.passthrough {
                     emit_raw(&mut res.out_bytes);
@@ -2299,15 +2494,26 @@ impl ChannelApcStream {
                     return;
                 }
 
+                let want_auto_reply =
+                    active.quiet == 0 && (active.id.is_some() || active.image_number.is_some());
                 if let Some(synthetic) = try_ingest_kitty_image(
                     &active.first_header,
                     &active.action,
                     active.format,
                     active.medium.as_deref(),
+                    active.compression.as_deref(),
                     active.width,
                     active.height,
+                    active.data_offset,
+                    active.data_size,
+                    want_auto_reply,
                     &active.payload_parts,
                 ) {
+                    if want_auto_reply {
+                        if let Some(reply) = format_kitty_reply(active.id, active.image_number, "OK") {
+                            res.auto_replies.push(reply);
+                        }
+                    }
                     res.out_bytes.extend_from_slice(&synthetic);
                 } else {
                     for chunk in active.raw_chunks {
@@ -2323,37 +2529,91 @@ impl ChannelApcStream {
             }
         }
 
-        // Probe unlink: `a=q` with `t=t`
-        if hdr.action == Some("q") && hdr.medium == Some("t") && !hdr.more {
-            if let Some(path_bytes) = base64_decode(payload_bytes) {
-                if let Ok(path_str) = std::str::from_utf8(&path_bytes) {
-                    let trimmed = path_str.trim_end_matches('\0').trim();
-                    if !trimmed.is_empty() {
-                        let raw_path = Path::new(trimmed);
-                        if is_temp_path(raw_path) {
-                            let unlinked = match std::fs::symlink_metadata(raw_path) {
+        // Instant Rust-side capability query responder (`a=q`): beats herdr-core's 100ms
+        // HC_IMAGE_ANSWER_MS deadline even on background/preattached sessions and cleans `t=t` / `t=s`.
+        if hdr.action == Some("q") && !hdr.more {
+            let fmt_ok = matches!(hdr.format, None | Some(24 | 32 | 100))
+                && matches!(hdr.compression, None | Some("z"));
+            let reply_status: Option<&'static str> = match hdr.medium {
+                None | Some("d") => {
+                    if fmt_ok && base64_decode(payload_bytes).is_some() {
+                        Some("OK")
+                    } else {
+                        Some("ENOTSUP:unsupported")
+                    }
+                }
+                Some("f") => {
+                    let ok = fmt_ok
+                        && base64_decode(payload_bytes)
+                            .and_then(|b| std::str::from_utf8(&b).ok().map(|s| s.trim_end_matches('\0').trim().to_string()))
+                            .is_some_and(|p| !p.is_empty() && validate_local_image_path(&p).is_ok());
+                    if ok {
+                        Some("OK")
+                    } else {
+                        Some("ENOENT:unable to open file")
+                    }
+                }
+                Some("t") => {
+                    let unlinked = base64_decode(payload_bytes)
+                        .and_then(|b| {
+                            std::str::from_utf8(&b)
+                                .ok()
+                                .map(|s| s.trim_end_matches('\0').trim().to_string())
+                        })
+                        .filter(|s| !s.is_empty())
+                        .is_some_and(|trimmed| {
+                            let raw_path = Path::new(&trimmed);
+                            if !is_temp_path(raw_path) {
+                                return false;
+                            }
+                            match std::fs::symlink_metadata(raw_path) {
                                 Ok(meta) if !meta.file_type().is_symlink() && meta.is_file() => {
                                     std::fs::remove_file(raw_path).is_ok()
                                 }
                                 Ok(_) => false,
                                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                                 Err(_) => false,
-                            };
-                            if unlinked {
-                                if hdr.quiet == 0 {
-                                    if let Some(id) = hdr.id {
-                                        res.auto_replies
-                                            .push(format!("\x1b_Gi={id};OK\x1b\\").into_bytes());
-                                    } else if let Some(num) = hdr.image_number {
-                                        res.auto_replies
-                                            .push(format!("\x1b_GI={num};OK\x1b\\").into_bytes());
-                                    }
-                                }
-                                return;
                             }
-                        }
+                        });
+                    if unlinked && fmt_ok {
+                        Some("OK")
+                    } else if !unlinked {
+                        None
+                    } else {
+                        Some("ENOTSUP:unsupported")
                     }
                 }
+                #[cfg(unix)]
+                Some("s") => {
+                    let ok = fmt_ok
+                        && base64_decode(payload_bytes)
+                            .and_then(|b| std::str::from_utf8(&b).ok().map(str::to_string))
+                            .is_some_and(|name| probe_and_unlink_shm(&name));
+                    if ok {
+                        Some("OK")
+                    } else if !fmt_ok {
+                        Some("ENOTSUP:unsupported")
+                    } else {
+                        Some("ENOENT:unable to open shm")
+                    }
+                }
+                #[cfg(not(unix))]
+                Some("s") => Some("ENOTSUP:unsupported"),
+                _ => Some("ENOTSUP:unsupported"),
+            };
+
+            if let Some(status) = reply_status {
+                let should_reply = if status == "OK" {
+                    hdr.quiet == 0
+                } else {
+                    hdr.quiet < 2
+                };
+                if should_reply {
+                    if let Some(reply) = format_kitty_reply(hdr.id, hdr.image_number, status) {
+                        res.auto_replies.push(reply);
+                    }
+                }
+                return;
             }
             emit_raw(&mut res.out_bytes);
             return;
@@ -2369,9 +2629,12 @@ impl ChannelApcStream {
             }
             Some(_) => false,
         };
+        #[cfg(unix)]
+        let eligible_medium = matches!(hdr.medium, None | Some("d") | Some("f") | Some("t") | Some("s"));
+        #[cfg(not(unix))]
         let eligible_medium = matches!(hdr.medium, None | Some("d") | Some("f") | Some("t"));
         let eligible_format = matches!(hdr.format, None | Some(100) | Some(32) | Some(24));
-        let eligible_comp = hdr.compression.is_none();
+        let eligible_comp = matches!(hdr.compression, None | Some("z"));
 
         if !is_upload_action || !eligible_medium || !eligible_format || !eligible_comp {
             emit_raw(&mut res.out_bytes);
@@ -2379,11 +2642,16 @@ impl ChannelApcStream {
                 self.chunked = Some(ActiveChunkUpload {
                     action: hdr.action.unwrap_or("t").to_string(),
                     id: hdr.id,
+                    image_number: hdr.image_number,
                     first_header: Vec::new(),
                     format: hdr.format,
                     medium: hdr.medium.map(str::to_string),
+                    compression: hdr.compression.map(str::to_string),
                     width: hdr.width,
                     height: hdr.height,
+                    data_size: hdr.data_size,
+                    data_offset: hdr.data_offset,
+                    quiet: hdr.quiet,
                     passthrough: true,
                     raw_chunks: Vec::new(),
                     payload_parts: Vec::new(),
@@ -2406,11 +2674,16 @@ impl ChannelApcStream {
                 self.chunked = Some(ActiveChunkUpload {
                     action: action_str.to_string(),
                     id: hdr.id,
+                    image_number: hdr.image_number,
                     first_header: Vec::new(),
                     format: hdr.format,
                     medium: hdr.medium.map(str::to_string),
+                    compression: hdr.compression.map(str::to_string),
                     width: hdr.width,
                     height: hdr.height,
+                    data_size: hdr.data_size,
+                    data_offset: hdr.data_offset,
+                    quiet: hdr.quiet,
                     passthrough: true,
                     raw_chunks: Vec::new(),
                     payload_parts: Vec::new(),
@@ -2426,11 +2699,16 @@ impl ChannelApcStream {
             self.chunked = Some(ActiveChunkUpload {
                 action: action_str.to_string(),
                 id: hdr.id,
+                image_number: hdr.image_number,
                 first_header: hdr_bytes.to_vec(),
                 format: hdr.format,
                 medium: hdr.medium.map(str::to_string),
+                compression: hdr.compression.map(str::to_string),
                 width: hdr.width,
                 height: hdr.height,
+                data_size: hdr.data_size,
+                data_offset: hdr.data_offset,
+                quiet: hdr.quiet,
                 passthrough: false,
                 raw_chunks: vec![raw],
                 payload_parts: vec![payload_bytes.to_vec()],
@@ -2439,16 +2717,27 @@ impl ChannelApcStream {
             return;
         }
 
+        let want_auto_reply =
+            hdr.quiet == 0 && (hdr.id.is_some() || hdr.image_number.is_some());
         let single_part = [payload_bytes.to_vec()];
         if let Some(synthetic) = try_ingest_kitty_image(
             hdr_bytes,
             action_str,
             hdr.format,
             hdr.medium,
+            hdr.compression,
             hdr.width,
             hdr.height,
+            hdr.data_offset,
+            hdr.data_size,
+            want_auto_reply,
             &single_part,
         ) {
+            if want_auto_reply {
+                if let Some(reply) = format_kitty_reply(hdr.id, hdr.image_number, "OK") {
+                    res.auto_replies.push(reply);
+                }
+            }
             res.out_bytes.extend_from_slice(&synthetic);
         } else {
             emit_raw(&mut res.out_bytes);
@@ -3057,5 +3346,114 @@ mod tests {
             "params": { "type": "doc", "terminal": "t1bf", "data": { "cols": 120, "rows": 40 } }
         });
         assert!(parse_size_event(&other_type).is_none());
+    }
+
+    #[test]
+    fn apc_stream_answers_direct_query_and_ingests_zlib_immediately() {
+        use super::{base64_encode, get_mem_image, ChannelApcStream};
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut parser = ChannelApcStream::default();
+
+        // Exact yazi probe under TERM_PROGRAM=herdr: must reply OK immediately in Rust
+        let probe = b"hdr\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\tail";
+        let pr = parser.push(probe);
+        assert_eq!(pr.out_bytes, b"hdrtail");
+        assert_eq!(pr.auto_replies, vec![b"\x1b_Gi=31;OK\x1b\\".to_vec()]);
+
+        // Valid o=z zlib-compressed f=32 RGBA image must decompress and store into pocket-mem:
+        let rgba = [12u8, 34, 56, 255, 78, 90, 123, 200];
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&rgba).unwrap();
+        let compressed = enc.finish().unwrap();
+        let z_b64 = base64_encode(&compressed);
+        let zr = parser.push(
+            format!("\x1b_Ga=T,o=z,f=32,s=2,v=1,i=88;{z_b64}\x1b\\").as_bytes(),
+        );
+        assert_eq!(zr.auto_replies, vec![b"\x1b_Gi=88;OK\x1b\\".to_vec()]);
+        let out_s = String::from_utf8(zr.out_bytes).unwrap();
+        assert!(out_s.contains("q=2"), "{out_s}");
+        assert!(out_s.contains("/2x1\x1b\\"), "{out_s}");
+        let mem_id: u64 = out_s
+            .split(";pocket-mem:")
+            .nth(1)
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (mime, cached) = get_mem_image(mem_id).unwrap();
+        assert_eq!(mime, "image/bmp");
+        assert_eq!(&cached[122..], &rgba);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apc_stream_supports_posix_shm_query_and_upload_without_leading_slash() {
+        use super::{base64_encode, get_mem_image, ChannelApcStream};
+
+        let raw_name = format!("hp_shm_{}", std::process::id());
+        let cname = std::ffi::CString::new(format!("/{raw_name}")).unwrap();
+        let rgba = [200u8, 100, 50, 255, 10, 20, 30, 128];
+
+        // Helper to create & populate POSIX shm object on macOS/Unix (unlink first if leftover).
+        let create_shm = |data: &[u8]| unsafe {
+            libc::shm_unlink(cname.as_ptr());
+            let fd = libc::shm_open(
+                cname.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR,
+                0o600 as libc::c_uint,
+            );
+            assert!(fd >= 0, "shm_open failed");
+            assert_eq!(libc::ftruncate(fd, data.len() as libc::off_t), 0);
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                data.len(),
+                libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+            libc::munmap(ptr, data.len());
+            libc::close(fd);
+        };
+
+        let mut parser = ChannelApcStream::default();
+        let name_b64 = base64_encode(raw_name.as_bytes());
+
+        // 1. a=q,t=s probe (without leading slash, matching kitten icat)
+        create_shm(&[0, 0, 0]);
+        let qr = parser.push(format!("\x1b_Gi=3,f=24,t=s,s=1,v=1,a=q;{name_b64}\x1b\\").as_bytes());
+        assert!(qr.out_bytes.is_empty());
+        assert_eq!(qr.auto_replies, vec![b"\x1b_Gi=3;OK\x1b\\".to_vec()]);
+        unsafe {
+            assert!(libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) < 0);
+        }
+
+        // 2. a=T,t=s image upload
+        create_shm(&rgba);
+        let ur = parser.push(
+            format!("\x1b_Ga=T,t=s,f=32,s=2,v=1,i=4,I=9;{name_b64}\x1b\\").as_bytes(),
+        );
+        assert_eq!(ur.auto_replies, vec![b"\x1b_Gi=4,I=9;OK\x1b\\".to_vec()]);
+        let out_s = String::from_utf8(ur.out_bytes).unwrap();
+        let mem_id: u64 = out_s
+            .split(";pocket-mem:")
+            .nth(1)
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(&get_mem_image(mem_id).unwrap().1[122..], &rgba);
+        unsafe {
+            assert!(libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) < 0);
+        }
     }
 }

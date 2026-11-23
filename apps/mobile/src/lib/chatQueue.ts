@@ -205,8 +205,9 @@ export const useMobileQueue = create<MobileQueueState>()(
 );
 
 const inFlight = new Set<string>();
-const dispatchState = new Map<string, { lastDispatchedAt: number; sawWorking: boolean }>();
+const dispatchState = new Map<string, { lastDispatchedAt: number; sawWorking: boolean; idleSince?: number }>();
 let watcherInstalled = false;
+const IDLE_DEBOUNCE_MS = 600;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -298,6 +299,7 @@ export function popMobileQueuedPromptForEdit(agentKey: string, id: string): Mobi
   return useMobileQueue.getState().pop(agentKey, id);
 }
 
+/** Non-destructive soft steer ("插队发送") from the mobile queue shelf. */
 export async function steerMobileQueuedPromptNow(agent: Agent, id: string): Promise<SendResult> {
   const store = useMobileQueue.getState();
   if (store.steering[agent.key] || inFlight.has(agent.key)) {
@@ -305,9 +307,21 @@ export async function steerMobileQueuedPromptNow(agent: Agent, id: string): Prom
   }
   const popped = store.pop(agent.key, id);
   if (!popped) return { ok: false, message: "这条排队消息已不存在" };
+  return softSteerSend(agent, popped.text, popped.pictures);
+}
+
+/** Explicit interrupt-and-send ("打断当前轮并发送") from the mobile queue shelf. */
+export async function interruptAndSendMobileQueuedPrompt(agent: Agent, id: string): Promise<SendResult> {
+  const store = useMobileQueue.getState();
+  if (store.steering[agent.key] || inFlight.has(agent.key)) {
+    return { ok: false, message: "正在操作，请稍候" };
+  }
+  const popped = store.pop(agent.key, id);
+  if (!popped) return { ok: false, message: "这条排队消息已不存在" };
   return interruptAndSend(agent, popped.text, popped.pictures);
 }
 
+/** Non-destructive soft steer from the mobile composer. */
 export async function steerMobileComposerNow(
   agent: Agent,
   rawText: string,
@@ -318,7 +332,20 @@ export async function steerMobileComposerNow(
   if (useMobileQueue.getState().steering[agent.key] || inFlight.has(agent.key)) {
     return { ok: false, message: "正在插队发送，请稍候" };
   }
-  return interruptAndSend(agent, clean, pictures);
+  return softSteerSend(agent, clean, pictures);
+}
+
+async function softSteerSend(agent: Agent, text: string, pictures: Attachment[]): Promise<SendResult> {
+  const store = useMobileQueue.getState();
+  dispatchState.delete(agent.key);
+  inFlight.add(agent.key);
+  store.setSteering(agent.key, true);
+  try {
+    return await sendOut(agent, text, pictures, "steer");
+  } finally {
+    inFlight.delete(agent.key);
+    store.setSteering(agent.key, false);
+  }
 }
 
 async function interruptAndSend(agent: Agent, text: string, pictures: Attachment[]): Promise<SendResult> {
@@ -331,7 +358,7 @@ async function interruptAndSend(agent: Agent, text: string, pictures: Attachment
       await call(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => undefined);
       await sleep(STEER_SETTLE_MS);
     }
-    return await sendOut(agent, text, pictures);
+    return await sendOut(agent, text, pictures, "auto");
   } finally {
     inFlight.delete(agent.key);
     store.setSteering(agent.key, false);
@@ -354,11 +381,18 @@ function runDrainTick(): void {
     }
     if (a.status === "working") {
       track.sawWorking = true;
+      track.idleSince = undefined;
     } else if (track.sawWorking && (a.status === "done" || a.status === "idle")) {
-      track.lastDispatchedAt = 0;
-      track.sawWorking = false;
+      if (!track.idleSince) track.idleSince = now;
+      if (now - track.idleSince >= IDLE_DEBOUNCE_MS) {
+        track.lastDispatchedAt = 0;
+        track.sawWorking = false;
+        track.idleSince = undefined;
+      }
     } else if (!hasQueue) {
       dispatchState.delete(key);
+    } else {
+      track.idleSince = undefined;
     }
   }
 
@@ -369,6 +403,7 @@ function runDrainTick(): void {
     if (!online || inFlight.has(key) || qState.steering[key]) continue;
     if (agent.status !== "idle" && agent.status !== "done") continue;
     const track = dispatchState.get(key);
+    if (track?.idleSince && now - track.idleSince < IDLE_DEBOUNCE_MS) continue;
     if (now - (track?.lastDispatchedAt ?? 0) < DRAIN_COOLDOWN_MS) continue;
 
     useMobileQueue.getState().clearPendingSwitch(key);
@@ -391,6 +426,7 @@ function runDrainTick(): void {
     if (!online || inFlight.has(key) || nextQueueState.steering[key]) continue;
     if (agent.status !== "idle" && agent.status !== "done") continue;
     const track = dispatchState.get(key);
+    if (track?.idleSince && now - track.idleSince < IDLE_DEBOUNCE_MS) continue;
     if (now - (track?.lastDispatchedAt ?? 0) < DRAIN_COOLDOWN_MS) continue;
 
     const next = nextQueueState.shiftNext(key);

@@ -1,4 +1,5 @@
 import {
+  LATEST_MANIFEST_URL,
   LATEST_SUMS_URL,
   RELEASE_REPO,
   SOURCE_PROBE_SLACK_MS,
@@ -8,8 +9,10 @@ import {
   decideRegion,
   localTimeZone,
   orderWithPreferredSource,
+  parseReleaseManifest,
   pickLowestLatency,
   releaseFromSums,
+  resolveChannelFromManifest,
   resolvePreferredSource,
   sourceLabel,
   sourcePrefixes,
@@ -19,10 +22,13 @@ import {
   type Region,
   type RegionDecision,
   type RegionSetting,
+  type ReleaseChannelId,
+  type ReleaseManifest,
   type SourceCache,
   type SourceProbe,
 } from "@herdr-pocket/protocol";
 import { desktopSessionStore, type DesktopSessionStore } from "./sessionStore";
+import { logger } from "./log";
 
 declare const __POCKET_TARGET__: "desktop" | "harmony";
 declare const __APP_VERSION__: string;
@@ -450,6 +456,24 @@ async function detectMacArch(): Promise<"arm64" | "x64"> {
   return typeof navigator !== "undefined" && /intel|x86_64/i.test(navigator.userAgent) ? "x64" : "arm64";
 }
 
+export function desktopReleaseChannel(
+  platform: PlatformKind = detectPlatform(),
+  macArch: "arm64" | "x64" = "arm64",
+): ReleaseChannelId {
+  switch (platform) {
+    case "openharmony":
+      return "harmonyos-arm64";
+    case "macos":
+      return macArch === "x64" ? "macos-x64" : "macos-arm64";
+    case "windows":
+      return "windows-x64-setup";
+    case "linux":
+      return "linux-x64-appimage";
+    default:
+      return "bundle";
+  }
+}
+
 export function platformAssetNameHint(version: string): string {
   const platform = detectPlatform();
   const macArch: "arm64" | "x64" =
@@ -614,24 +638,61 @@ async function fetchListing(url: string, signal: AbortSignal, timeoutMs: number)
   });
 }
 
+interface ParsedReleaseSource {
+  manifest?: ReleaseManifest;
+  version: string;
+  sums: Record<string, string>;
+}
+
+function parseManifestOrSums(text: string): ParsedReleaseSource | null {
+  const manifest = parseReleaseManifest(text);
+  if (manifest) {
+    const sums: Record<string, string> = {};
+    for (const entry of Object.values(manifest.channels)) {
+      if (entry) sums[entry.fileName] = entry.sha256;
+    }
+    return { manifest, version: manifest.releaseVersion, sums };
+  }
+  return releaseFromSums(text);
+}
+
 async function fetchSums(
   url: string,
   signal: AbortSignal,
   timeoutMs = SOURCE_PROBE_TIMEOUT_MS,
-): Promise<{ version: string; sums: Record<string, string> }> {
+): Promise<ParsedReleaseSource> {
   // A mirror that answers with an error page is not an answer.
-  const parsed = releaseFromSums(await fetchListing(url, signal, timeoutMs));
-  if (!parsed) throw new Error("not a SHA256SUMS listing");
+  const parsed = parseManifestOrSums(await fetchListing(url, signal, timeoutMs));
+  if (!parsed) throw new Error("not a release manifest or SHA256SUMS listing");
   return parsed;
+}
+
+async function fetchManifestOrSumsFromSource(
+  source: string,
+  signal: AbortSignal,
+  timeoutMs = SOURCE_PROBE_TIMEOUT_MS,
+): Promise<ParsedReleaseSource> {
+  try {
+    return await fetchSums(sourceUrl(source, LATEST_MANIFEST_URL), signal, timeoutMs);
+  } catch (err) {
+    if (signal.aborted) throw err;
+    return await fetchSums(sourceUrl(source, LATEST_SUMS_URL), signal, timeoutMs);
+  }
 }
 
 /** Every source at once; once one answers the others get the slack, then pickLowestLatency decides. */
 async function raceSums(
   order: string[],
-  pathUrl = LATEST_SUMS_URL,
-): Promise<{ winner?: string; version?: string; sums?: Record<string, string>; probes: SourceProbe[] }> {
+  pathUrl?: string,
+): Promise<{
+  winner?: string;
+  version?: string;
+  sums?: Record<string, string>;
+  manifest?: ReleaseManifest;
+  probes: SourceProbe[];
+}> {
   const probes: SourceProbe[] = [];
-  const results = new Map<string, { version: string; sums: Record<string, string> }>();
+  const results = new Map<string, ParsedReleaseSource>();
   const ctls = order.map(() => new AbortController());
   return new Promise((resolve) => {
     let done = false;
@@ -645,14 +706,17 @@ async function raceSums(
       for (const s of order) if (!probes.some((p) => p.source === s)) probes.push({ source: s, ok: false, ms: Date.now() - t0, error: "slower than the winner" });
       const winner = pickLowestLatency(probes, order);
       const picked = winner === undefined ? undefined : results.get(winner);
-      resolve({ winner, version: picked?.version, sums: picked?.sums, probes });
+      resolve({ winner, version: picked?.version, sums: picked?.sums, manifest: picked?.manifest, probes });
     };
     if (!order.length) return finish();
     order.forEach((source, i) => {
       const ctl = ctls[i]!;
       const timer = setTimeout(() => ctl.abort(), SOURCE_PROBE_TIMEOUT_MS);
       const started = Date.now();
-      fetchSums(sourceUrl(source, pathUrl), ctl.signal).then(
+      const req = pathUrl
+        ? fetchSums(sourceUrl(source, pathUrl), ctl.signal)
+        : fetchManifestOrSumsFromSource(source, ctl.signal);
+      req.then(
         (r) => {
           clearTimeout(timer);
           if (done) return;
@@ -793,6 +857,7 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
   let source: string | undefined;
   let version: string | undefined;
   let sumsMap: Record<string, string> | undefined;
+  let manifest: ReleaseManifest | undefined;
   let probes: SourceProbe[] | undefined;
 
   if (explicitSource !== undefined) {
@@ -800,9 +865,10 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
     const t = setTimeout(() => ctl.abort(), SOURCE_PROBE_TIMEOUT_MS);
     const started = Date.now();
     try {
-      const hit = await fetchSums(sourceUrl(explicitSource, LATEST_SUMS_URL), ctl.signal, SOURCE_PROBE_TIMEOUT_MS);
+      const hit = await fetchManifestOrSumsFromSource(explicitSource, ctl.signal, SOURCE_PROBE_TIMEOUT_MS);
       version = hit.version;
       sumsMap = hit.sums;
+      manifest = hit.manifest;
       source = explicitSource;
       probes = [{ source: explicitSource, ok: true, ms: Date.now() - started }];
     } catch (e) {
@@ -823,9 +889,10 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 2500);
     try {
-      const hit = await fetchSums(sourceUrl(cached, LATEST_SUMS_URL), ctl.signal, 2500);
+      const hit = await fetchManifestOrSumsFromSource(cached, ctl.signal, 2500);
       version = hit.version;
       sumsMap = hit.sums;
+      manifest = hit.manifest;
       source = cached;
     } catch (e) {
       nativeLog("info", "update", "remembered source failed, racing again", {
@@ -848,13 +915,22 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
       source = race.winner;
       version = race.version;
       sumsMap = race.sums;
+      manifest = race.manifest;
       if (explicitSource === undefined) {
         await writeSourceCache({ region: decision.region, winner: source, at: Date.now(), probes });
       }
     }
   }
 
+  const current = appVersion();
+  const platform = detectPlatform();
+  const macArch = platform === "macos" ? await detectMacArch() : "arm64";
+  const channel = desktopReleaseChannel(platform, macArch);
+
   const gh = await ghPromise;
+  const ghExpectedAsset = gh ? platformDownloadAsset(gh.version, platform, macArch) : "";
+  const ghHasPlatformAsset = Boolean(gh && gh.assets.some((a) => a.name === ghExpectedAsset));
+
   if (version === undefined) {
     if (gh) {
       version = gh.version;
@@ -863,11 +939,17 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
       nativeLog("warn", "update", "no release source answered", { region: decision.region, sources: base.length });
       throw new Error("检查更新失败，GitHub 与镜像线路均未响应，请检查网络连接");
     }
-  } else if (gh && compareVersions(gh.version, version) > 0) {
-    // GitHub API has a newer release than a CDN mirror's cached /releases/latest redirect.
+  } else if (gh && ghHasPlatformAsset && compareVersions(gh.version, version) > 0) {
+    // GitHub API has a newer release that actually ships this platform's installer.
     version = gh.version;
     sumsMap = undefined;
+    manifest = undefined;
   }
+
+  const chEntry = manifest ? resolveChannelFromManifest(manifest, channel) : null;
+  const resolvedVersion = manifest ? (chEntry?.version ?? current) : version;
+  const assetName = chEntry?.fileName ?? platformDownloadAsset(resolvedVersion, platform, macArch);
+  const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${resolvedVersion}/${assetName}`;
 
   const winner = source ?? "";
   nativeLog("info", "update", "release source chosen", {
@@ -875,33 +957,31 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
     reason: decision.reason,
     source: sourceLabel(winner),
     remembered: probes === undefined,
-    latest: version,
+    latest: resolvedVersion,
+    channel,
   });
 
-  const current = appVersion();
-  const platform = detectPlatform();
-  const macArch = platform === "macos" ? await detectMacArch() : "arm64";
-  const assetName = platformDownloadAsset(version, platform, macArch);
-  const rawUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${version}/${assetName}`;
   const orderedSources =
     explicitSource !== undefined && winner !== explicitSource
       ? withWinnerFirst(base, winner)
       : orderWithPreferredSource(base, preferredSource, winner);
   const downloadUrls = Array.from(new Set(orderedSources.map((s) => sourceUrl(s, rawUrl))));
 
-  const ghMatch = gh && compareVersions(gh.version, version) === 0 ? gh : null;
+  const ghMatch = gh && compareVersions(gh.version, resolvedVersion) === 0 ? gh : null;
   const ghAsset = ghMatch?.assets.find((a) => a.name === assetName);
-  const sha256 = sumsMap?.[assetName] ?? ghAsset?.sha256;
-  const assetSize = ghAsset?.size || undefined;
+  const sha256 = chEntry?.sha256 ?? sumsMap?.[assetName] ?? ghAsset?.sha256;
+  const assetSize = chEntry?.size || ghAsset?.size || undefined;
+  const assetConfirmed = manifest ? Boolean(chEntry) : sumsMap ? Boolean(sumsMap[assetName]) : Boolean(ghAsset);
+  const hasUpdate = assetConfirmed && compareVersions(resolvedVersion, current) > 0;
   const notes: ReleaseNotesInfo | null = ghMatch?.body
-    ? { body: ghMatch.body, url: ghMatch.htmlUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${version}`, publishedAt: ghMatch.publishedAt }
+    ? { body: ghMatch.body, url: ghMatch.htmlUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${resolvedVersion}`, publishedAt: ghMatch.publishedAt }
     : null;
 
   return {
     current,
-    latest: version,
-    hasUpdate: compareVersions(version, current) > 0,
-    pageUrl: ghMatch?.htmlUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${version}`,
+    latest: resolvedVersion,
+    hasUpdate,
+    pageUrl: ghMatch?.htmlUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${resolvedVersion}`,
     downloadUrl: sourceUrl(winner, rawUrl),
     assetName,
     downloadUrls,
@@ -1291,18 +1371,50 @@ let errorLoggingInstalled = false;
 
 /** Sends uncaught errors and unhandled rejections to the desktop log (redacted there). Call once at startup. */
 export function installErrorLogging(): void {
-  if (errorLoggingInstalled || !isTauri() || typeof window === "undefined") return;
+  if (errorLoggingInstalled || typeof window === "undefined") return;
   errorLoggingInstalled = true;
-  let budget = 50;
-  const send = (msg: string, data: Record<string, unknown>) => {
-    if (budget-- <= 0) return;
-    nativeLog("error", "app.js", msg.slice(0, 500), data);
+  let windowStart = Date.now();
+  let windowCount = 0;
+  let lastSig = "";
+  const send = (kind: string, msg: string, data: Record<string, unknown>) => {
+    const now = Date.now();
+    if (now - windowStart > 60_000) {
+      windowStart = now;
+      windowCount = 0;
+    }
+    const sig = `${kind}:${msg}`;
+    if (sig === lastSig && windowCount > 3) return;
+    if (++windowCount > 30) return;
+    lastSig = sig;
+    logger.error(kind, msg.slice(0, 500), data);
   };
-  window.addEventListener("error", (e) => {
-    send(e.message || "script error", { source: e.filename ? e.filename.replace(/^.*\/(?=[^/]+$)/, "") : undefined, line: e.lineno, col: e.colno });
-  });
+  window.addEventListener(
+    "error",
+    (e) => {
+      const target = e.target as HTMLElement | null;
+      if (e instanceof ErrorEvent || !target || target === (window as unknown as EventTarget)) {
+        send("app.js", e.message || "script error", {
+          source: e.filename ? e.filename.replace(/^.*\/(?=[^/]+$)/, "") : undefined,
+          line: e.lineno,
+          col: e.colno,
+          stack: e.error instanceof Error ? e.error.stack : undefined,
+        });
+      } else {
+        const tag = target.tagName?.toLowerCase() || "element";
+        const src = (target as HTMLImageElement | HTMLScriptElement).src || "";
+        send("app.resource", `failed to load <${tag}>`, {
+          tag,
+          src: src.slice(0, 180),
+        });
+      }
+    },
+    true,
+  );
   window.addEventListener("unhandledrejection", (e) => {
-    const r = e.reason as { message?: string; name?: string } | string | undefined;
-    send(typeof r === "string" ? r : r?.message || "unhandled rejection", { name: typeof r === "object" ? r?.name : undefined });
+    const r = e.reason as { message?: string; name?: string; stack?: string } | string | undefined;
+    send("app.js", typeof r === "string" ? r : r?.message || "unhandled rejection", {
+      name: typeof r === "object" ? r?.name : undefined,
+      stack: typeof r === "object" ? r?.stack : undefined,
+    });
   });
 }

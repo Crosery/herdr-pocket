@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HcAdapter, endsInPanel, isViewerSubscreen } from "../src/hc.ts";
+import { HcAdapter, detectDismissableSubscreen, endsInPanel, isInteractiveApprovalOrQuestion, isViewerSubscreen } from "../src/hc.ts";
 
 /** These fakes are shell scripts: Windows can't run them (CI there runs the rest). */
 const SH = { skip: process.platform === "win32" && "shell-script fakes" };
@@ -190,6 +190,7 @@ test("HcAdapter.send closes /swarm board (idle & working, multi-level) via Esc w
   const bin = join(dir, "hc");
   const statePath = join(dir, "screens.json");
   const keysLog = join(dir, "keys.log");
+  const rawInputLog = join(dir, "raw.log");
   const pasteLog = join(dir, "paste.log");
 
   const boardFooter = "tab switch pane · enter hide message · space expand · p filter · f follow · z zoom · esc back";
@@ -202,6 +203,8 @@ test("HcAdapter.send closes /swarm board (idle & working, multi-level) via Esc w
     ],
     // 1 level open while idle: board -> prompt
     "t-idle-board": [`Swarm board\nagent 1\n${boardFooter}`, "❯ "],
+    // Ignores raw DATA Esc so `hc keys` fallback closes it.
+    "t-fallback": [`Swarm board\nagent 2\n${boardFooter}`, "❯ "],
     // Stuck viewer (>3 Esc attempts)
     "t-stuck": [`Swarm board\nstuck\n${boardFooter}`],
     // Normal working screen (must NOT send Esc)
@@ -213,6 +216,7 @@ test("HcAdapter.send closes /swarm board (idle & working, multi-level) via Esc w
   };
   writeFileSync(statePath, JSON.stringify(initialState));
   writeFileSync(keysLog, "");
+  writeFileSync(rawInputLog, "");
   writeFileSync(pasteLog, "");
 
   writeFileSync(
@@ -267,7 +271,20 @@ if (args[0] === "connect") {
           }
         }
       } else if (kind === 0) {
-        appendFileSync(${JSON.stringify(pasteLog)}, JSON.stringify({ terminal: chToAddr.get(ch), data: p.toString("utf8") }) + "\\n");
+        const addr = chToAddr.get(ch);
+        const raw = p.toString("utf8");
+        if (raw === "\\x1b" || raw === "q" || raw === "\\x0f") {
+          appendFileSync(${JSON.stringify(rawInputLog)}, JSON.stringify([addr, raw]) + "\\n");
+          if (addr !== "t-fallback") {
+            const st = JSON.parse(readFileSync(stateFile, "utf8"));
+            if (Array.isArray(st[addr]) && st[addr].length > 1) {
+              st[addr].shift();
+              writeFileSync(stateFile, JSON.stringify(st));
+            }
+          }
+        } else {
+          appendFileSync(${JSON.stringify(pasteLog)}, JSON.stringify({ terminal: addr, data: raw }) + "\\n");
+        }
       }
     }
   });
@@ -279,6 +296,7 @@ if (args[0] === "connect") {
   const hc = new HcAdapter(bin);
   hc.terminals.set("t-work-board", { address: "t-work-board", status: { app: "omp", state: "working" } });
   hc.terminals.set("t-idle-board", { address: "t-idle-board", status: { app: "omp", state: "idle" } });
+  hc.terminals.set("t-fallback", { address: "t-fallback", status: { app: "omp", state: "idle" } });
   hc.terminals.set("t-stuck", { address: "t-stuck", status: { app: "omp", state: "working" } });
   hc.terminals.set("t-working-ok", { address: "t-working-ok", status: { app: "claude-code", state: "working" } });
   hc.terminals.set("t-blocked", { address: "t-blocked", status: { app: "claude-code", state: "blocked", msg: "Allow?" } });
@@ -287,6 +305,7 @@ if (args[0] === "connect") {
   try {
     await hc.send("t-work-board", "继续重构", true);
     await hc.send("t-idle-board", "看看进度", true);
+    await hc.send("t-fallback", "备选按键", true);
     await hc.send("t-working-ok", "补充测试", true);
     await hc.send("t-blocked", "允许执行", true);
     await hc.send("t-shell", "ls -la", true);
@@ -297,15 +316,27 @@ if (args[0] === "connect") {
     );
 
     await wait(50);
+    const rawCalls = readFileSync(rawInputLog, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as string[]);
+    assert.deepEqual(rawCalls, [
+      ["t-work-board", "\x1b"],
+      ["t-work-board", "\x1b"],
+      ["t-idle-board", "\x1b"],
+      ["t-fallback", "\x1b"],
+      ["t-stuck", "\x1b"],
+      ["t-stuck", "\x1b"],
+      ["t-stuck", "\x1b"],
+    ]);
     const keyCalls = readFileSync(keysLog, "utf8")
       .trim()
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l) as string[]);
     assert.deepEqual(keyCalls, [
-      ["t-work-board", "esc"],
-      ["t-work-board", "esc"],
-      ["t-idle-board", "esc"],
+      ["t-fallback", "esc"],
       ["t-stuck", "esc"],
       ["t-stuck", "esc"],
       ["t-stuck", "esc"],
@@ -319,6 +350,7 @@ if (args[0] === "connect") {
     assert.deepEqual(Object.fromEntries(pastedByTerminal), {
       "t-work-board": "\x1b[200~继续重构\x1b[201~\r",
       "t-idle-board": "\x1b[200~看看进度\x1b[201~\r",
+      "t-fallback": "\x1b[200~备选按键\x1b[201~\r",
       "t-working-ok": "\x1b[200~补充测试\x1b[201~\r",
       "t-blocked": "\x1b[200~允许执行\x1b[201~\r",
       "t-shell": "\x1b[200~ls -la\x1b[201~\r",
@@ -362,4 +394,89 @@ if (args[1] === "t-fail") {
   } finally {
     hc.stop();
   }
+});
+
+test("detectDismissableSubscreen enforces Hard Veto, handles working (esc to cancel) safely, and detects pagers/transcripts/status tabs", () => {
+  // Normal working turn with (esc to cancel) must NEVER be auto-dismissed.
+  assert.equal(endsInPanel("⠋ Working on task (esc to cancel)\n❯ "), false);
+  assert.equal(
+    detectDismissableSubscreen({
+      screen: "⠋ Thinking… (12s • esc to cancel)\n❯ ",
+      status: "working",
+    }),
+    null,
+  );
+  assert.equal(
+    detectDismissableSubscreen({
+      screen: "正在生成回复 (按 esc 取消)\n❯ ",
+      status: "working",
+    }),
+    null,
+  );
+
+  // Hard Veto: approval/permission/question prompts never dismiss even when status reads idle or blocked.
+  assert.equal(isInteractiveApprovalOrQuestion("Do you want to proceed?\n1. Yes\n2. No\nEsc to cancel"), true);
+  assert.equal(
+    detectDismissableSubscreen({
+      screen: "Allow tool execution?\n1. Yes, allow once\n2. No\nEsc to cancel",
+      status: "idle",
+    }),
+    null,
+  );
+  assert.equal(
+    detectDismissableSubscreen({
+      screen: "Press a number to choose\n1. Option A\nEsc to cancel",
+      status: "idle",
+    }),
+    null,
+  );
+  assert.equal(
+    detectDismissableSubscreen({
+      screen: "Settings Status Config\nEsc to close",
+      status: "blocked",
+      statusKind: "permission",
+    }),
+    null,
+  );
+
+  // Tabbed /status or /usage viewer closes via Esc even if agent status is working.
+  assert.deepEqual(
+    detectDismissableSubscreen({
+      screen: "   Settings  Status  Config\n   Model: opus\n   Esc to cancel",
+      status: "working",
+    }),
+    { kind: "viewer", dismissKey: "\x1b", dismissAlias: "esc", reason: "viewer" },
+  );
+
+  // OS pager (less/man) closes via 'q'.
+  assert.deepEqual(
+    detectDismissableSubscreen({
+      screen: "NAME\n  git-status - Show the working tree status\n(END)",
+      altScreen: true,
+      status: "idle",
+      fgName: "less",
+    }),
+    { kind: "pager", dismissKey: "q", dismissAlias: "q", reason: "pager" },
+  );
+
+  // Claude Code detailed transcript viewer closes via Ctrl+O (\x0f).
+  assert.deepEqual(
+    detectDismissableSubscreen({
+      screen: "Showing detailed transcript\n• Tool call output...\nctrl+o to collapse",
+      status: "idle",
+    }),
+    { kind: "viewer", dismissKey: "\x0f", dismissAlias: "ctrl+o", reason: "transcript" },
+  );
+
+  // HcAdapter.toAgent exposes structured statusKind only when blocked.
+  const perm = HcAdapter.toAgent(
+    { address: "t1", status: { app: "claude-code", state: "blocked", kind: "permission", msg: "Allow Bash?" } },
+    "d1",
+  );
+  assert.equal(perm.statusKind, "permission");
+  const idleWithKind = HcAdapter.toAgent(
+    { address: "t2", status: { app: "claude-code", state: "idle", kind: "permission" } },
+    "d1",
+  );
+  assert.equal(idleWithKind.statusKind, undefined);
 });

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DIRECT_SOURCE } from "@herdr-pocket/protocol";
-import { checkReleaseUpdate, probeUpdateSources, readCachedSourceProbes } from "../src/lib/bridge.ts";
+import {
+  DIRECT_SOURCE,
+  buildReleaseManifest,
+  channelFromAssetName,
+} from "@herdr-pocket/protocol";
+import { appVersion, checkReleaseUpdate, desktopReleaseChannel, probeUpdateSources, readCachedSourceProbes } from "../src/lib/bridge.ts";
 import { clientConfigStore } from "../src/lib/config.ts";
 import {
   dismissUpdatePrompt,
@@ -178,6 +182,39 @@ test("checkReleaseUpdate honors explicit preferredSource and falls back cleanly 
     });
     assert.equal(tried[0]?.startsWith("https://github.com/"), true, "direct must be tried first");
     assert.equal(directFallback.source, "gh-proxy.com", "fallback mirror takes over when direct fails");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("checkReleaseUpdate reads per-channel RELEASE-MANIFEST.json and ignores unrelated mobile-only bumps", async () => {
+  const desktopAsset = `herdr-pocket-0.2.23-macos-${typeof process !== "undefined" && process.arch === "x64" ? "x64" : "arm64"}.dmg`;
+  const channel = channelFromAssetName(desktopAsset)?.channel ?? desktopReleaseChannel();
+  const manifest = buildReleaseManifest({
+    releaseVersion: "99.0.0",
+    sums: {
+      "herdr-pocket-99.0.0-android-arm64.apk": "a".repeat(64),
+      [`herdr-pocket-${appVersion()}-${channel === "macos-x64" ? "macos-x64.dmg" : channel === "macos-arm64" ? "macos-arm64.dmg" : "linux-x64.AppImage"}`]:
+        "b".repeat(64),
+    },
+  });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL) => {
+    const url = String(input);
+    if (url.endsWith("RELEASE-MANIFEST.json")) {
+      return new Response(JSON.stringify(manifest), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const info = await checkReleaseUpdate({
+      region: "global",
+      preferredSource: "direct",
+      mirrors: [],
+    });
+    assert.equal(info.latest, appVersion());
+    assert.equal(info.hasUpdate, false, "mobile-only 99.0.0 release must NOT trigger desktop update");
   } finally {
     globalThis.fetch = realFetch;
   }

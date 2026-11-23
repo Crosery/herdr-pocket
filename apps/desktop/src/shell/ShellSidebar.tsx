@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, ChevronRight, Columns2, History, Laptop, PanelLeft, Pencil, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Terminal, Trash2 } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
@@ -17,6 +17,7 @@ import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, tileLetter, t
 import { pullHostDocNow } from "./herdrDocSync";
 import { activeTabIdForSpace, closeTabsForSpace, focusedLeafOfTab, openAgentTab, openSettingsFrame, renameSpaceInShellStore, setPalette, setSelectedSpace, shellStore, splitActivePaneWithContent, tabLeaves } from "./shellStore";
 import { shortcutText } from "./shortcuts";
+import { SpatialHint } from "./useModifierHoldHints";
 import { buildHostSpaces, spaceColorVars, type SidebarSpace } from "./spaceSync";
 
 const FOLD_KEY = "herdr-pocket-v3-folded";
@@ -249,15 +250,51 @@ export function ShellSidebar({
   const inScope = agents;
   const primaryMachineId = localHostId || machines[0]?.id || null;
 
+  const [hoverFreeze, setHoverFreeze] = useState(false);
+  const frozenOrderRef = useRef<Map<string, string[]>>(new Map());
+
   const groups = useMemo(() => {
-    if (sort === "recent") return [{ key: "recent" as const, title: "最近", list: [...inScope].sort((x, y) => lastChange(y) - lastChange(x)) }];
-    const by = new Map<ListGroup, Agent[]>();
-    for (const a of inScope) {
-      const g = listGroup(a, devices);
-      by.set(g, [...(by.get(g) ?? []), a]);
+    const raw =
+      sort === "recent"
+        ? [{ key: "recent" as const, title: "最近", list: [...inScope].sort((x, y) => lastChange(y) - lastChange(x)) }]
+        : (() => {
+            const by = new Map<ListGroup, Agent[]>();
+            for (const a of inScope) {
+              const g = listGroup(a, devices);
+              by.set(g, [...(by.get(g) ?? []), a]);
+            }
+            return LIST_GROUPS.filter((g) => by.get(g.key)?.length).map((g) => ({
+              key: g.key,
+              title: g.title,
+              list: by.get(g.key)!.sort((x, y) => lastChange(y) - lastChange(x)),
+            }));
+          })();
+
+    if (!hoverFreeze) {
+      const nextMap = new Map<string, string[]>();
+      for (const g of raw) {
+        nextMap.set(g.key, g.list.map((a) => a.key));
+      }
+      frozenOrderRef.current = nextMap;
+      return raw;
     }
-    return LIST_GROUPS.filter((g) => by.get(g.key)?.length).map((g) => ({ key: g.key, title: g.title, list: by.get(g.key)!.sort((x, y) => lastChange(y) - lastChange(x)) }));
-  }, [devices, inScope, sort]);
+
+    return raw.map((g) => {
+      const frozen = frozenOrderRef.current.get(g.key);
+      if (!frozen?.length) return g;
+      const rank = new Map<string, number>();
+      frozen.forEach((k, idx) => rank.set(k, idx));
+      const sorted = [...g.list].sort((x, y) => {
+        const rx = rank.get(x.key);
+        const ry = rank.get(y.key);
+        if (rx !== undefined && ry !== undefined) return rx - ry;
+        if (rx !== undefined) return -1;
+        if (ry !== undefined) return 1;
+        return lastChange(y) - lastChange(x);
+      });
+      return { ...g, list: sorted };
+    });
+  }, [devices, hoverFreeze, inScope, sort]);
 
   const focusedContent = activeTab ? focusedLeafOfTab(activeTab).content : null;
   const activeAgentKey = focusedContent?.kind === "agent" ? focusedContent.agentKey : null;
@@ -339,13 +376,15 @@ export function ShellSidebar({
           </div>
         )}
         {collapsed && canToggle ? null : (
-          <button className="v3-icon-btn" aria-label="跳到 Agent 或标签" title={`跳到 Agent 或标签（${shortcutText("palette")}）`} onClick={() => setPalette("jump")}>
+          <button className="v3-icon-btn has-hint" aria-label="跳到 Agent 或标签" title={`跳到 Agent 或标签（${shortcutText("jumpAgent")}）`} onClick={() => setPalette("jump")}>
             <Search size={15} />
+            <SpatialHint text={shortcutText("jumpAgent")} corner="tr" />
           </button>
         )}
         {canToggle ? (
-          <button className="v3-icon-btn" aria-label={collapsed ? "展开侧栏" : "收起侧栏"} title={`${collapsed ? "展开" : "收起"}侧栏（${shortcutText("toggleSidebar")}）`} onClick={onToggle}>
+          <button className="v3-icon-btn has-hint" aria-label={collapsed ? "展开侧栏" : "收起侧栏"} title={`${collapsed ? "展开" : "收起"}侧栏（${shortcutText("toggleSidebar")}）`} onClick={onToggle}>
             <PanelLeft size={15} />
+            <SpatialHint text={shortcutText("toggleSidebar")} corner="tr" />
           </button>
         ) : null}
       </div>
@@ -355,8 +394,9 @@ export function ShellSidebar({
           {collapsed ? null : (
             <div className="v3-block-head">
               <span className="grow">空间</span>
-              <button className="v3-icon-btn small" aria-label="新建空间" title="新建空间…" onClick={() => onNewSpace(null)}>
+              <button className="v3-icon-btn small has-hint" aria-label="新建空间" title={`新建空间（${shortcutText("newSpace")}）`} onClick={() => onNewSpace(null)}>
                 <Plus size={14} />
+                <SpatialHint text={shortcutText("newSpace")} corner="tr" />
               </button>
             </div>
           )}
@@ -485,7 +525,12 @@ export function ShellSidebar({
           </div>
         </section>
 
-        <section className="v3-block" aria-label="Agent">
+        <section
+          className="v3-block"
+          aria-label="Agent"
+          onPointerEnter={() => setHoverFreeze(true)}
+          onPointerLeave={() => setHoverFreeze(false)}
+        >
           {collapsed ? null : (
             <div className="v3-block-head">
               <span className="grow">Agent</span>
@@ -528,10 +573,11 @@ export function ShellSidebar({
       </div>
 
       <div className="v3-footer">
-        <button className="v3-foot-row" title={collapsed ? "设置" : undefined} onClick={() => openSettingsFrame(updateReady ? "updates" : "look")}>
+        <button className="v3-foot-row has-hint" title={collapsed ? "设置" : `设置（${shortcutText("settings")}）`} onClick={() => openSettingsFrame(updateReady ? "updates" : "look")}>
           <Settings size={14} />
           {collapsed ? null : <span className="grow truncate">设置</span>}
           {updateReady ? <span className="v3-update-dot" aria-label="有新版本" /> : null}
+          {!collapsed ? <SpatialHint text={shortcutText("settings")} corner="right" /> : null}
         </button>
         <button
           className="v3-foot-row"

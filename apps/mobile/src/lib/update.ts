@@ -15,6 +15,7 @@ import { Linking, Platform } from "react-native";
 import Constants from "expo-constants";
 import { create } from "zustand";
 import {
+  LATEST_MANIFEST_URL,
   LATEST_SUMS_URL,
   RELEASE_REPO,
   RELEASES_PAGE,
@@ -22,9 +23,11 @@ import {
   apkAssetName,
   compareVersions,
   inMainlandChina,
+  parseReleaseManifest,
   releaseAssetUrl,
   releaseFromSums,
   releaseSources,
+  resolveChannelFromManifest,
 } from "@herdr-pocket/protocol";
 import { PocketNative } from "../../modules/pocket-native";
 import { isMockServer } from "./mock";
@@ -75,7 +78,7 @@ function shortNotes(body: unknown): string {
     .slice(0, 280);
 }
 
-type Latest = { kind: "release"; release: ReleaseInfo } | { kind: "none" } | { kind: "unknown"; why: "offline" | "limited" };
+type Latest = { kind: "release"; release: ReleaseInfo } | { kind: "none" } | { kind: "unknown"; why: "offline" | "limited" | "missing" };
 
 /** `fetch` that gives up after `ms`. */
 async function fetchWithin(url: string, ms: number, init: RequestInit = {}): Promise<Response> {
@@ -88,7 +91,36 @@ async function fetchWithin(url: string, ms: number, init: RequestInit = {}): Pro
   }
 }
 
-/** The latest release from its SHA256SUMS (no notes, no size): works through a mirror. */
+/** Resolves Android channel release from `RELEASE-MANIFEST.json` (carries forward APK version across desktop-only releases). */
+async function fetchFromManifest(url: string): Promise<Latest> {
+  let res: Response;
+  try {
+    res = await fetchWithin(url, 10_000);
+  } catch {
+    return { kind: "unknown", why: "offline" };
+  }
+  if (!res.ok) {
+    return { kind: "unknown", why: res.status === 404 ? "missing" : res.status === 403 || res.status === 429 ? "limited" : "offline" };
+  }
+  const manifest = parseReleaseManifest(await res.text().catch(() => ""));
+  if (!manifest) return { kind: "unknown", why: "missing" };
+  const entry = resolveChannelFromManifest(manifest, "android-arm64");
+  if (!entry) return { kind: "none" };
+  return {
+    kind: "release",
+    release: {
+      version: entry.version,
+      url: releaseAssetUrl(entry.version, entry.fileName),
+      fileName: entry.fileName,
+      size: entry.size ?? 0,
+      sha256: entry.sha256,
+      page: `https://github.com/${RELEASE_REPO}/releases/tag/${entry.tag}`,
+      notes: "",
+    },
+  };
+}
+
+/** Fallback for older releases without `RELEASE-MANIFEST.json`: parses `SHA256SUMS`. */
 async function fetchFromSums(url: string): Promise<Latest> {
   let res: Response;
   try {
@@ -96,42 +128,59 @@ async function fetchFromSums(url: string): Promise<Latest> {
   } catch {
     return { kind: "unknown", why: "offline" };
   }
-  if (!res.ok) return { kind: "unknown", why: res.status === 404 ? "offline" : res.status === 403 || res.status === 429 ? "limited" : "offline" };
+  if (!res.ok) return { kind: "unknown", why: res.status === 404 ? "missing" : res.status === 403 || res.status === 429 ? "limited" : "offline" };
   const found = releaseFromSums(await res.text().catch(() => ""));
   if (!found) return { kind: "unknown", why: "offline" };
-  const fileName = apkAssetName(found.version);
-  const sha256 = found.sums[fileName];
+  const exact = apkAssetName(found.version);
+  const matchedEntry = found.sums[exact]
+    ? { fileName: exact, version: found.version, sha256: found.sums[exact]! }
+    : Object.entries(found.sums)
+        .map(([fileName, sha256]) => {
+          const m = /^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-android-arm64\.apk$/.exec(fileName);
+          return m?.[1] ? { fileName, version: m[1], sha256 } : null;
+        })
+        .find((x): x is { fileName: string; version: string; sha256: string } => Boolean(x));
+  if (!matchedEntry) return { kind: "unknown", why: "missing" };
   return {
     kind: "release",
     release: {
-      version: found.version,
-      url: sha256 ? releaseAssetUrl(found.version, fileName) : "",
-      fileName,
+      version: matchedEntry.version,
+      url: releaseAssetUrl(matchedEntry.version, matchedEntry.fileName),
+      fileName: matchedEntry.fileName,
       size: 0,
-      sha256,
-      page: `https://github.com/${RELEASE_REPO}/releases/tag/v${found.version}`,
+      sha256: matchedEntry.sha256,
+      page: `https://github.com/${RELEASE_REPO}/releases/tag/v${matchedEntry.version}`,
       notes: "",
     },
   };
 }
 
-/** Sources in order until one answers; mirrors race concurrently in mainland China. */
+async function raceMirrorCalls(fns: Array<() => Promise<Latest>>): Promise<Latest | null> {
+  if (!fns.length) return null;
+  try {
+    return await Promise.any(
+      fns.map(async (fn) => {
+        const r = await fn();
+        if (r.kind === "unknown") throw new Error(r.why);
+        return r;
+      }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Sources in order until one answers; mirrors race `RELEASE-MANIFEST.json` first, then `SHA256SUMS` / GitHub API. */
 async function fetchLatest(): Promise<Latest> {
   const china = inMainlandChina();
+  const manifests = releaseSources(LATEST_MANIFEST_URL, china).map((u) => () => fetchFromManifest(u));
   const sums = releaseSources(LATEST_SUMS_URL, china).map((u) => () => fetchFromSums(u));
-  if (china && sums.length > 1) {
-    try {
-      return await Promise.any(
-        sums.slice(0, -1).map(async (fn) => {
-          const r = await fn();
-          if (r.kind === "unknown") throw new Error(r.why);
-          return r;
-        }),
-      );
-    } catch {
-      // Fall through to GitHub API and direct download.
-    }
-    const rest = [fetchFromApi, sums[sums.length - 1]!];
+  if (china && manifests.length > 1) {
+    const mHit = await raceMirrorCalls(manifests.slice(0, -1));
+    if (mHit) return mHit;
+    const sHit = await raceMirrorCalls(sums.slice(0, -1));
+    if (sHit) return sHit;
+    const rest = [fetchFromApi, manifests[manifests.length - 1]!, sums[sums.length - 1]!];
     let last: Latest = { kind: "unknown", why: "offline" };
     for (const attempt of rest) {
       last = await attempt();
@@ -139,7 +188,7 @@ async function fetchLatest(): Promise<Latest> {
     }
     return last;
   }
-  const tries = [fetchFromApi, ...sums];
+  const tries = [...manifests, fetchFromApi, ...sums];
   let last: Latest = { kind: "unknown", why: "offline" };
   for (const attempt of tries) {
     last = await attempt();
@@ -148,11 +197,11 @@ async function fetchLatest(): Promise<Latest> {
   return last;
 }
 
-/** The GitHub API: release notes and sizes, but rate-limited and slow from mainland China. */
+/** The GitHub API: scans recent non-draft releases to find the newest release that ships an Android APK. */
 async function fetchFromApi(): Promise<Latest> {
   let res: Response;
   try {
-    res = await fetchWithin(`https://api.github.com/repos/${RELEASE_REPO}/releases/latest`, 12_000, {
+    res = await fetchWithin(`https://api.github.com/repos/${RELEASE_REPO}/releases?per_page=8`, 12_000, {
       headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
     });
   } catch {
@@ -160,29 +209,41 @@ async function fetchFromApi(): Promise<Latest> {
   }
   if (res.status === 404) return { kind: "none" };
   if (!res.ok) return { kind: "unknown", why: res.status === 403 || res.status === 429 ? "limited" : "offline" };
-  const json = (await res.json().catch(() => null)) as {
+  const list = (await res.json().catch(() => null)) as Array<{
+    draft?: boolean;
+    prerelease?: boolean;
     tag_name?: string;
     html_url?: string;
     body?: string;
     assets?: { name?: string; browser_download_url?: string; size?: number; digest?: string | null }[];
-  } | null;
-  const version = json?.tag_name?.trim().replace(/^v/i, "");
-  if (!version) return { kind: "unknown", why: "offline" };
-  const assets = json?.assets ?? [];
-  const want = apkAssetName(version);
-  const apk = assets.find((a) => a.name === want) ?? assets.find((a) => a.name && /^herdr-pocket-.+-android-arm64\.apk$/.test(a.name));
-  return {
-    kind: "release",
-    release: {
-      version,
-      url: apk?.browser_download_url ?? "",
-      fileName: apk?.name ?? want,
-      size: apk?.size ?? 0,
-      sha256: /^sha256:([0-9a-f]{64})$/i.exec(apk?.digest ?? "")?.[1]?.toLowerCase(),
-      page: json?.html_url ?? RELEASES_PAGE,
-      notes: shortNotes(json?.body),
-    },
-  };
+  }> | null;
+  if (!Array.isArray(list)) return { kind: "unknown", why: "offline" };
+  for (const json of list) {
+    if (json.draft || json.prerelease) continue;
+    const tagVersion = json.tag_name?.trim().replace(/^v/i, "") ?? "";
+    const assets = json.assets ?? [];
+    const want = tagVersion ? apkAssetName(tagVersion) : "";
+    const apk =
+      (want ? assets.find((a) => a.name === want && a.browser_download_url) : undefined) ??
+      assets.find((a) => a.name && /^herdr-pocket-.+-android-arm64\.apk$/.test(a.name) && a.browser_download_url);
+    if (!apk?.browser_download_url) continue;
+    const verMatch = apk.name ? /^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-android-arm64\.apk$/.exec(apk.name) : null;
+    const version = verMatch?.[1] || tagVersion;
+    if (!version) continue;
+    return {
+      kind: "release",
+      release: {
+        version,
+        url: apk.browser_download_url,
+        fileName: apk.name ?? apkAssetName(version),
+        size: apk.size ?? 0,
+        sha256: /^sha256:([0-9a-f]{64})$/i.exec(apk.digest ?? "")?.[1]?.toLowerCase(),
+        page: json.html_url ?? RELEASES_PAGE,
+        notes: shortNotes(json.body),
+      },
+    };
+  }
+  return { kind: "none" };
 }
 
 /**
@@ -214,15 +275,14 @@ export async function checkForUpdate(manual = false): Promise<void> {
     return;
   }
   const release = latest.kind === "release" ? latest.release : null;
-  const newer = !!release && compareVersions(release.version, currentVersion()) > 0;
+  const newer = Boolean(release?.url) && compareVersions(release!.version, currentVersion()) > 0;
   useSettings.getState().set({
     updateCheckedAt: Date.now(),
     updateRelease: newer ? release : null,
     // Found by hand in Settings: the person is already looking at it, so no extra prompt.
     ...(manual && newer && release?.url ? { updatePrompted: release.version } : {}),
   });
-  const waiting = newer && !release?.url;
-  syncPhase(manual && waiting ? `v${release?.version} 已发布，安卓安装包还没传上来` : null);
+  syncPhase(null);
 }
 
 /** Phase from what is known, keeping a download that is under way. */

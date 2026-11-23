@@ -91,6 +91,12 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
   const insets = useSafeAreaInsets();
   const headerHeight = useHeaderHeight();
   const [tab, setTab] = useState<Tab>(initialTab ?? (agent.isShell ? "terminal" : "chat"));
+  const [chatVisited, setChatVisited] = useState(tab === "chat");
+  const [termVisited, setTermVisited] = useState(tab === "terminal");
+  useEffect(() => {
+    if (tab === "chat") setChatVisited(true);
+    else if (tab === "terminal") setTermVisited(true);
+  }, [tab]);
   const subs = agent.subagents ?? 0;
 
   // Opening a finished agent is looking at it: herdr stops counting it as "已完成", on the desktop too.
@@ -148,8 +154,16 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
           <PocketSegmented value={tab} onChange={setTab} segments={buttons} compact={subs > 0} />
         </View>
         <View style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-          {tab === "chat" ? <ChatView agent={agent} active bottomInset={0} childCount={subs} /> : null}
-          {tab === "terminal" ? <TerminalView agent={agent} active /> : null}
+          {chatVisited ? (
+            <View style={{ flex: 1, display: tab === "chat" ? "flex" : "none" }}>
+              <ChatView agent={agent} active={tab === "chat"} bottomInset={0} childCount={subs} onSwitchToTerminal={() => setTab("terminal")} />
+            </View>
+          ) : null}
+          {termVisited ? (
+            <View style={{ flex: 1, display: tab === "terminal" ? "flex" : "none" }}>
+              <TerminalView agent={agent} active={tab === "terminal"} />
+            </View>
+          ) : null}
           {tab === "subs" ? <SubagentList agent={agent} trail={[]} active bottomInset={insets.bottom} /> : null}
           {tab === "info" ? <InfoView agent={agent} bottomInset={0} /> : null}
         </View>

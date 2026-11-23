@@ -22,6 +22,7 @@ export interface OutgoingSend extends OutgoingSendLike {
   agentKey: string;
   deviceId: string;
   attachments: StagedAttachment[];
+  uploadedPaths?: string[];
   attachedNames: string[];
   error?: string;
 }
@@ -45,14 +46,26 @@ export interface PendingModelSwitch {
   createdAt: number;
 }
 
+export interface CapturedCommandEntry {
+  id: string;
+  agentKey: string;
+  command: string;
+  output: string;
+  isError: boolean;
+  panelState: "none" | "closed" | "interactive_open";
+  ts: number;
+}
+
 interface ChatQueueState {
   queuedByAgent: Record<string, QueuedPrompt[]>;
   outgoingByAgent: Record<string, OutgoingSend[]>;
   pendingSwitchByAgent: Record<string, PendingModelSwitch>;
+  capturedByAgent: Record<string, CapturedCommandEntry[]>;
 }
 
 const EMPTY_QUEUED: QueuedPrompt[] = [];
 const EMPTY_OUTGOING: OutgoingSend[] = [];
+const EMPTY_CAPTURED: CapturedCommandEntry[] = [];
 const DRAIN_COOLDOWN_MS = 3500;
 const STEER_SETTLE_MS = 180;
 const INTERRUPTED_SEND_ERROR = "应用重启前发送中断，点击可重试";
@@ -64,6 +77,7 @@ export const chatQueueStore = createStore<ChatQueueState>({
   queuedByAgent: {},
   outgoingByAgent: {},
   pendingSwitchByAgent: {},
+  capturedByAgent: {},
 });
 
 interface SerializedQueuedPrompt {
@@ -81,6 +95,7 @@ interface SerializedOutgoingSend {
   deviceId: string;
   text: string;
   attachments: SerializedAttachment[];
+  uploadedPaths?: string[];
   attachedCount: number;
   attachedNames: string[];
   ts: number;
@@ -126,7 +141,7 @@ function serializeChatQueue(): SerializedChatQueueState | undefined {
   }
   const outgoingByAgent: Record<string, SerializedOutgoingSend[]> = {};
   for (const [key, list] of Object.entries(state.outgoingByAgent)) {
-    const keep = list.filter((item) => item.state !== "sent");
+    const keep = list.filter((item) => item.state !== "sent" && item.state !== "queued_terminal");
     if (!keep.length) continue;
     outgoingByAgent[key] = keep.map((item) => ({
       ...item,
@@ -184,9 +199,12 @@ function hydrateChatQueue(raw: unknown): void {
         if (!entry || typeof entry !== "object") continue;
         const r = entry as Record<string, unknown>;
         if (typeof r.id !== "string" || typeof r.deviceId !== "string" || typeof r.text !== "string") continue;
-        if (r.state === "sent") continue;
+        if (r.state === "sent" || r.state === "queued_terminal") continue;
         bumpIdSeq(r.id);
         const attachments = parseSerializedAttachments(r.attachments);
+        const uploadedPaths = Array.isArray(r.uploadedPaths)
+          ? r.uploadedPaths.filter((p): p is string => typeof p === "string" && p.length > 0)
+          : undefined;
         const wasSending = r.state === "sending";
         const attachedNames = Array.isArray(r.attachedNames)
           ? r.attachedNames.filter((n): n is string => typeof n === "string")
@@ -197,6 +215,7 @@ function hydrateChatQueue(raw: unknown): void {
           deviceId: r.deviceId,
           text: r.text,
           attachments,
+          ...(uploadedPaths?.length ? { uploadedPaths } : {}),
           attachedCount: typeof r.attachedCount === "number" ? r.attachedCount : attachments.length,
           attachedNames,
           ts: typeof r.ts === "number" ? r.ts : Date.now(),
@@ -248,7 +267,7 @@ function hydrateChatQueue(raw: unknown): void {
     pendingSwitchByAgent[k] = sw;
   }
 
-  chatQueueStore.set({ queuedByAgent, outgoingByAgent, pendingSwitchByAgent });
+  chatQueueStore.set({ queuedByAgent, outgoingByAgent, pendingSwitchByAgent, capturedByAgent: current.capturedByAgent });
 }
 
 registerWorkspaceSection("chatQueue", {
@@ -270,7 +289,38 @@ export function resetChatQueueForTest(): void {
   }
   inFlightAgents.clear();
   dispatchState.clear();
-  chatQueueStore.set({ queuedByAgent: {}, outgoingByAgent: {}, pendingSwitchByAgent: {} });
+  chatQueueStore.set({ queuedByAgent: {}, outgoingByAgent: {}, pendingSwitchByAgent: {}, capturedByAgent: {} });
+}
+
+export function dismissCapturedCommand(agentKey: string, id: string): void {
+  chatQueueStore.set((state) => {
+    const cur = state.capturedByAgent[agentKey];
+    if (!cur?.some((c) => c.id === id)) return state;
+    const nextList = cur.filter((c) => c.id !== id);
+    const nextMap = { ...state.capturedByAgent };
+    if (nextList.length) nextMap[agentKey] = nextList;
+    else delete nextMap[agentKey];
+    return { ...state, capturedByAgent: nextMap };
+  });
+}
+
+export async function closeInteractiveCommandPanel(
+  agent: Pick<Agent, "key" | "deviceId">,
+  captureId?: string,
+): Promise<void> {
+  await rpcCall(agent.deviceId, "terminal.keys", { agent: agent.key, keys: ["esc"] }).catch(() => {});
+  if (!captureId) return;
+  chatQueueStore.set((state) => {
+    const cur = state.capturedByAgent[agent.key];
+    if (!cur?.some((c) => c.id === captureId)) return state;
+    return {
+      ...state,
+      capturedByAgent: {
+        ...state.capturedByAgent,
+        [agent.key]: cur.map((c) => (c.id === captureId ? { ...c, panelState: "closed" as const } : c)),
+      },
+    };
+  });
 }
 
 function updateOutgoing(
@@ -309,10 +359,13 @@ function updateQueued(
   if (changed) scheduleWorkspacePersist();
 }
 
-async function deliverOutgoing(send: OutgoingSend): Promise<boolean> {
+async function deliverOutgoing(send: OutgoingSend, delivery: "auto" | "steer" = "auto"): Promise<boolean> {
   try {
     let body = send.text;
-    if (send.attachments.length > 0) {
+    let uploadedPaths = send.uploadedPaths;
+    if (uploadedPaths?.length) {
+      body = textWithFiles(send.text, uploadedPaths);
+    } else if (send.attachments.length > 0) {
       const toUpload = send.attachments.filter((s) => !s.hostRef && s.put);
       const uploaded = toUpload.length
         ? await rpcCall(
@@ -331,16 +384,58 @@ async function deliverOutgoing(send: OutgoingSend): Promise<boolean> {
           paths.push(uploaded.paths[uploadIdx++]!);
         }
       }
+      uploadedPaths = paths;
       body = textWithFiles(send.text, paths);
     }
-    await rpcCall(send.deviceId, "terminal.send", {
+    const sendRes = await rpcCall(send.deviceId, "terminal.send", {
       agent: send.agentKey,
       text: body,
       enter: true,
+      ...(delivery === "steer" ? { delivery: "steer" } : {}),
     });
-    for (const a of send.attachments) revokeAttachment(a);
+    const cap = sendRes?.commandCapture;
+    if (cap && (cap.output || cap.panelState === "interactive_open")) {
+      for (const a of send.attachments) revokeAttachment(a);
+      const capEntry: CapturedCommandEntry = {
+        id: nextId("cap"),
+        agentKey: send.agentKey,
+        command: cap.command || send.text.trim(),
+        output: cap.output ?? "",
+        isError: Boolean(cap.isError),
+        panelState: cap.panelState ?? "none",
+        ts: Date.now(),
+      };
+      chatQueueStore.set((state) => {
+        const nextOutgoingList = (state.outgoingByAgent[send.agentKey] ?? EMPTY_OUTGOING).filter((x) => x.id !== send.id);
+        const nextOutgoingMap = { ...state.outgoingByAgent };
+        if (nextOutgoingList.length) nextOutgoingMap[send.agentKey] = nextOutgoingList;
+        else delete nextOutgoingMap[send.agentKey];
+        const prevCaps = state.capturedByAgent[send.agentKey] ?? EMPTY_CAPTURED;
+        return {
+          ...state,
+          outgoingByAgent: nextOutgoingMap,
+          capturedByAgent: {
+            ...state.capturedByAgent,
+            [send.agentKey]: [...prevCaps, capEntry].slice(-12),
+          },
+        };
+      });
+      scheduleWorkspacePersist();
+      return true;
+    }
+    // Keep attachment thumbnails/paths alive on the optimistic bubble until Uniflo echoes or prunes it.
+    const nextState: OutgoingSend["state"] = sendRes?.waiting ? "queued_terminal" : "sent";
     updateOutgoing(send.agentKey, (list) =>
-      list.map((x) => (x.id === send.id ? { ...x, state: "sent", attachments: [], error: undefined } : x)),
+      list.map((x) =>
+        x.id === send.id
+          ? {
+              ...x,
+              state: nextState,
+              ...(uploadedPaths?.length ? { uploadedPaths } : {}),
+              error: undefined,
+            }
+          : x,
+      ),
     );
     return true;
   } catch (e) {
@@ -356,6 +451,7 @@ export async function sendPromptNow(
   agent: Pick<Agent, "key" | "deviceId">,
   rawText: string,
   attachments: StagedAttachment[],
+  delivery: "auto" | "steer" = "auto",
 ): Promise<boolean> {
   const clean = rawText.trim();
   if (!clean && attachments.length === 0) return false;
@@ -371,7 +467,7 @@ export async function sendPromptNow(
     state: "sending",
   };
   updateOutgoing(agent.key, (list) => [...list, entry]);
-  return deliverOutgoing(entry);
+  return deliverOutgoing(entry, delivery);
 }
 
 export async function retryFailedSend(sendId: string, agentKey: string): Promise<boolean> {
@@ -455,7 +551,25 @@ function waitMs(ms: number): Promise<void> {
   });
 }
 
+/** Non-destructive soft steer ("插队发送"): submits without killing the active turn. */
 export async function steerQueuedPromptNow(
+  agent: Pick<Agent, "key" | "deviceId" | "status">,
+  id: string,
+): Promise<void> {
+  if (inFlightAgents.has(agent.key)) return;
+  const popped = popQueuedPromptForEdit(agent.key, id);
+  if (!popped) return;
+  dispatchState.delete(agent.key);
+  inFlightAgents.add(agent.key);
+  try {
+    await sendPromptNow(agent, popped.text, popped.attachments, "steer");
+  } finally {
+    inFlightAgents.delete(agent.key);
+  }
+}
+
+/** Explicit destructive interrupt-and-send ("打断当前轮并发送"). */
+export async function interruptAndSendQueuedPrompt(
   agent: Pick<Agent, "key" | "deviceId" | "status">,
   id: string,
 ): Promise<void> {
@@ -469,12 +583,13 @@ export async function steerQueuedPromptNow(
       await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
       await waitMs(STEER_SETTLE_MS);
     }
-    await sendPromptNow(agent, popped.text, popped.attachments);
+    await sendPromptNow(agent, popped.text, popped.attachments, "auto");
   } finally {
     inFlightAgents.delete(agent.key);
   }
 }
 
+/** Non-destructive soft steer from the composer ("插队发送"): submits without interrupting the running turn. */
 export async function steerComposerNow(
   agent: Pick<Agent, "key" | "deviceId" | "status">,
   rawText: string,
@@ -486,11 +601,7 @@ export async function steerComposerNow(
   dispatchState.delete(agent.key);
   inFlightAgents.add(agent.key);
   try {
-    if (agent.status === "working") {
-      await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
-      await waitMs(STEER_SETTLE_MS);
-    }
-    await sendPromptNow(agent, clean, attachments);
+    await sendPromptNow(agent, clean, attachments, "steer");
   } finally {
     inFlightAgents.delete(agent.key);
   }
@@ -573,8 +684,9 @@ async function deliverPendingModelSwitch(sw: PendingModelSwitch): Promise<void> 
   }
 }
 
+const IDLE_DEBOUNCE_MS = 600;
 const inFlightAgents = new Set<string>();
-const dispatchState = new Map<string, { lastDispatchedAt: number; sawWorking: boolean }>();
+const dispatchState = new Map<string, { lastDispatchedAt: number; sawWorking: boolean; idleSince?: number }>();
 let watcherInstalled = false;
 
 function runQueueDrainTick(): void {
@@ -593,11 +705,19 @@ function runQueueDrainTick(): void {
     }
     if (agent.status === "working") {
       track.sawWorking = true;
+      track.idleSince = undefined;
     } else if (track.sawWorking && (agent.status === "done" || agent.status === "idle")) {
-      track.lastDispatchedAt = 0;
-      track.sawWorking = false;
+      // Require continuous idle/done >= 600ms so a 1-frame tool flicker never prematurely drains the queue.
+      if (!track.idleSince) track.idleSince = now;
+      if (now - track.idleSince >= IDLE_DEBOUNCE_MS) {
+        track.lastDispatchedAt = 0;
+        track.sawWorking = false;
+        track.idleSince = undefined;
+      }
     } else if (!hasQueue) {
       dispatchState.delete(key);
+    } else {
+      track.idleSince = undefined;
     }
   }
 
@@ -606,6 +726,7 @@ function runQueueDrainTick(): void {
     if (!agent) continue;
     const online = Boolean(live.devices[agent.deviceId]?.online);
     const track = dispatchState.get(key);
+    if (track?.idleSince && now - track.idleSince < IDLE_DEBOUNCE_MS) continue;
     if (!shouldAutoDrainQueue(agent.status, online, track?.lastDispatchedAt ?? 0, inFlightAgents.has(key), now)) {
       continue;
     }
@@ -627,6 +748,7 @@ function runQueueDrainTick(): void {
     if (!agent) continue;
     const online = Boolean(live.devices[agent.deviceId]?.online);
     const track = dispatchState.get(key);
+    if (track?.idleSince && now - track.idleSince < IDLE_DEBOUNCE_MS) continue;
     if (!shouldAutoDrainQueue(agent.status, online, track?.lastDispatchedAt ?? 0, inFlightAgents.has(key), now)) {
       continue;
     }
@@ -651,6 +773,7 @@ export function useAgentChatQueue(agentKey: string): {
   queued: QueuedPrompt[];
   outgoing: OutgoingSend[];
   pendingSwitch: PendingModelSwitch | null;
+  captured: CapturedCommandEntry[];
 } {
   useEffect(() => {
     ensureChatQueueWatcher();
@@ -658,5 +781,6 @@ export function useAgentChatQueue(agentKey: string): {
   const queued = chatQueueStore.use((s) => s.queuedByAgent[agentKey] ?? EMPTY_QUEUED);
   const outgoing = chatQueueStore.use((s) => s.outgoingByAgent[agentKey] ?? EMPTY_OUTGOING);
   const pendingSwitch = chatQueueStore.use((s) => s.pendingSwitchByAgent[agentKey] ?? null);
-  return { queued, outgoing, pendingSwitch };
+  const captured = chatQueueStore.use((s) => s.capturedByAgent[agentKey] ?? EMPTY_CAPTURED);
+  return { queued, outgoing, pendingSwitch, captured };
 }

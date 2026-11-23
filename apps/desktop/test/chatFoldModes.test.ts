@@ -16,23 +16,23 @@ const sampleEvents: ConvEvent[] = [
   { id: "a1", session: "s", ts: 10, kind: "assistant_message", text: "全部完成。" },
 ];
 
-test("foldConvEvents standard mode separates thinking blocks and groups consecutive tools", () => {
+test("foldConvEvents standard mode progressively folds contiguous thinking and tool calls in chronological order", () => {
   const rows = foldConvEvents(sampleEvents, "standard");
   assert.deepEqual(
     rows.map((r) => r.kind),
-    ["user", "thinking", "activity_group", "thinking", "tool", "assistant"],
+    ["user", "activity_group", "assistant"],
   );
-  const firstThought = rows[1];
-  assert.equal(firstThought?.kind, "thinking");
-  if (firstThought?.kind === "thinking") {
-    assert.equal(firstThought.defaultOpen, false);
-  }
-  const grp = rows[2];
+  const grp = rows[1];
   assert.equal(grp?.kind, "activity_group");
   if (grp?.kind === "activity_group") {
-    assert.equal(grp.tools.length, 2);
-    assert.equal(grp.thoughts.length, 0);
+    assert.equal(grp.tools.length, 3);
+    assert.equal(grp.thoughts.length, 2);
+    assert.deepEqual(
+      grp.entries.map((e) => e.kind),
+      ["thinking", "tool", "tool", "thinking", "tool"],
+    );
     assert.equal(grp.defaultOpen, undefined);
+    assert.equal(grp.hasFollowingAssistant, true);
   }
 });
 
@@ -46,6 +46,10 @@ test("foldConvEvents compact mode folds thoughts and tools into a single activit
   if (grp?.kind === "activity_group") {
     assert.equal(grp.tools.length, 3);
     assert.equal(grp.thoughts.length, 2);
+    assert.deepEqual(
+      grp.entries.map((e) => e.kind),
+      ["thinking", "tool", "tool", "thinking", "tool"],
+    );
   }
 });
 

@@ -4,6 +4,7 @@ import {
   Bot,
   Check,
   ChevronRight,
+  Copy,
   Cpu,
   FileEdit,
   FileText,
@@ -11,14 +12,17 @@ import {
   Globe,
   Image as ImageIcon,
   Info,
+  ListChecks,
   MessageSquareMore,
   PanelRightOpen,
   Paperclip,
   Search,
   Terminal,
   Wrench,
+  X,
 } from "lucide-react";
 import type { SubSession } from "@herdr-pocket/protocol";
+import { copyToClipboard } from "../lib/bridge";
 import { extractImageTargets } from "../lib/chatImages";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { native } from "../lib/native";
@@ -26,6 +30,7 @@ import { RichMarkdown } from "../lib/markdown";
 import { looksLikeClickableFilePath } from "../lib/openFileTarget";
 import { prettyMaybeJson, type ChatRow, type ToolCategory, type ToolStep } from "../lib/chatFold";
 import { rpcCall } from "../lib/relay";
+import { PocketCheckbox } from "./PocketUI";
 import { subLabel } from "./SubagentNav";
 import "../styles/chat-tools.css";
 
@@ -149,7 +154,7 @@ const ChatInlineImageThumb = memo(function ChatInlineImageThumb({
   );
 });
 
-function InlineImageStrip({
+export function InlineImageStrip({
   targets,
   agentKey,
   deviceId,
@@ -309,6 +314,101 @@ const ThinkingRowItem = memo(function ThinkingRowItem({
 });
 
 /** Single paired tool call + result row; lazily parses & mounts JSON/output only when clicked open. */
+interface EditDiffLine {
+  kind: "del" | "add";
+  text: string;
+}
+
+function extractInlineEditDiff(step: ToolStep): EditDiffLine[] {
+  const n = step.name.trim().toLowerCase();
+  if (!/^(edit|edit_file|multiedit|replace_file_content|multi_replace_file_content)$/.test(n)) return [];
+  const inp = step.input as Record<string, unknown> | undefined;
+  if (!inp || typeof inp !== "object") return [];
+  const out: EditDiffLine[] = [];
+  const pushPair = (oldStr: unknown, newStr: unknown) => {
+    if (typeof oldStr === "string" && oldStr) {
+      for (const line of oldStr.split("\n").slice(0, 6)) {
+        out.push({ kind: "del", text: line });
+      }
+    }
+    if (typeof newStr === "string" && newStr) {
+      for (const line of newStr.split("\n").slice(0, 6)) {
+        out.push({ kind: "add", text: line });
+      }
+    }
+  };
+  if (typeof inp.old_string === "string" || typeof inp.new_string === "string") {
+    pushPair(inp.old_string, inp.new_string);
+  } else if (typeof inp.TargetContent === "string" || typeof inp.ReplacementContent === "string") {
+    pushPair(inp.TargetContent, inp.ReplacementContent);
+  } else if (Array.isArray(inp.edits)) {
+    for (const chunk of inp.edits.slice(0, 2)) {
+      if (chunk && typeof chunk === "object") {
+        const rec = chunk as Record<string, unknown>;
+        pushPair(rec.old_string, rec.new_string);
+      }
+    }
+  } else if (Array.isArray(inp.ReplacementChunks)) {
+    for (const chunk of inp.ReplacementChunks.slice(0, 2)) {
+      if (chunk && typeof chunk === "object") {
+        const rec = chunk as Record<string, unknown>;
+        pushPair(rec.TargetContent, rec.ReplacementContent);
+      }
+    }
+  }
+  return out.slice(0, 10);
+}
+
+interface ParsedTodoEntry {
+  text: string;
+  done: boolean;
+  active: boolean;
+}
+
+function extractTodoEntries(input: unknown): ParsedTodoEntry[] {
+  if (!input || typeof input !== "object") return [];
+  const todos = (input as { todos?: unknown }).todos;
+  if (!Array.isArray(todos)) return [];
+  const out: ParsedTodoEntry[] = [];
+  for (const raw of todos) {
+    if (!raw || typeof raw !== "object") continue;
+    const rec = raw as Record<string, unknown>;
+    const text = String(rec.content ?? rec.subject ?? rec.task ?? rec.title ?? "").trim();
+    if (!text) continue;
+    const status = String(rec.status ?? "").toLowerCase();
+    out.push({
+      text,
+      done: status === "completed" || status === "done" || rec.completed === true,
+      active: status === "in_progress" || status === "active",
+    });
+  }
+  return out;
+}
+
+const TodoChecklistCard = memo(function TodoChecklistCard({ items }: { items: ParsedTodoEntry[] }) {
+  if (!items.length) return null;
+  const doneCount = items.filter((i) => i.done).length;
+  return (
+    <div className="chat-todo-card" role="region" aria-label="任务清单">
+      <div className="chat-todo-head">
+        <ListChecks size={13} />
+        <span>任务清单</span>
+        <span className="chat-todo-progress mono">
+          {doneCount}/{items.length}
+        </span>
+      </div>
+      <div className="chat-todo-list">
+        {items.slice(0, 12).map((item, idx) => (
+          <div key={`${idx}-${item.text.slice(0, 20)}`} className={`chat-todo-row${item.done ? " done" : item.active ? " active" : ""}`}>
+            <PocketCheckbox checked={item.done} disabled onCheckedChange={() => {}} ariaLabel={item.text} />
+            <span className="chat-todo-text">{item.text}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
 const ToolStepItem = memo(function ToolStepItem({
   step,
   sub,
@@ -334,6 +434,8 @@ const ToolStepItem = memo(function ToolStepItem({
 
   const formattedInput = useMemo(() => (open ? prettyMaybeJson(step.input) : ""), [open, step.input]);
   const formattedOutput = useMemo(() => (open && step.result ? prettyMaybeJson(step.result.output) : ""), [open, step.result]);
+  const diffLines = useMemo(() => extractInlineEditDiff(step), [step]);
+  const todoItems = useMemo(() => (/^todo_?write$/i.test(step.name.trim()) ? extractTodoEntries(step.input) : []), [step.input, step.name]);
   const fileTarget = useMemo(() => {
     if (!onOpenFile || (step.category !== "read" && step.category !== "edit") || !step.summary) return null;
     return extractTargetFromLine(step.summary);
@@ -379,6 +481,21 @@ const ToolStepItem = memo(function ToolStepItem({
       </div>
       {sub && onOpenSub ? (
         <SubLinkCard sub={sub} onOpenSub={onOpenSub} onOpenSubAside={onOpenSubAside} inset />
+      ) : null}
+      {standalone && todoItems.length > 0 ? (
+        <div style={{ padding: "0 10px 8px" }}>
+          <TodoChecklistCard items={todoItems} />
+        </div>
+      ) : null}
+      {diffLines.length > 0 ? (
+        <div className="chat-edit-diff mono">
+          {diffLines.map((dl, idx) => (
+            <div key={idx} className={`chat-edit-diff-line ${dl.kind}`}>
+              <span>{dl.kind === "del" ? "-" : "+"}</span>
+              <span>{dl.text}</span>
+            </div>
+          ))}
+        </div>
       ) : null}
       {toolImages.length > 0 ? (
         <div style={{ padding: "0 12px 6px 40px" }}>
@@ -426,22 +543,47 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
   onOpenFile?: (target: string) => void;
 }) {
   const [open, setOpen] = useState(Boolean(row.defaultOpen));
+  const userToggledRef = useRef(false);
   useEffect(() => {
-    setOpen(Boolean(row.defaultOpen));
-  }, [row.defaultOpen]);
+    if (row.defaultOpen) {
+      setOpen(true);
+      return;
+    }
+    if (row.hasFollowingAssistant && !row.running && !userToggledRef.current) {
+      setOpen(false);
+    } else if (!userToggledRef.current) {
+      setOpen(Boolean(row.defaultOpen));
+    }
+  }, [row.defaultOpen, row.hasFollowingAssistant, row.running]);
   const [showAll, setShowAll] = useState(false);
 
-  const visibleTools = useMemo(() => {
+  const visibleEntries = useMemo(() => {
     if (!open) return [];
-    if (showAll || row.tools.length <= STEP_WINDOW) return row.tools;
-    return row.tools.slice(-STEP_WINDOW);
-  }, [open, row.tools, showAll]);
+    const list = row.entries ?? [];
+    if (showAll || list.length <= STEP_WINDOW) return list;
+    return list.slice(-STEP_WINDOW);
+  }, [open, row.entries, showAll]);
 
-  const hiddenCount = open && !showAll && row.tools.length > STEP_WINDOW ? row.tools.length - STEP_WINDOW : 0;
+  const hiddenCount = open && !showAll && (row.entries?.length ?? 0) > STEP_WINDOW ? (row.entries?.length ?? 0) - STEP_WINDOW : 0;
   const subSessions = useMemo(
     () => row.tools.map((t) => subsByCall.get(t.callId)).filter((s): s is SubSession => Boolean(s)),
     [row.tools, subsByCall],
   );
+  const latestTodos = useMemo(() => {
+    for (let i = row.tools.length - 1; i >= 0; i -= 1) {
+      const t = row.tools[i]!;
+      if (/^todo_?write$/i.test(t.name.trim())) {
+        const parsed = extractTodoEntries(t.input);
+        if (parsed.length > 0) return parsed;
+      }
+    }
+    return [];
+  }, [row.tools]);
+  const livePreview = row.activeStep
+    ? row.activeStep.summary
+      ? `${row.activeStep.name} · ${row.activeStep.summary}`
+      : row.activeStep.name
+    : row.latestThought || (row.thoughts.length ? row.thoughts[row.thoughts.length - 1] : undefined);
 
   return (
     <div className={`act-group${row.running ? " running" : row.failedCount > 0 ? " error" : ""}${row.defaultOpen ? " full-mode" : ""}`}>
@@ -450,7 +592,10 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
           type="button"
           className="act-head"
           aria-expanded={open}
-          onClick={() => setOpen((v) => !v)}
+          onClick={() => {
+            userToggledRef.current = true;
+            setOpen((v) => !v);
+          }}
         >
           <span className="act-status-ic">
             {row.running ? <span className="act-spin" aria-label="运行中" /> : row.failedCount > 0 ? <AlertCircle size={14} /> : <Check size={14} />}
@@ -469,6 +614,18 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
         </button>
       </div>
 
+      {!open && row.running && livePreview ? (
+        <div className="act-live-preview" title={livePreview}>
+          <span>{livePreview}</span>
+        </div>
+      ) : null}
+
+      {!open && latestTodos.length > 0 ? (
+        <div style={{ padding: "0 10px 8px" }}>
+          <TodoChecklistCard items={latestTodos} />
+        </div>
+      ) : null}
+
       {!open && subSessions.length > 0 && onOpenSub
         ? subSessions.map((s) => (
             <SubLinkCard key={s.key} sub={s} onOpenSub={onOpenSub} onOpenSubAside={onOpenSubAside} inset />
@@ -477,42 +634,89 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
 
       {open ? (
         <div className={`act-body${row.defaultOpen ? " expanded" : ""}`}>
+          {latestTodos.length > 0 ? (
+            <div style={{ padding: "6px 8px 2px" }}>
+              <TodoChecklistCard items={latestTodos} />
+            </div>
+          ) : null}
           {hiddenCount > 0 ? (
             <button type="button" className="act-more-steps" onClick={() => setShowAll(true)}>
-              还有更早的 {hiddenCount} 个步骤 · 点此展开全部 {row.tools.length} 步
+              还有更早的 {hiddenCount} 个步骤 · 点此展开全部 {row.entries.length} 步
             </button>
           ) : null}
-          {row.thoughts.map((t, i) => (
-            <details key={i} className="act-thought" style={{ margin: "6px 8px 2px", borderRadius: 8 }}>
-              <summary>
-                <MessageSquareMore size={12} />
-                <span>思考过程{row.thoughts.length > 1 ? ` #${i + 1}` : ""}</span>
-              </summary>
-              <div className="act-thought-body">{t}</div>
-            </details>
-          ))}
-          {visibleTools.map((step) => (
-            <ToolStepItem
-              key={step.id}
-              step={step}
-              sub={subsByCall.get(step.callId)}
-              agentKey={agentKey}
-              deviceId={deviceId}
-              cwd={cwd}
-              onOpenSub={onOpenSub}
-              onOpenSubAside={onOpenSubAside}
-              onOpenFile={onOpenFile}
-            />
-          ))}
-          {row.notes.map((n, i) => (
-            <details key={i} className="act-thought" style={{ margin: "4px 8px 6px", borderRadius: 8 }}>
-              <summary>
-                <Info size={12} />
-                <span>{n.summary}</span>
-              </summary>
-              <div className="act-thought-body">{n.text}</div>
-            </details>
-          ))}
+          {visibleEntries.length > 0 ? (
+            visibleEntries.map((entry) => {
+              if (entry.kind === "thinking") {
+                return (
+                  <details key={entry.id} className="act-thought" style={{ margin: "6px 8px 2px", borderRadius: 8 }}>
+                    <summary>
+                      <MessageSquareMore size={12} />
+                      <span>思考过程</span>
+                    </summary>
+                    <div className="act-thought-body">{entry.text}</div>
+                  </details>
+                );
+              }
+              if (entry.kind === "note") {
+                return (
+                  <details key={entry.id} className="act-thought" style={{ margin: "4px 8px 6px", borderRadius: 8 }}>
+                    <summary>
+                      <Info size={12} />
+                      <span>{entry.summary}</span>
+                    </summary>
+                    <div className="act-thought-body">{entry.text}</div>
+                  </details>
+                );
+              }
+              return (
+                <ToolStepItem
+                  key={entry.step.id}
+                  step={entry.step}
+                  sub={subsByCall.get(entry.step.callId)}
+                  agentKey={agentKey}
+                  deviceId={deviceId}
+                  cwd={cwd}
+                  onOpenSub={onOpenSub}
+                  onOpenSubAside={onOpenSubAside}
+                  onOpenFile={onOpenFile}
+                />
+              );
+            })
+          ) : (
+            <>
+              {row.thoughts.map((t, i) => (
+                <details key={i} className="act-thought" style={{ margin: "6px 8px 2px", borderRadius: 8 }}>
+                  <summary>
+                    <MessageSquareMore size={12} />
+                    <span>思考过程{row.thoughts.length > 1 ? ` #${i + 1}` : ""}</span>
+                  </summary>
+                  <div className="act-thought-body">{t}</div>
+                </details>
+              ))}
+              {row.tools.map((step) => (
+                <ToolStepItem
+                  key={step.id}
+                  step={step}
+                  sub={subsByCall.get(step.callId)}
+                  agentKey={agentKey}
+                  deviceId={deviceId}
+                  cwd={cwd}
+                  onOpenSub={onOpenSub}
+                  onOpenSubAside={onOpenSubAside}
+                  onOpenFile={onOpenFile}
+                />
+              ))}
+              {row.notes.map((n, i) => (
+                <details key={i} className="act-thought" style={{ margin: "4px 8px 6px", borderRadius: 8 }}>
+                  <summary>
+                    <Info size={12} />
+                    <span>{n.summary}</span>
+                  </summary>
+                  <div className="act-thought-body">{n.text}</div>
+                </details>
+              ))}
+            </>
+          )}
         </div>
       ) : null}
     </div>
@@ -533,22 +737,47 @@ const UserRowItem = memo(function UserRowItem({
   onOpenFile?: (target: string) => void;
 }) {
   const [showInjected, setShowInjected] = useState(false);
-  const attachTargets = useMemo(() => {
-    if (!row.attachedLines.length) return [];
-    return row.attachedLines.map((line) => {
-      const target = extractTargetFromLine(line);
-      const label = (target || line).split("/").filter(Boolean).pop() || line;
-      return { raw: line, target, label };
-    });
-  }, [row.attachedLines]);
+  const [expanded, setExpanded] = useState(false);
+  const isLong = useMemo(() => {
+    if (!row.text) return false;
+    return row.text.length > 900 || row.text.split("\n").length > 12;
+  }, [row.text]);
   const imageTargets = useMemo(
     () => extractImageTargets([...row.attachedLines, row.text]),
     [row.attachedLines, row.text],
   );
+  const attachTargets = useMemo(() => {
+    if (!row.attachedLines.length) return [];
+    const imageSet = new Set(imageTargets.map((t) => t.trim()));
+    return row.attachedLines
+      .map((line) => {
+        const target = extractTargetFromLine(line);
+        const label = (target || line).split("/").filter(Boolean).pop() || line;
+        return { raw: line, target, label };
+      })
+      .filter((att) => {
+        if (att.target && imageSet.has(att.target.trim())) return false;
+        if (imageTargets.length > 0 && /^\[(?:Image|图片)\s*#?\d*\]$/i.test(att.raw.trim())) return false;
+        return true;
+      });
+  }, [imageTargets, row.attachedLines]);
 
   return (
     <div className="bubble-row user">
-      {row.text ? <div className="bubble user">{row.text}</div> : null}
+      {row.text ? (
+        <div className={`bubble user${isLong && !expanded ? " is-folded" : ""}`}>
+          <div>{row.text}</div>
+          {isLong ? (
+            <button
+              type="button"
+              className="user-fold-btn"
+              onClick={() => setExpanded((v) => !v)}
+            >
+              {expanded ? "收起" : "展开全部"}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <InlineImageStrip
         targets={imageTargets}
         agentKey={agentKey}
@@ -556,8 +785,8 @@ const UserRowItem = memo(function UserRowItem({
         cwd={cwd}
         onOpenFile={onOpenFile}
       />
-      {row.attachedCount > 0 ? (
-        attachTargets.length > 0 && onOpenFile ? (
+      {attachTargets.length > 0 ? (
+        onOpenFile ? (
           <div className="chat-att-list" title={row.attachedLines.join("\n")}>
             {attachTargets.map((att, idx) =>
               att.target ? (
@@ -582,9 +811,14 @@ const UserRowItem = memo(function UserRowItem({
         ) : (
           <div className="chat-attach-note row" style={{ gap: 5 }} title={row.attachedLines.join("\n")}>
             <Paperclip size={12} />
-            <span>已附带 {row.attachedCount} 个文件/图片</span>
+            <span>已附带 {attachTargets.length} 个文件</span>
           </div>
         )
+      ) : row.attachedCount > 0 && imageTargets.length === 0 ? (
+        <div className="chat-attach-note row" style={{ gap: 5 }} title={row.attachedLines.join("\n")}>
+          <Paperclip size={12} />
+          <span>已附带 {row.attachedCount} 个文件/图片</span>
+        </div>
       ) : null}
       {row.injected ? (
         <button type="button" className="chat-attach-note" onClick={() => setShowInjected((v) => !v)} style={{ cursor: "pointer" }}>
@@ -660,6 +894,96 @@ function shortModelLabel(raw: string): string {
   return trimmed.split("/").pop() || trimmed;
 }
 
+export const CommandResultCard = memo(function CommandResultCard({
+  command,
+  text,
+  isError,
+  panelState,
+  ts,
+  pos,
+  onSwitchToTerminal,
+  onDismissPanel,
+  onDismissCard,
+}: {
+  command: string;
+  text: string;
+  isError?: boolean;
+  panelState?: "none" | "closed" | "interactive_open";
+  ts: number;
+  pos?: string;
+  onSwitchToTerminal?: () => void;
+  onDismissPanel?: () => void;
+  onDismissCard?: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const lineCount = useMemo(() => (text ? text.split("\n").length : 0), [text]);
+  const collapsible = lineCount > 14;
+  const interactive = panelState === "interactive_open";
+
+  return (
+    <div
+      className={`chat-cmd-card${isError ? " is-error" : ""}${interactive ? " is-interactive" : ""}`}
+      title={fullTimeTitle(ts, pos)}
+    >
+      <div className="chat-cmd-head">
+        <span className="chat-cmd-badge mono">
+          {isError ? <AlertCircle size={12} /> : <Terminal size={12} />}
+          <span>{command}</span>
+        </span>
+        {ts > 0 ? <span className="chat-cmd-time">{clockStr(ts)}</span> : null}
+        <span className="grow" />
+        {text ? (
+          <button
+            type="button"
+            className="chat-cmd-btn"
+            aria-label="复制输出"
+            title="复制输出"
+            onClick={() => {
+              void copyToClipboard(text).then((ok) => {
+                if (ok) {
+                  setCopied(true);
+                  window.setTimeout(() => setCopied(false), 1500);
+                }
+              });
+            }}
+          >
+            {copied ? <Check size={12} /> : <Copy size={12} />}
+          </button>
+        ) : null}
+        {onDismissCard ? (
+          <button type="button" className="chat-cmd-btn" aria-label="收起结果" title="收起" onClick={onDismissCard}>
+            <X size={12} />
+          </button>
+        ) : null}
+      </div>
+      {text ? (
+        <pre className={`chat-cmd-body mono${collapsible && !expanded ? " is-collapsed" : ""}`}>{text}</pre>
+      ) : null}
+      {collapsible || interactive ? (
+        <div className="chat-cmd-foot">
+          {collapsible ? (
+            <button type="button" className="chat-cmd-link" onClick={() => setExpanded((v) => !v)}>
+              {expanded ? "收起输出" : `展开完整输出（${lineCount} 行）`}
+            </button>
+          ) : null}
+          <span className="grow" />
+          {interactive && onSwitchToTerminal ? (
+            <button type="button" className="chat-cmd-action primary" onClick={onSwitchToTerminal}>
+              切到终端继续操作
+            </button>
+          ) : null}
+          {interactive && onDismissPanel ? (
+            <button type="button" className="chat-cmd-action" onClick={onDismissPanel}>
+              关闭面板 (Esc)
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+});
+
 export const ChatTimelineRows = memo(function ChatTimelineRows({
   rows,
   subs,
@@ -669,6 +993,8 @@ export const ChatTimelineRows = memo(function ChatTimelineRows({
   onOpenSub,
   onOpenSubAside,
   onOpenFile,
+  onSwitchToTerminal,
+  onDismissCommandPanel,
 }: {
   rows: ChatRow[];
   subs: SubSession[];
@@ -678,6 +1004,8 @@ export const ChatTimelineRows = memo(function ChatTimelineRows({
   onOpenSub?: (sub: SubSession) => void;
   onOpenSubAside?: (sub: SubSession) => void;
   onOpenFile?: (target: string) => void;
+  onSwitchToTerminal?: () => void;
+  onDismissCommandPanel?: () => void;
 }) {
   const subsByCall = useMemo(() => {
     const m = new Map<string, SubSession>();
@@ -754,6 +1082,26 @@ export const ChatTimelineRows = memo(function ChatTimelineRows({
                 <div className="act-thought-body">{row.text}</div>
               </details>
             );
+          case "command_result":
+            return (
+              <CommandResultCard
+                key={row.id}
+                command={row.command}
+                text={row.text}
+                isError={row.isError}
+                panelState={row.panelState}
+                ts={row.ts}
+                pos={row.pos}
+                onSwitchToTerminal={onSwitchToTerminal}
+                onDismissPanel={onDismissCommandPanel}
+              />
+            );
+          case "compact_notice":
+            return (
+              <div key={row.id} className="chat-compact-sep" title={fullTimeTitle(row.ts, row.pos)}>
+                <span>{row.summary}</span>
+              </div>
+            );
           case "model_switch":
             return (
               <div key={row.id} className="chat-model-switch-sep" title={fullTimeTitle(row.ts, row.pos)}>
@@ -765,11 +1113,7 @@ export const ChatTimelineRows = memo(function ChatTimelineRows({
               </div>
             );
           case "turn_end":
-            return (
-              <div key={row.id} className="chat-turn-sep" title={fullTimeTitle(row.ts, row.pos)}>
-                <span>这一轮结束 · {clockStr(row.ts)}</span>
-              </div>
-            );
+            return null;
         }
       })}
     </>

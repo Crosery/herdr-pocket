@@ -202,6 +202,8 @@ export interface KittyGfxCommand {
   height?: number;
   cols?: number;
   rows?: number;
+  dataSize?: number;
+  dataOffset?: number;
   cropW?: number;
   cropH?: number;
   cropX?: number;
@@ -260,6 +262,8 @@ export function parseKittyGfxCommand(raw: string): KittyGfxCommand {
     height: int("v"),
     cols: int("c"),
     rows: int("r"),
+    dataSize: nonNegInt("S"),
+    dataOffset: nonNegInt("O"),
     cropW: nonNegInt("w"),
     cropH: nonNegInt("h"),
     cropX: nonNegInt("x"),
@@ -494,6 +498,7 @@ export interface KittyVirtualPlacementDims {
   cols: number;
   rows: number;
   zIndex: number;
+  alt?: boolean;
 }
 
 /** True only for non-virtual (`U=0`) `a=T` / `a=p` placements anchored at the terminal cursor. */
@@ -509,8 +514,14 @@ export function registerKittyVirtualPlacement(
   cols: number,
   rows: number,
   zIndex = 0,
+  alt?: boolean,
 ): void {
-  const dims: KittyVirtualPlacementDims = { cols, rows, zIndex };
+  const dims: KittyVirtualPlacementDims = {
+    cols,
+    rows,
+    zIndex,
+    ...(alt !== undefined ? { alt } : {}),
+  };
   map.set(`${imageId}:${placementId ?? 0}`, dims);
   map.set(`${imageId}:0`, dims);
 }
@@ -520,14 +531,30 @@ export function deleteKittyVirtualPlacements(
   map: Map<string, KittyVirtualPlacementDims>,
   imageId: number,
   placementId?: number,
+  alt?: boolean,
 ): void {
+  const matchesAlt = (entry: KittyVirtualPlacementDims | undefined) =>
+    alt === undefined || entry?.alt === undefined || entry.alt === alt;
   if (placementId !== undefined) {
-    map.delete(`${imageId}:${placementId}`);
+    const key = `${imageId}:${placementId}`;
+    if (matchesAlt(map.get(key))) map.delete(key);
     return;
   }
   const prefix = `${imageId}:`;
-  for (const key of map.keys()) {
-    if (key.startsWith(prefix)) map.delete(key);
+  for (const [key, val] of map.entries()) {
+    if (key.startsWith(prefix) && matchesAlt(val)) map.delete(key);
+  }
+}
+
+/** Removes all virtual (`U=1`) placements on the active buffer screen (`alt`). */
+export function clearKittyVirtualPlacementsForScreen(
+  map: Map<string, KittyVirtualPlacementDims>,
+  curAlt: boolean,
+): void {
+  for (const [key, val] of map.entries()) {
+    if (val.alt === undefined || val.alt === curAlt) {
+      map.delete(key);
+    }
   }
 }
 
@@ -535,8 +562,11 @@ export function lookupKittyVirtualPlacement(
   map: Map<string, KittyVirtualPlacementDims>,
   imageId: number,
   placementId: number,
+  alt?: boolean,
 ): KittyVirtualPlacementDims | undefined {
-  return map.get(`${imageId}:${placementId}`) ?? map.get(`${imageId}:0`);
+  const match = (entry: KittyVirtualPlacementDims | undefined) =>
+    entry && (alt === undefined || entry.alt === undefined || entry.alt === alt) ? entry : undefined;
+  return match(map.get(`${imageId}:${placementId}`)) ?? match(map.get(`${imageId}:0`));
 }
 
 export interface KittyBufferCellSample {

@@ -101,9 +101,13 @@ test("composerEnterAction: active IME composition and WKWebView post-composition
     "pass",
   );
 
-  // Alt+Enter triggers immediate steer send only when allowSteer=true, and still honors IME composition guard.
+  // Alt+Enter and Cmd/Ctrl+Enter trigger soft steer send when allowSteer=true, and still honor IME guard.
   assert.equal(
     composerEnterAction({ key: "Enter", shiftKey: false, altKey: true, ctrlKey: false, metaKey: false }, gate, 6000, true),
+    "steer",
+  );
+  assert.equal(
+    composerEnterAction({ key: "Enter", shiftKey: false, altKey: false, ctrlKey: false, metaKey: true }, gate, 6000, true),
     "steer",
   );
   assert.equal(

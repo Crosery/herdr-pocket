@@ -8,7 +8,9 @@ import { formatLogLine, logStore, redact, type LogLevel } from "../../lib/log";
 import { useWindowHidden } from "../../lib/layout";
 import { getActiveToken, restRequest } from "../../lib/relay";
 import { isMockServer } from "../../lib/mock";
-import { liveStore, settingsStore } from "../../lib/store";
+import { logAction } from "../../lib/log";
+import { allAgents, liveStore, settingsStore } from "../../lib/store";
+import { shellStore, tabPaneCount } from "../../shell/shellStore";
 import { ConfigSelect, ConfigSwitch, PaneTitle, SetHeading, SetRow } from "./rows";
 
 const LEVELS: Array<{ value: LogLevel | "all"; label: string }> = [
@@ -175,7 +177,27 @@ export function LogsPane() {
           disabled={!native.available()}
           onClick={async () => {
             try {
-              const path = await native.exportDiagnostics({ app: appVersion(), platform: detectPlatform(), link, server: server && !isMockServer(server) ? server : null });
+              const shellState = shellStore.get();
+              const liveState = liveStore.get();
+              const agentsList = allAgents(liveState.agents);
+              const splitTabs = shellState.tabs.filter((t) => tabPaneCount(t) > 1).length;
+              const workspace = {
+                tabs: shellState.tabs.length,
+                splitTabs,
+                hasSelectedSpace: Boolean(shellState.selectedSpace),
+                panel: shellState.panel,
+                devices: liveState.devices.length,
+                agents: agentsList.length,
+                waitingAgents: agentsList.filter((a) => a.status === "blocked").length,
+              };
+              const path = await native.exportDiagnostics({
+                app: appVersion(),
+                platform: detectPlatform(),
+                link,
+                server: server && !isMockServer(server) ? server : null,
+                workspace,
+              });
+              logAction("logs", "diagnostics.export", workspace);
               toast(`已导出：${path}`);
             } catch (e) {
               toast((e as Error).message, true);

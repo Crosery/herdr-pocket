@@ -64,7 +64,12 @@ export function addPictures(current: Attachment[], picked: Attachment[]): { list
  * picture has reached its computer. A computer whose herdr-pocket predates
  * pictures answers `unsupported`, which comes back as a plain reason.
  */
-export async function sendWithPictures(agent: Agent, text: string, pictures: Attachment[]): Promise<{ accepted: RpcResult<"terminal.send">; sent: string }> {
+export async function sendWithPictures(
+  agent: Agent,
+  text: string,
+  pictures: Attachment[],
+  delivery: "auto" | "steer" = "auto",
+): Promise<{ accepted: RpcResult<"terminal.send">; sent: string }> {
   let paths: string[] = [];
   if (pictures.length) {
     try {
@@ -83,6 +88,11 @@ export async function sendWithPictures(agent: Agent, text: string, pictures: Att
     if (paths.length !== pictures.length) throw new RelayError("internal", "电脑那边没收全图片，没有发送");
   }
   const sent = textWithFiles(text, paths);
-  const accepted = await call(agent.deviceId, "terminal.send", { agent: agent.key, text: sent, enter: true });
+  const accepted = await call(agent.deviceId, "terminal.send", {
+    agent: agent.key,
+    text: sent,
+    enter: true,
+    ...(delivery === "steer" ? { delivery: "steer" } : {}),
+  });
   return { accepted, sent };
 }

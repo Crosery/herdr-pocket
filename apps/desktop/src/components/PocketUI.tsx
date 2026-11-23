@@ -415,8 +415,20 @@ export class PocketErrorBoundary extends Component<
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
-    const loc = info.componentStack ? ` | ${info.componentStack.trim().split("\n")[0]?.trim() ?? ""}` : "";
-    logger.error("app.boundary", `${error.name}: ${error.message}${loc}`);
+    const frames = info.componentStack
+      ? info.componentStack
+          .trim()
+          .split("\n")
+          .slice(0, 4)
+          .map((l) => l.trim())
+          .join(" <- ")
+      : "";
+    logger.error("app.boundary", `${error.name}: ${error.message}`, {
+      title: this.props.title,
+      resetKey: this.props.resetKey ?? undefined,
+      stack: error.stack,
+      componentStack: frames || undefined,
+    });
   }
 
   componentDidUpdate(prevProps: { resetKey?: string | number | null }): void {

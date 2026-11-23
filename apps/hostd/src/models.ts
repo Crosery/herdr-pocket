@@ -17,6 +17,7 @@ import {
   extractModelExplicitEffort,
   inferAgentModelAndThinking,
   inferModelThinkingLevels,
+  isCommandErrorOutput,
   isNonReasoningModelName,
   normalizeSwitchHarness,
   parseTerminalModelAndThinking,
@@ -1780,6 +1781,7 @@ export async function setAgentModelAndThinking(
     };
   }
 
+  const beforeScreen = agent.source === "hc" ? await transport.hc.snapshotText(agent.localId, 30).catch(() => "") : "";
   for (let i = 0; i < plan.commands.length; i++) {
     if (i > 0) await wait(200);
     await sendLine(plan.commands[i]!);
@@ -1787,6 +1789,28 @@ export async function setAgentModelAndThinking(
   for (const chord of plan.keys ?? []) {
     await wait(120);
     await sendKeys(chord);
+  }
+  if (agent.source === "hc" && (plan.commands.length > 0 || (plan.keys?.length ?? 0) > 0)) {
+    await wait(320);
+    const afterScreen = await transport.hc.snapshotText(agent.localId, 30).catch(() => "");
+    if (endsInPanel(afterScreen)) {
+      await sendKeys(["esc"]).catch(() => undefined);
+      if (modelId || thinkingLevel) {
+        throw new Error(`未能直接应用切换，${agent.harness} 弹出了选择面板（可能不支持该参数）`);
+      }
+    }
+    if (afterScreen && afterScreen !== beforeScreen) {
+      const beforeSet = new Set(beforeScreen.split("\n").map((l) => l.trim()).filter(Boolean));
+      const newLines = afterScreen
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !beforeSet.has(l))
+        .slice(0, 6)
+        .join("\n");
+      if (isCommandErrorOutput(newLines)) {
+        throw new Error(newLines.split("\n")[0] || "切换模型或思考等级失败");
+      }
+    }
   }
 
   let resolvedModel = modelId ? (hNorm === "omp" ? stripModelEffortSuffix(modelId) : modelId) : undefined;

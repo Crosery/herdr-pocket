@@ -7,7 +7,11 @@ import { useQuery } from "@tanstack/react-query";
 import {
   compareConvEvents,
   formatModelSwitchSummary,
+  isCommandErrorOutput,
+  isDismissedCommandOutput,
+  parseLocalCommandOutputTag,
   parseModelSwitchEvent,
+  parseSlashCommandTag,
   sameMessage,
   type Agent,
   type ChatDisplayMode,
@@ -16,7 +20,7 @@ import {
 } from "@herdr-pocket/protocol";
 import { call, subscribe } from "../lib/relay";
 import { splitPictures } from "../lib/attach";
-import { followSends, forget } from "../lib/outbox";
+import { followSends, forget, useCapturedCommands } from "../lib/outbox";
 import { useLive, usePending, useSettings, type PendingSend } from "../lib/store";
 import { fixCjkEmphasis, hasList } from "../lib/markdown";
 import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
@@ -42,19 +46,44 @@ const clock = (ts: number) => {
 type ToolCall = Extract<ConvEvent, { kind: "tool_call" }>;
 type ToolResult = Extract<ConvEvent, { kind: "tool_result" }>;
 
+type MobileTurnEntry =
+  | { kind: "tool"; item: Extract<Row, { type: "tool" }> }
+  | { kind: "thinking"; id: string; text: string }
+  | { kind: "note"; id: string; summary: string; text: string };
+
 export type Row =
   | { type: "user"; id: string; text: string; ts: number; injected?: string; pictures?: string[] }
   | { type: "assistant"; id: string; text: string; ts: number }
   | { type: "thinking"; id: string; text: string; defaultOpen?: boolean }
   | { type: "tool"; id: string; call: ToolCall; result?: ToolResult }
-  /** A run of tool calls folded into one line (or combined with thoughts/notes in compact mode). */
-  | { type: "tools"; id: string; items: Extract<Row, { type: "tool" }>[]; thoughts?: string[]; notes?: Array<{ summary: string; text: string }>; defaultOpen?: boolean }
+  /** A run of tool calls folded into one cohesive progressive block in standard/compact mode. */
+  | {
+      type: "tools";
+      id: string;
+      items: Extract<Row, { type: "tool" }>[];
+      thoughts?: string[];
+      notes?: Array<{ summary: string; text: string }>;
+      entries?: MobileTurnEntry[];
+      latestThought?: string;
+      defaultOpen?: boolean;
+    }
   /** Sent from this phone, not yet echoed by the session. */
   | { type: "pending"; id: string; text: string; ts: number; pictures?: string[]; send: PendingSend; agentKey: string }
   | { type: "terminal_queued"; id: string; text: string }
   | { type: "turn_end"; id: string; ts: number }
   | { type: "model_switch"; id: string; ts: number; label: string; model?: string; thinking?: string }
-  | { type: "system"; id: string; text: string; summary: string };
+  | {
+      type: "command_result";
+      id: string;
+      command: string;
+      text: string;
+      isError: boolean;
+      panelState?: "none" | "closed" | "interactive_open";
+      ts: number;
+      captureId?: string;
+    }
+  | { type: "compact_notice"; id: string; summary: string; ts: number }
+  | { type: "system"; id: string; text: string; summary: string; ts?: number };
 
 function pushModelSwitch(
   rows: Row[],
@@ -84,15 +113,68 @@ export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standar
   const rows: Row[] = [];
   const toolIndex = new Map<string, number>();
   const defaultOpen = mode === "expanded";
-  for (const e of events) {
+  const lookaheadOutcome = (idx: number): "error" | "dismissed" | "output" | "model_switch" | null => {
+    const cur = events[idx]!;
+    for (let j = idx + 1; j < events.length; j += 1) {
+      const next = events[j]!;
+      if (Math.abs(next.ts - cur.ts) > 15_000) break;
+      if (
+        next.kind === "assistant_message" ||
+        next.kind === "tool_call" ||
+        (next.kind === "user_message" && !next.synthetic)
+      ) {
+        break;
+      }
+      if (next.kind !== "system") continue;
+      const parsedOut = parseLocalCommandOutputTag(next.text);
+      const body = (parsedOut?.body ?? next.text).trim();
+      if (!body) continue;
+      if (isDismissedCommandOutput(body)) return "dismissed";
+      if (next.subtype === "command_error" || parsedOut?.isError || isCommandErrorOutput(body)) return "error";
+      const nextSw = parseModelSwitchEvent(next);
+      if (nextSw && (nextSw.model || nextSw.thinking || nextSw.ackOnly)) return "model_switch";
+      if (next.subtype === "command_output" || parsedOut) return "output";
+    }
+    return null;
+  };
+
+const MOBILE_NOISY_SUBTYPES = new Set(["reminder", "自动插入", "system_message", "developer"]);
+const MOBILE_NOISY_PREFIX_RE =
+  /^\s*(?:<(?:SYSTEM_MESSAGE|ephemeral_message|session_context|INSTRUCTIONS|system-reminder|environment_context)\b|Base directory for this skill:\s+\S|\[Image:\s*original\b[^\]]*\]\s*$)/i;
+
+function isMobileHiddenNoise(text: string, subtype?: string): boolean {
+  const sub = subtype?.trim().toLowerCase();
+  if (sub && MOBILE_NOISY_SUBTYPES.has(sub)) return true;
+  if (subtype === "自动插入") return true;
+  return MOBILE_NOISY_PREFIX_RE.test(text);
+}
+
+  for (let i = 0; i < events.length; i += 1) {
+    const e = events[i]!;
+    if (e.kind === "system") {
+      const parsedOut = parseLocalCommandOutputTag(e.text);
+      const cleanBody = (parsedOut?.body ?? e.text).trim();
+      if (!cleanBody || isDismissedCommandOutput(cleanBody)) continue;
+      if (mode !== "expanded" && isMobileHiddenNoise(cleanBody, e.subtype)) continue;
+      const cmdTag = parseSlashCommandTag(e.text);
+      if (e.subtype === "command" || cmdTag) {
+        const nextOut = lookaheadOutcome(i);
+        if (nextOut === "error" || nextOut === "dismissed" || nextOut === "output") continue;
+        if (nextOut === "model_switch" && !parseModelSwitchEvent(e)) continue;
+      }
+    }
+
     switch (e.kind) {
       case "user_message": {
         const sw = parseModelSwitchEvent(e);
         if (sw) {
-          pushModelSwitch(rows, e.id, e.ts, sw);
+          const nextOut = lookaheadOutcome(i);
+          if (nextOut === "error" || nextOut === "dismissed") break;
+          if (!sw.ackOnly || sw.model || sw.thinking) pushModelSwitch(rows, e.id, e.ts, sw);
         } else if (e.synthetic) {
-          // Older hostd builds: harness-made "user" messages are system notes.
-          if (e.text.trim()) rows.push({ type: "system", id: e.id, text: e.text, summary: systemSummary(e.text) });
+          if (e.text.trim() && (mode === "expanded" || !isMobileHiddenNoise(e.text, "自动插入"))) {
+            rows.push({ type: "system", id: e.id, text: e.text, summary: systemSummary(e.text), ts: e.ts });
+          }
         } else if (e.text.trim() || e.injected?.trim()) {
           rows.push({ type: "user", id: e.id, text: e.text, ts: e.ts, injected: e.injected?.trim() || undefined });
         }
@@ -109,8 +191,8 @@ export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standar
         rows.push({ type: "tool", id: e.id, call: e });
         break;
       case "tool_result": {
-        const i = toolIndex.get(e.call_id);
-        const row = i == null ? undefined : rows[i];
+        const iIdx = toolIndex.get(e.call_id);
+        const row = iIdx == null ? undefined : rows[iIdx];
         if (row && row.type === "tool") row.result = e;
         break;
       }
@@ -118,10 +200,30 @@ export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standar
         if (rows.length && rows[rows.length - 1]?.type !== "turn_end") rows.push({ type: "turn_end", id: e.id, ts: e.ts });
         break;
       case "system": {
+        const parsedOut = parseLocalCommandOutputTag(e.text);
+        const cleanBody = (parsedOut?.body ?? e.text).trim();
+        if (!cleanBody || isDismissedCommandOutput(cleanBody)) break;
+        const subLower = e.subtype?.trim().toLowerCase();
+        if (subLower === "compact" || subLower === "checkpoint" || subLower === "compact_boundary") {
+          rows.push({ type: "compact_notice", id: e.id, summary: e.summary?.trim() || "上下文已压缩", ts: e.ts });
+          break;
+        }
+        if (e.subtype === "command_output" || e.subtype === "command_error" || parsedOut) {
+          const isError = e.subtype === "command_error" || Boolean(parsedOut?.isError) || isCommandErrorOutput(cleanBody);
+          rows.push({
+            type: "command_result",
+            id: e.id,
+            command: e.summary?.trim() || (isError ? "命令失败" : "命令输出"),
+            text: cleanBody,
+            isError,
+            ts: e.ts,
+          });
+          break;
+        }
         if (e.subtype === "model_switch") {
           const sw = parseModelSwitchEvent(e);
           if (sw) {
-            pushModelSwitch(rows, e.id, e.ts, sw);
+            if (!sw.ackOnly || sw.model || sw.thinking) pushModelSwitch(rows, e.id, e.ts, sw);
           } else if (e.summary?.trim() || e.text.trim()) {
             pushModelSwitch(rows, e.id, e.ts, { rawLabel: e.summary?.trim() || e.text.trim() });
           }
@@ -129,9 +231,11 @@ export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standar
         }
         const sw = parseModelSwitchEvent(e);
         if (sw) {
-          pushModelSwitch(rows, e.id, e.ts, sw);
+          const nextOut = lookaheadOutcome(i);
+          if (nextOut === "error" || nextOut === "dismissed") break;
+          if (!sw.ackOnly || sw.model || sw.thinking) pushModelSwitch(rows, e.id, e.ts, sw);
         } else if (e.text.trim()) {
-          rows.push({ type: "system", id: e.id, text: e.text, summary: e.summary?.trim() || systemSummary(e.text) });
+          rows.push({ type: "system", id: e.id, text: e.text, summary: e.summary?.trim() || systemSummary(e.text), ts: e.ts });
         }
         break;
       }
@@ -142,7 +246,7 @@ export function foldEvents(events: ConvEvent[], mode: ChatDisplayMode = "standar
   return groupTools(rows, mode);
 }
 
-/** Fold runs of tool calls (and adjacent thinking/system rows when mode is compact). */
+/** Fold runs of tool calls + adjacent thinking/system steps chronologically in standard/compact mode. */
 function groupTools(rows: Row[], mode: ChatDisplayMode): Row[] {
   const out: Row[] = [];
   let pending: Array<Extract<Row, { type: "tool" | "thinking" | "system" }>> = [];
@@ -153,7 +257,17 @@ function groupTools(rows: Row[], mode: ChatDisplayMode): Row[] {
     const notes = pending
       .filter((r): r is Extract<Row, { type: "system" }> => r.type === "system")
       .map((r) => ({ summary: r.summary, text: r.text }));
-    if (tools.length === 0) {
+    const entries: MobileTurnEntry[] = pending.map((r) =>
+      r.type === "tool"
+        ? { kind: "tool", item: r }
+        : r.type === "thinking"
+          ? { kind: "thinking", id: r.id, text: r.text }
+          : { kind: "note", id: r.id, summary: r.summary, text: r.text },
+    );
+    const latestThought = thoughts.length ? thoughts[thoughts.length - 1] : undefined;
+    if (tools.length === 0 && thoughts.length <= 1 && notes.length === 0) {
+      out.push(...pending);
+    } else if (tools.length === 0 && (mode === "expanded" || notes.length > 0 && thoughts.length === 0)) {
       out.push(...pending);
     } else if (tools.length === 1 && thoughts.length === 0 && notes.length === 0) {
       out.push(tools[0]!);
@@ -164,13 +278,15 @@ function groupTools(rows: Row[], mode: ChatDisplayMode): Row[] {
         items: tools,
         ...(thoughts.length ? { thoughts } : {}),
         ...(notes.length ? { notes } : {}),
+        entries,
+        ...(latestThought ? { latestThought } : {}),
         ...(mode === "expanded" ? { defaultOpen: true } : {}),
       });
     }
     pending = [];
   };
   for (const r of rows) {
-    if (r.type === "tool" || (mode === "compact" && (r.type === "thinking" || r.type === "system"))) {
+    if (r.type === "tool" || (mode !== "expanded" && (r.type === "thinking" || r.type === "system"))) {
       pending.push(r);
     } else {
       flush();
@@ -394,8 +510,13 @@ const UserBubble = memo(function UserBubble({ text, injected, ts, send, agentKey
   );
 });
 
-/** Children of the session on screen, keyed by the parent tool_call that spawned them. */
-const SubCtx = createContext<{ byCall: Map<string, SubSession>; open: (s: SubSession) => void } | null>(null);
+/** Children of the session on screen, keyed by the parent tool_call that spawned them, plus card actions. */
+const SubCtx = createContext<{
+  byCall: Map<string, SubSession>;
+  open: (s: SubSession) => void;
+  agent?: Agent;
+  onSwitchToTerminal?: () => void;
+} | null>(null);
 
 /** The agent's reply, always in full: folding it behind "展开全文" read as broken. */
 const AssistantBlock = memo(function AssistantBlock({ text, ts }: { text: string; ts?: number }) {
@@ -524,7 +645,21 @@ function ToolCard({ call: c, result, bare }: { call: ToolCall; result?: ToolResu
 }
 
 /** A run of tool calls on one line; tap to list them, tap one to see its input and output. */
-function ToolGroup({ items: tools, thoughts, notes, defaultOpen }: { items: Extract<Row, { type: "tool" }>[]; thoughts?: string[]; notes?: Array<{ summary: string; text: string }>; defaultOpen?: boolean }) {
+function ToolGroup({
+  items: tools,
+  thoughts,
+  notes,
+  entries,
+  latestThought,
+  defaultOpen,
+}: {
+  items: Extract<Row, { type: "tool" }>[];
+  thoughts?: string[];
+  notes?: Array<{ summary: string; text: string }>;
+  entries?: MobileTurnEntry[];
+  latestThought?: string;
+  defaultOpen?: boolean;
+}) {
   const p = usePalette();
   const [open, setOpen] = useState(Boolean(defaultOpen));
   useEffect(() => {
@@ -538,19 +673,22 @@ function ToolGroup({ items: tools, thoughts, notes, defaultOpen }: { items: Extr
   const names = [...counts].map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(" · ");
   const current = running[running.length - 1];
   const children = tools.map((t) => subs?.byCall.get(t.call.call_id)).filter((s): s is SubSession => !!s);
+  const thoughtText = latestThought || (thoughts?.length ? thoughts[thoughts.length - 1] : undefined);
   return (
     <View style={{ backgroundColor: p.surface2, borderRadius: radius.md, borderWidth: 1, borderColor: failed ? p.error : p.dark ? p.surface3 : "#F6E6EF" }}>
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded: open }}
-        accessibilityLabel={`用了 ${tools.length} 个工具${failed ? `，${failed} 个失败` : ""}${running.length ? "，还在运行" : ""}，${open ? "点按收起" : "点按展开"}`}
+        accessibilityLabel={`${tools.length ? `用了 ${tools.length} 个工具` : `思考与记录（${entries?.length ?? thoughts?.length ?? 0}）`}${failed ? `，${failed} 个失败` : ""}${running.length ? "，还在运行" : ""}，${open ? "点按收起" : "点按展开"}`}
         onPress={() => setOpen((v) => !v)}
         style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingHorizontal: space.md, minHeight: 42 }}
       >
         <View style={{ width: 26, height: 26, borderRadius: 9, backgroundColor: p.lavenderContainer, alignItems: "center", justifyContent: "center" }}>
           <MaterialCommunityIcons name="wrench-outline" size={15} color={p.dusk} />
         </View>
-        <Text style={{ fontFamily: fonts.bodyBold, color: p.ink, fontSize: 13.5 }}>{tools.length} 个工具</Text>
+        <Text style={{ fontFamily: fonts.bodyBold, color: p.ink, fontSize: 13.5 }}>
+          {tools.length ? (thoughts?.length ? `${tools.length} 个工具 · ${thoughts.length} 段思考` : `${tools.length} 个工具`) : `思考与分析（${thoughts?.length ?? 0}）`}
+        </Text>
         <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: p.faint }}>
           {names}
         </Text>
@@ -562,19 +700,37 @@ function ToolGroup({ items: tools, thoughts, notes, defaultOpen }: { items: Extr
         <Text numberOfLines={1} style={{ paddingHorizontal: space.md, paddingBottom: space.sm, fontFamily: fonts.mono, fontSize: 11.5, color: p.muted }}>
           正在运行 {current.call.name} {toolSummary(current.call.input)}
         </Text>
+      ) : !open && running.length > 0 && thoughtText ? (
+        <Text numberOfLines={1} style={{ paddingHorizontal: space.md, paddingBottom: space.sm, fontSize: 11.5, color: p.muted }}>
+          {thoughtText}
+        </Text>
       ) : null}
       {!open && subs ? children.map((s) => <SubLink key={s.key} s={s} onPress={() => subs.open(s)} />) : null}
       {open ? (
         <View style={{ paddingHorizontal: space.xs, paddingBottom: space.xs, gap: 4 }}>
-          {thoughts?.map((t, i) => (
-            <ThinkingPill key={`th-${i}`} text={t} />
-          ))}
-          {tools.map((r) => (
-            <ToolCard key={r.id} call={r.call} result={r.result} bare />
-          ))}
-          {notes?.map((n, i) => (
-            <FoldChip key={`nt-${i}`} label={n.summary} icon="information-outline" body={n.text} a11y={`系统提醒：${n.summary}`} />
-          ))}
+          {entries?.length ? (
+            entries.map((entry, idx) =>
+              entry.kind === "thinking" ? (
+                <ThinkingPill key={`${entry.id}-${idx}`} text={entry.text} />
+              ) : entry.kind === "note" ? (
+                <FoldChip key={`${entry.id}-${idx}`} label={entry.summary} icon="information-outline" body={entry.text} a11y={`系统提醒：${entry.summary}`} />
+              ) : (
+                <ToolCard key={entry.item.id} call={entry.item.call} result={entry.item.result} bare />
+              ),
+            )
+          ) : (
+            <>
+              {thoughts?.map((t, i) => (
+                <ThinkingPill key={`th-${i}`} text={t} />
+              ))}
+              {tools.map((r) => (
+                <ToolCard key={r.id} call={r.call} result={r.result} bare />
+              ))}
+              {notes?.map((n, i) => (
+                <FoldChip key={`nt-${i}`} label={n.summary} icon="information-outline" body={n.text} a11y={`系统提醒：${n.summary}`} />
+              ))}
+            </>
+          )}
         </View>
       ) : null}
     </View>
@@ -684,6 +840,90 @@ const NO_MVCP = { disabled: true };
 
 const rowType = (r: ListRow) => r.type;
 
+function MobileCommandCard({
+  row,
+}: {
+  row: Extract<Row, { type: "command_result" }>;
+}) {
+  const p = usePalette();
+  const ctx = useContext(SubCtx);
+  const [expanded, setExpanded] = useState(false);
+  const lines = useMemo(() => (row.text ? row.text.split("\n") : []), [row.text]);
+  const collapsible = lines.length > 14;
+  const shownText = collapsible && !expanded ? lines.slice(0, 14).join("\n") : row.text;
+  const interactive = row.panelState === "interactive_open";
+
+  return (
+    <View
+      style={{
+        borderRadius: radius.card,
+        borderWidth: 1,
+        borderColor: row.isError ? p.error : interactive ? p.accentText : p.divider,
+        backgroundColor: p.surface2,
+        padding: space.md,
+        gap: space.sm,
+      }}
+    >
+      <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+        <MaterialCommunityIcons
+          name={row.isError ? "alert-circle-outline" : "console"}
+          size={14}
+          color={row.isError ? p.error : p.accentText}
+        />
+        <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.monoBold, fontSize: 12, color: row.isError ? p.error : p.ink }}>
+          {row.command}
+        </Text>
+        {row.ts > 0 ? <Text style={{ color: p.faint, fontSize: 11 }}>{clock(row.ts)}</Text> : null}
+        {row.captureId && ctx?.agent ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="关闭输出卡片"
+            onPress={() => useCapturedCommands.getState().dismiss(ctx.agent!.key, row.captureId!)}
+            style={{ padding: 2 }}
+          >
+            <MaterialCommunityIcons name="close" size={14} color={p.muted} />
+          </Pressable>
+        ) : null}
+      </View>
+      {shownText ? (
+        <View style={{ borderRadius: radius.sm, backgroundColor: p.surface, padding: space.sm, borderWidth: 1, borderColor: p.divider }}>
+          <Text selectable style={{ fontFamily: fonts.mono, fontSize: 12, lineHeight: 17, color: p.ink }}>
+            {shownText}
+          </Text>
+        </View>
+      ) : null}
+      {collapsible || interactive ? (
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm, alignItems: "center" }}>
+          {collapsible ? (
+            <Pressable onPress={() => setExpanded((v) => !v)}>
+              <Text style={{ color: p.accentText, fontSize: 12, fontWeight: "600" }}>
+                {expanded ? "收起输出" : `展开全部（${lines.length} 行）`}
+              </Text>
+            </Pressable>
+          ) : null}
+          {interactive && ctx?.onSwitchToTerminal ? (
+            <PocketButton size="sm" variant="primary" onPress={ctx.onSwitchToTerminal}>
+              切到终端继续操作
+            </PocketButton>
+          ) : null}
+          {interactive && ctx?.agent ? (
+            <PocketButton
+              size="sm"
+              variant="ghost"
+              onPress={() => {
+                void call(ctx.agent!.deviceId, "terminal.keys", { agent: ctx.agent!.key, keys: ["esc"] }).catch(() => {});
+                if (row.captureId) useCapturedCommands.getState().markPanelClosed(ctx.agent!.key, row.captureId);
+              }}
+            >
+              关闭面板 (Esc)
+            </PocketButton>
+          ) : null}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
 const renderRow: ListRenderItem<ListRow> = ({ item }) => {
   switch (item.type) {
     case "end":
@@ -699,15 +939,28 @@ const renderRow: ListRenderItem<ListRow> = ({ item }) => {
     case "terminal_queued":
       return <UserBubble text={item.text} badge="终端排队中 · 本轮结束后自动处理" />;
     case "tools":
-      return <ToolGroup items={item.items} thoughts={item.thoughts} notes={item.notes} defaultOpen={item.defaultOpen} />;
+      return (
+        <ToolGroup
+          items={item.items}
+          thoughts={item.thoughts}
+          notes={item.notes}
+          entries={item.entries}
+          latestThought={item.latestThought}
+          defaultOpen={item.defaultOpen}
+        />
+      );
     case "assistant":
       return <AssistantBlock text={item.text} ts={item.ts} />;
     case "thinking":
       return <ThinkingPill text={item.text} defaultOpen={item.defaultOpen} />;
     case "tool":
       return <ToolCard call={item.call} result={item.result} />;
+    case "command_result":
+      return <MobileCommandCard row={item} />;
+    case "compact_notice":
+      return <ModelSwitchBanner label={item.summary} ts={item.ts} />;
     case "turn_end":
-      return <TurnEnd ts={item.ts} />;
+      return null;
     case "model_switch":
       return <ModelSwitchBanner label={item.label} ts={item.ts} />;
     case "system":
@@ -727,6 +980,7 @@ export function ChatView({
   sub,
   childCount,
   trail = [],
+  onSwitchToTerminal,
 }: {
   agent: Agent;
   active: boolean;
@@ -736,6 +990,7 @@ export function ChatView({
   /** Known number of children of the session on screen (enables `session.children`). */
   childCount?: number;
   trail?: Crumb[];
+  onSwitchToTerminal?: () => void;
 }) {
   if (agent.isShell && !agent.sessionKey && !sub) {
     return <ShellChatView agent={agent} active={active} bottomInset={bottomInset} />;
@@ -748,6 +1003,7 @@ export function ChatView({
       sub={sub}
       childCount={childCount}
       trail={trail}
+      onSwitchToTerminal={onSwitchToTerminal}
     />
   );
 }
@@ -881,6 +1137,7 @@ function SessionChatView({
   sub,
   childCount,
   trail = [],
+  onSwitchToTerminal,
 }: {
   agent: Agent;
   active: boolean;
@@ -888,6 +1145,7 @@ function SessionChatView({
   sub?: string;
   childCount?: number;
   trail?: Crumb[];
+  onSwitchToTerminal?: () => void;
 }) {
   const p = usePalette();
   const [older, setOlder] = useState<ConvEvent[]>([]);
@@ -1021,8 +1279,13 @@ function SessionChatView({
   const subCtx = useMemo(() => {
     const byCall = new Map<string, SubSession>();
     for (const s of kids.data?.sessions ?? []) if (s.parentCall) byCall.set(s.parentCall, s);
-    return { byCall, open: (s: SubSession) => openSub(agent.key, trail, s) };
-  }, [kids.data, agent.key, trail]);
+    return {
+      byCall,
+      open: (s: SubSession) => openSub(agent.key, trail, s),
+      agent,
+      onSwitchToTerminal,
+    };
+  }, [kids.data, agent, trail, onSwitchToTerminal]);
 
   const events = useMemo(() => {
     const seen = new Set(liveEvents.map((e) => e.id));
@@ -1039,8 +1302,21 @@ function SessionChatView({
     return () => clearInterval(t);
   }, [sendsAll?.length, agent.status]);
   const chatDisplayMode = useSettings((s) => s.chatDisplayMode);
+  const capturedCommands = useCapturedCommands((s) => s.byAgent[agent.key]);
   const folded = useMemo(() => foldEvents(events, chatDisplayMode), [events, chatDisplayMode]);
-  const sends = useMemo(() => followSends(sendsAll ?? [], folded, { status: agent.status, queued: agent.queued }, nowTick), [sendsAll, folded, agent.status, agent.queued, nowTick]);
+  const convForFollow = useMemo(
+    () =>
+      folded.map((r) => ({
+        type: r.type,
+        id: r.id,
+        ts: "ts" in r ? r.ts : undefined,
+        text: "text" in r ? r.text : undefined,
+        summary: r.type === "system" ? r.summary : r.type === "command_result" ? r.command : undefined,
+        label: r.type === "model_switch" ? r.label : undefined,
+      })),
+    [folded],
+  );
+  const sends = useMemo(() => followSends(sendsAll ?? [], convForFollow, { status: agent.status, queued: agent.queued }, nowTick), [sendsAll, convForFollow, agent.status, agent.queued, nowTick]);
   useEffect(() => {
     for (const x of sends.patches) patchSend(agent.key, x.id, x.patch);
     if (sends.drop.length) forget(agent.key, sends.drop);
@@ -1071,9 +1347,21 @@ function SessionChatView({
           return r.type === "user" && x ? { ...r, id: x.id, pictures: x.pictures } : r;
         }),
         ...sends.shown.map((x): Row => ({ type: "pending", id: x.id, text: x.text, ts: x.ts, pictures: x.pictures, send: x, agentKey: agent.key })),
+        ...(capturedCommands ?? []).map(
+          (c): Row => ({
+            type: "command_result",
+            id: c.id,
+            captureId: c.id,
+            command: c.command,
+            text: c.output,
+            isError: c.isError,
+            panelState: c.panelState,
+            ts: c.ts,
+          }),
+        ),
         ...terminalQueuedItems.map((text, idx): Row => ({ type: "terminal_queued", id: `term-q-${idx}-${text.slice(0, 24)}`, text })),
       ].reverse(),
-    [folded, sends, agent.key, terminalQueuedItems],
+    [folded, sends, agent.key, capturedCommands, terminalQueuedItems],
   );
   const working = !sub && agent.status === "working";
   const end = useMemo(

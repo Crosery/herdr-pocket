@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "dev.crosery.herdrpocket",
     "vendor": "crosery",
-    "versionCode": 2023,
-    "versionName": "0.2.23",
+    "versionCode": 2024,
+    "versionName": "0.2.24",
     "icon": "$media:layered_image",
     "label": "$string:app_name"
   }

@@ -15,8 +15,11 @@ use tauri::{AppHandle, Manager};
 
 #[tauri::command]
 pub fn log_write(level: String, kind: String, msg: String, data: Option<Value>) {
-    let level = Level::parse(&level).unwrap_or(Level::Info);
-    logging::write(level, "web", &kind, &msg, data.unwrap_or(Value::Null));
+    let parsed = Level::parse(&level).unwrap_or(Level::Info);
+    logging::write(parsed, "web", &kind, &msg, data.unwrap_or(Value::Null));
+    if parsed >= Level::Error {
+        relaylog::upload_soon();
+    }
 }
 
 #[derive(Serialize)]

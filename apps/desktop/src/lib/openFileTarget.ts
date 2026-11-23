@@ -1,5 +1,6 @@
 import type { Agent } from "@herdr-pocket/protocol";
 import { openFileTab } from "../shell/shellStore";
+import { logAction } from "./log";
 
 export interface ParsedFileTarget {
   path: string;
@@ -162,7 +163,13 @@ export function openAgentFileTarget(agent: Pick<Agent, "key" | "cwd"> | undefine
   if (!agent) return false;
   const parsed = parseFileTarget(raw, agent.cwd);
   if (!parsed) return false;
+  const ext = parsed.title.includes(".") ? parsed.title.split(".").pop()?.toLowerCase() ?? "" : "";
   if (typeof document !== "undefined" && !document.querySelector(".v3") && typeof window !== "undefined") {
+    logAction("files", "files.open", {
+      layout: "mobile",
+      ext,
+      hasLine: parsed.line !== undefined,
+    });
     window.dispatchEvent(
       new CustomEvent("pocket:open-mobile-file", {
         detail: { agentKey: agent.key, path: parsed.path, title: parsed.title },
@@ -170,6 +177,11 @@ export function openAgentFileTarget(agent: Pick<Agent, "key" | "cwd"> | undefine
     );
     return true;
   }
+  logAction("files", "files.open", {
+    layout: "desktop",
+    ext,
+    hasLine: parsed.line !== undefined,
+  });
   openFileTab(agent.key, parsed.path, parsed.title, {
     absPath: parsed.absPath,
     line: parsed.line,

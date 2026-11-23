@@ -20,6 +20,12 @@ export interface AppSettings {
   foldedGroups: string[];
   /** Sidebar folded to its icon rail by the user (wide windows only; narrow ones fold on their own). */
   sidebarCollapsed: boolean;
+  /** Show cmux-style floating spatial shortcut badges when holding ⌘ / Ctrl. */
+  showModifierHoldHints: boolean;
+  /** Play subtle local audio chime for background agent attention events. */
+  alertSound: boolean;
+  /** Only chime for completed tasks that ran >= 45s (blocked/permission always chime when alertSound is on). */
+  alertChimeOnlyLongTasks: boolean;
   /** "done" once the first-run guide was finished or skipped; "later" when closed half way. */
   onboarding: "new" | "later" | "done";
 }
@@ -56,6 +62,9 @@ function persistPrefs(s: AppSettings): void {
     hostFilter: s.hostFilter,
     foldedGroups: s.foldedGroups,
     sidebarCollapsed: s.sidebarCollapsed,
+    showModifierHoldHints: s.showModifierHoldHints,
+    alertSound: s.alertSound,
+    alertChimeOnlyLongTasks: s.alertChimeOnlyLongTasks,
     onboarding: s.onboarding,
   });
   try {
@@ -120,6 +129,9 @@ export const settingsStore = createStore<AppSettings>({
   hostFilter: saved.hostFilter ?? null,
   foldedGroups: saved.foldedGroups ?? [],
   sidebarCollapsed: saved.sidebarCollapsed ?? false,
+  showModifierHoldHints: saved.showModifierHoldHints ?? true,
+  alertSound: saved.alertSound ?? true,
+  alertChimeOnlyLongTasks: saved.alertChimeOnlyLongTasks ?? false,
   // Installs from before the guide existed already have a server: don't greet them as new.
   onboarding: saved.onboarding ?? (saved.lastServer ? "done" : "new"),
 });

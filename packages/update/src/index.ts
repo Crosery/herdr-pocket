@@ -39,9 +39,13 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import {
+  LATEST_MANIFEST_URL,
+  LATEST_SUMS_URL,
   RELEASE_REPO,
   apkAssetName,
+  parseReleaseManifest,
   releaseFromSums,
+  resolveChannelFromManifest,
   sourceLabel,
   sourceUrl,
   updateCheckDelays,
@@ -72,6 +76,7 @@ export const ASSETS = {
   bundle: (version: string) => `herdr-pocket-${version}.tar.gz`,
   apk: apkAssetName,
   checksums: "SHA256SUMS",
+  manifest: "RELEASE-MANIFEST.json",
 };
 
 export const SERVICES = {
@@ -161,27 +166,34 @@ export function sourcesFor(url: string): string[] {
 export async function latestRelease(): Promise<Release> {
   const t0 = Date.now();
   if (process.env.HERDR_POCKET_API) return { ...(await latestFromApi()), via: hostOf(apiBase()), ms: Date.now() - t0, how: "api" };
-  const url = `https://github.com/${repo()}/releases/latest/download/${ASSETS.checksums}`;
+  const manifestUrl = LATEST_MANIFEST_URL.replace(DEFAULT_REPO, repo());
+  const sumsUrl = LATEST_SUMS_URL.replace(DEFAULT_REPO, repo());
   const plan = sourcePlan();
   const region = plan.decision;
+  const fetchSource = (p: string, signal: AbortSignal) =>
+    latestFromManifest(sourceUrl(p, manifestUrl), signal).catch(() =>
+      latestFromSums(sourceUrl(p, sumsUrl), signal),
+    );
   if (plan.cached !== undefined) {
     try {
-      const r = await latestFromSums(sourceUrl(plan.cached, url), AbortSignal.timeout(10_000));
+      const r = await fetchSource(plan.cached, AbortSignal.timeout(10_000));
       return { ...r, via: sourceLabel(plan.cached), ms: Date.now() - t0, how: "cached", region };
     } catch {
       // The remembered source stopped answering: race them all again.
     }
   }
-  const race = await raceSources(plan.order, (p, signal) => latestFromSums(sourceUrl(p, url), signal));
+  const race = await raceSources(plan.order, fetchSource);
   if (race.winner !== undefined && race.value) {
     writeSourceCache({ region: region.region, winner: race.winner, at: Date.now(), probes: race.probes });
     return { ...race.value, via: sourceLabel(race.winner), ms: Date.now() - t0, how: "race", region, probes: race.probes };
   }
-  const sums = plan.order.map((p) => async (): Promise<Release> => ({ ...(await latestFromSums(sourceUrl(p, url), AbortSignal.timeout(30_000))), via: sourceLabel(p) }));
-  const api = async (): Promise<Release> => ({ ...(await latestFromApi()), via: hostOf(apiBase()) });
-  const tries = region.region === "cn" ? [...sums, api] : [api, ...sums];
+  const tries = [
+    ...plan.order.map((p) => async (): Promise<Release> => ({ ...(await fetchSource(p, AbortSignal.timeout(30_000))), via: sourceLabel(p) })),
+    async (): Promise<Release> => ({ ...(await latestFromApi()), via: hostOf(apiBase()) }),
+  ];
+  const orderedTries = region.region === "cn" ? tries : [tries[tries.length - 1]!, ...tries.slice(0, -1)];
   let first: unknown;
-  for (const attempt of tries) {
+  for (const attempt of orderedTries) {
     try {
       return { ...(await attempt()), ms: Date.now() - t0, how: "fallback", region, probes: race.probes };
     } catch (e) {
@@ -197,6 +209,27 @@ function hostOf(url: string): string {
   } catch {
     return url;
   }
+}
+
+/** The `bundle` channel release named by `RELEASE-MANIFEST.json` (carries forward unchanged versions). */
+async function latestFromManifest(url: string, signal?: AbortSignal): Promise<Release> {
+  const manifest = parseReleaseManifest(await fetchText(url, [url], signal));
+  if (!manifest) throw new Error(`${url} is not a release manifest`);
+  const entry = resolveChannelFromManifest(manifest, "bundle");
+  if (!entry) throw new Error(`${url} has no bundle channel entry`);
+  const tag = entry.tag || `v${entry.version}`;
+  const file = (t: string, name: string) => `https://github.com/${repo()}/releases/download/${t}/${name}`;
+  return {
+    version: entry.version,
+    tag,
+    page: `https://github.com/${repo()}/releases/tag/${tag}`,
+    assets: {
+      [entry.fileName]: file(tag, entry.fileName),
+      [ASSETS.checksums]: file(tag, ASSETS.checksums),
+      [ASSETS.manifest]: `https://github.com/${repo()}/releases/download/v${manifest.releaseVersion}/${ASSETS.manifest}`,
+    },
+    tarball: `https://github.com/${repo()}/archive/refs/tags/${tag}.tar.gz`,
+  };
 }
 
 /** The release a SHA256SUMS listing names (fetched from `url`, which may be a mirror). */
@@ -766,8 +799,14 @@ async function fetchText(url: string, sources = sourcesFor(url), signal?: AbortS
   throw first;
 }
 
-/** The hash for one file in a `sha256sum` listing. */
+/** The hash for one file in a `sha256sum` listing or `RELEASE-MANIFEST.json`. */
 export function sumFor(listing: string, name: string): string | undefined {
+  const manifest = parseReleaseManifest(listing);
+  if (manifest) {
+    for (const entry of Object.values(manifest.channels)) {
+      if (entry && entry.fileName === name) return entry.sha256;
+    }
+  }
   for (const line of listing.split("\n")) {
     const m = /^([0-9a-f]{64})\s+\*?(.+?)\s*$/i.exec(line);
     if (m && basename(m[2]!) === name) return m[1]!.toLowerCase();
