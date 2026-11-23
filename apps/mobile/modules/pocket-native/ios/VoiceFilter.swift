@@ -12,6 +12,7 @@ final class VoiceFilter {
     let tseEnrollment: VoxLockEnrollment?
     let needAutoOwnerSample: Bool
     let lockFirstSpeaker: Bool
+    let route: String
 
     init(
       denoise: Bool,
@@ -20,7 +21,8 @@ final class VoiceFilter {
       threshold: Float = 0.38,
       tseEnrollment: VoxLockEnrollment? = nil,
       needAutoOwnerSample: Bool = false,
-      lockFirstSpeaker: Bool = false
+      lockFirstSpeaker: Bool = false,
+      route: String = "speaker"
     ) {
       self.denoise = denoise
       self.enrolled = enrolled
@@ -29,6 +31,7 @@ final class VoiceFilter {
       self.tseEnrollment = tseEnrollment
       self.needAutoOwnerSample = needAutoOwnerSample
       self.lockFirstSpeaker = lockFirstSpeaker
+      self.route = route
     }
   }
 
@@ -69,7 +72,7 @@ final class VoiceFilter {
 
   private static let hop = Denoiser.hop // 160 samples = 10 ms
   private static let rampSamples = 256  // 16 ms raised-cosine ramp
-  private static let tsePrebufferSamples = 896 // 56 ms fixed cushion for zero-underflow K=5 streaming
+  private static let tsePrebufferSamples = 1_600 // 100 ms cushion for jittered mobile CPU scheduling
   private static let sendMax = 3_200
 
   private static let startProb: Float = 0.45
@@ -408,14 +411,16 @@ final class VoiceFilter {
       } else {
         if gatePhase < Self.rampSamples { gatePhase += 1 }
       }
-      let g: Float
+      let factor: Float
       if gatePhase >= Self.rampSamples {
-        g = 1.0
+        factor = 1.0
       } else if gatePhase <= 0 {
-        g = 0.0
+        factor = 0.0
       } else {
-        g = 0.5 - 0.5 * cos(Float.pi * Float(gatePhase) / Float(Self.rampSamples))
+        factor = 0.5 - 0.5 * cos(Float.pi * Float(gatePhase) / Float(Self.rampSamples))
       }
+      let minGain: Float = (!useTse && o.route == "speaker") ? 0.18 : 0.0
+      let g = minGain + (1.0 - minGain) * factor
       outFloats.append(enhOutBuf[i] * g)
     }
 
@@ -473,6 +478,10 @@ final class VoiceFilter {
     }
     if takeCount < Self.hop {
       _tseOverruns += 1
+      if _tseOverruns >= 8 && !_tseBypassed {
+        _tseBypassed = true
+        NSLog("PocketVoice TSE overrun count=%d >= 8, bypassing TSE to keep audio smooth", _tseOverruns)
+      }
       for i in takeCount..<Self.hop {
         outTse[i] = hpfHop[i]
         outRaw[i] = hpfHop[i]
@@ -524,7 +533,10 @@ final class VoiceFilter {
         _tseAudioMsSum += Double(curK * TargetExtractor.hop) * 1000.0 / Double(voiceRate)
 
         let budgetMs = curK <= 5 ? 38.0 : 60.0
-        if ms > budgetMs {
+        if ms > 95.0 {
+          _tseBypassed = true
+          NSLog("PocketVoice TSE single step overload (%.1f ms > 95 ms), bypassing TSE immediately", ms)
+        } else if ms > budgetMs {
           consecutiveSlowTse += 1
           if consecutiveSlowTse >= 3 {
             consecutiveSlowTse = 0
@@ -733,7 +745,9 @@ final class VoiceFilter {
       checkMsSum += v.ms
       if v.ms > checkMsMax { checkMsMax = v.ms }
 
-      let req: Float = v.kind == .end ? (o.threshold - 0.03) : (o.threshold - 0.01)
+      let speakerMargin: Float = ((tse == nil || tseBypassed) && o.route == "speaker") ? 0.05 : 0.0
+      let baseReq = max(0.24, o.threshold - speakerMargin)
+      let req: Float = v.kind == .end ? (baseReq - 0.03) : (baseReq - 0.01)
       let firstLockMode = enrolledNorm == nil && o.lockFirstSpeaker
       var effectiveScore = v.score
       var pass: Bool

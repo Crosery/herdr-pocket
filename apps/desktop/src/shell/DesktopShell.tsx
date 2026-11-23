@@ -52,7 +52,7 @@ import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle, updateSet
 import { terminalOwnsCtrlK } from "../lib/termKeys";
 import { getTerminalThemeSpec, resolveTerminalAppearance } from "../lib/terminalTheme";
 import { GROUP_RANK, lastChange, listGroup } from "./agentInfo";
-import { useHerdrDocSync } from "./herdrDocSync";
+import { flushHostNow, registerPendingSplitPlacement, syncHostNow, useHerdrDocSync } from "./herdrDocSync";
 import { Palette, type PaletteItem } from "./Palette";
 import { ShellSidebar } from "./ShellSidebar";
 import { PeekOverlay, ShellMain, ShellPanel, ShellStatus, ShellTabs, requestClosePane, requestCloseShellTab } from "./ShellWork";
@@ -71,7 +71,6 @@ import {
   setPalette,
   setSelectedSpace,
   shellStore,
-  spaceKeyFromAgent,
   splitTabPane,
   swapPaneDirection,
   tabLeaves,
@@ -209,12 +208,15 @@ export function DesktopShell({
       preferredSpace: string | null = null,
       splitTarget?: { tabId: string; paneId: string | null; direction: SplitDirection },
     ) => {
-      const { devices: devs, agents: agMap } = liveStore.get();
+      const { devices: devs, agents: agMap, spaces: spMap } = liveStore.get();
       const all = allAgents(agMap);
+      const allMap = new Map(all.map((a) => [a.key, a] as const));
+      const lookup = (k: string) => allMap.get(k);
       const s = shellStore.get();
+      const activeSpaceTabId = activeTabIdForSpace(s, lookup, spMap);
       const targetTab = splitTarget
         ? s.tabs.find((t) => t.id === splitTarget.tabId)
-        : s.tabs.find((t) => t.id === s.active);
+        : s.tabs.find((t) => t.id === (activeSpaceTabId ?? s.active));
       const targetLeaf = targetTab
         ? (splitTarget?.paneId
             ? tabLeaves(targetTab).find((l) => l.id === splitTarget.paneId)
@@ -223,7 +225,7 @@ export function DesktopShell({
       const targetContent = targetLeaf?.content;
       const targetAgentKey =
         targetContent && targetContent.kind !== "web" ? targetContent.agentKey : undefined;
-      const activeAgent = targetAgentKey ? all.find((a) => a.key === targetAgentKey) : undefined;
+      const activeAgent = targetAgentKey ? allMap.get(targetAgentKey) : undefined;
       const [selHost, selSpace] = s.selectedSpace ? (s.selectedSpace.split("\u0000") as [string, string]) : [null, null];
 
       const isOnlineHost = (id: string | null | undefined): id is string =>
@@ -246,32 +248,139 @@ export function DesktopShell({
       const spaceName =
         preferredSpace ??
         (activeAgent?.deviceId === hostId ? agentSpace(activeAgent) ?? null : null) ??
+        (targetTab?.docHostId === hostId && targetTab.docSpaceName ? targetTab.docSpaceName : null) ??
         (selHost === hostId ? selSpace : null);
+
+      const hostSpacesList = liveStore.get().spaces[hostId] ?? [];
+      const matchedKnownSpace =
+        (targetTab?.docHostId === hostId && targetTab.docSpaceId
+          ? hostSpacesList.find((sp) => sp.id === targetTab.docSpaceId)
+          : undefined) ??
+        (spaceName ? hostSpacesList.find((sp) => sp.name === spaceName) : hostSpacesList.find((sp) => sp.active) ?? hostSpacesList[0]);
 
       const folder =
         (activeAgent?.deviceId === hostId && activeAgent.cwd ? activeAgent.cwd : undefined) ??
-        all.find((a) => a.deviceId === hostId && (!spaceName || (agentSpace(a) ?? "") === spaceName) && a.cwd)?.cwd;
+        all.find((a) => a.deviceId === hostId && (!spaceName || (agentSpace(a) ?? "") === spaceName) && a.cwd)?.cwd ??
+        matchedKnownSpace?.folder;
 
-      const placePane = (key: string) => {
+      const placePane = (
+        key: string,
+        resolvedSpaceName?: string,
+        newPaneId?: string,
+        localIdHint?: string,
+      ) => {
         if (splitTarget && targetTab) {
-          splitTabPane(targetTab.id, targetLeaf?.id ?? splitTarget.paneId, splitTarget.direction, {
-            kind: "agent",
-            agentKey: key,
-            mode: "term",
-          });
+          const termId = localIdHint || key.slice(`${hostId}/hc:`.length);
+          if (!newPaneId && termId) {
+            registerPendingSplitPlacement(hostId, {
+              terminalId: termId,
+              agentKey: key,
+              targetTabId: targetTab.id,
+              ...(targetTab.docTabId ? { targetDocTabId: targetTab.docTabId } : {}),
+              anchorPaneId: targetLeaf?.id ?? splitTarget.paneId,
+              direction: splitTarget.direction,
+            });
+          }
+          splitTabPane(
+            targetTab.id,
+            targetLeaf?.id ?? splitTarget.paneId,
+            splitTarget.direction,
+            { kind: "agent", agentKey: key, mode: "term" },
+            { ...(newPaneId ? { newPaneId } : {}), dedupeOtherTabs: true },
+          );
+          if (newPaneId) {
+            void syncHostNow(hostId);
+          } else {
+            void flushHostNow(hostId);
+          }
         } else {
-          openAgentTab(key, "term");
+          if (resolvedSpaceName) {
+            const targetSpaceKey = `${hostId}\u0000${resolvedSpaceName}`;
+            if (shellStore.get().selectedSpace !== targetSpaceKey) {
+              setSelectedSpace(targetSpaceKey, lookup, liveStore.get().spaces);
+            }
+          }
+          openAgentTab(key, "term", { followSpace: true });
         }
       };
 
-      const knownSpaces = liveStore.get().spaces[hostId] ?? [];
-      const isLocal = knownSpaces.length === 0 && isTauri() && Boolean(localHostId && hostId === localHostId);
-      if (isLocal) {
+      const addOptimisticShell = (
+        key: string,
+        terminalId: string,
+        resolvedWhere: string | undefined,
+        resolvedCwd: string | undefined,
+      ) => {
+        liveStore.set((prev) => {
+          const list = prev.agents[hostId] ?? [];
+          if (list.some((a) => a.key === key)) return prev;
+          const shellAgent: Agent = {
+            key,
+            deviceId: hostId,
+            source: "hc",
+            localId: terminalId,
+            harness: "zsh",
+            title: "终端",
+            where: resolvedWhere,
+            cwd: resolvedCwd,
+            status: "idle",
+            statusSince: Date.now(),
+            isShell: true,
+            updatedAt: Date.now(),
+          };
+          return { ...prev, agents: { ...prev.agents, [hostId]: [shellAgent, ...list] }, rev: prev.rev + 1 };
+        });
+      };
+
+      // Path 1: When splitting an existing synced Herdr pane, delegate directly to Herdr.app (`pane.split`)
+      // so both local Mac and remote Mac split inside the exact tab in Herdr.app instead of creating a new tab!
+      const canUseHerdrPaneSplit = Boolean(
+        splitTarget &&
+          targetTab &&
+          targetLeaf &&
+          targetLeaf.content.kind === "agent" &&
+          activeAgent?.source === "hc" &&
+          activeAgent.deviceId === hostId &&
+          !targetLeaf.id.startsWith("p0:") &&
+          !targetLeaf.id.startsWith("p-"),
+      );
+      if (canUseHerdrPaneSplit && splitTarget && targetTab && targetLeaf) {
+        try {
+          const cmdRes = await rpcCall(
+            hostId,
+            "herdr.command",
+            {
+              command: "pane.split",
+              args: { pane: targetLeaf.id, direction: splitTarget.direction },
+            },
+            10_000,
+          );
+          const payload = (cmdRes?.result ?? {}) as { terminal?: unknown; pane?: unknown };
+          const rawTerm = typeof payload.terminal === "string" ? payload.terminal.trim() : "";
+          if (rawTerm) {
+            const termId = rawTerm.includes("/") ? rawTerm.split("/").pop()! : rawTerm;
+            const key = `${hostId}/hc:${termId}`;
+            const newPaneId = typeof payload.pane === "string" && payload.pane.trim() ? payload.pane.trim() : undefined;
+            addOptimisticShell(key, termId, spaceName || undefined, folder || undefined);
+            placePane(key, spaceName || undefined, newPaneId, termId);
+            refreshHostSpaces(hostId);
+            return;
+          }
+        } catch {
+          // Herdr.app window may be closed on that computer; fall through cleanly to direct hc/agent.create below.
+        }
+      }
+
+      const isLocalDesktop = isTauri() && native.available() && Boolean(localHostId && hostId === localHostId);
+      const tryLocalShellCreate = async (): Promise<boolean> => {
+        if (!isLocalDesktop) return false;
         try {
           let resolvedFolder = folder;
-          if (!resolvedFolder && spaceName) {
+          let spaceId = matchedKnownSpace?.id;
+          if ((!resolvedFolder || !spaceId) && spaceName) {
             const spRes = await rpcCall(hostId, "spaces.list", {}, 1_500).catch(() => null);
-            resolvedFolder = spRes?.spaces.find((sp) => sp.name === spaceName)?.folder;
+            const spMatch = spRes?.spaces.find((sp) => sp.name === spaceName);
+            resolvedFolder = resolvedFolder || spMatch?.folder;
+            spaceId = spaceId || spMatch?.id;
           }
           const grid = measureTerminalGrid(splitTarget?.direction);
           const created = await native.localTermCreateShell({
@@ -280,37 +389,30 @@ export function DesktopShell({
             rows: grid.rows,
             display: grid.display,
             spaceName: spaceName || undefined,
+            spaceId: spaceId || undefined,
+            tabId: splitTarget ? targetTab?.docTabId : undefined,
           });
           const key = `${hostId}/hc:${created.terminal}`;
-          liveStore.set((prev) => {
-            const list = prev.agents[hostId] ?? [];
-            if (list.some((a) => a.key === key)) return prev;
-            const shellAgent: Agent = {
-              key,
-              deviceId: hostId,
-              source: "hc",
-              localId: created.terminal,
-              harness: "zsh",
-              title: "终端",
-              where: spaceName || undefined,
-              cwd: created.cwd || resolvedFolder || undefined,
-              status: "idle",
-              statusSince: Date.now(),
-              isShell: true,
-              updatedAt: Date.now(),
-            };
-            return { ...prev, agents: { ...prev.agents, [hostId]: [shellAgent, ...list] }, rev: prev.rev + 1 };
-          });
-          placePane(key);
-          return;
+          addOptimisticShell(key, created.terminal, spaceName || undefined, created.cwd || resolvedFolder || undefined);
+          placePane(key, spaceName || undefined, undefined, created.terminal);
+          refreshHostSpaces(hostId);
+          return true;
         } catch {
-          // If local `hc` direct launch failed (e.g. `hc` absent), fall back to daemon RPC below.
+          return false;
         }
+      };
+
+      // When splitting locally while Herdr.app is closed (or standalone), or when there are no Herdr spaces yet,
+      // spawn directly via local `hc` and preserve the split placement in HerdrDoc.
+      if (isLocalDesktop && (splitTarget || hostSpacesList.length === 0)) {
+        if (await tryLocalShellCreate()) return;
       }
 
       try {
         const spRes = await rpcCall(hostId, "spaces.list", {}, 6_000).catch(() => null);
-        const matchedSpace = spaceName ? spRes?.spaces.find((sp) => sp.name === spaceName) : spRes?.spaces[0];
+        const matchedSpace = spaceName
+          ? spRes?.spaces.find((sp) => sp.name === spaceName)
+          : spRes?.spaces.find((sp) => sp.active) ?? spRes?.spaces[0];
         const spaceId = matchedSpace?.id;
         const resolvedFolder = folder || matchedSpace?.folder || spRes?.folders[0];
         const created = await rpcCall(
@@ -323,56 +425,55 @@ export function DesktopShell({
           },
           20_000,
         );
-        liveStore.set((prev) => {
-          const list = prev.agents[hostId] ?? [];
-          if (list.some((a) => a.key === created.agent)) return prev;
-          const shellAgent: Agent = {
-            key: created.agent,
-            deviceId: hostId,
-            source: "hc",
-            localId: created.terminal,
-            harness: "zsh",
-            title: "终端",
-            where: matchedSpace?.name || spaceName || undefined,
-            cwd: resolvedFolder || undefined,
-            status: "idle",
-            statusSince: Date.now(),
-            isShell: true,
-            updatedAt: Date.now(),
-          };
-          return { ...prev, agents: { ...prev.agents, [hostId]: [shellAgent, ...list] }, rev: prev.rev + 1 };
-        });
-        placePane(created.agent);
+        const resolvedWhere = matchedSpace?.name || spaceName || undefined;
+        addOptimisticShell(created.agent, created.terminal, resolvedWhere, resolvedFolder || undefined);
+        placePane(created.agent, resolvedWhere, undefined, created.terminal);
         refreshHostSpaces(hostId);
       } catch (e) {
+        if (isLocalDesktop && (await tryLocalShellCreate())) return;
         toast((e as Error).message, true);
       }
     },
     [toast],
   );
 
-  // Auto-select the active Space once host spaces arrive so the tab bar scopes to the Space like Herdr.app.
-  const autoSelectedSpace = useRef(Boolean(shellStore.get().selectedSpace));
+  // Keep a valid Space selected whenever host spaces or agents exist so the tab bar stays Space-scoped like Herdr.app.
   useEffect(() => {
-    if (autoSelectedSpace.current || shellStore.get().selectedSpace !== null) {
-      autoSelectedSpace.current = true;
-      return;
+    const curSel = shellStore.get().selectedSpace;
+    const all = allAgents(agentsMap);
+    const agentByKey = new Map(all.map((a) => [a.key, a] as const));
+    if (curSel) {
+      const sep = curSel.indexOf("\u0000");
+      const selHost = sep >= 0 ? curSel.slice(0, sep) : "";
+      const selName = sep >= 0 ? curSel.slice(sep + 1) : curSel;
+      const stillExists =
+        Boolean(spacesMap[selHost]?.some((sp) => sp.name === selName)) ||
+        all.some((a) => a.deviceId === selHost && (agentSpace(a) ?? "") === selName);
+      if (stillExists) return;
     }
+
     const localId = localHostIdStore.get();
     const candidateHosts = [
-      ...(localId && spacesMap[localId]?.length ? [localId] : []),
+      ...(localId ? [localId] : []),
       ...hosts.filter((h) => h.online && h.id !== localId).map((h) => h.id),
       ...Object.keys(spacesMap),
+      ...hosts.filter((h) => !h.online && h.id !== localId).map((h) => h.id),
     ];
-    const agentByKey = new Map(allAgents(agentsMap).map((a) => [a.key, a] as const));
     for (const hid of candidateHosts) {
       const list = spacesMap[hid];
-      if (!list?.length) continue;
-      const pick = list.find((sp) => sp.active) ?? list.find((sp) => sp.terminals > 0) ?? list[0];
-      if (!pick) continue;
-      autoSelectedSpace.current = true;
-      setSelectedSpace(`${hid}\u0000${pick.name}`, (k) => agentByKey.get(k));
-      return;
+      if (list?.length) {
+        const pick = list.find((sp) => sp.active) ?? list.find((sp) => sp.terminals > 0) ?? list[0];
+        if (pick) {
+          setSelectedSpace(`${hid}\u0000${pick.name}`, (k) => agentByKey.get(k), spacesMap);
+          return;
+        }
+      }
+      const fallbackAgent = all.find((a) => a.deviceId === hid && agentSpace(a));
+      const fallbackSpace = fallbackAgent ? agentSpace(fallbackAgent) : undefined;
+      if (fallbackSpace) {
+        setSelectedSpace(`${hid}\u0000${fallbackSpace}`, (k) => agentByKey.get(k), spacesMap);
+        return;
+      }
     }
   }, [agentsMap, hosts, spacesMap]);
 
@@ -429,11 +530,7 @@ export function DesktopShell({
                   ? GitBranch
                   : Globe,
         terms: label,
-        run: () => {
-          const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
-          if (shellStore.get().selectedSpace) setSelectedSpace(null, (k) => map.get(k));
-          setActiveTab(t.id);
-        },
+        run: () => setActiveTab(t.id),
       });
     }
     list.push(
@@ -633,14 +730,7 @@ export function DesktopShell({
         hint: devices[a.deviceId]?.name,
         terms: `${a.harness} ${a.cwd ?? ""}`,
         icon: (({ size }: { size?: number }) => <VendorIcon harness={a.harness} isShell={a.isShell} size={size ?? 14} />) as PaletteItem["icon"],
-        run: () => {
-          const s = shellStore.get();
-          const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
-          if (s.selectedSpace && s.selectedSpace !== spaceKeyFromAgent(a)) {
-            setSelectedSpace(null, (k) => map.get(k));
-          }
-          openAgentTab(a.key);
-        },
+        run: () => openAgentTab(a.key),
       });
     }
     list.push(
@@ -684,13 +774,13 @@ export function DesktopShell({
   function currentVisibleTabs() {
     const s = shellStore.get();
     const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
-    return visibleTabsForSpace(s.tabs, s.selectedSpace, (k) => map.get(k));
+    return visibleTabsForSpace(s.tabs, s.selectedSpace, (k) => map.get(k), liveStore.get().spaces);
   }
 
   function currentFocusedPane() {
     const s = shellStore.get();
     const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
-    const activeId = activeTabIdForSpace(s, (k) => map.get(k));
+    const activeId = activeTabIdForSpace(s, (k) => map.get(k), liveStore.get().spaces);
     const tab = s.tabs.find((x) => x.id === activeId);
     if (!tab) return null;
     const focused = focusedLeafOfTab(tab);
@@ -705,7 +795,7 @@ export function DesktopShell({
   function closeActive() {
     const s = shellStore.get();
     const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
-    const activeId = activeTabIdForSpace(s, (k) => map.get(k));
+    const activeId = activeTabIdForSpace(s, (k) => map.get(k), liveStore.get().spaces);
     const t = s.tabs.find((x) => x.id === activeId);
     if (t) requestCloseShellTab(t);
   }

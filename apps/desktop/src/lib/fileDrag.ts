@@ -73,8 +73,9 @@ export function resolveDropPath(item: WorkspaceDragItem, targetHostId: string): 
 export function startTabDrag(e: DragEvent<HTMLElement>, tabId: string): void {
   activeTabDragId = tabId;
   try {
-    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.effectAllowed = "copyMove";
     e.dataTransfer.setData(TAB_DRAG_MIME, tabId);
+    e.dataTransfer.setData("text/plain", `tab:${tabId}`);
   } catch {
     // WebKit fallback via module singleton
   }
@@ -103,8 +104,9 @@ export function readTabDrag(e: DragEvent<HTMLElement>): string | null {
 export function startPanelDrag(e: DragEvent<HTMLElement>, item: PanelDragItem): void {
   activePanelDrag = item;
   try {
-    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.effectAllowed = "copyMove";
     e.dataTransfer.setData(PANEL_DRAG_MIME, JSON.stringify(item));
+    e.dataTransfer.setData("text/plain", item.kind === "agent" ? item.agentKey : item.url);
   } catch {
     // WebKit fallback via module singleton
   }
@@ -141,8 +143,9 @@ export function readPanelDrag(e: DragEvent<HTMLElement>): PanelDragItem | null {
 export function startPaneDrag(e: DragEvent<HTMLElement>, item: PaneDragItem): void {
   activePaneDrag = item;
   try {
-    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.effectAllowed = "copyMove";
     e.dataTransfer.setData(PANE_DRAG_MIME, JSON.stringify(item));
+    e.dataTransfer.setData("text/plain", `${item.tabId}:${item.paneId}`);
   } catch {
     // WebKit fallback via module singleton
   }

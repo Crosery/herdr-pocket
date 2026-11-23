@@ -91,8 +91,24 @@ test("herdrRootToSplitNode and splitNodeToHerdrRoot preserve structure, weights,
   assert.equal((col?.children?.[1]?.content as { mod?: string })?.mod, "custom-widget");
 });
 
-test("formatHerdrTabLabel implements numbered tabs, tb<N> program fallback, custom names, and Z zoom badge", () => {
-  assert.equal(formatHerdrTabLabel({ name: "" }, 0, "Claude Code", false), "1");
+test("formatHerdrTabLabel uses live title / program fallback for unnamed tabs, preserves custom names, and shows Z zoom badge", () => {
+  assert.equal(formatHerdrTabLabel({ name: "" }, 0, "Claude Code", false), "Claude Code");
+  assert.equal(
+    formatHerdrTabLabel({ name: "" }, { programName: "Claude Code", liveTitle: "✳ Fix split panes" }, false),
+    "Fix split panes",
+  );
+  assert.equal(
+    formatHerdrTabLabel({ name: "" }, { programName: "Claude Code", liveTitle: "~/work_file/herdr-pocket" }, false),
+    "Claude Code",
+  );
+  assert.equal(
+    formatHerdrTabLabel({ name: "" }, { programName: "Codex", liveTitle: "t19g" }, false),
+    "Codex",
+  );
+  assert.equal(
+    formatHerdrTabLabel({ name: "" }, { programName: "Terminal", liveTitle: "zsh" }, true),
+    "Terminal Z",
+  );
   assert.equal(formatHerdrTabLabel({ name: "2" }, 1, "Codex", false), "2");
   assert.equal(formatHerdrTabLabel({ name: "2" }, 1, "Codex", true), "2 Z");
   assert.equal(formatHerdrTabLabel({ name: "tb12" }, 0, "Gemini CLI", false), "Gemini CLI");

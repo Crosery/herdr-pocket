@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, ChevronRight, Columns2, History, Laptop, PanelLeft, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Columns2, History, Laptop, PanelLeft, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Trash2 } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
 import { PocketButton, PocketModal, overlayStore, useToast } from "../components/PocketUI";
@@ -9,7 +9,7 @@ import { assetUrl } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
 import { pingRelay, refreshHostSpaces, rpcCall } from "../lib/relay";
-import { agentSpace, agentTitle, allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
+import { allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
 import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
@@ -81,7 +81,7 @@ export function ShellSidebar({
   const toast = useToast();
   const spaceSel = shellStore.use((s) => s.selectedSpace);
   const allByKey = useMemo(() => new Map(Object.values(agentsMap).flat().map((a) => [a.key, a] as const)), [agentsMap]);
-  const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k));
+  const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k), spacesMap);
 
   useEffect(() => {
     if (!agentMenu) return;
@@ -175,11 +175,9 @@ export function ShellSidebar({
   }, [agents, devices, localHostId, spacesMap]);
 
   const selected = spaceSel && machines.some((m) => m.spaces.some((s) => s.id === spaceSel)) ? spaceSel : null;
-  const [selDevice, selSpace] = selected ? (selected.split("\u0000") as [string, string]) : [null, null];
-  const inScope = useMemo(
-    () => (selected ? agents.filter((a) => a.deviceId === selDevice && (agentSpace(a) ?? "") === selSpace) : agents),
-    [agents, selected, selDevice, selSpace],
-  );
+  // Agent list stays global across all Spaces & computers like Herdr.app; clicking any Agent switches Spaces automatically.
+  const inScope = agents;
+  const primaryMachineId = localHostId || machines[0]?.id || null;
 
   const groups = useMemo(() => {
     if (sort === "recent") return [{ key: "recent" as const, title: "最近", list: [...inScope].sort((x, y) => lastChange(y) - lastChange(x)) }];
@@ -212,7 +210,9 @@ export function ShellSidebar({
 
   const agentRow = (a: Agent) => {
     const g = listGroup(a, devices);
-    const label = selected ? agentTitle(a) : spacedTitle(a);
+    const label = spacedTitle(a);
+    const showMachine = machines.length > 1 && a.deviceId !== primaryMachineId;
+    const machineName = showMachine ? devices[a.deviceId]?.name : undefined;
     const isFocusedAgent = a.key === activeAgentKey;
     const isInSplit = !isFocusedAgent && activeSplitAgentKeys.has(a.key);
     return (
@@ -223,7 +223,7 @@ export function ShellSidebar({
         draggable
         data-tauri-drag-region="false"
         className={`v3-row v3-agent${isFocusedAgent ? " selected" : isInSplit ? " in-split" : ""}${g === "offline" ? " dim" : ""}`}
-        title={collapsed ? label : undefined}
+        title={collapsed ? (machineName ? `${machineName} · ${label}` : label) : undefined}
         onDragStart={(e) => startPanelDrag(e, { kind: "agent", agentKey: a.key })}
         onDragEnd={() => endPanelDrag()}
         onClick={(e) => {
@@ -250,6 +250,7 @@ export function ShellSidebar({
         ) : (
           <>
             <span className="v3-row-label truncate">{label}</span>
+            {machineName ? <span className="v3-agent-machine truncate">{machineName}</span> : null}
             <span className="v3-time">{shortAgo(lastChange(a), now)}</span>
             <StatusMark group={g} compact={sort === "status" && g === "blocked"} />
           </>
@@ -344,13 +345,13 @@ export function ShellSidebar({
                             aria-pressed={selected === s.id}
                             className={`v3-row v3-space${s.count === 0 ? " empty" : ""}${selected === s.id ? " selected" : ""}`}
                             title={collapsed ? `${m.name} · ${label}` : s.folder || undefined}
-                            onClick={() => setSpaceSel(selected === s.id ? null : s.id)}
+                            onClick={() => setSpaceSel(s.id)}
                             onContextMenu={(e) => {
                               if (!m.online || collapsed) return;
                               e.preventDefault();
                               setDeleteSpaceTarget(s);
                             }}
-                            onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setSpaceSel(selected === s.id ? null : s.id))}
+                            onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setSpaceSel(s.id))}
                           >
                             <span
                               className={`v3-tile${custom ? " custom" : ` tone-${toneIndex(label)}`}`}
@@ -416,12 +417,6 @@ export function ShellSidebar({
           {collapsed ? null : (
             <div className="v3-block-head">
               <span className="grow">Agent</span>
-              {selected ? (
-                <button className="v3-filter-chip" onClick={() => setSpaceSel(null)} title="显示全部空间的 Agent">
-                  <span className="truncate">{selSpace}</span>
-                  <X size={11} />
-                </button>
-              ) : null}
               <button
                 className={`v3-icon-btn small${sort === "recent" ? " on" : ""}`}
                 aria-label={sort === "recent" ? "按状态分组" : "按最近排序"}

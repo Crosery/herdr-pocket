@@ -139,6 +139,7 @@ class VoiceFilter internal constructor(
     val captureMissingSample: Boolean = false,
     val requireIsolation: Boolean = enrolled != null,
     val lockFirstSpeaker: Boolean = false,
+    val route: String = "speaker",
   )
 
   data class UtteranceTelemetry(
@@ -190,9 +191,9 @@ class VoiceFilter internal constructor(
     private const val RECHECK_WINDOW_SAMPLES = 20_480 // 1280 ms
     private const val CLEAN_RING_CAP = 32_000 // 2.0 s
     private const val SESS_MIN_SAMPLES = 14_400 // 900 ms
-    // Capture delivers 20 ms packets. Budget for the first full chunk and its inference before playout.
-    private const val TSE_PREBUFFER_HOPS = 11
-    private const val TSE_RECOVERY_PREBUFFER_HOPS = 15
+    // Capture delivers 20 ms packets. Budget for the first full chunk and jittered mobile CPU scheduling.
+    private const val TSE_PREBUFFER_HOPS = 16
+    private const val TSE_RECOVERY_PREBUFFER_HOPS = 20
     private const val TSE_RETRY_DELAY_HOPS = 8
     private const val TSE_K5_BUDGET_MS = 38.0
     private const val TSE_K8_BUDGET_MS = 60.0
@@ -351,6 +352,10 @@ class VoiceFilter internal constructor(
     }
     if (take < HOP) {
       dst.fill(0f, take, HOP)
+      tseOverruns++
+      if (tseChunks > 0 && tseOverruns >= 8 && !tseBypassed) {
+        suspendTse("bypass_overrun", 0.0, retry = false)
+      }
     }
   }
 
@@ -568,7 +573,8 @@ class VoiceFilter internal constructor(
     val gen = resetGen
     val protos = prototypesNorm
     val sess = sessionEmb
-    val th = o.threshold
+    val speakerMargin = if (o.route == "speaker" && !isTseActive) 0.05f else 0f
+    val th = maxOf(0.24f, o.threshold - speakerMargin)
     val keepForSample = captureOwnerBuf != null && !ownerSampleDelivered
     worker(Runnable {
       val t0 = System.nanoTime()
@@ -613,6 +619,8 @@ class VoiceFilter internal constructor(
       checkMsSum += r.ms
       if (r.ms > checkMsMax) checkMsMax = r.ms
 
+      val speakerMargin = if (o.route == "speaker" && !isTseActive) 0.05f else 0f
+      val effectiveThreshold = maxOf(0.24f, o.threshold - speakerMargin)
       val firstLockMode = enrolledNorm == null && o.lockFirstSpeaker
       var effectiveScore = r.sv.effective
       var pass = if (firstLockMode) {
@@ -621,10 +629,10 @@ class VoiceFilter internal constructor(
           true
         } else {
           effectiveScore = cosine(embNorm, cur)
-          effectiveScore >= o.threshold
+          effectiveScore >= effectiveThreshold
         }
       } else {
-        effectiveScore >= o.threshold
+        effectiveScore >= effectiveThreshold
       }
       if (firstLockMode && sessionEmb == null && (r.usedSamples >= SESS_MIN_SAMPLES || r.kind == "end")) {
         sessionEmb = embNorm
@@ -770,7 +778,9 @@ class VoiceFilter internal constructor(
       lastTseAttenDb = attenDb(tseRms, r.rawRms)
 
       val budget = if (r.kFrames <= VoxLockStreamer.DEFAULT_K) TSE_K5_BUDGET_MS else TSE_K8_BUDGET_MS
-      if (r.ms > budget) {
+      if (r.ms > 150.0) {
+        suspendTse("bypass_tse", r.ms, retry = false)
+      } else if (r.ms > budget) {
         slowTseStreak++
         if (slowTseStreak >= 3) {
           slowTseStreak = 0

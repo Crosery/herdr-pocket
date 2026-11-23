@@ -194,6 +194,7 @@ export class Assistant {
   private wakeTimes: number[] = [];
   private wakesRunning = 0;
   private wakeQueue: Array<() => void> = [];
+  private activeWakeAborts = new Set<AbortController>();
   private boardSig = "";
   private timers = new Set<NodeJS.Timeout>();
   private reminderTimer: NodeJS.Timeout;
@@ -365,8 +366,14 @@ export class Assistant {
   /** Who typed the messages the next answer is for, for the log. */
   private askers: string[] = [];
 
+  /** Preempts in-flight background wake lookups so live voice/text turns never queue behind idle wakes. */
+  private preemptBackgroundWakes(): void {
+    for (const ac of this.activeWakeAborts) ac.abort();
+  }
+
   /** A typed message: stored at once, answered in the background. */
   say(text: string, from?: Asker): AssistantItem {
+    this.preemptBackgroundWakes();
     const item = this.put({ id: newId("u"), ts: this.now(), role: "user", text: text.slice(0, 4000), via: "text" });
     if (from) this.askers.push(from.name);
     this.schedule();
@@ -460,14 +467,23 @@ export class Assistant {
    */
   async delegate(objective: string, context: Array<{ role: string; content: string }>, signal: AbortSignal): Promise<Script> {
     if (!this.llm) return { say: "我现在只能陪你聊，查不了 agent，后台模型还没配好。", keep: "" };
+    this.preemptBackgroundWakes();
     const task = async (): Promise<Script> => {
       if (signal.aborted) return { say: "", keep: "" };
       const messages = this.messagesFromThread(VOICE_CONTEXT_ITEMS);
       pushUser(messages, delegateAsk(this.name, objective, context));
       this.setBusy(true, "语音任务");
       const t0 = Date.now();
+      const mergedAc = new AbortController();
+      const onCallerAbort = () => mergedAc.abort();
+      signal.addEventListener("abort", onCallerAbort, { once: true });
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        mergedAc.abort();
+      }, 22_000);
       try {
-        const run = await this.run(messages, { occasion: "call", signal });
+        const run = await this.run(messages, { occasion: "call", signal: mergedAc.signal });
         let script = splitScript(run.text || "好了。");
         // Notes are what the voice answers follow-up questions from: without them it can only ask again.
         if (!script.keep.trim() && run.notes.length) script = { ...script, keep: clip(run.notes.slice(-4).join("\n"), MAX_KEEP) };
@@ -479,9 +495,15 @@ export class Assistant {
         });
         return script;
       } catch (e) {
+        if (timedOut && !signal.aborted) {
+          this.event({ kind: "assistant.turn", level: "warn", msg: `call task timed out after ${Date.now() - t0}ms`, data: { objective: clip(oneLine(objective), 200) } });
+          return { say: "后台这会儿响应有点慢，你稍后再问我一次吧。", keep: "" };
+        }
         if (!signal.aborted) this.event({ kind: "assistant.turn", level: "error", msg: `call task failed after ${Date.now() - t0}ms: ${(e as Error).message.slice(0, 200)}`, data: { objective: clip(oneLine(objective), 200) } });
         throw e;
       } finally {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onCallerAbort);
         this.setBusy(false);
       }
     };
@@ -1589,6 +1611,7 @@ export class Assistant {
     if (this.wakesRunning >= WAKE_CONCURRENCY) await new Promise<void>((r) => this.wakeQueue.push(r));
     this.wakesRunning++;
     const ac = new AbortController();
+    this.activeWakeAborts.add(ac);
     let timer: NodeJS.Timeout | undefined;
     const t0 = Date.now();
     try {
@@ -1614,6 +1637,7 @@ export class Assistant {
       this.event({ kind: "wake", level: "error", msg: `wake-up failed after ${Date.now() - t0}ms: ${(e as Error).message.slice(0, 200)}` });
       return null;
     } finally {
+      this.activeWakeAborts.delete(ac);
       clearTimeout(timer);
       this.wakesRunning--;
       this.wakeQueue.shift()?.();

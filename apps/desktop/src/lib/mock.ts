@@ -414,6 +414,10 @@ function buildDemoModelsPool(harness: string): AgentModelOption[] {
   ];
 }
 
+let mockTermSeq = 20;
+let mockPaneSeq = 20;
+let mockSplitSeq = 20;
+
 const demoHerdrDocs: Record<string, { value: HerdrDoc; version: number }> = {
   "dev-mac": {
     version: 1,
@@ -426,7 +430,7 @@ const demoHerdrDocs: Record<string, { value: HerdrDoc; version: number }> = {
           tabs: [
             {
               id: "tb1",
-              name: "1",
+              name: "",
               root: {
                 id: "s1",
                 type: "row",
@@ -438,12 +442,12 @@ const demoHerdrDocs: Record<string, { value: HerdrDoc; version: number }> = {
             },
             {
               id: "tb2",
-              name: "2",
+              name: "",
               root: { id: "p3", type: "block", content: { terminal: "t2" } },
             },
             {
               id: "tb3",
-              name: "3",
+              name: "",
               root: { id: "p4", type: "block", content: { terminal: "t5" } },
             },
           ],
@@ -464,7 +468,7 @@ const demoHerdrDocs: Record<string, { value: HerdrDoc; version: number }> = {
           tabs: [
             {
               id: "tb1",
-              name: "1",
+              name: "",
               root: { id: "p1", type: "block", content: { terminal: "t3" } },
             },
           ],
@@ -607,6 +611,86 @@ export const mockApi = {
       const nextVersion = cur.version + 1;
       demoHerdrDocs[to] = { value: JSON.parse(JSON.stringify(nextVal)), version: nextVersion };
       return { ok: true, version: nextVersion };
+    }
+    if (method === "herdr.command" && params?.command === "pane.split") {
+      const paneId = String(params?.args?.pane ?? "").trim();
+      const direction = params?.args?.direction === "down" ? "down" : "right";
+      const axis = direction === "right" ? "row" : "column";
+      const entry = demoHerdrDocs[to];
+      if (!paneId || !entry) throw new Error(`no pane ${paneId}`);
+      const termId = `t${++mockTermSeq}`;
+      const newPaneId = `p${++mockPaneSeq}`;
+      let hitSpaceName = "";
+      let hitTabName = "1";
+      let hitFolder = to === "dev-linux" ? "~/repos/sample-cli" : "~/work/demo-app";
+      let inserted = false;
+
+      const splitNode = (node: any): any => {
+        if (!node || typeof node !== "object") return node;
+        if (node.type === "block" && node.id === paneId) {
+          inserted = true;
+          const share = node.size?.weight ?? 1;
+          const prevCopy = { ...node, size: { weight: share / 2 } };
+          const nextBlock = { id: newPaneId, type: "block", size: { weight: share / 2 }, content: { terminal: termId } };
+          return { id: `s${++mockSplitSeq}`, type: axis, children: [prevCopy, nextBlock] };
+        }
+        if ((node.type === "row" || node.type === "column") && Array.isArray(node.children)) {
+          if (node.type === axis) {
+            const idx = node.children.findIndex((c: any) => c?.id === paneId);
+            if (idx >= 0) {
+              inserted = true;
+              const target = node.children[idx];
+              const share = target.size?.weight ?? 1;
+              const kids = [...node.children];
+              kids.splice(
+                idx,
+                1,
+                { ...target, size: { weight: share / 2 } },
+                { id: newPaneId, type: "block", size: { weight: share / 2 }, content: { terminal: termId } },
+              );
+              return { ...node, children: kids };
+            }
+          }
+          return { ...node, children: node.children.map(splitNode) };
+        }
+        return node;
+      };
+
+      for (const sp of entry.value.spaces) {
+        for (const tb of sp.tabs) {
+          const prevInserted = inserted;
+          tb.root = splitNode(tb.root);
+          if (!prevInserted && inserted) {
+            hitSpaceName = sp.name || "";
+            hitTabName = tb.name || "1";
+            hitFolder = sp.folder || hitFolder;
+            break;
+          }
+        }
+        if (inserted) break;
+      }
+      if (!inserted) throw new Error(`no pane ${paneId}`);
+      entry.version += 1;
+
+      const key = `${to}/hc:${termId}`;
+      const ag: Agent = {
+        key,
+        deviceId: to,
+        source: "hc",
+        localId: termId,
+        harness: "zsh",
+        title: "终端",
+        where: hitSpaceName ? `${hitSpaceName} / ${hitTabName}` : hitTabName,
+        cwd: hitFolder,
+        status: "idle",
+        statusSince: Date.now(),
+        isShell: true,
+        updatedAt: Date.now(),
+      };
+      DEMO_AGENTS.unshift(ag);
+      DEMO_TERMINALS[key] = [`zsh · ${hitFolder}`, `${hitFolder} $ `];
+      mockApi.connect();
+      return { ok: true, result: { pane: newPaneId, terminal: termId } };
     }
     if (method === "folders.list") {
       const req = (params.path ?? "").trim() || "~";

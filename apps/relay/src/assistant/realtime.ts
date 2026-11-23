@@ -50,11 +50,17 @@ export interface RealtimeConfig {
   asrHoldMs?: number;
   /** Force-commit a user turn if server_vad stays open without audible voice for this long. */
   maxSpeechSilenceCommitMs?: number;
+  /** Override total upstream connect deadline (ms, defaults to 20s). */
+  attachTimeoutMs?: number;
+  /** Override hedged second upstream dial delay (ms, defaults to 4.5s). */
+  hedgeDelayMs?: number;
 }
 
 const PHONE_MIC_RATE = 16_000;
 const PHONE_SPEAKER_RATE = 48_000;
-const ATTACH_TIMEOUT_MS = 10_000;
+const ATTACH_TIMEOUT_MS = 20_000;
+const HEDGE_DELAY_MS = 4_500;
+const PRE_READY_BUFFER_MAX_BYTES = 51_200; // 1.6 s @ 16 kHz PCM16 mono
 const STUCK_VAD_COMMIT_MS = 12_000;
 const REFRESH_GAP_MS = 5000;
 const ASR_HOLD_MS = 900;
@@ -796,7 +802,12 @@ interface Run {
 }
 
 export class RealtimeCall {
-  private upstream: WebSocket;
+  private upstream: WebSocket | null = null;
+  private standbyUpstreams = new Set<WebSocket>();
+  private hedgeAttempted = false;
+  private hedgeTimer: NodeJS.Timeout | null = null;
+  private preReadyChunks: Buffer[] = [];
+  private preReadyBytes = 0;
   private ended = false;
   private captions = new CaptionPacer();
   private ready = false;
@@ -859,55 +870,127 @@ export class RealtimeCall {
     this.toPhone({ action: "relay.state", data: { state: "connecting" } });
     const url = new URL(cfg.url);
     if (!url.searchParams.has("model")) url.searchParams.set("model", cfg.model);
-    this.upstream = new WebSocket(url, {
-      headers: cfg.auth === "api-key" ? { "api-key": cfg.apiKey } : { Authorization: `Bearer ${cfg.apiKey}` },
-      // Audio frames would wait for zlib on the thread pool behind the hosts' screens; server-to-server bandwidth is cheap.
-      perMessageDeflate: false,
-      followRedirects: false,
-      handshakeTimeout: ATTACH_TIMEOUT_MS,
-      maxPayload: 16 * 1024 * 1024,
-    });
-    this.attachTimer = setTimeout(() => this.fail("语音服务没有及时响应"), ATTACH_TIMEOUT_MS + 2000);
+    const attachDeadlineMs = Math.max(500, cfg.attachTimeoutMs ?? ATTACH_TIMEOUT_MS);
+    const hedgeDelayMs = Math.max(50, cfg.hedgeDelayMs ?? HEDGE_DELAY_MS);
+    const headers = cfg.auth === "api-key" ? { "api-key": cfg.apiKey } : { Authorization: `Bearer ${cfg.apiKey}` };
+
+    const openUpstreamCandidate = (isBackup: boolean) => {
+      if (this.ended || this.upstream) return;
+      const ws = new WebSocket(url, {
+        headers,
+        // Audio frames would wait for zlib on the thread pool behind the hosts' screens; server-to-server bandwidth is cheap.
+        perMessageDeflate: false,
+        followRedirects: false,
+        handshakeTimeout: attachDeadlineMs,
+        maxPayload: 16 * 1024 * 1024,
+      });
+      this.standbyUpstreams.add(ws);
+
+      const maybeFallbackOrFail = (msg: string) => {
+        if (this.ended) return;
+        if (this.upstream === ws) {
+          this.fail(msg);
+          return;
+        }
+        this.standbyUpstreams.delete(ws);
+        if (this.upstream) return;
+        if (!isBackup && !this.hedgeAttempted) {
+          this.hedgeAttempted = true;
+          if (this.hedgeTimer) clearTimeout(this.hedgeTimer);
+          this.hedgeTimer = null;
+          openUpstreamCandidate(true);
+          return;
+        }
+        if (this.standbyUpstreams.size === 0) {
+          this.fail(msg);
+        }
+      };
+
+      ws.on("open", () => {
+        if (this.ended || this.upstream) {
+          this.standbyUpstreams.delete(ws);
+          ws.terminate();
+          return;
+        }
+        this.configureOn(ws);
+      });
+      ws.on("message", (data, binary) => {
+        if (binary) return;
+        let msg: Record<string, any>;
+        try {
+          msg = JSON.parse(data.toString());
+        } catch {
+          return;
+        }
+        if (!msg || typeof msg !== "object") return;
+        if (!this.upstream) {
+          if (this.ended) return;
+          if (msg.type === "error") {
+            this.onUpstream(msg);
+            return;
+          }
+          if (msg.type === "session.updated") {
+            this.upstream = ws;
+            this.standbyUpstreams.delete(ws);
+            if (this.hedgeTimer) {
+              clearTimeout(this.hedgeTimer);
+              this.hedgeTimer = null;
+            }
+            for (const other of this.standbyUpstreams) other.terminate();
+            this.standbyUpstreams.clear();
+            this.onUpstream(msg);
+          }
+          return;
+        }
+        if (this.upstream !== ws) return;
+        this.onUpstream(msg);
+      });
+      ws.on("unexpected-response", (_req, res) => {
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          this.standbyUpstreams.delete(ws);
+          this.fail("语音服务的密钥无效");
+          return;
+        }
+        const msg =
+          res.statusCode === 429
+            ? "语音服务现在太忙，稍后再试"
+            : `语音服务拒绝了连接（${res.statusCode}）`;
+        maybeFallbackOrFail(msg);
+      });
+      ws.on("close", () => {
+        if (this.upstream === ws) {
+          this.stop("语音服务断开了");
+          return;
+        }
+        maybeFallbackOrFail("连不上语音服务");
+      });
+      ws.on("error", () => {
+        maybeFallbackOrFail("连不上语音服务");
+      });
+    };
+
+    openUpstreamCandidate(false);
+    this.hedgeTimer = setTimeout(() => {
+      this.hedgeTimer = null;
+      if (this.ended || this.upstream || this.hedgeAttempted) return;
+      this.hedgeAttempted = true;
+      openUpstreamCandidate(true);
+    }, hedgeDelayMs);
+    this.attachTimer = setTimeout(() => this.fail("语音服务没有及时响应"), attachDeadlineMs);
     this.keepalive = setInterval(() => {
-      if (this.upstream.readyState === WebSocket.OPEN) this.upstream.ping();
+      if (this.upstream?.readyState === WebSocket.OPEN) this.upstream.ping();
     }, 25_000);
     this.detach = assistant.attachVoice({ notice: (n) => this.notice(n), board: () => this.refresh() });
 
-    this.upstream.on("open", () => this.configure());
-    this.upstream.on("message", (data, binary) => {
-      if (binary) return;
-      let msg: Record<string, any>;
-      try {
-        msg = JSON.parse(data.toString());
-      } catch {
-        return;
-      }
-      if (msg && typeof msg === "object") this.onUpstream(msg);
-    });
-    this.upstream.on("unexpected-response", (_req, res) => {
-      this.fail(res.statusCode === 401 || res.statusCode === 403 ? "语音服务的密钥无效" : res.statusCode === 429 ? "语音服务现在太忙，稍后再试" : `语音服务拒绝了连接（${res.statusCode}）`);
-    });
-    this.upstream.on("close", () => this.stop("语音服务断开了"));
-    this.upstream.on("error", () => this.fail("连不上语音服务"));
-
     phone.on("message", (data, binary) => {
       if (binary) {
-        if (!this.ready || this.upstream.readyState !== WebSocket.OPEN) {
+        const buf = asBuffer(data);
+        if (!this.ready || this.upstream?.readyState !== WebSocket.OPEN) {
           this.telemetry.onPreReadyBinary(data);
+          this.enqueuePreReadyPcm(buf);
           return;
         }
-        const buf = asBuffer(data);
-        this.telemetry.onRxPcm(buf);
-        const now = Date.now();
-        const dbfs = pcm16RmsDbfs(buf);
-        const openThresh = this.speaking ? -33 : -42;
-        if (dbfs >= openThresh) {
-          this.voiceHoldUntil = now + 360;
-        }
-        const passAudio = dbfs >= openThresh || (now < this.voiceHoldUntil && dbfs >= -48);
-        const gated = passAudio ? buf : Buffer.alloc(buf.length);
-        const pcm = this.mic.push(gated);
-        if (pcm.length) this.up({ type: "input_audio_buffer.append", audio: pcm.toString("base64") });
+        this.forwardPhonePcm(buf);
         return;
       }
       let msg: Record<string, unknown>;
@@ -942,8 +1025,53 @@ export class RealtimeCall {
     phone.on("error", () => this.stop("手机断开了"));
   }
 
+  private preReadyHoldUntil = 0;
+
+  private enqueuePreReadyPcm(buf: Buffer): void {
+    if (!buf.length) return;
+    const now = Date.now();
+    const dbfs = pcm16RmsDbfs(buf);
+    if (dbfs >= -50) {
+      this.preReadyHoldUntil = now + 450;
+    } else if (now >= this.preReadyHoldUntil) {
+      return;
+    }
+    const copy = Buffer.from(buf);
+    this.preReadyChunks.push(copy);
+    this.preReadyBytes += copy.length;
+    while (this.preReadyBytes > PRE_READY_BUFFER_MAX_BYTES && this.preReadyChunks.length > 0) {
+      const dropped = this.preReadyChunks.shift()!;
+      this.preReadyBytes -= dropped.length;
+    }
+  }
+
+  private forwardPhonePcm(buf: Buffer): void {
+    this.telemetry.onRxPcm(buf);
+    const now = Date.now();
+    const dbfs = pcm16RmsDbfs(buf);
+    const openThresh = this.speaking ? -36 : -50;
+    if (dbfs >= openThresh) {
+      this.voiceHoldUntil = now + 450;
+    }
+    const passAudio = dbfs >= openThresh || (now < this.voiceHoldUntil && dbfs >= -55);
+    const gated = passAudio ? buf : Buffer.alloc(buf.length);
+    const pcm = this.mic.push(gated);
+    if (pcm.length) this.up({ type: "input_audio_buffer.append", audio: pcm.toString("base64") });
+  }
+
+  private flushPreReadyPcm(): void {
+    if (!this.preReadyChunks.length) return;
+    const chunks = this.preReadyChunks;
+    this.preReadyChunks = [];
+    this.preReadyBytes = 0;
+    for (const chunk of chunks) {
+      if (!this.ready || this.upstream?.readyState !== WebSocket.OPEN) break;
+      this.forwardPhonePcm(chunk);
+    }
+  }
+
   private up(msg: Record<string, unknown>): void {
-    if (this.upstream.readyState === WebSocket.OPEN) this.upstream.send(JSON.stringify(msg));
+    if (this.upstream?.readyState === WebSocket.OPEN) this.upstream.send(JSON.stringify(msg));
   }
 
   private toPhone(msg: LiveRelayEvent | { action: string; data?: unknown }): void {
@@ -960,7 +1088,7 @@ export class RealtimeCall {
   }
 
   /** First setup: who it is, how it hears and speaks, the one tool it can call. */
-  private configure(): void {
+  private configureOn(ws: WebSocket): void {
     const c = this.cfg;
     this.recentText = this.assistant.recentForVoice();
     this.lastInstructions = this.instructions();
@@ -968,7 +1096,7 @@ export class RealtimeCall {
     const vad = c.vad ?? "server_vad";
     const turnDetection =
       vad === "server_vad"
-        ? { type: "server_vad", threshold: 0.65, prefix_padding_ms: 280, silence_duration_ms: 520, create_response: true, interrupt_response: true }
+        ? { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 460, create_response: true, interrupt_response: true }
         : { type: vad, create_response: true, interrupt_response: true };
     const session = this.ga
       ? {
@@ -1002,7 +1130,9 @@ export class RealtimeCall {
           tools: [ASK_TOOL],
           tool_choice: "auto",
         };
-    this.up({ type: "session.update", session });
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "session.update", session }));
+    }
   }
 
   /** Something the voice answers from changed: pushed at most once per gap, never while anyone is speaking. */
@@ -1096,6 +1226,7 @@ export class RealtimeCall {
           this.ready = true;
           this.telemetry.onReady();
           this.toPhone({ action: "relay.state", data: { state: "ready" } });
+          this.flushPreReadyPcm();
         }
         return;
       case "input_audio_buffer.speech_started": {
@@ -1530,11 +1661,14 @@ export class RealtimeCall {
     this.telemetry.onStop(why);
     releaseCall(this);
     clearTimeout(this.attachTimer);
+    if (this.hedgeTimer) clearTimeout(this.hedgeTimer);
     clearInterval(this.keepalive);
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.asrHoldTimer) clearTimeout(this.asrHoldTimer);
     this.clearVadCommitWatchdog();
+    this.preReadyChunks = [];
+    this.preReadyBytes = 0;
     this.captions.clear();
     this.detach();
     for (const ac of this.tasks.values()) ac.abort();
@@ -1545,7 +1679,9 @@ export class RealtimeCall {
     } catch {
       /* already gone */
     }
-    this.upstream.terminate();
+    for (const ws of this.standbyUpstreams) ws.terminate();
+    this.standbyUpstreams.clear();
+    this.upstream?.terminate();
     this.log(`realtime: call ended (${why}) ${this.deviceId}`);
   }
 }

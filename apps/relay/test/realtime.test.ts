@@ -164,9 +164,9 @@ test("an OpenAI Realtime voice call: same phone events as MOSS-Live, tasks throu
   assert.deepEqual(s.audio.input.transcription, { model: "gpt-4o-mini-transcribe", language: "zh" });
   assert.deepEqual(s.audio.input.turn_detection, {
     type: "server_vad",
-    threshold: 0.65,
-    prefix_padding_ms: 280,
-    silence_duration_ms: 520,
+    threshold: 0.5,
+    prefix_padding_ms: 300,
+    silence_duration_ms: 460,
     create_response: true,
     interrupt_response: true,
   });
@@ -606,5 +606,82 @@ test("server silence gate zeroes quiet hiss and stuck-VAD watchdog commits after
     await call.next((f) => f.action === "relay.state" && f.data.state === "closed");
   } finally {
     await r3.close();
+  }
+});
+
+test("hedged upstream dial recovers stalled primary session.updated and replays pre-ready audio", async () => {
+  const stalledWss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  await new Promise<void>((r) => stalledWss.once("listening", () => r()));
+  const stalledPort = (stalledWss.address() as { port: number }).port;
+  let attempts = 0;
+  let primarySock: Sock | null = null;
+  const backupReady = new Promise<Sock>((resolve) => {
+    stalledWss.on("connection", (ws) => {
+      attempts++;
+      const s = new Sock(ws);
+      if (attempts === 1) {
+        // Primary accepts WS & session.update but stalls without answering session.updated.
+        primarySock = s;
+        return;
+      }
+      resolve(s);
+    });
+  });
+
+  const r4 = new Relay({
+    dbPath: join(dir, "t-hedged.db"),
+    adminToken: ADMIN,
+    log: () => {},
+    llm,
+    live: {
+      provider: "openai-realtime",
+      url: `ws://127.0.0.1:${stalledPort}/v1/realtime`,
+      apiKey: "rt-test-key",
+      model: "gpt-realtime",
+      voice: "marin",
+      hedgeDelayMs: 60,
+      attachTimeoutMs: 4000,
+    },
+  });
+  const base4 = `http://127.0.0.1:${await r4.listen(0, "127.0.0.1")}`;
+  try {
+    const api4 = async (path: string, init: { token?: string; body?: unknown } = {}) => {
+      const res = await fetch(base4 + path, {
+        method: init.body ? "POST" : "GET",
+        headers: { "Content-Type": "application/json", ...(init.token ? { Authorization: `Bearer ${init.token}` } : {}) },
+        body: init.body ? JSON.stringify(init.body) : undefined,
+      });
+      return (await res.json()) as any;
+    };
+    const code = (await api4("/v1/pair/codes", { token: ADMIN, body: { kind: "viewer" } })).code;
+    const phone = (await api4("/v1/pair", { body: { code, name: "HedgePhone", kind: "viewer" } })) as { token: string };
+
+    const ws = new WebSocket(`${base4.replace("http", "ws")}/v1/assistant/live?token=${encodeURIComponent(phone.token)}`);
+    const call = new Sock(ws);
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+
+    // Send soft -46 dBFS speech (amp=165) while still connecting (`!ready`).
+    call.ws.send(pcm(320, 165));
+
+    // Hedged second attempt connects automatically after ~60ms when primary stalls before session.updated.
+    const backup = await backupReady;
+    assert.ok(primarySock);
+    const upd = await backup.next((f) => f.type === "session.update");
+    assert.equal(upd.session.audio.input.turn_detection.threshold, 0.5);
+    backup.send({ type: "session.updated", session: {} });
+
+    await call.next((f) => f.action === "relay.state" && f.data.state === "ready");
+    // Pre-ready buffered soft speech is replayed right away without gating out -46 dBFS voice.
+    const replayed = Buffer.from((await backup.next((f) => f.type === "input_audio_buffer.append")).audio, "base64");
+    assert.ok(samplesOf(replayed).some((x) => x > 100));
+
+    call.send({ action: "relay.hangup" });
+    await call.next((f) => f.action === "relay.state" && f.data.state === "closed");
+  } finally {
+    await r4.close();
+    await new Promise<void>((r) => stalledWss.close(() => r()));
   }
 });

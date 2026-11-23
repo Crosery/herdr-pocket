@@ -387,6 +387,27 @@
   padding: 0;
 }
 
+.v3-row[draggable="true"] {
+  -webkit-user-drag: element;
+}
+
+.v3-row[draggable="true"] > img,
+.v3-row[draggable="true"] > svg,
+.v3-row[draggable="true"] > .vendor-icon,
+.v3-row[draggable="true"] > .v3-row-label,
+.v3-row[draggable="true"] > .v3-agent-machine,
+.v3-row[draggable="true"] > .v3-time {
+  pointer-events: none;
+  -webkit-user-drag: none;
+}
+
+.v3-agent-machine {
+  flex: none;
+  max-width: 72px;
+  font-size: calc(10px * var(--ts, 1));
+  color: var(--v3-dim);
+}
+
 .v3-row-label {
   flex: 1 1 auto;
   min-width: 0;
@@ -678,7 +699,9 @@
 
 .v3-tab {
   height: 29px;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 78px;
+  max-width: 210px;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -693,15 +716,25 @@
   position: relative;
 }
 
+.v3-tab > svg,
+.v3-tab > .vendor-icon,
+.v3-tab > .v3-spinner,
+.v3-tab > .v3-dot {
+  flex: none;
+}
+
 .v3-tab[draggable="true"] {
   -webkit-user-drag: element;
 }
 
+.v3-tab[draggable="true"] > img,
 .v3-tab[draggable="true"] > svg,
+.v3-tab[draggable="true"] > .vendor-icon,
 .v3-tab[draggable="true"] > .v3-tab-label,
 .v3-tab[draggable="true"] > .v3-spinner,
 .v3-tab[draggable="true"] > .v3-dot {
   pointer-events: none;
+  -webkit-user-drag: none;
 }
 
 .v3-tab.dragging {
@@ -721,6 +754,9 @@
 }
 
 .v3-tab.active {
+  flex-shrink: 0;
+  max-width: 236px;
+  padding-right: 6px;
   border-color: var(--v3-border);
   background: var(--v3-raised);
   color: var(--v3-fg);
@@ -731,6 +767,8 @@
 }
 
 .v3-tab-label {
+  flex: 1 1 auto;
+  min-width: 0;
   max-width: 170px;
 }
 
@@ -752,6 +790,7 @@
 .v3-tab-x {
   width: 18px;
   height: 18px;
+  padding: 0;
   flex: none;
   display: grid;
   place-items: center;
@@ -761,7 +800,21 @@
   color: var(--v3-dim);
   cursor: pointer;
   opacity: 0.58;
-  transition: opacity 0.14s ease, background 0.14s ease, color 0.14s ease;
+  transition: width 0.12s ease, opacity 0.14s ease, background 0.14s ease, color 0.14s ease;
+}
+
+@media (hover: hover) {
+  .v3-tab:not(.active):not(:hover):not(:focus-within) {
+    padding-right: 10px;
+  }
+
+  .v3-tab:not(.active):not(:hover):not(:focus-within) .v3-tab-x {
+    width: 0;
+    margin-left: -4px;
+    opacity: 0;
+    pointer-events: none;
+    overflow: hidden;
+  }
 }
 
 .v3-tab.active .v3-tab-x,
@@ -988,11 +1041,58 @@
   color: var(--v3-fg);
 }
 
+.v3-pane-right {
+  margin-left: auto;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .v3-pane-actions {
   flex: none;
   display: inline-flex;
   align-items: center;
   gap: 2px;
+}
+
+.v3-pane-tool-btn {
+  height: 22px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px;
+  border: 1px solid var(--v3-border);
+  border-radius: 5px;
+  background: var(--v3-bg);
+  color: var(--v3-muted);
+  font: inherit;
+  font-size: calc(11.5px * var(--ts, 1));
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.v3-pane-tool-btn:hover {
+  background: var(--v3-hover);
+  color: var(--v3-fg);
+  border-color: color-mix(in srgb, var(--v3-accent) 45%, var(--v3-border));
+}
+
+@media (hover: hover) {
+  .v3-pane-actions {
+    display: none;
+  }
+
+  .v3-pane-head:hover .v3-pane-actions,
+  .v3-pane:has(> .v3-pane-grip:hover) .v3-pane-actions,
+  .v3-pane-actions:focus-within,
+  .v3-pane-head[data-menu-open="true"] .v3-pane-actions {
+    display: inline-flex;
+  }
 }
 
 .v3-pane-head > svg {

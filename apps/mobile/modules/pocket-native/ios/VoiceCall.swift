@@ -215,7 +215,8 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
               threshold: self.voiceThreshold,
               tseEnrollment: tseEnr,
               needAutoOwnerSample: self.effectiveTier == "tse" && self.enrolledVoice != nil && ownerSample == nil,
-              lockFirstSpeaker: self.useFirstSpeaker
+              lockFirstSpeaker: self.useFirstSpeaker,
+              route: self.lastRoute
             ),
             worker: { [weak self] job in self?.spkQueue.async(execute: job) },
             tseWorker: { [weak self] job in self?.tseQueue.async(execute: job) },
@@ -269,7 +270,7 @@ final class VoiceCall: NSObject, URLSessionWebSocketDelegate {
     every(ms: 100) { [weak self] in self?.reportLevel() }
     every(ms: 5_000) { [weak self] in self?.emitPeriodicTelemetry() }
     every(ms: 20_000) { [weak self] in self?.ping() }
-    q.asyncAfter(deadline: .now() + 15) { [weak self] in
+    q.asyncAfter(deadline: .now() + 24) { [weak self] in
       guard let self, !self.ended, !self.opened else { return }
       self.end("连接断了")
     }

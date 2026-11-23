@@ -794,6 +794,7 @@ pub async fn local_term_create_shell(
     display: Option<Value>,
     space_name: Option<String>,
     space_id: Option<String>,
+    tab_id: Option<String>,
     argv: Option<Vec<String>>,
 ) -> Result<LocalCreateShellResult, String> {
     let c = clamp_cols(cols);
@@ -817,6 +818,9 @@ pub async fn local_term_create_shell(
         }
         if let Some(sid) = space_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             labels.insert("herdr.space".into(), json!(sid));
+        }
+        if let Some(tid) = tab_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            labels.insert("herdr.tab".into(), json!(tid));
         }
         if !labels.is_empty() {
             params.insert("labels".into(), Value::Object(labels));

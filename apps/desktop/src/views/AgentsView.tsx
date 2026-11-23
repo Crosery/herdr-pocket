@@ -106,7 +106,7 @@ import {
   setComposerDraftText,
   subscribeComposerDrafts,
 } from "../lib/composerDrafts";
-import { endWorkspaceDrag, hasWorkspaceDrag, readWorkspaceDrag } from "../lib/fileDrag";
+import { endWorkspaceDrag, hasPaneDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readWorkspaceDrag } from "../lib/fileDrag";
 import { collectDroppedFilesSafe, readOsDraggedPaths, snapshotDroppedDataTransfer, stageOsDraggedItems } from "../lib/finderDrop";
 import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import { updateAgentRoleModel, useAutoAgentModelMeta } from "../lib/modelCatalogClient";
@@ -919,6 +919,7 @@ export function AgentDetailPanel({
   mobile = false,
   embedded = false,
   focused = true,
+  visible = true,
 }: {
   agent: Agent;
   initialTab?: "chat" | "term";
@@ -932,6 +933,8 @@ export function AgentDetailPanel({
   embedded?: boolean;
   /** Whether this pane holds focus within a split tab. */
   focused?: boolean;
+  /** Whether the hosting tab/slot is currently visible on screen. */
+  visible?: boolean;
 }) {
   const toast = useToast();
   const hostOnline = liveStore.use((s) => s.devices[agent.deviceId]?.online ?? true);
@@ -1828,6 +1831,8 @@ export function AgentDetailPanel({
   );
 
   const lastSendRef = useRef<{ sig: string; at: number } | null>(null);
+  const submitComposerRef = useRef<(overrideText?: string) => void>(() => {});
+  const composer = useComposerInput(composerInputValue, () => submitComposerRef.current());
 
   const submitComposer = (overrideText?: string) => {
     const isOverride = overrideText !== undefined;
@@ -1936,6 +1941,7 @@ export function AgentDetailPanel({
       })
       .finally(() => setSending(false));
   };
+  submitComposerRef.current = submitComposer;
 
   const interruptTurn = () => {
     void rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) =>
@@ -1982,7 +1988,6 @@ export function AgentDetailPanel({
     });
   }, []);
 
-  const composer = useComposerInput(composerInputValue, () => submitComposer());
   const prevFocusedRef = useRef(focused);
 
   useEffect(() => {
@@ -2048,8 +2053,11 @@ export function AgentDetailPanel({
     return () => window.removeEventListener("paste", onWindowPaste);
   }, [activeMode, composer.textareaRef, focused, handleFiles]);
 
+  const isSplitOnlyDrag = (e: DragEvent<HTMLDivElement>): boolean =>
+    hasTabDrag(e) || hasPanelDrag(e) || hasPaneDrag(e) || (hasWorkspaceDrag(e) && e.altKey);
+
   const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
-    if (activeMode !== "chat") return;
+    if (activeMode !== "chat" || isSplitOnlyDrag(e)) return;
     if (!e.dataTransfer?.types?.includes("Files") && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     dragDepthRef.current += 1;
@@ -2057,21 +2065,21 @@ export function AgentDetailPanel({
   };
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
-    if (activeMode !== "chat") return;
+    if (activeMode !== "chat" || isSplitOnlyDrag(e)) return;
     if (!e.dataTransfer?.types?.includes("Files") && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
   };
 
   const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    if (activeMode !== "chat") return;
+    if (activeMode !== "chat" || isSplitOnlyDrag(e)) return;
     if (!e.dataTransfer?.types?.includes("Files") && !hasWorkspaceDrag(e)) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragOver(false);
   };
 
   const onDrop = (e: DragEvent<HTMLDivElement>) => {
-    if (activeMode !== "chat") return;
+    if (activeMode !== "chat" || isSplitOnlyDrag(e)) return;
     dragDepthRef.current = 0;
     setDragOver(false);
     const snap = snapshotDroppedDataTransfer(e.dataTransfer);
@@ -2398,7 +2406,7 @@ export function AgentDetailPanel({
       {termVisited ? (
         <div style={{ flex: 1, minHeight: 0, display: activeMode === "term" ? "flex" : "none" }}>
           <PocketErrorBoundary resetKey={`${agent.key}:${activeMode}`} title="终端视图加载出错">
-            <TerminalSurface agent={agent} active={activeMode === "term"} focused={focused} />
+            <TerminalSurface agent={agent} active={visible && activeMode === "term"} focused={focused && visible} />
           </PocketErrorBoundary>
         </div>
       ) : null}

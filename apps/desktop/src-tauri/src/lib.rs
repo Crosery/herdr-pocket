@@ -631,7 +631,13 @@ pub fn run() {
     let builder = builder.register_asynchronous_uri_scheme_protocol(
         "pocket-local",
         |ctx, req, responder| {
-            if ctx.webview_label() != "main" {
+            let uri_str = req.uri().to_string();
+            let label = ctx.webview_label();
+            let is_cap = tauri::Url::parse(&uri_str)
+                .map(|u| u.path().starts_with("/cap/"))
+                .unwrap_or(false);
+            let allowed = label == "main" || (is_cap && label.starts_with("browser-"));
+            if !allowed {
                 let res = tauri::http::Response::builder()
                     .status(403)
                     .body(Vec::new())
@@ -639,7 +645,6 @@ pub fn run() {
                 responder.respond(res);
                 return;
             }
-            let uri_str = req.uri().to_string();
             let range_hdr = req
                 .headers()
                 .get("range")
@@ -746,6 +751,7 @@ pub fn run() {
             commands::pick_folder,
             commands::pick_file,
             commands::local_read_file,
+            commands::register_local_preview_token,
             commands::local_reveal_in_folder,
             commands::local_open_file,
             commands::local_agent_btw,
@@ -855,28 +861,39 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
             .unwrap();
     }
 
-    let mut path_param: Option<String> = None;
-    let mut cwd_param: Option<String> = None;
-    for (k, v) in url.query_pairs() {
-        if k == "path" {
-            path_param = Some(v.into_owned());
-        } else if k == "cwd" {
-            cwd_param = Some(v.into_owned());
+    let resolved = if let Some(rest) = url.path().strip_prefix("/cap/") {
+        let (token, rel) = match rest.split_once('/') {
+            Some((t, r)) => (t, r),
+            None => (rest, ""),
+        };
+        match commands::resolve_cap_preview_file(token, rel) {
+            Ok(r) => r,
+            Err(status) => return empty_err(status),
         }
-    }
-    let Some(ref raw_path) = path_param else {
-        return empty_err(400);
-    };
+    } else {
+        let mut path_param: Option<String> = None;
+        let mut cwd_param: Option<String> = None;
+        for (k, v) in url.query_pairs() {
+            if k == "path" {
+                path_param = Some(v.into_owned());
+            } else if k == "cwd" {
+                cwd_param = Some(v.into_owned());
+            }
+        }
+        let Some(ref raw_path) = path_param else {
+            return empty_err(400);
+        };
 
-    let resolved = match commands::resolve_safe_local_file(cwd_param.as_deref(), raw_path) {
-        Ok(r) => r,
-        Err(msg) => {
-            let status = if msg.contains("密钥") || msg.contains("设置目录") {
-                403
-            } else {
-                404
-            };
-            return empty_err(status);
+        match commands::resolve_safe_local_file(cwd_param.as_deref(), raw_path) {
+            Ok(r) => r,
+            Err(msg) => {
+                let status = if msg.contains("密钥") || msg.contains("设置目录") {
+                    403
+                } else {
+                    404
+                };
+                return empty_err(status);
+            }
         }
     };
 
@@ -1047,6 +1064,62 @@ mod tests {
         assert_eq!(miss.status().as_u16(), 404);
         let bad = super::serve_pocket_local("pocket-local://localhost/term-img/not-an-id", None);
         assert_eq!(bad.status().as_u16(), 404);
+    }
+
+    #[test]
+    fn serve_pocket_local_serves_capability_and_blocks_escape_or_private() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("herdr-pocket-cap-{nanos}"));
+        let sub = dir.join("assets");
+        std::fs::create_dir_all(&sub).unwrap();
+        let html = dir.join("preview.html");
+        let img = sub.join("shot.png");
+        let env_file = dir.join(".env");
+        let png = [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        std::fs::write(&html, b"<html><img src='./assets/shot.png'></html>").unwrap();
+        std::fs::write(&img, png).unwrap();
+        std::fs::write(&env_file, b"SECRET=1").unwrap();
+
+        let cap_url = crate::commands::issue_local_preview_url(None, &html.to_string_lossy()).unwrap();
+        assert!(cap_url.contains("/cap/"));
+        let token = cap_url.split("/cap/").nth(1).unwrap().split('/').next().unwrap();
+
+        let html_resp = super::serve_pocket_local(&cap_url, None);
+        assert_eq!(html_resp.status().as_u16(), 200);
+        assert_eq!(
+            html_resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+
+        let asset_uri = format!("pocket-local://localhost/cap/{token}/assets/shot.png");
+        let img_resp = super::serve_pocket_local(&asset_uri, None);
+        assert_eq!(img_resp.status().as_u16(), 200);
+        assert_eq!(img_resp.body(), &png);
+        assert_eq!(
+            img_resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("image/png")
+        );
+
+        let norm_escape_uri = format!("pocket-local://localhost/cap/{token}/../etc/passwd");
+        let norm_escape_status = super::serve_pocket_local(&norm_escape_uri, None).status().as_u16();
+        assert!(norm_escape_status == 403 || norm_escape_status == 404);
+        assert_eq!(crate::commands::resolve_cap_preview_file(token, "../etc/passwd").err(), Some(403));
+        assert_eq!(crate::commands::resolve_cap_preview_file(token, "%2e%2e/etc/passwd").err(), Some(403));
+
+        let env_uri = format!("pocket-local://localhost/cap/{token}/.env");
+        assert_eq!(super::serve_pocket_local(&env_uri, None).status().as_u16(), 403);
+
+        assert_eq!(
+            super::serve_pocket_local("pocket-local://localhost/cap/deadbeef/index.html", None)
+                .status()
+                .as_u16(),
+            404
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

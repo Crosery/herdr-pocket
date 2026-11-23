@@ -84,20 +84,68 @@ export function freshHerdrId(prefix: string, used: Set<string>): string {
  * custom name wins; legacy `tb<N>` names fall back to `primaryProgram` (or 1-based number);
  * empty names fall back to 1-based number; zoomed tabs append `" Z"`.
  */
+export interface HerdrTabLeadInfo {
+  programName?: string | null;
+  liveTitle?: string | null;
+  index?: number;
+}
+
+const GENERIC_SHELL_TITLES = new Set(["sh", "bash", "zsh", "fish", "pwsh", "cmd", "nu", "elvish", "ksh", "tcsh"]);
+const LIVE_TITLE_PREFIX_RE = /^[\u2800-\u28ff\u25cb\u25cf\u2733\u23f3\u2022\s]+/;
+const RAW_TERMINAL_ID_RE = /^(?:tb[0-9a-f]+|ttys?\d+|pts\/?\d+|t\d+[0-9a-z]{0,5})$/i;
+
+export function isPathLikeTitle(raw: string): boolean {
+  const s = raw.trim();
+  if (!s) return false;
+  if (s === "~" || s.startsWith("~/") || s.startsWith("./") || s.startsWith("../") || s.startsWith("/")) {
+    return true;
+  }
+  if (/^[a-zA-Z]:[\\/]/.test(s) || s.startsWith("\\\\")) return true;
+  if (s.includes("://")) return true;
+  return !/\s/.test(s) && s.includes("/");
+}
+
+export function cleanLiveTabTitle(raw: string | null | undefined, programName?: string | null): string {
+  if (!raw) return "";
+  const cleaned = raw
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(LIVE_TITLE_PREFIX_RE, "")
+    .trim();
+  if (!cleaned) return "";
+  if (cleaned.includes("@") || /^\d+$/.test(cleaned) || RAW_TERMINAL_ID_RE.test(cleaned)) {
+    return "";
+  }
+  if (isPathLikeTitle(cleaned)) return "";
+  const lower = cleaned.toLowerCase();
+  if (GENERIC_SHELL_TITLES.has(lower)) return "";
+  const prog = programName?.trim() ?? "";
+  if (prog && (lower === prog.toLowerCase() || (lower === "claude" && prog === "Claude Code"))) {
+    return prog;
+  }
+  return cleaned;
+}
+
 export function formatHerdrTabLabel(
   tab: { name?: string },
-  index0: number,
-  primaryProgram?: string,
-  isZoomed = false,
+  leadOrIndex: HerdrTabLeadInfo | number = 0,
+  isZoomedOrProgram?: boolean | string,
+  legacyZoomed = false,
 ): string {
+  const isLegacy = typeof leadOrIndex === "number";
+  const programName = isLegacy
+    ? (typeof isZoomedOrProgram === "string" ? isZoomedOrProgram : undefined)
+    : leadOrIndex.programName ?? undefined;
+  const liveTitle = isLegacy ? undefined : leadOrIndex.liveTitle ?? undefined;
+  const isZoomed = isLegacy ? legacyZoomed : Boolean(isZoomedOrProgram);
+
   const raw = tab.name?.trim() ?? "";
   let base: string;
-  if (!raw) {
-    base = String(index0 + 1);
-  } else if (TB_AUTO_NAME_RE.test(raw)) {
-    base = primaryProgram?.trim() || String(index0 + 1);
-  } else {
+  if (raw && !TB_AUTO_NAME_RE.test(raw)) {
     base = raw;
+  } else {
+    const prog = programName?.trim() || "";
+    const live = cleanLiveTabTitle(liveTitle, prog);
+    base = live || prog || "Terminal";
   }
   return isZoomed ? `${base} Z` : base;
 }
@@ -264,12 +312,14 @@ export function splitNodeToHerdrRoot(
 ): HerdrDocNode | null {
   const prevById = indexDocNodes(prevDocRoot);
   const usedIds = new Set<string>();
+  const seenTerminals = new Set<string>();
 
   const serialize = (cur: SplitNode): HerdrDocNode | null => {
     if (cur.type === "leaf") {
       if (cur.content.kind !== "agent") return null;
       const terminal = extractHcTerminalId(hostId, cur.content.agentKey);
-      if (!terminal) return null;
+      if (!terminal || seenTerminals.has(terminal)) return null;
+      seenTerminals.add(terminal);
       const prev = prevById.get(cur.id);
       const id = serializePaneId(cur.id, usedIds, "p");
       const size = formatWeightSize(cur.weight, prev?.size);
@@ -360,23 +410,22 @@ export function extractHostHerdrDoc(
   const usedTabIds = new Set<string>();
 
   const findOrCreateSpace = (spaceIdHint: string | undefined, spaceNameHint: string, folderHint: string): HerdrDocSpace => {
-    if (spaceIdHint) {
-      const byId = spaces.find((s) => s.id === spaceIdHint);
+    const knownMeta =
+      (spaceIdHint ? hostSpaces.find((s) => s.id === spaceIdHint) : undefined) ??
+      (spaceNameHint ? hostSpaces.find((s) => s.name === spaceNameHint) : undefined);
+    const effectiveId = spaceIdHint || knownMeta?.id;
+    if (effectiveId) {
+      const byId = spaces.find((s) => s.id === effectiveId);
       if (byId) return byId;
     }
     if (spaceNameHint) {
       const byName = spaces.find((s) => s.name === spaceNameHint);
       if (byName) return byName;
     }
-    const knownMeta =
-      (spaceIdHint ? hostSpaces.find((s) => s.id === spaceIdHint) : undefined) ??
-      (spaceNameHint ? hostSpaces.find((s) => s.name === spaceNameHint) : undefined);
     const id =
-      spaceIdHint && !usedSpaceIds.has(spaceIdHint)
-        ? (usedSpaceIds.add(spaceIdHint), spaceIdHint)
-        : knownMeta?.id && !usedSpaceIds.has(knownMeta.id)
-          ? (usedSpaceIds.add(knownMeta.id), knownMeta.id)
-          : freshHerdrId("sp", usedSpaceIds);
+      effectiveId && !usedSpaceIds.has(effectiveId)
+        ? (usedSpaceIds.add(effectiveId), effectiveId)
+        : freshHerdrId("sp", usedSpaceIds);
     const name = spaceNameHint || knownMeta?.name || folderHint.split(/[\\/]/).filter(Boolean).pop() || "workspace";
     const folder = knownMeta?.folder || folderHint || "";
     const created: HerdrDocSpace = { id, name, folder, tabs: [] };
@@ -423,8 +472,7 @@ export function extractHostHerdrDoc(
     if (!serializedRoot) continue;
 
     const docTabId = pickDocTabId(tab, usedTabIds);
-    const tabIdx = targetSpace.tabs.length;
-    const rawName = tab.docTabName !== undefined ? tab.docTabName : (prevTab?.name ?? String(tabIdx + 1));
+    const rawName = tab.docTabName !== undefined ? tab.docTabName : (prevTab?.name ?? "");
     const nextTab: HerdrDocTab = {
       ...(prevTab ?? {}),
       id: docTabId,

@@ -20,6 +20,9 @@ import {
 import { searchTerminalBuffer, type TerminalSearchMatch } from "../lib/terminalSearch";
 import {
   endWorkspaceDrag,
+  hasPaneDrag,
+  hasPanelDrag,
+  hasTabDrag,
   hasWorkspaceDrag,
   readWorkspaceDrag,
   resolveDropPath,
@@ -1437,11 +1440,9 @@ export function TerminalSurface({
       const diverged =
         externalSizeOverrideRef.current ||
         Boolean(pty && dims && (pty.cols !== dims.cols || pty.rows !== dims.rows));
-      if (diverged && localConnId && reattachLocalRef.current) {
+      if (diverged && localConnId) {
         externalSizeOverrideRef.current = false;
         if (dims) ptySizeRef.current = { cols: dims.cols, rows: dims.rows };
-        reattachLocalRef.current();
-        return;
       }
       syncResize(term, true);
     };
@@ -2388,7 +2389,8 @@ export function TerminalSurface({
             if (!alive || e.payload.terminal !== localTermId) return;
             const { cols, rows } = e.payload;
             ptySizeRef.current = { cols, rows };
-            if ((cols !== term.cols || rows !== term.rows) && !paneOwnsFocus()) {
+            const externalOwner = typeof document === "undefined" || !document.hasFocus() || !activeRef.current;
+            if ((cols !== term.cols || rows !== term.rows) && externalOwner) {
               flushPendingBytes();
               externalSizeOverrideRef.current = true;
               term.resize(cols, rows);
@@ -2413,12 +2415,17 @@ export function TerminalSurface({
     }
 
     let resizeRaf = 0;
+    let resizeSettleTimer = 0;
     const ro = new ResizeObserver(() => {
-      if (resizeRaf) cancelAnimationFrame(resizeRaf);
-      resizeRaf = requestAnimationFrame(() => {
-        resizeRaf = 0;
-        if (alive) syncResize(term);
-      });
+      if (resizeSettleTimer) window.clearTimeout(resizeSettleTimer);
+      resizeSettleTimer = window.setTimeout(() => {
+        resizeSettleTimer = 0;
+        if (resizeRaf) cancelAnimationFrame(resizeRaf);
+        resizeRaf = requestAnimationFrame(() => {
+          resizeRaf = 0;
+          if (alive) syncResize(term);
+        });
+      }, 90);
     });
     ro.observe(hostEl);
 
@@ -2451,6 +2458,7 @@ export function TerminalSurface({
       window.clearTimeout(seedTimer);
       window.clearTimeout(flushTimer);
       window.clearTimeout(webglRetryTimer);
+      if (resizeSettleTimer) window.clearTimeout(resizeSettleTimer);
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
       flushMicroQueued = false;
       overlayMicroQueued = false;
@@ -2553,12 +2561,10 @@ export function TerminalSurface({
         const prevConn = localConnRef.current;
         termRef.current.focus();
         if (localConnRef.current === prevConn) {
-          if (externalSizeOverrideRef.current && localConnRef.current && reattachLocalRef.current) {
+          if (externalSizeOverrideRef.current) {
             externalSizeOverrideRef.current = false;
-            reattachLocalRef.current();
-          } else {
-            syncResize(termRef.current, true);
           }
+          syncResize(termRef.current, true);
         }
       } else {
         syncResize(termRef.current);
@@ -2634,7 +2640,11 @@ export function TerminalSurface({
     }
   }, [jumpToSearchMatch, searchOpen, searchQuery]);
 
+  const isSplitOnlyDrag = (e: DragEvent<HTMLDivElement>): boolean =>
+    hasTabDrag(e) || hasPanelDrag(e) || hasPaneDrag(e) || (hasWorkspaceDrag(e) && e.altKey);
+
   const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
+    if (isSplitOnlyDrag(e)) return;
     if (!hasDropFiles(e.dataTransfer) && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     dragDepthRef.current += 1;
@@ -2642,12 +2652,14 @@ export function TerminalSurface({
   };
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (isSplitOnlyDrag(e)) return;
     if (!hasDropFiles(e.dataTransfer) && !hasWorkspaceDrag(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
   };
 
   const onDragLeave = (e: DragEvent<HTMLDivElement>) => {
+    if (isSplitOnlyDrag(e)) return;
     if (!hasDropFiles(e.dataTransfer) && !hasWorkspaceDrag(e)) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragOver(false);
@@ -2656,6 +2668,7 @@ export function TerminalSurface({
   const onDrop = (e: DragEvent<HTMLDivElement>) => {
     dragDepthRef.current = 0;
     setDragOver(false);
+    if (isSplitOnlyDrag(e)) return;
     const wsItem = readWorkspaceDrag(e);
     if (wsItem) {
       e.preventDefault();
@@ -2668,7 +2681,8 @@ export function TerminalSurface({
     }
     const dt = e.dataTransfer;
     if (!dt) return;
-    const hasPayload = hasDropFiles(dt) || (dt.files?.length ?? 0) > 0 || (dt.items?.length ?? 0) > 0;
+    const hasFileItem = Array.from(dt.items ?? []).some((item) => item.kind === "file");
+    const hasPayload = hasDropFiles(dt) || (dt.files?.length ?? 0) > 0 || hasFileItem;
     if (!hasPayload) return;
     e.preventDefault();
     e.stopPropagation();

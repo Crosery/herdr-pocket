@@ -235,12 +235,15 @@ test("TerminalSurface subscribes to local-term://size and fonts.ts prefers 1-cel
   assert.ok(idxSymbolsMono >= 0 && idxJbMono > idxSymbolsMono && idxJbProp > idxJbMono, "Mono Nerd fonts must precede proportional JetBrainsMono Nerd Font");
 });
 
-test("pane header action toolbar (.v3-pane-actions) remains visible by default", () => {
+test("pane header right group (.v3-pane-right) stays flush right and .v3-pane-actions collapses without phantom width until hover", () => {
   const css = readFileSync(new URL("../src/styles/shell.css", import.meta.url), "utf8");
-  const match = css.match(/\.v3-pane-actions\s*\{([^}]*)\}/);
-  assert.ok(match, "shell.css must define .v3-pane-actions");
-  assert.equal(/opacity\s*:\s*0/.test(match[1]!), false, ".v3-pane-actions must not hide with opacity: 0");
-  assert.equal(/pointer-events\s*:\s*none/.test(match[1]!), false, ".v3-pane-actions must remain clickable by default");
+  const rightMatch = css.match(/\.v3-pane-right\s*\{([^}]*)\}/);
+  assert.ok(rightMatch, "shell.css must define .v3-pane-right");
+  assert.match(rightMatch[1]!, /margin-left\s*:\s*auto/);
+  assert.match(rightMatch[1]!, /justify-content\s*:\s*flex-end/);
+  assert.equal(/opacity\s*:\s*0/.test(css.match(/\.v3-pane-actions\s*\{([^}]*)\}/)?.[1] ?? ""), false, ".v3-pane-actions must not leave an invisible gap with opacity: 0");
+  assert.match(css, /@media\s*\(hover:\s*hover\)[\s\S]*?\.v3-pane-actions\s*\{\s*display\s*:\s*none;/);
+  assert.match(css, /\.v3-pane-head:hover\s+\.v3-pane-actions[\s\S]*?display\s*:\s*inline-flex;/);
 });
 
 test("Touched desktop UI & sync modules have zero forward references to block-scoped let/const declarations (TDZ guard)", () => {
@@ -248,10 +251,15 @@ test("Touched desktop UI & sync modules have zero forward references to block-sc
   const targets = [
     "../src/components/TerminalSurface.tsx",
     "../src/shell/ShellWork.tsx",
+    "../src/shell/ShellSidebar.tsx",
+    "../src/shell/shellStore.ts",
     "../src/shell/DesktopShell.tsx",
     "../src/shell/herdrDoc.ts",
     "../src/shell/herdrDocSync.ts",
     "../src/views/WorkbenchView.tsx",
+    "../src/views/AgentsView.tsx",
+    "../src/lib/mock.ts",
+    "../src/lib/fileDrag.ts",
     "../src/lib/terminalSearch.ts",
   ];
   const cfg = ts.readConfigFile(cfgPath, ts.sys.readFile);

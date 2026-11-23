@@ -23,7 +23,7 @@ import { hydrateWorkspaceState } from "./lib/workspacePersist";
 import { startAutoUpdateChecks, updateStore } from "./lib/updates";
 import { completePairing, pairWithLocalHostWithin, pingRelay, signOut, startRelayLink, stopRelayLink } from "./lib/relay";
 import { allAgents, applyThemeAttribute, liveStore, settingsStore, spacedTitle, updateSettings } from "./lib/store";
-import { useEnergyAttributes, useViewport } from "./lib/layout";
+import { useEnergyAttributes, useViewportTier } from "./lib/layout";
 import { clientConfigStore, startClientConfig } from "./lib/config";
 import { logger } from "./lib/log";
 import { terminalOwnsCtrlK } from "./lib/termKeys";
@@ -69,9 +69,9 @@ function PocketAppShell() {
   const updateReady = updateStore.use((s) => Boolean(s.info?.hasUpdate));
 
   useEnergyAttributes();
-  const vp = useViewport();
-  const mobileLayout = vp.tier === "mobile";
-  const rail = vp.tier === "rail" || ((vp.tier === "regular" || vp.tier === "wide") && collapsedPref);
+  const tier = useViewportTier();
+  const mobileLayout = tier === "mobile";
+  const rail = tier === "rail" || ((tier === "regular" || tier === "wide") && collapsedPref);
 
   const [boot, setBoot] = useState<Boot>("loading");
   const [tab, setTab] = useState<TabId>("agents");
@@ -502,7 +502,7 @@ function PocketAppShell() {
     <div className="v3-root" style={{ fontSize }}>
       <DesktopShell
         collapsed={rail}
-        canToggleSidebar={vp.tier !== "rail"}
+        canToggleSidebar={tier !== "rail"}
         onToggleSidebar={() => updateSettings({ sidebarCollapsed: !collapsedPref })}
         onPairPhone={() => setPairOpen(true)}
         onConnectRelay={() => setRelayOpen(true)}

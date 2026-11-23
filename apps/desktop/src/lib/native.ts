@@ -716,6 +716,7 @@ export const native = {
     display?: Record<string, unknown>;
     spaceName?: string;
     spaceId?: string;
+    tabId?: string;
     argv?: string[];
   }): Promise<LocalCreateShellResult> =>
     inTauri()
@@ -726,6 +727,7 @@ export const native = {
           display: params.display ?? null,
           spaceName: params.spaceName ?? null,
           spaceId: params.spaceId ?? null,
+          tabId: params.tabId ?? null,
           argv: params.argv ?? null,
         })
       : Promise.reject(new Error("仅桌面端支持本地直连")),
@@ -858,6 +860,14 @@ export const native = {
     const qs = new URLSearchParams({ path: path.trim() });
     if (cwd?.trim()) qs.set("cwd", cwd.trim());
     return `${origin}/file?${qs.toString()}`;
+  },
+  /** Scoped capability URL (`pocket-local://localhost/cap/<token>/...`) usable inside HTML iframe & built-in browser. */
+  registerLocalPreviewUrl: async (path: string, cwd?: string): Promise<string | null> => {
+    if (!inTauri() || !path.trim()) return null;
+    return invoke<string>("register_local_preview_token", {
+      cwd: cwd?.trim() || null,
+      path: path.trim(),
+    });
   },
   readOsDragPaths: async (): Promise<DraggedOsItemNative[]> =>
     inTauri() ? invoke<DraggedOsItemNative[]>("read_os_drag_paths").catch(() => []) : [],

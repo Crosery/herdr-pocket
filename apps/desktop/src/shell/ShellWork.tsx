@@ -5,7 +5,7 @@ import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
-import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood } from "../components/MascotAndVendor";
+import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood, resolveVendor } from "../components/MascotAndVendor";
 import { serverLabel } from "../components/Sidebar";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
 import { prettyHotkey } from "../components/VoiceInput";
@@ -18,7 +18,7 @@ import { createBufferedEventMerger, foldConvEvents, mergeConvEvents } from "../l
 import { useClientConfig } from "../lib/config";
 import { endPaneDrag, endPanelDrag, endTabDrag, endWorkspaceDrag, hasPaneDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readPaneDrag, readPanelDrag, readTabDrag, readWorkspaceDrag, startPaneDrag, startPanelDrag, startTabDrag } from "../lib/fileDrag";
 import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
-import { canActOnLocalFile, revealInFolderLabel, revealInFolderShortLabel, revealLocalFile } from "../lib/localFileActions";
+import { canActOnLocalFile, isAbsoluteOrHomePath, openLocalFileDefault, openLocalFileInBuiltinBrowser, revealInFolderLabel, revealInFolderShortLabel, revealLocalFile } from "../lib/localFileActions";
 import { isMockServer } from "../lib/mock";
 import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
@@ -53,7 +53,6 @@ import {
   setPaneAgentMode,
   setPanelWidth,
   setPeek,
-  setSelectedSpace,
   shellStore,
   showPanel,
   splitActivePaneWithContent,
@@ -404,15 +403,20 @@ function TabChip({
 }) {
   const agentsMap = liveStore.use((s) => s.agents);
   const devices = liveStore.use((s) => s.devices);
+  const all = useMemo(() => allAgents(agentsMap), [agentsMap]);
   const leaves = useMemo(() => tabLeaves(tab), [tab]);
   const primary = focusedLeafOfTab(tab);
   const primaryContent = primary.content;
+  const leadLeaf = useMemo(
+    () => (primaryContent.kind === "agent" ? primary : leaves.find((l) => l.content.kind === "agent") ?? primary),
+    [leaves, primary, primaryContent.kind],
+  );
+  const leadContent = leadLeaf.content;
   const agent = useMemo(
-    () => (primaryContent.kind === "agent" ? allAgents(agentsMap).find((a) => a.key === primaryContent.agentKey) : undefined),
-    [agentsMap, primaryContent],
+    () => (leadContent.kind === "agent" ? all.find((a) => a.key === leadContent.agentKey) : undefined),
+    [all, leadContent],
   );
   const group = useMemo(() => {
-    const all = allAgents(agentsMap);
     let best: ReturnType<typeof listGroup> | null = null;
     const rank = { blocked: 4, working: 3, done: 2, idle: 1, offline: 0 };
     for (const leaf of leaves) {
@@ -424,15 +428,17 @@ function TabChip({
       if (!best || rank[g] > rank[best]) best = g;
     }
     return best;
-  }, [agentsMap, devices, leaves]);
+  }, [all, devices, leaves]);
   const title = contentTitle(primaryContent, agent);
-  const primaryProgram = primaryContent.kind === "agent" && agent ? agentTitle(agent) : undefined;
-  const isHerdrTab = Boolean(tab.docTabId || (hasSpaceFilter && primaryContent.kind === "agent"));
-  const shownLabel = isHerdrTab
+  const primaryProgram = leadContent.kind === "agent"
+    ? (agent ? (agent.isShell ? "Terminal" : resolveVendor(agent.harness, false).label) : "已结束的 Agent")
+    : undefined;
+  const primaryLiveTitle = leadContent.kind === "agent" && agent ? (agent.name || agent.title) : undefined;
+  const isHerdrTab = Boolean(tab.docTabId || leadContent.kind === "agent" || hasSpaceFilter);
+  const shownLabel = isHerdrTab && (tab.docTabId || leadContent.kind === "agent")
     ? formatHerdrTabLabel(
         { name: tab.docTabName ?? (tab.docTabId ? "" : undefined) },
-        index,
-        primaryProgram,
+        { programName: primaryProgram, liveTitle: primaryLiveTitle, index },
         Boolean(tab.split?.zoomedPaneId),
       )
     : (tab.docTabName || title);
@@ -589,6 +595,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
   const activeBySpace = shellStore.use((s) => s.activeBySpace);
   const panel = shellStore.use((s) => s.panel);
   const agentsMap = liveStore.use((s) => s.agents);
+  const spacesMap = liveStore.use((s) => s.spaces);
   const homePage = useClientConfig().browser.homePage;
   const [menu, setMenu] = useState<{ x: number; y: number; tab: ShellTab } | null>(null);
   const [newMenu, setNewMenu] = useState<{ x: number; y: number } | null>(null);
@@ -600,26 +607,41 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
   const wheelLockRef = useRef(0);
   const tabElsRef = useRef(new Map<string, HTMLDivElement>());
   const prevRectsRef = useRef(new Map<string, number>());
+  const tabAnimsRef = useRef(new WeakMap<HTMLDivElement, Animation>());
 
   const agentByKey = useMemo(() => new Map(allAgents(agentsMap).map((a) => [a.key, a] as const)), [agentsMap]);
   const lookupAgent = useCallback((k: string) => agentByKey.get(k), [agentByKey]);
   const visibleTabs = useMemo(
-    () => visibleTabsForSpace(tabs, selectedSpace, lookupAgent),
-    [lookupAgent, selectedSpace, tabs],
+    () => visibleTabsForSpace(tabs, selectedSpace, lookupAgent, spacesMap),
+    [lookupAgent, selectedSpace, spacesMap, tabs],
   );
   const active = useMemo(
-    () => activeTabIdForSpace({ tabs, active: rawActive, selectedSpace, activeBySpace }, lookupAgent),
-    [activeBySpace, lookupAgent, rawActive, selectedSpace, tabs],
+    () => activeTabIdForSpace({ tabs, active: rawActive, selectedSpace, activeBySpace }, lookupAgent, spacesMap),
+    [activeBySpace, lookupAgent, rawActive, selectedSpace, spacesMap, tabs],
   );
-  const selSpaceLabel = useMemo(() => {
-    if (!selectedSpace) return null;
-    const [, sp] = selectedSpace.split("\u0000");
-    return sp || "未分空间";
-  }, [selectedSpace]);
 
-  // Keep the active chip in view, as Herdr does.
+  // Keep the active chip in view on tab switch and tab-strip resize, matching Herdr.app.
   useEffect(() => {
-    scrollRef.current?.querySelector<HTMLElement>(".v3-tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const scroller = scrollRef.current;
+    if (!scroller) return;
+    const revealActive = () => {
+      scroller.querySelector<HTMLElement>(".v3-tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    };
+    revealActive();
+    if (typeof ResizeObserver === "undefined") return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        revealActive();
+      });
+    });
+    ro.observe(scroller);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
   }, [active, visibleTabs.length]);
 
   useEffect(() => {
@@ -629,13 +651,16 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
     };
   }, [toast]);
 
-  // Smooth FLIP slide animation whenever visible tabs reorder or insert.
+  // Smooth FLIP slide animation via Web Animations API so layout transform never gets stuck if renders overlap.
   useLayoutEffect(() => {
     const reduced = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const nextRects = new Map<string, number>();
     for (const t of visibleTabs) {
       const el = tabElsRef.current.get(t.id);
-      if (el) nextRects.set(t.id, el.getBoundingClientRect().left);
+      if (!el) continue;
+      tabAnimsRef.current.get(el)?.cancel();
+      tabAnimsRef.current.delete(el);
+      nextRects.set(t.id, el.getBoundingClientRect().left);
     }
     if (!reduced && prevRectsRef.current.size > 0) {
       for (const t of visibleTabs) {
@@ -644,14 +669,15 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
         const nextLeft = nextRects.get(t.id);
         if (!el || prevLeft === undefined || nextLeft === undefined) continue;
         const dx = prevLeft - nextLeft;
-        if (Math.abs(dx) < 1) continue;
-        el.style.transition = "none";
-        el.style.transform = `translateX(${dx}px)`;
-        el.getBoundingClientRect();
-        requestAnimationFrame(() => {
-          el.style.transition = "transform 180ms cubic-bezier(0.22, 1, 0.36, 1)";
-          el.style.transform = "";
-        });
+        if (Math.abs(dx) < 1 || typeof el.animate !== "function") continue;
+        const anim = el.animate(
+          [{ transform: `translateX(${dx}px)` }, { transform: "translateX(0px)" }],
+          { duration: 180, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+        );
+        tabAnimsRef.current.set(el, anim);
+        anim.onfinish = () => {
+          if (tabAnimsRef.current.get(el) === anim) tabAnimsRef.current.delete(el);
+        };
       }
     }
     prevRectsRef.current = nextRects;
@@ -805,21 +831,6 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       }}
       onDrop={(e) => handleDropAt(e)}
     >
-      {selSpaceLabel ? (
-        <span className="v3-space-scope-chip" data-tauri-drag-region="false" title={`当前仅显示空间「${selSpaceLabel}」的标签页`}>
-          <Layers size={11} />
-          <span className="truncate">{selSpaceLabel}</span>
-          <button
-            type="button"
-            className="v3-space-scope-x"
-            aria-label="显示全部空间的标签"
-            title="取消空间筛选，显示全部标签"
-            onClick={() => setSelectedSpace(null, lookupAgent)}
-          >
-            <X size={10} />
-          </button>
-        </span>
-      ) : null}
       <div
         ref={scrollRef}
         className="v3-tab-scroll"
@@ -900,6 +911,22 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       {menu ? (() => {
         const menuFocused = focusedLeafOfTab(menu.tab).content;
         const menuLeaves = tabLeaves(menu.tab);
+        const menuFileLeaf = menuFocused.kind === "file" ? menuFocused : menuLeaves.find((l) => l.content.kind === "file")?.content;
+        const menuFileAgent = menuFileLeaf && menuFileLeaf.kind === "file" ? agentByKey.get(menuFileLeaf.agentKey) : undefined;
+        const menuPlatform = detectPlatform();
+        const menuLocalHostId = localHostIdStore.get();
+        const canMenuFileLocal = Boolean(
+          menuFileLeaf &&
+            menuFileLeaf.kind === "file" &&
+            canActOnLocalFile({
+              nativeAvailable: native.available(),
+              agentDeviceId: menuFileAgent?.deviceId,
+              agentCwd: menuFileAgent?.cwd,
+              localHostId: menuLocalHostId,
+              path: menuFileLeaf.path,
+              absPath: menuFileLeaf.absPath,
+            }),
+        );
         const isLive = menuLeaves.some((l) => l.content.kind === "agent" && isLiveTerminalAgent(agentByKey.get(l.content.agentKey)));
         const idx = visibleTabs.findIndex((t) => t.id === menu.tab.id);
         const otherTabs = visibleTabs.filter((t) => t.id !== menu.tab.id);
@@ -938,6 +965,55 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
                 setRenamingId(id);
               }}
             />
+            {canMenuFileLocal && menuFileLeaf && menuFileLeaf.kind === "file" ? (
+              <>
+                <div className="menu-sep" />
+                <MenuItem
+                  label="用内置浏览器打开"
+                  icon={Globe}
+                  onClick={() => {
+                    const target = menuFileLeaf;
+                    const ag = menuFileAgent;
+                    setMenu(null);
+                    void openLocalFileInBuiltinBrowser({
+                      path: target.path,
+                      absPath: target.absPath,
+                      agentCwd: ag?.cwd,
+                      title: target.title,
+                      spaceKey: selectedSpace,
+                    }).catch((e: Error) => toast(e.message || "无法用内置浏览器打开", true));
+                  }}
+                />
+                <MenuItem
+                  label="用系统默认应用打开"
+                  icon={ExternalLink}
+                  onClick={() => {
+                    const target = menuFileLeaf;
+                    const ag = menuFileAgent;
+                    setMenu(null);
+                    void openLocalFileDefault({
+                      path: target.path,
+                      absPath: target.absPath,
+                      agentCwd: ag?.cwd,
+                    }).catch((e: Error) => toast(e.message || "无法用系统默认应用打开", true));
+                  }}
+                />
+                <MenuItem
+                  label={revealInFolderLabel(menuPlatform)}
+                  icon={FolderOpen}
+                  onClick={() => {
+                    const target = menuFileLeaf;
+                    const ag = menuFileAgent;
+                    setMenu(null);
+                    void revealLocalFile({
+                      path: target.path,
+                      absPath: target.absPath,
+                      agentCwd: ag?.cwd,
+                    }).catch((e: Error) => toast(e.message || "打开所在目录失败", true));
+                  }}
+                />
+              </>
+            ) : null}
             <div className="menu-sep" />
             {canMergeIntoActive ? (
               <>
@@ -1076,6 +1152,7 @@ function PaneHead({
   fileHead,
   isSplit,
   isZoomed,
+  onDraggingPaneChange,
   onSplitNewTerminal,
   onToggleZoom,
   onEqualize,
@@ -1092,6 +1169,7 @@ function PaneHead({
   fileHead?: FileViewerHeadState | null;
   isSplit: boolean;
   isZoomed: boolean;
+  onDraggingPaneChange: (paneId: string | null) => void;
   onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
   onToggleZoom: () => void;
   onEqualize: () => void;
@@ -1125,6 +1203,28 @@ function PaneHead({
             absPath: content.absPath,
             agentCwd: agent?.cwd,
           }).catch((e: Error) => toast(e.message || "打开所在目录失败", true));
+        }
+      : undefined;
+  const handleOpenDefault =
+    content.kind === "file"
+      ? () => {
+          void openLocalFileDefault({
+            path: content.path,
+            absPath: content.absPath,
+            agentCwd: agent?.cwd,
+          }).catch((e: Error) => toast(e.message || "无法用系统默认应用打开", true));
+        }
+      : undefined;
+  const handleOpenBuiltinBrowser =
+    content.kind === "file"
+      ? () => {
+          void openLocalFileInBuiltinBrowser({
+            path: content.path,
+            absPath: content.absPath,
+            agentCwd: agent?.cwd,
+            title: content.title,
+            spaceKey: shellStore.get().selectedSpace,
+          }).catch((e: Error) => toast(e.message || "无法用内置浏览器打开", true));
         }
       : undefined;
   let icon: React.ReactNode;
@@ -1170,9 +1270,29 @@ function PaneHead({
   const previewToggleable = Boolean(content.kind === "file" && (fileHead?.canPreview || fileHead?.isMd));
   const oppositeMode: AgentPaneMode = mode === "term" ? "chat" : "term";
 
+  const canDragHead = isSplit && !isZoomed;
+
   return (
     <div
-      className="v3-pane-head"
+      className={`v3-pane-head${canDragHead ? " draggable" : ""}`}
+      draggable={canDragHead}
+      data-menu-open={paneMenu ? "true" : undefined}
+      data-tauri-drag-region="false"
+      onDragStart={(e) => {
+        if (!canDragHead) return;
+        const target = e.target as HTMLElement | null;
+        if (target?.closest("button, input, a, [role='button']")) {
+          e.preventDefault();
+          return;
+        }
+        e.stopPropagation();
+        startPaneDrag(e, { tabId, paneId });
+        onDraggingPaneChange(paneId);
+      }}
+      onDragEnd={() => {
+        endPaneDrag();
+        onDraggingPaneChange(null);
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         setPaneMenu({ x: e.clientX, y: e.clientY });
@@ -1209,131 +1329,154 @@ function PaneHead({
           )}
         </>
       )}
-      {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
-      {sizeText ? <span className="v3-pane-pill num">{sizeText}</span> : null}
-      {content.kind === "agent" && agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
-        <SubagentCatalogTrigger
-          compact
-          deviceId={agent.deviceId}
-          agentKey={agent.key}
-          knownCount={subHead.knownCount}
-          subs={subHead.rootSubs}
-          onSelectSub={subHead.onSelectSub}
-          onOpenAside={subHead.onOpenAside}
-          onRefresh={subHead.onRefresh}
-        />
-      ) : null}
-      {content.kind === "agent" && group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
-      {content.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
-      {previewToggleable && fileHead ? (
-        <div className="v3-mode-switch" role="group" aria-label="视图">
+      <div className="v3-pane-right">
+        {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
+        {sizeText ? <span className="v3-pane-pill num">{sizeText}</span> : null}
+        {content.kind === "agent" && agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
+          <SubagentCatalogTrigger
+            compact
+            deviceId={agent.deviceId}
+            agentKey={agent.key}
+            knownCount={subHead.knownCount}
+            subs={subHead.rootSubs}
+            onSelectSub={subHead.onSelectSub}
+            onOpenAside={subHead.onOpenAside}
+            onRefresh={subHead.onRefresh}
+          />
+        ) : null}
+        {content.kind === "agent" && group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
+        {content.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
+        {previewToggleable && fileHead ? (
+          <div className="v3-mode-switch" role="group" aria-label="视图">
+            <button
+              type="button"
+              className={`v3-mode-btn v3-pane-mode-text${fileHead.preview ? " on" : ""}`}
+              aria-pressed={fileHead.preview}
+              onClick={() => fileHead.setPreview(true)}
+            >
+              {fileHead.previewLabel || "预览"}
+            </button>
+            <button
+              type="button"
+              className={`v3-mode-btn v3-pane-mode-text${!fileHead.preview ? " on" : ""}`}
+              aria-pressed={!fileHead.preview}
+              onClick={() => fileHead.setPreview(false)}
+            >
+              源码
+            </button>
+          </div>
+        ) : null}
+        {canRevealLocal && content.kind === "file" ? (
+          <>
+            <button
+              type="button"
+              className="v3-pane-tool-btn"
+              title="用内置浏览器打开"
+              onClick={handleOpenBuiltinBrowser}
+            >
+              <Globe size={12} />
+              <span>内置浏览器</span>
+            </button>
+            <button
+              type="button"
+              className="v3-pane-tool-btn"
+              title="用系统默认应用打开"
+              onClick={handleOpenDefault}
+            >
+              <ExternalLink size={12} />
+              <span>系统打开</span>
+            </button>
+            <button
+              type="button"
+              className="v3-pane-tool-btn"
+              aria-label={revealShortLabel}
+              title={`${revealLabel}（${content.absPath || content.path}）`}
+              onClick={handleReveal}
+            >
+              <FolderOpen size={12} />
+              <span>{platform === "macos" ? "访达" : "目录"}</span>
+            </button>
+          </>
+        ) : null}
+        <div className="v3-pane-actions">
+          {content.kind === "agent" && agent && mode && onModeChange ? (
+            <button
+              type="button"
+              className="v3-icon-btn small"
+              aria-label={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
+              title={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
+              onClick={() => onModeChange(oppositeMode)}
+            >
+              {oppositeMode === "chat" ? <MessageSquare size={13} /> : <Terminal size={13} />}
+            </button>
+          ) : null}
+          {content.kind === "agent" && agent && mode === "term" ? (
+            <button
+              type="button"
+              className="v3-icon-btn small"
+              aria-label="在终端中搜索"
+              title={`在终端中搜索（${shortcutText("terminalSearch")}）`}
+              onClick={() => {
+                if (typeof window !== "undefined") {
+                  window.dispatchEvent(new CustomEvent("pocket:term-search", { detail: { agentKey: agent.key } }));
+                }
+              }}
+            >
+              <Search size={13} />
+            </button>
+          ) : null}
+          {content.kind === "file" ? (
+            <button
+              type="button"
+              className="v3-icon-btn small"
+              aria-label="复制路径"
+              title={`复制路径（${content.absPath || content.path}）`}
+              onClick={() => {
+                void copyToClipboard(content.absPath || content.path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok));
+              }}
+            >
+              <Copy size={13} />
+            </button>
+          ) : null}
           <button
             type="button"
-            className={`v3-mode-btn v3-pane-mode-text${fileHead.preview ? " on" : ""}`}
-            aria-pressed={fileHead.preview}
-            onClick={() => fileHead.setPreview(true)}
+            className="v3-icon-btn small"
+            aria-label="向右分屏"
+            title={`向右分屏（${shortcutText("splitRight")}）`}
+            onClick={() => onSplitNewTerminal(tabId, paneId, "right")}
           >
-            {fileHead.previewLabel || "预览"}
+            <Columns2 size={13} />
           </button>
           <button
             type="button"
-            className={`v3-mode-btn v3-pane-mode-text${!fileHead.preview ? " on" : ""}`}
-            aria-pressed={!fileHead.preview}
-            onClick={() => fileHead.setPreview(false)}
+            className="v3-icon-btn small"
+            aria-label="向下分屏"
+            title={`向下分屏（${shortcutText("splitDown")}）`}
+            onClick={() => onSplitNewTerminal(tabId, paneId, "down")}
           >
-            源码
+            <Rows2 size={13} />
+          </button>
+          {isSplit || isZoomed ? (
+            <button
+              type="button"
+              className={`v3-icon-btn small${isZoomed ? " on" : ""}`}
+              aria-label={isZoomed ? "还原分屏布局" : "最大化此分屏"}
+              title={`${isZoomed ? "还原分屏布局" : "最大化此分屏"}（${shortcutText("zoomPane")}）`}
+              onClick={onToggleZoom}
+            >
+              {isZoomed ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="v3-icon-btn small"
+            aria-label={isSplit ? "关闭此分屏" : "关闭标签"}
+            title={isSplit ? `关闭此分屏（${shortcutText("closePane")}）` : `关闭标签（${shortcutText("closeTab")}）`}
+            onClick={onClose}
+          >
+            <X size={13} />
           </button>
         </div>
-      ) : null}
-      <div className="v3-pane-actions">
-        {content.kind === "agent" && agent && mode && onModeChange ? (
-          <button
-            type="button"
-            className="v3-icon-btn small"
-            aria-label={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
-            title={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
-            onClick={() => onModeChange(oppositeMode)}
-          >
-            {oppositeMode === "chat" ? <MessageSquare size={13} /> : <Terminal size={13} />}
-          </button>
-        ) : null}
-        {content.kind === "agent" && agent && mode === "term" ? (
-          <button
-            type="button"
-            className="v3-icon-btn small"
-            aria-label="在终端中搜索"
-            title={`在终端中搜索（${shortcutText("terminalSearch")}）`}
-            onClick={() => {
-              if (typeof window !== "undefined") {
-                window.dispatchEvent(new CustomEvent("pocket:term-search", { detail: { agentKey: agent.key } }));
-              }
-            }}
-          >
-            <Search size={13} />
-          </button>
-        ) : null}
-        {canRevealLocal ? (
-          <button
-            type="button"
-            className="v3-icon-btn small"
-            aria-label={revealShortLabel}
-            title={`${revealLabel}（${content.absPath || content.path}）`}
-            onClick={handleReveal}
-          >
-            <FolderOpen size={13} />
-          </button>
-        ) : null}
-        {content.kind === "file" ? (
-          <button
-            type="button"
-            className="v3-icon-btn small"
-            aria-label="复制路径"
-            title={`复制路径（${content.absPath || content.path}）`}
-            onClick={() => {
-              void copyToClipboard(content.absPath || content.path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok));
-            }}
-          >
-            <Copy size={13} />
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="v3-icon-btn small"
-          aria-label="向右分屏"
-          title={`向右分屏（${shortcutText("splitRight")}）`}
-          onClick={() => onSplitNewTerminal(tabId, paneId, "right")}
-        >
-          <Columns2 size={13} />
-        </button>
-        <button
-          type="button"
-          className="v3-icon-btn small"
-          aria-label="向下分屏"
-          title={`向下分屏（${shortcutText("splitDown")}）`}
-          onClick={() => onSplitNewTerminal(tabId, paneId, "down")}
-        >
-          <Rows2 size={13} />
-        </button>
-        {isSplit || isZoomed ? (
-          <button
-            type="button"
-            className={`v3-icon-btn small${isZoomed ? " on" : ""}`}
-            aria-label={isZoomed ? "还原分屏布局" : "最大化此分屏"}
-            title={`${isZoomed ? "还原分屏布局" : "最大化此分屏"}（${shortcutText("zoomPane")}）`}
-            onClick={onToggleZoom}
-          >
-            {isZoomed ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="v3-icon-btn small"
-          aria-label={isSplit ? "关闭此分屏" : "关闭标签"}
-          title={isSplit ? `关闭此分屏（${shortcutText("closePane")}）` : `关闭标签（${shortcutText("closeTab")}）`}
-          onClick={onClose}
-        >
-          <X size={13} />
-        </button>
       </div>
       {paneMenu ? (
         <Popup x={paneMenu.x} y={paneMenu.y} onClose={() => setPaneMenu(null)} width={236}>
@@ -1380,6 +1523,35 @@ function PaneHead({
               });
             }}
           />
+          {canRevealLocal && content.kind === "file" ? (
+            <>
+              <div className="menu-sep" />
+              <MenuItem
+                label="用内置浏览器打开"
+                icon={Globe}
+                onClick={() => {
+                  setPaneMenu(null);
+                  handleOpenBuiltinBrowser?.();
+                }}
+              />
+              <MenuItem
+                label="用系统默认应用打开"
+                icon={ExternalLink}
+                onClick={() => {
+                  setPaneMenu(null);
+                  handleOpenDefault?.();
+                }}
+              />
+              <MenuItem
+                label={revealLabel}
+                icon={FolderOpen}
+                onClick={() => {
+                  setPaneMenu(null);
+                  handleReveal?.();
+                }}
+              />
+            </>
+          ) : null}
           {isSplit || isZoomed ? (
             <>
               <div className="menu-sep" />
@@ -1521,6 +1693,7 @@ function SplitPaneSlot({
   isSplit,
   isFocused,
   isZoomed,
+  tabActive,
   draggingPaneId,
   onDraggingPaneChange,
   onSplitNewTerminal,
@@ -1530,6 +1703,7 @@ function SplitPaneSlot({
   isSplit: boolean;
   isFocused: boolean;
   isZoomed: boolean;
+  tabActive: boolean;
   draggingPaneId: string | null;
   onDraggingPaneChange: (paneId: string | null) => void;
   onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
@@ -1543,6 +1717,17 @@ function SplitPaneSlot({
   const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
   const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
   const [dropZone, setDropZone] = useState<SplitDropZone | null>(null);
+
+  useEffect(() => {
+    if (!dropZone) return;
+    const clear = () => setDropZone(null);
+    window.addEventListener("dragend", clear, true);
+    window.addEventListener("drop", clear, true);
+    return () => {
+      window.removeEventListener("dragend", clear, true);
+      window.removeEventListener("drop", clear, true);
+    };
+  }, [dropZone]);
 
   const label =
     content.kind === "agent"
@@ -1631,11 +1816,17 @@ function SplitPaneSlot({
         if (shellStore.get().panel === "browser") showPanel(null);
       } else if (panelItem.kind === "agent") {
         const targetAgent = allAgents(agentsMap).find((a) => a.key === panelItem.agentKey);
-        splitTabPane(tabId, leaf.id, dir, {
-          kind: "agent",
-          agentKey: panelItem.agentKey,
-          ...(targetAgent?.isShell ? { mode: "term" } : {}),
-        });
+        splitTabPane(
+          tabId,
+          leaf.id,
+          dir,
+          {
+            kind: "agent",
+            agentKey: panelItem.agentKey,
+            ...(targetAgent?.isShell ? { mode: "term" } : {}),
+          },
+          { dedupeOtherTabs: true },
+        );
       }
       return;
     }
@@ -1686,6 +1877,7 @@ function SplitPaneSlot({
           fileHead={fileHead}
           isSplit={isSplit}
           isZoomed={isZoomed}
+          onDraggingPaneChange={onDraggingPaneChange}
           onModeChange={content.kind === "agent" ? (m) => setPaneAgentMode(tabId, leaf.id, m) : undefined}
           onSplitNewTerminal={onSplitNewTerminal}
           onToggleZoom={() => toggleZoomTabPane(tabId, leaf.id)}
@@ -1730,7 +1922,7 @@ function SplitPaneSlot({
               <WebPane
                 key={content.webId}
                 tab={{ id: content.webId, url: content.url }}
-                active={visible}
+                active={visible && tabActive}
                 layoutKey={layoutKey}
                 onChange={(patch) => updateWebPane(tabId, leaf.id, patch)}
               />
@@ -1742,7 +1934,8 @@ function SplitPaneSlot({
                   key={agent.key}
                   agent={agent}
                   embedded
-                  focused={isFocused && visible}
+                  visible={visible && tabActive}
+                  focused={isFocused && visible && tabActive}
                   mode={mode}
                   onModeChange={(m) => setPaneAgentMode(tabId, leaf.id, m)}
                   onSubHeadChange={setSubHead}
@@ -1820,6 +2013,54 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
   );
 }
 
+const MAX_KEPT_AGENT_TABS = 12;
+
+function TabStage({
+  tab,
+  tabActive,
+  draggingPaneId,
+  onDraggingPaneChange,
+  onSplitNewTerminal,
+}: {
+  tab: ShellTab;
+  tabActive: boolean;
+  draggingPaneId: string | null;
+  onDraggingPaneChange: (paneId: string | null) => void;
+  onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
+}) {
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const splitLayout = useMemo(
+    () => computeSplitLayout(tabRootNode(tab), tab.split?.zoomedPaneId),
+    [tab],
+  );
+  const focusedId = focusedLeafOfTab(tab).id;
+  const isSplit = splitLayout.leaves.length > 1;
+  const zoomedId = tab.split?.zoomedPaneId ?? null;
+  return (
+    <div ref={stageRef} className="v3-split-stage">
+      {splitLayout.leaves.map((item) => (
+        <SplitPaneSlot
+          key={item.leaf.id}
+          tabId={tab.id}
+          item={item}
+          isSplit={isSplit}
+          isFocused={item.leaf.id === focusedId}
+          isZoomed={zoomedId === item.leaf.id}
+          tabActive={tabActive}
+          draggingPaneId={draggingPaneId}
+          onDraggingPaneChange={onDraggingPaneChange}
+          onSplitNewTerminal={onSplitNewTerminal}
+        />
+      ))}
+      {tabActive
+        ? splitLayout.sashes.map((sash) => (
+            <SplitSash key={sash.id} tabId={tab.id} sash={sash} stageRef={stageRef} />
+          ))
+        : null}
+    </div>
+  );
+}
+
 export function ShellMain({
   onNewTerminal,
   onNewAgent,
@@ -1834,29 +2075,47 @@ export function ShellMain({
   const selectedSpace = shellStore.use((s) => s.selectedSpace);
   const activeBySpace = shellStore.use((s) => s.activeBySpace);
   const agentsMap = liveStore.use((s) => s.agents);
+  const spacesMap = liveStore.use((s) => s.spaces);
   const agentByKey = useMemo(() => new Map(allAgents(agentsMap).map((a) => [a.key, a] as const)), [agentsMap]);
   const lookupAgent = useCallback((k: string) => agentByKey.get(k), [agentByKey]);
   const activeId = useMemo(
-    () => activeTabIdForSpace({ tabs, active: rawActive, selectedSpace, activeBySpace }, lookupAgent),
-    [activeBySpace, lookupAgent, rawActive, selectedSpace, tabs],
+    () => activeTabIdForSpace({ tabs, active: rawActive, selectedSpace, activeBySpace }, lookupAgent, spacesMap),
+    [activeBySpace, lookupAgent, rawActive, selectedSpace, spacesMap, tabs],
   );
   const active = tabs.find((t) => t.id === activeId) ?? null;
-  const stageRef = useRef<HTMLDivElement | null>(null);
   const [draggingPaneId, setDraggingPaneId] = useState<string | null>(null);
+  const keptAgentIdsRef = useRef<string[]>([]);
 
-  const splitLayout = useMemo(
-    () => (active ? computeSplitLayout(tabRootNode(active), active.split?.zoomedPaneId) : null),
-    [active],
+  const agentTabIds = useMemo(
+    () => new Set(tabs.filter((t) => tabLeaves(t).some((l) => l.content.kind === "agent")).map((t) => t.id)),
+    [tabs],
   );
-  const focusedId = active ? focusedLeafOfTab(active).id : null;
-  const isSplit = Boolean(splitLayout && splitLayout.leaves.length > 1);
-  const zoomedId = active?.split?.zoomedPaneId ?? null;
+  const keptAgentIds = useMemo(() => {
+    const pruned = keptAgentIdsRef.current.filter((id) => agentTabIds.has(id));
+    const next =
+      activeId && agentTabIds.has(activeId)
+        ? [activeId, ...pruned.filter((id) => id !== activeId)].slice(0, MAX_KEPT_AGENT_TABS)
+        : pruned.slice(0, MAX_KEPT_AGENT_TABS);
+    keptAgentIdsRef.current = next;
+    return next;
+  }, [activeId, agentTabIds]);
 
-  // Keep native WebViews from inactive tabs alive in hidden containers so pages never reload on tab switch.
+  const mountedTabIds = useMemo(() => {
+    const set = new Set(keptAgentIds);
+    if (activeId) set.add(activeId);
+    return set;
+  }, [activeId, keptAgentIds]);
+
+  const mountedTabs = useMemo(
+    () => tabs.filter((t) => mountedTabIds.has(t.id)),
+    [mountedTabIds, tabs],
+  );
+
+  // Keep native WebViews from unmounted inactive tabs alive in hidden containers so pages never reload on tab switch.
   const inactiveWebLeaves = useMemo(() => {
     const out: Array<{ tabId: string; leafId: string; webId: string; url: string }> = [];
     for (const t of tabs) {
-      if (t.id === activeId) continue;
+      if (mountedTabIds.has(t.id)) continue;
       for (const leaf of tabLeaves(t)) {
         if (leaf.content.kind === "web") {
           out.push({ tabId: t.id, leafId: leaf.id, webId: leaf.content.webId, url: leaf.content.url });
@@ -1864,32 +2123,29 @@ export function ShellMain({
       }
     }
     return out;
-  }, [activeId, tabs]);
+  }, [mountedTabIds, tabs]);
 
   return (
     <div className="v3-main">
-      {!active || !splitLayout ? (
-        <EmptyMain onNewTerminal={onNewTerminal} onNewAgent={onNewAgent} />
-      ) : (
-        <div ref={stageRef} className="v3-split-stage">
-          {splitLayout.leaves.map((item) => (
-            <SplitPaneSlot
-              key={item.leaf.id}
-              tabId={active.id}
-              item={item}
-              isSplit={isSplit}
-              isFocused={item.leaf.id === focusedId}
-              isZoomed={zoomedId === item.leaf.id}
+      {!active ? <EmptyMain onNewTerminal={onNewTerminal} onNewAgent={onNewAgent} /> : null}
+      {mountedTabs.map((t) => {
+        const isTabActive = t.id === active?.id;
+        return (
+          <div
+            key={t.id}
+            style={isTabActive ? { display: "contents" } : { display: "none" }}
+            aria-hidden={!isTabActive}
+          >
+            <TabStage
+              tab={t}
+              tabActive={isTabActive}
               draggingPaneId={draggingPaneId}
               onDraggingPaneChange={setDraggingPaneId}
               onSplitNewTerminal={onSplitNewTerminal}
             />
-          ))}
-          {splitLayout.sashes.map((sash) => (
-            <SplitSash key={sash.id} tabId={active.id} sash={sash} stageRef={stageRef} />
-          ))}
-        </div>
-      )}
+          </div>
+        );
+      })}
       {inactiveWebLeaves.map((w) => (
         <div key={`bg-web:${w.webId}`} style={{ display: "none" }}>
           <WebPane
@@ -1946,6 +2202,7 @@ function useFilesTarget() {
       return {
         agent: picked,
         spaceName: spName || "未分空间",
+        spaceKey: selectedSpace,
         fromSelectedSpace: true,
       };
     }
@@ -1955,6 +2212,7 @@ function useFilesTarget() {
     return {
       agent: picked,
       spaceName: picked ? (agentSpace(picked) || homeFolder(picked.cwd) || "") : "",
+      spaceKey: selectedSpace,
       fromSelectedSpace: false,
     };
   }, [devices, selectedSpace, spaceExists, tabAgentKey, withFolder]);
@@ -2034,7 +2292,17 @@ function useGitTarget() {
   }, [devices, filesTarget, focusedContent, selectedSpace, spacesMap]);
 }
 
-function FilesPanel({ agent, spaceName, fromSelectedSpace }: ReturnType<typeof useFilesTarget>) {
+function joinAgentAbsPath(cwd: string | undefined, relPath: string): string | undefined {
+  const trimmedRel = relPath.trim();
+  if (!trimmedRel) return undefined;
+  if (isAbsoluteOrHomePath(trimmedRel)) return trimmedRel;
+  const cleanCwd = cwd?.trim().replace(/[\\/]+$/, "");
+  if (!cleanCwd) return undefined;
+  const cleanRel = trimmedRel.replace(/^\.\//, "");
+  return `${cleanCwd}/${cleanRel}`;
+}
+
+function FilesPanel({ agent, spaceName, spaceKey, fromSelectedSpace }: ReturnType<typeof useFilesTarget>) {
   if (!agent) {
     return (
       <div className="v3-empty-line">
@@ -2049,15 +2317,22 @@ function FilesPanel({ agent, spaceName, fromSelectedSpace }: ReturnType<typeof u
       <FileTree
         key={`${agent.deviceId}:${agent.cwd}`}
         agent={agent}
-        onOpen={(path, name) => openFileTab(agent.key, path, name)}
+        onOpen={(path, name, absPath) =>
+          openFileTab(agent.key, path, name, {
+            absPath: absPath ?? joinAgentAbsPath(agent.cwd, path),
+            spaceKey,
+          })
+        }
         onOpenSplit={(path, name, direction, absPath) =>
           splitActivePaneWithContent(direction, {
             kind: "file",
             agentKey: agent.key,
             path,
             title: name,
-            ...(absPath ? { absPath } : {}),
-            spaceKey: shellStore.get().selectedSpace,
+            ...(absPath ?? joinAgentAbsPath(agent.cwd, path)
+              ? { absPath: absPath ?? joinAgentAbsPath(agent.cwd, path) }
+              : {}),
+            spaceKey: spaceKey ?? shellStore.get().selectedSpace,
           })
         }
       />
@@ -2394,10 +2669,19 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   const link = liveStore.use((s) => s.link);
   const devices = liveStore.use((s) => s.devices);
   const agentsMap = liveStore.use((s) => s.agents);
+  const spacesMap = liveStore.use((s) => s.spaces);
   const server = settingsStore.use((s) => s.server);
   const showShells = settingsStore.use((s) => s.showShells);
-  const activeTab = shellStore.use((s) => s.tabs.find((t) => t.id === s.active) ?? null);
+  const tabs = shellStore.use((s) => s.tabs);
+  const rawActive = shellStore.use((s) => s.active);
   const selectedSpace = shellStore.use((s) => s.selectedSpace);
+  const activeBySpace = shellStore.use((s) => s.activeBySpace);
+  const statusAgentByKey = useMemo(() => new Map(allAgents(agentsMap).map((a) => [a.key, a] as const)), [agentsMap]);
+  const statusActiveId = useMemo(
+    () => activeTabIdForSpace({ tabs, active: rawActive, selectedSpace, activeBySpace }, (k) => statusAgentByKey.get(k), spacesMap),
+    [activeBySpace, rawActive, selectedSpace, spacesMap, statusAgentByKey, tabs],
+  );
+  const activeTab = useMemo(() => tabs.find((t) => t.id === statusActiveId) ?? null, [statusActiveId, tabs]);
   const localHostId = useLocalHostDeviceId();
   const voice = useClientConfig().voiceInput;
   const callStatus = voiceCallStore.use((s) => s.status);
@@ -2417,7 +2701,12 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const blocked = all.filter((a) => listGroup(a, devices) === "blocked").length;
   const [selDevice, selSpace] = selectedSpace ? (selectedSpace.split("\u0000") as [string, string]) : [null, null];
-  const validSpace = Boolean(selectedSpace && all.some((a) => a.deviceId === selDevice && (agentSpace(a) ?? "") === selSpace));
+  const validSpace = Boolean(
+    selectedSpace &&
+      selDevice &&
+      (all.some((a) => a.deviceId === selDevice && (agentSpace(a) ?? "") === selSpace) ||
+        spacesMap[selDevice]?.some((sp) => sp.name === selSpace)),
+  );
   const host = agent
     ? devices[agent.deviceId]
     : validSpace && selDevice

@@ -56,6 +56,7 @@ import { ensureLocalHostDeviceId, localHostIdStore, useLocalHostDeviceId } from 
 import {
   canActOnLocalFile,
   openLocalFileDefault,
+  openLocalFileInBuiltinBrowser,
   resolveLocalActionTarget,
   revealInFolderLabel,
   revealInFolderShortLabel,
@@ -66,7 +67,7 @@ import { useClientConfig } from "../lib/config";
 import { openAgentFileTarget } from "../lib/openFileTarget";
 import { rpcCall, RelayError } from "../lib/relay";
 import { allAgents, createStore, liveStore, spacedTitle } from "../lib/store";
-import { updateResolvedFilePanePath } from "../shell/shellStore";
+import { shellStore, updateResolvedFilePanePath } from "../shell/shellStore";
 import { useWindowHidden } from "../lib/layout";
 import { endWorkspaceDrag, startWorkspaceDrag } from "../lib/fileDrag";
 import { logger } from "../lib/log";
@@ -171,14 +172,17 @@ export function FileTree({
   onOpenSplit,
 }: {
   agent: Agent;
-  onOpen: (path: string, name: string) => void;
+  onOpen: (path: string, name: string, absPath?: string) => void;
   onOpenSplit?: (path: string, name: string, direction: "right" | "down", absPath?: string) => void;
 }) {
   const toast = useToast();
   const files = useClientConfig().files;
+  const localHostId = useLocalHostDeviceId();
+  const platform = detectPlatform();
+  const revealLabel = revealInFolderLabel(platform);
   const [lists, setLists] = useState<Record<string, Listing | { error: string } | "loading">>({});
   const [open, setOpen] = useState<Set<string>>(new Set([""]));
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; name: string; absPath?: string } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; name: string; absPath?: string; isDir: boolean } | null>(null);
 
   useEffect(() => {
     if (!ctxMenu) return;
@@ -234,7 +238,10 @@ export function FileTree({
         }
         return n;
       });
-    } else onOpen(e.path, e.name);
+    } else {
+      const absPath = rootPath ? `${rootPath.replace(/[\\/]+$/, "")}/${e.path}` : undefined;
+      onOpen(e.path, e.name, absPath);
+    }
   };
 
   const render = (path: string, depth: number): React.ReactNode => {
@@ -273,9 +280,16 @@ export function FileTree({
                   toggleRow(e);
                 }}
                 onContextMenu={(ev) => {
-                  if (isDir || e.private || e.kind === "link" || !onOpenSplit) return;
+                  if (e.private || e.kind === "link") return;
                   ev.preventDefault();
-                  setCtxMenu({ x: ev.clientX, y: ev.clientY, path: e.path, name: e.name, absPath });
+                  setCtxMenu({
+                    x: ev.clientX,
+                    y: ev.clientY,
+                    path: e.path,
+                    name: e.name,
+                    absPath: absPath ?? (agent.cwd ? `${agent.cwd.replace(/[\\/]+$/, "")}/${e.path}` : undefined),
+                    isDir,
+                  });
                 }}
                 onKeyDown={(ev) => {
                   if (ev.key === "Enter" || ev.key === " ") {
@@ -335,61 +349,160 @@ export function FileTree({
         </div>
       ) : null}
       {render("", 0)}
-      {ctxMenu && onOpenSplit && typeof document !== "undefined"
-        ? createPortal(
-            <div
-              className="ctx-menu v3-popup"
-              role="menu"
-              style={{
-                position: "fixed",
-                left: Math.max(8, Math.min(ctxMenu.x, window.innerWidth - 200 - 8)),
-                top: Math.max(8, Math.min(ctxMenu.y, window.innerHeight - 160)),
-                width: 200,
-              }}
-              onPointerDown={(ev) => ev.stopPropagation()}
-            >
-              <button
-                type="button"
-                className="menu-item v3-menu-item"
-                role="menuitem"
-                onClick={() => {
-                  const t = ctxMenu;
-                  setCtxMenu(null);
-                  onOpen(t.path, t.name);
+      {ctxMenu && typeof document !== "undefined"
+        ? (() => {
+            const canLocalItem = canActOnLocalFile({
+              nativeAvailable: native.available(),
+              agentDeviceId: agent.deviceId,
+              agentCwd: agent.cwd,
+              localHostId,
+              path: ctxMenu.path,
+              absPath: ctxMenu.absPath,
+            });
+            return createPortal(
+              <div
+                className="ctx-menu v3-popup"
+                role="menu"
+                style={{
+                  position: "fixed",
+                  left: Math.max(8, Math.min(ctxMenu.x, window.innerWidth - 220 - 8)),
+                  top: Math.max(8, Math.min(ctxMenu.y, window.innerHeight - 260)),
+                  width: 220,
                 }}
+                onPointerDown={(ev) => ev.stopPropagation()}
               >
-                <FileText size={14} />
-                <span className="grow">在标签页中打开</span>
-              </button>
-              <button
-                type="button"
-                className="menu-item v3-menu-item"
-                role="menuitem"
-                onClick={() => {
-                  const t = ctxMenu;
-                  setCtxMenu(null);
-                  onOpenSplit(t.path, t.name, "right", t.absPath);
-                }}
-              >
-                <Columns2 size={14} />
-                <span className="grow">向右分屏打开</span>
-              </button>
-              <button
-                type="button"
-                className="menu-item v3-menu-item"
-                role="menuitem"
-                onClick={() => {
-                  const t = ctxMenu;
-                  setCtxMenu(null);
-                  onOpenSplit(t.path, t.name, "down", t.absPath);
-                }}
-              >
-                <Rows2 size={14} />
-                <span className="grow">向下分屏打开</span>
-              </button>
-            </div>,
-            document.body,
-          )
+                {!ctxMenu.isDir ? (
+                  <>
+                    <button
+                      type="button"
+                      className="menu-item v3-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        const t = ctxMenu;
+                        setCtxMenu(null);
+                        onOpen(t.path, t.name, t.absPath);
+                      }}
+                    >
+                      <FileText size={14} />
+                      <span className="grow">在标签页中打开</span>
+                    </button>
+                    {onOpenSplit ? (
+                      <>
+                        <button
+                          type="button"
+                          className="menu-item v3-menu-item"
+                          role="menuitem"
+                          onClick={() => {
+                            const t = ctxMenu;
+                            setCtxMenu(null);
+                            onOpenSplit(t.path, t.name, "right", t.absPath);
+                          }}
+                        >
+                          <Columns2 size={14} />
+                          <span className="grow">向右分屏打开</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="menu-item v3-menu-item"
+                          role="menuitem"
+                          onClick={() => {
+                            const t = ctxMenu;
+                            setCtxMenu(null);
+                            onOpenSplit(t.path, t.name, "down", t.absPath);
+                          }}
+                        >
+                          <Rows2 size={14} />
+                          <span className="grow">向下分屏打开</span>
+                        </button>
+                      </>
+                    ) : null}
+                    {canLocalItem ? (
+                      <>
+                        <div className="menu-sep" />
+                        <button
+                          type="button"
+                          className="menu-item v3-menu-item"
+                          role="menuitem"
+                          onClick={() => {
+                            const t = ctxMenu;
+                            setCtxMenu(null);
+                            void openLocalFileInBuiltinBrowser({
+                              path: t.path,
+                              absPath: t.absPath,
+                              agentCwd: agent.cwd,
+                              title: t.name,
+                              spaceKey: shellStore.get().selectedSpace,
+                            }).catch((err: Error) => toast(err.message || "无法用内置浏览器打开", true));
+                          }}
+                        >
+                          <Globe size={14} />
+                          <span className="grow">用内置浏览器打开</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="menu-item v3-menu-item"
+                          role="menuitem"
+                          onClick={() => {
+                            const t = ctxMenu;
+                            setCtxMenu(null);
+                            void openLocalFileDefault({
+                              path: t.path,
+                              absPath: t.absPath,
+                              agentCwd: agent.cwd,
+                            }).catch((err: Error) => toast(err.message || "无法用系统默认应用打开", true));
+                          }}
+                        >
+                          <ExternalLink size={14} />
+                          <span className="grow">用系统默认应用打开</span>
+                        </button>
+                      </>
+                    ) : null}
+                  </>
+                ) : null}
+                {canLocalItem ? (
+                  <>
+                    {ctxMenu.isDir ? (
+                      <button
+                        type="button"
+                        className="menu-item v3-menu-item"
+                        role="menuitem"
+                        onClick={() => {
+                          const t = ctxMenu;
+                          setCtxMenu(null);
+                          void openLocalFileDefault({
+                            path: t.path,
+                            absPath: t.absPath,
+                            agentCwd: agent.cwd,
+                          }).catch((err: Error) => toast(err.message || "无法打开文件夹", true));
+                        }}
+                      >
+                        <ExternalLink size={14} />
+                        <span className="grow">在系统默认应用中打开</span>
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="menu-item v3-menu-item"
+                      role="menuitem"
+                      onClick={() => {
+                        const t = ctxMenu;
+                        setCtxMenu(null);
+                        void revealLocalFile({
+                          path: t.path,
+                          absPath: t.absPath,
+                          agentCwd: agent.cwd,
+                        }).catch((err: Error) => toast(err.message || "打开所在目录失败", true));
+                      }}
+                    >
+                      <FolderOpen size={14} />
+                      <span className="grow">{revealLabel}</span>
+                    </button>
+                  </>
+                ) : null}
+              </div>,
+              document.body,
+            );
+          })()
         : null}
     </div>
   );
@@ -428,6 +541,7 @@ export function FileViewer({
   const [streamError, setStreamError] = useState(false);
   const [fetchedBytes, setFetchedBytes] = useState<Uint8Array | null>(null);
   const [fetchedSize, setFetchedSize] = useState<number | null>(null);
+  const [capHtmlUrl, setCapHtmlUrl] = useState<string | null>(null);
   const localId = useLocalHostDeviceId();
   const isMd = /\.(md|markdown|mdx)$/i.test(tab.path);
   const isSvg = /\.svg$/i.test(tab.path);
@@ -452,8 +566,6 @@ export function FileViewer({
   const isDirectStreamMedia = isImageExt || isAudioExt || isVideoExt;
   const isDirectFetchBinary =
     isPdfExt || isDocxExt || isOdtExt || isXlsxExt || isXlsExt || isOdsExt || isPptxExt;
-  const isLocalOwner =
-    native.available() && ((!agent && Boolean(tab.absPath)) || Boolean(agent && localId && localId === agent.deviceId));
   const platform = detectPlatform();
   const revealLabel = revealInFolderLabel(platform);
   const revealShort = revealInFolderShortLabel(platform);
@@ -465,6 +577,7 @@ export function FileViewer({
     path: tab.path,
     absPath: tab.absPath,
   });
+  const isLocalOwner = canRevealLocal;
   const localTarget = resolveLocalActionTarget({
     path: tab.path,
     absPath: tab.absPath,
@@ -484,12 +597,40 @@ export function FileViewer({
       agentCwd: agent?.cwd,
     }).catch((e: Error) => toast(e.message || "无法用系统默认应用打开", true));
   };
+  const handleOpenBuiltinBrowserLocal = () => {
+    void openLocalFileInBuiltinBrowser({
+      path: tab.path,
+      absPath: tab.absPath,
+      agentCwd: agent?.cwd,
+      title: tab.title,
+      spaceKey: shellStore.get().selectedSpace,
+    }).catch((e: Error) => toast(e.message || "无法用内置浏览器打开", true));
+  };
+  const isRelWorkspaceTarget = !/^(\/|~\/|~|[A-Za-z]:[\\/])/.test(tab.path);
+  const localTargetPath = agent?.cwd && isRelWorkspaceTarget ? tab.path : tab.absPath || tab.path;
   const localStreamUrl = useMemo(() => {
     if (!isLocalOwner || !(isDirectStreamMedia || isDirectFetchBinary) || streamError) return null;
-    const isRelWorkspace = !/^(\/|~\/|~|[A-Za-z]:[\\/])/.test(tab.path);
-    const streamTarget = agent?.cwd && isRelWorkspace ? tab.path : tab.absPath || tab.path;
-    return native.localFileStreamUrl(streamTarget, agent?.cwd);
-  }, [agent?.cwd, isDirectFetchBinary, isDirectStreamMedia, isLocalOwner, streamError, tab.absPath, tab.path]);
+    return native.localFileStreamUrl(localTargetPath, agent?.cwd);
+  }, [agent?.cwd, isDirectFetchBinary, isDirectStreamMedia, isLocalOwner, localTargetPath, streamError]);
+
+  useEffect(() => {
+    if (!isLocalOwner || !isHtml) {
+      setCapHtmlUrl(null);
+      return;
+    }
+    let alive = true;
+    void native
+      .registerLocalPreviewUrl(localTargetPath, agent?.cwd)
+      .then((u) => {
+        if (alive) setCapHtmlUrl(u);
+      })
+      .catch(() => {
+        if (alive) setCapHtmlUrl(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [agent?.cwd, isHtml, isLocalOwner, localTargetPath]);
 
   const prettyJson = useMemo(() => {
     if (!isJson || !text) return null;
@@ -765,10 +906,20 @@ export function FileViewer({
   const isPresentation = data?.kind === "presentation" || isPptxExt;
 
   const compactExternalAction = canRevealLocal ? (
-    <PocketButton size="sm" variant="ghost" onClick={handleOpenDefaultLocal} title="用系统默认应用打开">
-      <ExternalLink size={12} />
-      <span>系统打开</span>
-    </PocketButton>
+    <>
+      <PocketButton size="sm" variant="ghost" onClick={handleOpenBuiltinBrowserLocal} title="用内置浏览器打开">
+        <Globe size={12} />
+        <span>内置浏览器</span>
+      </PocketButton>
+      <PocketButton size="sm" variant="ghost" onClick={handleOpenDefaultLocal} title="用系统默认应用打开">
+        <ExternalLink size={12} />
+        <span>系统打开</span>
+      </PocketButton>
+      <PocketButton size="sm" variant="ghost" onClick={handleRevealLocal} title={`${revealLabel}（${localTarget.path}）`}>
+        <FolderOpen size={12} />
+        <span>{platform === "macos" ? "访达" : "目录"}</span>
+      </PocketButton>
+    </>
   ) : !native.available() && tab.absPath ? (
     <PocketButton
       size="sm"
@@ -783,6 +934,10 @@ export function FileViewer({
 
   const binaryActions = canRevealLocal ? (
     <div className="viewer-media-actions">
+      <PocketButton size="sm" variant="soft" onClick={handleOpenBuiltinBrowserLocal}>
+        <Globe size={13} />
+        <span>用内置浏览器打开</span>
+      </PocketButton>
       <PocketButton size="sm" variant="soft" onClick={handleRevealLocal}>
         <FolderOpen size={13} />
         <span>{revealLabel}</span>
@@ -821,15 +976,35 @@ export function FileViewer({
             </div>
           ) : null}
           {canRevealLocal ? (
-            <button
-              type="button"
-              className="side-icon-btn"
-              aria-label={revealShort}
-              title={`${revealLabel}（${localTarget.path}）`}
-              onClick={handleRevealLocal}
-            >
-              <FolderOpen size={14} />
-            </button>
+            <>
+              <button
+                type="button"
+                className="side-icon-btn"
+                aria-label="用内置浏览器打开"
+                title="用内置浏览器打开"
+                onClick={handleOpenBuiltinBrowserLocal}
+              >
+                <Globe size={14} />
+              </button>
+              <button
+                type="button"
+                className="side-icon-btn"
+                aria-label="用系统默认应用打开"
+                title="用系统默认应用打开"
+                onClick={handleOpenDefaultLocal}
+              >
+                <ExternalLink size={14} />
+              </button>
+              <button
+                type="button"
+                className="side-icon-btn"
+                aria-label={revealShort}
+                title={`${revealLabel}（${localTarget.path}）`}
+                onClick={handleRevealLocal}
+              >
+                <FolderOpen size={14} />
+              </button>
+            </>
           ) : null}
           <button
             type="button"
@@ -928,7 +1103,16 @@ export function FileViewer({
             actions={compactExternalAction}
           />
         ) : preview && isHtml ? (
-          <iframe sandbox="allow-scripts" srcDoc={text} className="viewer-html-frame" title={tab.title} />
+          capHtmlUrl ? (
+            <iframe
+              sandbox="allow-scripts allow-same-origin"
+              src={capHtmlUrl}
+              className="viewer-html-frame"
+              title={tab.title}
+            />
+          ) : (
+            <iframe sandbox="allow-scripts" srcDoc={text} className="viewer-html-frame" title={tab.title} />
+          )
         ) : preview && isTextTable && textTableData ? (
           <PocketDataGrid data={textTableData} actions={compactExternalAction} />
         ) : hlStart !== undefined && codeLines.length <= 5000 ? (

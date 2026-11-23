@@ -5,7 +5,12 @@ use crate::logging::{self, Level};
 use crate::{config, diagnostics, perms, relaylog, resources};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager};
 
 #[tauri::command]
@@ -998,12 +1003,213 @@ pub(crate) fn local_stream_mime(ext: &str) -> &'static str {
         return m;
     }
     match ext {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" | "cjs" => "text/javascript; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
         "csv" => "text/csv; charset=utf-8",
         "tsv" => "text/tab-separated-values; charset=utf-8",
-        "psv" => "text/plain; charset=utf-8",
-        "json" | "jsonl" | "ndjson" => "application/json; charset=utf-8",
+        "psv" | "txt" | "log" | "md" | "markdown" | "mdx" | "ts" | "tsx" | "jsx" | "rs" | "py" | "toml" | "yaml" | "yml" | "sh" => "text/plain; charset=utf-8",
+        "json" | "jsonl" | "ndjson" | "map" => "application/json; charset=utf-8",
         _ => "application/octet-stream",
     }
+}
+
+struct CapPreviewRegistry {
+    order: VecDeque<String>,
+    entries: HashMap<String, (PathBuf, PathBuf)>,
+}
+
+static CAP_PREVIEWS: OnceLock<Mutex<CapPreviewRegistry>> = OnceLock::new();
+static CAP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn cap_registry() -> &'static Mutex<CapPreviewRegistry> {
+    CAP_PREVIEWS.get_or_init(|| {
+        Mutex::new(CapPreviewRegistry {
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        })
+    })
+}
+
+fn next_cap_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let seq = CAP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let r1 = RandomState::new().build_hasher().finish();
+    let r2 = RandomState::new().build_hasher().finish();
+    let mut hasher = Sha256::new();
+    hasher.update(seq.to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(r1.to_le_bytes());
+    hasher.update(r2.to_le_bytes());
+    let digest = hasher.finalize();
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn encode_uri_segment(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    for b in seg.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn decode_uri_segment(seg: &str) -> Result<String, u16> {
+    let bytes = seg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(400);
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16).ok_or(400u16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16).ok_or(400u16)?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| 400)
+}
+
+fn build_resolved_local_file(canon: PathBuf) -> Result<ResolvedLocalFile, u16> {
+    let meta = fs::metadata(&canon).map_err(|_| 404u16)?;
+    if !meta.is_file() {
+        return Err(404);
+    }
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let name = canon
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = canon
+        .extension()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let language = local_language(&name, &ext).map(ToString::to_string);
+    let display_path = canon.to_string_lossy().into_owned();
+    Ok(ResolvedLocalFile {
+        canon,
+        display_path,
+        size,
+        mtime,
+        ext,
+        language,
+    })
+}
+
+pub(crate) fn resolve_cap_preview_file(token: &str, rel_path: &str) -> Result<ResolvedLocalFile, u16> {
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(404);
+    }
+    let (root_dir, default_file) = {
+        let guard = cap_registry().lock().map_err(|_| 500u16)?;
+        guard.entries.get(token).cloned().ok_or(404u16)?
+    };
+    let trimmed = rel_path.trim_matches('/');
+    let target = if trimmed.is_empty() {
+        default_file
+    } else {
+        let mut joined = root_dir.clone();
+        for seg in trimmed.split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            let decoded = decode_uri_segment(seg)?;
+            if decoded.contains('\0') || decoded.contains('\\') || decoded.contains('/') {
+                return Err(403);
+            }
+            if decoded == "." || decoded == ".." {
+                return Err(403);
+            }
+            if is_private_local_component(&decoded) {
+                return Err(403);
+            }
+            joined.push(decoded);
+        }
+        joined
+    };
+    let canon = fs::canonicalize(&target).map_err(|_| 404u16)?;
+    if !canon.starts_with(&root_dir) {
+        return Err(403);
+    }
+    for comp in canon.components() {
+        if let Component::Normal(part) = comp {
+            if is_private_local_component(&part.to_string_lossy()) {
+                return Err(403);
+            }
+        }
+    }
+    if let Some(cfg_dir) = crate::hostd_config_dir() {
+        if let Ok(cfg_canon) = fs::canonicalize(&cfg_dir) {
+            if canon.starts_with(&cfg_canon) {
+                return Err(403);
+            }
+        }
+    }
+    let _ = Path::new(&canon);
+    build_resolved_local_file(canon)
+}
+
+pub(crate) fn issue_local_preview_url(cwd: Option<&str>, path: &str) -> Result<String, String> {
+    let resolved = resolve_safe_local_file(cwd, path)?;
+    let parent = resolved
+        .canon
+        .parent()
+        .ok_or_else(|| "无法定位文件所在目录".to_string())?;
+    let root_dir = fs::canonicalize(parent).map_err(|e| format!("无法访问文件目录：{e}"))?;
+    let file_name = resolved
+        .canon
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "文件名无效".to_string())?;
+    let token = next_cap_token();
+    {
+        let mut guard = cap_registry().lock().map_err(|_| "注册表锁定失败".to_string())?;
+        if guard.order.len() >= 512 {
+            if let Some(old) = guard.order.pop_front() {
+                guard.entries.remove(&old);
+            }
+        }
+        guard.order.push_back(token.clone());
+        guard.entries.insert(token.clone(), (root_dir, resolved.canon));
+    }
+    let origin = if cfg!(target_os = "windows") {
+        "http://pocket-local.localhost"
+    } else {
+        "pocket-local://localhost"
+    };
+    Ok(format!("{origin}/cap/{token}/{}", encode_uri_segment(&file_name)))
+}
+
+#[tauri::command]
+pub fn register_local_preview_token(cwd: Option<String>, path: String) -> Result<String, String> {
+    issue_local_preview_url(cwd.as_deref(), &path)
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -6,7 +6,16 @@ import { native } from "../lib/native";
 import { rpcCall } from "../lib/relay";
 import { allAgents, liveStore } from "../lib/store";
 import { extractHostHerdrDoc } from "./herdrDoc";
-import { reconcileHostHerdrDoc, shellStore, type ShellState } from "./shellStore";
+import {
+  focusedLeafOfTab,
+  reconcileHostHerdrDoc,
+  refreshHostDocSpaceNames,
+  shellStore,
+  splitTabPane,
+  tabLeaves,
+  type ShellState,
+  type SplitDirection,
+} from "./shellStore";
 
 export interface HerdrDocGetResponse {
   value: HerdrDoc | null;
@@ -40,6 +49,35 @@ interface HostSlot {
   dirty: boolean;
   blocked: boolean;
   debounceTimer: ReturnType<typeof setTimeout> | null;
+}
+
+export interface PendingSplitPlacement {
+  terminalId: string;
+  agentKey: string;
+  targetTabId: string;
+  targetDocTabId?: string;
+  anchorPaneId?: string | null;
+  direction: SplitDirection;
+  createdAt?: number;
+}
+
+interface StoredPendingSplit extends Omit<PendingSplitPlacement, "createdAt"> {
+  createdAt: number;
+}
+
+const PENDING_SPLIT_TTL_MS = 6_000;
+const pendingSplits = new Map<string, StoredPendingSplit>();
+
+/** Records a fallback split about to be created so an immediate CAS conflict/doc pull cannot revert it to a standalone tab. */
+export function registerPendingSplitPlacement(hostId: string, placement: PendingSplitPlacement): void {
+  pendingSplits.set(hostId, {
+    ...placement,
+    createdAt: placement.createdAt ?? Date.now(),
+  });
+}
+
+export function clearPendingSplitPlacements(): void {
+  pendingSplits.clear();
 }
 
 export interface HerdrDocSyncController {
@@ -135,30 +173,75 @@ export function createHerdrDocSyncController(
     return (k: string) => byKey.get(k);
   };
 
-  const applyInboundDoc = (hostId: string, slot: HostSlot, doc: HerdrDoc, version: number): void => {
+  const applyInboundDoc = (hostId: string, slot: HostSlot, doc: HerdrDoc, version: number): boolean => {
     const json = stableDocJson(doc);
     slot.version = version;
     slot.baseDoc = doc;
     slot.readSucceeded = true;
     const lookup = makeAgentLookup();
+    const hostSpaces = transport.getSpaces()[hostId] ?? [];
     if (json !== slot.lastSyncedJson || doc.spaces.length > 0) {
       reconciling = true;
       try {
-        reconcileHostHerdrDoc(hostId, doc, lookup);
+        reconcileHostHerdrDoc(hostId, doc, lookup, hostSpaces);
       } finally {
         reconciling = false;
       }
     }
+
+    let preservedPendingSplit = false;
+    const pending = pendingSplits.get(hostId);
+    if (pending) {
+      if (Date.now() - pending.createdAt > PENDING_SPLIT_TTL_MS) {
+        pendingSplits.delete(hostId);
+      } else {
+        const curTabs = shellStore.get().tabs;
+        const targetTab =
+          curTabs.find((t) => t.id === pending.targetTabId) ??
+          (pending.targetDocTabId
+            ? curTabs.find((t) => t.docHostId === hostId && t.docTabId === pending.targetDocTabId)
+            : undefined) ??
+          (pending.anchorPaneId
+            ? curTabs.find((t) => tabLeaves(t).some((l) => l.id === pending.anchorPaneId))
+            : undefined);
+        const alreadyInTarget = Boolean(
+          targetTab && tabLeaves(targetTab).some((l) => l.content.kind === "agent" && l.content.agentKey === pending.agentKey),
+        );
+        pendingSplits.delete(hostId);
+        if (!alreadyInTarget && targetTab) {
+          const anchor =
+            pending.anchorPaneId && tabLeaves(targetTab).some((l) => l.id === pending.anchorPaneId)
+              ? pending.anchorPaneId
+              : focusedLeafOfTab(targetTab).id;
+          reconciling = true;
+          try {
+            const paneId = splitTabPane(
+              targetTab.id,
+              anchor,
+              pending.direction,
+              { kind: "agent", agentKey: pending.agentKey, mode: "term" },
+              { dedupeOtherTabs: true },
+            );
+            preservedPendingSplit = Boolean(paneId);
+          } finally {
+            reconciling = false;
+          }
+        }
+      }
+    }
+
     slot.lastSyncedJson = json;
     const postDoc = extractHostHerdrDoc(
       hostId,
       shellStore.get().tabs,
       doc,
-      transport.getSpaces()[hostId] ?? [],
+      hostSpaces,
       lookup,
     );
-    slot.lastLocalJson = stableDocJson(postDoc);
-    slot.dirty = false;
+    const postJson = stableDocJson(postDoc);
+    slot.lastLocalJson = postJson;
+    slot.dirty = preservedPendingSplit && postJson !== json;
+    return preservedPendingSplit;
   };
 
   const flushHost = async (hostId: string): Promise<void> => {
@@ -169,6 +252,7 @@ export function createHerdrDocSyncController(
     }
     if (slot.inflight || slot.blocked || !slot.readSucceeded || !slot.dirty) return;
     slot.inflight = true;
+    let conflictRetries = 0;
     try {
       while (slot.dirty && !slot.blocked) {
         const lookup = makeAgentLookup();
@@ -196,7 +280,11 @@ export function createHerdrDocSyncController(
         }
         if (res.conflict) {
           if (res.value) {
-            applyInboundDoc(hostId, slot, res.value, res.version);
+            const shouldRetry = applyInboundDoc(hostId, slot, res.value, res.version);
+            if (shouldRetry && slot.dirty && conflictRetries < 1) {
+              conflictRetries += 1;
+              continue;
+            }
           } else {
             slot.version = res.version;
           }
@@ -335,6 +423,18 @@ function getSharedController(): HerdrDocSyncController {
   return sharedController;
 }
 
+/** Pulls the latest `herdr-app` layout doc for `hostId` right away (for example after `herdr.command pane.split`). */
+export function syncHostNow(hostId: string): Promise<void> {
+  return getSharedController().syncHost(hostId);
+}
+
+/** Flushes local `herdr-app` doc changes for `hostId` without waiting for the debounce timer. */
+export function flushHostNow(hostId: string): Promise<void> {
+  const ctrl = getSharedController();
+  ctrl.handleShellChange(shellStore.get());
+  return ctrl.flushHost(hostId);
+}
+
 /**
  * Mounts bidirectional `herdr-app` layout sync on desktop:
  * reacts to local Tauri `local-term://doc-changed` push events, `shellStore` edits,
@@ -343,7 +443,14 @@ function getSharedController(): HerdrDocSyncController {
 export function useHerdrDocSync(): void {
   const link = liveStore.use((s) => s.link);
   const devices = liveStore.use((s) => s.devices);
+  const spacesMap = liveStore.use((s) => s.spaces);
   const localHostId = localHostIdStore.use((s) => s);
+
+  useEffect(() => {
+    for (const [hostId, list] of Object.entries(spacesMap)) {
+      if (list?.length) refreshHostDocSpaceNames(hostId, list);
+    }
+  }, [spacesMap]);
 
   useEffect(() => {
     const ctrl = getSharedController();

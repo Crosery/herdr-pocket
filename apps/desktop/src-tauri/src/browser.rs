@@ -106,11 +106,20 @@ fn emit(app: &AppHandle, id: &str, kind: &str, extra: Value) {
     let _ = app.emit_to("main", EVENT, payload);
 }
 
-/// http(s) to anywhere except the app's own origins, and about:blank.
+/// http(s) to anywhere except the app's own origins, scoped pocket-local preview capabilities, and about:blank.
 pub fn allowed(url: &Url, app_dev_url: Option<&Url>) -> bool {
     match url.scheme() {
+        "pocket-local" => {
+            url.host_str()
+                .map(|h| h.eq_ignore_ascii_case("localhost"))
+                .unwrap_or(false)
+                && url.path().starts_with("/cap/")
+        }
         "http" | "https" => {
             let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+            if host == "pocket-local.localhost" {
+                return url.scheme() == "http" && url.path().starts_with("/cap/");
+            }
             // tauri.localhost: the app itself on Windows/Linux; ipc./asset.localhost: its protocols.
             if matches!(
                 host.as_str(),
@@ -143,7 +152,11 @@ pub fn normalize_input(input: &str, engine: &str) -> Option<String> {
         return None;
     }
     if let Ok(u) = Url::parse(t) {
-        if matches!(u.scheme(), "http" | "https" | "about") {
+        if matches!(u.scheme(), "http" | "https" | "about")
+            || (u.scheme() == "pocket-local"
+                && u.host_str().map(|h| h.eq_ignore_ascii_case("localhost")).unwrap_or(false)
+                && u.path().starts_with("/cap/"))
+        {
             return Some(u.to_string());
         }
     }
@@ -709,6 +722,9 @@ mod tests {
         assert!(!allowed(&u("data:text/html,hi"), None));
         assert!(!allowed(&u("about:srcdoc"), None));
         assert!(allowed(&u("about:blank"), None));
+        assert!(allowed(&u("pocket-local://localhost/cap/abc123/index.html"), None));
+        assert!(allowed(&u("http://pocket-local.localhost/cap/abc123/index.html"), None));
+        assert!(!allowed(&u("pocket-local://localhost/file?path=/etc/passwd"), None));
     }
 
     #[test]

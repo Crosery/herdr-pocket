@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { IS_HARMONY_TARGET, isHarmony } from "./bridge";
+import { IS_HARMONY_TARGET, isHarmony, isTauri } from "./bridge";
 import { createStore } from "./store";
 import { clientConfigStore } from "./config";
 import { native } from "./native";
@@ -20,10 +20,33 @@ export const BP = {
 export type Tier = "mobile" | "rail" | "regular" | "wide";
 
 export function tierFor(width: number): Tier {
-  if (IS_HARMONY_TARGET || isHarmony() || width < BP.mobile) return "mobile";
+  if (IS_HARMONY_TARGET || isHarmony()) return "mobile";
+  if (width < BP.mobile) return isTauri() ? "rail" : "mobile";
   if (width < BP.rail) return "rail";
   if (width < BP.wide) return "regular";
   return "wide";
+}
+
+/** Layout tier only; skips re-renders on pixel-level window resizes within the same tier. */
+export function useViewportTier(): Tier {
+  const [tier, setTier] = useState<Tier>(() => tierFor(typeof window !== "undefined" ? window.innerWidth : 1200));
+  useEffect(() => {
+    let frame = 0;
+    const onResize = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        const next = tierFor(window.innerWidth);
+        setTier((prev) => (prev === next ? prev : next));
+      });
+    };
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, []);
+  return tier;
 }
 
 export interface Viewport {

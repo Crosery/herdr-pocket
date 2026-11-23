@@ -1,5 +1,5 @@
-import type { HerdrDoc, SubSession } from "@herdr-pocket/protocol";
-import { createStore } from "../lib/store";
+import type { HerdrDoc, SpaceInfo, SubSession } from "@herdr-pocket/protocol";
+import { allAgents, createStore, liveStore } from "../lib/store";
 import { registerWorkspaceSection, scheduleWorkspacePersist } from "../lib/workspacePersist";
 import type { SettingsSection } from "../views/SettingsView";
 import { herdrRootToSplitNode, splitNodeToHerdrRoot, syncedHerdrTabId } from "./herdrDoc";
@@ -162,11 +162,33 @@ function recordPaneFocus(tabId: string, paneId: string): void {
   focusHistoryByTab.set(tabId, [...prev.filter((x) => x !== paneId), paneId]);
 }
 
-export function spaceKeyFromAgent(a: AgentSpaceRef): string {
-  const raw = a.where ?? "";
+function spaceNameFromWhere(where?: string): string {
+  const raw = where ?? "";
   const slash = raw.indexOf(" / ");
-  const sp = (slash >= 0 ? raw.slice(0, slash) : raw).trim();
-  return `${a.deviceId}\u0000${sp}`;
+  return (slash >= 0 ? raw.slice(0, slash) : raw).trim();
+}
+
+export function spaceKeyFromAgent(a: AgentSpaceRef): string {
+  return `${a.deviceId}\u0000${spaceNameFromWhere(a.where)}`;
+}
+
+export function resolveAgentSpaceKey(
+  a: AgentSpaceRef,
+  spacesMap?: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>,
+): string | null {
+  const sp = spaceNameFromWhere(a.where);
+  if (sp) return `${a.deviceId}\u0000${sp}`;
+  const activeOrFirst = spacesMap?.[a.deviceId]?.find((s) => (s as SpaceInfo).active)?.name?.trim()
+    || spacesMap?.[a.deviceId]?.[0]?.name?.trim();
+  return activeOrFirst ? `${a.deviceId}\u0000${activeOrFirst}` : null;
+}
+
+function makeLiveAgentLookup(): (agentKey: string) => AgentSpaceRef | undefined {
+  const byKey = new Map<string, AgentSpaceRef>();
+  for (const a of allAgents(liveStore.get().agents)) {
+    byKey.set(a.key, a);
+  }
+  return (k) => byKey.get(k);
 }
 
 export function tabToPaneContent(tab: ShellTab): PaneContent {
@@ -262,9 +284,14 @@ export function paneContentSpaceKey(
 export function tabSpaceKey(
   tab: ShellTab,
   lookupAgent: (agentKey: string) => AgentSpaceRef | undefined,
+  hostSpacesMap?: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>,
 ): string | null {
   if (tab.docHostId && tab.docSpaceName !== undefined) {
-    return `${tab.docHostId}\u0000${tab.docSpaceName}`;
+    const metaName =
+      tab.docSpaceId && hostSpacesMap?.[tab.docHostId]
+        ? hostSpacesMap[tab.docHostId]!.find((sp) => sp.id === tab.docSpaceId)?.name?.trim()
+        : "";
+    return `${tab.docHostId}\u0000${metaName || tab.docSpaceName}`;
   }
   const focused = focusedLeafOfTab(tab);
   const direct = paneContentSpaceKey(focused.content, lookupAgent);
@@ -280,11 +307,18 @@ export function visibleTabsForSpace(
   tabs: ShellTab[],
   selectedSpace: string | null,
   lookupAgent: (agentKey: string) => AgentSpaceRef | undefined,
+  hostSpacesMap?: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>,
 ): ShellTab[] {
   if (!selectedSpace) return tabs;
+  const sep = selectedSpace.indexOf("\u0000");
+  const selHost = sep >= 0 ? selectedSpace.slice(0, sep) : "";
+  const selName = sep >= 0 ? selectedSpace.slice(sep + 1) : selectedSpace;
+  const matchedSpaceId = selHost ? hostSpacesMap?.[selHost]?.find((sp) => sp.name === selName)?.id : undefined;
   return tabs.filter((t) => {
-    if (t.docHostId && t.docSpaceName !== undefined) {
-      return `${t.docHostId}\u0000${t.docSpaceName}` === selectedSpace;
+    if (t.docHostId) {
+      if (t.docHostId !== selHost) return false;
+      if (matchedSpaceId && t.docSpaceId && t.docSpaceId === matchedSpaceId) return true;
+      return t.docSpaceName === selName;
     }
     return tabLeaves(t).some((l) => paneContentSpaceKey(l.content, lookupAgent) === selectedSpace);
   });
@@ -293,8 +327,9 @@ export function visibleTabsForSpace(
 export function activeTabIdForSpace(
   state: Pick<ShellState, "tabs" | "active" | "selectedSpace" | "activeBySpace">,
   lookupAgent: (agentKey: string) => AgentSpaceRef | undefined,
+  hostSpacesMap?: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>,
 ): string | null {
-  const visible = visibleTabsForSpace(state.tabs, state.selectedSpace, lookupAgent);
+  const visible = visibleTabsForSpace(state.tabs, state.selectedSpace, lookupAgent, hostSpacesMap);
   if (!visible.length) return null;
   if (state.active && visible.some((t) => t.id === state.active)) return state.active;
   const scopeKey = state.selectedSpace ?? ALL_SPACES_KEY;
@@ -312,6 +347,8 @@ export interface ShellState {
   activeBySpace: Record<string, string | null>;
   /** The side panel's section, or null when the panel is hidden. */
   panel: PanelId | null;
+  /** Remembered side panel section per space (`ALL_SPACES_KEY` for unfiltered view). */
+  panelBySpace?: Record<string, PanelId | null>;
   panelWidth: number;
   /** Subagent currently opened in the right-hand side panel. */
   subagentAside: SubagentAside | null;
@@ -328,7 +365,7 @@ export const PANEL_DEFAULT = 368;
 export const PANEL_MIN = 280;
 export const PANEL_MAX = 900;
 
-type PersistedShellState = Pick<ShellState, "tabs" | "active" | "selectedSpace" | "activeBySpace" | "panel" | "panelWidth">;
+type PersistedShellState = Pick<ShellState, "tabs" | "active" | "selectedSpace" | "activeBySpace" | "panel" | "panelBySpace" | "panelWidth">;
 
 function docFieldsOfTab(t: Partial<TabSplitFields>): Partial<TabSplitFields> {
   return {
@@ -393,12 +430,21 @@ function normalizePersistedShellState(rawInput: unknown): PersistedShellState | 
     raw.panel === "files" || raw.panel === "git" || raw.panel === "browser" || raw.panel === "assistant"
       ? raw.panel
       : null;
+  const panelBySpace: Record<string, PanelId | null> = {};
+  if (raw.panelBySpace && typeof raw.panelBySpace === "object" && !Array.isArray(raw.panelBySpace)) {
+    for (const [k, v] of Object.entries(raw.panelBySpace)) {
+      if (v === null || v === "files" || v === "git" || v === "browser" || v === "assistant") {
+        panelBySpace[k] = v;
+      }
+    }
+  }
   return {
     tabs,
     active: tabs.some((t) => t.id === raw.active) ? raw.active! : (tabs[0]?.id ?? null),
     selectedSpace: typeof raw.selectedSpace === "string" ? raw.selectedSpace : null,
     activeBySpace,
     panel,
+    panelBySpace,
     panelWidth: clampPanel(Number(raw.panelWidth) || PANEL_DEFAULT),
   };
 }
@@ -410,6 +456,7 @@ function pickPersistedShellState(s: ShellState): PersistedShellState {
     selectedSpace: s.selectedSpace,
     activeBySpace: s.activeBySpace,
     panel: s.panel === "subagent" ? null : s.panel,
+    panelBySpace: s.panelBySpace ?? {},
     panelWidth: s.panelWidth,
   };
 }
@@ -421,7 +468,7 @@ function load(): PersistedShellState {
   } catch {
     // Unreadable: start empty.
   }
-  return { tabs: [], active: null, selectedSpace: null, activeBySpace: {}, panel: null, panelWidth: PANEL_DEFAULT };
+  return { tabs: [], active: null, selectedSpace: null, activeBySpace: {}, panel: null, panelBySpace: {}, panelWidth: PANEL_DEFAULT };
 }
 
 export function clampPanel(px: number): number {
@@ -473,27 +520,48 @@ registerWorkspaceSection("shellState", {
 
 const set = shellStore.set;
 
+function spacePanelTransition(
+  s: ShellState,
+  nextSpace: string | null,
+): Pick<ShellState, "panel" | "panelBySpace" | "subagentAside"> {
+  if (nextSpace === s.selectedSpace) {
+    return { panel: s.panel, panelBySpace: s.panelBySpace ?? {}, subagentAside: s.subagentAside };
+  }
+  const prevScope = s.selectedSpace ?? ALL_SPACES_KEY;
+  const nextScope = nextSpace ?? ALL_SPACES_KEY;
+  const savedPanel: PanelId | null = s.panel === "subagent" ? null : s.panel;
+  const panelBySpace: Record<string, PanelId | null> = { ...(s.panelBySpace ?? {}), [prevScope]: savedPanel };
+  return {
+    panel: panelBySpace[nextScope] ?? null,
+    panelBySpace,
+    subagentAside: null,
+  };
+}
+
 export function setSelectedSpace(
   selectedSpace: string | null,
-  lookupAgent: (agentKey: string) => AgentSpaceRef | undefined = () => undefined,
+  lookupAgent: (agentKey: string) => AgentSpaceRef | undefined = makeLiveAgentLookup(),
+  hostSpacesMap: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]> = liveStore.get().spaces,
 ): void {
   set((s) => {
     const prevScope = s.selectedSpace ?? ALL_SPACES_KEY;
-    const prevVisible = visibleTabsForSpace(s.tabs, s.selectedSpace, lookupAgent);
+    const prevVisible = visibleTabsForSpace(s.tabs, s.selectedSpace, lookupAgent, hostSpacesMap);
     const prevActive = s.active && prevVisible.some((t) => t.id === s.active) ? s.active : prevVisible[0]?.id ?? null;
     const activeBySpace = { ...s.activeBySpace, [prevScope]: prevActive };
-    const nextVisible = visibleTabsForSpace(s.tabs, selectedSpace, lookupAgent);
+    const nextVisible = visibleTabsForSpace(s.tabs, selectedSpace, lookupAgent, hostSpacesMap);
     const nextScope = selectedSpace ?? ALL_SPACES_KEY;
     const remembered = activeBySpace[nextScope];
     const nextActive =
       (remembered && nextVisible.some((t) => t.id === remembered) ? remembered : undefined) ??
       nextVisible[0]?.id ??
       null;
+    const panelPatch = spacePanelTransition(s, selectedSpace);
     return {
       ...s,
       selectedSpace,
       activeBySpace,
       active: nextActive,
+      ...panelPatch,
     };
   });
 }
@@ -626,39 +694,81 @@ function findTabWithLeaf(
   tabs: readonly ShellTab[],
   predicate: (content: PaneContent) => boolean,
 ): { tab: ShellTab; leaf: SplitLeafNode } | null {
-  for (const tab of tabs) {
-    for (const leaf of tabLeaves(tab)) {
-      if (predicate(leaf.content)) return { tab, leaf };
+  for (const preferSynced of [true, false]) {
+    for (const tab of tabs) {
+      if (Boolean(tab.docHostId) !== preferSynced) continue;
+      for (const leaf of tabLeaves(tab)) {
+        if (predicate(leaf.content)) return { tab, leaf };
+      }
     }
   }
   return null;
 }
 
-/** Opens the agent as a tab, or focuses its tab/pane when it is already open. */
-export function openAgentTab(agentKey: string, mode?: AgentPaneMode): void {
+function hasNonEmptySpaceName(spaceKey: string | null | undefined): spaceKey is string {
+  if (!spaceKey) return false;
+  const sep = spaceKey.indexOf("\u0000");
+  return sep >= 0 && spaceKey.slice(sep + 1).trim().length > 0;
+}
+
+/**
+ * Opens the agent as a tab, or focuses its tab/pane when already open, and automatically
+ * switches `selectedSpace` to that agent's `(deviceId, spaceName)` across devices like Herdr.app.
+ */
+export function openAgentTab(
+  agentKey: string,
+  mode?: AgentPaneMode,
+  opts?: {
+    lookupAgent?: (key: string) => AgentSpaceRef | undefined;
+    spacesMap?: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>;
+    followSpace?: boolean;
+  },
+): void {
   const s = shellStore.get();
+  const lookup = opts?.lookupAgent ?? makeLiveAgentLookup();
+  const spacesMap = opts?.spacesMap ?? liveStore.get().spaces;
+  const agent = lookup(agentKey);
   const hit = findTabWithLeaf(s.tabs, (c) => c.kind === "agent" && c.agentKey === agentKey);
-  const scope = s.selectedSpace ?? ALL_SPACES_KEY;
+
+  let nextSpace = s.selectedSpace;
+  if (opts?.followSpace !== false) {
+    const hitSpace = hit ? tabSpaceKey(hit.tab, lookup, spacesMap) : null;
+    const agentSpace = agent ? resolveAgentSpaceKey(agent, spacesMap) : null;
+    if (hasNonEmptySpaceName(hitSpace)) nextSpace = hitSpace;
+    else if (hasNonEmptySpaceName(agentSpace)) nextSpace = agentSpace;
+  }
+
+  let activeBySpace = s.activeBySpace;
+  if (nextSpace !== s.selectedSpace) {
+    const prevScope = s.selectedSpace ?? ALL_SPACES_KEY;
+    const prevVisible = visibleTabsForSpace(s.tabs, s.selectedSpace, lookup, spacesMap);
+    const prevActive = s.active && prevVisible.some((t) => t.id === s.active) ? s.active : prevVisible[0]?.id ?? null;
+    activeBySpace = { ...s.activeBySpace, [prevScope]: prevActive };
+  }
+  const nextScope = nextSpace ?? ALL_SPACES_KEY;
+  const panelPatch = spacePanelTransition(s, nextSpace);
+
   if (hit) {
-    set(
-      focusTabAndLeaf(
-        s,
-        hit.tab,
-        hit.leaf.id,
-        scope,
-        mode && hit.leaf.content.kind === "agent" && hit.leaf.content.mode !== mode
-          ? (c) => (c.kind === "agent" ? { ...c, mode } : c)
-          : undefined,
-      ),
+    const nextState = focusTabAndLeaf(
+      { ...s, selectedSpace: nextSpace, activeBySpace },
+      hit.tab,
+      hit.leaf.id,
+      nextScope,
+      mode && hit.leaf.content.kind === "agent" && hit.leaf.content.mode !== mode
+        ? (c) => (c.kind === "agent" ? { ...c, mode } : c)
+        : undefined,
     );
+    set({ ...nextState, selectedSpace: nextSpace, ...panelPatch });
     return;
   }
   const tab: AgentTab = { id: `a:${agentKey}`, kind: "agent", agentKey, ...(mode ? { mode } : {}) };
   set({
     tabs: [...s.tabs, tab],
+    selectedSpace: nextSpace,
     active: tab.id,
-    activeBySpace: { ...s.activeBySpace, [scope]: tab.id },
+    activeBySpace: { ...activeBySpace, [nextScope]: tab.id },
     peek: null,
+    ...panelPatch,
   });
 }
 
@@ -689,7 +799,12 @@ export function openFileTab(
 ): void {
   const s = shellStore.get();
   const id = `f:${agentKey}:${path}`;
-  const scope = opts?.spaceKey !== undefined ? opts.spaceKey : s.selectedSpace;
+  const agentSpaceRef = opts?.spaceKey === undefined ? makeLiveAgentLookup()(agentKey) : undefined;
+  const resolvedAgentSpace = agentSpaceRef ? resolveAgentSpaceKey(agentSpaceRef, liveStore.get().spaces) : null;
+  const scope =
+    opts?.spaceKey !== undefined
+      ? opts.spaceKey
+      : (s.selectedSpace ?? (hasNonEmptySpaceName(resolvedAgentSpace) ? resolvedAgentSpace : null));
   const scopeMapKey = scope ?? ALL_SPACES_KEY;
   const patch = {
     ...(opts?.absPath ? { absPath: opts.absPath } : {}),
@@ -805,7 +920,12 @@ export function openDiffTab(opts: {
 }): void {
   const s = shellStore.get();
   const id = `d:${opts.deviceId}:${opts.cwd}:${opts.commit ? opts.commit : opts.staged ? "staged" : "work"}:${opts.path}`;
-  const scope = opts.spaceKey !== undefined ? opts.spaceKey : s.selectedSpace;
+  const diffAgentRef = opts.spaceKey === undefined && opts.agentKey ? makeLiveAgentLookup()(opts.agentKey) : undefined;
+  const resolvedAgentSpace = diffAgentRef ? resolveAgentSpaceKey(diffAgentRef, liveStore.get().spaces) : null;
+  const scope =
+    opts.spaceKey !== undefined
+      ? opts.spaceKey
+      : (s.selectedSpace ?? (hasNonEmptySpaceName(resolvedAgentSpace) ? resolvedAgentSpace : null));
   const scopeMapKey = scope ?? ALL_SPACES_KEY;
   const title = opts.path.split(/[\\/]/).pop() || opts.path;
   const hit = findTabWithLeaf(
@@ -921,13 +1041,39 @@ export function focusTabPane(tabId: string, paneId: string): void {
   });
 }
 
+function pruneAgentFromTab(tab: ShellTab, agentKey: string): ShellTab | null {
+  const leaves = tabLeaves(tab);
+  const target = leaves.find((l) => l.content.kind === "agent" && l.content.agentKey === agentKey);
+  if (!target) return tab;
+  if (leaves.length <= 1) {
+    focusHistoryByTab.delete(tab.id);
+    return null;
+  }
+  const nextRoot = removeSplitLeaf(tabRootNode(tab), target.id);
+  if (!nextRoot) {
+    focusHistoryByTab.delete(tab.id);
+    return null;
+  }
+  const remaining = listLeaves(nextRoot);
+  const nextFocus =
+    tab.split?.focusedPaneId && tab.split.focusedPaneId !== target.id && remaining.some((l) => l.id === tab.split!.focusedPaneId)
+      ? tab.split.focusedPaneId
+      : remaining[0]!.id;
+  const nextZoom =
+    tab.split?.zoomedPaneId && tab.split.zoomedPaneId !== target.id && remaining.some((l) => l.id === tab.split!.zoomedPaneId)
+      ? tab.split.zoomedPaneId
+      : null;
+  return applyRootToTab(tab, nextRoot, nextFocus, nextZoom);
+}
+
 export function splitTabPane(
   tabId: string,
   paneId: string | null,
   direction: SplitDirection,
   content: PaneContent,
+  opts?: { newPaneId?: string; dedupeOtherTabs?: boolean },
 ): string | null {
-  const newPaneId = makeSplitId("p");
+  const newPaneId = opts?.newPaneId?.trim() || makeSplitId("p");
   let inserted = false;
   set((s) => {
     const tab = s.tabs.find((t) => t.id === tabId);
@@ -944,10 +1090,27 @@ export function splitTabPane(
       content,
     });
     inserted = true;
+    const dedupeKey = opts?.dedupeOtherTabs && content.kind === "agent" ? content.agentKey : null;
+    const agentHost = dedupeKey ? dedupeKey.split("/")[0] : "";
+    const targetHost = tab.docHostId || agentHost;
+    const canDedupeOnHost = Boolean(dedupeKey && agentHost && targetHost === agentHost);
+    const nextTabs: ShellTab[] = [];
+    for (const t of s.tabs) {
+      if (t.id === tabId) {
+        nextTabs.push(applyRootToTab(t, nextRoot, newPaneId, null));
+        continue;
+      }
+      if (canDedupeOnHost && dedupeKey && (!t.docHostId || t.docHostId === targetHost)) {
+        const pruned = pruneAgentFromTab(t, dedupeKey);
+        if (pruned) nextTabs.push(pruned);
+        continue;
+      }
+      nextTabs.push(t);
+    }
     const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
     return {
       ...s,
-      tabs: s.tabs.map((t) => (t.id === tabId ? applyRootToTab(t, nextRoot, newPaneId, null) : t)),
+      tabs: nextTabs,
       active: tabId,
       activeBySpace: { ...s.activeBySpace, [scopeKey]: tabId },
       peek: null,
@@ -958,9 +1121,11 @@ export function splitTabPane(
 
 export function splitActivePaneWithContent(direction: SplitDirection, content: PaneContent): void {
   const s = shellStore.get();
+  const lookup = makeLiveAgentLookup();
+  const activeId = activeTabIdForSpace(s, lookup, liveStore.get().spaces) ?? s.active;
   const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
-  if (s.active && s.tabs.some((t) => t.id === s.active)) {
-    splitTabPane(s.active, null, direction, content);
+  if (activeId && s.tabs.some((t) => t.id === activeId)) {
+    splitTabPane(activeId, null, direction, content, { dedupeOtherTabs: content.kind === "agent" });
     return;
   }
   const existingIds = new Set(s.tabs.map((t) => t.id));
@@ -1287,9 +1452,28 @@ export function closeTabsForSpace(
 }
 
 export function setActiveTab(id: string): void {
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
   set((s) => {
-    const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
-    return { ...s, active: id, activeBySpace: { ...s.activeBySpace, [scopeKey]: id } };
+    const target = s.tabs.find((t) => t.id === id);
+    const tabSp = target ? tabSpaceKey(target, lookup, spacesMap) : null;
+    const nextSpace = hasNonEmptySpaceName(tabSp) ? tabSp : s.selectedSpace;
+    let nextBySpace = s.activeBySpace;
+    if (nextSpace !== s.selectedSpace) {
+      const prevScope = s.selectedSpace ?? ALL_SPACES_KEY;
+      const prevVisible = visibleTabsForSpace(s.tabs, s.selectedSpace, lookup, spacesMap);
+      const prevActive = s.active && prevVisible.some((t) => t.id === s.active) ? s.active : prevVisible[0]?.id ?? null;
+      nextBySpace = { ...s.activeBySpace, [prevScope]: prevActive };
+    }
+    const scopeKey = nextSpace ?? ALL_SPACES_KEY;
+    const panelPatch = spacePanelTransition(s, nextSpace);
+    return {
+      ...s,
+      selectedSpace: nextSpace,
+      active: id,
+      activeBySpace: { ...nextBySpace, [scopeKey]: id },
+      ...panelPatch,
+    };
   });
 }
 
@@ -1306,11 +1490,26 @@ export function cycleTab(step: 1 | -1, visibleTabs?: ShellTab[]): void {
 
 /** Shows the panel at `id`, or hides it when `id` is already showing. */
 export function togglePanel(id: PanelId): void {
-  set((s) => ({ ...s, panel: s.panel === id ? null : id }));
+  set((s) => {
+    const nextPanel = s.panel === id ? null : id;
+    const scope = s.selectedSpace ?? ALL_SPACES_KEY;
+    return {
+      ...s,
+      panel: nextPanel,
+      panelBySpace: { ...(s.panelBySpace ?? {}), [scope]: nextPanel },
+    };
+  });
 }
 
 export function showPanel(id: PanelId | null): void {
-  set({ panel: id });
+  set((s) => {
+    const scope = s.selectedSpace ?? ALL_SPACES_KEY;
+    return {
+      ...s,
+      panel: id,
+      ...(id !== "subagent" ? { panelBySpace: { ...(s.panelBySpace ?? {}), [scope]: id } } : {}),
+    };
+  });
 }
 
 export function openSubagentAside(agentKey: string, sub: SubSession, trail: SubSession[]): void {
@@ -1373,6 +1572,50 @@ function sameHerdrSplitShape(a: SplitNode | null, b: SplitNode | null): boolean 
   return false;
 }
 
+function resolveDocSpaceName(
+  space: Pick<HerdrDoc["spaces"][number], "id" | "name" | "folder">,
+  convertedLeaves: readonly SplitLeafNode[],
+  lookupAgent: (agentKey: string) => AgentSpaceRef | undefined,
+  hostSpaces?: readonly Pick<SpaceInfo, "id" | "name" | "folder">[],
+): string {
+  const direct = space.name?.trim();
+  if (direct) return direct;
+  const metaName = hostSpaces?.find((sp) => sp.id === space.id)?.name?.trim();
+  if (metaName) return metaName;
+  for (const leaf of convertedLeaves) {
+    if (leaf.content.kind !== "agent") continue;
+    const a = lookupAgent(leaf.content.agentKey);
+    const sp = a ? spaceNameFromWhere(a.where) : "";
+    if (sp) return sp;
+  }
+  const base = (space.folder ?? "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop()?.trim();
+  return base || "";
+}
+
+/**
+ * Updates `docSpaceName` on synced tabs when `spaces.list` resolves dynamically computed names
+ * for unnamed spaces (`space.name === ""` in `herdr-app` docs).
+ */
+export function refreshHostDocSpaceNames(
+  hostId: string,
+  hostSpaces: readonly Pick<SpaceInfo, "id" | "name">[],
+): void {
+  if (!hostSpaces.length) return;
+  const byId = new Map(hostSpaces.filter((s) => s.id && s.name?.trim()).map((s) => [s.id, s.name.trim()] as const));
+  if (!byId.size) return;
+  set((s) => {
+    let changed = false;
+    const tabs = s.tabs.map((t) => {
+      if (t.docHostId !== hostId || !t.docSpaceId) return t;
+      const nextName = byId.get(t.docSpaceId);
+      if (!nextName || t.docSpaceName === nextName) return t;
+      changed = true;
+      return { ...t, docSpaceName: nextName };
+    });
+    return changed ? { ...s, tabs } : s;
+  });
+}
+
 /**
  * Reconciles a host's `"herdr-app"` shared layout document into `shellStore.tabs`,
  * preserving Pocket-only tabs/panes (`file`/`diff`/`web`), private per-tab focus/zoom,
@@ -1381,7 +1624,8 @@ function sameHerdrSplitShape(a: SplitNode | null, b: SplitNode | null): boolean 
 export function reconcileHostHerdrDoc(
   hostId: string,
   doc: HerdrDoc,
-  _lookupAgent: (agentKey: string) => AgentSpaceRef | undefined = () => undefined,
+  lookupAgent: (agentKey: string) => AgentSpaceRef | undefined = makeLiveAgentLookup(),
+  hostSpaces?: readonly Pick<SpaceInfo, "id" | "name" | "folder">[],
 ): void {
   if (!doc || !Array.isArray(doc.spaces)) return;
   set((s) => {
@@ -1409,15 +1653,16 @@ export function reconcileHostHerdrDoc(
         const converted = herdrRootToSplitNode(hostId, docTab.root, prev ? tabRootNode(prev) : undefined);
         if (!converted) continue;
 
+        const convertedLeaves = listLeaves(converted);
+        const resolvedSpaceName = resolveDocSpaceName(space, convertedLeaves, lookupAgent, hostSpaces);
         const docFields: TabSplitFields = {
           docHostId: hostId,
           docSpaceId: space.id,
-          docSpaceName: space.name ?? "",
+          docSpaceName: resolvedSpaceName,
           docTabId: docTab.id,
           docTabName: docTab.name ?? "",
         };
 
-        const convertedLeaves = listLeaves(converted);
         let absorbedFocusLeafId: string | null = null;
         for (const leaf of convertedLeaves) {
           if (leaf.content.kind !== "agent") continue;

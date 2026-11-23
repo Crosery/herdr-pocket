@@ -489,8 +489,9 @@ class VoiceCall(
           prototypes = enrolledProtos,
           ownerSample = sample,
           threshold = voiceThreshold,
-          requireIsolation = enrolledVoice != null,
+          requireIsolation = enrolledVoice != null && (models.speaker != null || models.hasTse),
           lockFirstSpeaker = useFirstSpeaker,
+          route = activeRoute,
         ),
         worker = { r -> if (!ended) try { spkExec.execute(r) } catch (_: Throwable) {} },
         tseWorker = { r -> if (!ended) try { tseExec.execute(r) } catch (_: Throwable) {} },
@@ -516,15 +517,8 @@ class VoiceCall(
     vfRef = vf
     filter = vf
     emitInitTelemetry(models, vf)
-    if (effectiveTier != "denoise" && (enrolledVoice != null || useFirstSpeaker)) {
-      if (effectiveTier == "tse" && configuredTier == "tse" && vf?.isTseActive != true && vf?.isSvActive != true) {
-        end("人声分离未就绪，请到「通话降噪与声纹」下载模型或改用灵巧声纹")
-        return
-      }
-      if (vf?.isSvActive != true && vf?.isTseActive != true) {
-        end("声纹模型未下载，请先到「通话降噪与声纹」下载声纹模型")
-        return
-      }
+    if (effectiveTier != "denoise" && (enrolledVoice != null || useFirstSpeaker) && vf?.isSvActive != true && vf?.isTseActive != true) {
+      Log.w(TAG, "Voice isolation model missing (tier=$effectiveTier), degrading to denoise/mic path")
     }
 
     // Do not collect half a second of queued AudioRecord data while loading models.

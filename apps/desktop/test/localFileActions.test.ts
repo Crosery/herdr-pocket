@@ -12,13 +12,13 @@ import {
 import { looksLikeClickableFilePath, parseFileTarget } from "../src/lib/openFileTarget.ts";
 
 test("revealInFolderLabel and revealInFolderShortLabel localize per platform", () => {
-  assert.equal(revealInFolderLabel("macos"), "在 Finder 中打开所在目录");
+  assert.equal(revealInFolderLabel("macos"), "在访达中定位");
   assert.equal(revealInFolderLabel("windows"), "在资源管理器中打开所在目录");
   assert.equal(revealInFolderLabel("linux"), "打开所在目录");
   assert.equal(revealInFolderLabel("web"), "打开所在目录");
   assert.equal(revealInFolderLabel("openharmony"), "打开所在目录");
 
-  assert.equal(revealInFolderShortLabel("macos"), "在 Finder 中显示");
+  assert.equal(revealInFolderShortLabel("macos"), "在访达中显示");
   assert.equal(revealInFolderShortLabel("windows"), "在资源管理器中显示");
   assert.equal(revealInFolderShortLabel("linux"), "打开所在目录");
   assert.equal(revealInFolderShortLabel("web"), "打开所在目录");
