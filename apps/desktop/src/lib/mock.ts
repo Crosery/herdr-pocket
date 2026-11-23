@@ -17,6 +17,7 @@ import {
   type ConvEvent,
   type Device,
   type DeviceKind,
+  type HerdrDoc,
   type PairCode,
   type PairResponse,
   type PromptId,
@@ -192,6 +193,7 @@ const DEMO_TERMINALS: Record<string, string[]> = {
     "\x1b[38;5;212mClaude Code\x1b[0m · ~/work/demo-app",
     "\x1b[90m────────────────────────────────────\x1b[0m",
     "\x1b[32m✓\x1b[0m 读取 src/auth/callback.ts",
+    "• Explored 1 file (external-delivery-sequence.html)",
     "",
     "\x1b[33m请选择处理方式：\x1b[0m",
     "  \x1b[1m1.\x1b[0m 严格校验 state 并拒绝旧令牌",
@@ -229,8 +231,16 @@ const DEMO_TERMINALS: Record<string, string[]> = {
 
 const DEMO_FILES: Array<{ dir: string; name: string; kind: "file" | "dir"; size?: number; private?: boolean; ignored?: boolean; hidden?: boolean; gitStatus?: "M" | "A" | "D" | "R" | "U" | "?"; body?: string }> = [
   { dir: "", name: "src", kind: "dir", gitStatus: "M" },
+  { dir: "", name: "docs", kind: "dir" },
   { dir: "", name: "node_modules", kind: "dir", ignored: true },
   { dir: "", name: ".env", kind: "file", size: 120, private: true, hidden: true },
+  {
+    dir: "docs",
+    name: "external-delivery-sequence.html",
+    kind: "file",
+    size: 280,
+    body: "<!doctype html><html><body style=\"font-family:system-ui,sans-serif;padding:20px;line-height:1.6\"><h2>External Delivery Sequence</h2><p>Step 1: Auth Callback &rarr; Step 2: Verification Passed</p></body></html>",
+  },
   {
     dir: "",
     name: "README.md",
@@ -404,6 +414,66 @@ function buildDemoModelsPool(harness: string): AgentModelOption[] {
   ];
 }
 
+const demoHerdrDocs: Record<string, { value: HerdrDoc; version: number }> = {
+  "dev-mac": {
+    version: 1,
+    value: {
+      spaces: [
+        {
+          id: "sp-1",
+          name: "backend",
+          folder: "~/work/demo-app",
+          tabs: [
+            {
+              id: "tb1",
+              name: "1",
+              root: {
+                id: "s1",
+                type: "row",
+                children: [
+                  { id: "p1", type: "block", size: { weight: 1 }, content: { terminal: "t1" } },
+                  { id: "p2", type: "block", size: { weight: 1 }, content: { terminal: "t4" } },
+                ],
+              },
+            },
+            {
+              id: "tb2",
+              name: "2",
+              root: { id: "p3", type: "block", content: { terminal: "t2" } },
+            },
+            {
+              id: "tb3",
+              name: "3",
+              root: { id: "p4", type: "block", content: { terminal: "t5" } },
+            },
+          ],
+        },
+        { id: "sp-2", name: "release", folder: "~/repos/sample-cli", tabs: [] },
+        { id: "sp-3", name: "sandbox", folder: "~/scratch", tabs: [] },
+      ],
+    },
+  },
+  "dev-linux": {
+    version: 1,
+    value: {
+      spaces: [
+        {
+          id: "sp-lin-1",
+          name: "release",
+          folder: "~/repos/sample-cli",
+          tabs: [
+            {
+              id: "tb1",
+              name: "1",
+              root: { id: "p1", type: "block", content: { terminal: "t3" } },
+            },
+          ],
+        },
+      ],
+    },
+  },
+};
+
 export const mockApi = {
   pair(_code: string, name: string, platform: string): PairResponse {
     const me: Device = { id: "dev-viewer", name, kind: "viewer", platform, online: true, createdAt: Date.now(), lastSeenAt: Date.now() };
@@ -420,8 +490,11 @@ export const mockApi = {
       spaces: {
         "dev-mac": [
           { id: "sp-1", name: "backend", folder: "~/work/demo-app", tabs: 3, terminals: 3, color: "ansi6", active: true },
-          { id: "sp-2", name: "release", folder: "~/repos/sample-cli", tabs: 1, terminals: 1, color: "ansi3" },
-          { id: "sp-3", name: "sandbox", folder: "~/scratch", tabs: 1, terminals: 0, color: "ansi5" },
+          { id: "sp-2", name: "release", folder: "~/repos/sample-cli", tabs: 0, terminals: 0, color: "ansi3" },
+          { id: "sp-3", name: "sandbox", folder: "~/scratch", tabs: 0, terminals: 0, color: "ansi5" },
+        ],
+        "dev-linux": [
+          { id: "sp-lin-1", name: "release", folder: "~/repos/sample-cli", tabs: 1, terminals: 1, color: "ansi3", active: true },
         ],
       },
       rev: liveStore.get().rev + 1,
@@ -488,12 +561,21 @@ export const mockApi = {
       };
     }
     if (method === "files.read") {
-      const hit = DEMO_FILES.find((f) => (f.dir ? `${f.dir}/${f.name}` : f.name) === params.path);
+      const fullPath = (f: (typeof DEMO_FILES)[number]) => (f.dir ? `${f.dir}/${f.name}` : f.name);
+      const req = String(params.path ?? "").replace(/\\/g, "/").replace(/^\.\//, "");
+      let hit = DEMO_FILES.find((f) => fullPath(f) === req);
+      if (!hit && req && !/^(\/|~\/|\.\.\/)/.test(req)) {
+        const suffix = `/${req}`;
+        hit = DEMO_FILES.find(
+          (f) => f.kind === "file" && !f.ignored && !f.private && (fullPath(f) === req || fullPath(f).endsWith(suffix)),
+        );
+      }
       if (!hit || hit.kind !== "file") throw new Error("没有这个文件");
       if (hit.private) throw new Error("这个文件可能含有密钥，不能查看");
       const text = hit.body ?? "";
+      const resolvedPath = fullPath(hit);
       return {
-        path: params.path,
+        path: resolvedPath,
         size: text.length,
         mtime: now - 30 * min,
         binary: false,
@@ -503,6 +585,28 @@ export const mockApi = {
         text,
         language: hit.name.split(".").pop(),
       };
+    }
+    if (method === "herdr.doc.get") {
+      const entry = demoHerdrDocs[to];
+      return entry
+        ? { value: JSON.parse(JSON.stringify(entry.value)), version: entry.version }
+        : { value: { spaces: [] }, version: 1 };
+    }
+    if (method === "herdr.doc.set") {
+      const cur = demoHerdrDocs[to] ?? { value: { spaces: [] }, version: 0 };
+      const expected = typeof params?.version === "number" ? params.version : 0;
+      if (expected !== cur.version) {
+        return {
+          ok: false,
+          conflict: true,
+          value: JSON.parse(JSON.stringify(cur.value)),
+          version: cur.version,
+        };
+      }
+      const nextVal = (params?.value ?? { spaces: [] }) as HerdrDoc;
+      const nextVersion = cur.version + 1;
+      demoHerdrDocs[to] = { value: JSON.parse(JSON.stringify(nextVal)), version: nextVersion };
+      return { ok: true, version: nextVersion };
     }
     if (method === "folders.list") {
       const req = (params.path ?? "").trim() || "~";
@@ -793,6 +897,26 @@ export const mockApi = {
         if (removed) {
           delete DEMO_EVENTS[removed.key];
           delete DEMO_TERMINALS[removed.key];
+          const docEntry = demoHerdrDocs[removed.deviceId];
+          if (docEntry && removed.localId) {
+            const prune = (n: any): any => {
+              if (!n) return null;
+              if (n.type === "block") return n.content?.terminal === removed.localId ? null : n;
+              if (Array.isArray(n.children)) {
+                const kids = n.children.map(prune).filter(Boolean);
+                if (!kids.length) return null;
+                if (kids.length === 1) return kids[0];
+                return { ...n, children: kids };
+              }
+              return n;
+            };
+            for (const sp of docEntry.value.spaces) {
+              sp.tabs = sp.tabs
+                .map((t) => ({ ...t, root: prune(t.root) }))
+                .filter((t) => Boolean(t.root)) as any;
+            }
+            docEntry.version += 1;
+          }
         }
         mockApi.connect();
       } else {

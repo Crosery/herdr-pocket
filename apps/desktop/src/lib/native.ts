@@ -5,7 +5,7 @@
  * embedded browser, cookie import and dictation go through native-engineer's ./bridge.
  * Outside Tauri every call answers "unsupported" instead of throwing, so each screen renders.
  */
-import type { AgentModelsResult, RpcResult } from "@herdr-pocket/protocol";
+import type { AgentModelsResult, HerdrDoc, RpcResult } from "@herdr-pocket/protocol";
 import * as bridge from "./bridge";
 import type { VoiceAiTier } from "./voicePresets";
 
@@ -146,6 +146,12 @@ export interface LocalTermDataEvent {
 
 export interface LocalTermCloseEvent {
   id: string;
+}
+
+export interface LocalTermSizeEvent {
+  terminal: string;
+  cols: number;
+  rows: number;
 }
 
 export interface VoiceCallDspInfo {
@@ -709,6 +715,8 @@ export const native = {
     rows: number;
     display?: Record<string, unknown>;
     spaceName?: string;
+    spaceId?: string;
+    argv?: string[];
   }): Promise<LocalCreateShellResult> =>
     inTauri()
       ? invoke<LocalCreateShellResult>("local_term_create_shell", {
@@ -717,17 +725,43 @@ export const native = {
           rows: params.rows,
           display: params.display ?? null,
           spaceName: params.spaceName ?? null,
+          spaceId: params.spaceId ?? null,
+          argv: params.argv ?? null,
         })
       : Promise.reject(new Error("仅桌面端支持本地直连")),
-  localTermAttach: (params: {
+  localTermAttach: async (params: {
     id: string;
     terminal: string;
     cols: number;
     rows: number;
     history: number;
     display?: Record<string, unknown>;
-  }): Promise<LocalTermAttachResult> =>
-    inTauri() ? invoke<LocalTermAttachResult>("local_term_attach", params) : Promise.reject(new Error("仅桌面端支持本地直连")),
+    onData?: (bytes: Uint8Array) => void;
+  }): Promise<LocalTermAttachResult> => {
+    if (!inTauri()) throw new Error("仅桌面端支持本地直连");
+    const mod = await import("@tauri-apps/api/core");
+    const cb = params.onData;
+    const ch = new mod.Channel<ArrayBuffer>((raw) => {
+      if (!cb) return;
+      if (raw instanceof ArrayBuffer) {
+        cb(new Uint8Array(raw));
+      } else if (ArrayBuffer.isView(raw)) {
+        const v = raw as ArrayBufferView;
+        cb(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+      } else if (Array.isArray(raw)) {
+        cb(Uint8Array.from(raw));
+      }
+    });
+    return mod.invoke<LocalTermAttachResult>("local_term_attach", {
+      id: params.id,
+      terminal: params.terminal,
+      cols: params.cols,
+      rows: params.rows,
+      history: params.history,
+      display: params.display ?? null,
+      onData: ch,
+    });
+  },
   localTermInput: (id: string, data: string): Promise<void> =>
     inTauri() ? invoke<void>("local_term_input", { id, data }) : Promise.resolve(),
   localTermAutoInput: (id: string, data: string): Promise<void> =>
@@ -738,6 +772,20 @@ export const native = {
     inTauri() ? invoke<void>("local_term_resize", { id, cols, rows, display: display ?? null }) : Promise.resolve(),
   localTermDetach: (id: string): Promise<void> =>
     inTauri() ? invoke<void>("local_term_detach", { id }).catch(() => {}) : Promise.resolve(),
+  localTermKill: (terminal: string): Promise<void> =>
+    inTauri() ? invoke<void>("local_term_kill", { terminal }) : Promise.resolve(),
+  localHerdrDocGet: async (): Promise<{ value: HerdrDoc | null; version: number } | null> =>
+    inTauri() ? invoke<{ value: HerdrDoc | null; version: number }>("local_herdr_doc_get").catch(() => null) : null,
+  localHerdrDocSet: async (
+    value: HerdrDoc,
+    version: number,
+  ): Promise<{ ok: boolean; conflict?: boolean; value?: HerdrDoc | null; version: number }> => {
+    if (!inTauri()) throw new Error("仅桌面端支持本地文档写入");
+    return invoke<{ ok: boolean; conflict?: boolean; value?: HerdrDoc | null; version: number }>(
+      "local_herdr_doc_set",
+      { value, version },
+    );
+  },
   localTermReadImage: async (path: string): Promise<ArrayBuffer | null> =>
     inTauri() ? invoke<ArrayBuffer>("local_term_read_image", { path }).catch(() => null) : null,
   localTermStatImage: async (path: string, deleteAfter?: boolean): Promise<LocalImageStat | null> =>

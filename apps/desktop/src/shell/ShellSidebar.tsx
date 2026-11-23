@@ -1,8 +1,9 @@
-import { useMemo, useState, type CSSProperties } from "react";
-import { ChevronDown, ChevronRight, History, Laptop, PanelLeft, Plus, QrCode, Search, Server, Settings, Trash2, X } from "lucide-react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
+import { ChevronDown, ChevronRight, Columns2, History, Laptop, PanelLeft, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Trash2, X } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
-import { PocketButton, PocketModal, useToast } from "../components/PocketUI";
+import { PocketButton, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { serverLabel } from "../components/Sidebar";
 import { assetUrl } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
@@ -13,7 +14,7 @@ import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
 import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, tileLetter, toneIndex, type ListGroup } from "./agentInfo";
-import { closeTabsForSpace, openAgentTab, openSettingsFrame, setPalette, setSelectedSpace, shellStore } from "./shellStore";
+import { closeTabsForSpace, focusedLeafOfTab, openAgentTab, openSettingsFrame, setPalette, setSelectedSpace, shellStore, splitActivePaneWithContent, tabLeaves } from "./shellStore";
 import { shortcutText } from "./shortcuts";
 import { buildHostSpaces, spaceColorVars, type SidebarSpace } from "./spaceSync";
 
@@ -76,10 +77,27 @@ export function ShellSidebar({
   const [sort, setSortState] = useState<"status" | "recent">(() => readJson(SORT_KEY, "status"));
   const [deleteSpaceTarget, setDeleteSpaceTarget] = useState<SidebarSpace | null>(null);
   const [deletingSpace, setDeletingSpace] = useState(false);
+  const [agentMenu, setAgentMenu] = useState<{ x: number; y: number; agent: Agent } | null>(null);
   const toast = useToast();
   const spaceSel = shellStore.use((s) => s.selectedSpace);
   const allByKey = useMemo(() => new Map(Object.values(agentsMap).flat().map((a) => [a.key, a] as const)), [agentsMap]);
   const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k));
+
+  useEffect(() => {
+    if (!agentMenu) return;
+    const off = () => setAgentMenu(null);
+    const esc = (ev: KeyboardEvent) => ev.key === "Escape" && off();
+    window.addEventListener("pointerdown", off);
+    window.addEventListener("blur", off);
+    window.addEventListener("keydown", esc);
+    overlayStore.set((p) => ({ open: p.open + 1 }));
+    return () => {
+      window.removeEventListener("pointerdown", off);
+      window.removeEventListener("blur", off);
+      window.removeEventListener("keydown", esc);
+      overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
+    };
+  }, [agentMenu]);
 
   const confirmDeleteSpace = async () => {
     const target = deleteSpaceTarget;
@@ -173,7 +191,16 @@ export function ShellSidebar({
     return LIST_GROUPS.filter((g) => by.get(g.key)?.length).map((g) => ({ key: g.key, title: g.title, list: by.get(g.key)!.sort((x, y) => lastChange(y) - lastChange(x)) }));
   }, [devices, inScope, sort]);
 
-  const activeAgentKey = activeTab?.kind === "agent" ? activeTab.agentKey : null;
+  const focusedContent = activeTab ? focusedLeafOfTab(activeTab).content : null;
+  const activeAgentKey = focusedContent?.kind === "agent" ? focusedContent.agentKey : null;
+  const activeSplitAgentKeys = useMemo(() => {
+    const out = new Set<string>();
+    if (!activeTab) return out;
+    for (const leaf of tabLeaves(activeTab)) {
+      if (leaf.content.kind === "agent") out.add(leaf.content.agentKey);
+    }
+    return out;
+  }, [activeTab]);
   const connected = Boolean(server) && link === "online";
   const demo = isMockServer(server);
   const notice =
@@ -186,6 +213,8 @@ export function ShellSidebar({
   const agentRow = (a: Agent) => {
     const g = listGroup(a, devices);
     const label = selected ? agentTitle(a) : spacedTitle(a);
+    const isFocusedAgent = a.key === activeAgentKey;
+    const isInSplit = !isFocusedAgent && activeSplitAgentKeys.has(a.key);
     return (
       <div
         key={a.key}
@@ -193,11 +222,26 @@ export function ShellSidebar({
         tabIndex={0}
         draggable
         data-tauri-drag-region="false"
-        className={`v3-row v3-agent${a.key === activeAgentKey ? " selected" : ""}${g === "offline" ? " dim" : ""}`}
+        className={`v3-row v3-agent${isFocusedAgent ? " selected" : isInSplit ? " in-split" : ""}${g === "offline" ? " dim" : ""}`}
         title={collapsed ? label : undefined}
         onDragStart={(e) => startPanelDrag(e, { kind: "agent", agentKey: a.key })}
         onDragEnd={() => endPanelDrag()}
-        onClick={() => openAgentTab(a.key)}
+        onClick={(e) => {
+          if (e.altKey) {
+            splitActivePaneWithContent(e.shiftKey ? "down" : "right", {
+              kind: "agent",
+              agentKey: a.key,
+              ...(a.isShell ? { mode: "term" } : {}),
+            });
+            return;
+          }
+          openAgentTab(a.key);
+        }}
+        onContextMenu={(e) => {
+          if (collapsed) return;
+          e.preventDefault();
+          setAgentMenu({ x: e.clientX, y: e.clientY, agent: a });
+        }}
         onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), openAgentTab(a.key))}
       >
         <VendorIcon harness={a.harness} isShell={a.isShell} size={16} />
@@ -460,6 +504,70 @@ export function ShellSidebar({
           </PocketButton>
         </div>
       </PocketModal>
+      {agentMenu && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="ctx-menu v3-popup"
+              role="menu"
+              data-tauri-drag-region="false"
+              style={{
+                left: Math.max(8, Math.min(agentMenu.x, window.innerWidth - 208 - 8)),
+                top: Math.max(8, Math.min(agentMenu.y, window.innerHeight - 170)),
+                width: 208,
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  const target = agentMenu.agent;
+                  setAgentMenu(null);
+                  openAgentTab(target.key);
+                }}
+              >
+                <SquareArrowOutUpRight size={14} />
+                <span className="grow">在标签页中打开</span>
+              </button>
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  const target = agentMenu.agent;
+                  setAgentMenu(null);
+                  splitActivePaneWithContent("right", {
+                    kind: "agent",
+                    agentKey: target.key,
+                    ...(target.isShell ? { mode: "term" } : {}),
+                  });
+                }}
+              >
+                <Columns2 size={14} />
+                <span className="grow">向右分屏打开</span>
+              </button>
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  const target = agentMenu.agent;
+                  setAgentMenu(null);
+                  splitActivePaneWithContent("down", {
+                    kind: "agent",
+                    agentKey: target.key,
+                    ...(target.isShell ? { mode: "term" } : {}),
+                  });
+                }}
+              >
+                <Rows2 size={14} />
+                <span className="grow">向下分屏打开</span>
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
     </aside>
   );
 }

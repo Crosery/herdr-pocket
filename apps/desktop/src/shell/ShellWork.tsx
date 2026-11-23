@@ -1,5 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Copy, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, Laptop, Layers, MessageSquare, Plus, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import { createPortal } from "react-dom";
+import { Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, Search, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
@@ -11,12 +12,12 @@ import { prettyHotkey } from "../components/VoiceInput";
 import { AgentDetailPanel, type SubagentHeadInfo } from "../views/AgentsView";
 import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../views/WorkbenchView";
 import { assistantStore, loadAssistant } from "../lib/assistant";
-import { assetUrl, copyToClipboard, detectPlatform } from "../lib/bridge";
+import { assetUrl, copyToClipboard, detectPlatform, isTauri } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
 import { createBufferedEventMerger, foldConvEvents, mergeConvEvents } from "../lib/chatFold";
 import { useClientConfig } from "../lib/config";
-import { endPanelDrag, endTabDrag, endWorkspaceDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readPanelDrag, readTabDrag, readWorkspaceDrag, startPanelDrag, startTabDrag } from "../lib/fileDrag";
-import { useLocalHostDeviceId } from "../lib/fonts";
+import { endPaneDrag, endPanelDrag, endTabDrag, endWorkspaceDrag, hasPaneDrag, hasPanelDrag, hasTabDrag, hasWorkspaceDrag, readPaneDrag, readPanelDrag, readTabDrag, readWorkspaceDrag, startPaneDrag, startPanelDrag, startTabDrag } from "../lib/fileDrag";
+import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import { canActOnLocalFile, revealInFolderLabel, revealInFolderShortLabel, revealLocalFile } from "../lib/localFileActions";
 import { isMockServer } from "../lib/mock";
 import { native } from "../lib/native";
@@ -25,34 +26,53 @@ import { pingRelay, refreshHostSpaces, rpcCall, subscribeStream } from "../lib/r
 import { agentSpace, agentTitle, allAgents, createStore, findAgent, liveStore, settingsStore, spacedTitle } from "../lib/store";
 import { dismissVoiceMessage, hangupVoiceCall, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
 import { homeFolder, listGroup } from "./agentInfo";
+import { formatHerdrTabLabel } from "./herdrDoc";
 import { StatusMark } from "./ShellSidebar";
 import {
   activeTabIdForSpace,
   closeTab,
+  closeTabPane,
+  computeSplitLayout,
+  cycleTab,
+  detachPaneToTab,
+  equalizeTabSplits,
+  focusedLeafOfTab,
+  focusTabPane,
+  mergeTabIntoSplit,
   moveTab,
+  moveTabPaneToEdge,
   moveTabRelative,
   openAgentTab,
   openFileTab,
   openSettingsFrame,
-  openSubagentAside,
   openWebTab,
+  renameShellTab,
+  resizeTabSplit,
   setActiveTab,
-  setAgentTabMode,
   setPalette,
+  setPaneAgentMode,
   setPanelWidth,
   setPeek,
   setSelectedSpace,
   shellStore,
   showPanel,
+  splitActivePaneWithContent,
+  splitTabPane,
+  swapTabPanes,
+  tabLeaves,
+  tabRootNode,
   togglePanel,
-  updateWebTab,
+  toggleZoomTabPane,
+  unsplitTabToTabs,
+  updateWebPane,
   visibleTabsForSpace,
   type AgentPaneMode,
-  type AgentTab,
-  type DiffTab,
-  type FileTab,
+  type PaneContent,
   type PanelId,
   type ShellTab,
+  type SplitDirection,
+  type SplitLeafLayout,
+  type SplitSashLayout,
 } from "./shellStore";
 import { comboText, shortcutText, SHORTCUTS } from "./shortcuts";
 import "../styles/btw-slash.css";
@@ -63,16 +83,18 @@ function useAgent(key: string | null | undefined): Agent | undefined {
   return liveStore.use((s) => (key ? allAgents(s.agents).find((a) => a.key === key) : undefined));
 }
 
-/** Closes a tab in the UI only; a web tab's native view goes with it. */
+/** Closes a tab in the UI only; any web pane native views inside go with it. */
 export function closeShellTab(tab: ShellTab): void {
-  if (tab.kind === "web") void native.browserClose(tab.id);
+  for (const leaf of tabLeaves(tab)) {
+    if (leaf.content.kind === "web") void native.browserClose(leaf.content.webId);
+  }
   closeTab(tab.id);
 }
 
-type CloseConfirmState = {
-  tabs: ShellTab[];
-  busyAgents: Agent[];
-} | null;
+type CloseConfirmState =
+  | { kind: "tabs"; tabs: ShellTab[]; busyAgents: Agent[] }
+  | { kind: "pane"; tabId: string; paneId: string; busyAgent: Agent }
+  | null;
 
 const closeConfirmStore = createStore<CloseConfirmState>(null);
 let reportCloseError: (message: string) => void = () => {};
@@ -83,6 +105,18 @@ function isLiveTerminalAgent(agent: Agent | undefined): agent is Agent {
 
 function isBusyAgent(agent: Agent): boolean {
   return agent.status === "working" || agent.status === "blocked";
+}
+
+function countAgentPanesOutside(excluded: { tabIds?: ReadonlySet<string>; tabId?: string; paneId?: string }, agentKey: string): number {
+  let count = 0;
+  for (const t of shellStore.get().tabs) {
+    if (excluded.tabIds?.has(t.id)) continue;
+    for (const leaf of tabLeaves(t)) {
+      if (excluded.tabId === t.id && excluded.paneId === leaf.id) continue;
+      if (leaf.content.kind === "agent" && leaf.content.agentKey === agentKey) count += 1;
+    }
+  }
+  return count;
 }
 
 function removeAgentFromLiveStore(agent: Agent): void {
@@ -126,55 +160,97 @@ function clearAgentOverlays(agentKey: string): void {
   }
 }
 
+function killLiveAgent(agent: Agent, devicesToRefresh: Set<string>): void {
+  removeAgentFromLiveStore(agent);
+  clearAgentOverlays(agent.key);
+  const localId = localHostIdStore.get();
+  const killPromise =
+    isTauri() && native.available() && localId && localId === agent.deviceId && agent.source === "hc" && agent.localId
+      ? native
+          .localTermKill(agent.localId)
+          .catch(() => rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key }))
+      : rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key });
+  void killPromise
+    .then(() => {
+      if (!devicesToRefresh.has(agent.deviceId)) {
+        devicesToRefresh.add(agent.deviceId);
+        refreshHostSpaces(agent.deviceId);
+      }
+    })
+    .catch((err: unknown) => {
+      const code = (err as { code?: string } | null)?.code;
+      if (code === "not_found") {
+        refreshHostSpaces(agent.deviceId);
+        return;
+      }
+      restoreAgentToLiveStore(agent);
+      reportCloseError((err as Error)?.message || "关闭终端失败");
+    });
+}
+
 function executeCloseTabs(tabs: ShellTab[], mode: "hideOnly" | "killLive"): void {
+  const closingIds = new Set(tabs.map((t) => t.id));
+  const candidates: string[] = [];
+  for (const tab of tabs) {
+    for (const leaf of tabLeaves(tab)) {
+      if (leaf.content.kind === "agent") candidates.push(leaf.content.agentKey);
+    }
+    closeShellTab(tab);
+  }
+  if (mode !== "killLive") return;
   const killedKeys = new Set<string>();
   const devicesToRefresh = new Set<string>();
-  for (const tab of tabs) {
-    const agent = mode === "killLive" && tab.kind === "agent" ? findAgent(tab.agentKey) : undefined;
-    closeShellTab(tab);
-    if (!isLiveTerminalAgent(agent) || killedKeys.has(agent.key)) continue;
+  for (const agentKey of candidates) {
+    if (killedKeys.has(agentKey)) continue;
+    if (countAgentPanesOutside({ tabIds: closingIds }, agentKey) > 0) continue;
+    const agent = findAgent(agentKey);
+    if (!isLiveTerminalAgent(agent)) continue;
     killedKeys.add(agent.key);
-    removeAgentFromLiveStore(agent);
-    clearAgentOverlays(agent.key);
-    void rpcCall(agent.deviceId, "terminal.kill", { agent: agent.key })
-      .then(() => {
-        if (!devicesToRefresh.has(agent.deviceId)) {
-          devicesToRefresh.add(agent.deviceId);
-          refreshHostSpaces(agent.deviceId);
-        }
-      })
-      .catch((err: unknown) => {
-        const code = (err as { code?: string } | null)?.code;
-        if (code === "not_found") {
-          refreshHostSpaces(agent.deviceId);
-          return;
-        }
-        restoreAgentToLiveStore(agent);
-        reportCloseError((err as Error)?.message || "关闭终端失败");
-      });
+    killLiveAgent(agent, devicesToRefresh);
+  }
+}
+
+function executeClosePane(tabId: string, paneId: string, mode: "hideOnly" | "killLive"): void {
+  const tab = shellStore.get().tabs.find((t) => t.id === tabId);
+  if (!tab) return;
+  const leaf = tabLeaves(tab).find((l) => l.id === paneId);
+  if (!leaf) return;
+  if (leaf.content.kind === "web") {
+    void native.browserClose(leaf.content.webId);
+  }
+  const agentKey = leaf.content.kind === "agent" ? leaf.content.agentKey : null;
+  const agent = agentKey ? findAgent(agentKey) : undefined;
+  const keepShared = agentKey ? countAgentPanesOutside({ tabId, paneId }, agentKey) > 0 : false;
+  closeTabPane(tabId, paneId);
+  if (mode === "killLive" && !keepShared && isLiveTerminalAgent(agent)) {
+    killLiveAgent(agent, new Set<string>());
   }
 }
 
 /**
  * Closes multiple tabs with Herdr App parity:
- * - File/diff/web/missing/`uniflo` tabs close in UI immediately.
- * - Idle/done live agents close UI + optimistically leave sidebar + kill backend tab/terminal.
+ * - File/diff/web/missing/`uniflo` panes close in UI immediately.
+ * - Idle/done live agents (when not open in another pane) close UI + kill backend terminal.
  * - Any `working`/`blocked` live agent triggers the confirmation modal (`取消` / `仅收起标签` / `关闭并结束`).
  */
 export function requestCloseShellTabs(tabs: ShellTab[]): void {
   if (!tabs.length) return;
+  const closingIds = new Set(tabs.map((t) => t.id));
   const busyAgents: Agent[] = [];
   const seenBusy = new Set<string>();
   for (const tab of tabs) {
-    if (tab.kind !== "agent") continue;
-    const agent = findAgent(tab.agentKey);
-    if (isLiveTerminalAgent(agent) && isBusyAgent(agent) && !seenBusy.has(agent.key)) {
-      seenBusy.add(agent.key);
-      busyAgents.push(agent);
+    for (const leaf of tabLeaves(tab)) {
+      if (leaf.content.kind !== "agent") continue;
+      if (countAgentPanesOutside({ tabIds: closingIds }, leaf.content.agentKey) > 0) continue;
+      const agent = findAgent(leaf.content.agentKey);
+      if (isLiveTerminalAgent(agent) && isBusyAgent(agent) && !seenBusy.has(agent.key)) {
+        seenBusy.add(agent.key);
+        busyAgents.push(agent);
+      }
     }
   }
   if (busyAgents.length > 0) {
-    closeConfirmStore.set({ tabs, busyAgents });
+    closeConfirmStore.set({ kind: "tabs", tabs, busyAgents });
     return;
   }
   executeCloseTabs(tabs, "killLive");
@@ -185,6 +261,27 @@ export function requestCloseShellTab(tab: ShellTab): void {
   requestCloseShellTabs([tab]);
 }
 
+/** Closes one pane inside a tab (delegates to requestCloseShellTab when only one pane remains). */
+export function requestClosePane(tabId: string, paneId: string): void {
+  const tab = shellStore.get().tabs.find((t) => t.id === tabId);
+  if (!tab) return;
+  const leaves = tabLeaves(tab);
+  if (leaves.length <= 1) {
+    requestCloseShellTab(tab);
+    return;
+  }
+  const leaf = leaves.find((l) => l.id === paneId);
+  if (!leaf) return;
+  if (leaf.content.kind === "agent" && countAgentPanesOutside({ tabId, paneId }, leaf.content.agentKey) === 0) {
+    const agent = findAgent(leaf.content.agentKey);
+    if (isLiveTerminalAgent(agent) && isBusyAgent(agent)) {
+      closeConfirmStore.set({ kind: "pane", tabId, paneId, busyAgent: agent });
+      return;
+    }
+  }
+  executeClosePane(tabId, paneId, "killLive");
+}
+
 function clipModalTitleName(name: string, max = 48): string {
   return name.length > max ? `${name.slice(0, max)}…` : name;
 }
@@ -192,21 +289,29 @@ function clipModalTitleName(name: string, max = 48): string {
 function TabCloseConfirmModal() {
   const confirm = closeConfirmStore.use((s) => s);
   if (!confirm) return null;
-  const singleBusy = confirm.tabs.length === 1 && confirm.busyAgents.length === 1 ? confirm.busyAgents[0] : null;
+  const singleBusy =
+    confirm.kind === "pane"
+      ? confirm.busyAgent
+      : confirm.tabs.length === 1 && confirm.busyAgents.length === 1
+        ? confirm.busyAgents[0]
+        : null;
+  const isPane = confirm.kind === "pane";
   let title: string;
   let subtitle: string;
   if (singleBusy) {
-    title = `关闭正在运行的标签「${clipModalTitleName(agentTitle(singleBusy))}」？`;
+    title = `关闭正在运行的${isPane ? "分屏" : "标签"}「${clipModalTitleName(agentTitle(singleBusy))}」？`;
     subtitle =
       singleBusy.status === "blocked"
-        ? "该 Agent 正在等待你的回复或确认。你可以仅收起标签让它在后台继续，或直接关闭并结束终端进程。"
-        : "该 Agent 正在运行中。你可以仅收起标签让它在后台继续，或直接关闭并结束终端进程。";
-  } else if (confirm.busyAgents.length === 1) {
+        ? `该 Agent 正在等待你的回复或确认。你可以仅收起${isPane ? "分屏" : "标签"}让它在后台继续，或直接关闭并结束终端进程。`
+        : `该 Agent 正在运行中。你可以仅收起${isPane ? "分屏" : "标签"}让它在后台继续，或直接关闭并结束终端进程。`;
+  } else if (confirm.kind === "tabs" && confirm.busyAgents.length === 1) {
     title = `关闭正在运行的标签「${clipModalTitleName(agentTitle(confirm.busyAgents[0]!), 32)}」及其他 ${confirm.tabs.length - 1} 个标签？`;
     subtitle = "其中有 1 个 Agent 正在运行或等待回复：选择「仅收起标签」会保留进程在后台继续，选择「关闭并结束」将终止终端进程。";
   } else {
-    title = `关闭 ${confirm.tabs.length} 个标签（含 ${confirm.busyAgents.length} 个运行中）？`;
-    subtitle = `其中 ${confirm.busyAgents.length} 个 Agent 正在运行或等待回复：选择「仅收起标签」会保留进程在后台继续，选择「关闭并结束」将终止终端进程。`;
+    const count = confirm.kind === "tabs" ? confirm.tabs.length : 1;
+    const busyCount = confirm.kind === "tabs" ? confirm.busyAgents.length : 1;
+    title = `关闭 ${count} 个标签（含 ${busyCount} 个运行中）？`;
+    subtitle = `其中 ${busyCount} 个 Agent 正在运行或等待回复：选择「仅收起标签」会保留进程在后台继续，选择「关闭并结束」将终止终端进程。`;
   }
 
   return (
@@ -228,17 +333,21 @@ function TabCloseConfirmModal() {
           onClick={() => {
             const pending = closeConfirmStore.get();
             closeConfirmStore.set(null);
-            if (pending) executeCloseTabs(pending.tabs, "hideOnly");
+            if (!pending) return;
+            if (pending.kind === "pane") executeClosePane(pending.tabId, pending.paneId, "hideOnly");
+            else executeCloseTabs(pending.tabs, "hideOnly");
           }}
         >
-          仅收起标签
+          {isPane ? "仅收起分屏" : "仅收起标签"}
         </PocketButton>
         <PocketButton
           variant="danger"
           onClick={() => {
             const pending = closeConfirmStore.get();
             closeConfirmStore.set(null);
-            if (pending) executeCloseTabs(pending.tabs, "killLive");
+            if (!pending) return;
+            if (pending.kind === "pane") executeClosePane(pending.tabId, pending.paneId, "killLive");
+            else executeCloseTabs(pending.tabs, "killLive");
           }}
         >
           关闭并结束
@@ -250,14 +359,25 @@ function TabCloseConfirmModal() {
 
 // Tabs bar ---------------------------------------------------------------------
 
+function contentTitle(content: PaneContent, agent: Agent | undefined): string {
+  if (content.kind === "agent") return agent ? agentTitle(agent) : "已结束的 Agent";
+  if (content.kind === "web") return content.title === "about:blank" ? "新网页" : content.title;
+  return content.title;
+}
+
 function TabChip({
   tab,
   index,
   total,
   active,
+  hasSpaceFilter,
+  isRenaming,
   draggingId,
   dropTarget,
   setTabRef,
+  onStartRename,
+  onCommitRename,
+  onCancelRename,
   onDragStartTab,
   onDragEndTab,
   onDragOverTab,
@@ -268,20 +388,58 @@ function TabChip({
   index: number;
   total: number;
   active: boolean;
+  hasSpaceFilter: boolean;
+  isRenaming: boolean;
   draggingId: string | null;
   dropTarget: { id: string; side: "before" | "after" } | null;
   setTabRef: (el: HTMLDivElement | null) => void;
+  onStartRename: (id: string) => void;
+  onCommitRename: (id: string, name: string) => void;
+  onCancelRename: () => void;
   onDragStartTab: (e: ReactDragEvent<HTMLDivElement>, id: string) => void;
   onDragEndTab: () => void;
   onDragOverTab: (e: ReactDragEvent<HTMLDivElement>, id: string) => void;
   onDropTab: (e: ReactDragEvent<HTMLDivElement>, index: number) => void;
   onMenu: (e: ReactMouseEvent, tab: ShellTab) => void;
 }) {
-  const agent = useAgent(tab.kind === "agent" ? tab.agentKey : null);
+  const agentsMap = liveStore.use((s) => s.agents);
   const devices = liveStore.use((s) => s.devices);
-  const group = agent ? listGroup(agent, devices) : null;
-  const title =
-    tab.kind === "agent" ? (agent ? agentTitle(agent) : "已结束的 Agent") : tab.title === "about:blank" ? "新网页" : tab.title;
+  const leaves = useMemo(() => tabLeaves(tab), [tab]);
+  const primary = focusedLeafOfTab(tab);
+  const primaryContent = primary.content;
+  const agent = useMemo(
+    () => (primaryContent.kind === "agent" ? allAgents(agentsMap).find((a) => a.key === primaryContent.agentKey) : undefined),
+    [agentsMap, primaryContent],
+  );
+  const group = useMemo(() => {
+    const all = allAgents(agentsMap);
+    let best: ReturnType<typeof listGroup> | null = null;
+    const rank = { blocked: 4, working: 3, done: 2, idle: 1, offline: 0 };
+    for (const leaf of leaves) {
+      if (leaf.content.kind !== "agent") continue;
+      const ak = leaf.content.agentKey;
+      const a = all.find((x) => x.key === ak);
+      if (!a) continue;
+      const g = listGroup(a, devices);
+      if (!best || rank[g] > rank[best]) best = g;
+    }
+    return best;
+  }, [agentsMap, devices, leaves]);
+  const title = contentTitle(primaryContent, agent);
+  const primaryProgram = primaryContent.kind === "agent" && agent ? agentTitle(agent) : undefined;
+  const isHerdrTab = Boolean(tab.docTabId || (hasSpaceFilter && primaryContent.kind === "agent"));
+  const shownLabel = isHerdrTab
+    ? formatHerdrTabLabel(
+        { name: tab.docTabName ?? (tab.docTabId ? "" : undefined) },
+        index,
+        primaryProgram,
+        Boolean(tab.split?.zoomedPaneId),
+      )
+    : (tab.docTabName || title);
+  const [draft, setDraft] = useState(tab.docTabName ?? "");
+  useEffect(() => {
+    if (isRenaming) setDraft(tab.docTabName ?? "");
+  }, [isRenaming, tab.docTabName]);
   const side = dropTarget?.id === tab.id ? dropTarget.side : null;
   return (
     <div
@@ -289,21 +447,30 @@ function TabChip({
       role="tab"
       aria-selected={active}
       tabIndex={active ? 0 : -1}
-      draggable={total > 1}
+      draggable={total > 1 && !isRenaming}
       data-tauri-drag-region="false"
-      className={`v3-tab${active ? " active" : ""}${tab.kind === "agent" && !agent ? " gone" : ""}${draggingId === tab.id ? " dragging" : ""}${side ? ` drop-${side}` : ""}`}
+      className={`v3-tab${active ? " active" : ""}${primaryContent.kind === "agent" && !agent ? " gone" : ""}${draggingId === tab.id ? " dragging" : ""}${side ? ` drop-${side}` : ""}`}
       title={
-        tab.kind === "agent"
-          ? agent
-            ? spacedTitle(agent)
-            : title
-          : tab.kind === "file"
-            ? tab.path
-            : tab.kind === "diff"
-              ? `${tab.path} (${tab.staged ? "已暂存" : "工作区"})`
-              : tab.url
+        leaves.length > 1
+          ? `${title}（共 ${leaves.length} 个分屏）`
+          : primaryContent.kind === "agent"
+            ? agent
+              ? spacedTitle(agent)
+              : title
+            : primaryContent.kind === "file"
+              ? primaryContent.path
+              : primaryContent.kind === "diff"
+                ? `${primaryContent.path} (${primaryContent.staged ? "已暂存" : "工作区"})`
+                : primaryContent.url
       }
-      onClick={() => setActiveTab(tab.id)}
+      onClick={() => {
+        if (!isRenaming) setActiveTab(tab.id);
+      }}
+      onDoubleClick={(e) => {
+        if ((e.target as HTMLElement | null)?.closest(".v3-tab-x")) return;
+        e.stopPropagation();
+        onStartRename(tab.id);
+      }}
       onAuxClick={(e) => {
         if (e.button === 1) {
           e.preventDefault();
@@ -316,16 +483,42 @@ function TabChip({
       onDragOver={(e) => onDragOverTab(e, tab.id)}
       onDrop={(e) => onDropTab(e, index)}
     >
-      {tab.kind === "agent" ? (
+      {primaryContent.kind === "agent" ? (
         agent ? <VendorIcon harness={agent.harness} isShell={agent.isShell} size={14} /> : <File size={14} />
-      ) : tab.kind === "file" ? (
+      ) : primaryContent.kind === "file" ? (
         <FileText size={14} />
-      ) : tab.kind === "diff" ? (
+      ) : primaryContent.kind === "diff" ? (
         <GitBranch size={14} />
       ) : (
         <Globe size={14} />
       )}
-      <span className="v3-tab-label truncate">{title}</span>
+      {isRenaming ? (
+        <input
+          type="text"
+          className="v3-tab-rename-input"
+          autoFocus
+          value={draft}
+          placeholder={String(index + 1)}
+          aria-label="重命名标签"
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => onCommitRename(tab.id, draft)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onCommitRename(tab.id, draft);
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              e.stopPropagation();
+              onCancelRename();
+            }
+          }}
+        />
+      ) : (
+        <span className="v3-tab-label truncate">{shownLabel}</span>
+      )}
       {group === "working" ? <span className="v3-spinner small" aria-label="运行中" /> : null}
       {group === "blocked" ? <span className="v3-dot blocked" aria-label="需要你" /> : null}
       {group === "done" ? <span className="v3-dot done" aria-label="已完成" /> : null}
@@ -359,18 +552,23 @@ function Popup({ x, y, onClose, children, width = 220 }: { x: number; y: number;
       overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
     };
   }, [onClose]);
-  return (
+  const menuEl = (
     <div
       className="ctx-menu v3-popup"
       role="menu"
-      // Menus open inside the tabs bar, which is a drag region: a press on a menu's padding must not move the window.
+      // Menus open inside header/tabs bars: a press on a menu must not move the window.
       data-tauri-drag-region="false"
-      style={{ left: Math.max(8, Math.min(x, window.innerWidth - width - 8)), top: Math.min(y, window.innerHeight - 200), width }}
+      style={{
+        left: Math.max(8, Math.min(x, window.innerWidth - width - 8)),
+        top: Math.max(8, Math.min(y, window.innerHeight - 240)),
+        width,
+      }}
       onPointerDown={(e) => e.stopPropagation()}
     >
       {children}
     </div>
   );
+  return typeof document !== "undefined" ? createPortal(menuEl, document.body) : menuEl;
 }
 
 function MenuItem({ label, keys, icon: Icon, onClick, disabled }: { label: string; keys?: string; icon?: typeof Plus; onClick: () => void; disabled?: boolean }) {
@@ -394,10 +592,12 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
   const homePage = useClientConfig().browser.homePage;
   const [menu, setMenu] = useState<{ x: number; y: number; tab: ShellTab } | null>(null);
   const [newMenu, setNewMenu] = useState<{ x: number; y: number } | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; side: "before" | "after" } | null>(null);
   const [fileDropOver, setFileDropOver] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const wheelLockRef = useRef(0);
   const tabElsRef = useRef(new Map<string, HTMLDivElement>());
   const prevRectsRef = useRef(new Map<string, number>());
 
@@ -487,7 +687,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       setFileDropOver(true);
       return;
     }
-    if (!hasTabDrag(e) && !hasPanelDrag(e)) return;
+    if (!hasTabDrag(e) && !hasPanelDrag(e) && !hasPaneDrag(e)) return;
     if (id === draggingId) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
@@ -498,6 +698,23 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
 
   const handleDropAt = (e: ReactDragEvent<HTMLDivElement>, targetTabId?: string, side?: "before" | "after") => {
     setFileDropOver(false);
+    const paneItem = readPaneDrag(e);
+    if (paneItem) {
+      e.preventDefault();
+      e.stopPropagation();
+      endPaneDrag();
+      setDropTarget(null);
+      let insertBeforeTabId: string | undefined;
+      if (targetTabId && side) {
+        const idx = tabs.findIndex((t) => t.id === targetTabId);
+        if (idx >= 0) {
+          insertBeforeTabId = side === "before" ? targetTabId : tabs[idx + 1]?.id;
+        }
+      }
+      detachPaneToTab(paneItem.tabId, paneItem.paneId, { insertBeforeTabId });
+      return;
+    }
+
     const wsItem = readWorkspaceDrag(e);
     if (wsItem) {
       e.preventDefault();
@@ -575,7 +792,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
           e.preventDefault();
           e.dataTransfer.dropEffect = "copy";
           setFileDropOver(true);
-        } else if (hasTabDrag(e) || hasPanelDrag(e)) {
+        } else if (hasTabDrag(e) || hasPanelDrag(e) || hasPaneDrag(e)) {
           e.preventDefault();
           e.dataTransfer.dropEffect = "move";
         }
@@ -609,7 +826,16 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
         role="tablist"
         aria-label="标签"
         onWheel={(e) => {
-          if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY;
+          if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+            e.currentTarget.scrollLeft += e.deltaX;
+            return;
+          }
+          if (Math.abs(e.deltaY) >= 4 && visibleTabs.length > 1) {
+            const nowMs = Date.now();
+            if (nowMs - wheelLockRef.current < 160) return;
+            wheelLockRef.current = nowMs;
+            cycleTab(e.deltaY > 0 ? 1 : -1, visibleTabs);
+          }
         }}
       >
         {visibleTabs.map((t, i) => (
@@ -619,12 +845,20 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
             index={i}
             total={visibleTabs.length}
             active={t.id === active}
+            hasSpaceFilter={Boolean(selectedSpace)}
+            isRenaming={renamingId === t.id}
             draggingId={draggingId}
             dropTarget={dropTarget}
             setTabRef={(el) => {
               if (el) tabElsRef.current.set(t.id, el);
               else tabElsRef.current.delete(t.id);
             }}
+            onStartRename={(id) => setRenamingId(id)}
+            onCommitRename={(id, nextName) => {
+              setRenamingId(null);
+              renameShellTab(id, nextName);
+            }}
+            onCancelRename={() => setRenamingId(null)}
             onDragStartTab={onDragStartTab}
             onDragEndTab={onDragEndTab}
             onDragOverTab={onDragOverTab}
@@ -664,13 +898,16 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
         </Popup>
       ) : null}
       {menu ? (() => {
-        const menuAgent = menu.tab.kind === "agent" ? agentByKey.get(menu.tab.agentKey) : undefined;
-        const isLive = isLiveTerminalAgent(menuAgent);
+        const menuFocused = focusedLeafOfTab(menu.tab).content;
+        const menuLeaves = tabLeaves(menu.tab);
+        const isLive = menuLeaves.some((l) => l.content.kind === "agent" && isLiveTerminalAgent(agentByKey.get(l.content.agentKey)));
         const idx = visibleTabs.findIndex((t) => t.id === menu.tab.id);
         const otherTabs = visibleTabs.filter((t) => t.id !== menu.tab.id);
         const rightTabs = idx >= 0 ? visibleTabs.slice(idx + 1) : [];
+        const canMergeIntoActive = Boolean(active && menu.tab.id !== active && visibleTabs.some((t) => t.id === active));
+        const isMultiPane = menuLeaves.length > 1;
         return (
-          <Popup x={menu.x} y={menu.y} onClose={() => setMenu(null)} width={isLive ? 220 : 196}>
+          <Popup x={menu.x} y={menu.y} onClose={() => setMenu(null)} width={228}>
             <MenuItem
               label={isLive ? "关闭并结束" : "关闭"}
               icon={X}
@@ -692,7 +929,62 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
                 }}
               />
             ) : null}
-            {isLive ? <div className="menu-sep" /> : null}
+            <MenuItem
+              label="重命名标签"
+              icon={Pencil}
+              onClick={() => {
+                const id = menu.tab.id;
+                setMenu(null);
+                setRenamingId(id);
+              }}
+            />
+            <div className="menu-sep" />
+            {canMergeIntoActive ? (
+              <>
+                <MenuItem
+                  label="并入当前标签右侧分屏"
+                  icon={Columns2}
+                  onClick={() => {
+                    const target = menu.tab;
+                    setMenu(null);
+                    mergeTabIntoSplit(target.id, active!, null, "right");
+                  }}
+                />
+                <MenuItem
+                  label="并入当前标签下方分屏"
+                  icon={Rows2}
+                  onClick={() => {
+                    const target = menu.tab;
+                    setMenu(null);
+                    mergeTabIntoSplit(target.id, active!, null, "down");
+                  }}
+                />
+                <div className="menu-sep" />
+              </>
+            ) : null}
+            {isMultiPane ? (
+              <>
+                <MenuItem
+                  label="均分分屏尺寸"
+                  icon={Equal}
+                  onClick={() => {
+                    const target = menu.tab;
+                    setMenu(null);
+                    equalizeTabSplits(target.id);
+                  }}
+                />
+                <MenuItem
+                  label="拆分为多个标签页"
+                  icon={SquareArrowOutUpRight}
+                  onClick={() => {
+                    const target = menu.tab;
+                    setMenu(null);
+                    unsplitTabToTabs(target.id);
+                  }}
+                />
+                <div className="menu-sep" />
+              </>
+            ) : null}
             <MenuItem
               label="关闭其他"
               disabled={otherTabs.length === 0}
@@ -709,19 +1001,27 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
                 requestCloseShellTabs(rightTabs);
               }}
             />
-            {menu.tab.kind !== "agent" ? <div className="menu-sep" /> : null}
-            {menu.tab.kind === "file" || menu.tab.kind === "diff" ? (
+            {menuFocused.kind !== "agent" ? <div className="menu-sep" /> : null}
+            {menuFocused.kind === "file" || menuFocused.kind === "diff" ? (
               <MenuItem
                 label="复制路径"
                 icon={Copy}
-                onClick={() => (setMenu(null), void copyToClipboard((menu.tab as { path: string }).path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok)))}
+                onClick={() => {
+                  const path = menuFocused.kind === "file" ? (menuFocused.absPath || menuFocused.path) : menuFocused.path;
+                  setMenu(null);
+                  void copyToClipboard(path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok));
+                }}
               />
             ) : null}
-            {menu.tab.kind === "web" ? (
+            {menuFocused.kind === "web" ? (
               <MenuItem
                 label="复制网址"
                 icon={Copy}
-                onClick={() => (setMenu(null), void copyToClipboard((menu.tab as { url: string }).url).then((ok) => toast(ok ? "网址已复制" : "复制失败", !ok)))}
+                onClick={() => {
+                  const url = menuFocused.url;
+                  setMenu(null);
+                  void copyToClipboard(url).then((ok) => toast(ok ? "网址已复制" : "复制失败", !ok));
+                }}
               />
             ) : null}
           </Popup>
@@ -734,8 +1034,8 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
 
 // Panes ----------------------------------------------------------------------------
 
-function resolveAgentMode(tabMode: AgentPaneMode | undefined, agent: Agent | undefined): AgentPaneMode {
-  return tabMode ?? (agent?.isShell ? "term" : "chat");
+function resolveAgentMode(tabMode: AgentPaneMode | undefined, _agent: Agent | undefined): AgentPaneMode {
+  return tabMode ?? "term";
 }
 
 function ModeSwitchIcons({ mode, onModeChange }: { mode: AgentPaneMode; onModeChange: (m: AgentPaneMode) => void }) {
@@ -766,45 +1066,63 @@ function ModeSwitchIcons({ mode, onModeChange }: { mode: AgentPaneMode; onModeCh
 }
 
 function PaneHead({
-  tab,
+  tabId,
+  paneId,
+  content,
   agent,
   mode,
   onModeChange,
   subHead,
   fileHead,
+  isSplit,
+  isZoomed,
+  onSplitNewTerminal,
+  onToggleZoom,
+  onEqualize,
+  onDetach,
   onClose,
 }: {
-  tab: ShellTab;
+  tabId: string;
+  paneId: string;
+  content: PaneContent;
   agent: Agent | undefined;
   mode?: AgentPaneMode;
   onModeChange?: (m: AgentPaneMode) => void;
   subHead?: SubagentHeadInfo | null;
   fileHead?: FileViewerHeadState | null;
+  isSplit: boolean;
+  isZoomed: boolean;
+  onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
+  onToggleZoom: () => void;
+  onEqualize: () => void;
+  onDetach: () => void;
   onClose: () => void;
 }) {
   const toast = useToast();
   const devices = liveStore.use((s) => s.devices);
+  const homePage = useClientConfig().browser.homePage;
   const localHostId = useLocalHostDeviceId();
+  const [paneMenu, setPaneMenu] = useState<{ x: number; y: number } | null>(null);
   const group = agent ? listGroup(agent, devices) : null;
   const platform = detectPlatform();
   const revealLabel = revealInFolderLabel(platform);
   const revealShortLabel = revealInFolderShortLabel(platform);
   const canRevealLocal =
-    tab.kind === "file" &&
+    content.kind === "file" &&
     canActOnLocalFile({
       nativeAvailable: native.available(),
       agentDeviceId: agent?.deviceId,
       agentCwd: agent?.cwd,
       localHostId,
-      path: tab.path,
-      absPath: tab.absPath,
+      path: content.path,
+      absPath: content.absPath,
     });
   const handleReveal =
-    tab.kind === "file"
+    content.kind === "file"
       ? () => {
           void revealLocalFile({
-            path: tab.path,
-            absPath: tab.absPath,
+            path: content.path,
+            absPath: content.absPath,
             agentCwd: agent?.cwd,
           }).catch((e: Error) => toast(e.message || "打开所在目录失败", true));
         }
@@ -813,46 +1131,53 @@ function PaneHead({
   let name: string;
   let sub: string;
   let subTitle = "";
-  if (tab.kind === "agent") {
+  if (content.kind === "agent") {
     icon = agent ? <VendorIcon harness={agent.harness} isShell={agent.isShell} size={14} /> : <File size={14} />;
     name = agent ? spacedTitle(agent) : "这个 Agent 已经结束了";
     sub = agent ? homeFolder(agent.cwd) || agent.where || "" : "";
     subTitle = sub;
-  } else if (tab.kind === "file") {
+  } else if (content.kind === "file") {
     icon = <FileText size={14} />;
-    name = tab.title;
-    const normPath = tab.path.replace(/\\/g, "/");
+    name = content.title;
+    const normPath = content.path.replace(/\\/g, "/");
     const slash = normPath.lastIndexOf("/");
     sub = slash > 0 ? normPath.slice(0, slash) : "";
-    subTitle = tab.absPath || tab.path;
-  } else if (tab.kind === "diff") {
+    subTitle = content.absPath || content.path;
+  } else if (content.kind === "diff") {
     icon = <GitBranch size={14} />;
-    name = tab.title;
-    sub = tab.commit ? `提交 ${tab.commit.slice(0, 7)}` : tab.staged ? "暂存区变更" : "工作区变更";
-    subTitle = tab.path;
+    name = content.title;
+    sub = content.commit ? `提交 ${content.commit.slice(0, 7)}` : content.staged ? "暂存区变更" : "工作区变更";
+    subTitle = content.path;
   } else {
     icon = <Globe size={14} />;
-    name = tab.title === "about:blank" ? "新网页" : tab.title;
-    sub = tab.url === "about:blank" ? "" : tab.url;
+    name = content.title === "about:blank" ? "新网页" : content.title;
+    sub = content.url === "about:blank" ? "" : content.url;
     subTitle = sub;
   }
   const lineBadge =
-    tab.kind === "file" && tab.line
-      ? tab.endLine && tab.endLine !== tab.line
-        ? `L${tab.line}–${tab.endLine}`
-        : `L${tab.line}`
+    content.kind === "file" && content.line
+      ? content.endLine && content.endLine !== content.line
+        ? `L${content.line}–${content.endLine}`
+        : `L${content.line}`
       : null;
   const sizeText =
-    tab.kind === "file" && fileHead && fileHead.size !== null
+    content.kind === "file" && fileHead && fileHead.size !== null
       ? fileHead.size >= 1024
         ? `${Math.round(fileHead.size / 1024)} KB`
         : `${fileHead.size} B`
       : null;
-  const inSubView = Boolean(tab.kind === "agent" && agent && subHead && subHead.trail.length > 0);
-  const previewToggleable = Boolean(tab.kind === "file" && (fileHead?.canPreview || fileHead?.isMd));
+  const inSubView = Boolean(content.kind === "agent" && agent && subHead && subHead.trail.length > 0);
+  const previewToggleable = Boolean(content.kind === "file" && (fileHead?.canPreview || fileHead?.isMd));
+  const oppositeMode: AgentPaneMode = mode === "term" ? "chat" : "term";
 
   return (
-    <div className="v3-pane-head">
+    <div
+      className="v3-pane-head"
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setPaneMenu({ x: e.clientX, y: e.clientY });
+      }}
+    >
       {icon}
       {inSubView && agent && subHead ? (
         <SubagentHeaderLineage
@@ -886,7 +1211,7 @@ function PaneHead({
       )}
       {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
       {sizeText ? <span className="v3-pane-pill num">{sizeText}</span> : null}
-      {tab.kind === "agent" && agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
+      {content.kind === "agent" && agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
         <SubagentCatalogTrigger
           compact
           deviceId={agent.deviceId}
@@ -898,9 +1223,8 @@ function PaneHead({
           onRefresh={subHead.onRefresh}
         />
       ) : null}
-      {tab.kind === "agent" && group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
-      {tab.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
-      {tab.kind === "agent" && agent && mode && onModeChange ? <ModeSwitchIcons mode={mode} onModeChange={onModeChange} /> : null}
+      {content.kind === "agent" && group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
+      {content.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
       {previewToggleable && fileHead ? (
         <div className="v3-mode-switch" role="group" aria-label="视图">
           <button
@@ -921,101 +1245,526 @@ function PaneHead({
           </button>
         </div>
       ) : null}
-      {canRevealLocal ? (
+      <div className="v3-pane-actions">
+        {content.kind === "agent" && agent && mode && onModeChange ? (
+          <button
+            type="button"
+            className="v3-icon-btn small"
+            aria-label={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
+            title={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
+            onClick={() => onModeChange(oppositeMode)}
+          >
+            {oppositeMode === "chat" ? <MessageSquare size={13} /> : <Terminal size={13} />}
+          </button>
+        ) : null}
+        {content.kind === "agent" && agent && mode === "term" ? (
+          <button
+            type="button"
+            className="v3-icon-btn small"
+            aria-label="在终端中搜索"
+            title={`在终端中搜索（${shortcutText("terminalSearch")}）`}
+            onClick={() => {
+              if (typeof window !== "undefined") {
+                window.dispatchEvent(new CustomEvent("pocket:term-search", { detail: { agentKey: agent.key } }));
+              }
+            }}
+          >
+            <Search size={13} />
+          </button>
+        ) : null}
+        {canRevealLocal ? (
+          <button
+            type="button"
+            className="v3-icon-btn small"
+            aria-label={revealShortLabel}
+            title={`${revealLabel}（${content.absPath || content.path}）`}
+            onClick={handleReveal}
+          >
+            <FolderOpen size={13} />
+          </button>
+        ) : null}
+        {content.kind === "file" ? (
+          <button
+            type="button"
+            className="v3-icon-btn small"
+            aria-label="复制路径"
+            title={`复制路径（${content.absPath || content.path}）`}
+            onClick={() => {
+              void copyToClipboard(content.absPath || content.path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok));
+            }}
+          >
+            <Copy size={13} />
+          </button>
+        ) : null}
         <button
           type="button"
           className="v3-icon-btn small"
-          aria-label={revealShortLabel}
-          title={`${revealLabel}（${tab.absPath || tab.path}）`}
-          onClick={handleReveal}
+          aria-label="向右分屏"
+          title={`向右分屏（${shortcutText("splitRight")}）`}
+          onClick={() => onSplitNewTerminal(tabId, paneId, "right")}
         >
-          <FolderOpen size={13} />
+          <Columns2 size={13} />
         </button>
-      ) : null}
-      {tab.kind === "file" ? (
         <button
+          type="button"
           className="v3-icon-btn small"
-          aria-label="复制路径"
-          title={`复制路径（${tab.absPath || tab.path}）`}
-          onClick={() => {
-            void copyToClipboard(tab.absPath || tab.path).then((ok) => toast(ok ? "路径已复制" : "复制失败", !ok));
-          }}
+          aria-label="向下分屏"
+          title={`向下分屏（${shortcutText("splitDown")}）`}
+          onClick={() => onSplitNewTerminal(tabId, paneId, "down")}
         >
-          <Copy size={13} />
+          <Rows2 size={13} />
         </button>
+        {isSplit || isZoomed ? (
+          <button
+            type="button"
+            className={`v3-icon-btn small${isZoomed ? " on" : ""}`}
+            aria-label={isZoomed ? "还原分屏布局" : "最大化此分屏"}
+            title={`${isZoomed ? "还原分屏布局" : "最大化此分屏"}（${shortcutText("zoomPane")}）`}
+            onClick={onToggleZoom}
+          >
+            {isZoomed ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="v3-icon-btn small"
+          aria-label={isSplit ? "关闭此分屏" : "关闭标签"}
+          title={isSplit ? `关闭此分屏（${shortcutText("closePane")}）` : `关闭标签（${shortcutText("closeTab")}）`}
+          onClick={onClose}
+        >
+          <X size={13} />
+        </button>
+      </div>
+      {paneMenu ? (
+        <Popup x={paneMenu.x} y={paneMenu.y} onClose={() => setPaneMenu(null)} width={236}>
+          <MenuItem
+            label="向右分屏新建终端"
+            icon={Columns2}
+            keys={shortcutText("splitRight")}
+            onClick={() => {
+              setPaneMenu(null);
+              onSplitNewTerminal(tabId, paneId, "right");
+            }}
+          />
+          <MenuItem
+            label="向下分屏新建终端"
+            icon={Rows2}
+            keys={shortcutText("splitDown")}
+            onClick={() => {
+              setPaneMenu(null);
+              onSplitNewTerminal(tabId, paneId, "down");
+            }}
+          />
+          {content.kind === "agent" && agent ? (
+            <MenuItem
+              label={oppositeMode === "term" ? "右侧对照打开终端视图" : "右侧对照打开对话视图"}
+              icon={oppositeMode === "term" ? Terminal : MessageSquare}
+              onClick={() => {
+                setPaneMenu(null);
+                splitTabPane(tabId, paneId, "right", { kind: "agent", agentKey: agent.key, mode: oppositeMode });
+              }}
+            />
+          ) : null}
+          <MenuItem
+            label="向右分屏打开网页"
+            icon={Globe}
+            onClick={() => {
+              setPaneMenu(null);
+              const url = homePage || "about:blank";
+              splitTabPane(tabId, paneId, "right", {
+                kind: "web",
+                webId: `w:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+                url,
+                title: url === "about:blank" ? "新网页" : url,
+                spaceKey: shellStore.get().selectedSpace,
+              });
+            }}
+          />
+          {isSplit || isZoomed ? (
+            <>
+              <div className="menu-sep" />
+              <MenuItem
+                label={isZoomed ? "还原分屏布局" : "最大化此分屏"}
+                icon={isZoomed ? Minimize2 : Maximize2}
+                keys={shortcutText("zoomPane")}
+                onClick={() => {
+                  setPaneMenu(null);
+                  onToggleZoom();
+                }}
+              />
+              {isSplit ? (
+                <>
+                  <MenuItem
+                    label="均分分屏尺寸"
+                    icon={Equal}
+                    onClick={() => {
+                      setPaneMenu(null);
+                      onEqualize();
+                    }}
+                  />
+                  <MenuItem
+                    label="拆分为独立标签页"
+                    icon={SquareArrowOutUpRight}
+                    onClick={() => {
+                      setPaneMenu(null);
+                      onDetach();
+                    }}
+                  />
+                </>
+              ) : null}
+            </>
+          ) : null}
+          <div className="menu-sep" />
+          <MenuItem
+            label={isSplit ? "关闭此分屏" : "关闭标签"}
+            icon={X}
+            keys={isSplit ? shortcutText("closePane") : shortcutText("closeTab")}
+            onClick={() => {
+              setPaneMenu(null);
+              onClose();
+            }}
+          />
+        </Popup>
       ) : null}
-      <button className="v3-icon-btn small" aria-label="关闭标签" title={`关闭标签（${shortcutText("closeTab")}）`} onClick={onClose}>
-        <X size={13} />
-      </button>
     </div>
   );
 }
 
-function FilePane({ tab, agent }: { tab: FileTab; agent: Agent | undefined }) {
-  const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
+type SplitDropZone = SplitDirection | "center";
+
+function detectSplitDropZone(
+  e: ReactDragEvent<HTMLElement>,
+  rect: DOMRect,
+  allowCenter: boolean,
+): SplitDropZone {
+  const rx = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
+  const ry = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
+  if (allowCenter && rx > 0.25 && rx < 0.75 && ry > 0.25 && ry < 0.75) {
+    return "center";
+  }
+  const distances: Array<[SplitDirection, number]> = [
+    ["left", rx],
+    ["right", 1 - rx],
+    ["up", ry],
+    ["down", 1 - ry],
+  ];
+  distances.sort((a, b) => a[1] - b[1]);
+  return distances[0]![0];
+}
+
+function SplitSash({
+  tabId,
+  sash,
+  stageRef,
+}: {
+  tabId: string;
+  sash: SplitSashLayout;
+  stageRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const dragRef = useRef<{ lastPos: number; spanPx: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    return () => {
+      if (dragRef.current) {
+        dragRef.current = null;
+        overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
+      }
+    };
+  }, []);
+
+  const endDrag = () => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    setDragging(false);
+    overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
+  };
+
   return (
-    <section className="v3-pane" aria-label={tab.title}>
-      <PaneHead tab={tab} agent={agent} fileHead={fileHead} onClose={() => requestCloseShellTab(tab)} />
-      <div className="v3-pane-body">
-        <PocketErrorBoundary resetKey={tab.id} title="文件预览加载出错">
-          <FileViewer key={tab.id} tab={tab} agent={agent} embedded onHeadState={setFileHead} />
-        </PocketErrorBoundary>
-      </div>
-    </section>
+    <div
+      className={`v3-split-sash ${sash.axis}${dragging ? " dragging" : ""}`}
+      role="separator"
+      aria-orientation={sash.axis === "row" ? "vertical" : "horizontal"}
+      aria-label="拖动调整分屏大小，双击均分"
+      title="拖动调整分屏大小（双击恢复均分）"
+      style={sash.css}
+      onDoubleClick={() => equalizeTabSplits(tabId, sash.branchId)}
+      onPointerDown={(e: ReactPointerEvent<HTMLDivElement>) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        const rect = stageRef.current?.getBoundingClientRect();
+        const totalPx = sash.axis === "row" ? (rect?.width ?? window.innerWidth) : (rect?.height ?? window.innerHeight);
+        const spanPx = Math.max(140, totalPx * Math.max(0.1, sash.branchSpanScale));
+        dragRef.current = { lastPos: sash.axis === "row" ? e.clientX : e.clientY, spanPx };
+        setDragging(true);
+        overlayStore.set((p) => ({ open: p.open + 1 }));
+        e.currentTarget.setPointerCapture(e.pointerId);
+      }}
+      onPointerMove={(e: ReactPointerEvent<HTMLDivElement>) => {
+        const d = dragRef.current;
+        if (!d) return;
+        const pos = sash.axis === "row" ? e.clientX : e.clientY;
+        const deltaPx = pos - d.lastPos;
+        if (Math.abs(deltaPx) < 1) return;
+        d.lastPos = pos;
+        resizeTabSplit(tabId, sash.branchId, sash.index, deltaPx / d.spanPx);
+      }}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+    />
   );
 }
 
-function DiffPane({ tab }: { tab: DiffTab }) {
-  return (
-    <section className="v3-pane" aria-label={tab.title}>
-      <PaneHead tab={tab} agent={undefined} onClose={() => requestCloseShellTab(tab)} />
-      <div className="v3-pane-body">
-        <PocketErrorBoundary resetKey={tab.id} title="差异对比加载出错">
-          <DiffTabView key={tab.id} tab={tab} />
-        </PocketErrorBoundary>
-      </div>
-    </section>
-  );
-}
-
-function AgentPane({ tab, agentKey }: { tab: AgentTab; agentKey: string }) {
+function SplitPaneSlot({
+  tabId,
+  item,
+  isSplit,
+  isFocused,
+  isZoomed,
+  draggingPaneId,
+  onDraggingPaneChange,
+  onSplitNewTerminal,
+}: {
+  tabId: string;
+  item: SplitLeafLayout;
+  isSplit: boolean;
+  isFocused: boolean;
+  isZoomed: boolean;
+  draggingPaneId: string | null;
+  onDraggingPaneChange: (paneId: string | null) => void;
+  onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
+}) {
+  const { leaf, visible, css } = item;
+  const { content } = leaf;
+  const agentKey = content.kind === "agent" || content.kind === "file" ? content.agentKey : content.kind === "diff" ? content.agentKey : undefined;
   const agent = useAgent(agentKey);
-  const mode = resolveAgentMode(tab.mode, agent);
+  const devices = liveStore.use((s) => s.devices);
+  const agentsMap = liveStore.use((s) => s.agents);
   const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
+  const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
+  const [dropZone, setDropZone] = useState<SplitDropZone | null>(null);
+
+  const label =
+    content.kind === "agent"
+      ? agent
+        ? spacedTitle(agent)
+        : "已结束的 Agent"
+      : content.kind === "web"
+        ? content.title === "about:blank"
+          ? "新网页"
+          : content.title
+        : content.title;
+
+  const mode = content.kind === "agent" ? resolveAgentMode(content.mode, agent) : undefined;
+  const layoutKey = `${css.left}|${css.top}|${css.width}|${css.height}|${visible ? 1 : 0}`;
+  const isAgentPane = content.kind === "agent";
+
+  const acceptsSplitDrop = (e: ReactDragEvent<HTMLElement>): { ok: boolean; allowCenter: boolean } => {
+    if (hasPaneDrag(e)) {
+      const paneDrag = readPaneDrag(e);
+      if (paneDrag && paneDrag.tabId === tabId && paneDrag.paneId === leaf.id) return { ok: false, allowCenter: false };
+      return { ok: true, allowCenter: Boolean(paneDrag && paneDrag.tabId === tabId) };
+    }
+    if (hasTabDrag(e) || hasPanelDrag(e)) return { ok: true, allowCenter: false };
+    if (hasWorkspaceDrag(e)) {
+      const overHead = Boolean((e.target as HTMLElement | null)?.closest(".v3-pane-head"));
+      if (!isAgentPane || e.altKey || overHead) return { ok: true, allowCenter: false };
+    }
+    return { ok: false, allowCenter: false };
+  };
+
+  const handleDragOver = (e: ReactDragEvent<HTMLElement>) => {
+    const check = acceptsSplitDrop(e);
+    if (!check.ok) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = hasWorkspaceDrag(e) ? "copy" : "move";
+    const zone = detectSplitDropZone(e, e.currentTarget.getBoundingClientRect(), check.allowCenter);
+    setDropZone((prev) => (prev === zone ? prev : zone));
+  };
+
+  const handleDrop = (e: ReactDragEvent<HTMLElement>) => {
+    const check = acceptsSplitDrop(e);
+    if (!check.ok) return;
+    const zone = detectSplitDropZone(e, e.currentTarget.getBoundingClientRect(), check.allowCenter);
+    setDropZone(null);
+
+    const paneDrag = readPaneDrag(e);
+    if (paneDrag) {
+      e.preventDefault();
+      e.stopPropagation();
+      endPaneDrag();
+      onDraggingPaneChange(null);
+      if (paneDrag.tabId === tabId) {
+        if (zone === "center") swapTabPanes(tabId, paneDrag.paneId, leaf.id);
+        else moveTabPaneToEdge(tabId, paneDrag.paneId, leaf.id, zone);
+      } else {
+        const detachedId = detachPaneToTab(paneDrag.tabId, paneDrag.paneId);
+        if (detachedId) mergeTabIntoSplit(detachedId, tabId, leaf.id, zone === "center" ? "right" : zone);
+      }
+      return;
+    }
+
+    const tabDragId = readTabDrag(e);
+    if (tabDragId && tabDragId !== tabId) {
+      e.preventDefault();
+      e.stopPropagation();
+      endTabDrag();
+      mergeTabIntoSplit(tabDragId, tabId, leaf.id, zone === "center" ? "right" : zone);
+      return;
+    }
+
+    const panelItem = readPanelDrag(e);
+    if (panelItem) {
+      e.preventDefault();
+      e.stopPropagation();
+      endPanelDrag();
+      const dir: SplitDirection = zone === "center" ? "right" : zone;
+      if (panelItem.kind === "browser") {
+        splitTabPane(tabId, leaf.id, dir, {
+          kind: "web",
+          webId: `w:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+          url: panelItem.url,
+          title: panelItem.title,
+          ...(panelItem.spaceKey ? { spaceKey: panelItem.spaceKey } : {}),
+        });
+        if (shellStore.get().panel === "browser") showPanel(null);
+      } else if (panelItem.kind === "agent") {
+        const targetAgent = allAgents(agentsMap).find((a) => a.key === panelItem.agentKey);
+        splitTabPane(tabId, leaf.id, dir, {
+          kind: "agent",
+          agentKey: panelItem.agentKey,
+          ...(targetAgent?.isShell ? { mode: "term" } : {}),
+        });
+      }
+      return;
+    }
+
+    const wsItem = readWorkspaceDrag(e);
+    if (wsItem) {
+      e.preventDefault();
+      e.stopPropagation();
+      endWorkspaceDrag();
+      if (wsItem.kind === "file") {
+        const dir: SplitDirection = zone === "center" ? "right" : zone;
+        splitTabPane(tabId, leaf.id, dir, {
+          kind: "file",
+          agentKey: wsItem.agentKey,
+          path: wsItem.relPath,
+          title: wsItem.name,
+          ...(wsItem.absPath ? { absPath: wsItem.absPath } : {}),
+          spaceKey: shellStore.get().selectedSpace,
+        });
+      }
+    }
+  };
+
   return (
-    <section className="v3-pane" aria-label={agent ? spacedTitle(agent) : "Agent"}>
-      <PaneHead
-        tab={tab}
-        agent={agent}
-        mode={mode}
-        subHead={subHead}
-        onModeChange={(m) => setAgentTabMode(tab.id, m)}
-        onClose={() => requestCloseShellTab(tab)}
-      />
-      <div className="v3-pane-body">
-        <PocketErrorBoundary resetKey={tab.id} title="会话视图加载出错">
-          {agent ? (
-            <AgentDetailPanel
-              key={agent.key}
-              agent={agent}
-              embedded
-              mode={mode}
-              onModeChange={(m) => setAgentTabMode(tab.id, m)}
-              onSubHeadChange={setSubHead}
-              onBack={() => closeShellTab(tab)}
-              onOpenWorkbench={() => showPanel("files")}
-            />
+    <div
+      className="v3-split-slot"
+      style={visible ? css : { ...css, display: "none" }}
+      onPointerDownCapture={() => {
+        if (!isFocused) focusTabPane(tabId, leaf.id);
+      }}
+      onDragOver={handleDragOver}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropZone(null);
+      }}
+      onDrop={handleDrop}
+    >
+      <section
+        className={`v3-pane${isSplit ? " is-split" : ""}${isFocused ? " is-focused" : ""}${isZoomed ? " is-zoomed" : ""}`}
+        aria-label={label}
+      >
+        <PaneHead
+          tabId={tabId}
+          paneId={leaf.id}
+          content={content}
+          agent={agent}
+          mode={mode}
+          subHead={subHead}
+          fileHead={fileHead}
+          isSplit={isSplit}
+          isZoomed={isZoomed}
+          onModeChange={content.kind === "agent" ? (m) => setPaneAgentMode(tabId, leaf.id, m) : undefined}
+          onSplitNewTerminal={onSplitNewTerminal}
+          onToggleZoom={() => toggleZoomTabPane(tabId, leaf.id)}
+          onEqualize={() => equalizeTabSplits(tabId)}
+          onDetach={() => detachPaneToTab(tabId, leaf.id)}
+          onClose={() => requestClosePane(tabId, leaf.id)}
+        />
+        {isSplit && !isZoomed ? (
+          <div
+            className="v3-pane-grip"
+            draggable
+            data-tauri-drag-region="false"
+            title="拖动可移动或交换此分屏；拖到顶部标签栏可拆分为独立标签"
+            onDragStart={(e) => {
+              e.stopPropagation();
+              startPaneDrag(e, { tabId, paneId: leaf.id });
+              onDraggingPaneChange(leaf.id);
+            }}
+            onDragEnd={() => {
+              endPaneDrag();
+              onDraggingPaneChange(null);
+              setDropZone(null);
+            }}
+          >
+            <GripHorizontal size={12} />
+          </div>
+        ) : null}
+        <div className="v3-pane-body">
+          {content.kind === "file" ? (
+            <PocketErrorBoundary resetKey={leaf.id} title="文件预览加载出错">
+              <FileViewer key={leaf.id} tab={content} agent={agent} embedded onHeadState={setFileHead} />
+            </PocketErrorBoundary>
+          ) : content.kind === "diff" ? (
+            <PocketErrorBoundary resetKey={leaf.id} title="差异对比加载出错">
+              <DiffTabView
+                key={leaf.id}
+                tab={{ id: leaf.id, ...content }}
+              />
+            </PocketErrorBoundary>
+          ) : content.kind === "web" ? (
+            <PocketErrorBoundary resetKey={leaf.id} title="网页加载出错">
+              <WebPane
+                key={content.webId}
+                tab={{ id: content.webId, url: content.url }}
+                active={visible}
+                layoutKey={layoutKey}
+                onChange={(patch) => updateWebPane(tabId, leaf.id, patch)}
+              />
+            </PocketErrorBoundary>
           ) : (
-            <div className="v3-pane-empty">
-              <p>这个 Agent 已经结束，或者它的电脑离线了。</p>
-              <PocketButton size="sm" variant="soft" onClick={() => requestCloseShellTab(tab)}>
-                关闭标签
-              </PocketButton>
-            </div>
+            <PocketErrorBoundary resetKey={`${content.agentKey}:${leaf.id}`} title="会话视图加载出错">
+              {agent ? (
+                <AgentDetailPanel
+                  key={agent.key}
+                  agent={agent}
+                  embedded
+                  focused={isFocused && visible}
+                  mode={mode}
+                  onModeChange={(m) => setPaneAgentMode(tabId, leaf.id, m)}
+                  onSubHeadChange={setSubHead}
+                  onBack={() => requestClosePane(tabId, leaf.id)}
+                  onOpenWorkbench={() => showPanel("files")}
+                />
+              ) : (
+                <div className="v3-pane-empty">
+                  <p>{devices[content.agentKey.split("/")[0] ?? ""]?.online === false ? "这台电脑暂时离线了。" : "这个 Agent 已经结束，或者它的电脑离线了。"}</p>
+                  <PocketButton size="sm" variant="soft" onClick={() => requestClosePane(tabId, leaf.id)}>
+                    {isSplit ? "关闭此分屏" : "关闭标签"}
+                  </PocketButton>
+                </div>
+              )}
+            </PocketErrorBoundary>
           )}
-        </PocketErrorBoundary>
-      </div>
-    </section>
+        </div>
+        {dropZone && draggingPaneId !== leaf.id ? (
+          <div className="v3-split-drop-preview" data-zone={dropZone} aria-hidden />
+        ) : null}
+      </section>
+    </div>
   );
 }
 
@@ -1071,7 +1820,15 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
   );
 }
 
-export function ShellMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; onNewAgent: () => void }) {
+export function ShellMain({
+  onNewTerminal,
+  onNewAgent,
+  onSplitNewTerminal,
+}: {
+  onNewTerminal: () => void;
+  onNewAgent: () => void;
+  onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
+}) {
   const tabs = shellStore.use((s) => s.tabs);
   const rawActive = shellStore.use((s) => s.active);
   const selectedSpace = shellStore.use((s) => s.selectedSpace);
@@ -1084,25 +1841,64 @@ export function ShellMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => 
     [activeBySpace, lookupAgent, rawActive, selectedSpace, tabs],
   );
   const active = tabs.find((t) => t.id === activeId) ?? null;
-  const fileAgent = useAgent(active?.kind === "file" ? active.agentKey : null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [draggingPaneId, setDraggingPaneId] = useState<string | null>(null);
+
+  const splitLayout = useMemo(
+    () => (active ? computeSplitLayout(tabRootNode(active), active.split?.zoomedPaneId) : null),
+    [active],
+  );
+  const focusedId = active ? focusedLeafOfTab(active).id : null;
+  const isSplit = Boolean(splitLayout && splitLayout.leaves.length > 1);
+  const zoomedId = active?.split?.zoomedPaneId ?? null;
+
+  // Keep native WebViews from inactive tabs alive in hidden containers so pages never reload on tab switch.
+  const inactiveWebLeaves = useMemo(() => {
+    const out: Array<{ tabId: string; leafId: string; webId: string; url: string }> = [];
+    for (const t of tabs) {
+      if (t.id === activeId) continue;
+      for (const leaf of tabLeaves(t)) {
+        if (leaf.content.kind === "web") {
+          out.push({ tabId: t.id, leafId: leaf.id, webId: leaf.content.webId, url: leaf.content.url });
+        }
+      }
+    }
+    return out;
+  }, [activeId, tabs]);
 
   return (
     <div className="v3-main">
-      {!active ? <EmptyMain onNewTerminal={onNewTerminal} onNewAgent={onNewAgent} /> : null}
-      {active?.kind === "agent" ? <AgentPane key={active.id} tab={active} agentKey={active.agentKey} /> : null}
-      {active?.kind === "file" ? <FilePane key={active.id} tab={active} agent={fileAgent} /> : null}
-      {active?.kind === "diff" ? <DiffPane key={active.id} tab={active} /> : null}
-      {/* Web pages stay mounted so their native views keep their pages. */}
-      {tabs.map((t) =>
-        t.kind === "web" ? (
-          <section key={t.id} className="v3-pane" aria-label={t.title} style={{ display: t.id === activeId ? undefined : "none" }}>
-            <PaneHead tab={t} agent={undefined} onClose={() => requestCloseShellTab(t)} />
-            <div className="v3-pane-body">
-              <WebPane tab={t} active={t.id === activeId} onChange={(patch) => updateWebTab(t.id, patch)} />
-            </div>
-          </section>
-        ) : null,
+      {!active || !splitLayout ? (
+        <EmptyMain onNewTerminal={onNewTerminal} onNewAgent={onNewAgent} />
+      ) : (
+        <div ref={stageRef} className="v3-split-stage">
+          {splitLayout.leaves.map((item) => (
+            <SplitPaneSlot
+              key={item.leaf.id}
+              tabId={active.id}
+              item={item}
+              isSplit={isSplit}
+              isFocused={item.leaf.id === focusedId}
+              isZoomed={zoomedId === item.leaf.id}
+              draggingPaneId={draggingPaneId}
+              onDraggingPaneChange={setDraggingPaneId}
+              onSplitNewTerminal={onSplitNewTerminal}
+            />
+          ))}
+          {splitLayout.sashes.map((sash) => (
+            <SplitSash key={sash.id} tabId={active.id} sash={sash} stageRef={stageRef} />
+          ))}
+        </div>
       )}
+      {inactiveWebLeaves.map((w) => (
+        <div key={`bg-web:${w.webId}`} style={{ display: "none" }}>
+          <WebPane
+            tab={{ id: w.webId, url: w.url }}
+            active={false}
+            onChange={(patch) => updateWebPane(w.tabId, w.leafId, patch)}
+          />
+        </div>
+      ))}
     </div>
   );
 }
@@ -1124,7 +1920,13 @@ function useFilesTarget() {
   );
   const all = useMemo(() => allAgents(agentsMap), [agentsMap]);
   const active = tabs.find((t) => t.id === activeId);
-  const tabAgentKey = active?.kind === "agent" || active?.kind === "file" ? active.agentKey : null;
+  const focusedContent = active ? focusedLeafOfTab(active).content : null;
+  const tabAgentKey =
+    focusedContent?.kind === "agent" || focusedContent?.kind === "file"
+      ? focusedContent.agentKey
+      : focusedContent?.kind === "diff"
+        ? focusedContent.agentKey ?? null
+        : null;
   const lastKeyRef = useRef<string | null>(null);
 
   const spaceExists = useMemo(() => {
@@ -1172,15 +1974,16 @@ function useGitTarget() {
   const spacesMap = liveStore.use((s) => s.spaces);
   const devices = liveStore.use((s) => s.devices);
   const active = tabs.find((t) => t.id === activeId);
+  const focusedContent = active ? focusedLeafOfTab(active).content : null;
 
   return useMemo(() => {
-    if (active?.kind === "diff") {
+    if (focusedContent?.kind === "diff") {
       return {
-        deviceId: active.deviceId,
+        deviceId: focusedContent.deviceId,
         agent: filesTarget.agent,
-        cwd: active.cwd,
-        spaceName: active.cwd.split(/[\\/]/).filter(Boolean).pop() || "",
-        spaceKey: active.spaceKey ?? selectedSpace,
+        cwd: focusedContent.cwd,
+        spaceName: focusedContent.cwd.split(/[\\/]/).filter(Boolean).pop() || "",
+        spaceKey: focusedContent.spaceKey ?? selectedSpace,
       };
     }
     if (selectedSpace) {
@@ -1228,7 +2031,7 @@ function useGitTarget() {
       }
     }
     return { deviceId: undefined, agent: undefined, cwd: undefined, spaceName: "", spaceKey: selectedSpace };
-  }, [active, devices, filesTarget, selectedSpace, spacesMap]);
+  }, [devices, filesTarget, focusedContent, selectedSpace, spacesMap]);
 }
 
 function FilesPanel({ agent, spaceName, fromSelectedSpace }: ReturnType<typeof useFilesTarget>) {
@@ -1243,7 +2046,21 @@ function FilesPanel({ agent, spaceName, fromSelectedSpace }: ReturnType<typeof u
   }
   return (
     <div className="v3-files">
-      <FileTree key={`${agent.deviceId}:${agent.cwd}`} agent={agent} onOpen={(path, name) => openFileTab(agent.key, path, name)} />
+      <FileTree
+        key={`${agent.deviceId}:${agent.cwd}`}
+        agent={agent}
+        onOpen={(path, name) => openFileTab(agent.key, path, name)}
+        onOpenSplit={(path, name, direction, absPath) =>
+          splitActivePaneWithContent(direction, {
+            kind: "file",
+            agentKey: agent.key,
+            path,
+            title: name,
+            ...(absPath ? { absPath } : {}),
+            spaceKey: shellStore.get().selectedSpace,
+          })
+        }
+      />
     </div>
   );
 }
@@ -1592,7 +2409,10 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
   useEffect(() => {
     if (realtimeReady) setVoiceSetupHint(null);
   }, [realtimeReady]);
-  const agent = useAgent(activeTab && activeTab.kind !== "web" ? (activeTab.agentKey ?? null) : null);
+  const focusedTabContent = activeTab ? focusedLeafOfTab(activeTab).content : null;
+  const agent = useAgent(
+    focusedTabContent && focusedTabContent.kind !== "web" ? (focusedTabContent.agentKey ?? null) : null,
+  );
 
   const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const blocked = all.filter((a) => listGroup(a, devices) === "blocked").length;

@@ -918,6 +918,7 @@ export function AgentDetailPanel({
   onSubHeadChange,
   mobile = false,
   embedded = false,
+  focused = true,
 }: {
   agent: Agent;
   initialTab?: "chat" | "term";
@@ -929,6 +930,8 @@ export function AgentDetailPanel({
   mobile?: boolean;
   /** Inside a v3 pane: the pane header already shows harness, title, folder, and mode switcher. */
   embedded?: boolean;
+  /** Whether this pane holds focus within a split tab. */
+  focused?: boolean;
 }) {
   const toast = useToast();
   const hostOnline = liveStore.use((s) => s.devices[agent.deviceId]?.online ?? true);
@@ -1980,6 +1983,15 @@ export function AgentDetailPanel({
   }, []);
 
   const composer = useComposerInput(composerInputValue, () => submitComposer());
+  const prevFocusedRef = useRef(focused);
+
+  useEffect(() => {
+    const wasFocused = prevFocusedRef.current;
+    prevFocusedRef.current = focused;
+    if (embedded && focused && !wasFocused && activeMode === "chat") {
+      requestAnimationFrame(() => composer.textareaRef.current?.focus());
+    }
+  }, [activeMode, composer.textareaRef, embedded, focused]);
 
   const pickSlashCommand = useCallback(
     (cmd: SlashCommandItem, allowAutoSend: boolean) => {
@@ -2019,7 +2031,7 @@ export function AgentDetailPanel({
 
   useEffect(() => {
     const onWindowPaste = (e: ClipboardEvent) => {
-      if (activeMode !== "chat") return;
+      if (activeMode !== "chat" || !focused) return;
       const root = panelRef.current;
       if (!root || root.offsetParent === null) return;
       const target = e.target as HTMLElement | null;
@@ -2034,7 +2046,7 @@ export function AgentDetailPanel({
     };
     window.addEventListener("paste", onWindowPaste);
     return () => window.removeEventListener("paste", onWindowPaste);
-  }, [activeMode, composer.textareaRef, handleFiles]);
+  }, [activeMode, composer.textareaRef, focused, handleFiles]);
 
   const onDragEnter = (e: DragEvent<HTMLDivElement>) => {
     if (activeMode !== "chat") return;
@@ -2386,7 +2398,7 @@ export function AgentDetailPanel({
       {termVisited ? (
         <div style={{ flex: 1, minHeight: 0, display: activeMode === "term" ? "flex" : "none" }}>
           <PocketErrorBoundary resetKey={`${agent.key}:${activeMode}`} title="终端视图加载出错">
-            <TerminalSurface agent={agent} active={activeMode === "term"} />
+            <TerminalSurface agent={agent} active={activeMode === "term"} focused={focused} />
           </PocketErrorBoundary>
         </div>
       ) : null}

@@ -685,6 +685,167 @@ pub(crate) struct ResolvedLocalFile {
     pub language: Option<String>,
 }
 
+fn is_ignored_workspace_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".hg"
+            | ".svn"
+            | "node_modules"
+            | ".pnpm-store"
+            | "bower_components"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | ".ruff_cache"
+            | ".tox"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".nuxt"
+            | ".svelte-kit"
+            | ".turbo"
+            | ".parcel-cache"
+            | ".cache"
+            | "coverage"
+            | "out"
+            | ".output"
+            | "vendor"
+            | "Pods"
+            | ".gradle"
+            | ".idea"
+            | "DerivedData"
+    )
+}
+
+fn find_workspace_file_by_suffix(
+    real_cwd: &std::path::Path,
+    raw_suffix: &str,
+    cfg_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    use std::collections::VecDeque;
+
+    if raw_suffix.is_empty() || raw_suffix.contains('\0') {
+        return None;
+    }
+    let normalized = raw_suffix.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if parts.is_empty() || parts.iter().any(|s| *s == ".." || is_private_local_component(s)) {
+        return None;
+    }
+    let clean_suffix = parts.join("/");
+    let lower_suffix = clean_suffix.to_ascii_lowercase();
+    let allow_hidden_dirs = parts[0].starts_with('.');
+    let real_cfg = cfg_dir.map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf()));
+
+    let mut exact_best: Option<(usize, String, std::path::PathBuf)> = None;
+    let mut ci_best: Option<(usize, String, std::path::PathBuf)> = None;
+    let mut queue: VecDeque<(std::path::PathBuf, usize)> = VecDeque::new();
+    queue.push_back((real_cwd.to_path_buf(), 0));
+
+    let max_depth = 8usize;
+    let mut visited = 0usize;
+    let max_entries = 12_000usize;
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if visited >= max_entries {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > max_entries {
+                break;
+            }
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if is_private_local_component(&name) {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let full = entry.path();
+            if ft.is_dir() {
+                if depth + 1 >= max_depth {
+                    continue;
+                }
+                if is_ignored_workspace_dir(&name) {
+                    continue;
+                }
+                if !allow_hidden_dirs && name.starts_with('.') {
+                    continue;
+                }
+                queue.push_back((full, depth + 1));
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let Ok(rel) = full.strip_prefix(real_cwd) else {
+                continue;
+            };
+            let rel_str = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let rel_lower = rel_str.to_ascii_lowercase();
+            let is_exact = rel_str == clean_suffix
+                || (rel_str.len() > clean_suffix.len()
+                    && rel_str.ends_with(&clean_suffix)
+                    && rel_str.as_bytes()[rel_str.len() - clean_suffix.len() - 1] == b'/');
+            let is_ci = is_exact
+                || (rel_lower == lower_suffix
+                    || (rel_lower.len() > lower_suffix.len()
+                        && rel_lower.ends_with(&lower_suffix)
+                        && rel_lower.as_bytes()[rel_lower.len() - lower_suffix.len() - 1] == b'/'));
+            if !is_exact && !is_ci {
+                continue;
+            }
+            let Ok(canon) = fs::canonicalize(&full) else {
+                continue;
+            };
+            if !canon.starts_with(real_cwd) {
+                continue;
+            }
+            if let Some(ref cfg) = real_cfg {
+                if canon.starts_with(cfg) {
+                    continue;
+                }
+            }
+            let comp_depth = rel_str.matches('/').count();
+            if is_exact {
+                let better = match &exact_best {
+                    None => true,
+                    Some((bd, br, _)) => comp_depth < *bd || (comp_depth == *bd && &rel_str < br),
+                };
+                if better {
+                    exact_best = Some((comp_depth, rel_str, canon));
+                }
+            } else {
+                let better = match &ci_best {
+                    None => true,
+                    Some((bd, br, _)) => comp_depth < *bd || (comp_depth == *bd && &rel_str < br),
+                };
+                if better {
+                    ci_best = Some((comp_depth, rel_str, canon));
+                }
+            }
+        }
+    }
+
+    exact_best.or(ci_best).map(|(_, _, p)| p)
+}
+
 fn resolve_safe_local_target_inner(
     cwd: Option<&str>,
     path: &str,
@@ -698,16 +859,37 @@ fn resolve_safe_local_target_inner(
         .transpose()?;
 
     let candidate = if raw_target.is_absolute() {
-        raw_target
+        raw_target.clone()
     } else if let Some(ref base) = cwd_expanded {
         base.join(&raw_target)
     } else if let Some(home) = crate::home_dir() {
         home.join(&raw_target)
     } else {
-        raw_target
+        raw_target.clone()
     };
 
-    let canon = fs::canonicalize(&candidate).map_err(|_| "没有这个文件或目录".to_string())?;
+    let canon = match fs::canonicalize(&candidate) {
+        Ok(c) => c,
+        Err(_) => {
+            if let Some(ref base_dir) = cwd_expanded {
+                let real_cwd = fs::canonicalize(base_dir)
+                    .map_err(|_| "没有这个文件或目录".to_string())?;
+                let suffix = if !raw_target.is_absolute() {
+                    raw_target.to_string_lossy().into_owned()
+                } else if let Ok(rel) = raw_target.strip_prefix(base_dir) {
+                    rel.to_string_lossy().into_owned()
+                } else if let Ok(rel) = raw_target.strip_prefix(&real_cwd) {
+                    rel.to_string_lossy().into_owned()
+                } else {
+                    return Err("没有这个文件或目录".to_string());
+                };
+                find_workspace_file_by_suffix(&real_cwd, &suffix, cfg_dir)
+                    .ok_or_else(|| "没有这个文件或目录".to_string())?
+            } else {
+                return Err("没有这个文件或目录".to_string());
+            }
+        }
+    };
     for comp in canon.components() {
         if let std::path::Component::Normal(s) = comp {
             if is_private_local_component(&s.to_string_lossy()) {
@@ -1712,6 +1894,40 @@ mod tests {
         assert!(img.base64.is_some());
 
         assert!(read_local_file_sync(Some(&dir.to_string_lossy()), ".env", None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolves_bare_filename_into_workspace_subdirectory_and_excludes_ignored_and_private() {
+        let dir = std::env::temp_dir().join(format!("hp-cmd-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+
+        std::fs::write(
+            dir.join("docs/external-delivery-sequence.html"),
+            "<!doctype html><html><body>ok</body></html>",
+        )
+        .unwrap();
+        std::fs::write(dir.join("node_modules/pkg/secret.html"), "<html>ignore</html>").unwrap();
+        std::fs::write(dir.join("secrets/.env"), "KEY=123").unwrap();
+
+        let cwd = dir.to_string_lossy().into_owned();
+        let rel_hit = read_local_file_sync(Some(&cwd), "external-delivery-sequence.html", None).unwrap();
+        assert_eq!(rel_hit.path, "docs/external-delivery-sequence.html");
+        assert!(rel_hit.text.as_deref().unwrap_or("").contains("ok"));
+
+        let synth_abs = dir
+            .join("external-delivery-sequence.html")
+            .to_string_lossy()
+            .into_owned();
+        let abs_hit = read_local_file_sync(Some(&cwd), &synth_abs, None).unwrap();
+        assert_eq!(abs_hit.path, "docs/external-delivery-sequence.html");
+
+        assert!(read_local_file_sync(Some(&cwd), "secret.html", None).is_err());
+        assert!(read_local_file_sync(Some(&cwd), ".env", None).is_err());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

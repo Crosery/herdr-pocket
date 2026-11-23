@@ -44,71 +44,72 @@ test("resolveTerminalAppearance maps system/light/dark choices accurately", () =
   assert.equal(resolveTerminalAppearance("system", true), "dark");
 });
 
-test("getTerminalThemeSpec returns Herdr.app light (#ffffff, 4.5 contrast) and dark (#16141d, 1 contrast) specs", () => {
+test("getTerminalThemeSpec returns Herdr.app Paper (#ffffff, #111214 brightWhite) and Graphite (#17191d) specs", () => {
   const light = getTerminalThemeSpec("light");
   assert.equal(light.mode, "light");
   assert.equal(light.bg, "#ffffff");
-  assert.equal(light.fg, "#1f2328");
-  assert.equal(light.cursor, "#24292f");
-  assert.equal(light.minimumContrastRatio, 4.5);
+  assert.equal(light.fg, "#25272c");
+  assert.equal(light.cursor, "#25272c");
+  assert.equal(light.minimumContrastRatio, 1);
   assert.deepEqual(light.theme, {
     background: "#ffffff",
-    foreground: "#1f2328",
-    cursor: "#24292f",
+    foreground: "#25272c",
+    cursor: "#25272c",
     cursorAccent: "#ffffff",
-    selectionBackground: "rgba(255, 126, 168, 0.22)",
-    black: "#24292f",
-    red: "#d20f39",
+    selectionBackground: "rgba(207, 220, 245, 0.78)",
+    black: "#25272c",
+    red: "#c62a2a",
     green: "#1a7f37",
-    yellow: "#b56800",
-    blue: "#1e66f5",
-    magenta: "#b8336a",
-    cyan: "#0f7b8a",
-    white: "#dce0e8",
-    brightBlack: "#6c6f85",
-    brightRed: "#e64553",
-    brightGreen: "#2da44e",
-    brightYellow: "#df8e1d",
-    brightBlue: "#3b82f6",
-    brightMagenta: "#d6409f",
-    brightCyan: "#179299",
-    brightWhite: "#eff1f5",
+    yellow: "#8f5d00",
+    blue: "#1f62d0",
+    magenta: "#7a45c8",
+    cyan: "#0f6f74",
+    white: "#5f6068",
+    brightBlack: "#7b7e87",
+    brightRed: "#d1242f",
+    brightGreen: "#1f883d",
+    brightYellow: "#9a6700",
+    brightBlue: "#0969da",
+    brightMagenta: "#8250df",
+    brightCyan: "#1b7c83",
+    brightWhite: "#111214",
   });
 
   const dark = getTerminalThemeSpec("dark");
   assert.equal(dark.mode, "dark");
-  assert.equal(dark.bg, "#16141d");
-  assert.equal(dark.fg, "#f4eef8");
-  assert.equal(dark.cursor, "#ff71a8");
+  assert.equal(dark.bg, "#17191d");
+  assert.equal(dark.fg, "#d2d4d9");
+  assert.equal(dark.cursor, "#d2d4d9");
   assert.equal(dark.minimumContrastRatio, 1);
   assert.deepEqual(dark.theme, {
-    background: "#16141d",
-    foreground: "#f4eef8",
-    cursor: "#ff71a8",
-    cursorAccent: "#16141d",
-    selectionBackground: "rgba(255, 113, 168, 0.28)",
-    black: "#252131",
-    red: "#ff6b8b",
-    green: "#6be0a6",
-    yellow: "#f6c96b",
-    blue: "#7ab8ff",
-    magenta: "#eb8eff",
-    cyan: "#6fdce8",
-    white: "#ece5f5",
-    brightBlack: "#7b7391",
-    brightRed: "#ff8ba3",
-    brightGreen: "#8eedbc",
-    brightYellow: "#ffe08f",
-    brightBlue: "#9ecbff",
-    brightMagenta: "#f3b0ff",
-    brightCyan: "#96eaf4",
-    brightWhite: "#ffffff",
+    background: "#17191d",
+    foreground: "#d2d4d9",
+    cursor: "#d2d4d9",
+    cursorAccent: "#17191d",
+    selectionBackground: "rgba(57, 68, 84, 0.72)",
+    black: "#45484f",
+    red: "#dc8c95",
+    green: "#a6bd91",
+    yellow: "#d8be87",
+    blue: "#96b2d7",
+    magenta: "#b5a2ce",
+    cyan: "#8cbdc3",
+    white: "#d2d4d9",
+    brightBlack: "#818793",
+    brightRed: "#f0a5ad",
+    brightGreen: "#bad5a2",
+    brightYellow: "#ead2a1",
+    brightBlue: "#b0cbef",
+    brightMagenta: "#cbb7e6",
+    brightCyan: "#a4d5db",
+    brightWhite: "#f0f0f2",
   });
 });
 
-test("protocol defaults use comfortable Herdr.app 14px fontSize and 132% lineHeight", () => {
+test("protocol defaults use Herdr.app 14px fontSize, 115% lineHeight, and 500 fontWeight", () => {
   assert.equal(configKeySpec("terminal.fontSize")?.default, 14);
-  assert.equal(configKeySpec("terminal.lineHeight")?.default, 132);
+  assert.equal(configKeySpec("terminal.lineHeight")?.default, 115);
+  assert.equal(configKeySpec("terminal.fontWeight")?.default, 500);
 });
 
 test("deleteKittyPlacementsScoped d=a and d=A only clear active screen buffer and preserve other buffer assets", () => {
@@ -224,38 +225,60 @@ test("TerminalSurface keeps customGlyphs enabled across both light and dark mode
   assert.equal(/customGlyphs\s*[:=]\s*(?:false|activeSpec\.mode)/.test(src), false);
 });
 
-test("TerminalSurface has zero forward references to block-scoped let/const declarations (TDZ guard)", () => {
+test("TerminalSurface subscribes to local-term://size and fonts.ts prefers 1-cell Mono Nerd fonts", () => {
+  const termSrc = readFileSync(new URL("../src/components/TerminalSurface.tsx", import.meta.url), "utf8");
+  assert.ok(termSrc.includes('"local-term://size"'), "TerminalSurface must subscribe to local-term://size");
+  const fontsSrc = readFileSync(new URL("../src/lib/fonts.ts", import.meta.url), "utf8");
+  const idxSymbolsMono = fontsSrc.indexOf('"Symbols Nerd Font Mono"');
+  const idxJbMono = fontsSrc.indexOf('"JetBrainsMono Nerd Font Mono"');
+  const idxJbProp = fontsSrc.indexOf('"JetBrainsMono Nerd Font"');
+  assert.ok(idxSymbolsMono >= 0 && idxJbMono > idxSymbolsMono && idxJbProp > idxJbMono, "Mono Nerd fonts must precede proportional JetBrainsMono Nerd Font");
+});
+
+test("Touched desktop UI & sync modules have zero forward references to block-scoped let/const declarations (TDZ guard)", () => {
   const cfgPath = new URL("../tsconfig.json", import.meta.url).pathname;
-  const termPath = new URL("../src/components/TerminalSurface.tsx", import.meta.url).pathname;
+  const targets = [
+    "../src/components/TerminalSurface.tsx",
+    "../src/shell/ShellWork.tsx",
+    "../src/shell/DesktopShell.tsx",
+    "../src/shell/herdrDoc.ts",
+    "../src/shell/herdrDocSync.ts",
+    "../src/views/WorkbenchView.tsx",
+    "../src/lib/terminalSearch.ts",
+  ];
   const cfg = ts.readConfigFile(cfgPath, ts.sys.readFile);
   const parsed = ts.parseJsonConfigFileContent(cfg.config, ts.sys, dirname(cfgPath));
   const program = ts.createProgram(parsed.fileNames, parsed.options);
   const checker = program.getTypeChecker();
-  const sf = program.getSourceFile(termPath);
-  assert.ok(sf, "TerminalSurface.tsx must exist in tsconfig program");
 
   const forwardRefs: string[] = [];
-  const visit = (node: ts.Node) => {
-    if (ts.isIdentifier(node)) {
-      const sym = checker.getSymbolAtLocation(node);
-      const decl = sym?.valueDeclaration;
-      if (
-        decl &&
-        decl.getSourceFile() === sf &&
-        ts.isVariableDeclaration(decl) &&
-        decl.parent &&
-        ts.isVariableDeclarationList(decl.parent) &&
-        (decl.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
-        node.pos < decl.pos
-      ) {
-        const refPos = sf.getLineAndCharacterOfPosition(node.getStart());
-        const declPos = sf.getLineAndCharacterOfPosition(decl.getStart());
-        forwardRefs.push(`line ${refPos.line + 1} refs "${node.text}" before decl at line ${declPos.line + 1}`);
+  for (const rel of targets) {
+    const absPath = new URL(rel, import.meta.url).pathname;
+    const sf = program.getSourceFile(absPath);
+    assert.ok(sf, `${rel} must exist in tsconfig program`);
+
+    const visit = (node: ts.Node) => {
+      if (ts.isIdentifier(node)) {
+        const sym = checker.getSymbolAtLocation(node);
+        const decl = sym?.valueDeclaration;
+        if (
+          decl &&
+          decl.getSourceFile() === sf &&
+          ts.isVariableDeclaration(decl) &&
+          decl.parent &&
+          ts.isVariableDeclarationList(decl.parent) &&
+          (decl.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0 &&
+          node.pos < decl.pos
+        ) {
+          const refPos = sf.getLineAndCharacterOfPosition(node.getStart());
+          const declPos = sf.getLineAndCharacterOfPosition(decl.getStart());
+          forwardRefs.push(`${rel}:${refPos.line + 1} refs "${node.text}" before decl at line ${declPos.line + 1}`);
+        }
       }
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
 
   assert.deepEqual(forwardRefs, [], `Found TDZ forward references:\n${forwardRefs.join("\n")}`);
 });

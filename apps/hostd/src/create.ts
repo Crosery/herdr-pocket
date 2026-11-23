@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { HERDR_COMMANDS, type HerdrCommand, type LaunchOption, type SpaceInfo } from "@herdr-pocket/protocol";
+import { HERDR_COMMANDS, type HerdrCommand, type HerdrDoc, type LaunchOption, type SpaceInfo } from "@herdr-pocket/protocol";
 import type { AppNames, AppTerminalMeta, HcTerminal } from "./hc.ts";
 import { IS_WINDOWS, onPath, programName, windowsBins } from "./platform.ts";
 import { base, run } from "./util.ts";
@@ -249,7 +249,7 @@ function defaultDocsJsonPath(): string {
   return join(state, "herdr-core", "default", "docs.json");
 }
 
-function collectTerminalIdsFromRoot(node: unknown, out: string[] = []): string[] {
+export function collectTerminalIdsFromRoot(node: unknown, out: string[] = []): string[] {
   if (!node || typeof node !== "object") return out;
   if (Array.isArray(node)) {
     for (const item of node) collectTerminalIdsFromRoot(item, out);
@@ -393,6 +393,21 @@ export class HerdrApp {
       // ignore missing/invalid docs.json
     }
     return out;
+  }
+
+  /** Reads persisted `"herdr-app"` doc and CAS version from `docs.json` when available. */
+  readHerdrDocFromDisk(): { value: HerdrDoc | null; version: number } | null {
+    try {
+      const raw = JSON.parse(readFileSync(this.docsJsonPath, "utf8")) as Record<string, any>;
+      const entry = raw?.["herdr-app"] ?? raw?.docs?.["herdr-app"];
+      if (!entry || typeof entry !== "object") return null;
+      const val = entry.value;
+      const doc = val && typeof val === "object" && Array.isArray(val.spaces) ? (val as HerdrDoc) : null;
+      const version = Number(entry.version ?? 0);
+      return { value: doc, version: Number.isFinite(version) ? version : 0 };
+    } catch {
+      return null;
+    }
   }
 
   /** Reads spaces, order, folders, and colors directly from Herdr's persisted docs.json + shared.json. */

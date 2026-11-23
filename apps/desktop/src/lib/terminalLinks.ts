@@ -1,4 +1,4 @@
-import { looksLikeClickableFilePath } from "./openFileTarget";
+import { looksLikeClickableFilePath, splitFileLineSuffix } from "./openFileTarget";
 
 export interface TerminalBufferCellLike {
   getChars(): string;
@@ -292,4 +292,64 @@ export function findWordSelectionAtCell(
 /** Reads the full wrapped logical line containing `absRow0` as plain text. */
 export function readLogicalLineText(buf: TerminalBufferLike, absRow0: number): string {
   return collectLogicalParagraph(buf, absRow0)?.text ?? "";
+}
+
+function normalizeMatchPath(raw: string): string {
+  return raw.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+/**
+ * Resolves a bare filename or relative suffix clicked in terminal output (e.g.
+ * `external-delivery-sequence.html`) to the nearest longer path mentioning it
+ * in recent scrollback (e.g. `docs/external-delivery-sequence.html`), preserving `#L` / `:line`.
+ */
+export function resolveBareTerminalFileLink(
+  buf: TerminalBufferLike,
+  rawTarget: string,
+  fromRow0?: number,
+  maxLookbackLines = 400,
+): string {
+  const trimmed = rawTarget.trim();
+  if (!trimmed) return rawTarget;
+  if (/^(?:file:\/\/|https?:\/\/|mailto:|\/|~\/|\.\.\/|[A-Za-z]:[\\/])/i.test(trimmed)) {
+    return rawTarget;
+  }
+  const { target, suffix } = splitFileLineSuffix(trimmed);
+  const norm = normalizeMatchPath(target).replace(/\/+$/, "");
+  if (!norm || norm === "." || norm === ".." || norm.includes("/")) return rawTarget;
+
+  const endRow = Math.min(buf.length - 1, fromRow0 ?? buf.length - 1);
+  if (endRow < 0) return rawTarget;
+  const minRow = Math.max(0, endRow - Math.max(1, maxLookbackLines));
+
+  const lowerSuffix = `/${norm.toLowerCase()}`;
+  const exactSuffix = `/${norm}`;
+  let caseInsensitiveHit: string | null = null;
+
+  let row = endRow;
+  while (row >= minRow) {
+    const para = collectLogicalParagraph(buf, row);
+    if (!para) {
+      row -= 1;
+      continue;
+    }
+    const links = extractLinksFromParagraph(para);
+    for (let i = links.length - 1; i >= 0; i--) {
+      const item = links[i]!;
+      if (item.kind !== "file") continue;
+      const candTargetRaw = splitFileLineSuffix(item.text).target;
+      if (/^file:\/\//i.test(candTargetRaw)) continue;
+      const candNorm = normalizeMatchPath(candTargetRaw).replace(/\/+$/, "");
+      if (candNorm.length <= norm.length) continue;
+      if (candNorm.endsWith(exactSuffix)) {
+        return `${candTargetRaw}${suffix}`;
+      }
+      if (!caseInsensitiveHit && candNorm.toLowerCase().endsWith(lowerSuffix)) {
+        caseInsensitiveHit = `${candTargetRaw}${suffix}`;
+      }
+    }
+    row = para.startRow - 1;
+  }
+
+  return caseInsensitiveHit ?? rawTarget;
 }

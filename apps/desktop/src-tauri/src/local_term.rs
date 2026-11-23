@@ -9,11 +9,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter};
 
 const KIND_DATA: u8 = 0;
@@ -58,6 +59,14 @@ struct DataEvent {
 #[serde(rename_all = "camelCase")]
 struct CloseEvent {
     id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SizeEvent {
+    terminal: String,
+    cols: u16,
+    rows: u16,
 }
 
 pub fn encode_frame(channel: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -154,14 +163,20 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+struct RpcErr {
+    kind: Option<String>,
+    message: String,
+}
+
 enum ReplyTarget {
-    Channel0(std::sync::mpsc::Sender<Result<Value, String>>),
+    Channel0(mpsc::Sender<Result<Value, RpcErr>>),
 }
 
 struct Attachment {
     channel: u32,
     consumed: usize,
     automatic_input: bool,
+    sink: Option<Channel<InvokeResponseBody>>,
 }
 
 struct PreattachedChannel {
@@ -180,10 +195,11 @@ struct EarlyBuffer {
 }
 
 struct SharedState {
-    stdin: ChildStdin,
+    writer: mpsc::Sender<Vec<u8>>,
     child: Child,
     next_id: u64,
     replies: HashMap<u64, ReplyTarget>,
+    events_channel: Option<u32>,
     by_channel: HashMap<u32, String>,
     by_id: HashMap<String, Attachment>,
     preattached: HashMap<String, PreattachedChannel>,
@@ -193,14 +209,97 @@ struct SharedState {
 }
 
 impl SharedState {
-    fn write_frame(&mut self, channel: u32, kind: u8, payload: &[u8]) -> Result<(), String> {
+    fn write_frame(&self, channel: u32, kind: u8, payload: &[u8]) -> Result<(), String> {
+        if !self.alive {
+            return Err("hc connect 已退出".into());
+        }
         let bytes = encode_frame(channel, kind, payload);
-        self.stdin
-            .write_all(&bytes)
-            .map_err(|e| format!("hc stdin write failed: {e}"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("hc stdin flush failed: {e}"))
+        self.writer
+            .send(bytes)
+            .map_err(|_| "hc 写入线程已关闭".to_string())
+    }
+}
+
+fn parse_size_event(msg: &Value) -> Option<SizeEvent> {
+    if msg.get("method").and_then(Value::as_str) != Some("event") {
+        return None;
+    }
+    if msg.pointer("/params/type").and_then(Value::as_str) != Some("size") {
+        return None;
+    }
+    let terminal = msg
+        .pointer("/params/terminal")
+        .and_then(Value::as_str)?
+        .trim();
+    if terminal.is_empty() {
+        return None;
+    }
+    let cols = msg
+        .pointer("/params/data/cols")
+        .and_then(Value::as_u64)
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|&c| c > 0)?;
+    let rows = msg
+        .pointer("/params/data/rows")
+        .and_then(Value::as_u64)
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|&r| r > 0)?;
+    Some(SizeEvent {
+        terminal: terminal.to_string(),
+        cols,
+        rows,
+    })
+}
+
+fn process_event_lines(buf: &mut Vec<u8>, bytes: &[u8], app: &AppHandle) {
+    buf.extend_from_slice(bytes);
+    let mut consumed = 0usize;
+    let mut emit_doc = false;
+    let mut emit_terms = false;
+    let mut size_events: Vec<SizeEvent> = Vec::new();
+    for (i, b) in buf.iter().enumerate() {
+        if *b != b'\n' {
+            continue;
+        }
+        if let Ok(msg) = serde_json::from_slice::<Value>(&buf[consumed..i]) {
+            match msg.get("method").and_then(Value::as_str) {
+                Some("missed") => {
+                    emit_doc = true;
+                    emit_terms = true;
+                }
+                Some("event") => {
+                    match msg.pointer("/params/type").and_then(Value::as_str) {
+                        Some("doc") => emit_doc = true,
+                        Some("size") => {
+                            if let Some(ev) = parse_size_event(&msg) {
+                                size_events.push(ev);
+                            }
+                        }
+                        Some("created" | "restarted" | "finished" | "lost" | "removed" | "status" | "turn" | "labels") => {
+                            emit_terms = true;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        consumed = i + 1;
+    }
+    if consumed > 0 {
+        buf.drain(..consumed);
+    }
+    if buf.len() > 2 * 1024 * 1024 {
+        buf.clear();
+    }
+    if emit_doc {
+        let _ = app.emit("local-term://doc-changed", json!({}));
+    }
+    if emit_terms {
+        let _ = app.emit("local-term://terminals-changed", json!({}));
+    }
+    for ev in size_events {
+        let _ = app.emit("local-term://size", ev);
     }
 }
 
@@ -267,11 +366,33 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                 .any(|f| f.as_str() == Some("automatic_input"))
         });
 
+    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
+    thread::Builder::new()
+        .name("hc-framed-writer".into())
+        .spawn(move || {
+            let mut stdin = stdin;
+            while let Ok(first) = writer_rx.recv() {
+                if stdin.write_all(&first).is_err() {
+                    break;
+                }
+                while let Ok(more) = writer_rx.try_recv() {
+                    if stdin.write_all(&more).is_err() {
+                        return;
+                    }
+                }
+                if stdin.flush().is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| format!("无法创建 hc 写入线程: {e}"))?;
+
     let state = Arc::new(Mutex::new(SharedState {
-        stdin,
+        writer: writer_tx,
         child,
         next_id: 1,
         replies: HashMap::new(),
+        events_channel: None,
         by_channel: HashMap::new(),
         by_id: HashMap::new(),
         preattached: HashMap::new(),
@@ -291,6 +412,8 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
         .spawn(move || {
             let mut hdr = [0u8; HEADER_LEN];
             let mut apc_parsers: HashMap<u32, ChannelApcStream> = HashMap::new();
+            let mut events_buf: Vec<u8> = Vec::new();
+            let mut events_consumed: usize = 0;
             loop {
                 if reader.read_exact(&mut hdr).is_err() {
                     break;
@@ -331,14 +454,42 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                                 let target = state.lock().ok().and_then(|mut s| s.replies.remove(&id));
                                 if let Some(ReplyTarget::Channel0(tx)) = target {
-                                    if let Some(err) = msg.pointer("/error/message").and_then(Value::as_str) {
-                                        let _ = tx.send(Err(err.to_string()));
+                                    if let Some(err_obj) = msg.get("error").filter(|v| !v.is_null()) {
+                                        let message = err_obj
+                                            .get("message")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("core call failed")
+                                            .to_string();
+                                        let kind = err_obj
+                                            .pointer("/data/kind")
+                                            .and_then(Value::as_str)
+                                            .map(ToString::to_string);
+                                        let _ = tx.send(Err(RpcErr { kind, message }));
                                     } else {
                                         let _ = tx.send(Ok(msg.get("result").cloned().unwrap_or(Value::Null)));
                                     }
                                 }
                             }
                         }
+                    }
+                    continue;
+                }
+
+                let is_events = state
+                    .lock()
+                    .ok()
+                    .is_some_and(|s| s.events_channel == Some(channel));
+                if is_events {
+                    if kind == KIND_DATA {
+                        events_consumed += payload.len();
+                        if events_consumed >= 256 * 1024 {
+                            let ack = events_consumed as u32;
+                            events_consumed = 0;
+                            if let Ok(s) = state.lock() {
+                                let _ = s.write_frame(channel, KIND_CREDIT, &ack.to_le_bytes());
+                            }
+                        }
+                        process_event_lines(&mut events_buf, &payload, &app_clone);
                     }
                     continue;
                 }
@@ -356,8 +507,8 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                 };
 
                 enum Action {
-                    EmitData(String, Vec<u8>, Option<usize>),
-                    EmitClose(String),
+                    EmitData(String, Vec<u8>, Option<usize>, Option<Channel<InvokeResponseBody>>),
+                    EmitClose(String, Option<Channel<InvokeResponseBody>>),
                     None,
                 }
                 let action = {
@@ -386,22 +537,27 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                     if let Some(att_id) = s.by_channel.get(&channel).cloned() {
                         match kind {
                             KIND_DATA => {
-                                let credit_ack = s.by_id.get_mut(&att_id).and_then(|att| {
-                                    att.consumed += raw_len;
-                                    if att.consumed >= CREDIT_ACK_STEP {
-                                        let ack = att.consumed;
-                                        att.consumed = 0;
-                                        Some(ack)
-                                    } else {
-                                        None
-                                    }
-                                });
-                                Action::EmitData(att_id, out_payload, credit_ack)
+                                let (credit_ack, sink) = s
+                                    .by_id
+                                    .get_mut(&att_id)
+                                    .map(|att| {
+                                        att.consumed += raw_len;
+                                        let ack = if att.consumed >= CREDIT_ACK_STEP {
+                                            let a = att.consumed;
+                                            att.consumed = 0;
+                                            Some(a)
+                                        } else {
+                                            None
+                                        };
+                                        (ack, att.sink.clone())
+                                    })
+                                    .unwrap_or((None, None));
+                                Action::EmitData(att_id, out_payload, credit_ack, sink)
                             }
                             KIND_CLOSE => {
                                 s.by_channel.remove(&channel);
-                                s.by_id.remove(&att_id);
-                                Action::EmitClose(att_id)
+                                let sink = s.by_id.remove(&att_id).and_then(|att| att.sink);
+                                Action::EmitClose(att_id, sink)
                             }
                             _ => Action::None,
                         }
@@ -421,45 +577,59 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
                 };
 
                 match action {
-                    Action::EmitData(id, bytes, credit_ack) => {
+                    Action::EmitData(id, bytes, credit_ack, sink) => {
                         if let Some(ack) = credit_ack {
-                            if let Ok(mut s) = state.lock() {
+                            if let Ok(s) = state.lock() {
                                 let _ = s.write_frame(channel, KIND_CREDIT, &(ack as u32).to_le_bytes());
                             }
                         }
                         if !bytes.is_empty() {
-                            let _ = app_clone.emit(
-                                "local-term://data",
-                                DataEvent {
-                                    id,
-                                    data: base64_encode(&bytes),
-                                },
-                            );
+                            if let Some(ch) = sink {
+                                let _ = ch.send(InvokeResponseBody::Raw(bytes));
+                            } else {
+                                let _ = app_clone.emit(
+                                    "local-term://data",
+                                    DataEvent {
+                                        id,
+                                        data: base64_encode(&bytes),
+                                    },
+                                );
+                            }
                         }
                     }
-                    Action::EmitClose(id) => {
+                    Action::EmitClose(id, sink) => {
+                        if let Some(ch) = sink {
+                            let _ = ch.send(InvokeResponseBody::Raw(Vec::new()));
+                        }
                         let _ = app_clone.emit("local-term://close", CloseEvent { id });
                     }
                     Action::None => {}
                 }
             }
 
-            let closed_ids: Vec<String> = {
+            let closed_entries: Vec<(String, Option<Channel<InvokeResponseBody>>)> = {
                 if let Ok(mut s) = state.lock() {
                     s.alive = false;
                     for (_, target) in s.replies.drain() {
                         let ReplyTarget::Channel0(tx) = target;
-                        let _ = tx.send(Err("hc connect 已断开".into()));
+                        let _ = tx.send(Err(RpcErr {
+                            kind: None,
+                            message: "hc connect 已断开".into(),
+                        }));
                     }
+                    s.events_channel = None;
                     s.by_channel.clear();
                     s.preattached.clear();
                     s.early.clear();
-                    s.by_id.drain().map(|(id, _)| id).collect()
+                    s.by_id.drain().map(|(id, att)| (id, att.sink)).collect()
                 } else {
                     Vec::new()
                 }
             };
-            for id in closed_ids {
+            for (id, sink) in closed_entries {
+                if let Some(ch) = sink {
+                    let _ = ch.send(InvokeResponseBody::Raw(Vec::new()));
+                }
                 let _ = app_clone.emit("local-term://close", CloseEvent { id });
             }
             if let Some(strong) = weak_handle.upgrade() {
@@ -472,6 +642,38 @@ fn spawn_client(app: &AppHandle) -> Result<Arc<ClientHandle>, String> {
             let _ = state.lock().map(|mut s| s.child.kill());
         })
         .map_err(|e| format!("无法创建 hc 读取线程: {e}"))?;
+
+    let sub_handle = Arc::clone(&handle);
+    let _ = thread::Builder::new()
+        .name("hc-events-sub".into())
+        .spawn(move || {
+            let Ok(res) = call_channel0(&sub_handle, "events.subscribe", json!({})) else {
+                return;
+            };
+            let Some(ch) = res
+                .get("channel")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+            else {
+                return;
+            };
+            let early = if let Ok(mut s) = sub_handle.state.lock() {
+                s.events_channel = Some(ch);
+                let drained = s.early.remove(&ch).map(|b| b.frames).unwrap_or_default();
+                let _ = s.write_frame(ch, KIND_CREDIT, &(1024u32 * 1024u32).to_le_bytes());
+                drained
+            } else {
+                Vec::new()
+            };
+            if !early.is_empty() {
+                let mut early_buf = Vec::new();
+                for (k, bytes) in early {
+                    if k == KIND_DATA {
+                        process_event_lines(&mut early_buf, &bytes, &sub_handle.app);
+                    }
+                }
+            }
+        });
 
     Ok(handle)
 }
@@ -527,15 +729,21 @@ fn expand_local_cwd(raw: Option<&str>) -> Result<String, String> {
     Ok(canon.to_string_lossy().into_owned())
 }
 
-fn call_channel0(client: &ClientHandle, method: &str, params: Value) -> Result<Value, String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let req_bytes = {
+fn call_channel0_rpc(client: &ClientHandle, method: &str, params: Value) -> Result<Value, RpcErr> {
+    let (tx, rx) = mpsc::channel();
+    let req_id = {
         let mut s = client
             .state
             .lock()
-            .map_err(|_| "hc state lock poisoned".to_string())?;
+            .map_err(|_| RpcErr {
+                kind: None,
+                message: "hc state lock poisoned".to_string(),
+            })?;
         if !s.alive {
-            return Err("hc connect 已退出".into());
+            return Err(RpcErr {
+                kind: None,
+                message: "hc connect 已退出".into(),
+            });
         }
         let id = s.next_id;
         s.next_id += 1;
@@ -546,10 +754,16 @@ fn call_channel0(client: &ClientHandle, method: &str, params: Value) -> Result<V
             "method": method,
             "params": params,
         }))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| RpcErr {
+            kind: None,
+            message: e.to_string(),
+        })?;
         if let Err(err) = s.write_frame(0, KIND_DATA, &payload) {
             s.replies.remove(&id);
-            return Err(err);
+            return Err(RpcErr {
+                kind: None,
+                message: err,
+            });
         }
         id
     };
@@ -557,11 +771,18 @@ fn call_channel0(client: &ClientHandle, method: &str, params: Value) -> Result<V
         Ok(res) => res,
         Err(_) => {
             if let Ok(mut s) = client.state.lock() {
-                s.replies.remove(&req_bytes);
+                s.replies.remove(&req_id);
             }
-            Err(format!("{method}: 等待 hc 响应超时"))
+            Err(RpcErr {
+                kind: None,
+                message: format!("{method}: 等待 hc 响应超时"),
+            })
         }
     }
+}
+
+fn call_channel0(client: &ClientHandle, method: &str, params: Value) -> Result<Value, String> {
+    call_channel0_rpc(client, method, params).map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -572,6 +793,8 @@ pub async fn local_term_create_shell(
     rows: u16,
     display: Option<Value>,
     space_name: Option<String>,
+    space_id: Option<String>,
+    argv: Option<Vec<String>>,
 ) -> Result<LocalCreateShellResult, String> {
     let c = clamp_cols(cols);
     let r = clamp_rows(rows);
@@ -585,8 +808,18 @@ pub async fn local_term_create_shell(
         params.insert("size".into(), json!({ "cols": c, "rows": r }));
         params.insert("keep".into(), json!(true));
         params.insert("no_parent".into(), json!(true));
+        if let Some(args) = argv.filter(|v| !v.is_empty()) {
+            params.insert("argv".into(), json!(args));
+        }
+        let mut labels = serde_json::Map::new();
         if let Some(sp) = space_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            params.insert("labels".into(), json!({ "where": sp }));
+            labels.insert("where".into(), json!(sp));
+        }
+        if let Some(sid) = space_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            labels.insert("herdr.space".into(), json!(sid));
+        }
+        if !labels.is_empty() {
+            params.insert("labels".into(), Value::Object(labels));
         }
         if let Some(ref d) = sanitized_display {
             params.insert("display".into(), d.clone());
@@ -698,10 +931,13 @@ pub async fn local_term_attach(
     rows: u16,
     history: u32,
     display: Option<Value>,
+    on_data: Channel<InvokeResponseBody>,
 ) -> Result<LocalAttachResult, String> {
     let c = clamp_cols(cols);
     let r = clamp_rows(rows);
     let sanitized_display = sanitize_display(display.as_ref());
+    let sink_for_live = Some(on_data.clone());
+    let sink_for_early = Some(on_data);
     tauri::async_runtime::spawn_blocking(move || {
         let client = ensure_client(&app)?;
 
@@ -733,6 +969,7 @@ pub async fn local_term_attach(
                             channel: pre.channel,
                             consumed,
                             automatic_input: pre.automatic_input,
+                            sink: sink_for_live.clone(),
                         },
                     );
                     if let Some(ref d) = sanitized_display {
@@ -806,6 +1043,7 @@ pub async fn local_term_attach(
                         channel,
                         consumed: 0,
                         automatic_input,
+                        sink: sink_for_live,
                     },
                 );
                 let drained = s
@@ -824,13 +1062,17 @@ pub async fn local_term_attach(
         for (kind, payload) in early_frames {
             match kind {
                 KIND_DATA if !payload.is_empty() => {
-                    let _ = client.app.emit(
-                        "local-term://data",
-                        DataEvent {
-                            id: id.clone(),
-                            data: base64_encode(&payload),
-                        },
-                    );
+                    if let Some(ref ch) = sink_for_early {
+                        let _ = ch.send(InvokeResponseBody::Raw(payload));
+                    } else {
+                        let _ = client.app.emit(
+                            "local-term://data",
+                            DataEvent {
+                                id: id.clone(),
+                                data: base64_encode(&payload),
+                            },
+                        );
+                    }
                 }
                 KIND_CLOSE => {
                     closed = true;
@@ -842,6 +1084,9 @@ pub async fn local_term_attach(
             if let Ok(mut s) = client.state.lock() {
                 s.by_channel.remove(&channel);
                 s.by_id.remove(&id);
+            }
+            if let Some(ref ch) = sink_for_early {
+                let _ = ch.send(InvokeResponseBody::Raw(Vec::new()));
             }
             let _ = client.app.emit("local-term://close", CloseEvent { id });
         }
@@ -861,29 +1106,25 @@ pub async fn local_term_input(id: String, data: String) -> Result<(), String> {
     if data.is_empty() {
         return Ok(());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = {
-            let guard = global_client()
-                .lock()
-                .map_err(|_| "local_term lock poisoned".to_string())?;
-            guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| "本地终端未连接".to_string())?
-        };
-        let mut s = client
-            .state
+    let client = {
+        let guard = global_client()
             .lock()
-            .map_err(|_| "hc state lock poisoned".to_string())?;
-        let ch = s
-            .by_id
-            .get(&id)
-            .map(|a| a.channel)
-            .ok_or_else(|| "本地终端通道已关闭".to_string())?;
-        s.write_frame(ch, KIND_DATA, data.as_bytes())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+            .map_err(|_| "local_term lock poisoned".to_string())?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "本地终端未连接".to_string())?
+    };
+    let s = client
+        .state
+        .lock()
+        .map_err(|_| "hc state lock poisoned".to_string())?;
+    let ch = s
+        .by_id
+        .get(&id)
+        .map(|a| a.channel)
+        .ok_or_else(|| "本地终端通道已关闭".to_string())?;
+    s.write_frame(ch, KIND_DATA, data.as_bytes())
 }
 
 #[tauri::command]
@@ -896,58 +1137,50 @@ pub async fn local_term_resize(
     let c = clamp_cols(cols);
     let r = clamp_rows(rows);
     let sanitized_display = sanitize_display(display.as_ref());
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = {
-            let guard = global_client()
-                .lock()
-                .map_err(|_| "local_term lock poisoned".to_string())?;
-            guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| "本地终端未连接".to_string())?
-        };
-        let mut s = client
-            .state
+    let client = {
+        let guard = global_client()
             .lock()
-            .map_err(|_| "hc state lock poisoned".to_string())?;
-        let Some(ch) = s.by_id.get(&id).map(|a| a.channel) else {
-            return Ok(());
-        };
-        if let Some(d) = sanitized_display {
-            if let Ok(bytes) = serde_json::to_vec(&d) {
-                s.write_frame(ch, KIND_FACTS, &bytes)?;
-            }
+            .map_err(|_| "local_term lock poisoned".to_string())?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "本地终端未连接".to_string())?
+    };
+    let s = client
+        .state
+        .lock()
+        .map_err(|_| "hc state lock poisoned".to_string())?;
+    let Some(ch) = s.by_id.get(&id).map(|a| a.channel) else {
+        return Ok(());
+    };
+    if let Some(d) = sanitized_display {
+        if let Ok(bytes) = serde_json::to_vec(&d) {
+            s.write_frame(ch, KIND_FACTS, &bytes)?;
         }
-        let size = encode_resize_payload(c, r);
-        s.write_frame(ch, KIND_RESIZE, &size)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    }
+    let size = encode_resize_payload(c, r);
+    s.write_frame(ch, KIND_RESIZE, &size)
 }
 
 #[tauri::command]
 pub async fn local_term_focus(id: String, focused: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = {
-            let Ok(guard) = global_client().lock() else {
-                return Ok(());
-            };
-            match guard.as_ref().cloned() {
-                Some(c) => c,
-                None => return Ok(()),
-            }
-        };
-        let mut s = client
-            .state
-            .lock()
-            .map_err(|_| "hc state lock poisoned".to_string())?;
-        let Some(ch) = s.by_id.get(&id).map(|a| a.channel) else {
+    let client = {
+        let Ok(guard) = global_client().lock() else {
             return Ok(());
         };
-        s.write_frame(ch, KIND_FOCUS, &[u8::from(focused)])
-    })
-    .await
-    .map_err(|e| e.to_string())?
+        match guard.as_ref().cloned() {
+            Some(c) => c,
+            None => return Ok(()),
+        }
+    };
+    let s = client
+        .state
+        .lock()
+        .map_err(|_| "hc state lock poisoned".to_string())?;
+    let Some(ch) = s.by_id.get(&id).map(|a| a.channel) else {
+        return Ok(());
+    };
+    s.write_frame(ch, KIND_FOCUS, &[u8::from(focused)])
 }
 
 #[tauri::command]
@@ -955,31 +1188,89 @@ pub async fn local_term_auto_input(id: String, data: String) -> Result<(), Strin
     if data.is_empty() {
         return Ok(());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = {
-            let guard = global_client()
-                .lock()
-                .map_err(|_| "local_term lock poisoned".to_string())?;
-            guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| "本地终端未连接".to_string())?
-        };
-        let mut s = client
-            .state
+    let client = {
+        let guard = global_client()
             .lock()
-            .map_err(|_| "hc state lock poisoned".to_string())?;
-        let att = s
-            .by_id
-            .get(&id)
-            .ok_or_else(|| "本地终端通道已关闭".to_string())?;
-        let ch = att.channel;
-        let kind = if att.automatic_input {
-            KIND_AUTOMATIC_INPUT
-        } else {
-            KIND_DATA
-        };
-        s.write_frame(ch, kind, data.as_bytes())
+            .map_err(|_| "local_term lock poisoned".to_string())?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "本地终端未连接".to_string())?
+    };
+    let s = client
+        .state
+        .lock()
+        .map_err(|_| "hc state lock poisoned".to_string())?;
+    let att = s
+        .by_id
+        .get(&id)
+        .ok_or_else(|| "本地终端通道已关闭".to_string())?;
+    let ch = att.channel;
+    let kind = if att.automatic_input {
+        KIND_AUTOMATIC_INPUT
+    } else {
+        KIND_DATA
+    };
+    s.write_frame(ch, kind, data.as_bytes())
+}
+
+#[tauri::command]
+pub async fn local_term_kill(app: AppHandle, terminal: String) -> Result<(), String> {
+    let target = terminal.trim().to_string();
+    if target.is_empty() {
+        return Err("terminal 不能为空".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = ensure_client(&app)?;
+        call_channel0(&client, "terminal.kill", json!({ "terminal": target }))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn local_herdr_doc_get(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = ensure_client(&app)?;
+        let res = call_channel0(&client, "doc.get", json!({ "name": "herdr-app" }))?;
+        Ok(json!({
+            "value": res.get("value").cloned().unwrap_or(Value::Null),
+            "version": res.get("version").and_then(Value::as_u64).unwrap_or(0),
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn local_herdr_doc_set(app: AppHandle, value: Value, version: u64) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = ensure_client(&app)?;
+        match call_channel0_rpc(
+            &client,
+            "doc.set",
+            json!({ "name": "herdr-app", "value": value, "version": version }),
+        ) {
+            Ok(res) => Ok(json!({
+                "ok": true,
+                "version": res.get("version").and_then(Value::as_u64).unwrap_or(version + 1),
+            })),
+            Err(err)
+                if err.kind.as_deref() == Some("conflict")
+                    || err.message.to_ascii_lowercase().contains("conflict") =>
+            {
+                let fresh = call_channel0(&client, "doc.get", json!({ "name": "herdr-app" }))
+                    .unwrap_or_else(|_| json!({ "value": Value::Null, "version": 0 }));
+                Ok(json!({
+                    "ok": false,
+                    "conflict": true,
+                    "value": fresh.get("value").cloned().unwrap_or(Value::Null),
+                    "version": fresh.get("version").and_then(Value::as_u64).unwrap_or(0),
+                }))
+            }
+            Err(err) => Err(err.message),
+        }
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2734,5 +3025,33 @@ mod tests {
         assert!(get_mem_image(extra).is_some());
         assert!(get_mem_image(first).is_some(), "MRU entry must survive eviction");
         assert!(get_mem_image(ids[1]).is_none(), "LRU entry must be evicted at cap");
+    }
+
+    #[test]
+    fn parse_size_event_extracts_valid_terminal_dimensions() {
+        use super::parse_size_event;
+        use serde_json::json;
+
+        let valid = json!({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": { "type": "size", "terminal": "t1bf", "data": { "cols": 120, "rows": 40 } }
+        });
+        let parsed = parse_size_event(&valid).expect("valid size event should parse");
+        assert_eq!(parsed.terminal, "t1bf");
+        assert_eq!(parsed.cols, 120);
+        assert_eq!(parsed.rows, 40);
+
+        let zero_rows = json!({
+            "method": "event",
+            "params": { "type": "size", "terminal": "t1bf", "data": { "cols": 120, "rows": 0 } }
+        });
+        assert!(parse_size_event(&zero_rows).is_none());
+
+        let other_type = json!({
+            "method": "event",
+            "params": { "type": "doc", "terminal": "t1bf", "data": { "cols": 120, "rows": 40 } }
+        });
+        assert!(parse_size_event(&other_type).is_none());
     }
 }

@@ -4,7 +4,7 @@ import { native, type FontCatalog, type FontFaceMeta } from "./native";
 import { createStore } from "./store";
 
 const BASE_FALLBACK_FONTS =
-  'ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Monaco, "Cascadia Mono", Consolas';
+  '"JetBrains Mono", "Symbols Nerd Font Mono", "JetBrainsMono Nerd Font Mono", "JetBrainsMono Nerd Font", "Pocket Maple Mono", "SF Mono", Menlo, Monaco, ui-monospace, "Cascadia Mono", Consolas';
 const CJK_FALLBACK_FONTS = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei"';
 
 const GENERIC_FAMILIES = new Set([
@@ -105,6 +105,9 @@ export async function ensureFontCatalog(): Promise<FontCatalog | null> {
         }
         if (catalog.herdrFont) {
           void loadSingleFontFamily(catalog.herdrFont, false);
+        }
+        if (catalog.families.some((f) => f.toLowerCase() === "jetbrains mono")) {
+          void loadSingleFontFamily("JetBrains Mono", false);
         }
       }
       return catalog;
@@ -233,6 +236,7 @@ async function loadSingleFontFamily(family: string, preferBold: boolean): Promis
       const isNormal = face.style !== "italic";
       const isCoreWeight =
         face.weight === 400 ||
+        face.weight === 500 ||
         face.weight === 700 ||
         (preferBold && face.weight >= 500 && face.weight <= 800);
       if (isNormal && isCoreWeight) {
@@ -286,8 +290,16 @@ export async function ensureTerminalFontLoaded(customFamily: string, preferBold 
 
   const catalog = await ensureFontCatalog();
   const families = splitFontFamilies(customFamily);
-  if (families.length === 0 && catalog?.herdrFont) {
-    families.push(catalog.herdrFont);
+  if (families.length === 0) {
+    if (catalog?.herdrFont) {
+      families.push(catalog.herdrFont);
+    }
+    if (
+      catalog?.families.some((f) => f.toLowerCase() === "jetbrains mono") &&
+      !families.some((f) => f.toLowerCase() === "jetbrains mono")
+    ) {
+      families.push("JetBrains Mono");
+    }
   }
   if (catalog?.symbolsFont && !families.some((f) => f.toLowerCase() === catalog.symbolsFont!.toLowerCase())) {
     families.push(catalog.symbolsFont);

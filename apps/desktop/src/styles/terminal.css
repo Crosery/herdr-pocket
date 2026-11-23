@@ -7,10 +7,53 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  padding: 14px 18px;
-  background: var(--tp-term-bg, #16141d);
+  padding: 12px 14px;
+  background: var(--tp-term-bg, #17191d);
   outline: none;
   overflow: hidden;
+}
+
+.tp-term-search {
+  position: absolute;
+  top: 8px;
+  right: 14px;
+  z-index: 16;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--divider, rgba(128, 128, 128, 0.25));
+  border-radius: 8px;
+  background: var(--surface, #ffffff);
+  color: var(--ink, #1f2328);
+  box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.16));
+  font-size: calc(12px * var(--ts, 1));
+}
+
+.tp-term-search input {
+  width: 168px;
+  min-width: 90px;
+  height: 22px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: calc(12px * var(--ts, 1));
+}
+
+.tp-term-search input::placeholder {
+  color: var(--faint, #888);
+}
+
+.tp-term-search-count {
+  min-width: 44px;
+  text-align: center;
+  color: var(--muted, #666);
+  font-family: var(--font-mono);
+  font-size: calc(11px * var(--ts, 1));
+  font-variant-numeric: tabular-nums;
+  user-select: none;
 }
 
 .tp-term-wrap.drop-over::after {
@@ -41,12 +84,12 @@
 .tp-term-host .xterm {
   height: 100%;
   width: 100%;
-  background-color: var(--tp-term-bg, #16141d);
+  background-color: var(--tp-term-bg, #17191d);
 }
 
 .tp-term-host .xterm .xterm-viewport,
 .tp-term-host .xterm-viewport {
-  background-color: var(--tp-term-bg, #16141d);
+  background-color: var(--tp-term-bg, #17191d);
   scrollbar-width: thin;
   scrollbar-color: var(--tp-term-scroll, rgba(255, 255, 255, 0.18)) transparent;
 }
@@ -111,5 +154,5 @@
   overflow: visible;
   display: flex;
   align-items: center;
-  background: var(--tp-term-bg, #16141d);
+  background: var(--tp-term-bg, #17191d);
 }

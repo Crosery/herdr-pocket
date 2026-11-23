@@ -734,6 +734,21 @@
   max-width: 170px;
 }
 
+.v3-tab-rename-input {
+  width: 96px;
+  min-width: 48px;
+  max-width: 160px;
+  height: 21px;
+  padding: 0 6px;
+  border: 1px solid var(--v3-accent);
+  border-radius: 5px;
+  background: var(--v3-bg);
+  color: var(--v3-fg);
+  font: inherit;
+  font-size: calc(12px * var(--ts, 1));
+  outline: none;
+}
+
 .v3-tab-x {
   width: 18px;
   height: 18px;
@@ -804,8 +819,68 @@
 .v3-main {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   gap: 8px;
+}
+
+.v3-split-stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.v3-split-slot {
+  position: absolute;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.v3-split-slot > .v3-pane {
+  width: 100%;
+  height: 100%;
+}
+
+.v3-split-sash {
+  position: absolute;
+  z-index: 6;
+  touch-action: none;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.v3-split-sash.row {
+  cursor: col-resize;
+}
+
+.v3-split-sash.column {
+  cursor: row-resize;
+}
+
+.v3-split-sash::after {
+  content: "";
+  border-radius: 999px;
+  background: transparent;
+  transition: background 0.14s ease, opacity 0.14s ease;
+}
+
+.v3-split-sash.row::after {
+  width: 2px;
+  height: min(44px, 40%);
+}
+
+.v3-split-sash.column::after {
+  height: 2px;
+  width: min(44px, 40%);
+}
+
+.v3-split-sash:hover::after,
+.v3-split-sash.dragging::after {
+  background: var(--v3-accent);
 }
 
 .v3-pane {
@@ -818,10 +893,86 @@
   border-radius: 10px;
   background: var(--v3-bg);
   overflow: hidden;
+  position: relative;
+  container-type: inline-size;
+  opacity: 1;
+  filter: none;
 }
 
-.v3-pane:focus-within {
+.v3-pane:not(.is-split):focus-within,
+.v3-pane.is-split.is-focused {
   border-color: var(--v3-accent);
+}
+
+.v3-pane.is-zoomed {
+  box-shadow: var(--shadow-lg);
+}
+
+.v3-pane-grip {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 7;
+  width: 28px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0 0 6px 6px;
+  background: color-mix(in srgb, var(--v3-border) 60%, var(--v3-bg));
+  color: var(--v3-dim);
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.14s ease, background 0.14s ease, color 0.14s ease;
+  -webkit-user-drag: element;
+}
+
+.v3-pane.is-split > .v3-pane-head:hover + .v3-pane-grip,
+.v3-pane.is-split:has(> .v3-pane-head:hover) > .v3-pane-grip,
+.v3-pane-grip:hover {
+  opacity: 0.96;
+}
+
+.v3-pane-grip:hover {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  opacity: 1;
+}
+
+.v3-pane-grip:active {
+  cursor: grabbing;
+}
+
+.v3-split-drop-preview {
+  position: absolute;
+  z-index: 12;
+  pointer-events: none;
+  border-radius: 8px;
+  border: 2px solid var(--v3-accent);
+  background: color-mix(in srgb, var(--accent-soft) 52%, transparent);
+  transition: inset 90ms ease;
+}
+
+.v3-split-drop-preview[data-zone="left"] {
+  inset: 4px 50% 4px 4px;
+}
+
+.v3-split-drop-preview[data-zone="right"] {
+  inset: 4px 4px 4px 50%;
+}
+
+.v3-split-drop-preview[data-zone="up"] {
+  inset: 4px 4px 50% 4px;
+}
+
+.v3-split-drop-preview[data-zone="down"] {
+  inset: 50% 4px 4px 4px;
+}
+
+.v3-split-drop-preview[data-zone="center"] {
+  inset: 4px;
+  border-style: dashed;
 }
 
 .v3-pane-head {
@@ -830,11 +981,27 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 6px 0 10px;
+  padding: 0 10px;
   border-bottom: 1px solid var(--v3-border);
   background: var(--v3-bg);
   font-size: calc(12px * var(--ts, 1));
   color: var(--v3-fg);
+}
+
+.v3-pane-actions {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.v3-pane-head:hover .v3-pane-actions,
+.v3-pane-head:focus-within .v3-pane-actions {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .v3-pane-head > svg {
@@ -844,8 +1011,23 @@
 
 .v3-pane-name {
   flex: 0 1 auto;
+  min-width: 36px;
   max-width: 260px;
-  font-weight: 600;
+  font-weight: 500;
+}
+
+@container (max-width: 360px) {
+  .v3-pane-sub {
+    display: none;
+  }
+  .v3-pane-name {
+    flex: 1 1 auto;
+    max-width: none;
+  }
+}
+
+.v3-row.in-split {
+  background: color-mix(in srgb, var(--v3-selected) 52%, transparent);
 }
 
 .v3-pane-name.grow {

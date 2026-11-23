@@ -33,7 +33,7 @@ const URL_SCHEME_RE = /^(?:https?|mailto|wss?|data|tel):/i;
 const LINE_HASH_RE = /#L(\d+)(?:-L?(\d+))?$/i;
 const LINE_COLON_RE = /:(\d+)(?::\d+)?$/;
 
-function stripLineSuffix(raw: string): { target: string; line?: number; endLine?: number } {
+function splitFileLineSuffixRaw(raw: string): { target: string; suffix: string; line?: number; endLine?: number } {
   let target = raw;
   const hashMatch = LINE_HASH_RE.exec(target);
   if (hashMatch) {
@@ -42,6 +42,7 @@ function stripLineSuffix(raw: string): { target: string; line?: number; endLine?
     const endLine = hashMatch[2] ? Number(hashMatch[2]) : undefined;
     return {
       target,
+      suffix: hashMatch[0],
       line: Number.isFinite(line) && line > 0 ? line : undefined,
       endLine: endLine && Number.isFinite(endLine) && endLine >= line ? endLine : undefined,
     };
@@ -53,11 +54,26 @@ function stripLineSuffix(raw: string): { target: string; line?: number; endLine?
       const line = Number(colonMatch[1]);
       return {
         target: prefix,
+        suffix: colonMatch[0],
         line: Number.isFinite(line) && line > 0 ? line : undefined,
       };
     }
   }
-  return { target };
+  return { target, suffix: "" };
+}
+
+/** Splits optional `#L12` / `#L12-L20` / `:12[:4]` line suffix from a file token. */
+export function splitFileLineSuffix(raw: string): { target: string; suffix: string; line?: number; endLine?: number } {
+  return splitFileLineSuffixRaw(raw);
+}
+
+function stripLineSuffix(raw: string): { target: string; line?: number; endLine?: number } {
+  const { target, line, endLine } = splitFileLineSuffixRaw(raw);
+  return {
+    target,
+    ...(line !== undefined ? { line } : {}),
+    ...(endLine !== undefined ? { endLine } : {}),
+  };
 }
 
 function stripHomePrefix(p: string): string | null {

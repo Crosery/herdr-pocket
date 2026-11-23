@@ -33,6 +33,7 @@ export const SAFE_AGAIN = new Set<RpcMethod>([
   "sessions.usage",
   "harness.icons",
   "herdr.layout",
+  "herdr.doc.get",
   "agent.seen",
   "files.list",
   "files.read",

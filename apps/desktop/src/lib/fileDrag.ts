@@ -13,13 +13,20 @@ export type PanelDragItem =
   | { kind: "browser"; url: string; title: string; spaceKey?: string | null }
   | { kind: "agent"; agentKey: string };
 
+export interface PaneDragItem {
+  tabId: string;
+  paneId: string;
+}
+
 export const WORKSPACE_FILE_MIME = "application/x-herdr-pocket-file";
 export const TAB_DRAG_MIME = "application/x-herdr-pocket-tab";
 export const PANEL_DRAG_MIME = "application/x-herdr-pocket-panel";
+export const PANE_DRAG_MIME = "application/x-herdr-pocket-pane";
 
 let activeWorkspaceDrag: WorkspaceDragItem | null = null;
 let activeTabDragId: string | null = null;
 let activePanelDrag: PanelDragItem | null = null;
+let activePaneDrag: PaneDragItem | null = null;
 
 export function startWorkspaceDrag(e: DragEvent<HTMLElement>, item: WorkspaceDragItem): void {
   activeWorkspaceDrag = item;
@@ -129,4 +136,39 @@ export function readPanelDrag(e: DragEvent<HTMLElement>): PanelDragItem | null {
     // fall back to module singleton
   }
   return activePanelDrag;
+}
+
+export function startPaneDrag(e: DragEvent<HTMLElement>, item: PaneDragItem): void {
+  activePaneDrag = item;
+  try {
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData(PANE_DRAG_MIME, JSON.stringify(item));
+  } catch {
+    // WebKit fallback via module singleton
+  }
+}
+
+export function endPaneDrag(): void {
+  activePaneDrag = null;
+}
+
+export function hasPaneDrag(e: DragEvent<HTMLElement>): boolean {
+  if (activePaneDrag) return true;
+  const types = e.dataTransfer?.types;
+  return Boolean(types && Array.from(types).includes(PANE_DRAG_MIME));
+}
+
+export function readPaneDrag(e: DragEvent<HTMLElement>): PaneDragItem | null {
+  try {
+    const raw = e.dataTransfer?.getData(PANE_DRAG_MIME);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<PaneDragItem>;
+      if (typeof parsed.tabId === "string" && parsed.tabId && typeof parsed.paneId === "string" && parsed.paneId) {
+        return { tabId: parsed.tabId, paneId: parsed.paneId };
+      }
+    }
+  } catch {
+    // fall back to module singleton
+  }
+  return activePaneDrag;
 }

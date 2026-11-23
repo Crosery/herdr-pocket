@@ -259,6 +259,11 @@ export class HcAdapter extends EventEmitter {
     }
     if (msg.method === "event") {
       const p = msg.params ?? {};
+      if (p.type === "doc") {
+        this.emit("doc");
+        this.resync();
+        return;
+      }
       const t = typeof p.terminal === "string" ? this.terminals.get(p.terminal) : undefined;
       if (p.type === "title" && t) {
         // Spinner frames arrive many times per second; only the human part matters.
@@ -288,6 +293,7 @@ export class HcAdapter extends EventEmitter {
       }
       this.resync();
     } else if (msg.method === "missed") {
+      this.emit("doc");
       const fresh = msg.params?.terminals;
       if (Array.isArray(fresh)) this.setAll(fresh);
       else this.resync();
@@ -314,6 +320,28 @@ export class HcAdapter extends EventEmitter {
     const r = await this.oneShot("doc.set", { name, value, version });
     if (r?.error) throw new Error(r.error.message ?? "doc.set failed");
     return typeof r?.result?.version === "number" ? r.result.version : null;
+  }
+
+  /** Atomic CAS write against `doc.set`; returns latest doc + version on conflict instead of throwing. */
+  async docSetCas(
+    name: string,
+    value: unknown,
+    version: number,
+  ): Promise<{ ok: boolean; conflict?: boolean; value?: unknown; version: number }> {
+    const r = await this.oneShot("doc.set", { name, value, version });
+    if (r?.error) {
+      const kind = r.error?.data?.kind;
+      const msg = String(r.error?.message ?? "doc.set failed");
+      if (kind === "conflict" || /conflict|version/i.test(msg)) {
+        const fresh = await this.docGet(name).catch(() => null);
+        return { ok: false, conflict: true, value: fresh?.value ?? null, version: fresh?.version ?? 0 };
+      }
+      throw new Error(msg);
+    }
+    return {
+      ok: true,
+      version: typeof r?.result?.version === "number" ? r.result.version : version + 1,
+    };
   }
 
   async snapshotText(address: string, lines = 0): Promise<string> {

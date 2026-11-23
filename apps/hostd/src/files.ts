@@ -198,6 +198,74 @@ export async function resolveInside(root: string | undefined, rel: unknown, o: F
   return { realRoot: matchedExtra ?? realRoot, real, rel: matchedExtra ? (relative(matchedExtra, real).split(sep).join("/") || basename(real)) : parts.join("/") };
 }
 
+const IGNORED_WORKSPACE_DIRS = new Set(FILES_IGNORED);
+
+async function findWorkspaceFileBySuffix(
+  realRoot: string,
+  rawRel: string,
+  o: FilesOptions = {},
+): Promise<{ realRoot: string; real: string; rel: string } | null> {
+  if (!rawRel || rawRel.length > 4096 || rawRel.includes("\0")) return null;
+  const parts = rawRel.replace(/\\/g, "/").split("/").filter((p) => p && p !== ".");
+  if (!parts.length || parts.includes("..") || parts.some(isPrivateName)) return null;
+  const cleanSuffix = parts.join("/");
+  const lowerSuffix = cleanSuffix.toLowerCase();
+  const allowHiddenDirs = parts[0]!.startsWith(".");
+  const realPrivates = await Promise.all((o.privateDirs ?? []).map((dir) => realpath(dir).catch(() => dir)));
+
+  let exactBest: { depth: number; rel: string; real: string } | null = null;
+  let ciBest: { depth: number; rel: string; real: string } | null = null;
+  const queue: Array<{ dir: string; relPrefix: string; depth: number }> = [{ dir: realRoot, relPrefix: "", depth: 0 }];
+  const maxDepth = 8;
+  const maxEntries = 12_000;
+  let visited = 0;
+
+  while (queue.length > 0 && visited < maxEntries) {
+    const cur = queue.shift()!;
+    let dirents;
+    try {
+      dirents = await readdir(cur.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const d of dirents) {
+      visited += 1;
+      if (visited > maxEntries) break;
+      if (isPrivateName(d.name)) continue;
+      const rel = cur.relPrefix ? `${cur.relPrefix}/${d.name}` : d.name;
+      const full = join(cur.dir, d.name);
+      if (d.isDirectory()) {
+        if (cur.depth + 1 >= maxDepth) continue;
+        if (IGNORED_WORKSPACE_DIRS.has(d.name)) continue;
+        if (!allowHiddenDirs && d.name.startsWith(".")) continue;
+        queue.push({ dir: full, relPrefix: rel, depth: cur.depth + 1 });
+        continue;
+      }
+      if (!d.isFile()) continue;
+      const relLower = rel.toLowerCase();
+      const isExact = rel === cleanSuffix || rel.endsWith(`/${cleanSuffix}`);
+      const isCi = isExact || relLower === lowerSuffix || relLower.endsWith(`/${lowerSuffix}`);
+      if (!isExact && !isCi) continue;
+      const real = await realpath(full).catch(() => null);
+      if (!real || !inside(realRoot, real)) continue;
+      if (realPrivates.some((dir) => inside(dir, real))) continue;
+      const depth = rel.split("/").length - 1;
+      if (isExact) {
+        if (!exactBest || depth < exactBest.depth || (depth === exactBest.depth && byName(rel, exactBest.rel) < 0)) {
+          exactBest = { depth, rel, real };
+        }
+      } else {
+        if (!ciBest || depth < ciBest.depth || (depth === ciBest.depth && byName(rel, ciBest.rel) < 0)) {
+          ciBest = { depth, rel, real };
+        }
+      }
+    }
+  }
+
+  const pick = exactBest ?? ciBest;
+  return pick ? { realRoot, real: pick.real, rel: pick.rel } : null;
+}
+
 const byName = (a: string, b: string) => a.localeCompare(b, "en", { numeric: true, sensitivity: "base" }) || (a < b ? -1 : a > b ? 1 : 0);
 
 export async function listFiles(
@@ -269,7 +337,31 @@ export async function readFileSlice(
   o: FilesOptions = {},
 ): Promise<RpcResult<"files.read">> {
   if (typeof p.path !== "string" || !p.path) throw new FilesError("bad_request", "需要 path");
-  const { real, rel } = await resolveInside(root, p.path, o);
+  let resolved: { realRoot: string; real: string; rel: string };
+  try {
+    resolved = await resolveInside(root, p.path, o);
+  } catch (err) {
+    if (err instanceof FilesError && err.code === "not_found" && root && isAbsolute(root)) {
+      const realRoot = await realpath(root).catch(() => null);
+      if (realRoot) {
+        const rawNorm = p.path.replace(/\\/g, "/");
+        let suffix = rawNorm;
+        const rootNorm = root.replace(/\\/g, "/").replace(/\/+$/, "");
+        const realRootNorm = realRoot.replace(/\\/g, "/").replace(/\/+$/, "");
+        if (rawNorm.startsWith(`${rootNorm}/`)) suffix = rawNorm.slice(rootNorm.length + 1);
+        else if (rawNorm.startsWith(`${realRootNorm}/`)) suffix = rawNorm.slice(realRootNorm.length + 1);
+        else if (/^(\/|~\/|~|[A-Za-z]:)/.test(rawNorm)) suffix = "";
+        const hit = suffix ? await findWorkspaceFileBySuffix(realRoot, suffix, o) : null;
+        if (hit) resolved = hit;
+        else throw err;
+      } else {
+        throw err;
+      }
+    } else {
+      throw err;
+    }
+  }
+  const { real, rel } = resolved;
   const st = await stat(real);
   if (st.isDirectory()) throw new FilesError("bad_request", "这是一个目录，用 files.list 看");
   if (!st.isFile()) throw new FilesError("bad_request", "这不是普通文件");

@@ -10,6 +10,7 @@ import {
   type Agent,
   type AgentSource,
   type ConvEvent,
+  type HerdrDoc,
   type LayoutSpace,
   type Device,
   type ClientFrame,
@@ -23,7 +24,7 @@ import {
 } from "@herdr-pocket/protocol";
 import { HcAdapter, type AppNames } from "./hc.ts";
 import type { ScreenLines } from "./hcscreen.ts";
-import { HerdrApp, NoDesktopApp, checkFolder, findPrograms, herdrCommandArgs, installedLaunchers, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
+import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, findPrograms, herdrCommandArgs, installedLaunchers, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { DirectServer, type DirectPeer } from "./direct.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
@@ -60,6 +61,7 @@ const MUTATING = new Set([
   "terminal.interrupt",
   "terminal.kill",
   "herdr.command",
+  "herdr.doc.set",
   "sessions.resume",
   "git.stage",
   "git.unstage",
@@ -349,6 +351,9 @@ export class Host {
     if (hc) {
       this.sources.push("hc");
       this.hc.on("change", this.publish);
+      this.hc.on("doc", () => {
+        void this.refreshNames().then(() => this.publish());
+      });
       this.hc.start();
       void this.refreshNames();
       this.namesTimer = setInterval(() => void this.refreshNames(), 4_000);
@@ -1448,15 +1453,49 @@ export class Host {
     },
     "herdr.layout": async () => {
       this.needApp();
-      let ls: Awaited<ReturnType<HerdrApp["ls"]>>;
+      let rawSpaces: Array<{
+        id: string;
+        name: string;
+        folder?: string;
+        machine?: string | null;
+        active?: boolean;
+        tabs?: Array<{
+          id?: string;
+          name?: string;
+          active?: boolean;
+          settled?: boolean;
+          terminals?: Array<{ terminal?: string; pane?: string; app?: string | null; name?: string | null }>;
+        }>;
+      }> | null = null;
       try {
-        ls = await this.app.ls();
+        rawSpaces = (await this.app.ls()).spaces;
       } catch {
+        const docRes = (await this.hc.docGet("herdr-app").catch(() => null)) ?? this.app.readHerdrDocFromDisk();
+        const docVal = docRes?.value as HerdrDoc | null | undefined;
+        if (docVal && Array.isArray(docVal.spaces)) {
+          const activeSpaceId = typeof docVal.activeSpaceId === "string" ? docVal.activeSpaceId : undefined;
+          rawSpaces = docVal.spaces.map((s) => ({
+            id: s.id,
+            name: s.name,
+            folder: s.folder,
+            machine: typeof s.machine === "string" ? s.machine : null,
+            active: activeSpaceId ? activeSpaceId === s.id : Boolean(s.active),
+            tabs: (s.tabs ?? []).map((t) => ({
+              id: t.id,
+              name: t.name,
+              active: Boolean(t.active),
+              settled: Boolean(t.settled),
+              terminals: collectTerminalIdsFromRoot(t.root).map((terminal) => ({ terminal })),
+            })),
+          }));
+        }
+      }
+      if (!rawSpaces) {
         throw new RpcFailure("unsupported", "桌面 herdr 没有打开，先在电脑上打开它");
       }
       this.agents = this.collect();
       const byLocal = new Map(this.agents.filter((a) => a.source === "hc").map((a) => [a.localId, a]));
-      const spaces: LayoutSpace[] = ls.spaces
+      const spaces: LayoutSpace[] = rawSpaces
         .filter((s) => !s.machine)
         .map((s) => ({
           id: s.id,
@@ -1477,6 +1516,41 @@ export class Host {
           })),
         }));
       return { spaces };
+    },
+    "herdr.doc.get": async () => {
+      this.needApp();
+      const live = await this.hc.docGet("herdr-app").catch(() => null);
+      if (live) {
+        const val = live.value && typeof live.value === "object" && Array.isArray((live.value as HerdrDoc).spaces) ? (live.value as HerdrDoc) : null;
+        return { value: val, version: live.version };
+      }
+      const disk = this.app.readHerdrDocFromDisk();
+      return disk ?? { value: null, version: 0 };
+    },
+    "herdr.doc.set": async (p) => {
+      this.writable();
+      this.needApp();
+      if (!p?.value || typeof p.value !== "object" || !Array.isArray(p.value.spaces) || typeof p.version !== "number" || !Number.isFinite(p.version)) {
+        throw new RpcFailure("bad_request", "herdr.doc.set 需要合法的 value 与 version");
+      }
+      const res = await this.hc.docSetCas("herdr-app", p.value, p.version);
+      if (res.ok) {
+        await Promise.all([this.hc.list().catch(() => undefined), this.refreshNames().catch(() => undefined)]);
+        this.publishNow();
+      }
+      return {
+        ok: res.ok,
+        ...(res.conflict ? { conflict: true } : {}),
+        ...(res.value !== undefined
+          ? {
+              value:
+                res.value && typeof res.value === "object" && Array.isArray((res.value as HerdrDoc).spaces)
+                  ? (res.value as HerdrDoc)
+                  : null,
+            }
+          : {}),
+        version: res.version,
+      };
     },
     "herdr.command": async (p) => {
       this.writable();

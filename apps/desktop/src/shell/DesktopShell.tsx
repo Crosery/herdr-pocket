@@ -1,13 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowLeftRight,
+  ArrowRight,
+  ArrowUp,
+  ArrowUpDown,
   Bell,
   BookOpen,
+  Columns2,
   Cpu,
+  Equal,
   FolderTree,
   GitBranch,
   Globe,
   Info,
   Keyboard,
+  Maximize2,
   Mic,
   Moon,
   Palette as PaletteIcon,
@@ -15,10 +24,13 @@ import {
   Plus,
   QrCode,
   RefreshCw,
+  Rows2,
   ScrollText,
+  Search,
   Server,
   Shield,
   Sparkles,
+  SquareArrowOutUpRight,
   SquareStack,
   Sun,
   Terminal,
@@ -40,13 +52,18 @@ import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle, updateSet
 import { terminalOwnsCtrlK } from "../lib/termKeys";
 import { getTerminalThemeSpec, resolveTerminalAppearance } from "../lib/terminalTheme";
 import { GROUP_RANK, lastChange, listGroup } from "./agentInfo";
+import { useHerdrDocSync } from "./herdrDocSync";
 import { Palette, type PaletteItem } from "./Palette";
 import { ShellSidebar } from "./ShellSidebar";
-import { PeekOverlay, ShellMain, ShellPanel, ShellStatus, ShellTabs, requestCloseShellTab } from "./ShellWork";
+import { PeekOverlay, ShellMain, ShellPanel, ShellStatus, ShellTabs, requestClosePane, requestCloseShellTab } from "./ShellWork";
 import {
   activeTabIdForSpace,
   closeSettingsFrame,
   cycleTab,
+  detachPaneToTab,
+  equalizeTabSplits,
+  focusedLeafOfTab,
+  focusPaneDirection,
   openAgentTab,
   openSettingsFrame,
   openWebTab,
@@ -55,9 +72,14 @@ import {
   setSelectedSpace,
   shellStore,
   spaceKeyFromAgent,
+  splitTabPane,
+  swapPaneDirection,
+  tabLeaves,
   togglePanel,
+  toggleZoomTabPane,
   visibleTabsForSpace,
   type FrameSection,
+  type SplitDirection,
 } from "./shellStore";
 import { IS_MAC, matchShortcut } from "./shortcuts";
 import "../styles/shell.css";
@@ -77,24 +99,27 @@ const FRAME_ITEMS: Array<{ id: FrameSection; label: string; icon: PaletteItem["i
   { id: "about", label: "关于", icon: Info },
 ];
 
-function measureTerminalGrid(): {
+function measureTerminalGrid(splitDirection?: SplitDirection): {
   cols: number;
   rows: number;
   display: Record<string, unknown>;
 } {
   const termCfg = clientConfigStore.get().config.terminal;
   const fs = Math.max(9, Number(termCfg.fontSize) || 14);
-  const lh = Math.max(1.0, (Number(termCfg.lineHeight) || 132) / 100);
+  const lh = Math.max(1.0, (Number(termCfg.lineHeight) || 115) / 100);
   const cellW = Math.max(5, Math.round(fs * 0.6));
   const cellH = Math.max(10, Math.round(fs * lh));
   const pane =
+    (document.querySelector(".v3-pane.is-focused .tp-term-host") as HTMLElement | null) ??
     (document.querySelector(".v3-main .tp-term-host") as HTMLElement | null) ??
     (document.querySelector(".v3-main") as HTMLElement | null);
   const rect = pane?.getBoundingClientRect();
-  const availW = Math.max(320, (rect?.width ?? window.innerWidth - 300) - 36);
-  const availH = Math.max(180, (rect?.height ?? window.innerHeight - 100) - 70);
-  const cols = Math.min(500, Math.max(40, Math.floor(availW / cellW)));
-  const rows = Math.min(200, Math.max(12, Math.floor(availH / cellH)));
+  const rawW = Math.max(320, (rect?.width ?? window.innerWidth - 300) - 36);
+  const rawH = Math.max(180, (rect?.height ?? window.innerHeight - 100) - 70);
+  const availW = splitDirection === "left" || splitDirection === "right" ? Math.max(200, rawW * 0.5) : rawW;
+  const availH = splitDirection === "up" || splitDirection === "down" ? Math.max(110, rawH * 0.5) : rawH;
+  const cols = Math.min(500, Math.max(30, Math.floor(availW / cellW)));
+  const rows = Math.min(200, Math.max(10, Math.floor(availH / cellH)));
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
   const systemDark =
     typeof window !== "undefined" && Boolean(window.matchMedia?.("(prefers-color-scheme: dark)")?.matches);
@@ -136,11 +161,14 @@ export function DesktopShell({
   const tabs = shellStore.use((s) => s.tabs);
   const agentsMap = liveStore.use((s) => s.agents);
   const devices = liveStore.use((s) => s.devices);
+  const spacesMap = liveStore.use((s) => s.spaces);
   const showShells = settingsStore.use((s) => s.showShells);
   const theme = settingsStore.use((s) => s.theme);
   const homePage = useClientConfig().browser.homePage;
   const [create, setCreate] = useState<{ host: string | null; space: string | null } | null>(null);
   const [addComputer, setAddComputer] = useState(false);
+
+  useHerdrDocSync();
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const hosts = useMemo(() => Object.values(devices).filter((d) => d.kind === "host"), [devices]);
@@ -176,12 +204,26 @@ export function DesktopShell({
   }, [agentsMap, devices]);
 
   const spawnTerminalNow = useCallback(
-    async (preferredHost: string | null = null, preferredSpace: string | null = null) => {
+    async (
+      preferredHost: string | null = null,
+      preferredSpace: string | null = null,
+      splitTarget?: { tabId: string; paneId: string | null; direction: SplitDirection },
+    ) => {
       const { devices: devs, agents: agMap } = liveStore.get();
       const all = allAgents(agMap);
       const s = shellStore.get();
-      const activeTab = s.tabs.find((t) => t.id === s.active);
-      const activeAgent = activeTab && activeTab.kind !== "web" ? all.find((a) => a.key === activeTab.agentKey) : undefined;
+      const targetTab = splitTarget
+        ? s.tabs.find((t) => t.id === splitTarget.tabId)
+        : s.tabs.find((t) => t.id === s.active);
+      const targetLeaf = targetTab
+        ? (splitTarget?.paneId
+            ? tabLeaves(targetTab).find((l) => l.id === splitTarget.paneId)
+            : undefined) ?? focusedLeafOfTab(targetTab)
+        : undefined;
+      const targetContent = targetLeaf?.content;
+      const targetAgentKey =
+        targetContent && targetContent.kind !== "web" ? targetContent.agentKey : undefined;
+      const activeAgent = targetAgentKey ? all.find((a) => a.key === targetAgentKey) : undefined;
       const [selHost, selSpace] = s.selectedSpace ? (s.selectedSpace.split("\u0000") as [string, string]) : [null, null];
 
       const isOnlineHost = (id: string | null | undefined): id is string =>
@@ -191,8 +233,8 @@ export function DesktopShell({
 
       const hostId =
         (isOnlineHost(preferredHost) ? preferredHost : null) ??
-        (isOnlineHost(selHost) ? selHost : null) ??
         (isOnlineHost(activeAgent?.deviceId) ? activeAgent!.deviceId : null) ??
+        (isOnlineHost(selHost) ? selHost : null) ??
         Object.values(devs).find((d) => d.kind === "host" && d.online)?.id ??
         (isTauri() && localHostId ? localHostId : undefined);
 
@@ -203,12 +245,24 @@ export function DesktopShell({
 
       const spaceName =
         preferredSpace ??
-        (selHost === hostId ? selSpace : null) ??
-        (activeAgent?.deviceId === hostId ? agentSpace(activeAgent) ?? null : null);
+        (activeAgent?.deviceId === hostId ? agentSpace(activeAgent) ?? null : null) ??
+        (selHost === hostId ? selSpace : null);
 
       const folder =
         (activeAgent?.deviceId === hostId && activeAgent.cwd ? activeAgent.cwd : undefined) ??
         all.find((a) => a.deviceId === hostId && (!spaceName || (agentSpace(a) ?? "") === spaceName) && a.cwd)?.cwd;
+
+      const placePane = (key: string) => {
+        if (splitTarget && targetTab) {
+          splitTabPane(targetTab.id, targetLeaf?.id ?? splitTarget.paneId, splitTarget.direction, {
+            kind: "agent",
+            agentKey: key,
+            mode: "term",
+          });
+        } else {
+          openAgentTab(key, "term");
+        }
+      };
 
       const knownSpaces = liveStore.get().spaces[hostId] ?? [];
       const isLocal = knownSpaces.length === 0 && isTauri() && Boolean(localHostId && hostId === localHostId);
@@ -219,7 +273,7 @@ export function DesktopShell({
             const spRes = await rpcCall(hostId, "spaces.list", {}, 1_500).catch(() => null);
             resolvedFolder = spRes?.spaces.find((sp) => sp.name === spaceName)?.folder;
           }
-          const grid = measureTerminalGrid();
+          const grid = measureTerminalGrid(splitTarget?.direction);
           const created = await native.localTermCreateShell({
             cwd: resolvedFolder || undefined,
             cols: grid.cols,
@@ -247,7 +301,7 @@ export function DesktopShell({
             };
             return { ...prev, agents: { ...prev.agents, [hostId]: [shellAgent, ...list] }, rev: prev.rev + 1 };
           });
-          openAgentTab(key, "term");
+          placePane(key);
           return;
         } catch {
           // If local `hc` direct launch failed (e.g. `hc` absent), fall back to daemon RPC below.
@@ -288,7 +342,7 @@ export function DesktopShell({
           };
           return { ...prev, agents: { ...prev.agents, [hostId]: [shellAgent, ...list] }, rev: prev.rev + 1 };
         });
-        openAgentTab(created.agent, "term");
+        placePane(created.agent);
         refreshHostSpaces(hostId);
       } catch (e) {
         toast((e as Error).message, true);
@@ -296,6 +350,31 @@ export function DesktopShell({
     },
     [toast],
   );
+
+  // Auto-select the active Space once host spaces arrive so the tab bar scopes to the Space like Herdr.app.
+  const autoSelectedSpace = useRef(Boolean(shellStore.get().selectedSpace));
+  useEffect(() => {
+    if (autoSelectedSpace.current || shellStore.get().selectedSpace !== null) {
+      autoSelectedSpace.current = true;
+      return;
+    }
+    const localId = localHostIdStore.get();
+    const candidateHosts = [
+      ...(localId && spacesMap[localId]?.length ? [localId] : []),
+      ...hosts.filter((h) => h.online && h.id !== localId).map((h) => h.id),
+      ...Object.keys(spacesMap),
+    ];
+    const agentByKey = new Map(allAgents(agentsMap).map((a) => [a.key, a] as const));
+    for (const hid of candidateHosts) {
+      const list = spacesMap[hid];
+      if (!list?.length) continue;
+      const pick = list.find((sp) => sp.active) ?? list.find((sp) => sp.terminals > 0) ?? list[0];
+      if (!pick) continue;
+      autoSelectedSpace.current = true;
+      setSelectedSpace(`${hid}\u0000${pick.name}`, (k) => agentByKey.get(k));
+      return;
+    }
+  }, [agentsMap, hosts, spacesMap]);
 
   // The first time agents arrive with nothing open, open the most urgent one, so the work
   // area shows something useful. Closing every tab afterwards leaves it empty.
@@ -306,7 +385,7 @@ export function DesktopShell({
     const pick = [...agents].sort(
       (x, y) => GROUP_RANK[listGroup(x, devices)] - GROUP_RANK[listGroup(y, devices)] || lastChange(y) - lastChange(x),
     )[0];
-    if (pick && shellStore.get().tabs.length === 0) openAgentTab(pick.key);
+    if (pick && shellStore.get().tabs.length === 0) openAgentTab(pick.key, "term");
   }, [agents, devices]);
 
   const isDark = theme === "dark" || (theme === "system" && document.documentElement.getAttribute("data-theme") === "dark");
@@ -315,14 +394,40 @@ export function DesktopShell({
     const list: PaletteItem[] = [];
     const allByAgentKey = allAgents(agentsMap);
     for (const t of tabs) {
-      const a = t.kind === "agent" ? allByAgentKey.find((x) => x.key === t.agentKey) : undefined;
-      const label = t.kind === "agent" ? (a ? agentTitle(a) : "已结束的 Agent") : t.title === "about:blank" ? "新网页" : t.title;
+      const focusedContent = focusedLeafOfTab(t).content;
+      const leaves = tabLeaves(t);
+      const a = focusedContent.kind === "agent" ? allByAgentKey.find((x) => x.key === focusedContent.agentKey) : undefined;
+      const baseLabel =
+        focusedContent.kind === "agent"
+          ? a
+            ? agentTitle(a)
+            : "已结束的 Agent"
+          : focusedContent.title === "about:blank"
+            ? "新网页"
+            : focusedContent.title;
+      const label = leaves.length > 1 ? `${baseLabel}（${leaves.length} 分屏）` : baseLabel;
       list.push({
         id: `tab:${t.id}`,
         group: "标签",
         label: `切到：${label}`,
-        hint: t.kind === "file" || t.kind === "diff" ? t.path : t.kind === "web" ? t.url : a ? devices[a.deviceId]?.name : undefined,
-        icon: t.kind === "agent" ? SquareStack : t.kind === "file" ? FolderTree : t.kind === "diff" ? GitBranch : Globe,
+        hint:
+          focusedContent.kind === "file" || focusedContent.kind === "diff"
+            ? focusedContent.path
+            : focusedContent.kind === "web"
+              ? focusedContent.url
+              : a
+                ? devices[a.deviceId]?.name
+                : undefined,
+        icon:
+          leaves.length > 1
+            ? Columns2
+            : focusedContent.kind === "agent"
+              ? SquareStack
+              : focusedContent.kind === "file"
+                ? FolderTree
+                : focusedContent.kind === "diff"
+                  ? GitBranch
+                  : Globe,
         terms: label,
         run: () => {
           const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
@@ -338,6 +443,181 @@ export function DesktopShell({
       { id: "close-tab", group: "标签", label: "关闭标签", keys: ["Mod", "W"], icon: X, run: () => closeActive() },
       { id: "next-tab", group: "标签", label: "下一个标签", keys: ["Mod", "Shift", "]"], run: () => cycleTab(1, currentVisibleTabs()) },
       { id: "prev-tab", group: "标签", label: "上一个标签", keys: ["Mod", "Shift", "["], run: () => cycleTab(-1, currentVisibleTabs()) },
+      {
+        id: "split-right",
+        group: "分屏",
+        label: "向右分屏新建终端",
+        keys: IS_MAC ? ["Mod", "D"] : ["Mod", "Shift", "O"],
+        icon: Columns2,
+        terms: "split pane right column 分屏 右侧",
+        run: () => splitFocusedTerminal("right"),
+      },
+      {
+        id: "split-down",
+        group: "分屏",
+        label: "向下分屏新建终端",
+        keys: ["Mod", "Shift", "D"],
+        icon: Rows2,
+        terms: "split pane down row 分屏 下方",
+        run: () => splitFocusedTerminal("down"),
+      },
+      {
+        id: "pane-zoom",
+        group: "分屏",
+        label: "最大化 / 还原当前分屏",
+        keys: ["Mod", "Shift", "Enter"],
+        icon: Maximize2,
+        terms: "pane zoom maximize restore 放大 还原",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) toggleZoomTabPane(ref.tab.id, ref.paneId);
+        },
+      },
+      {
+        id: "pane-equalize",
+        group: "分屏",
+        label: "均分当前标签的分屏尺寸",
+        icon: Equal,
+        terms: "equalize split balance 均分",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) equalizeTabSplits(ref.tab.id);
+        },
+      },
+      {
+        id: "pane-detach",
+        group: "分屏",
+        label: "拆分当前分屏为独立标签",
+        icon: SquareArrowOutUpRight,
+        terms: "detach split pane tab 拆分",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) detachPaneToTab(ref.tab.id, ref.paneId);
+        },
+      },
+      {
+        id: "pane-close",
+        group: "分屏",
+        label: "关闭当前分屏",
+        keys: ["Mod", "Shift", "W"],
+        icon: X,
+        terms: "close pane 关闭分屏",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) requestClosePane(ref.tab.id, ref.paneId);
+        },
+      },
+      {
+        id: "pane-focus-left",
+        group: "分屏",
+        label: "焦点移到左侧分屏",
+        keys: ["Mod", "Alt", "ArrowLeft"],
+        icon: ArrowLeft,
+        terms: "pane go focus left",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) focusPaneDirection(ref.tab.id, "left");
+        },
+      },
+      {
+        id: "pane-focus-right",
+        group: "分屏",
+        label: "焦点移到右侧分屏",
+        keys: ["Mod", "Alt", "ArrowRight"],
+        icon: ArrowRight,
+        terms: "pane go focus right",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) focusPaneDirection(ref.tab.id, "right");
+        },
+      },
+      {
+        id: "pane-focus-up",
+        group: "分屏",
+        label: "焦点移到上方分屏",
+        keys: ["Mod", "Alt", "ArrowUp"],
+        icon: ArrowUp,
+        terms: "pane go focus up",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) focusPaneDirection(ref.tab.id, "up");
+        },
+      },
+      {
+        id: "pane-focus-down",
+        group: "分屏",
+        label: "焦点移到下方分屏",
+        keys: ["Mod", "Alt", "ArrowDown"],
+        icon: ArrowDown,
+        terms: "pane go focus down",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) focusPaneDirection(ref.tab.id, "down");
+        },
+      },
+      {
+        id: "pane-swap-left",
+        group: "分屏",
+        label: "与左侧分屏交换位置",
+        keys: ["Mod", "Alt", "Shift", "ArrowLeft"],
+        icon: ArrowLeftRight,
+        terms: "pane swap left 交换",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) swapPaneDirection(ref.tab.id, "left");
+        },
+      },
+      {
+        id: "pane-swap-right",
+        group: "分屏",
+        label: "与右侧分屏交换位置",
+        keys: ["Mod", "Alt", "Shift", "ArrowRight"],
+        icon: ArrowLeftRight,
+        terms: "pane swap right 交换",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) swapPaneDirection(ref.tab.id, "right");
+        },
+      },
+      {
+        id: "pane-swap-up",
+        group: "分屏",
+        label: "与上方分屏交换位置",
+        keys: ["Mod", "Alt", "Shift", "ArrowUp"],
+        icon: ArrowUpDown,
+        terms: "pane swap up 交换",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) swapPaneDirection(ref.tab.id, "up");
+        },
+      },
+      {
+        id: "pane-swap-down",
+        group: "分屏",
+        label: "与下方分屏交换位置",
+        keys: ["Mod", "Alt", "Shift", "ArrowDown"],
+        icon: ArrowUpDown,
+        terms: "pane swap down 交换",
+        run: () => {
+          const ref = currentFocusedPane();
+          if (ref) swapPaneDirection(ref.tab.id, "down");
+        },
+      },
+      {
+        id: "term-search",
+        group: "分屏",
+        label: "在当前终端输出中搜索",
+        keys: IS_MAC ? ["Mod", "F"] : ["Mod", "Shift", "F"],
+        icon: Search,
+        terms: "find search terminal output 查找 搜索",
+        run: () => {
+          const ref = currentFocusedPane();
+          const content = ref ? focusedLeafOfTab(ref.tab).content : null;
+          if (content?.kind === "agent") {
+            window.dispatchEvent(new CustomEvent("pocket:term-search", { detail: { agentKey: content.agentKey } }));
+          }
+        },
+      },
       { id: "panel-files", group: "面板", label: "显示或隐藏文件", keys: ["Mod", "J"], icon: FolderTree, terms: "files", run: () => togglePanel("files") },
       { id: "panel-git", group: "面板", label: "显示或隐藏 Git 管理", keys: ["Mod", "Shift", "G"], icon: GitBranch, terms: "git diff commit branch", run: () => togglePanel("git") },
       { id: "panel-browser", group: "面板", label: "显示或隐藏浏览器", icon: Globe, run: () => togglePanel("browser") },
@@ -407,6 +687,21 @@ export function DesktopShell({
     return visibleTabsForSpace(s.tabs, s.selectedSpace, (k) => map.get(k));
   }
 
+  function currentFocusedPane() {
+    const s = shellStore.get();
+    const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
+    const activeId = activeTabIdForSpace(s, (k) => map.get(k));
+    const tab = s.tabs.find((x) => x.id === activeId);
+    if (!tab) return null;
+    const focused = focusedLeafOfTab(tab);
+    return { tab, paneId: focused.id };
+  }
+
+  function splitFocusedTerminal(direction: SplitDirection) {
+    const ref = currentFocusedPane();
+    void spawnTerminalNow(null, null, ref ? { tabId: ref.tab.id, paneId: ref.paneId, direction } : undefined);
+  }
+
   function closeActive() {
     const s = shellStore.get();
     const map = new Map(allAgents(liveStore.get().agents).map((x) => [x.key, x] as const));
@@ -415,18 +710,39 @@ export function DesktopShell({
     if (t) requestCloseShellTab(t);
   }
 
-  // Window shortcuts (shell/shortcuts.ts). On Windows a focused terminal box keeps its Ctrl keys.
+  // Window shortcuts (shell/shortcuts.ts). On Windows a focused terminal box keeps bare Ctrl+letter keys.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const mod = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+      if (mod && !e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
+        const s = shellStore.get();
+        const dialogUp = Boolean(document.querySelector("[role=dialog][data-state=open]")) && !s.settings && !s.palette;
+        if (dialogUp || s.settings || s.palette) return;
+        const vis = currentVisibleTabs();
+        const picked = vis[Number(e.key) - 1];
+        if (picked) {
+          e.preventDefault();
+          setActiveTab(picked.id);
+        }
+        return;
+      }
       const id = matchShortcut(e);
       if (!id) return;
-      if (!IS_MAC && terminalOwnsCtrlK(e.target)) return;
+      if (!IS_MAC && !e.shiftKey && !e.altKey && terminalOwnsCtrlK(e.target)) return;
       const s = shellStore.get();
       // Another dialog on top (pairing, a confirm): only the palette and settings toggles pass.
       const dialogUp = Boolean(document.querySelector("[role=dialog][data-state=open]")) && !s.settings && !s.palette;
       if (dialogUp && id !== "palette" && id !== "settings") return;
       e.preventDefault();
       switch (id) {
+        case "terminalSearch": {
+          const ref = currentFocusedPane();
+          const content = ref ? focusedLeafOfTab(ref.tab).content : null;
+          if (content?.kind === "agent") {
+            window.dispatchEvent(new CustomEvent("pocket:term-search", { detail: { agentKey: content.agentKey } }));
+          }
+          break;
+        }
         case "palette":
           setPalette(s.palette ? false : "command");
           break;
@@ -446,6 +762,62 @@ export function DesktopShell({
         case "prevTab":
           cycleTab(-1, currentVisibleTabs());
           break;
+        case "splitRight":
+          splitFocusedTerminal("right");
+          break;
+        case "splitDown":
+          splitFocusedTerminal("down");
+          break;
+        case "closePane": {
+          const ref = currentFocusedPane();
+          if (ref) requestClosePane(ref.tab.id, ref.paneId);
+          break;
+        }
+        case "zoomPane": {
+          const ref = currentFocusedPane();
+          if (ref) toggleZoomTabPane(ref.tab.id, ref.paneId);
+          break;
+        }
+        case "focusPaneLeft": {
+          const ref = currentFocusedPane();
+          if (ref) focusPaneDirection(ref.tab.id, "left");
+          break;
+        }
+        case "focusPaneRight": {
+          const ref = currentFocusedPane();
+          if (ref) focusPaneDirection(ref.tab.id, "right");
+          break;
+        }
+        case "focusPaneUp": {
+          const ref = currentFocusedPane();
+          if (ref) focusPaneDirection(ref.tab.id, "up");
+          break;
+        }
+        case "focusPaneDown": {
+          const ref = currentFocusedPane();
+          if (ref) focusPaneDirection(ref.tab.id, "down");
+          break;
+        }
+        case "swapPaneLeft": {
+          const ref = currentFocusedPane();
+          if (ref) swapPaneDirection(ref.tab.id, "left");
+          break;
+        }
+        case "swapPaneRight": {
+          const ref = currentFocusedPane();
+          if (ref) swapPaneDirection(ref.tab.id, "right");
+          break;
+        }
+        case "swapPaneUp": {
+          const ref = currentFocusedPane();
+          if (ref) swapPaneDirection(ref.tab.id, "up");
+          break;
+        }
+        case "swapPaneDown": {
+          const ref = currentFocusedPane();
+          if (ref) swapPaneDirection(ref.tab.id, "down");
+          break;
+        }
         case "toggleSidebar":
           if (canToggleSidebar) onToggleSidebar();
           break;
@@ -477,7 +849,13 @@ export function DesktopShell({
       <div className="v3-work">
         <ShellTabs onNewTerminal={() => void spawnTerminalNow()} onNewAgent={() => newAgent()} padForLights={collapsed} />
         <div className="v3-body">
-          <ShellMain onNewTerminal={() => void spawnTerminalNow()} onNewAgent={() => newAgent()} />
+          <ShellMain
+            onNewTerminal={() => void spawnTerminalNow()}
+            onNewAgent={() => newAgent()}
+            onSplitNewTerminal={(tabId, paneId, direction) => {
+              void spawnTerminalNow(null, null, { tabId, paneId, direction });
+            }}
+          />
           <ShellPanel />
           <PeekOverlay />
         </div>

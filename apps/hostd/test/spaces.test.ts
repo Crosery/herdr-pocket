@@ -288,3 +288,80 @@ test("HerdrApp.names + Host.collect exclude detached closed tabs and restore sto
     ],
   );
 });
+
+test("Host herdr.doc.get, herdr.doc.set CAS, and herdr.layout fallback when Herdr.app window is closed", async () => {
+  const { Host } = await import("../src/host.ts");
+  const { NoDesktopApp } = await import("../src/create.ts");
+  const h = new Host({ config: { server: "http://127.0.0.1:9", token: "t", deviceId: "d", name: "test" }, log: () => {} });
+  h.sources = ["hc"];
+  h.deviceId = "d";
+
+  let docVersion = 3;
+  let storedDoc: Record<string, unknown> = {
+    spaces: [
+      {
+        id: "sp1",
+        name: "work",
+        folder: "/tmp/work",
+        tabs: [
+          {
+            id: "tb1",
+            name: "",
+            root: {
+              id: "tb1",
+              type: "row",
+              children: [
+                { id: "p1", type: "block", content: { terminal: "t1" } },
+                { id: "p2", type: "block", content: { terminal: "t2" } },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  h.app = new HerdrApp("herdr-app");
+  h.app.ls = async () => {
+    throw new NoDesktopApp();
+  };
+  h.hc.terminals = new Map<string, HcTerminal>([
+    ["t1", { address: "t1", cwd: "/tmp/work", status: { app: "claude-code", state: "working" } }],
+    ["t2", { address: "t2", cwd: "/tmp/work", foreground: { argv: ["zsh"] } }],
+  ]);
+  h.hc.list = async () => {};
+  h.hc.docGet = async () => ({ value: storedDoc, version: docVersion });
+  h.hc.docSetCas = async (_name, val, ver) => {
+    if (ver !== docVersion) {
+      return { ok: false, conflict: true, value: storedDoc, version: docVersion };
+    }
+    docVersion += 1;
+    storedDoc = val as Record<string, unknown>;
+    return { ok: true, version: docVersion };
+  };
+
+  const handlers = (h as unknown as {
+    handlers: {
+      "herdr.doc.get": (p: Record<string, never>, from: string) => Promise<{ value: unknown; version: number }>;
+      "herdr.doc.set": (p: { value: unknown; version: number }, from: string) => Promise<{ ok: boolean; conflict?: boolean; value?: unknown; version: number }>;
+      "herdr.layout": (p: Record<string, never>, from: string) => Promise<{ spaces: Array<{ id: string; tabs: Array<{ id: string; terminals: Array<{ terminal: string }> }> }> }>;
+    };
+  }).handlers;
+
+  const got = await handlers["herdr.doc.get"]({}, "phone1");
+  assert.equal(got.version, 3);
+  assert.equal((got.value as { spaces: Array<{ id: string }> }).spaces[0]!.id, "sp1");
+
+  const conflict = await handlers["herdr.doc.set"]({ value: storedDoc, version: 1 }, "phone1");
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.conflict, true);
+  assert.equal(conflict.version, 3);
+
+  const ok = await handlers["herdr.doc.set"]({ value: storedDoc, version: 3 }, "phone1");
+  assert.equal(ok.ok, true);
+  assert.equal(ok.version, 4);
+
+  const layout = await handlers["herdr.layout"]({}, "phone1");
+  assert.equal(layout.spaces.length, 1);
+  assert.deepEqual(layout.spaces[0]!.tabs[0]!.terminals.map((t) => t.terminal), ["t1", "t2"]);
+});

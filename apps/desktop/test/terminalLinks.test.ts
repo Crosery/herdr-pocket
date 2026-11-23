@@ -5,6 +5,7 @@ import {
   findTerminalLinksForBufferLine,
   findWordSelectionAtCell,
   readLogicalLineText,
+  resolveBareTerminalFileLink,
   type TerminalBufferCellLike,
   type TerminalBufferLike,
   type TerminalBufferLineLike,
@@ -118,4 +119,30 @@ test("findWordSelectionAtCell selects URLs, filenames, and plain words cleanly",
     row: 0,
     length: 7,
   });
+});
+
+test("resolveBareTerminalFileLink resolves bare filenames from scrollback subdirectories while preserving line anchors", () => {
+  const buf = makeMockBuffer([
+    { text: "• Read legacy/external-delivery-sequence.html" },
+    { text: "Updated docs/external-delivery-sequence.html and checked output." },
+    { text: "• Explored 1 file (external-delivery-sequence.html)" },
+  ]);
+
+  // Nearest match above row 2 wins over older match on row 0.
+  assert.equal(
+    resolveBareTerminalFileLink(buf, "external-delivery-sequence.html", 2),
+    "docs/external-delivery-sequence.html",
+  );
+  // Preserves line/column anchors.
+  assert.equal(
+    resolveBareTerminalFileLink(buf, "external-delivery-sequence.html#L12-L20", 2),
+    "docs/external-delivery-sequence.html#L12-L20",
+  );
+  assert.equal(
+    resolveBareTerminalFileLink(buf, "external-delivery-sequence.html:42", 2),
+    "docs/external-delivery-sequence.html:42",
+  );
+  // Non-bare paths stay untouched.
+  assert.equal(resolveBareTerminalFileLink(buf, "src/App.tsx", 2), "src/App.tsx");
+  assert.equal(resolveBareTerminalFileLink(buf, "/tmp/out.html", 2), "/tmp/out.html");
 });

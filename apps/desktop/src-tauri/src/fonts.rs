@@ -612,6 +612,16 @@ fn scan_dir(dir: &Path, depth: u8, out: &mut Vec<ScannedFace>) {
     }
 }
 
+fn symbols_font_priority(family_lower: &str) -> u8 {
+    match family_lower {
+        "symbols nerd font mono" => 4,
+        "jetbrainsmono nerd font mono" => 3,
+        s if s.ends_with(" nerd font mono") => 2,
+        "symbols nerd font" => 1,
+        _ => 0,
+    }
+}
+
 fn build_cache() -> FontCache {
     let mut raw = Vec::new();
     for dir in font_dirs() {
@@ -621,7 +631,7 @@ fn build_cache() -> FontCache {
     let mut mono_families: BTreeMap<String, String> = BTreeMap::new();
     let mut by_family_lower: HashMap<String, Vec<usize>> = HashMap::new();
     let mut faces = Vec::with_capacity(raw.len());
-    let mut symbols_font: Option<String> = None;
+    let mut symbols_font: Option<(u8, String)> = None;
 
     for mut face in raw {
         if face.family.starts_with('.') {
@@ -635,10 +645,9 @@ fn build_cache() -> FontCache {
                 .entry(key.clone())
                 .or_insert_with(|| face.family.clone());
         }
-        if key == "symbols nerd font mono" {
-            symbols_font = Some(face.family.clone());
-        } else if key == "symbols nerd font" && symbols_font.is_none() {
-            symbols_font = Some(face.family.clone());
+        let sym_rank = symbols_font_priority(&key);
+        if sym_rank > 0 && symbols_font.as_ref().is_none_or(|(best, _)| sym_rank > *best) {
+            symbols_font = Some((sym_rank, face.family.clone()));
         }
         by_family_lower.entry(key).or_default().push(id);
         faces.push(face);
@@ -651,7 +660,7 @@ fn build_cache() -> FontCache {
         faces,
         by_family_lower,
         families,
-        symbols_font,
+        symbols_font: symbols_font.map(|(_, f)| f),
     }
 }
 
@@ -802,7 +811,7 @@ pub async fn terminal_font_bytes(id: usize) -> Result<tauri::ipc::Response, Stri
 mod tests {
     use super::{
         is_selectable_mono_family, name_looks_mono, parse_herdr_terminal_toml, parse_name_table,
-        read_herdr_terminal_prefs_in, HerdrTerminalPrefs,
+        read_herdr_terminal_prefs_in, symbols_font_priority, HerdrTerminalPrefs,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1028,5 +1037,15 @@ line_height = 1.3
         let (fam, sub) = parse_name_table(&table);
         assert_eq!(fam.as_deref(), Some("TestMono"));
         assert!(sub.is_none());
+    }
+
+    #[test]
+    fn symbols_font_priority_prefers_mono_nerd_faces_over_proportional_fonts() {
+        assert_eq!(symbols_font_priority("symbols nerd font mono"), 4);
+        assert_eq!(symbols_font_priority("jetbrainsmono nerd font mono"), 3);
+        assert_eq!(symbols_font_priority("hack nerd font mono"), 2);
+        assert_eq!(symbols_font_priority("symbols nerd font"), 1);
+        assert_eq!(symbols_font_priority("jetbrainsmono nerd font"), 0);
+        assert!(symbols_font_priority("jetbrainsmono nerd font mono") > symbols_font_priority("symbols nerd font"));
     }
 }

@@ -349,8 +349,8 @@ Who reads it: CLI = `herdr-pocket` commands, daemon = `herdr-pocket run`, app = 
 | `resources.diskWarnGb` | `5` | 1–1000 | app | warn when free disk space falls below this |
 | `terminal.fontFamily` | `""` | font family name | app | monospace font family of the desktop terminal (empty: default stack) |
 | `terminal.fontSize` | `14` | 10–28 | app | font size of the desktop terminal in pixels |
-| `terminal.lineHeight` | `132` | 100–200 | app | line height of the desktop terminal in percent |
-| `terminal.fontWeight` | `400` | 300–700 | app | normal text weight of the desktop terminal (bold stays 700) |
+| `terminal.lineHeight` | `115` | 100–200 | app | line height of the desktop terminal in percent |
+| `terminal.fontWeight` | `500` | 300–700 | app | normal text weight of the desktop terminal (bold stays 700) |
 | `terminal.cursorBlink` | `true` | boolean | app | blink the cursor in the desktop terminal |
 
 Notes on `voiceInput.hotkey`:

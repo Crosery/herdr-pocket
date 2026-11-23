@@ -172,6 +172,47 @@ export interface LayoutTerminal {
   status?: AgentStatus;
 }
 
+/** Node size in herdr-core's shared `herdr-app` layout document. */
+export type HerdrDocSize = { weight: number } | { px: number };
+
+/** Layout tree node inside herdr-core's `"herdr-app"` document (`mirror.rs` / `layout.rs`). */
+export interface HerdrDocNode {
+  id: string;
+  type: "row" | "column" | "block" | "stack";
+  size?: HerdrDocSize;
+  content?:
+    | { terminal: string; [key: string]: unknown }
+    | { mod: string; props?: unknown; [key: string]: unknown }
+    | Record<string, unknown>;
+  children?: HerdrDocNode[];
+  active?: string;
+  hidden?: boolean;
+  [key: string]: unknown;
+}
+
+/** Shared tab entry inside `HerdrDocSpace`. */
+export interface HerdrDocTab {
+  id: string;
+  name: string;
+  root: HerdrDocNode;
+  [key: string]: unknown;
+}
+
+/** Shared space entry inside `HerdrDoc`. */
+export interface HerdrDocSpace {
+  id: string;
+  name: string;
+  folder: string;
+  tabs: HerdrDocTab[];
+  [key: string]: unknown;
+}
+
+/** Shared desktop workspace document stored under `"herdr-app"` in herdr-core. */
+export interface HerdrDoc {
+  spaces: HerdrDocSpace[];
+  [key: string]: unknown;
+}
+
 /**
  * Desktop herdr commands a computer accepts over rpc (`herdr.command`), with the
  * arguments each takes. `confirm`: it ends or starts programs, so the assistant
@@ -531,6 +572,13 @@ export interface RpcMethods {
   "herdr.layout": { params: Record<string, never>; result: { spaces: LayoutSpace[] } };
   /** One of `HERDR_COMMANDS` with its arguments. */
   "herdr.command": { params: { command: HerdrCommand; args?: Record<string, unknown> }; result: { ok: true; result?: unknown } };
+  /** Reads herdr-core's `"herdr-app"` layout document + CAS version. */
+  "herdr.doc.get": { params: Record<string, never>; result: { value: HerdrDoc | null; version: number } };
+  /** Atomically writes herdr-core's `"herdr-app"` layout document with CAS version check. */
+  "herdr.doc.set": {
+    params: { value: HerdrDoc; version: number };
+    result: { ok: boolean; conflict?: boolean; value?: HerdrDoc | null; version: number };
+  };
   /**
    * Recorded sessions on this computer, newest first. `q` is Uniflo's filter
    * (`h:claude s:work in:<folder> since:2d` and free words). Assistant only.
@@ -2375,8 +2423,8 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "resources.diskWarnGb", type: "integer", min: 1, max: 1000, default: 5, usedBy: D, label: "磁盘空间提醒（GB）", doc: "Warn when free disk space falls below this." },
   { key: "terminal.fontFamily", type: "string", default: "", usedBy: D, label: "终端字体", doc: "Monospace font family for the desktop terminal; empty uses the default stack." },
   { key: "terminal.fontSize", type: "integer", min: 10, max: 28, default: 14, usedBy: D, label: "终端字号", doc: "Font size of the desktop terminal in pixels." },
-  { key: "terminal.lineHeight", type: "integer", min: 100, max: 200, default: 132, usedBy: D, label: "终端行高（%）", doc: "Line height of the desktop terminal in percent." },
-  { key: "terminal.fontWeight", type: "integer", min: 300, max: 700, default: 400, usedBy: D, label: "终端字重", doc: "Normal text weight of the desktop terminal (bold stays 700)." },
+  { key: "terminal.lineHeight", type: "integer", min: 100, max: 200, default: 115, usedBy: D, label: "终端行高（%）", doc: "Line height of the desktop terminal in percent." },
+  { key: "terminal.fontWeight", type: "integer", min: 300, max: 700, default: 500, usedBy: D, label: "终端字重", doc: "Normal text weight of the desktop terminal (bold stays 700)." },
   { key: "terminal.cursorBlink", type: "boolean", default: true, usedBy: D, label: "终端光标闪烁", doc: "Blink the cursor in the desktop terminal." },
 ];
 

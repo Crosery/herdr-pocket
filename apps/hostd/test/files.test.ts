@@ -232,3 +232,29 @@ test("supports expanded video, audio, csv and office document metadata cleanly",
   assert.equal(rtf.binary, false);
   assert.ok(rtf.text?.includes("Hello"));
 });
+
+test("readFileSlice resolves bare filename into workspace subdirectory while excluding ignored and private dirs", async () => {
+  const bareRoot = join(dir, "bare-lookup");
+  mkdirSync(join(bareRoot, "docs", "nested"), { recursive: true });
+  mkdirSync(join(bareRoot, "node_modules", "pkg"), { recursive: true });
+  mkdirSync(join(bareRoot, "secrets"), { recursive: true });
+
+  writeFileSync(join(bareRoot, "docs", "external-delivery-sequence.html"), "<html><body>diagram</body></html>");
+  writeFileSync(join(bareRoot, "docs", "nested", "shallow-vs-deep.txt"), "deep");
+  writeFileSync(join(bareRoot, "shallow-vs-deep.txt"), "root");
+  writeFileSync(join(bareRoot, "node_modules", "pkg", "ignored-only.html"), "<html>ignored</html>");
+  writeFileSync(join(bareRoot, "secrets", ".env.prod"), "SECRET=1");
+
+  const resolved = await readFileSlice(bareRoot, { path: "external-delivery-sequence.html" });
+  assert.equal(resolved.path, "docs/external-delivery-sequence.html");
+  assert.ok(resolved.text?.includes("diagram"));
+
+  // Shallowest match wins when both root and nested match.
+  const shallow = await readFileSlice(bareRoot, { path: "shallow-vs-deep.txt" });
+  assert.equal(shallow.path, "shallow-vs-deep.txt");
+  assert.equal(shallow.text, "root");
+
+  // Ignored folders (node_modules) and private files remain unreachable.
+  await assert.rejects(readFileSlice(bareRoot, { path: "ignored-only.html" }), (e) => code(e) === "not_found");
+  await assert.rejects(readFileSlice(bareRoot, { path: ".env.prod" }), (e) => code(e) === "forbidden");
+});

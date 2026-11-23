@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { createPortal } from "react-dom";
 import {
   ArrowLeft,
   ArrowRight,
   ChevronDown,
   ChevronRight,
+  Columns2,
   Copy,
   ExternalLink,
   File,
@@ -17,6 +19,7 @@ import {
   Pin,
   Plus,
   RotateCw,
+  Rows2,
   X,
 } from "lucide-react";
 import type { Agent, FileEntry, RpcResult } from "@herdr-pocket/protocol";
@@ -63,6 +66,7 @@ import { useClientConfig } from "../lib/config";
 import { openAgentFileTarget } from "../lib/openFileTarget";
 import { rpcCall, RelayError } from "../lib/relay";
 import { allAgents, createStore, liveStore, spacedTitle } from "../lib/store";
+import { updateResolvedFilePanePath } from "../shell/shellStore";
 import { useWindowHidden } from "../lib/layout";
 import { endWorkspaceDrag, startWorkspaceDrag } from "../lib/fileDrag";
 import { logger } from "../lib/log";
@@ -161,11 +165,38 @@ export function newWebTab(url: string): void {
 
 type Listing = RpcResult<"files.list">;
 
-export function FileTree({ agent, onOpen }: { agent: Agent; onOpen: (path: string, name: string) => void }) {
+export function FileTree({
+  agent,
+  onOpen,
+  onOpenSplit,
+}: {
+  agent: Agent;
+  onOpen: (path: string, name: string) => void;
+  onOpenSplit?: (path: string, name: string, direction: "right" | "down", absPath?: string) => void;
+}) {
   const toast = useToast();
   const files = useClientConfig().files;
   const [lists, setLists] = useState<Record<string, Listing | { error: string } | "loading">>({});
   const [open, setOpen] = useState<Set<string>>(new Set([""]));
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; path: string; name: string; absPath?: string } | null>(null);
+
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", onKey);
+    overlayStore.set((p) => ({ open: p.open + 1 }));
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", onKey);
+      overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
+    };
+  }, [ctxMenu]);
 
   const load = useCallback(
     async (path: string) => {
@@ -233,7 +264,19 @@ export function FileTree({ agent, onOpen }: { agent: Agent; onOpen: (path: strin
                 className={`tree-row${e.private ? " locked" : ""}${e.ignored ? " dim" : ""}`}
                 style={{ paddingLeft: 8 + depth * 14 }}
                 title={e.private ? "可能含有密钥，不能查看" : e.path}
-                onClick={() => toggleRow(e)}
+                onClick={(ev) => {
+                  if (!isDir && !e.private && e.kind !== "link" && ev.altKey && onOpenSplit) {
+                    ev.preventDefault();
+                    onOpenSplit(e.path, e.name, ev.shiftKey ? "down" : "right", absPath);
+                    return;
+                  }
+                  toggleRow(e);
+                }}
+                onContextMenu={(ev) => {
+                  if (isDir || e.private || e.kind === "link" || !onOpenSplit) return;
+                  ev.preventDefault();
+                  setCtxMenu({ x: ev.clientX, y: ev.clientY, path: e.path, name: e.name, absPath });
+                }}
                 onKeyDown={(ev) => {
                   if (ev.key === "Enter" || ev.key === " ") {
                     ev.preventDefault();
@@ -292,6 +335,62 @@ export function FileTree({ agent, onOpen }: { agent: Agent; onOpen: (path: strin
         </div>
       ) : null}
       {render("", 0)}
+      {ctxMenu && onOpenSplit && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="ctx-menu v3-popup"
+              role="menu"
+              style={{
+                position: "fixed",
+                left: Math.max(8, Math.min(ctxMenu.x, window.innerWidth - 200 - 8)),
+                top: Math.max(8, Math.min(ctxMenu.y, window.innerHeight - 160)),
+                width: 200,
+              }}
+              onPointerDown={(ev) => ev.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  const t = ctxMenu;
+                  setCtxMenu(null);
+                  onOpen(t.path, t.name);
+                }}
+              >
+                <FileText size={14} />
+                <span className="grow">在标签页中打开</span>
+              </button>
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  const t = ctxMenu;
+                  setCtxMenu(null);
+                  onOpenSplit(t.path, t.name, "right", t.absPath);
+                }}
+              >
+                <Columns2 size={14} />
+                <span className="grow">向右分屏打开</span>
+              </button>
+              <button
+                type="button"
+                className="menu-item v3-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  const t = ctxMenu;
+                  setCtxMenu(null);
+                  onOpenSplit(t.path, t.name, "down", t.absPath);
+                }}
+              >
+                <Rows2 size={14} />
+                <span className="grow">向下分屏打开</span>
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
     </div>
   );
 }
@@ -387,7 +486,9 @@ export function FileViewer({
   };
   const localStreamUrl = useMemo(() => {
     if (!isLocalOwner || !(isDirectStreamMedia || isDirectFetchBinary) || streamError) return null;
-    return native.localFileStreamUrl(tab.absPath || tab.path, agent?.cwd);
+    const isRelWorkspace = !/^(\/|~\/|~|[A-Za-z]:[\\/])/.test(tab.path);
+    const streamTarget = agent?.cwd && isRelWorkspace ? tab.path : tab.absPath || tab.path;
+    return native.localFileStreamUrl(streamTarget, agent?.cwd);
   }, [agent?.cwd, isDirectFetchBinary, isDirectStreamMedia, isLocalOwner, streamError, tab.absPath, tab.path]);
 
   const prettyJson = useMemo(() => {
@@ -566,7 +667,8 @@ export function FileViewer({
 
   const read = useCallback(
     async (offset: number) => {
-      const localPathTarget = tab.absPath || tab.path;
+      const isRelWorkspace = !/^(\/|~\/|~|[A-Za-z]:[\\/])/.test(tab.path);
+      const localPathTarget = agent?.cwd && isRelWorkspace ? tab.path : tab.absPath || tab.path;
       const wantBytes = isCsv || isJsonLines || isJson ? 2 * 1024 * 1024 : undefined;
       let res: ReadResult | null = null;
       if (offset === 0 && native.available()) {
@@ -587,6 +689,9 @@ export function FileViewer({
           offset,
           ...(wantBytes ? { maxBytes: wantBytes } : {}),
         });
+      }
+      if (offset === 0 && agent && res.path && res.path !== tab.path && isRelWorkspace) {
+        updateResolvedFilePanePath(agent.key, tab.path, res.path, agent.cwd);
       }
       setData(res);
       setText((prev) => (offset ? prev + (res.text ?? "") : (res.text ?? "")));
@@ -823,7 +928,7 @@ export function FileViewer({
             actions={compactExternalAction}
           />
         ) : preview && isHtml ? (
-          <iframe sandbox="" srcDoc={text} className="viewer-html-frame" title={tab.title} />
+          <iframe sandbox="allow-scripts" srcDoc={text} className="viewer-html-frame" title={tab.title} />
         ) : preview && isTextTable && textTableData ? (
           <PocketDataGrid data={textTableData} actions={compactExternalAction} />
         ) : hlStart !== undefined && codeLines.length <= 5000 ? (
@@ -892,11 +997,14 @@ export function WebPane({
   tab,
   active,
   onChange,
+  layoutKey,
 }: {
   tab: Pick<WebTab, "id" | "url">;
   active: boolean;
   /** Where URL and title changes go (the shell's tabs); the workbench's own tabs by default. */
   onChange?: (patch: { url?: string; title?: string }) => void;
+  /** Layout version string to force re-measuring native WebView bounds across split resizes. */
+  layoutKey?: string;
 }) {
   const toast = useToast();
   const update = (patch: { url?: string; title?: string }) =>
@@ -963,7 +1071,7 @@ export function WebPane({
       window.removeEventListener("resize", sync);
       cancelAnimationFrame(frame);
     };
-  }, [localPath, supported, tab.id, tab.url]);
+  }, [layoutKey, localPath, supported, tab.id, tab.url]);
 
   useEffect(() => {
     if (!supported) return;
