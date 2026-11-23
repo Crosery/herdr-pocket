@@ -268,7 +268,10 @@ test("ToolUpdateManager verifies SHA-256 and atomically installs Herdr.app (darw
   assert.equal(linRes.ok, true);
   assert.equal(linRes.toVersion, "0.9.6");
   assert.ok(existsSync(linDest));
-  assert.equal(statSync(linDest).mode & 0o111, 0o111);
+  assert.equal(readFileSync(linDest, "utf8"), "#!/bin/sh\necho 0.9.6\n");
+  if (process.platform !== "win32") {
+    assert.equal(statSync(linDest).mode & 0o111, 0o111);
+  }
 });
 
 test("ToolUpdateManager orders hostd last and exposes RPC tools.check / tools.update / tools.updateStatus", async () => {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { DIRECT_PORTAL_FS_PREFIX } from "@herdr-pocket/protocol";
 import { DirectServer } from "../src/direct.ts";
@@ -108,7 +108,7 @@ test("PortalFileTicketStore + DirectServer serve /v1/portal-fs HTTP files, Range
 test("parseOpenerArgs + PortalHookServer handle open, open -R, xdg-open, gio open, explorer /select, and secret auth", async (t) => {
   assert.deepEqual(parseOpenerArgs("open", ["-R", "docs/out.html"], "/work/repo"), {
     kind: "reveal",
-    target: "/work/repo/docs/out.html",
+    target: resolve("/work/repo", "docs/out.html"),
     reveal: true,
   });
   assert.deepEqual(parseOpenerArgs("open", ["https://localhost:8787/callback"]), {
@@ -119,12 +119,12 @@ test("parseOpenerArgs + PortalHookServer handle open, open -R, xdg-open, gio ope
   });
   assert.deepEqual(parseOpenerArgs("xdg-open", ["report.pdf"], "/tmp/ws"), {
     kind: "file",
-    target: "/tmp/ws/report.pdf",
+    target: resolve("/tmp/ws", "report.pdf"),
     reveal: false,
   });
   assert.deepEqual(parseOpenerArgs("gio", ["open", "preview.html"], "/tmp/ws"), {
     kind: "html",
-    target: "/tmp/ws/preview.html",
+    target: resolve("/tmp/ws", "preview.html"),
     reveal: false,
   });
   assert.equal(parseOpenerArgs("gio", ["info", "preview.html"], "/tmp/ws"), null);
