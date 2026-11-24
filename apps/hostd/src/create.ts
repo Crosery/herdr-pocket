@@ -379,6 +379,10 @@ export class HerdrApp {
   private bin: string;
   private sharedJsonPath: string;
   private docsJsonPath: string;
+  private lsCache: { at: number; data: AppLs } | null = null;
+  private lsFailUntil = 0;
+  private lsLastErr: unknown = null;
+  private lsInflight: Promise<AppLs> | null = null;
   execWrapper?: string;
 
   constructor(
@@ -479,12 +483,36 @@ export class HerdrApp {
 
   /** The window's spaces, tabs and terminals; throws when the window is not open. */
   async ls(): Promise<AppLs> {
-    const out = await run(this.bin, ["ls"], { timeoutMs: 8000 }).catch((e: unknown) => {
-      throw notInstalled(e) ? new NoDesktopApp() : e;
-    });
-    const ls = JSON.parse(out) as AppLs;
-    if (!Array.isArray(ls?.spaces)) throw new Error("herdr-app ls: no spaces");
-    return ls;
+    const now = Date.now();
+    if (this.lsCache && now - this.lsCache.at < 1_500) {
+      return this.lsCache.data;
+    }
+    if (now < this.lsFailUntil && this.lsLastErr !== null) {
+      throw this.lsLastErr;
+    }
+    if (this.lsInflight) {
+      return this.lsInflight;
+    }
+    const p = run(this.bin, ["ls"], { timeoutMs: 2_500 })
+      .then((out) => {
+        const ls = JSON.parse(out) as AppLs;
+        if (!Array.isArray(ls?.spaces)) throw new Error("herdr-app ls: no spaces");
+        this.lsCache = { at: Date.now(), data: ls };
+        this.lsFailUntil = 0;
+        this.lsLastErr = null;
+        return ls;
+      })
+      .catch((e: unknown) => {
+        const err = notInstalled(e) ? new NoDesktopApp() : e;
+        this.lsFailUntil = Date.now() + 4_000;
+        this.lsLastErr = err;
+        throw err;
+      })
+      .finally(() => {
+        this.lsInflight = null;
+      });
+    this.lsInflight = p;
+    return p;
   }
 
   /** Space, tab, and terminal metadata by id as the open window shows them; throws when the window is not open. */
@@ -642,6 +670,9 @@ export class HerdrApp {
       if (o.tabName?.trim()) args.tab = o.tabName.trim();
     }
     const out = await doCommand(this.bin, cmd, args);
+    this.lsCache = null;
+    this.lsFailUntil = 0;
+    this.lsLastErr = null;
     const r = parseDoResult(out);
     if (!r.terminal) throw new Error(`桌面 herdr 没有返回新终端：${out.trim().slice(0, 200)}`);
     return r;
@@ -649,7 +680,11 @@ export class HerdrApp {
 
   /** Runs one checked command (see `herdrCommandArgs`) and returns what the app answered. */
   async command(command: HerdrCommand, args: Record<string, unknown>): Promise<unknown> {
-    return parseDo(await doCommand(this.bin, command, args));
+    const raw = await doCommand(this.bin, command, args);
+    this.lsCache = null;
+    this.lsFailUntil = 0;
+    this.lsLastErr = null;
+    return parseDo(raw);
   }
 
   /**

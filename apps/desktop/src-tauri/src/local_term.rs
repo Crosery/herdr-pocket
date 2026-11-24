@@ -934,11 +934,13 @@ pub async fn local_term_attach(
     cols: u16,
     rows: u16,
     history: u32,
+    focused: Option<bool>,
     display: Option<Value>,
     on_data: Channel<InvokeResponseBody>,
 ) -> Result<LocalAttachResult, String> {
     let c = clamp_cols(cols);
     let r = clamp_rows(rows);
+    let initial_focus = u8::from(focused.unwrap_or(true));
     let sanitized_display = sanitize_display(display.as_ref());
     let sink_for_live = Some(on_data.clone());
     let sink_for_early = Some(on_data);
@@ -988,7 +990,7 @@ pub async fn local_term_attach(
                     } else {
                         (pre.cols, pre.rows)
                     };
-                    let _ = s.write_frame(pre.channel, KIND_FOCUS, &[1]);
+                    let _ = s.write_frame(pre.channel, KIND_FOCUS, &[initial_focus]);
                     Some((pre.channel, ret_cols, ret_rows, drained))
                 } else {
                     s.early.remove(&pre.channel);
@@ -1056,7 +1058,7 @@ pub async fn local_term_attach(
                     .map(|b| b.frames)
                     .unwrap_or_default();
                 s.write_frame(channel, KIND_CREDIT, &INITIAL_CREDIT_BYTES.to_le_bytes())?;
-                let _ = s.write_frame(channel, KIND_FOCUS, &[1]);
+                let _ = s.write_frame(channel, KIND_FOCUS, &[initial_focus]);
                 drained
             };
             (channel, ret_cols, ret_rows, early_frames)

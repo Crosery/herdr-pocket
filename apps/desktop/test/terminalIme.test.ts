@@ -12,6 +12,7 @@ class MockTextarea extends EventTarget {
   value = "";
   spellcheck = true;
   parentElement: EventTarget | null = null;
+  style: Record<string, string> = {};
   attrs = new Map<string, string>();
   setAttribute(k: string, v: string) {
     this.attrs.set(k, v);
@@ -179,6 +180,102 @@ test("clampCompositionOverlayLayout keeps long preedit inside screen and chunkTe
   await sleep(100);
   assert.equal(activeClasses.has("active"), false);
   assert.equal(compView.textContent, "");
+
+  bridge.dispose();
+});
+
+test("attachTerminalImeBridge prevents WebKit double-paste across bracketed and plain pastes", async () => {
+  const host = new EventTarget();
+  const ta = new MockTextarea();
+  ta.parentElement = host;
+  const sent: string[] = [];
+  let xtermRunning = true;
+  ta.addEventListener("paste", () => {
+    if (xtermRunning) {
+      // Simulate xterm.js Clipboard.ts handlePasteEvent firing synchronously before bridge's onPaste
+      bridge.handleXtermData("\x1b[200~line1\rline2\x1b[201~");
+      ta.value = "";
+    }
+  });
+  const bridge = attachTerminalImeBridge(ta as unknown as HTMLTextAreaElement, (d) => sent.push(d));
+
+  // 1) Paste event WITH clipboardData (even if a WebKit implementation still emits insertFromPaste)
+  const pasteEv = new Event("paste", { bubbles: true, cancelable: true });
+  Object.assign(pasteEv, { clipboardData: { getData: () => "line1\nline2" } });
+  ta.dispatchEvent(pasteEv);
+  assert.equal(pasteEv.defaultPrevented, true, "onPaste should call preventDefault when clipboardData exists");
+
+  ta.value = "line1\nline2";
+  const before = new Event("beforeinput", { bubbles: true });
+  Object.assign(before, { inputType: "insertFromPaste", data: "line1\nline2", isComposing: false });
+  ta.dispatchEvent(before);
+
+  const inp = new Event("input", { bubbles: true });
+  Object.assign(inp, { inputType: "insertFromPaste", data: "line1\nline2", isComposing: false });
+  ta.dispatchEvent(inp);
+  await sleep(20);
+  assert.deepEqual(sent, ["\x1b[200~line1\rline2\x1b[201~"]);
+  assert.equal(ta.value, "");
+
+  // 2) Short single-word paste followed by insertFromPaste must also fire only once.
+  sent.length = 0;
+  xtermRunning = false;
+  ta.addEventListener(
+    "paste",
+    () => {
+      bridge.handleXtermData("\x1b[200~hello\x1b[201~");
+    },
+    { once: true },
+  );
+  const shortPaste = new Event("paste", { bubbles: true, cancelable: true });
+  Object.assign(shortPaste, { clipboardData: { getData: () => "hello" } });
+  ta.dispatchEvent(shortPaste);
+  const shortInp = new Event("input", { bubbles: true });
+  Object.assign(shortInp, { inputType: "insertFromPaste", data: "hello", isComposing: false });
+  ta.dispatchEvent(shortInp);
+  await sleep(75);
+  assert.deepEqual(sent, ["\x1b[200~hello\x1b[201~"]);
+
+  bridge.dispose();
+});
+
+test("clampCompositionOverlay walks past 0x0 .xterm-helpers to .xterm-screen and lifts above bottom bar", async () => {
+  const screen = new EventTarget() as EventTarget & {
+    parentElement?: EventTarget | null;
+    getBoundingClientRect?: () => { width: number; height: number };
+  };
+  screen.getBoundingClientRect = () => ({ width: 1200, height: 800 });
+
+  const compView = {
+    textContent: "测试语音输入很长的一段文字会正确换行而不是被 0px 父元素裁成一条细线",
+    offsetWidth: 420,
+    offsetHeight: 54,
+    classList: { remove: () => {} },
+    style: { left: "24px", top: "768px", lineHeight: "20px" } as Record<string, string>,
+  };
+  const helpers = new EventTarget() as EventTarget & {
+    parentElement?: EventTarget | null;
+    querySelector?: (sel: string) => unknown;
+    getBoundingClientRect?: () => { width: number; height: number };
+  };
+  helpers.parentElement = screen;
+  helpers.getBoundingClientRect = () => ({ width: 0, height: 0 });
+  helpers.querySelector = (sel: string) => (sel === ".composition-view" ? compView : null);
+
+  const ta = new MockTextarea() as MockTextarea & { closest?: (sel: string) => unknown };
+  ta.parentElement = helpers;
+  ta.closest = (sel: string) => (sel === ".xterm-screen" ? screen : null);
+  ta.style = { left: "24px", top: "768px" };
+
+  const bridge = attachTerminalImeBridge(ta as unknown as HTMLTextAreaElement, () => {});
+  ta.dispatchEvent(new Event("compositionstart"));
+  ta.dispatchEvent(new Event("compositionupdate"));
+  await sleep(25);
+
+  assert.equal(compView.style.maxWidth, "1192px");
+  assert.equal(compView.style.left, "24px");
+  assert.ok(parseInt(compView.style.top, 10) < 768 - 20, `expected lifted top, got ${compView.style.top}`);
+  assert.ok(parseInt(compView.style.top, 10) + 54 <= 800 - 28, "must clear bottom status bar");
 
   bridge.dispose();
 });

@@ -746,6 +746,7 @@ export const native = {
     cols: number;
     rows: number;
     history: number;
+    focused?: boolean;
     display?: Record<string, unknown>;
     onData?: (bytes: Uint8Array) => void;
   }): Promise<LocalTermAttachResult> => {
@@ -769,6 +770,7 @@ export const native = {
       cols: params.cols,
       rows: params.rows,
       history: params.history,
+      focused: params.focused ?? null,
       display: params.display ?? null,
       onData: ch,
     });

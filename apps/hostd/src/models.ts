@@ -36,10 +36,15 @@ import { harnessId, readJsonlModelAndThinkingTail } from "./uniflo.ts";
 const execFileAsync = promisify(execFile);
 
 const CATALOG_CACHE_MS = 5 * 60_000;
+const CLI_FAIL_COOLDOWN_MS = 60_000;
+const BRAIN_DIR_CACHE_MS = 15_000;
 const OMP_CLI_TIMEOUT_MS = 4_000;
 const MAX_MODELS = 500;
 const SESSION_TAIL_BYTES = 128 * 1024;
 const cliCatalogCache = new Map<string, { at: number; models: AgentModelOption[] }>();
+const cliCatalogInflight = new Map<string, Promise<AgentModelOption[]>>();
+const cliCatalogFailUntil = new Map<string, number>();
+let brainDirCache: { root: string; at: number; dirs: string[] } | null = null;
 let ompRefreshInflight: Promise<AgentModelOption[]> | null = null;
 
 function normHarnessKey(raw: string): string {
@@ -471,12 +476,54 @@ export function parseOpencodeModelsText(raw: string): AgentModelOption[] {
   return out;
 }
 
-async function cachedCliCatalog(key: string, loader: () => Promise<AgentModelOption[]>): Promise<AgentModelOption[]> {
+async function cachedCliCatalog(
+  key: string,
+  loader: () => Promise<AgentModelOption[]>,
+  opts?: { backgroundIfColdMs?: number },
+): Promise<AgentModelOption[]> {
   const cached = cliCatalogCache.get(key);
   if (cached && Date.now() - cached.at < CATALOG_CACHE_MS) return cached.models;
-  const models = await loader().catch(() => []);
-  // Only cache non-empty results for full 5m so a transient timeout does not strand the picker.
-  if (models.length > 0) cliCatalogCache.set(key, { at: Date.now(), models });
+  const failUntil = cliCatalogFailUntil.get(key) ?? 0;
+  if (Date.now() < failUntil) return cached?.models ?? [];
+
+  let p = cliCatalogInflight.get(key);
+  if (!p) {
+    p = loader()
+      .then((raw) => raw.slice(0, MAX_MODELS))
+      .catch(() => [] as AgentModelOption[])
+      .then((models) => {
+        if (models.length > 0) {
+          cliCatalogCache.set(key, { at: Date.now(), models });
+          cliCatalogFailUntil.delete(key);
+        } else {
+          cliCatalogFailUntil.set(key, Date.now() + CLI_FAIL_COOLDOWN_MS);
+        }
+        return models;
+      })
+      .finally(() => {
+        cliCatalogInflight.delete(key);
+      });
+    cliCatalogInflight.set(key, p);
+  }
+
+  const budgetMs = opts?.backgroundIfColdMs ?? 0;
+  if (budgetMs > 0) {
+    let timer: NodeJS.Timeout | undefined;
+    const raced = await Promise.race([
+      p,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), budgetMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (raced !== null) {
+      return raced.length ? raced : (cached?.models ?? []);
+    }
+    return cached?.models ?? [];
+  }
+
+  const models = await p;
   return models.length ? models : (cached?.models ?? []);
 }
 
@@ -531,43 +578,55 @@ async function getOmpCatalog(): Promise<AgentModelOption[]> {
 }
 
 async function getPiCatalog(): Promise<AgentModelOption[]> {
-  const piList = await cachedCliCatalog("pi", async () => {
-    const found = await findPrograms(["pi"]);
-    const bin = found.get("pi");
-    if (!bin) return [];
-    const { stdout } = await execFileAsync(bin, ["--list-models"], {
-      timeout: 10_000,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-    return parsePiModelsText(stdout);
-  });
+  const piList = await cachedCliCatalog(
+    "pi",
+    async () => {
+      const found = await findPrograms(["pi"]);
+      const bin = found.get("pi");
+      if (!bin) return [];
+      const { stdout } = await execFileAsync(bin, ["--list-models"], {
+        timeout: 10_000,
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      return parsePiModelsText(stdout);
+    },
+    { backgroundIfColdMs: 600 },
+  );
   return piList.length ? piList : getOmpCatalog();
 }
 
 async function getAgyCatalog(): Promise<AgentModelOption[]> {
-  return cachedCliCatalog("antigravity", async () => {
-    const found = await findPrograms(["agy"]);
-    const bin = found.get("agy");
-    if (!bin) return [];
-    const { stdout } = await execFileAsync(bin, ["models"], {
-      timeout: 8000,
-      maxBuffer: 1024 * 1024,
-    });
-    return parseAgyModelsText(stdout);
-  });
+  return cachedCliCatalog(
+    "antigravity",
+    async () => {
+      const found = await findPrograms(["agy"]);
+      const bin = found.get("agy");
+      if (!bin) return [];
+      const { stdout } = await execFileAsync(bin, ["models"], {
+        timeout: 8000,
+        maxBuffer: 1024 * 1024,
+      });
+      return parseAgyModelsText(stdout);
+    },
+    { backgroundIfColdMs: 600 },
+  );
 }
 
 async function getOpencodeCatalog(): Promise<AgentModelOption[]> {
-  return cachedCliCatalog("opencode", async () => {
-    const found = await findPrograms(["opencode", "kilo"]);
-    const bin = found.get("opencode") ?? found.get("kilo");
-    if (!bin) return [];
-    const { stdout } = await execFileAsync(bin, ["models"], {
-      timeout: 10_000,
-      maxBuffer: 2 * 1024 * 1024,
-    });
-    return parseOpencodeModelsText(stdout);
-  });
+  return cachedCliCatalog(
+    "opencode",
+    async () => {
+      const found = await findPrograms(["opencode", "kilo"]);
+      const bin = found.get("opencode") ?? found.get("kilo");
+      if (!bin) return [];
+      const { stdout } = await execFileAsync(bin, ["models"], {
+        timeout: 10_000,
+        maxBuffer: 2 * 1024 * 1024,
+      });
+      return parseOpencodeModelsText(stdout);
+    },
+    { backgroundIfColdMs: 600 },
+  );
 }
 
 function splitModelAndEffort(raw: string): { id: string; effort?: string } {
@@ -989,6 +1048,9 @@ export interface ModelsUnifloLike {
 
 export function clearModelsCacheForTest(): void {
   cliCatalogCache.clear();
+  cliCatalogInflight.clear();
+  cliCatalogFailUntil.clear();
+  brainDirCache = null;
   ompRefreshInflight = null;
 }
 
@@ -1089,20 +1151,26 @@ function findAntigravityTranscriptPath(id: string, homeDir: string): string | un
     /* ignore */
   }
   if (!existsSync(brainDir)) return undefined;
-  let entries;
-  try {
-    entries = readdirSync(brainDir, { withFileTypes: true });
-  } catch {
-    return undefined;
+  let dirNames: string[];
+  if (brainDirCache && brainDirCache.root === brainDir && Date.now() - brainDirCache.at < BRAIN_DIR_CACHE_MS) {
+    dirNames = brainDirCache.dirs;
+  } else {
+    try {
+      dirNames = readdirSync(brainDir, { withFileTypes: true })
+        .filter((ent) => ent.isDirectory())
+        .map((ent) => ent.name);
+      brainDirCache = { root: brainDir, at: Date.now(), dirs: dirNames };
+    } catch {
+      return undefined;
+    }
   }
   const lowerId = id.toLowerCase();
   const matches: Array<{ path: string; mtime: number }> = [];
-  for (const ent of entries) {
-    if (!ent.isDirectory()) continue;
-    const lowerDir = ent.name.toLowerCase();
+  for (const dirName of dirNames) {
+    const lowerDir = dirName.toLowerCase();
     const isMatch = lowerDir === lowerId || (lowerId.length >= 6 && lowerDir.startsWith(lowerId));
     if (!isMatch) continue;
-    const cand = join(brainDir, ent.name, ".system_generated", "logs", "transcript.jsonl");
+    const cand = join(brainDir, dirName, ".system_generated", "logs", "transcript.jsonl");
     try {
       const st = statSync(cand);
       if (st.isFile()) matches.push({ path: cand, mtime: st.mtimeMs });
@@ -1121,8 +1189,10 @@ function findSessionJsonlPath(sessionKey: string, harnessHint: string, homeDir: 
   const id = (colon >= 0 ? sessionKey.slice(colon + 1) : sessionKey).trim();
   if (!id || id.length < 4) return undefined;
 
+  let checkedAgy = false;
   const hNorm = normHarnessKey(harnessHint || prefix);
   if (hNorm === "antigravity" || prefix.toLowerCase() === "antigravity" || prefix.toLowerCase() === "agy") {
+    checkedAgy = true;
     const agyHit = findAntigravityTranscriptPath(id, homeDir);
     if (agyHit) return agyHit;
   }
@@ -1174,7 +1244,7 @@ function findSessionJsonlPath(sessionKey: string, harnessHint: string, homeDir: 
     pool.sort((a, b) => b.mtime - a.mtime);
     return pool[0]!.path;
   }
-  return findAntigravityTranscriptPath(id, homeDir);
+  return !checkedAgy && !hNorm ? findAntigravityTranscriptPath(id, homeDir) : undefined;
 }
 
 /**

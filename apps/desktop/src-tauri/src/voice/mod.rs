@@ -707,12 +707,29 @@ impl Controller {
                 self.set_registration(Some("modifier"), true, None, warning, None);
             }
             Err(e) => {
+                static LAST_MOD_WARN: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
                 let needs = hotkey::needs_input_monitoring().then_some("inputMonitoring");
-                logging::warn(
-                    "hotkey",
-                    "modifier hotkey unavailable",
-                    json!({ "hotkey": hk, "error": e, "needsPermission": needs }),
-                );
+                let should_log = LAST_MOD_WARN
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .ok()
+                    .map(|mut guard| {
+                        let key = (hk.to_string(), e.clone());
+                        if guard.as_ref() == Some(&key) {
+                            false
+                        } else {
+                            *guard = Some(key);
+                            true
+                        }
+                    })
+                    .unwrap_or(true);
+                if should_log {
+                    logging::warn(
+                        "hotkey",
+                        "modifier hotkey unavailable",
+                        json!({ "hotkey": hk, "error": e, "needsPermission": needs }),
+                    );
+                }
                 self.set_registration(Some("modifier"), false, Some(e), warning, needs);
             }
         }

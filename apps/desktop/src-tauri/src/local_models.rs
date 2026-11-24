@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(300);
+const CLI_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_MODELS: usize = 500;
 const SESSION_TAIL_BYTES: u64 = 128 * 1024;
 const CLI_TIMEOUT: Duration = Duration::from_secs(4);
@@ -43,9 +44,19 @@ struct CachedCatalog {
 }
 
 static CLI_CATALOG_CACHE: OnceLock<Mutex<HashMap<String, CachedCatalog>>> = OnceLock::new();
+static CLI_REFRESHING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static CLI_FAIL_UNTIL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn cache_map() -> &'static Mutex<HashMap<String, CachedCatalog>> {
     CLI_CATALOG_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn refreshing_set() -> &'static Mutex<HashSet<String>> {
+    CLI_REFRESHING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn fail_map() -> &'static Mutex<HashMap<String, Instant>> {
+    CLI_FAIL_UNTIL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn normalize_harness(raw: &str) -> String {
@@ -1789,6 +1800,65 @@ fn find_antigravity_transcript(home: &Path, id: &str) -> Option<PathBuf> {
     matches.first().map(|x| x.0.clone())
 }
 
+fn get_cli_cached_nonblocking<F>(key: &str, loader: F) -> Vec<ModelOption>
+where
+    F: FnOnce() -> Vec<ModelOption> + Send + 'static,
+{
+    let (cached_models, is_fresh) = if let Ok(guard) = cache_map().lock() {
+        if let Some(hit) = guard.get(key) {
+            (hit.models.clone(), hit.at.elapsed() < CATALOG_CACHE_TTL)
+        } else {
+            (Vec::new(), false)
+        }
+    } else {
+        (Vec::new(), false)
+    };
+    if is_fresh {
+        return cached_models;
+    }
+
+    let in_cooldown = fail_map()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(key).copied())
+        .is_some_and(|until| Instant::now() < until);
+    if in_cooldown {
+        return cached_models;
+    }
+
+    let should_spawn = refreshing_set()
+        .lock()
+        .map(|mut g| g.insert(key.to_string()))
+        .unwrap_or(false);
+    if should_spawn {
+        let key_owned = key.to_string();
+        std::thread::spawn(move || {
+            let models: Vec<ModelOption> = loader().into_iter().take(MAX_MODELS).collect();
+            if !models.is_empty() {
+                if let Ok(mut guard) = cache_map().lock() {
+                    guard.insert(
+                        key_owned.clone(),
+                        CachedCatalog {
+                            at: Instant::now(),
+                            models,
+                        },
+                    );
+                }
+                if let Ok(mut fg) = fail_map().lock() {
+                    fg.remove(&key_owned);
+                }
+            } else if let Ok(mut fg) = fail_map().lock() {
+                fg.insert(key_owned.clone(), Instant::now() + CLI_FAIL_COOLDOWN);
+            }
+            if let Ok(mut rg) = refreshing_set().lock() {
+                rg.remove(&key_owned);
+            }
+        });
+    }
+
+    cached_models
+}
+
 fn find_session_jsonl(home: &Path, h_norm: &str, session_key: &str) -> Option<PathBuf> {
     let (prefix, id) = match session_key.split_once(':') {
         Some((p, rest)) => (p.trim(), rest.trim()),
@@ -1797,10 +1867,12 @@ fn find_session_jsonl(home: &Path, h_norm: &str, session_key: &str) -> Option<Pa
     if id.len() < 4 {
         return None;
     }
+    let mut checked_agy = false;
     if h_norm == "antigravity"
         || prefix.eq_ignore_ascii_case("antigravity")
         || prefix.eq_ignore_ascii_case("agy")
     {
+        checked_agy = true;
         if let Some(hit) = find_antigravity_transcript(home, id) {
             return Some(hit);
         }
@@ -1883,9 +1955,13 @@ fn find_session_jsonl(home: &Path, h_norm: &str, session_key: &str) -> Option<Pa
         &mut prefix_matches
     };
     pool.sort_by(|a, b| b.1.cmp(&a.1));
-    pool.first()
-        .map(|x| x.0.clone())
-        .or_else(|| find_antigravity_transcript(home, id))
+    pool.first().map(|x| x.0.clone()).or_else(|| {
+        if !checked_agy && h_norm.is_empty() {
+            find_antigravity_transcript(home, id)
+        } else {
+            None
+        }
+    })
 }
 
 pub fn read_session_tail_model_and_thinking(
@@ -2408,8 +2484,9 @@ fn get_omp_cached_and_trigger_bg(home: Option<&Path>) -> Vec<ModelOption> {
 }
 
 fn get_pi_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
-    let pi = cached_cli_catalog("pi", || {
-        let Some(bin) = find_program_with_extra_dirs("pi", home) else {
+    let home_owned = home.map(Path::to_path_buf);
+    let pi = get_cli_cached_nonblocking("pi", move || {
+        let Some(bin) = find_program_with_extra_dirs("pi", home_owned.as_deref()) else {
             return Vec::new();
         };
         run_cli_stdout(&bin, &["--list-models"], CLI_TIMEOUT)
@@ -2417,15 +2494,16 @@ fn get_pi_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
             .unwrap_or_default()
     });
     if pi.is_empty() {
-        get_omp_cli_catalog(home)
+        get_omp_cached_and_trigger_bg(home)
     } else {
         pi
     }
 }
 
 fn get_agy_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
-    cached_cli_catalog("antigravity", || {
-        let Some(bin) = find_program_with_extra_dirs("agy", home) else {
+    let home_owned = home.map(Path::to_path_buf);
+    get_cli_cached_nonblocking("antigravity", move || {
+        let Some(bin) = find_program_with_extra_dirs("agy", home_owned.as_deref()) else {
             return Vec::new();
         };
         run_cli_stdout(&bin, &["models"], CLI_TIMEOUT)
@@ -2435,9 +2513,10 @@ fn get_agy_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
 }
 
 fn get_opencode_cli_catalog(home: Option<&Path>) -> Vec<ModelOption> {
-    cached_cli_catalog("opencode", || {
-        let Some(bin) = find_program_with_extra_dirs("opencode", home)
-            .or_else(|| find_program_with_extra_dirs("kilo", home))
+    let home_owned = home.map(Path::to_path_buf);
+    get_cli_cached_nonblocking("opencode", move || {
+        let Some(bin) = find_program_with_extra_dirs("opencode", home_owned.as_deref())
+            .or_else(|| find_program_with_extra_dirs("kilo", home_owned.as_deref()))
         else {
             return Vec::new();
         };

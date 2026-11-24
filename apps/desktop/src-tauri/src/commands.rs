@@ -312,12 +312,17 @@ fn source_cache_path() -> Option<std::path::PathBuf> {
 /// What `update_fetch_sums` may fetch: the latest or tagged release's SHA256SUMS or RELEASE-NOTES.md
 /// on github.com, directly or through a mirror prefix (https, or plain http on this machine).
 fn is_sums_url(url: &str) -> bool {
-    const LATEST_SUFFIXES: [&str; 2] = [
+    const LATEST_SUFFIXES: [&str; 3] = [
         "/releases/latest/download/SHA256SUMS",
         "/releases/latest/download/RELEASE-NOTES.md",
+        "/releases/latest/download/RELEASE-MANIFEST.json",
     ];
     const TAGGED_MARKER: &str = "/releases/download/v";
-    const TAGGED_SUFFIXES: [&str; 2] = ["/SHA256SUMS", "/RELEASE-NOTES.md"];
+    const TAGGED_SUFFIXES: [&str; 3] = [
+        "/SHA256SUMS",
+        "/RELEASE-NOTES.md",
+        "/RELEASE-MANIFEST.json",
+    ];
     let Ok(u) = url::Url::parse(url) else {
         return false;
     };
@@ -2177,14 +2182,22 @@ mod tests {
         let tagged = "https://github.com/owner/repo/releases/download/v0.2.4/SHA256SUMS";
         let notes_latest = "https://github.com/owner/repo/releases/latest/download/RELEASE-NOTES.md";
         let notes_tagged = "https://github.com/owner/repo/releases/download/v0.2.8/RELEASE-NOTES.md";
+        let manifest_latest =
+            "https://github.com/owner/repo/releases/latest/download/RELEASE-MANIFEST.json";
+        let manifest_tagged =
+            "https://github.com/owner/repo/releases/download/v0.2.28/RELEASE-MANIFEST.json";
         assert!(is_sums_url(gh));
         assert!(is_sums_url(tagged));
         assert!(is_sums_url(notes_latest));
         assert!(is_sums_url(notes_tagged));
+        assert!(is_sums_url(manifest_latest));
+        assert!(is_sums_url(manifest_tagged));
         assert!(is_sums_url(&format!("https://mirror.example.com/{gh}")));
         assert!(is_sums_url(&format!("https://mirror.example.com/{tagged}")));
         assert!(is_sums_url(&format!("https://mirror.example.com/{notes_latest}")));
         assert!(is_sums_url(&format!("https://mirror.example.com/{notes_tagged}")));
+        assert!(is_sums_url(&format!("https://mirror.example.com/{manifest_latest}")));
+        assert!(is_sums_url(&format!("https://mirror.example.com/{manifest_tagged}")));
         assert!(is_sums_url(&format!("http://localhost:8080/{gh}")));
         assert!(
             !is_sums_url(&format!("http://mirror.example.com/{gh}")),

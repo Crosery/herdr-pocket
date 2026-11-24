@@ -361,6 +361,7 @@ export function TerminalSurface({
   const resizeHudTimerRef = useRef<number>(0);
   const [resizeHud, setResizeHud] = useState<{ cols: number; rows: number } | null>(null);
   const reattachLocalRef = useRef<(() => void) | null>(null);
+  const onActivatedAttachRef = useRef<(() => void) | null>(null);
   const clearOverlaysRef = useRef<(() => void) | null>(null);
   const onMissingVirtualAssetRef = useRef<(() => void) | null>(null);
   const placementSeqRef = useRef(0);
@@ -2818,6 +2819,24 @@ export function TerminalSurface({
       seedTimer = window.setTimeout(runFallbackRead, 150);
     };
 
+    let readyToAttachResolve: (() => void) | null = null;
+    const isLayoutAttachable = () =>
+      activeRef.current && hostEl.clientWidth >= 60 && hostEl.clientHeight >= 40;
+    const notifyAttachReady = () => {
+      if (readyToAttachResolve && isLayoutAttachable()) {
+        const resolve = readyToAttachResolve;
+        readyToAttachResolve = null;
+        resolve();
+      }
+    };
+    onActivatedAttachRef.current = notifyAttachReady;
+    const waitUntilAttachable = async (): Promise<void> => {
+      if (isLayoutAttachable()) return;
+      await new Promise<void>((resolve) => {
+        readyToAttachResolve = resolve;
+      });
+    };
+
     let triggerLocalReattach: (() => void) | null = null;
     if (native.available() && (agent.source === "hc" || agent.source === "herdr") && agent.localId) {
       const localTermId = agent.localId;
@@ -2840,6 +2859,7 @@ export function TerminalSurface({
             cols: reqCols,
             rows: reqRows,
             history: 2000,
+            focused: activeRef.current && focusedRef.current,
             display: currentDisplay(term) as unknown as Record<string, unknown>,
             onData: (bytes) => {
               if (!alive || activeLocalConnId !== connId || gen !== attachGen || bytes.byteLength === 0) return;
@@ -2927,6 +2947,8 @@ export function TerminalSurface({
       reattachLocalRef.current = triggerLocalReattach;
 
       void (async () => {
+        await waitUntilAttachable();
+        if (!alive) return;
         const [resolvedLocalId] = await Promise.all([
           localHostIdStore.get() ? Promise.resolve(localHostIdStore.get()) : ensureLocalHostDeviceId(),
           waitLayoutAndFonts(),
@@ -2972,8 +2994,11 @@ export function TerminalSurface({
         await connectLocal(0);
       })();
     } else {
-      void waitLayoutAndFonts().then(() => {
-        if (alive) startRelayStream();
+      void waitUntilAttachable().then(() => {
+        if (!alive) return;
+        return waitLayoutAndFonts().then(() => {
+          if (alive) startRelayStream();
+        });
       });
     }
 
@@ -3064,6 +3089,9 @@ export function TerminalSurface({
         pendingRectW = last.contentRect.width;
         pendingRectH = last.contentRect.height;
       }
+      if (pendingRectW >= 60 && pendingRectH >= 40) {
+        notifyAttachReady();
+      }
       if (isSplitMotionActive()) {
         if (!offSplitSettle) {
           offSplitSettle = onSplitMotionSettled(() => {
@@ -3131,6 +3159,14 @@ export function TerminalSurface({
 
     return () => {
       alive = false;
+      if (onActivatedAttachRef.current === notifyAttachReady) {
+        onActivatedAttachRef.current = null;
+      }
+      if (readyToAttachResolve) {
+        const resolve = readyToAttachResolve;
+        readyToAttachResolve = null;
+        resolve();
+      }
       window.clearTimeout(hostReadyFallback);
       window.clearTimeout(seedTimer);
       window.clearTimeout(flushTimer);
@@ -3256,6 +3292,7 @@ export function TerminalSurface({
       detachWebglRef.current?.();
       return;
     }
+    onActivatedAttachRef.current?.();
     attachWebglRef.current?.();
     const term = termRef.current;
     lastActivateAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -3275,6 +3312,7 @@ export function TerminalSurface({
     term.refresh(0, Math.max(0, term.rows - 1));
     paintOverlays();
     const id = requestAnimationFrame(() => {
+      onActivatedAttachRef.current?.();
       if (termRef.current === term) {
         paintOverlays();
       }

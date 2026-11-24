@@ -192,6 +192,7 @@ export class Assistant {
   /** Agents that stopped and passed the thresholds, waiting to be looked at (possibly together). */
   private stops: Stop[] = [];
   private wakeTimes: number[] = [];
+  private wakeQuotaCooldownUntil = 0;
   private wakesRunning = 0;
   private wakeQueue: Array<() => void> = [];
   private activeWakeAborts = new Set<AbortController>();
@@ -1604,6 +1605,9 @@ export class Assistant {
    */
   private async look(material: string, tools: boolean, timeoutMs: number): Promise<ReturnType<typeof parseWake> | null> {
     if (!this.llm) return null;
+    if (this.now() < this.wakeQuotaCooldownUntil) {
+      return null;
+    }
     if (!this.mayWake()) {
       this.event({ kind: "wake", level: "warn", msg: "wake-up limit reached, using the fixed sentence" });
       return null;
@@ -1634,7 +1638,13 @@ export class Assistant {
       this.event({ kind: "wake", msg: `woke ${Date.now() - t0}ms verdict=${out.verdict}: ${clip(out.say, 120)}` });
       return out;
     } catch (e) {
-      this.event({ kind: "wake", level: "error", msg: `wake-up failed after ${Date.now() - t0}ms: ${(e as Error).message.slice(0, 200)}` });
+      const errMsg = ((e as Error)?.message ?? String(e)).slice(0, 200);
+      if (/(?:\b429\b|quota exhausted|insufficient_quota|rate[ _-]?limit)/i.test(errMsg)) {
+        this.wakeQuotaCooldownUntil = this.now() + 5 * 60_000;
+        this.event({ kind: "wake", level: "warn", msg: `wake-up paused 5m (quota/rate limit): ${errMsg}` });
+      } else {
+        this.event({ kind: "wake", level: "error", msg: `wake-up failed after ${Date.now() - t0}ms: ${errMsg}` });
+      }
       return null;
     } finally {
       this.activeWakeAborts.delete(ac);

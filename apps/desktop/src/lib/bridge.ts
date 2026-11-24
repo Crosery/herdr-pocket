@@ -554,7 +554,9 @@ export interface ProbeUpdateSourcesResult {
   probes: SourceProbe[];
 }
 
-const FULL_PROBE_TIMEOUT_MS = 3500;
+const FULL_PROBE_TIMEOUT_MS = 8000;
+const DESKTOP_PROBE_TIMEOUT_MS = 8000;
+const REMEMBERED_SOURCE_TIMEOUT_MS = 6000;
 
 /** Reads cached `probes` and `winner` from `sources.json` (or localStorage outside Tauri). */
 export async function readCachedSourceProbes(): Promise<CachedSourceProbes | null> {
@@ -670,7 +672,7 @@ function parseManifestOrSums(text: string): ParsedReleaseSource | null {
 async function fetchSums(
   url: string,
   signal: AbortSignal,
-  timeoutMs = SOURCE_PROBE_TIMEOUT_MS,
+  timeoutMs = DESKTOP_PROBE_TIMEOUT_MS,
 ): Promise<ParsedReleaseSource> {
   // A mirror that answers with an error page is not an answer.
   const parsed = parseManifestOrSums(await fetchListing(url, signal, timeoutMs));
@@ -681,13 +683,22 @@ async function fetchSums(
 async function fetchManifestOrSumsFromSource(
   source: string,
   signal: AbortSignal,
-  timeoutMs = SOURCE_PROBE_TIMEOUT_MS,
+  timeoutMs = DESKTOP_PROBE_TIMEOUT_MS,
 ): Promise<ParsedReleaseSource> {
+  const perReqTimeout = Math.max(2500, Math.min(timeoutMs, Math.floor(timeoutMs * 0.65)));
+  const ctl = new AbortController();
+  const onParentAbort = () => ctl.abort();
+  if (signal.aborted) ctl.abort();
+  else signal.addEventListener("abort", onParentAbort, { once: true });
+  const t = setTimeout(() => ctl.abort(), perReqTimeout);
   try {
-    return await fetchSums(sourceUrl(source, LATEST_MANIFEST_URL), signal, timeoutMs);
+    return await fetchSums(sourceUrl(source, LATEST_MANIFEST_URL), ctl.signal, perReqTimeout);
   } catch (err) {
     if (signal.aborted) throw err;
     return await fetchSums(sourceUrl(source, LATEST_SUMS_URL), signal, timeoutMs);
+  } finally {
+    clearTimeout(t);
+    signal.removeEventListener("abort", onParentAbort);
   }
 }
 
@@ -722,11 +733,11 @@ async function raceSums(
     if (!order.length) return finish();
     order.forEach((source, i) => {
       const ctl = ctls[i]!;
-      const timer = setTimeout(() => ctl.abort(), SOURCE_PROBE_TIMEOUT_MS);
+      const timer = setTimeout(() => ctl.abort(), DESKTOP_PROBE_TIMEOUT_MS);
       const started = Date.now();
       const req = pathUrl
-        ? fetchSums(sourceUrl(source, pathUrl), ctl.signal)
-        : fetchManifestOrSumsFromSource(source, ctl.signal);
+        ? fetchSums(sourceUrl(source, pathUrl), ctl.signal, DESKTOP_PROBE_TIMEOUT_MS)
+        : fetchManifestOrSumsFromSource(source, ctl.signal, DESKTOP_PROBE_TIMEOUT_MS);
       req.then(
         (r) => {
           clearTimeout(timer);
@@ -739,7 +750,7 @@ async function raceSums(
         (e: unknown) => {
           clearTimeout(timer);
           if (done) return;
-          const msg = ctl.signal.aborted ? `no answer within ${SOURCE_PROBE_TIMEOUT_MS} ms` : e instanceof Error ? e.message : String(e);
+          const msg = ctl.signal.aborted ? `no answer within ${DESKTOP_PROBE_TIMEOUT_MS} ms` : e instanceof Error ? e.message : String(e);
           probes.push({ source, ok: false, ms: Date.now() - started, error: msg.slice(0, 160) });
           if (probes.length === order.length) finish();
         },
@@ -857,7 +868,7 @@ export async function fetchVersionReleaseNotes(
 export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<ReleaseUpdateInfo> {
   const forceRace = typeof opts === "object" && opts !== null && Boolean(opts.forceRace);
   const ghPromise: Promise<GithubLatestRelease | null> = isTauri()
-    ? tauriInvoke<GithubLatestRelease>("update_fetch_github_latest", { timeoutMs: 4500 }).catch(() => null)
+    ? tauriInvoke<GithubLatestRelease>("update_fetch_github_latest", { timeoutMs: DESKTOP_PROBE_TIMEOUT_MS }).catch(() => null)
     : Promise.resolve(null);
 
   const { decision, mirrors, preferredSource } = await updateRegion(opts);
@@ -873,10 +884,10 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
 
   if (explicitSource !== undefined) {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), SOURCE_PROBE_TIMEOUT_MS);
+    const t = setTimeout(() => ctl.abort(), DESKTOP_PROBE_TIMEOUT_MS);
     const started = Date.now();
     try {
-      const hit = await fetchManifestOrSumsFromSource(explicitSource, ctl.signal, SOURCE_PROBE_TIMEOUT_MS);
+      const hit = await fetchManifestOrSumsFromSource(explicitSource, ctl.signal, DESKTOP_PROBE_TIMEOUT_MS);
       version = hit.version;
       sumsMap = hit.sums;
       manifest = hit.manifest;
@@ -884,7 +895,7 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
       probes = [{ source: explicitSource, ok: true, ms: Date.now() - started }];
     } catch (e) {
       const msg = ctl.signal.aborted
-        ? `no answer within ${SOURCE_PROBE_TIMEOUT_MS} ms`
+        ? `no answer within ${DESKTOP_PROBE_TIMEOUT_MS} ms`
         : e instanceof Error
           ? e.message
           : String(e);
@@ -898,9 +909,9 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
     }
   } else if (!forceRace && cached !== undefined) {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 2500);
+    const t = setTimeout(() => ctl.abort(), REMEMBERED_SOURCE_TIMEOUT_MS);
     try {
-      const hit = await fetchManifestOrSumsFromSource(cached, ctl.signal, 2500);
+      const hit = await fetchManifestOrSumsFromSource(cached, ctl.signal, REMEMBERED_SOURCE_TIMEOUT_MS);
       version = hit.version;
       sumsMap = hit.sums;
       manifest = hit.manifest;

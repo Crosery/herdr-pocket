@@ -587,6 +587,8 @@ export class UnifloAdapter {
   private refreshing = false;
   private refreshAgain = false;
   private transcriptMetaCache = new Map<string, { updatedAt: number; mtimeMs?: number; size?: number; model?: string; thinkingLevel?: string; queuedItems?: string[] }>();
+  private recentModelsCache = new Map<string, { at: number; models: string[] }>();
+  private recentModelsInflight = new Map<string, Promise<string[]>>();
 
   constructor(base = process.env.UNIFLO_URL ?? "http://127.0.0.1:7311", token = process.env.UNIFLO_TOKEN) {
     this.base = base.replace(/\/+$/, "");
@@ -1228,26 +1230,39 @@ export class UnifloAdapter {
     return { since: r.since ?? undefined, rows: rows.slice(0, 15), total: toUsage(r.totals ?? {}) };
   }
 
-  /** Recent distinct model IDs used in the last 30 days, ordered by steps/usage. */
+  /** Recent distinct model IDs used in the last 30 days, ordered by steps/usage (30s cache + inflight dedup). */
   async recentModels(harness?: string): Promise<string[]> {
-    const query = new URLSearchParams({ group_by: "model", since: "30d" });
-    if (harness?.trim()) query.set("q", `h:${harness.trim()}`);
-    const r = (await this.get(`/v1/usage?${query}`)) as { rows?: Array<Record<string, unknown>> };
-    const rows = Array.isArray(r.rows) ? r.rows : [];
-    const sorted = [...rows].sort((a, b) => {
-      const sa = typeof a.steps === "number" ? a.steps : 0;
-      const sb = typeof b.steps === "number" ? b.steps : 0;
-      return sb - sa;
+    const cacheKey = harness?.trim() || "*";
+    const cached = this.recentModelsCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < 30_000) return cached.models;
+    const existing = this.recentModelsInflight.get(cacheKey);
+    if (existing) return existing;
+
+    const p = (async () => {
+      const query = new URLSearchParams({ group_by: "model", since: "30d" });
+      if (harness?.trim()) query.set("q", `h:${harness.trim()}`);
+      const r = (await this.get(`/v1/usage?${query}`)) as { rows?: Array<Record<string, unknown>> };
+      const rows = Array.isArray(r.rows) ? r.rows : [];
+      const sorted = [...rows].sort((a, b) => {
+        const sa = typeof a.steps === "number" ? a.steps : 0;
+        const sb = typeof b.steps === "number" ? b.steps : 0;
+        return sb - sa;
+      });
+      const out: string[] = [];
+      const seen = new Set<string>();
+      for (const row of sorted) {
+        const id = String(row.key || row.label || "").trim();
+        if (!id || id === "(other)" || seen.has(id.toLowerCase())) continue;
+        seen.add(id.toLowerCase());
+        out.push(id);
+      }
+      this.recentModelsCache.set(cacheKey, { at: Date.now(), models: out });
+      return out;
+    })().finally(() => {
+      this.recentModelsInflight.delete(cacheKey);
     });
-    const out: string[] = [];
-    const seen = new Set<string>();
-    for (const row of sorted) {
-      const id = String(row.key || row.label || "").trim();
-      if (!id || id === "(other)" || seen.has(id.toLowerCase())) continue;
-      seen.add(id.toLowerCase());
-      out.push(id);
-    }
-    return out;
+    this.recentModelsInflight.set(cacheKey, p);
+    return p;
   }
 
   /** Detailed token, cache, reasoning, context, and per-model breakdown for one Uniflo session key. */

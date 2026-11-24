@@ -496,6 +496,8 @@ export class OsCaptureDriver {
   private deps: OsCaptureDeps;
   private macHelperBin: string | null = null;
   private macHelperTried = false;
+  private windowsCache: { at: number; list: RemoteWindowInfo[] } | null = null;
+  private windowsInflight: Promise<RemoteWindowInfo[]> | null = null;
 
   constructor(deps: OsCaptureDeps = {}) {
     this.deps = deps;
@@ -536,6 +538,20 @@ export class OsCaptureDriver {
   }
 
   async listWindows(): Promise<RemoteWindowInfo[]> {
+    if (this.windowsInflight) return this.windowsInflight;
+    const p = this.listWindowsUncached()
+      .then((list) => {
+        this.windowsCache = { at: Date.now(), list };
+        return list;
+      })
+      .finally(() => {
+        this.windowsInflight = null;
+      });
+    this.windowsInflight = p;
+    return p;
+  }
+
+  private async listWindowsUncached(): Promise<RemoteWindowInfo[]> {
     const info = detectPortalSession(this.deps);
     if (info.sessionType === "macos") {
       const helper = await this.ensureMacHelper();
@@ -701,7 +717,14 @@ export class OsCaptureDriver {
 
   async captureWindow(windowId: string): Promise<{ mime: "image/jpeg" | "image/png"; data: string; width: number; height: number; bounds?: RemoteWindowInfo["bounds"]; pid?: number } | null> {
     const info = detectPortalSession(this.deps);
-    const list = await this.listWindows().catch(() => []);
+    let list: RemoteWindowInfo[] = [];
+    if (windowId !== "screen:0") {
+      if (this.windowsCache && Date.now() - this.windowsCache.at < 5_000) {
+        list = this.windowsCache.list;
+      } else {
+        list = await this.listWindows().catch(() => []);
+      }
+    }
     const target = list.find((w) => w.id === windowId);
     const bounds = target?.bounds;
 

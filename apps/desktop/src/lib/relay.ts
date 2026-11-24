@@ -21,7 +21,7 @@ import { DirectError, DirectLink, SAFE_AGAIN } from "./direct";
 import { createIdentityProof } from "./h5Identity";
 import { localHostIdStore, refreshLocalHostIdFast } from "./fonts";
 import { liveStore, settingsStore, updateSettings } from "./store";
-import { clearSession, defaultDeviceName, detectPlatform, getLocalPairCode, pushSystemNotification, saveSession, type LocalPairError } from "./bridge";
+import { appVersion, clearSession, defaultDeviceName, detectPlatform, getLocalPairCode, pushSystemNotification, saveSession, type LocalPairError } from "./bridge";
 import { isMockServer, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
 import { logger, registerWebLogUploader } from "./log";
@@ -306,7 +306,7 @@ class SocketClient {
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this.lastSeen = Date.now();
-      this.send({ type: "hello", version: PROTOCOL_VERSION, platform: detectPlatform() });
+      this.send({ type: "hello", version: PROTOCOL_VERSION, platform: detectPlatform(), appVersion: appVersion() });
     };
     ws.onmessage = (ev) => {
       if (this.ws !== ws || typeof ev.data !== "string") return;

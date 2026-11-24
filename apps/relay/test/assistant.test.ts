@@ -962,3 +962,30 @@ test("woken inspection reads terminal fallback when current turn has no assistan
   assert.doesNotMatch(material, /上一轮的旧回答/);
   assert.match(material, /它的终端最后 40 行：\nBundling Herdr Pocket\.app/);
 });
+
+test("wake 429 quota exhaustion pauses wake retries for 5m without error spam and falls back cleanly", async () => {
+  const { publish } = await fakeHost("Mac Quota", () => undefined);
+  const phone = await pair("viewer", "Quota Phone");
+  const push = await Sock.open("/v1/notify", phone.token);
+  await push.next((f) => f.type === "hello");
+
+  let wakeAttempts = 0;
+  wake = () => {
+    wakeAttempts += 1;
+    throw new Error('mimo:mimo-v2.6-flash: HTTP 429 { "error": { "code": "429", "message": "quota exhausted" } }');
+  };
+
+  publish([agent("q1", "working", "任务一", ran(5 * 60_000))]);
+  await sleep(25);
+  publish([agent("q1", "done", "任务一")]);
+  const n1 = await push.next((f) => f.type === "notice");
+  assert.equal(n1.notice.title, "任务一 · 停了");
+  assert.equal(wakeAttempts, 1);
+
+  publish([agent("q2", "working", "任务二", ran(5 * 60_000))]);
+  await sleep(25);
+  publish([agent("q2", "done", "任务二")]);
+  const n2 = await push.next((f) => f.type === "notice");
+  assert.equal(n2.notice.title, "任务二 · 停了");
+  assert.equal(wakeAttempts, 1, "second stop within 5m cooldown must skip wake LLM call");
+});
