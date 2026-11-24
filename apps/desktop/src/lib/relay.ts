@@ -202,6 +202,7 @@ interface Sub {
   onEvent: StreamCb;
   onState?: StreamCb;
   via?: DirectLink;
+  delivered?: number;
 }
 
 interface DirectTryState {
@@ -515,7 +516,7 @@ class SocketClient {
         this.attempt = 0;
         void loadAssistant();
         for (const s of this.subs.values()) {
-          if (!s.via) this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
+          if (!s.via) this.openStream(s);
         }
         this.tryDirectAll(false);
         break;
@@ -592,9 +593,14 @@ class SocketClient {
         else s.onState?.({ kind: "live", result: f.result });
         break;
       }
-      case "stream_event":
-        this.subs.get(f.id)?.onEvent(f.event);
+      case "stream_event": {
+        const sub = this.subs.get(f.id);
+        if (sub) {
+          sub.delivered = (sub.delivered ?? 0) + 1;
+          sub.onEvent(f.event);
+        }
         break;
+      }
       case "pong": {
         this.clearPong();
         if (this.lastPing > 0) {
@@ -631,10 +637,25 @@ class SocketClient {
     }
   }
 
+  private streamParamsFor(s: Sub): unknown {
+    // When re-homing or reconnecting an already-populated terminal stream, request history: 0 so 600 scrollback lines never replay.
+    if (
+      s.stream === "terminal" &&
+      (s.delivered ?? 0) > 0 &&
+      s.params &&
+      typeof s.params === "object" &&
+      !Array.isArray(s.params)
+    ) {
+      return { ...(s.params as Record<string, unknown>), history: 0 };
+    }
+    return s.params;
+  }
+
   private openStream(s: Sub): void {
+    const params = this.streamParamsFor(s);
     const sent = s.via
-      ? s.via.subscribe(s.id, s.stream, s.params)
-      : this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params: s.params });
+      ? s.via.subscribe(s.id, s.stream, params)
+      : this.send({ type: "stream_subscribe", id: s.id, to: s.to, stream: s.stream, params });
     if (!sent) s.onState?.({ kind: "stale", error: "连接断开" });
   }
 
@@ -759,6 +780,7 @@ class SocketClient {
         this.rehome(to);
       } catch (e) {
         t.fails += 1;
+        logger.warn("link.direct", `direct attempt #${t.fails} to ${liveStore.get().devices[to]?.name ?? to} failed: ${(e as Error)?.message ?? String(e)}`);
         if (e instanceof RelayError && (e.code === "unsupported" || e.code === "forbidden")) {
           t.next = Infinity;
         } else {

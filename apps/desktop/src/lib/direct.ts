@@ -10,6 +10,7 @@ import {
   type StreamKind,
 } from "@herdr-pocket/protocol";
 import { native } from "./native";
+import { logger } from "./log";
 
 export class DirectError extends Error {
   code: RpcError["code"];
@@ -71,7 +72,7 @@ interface Pending {
 const DIAL_LOCAL_MS = 1200;
 const DIAL_REMOTE_MS = 2200;
 const PING_MS = 20_000;
-const PONG_WAIT_MS = 6_000;
+const PONG_WAIT_MS = 15_000;
 
 function decodeBase64(b64: string): Uint8Array {
   if (typeof Buffer !== "undefined") {
@@ -83,11 +84,17 @@ function decodeBase64(b64: string): Uint8Array {
   return out;
 }
 
-async function rawToBytes(data: unknown): Promise<Uint8Array | null> {
+function rawToBytesSync(data: unknown): Uint8Array | null {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (ArrayBuffer.isView(data)) {
     return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   }
+  return null;
+}
+
+async function rawToBytes(data: unknown): Promise<Uint8Array | null> {
+  const sync = rawToBytesSync(data);
+  if (sync) return sync;
   if (typeof Blob !== "undefined" && data instanceof Blob) {
     return new Uint8Array(await data.arrayBuffer());
   }
@@ -178,6 +185,8 @@ export class DirectLink {
   private seq = 0;
   private pingTimer: ReturnType<typeof setInterval>;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
+  private pingSentAt = 0;
+  private rxChain: Promise<void> = Promise.resolve();
   private closed = false;
 
   private constructor(
@@ -198,10 +207,16 @@ export class DirectLink {
     this.handlers = handlers;
 
     ws.onmessage = (ev) => {
-      void this.handleMessage(ev.data);
+      this.enqueueMessage(ev.data);
     };
-    ws.onclose = () => this.close();
-    ws.onerror = () => this.close();
+    ws.onclose = (ev) => {
+      logger.info("link.direct", `ws closed on ${this.displayAddr} (code=${ev?.code ?? "?"})`);
+      this.close();
+    };
+    ws.onerror = () => {
+      logger.warn("link.direct", `ws error on ${this.displayAddr}`);
+      this.close();
+    };
 
     this.pingTimer = setInterval(() => this.sendPing(), PING_MS);
   }
@@ -225,14 +240,18 @@ export class DirectLink {
     }
 
     if (native.available() && !preferLoopback) {
+      logger.info("link.direct", `probing ${candidates.join(", ")}:${offer.port} via native tunnel`);
       const tunnel = await native.openDirectTunnel(candidates, offer.port);
       if (tunnel && tunnel.localPort > 0) {
         try {
           const win = await dialCandidate("127.0.0.1", tunnel.localPort, offer.ticket, key, DIAL_LOCAL_MS);
+          logger.info("link.direct", `tunnel connected -> ${tunnel.remoteAddr}:${offer.port} (local:${tunnel.localPort})`);
           return new DirectLink(to, "127.0.0.1", tunnel.localPort, win.ws, win.cipher, handlers, tunnel.remoteAddr);
-        } catch {
-          // Fall back to direct WebSocket racing below if local tunnel fails handshake.
+        } catch (err) {
+          logger.warn("link.direct", `tunnel handshake failed (${String(err)}), falling back to direct race`);
         }
+      } else {
+        logger.warn("link.direct", `native tunnel unavailable for ${candidates.join(", ")}, falling back to direct race`);
       }
     }
 
@@ -300,11 +319,31 @@ export class DirectLink {
     }
   }
 
-  private async handleMessage(data: unknown): Promise<void> {
+  private enqueueMessage(data: unknown): void {
     if (this.closed) return;
-    const bytes = await rawToBytes(data);
-    const text = bytes ? this.cipher.open(bytes) : null;
+    const syncBytes = rawToBytesSync(data);
+    if (syncBytes) {
+      // Run ArrayBuffer / TypedArray decryption synchronously so ChaCha20 nonce order never drifts across microtasks.
+      this.processPacketBytes(syncBytes);
+      return;
+    }
+    this.rxChain = this.rxChain.then(async () => {
+      if (this.closed) return;
+      const bytes = await rawToBytes(data);
+      if (!bytes) {
+        logger.warn("link.direct", `unexpected non-binary direct frame on ${this.displayAddr}`);
+        this.close();
+        return;
+      }
+      this.processPacketBytes(bytes);
+    });
+  }
+
+  private processPacketBytes(bytes: Uint8Array): void {
+    if (this.closed) return;
+    const text = this.cipher.open(bytes);
     if (text === null) {
+      logger.warn("link.direct", `cipher open failed on ${this.displayAddr}`);
       this.close();
       return;
     }
@@ -337,10 +376,20 @@ export class DirectLink {
 
   private sendPing(): void {
     if (!this.open) return;
-    if (!this.send({ type: "ping", t: Date.now() })) return;
+    const now = Date.now();
+    this.pingSentAt = now;
+    if (!this.send({ type: "ping", t: now })) return;
     if (!this.pongTimer) {
       this.pongTimer = setTimeout(() => {
         this.pongTimer = null;
+        if (this.closed) return;
+        const elapsed = Date.now() - this.pingSentAt;
+        if (elapsed > PONG_WAIT_MS + 5_000) {
+          // WKWebView / App Nap froze timers: probe once more instead of tearing down a healthy socket.
+          this.sendPing();
+          return;
+        }
+        logger.warn("link.direct", `direct pong timeout on ${this.displayAddr} (${elapsed}ms)`);
         this.close();
       }, PONG_WAIT_MS);
     }

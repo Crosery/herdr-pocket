@@ -169,6 +169,29 @@
   pointer-events: none;
 }
 
+.tp-term-host .xterm .xterm-helper-textarea {
+  width: 1px !important;
+  height: 18px !important;
+  max-width: 1px !important;
+  max-height: 18px !important;
+  overflow: hidden !important;
+  clip-path: inset(0) !important;
+  white-space: nowrap !important;
+}
+
+.tp-term-host .xterm .composition-view.tp-ime-clamped {
+  left: var(--tp-ime-left, 2px) !important;
+  top: var(--tp-ime-top, 0px) !important;
+  max-width: var(--tp-ime-max-w, calc(100% - 4px)) !important;
+  width: fit-content !important;
+  height: auto !important;
+  min-height: var(--tp-ime-line-h, 18px) !important;
+  box-sizing: border-box !important;
+  white-space: pre-wrap !important;
+  word-break: break-all !important;
+  overflow-wrap: anywhere !important;
+}
+
 .tp-term-host .xterm.xterm-cursor-pointer,
 .tp-term-host .xterm.xterm-cursor-pointer .xterm-screen {
   cursor: pointer !important;

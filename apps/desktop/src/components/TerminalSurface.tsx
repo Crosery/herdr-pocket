@@ -1324,9 +1324,11 @@ export function TerminalSurface({
 
     hostEl.dataset.ready = "false";
     let initialReadyDone = false;
+    let initialAttachPending = false;
     const markHostReady = () => {
       if (initialReadyDone) return;
       initialReadyDone = true;
+      initialAttachPending = false;
       hostEl.dataset.ready = "true";
     };
     let hostReadyFallback = 0;
@@ -2823,15 +2825,22 @@ export function TerminalSurface({
       // straight to the latest progress instead of replaying top-to-bottom on switch.
       if (!initialReadyDone) {
         if (!initialBurstStartAt) initialBurstStartAt = nowMs;
-        const maxRemain = Math.max(0, INITIAL_BURST_MAX_MS - (nowMs - initialBurstStartAt));
-        if (!hitCap && maxRemain > 2) {
+        const burstElapsed = nowMs - initialBurstStartAt;
+        if (initialAttachPending && burstElapsed >= 450) {
+          initialAttachPending = false;
+        }
+        const maxRemain = Math.max(0, INITIAL_BURST_MAX_MS - burstElapsed);
+        if (!hitCap && (initialAttachPending || maxRemain > 2)) {
           if (flushRaf) {
             cancelAnimationFrame(flushRaf);
             flushRaf = 0;
           }
           if (flushTimer) window.clearTimeout(flushTimer);
-          const quietMs = activeLocalConnId ? 30 : 65;
-          flushTimer = window.setTimeout(flushPendingBytes, Math.min(quietMs, Math.ceil(maxRemain)));
+          const quietMs = activeLocalConnId ? 75 : 110;
+          flushTimer = window.setTimeout(
+            flushPendingBytes,
+            Math.min(quietMs, Math.max(8, Math.ceil(maxRemain))),
+          );
           return;
         }
         sawAnyOutput = true;
@@ -2940,12 +2949,16 @@ export function TerminalSurface({
 
     const startRelayStream = () => {
       if (!alive || unsubRelay) return;
+      if (!initialReadyDone) {
+        initialAttachPending = true;
+      }
       if (!initialReadyDone && !hostReadyFallback) {
         hostReadyFallback = window.setTimeout(markHostReady, 950);
       }
       let rawModeConfirmed = false;
       const runFallbackRead = () => {
         if (!alive || sawRaw || rawModeConfirmed) return;
+        initialAttachPending = false;
         void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 })
           .then((res) => {
             if (alive && !sawRaw && !rawModeConfirmed) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
@@ -3001,6 +3014,7 @@ export function TerminalSurface({
           if (!alive || !state) return;
           if (state.kind === "live" && state.result?.raw === true) {
             rawModeConfirmed = true;
+            initialAttachPending = false;
             if (seedTimer) {
               clearTimeout(seedTimer);
               seedTimer = 0;
@@ -3041,6 +3055,9 @@ export function TerminalSurface({
       const connectLocal = async (attempt: number): Promise<void> => {
         const gen = ++attachGen;
         if (!alive) return;
+        if (!initialReadyDone) {
+          initialAttachPending = true;
+        }
         if (!initialReadyDone && !hostReadyFallback) {
           hostReadyFallback = window.setTimeout(markHostReady, 950);
         }
@@ -3105,6 +3122,7 @@ export function TerminalSurface({
           // Batch buffered pre-resolve PTY chunks with the initial burst so partial scrollback never reveals early.
           const buffered = preResolveChunks;
           preResolveChunks = null;
+          initialAttachPending = false;
           for (const chunk of buffered) {
             if (!sawRaw) sawRaw = true;
             queueRawBytes(chunk);
@@ -3118,6 +3136,7 @@ export function TerminalSurface({
           }
         } catch {
           preResolveChunks = null;
+          initialAttachPending = false;
           if (localConnRef.current === connId) localConnRef.current = null;
           if (activeLocalConnId === connId) activeLocalConnId = null;
           if (alive && gen === attachGen) startRelayStream();

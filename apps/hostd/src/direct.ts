@@ -50,6 +50,7 @@ export interface DirectServerOptions {
   port?: number;
   /** This computer's device id (sent to the phone once the link opens). */
   hostId: () => string;
+  onOpen?: (peer: DirectPeer) => void;
   onFrame: (peer: DirectPeer, frame: Record<string, unknown>) => void;
   onClose: (peer: DirectPeer) => void;
   onHttpRequest?: (req: IncomingMessage, res: ServerResponse) => boolean | Promise<boolean>;
@@ -151,7 +152,7 @@ export class DirectServer {
       }
       const now = Date.now();
       for (const [t, x] of this.tickets) if (x.expiresAt < now) this.tickets.delete(t);
-    }, 30_000);
+    }, 45_000);
     this.beat.unref?.();
     wss.on("connection", (ws: WebSocket) => {
       alive.add(ws);
@@ -205,6 +206,7 @@ export class DirectServer {
     // One link per phone: a new one (the phone came back) replaces the old.
     for (const [other, p] of this.peers) if (p.deviceId === deviceId) other.close(4000, "replaced");
     this.peers.set(ws, peer);
+    this.opts.onOpen?.(peer);
     ws.on("message", (data, isBinary) => {
       const text = isBinary ? cipher.open(new Uint8Array(data as Buffer)) : null;
       if (text === null) {

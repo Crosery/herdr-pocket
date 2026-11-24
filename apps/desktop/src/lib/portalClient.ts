@@ -10,6 +10,7 @@ import {
   type PortalStreamEvent,
   type RemoteWindowInfo,
 } from "@herdr-pocket/protocol";
+import { logger } from "./log";
 import { getDirectEndpoint, rpcCall, subscribeStream } from "./relay";
 import { liveStore } from "./store";
 
@@ -333,7 +334,11 @@ export async function openPortalSurface(
   hostId: string,
   params: { agent?: string; kind: PortalKind; target?: string; url?: string; windowId?: string; reveal?: boolean; title?: string },
 ): Promise<{ item: PortalItem; ticket?: PortalFileTicket }> {
-  const res = await rpcCall(hostId, "portal.open", params, 20_000);
+  logger.info("portal", "portal.open", { kind: params.kind, reveal: Boolean(params.reveal) });
+  const res = await rpcCall(hostId, "portal.open", params, 20_000).catch((err) => {
+    logger.warn("portal", `portal.open failed: ${(err as Error)?.message ?? String(err)}`, { kind: params.kind });
+    throw err;
+  });
   setState((prev) => {
     const dismissedIds = { ...prev.dismissedIds };
     delete dismissedIds[res.item.id];
@@ -349,6 +354,7 @@ export async function openPortalSurface(
 }
 
 export async function closePortalSurface(hostId: string, portalId: string): Promise<void> {
+  logger.info("portal", "portal.close", { portalId });
   await rpcCall(hostId, "portal.close", { portalId }).catch(() => {});
   setState((prev) => {
     const itemsById = { ...prev.itemsById };
@@ -368,17 +374,22 @@ export function capturePortalFrameOnce(hostId: string, portalId: string): Promis
   const pending = inflightFrames.get(key);
   if (pending) return pending;
   const p = (async () => {
-    const res = await rpcCall(hostId, "portal.frame", { portalId }, 12_000);
-    if (res.item) {
-      setState((prev) => ({
-        ...prev,
-        itemsById: { ...prev.itemsById, [res.item!.id]: res.item! },
-      }));
+    try {
+      const res = await rpcCall(hostId, "portal.frame", { portalId }, 12_000);
+      if (res.item) {
+        setState((prev) => ({
+          ...prev,
+          itemsById: { ...prev.itemsById, [res.item!.id]: res.item! },
+        }));
+      }
+      if (res.frame) {
+        ingestPortalStreamEvent({ kind: "portal_frame", ...res.frame });
+      }
+      return res.frame;
+    } catch (err) {
+      logger.warn("portal", `portal.frame error: ${(err as Error)?.message ?? String(err)}`, { portalId });
+      throw err;
     }
-    if (res.frame) {
-      ingestPortalStreamEvent({ kind: "portal_frame", ...res.frame });
-    }
-    return res.frame;
   })().finally(() => {
     inflightFrames.delete(key);
   });

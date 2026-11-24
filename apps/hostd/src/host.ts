@@ -82,8 +82,11 @@ const MUTATING = new Set([
   "git.push",
   "tools.update",
   "portal.open",
+  "portal.input",
   "portal.close",
 ]);
+
+const QUIET_READ_RPCS = new Set(["portal.frame", "terminal.read", "session.events", "terminal.putChunk"]);
 
 /** What a call was about, short: never more than 200 characters of anyone's message. */
 function callSummary(params: unknown, result?: unknown): Record<string, unknown> | undefined {
@@ -207,9 +210,10 @@ export class Host {
   /** This computer's own log lines, uploaded to the relay every minute. */
   logs = new LogBuffer();
   private logTimer: NodeJS.Timeout | null = null;
+  private urgentLogTimer: NodeJS.Timeout | null = null;
   private stopTelemetry: (() => void) | null = null;
   /** How often the log ring is uploaded. */
-  logEveryMs = 60_000;
+  logEveryMs = 5_000;
   /** How long agent.create waits for a program before typing its first task (tests shorten it). */
   firstTaskOptions: TypeTaskOptions = {};
   /** Where pictures for agents of the herdr terminal app are kept (tests point it elsewhere). */
@@ -303,12 +307,17 @@ export class Host {
     this.chunkedPut = new ChunkedPutManager({
       filesDir: () => this.filesDir,
       putThroughHc: (localId, file) => this.hc.put(localId, file),
+      onLog: (level, msg, data) => this.note(level, "files", msg, data),
     });
     this.direct = new DirectServer({
       port: opts.config.directPort,
       hostId: () => this.deviceId,
+      onOpen: (peer) => this.note("info", "direct", `direct peer open ${this.who(peer.deviceId)} (${peer.tag})`),
       onFrame: (peer, f) => this.onDirectFrame(peer, f),
-      onClose: (peer) => this.stopStreams((id) => id.startsWith(peer.tag)),
+      onClose: (peer) => {
+        this.note("info", "direct", `direct peer closed ${this.who(peer.deviceId)} (${peer.tag})`);
+        this.stopStreams((id) => id.startsWith(peer.tag));
+      },
       onHttpRequest: async (req, res) =>
         (await this.chunkedPut.handleHttpRequest(req, res)) ||
         (await this.portal.tickets.handleHttpRequest(req, res)),
@@ -353,6 +362,13 @@ export class Host {
     const rank: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
     if (rank[level] < rank[this.settings.config.logging.level]) return;
     this.logs.push(level, kind, msg, data);
+    if ((level === "warn" || level === "error") && this.logTimer !== null && !this.urgentLogTimer && this.connected) {
+      this.urgentLogTimer = setTimeout(() => {
+        this.urgentLogTimer = null;
+        if (!this.stopped) this.flushLogs();
+      }, 400);
+      this.urgentLogTimer.unref?.();
+    }
   }
 
   private stampOf(c: LoadedClientConfig): string {
@@ -508,6 +524,10 @@ export class Host {
     if (this.namesTimer) clearInterval(this.namesTimer);
     if (this.sourceTimer) clearInterval(this.sourceTimer);
     if (this.logTimer) clearInterval(this.logTimer);
+    if (this.urgentLogTimer) {
+      clearTimeout(this.urgentLogTimer);
+      this.urgentLogTimer = null;
+    }
     this.stopTelemetry?.();
     this.stopTelemetry = null;
     if (this.waitTimer) clearInterval(this.waitTimer);
@@ -739,12 +759,29 @@ export class Host {
   }
 
   private send(f: ClientFrame): void {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(f));
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    const json = JSON.stringify(f);
+    const bytes = Buffer.byteLength(json);
+    if (bytes > 28 * 1024 * 1024) {
+      this.note("warn", "relay", `outbound ${f.type} frame too large (${bytes} bytes); blocked to prevent 1009`);
+      if (f.type === "rpc_result") {
+        this.ws.send(
+          JSON.stringify({
+            type: "rpc_result",
+            id: f.id,
+            error: { code: "bad_request", message: "响应数据过大，请改用直连或分片传输" },
+          } satisfies ClientFrame),
+        );
+      }
+      return;
+    }
+    this.ws.send(json);
   }
 
   // -------------------------------------------------------------------------
 
   private async handleRpc(f: Extract<ServerFrame, { type: "rpc" }>, reply: (x: ClientFrame) => void = (x) => this.send(x)): Promise<void> {
+    const t0 = Date.now();
     try {
       const allow = this.opts.allow ?? [];
       if (allow.length && !allow.includes(f.from)) throw new RpcFailure("forbidden", "这台电脑没有授权给你");
@@ -752,7 +789,12 @@ export class Host {
       if (!handler) throw new RpcFailure("unsupported", `unknown method ${f.method}`);
       const result = await handler((f.params ?? {}) as never, f.from);
       reply({ type: "rpc_result", id: f.id, result });
-      if (MUTATING.has(f.method)) this.note("info", "rpc", `${f.method} from ${this.who(f.from)} ok`, callSummary(f.params, result));
+      const ms = Date.now() - t0;
+      if (MUTATING.has(f.method)) {
+        this.note("info", "rpc", `${f.method} from ${this.who(f.from)} ok`, { ...(callSummary(f.params, result) ?? {}), ms });
+      } else if (!QUIET_READ_RPCS.has(f.method)) {
+        this.note("info", "rpc.read", `${f.method} from ${this.who(f.from)} ok (${ms}ms)`, { ...(callSummary(f.params) ?? {}), ms });
+      }
     } catch (e) {
       const error: RpcError =
         e instanceof RpcFailure
@@ -761,7 +803,12 @@ export class Host {
       reply({ type: "rpc_result", id: f.id, error });
       // Reads that find nothing are normal; anything else failing is worth a line.
       const quiet = error.code === "not_found" && !MUTATING.has(f.method);
-      if (!quiet) this.note(error.code === "internal" ? "error" : "warn", "rpc", `${f.method} from ${this.who(f.from)} failed: ${error.code}: ${error.message}`, callSummary(f.params));
+      if (!quiet) {
+        this.note(error.code === "internal" ? "error" : "warn", "rpc", `${f.method} from ${this.who(f.from)} failed: ${error.code}: ${error.message}`, {
+          ...(callSummary(f.params) ?? {}),
+          ms: Date.now() - t0,
+        });
+      }
     }
   }
 
@@ -800,6 +847,7 @@ export class Host {
           (ev) => this.sendStream(f.id, ev),
         );
         this.streamStops.set(f.id, stop);
+        this.note("info", "stream", `portal stream open from ${this.who(f.from)}`, { direct: Boolean(reply), agent: agentObj?.key });
         out({
           type: "stream_open",
           id: f.id,
@@ -876,6 +924,7 @@ export class Host {
           return;
         }
         this.streamStops.set(f.id, stop);
+        this.note("info", "stream", `terminal stream open ${a.key} from ${this.who(f.from)}`, { direct: Boolean(reply), raw: openedRaw });
         out({ type: "stream_open", id: f.id, result: { kind: "terminal", agent: a.key, ...(openedRaw ? { raw: true } : {}) } });
         return;
       }
@@ -964,6 +1013,7 @@ export class Host {
         clearTimeout(timer);
         offLive();
       });
+      this.note("info", "stream", `session stream open ${a.key} from ${this.who(f.from)}`, { direct: Boolean(reply), sub: typeof p.sub === "string" ? p.sub : undefined });
       out({ type: "stream_open", id: f.id, result: { kind: "session", sessionKey } });
     } catch (e) {
       const error: RpcError = e instanceof RpcFailure ? { code: e.code, message: e.message } : { code: "internal", message: String(e) };
@@ -1002,10 +1052,14 @@ export class Host {
   }
 
   private stopStream(id: string): void {
+    const meta = this.streamMeta.get(id);
     this.streamStops.get(id)?.();
     this.streamStops.delete(id);
     this.streamMeta.delete(id);
     this.streamReply.delete(id);
+    if (meta) {
+      this.note("info", "stream", `${meta.kind} stream closed ${meta.agent || "(global)"} (${this.who(meta.from)})`);
+    }
   }
 
   private queueEvent(agent: string, event: unknown): void {

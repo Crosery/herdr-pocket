@@ -2156,18 +2156,24 @@ pub fn query_traffic_light_metrics(app: AppHandle) -> crate::mainwin::TrafficLig
 pub fn query_os_modifiers() -> OsModifierState {
     #[cfg(target_os = "macos")]
     {
+        use objc2_app_kit::{NSEvent, NSEventModifierFlags};
         #[link(name = "CoreGraphics", kind = "framework")]
         extern "C" {
             fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
         }
-        const HID_STATE: i32 = 1; // kCGEventSourceStateHIDSystemState
-        let down = |k: u16| unsafe { CGEventSourceKeyState(HID_STATE, k) };
+        const COMBINED_SESSION_STATE: i32 = 0; // kCGEventSourceStateCombinedSessionState
+        let ns_flags = NSEvent::modifierFlags_class();
+        let down = |k: u16| unsafe { CGEventSourceKeyState(COMBINED_SESSION_STATE, k) };
+        let meta = ns_flags.contains(NSEventModifierFlags::Command) && (down(55) || down(54));
+        let ctrl = ns_flags.contains(NSEventModifierFlags::Control) && (down(59) || down(62));
+        let alt = ns_flags.contains(NSEventModifierFlags::Option) && (down(58) || down(61));
+        let shift = ns_flags.contains(NSEventModifierFlags::Shift) && (down(56) || down(60));
         return OsModifierState {
             supported: true,
-            meta: down(55) || down(54),  // kVK_Command, kVK_RightCommand
-            ctrl: down(59) || down(62),  // kVK_Control, kVK_RightControl
-            alt: down(58) || down(61),   // kVK_Option, kVK_RightOption
-            shift: down(56) || down(60), // kVK_Shift, kVK_RightShift
+            meta,
+            ctrl,
+            alt,
+            shift,
         };
     }
     #[cfg(windows)]

@@ -2106,11 +2106,23 @@ export function AgentDetailPanel({
       compHadChipRef.current = composing ? Boolean(leadingSlash) : null;
       setComposerComposing(composing);
     },
+    (nextInputVal) => {
+      setSlashDismissedFor(null);
+      if (leadingSlash) {
+        setText(`${leadingSlash.rawToken} ${nextInputVal}`);
+      } else {
+        if (nextInputVal.startsWith("/") && modelMenuMode) setModelMenuMode(null);
+        setText(nextInputVal);
+      }
+    },
   );
+
+  const readComposerFullText = () =>
+    leadingSlash ? `${leadingSlash.rawToken} ${composer.readValue()}` : composer.readValue();
 
   const submitComposer = (overrideText?: string) => {
     const isOverride = overrideText !== undefined;
-    const raw = (overrideText ?? text).trim();
+    const raw = (overrideText ?? readComposerFullText()).trim();
     const staged = isOverride ? [] : attachments;
     const now = Date.now();
     const sig = `${agent.key}\0${raw}\0${staged.length}`;
@@ -2130,6 +2142,7 @@ export function AgentDetailPanel({
       if (!isOverride) {
         clearComposerDraft(agent.key, { revoke: false });
         setTextState("");
+        composer.clearValue();
         setAttachmentsState([]);
         setChipDismissedPrefix(null);
       }
@@ -2141,6 +2154,7 @@ export function AgentDetailPanel({
     if (!staged.length && /^\/usage$/i.test(raw)) {
       if (!isOverride) {
         setText("");
+        composer.clearValue();
         setChipDismissedPrefix(null);
       }
       openUsageView();
@@ -2156,6 +2170,7 @@ export function AgentDetailPanel({
       const isOmpRoleCmd = normalizeSwitchHarness(agent.harness) === "omp" && /^\/(?:model|models)$/i.test(raw);
       if (!isOverride) {
         setText("");
+        composer.clearValue();
         setChipDismissedPrefix(null);
       }
       setModelMenuOmpTab(isOmpRoleCmd ? "roles" : "session");
@@ -2165,6 +2180,7 @@ export function AgentDetailPanel({
     if (!staged.length && /^\/(?:effort|thinking)$/i.test(raw) && effectiveThinkingLevels.length > 0) {
       if (!isOverride) {
         setText("");
+        composer.clearValue();
         setChipDismissedPrefix(null);
       }
       setModelMenuMode("thinking");
@@ -2176,6 +2192,7 @@ export function AgentDetailPanel({
         if (!isOverride) {
           clearComposerDraft(agent.key, { revoke: false });
           setTextState("");
+          composer.clearValue();
           setAttachmentsState([]);
           setChipDismissedPrefix(null);
         }
@@ -2188,6 +2205,7 @@ export function AgentDetailPanel({
     if (!isOverride) {
       clearComposerDraft(agent.key, { revoke: false });
       setTextState("");
+      composer.clearValue();
       setAttachmentsState([]);
       setChipDismissedPrefix(null);
     }
@@ -2224,11 +2242,12 @@ export function AgentDetailPanel({
   submitComposerRef.current = submitComposer;
 
   const steerComposer = () => {
-    const raw = text.trim();
+    const raw = readComposerFullText().trim();
     const staged = attachments;
     if (!raw && staged.length === 0) return;
     clearComposerDraft(agent.key, { revoke: false });
     setTextState("");
+    composer.clearValue();
     setAttachmentsState([]);
     setChipDismissedPrefix(null);
     stickRef.current = true;
@@ -2245,11 +2264,12 @@ export function AgentDetailPanel({
   steerComposerRef.current = steerComposer;
 
   const interruptComposer = () => {
-    const raw = text.trim();
+    const raw = readComposerFullText().trim();
     const staged = attachments;
     if (!raw && staged.length === 0) return;
     clearComposerDraft(agent.key, { revoke: false });
     setTextState("");
+    composer.clearValue();
     setAttachmentsState([]);
     setChipDismissedPrefix(null);
     stickRef.current = true;
@@ -3224,17 +3244,6 @@ export function AgentDetailPanel({
                         ? "输入终端命令按 Enter 执行…"
                         : `发给 ${clip(agent.name || agent.title || agent.harness, 16)}（/ 命令 · 可拖入或粘贴文件）`
               }
-              value={composerInputValue}
-              onChange={(e) => {
-                setSlashDismissedFor(null);
-                const evComposing = (e.nativeEvent as { isComposing?: boolean } | undefined)?.isComposing || composerComposing;
-                if (leadingSlash) {
-                  setText(`${leadingSlash.rawToken} ${e.target.value}`);
-                } else {
-                  if (!evComposing && e.target.value.startsWith("/") && modelMenuMode) setModelMenuMode(null);
-                  setText(e.target.value);
-                }
-              }}
               onPaste={(e) => {
                 const files = extractClipboardFiles(e.clipboardData);
                 if (files.length) {
@@ -3303,7 +3312,7 @@ export function AgentDetailPanel({
               ) : null}
             </div>
             <div className="composer-actions">
-              {isTurnBusy && !isBtwDraft && !agent.isShell && !activeSub && (Boolean(text.trim()) || attachments.length > 0) ? (
+              {isTurnBusy && !isBtwDraft && !agent.isShell && !activeSub && (composer.hasText || attachments.length > 0) ? (
                 <button
                   type="button"
                   className="composer-steer-pill"
@@ -3318,7 +3327,7 @@ export function AgentDetailPanel({
                 className="composer-send"
                 aria-label={isBtwDraft ? "发送旁路提问" : isTurnBusy ? "发送（运行中将自动排队）" : "发送"}
                 title={isBtwDraft ? "旁路提问，不打断当前轮 (Enter)" : isTurnBusy ? "发送或加入排队 (Enter)" : "发送 (Enter)"}
-                disabled={isBtwDraft ? !/^\/btw\s+\S/i.test(text.trim()) : !text.trim() && attachments.length === 0}
+                disabled={isBtwDraft ? !/^\/btw\s+\S/i.test(readComposerFullText().trim()) : !composer.hasText && attachments.length === 0}
                 onClick={() => submitComposer()}
               >
                 <Send size={14} />

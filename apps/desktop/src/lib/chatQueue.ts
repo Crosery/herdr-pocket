@@ -13,6 +13,7 @@ import {
   type SerializedAttachment,
   type StagedAttachment,
 } from "./dropPreview";
+import { logger } from "./log";
 import { rpcCall } from "./relay";
 import { allAgents, createStore, liveStore } from "./store";
 import { uploadRemoteFile } from "./uploadLargeFile";
@@ -470,6 +471,12 @@ async function deliverOutgoing(send: OutgoingSend, delivery: DeliveryMode = "aut
     // Keep attachment thumbnails/paths alive on the optimistic bubble until Uniflo echoes or prunes it.
     // Explicit steer / interrupt / inject sends stay inline (`sent`), never falling back to `queued_terminal`.
     const nextState: OutgoingSend["state"] = delivery === "auto" && sendRes?.waiting ? "queued_terminal" : "sent";
+    logger.info("chat", `deliver.${nextState}`, {
+      delivery,
+      chars: send.text.length,
+      files: send.attachments.length,
+      waiting: Boolean(sendRes?.waiting),
+    });
     updateOutgoing(send.agentKey, (list) =>
       list.map((x) =>
         x.id === send.id
@@ -485,6 +492,11 @@ async function deliverOutgoing(send: OutgoingSend, delivery: DeliveryMode = "aut
     return true;
   } catch (e) {
     const message = (e as Error).message || "发送失败";
+    logger.error("chat", `deliver.failed: ${message}`, {
+      delivery,
+      chars: send.text.length,
+      files: send.attachments.length,
+    });
     updateOutgoing(send.agentKey, (list) =>
       list.map((x) => (x.id === send.id ? { ...x, state: "failed", error: message } : x)),
     );
@@ -654,6 +666,7 @@ export async function interruptComposerNow(
   if (inFlightAgents.has(agent.key)) return false;
   const clean = rawText.trim();
   if (!clean && attachments.length === 0) return false;
+  logger.info("chat", "composer.interrupt", { chars: clean.length, files: attachments.length, status: agent.status });
   dispatchState.delete(agent.key);
   inFlightAgents.add(agent.key);
   try {
@@ -675,6 +688,7 @@ export async function injectTerminalQueuedNow(
   rawText: string,
 ): Promise<void> {
   const clean = rawText.trim();
+  logger.info("chat", "terminal_queued.inject", { chars: clean.length });
   const now = Date.now();
   chatQueueStore.set((state) => {
     const nextInjectedMap = { ...state.injectedTerminalByAgent };
@@ -721,6 +735,7 @@ export async function steerComposerNow(
   if (inFlightAgents.has(agent.key)) return;
   const clean = rawText.trim();
   if (!clean && attachments.length === 0) return;
+  logger.info("chat", "composer.steer", { chars: clean.length, files: attachments.length });
   dispatchState.delete(agent.key);
   inFlightAgents.add(agent.key);
   try {

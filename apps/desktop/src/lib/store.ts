@@ -66,7 +66,10 @@ export interface LiveState {
 
 const PREF_KEY = "herdr-pocket-client-prefs-v1";
 
-type PersistedPrefs = Partial<AppSettings> & { sidebarWidthV2?: boolean };
+type PersistedPrefs = Partial<AppSettings> & {
+  sidebarWidthV2?: boolean;
+  modifierHintsExplicit?: boolean;
+};
 
 function loadPrefs(): PersistedPrefs {
   try {
@@ -76,6 +79,8 @@ function loadPrefs(): PersistedPrefs {
     return {};
   }
 }
+
+let modifierHintsExplicit = Boolean(loadPrefs().modifierHintsExplicit);
 
 function persistPrefs(s: AppSettings): void {
   const payload = JSON.stringify({
@@ -93,6 +98,7 @@ function persistPrefs(s: AppSettings): void {
     sidebarWidthV2: true,
     h5LayoutMode: s.h5LayoutMode,
     showModifierHoldHints: s.showModifierHoldHints,
+    modifierHintsExplicit,
     alertSound: s.alertSound,
     alertChimeOnlyLongTasks: s.alertChimeOnlyLongTasks,
     onboarding: s.onboarding,
@@ -161,7 +167,7 @@ export const settingsStore = createStore<AppSettings>({
   sidebarCollapsed: saved.sidebarCollapsed ?? false,
   sidebarWidth: resolveInitialSidebarWidth(saved),
   h5LayoutMode: saved.h5LayoutMode === "mobile" || saved.h5LayoutMode === "desktop" ? saved.h5LayoutMode : "auto",
-  showModifierHoldHints: saved.showModifierHoldHints ?? true,
+  showModifierHoldHints: saved.modifierHintsExplicit ? (saved.showModifierHoldHints ?? false) : false,
   alertSound: saved.alertSound ?? true,
   alertChimeOnlyLongTasks: saved.alertChimeOnlyLongTasks ?? false,
   // Installs from before the guide existed already have a server: don't greet them as new.
@@ -169,6 +175,9 @@ export const settingsStore = createStore<AppSettings>({
 });
 
 export function updateSettings(patch: Partial<AppSettings>): void {
+  if (patch.showModifierHoldHints !== undefined) {
+    modifierHintsExplicit = true;
+  }
   settingsStore.set((prev) => {
     const next = { ...prev, ...patch };
     persistPrefs(next);

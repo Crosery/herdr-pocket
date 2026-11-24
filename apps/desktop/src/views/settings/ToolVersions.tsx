@@ -146,9 +146,14 @@ function HostToolCard({
         finishJob(snap);
         return;
       }
+      let pollInFlight = false;
+      let missCount = 0;
       pollRef.current = window.setInterval(() => {
+        if (pollInFlight) return;
+        pollInFlight = true;
         void rpcCall(host.id, "tools.updateStatus", { jobId: snap.jobId }, 8_000)
           .then((next) => {
+            missCount = 0;
             if (!next) {
               stopPolling();
               setJob(null);
@@ -158,9 +163,14 @@ function HostToolCard({
             if (!next.running) finishJob(next);
           })
           .catch(() => {
+            missCount += 1;
+            if (missCount < 5) return;
             stopPolling();
             setJob(null);
             void onRefresh(false);
+          })
+          .finally(() => {
+            pollInFlight = false;
           });
       }, 1500);
     } catch (e) {

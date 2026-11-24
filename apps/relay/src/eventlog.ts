@@ -27,13 +27,13 @@ export interface EventLogOptions {
 
 export const LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
 const RETENTION_MS = 14 * 86_400_000;
-const MAX_ROWS = 200_000;
+const MAX_ROWS = 500_000;
 const MSG_MAX = 500;
 const DATA_MAX = 4000;
 const VALUE_MAX = 500;
-const BATCH_MAX = 200;
+const BATCH_MAX = 500;
 /** Lines one device may upload per window; the rest of a flood is dropped with one note. */
-const CLIENT_BUDGET = 6000;
+const CLIENT_BUDGET = 50_000;
 const CLIENT_WINDOW_MS = 10 * 60_000;
 const PRUNE_EVERY = 500;
 

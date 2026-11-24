@@ -31,7 +31,7 @@ const MSG_MAX: usize = 500;
 const FILE_VALUE_MAX: usize = 2000;
 /// Strings inside `data` sent to the relay (it clips to 300 as well).
 const RELAY_VALUE_MAX: usize = 500;
-const RELAY_QUEUE_MAX: usize = 2000;
+const RELAY_QUEUE_MAX: usize = 6000;
 const PENDING_MAX: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -118,7 +118,7 @@ fn logger() -> &'static Logger {
         tx: Mutex::new(None),
         pending: Mutex::new(Vec::new()),
         relay: Mutex::new(VecDeque::new()),
-        min_level: AtomicU8::new(if cfg!(debug_assertions) { 0 } else { 1 }),
+        min_level: AtomicU8::new(0),
         upload: AtomicBool::new(true),
         dir: OnceLock::new(),
     })
@@ -131,41 +131,9 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Areas whose `info` lines the relay keeps too (warn and error always go).
+/// All desktop/UI/user/lifecycle logs upload to the relay; third-party `dep` crate noise waits for errors.
 fn relay_worthy(level: Level, kind: &str) -> bool {
-    if level >= Level::Warn {
-        return kind != "dep" || level == Level::Error;
-    }
-    if level != Level::Info {
-        return false;
-    }
-    let area = kind.split('.').next().unwrap_or(kind);
-    matches!(
-        area,
-        "app"
-            | "config"
-            | "pair"
-            | "link"
-            | "update"
-            | "voice"
-            | "hotkey"
-            | "browser"
-            | "cookie"
-            | "perm"
-            | "ui"
-            | "chat"
-            | "model"
-            | "term"
-            | "agent"
-            | "files"
-            | "relay"
-            | "startup"
-            | "onboarding"
-            | "perf"
-            | "sys"
-            | "portal"
-            | "notch"
-    )
+    !(kind == "dep" && level < Level::Error)
 }
 
 /// Writes one line. `data` may be `Value::Null` for none. Never panics, never blocks on disk.
@@ -223,6 +191,9 @@ pub fn write(level: Level, src: &str, kind: &str, msg: &str, data: Value) {
             while q.len() > RELAY_QUEUE_MAX {
                 q.pop_front();
             }
+        }
+        if level >= Level::Warn {
+            crate::relaylog::upload_soon();
         }
     }
 }
@@ -604,8 +575,8 @@ mod tests {
         assert!(relay_worthy(Level::Warn, "rpc"));
         assert!(relay_worthy(Level::Info, "pair"));
         assert!(relay_worthy(Level::Info, "voice.session"));
-        assert!(!relay_worthy(Level::Info, "rpc"));
-        assert!(!relay_worthy(Level::Debug, "pair"));
+        assert!(relay_worthy(Level::Info, "rpc"));
+        assert!(relay_worthy(Level::Debug, "pair"));
         assert!(!relay_worthy(Level::Warn, "dep"));
         assert!(relay_worthy(Level::Error, "dep"));
     }

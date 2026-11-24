@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type CompositionEvent, type KeyboardEvent } from "react";
+import { useLayoutEffect, useRef, useState, type ChangeEvent, type CompositionEvent, type KeyboardEvent } from "react";
 
 /**
  * Window (ms) right after `compositionend` during which a `keydown("Enter")`
@@ -83,20 +83,40 @@ function resizeTextarea(el: HTMLTextAreaElement | null, composing = false): void
 
 /**
  * Binds IME-safe Enter-to-send (and optional Alt+Enter steer submit) and auto-grow sizing to a composer `<textarea>`.
+ * When `onValueChange` is supplied, keeps the DOM `<textarea>` uncontrolled during active voice/IME composition
+ * so React re-renders never reset WebKit `NSTextInputClient` `markedTextRange` or displace pre-existing text.
  */
 export function useComposerInput(
   value: string,
   onSubmit: () => void,
   onSteerSubmit?: () => void,
   onCompositionChange?: (composing: boolean) => void,
+  onValueChange?: (next: string) => void,
 ) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gateRef = useRef<ComposerImeGate>(createImeGate());
+  const valueRef = useRef(value);
+  const onSubmitRef = useRef(onSubmit);
+  const onSteerRef = useRef(onSteerSubmit);
+  const onCompChangeRef = useRef(onCompositionChange);
+  const onValueChangeRef = useRef(onValueChange);
+  valueRef.current = value;
+  onSubmitRef.current = onSubmit;
+  onSteerRef.current = onSteerSubmit;
+  onCompChangeRef.current = onCompositionChange;
+  onValueChangeRef.current = onValueChange;
+
   const [isComposing, setIsComposing] = useState(false);
+  const [hasComposingText, setHasComposingText] = useState(false);
+  const unmanagedDuringIme = Boolean(onValueChange);
 
   useLayoutEffect(() => {
-    resizeTextarea(textareaRef.current, gateRef.current.composing);
-  }, [value]);
+    const el = textareaRef.current;
+    if (unmanagedDuringIme && !gateRef.current.composing && el && el.value !== value) {
+      el.value = value;
+    }
+    resizeTextarea(el, gateRef.current.composing);
+  }, [unmanagedDuringIme, value]);
 
   useLayoutEffect(() => {
     const el = textareaRef.current;
@@ -106,24 +126,62 @@ export function useComposerInput(
     return () => ro.disconnect();
   }, []);
 
-  const onCompositionStart = (_e: CompositionEvent<HTMLTextAreaElement>) => {
-    gateRef.current.composing = true;
-    setIsComposing(true);
-    onCompositionChange?.(true);
+  const syncHasText = (raw: string) => {
+    const next = raw.trim().length > 0;
+    setHasComposingText((prev) => (prev === next ? prev : next));
   };
 
-  const onCompositionEnd = (_e: CompositionEvent<HTMLTextAreaElement>) => {
+  const onCompositionStart = (e: CompositionEvent<HTMLTextAreaElement>) => {
+    gateRef.current.composing = true;
+    setIsComposing(true);
+    syncHasText(e.currentTarget?.value ?? "");
+    onCompChangeRef.current?.(true);
+  };
+
+  const onCompositionUpdate = (e: CompositionEvent<HTMLTextAreaElement>) => {
+    const el = e.currentTarget;
+    if (el) {
+      syncHasText(el.value);
+      resizeTextarea(el, true);
+    }
+  };
+
+  const onCompositionEnd = (e: CompositionEvent<HTMLTextAreaElement>) => {
     gateRef.current.composing = false;
     gateRef.current.compositionEndedAt = Date.now();
     setIsComposing(false);
-    onCompositionChange?.(false);
+    setHasComposingText(false);
+    onCompChangeRef.current?.(false);
+    const committed = e.currentTarget?.value;
+    if (typeof committed === "string") {
+      onValueChangeRef.current?.(committed);
+    }
     requestAnimationFrame(() => resizeTextarea(textareaRef.current, false));
   };
 
   const onBlur = () => {
+    const wasComposing = gateRef.current.composing;
     gateRef.current.composing = false;
     setIsComposing(false);
-    onCompositionChange?.(false);
+    setHasComposingText(false);
+    onCompChangeRef.current?.(false);
+    if (wasComposing && textareaRef.current) {
+      onValueChangeRef.current?.(textareaRef.current.value);
+    }
+  };
+
+  const onChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+    const el = e.currentTarget;
+    const evComposing =
+      gateRef.current.composing ||
+      Boolean((e.nativeEvent as unknown as { isComposing?: boolean } | undefined)?.isComposing);
+    if (evComposing) {
+      syncHasText(el.value);
+      resizeTextarea(el, true);
+      return;
+    }
+    setHasComposingText(false);
+    onValueChangeRef.current?.(el.value);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -141,21 +199,40 @@ export function useComposerInput(
       },
       gateRef.current,
       Date.now(),
-      Boolean(onSteerSubmit),
+      Boolean(onSteerRef.current),
     );
     if (action === "pass") return;
     e.preventDefault();
-    if (action === "steer") onSteerSubmit?.();
-    else if (action === "submit") onSubmit();
+    if (action === "steer") onSteerRef.current?.();
+    else if (action === "submit") onSubmitRef.current();
+  };
+
+  const readValue = (): string => textareaRef.current?.value ?? valueRef.current;
+
+  const clearValue = (): void => {
+    gateRef.current.composing = false;
+    setIsComposing(false);
+    setHasComposingText(false);
+    onCompChangeRef.current?.(false);
+    const el = textareaRef.current;
+    if (el) {
+      el.value = "";
+      resizeTextarea(el, false);
+    }
   };
 
   return {
     textareaRef,
     isComposing,
+    hasText: Boolean(value.trim()) || (isComposing && hasComposingText),
+    readValue,
+    clearValue,
     textareaProps: {
       ref: textareaRef,
       rows: 1,
+      ...(unmanagedDuringIme ? { defaultValue: value, onChange } : {}),
       onCompositionStart,
+      onCompositionUpdate,
       onCompositionEnd,
       onBlur,
       onKeyDown,

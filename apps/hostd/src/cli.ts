@@ -344,6 +344,18 @@ async function runDaemon(argv: string[]): Promise<void> {
   server.listen(CONTROL_SOCKET);
 
   await host.start();
+  process.on("uncaughtException", (err) => {
+    const msg = err instanceof Error ? err.stack || err.message : String(err);
+    console.error(`[hostd] uncaughtException: ${msg}`);
+    host.note("error", "host.crash_guard", `uncaughtException: ${msg.slice(0, 400)}`);
+    host.flushLogs();
+  });
+  process.on("unhandledRejection", (reason) => {
+    const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
+    console.error(`[hostd] unhandledRejection: ${msg}`);
+    host.note("error", "host.crash_guard", `unhandledRejection: ${msg.slice(0, 400)}`);
+    host.flushLogs();
+  });
   const region = currentRegion();
   host.note("info", "update", `downloads: region ${region.region} by ${region.reason}${region.timeZone ? ` (${region.timeZone})` : ""}`, { ...region });
   watchForUpdates((m, data, level) => {

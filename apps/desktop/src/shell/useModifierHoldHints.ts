@@ -80,6 +80,7 @@ export function useModifierHoldHints(): void {
     let activeChord: ShortcutModifierChord | null = null;
     let pendingChord: ShortcutModifierChord | null = null;
     let shownAt = 0;
+    let pointerOverTerminal = false;
 
     const stopPolling = () => {
       if (pollTimer !== null) {
@@ -167,6 +168,10 @@ export function useModifierHoldHints(): void {
         cancel("chord_key");
         return;
       }
+      if (pointerOverTerminal) {
+        cancel("terminal_hover");
+        return;
+      }
       const next = chordFromModifierEvent(e);
       if (!next) {
         cancel("keyup");
@@ -239,6 +244,12 @@ export function useModifierHoldHints(): void {
     const onWheel = () => cancel("wheel");
     const onBlur = () => cancel("blur");
     const onPointerMove = (e: PointerEvent | MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      pointerOverTerminal = Boolean(target?.closest?.(".tp-term-host"));
+      if (pointerOverTerminal && (pendingChord !== null || activeChord !== null)) {
+        cancel("terminal_hover");
+        return;
+      }
       if (pendingChord === null && activeChord === null) return;
       const modHeld = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
       if (!modHeld) {

@@ -14,7 +14,7 @@ export interface LogEntry {
 }
 
 const MAX = 2000;
-const WEB_RELAY_MAX = 500;
+const WEB_RELAY_MAX = 2000;
 let seq = 0;
 let pending: LogEntry[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -27,27 +27,8 @@ export interface WebRelayLogEntry {
   data?: Record<string, unknown>;
 }
 
-const WEB_RELAY_AREAS = new Set([
-  "app",
-  "config",
-  "pair",
-  "link",
-  "relay",
-  "perf",
-  "sys",
-  "h5",
-  "term",
-  "portal",
-  "ui",
-  "chat",
-  "startup",
-]);
-
-function isWebRelayWorthy(level: LogLevel, scope: string): boolean {
-  if (level === "warn" || level === "error") return true;
-  if (level !== "info") return false;
-  const area = scope.split(".")[0] ?? scope;
-  return WEB_RELAY_AREAS.has(area);
+function isWebRelayWorthy(_level: LogLevel, _scope: string): boolean {
+  return true;
 }
 
 let webRelayQueue: WebRelayLogEntry[] = [];
@@ -80,7 +61,7 @@ export function registerWebLogUploader(fn: ((batch: WebRelayLogEntry[]) => Promi
   if (fn && !webUploadTimer && typeof window !== "undefined") {
     webUploadTimer = setInterval(() => {
       void flushWebRelayLogs();
-    }, 30_000);
+    }, 5_000);
   }
   if (fn && webRelayQueue.length > 0) {
     void flushWebRelayLogs();

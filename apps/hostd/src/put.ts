@@ -228,11 +228,13 @@ export class ChunkedPutManager {
   private opts: {
     filesDir: () => string;
     putThroughHc: (localId: string, file: string) => Promise<string>;
+    onLog?: (level: "info" | "warn", msg: string, data?: Record<string, unknown>) => void;
   };
 
   constructor(opts: {
     filesDir: () => string;
     putThroughHc: (localId: string, file: string) => Promise<string>;
+    onLog?: (level: "info" | "warn", msg: string, data?: Record<string, unknown>) => void;
   }) {
     this.opts = opts;
     this.sweeper = setInterval(() => {
@@ -357,6 +359,7 @@ export class ChunkedPutManager {
         if (aborted) return;
         aborted = true;
         ws.destroy();
+        this.opts.onLog?.("warn", `direct-put HTTP ${status}: ${msg}`, { name: session.name, written, total: session.totalBytes });
         if (!res.headersSent) {
           res.writeHead(status, { ...cors, "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: msg }));
@@ -387,6 +390,7 @@ export class ChunkedPutManager {
         if (aborted) return;
         session.receivedBytes = written;
         session.lastAt = Date.now();
+        this.opts.onLog?.("info", `direct-put received ${written} bytes`, { name: session.name, total: session.totalBytes });
         res.writeHead(200, { ...cors, "Content-Type": "application/json" });
         res.end(JSON.stringify({ receivedBytes: written }));
         resolve();

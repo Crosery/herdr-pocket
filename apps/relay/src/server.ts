@@ -122,7 +122,7 @@ const SLOW_RPC_MS: Partial<Record<string, number>> = {
   "terminal.putFinish": 60_000,
 };
 /** Bodies of log uploads are larger than other requests. */
-const MAX_LOG_BODY = 512 * 1024;
+const MAX_LOG_BODY = 2 * 1024 * 1024;
 const STARTED = Date.now();
 
 export class HostCallError extends Error {
@@ -211,7 +211,7 @@ export class Relay {
     // Screens and conversations are text that shrinks several times over; hosts usually sit behind a slow uplink.
     this.wss = new WebSocketServer({
       noServer: true,
-      maxPayload: 8 * 1024 * 1024,
+      maxPayload: 32 * 1024 * 1024,
       perMessageDeflate: { threshold: 512, zlibDeflateOptions: { level: 4 }, concurrencyLimit: 16 },
     });
     this.http.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head));

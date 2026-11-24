@@ -258,6 +258,14 @@ export function attachTerminalImeBridge(
     const compView = findCompositionView();
     if (!compView) return;
     compView.classList?.remove("active");
+    compView.classList?.remove("tp-ime-clamped");
+    const styleObj = compView.style as CSSStyleDeclaration & Record<string, unknown>;
+    if (typeof styleObj?.removeProperty === "function") {
+      styleObj.removeProperty("--tp-ime-left");
+      styleObj.removeProperty("--tp-ime-top");
+      styleObj.removeProperty("--tp-ime-max-w");
+      styleObj.removeProperty("--tp-ime-line-h");
+    }
     if (compView.textContent) compView.textContent = "";
   };
 
@@ -266,6 +274,7 @@ export function attachTerminalImeBridge(
     const compView = findCompositionView();
     const screenEl = findScreenElement();
     if (!compView || !screenEl) return;
+    if (typeof screenEl.scrollLeft === "number" && screenEl.scrollLeft !== 0) screenEl.scrollLeft = 0;
     const screenRect = screenEl.getBoundingClientRect();
     if (screenRect.width <= 0 || screenRect.height <= 0) return;
 
@@ -285,6 +294,15 @@ export function attachTerminalImeBridge(
       naturalHeight: initialHeight,
     });
     if (compView.style) {
+      compView.classList?.add?.("tp-ime-clamped");
+      const setCssVar = (name: string, val: string) => {
+        const s = compView.style as CSSStyleDeclaration & Record<string, string>;
+        if (typeof s.setProperty === "function") s.setProperty(name, val);
+        else s[name] = val;
+      };
+      setCssVar("--tp-ime-max-w", `${firstPass.maxWidth}px`);
+      setCssVar("--tp-ime-left", `${firstPass.left}px`);
+      setCssVar("--tp-ime-line-h", `${Math.max(12, Math.round(cellH))}px`);
       compView.style.maxWidth = `${firstPass.maxWidth}px`;
       if (firstPass.left !== Math.round(curLeft)) {
         compView.style.left = `${firstPass.left}px`;
@@ -302,6 +320,9 @@ export function attachTerminalImeBridge(
               naturalHeight: wrappedHeight,
             })
           : firstPass;
+      setCssVar("--tp-ime-top", `${finalPass.top}px`);
+      setCssVar("--tp-ime-left", `${finalPass.left}px`);
+      setCssVar("--tp-ime-max-w", `${finalPass.maxWidth}px`);
       if (finalPass.top !== Math.round(curTop)) {
         compView.style.top = `${finalPass.top}px`;
       }
@@ -328,11 +349,15 @@ export function attachTerminalImeBridge(
     beforeInputSeq = null;
     captureSeq = null;
     lastCompEnd = null;
+    clampCompositionOverlay();
+    scheduleTimer(0, clampCompositionOverlay);
   };
 
   const onCompositionUpdate = () => {
     lastActivityAt = Date.now();
+    clampCompositionOverlay();
     scheduleTimer(0, clampCompositionOverlay);
+    scheduleTimer(4, clampCompositionOverlay);
   };
 
   const onCompositionEnd = (ev: Event) => {

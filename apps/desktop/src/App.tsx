@@ -57,6 +57,7 @@ import { allAgents, applyThemeAttribute, liveStore, settingsStore, spacedTitle, 
 import { useEnergyAttributes, useViewportTier } from "./lib/layout";
 import { clientConfigStore, startClientConfig } from "./lib/config";
 import { logger } from "./lib/log";
+import { installGlobalActionTelemetry } from "./lib/actionTelemetry";
 import { startDesktopPerfTelemetry } from "./lib/perfTelemetry";
 import { terminalOwnsCtrlK } from "./lib/termKeys";
 import { attachHudToVoiceCall, dismissVoiceMessage, hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore } from "./lib/voiceCall";
@@ -164,11 +165,13 @@ function PocketAppShell() {
       offTrafficLights = native.onTrafficLightMetrics(applyTrafficLights);
     }
     const offPerf = startDesktopPerfTelemetry();
+    const offActions = installGlobalActionTelemetry();
     const offDrag = installWindowDragBridge();
     const offPwa = initH5Pwa();
     return () => {
       offPwa();
       offDrag();
+      offActions();
       offPerf();
       offTrafficLights?.();
     };

@@ -4582,7 +4582,7 @@ mod lab {
             ));
         }
 
-        enroll_collected_speech(
+        super::enroll_collected_speech(
             &collected.models,
             &collected.speech,
             collected.speech_sq_sum,
@@ -4590,108 +4590,6 @@ mod lab {
             collected.noise_rms,
             "desktop-mic",
         )
-    }
-
-    pub(crate) fn enroll_collected_speech(
-        models: &models::LoadedModels,
-        speech: &[f32],
-        speech_sq_sum: f64,
-        speech_samples: usize,
-        noise_rms: f32,
-        route: &str,
-    ) -> Result<VoiceAiEnrollResult, String> {
-        let seconds = (speech.len() as f32) / (VOICE_RATE as f32);
-        let sp_sess = models
-            .speaker
-            .as_ref()
-            .ok_or_else(|| "声纹模型未加载".to_string())?;
-        let speaker = models::Speaker::new(&models.rt, sp_sess);
-
-        let piece = VOICE_RATE * 3 / 2;
-        let hop = VOICE_RATE * 3 / 4;
-        let mut pieces = Vec::new();
-        let mut off = 0usize;
-        while off + piece <= speech.len() {
-            if let Ok(raw) = speaker.embed(&speech[off..off + piece]) {
-                let norm = dsp::normalize_embedding(&raw);
-                if !norm.is_empty() {
-                    pieces.push(norm);
-                }
-            }
-            off += hop;
-        }
-        if pieces.is_empty() {
-            let raw = speaker.embed(speech)?;
-            let norm = dsp::normalize_embedding(&raw);
-            if !norm.is_empty() {
-                pieces.push(norm);
-            }
-        }
-        if pieces.is_empty() {
-            return Err("未能提取到有效声纹特征，请重试".into());
-        }
-
-        let mut kept = pieces.clone();
-        let mut centroid = dsp::mean_embedding(&kept);
-        let mut scores: Vec<f32> = kept.iter().map(|p| dsp::cosine(p, &centroid)).collect();
-        if pieces.len() >= 4 {
-            let mut sorted = scores.clone();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            let median = sorted[sorted.len() / 2];
-            let floor = (median - 0.22).max(0.35);
-            let filtered: Vec<Vec<f32>> = pieces
-                .iter()
-                .zip(scores.iter())
-                .filter(|(_, &sc)| sc >= floor)
-                .map(|(p, _)| p.clone())
-                .collect();
-            if filtered.len() >= 3 && filtered.len() < pieces.len() {
-                kept = filtered;
-                centroid = dsp::mean_embedding(&kept);
-                scores = kept.iter().map(|p| dsp::cosine(p, &centroid)).collect();
-            }
-        }
-
-        let prototypes = dsp::select_prototypes(&kept, &centroid, 6);
-        let owner_sample = dsp::pick_cleanest_sample(speech, OWNER_SAMPLE_LEN);
-        let has_sample = save_owner_sample(&owner_sample);
-
-        let speech_rms = if speech_samples > 0 {
-            (speech_sq_sum / (speech_samples as f64)).sqrt() as f32
-        } else {
-            0.02
-        };
-        let raw_snr = 20.0
-            * (f64::from(speech_rms.max(1e-4)) / f64::from(noise_rms.max(1e-4))).log10();
-        let snr_db = raw_snr.clamp(0.0, 60.0) as f32;
-        let consistency = scores.iter().sum::<f32>() / (scores.len().max(1) as f32);
-        let lowest = scores.iter().copied().fold(1.0f32, f32::min);
-
-        let mut cfg = load_config();
-        cfg.filter = true;
-        cfg.voiceprint = Some(VoiceprintRecord {
-            embedding: centroid,
-            prototypes: prototypes.clone(),
-            model_version: VOICEPRINT_MODEL_VERSION.into(),
-            has_sample,
-            route: Some(route.into()),
-            snr_db: Some(snr_db),
-            seconds,
-            consistency,
-            lowest,
-            created_at: now_ms(),
-        });
-        save_config(&cfg)?;
-
-        Ok(VoiceAiEnrollResult {
-            seconds,
-            consistency,
-            lowest,
-            snr_db,
-            prototypes_count: prototypes.len(),
-            has_sample,
-            state: current_state(),
-        })
     }
 
     pub fn cancel_enroll() {
@@ -5004,7 +4902,109 @@ pub fn enroll_from_pcm_bytes(pcm_le_i16: &[u8]) -> Result<VoiceAiEnrollResult, S
         ));
     };
 
-    lab::enroll_collected_speech(&loaded, &speech, sq_sum, sp_count, noise_rms, "audio-file")
+    enroll_collected_speech(&loaded, &speech, sq_sum, sp_count, noise_rms, "audio-file")
+}
+
+pub(crate) fn enroll_collected_speech(
+    models: &models::LoadedModels,
+    speech: &[f32],
+    speech_sq_sum: f64,
+    speech_samples: usize,
+    noise_rms: f32,
+    route: &str,
+) -> Result<VoiceAiEnrollResult, String> {
+    let seconds = (speech.len() as f32) / (VOICE_RATE as f32);
+    let sp_sess = models
+        .speaker
+        .as_ref()
+        .ok_or_else(|| "声纹模型未加载".to_string())?;
+    let speaker = models::Speaker::new(&models.rt, sp_sess);
+
+    let piece = VOICE_RATE * 3 / 2;
+    let hop = VOICE_RATE * 3 / 4;
+    let mut pieces = Vec::new();
+    let mut off = 0usize;
+    while off + piece <= speech.len() {
+        if let Ok(raw) = speaker.embed(&speech[off..off + piece]) {
+            let norm = dsp::normalize_embedding(&raw);
+            if !norm.is_empty() {
+                pieces.push(norm);
+            }
+        }
+        off += hop;
+    }
+    if pieces.is_empty() {
+        let raw = speaker.embed(speech)?;
+        let norm = dsp::normalize_embedding(&raw);
+        if !norm.is_empty() {
+            pieces.push(norm);
+        }
+    }
+    if pieces.is_empty() {
+        return Err("未能提取到有效声纹特征，请重试".into());
+    }
+
+    let mut kept = pieces.clone();
+    let mut centroid = dsp::mean_embedding(&kept);
+    let mut scores: Vec<f32> = kept.iter().map(|p| dsp::cosine(p, &centroid)).collect();
+    if pieces.len() >= 4 {
+        let mut sorted = scores.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let median = sorted[sorted.len() / 2];
+        let floor = (median - 0.22).max(0.35);
+        let filtered: Vec<Vec<f32>> = pieces
+            .iter()
+            .zip(scores.iter())
+            .filter(|(_, &sc)| sc >= floor)
+            .map(|(p, _)| p.clone())
+            .collect();
+        if filtered.len() >= 3 && filtered.len() < pieces.len() {
+            kept = filtered;
+            centroid = dsp::mean_embedding(&kept);
+            scores = kept.iter().map(|p| dsp::cosine(p, &centroid)).collect();
+        }
+    }
+
+    let prototypes = dsp::select_prototypes(&kept, &centroid, 6);
+    let owner_sample = dsp::pick_cleanest_sample(speech, OWNER_SAMPLE_LEN);
+    let has_sample = save_owner_sample(&owner_sample);
+
+    let speech_rms = if speech_samples > 0 {
+        (speech_sq_sum / (speech_samples as f64)).sqrt() as f32
+    } else {
+        0.02
+    };
+    let raw_snr = 20.0
+        * (f64::from(speech_rms.max(1e-4)) / f64::from(noise_rms.max(1e-4))).log10();
+    let snr_db = raw_snr.clamp(0.0, 60.0) as f32;
+    let consistency = scores.iter().sum::<f32>() / (scores.len().max(1) as f32);
+    let lowest = scores.iter().copied().fold(1.0f32, f32::min);
+
+    let mut cfg = load_config();
+    cfg.filter = true;
+    cfg.voiceprint = Some(VoiceprintRecord {
+        embedding: centroid,
+        prototypes: prototypes.clone(),
+        model_version: VOICEPRINT_MODEL_VERSION.into(),
+        has_sample,
+        route: Some(route.into()),
+        snr_db: Some(snr_db),
+        seconds,
+        consistency,
+        lowest,
+        created_at: now_ms(),
+    });
+    save_config(&cfg)?;
+
+    Ok(VoiceAiEnrollResult {
+        seconds,
+        consistency,
+        lowest,
+        snr_db,
+        prototypes_count: prototypes.len(),
+        has_sample,
+        state: current_state(),
+    })
 }
 
 pub fn start_test(app: AppHandle, threshold: Option<f32>) -> Result<(), String> {

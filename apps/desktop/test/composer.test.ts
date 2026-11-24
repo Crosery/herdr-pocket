@@ -1,7 +1,10 @@
 // Unit tests for desktop IME-safe Enter handling (src/lib/composerKeys.ts) and
 // media/file classification helpers (src/lib/dropPreview.ts). Run with `pnpm test`.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { IME_GUARD_MS, composerEnterAction, createImeGate } from "../src/lib/composerKeys.ts";
 import {
   dropKindOf,
@@ -154,4 +157,17 @@ test("dropPreview: medium classification, MIME inference, extension badges, byte
   assert.equal(looksBinary("hello\nworld"), false);
   assert.equal(looksBinary("abc\u0000def"), true);
   assert.equal(looksBinary("bad\uFFFDutf8"), true);
+});
+
+test("AgentsView & AssistantView keep composer textarea uncontrolled during voice/IME composition", () => {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const composerSrc = readFileSync(resolve(root, "src/lib/composerKeys.ts"), "utf8");
+  assert.equal(composerSrc.includes("if (evComposing)"), true);
+  assert.equal(composerSrc.includes("defaultValue: value"), true);
+  const agentsSrc = readFileSync(resolve(root, "src/views/AgentsView.tsx"), "utf8");
+  assert.equal(agentsSrc.includes("composer.clearValue()"), true);
+  assert.equal(/<textarea[\s\S]{0,400}\{\.\.\.composer\.textareaProps\}[\s\S]{0,600}value=\{/.test(agentsSrc), false);
+  const assistantSrc = readFileSync(resolve(root, "src/views/AssistantView.tsx"), "utf8");
+  assert.equal(assistantSrc.includes("clearComposerRef.current()"), true);
+  assert.equal(/<textarea[\s\S]{0,200}\{\.\.\.composer\.textareaProps\}[\s\S]{0,200}value=\{/.test(assistantSrc), false);
 });

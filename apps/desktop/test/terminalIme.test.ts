@@ -306,12 +306,23 @@ test("attachTerminalImeBridge prevents WebKit double-paste across bracketed and 
   bridge.dispose();
 });
 
-test("terminal.css renders .composition-view inline without card chrome or helper-textarea pointer traps", () => {
+test("terminal.css renders .composition-view inline with CSS-var clamping and bounds helper textarea width without pointer traps", () => {
   const css = readFileSync(resolve(ROOT, "src/styles/terminal.css"), "utf8");
   const compMatch = /\.tp-term-host\s+\.xterm\s+\.composition-view\s*\{[^}]*\}/.exec(css);
   assert.ok(compMatch, "found .composition-view rule");
   assert.equal(compMatch[0].includes("border: none"), true);
   assert.equal(compMatch[0].includes("box-shadow: none"), true);
   assert.equal(compMatch[0].includes("padding: 0"), true);
-  assert.equal(css.includes(".xterm-helper-textarea"), false);
+
+  const clampedMatch = /\.tp-term-host\s+\.xterm\s+\.composition-view\.tp-ime-clamped\s*\{[^}]*\}/.exec(css);
+  assert.ok(clampedMatch, "found .composition-view.tp-ime-clamped rule");
+  assert.equal(clampedMatch[0].includes("var(--tp-ime-left"), true);
+  assert.equal(clampedMatch[0].includes("var(--tp-ime-top"), true);
+  assert.equal(clampedMatch[0].includes("var(--tp-ime-max-w"), true);
+  assert.equal(clampedMatch[0].includes("!important"), true);
+
+  const taMatch = /\.tp-term-host\s+\.xterm\s+\.xterm-helper-textarea\s*\{[^}]*\}/.exec(css);
+  assert.ok(taMatch, "found .xterm-helper-textarea width guard");
+  assert.equal(taMatch[0].includes("max-width: 1px !important"), true);
+  assert.equal(taMatch[0].includes("pointer-events"), false, "must never trap pointer events");
 });

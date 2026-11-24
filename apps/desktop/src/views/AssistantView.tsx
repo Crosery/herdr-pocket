@@ -138,6 +138,7 @@ export function AssistantView({
   const callDuration = useCallClock(callStatus, callStartedAt, inCall);
   const sendLockRef = useRef(false);
   const lastSendRef = useRef<{ text: string; at: number } | null>(null);
+  const clearComposerRef = useRef<() => void>(() => {});
 
   const send = async (raw: string) => {
     const t = raw.trim();
@@ -150,6 +151,7 @@ export function AssistantView({
     try {
       await sendToAssistant(t);
       setText("");
+      clearComposerRef.current();
     } catch (e) {
       toast((e as Error).message, true);
     } finally {
@@ -158,7 +160,8 @@ export function AssistantView({
     }
   };
 
-  const composer = useComposerInput(text, () => void send(text));
+  const composer = useComposerInput(text, () => void send(composer.readValue()), undefined, undefined, setText);
+  clearComposerRef.current = composer.clearValue;
 
   const startCall = async () => {
     setCallExpanded(true);
@@ -264,19 +267,17 @@ export function AssistantView({
           <textarea
             {...composer.textareaProps}
             placeholder="和小羊说点什么…"
-            value={text}
-            onChange={(e) => setText(e.target.value)}
           />
         </div>
         <div className="composer-foot">
           <div className="composer-tools" />
           <div className="composer-actions">
-            {!text.trim() && (voice || isMockServer(server)) && !inCall ? (
+            {!composer.hasText && (voice || isMockServer(server)) && !inCall ? (
               <PocketIconButton active className="composer-send" tooltip="语音通话" onClick={() => void startCall()}>
                 <Phone size={15} />
               </PocketIconButton>
             ) : (
-              <PocketButton size="sm" className="composer-send" disabled={!text.trim() || sending} aria-label="发送" onClick={() => void send(text)}>
+              <PocketButton size="sm" className="composer-send" disabled={!composer.hasText || sending} aria-label="发送" onClick={() => void send(composer.readValue())}>
                 <Send size={14} />
               </PocketButton>
             )}

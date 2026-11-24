@@ -1,4 +1,5 @@
 import { DIRECT_PUT_PREFIX } from "@herdr-pocket/protocol";
+import { logger } from "./log";
 import { ensureDirectLinkNow, getDirectEndpoint, rpcCall } from "./relay";
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -61,6 +62,11 @@ export async function uploadRemoteFile(
   file: File,
   onProgress?: (pct: number, viaDirect: boolean) => void,
 ): Promise<string> {
+  const startedAt = Date.now();
+  logger.info("files", "files.upload.start", {
+    bytes: file.size,
+    mime: file.type || "application/octet-stream",
+  });
   const begin = await rpcCall(
     deviceId,
     "terminal.putBegin",
@@ -107,8 +113,18 @@ export async function uploadRemoteFile(
 
     const fin = await rpcCall(deviceId, "terminal.putFinish", { uploadId: begin.uploadId }, 60_000);
     onProgress?.(100, uploadedDirect);
+    logger.info("files", "files.upload.done", {
+      viaDirect: uploadedDirect,
+      bytes: file.size,
+      ms: Date.now() - startedAt,
+    });
     return fin.path;
   } catch (err) {
+    logger.error("files", `files.upload.error: ${(err as Error)?.message ?? String(err)}`, {
+      viaDirect: uploadedDirect,
+      bytes: file.size,
+      ms: Date.now() - startedAt,
+    });
     void rpcCall(deviceId, "terminal.putAbort", { uploadId: begin.uploadId }).catch(() => {});
     throw err;
   }
