@@ -12,6 +12,7 @@ export function isImeKeyEvent(e: TerminalImeKeyLike): boolean {
 export interface TerminalImeBridge {
   handleXtermData(data: string): void;
   isComposing(): boolean;
+  syncCompositionOverlay(): void;
   dispose(): void;
 }
 
@@ -52,7 +53,7 @@ export interface CompositionOverlayMetrics {
   naturalHeight: number;
 }
 
-/** Keeps active IME / voice dictation preedit inline and inside `.xterm-screen` only when overflowing edges. */
+/** Keeps active IME / voice dictation preedit inline and strictly inside `.xterm-screen` bounds so long voice input wraps vertically without horizontal push. */
 export function clampCompositionOverlayLayout(m: CompositionOverlayMetrics): {
   left: number;
   top: number;
@@ -60,12 +61,24 @@ export function clampCompositionOverlayLayout(m: CompositionOverlayMetrics): {
 } {
   const screenWidth = Math.max(80, m.screenWidth);
   const screenHeight = Math.max(24, m.screenHeight);
-  const maxWidth = Math.max(80, screenWidth - 4);
-  const width = Math.min(Math.max(1, m.naturalWidth), maxWidth);
-  const height = Math.max(1, m.naturalHeight || m.cellHeight || 18);
-  const left = Math.max(0, Math.min(m.cursorLeft, screenWidth - width - 2));
+  const fullMaxWidth = Math.max(76, screenWidth - 4);
+  const cursorLeft = Math.max(0, Math.min(m.cursorLeft, screenWidth - 2));
+  const inlineAvail = screenWidth - cursorLeft - 4;
+  let left: number;
+  let maxWidth: number;
+  let wrappedToNextRow = false;
+  if (inlineAvail >= 160 || m.naturalWidth <= inlineAvail) {
+    left = cursorLeft;
+    maxWidth = Math.max(76, Math.round(inlineAvail));
+  } else {
+    left = 2;
+    maxWidth = Math.round(fullMaxWidth);
+    wrappedToNextRow = cursorLeft > 8;
+  }
+  const cellH = Math.max(1, m.cellHeight || 18);
+  const height = Math.max(1, m.naturalHeight || cellH);
   const bottomMargin = 2;
-  let top = Math.max(0, m.cursorTop);
+  let top = Math.max(0, m.cursorTop + (wrappedToNextRow ? cellH : 0));
   if (top + height > screenHeight - bottomMargin) {
     top = Math.max(0, Math.min(m.cursorTop - height - 2, screenHeight - height - bottomMargin));
   }
@@ -74,7 +87,7 @@ export function clampCompositionOverlayLayout(m: CompositionOverlayMetrics): {
 
 /**
  * Splits long multi-character voice dictation / paste commits into <= 512-byte UTF-8 chunks
- * (below Darwin PTY canonical `MAX_INPUT = 1024`) and wraps plain text in bracketed paste when active.
+ * (below Darwin PTY canonical `MAX_INPUT = 1024`) and wraps plain multi-char text in bracketed paste when active.
  */
 export function chunkTerminalInputPayload(
   data: string,
@@ -84,7 +97,12 @@ export function chunkTerminalInputPayload(
   if (!data) return [];
   const cap = Math.max(64, maxChunkBytes);
   const dataBytes = utf8Encoder.encode(data).length;
-  const shouldBracket = bracketedPaste && dataBytes > 240 && !data.includes("\x1b") && !data.includes("\x00");
+  const shouldBracket =
+    bracketedPaste &&
+    dataBytes >= 6 &&
+    Array.from(data).length >= 2 &&
+    !data.includes("\x1b") &&
+    !/[\x00-\x08\x0b-\x1f\x7f]/.test(data);
   const payload = shouldBracket ? `\x1b[200~${data}\x1b[201~` : data;
   if (utf8Encoder.encode(payload).length <= cap) return [payload];
 
@@ -179,6 +197,7 @@ export function attachTerminalImeBridge(
     return {
       handleXtermData,
       isComposing: () => false,
+      syncCompositionOverlay: () => {},
       dispose: () => {},
     };
   }
@@ -250,31 +269,41 @@ export function attachTerminalImeBridge(
     const screenRect = screenEl.getBoundingClientRect();
     if (screenRect.width <= 0 || screenRect.height <= 0) return;
 
-    const preMaxWidth = Math.max(80, Math.round(screenRect.width - 4));
-    if (compView.style) {
-      compView.style.maxWidth = `${preMaxWidth}px`;
-    }
     const taLeft = textarea.style ? parseFloat(textarea.style.left || "") : Number.NaN;
     const taTop = textarea.style ? parseFloat(textarea.style.top || "") : Number.NaN;
     const curLeft = Number.isFinite(taLeft) && taLeft >= 0 ? taLeft : parseFloat(compView.style?.left || "0") || 0;
     const curTop = Number.isFinite(taTop) && taTop >= 0 ? taTop : parseFloat(compView.style?.top || "0") || 0;
     const cellH = parseFloat(compView.style?.lineHeight || compView.style?.height || "18") || 18;
-    const laidOut = clampCompositionOverlayLayout({
+    const initialHeight = compView.offsetHeight || cellH;
+    const firstPass = clampCompositionOverlayLayout({
       cursorLeft: curLeft,
       cursorTop: curTop,
       cellHeight: cellH,
       screenWidth: screenRect.width,
       screenHeight: screenRect.height,
       naturalWidth: compView.offsetWidth || Math.min(screenRect.width, (compView.textContent?.length ?? 1) * 14),
-      naturalHeight: compView.offsetHeight || cellH,
+      naturalHeight: initialHeight,
     });
     if (compView.style) {
-      compView.style.maxWidth = `${laidOut.maxWidth}px`;
-      if (laidOut.left !== Math.round(curLeft)) {
-        compView.style.left = `${laidOut.left}px`;
+      compView.style.maxWidth = `${firstPass.maxWidth}px`;
+      if (firstPass.left !== Math.round(curLeft)) {
+        compView.style.left = `${firstPass.left}px`;
       }
-      if (laidOut.top !== Math.round(curTop)) {
-        compView.style.top = `${laidOut.top}px`;
+      const wrappedHeight = compView.offsetHeight || cellH;
+      const finalPass =
+        wrappedHeight > initialHeight
+          ? clampCompositionOverlayLayout({
+              cursorLeft: curLeft,
+              cursorTop: curTop,
+              cellHeight: cellH,
+              screenWidth: screenRect.width,
+              screenHeight: screenRect.height,
+              naturalWidth: compView.offsetWidth || firstPass.maxWidth,
+              naturalHeight: wrappedHeight,
+            })
+          : firstPass;
+      if (finalPass.top !== Math.round(curTop)) {
+        compView.style.top = `${finalPass.top}px`;
       }
     }
   };
@@ -395,6 +424,7 @@ export function attachTerminalImeBridge(
   return {
     handleXtermData,
     isComposing: () => composing,
+    syncCompositionOverlay: clampCompositionOverlay,
     dispose: () => {
       if (compactTimer !== null) {
         clearTimeout(compactTimer);

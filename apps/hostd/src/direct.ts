@@ -63,7 +63,15 @@ const isVpn = (a: string) => /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(a);
 export function directAddrs(nets = networkInterfaces()): string[] {
   const all = Object.values(nets)
     .flat()
-    .filter((n): n is NonNullable<typeof n> => !!n && (n.family === "IPv4" || (n.family as unknown) === 4) && !n.internal && !n.address.startsWith("169.254."))
+    .filter(
+      (n): n is NonNullable<typeof n> =>
+        !!n &&
+        (n.family === "IPv4" || (n.family as unknown) === 4) &&
+        !n.internal &&
+        !n.address.startsWith("169.254.") &&
+        !n.address.startsWith("198.18.") &&
+        !n.address.startsWith("198.19."),
+    )
     .map((n) => n.address);
   const rank = (a: string) => (isPrivate(a) ? 0 : isVpn(a) ? 1 : 2);
   return [...new Set(all)].sort((a, b) => rank(a) - rank(b)).slice(0, 8);

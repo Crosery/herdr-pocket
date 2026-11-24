@@ -13,7 +13,7 @@ import { ImageAddon } from "@xterm/addon-image";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
-import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
+import { LARGE_PUT_LIMITS, PUT_LIMITS, applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge";
 import { hasFileJumpModifier, openAgentFileTarget } from "../lib/openFileTarget";
 import { setConfig, useClientConfig } from "../lib/config";
@@ -79,6 +79,7 @@ import { native, type LocalTermCloseEvent, type LocalTermSizeEvent } from "../li
 import { registerWebglCounter } from "../lib/perfTelemetry";
 import { ingestPortalStreamEvent } from "../lib/portalClient";
 import { rpcCall, subscribeStream } from "../lib/relay";
+import { uploadRemoteFile } from "../lib/uploadLargeFile";
 import { settingsStore } from "../lib/store";
 import {
   deleteKittyPlacementsScoped,
@@ -355,6 +356,7 @@ export function TerminalSurface({
   const kittyDimsByIdRef = useRef<Map<number, { cols: number; rows: number }>>(new Map());
   const overlayNodesRef = useRef<Map<string, { kind: "img" | "clip" | "osc66"; el: HTMLElement; img?: HTMLImageElement; sig: string }>>(new Map());
   const lastResizeSigRef = useRef("");
+  const ptyResizeTimerRef = useRef<number | null>(null);
   const appliedVisualSigRef = useRef("");
   const ptySizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const lastPtyBoxRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
@@ -383,6 +385,7 @@ export function TerminalSurface({
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
   const lastInputAtRef = useRef(0);
+  const lastInputLenRef = useRef(0);
   const lastActivateAtRef = useRef(0);
   const bracketedPasteRef = useRef(false);
   const agentRef = useRef(agent);
@@ -500,6 +503,7 @@ export function TerminalSurface({
     async (data: string) => {
       if (!data) return;
       lastInputAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
+      lastInputLenRef.current = data.length;
       const term = termRef.current;
       if (term) {
         if (term.hasSelection()) term.clearSelection();
@@ -571,22 +575,41 @@ export function TerminalSurface({
     async (files: FileList | File[]) => {
       const list = Array.from(files);
       if (!list.length) return;
-      const toSend = list.slice(0, 6);
+      const toSend = list.slice(0, PUT_LIMITS.files);
+      const smallFiles: File[] = [];
+      const largeFiles: File[] = [];
+      for (const f of toSend) {
+        if (f.size > LARGE_PUT_LIMITS.maxFileBytes) {
+          toast(`「${f.name}」超过 ${Math.floor(LARGE_PUT_LIMITS.maxFileBytes / 1024 / 1024)} MB 上限，无法发送`, true);
+          continue;
+        }
+        if (f.size > PUT_LIMITS.fileBytes) largeFiles.push(f);
+        else smallFiles.push(f);
+      }
       try {
-        const putFiles = await Promise.all(
-          toSend.map(async (f) => {
-            const buf = await f.arrayBuffer();
-            const bytes = new Uint8Array(buf);
-            let bin = "";
-            for (let i = 0; i < bytes.length; i += 0x8000) {
-              bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-            }
-            return { name: f.name || "file", mime: f.type || "application/octet-stream", data: btoa(bin) };
-          }),
-        );
-        const res = await rpcCall(agent.deviceId, "terminal.put", { agent: agent.key, files: putFiles }, 30_000);
-        if (res.paths.length) {
-          await sendInput(`${res.paths.map(shellQuotePath).join(" ")} `);
+        const landedPaths: string[] = [];
+        if (smallFiles.length > 0) {
+          const putFiles = await Promise.all(
+            smallFiles.map(async (f) => {
+              const buf = await f.arrayBuffer();
+              const bytes = new Uint8Array(buf);
+              let bin = "";
+              for (let i = 0; i < bytes.length; i += 0x8000) {
+                bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+              }
+              return { name: f.name || "file", mime: f.type || "application/octet-stream", data: btoa(bin) };
+            }),
+          );
+          const res = await rpcCall(agent.deviceId, "terminal.put", { agent: agent.key, files: putFiles }, 30_000);
+          landedPaths.push(...res.paths);
+        }
+        for (const lf of largeFiles) {
+          toast(`正在发送大文件「${lf.name}」…`);
+          const path = await uploadRemoteFile(agent.deviceId, agent.key, lf);
+          landedPaths.push(path);
+        }
+        if (landedPaths.length) {
+          await sendInput(`${landedPaths.map(shellQuotePath).join(" ")} `);
         }
       } catch (e) {
         toast((e as Error).message, true);
@@ -610,8 +633,9 @@ export function TerminalSurface({
     [],
   );
 
-  const flushPtyResize = useCallback(
+  const sendPtyResizeNow = useCallback(
     (term: XTerm, forceReclaim = false) => {
+      if (term.cols < 24 || term.rows < 6) return;
       const display = currentDisplay(term);
       const localConnId = localConnRef.current;
       if (forceReclaim) lastResizeSigRef.current = "";
@@ -657,9 +681,47 @@ export function TerminalSurface({
     [agent.deviceId, agent.key, currentDisplay],
   );
 
+  const flushPtyResize = useCallback(
+    (term: XTerm, forceReclaim = false) => {
+      if (term.cols < 24 || term.rows < 6) return;
+      if (forceReclaim || !ptySizeRef.current) {
+        if (ptyResizeTimerRef.current !== null) {
+          window.clearTimeout(ptyResizeTimerRef.current);
+          ptyResizeTimerRef.current = null;
+        }
+        sendPtyResizeNow(term, forceReclaim);
+        return;
+      }
+      if (ptyResizeTimerRef.current !== null) {
+        window.clearTimeout(ptyResizeTimerRef.current);
+      }
+      ptyResizeTimerRef.current = window.setTimeout(() => {
+        ptyResizeTimerRef.current = null;
+        const curTerm = termRef.current;
+        if (!curTerm || curTerm.cols < 24 || curTerm.rows < 6) return;
+        sendPtyResizeNow(curTerm, false);
+      }, 90);
+    },
+    [sendPtyResizeNow],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (ptyResizeTimerRef.current !== null) {
+        window.clearTimeout(ptyResizeTimerRef.current);
+        ptyResizeTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const syncResize = useCallback(
     (term: XTerm, forceReclaim = false) => {
-      if (!activeRef.current || !hostRef.current || hostRef.current.clientWidth <= 0 || hostRef.current.clientHeight <= 0) {
+      if (
+        !activeRef.current ||
+        !hostRef.current ||
+        hostRef.current.clientWidth < 180 ||
+        hostRef.current.clientHeight < 90
+      ) {
         return;
       }
       if (externalSizeOverrideRef.current && !forceReclaim && !paneOwnsFocus()) {
@@ -1267,7 +1329,7 @@ export function TerminalSurface({
       initialReadyDone = true;
       hostEl.dataset.ready = "true";
     };
-    let hostReadyFallback = window.setTimeout(markHostReady, 450);
+    let hostReadyFallback = 0;
     term.open(hostEl);
     appliedVisualSigRef.current = visualSig(fontFamily);
     fitAddon.fit();
@@ -1915,6 +1977,20 @@ export function TerminalSurface({
         onTelemetry: (ev, meta) => trackTerminalImeEvent(ev, meta),
       },
     );
+    const compHelper = (
+      term as unknown as { _core?: { _compositionHelper?: { updateCompositionElements?: (re?: boolean) => void } } }
+    )._core?._compositionHelper;
+    if (compHelper && typeof compHelper.updateCompositionElements === "function") {
+      const origUpdate = compHelper.updateCompositionElements.bind(compHelper);
+      compHelper.updateCompositionElements = (recursed?: boolean) => {
+        origUpdate(recursed);
+        imeBridge.syncCompositionOverlay();
+      };
+    }
+    const onHostCaptureScroll = () => {
+      if (hostEl.scrollLeft !== 0) hostEl.scrollLeft = 0;
+    };
+    hostEl.addEventListener("scroll", onHostCaptureScroll, true);
     const onTermFocus = () => {
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
       if (nowMs - lastActivateAtRef.current < 80) return;
@@ -2695,7 +2771,7 @@ export function TerminalSurface({
     const FLUSH_BYTE_CAP = 512 * 1024;
     const HIDDEN_OUTPUT_CLOCK_MS = 64;
     const SYNC_HOLD_MAX_MS = 32;
-    const INITIAL_BURST_MAX_MS = 320;
+    const INITIAL_BURST_MAX_MS = 650;
 
     const flushPendingBytes = () => {
       flushMicroQueued = false;
@@ -2754,7 +2830,7 @@ export function TerminalSurface({
             flushRaf = 0;
           }
           if (flushTimer) window.clearTimeout(flushTimer);
-          const quietMs = activeLocalConnId ? 24 : 45;
+          const quietMs = activeLocalConnId ? 30 : 65;
           flushTimer = window.setTimeout(flushPendingBytes, Math.min(quietMs, Math.ceil(maxRemain)));
           return;
         }
@@ -2794,7 +2870,10 @@ export function TerminalSurface({
       }
       syncHoldDeadline = 0;
 
-      const fastEcho = !sawAnyOutput || nowMs - lastInputAtRef.current < INPUT_FAST_MS || hitCap;
+      const fastEcho =
+        !sawAnyOutput ||
+        (nowMs - lastInputAtRef.current < INPUT_FAST_MS && lastInputLenRef.current <= 4) ||
+        hitCap;
       sawAnyOutput = true;
       if (fastEcho) {
         if (flushTimer) {
@@ -2861,11 +2940,15 @@ export function TerminalSurface({
 
     const startRelayStream = () => {
       if (!alive || unsubRelay) return;
+      if (!initialReadyDone && !hostReadyFallback) {
+        hostReadyFallback = window.setTimeout(markHostReady, 950);
+      }
+      let rawModeConfirmed = false;
       const runFallbackRead = () => {
-        if (!alive || sawRaw) return;
+        if (!alive || sawRaw || rawModeConfirmed) return;
         void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 200 })
           .then((res) => {
-            if (alive && !sawRaw) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
+            if (alive && !sawRaw && !rawModeConfirmed) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
           })
           .catch(() => {
             if (alive && !initialReadyDone) markHostReady();
@@ -2891,7 +2974,15 @@ export function TerminalSurface({
             }
             if (!sawRaw) {
               sawRaw = true;
-              if (fallbackLines.length) term.reset();
+              if (fallbackLines.length) {
+                initialReadyDone = false;
+                initialBurstStartAt = 0;
+                initialRevealQueued = false;
+                hostEl.dataset.ready = "false";
+                window.clearTimeout(hostReadyFallback);
+                hostReadyFallback = window.setTimeout(markHostReady, 950);
+                term.reset();
+              }
             }
             try {
               queueRawBytes(decodeBase64Bytes(ev.data));
@@ -2909,6 +3000,7 @@ export function TerminalSurface({
         (state: { kind?: string; result?: { raw?: boolean } } | undefined) => {
           if (!alive || !state) return;
           if (state.kind === "live" && state.result?.raw === true) {
+            rawModeConfirmed = true;
             if (seedTimer) {
               clearTimeout(seedTimer);
               seedTimer = 0;
@@ -2922,7 +3014,7 @@ export function TerminalSurface({
           }
         },
       );
-      seedTimer = window.setTimeout(runFallbackRead, 150);
+      seedTimer = window.setTimeout(runFallbackRead, 900);
     };
 
     let readyToAttachResolve: (() => void) | null = null;
@@ -2949,6 +3041,9 @@ export function TerminalSurface({
       const connectLocal = async (attempt: number): Promise<void> => {
         const gen = ++attachGen;
         if (!alive) return;
+        if (!initialReadyDone && !hostReadyFallback) {
+          hostReadyFallback = window.setTimeout(markHostReady, 950);
+        }
         fitAddon.fit();
         refreshCachedCellSize(term);
         centerScreenVerticalGap(hostEl, term);
@@ -3007,14 +3102,17 @@ export function TerminalSurface({
           } else {
             lastResizeSigRef.current = `${connId}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}@${display.bg}`;
           }
-          // Sync any buffered PTY bytes immediately now that connId is established
+          // Batch buffered pre-resolve PTY chunks with the initial burst so partial scrollback never reveals early.
           const buffered = preResolveChunks;
           preResolveChunks = null;
           for (const chunk of buffered) {
             if (!sawRaw) sawRaw = true;
             queueRawBytes(chunk);
           }
-          if (buffered.length > 0) flushPendingBytes();
+          if (buffered.length === 0 && !initialReadyDone) {
+            window.clearTimeout(hostReadyFallback);
+            hostReadyFallback = window.setTimeout(markHostReady, 220);
+          }
           if (alive) {
             void localTermFocus(connId, activeRef.current && focusedRef.current);
           }
@@ -3043,7 +3141,7 @@ export function TerminalSurface({
         wasAtBottomRef.current = true;
         hostEl.dataset.ready = "false";
         window.clearTimeout(hostReadyFallback);
-        hostReadyFallback = window.setTimeout(markHostReady, 450);
+        hostReadyFallback = window.setTimeout(markHostReady, 950);
         window.clearTimeout(orphanNudgeTimer);
         orphanNudgeTimer = 0;
         pendingBytes = [];
@@ -3352,6 +3450,7 @@ export function TerminalSurface({
       hostEl.removeEventListener("mouseleave", onHostMouseLeaveHover);
       hostEl.removeEventListener("mousedown", onHostMouseDownCapture, true);
       hostEl.removeEventListener("wheel", onHostWheel);
+      hostEl.removeEventListener("scroll", onHostCaptureScroll, true);
       window.removeEventListener("keyup", onModifierKeyUp, true);
       textarea?.removeEventListener("focus", onTermFocus);
       textarea?.removeEventListener("blur", onTermBlur);
@@ -3447,19 +3546,31 @@ export function TerminalSurface({
     };
   }, [active, focused, paintOverlays, syncResize]);
 
-  // Accept dictated text from desktop VoiceInput when this terminal pane is active and focused.
+  // Accept dictated text or virtual mobile pad keys when this terminal pane is active and focused.
   useEffect(() => {
     const onVoiceInput = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ text?: string }>).detail;
+      const detail = (ev as CustomEvent<{ text?: string; noFocus?: boolean }>).detail;
       const text = detail?.text;
       if (!text || !activeRef.current || !focusedRef.current) return;
       const hostEl = hostRef.current;
       if (!hostEl || hostEl.offsetParent === null) return;
       void sendInput(text);
-      requestAnimationFrame(() => termRef.current?.focus());
+      if (!detail?.noFocus) {
+        requestAnimationFrame(() => termRef.current?.focus());
+      }
+    };
+    const onFocusTerminal = () => {
+      if (!activeRef.current || !focusedRef.current) return;
+      const hostEl = hostRef.current;
+      if (!hostEl || hostEl.offsetParent === null) return;
+      termRef.current?.focus();
     };
     window.addEventListener("pocket:voice-term-input", onVoiceInput);
-    return () => window.removeEventListener("pocket:voice-term-input", onVoiceInput);
+    window.addEventListener("pocket:focus-terminal", onFocusTerminal);
+    return () => {
+      window.removeEventListener("pocket:voice-term-input", onVoiceInput);
+      window.removeEventListener("pocket:focus-terminal", onFocusTerminal);
+    };
   }, [sendInput]);
 
   const jumpToSearchMatch = useCallback((matches: TerminalSearchMatch[], idx: number) => {

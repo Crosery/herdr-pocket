@@ -1,6 +1,7 @@
-import { useEffect } from "react";
-import { buildHarnessSwitchCommands, stripModelEffortSuffix, textWithFiles, type Agent } from "@herdr-pocket/protocol";
+import { useEffect, useMemo } from "react";
+import { buildHarnessSwitchCommands, sameMessage, stripModelEffortSuffix, textWithFiles, type Agent } from "@herdr-pocket/protocol";
 import {
+  filterTerminalQueuedItems,
   reconcileOutgoingSends,
   shouldAutoDrainQueue,
   type OutgoingSendLike,
@@ -14,9 +15,12 @@ import {
 } from "./dropPreview";
 import { rpcCall } from "./relay";
 import { allAgents, createStore, liveStore } from "./store";
+import { uploadRemoteFile } from "./uploadLargeFile";
 import { registerWorkspaceSection, scheduleWorkspacePersist } from "./workspacePersist";
 
-export { reconcileOutgoingSends, shouldAutoDrainQueue, type OutgoingSendLike };
+export { filterTerminalQueuedItems, reconcileOutgoingSends, shouldAutoDrainQueue, type OutgoingSendLike };
+
+export type DeliveryMode = "auto" | "steer" | "interrupt";
 
 export interface OutgoingSend extends OutgoingSendLike {
   agentKey: string;
@@ -24,6 +28,7 @@ export interface OutgoingSend extends OutgoingSendLike {
   attachments: StagedAttachment[];
   uploadedPaths?: string[];
   attachedNames: string[];
+  progressText?: string;
   error?: string;
 }
 
@@ -56,18 +61,26 @@ export interface CapturedCommandEntry {
   ts: number;
 }
 
+interface InjectedTerminalRecord {
+  text: string;
+  at: number;
+}
+
 interface ChatQueueState {
   queuedByAgent: Record<string, QueuedPrompt[]>;
   outgoingByAgent: Record<string, OutgoingSend[]>;
   pendingSwitchByAgent: Record<string, PendingModelSwitch>;
   capturedByAgent: Record<string, CapturedCommandEntry[]>;
+  injectedTerminalByAgent: Record<string, InjectedTerminalRecord[]>;
 }
 
 const EMPTY_QUEUED: QueuedPrompt[] = [];
 const EMPTY_OUTGOING: OutgoingSend[] = [];
 const EMPTY_CAPTURED: CapturedCommandEntry[] = [];
+const EMPTY_INJECTED: InjectedTerminalRecord[] = [];
 const DRAIN_COOLDOWN_MS = 3500;
 const STEER_SETTLE_MS = 180;
+const INJECTED_TERMINAL_TTL_MS = 15_000;
 const INTERRUPTED_SEND_ERROR = "应用重启前发送中断，点击可重试";
 
 let idSeq = 0;
@@ -78,6 +91,7 @@ export const chatQueueStore = createStore<ChatQueueState>({
   outgoingByAgent: {},
   pendingSwitchByAgent: {},
   capturedByAgent: {},
+  injectedTerminalByAgent: {},
 });
 
 interface SerializedQueuedPrompt {
@@ -267,7 +281,13 @@ function hydrateChatQueue(raw: unknown): void {
     pendingSwitchByAgent[k] = sw;
   }
 
-  chatQueueStore.set({ queuedByAgent, outgoingByAgent, pendingSwitchByAgent, capturedByAgent: current.capturedByAgent });
+  chatQueueStore.set({
+    queuedByAgent,
+    outgoingByAgent,
+    pendingSwitchByAgent,
+    capturedByAgent: current.capturedByAgent,
+    injectedTerminalByAgent: current.injectedTerminalByAgent,
+  });
 }
 
 registerWorkspaceSection("chatQueue", {
@@ -289,7 +309,13 @@ export function resetChatQueueForTest(): void {
   }
   inFlightAgents.clear();
   dispatchState.clear();
-  chatQueueStore.set({ queuedByAgent: {}, outgoingByAgent: {}, pendingSwitchByAgent: {}, capturedByAgent: {} });
+  chatQueueStore.set({
+    queuedByAgent: {},
+    outgoingByAgent: {},
+    pendingSwitchByAgent: {},
+    capturedByAgent: {},
+    injectedTerminalByAgent: {},
+  });
 }
 
 export function dismissCapturedCommand(agentKey: string, id: string): void {
@@ -359,7 +385,7 @@ function updateQueued(
   if (changed) scheduleWorkspacePersist();
 }
 
-async function deliverOutgoing(send: OutgoingSend, delivery: "auto" | "steer" = "auto"): Promise<boolean> {
+async function deliverOutgoing(send: OutgoingSend, delivery: DeliveryMode = "auto"): Promise<boolean> {
   try {
     let body = send.text;
     let uploadedPaths = send.uploadedPaths;
@@ -380,10 +406,28 @@ async function deliverOutgoing(send: OutgoingSend, delivery: "auto" | "steer" = 
       for (const att of send.attachments) {
         if (att.hostRef) {
           paths.push(att.hostRef);
-        } else if (uploadIdx < uploaded.paths.length) {
-          paths.push(uploaded.paths[uploadIdx++]!);
+        } else if (att.put) {
+          if (uploadIdx < uploaded.paths.length) {
+            paths.push(uploaded.paths[uploadIdx++]!);
+          }
+        } else if (att.file) {
+          const uploadedPath = await uploadRemoteFile(
+            send.deviceId,
+            send.agentKey,
+            att.file,
+            (pct, viaDirect) => {
+              const label = `正在上传 ${att.name} · ${pct}%${viaDirect ? " (直连)" : ""}`;
+              updateOutgoing(send.agentKey, (list) =>
+                list.map((x) => (x.id === send.id ? { ...x, progressText: label } : x)),
+              );
+            },
+          );
+          paths.push(uploadedPath);
         }
       }
+      updateOutgoing(send.agentKey, (list) =>
+        list.map((x) => (x.id === send.id && x.progressText ? { ...x, progressText: undefined } : x)),
+      );
       uploadedPaths = paths;
       body = textWithFiles(send.text, paths);
     }
@@ -424,7 +468,8 @@ async function deliverOutgoing(send: OutgoingSend, delivery: "auto" | "steer" = 
       return true;
     }
     // Keep attachment thumbnails/paths alive on the optimistic bubble until Uniflo echoes or prunes it.
-    const nextState: OutgoingSend["state"] = sendRes?.waiting ? "queued_terminal" : "sent";
+    // Explicit steer / interrupt / inject sends stay inline (`sent`), never falling back to `queued_terminal`.
+    const nextState: OutgoingSend["state"] = delivery === "auto" && sendRes?.waiting ? "queued_terminal" : "sent";
     updateOutgoing(send.agentKey, (list) =>
       list.map((x) =>
         x.id === send.id
@@ -447,25 +492,34 @@ async function deliverOutgoing(send: OutgoingSend, delivery: "auto" | "steer" = 
   }
 }
 
-export async function sendPromptNow(
+function createOutgoingEntry(
   agent: Pick<Agent, "key" | "deviceId">,
-  rawText: string,
+  cleanText: string,
   attachments: StagedAttachment[],
-  delivery: "auto" | "steer" = "auto",
-): Promise<boolean> {
-  const clean = rawText.trim();
-  if (!clean && attachments.length === 0) return false;
-  const entry: OutgoingSend = {
+  state: OutgoingSend["state"] = "sending",
+): OutgoingSend {
+  return {
     id: nextId("out"),
     agentKey: agent.key,
     deviceId: agent.deviceId,
-    text: clean,
+    text: cleanText,
     attachments,
     attachedCount: attachments.length,
     attachedNames: attachments.map((a) => a.name),
     ts: Date.now(),
-    state: "sending",
+    state,
   };
+}
+
+export async function sendPromptNow(
+  agent: Pick<Agent, "key" | "deviceId">,
+  rawText: string,
+  attachments: StagedAttachment[],
+  delivery: DeliveryMode = "auto",
+): Promise<boolean> {
+  const clean = rawText.trim();
+  if (!clean && attachments.length === 0) return false;
+  const entry = createOutgoingEntry(agent, clean, attachments, "sending");
   updateOutgoing(agent.key, (list) => [...list, entry]);
   return deliverOutgoing(entry, delivery);
 }
@@ -579,14 +633,83 @@ export async function interruptAndSendQueuedPrompt(
   dispatchState.delete(agent.key);
   inFlightAgents.add(agent.key);
   try {
+    const entry = createOutgoingEntry(agent, popped.text.trim(), popped.attachments, "sending");
+    updateOutgoing(agent.key, (list) => [...list, entry]);
     if (agent.status === "working") {
       await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
       await waitMs(STEER_SETTLE_MS);
     }
-    await sendPromptNow(agent, popped.text, popped.attachments, "auto");
+    await deliverOutgoing(entry, "interrupt");
   } finally {
     inFlightAgents.delete(agent.key);
   }
+}
+
+/** Interrupt the running turn from the composer and immediately insert/send the prompt once. */
+export async function interruptComposerNow(
+  agent: Pick<Agent, "key" | "deviceId" | "status">,
+  rawText: string,
+  attachments: StagedAttachment[],
+): Promise<boolean> {
+  if (inFlightAgents.has(agent.key)) return false;
+  const clean = rawText.trim();
+  if (!clean && attachments.length === 0) return false;
+  dispatchState.delete(agent.key);
+  inFlightAgents.add(agent.key);
+  try {
+    const entry = createOutgoingEntry(agent, clean, attachments, "sending");
+    updateOutgoing(agent.key, (list) => [...list, entry]);
+    if (agent.status === "working") {
+      await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
+      await waitMs(STEER_SETTLE_MS);
+    }
+    return await deliverOutgoing(entry, "interrupt");
+  } finally {
+    inFlightAgents.delete(agent.key);
+  }
+}
+
+/** Injects a terminal-queued message immediately into the active turn without creating duplicate bubbles. */
+export async function injectTerminalQueuedNow(
+  agent: Pick<Agent, "key" | "deviceId">,
+  rawText: string,
+): Promise<void> {
+  const clean = rawText.trim();
+  const now = Date.now();
+  chatQueueStore.set((state) => {
+    const nextInjectedMap = { ...state.injectedTerminalByAgent };
+    if (clean) {
+      const fresh = (nextInjectedMap[agent.key] ?? EMPTY_INJECTED).filter(
+        (x) => now - x.at < INJECTED_TERMINAL_TTL_MS && !sameMessage(x.text, clean),
+      );
+      fresh.push({ text: clean, at: now });
+      nextInjectedMap[agent.key] = fresh;
+    }
+
+    const curOutgoing = state.outgoingByAgent[agent.key] ?? EMPTY_OUTGOING;
+    let promoted = false;
+    let nextOutgoing = curOutgoing.map((item) => {
+      if (!promoted && clean && item.state === "queued_terminal" && sameMessage(item.text, clean)) {
+        promoted = true;
+        return { ...item, state: "sent" as const, ts: now, error: undefined };
+      }
+      return item;
+    });
+    if (!promoted && clean && !nextOutgoing.some((item) => sameMessage(item.text, clean))) {
+      nextOutgoing = [...nextOutgoing, createOutgoingEntry(agent, clean, [], "sent")];
+    }
+
+    const nextOutgoingMap = { ...state.outgoingByAgent };
+    if (nextOutgoing.length) nextOutgoingMap[agent.key] = nextOutgoing;
+    else delete nextOutgoingMap[agent.key];
+
+    return {
+      ...state,
+      injectedTerminalByAgent: nextInjectedMap,
+      outgoingByAgent: nextOutgoingMap,
+    };
+  });
+  await rpcCall(agent.deviceId, "terminal.keys", { agent: agent.key, keys: ["alt+m"] });
 }
 
 /** Non-destructive soft steer from the composer ("插队发送"): submits without interrupting the running turn. */
@@ -774,6 +897,7 @@ export function useAgentChatQueue(agentKey: string): {
   outgoing: OutgoingSend[];
   pendingSwitch: PendingModelSwitch | null;
   captured: CapturedCommandEntry[];
+  injectedTerminalTexts: Set<string>;
 } {
   useEffect(() => {
     ensureChatQueueWatcher();
@@ -782,5 +906,10 @@ export function useAgentChatQueue(agentKey: string): {
   const outgoing = chatQueueStore.use((s) => s.outgoingByAgent[agentKey] ?? EMPTY_OUTGOING);
   const pendingSwitch = chatQueueStore.use((s) => s.pendingSwitchByAgent[agentKey] ?? null);
   const captured = chatQueueStore.use((s) => s.capturedByAgent[agentKey] ?? EMPTY_CAPTURED);
-  return { queued, outgoing, pendingSwitch, captured };
+  const injectedRecords = chatQueueStore.use((s) => s.injectedTerminalByAgent[agentKey] ?? EMPTY_INJECTED);
+  const injectedTerminalTexts = useMemo(
+    () => new Set(injectedRecords.map((r) => r.text)),
+    [injectedRecords],
+  );
+  return { queued, outgoing, pendingSwitch, captured, injectedTerminalTexts };
 }

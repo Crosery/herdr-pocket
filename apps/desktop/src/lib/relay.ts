@@ -595,9 +595,14 @@ class SocketClient {
       case "stream_event":
         this.subs.get(f.id)?.onEvent(f.event);
         break;
-      case "pong":
+      case "pong": {
         this.clearPong();
+        if (this.lastPing > 0) {
+          const rttMs = Math.max(1, Date.now() - this.lastPing);
+          liveStore.set((prev) => (prev.rttMs === rttMs ? prev : { ...prev, rttMs }));
+        }
         break;
+      }
       case "error":
         logger.warn("relay", `server error ${f.error.code}: ${f.error.message}`);
         if (f.error.code === "unauthorized") setLink("unauthorized", "server said unauthorized");
@@ -714,6 +719,12 @@ class SocketClient {
     }
   }
 
+  forceDirectNow(to: string): void {
+    const t = this.directTry.get(to);
+    if (t && t.next !== Infinity) t.next = 0;
+    this.tryDirect(to, true);
+  }
+
   private tryDirect(to: string, now: boolean): void {
     if (this.closed || this.ws?.readyState !== WebSocket.OPEN) return;
     if (this.direct.get(to)?.open) return;
@@ -743,8 +754,8 @@ class SocketClient {
         t.fails = 0;
         t.next = 0;
         this.direct.set(to, link);
-        liveStore.set((prev) => ({ ...prev, direct: { ...prev.direct, [to]: link.addr } }));
-        logger.info("link", `direct link to ${liveStore.get().devices[to]?.name ?? to} via ${link.addr}`);
+        liveStore.set((prev) => ({ ...prev, direct: { ...prev.direct, [to]: link.displayAddr } }));
+        logger.info("link", `direct link to ${liveStore.get().devices[to]?.name ?? to} via ${link.displayAddr}`);
         this.rehome(to);
       } catch (e) {
         t.fails += 1;
@@ -752,8 +763,8 @@ class SocketClient {
           t.next = Infinity;
         } else {
           const isLocal = localHostIdStore.get() === to;
-          const capMs = isLocal ? 15_000 : 5 * 60_000;
-          const baseMs = isLocal ? 2_000 : 15_000;
+          const capMs = isLocal ? 15_000 : 25_000;
+          const baseMs = isLocal ? 2_000 : 4_000;
           t.next = Date.now() + Math.min(capMs, baseMs * 2 ** Math.min(t.fails - 1, 5));
         }
       } finally {
@@ -984,6 +995,12 @@ export async function rpcCall<M extends RpcMethod>(
 
 export function getDirectEndpoint(to: string): { addr: string; port: number } | null {
   return activeClient?.directEndpoint(to) ?? null;
+}
+
+export function ensureDirectLinkNow(hostId: string): void {
+  const s = settingsStore.get();
+  if (!hostId || (s.server && isMockServer(s.server))) return;
+  activeClient?.forceDirectNow(hostId);
 }
 
 export function subscribeStream(

@@ -9,6 +9,7 @@ import {
   type ServerFrame,
   type StreamKind,
 } from "@herdr-pocket/protocol";
+import { native } from "./native";
 
 export class DirectError extends Error {
   code: RpcError["code"];
@@ -168,6 +169,7 @@ function dialCandidate(
 export class DirectLink {
   readonly to: string;
   readonly addr: string;
+  readonly displayAddr: string;
   readonly port: number;
   private ws: WebSocket;
   private cipher: DirectCipher;
@@ -185,9 +187,11 @@ export class DirectLink {
     ws: WebSocket,
     cipher: DirectCipher,
     handlers: DirectHandlers,
+    displayAddr = addr,
   ) {
     this.to = to;
     this.addr = addr;
+    this.displayAddr = displayAddr;
     this.port = port;
     this.ws = ws;
     this.cipher = cipher;
@@ -220,17 +224,80 @@ export class DirectLink {
       throw new DirectError("offline", "这台电脑没有可直连的地址");
     }
 
-    let lastErr: Error = new DirectError("offline", "无法直连这台电脑");
-    for (const addr of candidates) {
-      try {
-        const timeoutMs = addr === "127.0.0.1" ? DIAL_LOCAL_MS : DIAL_REMOTE_MS;
-        const win = await dialCandidate(addr, offer.port, offer.ticket, key, timeoutMs);
-        return new DirectLink(to, win.addr, offer.port, win.ws, win.cipher, handlers);
-      } catch (err) {
-        lastErr = err as Error;
+    if (native.available() && !preferLoopback) {
+      const tunnel = await native.openDirectTunnel(candidates, offer.port);
+      if (tunnel && tunnel.localPort > 0) {
+        try {
+          const win = await dialCandidate("127.0.0.1", tunnel.localPort, offer.ticket, key, DIAL_LOCAL_MS);
+          return new DirectLink(to, "127.0.0.1", tunnel.localPort, win.ws, win.cipher, handlers, tunnel.remoteAddr);
+        } catch {
+          // Fall back to direct WebSocket racing below if local tunnel fails handshake.
+        }
       }
     }
-    throw lastErr;
+
+    const STAGGER_MS = 120;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const opened: WebSocket[] = [];
+    let settled = false;
+
+    const cleanup = (keep?: WebSocket) => {
+      for (const t of timers) clearTimeout(t);
+      timers.length = 0;
+      for (const sock of opened) {
+        if (sock === keep) continue;
+        sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
+        try {
+          sock.close();
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    try {
+      const win = await Promise.any(
+        candidates.map(
+          (addr, idx) =>
+            new Promise<{ ws: WebSocket; cipher: DirectCipher; addr: string }>((resolve, reject) => {
+              const run = () => {
+                if (settled) {
+                  reject(new DirectError("offline", "cancelled"));
+                  return;
+                }
+                const timeoutMs = addr === "127.0.0.1" ? DIAL_LOCAL_MS : DIAL_REMOTE_MS;
+                dialCandidate(addr, offer.port, offer.ticket, key, timeoutMs)
+                  .then((res) => {
+                    opened.push(res.ws);
+                    if (settled) {
+                      try {
+                        res.ws.close();
+                      } catch {
+                        // ignore
+                      }
+                      reject(new DirectError("offline", "cancelled"));
+                      return;
+                    }
+                    settled = true;
+                    resolve(res);
+                  })
+                  .catch((err) => reject(err));
+              };
+              if (idx === 0) run();
+              else timers.push(setTimeout(run, idx * STAGGER_MS));
+            }),
+        ),
+      );
+      cleanup(win.ws);
+      return new DirectLink(to, win.addr, offer.port, win.ws, win.cipher, handlers, win.addr);
+    } catch (agg) {
+      cleanup();
+      const firstErr =
+        agg && typeof agg === "object" && "errors" in agg && Array.isArray((agg as { errors: unknown[] }).errors)
+          ? ((agg as { errors: Error[] }).errors[0] ?? new DirectError("offline", "无法直连这台电脑"))
+          : new DirectError("offline", "无法直连这台电脑");
+      throw firstErr instanceof Error ? firstErr : new DirectError("offline", String(firstErr));
+    }
   }
 
   private async handleMessage(data: unknown): Promise<void> {

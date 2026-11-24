@@ -50,6 +50,11 @@ const UNSUPPORTED_TRAFFIC_LIGHTS: TrafficLightMetrics = {
   safeTop: 0,
 };
 
+export interface DirectTunnelInfo {
+  localPort: number;
+  remoteAddr: string;
+}
+
 export interface Rect {
   x: number;
   y: number;
@@ -478,6 +483,9 @@ export const native = {
   onVoiceCallCommand: (cb: (cmd: VoiceCallCommand) => void): (() => void) => bridge.onVoiceCallCommand(cb),
   onVoiceCallMic: (cb: (ev: VoiceCallMicEvent) => void): (() => void) => bridge.onVoiceCallMic(cb),
   checkHotkey: (hotkey: string): Promise<HotkeyCheck | null> => (inTauri() ? bridge.checkHotkey(hotkey).catch(() => null) : Promise.resolve(null)),
+  voiceSetRecordingHotkey: async (recording: boolean): Promise<void> => {
+    if (inTauri()) await invoke<void>("voice_set_recording_hotkey", { recording }).catch(() => {});
+  },
   voiceReload: (): Promise<boolean> => bridge.voiceReload(),
   voiceCallMicStart: (): Promise<void> => bridge.voiceCallMicStart(),
   voiceCallMicStop: (): Promise<void> => bridge.voiceCallMicStop(),
@@ -653,6 +661,63 @@ export const native = {
       snrDb: null,
       hasSample: false,
     });
+  },
+  voiceAiExportVoiceprint: async (): Promise<{ voiceprint: Record<string, unknown>; sampleBase64?: string } | null> => {
+    if (inTauri()) {
+      return invoke<{ voiceprint: Record<string, unknown>; sampleBase64?: string } | null>("voice_ai_export_voiceprint");
+    }
+    const cur = getDemoVoiceAi();
+    if (!cur.enrolled) return null;
+    return {
+      voiceprint: {
+        embedding: Array.from({ length: 192 }, () => 0.07),
+        prototypes: [Array.from({ length: 192 }, () => 0.07)],
+        modelVersion: "eres2netv2-voxlock-v2",
+        seconds: cur.enrollSeconds || 5,
+        consistency: cur.consistency || 0.9,
+      },
+    };
+  },
+  voiceAiImportVoiceprint: async (payload: { voiceprint: Record<string, unknown>; sampleBase64?: string }): Promise<VoiceAiState> => {
+    if (inTauri()) {
+      return invoke<VoiceAiState>("voice_ai_import_voiceprint", { payload });
+    }
+    return setDemoVoiceAi({
+      ...getDemoVoiceAi(),
+      enrolled: true,
+      filter: true,
+      enrollSeconds: Number((payload.voiceprint?.seconds as number) || 5),
+      prototypesCount: Array.isArray(payload.voiceprint?.prototypes) ? payload.voiceprint.prototypes.length : 1,
+      consistency: Number((payload.voiceprint?.consistency as number) || 0.9),
+      hasSample: Boolean(payload.sampleBase64),
+    });
+  },
+  voiceAiEnrollFromPcm: async (pcmBase64: string): Promise<VoiceAiEnrollResult> => {
+    if (inTauri()) {
+      return invoke<VoiceAiEnrollResult>("voice_ai_enroll_from_pcm", { pcmBase64 });
+    }
+    if (!pcmBase64) throw new Error("音频文件为空");
+    const next = setDemoVoiceAi({
+      ...getDemoVoiceAi(),
+      enrolled: true,
+      filter: true,
+      svReady: true,
+      vadReady: true,
+      enrollSeconds: 6.4,
+      prototypesCount: 4,
+      consistency: 0.92,
+      snrDb: 26.1,
+      hasSample: true,
+    });
+    return {
+      seconds: 6.4,
+      consistency: 0.92,
+      lowest: 0.86,
+      snrDb: 26.1,
+      prototypesCount: 4,
+      hasSample: true,
+      state: next,
+    };
   },
   voiceAiStartTest: async (threshold?: number): Promise<void> => {
     if (inTauri()) return invoke<void>("voice_ai_start_test", { threshold: threshold ?? null });
@@ -926,6 +991,8 @@ export const native = {
     inTauri() ? invoke<void>("workspace_state_save", { raw }) : Promise.resolve(),
   queryOsModifiers: async (): Promise<OsModifierState> =>
     inTauri() ? invoke<OsModifierState>("query_os_modifiers").catch(() => UNSUPPORTED_OS_MODIFIERS) : UNSUPPORTED_OS_MODIFIERS,
+  openDirectTunnel: async (addrs: string[], port: number): Promise<DirectTunnelInfo | null> =>
+    inTauri() ? invoke<DirectTunnelInfo>("open_direct_tunnel", { addrs, port }).catch(() => null) : null,
   queryTrafficLightMetrics: async (): Promise<TrafficLightMetrics> =>
     inTauri()
       ? invoke<TrafficLightMetrics>("query_traffic_light_metrics").catch(() => UNSUPPORTED_TRAFFIC_LIGHTS)

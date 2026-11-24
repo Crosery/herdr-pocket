@@ -361,18 +361,29 @@ export async function closePortalSurface(hostId: string, portalId: string): Prom
   });
 }
 
-export async function capturePortalFrameOnce(hostId: string, portalId: string): Promise<PortalFramePayload | null> {
-  const res = await rpcCall(hostId, "portal.frame", { portalId }, 12_000);
-  if (res.item) {
-    setState((prev) => ({
-      ...prev,
-      itemsById: { ...prev.itemsById, [res.item!.id]: res.item! },
-    }));
-  }
-  if (res.frame) {
-    ingestPortalStreamEvent({ kind: "portal_frame", ...res.frame });
-  }
-  return res.frame;
+const inflightFrames = new Map<string, Promise<PortalFramePayload | null>>();
+
+export function capturePortalFrameOnce(hostId: string, portalId: string): Promise<PortalFramePayload | null> {
+  const key = `${hostId}\0${portalId}`;
+  const pending = inflightFrames.get(key);
+  if (pending) return pending;
+  const p = (async () => {
+    const res = await rpcCall(hostId, "portal.frame", { portalId }, 12_000);
+    if (res.item) {
+      setState((prev) => ({
+        ...prev,
+        itemsById: { ...prev.itemsById, [res.item!.id]: res.item! },
+      }));
+    }
+    if (res.frame) {
+      ingestPortalStreamEvent({ kind: "portal_frame", ...res.frame });
+    }
+    return res.frame;
+  })().finally(() => {
+    inflightFrames.delete(key);
+  });
+  inflightFrames.set(key, p);
+  return p;
 }
 
 export async function sendPortalInput(

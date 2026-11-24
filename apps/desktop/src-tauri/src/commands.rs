@@ -1893,6 +1893,31 @@ pub fn voice_ai_clear_voiceprint() -> Result<crate::voice_ai::VoiceAiState, Stri
 }
 
 #[tauri::command]
+pub fn voice_ai_export_voiceprint() -> Result<Option<serde_json::Value>, String> {
+    crate::voice_ai::export_voiceprint()
+}
+
+#[tauri::command]
+pub fn voice_ai_import_voiceprint(
+    payload: serde_json::Value,
+) -> Result<crate::voice_ai::VoiceAiState, String> {
+    crate::voice_ai::import_voiceprint(payload)
+}
+
+#[tauri::command]
+pub async fn voice_ai_enroll_from_pcm(
+    pcm_base64: String,
+) -> Result<crate::voice_ai::VoiceAiEnrollResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = crate::local_term::base64_decode(pcm_base64.as_bytes())
+            .ok_or_else(|| "音频数据编码无效".to_string())?;
+        crate::voice_ai::enroll_from_pcm_bytes(&bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn voice_ai_start_test(
     app: AppHandle,
     threshold: Option<f32>,
@@ -2131,14 +2156,18 @@ pub fn query_traffic_light_metrics(app: AppHandle) -> crate::mainwin::TrafficLig
 pub fn query_os_modifiers() -> OsModifierState {
     #[cfg(target_os = "macos")]
     {
-        use objc2_app_kit::{NSEvent, NSEventModifierFlags};
-        let flags = NSEvent::modifierFlags_class();
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+        }
+        const HID_STATE: i32 = 1; // kCGEventSourceStateHIDSystemState
+        let down = |k: u16| unsafe { CGEventSourceKeyState(HID_STATE, k) };
         return OsModifierState {
             supported: true,
-            meta: flags.contains(NSEventModifierFlags::Command),
-            ctrl: flags.contains(NSEventModifierFlags::Control),
-            alt: flags.contains(NSEventModifierFlags::Option),
-            shift: flags.contains(NSEventModifierFlags::Shift),
+            meta: down(55) || down(54),  // kVK_Command, kVK_RightCommand
+            ctrl: down(59) || down(62),  // kVK_Control, kVK_RightControl
+            alt: down(58) || down(61),   // kVK_Option, kVK_RightOption
+            shift: down(56) || down(60), // kVK_Shift, kVK_RightShift
         };
     }
     #[cfg(windows)]
@@ -2167,12 +2196,184 @@ pub fn query_os_modifiers() -> OsModifierState {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectTunnelInfo {
+    pub local_port: u16,
+    pub remote_addr: String,
+}
+
+type TunnelSlot = std::sync::Arc<Mutex<Option<std::net::TcpStream>>>;
+type TunnelEntry = (u16, TunnelSlot);
+
+fn direct_tunnels() -> &'static Mutex<HashMap<(std::net::IpAddr, u16), TunnelEntry>> {
+    static MAP: OnceLock<Mutex<HashMap<(std::net::IpAddr, u16), TunnelEntry>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pipe_bidirectional(client: std::net::TcpStream, upstream: std::net::TcpStream) {
+    use std::net::Shutdown;
+    let Ok(mut c_in) = client.try_clone() else {
+        return;
+    };
+    let Ok(mut u_out) = upstream.try_clone() else {
+        return;
+    };
+    let mut u_in = upstream;
+    let mut c_out = client;
+    let t1 = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut c_in, &mut u_out);
+        let _ = u_out.shutdown(Shutdown::Write);
+    });
+    let _ = std::io::copy(&mut u_in, &mut c_out);
+    let _ = c_out.shutdown(Shutdown::Write);
+    let _ = t1.join();
+}
+
+fn ensure_tunnel_listener(
+    ip: std::net::IpAddr,
+    port: u16,
+    prewarmed: std::net::TcpStream,
+) -> Result<u16, String> {
+    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let mut map = direct_tunnels()
+        .lock()
+        .map_err(|_| "direct tunnel map poisoned".to_string())?;
+    if let Some((local_port, slot)) = map.get(&(ip, port)) {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(prewarmed);
+        }
+        return Ok(*local_port);
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("bind local tunnel failed: {e}"))?;
+    let local_port = listener
+        .local_addr()
+        .map_err(|e| format!("read tunnel port failed: {e}"))?
+        .port();
+    let slot: TunnelSlot = Arc::new(Mutex::new(Some(prewarmed)));
+    let slot_bg = Arc::clone(&slot);
+    let remote = SocketAddr::new(ip, port);
+
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(client) = conn else { continue };
+            let _ = client.set_nodelay(true);
+            let ready = slot_bg.lock().ok().and_then(|mut g| g.take());
+            std::thread::spawn(move || {
+                let upstream = match ready {
+                    Some(s) => s,
+                    None => match TcpStream::connect_timeout(&remote, Duration::from_millis(2500)) {
+                        Ok(s) => {
+                            let _ = s.set_nodelay(true);
+                            s
+                        }
+                        Err(_) => {
+                            let _ = client.shutdown(Shutdown::Both);
+                            return;
+                        }
+                    },
+                };
+                pipe_bidirectional(client, upstream);
+            });
+        }
+    });
+
+    map.insert((ip, port), (local_port, slot));
+    Ok(local_port)
+}
+
+pub fn open_direct_tunnel_blocking(
+    addrs: Vec<String>,
+    port: u16,
+) -> Result<DirectTunnelInfo, String> {
+    use std::net::{IpAddr, SocketAddr, TcpStream};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    if port == 0 {
+        return Err("invalid direct port".into());
+    }
+    let mut ips: Vec<IpAddr> = Vec::new();
+    for raw in addrs {
+        if let Ok(ip) = raw.trim().parse::<IpAddr>() {
+            if !ips.contains(&ip) {
+                ips.push(ip);
+                if ips.len() >= 8 {
+                    break;
+                }
+            }
+        }
+    }
+    if ips.is_empty() {
+        return Err("no valid direct IP candidates".into());
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<(IpAddr, TcpStream), String>>();
+    let total = ips.len();
+    for ip in ips {
+        let tx_i = tx.clone();
+        std::thread::spawn(move || {
+            let sa = SocketAddr::new(ip, port);
+            let res = TcpStream::connect_timeout(&sa, Duration::from_millis(2200))
+                .map(|s| {
+                    let _ = s.set_nodelay(true);
+                    (ip, s)
+                })
+                .map_err(|e| format!("{ip}: {e}"));
+            let _ = tx_i.send(res);
+        });
+    }
+    drop(tx);
+
+    let deadline = Instant::now() + Duration::from_millis(2400);
+    let mut last_err = String::from("direct TCP race timed out");
+    for _ in 0..total {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(rem) {
+            Ok(Ok((ip, stream))) => {
+                let local_port = ensure_tunnel_listener(ip, port, stream)?;
+                return Ok(DirectTunnelInfo {
+                    local_port,
+                    remote_addr: ip.to_string(),
+                });
+            }
+            Ok(Err(e)) => {
+                last_err = e;
+            }
+            Err(_) => break,
+        }
+    }
+    Err(last_err)
+}
+
+#[tauri::command]
+pub async fn open_direct_tunnel(
+    addrs: Vec<String>,
+    port: u16,
+) -> Result<DirectTunnelInfo, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(open_direct_tunnel_blocking(addrs, port));
+    });
+    rx.await
+        .map_err(|_| "direct tunnel worker aborted".to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_sums_url, issue_local_preview_url, process_pcm_bytes_with_processor,
-        query_os_modifiers, read_local_file_sync, resolve_safe_local_file,
-        resolve_safe_local_reveal_target, resolve_safe_local_reveal_target_with_cfg_dir,
+        is_sums_url, issue_local_preview_url, open_direct_tunnel_blocking,
+        process_pcm_bytes_with_processor, query_os_modifiers, read_local_file_sync,
+        resolve_safe_local_file, resolve_safe_local_reveal_target,
+        resolve_safe_local_reveal_target_with_cfg_dir,
     };
 
     #[test]
@@ -2415,5 +2616,45 @@ mod tests {
         .unwrap();
         assert_eq!(u1, u2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_direct_tunnel_blocking_races_and_bridges_multiple_streams() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let echo_srv = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = echo_srv.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in echo_srv.incoming().take(2) {
+                if let Ok(mut sock) = conn {
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 32];
+                        if let Ok(n) = sock.read(&mut buf) {
+                            let _ = sock.write_all(&buf[..n]);
+                        }
+                    });
+                }
+            }
+        });
+
+        let dead_srv = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _dead_port = dead_srv.local_addr().unwrap().port();
+        drop(dead_srv);
+
+        let info = open_direct_tunnel_blocking(
+            vec!["127.0.0.1".to_string()],
+            port,
+        )
+        .unwrap();
+        assert_eq!(info.remote_addr, "127.0.0.1");
+
+        for payload in [b"hello-1".as_slice(), b"hello-2".as_slice()] {
+            let mut cli = std::net::TcpStream::connect(("127.0.0.1", info.local_port)).unwrap();
+            cli.write_all(payload).unwrap();
+            let mut got = [0u8; 7];
+            cli.read_exact(&mut got).unwrap();
+            assert_eq!(&got, payload);
+        }
     }
 }

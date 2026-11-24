@@ -7,7 +7,13 @@ import { test } from "node:test";
 import { DIRECT_PORTAL_FS_PREFIX, type PortalStreamEvent } from "@herdr-pocket/protocol";
 import { DirectServer } from "../src/direct.ts";
 import { PortalManager } from "../src/portal/index.ts";
-import { computeCapabilities, detectPortalSession, resolveLinuxGuiEnv } from "../src/portal/osCapture.ts";
+import {
+  OsCaptureDriver,
+  computeCapabilities,
+  defaultExecBin,
+  detectPortalSession,
+  resolveLinuxGuiEnv,
+} from "../src/portal/osCapture.ts";
 import { PortalFileTicketStore, bundleHtmlForRelay, readChunkForRpc } from "../src/portal/p2pFiles.ts";
 import { PortalHookServer, TerminalInputLineTracker, extractAutoPortalIntents, parseOpenerArgs } from "../src/portal/shims.ts";
 import { UnifloAdapter } from "../src/uniflo.ts";
@@ -15,7 +21,7 @@ import { UnifloAdapter } from "../src/uniflo.ts";
 test("PortalFileTicketStore + DirectServer serve /v1/portal-fs HTTP files, Ranges, CORS, and block traversal/private files", async (t) => {
   const rawRoot = mkdtempSync(join(tmpdir(), "hp-portal-fs-"));
   t.after(() => rmSync(rawRoot, { recursive: true, force: true }));
-  const root = realpathSync(rawRoot);
+  const root = realpathSync.native(rawRoot);
   const sub = join(root, "docs");
   const privDir = join(root, "secret-cfg");
   mkdirSync(sub, { recursive: true });
@@ -307,7 +313,7 @@ test("PortalManager auto-opens and deduplicates portals for terminal open input 
     rmSync(rawRoot, { recursive: true, force: true });
     rmSync(state, { recursive: true, force: true });
   });
-  const ws = realpathSync(rawRoot);
+  const ws = realpathSync.native(rawRoot);
   writeFileSync(join(ws, "page.html"), "<html><body>ok</body></html>");
 
   const events: PortalStreamEvent[] = [];
@@ -420,4 +426,38 @@ test("UnifloAdapter.rootSessionKey walks nested subagent parent pointers back to
   assert.equal(u.rootSessionKey("claude:sub2"), "claude:root");
   assert.equal(u.rootSessionKey("claude:sub1"), "claude:root");
   assert.equal(u.rootSessionKey("claude:root"), "claude:root");
+});
+
+test("defaultExecBin resolves with code -1 instead of throwing unhandled rejection on timeout/SIGTERM", async () => {
+  const res = await defaultExecBin(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], 60);
+  assert.equal(res.code, -1);
+});
+
+test("OsCaptureDriver.captureWindow coalesces concurrent calls and serves 45ms cache", async () => {
+  let capCalls = 0;
+  const driver = new OsCaptureDriver({
+    platform: "linux",
+    env: { WAYLAND_DISPLAY: "wayland-1", HYPRLAND_INSTANCE_SIGNATURE: "1" },
+    hasCmd: (c) => ["hyprctl", "grim"].includes(c),
+    execBin: async (cmd) => {
+      if (cmd === "hyprctl") {
+        return { code: 0, stderr: "", stdout: Buffer.from("[]") };
+      }
+      if (cmd === "grim") {
+        capCalls += 1;
+        await new Promise((r) => setTimeout(r, 25));
+        return { code: 0, stderr: "", stdout: Buffer.from("jpeg-payload") };
+      }
+      return { code: 1, stderr: "", stdout: Buffer.alloc(0) };
+    },
+  });
+
+  const [a, b] = await Promise.all([driver.captureWindow("screen:0"), driver.captureWindow("screen:0")]);
+  assert.equal(capCalls, 1);
+  assert.ok(a && b);
+  assert.equal(a.data, b.data);
+
+  const c = await driver.captureWindow("screen:0");
+  assert.equal(capCalls, 1);
+  assert.equal(c?.data, a.data);
 });

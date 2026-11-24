@@ -91,7 +91,9 @@ import {
   dismissCapturedCommand,
   dismissOutgoingSend,
   enqueuePrompt,
+  injectTerminalQueuedNow,
   interruptAndSendQueuedPrompt,
+  interruptComposerNow,
   moveQueuedPromptToTop,
   popQueuedPromptForEdit,
   pruneOutgoingSends,
@@ -106,7 +108,7 @@ import {
   type CapturedCommandEntry,
   type OutgoingSend,
 } from "../lib/chatQueue";
-import { interleaveOptimisticSends, isAgentTurnBusy } from "../lib/chatQueueLogic";
+import { filterTerminalQueuedItems, interleaveOptimisticSends, isAgentTurnBusy } from "../lib/chatQueueLogic";
 import { useComposerInput } from "../lib/composerKeys";
 import { prepareDroppedFiles, revokeAttachment, stageWorkspaceDragItem, type StagedAttachment } from "../lib/dropPreview";
 import {
@@ -192,7 +194,7 @@ interface QuickMenuState {
 
 const LONG_PRESS_MS = 500;
 
-function AgentRow({
+export function AgentRow({
   agent,
   offline,
   selected,
@@ -1051,6 +1053,8 @@ export function AgentDetailPanel({
   const clearModelMetaOverride = modelMeta.clearOverride;
   const [btwTurnsByAgent, setBtwTurnsByAgent] = useState<Record<string, BtwTurn[]>>({});
   const [chipDismissedPrefix, setChipDismissedPrefix] = useState<string | null>(null);
+  const [composerComposing, setComposerComposing] = useState(false);
+  const compHadChipRef = useRef<boolean | null>(null);
   const btwTurns = btwTurnsByAgent[agent.key] ?? [];
 
   useEffect(() => {
@@ -1120,7 +1124,7 @@ export function AgentDetailPanel({
     };
   }, []);
 
-  const { queued, outgoing, pendingSwitch, captured } = useAgentChatQueue(agent.key);
+  const { queued, outgoing, pendingSwitch, captured, injectedTerminalTexts } = useAgentChatQueue(agent.key);
   const activeSub = subTrail[subTrail.length - 1] ?? null;
   const isPlainShellChat = Boolean(agent.isShell && !agent.sessionKey && !activeSub);
 
@@ -1563,7 +1567,9 @@ export function AgentDetailPanel({
     () => mergeSlashCommands(builtinSlashCommands(agent.harness, agent.isShell), discoveredSlash),
     [agent.harness, agent.isShell, discoveredSlash],
   );
-  const rawLeadingSlash = !agent.isShell && !activeSub ? parseLeadingSlashToken(text, allSlashCommands) : null;
+  const parsedLeadingSlash = !agent.isShell && !activeSub ? parseLeadingSlashToken(text, allSlashCommands) : null;
+  const rawLeadingSlash =
+    composerComposing && compHadChipRef.current === false ? null : parsedLeadingSlash;
   const leadingSlash =
     rawLeadingSlash && chipDismissedPrefix?.toLowerCase() !== rawLeadingSlash.rawToken.toLowerCase()
       ? rawLeadingSlash
@@ -1693,13 +1699,14 @@ export function AgentDetailPanel({
   );
   const terminalQueuedItems = useMemo(
     () =>
-      rawTerminalQueued.filter(
-        (qText) =>
-          qText.trim() &&
-          !reconciled.unmatched.some((u) => sameMessage(qText, u.text)) &&
-          !queued.some((q) => sameMessage(qText, q.text)),
+      filterTerminalQueuedItems(
+        rawTerminalQueued,
+        reconciled.unmatched,
+        queued.map((q) => q.text),
+        injectedTerminalTexts,
+        foldedRows,
       ),
-    [queued, rawTerminalQueued, reconciled.unmatched],
+    [foldedRows, injectedTerminalTexts, queued, rawTerminalQueued, reconciled.unmatched],
   );
 
   const hasAnyRenderedRows =
@@ -2095,6 +2102,10 @@ export function AgentDetailPanel({
     composerInputValue,
     () => submitComposerRef.current(),
     isTurnBusy && !isBtwDraft ? () => steerComposerRef.current() : undefined,
+    (composing) => {
+      compHadChipRef.current = composing ? Boolean(leadingSlash) : null;
+      setComposerComposing(composing);
+    },
   );
 
   const submitComposer = (overrideText?: string) => {
@@ -2232,6 +2243,26 @@ export function AgentDetailPanel({
     requestAnimationFrame(() => composer.textareaRef.current?.focus());
   };
   steerComposerRef.current = steerComposer;
+
+  const interruptComposer = () => {
+    const raw = text.trim();
+    const staged = attachments;
+    if (!raw && staged.length === 0) return;
+    clearComposerDraft(agent.key, { revoke: false });
+    setTextState("");
+    setAttachmentsState([]);
+    setChipDismissedPrefix(null);
+    stickRef.current = true;
+    setAtBottom(true);
+    logAction("chat", "chat.interrupt_send", {
+      slash: raw.startsWith("/"),
+      chars: raw.length,
+      files: staged.length,
+    });
+    setSending(true);
+    void interruptComposerNow(agent, raw, staged).finally(() => setSending(false));
+    requestAnimationFrame(() => composer.textareaRef.current?.focus());
+  };
 
   const interruptTurn = useCallback(() => {
     void rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) =>
@@ -2475,7 +2506,11 @@ export function AgentDetailPanel({
     agent.status !== "working" &&
     !reconciled.awaitingReply &&
     !hasSending;
-  const totalQueuedCount = queued.length + (terminalQueuedItems.length || (agent.queued ?? 0));
+  const terminalQueueBadgeCount =
+    rawTerminalQueued.length > 0
+      ? terminalQueuedItems.length
+      : Math.max(0, (agent.queued ?? 0) - injectedTerminalTexts.size);
+  const totalQueuedCount = queued.length + terminalQueueBadgeCount;
   const runElapsed = workingStartRef.current ? workedFor(nowTick - workingStartRef.current) : "刚开始";
 
   return (
@@ -2730,7 +2765,7 @@ export function AgentDetailPanel({
                           <span>
                             {clockStr(seg.send.ts)} ·{" "}
                             {seg.send.state === "sending"
-                              ? "发送中…"
+                              ? seg.send.progressText || "发送中…"
                               : seg.send.state === "failed"
                                 ? `发送失败${seg.send.error ? `：${clip(seg.send.error, 40)}` : ""}`
                                 : seg.send.state === "queued_terminal"
@@ -2791,7 +2826,7 @@ export function AgentDetailPanel({
                 </button>
               </div>
             );
-          })() : (hasSending || reconciled.awaitingReply) && reconciled.unmatched.length === 0 ? (
+          })() : hasSending || reconciled.awaitingReply ? (
             <div className="agent-run-card" role="status" aria-live="polite">
               <XiaoyangOrb mood="working" size={26} />
               <div className="agent-run-body">
@@ -2817,41 +2852,6 @@ export function AgentDetailPanel({
               </button>
             </div>
           ) : null}
-
-          {!activeSub && terminalQueuedItems.length > 0
-            ? terminalQueuedItems.map((qText, idx) => {
-                const qImgs = extractImageTargets([qText]);
-                return (
-                  <div key={`term-q-${idx}-${qText.slice(0, 24)}`} className="bubble-row user queued-terminal">
-                    <div className="bubble user">
-                      <RichMarkdown text={qText} onOpenFile={(target) => openAgentFileTarget(agent, target)} />
-                    </div>
-                    {qImgs.length > 0 ? (
-                      <InlineImageStrip
-                        targets={qImgs}
-                        agentKey={agent.key}
-                        deviceId={agent.deviceId}
-                        cwd={agent.cwd}
-                        onOpenFile={(target) => openAgentFileTarget(agent, target)}
-                      />
-                    ) : null}
-                    <div className="bubble-send-meta">
-                      <span>终端排队中 · 本轮结束后自动处理</span>
-                      {agent.source === "hc" && idx === 0 ? (
-                        <button
-                          type="button"
-                          className="bubble-meta-btn primary"
-                          title="立即注入到当前轮 (Alt+M)"
-                          onClick={() => void sendKeys(["alt+m"])}
-                        >
-                          立即注入
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
-                );
-              })
-            : null}
         </div>
 
         {!atBottom && hasAnyRenderedRows ? (
@@ -3069,7 +3069,7 @@ export function AgentDetailPanel({
                             type="button"
                             className="composer-queue-steer"
                             title="立即注入到当前轮 (Alt+M)"
-                            onClick={() => void sendKeys(["alt+m"])}
+                            onClick={() => void injectTerminalQueuedNow(agent, qText).catch((e) => toast((e as Error).message, true))}
                           >
                             立即注入
                           </button>
@@ -3087,7 +3087,7 @@ export function AgentDetailPanel({
                     </div>
                   );
                 })
-              ) : agent.queued ? (
+              ) : rawTerminalQueued.length === 0 && (agent.queued ?? 0) > injectedTerminalTexts.size ? (
                 <div className="composer-queue-item">
                   <span className="composer-queue-idx">终端</span>
                   <span className="composer-queue-text" title={agent.queuedText || ""}>
@@ -3099,7 +3099,7 @@ export function AgentDetailPanel({
                         type="button"
                         className="composer-queue-steer"
                         title="立即注入到当前轮 (Alt+M)"
-                        onClick={() => void sendKeys(["alt+m"])}
+                        onClick={() => void injectTerminalQueuedNow(agent, agent.queuedText || "").catch((e) => toast((e as Error).message, true))}
                       >
                         立即注入
                       </button>
@@ -3227,10 +3227,11 @@ export function AgentDetailPanel({
               value={composerInputValue}
               onChange={(e) => {
                 setSlashDismissedFor(null);
+                const evComposing = (e.nativeEvent as { isComposing?: boolean } | undefined)?.isComposing || composerComposing;
                 if (leadingSlash) {
                   setText(`${leadingSlash.rawToken} ${e.target.value}`);
                 } else {
-                  if (e.target.value.startsWith("/") && modelMenuMode) setModelMenuMode(null);
+                  if (!evComposing && e.target.value.startsWith("/") && modelMenuMode) setModelMenuMode(null);
                   setText(e.target.value);
                 }
               }}
@@ -3302,6 +3303,16 @@ export function AgentDetailPanel({
               ) : null}
             </div>
             <div className="composer-actions">
+              {isTurnBusy && !isBtwDraft && !agent.isShell && !activeSub && (Boolean(text.trim()) || attachments.length > 0) ? (
+                <button
+                  type="button"
+                  className="composer-steer-pill"
+                  title="打断当前轮并立即插入发送"
+                  onClick={() => interruptComposer()}
+                >
+                  打断发送
+                </button>
+              ) : null}
               <PocketButton
                 size="sm"
                 className="composer-send"

@@ -104,14 +104,50 @@ async function defaultRunCmd(cmd: string, args: string[], timeoutMs: number): Pr
   });
 }
 
+export function formatFetchError(err: unknown): string {
+  const name = err instanceof Error ? err.name : "";
+  const msg = err instanceof Error ? err.message : String(err);
+  if (
+    name === "TimeoutError" ||
+    name === "AbortError" ||
+    /aborted due to timeout|timed out|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT/i.test(msg)
+  ) {
+    return "连接上游更新源超时，请稍后重试";
+  }
+  return msg || "网络请求失败";
+}
+
+function isRetryableFetchError(err: unknown): boolean {
+  const name = err instanceof Error ? err.name : "";
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    name === "TimeoutError" ||
+    name === "AbortError" ||
+    /aborted due to timeout|timed out|HTTP 5\d\d|ECONNRESET|ECONNREFUSED|ENOTFOUND|UND_ERR|fetch failed/i.test(msg)
+  );
+}
+
 async function defaultFetchText(url: string, timeoutMs: number): Promise<string> {
   if (url.startsWith("file:")) {
     const { readFile } = await import("node:fs/promises");
     return readFile(fileURLToPath(url), "utf8");
   }
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { "User-Agent": "herdr-pocket-hostd" } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.text();
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { "User-Agent": "herdr-pocket-hostd" } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0 && isRetryableFetchError(err)) {
+        await new Promise((r) => setTimeout(r, 400));
+        continue;
+      }
+      break;
+    }
+  }
+  throw new Error(formatFetchError(lastErr));
 }
 
 async function defaultFetchBytes(url: string, timeoutMs: number): Promise<Buffer> {
@@ -119,9 +155,22 @@ async function defaultFetchBytes(url: string, timeoutMs: number): Promise<Buffer
     const { readFile } = await import("node:fs/promises");
     return readFile(fileURLToPath(url));
   }
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { "User-Agent": "herdr-pocket-hostd" } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { "User-Agent": "herdr-pocket-hostd" } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0 && isRetryableFetchError(err)) {
+        await new Promise((r) => setTimeout(r, 400));
+        continue;
+      }
+      break;
+    }
+  }
+  throw new Error(formatFetchError(lastErr));
 }
 
 async function defaultUpdateHostd(): Promise<ToolUpdateItemResult> {
@@ -517,14 +566,14 @@ export class ToolUpdateManager {
     const base = releasesUrl(env);
     let manifest: AppLatestManifest;
     try {
-      manifest = JSON.parse(await fetchText(`${base}/app/latest.json`, 8000)) as AppLatestManifest;
+      manifest = JSON.parse(await fetchText(`${base}/app/latest.json`, 15_000)) as AppLatestManifest;
     } catch (e) {
       return {
         id: "app",
         ok: false,
         status: "failed",
         fromVersion,
-        message: `检查 Herdr 桌面版安装包失败：${(e as Error).message}`,
+        message: `检查 Herdr 桌面版安装包失败：${formatFetchError(e)}`,
       };
     }
 
@@ -554,7 +603,18 @@ export class ToolUpdateManager {
       };
     }
 
-    const bytes = await fetchBytes(picked.target.url, 120_000);
+    let bytes: Buffer;
+    try {
+      bytes = await fetchBytes(picked.target.url, 120_000);
+    } catch (e) {
+      return {
+        id: "app",
+        ok: false,
+        status: "failed",
+        fromVersion,
+        message: `下载 Herdr 桌面版安装包失败：${formatFetchError(e)}`,
+      };
+    }
     const actualSha = createHash("sha256").update(bytes).digest("hex").toLowerCase();
     const expectedSha = picked.target.sha256.trim().toLowerCase();
     if (actualSha !== expectedSha) {

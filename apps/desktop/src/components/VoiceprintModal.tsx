@@ -21,6 +21,7 @@ import {
   VOICEPRINT_SAMPLE_LINES,
   VOICEPRINT_SENSITIVITY_OPTIONS,
 } from "../lib/voicePresets";
+import { deleteVoiceprintFromRelay, pushVoiceprintToRelay } from "../lib/voiceprintSync";
 import {
   PocketBadge,
   PocketButton,
@@ -232,6 +233,7 @@ export function VoiceprintModal({
       onStateChange(res.state);
       setPhase("idle");
       setLevel(0);
+      void pushVoiceprintToRelay().catch(() => {});
       toast(
         res.consistency < 0.55
           ? "声纹已录入，建议后续在更安静的环境重录一次"
@@ -279,6 +281,7 @@ export function VoiceprintModal({
       const next = await native.voiceAiClearVoiceprint();
       onStateChange(next);
       setTestResult(null);
+      void deleteVoiceprintFromRelay().catch(() => {});
       toast("已清除本地声纹");
     } catch (e) {
       setError((e as Error).message);

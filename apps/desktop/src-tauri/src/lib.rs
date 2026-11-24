@@ -726,6 +726,7 @@ pub fn run() {
             voice::voice_status,
             voice::voice_check_hotkey,
             voice::voice_reload,
+            voice::voice_set_recording_hotkey,
             commands::voice_call_mic_start,
             commands::voice_call_mic_stop,
             commands::voice_call_mic_set_muted,
@@ -747,6 +748,9 @@ pub fn run() {
             commands::voice_ai_finish_enroll,
             commands::voice_ai_cancel_enroll,
             commands::voice_ai_clear_voiceprint,
+            commands::voice_ai_export_voiceprint,
+            commands::voice_ai_import_voiceprint,
+            commands::voice_ai_enroll_from_pcm,
             commands::voice_ai_start_test,
             commands::voice_ai_stop_test,
             browser::browser_open,
@@ -788,6 +792,7 @@ pub fn run() {
             commands::local_agent_btw,
             commands::query_os_modifiers,
             commands::query_traffic_light_metrics,
+            commands::open_direct_tunnel,
             updater::update_fetch_github_latest,
             updater::update_download_and_stage,
             updater::update_restart_and_apply,
@@ -811,7 +816,7 @@ pub fn run() {
     });
 }
 
-const MAX_LOCAL_RANGE_CHUNK: u64 = 16 * 1024 * 1024;
+const MAX_LOCAL_RANGE_CHUNK: u64 = 2 * 1024 * 1024;
 
 fn parse_byte_range(header: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
     let spec = header.trim().strip_prefix("bytes=")?;
@@ -1010,6 +1015,33 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
         }
     }
 
+    if total > 8 * 1024 * 1024 {
+        let file = match fs::File::open(&resolved.canon) {
+            Ok(f) => f,
+            Err(_) => return empty_err(404),
+        };
+        let end = (MAX_LOCAL_RANGE_CHUNK - 1).min(total - 1);
+        let want = end + 1;
+        let mut buf = Vec::with_capacity(want as usize);
+        if file.take(want).read_to_end(&mut buf).is_err() {
+            return empty_err(500);
+        }
+        return tauri::http::Response::builder()
+            .status(206)
+            .header("content-type", mime)
+            .header("accept-ranges", "bytes")
+            .header("content-range", format!("bytes 0-{end}/{total}"))
+            .header("content-length", buf.len().to_string())
+            .header("cache-control", "private, max-age=60")
+            .header("access-control-allow-origin", "*")
+            .header(
+                "access-control-expose-headers",
+                "content-length, content-range, accept-ranges, content-type",
+            )
+            .body(buf)
+            .unwrap();
+    }
+
     let Ok(bytes) = fs::read(&resolved.canon) else {
         return empty_err(404);
     };
@@ -1087,6 +1119,7 @@ mod tests {
 
     #[test]
     fn serve_pocket_local_serves_term_img_from_memory_cache() {
+        let _guard = crate::local_term::MEM_IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
         let id = crate::local_term::insert_mem_image("image/png", png.clone()).unwrap();
 

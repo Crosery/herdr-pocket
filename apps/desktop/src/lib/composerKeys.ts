@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, type CompositionEvent, type KeyboardEvent } from "react";
+import { useLayoutEffect, useRef, useState, type CompositionEvent, type KeyboardEvent } from "react";
 
 /**
  * Window (ms) right after `compositionend` during which a `keydown("Enter")`
@@ -61,45 +61,69 @@ export function composerEnterAction(
   return "submit";
 }
 
-function resizeTextarea(el: HTMLTextAreaElement | null): void {
+function resizeTextarea(el: HTMLTextAreaElement | null, composing = false): void {
   if (!el) return;
+  if (el.scrollLeft !== 0) el.scrollLeft = 0;
+  if (composing) {
+    // Never collapse height to 0px during active voice/IME composition, which shifts cursor baseline.
+    const curH = el.clientHeight || MIN_TEXTAREA_PX;
+    const nextH = Math.min(Math.max(curH, el.scrollHeight, MIN_TEXTAREA_PX), MAX_TEXTAREA_PX);
+    if (nextH > curH) el.style.height = `${nextH}px`;
+    el.style.overflowY = el.scrollHeight > MAX_TEXTAREA_PX ? "auto" : "hidden";
+    return;
+  }
+  const prevTop = el.scrollTop;
   el.style.height = "0px";
   const sh = el.scrollHeight;
   const h = Math.min(Math.max(sh, MIN_TEXTAREA_PX), MAX_TEXTAREA_PX);
   el.style.height = `${h}px`;
   el.style.overflowY = sh > MAX_TEXTAREA_PX ? "auto" : "hidden";
+  if (sh > MAX_TEXTAREA_PX) el.scrollTop = prevTop;
 }
 
 /**
  * Binds IME-safe Enter-to-send (and optional Alt+Enter steer submit) and auto-grow sizing to a composer `<textarea>`.
  */
-export function useComposerInput(value: string, onSubmit: () => void, onSteerSubmit?: () => void) {
+export function useComposerInput(
+  value: string,
+  onSubmit: () => void,
+  onSteerSubmit?: () => void,
+  onCompositionChange?: (composing: boolean) => void,
+) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gateRef = useRef<ComposerImeGate>(createImeGate());
+  const [isComposing, setIsComposing] = useState(false);
 
   useLayoutEffect(() => {
-    resizeTextarea(textareaRef.current);
+    resizeTextarea(textareaRef.current, gateRef.current.composing);
   }, [value]);
 
   useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => resizeTextarea(el));
+    const ro = new ResizeObserver(() => resizeTextarea(el, gateRef.current.composing));
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
 
   const onCompositionStart = (_e: CompositionEvent<HTMLTextAreaElement>) => {
     gateRef.current.composing = true;
+    setIsComposing(true);
+    onCompositionChange?.(true);
   };
 
   const onCompositionEnd = (_e: CompositionEvent<HTMLTextAreaElement>) => {
     gateRef.current.composing = false;
     gateRef.current.compositionEndedAt = Date.now();
+    setIsComposing(false);
+    onCompositionChange?.(false);
+    requestAnimationFrame(() => resizeTextarea(textareaRef.current, false));
   };
 
   const onBlur = () => {
     gateRef.current.composing = false;
+    setIsComposing(false);
+    onCompositionChange?.(false);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -127,6 +151,7 @@ export function useComposerInput(value: string, onSubmit: () => void, onSteerSub
 
   return {
     textareaRef,
+    isComposing,
     textareaProps: {
       ref: textareaRef,
       rows: 1,

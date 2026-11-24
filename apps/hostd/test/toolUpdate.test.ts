@@ -312,3 +312,27 @@ test("ToolUpdateManager orders hostd last and exposes RPC tools.check / tools.up
     await h.stop();
   }
 });
+
+test("updateApp returns clean Chinese timeout message when fetchBytes aborts with TimeoutError", async () => {
+  const { mgr } = makeDeps({
+    platform: "darwin",
+    arch: "arm64",
+    herdrAppVersion: async () => "0.1.0",
+    fetchText: async () =>
+      JSON.stringify({
+        version: "0.9.9",
+        targets: { "macos-aarch64": { url: "https://pocket.example.com/herdr.tar.gz", sha256: "a".repeat(64) } },
+      }),
+    fetchBytes: async () => {
+      const err = new Error("The operation was aborted due to timeout");
+      err.name = "TimeoutError";
+      throw err;
+    },
+  });
+
+  const res = await mgr.updateOne("app");
+  assert.equal(res.ok, false);
+  assert.equal(res.status, "failed");
+  assert.match(res.message, /连接上游更新源超时/);
+  assert.ok(!/The operation was aborted due to timeout/.test(res.message));
+});

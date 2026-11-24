@@ -3,18 +3,42 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 const GITHUB_LATEST_API: &str = "https://api.github.com/repos/Crosery/herdr-pocket/releases/latest";
 const MAX_ASSET_BYTES: u64 = 450 * 1024 * 1024;
 const ALLOWED_REPO_DOWNLOAD_SEGMENT: &str = "https://github.com/Crosery/herdr-pocket/releases/download/v";
+#[cfg(target_os = "macos")]
+const LOCAL_SIGNER_CN: &str = "Herdr Pocket Local Signer";
+const PROBE_TIMEOUT_MS: u64 = 2_500;
+const PARALLEL_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024;
+const PARALLEL_WORKERS: usize = 4;
+const STALL_ABORT_SECS: u64 = 5;
+const SLOW_SPEED_CHECK_SECS: u64 = 4;
+const SLOW_SPEED_MIN_BPS: f64 = 150.0 * 1024.0;
+
+fn updater_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .tcp_nodelay(true)
+                .pool_max_idle_per_host(8)
+                .user_agent("herdr-pocket-desktop-updater")
+                .build()
+                .map_err(|e| format!("无法创建更新网络客户端: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
@@ -166,7 +190,24 @@ pub fn is_allowed_release_asset_url(url: &str, asset_name: &str) -> bool {
     {
         return false;
     }
-    url.contains(ALLOWED_REPO_DOWNLOAD_SEGMENT) && url.ends_with(&format!("/{asset_name}"))
+    if url.contains(ALLOWED_REPO_DOWNLOAD_SEGMENT) && url.ends_with(&format!("/{asset_name}")) {
+        return true;
+    }
+    let path = u.path();
+    let suffix = format!("/{asset_name}");
+    if !path.contains("..") {
+        if let Some(idx) = path.find("/v1/releases/download/v") {
+            let rest = &path[idx + "/v1/releases/download/v".len()..];
+            if let Some(ver) = rest.strip_suffix(&suffix) {
+                return !ver.is_empty()
+                    && !ver.contains('/')
+                    && ver
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+            }
+        }
+    }
+    false
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -360,6 +401,8 @@ fn stage_macos_dmg(dmg_path: &Path, stage_root: &Path) -> Result<PathBuf, String
         .args(["-dr", "com.apple.quarantine", &staged_app.to_string_lossy()])
         .output();
 
+    maybe_resign_adhoc_macos_app(&staged_app);
+
     let sign_check = Command::new("codesign")
         .args(["--verify", "--deep", "--strict", &staged_app.to_string_lossy()])
         .output()
@@ -371,6 +414,124 @@ fn stage_macos_dmg(dmg_path: &Path, stage_root: &Path) -> Result<PathBuf, String
     }
 
     Ok(staged_app)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_local_codesign_identity() -> Option<String> {
+    let list_out = Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .ok()?;
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    if list_stdout.contains(LOCAL_SIGNER_CN) {
+        return Some(LOCAL_SIGNER_CN.to_string());
+    }
+
+    let home = std::env::var_os("HOME")?;
+    let keychain = PathBuf::from(&home).join("Library/Keychains/login.keychain-db");
+    if !keychain.exists() {
+        return None;
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("herdr-signer-{}", std::process::id()));
+    let _ = fs::create_dir_all(&tmp_dir);
+    let key_path = tmp_dir.join("signer.key");
+    let cert_path = tmp_dir.join("signer.crt");
+    let p12_path = tmp_dir.join("signer.p12");
+
+    let gen = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "3650",
+            "-subj",
+            &format!("/CN={LOCAL_SIGNER_CN}"),
+            "-addext",
+            "keyUsage=critical,digitalSignature",
+            "-addext",
+            "extendedKeyUsage=critical,codeSigning",
+            "-keyout",
+            &key_path.to_string_lossy(),
+            "-out",
+            &cert_path.to_string_lossy(),
+        ])
+        .output();
+
+    let ok = match gen {
+        Ok(o) if o.status.success() => {
+            let p12 = Command::new("openssl")
+                .args([
+                    "pkcs12",
+                    "-export",
+                    "-out",
+                    &p12_path.to_string_lossy(),
+                    "-inkey",
+                    &key_path.to_string_lossy(),
+                    "-in",
+                    &cert_path.to_string_lossy(),
+                    "-passout",
+                    "pass:",
+                ])
+                .output();
+            match p12 {
+                Ok(po) if po.status.success() => {
+                    let imp = Command::new("security")
+                        .args([
+                            "import",
+                            &p12_path.to_string_lossy(),
+                            "-k",
+                            &keychain.to_string_lossy(),
+                            "-P",
+                            "",
+                            "-T",
+                            "/usr/bin/codesign",
+                        ])
+                        .output();
+                    matches!(imp, Ok(io) if io.status.success())
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    let _ = fs::remove_dir_all(&tmp_dir);
+    if ok {
+        Some(LOCAL_SIGNER_CN.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_resign_adhoc_macos_app(staged_app: &Path) {
+    let info = match Command::new("codesign")
+        .args(["-dv", &staged_app.to_string_lossy()])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let stderr = String::from_utf8_lossy(&info.stderr);
+    // Preserve Apple Developer ID / notarized bundles untouched; only upgrade ad-hoc CI builds.
+    if !stderr.contains("Signature=adhoc") {
+        return;
+    }
+    let Some(identity) = ensure_local_codesign_identity() else {
+        return;
+    };
+    let _ = Command::new("codesign")
+        .args([
+            "--force",
+            "--deep",
+            "--sign",
+            &identity,
+            &staged_app.to_string_lossy(),
+        ])
+        .output();
 }
 
 #[tauri::command]
@@ -435,7 +596,12 @@ pub async fn update_download_and_stage(
     if !already_verified {
         let mut last_err = String::from("下载失败");
         let mut succeeded = false;
-        for url in valid_urls {
+        let candidates = probe_release_sources(client_for_updater()?, &valid_urls).await;
+        let candidate_count = candidates.len();
+
+        for (cand_idx, cand) in candidates.into_iter().enumerate() {
+            let has_fallback = cand_idx + 1 < candidate_count;
+            let url = cand.url;
             let source = source_host_label(&url);
             let _ = fs::remove_file(&part_path);
             emit_progress(
@@ -444,117 +610,49 @@ pub async fn update_download_and_stage(
                     phase: "downloading",
                     version: clean_ver.clone(),
                     downloaded_bytes: 0,
-                    total_bytes: None,
+                    total_bytes: cand.total_bytes,
                     percent: Some(0),
                     source: Some(source.clone()),
-                    message: Some(format!("正在从 {source} 下载…")),
+                    message: Some(format!("正在连接 {source}…")),
                 },
             );
 
-            let resp = match crate::net::client()
-                .get(&url)
-                .timeout(Duration::from_secs(600))
-                .send()
-                .await
+            let dl_res = if cand.supports_range
+                && cand
+                    .total_bytes
+                    .is_some_and(|n| n >= PARALLEL_THRESHOLD_BYTES && n <= MAX_ASSET_BYTES)
             {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    last_err = format!("{source}: HTTP {}", r.status().as_u16());
-                    continue;
-                }
-                Err(e) => {
-                    last_err = format!("{source}: {e}");
-                    continue;
-                }
+                let total = cand.total_bytes.unwrap_or(0);
+                download_parallel_range(
+                    &app,
+                    &clean_ver,
+                    &source,
+                    &url,
+                    total,
+                    &part_path,
+                    has_fallback,
+                )
+                .await
+            } else {
+                download_single_stream(
+                    &app,
+                    &clean_ver,
+                    &source,
+                    &url,
+                    &part_path,
+                    has_fallback,
+                )
+                .await
             };
 
-            let total_bytes = resp.content_length().filter(|&n| n > 0 && n <= MAX_ASSET_BYTES);
-            let file = match File::create(&part_path) {
-                Ok(f) => f,
+            let downloaded = match dl_res {
+                Ok(n) => n,
                 Err(e) => {
-                    let msg = format!("创建临时安装包失败: {e}");
-                    emit_progress(
-                        &app,
-                        UpdateProgressEvent {
-                            phase: "error",
-                            version: clean_ver.clone(),
-                            downloaded_bytes: 0,
-                            total_bytes,
-                            percent: None,
-                            source: Some(source),
-                            message: Some(msg.clone()),
-                        },
-                    );
-                    return Err(msg);
-                }
-            };
-            let mut writer = BufWriter::new(file);
-            let mut hasher = Sha256::new();
-            let mut downloaded: u64 = 0;
-            let mut last_emit = Instant::now();
-            let mut stream_err: Option<String> = None;
-            let mut resp = resp;
-
-            loop {
-                match resp.chunk().await {
-                    Ok(Some(chunk)) => {
-                        downloaded = downloaded.saturating_add(chunk.len() as u64);
-                        if downloaded > MAX_ASSET_BYTES {
-                            stream_err = Some("安装包超出大小限制".into());
-                            break;
-                        }
-                        if let Err(e) = writer.write_all(&chunk) {
-                            stream_err = Some(format!("写入临时文件失败: {e}"));
-                            break;
-                        }
-                        hasher.update(&chunk);
-                        if last_emit.elapsed() >= Duration::from_millis(80) {
-                            last_emit = Instant::now();
-                            let pct = total_bytes
-                                .map(|tot| ((downloaded.saturating_mul(100)) / tot.max(1)).min(99) as u8);
-                            emit_progress(
-                                &app,
-                                UpdateProgressEvent {
-                                    phase: "downloading",
-                                    version: clean_ver.clone(),
-                                    downloaded_bytes: downloaded,
-                                    total_bytes,
-                                    percent: pct,
-                                    source: Some(source.clone()),
-                                    message: None,
-                                },
-                            );
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        stream_err = Some(format!("{source} 下载中断: {e}"));
-                        break;
-                    }
-                }
-            }
-
-            if let Some(err) = stream_err {
-                drop(writer);
-                let _ = fs::remove_file(&part_path);
-                last_err = err;
-                continue;
-            }
-            if let Err(e) = writer.flush() {
-                drop(writer);
-                let _ = fs::remove_file(&part_path);
-                last_err = format!("刷新文件失败: {e}");
-                continue;
-            }
-            drop(writer);
-
-            if let Some(expected_len) = total_bytes {
-                if downloaded != expected_len {
                     let _ = fs::remove_file(&part_path);
-                    last_err = format!("{source} 下载大小不一致 ({downloaded}/{expected_len})");
+                    last_err = e;
                     continue;
                 }
-            }
+            };
 
             emit_progress(
                 &app,
@@ -569,7 +667,14 @@ pub async fn update_download_and_stage(
                 },
             );
 
-            let digest_hex = hex_encode(&hasher.finalize());
+            let digest_hex = match file_sha256(&part_path) {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = fs::remove_file(&part_path);
+                    last_err = format!("计算安装包校验和失败: {e}");
+                    continue;
+                }
+            };
             if digest_hex != sha_expected {
                 let _ = fs::remove_file(&part_path);
                 last_err = format!("{source} SHA-256 校验失败");
@@ -736,7 +841,19 @@ while kill -0 "$OLD_PID" 2>/dev/null && [ "$i" -lt 120 ]; do
   sleep 0.1
   i=$((i + 1))
 done
-if rm -rf "$TARGET_APP" 2>/dev/null && ditto "$STAGED_APP" "$TARGET_APP" 2>/dev/null; then
+if command -v rsync >/dev/null 2>&1 && [ -d "$TARGET_APP/Contents" ]; then
+  if rsync -a --delete "$STAGED_APP/Contents/" "$TARGET_APP/Contents/" 2>/dev/null; then
+    touch "$TARGET_APP" 2>/dev/null || true
+  else
+    osascript - "$STAGED_APP" "$TARGET_APP" <<'APPLESCRIPT'
+on run argv
+  set srcApp to item 1 of argv
+  set dstApp to item 2 of argv
+  do shell script "rsync -a --delete " & quoted form of (srcApp & "/Contents/") & " " & quoted form of (dstApp & "/Contents/") & " && touch " & quoted form of dstApp with administrator privileges
+end run
+APPLESCRIPT
+  fi
+elif rm -rf "$TARGET_APP" 2>/dev/null && ditto "$STAGED_APP" "$TARGET_APP" 2>/dev/null; then
   :
 else
   osascript - "$STAGED_APP" "$TARGET_APP" <<'APPLESCRIPT'
@@ -832,6 +949,465 @@ exec "$NEW_IMG"
     Ok(())
 }
 
+#[derive(Clone)]
+struct ProbedSource {
+    url: String,
+    ok: bool,
+    supports_range: bool,
+    total_bytes: Option<u64>,
+    latency_ms: u64,
+    orig_idx: usize,
+}
+
+fn client_for_updater() -> Result<&'static reqwest::Client, String> {
+    updater_client()
+}
+
+fn parse_content_range_total(header_val: &str) -> Option<u64> {
+    let (_, rest) = header_val.split_once('/')?;
+    let total = rest.trim().parse::<u64>().ok()?;
+    if total > 0 && total <= MAX_ASSET_BYTES {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn format_speed(bps: f64) -> String {
+    if !bps.is_finite() || bps <= 0.0 {
+        return String::new();
+    }
+    if bps >= 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", bps / (1024.0 * 1024.0))
+    } else if bps >= 1024.0 {
+        format!("{:.0} KB/s", bps / 1024.0)
+    } else {
+        format!("{:.0} B/s", bps)
+    }
+}
+
+async fn probe_release_sources(client: &reqwest::Client, urls: &[String]) -> Vec<ProbedSource> {
+    let mut handles = Vec::with_capacity(urls.len());
+    for (idx, url) in urls.iter().enumerate() {
+        let client = client.clone();
+        let url = url.clone();
+        handles.push(tauri::async_runtime::spawn(async move {
+            let started = Instant::now();
+            let res = tokio::time::timeout(Duration::from_millis(PROBE_TIMEOUT_MS), async {
+                let mut resp = client
+                    .get(&url)
+                    .header(reqwest::header::RANGE, "bytes=0-65535")
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let status = resp.status();
+                if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                    let total_bytes = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_range_total);
+                    let _ = resp.chunk().await.map_err(|e| e.to_string())?;
+                    Ok::<(bool, Option<u64>), String>((total_bytes.is_some(), total_bytes))
+                } else if status.is_success() {
+                    let total_bytes = resp
+                        .content_length()
+                        .filter(|&n| n > 0 && n <= MAX_ASSET_BYTES);
+                    let _ = resp.chunk().await.map_err(|e| e.to_string())?;
+                    Ok::<(bool, Option<u64>), String>((false, total_bytes))
+                } else {
+                    Err(format!("HTTP {}", status.as_u16()))
+                }
+            })
+            .await;
+
+            let latency_ms = started.elapsed().as_millis() as u64;
+            match res {
+                Ok(Ok((supports_range, total_bytes))) => ProbedSource {
+                    url,
+                    ok: true,
+                    supports_range,
+                    total_bytes,
+                    latency_ms,
+                    orig_idx: idx,
+                },
+                _ => ProbedSource {
+                    url,
+                    ok: false,
+                    supports_range: false,
+                    total_bytes: None,
+                    latency_ms,
+                    orig_idx: idx,
+                },
+            }
+        }));
+    }
+
+    let mut out = Vec::with_capacity(handles.len());
+    for h in handles {
+        if let Ok(item) = h.await {
+            out.push(item);
+        }
+    }
+    out.sort_by_key(|item| {
+        let score = if item.supports_range {
+            item.latency_ms.saturating_sub(120)
+        } else {
+            item.latency_ms
+        };
+        (!item.ok, score, item.orig_idx)
+    });
+    out
+}
+
+async fn download_parallel_range(
+    app: &AppHandle,
+    version: &str,
+    source: &str,
+    url: &str,
+    total_bytes: u64,
+    part_path: &Path,
+    has_fallback: bool,
+) -> Result<u64, String> {
+    let client = client_for_updater()?.clone();
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(part_path)
+        .map_err(|e| format!("创建临时安装包失败: {e}"))?;
+    file.set_len(total_bytes)
+        .map_err(|e| format!("预分配安装包空间失败: {e}"))?;
+    let shared_file = Arc::new(Mutex::new(file));
+
+    let step = (total_bytes / 16).clamp(1024 * 1024, 4 * 1024 * 1024);
+    let mut slices = std::collections::VecDeque::new();
+    let mut offset = 0u64;
+    while offset < total_bytes {
+        let end = offset.saturating_add(step - 1).min(total_bytes - 1);
+        slices.push_back((offset, end));
+        offset = end + 1;
+    }
+    let worker_count = PARALLEL_WORKERS.min(slices.len().max(1));
+    let queue = Arc::new(tokio::sync::Mutex::new(slices));
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
+    let last_byte_ms = Arc::new(AtomicU64::new(0));
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let first_err = Arc::new(Mutex::new(None::<String>));
+    let active_workers = Arc::new(AtomicU64::new(worker_count as u64));
+
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let client = client.clone();
+        let url = url.to_string();
+        let source = source.to_string();
+        let queue = Arc::clone(&queue);
+        let shared_file = Arc::clone(&shared_file);
+        let downloaded = Arc::clone(&downloaded);
+        let last_byte_ms = Arc::clone(&last_byte_ms);
+        let abort_flag = Arc::clone(&abort_flag);
+        let first_err = Arc::clone(&first_err);
+        let active_workers = Arc::clone(&active_workers);
+
+        handles.push(tauri::async_runtime::spawn(async move {
+            loop {
+                if abort_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let next = {
+                    let mut q = queue.lock().await;
+                    q.pop_front()
+                };
+                let Some((start, end)) = next else {
+                    break;
+                };
+                let range_hdr = format!("bytes={start}-{end}");
+                let resp_res = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    client
+                        .get(&url)
+                        .header(reqwest::header::RANGE, range_hdr)
+                        .send(),
+                )
+                .await;
+
+                let mut resp = match resp_res {
+                    Ok(Ok(r)) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => r,
+                    Ok(Ok(r)) => {
+                        if let Ok(mut e) = first_err.lock() {
+                            if e.is_none() {
+                                *e = Some(format!("{source}: 分片返回 HTTP {}", r.status().as_u16()));
+                            }
+                        }
+                        abort_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Ok(Err(err)) => {
+                        if let Ok(mut e) = first_err.lock() {
+                            if e.is_none() {
+                                *e = Some(format!("{source}: {err}"));
+                            }
+                        }
+                        abort_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(_) => {
+                        if let Ok(mut e) = first_err.lock() {
+                            if e.is_none() {
+                                *e = Some(format!("{source}: 分片请求超时"));
+                            }
+                        }
+                        abort_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
+
+                let mut cursor = start;
+                while !abort_flag.load(Ordering::Relaxed) {
+                    match tokio::time::timeout(Duration::from_secs(10), resp.chunk()).await {
+                        Ok(Ok(Some(chunk))) => {
+                            let len = chunk.len() as u64;
+                            if cursor.saturating_add(len) > end.saturating_add(1) {
+                                if let Ok(mut e) = first_err.lock() {
+                                    if e.is_none() {
+                                        *e = Some(format!("{source}: 服务端分片范围越界"));
+                                    }
+                                }
+                                abort_flag.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            let write_res = {
+                                let mut f = match shared_file.lock() {
+                                    Ok(guard) => guard,
+                                    Err(_) => {
+                                        abort_flag.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                };
+                                f.seek(SeekFrom::Start(cursor))
+                                    .and_then(|_| f.write_all(&chunk))
+                            };
+                            if let Err(err) = write_res {
+                                if let Ok(mut e) = first_err.lock() {
+                                    if e.is_none() {
+                                        *e = Some(format!("写入临时文件失败: {err}"));
+                                    }
+                                }
+                                abort_flag.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            cursor += len;
+                            downloaded.fetch_add(len, Ordering::Relaxed);
+                            last_byte_ms
+                                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        }
+                        Ok(Ok(None)) => break,
+                        Ok(Err(err)) => {
+                            if let Ok(mut e) = first_err.lock() {
+                                if e.is_none() {
+                                    *e = Some(format!("{source} 下载中断: {err}"));
+                                }
+                            }
+                            abort_flag.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(_) => {
+                            if let Ok(mut e) = first_err.lock() {
+                                if e.is_none() {
+                                    *e = Some(format!("{source} 分片接收超时"));
+                                }
+                            }
+                            abort_flag.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+
+                if !abort_flag.load(Ordering::Relaxed)
+                    && cursor != end + 1
+                {
+                    if let Ok(mut e) = first_err.lock() {
+                        if e.is_none() {
+                            *e = Some(format!("{source} 分片提前结束"));
+                        }
+                    }
+                    abort_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            active_workers.fetch_sub(1, Ordering::Relaxed);
+        }));
+    }
+
+    while active_workers.load(Ordering::Relaxed) > 0 {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let cur_dl = downloaded.load(Ordering::Relaxed);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if has_fallback && !abort_flag.load(Ordering::Relaxed) {
+            let idle_ms = elapsed_ms.saturating_sub(last_byte_ms.load(Ordering::Relaxed));
+            if idle_ms >= STALL_ABORT_SECS * 1000 {
+                if let Ok(mut e) = first_err.lock() {
+                    if e.is_none() {
+                        *e = Some(format!("{source} 下载停滞，切换备用源"));
+                    }
+                }
+                abort_flag.store(true, Ordering::Relaxed);
+                break;
+            }
+            if elapsed_ms >= SLOW_SPEED_CHECK_SECS * 1000 {
+                let bps = (cur_dl as f64) / ((elapsed_ms as f64) / 1000.0);
+                if bps < SLOW_SPEED_MIN_BPS {
+                    if let Ok(mut e) = first_err.lock() {
+                        if e.is_none() {
+                            *e = Some(format!("{source} 下载过慢，切换更快镜像"));
+                        }
+                    }
+                    abort_flag.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        let bps = if elapsed_ms > 200 {
+            (cur_dl as f64) / ((elapsed_ms as f64) / 1000.0)
+        } else {
+            0.0
+        };
+        let speed = format_speed(bps);
+        let pct = ((cur_dl.saturating_mul(100)) / total_bytes.max(1)).min(99) as u8;
+        emit_progress(
+            app,
+            UpdateProgressEvent {
+                phase: "downloading",
+                version: version.to_string(),
+                downloaded_bytes: cur_dl,
+                total_bytes: Some(total_bytes),
+                percent: Some(pct),
+                source: Some(source.to_string()),
+                message: Some(if speed.is_empty() {
+                    format!("正在从 {source} 并发下载…")
+                } else {
+                    format!("正在高速下载更新… {speed}")
+                }),
+            },
+        );
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    if let Ok(guard) = first_err.lock() {
+        if let Some(err) = guard.as_ref() {
+            return Err(err.clone());
+        }
+    }
+    if abort_flag.load(Ordering::Relaxed) {
+        return Err(format!("{source} 下载已中止"));
+    }
+
+    {
+        let mut f = shared_file
+            .lock()
+            .map_err(|_| "文件锁异常".to_string())?;
+        f.flush().map_err(|e| format!("刷新文件失败: {e}"))?;
+    }
+    drop(shared_file);
+
+    let got = downloaded.load(Ordering::Relaxed);
+    if got != total_bytes {
+        return Err(format!("{source} 下载大小不一致 ({got}/{total_bytes})"));
+    }
+    Ok(got)
+}
+
+async fn download_single_stream(
+    app: &AppHandle,
+    version: &str,
+    source: &str,
+    url: &str,
+    part_path: &Path,
+    has_fallback: bool,
+) -> Result<u64, String> {
+    let client = client_for_updater()?;
+    let resp = match tokio::time::timeout(Duration::from_secs(12), client.get(url).send()).await {
+        Ok(Ok(r)) if r.status().is_success() => r,
+        Ok(Ok(r)) => return Err(format!("{source}: HTTP {}", r.status().as_u16())),
+        Ok(Err(e)) => return Err(format!("{source}: {e}")),
+        Err(_) => return Err(format!("{source}: 连接超时")),
+    };
+
+    let total_bytes = resp
+        .content_length()
+        .filter(|&n| n > 0 && n <= MAX_ASSET_BYTES);
+    let file = File::create(part_path).map_err(|e| format!("创建临时安装包失败: {e}"))?;
+    let mut writer = BufWriter::new(file);
+    let mut downloaded: u64 = 0;
+    let started = Instant::now();
+    let mut last_emit = Instant::now();
+    let mut resp = resp;
+
+    loop {
+        let chunk_timeout = Duration::from_secs(if has_fallback { STALL_ABORT_SECS } else { 20 });
+        match tokio::time::timeout(chunk_timeout, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                downloaded = downloaded.saturating_add(chunk.len() as u64);
+                if downloaded > MAX_ASSET_BYTES {
+                    return Err("安装包超出大小限制".into());
+                }
+                writer
+                    .write_all(&chunk)
+                    .map_err(|e| format!("写入临时文件失败: {e}"))?;
+
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if has_fallback && elapsed_ms >= SLOW_SPEED_CHECK_SECS * 1000 {
+                    let bps = (downloaded as f64) / ((elapsed_ms as f64) / 1000.0);
+                    if bps < SLOW_SPEED_MIN_BPS {
+                        return Err(format!("{source} 下载过慢，切换更快镜像"));
+                    }
+                }
+                if last_emit.elapsed() >= Duration::from_millis(100) {
+                    last_emit = Instant::now();
+                    let bps = if elapsed_ms > 200 {
+                        (downloaded as f64) / ((elapsed_ms as f64) / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    let speed = format_speed(bps);
+                    let pct = total_bytes
+                        .map(|tot| ((downloaded.saturating_mul(100)) / tot.max(1)).min(99) as u8);
+                    emit_progress(
+                        app,
+                        UpdateProgressEvent {
+                            phase: "downloading",
+                            version: version.to_string(),
+                            downloaded_bytes: downloaded,
+                            total_bytes,
+                            percent: pct,
+                            source: Some(source.to_string()),
+                            message: (!speed.is_empty()).then(|| format!("正在下载更新… {speed}")),
+                        },
+                    );
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => return Err(format!("{source} 下载中断: {e}")),
+            Err(_) => return Err(format!("{source} 下载超时停滞")),
+        }
+    }
+
+    writer
+        .flush()
+        .map_err(|e| format!("刷新文件失败: {e}"))?;
+    if let Some(expected_len) = total_bytes {
+        if downloaded != expected_len {
+            return Err(format!("{source} 下载大小不一致 ({downloaded}/{expected_len})"));
+        }
+    }
+    Ok(downloaded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -865,6 +1441,22 @@ mod tests {
         ));
         assert!(!is_allowed_release_asset_url(&raw, "../evil.dmg"));
         assert!(!is_allowed_release_asset_url(&format!("{raw}?foo=1"), asset));
+        assert!(is_allowed_release_asset_url(
+            &format!("https://pocket.example.com/v1/releases/download/v0.2.33/{asset}"),
+            asset
+        ));
+        assert!(is_allowed_release_asset_url(
+            &format!("https://pocket.example.com/pocket/v1/releases/download/v0.2.33/{asset}"),
+            asset
+        ));
+        assert!(!is_allowed_release_asset_url(
+            &format!("https://pocket.example.com/v1/releases/download/v0.2.33/../{asset}"),
+            asset
+        ));
+        assert!(!is_allowed_release_asset_url(
+            &format!("http://pocket.example.com/v1/releases/download/v0.2.33/{asset}"),
+            asset
+        ));
     }
 
     #[test]

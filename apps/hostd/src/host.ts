@@ -37,7 +37,7 @@ import { SessionHints } from "./sessionhint.ts";
 import { base, debounce } from "./util.ts";
 import { InputWaits } from "./waiting.ts";
 import { typeFirstTask, type TypeTaskOptions } from "./firsttask.ts";
-import { FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from "./put.ts";
+import { ChunkedPutManager, FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from "./put.ts";
 import { LogBuffer, clipChars, levelOf } from "./logbuf.ts";
 import { startHostTelemetry } from "./sysTelemetry.ts";
 import { CONFIG_DIR, type HostConfig } from "./config.ts";
@@ -62,6 +62,9 @@ const MUTATING = new Set([
   "terminal.send",
   "terminal.keys",
   "terminal.put",
+  "terminal.putBegin",
+  "terminal.putFinish",
+  "terminal.putAbort",
   "agent.create",
   "agent.setModel",
   "space.delete",
@@ -162,6 +165,7 @@ export class Host {
   /** Phones connected straight to this computer (see direct.ts). */
   direct: DirectServer;
   portal: PortalManager;
+  chunkedPut: ChunkedPutManager;
   toolUpdater: ToolUpdateManager;
   private sendQueues = new Map<string, Array<{ id: string; text: string; enter: boolean; delivery?: "auto" | "steer" }>>();
   private queueSeq = 0;
@@ -296,12 +300,18 @@ export class Host {
       },
       log: (m) => this.log(m),
     });
+    this.chunkedPut = new ChunkedPutManager({
+      filesDir: () => this.filesDir,
+      putThroughHc: (localId, file) => this.hc.put(localId, file),
+    });
     this.direct = new DirectServer({
       port: opts.config.directPort,
       hostId: () => this.deviceId,
       onFrame: (peer, f) => this.onDirectFrame(peer, f),
       onClose: (peer) => this.stopStreams((id) => id.startsWith(peer.tag)),
-      onHttpRequest: (req, res) => this.portal.tickets.handleHttpRequest(req, res),
+      onHttpRequest: async (req, res) =>
+        (await this.chunkedPut.handleHttpRequest(req, res)) ||
+        (await this.portal.tickets.handleHttpRequest(req, res)),
       log: (m) => this.log(m),
     });
   }
@@ -507,6 +517,7 @@ export class Host {
     this.herdr.stop();
     this.uniflo.stop();
     this.portal.stop();
+    this.chunkedPut.dispose();
     this.direct.stop();
     for (const stop of this.streamStops.values()) stop();
     this.streamStops.clear();
@@ -1465,6 +1476,51 @@ export class Host {
         if (/unrecognized subcommand|unknown command/i.test(msg)) throw new RpcFailure("unsupported", "这台电脑的 herdr 太旧，还不能收图片（没有 hc put），更新 herdr 后再试");
         throw new RpcFailure("internal", `图片没能放到这台电脑上：${msg}`);
       }
+    },
+    "terminal.putBegin": async (p) => {
+      this.writable();
+      const a = this.resolve(p.agent);
+      if (a.source === "uniflo") throw new RpcFailure("unsupported", "只读会话不支持上传文件");
+      try {
+        const started = await this.chunkedPut.begin({
+          agentKey: a.key,
+          source: a.source,
+          localId: a.localId,
+          name: p.name,
+          mime: p.mime,
+          totalBytes: p.totalBytes,
+        });
+        return {
+          uploadId: started.uploadId,
+          chunkBytes: started.chunkBytes,
+          ...(this.direct.port ? { directToken: started.directToken } : {}),
+        };
+      } catch (e) {
+        throw new RpcFailure("bad_request", (e as Error).message);
+      }
+    },
+    "terminal.putChunk": async (p) => {
+      this.writable();
+      try {
+        return await this.chunkedPut.writeChunk(p.uploadId, p.index, p.data);
+      } catch (e) {
+        throw new RpcFailure("bad_request", (e as Error).message);
+      }
+    },
+    "terminal.putFinish": async (p) => {
+      this.writable();
+      try {
+        return await this.chunkedPut.finish(p.uploadId);
+      } catch (e) {
+        const msg = (e as Error).message;
+        if (/unrecognized subcommand|unknown command/i.test(msg)) {
+          throw new RpcFailure("unsupported", "这台电脑的 herdr 太旧，还不能收大文件（没有 hc put），更新 herdr 后再试");
+        }
+        throw new RpcFailure("internal", `文件没能放到这台电脑上：${msg}`);
+      }
+    },
+    "terminal.putAbort": async (p) => {
+      return await this.chunkedPut.abort(p.uploadId);
     },
     "session.events": async (p) => {
       const key = await this.sessionOf(p.agent, p.sub);

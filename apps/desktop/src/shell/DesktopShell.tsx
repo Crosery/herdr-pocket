@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ArrowDown,
   ArrowLeft,
@@ -181,6 +181,7 @@ export function DesktopShell({
   const devices = liveStore.use((s) => s.devices);
   const spacesMap = liveStore.use((s) => s.spaces);
   const showShells = settingsStore.use((s) => s.showShells);
+  const sidebarWidth = settingsStore.use((s) => s.sidebarWidth);
   const theme = settingsStore.use((s) => s.theme);
   const homePage = useClientConfig().browser.homePage;
   const [create, setCreate] = useState<{ host: string | null; space: string | null; preferNewSpace?: boolean } | null>(null);
@@ -996,7 +997,10 @@ export function DesktopShell({
   // Track Ctrl/Cmd modifier state for click-to-jump file links.
   useEffect(() => {
     const sync = (active: boolean) => {
-      document.documentElement.dataset.linkMod = active ? "true" : "false";
+      const next = active ? "true" : "false";
+      if (document.documentElement.dataset.linkMod !== next) {
+        document.documentElement.dataset.linkMod = next;
+      }
     };
     const onKeyEvent = (e: KeyboardEvent) => sync(e.ctrlKey || e.metaKey);
     const onPointerMove = (e: PointerEvent) => {
@@ -1242,7 +1246,10 @@ export function DesktopShell({
   );
 
   return (
-    <div className={`v3${collapsed ? " collapsed" : ""}`}>
+    <div
+      className={`v3${collapsed ? " collapsed" : ""}`}
+      style={{ "--v3-sidebar-effective": collapsed ? "48px" : `${sidebarWidth}px` } as CSSProperties}
+    >
       <ShellSidebar
         collapsed={collapsed}
         canToggle={canToggleSidebar}

@@ -60,6 +60,7 @@ export interface LiveState {
   agents: Record<string, Agent[]>;
   spaces: Record<string, SpaceInfo[]>;
   direct: Record<string, string>;
+  rttMs?: number | null;
   rev: number;
 }
 
@@ -199,6 +200,7 @@ export const liveStore = createStore<LiveState>({
   agents: {},
   spaces: {},
   direct: {},
+  rttMs: null,
   rev: 0,
 });
 

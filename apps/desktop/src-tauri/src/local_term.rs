@@ -1341,6 +1341,9 @@ fn mem_image_cache() -> &'static Mutex<MemTermImageCache> {
     CACHE.get_or_init(|| Mutex::new(MemTermImageCache::default()))
 }
 
+#[cfg(test)]
+pub(crate) static MEM_IMAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 static NEXT_MEM_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn insert_mem_image(mime: &'static str, data: Vec<u8>) -> Option<u64> {
@@ -3164,6 +3167,7 @@ mod tests {
 
     #[test]
     fn apc_stream_intercepts_chunked_f32_and_f100_across_frame_boundaries() {
+        let _guard = super::MEM_IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use super::{get_mem_image, ChannelApcStream};
 
         let rgba = vec![
@@ -3307,6 +3311,7 @@ mod tests {
 
     #[test]
     fn mem_image_cache_enforces_64_entry_lru_bound() {
+        let _guard = super::MEM_IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use super::{get_mem_image, insert_mem_image};
 
         let first = insert_mem_image("image/png", vec![1, 2, 3]).unwrap();
@@ -3352,6 +3357,7 @@ mod tests {
 
     #[test]
     fn apc_stream_answers_direct_query_and_ingests_zlib_immediately() {
+        let _guard = super::MEM_IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use super::{base64_encode, get_mem_image, ChannelApcStream};
         use flate2::write::ZlibEncoder;
         use flate2::Compression;
@@ -3395,6 +3401,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn apc_stream_supports_posix_shm_query_and_upload_without_leading_slash() {
+        let _guard = super::MEM_IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use super::{base64_encode, get_mem_image, ChannelApcStream};
 
         let raw_name = format!("hp_shm_{}", std::process::id());

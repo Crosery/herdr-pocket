@@ -394,6 +394,122 @@ fn models_dir() -> Option<PathBuf> {
     crate::hostd_config_dir().map(|d| d.join("voice-models"))
 }
 
+fn voiceprint_cache_path() -> Option<PathBuf> {
+    if let Some(custom) = std::env::var_os("HERDR_POCKET_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(custom).join("voiceprint-cache.json"));
+    }
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| crate::home_dir().map(|h| h.join("AppData").join("Local")));
+        return base.map(|d| d.join("herdr-pocket").join("voiceprint-cache.json"));
+    }
+    #[cfg(not(windows))]
+    {
+        crate::home_dir().map(|h| {
+            h.join(".local")
+                .join("state")
+                .join("herdr-pocket")
+                .join("voiceprint-cache.json")
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceprintBackup {
+    voiceprint: VoiceprintRecord,
+    #[serde(default)]
+    sample_pcm16_b64: Option<String>,
+}
+
+fn read_owner_sample_base64() -> Option<String> {
+    let p = owner_sample_path()?;
+    let bytes = fs::read(p).ok()?;
+    if bytes.len() < OWNER_SAMPLE_LEN * 2 {
+        return None;
+    }
+    Some(crate::local_term::base64_encode(&bytes))
+}
+
+fn write_owner_sample_base64(b64: &str) -> bool {
+    let Some(bytes) = crate::local_term::base64_decode(b64.as_bytes()) else {
+        return false;
+    };
+    if bytes.len() < OWNER_SAMPLE_LEN * 2 {
+        return false;
+    }
+    let Some(p) = owner_sample_path() else {
+        return false;
+    };
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    config::write_atomic(&p, &bytes).is_ok()
+}
+
+fn is_valid_voiceprint(vp: &VoiceprintRecord) -> bool {
+    vp.embedding.len() >= 64
+        && vp.embedding.len() <= 2048
+        && vp.embedding.iter().all(|v| v.is_finite())
+        && !vp.model_version.trim().is_empty()
+}
+
+fn write_voiceprint_backup(vp: &VoiceprintRecord) {
+    if !is_valid_voiceprint(vp) {
+        return;
+    }
+    let Some(path) = voiceprint_cache_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let backup = VoiceprintBackup {
+        voiceprint: vp.clone(),
+        sample_pcm16_b64: read_owner_sample_base64(),
+    };
+    if let Ok(mut bytes) = serde_json::to_vec_pretty(&backup) {
+        bytes.push(b'\n');
+        let _ = config::write_atomic(&path, &bytes);
+    }
+}
+
+fn delete_voiceprint_backup() {
+    if let Some(path) = voiceprint_cache_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn try_restore_voiceprint_from_cache(cfg: &mut VoiceAiConfig) -> bool {
+    if cfg.voiceprint.is_some() {
+        return false;
+    }
+    let Some(path) = voiceprint_cache_path() else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(backup) = serde_json::from_str::<VoiceprintBackup>(&raw) else {
+        return false;
+    };
+    if !is_valid_voiceprint(&backup.voiceprint) {
+        return false;
+    }
+    if !has_owner_sample() {
+        if let Some(b64) = backup.sample_pcm16_b64.as_deref() {
+            let _ = write_owner_sample_base64(b64);
+        }
+    }
+    let mut vp = backup.voiceprint;
+    vp.has_sample = has_owner_sample();
+    cfg.voiceprint = Some(vp);
+    true
+}
+
 fn sanitize_tier(raw: &str) -> String {
     match raw.trim() {
         "denoise" | "sv" | "tse" | "auto" => raw.trim().to_string(),
@@ -414,7 +530,7 @@ pub fn load_config() -> VoiceAiConfig {
             return cfg.clone();
         }
     }
-    let loaded = config_file_path()
+    let mut loaded = config_file_path()
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str::<VoiceAiConfig>(&raw).ok())
         .map(|mut c| {
@@ -423,6 +539,17 @@ pub fn load_config() -> VoiceAiConfig {
             c
         })
         .unwrap_or_default();
+    if try_restore_voiceprint_from_cache(&mut loaded) {
+        if let Some(path) = config_file_path() {
+            if let Some(dir) = path.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            if let Ok(mut bytes) = serde_json::to_vec_pretty(&loaded) {
+                bytes.push(b'\n');
+                let _ = config::write_atomic(&path, &bytes);
+            }
+        }
+    }
     if let Ok(mut guard) = config_lock().lock() {
         *guard = Some(loaded.clone());
     }
@@ -437,6 +564,9 @@ pub fn save_config(cfg: &VoiceAiConfig) -> Result<(), String> {
     let mut bytes = serde_json::to_vec_pretty(&clean).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     config::write_atomic(&path, &bytes).map_err(|e| format!("保存 voice-ai.json 失败：{e}"))?;
+    if let Some(ref vp) = clean.voiceprint {
+        write_voiceprint_backup(vp);
+    }
     if let Ok(mut guard) = config_lock().lock() {
         *guard = Some(clean);
     }
@@ -4452,19 +4582,37 @@ mod lab {
             ));
         }
 
-        let sp_sess = collected
-            .models
+        enroll_collected_speech(
+            &collected.models,
+            &collected.speech,
+            collected.speech_sq_sum,
+            collected.speech_samples,
+            collected.noise_rms,
+            "desktop-mic",
+        )
+    }
+
+    pub(crate) fn enroll_collected_speech(
+        models: &models::LoadedModels,
+        speech: &[f32],
+        speech_sq_sum: f64,
+        speech_samples: usize,
+        noise_rms: f32,
+        route: &str,
+    ) -> Result<VoiceAiEnrollResult, String> {
+        let seconds = (speech.len() as f32) / (VOICE_RATE as f32);
+        let sp_sess = models
             .speaker
             .as_ref()
             .ok_or_else(|| "声纹模型未加载".to_string())?;
-        let speaker = models::Speaker::new(&collected.models.rt, sp_sess);
+        let speaker = models::Speaker::new(&models.rt, sp_sess);
 
         let piece = VOICE_RATE * 3 / 2;
         let hop = VOICE_RATE * 3 / 4;
         let mut pieces = Vec::new();
         let mut off = 0usize;
-        while off + piece <= collected.speech.len() {
-            if let Ok(raw) = speaker.embed(&collected.speech[off..off + piece]) {
+        while off + piece <= speech.len() {
+            if let Ok(raw) = speaker.embed(&speech[off..off + piece]) {
                 let norm = dsp::normalize_embedding(&raw);
                 if !norm.is_empty() {
                     pieces.push(norm);
@@ -4473,7 +4621,7 @@ mod lab {
             off += hop;
         }
         if pieces.is_empty() {
-            let raw = speaker.embed(&collected.speech)?;
+            let raw = speaker.embed(speech)?;
             let norm = dsp::normalize_embedding(&raw);
             if !norm.is_empty() {
                 pieces.push(norm);
@@ -4505,16 +4653,16 @@ mod lab {
         }
 
         let prototypes = dsp::select_prototypes(&kept, &centroid, 6);
-        let owner_sample = dsp::pick_cleanest_sample(&collected.speech, OWNER_SAMPLE_LEN);
+        let owner_sample = dsp::pick_cleanest_sample(speech, OWNER_SAMPLE_LEN);
         let has_sample = save_owner_sample(&owner_sample);
 
-        let speech_rms = if collected.speech_samples > 0 {
-            (collected.speech_sq_sum / (collected.speech_samples as f64)).sqrt() as f32
+        let speech_rms = if speech_samples > 0 {
+            (speech_sq_sum / (speech_samples as f64)).sqrt() as f32
         } else {
             0.02
         };
         let raw_snr = 20.0
-            * (f64::from(speech_rms.max(1e-4)) / f64::from(collected.noise_rms.max(1e-4))).log10();
+            * (f64::from(speech_rms.max(1e-4)) / f64::from(noise_rms.max(1e-4))).log10();
         let snr_db = raw_snr.clamp(0.0, 60.0) as f32;
         let consistency = scores.iter().sum::<f32>() / (scores.len().max(1) as f32);
         let lowest = scores.iter().copied().fold(1.0f32, f32::min);
@@ -4526,7 +4674,7 @@ mod lab {
             prototypes: prototypes.clone(),
             model_version: VOICEPRINT_MODEL_VERSION.into(),
             has_sample,
-            route: Some("desktop-mic".into()),
+            route: Some(route.into()),
             snr_db: Some(snr_db),
             seconds,
             consistency,
@@ -4734,12 +4882,129 @@ pub fn cancel_enroll() -> bool {
 pub fn clear_voiceprint() -> Result<VoiceAiState, String> {
     lab::stop_all();
     delete_owner_sample();
+    delete_voiceprint_backup();
     invalidate_hud_badge_cache();
     let mut cfg = load_config();
     cfg.voiceprint = None;
     cfg.filter = false;
     save_config(&cfg)?;
     Ok(current_state())
+}
+
+pub fn export_voiceprint() -> Result<Option<serde_json::Value>, String> {
+    let cfg = load_config();
+    let Some(mut vp) = cfg.voiceprint else {
+        return Ok(None);
+    };
+    let sample_b64 = read_owner_sample_base64();
+    vp.has_sample = sample_b64.is_some();
+    Ok(Some(serde_json::json!({
+        "voiceprint": vp,
+        "sampleBase64": sample_b64,
+    })))
+}
+
+pub fn import_voiceprint(payload: serde_json::Value) -> Result<VoiceAiState, String> {
+    let vp_val = payload
+        .get("voiceprint")
+        .cloned()
+        .unwrap_or_else(|| payload.clone());
+    let mut vp: VoiceprintRecord =
+        serde_json::from_value(vp_val).map_err(|e| format!("声纹数据格式无效：{e}"))?;
+    if vp.model_version.trim().is_empty() {
+        vp.model_version = VOICEPRINT_MODEL_VERSION.into();
+    }
+    if !is_valid_voiceprint(&vp) {
+        return Err("声纹特征向量不完整或版本不支持".into());
+    }
+    vp.prototypes
+        .retain(|p| p.len() == vp.embedding.len() && p.iter().all(|v| v.is_finite()));
+    let sample_ok = payload
+        .get("sampleBase64")
+        .and_then(|v| v.as_str())
+        .is_some_and(write_owner_sample_base64);
+    vp.has_sample = sample_ok || has_owner_sample();
+
+    let mut cfg = load_config();
+    cfg.voiceprint = Some(vp);
+    cfg.filter = true;
+    save_config(&cfg)?;
+    Ok(current_state())
+}
+
+pub fn enroll_from_pcm_bytes(pcm_le_i16: &[u8]) -> Result<VoiceAiEnrollResult, String> {
+    if pcm_le_i16.len() < VOICE_RATE * 2 * 2 {
+        return Err("音频文件太短，请使用至少 2 秒清晰人声录音".into());
+    }
+    let max_bytes = VOICE_RATE * 60 * 2;
+    let slice = &pcm_le_i16[..pcm_le_i16.len().min(max_bytes)];
+    let mut samples = Vec::with_capacity(slice.len() / 2);
+    for ch in slice.chunks_exact(2) {
+        samples.push(f32::from(i16::from_le_bytes([ch[0], ch[1]])) / 32768.0);
+    }
+
+    let loaded = models::open_models(false, true, true, false)?;
+    if loaded.speaker.is_none() || loaded.vad.is_none() {
+        return Err("声纹或 VAD 模型还没准备好，请先下载模型".into());
+    }
+
+    let mut hpf = dsp::HighPass64::default();
+    let mut hpf_f32 = vec![0.0f32; samples.len()];
+    hpf.process_slice(&samples, &mut hpf_f32);
+
+    let mut vad = models::Vad::new(&loaded.rt, loaded.vad.as_ref().expect("vad checked"));
+    let mut vad_boost = dsp::QuietVadBoost::default();
+    let mut vad_speech = Vec::<f32>::with_capacity(VOICE_RATE * 20);
+    let mut rms_speech = Vec::<f32>::with_capacity(VOICE_RATE * 20);
+    let mut noise_rms = 0.0015f32;
+    let mut noise_windows = 0usize;
+    let mut vad_sq_sum = 0.0f64;
+    let mut vad_samples = 0usize;
+    let mut rms_sq_sum = 0.0f64;
+    let mut rms_samples = 0usize;
+
+    for win in hpf_f32.chunks_exact(models::Vad::WINDOW) {
+        let mut e = 0.0f64;
+        for &v in win {
+            e += f64::from(v) * f64::from(v);
+        }
+        let win_rms = (e / (models::Vad::WINDOW as f64)).sqrt() as f32;
+        if win_rms >= 0.008 && rms_speech.len() < VOICE_RATE * 20 {
+            rms_sq_sum += e;
+            rms_samples += models::Vad::WINDOW;
+            rms_speech.extend_from_slice(win);
+        }
+        let mut boosted = [0.0f32; models::Vad::WINDOW];
+        vad_boost.prepare(win, &mut boosted);
+        let p = vad.prob(&boosted).unwrap_or(0.0);
+        if p < 0.25 {
+            noise_rms = if noise_windows == 0 {
+                win_rms.max(0.0002)
+            } else {
+                0.90 * noise_rms + 0.10 * win_rms.max(0.0002)
+            };
+            noise_windows += 1;
+            continue;
+        }
+        if p >= 0.42 && vad_speech.len() < VOICE_RATE * 20 {
+            vad_sq_sum += e;
+            vad_samples += models::Vad::WINDOW;
+            vad_speech.extend_from_slice(win);
+        }
+    }
+
+    let (speech, sq_sum, sp_count) = if vad_speech.len() >= VOICE_RATE * 2 {
+        (vad_speech, vad_sq_sum, vad_samples)
+    } else if rms_speech.len() >= VOICE_RATE * 2 {
+        (rms_speech, rms_sq_sum, rms_samples)
+    } else {
+        let secs = (vad_speech.len() as f32) / (VOICE_RATE as f32);
+        return Err(format!(
+            "音频中检测到的有效人声只有 {secs:.1} 秒，请换一段更清晰、至少 2 秒的说话录音"
+        ));
+    };
+
+    lab::enroll_collected_speech(&loaded, &speech, sq_sum, sp_count, noise_rms, "audio-file")
 }
 
 pub fn start_test(app: AppHandle, threshold: Option<f32>) -> Result<(), String> {
@@ -6415,6 +6680,67 @@ mod tests {
 
         fs::write(&lib, b"tampered-ort-binary").unwrap();
         assert!(verify_downloaded_ort_at(&tmp, &lib).is_err());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn voiceprint_backup_cache_and_export_import_round_trip() {
+        let tmp = std::env::temp_dir().join(format!("hp-vp-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var_os("HERDR_POCKET_HOME");
+        std::env::set_var("HERDR_POCKET_HOME", &tmp);
+        if let Ok(mut guard) = config_lock().lock() {
+            *guard = None;
+        }
+
+        let emb = vec![0.0721f32; 192];
+        let payload = serde_json::json!({
+            "voiceprint": {
+                "embedding": emb,
+                "prototypes": [vec![0.0721f32; 192]],
+                "modelVersion": VOICEPRINT_MODEL_VERSION,
+                "hasSample": false,
+                "route": "desktop-mic",
+                "seconds": 4.2,
+                "consistency": 0.91,
+                "lowest": 0.85,
+                "createdAt": 1234567890
+            }
+        });
+        let imported = import_voiceprint(payload).unwrap();
+        assert!(imported.enrolled);
+        assert!(voiceprint_cache_path().unwrap().exists());
+
+        // Simulate clearing main voice-ai.json voiceprint without calling clear_voiceprint:
+        // cache should restore automatically on cold load_config().
+        let mut wiped = load_config();
+        wiped.voiceprint = None;
+        let cfg_bytes = serde_json::to_vec_pretty(&wiped).unwrap();
+        fs::write(config_file_path().unwrap(), &cfg_bytes).unwrap();
+        if let Ok(mut guard) = config_lock().lock() {
+            *guard = None;
+        }
+        let restored = load_config();
+        assert!(restored.voiceprint.is_some());
+        assert_eq!(restored.voiceprint.as_ref().unwrap().embedding.len(), 192);
+
+        let exported = export_voiceprint().unwrap().expect("should export");
+        assert!(exported.get("voiceprint").is_some());
+
+        // Explicit clear deletes backup cache too.
+        let cleared = clear_voiceprint().unwrap();
+        assert!(!cleared.enrolled);
+        assert!(!voiceprint_cache_path().unwrap().exists());
+
+        if let Some(old) = prev {
+            std::env::set_var("HERDR_POCKET_HOME", old);
+        } else {
+            std::env::remove_var("HERDR_POCKET_HOME");
+        }
+        if let Ok(mut guard) = config_lock().lock() {
+            *guard = None;
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 }

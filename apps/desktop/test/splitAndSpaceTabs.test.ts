@@ -384,7 +384,7 @@ test("Keep-alive ShellMain, TerminalSurface no-reattach focus/size sync, ResizeO
   const appSrc = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/styles/shell.css", import.meta.url), "utf8");
 
-  assert.match(shellSrc, /MAX_KEPT_AGENT_TABS\s*=\s*16/);
+  assert.match(shellSrc, /MAX_KEPT_AGENT_TABS\s*=\s*24/);
   assert.match(shellSrc, /v3-tab-layer/);
   assert.match(shellSrc, /v3-pane-tool-btn/);
   assert.match(css, /\.v3-tab\s*\{[\s\S]*min-width:\s*78px;[\s\S]*max-width:\s*210px;/);

@@ -31,7 +31,7 @@ import {
   sendPortalInput,
   subscribePortalFrames,
 } from "../lib/portalClient";
-import { rpcCall } from "../lib/relay";
+import { ensureDirectLinkNow, rpcCall } from "../lib/relay";
 import { liveStore } from "../lib/store";
 import { openFileTab } from "../shell/shellStore";
 import { PocketButton, PocketIconButton, PocketInput, PocketModal, PocketSelect, useToast } from "./PocketUI";
@@ -237,16 +237,20 @@ export function PortalViewerModal({
 
   useEffect(() => {
     if (!open || !hostId) return;
+    ensureDirectLinkNow(hostId);
     setLoadingWin(true);
     void refreshHostPortals(hostId, agent?.key, true)
       .catch(() => {})
       .finally(() => setLoadingWin(false));
   }, [agent?.key, hostId, open]);
 
+  const itemHostId = item?.hostId;
+  const itemId = item?.id;
+  const itemCanInteract = Boolean(item?.canInteract);
   useEffect(() => {
-    if (!open || !item || !item.canInteract) return;
-    return subscribePortalFrames(item.hostId, item.id, 12);
-  }, [item, open]);
+    if (!open || !itemHostId || !itemId || !itemCanInteract) return;
+    return subscribePortalFrames(itemHostId, itemId, 12);
+  }, [itemCanInteract, itemHostId, itemId, open]);
 
   const hostSessionItems = useMemo(
     () =>

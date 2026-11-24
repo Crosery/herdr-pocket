@@ -2228,7 +2228,7 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
   );
 }
 
-const MAX_KEPT_AGENT_TABS = 16;
+const MAX_KEPT_AGENT_TABS = 24;
 
 const TabStage = memo(function TabStage({
   tab,

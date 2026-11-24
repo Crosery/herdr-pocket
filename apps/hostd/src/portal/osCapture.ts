@@ -50,7 +50,7 @@ function defaultHasCmd(cmd: string, env: NodeJS.ProcessEnv = process.env): boole
   return found;
 }
 
-function defaultExecBin(
+export function defaultExecBin(
   cmd: string,
   args: string[],
   timeoutMs = 6000,
@@ -68,9 +68,13 @@ function defaultExecBin(
           resolve({ code: 0, stdout: outBuf, stderr: errStr });
           return;
         }
-        const code = (err as { code?: unknown }).code;
-        if (typeof code === "number" && !(err as { killed?: boolean }).killed) {
-          resolve({ code, stdout: outBuf, stderr: errStr });
+        const e = err as { code?: unknown; killed?: boolean; signal?: unknown; message?: string };
+        if (e.killed || e.signal != null || e.code === "ETIMEDOUT") {
+          resolve({ code: -1, stdout: outBuf, stderr: errStr || e.message || "timed out" });
+          return;
+        }
+        if (typeof e.code === "number") {
+          resolve({ code: e.code, stdout: outBuf, stderr: errStr });
         } else {
           reject(err);
         }
@@ -424,7 +428,60 @@ import CoreGraphics
 import Foundation
 
 let args = CommandLine.arguments
-if args.count >= 2 && args[1] == "list" {
+if args.count >= 2 && args[1] == "check" {
+  let ok = CGPreflightScreenCaptureAccess()
+  let out: [String: Any] = ["screenCapture": ok]
+  if let data = try? JSONSerialization.data(withJSONObject: out) {
+    FileHandle.standardOutput.write(data)
+  }
+} else if args.count >= 3 && args[1] == "capture" {
+  if !CGPreflightScreenCaptureAccess() {
+    FileHandle.standardError.write(Data("screen_recording_denied\\n".utf8))
+    exit(2)
+  }
+  let target = args[2]
+  let maxDim = args.count >= 4 ? (Int(args[3]) ?? 1280) : 1280
+  var imgOpt: CGImage?
+  if target == "screen:0" {
+    imgOpt = CGWindowListCreateImage(.infinite, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution])
+      ?? CGDisplayCreateImage(CGMainDisplayID())
+  } else if let wid = CGWindowID(target) {
+    imgOpt = CGWindowListCreateImage(.null, .optionIncludingWindow, wid, [.boundsIgnoreFraming, .bestResolution])
+  }
+  guard let srcImg = imgOpt else {
+    FileHandle.standardError.write(Data("capture_empty\\n".utf8))
+    exit(1)
+  }
+  var outImg = srcImg
+  let longest = max(srcImg.width, srcImg.height)
+  if maxDim > 0 && longest > maxDim {
+    let scale = Double(maxDim) / Double(longest)
+    let tw = max(1, Int(Double(srcImg.width) * scale))
+    let th = max(1, Int(Double(srcImg.height) * scale))
+    if let ctx = CGContext(
+      data: nil,
+      width: tw,
+      height: th,
+      bitsPerComponent: 8,
+      bytesPerRow: 0,
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+    ) {
+      ctx.interpolationQuality = .medium
+      ctx.draw(srcImg, in: CGRect(x: 0, y: 0, width: tw, height: th))
+      if let scaled = ctx.makeImage() {
+        outImg = scaled
+      }
+    }
+  }
+  let rep = NSBitmapImageRep(cgImage: outImg)
+  guard let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: NSNumber(value: 0.62)]) else {
+    FileHandle.standardError.write(Data("encode_failed\\n".utf8))
+    exit(1)
+  }
+  FileHandle.standardError.write(Data("dims:\\(outImg.width)x\\(outImg.height)\\n".utf8))
+  FileHandle.standardOutput.write(jpeg)
+} else if args.count >= 2 && args[1] == "list" {
   let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
   let info = (CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]) ?? []
   var out: [[String: Any]] = []
@@ -492,12 +549,24 @@ if args.count >= 2 && args[1] == "list" {
 }
 `;
 
+export type CaptureWindowResult = {
+  mime: "image/jpeg" | "image/png";
+  data: string;
+  width: number;
+  height: number;
+  bounds?: RemoteWindowInfo["bounds"];
+  pid?: number;
+};
+
 export class OsCaptureDriver {
   private deps: OsCaptureDeps;
   private macHelperBin: string | null = null;
   private macHelperTried = false;
+  private macScreenRecordingDenied = false;
   private windowsCache: { at: number; list: RemoteWindowInfo[] } | null = null;
   private windowsInflight: Promise<RemoteWindowInfo[]> | null = null;
+  private captureInflight = new Map<string, Promise<CaptureWindowResult | null>>();
+  private lastFrameCache = new Map<string, { at: number; frame: CaptureWindowResult | null }>();
 
   constructor(deps: OsCaptureDeps = {}) {
     this.deps = deps;
@@ -516,7 +585,7 @@ export class OsCaptureDriver {
     if (this.macHelperTried) return null;
     this.macHelperTried = true;
     const binDir = join(stateDir(), "bin");
-    const binPath = join(binDir, "hp-mac-portal");
+    const binPath = join(binDir, "hp-mac-portal-v2");
     if (existsSync(binPath)) {
       this.macHelperBin = binPath;
       return binPath;
@@ -524,7 +593,7 @@ export class OsCaptureDriver {
     if (!this.hasCmd("swiftc", process.env)) return null;
     try {
       mkdirSync(binDir, { recursive: true });
-      const srcPath = join(binDir, "hp-mac-portal.swift");
+      const srcPath = join(binDir, "hp-mac-portal-v2.swift");
       writeFileSync(srcPath, MAC_SWIFT_SRC);
       const r = await this.exec("swiftc", ["-O", srcPath, "-o", binPath], 30_000);
       if (r.code === 0 && existsSync(binPath)) {
@@ -533,6 +602,30 @@ export class OsCaptureDriver {
       }
     } catch {
       // fall back to screencapture + osascript
+    }
+    return null;
+  }
+
+  async checkPermissionNote(): Promise<string | null> {
+    const info = detectPortalSession(this.deps);
+    if (info.sessionType !== "macos") return null;
+    if (this.macScreenRecordingDenied) {
+      return "请在系统设置 -> 隐私与安全性 -> 屏幕录制 中勾选运行 hostd 的终端或应用，否则无法捕获其他应用窗口";
+    }
+    const helper = await this.ensureMacHelper();
+    if (!helper) return null;
+    try {
+      const r = await this.exec(helper, ["check"], 2000);
+      if (r.code === 0) {
+        const parsed = JSON.parse(r.stdout.toString("utf8")) as { screenCapture?: boolean };
+        if (parsed.screenCapture === false) {
+          this.macScreenRecordingDenied = true;
+          return "请在系统设置 -> 隐私与安全性 -> 屏幕录制 中勾选运行 hostd 的终端或应用，否则无法捕获其他应用窗口";
+        }
+        this.macScreenRecordingDenied = false;
+      }
+    } catch {
+      // ignore check error
     }
     return null;
   }
@@ -715,7 +808,24 @@ export class OsCaptureDriver {
     return out;
   }
 
-  async captureWindow(windowId: string): Promise<{ mime: "image/jpeg" | "image/png"; data: string; width: number; height: number; bounds?: RemoteWindowInfo["bounds"]; pid?: number } | null> {
+  async captureWindow(windowId: string): Promise<CaptureWindowResult | null> {
+    const cached = this.lastFrameCache.get(windowId);
+    if (cached && Date.now() - cached.at < 45) return cached.frame;
+    const inflight = this.captureInflight.get(windowId);
+    if (inflight) return inflight;
+    const p = this.captureWindowUncached(windowId)
+      .then((frame) => {
+        this.lastFrameCache.set(windowId, { at: Date.now(), frame });
+        return frame;
+      })
+      .finally(() => {
+        this.captureInflight.delete(windowId);
+      });
+    this.captureInflight.set(windowId, p);
+    return p;
+  }
+
+  private async captureWindowUncached(windowId: string): Promise<CaptureWindowResult | null> {
     const info = detectPortalSession(this.deps);
     let list: RemoteWindowInfo[] = [];
     if (windowId !== "screen:0") {
@@ -729,13 +839,37 @@ export class OsCaptureDriver {
     const bounds = target?.bounds;
 
     if (info.sessionType === "macos") {
+      const helper = await this.ensureMacHelper();
+      if (helper && (windowId === "screen:0" || /^\d+$/.test(windowId))) {
+        try {
+          const r = await this.exec(helper, ["capture", windowId, "1280"], 3500);
+          if (r.code === 0 && r.stdout.length > 0) {
+            this.macScreenRecordingDenied = false;
+            const dims = /dims:(\d+)x(\d+)/.exec(r.stderr);
+            return {
+              mime: "image/jpeg",
+              data: r.stdout.toString("base64"),
+              width: dims ? Number(dims[1]) : (bounds?.width ?? 1280),
+              height: dims ? Number(dims[2]) : (bounds?.height ?? 800),
+              bounds,
+              pid: target?.pid,
+            };
+          }
+          if (r.code === 2) {
+            this.macScreenRecordingDenied = true;
+            return null;
+          }
+        } catch {
+          // fallback below to screencapture
+        }
+      }
       const tmp = join(tmpdir(), `hp-cap-${process.pid}-${Date.now()}.jpg`);
       try {
         const args = windowId !== "screen:0" && /^\d+$/.test(windowId)
           ? ["-x", "-o", "-l", windowId, "-t", "jpg", tmp]
           : ["-x", "-t", "jpg", tmp];
-        const r = await this.exec("/usr/sbin/screencapture", args, 5000);
-        if (r.code === 0 && existsSync(tmp)) {
+        const r = await this.exec("/usr/sbin/screencapture", args, 5000).catch(() => null);
+        if (r?.code === 0 && existsSync(tmp)) {
           const buf = readFileSync(tmp);
           return {
             mime: "image/jpeg",

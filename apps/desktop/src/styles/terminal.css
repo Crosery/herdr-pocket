@@ -11,6 +11,7 @@
   background: var(--tp-term-bg, #17191d);
   outline: none;
   overflow: hidden;
+  overflow: clip;
 }
 
 .tp-term-search {
@@ -79,7 +80,9 @@
   min-width: 0;
   width: 100%;
   height: 100%;
-  transition: opacity 70ms ease-out;
+  overflow: hidden;
+  overflow: clip;
+  transition: none;
 }
 .tp-term-host[data-ready="false"] {
   opacity: 0;
@@ -91,6 +94,8 @@
 .tp-term-host .xterm {
   height: 100%;
   width: 100%;
+  overflow: hidden;
+  overflow: clip;
   background-color: var(--tp-term-bg, #17191d);
   font-variant-ligatures: none;
   font-feature-settings: "liga" 0, "calt" 0;
@@ -100,6 +105,7 @@
 .tp-term-host .xterm .xterm-viewport,
 .tp-term-host .xterm-viewport {
   background-color: var(--tp-term-bg, #17191d);
+  overflow-x: hidden;
   scrollbar-width: thin;
   scrollbar-color: var(--tp-term-scroll, rgba(255, 255, 255, 0.18)) transparent;
 }
@@ -124,12 +130,16 @@
 
 .tp-term-host .xterm-screen {
   position: relative;
+  overflow: hidden;
+  overflow: clip;
 }
 
 .tp-term-host .xterm .xterm-helpers {
   inset: 0;
   width: 100%;
   height: 100%;
+  overflow: hidden;
+  overflow: clip;
   pointer-events: none;
 }
 

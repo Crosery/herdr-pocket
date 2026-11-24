@@ -4,9 +4,14 @@ import {
   cancelPendingModelSwitch,
   chatQueueStore,
   enqueuePrompt,
+  injectTerminalQueuedNow,
+  interruptComposerNow,
   resetChatQueueForTest,
   schedulePendingModelSwitch,
 } from "../src/lib/chatQueue.ts";
+import { filterTerminalQueuedItems } from "../src/lib/chatQueueLogic.ts";
+import { DEMO_URL, mockApi } from "../src/lib/mock.ts";
+import { settingsStore } from "../src/lib/store.ts";
 import {
   getComposerDraft,
   resetComposerDraftsForTest,
@@ -265,4 +270,101 @@ test("pendingSwitchByAgent coalesces model + thinking switches separately from q
 
   cancelPendingModelSwitch(agent.key);
   assert.equal(chatQueueStore.get().pendingSwitchByAgent[agent.key], undefined);
+});
+
+test("filterTerminalQueuedItems suppresses duplicates across unmatched, app queue, injected, and foldedRows", () => {
+  const remaining = filterTerminalQueuedItems(
+    ["  ", "消息一", "消息二", "消息三", "消息四", "未发消息"],
+    [{ id: "out-1", text: "消息一", attachments: [], attachedCount: 0, ts: 10, state: "sent" }],
+    ["消息二"],
+    new Set(["消息三"]),
+    [
+      {
+        id: "u-1",
+        kind: "user",
+        text: "消息四",
+        ts: 20,
+        images: [],
+        attachedLines: [],
+      },
+    ],
+  );
+  assert.deepEqual(remaining, ["未发消息"]);
+});
+
+test("interruptComposerNow keeps one sent bubble even if terminal.send returns waiting: true", async () => {
+  const prevServer = settingsStore.get().server;
+  const origCall = mockApi.call;
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  settingsStore.set({ ...settingsStore.get(), server: DEMO_URL });
+  mockApi.call = (async (_to: string, method: string, params: Record<string, unknown>) => {
+    calls.push({ method, params });
+    if (method === "terminal.send") return { ok: true, waiting: true };
+    return { ok: true };
+  }) as typeof mockApi.call;
+  try {
+    const ok = await interruptComposerNow(
+      { key: "host1/hc:int1", deviceId: "host1", status: "working" },
+      "马上处理这个",
+      [],
+    );
+    assert.equal(ok, true);
+    assert.deepEqual(
+      calls.map((c) => c.method),
+      ["terminal.interrupt", "terminal.send"],
+    );
+    const outgoing = chatQueueStore.get().outgoingByAgent["host1/hc:int1"] ?? [];
+    assert.equal(outgoing.length, 1);
+    assert.equal(outgoing[0]!.text, "马上处理这个");
+    assert.equal(outgoing[0]!.state, "sent");
+  } finally {
+    mockApi.call = origCall;
+    settingsStore.set({ ...settingsStore.get(), server: prevServer });
+  }
+});
+
+test("injectTerminalQueuedNow promotes existing queued_terminal bubble without duplicating and hides shelf item", async () => {
+  const prevServer = settingsStore.get().server;
+  const origCall = mockApi.call;
+  const keyCalls: string[][] = [];
+  settingsStore.set({ ...settingsStore.get(), server: DEMO_URL });
+  mockApi.call = (async (_to: string, method: string, params: Record<string, unknown>) => {
+    if (method === "terminal.keys" && Array.isArray(params.keys)) {
+      keyCalls.push(params.keys.map(String));
+    }
+    return { ok: true };
+  }) as typeof mockApi.call;
+  try {
+    const agent = { key: "host1/hc:inj1", deviceId: "host1" };
+    chatQueueStore.set({
+      ...chatQueueStore.get(),
+      outgoingByAgent: {
+        [agent.key]: [
+          {
+            id: "out-q1",
+            agentKey: agent.key,
+            deviceId: agent.deviceId,
+            text: "插队消息",
+            attachments: [],
+            attachedCount: 0,
+            attachedNames: [],
+            ts: 100,
+            state: "queued_terminal",
+          },
+        ],
+      },
+    });
+    await injectTerminalQueuedNow(agent, "插队消息");
+    assert.deepEqual(keyCalls, [["alt+m"]]);
+    const state = chatQueueStore.get();
+    const outgoing = state.outgoingByAgent[agent.key] ?? [];
+    assert.equal(outgoing.length, 1);
+    assert.equal(outgoing[0]!.id, "out-q1");
+    assert.equal(outgoing[0]!.state, "sent");
+    const injectedSet = new Set((state.injectedTerminalByAgent[agent.key] ?? []).map((r) => r.text));
+    assert.deepEqual(filterTerminalQueuedItems(["插队消息", "下一条"], [], [], injectedSet), ["下一条"]);
+  } finally {
+    mockApi.call = origCall;
+    settingsStore.set({ ...settingsStore.get(), server: prevServer });
+  }
 });

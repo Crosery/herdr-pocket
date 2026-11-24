@@ -57,6 +57,7 @@ import {
   verifyReconfirmEcdsa,
 } from "./identity.ts";
 import { TranscribeError, TranscribeLimiter, audioType, resolveTranscribe, transcribe, transcribeInfo, wavDurationMs, type TranscribeSettings, type TranscribeTarget } from "./transcribe.ts";
+import { ReleaseCache } from "./releases.ts";
 
 const WEB_APP_CSP =
   "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https: http:; media-src 'self' blob: data:; connect-src *; frame-src 'self' blob: data:; manifest-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'";
@@ -85,6 +86,9 @@ export interface RelayOptions {
   transcribe?: TranscribeSettings;
   /** Per-device dictation limits (tests lower them). */
   transcribeLimits?: { perMinute?: number; concurrent?: number };
+  /** Directory and upstream override for the built-in release cache (`:memory:` tests isolate automatically). */
+  releaseCacheDir?: string;
+  releaseUpstreamBases?: string[];
 }
 
 interface Conn {
@@ -109,7 +113,14 @@ interface Pending {
 /** Calls that change something on a computer: logged even when they work. Typing keystrokes and "seen" marks are not. */
 const MUTATING = new Set(["terminal.send", "terminal.keys", "agent.create", "agent.setModel", "space.delete", "terminal.interrupt", "terminal.kill", "herdr.command", "herdr.doc.set", "sessions.resume", "tools.update"]);
 /** Calls that may run longer than the usual RPC timeout: a new agent's first task is typed in once its program is up (hostd waits up to 45 s). */
-const SLOW_RPC_MS: Partial<Record<string, number>> = { "agent.create": 100_000, "agent.btw": 65_000, "tools.update": 180_000 };
+const SLOW_RPC_MS: Partial<Record<string, number>> = {
+  "agent.create": 100_000,
+  "agent.btw": 65_000,
+  "tools.update": 180_000,
+  "terminal.putBegin": 60_000,
+  "terminal.putChunk": 60_000,
+  "terminal.putFinish": 60_000,
+};
 /** Bodies of log uploads are larger than other requests. */
 const MAX_LOG_BODY = 512 * 1024;
 const STARTED = Date.now();
@@ -173,6 +184,7 @@ export class Relay {
   /** What is in force now. */
   private eff: EffectiveConfig;
   private dictation: TranscribeLimiter;
+  private releases: ReleaseCache;
 
   private opts: RelayOptions;
 
@@ -184,6 +196,12 @@ export class Relay {
     this.events = new EventLog(this.store, { journal, deviceName: (id) => (id === "relay" ? "relay" : this.store.getDevice(id)?.name) });
     // Plain lines ("paired ...", "live: ...") are events too: kind from their prefix, trouble from their words.
     this.log = (m) => this.events.record(plainEvent(m));
+    this.releases = new ReleaseCache({
+      dbPath: opts.dbPath,
+      cacheDir: opts.releaseCacheDir,
+      upstreamBases: opts.releaseUpstreamBases,
+      log: this.log,
+    });
     this.http = createServer((req, res) => {
       this.handleHttp(req, res).catch((err) => {
         this.log(`http error: ${err instanceof Error ? err.stack : String(err)}`);
@@ -285,6 +303,7 @@ export class Relay {
     for (const c of this.conns.values()) c.ws.terminate();
     this.wss.close();
     await new Promise<void>((r) => this.http.close(() => r()));
+    this.releases.close();
     this.store.close();
   }
 
@@ -295,7 +314,7 @@ export class Relay {
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     if (req.method === "OPTIONS") {
       res.writeHead(204).end();
       return;
@@ -423,6 +442,21 @@ export class Relay {
         "X-Content-Type-Options": "nosniff",
       });
       res.end(req.method === "HEAD" ? undefined : asset.body);
+      return;
+    }
+
+    const releaseMatch = /^\/v1\/releases\/download\/([^/]+)\/([^/]+)$/.exec(path);
+    if ((req.method === "GET" || req.method === "HEAD") && releaseMatch) {
+      let tag = releaseMatch[1]!;
+      let asset = releaseMatch[2]!;
+      try {
+        tag = decodeURIComponent(tag);
+        asset = decodeURIComponent(asset);
+      } catch {
+        sendError(res, 400, "bad_request", "无效的下载地址");
+        return;
+      }
+      await this.releases.handleDownload(req, res, tag, asset);
       return;
     }
 
@@ -908,6 +942,55 @@ export class Relay {
         return;
       }
       sendJson(res, 200, this.overview());
+      return;
+    }
+
+    if (path === "/v1/voiceprint") {
+      if (!auth) {
+        sendError(res, 401, "unauthorized", "需要有效的设备令牌");
+        return;
+      }
+      if (req.method === "GET") {
+        const saved = this.store.getSetting<Record<string, unknown> | null>("voiceprint") ?? null;
+        sendJson(res, 200, {
+          voiceprint: saved?.voiceprint ?? null,
+          ...(typeof saved?.sampleBase64 === "string" ? { sampleBase64: saved.sampleBase64 } : {}),
+          ...(typeof saved?.updatedAt === "number" ? { updatedAt: saved.updatedAt } : {}),
+        });
+        return;
+      }
+      if (req.method === "PUT") {
+        const buf = await readBody(req, 512 * 1024);
+        if (!buf) {
+          sendError(res, 413, "bad_request", "声纹数据超出大小限制");
+          return;
+        }
+        let body: Record<string, unknown> | null = null;
+        try {
+          const parsed = JSON.parse(buf.toString("utf8"));
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+        } catch {
+          body = null;
+        }
+        const vp = body?.voiceprint as Record<string, unknown> | undefined;
+        if (!vp || !Array.isArray(vp.embedding) || vp.embedding.length < 64) {
+          sendError(res, 400, "bad_request", "声纹特征格式无效");
+          return;
+        }
+        this.store.putSetting("voiceprint", {
+          voiceprint: vp,
+          ...(typeof body?.sampleBase64 === "string" ? { sampleBase64: body.sampleBase64 } : {}),
+          updatedAt: Date.now(),
+        });
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === "DELETE") {
+        this.store.putSetting("voiceprint", null);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      sendError(res, 405, "bad_request", "method not allowed");
       return;
     }
 

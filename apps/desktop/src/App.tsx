@@ -6,6 +6,8 @@ import { XiaoyangOrb } from "./components/MascotAndVendor";
 import type { NavItem } from "./components/Sidebar";
 import { DesktopShell } from "./shell/DesktopShell";
 import { FRAME_SECTION_OF, openSettingsFrame } from "./shell/shellStore";
+import { MobileAppShell } from "./mobile/MobileAppShell";
+import "./styles/mobile-parity.css";
 import { PairPhoneModal } from "./components/PairPhoneModal";
 import { ConnectRelayPanel, RELAY_EXPLAINER } from "./components/ConnectRelayPanel";
 import { H5InstallAppCard } from "./components/H5InstallAppCard";
@@ -105,7 +107,13 @@ function PocketAppShell() {
   const rail = tier === "rail" || ((tier === "regular" || tier === "wide") && collapsedPref);
 
   const [boot, setBoot] = useState<Boot>("loading");
-  const [tab, setTab] = useState<TabId>("agents");
+  const [tab, setTab] = useState<TabId>(() => {
+    if (typeof window !== "undefined") {
+      const hasAgentParam = new URLSearchParams(window.location.search).has("agent");
+      if (!hasAgentParam && window.innerWidth < 860) return "assistant";
+    }
+    return "agents";
+  });
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [workbenchAgent, setWorkbenchAgent] = useState<string | null>(null);
@@ -850,34 +858,23 @@ function PocketAppShell() {
   const fontSize = `${Math.round(14 * textScale)}px`;
 
   if (mobileLayout) {
-    const hideTabs = tab === "agents" && selectedAgent !== null;
-    const mobileNav: Array<{ id: TabId; label: string; icon: NavItem<TabId>["icon"]; badge?: number }> = [
-      ...navItems.filter((n) => n.id !== "workbench"),
-      { id: "settings", label: "设置", icon: Settings },
-    ];
     return (
-      <div className={`mobile-shell${hideTabs ? " no-tabbar" : ""}`} style={{ fontSize }}>
-        <TitlebarStrip />
-        <div className="mobile-body">{activeContent}</div>
-        {!hideTabs ? (
-          <nav className="mobile-tabbar" aria-label="主导航">
-            {mobileNav.map((n) => {
-              const Icon = n.icon;
-              const active = tab === n.id;
-              return (
-                <button key={n.id} className={`tab-item${active ? " active" : ""}`} onClick={() => setTab(n.id)}>
-                  <div className="tab-pill">
-                    <Icon size={19} />
-                  </div>
-                  <span>{n.label}</span>
-                  {n.badge ? <span className="tab-dot num">{n.badge}</span> : null}
-                </button>
-              );
-            })}
-          </nav>
-        ) : null}
-        {overlays}
-      </div>
+      <MobileAppShell
+        tab={tab}
+        onTab={setTab}
+        selectedAgentKey={selectedAgent}
+        onSelectAgent={setSelectedAgent}
+        workbenchAgent={workbenchAgent}
+        onOpenWorkbench={(key) => {
+          setWorkbenchAgent(key);
+          setTab("workbench");
+        }}
+        onPairPhone={() => setPairOpen(true)}
+        onConnectRelay={() => setRelayOpen(true)}
+        banner={banner}
+        overlays={overlays}
+        fontSize={fontSize}
+      />
     );
   }
 

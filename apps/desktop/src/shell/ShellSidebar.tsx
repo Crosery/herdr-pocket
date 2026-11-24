@@ -26,7 +26,6 @@ import { buildHostSpaces, type SidebarSpace } from "./spaceSync";
 const FOLD_KEY = "herdr-pocket-v3-folded";
 const SORT_KEY = "herdr-pocket-v3-agent-sort";
 const SPACES_RATIO_KEY = "herdr-pocket-v3-spaces-ratio";
-const SPACES_SECTION_FOLD_ID = "sec:spaces";
 
 function clampSpacesRatio(r: unknown): number | null {
   if (typeof r !== "number" || !Number.isFinite(r)) return null;
@@ -270,7 +269,6 @@ export function ShellSidebar({
 
   const selected = spaceSel && machines.some((m) => m.spaces.some((s) => s.id === spaceSel)) ? spaceSel : null;
   const totalSpaces = useMemo(() => machines.reduce((n, m) => n + m.spaces.length, 0), [machines]);
-  const spacesFolded = folded.includes(SPACES_SECTION_FOLD_ID);
   // Agent list stays global across all Spaces & computers like Herdr.app; clicking any Agent switches Spaces automatically.
   const inScope = agents;
   const primaryMachineId = localHostId || machines[0]?.id || null;
@@ -432,24 +430,26 @@ export function ShellSidebar({
           aria-orientation="vertical"
           aria-label="拖动调整侧栏宽度，双击恢复默认"
           title="拖动调整侧栏宽度（双击恢复默认）"
-          onDoubleClick={() => updateSettings({ sidebarWidth: DEFAULT_SIDEBAR_WIDTH })}
-          onPointerDown={(e) => {
-            if (e.button !== 0 || !sidebarRef.current) return;
-            e.preventDefault();
-            const el = sidebarRef.current;
-            const startX = e.clientX;
-            const startW = el.getBoundingClientRect().width || sidebarWidth;
-            let curW = clampSidebarWidth(startW);
-            let rafId = 0;
-            setSidebarResizing(true);
-            setInteractiveResizeActive(true);
-            document.documentElement.dataset.splitResizing = "row";
-            e.currentTarget.setPointerCapture(e.pointerId);
+            onDoubleClick={() => updateSettings({ sidebarWidth: DEFAULT_SIDEBAR_WIDTH })}
+            onPointerDown={(e) => {
+              if (e.button !== 0 || !sidebarRef.current) return;
+              e.preventDefault();
+              const el = sidebarRef.current;
+              const v3El = el.closest(".v3") as HTMLElement | null;
+              const startX = e.clientX;
+              const startW = el.getBoundingClientRect().width || sidebarWidth;
+              let curW = clampSidebarWidth(startW);
+              let rafId = 0;
+              setSidebarResizing(true);
+              setInteractiveResizeActive(true);
+              document.documentElement.dataset.splitResizing = "row";
+              e.currentTarget.setPointerCapture(e.pointerId);
 
-            const apply = () => {
-              rafId = 0;
-              el.style.setProperty("--v3-sidebar-w", `${curW}px`);
-            };
+              const apply = () => {
+                rafId = 0;
+                el.style.setProperty("--v3-sidebar-w", `${curW}px`);
+                v3El?.style.setProperty("--v3-sidebar-effective", `${curW}px`);
+              };
             const onMove = (mv: PointerEvent) => {
               curW = clampSidebarWidth(startW + (mv.clientX - startX));
               if (!rafId) rafId = requestAnimationFrame(apply);
@@ -495,46 +495,25 @@ export function ShellSidebar({
       <div ref={listsRef} className="v3-lists">
         <section
           ref={spacesBlockRef}
-          className={`v3-block v3-block-spaces${spacesFolded && !collapsed ? " is-folded" : ""}${!collapsed && !spacesFolded && spacesRatio !== null ? " has-ratio" : ""}`}
-          style={!collapsed && !spacesFolded && spacesRatio !== null ? ({ "--v3-spaces-ratio": String(spacesRatio) } as CSSProperties) : undefined}
+          className={`v3-block v3-block-spaces${!collapsed && spacesRatio !== null ? " has-ratio" : ""}`}
+          style={!collapsed && spacesRatio !== null ? ({ "--v3-spaces-ratio": String(spacesRatio) } as CSSProperties) : undefined}
           aria-label="空间"
         >
           {collapsed ? null : (
-            <div
-              className="v3-block-head is-toggle"
-              role="button"
-              tabIndex={0}
-              aria-expanded={!spacesFolded}
-              title={spacesFolded ? "展开空间列表" : "收起空间列表"}
-              onClick={() => toggleFold(SPACES_SECTION_FOLD_ID)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  toggleFold(SPACES_SECTION_FOLD_ID);
-                }
-              }}
-            >
-              <span className="v3-block-caret" aria-hidden="true">
-                {spacesFolded ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
-              </span>
+            <div className="v3-block-head">
               <span>空间</span>
               {totalSpaces > 0 ? <span className="v3-count v3-sec-count">{totalSpaces}</span> : null}
               <span className="grow" />
               <button
-                className="v3-icon-btn small has-hint"
+                className="v3-icon-btn small"
                 aria-label="新建空间"
                 title={`新建空间（${shortcutText("newSpace")}）`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onNewSpace(null);
-                }}
+                onClick={() => onNewSpace(null)}
               >
                 <Plus size={14} />
-                <SpatialHint text={shortcutText("newSpace")} corner="tr" />
               </button>
             </div>
           )}
-          {spacesFolded && !collapsed ? null : (
           <div className="v3-block-body">
             {notice && !collapsed ? (
               <div className="v3-notice" role="status">
@@ -657,10 +636,9 @@ export function ShellSidebar({
               <div className="v3-empty-line">还没有电脑加入。在那台电脑上运行 herdr-pocket up，或在 设置 › 电脑与中继 里添加电脑。</div>
             ) : null}
           </div>
-          )}
         </section>
 
-        {!collapsed && !spacesFolded ? (
+        {!collapsed ? (
           <div
             className={`v3-lists-sash${spacesResizing ? " dragging" : ""}`}
             role="separator"

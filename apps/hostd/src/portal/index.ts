@@ -142,11 +142,17 @@ export class PortalManager {
   async capabilities(): Promise<HostPortalCapabilities> {
     const hasCdpBrowser = await this.browser.hasBrowser().catch(() => false);
     const { port } = this.deps.getDirectInfo();
-    return computeCapabilities({
+    const caps = computeCapabilities({
       deps: this.deps.captureDeps,
       hasCdpBrowser,
       directPort: port,
     });
+    const permNote = await this.capture.checkPermissionNote().catch(() => null);
+    if (permNote) {
+      const notes = [...(caps.notes ?? []), permNote];
+      return { ...caps, notes };
+    }
+    return caps;
   }
 
   private resolveAgentForHook(payload: HookOpenPayload): Agent | undefined {
@@ -532,9 +538,11 @@ export class PortalManager {
             });
         }, intervalMs);
         entry.timer.unref?.();
-        void this.captureFrame(params.portalId).then(({ frame }) => {
-          if (frame) send({ kind: "portal_frame", ...frame });
-        });
+        void this.captureFrame(params.portalId)
+          .then(({ frame }) => {
+            if (frame) send({ kind: "portal_frame", ...frame });
+          })
+          .catch(() => {});
       }
     }
 

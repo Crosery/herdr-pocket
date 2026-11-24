@@ -168,8 +168,33 @@ test("clampCompositionOverlayLayout aligns inline without bottom jump and leaves
   });
   assert.equal(edgeOverflow.maxWidth, 476);
   assert.ok(edgeOverflow.left >= 0);
-  assert.ok(edgeOverflow.left + Math.min(960, edgeOverflow.maxWidth) <= 478);
+  assert.ok(edgeOverflow.left + edgeOverflow.maxWidth <= 478);
   assert.ok(edgeOverflow.top < 460, "lifts only when overflowing bottom edge");
+
+  for (const cursorLeft of [0, 24, 180, 350, 460]) {
+    const res = clampCompositionOverlayLayout({
+      cursorLeft,
+      cursorTop: 120,
+      cellHeight: 18,
+      screenWidth: 500,
+      screenHeight: 400,
+      naturalWidth: 800,
+      naturalHeight: 18,
+    });
+    assert.ok(
+      res.left + res.maxWidth <= 500 - 2,
+      `composition overlay overflowed screenWidth=500 at cursorLeft=${cursorLeft}: left=${res.left} maxWidth=${res.maxWidth}`,
+    );
+    if (cursorLeft > 340) {
+      assert.equal(res.top, 138, `wrapped preedit at cursorLeft=${cursorLeft} should drop to next row instead of occluding existing prompt text`);
+    }
+  }
+
+  // Multi-char Chinese voice sentences (<240 bytes) still wrap in bracketed paste to prevent char-by-char flicker.
+  assert.deepEqual(chunkTerminalInputPayload("这是一段中等长度的语音输入文字", true), [
+    "\x1b[200~这是一段中等长度的语音输入文字\x1b[201~",
+  ]);
+  assert.deepEqual(chunkTerminalInputPayload("你", true), ["你"]);
 
   const encoder = new TextEncoder();
   const longVoiceText = "语音输入测试长文本，不会因为超过一百多个汉字就把终端横着撑爆掉。".repeat(45);
@@ -218,7 +243,7 @@ test("clampCompositionOverlayLayout aligns inline without bottom jump and leaves
   ta.dispatchEvent(new Event("compositionupdate"));
   await sleep(16);
 
-  assert.equal(compView.style.maxWidth, "1196px");
+  assert.equal(compView.style.maxWidth, "1172px");
   assert.equal(compView.style.left, "24px");
   assert.equal(compView.style.top, "400px");
   assert.deepEqual(ta.style, initialTaStyle, "must never mutate xterm helper textarea styles");

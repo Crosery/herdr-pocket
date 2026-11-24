@@ -18,6 +18,8 @@ import { PermissionGuideModal } from "./PermissionGuideModal";
 import { VoiceprintModal } from "./VoiceprintModal";
 import { assistantStore, loadAssistant } from "../lib/assistant";
 import { detectPlatform } from "../lib/bridge";
+import { VOICEPRINT_SENSITIVITY_OPTIONS } from "../lib/voicePresets";
+import { decodeAudioFileToPcm16Base64, pullVoiceprintFromRelay, pushVoiceprintToRelay } from "../lib/voiceprintSync";
 import {
   native,
   type Permission,
@@ -67,7 +69,7 @@ const RECOMMENDED_KEY = MAC ? "RightOption" : "RightControl";
 const isModifierKey = (v: string | null | undefined) => Boolean(v && MODIFIER_KEYS.some((m) => m.value === v));
 
 /** Builds a Tauri accelerator from a keydown; null until a non-modifier key arrives. */
-function acceleratorFrom(e: ReactKeyboardEvent): string | null {
+function acceleratorFrom(e: ReactKeyboardEvent | KeyboardEvent): string | null {
   const mods: string[] = [];
   const primary = MAC ? e.metaKey : e.ctrlKey;
   if (primary) mods.push("CommandOrControl");
@@ -379,28 +381,51 @@ export function PermissionCards({
 
 export function HotkeyRecorder({ value, onChange, disabled }: { value: string | null; onChange: (v: string) => void; disabled?: boolean }) {
   const [recording, setRecording] = useState(false);
+  const boxRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    void native.voiceSetRecordingHotkey(recording);
+    if (!recording) return;
+
+    const onWinKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape" || e.key === "Backspace" || e.key === "Delete") {
+        setRecording(false);
+        return;
+      }
+      const accel = acceleratorFrom(e);
+      if (accel) {
+        setRecording(false);
+        onChange(accel);
+      }
+    };
+    const onWinPointerDown = (e: PointerEvent) => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) {
+        setRecording(false);
+      }
+    };
+
+    window.addEventListener("keydown", onWinKeyDown, true);
+    window.addEventListener("pointerdown", onWinPointerDown, true);
+    return () => {
+      window.removeEventListener("keydown", onWinKeyDown, true);
+      window.removeEventListener("pointerdown", onWinPointerDown, true);
+      void native.voiceSetRecordingHotkey(false);
+    };
+  }, [recording, onChange]);
+
   return (
     <button
+      ref={boxRef}
       type="button"
       className={`hotkey-box${recording ? " recording" : ""}`}
       disabled={disabled}
-      onClick={() => setRecording(true)}
-      onBlur={() => setRecording(false)}
-      onKeyDown={(e) => {
-        if (!recording) return;
-        e.preventDefault();
-        e.stopPropagation();
-        if (e.key === "Escape") return setRecording(false);
-        const accel = acceleratorFrom(e);
-        if (accel) {
-          setRecording(false);
-          onChange(accel);
-        }
-      }}
+      onClick={() => setRecording((r) => !r)}
       aria-label="录制快捷键"
     >
       <Keyboard size={14} />
-      <span className="mono truncate">{recording ? "按下组合键（至少带一个修饰键，Esc 取消）" : prettyHotkey(value)}</span>
+      <span className="mono truncate">{recording ? "请按下组合键（需带 ⌘/⌥/Ctrl/Shift，Esc 取消）" : prettyHotkey(value)}</span>
     </button>
   );
 }
@@ -422,6 +447,10 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   const refreshingRef = useRef(false);
   const singleKey = isModifierKey(cfg.hotkey);
 
+  const [vpBusy, setVpBusy] = useState(false);
+  const audioImportRef = useRef<HTMLInputElement | null>(null);
+  const autoPulledVpRef = useRef(false);
+
   const refresh = useCallback(async () => {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
@@ -434,7 +463,21 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       ]);
       setPerms(p);
       setRuntime(r);
-      if (ai) setAiState(ai);
+      if (ai) {
+        setAiState(ai);
+        const srv = settingsStore.get().server;
+        if (!ai.enrolled && srv && !isMockServer(srv) && !autoPulledVpRef.current) {
+          autoPulledVpRef.current = true;
+          void pullVoiceprintFromRelay()
+            .then((restored) => {
+              if (restored) {
+                setAiState(restored);
+                toast("已从云端恢复本人声纹");
+              }
+            })
+            .catch(() => {});
+        }
+      }
     } finally {
       refreshingRef.current = false;
       setChecking(false);
@@ -504,6 +547,46 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
       const msg = (e as Error).message;
       if (!/取消/.test(msg)) toast(msg, true);
       void native.voiceAiState().then(setAiState);
+    }
+  };
+
+  const handleSyncVoiceprintFromRelay = async () => {
+    setVpBusy(true);
+    try {
+      const restored = await pullVoiceprintFromRelay();
+      if (restored) {
+        setAiState(restored);
+        toast("已从云端同步恢复本人声纹");
+      } else {
+        toast("云端暂未保存声纹，请先录制或导入一次", true);
+      }
+    } catch (e) {
+      toast((e as Error).message || "云端声纹同步失败", true);
+    } finally {
+      setVpBusy(false);
+    }
+  };
+
+  const handleAudioFileSelected = async (file: File | null | undefined) => {
+    if (!file || vpBusy) return;
+    setVpBusy(true);
+    try {
+      let current = await native.voiceAiState();
+      if (!current.svReady || !current.vadReady) {
+        toast("正在下载声纹提取模型，完成后自动导入…");
+        current = await native.voiceAiDownload("sv");
+        setAiState(current);
+      }
+      const pcmB64 = await decodeAudioFileToPcm16Base64(file);
+      const res = await native.voiceAiEnrollFromPcm(pcmB64);
+      setAiState(res.state);
+      void pushVoiceprintToRelay().catch(() => {});
+      toast(`已从音频提取声纹（${res.seconds.toFixed(1)}s），并同步开启只认我的声音`);
+    } catch (e) {
+      toast((e as Error).message || "音频提取声纹失败", true);
+    } finally {
+      setVpBusy(false);
+      if (audioImportRef.current) audioImportRef.current.value = "";
     }
   };
 
@@ -770,23 +853,78 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
                           : "已录入"
                         : "未录入"}
                     </PocketBadge>
+                    <PocketBadge tone={aiState.svReady ? "mint" : "neutral"}>
+                      {aiState.svReady ? "模型已就绪" : "首次需下载模型"}
+                    </PocketBadge>
                   </div>
-                  <div className="set-about">仅保留本人声音，忽略周围旁人说话</div>
+                  <div className="set-about">
+                    {aiState.svReady
+                      ? "仅保留本人声音，忽略周围旁人说话（模型已永久缓存本机）"
+                      : "首次录制或导入音频会下载约 68–210 MB 本地模型，下载一次永久缓存"}
+                  </div>
                 </div>
-                <div className="set-control" style={{ gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <div className="set-control" style={{ gap: 8, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  <input
+                    ref={audioImportRef}
+                    type="file"
+                    accept="audio/*,.wav,.mp3,.m4a,.aac,.flac,.caf,.ogg"
+                    style={{ display: "none" }}
+                    onChange={(e) => void handleAudioFileSelected(e.target.files?.[0])}
+                  />
                   {aiState.enrolled ? (
-                    <PocketSwitch
-                      checked={aiState.filter}
-                      onCheckedChange={(v) => void updateAiConfig({ filter: v })}
-                      label="只认我的声音"
-                    />
+                    <>
+                      <PocketSwitch
+                        checked={aiState.filter}
+                        onCheckedChange={(v) => void updateAiConfig({ filter: v })}
+                        label="只认我的声音"
+                      />
+                      <PocketSwitch
+                        checked={aiState.firstSpeaker}
+                        onCheckedChange={(v) => void updateAiConfig({ firstSpeaker: v })}
+                        label="首说话人锁定"
+                      />
+                      <PocketSelect
+                        aria-label="声纹识别灵敏度"
+                        value={String(
+                          (
+                            VOICEPRINT_SENSITIVITY_OPTIONS.find(
+                              (opt) => Math.abs(opt.value - aiState.threshold) < 0.02,
+                            ) ?? VOICEPRINT_SENSITIVITY_OPTIONS[1]
+                          ).value,
+                        )}
+                        onValueChange={(v) => void updateAiConfig({ threshold: Number(v) })}
+                        options={VOICEPRINT_SENSITIVITY_OPTIONS.map((opt) => ({
+                          value: String(opt.value),
+                          label: opt.label,
+                        }))}
+                      />
+                    </>
+                  ) : null}
+                  {server && !isMockServer(server) ? (
+                    <PocketButton
+                      size="sm"
+                      variant="ghost"
+                      disabled={vpBusy}
+                      onClick={() => void handleSyncVoiceprintFromRelay()}
+                    >
+                      云端同步
+                    </PocketButton>
                   ) : null}
                   <PocketButton
                     size="sm"
+                    variant="ghost"
+                    disabled={vpBusy || aiState.downloading}
+                    onClick={() => audioImportRef.current?.click()}
+                  >
+                    {vpBusy ? "处理中…" : "导入音频"}
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
                     variant={aiState.enrolled ? "soft" : "primary"}
+                    disabled={vpBusy}
                     onClick={() => setVpModalOpen(true)}
                   >
-                    {aiState.enrolled ? "管理声纹" : "录入与测试"}
+                    {aiState.enrolled ? "管理声纹" : "录制声纹"}
                   </PocketButton>
                 </div>
               </div>

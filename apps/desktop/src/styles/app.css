@@ -1326,6 +1326,10 @@ a {
   padding: 4px 2px;
   margin: 0;
   line-height: calc(22px * var(--ts, 1));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow-x: hidden;
   overflow-y: hidden;
   box-sizing: border-box;
 }

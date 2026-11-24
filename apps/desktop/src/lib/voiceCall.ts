@@ -374,6 +374,7 @@ interface PendingAudioRef {
 
 class WebVoiceSession {
   private ws: WebSocket | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private ctx: AudioContext | null = null;
   private outGain: GainNode | null = null;
   private outAnalyser: AnalyserNode | null = null;
@@ -686,6 +687,12 @@ class WebVoiceSession {
     const ws = new WebSocket(wsUrlFor(server, "/v1/assistant/live", token));
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = setTimeout(() => {
+      if (!this.ended && !this.reachedReady) {
+        this.cleanup("语音服务连接超时，请检查中转服务实时语音配置", true);
+      }
+    }, 8_000);
 
     ws.onopen = () => {
       if (this.ended) {
@@ -934,6 +941,10 @@ class WebVoiceSession {
       case "relay.state": {
         const st = str("state");
         if (st === "ready") {
+          if (this.connectTimer) {
+            clearTimeout(this.connectTimer);
+            this.connectTimer = null;
+          }
           if (!this.reachedReady) {
             this.reachedReady = true;
             this.startedAtMs = Date.now();
@@ -1162,6 +1173,10 @@ class WebVoiceSession {
     if (this.ended) return;
     this.ended = true;
     const wasHudShown = this.hudShown;
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
       this.pingTimer = null;

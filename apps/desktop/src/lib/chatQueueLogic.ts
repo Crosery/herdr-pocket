@@ -55,8 +55,9 @@ function rowStartTs(row: ChatRow): number {
 }
 
 function transcriptForm(row: Extract<ChatRow, { kind: "user" }>): string {
-  return row.attachedLines.length > 0
-    ? [row.text, ...row.attachedLines].filter(Boolean).join("\n")
+  const attached = row.attachedLines ?? [];
+  return attached.length > 0
+    ? [row.text, ...attached].filter(Boolean).join("\n")
     : row.text;
 }
 
@@ -232,6 +233,29 @@ export function interleaveOptimisticSends<T extends OutgoingSendLike>(
     out.push({ kind: "outgoing", send: qSend });
   }
   return out;
+}
+
+/**
+ * Filters terminal-side queued items that already appear inline as an optimistic outgoing
+ * bubble, in the app queue, in recent persisted user turns, or have just been injected.
+ */
+export function filterTerminalQueuedItems<T extends OutgoingSendLike>(
+  rawItems: readonly string[],
+  unmatched: readonly T[],
+  queuedTexts: readonly string[],
+  injectedTexts?: ReadonlySet<string> | readonly string[],
+  foldedRows?: readonly ChatRow[],
+): string[] {
+  const injectedList = injectedTexts ? Array.from(injectedTexts) : [];
+  const recentUsers = foldedRows ? foldedRows.slice(-8).filter((r) => r.kind === "user") : [];
+  return rawItems.filter((qText) => {
+    if (!qText.trim()) return false;
+    if (unmatched.some((u) => sameMessage(qText, u.text))) return false;
+    if (queuedTexts.some((q) => sameMessage(qText, q))) return false;
+    if (injectedList.some((inj) => sameMessage(qText, inj))) return false;
+    if (recentUsers.some((r) => sameMessage(qText, transcriptForm(r)))) return false;
+    return true;
+  });
 }
 
 /**

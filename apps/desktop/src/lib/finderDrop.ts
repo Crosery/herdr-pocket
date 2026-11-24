@@ -1,5 +1,5 @@
 import { isTauri } from "./bridge";
-import { dropKindOf, mediaTypeFor, type DropKind, type StagedAttachment } from "./dropPreview";
+import { dropKindOf, mediaTypeFor, shouldSkipVideoPreview, type DropKind, type StagedAttachment } from "./dropPreview";
 import { native } from "./native";
 
 export interface DraggedOsItem {
@@ -107,7 +107,10 @@ export function stageOsDraggedItems(
       ? "inode/directory"
       : mediaTypeFor(name) || "application/octet-stream";
     const kind: DropKind = item.isDir ? "file" : dropKindOf(name, mime);
-    const previewUrl = !item.isDir && isVisualDropKind(kind) ? pocketLocalUrl(cleanPath) : undefined;
+    const previewUrl =
+      !item.isDir && isVisualDropKind(kind) && !shouldSkipVideoPreview(kind, Math.max(0, item.size))
+        ? pocketLocalUrl(cleanPath)
+        : undefined;
 
     added.push({
       id: `att-os-${++osSeq}`,

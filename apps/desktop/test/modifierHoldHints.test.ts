@@ -8,7 +8,7 @@ import {
   remainingSuffixChip,
   shortcutsMatchingChordPrefix,
 } from "../src/shell/shortcuts.ts";
-import { chordFromOsModifiers, HOLD_DELAY_MS } from "../src/shell/useModifierHoldHints.ts";
+import { chordFromOsModifiers, HOLD_DELAY_MS, SpatialHint } from "../src/shell/useModifierHoldHints.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -59,8 +59,11 @@ test("shell.css places modifier chord HUD at top single-line and keeps statusbar
 
   const hudMatch = /\.v3-chord-hud\s*\{[^}]*\}/.exec(css);
   assert.ok(hudMatch, "found .v3-chord-hud block");
-  assert.equal(hudMatch[0].includes("top: 74px"), true);
+  assert.equal(hudMatch[0].includes("bottom: 0"), true);
+  assert.equal(hudMatch[0].includes("height: 28px"), true);
+  assert.equal(hudMatch[0].includes("top: 74px"), false);
   assert.equal(hudMatch[0].includes("flex-wrap: nowrap"), true);
+  assert.equal(SpatialHint({ shortcut: "newAgent", corner: "tr" }), null);
 
   const itemsMatch = /\.v3-chord-items\s*\{[^}]*\}/.exec(css);
   assert.ok(itemsMatch, "found .v3-chord-items block");
@@ -80,7 +83,7 @@ test("shell.css places modifier chord HUD at top single-line and keeps statusbar
 });
 
 test("OS HID modifier resolver suppresses phantom Command popups and hold delay avoids tap flicker", () => {
-  assert.ok(HOLD_DELAY_MS >= 400, `expected HOLD_DELAY_MS >= 400ms, got ${HOLD_DELAY_MS}`);
+  assert.ok(HOLD_DELAY_MS >= 600, `expected HOLD_DELAY_MS >= 600ms, got ${HOLD_DELAY_MS}`);
 
   // Unsupported OS never fabricates a chord
   assert.equal(

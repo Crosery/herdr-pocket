@@ -96,6 +96,15 @@ function HostToolCard({
   const [checking, setChecking] = useState(false);
   const [job, setJob] = useState<ToolUpdateJobSnapshot | null>(null);
   const pollRef = useRef<number | null>(null);
+  const finishedJobIdRef = useRef<string | null>(null);
+
+  const TOOL_LABELS: Record<string, string> = {
+    app: "Herdr 桌面版",
+    herdr: "Herdr CLI",
+    hc: "Herdr Core",
+    hostd: "Pocket 守护进程",
+    uniflo: "Uniflo",
+  };
 
   useEffect(() => {
     return () => {
@@ -113,11 +122,13 @@ function HostToolCard({
   const finishJob = (snap: ToolUpdateJobSnapshot) => {
     stopPolling();
     setJob(snap);
+    if (finishedJobIdRef.current === snap.jobId) return;
+    finishedJobIdRef.current = snap.jobId;
     void onRefresh(false);
     const failed = snap.completed.filter((c) => !c.ok);
     const updated = snap.completed.filter((c) => c.ok && (c.status === "updated" || c.status === "restarting"));
     if (failed.length > 0) {
-      toast(failed.map((f) => `${f.id}: ${f.message}`).join("；"), true);
+      toast(failed.map((f) => `${TOOL_LABELS[f.id] ?? f.id}：${f.message}`).join("；"), true);
     } else if (updated.length > 0) {
       toast(updated.map((u) => u.message).join(" · "));
     } else if (snap.completed.length > 0) {

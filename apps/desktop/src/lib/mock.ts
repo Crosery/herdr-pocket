@@ -1326,6 +1326,18 @@ export const mockApi = {
     if (method === "terminal.put") {
       return { paths: (params.files ?? []).map((f: any, i: number) => `/tmp/mock-${i}-${f.name}`) };
     }
+    if (method === "terminal.putBegin") {
+      return { uploadId: `mock-up-${Date.now()}`, chunkBytes: 2 * 1024 * 1024 };
+    }
+    if (method === "terminal.putChunk") {
+      return { receivedBytes: (Number(params.index ?? 0) + 1) * 1024 };
+    }
+    if (method === "terminal.putFinish") {
+      return { path: `/tmp/mock-large-${String(params.uploadId ?? "file")}.mp4` };
+    }
+    if (method === "terminal.putAbort") {
+      return { ok: true };
+    }
     if (method === "terminal.send") {
       const textStr = String(params.text ?? "");
       const modelMatch = /^\/model\s+(\S+)/i.exec(textStr.trim());

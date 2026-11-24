@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { PUT_LIMITS, sameMessage, splitFiles, textWithFiles, type Agent } from "@herdr-pocket/protocol";
-import { checkFiles, putLocal, putThrough, safeName, KEEP_MS } from "../src/put.ts";
+import { DIRECT_PUT_PREFIX, PUT_LIMITS, sameMessage, splitFiles, textWithFiles, type Agent } from "@herdr-pocket/protocol";
+import { ChunkedPutManager, checkFiles, putLocal, putThrough, safeName, KEEP_MS } from "../src/put.ts";
 import { HcAdapter } from "../src/hc.ts";
 import { Host } from "../src/host.ts";
 
@@ -195,4 +195,70 @@ test("terminal.put: checked pictures land beside the agent; an old hc and bad fi
   ro.h.agents = [agent("hc")];
   await assert.rejects(ro.put({ agent: "d/hc:t1", files: [jpeg()] }), (e: any) => e.code === "forbidden");
   ro.h.stop();
+});
+
+test("terminal.putBegin/putChunk/putFinish and direct P2P POST /v1/direct-put assemble large files safely", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hp-host-chunk-"));
+  const h = new Host({
+    config: { server: "http://127.0.0.1:9", token: "t", deviceId: "d", name: "test", directPort: 0 },
+    log: () => {},
+  });
+  h.filesDir = root;
+  h.agents = [agent("herdr")];
+  const x = h as unknown as {
+    handlers: Record<string, (p: unknown, from: string) => Promise<any>>;
+    startDirect: () => Promise<void>;
+  };
+  await x.startDirect();
+  try {
+    // 1. Relay chunked RPC upload
+    const p1 = Buffer.from("hello-");
+    const p2 = Buffer.from("chunked-video");
+    const fullRpc = Buffer.concat([p1, p2]);
+    const b1 = await x.handlers["terminal.putBegin"]!(
+      { agent: "d/herdr:t1", name: "demo clip.mp4", mime: "video/mp4", totalBytes: fullRpc.length },
+      "phone",
+    );
+    assert.ok(b1.uploadId && b1.directToken);
+    const c1 = await x.handlers["terminal.putChunk"]!({ uploadId: b1.uploadId, index: 0, data: fullRpc.toString("base64") }, "phone");
+    assert.equal(c1.receivedBytes, fullRpc.length);
+    await x.handlers["terminal.putAbort"]!({ uploadId: b1.uploadId }, "phone");
+
+    const seqMgr = new ChunkedPutManager({
+      filesDir: () => root,
+      putThroughHc: async (_id, f) => f,
+    });
+    const payload = Buffer.from("0123456789abcdef");
+    const sBegin = await seqMgr.begin({
+      agentKey: "d/herdr:t1",
+      source: "herdr",
+      localId: "t1",
+      name: "clip.mp4",
+      mime: "video/mp4",
+      totalBytes: payload.length,
+    });
+    await seqMgr.writeChunk(sBegin.uploadId, 0, payload.toString("base64"));
+    const fin1 = await seqMgr.finish(sBegin.uploadId);
+    assert.deepEqual(readFileSync(fin1.path), payload);
+    seqMgr.dispose();
+
+    // 2. Raw HTTP POST /v1/direct-put/<token> over DirectServer
+    const directPayload = Buffer.alloc(256 * 1024, 0x5a);
+    const b2 = await x.handlers["terminal.putBegin"]!(
+      { agent: "d/herdr:t1", name: "big-video.mp4", mime: "video/mp4", totalBytes: directPayload.length },
+      "phone",
+    );
+    assert.ok(h.direct.port && b2.directToken);
+    const upRes = await fetch(`http://127.0.0.1:${h.direct.port}${DIRECT_PUT_PREFIX}/${encodeURIComponent(b2.directToken)}`, {
+      method: "POST",
+      body: directPayload,
+    });
+    assert.equal(upRes.status, 200);
+    const upJson = (await upRes.json()) as { receivedBytes: number };
+    assert.equal(upJson.receivedBytes, directPayload.length);
+    const fin2 = await x.handlers["terminal.putFinish"]!({ uploadId: b2.uploadId }, "phone");
+    assert.equal(readFileSync(fin2.path).equals(directPayload), true);
+  } finally {
+    h.stop();
+  }
 });

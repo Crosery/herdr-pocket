@@ -1,4 +1,4 @@
-import type { PutFile } from "@herdr-pocket/protocol";
+import { LARGE_PUT_LIMITS, PUT_LIMITS, type PutFile } from "@herdr-pocket/protocol";
 import { resolveDropPath, type WorkspaceDragItem } from "./fileDrag";
 import { native } from "./native";
 
@@ -17,6 +17,11 @@ export const KIND_TEXT_ZH: Readonly<Record<DropKind, string>> = {
 
 const RASTER_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 const LOSSLESS_RASTER_LIMIT = Math.floor(1.5 * 1024 * 1024);
+export const MAX_INLINE_VIDEO_PREVIEW_BYTES = 32 * 1024 * 1024;
+
+export function shouldSkipVideoPreview(kind: DropKind, sizeBytes: number): boolean {
+  return kind === "video" && sizeBytes > MAX_INLINE_VIDEO_PREVIEW_BYTES;
+}
 
 const KIND_BY_EXTENSION: Readonly<Record<string, DropKind>> = {
   png: "image", jpg: "image", jpeg: "image", jfif: "image", webp: "image", gif: "image",
@@ -319,8 +324,8 @@ export async function prepareDroppedFiles(
     const kind = dropKindOf(file.name, mime);
     const name = file.name || "attachment";
 
-    let put: PutFile;
-    let encodedBytes: number;
+    let put: PutFile | undefined;
+    let encodedBytes = 0;
     if (kind === "image" && mime !== "image/svg+xml" && (!RASTER_MIMES.has(mime) || file.size > LOSSLESS_RASTER_LIMIT)) {
       const encoded = await encodeRasterToJpeg(file);
       put = encoded.put;
@@ -329,24 +334,31 @@ export async function prepareDroppedFiles(
         notice = `「${name}」压缩后仍超过 ${Math.floor(maxFileBytes / 1024 / 1024)} MB 上限`;
         continue;
       }
-    } else {
-      if (file.size > maxFileBytes) {
-        notice = `「${name}」超过 ${Math.floor(maxFileBytes / 1024 / 1024)} MB 上限`;
-        continue;
+      if (total + encodedBytes > maxTotalBytes) {
+        notice = `附件总大小一次最多 ${Math.floor(maxTotalBytes / 1024 / 1024)} MB`;
+        break;
+      }
+      total += encodedBytes;
+    } else if (file.size <= maxFileBytes && file.size <= PUT_LIMITS.fileBytes) {
+      if (total + file.size > maxTotalBytes) {
+        notice = `附件总大小一次最多 ${Math.floor(maxTotalBytes / 1024 / 1024)} MB`;
+        break;
       }
       const buf = new Uint8Array(await file.arrayBuffer());
       put = { name, mime: mime || "application/octet-stream", data: bytesToBase64(buf) };
       encodedBytes = buf.byteLength;
+      total += encodedBytes;
+    } else if (file.size <= LARGE_PUT_LIMITS.maxFileBytes) {
+      // Large non-image files (e.g. >5 MB videos) stream on send via P2P / chunked upload
+      // without loading hundreds of MB of base64 into JS memory during staging.
+      put = undefined;
+    } else {
+      notice = `「${name}」超过 ${Math.floor(LARGE_PUT_LIMITS.maxFileBytes / 1024 / 1024)} MB 上限`;
+      continue;
     }
-
-    if (total + encodedBytes > maxTotalBytes) {
-      notice = `附件总大小一次最多 ${Math.floor(maxTotalBytes / 1024 / 1024)} MB`;
-      break;
-    }
-    total += encodedBytes;
 
     let previewUrl: string | undefined;
-    if (needsObjectUrl(kind)) {
+    if (needsObjectUrl(kind) && !shouldSkipVideoPreview(kind, file.size)) {
       const blob = kind === "pdf" && file.type !== "application/pdf"
         ? new Blob([file], { type: "application/pdf" })
         : file;
@@ -357,10 +369,10 @@ export async function prepareDroppedFiles(
       id: `att-${++seq}`,
       sig,
       name,
-      mime: put.mime,
+      mime: put?.mime || mime || "application/octet-stream",
       size: file.size,
       kind,
-      put,
+      ...(put ? { put } : {}),
       file,
       previewUrl,
     });

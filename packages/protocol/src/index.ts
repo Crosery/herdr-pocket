@@ -382,6 +382,14 @@ export const PUT_LIMITS = {
   mimes: ["image/jpeg", "image/png", "image/webp", "image/gif"],
 } as const;
 
+/** Chunked / P2P streaming upload limits for large non-image media and archives. */
+export const LARGE_PUT_LIMITS = {
+  maxFileBytes: 1024 * 1024 * 1024,
+  chunkBytes: 2 * 1024 * 1024,
+} as const;
+
+export const DIRECT_PUT_PREFIX = "/v1/direct-put";
+
 /** The message an agent gets for a text with pictures: the text, then each picture's path on a line of its own. */
 export function textWithFiles(text: string, paths: string[]): string {
   return [text.trim(), ...paths].filter(Boolean).join("\n");
@@ -636,6 +644,20 @@ export interface RpcMethods {
    * Hosts before this call answer `unsupported`.
    */
   "terminal.put": { params: { agent: string; files: PutFile[] }; result: { paths: string[] } };
+  /** Starts a chunked/P2P large-file upload onto the agent host (returns uploadId + direct HTTP token). */
+  "terminal.putBegin": {
+    params: { agent: string; name: string; mime?: string; totalBytes: number };
+    result: { uploadId: string; chunkBytes: number; directToken?: string };
+  };
+  /** Appends a base64 chunk to a pending `terminal.putBegin` upload (relay fallback). */
+  "terminal.putChunk": {
+    params: { uploadId: string; index: number; data: string };
+    result: { receivedBytes: number };
+  };
+  /** Finalizes a chunked/P2P upload and moves it into the agent's file directory / `hc put`. */
+  "terminal.putFinish": { params: { uploadId: string }; result: { path: string } };
+  /** Aborts an incomplete large-file upload and cleans up its staging directory. */
+  "terminal.putAbort": { params: { uploadId: string }; result: { ok: true } };
   /** Conversation of the agent's matched Uniflo session, newest last. */
   "session.events": {
     /** `sub`: read a subagent session of this agent instead (from `session.children`). */

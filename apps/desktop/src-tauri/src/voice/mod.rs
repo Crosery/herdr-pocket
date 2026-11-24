@@ -42,6 +42,7 @@ pub const CALL_MIC_EVENT: &str = "voice-call://mic";
 const TAP_MS: u64 = 650;
 
 static CALL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECORDING_HOTKEY: AtomicBool = AtomicBool::new(false);
 static NEXT_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 static CACHED_VOICE_SOUNDS: AtomicBool = AtomicBool::new(true);
@@ -140,6 +141,11 @@ fn status_cell() -> &'static Mutex<VoiceStatus> {
 
 pub fn status() -> VoiceStatus {
     status_cell().lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn voice_set_recording_hotkey(recording: bool) {
+    RECORDING_HOTKEY.store(recording, Ordering::Relaxed);
 }
 
 pub(crate) fn on_shortcut(shortcut: Shortcut, pressed: bool) {
@@ -741,7 +747,10 @@ impl Controller {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Shortcut { shortcut, pressed } => {
-                if !self.cfg.voice_enabled || Some(shortcut) != self.registered {
+                if RECORDING_HOTKEY.load(Ordering::Relaxed)
+                    || !self.cfg.voice_enabled
+                    || Some(shortcut) != self.registered
+                {
                     return;
                 }
                 if pressed {
@@ -749,7 +758,7 @@ impl Controller {
                 }
             }
             Msg::Key(ev) => {
-                if !self.cfg.voice_enabled {
+                if RECORDING_HOTKEY.load(Ordering::Relaxed) || !self.cfg.voice_enabled {
                     return;
                 }
                 if self.tap.on_event(ev, Instant::now()) {

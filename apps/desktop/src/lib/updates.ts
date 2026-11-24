@@ -21,7 +21,8 @@ import {
   type ReleaseUpdateInfo,
 } from "./bridge";
 import { clientConfigStore } from "./config";
-import { createStore } from "./store";
+import { createStore, settingsStore } from "./store";
+import { isMockServer } from "./mock";
 import { logger } from "./log";
 import { flushWorkspaceStateNow } from "./workspacePersist";
 
@@ -342,10 +343,26 @@ export async function startUpdateDownload(): Promise<void> {
       throw new Error("未获取到安装包 SHA-256 校验值（可能仍在发布上传中）");
     }
 
+    const relayUrls: string[] = [];
+    const srv = settingsStore.get().server?.trim();
+    if (srv && !isMockServer(srv)) {
+      try {
+        const parsed = new URL(srv);
+        const isLocalHttp = parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
+        if (parsed.protocol === "https:" || isLocalHttp) {
+          relayUrls.push(`${srv.replace(/\/+$/, "")}/v1/releases/download/v${info.latest}/${assetName}`);
+        }
+      } catch {
+        // ignore invalid configured server URL
+      }
+    }
+    const baseUrls = info.downloadUrls.length ? info.downloadUrls : [info.downloadUrl];
+    const dedupedUrls = [...new Set([...relayUrls, ...baseUrls])];
+
     const res = await downloadAndStageUpdate({
       version: info.latest,
       assetName,
-      urls: info.downloadUrls.length ? info.downloadUrls : [info.downloadUrl],
+      urls: dedupedUrls,
       expectedSha256: sha256,
     });
     if (res.ready) {

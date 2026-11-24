@@ -1,21 +1,16 @@
-import { createElement, useEffect } from "react";
+import { useEffect } from "react";
 import { native, type OsModifierState } from "../lib/native";
 import { createStore, settingsStore } from "../lib/store";
 import { isImeKeyEvent } from "../lib/terminalIme";
 import { trackModifierGhostBlocked, trackModifierHudHide, trackModifierHudShow } from "../lib/uiTelemetry";
 import {
   chordFromModifierEvent,
-  chordIncludesPrefix,
-  chordOfKeys,
   IS_MAC,
-  remainingSuffixChip,
-  SHORTCUTS,
-  shortcutText,
   type ShortcutId,
   type ShortcutModifierChord,
 } from "./shortcuts";
 
-export const HOLD_DELAY_MS = 450;
+export const HOLD_DELAY_MS = 600;
 const OS_MODIFIER_POLL_MS = 200;
 
 export const modifierChordStore = createStore<ShortcutModifierChord | null>(null);
@@ -45,63 +40,17 @@ function isModifierKeyName(key: string): boolean {
   return key === "Meta" || key === "Control" || key === "Alt" || key === "Shift";
 }
 
-function inferChordFromText(text: string): ShortcutModifierChord {
-  if (/(?:⌥⇧|Alt\+Shift)/i.test(text)) return "Mod+Alt+Shift";
-  if (/(?:⇧|Shift)/i.test(text)) return "Mod+Shift";
-  if (/(?:⌥|Alt)/i.test(text)) return "Mod+Alt";
-  return "Mod";
-}
-
-function parseDisplayKeys(displayText: string, chord: ShortcutModifierChord): string[] {
-  const cleaned = displayText
-    .replace(/^⌘/, "")
-    .replace(/^Ctrl\+/i, "")
-    .replace(/^[⌥⇧]+/, "")
-    .replace(/^(?:Alt\+|Shift\+)+/i, "");
-  const parts = chord.split("+");
-  return [...parts, cleaned || displayText];
-}
-
 export type SpatialHintCorner = "tr" | "br" | "center" | "right" | "stack" | "top" | "top-right" | "bottom";
 
-/** Pure CSS-toggled floating keycap badge matching held modifier prefix `[data-shortcut-hints]`. */
-export function SpatialHint({
-  text,
-  shortcut,
-  chord,
-  corner = "tr",
-  className = "",
-}: {
+/** Retired floating button/tab corner badges (would overlap adjacent controls); Chord HUD lives strictly inside .v3-status. */
+export function SpatialHint(_props: {
   text?: string;
   shortcut?: ShortcutId;
   chord?: ShortcutModifierChord;
   corner?: SpatialHintCorner;
   className?: string;
-}) {
-  const displayText = text ?? (shortcut ? shortcutText(shortcut) : "");
-  if (!displayText) return null;
-  const def = shortcut ? SHORTCUTS.find((x) => x.id === shortcut) : undefined;
-  const resolvedChord = chord ?? (def ? chordOfKeys(def.keys) ?? inferChordFromText(displayText) : inferChordFromText(displayText));
-  const resolvedKeys = def?.keys ?? parseDisplayKeys(displayText, resolvedChord);
-  const chipProps: Record<string, string> = {};
-  if (chordIncludesPrefix(resolvedChord, "Mod")) {
-    chipProps["data-chip-mod"] = remainingSuffixChip(resolvedKeys, "Mod");
-  }
-  if (chordIncludesPrefix(resolvedChord, "Mod+Shift")) {
-    chipProps["data-chip-mod-shift"] = remainingSuffixChip(resolvedKeys, "Mod+Shift");
-  }
-  if (chordIncludesPrefix(resolvedChord, "Mod+Alt")) {
-    chipProps["data-chip-mod-alt"] = remainingSuffixChip(resolvedKeys, "Mod+Alt");
-  }
-  if (chordIncludesPrefix(resolvedChord, "Mod+Alt+Shift")) {
-    chipProps["data-chip-mod-alt-shift"] = remainingSuffixChip(resolvedKeys, "Mod+Alt+Shift");
-  }
-  return createElement("kbd", {
-    className: `v3-spatial-hint pos-${corner}${className ? ` ${className}` : ""}`,
-    "data-chord": resolvedChord,
-    "aria-hidden": "true",
-    ...chipProps,
-  });
+}): null {
+  return null;
 }
 
 /**
@@ -328,6 +277,7 @@ export function useModifierHoldHints(): void {
     window.addEventListener("wheel", onWheel, true);
     window.addEventListener("pointermove", onPointerMove, true);
     window.addEventListener("blur", onBlur);
+    window.addEventListener("pocket:voice-term-input", onImeCancel);
     document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
@@ -348,6 +298,7 @@ export function useModifierHoldHints(): void {
       window.removeEventListener("wheel", onWheel, true);
       window.removeEventListener("pointermove", onPointerMove, true);
       window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pocket:voice-term-input", onImeCancel);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [enabled]);

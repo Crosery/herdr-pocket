@@ -79,10 +79,14 @@ test("UTF-8 without a platform codec gives the same bytes as Node's", () => {
   }
 });
 
-test("addresses offered: LAN first, then VPN, no loopback or link-local", () => {
+test("addresses offered: LAN first, then VPN, no loopback, link-local, or fake-IP TUN", () => {
   const nets = {
     lo0: [{ address: "127.0.0.1", family: "IPv4", internal: true }],
     utun4: [{ address: "100.77.43.217", family: "IPv4", internal: false }],
+    utun9: [
+      { address: "198.18.0.1", family: "IPv4", internal: false },
+      { address: "198.19.1.2", family: "IPv4", internal: false },
+    ],
     en0: [{ address: "192.168.8.20", family: "IPv4", internal: false }, { address: "fe80::1", family: "IPv6", internal: false }],
     en9: [{ address: "169.254.3.4", family: "IPv4", internal: false }],
   } as never;
