@@ -783,6 +783,7 @@ pub fn run() {
             commands::local_reveal_in_folder,
             commands::local_open_file,
             commands::local_agent_btw,
+            commands::query_os_modifiers,
             updater::update_fetch_github_latest,
             updater::update_download_and_stage,
             updater::update_restart_and_apply,

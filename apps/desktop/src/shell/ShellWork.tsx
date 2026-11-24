@@ -634,6 +634,8 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
   const wheelLockRef = useRef(0);
   const tabElsRef = useRef(new Map<string, HTMLDivElement>());
   const prevRectsRef = useRef(new Map<string, number>());
+  const prevTabSpaceRef = useRef<string | null>(selectedSpace);
+  const prevTabIdsKeyRef = useRef<string>("");
   const tabAnimsRef = useRef(new WeakMap<HTMLDivElement, Animation>());
 
   const agentByKey = useMemo(() => new Map(allAgents(agentsMap).map((a) => [a.key, a] as const)), [agentsMap]);
@@ -678,9 +680,13 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
     };
   }, [toast]);
 
-  // Smooth FLIP slide animation via Web Animations API so layout transform never gets stuck if renders overlap.
+  // Smooth FLIP slide animation via Web Animations API only on intra-space tab list additions/removals/reorders.
   useLayoutEffect(() => {
     const reduced = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const nextTabIdsKey = visibleTabs.map((t) => t.id).join("\u0001");
+    const sameSpace = prevTabSpaceRef.current === selectedSpace;
+    const idsChanged = prevTabIdsKeyRef.current !== "" && nextTabIdsKey !== prevTabIdsKeyRef.current;
+    const shouldAnimate = !reduced && sameSpace && idsChanged && prevRectsRef.current.size > 0;
     const nextRects = new Map<string, number>();
     for (const t of visibleTabs) {
       const el = tabElsRef.current.get(t.id);
@@ -689,7 +695,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       tabAnimsRef.current.delete(el);
       nextRects.set(t.id, el.getBoundingClientRect().left);
     }
-    if (!reduced && prevRectsRef.current.size > 0) {
+    if (shouldAnimate) {
       for (const t of visibleTabs) {
         const el = tabElsRef.current.get(t.id);
         const prevLeft = prevRectsRef.current.get(t.id);
@@ -708,7 +714,9 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       }
     }
     prevRectsRef.current = nextRects;
-  }, [visibleTabs]);
+    prevTabSpaceRef.current = selectedSpace;
+    prevTabIdsKeyRef.current = nextTabIdsKey;
+  }, [selectedSpace, visibleTabs]);
 
   const panelBtn = (id: PanelId, label: string, Icon: typeof Plus, keys?: string) => (
     <button

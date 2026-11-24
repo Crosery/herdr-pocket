@@ -8,6 +8,7 @@ import {
   remainingSuffixChip,
   shortcutsMatchingChordPrefix,
 } from "../src/shell/shortcuts.ts";
+import { chordFromOsModifiers, HOLD_DELAY_MS } from "../src/shell/useModifierHoldHints.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -72,4 +73,42 @@ test("shell.css places modifier chord HUD at top single-line and keeps statusbar
   const statusBtnMatch = /\.v3-status-btn\s*\{[^}]*\}/.exec(css);
   assert.ok(statusBtnMatch, "found .v3-status-btn block");
   assert.equal(statusBtnMatch[0].includes("display: inline-flex"), true);
+
+  const inlineKeysMatch = /\.v3-keys-text\[data-inline-chord="Mod"\]\s*\{[^}]*\}/.exec(css);
+  assert.ok(inlineKeysMatch, "found resting .v3-keys-text[data-inline-chord=\"Mod\"] block");
+  assert.equal(inlineKeysMatch[0].includes("padding: 1px 5px"), true);
+});
+
+test("OS HID modifier resolver suppresses phantom Command popups and hold delay avoids tap flicker", () => {
+  assert.ok(HOLD_DELAY_MS >= 400, `expected HOLD_DELAY_MS >= 400ms, got ${HOLD_DELAY_MS}`);
+
+  // Unsupported OS never fabricates a chord
+  assert.equal(
+    chordFromOsModifiers({ supported: false, meta: true, ctrl: false, alt: false, shift: false }, true),
+    null,
+  );
+  // Released Command on macOS returns null
+  assert.equal(
+    chordFromOsModifiers({ supported: true, meta: false, ctrl: false, alt: false, shift: false }, true),
+    null,
+  );
+  // Held Command layers on macOS
+  assert.equal(
+    chordFromOsModifiers({ supported: true, meta: true, ctrl: false, alt: false, shift: false }, true),
+    "Mod",
+  );
+  assert.equal(
+    chordFromOsModifiers({ supported: true, meta: true, ctrl: false, alt: true, shift: true }, true),
+    "Mod+Alt+Shift",
+  );
+  // Ctrl+Cmd on macOS does not trigger Mod
+  assert.equal(
+    chordFromOsModifiers({ supported: true, meta: true, ctrl: true, alt: false, shift: false }, true),
+    null,
+  );
+  // Windows uses Ctrl as Mod
+  assert.equal(
+    chordFromOsModifiers({ supported: true, meta: false, ctrl: true, alt: false, shift: true }, false),
+    "Mod+Shift",
+  );
 });

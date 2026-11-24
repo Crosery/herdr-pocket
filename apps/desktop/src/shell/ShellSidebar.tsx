@@ -102,6 +102,9 @@ export function ShellSidebar({
   const [renamingSpace, setRenamingSpace] = useState(false);
   const [spaceMenu, setSpaceMenu] = useState<{ x: number; y: number; space: SidebarSpace } | null>(null);
   const [agentMenu, setAgentMenu] = useState<{ x: number; y: number; agent: Agent } | null>(null);
+  const [hoverFreeze, setHoverFreeze] = useState(false);
+  const frozenOrderRef = useRef<Map<string, string[]>>(new Map());
+  const stableGroupOrderRef = useRef<Map<string, string[]>>(new Map());
   const customSpaceIcons = spaceIconStore.use((m) => m);
   const toast = useToast();
   const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k), spacesMap);
@@ -223,6 +226,8 @@ export function ShellSidebar({
     writeJson(FOLD_KEY, next);
   };
   const setSort = (v: "status" | "recent") => {
+    stableGroupOrderRef.current.clear();
+    frozenOrderRef.current.clear();
     setSortState(v);
     writeJson(SORT_KEY, v);
   };
@@ -253,9 +258,6 @@ export function ShellSidebar({
   const inScope = agents;
   const primaryMachineId = localHostId || machines[0]?.id || null;
 
-  const [hoverFreeze, setHoverFreeze] = useState(false);
-  const frozenOrderRef = useRef<Map<string, string[]>>(new Map());
-
   const groups = useMemo(() => {
     const raw =
       sort === "recent"
@@ -266,11 +268,32 @@ export function ShellSidebar({
               const g = listGroup(a, devices);
               by.set(g, [...(by.get(g) ?? []), a]);
             }
-            return LIST_GROUPS.filter((g) => by.get(g.key)?.length).map((g) => ({
-              key: g.key,
-              title: g.title,
-              list: by.get(g.key)!.sort((x, y) => lastChange(y) - lastChange(x)),
-            }));
+            return LIST_GROUPS.filter((g) => by.get(g.key)?.length).map((g) => {
+              const items = by.get(g.key)!;
+              const prevOrder = stableGroupOrderRef.current.get(g.key);
+              if (!prevOrder?.length) {
+                return {
+                  key: g.key,
+                  title: g.title,
+                  list: items.sort((x, y) => lastChange(y) - lastChange(x)),
+                };
+              }
+              const prevRank = new Map<string, number>();
+              prevOrder.forEach((k, idx) => prevRank.set(k, idx));
+              const newlyEntered: Agent[] = [];
+              const existing: Agent[] = [];
+              for (const item of items) {
+                if (prevRank.has(item.key)) existing.push(item);
+                else newlyEntered.push(item);
+              }
+              newlyEntered.sort((x, y) => lastChange(y) - lastChange(x));
+              existing.sort((x, y) => prevRank.get(x.key)! - prevRank.get(y.key)!);
+              return {
+                key: g.key,
+                title: g.title,
+                list: [...newlyEntered, ...existing],
+              };
+            });
           })();
 
     if (!hoverFreeze) {
@@ -279,6 +302,7 @@ export function ShellSidebar({
         nextMap.set(g.key, g.list.map((a) => a.key));
       }
       frozenOrderRef.current = nextMap;
+      stableGroupOrderRef.current = nextMap;
       return raw;
     }
 

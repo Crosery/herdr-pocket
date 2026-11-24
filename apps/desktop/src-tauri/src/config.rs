@@ -90,7 +90,7 @@ impl Default for Native {
             close_to_tray: false,
             launch_at_login: false,
             launch_at_login_set: false,
-            dynamic_island: true,
+            dynamic_island: false,
         }
     }
 }

@@ -620,6 +620,7 @@ export function setSelectedSpace(
   selectedSpace: string | null,
   lookupAgent: (agentKey: string) => AgentSpaceRef | undefined = makeLiveAgentLookup(),
   hostSpacesMap: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]> = liveStore.get().spaces,
+  opts?: { trigger?: "user" | "auto" | "shortcut" },
 ): void {
   set((s) => {
     const prevScope = s.selectedSpace ?? ALL_SPACES_KEY;
@@ -639,6 +640,7 @@ export function setSelectedSpace(
         allSpaces: selectedSpace === null,
         visibleTabs: nextVisible.length,
         hasActive: Boolean(nextActive),
+        trigger: opts?.trigger ?? "user",
       });
     }
     return {
@@ -841,6 +843,7 @@ export function openAgentTab(
     lookupAgent?: (key: string) => AgentSpaceRef | undefined;
     spacesMap?: Record<string, readonly Pick<SpaceInfo, "id" | "name">[]>;
     followSpace?: boolean;
+    trigger?: "user" | "auto" | "shortcut" | "attention";
     docMeta?: {
       docHostId: string;
       docSpaceId?: string;
@@ -900,6 +903,10 @@ export function openAgentTab(
     logAction("ui", "ui.tab.focus", {
       kind: hit.tab.kind,
       mode: mode ?? (hit.leaf.content.kind === "agent" ? hit.leaf.content.mode : undefined),
+      spaceChanged: nextSpace !== s.selectedSpace,
+      splitPanes: tabLeaves(hit.tab).length,
+      totalTabs: s.tabs.length,
+      trigger: opts?.trigger ?? "user",
     });
     return;
   }
@@ -919,7 +926,12 @@ export function openAgentTab(
     ...(mode ? { mode } : {}),
     ...docFields,
   };
-  logAction("ui", "ui.tab.open", { kind: "agent", mode: mode ?? "default", tabsAfter: s.tabs.length + 1 });
+  logAction("ui", "ui.tab.open", {
+    kind: "agent",
+    mode: mode ?? "default",
+    tabsAfter: s.tabs.length + 1,
+    trigger: opts?.trigger ?? "user",
+  });
   set({
     tabs: [...s.tabs, tab],
     selectedSpace: nextSpace,
@@ -1451,6 +1463,7 @@ export function toggleZoomTabPane(tabId: string, paneId?: string): void {
     const unzoom = tab.split?.zoomedPaneId === targetId;
     const nextZoom = unzoom ? null : targetId;
     recordPaneFocus(tabId, targetId);
+    logAction("ui", "ui.split.zoom", { zoomed: !unzoom, splitPanes: leaves.length });
     return {
       ...s,
       tabs: s.tabs.map((t) => (t.id === tabId ? applyRootToTab(t, tabRootNode(t), targetId, nextZoom) : t)),
@@ -1645,6 +1658,7 @@ export function unsplitTabToTabs(tabId: string): void {
     const nextActiveId = expanded[focusedIdx]?.id ?? tabId;
     const nextTabs = [...s.tabs.slice(0, tabIdx), ...expanded, ...s.tabs.slice(tabIdx + 1)];
     const scopeKey = s.selectedSpace ?? ALL_SPACES_KEY;
+    logAction("ui", "ui.split.unsplit", { expandedTabs: expanded.length });
     return {
       ...s,
       tabs: nextTabs,
@@ -1744,7 +1758,7 @@ export function closeTabsForSpace(
   });
 }
 
-export function setActiveTab(id: string): void {
+export function setActiveTab(id: string, opts?: { trigger?: "click" | "shortcut" | "palette" | "user" }): void {
   const lookup = makeLiveAgentLookup();
   const spacesMap = liveStore.get().spaces;
   set((s) => {
@@ -1763,6 +1777,9 @@ export function setActiveTab(id: string): void {
       logAction("ui", "ui.tab.switch", {
         kind: target.kind,
         spaceChanged: nextSpace !== s.selectedSpace,
+        splitPanes: tabLeaves(target).length,
+        totalTabs: s.tabs.length,
+        trigger: opts?.trigger ?? "user",
       });
     }
     return {
@@ -1780,9 +1797,18 @@ export function cycleTab(step: 1 | -1, visibleTabs?: ShellTab[]): void {
   const list = visibleTabs && visibleTabs.length ? visibleTabs : s.tabs;
   if (!list.length) return;
   const i = Math.max(0, list.findIndex((t) => t.id === s.active));
-  const nextId = list[(i + step + list.length) % list.length]!.id;
+  const target = list[(i + step + list.length) % list.length]!;
+  if (s.active !== target.id) {
+    logAction("ui", "ui.tab.switch", {
+      kind: target.kind,
+      spaceChanged: false,
+      splitPanes: tabLeaves(target).length,
+      totalTabs: s.tabs.length,
+      trigger: "shortcut",
+    });
+  }
   set({
-    ...activationTransition(s, nextId, s.selectedSpace, makeLiveAgentLookup(), liveStore.get().spaces),
+    ...activationTransition(s, target.id, s.selectedSpace, makeLiveAgentLookup(), liveStore.get().spaces),
   });
 }
 

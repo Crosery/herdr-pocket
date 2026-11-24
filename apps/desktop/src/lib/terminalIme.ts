@@ -15,9 +15,18 @@ export interface TerminalImeBridge {
   dispose(): void;
 }
 
-const INPUT_SETTLE_MS = 6;
-const COMP_SETTLE_MS = 8;
+export type TerminalImeTelemetryEvent = "rescue_xpc" | "rescue_comp" | "paste_dedup";
+
+export interface AttachTerminalImeOptions {
+  onTelemetry?: (event: TerminalImeTelemetryEvent, meta: Record<string, number | string | boolean>) => void;
+}
+
+const INPUT_SETTLE_MS = 12;
+const COMP_SETTLE_MS = 14;
+const PASTE_SUPPRESS_MS = 80;
 const COMMIT_MATCH_WINDOW_MS = 120;
+const IDLE_COMPACT_AFTER_MS = 2_500;
+const IDLE_COMPACT_MIN_LEN = 16_384;
 const COMMIT_INPUT_TYPES = new Set([
   "insertText",
   "insertFromComposition",
@@ -43,7 +52,7 @@ export interface CompositionOverlayMetrics {
   naturalHeight: number;
 }
 
-/** Keeps active IME / voice dictation preedit overlays inside `.xterm-screen` instead of clipping off the right/bottom edges. */
+/** Keeps active IME / voice dictation preedit inline and inside `.xterm-screen` only when overflowing edges. */
 export function clampCompositionOverlayLayout(m: CompositionOverlayMetrics): {
   left: number;
   top: number;
@@ -51,14 +60,14 @@ export function clampCompositionOverlayLayout(m: CompositionOverlayMetrics): {
 } {
   const screenWidth = Math.max(80, m.screenWidth);
   const screenHeight = Math.max(24, m.screenHeight);
-  const maxWidth = Math.max(80, screenWidth - 8);
+  const maxWidth = Math.max(80, screenWidth - 4);
   const width = Math.min(Math.max(1, m.naturalWidth), maxWidth);
   const height = Math.max(1, m.naturalHeight || m.cellHeight || 18);
-  const left = Math.max(4, Math.min(m.cursorLeft, screenWidth - width - 4));
-  const bottomMargin = screenHeight >= 160 ? 28 : 4;
-  let top = Math.max(4, m.cursorTop);
+  const left = Math.max(0, Math.min(m.cursorLeft, screenWidth - width - 2));
+  const bottomMargin = 2;
+  let top = Math.max(0, m.cursorTop);
   if (top + height > screenHeight - bottomMargin) {
-    top = Math.max(4, Math.min(m.cursorTop - height - 4, screenHeight - height - bottomMargin));
+    top = Math.max(0, Math.min(m.cursorTop - height - 2, screenHeight - height - bottomMargin));
   }
   return { left: Math.round(left), top: Math.round(top), maxWidth: Math.round(maxWidth) };
 }
@@ -104,11 +113,12 @@ interface PendingXtermCommit {
 
 /**
  * Bridges macOS WKWebView & desktop browser IME commits (`。`, `，`, `？`, `“”`, phrases, voice IME)
- * onto xterm.js without duplicate sends, stuck preedit boxes, or swallowed XPC commits.
+ * onto xterm.js without duplicate sends, wiped textarea offsets, or swallowed XPC commits.
  */
 export function attachTerminalImeBridge(
   textarea: HTMLTextAreaElement | null | undefined,
   onCommit: (data: string) => void,
+  opts?: AttachTerminalImeOptions,
 ): TerminalImeBridge {
   let composing = false;
   let emittedSeq = 0;
@@ -116,10 +126,18 @@ export function attachTerminalImeBridge(
   let captureSeq: number | null = null;
   let lastCompEnd: { data: string; at: number } | null = null;
   let lastPasteAt = 0;
-  let clampingOverlay = false;
-  let compStyleObserver: MutationObserver | null = null;
+  let lastActivityAt = Date.now();
+  let compactTimer: ReturnType<typeof setTimeout> | null = null;
   const xtermCommits: PendingXtermCommit[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
+
+  const emitTelemetry = (event: TerminalImeTelemetryEvent, meta: Record<string, number | string | boolean>) => {
+    try {
+      opts?.onTelemetry?.(event, meta);
+    } catch {
+      // ignore telemetry failures
+    }
+  };
 
   const pruneCommits = (now: number) => {
     while (xtermCommits.length > 0 && now - xtermCommits[0]!.at > COMMIT_MATCH_WINDOW_MS) {
@@ -149,10 +167,10 @@ export function attachTerminalImeBridge(
 
   const handleXtermData = (data: string) => {
     if (!data) return;
+    lastActivityAt = Date.now();
     emittedSeq += 1;
-    const now = Date.now();
-    pruneCommits(now);
-    xtermCommits.push({ data, at: now });
+    pruneCommits(lastActivityAt);
+    xtermCommits.push({ data, at: lastActivityAt });
     if (xtermCommits.length > 32) xtermCommits.shift();
     onCommit(data);
   };
@@ -176,6 +194,19 @@ export function attachTerminalImeBridge(
       fn();
     }, ms);
     timers.add(id);
+  };
+
+  // Never reset textarea.value during active typing; xterm CompositionHelper relies on monotonic offsets.
+  // Only reclaim unbounded growth after prolonged idle when no composition is active.
+  const scheduleLongIdleCompact = () => {
+    if (textarea.value.length <= IDLE_COMPACT_MIN_LEN) return;
+    if (compactTimer !== null) clearTimeout(compactTimer);
+    compactTimer = setTimeout(() => {
+      compactTimer = null;
+      if (!composing && textarea.value.length > IDLE_COMPACT_MIN_LEN && Date.now() - lastActivityAt >= IDLE_COMPACT_AFTER_MS) {
+        textarea.value = "";
+      }
+    }, IDLE_COMPACT_AFTER_MS);
   };
 
   const findCompositionView = (): HTMLElement | null => {
@@ -203,16 +234,8 @@ export function attachTerminalImeBridge(
     return null;
   };
 
-  const stopCompObserver = () => {
-    if (compStyleObserver) {
-      compStyleObserver.disconnect();
-      compStyleObserver = null;
-    }
-  };
-
   const clearStuckCompositionView = () => {
     if (composing) return;
-    stopCompObserver();
     const compView = findCompositionView();
     if (!compView) return;
     compView.classList?.remove("active");
@@ -220,62 +243,39 @@ export function attachTerminalImeBridge(
   };
 
   const clampCompositionOverlay = () => {
-    if (!composing || clampingOverlay) return;
+    if (!composing) return;
     const compView = findCompositionView();
     const screenEl = findScreenElement();
     if (!compView || !screenEl) return;
     const screenRect = screenEl.getBoundingClientRect();
     if (screenRect.width <= 0 || screenRect.height <= 0) return;
 
-    clampingOverlay = true;
-    try {
-      const preMaxWidth = Math.max(80, Math.round(screenRect.width - 8));
-      if (compView.style) {
-        compView.style.maxWidth = `${preMaxWidth}px`;
-      }
-      const taLeft = textarea.style ? parseFloat(textarea.style.left || "") : Number.NaN;
-      const taTop = textarea.style ? parseFloat(textarea.style.top || "") : Number.NaN;
-      const curLeft = Number.isFinite(taLeft) && taLeft >= 0 ? taLeft : parseFloat(compView.style?.left || "0") || 0;
-      const curTop = Number.isFinite(taTop) && taTop >= 0 ? taTop : parseFloat(compView.style?.top || "0") || 0;
-      const cellH = parseFloat(compView.style?.lineHeight || compView.style?.height || "18") || 18;
-      const laidOut = clampCompositionOverlayLayout({
-        cursorLeft: curLeft,
-        cursorTop: curTop,
-        cellHeight: cellH,
-        screenWidth: screenRect.width,
-        screenHeight: screenRect.height,
-        naturalWidth: compView.offsetWidth || Math.min(screenRect.width, (compView.textContent?.length ?? 1) * 14),
-        naturalHeight: compView.offsetHeight || cellH,
-      });
-      if (compView.style) {
-        compView.style.maxWidth = `${laidOut.maxWidth}px`;
+    const preMaxWidth = Math.max(80, Math.round(screenRect.width - 4));
+    if (compView.style) {
+      compView.style.maxWidth = `${preMaxWidth}px`;
+    }
+    const taLeft = textarea.style ? parseFloat(textarea.style.left || "") : Number.NaN;
+    const taTop = textarea.style ? parseFloat(textarea.style.top || "") : Number.NaN;
+    const curLeft = Number.isFinite(taLeft) && taLeft >= 0 ? taLeft : parseFloat(compView.style?.left || "0") || 0;
+    const curTop = Number.isFinite(taTop) && taTop >= 0 ? taTop : parseFloat(compView.style?.top || "0") || 0;
+    const cellH = parseFloat(compView.style?.lineHeight || compView.style?.height || "18") || 18;
+    const laidOut = clampCompositionOverlayLayout({
+      cursorLeft: curLeft,
+      cursorTop: curTop,
+      cellHeight: cellH,
+      screenWidth: screenRect.width,
+      screenHeight: screenRect.height,
+      naturalWidth: compView.offsetWidth || Math.min(screenRect.width, (compView.textContent?.length ?? 1) * 14),
+      naturalHeight: compView.offsetHeight || cellH,
+    });
+    if (compView.style) {
+      compView.style.maxWidth = `${laidOut.maxWidth}px`;
+      if (laidOut.left !== Math.round(curLeft)) {
         compView.style.left = `${laidOut.left}px`;
+      }
+      if (laidOut.top !== Math.round(curTop)) {
         compView.style.top = `${laidOut.top}px`;
       }
-      if (textarea.style) {
-        textarea.style.width = "24px";
-        textarea.style.maxWidth = "48px";
-        textarea.style.height = `${Math.max(16, Math.round(cellH))}px`;
-      }
-    } finally {
-      clampingOverlay = false;
-    }
-  };
-
-  const ensureCompObserver = () => {
-    if (compStyleObserver || typeof MutationObserver === "undefined") return;
-    const compView = findCompositionView();
-    if (!compView || typeof Node === "undefined" || !(compView instanceof Node)) return;
-    compStyleObserver = new MutationObserver(() => {
-      if (composing && !clampingOverlay) clampCompositionOverlay();
-    });
-    compStyleObserver.observe(compView, { attributes: true, attributeFilter: ["style"] });
-  };
-
-  const resetTextareaIfIdle = () => {
-    if (!composing) {
-      if (textarea.value) textarea.value = "";
-      clearStuckCompositionView();
     }
   };
 
@@ -283,69 +283,60 @@ export function attachTerminalImeBridge(
 
   const onCaptureInput = (ev: Event) => {
     if (ev.target !== textarea) return;
+    lastActivityAt = Date.now();
     captureSeq = emittedSeq;
   };
 
   const onBeforeInput = (ev: Event) => {
     if (ev.target !== textarea) return;
+    lastActivityAt = Date.now();
     beforeInputSeq = emittedSeq;
   };
 
   const onCompositionStart = () => {
     composing = true;
+    lastActivityAt = Date.now();
     beforeInputSeq = null;
     captureSeq = null;
     lastCompEnd = null;
-    ensureCompObserver();
-    scheduleTimer(0, clampCompositionOverlay);
   };
 
   const onCompositionUpdate = () => {
-    ensureCompObserver();
+    lastActivityAt = Date.now();
     scheduleTimer(0, clampCompositionOverlay);
-    scheduleTimer(16, clampCompositionOverlay);
   };
 
   const onCompositionEnd = (ev: Event) => {
     composing = false;
-    stopCompObserver();
-    const seqAtEnd = emittedSeq;
+    lastActivityAt = Date.now();
     const compData = (ev as CompositionEvent).data ?? "";
     const endedAt = Date.now();
     if (compData) lastCompEnd = { data: compData, at: endedAt };
-    const settleMs = compData.length > 64 ? 18 : COMP_SETTLE_MS;
+    const settleMs = compData.length > 64 ? 20 : COMP_SETTLE_MS;
     scheduleTimer(settleMs, () => {
       if (composing) return;
-      if (compData && emittedSeq === seqAtEnd && !consumeMatchingXtermCommit(compData, endedAt)) {
+      if (compData && !consumeMatchingXtermCommit(compData, endedAt)) {
+        emitTelemetry("rescue_comp", { chars: compData.length });
         onCommit(compData);
-      } else if (compData) {
-        consumeMatchingXtermCommit(compData, endedAt);
       }
-      resetTextareaIfIdle();
+      clearStuckCompositionView();
+      scheduleLongIdleCompact();
     });
   };
 
   const onPaste = (ev: Event) => {
     composing = false;
     lastPasteAt = Date.now();
-    stopCompObserver();
+    lastActivityAt = lastPasteAt;
     if ((ev as ClipboardEvent).clipboardData) {
       ev.preventDefault?.();
     }
-    scheduleTimer(0, resetTextareaIfIdle);
-  };
-
-  const onBlur = () => {
-    scheduleTimer(80, () => {
-      if (typeof document === "undefined" || document.activeElement !== textarea) {
-        composing = false;
-        clearStuckCompositionView();
-      }
-    });
+    scheduleTimer(0, clearStuckCompositionView);
   };
 
   const onBubbleInput = (ev: Event) => {
     const inputEv = ev as InputEvent;
+    lastActivityAt = Date.now();
     if (composing || inputEv.isComposing || inputEv.inputType === "insertCompositionText") {
       beforeInputSeq = null;
       captureSeq = null;
@@ -354,10 +345,11 @@ export function attachTerminalImeBridge(
     }
 
     const inputType = typeof inputEv.inputType === "string" ? inputEv.inputType : "";
-    if (inputType === "insertFromPaste" || Date.now() - lastPasteAt < 60) {
+    if (inputType === "insertFromPaste" || Date.now() - lastPasteAt < PASTE_SUPPRESS_MS) {
       beforeInputSeq = null;
       captureSeq = null;
-      scheduleTimer(INPUT_SETTLE_MS, resetTextareaIfIdle);
+      emitTelemetry("paste_dedup", { inputType: inputType || "recent_paste" });
+      scheduleLongIdleCompact();
       return;
     }
     const baselineSeq = beforeInputSeq ?? captureSeq ?? emittedSeq;
@@ -366,18 +358,18 @@ export function attachTerminalImeBridge(
 
     const rawData = typeof inputEv.data === "string" ? inputEv.data : "";
     if (!rawData || (inputType && !COMMIT_INPUT_TYPES.has(inputType))) {
-      scheduleTimer(INPUT_SETTLE_MS, resetTextareaIfIdle);
+      scheduleLongIdleCompact();
       return;
     }
 
     const now = Date.now();
     if (inputType === "insertFromComposition" && lastCompEnd && lastCompEnd.data === rawData && now - lastCompEnd.at < 25) {
-      scheduleTimer(INPUT_SETTLE_MS, resetTextareaIfIdle);
+      scheduleLongIdleCompact();
       return;
     }
 
     if (emittedSeq > baselineSeq || consumeMatchingXtermCommit(rawData, now)) {
-      scheduleTimer(INPUT_SETTLE_MS, resetTextareaIfIdle);
+      scheduleLongIdleCompact();
       return;
     }
 
@@ -385,9 +377,10 @@ export function attachTerminalImeBridge(
     scheduleTimer(INPUT_SETTLE_MS, () => {
       if (composing) return;
       if (!consumeMatchingXtermCommit(rawData, now)) {
+        emitTelemetry("rescue_xpc", { chars: rawData.length, inputType: inputType || "unknown" });
         onCommit(rawData);
       }
-      resetTextareaIfIdle();
+      scheduleLongIdleCompact();
     });
   };
 
@@ -397,14 +390,16 @@ export function attachTerminalImeBridge(
   textarea.addEventListener("compositionupdate", onCompositionUpdate);
   textarea.addEventListener("compositionend", onCompositionEnd);
   textarea.addEventListener("paste", onPaste);
-  textarea.addEventListener("blur", onBlur);
   textarea.addEventListener("input", onBubbleInput);
 
   return {
     handleXtermData,
     isComposing: () => composing,
     dispose: () => {
-      stopCompObserver();
+      if (compactTimer !== null) {
+        clearTimeout(compactTimer);
+        compactTimer = null;
+      }
       for (const id of timers) clearTimeout(id);
       timers.clear();
       captureHost.removeEventListener("input", onCaptureInput, true);
@@ -413,7 +408,6 @@ export function attachTerminalImeBridge(
       textarea.removeEventListener("compositionupdate", onCompositionUpdate);
       textarea.removeEventListener("compositionend", onCompositionEnd);
       textarea.removeEventListener("paste", onPaste);
-      textarea.removeEventListener("blur", onBlur);
       textarea.removeEventListener("input", onBubbleInput);
     },
   };

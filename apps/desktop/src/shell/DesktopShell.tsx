@@ -94,6 +94,7 @@ import {
   type SplitDirection,
 } from "./shellStore";
 import { IS_MAC, matchShortcut } from "./shortcuts";
+import { installWindowFocusTelemetry } from "../lib/uiTelemetry";
 import { buildHostSpaces } from "./spaceSync";
 import { useModifierHoldHints } from "./useModifierHoldHints";
 import "../styles/shell.css";
@@ -189,6 +190,7 @@ export function DesktopShell({
   useModifierHoldHints();
   useHerdrDocSync();
   useEffect(() => startAttentionCenter(), []);
+  useEffect(() => installWindowFocusTelemetry(), []);
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const hosts = useMemo(() => Object.values(devices).filter((d) => d.kind === "host"), [devices]);
@@ -541,7 +543,7 @@ export function DesktopShell({
       );
       const renamedSpace = spacesMap[selHost]?.find((sp) => sp.id && prevDocSpaceIds.has(sp.id) && sp.name);
       if (renamedSpace) {
-        setSelectedSpace(`${selHost}\u0000${renamedSpace.name}`, (k) => agentByKey.get(k), spacesMap);
+        setSelectedSpace(`${selHost}\u0000${renamedSpace.name}`, (k) => agentByKey.get(k), spacesMap, { trigger: "auto" });
         return;
       }
     }
@@ -558,14 +560,14 @@ export function DesktopShell({
       if (list?.length) {
         const pick = list.find((sp) => sp.active) ?? list.find((sp) => sp.terminals > 0) ?? list[0];
         if (pick) {
-          setSelectedSpace(`${hid}\u0000${pick.name}`, (k) => agentByKey.get(k), spacesMap);
+          setSelectedSpace(`${hid}\u0000${pick.name}`, (k) => agentByKey.get(k), spacesMap, { trigger: "auto" });
           return;
         }
       }
       const fallbackAgent = all.find((a) => a.deviceId === hid && agentSpace(a));
       const fallbackSpace = fallbackAgent ? agentSpace(fallbackAgent) : undefined;
       if (fallbackSpace) {
-        setSelectedSpace(`${hid}\u0000${fallbackSpace}`, (k) => agentByKey.get(k), spacesMap);
+        setSelectedSpace(`${hid}\u0000${fallbackSpace}`, (k) => agentByKey.get(k), spacesMap, { trigger: "auto" });
         return;
       }
     }
@@ -580,7 +582,7 @@ export function DesktopShell({
     const pick = [...agents].sort(
       (x, y) => GROUP_RANK[listGroup(x, devices)] - GROUP_RANK[listGroup(y, devices)] || lastChange(y) - lastChange(x),
     )[0];
-    if (pick && shellStore.get().tabs.length === 0) openAgentTab(pick.key, "term");
+    if (pick && shellStore.get().tabs.length === 0) openAgentTab(pick.key, "term", { trigger: "auto" });
   }, [agents, devices]);
 
   const isDark = theme === "dark" || (theme === "system" && document.documentElement.getAttribute("data-theme") === "dark");
@@ -945,7 +947,7 @@ export function DesktopShell({
     const idx = cur ? ordered.indexOf(cur) : -1;
     const nextIdx = idx < 0 ? (step > 0 ? 0 : ordered.length - 1) : (idx + step + ordered.length) % ordered.length;
     const lookup = new Map(allAgents(live.agents).map((x) => [x.key, x] as const));
-    setSelectedSpace(ordered[nextIdx]!, (k) => lookup.get(k), live.spaces);
+    setSelectedSpace(ordered[nextIdx]!, (k) => lookup.get(k), live.spaces, { trigger: "shortcut" });
   }
 
   function jumpUrgentAgent() {
@@ -964,7 +966,7 @@ export function DesktopShell({
       : null;
     const curIdx = curKey ? list.findIndex((a) => a.key === curKey) : -1;
     const picked = list[(curIdx + 1) % list.length]!;
-    openAgentTab(picked.key);
+    openAgentTab(picked.key, undefined, { trigger: "shortcut" });
   }
 
   function closeActive() {
@@ -997,16 +999,29 @@ export function DesktopShell({
       document.documentElement.dataset.linkMod = active ? "true" : "false";
     };
     const onKeyEvent = (e: KeyboardEvent) => sync(e.ctrlKey || e.metaKey);
-    const onBlur = () => sync(false);
+    const onPointerMove = (e: PointerEvent) => {
+      if (!(e.ctrlKey || e.metaKey) && document.documentElement.dataset.linkMod === "true") {
+        sync(false);
+      }
+    };
+    const clear = () => sync(false);
     sync(false);
     window.addEventListener("keydown", onKeyEvent, true);
     window.addEventListener("keyup", onKeyEvent, true);
-    window.addEventListener("blur", onBlur);
+    window.addEventListener("pointermove", onPointerMove, true);
+    window.addEventListener("paste", clear, true);
+    window.addEventListener("copy", clear, true);
+    window.addEventListener("contextmenu", clear, true);
+    window.addEventListener("blur", clear);
     return () => {
       delete document.documentElement.dataset.linkMod;
       window.removeEventListener("keydown", onKeyEvent, true);
       window.removeEventListener("keyup", onKeyEvent, true);
-      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pointermove", onPointerMove, true);
+      window.removeEventListener("paste", clear, true);
+      window.removeEventListener("copy", clear, true);
+      window.removeEventListener("contextmenu", clear, true);
+      window.removeEventListener("blur", clear);
     };
   }, []);
 
@@ -1023,7 +1038,7 @@ export function DesktopShell({
         if (picked) {
           e.preventDefault();
           logAction("ui", "ui.shortcut", { id: e.key === "9" ? "jumpLastTab" : "jumpTabRange", slot: Number(e.key) });
-          setActiveTab(picked.id);
+          setActiveTab(picked.id, { trigger: "shortcut" });
         }
         return;
       }
@@ -1078,7 +1093,7 @@ export function DesktopShell({
           cycleSpace(1);
           break;
         case "allSpaces":
-          setSelectedSpace(null);
+          setSelectedSpace(null, undefined, undefined, { trigger: "shortcut" });
           break;
         case "newAgentDialog":
           newAgent();

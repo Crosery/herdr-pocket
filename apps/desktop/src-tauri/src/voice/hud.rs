@@ -21,6 +21,65 @@ static LATEST: Mutex<Option<Value>> = Mutex::new(None);
 static LAST_USE: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_INTERACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "macos")]
+mod macos {
+    use objc2::runtime::Bool;
+    use objc2::{msg_send, sel};
+    use objc2_app_kit::NSWindow;
+    use objc2_foundation::{MainThreadMarker, NSObjectProtocol};
+
+    pub fn configure_window(w: &tauri::WebviewWindow) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        let Ok(ptr) = w.ns_window() else {
+            return;
+        };
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let ns_win = &*(ptr as *const NSWindow);
+            ns_win.setHidesOnDeactivate(false);
+            if ns_win.respondsToSelector(sel!(_setPreventsActivation:)) {
+                let _: () = msg_send![ns_win, _setPreventsActivation: Bool::YES];
+            }
+        }
+    }
+
+    pub fn order_front_non_activating(w: &tauri::WebviewWindow) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        let Ok(ptr) = w.ns_window() else {
+            return;
+        };
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let ns_win = &*(ptr as *const NSWindow);
+            ns_win.orderFrontRegardless();
+        }
+    }
+
+    pub fn hide_non_activating(w: &tauri::WebviewWindow) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        let Ok(ptr) = w.ns_window() else {
+            return;
+        };
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let ns_win = &*(ptr as *const NSWindow);
+            ns_win.orderOut(None);
+        }
+    }
+}
+
 fn is_interactive_state(state: &Value) -> bool {
     matches!(
         state.get("state").and_then(Value::as_str),
@@ -113,6 +172,8 @@ fn ensure(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     let builder = builder.transparent(true);
     match builder.build() {
         Ok(w) => {
+            #[cfg(target_os = "macos")]
+            macos::configure_window(&w);
             let _ = w.set_ignore_cursor_events(true);
             crate::logging::debug("voice.hud", "hud window created", Value::Null);
             Some(w)
@@ -146,6 +207,9 @@ pub fn show(app: &AppHandle, state: Value) {
             if !was_visible {
                 let _ = w.set_size(tauri::LogicalSize::new(WIDTH, HEIGHT));
                 place(&app2, &w, HEIGHT);
+                #[cfg(target_os = "macos")]
+                macos::order_front_non_activating(&w);
+                #[cfg(not(target_os = "macos"))]
                 let _ = w.show();
             }
             push(&app2, &state);
@@ -217,6 +281,9 @@ pub fn hide(app: &AppHandle) {
     let _ = app.run_on_main_thread(move || {
         if let Some(w) = app2.get_webview_window(LABEL) {
             let _ = w.set_ignore_cursor_events(true);
+            #[cfg(target_os = "macos")]
+            macos::hide_non_activating(&w);
+            #[cfg(not(target_os = "macos"))]
             let _ = w.hide();
             let _ = w.eval("window.__hud && window.__hud({ state: 'hidden' })");
         }

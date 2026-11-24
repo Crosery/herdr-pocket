@@ -1,7 +1,7 @@
 import type { Agent, AgentStatus, SpaceInfo } from "@herdr-pocket/protocol";
 import { playAttentionChime } from "./alertSound";
 import { isTauri } from "./bridge";
-import { clientConfigStore } from "./config";
+import { clientConfigStore, isDynamicIslandEnabled } from "./config";
 import { native } from "./native";
 import { rpcCall } from "./relay";
 import { agentSpace, allAgents, createStore, findAgent, liveStore, settingsStore, spacedTitle } from "./store";
@@ -291,7 +291,7 @@ let lastNotchSyncJson: string | null = null;
 export function buildNotchSyncPayload(): Record<string, unknown> {
   const st = attentionStore.get();
   const notifOn = settingsStore.get().notifications;
-  const islandOn = clientConfigStore.get().config.general.dynamicIsland;
+  const islandOn = isDynamicIslandEnabled();
   const prefTheme = settingsStore.get().theme;
   const domTheme =
     typeof document !== "undefined" ? document.documentElement.getAttribute("data-theme") : null;
@@ -463,7 +463,7 @@ export function jumpToAttentionAgent(agentKey: string): boolean {
   void native.notchFocusMain();
 
   if (!agentKey.startsWith("demo/")) {
-    openAgentTab(agentKey);
+    openAgentTab(agentKey, undefined, { trigger: "attention" });
     const s = shellStore.get();
     for (const tab of s.tabs) {
       const hitLeaf = tabLeaves(tab).find((l) => l.content.kind === "agent" && l.content.agentKey === agentKey);

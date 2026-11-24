@@ -18,6 +18,7 @@ import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge"
 import { hasFileJumpModifier, openAgentFileTarget } from "../lib/openFileTarget";
 import { setConfig, useClientConfig } from "../lib/config";
 import { attachTerminalImeBridge, chunkTerminalInputPayload, isImeKeyEvent } from "../lib/terminalIme";
+import { trackTerminalImeEvent, trackTerminalLayoutJump } from "../lib/uiTelemetry";
 import {
   findLinkAtCell,
   findTerminalLinksForBufferLine,
@@ -356,6 +357,7 @@ export function TerminalSurface({
   const lastResizeSigRef = useRef("");
   const appliedVisualSigRef = useRef("");
   const ptySizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const lastPtyBoxRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const externalSizeOverrideRef = useRef(false);
   const lastObservedBoxRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const resizeHudTimerRef = useRef<number>(0);
@@ -615,9 +617,29 @@ export function TerminalSurface({
       if (lastResizeSigRef.current === sig) return;
       lastResizeSigRef.current = sig;
       const prevPty = ptySizeRef.current;
+      const curBoxW = hostRef.current?.clientWidth ?? 0;
+      const curBoxH = hostRef.current?.clientHeight ?? 0;
+      const prevPtyBox = lastPtyBoxRef.current;
       ptySizeRef.current = { cols: term.cols, rows: term.rows };
+      lastPtyBoxRef.current = { w: curBoxW, h: curBoxH };
       if (!prevPty || prevPty.cols !== term.cols || prevPty.rows !== term.rows) {
         logger.debug("term", "term.resize", { cols: term.cols, rows: term.rows });
+        if (
+          prevPty &&
+          Math.abs(term.cols - prevPty.cols) > 20 &&
+          prevPtyBox.w > 0 &&
+          Math.abs(curBoxW - prevPtyBox.w) <= 4
+        ) {
+          trackTerminalLayoutJump({
+            prevCols: prevPty.cols,
+            prevRows: prevPty.rows,
+            cols: term.cols,
+            rows: term.rows,
+            deltaCols: term.cols - prevPty.cols,
+            deltaRows: term.rows - prevPty.rows,
+            mode: localConnId ? "local" : "relay",
+          });
+        }
       }
       if (localConnId) {
         void native.localTermResize(localConnId, term.cols, term.rows, display as unknown as Record<string, unknown>).catch(() => {});
@@ -1868,9 +1890,15 @@ export function TerminalSurface({
       syncResize(term, true);
     };
     const textarea = term.textarea;
-    const imeBridge = attachTerminalImeBridge(textarea, (data) => {
-      void sendInput(data);
-    });
+    const imeBridge = attachTerminalImeBridge(
+      textarea,
+      (data) => {
+        void sendInput(data);
+      },
+      {
+        onTelemetry: (ev, meta) => trackTerminalImeEvent(ev, meta),
+      },
+    );
     const onTermFocus = () => {
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
       if (nowMs - lastActivateAtRef.current < 80) return;

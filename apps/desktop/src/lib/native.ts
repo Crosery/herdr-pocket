@@ -20,6 +20,22 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 const inTauri = () => bridge.isTauri();
 
+export interface OsModifierState {
+  supported: boolean;
+  meta: boolean;
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+}
+
+const UNSUPPORTED_OS_MODIFIERS: OsModifierState = {
+  supported: false,
+  meta: false,
+  ctrl: false,
+  alt: false,
+  shift: false,
+};
+
 export interface Rect {
   x: number;
   y: number;
@@ -886,4 +902,6 @@ export const native = {
     inTauri() ? invoke<string | null>("workspace_state_load").catch(() => null) : null,
   workspaceStateSave: async (raw: string): Promise<void> =>
     inTauri() ? invoke<void>("workspace_state_save", { raw }) : Promise.resolve(),
+  queryOsModifiers: async (): Promise<OsModifierState> =>
+    inTauri() ? invoke<OsModifierState>("query_os_modifiers").catch(() => UNSUPPORTED_OS_MODIFIERS) : UNSUPPORTED_OS_MODIFIERS,
 };

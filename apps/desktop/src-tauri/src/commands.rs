@@ -2029,13 +2029,72 @@ pub async fn voice_call_dsp_close() {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OsModifierState {
+    pub supported: bool,
+    pub meta: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+#[tauri::command]
+pub fn query_os_modifiers() -> OsModifierState {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSEvent, NSEventModifierFlags};
+        let flags = NSEvent::modifierFlags_class();
+        return OsModifierState {
+            supported: true,
+            meta: flags.contains(NSEventModifierFlags::Command),
+            ctrl: flags.contains(NSEventModifierFlags::Control),
+            alt: flags.contains(NSEventModifierFlags::Option),
+            shift: flags.contains(NSEventModifierFlags::Shift),
+        };
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+        };
+        let down = |vk: u16| (unsafe { GetAsyncKeyState(i32::from(vk)) } as u16 & 0x8000) != 0;
+        return OsModifierState {
+            supported: true,
+            meta: down(VK_LWIN) || down(VK_RWIN),
+            ctrl: down(VK_CONTROL),
+            alt: down(VK_MENU),
+            shift: down(VK_SHIFT),
+        };
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        OsModifierState {
+            supported: false,
+            meta: false,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         is_sums_url, issue_local_preview_url, process_pcm_bytes_with_processor,
-        read_local_file_sync, resolve_safe_local_file, resolve_safe_local_reveal_target,
-        resolve_safe_local_reveal_target_with_cfg_dir,
+        query_os_modifiers, read_local_file_sync, resolve_safe_local_file,
+        resolve_safe_local_reveal_target, resolve_safe_local_reveal_target_with_cfg_dir,
     };
+
+    #[test]
+    fn query_os_modifiers_reports_platform_support() {
+        let st = query_os_modifiers();
+        #[cfg(any(target_os = "macos", windows))]
+        assert!(st.supported);
+        #[cfg(not(any(target_os = "macos", windows)))]
+        assert!(!st.supported);
+    }
 
     #[test]
     fn resolve_safe_local_reveal_target_accepts_files_and_dirs_and_blocks_private_paths() {

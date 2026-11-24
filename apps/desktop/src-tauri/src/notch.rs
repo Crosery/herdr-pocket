@@ -223,6 +223,7 @@ mod macos {
             ns_win.setLevel(26);
             ns_win.setHasShadow(false);
             ns_win.setOpaque(false);
+            ns_win.setHidesOnDeactivate(false);
             ns_win.setBackgroundColor(Some(&NSColor::clearColor()));
             ns_win.setCollectionBehavior(
                 NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -249,6 +250,22 @@ mod macos {
         unsafe {
             let ns_win = &*(ptr as *const NSWindow);
             ns_win.orderFrontRegardless();
+        }
+    }
+
+    pub fn hide_non_activating(w: &tauri::WebviewWindow) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        let Ok(ptr) = w.ns_window() else {
+            return;
+        };
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let ns_win = &*(ptr as *const NSWindow);
+            ns_win.orderOut(None);
         }
     }
 
@@ -409,7 +426,7 @@ fn apply_layout_and_push(app: &AppHandle, state: &Value) {
         }
         if let Some(w) = app.get_webview_window(LABEL) {
             let _ = w.set_ignore_cursor_events(true);
-            let _ = w.hide();
+            macos::hide_non_activating(&w);
         }
         return;
     }
@@ -445,7 +462,6 @@ fn apply_layout_and_push(app: &AppHandle, state: &Value) {
     }
     if !was_visible || geom_changed {
         let _ = w.set_ignore_cursor_events(false);
-        let _ = w.show();
         macos::order_front_non_activating(&w);
     }
     push_state(app, state, frame, mode);
@@ -637,7 +653,7 @@ pub fn hide(app: &AppHandle) {
         let _ = app.run_on_main_thread(move || {
             if let Some(w) = app2.get_webview_window(LABEL) {
                 let _ = w.set_ignore_cursor_events(true);
-                let _ = w.hide();
+                macos::hide_non_activating(&w);
             }
         });
     }

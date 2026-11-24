@@ -1905,14 +1905,15 @@
 }
 
 .v3-keys-text[data-inline-chord="Mod"] {
-  transition: background-color 110ms ease-out, color 110ms ease-out, padding 110ms ease-out;
+  padding: 1px 5px;
+  margin: -1px -5px;
+  border-radius: 4px;
+  transition: background-color 110ms ease-out, color 110ms ease-out;
 }
 
 :root[data-shortcut-hints="Mod"] .v3-keys-text[data-inline-chord="Mod"] {
   background: var(--accent-text);
   color: #fff;
-  border-radius: 4px;
-  padding: 1px 5px;
 }
 
 :root[data-shortcut-hints="Mod"] .v3-spatial-hint.hide-on-bare-mod {

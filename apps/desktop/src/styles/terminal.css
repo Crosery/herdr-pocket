@@ -133,39 +133,29 @@
   pointer-events: none;
 }
 
-.tp-term-host .xterm .xterm-helper-textarea {
-  pointer-events: auto;
-}
-
 .tp-term-host .xterm .xterm-rows {
   position: relative;
   z-index: 2;
 }
 
 .tp-term-host .xterm .composition-view {
-  z-index: 8;
+  z-index: 6;
   width: max-content;
-  min-width: 1.5em;
-  background: color-mix(in srgb, var(--tp-term-bg, #17191d) 94%, var(--primary, #ff6d9c));
+  max-width: calc(100% - 4px);
+  height: auto !important;
+  background: var(--tp-term-bg, #17191d);
   color: var(--tp-term-fg, #e6edf3);
-  border: 1.5px solid color-mix(in srgb, var(--primary, #ff6d9c) 62%, transparent);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
   text-decoration: underline;
   text-decoration-color: var(--primary, #ff8fb3);
   text-underline-offset: 3px;
-  white-space: pre-wrap !important;
+  white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
-  height: auto !important;
-  min-height: 1.4em;
-  line-height: 1.45 !important;
-  max-width: calc(100% - 8px);
-  max-height: min(45%, 200px);
-  overflow-x: hidden;
-  overflow-y: auto;
-  box-sizing: border-box;
-  padding: 4px 8px;
-  border-radius: 8px;
   pointer-events: none;
 }
 

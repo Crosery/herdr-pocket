@@ -95,6 +95,12 @@ function hasRawKey(key: string): boolean {
   return Boolean(sec && typeof sec === "object" && (sec as Record<string, unknown>)[name] !== undefined);
 }
 
+/** Floating notch window stays off unless explicitly enabled in config.json (`general.dynamicIsland`). */
+export function isDynamicIslandEnabled(): boolean {
+  if (!hasRawKey("general.dynamicIsland")) return false;
+  return Boolean(clientConfigStore.get().config.general.dynamicIsland);
+}
+
 /**
  * Screens that still call updateSettings (theme, text size, shells, notifications) end up in
  * config.json too, so the CLI sees them and the next reload does not undo them.

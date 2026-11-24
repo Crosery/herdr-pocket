@@ -685,7 +685,7 @@ async function fetchManifestOrSumsFromSource(
   signal: AbortSignal,
   timeoutMs = DESKTOP_PROBE_TIMEOUT_MS,
 ): Promise<ParsedReleaseSource> {
-  const perReqTimeout = Math.max(2500, Math.min(timeoutMs, Math.floor(timeoutMs * 0.65)));
+  const perReqTimeout = Math.max(3000, Math.min(timeoutMs, Math.floor(timeoutMs * 0.68)));
   const ctl = new AbortController();
   const onParentAbort = () => ctl.abort();
   if (signal.aborted) ctl.abort();
@@ -695,7 +695,17 @@ async function fetchManifestOrSumsFromSource(
     return await fetchSums(sourceUrl(source, LATEST_MANIFEST_URL), ctl.signal, perReqTimeout);
   } catch (err) {
     if (signal.aborted) throw err;
-    return await fetchSums(sourceUrl(source, LATEST_SUMS_URL), signal, timeoutMs);
+    const fallbackCtl = new AbortController();
+    const onParentFallbackAbort = () => fallbackCtl.abort();
+    if (signal.aborted) fallbackCtl.abort();
+    else signal.addEventListener("abort", onParentFallbackAbort, { once: true });
+    const fallbackTimer = setTimeout(() => fallbackCtl.abort(), perReqTimeout);
+    try {
+      return await fetchSums(sourceUrl(source, LATEST_SUMS_URL), fallbackCtl.signal, perReqTimeout);
+    } finally {
+      clearTimeout(fallbackTimer);
+      signal.removeEventListener("abort", onParentFallbackAbort);
+    }
   } finally {
     clearTimeout(t);
     signal.removeEventListener("abort", onParentAbort);
