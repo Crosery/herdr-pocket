@@ -3,7 +3,7 @@
     "name": "Herdr Pocket",
     "slug": "herdr-pocket",
     "scheme": "herdrpocket",
-    "version": "0.2.31",
+    "version": "0.2.32",
     "orientation": "portrait",
     "icon": "./assets/brand/icon-1024.png",
     "userInterfaceStyle": "automatic",
@@ -18,7 +18,7 @@
           "audio"
         ]
       },
-      "buildNumber": "2031"
+      "buildNumber": "2032"
     },
     "android": {
       "package": "dev.crosery.herdrpocket",

@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { canActOnLocalFile } from "../src/lib/localFileActions.ts";
 import { parseFileTarget } from "../src/lib/openFileTarget.ts";
-import { buildPortalP2pUrl, mapContainedPointer } from "../src/lib/portalClient.ts";
+import { buildPortalP2pUrl, filterVisiblePortalItems, mapContainedPointer } from "../src/lib/portalClient.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -134,4 +134,69 @@ test("new Batch 2 UI/docs files contain zero emojis", () => {
     const m = EMOJI_RE.exec(text);
     assert.equal(m, null, `unexpected emoji in ${rel}: ${m?.[0]}`);
   }
+});
+
+test("SessionPortalPiP filters same-machine auto-popups on desktop, preserves terminal focus, and anchors in-term top-right", () => {
+  const autoItem = {
+    id: "ptl-auto",
+    hostId: "h1",
+    agentKey: "h1/hc:t1",
+    kind: "window" as const,
+    title: "ego lite",
+    canInteract: true,
+    transportHint: "p2p" as const,
+    createdAt: 100,
+    updatedAt: 200,
+  };
+  const manualItem = { ...autoItem, id: "ptl-manual", updatedAt: 150 };
+  const itemsById = { [autoItem.id]: autoItem, [manualItem.id]: manualItem };
+
+  // Same local Tauri machine hides automatic popups while retaining manually launched portals
+  const localVisible = filterVisiblePortalItems({
+    itemsById,
+    dismissedIds: {},
+    manualIds: { [manualItem.id]: true },
+    agent: { deviceId: "h1", key: "h1/hc:t1" },
+    isTauriApp: true,
+    localHostId: "h1",
+  });
+  assert.deepEqual(
+    localVisible.map((i) => i.id),
+    ["ptl-manual"],
+  );
+
+  // Controlling a remote host or web H5 surfaces automatic portals immediately
+  const remoteVisible = filterVisiblePortalItems({
+    itemsById,
+    dismissedIds: {},
+    manualIds: { [manualItem.id]: true },
+    agent: { deviceId: "h1", key: "h1/hc:t1" },
+    isTauriApp: true,
+    localHostId: "h2",
+  });
+  assert.deepEqual(
+    remoteVisible.map((i) => i.id),
+    ["ptl-auto", "ptl-manual"],
+  );
+
+  const h5Visible = filterVisiblePortalItems({
+    itemsById,
+    dismissedIds: { [manualItem.id]: true },
+    manualIds: {},
+    agent: { deviceId: "h1", key: "h1/hc:t1" },
+    isTauriApp: false,
+    localHostId: null,
+  });
+  assert.deepEqual(
+    h5Visible.map((i) => i.id),
+    ["ptl-auto"],
+  );
+
+  const pipSrc = readFileSync(join(ROOT, "apps/desktop/src/components/SessionPortalPiP.tsx"), "utf8");
+  const agentsSrc = readFileSync(join(ROOT, "apps/desktop/src/views/AgentsView.tsx"), "utf8");
+  const cssSrc = readFileSync(join(ROOT, "apps/desktop/src/styles/app.css"), "utf8");
+  assert.match(pipSrc, /onMouseDown=\{\(e\)\s*=>\s*\{\s*e\.preventDefault\(\);/);
+  assert.match(pipSrc, /mode\s*===\s*"term"\s*\?\s*" in-term"\s*:\s*""/);
+  assert.match(agentsSrc, /<SessionPortalPiP[\s\S]*mode=\{activeMode\}/);
+  assert.match(cssSrc, /\.session-portal-pip\.in-term\s*\{[\s\S]*top:\s*14px;/);
 });

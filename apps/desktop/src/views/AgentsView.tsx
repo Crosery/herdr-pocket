@@ -3362,6 +3362,7 @@ export function AgentDetailPanel({
       <SessionPortalPiP
         agent={agent}
         visible={visible}
+        mode={activeMode}
         onExpandPortal={(pid) => {
           setActivePortalId(pid);
           setPortalModalOpen(true);

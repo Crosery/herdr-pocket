@@ -45,6 +45,26 @@ export function buildPortalP2pSiblingUrl(baseEntryUrl: string, siblingName: stri
   return `${baseEntryUrl.slice(0, idx + 1)}${encodeURIComponent(siblingName)}`;
 }
 
+export function filterVisiblePortalItems(opts: {
+  itemsById: Record<string, PortalItem>;
+  dismissedIds: Record<string, true>;
+  manualIds: Record<string, true>;
+  agent: { deviceId: string; key: string };
+  isTauriApp: boolean;
+  localHostId: string | null;
+}): PortalItem[] {
+  const isSameLocalMachine = opts.isTauriApp && Boolean(opts.localHostId) && opts.agent.deviceId === opts.localHostId;
+  return Object.values(opts.itemsById)
+    .filter((i) => {
+      if (i.hostId !== opts.agent.deviceId) return false;
+      if (i.agentKey && i.agentKey !== opts.agent.key) return false;
+      if (opts.dismissedIds[i.id]) return false;
+      if (isSameLocalMachine && !opts.manualIds[i.id]) return false;
+      return true;
+    })
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
 /**
  * Maps viewer client coordinates `(clientX, clientY)` onto `[0, 1]` coordinates of the
  * remote image rendered with `object-fit: contain` inside `(rectWidth x rectHeight)`.
@@ -93,6 +113,7 @@ interface PortalState {
   capsByHost: Record<string, HostPortalCapabilities>;
   windowsByHost: Record<string, RemoteWindowInfo[]>;
   dismissedIds: Record<string, true>;
+  manualIds: Record<string, true>;
 }
 
 const initialState: PortalState = {
@@ -102,6 +123,7 @@ const initialState: PortalState = {
   capsByHost: {},
   windowsByHost: {},
   dismissedIds: {},
+  manualIds: {},
 };
 
 let state: PortalState = initialState;
@@ -156,6 +178,7 @@ export function resetPortalClientStateForTest(): void {
     w.stop();
   }
   hostPortalWatchers.clear();
+  state = initialState;
 }
 
 function setState(updater: (prev: PortalState) => PortalState): void {
@@ -319,6 +342,7 @@ export async function openPortalSurface(
       itemsById: { ...prev.itemsById, [res.item.id]: res.item },
       ...(res.ticket ? { ticketsById: { ...prev.ticketsById, [res.item.id]: res.ticket } } : {}),
       dismissedIds,
+      manualIds: { ...prev.manualIds, [res.item.id]: true },
     };
   });
   return res;

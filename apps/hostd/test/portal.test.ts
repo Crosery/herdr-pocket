@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { DIRECT_PORTAL_FS_PREFIX } from "@herdr-pocket/protocol";
+import { DIRECT_PORTAL_FS_PREFIX, type PortalStreamEvent } from "@herdr-pocket/protocol";
 import { DirectServer } from "../src/direct.ts";
+import { PortalManager } from "../src/portal/index.ts";
 import { computeCapabilities, detectPortalSession, resolveLinuxGuiEnv } from "../src/portal/osCapture.ts";
 import { PortalFileTicketStore, bundleHtmlForRelay, readChunkForRpc } from "../src/portal/p2pFiles.ts";
-import { PortalHookServer, parseOpenerArgs } from "../src/portal/shims.ts";
+import { PortalHookServer, TerminalInputLineTracker, extractAutoPortalIntents, parseOpenerArgs } from "../src/portal/shims.ts";
+import { UnifloAdapter } from "../src/uniflo.ts";
 
 test("PortalFileTicketStore + DirectServer serve /v1/portal-fs HTTP files, Ranges, CORS, and block traversal/private files", async (t) => {
   const rawRoot = mkdtempSync(join(tmpdir(), "hp-portal-fs-"));
@@ -258,4 +261,163 @@ test("osCapture detects macOS, Windows, Linux X11, Wayland wlroots/KDE/GNOME, sy
   assert.equal(headless.sessionType, "headless");
   assert.equal(headless.canCaptureScreen, false);
   assert.equal(headless.hasCdpBrowser, true);
+});
+
+test("TerminalInputLineTracker reconstructs lines across CSI, Backspace, Ctrl+W/C/U, and bracketed paste", () => {
+  const tracker = new TerminalInputLineTracker();
+  assert.deepEqual(tracker.feed("a1", "open\x1b[A ./fo"), []);
+  assert.deepEqual(tracker.feed("a1", "o\x7f.html\r"), ["open ./fo.html"]);
+  assert.deepEqual(tracker.feed("a1", "\n"), []); // ignores \n immediately after \r
+  assert.deepEqual(tracker.feed("a1", "ls -la\x03open\t-R src\r\n"), ["open -R src"]);
+  assert.deepEqual(tracker.feed("a1", "git status\x17open app.html\r"), ["git open app.html"]);
+  assert.deepEqual(tracker.feed("a1", "\x1b[200~ego-browser nodejs -e 'go()' \x1b[201~\r"), ["ego-browser nodejs -e 'go()'"]);
+  assert.deepEqual(tracker.feed("a1", "echo wrong\x15open ok.png\n"), ["open ok.png"]);
+});
+
+test("extractAutoPortalIntents parses open, open -R, open -a, cd && open, ego-browser, and ignores quoted text", () => {
+  assert.deepEqual(extractAutoPortalIntents("open a.html", "/work/app"), [
+    { type: "opener", kind: "html", target: resolve("/work/app", "a.html"), reveal: false },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents("open -R build/out.dmg", "/work/app"), [
+    { type: "opener", kind: "reveal", target: resolve("/work/app", "build/out.dmg"), reveal: true },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents("open -a Safari https://example.com"), [
+    { type: "opener", kind: "browser", target: "https://example.com", url: "https://example.com", reveal: false, app: "Safari" },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents('open -a "微信开发者工具"'), [
+    { type: "app_window", appHint: "微信开发者工具", label: "微信开发者工具" },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents("cd docs && open arch.html", "/work/app"), [
+    { type: "opener", kind: "html", target: resolve("/work/app/docs", "arch.html"), reveal: false },
+  ]);
+  assert.deepEqual(
+    extractAutoPortalIntents(
+      "ego-browser nodejs <<'EOF'\nconst task = await taskSpace(\"login check\");\nawait page.goto(\"http://127.0.0.1:5173/home\");\nEOF",
+    ),
+    [{ type: "app_window", appHint: "ego lite", label: "ego lite · login check", url: "http://127.0.0.1:5173/home" }],
+  );
+  assert.deepEqual(extractAutoPortalIntents("ego-browser skill"), []);
+  assert.deepEqual(extractAutoPortalIntents('git commit -m "open window" && echo "open a.html"'), []);
+});
+
+test("PortalManager auto-opens and deduplicates portals for terminal open input and Agent ego-browser calls", async (t) => {
+  const rawRoot = mkdtempSync(join(tmpdir(), "hp-auto-portal-"));
+  const state = mkdtempSync(join(tmpdir(), "hp-auto-state-"));
+  t.after(() => {
+    rmSync(rawRoot, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  });
+  const ws = realpathSync(rawRoot);
+  writeFileSync(join(ws, "page.html"), "<html><body>ok</body></html>");
+
+  const events: PortalStreamEvent[] = [];
+  const fakeAgent = {
+    key: "h1/hc:t1",
+    deviceId: "h1",
+    source: "hc" as const,
+    localId: "t1",
+    harness: "shell",
+    where: "测试",
+    cwd: ws,
+    status: "idle" as const,
+    isShell: true,
+    updatedAt: Date.now(),
+  };
+
+  const mgr = new PortalManager({
+    hostId: () => "h1",
+    getAgents: () => [fakeAgent],
+    getTerminals: () => new Map([["t1", { address: "t1", cwd: ws }]]),
+    getFilesOptions: () => ({ extraRoots: [ws] }),
+    getDirectInfo: () => ({ port: null, addrs: [], connectedCount: 0 }),
+    hasRemoteViewers: () => true,
+    onPortalEvent: (ev) => events.push(ev),
+    stateDir: state,
+    captureDeps: {
+      platform: "linux",
+      env: { WAYLAND_DISPLAY: "wayland-1", HYPRLAND_INSTANCE_SIGNATURE: "1" },
+      hasCmd: (c) => ["hyprctl", "grim"].includes(c),
+      execBin: async (cmd, args) => {
+        if (cmd === "hyprctl") {
+          return {
+            code: 0,
+            stderr: "",
+            stdout: Buffer.from(
+              JSON.stringify([
+                { address: "0xego1", pid: 4242, class: "ego lite", title: "ego lite - Preview", size: [1280, 820], at: [10, 10] },
+              ]),
+            ),
+          };
+        }
+        if (cmd === "grim" && args.includes("-")) {
+          return { code: 0, stderr: "", stdout: Buffer.from("fake-jpeg-bytes") };
+        }
+        return { code: 1, stderr: "unexpected", stdout: Buffer.alloc(0) };
+      },
+    },
+  });
+  t.after(() => mgr.stop());
+
+  mgr.observeTerminalInput(fakeAgent, "open page.html\r");
+  for (let i = 0; i < 20 && !mgr.listPortals(fakeAgent.key).some((x) => x.kind === "html"); i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const htmlItem = mgr.listPortals(fakeAgent.key).find((x) => x.kind === "html");
+  assert.ok(htmlItem);
+  assert.equal(htmlItem.targetPath, join(ws, "page.html"));
+
+  mgr.inspectToolCallForPortal(fakeAgent, "run_command", {
+    CommandLine: 'ego-browser nodejs -e "await page.goto(\\"http://127.0.0.1:4173/demo\\")"',
+  });
+  for (let i = 0; i < 25 && !mgr.listPortals(fakeAgent.key).some((x) => x.kind === "window"); i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const winItems1 = mgr.listPortals(fakeAgent.key).filter((x) => x.kind === "window");
+  assert.equal(winItems1.length, 1);
+  assert.equal(winItems1[0]!.windowId, "hypr:0xego1");
+  assert.equal(winItems1[0]!.url, "http://127.0.0.1:4173/demo");
+
+  // Running another ego-browser command on the same agent updates the same window portal instead of duplicating.
+  mgr.inspectToolCallForPortal(fakeAgent, "bash", {
+    command: 'ego-browser nodejs -e "await page.goto(\\"http://127.0.0.1:4173/next\\")"',
+  });
+  await new Promise((r) => setTimeout(r, 80));
+  const winItems2 = mgr.listPortals(fakeAgent.key).filter((x) => x.kind === "window");
+  assert.equal(winItems2.length, 1);
+  assert.equal(winItems2[0]!.url, "http://127.0.0.1:4173/next");
+  assert.ok(events.some((e) => e.kind === "portal_frame" && e.portalId === winItems2[0]!.id));
+});
+
+test("UnifloAdapter.rootSessionKey walks nested subagent parent pointers back to root session", async (t) => {
+  const srv = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1/health") {
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (req.url?.startsWith("/v1/sessions")) {
+      res.end(
+        JSON.stringify([
+          { key: "claude:root", harness: "claude-code", updated_at: 300, status: "work" },
+          { key: "claude:sub1", harness: "claude-code", parent: "claude:root", updated_at: 310, status: "work" },
+          { key: "claude:sub2", harness: "claude-code", parent: "claude:sub1", updated_at: 320, status: "work" },
+        ]),
+      );
+      return;
+    }
+    res.statusCode = 404;
+    res.end("{}");
+  });
+  await new Promise<void>((resolveListen) => srv.listen(0, "127.0.0.1", resolveListen));
+  t.after(() => srv.close());
+  const port = (srv.address() as { port: number }).port;
+  const u = new UnifloAdapter(`http://127.0.0.1:${port}`);
+  t.after(() => u.stop());
+  u.start(() => {});
+  for (let i = 0; i < 30 && u.rootSessionKey("claude:sub2") !== "claude:root"; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(u.rootSessionKey("claude:sub2"), "claude:root");
+  assert.equal(u.rootSessionKey("claude:sub1"), "claude:root");
+  assert.equal(u.rootSessionKey("claude:root"), "claude:root");
 });

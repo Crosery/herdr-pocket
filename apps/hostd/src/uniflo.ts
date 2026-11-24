@@ -568,6 +568,8 @@ export class UnifloAdapter {
   private token: string | undefined;
   private timer: NodeJS.Timeout | null = null;
   private onChange: () => void = () => {};
+  private onLiveToolCall?: (sessionKey: string, ev: ConvEvent) => void;
+  private parentBySession = new Map<string, string>();
   /** Sessions named by a running agent (see SessionHints) that the recent list doesn't hold. */
   private named = new Map<string, UnifloSession>();
   /** Named keys being fetched, or not found (key -> when to look again). */
@@ -604,12 +606,24 @@ export class UnifloAdapter {
     }
   }
 
-  start(onChange: () => void): void {
+  start(onChange: () => void, onLiveToolCall?: (sessionKey: string, ev: ConvEvent) => void): void {
     this.onChange = onChange;
+    this.onLiveToolCall = onLiveToolCall;
     void this.refresh();
     this.timer = setInterval(() => void this.refresh(), 8000);
     this.liveAbort = new AbortController();
     void this.watch(this.liveAbort.signal);
+  }
+
+  /** Resolves a subagent/child session key to its root parent session key without cycles. */
+  rootSessionKey(sessionKey: string): string {
+    let cur = sessionKey;
+    for (let depth = 0; depth < 8; depth += 1) {
+      const parent = this.parentBySession.get(cur);
+      if (!parent || parent === cur) break;
+      cur = parent;
+    }
+    return cur;
   }
 
   stop(): void {
@@ -689,10 +703,16 @@ export class UnifloAdapter {
       this.wakeAll();
     } else if (j.type === "event" && j.event && typeof j.event.session === "string") {
       const set = this.liveListeners.get(j.event.session);
-      if (!set?.size) return;
+      const needsToolHook = Boolean(this.onLiveToolCall && j.event.kind === "tool_call");
+      if (!set?.size && !needsToolHook) return;
       const e = sameAsPage(j.event) ? toConvEvent(j.event) : undefined;
       if (e === null) return; // a usage tick or an empty notice: nothing to show
-      for (const fn of [...set]) fn(e ?? null);
+      if (e && e.kind === "tool_call" && this.onLiveToolCall) {
+        this.onLiveToolCall(j.event.session, e);
+      }
+      if (set?.size) {
+        for (const fn of [...set]) fn(e ?? null);
+      }
     } else if (j.type === "session" && j.session?.key) {
       // A new session (a fresh start, `/clear`, a subagent) or a changed one: match agents now, not in 8 s.
       if (this.known.get(j.session.key) !== sessionSig(j.session)) this.refreshSoon();
@@ -738,8 +758,10 @@ export class UnifloAdapter {
       const before = this.sig();
       this.sessions = list.filter((s) => !s.parent);
       this.childCounts = new Map();
+      this.parentBySession = new Map();
       for (const s of list) {
         if (!s.parent) continue;
+        this.parentBySession.set(s.key, s.parent);
         const c = this.childCounts.get(s.parent) ?? [0, 0];
         c[0]++;
         if (s.status === "work") c[1]++;

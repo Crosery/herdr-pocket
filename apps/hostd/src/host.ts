@@ -461,7 +461,12 @@ export class Host {
     }
     if (uniflo) {
       this.sources.push("uniflo");
-      this.uniflo.start(this.publish);
+      this.uniflo.start(this.publish, (sessionKey, ev) => {
+        if (ev.kind !== "tool_call") return;
+        const rootKey = this.uniflo.rootSessionKey(sessionKey);
+        const agent = this.agents.find((x) => x.sessionKey === sessionKey || x.sessionKey === rootKey);
+        if (agent) this.portal.inspectToolCallForPortal(agent, ev.name, ev.input);
+      });
       added.push("uniflo");
     }
     if (!this.sourcesLogged) {
@@ -889,6 +894,7 @@ export class Host {
       let busy = false;
       let again = false;
       let failing = false;
+      let initialLoaded = false;
       const tick = async () => {
         if (stopped) return;
         if (busy) {
@@ -904,7 +910,16 @@ export class Host {
             failing = false;
             this.sendStream(f.id, { kind: "alive", at: Date.now() });
           }
-          for (const e of r.events) if ((liveAt.get(e.id) ?? 0) <= at) forward(e, false);
+          for (const e of r.events) {
+            if ((liveAt.get(e.id) ?? 0) <= at) {
+              const isFresh = initialLoaded && !seen.has(e.id);
+              forward(e, false);
+              if (isFresh && e.kind === "tool_call") {
+                this.portal.inspectToolCallForPortal(a, e.name, e.input);
+              }
+            }
+          }
+          initialLoaded = true;
         } catch (e) {
           if (!failing) this.sendStream(f.id, { kind: "stale", message: (e as Error).message, at: Date.now() });
           failing = true;
@@ -1101,7 +1116,8 @@ export class Host {
                 changed = true;
               }
             }
-            this.portal.inspectScreenForOAuth(a, text);
+            const fgArgv = this.hc.terminals.get(a.localId)?.foreground?.argv;
+            this.portal.inspectScreenForOAuth(a, text, fgArgv);
             const sub = this.hc.detectSubscreenFromSnapshot(a.localId, { text, altScreen: snap?.altScreen });
             if (sub) {
               if (this.subscreenByAgent.get(a.key) !== sub) {
@@ -1379,6 +1395,9 @@ export class Host {
       }
       const delivery = p.delivery === "steer" ? "steer" : "auto";
       const queued = this.enqueueSend(a, p.text, p.enter !== false, delivery);
+      if (p.enter !== false) {
+        this.portal.observeSubmittedCommand(a, p.text, "user_send");
+      }
       // In a turn, the program keeps typed text in its input box until the turn ends.
       const waiting = p.enter !== false && status === "working";
       if (waiting) {
@@ -1403,6 +1422,9 @@ export class Host {
       if (typeof p.data !== "string" || !p.data || p.data.length > 262_144) throw new RpcFailure("bad_request", "data is required");
       if (a.source === "hc" || (a.source === "herdr" && this.hc.terminals.has(a.localId))) {
         await this.hc.input(a.localId, p.data, Boolean(p.auto));
+        if (!p.auto) {
+          this.portal.observeTerminalInput(a, p.data);
+        }
         return { ok: true as const };
       }
       if (a.source === "herdr" && (p.data === "\x1b[13;2u" || p.data === "\x1b[27;2;13~" || p.data === "\x1b\r")) {

@@ -25,6 +25,22 @@ export interface ParsedOpenInvocation {
   url?: string;
 }
 
+export type AutoPortalIntent =
+  | {
+      type: "opener";
+      kind: PortalKind;
+      target?: string;
+      url?: string;
+      reveal: boolean;
+      app?: string;
+    }
+  | {
+      type: "app_window";
+      appHint: string;
+      label: string;
+      url?: string;
+    };
+
 export function classifyTarget(rawTarget: string, opts: { reveal?: boolean; isDir?: boolean; cwd?: string } = {}): ParsedOpenInvocation {
   let target = rawTarget.trim().replace(/^["']|["']$/g, "");
   if (opts.reveal) {
@@ -93,9 +109,386 @@ export function parseOpenerArgs(tool: string, argv: string[], cwd?: string): Par
     break;
   }
 
-  if (!rawTarget) return null;
+  if (!rawTarget) {
+    if (app && (cleanTool === "open" || cleanTool === "herdr-pocket-open")) {
+      return { kind: "window", target: app, reveal: false, app };
+    }
+    return null;
+  }
   const parsed = classifyTarget(rawTarget, { reveal, cwd });
   return app ? { ...parsed, app } : parsed;
+}
+
+interface ShellSegment {
+  tokens: string[];
+  heredocBody: string;
+}
+
+function tokenizeSegmentText(seg: string): string[] {
+  const tokens: string[] = [];
+  let cur = "";
+  let inTok = false;
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < seg.length; i += 1) {
+    const ch = seg[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") {
+        const next = seg[i + 1];
+        if (next === '"' || next === "\\" || next === "$" || next === "`") {
+          cur += next;
+          i += 1;
+          continue;
+        }
+      }
+      if (ch === '"') quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < seg.length) {
+      inTok = true;
+      cur += seg[i + 1]!;
+      i += 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      inTok = true;
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inTok) {
+        tokens.push(cur);
+        cur = "";
+        inTok = false;
+      }
+      continue;
+    }
+    if (ch === "#") break;
+    inTok = true;
+    cur += ch;
+  }
+  if (inTok) tokens.push(cur);
+  return tokens;
+}
+
+function splitTopLevelShellSegments(commandLine: string): ShellSegment[] {
+  const lines = commandLine.replace(/\r\n?/g, "\n").split("\n");
+  const out: ShellSegment[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      i += 1;
+      continue;
+    }
+
+    // Extract heredoc delimiters on this line (e.g. `<<'EOF'`, `<<EOF`, `<<-EOF`).
+    const heredocSpecs: Array<{ delim: string; stripTabs: boolean }> = [];
+    {
+      let quote: "'" | '"' | null = null;
+      for (let j = 0; j < line.length; j += 1) {
+        const ch = line[j]!;
+        if (quote === "'") {
+          if (ch === "'") quote = null;
+          continue;
+        }
+        if (quote === '"') {
+          if (ch === "\\") j += 1;
+          else if (ch === '"') quote = null;
+          continue;
+        }
+        if (ch === "\\") {
+          j += 1;
+          continue;
+        }
+        if (ch === "'" || ch === '"') {
+          quote = ch;
+          continue;
+        }
+        if (ch === "<" && line[j + 1] === "<" && line[j + 2] !== "<") {
+          const m = /^<<(-?)\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_-]*))/.exec(line.slice(j));
+          if (m) {
+            const delim = m[2] ?? m[3] ?? m[4] ?? "";
+            if (delim) heredocSpecs.push({ delim, stripTabs: m[1] === "-" });
+            j += m[0].length - 1;
+          }
+        }
+      }
+    }
+
+    // Split line by unquoted `;`, `&&`, `||`, `&`, `|`.
+    const parts: string[] = [];
+    let start = 0;
+    let quote: "'" | '"' | null = null;
+    for (let j = 0; j < line.length; j += 1) {
+      const ch = line[j]!;
+      if (quote === "'") {
+        if (ch === "'") quote = null;
+        continue;
+      }
+      if (quote === '"') {
+        if (ch === "\\") j += 1;
+        else if (ch === '"') quote = null;
+        continue;
+      }
+      if (ch === "\\") {
+        j += 1;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch === "#") {
+        parts.push(line.slice(start, j));
+        start = line.length;
+        break;
+      }
+      if ((ch === "&" && line[j + 1] === "&") || (ch === "|" && line[j + 1] === "|")) {
+        parts.push(line.slice(start, j));
+        j += 1;
+        start = j + 1;
+        continue;
+      }
+      if (ch === ";" || ch === "|" || ch === "&") {
+        parts.push(line.slice(start, j));
+        start = j + 1;
+      }
+    }
+    if (start <= line.length) parts.push(line.slice(start));
+
+    let heredocBody = "";
+    i += 1;
+    for (const spec of heredocSpecs) {
+      const bodyLines: string[] = [];
+      while (i < lines.length) {
+        const nextLine = lines[i]!;
+        const cmp = spec.stripTabs ? nextLine.replace(/^\t+/, "") : nextLine;
+        i += 1;
+        if (cmp === spec.delim) break;
+        bodyLines.push(nextLine);
+      }
+      if (bodyLines.length) heredocBody += `${heredocBody ? "\n" : ""}${bodyLines.join("\n")}`;
+    }
+
+    const nonEmptyParts = parts.map((p) => tokenizeSegmentText(p)).filter((t) => t.length > 0);
+    for (let k = 0; k < nonEmptyParts.length; k += 1) {
+      out.push({
+        tokens: nonEmptyParts[k]!,
+        heredocBody: k === nonEmptyParts.length - 1 ? heredocBody : "",
+      });
+    }
+  }
+  return out;
+}
+
+function unwrapCommandPrefix(tokens: string[]): { cmd: string; rest: string[] } | null {
+  let idx = 0;
+  while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx]!)) {
+    idx += 1;
+  }
+  while (idx < tokens.length) {
+    const head = tokens[idx]!;
+    const base = head.split("/").pop()?.toLowerCase() ?? head.toLowerCase();
+    if (base === "sudo") {
+      idx += 1;
+      while (idx < tokens.length && tokens[idx]!.startsWith("-")) {
+        if (tokens[idx] === "-u" || tokens[idx] === "-g") idx += 2;
+        else idx += 1;
+      }
+      continue;
+    }
+    if (base === "nohup" || base === "env") {
+      idx += 1;
+      while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx]!)) idx += 1;
+      continue;
+    }
+    if (base === "command") {
+      idx += 1;
+      while (idx < tokens.length && tokens[idx]!.startsWith("-")) {
+        if (tokens[idx] === "-v" || tokens[idx] === "-V") return null;
+        idx += 1;
+      }
+      continue;
+    }
+    return { cmd: base, rest: tokens.slice(idx + 1) };
+  }
+  return null;
+}
+
+const OPENER_TOOLS = new Set([
+  "open",
+  "xdg-open",
+  "gio",
+  "sensible-browser",
+  "wslview",
+  "herdr-pocket-open",
+  "herdr-pocket-browser",
+  "explorer",
+  "explorer.exe",
+]);
+
+function expandTildePath(raw: string): string {
+  if (raw === "~") return homedir();
+  if (raw.startsWith("~/") || raw.startsWith("~\\")) return join(homedir(), raw.slice(2));
+  return raw;
+}
+
+/** Extracts file/browser/window auto-portal intents from shell commands while ignoring quoted prose. */
+export function extractAutoPortalIntents(commandLine: string, cwd?: string): AutoPortalIntent[] {
+  if (!commandLine || !commandLine.trim()) return [];
+  const segments = splitTopLevelShellSegments(commandLine);
+  const intents: AutoPortalIntent[] = [];
+  let effectiveCwd = cwd?.trim() || undefined;
+
+  for (const seg of segments) {
+    const unwrapped = unwrapCommandPrefix(seg.tokens);
+    if (!unwrapped) continue;
+    const { cmd, rest } = unwrapped;
+
+    if (cmd === "cd" && rest[0] && !rest[0].startsWith("-")) {
+      const targetDir = expandTildePath(rest[0]);
+      effectiveCwd = effectiveCwd && !isAbsolute(targetDir) ? resolve(effectiveCwd, targetDir) : targetDir;
+      continue;
+    }
+
+    if (OPENER_TOOLS.has(cmd)) {
+      const parsed = parseOpenerArgs(cmd, rest, effectiveCwd);
+      if (!parsed) continue;
+      if (parsed.kind === "window" && parsed.app) {
+        intents.push({
+          type: "app_window",
+          appHint: parsed.app,
+          label: parsed.app,
+        });
+      } else {
+        intents.push({
+          type: "opener",
+          kind: parsed.kind,
+          target: parsed.target,
+          ...(parsed.url ? { url: parsed.url } : {}),
+          reveal: parsed.reveal,
+          ...(parsed.app ? { app: parsed.app } : {}),
+        });
+      }
+      continue;
+    }
+
+    if (cmd === "ego-browser" || cmd === "tabbit" || cmd === "agent-browser") {
+      const nonFlag = rest.find((t) => !t.startsWith("-"))?.toLowerCase();
+      if (
+        rest.some((t) => t === "--help" || t === "-h" || t === "--version" || t === "-v") ||
+        (nonFlag && (nonFlag === "skill" || nonFlag === "help" || nonFlag === "upgrade" || nonFlag === "import"))
+      ) {
+        continue;
+      }
+      const scanText = `${rest.join(" ")}\n${seg.heredocBody}`;
+      const urlMatch = /(https?:\/\/[^\s"'`<>()\\;]+)/i.exec(scanText);
+      const url = urlMatch?.[1];
+      if (cmd === "ego-browser") {
+        const spaceMatch = /taskSpace\(\s*["']([^"'\n]{1,60})["']/.exec(scanText);
+        intents.push({
+          type: "app_window",
+          appHint: "ego lite",
+          label: spaceMatch?.[1] ? `ego lite · ${spaceMatch[1]}` : "ego lite 浏览器",
+          ...(url ? { url } : {}),
+        });
+      } else if (cmd === "tabbit") {
+        intents.push({
+          type: "app_window",
+          appHint: "Tabbit",
+          label: "Tabbit 浏览器",
+          ...(url ? { url } : {}),
+        });
+      } else {
+        intents.push({
+          type: "app_window",
+          appHint: "Chrome",
+          label: "Agent 浏览器",
+          ...(url ? { url } : {}),
+        });
+      }
+    }
+  }
+
+  return intents;
+}
+
+const ANSI_STRIP_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bO[\s\S]?|\x1b[\s\S]?/g;
+
+/** Reconstructs submitted shell command lines from raw PTY keystrokes/pastes per agent terminal. */
+export class TerminalInputLineTracker {
+  private buffers = new Map<string, { chars: string[]; lastHadCr: boolean }>();
+
+  feed(agentKey: string, rawData: string): string[] {
+    if (!rawData) return [];
+    let entry = this.buffers.get(agentKey);
+    if (!entry) {
+      entry = { chars: [], lastHadCr: false };
+      this.buffers.set(agentKey, entry);
+    }
+
+    const cleaned = rawData.replace(ANSI_STRIP_RE, "");
+    const submitted: string[] = [];
+
+    for (const ch of cleaned) {
+      if (ch === "\r") {
+        const line = entry.chars.join("").trim();
+        entry.chars.length = 0;
+        entry.lastHadCr = true;
+        if (line) submitted.push(line);
+        continue;
+      }
+      if (ch === "\n") {
+        if (entry.lastHadCr) {
+          entry.lastHadCr = false;
+          continue;
+        }
+        const line = entry.chars.join("").trim();
+        entry.chars.length = 0;
+        if (line) submitted.push(line);
+        continue;
+      }
+      entry.lastHadCr = false;
+      if (ch === "\x03" || ch === "\x15") {
+        entry.chars.length = 0;
+        continue;
+      }
+      if (ch === "\x7f" || ch === "\x08") {
+        entry.chars.pop();
+        continue;
+      }
+      if (ch === "\x17") {
+        while (entry.chars.length && entry.chars[entry.chars.length - 1] === " ") entry.chars.pop();
+        while (entry.chars.length && entry.chars[entry.chars.length - 1] !== " ") entry.chars.pop();
+        continue;
+      }
+      if (ch === "\t") {
+        if (entry.chars.length < 4096) entry.chars.push(" ");
+        continue;
+      }
+      const code = ch.codePointAt(0) ?? 0;
+      if (code < 0x20) continue;
+      if (entry.chars.length < 4096) entry.chars.push(ch);
+    }
+
+    if (this.buffers.size > 64) {
+      const oldest = this.buffers.keys().next().value;
+      if (oldest && oldest !== agentKey) this.buffers.delete(oldest);
+    }
+    return submitted;
+  }
+
+  clear(agentKey: string): void {
+    this.buffers.delete(agentKey);
+  }
 }
 
 export function hookFilePath(dir = stateDir()): string {

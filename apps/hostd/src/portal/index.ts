@@ -18,7 +18,7 @@ import { stateDir } from "@herdr-pocket/update";
 import { CdpBrowserPool } from "./cdpBrowser.ts";
 import { OsCaptureDriver, computeCapabilities, type OsCaptureDeps } from "./osCapture.ts";
 import { PortalFileTicketStore, bundleHtmlForRelay, listDirectoryForPortal, mimeForFilename, readChunkForRpc } from "./p2pFiles.ts";
-import { PortalHookServer, classifyTarget, ensurePortalShims, parseOpenerArgs, type HookOpenPayload } from "./shims.ts";
+import { PortalHookServer, TerminalInputLineTracker, classifyTarget, ensurePortalShims, extractAutoPortalIntents, parseOpenerArgs, type AutoPortalIntent, type HookOpenPayload } from "./shims.ts";
 import type { FilesOptions } from "../files.ts";
 
 export interface PortalManagerDeps {
@@ -34,6 +34,26 @@ export interface PortalManagerDeps {
 }
 
 const MAX_PORTAL_ITEMS = 40;
+const AUTO_DEDUP_MS = 4000;
+const SCREEN_FOREGROUND_THROTTLE_MS = 8000;
+const BROWSER_WINDOW_HINTS = ["ego lite", "google chrome", "safari", "tabbit", "arc", "microsoft edge", "brave browser", "firefox", "chromium"];
+const TERMINAL_APP_NAMES = new Set(["herdr", "herdr pocket", "ghostty", "iterm2", "terminal", "终端", "wezterm", "alacritty", "kitty", "warp"]);
+const INLINE_FILE_EXT_RE = /\.(?:html?|png|jpe?g|webp|gif|svg|bmp|ico|avif|pdf|mp4|webm|mov|mp3|wav|m4a|ogg|aac|flac|csv|tsv|json|jsonl|docx?|xlsx?|pptx?|odt|ods|rtf|md|txt|ts|tsx|js|jsx|py|rs|go|css|yml|yaml|toml|sh|log)$/i;
+const APP_ALIASES: Record<string, string[]> = {
+  "ego lite": ["ego lite", "ego"],
+  chrome: ["google chrome", "chrome", "chromium"],
+  "google chrome": ["google chrome", "chrome", "chromium"],
+  finder: ["访达", "finder"],
+  "访达": ["访达", "finder"],
+  preview: ["预览", "preview"],
+  "预览": ["预览", "preview"],
+  tabbit: ["tabbit"],
+  safari: ["safari"],
+};
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 export class PortalManager {
   private deps: PortalManagerDeps;
@@ -46,6 +66,9 @@ export class PortalManager {
   private windowSeq = 0;
   private shimsInfo: { shimsDir: string; browserShim: string; execWrapper?: string } | null = null;
   private seenOAuthUrls = new Set<string>();
+  private inputTracker = new TerminalInputLineTracker();
+  private recentAutoKeys = new Map<string, number>();
+  private lastForegroundCheckAt = new Map<string, number>();
   private streamWatchers = new Map<
     string,
     {
@@ -173,7 +196,8 @@ export class PortalManager {
     const hasRemote = this.deps.hasRemoteViewers();
     const caps = await this.capabilities();
     const isHeadless = caps.sessionType === "headless";
-    if (!hasRemote && !isHeadless && payload.tool !== "herdr-pocket-open" && payload.tool !== "herdr-pocket-browser") {
+    const forceHandled = payload.tool === "herdr-pocket-open" || payload.tool === "herdr-pocket-browser";
+    if (!hasRemote && !isHeadless && !forceHandled) {
       // No remote viewer connected and host has its own desktop: let native OS opener handle it.
       return { handled: false };
     }
@@ -185,6 +209,18 @@ export class PortalManager {
     if (!parsed) return { handled: false };
 
     const agent = this.resolveAgentForHook(payload);
+    if (parsed.kind === "window" && parsed.app) {
+      this.markAutoDedup(`${agent?.key ?? ""}\0win\0${parsed.app.toLowerCase()}`);
+      void this.detectAndOpenWindowPortal({
+        agent,
+        appHint: parsed.app,
+        titleHint: parsed.app,
+        urlHint: parsed.url,
+      });
+      return { handled: isHeadless || forceHandled };
+    }
+
+    this.markAutoDedup(`${agent?.key ?? ""}\0${parsed.kind}\0${parsed.url || parsed.target}`);
     const opened = await this.openPortal({
       agentKey: agent?.key,
       kind: parsed.kind,
@@ -193,7 +229,8 @@ export class PortalManager {
       reveal: parsed.reveal,
       title: parsed.app ? `${parsed.app} · ${basename(parsed.target)}` : undefined,
     });
-    return { handled: true, id: opened.item.id };
+    // Return handled:false on GUI hosts for native `open` shims so the real OS app/browser also launches locally.
+    return { handled: isHeadless || forceHandled, id: opened.item.id };
   }
 
   private pruneItems(): void {
@@ -512,40 +549,337 @@ export class PortalManager {
     w.offBrowser?.();
   }
 
-  /** Detect `open` / `xdg-open` / OAuth localhost hints from passive Uniflo tool calls. */
-  inspectToolCallForPortal(agent: Agent, toolName: string, input: unknown): void {
-    if (!this.deps.hasRemoteViewers()) return;
-    if (!/bash|shell|exec|terminal/i.test(toolName) || !input || typeof input !== "object") return;
-    const cmd = typeof (input as Record<string, unknown>).command === "string"
-      ? (input as Record<string, unknown>).command as string
-      : typeof (input as Record<string, unknown>).cmd === "string"
-        ? (input as Record<string, unknown>).cmd as string
-        : "";
-    if (!cmd) return;
-    const m = /\b(open\s+-R|open|xdg-open|gio\s+open)\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i.exec(cmd);
-    if (!m) return;
-    const rawTarget = (m[2] ?? m[3] ?? m[4] ?? "").trim();
-    if (!rawTarget || rawTarget.startsWith("-")) return;
-    const reveal = /open\s+-R/i.test(m[1]!);
-    const full = agent.cwd && !rawTarget.startsWith("/") && !/^https?:/i.test(rawTarget)
-      ? resolve(agent.cwd, rawTarget)
-      : rawTarget;
-    if (!/^https?:/i.test(full) && !existsSync(full)) return;
-    const dup = [...this.items.values()].find(
-      (i) => i.agentKey === agent.key && (i.targetPath === full || i.url === full) && Date.now() - i.createdAt < 15_000,
-    );
-    if (dup) return;
-    void this.openPortal({
-      agentKey: agent.key,
-      kind: /^https?:/i.test(full) ? "browser" : reveal ? "reveal" : /\.html?$/i.test(full) ? "html" : "file",
-      target: full,
-      reveal,
-    }).catch(() => {});
+  private markAutoDedup(key: string): void {
+    const now = Date.now();
+    this.recentAutoKeys.set(key, now);
+    if (this.recentAutoKeys.size > 160) {
+      const oldest = this.recentAutoKeys.keys().next().value;
+      if (oldest) this.recentAutoKeys.delete(oldest);
+    }
   }
 
-  /** Detect OAuth / localhost login URLs printed on active remote terminals and surface in PiP. */
-  inspectScreenForOAuth(agent: Agent, screenText: string): void {
-    if (!this.deps.hasRemoteViewers() || !screenText) return;
+  private checkAndMarkAutoDedup(key: string, ttlMs = AUTO_DEDUP_MS): boolean {
+    const now = Date.now();
+    const prev = this.recentAutoKeys.get(key);
+    if (prev !== undefined && now - prev < ttlMs) return true;
+    this.markAutoDedup(key);
+    return false;
+  }
+
+  private matchWindowByHint(
+    windows: RemoteWindowInfo[],
+    hints: string[],
+    beforeIds?: Set<string>,
+  ): RemoteWindowInfo | undefined {
+    const visible = windows.filter((w) => !w.isScreen && (w.bounds?.width ?? 200) >= 140 && (w.bounds?.height ?? 200) >= 100);
+    const expandedHints = hints.flatMap((h) => {
+      const lower = h.trim().toLowerCase();
+      return APP_ALIASES[lower] ?? (lower ? [lower] : []);
+    });
+    const allowPocket = expandedHints.some((h) => h.includes("herdr pocket"));
+    const candidates = visible.filter((w) => allowPocket || !w.appName.toLowerCase().includes("herdr pocket"));
+
+    const matchHint = (w: RemoteWindowInfo): boolean => {
+      if (!expandedHints.length) return false;
+      const app = w.appName.toLowerCase();
+      const title = w.title.toLowerCase();
+      return expandedHints.some((h) => app.includes(h) || title.includes(h));
+    };
+
+    if (expandedHints.length) {
+      const freshMatch = beforeIds ? candidates.find((w) => !beforeIds.has(w.id) && matchHint(w)) : undefined;
+      if (freshMatch) return freshMatch;
+      const matched = candidates.filter(matchHint);
+      if (matched.length) {
+        return matched.sort(
+          (a, b) => (b.bounds?.width ?? 800) * (b.bounds?.height ?? 600) - (a.bounds?.width ?? 800) * (a.bounds?.height ?? 600),
+        )[0];
+      }
+    }
+
+    if (beforeIds) {
+      const freshNonTerm = candidates.find(
+        (w) => !beforeIds.has(w.id) && !TERMINAL_APP_NAMES.has(w.appName.toLowerCase()),
+      );
+      if (freshNonTerm) return freshNonTerm;
+    }
+    return undefined;
+  }
+
+  private pushWindowPortalUpdate(
+    existing: PortalItem,
+    opts: { title?: string; url?: string; cap: { mime: "image/jpeg" | "image/png"; data: string; width: number; height: number } },
+  ): void {
+    const now = Date.now();
+    if (opts.title) existing.title = opts.title;
+    if (opts.url) {
+      existing.url = opts.url;
+      existing.subtitle = opts.url;
+    }
+    existing.width = opts.cap.width;
+    existing.height = opts.cap.height;
+    existing.updatedAt = now;
+    this.emitEvent("opened", existing);
+    const frame: PortalFramePayload = {
+      portalId: existing.id,
+      seq: ++this.windowSeq,
+      mime: opts.cap.mime,
+      data: opts.cap.data,
+      width: opts.cap.width,
+      height: opts.cap.height,
+      url: existing.url,
+      title: existing.title,
+      at: now,
+    };
+    this.deps.onPortalEvent({ kind: "portal_frame", ...frame });
+    for (const w of this.streamWatchers.values()) {
+      if (w.portalId === existing.id || (w.agentKey && existing.agentKey && w.agentKey === existing.agentKey)) {
+        w.send({ kind: "portal_frame", ...frame });
+      }
+    }
+  }
+
+  private async detectAndOpenWindowPortal(opts: {
+    agent?: Agent;
+    appHint?: string | string[];
+    titleHint?: string;
+    urlHint?: string;
+    beforeIds?: Set<string>;
+    fallbackOpener?: Extract<AutoPortalIntent, { type: "opener" }>;
+    immediate?: boolean;
+  }): Promise<PortalItem | null> {
+    const hints = Array.isArray(opts.appHint) ? opts.appHint : opts.appHint ? [opts.appHint] : [];
+    const delays = opts.immediate ? [0, 300, 900, 1700] : [250, 800, 1600];
+
+    for (const ms of delays) {
+      if (ms > 0) await delayMs(ms);
+      const wins = await this.capture.listWindows().catch(() => []);
+      const hit = this.matchWindowByHint(wins, hints, opts.beforeIds);
+      if (!hit) continue;
+      const cap = await this.capture.captureWindow(hit.id).catch(() => null);
+      if (!cap) continue;
+
+      const existing = [...this.items.values()].find(
+        (i) => i.agentKey === opts.agent?.key && i.kind === "window" && i.windowId === hit.id,
+      );
+      const nextTitle = opts.titleHint || `${hit.appName}${hit.title && hit.title !== hit.appName ? ` · ${hit.title}` : ""}`;
+      if (existing) {
+        this.pushWindowPortalUpdate(existing, { title: nextTitle, url: opts.urlHint, cap });
+        return existing;
+      }
+      const { item } = await this.openPortal({
+        agentKey: opts.agent?.key,
+        kind: "window",
+        windowId: hit.id,
+        url: opts.urlHint,
+        title: nextTitle,
+      });
+      this.pushWindowPortalUpdate(item, { title: nextTitle, url: opts.urlHint, cap });
+      return item;
+    }
+
+    if (opts.urlHint) {
+      const existingBrowser = [...this.items.values()].find(
+        (i) => i.agentKey === opts.agent?.key && i.kind === "browser",
+      );
+      if (existingBrowser && existingBrowser.url === opts.urlHint) {
+        existingBrowser.updatedAt = Date.now();
+        this.emitEvent("opened", existingBrowser);
+        return existingBrowser;
+      }
+      const { item } = await this.openPortal({
+        agentKey: opts.agent?.key,
+        kind: "browser",
+        url: opts.urlHint,
+        title: opts.titleHint,
+      }).catch(() => ({ item: null as PortalItem | null }));
+      return item;
+    }
+
+    if (opts.fallbackOpener?.target && existsSync(opts.fallbackOpener.target)) {
+      const { item } = await this.openPortal({
+        agentKey: opts.agent?.key,
+        kind: opts.fallbackOpener.kind,
+        target: opts.fallbackOpener.target,
+        reveal: opts.fallbackOpener.reveal,
+      }).catch(() => ({ item: null as PortalItem | null }));
+      return item;
+    }
+    return null;
+  }
+
+  /** Reconstruct submitted commands from raw terminal keystrokes/pastes and auto-open matching portals. */
+  observeTerminalInput(agent: Agent, rawData: string): void {
+    if (!this.deps.hasRemoteViewers()) return;
+    const submitted = this.inputTracker.feed(agent.key, rawData);
+    for (const line of submitted) {
+      this.observeSubmittedCommand(agent, line, "terminal_input");
+    }
+  }
+
+  /** Parse submitted shell commands (typed, pasted, sent via composer, or run by an Agent) into live Portals. */
+  observeSubmittedCommand(
+    agent: Agent,
+    commandText: string,
+    _source: "terminal_input" | "user_send" | "agent_tool" | "foreground" = "terminal_input",
+  ): void {
+    if (!this.deps.hasRemoteViewers() || !commandText) return;
+    const liveCwd = this.deps.getTerminals().get(agent.localId)?.cwd || agent.cwd || undefined;
+    const intents = extractAutoPortalIntents(commandText, liveCwd);
+    for (const intent of intents) {
+      void this.applyAutoPortalIntent(agent, intent).catch(() => {});
+    }
+  }
+
+  private async applyAutoPortalIntent(agent: Agent, intent: AutoPortalIntent): Promise<void> {
+    if (intent.type === "app_window") {
+      const dedupKey = `${agent.key}\0win\0${intent.appHint.toLowerCase()}\0${intent.url ?? ""}`;
+      if (this.checkAndMarkAutoDedup(dedupKey, 2500)) return;
+      const appLower = intent.appHint.toLowerCase();
+      const immediate = appLower.includes("ego") || appLower.includes("tabbit");
+      await this.detectAndOpenWindowPortal({
+        agent,
+        appHint: intent.appHint,
+        titleHint: intent.label,
+        urlHint: intent.url,
+        immediate,
+      });
+      return;
+    }
+
+    const dedupId = intent.url || intent.target || intent.app || "";
+    if (this.checkAndMarkAutoDedup(`${agent.key}\0${intent.kind}\0${dedupId}`, 3500)) return;
+
+    if (intent.app) {
+      const wins = await this.capture.listWindows().catch(() => []);
+      await this.detectAndOpenWindowPortal({
+        agent,
+        appHint: intent.app,
+        urlHint: intent.url,
+        beforeIds: new Set(wins.map((w) => w.id)),
+        fallbackOpener: intent,
+      });
+      return;
+    }
+
+    if (intent.kind === "browser") {
+      const url = intent.url || intent.target;
+      if (!url) return;
+      const wins = await this.capture.listWindows().catch(() => []);
+      await this.detectAndOpenWindowPortal({
+        agent,
+        appHint: BROWSER_WINDOW_HINTS,
+        urlHint: url,
+        beforeIds: new Set(wins.map((w) => w.id)),
+        titleHint: url,
+      });
+      return;
+    }
+
+    const target = intent.target;
+    if (!target || !existsSync(target)) return;
+    const existing = [...this.items.values()].find(
+      (i) => i.agentKey === agent.key && i.kind === intent.kind && i.targetPath === target,
+    );
+    if (existing) {
+      existing.updatedAt = Date.now();
+      this.emitEvent("opened", existing);
+    } else {
+      await this.openPortal({
+        agentKey: agent.key,
+        kind: intent.kind,
+        target,
+        reveal: intent.reveal,
+      });
+    }
+
+    if (intent.kind === "file" && !INLINE_FILE_EXT_RE.test(target)) {
+      const wins = await this.capture.listWindows().catch(() => []);
+      await this.detectAndOpenWindowPortal({
+        agent,
+        beforeIds: new Set(wins.map((w) => w.id)),
+      });
+    }
+  }
+
+  /** Detect `open` / `xdg-open` / `ego-browser` / MCP browser / file-display calls from Agent turns or shell tools. */
+  inspectToolCallForPortal(agent: Agent, toolName: string, input: unknown): void {
+    if (!this.deps.hasRemoteViewers() || !input || typeof input !== "object") return;
+    const inp = input as Record<string, unknown>;
+
+    if (/bash|zsh|shell|exec|terminal|command/i.test(toolName)) {
+      const cmd =
+        (typeof inp.command === "string" && inp.command) ||
+        (typeof inp.CommandLine === "string" && inp.CommandLine) ||
+        (typeof inp.cmd === "string" && inp.cmd) ||
+        (typeof inp.script === "string" && inp.script) ||
+        "";
+      if (cmd) this.observeSubmittedCommand(agent, cmd, "agent_tool");
+      return;
+    }
+
+    if (/ego[-_]?browser|tabbit|playwright|puppeteer|chrome[-_]?devtools|browser|navigate|goto|open_url|web_preview/i.test(toolName)) {
+      const url =
+        (typeof inp.url === "string" && inp.url) ||
+        (typeof inp.href === "string" && inp.href) ||
+        (typeof inp.target === "string" && /^https?:/i.test(inp.target) && inp.target) ||
+        undefined;
+      const appHint = /ego/i.test(toolName)
+        ? "ego lite"
+        : /tabbit/i.test(toolName)
+          ? "Tabbit"
+          : BROWSER_WINDOW_HINTS;
+      const dedupKey = `${agent.key}\0mcp\0${Array.isArray(appHint) ? "browser" : appHint}\0${url ?? ""}`;
+      if (this.checkAndMarkAutoDedup(dedupKey, 2500)) return;
+      void this.detectAndOpenWindowPortal({
+        agent,
+        appHint,
+        titleHint: /ego/i.test(toolName) ? "ego lite 浏览器" : /tabbit/i.test(toolName) ? "Tabbit 浏览器" : undefined,
+        urlHint: url,
+        immediate: true,
+      }).catch(() => {});
+      return;
+    }
+
+    if (/display_file|open_file|preview_file/i.test(toolName)) {
+      const raw =
+        (typeof inp.path === "string" && inp.path) ||
+        (typeof inp.file_path === "string" && inp.file_path) ||
+        (typeof inp.target === "string" && inp.target) ||
+        "";
+      if (!raw) return;
+      const full = agent.cwd && !raw.startsWith("/") ? resolve(agent.cwd, raw) : raw;
+      if (!existsSync(full)) return;
+      if (this.checkAndMarkAutoDedup(`${agent.key}\0display\0${full}`, 3500)) return;
+      const kind: PortalKind = /\.html?$/i.test(full) ? "html" : "file";
+      void this.openPortal({ agentKey: agent.key, kind, target: full }).catch(() => {});
+    }
+  }
+
+  /** Detect OAuth URLs or running browser CLIs (`ego-browser`, `tabbit`) on active remote terminals. */
+  inspectScreenForOAuth(agent: Agent, screenText: string, fgArgv?: string[]): void {
+    if (!this.deps.hasRemoteViewers()) return;
+
+    if (fgArgv?.length) {
+      const joined = fgArgv.join(" ");
+      if (/\b(ego-browser|tabbit|agent-browser)\b/i.test(joined)) {
+        const prevAt = this.lastForegroundCheckAt.get(agent.key) ?? 0;
+        if (Date.now() - prevAt >= SCREEN_FOREGROUND_THROTTLE_MS) {
+          this.lastForegroundCheckAt.set(agent.key, Date.now());
+          this.observeSubmittedCommand(agent, joined, "foreground");
+        }
+      }
+    }
+
+    if (!screenText) return;
+    if (/\[p\d+\s+"[^"]*"\s+\|\s+space\s+"/.test(screenText)) {
+      const prevAt = this.lastForegroundCheckAt.get(agent.key) ?? 0;
+      if (Date.now() - prevAt >= SCREEN_FOREGROUND_THROTTLE_MS) {
+        this.lastForegroundCheckAt.set(agent.key, Date.now());
+        this.observeSubmittedCommand(agent, "ego-browser nodejs", "foreground");
+      }
+    }
+
     const flat = screenText.replace(/\r/g, "");
     const m = /(https?:\/\/[^\s"'<>()]+(?:oauth|authorize|login|auth)[^\s"'<>()]*)/i.exec(flat);
     if (!m?.[1]) return;

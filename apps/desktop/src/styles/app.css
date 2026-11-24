@@ -5560,8 +5560,8 @@ a {
   right: 16px;
   bottom: 108px;
   z-index: 42;
-  width: 300px;
-  height: 210px;
+  width: 320px;
+  height: 224px;
   min-width: 220px;
   min-height: 150px;
   max-width: calc(100vw - 24px);
@@ -5574,6 +5574,12 @@ a {
   box-shadow: 0 12px 32px rgba(18, 12, 24, 0.22);
   overflow: hidden;
   backdrop-filter: blur(12px);
+}
+
+.session-portal-pip.in-term {
+  top: 14px;
+  right: 16px;
+  bottom: auto;
 }
 
 .session-portal-pip.is-collapsed {
@@ -5688,6 +5694,26 @@ a {
   min-height: 0;
   object-fit: cover;
   background: #141219;
+}
+
+.session-portal-pip-framewrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.session-portal-pip-iframe {
+  width: 333.34%;
+  height: 333.34%;
+  border: 0;
+  transform: scale(0.3);
+  transform-origin: 0 0;
+  pointer-events: none;
+  background: var(--surface);
 }
 
 .session-portal-pip-card {

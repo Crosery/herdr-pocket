@@ -5,6 +5,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronUp,
+  ExternalLink,
   FileCode2,
   FolderSearch,
   Globe,
@@ -12,13 +13,19 @@ import {
   X,
 } from "lucide-react";
 import type { Agent, PortalItem } from "@herdr-pocket/protocol";
+import { isTauri } from "../lib/bridge";
+import { useLocalHostDeviceId } from "../lib/fonts";
+import { native } from "../lib/native";
+import { rpcCall } from "../lib/relay";
 import {
   closePortalSurface,
+  filterVisiblePortalItems,
   portalStore,
   subscribeAgentPortalUpdates,
   subscribePortalFrames,
 } from "../lib/portalClient";
 import { liveStore } from "../lib/store";
+import { openWebTab, shellStore } from "../shell/shellStore";
 
 type ResizeDir = "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
 
@@ -27,6 +34,9 @@ const PIP_MAX_W = 880;
 const PIP_MIN_H = 150;
 const PIP_MAX_H = 680;
 const PIP_MARGIN = 12;
+const PIP_DEFAULT_W = 320;
+const PIP_DEFAULT_H = 224;
+const PIP_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|gif|svg|bmp|ico|avif)$/i;
 
 interface PipBox {
   x: number | null;
@@ -71,35 +81,57 @@ function portalIcon(kind: PortalItem["kind"]) {
 export function SessionPortalPiP({
   agent,
   visible = true,
+  mode = "chat",
   onExpandPortal,
 }: {
   agent: Agent;
   visible?: boolean;
+  mode?: "chat" | "term";
   onExpandPortal: (portalId: string) => void;
 }) {
   const itemsById = portalStore.use((s) => s.itemsById);
   const framesById = portalStore.use((s) => s.framesById);
   const dismissedIds = portalStore.use((s) => s.dismissedIds);
+  const manualIds = portalStore.use((s) => s.manualIds);
   const directAddr = liveStore.use((s) => s.direct[agent.deviceId]);
+  const localHostId = useLocalHostDeviceId();
+  const isTauriApp = isTauri();
 
   const items = useMemo(
     () =>
-      Object.values(itemsById)
-        .filter((i) => i.hostId === agent.deviceId && (!i.agentKey || i.agentKey === agent.key) && !dismissedIds[i.id])
-        .sort((a, b) => b.updatedAt - a.updatedAt),
-    [agent.deviceId, agent.key, dismissedIds, itemsById],
+      filterVisiblePortalItems({
+        itemsById,
+        dismissedIds,
+        manualIds,
+        agent,
+        isTauriApp,
+        localHostId,
+      }),
+    [agent, dismissedIds, isTauriApp, itemsById, localHostId, manualIds],
   );
 
   const [index, setIndex] = useState(0);
   const [collapsed, setCollapsed] = useState(false);
-  const [box, setBox] = useState<PipBox>({ x: null, y: null, w: 300, h: 210 });
+  const [box, setBox] = useState<PipBox>({ x: null, y: null, w: PIP_DEFAULT_W, h: PIP_DEFAULT_H });
   const [gesture, setGesture] = useState<"idle" | "drag" | "resize">("idle");
+  const [htmlPreview, setHtmlPreview] = useState<{ portalId: string; memUrl?: string | null; srcDoc?: string } | null>(null);
+  const [imgPreview, setImgPreview] = useState<{ portalId: string; dataUri: string } | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const prevTopIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!visible) return;
     return subscribeAgentPortalUpdates(agent.deviceId, agent.key);
   }, [agent.deviceId, agent.key, visible]);
+
+  useEffect(() => {
+    const topId = items[0]?.id ?? null;
+    if (topId && topId !== prevTopIdRef.current) {
+      setIndex(0);
+      setCollapsed(false);
+    }
+    prevTopIdRef.current = topId;
+  }, [items]);
 
   useEffect(() => {
     const onResize = () => {
@@ -117,15 +149,83 @@ export function SessionPortalPiP({
   }, [collapsed]);
 
   const current = items[Math.min(index, Math.max(0, items.length - 1))];
+  const currentId = current?.id;
+  const currentKind = current?.kind;
+  const currentHostId = current?.hostId;
+  const currentPath = current?.targetPath;
+  const currentTitle = current?.title;
+  const currentMime = current?.mime;
+  const currentCanInteract = Boolean(current?.canInteract);
 
   useEffect(() => {
-    if (!visible || collapsed || !current || !current.canInteract) return;
-    return subscribePortalFrames(current.hostId, current.id, 3);
-  }, [collapsed, current, visible]);
+    if (!visible || collapsed || !currentHostId || !currentId || !currentCanInteract) return;
+    return subscribePortalFrames(currentHostId, currentId, 6);
+  }, [collapsed, currentCanInteract, currentHostId, currentId, visible]);
+
+  useEffect(() => {
+    if (!visible || collapsed || !currentId || !currentHostId || !currentPath || currentKind !== "html") {
+      setHtmlPreview(null);
+      return;
+    }
+    let alive = true;
+    void rpcCall(currentHostId, "portal.bundleHtml", {
+      agent: agent.key,
+      path: currentPath,
+      ...(agent.cwd ? { cwd: agent.cwd } : {}),
+    })
+      .then(async (res) => {
+        if (!alive || !res?.html) return;
+        let memUrl: string | null = null;
+        if (isTauri() && native.available()) {
+          memUrl = await native.registerMemHtmlPreview(res.title || currentTitle || "preview.html", res.html).catch(() => null);
+        }
+        if (alive) {
+          setHtmlPreview({ portalId: currentId, memUrl, srcDoc: res.html });
+        }
+      })
+      .catch(() => {
+        if (alive) setHtmlPreview(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [agent.cwd, agent.key, collapsed, currentHostId, currentId, currentKind, currentPath, currentTitle, visible]);
+
+  const isInlineImageFile =
+    currentKind === "file" && Boolean(currentPath && (PIP_IMAGE_EXT_RE.test(currentPath) || currentMime?.startsWith("image/")));
+
+  useEffect(() => {
+    if (!visible || collapsed || !currentId || !currentHostId || !currentPath || !isInlineImageFile) {
+      setImgPreview(null);
+      return;
+    }
+    let alive = true;
+    void rpcCall(currentHostId, "files.readChunk", {
+      agent: agent.key,
+      path: currentPath,
+      offset: 0,
+      length: 1536 * 1024,
+    })
+      .then((c) => {
+        if (!alive || !c?.base64) return;
+        setImgPreview({ portalId: currentId, dataUri: `data:${c.mime || "image/png"};base64,${c.base64}` });
+      })
+      .catch(() => {
+        if (alive) setImgPreview(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [agent.key, collapsed, currentHostId, currentId, currentPath, isInlineImageFile, visible]);
 
   if (!items.length || !current) return null;
 
   const frame = framesById[current.id];
+  const activeHtml = htmlPreview?.portalId === current.id ? htmlPreview : null;
+  const activeImg = imgPreview?.portalId === current.id ? imgPreview : null;
+  const openUrl =
+    (current.url && /^https?:\/\//i.test(current.url) ? current.url : null) ??
+    (activeHtml?.memUrl ? activeHtml.memUrl : null);
   const p2pLabel = directAddr || current.transportHint === "p2p" ? "P2P 直连" : "中继";
 
   const currentAnchorRect = () => {
@@ -145,7 +245,9 @@ export function SessionPortalPiP({
     }
     return {
       x: box.x ?? Math.max(PIP_MARGIN, (typeof window !== "undefined" ? window.innerWidth : 1000) - box.w - 24),
-      y: box.y ?? Math.max(PIP_MARGIN, (typeof window !== "undefined" ? window.innerHeight : 700) - box.h - 120),
+      y:
+        box.y ??
+        (mode === "term" ? 14 : Math.max(PIP_MARGIN, (typeof window !== "undefined" ? window.innerHeight : 700) - box.h - 120)),
       w: box.w,
       h: box.h,
       parentW: typeof window !== "undefined" ? window.innerWidth : 1200,
@@ -260,10 +362,13 @@ export function SessionPortalPiP({
   return (
     <div
       ref={rootRef}
-      className={`session-portal-pip${collapsed ? " is-collapsed" : ""}${gesture === "drag" ? " is-dragging" : ""}${gesture === "resize" ? " is-resizing" : ""}`}
+      className={`session-portal-pip${mode === "term" ? " in-term" : ""}${collapsed ? " is-collapsed" : ""}${gesture === "drag" ? " is-dragging" : ""}${gesture === "resize" ? " is-resizing" : ""}`}
       style={posStyle}
       role="region"
       aria-label={`跨端回传浮窗 · ${current.title}`}
+      onMouseDown={(e) => {
+        e.preventDefault();
+      }}
     >
       {!collapsed
         ? dirs.map((d) => (
@@ -302,6 +407,17 @@ export function SessionPortalPiP({
               <ChevronRight size={12} />
             </button>
           </div>
+        ) : null}
+        {openUrl ? (
+          <button
+            type="button"
+            className="session-portal-pip-btn"
+            title="在内置浏览器标签打开"
+            aria-label="在内置浏览器标签打开"
+            onClick={() => openWebTab(openUrl, current.title, { spaceKey: shellStore.get().selectedSpace })}
+          >
+            <ExternalLink size={12} />
+          </button>
         ) : null}
         <button
           type="button"
@@ -345,6 +461,23 @@ export function SessionPortalPiP({
               className="session-portal-pip-img"
               draggable={false}
             />
+          ) : activeImg ? (
+            <img
+              src={activeImg.dataUri}
+              alt={current.title}
+              className="session-portal-pip-img"
+              draggable={false}
+            />
+          ) : activeHtml && (activeHtml.memUrl || activeHtml.srcDoc) ? (
+            <div className="session-portal-pip-framewrap">
+              <iframe
+                title={current.title}
+                className="session-portal-pip-iframe"
+                sandbox="allow-scripts"
+                tabIndex={-1}
+                {...(activeHtml.memUrl ? { src: activeHtml.memUrl } : { srcDoc: activeHtml.srcDoc })}
+              />
+            </div>
           ) : (
             <div className="session-portal-pip-card">
               <div className="session-portal-pip-kind">
