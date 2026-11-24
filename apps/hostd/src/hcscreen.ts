@@ -377,7 +377,10 @@ export class HcScreens {
     let pendingBytes = 0;
     let consumedBytes = 0;
     let lastEmitAt = 0;
+    let sawFirstEmit = false;
+    let firstBurstStartAt = 0;
     const MAX_CHUNK = 192 * 1024;
+    const FIRST_BURST_CAP = 512 * 1024;
     const kittyStream = new KittyHostStream();
 
     const flush = () => {
@@ -393,6 +396,7 @@ export class HcScreens {
       const combined = pending.length === 1 ? pending[0]! : Buffer.concat(pending, pendingBytes);
       pending = [];
       pendingBytes = 0;
+      sawFirstEmit = true;
       lastEmitAt = Date.now();
       for (let off = 0; off < combined.length; off += MAX_CHUNK) {
         onData(combined.subarray(off, off + MAX_CHUNK), curCols, curRows);
@@ -455,6 +459,18 @@ export class HcScreens {
         }
       }
       if (!pendingBytes) return;
+      if (!sawFirstEmit) {
+        const now = Date.now();
+        if (!firstBurstStartAt) firstBurstStartAt = now;
+        const burstElapsed = now - firstBurstStartAt;
+        if (pendingBytes >= FIRST_BURST_CAP || burstElapsed >= 60) {
+          flush();
+        } else {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(flush, Math.min(18, Math.max(1, 60 - burstElapsed)));
+        }
+        return;
+      }
       const elapsed = Date.now() - lastEmitAt;
       if (pendingBytes >= MAX_CHUNK || elapsed >= 12) {
         flush();

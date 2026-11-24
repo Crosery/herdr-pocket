@@ -577,9 +577,11 @@ fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
         tauri::WindowEvent::Focused(_) | tauri::WindowEvent::Resized(_) => {
             if matches!(event, tauri::WindowEvent::Resized(_)) {
                 mainwin::record_window_geometry_change(window.app_handle());
+                mainwin::sync_traffic_light_metrics(window.app_handle());
             }
             mainwin::visibility_changed(window.app_handle());
             if matches!(event, tauri::WindowEvent::Focused(true)) {
+                mainwin::sync_traffic_light_metrics(window.app_handle());
                 mainwin::wake(window.app_handle(), "focus");
             }
         }
@@ -780,10 +782,12 @@ pub fn run() {
             commands::pick_file,
             commands::local_read_file,
             commands::register_local_preview_token,
+            commands::register_mem_html_preview,
             commands::local_reveal_in_folder,
             commands::local_open_file,
             commands::local_agent_btw,
             commands::query_os_modifiers,
+            commands::query_traffic_light_metrics,
             updater::update_fetch_github_latest,
             updater::update_download_and_stage,
             updater::update_restart_and_apply,
@@ -888,6 +892,25 @@ fn serve_pocket_local(uri_str: &str, range_hdr: Option<&str>) -> tauri::http::Re
             .header("cache-control", "public, max-age=3600, immutable")
             .body((*bytes).clone())
             .unwrap();
+    }
+
+    if let Some(rest) = url.path().strip_prefix("/cap/") {
+        let (token, rel) = match rest.split_once('/') {
+            Some((t, r)) => (t, r),
+            None => (rest, ""),
+        };
+        if token.starts_with("mem-") {
+            let Some(bytes) = commands::get_mem_html_preview(token, rel) else {
+                return empty_err(404);
+            };
+            return tauri::http::Response::builder()
+                .status(200)
+                .header("content-type", "text/html; charset=utf-8")
+                .header("cache-control", "no-store")
+                .header("access-control-allow-origin", "*")
+                .body(bytes)
+                .unwrap();
+        }
     }
 
     let resolved = if let Some(rest) = url.path().strip_prefix("/cap/") {
@@ -1149,6 +1172,25 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_pocket_local_serves_mem_html_preview_and_blocks_mismatch() {
+        let html = "<!doctype html><html><body><script>window.__ok=1</script></body></html>";
+        let url = crate::commands::issue_mem_html_preview_url("架构关系图.html", html).unwrap();
+        assert!(url.contains("/cap/mem-"));
+
+        let resp = super::serve_pocket_local(&url, None);
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(resp.body(), html.as_bytes());
+
+        let token = url.split("/cap/").nth(1).unwrap().split('/').next().unwrap();
+        let bad = format!("pocket-local://localhost/cap/{token}/other.html");
+        assert_eq!(super::serve_pocket_local(&bad, None).status().as_u16(), 404);
     }
 
     #[test]

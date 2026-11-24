@@ -4311,20 +4311,26 @@ a {
 /* macOS overlay title bar (Tauri): the window has no title strip, so views without the v3
    sidebar keep their content below the traffic lights and get a strip to drag the window by. */
 :root[data-titlebar="overlay"] {
-  --safe-top: 28px;
+  --tl-safe-left: 88px;
+  --safe-top: 38px;
+}
+
+:root[data-titlebar="overlay"][data-fullscreen] {
+  --tl-safe-left: 14px;
+  --safe-top: 0px;
 }
 
 .titlebar-strip {
   display: none;
 }
 
-:root[data-titlebar="overlay"] .titlebar-strip {
+:root[data-titlebar="overlay"]:not([data-fullscreen]) .titlebar-strip {
   display: block;
   position: fixed;
   top: 4px;
-  left: 6px;
+  left: var(--tl-safe-left, 88px);
   right: 6px;
-  height: 24px;
+  height: 32px;
   z-index: 200;
 }
 

@@ -18,6 +18,7 @@ use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Theme};
 /// To the main window: `{ reason: "focus" | "shown" | "network" }`. The page should check
 /// its relay link now (reconnect at once if it is down) instead of waiting for its backoff.
 pub const WAKE_EVENT: &str = "app://wake";
+pub const TRAFFIC_LIGHTS_EVENT: &str = "app://traffic-lights";
 const TRAY_ID: &str = "pocket-tray";
 const WINDOW_STATE_FILE: &str = "window-state.json";
 /// tauri.conf.json's minimum; lowered on screens where it does not fit.
@@ -40,7 +41,8 @@ pub struct SavedWindowState {
     pub fullscreen: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct MonitorWorkArea {
     pub x: f64,
     pub y: f64,
@@ -48,6 +50,165 @@ pub struct MonitorWorkArea {
     pub height: f64,
     pub deco_w: f64,
     pub deco_h: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficLightMetrics {
+    pub supported: bool,
+    pub fullscreen: bool,
+    pub safe_left: f64,
+    pub safe_top: f64,
+}
+
+pub fn compute_traffic_light_safe_zone(
+    fullscreen: bool,
+    zoom_right_x: f64,
+    zoom_bottom_y: f64,
+) -> (f64, f64) {
+    if fullscreen {
+        return (14.0, 0.0);
+    }
+    let safe_left = if zoom_right_x.is_finite() && zoom_right_x > 0.0 {
+        (zoom_right_x + 12.0).ceil().clamp(80.0, 128.0)
+    } else {
+        88.0
+    };
+    let safe_top = if zoom_bottom_y.is_finite() && zoom_bottom_y > 0.0 {
+        (zoom_bottom_y + 10.0).ceil().clamp(36.0, 52.0)
+    } else {
+        38.0
+    };
+    (safe_left, safe_top)
+}
+
+#[cfg(target_os = "macos")]
+fn measure_main_traffic_lights_on_main(app: &AppHandle) -> TrafficLightMetrics {
+    use objc2::msg_send;
+    use objc2_app_kit::{NSView, NSWindow};
+
+    let Some(w) = app.get_webview_window("main") else {
+        return TrafficLightMetrics {
+            supported: true,
+            fullscreen: false,
+            safe_left: 88.0,
+            safe_top: 38.0,
+        };
+    };
+    let fullscreen = w.is_fullscreen().unwrap_or(false);
+    if fullscreen {
+        let (safe_left, safe_top) = compute_traffic_light_safe_zone(true, 0.0, 0.0);
+        return TrafficLightMetrics {
+            supported: true,
+            fullscreen: true,
+            safe_left,
+            safe_top,
+        };
+    }
+    let Ok(ptr) = w.ns_window() else {
+        return TrafficLightMetrics {
+            supported: true,
+            fullscreen: false,
+            safe_left: 88.0,
+            safe_top: 38.0,
+        };
+    };
+    if ptr.is_null() {
+        return TrafficLightMetrics {
+            supported: true,
+            fullscreen: false,
+            safe_left: 88.0,
+            safe_top: 38.0,
+        };
+    }
+    let ns_win = unsafe { &*(ptr as *const NSWindow) };
+    let zoom_ptr: *mut NSView = unsafe { msg_send![ns_win, standardWindowButton: 2usize] };
+    if zoom_ptr.is_null() {
+        return TrafficLightMetrics {
+            supported: true,
+            fullscreen: false,
+            safe_left: 88.0,
+            safe_top: 38.0,
+        };
+    }
+    let zoom_view = unsafe { &*zoom_ptr };
+    let bounds = zoom_view.bounds();
+    let rect = zoom_view.convertRect_toView(bounds, None);
+    let win_h = ns_win.frame().size.height;
+    let zoom_right_x = rect.origin.x + rect.size.width;
+    let zoom_bottom_y = (win_h - rect.origin.y).max(26.0);
+    let (safe_left, safe_top) = compute_traffic_light_safe_zone(false, zoom_right_x, zoom_bottom_y);
+    TrafficLightMetrics {
+        supported: true,
+        fullscreen: false,
+        safe_left,
+        safe_top,
+    }
+}
+
+pub fn query_traffic_light_metrics(app: &AppHandle) -> TrafficLightMetrics {
+    #[cfg(target_os = "macos")]
+    {
+        if objc2_foundation::MainThreadMarker::new().is_some() {
+            return measure_main_traffic_lights_on_main(app);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let app2 = app.clone();
+        if app
+            .run_on_main_thread(move || {
+                let _ = tx.send(measure_main_traffic_lights_on_main(&app2));
+            })
+            .is_ok()
+        {
+            if let Ok(m) = rx.recv_timeout(Duration::from_millis(200)) {
+                return m;
+            }
+        }
+        TrafficLightMetrics {
+            supported: true,
+            fullscreen: false,
+            safe_left: 88.0,
+            safe_top: 38.0,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        TrafficLightMetrics {
+            supported: false,
+            fullscreen: false,
+            safe_left: 0.0,
+            safe_top: 0.0,
+        }
+    }
+}
+
+pub fn sync_traffic_light_metrics(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        static LAST_METRICS: Mutex<Option<TrafficLightMetrics>> = Mutex::new(None);
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let metrics = measure_main_traffic_lights_on_main(&app2);
+            let changed = LAST_METRICS
+                .lock()
+                .ok()
+                .map(|mut guard| {
+                    if guard.as_ref() == Some(&metrics) {
+                        false
+                    } else {
+                        *guard = Some(metrics);
+                        true
+                    }
+                })
+                .unwrap_or(true);
+            if changed {
+                let _ = app2.emit_to("main", TRAFFIC_LIGHTS_EVENT, metrics);
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 }
 
 static PLACEMENT_READY: AtomicBool = AtomicBool::new(false);
@@ -318,6 +479,7 @@ pub fn fit_on_start(app: &AppHandle) {
             }
         }
         PLACEMENT_READY.store(true, Ordering::SeqCst);
+        sync_traffic_light_metrics(app);
         logging::info(
             "app.window",
             "window restored",
@@ -369,6 +531,7 @@ pub fn fit_on_start(app: &AppHandle) {
         *g = Some((x, y, size.0, size.1));
     }
     PLACEMENT_READY.store(true, Ordering::SeqCst);
+    sync_traffic_light_metrics(app);
     logging::info(
         "app.window",
         "window placed",
@@ -743,12 +906,16 @@ fn watch_occlusion(app: &AppHandle) {
     use objc2_app_kit::{
         NSApplicationDidHideNotification, NSApplicationDidUnhideNotification,
         NSWindowDidChangeOcclusionStateNotification, NSWindowDidDeminiaturizeNotification,
+        NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification,
         NSWindowDidMiniaturizeNotification,
     };
     use objc2_foundation::{NSNotification, NSNotificationCenter, NSOperationQueue};
     use std::ptr::NonNull;
     let app = app.clone();
+    let app_fs = app.clone();
     let block = block2::RcBlock::new(move |_n: NonNull<NSNotification>| visibility_changed(&app));
+    let fs_block =
+        block2::RcBlock::new(move |_n: NonNull<NSNotification>| sync_traffic_light_metrics(&app_fs));
     let center = NSNotificationCenter::defaultCenter();
     let queue = NSOperationQueue::mainQueue();
     // SAFETY: AppKit's constants; the block runs on the main queue it is given.
@@ -771,6 +938,23 @@ fn watch_occlusion(app: &AppHandle) {
             )
         };
         // Never removed: the observers live as long as the app.
+        std::mem::forget(observer);
+    }
+    let fs_names = unsafe {
+        [
+            NSWindowDidEnterFullScreenNotification,
+            NSWindowDidExitFullScreenNotification,
+        ]
+    };
+    for name in fs_names {
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(name),
+                None,
+                Some(&queue),
+                &fs_block,
+            )
+        };
         std::mem::forget(observer);
     }
 }
@@ -864,6 +1048,7 @@ pub fn show_main(app: &AppHandle, why: &str) {
         let _ = w.set_focus();
     }
     resources::refresh_visibility(app);
+    sync_traffic_light_metrics(app);
     logging::debug("app.window", "window shown", json!({ "why": why }));
     wake(app, "shown");
 }
@@ -1051,7 +1236,22 @@ mod network {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit, resolve_restored_window_state, MonitorWorkArea, SavedWindowState};
+    use super::{
+        compute_traffic_light_safe_zone, fit, resolve_restored_window_state, MonitorWorkArea,
+        SavedWindowState,
+    };
+
+    #[test]
+    fn computes_traffic_light_safe_zone_for_macos_versions_and_fullscreen() {
+        // macOS Sequoia: zoom right ~64pt -> 76 -> clamped >= 80pt
+        assert_eq!(compute_traffic_light_safe_zone(false, 64.0, 26.0), (80.0, 36.0));
+        // macOS Tahoe Liquid Glass: zoom right ~74.5pt -> ceil(86.5) = 87pt
+        assert_eq!(compute_traffic_light_safe_zone(false, 74.5, 27.5), (87.0, 38.0));
+        // Even wider buttons stay padded by 12pt up to 128pt cap
+        assert_eq!(compute_traffic_light_safe_zone(false, 90.0, 29.0), (102.0, 39.0));
+        // Fullscreen hides traffic lights so title bar reclaims left inset and top safe area
+        assert_eq!(compute_traffic_light_safe_zone(true, 74.5, 27.5), (14.0, 0.0));
+    }
 
     #[test]
     fn fits_small_windows_screens() {

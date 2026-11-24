@@ -28,7 +28,7 @@ import {
   trySilentReconfirm,
 } from "./lib/h5Identity";
 import { isMockServer } from "./lib/mock";
-import { native } from "./lib/native";
+import { native, type TrafficLightMetrics } from "./lib/native";
 import { installWindowDragBridge } from "./lib/windowDrag";
 import { ensureChatQueueWatcher } from "./lib/chatQueue";
 import {
@@ -142,7 +142,19 @@ function PocketAppShell() {
     document.documentElement.setAttribute("data-platform", platform);
     document.documentElement.setAttribute("data-client", isH5Web() ? "h5" : isHarmony() ? "harmony" : "desktop");
     // macOS app: the title bar overlays the window and the traffic lights sit in the sidebar (R36 / N4).
-    if (platform === "macos" && isTauri()) document.documentElement.setAttribute("data-titlebar", "overlay");
+    let offTrafficLights: (() => void) | null = null;
+    if (platform === "macos" && isTauri()) {
+      document.documentElement.setAttribute("data-titlebar", "overlay");
+      const applyTrafficLights = (m: TrafficLightMetrics) => {
+        if (!m.supported) return;
+        const root = document.documentElement;
+        root.style.setProperty("--tl-safe-left", `${Math.round(m.safeLeft)}px`);
+        root.style.setProperty("--safe-top", m.safeTop > 0 ? `${Math.round(m.safeTop)}px` : "0px");
+        root.toggleAttribute("data-fullscreen", Boolean(m.fullscreen));
+      };
+      void native.queryTrafficLightMetrics().then(applyTrafficLights);
+      offTrafficLights = native.onTrafficLightMetrics(applyTrafficLights);
+    }
     const offPerf = startDesktopPerfTelemetry();
     const offDrag = installWindowDragBridge();
     const offPwa = initH5Pwa();
@@ -150,6 +162,7 @@ function PocketAppShell() {
       offPwa();
       offDrag();
       offPerf();
+      offTrafficLights?.();
     };
   }, []);
 

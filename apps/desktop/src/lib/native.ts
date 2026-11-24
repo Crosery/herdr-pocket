@@ -36,6 +36,20 @@ const UNSUPPORTED_OS_MODIFIERS: OsModifierState = {
   shift: false,
 };
 
+export interface TrafficLightMetrics {
+  supported: boolean;
+  fullscreen: boolean;
+  safeLeft: number;
+  safeTop: number;
+}
+
+const UNSUPPORTED_TRAFFIC_LIGHTS: TrafficLightMetrics = {
+  supported: false,
+  fullscreen: false,
+  safeLeft: 0,
+  safeTop: 0,
+};
+
 export interface Rect {
   x: number;
   y: number;
@@ -896,6 +910,14 @@ export const native = {
       path: path.trim(),
     });
   },
+  /** In-memory HTML capability URL (`pocket-local://localhost/cap/mem-<token>/...`) for remote HTML previews without CSP `srcdoc` restrictions. */
+  registerMemHtmlPreview: async (fileName: string, html: string): Promise<string | null> => {
+    if (!inTauri() || !html) return null;
+    return invoke<string>("register_mem_html_preview", {
+      fileName: fileName.trim() || "preview.html",
+      html,
+    });
+  },
   readOsDragPaths: async (): Promise<DraggedOsItemNative[]> =>
     inTauri() ? invoke<DraggedOsItemNative[]>("read_os_drag_paths").catch(() => []) : [],
   workspaceStateLoad: async (): Promise<string | null> =>
@@ -904,4 +926,28 @@ export const native = {
     inTauri() ? invoke<void>("workspace_state_save", { raw }) : Promise.resolve(),
   queryOsModifiers: async (): Promise<OsModifierState> =>
     inTauri() ? invoke<OsModifierState>("query_os_modifiers").catch(() => UNSUPPORTED_OS_MODIFIERS) : UNSUPPORTED_OS_MODIFIERS,
+  queryTrafficLightMetrics: async (): Promise<TrafficLightMetrics> =>
+    inTauri()
+      ? invoke<TrafficLightMetrics>("query_traffic_light_metrics").catch(() => UNSUPPORTED_TRAFFIC_LIGHTS)
+      : UNSUPPORTED_TRAFFIC_LIGHTS,
+  onTrafficLightMetrics: (cb: (metrics: TrafficLightMetrics) => void): (() => void) => {
+    if (!inTauri()) return () => {};
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<TrafficLightMetrics>("app://traffic-lights", (ev) => {
+          if (alive && ev.payload) cb(ev.payload);
+        }),
+      )
+      .then((fn) => {
+        if (alive) unlisten = fn;
+        else fn();
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  },
 };

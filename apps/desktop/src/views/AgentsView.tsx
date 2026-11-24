@@ -2864,7 +2864,14 @@ export function AgentDetailPanel({
       ) : null}
 
       {termVisited ? (
-        <div style={{ flex: 1, minHeight: 0, display: activeMode === "term" ? "flex" : "none" }}>
+        <div
+          aria-hidden={activeMode !== "term"}
+          style={
+            activeMode === "term"
+              ? { flex: 1, minHeight: 0, display: "flex" }
+              : { position: "absolute", inset: 0, display: "flex", visibility: "hidden", pointerEvents: "none", zIndex: -1 }
+          }
+        >
           <PocketErrorBoundary resetKey={agent.key} title="终端视图加载出错">
             <TerminalSurface agent={agent} active={visible && activeMode === "term"} focused={focused && visible} />
           </PocketErrorBoundary>

@@ -97,6 +97,23 @@ test("PortalFileTicketStore + DirectServer serve /v1/portal-fs HTTP files, Range
   assert.match(bundled.html, /https:\/\/example\.com\/ext\.js/);
   assert.doesNotMatch(bundled.html, /SECRET_KEY/);
 
+  // Workspace-relative ../ assets, CSS url(...), and ES module scripts should bundle cleanly within workspace root
+  const nestedDir = join(sub, "pages");
+  mkdirSync(nestedDir, { recursive: true });
+  writeFileSync(join(sub, "shared.css"), ".bg{background:url('./dot.svg')}");
+  writeFileSync(join(nestedDir, "dep.js"), "export const val = 42;");
+  writeFileSync(join(nestedDir, "mod.js"), "import { val } from './dep.js'; window.__mod = val;");
+  writeFileSync(
+    join(nestedDir, "view.html"),
+    '<!doctype html><html><head><link rel="stylesheet" href="../shared.css"></head><body><script type="module" src="./mod.js"></script><script src="../.env"></script></body></html>',
+  );
+  const nestedBundle = await bundleHtmlForRelay(sub, { path: "pages/view.html" }, filesOpts);
+  assert.match(nestedBundle.html, /\.bg\{background:url\("data:image\/svg\+xml;base64,/);
+  assert.match(nestedBundle.html, /data:text\/javascript;base64,/);
+  assert.match(nestedBundle.html, /window\.__mod = val/);
+  assert.match(nestedBundle.html, /src="\.\.\/\.env"/);
+  assert.doesNotMatch(nestedBundle.html, /SECRET_KEY/);
+
   const c1 = await readChunkForRpc(sub, { path: "media.bin", offset: 0, length: 6 }, filesOpts);
   assert.equal(Buffer.from(c1.base64, "base64").toString("utf8"), "012345");
   assert.equal(c1.eof, false);

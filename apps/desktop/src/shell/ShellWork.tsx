@@ -1280,6 +1280,10 @@ function PaneHead({
   const handleOpenBuiltinBrowser =
     content.kind === "file"
       ? () => {
+          if (fileHead?.openInBrowserUrl && !canRevealLocal) {
+            openWebTab(fileHead.openInBrowserUrl, content.title, { spaceKey: shellStore.get().selectedSpace });
+            return;
+          }
           void openLocalFileInBuiltinBrowser({
             path: content.path,
             absPath: content.absPath,
@@ -1459,6 +1463,16 @@ function PaneHead({
               <span>{platform === "macos" ? "访达" : "目录"}</span>
             </button>
           </>
+        ) : !canRevealLocal && content.kind === "file" && fileHead?.openInBrowserUrl ? (
+          <button
+            type="button"
+            className="v3-pane-tool-btn"
+            title="用内置浏览器打开"
+            onClick={handleOpenBuiltinBrowser}
+          >
+            <Globe size={12} />
+            <span>内置浏览器</span>
+          </button>
         ) : null}
         <div className="v3-pane-actions">
           {content.kind === "agent" && agent && mode && onModeChange ? (
@@ -1646,6 +1660,18 @@ function PaneHead({
                 onClick={() => {
                   setPaneMenu(null);
                   handleReveal?.();
+                }}
+              />
+            </>
+          ) : !canRevealLocal && content.kind === "file" && fileHead?.openInBrowserUrl ? (
+            <>
+              <div className="menu-sep" />
+              <MenuItem
+                label="用内置浏览器打开"
+                icon={Globe}
+                onClick={() => {
+                  setPaneMenu(null);
+                  handleOpenBuiltinBrowser?.();
                 }}
               />
             </>
@@ -2202,7 +2228,7 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
   );
 }
 
-const MAX_KEPT_AGENT_TABS = 6;
+const MAX_KEPT_AGENT_TABS = 16;
 
 const TabStage = memo(function TabStage({
   tab,

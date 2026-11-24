@@ -16,6 +16,7 @@ import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
 import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, type ListGroup } from "./agentInfo";
 import { pullHostDocNow } from "./herdrDocSync";
+import { formatSidebarAgentRow } from "./sidebarAgentRow";
 import { SPACE_ICON_PRESETS, SpaceTileIcon, setCustomSpaceIcon, spaceIconStore } from "./spaceIcon";
 import { activeTabIdForSpace, closeTabsForSpace, focusedLeafOfTab, openAgentTab, openSettingsFrame, renameSpaceInShellStore, setPalette, setSelectedSpace, shellStore, splitActivePaneWithContent, tabLeaves } from "./shellStore";
 import { shortcutText } from "./shortcuts";
@@ -24,6 +25,13 @@ import { buildHostSpaces, type SidebarSpace } from "./spaceSync";
 
 const FOLD_KEY = "herdr-pocket-v3-folded";
 const SORT_KEY = "herdr-pocket-v3-agent-sort";
+const SPACES_RATIO_KEY = "herdr-pocket-v3-spaces-ratio";
+const SPACES_SECTION_FOLD_ID = "sec:spaces";
+
+function clampSpacesRatio(r: unknown): number | null {
+  if (typeof r !== "number" || !Number.isFinite(r)) return null;
+  return Math.max(0.18, Math.min(0.72, Number(r.toFixed(3))));
+}
 
 function readJson<T>(key: string, fallback: T): T {
   try {
@@ -103,6 +111,13 @@ export function ShellSidebar({
   const [spaceMenu, setSpaceMenu] = useState<{ x: number; y: number; space: SidebarSpace } | null>(null);
   const [agentMenu, setAgentMenu] = useState<{ x: number; y: number; agent: Agent } | null>(null);
   const [hoverFreeze, setHoverFreeze] = useState(false);
+  const [spacesRatio, setSpacesRatio] = useState<number | null>(() => clampSpacesRatio(readJson<unknown>(SPACES_RATIO_KEY, null)));
+  const [spacesResizing, setSpacesResizing] = useState(false);
+  const [sidebarResizing, setSidebarResizing] = useState(false);
+  const sidebarWidth = settingsStore.use((s) => s.sidebarWidth);
+  const sidebarRef = useRef<HTMLElement | null>(null);
+  const listsRef = useRef<HTMLDivElement | null>(null);
+  const spacesBlockRef = useRef<HTMLElement | null>(null);
   const frozenOrderRef = useRef<Map<string, string[]>>(new Map());
   const stableGroupOrderRef = useRef<Map<string, string[]>>(new Map());
   const customSpaceIcons = spaceIconStore.use((m) => m);
@@ -254,6 +269,8 @@ export function ShellSidebar({
   }, [agents, devices, localHostId, spacesMap]);
 
   const selected = spaceSel && machines.some((m) => m.spaces.some((s) => s.id === spaceSel)) ? spaceSel : null;
+  const totalSpaces = useMemo(() => machines.reduce((n, m) => n + m.spaces.length, 0), [machines]);
+  const spacesFolded = folded.includes(SPACES_SECTION_FOLD_ID);
   // Agent list stays global across all Spaces & computers like Herdr.app; clicking any Agent switches Spaces automatically.
   const inScope = agents;
   const primaryMachineId = localHostId || machines[0]?.id || null;
@@ -347,8 +364,14 @@ export function ShellSidebar({
     const label = spacedTitle(a);
     const showMachine = machines.length > 1 && a.deviceId !== primaryMachineId;
     const machineName = showMachine ? devices[a.deviceId]?.name : undefined;
+    const { primary, secondary } = formatSidebarAgentRow(a, { showMachine, machineName });
     const isFocusedAgent = a.key === activeAgentKey;
     const isInSplit = !isFocusedAgent && activeSplitAgentKeys.has(a.key);
+    const tooltipText = collapsed
+      ? (machineName ? `${machineName} · ${label}` : label)
+      : secondary
+        ? `${primary} — ${secondary}`
+        : primary;
     return (
       <div
         key={a.key}
@@ -356,8 +379,8 @@ export function ShellSidebar({
         tabIndex={0}
         draggable
         data-tauri-drag-region="false"
-        className={`v3-row v3-agent${isFocusedAgent ? " selected" : isInSplit ? " in-split" : ""}${g === "offline" ? " dim" : ""}`}
-        title={collapsed ? (machineName ? `${machineName} · ${label}` : label) : undefined}
+        className={`v3-row v3-agent${secondary && !collapsed ? " has-sub" : ""}${isFocusedAgent ? " selected" : isInSplit ? " in-split" : ""}${g === "offline" ? " dim" : ""}`}
+        title={tooltipText}
         onDragStart={(e) => startPanelDrag(e, { kind: "agent", agentKey: a.key })}
         onDragEnd={() => endPanelDrag()}
         onClick={(e) => {
@@ -382,20 +405,18 @@ export function ShellSidebar({
         {collapsed ? (
           g === "blocked" ? <span className="v3-corner blocked" aria-label="需要你" /> : null
         ) : (
-          <>
-            <span className="v3-row-label truncate">{label}</span>
-            {machineName ? <span className="v3-agent-machine truncate">{machineName}</span> : null}
-            <span className="v3-time">{shortAgo(lastChange(a), now)}</span>
-            <StatusMark group={g} compact={sort === "status" && g === "blocked"} />
-          </>
+          <div className="v3-agent-body">
+            <div className="v3-agent-top">
+              <span className="v3-agent-title v3-row-label truncate">{primary}</span>
+              <span className="v3-time">{shortAgo(lastChange(a), now)}</span>
+              <StatusMark group={g} compact={sort === "status" && g === "blocked"} />
+            </div>
+            {secondary ? <div className="v3-agent-sub truncate">{secondary}</div> : null}
+          </div>
         )}
       </div>
     );
   };
-
-  const sidebarWidth = settingsStore.use((s) => s.sidebarWidth);
-  const sidebarRef = useRef<HTMLElement | null>(null);
-  const [sidebarResizing, setSidebarResizing] = useState(false);
 
   return (
     <aside
@@ -459,12 +480,10 @@ export function ShellSidebar({
             <span className="truncate">Herdr Pocket</span>
           </div>
         )}
-        {collapsed && canToggle ? null : (
-          <button className="v3-icon-btn has-hint" aria-label="跳到 Agent 或标签" title={`跳到 Agent 或标签（${shortcutText("jumpAgent")}）`} onClick={() => setPalette("jump")}>
-            <Search size={15} />
-            <SpatialHint text={shortcutText("jumpAgent")} corner="bottom" />
-          </button>
-        )}
+        <button className="v3-icon-btn v3-brand-search has-hint" aria-label="跳到 Agent 或标签" title={`跳到 Agent 或标签（${shortcutText("jumpAgent")}）`} onClick={() => setPalette("jump")}>
+          <Search size={15} />
+          <SpatialHint text={shortcutText("jumpAgent")} corner="bottom" />
+        </button>
         {canToggle ? (
           <button className="v3-icon-btn has-hint" aria-label={collapsed ? "展开侧栏" : "收起侧栏"} title={`${collapsed ? "展开" : "收起"}侧栏（${shortcutText("toggleSidebar")}）`} onClick={onToggle}>
             <PanelLeft size={15} />
@@ -473,17 +492,49 @@ export function ShellSidebar({
         ) : null}
       </div>
 
-      <div className="v3-lists">
-        <section className="v3-block" aria-label="空间">
+      <div ref={listsRef} className="v3-lists">
+        <section
+          ref={spacesBlockRef}
+          className={`v3-block v3-block-spaces${spacesFolded && !collapsed ? " is-folded" : ""}${!collapsed && !spacesFolded && spacesRatio !== null ? " has-ratio" : ""}`}
+          style={!collapsed && !spacesFolded && spacesRatio !== null ? ({ "--v3-spaces-ratio": String(spacesRatio) } as CSSProperties) : undefined}
+          aria-label="空间"
+        >
           {collapsed ? null : (
-            <div className="v3-block-head">
-              <span className="grow">空间</span>
-              <button className="v3-icon-btn small has-hint" aria-label="新建空间" title={`新建空间（${shortcutText("newSpace")}）`} onClick={() => onNewSpace(null)}>
+            <div
+              className="v3-block-head is-toggle"
+              role="button"
+              tabIndex={0}
+              aria-expanded={!spacesFolded}
+              title={spacesFolded ? "展开空间列表" : "收起空间列表"}
+              onClick={() => toggleFold(SPACES_SECTION_FOLD_ID)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  toggleFold(SPACES_SECTION_FOLD_ID);
+                }
+              }}
+            >
+              <span className="v3-block-caret" aria-hidden="true">
+                {spacesFolded ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+              </span>
+              <span>空间</span>
+              {totalSpaces > 0 ? <span className="v3-count v3-sec-count">{totalSpaces}</span> : null}
+              <span className="grow" />
+              <button
+                className="v3-icon-btn small has-hint"
+                aria-label="新建空间"
+                title={`新建空间（${shortcutText("newSpace")}）`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onNewSpace(null);
+                }}
+              >
                 <Plus size={14} />
                 <SpatialHint text={shortcutText("newSpace")} corner="tr" />
               </button>
             </div>
           )}
+          {spacesFolded && !collapsed ? null : (
           <div className="v3-block-body">
             {notice && !collapsed ? (
               <div className="v3-notice" role="status">
@@ -606,17 +657,75 @@ export function ShellSidebar({
               <div className="v3-empty-line">还没有电脑加入。在那台电脑上运行 herdr-pocket up，或在 设置 › 电脑与中继 里添加电脑。</div>
             ) : null}
           </div>
+          )}
         </section>
 
+        {!collapsed && !spacesFolded ? (
+          <div
+            className={`v3-lists-sash${spacesResizing ? " dragging" : ""}`}
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="拖动调整空间与 Agent 列表高度，双击恢复自动"
+            title="拖动调整空间与 Agent 高度（双击恢复默认）"
+            onDoubleClick={() => {
+              setSpacesRatio(null);
+              writeJson(SPACES_RATIO_KEY, null);
+            }}
+            onPointerDown={(e) => {
+              if (e.button !== 0 || !listsRef.current || !spacesBlockRef.current) return;
+              e.preventDefault();
+              const listsEl = listsRef.current;
+              const spacesEl = spacesBlockRef.current;
+              const listsRect = listsEl.getBoundingClientRect();
+              const totalH = Math.max(180, listsRect.height);
+              const startY = e.clientY;
+              const startH = spacesEl.getBoundingClientRect().height || totalH * 0.42;
+              let curRatio = clampSpacesRatio(startH / totalH) ?? 0.42;
+              let rafId = 0;
+              setSpacesResizing(true);
+              document.documentElement.dataset.splitResizing = "column";
+              e.currentTarget.setPointerCapture(e.pointerId);
+
+              const apply = () => {
+                rafId = 0;
+                spacesEl.style.setProperty("--v3-spaces-ratio", String(curRatio));
+                spacesEl.classList.add("has-ratio");
+              };
+              const onMove = (mv: PointerEvent) => {
+                curRatio = clampSpacesRatio((startH + (mv.clientY - startY)) / totalH) ?? 0.42;
+                if (!rafId) rafId = requestAnimationFrame(apply);
+              };
+              const finish = () => {
+                window.removeEventListener("pointermove", onMove);
+                window.removeEventListener("pointerup", finish);
+                window.removeEventListener("pointercancel", finish);
+                if (rafId) {
+                  cancelAnimationFrame(rafId);
+                  apply();
+                }
+                delete document.documentElement.dataset.splitResizing;
+                setSpacesResizing(false);
+                setSpacesRatio(curRatio);
+                writeJson(SPACES_RATIO_KEY, curRatio);
+              };
+              window.addEventListener("pointermove", onMove);
+              window.addEventListener("pointerup", finish);
+              window.addEventListener("pointercancel", finish);
+            }}
+          />
+        ) : null}
+
         <section
-          className="v3-block"
+          className="v3-block v3-block-agents"
           aria-label="Agent"
           onPointerEnter={() => setHoverFreeze(true)}
           onPointerLeave={() => setHoverFreeze(false)}
         >
           {collapsed ? null : (
             <div className="v3-block-head">
-              <span className="grow">Agent</span>
+              <span>Agent</span>
+              <span className="v3-count v3-sec-count">{inScope.length}</span>
+              <span className="grow" />
               <button
                 className={`v3-icon-btn small${sort === "recent" ? " on" : ""}`}
                 aria-label={sort === "recent" ? "按状态分组" : "按最近排序"}

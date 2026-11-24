@@ -37,6 +37,11 @@
   outline: none;
 }
 
+:root[data-titlebar="overlay"]:not([data-fullscreen]) .settings-frame {
+  max-height: calc(100vh - 80px);
+  top: calc(50% + 14px);
+}
+
 .settings-frame[data-state="open"] {
   animation: sf-in 0.12s var(--ease-out);
 }

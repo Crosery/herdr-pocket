@@ -6,13 +6,23 @@ export type LinkStatus = "idle" | "connecting" | "online" | "offline" | "unautho
 export type ThemeChoice = "system" | "light" | "dark";
 export type H5LayoutMode = "auto" | "mobile" | "desktop";
 
-export const DEFAULT_SIDEBAR_WIDTH = 236;
-export const MIN_SIDEBAR_WIDTH = 180;
-export const MAX_SIDEBAR_WIDTH = 380;
+export const DEFAULT_SIDEBAR_WIDTH = 268;
+export const MIN_SIDEBAR_WIDTH = 200;
+export const MAX_SIDEBAR_WIDTH = 400;
 
 export function clampSidebarWidth(w: unknown): number {
   const n = typeof w === "number" && Number.isFinite(w) ? Math.round(w) : DEFAULT_SIDEBAR_WIDTH;
   return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, n));
+}
+
+export function resolveInitialSidebarWidth(saved: {
+  sidebarWidth?: unknown;
+  sidebarWidthV2?: unknown;
+}): number {
+  if (!saved.sidebarWidthV2 && (saved.sidebarWidth === undefined || saved.sidebarWidth === 236)) {
+    return DEFAULT_SIDEBAR_WIDTH;
+  }
+  return clampSidebarWidth(saved.sidebarWidth);
 }
 
 export interface AppSettings {
@@ -55,10 +65,12 @@ export interface LiveState {
 
 const PREF_KEY = "herdr-pocket-client-prefs-v1";
 
-function loadPrefs(): Partial<AppSettings> {
+type PersistedPrefs = Partial<AppSettings> & { sidebarWidthV2?: boolean };
+
+function loadPrefs(): PersistedPrefs {
   try {
     const raw = window.PocketHarmony?.getPref?.(PREF_KEY) || localStorage.getItem(PREF_KEY);
-    return raw ? (JSON.parse(raw) as Partial<AppSettings>) : {};
+    return raw ? (JSON.parse(raw) as PersistedPrefs) : {};
   } catch {
     return {};
   }
@@ -77,6 +89,7 @@ function persistPrefs(s: AppSettings): void {
     foldedGroups: s.foldedGroups,
     sidebarCollapsed: s.sidebarCollapsed,
     sidebarWidth: s.sidebarWidth,
+    sidebarWidthV2: true,
     h5LayoutMode: s.h5LayoutMode,
     showModifierHoldHints: s.showModifierHoldHints,
     alertSound: s.alertSound,
@@ -145,7 +158,7 @@ export const settingsStore = createStore<AppSettings>({
   hostFilter: saved.hostFilter ?? null,
   foldedGroups: saved.foldedGroups ?? [],
   sidebarCollapsed: saved.sidebarCollapsed ?? false,
-  sidebarWidth: clampSidebarWidth(saved.sidebarWidth),
+  sidebarWidth: resolveInitialSidebarWidth(saved),
   h5LayoutMode: saved.h5LayoutMode === "mobile" || saved.h5LayoutMode === "desktop" ? saved.h5LayoutMode : "auto",
   showModifierHoldHints: saved.showModifierHoldHints ?? true,
   alertSound: saved.alertSound ?? true,

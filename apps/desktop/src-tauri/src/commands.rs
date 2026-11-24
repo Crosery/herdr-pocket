@@ -1231,6 +1231,89 @@ pub fn register_local_preview_token(cwd: Option<String>, path: String) -> Result
     issue_local_preview_url(cwd.as_deref(), &path)
 }
 
+const MEM_HTML_CAP_MAX: usize = 32;
+const MEM_HTML_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+struct MemHtmlPreviewRegistry {
+    order: VecDeque<String>,
+    entries: HashMap<String, (String, Vec<u8>)>,
+}
+
+static MEM_HTML_PREVIEWS: OnceLock<Mutex<MemHtmlPreviewRegistry>> = OnceLock::new();
+
+fn mem_html_registry() -> &'static Mutex<MemHtmlPreviewRegistry> {
+    MEM_HTML_PREVIEWS.get_or_init(|| {
+        Mutex::new(MemHtmlPreviewRegistry {
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        })
+    })
+}
+
+pub(crate) fn issue_mem_html_preview_url(file_name: &str, html: &str) -> Result<String, String> {
+    let raw_bytes = html.as_bytes();
+    if raw_bytes.len() > MEM_HTML_MAX_BYTES {
+        return Err("HTML 预览内容超过 8 MB 上限".into());
+    }
+    let trimmed = file_name.trim().replace('\\', "/");
+    let base_name = Path::new(&trimmed)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty() && s != "." && s != ".." && !s.contains('\0'))
+        .unwrap_or_else(|| "preview.html".to_string());
+    let bytes = raw_bytes.to_vec();
+    let token = {
+        let mut guard = mem_html_registry()
+            .lock()
+            .map_err(|_| "内存预览注册表锁定失败".to_string())?;
+        if let Some((existing, _)) = guard
+            .entries
+            .iter()
+            .find(|(_, (n, b))| n == &base_name && b == &bytes)
+        {
+            existing.clone()
+        } else {
+            let tok = format!("mem-{}", next_cap_token());
+            if guard.order.len() >= MEM_HTML_CAP_MAX {
+                if let Some(old) = guard.order.pop_front() {
+                    guard.entries.remove(&old);
+                }
+            }
+            guard.order.push_back(tok.clone());
+            guard.entries.insert(tok.clone(), (base_name.clone(), bytes));
+            tok
+        }
+    };
+    let origin = if cfg!(target_os = "windows") {
+        "http://pocket-local.localhost"
+    } else {
+        "pocket-local://localhost"
+    };
+    Ok(format!("{origin}/cap/{token}/{}", encode_uri_segment(&base_name)))
+}
+
+pub(crate) fn get_mem_html_preview(token: &str, rel_path: &str) -> Option<Vec<u8>> {
+    let hex = token.strip_prefix("mem-")?;
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let guard = mem_html_registry().lock().ok()?;
+    let (stored_name, bytes) = guard.entries.get(token)?;
+    let trimmed = rel_path.trim_matches('/');
+    if !trimmed.is_empty() {
+        let decoded = decode_uri_segment(trimmed).ok()?;
+        if &decoded != stored_name {
+            return None;
+        }
+    }
+    Some(bytes.clone())
+}
+
+#[tauri::command]
+pub fn register_mem_html_preview(file_name: String, html: String) -> Result<String, String> {
+    issue_mem_html_preview_url(&file_name, &html)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalFileSlice {
@@ -2037,6 +2120,11 @@ pub struct OsModifierState {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
+}
+
+#[tauri::command]
+pub fn query_traffic_light_metrics(app: AppHandle) -> crate::mainwin::TrafficLightMetrics {
+    crate::mainwin::query_traffic_light_metrics(&app)
 }
 
 #[tauri::command]

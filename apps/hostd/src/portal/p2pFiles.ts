@@ -3,14 +3,16 @@ import { createReadStream } from "node:fs";
 import { open, readdir, readFile, realpath, stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, relative, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { DIRECT_PORTAL_FS_PREFIX, FILES_LIMITS, type FileEntry, type PortalFileTicket } from "@herdr-pocket/protocol";
 import { FilesError, inside, isPrivateName, resolveInside, type FilesOptions } from "../files.ts";
 
 const CAP_TTL_MS = 30 * 60_000;
 const CAP_MAX = 256;
 const CHUNK_MAX_BYTES = 2 * 1024 * 1024;
-const BUNDLE_HTML_MAX_TOTAL = 4 * 1024 * 1024;
+const BUNDLE_HTML_MAX_TOTAL = 12 * 1024 * 1024;
+const BUNDLE_SINGLE_ASSET_MAX = 4 * 1024 * 1024;
+const BUNDLE_CSS_URL_MAX = 512 * 1024;
 
 export const PORTAL_MIME_MAP: Record<string, string> = {
   html: "text/html; charset=utf-8",
@@ -136,8 +138,11 @@ export class PortalFileTicketStore {
     const resolved = await resolveInside(opts.agentCwd, opts.path, opts.filesOpts);
     const st = await stat(resolved.real);
     const isDir = st.isDirectory();
-    const capRoot = isDir ? resolved.real : dirname(resolved.real);
-    const entryPath = isDir ? "" : basename(resolved.real);
+    const realAgentCwd =
+      opts.agentCwd && isAbsolute(opts.agentCwd) ? await realpath(opts.agentCwd).catch(() => null) : null;
+    const useWorkspaceRoot = !isDir && Boolean(realAgentCwd && resolved.realRoot === realAgentCwd);
+    const capRoot = isDir ? resolved.real : useWorkspaceRoot ? resolved.realRoot : dirname(resolved.real);
+    const entryPath = isDir ? "" : useWorkspaceRoot ? resolved.rel : basename(resolved.real);
     const mime = isDir ? "inode/directory" : mimeForFilename(resolved.real);
     const size = isDir ? 0 : st.size;
 
@@ -372,44 +377,109 @@ export async function bundleHtmlForRelay(
   const st = await stat(resolved.real);
   if (!st.isFile()) throw new FilesError("bad_request", "目标不是 HTML 文件");
   const baseDir = dirname(resolved.real);
+  const allowedRoot = resolved.realRoot && inside(resolved.realRoot, baseDir) ? resolved.realRoot : baseDir;
   const realPrivates = await Promise.all((filesOpts.privateDirs ?? []).map((dir) => realpath(dir).catch(() => dir)));
   let html = await readFile(resolved.real, "utf8");
   let budget = BUNDLE_HTML_MAX_TOTAL - Buffer.byteLength(html, "utf8");
 
-  const resolveSibling = async (rawRef: string): Promise<{ real: string; mime: string; bytes: Buffer } | null> => {
+  const resolveAsset = async (
+    fromDir: string,
+    rawRef: string,
+    perAssetCap = BUNDLE_SINGLE_ASSET_MAX,
+  ): Promise<{ real: string; mime: string; bytes: Buffer } | null> => {
     const clean = rawRef.split("#")[0]?.split("?")[0]?.trim() ?? "";
     if (!clean || /^(?:https?:|data:|blob:|mailto:|javascript:|\/\/)/i.test(clean)) return null;
     if (clean.startsWith("/") && !clean.startsWith("./")) return null;
-    const candidate = join(baseDir, clean);
+    const candidate = join(fromDir, clean);
     const real = await realpath(candidate).catch(() => null);
-    if (!real || !inside(baseDir, real)) return null;
-    const parts = relative(baseDir, real).split(sep).filter(Boolean);
+    if (!real || !inside(allowedRoot, real)) return null;
+    const parts = relative(allowedRoot, real).split(sep).filter(Boolean);
     if (parts.some(isPrivateName) || isPrivateName(basename(real))) return null;
     if (realPrivates.some((d) => inside(d, real))) return null;
     const s = await stat(real).catch(() => null);
-    if (!s || !s.isFile() || s.size > budget || s.size > 1024 * 1024) return null;
+    if (!s || !s.isFile() || s.size > budget || s.size > perAssetCap) return null;
     const bytes = await readFile(real);
     budget -= bytes.length;
     return { real, mime: mimeForFilename(real), bytes };
   };
+
+  const inlineCssUrls = async (cssText: string, cssDir: string): Promise<string> => {
+    const urlRe = /url\(\s*(["']?)([^"')]+)\1\s*\)/gi;
+    const refs = [...cssText.matchAll(urlRe)];
+    if (!refs.length) return cssText;
+    let out = cssText;
+    for (const m of refs) {
+      const hit = await resolveAsset(cssDir, m[2]!, BUNDLE_CSS_URL_MAX);
+      if (!hit) continue;
+      const b64 = hit.bytes.toString("base64");
+      out = out.replace(m[0], `url("data:${hit.mime};base64,${b64}")`);
+    }
+    return out;
+  };
+
+  const inlineModuleSpecifiers = async (
+    modDir: string,
+    modText: string,
+    seen: Set<string>,
+  ): Promise<string | null> => {
+    const importRe =
+      /(\b(?:import|export)\b[^;\n]*?\bfrom\s*)(["'])(\.{1,2}\/[^"']+)\2|(\bimport\s*\(\s*)(["'])(\.{1,2}\/[^"']+)\5(\s*\))|(\bimport\s*)(["'])(\.{1,2}\/[^"']+)\9/g;
+    const matches = [...modText.matchAll(importRe)];
+    let out = modText;
+    for (const m of matches) {
+      const spec = m[3] ?? m[6] ?? m[10] ?? "";
+      const hit = await resolveAsset(modDir, spec);
+      if (!hit || seen.has(hit.real)) return null;
+      seen.add(hit.real);
+      const childInlined = await inlineModuleSpecifiers(dirname(hit.real), hit.bytes.toString("utf8"), seen);
+      seen.delete(hit.real);
+      if (childInlined === null) return null;
+      const dataUri = `data:text/javascript;base64,${Buffer.from(childInlined, "utf8").toString("base64")}`;
+      if (m[3] !== undefined) {
+        out = out.replace(m[0], `${m[1]}"${dataUri}"`);
+      } else if (m[6] !== undefined) {
+        out = out.replace(m[0], `${m[4]}"${dataUri}"${m[7]}`);
+      } else if (m[10] !== undefined) {
+        out = out.replace(m[0], `${m[8]}"${dataUri}"`);
+      }
+    }
+    return out;
+  };
+
+  // Inline CSS url(...) inside existing <style> blocks
+  const styleBlockRe = /<style\b([^>]*)>([\s\S]*?)<\/style>/gi;
+  for (const m of [...html.matchAll(styleBlockRe)]) {
+    const inlined = await inlineCssUrls(m[2]!, baseDir);
+    if (inlined !== m[2]) {
+      html = html.replace(m[0], `<style${m[1]}>${inlined}</style>`);
+    }
+  }
 
   // Inline local <link rel="stylesheet" href="...">
   const linkRe = /<link\b([^>]*?)\bhref=(["'])([^"']+)\2([^>]*)>/gi;
   const links = [...html.matchAll(linkRe)];
   for (const m of links) {
     if (!/rel=(["'])stylesheet\1/i.test(m[0])) continue;
-    const hit = await resolveSibling(m[3]!);
+    const hit = await resolveAsset(baseDir, m[3]!);
     if (!hit) continue;
-    html = html.replace(m[0], `<style>${hit.bytes.toString("utf8")}</style>`);
+    const css = await inlineCssUrls(hit.bytes.toString("utf8"), dirname(hit.real));
+    html = html.replace(m[0], `<style>${css}</style>`);
   }
 
-  // Inline local classic <script src="..."></script>
+  // Inline local <script src="...">...</script> (classic and ES module)
   const scriptRe = /<script\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>\s*<\/script>/gi;
   const scripts = [...html.matchAll(scriptRe)];
   for (const m of scripts) {
-    if (/\btype=(["'])module\1/i.test(m[0])) continue;
-    const hit = await resolveSibling(m[3]!);
+    const isModule = /\btype=(["'])module\1/i.test(m[0]);
+    const hit = await resolveAsset(baseDir, m[3]!);
     if (!hit) continue;
+    if (isModule) {
+      const seen = new Set<string>([hit.real]);
+      const inlinedMod = await inlineModuleSpecifiers(dirname(hit.real), hit.bytes.toString("utf8"), seen);
+      if (inlinedMod === null) continue;
+      html = html.replace(m[0], `<script${m[1]}${m[4]}>${escapeScriptClose(inlinedMod)}</script>`);
+      continue;
+    }
     html = html.replace(m[0], `<script${m[1]}${m[4]}>${escapeScriptClose(hit.bytes.toString("utf8"))}</script>`);
   }
 
@@ -417,7 +487,7 @@ export async function bundleHtmlForRelay(
   const imgRe = /(<img\b[^>]*?\bsrc=)(["'])([^"']+)\2/gi;
   const imgs = [...html.matchAll(imgRe)];
   for (const m of imgs) {
-    const hit = await resolveSibling(m[3]!);
+    const hit = await resolveAsset(baseDir, m[3]!);
     if (!hit) continue;
     const b64 = hit.bytes.toString("base64");
     html = html.replace(m[0], `${m[1]}"data:${hit.mime};base64,${b64}"`);

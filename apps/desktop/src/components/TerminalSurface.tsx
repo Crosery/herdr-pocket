@@ -396,6 +396,7 @@ export function TerminalSurface({
   focusedRef.current = focused;
   const isShellRef = useRef(Boolean(agent.isShell));
   isShellRef.current = Boolean(agent.isShell);
+  const wasAtBottomRef = useRef(true);
 
   const paneOwnsFocus = useCallback(() => {
     if (typeof document === "undefined" || !document.hasFocus()) return false;
@@ -506,6 +507,7 @@ export function TerminalSurface({
         if (buf === term.buffer.normal && buf.viewportY < buf.baseY) {
           term.scrollToBottom();
         }
+        wasAtBottomRef.current = true;
       }
       const bpActive =
         bracketedPasteRef.current ||
@@ -1259,15 +1261,14 @@ export function TerminalSurface({
     kittyKeys.reset();
 
     hostEl.dataset.ready = "false";
-    let hostReadyDone = false;
+    let initialReadyDone = false;
     const markHostReady = () => {
-      if (hostReadyDone) return;
-      hostReadyDone = true;
+      if (initialReadyDone) return;
+      initialReadyDone = true;
       hostEl.dataset.ready = "true";
     };
-    const hostReadyFallback = window.setTimeout(markHostReady, 110);
+    let hostReadyFallback = window.setTimeout(markHostReady, 450);
     term.open(hostEl);
-    term.write("", markHostReady);
     appliedVisualSigRef.current = visualSig(fontFamily);
     fitAddon.fit();
     refreshCachedCellSize(term);
@@ -1424,9 +1425,24 @@ export function TerminalSurface({
       });
     };
 
-    const dispScroll = term.onScroll(scheduleOverlay);
+    const syncBottomSticky = () => {
+      if (!initialReadyDone || !activeRef.current || hostEl.clientHeight <= 40) return;
+      const buf = term.buffer.active;
+      if (buf === term.buffer.normal) {
+        wasAtBottomRef.current = buf.viewportY >= buf.baseY - 1;
+      } else {
+        wasAtBottomRef.current = true;
+      }
+    };
+    const dispScroll = term.onScroll(() => {
+      syncBottomSticky();
+      scheduleOverlay();
+    });
     const dispRender = term.onRender(scheduleOverlay);
-    const dispWriteParsed = term.onWriteParsed(flushOverlaySoon);
+    const dispWriteParsed = term.onWriteParsed(() => {
+      syncBottomSticky();
+      flushOverlaySoon();
+    });
     const clearOverlayMarkers = (altOnly = false) => {
       osc66Ref.current = osc66Ref.current.filter((r) => {
         if (altOnly && !r.alt) return true;
@@ -2648,7 +2664,17 @@ export function TerminalSurface({
     const writeFallbackScreen = (lines: string[]) => {
       if (sawRaw) return;
       fallbackLines = lines;
-      term.write(`\x1b[2J\x1b[H${lines.join("\r\n")}`);
+      term.write(`\x1b[2J\x1b[H${lines.join("\r\n")}`, () => {
+        if (!alive || termRef.current !== term) return;
+        if (!initialReadyDone) {
+          if (term.buffer.active === term.buffer.normal) {
+            term.scrollToBottom();
+          }
+          wasAtBottomRef.current = true;
+          markHostReady();
+        }
+        paintOverlays();
+      });
     };
 
     let unsubRelay: (() => void) | null = null;
@@ -2663,10 +2689,13 @@ export function TerminalSurface({
     let pendingByteCount = 0;
     let sawAnyOutput = false;
     let syncHoldDeadline = 0;
+    let initialBurstStartAt = 0;
+    let initialRevealQueued = false;
     const INPUT_FAST_MS = 200;
     const FLUSH_BYTE_CAP = 512 * 1024;
     const HIDDEN_OUTPUT_CLOCK_MS = 64;
     const SYNC_HOLD_MAX_MS = 32;
+    const INITIAL_BURST_MAX_MS = 320;
 
     const flushPendingBytes = () => {
       flushMicroQueued = false;
@@ -2689,7 +2718,21 @@ export function TerminalSurface({
       pendingBytes = [];
       pendingByteCount = 0;
       if (alive) {
+        const needsInitialReveal = !initialReadyDone;
         writeSegmented(textDecoder.decode(merged, { stream: true }));
+        if (needsInitialReveal && !initialRevealQueued) {
+          initialRevealQueued = true;
+          term.write("", () => {
+            initialRevealQueued = false;
+            if (!alive || termRef.current !== term) return;
+            if (term.buffer.active === term.buffer.normal) {
+              term.scrollToBottom();
+            }
+            wasAtBottomRef.current = true;
+            markHostReady();
+            paintOverlays();
+          });
+        }
       }
     };
 
@@ -2699,6 +2742,39 @@ export function TerminalSurface({
       pendingByteCount += bytes.length;
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
       const hitCap = pendingByteCount >= FLUSH_BYTE_CAP;
+
+      // Batch initial history bursts silently while data-ready="false" so xterm jumps
+      // straight to the latest progress instead of replaying top-to-bottom on switch.
+      if (!initialReadyDone) {
+        if (!initialBurstStartAt) initialBurstStartAt = nowMs;
+        const maxRemain = Math.max(0, INITIAL_BURST_MAX_MS - (nowMs - initialBurstStartAt));
+        if (!hitCap && maxRemain > 2) {
+          if (flushRaf) {
+            cancelAnimationFrame(flushRaf);
+            flushRaf = 0;
+          }
+          if (flushTimer) window.clearTimeout(flushTimer);
+          const quietMs = activeLocalConnId ? 24 : 45;
+          flushTimer = window.setTimeout(flushPendingBytes, Math.min(quietMs, Math.ceil(maxRemain)));
+          return;
+        }
+        sawAnyOutput = true;
+        if (flushTimer) {
+          window.clearTimeout(flushTimer);
+          flushTimer = 0;
+        }
+        if (flushRaf) {
+          cancelAnimationFrame(flushRaf);
+          flushRaf = 0;
+        }
+        if (!flushMicroQueued) {
+          flushMicroQueued = true;
+          queueMicrotask(() => {
+            if (flushMicroQueued) flushPendingBytes();
+          });
+        }
+        return;
+      }
 
       // DEC ?2026 synchronized output: hold briefly (<= 32ms) so full-screen TUI / SIGWINCH
       // redraws commit atomically on a single VSync frame without mid-frame blanking or tearing.
@@ -2791,7 +2867,9 @@ export function TerminalSurface({
           .then((res) => {
             if (alive && !sawRaw) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
           })
-          .catch(() => {});
+          .catch(() => {
+            if (alive && !initialReadyDone) markHostReady();
+          });
       };
       unsubRelay = subscribeStream(
         agent.deviceId,
@@ -2801,7 +2879,7 @@ export function TerminalSurface({
           raw: true,
           cols: term.cols,
           rows: term.rows,
-          history: 800,
+          history: 600,
           display: currentDisplay(term),
         },
         (ev) => {
@@ -2886,7 +2964,7 @@ export function TerminalSurface({
             terminal: localTermId,
             cols: reqCols,
             rows: reqRows,
-            history: 2000,
+            history: 1200,
             focused: activeRef.current && focusedRef.current,
             display: currentDisplay(term) as unknown as Record<string, unknown>,
             onData: (bytes) => {
@@ -2959,6 +3037,13 @@ export function TerminalSurface({
         sawRaw = false;
         sawAnyOutput = false;
         didOrphanNudge = false;
+        initialReadyDone = false;
+        initialBurstStartAt = 0;
+        initialRevealQueued = false;
+        wasAtBottomRef.current = true;
+        hostEl.dataset.ready = "false";
+        window.clearTimeout(hostReadyFallback);
+        hostReadyFallback = window.setTimeout(markHostReady, 450);
         window.clearTimeout(orphanNudgeTimer);
         orphanNudgeTimer = 0;
         pendingBytes = [];
@@ -3323,6 +3408,7 @@ export function TerminalSurface({
     onActivatedAttachRef.current?.();
     attachWebglRef.current?.();
     const term = termRef.current;
+    const stickToBottom = wasAtBottomRef.current;
     lastActivateAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (externalSizeOverrideRef.current) {
       lastResizeSigRef.current = "";
@@ -3337,11 +3423,22 @@ export function TerminalSurface({
     } else {
       syncResize(term);
     }
+    if (stickToBottom && term.buffer.active === term.buffer.normal) {
+      term.scrollToBottom();
+      wasAtBottomRef.current = true;
+    }
     term.refresh(0, Math.max(0, term.rows - 1));
     paintOverlays();
     const id = requestAnimationFrame(() => {
       onActivatedAttachRef.current?.();
       if (termRef.current === term) {
+        if (
+          stickToBottom &&
+          term.buffer.active === term.buffer.normal &&
+          term.buffer.active.viewportY < term.buffer.active.baseY
+        ) {
+          term.scrollToBottom();
+        }
         paintOverlays();
       }
     });
