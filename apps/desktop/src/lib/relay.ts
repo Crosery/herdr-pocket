@@ -1052,7 +1052,7 @@ export async function claimWebJoinTicket(serverInput: string, id: string, secret
   });
 }
 
-export async function completePairing(serverInput: string, code: string, customName?: string, via: PairVia = "typed"): Promise<void> {
+export async function completePairing(serverInput: string, code: string, customName?: string, via: PairVia = "typed"): Promise<PairResponse> {
   const server = normalizeServer(serverInput);
   if (!server) throw new RelayError("bad_request", "请填写服务器地址");
   if (!isMockServer(server) && !code.trim()) throw new RelayError("bad_request", "请填写配对码");
@@ -1067,20 +1067,21 @@ export async function completePairing(serverInput: string, code: string, customN
   });
   logger.info("pair", `paired as ${res.device.id}`);
   await applyAuthenticatedPairResponse(server, res);
+  return res;
 }
 
 /**
  * Pairs this app through the computer's own herdr-pocket login: the daemon's device token
  * asks its relay for a one-time viewer code, which then pairs this app like a typed code.
  */
-export async function pairWithLocalHost(customName?: string): Promise<void> {
+export async function pairWithLocalHost(customName?: string): Promise<PairResponse> {
   // The native side makes the code with the daemon's token; the token never comes here.
   const local = await getLocalPairCode().catch((err: LocalPairError) => {
     throw new RelayError(err.code === "unauthorized" || err.code === "offline" ? err.code : "internal", err.message);
   });
   const server = normalizeServer(local.server);
   logger.info("pair", `using this computer's herdr-pocket login for ${server}`);
-  await completePairing(server, local.code, customName, "local-login");
+  return await completePairing(server, local.code, customName, "local-login");
 }
 
 /** pairWithLocalHost with a deadline, for the unattended first-launch attempt. */

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { webcrypto } from "node:crypto";
+import { createHash, generateKeyPairSync, sign, webcrypto } from "node:crypto";
 import { Relay } from "../src/server.ts";
 
 const ADMIN = "test-admin-token-0123456789abcdef";
@@ -46,6 +46,17 @@ test("H5 /app subpath redirect and static bundle serving work under reverse-prox
     assert.equal(assetRes.status, 200);
     const assetBody = await assetRes.text();
     assert.ok(assetBody.length > 0);
+
+    const jsMatch = /\.\/(assets\/index-[^"'\s]+\.js)/.exec(html);
+    assert.ok(jsMatch, "built H5 index.html references main index bundle");
+    const jsRes = await fetch(`${base}/app/${jsMatch[1]}`);
+    assert.equal(jsRes.status, 200);
+    const jsBody = await jsRes.text();
+    assert.ok(jsBody.includes("摄像头扫码连接"), "built H5 bundle exposes camera scan UI");
+    assert.ok(jsBody.includes("打开摄像头扫码"), "built H5 bundle exposes camera trigger button");
+    assert.ok(jsBody.includes("选二维码图片"), "built H5 bundle exposes screenshot/photo QR picker");
+    assert.ok(jsBody.includes("使用通行密钥确认唯一身份"), "built H5 bundle exposes Passkey identity modal");
+    assert.ok(!jsBody.includes("让已登录的手机或电脑扫码放行"), "built H5 bundle removes reverse-QR join section");
   } finally {
     await relay.close();
   }
@@ -171,6 +182,157 @@ test("H5 ECDSA P-256 identity proof & anchor cookie recover identity without dup
     const viewers = devsBody.devices.filter((d) => d.kind === "viewer");
     assert.equal(viewers.length, 1, "only 1 viewer device exists in store");
     assert.equal(viewers[0]!.id, pair1.device.id);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("H5 WebAuthn Passkey options, registration, and reconfirm merge temporary viewer into original identity", async () => {
+  const relay = new Relay({ dbPath: tempDb(), adminToken: ADMIN, publicUrl: PUBLIC, log: () => {} });
+  const port = await relay.listen(0, "127.0.0.1");
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const codeARes = await fetch(`${base}/v1/pair/codes`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ADMIN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "viewer" }),
+    });
+    const codeA = (await codeARes.json()) as { code: string };
+    const pairARes = await fetch(`${base}/v1/pair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code: codeA.code,
+        name: "iPhone · Safari (Passkey Primary)",
+        kind: "viewer",
+        platform: "h5-ios",
+        via: "qr",
+      }),
+    });
+    assert.equal(pairARes.status, 200);
+    const viewerA = (await pairARes.json()) as { device: { id: string; passkeyLinked?: boolean }; token: string };
+
+    const optRes = await fetch(`${base}/v1/identity/passkey/options`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${viewerA.token}`, "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(optRes.status, 200);
+    const opt = (await optRes.json()) as {
+      challenge: string;
+      rp: { id: string };
+      authenticatorSelection?: { residentKey?: string; requireResidentKey?: boolean; userVerification?: string };
+    };
+    assert.equal(opt.rp.id, "pocket.example.com");
+    assert.equal(opt.authenticatorSelection?.residentKey, "preferred");
+    assert.equal(opt.authenticatorSelection?.userVerification, "preferred");
+
+    const passkeyKp = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const passkeySpki = toB64Url(passkeyKp.publicKey.export({ type: "spki", format: "der" }));
+    const regClientData = toB64Url(
+      Buffer.from(
+        JSON.stringify({
+          type: "webauthn.create",
+          challenge: opt.challenge,
+          origin: "https://pocket.example.com",
+        }),
+      ),
+    );
+    const regRes = await fetch(`${base}/v1/identity/passkey/register`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${viewerA.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        challenge: opt.challenge,
+        credId: "cred-passkey-1",
+        publicKeySpki: passkeySpki,
+        clientDataJSON: regClientData,
+      }),
+    });
+    assert.equal(regRes.status, 200);
+    const regBody = (await regRes.json()) as { device: { id: string; passkeyLinked?: boolean } };
+    assert.equal(regBody.device.id, viewerA.device.id);
+    assert.equal(regBody.device.passkeyLinked, true);
+
+    // Pair a temporary second viewer (e.g., user scanned QR on a brand-new browser) then switch back via Passkey.
+    const codeBRes = await fetch(`${base}/v1/pair/codes`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${ADMIN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "viewer" }),
+    });
+    const codeB = (await codeBRes.json()) as { code: string };
+    const pairBRes = await fetch(`${base}/v1/pair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code: codeB.code,
+        name: "Mac · Chrome (Temp Session)",
+        kind: "viewer",
+        platform: "h5-macos",
+        via: "qr",
+      }),
+    });
+    assert.equal(pairBRes.status, 200);
+    const viewerB = (await pairBRes.json()) as { device: { id: string }; token: string };
+    assert.notEqual(viewerB.device.id, viewerA.device.id);
+
+    const chRes = await fetch(`${base}/v1/identity/challenge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(chRes.status, 200);
+    const ch = (await chRes.json()) as { challenge: string; rpId: string };
+
+    const authData = Buffer.concat([
+      createHash("sha256").update(ch.rpId, "utf8").digest(),
+      Buffer.from([0x05, 0, 0, 0, 1]),
+    ]);
+    const assertionClientBuf = Buffer.from(
+      JSON.stringify({
+        type: "webauthn.get",
+        challenge: ch.challenge,
+        origin: "https://pocket.example.com",
+      }),
+    );
+    const clientHash = createHash("sha256").update(assertionClientBuf).digest();
+    const sig = sign("sha256", Buffer.concat([authData, clientHash]), passkeyKp.privateKey);
+
+    const reconfirmRes = await fetch(`${base}/v1/identity/reconfirm`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${viewerB.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        challenge: ch.challenge,
+        platform: "h5-macos",
+        passkey: {
+          id: "cred-passkey-1",
+          rawId: toB64Url(Buffer.from("cred-passkey-1")),
+          authenticatorData: toB64Url(authData),
+          clientDataJSON: toB64Url(assertionClientBuf),
+          signature: toB64Url(sig),
+        },
+      }),
+    });
+    assert.equal(reconfirmRes.status, 200);
+    const reconfirmed = (await reconfirmRes.json()) as { device: { id: string; passkeyLinked?: boolean }; token: string };
+    assert.equal(reconfirmed.device.id, viewerA.device.id);
+    assert.equal(reconfirmed.device.passkeyLinked, true);
+
+    const devsRes = await fetch(`${base}/v1/devices`, {
+      headers: { Authorization: `Bearer ${reconfirmed.token}` },
+    });
+    assert.equal(devsRes.status, 200);
+    const devsBody = (await devsRes.json()) as { devices: Array<{ id: string; kind: string }> };
+    const viewers = devsBody.devices.filter((d) => d.kind === "viewer");
+    assert.equal(viewers.length, 1, "temporary viewer B should be merged away cleanly");
+    assert.equal(viewers[0]!.id, viewerA.device.id);
+
+    const staleRes = await fetch(`${base}/v1/devices`, {
+      headers: { Authorization: `Bearer ${viewerB.token}` },
+    });
+    assert.equal(staleRes.status, 401, "merged temporary viewer token is revoked");
   } finally {
     await relay.close();
   }

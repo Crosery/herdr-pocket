@@ -143,6 +143,14 @@ fn should_be_visible(state: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|arr| !arr.is_empty());
     let has_peek = state.get("peek").is_some_and(|v| !v.is_null());
+    let is_demo = state.get("demo").and_then(Value::as_bool).unwrap_or(false);
+    let window_focused = state
+        .get("windowFocused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if window_focused && !has_peek && !is_demo && !EXPANDED.load(Ordering::Relaxed) {
+        return false;
+    }
     has_items || has_peek
 }
 
@@ -641,5 +649,27 @@ mod tests {
             compute_notch_frame(0.0, 0.0, 1920.0, 28.0, 0.0, 0.0, false, NotchViewMode::Peek);
         assert_eq!(peek_flat.width, 396.0);
         assert_eq!(peek_flat.y, 4.0);
+    }
+
+    #[test]
+    fn should_be_visible_hides_non_peek_notch_while_main_window_is_focused() {
+        assert!(!super::should_be_visible(&json!({
+            "enabled": true,
+            "windowFocused": true,
+            "items": [{ "id": "a" }],
+            "peek": null
+        })));
+        assert!(super::should_be_visible(&json!({
+            "enabled": true,
+            "windowFocused": false,
+            "items": [{ "id": "a" }],
+            "peek": null
+        })));
+        assert!(super::should_be_visible(&json!({
+            "enabled": true,
+            "windowFocused": true,
+            "items": [{ "id": "a" }],
+            "peek": { "id": "p1" }
+        })));
     }
 }

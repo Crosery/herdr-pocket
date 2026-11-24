@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { AlertCircle, ArrowRight, ChevronDown, ChevronRight, Copy, ExternalLink, Fingerprint, Laptop, Link2, QrCode, RefreshCw, ShieldCheck } from "lucide-react";
-import { parsePairInput, type IdentityHintResponse, type JoinTicket } from "@herdr-pocket/protocol";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { AlertCircle, ArrowRight, Camera, ChevronDown, ChevronRight, ExternalLink, Fingerprint, ImageUp, Laptop, Link2, ShieldCheck } from "lucide-react";
+import { parsePairInput, type IdentityHintResponse, type PairResponse } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketInput, useToast } from "./PocketUI";
-import { copyToClipboard, defaultDeviceName, getHostdStatus, isH5Web, openExternalUrl, type HostdLocalStatus } from "../lib/bridge";
+import { decodeQrImageFile, extractScannedPair, H5QrScannerModal, type ScannedPairPayload } from "./H5QrScannerModal";
+import { defaultDeviceName, getHostdStatus, isH5Web, openExternalUrl, type HostdLocalStatus } from "../lib/bridge";
 import {
   fetchIdentityHint,
   inferRelayUrlFromLocation,
@@ -14,11 +15,9 @@ import {
 import { isMockServer } from "../lib/mock";
 import {
   applyAuthenticatedPairResponse,
-  claimWebJoinTicket,
   completePairing,
   normalizeServer,
   pairWithLocalHost,
-  requestWebJoinTicket,
 } from "../lib/relay";
 import { settingsStore } from "../lib/store";
 import { logger } from "../lib/log";
@@ -27,8 +26,8 @@ export const RELAY_EXPLAINER = "中转服务器是你自己部署的一个小服
 export const RELAY_DEPLOY_DOCS = "https://github.com/Crosery/herdr-pocket/tree/main/docs/deploy";
 
 /**
- * The ways to reach a relay: local herdr-pocket login, browser H5 identity/Passkey recovery or
- * reverse-QR approval, a pasted invite, or a typed address and pair code.
+ * The ways to reach a relay: local herdr-pocket login, browser H5 camera QR scan and Passkey
+ * identity recovery, a pasted invite, or a typed address and pair code.
  */
 export function ConnectRelayPanel({
   onConnected,
@@ -36,7 +35,7 @@ export function ConnectRelayPanel({
   initialHint = null,
   autoFocus = false,
 }: {
-  onConnected?: () => void;
+  onConnected?: (res?: PairResponse) => void;
   initialError?: string | null;
   initialHint?: IdentityHintResponse | null;
   autoFocus?: boolean;
@@ -50,12 +49,12 @@ export function ConnectRelayPanel({
   const [code, setCode] = useState("");
   const [name, setName] = useState(() => defaultDeviceName());
   const [paste, setPaste] = useState("");
-  const [busy, setBusy] = useState<"local" | "manual" | "reconfirm" | "join" | null>(null);
+  const [busy, setBusy] = useState<"local" | "manual" | "reconfirm" | "scan" | null>(null);
   const [error, setError] = useState<string | null>(initialError ?? null);
   const [manualOpen, setManualOpen] = useState(h5);
   const [hint, setHint] = useState<IdentityHintResponse | null>(initialHint);
-  const [joinTicket, setJoinTicket] = useState<JoinTicket | null>(null);
-  const [joinQr, setJoinQr] = useState("");
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const qrFileRef = useRef<HTMLInputElement | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -102,46 +101,6 @@ export function ConnectRelayPanel({
     };
   }, [h5, normServer]);
 
-  useEffect(() => {
-    if (!joinTicket || !normServer) return;
-    let cancelled = false;
-    const poll = async () => {
-      if (Date.now() > joinTicket.expiresAt) {
-        if (!cancelled) {
-          setJoinTicket(null);
-          setJoinQr("");
-          setError("加入申请二维码已过期，可以点一次重新生成。");
-        }
-        return;
-      }
-      try {
-        const res = await claimWebJoinTicket(normServer, joinTicket.id, joinTicket.secret);
-        if (cancelled) return;
-        if (res.status === "approved") {
-          setJoinTicket(null);
-          setJoinQr("");
-          await applyAuthenticatedPairResponse(normServer, { device: res.device, token: res.token });
-          toast("已获准加入，正在进入");
-          onConnected?.();
-        } else if (res.status === "denied") {
-          setJoinTicket(null);
-          setJoinQr("");
-          setError("另一台设备拒绝了本次加入申请。");
-        }
-      } catch (err) {
-        if (!cancelled && /not_found|过期/.test((err as Error).message)) {
-          setJoinTicket(null);
-          setJoinQr("");
-        }
-      }
-    };
-    const timer = window.setInterval(() => void poll(), 2000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [joinTicket, normServer, onConnected, toast]);
-
   const handlePaste = (val: string) => {
     setPaste(val);
     const parsed = parsePairInput(val);
@@ -163,9 +122,9 @@ export function ConnectRelayPanel({
     setBusy("local");
     setError(null);
     try {
-      await pairWithLocalHost(name);
+      const res = await pairWithLocalHost(name);
       toast("已用这台电脑的登录连上中转服务器");
-      onConnected?.();
+      onConnected?.(res);
     } catch (err) {
       fail(err);
     } finally {
@@ -180,16 +139,21 @@ export function ConnectRelayPanel({
     setBusy("reconfirm");
     setError(null);
     try {
-      let res = await trySilentReconfirm(normServer);
-      if (!res && isPasskeySupported()) {
+      let res: PairResponse | null = null;
+      if (isPasskeySupported() && (hint?.passkeyLinked || !hint?.anchored)) {
         res = await reconfirmWithPasskey(normServer);
+      } else {
+        res = await trySilentReconfirm(normServer);
+        if (!res && isPasskeySupported()) {
+          res = await reconfirmWithPasskey(normServer);
+        }
       }
       if (!res) {
         throw new Error("当前浏览器尚未在此服务器上保存或绑定可验证身份，请先扫码或输入一次配对码完成绑定");
       }
       await applyAuthenticatedPairResponse(normServer, res);
       toast("已确认本机设备身份");
-      onConnected?.();
+      onConnected?.(res);
     } catch (err) {
       fail(err);
     } finally {
@@ -197,19 +161,43 @@ export function ConnectRelayPanel({
     }
   };
 
-  const startReverseJoin = async () => {
-    if (!normServer || isMockServer(normServer)) {
-      return setError("先填写中转服务器地址再生成申请二维码");
+  const handleScanned = async (parsed: ScannedPairPayload) => {
+    const targetServer = normalizeServer(parsed.server || server);
+    if (!targetServer) {
+      throw new Error("二维码未包含服务器地址，请先在下方填写服务器地址后再扫码");
     }
-    setBusy("join");
+    setServer(targetServer);
+    setCode(parsed.code);
+    setBusy("scan");
     setError(null);
     try {
-      const ticket = await requestWebJoinTicket(normServer, name);
-      const QRCode = await import("qrcode");
-      const qr = await QRCode.toDataURL(ticket.link, { width: 280, margin: 1, color: { dark: "#2B2236", light: "#FFFFFF" } });
-      if (!mountedRef.current) return;
-      setJoinQr(qr);
-      setJoinTicket(ticket);
+      const res = await completePairing(targetServer, parsed.code, name, "qr");
+      if (mountedRef.current) setScannerOpen(false);
+      toast("扫码连接成功");
+      onConnected?.(res);
+    } finally {
+      if (mountedRef.current) setBusy(null);
+    }
+  };
+
+  const onPickQrFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy("scan");
+    setError(null);
+    try {
+      const raw = await decodeQrImageFile(file);
+      if (!raw) {
+        setError("图片里未识别到清晰的二维码，请换一张清晰截图或完整二维码图片");
+        return;
+      }
+      const parsed = extractScannedPair(raw, typeof window !== "undefined" ? window.location.href : undefined);
+      if (!parsed) {
+        setError("识别到的二维码不是 Herdr Pocket 配对码");
+        return;
+      }
+      await handleScanned(parsed);
     } catch (err) {
       fail(err);
     } finally {
@@ -226,9 +214,9 @@ export function ConnectRelayPanel({
     try {
       // The relay's log records whether the code came from a pasted invite or was typed.
       const fromLink = parsePairInput(paste)?.code?.toUpperCase() === code.trim().toUpperCase();
-      await completePairing(server, code, name, fromLink ? "link" : "typed");
+      const res = await completePairing(server, code, name, fromLink ? "link" : "typed");
       toast("连接成功");
-      onConnected?.();
+      onConnected?.(res);
     } catch (err) {
       const msg = (err as Error)?.message ?? "";
       fail(
@@ -262,8 +250,37 @@ export function ConnectRelayPanel({
               <PocketBadge tone="pink">{recognized.name}</PocketBadge>
             </div>
             <div className="faint" style={{ fontSize: "calc(12px * var(--ts, 1))", marginTop: 2 }}>
-              将自动适配{recognized.formFactor === "desktop" ? "桌面多窗格" : "手机/平板触控"}界面，并绑定本地加密身份以防浏览器缓存变更产生重复设备。
+              将自动适配{recognized.formFactor === "desktop" ? "桌面多窗格" : "手机/平板触控"}界面，并默认使用通行密钥确认本机唯一身份。
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {h5 ? (
+        <div className="choice-card primary">
+          <div className="grow min-w-0">
+            <div className="choice-title">摄像头扫码连接</div>
+            <div className="faint wrap-anywhere">
+              像手机 App 一样，直接用摄像头扫描桌面端、命令行或已登录设备上的配对二维码，或从相册导入二维码截图。
+            </div>
+          </div>
+          <input
+            ref={qrFileRef}
+            type="file"
+            accept="image/*"
+            style={{ display: "none" }}
+            aria-label="选择二维码图片连接"
+            onChange={(e) => void onPickQrFile(e)}
+          />
+          <div className="row wrap" style={{ gap: 8 }}>
+            <PocketButton variant="primary" disabled={busy !== null} onClick={() => setScannerOpen(true)}>
+              <Camera size={15} />
+              <span>{busy === "scan" ? "正在连接…" : "打开摄像头扫码"}</span>
+            </PocketButton>
+            <PocketButton variant="soft" disabled={busy !== null} onClick={() => qrFileRef.current?.click()}>
+              <ImageUp size={15} />
+              <span>选二维码图片</span>
+            </PocketButton>
           </div>
         </div>
       ) : null}
@@ -287,66 +304,27 @@ export function ConnectRelayPanel({
         <div className={`choice-card${hint?.anchored || hint?.passkeyLinked ? " primary" : ""}`}>
           <div className="grow min-w-0">
             <div className="choice-title">
-              {hint?.deviceName ? `快速恢复已绑定身份（${hint.deviceName}）` : "用本机唯一身份 / 通行密钥恢复登录"}
+              {hint?.deviceName ? `用通行密钥恢复原身份（${hint.deviceName}）` : "用通行密钥快速回到上一个身份"}
             </div>
             <div className="faint wrap-anywhere">
-              {hint?.anchored
-                ? "检测到当前浏览器曾登记过此中转服务器，验证后将沿用原设备 ID，不新增重复设备。"
-                : "如果你曾在本浏览器绑定通行密钥（Face ID / Touch ID / 指纹）或保留加密钥匙，可直接验签登录。"}
+              {hint?.anchored && !hint?.passkeyLinked
+                ? "检测到当前浏览器曾登录此服务器，验证后将沿用原设备 ID，不产生重复设备。"
+                : "新设备或清理缓存后无需重新配对，通过通行密钥（Face ID / Touch ID / 指纹）即可直接回到上一个唯一身份。"}
             </div>
           </div>
           <PocketButton variant={hint?.anchored || hint?.passkeyLinked ? "primary" : "soft"} disabled={busy !== null} onClick={() => void reconfirmIdentity()}>
             <Fingerprint size={15} />
-            <span>{busy === "reconfirm" ? "正在验证…" : hint?.anchored ? "一键恢复身份" : "通行密钥登录"}</span>
+            <span>{busy === "reconfirm" ? "正在验证…" : hint?.anchored && !hint?.passkeyLinked ? "一键恢复身份" : "通行密钥登录"}</span>
           </PocketButton>
         </div>
       ) : null}
 
       {h5 ? (
-        <div className="choice-card column">
-          <div className="row wrap" style={{ justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-            <div className="grow min-w-0">
-              <div className="choice-title">让已登录的手机或电脑扫码放行</div>
-              <div className="faint">适合没有现成配对码时，用另一台已登录 Herdr Pocket 的设备扫一下确认。</div>
-            </div>
-            <PocketButton size="sm" variant="soft" disabled={busy !== null} onClick={() => void startReverseJoin()}>
-              {joinTicket ? <RefreshCw size={14} /> : <QrCode size={14} />}
-              <span>{busy === "join" ? "正在生成…" : joinTicket ? "刷新二维码" : "生成确认码"}</span>
-            </PocketButton>
-          </div>
-          {joinTicket && joinQr ? (
-            <div className="h5-join-box">
-              <img src={joinQr} alt="等待确认加入的二维码" className="h5-join-qr" />
-              <div className="stack min-w-0 grow" style={{ gap: 6 }}>
-                <div style={{ fontWeight: 700, fontSize: "calc(13px * var(--ts, 1))" }}>用已登录的 Herdr Pocket 扫一扫</div>
-                <div className="faint">或者点击复制链接，在已登录设备浏览器里打开同意即可（3 分钟内有效）。</div>
-                <div className="row wrap" style={{ gap: 6 }}>
-                  <PocketButton
-                    size="sm"
-                    variant="ghost"
-                    onClick={async () => {
-                      const ok = await copyToClipboard(joinTicket.link);
-                      toast(ok ? "确认链接已复制" : "复制失败", !ok);
-                    }}
-                  >
-                    <Copy size={13} />
-                    <span>复制确认链接</span>
-                  </PocketButton>
-                  <PocketButton
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => {
-                      setJoinTicket(null);
-                      setJoinQr("");
-                    }}
-                  >
-                    取消等待
-                  </PocketButton>
-                </div>
-              </div>
-            </div>
-          ) : null}
-        </div>
+        <H5QrScannerModal
+          open={scannerOpen}
+          onOpenChange={setScannerOpen}
+          onScanned={handleScanned}
+        />
       ) : null}
 
       <div className="choice-card column">

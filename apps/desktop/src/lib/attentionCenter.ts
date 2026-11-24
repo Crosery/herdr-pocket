@@ -295,6 +295,8 @@ export function buildNotchSyncPayload(): Record<string, unknown> {
   const visibleItems = st.items.slice(0, 12);
   return {
     enabled: Boolean(notifOn && islandOn),
+    windowFocused: st.windowFocused,
+    demo: runtimeTracker.demoUntil > Date.now(),
     items: visibleItems.map((it) => ({
       id: it.id,
       agentKey: it.agentKey,
@@ -531,14 +533,17 @@ export function startAttentionCenter(): () => void {
   const onFocus = () => {
     attentionStore.set({ windowFocused: true });
     syncAttentionFromRuntime();
+    scheduleNotchSync(true);
   };
   const onBlur = () => {
     attentionStore.set({ windowFocused: false });
+    scheduleNotchSync(true);
   };
   const onVisibility = () => {
     const focused = !document.hidden && document.hasFocus();
     attentionStore.set({ windowFocused: focused });
     if (focused) syncAttentionFromRuntime();
+    scheduleNotchSync(true);
   };
 
   if (typeof window !== "undefined") {

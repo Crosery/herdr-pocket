@@ -801,6 +801,12 @@
   scrollbar-width: none;
 }
 
+.v3-tabs-drag-gap {
+  flex: 0 0 28px;
+  height: 100%;
+  min-width: 16px;
+}
+
 .v3-tab-scroll::-webkit-scrollbar {
   display: none;
 }

@@ -468,6 +468,10 @@ export const native = {
     inTauri() ? invoke<void>("notch_sync", { state }).catch(() => {}) : noop(),
   notchFocusMain: async (): Promise<void> =>
     inTauri() ? invoke<void>("notch_focus_main").catch(() => {}) : noop(),
+  windowStartDragging: async (): Promise<void> =>
+    inTauri() ? invoke<void>("window_start_dragging").catch(() => {}) : noop(),
+  windowToggleMaximize: async (): Promise<void> =>
+    inTauri() ? invoke<void>("window_toggle_maximize").catch(() => {}) : noop(),
 
   // Local SOTA Audio DSP & Voiceprint (src-tauri/src/voice_ai.rs + Demo Mode) ---
   voiceAiState: async (): Promise<VoiceAiState> =>

@@ -932,6 +932,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       >
         <ChevronDown size={13} />
       </button>
+      <div className="v3-tabs-drag-gap" aria-hidden="true" />
       <div className="v3-tabs-right">
         {panelBtn("files", "文件", FolderTree, shortcutText("togglePanel"))}
         {panelBtn("git", "Git", GitBranch, shortcutText("toggleGit"))}

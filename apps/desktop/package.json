@@ -1,7 +1,7 @@
 {
   "name": "@herdr-pocket/desktop",
   "private": true,
-  "version": "0.2.26",
+  "version": "0.2.27",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
@@ -27,6 +27,7 @@
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
+    "jsqr": "^1.4.0",
     "lucide-react": "^0.511.0",
     "qrcode": "^1.5.4",
     "react": "^19.1.0",

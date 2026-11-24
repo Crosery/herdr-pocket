@@ -493,6 +493,10 @@ export class Relay {
           return;
         }
         this.store.setPasskeySignCount(rec.device.id, check.nextSignCount);
+        const caller = this.authenticate(req, url);
+        if (caller && caller !== "admin" && caller.kind === "viewer" && caller.id !== rec.device.id) {
+          this.removeDevice(caller.id, "merged-into-passkey");
+        }
         const rotated = this.store.rotateDeviceToken(rec.device.id, {
           name: customName,
           platform,
@@ -693,6 +697,11 @@ export class Relay {
         rp: { id: issued.rpId, name: "Herdr Pocket" },
         user: { id: auth.id, name: auth.name, displayName: auth.name },
         pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: {
+          residentKey: "preferred",
+          requireResidentKey: false,
+          userVerification: "preferred",
+        },
       });
       return;
     }

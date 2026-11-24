@@ -571,7 +571,13 @@ fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
                 window.app_handle().exit(0);
             }
         }
+        tauri::WindowEvent::Moved(_) => {
+            mainwin::record_window_geometry_change(window.app_handle());
+        }
         tauri::WindowEvent::Focused(_) | tauri::WindowEvent::Resized(_) => {
+            if matches!(event, tauri::WindowEvent::Resized(_)) {
+                mainwin::record_window_geometry_change(window.app_handle());
+            }
             mainwin::visibility_changed(window.app_handle());
             if matches!(event, tauri::WindowEvent::Focused(true)) {
                 mainwin::wake(window.app_handle(), "focus");
@@ -587,6 +593,7 @@ pub(crate) fn prepare_relaunch(handle: &tauri::AppHandle) {
         "app relaunch requested",
         json!({ "via": "permission" }),
     );
+    mainwin::flush_window_state(handle);
     local_term::shutdown();
     voice_ai::shutdown();
     voice::shutdown(handle);
@@ -603,6 +610,7 @@ fn on_quit(handle: &tauri::AppHandle, via: &str) {
         return;
     }
     logging::info("app", "app quitting", json!({ "via": via }));
+    mainwin::flush_window_state(handle);
     local_term::shutdown();
     voice_ai::shutdown();
     voice::shutdown(handle);
@@ -726,6 +734,8 @@ pub fn run() {
             commands::voice_hud_hide,
             commands::notch_sync,
             commands::notch_focus_main,
+            commands::window_start_dragging,
+            commands::window_toggle_maximize,
             commands::voice_ai_state,
             commands::voice_ai_set_config,
             commands::voice_ai_download,

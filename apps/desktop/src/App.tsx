@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
-import { AppWindow, Bot, Laptop, MessageSquare, Moon, QrCode, Server, Settings, Sun } from "lucide-react";
-import { parsePairLink, type IdentityHintResponse } from "@herdr-pocket/protocol";
+import { AlertCircle, AppWindow, Bot, Fingerprint, Laptop, MessageSquare, Moon, QrCode, Server, Settings, Sun } from "lucide-react";
+import { parsePairLink, type IdentityHintResponse, type PairResponse } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketInput, PocketModal, ToastProvider, useToast } from "./components/PocketUI";
 import { XiaoyangOrb } from "./components/MascotAndVendor";
 import type { NavItem } from "./components/Sidebar";
@@ -16,8 +16,18 @@ import { OnboardingView, type OnboardStep } from "./views/OnboardingView";
 import type { SettingsSection } from "./views/SettingsView";
 import { assistantStore } from "./lib/assistant";
 import { detectPlatform, getHostdStatus, isH5Web, isHarmony, isTauri, loadSession } from "./lib/bridge";
-import { fetchIdentityHint, inferRelayUrlFromLocation, recognizeWebDevice, trySilentReconfirm } from "./lib/h5Identity";
+import {
+  fetchIdentityHint,
+  inferRelayUrlFromLocation,
+  isPasskeySupported,
+  recognizeWebDevice,
+  reconfirmWithPasskey,
+  registerDevicePasskey,
+  trySilentReconfirm,
+} from "./lib/h5Identity";
+import { isMockServer } from "./lib/mock";
 import { native } from "./lib/native";
+import { installWindowDragBridge } from "./lib/windowDrag";
 import { ensureChatQueueWatcher } from "./lib/chatQueue";
 import {
   buildCuteFontFamily,
@@ -109,10 +119,21 @@ function PocketAppShell() {
   const [pendingApproveId, setPendingApproveId] = useState<string | null>(null);
   const [approveReq, setApproveReq] = useState<{ id: string; name: string; platform?: string } | null>(null);
   const [approveBusy, setApproveBusy] = useState(false);
+  const [passkeyPrompt, setPasskeyPrompt] = useState<{ server: string; deviceId: string; deviceName: string } | null>(null);
+  const [passkeyBusy, setPasskeyBusy] = useState<"register" | "switch" | null>(null);
+  const [passkeyErr, setPasskeyErr] = useState<string | null>(null);
   // Desktop without a relay: the guide floats over the (empty) shell and can be closed.
   const [firstGuideClosed, setFirstGuideClosed] = useState(false);
   const mobileRef = useRef(mobileLayout);
   mobileRef.current = mobileLayout;
+
+  const maybePromptH5Passkey = useCallback((pairedServer: string, res?: PairResponse | null) => {
+    if (!isH5Web() || !res || res.device.passkeyLinked || isMockServer(pairedServer) || !isPasskeySupported()) {
+      return;
+    }
+    setPasskeyErr(null);
+    setPasskeyPrompt({ server: pairedServer, deviceId: res.device.id, deviceName: res.device.name });
+  }, []);
 
   useEffect(() => {
     const platform = detectPlatform();
@@ -120,7 +141,12 @@ function PocketAppShell() {
     document.documentElement.setAttribute("data-client", isH5Web() ? "h5" : isHarmony() ? "harmony" : "desktop");
     // macOS app: the title bar overlays the window and the traffic lights sit in the sidebar (R36 / N4).
     if (platform === "macos" && isTauri()) document.documentElement.setAttribute("data-titlebar", "overlay");
-    return startDesktopPerfTelemetry();
+    const offPerf = startDesktopPerfTelemetry();
+    const offDrag = installWindowDragBridge();
+    return () => {
+      offDrag();
+      offPerf();
+    };
   }, []);
 
   // Text size reaches every CSS font size (and dialogs outside the shell) through --ts.
@@ -186,12 +212,15 @@ function PocketAppShell() {
       const hit = parsePairLink(url);
       if (hit) {
         void completePairing(hit.server, hit.code, undefined, "link").then(
-          () => toast("已通过链接重新配对"),
+          (res) => {
+            toast("已通过链接重新配对");
+            maybePromptH5Passkey(hit.server, res);
+          },
           (e) => toast((e as Error).message, true),
         );
       }
     };
-  }, [toast]);
+  }, [maybePromptH5Passkey, toast]);
 
   // Startup never waits on the network: a saved session connects in the background, and a
   // logged-in herdr-pocket on this computer is tried once with a deadline.
@@ -215,9 +244,10 @@ function PocketAppShell() {
 
         if (pairParam && inferred) {
           try {
-            await completePairing(inferred, pairParam, undefined, "qr");
+            const res = await completePairing(inferred, pairParam, undefined, "qr");
             if (!alive) return;
             toast("扫码登录成功，已绑定本机防漂移身份");
+            maybePromptH5Passkey(inferred, res);
             setBoot("ready");
             return;
           } catch (err) {
@@ -445,7 +475,11 @@ function PocketAppShell() {
             autoFocus
             initialError={autoError}
             initialHint={h5Hint}
-            onConnected={() => setAutoError(null)}
+            onConnected={(res) => {
+              setAutoError(null);
+              const srv = settingsStore.get().server;
+              if (srv) maybePromptH5Passkey(srv, res);
+            }}
           />
         </div>
       </div>
@@ -567,7 +601,16 @@ function PocketAppShell() {
         }}
       />
       <PocketModal open={relayOpen} onOpenChange={setRelayOpen} title="连接中转服务器" subtitle={RELAY_EXPLAINER} width={560}>
-        {relayOpen ? <ConnectRelayPanel autoFocus onConnected={() => setRelayOpen(false)} /> : null}
+        {relayOpen ? (
+          <ConnectRelayPanel
+            autoFocus
+            onConnected={(res) => {
+              setRelayOpen(false);
+              const srv = settingsStore.get().server;
+              if (srv) maybePromptH5Passkey(srv, res);
+            }}
+          />
+        ) : null}
       </PocketModal>
       <PocketModal open={cmdOpen} onOpenChange={setCmdOpen} title="快速跳转" width={480}>
         <div className="stack cmdk">
@@ -692,6 +735,90 @@ function PocketAppShell() {
                 }}
               >
                 允许加入
+              </PocketButton>
+            </div>
+          </div>
+        ) : null}
+      </PocketModal>
+      <PocketModal
+        open={Boolean(passkeyPrompt)}
+        onOpenChange={(open) => {
+          if (!open && !passkeyBusy) {
+            setPasskeyErr(null);
+            setPasskeyPrompt(null);
+          }
+        }}
+        title="使用通行密钥确认唯一身份"
+        subtitle="绑定后，后续在任何新设备或新浏览器都可用通行密钥直接回到当前身份，避免重复设备。"
+        width={440}
+      >
+        {passkeyPrompt ? (
+          <div className="stack" style={{ gap: 14 }}>
+            {passkeyErr ? (
+              <div className="inline-alert" role="alert">
+                <AlertCircle size={16} />
+                <span>{passkeyErr}</span>
+              </div>
+            ) : null}
+            <div className="muted">
+              当前已接入身份 <strong style={{ color: "var(--ink)" }}>{passkeyPrompt.deviceName}</strong>（
+              <span className="mono">{passkeyPrompt.deviceId}</span>）。你可以用 Face ID / Touch ID / 指纹锁定此身份，或直接切回之前绑定过通行密钥的旧身份。
+            </div>
+            <div className="stack" style={{ gap: 8 }}>
+              <PocketButton
+                variant="primary"
+                disabled={passkeyBusy !== null}
+                onClick={async () => {
+                  const tok = getActiveToken();
+                  if (!tok) return;
+                  setPasskeyBusy("register");
+                  setPasskeyErr(null);
+                  try {
+                    const updated = await registerDevicePasskey(passkeyPrompt.server, tok);
+                    liveStore.set({ devices: { ...liveStore.get().devices, [updated.id]: updated } });
+                    toast("已用通行密钥锁定唯一身份");
+                    setPasskeyPrompt(null);
+                  } catch (e) {
+                    setPasskeyErr((e as Error)?.message || "通行密钥绑定失败，可稍后在“设置 -> 本机唯一身份锁”绑定");
+                  } finally {
+                    setPasskeyBusy(null);
+                  }
+                }}
+              >
+                <Fingerprint size={15} />
+                <span>{passkeyBusy === "register" ? "正在验证通行密钥…" : "创建并绑定通行密钥"}</span>
+              </PocketButton>
+              <PocketButton
+                variant="soft"
+                disabled={passkeyBusy !== null}
+                onClick={async () => {
+                  const tok = getActiveToken();
+                  setPasskeyBusy("switch");
+                  setPasskeyErr(null);
+                  try {
+                    const switched = await reconfirmWithPasskey(passkeyPrompt.server, tok ?? undefined);
+                    await applyAuthenticatedPairResponse(passkeyPrompt.server, switched);
+                    toast(`已回到原身份 ${switched.device.name}`);
+                    setPasskeyPrompt(null);
+                  } catch (e) {
+                    setPasskeyErr((e as Error)?.message || "未匹配到已有通行密钥或验证已取消");
+                  } finally {
+                    setPasskeyBusy(null);
+                  }
+                }}
+              >
+                <Fingerprint size={15} />
+                <span>{passkeyBusy === "switch" ? "正在恢复原身份…" : "已有通行密钥？回到上一个身份"}</span>
+              </PocketButton>
+              <PocketButton
+                variant="ghost"
+                disabled={passkeyBusy !== null}
+                onClick={() => {
+                  setPasskeyErr(null);
+                  setPasskeyPrompt(null);
+                }}
+              >
+                稍后再说
               </PocketButton>
             </div>
           </div>

@@ -1,10 +1,45 @@
-import type {
-  Device,
-  DeviceIdentityProof,
-  IdentityChallengeResponse,
-  IdentityHintResponse,
-  PairResponse,
+import {
+  isPairCode,
+  parsePairInput,
+  type Device,
+  type DeviceIdentityProof,
+  type IdentityChallengeResponse,
+  type IdentityHintResponse,
+  type PairResponse,
 } from "@herdr-pocket/protocol";
+
+export interface ScannedPairPayload {
+  server?: string;
+  code: string;
+}
+
+/** Parses standard invite/pair links, H5 `?pair=` links, or bare `WORD-1234` codes from QR text. */
+export function extractScannedPair(raw: string, fallbackHref?: string): ScannedPairPayload | null {
+  const direct = parsePairInput(raw);
+  if (direct) return direct;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const url = new URL(trimmed);
+    const candidate = url.searchParams.get("pair") ?? url.searchParams.get("code");
+    if (candidate && isPairCode(candidate.trim())) {
+      const normalized = candidate.trim().toUpperCase().replace(/^([A-Z]+)-?(\d+)$/, "$1-$2");
+      const server = inferRelayUrlFromLocation({ origin: url.origin, pathname: url.pathname });
+      return { ...(server ? { server } : {}), code: normalized };
+    }
+  } catch {
+    if (fallbackHref) {
+      try {
+        const base = new URL(fallbackHref);
+        const rel = new URL(trimmed, base);
+        return extractScannedPair(rel.toString());
+      } catch {
+        // ignore relative parse failure
+      }
+    }
+  }
+  return null;
+}
 
 export interface RecognizedWebDevice {
   name: string;
@@ -406,6 +441,7 @@ export async function registerDevicePasskey(relayUrl: string, token: string): Pr
     rp: { id: string; name: string };
     user: { id: string; name: string; displayName: string };
     pubKeyCredParams: PublicKeyCredentialParameters[];
+    authenticatorSelection?: AuthenticatorSelectionCriteria;
   };
 
   const created = (await navigator.credentials.create({
@@ -418,7 +454,11 @@ export async function registerDevicePasskey(relayUrl: string, token: string): Pr
         displayName: opt.user.displayName,
       },
       pubKeyCredParams: opt.pubKeyCredParams,
-      authenticatorSelection: { residentKey: "preferred", userVerification: "preferred" },
+      authenticatorSelection: opt.authenticatorSelection ?? {
+        residentKey: "preferred",
+        requireResidentKey: false,
+        userVerification: "preferred",
+      },
       timeout: 60_000,
     },
   })) as PublicKeyCredential | null;
@@ -444,7 +484,7 @@ export async function registerDevicePasskey(relayUrl: string, token: string): Pr
   return body.device;
 }
 
-export async function reconfirmWithPasskey(relayUrl: string): Promise<PairResponse> {
+export async function reconfirmWithPasskey(relayUrl: string, mergeToken?: string): Promise<PairResponse> {
   if (!isPasskeySupported()) {
     throw new Error("当前浏览器不支持通行密钥");
   }
@@ -474,7 +514,10 @@ export async function reconfirmWithPasskey(relayUrl: string): Promise<PairRespon
   const res = await fetch(`${base}/v1/identity/reconfirm`, {
     method: "POST",
     credentials: "same-origin",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(mergeToken ? { authorization: `Bearer ${mergeToken}` } : {}),
+    },
     body: JSON.stringify({
       challenge: ch.challenge,
       platform: recognized.platform,

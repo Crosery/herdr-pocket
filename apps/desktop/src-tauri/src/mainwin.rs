@@ -6,7 +6,10 @@
 //! WebSocket without the page noticing for a long time.
 
 use crate::{config, logging, resources};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,12 +19,133 @@ use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Theme};
 /// its relay link now (reconnect at once if it is down) instead of waiting for its backoff.
 pub const WAKE_EVENT: &str = "app://wake";
 const TRAY_ID: &str = "pocket-tray";
+const WINDOW_STATE_FILE: &str = "window-state.json";
 /// tauri.conf.json's minimum; lowered on screens where it does not fit.
 const MIN_W: f64 = 420.0;
 const MIN_H: f64 = 640.0;
 /// Smallest height the UI is ever given (1366x768 at 125% with a taskbar leaves about 530).
 const FLOOR_H: f64 = 480.0;
 const MARGIN: f64 = 12.0;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedWindowState {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    #[serde(default)]
+    pub maximized: bool,
+    #[serde(default)]
+    pub fullscreen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MonitorWorkArea {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub deco_w: f64,
+    pub deco_h: f64,
+}
+
+static PLACEMENT_READY: AtomicBool = AtomicBool::new(false);
+static STATE_DIRTY: AtomicBool = AtomicBool::new(false);
+static SAVE_PENDING: AtomicBool = AtomicBool::new(false);
+static LAST_NORMAL_BOUNDS: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+static LAST_STATE_CACHE: Mutex<Option<SavedWindowState>> = Mutex::new(None);
+
+fn window_state_path() -> Option<PathBuf> {
+    crate::hostd_config_dir().map(|d| d.join(WINDOW_STATE_FILE))
+}
+
+fn load_window_state() -> Option<SavedWindowState> {
+    let p = window_state_path()?;
+    let raw = fs::read_to_string(p).ok()?;
+    serde_json::from_str::<SavedWindowState>(&raw).ok()
+}
+
+fn write_window_state(state: &SavedWindowState) {
+    let Some(p) = window_state_path() else {
+        return;
+    };
+    let Ok(mut bytes) = serde_json::to_vec_pretty(state) else {
+        return;
+    };
+    bytes.push(b'\n');
+    if let Err(e) = config::write_atomic(&p, &bytes) {
+        logging::warn(
+            "app.window",
+            "window state write failed",
+            json!({ "error": e.to_string() }),
+        );
+    }
+}
+
+/// Validates saved bounds against connected monitors and returns the restored placement only if
+/// enough of the window still overlaps an active monitor (`>= 120 x 80` logical px); otherwise
+/// returns `None` so startup falls back to centered placement on the active screen.
+pub fn resolve_restored_window_state(
+    saved: &SavedWindowState,
+    monitors: &[MonitorWorkArea],
+) -> Option<SavedWindowState> {
+    if !saved.x.is_finite()
+        || !saved.y.is_finite()
+        || !saved.width.is_finite()
+        || !saved.height.is_finite()
+        || saved.width < 240.0
+        || saved.height < 240.0
+        || monitors.is_empty()
+    {
+        return None;
+    }
+
+    let mut best: Option<(f64, &MonitorWorkArea)> = None;
+    for m in monitors {
+        let outer_w = saved.width + m.deco_w.max(0.0);
+        let outer_h = saved.height + m.deco_h.max(0.0);
+        let ix0 = saved.x.max(m.x);
+        let iy0 = saved.y.max(m.y);
+        let ix1 = (saved.x + outer_w).min(m.x + m.width);
+        let iy1 = (saved.y + outer_h).min(m.y + m.height);
+        let iw = (ix1 - ix0).max(0.0);
+        let ih = (iy1 - iy0).max(0.0);
+        if iw >= 120.0 && ih >= 80.0 {
+            let area = iw * ih;
+            if best.is_none_or(|(best_area, _)| area > best_area) {
+                best = Some((area, m));
+            }
+        }
+    }
+
+    let (_, m) = best?;
+    let deco_w = m.deco_w.max(0.0);
+    let deco_h = m.deco_h.max(0.0);
+    let max_inner_w = (m.width - deco_w).max(MIN_W.min(m.width));
+    let max_inner_h = (m.height - deco_h).max(FLOOR_H.min(m.height));
+    let min_inner_w = MIN_W.min(max_inner_w);
+    let min_inner_h = FLOOR_H.min(max_inner_h);
+
+    let width = saved.width.clamp(min_inner_w, max_inner_w);
+    let height = saved.height.clamp(min_inner_h, max_inner_h);
+    let outer_w = width + deco_w;
+    let min_x = m.x - outer_w + 120.0;
+    let max_x = m.x + m.width - 120.0;
+    let x = saved.x.clamp(min_x.min(max_x), max_x.max(min_x));
+    let min_y = m.y;
+    let max_y = (m.y + m.height - 44.0).max(m.y);
+    let y = saved.y.clamp(min_y, max_y);
+
+    Some(SavedWindowState {
+        x,
+        y,
+        width,
+        height,
+        maximized: saved.maximized,
+        fullscreen: saved.fullscreen,
+    })
+}
 
 fn app_cell() -> &'static OnceLock<AppHandle> {
     static APP: OnceLock<AppHandle> = OnceLock::new();
@@ -45,18 +169,176 @@ pub fn fit(want: (f64, f64), area: (f64, f64), deco: (f64, f64)) -> ((f64, f64),
     (size, min)
 }
 
-/// First thing at start: the window fits the work area of its screen (taskbar and Dock
-/// excluded) and sits in its middle.
+fn window_deco(w: &tauri::Window, scale: f64) -> (f64, f64) {
+    let (Ok(inner), Ok(outer)) = (w.inner_size(), w.outer_size()) else {
+        return (0.0, 0.0);
+    };
+    let inner = inner.to_logical::<f64>(scale);
+    let outer = outer.to_logical::<f64>(scale);
+    (
+        (outer.width - inner.width).max(0.0),
+        (outer.height - inner.height).max(0.0),
+    )
+}
+
+fn snapshot_window_state(w: &tauri::Window) -> Option<SavedWindowState> {
+    let scale = w.scale_factor().unwrap_or(1.0).max(1.0);
+    let fullscreen = w.is_fullscreen().unwrap_or(false);
+    let maximized = !fullscreen && w.is_maximized().unwrap_or(false);
+    let outer_pos = w.outer_position().ok()?.to_logical::<f64>(scale);
+    let inner = w.inner_size().ok()?.to_logical::<f64>(scale);
+    let (x, y, width, height) = if !fullscreen {
+        if let Ok(mut g) = LAST_NORMAL_BOUNDS.lock() {
+            *g = Some((outer_pos.x, outer_pos.y, inner.width, inner.height));
+        }
+        (outer_pos.x, outer_pos.y, inner.width, inner.height)
+    } else if let Ok(g) = LAST_NORMAL_BOUNDS.lock() {
+        (*g)?
+    } else {
+        (outer_pos.x, outer_pos.y, inner.width, inner.height)
+    };
+    if width < 240.0 || height < 240.0 {
+        return None;
+    }
+    Some(SavedWindowState {
+        x,
+        y,
+        width,
+        height,
+        maximized,
+        fullscreen,
+    })
+}
+
+pub fn record_window_geometry_change(app: &AppHandle) {
+    if !PLACEMENT_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(w) = app.get_window("main") else {
+        return;
+    };
+    if w.is_minimized().unwrap_or(false) || !w.is_visible().unwrap_or(true) {
+        return;
+    }
+    let Some(state) = snapshot_window_state(&w) else {
+        return;
+    };
+    if let Ok(mut cache) = LAST_STATE_CACHE.lock() {
+        if cache.as_ref() == Some(&state) {
+            return;
+        }
+        *cache = Some(state);
+    }
+    STATE_DIRTY.store(true, Ordering::SeqCst);
+    if SAVE_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        SAVE_PENDING.store(false, Ordering::SeqCst);
+        if !STATE_DIRTY.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let snapshot = LAST_STATE_CACHE.lock().ok().and_then(|g| g.clone());
+        if let Some(st) = snapshot {
+            write_window_state(&st);
+        }
+    });
+}
+
+pub fn flush_window_state(app: &AppHandle) {
+    if !PLACEMENT_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(w) = app.get_window("main") {
+        if !w.is_minimized().unwrap_or(false) && w.is_visible().unwrap_or(true) {
+            if let Some(st) = snapshot_window_state(&w) {
+                if let Ok(mut cache) = LAST_STATE_CACHE.lock() {
+                    *cache = Some(st);
+                }
+                STATE_DIRTY.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    if STATE_DIRTY.swap(false, Ordering::SeqCst) {
+        let snapshot = LAST_STATE_CACHE.lock().ok().and_then(|g| g.clone());
+        if let Some(st) = snapshot {
+            write_window_state(&st);
+        }
+    }
+}
+
+/// Restores the window's prior screen & size/state when still on a connected display, otherwise
+/// fits and centers it cleanly on the active monitor.
 pub fn fit_on_start(app: &AppHandle) {
     let Some(w) = app.get_window("main") else {
         return;
     };
+
+    let base_scale = w.scale_factor().unwrap_or(1.0).max(1.0);
+    let deco = window_deco(&w, base_scale);
+    let avail: Vec<MonitorWorkArea> = w
+        .available_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            let s = m.scale_factor().max(1.0);
+            let wa = m.work_area();
+            MonitorWorkArea {
+                x: f64::from(wa.position.x) / s,
+                y: f64::from(wa.position.y) / s,
+                width: f64::from(wa.size.width) / s,
+                height: f64::from(wa.size.height) / s,
+                deco_w: deco.0,
+                deco_h: deco.1,
+            }
+        })
+        .collect();
+
+    if let Some(saved) = load_window_state().and_then(|s| resolve_restored_window_state(&s, &avail))
+    {
+        let min_w = MIN_W.min(saved.width);
+        let min_h = FLOOR_H.min(MIN_H.min(saved.height));
+        let _ = w.set_min_size(Some(LogicalSize::new(min_w, min_h)));
+        let _ = w.set_position(LogicalPosition::new(saved.x, saved.y));
+        let _ = w.set_size(LogicalSize::new(saved.width, saved.height));
+        let _ = w.set_position(LogicalPosition::new(saved.x, saved.y));
+        if let Ok(mut g) = LAST_NORMAL_BOUNDS.lock() {
+            *g = Some((saved.x, saved.y, saved.width, saved.height));
+        }
+        if let Ok(mut cache) = LAST_STATE_CACHE.lock() {
+            *cache = Some(saved.clone());
+        }
+        if saved.fullscreen {
+            let _ = w.set_fullscreen(true);
+        } else {
+            #[cfg(not(target_os = "macos"))]
+            if saved.maximized {
+                let _ = w.maximize();
+            }
+        }
+        PLACEMENT_READY.store(true, Ordering::SeqCst);
+        logging::info(
+            "app.window",
+            "window restored",
+            json!({
+                "x": saved.x.round(),
+                "y": saved.y.round(),
+                "size": [saved.width.round(), saved.height.round()],
+                "fullscreen": saved.fullscreen,
+                "maximized": saved.maximized,
+            }),
+        );
+        return;
+    }
+
     let Some(m) = w
         .current_monitor()
         .ok()
         .flatten()
         .or_else(|| w.primary_monitor().ok().flatten())
     else {
+        PLACEMENT_READY.store(true, Ordering::SeqCst);
         return;
     };
     let scale = m.scale_factor();
@@ -69,15 +351,12 @@ pub fn fit_on_start(app: &AppHandle) {
         f64::from(area.size.width) / scale,
         f64::from(area.size.height) / scale,
     );
-    let (Ok(inner), Ok(outer)) = (w.inner_size(), w.outer_size()) else {
+    let Ok(inner) = w.inner_size() else {
+        PLACEMENT_READY.store(true, Ordering::SeqCst);
         return;
     };
     let inner = inner.to_logical::<f64>(scale);
-    let outer = outer.to_logical::<f64>(scale);
-    let deco = (
-        (outer.width - inner.width).max(0.0),
-        (outer.height - inner.height).max(0.0),
-    );
+    let deco = window_deco(&w, scale);
     let (size, min) = fit((inner.width, inner.height), (aw, ah), deco);
     let _ = w.set_min_size(Some(LogicalSize::new(min.0, min.1)));
     if size.0 < inner.width - 0.5 || size.1 < inner.height - 0.5 {
@@ -86,11 +365,118 @@ pub fn fit_on_start(app: &AppHandle) {
     let x = ax + ((aw - size.0 - deco.0) / 2.0).max(0.0);
     let y = ay + ((ah - size.1 - deco.1) / 2.0).max(0.0);
     let _ = w.set_position(LogicalPosition::new(x, y));
+    if let Ok(mut g) = LAST_NORMAL_BOUNDS.lock() {
+        *g = Some((x, y, size.0, size.1));
+    }
+    PLACEMENT_READY.store(true, Ordering::SeqCst);
     logging::info(
         "app.window",
         "window placed",
         json!({ "workArea": [aw.round(), ah.round()], "scale": scale, "size": [size.0.round(), size.1.round()], "minHeight": min.1.round() }),
     );
+}
+
+/// Starts a native OS window drag on the main window. On macOS, synthesizes a valid
+/// `LeftMouseDown` NSEvent in the main window's coordinate space whenever `NSApp.currentEvent`
+/// was superseded by async WKWebView IPC, cursor movement, or HUD/accessory windows.
+pub fn start_dragging(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            use objc2_app_kit::{
+                NSApplication, NSEvent, NSEventModifierFlags, NSEventType, NSWindow,
+            };
+            use objc2_foundation::{MainThreadMarker, NSProcessInfo};
+
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let Some(w) = app2.get_webview_window("main") else {
+                return;
+            };
+            let Ok(ptr) = w.ns_window() else {
+                return;
+            };
+            if ptr.is_null() {
+                return;
+            }
+            if NSEvent::pressedMouseButtons() & 1 == 0 {
+                return;
+            }
+            let ns_win = unsafe { &*(ptr as *const NSWindow) };
+            ns_win.setMovable(true);
+            let win_num = ns_win.windowNumber();
+            let ns_app = NSApplication::sharedApplication(mtm);
+            let cur_ev = ns_app.currentEvent();
+            if let Some(ref ev) = cur_ev {
+                if ev.r#type() == NSEventType::LeftMouseDown && ev.windowNumber() == win_num {
+                    ns_win.performWindowDragWithEvent(ev);
+                    return;
+                }
+            }
+            let screen_pt = NSEvent::mouseLocation();
+            let win_pt = ns_win.convertPointFromScreen(screen_pt);
+            let flags = cur_ev
+                .as_ref()
+                .map(|e| e.modifierFlags())
+                .unwrap_or(NSEventModifierFlags::empty());
+            let uptime = NSProcessInfo::processInfo().systemUptime();
+            if let Some(synth) = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                NSEventType::LeftMouseDown,
+                win_pt,
+                flags,
+                uptime,
+                win_num,
+                None,
+                0,
+                1,
+                1.0,
+            ) {
+                ns_win.performWindowDragWithEvent(&synth);
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(w) = app.get_window("main") {
+            let _ = w.start_dragging();
+        }
+    }
+}
+
+pub fn toggle_maximize(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            use objc2_app_kit::NSWindow;
+            use objc2_foundation::MainThreadMarker;
+
+            let Some(_mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let Some(w) = app2.get_webview_window("main") else {
+                return;
+            };
+            let Ok(ptr) = w.ns_window() else {
+                return;
+            };
+            if ptr.is_null() {
+                return;
+            }
+            let ns_win = unsafe { &*(ptr as *const NSWindow) };
+            ns_win.setMovable(true);
+            ns_win.zoom(None);
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(w) = app.get_window("main") {
+            let maxed = w.is_maximized().unwrap_or(false);
+            let _ = if maxed { w.unmaximize() } else { w.maximize() };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +848,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 /// The window's close button with `general.closeToTray`: hide instead of quitting. Hidden, the
 /// app keeps the same energy rules as a minimised window (resources::window_visible is false).
 pub fn hide_to_tray(app: &AppHandle) {
+    flush_window_state(app);
     if let Some(w) = app.get_window("main") {
         let _ = w.hide();
     }
@@ -664,7 +1051,7 @@ mod network {
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::{fit, resolve_restored_window_state, MonitorWorkArea, SavedWindowState};
 
     #[test]
     fn fits_small_windows_screens() {
@@ -687,5 +1074,61 @@ mod tests {
         let ((_, h), (_, min_h)) = fit((1180.0, 780.0), (800.0, 450.0), (0.0, 30.0));
         assert_eq!(h, 420.0);
         assert_eq!(min_h, 420.0);
+    }
+
+    #[test]
+    fn resolve_restored_preserves_secondary_monitor_and_rejects_unplugged() {
+        let laptop = MonitorWorkArea {
+            x: 0.0,
+            y: 38.0,
+            width: 1728.0,
+            height: 1079.0,
+            deco_w: 0.0,
+            deco_h: 0.0,
+        };
+        let external = MonitorWorkArea {
+            x: 1728.0,
+            y: -320.0,
+            width: 3440.0,
+            height: 1415.0,
+            deco_w: 0.0,
+            deco_h: 0.0,
+        };
+        let saved = SavedWindowState {
+            x: 1800.0,
+            y: -280.0,
+            width: 2400.0,
+            height: 1200.0,
+            maximized: true,
+            fullscreen: false,
+        };
+        let restored = resolve_restored_window_state(&saved, &[laptop, external]).unwrap();
+        assert_eq!(restored, saved);
+
+        // External unplugged: should return None so fit_on_start centers on laptop.
+        assert_eq!(resolve_restored_window_state(&saved, &[laptop]), None);
+    }
+
+    #[test]
+    fn resolve_restored_keeps_titlebar_below_menu_bar() {
+        let laptop = MonitorWorkArea {
+            x: 0.0,
+            y: 25.0,
+            width: 1728.0,
+            height: 1092.0,
+            deco_w: 0.0,
+            deco_h: 0.0,
+        };
+        let saved = SavedWindowState {
+            x: 100.0,
+            y: -12.0,
+            width: 1200.0,
+            height: 800.0,
+            maximized: false,
+            fullscreen: false,
+        };
+        let restored = resolve_restored_window_state(&saved, &[laptop]).unwrap();
+        assert_eq!(restored.y, 25.0);
+        assert_eq!(restored.x, 100.0);
     }
 }

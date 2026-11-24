@@ -1862,6 +1862,16 @@ pub fn notch_focus_main(app: AppHandle) {
     crate::mainwin::show_main(&app, "notch.focus");
 }
 
+#[tauri::command]
+pub fn window_start_dragging(app: AppHandle) {
+    crate::mainwin::start_dragging(&app);
+}
+
+#[tauri::command]
+pub fn window_toggle_maximize(app: AppHandle) {
+    crate::mainwin::toggle_maximize(&app);
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceCallDspInfo {
