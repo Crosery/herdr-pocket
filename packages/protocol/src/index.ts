@@ -2590,7 +2590,7 @@ export function releaseFromSums(listing: string): { version: string; sums: Recor
     if (!m) continue;
     sums[m[2]!] = m[1]!.toLowerCase();
     const v = /^herdr-pocket-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:-(?:android-arm64\.apk|ios-arm64\.ipa|harmonyos-arm64\.hap|macos-(?:arm64|x64)\.dmg|windows-x64(?:-setup\.exe|\.msi)|linux-x64(?:\.deb|\.AppImage))|\.tar\.gz)$/.exec(m[2]!);
-    if (v && !version) version = v[1]!;
+    if (v && (!version || compareVersions(v[1]!, version) > 0)) version = v[1]!;
   }
   return version ? { version, sums } : null;
 }

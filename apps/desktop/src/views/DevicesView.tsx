@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Check, Copy, Laptop, Monitor, Plus, Smartphone, Trash2 } from "lucide-react";
 import type { Device, DeviceKind, PairCode } from "@herdr-pocket/protocol";
 import { EmptyState, PocketBadge, PocketButton, PocketCard, PocketIconButton, PocketModal, fs, useToast } from "../components/PocketUI";
-import { copyToClipboard } from "../lib/bridge";
+import { copyToClipboard, isH5Web } from "../lib/bridge";
 import { partitionDevices, type ClassifiedDevice } from "../lib/deviceRole";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { installHostCommand } from "../components/LocalHostDeps";
@@ -90,6 +90,7 @@ export function DevicesView({
     );
   };
 
+  const h5 = isH5Web();
   return (
     <div className="main-scroll">
       <div style={{ maxWidth: 960, margin: "0 auto" }} className="stack">
@@ -104,7 +105,7 @@ export function DevicesView({
             {onPairPhone ? (
               <PocketButton variant="soft" onClick={onPairPhone}>
                 <Smartphone size={15} />
-                <span>扫码连接手机</span>
+                <span>{h5 ? "生成配对码" : "扫码连接手机"}</span>
               </PocketButton>
             ) : null}
             <PocketButton onClick={() => setInviteOpen(true)}>
@@ -115,7 +116,11 @@ export function DevicesView({
         </div>
 
         {totalCount === 0 ? (
-          <EmptyState mood="sleepy" title="还没有已配对设备" body="点“添加电脑”拿到安装命令，或点“扫码连接手机”。" />
+          <EmptyState
+            mood="sleepy"
+            title="还没有已配对设备"
+            body={h5 ? "点“添加电脑”拿到安装命令，或点“生成配对码”。" : "点“添加电脑”拿到安装命令，或点“扫码连接手机”。"}
+          />
         ) : (
           <div className="stack" style={{ gap: 18 }}>
             <div className="stack" style={{ gap: 10 }}>

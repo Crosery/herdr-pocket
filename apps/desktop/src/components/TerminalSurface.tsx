@@ -17,7 +17,7 @@ import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@her
 import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge";
 import { hasFileJumpModifier, openAgentFileTarget } from "../lib/openFileTarget";
 import { setConfig, useClientConfig } from "../lib/config";
-import { attachTerminalImeBridge, isImeKeyEvent } from "../lib/terminalIme";
+import { attachTerminalImeBridge, chunkTerminalInputPayload, isImeKeyEvent } from "../lib/terminalIme";
 import {
   findLinkAtCell,
   findTerminalLinksForBufferLine,
@@ -344,7 +344,7 @@ export function TerminalSurface({
   const attachWebglRef = useRef<(() => void) | null>(null);
   const detachWebglRef = useRef<(() => void) | null>(null);
   const localConnRef = useRef<string | null>(null);
-  const relayPendingRef = useRef("");
+  const relayPendingRef = useRef<string[]>([]);
   const relayFlushingRef = useRef(false);
   const kittyKeysRef = useRef(new KittyKeyboardState());
   const osc66Ref = useRef<Osc66Run[]>([]);
@@ -504,27 +504,38 @@ export function TerminalSurface({
           term.scrollToBottom();
         }
       }
+      const bpActive =
+        bracketedPasteRef.current ||
+        Boolean((term?.modes as { bracketedPasteMode?: boolean } | undefined)?.bracketedPasteMode);
+      const chunks = chunkTerminalInputPayload(data, bpActive);
       const localConnId = localConnRef.current;
       if (localConnId) {
         try {
-          await native.localTermInput(localConnId, data);
+          for (let i = 0; i < chunks.length; i++) {
+            await native.localTermInput(localConnId, chunks[i]!);
+            if (i + 1 < chunks.length) {
+              await new Promise((r) => setTimeout(r, 4));
+            }
+          }
           return;
         } catch {
           // If local attach closed unexpectedly, clear and fall through to relay queue.
           if (localConnRef.current === localConnId) localConnRef.current = null;
         }
       }
-      relayPendingRef.current += data;
+      relayPendingRef.current.push(...chunks);
       if (relayFlushingRef.current) return;
       relayFlushingRef.current = true;
       try {
         while (relayPendingRef.current.length > 0) {
-          const batch = relayPendingRef.current.slice(0, 16_384);
-          relayPendingRef.current = relayPendingRef.current.slice(batch.length);
+          const batch = relayPendingRef.current.shift()!;
           try {
             await rpcCall(agent.deviceId, "terminal.input", { agent: agent.key, data: batch });
           } catch {
             await rpcCall(agent.deviceId, "terminal.send", { agent: agent.key, text: batch, enter: false }).catch(() => {});
+          }
+          if (relayPendingRef.current.length > 0) {
+            await new Promise((r) => setTimeout(r, 4));
           }
         }
       } finally {
@@ -3161,7 +3172,7 @@ export function TerminalSurface({
         void native.localTermDetach(activeLocalConnId);
       }
       lastResizeSigRef.current = "";
-      relayPendingRef.current = "";
+      relayPendingRef.current = [];
       dispScroll.dispose();
       dispRender.dispose();
       dispWriteParsed.dispose();

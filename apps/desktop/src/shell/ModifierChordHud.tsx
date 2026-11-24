@@ -109,7 +109,7 @@ export function ModifierChordHud() {
       if (ra !== rb) return ra - rb;
       return 0;
     });
-    const maxItems = chord === "Mod" ? 12 : 9;
+    const maxItems = chord === "Mod" ? 7 : 6;
     const items = matching.slice(0, maxItems).map((item) => ({
       id: item.shortcut.id,
       key: item.actionChip,

@@ -41,7 +41,7 @@ function parseDisplayKeys(displayText: string, chord: ShortcutModifierChord): st
   return [...parts, cleaned || displayText];
 }
 
-export type SpatialHintCorner = "tr" | "br" | "center" | "right" | "stack";
+export type SpatialHintCorner = "tr" | "br" | "center" | "right" | "stack" | "top" | "top-right" | "bottom";
 
 /** Pure CSS-toggled floating keycap badge matching held modifier prefix `[data-shortcut-hints]`. */
 export function SpatialHint({

@@ -68,6 +68,34 @@ pub fn compute_notch_frame(
     has_aux: bool,
     mode: NotchViewMode,
 ) -> NotchFrame {
+    compute_notch_frame_for_items(
+        mon_x,
+        mon_y,
+        mon_w,
+        menu_bar_h,
+        aux_left_w,
+        aux_right_w,
+        has_aux,
+        mode,
+        3,
+        2,
+    )
+}
+
+/// Computes exact floating window bounds sized to the active alert count & filter visibility.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_notch_frame_for_items(
+    mon_x: f64,
+    mon_y: f64,
+    mon_w: f64,
+    menu_bar_h: f64,
+    aux_left_w: f64,
+    aux_right_w: f64,
+    has_aux: bool,
+    mode: NotchViewMode,
+    item_count: usize,
+    category_count: usize,
+) -> NotchFrame {
     let bar_h = menu_bar_h.clamp(24.0, 46.0);
     let mon_w = mon_w.max(320.0);
     let has_notch =
@@ -77,33 +105,36 @@ pub fn compute_notch_frame(
     } else {
         0.0
     };
-    let top_inset = if has_notch { bar_h } else { 4.0 };
-    let y = mon_y + if has_notch { 0.0 } else { 4.0 };
+    let top_inset = if has_notch { bar_h.max(32.0) } else { 32.0 };
+    let y = mon_y;
 
+    let visible_rows = item_count.clamp(1, 4) as f64;
+    let filter_h = if category_count >= 2 { 32.0 } else { 0.0 };
     let (width, height) = match mode {
         NotchViewMode::Compact => {
             if has_notch {
-                (notch_width + 136.0, bar_h.max(34.0))
+                (notch_width + 164.0, bar_h.max(32.0) + 10.0)
             } else {
-                (236.0, 30.0)
+                (268.0, 44.0)
             }
         }
         NotchViewMode::Peek => (
-            396.0,
+            488.0,
             if has_notch {
-                (bar_h + 58.0).max(94.0)
+                bar_h.max(32.0) + 74.0
             } else {
-                86.0
+                102.0
             },
         ),
-        NotchViewMode::Expanded => (
-            420.0,
-            if has_notch {
-                (bar_h + 252.0).max(288.0)
-            } else {
-                280.0
-            },
-        ),
+        NotchViewMode::Expanded => {
+            let header_h = if has_notch { bar_h.max(34.0) } else { 36.0 };
+            let list_h = visible_rows * 58.0 + 18.0;
+            let shadow_pad = 14.0;
+            (
+                536.0,
+                (header_h + filter_h + list_h + shadow_pad).clamp(132.0, 368.0),
+            )
+        }
     };
     let width = width.min(mon_w - 24.0);
     let x = mon_x + ((mon_w - width) / 2.0).max(0.0);
@@ -118,6 +149,19 @@ pub fn compute_notch_frame(
         top_inset,
         has_notch,
     }
+}
+
+fn state_item_metrics(state: &Value) -> (usize, usize) {
+    let Some(arr) = state.get("items").and_then(Value::as_array) else {
+        return (0, 0);
+    };
+    let mut cats = std::collections::HashSet::new();
+    for item in arr {
+        if let Some(c) = item.get("category").and_then(Value::as_str) {
+            cats.insert(c);
+        }
+    }
+    (arr.len(), cats.len())
 }
 
 fn current_mode(state: &Value) -> NotchViewMode {
@@ -156,11 +200,11 @@ fn should_be_visible(state: &Value) -> bool {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{compute_notch_frame, NotchFrame, NotchViewMode};
+    use super::{compute_notch_frame_for_items, NotchFrame, NotchViewMode};
     use objc2::runtime::Bool;
     use objc2::{msg_send, sel};
     use objc2_app_kit::{NSColor, NSScreen, NSWindow, NSWindowCollectionBehavior};
-    use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect};
+    use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize};
 
     pub fn configure_window(w: &tauri::WebviewWindow) {
         if MainThreadMarker::new().is_none() {
@@ -209,9 +253,6 @@ mod macos {
     }
 
     pub fn align_top_origin_if_needed(w: &tauri::WebviewWindow, frame: NotchFrame) {
-        if !frame.has_notch && frame.y > 8.0 {
-            return;
-        }
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -238,16 +279,30 @@ mod macos {
             return;
         };
         let sf = screen.frame();
-        let top_offset = if frame.has_notch { 0.0 } else { 4.0 };
+        let top_offset = 0.0;
         let desired_x = sf.origin.x + ((sf.size.width - frame.width) / 2.0).max(0.0);
         let desired_y = sf.origin.y + sf.size.height - top_offset - frame.height;
-        if (win_frame.origin.x - desired_x).abs() > 1.0 || (win_frame.origin.y - desired_y).abs() > 1.0
+        if (win_frame.origin.x - desired_x).abs() > 0.5
+            || (win_frame.origin.y - desired_y).abs() > 0.5
+            || (win_frame.size.width - frame.width).abs() > 0.5
+            || (win_frame.size.height - frame.height).abs() > 0.5
         {
-            ns_win.setFrameOrigin(NSPoint::new(desired_x, desired_y));
+            ns_win.setFrame_display(
+                NSRect::new(
+                    NSPoint::new(desired_x, desired_y),
+                    NSSize::new(frame.width, frame.height),
+                ),
+                true,
+            );
         }
     }
 
-    pub fn measure_frame(app: &tauri::AppHandle, mode: NotchViewMode) -> NotchFrame {
+    pub fn measure_frame(
+        app: &tauri::AppHandle,
+        mode: NotchViewMode,
+        item_count: usize,
+        category_count: usize,
+    ) -> NotchFrame {
         let monitor = app
             .cursor_position()
             .ok()
@@ -303,7 +358,7 @@ mod macos {
             }
         }
 
-        compute_notch_frame(
+        compute_notch_frame_for_items(
             mon_x,
             mon_y,
             mon_w,
@@ -312,6 +367,8 @@ mod macos {
             aux_right,
             has_aux,
             mode,
+            item_count,
+            category_count,
         )
     }
 }
@@ -361,7 +418,8 @@ fn apply_layout_and_push(app: &AppHandle, state: &Value) {
         return;
     };
     let mode = current_mode(state);
-    let frame = macos::measure_frame(app, mode);
+    let (item_count, category_count) = state_item_metrics(state);
+    let frame = macos::measure_frame(app, mode, item_count, category_count);
     let next_geom = (
         frame.x.round() as i64,
         frame.y.round() as i64,
@@ -626,29 +684,60 @@ mod tests {
         assert_eq!(compact_notch.notch_width, 200.0);
         assert_eq!(compact_notch.y, 0.0);
         assert_eq!(compact_notch.top_inset, 38.0);
-        assert_eq!(compact_notch.width, 336.0);
-        assert_eq!(compact_notch.x, (1512.0 - 336.0) / 2.0);
+        assert_eq!(compact_notch.width, 364.0);
+        assert_eq!(compact_notch.height, 48.0);
+        assert_eq!(compact_notch.x, (1512.0 - 364.0) / 2.0);
 
         let expanded_notch =
             compute_notch_frame(0.0, 0.0, 1512.0, 38.0, 656.0, 656.0, true, NotchViewMode::Expanded);
         assert_eq!(expanded_notch.y, 0.0);
-        assert!(expanded_notch.height >= 288.0);
+        assert_eq!(expanded_notch.width, 536.0);
+        assert!(expanded_notch.height >= 260.0);
         assert_eq!(expanded_notch.top_inset, 38.0);
 
-        // External display without hardware notch (`aux_left_w == 0`).
+        // External display without hardware notch (`aux_left_w == 0`), anchored flush at top bezel.
         let compact_flat =
             compute_notch_frame(0.0, 0.0, 1920.0, 28.0, 0.0, 0.0, true, NotchViewMode::Compact);
         assert!(!compact_flat.has_notch);
         assert_eq!(compact_flat.notch_width, 0.0);
-        assert_eq!(compact_flat.y, 4.0);
-        assert_eq!(compact_flat.top_inset, 4.0);
-        assert_eq!(compact_flat.width, 236.0);
-        assert_eq!(compact_flat.height, 30.0);
+        assert_eq!(compact_flat.y, 0.0);
+        assert_eq!(compact_flat.top_inset, 32.0);
+        assert_eq!(compact_flat.width, 268.0);
+        assert_eq!(compact_flat.height, 44.0);
 
         let peek_flat =
             compute_notch_frame(0.0, 0.0, 1920.0, 28.0, 0.0, 0.0, false, NotchViewMode::Peek);
-        assert_eq!(peek_flat.width, 396.0);
-        assert_eq!(peek_flat.y, 4.0);
+        assert_eq!(peek_flat.width, 488.0);
+        assert_eq!(peek_flat.height, 102.0);
+        assert_eq!(peek_flat.y, 0.0);
+
+        let expanded_one = super::compute_notch_frame_for_items(
+            0.0,
+            0.0,
+            1920.0,
+            28.0,
+            0.0,
+            0.0,
+            false,
+            NotchViewMode::Expanded,
+            1,
+            1,
+        );
+        let expanded_many = super::compute_notch_frame_for_items(
+            0.0,
+            0.0,
+            1920.0,
+            28.0,
+            0.0,
+            0.0,
+            false,
+            NotchViewMode::Expanded,
+            4,
+            3,
+        );
+        assert_eq!(expanded_one.width, 536.0);
+        assert!(expanded_one.height >= 132.0 && expanded_one.height < expanded_many.height);
+        assert!(expanded_many.height <= 368.0);
     }
 
     #[test]

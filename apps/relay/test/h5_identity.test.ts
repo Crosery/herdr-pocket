@@ -47,6 +47,24 @@ test("H5 /app subpath redirect and static bundle serving work under reverse-prox
     const assetBody = await assetRes.text();
     assert.ok(assetBody.length > 0);
 
+    const manifestRes = await fetch(`${base}/app/manifest.webmanifest`);
+    assert.equal(manifestRes.status, 200);
+    assert.match(manifestRes.headers.get("content-type") ?? "", /manifest\+json/);
+    const manifestJson = (await manifestRes.json()) as { display?: string; start_url?: string };
+    assert.equal(manifestJson.display, "standalone");
+    assert.equal(manifestJson.start_url, "./");
+
+    const swRes = await fetch(`${base}/app/sw.js`);
+    assert.equal(swRes.status, 200);
+    assert.equal(swRes.headers.get("service-worker-allowed"), "./");
+    assert.equal(swRes.headers.get("cache-control"), "no-cache");
+
+    const pwaIconRes = await fetch(`${base}/app/assets/brand/pwa-192.png`);
+    assert.equal(pwaIconRes.status, 200);
+    assert.match(pwaIconRes.headers.get("content-type") ?? "", /image\/png/);
+    const pwaIconBytes = await pwaIconRes.arrayBuffer();
+    assert.ok(pwaIconBytes.byteLength > 1000);
+
     const jsMatch = /\.\/(assets\/index-[^"'\s]+\.js)/.exec(html);
     assert.ok(jsMatch, "built H5 index.html references main index bundle");
     const jsRes = await fetch(`${base}/app/${jsMatch[1]}`);

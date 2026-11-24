@@ -132,14 +132,25 @@
 }
 
 .tp-term-host .xterm .composition-view {
-  z-index: 6;
-  background: var(--tp-term-bg, #17191d);
+  z-index: 8;
+  background: color-mix(in srgb, var(--surface, #27212f) 96%, var(--tp-term-bg, #17191d));
   color: var(--tp-term-fg, #e6edf3);
+  border: 1px solid var(--line-pink, rgba(255, 126, 168, 0.4));
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
   text-decoration: underline;
   text-decoration-color: var(--primary, #ff8fb3);
   text-underline-offset: 3px;
-  padding: 0 1px;
-  border-radius: 2px;
+  white-space: pre-wrap !important;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  height: auto !important;
+  min-height: 1.35em;
+  max-width: calc(100% - 8px);
+  max-height: min(44%, 180px);
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 2px 6px;
+  border-radius: 6px;
   pointer-events: none;
 }
 

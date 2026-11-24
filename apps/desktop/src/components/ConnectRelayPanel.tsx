@@ -34,11 +34,13 @@ export function ConnectRelayPanel({
   initialError,
   initialHint = null,
   autoFocus = false,
+  hideDeviceBanner = false,
 }: {
   onConnected?: (res?: PairResponse) => void;
   initialError?: string | null;
   initialHint?: IdentityHintResponse | null;
   autoFocus?: boolean;
+  hideDeviceBanner?: boolean;
 }) {
   const toast = useToast();
   const h5 = isH5Web();
@@ -51,7 +53,7 @@ export function ConnectRelayPanel({
   const [paste, setPaste] = useState("");
   const [busy, setBusy] = useState<"local" | "manual" | "reconfirm" | "scan" | null>(null);
   const [error, setError] = useState<string | null>(initialError ?? null);
-  const [manualOpen, setManualOpen] = useState(h5);
+  const [manualOpen, setManualOpen] = useState(Boolean(initialError));
   const [hint, setHint] = useState<IdentityHintResponse | null>(initialHint);
   const [scannerOpen, setScannerOpen] = useState(false);
   const qrFileRef = useRef<HTMLInputElement | null>(null);
@@ -65,10 +67,7 @@ export function ConnectRelayPanel({
   }, []);
 
   const check = useCallback(async () => {
-    if (h5) {
-      setManualOpen(true);
-      return;
-    }
+    if (h5) return;
     const status = await getHostdStatus();
     if (!mountedRef.current) return;
     setLocal(status);
@@ -241,7 +240,7 @@ export function ConnectRelayPanel({
         </div>
       ) : null}
 
-      {recognized ? (
+      {!hideDeviceBanner && recognized ? (
         <div className="h5-device-banner">
           <ShieldCheck size={15} className="h5-device-icon" />
           <div className="grow min-w-0">
@@ -272,7 +271,7 @@ export function ConnectRelayPanel({
             aria-label="选择二维码图片连接"
             onChange={(e) => void onPickQrFile(e)}
           />
-          <div className="row wrap" style={{ gap: 8 }}>
+          <div className="choice-card-actions">
             <PocketButton variant="primary" disabled={busy !== null} onClick={() => setScannerOpen(true)}>
               <Camera size={15} />
               <span>{busy === "scan" ? "正在连接…" : "打开摄像头扫码"}</span>

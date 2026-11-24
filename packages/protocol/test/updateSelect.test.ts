@@ -16,6 +16,7 @@ import {
   parseReleaseManifest,
   parseSlashCommandTag,
   pickLowestLatency,
+  releaseFromSums,
   resolveChannelFromManifest,
   resolvePreferredSource,
   updateCheckDelays,
@@ -212,5 +213,22 @@ describe("protocol updateSelect & config schema", () => {
       }),
       true,
     );
+  });
+
+  test("releaseFromSums picks highest version when SHA256SUMS mixes carried-forward older mobile packages", () => {
+    const h1 = "1".repeat(64);
+    const h2 = "2".repeat(64);
+    const h3 = "3".repeat(64);
+    const listing = [
+      `${h1}  herdr-pocket-0.2.26-android-arm64.apk`,
+      `${h2}  herdr-pocket-0.2.28-macos-arm64.dmg`,
+      `${h3}  herdr-pocket-0.2.28.tar.gz`,
+    ].join("\n");
+    const parsed = releaseFromSums(listing);
+    assert.ok(parsed);
+    assert.equal(parsed.version, "0.2.28");
+    assert.equal(parsed.sums["herdr-pocket-0.2.26-android-arm64.apk"], h1);
+    assert.equal(parsed.sums["herdr-pocket-0.2.28-macos-arm64.dmg"], h2);
+    assert.equal(parsed.sums["herdr-pocket-0.2.28.tar.gz"], h3);
   });
 });

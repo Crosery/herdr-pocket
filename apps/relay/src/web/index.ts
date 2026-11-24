@@ -21,6 +21,7 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
   ".svg": "image/svg+xml",
   ".json": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".wav": "audio/wav",
   ".mp3": "audio/mpeg",
   ".wasm": "application/wasm",
@@ -43,7 +44,7 @@ export function webPage(): string | null {
  * Safely resolves any static file inside `apps/relay/src/web/dist` (such as
  * `./assets/...` or `./favicon.ico`), blocking traversal and symlinks outside root.
  */
-export function webAsset(rawRel: string): { body: Buffer; type: string; immutable: boolean } | null {
+export function webAsset(rawRel: string): { body: Buffer; type: string; immutable: boolean; noCache: boolean } | null {
   let decoded: string;
   try {
     decoded = decodeURIComponent(rawRel);
@@ -70,10 +71,12 @@ export function webAsset(rawRel: string): { body: Buffer; type: string; immutabl
     if (!statSync(real).isFile()) return null;
     const ext = extname(real).toLowerCase();
     const isHashedViteChunk = /^assets\/[^/]+-[A-Za-z0-9_-]{6,}\.[A-Za-z0-9]+$/.test(decoded);
+    const noCache = decoded === "sw.js" || decoded === "manifest.webmanifest" || ext === ".html";
     return {
       body: readFileSync(real),
       type: MIME[ext] ?? "application/octet-stream",
       immutable: isHashedViteChunk,
+      noCache,
     };
   } catch {
     return null;

@@ -75,7 +75,11 @@ export function groupMatchesPath(group, filePath) {
   if (filePath === ".github/workflows/release.yml" || filePath === "pnpm-lock.yaml" || filePath === "package.json") {
     return true;
   }
-  if (filePath.startsWith("scripts/build-release-manifest") || filePath.startsWith("scripts/detect-release-channels")) {
+  if (
+    filePath.startsWith("scripts/build-release-manifest") ||
+    filePath.startsWith("scripts/detect-release-channels") ||
+    filePath.startsWith("scripts/sync-carried-release-assets")
+  ) {
     return false;
   }
   switch (group) {

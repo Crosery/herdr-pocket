@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   chordIncludesPrefix,
   remainingSuffixChip,
   shortcutsMatchingChordPrefix,
 } from "../src/shell/shortcuts.ts";
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 test("progressive modifier prefix matching includes supersets while holding ⌘ and narrows on ⌘⇧ / ⌘⌥", () => {
   assert.equal(chordIncludesPrefix("Mod", "Mod"), true);
@@ -43,4 +48,28 @@ test("progressive modifier prefix matching includes supersets while holding ⌘ 
   assert.equal(modAltShiftIds.has("splitDown"), false);
   assert.equal(modAltShiftIds.has("swapPaneLeft"), true);
   assert.equal(modAltShiftIds.has("unsplitTab"), true);
+});
+
+test("shell.css places modifier chord HUD at top single-line and keeps statusbar overflow visible", () => {
+  const css = readFileSync(resolve(ROOT, "src/styles/shell.css"), "utf8");
+  const statusMatch = /\.v3-status\s*\{[^}]*\}/.exec(css);
+  assert.ok(statusMatch, "found .v3-status block");
+  assert.equal(statusMatch[0].includes("overflow: visible"), true);
+
+  const hudMatch = /\.v3-chord-hud\s*\{[^}]*\}/.exec(css);
+  assert.ok(hudMatch, "found .v3-chord-hud block");
+  assert.equal(hudMatch[0].includes("top: 74px"), true);
+  assert.equal(hudMatch[0].includes("flex-wrap: nowrap"), true);
+
+  const itemsMatch = /\.v3-chord-items\s*\{[^}]*\}/.exec(css);
+  assert.ok(itemsMatch, "found .v3-chord-items block");
+  assert.equal(itemsMatch[0].includes("flex-wrap: nowrap"), true);
+
+  const brandNameMatch = /\.v3-brand-name\s*\{[^}]*\}/.exec(css);
+  assert.ok(brandNameMatch, "found .v3-brand-name block");
+  assert.equal(brandNameMatch[0].includes("overflow: hidden"), true);
+
+  const statusBtnMatch = /\.v3-status-btn\s*\{[^}]*\}/.exec(css);
+  assert.ok(statusBtnMatch, "found .v3-status-btn block");
+  assert.equal(statusBtnMatch[0].includes("display: inline-flex"), true);
 });

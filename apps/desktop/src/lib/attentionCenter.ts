@@ -292,9 +292,22 @@ export function buildNotchSyncPayload(): Record<string, unknown> {
   const st = attentionStore.get();
   const notifOn = settingsStore.get().notifications;
   const islandOn = clientConfigStore.get().config.general.dynamicIsland;
+  const prefTheme = settingsStore.get().theme;
+  const domTheme =
+    typeof document !== "undefined" ? document.documentElement.getAttribute("data-theme") : null;
+  const theme =
+    prefTheme === "dark" ||
+    domTheme === "dark" ||
+    (prefTheme === "system" &&
+      domTheme !== "light" &&
+      typeof window !== "undefined" &&
+      Boolean(window.matchMedia?.("(prefers-color-scheme: dark)")?.matches))
+      ? "dark"
+      : "light";
   const visibleItems = st.items.slice(0, 12);
   return {
     enabled: Boolean(notifOn && islandOn),
+    theme,
     windowFocused: st.windowFocused,
     demo: runtimeTracker.demoUntil > Date.now(),
     items: visibleItems.map((it) => ({

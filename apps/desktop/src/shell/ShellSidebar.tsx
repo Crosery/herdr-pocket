@@ -432,19 +432,19 @@ export function ShellSidebar({
         {collapsed ? null : (
           <div className="v3-brand-name">
             <img src={assetUrl("brand/logo-160.webp")} alt="" width={20} height={20} />
-            <span>Herdr Pocket</span>
+            <span className="truncate">Herdr Pocket</span>
           </div>
         )}
         {collapsed && canToggle ? null : (
           <button className="v3-icon-btn has-hint" aria-label="跳到 Agent 或标签" title={`跳到 Agent 或标签（${shortcutText("jumpAgent")}）`} onClick={() => setPalette("jump")}>
             <Search size={15} />
-            <SpatialHint text={shortcutText("jumpAgent")} corner="tr" />
+            <SpatialHint text={shortcutText("jumpAgent")} corner="bottom" />
           </button>
         )}
         {canToggle ? (
           <button className="v3-icon-btn has-hint" aria-label={collapsed ? "展开侧栏" : "收起侧栏"} title={`${collapsed ? "展开" : "收起"}侧栏（${shortcutText("toggleSidebar")}）`} onClick={onToggle}>
             <PanelLeft size={15} />
-            <SpatialHint text={shortcutText("toggleSidebar")} corner="tr" />
+            <SpatialHint text={shortcutText("toggleSidebar")} corner="bottom" />
           </button>
         ) : null}
       </div>

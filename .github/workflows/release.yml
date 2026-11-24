@@ -514,6 +514,18 @@ jobs:
               done
             fi
           fi
+      - name: Carry forward unchanged client packages
+        run: |
+          prev_flag=""
+          if [ -s prev-manifest/prev-manifest.json ]; then
+            prev_flag="prev-manifest/prev-manifest.json"
+          fi
+          node repo-src/scripts/sync-carried-release-assets.mjs \
+            --carry \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --dist dist \
+            ${prev_flag:+--prev "$prev_flag"}
       - name: Prepare release announcement
         run: |
           rm -f announcement.md
@@ -545,16 +557,21 @@ jobs:
           LC_ALL=C sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       - name: Publish
-        env:
-          IOS_RESULT: ${{ needs.ios.result }}
         run: |
-          if [ "$IOS_RESULT" = "success" ]; then
+          if ls dist/herdr-pocket-*-ios-arm64.ipa >/dev/null 2>&1; then
             mobile_line='- **Mobile clients**: Android (`.apk`), iOS (`.ipa` unsigned sideload), HarmonyOS NEXT (`.hap` unsigned)'
           else
             mobile_line='- **Mobile clients**: Android (`.apk`), HarmonyOS NEXT (`.hap` unsigned)'
           fi
+          node repo-src/scripts/sync-carried-release-assets.mjs \
+            --render-table dist/RELEASE-MANIFEST.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --release-tag "$TAG" \
+            --out download-table.md
           cat announcement.md > notes.md
           printf '\n\n---\n\n' >> notes.md
+          cat download-table.md >> notes.md
+          printf '\n' >> notes.md
           cat >> notes.md <<EOF
           Relay image: \`${IMAGE,,}:$VERSION\` (per-channel metadata in \`RELEASE-MANIFEST.json\`)
 

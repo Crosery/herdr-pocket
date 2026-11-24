@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { attachTerminalImeBridge, isImeKeyEvent } from "../src/lib/terminalIme.ts";
+import {
+  attachTerminalImeBridge,
+  chunkTerminalInputPayload,
+  clampCompositionOverlayLayout,
+  isImeKeyEvent,
+} from "../src/lib/terminalIme.ts";
 import { matchesCombo } from "../src/shell/shortcuts.ts";
 
 class MockTextarea extends EventTarget {
@@ -119,6 +124,61 @@ test("attachTerminalImeBridge preserves active composition preedit and rescues d
   await sleep(16);
   assert.deepEqual(sent, ["测试。"]);
   assert.equal(ta.value, "");
+
+  bridge.dispose();
+});
+
+test("clampCompositionOverlayLayout keeps long preedit inside screen and chunkTerminalInputPayload stays <= 512B", async () => {
+  const inside = clampCompositionOverlayLayout({
+    cursorLeft: 420,
+    cursorTop: 460,
+    cellHeight: 18,
+    screenWidth: 480,
+    screenHeight: 480,
+    naturalWidth: 960,
+    naturalHeight: 72,
+  });
+  assert.equal(inside.maxWidth, 472);
+  assert.ok(inside.left >= 4);
+  assert.ok(inside.left + Math.min(960, inside.maxWidth) <= 476);
+  assert.ok(inside.top < 460, "flips composition overlay above cursor near bottom edge");
+
+  const encoder = new TextEncoder();
+  const longVoiceText = "语音输入测试长文本，不会因为超过一百多个汉字就把终端横着撑爆掉。".repeat(45);
+  assert.ok(encoder.encode(longVoiceText).length > 2000);
+  const chunks = chunkTerminalInputPayload(longVoiceText, true);
+  assert.ok(chunks.length >= 4);
+  for (const chunk of chunks) {
+    assert.ok(encoder.encode(chunk).length <= 512, `chunk exceeded 512B: ${encoder.encode(chunk).length}`);
+    assert.equal(chunk.includes("\uFFFD"), false, "never splits multi-byte UTF-8 characters");
+  }
+  assert.equal(chunks.join(""), `\x1b[200~${longVoiceText}\x1b[201~`);
+
+  const activeClasses = new Set(["composition-view", "active"]);
+  const compView = {
+    textContent: "残留文本",
+    classList: {
+      remove: (cls: string) => activeClasses.delete(cls),
+    },
+    style: {},
+  };
+  const host = new EventTarget() as EventTarget & { querySelector?: (sel: string) => unknown };
+  host.querySelector = (sel: string) => (sel === ".composition-view" ? compView : null);
+  const ta = new MockTextarea();
+  ta.parentElement = host;
+  const bridge = attachTerminalImeBridge(ta as unknown as HTMLTextAreaElement, () => {});
+
+  ta.dispatchEvent(new Event("paste"));
+  await sleep(14);
+  assert.equal(activeClasses.has("active"), false);
+  assert.equal(compView.textContent, "");
+
+  activeClasses.add("active");
+  compView.textContent = "失焦残留";
+  ta.dispatchEvent(new Event("blur"));
+  await sleep(100);
+  assert.equal(activeClasses.has("active"), false);
+  assert.equal(compView.textContent, "");
 
   bridge.dispose();
 });

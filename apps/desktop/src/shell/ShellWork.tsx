@@ -1473,7 +1473,7 @@ function PaneHead({
               {oppositeMode === "term" && (Boolean(agent.subscreen) || agent.status === "blocked") ? (
                 <span className="term-attn-dot" aria-hidden />
               ) : null}
-              {isFocused ? <SpatialHint text={shortcutText("togglePaneMode")} corner="tr" /> : null}
+              {isFocused ? <SpatialHint text={shortcutText("togglePaneMode")} corner="bottom" /> : null}
             </button>
           ) : null}
           {content.kind === "agent" && agent ? (
@@ -1531,7 +1531,7 @@ function PaneHead({
             onClick={() => onSplitNewTerminal(tabId, paneId, "right")}
           >
             <Columns2 size={13} />
-            {isFocused ? <SpatialHint text={shortcutText("splitRight")} corner="tr" /> : null}
+            {isFocused ? <SpatialHint text={shortcutText("splitRight")} corner="bottom" /> : null}
           </button>
           <button
             type="button"
@@ -1541,7 +1541,7 @@ function PaneHead({
             onClick={() => onSplitNewTerminal(tabId, paneId, "down")}
           >
             <Rows2 size={13} />
-            {isFocused ? <SpatialHint text={shortcutText("splitDown")} corner="tr" /> : null}
+            {isFocused ? <SpatialHint text={shortcutText("splitDown")} corner="bottom" /> : null}
           </button>
           {isSplit || isZoomed ? (
             <button
@@ -1552,7 +1552,7 @@ function PaneHead({
               onClick={onToggleZoom}
             >
               {isZoomed ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-              {isFocused ? <SpatialHint shortcut="zoomPane" corner="tr" /> : null}
+              {isFocused ? <SpatialHint shortcut="zoomPane" corner="bottom" /> : null}
             </button>
           ) : null}
           <button
@@ -1563,8 +1563,8 @@ function PaneHead({
             onClick={onClose}
           >
             <X size={13} />
-            {isFocused ? <SpatialHint text={shortcutText("closeTab")} corner="tr" /> : null}
-            {isFocused && isSplit ? <SpatialHint shortcut="unsplitTab" corner="br" /> : null}
+            {isFocused ? <SpatialHint text={shortcutText("closeTab")} corner="bottom" /> : null}
+            {isFocused && isSplit ? <SpatialHint shortcut="unsplitTab" corner="bottom" className="hide-on-bare-mod" /> : null}
           </button>
         </div>
       </div>
@@ -3170,24 +3170,24 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
         <div ref={ovisAnchorRef} className="v3-ovis-anchor">
           <button
             type="button"
-            className={`v3-status-btn has-hint truncate${attentionItems.length > 0 || blocked > 0 ? " v3-status-need" : ""}`}
-            title={`打开 Ovis 提醒队列（${shortcutText("jumpUrgent")} 跳转下一条）`}
+            className={`v3-status-btn has-hint${attentionItems.length > 0 || blocked > 0 ? " v3-status-need" : ""}`}
+            title={`打开小羊提醒队列（${shortcutText("jumpUrgent")} 跳转下一条）`}
             onClick={() => setOvisOpen((v) => !v)}
           >
             <Bell size={12} />
-            <span>
+            <span className="truncate">
               {attentionItems.length > 0
                 ? `${attentionItems.length} 条待处理`
                 : blocked > 0
                   ? `${blocked} 个需要你`
                   : "提醒"}
             </span>
-            <SpatialHint text={shortcutText("jumpUrgent")} corner="tr" />
+            <SpatialHint text={shortcutText("jumpUrgent")} corner="top" />
           </button>
           {ovisOpen ? (
-            <div className="v3-ovis-popover" role="dialog" aria-label="Ovis 分类提醒队列">
+            <div className="v3-ovis-popover" role="dialog" aria-label="小羊分类提醒队列">
               <div className="v3-ovis-head">
-                <span>Ovis 待处理队列（{attentionItems.length}）</span>
+                <span>小羊提醒队列（{attentionItems.length}）</span>
                 <button
                   type="button"
                   className="btw-icon-btn"
@@ -3361,7 +3361,7 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
       </div>
       <button
         type="button"
-        className="v3-status-item v3-status-btn has-hint"
+        className="v3-status-item v3-status-btn"
         style={{ flex: "none" }}
         onClick={() => {
           if (typeof window !== "undefined") {
@@ -3371,14 +3371,12 @@ export function ShellStatus({ onConnectRelay }: { onConnectRelay: () => void }) 
         title={`快捷键指南（${shortcutText("shortcutHelp")}）`}
       >
         <Keyboard size={13} />
-        <span className="v3-keys-text">{shortcutText("shortcutHelp")}</span>
+        <span className="v3-keys-text" data-inline-chord="Mod">{shortcutText("shortcutHelp")}</span>
         <span>快捷键</span>
-        <SpatialHint text={shortcutText("shortcutHelp")} corner="tr" />
       </button>
-      <button className="v3-status-item v3-status-btn has-hint" style={{ flex: "none" }} onClick={() => setPalette("command")} title="打开命令面板">
-        <span className="v3-keys-text">{shortcutText("palette")}</span>
+      <button className="v3-status-item v3-status-btn" style={{ flex: "none" }} onClick={() => setPalette("command")} title="打开命令面板">
+        <span className="v3-keys-text" data-inline-chord="Mod">{shortcutText("palette")}</span>
         <span>命令</span>
-        <SpatialHint text={shortcutText("palette")} corner="tr" />
       </button>
     </footer>
   );

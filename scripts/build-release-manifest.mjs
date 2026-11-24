@@ -85,13 +85,18 @@ if (values.dist && existsSync(values.dist)) {
     const st = statSync(full);
     if (!st.isFile() || st.size === 0) continue;
     const sha256 = createHash("sha256").update(readFileSync(full)).digest("hex");
+    const prevEntry = channels[info.channel];
+    const isCarried =
+      Boolean(prevEntry) &&
+      prevEntry.version === info.version &&
+      prevEntry.sha256 === sha256;
     channels[info.channel] = {
       version: info.version,
-      tag: `v${info.version}`,
+      tag: isCarried ? (prevEntry.tag || `v${info.version}`) : `v${info.version}`,
       fileName: entry,
       sha256,
       size: st.size,
-      updatedAt: nowIso,
+      updatedAt: isCarried ? (prevEntry.updatedAt || nowIso) : nowIso,
     };
   }
 }

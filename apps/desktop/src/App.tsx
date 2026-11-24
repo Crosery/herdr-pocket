@@ -1,13 +1,14 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { AlertCircle, AppWindow, Bot, Fingerprint, Laptop, MessageSquare, Moon, QrCode, Server, Settings, Sun } from "lucide-react";
 import { parsePairLink, type IdentityHintResponse, type PairResponse } from "@herdr-pocket/protocol";
-import { PocketButton, PocketErrorBoundary, PocketInput, PocketModal, ToastProvider, useToast } from "./components/PocketUI";
+import { PocketBadge, PocketButton, PocketErrorBoundary, PocketInput, PocketModal, ToastProvider, useToast } from "./components/PocketUI";
 import { XiaoyangOrb } from "./components/MascotAndVendor";
 import type { NavItem } from "./components/Sidebar";
 import { DesktopShell } from "./shell/DesktopShell";
 import { FRAME_SECTION_OF, openSettingsFrame } from "./shell/shellStore";
 import { PairPhoneModal } from "./components/PairPhoneModal";
 import { ConnectRelayPanel, RELAY_EXPLAINER } from "./components/ConnectRelayPanel";
+import { H5InstallAppCard } from "./components/H5InstallAppCard";
 import { UpdatePrompt } from "./components/UpdatePrompt";
 import { VoiceHud } from "./components/VoiceInput";
 import { AgentsView } from "./views/AgentsView";
@@ -16,6 +17,7 @@ import { OnboardingView, type OnboardStep } from "./views/OnboardingView";
 import type { SettingsSection } from "./views/SettingsView";
 import { assistantStore } from "./lib/assistant";
 import { detectPlatform, getHostdStatus, isH5Web, isHarmony, isTauri, loadSession } from "./lib/bridge";
+import { initH5Pwa } from "./lib/pwa";
 import {
   fetchIdentityHint,
   inferRelayUrlFromLocation,
@@ -143,7 +145,9 @@ function PocketAppShell() {
     if (platform === "macos" && isTauri()) document.documentElement.setAttribute("data-titlebar", "overlay");
     const offPerf = startDesktopPerfTelemetry();
     const offDrag = installWindowDragBridge();
+    const offPwa = initH5Pwa();
     return () => {
+      offPwa();
       offDrag();
       offPerf();
     };
@@ -464,15 +468,17 @@ function PocketAppShell() {
     return (
       <div className="h5-auth-screen" style={{ fontSize: `${Math.round(14 * textScale)}px` }}>
         <div className="h5-auth-card">
-          <div className="h5-auth-head">
-            <XiaoyangOrb mood="hello" size={60} />
-            <div className="min-w-0 grow">
-              <h1 className="cute-font h5-auth-title">Herdr Pocket 网页端</h1>
-              <div className="faint wrap-anywhere">{recognized.name} · 自动适配手机与桌面视图</div>
+          <div className="h5-auth-hero">
+            <XiaoyangOrb mood="hello" size={64} />
+            <h1 className="cute-font h5-auth-title">Herdr Pocket</h1>
+            <div className="row wrap" style={{ justifyContent: "center", gap: 6 }}>
+              <PocketBadge tone="pink">{recognized.name}</PocketBadge>
+              <span className="h5-auth-subtitle">扫码连接 · 通行密钥确认唯一身份</span>
             </div>
           </div>
           <ConnectRelayPanel
             autoFocus
+            hideDeviceBanner
             initialError={autoError}
             initialHint={h5Hint}
             onConnected={(res) => {
@@ -481,6 +487,7 @@ function PocketAppShell() {
               if (srv) maybePromptH5Passkey(srv, res);
             }}
           />
+          <H5InstallAppCard compact />
         </div>
       </div>
     );
@@ -836,7 +843,7 @@ function PocketAppShell() {
       { id: "settings", label: "设置", icon: Settings },
     ];
     return (
-      <div className="mobile-shell" style={{ fontSize }}>
+      <div className={`mobile-shell${hideTabs ? " no-tabbar" : ""}`} style={{ fontSize }}>
         <TitlebarStrip />
         <div className="mobile-body">{activeContent}</div>
         {!hideTabs ? (

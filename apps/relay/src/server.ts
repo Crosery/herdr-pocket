@@ -58,6 +58,9 @@ import {
 } from "./identity.ts";
 import { TranscribeError, TranscribeLimiter, audioType, resolveTranscribe, transcribe, transcribeInfo, wavDurationMs, type TranscribeSettings, type TranscribeTarget } from "./transcribe.ts";
 
+const WEB_APP_CSP =
+  "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https: http:; media-src 'self' blob: data:; connect-src *; frame-src 'self' blob: data:; manifest-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'";
+
 export interface RelayOptions {
   dbPath: string;
   /** Admin token: may mint pair codes. Required to bootstrap the first device. */
@@ -321,8 +324,7 @@ export class Relay {
         "X-Robots-Tag": "noindex, nofollow",
         "X-Content-Type-Options": "nosniff",
         "X-Frame-Options": "DENY",
-        "Content-Security-Policy":
-          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https: http:; media-src 'self' blob: data:; connect-src *; frame-src 'self' blob: data:; frame-ancestors 'none'",
+        "Content-Security-Policy": WEB_APP_CSP,
       });
       res.end(req.method === "HEAD" ? undefined : html);
       return;
@@ -336,7 +338,12 @@ export class Relay {
         res.writeHead(200, {
           "Content-Type": asset.type,
           "Content-Length": asset.body.length,
-          "Cache-Control": asset.immutable ? "public, max-age=31536000, immutable" : "public, max-age=3600",
+          "Cache-Control": asset.noCache
+            ? "no-cache"
+            : asset.immutable
+              ? "public, max-age=31536000, immutable"
+              : "public, max-age=3600",
+          ...(rel === "sw.js" ? { "Service-Worker-Allowed": "./" } : {}),
           "X-Content-Type-Options": "nosniff",
         });
         res.end(req.method === "HEAD" ? undefined : asset.body);
@@ -345,7 +352,15 @@ export class Relay {
       if (!rel.includes(".")) {
         const html = webPage();
         if (html) {
-          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
+          res.writeHead(200, {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Referrer-Policy": "no-referrer",
+            "X-Robots-Tag": "noindex, nofollow",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Content-Security-Policy": WEB_APP_CSP,
+          });
           res.end(req.method === "HEAD" ? undefined : html);
           return;
         }

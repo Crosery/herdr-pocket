@@ -12,12 +12,14 @@ import {
   sourcePrefixes,
 } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketInput, PocketSelect, PocketSwitch, PocketTextarea, useToast, type SelectOption } from "../../components/PocketUI";
+import { H5InstallAppCard } from "../../components/H5InstallAppCard";
 import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { CookieImportButton } from "../../components/CookieImport";
 import { serverLabel } from "../../components/Sidebar";
-import { appVersion, copyToClipboard, detectPlatform, getHostdStatus, isH5Web, openExternalUrl, pushSystemNotification, type HostdLocalStatus } from "../../lib/bridge";
+import { appVersion, copyToClipboard, detectPlatform, getHostdStatus, isH5Web, isTauri, openExternalUrl, pushSystemNotification, type HostdLocalStatus } from "../../lib/bridge";
 import { isPasskeySupported, recognizeWebDevice, registerDevicePasskey } from "../../lib/h5Identity";
 import { native, type ResourceUsage } from "../../lib/native";
+import { refreshH5Bundle } from "../../lib/pwa";
 import { clientConfigStore, setConfig, useClientConfig } from "../../lib/config";
 import {
   checkForUpdate,
@@ -60,6 +62,7 @@ function ConfigFileBlock() {
   const path = clientConfigStore.use((s) => s.path);
   const error = clientConfigStore.use((s) => s.error);
   const problems = clientConfigStore.use((s) => s.problems);
+  if (!isTauri()) return null;
   return (
     <>
       <SetHeading>配置文件</SetHeading>
@@ -152,6 +155,7 @@ export function StartupRows() {
 }
 
 function GuideRow({ onReopenGuide }: { onReopenGuide: () => void }) {
+  if (!isTauri()) return null;
   return (
     <>
       <SetHeading>新手引导</SetHeading>
@@ -250,6 +254,7 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
       <SetHeading>外观</SetHeading>
       <ThemeRow />
       <H5LayoutModeRow />
+      <H5InstallAppCard />
       <SetRow title="文字大小" about={`当前 ${general.textScale}%`}>
         <div className="segmented">
           {textPresets.map((pct) => (
@@ -266,6 +271,13 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
       <UiFontSettingsSection />
       <ChatDisplayModeRow />
       <ConfigSwitch k="general.showShells" about="列出普通 Shell 终端" />
+      {!isTauri() ? (
+        <>
+          <SetHeading>文件查看</SetHeading>
+          <ConfigSwitch k="files.showHidden" about="显示以点号开头的隐藏文件与目录" />
+          <ConfigSwitch k="files.showIgnored" about="显示 .gitignore 忽略的构建产物与依赖目录" />
+        </>
+      ) : null}
       {DESKTOP ? <TerminalSettingsSection /> : null}
       <StartupRows />
       <ConfigFileBlock />
@@ -319,6 +331,7 @@ export function ConnectionPane({ onConnectRelay, onPairPhone }: { onConnectRelay
   const { hostd, checking, recheck } = useHostdStatus();
   const phones = Object.values(devices).filter((d) => d.kind === "viewer");
   const { tone: statusTone, text: statusText } = linkLabel(link);
+  const h5 = isH5Web();
   return (
     <div className="pane">
       <PaneTitle title="连接" />
@@ -329,9 +342,9 @@ export function ConnectionPane({ onConnectRelay, onPairPhone }: { onConnectRelay
         </PocketBadge>
       </SetRow>
       <div className="row wrap" style={{ gap: 8, padding: "12px 0" }}>
-        <PocketButton variant="primary" onClick={onPairPhone}>
+        <PocketButton variant={h5 ? "soft" : "primary"} onClick={onPairPhone}>
           <QrCode size={15} />
-          <span>扫码连接手机</span>
+          <span>{h5 ? "生成配对码" : "扫码连接手机"}</span>
         </PocketButton>
         <PocketButton variant="soft" onClick={onConnectRelay}>
           <Server size={15} />
@@ -390,10 +403,12 @@ export function NotificationsPane() {
           void refreshNotifyChannel();
         }}
       />
-      <ConfigSwitch
-        k="general.dynamicIsland"
-        about="在 macOS 屏幕顶部刘海 / 菜单栏中央联动显示灵动岛提醒与快速跳转"
-      />
+      {isTauri() ? (
+        <ConfigSwitch
+          k="general.dynamicIsland"
+          about="在 macOS 屏幕顶部刘海 / 菜单栏中央联动显示灵动岛提醒与快速跳转"
+        />
+      ) : null}
       <SetRow title="提示音" about="后台 Agent 需要你确认或长任务完成时播放轻柔提示音">
         <PocketSwitch checked={alertSound} onCheckedChange={(v) => updateSettings({ alertSound: v })} label="提示音" />
       </SetRow>
@@ -404,16 +419,20 @@ export function NotificationsPane() {
           label="仅长耗时任务完成时响铃"
         />
       </SetRow>
-      <SetRow title="灵动岛与提醒预览" about="触发示例审批、提问与完成提醒，预览顶部灵动岛与窗口内提醒队列">
-        <PocketButton size="sm" variant="soft" onClick={() => triggerDemoAttentionPreview()}>
-          预览提醒效果
-        </PocketButton>
-      </SetRow>
-      <SetRow title="测试通知">
-        <PocketButton size="sm" variant="ghost" onClick={() => void pushSystemNotification("Herdr Pocket", "通知能正常弹出")}>
-          发一条试试
-        </PocketButton>
-      </SetRow>
+      {isTauri() ? (
+        <>
+          <SetRow title="灵动岛与提醒预览" about="触发示例审批、提问与完成提醒，预览顶部灵动岛与窗口内提醒队列">
+            <PocketButton size="sm" variant="soft" onClick={() => triggerDemoAttentionPreview()}>
+              预览提醒效果
+            </PocketButton>
+          </SetRow>
+          <SetRow title="测试通知">
+            <PocketButton size="sm" variant="ghost" onClick={() => void pushSystemNotification("Herdr Pocket", "通知能正常弹出")}>
+              发一条试试
+            </PocketButton>
+          </SetRow>
+        </>
+      ) : null}
       <SetHeading>和小羊通话</SetHeading>
       <SetRow title="通话降噪" about="系统回声消除与降噪">
         <PocketSwitch checked={denoise} onCheckedChange={(v) => updateSettings({ denoise: v })} label="通话降噪" />
@@ -476,7 +495,25 @@ export function BrowserPane() {
   );
 }
 
-export function UpdatesPane() {
+function H5UpdatesPane() {
+  return (
+    <div className="pane">
+      <PaneTitle title="更新" />
+      <SetRow
+        title={`当前网页端版本 v${appVersion()}`}
+        about="网页端与手机桌面应用随中转服务器同步发布，刷新即可载入最新版本"
+      >
+        <PocketButton size="sm" variant="primary" onClick={() => void refreshH5Bundle()}>
+          <RefreshCw size={14} />
+          <span>刷新并载入最新版</span>
+        </PocketButton>
+      </SetRow>
+      <ToolVersionsSection />
+    </div>
+  );
+}
+
+function DesktopUpdatesPane() {
   const toast = useToast();
   const st = updateStore.use((s) => s);
   // Re-renders when update.region or update.mirrors change, so the order shown stays current.
@@ -711,6 +748,10 @@ export function UpdatesPane() {
       <ToolVersionsSection />
     </div>
   );
+}
+
+export function UpdatesPane() {
+  return isH5Web() ? <H5UpdatesPane /> : <DesktopUpdatesPane />;
 }
 
 /** update.mirrors: the user's own GitHub mirror prefixes, raced before the built-in ones. */

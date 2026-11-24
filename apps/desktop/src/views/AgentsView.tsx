@@ -3265,7 +3265,7 @@ export function AgentDetailPanel({
                     <Cpu size={13} />
                     <span className="truncate mono">{(modelMeta.currentModel || agent.model) ? (modelMeta.currentModel || agent.model)!.split("/").pop() : "切换模型"}</span>
                     <ChevronDown size={11} />
-                    <SpatialHint shortcut="openModelPicker" corner="tr" />
+                    <SpatialHint shortcut="openModelPicker" corner="top" />
                   </button>
                   {effectiveThinkingLevels.length > 0 ? (() => {
                     const displayThinking = modelMeta.currentThinking || agent.thinkingLevel;
@@ -3287,7 +3287,7 @@ export function AgentDetailPanel({
                           {displayThinking ? `思考 · ${formatEffortLabel(displayThinking)}` : "思考等级"}
                         </span>
                         <ChevronDown size={11} />
-                        <SpatialHint shortcut="openThinkingPicker" corner="tr" />
+                        <SpatialHint shortcut="openThinkingPicker" corner="top" />
                       </button>
                     );
                   })() : null}

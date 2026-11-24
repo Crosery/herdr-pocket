@@ -173,6 +173,10 @@ export function applyThemeAttribute(choice: ThemeChoice): void {
       Boolean(window.matchMedia?.("(prefers-color-scheme: dark)")?.matches));
   if (typeof document !== "undefined") {
     document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeMeta) {
+      themeMeta.setAttribute("content", dark ? "#1E1A26" : "#FBF4FC");
+    }
   }
 }
 

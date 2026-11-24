@@ -1634,13 +1634,23 @@ a {
   transform: translate(-50%, -50%);
   width: calc(100vw - 32px);
   max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 32px - var(--safe-top) - var(--safe-bottom));
   overflow-y: auto;
+  overscroll-behavior: contain;
   background: var(--surface);
   border: 1px solid var(--divider);
   border-radius: var(--r-xl);
   padding: 20px 22px;
   box-shadow: var(--shadow-lg);
   z-index: 160;
+}
+
+@media (max-width: 520px) {
+  .pk-dialog {
+    width: calc(100vw - 20px);
+    padding: 16px;
+    border-radius: 20px;
+  }
 }
 
 .pk-dialog-title {
@@ -1660,9 +1670,10 @@ a {
 
 .toast-viewport {
   position: fixed;
-  bottom: 78px;
+  bottom: calc(78px + var(--safe-bottom));
   left: 50%;
   transform: translateX(-50%);
+  max-width: calc(100vw - 24px);
   z-index: 400;
   display: flex;
   flex-direction: column;
@@ -1788,19 +1799,22 @@ a {
 }
 
 /* Breakpoints mirror lib/layout.ts (BP): below 860 the phone layout takes over in JS, so
-   this only guards a window caught mid-resize. */
-@media (max-width: 859.98px) {
-  .agents-split {
-    grid-template-columns: minmax(0, 1fr);
-    padding: 10px 14px;
-  }
-}
-
+   these only guard a window caught mid-resize and adjust .main-scroll padding on narrow screens. */
 @media (max-width: 1099.98px) {
   .agents-split {
     grid-template-columns: minmax(270px, 300px) minmax(0, 1fr);
     gap: 12px;
     padding: 12px 14px 14px;
+  }
+}
+
+@media (max-width: 859.98px) {
+  .agents-split {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 10px 14px;
+  }
+  .main-scroll {
+    padding: 12px 14px calc(20px + var(--safe-bottom));
   }
 }
 
@@ -2265,6 +2279,37 @@ a {
 
 .choice-card > .grow {
   min-width: 0;
+}
+
+.choice-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 560px) {
+  .choice-card:not(.column) {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .choice-card:not(.column) > .pk-btn,
+  .choice-card:not(.column) > .choice-card-actions {
+    width: 100%;
+  }
+  .choice-card:not(.column) > .choice-card-actions .pk-btn {
+    flex: 1 1 130px;
+  }
+}
+
+@media (hover: none) and (pointer: coarse), (max-width: 640px) {
+  .pk-input,
+  .pk-textarea,
+  .composer-input-wrap textarea,
+  .composer-row textarea {
+    font-size: max(16px, calc(15px * var(--ts, 1)));
+  }
 }
 
 .choice-title {
@@ -5994,43 +6039,68 @@ a {
 html[data-client="h5"],
 html[data-client="h5"] body,
 html[data-client="h5"] #root {
+  height: 100%;
   height: 100dvh;
-  min-height: 100dvh;
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+  overscroll-behavior-y: contain;
+}
+
+html[data-client="h5"] button,
+html[data-client="h5"] a {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
 html[data-client="h5"] .mobile-shell {
+  height: 100%;
   height: 100dvh;
-  padding-top: env(safe-area-inset-top, 0px);
+  padding-top: var(--safe-top);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
 }
 
-html[data-client="h5"] .mobile-tabbar {
-  padding-bottom: max(6px, env(safe-area-inset-bottom, 0px));
+.mobile-shell.no-tabbar .composer-card {
+  margin-bottom: calc(12px + var(--safe-bottom));
+}
+
+.mobile-shell.no-tabbar .term-keybar {
+  padding-bottom: calc(8px + var(--safe-bottom));
 }
 
 .h5-auth-screen {
-  min-height: 100dvh;
+  height: 100%;
+  height: 100dvh;
   width: 100%;
   background: var(--page);
   background-image: var(--aura);
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  padding: calc(18px + env(safe-area-inset-top, 0px)) 16px calc(22px + env(safe-area-inset-bottom, 0px));
+  padding: calc(16px + var(--safe-top)) calc(14px + env(safe-area-inset-right, 0px)) calc(22px + var(--safe-bottom)) calc(14px + env(safe-area-inset-left, 0px));
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .h5-auth-card {
   width: 100%;
-  max-width: 540px;
+  max-width: 480px;
+  margin: auto 0;
   background: var(--surface);
   border: 1px solid var(--line-pink);
-  border-radius: 22px;
-  padding: 22px;
-  box-shadow: var(--shadow-md);
+  border-radius: 24px;
+  padding: 20px;
+  box-shadow: var(--shadow);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
+}
+
+.h5-auth-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  padding: 2px 4px 4px;
 }
 
 .h5-auth-head {
@@ -6040,8 +6110,67 @@ html[data-client="h5"] .mobile-tabbar {
 }
 
 .h5-auth-title {
-  margin: 0 0 4px;
-  font-size: calc(22px * var(--ts, 1));
+  margin: 0;
+  font-size: calc(23px * var(--ts, 1));
+  color: var(--ink);
+  line-height: 1.2;
+}
+
+.h5-auth-subtitle {
+  font-size: calc(12.5px * var(--ts, 1));
+  color: var(--faint);
+}
+
+.h5-install-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--accent-soft) 52%, var(--surface));
+  border: 1px dashed var(--line-pink);
+}
+
+.h5-install-title {
+  font-weight: 800;
+  font-size: calc(13.5px * var(--ts, 1));
+  color: var(--ink);
+}
+
+.h5-install-steps {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: calc(13.5px * var(--ts, 1));
+  color: var(--ink);
+}
+
+.settings-mobile-hero {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  border-radius: 18px;
+  background: var(--surface);
+  border: 1px solid var(--line-pink);
+  box-shadow: var(--shadow-sm);
+}
+
+.settings-mobile-hero-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-mobile-hero-name {
+  font-weight: 800;
+  font-size: calc(15px * var(--ts, 1));
   color: var(--ink);
 }
 
@@ -6148,10 +6277,18 @@ html[data-client="h5"] .mobile-tabbar {
 
 @media (max-width: 520px) {
   .h5-auth-screen {
-    align-items: flex-start;
+    padding: calc(12px + var(--safe-top)) calc(10px + env(safe-area-inset-right, 0px)) calc(18px + var(--safe-bottom)) calc(10px + env(safe-area-inset-left, 0px));
   }
   .h5-auth-card {
-    padding: 16px;
-    border-radius: 18px;
+    padding: 16px 14px;
+    border-radius: 20px;
+    gap: 12px;
+  }
+  .h5-install-strip {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .h5-install-strip > .pk-btn {
+    width: 100%;
   }
 }

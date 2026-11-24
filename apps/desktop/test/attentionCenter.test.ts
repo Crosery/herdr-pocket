@@ -8,6 +8,7 @@ import { liveStore } from "../src/lib/store.ts";
 import { shellStore, tabLeaves } from "../src/shell/shellStore.ts";
 import {
   attentionStore,
+  buildNotchSyncPayload,
   classifyAttentionCategory,
   createAttentionTracker,
   jumpToAttentionAgent,
@@ -17,6 +18,7 @@ import {
   sortAttentionItems,
   type AttentionItem,
 } from "../src/lib/attentionCenter.ts";
+import { settingsStore } from "../src/lib/store.ts";
 
 function makeAgent(patch: Partial<Agent> & Pick<Agent, "key">): Agent {
   return {
@@ -198,4 +200,31 @@ test("pushNotchNow skips duplicate serialized notch payloads", () => {
   });
   assert.equal(pushNotchNow(), true);
   assert.equal(pushNotchNow(), false);
+});
+
+const DESKTOP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+test("notch-hud assets use 小羊提醒 branding, NotchShape SVG geometry, valid mascot assets, and theme payload", () => {
+  const html = readFileSync(resolve(DESKTOP_ROOT, "public/notch-hud.html"), "utf8");
+  const js = readFileSync(resolve(DESKTOP_ROOT, "public/notch-hud.js"), "utf8");
+  assert.equal(html.includes("小羊提醒"), true);
+  assert.equal(html.includes("notchBgPath"), true);
+  assert.equal(js.includes("M 0 0"), true);
+  assert.equal(html.includes("Ovis"), false);
+  assert.equal(js.includes("Ovis"), false);
+  assert.equal(html.includes("brand/mascot/"), false);
+  assert.equal(js.includes("brand/mascot/"), false);
+  assert.equal(js.includes("demo-app"), true);
+  assert.equal(js.includes("assets/mascot/waiting.webp"), true);
+  assert.equal(js.includes("assets/mascot/yay.webp"), true);
+
+  const prevTheme = settingsStore.get().theme;
+  try {
+    settingsStore.set({ theme: "light" });
+    assert.equal(buildNotchSyncPayload().theme, "light");
+    settingsStore.set({ theme: "dark" });
+    assert.equal(buildNotchSyncPayload().theme, "dark");
+  } finally {
+    settingsStore.set({ theme: prevTheme });
+  }
 });

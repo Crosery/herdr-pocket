@@ -1,9 +1,14 @@
 import { useState, type ComponentType } from "react";
 import { AppWindow, Bell, ChevronLeft, ChevronRight, Cpu, Info, Link2, Mic, RefreshCw, ScrollText, Settings2, Sparkles } from "lucide-react";
+import { XiaoyangOrb } from "../components/MascotAndVendor";
+import { PocketBadge } from "../components/PocketUI";
+import { serverLabel } from "../components/Sidebar";
 import { VoiceInputSetup } from "../components/VoiceInput";
+import { isTauri } from "../lib/bridge";
+import { liveStore, settingsStore } from "../lib/store";
 import { updateStore } from "../lib/updates";
 import { AssistantSettings, type AssistantTab } from "./settings/AssistantSettings";
-import { AboutPane, BrowserPane, ConnectionPane, GeneralPane, NotificationsPane, PerformancePane, UpdatesPane } from "./settings/Panes";
+import { AboutPane, BrowserPane, ConnectionPane, GeneralPane, NotificationsPane, PerformancePane, UpdatesPane, linkLabel } from "./settings/Panes";
 import { LogsPane } from "./settings/LogsPane";
 import { PaneTitle } from "./settings/rows";
 
@@ -32,6 +37,8 @@ const SECTIONS: Array<{ id: SettingsSection; title: string; icon: ComponentType<
   { id: "about", title: "关于", icon: Info },
 ];
 
+const DESKTOP_ONLY_SECTIONS: ReadonlySet<SettingsSection> = new Set(["voice", "browser", "performance"]);
+
 /**
  * Settings after Herdr's: a category list and one pane; changes apply at once and go to
  * config.json where the key lives there (docs/design/desktop-v2.md section 4).
@@ -55,9 +62,16 @@ export function SettingsView({
   // Narrow windows show the list first, then one pane with a way back.
   const [mobilePane, setMobilePane] = useState(false);
   const updateReady = updateStore.use((s) => Boolean(s.info?.hasUpdate));
+  const server = settingsStore.use((s) => s.server);
+  const deviceName = settingsStore.use((s) => s.deviceName);
+  const link = liveStore.use((s) => s.link);
+  const { tone: linkTone, text: linkText } = linkLabel(link);
+
+  const visibleSections = isTauri() ? SECTIONS : SECTIONS.filter((s) => !DESKTOP_ONLY_SECTIONS.has(s.id));
+  const activeSection: SettingsSection = visibleSections.some((s) => s.id === section) ? section : "general";
 
   const pane = (() => {
-    switch (section) {
+    switch (activeSection) {
       case "general":
         return <GeneralPane onReopenGuide={onReopenGuide} />;
       case "connection":
@@ -94,9 +108,9 @@ export function SettingsView({
   const nav = (
     <nav className="settings-nav" aria-label="设置分类">
       <div className="settings-nav-title cute-font">设置</div>
-      {SECTIONS.map((s) => {
+      {visibleSections.map((s) => {
         const Icon = s.icon;
-        const on = s.id === section;
+        const on = s.id === activeSection;
         return (
           <button
             key={s.id}
@@ -129,7 +143,19 @@ export function SettingsView({
             {pane}
           </>
         ) : (
-          nav
+          <>
+            <div className="settings-mobile-hero">
+              <XiaoyangOrb mood={link === "online" ? "yay" : "hello"} size={44} />
+              <div className="settings-mobile-hero-meta">
+                <div className="settings-mobile-hero-name truncate">{deviceName || "Herdr Pocket"}</div>
+                <div className="faint truncate">{server ? serverLabel(server) : "未连接服务器"}</div>
+              </div>
+              <PocketBadge tone={linkTone} pulse={link === "connecting"}>
+                {linkText}
+              </PocketBadge>
+            </div>
+            {nav}
+          </>
         )}
       </div>
     );

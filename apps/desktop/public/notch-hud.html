@@ -7,19 +7,35 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
     />
-    <title>Herdr Pocket 灵动岛提醒</title>
+    <title>Herdr Pocket · 小羊提醒</title>
     <style>
       :root {
         --notch-w: 0px;
-        --notch-top: 4px;
-        --island-bg: rgba(11, 11, 15, 0.96);
-        --island-border: rgba(255, 255, 255, 0.14);
-        --island-fg: #f8fafc;
-        --island-muted: rgba(248, 250, 252, 0.68);
-        --accent-approval: #fb7185;
-        --accent-question: #fbbf24;
-        --accent-error: #f97316;
-        --accent-completed: #34d399;
+        --ear-r: 19px;
+        --header-h: 36px;
+        --spring: cubic-bezier(0.32, 0.72, 0, 1);
+        --ink: #fdf7fb;
+        --ink-soft: rgba(253, 247, 251, 0.88);
+        --muted: rgba(226, 212, 238, 0.64);
+        --divider: rgba(255, 200, 224, 0.1);
+        --card-bg: rgba(255, 242, 248, 0.055);
+        --card-hover: rgba(255, 143, 179, 0.13);
+        --card-border: rgba(255, 184, 214, 0.12);
+        --card-border-hover: rgba(255, 143, 179, 0.36);
+        --pink: #ff8fb3;
+        --pink-hi: #ffb3cd;
+        --pink-soft: rgba(255, 143, 179, 0.18);
+        --pink-text: #ffafd0;
+        --on-pink: #230f1b;
+        --lav-soft: rgba(185, 162, 245, 0.2);
+        --lav-text: #d6c8ff;
+        --warn-soft: rgba(255, 198, 108, 0.19);
+        --warn-text: #ffd68c;
+        --mint-soft: rgba(86, 224, 179, 0.18);
+        --mint-text: #7ef0cb;
+        --glass-btn: rgba(255, 255, 255, 0.07);
+        --glass-btn-hover: rgba(255, 143, 179, 0.22);
+        --glass-border: rgba(255, 255, 255, 0.12);
       }
 
       * {
@@ -34,71 +50,144 @@
         padding: 0;
         background: transparent;
         overflow: hidden;
-        font-family: "PingFang SC", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-        color: var(--island-fg);
+        font-family: "Nunito", -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", system-ui, sans-serif;
+        color: var(--ink);
         -webkit-font-smoothing: antialiased;
         user-select: none;
+        -webkit-user-select: none;
       }
 
       body {
-        display: flex;
-        justify-content: center;
-        align-items: flex-start;
+        padding: 0 8px 10px;
+      }
+
+      body.standalone-qa {
+        background: linear-gradient(180deg, #e7d9f2 0%, #f7eaf2 100%);
+      }
+
+      html[data-theme="dark"] body.standalone-qa {
+        background: linear-gradient(180deg, #161120 0%, #241b30 100%);
       }
 
       .island {
+        position: relative;
         width: 100%;
         height: 100%;
-        background: var(--island-bg);
-        border: 1px solid var(--island-border);
-        border-radius: 0 0 20px 20px;
+      }
+
+      .notch-svg {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        overflow: visible;
+        pointer-events: none;
+        filter: drop-shadow(0 10px 18px rgba(8, 5, 15, 0.48)) drop-shadow(0 2px 6px rgba(255, 126, 168, 0.14));
+      }
+
+      .island-inner {
+        position: relative;
+        z-index: 2;
+        width: 100%;
+        height: 100%;
+        padding: 0 var(--ear-r);
         display: flex;
         flex-direction: column;
         overflow: hidden;
-        transition: border-radius 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 180ms ease;
+        transition: opacity 180ms var(--spring);
       }
 
-      body[data-has-notch="false"] .island {
-        border-radius: 18px;
+      .compact-bar,
+      .peek-view,
+      .expanded-view {
+        display: none;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
       }
 
-      .compact-bar {
+      body[data-mode="compact"] .compact-bar { display: flex; }
+      body[data-mode="peek"] .peek-view { display: flex; }
+      body[data-mode="expanded"] .expanded-view { display: flex; }
+
+      .wing-header {
+        height: var(--header-h);
+        flex: none;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        height: 100%;
-        padding: 0 12px;
-        gap: 8px;
-        cursor: pointer;
-      }
-
-      .compact-ear {
-        display: inline-flex;
-        align-items: center;
+        padding: 0 10px;
         gap: 6px;
-        min-width: 0;
       }
 
-      .compact-spacer {
+      body[data-has-notch="true"] .wing-header {
+        padding: 0 8px;
+      }
+
+      body[data-mode="compact"][data-has-notch="true"] .wing-header {
+        padding: 0 5px;
+        gap: 4px;
+      }
+
+      .wing-left {
+        flex: 1 1 0;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 6px;
+      }
+
+      .wing-right {
+        flex: 1 1 0;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 5px;
+      }
+
+      .notch-cutout {
         width: var(--notch-w);
         flex: none;
         height: 100%;
       }
 
-      .mascot {
-        width: 18px;
-        height: 18px;
-        border-radius: 50%;
-        object-fit: cover;
-        flex: none;
+      body[data-has-notch="false"] .notch-cutout {
+        display: none;
       }
 
-      .mascot-lg {
-        width: 28px;
-        height: 28px;
-        border-radius: 50%;
-        object-fit: cover;
+      .compact-bar {
+        cursor: pointer;
+      }
+
+      .compact-mascot {
+        width: 20px;
+        height: 20px;
+        object-fit: contain;
         flex: none;
+        display: block;
+      }
+
+      .head-mascot {
+        width: 18px;
+        height: 18px;
+        object-fit: contain;
+        flex: none;
+        display: block;
+      }
+
+      .wing-brand {
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--ink-soft);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      body[data-has-notch="true"] .compact-brand {
+        display: none;
       }
 
       .dot {
@@ -109,71 +198,69 @@
       }
 
       .dot.approval {
-        background: var(--accent-approval);
+        background: #ff6b9d;
+        box-shadow: 0 0 8px rgba(255, 107, 157, 0.85);
+        animation: pulseGlow 1.9s ease-in-out infinite;
       }
+
       .dot.question {
-        background: var(--accent-question);
+        background: #b9a2f5;
+        box-shadow: 0 0 8px rgba(185, 162, 245, 0.8);
+        animation: pulseGlow 2.2s ease-in-out infinite;
       }
+
       .dot.error {
-        background: var(--accent-error);
+        background: #fbbf24;
+        box-shadow: 0 0 8px rgba(251, 191, 36, 0.85);
       }
+
       .dot.completed {
-        background: var(--accent-completed);
+        background: #4ade80;
+        box-shadow: 0 0 7px rgba(74, 222, 128, 0.72);
+      }
+
+      @keyframes pulseGlow {
+        0%, 100% { transform: scale(1); opacity: 1; }
+        50% { transform: scale(1.22); opacity: 0.72; }
       }
 
       .compact-label {
         font-size: 11.5px;
-        font-weight: 600;
-        color: var(--island-fg);
+        font-weight: 700;
+        color: var(--ink-soft);
         white-space: nowrap;
       }
 
       .count-pill {
-        min-width: 18px;
-        height: 18px;
-        padding: 0 5px;
+        min-width: 19px;
+        height: 19px;
+        padding: 0 6px;
         border-radius: 999px;
-        background: rgba(255, 255, 255, 0.16);
-        color: #fff;
-        font-size: 10.5px;
+        background: linear-gradient(135deg, var(--pink-hi), var(--pink));
+        color: var(--on-pink);
+        font-size: 11px;
+        font-weight: 800;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .glass-chip {
+        height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        border: 1px solid var(--glass-border);
+        background: var(--glass-btn);
+        color: var(--ink-soft);
+        font-size: 11px;
         font-weight: 700;
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        font-variant-numeric: tabular-nums;
-      }
-
-      .peek-view,
-      .expanded-view {
-        display: none;
-        flex-direction: column;
-        width: 100%;
-        height: 100%;
-      }
-
-      body[data-mode="compact"] .compact-bar {
-        display: flex;
-      }
-      body[data-mode="peek"] .compact-bar,
-      body[data-mode="expanded"] .compact-bar {
-        display: none;
-      }
-      body[data-mode="peek"] .peek-view {
-        display: flex;
-      }
-      body[data-mode="expanded"] .expanded-view {
-        display: flex;
-      }
-
-      .notch-bridge {
-        height: var(--notch-top);
+        white-space: nowrap;
         flex: none;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 0 14px;
-        font-size: 11px;
-        color: var(--island-muted);
       }
 
       .peek-body {
@@ -181,8 +268,41 @@
         min-height: 0;
         display: flex;
         align-items: center;
-        gap: 10px;
-        padding: 4px 14px 10px;
+        gap: 11px;
+        padding: 4px 12px 10px;
+      }
+
+      .peek-squircle {
+        width: 38px;
+        height: 38px;
+        border-radius: 11px;
+        border: 1px solid rgba(255, 184, 214, 0.24);
+        background: rgba(255, 143, 179, 0.14);
+        display: grid;
+        place-items: center;
+        flex: none;
+      }
+
+      .peek-squircle.question {
+        border-color: rgba(185, 162, 245, 0.28);
+        background: rgba(185, 162, 245, 0.16);
+      }
+
+      .peek-squircle.error {
+        border-color: rgba(255, 198, 108, 0.28);
+        background: rgba(255, 198, 108, 0.14);
+      }
+
+      .peek-squircle.completed {
+        border-color: rgba(86, 224, 179, 0.28);
+        background: rgba(86, 224, 179, 0.14);
+      }
+
+      .peek-squircle img {
+        width: 28px;
+        height: 28px;
+        object-fit: contain;
+        display: block;
       }
 
       .peek-copy {
@@ -190,7 +310,7 @@
         min-width: 0;
         display: flex;
         flex-direction: column;
-        gap: 2px;
+        gap: 3px;
       }
 
       .peek-top {
@@ -201,33 +321,23 @@
       }
 
       .cat-tag {
-        padding: 1px 7px;
+        padding: 2px 7px;
         border-radius: 999px;
         font-size: 10.5px;
-        font-weight: 700;
+        font-weight: 800;
         flex: none;
-      }
-      .cat-tag.approval {
-        background: rgba(251, 113, 133, 0.22);
-        color: #fda4af;
-      }
-      .cat-tag.question {
-        background: rgba(251, 191, 36, 0.22);
-        color: #fde68a;
-      }
-      .cat-tag.error {
-        background: rgba(249, 115, 22, 0.24);
-        color: #fdba74;
-      }
-      .cat-tag.completed {
-        background: rgba(52, 211, 153, 0.22);
-        color: #6ee7b7;
+        white-space: nowrap;
       }
 
+      .cat-tag.approval { background: var(--pink-soft); color: var(--pink-text); }
+      .cat-tag.question { background: var(--lav-soft); color: var(--lav-text); }
+      .cat-tag.error { background: var(--warn-soft); color: var(--warn-text); }
+      .cat-tag.completed { background: var(--mint-soft); color: var(--mint-text); }
+
       .item-title {
-        font-size: 12.5px;
-        font-weight: 600;
-        color: var(--island-fg);
+        font-size: 13px;
+        font-weight: 700;
+        color: var(--ink);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -235,109 +345,147 @@
 
       .item-sub {
         font-size: 11.5px;
-        color: var(--island-muted);
+        color: var(--muted);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        font-family: "Pocket Maple Mono", ui-monospace, "SF Mono", Menlo, "PingFang SC", system-ui, sans-serif;
       }
 
       .jump-btn {
         height: 26px;
-        padding: 0 11px;
+        padding: 0 10px 0 11px;
         border-radius: 999px;
         border: 0;
-        background: #ec4899;
-        color: #fff;
+        background: linear-gradient(135deg, var(--pink-hi), var(--pink));
+        color: var(--on-pink);
         font-size: 11.5px;
-        font-weight: 600;
-        cursor: pointer;
-        flex: none;
-      }
-
-      .jump-btn:hover {
-        background: #db2777;
-      }
-
-      .exp-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        padding: 6px 14px 8px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-      }
-
-      .exp-title {
+        font-weight: 800;
         display: inline-flex;
         align-items: center;
-        gap: 7px;
-        font-size: 12px;
-        font-weight: 700;
-      }
-
-      .exp-clear {
-        border: 0;
-        background: transparent;
-        color: var(--island-muted);
-        font-size: 11px;
+        gap: 3px;
         cursor: pointer;
-        padding: 3px 6px;
-        border-radius: 6px;
+        flex: none;
+        white-space: nowrap;
+        box-shadow: 0 3px 10px rgba(255, 143, 179, 0.28);
+        transition: transform 140ms var(--spring), filter 140ms ease;
       }
 
-      .exp-clear:hover {
-        background: rgba(255, 255, 255, 0.1);
+      .jump-btn:hover { filter: brightness(1.06); }
+      .jump-btn:active { transform: scale(0.95); }
+
+      .exp-btn {
+        height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        border: 1px solid var(--glass-border);
+        background: var(--glass-btn);
+        color: var(--ink-soft);
+        font-size: 11px;
+        font-weight: 700;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        white-space: nowrap;
+        flex: none;
+        transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
+      }
+
+      .exp-btn:hover {
+        background: var(--glass-btn-hover);
+        border-color: rgba(255, 143, 179, 0.42);
         color: #fff;
       }
 
       .exp-filters {
         display: flex;
         align-items: center;
-        gap: 4px;
-        padding: 6px 12px;
+        gap: 5px;
+        padding: 6px 12px 4px;
+        border-top: 1px solid var(--divider);
+        flex: none;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+
+      .exp-filters[hidden] {
+        display: none;
       }
 
       .filter-chip {
-        border: 0;
+        border: 1px solid transparent;
         border-radius: 999px;
-        padding: 3px 8px;
-        background: transparent;
-        color: var(--island-muted);
+        padding: 2px 9px;
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--muted);
         font-size: 11px;
-        font-weight: 600;
+        font-weight: 700;
+        white-space: nowrap;
         cursor: pointer;
+        flex: none;
+        transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
+      }
+
+      .filter-chip:hover {
+        color: var(--ink);
+        background: rgba(255, 255, 255, 0.11);
       }
 
       .filter-chip.active {
-        background: rgba(255, 255, 255, 0.14);
-        color: #fff;
+        background: var(--pink-soft);
+        border-color: rgba(255, 143, 179, 0.4);
+        color: var(--pink-text);
       }
 
       .exp-list {
         flex: 1;
         min-height: 0;
         overflow-y: auto;
-        padding: 0 10px 10px;
+        padding: 6px 10px 12px;
+        border-top: 1px solid var(--divider);
         display: flex;
         flex-direction: column;
         gap: 6px;
+        scrollbar-width: none;
       }
 
-      .exp-card {
+      .exp-filters:not([hidden]) + .exp-list {
+        border-top: 0;
+        padding-top: 3px;
+      }
+
+      .item-card {
         display: flex;
         align-items: center;
-        gap: 8px;
-        padding: 7px 9px;
-        border-radius: 12px;
-        background: rgba(255, 255, 255, 0.06);
-        border: 1px solid rgba(255, 255, 255, 0.07);
+        gap: 9px;
+        padding: 8px 10px;
+        border-radius: 13px;
+        background: var(--card-bg);
+        border: 1px solid var(--card-border);
+        transition: background-color 160ms var(--spring), border-color 160ms var(--spring);
       }
 
-      .exp-card:hover {
-        background: rgba(255, 255, 255, 0.1);
+      .item-card:hover {
+        background: var(--card-hover);
+        border-color: var(--card-border-hover);
       }
 
-      .exp-card-body {
+      .cat-badge {
+        width: 28px;
+        height: 28px;
+        border-radius: 9px;
+        display: grid;
+        place-items: center;
+        flex: none;
+      }
+
+      .cat-badge.approval { background: var(--pink-soft); color: var(--pink-text); }
+      .cat-badge.question { background: var(--lav-soft); color: var(--lav-text); }
+      .cat-badge.error { background: var(--warn-soft); color: var(--warn-text); }
+      .cat-badge.completed { background: var(--mint-soft); color: var(--mint-text); }
+
+      .item-body {
         flex: 1;
         min-width: 0;
         display: flex;
@@ -347,20 +495,22 @@
       }
 
       .exp-close {
-        width: 20px;
-        height: 20px;
+        width: 22px;
+        height: 22px;
         border-radius: 999px;
         border: 0;
         background: transparent;
-        color: var(--island-muted);
+        color: var(--muted);
         cursor: pointer;
-        font-size: 13px;
-        line-height: 1;
+        display: inline-grid;
+        place-items: center;
+        padding: 0;
         flex: none;
+        transition: background-color 120ms ease, color 120ms ease;
       }
 
       .exp-close:hover {
-        background: rgba(255, 255, 255, 0.14);
+        background: rgba(255, 255, 255, 0.12);
         color: #fff;
       }
 
@@ -369,55 +519,95 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        color: var(--island-muted);
+        color: var(--muted);
         font-size: 12px;
+        padding: 16px 0;
       }
     </style>
   </head>
   <body data-mode="compact" data-has-notch="true">
     <div id="island" class="island">
-      <div id="compactBar" class="compact-bar" role="button" tabindex="0" aria-label="展开灵动岛提醒队列">
-        <div class="compact-ear">
-          <img class="mascot" src="brand/mascot/call-listening.webp" alt="" />
-          <span id="compactDot" class="dot approval"></span>
-        </div>
-        <div class="compact-spacer" aria-hidden="true"></div>
-        <div class="compact-ear">
-          <span id="compactLabel" class="compact-label">待处理</span>
-          <span id="compactCount" class="count-pill">0</span>
-        </div>
-      </div>
+      <svg id="notchSvg" class="notch-svg" aria-hidden="true">
+        <defs>
+          <linearGradient id="notchBgGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#040307" stop-opacity="0.99" />
+            <stop offset="52%" stop-color="#0C0913" stop-opacity="0.98" />
+            <stop offset="100%" stop-color="#171122" stop-opacity="0.985" />
+          </linearGradient>
+          <radialGradient id="notchSakuraGlow" cx="50%" cy="100%" r="65%">
+            <stop offset="0%" stop-color="rgba(255, 143, 179, 0.14)" />
+            <stop offset="65%" stop-color="rgba(255, 143, 179, 0.04)" />
+            <stop offset="100%" stop-color="rgba(255, 143, 179, 0)" />
+          </radialGradient>
+          <linearGradient id="notchRimGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="rgba(255, 158, 196, 0)" />
+            <stop offset="22%" stop-color="rgba(255, 158, 196, 0.08)" />
+            <stop offset="100%" stop-color="rgba(255, 158, 196, 0.30)" />
+          </linearGradient>
+        </defs>
+        <path id="notchBgPath" fill="url(#notchBgGrad)" />
+        <path id="notchGlowPath" fill="url(#notchSakuraGlow)" />
+        <path id="notchRimPath" fill="none" stroke="url(#notchRimGrad)" stroke-width="1" />
+      </svg>
 
-      <div id="peekView" class="peek-view">
-        <div class="notch-bridge" aria-hidden="true"></div>
-        <div class="peek-body">
-          <img class="mascot-lg" src="brand/mascot/call-listening.webp" alt="" />
-          <div class="peek-copy">
-            <div class="peek-top">
-              <span id="peekTag" class="cat-tag approval">需要审批</span>
-              <span id="peekTitle" class="item-title">Herdr Pocket</span>
+      <div id="islandInner" class="island-inner">
+        <div id="compactBar" class="compact-bar" role="button" tabindex="0" aria-label="展开小羊提醒队列">
+          <div class="wing-header">
+            <div class="wing-left">
+              <img id="compactMascot" class="compact-mascot" src="assets/mascot/waiting.webp" alt="" />
+              <span id="compactDot" class="dot approval"></span>
+              <span class="wing-brand compact-brand">小羊</span>
             </div>
-            <div id="peekSub" class="item-sub">等待确认</div>
+            <div class="notch-cutout" aria-hidden="true"></div>
+            <div class="wing-right">
+              <span id="compactLabel" class="compact-label">待处理</span>
+              <span id="compactCount" class="count-pill">0</span>
+            </div>
           </div>
-          <button id="peekJumpBtn" type="button" class="jump-btn">跳转</button>
         </div>
-      </div>
 
-      <div id="expandedView" class="expanded-view">
-        <div class="notch-bridge" aria-hidden="true"></div>
-        <div class="exp-head">
-          <div class="exp-title">
-            <img class="mascot" src="brand/mascot/call-listening.webp" alt="" />
-            <span>Ovis 待处理提醒</span>
-            <span id="expTotal" class="count-pill">0</span>
+        <div id="peekView" class="peek-view">
+          <div class="wing-header">
+            <div class="wing-left">
+              <img id="peekHeadMascot" class="head-mascot" src="assets/mascot/waiting.webp" alt="" />
+              <span class="wing-brand">小羊提醒</span>
+            </div>
+            <div class="notch-cutout" aria-hidden="true"></div>
+            <div class="wing-right">
+              <span id="peekCountLabel" class="glass-chip">1 条提醒</span>
+            </div>
           </div>
-          <div>
-            <button id="openMainBtn" type="button" class="exp-clear">主窗口</button>
-            <button id="clearAllBtn" type="button" class="exp-clear">全部已读</button>
+          <div class="peek-body">
+            <div id="peekSquircle" class="peek-squircle approval">
+              <img id="peekMascot" src="assets/mascot/waiting.webp" alt="" />
+            </div>
+            <div class="peek-copy">
+              <div class="peek-top">
+                <span id="peekTag" class="cat-tag approval">需要审批</span>
+                <span id="peekTitle" class="item-title">Herdr Pocket</span>
+              </div>
+              <div id="peekSub" class="item-sub">等待确认</div>
+            </div>
+            <button id="peekJumpBtn" type="button" class="jump-btn">查看</button>
           </div>
         </div>
-        <div id="expFilters" class="exp-filters"></div>
-        <div id="expList" class="exp-list"></div>
+
+        <div id="expandedView" class="expanded-view">
+          <div class="wing-header">
+            <div class="wing-left">
+              <img id="expMascot" class="head-mascot" src="assets/mascot/waiting.webp" alt="" />
+              <span class="wing-brand">小羊提醒</span>
+              <span id="expTotal" class="count-pill">0</span>
+            </div>
+            <div class="notch-cutout" aria-hidden="true"></div>
+            <div class="wing-right">
+              <button id="openMainBtn" type="button" class="exp-btn">主窗口</button>
+              <button id="clearAllBtn" type="button" class="exp-btn">全部已读</button>
+            </div>
+          </div>
+          <div id="expFilters" class="exp-filters" hidden></div>
+          <div id="expList" class="exp-list"></div>
+        </div>
       </div>
     </div>
 
