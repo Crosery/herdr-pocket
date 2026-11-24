@@ -28,6 +28,7 @@ import {
   type AssistantConfirm,
   type AssistantConfigChange,
   type LogLevel,
+  type PasskeyAssertionPayload,
   type VoiceProviderId,
   TRANSCRIBE_LIMITS,
   type TranscribeResult,
@@ -43,6 +44,18 @@ import { isPromptId, promptView, promptViews, setPromptEdits } from "./assistant
 import { startCall, endAllCalls, type LiveConfig } from "./assistant/live.ts";
 import { EventLog, levelsFrom, parseSince, type EventInput } from "./eventlog.ts";
 import { adminPage, adminAsset } from "./admin.ts";
+import { webAsset, webPage } from "./web/index.ts";
+import {
+  ChallengeStore,
+  formatAnchorCookieHeader,
+  parseAnchorCookies,
+  signAnchorToken,
+  verifyAnchorToken,
+  verifyDeviceIdentityProof,
+  verifyPasskeyAssertion,
+  verifyPasskeyRegistration,
+  verifyReconfirmEcdsa,
+} from "./identity.ts";
 import { TranscribeError, TranscribeLimiter, audioType, resolveTranscribe, transcribe, transcribeInfo, wavDurationMs, type TranscribeSettings, type TranscribeTarget } from "./transcribe.ts";
 
 export interface RelayOptions {
@@ -113,6 +126,8 @@ interface Join {
   ip: string;
   /** Device this request replaces when approved (the asker's previous registration). */
   replaces?: string;
+  identity?: { identityPubKey: string; fingerprintHash?: string };
+  anchorDeviceId?: string;
   state: "pending" | "denied" | "approved";
   /** Held only until the asking device collects it. */
   granted?: PairResponse;
@@ -142,6 +157,7 @@ export class Relay {
   private seq = 0;
   private pairFails = new Map<string, { n: number; since: number }>();
   private joins = new Map<string, Join>();
+  private challenges = new ChallengeStore();
   private heartbeat: NodeJS.Timeout;
   /** Every line also becomes an event (see eventlog.ts); `journal` is the raw output. */
   private log: (msg: string) => void;
@@ -282,7 +298,61 @@ export class Relay {
       return;
     }
     const url = new URL(req.url ?? "/", "http://relay");
-    const path = url.pathname.replace(/\/+$/, "") || "/";
+    const rawPathname = url.pathname;
+    const path = rawPathname.replace(/\/+$/, "") || "/";
+
+    // H5 Web Client at /app/ and /h5/: trailing slash ensures relative ./assets/ resolves cleanly under subpaths like /pocket/app/.
+    if ((req.method === "GET" || req.method === "HEAD") && (rawPathname === "/app" || rawPathname === "/h5")) {
+      const target = `${this.publicUrl(req)}/app/${url.search}`;
+      res.writeHead(302, { Location: target, "Cache-Control": "no-store" }).end();
+      return;
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && (rawPathname === "/app/" || rawPathname === "/h5/")) {
+      const html = webPage();
+      if (!html) {
+        sendError(res, 503, "unsupported", "网页版资源尚未构建");
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Referrer-Policy": "no-referrer",
+        "X-Robots-Tag": "noindex, nofollow",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy":
+          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https: http:; media-src 'self' blob: data:; connect-src *; frame-src 'self' blob: data:; frame-ancestors 'none'",
+      });
+      res.end(req.method === "HEAD" ? undefined : html);
+      return;
+    }
+
+    const webMatch = /^\/(?:app|h5)\/(.+)$/.exec(rawPathname);
+    if ((req.method === "GET" || req.method === "HEAD") && webMatch) {
+      const rel = webMatch[1] === "favicon.ico" ? "assets/brand/favicon.ico" : webMatch[1]!;
+      const asset = webAsset(rel);
+      if (asset) {
+        res.writeHead(200, {
+          "Content-Type": asset.type,
+          "Content-Length": asset.body.length,
+          "Cache-Control": asset.immutable ? "public, max-age=31536000, immutable" : "public, max-age=3600",
+          "X-Content-Type-Options": "nosniff",
+        });
+        res.end(req.method === "HEAD" ? undefined : asset.body);
+        return;
+      }
+      if (!rel.includes(".")) {
+        const html = webPage();
+        if (html) {
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
+          res.end(req.method === "HEAD" ? undefined : html);
+          return;
+        }
+      }
+      sendError(res, 404, "not_found", "not found");
+      return;
+    }
 
     // QR landing pages: they echo the URL and never look the code or request up.
     const lm = /^\/(p|j)\/([^/]+)$/.exec(path);
@@ -356,6 +426,127 @@ export class Relay {
       return;
     }
 
+    if (req.method === "GET" && path === "/v1/identity/hint") {
+      const anchored = this.resolveAnchoredDevice(req);
+      if (!anchored || anchored.kind !== "viewer") {
+        sendJson(res, 200, { anchored: false });
+        return;
+      }
+      sendJson(res, 200, {
+        anchored: true,
+        deviceId: anchored.id,
+        deviceName: anchored.name,
+        passkeyLinked: Boolean(anchored.passkeyLinked),
+      });
+      return;
+    }
+
+    if (req.method === "POST" && path === "/v1/identity/challenge") {
+      const ip = this.clientIp(req);
+      if (this.pairBlocked(ip)) {
+        sendError(res, 429, "forbidden", "尝试太多次，请稍后再试");
+        return;
+      }
+      const issued = this.challenges.issue(this.rpIdOf(req));
+      sendJson(res, 200, issued);
+      return;
+    }
+
+    if (req.method === "POST" && path === "/v1/identity/reconfirm") {
+      const ip = this.clientIp(req);
+      if (this.pairBlocked(ip)) {
+        sendError(res, 429, "forbidden", "验证尝试太多次，请稍后再试");
+        return;
+      }
+      const body = await readJson(req);
+      const challenge = str(body?.challenge, 128);
+      if (!challenge) {
+        sendError(res, 400, "bad_request", "缺少验证 challenge");
+        return;
+      }
+      const ch = this.challenges.consume(challenge);
+      if (!ch) {
+        this.pairFailed(ip);
+        sendError(res, 401, "unauthorized", "验证已过期或无效，请重试");
+        return;
+      }
+      const platform = str(body?.platform, 32);
+      const customName = str(body?.name, 64)?.trim();
+      const passkey = body?.passkey as PasskeyAssertionPayload | undefined;
+      if (passkey && typeof passkey === "object" && typeof passkey.id === "string") {
+        const rec = this.store.findPasskeyAuthRecord(passkey.id);
+        if (!rec || rec.device.kind !== "viewer") {
+          this.pairFailed(ip);
+          sendError(res, 401, "unauthorized", "当前中转服务未绑定该通行密钥");
+          return;
+        }
+        const check = verifyPasskeyAssertion({
+          challenge,
+          rpId: ch.rpId,
+          publicKeySpki: rec.publicKeySpki,
+          prevSignCount: rec.signCount,
+          assertion: passkey,
+        });
+        if (!check.ok) {
+          this.pairFailed(ip);
+          sendError(res, 401, "unauthorized", "通行密钥签名校验失败");
+          return;
+        }
+        this.store.setPasskeySignCount(rec.device.id, check.nextSignCount);
+        const rotated = this.store.rotateDeviceToken(rec.device.id, {
+          name: customName,
+          platform,
+        });
+        if (!rotated) {
+          sendError(res, 404, "not_found", "设备记录已移除");
+          return;
+        }
+        this.events.record({
+          kind: "pair",
+          level: "info",
+          msg: `viewer "${rotated.device.name}" (${rotated.device.id}) reconfirmed identity via passkey`,
+          device: rotated.device.id,
+          data: { platform: platform ?? rotated.device.platform, method: "passkey" },
+        });
+        this.setAnchorCookie(req, res, rotated.device.id);
+        this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(rotated.device) });
+        sendJson(res, 200, { device: this.decorate(rotated.device), token: rotated.token } satisfies PairResponse);
+        return;
+      }
+
+      const identityPubKey = str(body?.identityPubKey, 512);
+      const signature = str(body?.signature, 512);
+      if (!identityPubKey || !signature || !verifyReconfirmEcdsa(challenge, identityPubKey, signature)) {
+        this.pairFailed(ip);
+        sendError(res, 401, "unauthorized", "设备身份密钥校验失败，需要重新扫码连接");
+        return;
+      }
+      const existing = this.store.findDeviceByIdentityPubKey(identityPubKey, "viewer");
+      if (!existing) {
+        sendError(res, 404, "not_found", "这台浏览器还没有在中转服务登记身份");
+        return;
+      }
+      const rotated = this.store.rotateDeviceToken(existing.id, {
+        name: customName,
+        platform,
+      });
+      if (!rotated) {
+        sendError(res, 404, "not_found", "设备记录已移除");
+        return;
+      }
+      this.events.record({
+        kind: "pair",
+        level: "info",
+        msg: `viewer "${rotated.device.name}" (${rotated.device.id}) reconfirmed identity via keypair`,
+        device: rotated.device.id,
+        data: { platform: platform ?? rotated.device.platform, method: "ecdsa" },
+      });
+      this.setAnchorCookie(req, res, rotated.device.id);
+      this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(rotated.device) });
+      sendJson(res, 200, { device: this.decorate(rotated.device), token: rotated.token } satisfies PairResponse);
+      return;
+    }
+
     if (req.method === "POST" && path === "/v1/pair") {
       const ip = this.clientIp(req);
       if (this.pairBlocked(ip)) {
@@ -368,6 +559,7 @@ export class Relay {
       const kind = body?.kind === "host" || body?.kind === "viewer" ? (body.kind as DeviceKind) : null;
       const platform = str(body?.platform, 32);
       const via = str(body?.via, 24)?.replace(/[^a-z0-9-]/gi, "");
+      const verifiedId = verifyDeviceIdentityProof(body?.identity);
       if (!code || !name || !kind) {
         sendError(res, 400, "bad_request", "需要 code、name 和 kind（host 或 viewer）");
         return;
@@ -389,20 +581,43 @@ export class Relay {
         else sendError(res, 401, "unauthorized", "配对码不对，或者已经用过了");
         return;
       }
-      // A device that pairs again while still holding its old token is the same device coming back:
-      // it takes over its old entry instead of leaving a dead twin in the list.
       const previous = this.authenticate(req, url);
-      if (previous && previous !== "admin" && previous.kind === kind) this.removeDevice(previous.id, "re-paired");
-      const { device, token } = this.store.createDevice({ name: this.store.uniqueName(name), kind, platform });
+      const existingMatch = this.findReusableDeviceForPair({
+        kind,
+        previous,
+        verifiedId,
+        anchored: this.resolveAnchoredDevice(req),
+      });
+      let created: { device: Device; token: string };
+      if (existingMatch && existingMatch.mode === "reuse") {
+        created = this.store.rotateDeviceToken(existingMatch.device.id, {
+          platform,
+          identityPubKey: verifiedId?.identityPubKey,
+          identityFp: verifiedId?.fingerprintHash,
+        })!;
+      } else {
+        if (previous && previous !== "admin" && previous.kind === kind) {
+          this.removeDevice(previous.id, "re-paired");
+        }
+        created = this.store.createDevice({
+          name: this.store.uniqueName(name),
+          kind,
+          platform,
+          identityPubKey: verifiedId?.identityPubKey,
+          identityFp: verifiedId?.fingerprintHash,
+        });
+      }
+      const { device, token } = created;
       const maker = row.createdBy === "admin" ? "admin" : row.createdBy ? (this.store.getDevice(row.createdBy)?.name ?? row.createdBy) : "setup code";
-      this.log(`paired ${kind} "${name}" (${device.id})`);
+      this.log(`paired ${kind} "${device.name}" (${device.id})`);
       this.events.record({
         kind: "pair",
         level: "info",
-        msg: `${kind} "${device.name}" paired with a code from ${maker}${via ? ` via ${via}` : ""}${previous && previous !== "admin" && previous.kind === kind ? ", replacing its old entry" : ""}`,
+        msg: `${kind} "${device.name}" paired with a code from ${maker}${via ? ` via ${via}` : ""}${existingMatch?.mode === "reuse" ? ", reusing anchored identity" : previous && previous !== "admin" && previous.kind === kind ? ", replacing its old entry" : ""}`,
         device: device.id,
-        data: { kind, platform, via, codeFrom: row.createdBy ?? "setup", replaced: previous && previous !== "admin" && previous.kind === kind ? previous.id : undefined },
+        data: { kind, platform, via, codeFrom: row.createdBy ?? "setup", reused: existingMatch?.mode === "reuse" ? device.id : undefined },
       });
+      if (kind === "viewer") this.setAnchorCookie(req, res, device.id);
       this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(device) });
       const out: PairResponse = { device: this.decorate(device), token };
       sendJson(res, 200, out);
@@ -425,11 +640,15 @@ export class Relay {
         return;
       }
       const previous = this.authenticate(req, url);
+      const verifiedId = verifyDeviceIdentityProof(body?.identity);
+      const anchored = kind === "viewer" ? this.resolveAnchoredDevice(req) : null;
       const join: Join = {
         req: { id: randomBytes(12).toString("base64url"), name, kind, platform: str(body?.platform, 32), expiresAt: Date.now() + JOIN_TTL_MS },
         secret: randomBytes(24).toString("base64url"),
         ip,
         replaces: previous && previous !== "admin" && previous.kind === kind ? previous.id : undefined,
+        ...(verifiedId ? { identity: verifiedId } : {}),
+        ...(anchored && anchored.kind === kind ? { anchorDeviceId: anchored.id } : {}),
         state: "pending",
       };
       this.joins.set(join.req.id, join);
@@ -449,7 +668,10 @@ export class Relay {
       }
       let out: JoinClaim = { status: "pending" };
       if (join.state === "denied") out = { status: "denied" };
-      else if (join.state === "approved" && join.granted) out = { status: "approved", ...join.granted };
+      else if (join.state === "approved" && join.granted) {
+        out = { status: "approved", ...join.granted };
+        if (join.granted.device.kind === "viewer") this.setAnchorCookie(req, res, join.granted.device.id);
+      }
       // Answered requests are handed over exactly once.
       if (join.state !== "pending") this.joins.delete(join.req.id);
       sendJson(res, 200, out);
@@ -458,6 +680,63 @@ export class Relay {
 
     // Everything below needs a device token (or the admin token where noted).
     const auth = this.authenticate(req, url);
+
+    if (req.method === "POST" && path === "/v1/identity/passkey/options") {
+      if (!auth || auth === "admin" || auth.kind !== "viewer") {
+        sendError(res, 401, "unauthorized", "需要浏览器/手机端设备令牌");
+        return;
+      }
+      const issued = this.challenges.issue(this.rpIdOf(req));
+      sendJson(res, 200, {
+        challenge: issued.challenge,
+        expiresAt: issued.expiresAt,
+        rp: { id: issued.rpId, name: "Herdr Pocket" },
+        user: { id: auth.id, name: auth.name, displayName: auth.name },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      });
+      return;
+    }
+
+    if (req.method === "POST" && path === "/v1/identity/passkey/register") {
+      if (!auth || auth === "admin" || auth.kind !== "viewer") {
+        sendError(res, 401, "unauthorized", "需要浏览器/手机端设备令牌");
+        return;
+      }
+      const body = await readJson(req);
+      const challenge = str(body?.challenge, 128);
+      const credId = str(body?.credId, 512);
+      const publicKeySpki = str(body?.publicKeySpki, 512);
+      const clientDataJSON = str(body?.clientDataJSON, 2048);
+      if (!challenge || !credId || !publicKeySpki || !clientDataJSON) {
+        sendError(res, 400, "bad_request", "缺少通行密钥注册参数");
+        return;
+      }
+      const ch = this.challenges.consume(challenge);
+      if (!ch) {
+        sendError(res, 401, "unauthorized", "注册超时或 challenge 无效，请重试");
+        return;
+      }
+      const verified = verifyPasskeyRegistration({ challenge, rpId: ch.rpId, credId, publicKeySpki, clientDataJSON });
+      if (!verified) {
+        sendError(res, 400, "bad_request", "通行密钥公钥或来源验证失败");
+        return;
+      }
+      const updated = this.store.setDevicePasskey(auth.id, verified.credId, verified.publicKeySpki);
+      if (!updated) {
+        sendError(res, 404, "not_found", "设备记录不存在");
+        return;
+      }
+      this.events.record({
+        kind: "pair",
+        level: "info",
+        msg: `viewer "${updated.name}" (${updated.id}) linked a hardware passkey`,
+        device: updated.id,
+      });
+      this.setAnchorCookie(req, res, updated.id);
+      this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(updated) });
+      sendJson(res, 200, { device: this.decorate(updated) });
+      return;
+    }
 
     if (jm && (req.method === "GET" ? !jm[2] : jm[2] === "approve" || jm[2] === "deny")) {
       if (!auth) {
@@ -481,8 +760,33 @@ export class Relay {
         sendJson(res, 200, { ok: true });
         return;
       }
-      if (join.replaces) this.removeDevice(join.replaces, "re-paired");
-      const { device, token } = this.store.createDevice({ name: this.store.uniqueName(join.req.name), kind: join.req.kind, platform: join.req.platform });
+      let grantedPair: { device: Device; token: string } | null = null;
+      if (!join.replaces) {
+        const match = this.findReusableDeviceForPair({
+          kind: join.req.kind,
+          previous: null,
+          verifiedId: join.identity ?? null,
+          anchored: join.anchorDeviceId ? this.store.getDevice(join.anchorDeviceId) : null,
+        });
+        if (match?.mode === "reuse") {
+          grantedPair = this.store.rotateDeviceToken(match.device.id, {
+            platform: join.req.platform,
+            identityPubKey: join.identity?.identityPubKey,
+            identityFp: join.identity?.fingerprintHash,
+          });
+        }
+      }
+      if (!grantedPair) {
+        if (join.replaces) this.removeDevice(join.replaces, "re-paired");
+        grantedPair = this.store.createDevice({
+          name: this.store.uniqueName(join.req.name),
+          kind: join.req.kind,
+          platform: join.req.platform,
+          identityPubKey: join.identity?.identityPubKey,
+          identityFp: join.identity?.fingerprintHash,
+        });
+      }
+      const { device, token } = grantedPair;
       join.state = "approved";
       join.granted = { device: this.decorate(device), token };
       this.log(`joined ${device.kind} "${device.name}" (${device.id}), approved by ${by}`);
@@ -934,6 +1238,51 @@ export class Relay {
     if (this.opts.publicUrl) return this.opts.publicUrl.replace(/\/+$/, "");
     const proto = this.opts.trustProxy ? String(req.headers["x-forwarded-proto"] ?? "http").split(",")[0] : "http";
     return `${proto}://${req.headers.host ?? "localhost"}`;
+  }
+
+  private rpIdOf(req: IncomingMessage): string {
+    try {
+      return new URL(this.publicUrl(req)).hostname.toLowerCase();
+    } catch {
+      return String(req.headers.host ?? "localhost").split(":")[0]!.toLowerCase();
+    }
+  }
+
+  private resolveAnchoredDevice(req: IncomingMessage): Device | null {
+    const cookies = parseAnchorCookies(req);
+    const id = verifyAnchorToken(cookies.hp_anchor, (d) => this.config.hmacAnchor(d));
+    return id ? this.store.getDevice(id) : null;
+  }
+
+  private setAnchorCookie(req: IncomingMessage, res: ServerResponse, deviceId: string): void {
+    const secure = this.publicUrl(req).startsWith("https://");
+    const val = signAnchorToken(deviceId, (d) => this.config.hmacAnchor(d));
+    res.setHeader("Set-Cookie", formatAnchorCookieHeader(val, secure));
+  }
+
+  private findReusableDeviceForPair(opts: {
+    kind: DeviceKind;
+    previous: Device | "admin" | null;
+    verifiedId: { identityPubKey: string; fingerprintHash?: string } | null;
+    anchored: Device | null;
+  }): { mode: "reuse"; device: Device } | null {
+    if (opts.verifiedId) {
+      const byKey = this.store.findDeviceByIdentityPubKey(opts.verifiedId.identityPubKey, opts.kind);
+      if (byKey) return { mode: "reuse", device: byKey };
+    }
+    if (opts.previous && opts.previous !== "admin" && opts.previous.kind === opts.kind) {
+      const rec = this.store.getDeviceIdentityRecord(opts.previous.id);
+      if (rec?.identityPubKey && opts.verifiedId && rec.identityPubKey === opts.verifiedId.identityPubKey) {
+        return { mode: "reuse", device: rec.device };
+      }
+    }
+    if (opts.anchored && opts.anchored.kind === opts.kind) {
+      const rec = this.store.getDeviceIdentityRecord(opts.anchored.id);
+      if (rec && (!rec.identityPubKey || (opts.verifiedId && rec.identityPubKey === opts.verifiedId.identityPubKey))) {
+        return { mode: "reuse", device: rec.device };
+      }
+    }
+    return null;
   }
 
   private clientIp(req: IncomingMessage): string {

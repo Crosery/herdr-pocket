@@ -28,12 +28,26 @@ import {
   type SourceProbe,
 } from "@herdr-pocket/protocol";
 import { desktopSessionStore, type DesktopSessionStore } from "./sessionStore";
+import { clearVaultSession, readVaultSession, recognizeWebDevice, writeVaultSession } from "./h5Identity";
 import { logger } from "./log";
 
-declare const __POCKET_TARGET__: "desktop" | "harmony";
+declare const __POCKET_TARGET__: "desktop" | "harmony" | "web";
 declare const __APP_VERSION__: string;
 
-export type PlatformKind = "macos" | "windows" | "linux" | "openharmony" | "web";
+export type PlatformKind =
+  | "macos"
+  | "windows"
+  | "linux"
+  | "openharmony"
+  | "web"
+  | "h5-ios"
+  | "h5-ipados"
+  | "h5-android"
+  | "h5-harmony"
+  | "h5-macos"
+  | "h5-windows"
+  | "h5-linux"
+  | "h5-web";
 
 export interface SavedSession {
   server: string;
@@ -102,6 +116,10 @@ export function isHarmony(): boolean {
   return typeof window !== "undefined" && Boolean(window.PocketHarmony);
 }
 
+export function isH5Web(): boolean {
+  return typeof window !== "undefined" && !isTauri() && !isHarmony();
+}
+
 export function appVersion(): string {
   const w = typeof window !== "undefined" ? window : undefined;
   const fromHarmony = w?.PocketHarmony?.appVersion?.();
@@ -115,6 +133,9 @@ export function appVersion(): string {
 
 export function detectPlatform(): PlatformKind {
   if (isHarmony()) return "openharmony";
+  if (!isTauri() && typeof navigator !== "undefined") {
+    return recognizeWebDevice().platform;
+  }
   const nav = typeof navigator !== "undefined" ? `${navigator.platform} ${navigator.userAgent}`.toLowerCase() : "";
   if (nav.includes("mac")) return "macos";
   if (nav.includes("win")) return "windows";
@@ -125,6 +146,9 @@ export function detectPlatform(): PlatformKind {
 export function defaultDeviceName(): string {
   const harmonyName = window.PocketHarmony?.deviceName?.();
   if (harmonyName && harmonyName.trim()) return harmonyName.trim().slice(0, 40);
+  if (!isTauri() && typeof navigator !== "undefined") {
+    return recognizeWebDevice().name;
+  }
   const p = detectPlatform();
   if (p === "openharmony") return "我的鸿蒙设备";
   if (p === "macos") return "我的 Mac";
@@ -168,12 +192,7 @@ export async function loadSession(): Promise<SavedSession | null> {
       // ignore
     }
   }
-  try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    return raw ? (JSON.parse(raw) as SavedSession) : null;
-  } catch {
-    return null;
-  }
+  return readVaultSession<SavedSession>();
 }
 
 export async function saveSession(session: SavedSession): Promise<void> {
@@ -186,11 +205,7 @@ export async function saveSession(session: SavedSession): Promise<void> {
       // Fallback below
     }
   }
-  try {
-    localStorage.setItem(SESSION_KEY, encoded);
-  } catch {
-    // ignore
-  }
+  await writeVaultSession(session);
 }
 
 export async function clearSession(): Promise<void> {
@@ -202,11 +217,7 @@ export async function clearSession(): Promise<void> {
       // ignore
     }
   }
-  try {
-    localStorage.removeItem(SESSION_KEY);
-  } catch {
-    // ignore
-  }
+  await clearVaultSession();
 }
 
 export async function getHostdStatus(): Promise<HostdLocalStatus | null> {

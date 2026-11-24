@@ -49,6 +49,17 @@ interface DeviceRow {
   token_hash: string;
   created_at: number;
   last_seen_at: number;
+  identity_pubkey: string | null;
+  passkey_cred_id: string | null;
+  passkey_cose_pub: string | null;
+  passkey_sign_count: number | null;
+  identity_fp: string | null;
+}
+
+export interface PasskeyAuthRecord {
+  device: Device;
+  publicKeySpki: string;
+  signCount: number;
 }
 
 export class Store {
@@ -104,6 +115,29 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
       CREATE INDEX IF NOT EXISTS events_device ON events (device, ts);
+    `);
+    this.ensureDeviceIdentityColumns();
+  }
+
+  private ensureDeviceIdentityColumns(): void {
+    const cols = new Set(
+      (this.db.prepare("PRAGMA table_info(devices)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    const add: Array<[string, string]> = [
+      ["identity_pubkey", "TEXT"],
+      ["passkey_cred_id", "TEXT"],
+      ["passkey_cose_pub", "TEXT"],
+      ["passkey_sign_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["identity_fp", "TEXT"],
+    ];
+    for (const [col, def] of add) {
+      if (!cols.has(col)) {
+        this.db.exec(`ALTER TABLE devices ADD COLUMN ${col} ${def}`);
+      }
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS devices_identity_pub ON devices (identity_pubkey);
+      CREATE INDEX IF NOT EXISTS devices_passkey_cred ON devices (passkey_cred_id);
     `);
   }
 
@@ -286,18 +320,120 @@ export class Store {
     }
   }
 
-  createDevice(input: { name: string; kind: DeviceKind; platform?: string }): { device: Device; token: string } {
+  createDevice(input: {
+    name: string;
+    kind: DeviceKind;
+    platform?: string;
+    identityPubKey?: string;
+    identityFp?: string;
+  }): { device: Device; token: string } {
     const now = Date.now();
     const id = randomUUID().replace(/-/g, "").slice(0, 12);
     const token = `hp_${randomBytes(32).toString("base64url")}`;
     this.db
       .prepare(
-        "INSERT INTO devices (id, name, kind, platform, token_hash, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO devices (id, name, kind, platform, token_hash, created_at, last_seen_at, identity_pubkey, identity_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(id, input.name, input.kind, input.platform ?? null, hashToken(token), now, now);
+      .run(
+        id,
+        input.name,
+        input.kind,
+        input.platform ?? null,
+        hashToken(token),
+        now,
+        now,
+        input.identityPubKey ?? null,
+        input.identityFp ?? null,
+      );
     // The relay is set up now, however this device got in: the first-run code must not outlive that.
     this.dropSetupCodes();
     return { device: this.toDevice(this.getRow(id)!), token };
+  }
+
+  /**
+   * Re-authenticates an existing device preserving its immutable `device.id`, creation timestamp,
+   * and bound Passkey credential while rotating its bearer token and updating live descriptors.
+   */
+  rotateDeviceToken(
+    id: string,
+    patch?: {
+      name?: string;
+      platform?: string;
+      identityPubKey?: string;
+      identityFp?: string;
+    },
+  ): { device: Device; token: string } | null {
+    const cur = this.getRow(id);
+    if (!cur) return null;
+    const now = Date.now();
+    const token = `hp_${randomBytes(32).toString("base64url")}`;
+    this.db
+      .prepare(
+        `UPDATE devices
+         SET token_hash = ?,
+             last_seen_at = ?,
+             name = ?,
+             platform = ?,
+             identity_pubkey = COALESCE(?, identity_pubkey),
+             identity_fp = COALESCE(?, identity_fp)
+         WHERE id = ?`,
+      )
+      .run(
+        hashToken(token),
+        now,
+        patch?.name?.trim() || cur.name,
+        patch?.platform ?? cur.platform,
+        patch?.identityPubKey ?? null,
+        patch?.identityFp ?? null,
+        id,
+      );
+    this.dropSetupCodes();
+    const next = this.getRow(id);
+    return next ? { device: this.toDevice(next), token } : null;
+  }
+
+  findDeviceByIdentityPubKey(identityPubKey: string, kind?: DeviceKind): (Device & { identityPubKey?: string }) | null {
+    const row = kind
+      ? (this.db
+          .prepare("SELECT * FROM devices WHERE identity_pubkey = ? AND kind = ? ORDER BY last_seen_at DESC LIMIT 1")
+          .get(identityPubKey, kind) as DeviceRow | undefined)
+      : (this.db
+          .prepare("SELECT * FROM devices WHERE identity_pubkey = ? ORDER BY last_seen_at DESC LIMIT 1")
+          .get(identityPubKey) as DeviceRow | undefined);
+    return row ? { ...this.toDevice(row), ...(row.identity_pubkey ? { identityPubKey: row.identity_pubkey } : {}) } : null;
+  }
+
+  getDeviceIdentityRecord(id: string): { device: Device; identityPubKey?: string; passkeyCredId?: string } | null {
+    const r = this.getRow(id);
+    if (!r) return null;
+    return {
+      device: this.toDevice(r),
+      ...(r.identity_pubkey ? { identityPubKey: r.identity_pubkey } : {}),
+      ...(r.passkey_cred_id ? { passkeyCredId: r.passkey_cred_id } : {}),
+    };
+  }
+
+  setDevicePasskey(id: string, credId: string, publicKeySpki: string): Device | null {
+    this.db
+      .prepare("UPDATE devices SET passkey_cred_id = ?, passkey_cose_pub = ?, passkey_sign_count = 0 WHERE id = ?")
+      .run(credId, publicKeySpki, id);
+    return this.getDevice(id);
+  }
+
+  findPasskeyAuthRecord(credId: string): PasskeyAuthRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM devices WHERE passkey_cred_id = ? LIMIT 1")
+      .get(credId) as DeviceRow | undefined;
+    if (!row || !row.passkey_cose_pub) return null;
+    return {
+      device: this.toDevice(row),
+      publicKeySpki: row.passkey_cose_pub,
+      signCount: row.passkey_sign_count ?? 0,
+    };
+  }
+
+  setPasskeySignCount(id: string, signCount: number): void {
+    this.db.prepare("UPDATE devices SET passkey_sign_count = ? WHERE id = ?").run(signCount, id);
   }
 
   deviceByToken(token: string): Device | null {
@@ -347,6 +483,7 @@ export class Store {
       online: false,
       createdAt: r.created_at,
       lastSeenAt: r.last_seen_at,
+      ...(r.passkey_cred_id ? { passkeyLinked: true } : {}),
     };
   }
 }

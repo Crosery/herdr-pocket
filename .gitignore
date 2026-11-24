@@ -1,6 +1,7 @@
 node_modules/
 dist/
 !apps/relay/src/admin/dist/
+!apps/relay/src/web/dist/
 .expo/
 *.db
 *.db-*

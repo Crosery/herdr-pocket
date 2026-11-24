@@ -29,8 +29,17 @@ import { endPaneDrag, endPanelDrag, endTabDrag, endWorkspaceDrag, hasPaneDrag, h
 import { localHostIdStore, useLocalHostDeviceId } from "../lib/fonts";
 import { canActOnLocalFile, isAbsoluteOrHomePath, openLocalFileDefault, openLocalFileInBuiltinBrowser, revealInFolderLabel, revealInFolderShortLabel, revealLocalFile } from "../lib/localFileActions";
 import { isMockServer } from "../lib/mock";
-import { collapsedEntryUnitRect, easeOutQuart, lerpUnitRect, SPLIT_MOTION_MS, unitRectToCss } from "./splitMotion";
-import { type CssRect, type UnitRect } from "./splitTree";
+import {
+  beginSplitMotion,
+  collapsedEntryUnitRect,
+  easeOutQuart,
+  lerpUnitRect,
+  setInteractiveResizeActive,
+  SPLIT_MOTION_MS,
+  unitRectToCss,
+} from "./splitMotion";
+import { reportSplitTransitionPerf } from "../lib/perfTelemetry";
+import { resizeSplitPair, type CssRect, type SplitNode, type UnitRect } from "./splitTree";
 import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
 import { pingRelay, refreshHostSpaces, rpcCall, subscribeStream } from "../lib/relay";
@@ -43,6 +52,7 @@ import {
   activeTabIdForSpace,
   closeTab,
   closeTabPane,
+  commitTabSplitRoot,
   computeSplitLayout,
   cycleTab,
   detachPaneToTab,
@@ -58,7 +68,6 @@ import {
   openSettingsFrame,
   openWebTab,
   renameShellTab,
-  resizeTabSplit,
   setActiveTab,
   setPalette,
   setPaneAgentMode,
@@ -545,7 +554,7 @@ const TabChip = memo(function TabChip({
         corner="right"
         className="v3-tab-hint"
       />
-      {active ? <SpatialHint shortcut="closeWholeTab" corner="right" /> : null}
+      {active ? <SpatialHint shortcut="closeWholeTab" corner="tr" /> : null}
       <button
         className="v3-tab-x"
         aria-label={`关闭 ${title}`}
@@ -1554,7 +1563,7 @@ function PaneHead({
           >
             <X size={13} />
             {isFocused ? <SpatialHint text={shortcutText("closeTab")} corner="tr" /> : null}
-            {isFocused && isSplit ? <SpatialHint shortcut="unsplitTab" corner="tr" /> : null}
+            {isFocused && isSplit ? <SpatialHint shortcut="unsplitTab" corner="br" /> : null}
           </button>
         </div>
       </div>
@@ -1708,11 +1717,19 @@ function SplitSash({
   tabId,
   sash,
   stageRef,
+  sashElsRef,
+  onStartDrag,
+  onMoveDrag,
+  onEndDrag,
   onDraggingChange,
 }: {
   tabId: string;
   sash: SplitSashLayout;
   stageRef: React.RefObject<HTMLDivElement | null>;
+  sashElsRef: React.MutableRefObject<Map<string, HTMLDivElement>>;
+  onStartDrag: () => void;
+  onMoveDrag: (branchId: string, index: number, deltaFraction: number) => void;
+  onEndDrag: () => void;
   onDraggingChange?: (dragging: boolean) => void;
 }) {
   const dragRef = useRef<{ lastPos: number; spanPx: number } | null>(null);
@@ -1720,14 +1737,22 @@ function SplitSash({
   const rafIdRef = useRef(0);
   const [dragging, setDragging] = useState(false);
 
+  const attachRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (el) sashElsRef.current.set(sash.id, el);
+      else sashElsRef.current.delete(sash.id);
+    },
+    [sash.id, sashElsRef],
+  );
+
   const flushDragDelta = useCallback(() => {
     rafIdRef.current = 0;
     const d = dragRef.current;
     const delta = pendingDeltaRef.current;
     pendingDeltaRef.current = 0;
     if (!d || Math.abs(delta) < 0.25) return;
-    resizeTabSplit(tabId, sash.branchId, sash.index, delta / d.spanPx);
-  }, [sash.branchId, sash.index, tabId]);
+    onMoveDrag(sash.branchId, sash.index, delta / d.spanPx);
+  }, [onMoveDrag, sash.branchId, sash.index]);
 
   useEffect(() => {
     return () => {
@@ -1738,11 +1763,13 @@ function SplitSash({
       pendingDeltaRef.current = 0;
       if (dragRef.current) {
         dragRef.current = null;
+        delete document.documentElement.dataset.splitResizing;
+        onEndDrag();
         onDraggingChange?.(false);
         overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
       }
     };
-  }, [onDraggingChange]);
+  }, [onDraggingChange, onEndDrag]);
 
   const endDrag = () => {
     if (!dragRef.current) return;
@@ -1751,13 +1778,16 @@ function SplitSash({
       flushDragDelta();
     }
     dragRef.current = null;
+    delete document.documentElement.dataset.splitResizing;
     setDragging(false);
+    onEndDrag();
     onDraggingChange?.(false);
     overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
   };
 
   return (
     <div
+      ref={attachRef}
       className={`v3-split-sash ${sash.axis}${dragging ? " dragging" : ""}`}
       role="separator"
       aria-orientation={sash.axis === "row" ? "vertical" : "horizontal"}
@@ -1773,7 +1803,9 @@ function SplitSash({
         const spanPx = Math.max(140, totalPx * Math.max(0.1, sash.branchSpanScale));
         dragRef.current = { lastPos: sash.axis === "row" ? e.clientX : e.clientY, spanPx };
         pendingDeltaRef.current = 0;
+        document.documentElement.dataset.splitResizing = sash.axis;
         setDragging(true);
+        onStartDrag();
         onDraggingChange?.(true);
         overlayStore.set((p) => ({ open: p.open + 1 }));
         e.currentTarget.setPointerCapture(e.pointerId);
@@ -1808,7 +1840,7 @@ function directionalShortcutsForSibling(
   return dy >= 0 ? ["focusPaneDown", "swapPaneDown"] : ["focusPaneUp", "swapPaneUp"];
 }
 
-function SplitPaneSlot({
+const SplitPaneSlot = memo(function SplitPaneSlot({
   tabId,
   paneKey,
   item,
@@ -1818,7 +1850,7 @@ function SplitPaneSlot({
   focusedUnit,
   tabActive,
   draggingPaneId,
-  slotRef,
+  slotElsRef,
   onDraggingPaneChange,
   onSplitNewTerminal,
 }: {
@@ -1831,7 +1863,7 @@ function SplitPaneSlot({
   focusedUnit?: UnitRect | null;
   tabActive: boolean;
   draggingPaneId: string | null;
-  slotRef?: (el: HTMLDivElement | null) => void;
+  slotElsRef?: React.MutableRefObject<Map<string, HTMLDivElement>>;
   onDraggingPaneChange: (paneId: string | null) => void;
   onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
 }) {
@@ -1839,11 +1871,19 @@ function SplitPaneSlot({
   const { content } = leaf;
   const agentKey = content.kind === "agent" || content.kind === "file" ? content.agentKey : content.kind === "diff" ? content.agentKey : undefined;
   const agent = useAgent(agentKey);
-  const devices = liveStore.use((s) => s.devices);
-  const agentsMap = liveStore.use((s) => s.agents);
+  const hostDeviceId = agentKey ? (agentKey.split("/")[0] ?? "") : "";
+  const hostOffline = liveStore.use((s) => (hostDeviceId ? s.devices[hostDeviceId]?.online === false : false));
   const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
   const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
   const [dropZone, setDropZone] = useState<SplitDropZone | null>(null);
+  const attachSlotRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!slotElsRef) return;
+      if (el) slotElsRef.current.set(leaf.id, el);
+      else slotElsRef.current.delete(leaf.id);
+    },
+    [leaf.id, slotElsRef],
+  );
 
   useEffect(() => {
     if (!dropZone) return;
@@ -1942,7 +1982,7 @@ function SplitPaneSlot({
         });
         if (shellStore.get().panel === "browser") showPanel(null);
       } else if (panelItem.kind === "agent") {
-        const targetAgent = lookupAgentByKey(agentsMap, panelItem.agentKey);
+        const targetAgent = lookupAgentByKey(liveStore.get().agents, panelItem.agentKey);
         splitTabPane(
           tabId,
           leaf.id,
@@ -1984,7 +2024,7 @@ function SplitPaneSlot({
 
   return (
     <div
-      ref={slotRef}
+      ref={attachSlotRef}
       className="v3-split-slot"
       style={visible ? css : { ...css, display: "none" }}
       onPointerDownCapture={() => {
@@ -2078,7 +2118,7 @@ function SplitPaneSlot({
                 />
               ) : (
                 <div className="v3-pane-empty">
-                  <p>{devices[content.agentKey.split("/")[0] ?? ""]?.online === false ? "这台电脑暂时离线了。" : "这个 Agent 已经结束，或者它的电脑离线了。"}</p>
+                  <p>{hostOffline ? "这台电脑暂时离线了。" : "这个 Agent 已经结束，或者它的电脑离线了。"}</p>
                   <PocketButton size="sm" variant="soft" onClick={() => requestClosePane(tabId, leaf.id)}>
                     {isSplit ? "关闭此分屏" : "关闭标签"}
                   </PocketButton>
@@ -2091,15 +2131,15 @@ function SplitPaneSlot({
           <div className="v3-split-drop-preview" data-zone={dropZone} aria-hidden />
         ) : null}
         {navPair ? (
-          <>
-            <SpatialHint shortcut={navPair[0]} corner="center" className="v3-pane-nav-hint" />
-            <SpatialHint shortcut={navPair[1]} corner="center" className="v3-pane-nav-hint" />
-          </>
+          <div className="v3-pane-nav-hint-stack" aria-hidden="true">
+            <SpatialHint shortcut={navPair[0]} corner="stack" className="v3-pane-nav-hint" />
+            <SpatialHint shortcut={navPair[1]} corner="stack" className="v3-pane-nav-hint" />
+          </div>
         ) : null}
       </section>
     </div>
   );
-}
+});
 
 function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; onNewAgent: () => void }) {
   const homePage = useClientConfig().browser.homePage;
@@ -2155,7 +2195,7 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
 
 const MAX_KEPT_AGENT_TABS = 6;
 
-function TabStage({
+const TabStage = memo(function TabStage({
   tab,
   tabActive,
   draggingPaneId,
@@ -2188,7 +2228,59 @@ function TabStage({
   const prevUnitsRef = useRef<Map<string, UnitRect> | null>(null);
   const prevFocusedIdRef = useRef<string | null>(null);
   const slotElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const sashElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const liveRootRef = useRef<SplitNode>(tabRootNode(tab));
   const motionRafRef = useRef<number>(0);
+
+  if (!sashDragging) {
+    liveRootRef.current = tabRootNode(tab);
+  }
+
+  const applyDirectSplitCss = useCallback(
+    (root: SplitNode) => {
+      const computed = computeSplitLayout(root, zoomedId);
+      for (const item of computed.leaves) {
+        const el = slotElsRef.current.get(item.leaf.id);
+        if (!el) continue;
+        el.style.left = item.css.left;
+        el.style.top = item.css.top;
+        el.style.width = item.css.width;
+        el.style.height = item.css.height;
+      }
+      for (const sh of computed.sashes) {
+        const el = sashElsRef.current.get(sh.id);
+        if (!el) continue;
+        el.style.left = sh.css.left;
+        el.style.top = sh.css.top;
+        el.style.width = sh.css.width;
+        el.style.height = sh.css.height;
+      }
+    },
+    [zoomedId],
+  );
+
+  const handleSashStart = useCallback(() => {
+    liveRootRef.current = tabRootNode(tab);
+    setInteractiveResizeActive(true);
+  }, [tab]);
+
+  const handleSashMove = useCallback(
+    (branchId: string, index: number, deltaFraction: number) => {
+      const nextRoot = resizeSplitPair(liveRootRef.current, branchId, index, deltaFraction);
+      if (nextRoot === liveRootRef.current) return;
+      liveRootRef.current = nextRoot;
+      applyDirectSplitCss(nextRoot);
+    },
+    [applyDirectSplitCss],
+  );
+
+  const handleSashEnd = useCallback(() => {
+    const finalRoot = liveRootRef.current;
+    if (finalRoot !== tabRootNode(tab)) {
+      commitTabSplitRoot(tab.id, finalRoot);
+    }
+    setInteractiveResizeActive(false);
+  }, [tab]);
 
   useLayoutEffect(() => {
     const prevUnits = prevUnitsRef.current;
@@ -2224,6 +2316,9 @@ function TabStage({
       tracks.push({ el, from, to: item.unit, finalCss: item.css });
     }
     if (!tracks.length) return;
+
+    beginSplitMotion(SPLIT_MOTION_MS + 25);
+    reportSplitTransitionPerf(nextUnits.size > prevUnits.size ? "open" : "close", nextUnits.size);
 
     const applyRect = (el: HTMLDivElement, css: CssRect) => {
       el.style.left = css.left;
@@ -2270,6 +2365,14 @@ function TabStage({
     };
   }, [focusedId, sashDragging, splitLayout.leaves, zoomedId]);
 
+  const handleSashDraggingChange = useCallback(
+    (dragging: boolean) => {
+      setSashDragging(dragging);
+      if (dragging) reportSplitTransitionPerf("sash", splitLayout.leaves.length);
+    },
+    [splitLayout.leaves.length],
+  );
+
   return (
     <div ref={stageRef} className="v3-split-stage" data-sash-dragging={sashDragging ? "true" : "false"}>
       {splitLayout.leaves.map((item, idx) => (
@@ -2284,22 +2387,29 @@ function TabStage({
           focusedUnit={focusedUnit}
           tabActive={tabActive}
           draggingPaneId={draggingPaneId}
-          slotRef={(el) => {
-            if (el) slotElsRef.current.set(item.leaf.id, el);
-            else slotElsRef.current.delete(item.leaf.id);
-          }}
+          slotElsRef={slotElsRef}
           onDraggingPaneChange={onDraggingPaneChange}
           onSplitNewTerminal={onSplitNewTerminal}
         />
       ))}
       {tabActive
         ? splitLayout.sashes.map((sash) => (
-            <SplitSash key={sash.id} tabId={tab.id} sash={sash} stageRef={stageRef} onDraggingChange={setSashDragging} />
+            <SplitSash
+              key={sash.id}
+              tabId={tab.id}
+              sash={sash}
+              stageRef={stageRef}
+              sashElsRef={sashElsRef}
+              onStartDrag={handleSashStart}
+              onMoveDrag={handleSashMove}
+              onEndDrag={handleSashEnd}
+              onDraggingChange={handleSashDraggingChange}
+            />
           ))
         : null}
     </div>
   );
-}
+});
 
 export function ShellMain({
   onNewTerminal,

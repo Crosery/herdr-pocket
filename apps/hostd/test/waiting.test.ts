@@ -83,14 +83,14 @@ test("without a conversation: stopped then working again means taken; stopped lo
 test("the log ring keeps the newest lines, redacts tokens and guesses levels", () => {
   const b = new LogBuffer(3);
   for (let i = 0; i < 5; i++) b.push("info", "hostd", `line ${i}`);
-  b.push("warn", "rpc", "send failed Bearer abcdefghijkl0123 hp_abcdefghijklmnop", { url: "wss://x/v1/ws?token=hp_abcdefghijklmnop", text: "x".repeat(400) });
+  b.push("warn", "rpc", "send failed Bearer abcdefghijkl0123 hp_abcdefghijklmnop", { url: "wss://x/v1/ws?token=hp_abcdefghijklmnop", text: "x".repeat(650) });
   assert.equal(b.size, 3);
   assert.equal(b.dropped, 3);
   const out = b.take(10);
   assert.deepEqual(out.map((e) => e.msg).slice(0, 2), ["line 3", "line 4"]);
   assert.equal(out[2]!.msg, "send failed Bearer *** hp_***");
   assert.equal(out[2]!.data!.url, "wss://x/v1/ws?token=***");
-  assert.ok(String(out[2]!.data!.text).length <= 301);
+  assert.ok(String(out[2]!.data!.text).length <= 501);
   assert.equal(levelOf("relay answered 502"), "info");
   assert.equal(levelOf("disconnected, retrying in 2s"), "warn");
   assert.equal(levelOf("agent.create failed: error spawning"), "error");

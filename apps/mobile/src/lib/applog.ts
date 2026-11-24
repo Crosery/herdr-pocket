@@ -41,7 +41,7 @@ export function applog(level: LogLevel, kind: string, msg: string, data?: Record
     packed = {};
     for (const [k, v] of Object.entries(data)) {
       if (v === undefined) continue;
-      packed[k] = typeof v === "string" ? clip(redact(v), 300) : v;
+      packed[k] = typeof v === "string" ? clip(redact(v), 500) : v;
     }
   }
   ring.push({ ts: Date.now(), level, kind, msg: clip(redact(msg.replace(/\s+/g, " ").trim()), 500), data: packed });

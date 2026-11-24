@@ -359,8 +359,8 @@ export function OnboardingView({
 
   if (frame) {
     return (
-      // The frame covers the shell's drag regions, so its backdrop and header move the window (macOS overlay title bar).
-      <div className="wf-root" role="dialog" aria-modal="true" aria-label="新手引导" data-tauri-drag-region>
+      // Only the modal header acts as a drag region so top/corner OS resize cursors remain free.
+      <div className="wf-root" role="dialog" aria-modal="true" aria-label="新手引导">
         <div className="wf-card">
           <header className="wf-head" data-tauri-drag-region="deep">
             <img src={assetUrl("brand/logo-160.webp")} alt="" width={18} height={18} />

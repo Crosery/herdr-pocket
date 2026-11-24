@@ -680,10 +680,12 @@ test("renameSpaceInShellStore migrates selectedSpace, activeBySpace, panelBySpac
   assert.equal(fileTab?.kind === "file" ? fileTab.spaceKey : undefined, newSpaceKey);
 });
 
-test("terminal stability and pane-header hover guards prevent WebGL garbling and subagent jump", () => {
+test("terminal stability and pane-header hover guards cap WebGL contexts and avoid subagent jump", () => {
   const testDir = dirname(fileURLToPath(import.meta.url));
   const termSrc = readFileSync(resolve(testDir, "../src/components/TerminalSurface.tsx"), "utf8");
-  assert.equal(termSrc.includes("@xterm/addon-webgl"), false, "WebGL addon must remain disabled to prevent WKWebView glyph corruption");
+  assert.equal(termSrc.includes("MAX_ACTIVE_WEBGL = 6"), true, "WebGL addon must be pooled and bounded by MAX_ACTIVE_WEBGL");
+  assert.equal(termSrc.includes("onContextLoss"), true, "WebGL addon must detach cleanly on context loss");
+  assert.equal(termSrc.includes("detachWebgl()"), true, "WebGL addon must detach when hidden or showing Kitty underlays");
   assert.equal(termSrc.includes("useLayoutEffect("), true, "TerminalSurface should use useLayoutEffect for synchronous tab-switch repaint");
   assert.equal(termSrc.includes("term.reset();\n            return connectLocal"), false, "connectLocal size drift should resize in place instead of term.reset()");
 

@@ -286,6 +286,39 @@ export const attentionStore = createStore<AttentionState>({
 const runtimeTracker = createAttentionTracker();
 let peekTimer: number | null = null;
 let notchTimer: number | null = null;
+let lastNotchSyncJson: string | null = null;
+
+export function buildNotchSyncPayload(): Record<string, unknown> {
+  const st = attentionStore.get();
+  const notifOn = settingsStore.get().notifications;
+  const islandOn = clientConfigStore.get().config.general.dynamicIsland;
+  const visibleItems = st.items.slice(0, 12);
+  return {
+    enabled: Boolean(notifOn && islandOn),
+    items: visibleItems.map((it) => ({
+      id: it.id,
+      agentKey: it.agentKey,
+      category: it.category,
+      title: it.title,
+      subtitle: it.subtitle,
+      ts: it.ts,
+    })),
+    peek:
+      notifOn && st.peek
+        ? {
+            id: st.peek.id,
+            agentKey: st.peek.agentKey,
+            category: st.peek.category,
+            title: st.peek.title,
+            subtitle: st.peek.subtitle,
+          }
+        : null,
+  };
+}
+
+export function resetNotchSyncDedupeForTest(): void {
+  lastNotchSyncJson = null;
+}
 
 function clearPeekTimer(): void {
   if (peekTimer !== null && typeof window !== "undefined") {
@@ -306,36 +339,17 @@ function showTransientPeek(item: AttentionItem | null, durationMs = PEEK_DURATIO
   }
 }
 
-function pushNotchNow(): void {
+export function pushNotchNow(): boolean {
   if (notchTimer !== null && typeof window !== "undefined") {
     window.clearTimeout(notchTimer);
     notchTimer = null;
   }
-  const st = attentionStore.get();
-  const notifOn = settingsStore.get().notifications;
-  const islandOn = clientConfigStore.get().config.general.dynamicIsland;
-  const visibleItems = st.items.slice(0, 12);
-  void native.notchSync({
-    enabled: Boolean(notifOn && islandOn),
-    items: visibleItems.map((it) => ({
-      id: it.id,
-      agentKey: it.agentKey,
-      category: it.category,
-      title: it.title,
-      subtitle: it.subtitle,
-      ts: it.ts,
-    })),
-    peek:
-      notifOn && st.peek
-        ? {
-            id: st.peek.id,
-            agentKey: st.peek.agentKey,
-            category: st.peek.category,
-            title: st.peek.title,
-            subtitle: st.peek.subtitle,
-          }
-        : null,
-  });
+  const payload = buildNotchSyncPayload();
+  const json = JSON.stringify(payload);
+  if (json === lastNotchSyncJson) return false;
+  lastNotchSyncJson = json;
+  void native.notchSync(payload);
+  return true;
 }
 
 function scheduleNotchSync(immediate = false): void {

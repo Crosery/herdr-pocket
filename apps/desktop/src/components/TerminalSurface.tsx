@@ -1,15 +1,23 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent } from "react";
 import { ChevronDown, ChevronUp, X } from "lucide-react";
 import { Terminal as XTerm, type IMarker } from "@xterm/xterm";
-import { proposeGridFast } from "../shell/splitMotion";
+import {
+  isInteractiveResizeActive,
+  isSplitMotionActive,
+  onInteractiveResizeSettled,
+  onSplitMotionSettled,
+  proposeGridFast,
+} from "../shell/splitMotion";
 import { FitAddon } from "@xterm/addon-fit";
 import { ImageAddon } from "@xterm/addon-image";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { applyRows, configKeySpec, type Agent, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge";
 import { hasFileJumpModifier, openAgentFileTarget } from "../lib/openFileTarget";
 import { setConfig, useClientConfig } from "../lib/config";
+import { attachTerminalImeBridge, isImeKeyEvent } from "../lib/terminalIme";
 import {
   findLinkAtCell,
   findTerminalLinksForBufferLine,
@@ -67,6 +75,7 @@ import {
 } from "../lib/kittyProtocol";
 import { logAction, logger } from "../lib/log";
 import { native, type LocalTermCloseEvent, type LocalTermSizeEvent } from "../lib/native";
+import { registerWebglCounter } from "../lib/perfTelemetry";
 import { ingestPortalStreamEvent } from "../lib/portalClient";
 import { rpcCall, subscribeStream } from "../lib/relay";
 import { settingsStore } from "../lib/store";
@@ -84,6 +93,14 @@ import { useToast } from "./PocketUI";
 import "../styles/terminal.css";
 
 const tauriEventPromise = native.available() ? import("@tauri-apps/api/event") : null;
+
+const MAX_ACTIVE_WEBGL = 6;
+let activeWebglCount = 0;
+registerWebglCounter(() => activeWebglCount);
+
+export function getActiveWebglTerminalCount(): number {
+  return activeWebglCount;
+}
 
 export { buildTerminalFontFamily };
 
@@ -115,10 +132,43 @@ interface KittyPlacement {
   cropH?: number;
   cellOffsetX?: number;
   cellOffsetY?: number;
-  placedOnBlankCells?: boolean;
 }
 
 const IS_WINDOWS = detectPlatform() === "windows";
+const SYNC_OPEN_BYTES = [0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x32, 0x36, 0x68] as const;
+const SYNC_CLOSE_BYTES = [0x1b, 0x5b, 0x3f, 0x32, 0x30, 0x32, 0x36, 0x6c] as const;
+
+function findLastSeqInChunks(chunks: Uint8Array[], seq: readonly number[]): number {
+  let offset = 0;
+  let lastFound = -1;
+  const n = seq.length;
+  for (const chunk of chunks) {
+    if (chunk.length >= n) {
+      for (let i = chunk.length - n; i >= 0; i--) {
+        let match = true;
+        for (let k = 0; k < n; k++) {
+          if (chunk[i + k] !== seq[k]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          lastFound = offset + i;
+          break;
+        }
+      }
+    }
+    offset += chunk.length;
+  }
+  return lastFound;
+}
+
+function chunksHaveOpenSyncOutput(chunks: Uint8Array[]): boolean {
+  const openPos = findLastSeqInChunks(chunks, SYNC_OPEN_BYTES);
+  if (openPos < 0) return false;
+  const closePos = findLastSeqInChunks(chunks, SYNC_CLOSE_BYTES);
+  return openPos > closePos;
+}
 
 interface Osc66Run {
   key: string;
@@ -290,6 +340,9 @@ export function TerminalSurface({
   const overlayRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const webglRef = useRef<WebglAddon | null>(null);
+  const attachWebglRef = useRef<(() => void) | null>(null);
+  const detachWebglRef = useRef<(() => void) | null>(null);
   const localConnRef = useRef<string | null>(null);
   const relayPendingRef = useRef("");
   const relayFlushingRef = useRef(false);
@@ -304,6 +357,9 @@ export function TerminalSurface({
   const appliedVisualSigRef = useRef("");
   const ptySizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const externalSizeOverrideRef = useRef(false);
+  const lastObservedBoxRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const resizeHudTimerRef = useRef<number>(0);
+  const [resizeHud, setResizeHud] = useState<{ cols: number; rows: number } | null>(null);
   const reattachLocalRef = useRef<(() => void) | null>(null);
   const clearOverlaysRef = useRef<(() => void) | null>(null);
   const onMissingVirtualAssetRef = useRef<(() => void) | null>(null);
@@ -663,10 +719,10 @@ export function TerminalSurface({
               const cellPxW = Math.max(1, cellW * dpr);
               const cellPxH = Math.max(1, cellH * dpr);
               if (placement.explicitCols === undefined) {
-                placement.cols = Math.max(1, Math.min(term.cols, Math.ceil(asset.width / cellPxW)));
+                placement.cols = Math.max(1, Math.ceil(asset.width / cellPxW));
               }
               if (placement.explicitRows === undefined) {
-                placement.rows = Math.max(1, Math.min(term.rows, Math.ceil(asset.height / cellPxH)));
+                placement.rows = Math.max(1, Math.ceil(asset.height / cellPxH));
               }
             }
             requestAnimationFrame(paintOverlays);
@@ -777,7 +833,6 @@ export function TerminalSurface({
     if (kittyPlacementsRef.current.length > 0) {
       const keptPlacements: KittyPlacement[] = [];
       let changedPlacements = false;
-      const cellScratch = buf.getNullCell();
       for (const p of kittyPlacementsRef.current) {
         if (!p.alt && p.endMarker) {
           if (p.endMarker.isDisposed || p.endMarker.line < 0) {
@@ -787,30 +842,6 @@ export function TerminalSurface({
           }
           if (p.endMarker.line !== p.bufferY) {
             p.bufferY = p.endMarker.line;
-          }
-        }
-        if (p.alt === curAlt && !p.alt && p.placedOnBlankCells) {
-          let overwritten = false;
-          const maxRow = Math.min(buf.length, p.bufferY + Math.max(1, p.rows));
-          const maxCol = Math.min(term.cols, p.col + Math.max(1, p.cols));
-          const rowStep = maxRow - p.bufferY > 8 ? Math.ceil((maxRow - p.bufferY) / 6) : 1;
-          const colStep = maxCol - p.col > 16 ? Math.ceil((maxCol - p.col) / 8) : 1;
-          for (let y = Math.max(0, p.bufferY); y < maxRow && !overwritten; y += rowStep) {
-            const line = buf.getLine(y);
-            if (!line) continue;
-            for (let x = Math.max(0, p.col); x < maxCol; x += colStep) {
-              const c = line.getCell(x, cellScratch);
-              const ch = c?.getChars() ?? "";
-              if (ch && ch !== " " && !ch.startsWith(KITTY_SENTINEL_PREFIX)) {
-                overwritten = true;
-                break;
-              }
-            }
-          }
-          if (overwritten) {
-            p.endMarker?.dispose();
-            changedPlacements = true;
-            continue;
           }
         }
         keptPlacements.push(p);
@@ -827,8 +858,16 @@ export function TerminalSurface({
       const key = `kp:${p.key}`;
       const left = Math.round(p.col * cellW + (p.cellOffsetX ?? 0) / dpr);
       const top = Math.round((p.bufferY - topY) * cellH + (p.cellOffsetY ?? 0) / dpr);
-      const boxW = Math.max(cellW, Math.round(p.cols * cellW));
-      const boxH = Math.max(cellH, Math.round(p.rows * cellH));
+      const isDirectPixel =
+        p.explicitCols === undefined &&
+        p.explicitRows === undefined &&
+        !asset.needsMeasure &&
+        asset.width > 0 &&
+        asset.height > 0;
+      const directSrcW = isDirectPixel ? (p.cropW && p.cropW > 0 ? p.cropW : asset.width) : 0;
+      const directSrcH = isDirectPixel ? (p.cropH && p.cropH > 0 ? p.cropH : asset.height) : 0;
+      const boxW = isDirectPixel ? Math.max(1, Math.round(directSrcW / dpr)) : Math.max(cellW, Math.round(p.cols * cellW));
+      const boxH = isDirectPixel ? Math.max(1, Math.round(directSrcH / dpr)) : Math.max(cellH, Math.round(p.rows * cellH));
       const zNum = p.zIndex;
       const zIndex = zNum < 0 ? String(Math.max(1, 100 + Math.max(-99, zNum))) : String(Math.max(1, 5 + zNum));
 
@@ -922,7 +961,7 @@ export function TerminalSurface({
       for (const block of virtualBlocks) {
         const asset = kittyAssetsRef.current.get(block.imageId);
         if (!asset) {
-          if (curAlt) missingVirtual = true;
+          missingVirtual = true;
           continue;
         }
         const vdims = lookupKittyVirtualPlacement(kittyVirtualDimsRef.current, block.imageId, block.placementId, curAlt);
@@ -1061,6 +1100,11 @@ export function TerminalSurface({
 
     syncContainerChildren(underlay ?? null, orderedUnderlayEls);
     syncContainerChildren(overlay, orderedOverlayEls);
+    if (orderedUnderlayEls.length > 0) {
+      detachWebglRef.current?.();
+    } else if (activeRef.current) {
+      attachWebglRef.current?.();
+    }
   }, [fontFamily]);
 
   const visualSig = useCallback(
@@ -1196,8 +1240,41 @@ export function TerminalSurface({
     centerScreenVerticalGap(hostEl, term);
     bracketedPasteRef.current = false;
 
-    // Render with xterm's DOM renderer (+ ImageAddon) instead of WKWebView WebGL2 so
-    // shared TextureAtlas corruption and hidden-tab context drops cannot garble or blank terminals.
+    // GPU WebGL rendering runs strictly on visible, active panes (up to MAX_ACTIVE_WEBGL)
+    // and detaches immediately when hidden or underlaid so WKWebView never retains stale atlases.
+    const detachWebgl = () => {
+      const addon = webglRef.current;
+      if (!addon) return;
+      webglRef.current = null;
+      activeWebglCount = Math.max(0, activeWebglCount - 1);
+      try {
+        addon.dispose();
+      } catch {
+        // ignore already disposed addon
+      }
+    };
+    const attachWebgl = () => {
+      if (!alive || termRef.current !== term) return;
+      if (!activeRef.current || (underlayRef.current?.childElementCount ?? 0) > 0) {
+        detachWebgl();
+        return;
+      }
+      if (webglRef.current || activeWebglCount >= MAX_ACTIVE_WEBGL) return;
+      try {
+        const addon = new WebglAddon();
+        addon.onContextLoss(() => {
+          if (webglRef.current === addon) detachWebgl();
+        });
+        term.loadAddon(addon);
+        webglRef.current = addon;
+        activeWebglCount += 1;
+      } catch {
+        // Environments without WebGL2 fall back cleanly to xterm's DOM renderer.
+      }
+    };
+    attachWebglRef.current = attachWebgl;
+    detachWebglRef.current = detachWebgl;
+    attachWebgl();
 
     // Ensure OS / Herdr / Nerd fonts load asynchronously right after opening without flashing an already-ready atlas.
     const fontWeightSpec = termCfg.fontWeight >= 600 ? 600 : 400;
@@ -1233,7 +1310,6 @@ export function TerminalSurface({
         orphanNudgeTimer = 0;
         if (!alive || didOrphanNudge || termRef.current !== term) return;
         const buf = term.buffer.active;
-        if (buf !== term.buffer.alternate) return;
         const scratch = buf.getNullCell();
         const blocks = collectVirtualSpriteBlocks(buf.viewportY, buf.viewportY + term.rows, term.cols, (absY, x, out) => {
           const line = buf.getLine(absY);
@@ -1296,7 +1372,7 @@ export function TerminalSurface({
 
     const flushOverlaySoon = () => {
       if (!hasOverlayContent()) {
-        if (!didOrphanNudge && isAlt() && kittyAssetsRef.current.size === 0) {
+        if (!didOrphanNudge && kittyAssetsRef.current.size === 0) {
           scheduleOrphanVirtualNudge();
         }
         return;
@@ -1780,6 +1856,9 @@ export function TerminalSurface({
       syncResize(term, true);
     };
     const textarea = term.textarea;
+    const imeBridge = attachTerminalImeBridge(textarea, (data) => {
+      void sendInput(data);
+    });
     const onTermFocus = () => {
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
       if (nowMs - lastActivateAtRef.current < 80) return;
@@ -1803,6 +1882,7 @@ export function TerminalSurface({
     // Key handling: preserve global app shortcuts (⌘T/⌘W/⌘P/...), Herdr macOS keys, and Kitty CSI u.
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
       if (e.type === "keyup") return true;
+      if (isImeKeyEvent(e) || imeBridge.isComposing()) return true;
       if (e.type !== "keydown") {
         // Prevent xterm's CoreBrowserTerminal._keyPress from emitting a stray "\r" after modified Enter.
         if (
@@ -1939,7 +2019,7 @@ export function TerminalSurface({
     });
 
     const dispData = term.onData((data) => {
-      void sendInput(data);
+      imeBridge.handleXtermData(data);
     });
 
     // Kitty Graphics APC command state
@@ -1968,33 +2048,6 @@ export function TerminalSurface({
     const captureAnchor = (): KittyAnchor => {
       const buf = term.buffer.active;
       return { bufferY: buf.baseY + buf.cursorY, col: buf.cursorX, alt: isAlt(), colReady: true, rowReady: true };
-    };
-
-    const samplePlacedOnBlankCells = (
-      buf: typeof term.buffer.active,
-      alt: boolean,
-      bufferY: number,
-      col: number,
-      cols: number,
-      rows: number,
-      zIndex: number,
-    ): boolean => {
-      if (alt || zIndex < 0) return false;
-      const scratch = buf.getNullCell();
-      const maxRow = Math.min(buf.length, bufferY + Math.max(1, rows));
-      const maxCol = Math.min(term.cols, col + Math.max(1, cols));
-      const rowStep = maxRow - bufferY > 6 ? Math.ceil((maxRow - bufferY) / 4) : 1;
-      const colStep = maxCol - col > 12 ? Math.ceil((maxCol - col) / 6) : 1;
-      for (let y = Math.max(0, bufferY); y < maxRow; y += rowStep) {
-        const line = buf.getLine(y);
-        if (!line) continue;
-        for (let x = Math.max(0, col); x < maxCol; x += colStep) {
-          const c = line.getCell(x, scratch);
-          const ch = c?.getChars() ?? "";
-          if (ch && ch !== " " && !ch.startsWith(KITTY_SENTINEL_PREFIX)) return false;
-        }
-      }
-      return true;
     };
 
     const pushPlacement = (
@@ -2030,7 +2083,6 @@ export function TerminalSurface({
         cropH: cmd.cropH,
         cellOffsetX: cmd.cellOffsetX,
         cellOffsetY: cmd.cellOffsetY,
-        placedOnBlankCells: samplePlacedOnBlankCells(buf, anchor.alt, anchor.bufferY, anchor.col, cols, rows, cmd.zIndex),
       };
       if (cmd.placementId !== undefined && cmd.placementId > 0) {
         const idx = kittyPlacementsRef.current.findIndex(
@@ -2111,13 +2163,13 @@ export function TerminalSurface({
         rows = cmd.rows;
       } else if (cmd.cols !== undefined && pxW && pxH) {
         cols = cmd.cols;
-        rows = Math.max(1, Math.min(term.rows, Math.round((cmd.cols * cellPxW * pxH) / (pxW * cellPxH))));
+        rows = Math.max(1, Math.round((cmd.cols * cellPxW * pxH) / (pxW * cellPxH)));
       } else if (cmd.rows !== undefined && pxW && pxH) {
         rows = cmd.rows;
-        cols = Math.max(1, Math.min(term.cols, Math.round((cmd.rows * cellPxH * pxW) / (pxH * cellPxW))));
+        cols = Math.max(1, Math.round((cmd.rows * cellPxH * pxW) / (pxH * cellPxW)));
       } else {
-        cols = cmd.cols ?? (pxW ? Math.max(1, Math.min(term.cols, Math.ceil(pxW / cellPxW))) : 1);
-        rows = cmd.rows ?? (pxH ? Math.max(1, Math.min(term.rows, Math.ceil(pxH / cellPxH))) : 1);
+        cols = cmd.cols ?? (pxW ? Math.max(1, Math.ceil(pxW / cellPxW)) : 1);
+        rows = cmd.rows ?? (pxH ? Math.max(1, Math.ceil(pxH / cellPxH)) : 1);
       }
       return { cols, rows, colsKnown, rowsKnown };
     };
@@ -2570,12 +2622,15 @@ export function TerminalSurface({
     let flushTimer = 0;
     let pendingByteCount = 0;
     let sawAnyOutput = false;
-    const OUTPUT_CLOCK_MS = 33;
+    let syncHoldDeadline = 0;
     const INPUT_FAST_MS = 200;
     const FLUSH_BYTE_CAP = 512 * 1024;
+    const HIDDEN_OUTPUT_CLOCK_MS = 64;
+    const SYNC_HOLD_MAX_MS = 32;
 
     const flushPendingBytes = () => {
       flushMicroQueued = false;
+      syncHoldDeadline = 0;
       if (flushTimer) {
         window.clearTimeout(flushTimer);
         flushTimer = 0;
@@ -2603,12 +2658,36 @@ export function TerminalSurface({
       pendingBytes.push(bytes);
       pendingByteCount += bytes.length;
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
-      const fastEcho = !sawAnyOutput || nowMs - lastInputAtRef.current < INPUT_FAST_MS || pendingByteCount >= FLUSH_BYTE_CAP;
+      const hitCap = pendingByteCount >= FLUSH_BYTE_CAP;
+
+      // DEC ?2026 synchronized output: hold briefly (<= 32ms) so full-screen TUI / SIGWINCH
+      // redraws commit atomically on a single VSync frame without mid-frame blanking or tearing.
+      if (!hitCap && chunksHaveOpenSyncOutput(pendingBytes)) {
+        if (!syncHoldDeadline) syncHoldDeadline = nowMs + SYNC_HOLD_MAX_MS;
+        const remainMs = syncHoldDeadline - nowMs;
+        if (remainMs > 2) {
+          if (flushRaf) {
+            cancelAnimationFrame(flushRaf);
+            flushRaf = 0;
+          }
+          if (!flushTimer) {
+            flushTimer = window.setTimeout(flushPendingBytes, Math.min(SYNC_HOLD_MAX_MS, Math.ceil(remainMs)));
+          }
+          return;
+        }
+      }
+      syncHoldDeadline = 0;
+
+      const fastEcho = !sawAnyOutput || nowMs - lastInputAtRef.current < INPUT_FAST_MS || hitCap;
       sawAnyOutput = true;
       if (fastEcho) {
         if (flushTimer) {
           window.clearTimeout(flushTimer);
           flushTimer = 0;
+        }
+        if (flushRaf) {
+          cancelAnimationFrame(flushRaf);
+          flushRaf = 0;
         }
         if (!flushMicroQueued) {
           flushMicroQueued = true;
@@ -2618,8 +2697,24 @@ export function TerminalSurface({
         }
         return;
       }
+      const isVisible =
+        activeRef.current &&
+        (typeof document === "undefined" || document.visibilityState === "visible");
+      if (isVisible && typeof requestAnimationFrame === "function") {
+        if (flushTimer) {
+          window.clearTimeout(flushTimer);
+          flushTimer = 0;
+        }
+        if (!flushMicroQueued && !flushRaf) {
+          flushRaf = requestAnimationFrame(() => {
+            flushRaf = 0;
+            flushPendingBytes();
+          });
+        }
+        return;
+      }
       if (!flushMicroQueued && !flushTimer) {
-        flushTimer = window.setTimeout(flushPendingBytes, OUTPUT_CLOCK_MS);
+        flushTimer = window.setTimeout(flushPendingBytes, HIDDEN_OUTPUT_CLOCK_MS);
       }
     };
 
@@ -2874,13 +2969,40 @@ export function TerminalSurface({
     let resizeRaf = 0;
     let resizeSettleTimer = 0;
     let lastPtySyncAt = 0;
-    let pendingRectW = 0;
-    let pendingRectH = 0;
-    const applyLiveResize = (rectW: number, rectH: number) => {
+    let lastLiveResizeAt = 0;
+    let lastResizeCostMs = 0;
+    let pendingRectW = hostEl.clientWidth;
+    let pendingRectH = hostEl.clientHeight;
+    if (pendingRectW > 0 && pendingRectH > 0) {
+      lastObservedBoxRef.current = { w: pendingRectW, h: pendingRectH };
+    }
+    let offSplitSettle: (() => void) | null = null;
+    let offInteractiveSettle: (() => void) | null = null;
+
+    const flashResizeHud = (cols: number, rows: number) => {
+      if (!alive || !activeRef.current) return;
+      setResizeHud((prev) => (prev && prev.cols === cols && prev.rows === rows ? prev : { cols, rows }));
+      if (resizeHudTimerRef.current) window.clearTimeout(resizeHudTimerRef.current);
+      resizeHudTimerRef.current = window.setTimeout(() => {
+        resizeHudTimerRef.current = 0;
+        if (alive) setResizeHud(null);
+      }, 360);
+    };
+
+    const applyLiveResize = (rectW: number, rectH: number, showHud = false) => {
       if (!alive || !activeRef.current || !hostRef.current) return;
       const w = rectW > 0 ? rectW : hostRef.current.clientWidth;
       const h = rectH > 0 ? rectH : hostRef.current.clientHeight;
       if (w <= 0 || h <= 0) return;
+
+      const prevBox = lastObservedBoxRef.current;
+      const boxChanged = Math.abs(w - prevBox.w) >= 1 || Math.abs(h - prevBox.h) >= 1;
+      const canClaimLayout =
+        typeof document === "undefined" || document.hasFocus() || isInteractiveResizeActive();
+      if (boxChanged) {
+        lastObservedBoxRef.current = { w, h };
+        if (canClaimLayout) externalSizeOverrideRef.current = false;
+      }
       if (externalSizeOverrideRef.current && !paneOwnsFocus()) return;
       externalSizeOverrideRef.current = false;
 
@@ -2893,17 +3015,36 @@ export function TerminalSurface({
         syncResize(term);
         return;
       }
-      if (grid.cols !== term.cols || grid.rows !== term.rows) {
+      const dimsChanged = grid.cols !== term.cols || grid.rows !== term.rows;
+      if (dimsChanged) {
+        const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
         term.resize(grid.cols, grid.rows);
+        lastResizeCostMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
+        if (showHud && prevBox.w > 0 && prevBox.h > 0) {
+          flashResizeHud(grid.cols, grid.rows);
+        }
       }
       centerScreenVerticalGap(hostRef.current, term);
       paintOverlays();
 
       const now = typeof performance !== "undefined" ? performance.now() : Date.now();
-      if (now - lastPtySyncAt >= 55) {
+      const inInteractive =
+        isInteractiveResizeActive() || Boolean(hostEl.closest('[data-sash-dragging="true"]'));
+      if (now - lastPtySyncAt >= (inInteractive ? 65 : 55)) {
         lastPtySyncAt = now;
         flushPtyResize(term);
       }
+    };
+
+    const scheduleSettleFlush = (delayMs: number) => {
+      if (resizeSettleTimer) window.clearTimeout(resizeSettleTimer);
+      resizeSettleTimer = window.setTimeout(() => {
+        resizeSettleTimer = 0;
+        if (!alive || isSplitMotionActive() || isInteractiveResizeActive()) return;
+        applyLiveResize(hostRef.current?.clientWidth ?? pendingRectW, hostRef.current?.clientHeight ?? pendingRectH, false);
+        lastPtySyncAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+        flushPtyResize(term);
+      }, delayMs);
     };
 
     const ro = new ResizeObserver((entries) => {
@@ -2912,20 +3053,44 @@ export function TerminalSurface({
         pendingRectW = last.contentRect.width;
         pendingRectH = last.contentRect.height;
       }
+      if (isSplitMotionActive()) {
+        if (!offSplitSettle) {
+          offSplitSettle = onSplitMotionSettled(() => {
+            offSplitSettle = null;
+            if (!alive || !activeRef.current || !hostRef.current) return;
+            applyLiveResize(hostRef.current.clientWidth || pendingRectW, hostRef.current.clientHeight || pendingRectH, false);
+            lastPtySyncAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+            flushPtyResize(term);
+          });
+        }
+        return;
+      }
+
+      const inInteractive =
+        isInteractiveResizeActive() || Boolean(hostEl.closest('[data-sash-dragging="true"]'));
+      if (inInteractive && !offInteractiveSettle) {
+        offInteractiveSettle = onInteractiveResizeSettled(() => {
+          offInteractiveSettle?.();
+          offInteractiveSettle = null;
+          scheduleSettleFlush(24);
+        });
+      }
+
+      const frameIntervalMs = lastResizeCostMs >= 6 ? 32 : 16;
       if (!resizeRaf) {
         resizeRaf = requestAnimationFrame(() => {
           resizeRaf = 0;
-          applyLiveResize(pendingRectW, pendingRectH);
+          if (isSplitMotionActive()) return;
+          const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+          if (now - lastLiveResizeAt < frameIntervalMs) {
+            scheduleSettleFlush(inInteractive ? 45 : 75);
+            return;
+          }
+          lastLiveResizeAt = now;
+          applyLiveResize(pendingRectW, pendingRectH, true);
         });
       }
-      if (resizeSettleTimer) window.clearTimeout(resizeSettleTimer);
-      resizeSettleTimer = window.setTimeout(() => {
-        resizeSettleTimer = 0;
-        if (!alive) return;
-        applyLiveResize(hostRef.current?.clientWidth ?? pendingRectW, hostRef.current?.clientHeight ?? pendingRectH);
-        lastPtySyncAt = typeof performance !== "undefined" ? performance.now() : Date.now();
-        flushPtyResize(term);
-      }, 110);
+      scheduleSettleFlush(inInteractive ? 85 : 100);
     });
     ro.observe(hostEl);
 
@@ -2961,6 +3126,17 @@ export function TerminalSurface({
       window.clearTimeout(orphanNudgeTimer);
       onMissingVirtualAssetRef.current = null;
       clearOverlaysRef.current = null;
+      if (attachWebglRef.current === attachWebgl) attachWebglRef.current = null;
+      if (detachWebglRef.current === detachWebgl) detachWebglRef.current = null;
+      detachWebgl();
+      offSplitSettle?.();
+      offSplitSettle = null;
+      offInteractiveSettle?.();
+      offInteractiveSettle = null;
+      if (resizeHudTimerRef.current) {
+        window.clearTimeout(resizeHudTimerRef.current);
+        resizeHudTimerRef.current = 0;
+      }
       if (resizeSettleTimer) window.clearTimeout(resizeSettleTimer);
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
       flushMicroQueued = false;
@@ -3009,6 +3185,7 @@ export function TerminalSurface({
       dispResetKeys.dispose();
       dispLinkProvider.dispose();
       dispData.dispose();
+      imeBridge.dispose();
       document.removeEventListener("copy", onDocumentCopy, true);
       activeDragCleanup?.();
       hostEl.removeEventListener("mousemove", onHostMouseMoveHover);
@@ -3064,7 +3241,11 @@ export function TerminalSurface({
     if (localConnId) {
       void localTermFocus(localConnId, active && focused);
     }
-    if (!active || !termRef.current) return;
+    if (!active || !termRef.current) {
+      detachWebglRef.current?.();
+      return;
+    }
+    attachWebglRef.current?.();
     const term = termRef.current;
     lastActivateAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (externalSizeOverrideRef.current) {
@@ -3235,12 +3416,13 @@ export function TerminalSurface({
     () =>
       ({
         "--tp-term-bg": activeSpec.bg,
+        "--tp-term-fg": activeSpec.fg,
         "--tp-term-scroll": activeSpec.mode === "light" ? "rgba(0, 0, 0, 0.22)" : "rgba(255, 255, 255, 0.18)",
         "--tp-term-scroll-hover": activeSpec.mode === "light" ? "rgba(0, 0, 0, 0.42)" : "rgba(255, 255, 255, 0.34)",
         "--tp-term-drop-bg": activeSpec.mode === "light" ? "rgba(255, 255, 255, 0.88)" : "rgba(23, 25, 29, 0.86)",
         "--tp-term-drop-fg": activeSpec.mode === "light" ? "#25272c" : "#f0f0f2",
       }) as CSSProperties,
-    [activeSpec.bg, activeSpec.mode],
+    [activeSpec.bg, activeSpec.fg, activeSpec.mode],
   );
 
   return (
@@ -3291,6 +3473,11 @@ export function TerminalSurface({
       <div ref={hostRef} className="tp-term-host" />
       <div ref={underlayRef} className="tp-term-underlay" aria-hidden />
       <div ref={overlayRef} className="tp-term-overlay" aria-hidden />
+      {resizeHud ? (
+        <div className="tp-resize-hud num" aria-hidden="true">
+          {resizeHud.cols} × {resizeHud.rows}
+        </div>
+      ) : null}
       {searchOpen ? (
         <div
           className="tp-term-search"

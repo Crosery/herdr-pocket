@@ -11,7 +11,9 @@ import {
   classifyAttentionCategory,
   createAttentionTracker,
   jumpToAttentionAgent,
+  pushNotchNow,
   reconcileAttentionSnapshot,
+  resetNotchSyncDedupeForTest,
   sortAttentionItems,
   type AttentionItem,
 } from "../src/lib/attentionCenter.ts";
@@ -178,4 +180,22 @@ test("jumpToAttentionAgent activates existing split pane across spaces, unzooms 
   assert.equal(workTab?.split?.zoomedPaneId, undefined);
   assert.equal(tabLeaves(workTab!).length, 2);
   assert.equal(attentionStore.get().items.length, 0);
+});
+
+test("pushNotchNow skips duplicate serialized notch payloads", () => {
+  resetNotchSyncDedupeForTest();
+  attentionStore.set({
+    items: [{ id: "d1/hc:a:done", agentKey: "d1/hc:a", category: "completed", title: "Done", subtitle: "ok", ts: 1234 }],
+    peek: null,
+    windowFocused: true,
+  });
+  assert.equal(pushNotchNow(), true);
+  assert.equal(pushNotchNow(), false);
+  attentionStore.set({
+    items: [{ id: "d1/hc:a:done", agentKey: "d1/hc:a", category: "completed", title: "Done 2", subtitle: "ok", ts: 1235 }],
+    peek: null,
+    windowFocused: true,
+  });
+  assert.equal(pushNotchNow(), true);
+  assert.equal(pushNotchNow(), false);
 });

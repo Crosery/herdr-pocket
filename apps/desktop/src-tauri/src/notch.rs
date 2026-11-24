@@ -32,6 +32,30 @@ pub struct NotchFrame {
 
 static LATEST_STATE: Mutex<Option<Value>> = Mutex::new(None);
 static EXPANDED: AtomicBool = AtomicBool::new(false);
+static LAST_SYNC_STATE: Mutex<Option<(String, bool)>> = Mutex::new(None);
+static LAST_APPLIED_GEOM: Mutex<Option<(i64, i64, i64, i64, bool)>> = Mutex::new(None);
+
+fn should_skip_sync(cache: &Mutex<Option<(String, bool)>>, state: &Value, expanded: bool) -> bool {
+    let serialized = state.to_string();
+    if let Ok(mut g) = cache.lock() {
+        if let Some((prev_json, prev_expanded)) = g.as_ref() {
+            if *prev_json == serialized && *prev_expanded == expanded {
+                return true;
+            }
+        }
+        *g = Some((serialized, expanded));
+    }
+    false
+}
+
+fn clear_sync_caches() {
+    if let Ok(mut g) = LAST_SYNC_STATE.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = LAST_APPLIED_GEOM.lock() {
+        *g = None;
+    }
+}
 
 /// Pure cross-platform frame calculator for hardware-notch and standard displays.
 pub fn compute_notch_frame(
@@ -125,63 +149,24 @@ fn should_be_visible(state: &Value) -> bool {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{compute_notch_frame, NotchFrame, NotchViewMode};
-    use objc2::declare::ClassBuilder;
-    use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
+    use objc2::runtime::Bool;
     use objc2::{msg_send, sel};
     use objc2_app_kit::{NSColor, NSScreen, NSWindow, NSWindowCollectionBehavior};
-    use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSRect};
-    use std::ffi::CStr;
-    use std::sync::OnceLock;
-
-    const SUBCLASS_NAME: &CStr = c"PocketNotchWindow";
-    static SUBCLASS_ADDR: OnceLock<usize> = OnceLock::new();
-
-    unsafe extern "C-unwind" fn constrain_frame_rect(
-        _this: *mut AnyObject,
-        _cmd: Sel,
-        frame_rect: NSRect,
-        _screen: *mut AnyObject,
-    ) -> NSRect {
-        frame_rect
-    }
+    use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect};
 
     pub fn configure_window(w: &tauri::WebviewWindow) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
         let Ok(ptr) = w.ns_window() else {
             return;
         };
         if ptr.is_null() {
             return;
         }
-        let ns_obj = ptr as *mut AnyObject;
-        // SAFETY: Always invoked on main thread via `app.run_on_main_thread`.
+        // SAFETY: Always invoked once at creation on the main thread via `ensure()`.
+        // Never mutate `isa` / object_setClass on NSKVONotifying_* subclasses.
         unsafe {
-            let base_cls = (&*ns_obj).class();
-            let sub_addr = *SUBCLASS_ADDR.get_or_init(|| {
-                if let Some(existing) = AnyClass::get(SUBCLASS_NAME) {
-                    return existing as *const AnyClass as usize;
-                }
-                if let Some(mut builder) = ClassBuilder::new(SUBCLASS_NAME, base_cls) {
-                    builder.add_method(
-                        sel!(constrainFrameRect:toScreen:),
-                        constrain_frame_rect
-                            as unsafe extern "C-unwind" fn(
-                                *mut AnyObject,
-                                Sel,
-                                NSRect,
-                                *mut AnyObject,
-                            ) -> NSRect,
-                    );
-                    let cls = builder.register();
-                    cls as *const AnyClass as usize
-                } else {
-                    base_cls as *const AnyClass as usize
-                }
-            });
-            let sub_cls = sub_addr as *const AnyClass;
-            if !std::ptr::eq(base_cls, sub_cls) {
-                objc2::ffi::object_setClass(ns_obj.cast(), sub_cls.cast());
-            }
-
             let ns_win = &*(ptr as *const NSWindow);
             ns_win.setLevel(26);
             ns_win.setHasShadow(false);
@@ -200,6 +185,9 @@ mod macos {
     }
 
     pub fn order_front_non_activating(w: &tauri::WebviewWindow) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
         let Ok(ptr) = w.ns_window() else {
             return;
         };
@@ -209,6 +197,45 @@ mod macos {
         unsafe {
             let ns_win = &*(ptr as *const NSWindow);
             ns_win.orderFrontRegardless();
+        }
+    }
+
+    pub fn align_top_origin_if_needed(w: &tauri::WebviewWindow, frame: NotchFrame) {
+        if !frame.has_notch && frame.y > 8.0 {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Ok(ptr) = w.ns_window() else {
+            return;
+        };
+        if ptr.is_null() {
+            return;
+        }
+        let screens = NSScreen::screens(mtm);
+        let ns_win = unsafe { &*(ptr as *const NSWindow) };
+        let win_frame = ns_win.frame();
+        let target_screen = screens
+            .iter()
+            .find(|s| {
+                let sf = s.frame();
+                win_frame.origin.x >= sf.origin.x - 2.0
+                    && win_frame.origin.x <= sf.origin.x + sf.size.width + 2.0
+                    && win_frame.origin.y >= sf.origin.y - 2.0
+                    && win_frame.origin.y <= sf.origin.y + sf.size.height + 2.0
+            })
+            .or_else(|| NSScreen::mainScreen(mtm));
+        let Some(screen) = target_screen else {
+            return;
+        };
+        let sf = screen.frame();
+        let top_offset = if frame.has_notch { 0.0 } else { 4.0 };
+        let desired_x = sf.origin.x + ((sf.size.width - frame.width) / 2.0).max(0.0);
+        let desired_y = sf.origin.y + sf.size.height - top_offset - frame.height;
+        if (win_frame.origin.x - desired_x).abs() > 1.0 || (win_frame.origin.y - desired_y).abs() > 1.0
+        {
+            ns_win.setFrameOrigin(NSPoint::new(desired_x, desired_y));
         }
     }
 
@@ -312,6 +339,9 @@ fn push_state(app: &AppHandle, state: &Value, frame: NotchFrame, mode: NotchView
 fn apply_layout_and_push(app: &AppHandle, state: &Value) {
     if !should_be_visible(state) {
         EXPANDED.store(false, Ordering::Relaxed);
+        if let Ok(mut g) = LAST_APPLIED_GEOM.lock() {
+            *g = None;
+        }
         if let Some(w) = app.get_webview_window(LABEL) {
             let _ = w.set_ignore_cursor_events(true);
             let _ = w.hide();
@@ -322,14 +352,36 @@ fn apply_layout_and_push(app: &AppHandle, state: &Value) {
     let Some(w) = ensure(app) else {
         return;
     };
-    macos::configure_window(&w);
     let mode = current_mode(state);
     let frame = macos::measure_frame(app, mode);
-    let _ = w.set_size(LogicalSize::new(frame.width, frame.height));
-    let _ = w.set_position(LogicalPosition::new(frame.x, frame.y));
-    let _ = w.set_ignore_cursor_events(false);
-    let _ = w.show();
-    macos::order_front_non_activating(&w);
+    let next_geom = (
+        frame.x.round() as i64,
+        frame.y.round() as i64,
+        frame.width.round() as i64,
+        frame.height.round() as i64,
+        true,
+    );
+    let (geom_changed, was_visible) = match LAST_APPLIED_GEOM.lock() {
+        Ok(mut g) => {
+            let prev_vis = g.as_ref().is_some_and(|p| p.4);
+            let changed = g.as_ref() != Some(&next_geom);
+            if changed {
+                *g = Some(next_geom);
+            }
+            (changed, prev_vis)
+        }
+        Err(_) => (true, false),
+    };
+    if geom_changed {
+        let _ = w.set_size(LogicalSize::new(frame.width, frame.height));
+        let _ = w.set_position(LogicalPosition::new(frame.x, frame.y));
+        macos::align_top_origin_if_needed(&w, frame);
+    }
+    if !was_visible || geom_changed {
+        let _ = w.set_ignore_cursor_events(false);
+        let _ = w.show();
+        macos::order_front_non_activating(&w);
+    }
     push_state(app, state, frame, mode);
 }
 
@@ -368,6 +420,7 @@ fn handle_notch_url(app: &AppHandle, raw_url: &str) {
     match host {
         "expand" => {
             EXPANDED.store(true, Ordering::Relaxed);
+            clear_sync_caches();
             if let Ok(g) = LATEST_STATE.lock() {
                 if let Some(st) = g.as_ref() {
                     let app2 = app.clone();
@@ -378,6 +431,7 @@ fn handle_notch_url(app: &AppHandle, raw_url: &str) {
         }
         "collapse" => {
             EXPANDED.store(false, Ordering::Relaxed);
+            clear_sync_caches();
             if let Ok(g) = LATEST_STATE.lock() {
                 if let Some(st) = g.as_ref() {
                     let app2 = app.clone();
@@ -388,6 +442,7 @@ fn handle_notch_url(app: &AppHandle, raw_url: &str) {
         }
         "jump" => {
             EXPANDED.store(false, Ordering::Relaxed);
+            clear_sync_caches();
             if let Some(agent_key) = val_param("key") {
                 crate::mainwin::show_main(app, "notch.jump");
                 let _ = app.emit_to(
@@ -483,6 +538,10 @@ fn ensure(app: &AppHandle) -> Option<tauri::WebviewWindow> {
 }
 
 pub fn sync(app: &AppHandle, state: Value) {
+    let expanded = EXPANDED.load(Ordering::Relaxed);
+    if should_skip_sync(&LAST_SYNC_STATE, &state, expanded) {
+        return;
+    }
     if let Ok(mut g) = LATEST_STATE.lock() {
         *g = Some(state.clone());
     }
@@ -502,6 +561,7 @@ pub fn sync(app: &AppHandle, state: Value) {
 #[allow(dead_code)]
 pub fn hide(app: &AppHandle) {
     EXPANDED.store(false, Ordering::Relaxed);
+    clear_sync_caches();
     if let Ok(mut g) = LATEST_STATE.lock() {
         *g = None;
     }
@@ -521,6 +581,7 @@ pub fn hide(app: &AppHandle) {
 
 pub fn shutdown(app: &AppHandle) {
     EXPANDED.store(false, Ordering::Relaxed);
+    clear_sync_caches();
     if let Some(w) = app.get_webview_window(LABEL) {
         let _ = w.close();
     }
@@ -528,7 +589,25 @@ pub fn shutdown(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_notch_frame, NotchViewMode};
+    use super::{compute_notch_frame, should_skip_sync, NotchViewMode};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    #[test]
+    fn sync_payload_deduplication_skips_identical_snapshots() {
+        let cache = Mutex::new(None);
+        let st1 = json!({ "enabled": true, "items": [{ "id": "a" }], "peek": null });
+        let st2 = json!({ "enabled": true, "items": [{ "id": "a" }], "peek": null });
+        let st3 = json!({ "enabled": true, "items": [{ "id": "b" }], "peek": null });
+
+        assert!(!should_skip_sync(&cache, &st1, false));
+        assert!(should_skip_sync(&cache, &st2, false));
+        // Expanded state change invalidates the skip even if payload is unchanged.
+        assert!(!should_skip_sync(&cache, &st2, true));
+        assert!(should_skip_sync(&cache, &st2, true));
+        // Content change invalidates the skip.
+        assert!(!should_skip_sync(&cache, &st3, true));
+    }
 
     #[test]
     fn compute_notch_frame_handles_notched_macbook_and_standard_monitor() {

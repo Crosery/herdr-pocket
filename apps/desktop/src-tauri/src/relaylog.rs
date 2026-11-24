@@ -9,7 +9,7 @@ use std::time::Duration;
 use tauri::AppHandle;
 use tokio::sync::{Mutex, Notify};
 
-const EVERY: Duration = Duration::from_secs(60);
+const EVERY: Duration = Duration::from_secs(30);
 const BATCH: usize = 200;
 
 /// An older relay without /v1/logs: stop until the app restarts.

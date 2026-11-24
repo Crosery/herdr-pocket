@@ -545,6 +545,9 @@ fn on_setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
     relaylog::start(handle.clone());
+    diagnostics::log_startup_profile(&handle);
+    diagnostics::report_previous_crash_if_any(&handle);
+    resources::start_telemetry(handle.clone());
     config::start_watch(handle.clone());
     perms::log_states("startup");
     voice::init(&handle);

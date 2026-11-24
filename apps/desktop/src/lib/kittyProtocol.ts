@@ -1153,3 +1153,15 @@ export function encodeRgbaBmpV4(
   }
   return out;
 }
+
+/**
+ * Returns true if the VT text stream enters DEC private synchronized output mode
+ * (`CSI ? 2026 h`) without a subsequent matching reset (`CSI ? 2026 l`), indicating
+ * a TUI frame (e.g. during SIGWINCH redraws) is mid-update.
+ */
+export function hasOpenSyncOutput(text: string): boolean {
+  const openIdx = text.lastIndexOf("\x1b[?2026h");
+  if (openIdx < 0) return false;
+  const closeIdx = text.lastIndexOf("\x1b[?2026l");
+  return openIdx > closeIdx;
+}

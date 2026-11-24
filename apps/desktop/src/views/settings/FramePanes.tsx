@@ -25,7 +25,7 @@ import { IS_MAC, SHORTCUTS, keyChips } from "../../shell/shortcuts";
 import { openSettingsFrame } from "../../shell/shellStore";
 import { RemoveDeviceDialog } from "../DevicesView";
 import { ConfigSwitch, PaneTitle, SetHeading, SetRow } from "./rows";
-import { SignOutBlock, StartupRows, ThemeRow, linkLabel, useHostdStatus } from "./Panes";
+import { H5IdentityLockSection, H5LayoutModeRow, SignOutBlock, StartupRows, ThemeRow, linkLabel, useHostdStatus } from "./Panes";
 
 /** Key chips for one combo: ["⌘", "P"] or ["Ctrl", "P"]. */
 function Keys({ keys }: { keys: string[] }) {
@@ -462,6 +462,7 @@ export function LookPane() {
     <div className="pane">
       <SetHeading>主题</SetHeading>
       <ThemeRow />
+      <H5LayoutModeRow />
       <SetHeading>大小与字体</SetHeading>
       <TextScaleRow />
       <UiFontSettingsSection />
@@ -692,6 +693,8 @@ export function MachinesPane({
           </PocketButton>
         ) : null}
       </div>
+
+      <H5IdentityLockSection />
 
       <SetHeading>桌面端</SetHeading>
       {desktop.length ? (

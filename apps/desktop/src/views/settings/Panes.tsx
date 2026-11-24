@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Copy, Download, ExternalLink, FileText, FolderOpen, LogOut, QrCode, RefreshCw, RotateCcw, Server, Trash2 } from "lucide-react";
+import { Copy, Download, ExternalLink, FileText, Fingerprint, FolderOpen, LogOut, QrCode, RefreshCw, RotateCcw, Server, Trash2 } from "lucide-react";
 import {
   DIRECT_SOURCE,
   RELEASES_PAGE,
@@ -15,7 +15,8 @@ import { PocketBadge, PocketButton, PocketInput, PocketSelect, PocketSwitch, Poc
 import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { CookieImportButton } from "../../components/CookieImport";
 import { serverLabel } from "../../components/Sidebar";
-import { appVersion, copyToClipboard, detectPlatform, getHostdStatus, openExternalUrl, pushSystemNotification, type HostdLocalStatus } from "../../lib/bridge";
+import { appVersion, copyToClipboard, detectPlatform, getHostdStatus, isH5Web, openExternalUrl, pushSystemNotification, type HostdLocalStatus } from "../../lib/bridge";
+import { isPasskeySupported, recognizeWebDevice, registerDevicePasskey } from "../../lib/h5Identity";
 import { native, type ResourceUsage } from "../../lib/native";
 import { clientConfigStore, setConfig, useClientConfig } from "../../lib/config";
 import {
@@ -31,8 +32,8 @@ import {
 import { RichMarkdown } from "../../lib/markdown";
 import { triggerDemoAttentionPreview } from "../../lib/attentionCenter";
 import { isMockServer } from "../../lib/mock";
-import { refreshNotifyChannel, signOut } from "../../lib/relay";
-import { liveStore, relTime, settingsStore, updateSettings } from "../../lib/store";
+import { getActiveToken, refreshNotifyChannel, signOut } from "../../lib/relay";
+import { liveStore, relTime, settingsStore, updateSettings, type H5LayoutMode } from "../../lib/store";
 import { useWindowHidden } from "../../lib/layout";
 import { ConfigSelect, ConfigSwitch, PaneTitle, SetHeading, SetRow } from "./rows";
 import { ChatDisplayModeRow, TerminalSettingsSection, UiFontSettingsSection } from "./FramePanes";
@@ -163,6 +164,81 @@ function GuideRow({ onReopenGuide }: { onReopenGuide: () => void }) {
   );
 }
 
+const H5_LAYOUT_OPTIONS: SelectOption[] = [
+  { value: "auto", label: "自动跟随设备（手机触控 / 桌面多窗格）" },
+  { value: "mobile", label: "固定手机触控界面" },
+  { value: "desktop", label: "固定桌面多窗格界面" },
+];
+
+export function H5LayoutModeRow() {
+  const mode = settingsStore.use((s) => s.h5LayoutMode);
+  if (!isH5Web()) return null;
+  return (
+    <SetRow title="网页端界面形态" about="可固定为手机触控布局或桌面分屏窗格，默认自动识别当前设备">
+      <PocketSelect
+        ariaLabel="网页端界面形态"
+        value={mode}
+        options={H5_LAYOUT_OPTIONS}
+        onValueChange={(v) => updateSettings({ h5LayoutMode: v as H5LayoutMode })}
+      />
+    </SetRow>
+  );
+}
+
+export function H5IdentityLockSection() {
+  const toast = useToast();
+  const server = settingsStore.use((s) => s.server);
+  const deviceId = settingsStore.use((s) => s.deviceId);
+  const devices = liveStore.use((s) => s.devices);
+  const [busy, setBusy] = useState(false);
+  if (!isH5Web()) return null;
+
+  const recognized = recognizeWebDevice();
+  const current = deviceId ? devices[deviceId] : undefined;
+  const passkeyLinked = Boolean(current?.passkeyLinked);
+  const real = Boolean(server && !isMockServer(server));
+
+  const bindPasskey = async () => {
+    const token = getActiveToken();
+    if (!server || !token) return;
+    setBusy(true);
+    try {
+      const updated = await registerDevicePasskey(server, token);
+      liveStore.set({ devices: { ...liveStore.get().devices, [updated.id]: updated } });
+      toast("已绑定本机硬件通行密钥");
+    } catch (e) {
+      toast((e as Error).message || "通行密钥绑定失败", true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <SetHeading>本机唯一身份锁</SetHeading>
+      <SetRow
+        title={recognized.name}
+        about={deviceId ? `当前设备 ID：${deviceId}` : "尚未登录中转服务器"}
+      >
+        <PocketBadge tone={passkeyLinked ? "mint" : "pink"}>
+          {passkeyLinked ? "已绑定通行密钥" : "防身份漂移已启用"}
+        </PocketBadge>
+      </SetRow>
+      {real && isPasskeySupported() ? (
+        <SetRow
+          title="硬件通行密钥（Face ID / Touch ID / 指纹）"
+          about="即使清理浏览器存储或切换无痕缓存，也可通过本机生物识别一键恢复同一设备 ID"
+        >
+          <PocketButton size="sm" variant="soft" disabled={busy} onClick={() => void bindPasskey()}>
+            <Fingerprint size={14} />
+            <span>{busy ? "正在绑定…" : passkeyLinked ? "重新绑定通行密钥" : "绑定通行密钥"}</span>
+          </PocketButton>
+        </SetRow>
+      ) : null}
+    </>
+  );
+}
+
 export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
   const toast = useToast();
   const general = useClientConfig().general;
@@ -173,6 +249,7 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
       <PaneTitle title="通用" />
       <SetHeading>外观</SetHeading>
       <ThemeRow />
+      <H5LayoutModeRow />
       <SetRow title="文字大小" about={`当前 ${general.textScale}%`}>
         <div className="segmented">
           {textPresets.map((pct) => (
@@ -276,6 +353,8 @@ export function ConnectionPane({ onConnectRelay, onPairPhone }: { onConnectRelay
       {phones.length ? (
         <SetRow title="已连接的手机和桌面端" about={phones.map((p) => `${p.name}（${p.online ? "在线" : `上次 ${relTime(p.lastSeenAt)}`}）`).join("、")} />
       ) : null}
+
+      <H5IdentityLockSection />
 
       {hostd ? (
         <>

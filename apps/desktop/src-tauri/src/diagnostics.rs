@@ -47,6 +47,190 @@ pub fn os_version() -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &str) -> Option<String> {
+    use std::ffi::CString;
+    let c_name = CString::new(name).ok()?;
+    let mut size: libc::size_t = 0;
+    unsafe {
+        if libc::sysctlbyname(
+            c_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+            || size == 0
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        if libc::sysctlbyname(
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+        while buf.last() == Some(&0) {
+            buf.pop();
+        }
+        String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+    }
+}
+
+#[cfg(unix)]
+fn total_ram_mb() -> Option<u64> {
+    unsafe {
+        let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        if pages > 0 && page_size > 0 {
+            Some(((pages as u64).saturating_mul(page_size as u64)) / (1024 * 1024))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn total_ram_mb() -> Option<u64> {
+    None
+}
+
+pub fn hardware_profile() -> Value {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    #[cfg(target_os = "macos")]
+    let (cpu_brand, hw_model) = (
+        sysctl_string("machdep.cpu.brand_string"),
+        sysctl_string("hw.model"),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (cpu_brand, hw_model): (Option<String>, Option<String>) = (None, None);
+    json!({
+        "os": os_version(),
+        "arch": std::env::consts::ARCH,
+        "cores": cores,
+        "ramMb": total_ram_mb(),
+        "cpu": cpu_brand,
+        "hwModel": hw_model,
+    })
+}
+
+pub fn log_startup_profile(app: &AppHandle) {
+    let mut profile = hardware_profile();
+    if let Value::Object(ref mut m) = profile {
+        m.insert(
+            "version".into(),
+            Value::String(app.package_info().version.to_string()),
+        );
+    }
+    logging::info("sys.boot", "desktop hardware & OS profile", profile);
+}
+
+#[cfg(target_os = "macos")]
+pub fn report_previous_crash_if_any(app: &AppHandle) {
+    let Some(home) = crate::home_dir() else {
+        return;
+    };
+    let diag_dir = home.join("Library").join("Logs").join("DiagnosticReports");
+    let Ok(entries) = fs::read_dir(&diag_dir) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            (name.starts_with("herdr-pocket-desktop-") || name.starts_with("Herdr Pocket-"))
+                && name.ends_with(".ips")
+        })
+        .collect();
+    files.sort();
+    let Some(newest) = files.pop() else {
+        return;
+    };
+    let Some(file_name) = newest.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        return;
+    };
+    let marker_path = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("last-reported-crash.txt"));
+    if let Some(ref mp) = marker_path {
+        if fs::read_to_string(mp).ok().as_deref().map(str::trim) == Some(file_name.as_str()) {
+            return;
+        }
+    }
+    let Ok(raw) = fs::read_to_string(&newest) else {
+        return;
+    };
+    let mut lines = raw.lines();
+    let header_json: Option<Value> = lines.next().and_then(|l| serde_json::from_str(l).ok());
+    let body_raw: String = lines.collect::<Vec<_>>().join("\n");
+    let body_json: Option<Value> = serde_json::from_str(&body_raw).ok();
+    let version = header_json
+        .as_ref()
+        .and_then(|h| h.get("app_version").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let capture_time = header_json
+        .as_ref()
+        .and_then(|h| h.get("timestamp").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let exc_type = body_json
+        .as_ref()
+        .and_then(|b| b.pointer("/exception/type").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let exc_sub = body_json
+        .as_ref()
+        .and_then(|b| b.pointer("/exception/subtype").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let fault_idx = body_json
+        .as_ref()
+        .and_then(|b| b.get("faultingThread").and_then(|v| v.as_u64()))
+        .unwrap_or(0) as usize;
+    let frames: Vec<String> = body_json
+        .as_ref()
+        .and_then(|b| b.pointer(&format!("/threads/{fault_idx}/frames")))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(8)
+                .filter_map(|f| {
+                    let sym = f.get("symbol").and_then(|v| v.as_str())?;
+                    Some(redact::text(sym).into_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    logging::warn(
+        "sys.crash_prev",
+        &format!("previous crash report detected ({file_name}): {exc_type}"),
+        json!({
+            "file": redact::text(&file_name).into_owned(),
+            "appVersion": version,
+            "captureTime": capture_time,
+            "exception": exc_type,
+            "subtype": exc_sub,
+            "topFrames": frames,
+        }),
+    );
+    if let Some(mp) = marker_path {
+        if let Some(parent) = mp.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(mp, &file_name);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn report_previous_crash_if_any(_app: &AppHandle) {}
+
 fn system_section(app: &AppHandle) -> Value {
     let pkg = app.package_info();
     json!({

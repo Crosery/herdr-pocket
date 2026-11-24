@@ -9,7 +9,8 @@ import { assetUrl } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
 import { pingRelay, refreshHostSpaces, rpcCall } from "../lib/relay";
-import { agentSpace, allAgents, liveStore, settingsStore, spacedTitle } from "../lib/store";
+import { agentSpace, allAgents, clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, liveStore, settingsStore, spacedTitle, updateSettings } from "../lib/store";
+import { setInteractiveResizeActive } from "./splitMotion";
 import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
@@ -368,8 +369,65 @@ export function ShellSidebar({
     );
   };
 
+  const sidebarWidth = settingsStore.use((s) => s.sidebarWidth);
+  const sidebarRef = useRef<HTMLElement | null>(null);
+  const [sidebarResizing, setSidebarResizing] = useState(false);
+
   return (
-    <aside className="v3-sidebar" aria-label="侧栏">
+    <aside
+      ref={sidebarRef}
+      className={`v3-sidebar${sidebarResizing ? " is-resizing" : ""}`}
+      style={!collapsed ? ({ "--v3-sidebar-w": `${sidebarWidth}px` } as CSSProperties) : undefined}
+      aria-label="侧栏"
+    >
+      {!collapsed ? (
+        <div
+          className="v3-sidebar-resize"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="拖动调整侧栏宽度，双击恢复默认"
+          title="拖动调整侧栏宽度（双击恢复默认）"
+          onDoubleClick={() => updateSettings({ sidebarWidth: DEFAULT_SIDEBAR_WIDTH })}
+          onPointerDown={(e) => {
+            if (e.button !== 0 || !sidebarRef.current) return;
+            e.preventDefault();
+            const el = sidebarRef.current;
+            const startX = e.clientX;
+            const startW = el.getBoundingClientRect().width || sidebarWidth;
+            let curW = clampSidebarWidth(startW);
+            let rafId = 0;
+            setSidebarResizing(true);
+            setInteractiveResizeActive(true);
+            document.documentElement.dataset.splitResizing = "row";
+            e.currentTarget.setPointerCapture(e.pointerId);
+
+            const apply = () => {
+              rafId = 0;
+              el.style.setProperty("--v3-sidebar-w", `${curW}px`);
+            };
+            const onMove = (mv: PointerEvent) => {
+              curW = clampSidebarWidth(startW + (mv.clientX - startX));
+              if (!rafId) rafId = requestAnimationFrame(apply);
+            };
+            const finish = () => {
+              window.removeEventListener("pointermove", onMove);
+              window.removeEventListener("pointerup", finish);
+              window.removeEventListener("pointercancel", finish);
+              if (rafId) {
+                cancelAnimationFrame(rafId);
+                apply();
+              }
+              delete document.documentElement.dataset.splitResizing;
+              setSidebarResizing(false);
+              setInteractiveResizeActive(false);
+              updateSettings({ sidebarWidth: curW });
+            };
+            window.addEventListener("pointermove", onMove);
+            window.addEventListener("pointerup", finish);
+            window.addEventListener("pointercancel", finish);
+          }}
+        />
+      ) : null}
       <div className="v3-brand" data-tauri-drag-region="deep">
         {collapsed ? null : (
           <div className="v3-brand-name">

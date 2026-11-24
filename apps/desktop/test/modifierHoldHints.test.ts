@@ -1,79 +1,46 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  chordFromModifierEvent,
-  chordOfKeys,
-  nextModifierSteps,
-  shortcutsForChord,
-  trailingKeyChip,
+  chordIncludesPrefix,
+  remainingSuffixChip,
+  shortcutsMatchingChordPrefix,
 } from "../src/shell/shortcuts.ts";
 
-test("chordOfKeys and chordFromModifierEvent classify Mod -> Mod+Shift / Mod+Alt -> Mod+Alt+Shift accurately", () => {
-  assert.equal(chordOfKeys(["Mod", "D"]), "Mod");
-  assert.equal(chordOfKeys(["Mod", "Shift", "D"]), "Mod+Shift");
-  assert.equal(chordOfKeys(["Mod", "Alt", "ArrowLeft"]), "Mod+Alt");
-  assert.equal(chordOfKeys(["Mod", "Alt", "Shift", "ArrowLeft"]), "Mod+Alt+Shift");
-  assert.equal(chordOfKeys(["Ctrl", "C"]), null);
+test("progressive modifier prefix matching includes supersets while holding ⌘ and narrows on ⌘⇧ / ⌘⌥", () => {
+  assert.equal(chordIncludesPrefix("Mod", "Mod"), true);
+  assert.equal(chordIncludesPrefix("Mod+Shift", "Mod"), true);
+  assert.equal(chordIncludesPrefix("Mod+Alt", "Mod"), true);
+  assert.equal(chordIncludesPrefix("Mod+Alt+Shift", "Mod"), true);
 
-  assert.equal(
-    chordFromModifierEvent({ metaKey: true, ctrlKey: false, altKey: false, shiftKey: false }, true),
-    "Mod",
-  );
-  assert.equal(
-    chordFromModifierEvent({ metaKey: true, ctrlKey: false, altKey: false, shiftKey: true }, true),
-    "Mod+Shift",
-  );
-  assert.equal(
-    chordFromModifierEvent({ metaKey: true, ctrlKey: false, altKey: true, shiftKey: false }, true),
-    "Mod+Alt",
-  );
-  assert.equal(
-    chordFromModifierEvent({ metaKey: true, ctrlKey: false, altKey: true, shiftKey: true }, true),
-    "Mod+Alt+Shift",
-  );
-  // Cross-holding Ctrl alongside Meta on macOS drops chord cleanly; releasing Shift steps back to Mod.
-  assert.equal(
-    chordFromModifierEvent({ metaKey: true, ctrlKey: true, altKey: false, shiftKey: false }, true),
-    null,
-  );
-  assert.equal(
-    chordFromModifierEvent({ metaKey: false, ctrlKey: true, altKey: false, shiftKey: true }, false),
-    "Mod+Shift",
-  );
-  assert.equal(trailingKeyChip(["Mod", "Alt", "ArrowRight"], true), "→");
-});
+  assert.equal(chordIncludesPrefix("Mod", "Mod+Shift"), false);
+  assert.equal(chordIncludesPrefix("Mod+Shift", "Mod+Shift"), true);
+  assert.equal(chordIncludesPrefix("Mod+Alt", "Mod+Shift"), false);
+  assert.equal(chordIncludesPrefix("Mod+Alt+Shift", "Mod+Shift"), true);
 
-test("shortcutsForChord separates each layer exclusively and nextModifierSteps exposes valid progressions", () => {
-  const modIds = new Set(shortcutsForChord("Mod").map((s) => s.shortcut.id));
-  const shiftIds = new Set(shortcutsForChord("Mod+Shift").map((s) => s.shortcut.id));
-  const altIds = new Set(shortcutsForChord("Mod+Alt").map((s) => s.shortcut.id));
-  const altShiftIds = new Set(shortcutsForChord("Mod+Alt+Shift").map((s) => s.shortcut.id));
+  assert.equal(chordIncludesPrefix("Mod+Alt+Shift", "Mod+Alt+Shift"), true);
+  assert.equal(chordIncludesPrefix("Mod+Shift", "Mod+Alt+Shift"), false);
 
-  assert.ok(modIds.has("closeTab"));
-  assert.ok(!modIds.has("closeWholeTab"));
-  assert.ok(shiftIds.has("closeWholeTab"));
-  assert.ok(shiftIds.has("splitDown"));
-  assert.ok(shiftIds.has("zoomPane"));
-  assert.ok(!shiftIds.has("splitRight"));
-  assert.ok(altIds.has("focusPaneLeft"));
-  assert.ok(altIds.has("equalizeSplits"));
-  assert.ok(altShiftIds.has("swapPaneLeft"));
-  assert.ok(altShiftIds.has("unsplitTab"));
+  assert.equal(remainingSuffixChip(["Mod", "D"], "Mod", true), "D");
+  assert.equal(remainingSuffixChip(["Mod", "Shift", "D"], "Mod", true), "⇧D");
+  assert.equal(remainingSuffixChip(["Mod", "Shift", "D"], "Mod+Shift", true), "D");
+  assert.equal(remainingSuffixChip(["Mod", "Alt", "Shift", "ArrowLeft"], "Mod", true), "⌥⇧←");
+  assert.equal(remainingSuffixChip(["Mod", "Alt", "Shift", "ArrowLeft"], "Mod+Shift", true), "⌥←");
+  assert.equal(remainingSuffixChip(["Mod", "Alt", "Shift", "ArrowLeft"], "Mod+Alt+Shift", true), "←");
 
-  const fromMod = nextModifierSteps("Mod", true);
-  assert.deepEqual(
-    fromMod.map((s) => s.targetChord),
-    ["Mod+Shift", "Mod+Alt"],
-  );
-  const fromShift = nextModifierSteps("Mod+Shift", true);
-  assert.deepEqual(
-    fromShift.map((s) => s.targetChord),
-    ["Mod+Alt+Shift"],
-  );
-  const fromAlt = nextModifierSteps("Mod+Alt", true);
-  assert.deepEqual(
-    fromAlt.map((s) => s.targetChord),
-    ["Mod+Alt+Shift"],
-  );
-  assert.deepEqual(nextModifierSteps("Mod+Alt+Shift", true), []);
+  const modIds = new Set(shortcutsMatchingChordPrefix("Mod").map((x) => x.shortcut.id));
+  assert.equal(modIds.has("newAgent"), true);
+  assert.equal(modIds.has("splitDown"), true);
+  assert.equal(modIds.has("focusPaneLeft"), true);
+  assert.equal(modIds.has("unsplitTab"), true);
+
+  const modShiftIds = new Set(shortcutsMatchingChordPrefix("Mod+Shift").map((x) => x.shortcut.id));
+  assert.equal(modShiftIds.has("newAgent"), false);
+  assert.equal(modShiftIds.has("focusPaneLeft"), false);
+  assert.equal(modShiftIds.has("splitDown"), true);
+  assert.equal(modShiftIds.has("unsplitTab"), true);
+
+  const modAltShiftIds = new Set(shortcutsMatchingChordPrefix("Mod+Alt+Shift").map((x) => x.shortcut.id));
+  assert.equal(modAltShiftIds.has("splitDown"), false);
+  assert.equal(modAltShiftIds.has("swapPaneLeft"), true);
+  assert.equal(modAltShiftIds.has("unsplitTab"), true);
 });

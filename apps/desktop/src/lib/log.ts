@@ -14,9 +14,78 @@ export interface LogEntry {
 }
 
 const MAX = 2000;
+const WEB_RELAY_MAX = 500;
 let seq = 0;
 let pending: LogEntry[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+export interface WebRelayLogEntry {
+  ts: number;
+  level: LogLevel;
+  kind: string;
+  msg: string;
+  data?: Record<string, unknown>;
+}
+
+const WEB_RELAY_AREAS = new Set([
+  "app",
+  "config",
+  "pair",
+  "link",
+  "relay",
+  "perf",
+  "sys",
+  "h5",
+  "term",
+  "portal",
+  "ui",
+  "chat",
+  "startup",
+]);
+
+function isWebRelayWorthy(level: LogLevel, scope: string): boolean {
+  if (level === "warn" || level === "error") return true;
+  if (level !== "info") return false;
+  const area = scope.split(".")[0] ?? scope;
+  return WEB_RELAY_AREAS.has(area);
+}
+
+let webRelayQueue: WebRelayLogEntry[] = [];
+let webUploader: ((batch: WebRelayLogEntry[]) => Promise<boolean>) | null = null;
+let webUploadTimer: ReturnType<typeof setInterval> | null = null;
+let webUploading = false;
+
+export async function flushWebRelayLogs(): Promise<void> {
+  if (webUploading || !webUploader || webRelayQueue.length === 0) return;
+  webUploading = true;
+  try {
+    while (webRelayQueue.length > 0 && webUploader) {
+      const batch = webRelayQueue.splice(0, 200);
+      const ok = await webUploader(batch).catch(() => false);
+      if (!ok) {
+        webRelayQueue.unshift(...batch);
+        if (webRelayQueue.length > WEB_RELAY_MAX) {
+          webRelayQueue.splice(0, webRelayQueue.length - WEB_RELAY_MAX);
+        }
+        break;
+      }
+    }
+  } finally {
+    webUploading = false;
+  }
+}
+
+export function registerWebLogUploader(fn: ((batch: WebRelayLogEntry[]) => Promise<boolean>) | null): void {
+  webUploader = fn;
+  if (fn && !webUploadTimer && typeof window !== "undefined") {
+    webUploadTimer = setInterval(() => {
+      void flushWebRelayLogs();
+    }, 30_000);
+  }
+  if (fn && webRelayQueue.length > 0) {
+    void flushWebRelayLogs();
+  }
+}
 
 export const logStore = createStore<{ entries: LogEntry[] }>({ entries: [] });
 
@@ -93,9 +162,13 @@ function flush(): void {
   }
   const batch = pending;
   pending = [];
-  if (!batch.length) return;
-  for (const e of batch) {
-    void native.writeLog(e.level, e.scope, e.msg, e.data);
+  if (batch.length) {
+    for (const e of batch) {
+      void native.writeLog(e.level, e.scope, e.msg, e.data);
+    }
+  }
+  if (!native.available()) {
+    void flushWebRelayLogs();
   }
 }
 
@@ -122,6 +195,18 @@ export function log(level: LogLevel, scope: string, msg: string, data?: Record<s
     return { entries };
   });
   pending.push(entry);
+  if (!native.available() && isWebRelayWorthy(level, scope)) {
+    webRelayQueue.push({
+      ts: entry.ts,
+      level,
+      kind: scope.slice(0, 40) || "web",
+      msg: entry.msg.slice(0, 500),
+      ...(cleanData ? { data: cleanData } : {}),
+    });
+    if (webRelayQueue.length > WEB_RELAY_MAX) {
+      webRelayQueue.splice(0, webRelayQueue.length - WEB_RELAY_MAX);
+    }
+  }
   if (level === "warn" || level === "error") {
     if (flushTimer) {
       clearTimeout(flushTimer);

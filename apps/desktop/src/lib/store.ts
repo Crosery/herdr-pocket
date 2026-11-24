@@ -4,6 +4,16 @@ import { STATUS_ORDER } from "@herdr-pocket/protocol";
 
 export type LinkStatus = "idle" | "connecting" | "online" | "offline" | "unauthorized";
 export type ThemeChoice = "system" | "light" | "dark";
+export type H5LayoutMode = "auto" | "mobile" | "desktop";
+
+export const DEFAULT_SIDEBAR_WIDTH = 236;
+export const MIN_SIDEBAR_WIDTH = 180;
+export const MAX_SIDEBAR_WIDTH = 380;
+
+export function clampSidebarWidth(w: unknown): number {
+  const n = typeof w === "number" && Number.isFinite(w) ? Math.round(w) : DEFAULT_SIDEBAR_WIDTH;
+  return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, n));
+}
 
 export interface AppSettings {
   server: string | null;
@@ -20,6 +30,10 @@ export interface AppSettings {
   foldedGroups: string[];
   /** Sidebar folded to its icon rail by the user (wide windows only; narrow ones fold on their own). */
   sidebarCollapsed: boolean;
+  /** User-dragged sidebar width in px (180..380). */
+  sidebarWidth: number;
+  /** H5 browser layout mode preference ("auto" detects mobile vs desktop hardware). */
+  h5LayoutMode: H5LayoutMode;
   /** Show cmux-style floating spatial shortcut badges when holding ⌘ / Ctrl. */
   showModifierHoldHints: boolean;
   /** Play subtle local audio chime for background agent attention events. */
@@ -62,6 +76,8 @@ function persistPrefs(s: AppSettings): void {
     hostFilter: s.hostFilter,
     foldedGroups: s.foldedGroups,
     sidebarCollapsed: s.sidebarCollapsed,
+    sidebarWidth: s.sidebarWidth,
+    h5LayoutMode: s.h5LayoutMode,
     showModifierHoldHints: s.showModifierHoldHints,
     alertSound: s.alertSound,
     alertChimeOnlyLongTasks: s.alertChimeOnlyLongTasks,
@@ -129,6 +145,8 @@ export const settingsStore = createStore<AppSettings>({
   hostFilter: saved.hostFilter ?? null,
   foldedGroups: saved.foldedGroups ?? [],
   sidebarCollapsed: saved.sidebarCollapsed ?? false,
+  sidebarWidth: clampSidebarWidth(saved.sidebarWidth),
+  h5LayoutMode: saved.h5LayoutMode === "mobile" || saved.h5LayoutMode === "desktop" ? saved.h5LayoutMode : "auto",
   showModifierHoldHints: saved.showModifierHoldHints ?? true,
   alertSound: saved.alertSound ?? true,
   alertChimeOnlyLongTasks: saved.alertChimeOnlyLongTasks ?? false,

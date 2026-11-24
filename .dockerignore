@@ -8,6 +8,8 @@ apps/mobile
 apps/site
 docs
 dist
+!apps/relay/src/admin/dist
+!apps/relay/src/web/dist
 deploy
 scripts
 **/data

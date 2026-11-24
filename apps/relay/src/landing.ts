@@ -26,10 +26,12 @@ function intentUrl(appLink: string): string {
 
 export function pairLanding(server: string, code: string): LandingPage {
   const app = pairAppLink(server, code);
+  const cleanServer = server.replace(/\/+$/, "");
   return page({
     title: "连接 Herdr Pocket",
-    lead: "有人邀请这台手机连到 Herdr Pocket。装好 App 后点下面的按钮，就能直接连上。",
+    lead: "可以用网页版直接打开，或者打开已安装的 Herdr Pocket App。",
     open: intentUrl(app),
+    web: `${cleanServer}/app/?pair=${encodeURIComponent(code)}`,
     manual: `
       <section class="manual">
         <div class="label">打不开时，在 App 首页手动输入</div>
@@ -43,10 +45,12 @@ export function pairLanding(server: string, code: string): LandingPage {
 
 export function joinLanding(server: string, id: string): LandingPage {
   const app = joinAppLink(server, id);
+  const cleanServer = server.replace(/\/+$/, "");
   return page({
     title: "有设备想加入",
-    lead: "一台新设备正在等你放行。用已经连上的手机打开 Herdr Pocket 确认，看清是你自己的设备再点允许。",
+    lead: "一台新设备正在等你放行。用已登录的手机 App 或网页版打开确认。",
     open: intentUrl(app),
+    web: `${cleanServer}/app/?approve=${encodeURIComponent(id)}`,
     manual: `
       <section class="manual">
         <div class="label">也可以这样</div>
@@ -64,11 +68,12 @@ export function notFoundLanding(): LandingPage {
   });
 }
 
-function page(o: { title: string; lead: string; open?: string; manual?: string; tips: string[] }): LandingPage {
+function page(o: { title: string; lead: string; open?: string; web?: string; manual?: string; tips: string[] }): LandingPage {
   const nonce = randomBytes(12).toString("base64");
   const actions = o.open
     ? `
-      <a class="btn" href="${esc(o.open)}">用 Herdr Pocket 打开</a>
+      ${o.web ? `<a class="btn" href="${esc(o.web)}">直接打开网页版 (H5)</a>` : ""}
+      <a class="${o.web ? "btn secondary" : "btn"}" href="${esc(o.open)}">用 Herdr Pocket 打开</a>
       <a class="ghost" href="${esc(RELEASES_PAGE)}" rel="noreferrer noopener">还没装？下载安卓 App</a>`
     : "";
   const tips = [
@@ -97,6 +102,7 @@ h1{margin:6px 0 0;text-align:center;font-size:24px;line-height:1.35;font-weight:
 .lead{margin:0;text-align:center;color:var(--muted);font-size:15px}
 .btn,.ghost{display:block;text-align:center;text-decoration:none;border-radius:999px;font-weight:700}
 .btn{background:var(--primary);color:var(--onPrimary);font-size:17px;padding:15px 18px;margin-top:6px;box-shadow:0 8px 20px var(--shadow)}
+.btn.secondary{background:var(--surface);color:var(--accent);border:1.5px solid var(--primary);box-shadow:none;margin-top:0}
 .ghost{color:var(--accent);font-size:15px;padding:10px}
 .manual{background:var(--surface);border-radius:20px;padding:16px 16px 10px;box-shadow:0 6px 18px var(--shadow);display:flex;flex-direction:column;gap:10px}
 .label{color:var(--faint);font-size:13px}

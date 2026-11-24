@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Herdr Pocket · 小羊实时通话</title>
+<!--
+  Floating Xiaoyang realtime voice call capsule (src-tauri/src/voice/hud.rs). Strict CSP: zero inline JS.
+  States pushed via window.__hud(state):
+    { state: "connecting", dspBadge?, muted?, sounds? }
+    { state: "active", phase?: "idle"|"thinking"|"speaking", muted?, level?, startedAt?, task?, caption?, dspBadge?, sounds? }
+    { state: "error", message, sounds? }
+    { state: "hidden" }
+-->
+<style>
+  :root {
+    --pink: #ff6ea4;
+    --pink-deep: #e84685;
+    --lav: #9f84f7;
+    --accent-soft: rgba(255, 110, 164, 0.14);
+    --accent-text: #b8336a;
+    --ink: #2c2038;
+    --ink-soft: #4e3f60;
+    --muted: #786a88;
+    --surface: rgba(255, 250, 253, 0.92);
+    --border: rgba(255, 110, 164, 0.34);
+    --btn-bg: rgba(74, 59, 92, 0.08);
+    --btn-border: rgba(74, 59, 92, 0.10);
+    --btn-hover: rgba(74, 59, 92, 0.15);
+    --danger: #d93861;
+    --danger-bg: rgba(217, 56, 97, 0.12);
+    --danger-border: rgba(217, 56, 97, 0.28);
+    --danger-solid: #d93861;
+    --orb-bg: radial-gradient(circle at 35% 30%, rgba(255, 227, 236, 0.96), rgba(241, 235, 255, 0.96));
+    --orb-shadow: 0 3px 10px rgba(184, 51, 106, 0.20), 0 1px 4px rgba(44, 32, 56, 0.08);
+    --badge-ring: #fffafd;
+    --muted-badge-bg: #6f647d;
+    --shadow: 0 10px 26px rgba(184, 51, 106, 0.20), 0 2px 10px rgba(24, 16, 36, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #f6effa;
+      --ink-soft: #dcd0eb;
+      --muted: #b4a7c5;
+      --accent-soft: rgba(255, 126, 178, 0.20);
+      --accent-text: #ff9ec4;
+      --surface: rgba(26, 20, 35, 0.90);
+      --border: rgba(255, 130, 180, 0.34);
+      --btn-bg: rgba(255, 255, 255, 0.09);
+      --btn-border: rgba(255, 255, 255, 0.12);
+      --btn-hover: rgba(255, 255, 255, 0.17);
+      --danger: #ff92ab;
+      --danger-bg: rgba(255, 107, 145, 0.18);
+      --danger-border: rgba(255, 130, 165, 0.34);
+      --danger-solid: #e34a73;
+      --orb-bg: radial-gradient(circle at 35% 30%, rgba(74, 43, 58, 0.96), rgba(53, 44, 74, 0.96));
+      --orb-shadow: 0 4px 14px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 130, 180, 0.16);
+      --badge-ring: #1a1423;
+      --muted-badge-bg: #584e68;
+      --shadow: 0 12px 30px rgba(0, 0, 0, 0.54), 0 0 0 1px rgba(255, 255, 255, 0.06);
+    }
+  }
+  html[data-theme="dark"] {
+    --ink: #f6effa;
+    --ink-soft: #dcd0eb;
+    --muted: #b4a7c5;
+    --accent-soft: rgba(255, 126, 178, 0.20);
+    --accent-text: #ff9ec4;
+    --surface: rgba(26, 20, 35, 0.90);
+    --border: rgba(255, 130, 180, 0.34);
+    --btn-bg: rgba(255, 255, 255, 0.09);
+    --btn-border: rgba(255, 255, 255, 0.12);
+    --btn-hover: rgba(255, 255, 255, 0.17);
+    --danger: #ff92ab;
+    --danger-bg: rgba(255, 107, 145, 0.18);
+    --danger-border: rgba(255, 130, 165, 0.34);
+    --danger-solid: #e34a73;
+    --orb-bg: radial-gradient(circle at 35% 30%, rgba(74, 43, 58, 0.96), rgba(53, 44, 74, 0.96));
+    --orb-shadow: 0 4px 14px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 130, 180, 0.16);
+    --badge-ring: #1a1423;
+    --muted-badge-bg: #584e68;
+    --shadow: 0 12px 30px rgba(0, 0, 0, 0.54), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  }
+  html[data-theme="light"] {
+    --ink: #2c2038;
+    --ink-soft: #4e3f60;
+    --muted: #786a88;
+    --accent-soft: rgba(255, 110, 164, 0.14);
+    --accent-text: #b8336a;
+    --surface: rgba(255, 250, 253, 0.92);
+    --border: rgba(255, 110, 164, 0.34);
+    --btn-bg: rgba(74, 59, 92, 0.08);
+    --btn-border: rgba(74, 59, 92, 0.10);
+    --btn-hover: rgba(74, 59, 92, 0.15);
+    --danger: #d93861;
+    --danger-bg: rgba(217, 56, 97, 0.12);
+    --danger-border: rgba(217, 56, 97, 0.28);
+    --danger-solid: #d93861;
+    --orb-bg: radial-gradient(circle at 35% 30%, rgba(255, 227, 236, 0.96), rgba(241, 235, 255, 0.96));
+    --orb-shadow: 0 3px 10px rgba(184, 51, 106, 0.20), 0 1px 4px rgba(44, 32, 56, 0.08);
+    --badge-ring: #fffafd;
+    --muted-badge-bg: #6f647d;
+    --shadow: 0 10px 26px rgba(184, 51, 106, 0.20), 0 2px 10px rgba(24, 16, 36, 0.08);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: default;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei UI", system-ui, sans-serif;
+    color: var(--ink);
+  }
+  body.standalone-qa {
+    background: radial-gradient(circle at 50% 35%, rgba(255, 217, 232, 0.45), rgba(236, 228, 255, 0.38) 55%, rgba(247, 242, 255, 0.6));
+  }
+  html[data-theme="dark"] body.standalone-qa {
+    background: radial-gradient(circle at 50% 35%, rgba(74, 36, 64, 0.48), rgba(30, 26, 38, 0.94));
+  }
+  @media (prefers-color-scheme: dark) {
+    html:not([data-theme="light"]) body.standalone-qa {
+      background: radial-gradient(circle at 50% 35%, rgba(74, 36, 64, 0.48), rgba(30, 26, 38, 0.94));
+    }
+  }
+  .hud {
+    position: relative;
+    width: 522px;
+    max-width: calc(100vw - 16px);
+    height: 62px;
+    padding: 0 12px 0 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border-radius: 999px;
+    background: var(--surface);
+    -webkit-backdrop-filter: blur(24px) saturate(185%);
+    backdrop-filter: blur(24px) saturate(185%);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+    transition: opacity 140ms ease-out, transform 200ms cubic-bezier(0.22, 1, 0.36, 1), width 180ms ease;
+  }
+  .hud.on { opacity: 1; transform: translateY(0) scale(1); }
+  .hud.error { width: 460px; }
+  .hud.connecting::before,
+  .hud.phase-thinking::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 1.5px;
+    border-radius: 999px;
+    background: conic-gradient(from var(--beam, 0deg), transparent 0deg, var(--pink) 80deg, var(--lav) 160deg, transparent 240deg);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    animation: beam-spin 1.4s linear infinite;
+    pointer-events: none;
+  }
+  @property --beam {
+    syntax: "<angle>";
+    inherits: false;
+    initial-value: 0deg;
+  }
+  @keyframes beam-spin {
+    to { --beam: 360deg; }
+  }
+  .mascot-orb {
+    width: 44px;
+    height: 44px;
+    flex: none;
+    position: relative;
+    border-radius: 50%;
+    border: 1.5px solid var(--border);
+    background: var(--orb-bg);
+    box-shadow: var(--orb-shadow);
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+  }
+  .mascot-img {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+    transition: filter 160ms ease, opacity 160ms ease;
+  }
+  .hud.phase-speaking .mascot-orb {
+    border-color: var(--lav);
+    box-shadow: 0 3px 14px rgba(159, 132, 247, 0.40);
+  }
+  .hud.phase-thinking .mascot-orb,
+  .hud.connecting .mascot-orb {
+    border-color: var(--lav);
+    box-shadow: 0 3px 12px rgba(159, 132, 247, 0.30);
+  }
+  .hud.is-muted .mascot-orb {
+    border-color: var(--muted);
+    box-shadow: none;
+  }
+  .hud.is-muted .mascot-img {
+    filter: saturate(0.45) brightness(0.9);
+    opacity: 0.86;
+  }
+  .hud.error .mascot-orb {
+    border-color: var(--danger);
+    box-shadow: 0 3px 10px rgba(217, 56, 97, 0.34);
+  }
+  .hud.error .mascot-img {
+    filter: saturate(0.72);
+  }
+  .mascot-orb::after {
+    content: "";
+    position: absolute;
+    inset: -3px;
+    border-radius: 50%;
+    border: 1.5px solid var(--pink);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .hud.active:not(.is-muted) .mascot-orb::after {
+    animation: ring 1.45s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
+  }
+  .hud.phase-speaking .mascot-orb::after {
+    border-color: var(--lav);
+    animation: ring 0.95s cubic-bezier(0.2, 0.7, 0.3, 1) infinite;
+  }
+  @keyframes ring {
+    0% { opacity: 0.68; transform: scale(0.92); }
+    100% { opacity: 0; transform: scale(1.18); }
+  }
+  .mascot-badge {
+    position: absolute;
+    right: -2px;
+    bottom: -2px;
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    border: 1.5px solid var(--badge-ring);
+    background: linear-gradient(135deg, var(--lav), var(--pink));
+    color: #fff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24);
+    z-index: 2;
+  }
+  .mascot-badge svg {
+    width: 10px;
+    height: 10px;
+    fill: currentColor;
+    display: block;
+  }
+  .mascot-badge.is-muted {
+    background: var(--muted-badge-bg);
+  }
+  .mascot-badge.is-error {
+    background: var(--danger-solid);
+  }
+  .mascot-badge .spin {
+    width: 9px;
+    height: 9px;
+    border-width: 1.6px;
+  }
+  .text {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+  }
+  .title-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .title {
+    min-width: 0;
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 17px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .dsp-pill {
+    flex: none;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 14px;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+  }
+  .sub {
+    font-size: 11px;
+    line-height: 14px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .hud.error .title {
+    color: var(--danger);
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    font-size: 12px;
+    line-height: 15px;
+  }
+  .bars {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 24px;
+    padding: 0 1px;
+  }
+  .bars i {
+    display: block;
+    width: 2.5px;
+    height: 4px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, var(--pink), var(--lav));
+    transition: height 75ms cubic-bezier(0.22, 1, 0.36, 1), opacity 100ms ease;
+    opacity: 0.78;
+  }
+  .time {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    color: var(--accent-text);
+    font-weight: 700;
+    min-width: 36px;
+    text-align: right;
+  }
+  .actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .act-btn {
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--btn-border);
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    padding: 0;
+    background: var(--btn-bg);
+    color: var(--ink-soft);
+    transition: transform 100ms ease, background 120ms ease, color 120ms ease, border-color 120ms ease;
+  }
+  .act-btn:hover { background: var(--btn-hover); color: var(--ink); transform: scale(1.05); }
+  .act-btn:active { transform: scale(0.95); }
+  .act-btn.is-muted {
+    background: var(--danger-bg);
+    color: var(--danger);
+    border-color: var(--danger-border);
+  }
+  .act-btn svg { width: 14px; height: 14px; fill: currentColor; }
+  .hangup-btn {
+    height: 30px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 700;
+    line-height: 1;
+    white-space: nowrap;
+    color: #fff;
+    background: linear-gradient(135deg, #ff5d8f, #d93861);
+    box-shadow: 0 2px 8px rgba(217, 56, 97, 0.30);
+    transition: transform 100ms ease, filter 120ms ease;
+  }
+  .hangup-btn:hover { filter: brightness(0.96); transform: scale(1.03); }
+  .hangup-btn:active { transform: scale(0.96); }
+  .hangup-btn svg { width: 13px; height: 13px; fill: currentColor; flex: none; }
+  .spin {
+    width: 15px;
+    height: 15px;
+    border: 2px solid rgba(255, 255, 255, 0.42);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.75s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  [hidden] { display: none !important; }
+  @media (prefers-reduced-motion: reduce) {
+    .hud, .bars i, .act-btn, .hangup-btn, .mascot-orb, .mascot-img { transition: none; }
+    .hud.active:not(.is-muted) .mascot-orb::after,
+    .hud.phase-speaking .mascot-orb::after,
+    .spin,
+    .hud.connecting::before,
+    .hud.phase-thinking::before { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div class="hud" id="hud" role="status" aria-live="polite">
+  <div class="mascot-orb" id="mascotOrb">
+    <img class="mascot-img" id="mascotImg" src="assets/call/connecting.webp" alt="小羊" />
+    <span class="mascot-badge" id="mascotBadge" hidden></span>
+  </div>
+  <div class="text">
+    <div class="title-row">
+      <div class="title" id="title">正在接通小羊…</div>
+      <span class="dsp-pill" id="dspBadge" hidden></span>
+    </div>
+    <div class="sub" id="sub">直接说话即可 · 再按快捷键挂断</div>
+  </div>
+  <div class="bars" id="bars"></div>
+  <div class="time" id="time">00:00</div>
+  <div class="actions" id="actions">
+    <button type="button" class="act-btn" id="btnMute" aria-label="静音" aria-pressed="false" title="静音"></button>
+    <button type="button" class="hangup-btn" id="btnHangup" aria-label="挂断" title="挂断"></button>
+  </div>
+</div>
+<script src="voice-hud.js"></script>
+</body>
+</html>

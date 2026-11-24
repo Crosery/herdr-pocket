@@ -82,8 +82,18 @@ test("agent.create without a folder opens in the home folder; the shell gets no 
   h.stop();
 });
 
-test("a closed desktop window without a herdr-app doc is still reported, not worked around", async () => {
+test("a closed desktop window without a herdr-app doc still allows listing labeled spaces and creating via hc", async () => {
   const { h, call, started } = headless();
+  const labeled: Array<{ addr: string; labels: Record<string, string> }> = [];
+  h.hc.terminals.set("t1", {
+    address: "t1",
+    cwd: homedir(),
+    state: "live",
+    labels: { "herdr.space": "sp-live", "herdr.tab": "tb-live", where: "测试 / tab1" },
+  });
+  h.hc.label = async (addr, labels) => {
+    labeled.push({ addr, labels });
+  };
   h.app.ls = async () => {
     throw new Error("herdr-app ls failed: no herdr window");
   };
@@ -91,10 +101,20 @@ test("a closed desktop window without a herdr-app doc is still reported, not wor
     throw new Error("桌面 herdr 没有打开，先在电脑上打开它");
   };
   const r = await call("spaces.list", {});
-  assert.equal(r.canCreate, false);
-  assert.equal(r.standalone, undefined);
-  await assert.rejects(call("agent.create", { launcher: "kimi" }), (e: any) => e.code === "unsupported" && /没有打开/.test(e.message));
-  assert.equal(started.length, 0);
+  assert.equal(r.canCreate, true);
+  assert.equal(r.reason, undefined);
+  assert.equal(r.spaces.length, 1);
+  assert.equal(r.spaces[0]!.id, "sp-live");
+  assert.equal(r.spaces[0]!.name, "测试");
+
+  const created = await call("agent.create", { space: "sp-live", spaceName: "测试", tabName: "shell", launcher: "shell", folder: homedir() });
+  assert.equal(started.length, 1);
+  assert.equal(created.agent, "d/hc:t9");
+  assert.equal(created.space, "sp-live");
+  assert.deepEqual(labeled, [{ addr: "t9", labels: { "herdr.space": "sp-live", where: "测试 / shell" } }]);
+
+  const layout = await call("herdr.layout", {});
+  assert.deepEqual(layout, { spaces: [] });
   h.stop();
 });
 

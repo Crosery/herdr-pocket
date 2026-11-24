@@ -42,7 +42,7 @@ export class LogBuffer {
     let packed: Record<string, unknown> | undefined;
     if (data) {
       packed = {};
-      for (const [k, v] of Object.entries(data)) if (v !== undefined) packed[k] = typeof v === "string" ? clipChars(redactLine(v), 300) : v;
+      for (const [k, v] of Object.entries(data)) if (v !== undefined) packed[k] = typeof v === "string" ? clipChars(redactLine(v), 500) : v;
     }
     this.items.push({ ts: Date.now(), level, kind, msg: clipChars(redactLine(msg.replace(/\s+/g, " ").trim()), 500), data: packed });
     if (this.items.length > this.max) {

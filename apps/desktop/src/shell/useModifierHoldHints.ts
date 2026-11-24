@@ -2,8 +2,10 @@ import { createElement, useEffect } from "react";
 import { createStore, settingsStore } from "../lib/store";
 import {
   chordFromModifierEvent,
+  chordIncludesPrefix,
   chordOfKeys,
   IS_MAC,
+  remainingSuffixChip,
   SHORTCUTS,
   shortcutText,
   type ShortcutId,
@@ -27,6 +29,58 @@ function inferChordFromText(text: string): ShortcutModifierChord {
   if (/(?:⇧|Shift)/i.test(text)) return "Mod+Shift";
   if (/(?:⌥|Alt)/i.test(text)) return "Mod+Alt";
   return "Mod";
+}
+
+function parseDisplayKeys(displayText: string, chord: ShortcutModifierChord): string[] {
+  const cleaned = displayText
+    .replace(/^⌘/, "")
+    .replace(/^Ctrl\+/i, "")
+    .replace(/^[⌥⇧]+/, "")
+    .replace(/^(?:Alt\+|Shift\+)+/i, "");
+  const parts = chord.split("+");
+  return [...parts, cleaned || displayText];
+}
+
+export type SpatialHintCorner = "tr" | "br" | "center" | "right" | "stack";
+
+/** Pure CSS-toggled floating keycap badge matching held modifier prefix `[data-shortcut-hints]`. */
+export function SpatialHint({
+  text,
+  shortcut,
+  chord,
+  corner = "tr",
+  className = "",
+}: {
+  text?: string;
+  shortcut?: ShortcutId;
+  chord?: ShortcutModifierChord;
+  corner?: SpatialHintCorner;
+  className?: string;
+}) {
+  const displayText = text ?? (shortcut ? shortcutText(shortcut) : "");
+  if (!displayText) return null;
+  const def = shortcut ? SHORTCUTS.find((x) => x.id === shortcut) : undefined;
+  const resolvedChord = chord ?? (def ? chordOfKeys(def.keys) ?? inferChordFromText(displayText) : inferChordFromText(displayText));
+  const resolvedKeys = def?.keys ?? parseDisplayKeys(displayText, resolvedChord);
+  const chipProps: Record<string, string> = {};
+  if (chordIncludesPrefix(resolvedChord, "Mod")) {
+    chipProps["data-chip-mod"] = remainingSuffixChip(resolvedKeys, "Mod");
+  }
+  if (chordIncludesPrefix(resolvedChord, "Mod+Shift")) {
+    chipProps["data-chip-mod-shift"] = remainingSuffixChip(resolvedKeys, "Mod+Shift");
+  }
+  if (chordIncludesPrefix(resolvedChord, "Mod+Alt")) {
+    chipProps["data-chip-mod-alt"] = remainingSuffixChip(resolvedKeys, "Mod+Alt");
+  }
+  if (chordIncludesPrefix(resolvedChord, "Mod+Alt+Shift")) {
+    chipProps["data-chip-mod-alt-shift"] = remainingSuffixChip(resolvedKeys, "Mod+Alt+Shift");
+  }
+  return createElement("kbd", {
+    className: `v3-spatial-hint pos-${corner}${className ? ` ${className}` : ""}`,
+    "data-chord": resolvedChord,
+    "aria-hidden": "true",
+    ...chipProps,
+  });
 }
 
 /**
@@ -133,35 +187,4 @@ export function useModifierHoldHints(): void {
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [enabled]);
-}
-
-export type SpatialHintCorner = "tr" | "br" | "center" | "right";
-
-/** Pure CSS-toggled floating keycap badge matching `[data-shortcut-hints="<chord>"]`. */
-export function SpatialHint({
-  text,
-  shortcut,
-  chord,
-  corner = "tr",
-  className = "",
-}: {
-  text?: string;
-  shortcut?: ShortcutId;
-  chord?: ShortcutModifierChord;
-  corner?: SpatialHintCorner;
-  className?: string;
-}) {
-  const displayText = text ?? (shortcut ? shortcutText(shortcut) : "");
-  if (!displayText) return null;
-  const def = shortcut ? SHORTCUTS.find((x) => x.id === shortcut) : undefined;
-  const resolvedChord = chord ?? (def ? chordOfKeys(def.keys) ?? inferChordFromText(displayText) : inferChordFromText(displayText));
-  return createElement(
-    "kbd",
-    {
-      className: `v3-spatial-hint pos-${corner}${className ? ` ${className}` : ""}`,
-      "data-chord": resolvedChord,
-      "aria-hidden": "true",
-    },
-    displayText,
-  );
 }

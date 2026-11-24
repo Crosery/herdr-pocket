@@ -106,6 +106,57 @@ const initialState: PortalState = {
 
 let state: PortalState = initialState;
 const listeners = new Set<() => void>();
+const unsupportedHostVersions = new Map<string, string>();
+const hostPortalWatchers = new Map<
+  string,
+  {
+    refs: number;
+    stop: () => void;
+  }
+>();
+
+function hostVersionKey(hostId: string): string {
+  const dev = liveStore.get().devices[hostId];
+  return `${dev?.version ?? ""}:${dev?.online ? 1 : 0}`;
+}
+
+const UNSUPPORTED_PORTAL_CAPS: HostPortalCapabilities = {
+  platform: "unknown",
+  sessionType: "headless",
+  canListWindows: false,
+  canCaptureWindow: false,
+  canCaptureScreen: false,
+  canInjectInput: false,
+  hasCdpBrowser: false,
+};
+
+export function isHostPortalUnsupported(hostId: string): boolean {
+  const cached = unsupportedHostVersions.get(hostId);
+  if (!cached) return false;
+  if (cached === hostVersionKey(hostId)) return true;
+  unsupportedHostVersions.delete(hostId);
+  return false;
+}
+
+export function isPortalUnsupportedError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  const msg = String((err as { message?: unknown; error?: unknown }).message ?? (err as { error?: unknown }).error ?? "");
+  if (code === "unsupported") return true;
+  return /unknown method\s+portal\.|unknown stream\b|unsupported.*portal/i.test(msg);
+}
+
+export function markHostPortalUnsupported(hostId: string): void {
+  unsupportedHostVersions.set(hostId, hostVersionKey(hostId));
+}
+
+export function resetPortalClientStateForTest(): void {
+  unsupportedHostVersions.clear();
+  for (const w of hostPortalWatchers.values()) {
+    w.stop();
+  }
+  hostPortalWatchers.clear();
+}
 
 function setState(updater: (prev: PortalState) => PortalState): void {
   state = updater(state);
@@ -201,10 +252,32 @@ export async function refreshHostPortals(
   agentKey?: string,
   includeWindows = false,
 ): Promise<{ items: PortalItem[]; windows?: RemoteWindowInfo[]; capabilities: HostPortalCapabilities }> {
-  const res = await rpcCall(hostId, "portal.list", {
-    ...(agentKey ? { agent: agentKey } : {}),
-    includeWindows,
-  });
+  if (isHostPortalUnsupported(hostId) && !includeWindows) {
+    return {
+      items: [],
+      capabilities: UNSUPPORTED_PORTAL_CAPS,
+    };
+  }
+  let res: { items: PortalItem[]; windows?: RemoteWindowInfo[]; capabilities: HostPortalCapabilities };
+  try {
+    res = await rpcCall(hostId, "portal.list", {
+      ...(agentKey ? { agent: agentKey } : {}),
+      includeWindows,
+    });
+    unsupportedHostVersions.delete(hostId);
+  } catch (err) {
+    if (isPortalUnsupportedError(err)) {
+      markHostPortalUnsupported(hostId);
+      if (includeWindows) {
+        throw new Error("这台电脑的 herdr-pocket 版本较旧，暂不支持跨端窗口回传，请先更新工具");
+      }
+      return {
+        items: [],
+        capabilities: UNSUPPORTED_PORTAL_CAPS,
+      };
+    }
+    throw err;
+  }
   setState((prev) => {
     const nextItems = { ...prev.itemsById };
     if (agentKey) {
@@ -305,22 +378,54 @@ export async function sendPortalInput(
   return res;
 }
 
-export function subscribeAgentPortalUpdates(hostId: string, agentKey: string): () => void {
+export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): () => void {
+  const existing = hostPortalWatchers.get(hostId);
+  if (existing) {
+    existing.refs += 1;
+    return () => {
+      const cur = hostPortalWatchers.get(hostId);
+      if (!cur) return;
+      cur.refs -= 1;
+      if (cur.refs <= 0) {
+        hostPortalWatchers.delete(hostId);
+        cur.stop();
+      }
+    };
+  }
+
   let alive = true;
   let streamFailed = false;
-  void refreshHostPortals(hostId, agentKey, false).catch(() => {});
+  let timer = 0;
+
+  const stopRecoveryTimer = () => {
+    if (timer) {
+      window.clearInterval(timer);
+      timer = 0;
+    }
+  };
+
+  if (!isHostPortalUnsupported(hostId)) {
+    void refreshHostPortals(hostId, undefined, false).catch(() => {});
+  }
 
   const unsub = subscribeStream(
     hostId,
     "portal",
-    { agent: agentKey },
+    {},
     (ev) => {
       if (alive) ingestPortalStreamEvent(ev);
     },
     (st) => {
       if (!alive) return;
-      if (st?.kind === "error") streamFailed = true;
+      if (st?.kind === "error") {
+        streamFailed = true;
+        if (isPortalUnsupportedError(st)) {
+          markHostPortalUnsupported(hostId);
+          stopRecoveryTimer();
+        }
+      }
       if (st?.kind === "live" && Array.isArray(st.result?.items)) {
+        unsupportedHostVersions.delete(hostId);
         for (const item of st.result.items as PortalItem[]) {
           ingestPortalStreamEvent({ kind: "portal_event", action: "updated", item, at: Date.now() });
         }
@@ -328,18 +433,36 @@ export function subscribeAgentPortalUpdates(hostId: string, agentKey: string): (
     },
   );
 
-  // Light recovery poll in case an older relay rejects `stream: "portal"`
-  const timer = window.setInterval(() => {
+  // Light recovery poll in case an older relay rejects `stream: "portal"`, stopping immediately if hostd lacks portal.*.
+  timer = window.setInterval(() => {
     if (!alive) return;
+    if (isHostPortalUnsupported(hostId)) {
+      stopRecoveryTimer();
+      return;
+    }
     if (streamFailed) {
-      void refreshHostPortals(hostId, agentKey, false).catch(() => {});
+      void refreshHostPortals(hostId, undefined, false).catch(() => {});
     }
   }, 5000);
 
+  const entry = {
+    refs: 1,
+    stop: () => {
+      alive = false;
+      stopRecoveryTimer();
+      unsub();
+    },
+  };
+  hostPortalWatchers.set(hostId, entry);
+
   return () => {
-    alive = false;
-    window.clearInterval(timer);
-    unsub();
+    const cur = hostPortalWatchers.get(hostId);
+    if (!cur) return;
+    cur.refs -= 1;
+    if (cur.refs <= 0) {
+      hostPortalWatchers.delete(hostId);
+      cur.stop();
+    }
   };
 }
 

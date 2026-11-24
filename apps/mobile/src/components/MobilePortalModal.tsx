@@ -59,22 +59,45 @@ function mapContainedTap(opts: {
   };
 }
 
-export function useAgentPortals(hostId: string, agentKey: string): {
+const unsupportedPortalHosts = new Map<string, string>();
+
+function hostVersionKey(hostId: string, appVersion?: string): string {
+  return `${hostId}:${appVersion ?? ""}`;
+}
+
+export function useAgentPortals(hostId: string, agentKey: string, hostVersion?: string): {
   items: PortalItem[];
+  unsupported: boolean;
   refresh: () => void;
 } {
   const [items, setItems] = useState<PortalItem[]>([]);
+  const verKey = hostVersionKey(hostId, hostVersion);
+  const [unsupported, setUnsupported] = useState(() => unsupportedPortalHosts.get(hostId) === verKey);
 
   const refresh = useCallback(() => {
+    if (unsupportedPortalHosts.get(hostId) === verKey) {
+      setUnsupported(true);
+      setItems([]);
+      return;
+    }
     void call(hostId, "portal.list", { agent: agentKey })
       .then((res) => {
+        unsupportedPortalHosts.delete(hostId);
+        setUnsupported(false);
         setItems(res.items ?? []);
       })
-      .catch(() => {});
-  }, [agentKey, hostId]);
+      .catch((e: { code?: string; message?: string }) => {
+        if (e?.code === "unsupported" || /unknown method\s+portal\./i.test(String(e?.message ?? ""))) {
+          unsupportedPortalHosts.set(hostId, verKey);
+          setUnsupported(true);
+          setItems([]);
+        }
+      });
+  }, [agentKey, hostId, verKey]);
 
   useEffect(() => {
     refresh();
+    if (unsupportedPortalHosts.get(hostId) === verKey) return;
     const unsub = subscribe(hostId, "portal", { agent: agentKey }, (raw) => {
       const ev = raw as Partial<PortalStreamEvent>;
       if (ev?.kind !== "portal_event" || !ev.item) return;
@@ -89,9 +112,9 @@ export function useAgentPortals(hostId: string, agentKey: string): {
       });
     });
     return unsub;
-  }, [agentKey, hostId, refresh]);
+  }, [agentKey, hostId, refresh, verKey]);
 
-  return { items, refresh };
+  return { items, unsupported, refresh };
 }
 
 export function MobilePortalBanner({
@@ -310,7 +333,12 @@ export function MobilePortalModal({
         setSelectedId(res.item.id);
         onChanged();
       } catch (e) {
-        setErr(friendlyError(e));
+        const errObj = e as { code?: string; message?: string };
+        if (errObj?.code === "unsupported" || /unknown method\s+portal\./i.test(String(errObj?.message ?? ""))) {
+          setErr("这台电脑的 herdr-pocket 版本较旧，暂不支持跨端窗口回传，请先更新工具");
+        } else {
+          setErr(friendlyError(e));
+        }
       } finally {
         setBusy(false);
       }

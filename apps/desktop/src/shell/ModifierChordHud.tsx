@@ -1,5 +1,12 @@
 import { useMemo } from "react";
-import { keyChips, nextModifierSteps, shortcutsForChord, shortcutText, type ShortcutModifierChord } from "./shortcuts";
+import {
+  keyChips,
+  nextModifierSteps,
+  shortcutsMatchingChordPrefix,
+  shortcutText,
+  type ShortcutId,
+  type ShortcutModifierChord,
+} from "./shortcuts";
 import { useActiveModifierChord } from "./useModifierHoldHints";
 
 const SHORT_LABELS: Record<string, string> = {
@@ -46,12 +53,36 @@ const SHORT_LABELS: Record<string, string> = {
   interruptAgent: "中断回复",
 };
 
-const PRIORITY_BY_CHORD: Record<ShortcutModifierChord, string[]> = {
-  Mod: ["splitRight", "newAgent", "closeTab", "toggleSidebar", "togglePanel", "palette", "shortcutHelp"],
-  "Mod+Shift": ["splitDown", "zoomPane", "closeWholeTab", "nextTab", "jumpUrgent", "toggleGit", "assistant"],
-  "Mod+Alt": ["focusPaneLeft", "focusPaneRight", "equalizeSplits", "prevSpace", "nextSpace", "openModelPicker", "toggleBrowser"],
-  "Mod+Alt+Shift": ["swapPaneLeft", "swapPaneRight", "swapPaneUp", "swapPaneDown", "unsplitTab"],
-};
+const PRIORITY_IDS: ShortcutId[] = [
+  "splitRight",
+  "newAgent",
+  "closeTab",
+  "toggleSidebar",
+  "togglePanel",
+  "palette",
+  "splitDown",
+  "zoomPane",
+  "closeWholeTab",
+  "nextTab",
+  "jumpUrgent",
+  "toggleGit",
+  "assistant",
+  "focusPaneLeft",
+  "focusPaneRight",
+  "equalizeSplits",
+  "prevSpace",
+  "nextSpace",
+  "openModelPicker",
+  "toggleBrowser",
+  "swapPaneLeft",
+  "swapPaneRight",
+  "swapPaneUp",
+  "swapPaneDown",
+  "unsplitTab",
+  "shortcutHelp",
+];
+
+const PRIORITY_RANK = new Map<ShortcutId, number>(PRIORITY_IDS.map((id, i) => [id, i]));
 
 const STEP_SUMMARY: Record<ShortcutModifierChord, string> = {
   Mod: "基础导航",
@@ -61,8 +92,8 @@ const STEP_SUMMARY: Record<ShortcutModifierChord, string> = {
 };
 
 /**
- * Floating bottom chord guide bar shown while holding ⌘ / Ctrl and stepping into
- * second modifiers (⇧ / ⌥ / ⌥⇧), always pointer-events: none.
+ * Floating bottom chord guide bar shown while holding ⌘ / Ctrl and narrowing live as
+ * second/third modifiers (⇧ / ⌥) are added or released, always pointer-events: none.
  */
 export function ModifierChordHud() {
   const chord = useActiveModifierChord();
@@ -70,23 +101,20 @@ export function ModifierChordHud() {
   const model = useMemo(() => {
     if (!chord) return null;
     const modChips = keyChips(chord.split("+"));
-    const entries = shortcutsForChord(chord);
-    const byId = new Map(entries.map((entry) => [entry.shortcut.id, entry] as const));
-    const ordered: typeof entries = [];
-    for (const id of PRIORITY_BY_CHORD[chord]) {
-      const hit = byId.get(id as any);
-      if (hit) {
-        ordered.push(hit);
-        byId.delete(id as any);
-      }
-    }
-    for (const rest of byId.values()) {
-      if (!rest.shortcut.helpOnly) ordered.push(rest);
-    }
-    const items = ordered.slice(0, 7).map((item) => ({
+    const matching = shortcutsMatchingChordPrefix(chord).filter((entry) => !entry.shortcut.helpOnly);
+    matching.sort((a, b) => {
+      if (a.exact !== b.exact) return a.exact ? -1 : 1;
+      const ra = PRIORITY_RANK.get(a.shortcut.id) ?? 999;
+      const rb = PRIORITY_RANK.get(b.shortcut.id) ?? 999;
+      if (ra !== rb) return ra - rb;
+      return 0;
+    });
+    const maxItems = chord === "Mod" ? 12 : 9;
+    const items = matching.slice(0, maxItems).map((item) => ({
       id: item.shortcut.id,
       key: item.actionChip,
       label: SHORT_LABELS[item.shortcut.id] ?? item.shortcut.label,
+      exact: item.exact,
     }));
     const steps = nextModifierSteps(chord).map((s) => ({
       ...s,
@@ -108,7 +136,7 @@ export function ModifierChordHud() {
       </div>
       <div className="v3-chord-items">
         {model.items.map((item) => (
-          <span key={item.id} className="v3-chord-item">
+          <span key={item.id} className={`v3-chord-item${item.exact ? "" : " is-subchord"}`}>
             <kbd className="v3-chord-key">{item.key}</kbd>
             <span>{item.label}</span>
           </span>

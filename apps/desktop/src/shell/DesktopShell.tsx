@@ -1213,6 +1213,19 @@ export function DesktopShell({
     return () => window.removeEventListener("keydown", onKey);
   }, [canToggleSidebar, newAgent, newSpace, onToggleSidebar, spawnTerminalNow]);
 
+  const handleShellNewTerminal = useCallback(() => {
+    void spawnTerminalNow();
+  }, [spawnTerminalNow]);
+  const handleShellNewAgent = useCallback(() => {
+    newAgent();
+  }, [newAgent]);
+  const handleShellSplitNewTerminal = useCallback(
+    (tabId: string, paneId: string, direction: SplitDirection) => {
+      void spawnTerminalNow(null, null, { tabId, paneId, direction });
+    },
+    [spawnTerminalNow],
+  );
+
   return (
     <div className={`v3${collapsed ? " collapsed" : ""}`}>
       <ShellSidebar
@@ -1226,14 +1239,12 @@ export function DesktopShell({
         onNewTerminal={(h, sp) => void spawnTerminalNow(h, sp)}
       />
       <div className="v3-work">
-        <ShellTabs onNewTerminal={() => void spawnTerminalNow()} onNewAgent={() => newAgent()} padForLights={collapsed} />
+        <ShellTabs onNewTerminal={handleShellNewTerminal} onNewAgent={handleShellNewAgent} padForLights={collapsed} />
         <div className="v3-body">
           <ShellMain
-            onNewTerminal={() => void spawnTerminalNow()}
-            onNewAgent={() => newAgent()}
-            onSplitNewTerminal={(tabId, paneId, direction) => {
-              void spawnTerminalNow(null, null, { tabId, paneId, direction });
-            }}
+            onNewTerminal={handleShellNewTerminal}
+            onNewAgent={handleShellNewAgent}
+            onSplitNewTerminal={handleShellSplitNewTerminal}
           />
           <ShellPanel />
           <PeekOverlay />

@@ -1538,6 +1538,17 @@ export function resizeTabSplit(tabId: string, branchId: string, index: number, d
   });
 }
 
+export function commitTabSplitRoot(tabId: string, nextRoot: SplitNode): void {
+  set((s) => {
+    const tab = s.tabs.find((t) => t.id === tabId);
+    if (!tab) return s;
+    return {
+      ...s,
+      tabs: s.tabs.map((t) => (t.id === tabId ? applyRootToTab(t, nextRoot) : t)),
+    };
+  });
+}
+
 export function equalizeTabSplits(tabId: string, branchId?: string): void {
   set((s) => {
     const tab = s.tabs.find((t) => t.id === tabId);

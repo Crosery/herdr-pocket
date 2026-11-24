@@ -39,6 +39,7 @@ import { InputWaits } from "./waiting.ts";
 import { typeFirstTask, type TypeTaskOptions } from "./firsttask.ts";
 import { FILES_DIR, checkFiles, putLocal, putThrough, type CheckedFile } from "./put.ts";
 import { LogBuffer, clipChars, levelOf } from "./logbuf.ts";
+import { startHostTelemetry } from "./sysTelemetry.ts";
 import { CONFIG_DIR, type HostConfig } from "./config.ts";
 import { defaultHcBin } from "./platform.ts";
 import { FilesError, listFiles, listFolders, readFileSlice } from "./files.ts";
@@ -202,6 +203,7 @@ export class Host {
   /** This computer's own log lines, uploaded to the relay every minute. */
   logs = new LogBuffer();
   private logTimer: NodeJS.Timeout | null = null;
+  private stopTelemetry: (() => void) | null = null;
   /** How often the log ring is uploaded. */
   logEveryMs = 60_000;
   /** How long agent.create waits for a program before typing its first task (tests shorten it). */
@@ -395,6 +397,14 @@ export class Host {
     }
     this.logTimer = setInterval(() => this.flushLogs(), this.logEveryMs);
     this.logTimer.unref?.();
+    this.stopTelemetry = startHostTelemetry(
+      (level, kind, msg, data) => this.note(level, kind, msg, data),
+      () => ({
+        agentCount: this.agents.length,
+        activeStreams: this.streamStops.size,
+        directPeers: this.direct.connected().length,
+      }),
+    );
     this.screenQueueTimer = setInterval(() => void this.refreshScreenQueues(), this.screenQueueMs);
     this.screenQueueTimer.unref?.();
     const hook = await this.portal.startHookAndShims().catch(() => null);
@@ -483,6 +493,8 @@ export class Host {
     if (this.namesTimer) clearInterval(this.namesTimer);
     if (this.sourceTimer) clearInterval(this.sourceTimer);
     if (this.logTimer) clearInterval(this.logTimer);
+    this.stopTelemetry?.();
+    this.stopTelemetry = null;
     if (this.waitTimer) clearInterval(this.waitTimer);
     if (this.screenQueueTimer) clearInterval(this.screenQueueTimer);
     this.flushLogs();
@@ -1197,12 +1209,17 @@ export class Host {
       if (e instanceof NoDesktopApp) {
         // Standalone herdr-core (Windows / servers) without a desktop app.
       } else if (isHerdrWindowClosedError(e)) {
-        const doc = await this.hc.docGet("herdr-app").catch(() => null);
+        const doc = (await this.hc.docGet("herdr-app").catch(() => null)) ?? this.app.readHerdrDocFromDisk();
         const val = doc?.value;
-        if (!val || typeof val !== "object" || Array.isArray(val) || !Array.isArray((val as { spaces?: unknown }).spaces)) {
-          throw new RpcFailure("unsupported", (e as Error).message);
+        if (
+          val &&
+          typeof val === "object" &&
+          !Array.isArray(val) &&
+          Array.isArray((val as { spaces?: unknown }).spaces) &&
+          typeof this.hc.docSet === "function"
+        ) {
+          closedDoc = doc;
         }
-        closedDoc = doc;
       } else {
         throw new RpcFailure("unsupported", (e as Error).message);
       }
@@ -1212,20 +1229,39 @@ export class Host {
       const portalEnv = this.portal.isHookRunning() ? this.portal.childEnv() : undefined;
       const terminal = portalEnv ? await this.hc.spawnTerminal(argv, resolvedCwd, portalEnv) : await this.hc.spawnTerminal(argv, resolvedCwd);
       if (closedDoc) {
-        const placed = await this.app.createInDocWhenWindowClosed(
-          {
-            ...docFallbackOpts,
-            folder: resolvedCwd,
-            terminal,
-            initialDoc: closedDoc,
-          },
-          this.hc,
-        );
-        this.note("info", "create", `herdr window closed: started ${argv[0] ? base(argv[0]) : "a shell"} as ${terminal} in doc space ${placed.space}`);
-        return { space: placed.space, tab: placed.tab, terminal, direct: true };
+        try {
+          const placed = await this.app.createInDocWhenWindowClosed(
+            {
+              ...docFallbackOpts,
+              folder: resolvedCwd,
+              terminal,
+              initialDoc: closedDoc,
+            },
+            this.hc,
+          );
+          this.note("info", "create", `herdr window closed: started ${argv[0] ? base(argv[0]) : "a shell"} as ${terminal} in doc space ${placed.space}`);
+          return { space: placed.space, tab: placed.tab, terminal, direct: true };
+        } catch {
+          // Fall through cleanly if `hc doc set` is unsupported (e.g. older hc binary).
+        }
       }
-      this.note("info", "create", `no desktop herdr here: started ${argv[0] ? base(argv[0]) : "a shell"} as ${terminal} with hc run`);
-      return { space: "", tab: "", terminal, direct: true };
+      const spaceId = docFallbackOpts?.space?.trim() || "";
+      const spaceLabelName =
+        docFallbackOpts?.spaceName?.trim() ||
+        (spaceId ? this.names?.spaces.get(spaceId) : undefined) ||
+        "";
+      const tabLabelName = docFallbackOpts?.tabName?.trim() || "";
+      const whereLabel = spaceLabelName ? (tabLabelName ? `${spaceLabelName} / ${tabLabelName}` : spaceLabelName) : "";
+      if ((spaceId || whereLabel) && this.hc.label) {
+        await this.hc
+          .label(terminal, {
+            ...(spaceId ? { "herdr.space": spaceId } : {}),
+            ...(whereLabel ? { where: whereLabel } : {}),
+          })
+          .catch(() => {});
+      }
+      this.note("info", "create", `hc headless: started ${argv[0] ? base(argv[0]) : "a shell"} as ${terminal} with hc run`);
+      return { space: spaceId, tab: "", terminal, direct: true };
     } catch (e) {
       throw new RpcFailure("unsupported", (e as Error).message);
     }
@@ -1433,17 +1469,47 @@ export class Host {
       try {
         spaces = await this.app.spaces(this.hc.terminals);
       } catch (e) {
-        // Without the desktop app (Windows, servers) new agents get terminals of their own.
-        if (e instanceof NoDesktopApp) standalone = true;
-        else {
+        // Without the desktop app (Windows, servers) or when its window is closed, hc still runs terminals.
+        if (e instanceof NoDesktopApp) {
+          standalone = true;
+        } else {
           spaces = this.app.spacesFromDocs(this.hc.terminals);
-          const doc = await this.hc.docGet("herdr-app").catch(() => null);
-          const docVal = doc?.value;
-          const hasHerdrDoc =
-            spaces.length > 0 ||
-            Boolean(docVal && typeof docVal === "object" && !Array.isArray(docVal) && Array.isArray((docVal as { spaces?: unknown }).spaces));
-          if (!hasHerdrDoc) {
-            reason ??= "桌面 herdr 没有打开，先在电脑上打开它";
+          if (spaces.length === 0) {
+            const grouped = new Map<string, { id: string; name: string; folder?: string; tabs: Set<string>; terminals: number }>();
+            for (const [addr, t] of this.hc.terminals.entries()) {
+              const sid = t.labels?.["herdr.space"]?.trim() || "";
+              const whereName = t.labels?.where?.split(" / ")[0]?.trim() || "";
+              const sname = (sid ? this.names?.spaces.get(sid) : undefined) || whereName || "";
+              const key = sid || sname;
+              if (!key) continue;
+              const existing = grouped.get(key);
+              const rec =
+                existing ??
+                (() => {
+                  const created = {
+                    id: sid || sname,
+                    name: sname || sid,
+                    folder: t.cwd ?? undefined,
+                    tabs: new Set<string>(),
+                    terminals: 0,
+                  };
+                  grouped.set(key, created);
+                  return created;
+                })();
+              if (!rec.folder && t.cwd) rec.folder = t.cwd;
+              rec.tabs.add(t.labels?.["herdr.tab"]?.trim() || addr);
+              rec.terminals += 1;
+            }
+            spaces = [...grouped.values()].map((g) => ({
+              id: g.id,
+              name: g.name,
+              ...(g.folder ? { folder: g.folder } : {}),
+              tabs: g.tabs.size,
+              terminals: g.terminals,
+            }));
+          }
+          if (!isHerdrWindowClosedError(e) && !spaces.length) {
+            standalone = true;
           }
         }
       }
@@ -1790,7 +1856,7 @@ export class Host {
         }
       }
       if (!rawSpaces) {
-        throw new RpcFailure("unsupported", "桌面 herdr 没有打开，先在电脑上打开它");
+        return { spaces: [] };
       }
       this.agents = this.collect();
       const byLocal = new Map(this.agents.filter((a) => a.source === "hc").map((a) => [a.localId, a]));

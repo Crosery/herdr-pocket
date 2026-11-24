@@ -4,7 +4,9 @@ import {
   type Device,
   type DeviceKind,
   type DirectOffer,
+  type JoinClaim,
   type JoinRequest,
+  type JoinTicket,
   type PairCode,
   type PairRequest,
   type PairResponse,
@@ -16,13 +18,15 @@ import {
   type StreamKind,
 } from "@herdr-pocket/protocol";
 import { DirectError, DirectLink, SAFE_AGAIN } from "./direct";
+import { createIdentityProof } from "./h5Identity";
 import { localHostIdStore, refreshLocalHostIdFast } from "./fonts";
 import { liveStore, settingsStore, updateSettings } from "./store";
 import { clearSession, defaultDeviceName, detectPlatform, getLocalPairCode, pushSystemNotification, saveSession, type LocalPairError } from "./bridge";
 import { isMockServer, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
-import { logger } from "./log";
+import { logger, registerWebLogUploader } from "./log";
 import { onNativeEvent } from "./native";
+import { recordClientRpcSample } from "./perfTelemetry";
 
 export class RelayError extends Error {
   code: RpcError["code"];
@@ -59,6 +63,7 @@ export async function restRequest<T>(
   let res: Response;
   try {
     res = await fetch(`${server}${path}`, {
+      credentials: "same-origin",
       ...init,
       signal: abort.signal,
       headers: { ...headers, ...(init.headers as Record<string, string> | undefined) },
@@ -90,7 +95,15 @@ export async function pairDevice(
   via: PairVia = "typed",
 ): Promise<PairResponse> {
   if (isMockServer(server)) return mockApi.pair(code, name, platform);
-  const req: PairRequest = { code: code.trim().toUpperCase(), name, kind: "viewer", platform, via };
+  const identity = await createIdentityProof();
+  const req: PairRequest = {
+    code: code.trim().toUpperCase(),
+    name,
+    kind: "viewer",
+    platform,
+    via,
+    ...(identity ? { identity } : {}),
+  };
   return restRequest<PairResponse>(server, "/v1/pair", {
     method: "POST",
     token: previousToken,
@@ -575,7 +588,7 @@ class SocketClient {
       case "stream_open": {
         const s = this.subs.get(f.id);
         if (!s) break;
-        if (f.error) s.onState?.({ kind: "error", error: f.error.message });
+        if (f.error) s.onState?.({ kind: "error", code: f.error.code, error: f.error.message });
         else s.onState?.({ kind: "live", result: f.result });
         break;
       }
@@ -783,18 +796,42 @@ class SocketClient {
     });
   }
 
-  call(to: string, method: RpcMethod, params: unknown, timeoutMs = 15_000): Promise<unknown> {
+  async call(to: string, method: RpcMethod, params: unknown, timeoutMs = 15_000): Promise<unknown> {
+    const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const elapsed = () => (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
     const link = this.direct.get(to);
     if (!link?.open || method === "direct.offer") {
-      return this.relayCall(to, method, params, timeoutMs);
-    }
-    return link.call(method, params, timeoutMs).catch((err: unknown) => {
-      if (!(err instanceof DirectError)) throw err;
-      if ((err.code === "offline" || err.code === "timeout") && SAFE_AGAIN.has(method)) {
-        return this.relayCall(to, method, params, timeoutMs);
+      try {
+        const out = await this.relayCall(to, method, params, timeoutMs);
+        recordClientRpcSample(method, elapsed(), false, true);
+        return out;
+      } catch (err) {
+        recordClientRpcSample(method, elapsed(), false, false);
+        throw err;
       }
+    }
+    try {
+      const out = await link.call(method, params, timeoutMs);
+      recordClientRpcSample(method, elapsed(), true, true);
+      return out;
+    } catch (err: unknown) {
+      if (!(err instanceof DirectError)) {
+        recordClientRpcSample(method, elapsed(), true, false);
+        throw err;
+      }
+      if ((err.code === "offline" || err.code === "timeout") && SAFE_AGAIN.has(method)) {
+        try {
+          const fallback = await this.relayCall(to, method, params, timeoutMs);
+          recordClientRpcSample(method, elapsed(), false, true);
+          return fallback;
+        } catch (err2) {
+          recordClientRpcSample(method, elapsed(), false, false);
+          throw err2;
+        }
+      }
+      recordClientRpcSample(method, elapsed(), true, false);
       throw new RelayError(err.code, err.message);
-    });
+    }
   }
 
   directEndpoint(to: string): { addr: string; port: number } | null {
@@ -875,13 +912,28 @@ export function startRelayLink(server: string, token: string): void {
   stopRelayLink();
   currentToken = token;
   if (isMockServer(server)) {
+    registerWebLogUploader(null);
     mockApi.connect();
     return;
   }
   activeClient = new SocketClient(server, token);
+  registerWebLogUploader(async (entries) => {
+    try {
+      const res = await fetch(`${normalizeServer(server)}/v1/logs`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ entries }),
+      });
+      if (res.status === 404 || res.status === 401) return true;
+      return res.ok;
+    } catch {
+      return false;
+    }
+  });
 }
 
 export function stopRelayLink(): void {
+  registerWebLogUploader(null);
   activeClient?.close();
   activeClient = null;
   currentToken = null;
@@ -952,20 +1004,9 @@ export function subscribeStream(
   return activeClient.subscribe(to, stream, params, onEvent, onState);
 }
 
-export async function completePairing(serverInput: string, code: string, customName?: string, via: PairVia = "typed"): Promise<void> {
+export async function applyAuthenticatedPairResponse(serverInput: string, res: PairResponse): Promise<void> {
   const server = normalizeServer(serverInput);
   if (!server) throw new RelayError("bad_request", "请填写服务器地址");
-  if (!isMockServer(server) && !code.trim()) throw new RelayError("bad_request", "请填写配对码");
-  const name = customName?.trim() || defaultDeviceName();
-  const prevServer = settingsStore.get().server;
-  const prevToken = prevServer === server ? currentToken ?? undefined : undefined;
-  // Never the code or the token in the log: only how the code arrived.
-  logger.info("pair", `pairing "${name}" with ${server} via ${via}`);
-  const res = await pairDevice(server, code || "DEMO-0000", name, detectPlatform(), prevToken, via).catch((err: Error) => {
-    logger.warn("pair", `pairing via ${via} failed: ${err.message}`);
-    throw err;
-  });
-  logger.info("pair", `paired as ${res.device.id}`);
   await saveSession({
     server,
     token: res.token,
@@ -980,6 +1021,52 @@ export async function completePairing(serverInput: string, code: string, customN
     ...(isMockServer(server) ? {} : { lastServer: server }),
   });
   startRelayLink(server, res.token);
+}
+
+export async function requestWebJoinTicket(serverInput: string, customName?: string): Promise<JoinTicket> {
+  const server = normalizeServer(serverInput);
+  if (!server) throw new RelayError("bad_request", "请先填写服务器地址");
+  if (isMockServer(server)) throw new RelayError("unsupported", "演示模式不支持扫码加入申请");
+  const name = customName?.trim() || defaultDeviceName();
+  const prevServer = settingsStore.get().server;
+  const prevToken = prevServer === server ? currentToken ?? undefined : undefined;
+  const identity = await createIdentityProof();
+  return restRequest<JoinTicket>(server, "/v1/join", {
+    method: "POST",
+    token: prevToken,
+    body: JSON.stringify({
+      name,
+      kind: "viewer",
+      platform: detectPlatform(),
+      ...(identity ? { identity } : {}),
+    }),
+  });
+}
+
+export async function claimWebJoinTicket(serverInput: string, id: string, secret: string): Promise<JoinClaim> {
+  const server = normalizeServer(serverInput);
+  if (!server) throw new RelayError("bad_request", "请先填写服务器地址");
+  return restRequest<JoinClaim>(server, `/v1/join/${encodeURIComponent(id)}/claim`, {
+    method: "POST",
+    body: JSON.stringify({ secret }),
+  });
+}
+
+export async function completePairing(serverInput: string, code: string, customName?: string, via: PairVia = "typed"): Promise<void> {
+  const server = normalizeServer(serverInput);
+  if (!server) throw new RelayError("bad_request", "请填写服务器地址");
+  if (!isMockServer(server) && !code.trim()) throw new RelayError("bad_request", "请填写配对码");
+  const name = customName?.trim() || defaultDeviceName();
+  const prevServer = settingsStore.get().server;
+  const prevToken = prevServer === server ? currentToken ?? undefined : undefined;
+  // Never the code or the token in the log: only how the code arrived.
+  logger.info("pair", `pairing "${name}" with ${server} via ${via}`);
+  const res = await pairDevice(server, code || "DEMO-0000", name, detectPlatform(), prevToken, via).catch((err: Error) => {
+    logger.warn("pair", `pairing via ${via} failed: ${err.message}`);
+    throw err;
+  });
+  logger.info("pair", `paired as ${res.device.id}`);
+  await applyAuthenticatedPairResponse(server, res);
 }
 
 /**

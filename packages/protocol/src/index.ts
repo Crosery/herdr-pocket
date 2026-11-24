@@ -25,13 +25,15 @@ export interface Device {
   id: string;
   name: string;
   kind: DeviceKind;
-  platform?: string; // darwin | linux | ios | android | ...
+  platform?: string; // darwin | linux | ios | android | h5-ios | h5-macos | ...
   online: boolean;
   createdAt: number; // epoch ms
   lastSeenAt: number; // epoch ms
   /** Agent sources a host can bridge, e.g. ["hc", "herdr", "uniflo"]. */
   sources?: AgentSource[];
   version?: string;
+  /** True when the browser/viewer has registered a hardware Passkey or persistent key anchor. */
+  passkeyLinked?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -2169,6 +2171,49 @@ export interface PairCode {
   link: string;
 }
 
+export interface DeviceIdentityProof {
+  /** Base64url-encoded SPKI ECDSA P-256 public key held non-extractably in browser storage. */
+  identityPubKey: string;
+  /** Base64url ECDSA-P256 SHA-256 signature over `herdr-pocket-id-v1:<proofTimestamp>:<identityPubKey>`. */
+  proofSignature: string;
+  proofTimestamp: number;
+  /** Coarse hardware/browser trait SHA-256 digest for diagnostics & tie-breaking. */
+  fingerprintHash?: string;
+  uaPlatform?: string;
+  formFactor?: "mobile" | "tablet" | "desktop";
+}
+
+export interface IdentityHintResponse {
+  anchored: boolean;
+  deviceId?: string;
+  deviceName?: string;
+  passkeyLinked?: boolean;
+}
+
+export interface IdentityChallengeResponse {
+  challenge: string;
+  expiresAt: number;
+  rpId: string;
+}
+
+export interface PasskeyAssertionPayload {
+  id: string;
+  rawId: string;
+  authenticatorData: string;
+  clientDataJSON: string;
+  signature: string;
+  userHandle?: string;
+}
+
+export interface IdentityReconfirmRequest {
+  challenge: string;
+  identityPubKey?: string;
+  signature?: string;
+  platform?: string;
+  name?: string;
+  passkey?: PasskeyAssertionPayload;
+}
+
 export interface PairRequest {
   code: string;
   name: string;
@@ -2179,6 +2224,8 @@ export interface PairRequest {
    * asked this computer's logged-in herdr-pocket for it), `qr`, `link`, `typed`, `setup`, `cli`.
    */
   via?: string;
+  /** Persistent browser/app identity proof so re-pairing reuses the existing device instead of drifting. */
+  identity?: DeviceIdentityProof;
 }
 
 export interface PairResponse {

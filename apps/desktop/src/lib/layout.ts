@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { IS_HARMONY_TARGET, isHarmony, isTauri } from "./bridge";
-import { createStore } from "./store";
+import { IS_HARMONY_TARGET, isH5Web, isHarmony, isTauri } from "./bridge";
+import { recognizeWebDevice } from "./h5Identity";
+import { createStore, settingsStore, type H5LayoutMode } from "./store";
 import { clientConfigStore } from "./config";
 import { native } from "./native";
 
@@ -19,8 +20,19 @@ export const BP = {
 
 export type Tier = "mobile" | "rail" | "regular" | "wide";
 
-export function tierFor(width: number): Tier {
+export function tierFor(width: number, h5Mode: H5LayoutMode = "auto"): Tier {
   if (IS_HARMONY_TARGET || isHarmony()) return "mobile";
+  if (isH5Web()) {
+    if (h5Mode === "mobile") return "mobile";
+    if (h5Mode === "desktop") {
+      if (width < BP.rail) return "rail";
+      if (width < BP.wide) return "regular";
+      return "wide";
+    }
+    if (typeof navigator !== "undefined" && recognizeWebDevice().formFactor === "mobile") {
+      return "mobile";
+    }
+  }
   if (width < BP.mobile) return isTauri() ? "rail" : "mobile";
   if (width < BP.rail) return "rail";
   if (width < BP.wide) return "regular";
@@ -29,14 +41,18 @@ export function tierFor(width: number): Tier {
 
 /** Layout tier only; skips re-renders on pixel-level window resizes within the same tier. */
 export function useViewportTier(): Tier {
-  const [tier, setTier] = useState<Tier>(() => tierFor(typeof window !== "undefined" ? window.innerWidth : 1200));
+  const h5Mode = settingsStore.use((s) => s.h5LayoutMode);
+  const [tier, setTier] = useState<Tier>(() =>
+    tierFor(typeof window !== "undefined" ? window.innerWidth : 1200, h5Mode),
+  );
   useEffect(() => {
+    setTier(tierFor(typeof window !== "undefined" ? window.innerWidth : 1200, h5Mode));
     let frame = 0;
     const onResize = () => {
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
-        const next = tierFor(window.innerWidth);
+        const next = tierFor(window.innerWidth, settingsStore.get().h5LayoutMode);
         setTier((prev) => (prev === next ? prev : next));
       });
     };
@@ -45,7 +61,7 @@ export function useViewportTier(): Tier {
       window.removeEventListener("resize", onResize);
       if (frame) cancelAnimationFrame(frame);
     };
-  }, []);
+  }, [h5Mode]);
   return tier;
 }
 

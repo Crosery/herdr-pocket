@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { AppWindow, Bot, Laptop, MessageSquare, Moon, QrCode, Server, Settings, Sun } from "lucide-react";
-import { parsePairLink } from "@herdr-pocket/protocol";
+import { parsePairLink, type IdentityHintResponse } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketInput, PocketModal, ToastProvider, useToast } from "./components/PocketUI";
 import { XiaoyangOrb } from "./components/MascotAndVendor";
 import type { NavItem } from "./components/Sidebar";
@@ -15,7 +15,8 @@ import { DevicesView } from "./views/DevicesView";
 import { OnboardingView, type OnboardStep } from "./views/OnboardingView";
 import type { SettingsSection } from "./views/SettingsView";
 import { assistantStore } from "./lib/assistant";
-import { detectPlatform, getHostdStatus, isTauri, loadSession } from "./lib/bridge";
+import { detectPlatform, getHostdStatus, isH5Web, isHarmony, isTauri, loadSession } from "./lib/bridge";
+import { fetchIdentityHint, inferRelayUrlFromLocation, recognizeWebDevice, trySilentReconfirm } from "./lib/h5Identity";
 import { native } from "./lib/native";
 import { ensureChatQueueWatcher } from "./lib/chatQueue";
 import {
@@ -26,11 +27,23 @@ import {
 } from "./lib/fonts";
 import { hydrateWorkspaceState } from "./lib/workspacePersist";
 import { startAutoUpdateChecks, updateStore } from "./lib/updates";
-import { completePairing, pairWithLocalHostWithin, pingRelay, signOut, startRelayLink, stopRelayLink } from "./lib/relay";
+import {
+  answerJoinRequest,
+  applyAuthenticatedPairResponse,
+  completePairing,
+  getActiveToken,
+  getJoinRequest,
+  pairWithLocalHostWithin,
+  pingRelay,
+  signOut,
+  startRelayLink,
+  stopRelayLink,
+} from "./lib/relay";
 import { allAgents, applyThemeAttribute, liveStore, settingsStore, spacedTitle, updateSettings } from "./lib/store";
 import { useEnergyAttributes, useViewportTier } from "./lib/layout";
 import { clientConfigStore, startClientConfig } from "./lib/config";
 import { logger } from "./lib/log";
+import { startDesktopPerfTelemetry } from "./lib/perfTelemetry";
 import { terminalOwnsCtrlK } from "./lib/termKeys";
 import { attachHudToVoiceCall, dismissVoiceMessage, hangupVoiceCall, setVoiceMuted, startVoiceCall, voiceCallStore } from "./lib/voiceCall";
 
@@ -92,6 +105,10 @@ function PocketAppShell() {
   const [addHostNonce, setAddHostNonce] = useState(0);
   const [guide, setGuide] = useState<{ step: OnboardStep; error: string | null } | null>(null);
   const [autoError, setAutoError] = useState<string | null>(null);
+  const [h5Hint, setH5Hint] = useState<IdentityHintResponse | null>(null);
+  const [pendingApproveId, setPendingApproveId] = useState<string | null>(null);
+  const [approveReq, setApproveReq] = useState<{ id: string; name: string; platform?: string } | null>(null);
+  const [approveBusy, setApproveBusy] = useState(false);
   // Desktop without a relay: the guide floats over the (empty) shell and can be closed.
   const [firstGuideClosed, setFirstGuideClosed] = useState(false);
   const mobileRef = useRef(mobileLayout);
@@ -100,8 +117,10 @@ function PocketAppShell() {
   useEffect(() => {
     const platform = detectPlatform();
     document.documentElement.setAttribute("data-platform", platform);
+    document.documentElement.setAttribute("data-client", isH5Web() ? "h5" : isHarmony() ? "harmony" : "desktop");
     // macOS app: the title bar overlays the window and the traffic lights sit in the sidebar (R36 / N4).
     if (platform === "macos" && isTauri()) document.documentElement.setAttribute("data-titlebar", "overlay");
+    return startDesktopPerfTelemetry();
   }, []);
 
   // Text size reaches every CSS font size (and dialogs outside the shell) through --ts.
@@ -183,6 +202,60 @@ function PocketAppShell() {
     void refreshLocalHostIdFast();
     void (async () => {
       await startClientConfig();
+
+      if (isH5Web() && typeof window !== "undefined") {
+        const url = new URL(window.location.href);
+        const pairParam = url.searchParams.get("pair")?.trim();
+        const approveParam = url.searchParams.get("approve")?.trim();
+        const inferred = inferRelayUrlFromLocation(window.location);
+        if (pairParam || approveParam) {
+          window.history.replaceState(null, "", `${url.pathname}${url.hash}`);
+        }
+        if (approveParam && alive) setPendingApproveId(approveParam);
+
+        if (pairParam && inferred) {
+          try {
+            await completePairing(inferred, pairParam, undefined, "qr");
+            if (!alive) return;
+            toast("扫码登录成功，已绑定本机防漂移身份");
+            setBoot("ready");
+            return;
+          } catch (err) {
+            if (!alive) return;
+            setAutoError((err as Error).message);
+          }
+        }
+
+        const saved = await loadSession();
+        if (!alive) return;
+        if (saved) {
+          updateSettings({ server: saved.server, deviceId: saved.deviceId, deviceName: saved.deviceName, lastServer: saved.lastServer ?? saved.server });
+          startRelayLink(saved.server, saved.token);
+          setBoot("ready");
+          return;
+        }
+
+        if (inferred) {
+          const recovered = await trySilentReconfirm(inferred);
+          if (!alive) return;
+          if (recovered) {
+            await applyAuthenticatedPairResponse(inferred, recovered);
+            if (!alive) return;
+            toast("已自动恢复本机设备身份");
+            setBoot("ready");
+            return;
+          }
+          const hint = await fetchIdentityHint(inferred);
+          if (!alive) return;
+          setH5Hint(hint);
+          if (!settingsStore.get().lastServer) {
+            updateSettings({ lastServer: inferred });
+          }
+        }
+        setBoot("ready");
+        return;
+      }
+
       const s = await loadSession();
       if (!alive) return;
       if (s) {
@@ -218,6 +291,26 @@ function PocketAppShell() {
       stopRelayLink();
     };
   }, [toast]);
+
+  useEffect(() => {
+    if (boot !== "ready" || !server || !pendingApproveId) return;
+    const token = getActiveToken();
+    if (!token) return;
+    let cancelled = false;
+    void getJoinRequest(server, token, pendingApproveId)
+      .then((req) => {
+        if (!cancelled) setApproveReq({ id: req.id, name: req.name, platform: req.platform });
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          toast((err as Error).message || "加入请求已失效或过期", true);
+          setPendingApproveId(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [boot, server, pendingApproveId, toast]);
 
   useEffect(() => {
     if (!callMessage) return;
@@ -332,6 +425,29 @@ function PocketAppShell() {
         <PocketButton variant="ghost" size="sm" onClick={() => setBoot("ready")}>
           不等了，手动连接
         </PocketButton>
+      </div>
+    );
+  }
+
+  if (!server && isH5Web()) {
+    const recognized = recognizeWebDevice();
+    return (
+      <div className="h5-auth-screen" style={{ fontSize: `${Math.round(14 * textScale)}px` }}>
+        <div className="h5-auth-card">
+          <div className="h5-auth-head">
+            <XiaoyangOrb mood="hello" size={60} />
+            <div className="min-w-0 grow">
+              <h1 className="cute-font h5-auth-title">Herdr Pocket 网页端</h1>
+              <div className="faint wrap-anywhere">{recognized.name} · 自动适配手机与桌面视图</div>
+            </div>
+          </div>
+          <ConnectRelayPanel
+            autoFocus
+            initialError={autoError}
+            initialHint={h5Hint}
+            onConnected={() => setAutoError(null)}
+          />
+        </div>
       </div>
     );
   }
@@ -517,6 +633,70 @@ function PocketAppShell() {
       ) : null}
       <VoiceHud />
       <UpdatePrompt />
+      <PocketModal
+        open={Boolean(approveReq)}
+        onOpenChange={(open) => {
+          if (!open && !approveBusy) {
+            setApproveReq(null);
+            setPendingApproveId(null);
+          }
+        }}
+        title="允许新设备加入？"
+        width={420}
+      >
+        {approveReq ? (
+          <div className="stack" style={{ gap: 14 }}>
+            <div className="muted">
+              设备 <strong style={{ color: "var(--ink)" }}>{approveReq.name}</strong>
+              {approveReq.platform ? `（${approveReq.platform}）` : ""} 请求接入当前中转服务器。
+            </div>
+            <div className="row wrap" style={{ justifyContent: "flex-end", gap: 8 }}>
+              <PocketButton
+                variant="ghost"
+                disabled={approveBusy}
+                onClick={async () => {
+                  const tok = getActiveToken();
+                  if (!server || !tok) return;
+                  setApproveBusy(true);
+                  try {
+                    await answerJoinRequest(server, tok, approveReq.id, false);
+                    toast("已拒绝该加入请求");
+                  } catch (e) {
+                    toast((e as Error).message, true);
+                  } finally {
+                    setApproveBusy(false);
+                    setApproveReq(null);
+                    setPendingApproveId(null);
+                  }
+                }}
+              >
+                拒绝
+              </PocketButton>
+              <PocketButton
+                variant="primary"
+                disabled={approveBusy}
+                onClick={async () => {
+                  const tok = getActiveToken();
+                  if (!server || !tok) return;
+                  setApproveBusy(true);
+                  try {
+                    await answerJoinRequest(server, tok, approveReq.id, true);
+                    toast(`已允许 ${approveReq.name} 加入`);
+                  } catch (e) {
+                    toast((e as Error).message, true);
+                  } finally {
+                    setApproveBusy(false);
+                    setApproveReq(null);
+                    setPendingApproveId(null);
+                  }
+                }}
+              >
+                允许加入
+              </PocketButton>
+            </div>
+          </div>
+        ) : null}
+      </PocketModal>
     </>
   );
 

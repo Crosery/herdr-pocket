@@ -364,7 +364,7 @@ test("clearKittyVirtualPlacementsForScreen isolates alt vs main screen and termi
 
   const termCss = readFileSync(new URL("../src/styles/terminal.css", import.meta.url), "utf8");
   const zUnder = Number(termCss.match(/\.tp-term-underlay\s*\{[^}]*z-index:\s*(\d+)/)?.[1] ?? -1);
-  const zRows = Number(termCss.match(/\.tp-term-host\s+\.xterm-rows\s*\{[^}]*z-index:\s*(\d+)/)?.[1] ?? -1);
+  const zRows = Number(termCss.match(/\.tp-term-host(?:\s+\.xterm)?\s+\.xterm-rows\s*\{[^}]*z-index:\s*(\d+)/)?.[1] ?? -1);
   const zOver = Number(termCss.match(/\.tp-term-overlay\s*\{[^}]*z-index:\s*(\d+)/)?.[1] ?? -1);
   assert.ok(zUnder > 0 && zUnder < zRows && zRows < zOver, `expected underlay (${zUnder}) < rows (${zRows}) < overlay (${zOver})`);
 });

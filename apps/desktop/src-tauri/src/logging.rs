@@ -30,8 +30,8 @@ const MSG_MAX: usize = 500;
 /// Strings inside `data` in the local file (stacks need room).
 const FILE_VALUE_MAX: usize = 2000;
 /// Strings inside `data` sent to the relay (it clips to 300 as well).
-const RELAY_VALUE_MAX: usize = 300;
-const RELAY_QUEUE_MAX: usize = 500;
+const RELAY_VALUE_MAX: usize = 500;
+const RELAY_QUEUE_MAX: usize = 2000;
 const PENDING_MAX: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -161,6 +161,10 @@ fn relay_worthy(level: Level, kind: &str) -> bool {
             | "relay"
             | "startup"
             | "onboarding"
+            | "perf"
+            | "sys"
+            | "portal"
+            | "notch"
     )
 }
 

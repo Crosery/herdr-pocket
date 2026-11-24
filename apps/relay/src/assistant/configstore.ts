@@ -9,7 +9,7 @@
  * never leaves the relay again: phones see whether one is set and its last
  * four characters.
  */
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHmac, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import type {
   AssistantConfigChange,
@@ -136,6 +136,10 @@ export class Sealer {
     return { iv: iv.toString("base64"), tag: c.getAuthTag().toString("base64"), data: data.toString("base64") };
   }
 
+  hmacSha256(data: string): string {
+    return createHmac("sha256", this.key).update(data, "utf8").digest("base64url");
+  }
+
   /** Undefined when it cannot be opened (another key file, a damaged value). */
   open(s: Sealed | undefined): string | undefined {
     if (!s) return undefined;
@@ -182,6 +186,10 @@ export class ConfigStore {
 
   rev(): number {
     return this.saved().rev;
+  }
+
+  hmacAnchor(data: string): string {
+    return this.sealer.hmacSha256(data);
   }
 
   // ---------------------------------------------------------------------------

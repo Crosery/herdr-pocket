@@ -20,6 +20,41 @@ import {
 } from "../lib/portalClient";
 import { liveStore } from "../lib/store";
 
+type ResizeDir = "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
+
+const PIP_MIN_W = 220;
+const PIP_MAX_W = 880;
+const PIP_MIN_H = 150;
+const PIP_MAX_H = 680;
+const PIP_MARGIN = 12;
+
+interface PipBox {
+  x: number | null;
+  y: number | null;
+  w: number;
+  h: number;
+}
+
+function clampPipSize(w: number, h: number): { w: number; h: number } {
+  const maxW = typeof window !== "undefined" ? Math.min(PIP_MAX_W, Math.max(PIP_MIN_W, window.innerWidth - PIP_MARGIN * 2)) : PIP_MAX_W;
+  const maxH = typeof window !== "undefined" ? Math.min(PIP_MAX_H, Math.max(PIP_MIN_H, window.innerHeight - PIP_MARGIN * 2)) : PIP_MAX_H;
+  return {
+    w: Math.round(Math.max(PIP_MIN_W, Math.min(maxW, w))),
+    h: Math.round(Math.max(PIP_MIN_H, Math.min(maxH, h))),
+  };
+}
+
+function clampPipPos(x: number, y: number, w: number, h: number): { x: number; y: number } {
+  const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
+  const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+  const maxX = Math.max(PIP_MARGIN, vw - w - PIP_MARGIN);
+  const maxY = Math.max(PIP_MARGIN, vh - h - PIP_MARGIN);
+  return {
+    x: Math.round(Math.max(PIP_MARGIN, Math.min(maxX, x))),
+    y: Math.round(Math.max(PIP_MARGIN, Math.min(maxY, y))),
+  };
+}
+
 function portalIcon(kind: PortalItem["kind"]) {
   switch (kind) {
     case "browser":
@@ -57,13 +92,29 @@ export function SessionPortalPiP({
 
   const [index, setIndex] = useState(0);
   const [collapsed, setCollapsed] = useState(false);
-  const [offset, setOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const dragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+  const [box, setBox] = useState<PipBox>({ x: null, y: null, w: 300, h: 210 });
+  const [gesture, setGesture] = useState<"idle" | "drag" | "resize">("idle");
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!visible) return;
     return subscribeAgentPortalUpdates(agent.deviceId, agent.key);
   }, [agent.deviceId, agent.key, visible]);
+
+  useEffect(() => {
+    const onResize = () => {
+      setBox((prev) => {
+        const sz = clampPipSize(prev.w, prev.h);
+        if (prev.x === null || prev.y === null) {
+          return sz.w === prev.w && sz.h === prev.h ? prev : { ...prev, ...sz };
+        }
+        const pos = clampPipPos(prev.x, prev.y, sz.w, collapsed ? 44 : sz.h);
+        return { ...sz, ...pos };
+      });
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [collapsed]);
 
   const current = items[Math.min(index, Math.max(0, items.length - 1))];
 
@@ -77,35 +128,155 @@ export function SessionPortalPiP({
   const frame = framesById[current.id];
   const p2pLabel = directAddr || current.transportHint === "p2p" ? "P2P 直连" : "中继";
 
+  const currentAnchorRect = () => {
+    const el = rootRef.current;
+    const parent = el?.offsetParent as HTMLElement | null;
+    if (el && parent) {
+      const r = el.getBoundingClientRect();
+      const pr = parent.getBoundingClientRect();
+      return {
+        x: box.x ?? Math.round(r.left - pr.left),
+        y: box.y ?? Math.round(r.top - pr.top),
+        w: box.w,
+        h: box.h,
+        parentW: parent.clientWidth,
+        parentH: parent.clientHeight,
+      };
+    }
+    return {
+      x: box.x ?? Math.max(PIP_MARGIN, (typeof window !== "undefined" ? window.innerWidth : 1000) - box.w - 24),
+      y: box.y ?? Math.max(PIP_MARGIN, (typeof window !== "undefined" ? window.innerHeight : 700) - box.h - 120),
+      w: box.w,
+      h: box.h,
+      parentW: typeof window !== "undefined" ? window.innerWidth : 1200,
+      parentH: typeof window !== "undefined" ? window.innerHeight : 800,
+    };
+  };
+
+  const startMoveDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const orig = currentAnchorRect();
+    let moved = false;
+    setGesture("drag");
+    e.currentTarget.setPointerCapture(e.pointerId);
+
+    const onMove = (ev: PointerEvent) => {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (!moved && Math.hypot(dx, dy) < 4) return;
+      moved = true;
+      const h = collapsed ? 44 : orig.h;
+      const maxX = Math.max(PIP_MARGIN, orig.parentW - orig.w - PIP_MARGIN);
+      const maxY = Math.max(PIP_MARGIN, orig.parentH - h - PIP_MARGIN);
+      setBox((prev) => ({
+        ...prev,
+        x: Math.round(Math.max(PIP_MARGIN, Math.min(maxX, orig.x + dx))),
+        y: Math.round(Math.max(PIP_MARGIN, Math.min(maxY, orig.y + dy))),
+      }));
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      setGesture("idle");
+      if (!moved) onExpandPortal(current.id);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  };
+
+  const startResize = (dir: ResizeDir) => (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || collapsed) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const orig = currentAnchorRect();
+    const origRight = orig.x + orig.w;
+    const origBottom = orig.y + orig.h;
+    setGesture("resize");
+    e.currentTarget.setPointerCapture(e.pointerId);
+
+    const onMove = (ev: PointerEvent) => {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      let nextX = orig.x;
+      let nextY = orig.y;
+      let nextW = orig.w;
+      let nextH = orig.h;
+
+      if (dir.includes("e")) nextW = orig.w + dx;
+      if (dir.includes("s")) nextH = orig.h + dy;
+      if (dir.includes("w")) {
+        nextW = orig.w - dx;
+        nextX = origRight - Math.max(PIP_MIN_W, Math.min(PIP_MAX_W, nextW));
+      }
+      if (dir.includes("n")) {
+        nextH = orig.h - dy;
+        nextY = origBottom - Math.max(PIP_MIN_H, Math.min(PIP_MAX_H, nextH));
+      }
+      const clampedSz = clampPipSize(nextW, nextH);
+      if (dir.includes("w")) nextX = origRight - clampedSz.w;
+      if (dir.includes("n")) nextY = origBottom - clampedSz.h;
+      const maxX = Math.max(PIP_MARGIN, orig.parentW - clampedSz.w - PIP_MARGIN);
+      const maxY = Math.max(PIP_MARGIN, orig.parentH - clampedSz.h - PIP_MARGIN);
+      setBox({
+        w: clampedSz.w,
+        h: clampedSz.h,
+        x: Math.round(Math.max(PIP_MARGIN, Math.min(maxX, nextX))),
+        y: Math.round(Math.max(PIP_MARGIN, Math.min(maxY, nextY))),
+      });
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      setGesture("idle");
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  };
+
+  const posStyle: React.CSSProperties =
+    box.x !== null && box.y !== null
+      ? {
+          left: box.x,
+          top: box.y,
+          right: "auto",
+          bottom: "auto",
+          ...(collapsed ? {} : { width: box.w, height: box.h }),
+        }
+      : collapsed
+        ? {}
+        : { width: box.w, height: box.h };
+
+  const dirs: ResizeDir[] = ["n", "s", "e", "w", "nw", "ne", "sw", "se"];
+
   return (
     <div
-      className={`session-portal-pip${collapsed ? " is-collapsed" : ""}`}
-      style={{ transform: `translate3d(${offset.x}px, ${offset.y}px, 0)` }}
+      ref={rootRef}
+      className={`session-portal-pip${collapsed ? " is-collapsed" : ""}${gesture === "drag" ? " is-dragging" : ""}${gesture === "resize" ? " is-resizing" : ""}`}
+      style={posStyle}
       role="region"
       aria-label={`跨端回传浮窗 · ${current.title}`}
     >
-      <div
-        className="session-portal-pip-head"
-        onPointerDown={(e) => {
-          if ((e.target as HTMLElement).closest("button")) return;
-          const orig = { ...offset };
-          dragRef.current = { startX: e.clientX, startY: e.clientY, origX: orig.x, origY: orig.y };
-          const onMove = (ev: PointerEvent) => {
-            if (!dragRef.current) return;
-            setOffset({
-              x: Math.min(24, Math.max(-420, dragRef.current.origX + (ev.clientX - dragRef.current.startX))),
-              y: Math.min(24, Math.max(-360, dragRef.current.origY + (ev.clientY - dragRef.current.startY))),
-            });
-          };
-          const onUp = () => {
-            dragRef.current = null;
-            window.removeEventListener("pointermove", onMove);
-            window.removeEventListener("pointerup", onUp);
-          };
-          window.addEventListener("pointermove", onMove);
-          window.addEventListener("pointerup", onUp);
-        }}
-      >
+      {!collapsed
+        ? dirs.map((d) => (
+            <div
+              key={d}
+              className={`pip-resize-handle pip-resize-${d}`}
+              onPointerDown={startResize(d)}
+              aria-hidden
+            />
+          ))
+        : null}
+
+      <div className="session-portal-pip-head" onPointerDown={startMoveDrag}>
         <span className="session-portal-pip-ic">{portalIcon(current.kind)}</span>
         <span className="session-portal-pip-title truncate" title={current.title}>
           {current.title}

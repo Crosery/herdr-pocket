@@ -19,6 +19,34 @@ export function proposeGridFast(
 let settledAt = 0;
 let settleTimer: number | null = null;
 const settledListeners = new Set<() => void>();
+let interactiveResizeActive = false;
+const interactiveResizeSettledListeners = new Set<() => void>();
+
+export function setInteractiveResizeActive(active: boolean): void {
+  if (interactiveResizeActive === active) return;
+  interactiveResizeActive = active;
+  if (!active && interactiveResizeSettledListeners.size > 0) {
+    const callbacks = Array.from(interactiveResizeSettledListeners);
+    for (const cb of callbacks) {
+      try {
+        cb();
+      } catch {
+        // ignore listener errors when interactive resize settles
+      }
+    }
+  }
+}
+
+export function isInteractiveResizeActive(): boolean {
+  return interactiveResizeActive;
+}
+
+export function onInteractiveResizeSettled(cb: () => void): () => void {
+  interactiveResizeSettledListeners.add(cb);
+  return () => {
+    interactiveResizeSettledListeners.delete(cb);
+  };
+}
 
 export function easeOutQuart(t: number): number {
   const clamped = Math.max(0, Math.min(1, t));

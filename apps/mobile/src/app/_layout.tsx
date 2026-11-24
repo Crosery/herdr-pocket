@@ -14,6 +14,7 @@ import { loadToken } from "../lib/auth";
 import { startLink, stopLink } from "../lib/relay";
 import { isMockServer } from "../lib/mock";
 import { startAppLog } from "../lib/applog";
+import { startMobilePerfTelemetry } from "../lib/perfTelemetry";
 import { fonts } from "../theme/tokens";
 import { useAlertSync } from "../lib/alerts";
 import { PocketStackHeader, PocketToast } from "../components/ui";
@@ -115,7 +116,10 @@ export default function RootLayout() {
   const ready = (loaded || !!error) && hydrated;
 
   // The phone's own log goes to the relay every minute and when the app is put away.
-  useEffect(() => startAppLog(), []);
+  useEffect(() => {
+    startAppLog();
+    return startMobilePerfTelemetry();
+  }, []);
 
   useEffect(() => {
     if (ready) {

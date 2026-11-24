@@ -460,6 +460,38 @@ pub fn snapshot_value(app: &AppHandle) -> Value {
     serde_json::to_value(usage(app)).unwrap_or(Value::Null)
 }
 
+pub fn start_telemetry(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let u = usage(&app);
+            let rss_mb = u.process.rss_bytes / (1024 * 1024);
+            let footprint_mb = u
+                .process
+                .footprint_bytes
+                .map(|b| b / (1024 * 1024))
+                .unwrap_or(rss_mb);
+            let wv_mb = u.process.webview_bytes.map(|b| b / (1024 * 1024));
+            crate::logging::info(
+                "sys.resources",
+                &format!("desktop pulse mem={}MB visible={}", footprint_mb, u.window_visible),
+                serde_json::json!({
+                    "rssMb": rss_mb,
+                    "footprintMb": footprint_mb,
+                    "wvRssMb": wv_mb,
+                    "cpuPct": u.cpu_percent,
+                    "wakeupsPerSec": u.wakeups_per_sec,
+                    "lowPower": u.low_power,
+                    "windowVisible": u.window_visible,
+                }),
+            );
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

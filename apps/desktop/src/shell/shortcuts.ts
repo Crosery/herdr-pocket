@@ -218,6 +218,7 @@ export function formatEventKeyTokens(e: KeyboardEvent): string[] {
 
 /** Whether a keydown matches one combo of the table. */
 export function matchesCombo(e: KeyboardEvent, keys: string[]): boolean {
+  if (e.isComposing || e.keyCode === 229 || e.key === "Process" || e.key === "Dead") return false;
   const key = keys[keys.length - 1]!;
   const wantShift = keys.includes("Shift");
   const wantAlt = keys.includes("Alt");
@@ -239,8 +240,51 @@ export function matchesCombo(e: KeyboardEvent, keys: string[]): boolean {
 
 export type ShortcutModifierChord = "Mod" | "Mod+Shift" | "Mod+Alt" | "Mod+Alt+Shift";
 
+const CHORD_MOD_SET: Record<ShortcutModifierChord, ReadonlySet<string>> = {
+  Mod: new Set(["Mod"]),
+  "Mod+Shift": new Set(["Mod", "Shift"]),
+  "Mod+Alt": new Set(["Mod", "Alt"]),
+  "Mod+Alt+Shift": new Set(["Mod", "Alt", "Shift"]),
+};
+
+const MOD_ORDER = ["Mod", "Ctrl", "Alt", "Shift"] as const;
+
+/** Returns true when `comboChord` includes every modifier currently held in `heldPrefix`. */
+export function chordIncludesPrefix(
+  comboChord: ShortcutModifierChord,
+  heldPrefix: ShortcutModifierChord,
+): boolean {
+  const held = CHORD_MOD_SET[heldPrefix];
+  const combo = CHORD_MOD_SET[comboChord];
+  for (const mod of held) {
+    if (!combo.has(mod)) return false;
+  }
+  return true;
+}
+
+/** Formats the remaining unheld modifiers + key cap for a shortcut under a held modifier prefix. */
+export function remainingSuffixChip(
+  keys: readonly string[],
+  heldPrefix: ShortcutModifierChord,
+  isMac = IS_MAC,
+): string {
+  if (!keys.length) return "";
+  const held = CHORD_MOD_SET[heldPrefix];
+  const glyphs = isMac ? MAC_GLYPH : OTHER_GLYPH;
+  const remaining: string[] = [];
+  const rawMods = new Set(keys.slice(0, -1));
+  for (const m of MOD_ORDER) {
+    if (rawMods.has(m) && !held.has(m)) {
+      remaining.push(glyphs[m] ?? m);
+    }
+  }
+  const last = keys[keys.length - 1] ?? "";
+  remaining.push(glyphs[last] ?? last);
+  return isMac ? remaining.join("") : remaining.join("+");
+}
+
 /** Returns the primary modifier chord prefix of a combo (null for non-Mod / Ctrl combos on Mac). */
-export function chordOfKeys(keys: string[]): ShortcutModifierChord | null {
+export function chordOfKeys(keys: readonly string[]): ShortcutModifierChord | null {
   if (!keys.includes("Mod") || keys.includes("Ctrl")) return null;
   const hasAlt = keys.includes("Alt");
   const hasShift = keys.includes("Shift");
@@ -280,6 +324,46 @@ export function shortcutsForChord(
         : shortcut.alt?.find((combo) => chordOfKeys(combo) === chord);
     if (!matched) continue;
     out.push({ shortcut, keys: matched, actionChip: trailingKeyChip(matched) });
+  }
+  return out;
+}
+
+export function shortcutsMatchingChordPrefix(
+  heldPrefix: ShortcutModifierChord,
+  isMac = IS_MAC,
+): Array<{ shortcut: Shortcut; keys: string[]; chord: ShortcutModifierChord; exact: boolean; actionChip: string }> {
+  const out: Array<{
+    shortcut: Shortcut;
+    keys: string[];
+    chord: ShortcutModifierChord;
+    exact: boolean;
+    actionChip: string;
+  }> = [];
+  for (const shortcut of SHORTCUTS) {
+    const primaryChord = chordOfKeys(shortcut.keys);
+    let matchedKeys: string[] | undefined;
+    let matchedChord: ShortcutModifierChord | null = null;
+    if (primaryChord && chordIncludesPrefix(primaryChord, heldPrefix)) {
+      matchedKeys = shortcut.keys;
+      matchedChord = primaryChord;
+    } else if (shortcut.alt) {
+      for (const altKeys of shortcut.alt) {
+        const altChord = chordOfKeys(altKeys);
+        if (altChord && chordIncludesPrefix(altChord, heldPrefix)) {
+          matchedKeys = altKeys;
+          matchedChord = altChord;
+          break;
+        }
+      }
+    }
+    if (!matchedKeys || !matchedChord) continue;
+    out.push({
+      shortcut,
+      keys: matchedKeys,
+      chord: matchedChord,
+      exact: matchedChord === heldPrefix,
+      actionChip: remainingSuffixChip(matchedKeys, heldPrefix, isMac),
+    });
   }
   return out;
 }

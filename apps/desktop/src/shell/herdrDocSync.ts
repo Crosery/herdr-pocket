@@ -6,6 +6,7 @@ import { native } from "../lib/native";
 import { rpcCall } from "../lib/relay";
 import { allAgents, liveStore } from "../lib/store";
 import { extractHostHerdrDoc } from "./herdrDoc";
+import { isInteractiveResizeActive, onInteractiveResizeSettled } from "./splitMotion";
 import {
   focusedLeafOfTab,
   reconcileHostHerdrDoc,
@@ -301,6 +302,7 @@ export function createHerdrDocSyncController(
   };
 
   const syncHost = async (hostId: string, opts?: { forcePull?: boolean }): Promise<void> => {
+    if (isInteractiveResizeActive()) return;
     const slot = ensureSlot(hostId);
     if (opts?.forcePull) {
       if (slot.debounceTimer) {
@@ -360,7 +362,7 @@ export function createHerdrDocSyncController(
   };
 
   const handleShellChange = (state: ShellState = shellStore.get()): void => {
-    if (reconciling) return;
+    if (reconciling || isInteractiveResizeActive()) return;
     const devs = transport.getDevices();
     const spacesMap = transport.getSpaces();
     const lookup = makeAgentLookup();
@@ -474,6 +476,9 @@ export function useHerdrDocSync(): void {
     const unsubShell = shellStore.subscribe(() => {
       ctrl.handleShellChange(shellStore.get());
     });
+    const unsubResizeSettle = onInteractiveResizeSettled(() => {
+      ctrl.handleShellChange(shellStore.get());
+    });
 
     let docPullTimer: ReturnType<typeof setTimeout> | null = null;
     let alive = true;
@@ -518,6 +523,7 @@ export function useHerdrDocSync(): void {
     return () => {
       alive = false;
       unsubShell();
+      unsubResizeSettle();
       clearInterval(timer);
       if (docPullTimer) clearTimeout(docPullTimer);
       for (const off of offListeners) off();

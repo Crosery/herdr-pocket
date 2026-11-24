@@ -73,6 +73,7 @@ import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
 import { copyToClipboard } from "../lib/bridge";
+import { extractImageTargets } from "../lib/chatImages";
 import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../lib/chatFold";
 import {
   builtinSlashCommands,
@@ -964,6 +965,19 @@ export function AgentDetailPanel({
     onModeChange?.(m);
   };
   const [termVisited, setTermVisited] = useState(activeMode === "term");
+  const [chatVisited, setChatVisited] = useState(activeMode === "chat");
+  const modeVisitKeyRef = useRef(agent.key);
+  useEffect(() => {
+    if (modeVisitKeyRef.current !== agent.key) {
+      modeVisitKeyRef.current = agent.key;
+      setTermVisited(activeMode === "term");
+      setChatVisited(activeMode === "chat");
+      return;
+    }
+    if (activeMode === "chat") {
+      setChatVisited(true);
+    }
+  }, [activeMode, agent.key]);
   useEffect(() => {
     if (activeMode === "term") {
       setTermVisited(true);
@@ -1119,13 +1133,14 @@ export function AgentDetailPanel({
   }, [agent.key, agent.status, agent.statusSince]);
 
   useEffect(() => {
-    if (agent.status !== "working" && outgoing.length === 0 && !sending) return;
+    if (activeMode !== "chat" || !visible || (agent.status !== "working" && outgoing.length === 0 && !sending)) return;
     setNowTick(Date.now());
     const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [agent.status, outgoing.length, sending]);
+  }, [activeMode, agent.status, outgoing.length, sending, visible]);
 
   useEffect(() => {
+    if (!chatVisited) return;
     let alive = true;
     const prev = sessionTrackRef.current;
     const sessionSwitched = prev.agentKey !== agent.key || (Boolean(prev.sessionKey) && Boolean(agent.sessionKey) && prev.sessionKey !== agent.sessionKey);
@@ -1223,7 +1238,7 @@ export function AgentDetailPanel({
       window.clearInterval(pollTimer);
       unsubSession();
     };
-  }, [agent.deviceId, agent.key, agent.sessionKey]);
+  }, [agent.deviceId, agent.key, agent.sessionKey, chatVisited]);
 
   const lastSeenMarkRef = useRef<string | null>(null);
   const wasVisibleForSeenRef = useRef(false);
@@ -1257,7 +1272,7 @@ export function AgentDetailPanel({
   }, [agent.deviceId, agent.key, agent.status, agent.turn, canMarkSeen]);
 
   useEffect(() => {
-    if (!agent.subagents) return;
+    if (!chatVisited || !agent.subagents) return;
     let alive = true;
     void rpcCall(agent.deviceId, "session.children", { agent: agent.key })
       .then((res) => {
@@ -1267,7 +1282,7 @@ export function AgentDetailPanel({
     return () => {
       alive = false;
     };
-  }, [agent.deviceId, agent.key, agent.subagents]);
+  }, [agent.deviceId, agent.key, agent.subagents, chatVisited]);
 
   const activeSubKey = activeSub?.key;
   useEffect(() => {
@@ -1431,7 +1446,7 @@ export function AgentDetailPanel({
   }, [activeSubKey, agent.deviceId, agent.key, agent.sessionKey, visible]);
 
   useEffect(() => {
-    if (agent.isShell) {
+    if (!chatVisited || agent.isShell) {
       setDiscoveredSlash([]);
       return;
     }
@@ -1446,7 +1461,7 @@ export function AgentDetailPanel({
     return () => {
       alive = false;
     };
-  }, [agent.cwd, agent.deviceId, agent.harness, agent.isShell, agent.key]);
+  }, [agent.cwd, agent.deviceId, agent.harness, agent.isShell, agent.key, chatVisited]);
 
   useEffect(() => {
     if (activeMode !== "chat" || agent.status !== "blocked") {
@@ -1467,10 +1482,14 @@ export function AgentDetailPanel({
   const choices = useMemo(() => (activeMode === "chat" && choiceLines.length ? parseChoices(choiceLines) : []), [activeMode, choiceLines]);
   const displayedEvents = activeSub ? subEvents : events;
   const shellChat = useMemo(() => (isPlainShellChat ? parseTerminalChatTranscript(shellRaw) : null), [isPlainShellChat, shellRaw]);
-  const foldedRows = useMemo(
-    () => (isPlainShellChat ? [] : foldConvEvents(displayedEvents, chatDisplayMode)),
-    [chatDisplayMode, displayedEvents, isPlainShellChat],
-  );
+  const cachedFoldedRef = useRef<ChatRow[]>([]);
+  const foldedRows = useMemo(() => {
+    if (isPlainShellChat) return [];
+    if (activeMode !== "chat") return cachedFoldedRef.current;
+    const next = foldConvEvents(displayedEvents, chatDisplayMode);
+    cachedFoldedRef.current = next;
+    return next;
+  }, [activeMode, chatDisplayMode, displayedEvents, isPlainShellChat]);
   const isTurnBusy = useMemo(() => isAgentTurnBusy(agent.status, foldedRows), [agent.status, foldedRows]);
   const convReconciled = useMemo(
     () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick),
@@ -1497,7 +1516,15 @@ export function AgentDetailPanel({
     return { unmatched, matchedIds, expiredIds, awaitingReply: false };
   }, [convReconciled, isPlainShellChat, nowTick, outgoing, shellChat]);
 
+  const cachedSegmentsRef = useRef<
+    Array<
+      | { kind: "rows"; id: string; rows: ChatRow[] }
+      | { kind: "outgoing"; send: OutgoingSend }
+      | { kind: "captured"; cap: CapturedCommandEntry }
+    >
+  >([]);
   const timelineSegments = useMemo(() => {
+    if (activeMode !== "chat") return cachedSegmentsRef.current;
     const items = interleaveOptimisticSends(foldedRows, reconciled.unmatched);
     const sortedCaps = !isPlainShellChat && !activeSub ? [...captured].sort((a, b) => a.ts - b.ts) : [];
     const segs: Array<
@@ -1528,8 +1555,9 @@ export function AgentDetailPanel({
       segs.push({ kind: "captured", cap: sortedCaps[cIdx]! });
       cIdx += 1;
     }
+    cachedSegmentsRef.current = segs;
     return segs;
-  }, [activeSub, captured, foldedRows, isPlainShellChat, reconciled.unmatched]);
+  }, [activeMode, activeSub, captured, foldedRows, isPlainShellChat, reconciled.unmatched]);
 
   const allSlashCommands = useMemo(
     () => mergeSlashCommands(builtinSlashCommands(agent.harness, agent.isShell), discoveredSlash),
@@ -2556,6 +2584,7 @@ export function AgentDetailPanel({
         </div>
       ) : null}
 
+      {chatVisited ? (
       <div className="chat-scroll-wrap" style={{ display: activeMode === "chat" ? undefined : "none" }}>
         <div
           ref={chatScrollRef}
@@ -2656,12 +2685,15 @@ export function AgentDetailPanel({
                   ) : (() => {
                     const imgAtts = seg.send.attachments.filter((a) => a.kind === "image" && a.previewUrl);
                     const fileAtts = seg.send.attachments.filter((a) => !(a.kind === "image" && a.previewUrl));
+                    const outImgs = !imgAtts.length
+                      ? extractImageTargets([...(seg.send.uploadedPaths ?? []), seg.send.text])
+                      : [];
                     return (
                       <div key={seg.send.id} className="bubble-row user">
                         {seg.send.text ? <div className="bubble user">{seg.send.text}</div> : null}
-                        {seg.send.uploadedPaths?.length && !imgAtts.length ? (
+                        {outImgs.length > 0 ? (
                           <InlineImageStrip
-                            targets={seg.send.uploadedPaths}
+                            targets={outImgs}
                             agentKey={agent.key}
                             deviceId={agent.deviceId}
                             cwd={agent.cwd}
@@ -2787,26 +2819,38 @@ export function AgentDetailPanel({
           ) : null}
 
           {!activeSub && terminalQueuedItems.length > 0
-            ? terminalQueuedItems.map((qText, idx) => (
-                <div key={`term-q-${idx}-${qText.slice(0, 24)}`} className="bubble-row user queued-terminal">
-                  <div className="bubble user">
-                    <RichMarkdown text={qText} onOpenFile={(target) => openAgentFileTarget(agent, target)} />
-                  </div>
-                  <div className="bubble-send-meta">
-                    <span>终端排队中 · 本轮结束后自动处理</span>
-                    {agent.source === "hc" && idx === 0 ? (
-                      <button
-                        type="button"
-                        className="bubble-meta-btn primary"
-                        title="立即注入到当前轮 (Alt+M)"
-                        onClick={() => void sendKeys(["alt+m"])}
-                      >
-                        立即注入
-                      </button>
+            ? terminalQueuedItems.map((qText, idx) => {
+                const qImgs = extractImageTargets([qText]);
+                return (
+                  <div key={`term-q-${idx}-${qText.slice(0, 24)}`} className="bubble-row user queued-terminal">
+                    <div className="bubble user">
+                      <RichMarkdown text={qText} onOpenFile={(target) => openAgentFileTarget(agent, target)} />
+                    </div>
+                    {qImgs.length > 0 ? (
+                      <InlineImageStrip
+                        targets={qImgs}
+                        agentKey={agent.key}
+                        deviceId={agent.deviceId}
+                        cwd={agent.cwd}
+                        onOpenFile={(target) => openAgentFileTarget(agent, target)}
+                      />
                     ) : null}
+                    <div className="bubble-send-meta">
+                      <span>终端排队中 · 本轮结束后自动处理</span>
+                      {agent.source === "hc" && idx === 0 ? (
+                        <button
+                          type="button"
+                          className="bubble-meta-btn primary"
+                          title="立即注入到当前轮 (Alt+M)"
+                          onClick={() => void sendKeys(["alt+m"])}
+                        >
+                          立即注入
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
-                </div>
-              ))
+                );
+              })
             : null}
         </div>
 
@@ -2817,6 +2861,7 @@ export function AgentDetailPanel({
           </button>
         ) : null}
       </div>
+      ) : null}
 
       {termVisited ? (
         <div style={{ flex: 1, minHeight: 0, display: activeMode === "term" ? "flex" : "none" }}>
@@ -2998,35 +3043,43 @@ export function AgentDetailPanel({
                 );
               })}
               {terminalQueuedItems.length > 0 ? (
-                terminalQueuedItems.map((qText, idx) => (
-                  <div key={`shelf-term-q-${idx}-${qText.slice(0, 24)}`} className="composer-queue-item">
-                    <span className="composer-queue-idx">终端</span>
-                    <span className="composer-queue-text" title={qText}>
-                      {qText}
-                    </span>
-                    <div className="composer-queue-actions">
-                      {agent.source === "hc" && idx === 0 ? (
+                terminalQueuedItems.map((qText, idx) => {
+                  const qImgs = extractImageTargets([qText]);
+                  return (
+                    <div key={`shelf-term-q-${idx}-${qText.slice(0, 24)}`} className="composer-queue-item">
+                      <span className="composer-queue-idx">终端</span>
+                      <span className="composer-queue-text" title={qText}>
+                        {qText}
+                      </span>
+                      {qImgs.length > 0 ? (
+                        <span className="composer-queue-att" title={qImgs.join("\n")}>
+                          图片 ×{qImgs.length}
+                        </span>
+                      ) : null}
+                      <div className="composer-queue-actions">
+                        {agent.source === "hc" && idx === 0 ? (
+                          <button
+                            type="button"
+                            className="composer-queue-steer"
+                            title="立即注入到当前轮 (Alt+M)"
+                            onClick={() => void sendKeys(["alt+m"])}
+                          >
+                            立即注入
+                          </button>
+                        ) : null}
                         <button
                           type="button"
-                          className="composer-queue-steer"
-                          title="立即注入到当前轮 (Alt+M)"
-                          onClick={() => void sendKeys(["alt+m"])}
+                          className="composer-queue-ic"
+                          aria-label="中断当前轮"
+                          title="中断当前轮"
+                          onClick={interruptTurn}
                         >
-                          立即注入
+                          <Square size={11} />
                         </button>
-                      ) : null}
-                      <button
-                        type="button"
-                        className="composer-queue-ic"
-                        aria-label="中断当前轮"
-                        title="中断当前轮"
-                        onClick={interruptTurn}
-                      >
-                        <Square size={11} />
-                      </button>
+                      </div>
                     </div>
-                  </div>
-                ))
+                  );
+                })
               ) : agent.queued ? (
                 <div className="composer-queue-item">
                   <span className="composer-queue-idx">终端</span>
