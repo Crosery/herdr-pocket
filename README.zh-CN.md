@@ -1,262 +1,226 @@
-<p align="center"><a href="README.md">English</a> | <b>简体中文</b></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/hero-zh-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/hero-zh-light.svg" />
+    <img alt="Herdr Pocket — 装进口袋的 AI 助手，随时掌控多台电脑上的 AI Agent" src="docs/readme/hero-zh-light.svg" width="100%" />
+  </picture>
+</p>
 
-<div align="center">
+<p align="center">
+  <strong>用手机、平板或桌面端实时接管每台电脑上的 AI 编程 Agent —— 原生支持 iOS、Android、HarmonyOS NEXT、macOS、Windows、Linux 与网页 H5。</strong>
+</p>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/readme/hero-zh-dark.svg" />
-  <img src="docs/readme/hero-zh-light.svg" width="100%" alt="Herdr Pocket：所有电脑上的 coding agent，都装进你的口袋。穿淡紫色卫衣的吉祥物小羊站在云朵上欢呼。" />
-</picture>
+<p align="center">
+  <a href="README.md">English</a> ·
+  <a href="README.zh-CN.md"><strong>简体中文</strong></a> ·
+  <a href="https://crosery.github.io/herdr-pocket/">官方网站</a> ·
+  <a href="https://github.com/Crosery/herdr-pocket/releases">全部发布包 (v0.2.45)</a> ·
+  <a href="docs/deploy/README.md">自托管部署指南</a>
+</p>
 
-在手机（Android / iOS / 鸿蒙 HarmonyOS NEXT）或桌面电脑（Windows / macOS / Linux）上看每台电脑里 Claude Code、Codex、Gemini CLI 这些 agent 在干什么，<br />
-给它们发消息、按键、开新的，或者直接打电话让助理小羊替你去办。
+<p align="center">
+  <img alt="开源协议 AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-ff4f8b?style=flat-square" />
+  <img alt="支持平台" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android%20%7C%20HarmonyOS%20NEXT-1d1720?style=flat-square" />
+  <img alt="零依赖默认关闭" src="https://img.shields.io/badge/plugins-%E9%BB%98%E8%AE%A4%E5%85%B3%E9%97%AD%20%C2%B7%20%E6%8C%89%E9%9C%80%E5%90%AF%E7%94%A8-ff4f8b?style=flat-square" />
+</p>
 
-*Your coding agents on every computer, in your pocket: a self-hosted relay, a small daemon per computer, and mobile & desktop apps with a voice assistant.*
+---
 
-[![Release](https://img.shields.io/github/v/release/Crosery/herdr-pocket?color=f472b6&label=release)](https://github.com/Crosery/herdr-pocket/releases/latest)
-[![CI](https://img.shields.io/github/actions/workflow/status/Crosery/herdr-pocket/ci.yml?branch=main&label=CI)](https://github.com/Crosery/herdr-pocket/actions/workflows/ci.yml)
-![Clients](https://img.shields.io/badge/clients-Android%20%C2%B7%20iOS%20%C2%B7%20HarmonyOS%20%C2%B7%20Desktop-a78bfa)
-![Node](https://img.shields.io/badge/node-%E2%89%A5%2022.18-c084fc)
-![Self-hosted](https://img.shields.io/badge/relay-self--hosted-f9a8d4)
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-f472b6)](LICENSE)
-
-[官网](https://crosery.github.io/herdr-pocket/) · [部署](docs/deploy/README.md) · [模型与语音配置](docs/config.md) · [下载各端客户端](https://github.com/Crosery/herdr-pocket/releases/latest) · [官网源码](apps/site)
-
-</div>
+## 全端效果一览
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/readme/showcase-dark.webp" />
-    <img src="docs/readme/showcase-light.webp" width="100%" alt="手机框里的五个 App 页面：所有电脑的 agent 列表、排好版的对话、助理小羊、带自带小键盘的终端、语音通话" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/showcase-light.webp" />
+    <img alt="Herdr Pocket 多端实拍展示：v3 桌面工作台与移动端亮暗双主题" src="docs/readme/showcase-light.webp" width="100%" />
   </picture>
 </p>
 
-<details>
-<summary>另一套配色的截图</summary>
+<table align="center">
+  <tr>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/desktop-light.webp" alt="桌面 v3 多分屏工作台" width="100%" />
+      <br />
+      <strong>v3 分屏与堆叠工作台</strong>
+      <br />
+      <sub>多栏协作视图、<code>/</code> 与 <code>\</code> 统一斜杠命令面板、意图驱动创建空间与 Git Worktree 隔离。</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/browser-ai-light.webp" alt="内置多空间浏览器与 AI 虚拟光标" width="100%" />
+      <br />
+      <strong>多空间浏览器与 AI 虚拟光标</strong>
+      <br />
+      <sub>Space 标签隔离、按需开启的粉色虚拟鼠标轨迹、验证码保护与一键人类接管。</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/plugins-light.webp" alt="默认关闭的插件中心" width="100%" />
+      <br />
+      <strong>按需启用的插件中心</strong>
+      <br />
+      <sub>全部插件默认关闭、零强依赖：仅在认可并需要时手动开启浏览器操控、工作区巡检、安全抓取与 Webhook。</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
+## 全平台安装包直链（`v0.2.45`）
+
+以下安装包均由 GitHub Actions 自动构建并附带 `SHA256SUMS` 与中文更新说明，也可直接前往 [Releases 页面](https://github.com/Crosery/herdr-pocket/releases) 下载。
+
+| 平台 | 架构 / 格式 | 直接下载链接 | 说明 |
+| --- | --- | --- | --- |
+| **macOS** | Apple Silicon (`arm64`) `.dmg` | [herdr-pocket-0.2.45-macos-arm64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-macos-arm64.dmg) | M1–M4 原生 Tauri v2 桌面端 |
+| **macOS** | Intel (`x64`) `.dmg` | [herdr-pocket-0.2.45-macos-x64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-macos-x64.dmg) | Intel Mac 桌面端 |
+| **Windows** | `x64` NSIS 安装器 `.exe` | [herdr-pocket-0.2.45-windows-x64-setup.exe](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-windows-x64-setup.exe) | 推荐的标准安装向导 |
+| **Windows** | `x64` `.msi` 安装包 | [herdr-pocket-0.2.45-windows-x64.msi](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-windows-x64.msi) | 静默 / MSI 部署包 |
+| **Linux** | `x64` 便携镜像 `.AppImage` | [herdr-pocket-0.2.45-linux-x64.AppImage](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-linux-x64.AppImage) | 免安装运行 |
+| **Linux** | `x64` Debian/Ubuntu `.deb` | [herdr-pocket-0.2.45-linux-x64.deb](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-linux-x64.deb) | `apt` / `dpkg` 安装包 |
+| **Android** | `arm64` 原生 `.apk` | [herdr-pocket-0.2.45-android-arm64.apk](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-android-arm64.apk) | 支持应用内一键更新与语音唤醒 |
+| **HarmonyOS NEXT** | `arm64` 原生 `.hap` | [herdr-pocket-0.2.45-harmonyos-arm64.hap](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-harmonyos-arm64.hap) | Stage 模型 ArkTS 原生外壳 |
+| **iOS** | `arm64` 侧载包 `.ipa` | [herdr-pocket-0.2.45-ios-arm64.ipa](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-ios-arm64.ipa) | 兼容 AltStore / SideStore / TrollStore |
+| **中转与守护进程** | 跨平台源码包 `.tar.gz` | [herdr-pocket-0.2.45.tar.gz](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45.tar.gz) | `install-host` 与 `herdr-pocket update` 使用 |
+
+---
+
+## 核心能力矩阵
+
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/showcase-light.webp" />
-    <img src="docs/readme/showcase-dark.webp" width="100%" alt="同样五个页面的另一套配色" />
-  </picture>
-</p>
-</details>
-
-## 能做什么
-
-<p align="center">
-  <picture>
-    <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/readme/features-narrow-zh-dark.svg" />
-    <source media="(max-width: 600px)" srcset="docs/readme/features-narrow-zh-light.svg" />
     <source media="(prefers-color-scheme: dark)" srcset="docs/readme/features-zh-dark.svg" />
-    <img src="docs/readme/features-zh-light.svg" width="100%" alt="功能一览：一眼看全、随手操作、开新 agent、助理小羊、打电话、扫码就连、电脑互相调用、自己的服务器、自动更新、有日志可查。每一项的说明见下方表格。" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/features-zh-light.svg" />
+    <img alt="Herdr Pocket 核心功能矩阵：多端控制、多空间浏览器、插件中心与 P2P 传送门" src="docs/readme/features-zh-light.svg" width="100%" />
   </picture>
 </p>
 
-<details>
-<summary><b>每项功能的详细说明</b></summary>
+### 1. 不改变终端习惯的全端 Agent 控制
+- **完整保留原汁原味的 CLI 工作流**：在 macOS / Linux / Windows 电脑上继续用你熟悉的 Claude Code、Codex、OpenCode、Gemini CLI 或 OMP，Pocket 通过 `hostd` 守护进程无侵入接入。
+- **`/` 与 `\` 同步 CLI 命令面板**：在对话输入框敲 `/` 或 `\` 即可呼出统一同步的斜杠命令面板（`/clear`、`/compact`、`/model`、`/resume` 等），不再因入口不同而漏掉快捷指令。
+- **意图优先「创建空间」与 Git Worktree 隔离**：选定任务意图即可记住常用工具组合，支持一键开启 Git Worktree 隔离分支，多任务并行互不干扰。
+- **对话流与原生终端无缝切换**：随时在结构化工具卡片、代码 Diff、审批确认与高精度 xterm 原生终端之间切换。
 
-| | |
-|---|---|
-| **一眼看全** | 所有电脑上的 agent 按状态排好：在干活、在等你、跑完了。点进去是排好版的对话（工具调用折成卡片）和实时终端。 |
-| **随手操作** | 发消息和图片，按 Esc / Tab / 方向键 / Ctrl+C，agent 给出编号选项时点一下就能选。终端用 App 自带的紧凑键盘，不让系统输入法挡住屏幕，要打中文时一键切回去。 |
-| **开新 agent** | 在任意一台电脑的任意空间里，启动那台电脑上装了的 agent：Claude Code、Codex、Gemini CLI、Kimi、Cursor Agent、Droid、CodeBuddy、Qoder、OpenCode…… 第一条任务一起交过去。 |
-| **助理小羊** | 一个对话管所有电脑：问谁在等你、某个 agent 卡在哪、花了多少钱；让它传话、按键、开新的 agent。默认直接动手，结果照实告诉你。agent 卡住或跑完时它会主动说，App 关着也会推送到通知栏，还能设提醒。 |
-| **打电话** | 和小羊语音通话，边走路边指挥。支持 MOSS-Live 与 OpenAI Realtime 双协议，内置端侧声纹锁定与通话降噪；通话里不用点确认。 |
-| **扫码就连** | 二维码是普通的 https 链接，任何相机都能扫；新服务器的第一台设备扫启动时打印的码就行，不用复制密钥。 |
-| **电脑互相调用** | 在一台电脑的终端里看另一台电脑的 agent、给它发消息、按键。 |
-| **自己的服务器** | 中转服务部署在你自己的机器上：Docker、Cloudflare Tunnel、Node + systemd、Fly.io、Render、Kubernetes 都有现成配置。 |
-| **自动更新** | 手机 App、电脑端命令和服务器都从 GitHub Releases 更新，电脑和服务器的更新出问题时保持原版本，也能一键退回。 |
-| **有日志可查** | 服务器、电脑、手机的日志都汇总到中转服务，用 `herdr-pocket logs` 或浏览器里的 `/admin` 控制台查，也可以直接问小羊“卡在哪一步了”。 |
+### 2. 多空间浏览器与可选 AI 虚拟光标（`plugins.aiBrowser`，默认关闭）
+- **Space 隔离 + 多标签页**：桌面工作台内置多空间、多标签浏览器面板，把本地开发预览、文档和业务控制台分门别类管好，互不串 Cookie 与上下文。
+- **零外部依赖、默认不打扰**：在未主动启用 `plugins.aiBrowser` 前完全零感知；当你需要 AI 帮忙操作网页时再开启，无需安装额外浏览器扩展或重型运行环境。
+- **实时状态栏 + 粉色虚拟鼠标 + 一键接管**：闭合 Shadow DOM 渲染高精度粉色虚拟光标与当前动作状态栏，遇到登录、密码或验证码自动触发人类接管保护，也可随时点击 **「我来接管」 / 「已完成，交还 AI」**。
+- **CLI 与 RPC 全链路可控**：Agent 或脚本可通过 `herdr-pocket browser` 直接操控：
 
-</details>
+```sh
+herdr-pocket browser status --json
+herdr-pocket browser open http://localhost:3000 --space work --page app
+herdr-pocket browser snapshot --space work --json
+herdr-pocket browser click @e12 --space work --label "提交登录"
+herdr-pocket browser fill @e14 "hello" --space work
+herdr-pocket browser handoff --space work --reason "需要人工完成短信验证"
+herdr-pocket browser resume --space work
+```
 
-## 怎么连起来
+### 3. 小羊助理与插件中心（`插件中心`，默认全闭）
+- **一切插件默认关闭**：用户不会被强制安装或开启任何多余能力，只有在了解并认可后才按需开关。
+- **桌面端 / 移动端插件中心支持**：
+  - `browser`（`browser_act`）：授权小羊助理驱动当前桌面 Space 浏览器，并严格受人工接管保护限制。
+  - `workspace`（`inspect_workspace`）：在受控输出上限内快速巡检受控电脑的代码仓库与文件结构。
+  - `webfetch`（`fetch_webpage`）：内置 DNS/IP 级 SSRF 防护（拦截回环、链路本地、内网私网地址及重定向跳转）与 8 KB 正文截断的网页安全读取工具。
+  - `webhooks`：自定义 HTTP Webhook 工具，鉴权密钥使用中转秘钥密封存储并在读取接口统一脱敏展示。
+
+### 4. P2P 跨端传送门（`herdr-pocket open`）
+- 在远端终端触发链接、点击调试端口或运行 `herdr-pocket open <文件路径或URL>`，客户端优先探测局域网或组网直连加密传输，直连不可达时平滑回落至自托管中转。
+
+---
+
+## 视觉概念与系统架构
+
+<table align="center">
+  <tr>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/ecosystem-hero.webp" alt="Herdr Pocket 多端协同总览插画" width="100%" />
+      <br />
+      <sub>全端协同驾驶舱</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/ai-browser-portal.webp" alt="Space 浏览器虚拟光标与人工接管插画" width="100%" />
+      <br />
+      <sub>虚拟鼠标与人工接管协作</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/xiaoyang-plugins.webp" alt="小羊助理按需启用插件中心插画" width="100%" />
+      <br />
+      <sub>小羊助理与按需插件中心</sub>
+    </td>
+  </tr>
+</table>
 
 <p align="center">
   <picture>
-    <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/readme/architecture-narrow-zh-dark.svg" />
-    <source media="(max-width: 600px)" srcset="docs/readme/architecture-narrow-zh-light.svg" />
     <source media="(prefers-color-scheme: dark)" srcset="docs/readme/architecture-zh-dark.svg" />
-    <img src="docs/readme/architecture-zh-light.svg" width="100%" alt="示意图：安卓 App（小羊助理、语音通话）和另一台手机通过 wss 连到你自己服务器上的中转服务，中转服务负责配对、转发和小羊。电脑 A 和电脑 B 各自运行 herdr-pocket，旁边是 herdr 里的 agent，也都主动连到中转服务。中转服务再调用你配置的文字模型和语音服务。" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/architecture-zh-light.svg" />
+    <img alt="Herdr Pocket 系统架构图：移动端桌面端、自建 Relay 与电脑 hostd" src="docs/readme/architecture-zh-light.svg" width="100%" />
   </picture>
 </p>
 
-- **电脑端** `herdr-pocket`：每台电脑一个后台程序，读 herdr 里的 agent，把状态、对话和终端发给中转服务，执行手机发来的操作。
-- **中转服务** relay：负责设备配对和令牌、在线状态、请求转发，小羊助理也跑在这里。所有设备都只主动连它，电脑不用开端口。
-- **全端客户端（手机与桌面）**：Android 与 iOS 客户端（Expo / React Native + 原生语音、声纹降噪与多镜像分片加速模块）、鸿蒙 HarmonyOS NEXT 原生 Stage 模型客户端（`.hap`），以及 Windows / macOS / Linux 桌面客户端（Tauri v2）。
+### 仓内模块组成
+- **`apps/relay`**：轻量级 Node.js + SQLite 中转服务。设备凭证仅存储哈希值，负责长连接转发、小羊助理（以及秘钥密封存储 `<db>.key`）和 `/app/` 网页端分发。
+- **`apps/hostd`**：运行在各台受控电脑上的守护进程（`herdr-pocket`）。桥接本地 `herdr` 终端、Uniflo 历史记录、Git Worktree 创建、P2P 传送门，以及可选的浏览器插件驱动。
+- **全端客户端**：
+  - `apps/desktop`：**React 19 + Tauri v2** 原生桌面应用（macOS / Windows / Linux）。
+  - `apps/mobile`：**Expo SDK 58** 原生移动端（Android / iOS）。
+  - `apps/harmony`：**HarmonyOS NEXT** Stage 模型 ArkTS 原生应用（复用共享桌面工作台构建包）。
+
+---
 
 ## 快速开始
 
-需要：一台手机和电脑都能连上的服务器（Linux），装了 herdr 的电脑（macOS、Linux 或 Windows），以及一部手机（Android、iOS 或鸿蒙 HarmonyOS NEXT）或任意桌面电脑客户端。
+### 1. 部署你自己的中转服务器（2 分钟）
 
-### 1. 部署中转服务
-
-一条命令（有 Docker 就用 Docker，没有就用 Node + systemd）：
+支持 Docker、原生 Node + systemd、Fly.io、Render、Kubernetes，以及免开端口的 Cloudflare Tunnel（详见 [部署文档](docs/deploy/README.md)）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-relay.sh | sudo bash -s -- --domain pocket.example.com
 ```
 
-| 你的情况 | 参数 |
-|---|---|
-| 有域名，服务器能开 80/443 端口（Caddy 自动 HTTPS） | `--domain pocket.example.com` |
-| 域名在 Cloudflare，服务器不想开端口（家里、内网） | `--tunnel <token> --domain pocket.example.com` |
-| 没有域名，先试一下 | `--tunnel quick`（临时 trycloudflare 地址，重启会变） |
-| 局域网，或者前面已经有自己的反向代理 | `--port 7420` |
-| 不想装 Docker | 加 `--native` |
+### 2. 在受控电脑接入 `hostd`
 
-只用 Docker Compose 也可以：
-
-```sh
-mkdir herdr-pocket && cd herdr-pocket
-curl -fsSLO https://raw.githubusercontent.com/Crosery/herdr-pocket/main/deploy/docker/compose.yml
-docker compose up -d
-docker compose logs relay | grep "setup code"   # 第一台设备用的设置码
-```
-
-Fly.io、Render、Railway、Zeabur、Kubernetes 和各种方式的细节见 [部署文档](docs/deploy/README.md)。不管哪种方式，数据库要放在持久存储上，并且只跑一个实例。
-
-### 2. 连上第一台设备
-
-新服务器还没有设备时，会打印一个一次性的设置码和二维码（30 分钟有效，只能用一次）：
-
-```
-[relay] setup code=MEOW-482193 link=https://pocket.example.com/p/MEOW-482193 expires=…
-```
-
-- **先连手机**：用相机扫这个二维码，网页上点“用 Herdr Pocket 打开”。还没装 App 时，页面上有下载链接。
-- **先连电脑**：把这条链接交给电脑端，见下一步。
-
-找不到了就在服务器上运行 `sudo herdr-pocket-relay setup` 再看一次，过期了用 `--new` 换一个。
-
-### 3. 装电脑端
+**macOS / Linux：**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.sh | bash -s -- --server https://pocket.example.com
 ```
 
-它会装好 `herdr-pocket` 命令和开机自启的后台服务（macOS 用 launchd，Linux 用 systemd 用户服务）。终端会显示一个二维码，用已经连上的手机扫一下，点“允许加入”。第一台设备就是这台电脑时，把 `--server …` 换成第 2 步的设置链接：`… | bash -s -- https://pocket.example.com/p/<设置码>`。
-
-电脑上要有 Node.js 22.18 或更新的版本，没有的话安装脚本会单独下载一份，不影响系统里的 Node。
-
-**Windows**（10 1809 以上或 11）：在 PowerShell 里运行下面这条。不需要管理员权限，自带 Node，登录 Windows 后在后台自动上线，不弹窗口。
+**Windows (PowerShell)：**
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
 ```
 
-第一台设备就是这台电脑时，改用设置链接：`… -Link https://pocket.example.com/p/<设置码>`。详见 [docs/deploy/host.md](docs/deploy/host.md#windows)。
+*中国大陆网络环境：* 安装脚本前缀可加上 `https://ghfast.top/`，运行 `herdr-pocket update --probe` 可自动测速并记住最快的更新镜像源。
 
-在中国大陆，GitHub 慢的时候在脚本地址前加镜像：`https://ghfast.top/https://raw.githubusercontent.com/...`。脚本按时区判断，之后的下载和以后的更新都会自动先走镜像，见 [docs/deploy/updates.md](docs/deploy/updates.md#中国大陆)。
+### 3. 在手机或电脑打开 Pocket
 
-### 4. 装手机 / 桌面客户端
+从上方 [全平台安装包直链](#全平台安装包直链v0245) 安装对应客户端，运行 `herdr-pocket pair` 扫码或使用配对链接加入，或直接在浏览器打开 `https://<你的中转域名>/app/`。
 
-从 [Releases](https://github.com/Crosery/herdr-pocket/releases/latest) 选择对应平台的安装包：
+---
 
-- **Android**：`herdr-pocket-<版本>-android-arm64.apk`（支持应用内自动更新与多镜像声纹模型下载）
-- **iOS**：`herdr-pocket-<版本>-ios-arm64.ipa`（未签名包，可通过 AltStore、SideStore、TrollStore 或 Xcode 签名安装）
-- **鸿蒙（HarmonyOS NEXT）**：`herdr-pocket-<版本>-harmonyos-arm64.hap`（未签名 `.hap`，可用 DevEco Studio 签名安装）
-- **PC 桌面端（Windows / macOS / Linux）**：`macos-{arm64,x64}.dmg`、`windows-x64-setup.exe` / `.msi`、`linux-x64.{AppImage,deb}`
+## 安全与信任边界说明
 
-### 5. 加更多设备
+- **传输模型说明**：客户端与受控电脑之间的通信经由 TLS 加密并在各设备间验签，但自建中转服务在内存中转发数据，并非针对中转运维者的端到端密文黑盒 —— 这也是项目优先保证一键自托管、把服务器完全交回你自己掌控的原因。
+- **默认零侵入与防越权**：全部浏览器操控与小羊插件默认关闭（`false`）；外网抓取严格校验证书与目标 IP 阻止访问内网地址；API Key 与 Webhook Secret 在落盘前均经服务端密钥密封，接口回读统一脱敏。
 
-任何已经连上的设备都能邀请别的设备，邀请码一次性、10 分钟有效：
+---
 
-- 手机：App 里“设备 → 邀请设备”出二维码，或者用系统分享把链接发给另一台手机。
-- 电脑：`herdr-pocket pair` 在终端里打印二维码。
-- 复制了邀请链接再打开 App，首页会直接提示“用它连接”。
-
-## 配置小羊
-
-小羊跑在中转服务里，配置写在服务器的 `relay.env`（安装脚本放在 `/opt/herdr-pocket/relay.env`，Docker 方式放在 compose 同一目录）。不配模型也能用 App 的其他功能，只是没有助理。
-
-```sh
-# 文字模型：provider:model，按顺序尝试，前一个失败或太慢就换下一个
-POCKET_DEEPSEEK_API_KEY=sk-...
-POCKET_QWEN_API_KEY=sk-...
-POCKET_ASSISTANT_MODELS=deepseek:deepseek-flash,qwen:qwen3.7-plus
-
-# 语音通话：默认 MOSS-Live（推荐），填上 key 就能打电话
-POCKET_VOICE_KEY=...
-# POCKET_VOICE_PROVIDER=openai-realtime
-
-# 可选
-# POCKET_TIMEZONE=Asia/Shanghai        # 小羊报时和提醒用的时区
-# POCKET_ASSISTANT_CONFIRM=never       # always：文字对话里先问再动手（通话从不等确认）
-```
-
-内置的文字模型厂商：小米 MiMo、Anthropic、OpenAI、DeepSeek、通义千问、Kimi、智谱 GLM、硅基流动、火山方舟、OpenRouter、Gemini、Ollama（本地），支持 `OpenAI Chat`、`OpenAI Responses (Codex)`、`Anthropic`、`Google Gemini`、`Ollama` 五种协议；在客户端和 `/admin` 控制台填好密钥即可一键自动扫描上游模型并排好主备顺序。每家的地址、变量和配置文件写法见 [docs/config.md](docs/config.md)。
-
-“动手前先问我”也可以在 App 的设置里或 `/admin` 里切换，改过的值存在服务器上。
-
-## 命令行
-
-```sh
-herdr-pocket up --server pocket.example.com   # 登记这台电脑并保持在线（login + run）
-herdr-pocket pair                             # 出一个邀请二维码，加手机或别的电脑
-herdr-pocket status                           # 登记和连接状态
-
-herdr-pocket agents                           # 所有在线电脑的 agent
-herdr-pocket read  macbook/t42                # 看另一台电脑的终端
-herdr-pocket send  macbook/t42 跑一下测试
-herdr-pocket keys  macbook/t42 esc
-
-herdr-pocket logs --since 1h --level warn     # 查中转服务、电脑、手机记下的日志
-herdr-pocket update                           # 更新到最新版本（--check 只检查，--rollback 退回）
-```
-
-`herdr-pocket run --read-only` 只让别人看不让动；`--allow <设备 id,…>` 只让指定设备操作这台电脑。小羊以中转服务的身份调用电脑（设备 id 为 `relay`），用了 `--allow` 时要把它加进去。
-
-服务器上对应的命令是 `herdr-pocket-relay`：`setup`、`status`、`logs`、`update`、`version`。
-
-## 更新
-
-| | 命令 |
-|---|---|
-| 手机 App | 有新版本时自动提示，也可以在“设置 → 版本”里手动检查 |
-| 电脑 | `herdr-pocket update` |
-| 服务器 | `sudo herdr-pocket-relay update`；Docker 方式是 `docker compose pull && docker compose up -d` |
-
-电脑和服务器的更新先把新版本解压到旁边的目录、试启动一次，没问题才切换并重启；失败时原版本不动，`--rollback` 可以退回上一个版本。发布流程见 [docs/deploy/updates.md](docs/deploy/updates.md)。
-
-## 日志和控制台
-
-- **`/admin`**：浏览器打开 `https://pocket.example.com/admin`，填 `POCKET_ADMIN_TOKEN`（安装脚本会生成一个）。可配置模型与服务商（含一键扫描上游模型）、实时语音与音色、系统提示词，查看版本、在线设备、最近 24 小时统计、扫码配对与实时日志，还能吊销设备或切换“动手前先问我”。
-- **`herdr-pocket logs`**：任意一台已登记的电脑都能查，可按时间、设备、类型、级别、关键字过滤，`--follow` 持续跟。
-- 手机和电脑的日志会定时上传到中转服务，上传前抹掉令牌和密钥。
-
-## 安全
-
-- 设备令牌只在配对时出现一次，服务器只存 SHA-256。在 App 里或 `/admin` 吊销后立刻断线。
-- 邀请码一次性、默认 10 分钟过期；同一 IP 失败 10 次锁 10 分钟。设置码只在服务器还没有任何设备时存在。
-- 二维码网页只显示网址里已有的内容，不查询码是否有效，不缓存，不带来源信息。
-- agent 归属由中转服务按连接身份改写，电脑不能冒充别的电脑。手机只能按名字选择要启动的程序，不能让电脑执行任意命令。
-- 生产环境请走 HTTPS。**中转服务能看到明文内容，目前没有端到端加密**，请部署在你信任的机器上。
-
-## 开发
-
-| 目录 | 内容 |
-|---|---|
-| `packages/protocol` | 设备、agent、对话、RPC、流和配对的版本化协议，跨进程的改动从这里开始 |
-| `packages/update` | 版本号、GitHub Releases 检查、原地更新和回滚 |
-| `apps/relay` | 中转服务和助理小羊 |
-| `apps/hostd` | 电脑端后台程序和 `herdr-pocket` 命令行 |
-| `apps/mobile` | Android 与 iOS 客户端（Expo SDK 58），不在根目录的 pnpm workspace 里 |
-| `apps/desktop` | PC 桌面端（React + Tauri v2，支持 Windows / macOS / Linux）及共享鸿蒙网页前端 |
-| `apps/harmony` | HarmonyOS NEXT 原生 ArkTS 工程 |
-| `apps/site` | 官网和介绍视频（Vite + three.js，视频用 Remotion 渲染） |
-| `deploy/`、`scripts/` | Docker、systemd、launchd、Fly、Render、k8s 配置和安装脚本 |
+## 本地开发与验证
 
 ```sh
 pnpm install
 pnpm typecheck
 pnpm --filter @herdr-pocket/relay test
 pnpm --filter @herdr-pocket/hostd test
-
-cd apps/mobile && pnpm install && pnpm typecheck
-cd apps/desktop && pnpm install && pnpm typecheck && pnpm build && pnpm build:harmony
+pnpm --dir apps/desktop typecheck && pnpm --dir apps/desktop test
+pnpm --dir apps/mobile typecheck
 ```
 
-App 不连服务器也能看：在连接页点“还没有服务器？先逛逛演示数据”。协作约定见 [AGENTS.md](AGENTS.md)，文档索引见 [docs/README.md](docs/README.md)，App 的开发和打包见 [apps/mobile/README.md](apps/mobile/README.md)。
+开发规范、UI 组件红线与发布流程见 [AGENTS.md](AGENTS.md) 与 [docs/design/ui-component-rules.md](docs/design/ui-component-rules.md)。
+
+---
 
 ## 许可证
 

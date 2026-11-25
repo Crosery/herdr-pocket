@@ -4,7 +4,16 @@
  * local stand-in answers instead.
  */
 import { create } from "zustand";
-import type { AssistantConfirm, AssistantItem, AssistantState, Reminder, ServerFrame } from "@herdr-pocket/protocol";
+import type {
+  AssistantConfirm,
+  AssistantItem,
+  AssistantPluginId,
+  AssistantSettings,
+  AssistantState,
+  AssistantWebhookTool,
+  Reminder,
+  ServerFrame,
+} from "@herdr-pocket/protocol";
 import { useSettings } from "./store";
 import { loadToken } from "./auth";
 import { isMockServer, mockAssistant } from "./mock";
@@ -20,6 +29,8 @@ interface AssistantStore {
   reminders: Reminder[];
   /** "always": the assistant asks before acting in typed chats. Unknown (older relay): null. Calls never wait. */
   confirm: AssistantConfirm | null;
+  plugins: Partial<Record<AssistantPluginId, boolean>>;
+  webhooks: AssistantWebhookTool[];
   loaded: boolean;
   error: string | null;
   /** Things the assistant brought up on its own while its screen was not in view. */
@@ -35,6 +46,8 @@ export const useAssistant = create<AssistantStore>()(() => ({
   model: null,
   reminders: [],
   confirm: null,
+  plugins: {},
+  webhooks: [],
   loaded: false,
   error: null,
   unread: 0,
@@ -69,6 +82,8 @@ export function applyAssistantState(s: AssistantState): void {
     model: s.model ?? null,
     reminders: s.reminders,
     confirm: s.settings?.confirm ?? null,
+    plugins: s.settings?.plugins ?? {},
+    webhooks: s.settings?.webhooks ?? [],
     loaded: true,
     error: null,
   });
@@ -194,10 +209,39 @@ export async function setAssistantConfirm(confirm: AssistantConfirm): Promise<vo
       mockAssistant.setConfirm(confirm);
       return;
     }
-    const r = await api<{ confirm: AssistantConfirm }>("/v1/assistant/settings", { body: { confirm } });
+    const r = await api<AssistantSettings>("/v1/assistant/settings", { body: { confirm } });
     useAssistant.setState({ confirm: r.confirm });
   } catch (e) {
     useAssistant.setState({ confirm: before });
+    throw e;
+  }
+}
+
+export async function updateAssistantPlugins(patch: {
+  plugins?: Partial<Record<AssistantPluginId, boolean>>;
+  webhooks?: AssistantWebhookTool[];
+}): Promise<AssistantSettings> {
+  const prevPlugins = useAssistant.getState().plugins;
+  const prevWebhooks = useAssistant.getState().webhooks;
+  useAssistant.setState({
+    ...(patch.plugins ? { plugins: patch.plugins } : {}),
+    ...(patch.webhooks !== undefined ? { webhooks: patch.webhooks } : {}),
+  });
+  try {
+    if (isMockServer(useSettings.getState().server)) {
+      const next = mockAssistant.setPluginSettings(patch);
+      useAssistant.setState({ plugins: next.plugins ?? {}, webhooks: next.webhooks ?? [] });
+      return next;
+    }
+    const r = await api<AssistantSettings>("/v1/assistant/settings", { body: patch });
+    useAssistant.setState({
+      confirm: r.confirm,
+      plugins: r.plugins ?? {},
+      webhooks: r.webhooks ?? [],
+    });
+    return r;
+  } catch (e) {
+    useAssistant.setState({ plugins: prevPlugins, webhooks: prevWebhooks });
     throw e;
   }
 }

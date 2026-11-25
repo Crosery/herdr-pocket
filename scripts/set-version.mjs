@@ -104,3 +104,27 @@ if (existsSync(androidGradle)) {
   writeFileSync(androidGradle, text);
   console.log(`apps/mobile/android/app/build.gradle  ${version} (versionCode ${versionCode})`);
 }
+
+const siteConfig = join(root, "apps/site/src/config.ts");
+if (existsSync(siteConfig)) {
+  const prev = readFileSync(siteConfig, "utf8");
+  const next = prev.replace(/(latestVersion:\s*)"[^"]*"/, `$1"${version}"`);
+  if (next !== prev) {
+    writeFileSync(siteConfig, next);
+    console.log(`apps/site/src/config.ts  latestVersion ${version}`);
+  }
+}
+
+for (const rel of ["README.md", "README.zh-CN.md", "apps/site/index.html"]) {
+  const path = join(root, rel);
+  if (!existsSync(path)) continue;
+  const prev = readFileSync(path, "utf8");
+  const next = prev
+    .replace(/(releases\/(?:download|tag)\/v)\d+\.\d+\.\d+/g, `$1${version}`)
+    .replace(/(herdr-pocket-)\d+\.\d+\.\d+(?=(?:-[a-z0-9-]+)?\.(?:dmg|exe|msi|AppImage|deb|apk|ipa|hap|tar\.gz))/g, `$1${version}`)
+    .replace(/(\bDownload v|\*\*v|最新版本[:：]\s*`?v|id="dl-version-pill">v)\d+\.\d+\.\d+/g, `$1${version}`);
+  if (next !== prev) {
+    writeFileSync(path, next);
+    console.log(`${rel}  release links -> v${version}`);
+  }
+}

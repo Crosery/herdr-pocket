@@ -1,260 +1,226 @@
-<p align="center"><b>English</b> | <a href="README.zh-CN.md">简体中文</a></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/hero-en-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/hero-en-light.svg" />
+    <img alt="Herdr Pocket — Your AI agents in your pocket, across phone and desktop" src="docs/readme/hero-en-light.svg" width="100%" />
+  </picture>
+</p>
 
-<div align="center">
+<p align="center">
+  <strong>Control AI coding agents across every computer — from iOS, Android, HarmonyOS NEXT, macOS, Windows, Linux, or any browser.</strong>
+</p>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/readme/hero-en-dark.svg" />
-  <img src="docs/readme/hero-en-light.svg" width="100%" alt="Herdr Pocket: every coding agent on every computer, in your pocket. The mascot Xiaoyang, a sheep girl in a lavender hoodie, cheers from a cloud." />
-</picture>
+<p align="center">
+  <a href="README.md"><strong>English</strong></a> ·
+  <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="https://crosery.github.io/herdr-pocket/">Official Website</a> ·
+  <a href="https://github.com/Crosery/herdr-pocket/releases">Releases (v0.2.45)</a> ·
+  <a href="docs/deploy/README.md">Self-Hosting Docs</a>
+</p>
 
-See what Claude Code, Codex, Gemini CLI and the other agents on each of your computers are doing, right from your phone (Android, iOS, HarmonyOS NEXT) or desktop (Windows, macOS, Linux).<br />
-Message them, press keys, start new ones, or just call Xiaoyang, the assistant, and let her handle it.
+<p align="center">
+  <img alt="License AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-ff4f8b?style=flat-square" />
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android%20%7C%20HarmonyOS%20NEXT-1d1720?style=flat-square" />
+  <img alt="Default Opt-In Plugins" src="https://img.shields.io/badge/plugins-100%25%20opt--in%20%C2%B7%20zero%20lock--in-ff4f8b?style=flat-square" />
+</p>
 
-*Your coding agents on every computer, in your pocket: a self-hosted relay, a small daemon per computer, and mobile & desktop apps with a voice assistant.*
+---
 
-[![Release](https://img.shields.io/github/v/release/Crosery/herdr-pocket?color=f472b6&label=release)](https://github.com/Crosery/herdr-pocket/releases/latest)
-[![CI](https://img.shields.io/github/actions/workflow/status/Crosery/herdr-pocket/ci.yml?branch=main&label=CI)](https://github.com/Crosery/herdr-pocket/actions/workflows/ci.yml)
-![Clients](https://img.shields.io/badge/clients-Android%20%C2%B7%20iOS%20%C2%B7%20HarmonyOS%20%C2%B7%20Desktop-a78bfa)
-![Node](https://img.shields.io/badge/node-%E2%89%A5%2022.18-c084fc)
-![Self-hosted](https://img.shields.io/badge/relay-self--hosted-f9a8d4)
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-f472b6)](LICENSE)
-
-[Website](https://crosery.github.io/herdr-pocket/) · [Deploy](docs/deploy/README.md) · [Models and voice](docs/config.md) · [Download clients](https://github.com/Crosery/herdr-pocket/releases/latest) · [Website source](apps/site)
-
-</div>
+## Multi-Device Workspace Showcase
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/readme/showcase-dark.webp" />
-    <img src="docs/readme/showcase-light.webp" width="100%" alt="Five app screens in phone frames: the agent list on every computer, a formatted conversation, the assistant Xiaoyang, the terminal with its compact keyboard, and a voice call" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/showcase-light.webp" />
+    <img alt="Herdr Pocket multi-device showcase: Desktop v3 workbench and mobile clients in light and dark mode" src="docs/readme/showcase-light.webp" width="100%" />
   </picture>
 </p>
 
-<details>
-<summary>Screenshots in the other theme</summary>
+<table align="center">
+  <tr>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/desktop-light.webp" alt="Desktop v3 Split Workbench" width="100%" />
+      <br />
+      <strong>v3 Split &amp; Stacked Workbench</strong>
+      <br />
+      <sub>Multi-pane workspaces, <code>/</code> &amp; <code>\</code> command surface, Intent Spaces &amp; Git Worktree isolation.</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/browser-ai-light.webp" alt="Multi-Space Built-in Browser and Opt-In AI Cursor" width="100%" />
+      <br />
+      <strong>Space Browser &amp; AI Virtual Cursor</strong>
+      <br />
+      <sub>Multi-space tabs, optional AI pink virtual cursor overlay, CAPTCHA guard &amp; instant human takeover.</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/plugins-light.webp" alt="Opt-In Xiaoyang Plugin Center" width="100%" />
+      <br />
+      <strong>Opt-In Plugin Center</strong>
+      <br />
+      <sub>All plugins off by default: enable <code>browser_act</code>, workspace inspection, SSRF-safe web fetch, or custom webhooks only when needed.</sub>
+    </td>
+  </tr>
+</table>
+
+---
+
+## Direct Downloads (`v0.2.45`)
+
+Every build below comes straight from [GitHub Releases](https://github.com/Crosery/herdr-pocket/releases) alongside `SHA256SUMS` and Chinese/English release notes.
+
+| Platform | Architecture / Format | Direct Download | Notes |
+| --- | --- | --- | --- |
+| **macOS** | Apple Silicon (`arm64`) `.dmg` | [herdr-pocket-0.2.45-macos-arm64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-macos-arm64.dmg) | Tauri v2 desktop app (M1–M4) |
+| **macOS** | Intel (`x64`) `.dmg` | [herdr-pocket-0.2.45-macos-x64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-macos-x64.dmg) | Tauri v2 desktop app (x86_64) |
+| **Windows** | `x64` NSIS Installer `.exe` | [herdr-pocket-0.2.45-windows-x64-setup.exe](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-windows-x64-setup.exe) | Recommended Windows installer |
+| **Windows** | `x64` Windows Installer `.msi` | [herdr-pocket-0.2.45-windows-x64.msi](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-windows-x64.msi) | Enterprise / MSI deployment |
+| **Linux** | `x64` Portable `.AppImage` | [herdr-pocket-0.2.45-linux-x64.AppImage](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-linux-x64.AppImage) | Zero-install portable image |
+| **Linux** | `x64` Debian/Ubuntu `.deb` | [herdr-pocket-0.2.45-linux-x64.deb](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-linux-x64.deb) | `apt` / `dpkg` package |
+| **Android** | `arm64` Native `.apk` | [herdr-pocket-0.2.45-android-arm64.apk](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-android-arm64.apk) | In-app self-update &amp; voice mode |
+| **HarmonyOS NEXT** | `arm64` Stage-Model `.hap` | [herdr-pocket-0.2.45-harmonyos-arm64.hap](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-harmonyos-arm64.hap) | Native ArkTS shell + Web workbench |
+| **iOS** | `arm64` Sideload `.ipa` | [herdr-pocket-0.2.45-ios-arm64.ipa](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45-ios-arm64.ipa) | AltStore / SideStore / TrollStore |
+| **Relay &amp; Hostd** | Cross-platform `.tar.gz` | [herdr-pocket-0.2.45.tar.gz](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.45/herdr-pocket-0.2.45.tar.gz) | Used by `install-host` &amp; `herdr-pocket update` |
+
+---
+
+## Core Capabilities
+
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/showcase-light.webp" />
-    <img src="docs/readme/showcase-dark.webp" width="100%" alt="The same five screens in the other color theme" />
-  </picture>
-</p>
-</details>
-
-## What it does
-
-<p align="center">
-  <picture>
-    <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/readme/features-narrow-en-dark.svg" />
-    <source media="(max-width: 600px)" srcset="docs/readme/features-narrow-en-light.svg" />
     <source media="(prefers-color-scheme: dark)" srcset="docs/readme/features-en-dark.svg" />
-    <img src="docs/readme/features-en-light.svg" width="100%" alt="Features at a glance: see it all, hands on, new agents, Xiaoyang, voice calls, scan to connect, computer to computer, your own server, auto updates, logs. Each one is described in the table below." />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/features-en-light.svg" />
+    <img alt="Herdr Pocket core features across mobile, desktop, browser space, plugins, and relay" src="docs/readme/features-en-light.svg" width="100%" />
   </picture>
 </p>
 
-<details>
-<summary><b>Every feature in detail</b></summary>
+### 1. Real-Time Agent Control Without Changing Your CLI Workflow
+- **Multi-harness support**: Keep running Claude Code, Codex, OpenCode, Gemini CLI, OMP, or plain shells inside `herdr` on macOS, Linux, or Windows — Pocket attaches without wrapping or breaking your workflow.
+- **Unified `/` & `\` Command Surface**: Typing `/` or `\` opens a synchronized command popup (`/clear`, `/compact`, `/model`, `/resume`, etc.) across mobile, desktop, and H5.
+- **Intent-First Create Space & Git Worktree**: Pick what you want to do, choose your harness and launcher, and optionally spin up an isolated Git Worktree branch in one tap so parallel tasks never collide in one working tree.
+- **Native Terminal + Conversation Stream**: Switch cleanly between structured chat turns (diffs, tool cards, permissions, questions) and crisp native xterm rendering with live terminal graphics.
 
-| | |
-|---|---|
-| **See it all** | The agents on every computer, sorted by state: working, waiting on you, done. Tap one for a formatted conversation (tool calls folded into cards) and a live terminal. |
-| **Hands on** | Send messages and pictures, press Esc / Tab / arrows / Ctrl+C, and answer an agent's numbered choices with one tap. The terminal uses the app's own compact keyboard, so the system keyboard doesn't cover the screen; one tap switches back when you need to type Chinese. |
-| **New agents** | In any space on any computer, start an agent installed on that computer: Claude Code, Codex, Gemini CLI, Kimi, Cursor Agent, Droid, CodeBuddy, Qoder, OpenCode… and hand it its first task at the same time. |
-| **Xiaoyang** | One conversation for all your computers: ask who is waiting on you, where an agent is stuck, how much it has cost; have her pass on a message, press keys, start a new agent. By default she acts directly and tells you exactly how it went. When an agent gets stuck or finishes she speaks up on her own, pushing to the notification shade even while the app is closed, and she can set reminders. |
-| **Call her** | Voice calls with Xiaoyang, so you can direct things while you walk. Supports MOSS-Live and OpenAI Realtime with on-device voiceprint lock and call noise suppression; nothing waits for a confirm tap during a call. |
-| **Scan to connect** | QR codes are plain https links that any camera can scan. The first device on a new server just scans the code printed at startup; no keys to copy. |
-| **Computer to computer** | From one computer's terminal, look at another computer's agents, send them messages and press keys. |
-| **Your own server** | The relay runs on your own machine, with ready-made setups for Docker, Cloudflare Tunnel, Node + systemd, Fly.io, Render and Kubernetes. |
-| **Auto updates** | The phone app, the computer command and the server all update from GitHub Releases. If an update on a computer or the server goes wrong, the old version stays in place, and you can roll back in one step. |
-| **Logs** | Logs from the server, the computers and the phones all collect on the relay. Read them with `herdr-pocket logs` or the `/admin` console in your browser, or just ask Xiaoyang "where did it get stuck?" |
+### 2. Multi-Space & Multi-Tab Browser + Opt-In AI Virtual Cursor (`plugins.aiBrowser`, off by default)
+- **Workspace-grade browser spaces**: Organize dev previews, docs, and login sessions into separate browser spaces and multi-tab panes directly inside the desktop workbench.
+- **Zero-dependency AI automation when you turn it on**: Keep `plugins.aiBrowser` disabled for zero footprint; flip it on to let agents inspect interactive elements (`@e1`, `@e2`), click, fill, select, scroll, press keys, and stream what they are doing.
+- **Pink Virtual Cursor & Live Human Takeover**: Watch the closed Shadow DOM pink cursor glide across targets with status banners, trigger `我来接管` / `已完成，交还 AI` at any moment, and rely on built-in CAPTCHA / password human-handoff guards.
+- **Scriptable CLI & RPC (`hostd`)**: Drive spaces from agents or scripts via `herdr-pocket browser`:
 
-</details>
+```sh
+herdr-pocket browser status --json
+herdr-pocket browser open http://localhost:3000 --space work --page app
+herdr-pocket browser snapshot --space work --json
+herdr-pocket browser click @e12 --space work --label "Submit login form"
+herdr-pocket browser fill @e14 "hello" --space work
+herdr-pocket browser handoff --space work --reason "Need human SMS verification"
+herdr-pocket browser resume --space work
+```
 
-## How it connects
+### 3. Xiaoyang Assistant & Opt-In Plugin Center (`插件中心`, all `false` by default)
+- **Clean by default, extensible on demand**: Every plugin starts `false` — no surprise background tools, no heavy external dependencies, and zero lock-in.
+- **Built-in Xiaoyang Plugins**: Enable only what you trust in Desktop/Mobile **Plugin Center**:
+  - `browser` (`browser_act`): Let Xiaoyang interact with your Space Browser while staying subject to human handoff rules.
+  - `workspace` (`inspect_workspace`): Safely inspect repository layout and files with bounded output.
+  - `webfetch` (`fetch_webpage`): Fetch web documentation with DNS/IP SSRF blocking (rejects loopback, link-local, RFC1918, and IPv6 ULA targets, including redirects) and 8 KB text truncation.
+  - `webhooks`: Register custom HTTP webhook tools whose bearer secrets are sealed at rest and masked (`••••••••`) across read APIs.
+
+### 4. P2P Cross-Device Portal & Direct File Transfer
+- Run `herdr-pocket open <url-or-file>` from any paired machine or trigger URL/file hooks inside tmux — Pocket detects LAN or WireGuard/Tailscale peers automatically for direct encrypted P2P transfer, falling back seamlessly to your relay.
+
+---
+
+## Visual Architecture & AI Ecosystem
+
+<table align="center">
+  <tr>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/ecosystem-hero.webp" alt="Cross-device ecosystem hero illustration" width="100%" />
+      <br />
+      <sub>Multi-device unified cockpit</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/ai-browser-portal.webp" alt="Space Browser AI virtual cursor & takeover illustration" width="100%" />
+      <br />
+      <sub>AI Virtual Cursor &amp; Human Takeover</sub>
+    </td>
+    <td align="center" width="33.3%">
+      <img src="apps/site/public/assets/showcase/xiaoyang-plugins.webp" alt="Xiaoyang Assistant opt-in Plugin Center illustration" width="100%" />
+      <br />
+      <sub>Xiaoyang Opt-In Plugin Center</sub>
+    </td>
+  </tr>
+</table>
 
 <p align="center">
   <picture>
-    <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/readme/architecture-narrow-en-dark.svg" />
-    <source media="(max-width: 600px)" srcset="docs/readme/architecture-narrow-en-light.svg" />
     <source media="(prefers-color-scheme: dark)" srcset="docs/readme/architecture-en-dark.svg" />
-    <img src="docs/readme/architecture-en-light.svg" width="100%" alt="Diagram: the Android app (with Xiaoyang and voice calls) and another phone connect over wss to the relay on your own server, which handles pairing, forwarding and Xiaoyang. Computers A and B each run herdr-pocket next to the agents in herdr and also connect out to the relay. The relay calls the text model and voice providers you configure." />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/architecture-en-light.svg" />
+    <img alt="Herdr Pocket architecture diagram connecting Phone/Desktop clients, Self-Hosted Relay, and Computer hostd" src="docs/readme/architecture-en-light.svg" width="100%" />
   </picture>
 </p>
 
-- **Computer side** `herdr-pocket`: one background program per computer. It reads the agents in herdr, sends their state, conversations and terminals to the relay, and carries out what the phone asks for.
-- **Relay**: handles device pairing and tokens, online status and request forwarding; Xiaoyang the assistant runs here too. Every device only ever connects out to it, so computers don't need to open any ports.
-- **Mobile & desktop clients**: Android and iOS apps (Expo / React Native with native voice, noise-suppression, and multi-mirror download modules), HarmonyOS NEXT native Stage-model app (`.hap`), and cross-platform desktop apps for Windows, macOS, and Linux (Tauri v2).
+### How It Works
+- **`apps/relay`**: Lightweight WebSocket + HTTP relay (`Node.js` + SQLite). Stores hashed device tokens (`SHA-256`), manages Xiaoyang assistant state/sealed keys, serves the H5 client (`/app/`), and relays frames when direct P2P isn't reachable.
+- **`apps/hostd`**: Per-computer daemon (`herdr-pocket`). Bridges local `herdr` TUI sockets, Uniflo session logs, Git worktree creation, Portal P2P transfers, and the optional Chromium/bridge AI browser controller.
+- **Clients**:
+  - `apps/desktop`: **React 19 + Tauri v2** native app for macOS, Windows, and Linux.
+  - `apps/mobile`: **Expo SDK 58** native app for Android and iOS.
+  - `apps/harmony`: **HarmonyOS NEXT** Stage-Model ArkTS shell wrapping the shared workbench bundle.
 
-## Quick start
+---
 
-You need: a server (Linux) that your clients and computers can reach, a computer with herdr installed (macOS, Linux or Windows), and a phone (Android, iOS or HarmonyOS NEXT) or desktop client.
+## Quickstart
 
-### 1. Deploy the relay
+### 1. Deploy Your Own Relay (2 Minutes)
 
-One command (uses Docker if it's there, otherwise Node + systemd):
+Pick Docker, native Node + systemd, Fly.io, Render, Kubernetes, or Cloudflare Tunnel without opening firewall ports ([Deployment Guide](docs/deploy/README.md)):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-relay.sh | sudo bash -s -- --domain pocket.example.com
 ```
 
-| Your situation | Flags |
-|---|---|
-| You have a domain and the server can open ports 80/443 (Caddy sets up HTTPS automatically) | `--domain pocket.example.com` |
-| The domain is on Cloudflare and you'd rather not open ports on the server (at home, on an internal network) | `--tunnel <token> --domain pocket.example.com` |
-| No domain, just trying it out | `--tunnel quick` (a temporary trycloudflare address that changes on restart) |
-| A LAN, or you already have your own reverse proxy in front | `--port 7420` |
-| You don't want to install Docker | add `--native` |
+### 2. Connect Each Computer (`hostd`)
 
-Plain Docker Compose works too:
-
-```sh
-mkdir herdr-pocket && cd herdr-pocket
-curl -fsSLO https://raw.githubusercontent.com/Crosery/herdr-pocket/main/deploy/docker/compose.yml
-docker compose up -d
-docker compose logs relay | grep "setup code"   # the setup code for the first device
-```
-
-For Fly.io, Render, Railway, Zeabur, Kubernetes and the details of every route, see the [deploy docs](docs/deploy/README.md). Whichever you pick, keep the database on persistent storage and run only one instance.
-
-### 2. Connect the first device
-
-While a new server has no devices yet, it prints a one-time setup code and QR code (valid for 30 minutes, single use):
-
-```
-[relay] setup code=MEOW-482193 link=https://pocket.example.com/p/MEOW-482193 expires=…
-```
-
-- **Phone first**: scan the QR code with your camera and tap “用 Herdr Pocket 打开” (Open with Herdr Pocket) on the page. If the app isn't installed yet, the page has a download link.
-- **Computer first**: hand this link to the computer side; see the next step.
-
-Lost it? Run `sudo herdr-pocket-relay setup` on the server to see it again; if it has expired, add `--new` for a fresh one.
-
-### 3. Install the computer side
+**macOS / Linux:**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.sh | bash -s -- --server https://pocket.example.com
 ```
 
-It installs the `herdr-pocket` command and a background service that starts automatically (launchd on macOS, a systemd user service on Linux). The terminal shows a QR code: scan it with a phone that's already connected and tap “允许加入” (Allow). If this computer is the first device, replace `--server …` with the setup link from step 2: `… | bash -s -- https://pocket.example.com/p/<setup code>`.
-
-The computer needs Node.js 22.18 or newer. If it doesn't have one, the installer downloads a separate copy that leaves the system's Node alone.
-
-**Windows** (10 1809 or newer, or 11): run this in PowerShell instead. No administrator rights needed; it brings its own Node and starts Herdr Pocket hidden when you log on.
+**Windows (PowerShell):**
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
 ```
 
-For the first device, pass the setup link instead: `… -Link https://pocket.example.com/p/<setup code>`. Details in [docs/deploy/host.md](docs/deploy/host.md#windows).
+*Mainland China mirror supported:* prepend `https://ghfast.top/` before the script URL or run `herdr-pocket update --probe` to benchmark fastest download sources automatically.
 
-### 4. Install a mobile or desktop client
+### 3. Open Pocket on Phone or Desktop
 
-Download your platform package from [Releases](https://github.com/Crosery/herdr-pocket/releases/latest):
+Install the native app from [Direct Downloads](#direct-downloads-v0245), pair once via invite link or QR code (`herdr-pocket pair`), or visit `https://<your-relay>/app/` in any browser.
 
-- **Android**: `herdr-pocket-<version>-android-arm64.apk` (with in-app self-update and multi-mirror voice model download)
-- **iOS**: `herdr-pocket-<version>-ios-arm64.ipa` (unsigned `.ipa`; install via AltStore, SideStore, TrollStore, or Xcode)
-- **HarmonyOS NEXT**: `herdr-pocket-<version>-harmonyos-arm64.hap` (unsigned `.hap`; install or sign with DevEco Studio)
-- **Desktop (macOS / Windows / Linux)**: `macos-{arm64,x64}.dmg`, `windows-x64-setup.exe` / `.msi`, or `linux-x64.{AppImage,deb}`
+---
 
-### 5. Add more devices
+## Security & Trust Model
 
-Any device that's already connected can invite others. Invite codes are single use and valid for 10 minutes:
+- **Relay sees plaintext on the wire inside TLS**: Frames between clients and hosts are authenticated and TLS-encrypted in transit, **not** end-to-end encrypted against the relay operator — which is why Herdr Pocket makes self-hosting effortless and under your full control.
+- **Zero-trust defaults**: All AI Browser & Xiaoyang plugins ship **disabled (`false`)**, private IP fetches are blocked by SSRF validation, webhook secrets and LLM API keys are encrypted on disk with `<db>.key` and masked in UI responses, and device tokens are stored only as hashes.
 
-- Phone: in the app, “设备 → 邀请设备” (Devices → Invite device) shows a QR code, or send the link to another phone with the system share sheet.
-- Computer: `herdr-pocket pair` prints a QR code in the terminal.
-- Copy an invite link, then open the app: the home screen offers “用它连接” (Connect with it) right away.
-
-## Setting up Xiaoyang
-
-Xiaoyang runs inside the relay and is configured in the server's `relay.env` (the installer puts it at `/opt/herdr-pocket/relay.env`; with Docker it sits in the same directory as the compose file). Without a model, everything else in the app still works; there's just no assistant.
-
-```sh
-# Text models: provider:model, tried in order; when one fails or is too slow, the next takes over
-POCKET_DEEPSEEK_API_KEY=sk-...
-POCKET_QWEN_API_KEY=sk-...
-POCKET_ASSISTANT_MODELS=deepseek:deepseek-flash,qwen:qwen3.7-plus
-
-# Voice calls: MOSS-Live by default (recommended); add the key and you can call
-POCKET_VOICE_KEY=...
-# POCKET_VOICE_PROVIDER=openai-realtime
-
-# Optional
-# POCKET_TIMEZONE=Asia/Shanghai        # time zone Xiaoyang uses for the time and reminders
-# POCKET_ASSISTANT_CONFIRM=never       # always: ask before acting in text chats (calls never wait for confirmation)
-```
-
-Built-in text model providers: Xiaomi MiMo, Anthropic, OpenAI, DeepSeek, Qwen (Tongyi Qianwen), Kimi, Zhipu GLM, SiliconFlow, Volcano Engine Ark, OpenRouter, Gemini, and Ollama (local). Five protocols are supported (`OpenAI Chat`, `OpenAI Responses (Codex)`, `Anthropic`, `Google Gemini`, and `Ollama`), with 1-tap upstream model auto-scanning in the mobile app, desktop app, and `/admin`. Each provider's address, variables and config-file format are in [docs/config.md](docs/config.md).
-
-Ask before acting (“动手前先问我”) can also be switched in the app's settings or in `/admin`; the changed value is stored on the server.
-
-## Command line
-
-```sh
-herdr-pocket up --server pocket.example.com   # register this computer and keep it online (login + run)
-herdr-pocket pair                             # show an invite QR code to add a phone or another computer
-herdr-pocket status                           # registration and connection state
-
-herdr-pocket agents                           # agents on every online computer
-herdr-pocket read  macbook/t42                # look at another computer's terminal
-herdr-pocket send  macbook/t42 run the tests
-herdr-pocket keys  macbook/t42 esc
-
-herdr-pocket logs --since 1h --level warn     # logs recorded by the relay, the computers and the phones
-herdr-pocket update                           # update to the latest version (--check only checks, --rollback goes back)
-```
-
-`herdr-pocket run --read-only` lets others look but not touch; `--allow <device id,…>` lets only the listed devices operate this computer. Xiaoyang calls computers as the relay (device id `relay`), so add it when you use `--allow`.
-
-On the server, the matching command is `herdr-pocket-relay`: `setup`, `status`, `logs`, `update`, `version`.
-
-## Updates
-
-| | Command |
-|---|---|
-| Phone app | Prompts by itself when a new version is out; you can also check by hand in “设置 → 版本” (Settings → Version) |
-| Computer | `herdr-pocket update` |
-| Server | `sudo herdr-pocket-relay update`; with Docker, `docker compose pull && docker compose up -d` |
-
-Computer and server updates first unpack the new version into a directory next to the current one and start it once as a trial; only if that works do they switch over and restart. If it fails, the old version is left untouched, and `--rollback` returns to the previous version. The release process is in [docs/deploy/updates.md](docs/deploy/updates.md).
-
-## Logs and console
-
-- **`/admin`**: open `https://pocket.example.com/admin` in a browser and enter `POCKET_ADMIN_TOKEN` (the installer generates one). Configure text providers/models (with upstream model auto-scan), realtime voice, and prompts; inspect version, online devices, 24h statistics, pairing QR codes, and live logs; revoke devices or toggle ask before acting.
-- **`herdr-pocket logs`**: works from any registered computer. Filter by time, device, kind, level and keyword; `--follow` keeps watching.
-- Phone and computer logs are uploaded to the relay periodically, with tokens and keys wiped out before upload.
-
-## Security
-
-- A device token appears only once, at pairing, and the server stores only its SHA-256. Revoke a device in the app or in `/admin` and it disconnects immediately.
-- Invite codes are single use and expire after 10 minutes by default; 10 failures from the same IP lock it out for 10 minutes. A setup code exists only while the server has no devices at all.
-- The QR code web page only shows what's already in its URL: it doesn't check whether the code is valid, isn't cached, and sends no referrer.
-- The relay rewrites agent ownership according to each connection's identity, so a computer can't pose as another. A phone can only choose which program to start by name; it can't make a computer run arbitrary commands.
-- Use HTTPS in production. **The relay can see the content in plaintext; there's no end-to-end encryption yet**, so deploy it on a machine you trust.
+---
 
 ## Development
-
-| Directory | Contents |
-|---|---|
-| `packages/protocol` | Versioned protocol for devices, agents, conversations, RPC, streams and pairing; cross-process changes start here |
-| `packages/update` | Version numbers, GitHub Releases checks, in-place updates and rollback |
-| `apps/relay` | The relay and Xiaoyang the assistant |
-| `apps/hostd` | The computer-side background program and the `herdr-pocket` command line |
-| `apps/mobile` | Android & iOS mobile app (Expo SDK 58), not part of the root pnpm workspace |
-| `apps/desktop` | Cross-platform desktop app (React + Tauri v2 for macOS, Windows, Linux) and shared HarmonyOS web UI |
-| `apps/harmony` | HarmonyOS NEXT Stage-Model ArkTS shell |
-| `apps/site` | Website and intro video (Vite + three.js; the video is rendered with Remotion) |
-| `deploy/`, `scripts/` | Docker, systemd, launchd, Fly, Render and k8s configs, and the install scripts |
 
 ```sh
 pnpm install
 pnpm typecheck
 pnpm --filter @herdr-pocket/relay test
 pnpm --filter @herdr-pocket/hostd test
-
-cd apps/mobile && pnpm install && pnpm typecheck
-cd apps/desktop && pnpm install && pnpm typecheck && pnpm build && pnpm build:harmony
+pnpm --dir apps/desktop typecheck && pnpm --dir apps/desktop test
+pnpm --dir apps/mobile typecheck
 ```
 
-You can look around the app without a server: on the connect screen, tap “还没有服务器？先逛逛演示数据” (No server yet? Look around with demo data). Collaboration conventions are in [AGENTS.md](AGENTS.md), the docs index is [docs/README.md](docs/README.md), and app development and packaging are in [apps/mobile/README.md](apps/mobile/README.md).
+See [AGENTS.md](AGENTS.md) and [docs/design/ui-component-rules.md](docs/design/ui-component-rules.md) for UI primitive rules, workspace build instructions, and release conventions.
+
+---
 
 ## License
 

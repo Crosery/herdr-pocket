@@ -82,6 +82,7 @@ export type FrameSection =
   | "privacy"
   | "voice"
   | "assistant"
+  | "plugins"
   | "browser"
   | "performance"
   | "logs"
@@ -94,6 +95,7 @@ export const FRAME_SECTION_OF: Record<SettingsSection, FrameSection> = {
   voice: "voice",
   notifications: "alerts",
   assistant: "assistant",
+  plugins: "plugins",
   browser: "browser",
   updates: "updates",
   performance: "performance",

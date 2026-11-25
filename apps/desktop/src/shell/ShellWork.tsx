@@ -1,8 +1,8 @@
 import { Suspense, lazy, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, Bell, Check, ChevronDown, Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, HelpCircle, Keyboard, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, ScreenShare, Search, ShieldAlert, Sparkles, SquareArrowOutUpRight, Terminal, X } from "lucide-react";
+import { AlertTriangle, Bell, Check, ChevronDown, Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, HelpCircle, Keyboard, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, ScreenShare, Search, ShieldAlert, Sparkles, SquareArrowOutUpRight, Terminal, Trash2, X } from "lucide-react";
 import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
-import { PocketButton, PocketErrorBoundary, PocketModal, overlayStore, useToast } from "../components/PocketUI";
+import { PocketButton, PocketErrorBoundary, PocketInput, PocketModal, PocketSelect, overlayStore, useToast } from "../components/PocketUI";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood, resolveVendor } from "../components/MascotAndVendor";
@@ -14,6 +14,17 @@ import { prettyHotkey } from "../components/VoiceInput";
 import { AgentDetailPanel, type SubagentHeadInfo } from "../views/AgentsView";
 import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../views/WorkbenchView";
 import { assistantStore, loadAssistant } from "../lib/assistant";
+import {
+  browserSpacesStore,
+  closeBrowserTab,
+  createUserBrowserSpace,
+  deleteBrowserSpace,
+  openBrowserTab,
+  selectBrowserSpace,
+  selectBrowserTab,
+  updateBrowserTab,
+  useBrowserSpaces,
+} from "../lib/browserSpaces";
 import { assetUrl, copyToClipboard, detectPlatform, isTauri } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
 import {
@@ -2993,38 +3004,182 @@ function FilesPanel({ agent, spaceName, spaceKey, fromSelectedSpace }: ReturnTyp
 
 const PANEL_WEB_ID = "panel-web";
 
+function browserTabLabel(title: string, url: string): string {
+  if (title && title !== "新标签页" && title !== url) return title;
+  if (!url || url === "about:blank") return "新标签页";
+  try {
+    const u = new URL(url);
+    return u.hostname || url;
+  } catch {
+    return url;
+  }
+}
+
 function BrowserPanel({
-  url,
   onMetaChange,
 }: {
-  url: string;
+  url?: string;
   onMetaChange: (meta: { url: string; title: string }) => void;
 }) {
   const homePage = useClientConfig().browser.homePage;
-  const [title, setTitle] = useState(url);
+  const bState = useBrowserSpaces();
+  const activeSpace = bState.spaces.find((s) => s.id === bState.activeSpaceId) ?? bState.spaces[0]!;
+  const activeTab = activeSpace.tabs.find((t) => t.id === activeSpace.activeTabId) ?? activeSpace.tabs[0]!;
+  const [addingSpace, setAddingSpace] = useState(false);
+  const [spaceDraft, setSpaceDraft] = useState("");
+
+  const spaceOptions = useMemo(
+    () =>
+      bState.spaces.map((sp) => ({
+        value: sp.id,
+        label: sp.name,
+        badge: sp.kind === "ai" ? "AI" : `${sp.tabs.length}`,
+        tone: (sp.kind === "ai" ? "accent" : "default") as "accent" | "default",
+      })),
+    [bState.spaces],
+  );
+
+  const submitNewSpace = () => {
+    createUserBrowserSpace(spaceDraft.trim() || undefined, homePage || "about:blank");
+    setSpaceDraft("");
+    setAddingSpace(false);
+  };
+
   return (
     <div className="v3-panel-web">
+      <div className="v3-bspace-bar">
+        <div className="v3-bspace-select">
+          <PocketSelect
+            size="sm"
+            value={activeSpace.id}
+            onValueChange={(id) => selectBrowserSpace(id)}
+            options={spaceOptions}
+            ariaLabel="选择浏览空间"
+          />
+        </div>
+        <button
+          type="button"
+          className="v3-icon-btn small"
+          aria-label="新建浏览空间"
+          title="新建浏览空间"
+          onClick={() => setAddingSpace((v) => !v)}
+        >
+          <Plus size={13} />
+        </button>
+        {activeSpace.id !== "default" ? (
+          <button
+            type="button"
+            className="v3-icon-btn small"
+            aria-label="关闭当前浏览空间"
+            title="关闭当前浏览空间"
+            onClick={() => deleteBrowserSpace(activeSpace.id)}
+          >
+            <Trash2 size={13} />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="v3-mini-btn v3-bspace-pop"
+          onClick={() => {
+            openWebTab(activeTab.url, activeTab.title || activeTab.url);
+            showPanel(null);
+          }}
+          title="在顶部标签页打开此网页，或直接拖动标题栏放入"
+        >
+          <SquareArrowOutUpRight size={12} />
+          <span>放入标签栏</span>
+        </button>
+      </div>
+
+      {addingSpace ? (
+        <form
+          className="v3-bspace-new"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submitNewSpace();
+          }}
+        >
+          <PocketInput
+            value={spaceDraft}
+            onChange={(e) => setSpaceDraft(e.target.value)}
+            placeholder="空间名称（例如：文档研究 / 本地调试）"
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setAddingSpace(false);
+                setSpaceDraft("");
+              }
+            }}
+          />
+          <PocketButton size="sm" variant="primary" type="submit">
+            创建
+          </PocketButton>
+          <PocketButton
+            size="sm"
+            variant="ghost"
+            type="button"
+            onClick={() => {
+              setAddingSpace(false);
+              setSpaceDraft("");
+            }}
+          >
+            取消
+          </PocketButton>
+        </form>
+      ) : null}
+
+      <div className="v3-btabs" role="tablist" aria-label="浏览器标签页">
+        {activeSpace.tabs.map((t) => {
+          const isCur = t.id === activeTab.id;
+          const label = browserTabLabel(t.title, t.url);
+          return (
+            <div key={t.id} className={`v3-btab${isCur ? " active" : ""}`}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={isCur}
+                className="v3-btab-btn truncate"
+                title={t.url && t.url !== "about:blank" ? t.url : "新标签页"}
+                onClick={() => selectBrowserTab(activeSpace.id, t.id)}
+              >
+                {t.openedBy === "agent" ? <Sparkles size={11} className="v3-btab-ai" /> : null}
+                <span className="truncate">{label}</span>
+              </button>
+              <button
+                type="button"
+                className="v3-btab-x"
+                aria-label={`关闭标签页 ${label}`}
+                onClick={() => closeBrowserTab(activeSpace.id, t.id)}
+              >
+                <X size={11} />
+              </button>
+            </div>
+          );
+        })}
+        <button
+          type="button"
+          className="v3-icon-btn small v3-btab-add"
+          aria-label="新建网页标签页"
+          title="新建网页标签页"
+          onClick={() => openBrowserTab(activeSpace.id, "about:blank")}
+        >
+          <Plus size={12} />
+        </button>
+      </div>
+
       <WebPane
-        tab={{ id: PANEL_WEB_ID, url: homePage || "about:blank" }}
+        key={activeTab.id}
+        tab={{ id: activeTab.id, url: activeTab.url }}
+        browserSpace={activeSpace}
         active
         onChange={(p) => {
-          const nextUrl = p.url ?? url;
-          const nextTitle = p.title ?? (p.url ? p.url : title);
-          if (p.title) setTitle(p.title);
-          onMetaChange({ url: nextUrl, title: nextTitle });
+          updateBrowserTab(activeTab.id, p);
+          onMetaChange({
+            url: p.url ?? activeTab.url,
+            title: p.title ?? (p.url ? p.url : activeTab.title),
+          });
         }}
       />
-      <button
-        className="v3-mini-btn v3-panel-web-pop"
-        onClick={() => {
-          openWebTab(url, title || url);
-          showPanel(null);
-        }}
-        title="在顶部标签页打开此网页，或直接拖动标题栏放入"
-      >
-        <SquareArrowOutUpRight size={12} />
-        <span>放入标签栏</span>
-      </button>
     </div>
   );
 }
@@ -3175,9 +3330,13 @@ function SubagentAsidePanel() {
 export const ShellPanel = memo(function ShellPanel() {
   const panel = shellStore.use((s) => s.panel);
 
-  // The browser panel's native view closes with the panel.
+  // Hide visible browser space WebViews when the browser panel closes while keeping tabs/spaces intact.
   useEffect(() => {
-    if (panel !== "browser") void native.browserClose(PANEL_WEB_ID).catch(() => undefined);
+    if (panel === "browser") return;
+    void native.browserSetVisible(PANEL_WEB_ID, false).catch(() => undefined);
+    for (const sp of browserSpacesStore.get().spaces) {
+      for (const t of sp.tabs) void native.browserSetVisible(t.id, false).catch(() => undefined);
+    }
   }, [panel]);
 
   if (!panel) return null;

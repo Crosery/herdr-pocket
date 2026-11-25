@@ -19,6 +19,8 @@ import {
   initReveal,
   initFaq,
   initVideo,
+  initDownloads,
+  initDesktopShowcase,
   initNav,
   wrapTitleLines,
 } from "./sections";
@@ -169,10 +171,12 @@ window.addEventListener("resize", () => {
 
 initNav();
 initHero();
+initDownloads();
 initMarquee();
 initStatement();
 initFlow(lenis);
 initViews();
+initDesktopShowcase();
 initAssistant();
 initCall();
 initCommands();

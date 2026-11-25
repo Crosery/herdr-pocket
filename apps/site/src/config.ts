@@ -8,6 +8,7 @@ const raw = `https://raw.githubusercontent.com/${repo}/main`;
 export const SITE = {
   name: "Herdr Pocket",
   repo,
+  latestVersion: "0.2.45",
   githubUrl: `https://github.com/${repo}`,
   releasesUrl: `https://github.com/${repo}/releases`,
   docsUrl: `https://github.com/${repo}#readme`,
@@ -117,4 +118,10 @@ export function commandHtml(cmd: string, prompt: string): string {
       return line.startsWith("  ") ? body : `<span class="cmd-prompt" aria-hidden="true">${escHtml(prompt)} </span>${body}`;
     })
     .join("\n");
+}
+
+/** Direct GitHub Release asset download URL for a pinned version + suffix (e.g. "-macos-arm64.dmg"). */
+export function releaseAssetUrl(suffix: string, version: string = SITE.latestVersion): string {
+  const clean = version.trim().replace(/^v/i, "") || SITE.latestVersion;
+  return `https://github.com/${SITE.repo}/releases/download/v${clean}/herdr-pocket-${clean}${suffix}`;
 }

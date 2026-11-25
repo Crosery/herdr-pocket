@@ -110,7 +110,7 @@ test("agent.create: a task for a program that takes none at start is typed in on
   h.firstTaskOptions = { minMs: 50, stableMs: 100, pollMs: 20, timeoutMs: 2000 };
 
   const r = await x.handlers["agent.create"]!({ launcher: "kimi", folder: "~", task: "看下 README" }, "relay");
-  assert.deepEqual(r, { agent: "d/hc:t9", space: "w1", tab: "b1", terminal: "t9", task: "typed" });
+  assert.deepEqual(r, { agent: "d/hc:t9", space: "w1", tab: "b1", terminal: "t9", folder: "~", task: "typed" });
   assert.equal(created[0]!.task, undefined, "not handed to the program's command line");
   assert.deepEqual(typed, ["看下 README"]);
   const line = x.logs.take(50).find((e) => e.kind === "create");

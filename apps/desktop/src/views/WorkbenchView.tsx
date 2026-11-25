@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import {
   ArrowLeft,
   ArrowRight,
+  Blocks,
   ChevronDown,
   ChevronRight,
   Columns2,
@@ -10,10 +11,12 @@ import {
   Download,
   ExternalLink,
   File,
+  FileSearch,
   FileText,
   Folder,
   FolderOpen,
   Globe,
+  Hand,
   Lock,
   PanelLeftClose,
   PanelLeftOpen,
@@ -21,6 +24,8 @@ import {
   Plus,
   RotateCw,
   Rows2,
+  Search,
+  Sparkles,
   X,
 } from "lucide-react";
 import type { Agent, FileEntry, RpcResult } from "@herdr-pocket/protocol";
@@ -69,7 +74,8 @@ import { openAgentFileTarget } from "../lib/openFileTarget";
 import { buildPortalP2pUrl, fetchPortalFileP2p } from "../lib/portalClient";
 import { getDirectEndpoint, getDirectLink, rpcCall, RelayError } from "../lib/relay";
 import { allAgents, createStore, liveStore, spacedTitle } from "../lib/store";
-import { openWebTab, shellStore, updateResolvedFilePanePath } from "../shell/shellStore";
+import { controlAiBrowserSpace, removeBrowserBookmark, useBrowserSpaces, type BrowserSpace } from "../lib/browserSpaces";
+import { openSettingsFrame, openWebTab, shellStore, updateResolvedFilePanePath } from "../shell/shellStore";
 import { useWindowHidden } from "../lib/layout";
 import { endWorkspaceDrag, startWorkspaceDrag } from "../lib/fileDrag";
 import { logger } from "../lib/log";
@@ -1604,11 +1610,19 @@ function hostOf(url: string): string | undefined {
   }
 }
 
+const QUICK_LOCAL_URLS = [
+  { label: "localhost:3000", url: "http://localhost:3000" },
+  { label: "localhost:5173", url: "http://localhost:5173" },
+  { label: "localhost:8080", url: "http://localhost:8080" },
+  { label: "127.0.0.1:7420", url: "http://127.0.0.1:7420" },
+];
+
 export function WebPane({
   tab,
   active,
   onChange,
   layoutKey,
+  browserSpace,
 }: {
   tab: Pick<WebTab, "id" | "url">;
   active: boolean;
@@ -1616,29 +1630,42 @@ export function WebPane({
   onChange?: (patch: { url?: string; title?: string }) => void;
   /** Layout version string to force re-measuring native WebView bounds across split resizes. */
   layoutKey?: string;
+  /** Optional owning browser space metadata (for live AI status & takeover bar). */
+  browserSpace?: BrowserSpace;
 }) {
   const toast = useToast();
   const update = (patch: { url?: string; title?: string }) =>
     onChange ? onChange(patch) : wb.set((s) => ({ ...s, tabs: s.tabs.map((t) => (t.id === tab.id && t.kind === "web" ? { ...t, ...patch } : t)) }));
-  const engine = useClientConfig().browser.searchEngine;
+  const cfg = useClientConfig();
+  const engine = cfg.browser.searchEngine;
+  const aiBrowserEnabled = cfg.plugins.aiBrowser;
+  const bState = useBrowserSpaces();
   const hidden = useWindowHidden();
   const overlays = overlayStore.use((s) => s.open);
   const hostRef = useRef<HTMLDivElement>(null);
   const opened = useRef(false);
   const [address, setAddress] = useState(() => parseLocalFileAddress(tab.url) ?? (tab.url === "about:blank" ? "" : tab.url));
+  const [startQuery, setStartQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const supported = native.browserSupported();
   const localPath = useMemo(() => parseLocalFileAddress(tab.url), [tab.url]);
+  const isBlankStart = !localPath && (!tab.url || tab.url === "about:blank");
   const localTitle = localPath ? localPath.split(/[\\/]/).pop() || localPath : "";
   const platform = detectPlatform();
   const revealLabel = revealInFolderLabel(platform);
   const revealShort = revealInFolderShortLabel(platform);
   const canRevealLocalPath = native.available() && Boolean(localPath);
+  const showAiBar = Boolean(
+    aiBrowserEnabled &&
+      browserSpace &&
+      (browserSpace.kind === "ai" || browserSpace.ownership !== "user"),
+  );
 
   useEffect(() => {
     const parsed = parseLocalFileAddress(tab.url);
     if (parsed) setAddress(parsed);
     else if (tab.url === "about:blank") setAddress("");
+    else if (tab.url) setAddress(tab.url);
   }, [tab.url]);
 
   useEffect(
@@ -1656,9 +1683,9 @@ export function WebPane({
     [tab.id],
   );
 
-  // The native webview follows its placeholder; it hides behind dialogs, local previews, and other tabs.
+  // The native webview follows its placeholder; it hides behind dialogs, blank start view, local previews, and other tabs.
   useLayoutEffect(() => {
-    if (!supported || localPath) return;
+    if (!supported || localPath || isBlankStart) return;
     const el = hostRef.current;
     if (!el) return;
     const rect = () => {
@@ -1682,17 +1709,19 @@ export function WebPane({
       window.removeEventListener("resize", sync);
       cancelAnimationFrame(frame);
     };
-  }, [layoutKey, localPath, supported, tab.id, tab.url]);
+  }, [isBlankStart, layoutKey, localPath, supported, tab.id, tab.url]);
 
   useEffect(() => {
     if (!supported) return;
-    void native.browserSetVisible(tab.id, active && !hidden && overlays === 0 && !localPath);
-  }, [supported, tab.id, active, hidden, overlays, localPath]);
+    void native.browserSetVisible(tab.id, active && !hidden && overlays === 0 && !localPath && !isBlankStart);
+  }, [supported, tab.id, active, hidden, overlays, localPath, isBlankStart]);
 
   useEffect(() => () => void native.browserSetVisible(tab.id, false), [tab.id]);
 
   const go = (input: string) => {
-    const local = parseLocalFileAddress(input);
+    const trimmed = input.trim();
+    if (!trimmed) return;
+    const local = parseLocalFileAddress(trimmed);
     if (local) {
       const fileUrl = toFileUrl(local);
       const name = local.split(/[\\/]/).pop() || local;
@@ -1701,10 +1730,10 @@ export function WebPane({
       if (supported) void native.browserSetVisible(tab.id, false);
       return;
     }
-    const url = toUrl(input, engine);
+    const url = toUrl(trimmed, engine);
     setAddress(url);
     update({ url, title: url });
-    if (supported) void native.browserNavigate(tab.id, { url });
+    if (supported && opened.current) void native.browserNavigate(tab.id, { url });
   };
 
   return (
@@ -1716,13 +1745,13 @@ export function WebPane({
           go(address);
         }}
       >
-        <button type="button" className="side-icon-btn" aria-label="后退" disabled={!supported || Boolean(localPath)} onClick={() => void native.browserNavigate(tab.id, { back: true })}>
+        <button type="button" className="side-icon-btn" aria-label="后退" disabled={!supported || Boolean(localPath) || isBlankStart} onClick={() => void native.browserNavigate(tab.id, { back: true })}>
           <ArrowLeft size={15} />
         </button>
-        <button type="button" className="side-icon-btn" aria-label="前进" disabled={!supported || Boolean(localPath)} onClick={() => void native.browserNavigate(tab.id, { forward: true })}>
+        <button type="button" className="side-icon-btn" aria-label="前进" disabled={!supported || Boolean(localPath) || isBlankStart} onClick={() => void native.browserNavigate(tab.id, { forward: true })}>
           <ArrowRight size={15} />
         </button>
-        <button type="button" className="side-icon-btn" aria-label={loading ? "停止" : "刷新"} disabled={!supported || Boolean(localPath)} onClick={() => void native.browserNavigate(tab.id, loading ? { stop: true } : { reload: true })}>
+        <button type="button" className="side-icon-btn" aria-label={loading ? "停止" : "刷新"} disabled={!supported || Boolean(localPath) || isBlankStart} onClick={() => void native.browserNavigate(tab.id, loading ? { stop: true } : { reload: true })}>
           {loading ? <X size={15} /> : <RotateCw size={15} />}
         </button>
         <div className="grow">
@@ -1739,7 +1768,7 @@ export function WebPane({
               if (picked) go(picked);
             }}
           >
-            <FolderOpen size={15} />
+            <FileSearch size={15} />
           </button>
         ) : null}
         {canRevealLocalPath && localPath ? (
@@ -1760,6 +1789,7 @@ export function WebPane({
           className="side-icon-btn"
           aria-label={localPath ? "用系统默认应用打开" : "在系统浏览器打开"}
           title={localPath ? "用系统默认应用打开" : "在系统默认程序打开"}
+          disabled={isBlankStart && !address.trim()}
           onClick={() => {
             if (localPath && native.available()) {
               void openLocalFileDefault({ path: localPath }).catch((e: Error) =>
@@ -1774,13 +1804,128 @@ export function WebPane({
         </button>
         <CookieImportButton compact currentHost={hostOf(tab.url)} />
       </form>
-      <div ref={hostRef} className={`web-host${localPath ? " local" : ""}`}>
+      {showAiBar && browserSpace ? (
+        <div
+          className={`web-ai-bar ${
+            browserSpace.ownership === "agentHandoff"
+              ? "handoff"
+              : browserSpace.ownership === "agentWorking"
+                ? "working"
+                : "paused"
+          }`}
+          role="status"
+        >
+          <span className="web-ai-status">
+            {browserSpace.ownership === "agentHandoff" ? (
+              <Hand size={14} className="web-ai-ico" />
+            ) : browserSpace.ownership === "agentWorking" ? (
+              <span className="web-ai-dot" aria-hidden />
+            ) : (
+              <Sparkles size={14} className="web-ai-ico" />
+            )}
+            <span className="truncate">
+              {browserSpace.ownership === "agentHandoff"
+                ? `需要你协助 · ${browserSpace.handoffReason || "请完成页面确认或手动操作后交还 AI"}`
+                : browserSpace.ownership === "agentWorking"
+                  ? `AI 正在操作 · ${browserSpace.statusText || "正在浏览网页"}`
+                  : "已由你接管 · AI 处于暂停等待状态"}
+            </span>
+          </span>
+          {browserSpace.ownership === "agentWorking" ? (
+            <PocketButton size="sm" variant="soft" onClick={() => controlAiBrowserSpace(browserSpace.id, "takeover")}>
+              我来接管
+            </PocketButton>
+          ) : (
+            <PocketButton size="sm" variant="primary" onClick={() => controlAiBrowserSpace(browserSpace.id, "resume")}>
+              已完成，交还 AI
+            </PocketButton>
+          )}
+        </div>
+      ) : null}
+      <div ref={hostRef} className={`web-host${localPath ? " local" : isBlankStart ? " blank" : ""}`}>
         {localPath ? (
           <FileViewer
             key={localPath}
             tab={{ path: localPath, title: localTitle, absPath: localPath }}
             agent={undefined}
           />
+        ) : isBlankStart ? (
+          <div className="web-start">
+            <div className="web-start-head">
+              <div className="web-start-title">
+                <Globe size={16} />
+                <span>{browserSpace ? `${browserSpace.name} · 起始页` : "内置浏览器"}</span>
+              </div>
+              <p className="web-start-sub">输入网址、搜索关键词，或从本机开发服务与收藏书签快速打开。</p>
+            </div>
+            <form
+              className="web-start-search"
+              onSubmit={(e) => {
+                e.preventDefault();
+                go(startQuery);
+              }}
+            >
+              <PocketInput
+                value={startQuery}
+                onChange={(e) => setStartQuery(e.target.value)}
+                placeholder="输入 URL 或搜索内容…"
+                spellCheck={false}
+              />
+              <PocketButton size="sm" variant="primary" type="submit">
+                <Search size={13} />
+                <span>打开</span>
+              </PocketButton>
+            </form>
+            <div className="web-start-section">
+              <div className="web-start-label">本机常用端口</div>
+              <div className="web-start-chips">
+                {QUICK_LOCAL_URLS.map((q) => (
+                  <button
+                    key={q.url}
+                    type="button"
+                    className="web-start-chip mono"
+                    onClick={() => go(q.url)}
+                  >
+                    {q.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {bState.bookmarks.length > 0 ? (
+              <div className="web-start-section">
+                <div className="web-start-label">最近访问与书签</div>
+                <div className="web-start-bookmarks">
+                  {bState.bookmarks.slice(0, 6).map((b) => (
+                    <div key={b.url} className="web-start-bm">
+                      <button type="button" className="web-start-bm-link truncate" title={b.url} onClick={() => go(b.url)}>
+                        <span className="truncate">{b.title || b.url}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="web-start-bm-del"
+                        aria-label={`移除书签 ${b.title || b.url}`}
+                        onClick={() => removeBrowserBookmark(b.url)}
+                      >
+                        <X size={11} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {!aiBrowserEnabled ? (
+              <div className="web-start-plugin">
+                <div className="web-start-plugin-copy">
+                  <strong>可选：AI 浏览器协作插件（默认关闭）</strong>
+                  <span>开启后支持 AI 独立浏览空间、粉色虚拟光标可视化与随点随接管，零外部依赖。</span>
+                </div>
+                <PocketButton size="sm" variant="soft" onClick={() => openSettingsFrame("plugins")}>
+                  <Blocks size={13} />
+                  <span>插件中心</span>
+                </PocketButton>
+              </div>
+            ) : null}
+          </div>
         ) : !supported ? (
           <EmptyState
             mood="sleepy"

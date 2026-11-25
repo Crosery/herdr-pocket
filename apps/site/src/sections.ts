@@ -1,5 +1,15 @@
 import { ScrollTrigger } from "gsap/ScrollTrigger";
-import { SITE, commandHtml, commandPrompt, fillCommand, needsServer, parseServer, type CommandKey, type Server } from "./config";
+import {
+  SITE,
+  commandHtml,
+  commandPrompt,
+  fillCommand,
+  needsServer,
+  parseServer,
+  releaseAssetUrl,
+  type CommandKey,
+  type Server,
+} from "./config";
 import { getLang, onLang, t } from "./i18n";
 import {
   agentListScreen,
@@ -626,6 +636,132 @@ export function initVideo(): void {
   );
 }
 
+// ------------------------------------------------------------------ downloads hub
+type VisitorOs = "macos" | "windows" | "linux" | "android" | "harmony" | "ios";
+
+function detectVisitorOs(): VisitorOs | null {
+  const ua = navigator.userAgent || "";
+  const plat = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || "";
+  const src = `${plat} ${ua}`;
+  if (/OpenHarmony|HarmonyOS/i.test(src)) return "harmony";
+  if (/Android/i.test(src)) return "android";
+  if (/iPhone|iPad|iPod/i.test(src)) return "ios";
+  if (/Mac/i.test(src)) return "macos";
+  if (/Win/i.test(src)) return "windows";
+  if (/Linux|X11/i.test(src)) return "linux";
+  return null;
+}
+
+export function initDownloads(): void {
+  const versionPill = $("#dl-version-pill");
+  const notesLink = $<HTMLAnchorElement>("#dl-notes-link");
+  const sumsLink = $<HTMLAnchorElement>("#dl-sums-link");
+  const assetLinks = $$<HTMLAnchorElement>("a[data-asset]");
+
+  const applyPinned = (version: string) => {
+    const clean = version.trim().replace(/^v/i, "") || SITE.latestVersion;
+    if (versionPill) versionPill.textContent = `v${clean}`;
+    if (notesLink) notesLink.href = `${SITE.releasesUrl}/tag/v${clean}`;
+    if (sumsLink) sumsLink.href = `https://github.com/${SITE.repo}/releases/download/v${clean}/SHA256SUMS`;
+    for (const a of assetLinks) {
+      const suffix = a.dataset.asset;
+      if (suffix) a.href = releaseAssetUrl(suffix, clean);
+    }
+  };
+
+  applyPinned(SITE.latestVersion);
+
+  const os = detectVisitorOs();
+  if (os) {
+    for (const card of $$<HTMLElement>(".dl-hub-card[data-os]")) {
+      card.classList.toggle("is-recommended", card.dataset.os === os);
+    }
+  }
+
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ctrl ? window.setTimeout(() => ctrl.abort(), 4500) : 0;
+  fetch(`https://api.github.com/repos/${SITE.repo}/releases/latest`, {
+    headers: { Accept: "application/vnd.github+json" },
+    ...(ctrl ? { signal: ctrl.signal } : {}),
+  })
+    .then(async (res) => {
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        tag_name?: unknown;
+        html_url?: unknown;
+        assets?: Array<{ name?: unknown; browser_download_url?: unknown }>;
+      };
+      const tag = typeof data.tag_name === "string" ? data.tag_name.trim() : "";
+      if (!tag) return;
+      const ver = tag.replace(/^v/i, "");
+      if (ver) applyPinned(ver);
+      if (notesLink && typeof data.html_url === "string" && data.html_url) {
+        notesLink.href = data.html_url;
+      }
+      const assets = Array.isArray(data.assets) ? data.assets : [];
+      const sums = assets.find((x) => x.name === "SHA256SUMS" && typeof x.browser_download_url === "string");
+      if (sumsLink && typeof sums?.browser_download_url === "string") {
+        sumsLink.href = sums.browser_download_url;
+      }
+      for (const a of assetLinks) {
+        const suffix = a.dataset.asset;
+        if (!suffix) continue;
+        const found = assets.find(
+          (x) => typeof x.name === "string" && x.name.endsWith(suffix) && typeof x.browser_download_url === "string",
+        );
+        if (found && typeof found.browser_download_url === "string") {
+          a.href = found.browser_download_url;
+        }
+      }
+    })
+    .catch(() => {
+      // Keep deterministic release URLs when GitHub API is unreachable or rate-limited.
+    })
+    .finally(() => {
+      if (timer) window.clearTimeout(timer);
+    });
+}
+
+// ------------------------------------------------------------------ desktop & plugins showcase
+export function initDesktopShowcase(): void {
+  const tabs = $$<HTMLButtonElement>("[data-desk-tab]");
+  const panels = $$<HTMLElement>("[data-desk-panel]");
+  if (!tabs.length || !panels.length) return;
+
+  const activate = (key: string) => {
+    for (const btn of tabs) {
+      const on = btn.dataset.deskTab === key;
+      btn.classList.toggle("is-on", on);
+      btn.setAttribute("aria-selected", on ? "true" : "false");
+    }
+    for (const panel of panels) {
+      panel.classList.toggle("is-hidden", panel.dataset.deskPanel !== key);
+    }
+    ScrollTrigger.refresh();
+  };
+
+  for (const btn of tabs) {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.deskTab;
+      if (key) activate(key);
+    });
+  }
+
+  const shot = $<HTMLImageElement>("#desk-shot-workbench");
+  if (shot) {
+    const syncThemeShot = () => {
+      const dark = document.documentElement.dataset.theme === "dark";
+      const next = dark ? shot.dataset.dark : shot.dataset.light;
+      if (next && shot.getAttribute("src") !== next) shot.setAttribute("src", next);
+    };
+    syncThemeShot();
+    if (typeof MutationObserver === "function") {
+      const mo = new MutationObserver(syncThemeShot);
+      mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    }
+  }
+}
+
 // ------------------------------------------------------------------ nav
 export function initNav(): void {
   const nav = $("#nav")!;
@@ -647,7 +783,7 @@ export function initNav(): void {
     },
     { rootMargin: "-45% 0px -50% 0px" },
   );
-  ["how", "views", "assistant", "deploy", "faq"].forEach((id) => {
+  ["download", "how", "views", "desktop", "assistant", "deploy", "faq"].forEach((id) => {
     const s = document.getElementById(id);
     if (s) io.observe(s);
   });

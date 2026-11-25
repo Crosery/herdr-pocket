@@ -361,6 +361,9 @@ fn builder(app: &AppHandle, id: &str, label: &str, url: Url) -> WebviewBuilder<t
             }
         })
         .on_document_title_changed(move |_w, title| {
+            if crate::browser_ai::on_rpc_title(&a3, &i3, &title) {
+                return;
+            }
             emit(&a3, &i3, "title", json!({ "title": title }));
         })
         .on_new_window(move |u, _features| {
@@ -509,6 +512,7 @@ pub fn on_main_hidden(_app: &AppHandle) {}
 
 /// `browser.clearOnExit`: browsing data goes now (open panels) or when the next panel opens.
 pub fn on_exit(app: &AppHandle) {
+    crate::browser_ai::on_exit();
     if !crate::config::native().browser_clear_on_exit {
         return;
     }
@@ -698,6 +702,60 @@ pub async fn browser_clear_data(app: AppHandle) -> Result<u64, String> {
 #[tauri::command]
 pub fn browser_store_kind() -> &'static str {
     store_kind()
+}
+
+pub fn config_changed(app: &AppHandle) {
+    crate::browser_ai::config_changed(app);
+}
+
+pub fn panel_exists(app: &AppHandle, id: &str) -> bool {
+    panel(app, id).is_ok()
+}
+
+pub fn panel_url(app: &AppHandle, id: &str) -> Option<String> {
+    panel(app, id).ok()?.url().ok().map(|u| u.to_string())
+}
+
+pub fn eval_panel_js(app: &AppHandle, id: &str, js: &str) -> Result<(), String> {
+    let w = panel(app, id)?;
+    w.eval(js).map_err(|e| e.to_string())
+}
+
+pub fn eval_all_panels(app: &AppHandle, js: &str) {
+    for w in panels(app) {
+        let _ = w.eval(js);
+    }
+}
+
+pub fn open_headless_panel(app: &AppHandle, id: &str, url: &str) -> Result<(), String> {
+    open(
+        app,
+        id,
+        url,
+        Rect {
+            x: 16.0,
+            y: 80.0,
+            width: 800.0,
+            height: 600.0,
+        },
+    )?;
+    if let Ok(w) = panel(app, id) {
+        let _ = w.hide();
+    }
+    Ok(())
+}
+
+pub fn navigate_panel_sync(app: &AppHandle, id: &str, input: &str) -> Result<(), String> {
+    let w = panel(app, id)?;
+    let target = parse_target(app, input)?;
+    w.navigate(target).map_err(|e| e.to_string())
+}
+
+pub fn close_panel_sync(app: &AppHandle, id: &str) -> Result<(), String> {
+    let Ok(w) = panel(app, id) else {
+        return Ok(());
+    };
+    w.close().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

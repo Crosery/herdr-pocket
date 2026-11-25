@@ -154,6 +154,27 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
   const standalone = !!d?.standalone;
   const isNew = spaceId === NEW && !standalone;
   const chosenSpace = d?.spaces.find((s) => s.id === spaceId);
+  const folderBaseName = (raw: string) => raw.trim().replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+  const selectFolderPath = (nextFolder: string, spacesList = d?.spaces ?? []) => {
+    setFolder(nextFolder);
+    setFolderTouched(true);
+    if (isNew && !spaceName.trim()) {
+      const baseName = folderBaseName(nextFolder);
+      if (baseName) {
+        const taken = new Set(spacesList.map((s) => s.name.toLowerCase()));
+        let cand = baseName;
+        if (taken.has(cand.toLowerCase())) {
+          for (let i = 2; i < 50; i += 1) {
+            if (!taken.has(`${baseName}-${i}`.toLowerCase())) {
+              cand = `${baseName}-${i}`;
+              break;
+            }
+          }
+        }
+        setSpaceName(cand);
+      }
+    }
+  };
   const missingSpace = !!d && !standalone && isNew && !!target.spaceName && !d.spaces.some((s) => s.name === target.spaceName) ? target.spaceName : null;
   const launch = d?.launchers.find((l) => l.id === launcher);
   // Programs that can't take a task at start get it typed in once they're up, where the computer does that.
@@ -309,13 +330,7 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
             </View>
           ) : null}
 
-          {isNew ? (
-            <Field title="空间名字">
-              <Input value={spaceName} onChangeText={setSpaceName} placeholder="不填就用文件夹名" accessibilityLabel="空间名字" />
-            </Field>
-          ) : null}
-
-          <Field title="文件夹" hint={isNew || standalone ? "不填就是 ~" : "不填就用这个空间的文件夹"}>
+          <Field title="文件夹" hint={isNew || standalone ? "点常用项目自动填入空间名，不填默认 ~" : "不填就用这个空间的文件夹"}>
             {folders.length ? (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.sm }}>
                 {folders.map((f) => (
@@ -323,10 +338,15 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
                     key={f}
                     on={folder.trim() === f}
                     onPress={() => {
-                      setFolder(folder.trim() === f ? "" : f);
-                      setFolderTouched(true);
+                      if (folder.trim() === f) {
+                        setFolder("");
+                        setFolderTouched(true);
+                      } else {
+                        selectFolderPath(f);
+                      }
                     }}
-                    label={f}
+                    label={folderBaseName(f) || f}
+                    a11y={f}
                   />
                 ))}
               </ScrollView>
@@ -343,6 +363,12 @@ export function CreateAgentSheet({ visible, onDismiss, target, hosts }: { visibl
               accessibilityLabel="文件夹路径"
             />
           </Field>
+
+          {isNew ? (
+            <Field title="空间名字">
+              <Input value={spaceName} onChangeText={setSpaceName} placeholder={folderBaseName(folder) || "不填就用文件夹名"} accessibilityLabel="空间名字" />
+            </Field>
+          ) : null}
 
           <Field title="程序">
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>

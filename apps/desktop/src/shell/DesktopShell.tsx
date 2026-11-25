@@ -8,6 +8,7 @@ import {
   ArrowUpDown,
   BarChart2,
   Bell,
+  Blocks,
   BookOpen,
   Bot,
   Columns2,
@@ -49,6 +50,7 @@ import { CreateAgentModal } from "../views/AgentsView";
 import { SettingsFrame } from "../views/settings/SettingsFrame";
 import { useClientConfig, clientConfigStore } from "../lib/config";
 import { overlayStore, useToast } from "../components/PocketUI";
+import { installBrowserAiBridgeListeners } from "../lib/browserSpaces";
 import { isTauri } from "../lib/bridge";
 import { logAction } from "../lib/log";
 import { localHostIdStore, refreshLocalHostIdFast } from "../lib/fonts";
@@ -83,6 +85,7 @@ import {
   setPaneAgentMode,
   setSelectedSpace,
   shellStore,
+  showPanel,
   splitTabPane,
   swapPaneDirection,
   tabLeaves,
@@ -112,6 +115,7 @@ const FRAME_ITEMS: Array<{ id: FrameSection; label: string; icon: PaletteItem["i
   { id: "privacy", label: "隐私", icon: Shield },
   { id: "voice", label: "语音唤醒与声纹", icon: Mic },
   { id: "assistant", label: "小羊助理", icon: Sparkles },
+  { id: "plugins", label: "插件中心", icon: Blocks },
   { id: "browser", label: "浏览器与文件", icon: Globe },
   { id: "performance", label: "性能与资源", icon: Cpu },
   { id: "logs", label: "日志与诊断", icon: ScrollText },
@@ -193,6 +197,7 @@ export function DesktopShell({
   useHerdrDocSync();
   useEffect(() => startAttentionCenter(), []);
   useEffect(() => installWindowFocusTelemetry(), []);
+  useEffect(() => installBrowserAiBridgeListeners(() => showPanel("browser")), []);
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const hosts = useMemo(() => Object.values(devices).filter((d) => d.kind === "host"), [devices]);
@@ -1295,6 +1300,11 @@ export function DesktopShell({
         defaultHost={create?.host ?? null}
         defaultSpace={create?.space ?? null}
         preferNewSpace={Boolean(create?.preferNewSpace)}
+        onOpenExistingSpace={(existingHostId, sp) => {
+          const targetSpaceKey = `${existingHostId}\u0000${sp.name}`;
+          const lookupNow = (k: string) => liveStore.get().agents[existingHostId]?.find((a) => a.key === k);
+          setSelectedSpace(targetSpaceKey, lookupNow, liveStore.get().spaces);
+        }}
         onCreated={(info) => {
           const isShell = info.launcher === "shell";
           const folderBase = (info.folder ?? "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";

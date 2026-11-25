@@ -1,5 +1,5 @@
 import { useState, type ComponentType } from "react";
-import { AppWindow, Bell, ChevronLeft, ChevronRight, Cpu, Info, Link2, Mic, RefreshCw, ScrollText, Settings2, Sparkles } from "lucide-react";
+import { AppWindow, Bell, Blocks, ChevronLeft, ChevronRight, Cpu, Info, Link2, Mic, RefreshCw, ScrollText, Settings2, Sparkles } from "lucide-react";
 import { XiaoyangOrb } from "../components/MascotAndVendor";
 import { PocketBadge } from "../components/PocketUI";
 import { serverLabel } from "../components/Sidebar";
@@ -9,6 +9,7 @@ import { liveStore, settingsStore } from "../lib/store";
 import { updateStore } from "../lib/updates";
 import { AssistantSettings, type AssistantTab } from "./settings/AssistantSettings";
 import { AboutPane, BrowserPane, ConnectionPane, GeneralPane, NotificationsPane, PerformancePane, UpdatesPane, linkLabel } from "./settings/Panes";
+import { PluginsPane } from "./settings/PluginsPane";
 import { LogsPane } from "./settings/LogsPane";
 import { PaneTitle } from "./settings/rows";
 
@@ -18,6 +19,7 @@ export type SettingsSection =
   | "voice"
   | "notifications"
   | "assistant"
+  | "plugins"
   | "browser"
   | "updates"
   | "performance"
@@ -30,6 +32,7 @@ const SECTIONS: Array<{ id: SettingsSection; title: string; icon: ComponentType<
   { id: "voice", title: "语音唤醒与声纹", icon: Mic },
   { id: "notifications", title: "通知", icon: Bell },
   { id: "assistant", title: "小羊助理", icon: Sparkles },
+  { id: "plugins", title: "插件中心", icon: Blocks },
   { id: "browser", title: "浏览器与文件", icon: AppWindow },
   { id: "updates", title: "更新", icon: RefreshCw },
   { id: "performance", title: "性能与资源", icon: Cpu },
@@ -92,6 +95,8 @@ export function SettingsView({
             <AssistantSettings subTab={assistantTab} onSubTab={setAssistantTab} />
           </div>
         );
+      case "plugins":
+        return <PluginsPane />;
       case "browser":
         return <BrowserPane />;
       case "updates":

@@ -17,6 +17,7 @@ import { UPDATE_HELP, currentRegion, updateCommand, versionCommand, watchForUpda
 import { CONFIG_HELP, configCommand } from "./configcmd.ts";
 import { readUpstreamCache, upstreamCheckEnabled, upstreamLine, watchUpstream } from "./upstream.ts";
 import { readHookConfig } from "./portal/shims.ts";
+import { getBrowserStatus, runBrowserAct, shutdownBrowserPluginCdp } from "./browserPlugin.ts";
 
 const HELP = `herdr-pocket ${HOSTD_VERSION} — put this computer's herdr agents in your pocket
 
@@ -48,6 +49,17 @@ Look and talk (works with any computer on the relay)
   read <device>/<agent> [--lines N]
   send <device>/<agent> <text...>
   keys <device>/<agent> <key...>     e.g. enter, esc, up, ctrl+c, y
+
+Browser (optional AI Browser plugin, off by default via plugins.aiBrowser)
+  browser status|spaces [--json]
+  browser open <url> [--space <id>] [--page <label>] [--label <text>]
+  browser snapshot [--space <id>] [--page <label>] [--json]
+  browser click|dblclick|hover <@ref|selector> [--space <id>] [--label <text>]
+  browser fill|select <@ref|selector> <value> [--space <id>] [--label <text>]
+  browser press <key> [<@ref|selector>] [--space <id>]
+  browser scroll <deltaY> [--space <id>]
+  browser handoff [--reason <text>] [--space <id>]
+  browser resume|finish [--keep p1,p2] [--space <id>]
 
 <device> is a device name or id; <agent> is a local id such as t42.
 
@@ -88,6 +100,8 @@ async function main(): Promise<void> {
       return logs(rest);
     case "open":
       return openPortalCli(rest);
+    case "browser":
+      return browserCli(rest);
     case "config":
       return configCommand(rest, reportToRelay);
     case "version":
@@ -651,6 +665,100 @@ function ago(ms: number): string {
   if (s < 5400) return `${Math.round(s / 60)} min ago`;
   if (s < 129600) return `${Math.round(s / 3600)} h ago`;
   return `${Math.round(s / 86400)} d ago`;
+}
+
+async function browserCli(argv: string[]): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      space: { type: "string" },
+      page: { type: "string" },
+      label: { type: "string" },
+      reason: { type: "string" },
+      keep: { type: "string" },
+      json: { type: "boolean" },
+    },
+  });
+  const sub = positionals[0] || "status";
+  try {
+    if (sub === "status" || sub === "spaces") {
+      const status = await getBrowserStatus();
+      if (values.json) {
+        console.log(JSON.stringify(status, null, 2));
+        return;
+      }
+      if (!status.enabled) {
+        console.log("AI Browser plugin: disabled (zero-dependency mode).");
+        console.log("Enable with: herdr-pocket config set plugins.aiBrowser true");
+        return;
+      }
+      console.log(`AI Browser plugin: enabled (${status.backend}), spaces=${status.spaces.length}`);
+      for (const sp of status.spaces) {
+        console.log(`- [${sp.id}] ${sp.name} (${sp.kind}, ownership=${sp.ownership})${sp.statusText ? ` · ${sp.statusText}` : ""}`);
+        for (const pg of sp.pages) {
+          console.log(`    ${pg.active ? "*" : " "} ${pg.label}: ${pg.title || "(untitled)"} — ${pg.url}`);
+        }
+      }
+      return;
+    }
+
+    const opMap = new Set([
+      "open",
+      "snapshot",
+      "click",
+      "dblclick",
+      "hover",
+      "fill",
+      "select",
+      "press",
+      "scroll",
+      "handoff",
+      "resume",
+      "finish",
+    ]);
+    if (!opMap.has(sub)) {
+      fail(`unknown browser subcommand: ${sub}\n\n${HELP}`);
+    }
+    const op = sub as Parameters<typeof runBrowserAct>[0]["op"];
+    const params: Parameters<typeof runBrowserAct>[0] = {
+      op,
+      spaceId: values.space,
+      page: values.page,
+      label: values.label,
+      reason: values.reason,
+      keep: values.keep ? values.keep.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+    };
+    if (op === "open") {
+      params.url = positionals[1] || "about:blank";
+    } else if (op === "click" || op === "dblclick" || op === "hover") {
+      params.target = positionals[1];
+    } else if (op === "fill" || op === "select") {
+      params.target = positionals[1];
+      params.value = positionals[2] ?? "";
+    } else if (op === "press") {
+      params.key = positionals[1] || "Enter";
+      params.target = positionals[2];
+    } else if (op === "scroll") {
+      const n = Number(positionals[1] ?? "420");
+      params.deltaY = Number.isFinite(n) ? n : 420;
+    }
+
+    const res = await runBrowserAct(params);
+    if (values.json) {
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+    if (res.snapshot) {
+      console.log(res.snapshot);
+      return;
+    }
+    console.log(
+      `${res.ok ? "ok" : "paused"} space=${res.spaceId} page=${res.page} ownership=${res.ownership}${res.url ? ` url=${res.url}` : ""}${res.note ? ` · ${res.note}` : ""}`,
+    );
+  } finally {
+    await shutdownBrowserPluginCdp();
+  }
 }
 
 async function openPortalCli(argv: string[]): Promise<void> {

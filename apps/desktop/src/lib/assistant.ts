@@ -2,6 +2,7 @@ import type {
   AssistantConfigChange,
   AssistantConfigView,
   AssistantItem,
+  AssistantSettings,
   AssistantState,
   ModelTestResult,
   PromptId,
@@ -23,6 +24,7 @@ export interface AssistantStoreState {
   voice: boolean;
   model: string | null;
   reminders: Reminder[];
+  settings: AssistantSettings;
   loaded: boolean;
   error: string | null;
   unread: number;
@@ -36,6 +38,7 @@ export const assistantStore = createStore<AssistantStoreState>({
   voice: false,
   model: null,
   reminders: [],
+  settings: { confirm: "never" },
   loaded: false,
   error: null,
   unread: 0,
@@ -76,6 +79,7 @@ export function applyAssistantState(s: AssistantState): void {
     voice: s.voice,
     model: s.model ?? null,
     reminders: s.reminders,
+    settings: s.settings ?? { confirm: "never" },
     loaded: true,
     error: null,
   });
@@ -263,4 +267,28 @@ export async function saveAssistantPrompt(id: PromptId, body: { text?: string; r
     prompts: prev.prompts.map((p) => (p.id === id ? updated : p)),
   }));
   return updated;
+}
+
+export async function loadAssistantSettings(): Promise<AssistantSettings> {
+  const server = settingsStore.get().server;
+  if (server && isMockServer(server)) {
+    const cur = mockApi.assistantSettings();
+    assistantStore.set({ settings: cur });
+    return cur;
+  }
+  const s = await assistantApi<AssistantSettings>("/v1/assistant/settings");
+  assistantStore.set({ settings: s });
+  return s;
+}
+
+export async function updateAssistantSettings(patch: Partial<AssistantSettings>): Promise<AssistantSettings> {
+  const server = settingsStore.get().server;
+  if (server && isMockServer(server)) {
+    const next = mockApi.saveAssistantSettings(patch);
+    assistantStore.set({ settings: next });
+    return next;
+  }
+  const next = await assistantApi<AssistantSettings>("/v1/assistant/settings", { body: patch });
+  assistantStore.set({ settings: next });
+  return next;
 }

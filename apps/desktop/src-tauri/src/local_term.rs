@@ -3250,6 +3250,7 @@ mod tests {
 
     #[test]
     fn apc_stream_unlinks_probes_and_t_files_safely_and_preserves_utf8() {
+        let _guard = super::MEM_IMAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use super::{get_mem_image, ChannelApcStream};
 
         let dir = std::env::temp_dir().join(format!("herdr-apc-probe-test-{}", std::process::id()));

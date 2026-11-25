@@ -27,6 +27,7 @@ import {
   type NotifyFrame,
   type AssistantConfirm,
   type AssistantConfigChange,
+  type AssistantPluginId,
   type LogLevel,
   type PasskeyAssertionPayload,
   type VoiceProviderId,
@@ -1114,13 +1115,39 @@ export class Relay {
         sendJson(res, 200, { ...this.assistant.settings(), default: this.assistant.defaultConfirm() });
         return;
       }
-      if (req.method === "POST") {
-        const confirm = (await readJson(req))?.confirm;
-        if (confirm !== "never" && confirm !== "always") {
+      if (req.method === "POST" || req.method === "PUT") {
+        const body = (await readJson(req)) ?? {};
+        const hasConfirm = Object.hasOwn(body, "confirm");
+        const hasPlugins = Object.hasOwn(body, "plugins");
+        const hasWebhooks = Object.hasOwn(body, "webhooks");
+        if (hasConfirm && body.confirm !== "never" && body.confirm !== "always") {
           sendError(res, 400, "bad_request", "confirm 需要是 never 或 always");
           return;
         }
-        sendJson(res, 200, this.assistant.setConfirm(confirm, auth === "admin" ? "admin" : auth.name));
+        if (hasPlugins && (typeof body.plugins !== "object" || body.plugins === null || Array.isArray(body.plugins))) {
+          sendError(res, 400, "bad_request", "plugins 需要是对象");
+          return;
+        }
+        if (hasWebhooks && !Array.isArray(body.webhooks)) {
+          sendError(res, 400, "bad_request", "webhooks 需要是数组");
+          return;
+        }
+        if (!hasConfirm && !hasPlugins && !hasWebhooks) {
+          sendError(res, 400, "bad_request", "至少需要传入 confirm、plugins 或 webhooks");
+          return;
+        }
+        sendJson(
+          res,
+          200,
+          this.assistant.updateSettings(
+            {
+              ...(hasConfirm ? { confirm: body.confirm as AssistantConfirm } : {}),
+              ...(hasPlugins ? { plugins: body.plugins as Partial<Record<AssistantPluginId, boolean>> } : {}),
+              ...(hasWebhooks ? { webhooks: body.webhooks } : {}),
+            },
+            auth === "admin" ? "admin" : auth.name,
+          ),
+        );
         return;
       }
     }

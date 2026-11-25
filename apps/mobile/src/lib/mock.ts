@@ -10,6 +10,7 @@ import {
   type Agent,
   type AssistantConfirm,
   type AssistantItem,
+  type AssistantSettings,
   type AssistantState,
   type Reminder,
   type AgentStatus,
@@ -1140,6 +1141,8 @@ function remindersNow(): Reminder[] {
   return assistantReminders;
 }
 let assistantConfirm: AssistantConfirm = "never";
+let assistantPlugins: AssistantSettings["plugins"] = {};
+let assistantWebhooks: AssistantSettings["webhooks"] = [];
 let assistantSink: AssistantSink | null = null;
 
 function aid(prefix: string) {
@@ -1155,7 +1158,20 @@ function aput(item: AssistantItem) {
 
 function demoState(): AssistantState {
   if (perfDemo() && !assistantItems.length && !assistantCleared) assistantItems = perfAssistantItems();
-  return { items: assistantItems.slice(), busy: false, ready: true, voice: false, model: "演示", reminders: remindersNow().slice(), settings: { confirm: assistantConfirm } };
+  const hasPlugins = Object.values(assistantPlugins ?? {}).some(Boolean);
+  return {
+    items: assistantItems.slice(),
+    busy: false,
+    ready: true,
+    voice: false,
+    model: "演示",
+    reminders: remindersNow().slice(),
+    settings: {
+      confirm: assistantConfirm,
+      ...(hasPlugins ? { plugins: { ...assistantPlugins } } : {}),
+      ...(assistantWebhooks?.length ? { webhooks: assistantWebhooks.map((w) => ({ ...w })) } : {}),
+    },
+  };
 }
 
 export const mockAssistant = {
@@ -1263,5 +1279,15 @@ export const mockAssistant = {
   },
   setConfirm(confirm: AssistantConfirm) {
     assistantConfirm = confirm;
+  },
+  setPluginSettings(patch: { plugins?: AssistantSettings["plugins"]; webhooks?: AssistantSettings["webhooks"] }): AssistantSettings {
+    if (patch.plugins) assistantPlugins = { ...assistantPlugins, ...patch.plugins };
+    if (patch.webhooks !== undefined) assistantWebhooks = patch.webhooks.map((w) => ({ ...w }));
+    const hasPlugins = Object.values(assistantPlugins ?? {}).some(Boolean);
+    return {
+      confirm: assistantConfirm,
+      ...(hasPlugins ? { plugins: { ...assistantPlugins } } : {}),
+      ...(assistantWebhooks?.length ? { webhooks: assistantWebhooks.map((w) => ({ ...w })) } : {}),
+    };
   },
 };

@@ -4,8 +4,10 @@ import type { Lang } from "./config";
 // At boot the Chinese markup is captured from the DOM so switching back is lossless.
 const en: Record<string, string> = {
   "nav.skip": "Skip to content",
+  "nav.download": "Downloads",
   "nav.how": "How it works",
-  "nav.views": "Features",
+  "nav.views": "Mobile",
+  "nav.desktop": "Desktop",
   "nav.assistant": "Assistant",
   "nav.deploy": "Deploy",
   "nav.faq": "FAQ",
@@ -13,7 +15,8 @@ const en: Record<string, string> = {
   "hero.title": "All your coding agents,<br /><em>in your pocket.</em>",
   "hero.sub":
     "Herdr Pocket connects the Claude Code, Codex, Gemini, OpenCode… sessions running in herdr to Android, iOS, HarmonyOS NEXT and Windows / macOS / Linux desktops: live status, readable conversations, a real terminal. Xiaoyang, the assistant, keeps watch and tells you the moment something finishes or gets stuck.",
-  "hero.cta1": "Get started",
+  "hero.cta1": "Download",
+  "hero.cta3": "2-min self-host",
   "hero.cta2": "Watch the 90-second intro",
   "hero.needs": "You need three things:",
   "hero.need1": "Your own server",
@@ -202,6 +205,49 @@ const en: Record<string, string> = {
   "footer.issues": "Issues",
   "footer.learn": "Learn",
   "footer.note": "Herdr Pocket is open source and works together with herdr.",
+  "dl.eyebrow": "All-Platform Downloads",
+  "dl.title": "Desktop, mobile & HarmonyOS apps, <em>ready in one click</em>",
+  "dl.lead":
+    "Signed installers and SHA256SUMS publish together on GitHub Releases. Your current platform is highlighted automatically while direct links sync in the background.",
+  "dl.detect": "All 6 platforms in sync",
+  "dl.notes": "Release notes",
+  "dl.recommended": "Recommended for this device",
+  "dl.macos.d": "Native Tauri v2 desktop app for Apple Silicon (M1–M4) & Intel with split workbench and Space Browser.",
+  "dl.windows.d": "x64 WebView2 split workbench installer with automatic local herdr-pocket pairing.",
+  "dl.windows.exe": "Installer",
+  "dl.linux.d": "x64 portable AppImage and Debian / Ubuntu .deb packages for X11 & Wayland.",
+  "dl.android.d": "Native arm64 APK with persistent background alerts, Xiaoyang voice calls, Plugin Center, and in-app upgrades.",
+  "dl.android.apk": "Download APK",
+  "dl.harmony.d": "HarmonyOS NEXT Stage-model ArkTS shell sharing the unified workbench bundle and pink UI.",
+  "dl.harmony.hap": "Download HAP",
+  "dl.ios.d": "Unsigned sideload IPA compatible with AltStore, SideStore, TrollStore, or self-signing via Xcode.",
+  "dl.ios.ipa": "Download IPA",
+  "dl.cli.note": "Looking for the relay + host CLI bundle?",
+  "dl.deploy.jump": "2-minute self-hosting guide",
+  "desk.eyebrow": "Desktop & Opt-In Plugins",
+  "desk.title": "Split desktop workbench, Space Browser, <em>and zero-lock-in plugins</em>",
+  "desk.lead":
+    "No forced extensions or heavy dependencies: all AI browser and Xiaoyang plugins ship disabled by default (false) and turn on only when you choose.",
+  "desk.tab.workbench": "v3 Workbench",
+  "desk.tab.browser": "Space Browser & AI",
+  "desk.tab.plugins": "Opt-In Plugins",
+  "desk.wb.t": "Multi-pane · Synced / & \\ command panel · Intent Spaces & Git Worktree",
+  "desk.wb.d":
+    "Collaborate with chats, native terminals, diffs, and Xiaoyang side by side; type / or \\ for synced CLI commands, or create spaces in an isolated Git worktree.",
+  "desk.wb.theme": "Switches automatically with Light / Dark theme",
+  "desk.br.t": "Multi-space tabs · Pink virtual cursor · Takeover / Resume",
+  "desk.br.d":
+    "Keep work docs and previews in isolated spaces; enable plugins.aiBrowser to watch every AI step and hand control back whenever passwords or CAPTCHAs appear.",
+  "desk.pl.t": "Off by default · Zero forced deps · Sealed secrets & SSRF guard",
+  "desk.pl.d":
+    "Manage browser_act, inspect_workspace, SSRF-safe fetch_webpage, and custom webhooks in one Plugin Center — zero tools exposed until enabled.",
+  "desk.pl.badge": "Default: OFF",
+  "desk.g1.t": "Unified Multi-Device Cockpit",
+  "desk.g1.d": "Phones, HarmonyOS, tablets, and desktops share one real-time protocol and P2P fast path.",
+  "desk.g2.t": "Transparent AI Browser Control",
+  "desk.g2.d": "A closed Shadow DOM pink virtual cursor shows every click and keystroke while keeping humans in charge.",
+  "desk.g3.t": "Restrained Opt-In Extensibility",
+  "desk.g3.d": "Zero mandatory extensions or sidecar bloat — toggle capabilities on only when they earn your trust.",
 };
 
 const zh: Record<string, string> = {};

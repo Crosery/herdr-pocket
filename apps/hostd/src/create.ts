@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { HERDR_COMMANDS, type HerdrCommand, type HerdrDoc, type LaunchOption, type SpaceInfo } from "@herdr-pocket/protocol";
 import type { AppNames, AppTerminalMeta, HcTerminal } from "./hc.ts";
 import { IS_WINDOWS, onPath, programName, windowsBins } from "./platform.ts";
@@ -136,6 +136,68 @@ export function checkFolder(raw: unknown): string {
   p = resolve(p);
   if (!existsSync(p) || !statSync(p).isDirectory()) throw new Error(`这台电脑上没有这个文件夹：${raw}`);
   return p;
+}
+
+const VALID_WORKTREE_BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/;
+
+/** Validates a branch name for optional isolated worktree creation on space start. */
+export function normalizeWorktreeBranch(raw: unknown): string {
+  const b = typeof raw === "string" ? raw.trim() : "";
+  if (
+    !b ||
+    !VALID_WORKTREE_BRANCH.test(b) ||
+    b.includes("..") ||
+    b.includes("//") ||
+    b.includes("@{") ||
+    b.startsWith("-") ||
+    b.endsWith("/") ||
+    b.endsWith(".") ||
+    b.endsWith(".lock")
+  ) {
+    throw new Error("Git 分支名称格式不对（仅支持字母、数字、. _ / -）");
+  }
+  return b;
+}
+
+/**
+ * Creates an isolated Git worktree sibling directory under `<repoParent>/.herdr-worktrees/`
+ * when creating a new space with `worktreeBranch`, reusing the zero-dependency system `git` binary.
+ */
+export async function createWorktreeFolder(folder: string, rawBranch: unknown): Promise<string> {
+  const branch = normalizeWorktreeBranch(rawBranch);
+  let repoRoot: string;
+  try {
+    repoRoot = (await run("git", ["-C", folder, "rev-parse", "--show-toplevel"], { timeoutMs: 8_000 })).trim();
+  } catch {
+    throw new Error("这个目录不是 Git 仓库，无法创建独立 Worktree");
+  }
+  if (!repoRoot || !existsSync(repoRoot)) {
+    throw new Error("找不到 Git 仓库根目录，无法创建独立 Worktree");
+  }
+  const wtRoot = join(dirname(repoRoot), ".herdr-worktrees");
+  mkdirSync(wtRoot, { recursive: true });
+  const slug = branch.replace(/[\\/]+/g, "-").replace(/[^A-Za-z0-9._-]/g, "-");
+  const repoName = base(repoRoot) || "repo";
+  let wtPath = join(wtRoot, `${repoName}-${slug}`);
+  if (existsSync(wtPath)) {
+    wtPath = join(wtRoot, `${repoName}-${slug}-${randomBytes(2).toString("hex")}`);
+  }
+  let branchExists = false;
+  try {
+    await run("git", ["-C", repoRoot, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { timeoutMs: 5_000 });
+    branchExists = true;
+  } catch {
+    branchExists = false;
+  }
+  try {
+    const args = branchExists
+      ? ["-C", repoRoot, "worktree", "add", wtPath, branch]
+      : ["-C", repoRoot, "worktree", "add", "-b", branch, wtPath];
+    await run("git", args, { timeoutMs: 20_000 });
+  } catch (e) {
+    throw new Error(`创建 Git Worktree 失败：${(e as Error).message}`);
+  }
+  return wtPath;
 }
 
 export interface AppLsTerminal {

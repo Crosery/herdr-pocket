@@ -7,6 +7,7 @@ use std::time::Duration;
 use tauri::Manager;
 
 mod browser;
+mod browser_ai;
 mod commands;
 mod config;
 mod cookies;
@@ -553,6 +554,7 @@ fn on_setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     perms::log_states("startup");
     portal_bridge::start(&handle);
     voice::init(&handle);
+    browser_ai::init(&handle);
     mainwin::init(&handle);
     local_term::warmup(&handle);
     Ok(())
@@ -763,6 +765,9 @@ pub fn run() {
             browser::browser_list,
             browser::browser_clear_data,
             browser::browser_store_kind,
+            browser_ai::browser_ai_state,
+            browser_ai::browser_sync_spaces,
+            browser_ai::browser_ai_control,
             cookies::cookie_sources,
             cookies::cookie_domains,
             cookies::cookie_import,

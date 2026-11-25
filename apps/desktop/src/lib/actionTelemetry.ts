@@ -60,6 +60,10 @@ export function installGlobalActionTelemetry(): () => void {
 
   const onCompositionEnd = (ev: CompositionEvent) => {
     const el = ev.target instanceof HTMLElement ? ev.target : null;
+    if (el && (el.classList.contains("xterm-helper-textarea") || el.closest(".xterm"))) {
+      compStartedAt = 0;
+      return;
+    }
     const tag = el ? el.tagName.toLowerCase() : "unknown";
     const ms = compStartedAt > 0 ? Math.max(0, Date.now() - compStartedAt) : 0;
     compStartedAt = 0;

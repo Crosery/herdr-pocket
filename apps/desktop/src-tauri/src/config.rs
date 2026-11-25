@@ -55,6 +55,7 @@ pub struct Native {
     pub voice_sounds: bool,
     pub browser_cookie_import: String,
     pub browser_clear_on_exit: bool,
+    pub plugin_ai_browser: bool,
     pub low_power: String,
     pub memory_warn_mb: u64,
     pub disk_warn_gb: u64,
@@ -81,6 +82,7 @@ impl Default for Native {
             voice_sounds: true,
             browser_cookie_import: "ask".into(),
             browser_clear_on_exit: false,
+            plugin_ai_browser: false,
             low_power: "auto".into(),
             memory_warn_mb: 1024,
             disk_warn_gb: 5,
@@ -155,6 +157,7 @@ impl Native {
                 &d.browser_cookie_import,
             ),
             browser_clear_on_exit: get_bool(raw, "browser.clearOnExit", d.browser_clear_on_exit),
+            plugin_ai_browser: get_bool(raw, "plugins.aiBrowser", d.plugin_ai_browser),
             low_power: get_enum(
                 raw,
                 "resources.lowPower",
@@ -466,6 +469,7 @@ fn adopt(app: Option<&AppHandle>, file: &ConfigFile, notify: bool) {
         if changed {
             crate::voice::config_changed(app);
             crate::mainwin::config_changed(app);
+            crate::browser::config_changed(app);
         }
         if notify {
             let _ = app.emit(CHANGED_EVENT, file);

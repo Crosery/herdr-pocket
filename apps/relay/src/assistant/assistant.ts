@@ -18,8 +18,10 @@ import {
   type AssistantAction,
   type AssistantConfirm,
   type AssistantItem,
+  type AssistantPluginId,
   type AssistantSettings,
   type AssistantState,
+  type AssistantWebhookTool,
   type LogEntry,
   type ConvEvent,
   type Device,
@@ -41,6 +43,17 @@ import { claimsDelivery, guardClaims, newFacts, type RunFacts } from "./guard.ts
 import { MATCH_MIN, agentNames, foldName, pickOne, rank } from "./lookup.ts";
 import type { ContentBlock, Llm, Msg, ToolDef } from "./llm.ts";
 import { PROMPT_EPOCH, delegateAsk, herdrCommandList, systemPrompt, wakeBatch, wakeBlocked, wakeFinished, type Occasion } from "./prompts.ts";
+import {
+  PLUGIN_READ_ONLY_TOOLS,
+  executePluginTool,
+  maskWebhooks,
+  normalizePlugins,
+  normalizeWebhooks,
+  pluginPromptHints,
+  pluginToolDefs,
+  serializePlugins,
+  type AssistantPluginMap,
+} from "./plugins.ts";
 import { MAX_KEEP, clip, clockTime, cnNumber, filterTalk, noEmoji, normName, oneLine, parseWake, splitScript, spokenFor, spokenTime, stripMd } from "./speech.ts";
 import { timeZone, utcOffset, zoneLabel, zoneName } from "./timezone.ts";
 
@@ -123,6 +136,8 @@ interface Turn {
 }
 
 const SETTING_CONFIRM = "assistant.confirm";
+const SETTING_PLUGINS = "assistant.plugins";
+const SETTING_WEBHOOKS = "assistant.webhooks";
 
 const MAX_ITEMS = 400;
 const CONTEXT_ITEMS = 30;
@@ -155,6 +170,7 @@ const READ_ONLY_TOOLS = new Set([
   "costs",
   "read_logs",
   "list_reminders",
+  ...PLUGIN_READ_ONLY_TOOLS,
 ]);
 
 /** Detects when the model promised to check agents ("我先去看看 / 读一遍") without actually calling any tool. */
@@ -201,6 +217,7 @@ export class Assistant {
   private reminderTimer: NodeJS.Timeout;
   private sinks = new Set<NoticeSink>();
   private voices = new Set<VoiceSink>();
+  private pendingPluginConfirms = new Map<string, number>();
   private closed = false;
   name: string;
 
@@ -265,8 +282,22 @@ export class Assistant {
     return saved === "always" || saved === "never" ? saved : (this.opts.confirm ?? "never");
   }
 
+  pluginMap(): AssistantPluginMap {
+    return normalizePlugins(this.store.getSetting(SETTING_PLUGINS));
+  }
+
+  storedWebhooks(): AssistantWebhookTool[] {
+    return normalizeWebhooks(this.store.getSetting(SETTING_WEBHOOKS));
+  }
+
   settings(): AssistantSettings {
-    return { confirm: this.confirmMode() };
+    const plugins = serializePlugins(this.pluginMap());
+    const webhooks = maskWebhooks(this.storedWebhooks());
+    return {
+      confirm: this.confirmMode(),
+      ...(Object.keys(plugins).length ? { plugins } : {}),
+      ...(webhooks.length ? { webhooks } : {}),
+    };
   }
 
   /** What the relay starts with when the app has not chosen. */
@@ -275,10 +306,46 @@ export class Assistant {
   }
 
   setConfirm(confirm: AssistantConfirm, by: string): AssistantSettings {
-    const before = this.confirmMode();
-    this.store.putSetting(SETTING_CONFIRM, confirm);
-    if (before !== confirm) {
-      this.event({ kind: "settings", msg: `ask before acting: ${before} -> ${confirm} (by ${by})` });
+    return this.updateSettings({ confirm }, by);
+  }
+
+  updateSettings(
+    patch: {
+      confirm?: AssistantConfirm;
+      plugins?: Partial<Record<AssistantPluginId, boolean>>;
+      webhooks?: unknown;
+    },
+    by: string,
+  ): AssistantSettings {
+    let changed = false;
+    if (patch.confirm === "always" || patch.confirm === "never") {
+      const before = this.confirmMode();
+      this.store.putSetting(SETTING_CONFIRM, patch.confirm);
+      if (before !== patch.confirm) {
+        this.event({ kind: "settings", msg: `ask before acting: ${before} -> ${patch.confirm} (by ${by})` });
+        changed = true;
+      }
+    }
+    if (patch.plugins && typeof patch.plugins === "object") {
+      const cur = this.pluginMap();
+      const next = normalizePlugins({ ...cur, ...patch.plugins });
+      this.store.putSetting(SETTING_PLUGINS, serializePlugins(next));
+      const diff = (["browser", "workspace", "webfetch", "webhooks"] as const)
+        .filter((k) => cur[k] !== next[k])
+        .map((k) => `${k}:${next[k] ? "on" : "off"}`);
+      if (diff.length) {
+        this.event({ kind: "settings", msg: `plugins changed ${diff.join(",")} (by ${by})` });
+        changed = true;
+      }
+    }
+    if (patch.webhooks !== undefined) {
+      const prev = this.storedWebhooks();
+      const next = normalizeWebhooks(patch.webhooks, prev);
+      this.store.putSetting(SETTING_WEBHOOKS, next);
+      this.event({ kind: "settings", msg: `webhooks updated (${next.length} tools, by ${by})` });
+      changed = true;
+    }
+    if (changed) {
       this.host.toViewers({ type: "assistant_reset" });
     }
     return this.settings();
@@ -554,8 +621,13 @@ export class Assistant {
     /** What the tools gave back, one clipped line each: the facts a call keeps when the model wrote none. */
     const notes: string[] = [];
     const turn: Turn = { occasion: opts.occasion, facts: newFacts() };
-    const system = systemPrompt(this.name, opts.occasion, this.backendBoard(), { confirm: !this.direct(turn) });
-    const tools = opts.allow ? TOOLS.filter((t) => opts.allow!.has(t.name)) : TOOLS;
+    const plugins = this.pluginMap();
+    const webhooks = this.storedWebhooks();
+    const system =
+      systemPrompt(this.name, opts.occasion, this.backendBoard(), { confirm: !this.direct(turn) }) +
+      pluginPromptHints(plugins);
+    const allTools = [...TOOLS, ...pluginToolDefs(plugins, webhooks)];
+    const tools = opts.allow ? allTools.filter((t) => opts.allow!.has(t.name)) : allTools;
     const rounds = opts.maxRounds ?? (opts.occasion === "text" ? TEXT_TOOL_ROUNDS : MAX_TOOL_ROUNDS);
     /** What is said must match what was done in this run (the guard), and the log says when it did not. */
     const finish = (raw: string) => {
@@ -1266,8 +1338,31 @@ export class Assistant {
         const ok = typeof input.id === "string" && this.cancelReminder(input.id);
         return { out: ok ? "取消了" : "没有这个提醒", step: ok ? "取消了一个提醒" : undefined };
       }
-      default:
+      default: {
+        const pluginResult = await executePluginTool(name, input, {
+          plugins: this.pluginMap(),
+          webhooks: this.storedWebhooks(),
+          resolveDevice: (ref) => this.resolveDevice(ref),
+          deviceName: (id) => this.deviceName(id),
+          callHost: <T = unknown>(id: string, method: string, params: Record<string, unknown>, timeoutMs?: number) =>
+            this.ask(id, method as RpcMethod, params as never, timeoutMs) as unknown as Promise<T>,
+          requireConfirm: (opKey, summary, confirmedArg) => {
+            if (this.direct(turn)) return null;
+            const proposedAt = this.pendingPluginConfirms.get(opKey);
+            const userAgreedAfter =
+              proposedAt !== undefined &&
+              this.items.some((x) => x.role === "user" && x.ts > proposedAt);
+            if (confirmedArg && userAgreedAfter) {
+              this.pendingPluginConfirms.delete(opKey);
+              return null;
+            }
+            this.pendingPluginConfirms.set(opKey, this.now());
+            return `尚未执行，需要你先确认：${summary}。先用一句话问用户是否允许；得到用户明确同意后再带 confirmed=true 调用。`;
+          },
+        });
+        if (pluginResult) return pluginResult;
         throw new Error(`没有 ${name} 这个工具`);
+      }
     }
   }
 

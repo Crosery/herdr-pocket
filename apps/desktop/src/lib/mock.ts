@@ -13,6 +13,7 @@ import {
   type AssistantConfigChange,
   type AssistantConfigView,
   type AssistantItem,
+  type AssistantSettings,
   type AssistantState,
   type ConvEvent,
   type Device,
@@ -40,6 +41,8 @@ import {
   type ToolUpdateItemResult,
   type ToolUpdateJobSnapshot,
 } from "@herdr-pocket/protocol";
+import { clientConfigStore } from "./config";
+import { browserSpacesStore } from "./browserSpaces";
 import { liveStore } from "./store";
 
 export const DEMO_URL = "demo://local";
@@ -897,8 +900,8 @@ function buildDemoRawTerminalPayload(agentKey: string): string {
     "\x1b[90m+------------------+--------------------+--------------------+----------------------------+\x1b[0m",
     "| 服务模块         | 独立容器架构       | 前端宿主路径       | 改 UI 要不要重打发布包     |",
     "|------------------+--------------------+--------------------+----------------------------|",
-    "| xc-servers       | 独立容器运行       | /apps/:appId       | 不需要，直接部署服务端即可 |",
-    "| xc-reminder      | 已拆出至总控台     | apps/console/dist  | 需随总控台版本统一构建发布 |",
+    "| api-gateway      | 独立容器运行       | /apps/:appId       | 不需要，直接部署服务端即可 |",
+    "| cron-runner      | 已拆出至总控台     | apps/console/dist  | 需随总控台版本统一构建发布 |",
     "\x1b[90m+------------------+--------------------+--------------------+----------------------------+\x1b[0m",
   );
   lines.push(...existing);
@@ -1535,7 +1538,10 @@ export const mockApi = {
         (params.spaceName ? docEntry.value.spaces.find((sp) => sp.name === params.spaceName) : undefined);
       if (!targetSpace) {
         const spId = params.space || `sp-${++mockTermSeq}`;
-        const spFolder = params.folder || "~/work/demo-app";
+        const rawFolder = params.folder || "~/work/demo-app";
+        const spFolder = params.worktreeBranch
+          ? `~/work/.herdr-worktrees/${rawFolder.split("/").filter(Boolean).pop() || "repo"}-${String(params.worktreeBranch).replace(/[^a-zA-Z0-9._-]+/g, "-")}`
+          : rawFolder;
         const spName = params.spaceName || spFolder.split("/").filter(Boolean).pop() || "workspace";
         targetSpace = { id: spId, name: spName, folder: spFolder, tabs: [] };
         docEntry.value.spaces.push(targetSpace);
@@ -1547,7 +1553,7 @@ export const mockApi = {
       });
       docEntry.version += 1;
 
-      const resolvedCwd = params.folder || targetSpace.folder || "~/work/demo-app";
+      const resolvedCwd = targetSpace.folder || params.folder || "~/work/demo-app";
       const tabLabel = params.tabName || `${targetSpace.tabs.length}`;
       const ag: Agent = {
         key,
@@ -1568,7 +1574,7 @@ export const mockApi = {
       DEMO_EVENTS[key] = !isShell && params.task ? [{ id: `u-${Date.now()}`, session: ag.sessionKey!, ts: Date.now(), kind: "user_message", text: params.task }] : [];
       DEMO_TERMINALS[key] = [`${ag.harness} · ${ag.cwd}`, params.task ? `$ ${params.task}` : "$ ready"];
       mockApi.connect();
-      return { agent: key, space: targetSpace.id, tab: newTabId, terminal: id, task: "started" };
+      return { agent: key, space: targetSpace.id, tab: newTabId, terminal: id, task: "started", folder: resolvedCwd };
     }
     if (method === "agent.seen") {
       const reqKey = String(params?.agent ?? "");
@@ -1857,6 +1863,52 @@ export const mockApi = {
     if (method === "portal.observeCommand") {
       return { ok: true };
     }
+    if (method === "browser.status") {
+      const enabled = clientConfigStore.get().config.plugins.aiBrowser;
+      if (!enabled) {
+        return { enabled: false, backend: "none", spaces: [] };
+      }
+      const b = browserSpacesStore.get();
+      return {
+        enabled: true,
+        backend: "desktop",
+        activeSpaceId: b.activeSpaceId,
+        spaces: b.spaces.map((sp) => ({
+          id: sp.id,
+          name: sp.name,
+          kind: sp.kind,
+          ownership: sp.ownership,
+          ...(sp.statusText ? { statusText: sp.statusText } : {}),
+          ...(sp.handoffReason ? { handoffReason: sp.handoffReason } : {}),
+          activePage: sp.tabs.find((t) => t.id === sp.activeTabId)?.label ?? "p1",
+          pages: sp.tabs.map((t, idx) => ({
+            label: t.label || `p${idx + 1}`,
+            title: t.title,
+            url: t.url,
+            active: t.id === sp.activeTabId,
+          })),
+        })),
+      };
+    }
+    if (method === "browser.act") {
+      const enabled = clientConfigStore.get().config.plugins.aiBrowser;
+      if (!enabled) {
+        throw new Error("AI 浏览器插件默认关闭，请在 设置 › 插件中心 按需启用");
+      }
+      const sid = typeof params?.spaceId === "string" && params.spaceId ? params.spaceId : "ai-demo";
+      return {
+        ok: true,
+        spaceId: sid,
+        page: typeof params?.page === "string" && params.page ? params.page : "p1",
+        url: typeof params?.url === "string" ? params.url : "https://pocket.example.com",
+        title: "Demo Browser Space",
+        ownership: params?.op === "handoff" ? "agentHandoff" : params?.op === "finish" ? "user" : "agentWorking",
+        ...(params?.op === "handoff" ? { handoffReason: String(params?.reason ?? "请完成验证后交还 AI") } : {}),
+        ...(params?.op === "snapshot"
+          ? { snapshot: "Title: Demo Workspace\nURL: https://pocket.example.com\n---\n@e1 [link] \"Docs\"\n@e2 [button] \"Deploy\"" }
+          : {}),
+      };
+    }
     return { ok: true };
   },
   subscribe(
@@ -1978,6 +2030,34 @@ export const mockApi = {
   },
   clearAssistant(): void {
     demoAssistantState = { ...demoAssistantState, items: [] };
+  },
+  assistantSettings: (): AssistantSettings => {
+    const cur: AssistantSettings = demoAssistantState.settings ?? { confirm: "never" };
+    return {
+      confirm: cur.confirm,
+      ...(cur.plugins ? { plugins: { ...cur.plugins } } : {}),
+      ...(cur.webhooks ? { webhooks: cur.webhooks.map((w) => ({ ...w })) } : {}),
+    };
+  },
+  saveAssistantSettings(patch: Partial<AssistantSettings>): AssistantSettings {
+    const cur: AssistantSettings = demoAssistantState.settings ?? { confirm: "never" };
+    const nextPlugins = patch.plugins ? { ...(cur.plugins ?? {}), ...patch.plugins } : cur.plugins;
+    const nextWebhooks = patch.webhooks !== undefined ? patch.webhooks.map((w) => ({ ...w })) : cur.webhooks;
+    const cleanPlugins: AssistantSettings["plugins"] = {};
+    if (nextPlugins) {
+      for (const k of ["browser", "workspace", "webfetch", "webhooks"] as const) {
+        if (nextPlugins[k]) cleanPlugins[k] = true;
+      }
+    }
+    demoAssistantState = {
+      ...demoAssistantState,
+      settings: {
+        confirm: patch.confirm ?? cur.confirm,
+        ...(Object.keys(cleanPlugins).length ? { plugins: cleanPlugins } : {}),
+        ...(nextWebhooks?.length ? { webhooks: nextWebhooks } : {}),
+      },
+    };
+    return mockApi.assistantSettings();
   },
   configView: (): AssistantConfigView => ({ ...demoConfig, providers: demoConfig.providers.map((p) => ({ ...p })), models: demoConfig.models.map((m) => ({ ...m })) }),
   saveConfig(patch: AssistantConfigChange): AssistantConfigView {

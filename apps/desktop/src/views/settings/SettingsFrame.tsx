@@ -3,6 +3,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import {
   AppWindow,
   Bell,
+  Blocks,
   Cpu,
   FileDown,
   Info,
@@ -25,6 +26,7 @@ import { liveStore, settingsStore } from "../../lib/store";
 import { updateStore } from "../../lib/updates";
 import { closeSettingsFrame, openSettingsFrame, shellStore, type FrameSection } from "../../shell/shellStore";
 import { AboutPane, BrowserPane, NotificationsPane, PerformancePane, UpdatesPane } from "./Panes";
+import { PluginsPane } from "./PluginsPane";
 import { KeyboardPane, LookPane, MachinesPane, PrivacyPane } from "./FramePanes";
 import { LogsPane } from "./LogsPane";
 import { PaneTitle } from "./rows";
@@ -55,6 +57,7 @@ const HERDR_ORDER: Item[] = [
 const OURS: Item[] = [
   { id: "voice", title: "语音唤醒与声纹", icon: Mic },
   { id: "assistant", title: "小羊助理", icon: Sparkles },
+  { id: "plugins", title: "插件中心", icon: Blocks },
   { id: "browser", title: "浏览器与文件", icon: AppWindow },
   { id: "performance", title: "性能与资源", icon: Cpu },
   { id: "logs", title: "日志与诊断", icon: ScrollText },
@@ -165,6 +168,8 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
             </Suspense>
           </div>
         );
+      case "plugins":
+        return <PluginsPane />;
       case "browser":
         return <BrowserPane />;
       case "performance":

@@ -19,6 +19,8 @@ import {
   sourceUrl,
   withWinnerFirst,
   type PutFile,
+  type BrowserSpacePageSummary,
+  type BrowserSpaceSummary,
   type Region,
   type RegionDecision,
   type RegionSetting,
@@ -1176,6 +1178,57 @@ export function browserClearData(): Promise<number> {
  */
 export async function browserStoreKind(): Promise<"persistent" | "session" | null> {
   return isTauri() ? call<"persistent" | "session">("browser_store_kind").catch(() => null) : null;
+}
+
+export interface BrowserAiBridgePage extends BrowserSpacePageSummary {
+  panelId: string;
+}
+
+export interface BrowserAiBridgeSpace extends Omit<BrowserSpaceSummary, "pages"> {
+  pages: BrowserAiBridgePage[];
+}
+
+export interface BrowserAiBridgeState {
+  enabled: boolean;
+  backend: "desktop" | "cdp" | "none";
+  spaces: BrowserAiBridgeSpace[];
+  activeSpaceId?: string;
+}
+
+export interface BrowserAiCommand {
+  kind: "open_space" | "finish_space";
+  spaceId?: string;
+  pageLabel?: string;
+  panelId?: string;
+  url?: string;
+  statusText?: string;
+  keep?: string[];
+}
+
+export async function browserAiState(): Promise<BrowserAiBridgeState | null> {
+  return isTauri() ? call<BrowserAiBridgeState>("browser_ai_state").catch(() => null) : null;
+}
+
+export function browserSyncSpaces(spaces: BrowserAiBridgeSpace[], activeSpaceId: string | null): Promise<void> {
+  return isTauri() ? call<void>("browser_sync_spaces", { spaces, activeSpaceId }).catch(() => {}) : Promise.resolve();
+}
+
+export function browserAiControl(
+  spaceId: string,
+  action: "takeover" | "resume" | "handoff" | "close_space",
+  reason?: string,
+): Promise<void> {
+  return isTauri()
+    ? call<void>("browser_ai_control", { spaceId, action, reason: reason ?? null }).catch(() => {})
+    : Promise.resolve();
+}
+
+export function onBrowserAiState(cb: (s: BrowserAiBridgeState) => void): () => void {
+  return listenTauri<BrowserAiBridgeState>("browser://ai-state", cb);
+}
+
+export function onBrowserAiCommand(cb: (cmd: BrowserAiCommand) => void): () => void {
+  return listenTauri<BrowserAiCommand>("browser://ai-command", cb);
 }
 
 // Cookie import from installed browsers --------------------------------------------

@@ -658,18 +658,13 @@ jobs:
           EOF
           flags=()
           [ "$PRERELEASE" = true ] && flags+=(--prerelease)
-          for attempt in 1 2 3 4; do
-            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              if gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber && \
-                 gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --title "Herdr Pocket $VERSION" --notes-file notes.md; then
-                break
-              fi
-            else
-              if gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
-                   --title "Herdr Pocket $VERSION" --notes-file notes.md --generate-notes "${flags[@]}"; then
-                break
-              fi
-            fi
-            [ "$attempt" -eq 4 ] && exit 1
-            sleep $((attempt * 6))
+          retry_gh() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 4 ] && return 1; sleep $((n * 5)); done; }
+          if ! retry_gh gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            retry_gh gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --title "Herdr Pocket $VERSION" --notes-file notes.md --generate-notes "${flags[@]}"
+          fi
+          for f in dist/*; do
+            [ -e "$f" ] || continue
+            retry_gh gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
           done
+          retry_gh gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --title "Herdr Pocket $VERSION" --notes-file notes.md

@@ -496,6 +496,9 @@ a {
 .pk-textarea {
   min-height: 92px;
   resize: vertical;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .pk-select-trigger {
@@ -3542,6 +3545,224 @@ a {
   padding: 4px 12px;
   border-radius: var(--r-pill);
   font-size: calc(13px * var(--ts, 1));
+}
+
+.web-ai-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--divider);
+  font-size: calc(12.2px * var(--ts, 1));
+  min-width: 0;
+}
+
+.web-ai-bar.working {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.web-ai-bar.handoff {
+  background: var(--blush-soft);
+  color: var(--ink);
+}
+
+.web-ai-bar.paused {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.web-ai-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.web-ai-ico {
+  flex: none;
+  color: var(--primary);
+}
+
+.web-ai-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--primary);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary) 24%, transparent);
+  animation: webAiPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes webAiPulse {
+  0%, 100% { transform: scale(0.9); opacity: 0.8; }
+  50% { transform: scale(1.15); opacity: 1; }
+}
+
+.web-host.blank {
+  align-items: flex-start;
+  justify-content: center;
+  background: var(--surface);
+  overflow-y: auto;
+  padding: 20px 16px;
+}
+
+.web-start {
+  width: 100%;
+  max-width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin: auto 0;
+}
+
+.web-start-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.web-start-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: calc(15px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.web-start-title svg {
+  color: var(--primary);
+}
+
+.web-start-sub {
+  margin: 0;
+  font-size: calc(12.5px * var(--ts, 1));
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.web-start-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.web-start-search .pk-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.web-start-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.web-start-label {
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.web-start-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.web-start-chip {
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: calc(12px * var(--ts, 1));
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.web-start-chip:hover {
+  border-color: var(--line-pink);
+  background: var(--accent-soft);
+}
+
+.web-start-bookmarks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 6px;
+}
+
+.web-start-bm {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 6px 5px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  min-width: 0;
+}
+
+.web-start-bm-link {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: calc(12px * var(--ts, 1));
+  text-align: left;
+  cursor: pointer;
+}
+
+.web-start-bm-del {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.web-start-bm-del:hover {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.web-start-plugin {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line-pink);
+  background: var(--accent-soft);
+}
+
+.web-start-plugin-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.web-start-plugin-copy strong {
+  font-size: calc(12.8px * var(--ts, 1));
+  color: var(--ink);
+}
+
+.web-start-plugin-copy span {
+  font-size: calc(11.8px * var(--ts, 1));
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .web-host {

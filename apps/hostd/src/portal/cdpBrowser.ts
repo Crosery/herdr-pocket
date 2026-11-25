@@ -303,6 +303,18 @@ class CdpSession {
     await this.captureOnce(true);
   }
 
+  async evalJson<T = unknown>(expression: string): Promise<T> {
+    const res = await this.cdp("Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (res?.exceptionDetails) {
+      throw new Error(String(res.exceptionDetails.text || res.exceptionDetails.exception?.description || "Page evaluate error"));
+    }
+    return res?.result?.value as T;
+  }
+
   private async refreshNavState(): Promise<void> {
     try {
       const h = await this.cdp("Page.getNavigationHistory", {});

@@ -2,14 +2,17 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import {
   ArrowDown,
   ArrowLeft,
+  ArrowRight,
   ArrowUp,
   Brain,
   ChevronDown,
   ChevronRight,
   Cpu,
   Folder,
+  FolderGit2,
   FolderOpen,
   FolderTree,
+  GitBranch,
   Laptop,
   Menu,
   Paperclip,
@@ -55,6 +58,7 @@ import {
   PocketInput,
   PocketModal,
   PocketSelect,
+  PocketSwitch,
   fs,
   overlayStore,
   useToast,
@@ -3460,6 +3464,23 @@ export interface CreatedAgentInfo {
   launcher: string;
 }
 
+const LAST_LAUNCHER_KEY = "hp-last-create-launcher";
+
+function folderBasename(p: string): string {
+  return p.trim().replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+}
+
+function suggestUniqueSpaceName(baseName: string, spaces: SpaceInfo[]): string {
+  const clean = baseName.trim() || "workspace";
+  const taken = new Set(spaces.map((s) => s.name.toLowerCase()));
+  if (!taken.has(clean.toLowerCase())) return clean;
+  for (let i = 2; i < 50; i += 1) {
+    const cand = `${clean}-${i}`;
+    if (!taken.has(cand.toLowerCase())) return cand;
+  }
+  return clean;
+}
+
 export function CreateAgentModal({
   open,
   onOpenChange,
@@ -3468,6 +3489,7 @@ export function CreateAgentModal({
   defaultSpace,
   preferNewSpace = false,
   onCreated,
+  onOpenExistingSpace,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
@@ -3476,11 +3498,13 @@ export function CreateAgentModal({
   defaultSpace: string | null;
   preferNewSpace?: boolean;
   onCreated: (info: CreatedAgentInfo) => void;
+  onOpenExistingSpace?: (hostId: string, space: SpaceInfo) => void;
 }) {
   const toast = useToast();
   const localHostId = useLocalHostDeviceId();
   const onlineHosts = hosts.filter((h) => h.online);
   const [hostId, setHostId] = useState(defaultHost || onlineHosts[0]?.id || "");
+  const [hostPickerOpen, setHostPickerOpen] = useState(false);
   const isLocalHost = native.available() && Boolean(localHostId) && hostId === localHostId;
   const [spaces, setSpaces] = useState<SpaceInfo[]>([]);
   const [launchers, setLaunchers] = useState<LaunchOption[]>([]);
@@ -3492,6 +3516,9 @@ export function CreateAgentModal({
   const [folder, setFolder] = useState("");
   const [folderTouched, setFolderTouched] = useState(false);
   const [browseOpen, setBrowseOpen] = useState(false);
+  const [useWorktree, setUseWorktree] = useState(false);
+  const [worktreeBranch, setWorktreeBranch] = useState("");
+  const [branchTouched, setBranchTouched] = useState(false);
   const [task, setTask] = useState("");
   const [busy, setBusy] = useState(false);
   const [spaceState, setSpaceState] = useState<{ loading: boolean; error: string | null; canCreate: boolean; reason?: string }>({
@@ -3504,12 +3531,16 @@ export function CreateAgentModal({
     if (!open) return;
     const h = defaultHost || onlineHosts[0]?.id || hosts[0]?.id || "";
     setHostId(h);
+    setHostPickerOpen(!preferNewSpace && !defaultHost && onlineHosts.length > 1);
     setSpaceName(defaultSpace || "");
     setSpaceNameTouched(Boolean(defaultSpace));
+    setUseWorktree(false);
+    setWorktreeBranch("");
+    setBranchTouched(false);
     setTask("");
     setFolderTouched(false);
     setBrowseOpen(false);
-  }, [open, defaultHost, defaultSpace]);
+  }, [open, defaultHost, defaultSpace, preferNewSpace]);
 
   useEffect(() => {
     if (!open || !hostId) return;
@@ -3530,7 +3561,18 @@ export function CreateAgentModal({
         setSpaces(res.spaces);
         setLaunchers(sortedLaunchers);
         setFolders(res.folders);
-        setLauncher(sortedLaunchers.find((l) => l.id === "shell")?.id ?? sortedLaunchers[0]?.id ?? "");
+        let savedLauncher = "";
+        try {
+          savedLauncher = localStorage.getItem(LAST_LAUNCHER_KEY) || "";
+        } catch {
+          savedLauncher = "";
+        }
+        const preferredLauncher =
+          (savedLauncher && sortedLaunchers.some((l) => l.id === savedLauncher) ? savedLauncher : "") ||
+          sortedLaunchers.find((l) => l.id === "shell")?.id ||
+          sortedLaunchers[0]?.id ||
+          "";
+        setLauncher(preferredLauncher);
         const matched = defaultSpace ? res.spaces.find((s) => s.name === defaultSpace) : undefined;
         if (preferNewSpace && !defaultSpace) {
           setSpaceId("");
@@ -3551,20 +3593,31 @@ export function CreateAgentModal({
     };
   }, [open, hostId, defaultSpace, preferNewSpace]);
 
-  const applyChosenFolder = (nextFolder: string, markTouched = true) => {
+  const applyChosenFolder = (nextFolder: string, markTouched = true, loadedSpaces = spaces) => {
     setFolder(nextFolder);
     if (markTouched) setFolderTouched(true);
     const norm = normalizeFolderKey(nextFolder);
+    const baseName = folderBasename(nextFolder);
     if (!norm) return;
-    const matched = spaces.find((s) => s.folder && normalizeFolderKey(s.folder) === norm);
+    if (preferNewSpace && !defaultSpace) {
+      // Dedicated "New Space" flow: never hijack into an existing space on folder click.
+      setSpaceId("");
+      if (!spaceNameTouched && baseName) {
+        const nextName = suggestUniqueSpaceName(baseName, loadedSpaces);
+        setSpaceName(nextName);
+        if (!branchTouched) {
+          const slug = nextName.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "work";
+          setWorktreeBranch(`feat/${slug}`);
+        }
+      }
+      return;
+    }
+    const matched = loadedSpaces.find((s) => s.folder && normalizeFolderKey(s.folder) === norm);
     if (matched) {
       setSpaceId(matched.id);
     } else {
       setSpaceId("");
-      if (!spaceNameTouched) {
-        const baseName = nextFolder.trim().replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
-        if (baseName) setSpaceName(baseName);
-      }
+      if (!spaceNameTouched && baseName) setSpaceName(baseName);
     }
   };
 
@@ -3578,20 +3631,55 @@ export function CreateAgentModal({
   };
 
   const matchedSpaceObj = spaceId ? spaces.find((s) => s.id === spaceId) : undefined;
+  const folderMatchesSpace = useMemo(() => {
+    const norm = normalizeFolderKey(folder);
+    if (!norm) return undefined;
+    return spaces.find((s) => s.folder && normalizeFolderKey(s.folder) === norm);
+  }, [folder, spaces]);
 
-  const submit = async () => {
-    if (!hostId || !launcher) return;
+  // Combine recent folders + space folders into clean, searchable project items.
+  const projectRows = useMemo(() => {
+    const seen = new Set<string>();
+    const rows: Array<{ path: string; name: string; existing?: SpaceInfo }> = [];
+    for (const raw of [...folders, ...spaces.map((s) => s.folder).filter((x): x is string => Boolean(x))]) {
+      const clean = raw.trim();
+      const norm = normalizeFolderKey(clean);
+      if (!clean || !norm || seen.has(norm)) continue;
+      seen.add(norm);
+      const existing = spaces.find((s) => s.folder && normalizeFolderKey(s.folder) === norm);
+      rows.push({ path: clean, name: folderBasename(clean) || clean, existing });
+    }
+    const q = folder.trim().toLowerCase();
+    // Only filter when the query isn't already an exact selected path so the list stays scannable after picking.
+    const isExactPicked = rows.some((r) => normalizeFolderKey(r.path) === normalizeFolderKey(folder));
+    if (!q || isExactPicked) return rows.slice(0, 8);
+    return rows.filter((r) => r.name.toLowerCase().includes(q) || r.path.toLowerCase().includes(q)).slice(0, 8);
+  }, [folders, spaces, folder]);
+
+  const submit = async (overrideFolder?: string) => {
+    if (!hostId || !launcher || busy) return;
+    const effectiveFolder = (overrideFolder ?? folder).trim();
+    if (useWorktree && !spaceId && !effectiveFolder) {
+      toast("创建独立 Git Worktree 需要先选择仓库目录", true);
+      return;
+    }
     setBusy(true);
     try {
-      const cleanFolder = folder.trim();
-      const folderBase = cleanFolder.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || "";
+      const cleanFolder = effectiveFolder;
+      const folderBase = folderBasename(cleanFolder);
       const resolvedSpaceName = matchedSpaceObj?.name || spaceName.trim() || folderBase || "workspace";
+      try {
+        localStorage.setItem(LAST_LAUNCHER_KEY, launcher);
+      } catch {
+        // ignore storage restrictions
+      }
       const res = await rpcCall(hostId, "agent.create", {
         space: spaceId || undefined,
-        spaceName: spaceId ? undefined : spaceName.trim() || undefined,
+        spaceName: spaceId ? undefined : resolvedSpaceName,
         folder: cleanFolder || undefined,
         launcher,
         task: launcher !== "shell" && task.trim() ? task.trim() : undefined,
+        ...(!spaceId && useWorktree && worktreeBranch.trim() ? { worktreeBranch: worktreeBranch.trim() } : {}),
       }, 30_000);
       onOpenChange(false);
       setTask("");
@@ -3602,7 +3690,7 @@ export function CreateAgentModal({
         spaceId: res.space || spaceId || undefined,
         tabId: res.tab || undefined,
         spaceName: resolvedSpaceName,
-        folder: cleanFolder || matchedSpaceObj?.folder || undefined,
+        folder: res.folder || cleanFolder || matchedSpaceObj?.folder || undefined,
         launcher,
       });
     } catch (e) {
@@ -3614,6 +3702,7 @@ export function CreateAgentModal({
 
   const isCreatingSpace = preferNewSpace || !spaceId;
   const isShellLauncher = launcher === "shell";
+  const selectedHost = hosts.find((h) => h.id === hostId);
 
   return (
     <>
@@ -3623,20 +3712,33 @@ export function CreateAgentModal({
         title={isCreatingSpace ? "新建空间" : "新建终端 / Agent"}
         subtitle={
           isCreatingSpace
-            ? "选择工作目录并创建新空间，默认直接进入终端（也可切换启动指定 Agent）"
-            : "选择工作目录后自动匹配已有空间（或新建命名空间）"
+            ? `${selectedHost ? `在 ${selectedHost.name} 上` : ""}选项目目录或直接命名创建，默认开启终端（双击项目行可直接创建）`
+            : "选择工作目录并添加新标签到对应空间"
         }
         width={540}
       >
         <div className="stack">
-          {hosts.length > 0 ? (
+          {hosts.length > 0 && (hostPickerOpen || (!preferNewSpace && hosts.length > 1)) ? (
             <div>
-              <div className="faint" style={{ marginBottom: 4 }}>电脑</div>
+              <div className="between" style={{ marginBottom: 4 }}>
+                <span className="faint">目标电脑</span>
+                {preferNewSpace && hosts.length > 1 ? (
+                  <button type="button" className="v3-mini-btn" onClick={() => setHostPickerOpen(false)}>收起</button>
+                ) : null}
+              </div>
               <PocketSelect
                 value={hostId}
                 onValueChange={setHostId}
                 options={hosts.map((h) => ({ value: h.id, label: h.online ? h.name : `${h.name} (离线)` }))}
               />
+            </div>
+          ) : hosts.length > 1 && selectedHost ? (
+            <div className="between" style={{ padding: "2px 0" }}>
+              <span className="row" style={{ gap: 6, fontSize: 12.5, color: "var(--muted)" }}>
+                <Laptop size={13} />
+                <span>电脑：<strong style={{ color: "var(--ink)" }}>{selectedHost.name}</strong></span>
+              </span>
+              <button type="button" className="v3-mini-btn" onClick={() => setHostPickerOpen(true)}>切换电脑</button>
             </div>
           ) : null}
 
@@ -3646,9 +3748,219 @@ export function CreateAgentModal({
             <div className="faint" style={{ color: "var(--blush-text)", fontSize: 12.5 }}>{spaceState.reason}</div>
           ) : null}
 
+          <div>
+            <div className="between" style={{ marginBottom: 5, gap: 8 }}>
+              <span className="faint" style={{ flexShrink: 0 }}>项目目录</span>
+              {!isCreatingSpace && matchedSpaceObj ? (
+                <span className="faint truncate" style={{ minWidth: 0, fontSize: 12, color: "var(--mint-text)" }}>
+                  将在「{matchedSpaceObj.name}」新建 Tab
+                </span>
+              ) : isCreatingSpace && folderMatchesSpace && onOpenExistingSpace ? (
+                <span className="row" style={{ gap: 6, fontSize: 12, color: "var(--muted)" }}>
+                  <span>已有「{folderMatchesSpace.name}」</span>
+                  <button
+                    type="button"
+                    className="v3-mini-btn"
+                    onClick={() => {
+                      onOpenChange(false);
+                      onOpenExistingSpace(hostId, folderMatchesSpace);
+                    }}
+                  >
+                    直接进入
+                  </button>
+                </span>
+              ) : null}
+            </div>
+            <div className="row" style={{ gap: 6, alignItems: "center" }}>
+              <PocketInput
+                autoFocus
+                mono
+                style={{ flex: 1, minWidth: 0 }}
+                placeholder="筛选最近项目，或输入路径 ~/work/project…"
+                value={folder}
+                onChange={(e) => applyChosenFolder(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.nativeEvent.isComposing && (folder.trim() || spaceName.trim())) {
+                    e.preventDefault();
+                    void submit();
+                  }
+                }}
+              />
+              {isLocalHost ? (
+                <>
+                  <PocketButton size="sm" variant="soft" onClick={() => void pickSystemFolder()}>
+                    <FolderOpen size={14} /> 选择目录…
+                  </PocketButton>
+                  <button
+                    type="button"
+                    className="side-icon-btn"
+                    title="在弹窗内浏览目录"
+                    aria-label="在弹窗内浏览目录"
+                    onClick={() => setBrowseOpen(true)}
+                  >
+                    <FolderTree size={14} />
+                  </button>
+                </>
+              ) : (
+                <PocketButton size="sm" variant="soft" onClick={() => setBrowseOpen(true)}>
+                  <FolderTree size={14} /> 浏览目录…
+                </PocketButton>
+              )}
+            </div>
+
+            {projectRows.length > 0 ? (
+              <div
+                style={{
+                  marginTop: 8,
+                  display: "grid",
+                  gap: 4,
+                  maxHeight: 164,
+                  overflowY: "auto",
+                }}
+              >
+                {projectRows.map((row) => {
+                  const selected = normalizeFolderKey(folder) === normalizeFolderKey(row.path);
+                  return (
+                    <div
+                      key={row.path}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => applyChosenFolder(row.path)}
+                      onDoubleClick={() => {
+                        applyChosenFolder(row.path);
+                        void submit(row.path);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          applyChosenFolder(row.path);
+                          void submit(row.path);
+                        }
+                      }}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "6px 10px",
+                        borderRadius: "var(--r-md)",
+                        border: `1px solid ${selected ? "var(--line-pink)" : "var(--divider)"}`,
+                        background: selected ? "var(--accent-soft)" : "var(--surface)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      {row.existing ? <FolderGit2 size={14} style={{ color: "var(--accent-text)", flexShrink: 0 }} /> : <Folder size={14} style={{ color: "var(--muted)", flexShrink: 0 }} />}
+                      <span style={{ fontWeight: 700, fontSize: 13, color: selected ? "var(--accent-text)" : "var(--ink)", flexShrink: 0 }}>
+                        {row.name}
+                      </span>
+                      <span className="mono truncate" style={{ flex: 1, minWidth: 0, fontSize: 11.5, color: "var(--faint)" }}>
+                        {row.path}
+                      </span>
+                      {row.existing ? (
+                        <PocketBadge tone="lav">
+                          {row.existing.name}
+                        </PocketBadge>
+                      ) : null}
+                      {selected ? <ArrowRight size={13} style={{ color: "var(--accent-text)", flexShrink: 0 }} /> : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+
+          {!preferNewSpace && spaces.length > 0 ? (
+            <div>
+              <div className="faint" style={{ marginBottom: 4 }}>所属空间（同目录自动匹配，也可指定或新建）</div>
+              <PocketSelect
+                value={spaceId}
+                onValueChange={(nextId) => {
+                  setSpaceId(nextId);
+                  if (!folderTouched) {
+                    const sp = spaces.find((s) => s.id === nextId);
+                    if (sp?.folder) setFolder(sp.folder);
+                  }
+                }}
+                options={[{ value: "", label: "新建独立空间" }, ...spaces.map((s) => ({ value: s.id, label: s.folder ? `${s.name} (${s.folder})` : s.name }))]}
+              />
+            </div>
+          ) : null}
+
+          {!spaceId ? (
+            <div className="stack" style={{ gap: 8 }}>
+              <div className="row" style={{ gap: 10, alignItems: "flex-end" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="faint" style={{ marginBottom: 4 }}>空间名称</div>
+                  <PocketInput
+                    placeholder={folderBasename(folder) || "例如：backend（留空按目录命名）"}
+                    value={spaceName}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setSpaceName(val);
+                      setSpaceNameTouched(true);
+                      if (!branchTouched && val.trim()) {
+                        const slug = val.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "work";
+                        setWorktreeBranch(`feat/${slug}`);
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                        e.preventDefault();
+                        void submit();
+                      }
+                    }}
+                  />
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    height: 38,
+                    padding: "0 10px",
+                    borderRadius: "var(--r-md)",
+                    border: `1px solid ${useWorktree ? "var(--line-pink)" : "var(--divider)"}`,
+                    background: useWorktree ? "var(--accent-soft)" : "var(--surface)",
+                    flexShrink: 0,
+                  }}
+                >
+                  <GitBranch size={13} style={{ color: useWorktree ? "var(--accent-text)" : "var(--muted)" }} />
+                  <span style={{ fontSize: 12.5, fontWeight: 600, color: useWorktree ? "var(--accent-text)" : "var(--ink)" }}>Git Worktree</span>
+                  <PocketSwitch
+                    label="创建独立 Git Worktree"
+                    checked={useWorktree}
+                    onCheckedChange={(checked) => {
+                      setUseWorktree(checked);
+                      if (checked && !worktreeBranch.trim()) {
+                        const base = (spaceName.trim() || folderBasename(folder) || "work")
+                          .toLowerCase()
+                          .replace(/[^a-z0-9._-]+/g, "-")
+                          .replace(/^-+|-+$/g, "") || "work";
+                        setWorktreeBranch(`feat/${base}`);
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+              {useWorktree ? (
+                <div>
+                  <div className="faint" style={{ marginBottom: 4 }}>隔离分支名（将自动在仓库旁创建独立 Worktree 工作区）</div>
+                  <PocketInput
+                    mono
+                    placeholder="feat/new-space"
+                    value={worktreeBranch}
+                    onChange={(e) => {
+                      setWorktreeBranch(e.target.value);
+                      setBranchTouched(true);
+                    }}
+                  />
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
           {launchers.length > 0 ? (
             <div>
-              <div className="faint" style={{ marginBottom: 4 }}>程序 / Harness</div>
+              <div className="faint" style={{ marginBottom: 4 }}>默认打开</div>
               <div className="row wrap" style={{ gap: 6 }}>
                 {launchers.map((l) => (
                   <PocketButton key={l.id} size="sm" variant={launcher === l.id ? "primary" : "ghost"} onClick={() => setLauncher(l.id)}>
@@ -3659,102 +3971,35 @@ export function CreateAgentModal({
             </div>
           ) : null}
 
-          <div>
-            <div className="between" style={{ marginBottom: 4, gap: 8 }}>
-              <span className="faint" style={{ flexShrink: 0 }}>工作目录</span>
-              {folder.trim() ? (
-                <span className="faint truncate" style={{ minWidth: 0, fontSize: 12, color: matchedSpaceObj ? "var(--mint-text)" : "var(--accent-text)" }}>
-                  {matchedSpaceObj ? `复用空间「${matchedSpaceObj.name}」· 新建 Tab` : `将新建空间「${spaceName.trim() || folder.trim().replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "新空间"}」`}
-                </span>
-              ) : null}
-            </div>
-            <div className="row wrap" style={{ gap: 6, alignItems: "center" }}>
-              <PocketInput
-                mono
-                style={{ flex: "1 1 200px", minWidth: 0 }}
-                placeholder="~/work/project"
-                value={folder}
-                onChange={(e) => applyChosenFolder(e.target.value)}
-              />
-              {isLocalHost ? (
-                <PocketButton size="sm" variant="ghost" onClick={() => void pickSystemFolder()}>
-                  <FolderOpen size={14} /> 访达
-                </PocketButton>
-              ) : null}
-              <PocketButton size="sm" variant="soft" onClick={() => setBrowseOpen(true)}>
-                <FolderTree size={14} /> 浏览目录…
-              </PocketButton>
-            </div>
-
-            {folders.length > 0 ? (
-              <div className="row wrap" style={{ gap: 5, marginTop: 6 }}>
-                {folders.slice(0, 8).map((f) => (
-                  <button
-                    key={f}
-                    type="button"
-                    className="term-key"
-                    style={
-                      normalizeFolderKey(folder) === normalizeFolderKey(f)
-                        ? { borderColor: "var(--line-pink)", color: "var(--accent-text)", background: "var(--accent-soft)", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }
-                        : { maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }
-                    }
-                    onClick={() => applyChosenFolder(f)}
-                  >
-                    {f}
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </div>
-
-          {spaces.length > 0 ? (
-            <div>
-              <div className="faint" style={{ marginBottom: 4 }}>所属空间（同目录自动复用，也可手动指定或新建）</div>
-              <PocketSelect
-                value={spaceId}
-                onValueChange={(nextId) => {
-                  setSpaceId(nextId);
-                  if (!folderTouched) {
-                    const sp = spaces.find((s) => s.id === nextId);
-                    if (sp?.folder) setFolder(sp.folder);
-                  }
-                }}
-                options={[{ value: "", label: "新建命名空间" }, ...spaces.map((s) => ({ value: s.id, label: s.folder ? `${s.name} (${s.folder})` : s.name }))]}
-              />
-            </div>
-          ) : null}
-
-          {!spaceId ? (
-            <div>
-              <div className="faint" style={{ marginBottom: 4 }}>新空间名称</div>
-              <PocketInput
-                placeholder="例如：backend"
-                value={spaceName}
-                onChange={(e) => {
-                  setSpaceName(e.target.value);
-                  setSpaceNameTouched(true);
-                }}
-              />
-            </div>
-          ) : null}
-
           {!isShellLauncher ? (
             <div>
               <div className="faint" style={{ marginBottom: 4 }}>第一条任务（可选）</div>
-              <PocketInput placeholder="要交给它做什么…" value={task} onChange={(e) => setTask(e.target.value)} />
+              <PocketInput
+                placeholder="要交给它做什么…"
+                value={task}
+                onChange={(e) => setTask(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    void submit();
+                  }
+                }}
+              />
             </div>
           ) : null}
 
-          <div className="row" style={{ justifyContent: "flex-end" }}>
+          <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
             <PocketButton variant="ghost" onClick={() => onOpenChange(false)}>取消</PocketButton>
             <PocketButton variant="primary" disabled={busy || spaceState.loading || !spaceState.canCreate || !hostId || !launcher} onClick={() => void submit()}>
               {busy
-                ? "正在打开…"
-                : !spaceId && isShellLauncher
-                  ? "创建空间并打开终端"
-                  : isShellLauncher
-                    ? "打开终端"
-                    : "启动 Agent"}
+                ? "正在创建…"
+                : !spaceId && useWorktree
+                  ? "创建 Worktree 空间"
+                  : !spaceId && isShellLauncher
+                    ? "创建空间"
+                    : isShellLauncher
+                      ? "打开终端"
+                      : "创建并启动 Agent"}
             </PocketButton>
           </div>
         </div>

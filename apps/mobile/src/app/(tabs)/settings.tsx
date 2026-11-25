@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { AppState, Image, Pressable, ScrollView, useWindowDimensions, View } from "react-native";
 import { Text } from "react-native-paper";
-import { router } from "expo-router";
+import { router, type Href } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -424,6 +424,9 @@ function AssistantConfigCard() {
   const configError = useAssistantConfig((x) => x.configError);
   const prompts = useAssistantConfig((x) => x.prompts);
   const promptsError = useAssistantConfig((x) => x.promptsError);
+  const plugins = useAssistant((x) => x.plugins);
+  const enabledPlugins = Object.values(plugins).filter(Boolean).length;
+  const pluginsLine = enabledPlugins > 0 ? `已开启 ${enabledPlugins} 项扩展工具` : "默认全部关闭（按需开启）";
   const main = config?.models[0];
   const spare = (config?.models.length ?? 1) - 1;
   const modelsLine = config
@@ -442,6 +445,8 @@ function AssistantConfigCard() {
       <Row icon="account-voice" title="语音" sub={voiceLine} dim={!config} onPress={() => router.push("/assistant-config/voice")} />
       <Divider />
       <Row icon="text-box-edit-outline" title="提示词" sub={promptsLine} dim={!prompts} onPress={() => router.push("/assistant-config/prompts")} />
+      <Divider />
+      <Row icon="puzzle-outline" title="插件中心" sub={pluginsLine} onPress={() => router.push("/assistant-config/plugins" as Href)} />
     </Card>
   );
 }

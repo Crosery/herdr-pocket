@@ -30,7 +30,7 @@ import {
 import { HcAdapter, type AppNames } from "./hc.ts";
 import { sendAndCaptureSlashCommand } from "./slashCapture.ts";
 import type { ScreenLines } from "./hcscreen.ts";
-import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, findPrograms, herdrCommandArgs, installedLaunchers, isHerdrWindowClosedError, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
+import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, createWorktreeFolder, findPrograms, herdrCommandArgs, installedLaunchers, isHerdrWindowClosedError, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { DirectServer, directAddrs, type DirectPeer } from "./direct.ts";
 import { WebRtcDirectServer } from "./webrtc.ts";
@@ -53,6 +53,7 @@ import { scanAgentSlashCommands } from "./slash.ts";
 import { askAgentBtw } from "./btw.ts";
 import { getAgentModels, setAgentModelAndThinking } from "./models.ts";
 import { getAgentUsageReport } from "./usage.ts";
+import { BrowserPluginError, getBrowserStatus, runBrowserAct, shutdownBrowserPluginCdp } from "./browserPlugin.ts";
 import { run } from "./util.ts";
 import { changedKeys } from "./configcmd.ts";
 import { VERSION, clientConfigPath, readClientConfig, type LoadedClientConfig } from "@herdr-pocket/update";
@@ -89,6 +90,7 @@ const MUTATING = new Set([
   "portal.open",
   "portal.input",
   "portal.close",
+  "browser.act",
 ]);
 
 const QUIET_READ_RPCS = new Set(["portal.frame", "terminal.read", "session.events", "terminal.putChunk"]);
@@ -566,6 +568,7 @@ export class Host {
     this.herdr.stop();
     this.uniflo.stop();
     this.portal.stop();
+    void shutdownBrowserPluginCdp();
     this.chunkedPut.dispose();
     this.direct.stop();
     this.webrtc.stop();
@@ -1806,6 +1809,16 @@ export class Host {
           }
         }
       }
+      const worktreeBranch = str(p.worktreeBranch, 120);
+      if (worktreeBranch) {
+        if (p.space) throw new RpcFailure("bad_request", "在已有空间里不能再创建独立 Git Worktree");
+        if (!folder) throw new RpcFailure("bad_request", "创建 Git Worktree 需要先指定仓库目录");
+        try {
+          folder = await createWorktreeFolder(folder, worktreeBranch);
+        } catch (e) {
+          throw new RpcFailure("bad_request", (e as Error).message);
+        }
+      }
       const task = str(p.task, 20_000);
       const r = await this.newTerminal(
         () =>
@@ -1831,6 +1844,7 @@ export class Host {
         space: r.space,
         ...(r.tab ? { tab: r.tab } : {}),
         terminal: r.terminal,
+        ...(folder ? { folder: shortHome(folder) ?? folder } : {}),
       };
       const refreshPostCreate = () =>
         Promise.all([this.hc.list(), this.refreshNames()])
@@ -2373,6 +2387,20 @@ export class Host {
         this.portal.observeSubmittedCommand(a, p.command, "terminal_input");
       }
       return { ok: true as const };
+    },
+    "browser.status": async () => {
+      return getBrowserStatus();
+    },
+    "browser.act": async (p) => {
+      this.writable();
+      try {
+        return await runBrowserAct(p);
+      } catch (err) {
+        if (err instanceof BrowserPluginError) {
+          throw new RpcFailure(err.code, err.message);
+        }
+        throw err;
+      }
     },
   };
 }

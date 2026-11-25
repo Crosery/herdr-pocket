@@ -698,11 +698,12 @@ export interface RpcMethods {
   };
   /**
    * Starts an agent: in a new tab of `space`, or (no `space`) in a new space
-   * named `spaceName` (empty: named after its folder). Shown at once in the desktop app.
+   * named `spaceName` (empty: named after its folder). Optional `worktreeBranch` creates an
+   * isolated Git worktree inside the repo before launching. Shown at once in the desktop app.
    */
   "agent.create": {
-    params: { space?: string; spaceName?: string; tabName?: string; folder?: string; launcher: string; task?: string };
-    result: { agent: string; space: string; tab?: string; terminal: string; task?: FirstTask; taskNote?: string };
+    params: { space?: string; spaceName?: string; tabName?: string; folder?: string; launcher: string; task?: string; worktreeBranch?: string };
+    result: { agent: string; space: string; tab?: string; terminal: string; task?: FirstTask; taskNote?: string; folder?: string };
   };
   "host.info": {
     params: Record<string, never>;
@@ -936,6 +937,77 @@ export interface RpcMethods {
     params: { agent: string; command: string };
     result: { ok: true };
   };
+  /** Optional zero-dependency AI Browser plugin status (disabled by default via `plugins.aiBrowser`). */
+  "browser.status": {
+    params: Record<string, never>;
+    result: {
+      enabled: boolean;
+      backend: "desktop" | "cdp" | "none";
+      spaces: BrowserSpaceSummary[];
+      activeSpaceId?: string;
+    };
+  };
+  /** Optional zero-dependency AI Browser plugin actions (`plugins.aiBrowser` must be enabled). */
+  "browser.act": {
+    params: {
+      spaceId?: string;
+      page?: string;
+      op: BrowserActOp;
+      url?: string;
+      target?: string;
+      value?: string;
+      key?: string;
+      deltaY?: number;
+      label?: string;
+      reason?: string;
+      keep?: string[];
+    };
+    result: {
+      ok: boolean;
+      spaceId: string;
+      page: string;
+      url?: string;
+      title?: string;
+      ownership: BrowserSpaceOwnership;
+      handoffReason?: string;
+      snapshot?: string;
+      note?: string;
+    };
+  };
+}
+
+export type BrowserSpaceOwnership = "user" | "agentWorking" | "agentHandoff";
+
+export type BrowserActOp =
+  | "open"
+  | "snapshot"
+  | "click"
+  | "dblclick"
+  | "hover"
+  | "fill"
+  | "select"
+  | "press"
+  | "scroll"
+  | "handoff"
+  | "resume"
+  | "finish";
+
+export interface BrowserSpacePageSummary {
+  label: string;
+  title: string;
+  url: string;
+  active?: boolean;
+}
+
+export interface BrowserSpaceSummary {
+  id: string;
+  name: string;
+  kind: "user" | "ai";
+  ownership: BrowserSpaceOwnership;
+  statusText?: string;
+  handoffReason?: string;
+  activePage?: string;
+  pages: BrowserSpacePageSummary[];
 }
 
 export type HostToolId = "app" | "herdr" | "hc" | "uniflo" | "hostd";
@@ -1489,8 +1561,22 @@ export interface RpcError {
  */
 export type AssistantConfirm = "never" | "always";
 
+export type AssistantPluginId = "browser" | "workspace" | "webfetch" | "webhooks";
+
+export interface AssistantWebhookTool {
+  id: string;
+  name: string;
+  description: string;
+  url: string;
+  secretHeader?: string;
+}
+
 export interface AssistantSettings {
   confirm: AssistantConfirm;
+  /** Optional Xiaoyang tool plugins, all disabled (false) by default for zero context overhead. */
+  plugins?: Partial<Record<AssistantPluginId, boolean>>;
+  /** User-configured HTTP POST webhook tools active when `plugins.webhooks` is enabled. */
+  webhooks?: AssistantWebhookTool[];
 }
 
 // ---- Assistant configuration: models, keys, voice and prompts, edited from any phone ----
@@ -2911,6 +2997,9 @@ export interface ClientConfig {
     fontWeight: number;
     cursorBlink: boolean;
   };
+  plugins: {
+    aiBrowser: boolean;
+  };
 }
 
 export type ConfigValue = boolean | number | string | string[];
@@ -2993,10 +3082,18 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "terminal.lineHeight", type: "integer", min: 100, max: 200, default: 115, usedBy: D, label: "终端行高（%）", doc: "Line height of the desktop terminal in percent." },
   { key: "terminal.fontWeight", type: "integer", min: 300, max: 700, default: 500, usedBy: D, label: "终端字重", doc: "Normal text weight of the desktop terminal (bold stays 700)." },
   { key: "terminal.cursorBlink", type: "boolean", default: true, usedBy: D, label: "终端光标闪烁", doc: "Blink the cursor in the desktop terminal." },
+  {
+    key: "plugins.aiBrowser",
+    type: "boolean",
+    default: false,
+    usedBy: ALL,
+    label: "AI 浏览器协作与虚拟光标",
+    doc: "Enable optional AI TaskSpaces, @ref snapshots, visible virtual cursor, status handoff bar, and zero-dependency CLI in the built-in browser (off by default).",
+  },
 ];
 
 /** The file's sections, in order. */
-export const CLIENT_CONFIG_SECTIONS = ["general", "update", "logging", "voiceInput", "browser", "files", "resources", "terminal"] as const;
+export const CLIENT_CONFIG_SECTIONS = ["general", "update", "logging", "voiceInput", "browser", "files", "resources", "terminal", "plugins"] as const;
 
 export interface ConfigProblem {
   /** `section.name`, a section, or "" for the whole file. */

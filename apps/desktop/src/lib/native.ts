@@ -64,6 +64,10 @@ export interface Rect {
 
 // Browser, cookie and voice wake shapes are in ./bridge.
 export type {
+  BrowserAiBridgePage,
+  BrowserAiBridgeSpace,
+  BrowserAiBridgeState,
+  BrowserAiCommand,
   BrowserEvent,
   CookieBrowser as BrowserFamily,
   CookieImportResult,
@@ -465,6 +469,16 @@ export const native = {
   onBrowserEvent: (cb: (e: BrowserEvent) => void): (() => void) => bridge.onBrowserEvent(cb),
   browserClearData: (): Promise<number> => bridge.browserClearData(),
   browserStoreKind: (): Promise<"persistent" | "session" | null> => bridge.browserStoreKind(),
+  browserAiState: (): Promise<bridge.BrowserAiBridgeState | null> => bridge.browserAiState(),
+  browserSyncSpaces: (spaces: bridge.BrowserAiBridgeSpace[], activeSpaceId: string | null): Promise<void> =>
+    bridge.browserSyncSpaces(spaces, activeSpaceId),
+  browserAiControl: (
+    spaceId: string,
+    action: "takeover" | "resume" | "handoff" | "close_space",
+    reason?: string,
+  ): Promise<void> => bridge.browserAiControl(spaceId, action, reason),
+  onBrowserAiState: (cb: (s: bridge.BrowserAiBridgeState) => void): (() => void) => bridge.onBrowserAiState(cb),
+  onBrowserAiCommand: (cb: (cmd: bridge.BrowserAiCommand) => void): (() => void) => bridge.onBrowserAiCommand(cb),
 
   // Cookie import (lib/bridge.ts) ------------------------------------------------
   cookieImportSupported: (): boolean => inTauri(),
