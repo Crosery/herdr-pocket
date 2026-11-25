@@ -381,6 +381,7 @@ pub fn status() -> Status {
             app_bundle_path: current_app_bundle().map(|p| p.to_string_lossy().into_owned()),
             notes: vec![
                 "屏幕录制：跨端窗口回传与本机浮窗预览时需要。".into(),
+                "辅助功能：跨端远控时向本机注入真实鼠标与键盘操作时需要。".into(),
                 "麦克风：与小羊实时语音通话和录制声纹时需要。".into(),
                 "输入监控：只用一个修饰键（如右 Option、Fn）做小羊唤醒快捷键时需要。".into(),
             ],

@@ -43,6 +43,7 @@ export interface DirectPeer {
   deviceId: string;
   send(frame: object): void;
   close(): void;
+  bufferedBytes?(): number;
 }
 
 export interface DirectServerOptions {
@@ -219,6 +220,7 @@ export class DirectServer {
         if (ws.readyState === WebSocket.OPEN) ws.send(cipher.seal(JSON.stringify(frame)), { binary: true });
       },
       close: () => ws.close(),
+      bufferedBytes: () => (ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0),
     };
     // Allow concurrent direct sockets from multiple tabs/windows on the same viewer (cap 8).
     const sameDevicePeers: WebSocket[] = [];

@@ -34,6 +34,8 @@ import {
   resolveBareTerminalFileLink,
 } from "../lib/terminalLinks";
 import { searchTerminalBuffer, type TerminalSearchMatch } from "../lib/terminalSearch";
+import { extractPromptCommandFromXterm, feedLocalCommandLineBuffer } from "../lib/terminalCommandExtract";
+export { extractPromptCommandFromXterm };
 import {
   endWorkspaceDrag,
   hasPaneDrag,
@@ -368,44 +370,6 @@ function centerScreenVerticalGap(hostEl: HTMLElement | null, term: XTerm): void 
   screen.style.marginTop = spare > 1 ? `${Math.floor(spare / 2)}px` : "";
 }
 
-const LOCAL_ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bO[\s\S]?|\x1b[\s\S]?/g;
-
-function feedLocalCommandLineBuffer(bufRef: { current: string }, raw: string): string[] {
-  const cleaned = raw.replace(LOCAL_ANSI_RE, "");
-  const out: string[] = [];
-  let chars = Array.from(bufRef.current);
-  for (const ch of cleaned) {
-    if (ch === "\r" || ch === "\n") {
-      const line = chars.join("").trim();
-      chars = [];
-      if (line) out.push(line);
-      continue;
-    }
-    if (ch === "\x03" || ch === "\x15") {
-      chars = [];
-      continue;
-    }
-    if (ch === "\x7f" || ch === "\x08") {
-      chars.pop();
-      continue;
-    }
-    if (ch === "\x17") {
-      while (chars.length && chars[chars.length - 1] === " ") chars.pop();
-      while (chars.length && chars[chars.length - 1] !== " ") chars.pop();
-      continue;
-    }
-    const code = ch.codePointAt(0) ?? 0;
-    if (code === 0x09) {
-      if (chars.length < 4096) chars.push(" ");
-      continue;
-    }
-    if (code < 0x20) continue;
-    if (chars.length < 4096) chars.push(ch);
-  }
-  bufRef.current = chars.slice(-4096).join("");
-  return out;
-}
-
 export function TerminalSurface({
   agent,
   active,
@@ -632,6 +596,22 @@ export function TerminalSurface({
         userScrollAdjustUntilRef.current = 0;
         snapTerminalViewportImmediate(term, true, 0);
       }
+      const screenCmd = /[\r\n]/.test(data) ? extractPromptCommandFromXterm(termRef.current) : "";
+      const collectSubmittedCommands = (rawBytes: string): string[] => {
+        const lines = feedLocalCommandLineBuffer(localCmdBufRef, rawBytes);
+        const out: string[] = [];
+        const seen = new Set<string>();
+        const add = (c: string) => {
+          const clean = c.trim();
+          if (!clean || seen.has(clean)) return;
+          seen.add(clean);
+          out.push(clean);
+        };
+        if (screenCmd) add(screenCmd);
+        for (const l of lines) add(l);
+        return out;
+      };
+
       const bpActive =
         bracketedPasteRef.current ||
         Boolean((term?.modes as { bracketedPasteMode?: boolean } | undefined)?.bracketedPasteMode);
@@ -645,8 +625,7 @@ export function TerminalSurface({
               await new Promise((r) => setTimeout(r, 4));
             }
           }
-          const lines = feedLocalCommandLineBuffer(localCmdBufRef, data);
-          for (const cmdLine of lines) {
+          for (const cmdLine of collectSubmittedCommands(data)) {
             void rpcCall(agent.deviceId, "portal.observeCommand", { agent: agent.key, command: cmdLine }).catch(() => {});
           }
           return;
@@ -654,6 +633,9 @@ export function TerminalSurface({
           // If local attach closed unexpectedly, clear and fall through to relay queue.
           if (localConnRef.current === localConnId) localConnRef.current = null;
         }
+      }
+      for (const cmdLine of collectSubmittedCommands(data)) {
+        void rpcCall(agent.deviceId, "portal.observeCommand", { agent: agent.key, command: cmdLine }).catch(() => {});
       }
       relayPendingRef.current.push(...chunks);
       if (relayFlushingRef.current) return;

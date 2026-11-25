@@ -654,6 +654,30 @@ export class TerminalInputLineTracker {
   }
 }
 
+const OMZ_PROMPT_PREFIX_RE =
+  /^.*?➜\s+(?:\S+\s+git:\([^)]+\)(?:\s+[✗×*!+])?\s+|(?:~(?:\/[^\s]*)?|\/[^\s]+|\.\.?)\s+)/u;
+const PROMPT_GLYPH_PREFIX_RE = /^.*?(?:→|❯|➜|λ)\s+/u;
+const STANDARD_PROMPT_PREFIX_RE = /^(?:\([^)]+\)\s+)?(?:[^$%#>\r\n]{0,64}[$%#>]\s+)/;
+
+/**
+ * Extracts an entered shell command from a rendered terminal prompt line by stripping ANSI escapes
+ * and Starship/Oh-My-Zsh/Powerlevel10k/bash/zsh/fish prompt prefixes.
+ */
+export function extractCommandFromTerminalScreenLine(rawLine: string): string {
+  const clean = rawLine.replace(ANSI_STRIP_RE, "").trimEnd();
+  if (!clean.trim()) return "";
+  let stripped = clean;
+  const glyphMatch = OMZ_PROMPT_PREFIX_RE.exec(clean) ?? PROMPT_GLYPH_PREFIX_RE.exec(clean);
+  if (glyphMatch) {
+    stripped = clean.slice(glyphMatch[0].length);
+  } else {
+    stripped = clean.replace(STANDARD_PROMPT_PREFIX_RE, "");
+  }
+  const cmd = stripped.trim();
+  if (!cmd || /^(?:→|❯|➜|λ|[$%#>])$/u.test(cmd)) return "";
+  return cmd;
+}
+
 export function hookFilePath(dir = stateDir()): string {
   return join(dir, "portal-hook.json");
 }

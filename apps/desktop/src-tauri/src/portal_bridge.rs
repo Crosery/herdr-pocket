@@ -1,7 +1,9 @@
 //! Local macOS portal execution bridge (`~/.local/state/herdr-pocket/desktop-portal.sock`).
 //!
 //! Spawns `hp-mac-portal-v3` directly from the signed `Herdr Pocket.app` bundle instead of the
-//! background `node` LaunchAgent so macOS TCC attributes Screen Recording to `Herdr Pocket.app`.
+//! background `node` LaunchAgent so macOS TCC attributes Screen Recording and Accessibility to
+//! `Herdr Pocket.app`. Also keeps persistent warm `serve` helpers and keep-alive Unix connections
+//! for low-latency 60 FPS capture and real-time pointer/keyboard injection.
 
 use tauri::AppHandle;
 
@@ -9,6 +11,7 @@ use tauri::AppHandle;
 mod mac {
     use crate::local_term::base64_encode;
     use crate::logging;
+    use crate::perm_companion;
     use crate::perms::{self, State};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
@@ -17,19 +20,23 @@ mod mac {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
+    use tauri::AppHandle;
 
     const SOCKET_NAME: &str = "desktop-portal.sock";
-    const MAX_REQ_BYTES: usize = 64 * 1024;
-    const MAX_ARGS: usize = 10;
+    const MAX_REQ_BYTES: usize = 256 * 1024;
+    const MAX_ARGS: usize = 12;
     const MAX_TIMEOUT_MS: u64 = 8000;
     const DEFAULT_TIMEOUT_MS: u64 = 4800;
 
     static RUNNING: AtomicBool = AtomicBool::new(false);
     static SOCK_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+    static CAPTURE_WORKER: OnceLock<Mutex<WorkerSlot>> = OnceLock::new();
+    static INPUT_WORKER: OnceLock<Mutex<WorkerSlot>> = OnceLock::new();
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -40,12 +47,41 @@ mod mac {
         timeout_ms: Option<u64>,
     }
 
-    #[derive(Debug, Serialize)]
+    #[derive(Debug, Default, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct BridgeResponse {
         code: i32,
         stdout_base64: String,
         stderr: String,
+        #[serde(default)]
+        keep_alive: bool,
+    }
+
+    type HelperSignature = (PathBuf, Option<SystemTime>, u64);
+
+    struct PersistentWorker {
+        sig: HelperSignature,
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl PersistentWorker {
+        fn stop(mut self) {
+            drop(self.stdin);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[derive(Default)]
+    struct WorkerSlot {
+        worker: Option<PersistentWorker>,
+        serve_unsupported_for: Option<HelperSignature>,
+    }
+
+    pub fn set_app_handle(app: &AppHandle) {
+        let _ = APP_HANDLE.set(app.clone());
     }
 
     pub(super) fn hostd_state_dir() -> Option<PathBuf> {
@@ -63,11 +99,20 @@ mod mac {
     pub(super) fn is_allowed_subcommand(cmd: &str) -> bool {
         matches!(
             cmd,
-            "check" | "list" | "capture" | "click" | "scroll" | "text" | "key"
+            "check"
+                | "list"
+                | "capture"
+                | "click"
+                | "scroll"
+                | "text"
+                | "key"
+                | "clipboard"
+                | "open_accessibility"
+                | "open_screen_recording"
         )
     }
 
-    fn verify_owned_helper(path: &Path) -> Result<(), String> {
+    fn verify_owned_helper(path: &Path) -> Result<HelperSignature, String> {
         let meta = fs::symlink_metadata(path).map_err(|e| format!("helper_missing:{e}"))?;
         if meta.file_type().is_symlink() || !meta.is_file() {
             return Err("helper_invalid_type".into());
@@ -76,7 +121,92 @@ mod mac {
         if meta.uid() != current_uid {
             return Err("helper_uid_mismatch".into());
         }
-        Ok(())
+        Ok((path.to_path_buf(), meta.modified().ok(), meta.len()))
+    }
+
+    fn spawn_worker(helper: &Path, sig: HelperSignature) -> Result<PersistentWorker, String> {
+        let mut child = Command::new(helper)
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("spawn_failed:{e}"))?;
+        let stdin = child.stdin.take().ok_or("worker_stdin_missing")?;
+        let stdout = child.stdout.take().ok_or("worker_stdout_missing")?;
+        Ok(PersistentWorker {
+            sig,
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    fn try_persistent_worker(
+        slot_cell: &OnceLock<Mutex<WorkerSlot>>,
+        helper: &Path,
+        args: &[String],
+    ) -> Result<Option<BridgeResponse>, String> {
+        let sig = verify_owned_helper(helper)?;
+        let cell = slot_cell.get_or_init(|| Mutex::new(WorkerSlot::default()));
+        let Ok(mut slot) = cell.lock() else {
+            return Ok(None);
+        };
+        if slot.serve_unsupported_for.as_ref() == Some(&sig) {
+            return Ok(None);
+        }
+
+        let need_respawn = match slot.worker.as_mut() {
+            Some(w) if w.sig == sig => matches!(w.child.try_wait(), Ok(Some(_)) | Err(_)),
+            _ => true,
+        };
+        if need_respawn {
+            if let Some(old) = slot.worker.take() {
+                old.stop();
+            }
+            match spawn_worker(helper, sig.clone()) {
+                Ok(w) => slot.worker = Some(w),
+                Err(_) => return Ok(None),
+            }
+        }
+
+        let Some(w) = slot.worker.as_mut() else {
+            return Ok(None);
+        };
+        let req_line = match serde_json::to_string(&json!({ "args": args })) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        if w.stdin.write_all(req_line.as_bytes()).is_err()
+            || w.stdin.write_all(b"\n").is_err()
+            || w.stdin.flush().is_err()
+        {
+            if let Some(old) = slot.worker.take() {
+                old.stop();
+            }
+            return Ok(None);
+        }
+
+        let mut resp_line = String::new();
+        match w.stdout.read_line(&mut resp_line) {
+            Ok(0) | Err(_) => {
+                if let Some(old) = slot.worker.take() {
+                    old.stop();
+                }
+                slot.serve_unsupported_for = Some(sig);
+                Ok(None)
+            }
+            Ok(_) => match serde_json::from_str::<BridgeResponse>(resp_line.trim()) {
+                Ok(resp) if resp.stderr != "unsupported_serve" => Ok(Some(resp)),
+                _ => {
+                    if let Some(old) = slot.worker.take() {
+                        old.stop();
+                    }
+                    slot.serve_unsupported_for = Some(sig);
+                    Ok(None)
+                }
+            },
+        }
     }
 
     fn run_helper_with_timeout(
@@ -84,7 +214,7 @@ mod mac {
         args: &[String],
         timeout: Duration,
     ) -> Result<BridgeResponse, String> {
-        verify_owned_helper(helper)?;
+        let _ = verify_owned_helper(helper)?;
         let mut child = Command::new(helper)
             .args(args)
             .stdin(Stdio::null())
@@ -124,9 +254,10 @@ mod mac {
                             code: -1,
                             stdout_base64: String::new(),
                             stderr: "helper_timeout".into(),
+                            keep_alive: false,
                         });
                     }
-                    std::thread::sleep(Duration::from_millis(12));
+                    std::thread::sleep(Duration::from_millis(8));
                 }
                 Err(e) => {
                     let _ = child.kill();
@@ -142,49 +273,72 @@ mod mac {
             code,
             stdout_base64: base64_encode(&stdout),
             stderr,
+            keep_alive: false,
         })
     }
 
     pub(super) fn handle_request_line(line: &str, helper_override: Option<&Path>) -> String {
-        let respond = |res: BridgeResponse| {
+        let respond = |mut res: BridgeResponse| {
+            res.keep_alive = true;
             serde_json::to_string(&res).unwrap_or_else(|_| {
-                "{\"code\":-1,\"stdoutBase64\":\"\",\"stderr\":\"encode_error\"}".into()
+                "{\"code\":-1,\"stdoutBase64\":\"\",\"stderr\":\"encode_error\",\"keepAlive\":true}".into()
             })
         };
 
         let Ok(req) = serde_json::from_str::<BridgeRequest>(line) else {
             return respond(BridgeResponse {
                 code: -1,
-                stdout_base64: String::new(),
                 stderr: "invalid_request".into(),
+                ..Default::default()
             });
         };
         if req.args.is_empty() || req.args.len() > MAX_ARGS {
             return respond(BridgeResponse {
                 code: -1,
-                stdout_base64: String::new(),
                 stderr: "invalid_args".into(),
+                ..Default::default()
             });
         }
         let cmd = req.args[0].as_str();
         if !is_allowed_subcommand(cmd) {
             return respond(BridgeResponse {
                 code: -1,
-                stdout_base64: String::new(),
                 stderr: "disallowed_command".into(),
+                ..Default::default()
             });
         }
 
         if cmd == "check" {
-            let allowed = perms::status().screen_recording == State::Granted;
-            let payload = format!(
-                "{{\"screenCapture\":{}}}",
-                if allowed { "true" } else { "false" }
-            );
+            let st = perms::status();
+            let payload = serde_json::to_string(&json!({
+                "screenCapture": st.screen_recording == State::Granted,
+                "accessibility": st.accessibility == State::Granted,
+                "bridgeVersion": 2
+            }))
+            .unwrap_or_else(|_| "{\"screenCapture\":false,\"accessibility\":false,\"bridgeVersion\":2}".into());
             return respond(BridgeResponse {
                 code: 0,
                 stdout_base64: base64_encode(payload.as_bytes()),
-                stderr: String::new(),
+                ..Default::default()
+            });
+        }
+
+        if cmd == "open_accessibility" || cmd == "open_screen_recording" {
+            let kind = if cmd == "open_accessibility" {
+                "accessibility"
+            } else {
+                "screenRecording"
+            };
+            let _ = perms::request(kind);
+            let _ = perms::open_settings(kind);
+            if let Some(app) = APP_HANDLE.get() {
+                perm_companion::show(app, kind);
+            }
+            let payload = format!("{{\"opened\":true,\"kind\":\"{kind}\"}}");
+            return respond(BridgeResponse {
+                code: 0,
+                stdout_base64: base64_encode(payload.as_bytes()),
+                ..Default::default()
             });
         }
 
@@ -194,10 +348,23 @@ mod mac {
         else {
             return respond(BridgeResponse {
                 code: -1,
-                stdout_base64: String::new(),
                 stderr: "helper_path_unavailable".into(),
+                ..Default::default()
             });
         };
+
+        // Bypass shared persistent worker slots when running unit tests with a custom override
+        // unless using normal helper lifecycle; wait: using worker slots works with helper_override
+        // too because sig includes helper PathBuf! Still keep dedicated capture vs input slots so
+        // frame capture never stalls mouse/keyboard injection.
+        let slot = if cmd == "capture" {
+            &CAPTURE_WORKER
+        } else {
+            &INPUT_WORKER
+        };
+        if let Ok(Some(resp)) = try_persistent_worker(slot, &helper, &req.args) {
+            return respond(resp);
+        }
 
         let timeout_ms = req
             .timeout_ms
@@ -207,31 +374,45 @@ mod mac {
             Ok(resp) => respond(resp),
             Err(err) => respond(BridgeResponse {
                 code: -1,
-                stdout_base64: String::new(),
                 stderr: err,
+                ..Default::default()
             }),
         }
     }
 
     fn handle_connection(stream: UnixStream) {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         let Ok(mut writer) = stream.try_clone() else {
             return;
         };
         let mut reader = BufReader::new(stream);
-        let mut raw = Vec::new();
-        let mut limited = (&mut reader).take((MAX_REQ_BYTES + 1) as u64);
-        if limited.read_until(b'\n', &mut raw).is_err() || raw.len() > MAX_REQ_BYTES {
-            return;
+        while RUNNING.load(Ordering::SeqCst) {
+            let mut raw = Vec::new();
+            let mut limited = (&mut reader).take((MAX_REQ_BYTES + 1) as u64);
+            match limited.read_until(b'\n', &mut raw) {
+                Ok(0) => break,
+                Ok(_) if raw.len() > MAX_REQ_BYTES => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&raw);
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let resp = handle_request_line(line.trim(), None);
+                    if writer.write_all(resp.as_bytes()).is_err()
+                        || writer.write_all(b"\n").is_err()
+                        || writer.flush().is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
-        let line = String::from_utf8_lossy(&raw);
-        let resp = handle_request_line(line.trim(), None);
-        let _ = writer.write_all(resp.as_bytes());
-        let _ = writer.write_all(b"\n");
     }
 
-    pub fn start() {
+    pub fn start(app: &AppHandle) {
+        set_app_handle(app);
         if RUNNING.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -240,7 +421,11 @@ mod mac {
             return;
         };
         if let Err(e) = fs::create_dir_all(&dir) {
-            logging::warn("portal_bridge", "failed to create state dir", json!({ "error": e.to_string() }));
+            logging::warn(
+                "portal_bridge",
+                "failed to create state dir",
+                json!({ "error": e.to_string() }),
+            );
             RUNNING.store(false, Ordering::SeqCst);
             return;
         }
@@ -297,10 +482,18 @@ mod mac {
         if !RUNNING.swap(false, Ordering::SeqCst) {
             return;
         }
+        for cell in [&CAPTURE_WORKER, &INPUT_WORKER] {
+            if let Some(m) = cell.get() {
+                if let Ok(mut slot) = m.lock() {
+                    if let Some(w) = slot.worker.take() {
+                        w.stop();
+                    }
+                }
+            }
+        }
         if let Some(cell) = SOCK_PATH.get() {
             if let Ok(mut slot) = cell.lock() {
                 if let Some(path) = slot.take() {
-                    // Poke listener once so accept() wakes up immediately, then remove socket file.
                     let _ = UnixStream::connect(&path);
                     let _ = fs::remove_file(path);
                 }
@@ -309,9 +502,11 @@ mod mac {
     }
 }
 
-pub fn start(_app: &AppHandle) {
+pub fn start(app: &AppHandle) {
     #[cfg(target_os = "macos")]
-    mac::start();
+    mac::start(app);
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 }
 
 pub fn shutdown() {
@@ -324,13 +519,26 @@ mod tests {
     use super::mac::{handle_request_line, is_allowed_subcommand};
     use crate::local_term::base64_decode;
     use serde_json::Value;
+    use std::fs::{self, Permissions};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn subcommand_allowlist_blocks_arbitrary_binaries() {
-        for ok in ["check", "list", "capture", "click", "scroll", "text", "key"] {
+        for ok in [
+            "check",
+            "list",
+            "capture",
+            "click",
+            "scroll",
+            "text",
+            "key",
+            "clipboard",
+            "open_accessibility",
+            "open_screen_recording",
+        ] {
             assert!(is_allowed_subcommand(ok), "{ok} should be allowed");
         }
-        for bad in ["", "rm", "/bin/sh", "eval", "../check", "CHECK"] {
+        for bad in ["", "rm", "/bin/sh", "eval", "../check", "CHECK", "serve"] {
             assert!(!is_allowed_subcommand(bad), "{bad} must be rejected");
         }
     }
@@ -354,5 +562,47 @@ mod tests {
         let decoded = base64_decode(chk["stdoutBase64"].as_str().unwrap().as_bytes()).unwrap();
         let parsed: Value = serde_json::from_slice(&decoded).unwrap();
         assert!(parsed["screenCapture"].is_boolean());
+        assert!(parsed["accessibility"].is_boolean());
+        assert_eq!(parsed["bridgeVersion"], 2);
+    }
+
+    #[test]
+    fn bridge_supports_persistent_serve_worker_and_fallback() {
+        let dir = std::env::temp_dir().join(format!("hp-bridge-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let serve_script = dir.join("mock-serve-helper.sh");
+        fs::write(
+            &serve_script,
+            "#!/bin/sh\nif [ \"$1\" = \"serve\" ]; then\n  while IFS= read -r line; do\n    echo '{\"code\":0,\"stdoutBase64\":\"W10=\",\"stderr\":\"warm\"}'\n  done\n  exit 0\nfi\necho '[]'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&serve_script, Permissions::from_mode(0o755)).unwrap();
+
+        let r1: Value = serde_json::from_str(&handle_request_line(
+            r#"{"args":["list"]}"#,
+            Some(&serve_script),
+        ))
+        .unwrap();
+        assert_eq!(r1["code"], 0);
+        assert_eq!(r1["stderr"], "warm");
+
+        let one_shot = dir.join("mock-oneshot-helper.sh");
+        fs::write(
+            &one_shot,
+            "#!/bin/sh\nif [ \"$1\" = \"serve\" ]; then\n  exit 0\nfi\nprintf '[]'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&one_shot, Permissions::from_mode(0o755)).unwrap();
+
+        let r2: Value = serde_json::from_str(&handle_request_line(
+            r#"{"args":["list"]}"#,
+            Some(&one_shot),
+        ))
+        .unwrap();
+        assert_eq!(r2["code"], 0);
+        let decoded = base64_decode(r2["stdoutBase64"].as_str().unwrap().as_bytes()).unwrap();
+        assert_eq!(String::from_utf8_lossy(&decoded), "[]");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

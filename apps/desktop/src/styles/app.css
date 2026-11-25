@@ -961,10 +961,10 @@ a {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 14px 16px;
+  padding: 16px 20px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .bubble-row {
@@ -991,10 +991,17 @@ a {
 }
 
 .bubble.user {
-  background: var(--primary);
-  color: var(--on-primary);
+  background: var(--accent-soft);
+  color: var(--ink);
+  border: 1px solid var(--line-pink);
   border-bottom-right-radius: 6px;
   white-space: pre-wrap;
+}
+
+:root[data-theme="dark"] .bubble.user {
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface-2));
+  border-color: color-mix(in srgb, var(--primary) 34%, var(--divider));
+  color: var(--ink);
 }
 
 .bubble.assistant {
@@ -1285,13 +1292,19 @@ a {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  margin: 8px 14px 12px;
+  margin: 0;
   padding: 10px 12px 8px;
-  border-radius: 20px;
-  background: var(--surface-2);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--surface-2));
+  backdrop-filter: blur(12px);
   border: 1px solid var(--divider);
+  box-shadow: 0 4px 20px rgba(36, 18, 30, 0.06);
   gap: 6px;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+:root[data-theme="dark"] .composer-card {
+  box-shadow: none;
 }
 
 .composer-card:focus-within {
@@ -1647,6 +1660,34 @@ a {
   padding: 20px 22px;
   box-shadow: var(--shadow-lg);
   z-index: 160;
+}
+
+.pk-dialog.is-immersive {
+  width: 98vw;
+  max-width: 98vw !important;
+  height: 96vh;
+  max-height: 96vh;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.pk-dialog.is-immersive .portal-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.portal-interactive-wrap.is-immersive {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.portal-interactive-wrap.is-immersive .portal-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
 }
 
 @media (max-width: 520px) {
@@ -5753,6 +5794,24 @@ a {
   overflow-wrap: anywhere;
 }
 
+.session-portal-pip-text {
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--divider);
+  font-size: calc(10.5px * var(--ts, 1));
+  line-height: 1.4;
+  color: var(--ink);
+  max-height: 98px;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 6;
+  -webkit-box-orient: vertical;
+}
+
 .session-portal-pip-card-act {
   display: flex;
   align-items: center;
@@ -5915,7 +5974,95 @@ a {
 .portal-interactive-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+}
+
+.portal-interactive-bar .pk-select-trigger {
+  max-width: 240px;
+  min-width: 0;
+}
+
+.portal-bar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.portal-mode-seg {
+  display: inline-flex;
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.portal-mode-btn {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.portal-mode-btn:hover {
+  color: var(--ink);
+}
+
+.portal-mode-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.portal-shortcut-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--divider);
+}
+
+.portal-shortcut-group {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.portal-mod-chip {
+  border: 1px solid var(--divider);
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.portal-mod-chip:hover {
+  color: var(--ink);
+  border-color: var(--line-pink);
+}
+
+.portal-mod-chip.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #ffffff;
+  font-weight: 600;
 }
 
 .portal-url-input {
@@ -5943,8 +6090,8 @@ a {
 .portal-stage {
   position: relative;
   flex: 1 1 auto;
-  min-height: 360px;
-  max-height: 54vh;
+  min-height: 380px;
+  max-height: 60vh;
   background: #100e14;
   border: 1px solid var(--divider);
   border-radius: 12px;
@@ -5953,7 +6100,8 @@ a {
   justify-content: center;
   overflow: hidden;
   outline: none;
-  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
 }
 
 .portal-stage:focus-visible {
@@ -5965,6 +6113,65 @@ a {
   height: 100%;
   object-fit: contain;
   user-select: none;
+}
+
+.portal-stage-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
+.portal-remote-cursor {
+  position: absolute;
+  pointer-events: none;
+  z-index: 4;
+  transform: translate(-4px, -2px);
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.45));
+}
+
+.portal-click-ripple {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid var(--primary);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 3;
+  animation: portalRippleOut 0.36s ease-out forwards;
+}
+
+.portal-click-ripple.is-right {
+  border-color: #38bdf8;
+}
+
+@keyframes portalRippleOut {
+  from {
+    opacity: 0.95;
+    transform: translate(-50%, -50%) scale(0.5);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1.65);
+  }
+}
+
+.portal-trackpad-bar {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--divider);
+  box-shadow: var(--shadow-sm);
 }
 
 .portal-stage-placeholder {

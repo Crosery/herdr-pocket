@@ -4,41 +4,56 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Camera,
   ChevronRight,
+  Clipboard,
+  ClipboardPaste,
   Columns2,
   Copy,
   ExternalLink,
+  Eye,
   FileCode2,
   Folder,
   FolderOpen,
   FolderSearch,
   Globe,
+  Hand,
+  Keyboard,
+  Maximize2,
+  Minimize2,
   Monitor,
+  MousePointer,
   MousePointerClick,
   RefreshCw,
   RotateCw,
+  ShieldAlert,
   Trash2,
+  X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
-import type { Agent, FileEntry, PortalItem, RemoteWindowInfo } from "@herdr-pocket/protocol";
+import type { Agent, FileEntry, PortalInputAction, PortalItem, RemoteWindowInfo } from "@herdr-pocket/protocol";
 import { FileViewer } from "../views/WorkbenchView";
-import { copyToClipboard, detectPlatform, isTauri, openExternalUrl } from "../lib/bridge";
+import { copyToClipboard, detectPlatform, isTauri, openExternalUrl, readFromClipboard } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { native } from "../lib/native";
 import {
   capturePortalFrameOnce,
   closePortalSurface,
   isLoopbackPortalUrl,
-  mapContainedPointer,
   openPortalSurface,
   portalStore,
   refreshHostPortals,
   sendPortalInput,
   subscribePortalFrames,
+  syncPortalClipboard,
+  updatePortalStreamConfig,
 } from "../lib/portalClient";
 import { ensureDirectLinkNow, rpcCall } from "../lib/relay";
 import { liveStore } from "../lib/store";
 import { openFileTab } from "../shell/shellStore";
 import { PocketButton, PocketIconButton, PocketInput, PocketModal, PocketSelect, useToast } from "./PocketUI";
+import { PortalRemoteStage, type RemoteControlMode, type StageStreamMetrics } from "./PortalRemoteStage";
 
 const SESSION_LABELS: Record<string, string> = {
   macos: "macOS ScreenCaptureKit",
@@ -50,6 +65,20 @@ const SESSION_LABELS: Record<string, string> = {
   "wayland-other": "Linux Wayland",
   headless: "Linux 无界面模式",
 };
+
+const QUALITY_PRESETS: Array<{ id: string; label: string; fps: number; maxWidth: number; quality: number }> = [
+  { id: "smooth", label: "流畅 · 30帧", fps: 30, maxWidth: 1080, quality: 58 },
+  { id: "hd30", label: "高清 · 30帧", fps: 30, maxWidth: 1440, quality: 72 },
+  { id: "hd60", label: "超清 · 60帧", fps: 60, maxWidth: 1600, quality: 78 },
+  { id: "raw60", label: "原画 · 60帧", fps: 60, maxWidth: 2560, quality: 92 },
+];
+
+const MOD_OPTIONS: Array<{ id: string; label: string }> = [
+  { id: "meta", label: "Cmd/Win" },
+  { id: "ctrl", label: "Ctrl" },
+  { id: "alt", label: "Opt/Alt" },
+  { id: "shift", label: "Shift" },
+];
 
 function RevealExplorer({
   item,
@@ -223,6 +252,7 @@ export function PortalViewerModal({
   const caps = portalStore.use((s) => s.capsByHost[hostId]);
   const windows = portalStore.use((s) => s.windowsByHost[hostId] ?? []);
   const directAddr = liveStore.use((s) => s.direct[hostId]);
+  const rttMs = liveStore.use((s) => s.rttMs);
 
   const item = activePortalId ? itemsById[activePortalId] : undefined;
   const frame = item ? framesById[item.id] : undefined;
@@ -237,6 +267,8 @@ export function PortalViewerModal({
       (permNoteMatch.test(item?.streamError ?? "") ||
         (!item && caps?.notes?.some((n) => permNoteMatch.test(n)))),
   );
+  const inputPermNote = caps?.inputPermissionNote;
+  const needsMacAccessPerm = Boolean(isMacDesktop && !isRemoteHost && inputPermNote);
 
   const [browserUrlInput, setBrowserUrlInput] = useState("http://127.0.0.1:3000");
   const [navUrlInput, setNavUrlInput] = useState("");
@@ -246,11 +278,44 @@ export function PortalViewerModal({
   const [retryingFrame, setRetryingFrame] = useState(false);
   const [waitingSlow, setWaitingSlow] = useState(false);
   const [keyBuffer, setKeyBuffer] = useState("");
-  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [controlMode, setControlMode] = useState<RemoteControlMode>(() =>
+    typeof window !== "undefined" && window.innerWidth < 720 ? "trackpad" : "pointer",
+  );
+  const [presetId, setPresetId] = useState<string>("hd60");
+  const [showRemoteCursor, setShowRemoteCursor] = useState(true);
+  const [shortcutOpen, setShortcutOpen] = useState(true);
+  const [immersive, setImmersive] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [latchedMods, setLatchedMods] = useState<string[]>([]);
+  const [metrics, setMetrics] = useState<StageStreamMetrics>({ fps: 0, kbps: 0 });
+  const [clipBusy, setClipBusy] = useState(false);
+
+  const DEFAULT_PRESET = { id: "hd60", label: "超清 · 60帧", fps: 60, maxWidth: 1600, quality: 78 };
+  const activePreset = QUALITY_PRESETS.find((p) => p.id === presetId) ?? DEFAULT_PRESET;
+  const streamCfgRef = useRef({
+    fps: activePreset.fps,
+    maxWidth: activePreset.maxWidth,
+    quality: activePreset.quality,
+    showCursor: showRemoteCursor,
+  });
+  streamCfgRef.current = {
+    fps: activePreset.fps,
+    maxWidth: activePreset.maxWidth,
+    quality: activePreset.quality,
+    showCursor: showRemoteCursor,
+  };
 
   useEffect(() => {
     if (item?.url) setNavUrlInput(item.url);
   }, [item?.id, item?.url]);
+
+  useEffect(() => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+    setLatchedMods([]);
+    setMetrics({ fps: 0, kbps: 0 });
+  }, [item?.id]);
 
   useEffect(() => {
     if (!open || !hostId) return;
@@ -274,24 +339,24 @@ export function PortalViewerModal({
 
   useEffect(() => {
     if (!open || !itemHostId || !itemId || !itemCanInteract) return;
-    return subscribePortalFrames(itemHostId, itemId, 12);
+    return subscribePortalFrames(itemHostId, itemId, streamCfgRef.current);
   }, [itemCanInteract, itemHostId, itemId, open]);
 
   useEffect(() => {
-    if (!open || !needsMacScreenPerm) return;
+    if (!open || (!needsMacScreenPerm && !needsMacAccessPerm)) return;
     const retryAfterGrant = async () => {
       const p = await native.getPermissions();
-      if (p?.screenRecording !== "granted") return;
+      if (p?.screenRecording !== "granted" && p?.accessibility !== "granted") return;
       void refreshHostPortals(hostId, agent?.key, true).catch(() => {});
       if (itemHostId && itemId) {
-        void capturePortalFrameOnce(itemHostId, itemId).catch(() => {});
+        void capturePortalFrameOnce(itemHostId, itemId, streamCfgRef.current).catch(() => {});
       }
     };
     const off = native.onPermissionsChanged((p) => {
-      if (p.screenRecording !== "granted") return;
+      if (p.screenRecording !== "granted" && p.accessibility !== "granted") return;
       void refreshHostPortals(hostId, agent?.key, true).catch(() => {});
       if (itemHostId && itemId) {
-        void capturePortalFrameOnce(itemHostId, itemId).catch(() => {});
+        void capturePortalFrameOnce(itemHostId, itemId, streamCfgRef.current).catch(() => {});
       }
     });
     const onFocus = () => {
@@ -302,7 +367,7 @@ export function PortalViewerModal({
       off();
       window.removeEventListener("focus", onFocus);
     };
-  }, [agent?.key, hostId, itemHostId, itemId, needsMacScreenPerm, open]);
+  }, [agent?.key, hostId, itemHostId, itemId, needsMacAccessPerm, needsMacScreenPerm, open]);
 
   const hostSessionItems = useMemo(
     () =>
@@ -367,32 +432,121 @@ export function PortalViewerModal({
     }
   };
 
-  const handlePointer = (action: "click" | "dblclick" | "down" | "up", clientX: number, clientY: number, button: "left" | "right" | "middle" = "left") => {
-    if (!item || !item.canInteract || !stageRef.current) return;
-    const rect = stageRef.current.getBoundingClientRect();
-    const { nx, ny } = mapContainedPointer({
-      clientX,
-      clientY,
-      rectLeft: rect.left,
-      rectTop: rect.top,
-      rectWidth: rect.width,
-      rectHeight: rect.height,
-      imageWidth: frame?.width ?? item.width,
-      imageHeight: frame?.height ?? item.height,
-    });
-    void sendPortalInput(item.hostId, item.id, { type: "pointer", action, nx, ny, button }).catch((e: Error) => {
-      toast(e.message || "远控点击失败", true);
+  const handleSendInput = (input: PortalInputAction) => {
+    if (!item || !item.canInteract) return;
+    void sendPortalInput(item.hostId, item.id, input).catch((e: Error) => {
+      if (input.type !== "pointer" || (input.action !== "move" && input.action !== "drag")) {
+        toast(e.message || "远控输入失败", true);
+      }
     });
   };
 
+  const handleSelectPreset = (nextId: string) => {
+    setPresetId(nextId);
+    const next = QUALITY_PRESETS.find((p) => p.id === nextId);
+    if (!next || !item || !item.canInteract) return;
+    void updatePortalStreamConfig(item.hostId, item.id, {
+      fps: next.fps,
+      maxWidth: next.maxWidth,
+      quality: next.quality,
+      showCursor: showRemoteCursor,
+    });
+  };
+
+  const handleToggleCursor = () => {
+    const next = !showRemoteCursor;
+    setShowRemoteCursor(next);
+    if (!item || !item.canInteract) return;
+    void updatePortalStreamConfig(item.hostId, item.id, { showCursor: next });
+  };
+
+  const handleToggleMod = (mod: string) => {
+    setLatchedMods((prev) => (prev.includes(mod) ? prev.filter((m) => m !== mod) : [...prev, mod]));
+  };
+
+  const sendShortcutKey = (key: string, fixedMods: string[] = []) => {
+    if (!item || !item.canInteract) return;
+    const mods = Array.from(new Set([...fixedMods, ...latchedMods]));
+    handleSendInput({
+      type: "key",
+      key,
+      action: "press",
+      ...(mods.length ? { modifiers: mods } : {}),
+    });
+    if (latchedMods.length) setLatchedMods([]);
+  };
+
+  const handlePushClipboard = async () => {
+    if (!item || clipBusy) return;
+    setClipBusy(true);
+    try {
+      const localText = (await readFromClipboard()) ?? keyBuffer;
+      if (!localText) {
+        toast("本机剪贴板为空，可先在下方输入文本再同步", true);
+        return;
+      }
+      await syncPortalClipboard(item.hostId, item.id, "set", localText);
+      toast(`已推送剪贴板到远端（${localText.length} 字符）`);
+    } catch (e) {
+      toast((e as Error).message || "推送剪贴板失败", true);
+    } finally {
+      setClipBusy(false);
+    }
+  };
+
+  const handlePullClipboard = async () => {
+    if (!item || clipBusy) return;
+    setClipBusy(true);
+    try {
+      const remoteText = await syncPortalClipboard(item.hostId, item.id, "get");
+      if (!remoteText) {
+        toast("远端剪贴板暂无文本内容");
+        return;
+      }
+      await copyToClipboard(remoteText).catch(() => false);
+      const preview = remoteText.replace(/\s+/g, " ").slice(0, 32);
+      toast(`已拉取远端剪贴板：${preview}${remoteText.length > 32 ? "…" : ""}`);
+    } catch (e) {
+      toast((e as Error).message || "拉取剪贴板失败", true);
+    } finally {
+      setClipBusy(false);
+    }
+  };
+
+  const handleScreenshot = () => {
+    if (!frame) return;
+    const a = document.createElement("a");
+    const ext = frame.mime === "image/jpeg" ? "jpg" : frame.mime === "image/webp" ? "webp" : "png";
+    a.href = `data:${frame.mime};base64,${frame.data}`;
+    a.download = `remote-${(item?.title || "capture").replace(/[^\w.-]+/g, "_")}.${ext}`;
+    a.click();
+    toast("已保存当前画面截图");
+  };
+
+  const handleRequestAccessibility = () => {
+    if (needsMacAccessPerm) {
+      void native.openPermissionSettings("accessibility", true);
+    }
+    if (item) {
+      void sendPortalInput(item.hostId, item.id, { type: "promptPermission", kind: "accessibility" }).catch(() => {});
+    }
+  };
+
   const sessionLabel = caps ? (SESSION_LABELS[caps.sessionType] ?? caps.sessionType) : "检测中";
+  const isRemoteMacHost = caps?.sessionType === "macos";
+  const primaryCopyMod = isRemoteMacHost ? ["meta"] : ["ctrl"];
   const transportLabel = directAddr || item?.transportHint === "p2p" ? "P2P 直连" : "中继传输";
 
   return (
     <PocketModal
       open={open}
-      onOpenChange={onOpenChange}
-      width={1020}
+      onOpenChange={(next) => {
+        if (!next) setImmersive(false);
+        onOpenChange(next);
+      }}
+      width={immersive ? 1920 : 1060}
+      className={immersive ? "is-immersive" : ""}
+      hideHeader={immersive}
       title={item ? item.title : "跨端窗口、浏览器与文件回传"}
       subtitle={
         item
@@ -512,6 +666,18 @@ export function PortalViewerModal({
                   ) : null}
                 </div>
               ) : null}
+              {inputPermNote ? (
+                <div className="inline-alert" style={{ marginBottom: 8, alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <ShieldAlert size={14} />
+                    <span>{inputPermNote}</span>
+                  </span>
+                  <PocketButton size="sm" variant="primary" onClick={handleRequestAccessibility}>
+                    <ExternalLink size={12} />
+                    <span>{needsMacAccessPerm ? "去授权辅助功能" : "触发远端辅助功能授权"}</span>
+                  </PocketButton>
+                </div>
+              ) : null}
               {windows.length === 0 ? (
                 <div className="faint" style={{ padding: "8px 0" }}>
                   {caps?.sessionType === "headless"
@@ -549,7 +715,7 @@ export function PortalViewerModal({
             </div>
           </div>
         ) : item.kind === "browser" || item.kind === "window" ? (
-          <div className="portal-interactive-wrap">
+          <div className={`portal-interactive-wrap${immersive ? " is-immersive" : ""}`}>
             <div className="portal-interactive-bar">
               {item.kind === "browser" ? (
                 <>
@@ -609,11 +775,7 @@ export function PortalViewerModal({
                           <ExternalLink size={12} />
                           <span>本机打开</span>
                         </PocketButton>
-                      ) : (
-                        <span className="portal-cap-pill" title="该地址仅运行在远端电脑本地回环网卡">
-                          远端本地端口
-                        </span>
-                      )}
+                      ) : null}
                     </>
                   ) : null}
                 </>
@@ -622,6 +784,7 @@ export function PortalViewerModal({
                   {windows.length > 0 ? (
                     <PocketSelect
                       size="sm"
+                      ariaLabel="切换远端显示器或窗口"
                       value={item.windowId || "screen:0"}
                       onValueChange={(nextWid) => {
                         const chosen = windows.find((w) => w.id === nextWid);
@@ -630,94 +793,257 @@ export function PortalViewerModal({
                       options={windows.map((w) => ({
                         value: w.id,
                         label: `${w.appName} · ${w.title}`,
+                        ...(w.bounds ? { badge: `${w.bounds.width}×${w.bounds.height}` } : {}),
                       }))}
                     />
-                  ) : null}
-                  <span className="portal-cap-pill">{sessionLabel}</span>
-                  <div className="grow" />
+                  ) : (
+                    <span className="portal-cap-pill truncate">{item.title}</span>
+                  )}
                 </>
               )}
-              <span className="portal-cap-pill accent">{transportLabel}</span>
-              <PocketIconButton
+
+              <div className="portal-mode-seg" role="group" aria-label="操控模式">
+                <button
+                  type="button"
+                  className={`portal-mode-btn${controlMode === "pointer" ? " active" : ""}`}
+                  onClick={() => setControlMode("pointer")}
+                  title="指针直控：移动同步、点击与拖拽直达目标"
+                >
+                  <MousePointer size={12} />
+                  <span>指针</span>
+                </button>
+                <button
+                  type="button"
+                  className={`portal-mode-btn${controlMode === "trackpad" ? " active" : ""}`}
+                  onClick={() => setControlMode("trackpad")}
+                  title="触控板模式：单指划动光标、双击拖拽、双指缩放"
+                >
+                  <Hand size={12} />
+                  <span>触控板</span>
+                </button>
+                <button
+                  type="button"
+                  className={`portal-mode-btn${controlMode === "view" ? " active" : ""}`}
+                  onClick={() => setControlMode("view")}
+                  title="仅观看：锁定远端输入，避免误触"
+                >
+                  <Eye size={12} />
+                  <span>只读</span>
+                </button>
+              </div>
+
+              <PocketSelect
                 size="sm"
-                tooltip="关闭此次回传"
-                onClick={() => {
-                  const closingId = item.id;
-                  onSelectPortalId(null);
-                  void closePortalSurface(item.hostId, closingId);
-                }}
-              >
-                <Trash2 size={13} />
-              </PocketIconButton>
+                ariaLabel="画面清晰度与帧率"
+                value={presetId}
+                onValueChange={handleSelectPreset}
+                options={QUALITY_PRESETS.map((p) => ({ value: p.id, label: p.label }))}
+              />
+
+              <span className="portal-cap-pill accent mono">
+                {transportLabel}
+                {metrics.fps > 0 ? ` · ${metrics.fps}fps` : ""}
+                {metrics.kbps > 0 ? ` · ${metrics.kbps}KB/s` : ""}
+                {typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}
+              </span>
+
+              <div className="portal-bar-actions">
+                <PocketIconButton
+                  size="sm"
+                  tooltip={showRemoteCursor ? "隐藏远端原生光标" : "显示远端原生光标"}
+                  active={showRemoteCursor}
+                  onClick={handleToggleCursor}
+                >
+                  <MousePointerClick size={13} />
+                </PocketIconButton>
+                <PocketIconButton
+                  size="sm"
+                  tooltip="缩小画面"
+                  disabled={zoom <= 1}
+                  onClick={() => {
+                    const next = Math.max(1, Math.round((zoom - 0.5) * 10) / 10);
+                    setZoom(next);
+                    if (next <= 1) setPan({ x: 0, y: 0 });
+                  }}
+                >
+                  <ZoomOut size={13} />
+                </PocketIconButton>
+                <PocketIconButton
+                  size="sm"
+                  tooltip={`放大画面（当前 ${Math.round(zoom * 100)}%）`}
+                  disabled={zoom >= 4}
+                  onClick={() => setZoom((z) => Math.min(4, Math.round((z + 0.5) * 10) / 10))}
+                >
+                  <ZoomIn size={13} />
+                </PocketIconButton>
+                <PocketIconButton
+                  size="sm"
+                  tooltip={shortcutOpen ? "收起快捷按键与剪贴板栏" : "展开快捷按键与剪贴板栏"}
+                  active={shortcutOpen}
+                  onClick={() => setShortcutOpen((v) => !v)}
+                >
+                  <Keyboard size={13} />
+                </PocketIconButton>
+                <PocketIconButton
+                  size="sm"
+                  tooltip="截图保存当前帧"
+                  disabled={!frame}
+                  onClick={handleScreenshot}
+                >
+                  <Camera size={13} />
+                </PocketIconButton>
+                <PocketIconButton
+                  size="sm"
+                  tooltip={immersive ? "退出全屏远控" : "沉浸全屏远控"}
+                  active={immersive}
+                  onClick={() => setImmersive((v) => !v)}
+                >
+                  {immersive ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                </PocketIconButton>
+                <PocketIconButton
+                  size="sm"
+                  tooltip="关闭此次回传"
+                  onClick={() => {
+                    const closingId = item.id;
+                    setImmersive(false);
+                    onSelectPortalId(null);
+                    void closePortalSurface(item.hostId, closingId);
+                  }}
+                >
+                  <Trash2 size={13} />
+                </PocketIconButton>
+                {immersive ? (
+                  <PocketIconButton
+                    size="sm"
+                    tooltip="退出远程窗口"
+                    onClick={() => {
+                      setImmersive(false);
+                      onOpenChange(false);
+                    }}
+                  >
+                    <X size={14} />
+                  </PocketIconButton>
+                ) : null}
+              </div>
             </div>
 
-            <div
-              ref={stageRef}
-              className="portal-stage"
-              tabIndex={0}
-              aria-label="远程交互画面，可点击、滚轮和键盘输入"
-              onClick={(e) => {
-                stageRef.current?.focus();
-                handlePointer("click", e.clientX, e.clientY, e.button === 2 ? "right" : "left");
-              }}
-              onDoubleClick={(e) => {
-                handlePointer("dblclick", e.clientX, e.clientY, "left");
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                handlePointer("click", e.clientX, e.clientY, "right");
-              }}
-              onWheel={(e) => {
-                if (!stageRef.current) return;
-                const rect = stageRef.current.getBoundingClientRect();
-                const { nx, ny } = mapContainedPointer({
-                  clientX: e.clientX,
-                  clientY: e.clientY,
-                  rectLeft: rect.left,
-                  rectTop: rect.top,
-                  rectWidth: rect.width,
-                  rectHeight: rect.height,
-                  imageWidth: frame?.width ?? item.width,
-                  imageHeight: frame?.height ?? item.height,
-                });
-                void sendPortalInput(item.hostId, item.id, {
-                  type: "wheel",
-                  nx,
-                  ny,
-                  deltaX: e.deltaX,
-                  deltaY: e.deltaY,
-                }).catch(() => {});
-              }}
-              onKeyDown={(e) => {
-                if (e.metaKey && e.key.toLowerCase() === "v") return;
-                e.preventDefault();
-                const mods: string[] = [];
-                if (e.metaKey) mods.push("meta");
-                if (e.ctrlKey) mods.push("ctrl");
-                if (e.altKey) mods.push("alt");
-                if (e.shiftKey) mods.push("shift");
-                if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
-                  void sendPortalInput(item.hostId, item.id, { type: "text", text: e.key }).catch(() => {});
-                } else {
-                  void sendPortalInput(item.hostId, item.id, { type: "key", key: e.key, modifiers: mods }).catch(() => {});
-                }
-              }}
-              onPaste={(e) => {
-                const clipText = e.clipboardData.getData("text/plain");
-                if (clipText) {
-                  e.preventDefault();
-                  void sendPortalInput(item.hostId, item.id, { type: "text", text: clipText }).catch(() => {});
-                }
-              }}
-            >
-              {frame ? (
-                <img
-                  src={`data:${frame.mime};base64,${frame.data}`}
-                  alt={item.title}
-                  className="portal-stage-img"
-                  draggable={false}
-                />
-              ) : (
+            {inputPermNote ? (
+              <div className="inline-alert" style={{ alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <ShieldAlert size={14} />
+                  <span>{inputPermNote}</span>
+                </span>
+                <PocketButton size="sm" variant="primary" onClick={handleRequestAccessibility}>
+                  <ExternalLink size={12} />
+                  <span>{needsMacAccessPerm ? "去授权辅助功能" : "触发远端辅助功能授权"}</span>
+                </PocketButton>
+              </div>
+            ) : null}
+
+            {shortcutOpen ? (
+              <div className="portal-shortcut-bar">
+                <div className="portal-shortcut-group">
+                  {MOD_OPTIONS.map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      className={`portal-mod-chip mono${latchedMods.includes(m.id) ? " active" : ""}`}
+                      onClick={() => handleToggleMod(m.id)}
+                      title="点击锁定修饰键（将在下次点击或按键后自动生效并释放）"
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="portal-shortcut-group">
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Escape")}>
+                    Esc
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Tab")}>
+                    Tab
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Backspace")}>
+                    退格
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("a", primaryCopyMod)}>
+                    全选
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("c", primaryCopyMod)}>
+                    复制
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("v", primaryCopyMod)}>
+                    粘贴
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("z", primaryCopyMod)}>
+                    撤销
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => sendShortcutKey("Tab", isRemoteMacHost ? ["meta"] : ["alt"])}
+                  >
+                    切换应用
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => sendShortcutKey("ArrowUp", isRemoteMacHost ? ["ctrl"] : ["meta"])}
+                  >
+                    调度中心
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("ArrowLeft")}>
+                    左
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("ArrowUp")}>
+                    上
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("ArrowDown")}>
+                    下
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("ArrowRight")}>
+                    右
+                  </PocketButton>
+                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Enter")}>
+                    回车
+                  </PocketButton>
+                </div>
+                <div className="portal-shortcut-group">
+                  <PocketButton
+                    size="sm"
+                    variant="soft"
+                    disabled={clipBusy}
+                    onClick={() => void handlePushClipboard()}
+                  >
+                    <ClipboardPaste size={12} />
+                    <span>推送剪贴板</span>
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="soft"
+                    disabled={clipBusy}
+                    onClick={() => void handlePullClipboard()}
+                  >
+                    <Clipboard size={12} />
+                    <span>拉取剪贴板</span>
+                  </PocketButton>
+                </div>
+              </div>
+            ) : null}
+
+            <PortalRemoteStage
+              item={item}
+              frame={frame}
+              controlMode={controlMode}
+              showRemoteCursor={showRemoteCursor}
+              zoom={zoom}
+              pan={pan}
+              onPanChange={setPan}
+              onZoomChange={setZoom}
+              latchedMods={latchedMods}
+              onConsumeLatchedMods={() => setLatchedMods([])}
+              onSendInput={handleSendInput}
+              onMetricsChange={setMetrics}
+              placeholder={
                 <div className="portal-stage-placeholder">
                   <MousePointerClick size={28} />
                   <div>
@@ -756,7 +1082,7 @@ export function PortalViewerModal({
                       disabled={retryingFrame}
                       onClick={() => {
                         setRetryingFrame(true);
-                        void capturePortalFrameOnce(item.hostId, item.id)
+                        void capturePortalFrameOnce(item.hostId, item.id, streamCfgRef.current)
                           .catch((e: Error) => toast(e.message || "重试捕获失败", true))
                           .finally(() => setRetryingFrame(false));
                       }}
@@ -772,8 +1098,8 @@ export function PortalViewerModal({
                     ) : null}
                   </div>
                 </div>
-              )}
-            </div>
+              }
+            />
 
             <div className="portal-quick-input-bar">
               <PocketInput

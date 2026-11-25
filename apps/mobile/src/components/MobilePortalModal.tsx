@@ -1,16 +1,20 @@
-import { useCallback, useEffect, useState } from "react";
-import { Image, Linking, Modal, Pressable, ScrollView, TextInput, View } from "react-native";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Image, Linking, Modal, PanResponder, Pressable, ScrollView, TextInput, View } from "react-native";
 import { Text } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import * as Clipboard from "expo-clipboard";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
+import Svg, { Path } from "react-native-svg";
 import {
   DIRECT_PORTAL_FS_PREFIX,
   type Agent,
   type FileEntry,
+  type HostPortalCapabilities,
   type PortalFramePayload,
   type PortalInputAction,
   type PortalItem,
   type PortalStreamEvent,
+  type RemoteWindowInfo,
 } from "@herdr-pocket/protocol";
 import { call, getDirectEndpoint, subscribe } from "../lib/relay";
 import { friendlyError } from "../lib/session";
@@ -19,6 +23,19 @@ import { fonts, radius, space } from "../theme/tokens";
 import { PocketButton, PocketSpinner } from "./pocket";
 import { Card, PageBackground } from "./ui";
 
+const MOBILE_PRESETS: Array<{ id: string; label: string; fps: number; maxWidth: number; quality: number }> = [
+  { id: "smooth", label: "流畅 30帧", fps: 30, maxWidth: 960, quality: 55 },
+  { id: "hd30", label: "高清 30帧", fps: 30, maxWidth: 1280, quality: 72 },
+  { id: "hd60", label: "超清 60帧", fps: 60, maxWidth: 1600, quality: 78 },
+];
+
+const MOBILE_MODS: Array<{ id: string; label: string }> = [
+  { id: "meta", label: "Cmd" },
+  { id: "ctrl", label: "Ctrl" },
+  { id: "alt", label: "Opt" },
+  { id: "shift", label: "Shift" },
+];
+
 function kindIcon(kind: PortalItem["kind"]): "web" | "monitor" | "folder-open-outline" | "file-document-outline" {
   if (kind === "browser") return "web";
   if (kind === "window") return "monitor";
@@ -26,16 +43,13 @@ function kindIcon(kind: PortalItem["kind"]): "web" | "monitor" | "folder-open-ou
   return "file-document-outline";
 }
 
-function mapContainedTap(opts: {
-  locationX: number;
-  locationY: number;
-  boxW: number;
-  boxH: number;
-  imgW?: number;
-  imgH?: number;
-}): { nx: number; ny: number } {
-  const { locationX, locationY, boxW, boxH, imgW, imgH } = opts;
-  if (boxW <= 0 || boxH <= 0) return { nx: 0.5, ny: 0.5 };
+function computeContainedBox(boxW: number, boxH: number, imgW?: number, imgH?: number): {
+  drawX: number;
+  drawY: number;
+  drawW: number;
+  drawH: number;
+} {
+  if (boxW <= 0 || boxH <= 0) return { drawX: 0, drawY: 0, drawW: 1, drawH: 1 };
   let drawX = 0;
   let drawY = 0;
   let drawW = boxW;
@@ -53,9 +67,43 @@ function mapContainedTap(opts: {
       drawY = (boxH - drawH) / 2;
     }
   }
+  return { drawX, drawY, drawW: Math.max(1, drawW), drawH: Math.max(1, drawH) };
+}
+
+function mapContainedTap(opts: {
+  locationX: number;
+  locationY: number;
+  boxW: number;
+  boxH: number;
+  imgW?: number;
+  imgH?: number;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
+}): { nx: number; ny: number } {
+  const { locationX, locationY, boxW, boxH, imgW, imgH, zoom = 1, panX = 0, panY = 0 } = opts;
+  const { drawX, drawY, drawW, drawH } = computeContainedBox(boxW, boxH, imgW, imgH);
+  const z = Math.max(1, zoom);
+  const ux = (locationX - boxW / 2 - panX) / z + boxW / 2;
+  const uy = (locationY - boxH / 2 - panY) / z + boxH / 2;
   return {
-    nx: Math.min(1, Math.max(0, (locationX - drawX) / Math.max(1, drawW))),
-    ny: Math.min(1, Math.max(0, (locationY - drawY) / Math.max(1, drawH))),
+    nx: Math.min(1, Math.max(0, (ux - drawX) / drawW)),
+    ny: Math.min(1, Math.max(0, (uy - drawY) / drawH)),
+  };
+}
+
+function stepMobileCursor(
+  cur: { nx: number; ny: number },
+  dx: number,
+  dy: number,
+  boxW: number,
+  boxH: number,
+): { nx: number; ny: number } {
+  const speed = Math.hypot(dx, dy);
+  const gain = speed > 14 ? 1.85 : speed > 5 ? 1.35 : 1.05;
+  return {
+    nx: Math.min(1, Math.max(0, cur.nx + (dx * gain) / Math.max(180, boxW))),
+    ny: Math.min(1, Math.max(0, cur.ny + (dy * gain) / Math.max(140, boxH))),
   };
 }
 
@@ -215,6 +263,18 @@ export function MobilePortalModal({
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // UU-style remote controls
+  const [windows, setWindows] = useState<RemoteWindowInfo[]>([]);
+  const [caps, setCaps] = useState<HostPortalCapabilities | null>(null);
+  const [controlMode, setControlMode] = useState<"trackpad" | "touch" | "view">("trackpad");
+  const [presetId, setPresetId] = useState<string>("hd30");
+  const [zoom, setZoom] = useState<1 | 2>(1);
+  const [cursorNxNy, setCursorNxNy] = useState<{ nx: number; ny: number }>({ nx: 0.5, ny: 0.5 });
+  const [dragLocked, setDragLocked] = useState(false);
+  const [stageTouching, setStageTouching] = useState(false);
+  const [latchedMods, setLatchedMods] = useState<string[]>([]);
+  const [clipInfo, setClipInfo] = useState<string | null>(null);
+
   // Reveal / file preview state
   const [dirPath, setDirPath] = useState(agent.cwd || "~");
   const [parentDir, setParentDir] = useState<string | null>(null);
@@ -230,19 +290,51 @@ export function MobilePortalModal({
     else if (!selectedId || !items.some((x) => x.id === selectedId)) setSelectedId(items[0]?.id ?? null);
   }, [initialItem, items, selectedId, visible]);
 
+  useEffect(() => {
+    if (!visible) return;
+    let alive = true;
+    void call(agent.deviceId, "portal.list", { agent: agent.key, includeWindows: true })
+      .then((res) => {
+        if (!alive) return;
+        setWindows(res.windows ?? []);
+        setCaps(res.capabilities ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [agent.deviceId, agent.key, visible]);
+
   const baseActive = items.find((x) => x.id === selectedId) ?? items[0] ?? null;
   const active = baseActive && itemPatch && itemPatch.id === baseActive.id ? itemPatch : baseActive;
+
+  const activePreset = MOBILE_PRESETS.find((x) => x.id === presetId) ?? MOBILE_PRESETS[1]!;
+  const presetRef = useRef(activePreset);
+  presetRef.current = activePreset;
 
   const fetchFrameOnce = useCallback(async () => {
     if (!active) return;
     try {
-      const res = await call(agent.deviceId, "portal.frame", { portalId: active.id }, 12_000);
+      const cfg = presetRef.current;
+      const res = await call(
+        agent.deviceId,
+        "portal.frame",
+        { portalId: active.id, maxWidth: cfg.maxWidth, quality: cfg.quality, showCursor: true },
+        12_000,
+      );
       if (res.item) setItemPatch(res.item);
       if (res.frame) setFrame(res.frame);
     } catch (e) {
       setErr(friendlyError(e));
     }
   }, [active, agent.deviceId]);
+
+  useEffect(() => {
+    setDragLocked(false);
+    setLatchedMods([]);
+    setClipInfo(null);
+    setZoom(1);
+  }, [active?.id]);
 
   useEffect(() => {
     if (!visible || !active) return;
@@ -254,22 +346,33 @@ export function MobilePortalModal({
       return;
     }
     let alive = true;
-    void call(agent.deviceId, "portal.frame", { portalId: active.id }, 12_000)
+    const cfg = presetRef.current;
+    void call(
+      agent.deviceId,
+      "portal.frame",
+      { portalId: active.id, maxWidth: cfg.maxWidth, quality: cfg.quality, showCursor: true },
+      12_000,
+    )
       .then((res) => {
         if (!alive) return;
         if (res.item) setItemPatch(res.item);
         if (res.frame) setFrame(res.frame);
       })
       .catch(() => {});
-    const unsub = subscribe(agent.deviceId, "portal", { portalId: active.id, fps: 10 }, (raw) => {
-      const ev = raw as Partial<PortalStreamEvent>;
-      if (!alive || !ev) return;
-      if (ev.kind === "portal_event" && ev.item && ev.item.id === active.id) {
-        setItemPatch(ev.item);
-      } else if (ev.kind === "portal_frame" && ev.portalId === active.id && ev.data) {
-        setFrame(ev as PortalFramePayload);
-      }
-    });
+    const unsub = subscribe(
+      agent.deviceId,
+      "portal",
+      { portalId: active.id, fps: cfg.fps, maxWidth: cfg.maxWidth, quality: cfg.quality, showCursor: true },
+      (raw) => {
+        const ev = raw as Partial<PortalStreamEvent>;
+        if (!alive || !ev) return;
+        if (ev.kind === "portal_event" && ev.item && ev.item.id === active.id) {
+          setItemPatch(ev.item);
+        } else if (ev.kind === "portal_frame" && ev.portalId === active.id && ev.data) {
+          setFrame(ev as PortalFramePayload);
+        }
+      },
+    );
     return () => {
       alive = false;
       unsub();
@@ -327,27 +430,31 @@ export function MobilePortalModal({
   }, [active?.id, active?.kind, active?.parentDir, active?.targetPath, agent.cwd, agent.deviceId, agent.key, loadPreviewFile, visible]);
 
   const sendInput = useCallback(
-    async (input: PortalInputAction) => {
-      if (!active) return;
+    async (input: PortalInputAction): Promise<{ clipboardText?: string } | null> => {
+      if (!active) return null;
       try {
         const res = await call(agent.deviceId, "portal.input", { portalId: active.id, input }, 10_000);
         if (res.url) setUrlInput(res.url);
+        return res;
       } catch (e) {
-        setErr(friendlyError(e));
+        if (input.type !== "pointer" || (input.action !== "move" && input.action !== "drag")) {
+          setErr(friendlyError(e));
+        }
+        return null;
       }
     },
     [active, agent.deviceId],
   );
 
   const openNew = useCallback(
-    async (kind: "browser" | "window", target?: string) => {
+    async (kind: "browser" | "window", target?: string, customTitle?: string) => {
       setBusy(true);
       setErr(null);
       try {
         const res = await call(agent.deviceId, "portal.open", {
           agent: agent.key,
           kind,
-          ...(kind === "browser" ? { url: target } : { windowId: "screen:0" }),
+          ...(kind === "browser" ? { url: target } : { windowId: target || "screen:0", ...(customTitle ? { title: customTitle } : {}) }),
         });
         setSelectedId(res.item.id);
         onChanged();
@@ -371,6 +478,164 @@ export function MobilePortalModal({
     setSelectedId(null);
     onChanged();
   }, [active, agent.deviceId, onChanged]);
+
+  const toggleMod = (mod: string) => {
+    setLatchedMods((prev) => (prev.includes(mod) ? prev.filter((x) => x !== mod) : [...prev, mod]));
+  };
+
+  const sendQuickKey = (key: string, fixedMods: string[] = []) => {
+    const mods = Array.from(new Set([...fixedMods, ...latchedMods]));
+    void sendInput({
+      type: "key",
+      key,
+      action: "press",
+      ...(mods.length ? { modifiers: mods } : {}),
+    });
+    if (latchedMods.length) setLatchedMods([]);
+  };
+
+  const handleToggleDragLock = () => {
+    const next = !dragLocked;
+    setDragLocked(next);
+    void sendInput({
+      type: "pointer",
+      action: next ? "down" : "up",
+      nx: cursorNxNy.nx,
+      ny: cursorNxNy.ny,
+      button: "left",
+    });
+  };
+
+  const handleSelectPreset = (nextId: string) => {
+    setPresetId(nextId);
+    const next = MOBILE_PRESETS.find((x) => x.id === nextId);
+    if (!next || !active) return;
+    void sendInput({
+      type: "config",
+      fps: next.fps,
+      maxWidth: next.maxWidth,
+      quality: next.quality,
+      showCursor: true,
+    });
+  };
+
+  const handlePushClipboard = async () => {
+    try {
+      const local = (await Clipboard.getStringAsync()) || textInput;
+      if (!local) {
+        setClipInfo("本机剪贴板为空，可先输入文字后再同步");
+        return;
+      }
+      await sendInput({ type: "clipboard", action: "set", text: local });
+      setClipInfo(`已同步到远端剪贴板（${local.length} 字符）`);
+    } catch (e) {
+      setErr(friendlyError(e));
+    }
+  };
+
+  const handlePullClipboard = async () => {
+    try {
+      const res = await sendInput({ type: "clipboard", action: "get" });
+      const txt = res?.clipboardText;
+      if (!txt) {
+        setClipInfo("远端剪贴板暂无文本内容");
+        return;
+      }
+      await Clipboard.setStringAsync(txt);
+      const preview = txt.replace(/\s+/g, " ").slice(0, 28);
+      setClipInfo(`已拉取远端剪贴板：${preview}${txt.length > 28 ? "…" : ""}`);
+    } catch (e) {
+      setErr(friendlyError(e));
+    }
+  };
+
+  // Refs so PanResponder always accesses fresh coordinates & settings without recreating responder per move.
+  const controlModeRef = useRef(controlMode);
+  controlModeRef.current = controlMode;
+  const cursorRef = useRef(cursorNxNy);
+  cursorRef.current = cursorNxNy;
+  const boxSizeRef = useRef(boxSize);
+  boxSizeRef.current = boxSize;
+  const dragLockRef = useRef(dragLocked);
+  dragLockRef.current = dragLocked;
+  const latchedModsRef = useRef(latchedMods);
+  latchedModsRef.current = latchedMods;
+  const sendInputRef = useRef(sendInput);
+  sendInputRef.current = sendInput;
+  const panStateRef = useRef({ prevDx: 0, prevDy: 0, downAt: 0, movedPx: 0, lastSentAt: 0 });
+
+  const trackpadResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => controlModeRef.current === "trackpad",
+        onMoveShouldSetPanResponder: () => controlModeRef.current === "trackpad",
+        onPanResponderTerminationRequest: () => false,
+        onPanResponderGrant: () => {
+          setStageTouching(true);
+          panStateRef.current = { prevDx: 0, prevDy: 0, downAt: Date.now(), movedPx: 0, lastSentAt: 0 };
+        },
+        onPanResponderMove: (_evt, g) => {
+          const st = panStateRef.current;
+          const ddx = g.dx - st.prevDx;
+          const ddy = g.dy - st.prevDy;
+          st.prevDx = g.dx;
+          st.prevDy = g.dy;
+          st.movedPx += Math.hypot(ddx, ddy);
+          const next = stepMobileCursor(cursorRef.current, ddx, ddy, boxSizeRef.current.width, boxSizeRef.current.height);
+          cursorRef.current = next;
+          setCursorNxNy(next);
+          const now = Date.now();
+          if (now - st.lastSentAt >= 28) {
+            st.lastSentAt = now;
+            void sendInputRef.current({
+              type: "pointer",
+              action: dragLockRef.current ? "drag" : "move",
+              nx: next.nx,
+              ny: next.ny,
+              button: "left",
+            });
+          }
+        },
+        onPanResponderRelease: (_evt, g) => {
+          setStageTouching(false);
+          const st = panStateRef.current;
+          const dt = Date.now() - st.downAt;
+          const pt = cursorRef.current;
+          if (Math.hypot(g.dx, g.dy) < 8 && st.movedPx < 10 && dt < 260) {
+            const mods = latchedModsRef.current;
+            void sendInputRef.current({
+              type: "pointer",
+              action: "click",
+              nx: pt.nx,
+              ny: pt.ny,
+              button: "left",
+              ...(mods.length ? { modifiers: mods } : {}),
+            });
+            if (mods.length) setLatchedMods([]);
+          } else {
+            void sendInputRef.current({
+              type: "pointer",
+              action: dragLockRef.current ? "drag" : "move",
+              nx: pt.nx,
+              ny: pt.ny,
+              button: "left",
+            });
+          }
+        },
+        onPanResponderTerminate: () => {
+          setStageTouching(false);
+        },
+      }),
+    [],
+  );
+
+  const containedBox = computeContainedBox(boxSize.width, boxSize.height, frame?.width, frame?.height);
+  const panOffsetX = zoom > 1 ? Math.max(-containedBox.drawW * 0.45, Math.min(containedBox.drawW * 0.45, (0.5 - cursorNxNy.nx) * containedBox.drawW * 0.8)) : 0;
+  const panOffsetY = zoom > 1 ? Math.max(-containedBox.drawH * 0.45, Math.min(containedBox.drawH * 0.45, (0.5 - cursorNxNy.ny) * containedBox.drawH * 0.8)) : 0;
+  const cursorBoxX = boxSize.width / 2 + panOffsetX + (containedBox.drawX + cursorNxNy.nx * containedBox.drawW - boxSize.width / 2) * zoom;
+  const cursorBoxY = boxSize.height / 2 + panOffsetY + (containedBox.drawY + cursorNxNy.ny * containedBox.drawH - boxSize.height / 2) * zoom;
+  const isRemoteMac = caps?.sessionType === "macos";
+  const primaryCopyMod = isRemoteMac ? ["meta"] : ["ctrl"];
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="fullScreen" onRequestClose={onDismiss}>
@@ -418,7 +683,10 @@ export function MobilePortalModal({
           </Pressable>
         </View>
 
-        <ScrollView contentContainerStyle={{ padding: space.lg, paddingBottom: insets.bottom + space.xxl, gap: space.md }}>
+        <ScrollView
+          scrollEnabled={!stageTouching}
+          contentContainerStyle={{ padding: space.lg, paddingBottom: insets.bottom + space.xxl, gap: space.md }}
+        >
           {items.length > 0 ? (
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.sm }}>
               {items.map((it) => {
@@ -447,6 +715,20 @@ export function MobilePortalModal({
                 );
               })}
             </ScrollView>
+          ) : null}
+
+          {caps?.inputPermissionNote ? (
+            <Card style={{ padding: space.md, backgroundColor: p.accentContainer, gap: space.xs }}>
+              <Text style={{ color: p.ink, fontSize: 12.5 }}>{caps.inputPermissionNote}</Text>
+              <View style={{ flexDirection: "row" }}>
+                <PocketButton
+                  size="sm"
+                  onPress={() => void sendInput({ type: "promptPermission", kind: "accessibility" })}
+                >
+                  触发远端辅助功能授权
+                </PocketButton>
+              </View>
+            </Card>
           ) : null}
 
           {err ? (
@@ -486,27 +768,101 @@ export function MobilePortalModal({
                     前往
                   </PocketButton>
                 </View>
+              ) : windows.length > 0 ? (
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.xs }}>
+                  {windows.map((w) => {
+                    const selected = (active.windowId || "screen:0") === w.id;
+                    return (
+                      <Pressable
+                        key={w.id}
+                        onPress={() => void openNew("window", w.id, `${w.appName} · ${w.title}`)}
+                        style={{
+                          paddingHorizontal: 10,
+                          paddingVertical: 6,
+                          borderRadius: radius.pill,
+                          backgroundColor: selected ? p.accentContainer : p.surface,
+                          borderWidth: 1,
+                          borderColor: selected ? p.primary : p.divider,
+                        }}
+                      >
+                        <Text numberOfLines={1} style={{ fontSize: 12, color: selected ? p.accentText : p.ink, fontFamily: selected ? fonts.bodyBold : undefined }}>
+                          {w.appName} · {w.title}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
               ) : null}
 
-              <Pressable
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.xs, alignItems: "center" }}>
+                {(
+                  [
+                    { id: "trackpad", label: "触控板" },
+                    { id: "touch", label: "直点" },
+                    { id: "view", label: "只读" },
+                  ] as const
+                ).map((m) => {
+                  const sel = controlMode === m.id;
+                  return (
+                    <Pressable
+                      key={m.id}
+                      onPress={() => setControlMode(m.id)}
+                      style={{
+                        paddingHorizontal: 10,
+                        paddingVertical: 6,
+                        borderRadius: radius.pill,
+                        backgroundColor: sel ? p.primary : p.surface2,
+                        borderWidth: 1,
+                        borderColor: sel ? p.primary : p.divider,
+                      }}
+                    >
+                      <Text style={{ fontSize: 12, fontFamily: fonts.bodyBold, color: sel ? p.onPrimary : p.ink }}>{m.label}</Text>
+                    </Pressable>
+                  );
+                })}
+                {MOBILE_PRESETS.map((pr) => {
+                  const sel = presetId === pr.id;
+                  return (
+                    <Pressable
+                      key={pr.id}
+                      onPress={() => handleSelectPreset(pr.id)}
+                      style={{
+                        paddingHorizontal: 10,
+                        paddingVertical: 6,
+                        borderRadius: radius.pill,
+                        backgroundColor: sel ? p.accentContainer : p.surface,
+                        borderWidth: 1,
+                        borderColor: sel ? p.primary : p.divider,
+                      }}
+                    >
+                      <Text style={{ fontSize: 11.5, color: sel ? p.accentText : p.muted }}>{pr.label}</Text>
+                    </Pressable>
+                  );
+                })}
+                <Pressable
+                  onPress={() => setZoom((z) => (z === 1 ? 2 : 1))}
+                  style={{
+                    paddingHorizontal: 10,
+                    paddingVertical: 6,
+                    borderRadius: radius.pill,
+                    backgroundColor: zoom === 2 ? p.accentContainer : p.surface,
+                    borderWidth: 1,
+                    borderColor: zoom === 2 ? p.primary : p.divider,
+                  }}
+                >
+                  <Text style={{ fontSize: 11.5, fontFamily: fonts.mono, color: zoom === 2 ? p.accentText : p.ink }}>{zoom}x</Text>
+                </Pressable>
+              </ScrollView>
+
+              <View
                 onLayout={(e) => {
                   const { width, height } = e.nativeEvent.layout;
                   setBoxSize({ width, height });
                 }}
-                onPress={(e) => {
-                  const { nx, ny } = mapContainedTap({
-                    locationX: e.nativeEvent.locationX,
-                    locationY: e.nativeEvent.locationY,
-                    boxW: boxSize.width,
-                    boxH: boxSize.height,
-                    imgW: frame?.width,
-                    imgH: frame?.height,
-                  });
-                  void sendInput({ type: "pointer", action: "click", nx, ny, button: "left" });
-                }}
+                {...(controlMode === "trackpad" ? trackpadResponder.panHandlers : {})}
                 style={{
                   width: "100%",
-                  height: 300,
+                  height: 320,
                   borderRadius: radius.card,
                   overflow: "hidden",
                   backgroundColor: p.surface2,
@@ -517,11 +873,65 @@ export function MobilePortalModal({
                 }}
               >
                 {frame ? (
-                  <Image
-                    source={{ uri: `data:${frame.mime};base64,${frame.data}` }}
-                    resizeMode="contain"
-                    style={{ width: "100%", height: "100%" }}
-                  />
+                  <Pressable
+                    disabled={controlMode !== "touch"}
+                    onPress={(e) => {
+                      if (controlMode !== "touch") return;
+                      const pt = mapContainedTap({
+                        locationX: e.nativeEvent.locationX,
+                        locationY: e.nativeEvent.locationY,
+                        boxW: boxSize.width,
+                        boxH: boxSize.height,
+                        imgW: frame.width,
+                        imgH: frame.height,
+                        zoom,
+                        panX: panOffsetX,
+                        panY: panOffsetY,
+                      });
+                      setCursorNxNy(pt);
+                      const mods = latchedMods;
+                      void sendInput({
+                        type: "pointer",
+                        action: "click",
+                        nx: pt.nx,
+                        ny: pt.ny,
+                        button: "left",
+                        ...(mods.length ? { modifiers: mods } : {}),
+                      });
+                      if (mods.length) setLatchedMods([]);
+                    }}
+                    style={{ width: "100%", height: "100%", position: "relative" }}
+                  >
+                    <Image
+                      source={{ uri: `data:${frame.mime};base64,${frame.data}` }}
+                      resizeMode="contain"
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        transform: [{ translateX: panOffsetX }, { translateY: panOffsetY }, { scale: zoom }],
+                      }}
+                    />
+                    {controlMode === "trackpad" ? (
+                      <View
+                        pointerEvents="none"
+                        style={{
+                          position: "absolute",
+                          left: Math.max(0, Math.min(boxSize.width - 18, cursorBoxX)),
+                          top: Math.max(0, Math.min(boxSize.height - 18, cursorBoxY)),
+                        }}
+                      >
+                        <Svg width={20} height={20} viewBox="0 0 24 24" fill="none">
+                          <Path
+                            d="M5 3L19 12.2L12.1 13.7L8.6 20L5 3Z"
+                            fill="#FFFFFF"
+                            stroke="#18121E"
+                            strokeWidth={2}
+                            strokeLinejoin="round"
+                          />
+                        </Svg>
+                      </View>
+                    ) : null}
+                  </Pressable>
                 ) : active.streamError ? (
                   <View style={{ alignItems: "center", gap: space.sm, paddingHorizontal: space.lg }}>
                     <Text style={{ color: p.error, fontSize: 13, fontFamily: fonts.bodyBold, textAlign: "center" }}>
@@ -538,7 +948,123 @@ export function MobilePortalModal({
                     <Text style={{ color: p.muted, fontSize: 13 }}>正在等待远端画面…</Text>
                   </View>
                 )}
-              </Pressable>
+              </View>
+
+              {controlMode !== "view" ? (
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.xs }}>
+                  <PocketButton
+                    size="sm"
+                    variant="soft"
+                    onPress={() => {
+                      void sendInput({
+                        type: "pointer",
+                        action: "click",
+                        nx: cursorNxNy.nx,
+                        ny: cursorNxNy.ny,
+                        button: "left",
+                        ...(latchedMods.length ? { modifiers: latchedMods } : {}),
+                      });
+                      if (latchedMods.length) setLatchedMods([]);
+                    }}
+                  >
+                    左键
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="soft"
+                    onPress={() => {
+                      void sendInput({
+                        type: "pointer",
+                        action: "click",
+                        nx: cursorNxNy.nx,
+                        ny: cursorNxNy.ny,
+                        button: "right",
+                        ...(latchedMods.length ? { modifiers: latchedMods } : {}),
+                      });
+                      if (latchedMods.length) setLatchedMods([]);
+                    }}
+                  >
+                    右键
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant={dragLocked ? "primary" : "ghost"}
+                    onPress={handleToggleDragLock}
+                  >
+                    {dragLocked ? "松开拖拽" : "拖拽锁定"}
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="ghost"
+                    onPress={() => void sendInput({ type: "wheel", nx: cursorNxNy.nx, ny: cursorNxNy.ny, deltaX: 0, deltaY: -180 })}
+                  >
+                    上滚
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="ghost"
+                    onPress={() => void sendInput({ type: "wheel", nx: cursorNxNy.nx, ny: cursorNxNy.ny, deltaX: 0, deltaY: 180 })}
+                  >
+                    下滚
+                  </PocketButton>
+                </ScrollView>
+              ) : null}
+
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.xs }}>
+                {MOBILE_MODS.map((m) => {
+                  const sel = latchedMods.includes(m.id);
+                  return (
+                    <Pressable
+                      key={m.id}
+                      onPress={() => toggleMod(m.id)}
+                      style={{
+                        paddingHorizontal: 10,
+                        paddingVertical: 5,
+                        borderRadius: radius.pill,
+                        backgroundColor: sel ? p.primary : p.surface,
+                        borderWidth: 1,
+                        borderColor: sel ? p.primary : p.divider,
+                      }}
+                    >
+                      <Text style={{ fontSize: 11.5, fontFamily: fonts.mono, color: sel ? p.onPrimary : p.ink }}>{m.label}</Text>
+                    </Pressable>
+                  );
+                })}
+                <PocketButton size="sm" variant="ghost" onPress={() => sendQuickKey("Escape")}>
+                  Esc
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => sendQuickKey("Tab")}>
+                  Tab
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => sendQuickKey("Tab", isRemoteMac ? ["meta"] : ["alt"])}>
+                  切换应用
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => sendQuickKey("a", primaryCopyMod)}>
+                  全选
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => sendQuickKey("c", primaryCopyMod)}>
+                  复制
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => sendQuickKey("v", primaryCopyMod)}>
+                  粘贴
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => sendQuickKey("z", primaryCopyMod)}>
+                  撤销
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => sendQuickKey("Backspace")}>
+                  退格
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => void handlePushClipboard()}>
+                  推送剪贴板
+                </PocketButton>
+                <PocketButton size="sm" variant="ghost" onPress={() => void handlePullClipboard()}>
+                  拉取剪贴板
+                </PocketButton>
+              </ScrollView>
+
+              {clipInfo ? (
+                <Text style={{ fontSize: 12, color: p.accentText }}>{clipInfo}</Text>
+              ) : null}
 
               <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
                 <TextInput
@@ -569,7 +1095,7 @@ export function MobilePortalModal({
                 >
                   输入
                 </PocketButton>
-                <PocketButton size="sm" variant="soft" onPress={() => void sendInput({ type: "key", key: "Enter" })}>
+                <PocketButton size="sm" variant="soft" onPress={() => sendQuickKey("Enter")}>
                   回车
                 </PocketButton>
               </View>

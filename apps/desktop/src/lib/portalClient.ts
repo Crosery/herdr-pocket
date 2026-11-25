@@ -149,30 +149,103 @@ export function mapContainedPointer(opts: {
   imageWidth?: number;
   imageHeight?: number;
 }): { nx: number; ny: number } {
-  const { clientX, clientY, rectLeft, rectTop, rectWidth, rectHeight, imageWidth, imageHeight } = opts;
-  if (rectWidth <= 0 || rectHeight <= 0) return { nx: 0.5, ny: 0.5 };
+  const { nx, ny } = mapZoomedStagePointer(opts);
+  return { nx, ny };
+}
+
+/** Computes fitted base image box `(drawLeft, drawTop, drawW, drawH)` inside container `(boxW x boxH)`. */
+export function computeContainedRect(
+  boxW: number,
+  boxH: number,
+  imageWidth?: number,
+  imageHeight?: number,
+): { drawLeft: number; drawTop: number; drawW: number; drawH: number } {
+  if (boxW <= 0 || boxH <= 0) return { drawLeft: 0, drawTop: 0, drawW: 1, drawH: 1 };
   let drawLeft = 0;
   let drawTop = 0;
-  let drawW = rectWidth;
-  let drawH = rectHeight;
+  let drawW = boxW;
+  let drawH = boxH;
   if (imageWidth && imageHeight && imageWidth > 0 && imageHeight > 0) {
     const imgAspect = imageWidth / imageHeight;
-    const boxAspect = rectWidth / rectHeight;
+    const boxAspect = boxW / boxH;
     if (boxAspect > imgAspect) {
-      drawH = rectHeight;
-      drawW = rectHeight * imgAspect;
-      drawLeft = (rectWidth - drawW) / 2;
+      drawH = boxH;
+      drawW = boxH * imgAspect;
+      drawLeft = (boxW - drawW) / 2;
     } else {
-      drawW = rectWidth;
-      drawH = rectWidth / imgAspect;
-      drawTop = (rectHeight - drawH) / 2;
+      drawW = boxW;
+      drawH = rectHeightScaled(boxW, imgAspect);
+      drawTop = (boxH - drawH) / 2;
     }
   }
-  const rx = clientX - rectLeft - drawLeft;
-  const ry = clientY - rectTop - drawTop;
+  return { drawLeft, drawTop, drawW, drawH };
+}
+
+function rectHeightScaled(boxW: number, imgAspect: number): number {
+  return boxW / imgAspect;
+}
+
+/**
+ * Maps viewer client coordinates onto `[0, 1]` coordinates of the remote frame with optional
+ * stage zoom (`>= 1`) and centered pan offsets (`panX`, `panY` in CSS pixels).
+ */
+export function mapZoomedStagePointer(opts: {
+  clientX: number;
+  clientY: number;
+  rectLeft: number;
+  rectTop: number;
+  rectWidth: number;
+  rectHeight: number;
+  imageWidth?: number;
+  imageHeight?: number;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
+}): { nx: number; ny: number; inside: boolean } {
+  const {
+    clientX,
+    clientY,
+    rectLeft,
+    rectTop,
+    rectWidth,
+    rectHeight,
+    imageWidth,
+    imageHeight,
+    zoom = 1,
+    panX = 0,
+    panY = 0,
+  } = opts;
+  if (rectWidth <= 0 || rectHeight <= 0) return { nx: 0.5, ny: 0.5, inside: false };
+  const z = Math.max(0.5, zoom);
+  const { drawLeft, drawTop, drawW, drawH } = computeContainedRect(rectWidth, rectHeight, imageWidth, imageHeight);
+  const px = clientX - rectLeft;
+  const py = clientY - rectTop;
+  const unzoomX = (px - rectWidth / 2 - panX) / z + rectWidth / 2;
+  const unzoomY = (py - rectHeight / 2 - panY) / z + rectHeight / 2;
+  const rawNx = (unzoomX - drawLeft) / Math.max(1, drawW);
+  const rawNy = (unzoomY - drawTop) / Math.max(1, drawH);
   return {
-    nx: Math.min(1, Math.max(0, rx / Math.max(1, drawW))),
-    ny: Math.min(1, Math.max(0, ry / Math.max(1, drawH))),
+    nx: Math.min(1, Math.max(0, rawNx)),
+    ny: Math.min(1, Math.max(0, rawNy)),
+    inside: rawNx >= 0 && rawNx <= 1 && rawNy >= 0 && rawNy <= 1,
+  };
+}
+
+/** Integrates relative trackpad movement `(dxPx, dyPx)` with pointer acceleration and clamping. */
+export function stepTrackpadCursor(
+  cur: { nx: number; ny: number },
+  dxPx: number,
+  dyPx: number,
+  stageWidth: number,
+  stageHeight: number,
+): { nx: number; ny: number } {
+  const w = Math.max(120, stageWidth);
+  const h = Math.max(120, stageHeight);
+  const speed = Math.hypot(dxPx, dyPx);
+  const accel = 1 + Math.min(1.8, speed / 18) * 0.55;
+  return {
+    nx: Math.min(1, Math.max(0, cur.nx + (dxPx * accel) / w)),
+    ny: Math.min(1, Math.max(0, cur.ny + (dyPx * accel) / h)),
   };
 }
 
@@ -184,6 +257,7 @@ interface PortalState {
   windowsByHost: Record<string, RemoteWindowInfo[]>;
   dismissedIds: Record<string, true>;
   manualIds: Record<string, true>;
+  openSeqById: Record<string, number>;
 }
 
 const initialState: PortalState = {
@@ -194,6 +268,7 @@ const initialState: PortalState = {
   windowsByHost: {},
   dismissedIds: {},
   manualIds: {},
+  openSeqById: {},
 };
 
 let state: PortalState = initialState;
@@ -312,11 +387,16 @@ export function ingestPortalStreamEvent(ev: unknown): void {
     } else {
       setState((prev) => {
         const dismissedIds = { ...prev.dismissedIds };
-        if (e.action === "opened") delete dismissedIds[item.id];
+        const openSeqById = { ...prev.openSeqById };
+        if (e.action === "opened") {
+          delete dismissedIds[item.id];
+          openSeqById[item.id] = (openSeqById[item.id] ?? 0) + 1;
+        }
         return {
           ...prev,
           itemsById: { ...prev.itemsById, [item.id]: item },
           dismissedIds,
+          openSeqById,
         };
       });
     }
@@ -433,6 +513,7 @@ export async function openPortalSurface(
       ...(res.ticket ? { ticketsById: { ...prev.ticketsById, [res.item.id]: res.ticket } } : {}),
       dismissedIds,
       manualIds: { ...prev.manualIds, [res.item.id]: true },
+      openSeqById: { ...prev.openSeqById, [res.item.id]: (prev.openSeqById[res.item.id] ?? 0) + 1 },
     };
   });
   return res;
@@ -454,13 +535,27 @@ export async function closePortalSurface(hostId: string, portalId: string): Prom
 
 const inflightFrames = new Map<string, Promise<PortalFramePayload | null>>();
 
-export function capturePortalFrameOnce(hostId: string, portalId: string): Promise<PortalFramePayload | null> {
+export function capturePortalFrameOnce(
+  hostId: string,
+  portalId: string,
+  opts?: { maxWidth?: number; quality?: number; showCursor?: boolean },
+): Promise<PortalFramePayload | null> {
   const key = `${hostId}\0${portalId}`;
   const pending = inflightFrames.get(key);
   if (pending) return pending;
   const p = (async () => {
     try {
-      const res = await rpcCall(hostId, "portal.frame", { portalId }, 12_000);
+      const res = await rpcCall(
+        hostId,
+        "portal.frame",
+        {
+          portalId,
+          ...(opts?.maxWidth ? { maxWidth: opts.maxWidth } : {}),
+          ...(opts?.quality ? { quality: opts.quality } : {}),
+          ...(opts?.showCursor !== undefined ? { showCursor: opts.showCursor } : {}),
+        },
+        12_000,
+      );
       if (res.item) {
         setState((prev) => ({
           ...prev,
@@ -486,7 +581,7 @@ export async function sendPortalInput(
   hostId: string,
   portalId: string,
   input: PortalInputAction,
-): Promise<{ url?: string; title?: string }> {
+): Promise<{ url?: string; title?: string; clipboardText?: string }> {
   const res = await rpcCall(hostId, "portal.input", { portalId, input }, 10_000);
   if (res.url || res.title) {
     setState((prev) => {
@@ -507,6 +602,24 @@ export async function sendPortalInput(
     });
   }
   return res;
+}
+
+export async function updatePortalStreamConfig(
+  hostId: string,
+  portalId: string,
+  cfg: { fps?: number; maxWidth?: number; quality?: number; showCursor?: boolean },
+): Promise<void> {
+  await sendPortalInput(hostId, portalId, { type: "config", ...cfg }).catch(() => {});
+}
+
+export async function syncPortalClipboard(
+  hostId: string,
+  portalId: string,
+  action: "get" | "set",
+  text?: string,
+): Promise<string | undefined> {
+  const res = await sendPortalInput(hostId, portalId, { type: "clipboard", action, ...(text !== undefined ? { text } : {}) });
+  return res.clipboardText;
 }
 
 export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): () => void {
@@ -603,19 +716,27 @@ export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): 
 export function subscribePortalFrames(
   hostId: string,
   portalId: string,
-  fps = 12,
+  fpsOrOpts: number | { fps?: number; maxWidth?: number; quality?: number; showCursor?: boolean } = 30,
 ): () => void {
+  const opts = typeof fpsOrOpts === "number" ? { fps: fpsOrOpts } : fpsOrOpts;
+  const fps = Math.max(1, Math.min(60, opts.fps ?? 30));
   let alive = true;
   let streamLive = false;
   let lastStreamFrameAt = 0;
   let busy = false;
 
-  void capturePortalFrameOnce(hostId, portalId).catch(() => {});
+  void capturePortalFrameOnce(hostId, portalId, opts).catch(() => {});
 
   const unsub = subscribeStream(
     hostId,
     "portal",
-    { portalId, fps },
+    {
+      portalId,
+      fps,
+      ...(opts.maxWidth ? { maxWidth: opts.maxWidth } : {}),
+      ...(opts.quality ? { quality: opts.quality } : {}),
+      ...(opts.showCursor !== undefined ? { showCursor: opts.showCursor } : {}),
+    },
     (ev) => {
       if (!alive) return;
       if (ev?.kind === "portal_frame" && ev.portalId === portalId) {
@@ -629,18 +750,19 @@ export function subscribePortalFrames(
     },
   );
 
-  const pollInterval = Math.max(120, Math.round(1000 / Math.max(1, Math.min(8, fps))));
+  // Fallback RPC poll only kicks in when push stream isn't delivering (e.g. older relay / stalled stream).
+  const pollInterval = Math.max(90, Math.round(1000 / Math.max(1, Math.min(12, fps))));
   let lastErrorPollAt = 0;
   const timer = window.setInterval(() => {
     if (!alive || busy) return;
-    if (streamLive && Date.now() - lastStreamFrameAt < 1200) return;
+    if (streamLive && (lastStreamFrameAt === 0 || Date.now() - lastStreamFrameAt < 1500)) return;
     if (state.itemsById[portalId]?.streamError) {
       const now = Date.now();
       if (now - lastErrorPollAt < 4000) return;
       lastErrorPollAt = now;
     }
     busy = true;
-    void capturePortalFrameOnce(hostId, portalId)
+    void capturePortalFrameOnce(hostId, portalId, opts)
       .catch(() => {})
       .finally(() => {
         busy = false;

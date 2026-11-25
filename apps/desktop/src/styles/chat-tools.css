@@ -1558,10 +1558,10 @@
 /* ovis-inspired Chat UI enhancements: command cards, compact dividers, Edit diff, Todo checklist, long bubble fold */
 
 .bubble.user.is-folded > div:first-child {
-  display: -webkit-box;
-  -webkit-line-clamp: 10;
-  -webkit-box-orient: vertical;
+  max-height: 11rem;
   overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 72%, transparent 100%);
 }
 
 .user-fold-btn {
@@ -1570,9 +1570,9 @@
   margin-top: 6px;
   padding: 2px 8px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  background: rgba(255, 255, 255, 0.14);
-  color: inherit;
+  border: 1px solid var(--divider);
+  background: color-mix(in srgb, var(--surface) 75%, transparent);
+  color: var(--accent-text);
   font: inherit;
   font-size: calc(11.2px * var(--ts, 1));
   font-weight: 600;
@@ -1580,7 +1580,395 @@
 }
 
 .user-fold-btn:hover {
-  background: rgba(255, 255, 255, 0.24);
+  border-color: var(--line-pink);
+  background: var(--surface);
+}
+
+/* t3code-inspired centered column, borderless prose & flat WorkLog */
+
+.t3-chat-column {
+  width: 100%;
+  max-width: 48rem;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.t3-composer-shell {
+  width: 100%;
+  max-width: 48rem;
+  margin: 0 auto;
+  padding: 4px 20px 12px;
+  flex-shrink: 0;
+}
+
+.t3-assistant-row {
+  max-width: 100%;
+  width: 100%;
+  gap: 4px;
+}
+
+.t3-assistant-body {
+  padding: 2px 4px;
+  width: 100%;
+  min-width: 0;
+  word-break: break-word;
+  color: var(--ink);
+  font-size: calc(14px * var(--ts, 1));
+  line-height: 1.65;
+}
+
+.t3-hover-meta {
+  opacity: 0;
+  transition: opacity 0.16s ease;
+}
+
+.bubble-row:hover .t3-hover-meta,
+.bubble-row:focus-within .t3-hover-meta {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .t3-hover-meta {
+    opacity: 0.9;
+  }
+}
+
+.t3-meta-copy {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+}
+
+.t3-meta-copy:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+.t3-work-block,
+.t3-work-step {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.t3-work-row-wrap {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 4px;
+}
+
+.t3-work-row {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 26px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: calc(13px * var(--ts, 1));
+  line-height: 1.45;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+}
+
+.t3-work-row:hover {
+  background: color-mix(in srgb, var(--ink) 4.5%, transparent);
+  color: var(--ink);
+}
+
+.t3-work-ic {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+}
+
+.t3-work-ic.running {
+  color: var(--primary);
+}
+
+.t3-work-ic.error {
+  color: var(--blush-text);
+}
+
+.t3-work-ic.read,
+.t3-work-ic.search,
+.t3-work-ic.web {
+  color: #3a77ad;
+}
+
+.t3-work-ic.edit {
+  color: #b4572e;
+}
+
+.t3-work-ic.run {
+  color: var(--mint-text);
+}
+
+.t3-work-ic.agent {
+  color: var(--accent-text);
+}
+
+:root[data-theme="dark"] .t3-work-ic.read,
+:root[data-theme="dark"] .t3-work-ic.search,
+:root[data-theme="dark"] .t3-work-ic.web {
+  color: #7cb8f0;
+}
+
+:root[data-theme="dark"] .t3-work-ic.edit {
+  color: #f09a72;
+}
+
+.t3-work-title {
+  flex: none;
+  font-weight: 500;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.t3-step-name {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.t3-work-preview,
+.t3-work-summary {
+  flex: 1 1 0;
+  min-width: 0;
+  color: var(--faint);
+  font-size: calc(12px * var(--ts, 1));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.t3-work-time {
+  flex: none;
+  font-size: calc(11px * var(--ts, 1));
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+
+.t3-work-row:hover .t3-work-time {
+  opacity: 1;
+}
+
+.t3-work-chev {
+  opacity: 0.45;
+  transition: transform 0.14s ease, opacity 0.14s ease;
+}
+
+.t3-work-row:hover .t3-work-chev,
+.t3-work-chev.open {
+  opacity: 1;
+}
+
+.t3-open-file-link {
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: var(--accent-text);
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.t3-open-file-link:hover {
+  background: var(--accent-soft);
+}
+
+.t3-work-live {
+  padding: 0 6px 2px 31px;
+  font-size: calc(12px * var(--ts, 1));
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.t3-work-children {
+  margin: 2px 0 6px 14px;
+  padding-left: 11px;
+  border-left: 1.5px solid var(--divider);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.t3-thought-detail {
+  margin: 2px 0 6px 14px;
+  padding: 3px 0 3px 12px;
+  border-left: 1.5px solid var(--divider);
+  font-size: calc(12.5px * var(--ts, 1));
+  line-height: 1.6;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.t3-inline-thought summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 25px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: calc(12.5px * var(--ts, 1));
+  cursor: pointer;
+  list-style: none;
+}
+
+.t3-inline-thought summary:hover {
+  background: color-mix(in srgb, var(--ink) 4.5%, transparent);
+}
+
+.t3-inline-thought summary::-webkit-details-marker {
+  display: none;
+}
+
+.t3-more-steps {
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  color: var(--accent-text);
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 600;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+
+.t3-indented-block {
+  margin-left: 24px;
+  padding-left: 0;
+}
+
+.t3-working-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 24px;
+  padding: 2px 6px;
+  color: var(--muted);
+  font-size: calc(13px * var(--ts, 1));
+  font-variant-numeric: tabular-nums;
+}
+
+.t3-working-ic {
+  flex: none;
+  color: var(--faint);
+}
+
+.t3-working-elapsed {
+  font-size: calc(12px * var(--ts, 1));
+  color: var(--faint);
+}
+
+@keyframes t3LiveShine {
+  from {
+    background-position: -4.5rem 0, 0 0;
+  }
+  to {
+    background-position: calc(100% + 4.5rem) 0, 0 0;
+  }
+}
+
+.t3-live-shine {
+  display: inline-block;
+  min-width: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .t3-live-shine {
+    color: transparent;
+    background-image: linear-gradient(to right, transparent, var(--ink), transparent),
+      linear-gradient(var(--muted), var(--muted));
+    background-size: 4.5rem 100%, 100% 100%;
+    background-repeat: no-repeat;
+    -webkit-background-clip: text;
+    background-clip: text;
+    animation: t3LiveShine 2.2s steps(30) infinite;
+  }
+}
+
+.t3-blocked-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--blush-soft);
+  color: var(--blush-text);
+  font-size: calc(12.5px * var(--ts, 1));
+}
+
+.t3-blocked-btn {
+  flex: none;
+  border: 1px solid rgba(184, 58, 82, 0.35);
+  background: var(--surface);
+  color: var(--blush-text);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.composer-stop-btn {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: #e14d67;
+  color: #ffffff;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(225, 77, 103, 0.25);
+  transition: transform 0.1s ease, background 0.14s ease;
+}
+
+.composer-stop-btn:hover {
+  background: #cb3c55;
+}
+
+.composer-stop-btn:focus-visible {
+  outline: 2px solid var(--ring-focus);
+  outline-offset: 2px;
+}
+
+@media (max-width: 700px) {
+  .t3-composer-shell {
+    padding: 4px 12px 10px;
+  }
 }
 
 .chat-cmd-card {

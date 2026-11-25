@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Bot,
+  Brain,
   Check,
   ChevronRight,
   Copy,
@@ -281,7 +282,7 @@ function SubLinkCard({
   );
 }
 
-/** Standalone thinking block matching Mobile's ThinkingPill & Uniflo clarity. */
+/** Standalone thinking block matching t3code borderless WorkLog style. */
 const ThinkingRowItem = memo(function ThinkingRowItem({
   row,
 }: {
@@ -296,19 +297,21 @@ const ThinkingRowItem = memo(function ThinkingRowItem({
     [row.text],
   );
   return (
-    <div className={`act-thought-pill${open ? " open" : ""}`}>
+    <div className={`t3-work-block${open ? " open" : ""}`}>
       <button
         type="button"
-        className="act-thought-head"
+        className="t3-work-row"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
-        <ChevronRight size={13} className={`act-chev${open ? " open" : ""}`} />
-        <MessageSquareMore size={13} className="act-thought-ic" />
-        <span className="act-thought-title">思考过程</span>
-        {!open && preview ? <span className="act-thought-preview truncate">{preview}</span> : null}
+        <span className="t3-work-ic">
+          <Brain size={13} />
+        </span>
+        <span className="t3-work-title">思考过程</span>
+        {!open && preview ? <span className="t3-work-preview truncate">{preview}</span> : null}
+        <ChevronRight size={13} className={`act-chev t3-work-chev${open ? " open" : ""}`} />
       </button>
-      {open ? <div className="act-thought-body">{row.text}</div> : null}
+      {open ? <div className="t3-thought-detail">{row.text}</div> : null}
     </div>
   );
 });
@@ -449,29 +452,30 @@ const ToolStepItem = memo(function ToolStepItem({
   );
 
   return (
-    <div className={standalone ? "act-group" : "act-step"}>
-      <div className="act-step-wrap">
+    <div className={standalone ? "t3-work-block" : "t3-work-step"}>
+      <div className="t3-work-row-wrap">
         <button
           type="button"
-          className="act-step-row"
+          className="t3-work-row"
           aria-expanded={open}
           onClick={() => setOpen((v) => !v)}
         >
-          <span className={`act-step-ic ${step.category}`}>
-            <CategoryIcon cat={step.category} />
+          <span className={`t3-work-ic ${step.category}`}>
+            {step.running ? <span className="act-spin" aria-label="运行中" /> : <CategoryIcon cat={step.category} />}
           </span>
-          <span className="act-step-name">{step.name}</span>
-          {step.summary ? <span className="act-step-target" title={step.summary}>{step.summary}</span> : <span className="act-step-target" />}
-          <span className={`act-step-state${step.running ? " running" : step.isError ? " error" : ""}`}>
-            {step.running ? <span className="act-spin" aria-label="运行中" /> : step.isError ? <AlertCircle size={13} /> : <Check size={13} />}
-          </span>
-          <ChevronRight size={13} className={`act-chev${open ? " open" : ""}`} />
+          <span className="t3-step-name">{step.name}</span>
+          {step.summary ? <span className="t3-work-preview mono truncate" title={step.summary}>{step.summary}</span> : <span className="t3-work-preview" />}
+          {step.isError ? (
+            <span className="act-step-state error" title="执行失败">
+              <AlertCircle size={13} />
+            </span>
+          ) : null}
+          <ChevronRight size={12} className={`act-chev t3-work-chev${open ? " open" : ""}`} />
         </button>
         {fileTarget && onOpenFile ? (
           <button
             type="button"
-            className="act-sub-btn"
-            style={{ marginRight: 6 }}
+            className="t3-open-file-link"
             title={`在标签页打开 ${fileTarget}`}
             onClick={() => onOpenFile(fileTarget)}
           >
@@ -483,12 +487,12 @@ const ToolStepItem = memo(function ToolStepItem({
         <SubLinkCard sub={sub} onOpenSub={onOpenSub} onOpenSubAside={onOpenSubAside} inset />
       ) : null}
       {standalone && todoItems.length > 0 ? (
-        <div style={{ padding: "0 10px 8px" }}>
+        <div style={{ padding: "2px 0 6px 24px" }}>
           <TodoChecklistCard items={todoItems} />
         </div>
       ) : null}
       {diffLines.length > 0 ? (
-        <div className="chat-edit-diff mono">
+        <div className="chat-edit-diff mono t3-indented-block">
           {diffLines.map((dl, idx) => (
             <div key={idx} className={`chat-edit-diff-line ${dl.kind}`}>
               <span>{dl.kind === "del" ? "-" : "+"}</span>
@@ -498,7 +502,7 @@ const ToolStepItem = memo(function ToolStepItem({
         </div>
       ) : null}
       {toolImages.length > 0 ? (
-        <div style={{ padding: "0 12px 6px 40px" }}>
+        <div style={{ padding: "2px 0 6px 26px" }}>
           <InlineImageStrip
             targets={toolImages}
             agentKey={agentKey}
@@ -509,7 +513,7 @@ const ToolStepItem = memo(function ToolStepItem({
         </div>
       ) : null}
       {open ? (
-        <div className="act-step-io">
+        <div className="act-step-io t3-indented-block">
           {formattedInput ? <IoBlock title="输入参数" content={formattedInput} /> : null}
           {step.result ? (
             <IoBlock title={step.isError ? "输出（出错）" : "输出"} content={formattedOutput || "（无输出）"} error={step.isError} />
@@ -522,7 +526,7 @@ const ToolStepItem = memo(function ToolStepItem({
   );
 });
 
-/** Collapsible multi-tool activity row (Uniflo / Mobile pattern): crisp grouped bar, or expanded stack in full mode. */
+/** Borderless flat WorkLog activity group modeled after t3code WorkLogSection / WorkGroupHeader. */
 const ActivityGroupItem = memo(function ActivityGroupItem({
   row,
   subsByCall,
@@ -584,44 +588,50 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
       ? `${row.activeStep.name} · ${row.activeStep.summary}`
       : row.activeStep.name
     : row.latestThought || (row.thoughts.length ? row.thoughts[row.thoughts.length - 1] : undefined);
+  const compactSeries = row.series.map((s) => (s.count > 1 ? `${s.name} ×${s.count}` : s.name)).join(" · ");
 
   return (
-    <div className={`act-group${row.running ? " running" : row.failedCount > 0 ? " error" : ""}${row.defaultOpen ? " full-mode" : ""}`}>
-      <div className="act-head-wrap">
+    <div className={`t3-work-block${row.running ? " running" : row.failedCount > 0 ? " error" : ""}`}>
+      <div className="t3-work-row-wrap">
         <button
           type="button"
-          className="act-head"
+          className="t3-work-row"
           aria-expanded={open}
           onClick={() => {
             userToggledRef.current = true;
             setOpen((v) => !v);
           }}
         >
-          <span className="act-status-ic">
-            {row.running ? <span className="act-spin" aria-label="运行中" /> : row.failedCount > 0 ? <AlertCircle size={14} /> : <Check size={14} />}
+          <span className={`t3-work-ic${row.running ? " running" : row.failedCount > 0 ? " error" : ""}`}>
+            {row.running ? <span className="act-spin" aria-label="运行中" /> : row.failedCount > 0 ? <AlertCircle size={13} /> : <Wrench size={13} />}
           </span>
-          <span className="act-title">{row.headline}</span>
-          {row.detailLine ? <span className="act-detail" title={row.detailLine}>{row.detailLine}</span> : null}
-          <span className="act-series" aria-hidden>
-            {row.series.map((s) => (
-              <span key={s.name} className={`act-chip${s.running ? " running" : s.error ? " error" : ""}`}>
-                <span>{s.name}</span>
-                {s.count > 1 ? <span>×{s.count}</span> : null}
-              </span>
-            ))}
-          </span>
-          <ChevronRight size={14} className={`act-chev${open ? " open" : ""}`} />
+          <span className={`t3-work-title${row.running ? " t3-live-shine" : ""}`}>{row.headline}</span>
+          {compactSeries ? (
+            <span className="t3-work-summary truncate" title={row.detailLine || compactSeries}>
+              {compactSeries}
+            </span>
+          ) : row.detailLine ? (
+            <span className="t3-work-summary truncate" title={row.detailLine}>
+              {row.detailLine}
+            </span>
+          ) : (
+            <span className="t3-work-summary" />
+          )}
+          {row.endTs > 0 ? (
+            <span className="t3-work-time">{clockStr(row.endTs)}</span>
+          ) : null}
+          <ChevronRight size={13} className={`act-chev t3-work-chev${open ? " open" : ""}`} />
         </button>
       </div>
 
       {!open && row.running && livePreview ? (
-        <div className="act-live-preview" title={livePreview}>
-          <span>{livePreview}</span>
+        <div className="t3-work-live" title={livePreview}>
+          <span className="t3-live-shine truncate">{livePreview}</span>
         </div>
       ) : null}
 
       {!open && latestTodos.length > 0 ? (
-        <div style={{ padding: "0 10px 8px" }}>
+        <div style={{ padding: "4px 0 4px 24px" }}>
           <TodoChecklistCard items={latestTodos} />
         </div>
       ) : null}
@@ -633,38 +643,38 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
         : null}
 
       {open ? (
-        <div className={`act-body${row.defaultOpen ? " expanded" : ""}`}>
+        <div className="t3-work-children">
           {latestTodos.length > 0 ? (
-            <div style={{ padding: "6px 8px 2px" }}>
+            <div style={{ padding: "4px 0" }}>
               <TodoChecklistCard items={latestTodos} />
             </div>
           ) : null}
           {hiddenCount > 0 ? (
-            <button type="button" className="act-more-steps" onClick={() => setShowAll(true)}>
-              还有更早的 {hiddenCount} 个步骤 · 点此展开全部 {row.entries.length} 步
+            <button type="button" className="t3-more-steps" onClick={() => setShowAll(true)}>
+              还有更早的 {hiddenCount} 个步骤 · 展开全部 {row.entries.length} 步
             </button>
           ) : null}
           {visibleEntries.length > 0 ? (
             visibleEntries.map((entry) => {
               if (entry.kind === "thinking") {
                 return (
-                  <details key={entry.id} className="act-thought" style={{ margin: "6px 8px 2px", borderRadius: 8 }}>
+                  <details key={entry.id} className="t3-inline-thought">
                     <summary>
-                      <MessageSquareMore size={12} />
+                      <Brain size={12} />
                       <span>思考过程</span>
                     </summary>
-                    <div className="act-thought-body">{entry.text}</div>
+                    <div className="t3-thought-detail">{entry.text}</div>
                   </details>
                 );
               }
               if (entry.kind === "note") {
                 return (
-                  <details key={entry.id} className="act-thought" style={{ margin: "4px 8px 6px", borderRadius: 8 }}>
+                  <details key={entry.id} className="t3-inline-thought">
                     <summary>
                       <Info size={12} />
                       <span>{entry.summary}</span>
                     </summary>
-                    <div className="act-thought-body">{entry.text}</div>
+                    <div className="t3-thought-detail">{entry.text}</div>
                   </details>
                 );
               }
@@ -685,12 +695,12 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
           ) : (
             <>
               {row.thoughts.map((t, i) => (
-                <details key={i} className="act-thought" style={{ margin: "6px 8px 2px", borderRadius: 8 }}>
+                <details key={i} className="t3-inline-thought">
                   <summary>
-                    <MessageSquareMore size={12} />
+                    <Brain size={12} />
                     <span>思考过程{row.thoughts.length > 1 ? ` #${i + 1}` : ""}</span>
                   </summary>
-                  <div className="act-thought-body">{t}</div>
+                  <div className="t3-thought-detail">{t}</div>
                 </details>
               ))}
               {row.tools.map((step) => (
@@ -707,12 +717,12 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
                 />
               ))}
               {row.notes.map((n, i) => (
-                <details key={i} className="act-thought" style={{ margin: "4px 8px 6px", borderRadius: 8 }}>
+                <details key={i} className="t3-inline-thought">
                   <summary>
                     <Info size={12} />
                     <span>{n.summary}</span>
                   </summary>
-                  <div className="act-thought-body">{n.text}</div>
+                  <div className="t3-thought-detail">{n.text}</div>
                 </details>
               ))}
             </>
@@ -847,11 +857,12 @@ const AssistantRowItem = memo(function AssistantRowItem({
   cwd?: string;
   onOpenFile?: (target: string) => void;
 }) {
+  const [copied, setCopied] = useState(false);
   const imageTargets = useMemo(() => extractImageTargets([row.text]), [row.text]);
   const shortModel = row.model ? shortModelLabel(row.model) : undefined;
   return (
-    <div className="bubble-row assistant">
-      <div className="bubble assistant">
+    <div className="bubble-row assistant t3-assistant-row">
+      <div className="t3-assistant-body">
         <RichMarkdown text={row.text} onOpenFile={onOpenFile} />
       </div>
       <InlineImageStrip
@@ -861,10 +872,28 @@ const AssistantRowItem = memo(function AssistantRowItem({
         cwd={cwd}
         onOpenFile={onOpenFile}
       />
-      {row.ts > 0 || shortModel ? (
-        <div className="bubble-time-meta assistant" title={fullTimeTitle(row.ts, row.pos)}>
+      {row.ts > 0 || shortModel || row.text ? (
+        <div className="bubble-time-meta t3-hover-meta assistant" title={fullTimeTitle(row.ts, row.pos)}>
           {row.ts > 0 ? <span>{clockStr(row.ts)}</span> : null}
           {shortModel ? <span className="mono truncate">{shortModel}</span> : null}
+          {row.text ? (
+            <button
+              type="button"
+              className="t3-meta-copy"
+              aria-label="复制回复内容"
+              title="复制回复"
+              onClick={() => {
+                void copyToClipboard(row.text).then((ok) => {
+                  if (ok) {
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1500);
+                  }
+                });
+              }}
+            >
+              {copied ? <Check size={11} /> : <Copy size={11} />}
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -1074,12 +1103,12 @@ export const ChatTimelineRows = memo(function ChatTimelineRows({
             return <ThinkingRowItem key={row.id} row={row} />;
           case "system":
             return (
-              <details key={row.id} className="act-thought">
+              <details key={row.id} className="t3-inline-thought">
                 <summary>
-                  <Info size={13} />
+                  <Info size={12} />
                   <span>{row.summary}</span>
                 </summary>
-                <div className="act-thought-body">{row.text}</div>
+                <div className="t3-thought-detail">{row.text}</div>
               </details>
             );
           case "command_result":

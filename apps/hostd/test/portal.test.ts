@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -9,9 +10,11 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { DIRECT_PORTAL_FS_PREFIX, type PortalStreamEvent } from "@herdr-pocket/protocol";
 import { DirectServer } from "../src/direct.ts";
+import { Host } from "../src/host.ts";
 import { CdpBrowserPool, findChromiumBinary } from "../src/portal/cdpBrowser.ts";
 import { PortalManager } from "../src/portal/index.ts";
 import {
+  MAC_SWIFT_SRC,
   OsCaptureDriver,
   computeCapabilities,
   defaultExecBin,
@@ -19,7 +22,13 @@ import {
   resolveLinuxGuiEnv,
 } from "../src/portal/osCapture.ts";
 import { PortalFileTicketStore, bundleHtmlForRelay, readChunkForRpc } from "../src/portal/p2pFiles.ts";
-import { PortalHookServer, TerminalInputLineTracker, extractAutoPortalIntents, parseOpenerArgs } from "../src/portal/shims.ts";
+import {
+  PortalHookServer,
+  TerminalInputLineTracker,
+  extractAutoPortalIntents,
+  extractCommandFromTerminalScreenLine,
+  parseOpenerArgs,
+} from "../src/portal/shims.ts";
 import { UnifloAdapter } from "../src/uniflo.ts";
 
 test("PortalFileTicketStore + DirectServer serve /v1/portal-fs HTTP files, Ranges, CORS, and block traversal/private files", async (t) => {
@@ -1025,4 +1034,360 @@ test(
   const fbCap = await fallbackDriver.captureWindow("99");
   assert.equal(fbCap, null);
   assert.ok(localExecCalled >= 1);
+});
+
+test("OsCaptureDriver maps negative multi-display bounds, caches window list, and forwards drag/key/clipboard", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hp-multi-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const recorded: string[][] = [];
+  let listCalls = 0;
+
+  const driver = new OsCaptureDriver({
+    platform: "darwin",
+    binDir,
+    hasCmd: (c) => c === "swiftc",
+    execBin: async (_cmd, args) => {
+      if (args.includes("-o")) {
+        const outIdx = args.indexOf("-o");
+        if (outIdx >= 0 && args[outIdx + 1]) writeFileSync(args[outIdx + 1]!, "mock-bin");
+        return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+      }
+      recorded.push(args);
+      if (args[0] === "check") {
+        return { code: 0, stderr: "", stdout: Buffer.from(JSON.stringify({ screenCapture: true, accessibility: true })) };
+      }
+      if (args[0] === "list") {
+        listCalls += 1;
+        return {
+          code: 0,
+          stderr: "",
+          stdout: Buffer.from(
+            JSON.stringify([
+              { id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true, displayIndex: 0, scaleFactor: 2, bounds: { x: 0, y: 0, width: 1728, height: 1117 } },
+              { id: "screen:1", appName: "macOS 桌面", title: "显示器 2", isScreen: true, displayIndex: 1, scaleFactor: 1, bounds: { x: -1760, y: -1440, width: 5120, height: 1440 } },
+            ]),
+          ),
+        };
+      }
+      if (args[0] === "clipboard" && args[1] === "get") {
+        return { code: 0, stderr: "", stdout: Buffer.from("copied-text-123") };
+      }
+      if (args[0] === "clipboard" && args[1] === "set") {
+        return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+      }
+      return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+    },
+  });
+  t.after(() => driver.dispose());
+
+  // Negative-offset display bounds: (-1760 + 0.5*5120, -1440 + 0.25*1440) => (800, -1080)
+  await driver.injectInput("screen:1", {
+    type: "pointer",
+    action: "drag",
+    nx: 0.5,
+    ny: 0.25,
+    button: "left",
+    modifiers: ["meta", "shift"],
+  });
+  await driver.injectInput("screen:1", { type: "pointer", action: "move", nx: 0.25, ny: 0.5, button: "left" });
+  await driver.injectInput("screen:1", { type: "pointer", action: "down", nx: 0.25, ny: 0.5, button: "right" });
+  await driver.injectInput("screen:1", { type: "pointer", action: "up", nx: 0.25, ny: 0.5, button: "right" });
+  await driver.injectInput("screen:1", { type: "key", key: "Tab", modifiers: ["ctrl"], action: "down" });
+
+  assert.equal(listCalls, 1, "windowsCache should prevent redundant list calls within cache TTL");
+  const dragCall = recorded.find((a) => a[0] === "click" && a[4] === "drag");
+  assert.deepEqual(dragCall, ["click", "800", "-1080", "left", "drag", "0", "meta,shift"]);
+  const moveCall = recorded.find((a) => a[0] === "click" && a[4] === "move");
+  assert.deepEqual(moveCall, ["click", "-480", "-720", "left", "move", "0", ""]);
+  const downCall = recorded.find((a) => a[0] === "click" && a[4] === "down");
+  assert.deepEqual(downCall, ["click", "-480", "-720", "right", "down", "0", ""]);
+  const keyCall = recorded.find((a) => a[0] === "key");
+  assert.deepEqual(keyCall, ["key", "Tab", "0", "ctrl", "down"]);
+
+  const pulled = await driver.handleClipboard("get");
+  assert.equal(pulled, "copied-text-123");
+  await driver.handleClipboard("set", "hello-remote");
+  const setCall = recorded.find((a) => a[0] === "clipboard" && a[1] === "set");
+  assert.equal(setCall?.[2], Buffer.from("hello-remote", "utf8").toString("base64"));
+});
+
+test("PortalManager handles config updates, deduplicates unchanged frames, and Host drops buffered intermediate portal_frame", async (t) => {
+  const state = mkdtempSync(join(tmpdir(), "hp-mgr-dedup-"));
+  const binDir = join(state, "bin");
+  mkdirSync(binDir, { recursive: true });
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+
+  let imgSeed = Buffer.from("frame-alpha");
+  const fakeAgent = { key: "h1/hc:t1", deviceId: "h1", name: "t1", status: "idle", tool: "claude" } as any;
+  const mgr = new PortalManager({
+    hostId: () => "h1",
+    getAgents: () => [fakeAgent],
+    getTerminals: () => new Map([["t1", { address: "t1", cwd: "/tmp" }]]),
+    getFilesOptions: () => ({ extraRoots: ["/tmp"] }),
+    getDirectInfo: () => ({ port: null, addrs: [], connectedCount: 0 }),
+    hasRemoteViewers: () => true,
+    onPortalEvent: () => {},
+    stateDir: state,
+    captureDeps: {
+      platform: "darwin",
+      binDir,
+      hasCmd: (c) => c === "swiftc",
+      execBin: async (_cmd, args) => {
+        if (args.includes("-o")) {
+          const outIdx = args.indexOf("-o");
+          if (outIdx >= 0 && args[outIdx + 1]) writeFileSync(args[outIdx + 1]!, "mock-bin");
+          return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+        }
+        if (args[0] === "check") return { code: 0, stderr: "", stdout: Buffer.from('{"screenCapture":true,"accessibility":true}') };
+        if (args[0] === "list") {
+          return {
+            code: 0,
+            stderr: "",
+            stdout: Buffer.from(JSON.stringify([{ id: "screen:0", appName: "macOS", title: "主屏幕", isScreen: true, bounds: { x: 0, y: 0, width: 1728, height: 1117 } }])),
+          };
+        }
+        if (args[0] === "capture") return { code: 0, stderr: "dims:1728x1117\n", stdout: imgSeed };
+        return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+      },
+    },
+  });
+  t.after(() => mgr.stop());
+
+  const opened = await mgr.openPortal({ agentKey: fakeAgent.key, kind: "window", windowId: "screen:0" });
+  const received: PortalStreamEvent[] = [];
+  const stop = mgr.subscribe("sub-1", { portalId: opened.item.id, fps: 15, maxWidth: 1200, quality: 70 }, (ev) => received.push(ev));
+  t.after(stop);
+
+  for (let i = 0; i < 15 && received.filter((x) => x.kind === "portal_frame").length < 1; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const initialCount = received.filter((x) => x.kind === "portal_frame").length;
+  assert.equal(initialCount, 1);
+
+  // Stay on identical frame for ~180ms -> dedup prevents spamming identical frame hashes.
+  await new Promise((r) => setTimeout(r, 180));
+  assert.equal(received.filter((x) => x.kind === "portal_frame").length, 1);
+
+  // Mutate frame bytes -> config change raises FPS & changed frame emits right away.
+  imgSeed = Buffer.from("frame-beta-updated");
+  await mgr.sendInput(opened.item.id, { type: "config", fps: 60, maxWidth: 1600, quality: 85, showCursor: false });
+  for (let i = 0; i < 20 && received.filter((x) => x.kind === "portal_frame").length < 2; i += 1) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(received.filter((x) => x.kind === "portal_frame").length >= 2);
+
+  // Backpressure check via Host.prototype.handleStreamSubscribe / sendStream
+  let peerBuffered = 300 * 1024;
+  const pushedToPeer: any[] = [];
+  let portalSubCb: ((ev: any) => void) | null = null;
+  const fakeHost: any = {
+    streamStops: new Map(),
+    streamMeta: new Map(),
+    streamReply: new Map(),
+    streamPeerBufferedBytes: new Map(),
+    opts: {},
+    resolve: () => undefined,
+    send: () => {},
+    note: () => {},
+    who: (id: string) => id,
+    stopStream: () => {},
+    portal: {
+      subscribe: (_id: string, _p: unknown, onEv: (ev: any) => void) => {
+        portalSubCb = onEv;
+        return () => {};
+      },
+      listPortals: () => [],
+    },
+    sendStream: (Host.prototype as any).sendStream,
+  };
+  await (Host.prototype as any).handleStreamSubscribe.call(
+    fakeHost,
+    { type: "stream_subscribe", id: "s-bp", from: "viewer-1", stream: "portal", params: { portalId: "p1", fps: 30 } },
+    (frame: unknown) => pushedToPeer.push(frame),
+    () => peerBuffered,
+  );
+  const emitSub = portalSubCb as ((ev: any) => void) | null;
+  if (!emitSub) throw new Error("expected portalSubCb");
+  emitSub({ kind: "portal_frame", portalId: "p1", seq: 1, data: "a" });
+  emitSub({ kind: "portal_frame", portalId: "p1", seq: 2, data: "b" }); // dropped while > 256KB
+  emitSub({ kind: "portal_event", action: "updated", item: opened.item, at: Date.now() }); // never dropped
+  peerBuffered = 1024;
+  emitSub({ kind: "portal_frame", portalId: "p1", seq: 3, data: "c" });
+
+  assert.deepEqual(
+    pushedToPeer.map((f) => (f.type === "stream_open" ? "stream_open" : f.event?.kind === "portal_frame" ? `f:${f.event.seq}` : f.event?.kind)),
+    ["stream_open", "f:1", "portal_event", "f:3"],
+  );
+});
+
+test(
+  "darwin MAC_SWIFT_SRC compiles cleanly and serve handles read-only check/list",
+  { skip: process.platform !== "darwin" },
+  async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "hp-swift-ro-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const swiftPath = join(dir, "helper.swift");
+    const binPath = join(dir, "helper");
+    writeFileSync(swiftPath, MAC_SWIFT_SRC);
+    await new Promise<void>((res, rej) => {
+      execFile("swiftc", ["-O", swiftPath, "-o", binPath], { timeout: 60_000 }, (err, _out, errStr) => {
+        if (err) rej(new Error(errStr || err.message));
+        else res();
+      });
+    });
+
+    const child = spawn(binPath, ["serve"], { stdio: ["pipe", "pipe", "pipe"] });
+    t.after(() => {
+      try {
+        child.kill();
+      } catch {}
+    });
+
+    const sendReq = (args: string[]) =>
+      new Promise<{ code: number; stdoutBase64: string; stderr: string }>((res, rej) => {
+        let buf = "";
+        const onData = (chunk: Buffer) => {
+          buf += chunk.toString("utf8");
+          const nl = buf.indexOf("\n");
+          if (nl >= 0) {
+            child.stdout.off("data", onData);
+            try {
+              res(JSON.parse(buf.slice(0, nl)));
+            } catch (e) {
+              rej(e);
+            }
+          }
+        };
+        child.stdout.on("data", onData);
+        child.stdin.write(`${JSON.stringify({ args })}\n`);
+      });
+
+    const checkResp = await sendReq(["check"]);
+    assert.equal(checkResp.code, 0);
+    const checkJson = JSON.parse(Buffer.from(checkResp.stdoutBase64, "base64").toString("utf8"));
+    assert.equal(typeof checkJson.screenCapture, "boolean");
+    assert.equal(typeof checkJson.accessibility, "boolean");
+
+    const listResp = await sendReq(["list"]);
+    assert.equal(listResp.code, 0);
+    const listJson = JSON.parse(Buffer.from(listResp.stdoutBase64, "base64").toString("utf8"));
+    assert.ok(Array.isArray(listJson));
+    const mainScreen = listJson.find((w: any) => w.id === "screen:0");
+    assert.ok(mainScreen?.bounds?.width > 0);
+    assert.ok(mainScreen?.scaleFactor >= 1);
+  },
+);
+
+test("extractCommandFromTerminalScreenLine strips Starship/OMZ/Powerlevel10k/ANSI prompts cleanly", () => {
+  assert.equal(extractCommandFromTerminalScreenLine("\x1b[32m→\x1b[0m open CLAUDE.md"), "open CLAUDE.md");
+  assert.equal(
+    extractCommandFromTerminalScreenLine("➜  strum_app git:(stage) open docs/index.html"),
+    "open docs/index.html",
+  );
+  assert.equal(extractCommandFromTerminalScreenLine("❯ ego-browser nodejs"), "ego-browser nodejs");
+  assert.equal(extractCommandFromTerminalScreenLine("crosery@mac ~/app % open README.md"), "open README.md");
+  assert.equal(extractCommandFromTerminalScreenLine("→   "), "");
+  assert.equal(extractCommandFromTerminalScreenLine("\x1b[36m❯\x1b[0m"), "");
+});
+
+test("PortalManager.observeSubmittedCommand and pollWindowDeltas auto-surface files, new ppid=1 windows, browser retitles, and TCC streamError without active remote viewers", async (t) => {
+  const state = mkdtempSync(join(tmpdir(), "hp-win-delta-"));
+  const workDir = join(state, "work");
+  const binDir = join(state, "bin");
+  mkdirSync(workDir, { recursive: true });
+  writeFileSync(join(workDir, "CLAUDE.md"), "# Project Guide\nHello world\n");
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+
+  const events: PortalStreamEvent[] = [];
+  const fakeAgent = {
+    key: "h1/hc:delta1",
+    deviceId: "h1",
+    source: "hc" as const,
+    localId: "delta1",
+    harness: "shell",
+    where: "终端",
+    cwd: workDir,
+    status: "idle" as const,
+    isShell: true,
+    updatedAt: Date.now(),
+  };
+
+  let mockWindows = [
+    { id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true },
+    { id: "100", appName: "Finder", title: "访达", pid: 100, bounds: { x: 0, y: 0, width: 800, height: 600 } },
+    { id: "9002", appName: "ego lite", title: "http://127.0.0.1:8764/?t=1", pid: 778, bounds: { x: 20, y: 20, width: 960, height: 720 } },
+  ];
+  let captureFail = false;
+
+  const mgr = new PortalManager({
+    hostId: () => "h1",
+    getAgents: () => [fakeAgent],
+    getTerminals: () => new Map([["delta1", { address: "delta1", cwd: workDir, pid: 500 }]]),
+    getFilesOptions: () => ({ extraRoots: [workDir] }),
+    getDirectInfo: () => ({ port: null, addrs: [], connectedCount: 0 }),
+    hasRemoteViewers: () => false,
+    onPortalEvent: (ev) => events.push(ev),
+    stateDir: state,
+    captureDeps: {
+      platform: "darwin",
+      binDir,
+      hasCmd: (c) => c === "swiftc",
+      listProcesses: async () => [
+        { pid: 1, ppid: 0, name: "launchd" },
+        { pid: 100, ppid: 1, name: "Finder" },
+        { pid: 500, ppid: 1, name: "zsh" },
+        { pid: 777, ppid: 1, name: "Typora" },
+        { pid: 778, ppid: 1, name: "ego lite" },
+      ],
+      execBin: async (cmd, args) => {
+        if (cmd === "swiftc") {
+          const outIdx = args.indexOf("-o");
+          if (outIdx >= 0 && args[outIdx + 1]) writeFileSync(args[outIdx + 1]!, "mock-bin");
+          return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+        }
+        if (args[0] === "list") return { code: 0, stderr: "", stdout: Buffer.from(JSON.stringify(mockWindows.slice(1))) };
+        if (args[0] === "capture") {
+          if (captureFail) return { code: 1, stderr: "Screen Recording denied", stdout: Buffer.alloc(0) };
+          return { code: 0, stderr: "dims:900x700\n", stdout: Buffer.from("jpg-frame") };
+        }
+        return { code: 1, stderr: "", stdout: Buffer.alloc(0) };
+      },
+    },
+  });
+  t.after(() => mgr.stop());
+
+  // 1) Command observation works without active remote viewers and resolves unique filename prefix `CLAU` -> `CLAUDE.md`
+  mgr.observeSubmittedCommand(fakeAgent, "open CLAU", "terminal_input");
+  await new Promise((r) => setTimeout(r, 80));
+  const filePortals = mgr.listPortals(fakeAgent.key).filter((p) => p.targetPath?.endsWith("CLAUDE.md"));
+  assert.equal(filePortals.length, 1);
+
+  // 2) First pollWindowDeltas seeds pre-existing Finder / ego lite windows without opening them
+  await mgr.pollWindowDeltas();
+  assert.equal(mgr.listPortals(fakeAgent.key).filter((p) => p.kind === "window").length, 0);
+
+  // 3) LaunchServices reparented window (ppid=1) appears -> auto-opens window portal
+  mockWindows = [
+    ...mockWindows,
+    { id: "9001", appName: "Typora", title: "CLAUDE.md", pid: 777, bounds: { x: 20, y: 20, width: 900, height: 700 } },
+  ];
+  await mgr.pollWindowDeltas();
+  const win9001 = mgr.listPortals(fakeAgent.key).find((p) => p.windowId === "9001");
+  assert.ok(win9001, "expected new ppid=1 Typora window to auto-open");
+
+  // 4) Existing browser window retitles (?t=1 -> ?t=2) and Screen Recording fails -> opens with streamError populated
+  captureFail = true;
+  mockWindows = mockWindows.map((w) =>
+    w.id === "9002" ? { ...w, title: "http://127.0.0.1:8764/?t=2" } : w,
+  );
+  await mgr.pollWindowDeltas();
+  const win9002 = mgr.listPortals(fakeAgent.key).find((p) => p.windowId === "9002");
+  assert.ok(win9002, "expected retitled ego lite window to surface");
+  assert.ok(win9002.streamError && win9002.streamError.length > 0, "expected TCC capture error to be surfaced as streamError");
+  assert.ok(
+    events.some((e) => e.kind === "portal_event" && e.action === "opened" && e.item.windowId === "9002"),
+    "expected opened portal_event for retitled window",
+  );
 });

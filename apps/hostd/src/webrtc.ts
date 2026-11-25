@@ -363,6 +363,7 @@ export class WebRtcDirectServer {
         }
         onDone();
       },
+      bufferedBytes: () => (dc.readyState === "open" ? dc.bufferedAmount : 0),
     };
 
     const emitWelcome = () => {

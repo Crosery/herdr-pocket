@@ -32,6 +32,7 @@ import { HerdrAdapter } from "./herdr.ts";
 import { DirectServer, directAddrs, type DirectPeer } from "./direct.ts";
 import { WebRtcDirectServer } from "./webrtc.ts";
 import { PortalManager } from "./portal/index.ts";
+import { extractCommandFromTerminalScreenLine } from "./portal/shims.ts";
 import { ToolUpdateManager } from "./toolUpdate.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
 import { SessionHints } from "./sessionhint.ts";
@@ -166,6 +167,7 @@ export class Host {
   private streamMeta = new Map<string, { from: string; kind: StreamKind; agent: string }>();
   /** Streams opened over a direct link answer there, not through the relay. */
   private streamReply = new Map<string, (f: ClientFrame) => void>();
+  private streamPeerBufferedBytes = new Map<string, () => number>();
   /** Phones connected straight to this computer (see direct.ts). */
   direct: DirectServer;
   webrtc: WebRtcDirectServer;
@@ -358,7 +360,11 @@ export class Host {
       void this.handleRpc({ type: "rpc", id, from: peer.deviceId, method: f.method as RpcMethod, params: f.params }, (x) => peer.send(x));
     } else if (f.type === "stream_subscribe" && id && (f.stream === "terminal" || f.stream === "session" || f.stream === "portal")) {
       const reply = (x: ClientFrame) => peer.send("id" in x && typeof x.id === "string" ? { ...x, id: x.id.slice(peer.tag.length) } : x);
-      void this.handleStreamSubscribe({ type: "stream_subscribe", id: peer.tag + id, from: peer.deviceId, stream: f.stream, params: f.params }, reply);
+      void this.handleStreamSubscribe(
+        { type: "stream_subscribe", id: peer.tag + id, from: peer.deviceId, stream: f.stream, params: f.params },
+        reply,
+        peer.bufferedBytes,
+      );
     } else if (f.type === "stream_unsubscribe" && id) this.stopStream(peer.tag + id);
   }
 
@@ -831,13 +837,22 @@ export class Host {
   }
 
   private sendStream(id: string, event: unknown): void {
+    const ev = event as { kind?: string; seq?: number } | null;
+    if (ev?.kind === "portal_frame" && (ev.seq ?? 0) > 1) {
+      const buffered = this.streamPeerBufferedBytes.get(id)?.() ?? (this.ws?.bufferedAmount ?? 0);
+      if (buffered > 256 * 1024) return;
+    }
     const frame: ClientFrame = { type: "stream_event", id, event };
     const reply = this.streamReply.get(id);
     if (reply) reply(frame);
     else this.send(frame);
   }
 
-  private async handleStreamSubscribe(f: Extract<ServerFrame, { type: "stream_subscribe" }>, reply?: (x: ClientFrame) => void): Promise<void> {
+  private async handleStreamSubscribe(
+    f: Extract<ServerFrame, { type: "stream_subscribe" }>,
+    reply?: (x: ClientFrame) => void,
+    bufferedBytes?: () => number,
+  ): Promise<void> {
     const out = reply ?? ((x: ClientFrame) => this.send(x));
     const allow = this.opts.allow ?? [];
     if (allow.length && !allow.includes(f.from)) {
@@ -855,12 +870,17 @@ export class Host {
         const meta = { from: f.from, kind: "portal" as StreamKind, agent: agentObj?.key ?? "" };
         this.streamMeta.set(f.id, meta);
         if (reply) this.streamReply.set(f.id, reply);
+      if (bufferedBytes) this.streamPeerBufferedBytes.set(f.id, bufferedBytes);
+        if (bufferedBytes) this.streamPeerBufferedBytes.set(f.id, bufferedBytes);
         const stop = this.portal.subscribe(
           f.id,
           {
             ...(typeof p.portalId === "string" && p.portalId ? { portalId: p.portalId } : {}),
             ...(agentObj ? { agent: agentObj.key } : {}),
             ...(typeof p.fps === "number" ? { fps: p.fps } : {}),
+            ...(typeof p.maxWidth === "number" ? { maxWidth: p.maxWidth } : {}),
+            ...(typeof p.quality === "number" ? { quality: p.quality } : {}),
+            ...(typeof p.showCursor === "boolean" ? { showCursor: p.showCursor } : {}),
           },
           (ev) => this.sendStream(f.id, ev),
         );
@@ -881,6 +901,7 @@ export class Host {
       const meta = { from: f.from, kind: f.stream, agent: a.key };
       this.streamMeta.set(f.id, meta);
       if (reply) this.streamReply.set(f.id, reply);
+      if (bufferedBytes) this.streamPeerBufferedBytes.set(f.id, bufferedBytes);
       if (f.stream === "terminal") {
         let stop: () => void = () => undefined;
         let openedRaw = false;
@@ -1037,6 +1058,7 @@ export class Host {
       const error: RpcError = e instanceof RpcFailure ? { code: e.code, message: e.message } : { code: "internal", message: String(e) };
       this.streamMeta.delete(f.id);
       this.streamReply.delete(f.id);
+      this.streamPeerBufferedBytes.delete(f.id);
       out({ type: "stream_open", id: f.id, error });
       if (error.code !== "not_found") this.note("warn", "stream", `${f.stream} stream for ${String(agentName)} failed: ${error.code}: ${error.message}`);
     }
@@ -1075,6 +1097,7 @@ export class Host {
     this.streamStops.delete(id);
     this.streamMeta.delete(id);
     this.streamReply.delete(id);
+    this.streamPeerBufferedBytes.delete(id);
     if (meta) {
       this.note("info", "stream", `${meta.kind} stream closed ${meta.agent || "(global)"} (${this.who(meta.from)})`);
     }
@@ -1504,9 +1527,32 @@ export class Host {
       const a = this.resolve(p.agent);
       if (typeof p.data !== "string" || !p.data || p.data.length > 262_144) throw new RpcFailure("bad_request", "data is required");
       if (a.source === "hc" || (a.source === "herdr" && this.hc.terminals.has(a.localId))) {
+        let screenCmd = "";
+        if (!p.auto && /[\r\n]/.test(p.data)) {
+          try {
+            const snap = await this.hc.read(a.localId, 8);
+            const lines = (snap?.text ?? "").split("\n");
+            let lastNonEmpty = "";
+            for (let i = lines.length - 1; i >= 0; i -= 1) {
+              const l = lines[i]?.trimEnd() ?? "";
+              if (l.trim()) {
+                lastNonEmpty = l;
+                break;
+              }
+            }
+            if (lastNonEmpty && /^(?:.*(?:→|❯|➜|λ)\s+|\(?[^)]+\)?\s+[^$%#>\r\n]*[$%#>]\s+|[^$%#>\r\n]{1,64}[$%#>]\s+)/u.test(lastNonEmpty)) {
+              screenCmd = extractCommandFromTerminalScreenLine(lastNonEmpty);
+            }
+          } catch {
+            // ignore transient snapshot error before typing
+          }
+        }
         await this.hc.input(a.localId, p.data, Boolean(p.auto));
         if (!p.auto) {
           this.portal.observeTerminalInput(a, p.data);
+          if (screenCmd) {
+            this.portal.observeSubmittedCommand(a, screenCmd, "terminal_input");
+          }
         }
         return { ok: true as const };
       }
@@ -2215,7 +2261,11 @@ export class Host {
     },
     "portal.frame": async (p) => {
       if (typeof p.portalId !== "string" || !p.portalId) throw new RpcFailure("bad_request", "portalId is required");
-      return this.portal.captureFrame(p.portalId);
+      return this.portal.captureFrame(p.portalId, {
+        ...(typeof p.maxWidth === "number" ? { maxWidth: p.maxWidth } : {}),
+        ...(typeof p.quality === "number" ? { quality: p.quality } : {}),
+        ...(typeof p.showCursor === "boolean" ? { showCursor: p.showCursor } : {}),
+      });
     },
     "portal.input": async (p) => {
       this.writable();

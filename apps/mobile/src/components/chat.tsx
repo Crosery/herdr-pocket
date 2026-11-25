@@ -27,11 +27,11 @@ import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
 import { parseTerminalChatTranscript, shellTurnMatchesCommand } from "../lib/terminalChat";
 import { usePalette } from "../theme/theme";
 import { brand, fonts, radius, space, statusColors, type Palette } from "../theme/tokens";
-import { EmptyState, PocketToast, TypingDots } from "./ui";
+import { EmptyState, PocketToast } from "./ui";
 import { PocketButton, PocketSpinner } from "./pocket";
 import { Md } from "./md";
 import { ReplyDots, SendMark } from "./outbox";
-import { BusyMascot, Sparkle } from "./Mascot";
+import { Sparkle } from "./Mascot";
 import { CuteIcon } from "./icons";
 
 const clock = (ts: number) => {
@@ -518,7 +518,7 @@ const SubCtx = createContext<{
   onSwitchToTerminal?: () => void;
 } | null>(null);
 
-/** The agent's reply, always in full: folding it behind "展开全文" read as broken. */
+/** The agent's reply, always in full on the canvas surface matching t3code prose rhythm. */
 const AssistantBlock = memo(function AssistantBlock({ text, ts }: { text: string; ts?: number }) {
   const p = usePalette();
   const scale = useSettings((s) => s.textScale);
@@ -528,23 +528,14 @@ const AssistantBlock = memo(function AssistantBlock({ text, ts }: { text: string
     <View style={{ alignItems: "flex-start", gap: 4 }}>
       <View
         style={{
-          alignSelf: "flex-start",
-          ...(hasList(md) ? { width: "94%" as const } : { maxWidth: "94%" as const }),
-          backgroundColor: p.surface,
-          borderRadius: radius.card,
-          borderBottomLeftRadius: 6,
-          paddingHorizontal: space.lg,
-          paddingVertical: space.xs,
-          elevation: p.dark ? 0 : 1,
-          shadowColor: p.shadow,
-          shadowOpacity: 0.1,
-          shadowRadius: 8,
-          shadowOffset: { width: 0, height: 3 },
+          alignSelf: "stretch",
+          paddingHorizontal: 2,
+          paddingVertical: space.xxs,
         }}
       >
         <Md style={styles}>{md}</Md>
       </View>
-      {ts ? <Text style={{ color: p.faint, fontSize: 11, paddingLeft: 4 }}>{clock(ts)}</Text> : null}
+      {ts ? <Text style={{ color: p.faint, fontSize: 11, paddingLeft: 2 }}>{clock(ts)}</Text> : null}
     </View>
   );
 });
@@ -560,16 +551,20 @@ function ThinkingPill({ text, defaultOpen }: { text: string; defaultOpen?: boole
       accessibilityRole="button"
       accessibilityLabel={open ? "收起思考过程" : "展开思考过程"}
       onPress={() => setOpen((v) => !v)}
-      style={{ alignSelf: open ? "stretch" : "flex-start", maxWidth: "100%", backgroundColor: p.duskContainer, borderRadius: open ? radius.md : radius.pill, paddingHorizontal: space.md, paddingVertical: space.sm, minHeight: 36, justifyContent: "center" }}
+      style={{ alignSelf: "stretch", paddingHorizontal: 4, paddingVertical: 5, justifyContent: "center" }}
     >
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-        <MaterialCommunityIcons name="thought-bubble-outline" size={15} color={p.dusk} />
-        <Text numberOfLines={1} style={{ flexShrink: 1, color: p.dusk, fontFamily: fonts.bodySemi, fontSize: 13 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 7 }}>
+        <MaterialCommunityIcons name="brain" size={14} color={p.faint} />
+        <Text numberOfLines={1} style={{ flexShrink: 1, color: p.muted, fontFamily: fonts.bodySemi, fontSize: 13 }}>
           {open ? "思考过程" : text.trim().split("\n")[0]}
         </Text>
-        <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-down"} size={16} color={p.dusk} />
+        <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-right"} size={15} color={p.faint} />
       </View>
-      {open ? <Text selectable style={{ color: p.muted, fontSize: 13.5, lineHeight: 20, marginTop: space.sm }}>{text}</Text> : null}
+      {open ? (
+        <View style={{ marginLeft: 10, paddingLeft: 10, marginTop: 4, borderLeftWidth: 1.5, borderLeftColor: p.divider }}>
+          <Text selectable style={{ color: p.muted, fontSize: 13, lineHeight: 19 }}>{text}</Text>
+        </View>
+      ) : null}
     </Pressable>
   );
 }
@@ -675,26 +670,28 @@ function ToolGroup({
   const children = tools.map((t) => subs?.byCall.get(t.call.call_id)).filter((s): s is SubSession => !!s);
   const thoughtText = latestThought || (thoughts?.length ? thoughts[thoughts.length - 1] : undefined);
   return (
-    <View style={{ backgroundColor: p.surface2, borderRadius: radius.md, borderWidth: 1, borderColor: failed ? p.error : p.dark ? p.surface3 : "#F6E6EF" }}>
+    <View style={{ backgroundColor: open ? p.surface2 : "transparent", borderRadius: radius.sm }}>
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded: open }}
         accessibilityLabel={`${tools.length ? `用了 ${tools.length} 个工具` : `思考与记录（${entries?.length ?? thoughts?.length ?? 0}）`}${failed ? `，${failed} 个失败` : ""}${running.length ? "，还在运行" : ""}，${open ? "点按收起" : "点按展开"}`}
         onPress={() => setOpen((v) => !v)}
-        style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingHorizontal: space.md, minHeight: 42 }}
+        style={{ flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 4, minHeight: 30 }}
       >
-        <View style={{ width: 26, height: 26, borderRadius: 9, backgroundColor: p.lavenderContainer, alignItems: "center", justifyContent: "center" }}>
-          <MaterialCommunityIcons name="wrench-outline" size={15} color={p.dusk} />
-        </View>
-        <Text style={{ fontFamily: fonts.bodyBold, color: p.ink, fontSize: 13.5 }}>
+        <MaterialCommunityIcons
+          name={failed ? "alert-circle-outline" : "wrench-outline"}
+          size={14}
+          color={failed ? p.error : running.length ? p.primary : p.faint}
+        />
+        <Text style={{ fontFamily: fonts.bodySemi, color: p.muted, fontSize: 13 }}>
           {tools.length ? (thoughts?.length ? `${tools.length} 个工具 · ${thoughts.length} 段思考` : `${tools.length} 个工具`) : `思考与分析（${thoughts?.length ?? 0}）`}
         </Text>
         <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: p.faint }}>
           {names}
         </Text>
         {failed ? <Text style={{ color: p.error, fontFamily: fonts.bodyBold, fontSize: 12 }}>{failed} 个失败</Text> : null}
-        {running.length ? <PocketSpinner size={12} /> : failed ? null : <CuteIcon name="done" size={16} color={statusColors("working", p.dark).fg} fill={p.dark ? "transparent" : statusColors("working", p.dark).bg} strokeWidth={2.4} />}
-        <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-down"} size={16} color={p.faint} />
+        {running.length ? <PocketSpinner size={12} /> : null}
+        <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-right"} size={15} color={p.faint} />
       </Pressable>
       {!open && current ? (
         <Text numberOfLines={1} style={{ paddingHorizontal: space.md, paddingBottom: space.sm, fontFamily: fonts.mono, fontSize: 11.5, color: p.muted }}>
@@ -1716,7 +1713,7 @@ function workedFor(ms: number): string {
   return m < 60 ? `${m} 分钟` : m % 60 ? `${Math.floor(m / 60)} 小时 ${m % 60} 分` : `${Math.floor(m / 60)} 小时`;
 }
 
-/** Under the newest message while the agent works: the busy mascot on a soft card, and for how long. */
+/** Flat one-line working status matching t3code WorkingTimelineRow (no bulky card). */
 function WorkingBadge({
   since,
   now,
@@ -1729,63 +1726,38 @@ function WorkingBadge({
   stopping?: boolean;
 }) {
   const p = usePalette();
-  const c = statusColors("working", p.dark);
   return (
-    <View accessibilityLiveRegion="polite" style={{ flexDirection: "row", paddingTop: space.md }}>
-      <View
-        style={{
-          flexDirection: "row",
-          alignItems: "center",
-          gap: space.md,
-          backgroundColor: p.surface,
-          borderRadius: radius.card,
-          paddingLeft: space.sm,
-          paddingRight: onStop ? space.sm : space.lg,
-          paddingVertical: 6,
-          borderWidth: 1,
-          borderColor: p.dark ? p.surface3 : "#F6DDE8",
-          elevation: p.dark ? 0 : 1,
-          shadowColor: p.shadow,
-          shadowOpacity: 0.1,
-          shadowRadius: 8,
-          shadowOffset: { width: 0, height: 3 },
-        }}
-      >
-        <BusyMascot size={44} />
-        <View style={{ width: 1, alignSelf: "stretch", marginVertical: 4, backgroundColor: p.divider }} />
-        <View style={{ gap: 1 }}>
-          <Text style={{ fontFamily: fonts.cute, fontSize: 15.5, color: p.accentText }}>正在干活</Text>
-          <Text style={{ color: p.muted, fontSize: 12, fontFamily: fonts.bodySemi }}>{since ? workedFor(now - since) : "刚开始"}</Text>
-        </View>
-        <View style={{ marginLeft: space.xs }}>
-          <TypingDots color={c.fg} />
-        </View>
-        {onStop ? (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="停止当前轮"
-            disabled={stopping}
-            onPress={onStop}
-            hitSlop={6}
-            style={({ pressed }) => ({
-              flexDirection: "row",
-              alignItems: "center",
-              gap: 3,
-              paddingHorizontal: 9,
-              paddingVertical: 4,
-              borderRadius: radius.pill,
-              backgroundColor: pressed ? p.surface3 : p.accentContainer,
-              borderWidth: 1,
-              borderColor: p.primary,
-              opacity: stopping ? 0.55 : 1,
-              marginLeft: space.xs,
-            })}
-          >
-            <MaterialCommunityIcons name="stop" size={13} color={p.accentText} />
-            <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>停止</Text>
-          </Pressable>
-        ) : null}
-      </View>
+    <View
+      accessibilityLiveRegion="polite"
+      style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingTop: space.sm, paddingHorizontal: 4 }}
+    >
+      <PocketSpinner size={12} color={p.primary} />
+      <Text style={{ color: p.muted, fontSize: 13, fontFamily: fonts.bodySemi }}>
+        思考中 · {since ? workedFor(now - since) : "刚开始"}
+      </Text>
+      {onStop ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="停止当前轮"
+          disabled={stopping}
+          onPress={onStop}
+          hitSlop={6}
+          style={({ pressed }) => ({
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 3,
+            paddingHorizontal: 8,
+            paddingVertical: 3,
+            borderRadius: radius.pill,
+            backgroundColor: pressed ? p.surface3 : p.accentContainer,
+            opacity: stopping ? 0.55 : 1,
+            marginLeft: "auto",
+          })}
+        >
+          <MaterialCommunityIcons name="stop" size={12} color={p.accentText} />
+          <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>停止</Text>
+        </Pressable>
+      ) : null}
     </View>
   );
 }

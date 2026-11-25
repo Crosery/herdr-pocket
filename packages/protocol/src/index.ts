@@ -913,12 +913,12 @@ export interface RpcMethods {
     result: { ok: true };
   };
   "portal.frame": {
-    params: { portalId: string; maxWidth?: number; quality?: number };
+    params: { portalId: string; maxWidth?: number; quality?: number; showCursor?: boolean };
     result: { frame: PortalFramePayload | null; item: PortalItem | null };
   };
   "portal.input": {
     params: { portalId: string; input: PortalInputAction };
-    result: { ok: true; url?: string; title?: string };
+    result: { ok: true; url?: string; title?: string; clipboardText?: string };
   };
   "portal.fileTicket": {
     params: { agent?: string; path: string; cwd?: string; portalId?: string };
@@ -983,6 +983,7 @@ export interface HostPortalCapabilities {
   canInjectInput: boolean;
   hasCdpBrowser: boolean;
   directPort?: number | null;
+  inputPermissionNote?: string;
   notes?: string[];
 }
 
@@ -993,6 +994,8 @@ export interface RemoteWindowInfo {
   bounds?: { x: number; y: number; width: number; height: number };
   pid?: number;
   isScreen?: boolean;
+  displayIndex?: number;
+  scaleFactor?: number;
 }
 
 export interface PortalItem {
@@ -1041,6 +1044,10 @@ export interface PortalFramePayload {
   title?: string;
   canGoBack?: boolean;
   canGoForward?: boolean;
+  cursorX?: number;
+  cursorY?: number;
+  cursorVisible?: boolean;
+  captureMs?: number;
   at: number;
 }
 
@@ -1049,10 +1056,20 @@ export type PortalStreamEvent =
   | ({ kind: "portal_frame" } & PortalFramePayload);
 
 export type PortalInputAction =
-  | { type: "pointer"; action: "move" | "down" | "up" | "click" | "dblclick"; nx: number; ny: number; button?: "left" | "right" | "middle" }
-  | { type: "wheel"; nx: number; ny: number; deltaX: number; deltaY: number }
-  | { type: "key"; key: string; modifiers?: string[] }
+  | {
+      type: "pointer";
+      action: "move" | "down" | "up" | "click" | "dblclick" | "drag";
+      nx: number;
+      ny: number;
+      button?: "left" | "right" | "middle";
+      modifiers?: string[];
+    }
+  | { type: "wheel"; nx: number; ny: number; deltaX: number; deltaY: number; modifiers?: string[] }
+  | { type: "key"; key: string; modifiers?: string[]; action?: "press" | "down" | "up" }
   | { type: "text"; text: string }
+  | { type: "clipboard"; action: "get" | "set"; text?: string }
+  | { type: "config"; fps?: number; maxWidth?: number; quality?: number; showCursor?: boolean }
+  | { type: "promptPermission"; kind: "accessibility" | "screenRecording" }
   | { type: "navigate"; action: "goto" | "back" | "forward" | "reload"; url?: string };
 
 export const DIRECT_PORTAL_FS_PREFIX = "/v1/portal-fs";

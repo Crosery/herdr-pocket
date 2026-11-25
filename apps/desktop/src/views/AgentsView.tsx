@@ -898,16 +898,15 @@ function extractClipboardFiles(data: DataTransfer | null): File[] {
   return out;
 }
 
-function workedFor(ms: number): string {
+function formatCompactRunElapsed(ms: number): string {
   const sec = Math.max(0, Math.floor(ms / 1000));
-  if (sec < 5) return "刚开始";
-  if (sec < 60) return `已运行 ${sec} 秒`;
+  if (sec < 60) return `${sec}s`;
   const min = Math.floor(sec / 60);
   const remSec = sec % 60;
-  if (min < 60) return `已运行 ${min} 分 ${remSec} 秒`;
+  if (min < 60) return `${min}m ${String(remSec).padStart(2, "0")}s`;
   const hr = Math.floor(min / 60);
   const remMin = min % 60;
-  return remMin ? `已运行 ${hr} 小时 ${remMin} 分` : `已运行 ${hr} 小时`;
+  return `${hr}h ${String(remMin).padStart(2, "0")}m`;
 }
 
 export interface SubagentHeadInfo {
@@ -2540,7 +2539,7 @@ export function AgentDetailPanel({
       ? terminalQueuedItems.length
       : Math.max(0, (agent.queued ?? 0) - injectedTerminalTexts.size);
   const totalQueuedCount = queued.length + terminalQueueBadgeCount;
-  const runElapsed = workingStartRef.current ? workedFor(nowTick - workingStartRef.current) : "刚开始";
+  const runElapsed = workingStartRef.current ? formatCompactRunElapsed(nowTick - workingStartRef.current) : "";
 
   return (
     <div
@@ -2661,6 +2660,7 @@ export function AgentDetailPanel({
             }
           }}
         >
+          <div className="t3-chat-column">
           {!activeSub && !isPlainShellChat && loadingOlder ? (
             <div className="chat-top-status" role="status" aria-live="polite">
               <span className="act-spin" aria-hidden />
@@ -2828,59 +2828,30 @@ export function AgentDetailPanel({
             </>
           )}
 
-          {isTurnBusy ? (() => {
-            const lastFolded = foldedRows[foldedRows.length - 1];
-            const hasInlineRunning = Boolean(
-              lastFolded &&
-                ((lastFolded.kind === "activity_group" && lastFolded.running) ||
-                  (lastFolded.kind === "tool" && lastFolded.step.running)),
-            );
-            return (
-              <div className="agent-run-card" role="status" aria-live="polite">
-                <XiaoyangOrb mood="working" size={30} />
-                <div className="agent-run-body">
-                  <div className="agent-run-title">
-                    <span>{hasInlineRunning ? "正在运行" : activeToolLabel ? `正在执行 · ${activeToolLabel}` : "正在思考与处理"}</span>
-                    <span className="chat-typing-dots" aria-hidden>
-                      <span />
-                      <span />
-                      <span />
-                    </span>
-                  </div>
-                  <div className="agent-run-sub">{runElapsed}</div>
-                </div>
-                <button type="button" className="agent-stop-pill" onClick={interruptTurn} title="中断当前轮">
-                  <Square size={10} />
-                  <span>停止</span>
-                </button>
-              </div>
-            );
-          })() : hasSending || reconciled.awaitingReply ? (
-            <div className="agent-run-card" role="status" aria-live="polite">
-              <XiaoyangOrb mood="working" size={26} />
-              <div className="agent-run-body">
-                <div className="agent-run-title">
-                  <span>{hasSending ? "正在发送…" : "已送达，等待响应…"}</span>
-                  <span className="chat-typing-dots" aria-hidden>
-                    <span />
-                    <span />
-                    <span />
-                  </span>
-                </div>
-              </div>
+          {isTurnBusy ? (
+            <div className="t3-working-row" role="status" aria-live="polite">
+              <Brain size={13} className="t3-working-ic" />
+              <span className="t3-live-shine">
+                {activeToolLabel ? `正在执行 ${activeToolLabel}` : "思考中"}
+              </span>
+              {runElapsed ? <span className="t3-working-elapsed mono">{runElapsed}</span> : null}
+            </div>
+          ) : hasSending || reconciled.awaitingReply ? (
+            <div className="t3-working-row" role="status" aria-live="polite">
+              <span className="act-spin" aria-hidden />
+              <span className="t3-live-shine">{hasSending ? "正在发送…" : "等待响应…"}</span>
             </div>
           ) : agent.status === "blocked" ? (
-            <div className="agent-run-card blocked" role="status" aria-live="polite">
-              <XiaoyangOrb mood="waiting" size={28} />
-              <div className="agent-run-body">
-                <div className="agent-run-title">等待你的确认或输入</div>
-                {agent.statusNote ? <div className="agent-run-sub">{clip(agent.statusNote, 48)}</div> : null}
-              </div>
-              <button type="button" className="agent-stop-pill" onClick={() => selectMode("term")}>
+            <div className="t3-blocked-bar" role="status" aria-live="polite">
+              <span className="truncate">
+                等待终端确认或输入{agent.statusNote ? ` · ${clip(agent.statusNote, 48)}` : ""}
+              </span>
+              <button type="button" className="t3-blocked-btn" onClick={() => selectMode("term")}>
                 切到终端处理
               </button>
             </div>
           ) : null}
+          </div>
         </div>
 
         {!atBottom && hasAnyRenderedRows ? (
@@ -2961,6 +2932,7 @@ export function AgentDetailPanel({
           onBackMain={goRootSub}
         />
       ) : activeMode === "chat" ? (
+        <div className="t3-composer-shell">
         <div ref={composerCardRef} className={`composer-card${dragOver ? " drop-over" : ""}`} style={{ position: "relative" }}>
           {slashOpen ? (
             <SlashCommandPopup
@@ -3321,28 +3293,66 @@ export function AgentDetailPanel({
               ) : null}
             </div>
             <div className="composer-actions">
-              {isTurnBusy && !isBtwDraft && !agent.isShell && !activeSub && (composer.hasText || attachments.length > 0) ? (
-                <button
-                  type="button"
-                  className="composer-steer-pill"
-                  title="打断当前轮并立即插入发送"
-                  onClick={() => interruptComposer()}
+              {isTurnBusy && !isBtwDraft && !agent.isShell && !activeSub ? (
+                composer.hasText || attachments.length > 0 ? (
+                  <>
+                    <button
+                      type="button"
+                      className="composer-steer-pill"
+                      title="打断当前轮并立即插入发送"
+                      onClick={() => interruptComposer()}
+                    >
+                      打断发送
+                    </button>
+                    <PocketButton
+                      size="sm"
+                      className="composer-send"
+                      aria-label="发送（运行中将自动排队）"
+                      title="发送或加入排队 (Enter)"
+                      onClick={() => submitComposer()}
+                    >
+                      <Send size={14} />
+                    </PocketButton>
+                    <button
+                      type="button"
+                      className="composer-stop-btn"
+                      aria-label="中断当前轮"
+                      title="中断当前轮"
+                      onClick={interruptTurn}
+                    >
+                      <svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                        <rect x="2" y="2" width="8" height="8" rx="1.5" />
+                      </svg>
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="composer-stop-btn"
+                    aria-label="中断当前轮"
+                    title="中断当前轮"
+                    onClick={interruptTurn}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                      <rect x="2" y="2" width="8" height="8" rx="1.5" />
+                    </svg>
+                  </button>
+                )
+              ) : (
+                <PocketButton
+                  size="sm"
+                  className="composer-send"
+                  aria-label={isBtwDraft ? "发送旁路提问" : isTurnBusy ? "发送（运行中将自动排队）" : "发送"}
+                  title={isBtwDraft ? "旁路提问，不打断当前轮 (Enter)" : isTurnBusy ? "发送或加入排队 (Enter)" : "发送 (Enter)"}
+                  disabled={isBtwDraft ? !/^\/btw\s+\S/i.test(readComposerFullText().trim()) : !composer.hasText && attachments.length === 0}
+                  onClick={() => submitComposer()}
                 >
-                  打断发送
-                </button>
-              ) : null}
-              <PocketButton
-                size="sm"
-                className="composer-send"
-                aria-label={isBtwDraft ? "发送旁路提问" : isTurnBusy ? "发送（运行中将自动排队）" : "发送"}
-                title={isBtwDraft ? "旁路提问，不打断当前轮 (Enter)" : isTurnBusy ? "发送或加入排队 (Enter)" : "发送 (Enter)"}
-                disabled={isBtwDraft ? !/^\/btw\s+\S/i.test(readComposerFullText().trim()) : !composer.hasText && attachments.length === 0}
-                onClick={() => submitComposer()}
-              >
-                <Send size={14} />
-              </PocketButton>
+                  <Send size={14} />
+                </PocketButton>
+              )}
             </div>
           </div>
+        </div>
         </div>
       ) : null}
 

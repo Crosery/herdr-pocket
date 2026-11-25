@@ -5,14 +5,18 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { canActOnLocalFile } from "../src/lib/localFileActions.ts";
 import { parseFileTarget } from "../src/lib/openFileTarget.ts";
+import { extractPromptCommandFromXterm, feedLocalCommandLineBuffer } from "../src/lib/terminalCommandExtract.ts";
 import {
   buildPortalP2pUrl,
+  dismissPortalInUi,
   filterVisiblePortalItems,
   ingestPortalStreamEvent,
   isLoopbackPortalUrl,
   mapContainedPointer,
+  mapZoomedStagePointer,
   portalStore,
   resetPortalClientStateForTest,
+  stepTrackpadCursor,
 } from "../src/lib/portalClient.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -127,13 +131,17 @@ test("parseFileTarget recognizes Office, HTML, and image extensions", () => {
 test("new Batch 2 UI/docs files contain zero emojis", () => {
   const EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
   const files = [
+    "apps/desktop/src/components/ChatTimeline.tsx",
+    "apps/desktop/src/components/PortalRemoteStage.tsx",
     "apps/desktop/src/components/PortalViewerModal.tsx",
     "apps/desktop/src/components/SessionPortalPiP.tsx",
     "apps/desktop/src/lib/portalClient.ts",
     "apps/desktop/src/views/settings/ToolVersions.tsx",
     "apps/mobile/src/components/HostToolsSheet.tsx",
     "apps/mobile/src/components/MobilePortalModal.tsx",
+    "apps/mobile/src/components/chat.tsx",
     "docs/releases/v0.2.25.md",
+    "docs/releases/v0.2.42.md",
   ];
   for (const rel of files) {
     const full = join(ROOT, rel);
@@ -265,4 +273,151 @@ test("isLoopbackPortalUrl distinguishes remote loopback URLs and portal_frame cl
   assert.equal(portalStore.get().framesById["ptl-err-1"]?.seq, 1);
   assert.match(readFileSync(join(ROOT, "apps/desktop/src/components/SessionPortalPiP.tsx"), "utf8"), /去授权屏幕录制/);
   assert.match(readFileSync(join(ROOT, "apps/desktop/src/components/PortalViewerModal.tsx"), "utf8"), /去授权屏幕录制/);
+});
+
+test("mapZoomedStagePointer & stepTrackpadCursor handle zoom, pan, acceleration, and clamping", () => {
+  // Stage 1000x500, image 1000x500 -> zoom=2, panX=100, panY=-50.
+  // Clicking at center+pan => (600, 200) maps back to center (0.5, 0.5).
+  const centerHit = mapZoomedStagePointer({
+    clientX: 600,
+    clientY: 200,
+    rectLeft: 0,
+    rectTop: 0,
+    rectWidth: 1000,
+    rectHeight: 500,
+    imageWidth: 1000,
+    imageHeight: 500,
+    zoom: 2,
+    panX: 100,
+    panY: -50,
+  });
+  assert.ok(Math.abs(centerHit.nx - 0.5) < 1e-6);
+  assert.ok(Math.abs(centerHit.ny - 0.5) < 1e-6);
+  assert.equal(centerHit.inside, true);
+
+  // Far right edge beyond image => clamps to 1.0 and marks inside = false
+  const clamped = mapZoomedStagePointer({
+    clientX: 1200,
+    clientY: 250,
+    rectLeft: 0,
+    rectTop: 0,
+    rectWidth: 1000,
+    rectHeight: 500,
+    imageWidth: 1000,
+    imageHeight: 500,
+    zoom: 1,
+  });
+  assert.equal(clamped.nx, 1);
+  assert.equal(clamped.inside, false);
+
+  // Small relative trackpad nudge has near 1x precision, fast swipe accelerates, and ends clamp [0, 1]
+  const slow = stepTrackpadCursor({ nx: 0.5, ny: 0.5 }, 2, 0, 1000, 500);
+  const fast = stepTrackpadCursor({ nx: 0.5, ny: 0.5 }, 40, 0, 1000, 500);
+  assert.ok(slow.nx > 0.502 && slow.nx < 0.503);
+  assert.ok(fast.nx > 0.57);
+  const edge = stepTrackpadCursor({ nx: 0.99, ny: 0.01 }, 200, -200, 500, 500);
+  assert.deepEqual(edge, { nx: 1, ny: 0 });
+});
+
+test("extractPromptCommandFromXterm reconstructs wrapped rows and strips Starship/OMZ/ANSI prompts", () => {
+  const makeTerm = (rows: Array<{ text: string; isWrapped?: boolean }>, cursorY: number, baseY = 0) => ({
+    buffer: {
+      active: {
+        baseY,
+        cursorY,
+        length: rows.length,
+        getLine: (y: number) =>
+          rows[y]
+            ? {
+                isWrapped: rows[y]!.isWrapped,
+                translateToString: () => rows[y]!.text,
+              }
+            : undefined,
+      },
+    },
+  });
+
+  // 1) Wrapped Starship command line (split across two xterm rows)
+  assert.equal(
+    extractPromptCommandFromXterm(
+      makeTerm(
+        [
+          { text: "crosery ~/work/strum_app stage" },
+          { text: "→ open CLAU", isWrapped: false },
+          { text: "DE.md", isWrapped: true },
+        ],
+        2,
+      ),
+    ),
+    "open CLAUDE.md",
+  );
+
+  // 2) Oh-My-Zsh arrow & ANSI colors
+  assert.equal(
+    extractPromptCommandFromXterm(makeTerm([{ text: "\x1b[32m➜\x1b[0m  herdr-pocket git:(main) ego-browser nodejs" }], 0)),
+    "ego-browser nodejs",
+  );
+
+  // 3) Standard zsh prompt with %
+  assert.equal(
+    extractPromptCommandFromXterm(makeTerm([{ text: "crosery@mac ~/repo % open docs/index.html" }], 0)),
+    "open docs/index.html",
+  );
+
+  // 4) Bare empty prompt returns empty string
+  assert.equal(extractPromptCommandFromXterm(makeTerm([{ text: "→ " }], 0)), "");
+
+  // 5) feedLocalCommandLineBuffer handles backspace and word delete
+  const bufRef = { current: "" };
+  assert.deepEqual(feedLocalCommandLineBuffer(bufRef, "open foob\x7f\x7f\x7f\x7fCLAUDE.md\r"), ["open CLAUDE.md"]);
+});
+
+test("ingestPortalStreamEvent opened increments openSeqById and clears dismissedIds so SessionPortalPiP re-surfaces", () => {
+  resetPortalClientStateForTest();
+  const item = {
+    id: "ptl-reopen",
+    hostId: "h1",
+    agentKey: "h1/hc:t1",
+    kind: "window" as const,
+    title: "ego lite",
+    canInteract: true,
+    createdAt: 1000,
+    updatedAt: 1000,
+  };
+  ingestPortalStreamEvent({ kind: "portal_event", action: "opened", item, at: 1000 });
+  assert.equal(portalStore.get().openSeqById["ptl-reopen"], 1);
+  assert.equal(portalStore.get().dismissedIds["ptl-reopen"], undefined);
+
+  dismissPortalInUi("ptl-reopen");
+  assert.equal(portalStore.get().dismissedIds["ptl-reopen"], true);
+
+  ingestPortalStreamEvent({
+    kind: "portal_event",
+    action: "opened",
+    item: { ...item, title: "ego lite - updated", updatedAt: 2000 },
+    at: 2000,
+  });
+  assert.equal(portalStore.get().dismissedIds["ptl-reopen"], undefined);
+  assert.equal(portalStore.get().openSeqById["ptl-reopen"], 2);
+  resetPortalClientStateForTest();
+});
+
+test("t3code Chat UI structural contract: unboxed centered layout, no bulky bottom run card, and compact stop button", () => {
+  const agentsView = readFileSync(join(ROOT, "apps/desktop/src/views/AgentsView.tsx"), "utf8");
+  const chatTimeline = readFileSync(join(ROOT, "apps/desktop/src/components/ChatTimeline.tsx"), "utf8");
+  const mobileChat = readFileSync(join(ROOT, "apps/mobile/src/components/chat.tsx"), "utf8");
+
+  assert.ok(!agentsView.includes("agent-run-card"), "AgentsView should not render legacy agent-run-card");
+  assert.ok(!agentsView.includes("agent-stop-pill"), "AgentsView should not render legacy agent-stop-pill");
+  for (const cls of ["t3-chat-column", "t3-working-row", "t3-composer-shell", "composer-stop-btn"]) {
+    assert.ok(agentsView.includes(cls), `AgentsView missing ${cls}`);
+  }
+  for (const cls of ["t3-work-row", "t3-work-children", "t3-assistant-row", "t3-assistant-body", "t3-live-shine"]) {
+    assert.ok(chatTimeline.includes(cls), `ChatTimeline missing ${cls}`);
+  }
+  assert.ok(!mobileChat.includes("BusyMascot"), "mobile chat should not keep bulky BusyMascot working banner");
+
+  // AgentsView has 1 pre-existing ✓ at chat-shell-empty; ensure zero other emojis exist.
+  const NON_CHECKMARK_EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{2712}\u{2715}-\u{27BF}]/u;
+  assert.equal(NON_CHECKMARK_EMOJI_RE.exec(agentsView), null, "unexpected emoji in AgentsView.tsx");
 });

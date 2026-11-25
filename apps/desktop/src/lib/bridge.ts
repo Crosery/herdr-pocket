@@ -344,6 +344,17 @@ export async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+export async function readFromClipboard(): Promise<string> {
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
+      return await navigator.clipboard.readText();
+    }
+  } catch {
+    // permission denied or unsupported context
+  }
+  return "";
+}
+
 export function assetUrl(path: string): string {
   const clean = path.replace(/^\/+/, "");
   return `./assets/${clean}`;

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import type {
@@ -58,6 +58,26 @@ function delayMs(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function frameFingerprint(frame: PortalFramePayload): string {
+  const len = frame.data.length;
+  const mid = len >> 1;
+  return `${frame.width}x${frame.height}:${len}:${frame.data.slice(0, 32)}:${frame.data.slice(mid, mid + 32)}:${frame.data.slice(-32)}:${frame.cursorX?.toFixed(3) ?? ""}:${frame.cursorY?.toFixed(3) ?? ""}:${frame.cursorVisible ? 1 : 0}:${frame.url ?? ""}`;
+}
+
+interface PortalWatcher {
+  portalId?: string;
+  agentKey?: string;
+  send: (ev: PortalStreamEvent) => void;
+  timer?: NodeJS.Timeout;
+  offBrowser?: () => void;
+  fps: number;
+  maxWidth: number;
+  quality: number;
+  showCursor: boolean;
+  lastHash?: string;
+  lastSentAt?: number;
+}
+
 export class PortalManager {
   private deps: PortalManagerDeps;
   readonly tickets = new PortalFileTicketStore();
@@ -82,18 +102,13 @@ export class PortalManager {
   private scanFollowupTimers: NodeJS.Timeout[] = [];
   private scanInFlight: Promise<void> | null = null;
   private lastScanAt = 0;
+  private windowDeltaTimer: NodeJS.Timeout | null = null;
+  private windowDeltaInFlight = false;
+  private knownWindows = new Map<string, { appName: string; title: string }>();
+  private windowBaselineSeeded = false;
   private browserReviving = new Map<string, Promise<void>>();
-  private streamWatchers = new Map<
-    string,
-    {
-      portalId?: string;
-      agentKey?: string;
-      send: (ev: PortalStreamEvent) => void;
-      timer?: NodeJS.Timeout;
-      offBrowser?: () => void;
-      fps: number;
-    }
-  >();
+  private pokeTimers = new Map<string, NodeJS.Timeout>();
+  private streamWatchers = new Map<string, PortalWatcher>();
 
   constructor(deps: PortalManagerDeps) {
     this.deps = deps;
@@ -117,6 +132,7 @@ export class PortalManager {
       });
       const port = await this.hookServer.start();
       void this.ensureBaselineInitialized();
+      this.ensureWindowDeltaWatcher();
       return { ...this.shimsInfo, port };
     } catch {
       return null;
@@ -152,14 +168,23 @@ export class PortalManager {
       clearTimeout(this.scanTimer);
       this.scanTimer = null;
     }
+    if (this.windowDeltaTimer) {
+      clearInterval(this.windowDeltaTimer);
+      this.windowDeltaTimer = null;
+    }
     for (const t of this.scanFollowupTimers) clearTimeout(t);
     this.scanFollowupTimers = [];
+    for (const t of this.pokeTimers.values()) clearTimeout(t);
+    this.pokeTimers.clear();
     this.autoWindowMeta.clear();
+    this.knownWindows.clear();
+    this.windowBaselineSeeded = false;
     this.browserReviving.clear();
     for (const id of [...this.streamWatchers.keys()]) this.unsubscribe(id);
     this.hookServer?.stop();
     this.hookServer = null;
     this.browser.closeAll();
+    this.capture.dispose();
   }
 
   async capabilities(): Promise<HostPortalCapabilities> {
@@ -170,12 +195,15 @@ export class PortalManager {
       hasCdpBrowser,
       directPort: port,
     });
-    const permNote = await this.capture.checkPermissionNote().catch(() => null);
-    if (permNote) {
-      const notes = [...(caps.notes ?? []), permNote];
-      return { ...caps, notes };
-    }
-    return caps;
+    const [permNote, inputPermissionNote] = await Promise.all([
+      this.capture.checkPermissionNote().catch(() => null),
+      this.capture.checkInputPermissionNote().catch(() => null),
+    ]);
+    return {
+      ...caps,
+      ...(inputPermissionNote ? { inputPermissionNote } : {}),
+      ...(permNote ? { notes: [...(caps.notes ?? []), permNote] } : {}),
+    };
   }
 
   private resolveAgentForHook(payload: HookOpenPayload): Agent | undefined {
@@ -460,9 +488,15 @@ export class PortalManager {
           height: cap.height,
           ...(url ? { url } : {}),
           title,
+          ...(cap.cursorX !== undefined ? { cursorX: cap.cursorX, cursorY: cap.cursorY, cursorVisible: cap.cursorVisible } : {}),
+          ...(cap.captureMs !== undefined ? { captureMs: cap.captureMs } : {}),
           at: now,
         };
       } else {
+        if (hit?.bounds) {
+          width = hit.bounds.width;
+          height = hit.bounds.height;
+        }
         const permNote = await this.capture.checkPermissionNote().catch(() => null);
         streamError = permNote ?? "当前无法捕获该系统窗口画面（窗口可能已最小化、关闭，或系统未授予抓屏权限）";
       }
@@ -525,7 +559,10 @@ export class PortalManager {
     return this.capture.listWindows();
   }
 
-  async captureFrame(portalId: string): Promise<{ frame: PortalFramePayload | null; item: PortalItem | null }> {
+  async captureFrame(
+    portalId: string,
+    opts?: { maxWidth?: number; quality?: number; showCursor?: boolean; fps?: number },
+  ): Promise<{ frame: PortalFramePayload | null; item: PortalItem | null }> {
     const item = this.items.get(portalId) ?? null;
     if (!item) return { frame: null, item: null };
     if (item.kind === "browser") {
@@ -558,7 +595,7 @@ export class PortalManager {
       return { frame, item };
     }
     if (item.kind === "window") {
-      const cap = await this.capture.captureWindow(item.windowId || "screen:0");
+      const cap = await this.capture.captureWindow(item.windowId || "screen:0", opts);
       if (!cap) {
         const permNote = await this.capture.checkPermissionNote().catch(() => null);
         this.syncItemStreamError(item, permNote ?? "当前无法捕获该系统窗口画面（窗口可能已最小化、关闭，或系统未授予抓屏权限）");
@@ -573,6 +610,8 @@ export class PortalManager {
         height: cap.height,
         ...(item.url ? { url: item.url } : {}),
         title: item.title,
+        ...(cap.cursorX !== undefined ? { cursorX: cap.cursorX, cursorY: cap.cursorY, cursorVisible: cap.cursorVisible } : {}),
+        ...(cap.captureMs !== undefined ? { captureMs: cap.captureMs } : {}),
         at: Date.now(),
       };
       item.width = cap.width;
@@ -584,9 +623,133 @@ export class PortalManager {
     return { frame: null, item };
   }
 
-  async sendInput(portalId: string, input: PortalInputAction): Promise<{ url?: string; title?: string }> {
+  private sendFrameToWatcher(w: PortalWatcher, frame: PortalFramePayload, allowDedup = true): void {
+    const fp = frameFingerprint(frame);
+    const now = Date.now();
+    if (allowDedup && w.lastHash === fp && now - (w.lastSentAt ?? 0) < 900) {
+      return;
+    }
+    w.lastHash = fp;
+    w.lastSentAt = now;
+    w.send({ kind: "portal_frame", ...frame });
+  }
+
+  private startWindowWatcherLoop(streamId: string, w: PortalWatcher): void {
+    if (w.timer) {
+      clearInterval(w.timer);
+      w.timer = undefined;
+    }
+    const portalId = w.portalId;
+    if (!portalId) return;
+    let busy = false;
+    let lastErrCapAt = 0;
+    const intervalMs = Math.max(16, Math.round(1000 / Math.max(1, w.fps)));
+    const pump = () => {
+      if (busy || !this.streamWatchers.has(streamId)) return;
+      const curItem = this.items.get(portalId);
+      if (curItem?.streamError && Date.now() - lastErrCapAt < 2000) return;
+      busy = true;
+      void this.captureFrame(portalId, {
+        maxWidth: w.maxWidth,
+        quality: w.quality,
+        showCursor: w.showCursor,
+        fps: w.fps,
+      })
+        .then(({ frame }) => {
+          if (frame && this.streamWatchers.has(streamId)) {
+            this.sendFrameToWatcher(w, frame, true);
+          } else if (!frame) {
+            lastErrCapAt = Date.now();
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          busy = false;
+        });
+    };
+    w.timer = setInterval(pump, intervalMs);
+    w.timer.unref?.();
+    pump();
+  }
+
+  private scheduleInputPoke(portalId: string): void {
+    if (this.pokeTimers.has(portalId)) return;
+    const t = setTimeout(() => {
+      this.pokeTimers.delete(portalId);
+      const item = this.items.get(portalId);
+      if (!item || item.kind !== "window") return;
+      const watchers = [...this.streamWatchers.values()].filter((w) => w.portalId === portalId);
+      if (!watchers.length) return;
+      const lead = watchers[0]!;
+      void this.captureFrame(portalId, {
+        maxWidth: lead.maxWidth,
+        quality: lead.quality,
+        showCursor: lead.showCursor,
+        fps: lead.fps,
+      })
+        .then(({ frame }) => {
+          if (!frame) return;
+          for (const w of watchers) {
+            this.sendFrameToWatcher(w, frame, false);
+          }
+        })
+        .catch(() => {});
+    }, 18);
+    t.unref?.();
+    this.pokeTimers.set(portalId, t);
+  }
+
+  async sendInput(portalId: string, input: PortalInputAction): Promise<{ url?: string; title?: string; clipboardText?: string }> {
     const item = this.items.get(portalId);
     if (!item) throw new Error("回传窗口不存在或已关闭");
+
+    if (input.type === "config") {
+      for (const [streamId, w] of this.streamWatchers) {
+        if (w.portalId !== portalId) continue;
+        if (typeof input.fps === "number" && Number.isFinite(input.fps)) {
+          w.fps = Math.min(60, Math.max(1, Math.round(input.fps)));
+        }
+        if (typeof input.maxWidth === "number" && Number.isFinite(input.maxWidth)) {
+          w.maxWidth = Math.min(2560, Math.max(480, Math.round(input.maxWidth)));
+        }
+        if (typeof input.quality === "number" && Number.isFinite(input.quality)) {
+          w.quality = Math.min(92, Math.max(40, Math.round(input.quality)));
+        }
+        if (typeof input.showCursor === "boolean") {
+          w.showCursor = input.showCursor;
+        }
+        w.lastHash = undefined;
+        if (item.kind === "window") {
+          this.startWindowWatcherLoop(streamId, w);
+        }
+      }
+      if (item.kind === "browser") {
+        void this.captureFrame(portalId).catch(() => {});
+      }
+      return { title: item.title };
+    }
+
+    if (input.type === "promptPermission") {
+      await this.capture.promptPermission(input.kind);
+      return { title: item.title };
+    }
+
+    if (input.type === "clipboard") {
+      if (item.kind === "browser") {
+        const sess = this.browser.get(portalId);
+        if (sess && input.action === "set" && input.text) {
+          await sess.dispatchInput({ type: "text", text: input.text });
+          return { url: item.url, title: item.title };
+        }
+      }
+      const clipboardText = await this.capture.handleClipboard(input.action, input.text);
+      return {
+        ...(item.url ? { url: item.url } : {}),
+        title: item.title,
+        ...(clipboardText !== undefined ? { clipboardText } : {}),
+      };
+    }
+
     if (item.kind === "browser") {
       let sess = this.browser.get(portalId);
       if (!sess && item.url) {
@@ -613,6 +776,9 @@ export class PortalManager {
     if (item.kind === "window") {
       await this.capture.injectInput(item.windowId || "screen:0", input);
       item.updatedAt = Date.now();
+      if (input.type !== "pointer" || input.action !== "move") {
+        this.scheduleInputPoke(portalId);
+      }
       return { title: item.title };
     }
     throw new Error("当前回传类型不支持远程键鼠交互");
@@ -654,24 +820,24 @@ export class PortalManager {
 
   subscribe(
     streamId: string,
-    params: { portalId?: string; agent?: string; fps?: number },
+    params: { portalId?: string; agent?: string; fps?: number; maxWidth?: number; quality?: number; showCursor?: boolean },
     send: (ev: PortalStreamEvent) => void,
   ): () => void {
-    const fps = Math.min(20, Math.max(1, Number(params.fps ?? (params.portalId ? 10 : 0)) || (params.portalId ? 10 : 0)));
-    const entry: {
-      portalId?: string;
-      agentKey?: string;
-      send: (ev: PortalStreamEvent) => void;
-      timer?: NodeJS.Timeout;
-      offBrowser?: () => void;
-      fps: number;
-    } = {
+    const fps = Math.min(60, Math.max(1, Number(params.fps ?? (params.portalId ? 30 : 0)) || (params.portalId ? 30 : 0)));
+    const maxWidth = Math.min(2560, Math.max(480, Number(params.maxWidth ?? 1600) || 1600));
+    const quality = Math.min(92, Math.max(40, Number(params.quality ?? 72) || 72));
+    const showCursor = typeof params.showCursor === "boolean" ? params.showCursor : true;
+    const entry: PortalWatcher = {
       portalId: params.portalId,
       agentKey: params.agent,
       send,
       fps,
+      maxWidth,
+      quality,
+      showCursor,
     };
     this.streamWatchers.set(streamId, entry);
+    this.ensureWindowDeltaWatcher();
 
     if (params.portalId) {
       this.attachBrowserToWatcher(streamId);
@@ -681,35 +847,12 @@ export class PortalManager {
         if (!sess?.getLatestFrame()) {
           void this.captureFrame(params.portalId)
             .then(({ frame }) => {
-              if (frame && this.streamWatchers.has(streamId)) send({ kind: "portal_frame", ...frame });
+              if (frame && this.streamWatchers.has(streamId)) this.sendFrameToWatcher(entry, frame, false);
             })
             .catch(() => {});
         }
       } else if (item?.kind === "window") {
-        let busy = false;
-        let lastErrCapAt = 0;
-        const intervalMs = Math.max(60, Math.round(1000 / Math.max(1, fps)));
-        entry.timer = setInterval(() => {
-          if (busy) return;
-          const curItem = this.items.get(params.portalId!);
-          if (curItem?.streamError && Date.now() - lastErrCapAt < 2000) return;
-          busy = true;
-          void this.captureFrame(params.portalId!)
-            .then(({ frame }) => {
-              if (frame) send({ kind: "portal_frame", ...frame });
-              else lastErrCapAt = Date.now();
-            })
-            .catch(() => {})
-            .finally(() => {
-              busy = false;
-            });
-        }, intervalMs);
-        entry.timer.unref?.();
-        void this.captureFrame(params.portalId)
-          .then(({ frame }) => {
-            if (frame) send({ kind: "portal_frame", ...frame });
-          })
-          .catch(() => {});
+        this.startWindowWatcherLoop(streamId, entry);
       }
     }
 
@@ -745,6 +888,7 @@ export class PortalManager {
     windows: RemoteWindowInfo[],
     hints: string[],
     beforeIds?: Set<string>,
+    beforeTitles?: Map<string, string>,
   ): RemoteWindowInfo | undefined {
     const visible = windows.filter((w) => !w.isScreen && (w.bounds?.width ?? 200) >= 140 && (w.bounds?.height ?? 200) >= 100);
     const expandedHints = hints.flatMap((h) => {
@@ -754,6 +898,12 @@ export class PortalManager {
     const allowPocket = expandedHints.some((h) => h.includes("herdr pocket"));
     const candidates = visible.filter((w) => allowPocket || !w.appName.toLowerCase().includes("herdr pocket"));
 
+    const isFreshOrRetitled = (w: RemoteWindowInfo): boolean => {
+      if (beforeIds && !beforeIds.has(w.id)) return true;
+      if (beforeTitles && beforeTitles.has(w.id) && beforeTitles.get(w.id) !== w.title && w.title.trim() !== "") return true;
+      return false;
+    };
+
     const matchHint = (w: RemoteWindowInfo): boolean => {
       if (!expandedHints.length) return false;
       const app = w.appName.toLowerCase();
@@ -762,7 +912,7 @@ export class PortalManager {
     };
 
     if (expandedHints.length) {
-      const freshMatch = beforeIds ? candidates.find((w) => !beforeIds.has(w.id) && matchHint(w)) : undefined;
+      const freshMatch = beforeIds || beforeTitles ? candidates.find((w) => isFreshOrRetitled(w) && matchHint(w)) : undefined;
       if (freshMatch) return freshMatch;
       const matched = candidates.filter(matchHint);
       if (matched.length) {
@@ -772,13 +922,206 @@ export class PortalManager {
       }
     }
 
-    if (beforeIds) {
+    if (beforeIds || beforeTitles) {
       const freshNonTerm = candidates.find(
-        (w) => !beforeIds.has(w.id) && !TERMINAL_APP_NAMES.has(w.appName.toLowerCase()),
+        (w) => isFreshOrRetitled(w) && !TERMINAL_APP_NAMES.has(w.appName.toLowerCase()),
       );
       if (freshNonTerm) return freshNonTerm;
     }
     return undefined;
+  }
+
+  private isTrackableAppWindow(w: RemoteWindowInfo): boolean {
+    if (w.isScreen) return false;
+    if ((w.bounds?.width ?? 200) < 160 || (w.bounds?.height ?? 200) < 120) return false;
+    const app = w.appName.trim().toLowerCase();
+    if (!app) return false;
+    if (TERMINAL_APP_NAMES.has(app) || app.includes("herdr pocket")) return false;
+    if (
+      app === "system settings" ||
+      app === "系统设置" ||
+      app === "loginwindow" ||
+      app === "dock" ||
+      app === "window server" ||
+      app === "windowserver" ||
+      app === "control center" ||
+      app === "控制中心" ||
+      app === "notification center" ||
+      app === "通知中心" ||
+      app === "spotlight" ||
+      app === "聚焦" ||
+      app === "screenshot" ||
+      app === "截屏"
+    ) {
+      return false;
+    }
+    if ((app === "finder" || app === "访达") && !w.title.trim()) return false;
+    return true;
+  }
+
+  private resolveOwnerAgentForWindow(
+    w: RemoteWindowInfo,
+    procs: Map<number, { ppid: number; name: string }>,
+  ): Agent | undefined {
+    const agents = this.deps.getAgents();
+    const terms = this.deps.getTerminals();
+    const fgPidToAgent = new Map<number, Agent>();
+    const termPidToAgent = new Map<number, Agent>();
+    let wslFgAgent: Agent | undefined;
+
+    for (const agent of agents) {
+      const t = terms.get(agent.localId);
+      if (!t) continue;
+      if (t.foreground?.pid) {
+        fgPidToAgent.set(t.foreground.pid, agent);
+        if (!wslFgAgent && t.foreground.argv?.some((arg) => /\bwsl(?:\.exe)?\b/i.test(arg))) {
+          wslFgAgent = agent;
+        }
+      }
+      if (t.pid) termPidToAgent.set(t.pid, agent);
+    }
+
+    if (w.pid && (fgPidToAgent.size > 0 || termPidToAgent.size > 0)) {
+      let cur = w.pid;
+      const seen = new Set<number>();
+      for (let hop = 0; hop < PROCESS_TREE_MAX_HOPS && cur > 1 && !seen.has(cur); hop += 1) {
+        seen.add(cur);
+        const fgHit = fgPidToAgent.get(cur);
+        if (fgHit) return fgHit;
+        const termHit = termPidToAgent.get(cur);
+        if (termHit) return termHit;
+        const p = procs.get(cur);
+        if (!p || !p.ppid || p.ppid === cur) break;
+        cur = p.ppid;
+      }
+    }
+
+    const recentAgent =
+      this.lastCommandCtx && Date.now() - this.lastCommandCtx.at < 20_000
+        ? agents.find((a) => a.key === this.lastCommandCtx?.agentKey)
+        : undefined;
+    if (recentAgent) return recentAgent;
+
+    const isWinHost = (this.deps.captureDeps?.platform ?? process.platform) === "win32";
+    if (XSERVER_APP_RE.test(w.appName) && (isWinHost || wslFgAgent)) return wslFgAgent;
+    return undefined;
+  }
+
+  private ensureWindowDeltaWatcher(): void {
+    if (this.windowDeltaTimer) return;
+    this.windowDeltaTimer = setInterval(() => {
+      if (this.streamWatchers.size > 0 || this.deps.hasRemoteViewers()) {
+        void this.pollWindowDeltas().catch(() => {});
+      }
+    }, 1600);
+    this.windowDeltaTimer.unref?.();
+  }
+
+  /**
+   * Watches OS-wide window additions and title updates so newly launched windows or browsers
+   * (e.g. `open CLAUDE.md`, `ego-browser`, GUI apps launched outside PTY process trees) auto-surface in `SessionPortalPiP`.
+   */
+  async pollWindowDeltas(): Promise<void> {
+    if (this.windowDeltaInFlight) return;
+    this.windowDeltaInFlight = true;
+    try {
+      const wins = await this.capture.listWindows().catch(() => []);
+      if (!wins.length && !this.windowBaselineSeeded) return;
+      const visible = wins.filter((w) => this.isTrackableAppWindow(w));
+      if (!this.windowBaselineSeeded) {
+        this.knownWindows = new Map(visible.map((w) => [w.id, { appName: w.appName, title: w.title }]));
+        this.windowBaselineSeeded = true;
+        return;
+      }
+
+      const newWindows = visible.filter((w) => !this.knownWindows.has(w.id));
+      const procs = newWindows.some((w) => w.pid)
+        ? await this.capture.listProcessParents().catch(() => new Map<number, { ppid: number; name: string }>())
+        : new Map<number, { ppid: number; name: string }>();
+
+      const recentAgent =
+        this.lastCommandCtx && Date.now() - this.lastCommandCtx.at < 15_000
+          ? this.deps.getAgents().find((a) => a.key === this.lastCommandCtx?.agentKey)
+          : undefined;
+
+      for (const w of visible) {
+        const prev = this.knownWindows.get(w.id);
+        const existingPortal = [...this.items.values()].find((i) => i.kind === "window" && i.windowId === w.id);
+        const nextTitle = `${w.appName}${w.title && w.title !== w.appName ? ` · ${w.title}` : ""}`;
+
+        if (!prev) {
+          if (existingPortal) {
+            const meta = this.autoWindowMeta.get(existingPortal.id);
+            if (meta) meta.missCount = 0;
+            continue;
+          }
+          if (this.checkAndMarkAutoDedup(`delta-open\0${w.id}`, 2000)) continue;
+          const owner = this.resolveOwnerAgentForWindow(w, procs);
+          const { item } = await this.openPortal({
+            agentKey: owner?.key,
+            kind: "window",
+            windowId: w.id,
+            title: nextTitle,
+          });
+          this.autoWindowMeta.set(item.id, {
+            portalId: item.id,
+            windowId: w.id,
+            openedAt: Date.now(),
+            missCount: 0,
+          });
+          continue;
+        }
+
+        if (prev.title !== w.title && w.title.trim() !== "") {
+          const isBrowserApp = /ego\s*lite|\bego\b|tabbit|chrome|chromium|safari|arc|firefox|playwright/i.test(w.appName);
+          const isAutoBrowser = /\b(?:ego\s*lite|ego|tabbit|chromium|playwright|chrome\s*for\s*testing)\b/i.test(w.appName);
+          if (existingPortal) {
+            const cap = await this.capture.captureWindow(w.id).catch(() => null);
+            if (cap) {
+              this.syncItemStreamError(existingPortal, undefined);
+              this.pushWindowPortalUpdate(existingPortal, { title: nextTitle, cap });
+            } else {
+              existingPortal.title = nextTitle;
+              existingPortal.updatedAt = Date.now();
+              this.emitEvent(isBrowserApp || recentAgent ? "opened" : "updated", existingPortal);
+            }
+          } else if ((isAutoBrowser || recentAgent) && !this.checkAndMarkAutoDedup(`delta-retitle\0${w.id}`, 2000)) {
+            const { item } = await this.openPortal({
+              agentKey: recentAgent?.key,
+              kind: "window",
+              windowId: w.id,
+              title: nextTitle,
+            });
+            this.autoWindowMeta.set(item.id, {
+              portalId: item.id,
+              windowId: w.id,
+              openedAt: Date.now(),
+              missCount: 0,
+            });
+          }
+        }
+      }
+
+      this.knownWindows = new Map(visible.map((w) => [w.id, { appName: w.appName, title: w.title }]));
+
+      if (this.autoWindowMeta.size > 0 && wins.length > 0) {
+        const liveIds = new Set(visible.map((w) => w.id));
+        const now = Date.now();
+        for (const [portalId, meta] of [...this.autoWindowMeta.entries()]) {
+          if (liveIds.has(meta.windowId)) {
+            meta.missCount = 0;
+            continue;
+          }
+          if (now - meta.openedAt < 1500) continue;
+          meta.missCount += 1;
+          if (meta.missCount >= 2) {
+            this.closePortal(portalId);
+          }
+        }
+      }
+    } finally {
+      this.windowDeltaInFlight = false;
+    }
   }
 
   private pushWindowPortalUpdate(
@@ -820,6 +1163,7 @@ export class PortalManager {
     titleHint?: string;
     urlHint?: string;
     beforeIds?: Set<string>;
+    beforeTitles?: Map<string, string>;
     fallbackOpener?: Extract<AutoPortalIntent, { type: "opener" }>;
     immediate?: boolean;
   }): Promise<PortalItem | null> {
@@ -831,7 +1175,7 @@ export class PortalManager {
     for (const ms of delays) {
       if (ms > 0) await delayMs(ms);
       const wins = await this.capture.listWindows().catch(() => []);
-      const hit = this.matchWindowByHint(wins, hints, opts.beforeIds);
+      const hit = this.matchWindowByHint(wins, hints, opts.beforeIds, opts.beforeTitles);
       if (!hit) continue;
       lastHit = hit;
       const cap = await this.capture.captureWindow(hit.id).catch(() => null);
@@ -1135,7 +1479,7 @@ export class PortalManager {
     commandText: string,
     _source: "terminal_input" | "user_send" | "agent_tool" | "foreground" = "terminal_input",
   ): void {
-    if (!this.deps.hasRemoteViewers() || !commandText) return;
+    if (!commandText) return;
     this.lastCommandCtx = {
       agentKey: agent.key,
       at: Date.now(),
@@ -1147,6 +1491,23 @@ export class PortalManager {
       void this.applyAutoPortalIntent(agent, intent).catch(() => {});
     }
     this.scheduleFollowupScans([350, 1000, 2200]);
+  }
+
+  private resolveTargetWithUniquePrefix(target: string): string | null {
+    if (existsSync(target)) return target;
+    try {
+      const dir = dirname(target);
+      const baseLower = basename(target).toLowerCase();
+      if (!baseLower || !existsSync(dir)) return null;
+      const matches = readdirSync(dir).filter((name) => name.toLowerCase().startsWith(baseLower));
+      if (matches.length === 1 && matches[0]) {
+        const candidate = resolve(dir, matches[0]);
+        if (existsSync(candidate)) return candidate;
+      }
+    } catch {
+      // ignore fs errors
+    }
+    return null;
   }
 
   private async applyAutoPortalIntent(agent: Agent, intent: AutoPortalIntent): Promise<void> {
@@ -1175,6 +1536,7 @@ export class PortalManager {
         appHint: intent.app,
         urlHint: intent.url,
         beforeIds: new Set(wins.map((w) => w.id)),
+        beforeTitles: new Map(wins.map((w) => [w.id, w.title])),
         fallbackOpener: intent,
       });
       return;
@@ -1189,15 +1551,17 @@ export class PortalManager {
         appHint: BROWSER_WINDOW_HINTS,
         urlHint: url,
         beforeIds: new Set(wins.map((w) => w.id)),
+        beforeTitles: new Map(wins.map((w) => [w.id, w.title])),
         titleHint: url,
       });
       return;
     }
 
-    const target = intent.target;
-    if (!target || !existsSync(target)) return;
+    const resolvedTarget = intent.target ? this.resolveTargetWithUniquePrefix(intent.target) : null;
+    if (!resolvedTarget) return;
+    const beforeWins = await this.capture.listWindows().catch(() => []);
     const existing = [...this.items.values()].find(
-      (i) => i.agentKey === agent.key && i.kind === intent.kind && i.targetPath === target,
+      (i) => i.agentKey === agent.key && i.kind === intent.kind && i.targetPath === resolvedTarget,
     );
     if (existing) {
       existing.updatedAt = Date.now();
@@ -1206,23 +1570,23 @@ export class PortalManager {
       await this.openPortal({
         agentKey: agent.key,
         kind: intent.kind,
-        target,
+        target: resolvedTarget,
         reveal: intent.reveal,
       });
     }
 
-    if (intent.kind === "file" && !INLINE_FILE_EXT_RE.test(target)) {
-      const wins = await this.capture.listWindows().catch(() => []);
-      await this.detectAndOpenWindowPortal({
-        agent,
-        beforeIds: new Set(wins.map((w) => w.id)),
-      });
-    }
+    // Also follow up on any GUI window spawned or retitled via LaunchServices (`open CLAUDE.md` -> Typora / Preview / VS Code, etc.).
+    void this.detectAndOpenWindowPortal({
+      agent,
+      beforeIds: new Set(beforeWins.map((w) => w.id)),
+      beforeTitles: new Map(beforeWins.map((w) => [w.id, w.title])),
+      titleHint: basename(resolvedTarget),
+    }).catch(() => {});
   }
 
   /** Detect `open` / `xdg-open` / `ego-browser` / MCP browser / file-display calls from Agent turns or shell tools. */
   inspectToolCallForPortal(agent: Agent, toolName: string, input: unknown): void {
-    if (!this.deps.hasRemoteViewers() || !input || typeof input !== "object") return;
+    if (!input || typeof input !== "object") return;
     const inp = input as Record<string, unknown>;
 
     if (/bash|zsh|shell|exec|terminal|command/i.test(toolName)) {

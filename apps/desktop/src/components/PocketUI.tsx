@@ -345,6 +345,8 @@ export function PocketModal({
   title,
   subtitle,
   width = 520,
+  className = "",
+  hideHeader = false,
   children,
 }: {
   open: boolean;
@@ -352,6 +354,8 @@ export function PocketModal({
   title: string;
   subtitle?: string;
   width?: number;
+  className?: string;
+  hideHeader?: boolean;
   children: ReactNode;
 }) {
   useEffect(() => {
@@ -363,18 +367,25 @@ export function PocketModal({
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="pk-overlay" />
-        <Dialog.Content className="pk-dialog" style={{ maxWidth: width }}>
-          <div className="between" style={{ marginBottom: 12 }}>
-            <div>
-              <Dialog.Title className="pk-dialog-title">{title}</Dialog.Title>
-              {subtitle ? <Dialog.Description className="faint">{subtitle}</Dialog.Description> : null}
+        <Dialog.Content className={`pk-dialog${className ? ` ${className}` : ""}`} style={{ maxWidth: width }}>
+          {hideHeader ? (
+            <>
+              <Dialog.Title className="sr-only">{title}</Dialog.Title>
+              {subtitle ? <Dialog.Description className="sr-only">{subtitle}</Dialog.Description> : null}
+            </>
+          ) : (
+            <div className="between" style={{ marginBottom: 12 }}>
+              <div>
+                <Dialog.Title className="pk-dialog-title">{title}</Dialog.Title>
+                {subtitle ? <Dialog.Description className="faint">{subtitle}</Dialog.Description> : null}
+              </div>
+              <Dialog.Close asChild>
+                <PocketIconButton size="sm" aria-label="关闭">
+                  <X size={16} />
+                </PocketIconButton>
+              </Dialog.Close>
             </div>
-            <Dialog.Close asChild>
-              <PocketIconButton size="sm" aria-label="关闭">
-                <X size={16} />
-              </PocketIconButton>
-            </Dialog.Close>
-          </div>
+          )}
           {children}
         </Dialog.Content>
       </Dialog.Portal>

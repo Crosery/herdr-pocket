@@ -636,7 +636,8 @@ function demoWindowsForHost(hostId: string): RemoteWindowInfo[] {
     ];
   }
   return [
-    { id: "screen:0", appName: "macOS Display", title: "内建视网膜显示器", bounds: { x: 0, y: 0, width: 1728, height: 1117 }, isScreen: true },
+    { id: "screen:0", appName: "macOS 桌面", title: "屏幕 1 (1728×1117)", displayIndex: 0, scaleFactor: 2, bounds: { x: 0, y: 0, width: 1728, height: 1117 }, isScreen: true },
+    { id: "screen:1", appName: "macOS 桌面", title: "扩展显示器 2 (2560×1440)", displayIndex: 1, scaleFactor: 1, bounds: { x: 1728, y: 0, width: 2560, height: 1440 }, isScreen: true },
     { id: "win:chrome-1", appName: "Google Chrome", title: "GitHub OAuth 登录授权", bounds: { x: 120, y: 90, width: 1140, height: 780 }, pid: 4120 },
     { id: "win:finder-1", appName: "Finder", title: "docs — external-delivery-sequence.html", bounds: { x: 220, y: 140, width: 880, height: 560 }, pid: 418 },
   ];
@@ -683,9 +684,22 @@ const demoPortals: PortalItem[] = [
 const FALLBACK_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-function renderDemoFramePngBase64(item: PortalItem): { data: string; width: number; height: number } {
+const mockCursorByPortal = new Map<string, { nx: number; ny: number; lastAction: string; showCursor: boolean; fps: number; maxWidth: number; quality: number }>();
+let mockClipboardText = "https://example.com/demo-copied-from-remote";
+
+function demoPortalMeta(portalId: string) {
+  let meta = mockCursorByPortal.get(portalId);
+  if (!meta) {
+    meta = { nx: 0.42, ny: 0.56, lastAction: "ready", showCursor: true, fps: 60, maxWidth: 1600, quality: 72 };
+    mockCursorByPortal.set(portalId, meta);
+  }
+  return meta;
+}
+
+function renderDemoFramePngBase64(item: PortalItem): { data: string; width: number; height: number; cursorX: number; cursorY: number; cursorVisible: boolean } {
+  const meta = demoPortalMeta(item.id);
   if (typeof document === "undefined") {
-    return { data: FALLBACK_PNG_B64, width: 960, height: 600 };
+    return { data: FALLBACK_PNG_B64, width: 960, height: 600, cursorX: meta.nx, cursorY: meta.ny, cursorVisible: true };
   }
   try {
     const w = 960;
@@ -694,7 +708,7 @@ function renderDemoFramePngBase64(item: PortalItem): { data: string; width: numb
     canvas.width = w;
     canvas.height = h;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return { data: FALLBACK_PNG_B64, width: w, height: h };
+    if (!ctx) return { data: FALLBACK_PNG_B64, width: w, height: h, cursorX: meta.nx, cursorY: meta.ny, cursorVisible: true };
 
     ctx.fillStyle = "#fff9fb";
     ctx.fillRect(0, 0, w, h);
@@ -721,7 +735,7 @@ function renderDemoFramePngBase64(item: PortalItem): { data: string; width: numb
     ctx.strokeRect(48, 86, w - 96, 46);
     ctx.fillStyle = "#6b7280";
     ctx.font = "15px monospace";
-    ctx.fillText((item.url || item.targetPath || "p2p://remote-surface").slice(0, 72), 68, 114);
+    ctx.fillText((item.url || item.targetPath || `p2p://remote-surface · ${meta.maxWidth}p · ${meta.fps}fps`).slice(0, 72), 68, 114);
 
     // Center card
     ctx.fillStyle = "#ffffff";
@@ -731,25 +745,41 @@ function renderDemoFramePngBase64(item: PortalItem): { data: string; width: numb
 
     ctx.fillStyle = "#9d174d";
     ctx.font = "700 24px sans-serif";
-    ctx.fillText(item.kind === "browser" ? "Remote OAuth / Browser Session" : "Remote OS Window Capture", 220, 250);
+    ctx.fillText(item.kind === "browser" ? "Remote OAuth / Browser Session" : "Remote OS Window Capture", 200, 245);
 
     ctx.fillStyle = "#4b5563";
     ctx.font = "16px sans-serif";
-    ctx.fillText("Transport: P2P Direct Link · Interactive Pointer & Keyboard Enabled", 220, 298);
+    ctx.fillText(`Transport: P2P Direct Link · Cursor (${meta.nx.toFixed(2)}, ${meta.ny.toFixed(2)}) · ${meta.lastAction}`, 200, 294);
 
     ctx.fillStyle = "#ec4899";
-    ctx.fillRect(220, 348, 220, 48);
+    ctx.fillRect(200, 344, 240, 48);
     ctx.fillStyle = "#ffffff";
     ctx.font = "600 16px sans-serif";
-    ctx.fillText("Continue / Authorize", 252, 378);
+    ctx.fillText("Continue / Authorize", 238, 374);
+
+    if (meta.showCursor) {
+      const cx = meta.nx * w;
+      const cy = meta.ny * h;
+      ctx.fillStyle = "#18121e";
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + 16, cy + 11);
+      ctx.lineTo(cx + 7, cy + 13);
+      ctx.lineTo(cx + 4, cy + 21);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
 
     const url = canvas.toDataURL("image/png");
     const b64 = url.split(",")[1];
-    if (b64) return { data: b64, width: w, height: h };
+    if (b64) return { data: b64, width: w, height: h, cursorX: meta.nx, cursorY: meta.ny, cursorVisible: true };
   } catch {
     // fallback below
   }
-  return { data: FALLBACK_PNG_B64, width: 960, height: 600 };
+  return { data: FALLBACK_PNG_B64, width: 960, height: 600, cursorX: meta.nx, cursorY: meta.ny, cursorVisible: true };
 }
 
 type MockPortalWatcher = {
@@ -765,6 +795,34 @@ function emitMockPortalEvent(action: "opened" | "updated" | "closed", item: Port
   for (const w of demoPortalWatchers) {
     if (w.to !== item.hostId) continue;
     if (w.agent && item.agentKey && w.agent !== item.agentKey) continue;
+    if (w.portalId && w.portalId !== item.id) continue;
+    w.onEvent(ev);
+  }
+}
+
+function emitMockPortalFrame(item: PortalItem): void {
+  if (item.kind !== "browser" && item.kind !== "window") return;
+  const rendered = renderDemoFramePngBase64(item);
+  const ev: PortalStreamEvent = {
+    kind: "portal_frame",
+    portalId: item.id,
+    seq: demoFrameSeq++,
+    mime: "image/png",
+    data: rendered.data,
+    width: rendered.width,
+    height: rendered.height,
+    cursorX: rendered.cursorX,
+    cursorY: rendered.cursorY,
+    cursorVisible: rendered.cursorVisible,
+    captureMs: 6,
+    ...(item.url ? { url: item.url } : {}),
+    title: item.title,
+    canGoBack: item.kind === "browser",
+    canGoForward: false,
+    at: Date.now(),
+  };
+  for (const w of demoPortalWatchers) {
+    if (w.to !== item.hostId) continue;
     if (w.portalId && w.portalId !== item.id) continue;
     w.onEvent(ev);
   }
@@ -1705,6 +1763,10 @@ export const mockApi = {
         data: rendered.data,
         width: rendered.width,
         height: rendered.height,
+        cursorX: rendered.cursorX,
+        cursorY: rendered.cursorY,
+        cursorVisible: rendered.cursorVisible,
+        captureMs: 6,
         ...(item.url ? { url: item.url } : {}),
         title: item.title,
         canGoBack: item.kind === "browser",
@@ -1717,11 +1779,54 @@ export const mockApi = {
       const item = demoPortals.find((p) => p.id === params?.portalId);
       if (!item) throw new Error("回传窗口不存在或已关闭");
       const input = params?.input as PortalInputAction | undefined;
-      if (input?.type === "navigate" && input.action === "goto" && input.url) {
-        item.url = input.url;
-        item.subtitle = input.url;
-        item.updatedAt = Date.now();
-        emitMockPortalEvent("updated", item);
+      const meta = demoPortalMeta(item.id);
+      if (input?.type === "navigate") {
+        if (input.action === "goto" && input.url) {
+          item.url = input.url;
+          item.subtitle = input.url;
+          item.updatedAt = Date.now();
+          emitMockPortalEvent("updated", item);
+        }
+        meta.lastAction = `nav:${input.action}`;
+        emitMockPortalFrame(item);
+      } else if (input?.type === "pointer") {
+        meta.nx = Math.max(0, Math.min(1, input.nx));
+        meta.ny = Math.max(0, Math.min(1, input.ny));
+        meta.lastAction = `${input.action}:${input.button ?? "left"}`;
+        emitMockPortalFrame(item);
+      } else if (input?.type === "wheel") {
+        if (typeof input.nx === "number" && typeof input.ny === "number") {
+          meta.nx = Math.max(0, Math.min(1, input.nx));
+          meta.ny = Math.max(0, Math.min(1, input.ny));
+        }
+        meta.lastAction = `wheel(${Math.round(input.deltaX ?? 0)},${Math.round(input.deltaY ?? 0)})`;
+        emitMockPortalFrame(item);
+      } else if (input?.type === "key") {
+        meta.lastAction = `key:${input.modifiers?.length ? `${input.modifiers.join("+")}+` : ""}${input.key}`;
+        emitMockPortalFrame(item);
+      } else if (input?.type === "text") {
+        meta.lastAction = `text:${String(input.text ?? "").slice(0, 14)}`;
+        emitMockPortalFrame(item);
+      } else if (input?.type === "config") {
+        if (typeof input.fps === "number") meta.fps = Math.max(0, Math.min(60, input.fps));
+        if (typeof input.maxWidth === "number") meta.maxWidth = Math.max(480, Math.min(3840, input.maxWidth));
+        if (typeof input.quality === "number") meta.quality = Math.max(20, Math.min(100, input.quality));
+        if (typeof input.showCursor === "boolean") meta.showCursor = input.showCursor;
+        meta.lastAction = `config:${meta.maxWidth}p/${meta.fps}fps`;
+        emitMockPortalFrame(item);
+      } else if (input?.type === "clipboard") {
+        if (input.action === "set") {
+          mockClipboardText = String(input.text ?? "");
+          meta.lastAction = "clipboard:set";
+          emitMockPortalFrame(item);
+          return { ok: true, clipboardText: mockClipboardText, ...(item.url ? { url: item.url } : {}), title: item.title };
+        }
+        meta.lastAction = "clipboard:get";
+        emitMockPortalFrame(item);
+        return { ok: true, clipboardText: mockClipboardText, ...(item.url ? { url: item.url } : {}), title: item.title };
+      } else if (input?.type === "promptPermission") {
+        meta.lastAction = `perm:${input.kind}`;
+        emitMockPortalFrame(item);
       }
       return { ok: true, ...(item.url ? { url: item.url } : {}), title: item.title };
     }
@@ -1768,9 +1873,15 @@ export const mockApi = {
       demoPortalWatchers.add(watcher);
       const items = demoPortals.filter((p) => p.hostId === to && (!agent || !p.agentKey || p.agentKey === agent));
       onState?.({ kind: "live", result: { items } });
+      let timer: ReturnType<typeof setInterval> | null = null;
       if (portalId) {
         const target = demoPortals.find((p) => p.id === portalId);
         if (target && (target.kind === "browser" || target.kind === "window")) {
+          const meta = demoPortalMeta(target.id);
+          if (typeof params?.fps === "number") meta.fps = Math.max(0, Math.min(60, params.fps));
+          if (typeof params?.maxWidth === "number") meta.maxWidth = Math.max(480, Math.min(3840, params.maxWidth));
+          if (typeof params?.quality === "number") meta.quality = Math.max(20, Math.min(100, params.quality));
+          if (typeof params?.showCursor === "boolean") meta.showCursor = params.showCursor;
           const rendered = renderDemoFramePngBase64(target);
           onEvent({
             kind: "portal_frame",
@@ -1780,15 +1891,44 @@ export const mockApi = {
             data: rendered.data,
             width: rendered.width,
             height: rendered.height,
+            cursorX: rendered.cursorX,
+            cursorY: rendered.cursorY,
+            cursorVisible: rendered.cursorVisible,
+            captureMs: 6,
             ...(target.url ? { url: target.url } : {}),
             title: target.title,
             canGoBack: target.kind === "browser",
             canGoForward: false,
             at: Date.now(),
           } satisfies PortalStreamEvent);
+          timer = setInterval(() => {
+            if (meta.fps <= 0) return;
+            const liveTarget = demoPortals.find((p) => p.id === portalId);
+            if (!liveTarget || (liveTarget.kind !== "browser" && liveTarget.kind !== "window")) return;
+            const liveRendered = renderDemoFramePngBase64(liveTarget);
+            onEvent({
+              kind: "portal_frame",
+              portalId: liveTarget.id,
+              seq: demoFrameSeq++,
+              mime: "image/png",
+              data: liveRendered.data,
+              width: liveRendered.width,
+              height: liveRendered.height,
+              cursorX: liveRendered.cursorX,
+              cursorY: liveRendered.cursorY,
+              cursorVisible: liveRendered.cursorVisible,
+              captureMs: 6,
+              ...(liveTarget.url ? { url: liveTarget.url } : {}),
+              title: liveTarget.title,
+              canGoBack: liveTarget.kind === "browser",
+              canGoForward: false,
+              at: Date.now(),
+            } satisfies PortalStreamEvent);
+          }, 500);
         }
       }
       return () => {
+        if (timer !== null) clearInterval(timer);
         demoPortalWatchers.delete(watcher);
       };
     }

@@ -96,6 +96,7 @@ export function SessionPortalPiP({
   const framesById = portalStore.use((s) => s.framesById);
   const dismissedIds = portalStore.use((s) => s.dismissedIds);
   const manualIds = portalStore.use((s) => s.manualIds);
+  const openSeqById = portalStore.use((s) => s.openSeqById);
   const directAddr = liveStore.use((s) => s.direct[agent.deviceId]);
   const localHostId = useLocalHostDeviceId();
   const isTauriApp = isTauri();
@@ -119,22 +120,29 @@ export function SessionPortalPiP({
   const [gesture, setGesture] = useState<"idle" | "drag" | "resize">("idle");
   const [htmlPreview, setHtmlPreview] = useState<{ portalId: string; memUrl?: string | null; srcDoc?: string } | null>(null);
   const [imgPreview, setImgPreview] = useState<{ portalId: string; dataUri: string } | null>(null);
+  const [textPreview, setTextPreview] = useState<{ portalId: string; text: string } | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const prevTopIdRef = useRef<string | null>(null);
+  const prevTopSigRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!visible) return;
     return subscribeAgentPortalUpdates(agent.deviceId, agent.key);
   }, [agent.deviceId, agent.key, visible]);
 
+  const topId = items[0]?.id ?? null;
+  const topOpenSeq = topId ? (openSeqById[topId] ?? 0) : 0;
   useEffect(() => {
-    const topId = items[0]?.id ?? null;
-    if (topId && topId !== prevTopIdRef.current) {
+    if (!topId) {
+      prevTopSigRef.current = null;
+      return;
+    }
+    const sig = `${topId}:${topOpenSeq}`;
+    if (sig !== prevTopSigRef.current) {
       setIndex(0);
       setCollapsed(false);
     }
-    prevTopIdRef.current = topId;
-  }, [items]);
+    prevTopSigRef.current = sig;
+  }, [topId, topOpenSeq]);
 
   useEffect(() => {
     const onResize = () => {
@@ -162,7 +170,7 @@ export function SessionPortalPiP({
 
   useEffect(() => {
     if (!visible || collapsed || !currentHostId || !currentId || !currentCanInteract) return;
-    return subscribePortalFrames(currentHostId, currentId, 6);
+    return subscribePortalFrames(currentHostId, currentId, { fps: 12, maxWidth: 960, quality: 68 });
   }, [collapsed, currentCanInteract, currentHostId, currentId, visible]);
 
   useEffect(() => {
@@ -233,6 +241,32 @@ export function SessionPortalPiP({
     };
   }, [agent.key, collapsed, currentHostId, currentId, currentPath, imgPreview?.dataUri, imgPreview?.portalId, isInlineImageFile, visible]);
 
+  const isInlineTextFile = currentKind === "file" && !isInlineImageFile;
+
+  useEffect(() => {
+    if (!currentId || !isInlineTextFile) {
+      setTextPreview(null);
+      return;
+    }
+    if (!visible || collapsed || !currentHostId || !currentPath) return;
+    if (textPreview?.portalId === currentId && textPreview.text) return;
+    let alive = true;
+    void rpcCall(currentHostId, "files.read", {
+      agent: agent.key,
+      path: currentPath,
+    })
+      .then((res) => {
+        if (!alive || !res?.text) return;
+        setTextPreview({ portalId: currentId, text: res.text.slice(0, 1200) });
+      })
+      .catch(() => {
+        if (alive) setTextPreview(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [agent.key, collapsed, currentHostId, currentId, currentPath, isInlineTextFile, textPreview?.portalId, textPreview?.text, visible]);
+
   const isSameLocalHost = Boolean(isTauriApp && localHostId && current?.hostId === localHostId);
   const needsMacScreenPerm = Boolean(
     isTauriApp &&
@@ -270,6 +304,7 @@ export function SessionPortalPiP({
   const frame = framesById[current.id];
   const activeHtml = htmlPreview?.portalId === current.id ? htmlPreview : null;
   const activeImg = imgPreview?.portalId === current.id ? imgPreview : null;
+  const activeText = textPreview?.portalId === current.id ? textPreview : null;
   const safeExternalUrl =
     current.url && /^https?:\/\//i.test(current.url) && (isSameLocalHost || !isLoopbackPortalUrl(current.url))
       ? current.url
@@ -565,6 +600,9 @@ export function SessionPortalPiP({
               >
                 {current.streamError || current.highlightName || current.subtitle || current.url || current.targetPath || current.title}
               </div>
+              {activeText && !current.streamError ? (
+                <pre className="session-portal-pip-text mono">{activeText.text}</pre>
+              ) : null}
               {needsMacScreenPerm ? (
                 <div className="session-portal-pip-card-act">
                   <PocketButton

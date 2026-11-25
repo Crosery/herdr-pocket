@@ -5,6 +5,7 @@ import {
   Keyboard,
   Mic,
   MicOff,
+  MousePointer,
   PhoneCall,
   PhoneOff,
   Power,
@@ -95,7 +96,7 @@ const PERMISSION_INFO: Record<PermissionKind, { title: string; why: string; how:
   },
   accessibility: {
     title: "辅助功能",
-    why: "无需开启",
+    why: "跨端远控时向本机注入真实鼠标移动、点击、拖拽与键盘快捷键时需要",
     how: "系统设置 › 隐私与安全性 › 辅助功能",
   },
   inputMonitoring: {
@@ -140,11 +141,12 @@ const DEMO_PERMS: Permissions = {
   notes: [],
 };
 
-type MacRepairableKind = "inputMonitoring" | "screenRecording";
-type VisiblePermKind = "screenRecording" | "microphone" | "inputMonitoring";
+type MacRepairableKind = "inputMonitoring" | "screenRecording" | "accessibility";
+type VisiblePermKind = "screenRecording" | "accessibility" | "microphone" | "inputMonitoring";
 
 function PermissionRowIcon({ kind }: { kind: VisiblePermKind }) {
   if (kind === "screenRecording") return <AppWindow size={16} />;
+  if (kind === "accessibility") return <MousePointer size={16} />;
   if (kind === "microphone") return <Mic size={16} />;
   return <Keyboard size={16} />;
 }
@@ -161,7 +163,7 @@ export function PermissionCards({
   checking: boolean;
   /** The hotkey is one modifier tapped alone: Input Monitoring is needed (macOS). */
   singleKey?: boolean;
-  /** `voice`: microphone + inputMonitoring; `all`: also includes screenRecording in Privacy settings. */
+  /** `voice`: microphone + inputMonitoring; `all`: also includes screenRecording & accessibility in Privacy settings. */
   scope?: "voice" | "all";
 }) {
   const toast = useToast();
@@ -178,7 +180,7 @@ export function PermissionCards({
   const isMac = effectivePerms?.platform ? effectivePerms.platform === "macos" : MAC;
   const kinds: VisiblePermKind[] = isMac
     ? scope === "all"
-      ? ["screenRecording", "microphone", "inputMonitoring"]
+      ? ["screenRecording", "accessibility", "microphone", "inputMonitoring"]
       : ["microphone", "inputMonitoring"]
     : ["microphone"];
 
@@ -195,6 +197,10 @@ export function PermissionCards({
         delete next.screenRecording;
         changed = true;
       }
+      if (prev.accessibility && effectivePerms.accessibility === "granted") {
+        delete next.accessibility;
+        changed = true;
+      }
       return changed ? next : prev;
     });
   }, [effectivePerms]);
@@ -207,7 +213,10 @@ export function PermissionCards({
     });
   }, [onChanged]);
 
-  const watchingPending = isMac && native.available() && Boolean(pendingGrant.inputMonitoring || pendingGrant.screenRecording);
+  const watchingPending =
+    isMac &&
+    native.available() &&
+    Boolean(pendingGrant.inputMonitoring || pendingGrant.screenRecording || pendingGrant.accessibility);
   useEffect(() => {
     if (!watchingPending) return;
     let alive = true;
@@ -216,7 +225,8 @@ export function PermissionCards({
       if (!alive || !next) return;
       const grantedNow =
         (pendingGrant.inputMonitoring && next.inputMonitoring === "granted") ||
-        (pendingGrant.screenRecording && next.screenRecording === "granted");
+        (pendingGrant.screenRecording && next.screenRecording === "granted") ||
+        (pendingGrant.accessibility && next.accessibility === "granted");
       if (grantedNow) {
         await native.voiceReload().catch(() => false);
       }
@@ -236,10 +246,10 @@ export function PermissionCards({
       window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [watchingPending, pendingGrant.inputMonitoring, pendingGrant.screenRecording, onChanged]);
+  }, [watchingPending, pendingGrant.accessibility, pendingGrant.inputMonitoring, pendingGrant.screenRecording, onChanged]);
 
   const handleGrant = async (k: VisiblePermKind, state: Permission) => {
-    if (isMac && (k === "inputMonitoring" || k === "screenRecording")) {
+    if (isMac && (k === "inputMonitoring" || k === "screenRecording" || k === "accessibility")) {
       setPendingGrant((prev) => ({ ...prev, [k]: true }));
     }
     if (!native.available()) {
@@ -304,7 +314,7 @@ export function PermissionCards({
         if (state === "notApplicable") return null;
         const label = PERM_LABEL[state];
         const done = state === "granted";
-        const isMacRepairable = isMac && (k === "inputMonitoring" || k === "screenRecording");
+        const isMacRepairable = isMac && (k === "inputMonitoring" || k === "screenRecording" || k === "accessibility");
         const showPendingBar = isMacRepairable && !done && Boolean(pendingGrant[k]);
         const optionalCombo = isMac && k === "inputMonitoring" && !singleKey;
         return (
