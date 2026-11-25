@@ -416,15 +416,57 @@ fn stage_macos_dmg(dmg_path: &Path, stage_root: &Path) -> Result<PathBuf, String
     Ok(staged_app)
 }
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn pick_preferred_codesign_identity(find_identity_stdout: &str) -> Option<String> {
+    let mut local_signer: Option<String> = None;
+    let mut dev_id: Option<String> = None;
+    let mut apple_dev: Option<String> = None;
+
+    for raw in find_identity_stdout.lines() {
+        let line = raw.trim();
+        if line.contains("CSSMERR_") || line.contains("REVOKED") {
+            continue;
+        }
+        let Some((_, rest)) = line.split_once(')') else {
+            continue;
+        };
+        let rest = rest.trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let sha = parts.next().unwrap_or("").trim();
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let label = parts.next().unwrap_or("").trim();
+        let sha_upper = sha.to_ascii_uppercase();
+        if label.contains("Herdr Pocket Local Signer") && local_signer.is_none() {
+            local_signer = Some(sha_upper);
+        } else if label.contains("Developer ID Application:") && dev_id.is_none() {
+            dev_id = Some(sha_upper);
+        } else if label.contains("Apple Development:") && apple_dev.is_none() {
+            apple_dev = Some(sha_upper);
+        }
+    }
+
+    local_signer.or(dev_id).or(apple_dev)
+}
+
 #[cfg(target_os = "macos")]
-fn ensure_local_codesign_identity() -> Option<String> {
+fn query_valid_codesign_identity() -> Option<String> {
     let list_out = Command::new("security")
         .args(["find-identity", "-v", "-p", "codesigning"])
         .output()
         .ok()?;
+    if !list_out.status.success() {
+        return None;
+    }
     let list_stdout = String::from_utf8_lossy(&list_out.stdout);
-    if list_stdout.contains(LOCAL_SIGNER_CN) {
-        return Some(LOCAL_SIGNER_CN.to_string());
+    pick_preferred_codesign_identity(&list_stdout)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_local_codesign_identity() -> Option<String> {
+    if let Some(existing) = query_valid_codesign_identity() {
+        return Some(existing);
     }
 
     let home = std::env::var_os("HOME")?;
@@ -438,8 +480,17 @@ fn ensure_local_codesign_identity() -> Option<String> {
     let key_path = tmp_dir.join("signer.key");
     let cert_path = tmp_dir.join("signer.crt");
     let p12_path = tmp_dir.join("signer.p12");
+    let cfg_path = tmp_dir.join("signer.cnf");
+    let openssl_cfg = "[req]\ndistinguished_name=dn\n[dn]\n[v3_cs]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n";
+    let _ = fs::write(&cfg_path, openssl_cfg);
 
-    let gen = Command::new("openssl")
+    let openssl_bin = if Path::new("/usr/bin/openssl").exists() {
+        "/usr/bin/openssl"
+    } else {
+        "openssl"
+    };
+
+    let gen = Command::new(openssl_bin)
         .args([
             "req",
             "-x509",
@@ -450,10 +501,10 @@ fn ensure_local_codesign_identity() -> Option<String> {
             "3650",
             "-subj",
             &format!("/CN={LOCAL_SIGNER_CN}"),
-            "-addext",
-            "keyUsage=critical,digitalSignature",
-            "-addext",
-            "extendedKeyUsage=critical,codeSigning",
+            "-extensions",
+            "v3_cs",
+            "-config",
+            &cfg_path.to_string_lossy(),
             "-keyout",
             &key_path.to_string_lossy(),
             "-out",
@@ -461,9 +512,9 @@ fn ensure_local_codesign_identity() -> Option<String> {
         ])
         .output();
 
-    let ok = match gen {
+    let imported = match gen {
         Ok(o) if o.status.success() => {
-            let p12 = Command::new("openssl")
+            let p12 = Command::new(openssl_bin)
                 .args([
                     "pkcs12",
                     "-export",
@@ -499,8 +550,8 @@ fn ensure_local_codesign_identity() -> Option<String> {
         _ => false,
     };
     let _ = fs::remove_dir_all(&tmp_dir);
-    if ok {
-        Some(LOCAL_SIGNER_CN.to_string())
+    if imported {
+        query_valid_codesign_identity()
     } else {
         None
     }
@@ -523,15 +574,26 @@ fn maybe_resign_adhoc_macos_app(staged_app: &Path) {
     let Some(identity) = ensure_local_codesign_identity() else {
         return;
     };
-    let _ = Command::new("codesign")
-        .args([
-            "--force",
-            "--deep",
-            "--sign",
-            &identity,
-            &staged_app.to_string_lossy(),
-        ])
-        .output();
+    let ent_dir = std::env::temp_dir().join(format!("herdr-ent-{}", std::process::id()));
+    let _ = fs::create_dir_all(&ent_dir);
+    let ent_path = ent_dir.join("entitlements.plist");
+    if fs::write(&ent_path, include_bytes!("../entitlements.plist")).is_ok() {
+        let _ = Command::new("codesign")
+            .args([
+                "--force",
+                "--deep",
+                "--options",
+                "runtime",
+                "--timestamp=none",
+                "--entitlements",
+                &ent_path.to_string_lossy(),
+                "--sign",
+                &identity,
+                &staged_app.to_string_lossy(),
+            ])
+            .output();
+    }
+    let _ = fs::remove_dir_all(&ent_dir);
 }
 
 #[tauri::command]
@@ -841,26 +903,19 @@ while kill -0 "$OLD_PID" 2>/dev/null && [ "$i" -lt 120 ]; do
   sleep 0.1
   i=$((i + 1))
 done
-if command -v rsync >/dev/null 2>&1 && [ -d "$TARGET_APP/Contents" ]; then
-  if rsync -a --delete "$STAGED_APP/Contents/" "$TARGET_APP/Contents/" 2>/dev/null; then
-    touch "$TARGET_APP" 2>/dev/null || true
-  else
-    osascript - "$STAGED_APP" "$TARGET_APP" <<'APPLESCRIPT'
-on run argv
-  set srcApp to item 1 of argv
-  set dstApp to item 2 of argv
-  do shell script "rsync -a --delete " & quoted form of (srcApp & "/Contents/") & " " & quoted form of (dstApp & "/Contents/") & " && touch " & quoted form of dstApp with administrator privileges
-end run
-APPLESCRIPT
-  fi
-elif rm -rf "$TARGET_APP" 2>/dev/null && ditto "$STAGED_APP" "$TARGET_APP" 2>/dev/null; then
-  :
+TMP_APP="${TARGET_APP}.updating-$$"
+rm -rf "$TMP_APP" 2>/dev/null || true
+if ditto "$STAGED_APP" "$TMP_APP" 2>/dev/null && rm -rf "$TARGET_APP" 2>/dev/null && mv "$TMP_APP" "$TARGET_APP" 2>/dev/null; then
+  xattr -dr com.apple.quarantine "$TARGET_APP" 2>/dev/null || true
+  touch "$TARGET_APP" 2>/dev/null || true
 else
+  rm -rf "$TMP_APP" 2>/dev/null || true
   osascript - "$STAGED_APP" "$TARGET_APP" <<'APPLESCRIPT'
 on run argv
   set srcApp to item 1 of argv
   set dstApp to item 2 of argv
-  do shell script "rm -rf " & quoted form of dstApp & " && ditto " & quoted form of srcApp & " " & quoted form of dstApp with administrator privileges
+  set tmpApp to dstApp & ".updating"
+  do shell script "rm -rf " & quoted form of tmpApp & " && ditto " & quoted form of srcApp & " " & quoted form of tmpApp & " && rm -rf " & quoted form of dstApp & " && mv " & quoted form of tmpApp & " " & quoted form of dstApp & " && (xattr -dr com.apple.quarantine " & quoted form of dstApp & " || true) && touch " & quoted form of dstApp with administrator privileges
 end run
 APPLESCRIPT
 fi
@@ -1412,6 +1467,7 @@ async fn download_single_stream(
 mod tests {
     use super::{
         file_sha256, is_allowed_release_asset_url, macos_current_app_bundle,
+        pick_preferred_codesign_identity,
     };
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
@@ -1483,5 +1539,31 @@ mod tests {
             macos_current_app_bundle(PathBuf::from("/usr/local/bin/herdr").as_path()),
             None
         );
+    }
+
+    #[test]
+    fn picks_preferred_valid_codesign_identity_ignoring_untrusted_entries() {
+        let dev_id_sha = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let apple_dev_sha = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let local_sha = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let bad_sha = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+
+        let empty = "0 valid identities found\n";
+        assert_eq!(pick_preferred_codesign_identity(empty), None);
+
+        let untrusted_only = format!(
+            "  1) {bad_sha} \"Herdr Pocket Local Signer\" (CSSMERR_TP_NOT_TRUSTED)\n  0 valid identities found\n"
+        );
+        assert_eq!(pick_preferred_codesign_identity(&untrusted_only), None);
+
+        let mixed = format!(
+            "  1) {apple_dev_sha} \"Apple Development: example@example.com\"\n  2) {dev_id_sha} \"Developer ID Application: Example Corp (TEAM123)\"\n  2 valid identities found\n"
+        );
+        assert_eq!(pick_preferred_codesign_identity(&mixed).as_deref(), Some(dev_id_sha));
+
+        let with_local = format!(
+            "  1) {dev_id_sha} \"Developer ID Application: Example Corp (TEAM123)\"\n  2) {local_sha} \"Herdr Pocket Local Signer\"\n  2 valid identities found\n"
+        );
+        assert_eq!(pick_preferred_codesign_identity(&with_local).as_deref(), Some(local_sha));
     }
 }

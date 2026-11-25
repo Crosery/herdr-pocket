@@ -26,6 +26,14 @@ interface XTermCoreInternals {
     _sync?: (ydisp?: number) => void;
     scrollToLine?: (line: number, immediate?: boolean) => void;
   };
+  _bufferService?: {
+    isUserScrolling?: boolean;
+    buffer?: {
+      ydisp: number;
+      ybase: number;
+    };
+    scrollLines?: (disp: number, suppressScrollEvent?: boolean) => void;
+  };
 }
 
 /**
@@ -110,21 +118,43 @@ export function snapTerminalViewportImmediate(
     ? baseY
     : Math.max(0, Math.min(baseY, baseY - Math.max(0, savedOffsetFromBottom)));
 
-  if (!isTerminalRendererReady(term)) {
+  const core = (term as unknown as { _core?: XTermCoreInternals })._core;
+  const bs = core?._bufferService;
+  const vp = core?._viewport;
+
+  const syncLogicalBuffer = (): boolean => {
+    if (bs && typeof bs.scrollLines === "function") {
+      const curY = bs.buffer?.ydisp ?? buf.normal.viewportY;
+      if (curY !== targetY) {
+        bs.scrollLines(targetY - curY, true);
+      }
+      bs.isUserScrolling = !stickToBottom && targetY < baseY;
+      return curY !== targetY;
+    }
     if (buf.normal.viewportY !== targetY) {
       term.scrollToLine(targetY);
+      return true;
     }
+    return false;
+  };
+
+  if (!isTerminalRendererReady(term)) {
+    syncLogicalBuffer();
     return false;
   }
 
-  const vp = (term as unknown as { _core?: XTermCoreInternals })._core?._viewport;
   if (vp) {
     // Sync Scrollable dimensions before touching viewportY so stale 0-height state cannot clamp to 0.
     vp._latestYDisp = undefined;
     vp._sync?.(targetY);
   }
-  if (buf.normal.viewportY !== targetY) {
-    term.scrollToLine(targetY);
+  const moved = syncLogicalBuffer();
+  if (bs && moved) {
+    const termWithRefresh = term as unknown as {
+      refresh?: (start: number, end: number) => void;
+      rows?: number;
+    };
+    termWithRefresh.refresh?.(0, Math.max(0, (termWithRefresh.rows ?? 1) - 1));
   }
   if (vp) {
     vp._latestYDisp = undefined;
@@ -132,4 +162,85 @@ export function snapTerminalViewportImmediate(
     vp.scrollToLine?.(targetY, true);
   }
   return true;
+}
+
+export interface StickyScrollState {
+  wasAtBottom: boolean;
+  savedOffsetFromBottom: number;
+}
+
+export interface ReconcileStickyInput {
+  prev: StickyScrollState;
+  isAltBuffer: boolean;
+  baseY: number;
+  viewportY: number;
+  hasUserScrollUpIntent: boolean;
+  hasUserScrollAdjustIntent: boolean;
+}
+
+export interface ReconcileStickyResult extends StickyScrollState {
+  shouldSnapToBottom: boolean;
+}
+
+/**
+ * Reconciles sticky bottom scroll tracking without letting passive programmatic reflows,
+ * hidden-tab clamps, or renderer swaps poison `wasAtBottom` into scrolling to the top.
+ */
+export function reconcileTerminalBottomSticky(input: ReconcileStickyInput): ReconcileStickyResult {
+  if (input.isAltBuffer) {
+    return { wasAtBottom: true, savedOffsetFromBottom: 0, shouldSnapToBottom: false };
+  }
+  const safeBaseY = Math.max(0, input.baseY);
+  const safeViewportY = Math.max(0, Math.min(safeBaseY, input.viewportY));
+  const atBottom = safeViewportY >= safeBaseY - 1;
+
+  if (input.prev.wasAtBottom) {
+    if (atBottom) {
+      return {
+        wasAtBottom: true,
+        savedOffsetFromBottom: 0,
+        shouldSnapToBottom: safeViewportY < safeBaseY,
+      };
+    }
+    if (input.hasUserScrollUpIntent) {
+      return {
+        wasAtBottom: false,
+        savedOffsetFromBottom: Math.max(1, safeBaseY - safeViewportY),
+        shouldSnapToBottom: false,
+      };
+    }
+    // Programmatic resize reflow, hidden-tab clamp, or multi-line TUI rewrite — stay pinned to bottom!
+    return {
+      wasAtBottom: true,
+      savedOffsetFromBottom: 0,
+      shouldSnapToBottom: true,
+    };
+  }
+
+  if (atBottom) {
+    return {
+      wasAtBottom: true,
+      savedOffsetFromBottom: 0,
+      shouldSnapToBottom: safeViewportY < safeBaseY,
+    };
+  }
+  if (input.hasUserScrollAdjustIntent) {
+    return {
+      wasAtBottom: false,
+      savedOffsetFromBottom: Math.max(1, safeBaseY - safeViewportY),
+      shouldSnapToBottom: false,
+    };
+  }
+  if (safeViewportY === 0 && input.prev.savedOffsetFromBottom < safeBaseY - 5) {
+    return {
+      wasAtBottom: false,
+      savedOffsetFromBottom: input.prev.savedOffsetFromBottom,
+      shouldSnapToBottom: false,
+    };
+  }
+  return {
+    wasAtBottom: false,
+    savedOffsetFromBottom: Math.max(1, safeBaseY - safeViewportY),
+    shouldSnapToBottom: false,
+  };
 }

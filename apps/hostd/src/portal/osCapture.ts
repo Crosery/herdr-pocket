@@ -867,6 +867,28 @@ export class OsCaptureDriver {
     return (this.deps.pathExists ?? existsSync)(p);
   }
 
+  private async signMacHelperIfPossible(binPath: string): Promise<void> {
+    if (this.deps.execBin) return;
+    try {
+      const info = await defaultExecBin("codesign", ["-dv", binPath], 3000);
+      if (info.code === 0 && !info.stderr.includes("Signature=adhoc")) return;
+      const ids = await defaultExecBin("security", ["find-identity", "-v", "-p", "codesigning"], 3000);
+      if (ids.code !== 0) return;
+      const stdout = ids.stdout.toString("utf8");
+      const pick =
+        /^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"Developer ID Application:/m.exec(stdout)?.[1] ??
+        /^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"Apple Development:/m.exec(stdout)?.[1];
+      if (!pick) return;
+      await defaultExecBin(
+        "codesign",
+        ["--force", "--timestamp=none", "-i", "dev.crosery.herdrpocket.portal-helper", "--sign", pick, binPath],
+        5000,
+      );
+    } catch {
+      // keep working ad-hoc helper when keychain identity is unavailable
+    }
+  }
+
   private async ensureMacHelper(): Promise<string | null> {
     if (this.macHelperBin && existsSync(this.macHelperBin)) return this.macHelperBin;
     if (this.macHelperTried) return null;
@@ -874,6 +896,7 @@ export class OsCaptureDriver {
     const binDir = this.deps.binDir ?? join(stateDir(), "bin");
     const binPath = join(binDir, "hp-mac-portal-v3");
     if (existsSync(binPath)) {
+      await this.signMacHelperIfPossible(binPath);
       this.macHelperBin = binPath;
       return binPath;
     }
@@ -884,6 +907,7 @@ export class OsCaptureDriver {
       writeFileSync(srcPath, MAC_SWIFT_SRC);
       const r = await this.exec("swiftc", ["-O", srcPath, "-o", binPath], 30_000);
       if (r.code === 0 && existsSync(binPath)) {
+        await this.signMacHelperIfPossible(binPath);
         this.macHelperBin = binPath;
         return binPath;
       }

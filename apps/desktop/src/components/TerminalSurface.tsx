@@ -21,6 +21,7 @@ import { attachTerminalImeBridge, chunkTerminalInputPayload, isImeKeyEvent } fro
 import {
   isTerminalRendererReady,
   paintTerminalViewportImmediate,
+  reconcileTerminalBottomSticky,
   snapTerminalViewportImmediate,
   wakeTerminalRendererImmediate,
 } from "../lib/terminalScroll";
@@ -506,6 +507,9 @@ export function TerminalSurface({
   isShellRef.current = Boolean(agent.isShell);
   const wasAtBottomRef = useRef(true);
   const savedOffsetFromBottomRef = useRef(0);
+  const userScrollUpUntilRef = useRef(0);
+  const userScrollAdjustUntilRef = useRef(0);
+  const scrollbarDraggingRef = useRef(false);
   const pendingViewportSyncRef = useRef(true);
   const localCmdBufRef = useRef("");
 
@@ -624,6 +628,8 @@ export function TerminalSurface({
         if (term.hasSelection()) term.clearSelection();
         savedOffsetFromBottomRef.current = 0;
         wasAtBottomRef.current = true;
+        userScrollUpUntilRef.current = 0;
+        userScrollAdjustUntilRef.current = 0;
         snapTerminalViewportImmediate(term, true, 0);
       }
       const bpActive =
@@ -862,6 +868,7 @@ export function TerminalSurface({
       }
       externalSizeOverrideRef.current = false;
       fitRef.current?.fit();
+      if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
       refreshCachedCellSize(term);
       centerScreenVerticalGap(hostRef.current, term);
       flushPtyResize(term, forceReclaim);
@@ -1529,6 +1536,7 @@ export function TerminalSurface({
         term.loadAddon(addon);
         webglRef.current = addon;
         wakeTerminalRendererImmediate(term);
+        if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
         paintTerminalViewportImmediate(term);
       } catch {
         releaseWebglSlot(poolKey);
@@ -1658,8 +1666,10 @@ export function TerminalSurface({
       });
     };
 
+    let syncingSticky = false;
     const syncBottomSticky = () => {
       if (
+        syncingSticky ||
         !initialReadyDone ||
         !activeRef.current ||
         hostEl.clientHeight <= 40 ||
@@ -1668,14 +1678,31 @@ export function TerminalSurface({
       ) {
         return;
       }
+      const now = Date.now();
       const buf = term.buffer.active;
-      if (buf === term.buffer.normal) {
-        const atBottom = buf.viewportY >= buf.baseY - 1;
-        wasAtBottomRef.current = atBottom;
-        savedOffsetFromBottomRef.current = atBottom ? 0 : Math.max(0, buf.baseY - buf.viewportY);
-      } else {
-        wasAtBottomRef.current = true;
-        savedOffsetFromBottomRef.current = 0;
+      const next = reconcileTerminalBottomSticky({
+        prev: {
+          wasAtBottom: wasAtBottomRef.current,
+          savedOffsetFromBottom: savedOffsetFromBottomRef.current,
+        },
+        isAltBuffer: buf !== term.buffer.normal,
+        baseY: term.buffer.normal.baseY,
+        viewportY: term.buffer.normal.viewportY,
+        hasUserScrollUpIntent: scrollbarDraggingRef.current || now <= userScrollUpUntilRef.current,
+        hasUserScrollAdjustIntent: scrollbarDraggingRef.current || now <= userScrollAdjustUntilRef.current,
+      });
+      wasAtBottomRef.current = next.wasAtBottom;
+      savedOffsetFromBottomRef.current = next.savedOffsetFromBottom;
+      if (next.wasAtBottom) {
+        userScrollUpUntilRef.current = 0;
+      }
+      if (next.shouldSnapToBottom) {
+        syncingSticky = true;
+        try {
+          snapTerminalViewportImmediate(term, true, 0);
+        } finally {
+          syncingSticky = false;
+        }
       }
     };
     const dispScroll = term.onScroll(() => {
@@ -1994,6 +2021,7 @@ export function TerminalSurface({
 
     // Bridge drag-to-select, double/triple-click, Shift-override, copy-on-select, and Ctrl/Cmd+Click links.
     let activeDragCleanup: (() => void) | null = null;
+    let activeScrollbarCleanup: (() => void) | null = null;
     let lastMouseHoverLink = false;
     const onHostMouseMoveHover = (e: MouseEvent) => {
       if (!hasFileJumpModifier(e)) {
@@ -2023,6 +2051,27 @@ export function TerminalSurface({
       }
     };
     const onHostMouseDownCapture = (e: MouseEvent) => {
+      if ((e.target as HTMLElement | null)?.closest(".scrollbar")) {
+        scrollbarDraggingRef.current = true;
+        const now = Date.now();
+        userScrollUpUntilRef.current = now + 900;
+        userScrollAdjustUntilRef.current = now + 900;
+        activeScrollbarCleanup?.();
+        let cleanupScrollbar = () => {};
+        const finishScrollbarDrag = () => {
+          cleanupScrollbar();
+          scrollbarDraggingRef.current = false;
+          userScrollAdjustUntilRef.current = Date.now() + 250;
+        };
+        cleanupScrollbar = () => {
+          window.removeEventListener("mouseup", finishScrollbarDrag, true);
+          window.removeEventListener("blur", finishScrollbarDrag, true);
+          if (activeScrollbarCleanup === cleanupScrollbar) activeScrollbarCleanup = null;
+        };
+        activeScrollbarCleanup = cleanupScrollbar;
+        window.addEventListener("mouseup", finishScrollbarDrag, true);
+        window.addEventListener("blur", finishScrollbarDrag, true);
+      }
       if (e.button === 0 && hasFileJumpModifier(e)) {
         const modCell = resolvePointerCell(hostEl, term, e.clientX, e.clientY, false);
         const modLink = modCell?.link || hoveredOscLinkRef.current;
@@ -2126,6 +2175,18 @@ export function TerminalSurface({
       window.addEventListener("blur", cleanup, true);
     };
 
+    const onHostWheelCapture = (e: WheelEvent) => {
+      if (!isAlt() && term.modes.mouseTrackingMode === "none" && Math.abs(e.deltaY) >= 0.5) {
+        const now = Date.now();
+        userScrollAdjustUntilRef.current = now + 900;
+        if (e.deltaY < 0) {
+          userScrollUpUntilRef.current = now + 900;
+        } else if (e.deltaY > 0 && term.buffer.normal.viewportY >= term.buffer.normal.baseY - 1) {
+          userScrollUpUntilRef.current = 0;
+        }
+      }
+    };
+
     const onHostWheel = (e: WheelEvent) => {
       if (!isAlt() || term.modes.mouseTrackingMode !== "none") return;
       if (Math.abs(e.deltaY) < 1) return;
@@ -2142,6 +2203,7 @@ export function TerminalSurface({
     hostEl.addEventListener("mousemove", onHostMouseMoveHover);
     hostEl.addEventListener("mouseleave", onHostMouseLeaveHover);
     hostEl.addEventListener("mousedown", onHostMouseDownCapture, true);
+    hostEl.addEventListener("wheel", onHostWheelCapture, { capture: true, passive: true });
     hostEl.addEventListener("wheel", onHostWheel, { passive: false });
     window.addEventListener("keyup", onModifierKeyUp, true);
 
@@ -2230,6 +2292,11 @@ export function TerminalSurface({
         e.preventDefault();
         return false;
       };
+      if (e.key === "PageUp") {
+        const now = Date.now();
+        userScrollUpUntilRef.current = now + 900;
+        userScrollAdjustUntilRef.current = now + 900;
+      }
       const modTabJump = (IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey) && !e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key);
       if (modTabJump) {
         return false;
@@ -2938,6 +3005,8 @@ export function TerminalSurface({
         if (!initialReadyDone || wasAtBottomRef.current) {
           wasAtBottomRef.current = true;
           savedOffsetFromBottomRef.current = 0;
+          userScrollUpUntilRef.current = 0;
+          userScrollAdjustUntilRef.current = 0;
           if (activeRef.current) {
             wakeTerminalRendererImmediate(term);
           }
@@ -3012,6 +3081,8 @@ export function TerminalSurface({
             if (!alive || termRef.current !== term) return;
             wasAtBottomRef.current = true;
             savedOffsetFromBottomRef.current = 0;
+            userScrollUpUntilRef.current = 0;
+            userScrollAdjustUntilRef.current = 0;
             if (activeRef.current) {
               wakeTerminalRendererImmediate(term);
             }
@@ -3363,6 +3434,7 @@ export function TerminalSurface({
               // then reclaim the local pane's viewport dimensions once the snapshot commits.
               if (term.cols !== attRes.cols || term.rows !== attRes.rows) {
                 term.resize(attRes.cols, attRes.rows);
+                if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
                 refreshCachedCellSize(term);
               }
               for (const chunk of buffered) {
@@ -3382,6 +3454,7 @@ export function TerminalSurface({
             } else if (ownsInitialSize) {
               externalSizeOverrideRef.current = false;
               fitAddon.fit();
+              if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
               refreshCachedCellSize(term);
               centerScreenVerticalGap(hostEl, term);
               lastResizeSigRef.current = `${connId}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}@${display.bg}`;
@@ -3390,11 +3463,13 @@ export function TerminalSurface({
             } else {
               externalSizeOverrideRef.current = true;
               term.resize(attRes.cols, attRes.rows);
+              if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
               refreshCachedCellSize(term);
             }
           } else {
             if (term.cols !== wantCols || term.rows !== wantRows) {
               fitAddon.fit();
+              if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
               refreshCachedCellSize(term);
               centerScreenVerticalGap(hostEl, term);
             }
@@ -3442,6 +3517,8 @@ export function TerminalSurface({
         pendingResetBeforeRawFlush = false;
         wasAtBottomRef.current = true;
         savedOffsetFromBottomRef.current = 0;
+        userScrollUpUntilRef.current = 0;
+        userScrollAdjustUntilRef.current = 0;
         pendingViewportSyncRef.current = true;
         hostEl.dataset.ready = "false";
         window.clearTimeout(hostReadyFallback);
@@ -3502,6 +3579,7 @@ export function TerminalSurface({
             flushPendingBytes();
             externalSizeOverrideRef.current = true;
             term.resize(cols, rows);
+            if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
             refreshCachedCellSize(term);
             scheduleOverlay();
           },
@@ -3572,6 +3650,7 @@ export function TerminalSurface({
       if (dimsChanged) {
         const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
         term.resize(grid.cols, grid.rows);
+        if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
         lastResizeCostMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
         if (showHud && prevBox.w > 0 && prevBox.h > 0) {
           flashResizeHud(grid.cols, grid.rows);
@@ -3760,9 +3839,12 @@ export function TerminalSurface({
       imeBridge.dispose();
       document.removeEventListener("copy", onDocumentCopy, true);
       activeDragCleanup?.();
+      activeScrollbarCleanup?.();
+      scrollbarDraggingRef.current = false;
       hostEl.removeEventListener("mousemove", onHostMouseMoveHover);
       hostEl.removeEventListener("mouseleave", onHostMouseLeaveHover);
       hostEl.removeEventListener("mousedown", onHostMouseDownCapture, true);
+      hostEl.removeEventListener("wheel", onHostWheelCapture, true);
       hostEl.removeEventListener("wheel", onHostWheel);
       hostEl.removeEventListener("scroll", onHostCaptureScroll, true);
       window.removeEventListener("keyup", onModifierKeyUp, true);
@@ -3877,7 +3959,7 @@ export function TerminalSurface({
       if (curConnId) {
         void localTermFocus(curConnId, focusedRef.current);
       }
-      if (pendingViewportSyncRef.current && snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
+      if (snapTerminalViewportImmediate(term, wasAtBottomRef.current, savedOffsetFromBottomRef.current)) {
         pendingViewportSyncRef.current = false;
       }
       paintOverlays();
@@ -3923,6 +4005,11 @@ export function TerminalSurface({
     const buf = term.buffer.active;
     const targetTop = Math.max(0, Math.min(buf.baseY, m.row0 - Math.floor(term.rows / 2)));
     const delta = targetTop - buf.viewportY;
+    if (targetTop < buf.baseY - 1) {
+      const now = Date.now();
+      userScrollUpUntilRef.current = now + 900;
+      userScrollAdjustUntilRef.current = now + 900;
+    }
     if (delta !== 0) term.scrollLines(delta);
     setSearchIdx(clamped);
   }, []);
