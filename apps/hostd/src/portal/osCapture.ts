@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { connect as connectSocket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type {
@@ -26,6 +27,8 @@ export interface OsCaptureDeps {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   binDir?: string;
+  /** Override path to Herdr Pocket.app Unix portal bridge socket (macOS). */
+  portalBridgeSocket?: string;
   uid?: () => number;
   hasCmd?: (cmd: string) => boolean;
   pathExists?: (p: string) => boolean;
@@ -961,6 +964,107 @@ export class OsCaptureDriver {
     return this.exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", buildWin32InlinePs(args)], timeoutMs);
   }
 
+  private resolvePortalBridgeSocket(): string {
+    return this.deps.portalBridgeSocket ?? join(stateDir(this.deps.env), "desktop-portal.sock");
+  }
+
+  private async execViaDesktopBridge(args: string[], timeoutMs: number): Promise<CaptureExecResult | null> {
+    if (this.deps.execBin && !this.deps.portalBridgeSocket) return null;
+    const sockPath = this.resolvePortalBridgeSocket();
+    if (!this.pathExists(sockPath)) return null;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let connected = false;
+      let buf = "";
+      const finish = (res: CaptureExecResult | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(connectTimer);
+        clearTimeout(totalTimer);
+        sock.destroy();
+        resolve(res);
+      };
+
+      const sock = connectSocket(sockPath);
+      const connectTimer = setTimeout(() => {
+        if (!connected) finish(null);
+      }, 200);
+      const totalTimer = setTimeout(() => {
+        finish(null);
+      }, Math.max(400, timeoutMs));
+
+      sock.once("error", () => finish(null));
+      sock.once("connect", () => {
+        connected = true;
+        clearTimeout(connectTimer);
+        sock.write(`${JSON.stringify({ args, timeoutMs })}\n`);
+      });
+      sock.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        const nl = buf.indexOf("\n");
+        if (nl < 0) return;
+        try {
+          const parsed = JSON.parse(buf.slice(0, nl)) as {
+            code?: number;
+            stdoutBase64?: string;
+            stderr?: string;
+          };
+          if (typeof parsed.code === "number" && parsed.stderr !== "helper_missing") {
+            finish({
+              code: parsed.code,
+              stdout: Buffer.from(parsed.stdoutBase64 || "", "base64"),
+              stderr: parsed.stderr || "",
+            });
+            return;
+          }
+        } catch {
+          // fall back to direct exec below
+        }
+        finish(null);
+      });
+      sock.once("end", () => {
+        if (settled) return;
+        const trimmed = buf.trim();
+        if (!trimmed) {
+          finish(null);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(trimmed) as {
+            code?: number;
+            stdoutBase64?: string;
+            stderr?: string;
+          };
+          if (typeof parsed.code === "number" && parsed.stderr !== "helper_missing") {
+            finish({
+              code: parsed.code,
+              stdout: Buffer.from(parsed.stdoutBase64 || "", "base64"),
+              stderr: parsed.stderr || "",
+            });
+            return;
+          }
+        } catch {
+          // fall back
+        }
+        finish(null);
+      });
+    });
+  }
+
+  private async execMacHelper(
+    helperPath: string | null,
+    args: string[],
+    timeoutMs: number,
+  ): Promise<{ res: CaptureExecResult; viaBridge: boolean } | null> {
+    const bridged = await this.execViaDesktopBridge(args, timeoutMs);
+    if (bridged && !bridged.stderr.startsWith("helper_missing:") && bridged.stderr !== "disallowed_command") {
+      return { res: bridged, viaBridge: true };
+    }
+    if (!helperPath) return null;
+    return { res: await this.exec(helperPath, args, timeoutMs), viaBridge: false };
+  }
+
   async checkPermissionNote(): Promise<string | null> {
     const info = detectPortalSession(this.deps);
     if (info.sessionType === "win32") {
@@ -977,16 +1081,20 @@ export class OsCaptureDriver {
       return null;
     }
     if (info.sessionType !== "macos") return null;
-    const noteMsg = "请在系统设置 -> 隐私与安全性 -> 屏幕录制 中勾选运行 hostd 的终端或应用，否则无法捕获其他应用窗口";
-    if (this.macScreenRecordingCache && Date.now() - this.macScreenRecordingCache.at < 10_000) {
+    const cacheTtl = this.macScreenRecordingCache?.denied ? 1_200 : 5_000;
+    const bridgeLive = this.pathExists(this.resolvePortalBridgeSocket());
+    const desktopInstalled = bridgeLive || this.pathExists("/Applications/Herdr Pocket.app");
+    const noteMsg = desktopInstalled
+      ? "需开启 Herdr Pocket「屏幕录制」权限以捕获窗口画面"
+      : "请在系统设置 → 隐私与安全性 → 屏幕录制 中开启抓屏权限";
+    if (this.macScreenRecordingCache && Date.now() - this.macScreenRecordingCache.at < cacheTtl) {
       return this.macScreenRecordingCache.denied ? noteMsg : null;
     }
     const helper = await this.ensureMacHelper();
-    if (!helper) return null;
     try {
-      const r = await this.exec(helper, ["check"], 2000);
-      if (r.code === 0) {
-        const parsed = JSON.parse(r.stdout.toString("utf8")) as { screenCapture?: boolean };
+      const execOut = await this.execMacHelper(helper, ["check"], 2000);
+      if (execOut && execOut.res.code === 0) {
+        const parsed = JSON.parse(execOut.res.stdout.toString("utf8")) as { screenCapture?: boolean };
         const denied = parsed.screenCapture === false;
         this.macScreenRecordingCache = { denied, at: Date.now() };
         if (denied) return noteMsg;
@@ -1074,19 +1182,17 @@ export class OsCaptureDriver {
     const info = detectPortalSession(this.deps);
     if (info.sessionType === "macos") {
       const helper = await this.ensureMacHelper();
-      if (helper) {
-        try {
-          const r = await this.exec(helper, ["list"], 4000);
-          if (r.code === 0) {
-            const list = JSON.parse(r.stdout.toString("utf8")) as RemoteWindowInfo[];
-            return [
-              { id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true },
-              ...list,
-            ];
-          }
-        } catch {
-          // fallback below
+      try {
+        const execOut = await this.execMacHelper(helper, ["list"], 4000);
+        if (execOut && execOut.res.code === 0) {
+          const list = JSON.parse(execOut.res.stdout.toString("utf8")) as RemoteWindowInfo[];
+          return [
+            { id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true },
+            ...list,
+          ];
         }
+      } catch {
+        // fallback below
       }
       // Pure JXA fallback listing front processes
       if (Date.now() < this.jxaTimedOutUntil) {
@@ -1343,7 +1449,11 @@ export class OsCaptureDriver {
     if (inflight) return inflight;
     const p = this.captureWindowUncached(windowId)
       .then((frame) => {
-        this.lastFrameCache.set(windowId, { at: Date.now(), frame });
+        if (frame) {
+          this.lastFrameCache.set(windowId, { at: Date.now(), frame });
+        } else {
+          this.lastFrameCache.delete(windowId);
+        }
         return frame;
       })
       .finally(() => {
@@ -1368,24 +1478,27 @@ export class OsCaptureDriver {
 
     if (info.sessionType === "macos") {
       const helper = await this.ensureMacHelper();
-      if (helper && (windowId === "screen:0" || /^\d+$/.test(windowId))) {
+      if (windowId === "screen:0" || /^\d+$/.test(windowId)) {
         try {
-          const r = await this.exec(helper, ["capture", windowId, "1280"], 4800);
-          if (r.code === 0 && r.stdout.length > 0) {
-            this.macScreenRecordingCache = { denied: false, at: Date.now() };
-            const dims = /dims:(\d+)x(\d+)/.exec(r.stderr);
-            return {
-              mime: "image/jpeg",
-              data: r.stdout.toString("base64"),
-              width: dims ? Number(dims[1]) : (bounds?.width ?? 1280),
-              height: dims ? Number(dims[2]) : (bounds?.height ?? 800),
-              bounds,
-              pid: target?.pid,
-            };
-          }
-          if (r.code === 2) {
-            this.macScreenRecordingCache = { denied: true, at: Date.now() };
-            return null;
+          const execOut = await this.execMacHelper(helper, ["capture", windowId, "1280"], 4800);
+          if (execOut) {
+            const { res: r } = execOut;
+            if (r.code === 0 && r.stdout.length > 0) {
+              this.macScreenRecordingCache = { denied: false, at: Date.now() };
+              const dims = /dims:(\d+)x(\d+)/.exec(r.stderr);
+              return {
+                mime: "image/jpeg",
+                data: r.stdout.toString("base64"),
+                width: dims ? Number(dims[1]) : (bounds?.width ?? 1280),
+                height: dims ? Number(dims[2]) : (bounds?.height ?? 800),
+                bounds,
+                pid: target?.pid,
+              };
+            }
+            if (r.code === 2) {
+              this.macScreenRecordingCache = { denied: true, at: Date.now() };
+              return null;
+            }
           }
         } catch {
           // fallback below to screencapture
@@ -1603,23 +1716,29 @@ export class OsCaptureDriver {
     if (info.sessionType === "macos") {
       const helper = await this.ensureMacHelper();
       const pid = target?.pid ?? 0;
-      if (helper) {
-        if (input.type === "pointer" && (input.action === "click" || input.action === "dblclick" || input.action === "up")) {
-          const { x, y } = absPoint(input.nx, input.ny);
-          const count = input.action === "dblclick" ? "2" : "1";
-          await this.exec(helper, ["click", String(x), String(y), input.button ?? "left", count, ...(pid ? [String(pid)] : [])], 3000);
+      const runMacHelperInput = async (args: string[]) => {
+        const res = await this.execMacHelper(helper, args, 3000);
+        return Boolean(res);
+      };
+      if (input.type === "pointer" && (input.action === "click" || input.action === "dblclick" || input.action === "up")) {
+        const { x, y } = absPoint(input.nx, input.ny);
+        const count = input.action === "dblclick" ? "2" : "1";
+        if (await runMacHelperInput(["click", String(x), String(y), input.button ?? "left", count, ...(pid ? [String(pid)] : [])])) {
           return;
         }
-        if (input.type === "wheel") {
-          await this.exec(helper, ["scroll", String(Math.round(-input.deltaY / 10)), String(Math.round(-input.deltaX / 10))], 3000);
+      }
+      if (input.type === "wheel") {
+        if (await runMacHelperInput(["scroll", String(Math.round(-input.deltaY / 10)), String(Math.round(-input.deltaX / 10))])) {
           return;
         }
-        if (input.type === "text") {
-          await this.exec(helper, ["text", input.text, ...(pid ? [String(pid)] : [])], 3000);
+      }
+      if (input.type === "text") {
+        if (await runMacHelperInput(["text", input.text, ...(pid ? [String(pid)] : [])])) {
           return;
         }
-        if (input.type === "key") {
-          await this.exec(helper, ["key", input.key, ...(pid ? [String(pid)] : [])], 3000);
+      }
+      if (input.type === "key") {
+        if (await runMacHelperInput(["key", input.key, ...(pid ? [String(pid)] : [])])) {
           return;
         }
       }

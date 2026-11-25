@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
+  AppWindow,
   ExternalLink,
   Keyboard,
   Mic,
@@ -9,12 +10,10 @@ import {
   Power,
   RefreshCw,
   RotateCcw,
-  SlidersHorizontal,
 } from "lucide-react";
 import { configKeySpec } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketIconButton, PocketSelect, PocketSwitch, useToast } from "./PocketUI";
 import { XiaoyangOrb, resolveCallMascotMood } from "./MascotAndVendor";
-import { PermissionGuideModal } from "./PermissionGuideModal";
 import { VoiceprintModal } from "./VoiceprintModal";
 import { assistantStore, loadAssistant } from "../lib/assistant";
 import { detectPlatform } from "../lib/bridge";
@@ -109,6 +108,11 @@ const PERMISSION_INFO: Record<PermissionKind, { title: string; why: string; how:
     why: "避免按 Fn 时误触发系统输入法或表情",
     how: "系统设置 › 键盘 › 按下地球仪键时",
   },
+  screenRecording: {
+    title: "屏幕录制",
+    why: "跨端窗口回传与本机浮窗预览时需要",
+    how: "系统设置 › 隐私与安全性 › 屏幕录制",
+  },
   fullDiskAccess: {
     title: "完全磁盘访问",
     why: "导入 Safari Cookie 需要",
@@ -130,14 +134,17 @@ const DEMO_PERMS: Permissions = {
   microphone: "granted",
   accessibility: "notApplicable",
   inputMonitoring: "notDetermined",
+  screenRecording: MAC ? "notDetermined" : "notApplicable",
   fullDiskAccess: "denied",
   appBundlePath: "/Applications/Herdr Pocket.app",
   notes: [],
 };
 
-type MacRepairableKind = "inputMonitoring";
+type MacRepairableKind = "inputMonitoring" | "screenRecording";
+type VisiblePermKind = "screenRecording" | "microphone" | "inputMonitoring";
 
-function PermissionRowIcon({ kind }: { kind: "microphone" | "inputMonitoring" }) {
+function PermissionRowIcon({ kind }: { kind: VisiblePermKind }) {
+  if (kind === "screenRecording") return <AppWindow size={16} />;
   if (kind === "microphone") return <Mic size={16} />;
   return <Keyboard size={16} />;
 }
@@ -147,15 +154,17 @@ export function PermissionCards({
   onChanged,
   checking,
   singleKey = false,
+  scope = "voice",
 }: {
   perms: Permissions | null;
   onChanged: () => void;
   checking: boolean;
   /** The hotkey is one modifier tapped alone: Input Monitoring is needed (macOS). */
   singleKey?: boolean;
+  /** `voice`: microphone + inputMonitoring; `all`: also includes screenRecording in Privacy settings. */
+  scope?: "voice" | "all";
 }) {
   const toast = useToast();
-  const [guideKind, setGuideKind] = useState<PermissionKind | null>(null);
   const [permsOverride, setPermsOverride] = useState<Permissions | null>(null);
   const [pendingGrant, setPendingGrant] = useState<Partial<Record<MacRepairableKind, boolean>>>({});
   const [resettingKind, setResettingKind] = useState<PermissionKind | null>(null);
@@ -166,27 +175,48 @@ export function PermissionCards({
   }, [perms]);
 
   const effectivePerms = permsOverride ?? perms ?? (!native.available() ? DEMO_PERMS : null);
-  const kinds: Array<"microphone" | "inputMonitoring"> = MAC
-    ? ["microphone", "inputMonitoring"]
+  const isMac = effectivePerms?.platform ? effectivePerms.platform === "macos" : MAC;
+  const kinds: VisiblePermKind[] = isMac
+    ? scope === "all"
+      ? ["screenRecording", "microphone", "inputMonitoring"]
+      : ["microphone", "inputMonitoring"]
     : ["microphone"];
 
   useEffect(() => {
     if (!effectivePerms) return;
     setPendingGrant((prev) => {
+      let changed = false;
+      const next = { ...prev };
       if (prev.inputMonitoring && effectivePerms.inputMonitoring === "granted") {
-        return {};
+        delete next.inputMonitoring;
+        changed = true;
       }
-      return prev;
+      if (prev.screenRecording && effectivePerms.screenRecording === "granted") {
+        delete next.screenRecording;
+        changed = true;
+      }
+      return changed ? next : prev;
     });
   }, [effectivePerms]);
 
   useEffect(() => {
-    if (!MAC || !native.available() || !pendingGrant.inputMonitoring) return;
+    if (!native.available()) return;
+    return native.onPermissionsChanged((next) => {
+      setPermsOverride(next);
+      onChanged();
+    });
+  }, [onChanged]);
+
+  const watchingPending = isMac && native.available() && Boolean(pendingGrant.inputMonitoring || pendingGrant.screenRecording);
+  useEffect(() => {
+    if (!watchingPending) return;
     let alive = true;
     const poll = async (forceRefresh = false) => {
       const next = await native.getPermissions();
       if (!alive || !next) return;
-      const grantedNow = next.inputMonitoring === "granted";
+      const grantedNow =
+        (pendingGrant.inputMonitoring && next.inputMonitoring === "granted") ||
+        (pendingGrant.screenRecording && next.screenRecording === "granted");
       if (grantedNow) {
         await native.voiceReload().catch(() => false);
       }
@@ -206,16 +236,16 @@ export function PermissionCards({
       window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [pendingGrant.inputMonitoring, onChanged]);
+  }, [watchingPending, pendingGrant.inputMonitoring, pendingGrant.screenRecording, onChanged]);
 
-  const handleGrant = async (k: "microphone" | "inputMonitoring", state: Permission) => {
-    if (MAC && k === "inputMonitoring") {
+  const handleGrant = async (k: VisiblePermKind, state: Permission) => {
+    if (isMac && (k === "inputMonitoring" || k === "screenRecording")) {
       setPendingGrant((prev) => ({ ...prev, [k]: true }));
     }
     if (!native.available()) {
       toast(
-        MAC
-          ? `演示模式：已打开系统设置「${PERMISSION_INFO[k].title}」，可直接使用下方重启或重置缓存`
+        isMac
+          ? `演示模式：已在「${PERMISSION_INFO[k].title}」旁打开应用拖拽小窗`
           : "请在桌面客户端中打开系统设置",
       );
       return;
@@ -257,7 +287,7 @@ export function PermissionCards({
     try {
       const restarted = await native.relaunchApp();
       if (!restarted) {
-        toast("演示模式无法重启进程；桌面端会立即重启应用使权限生效");
+        toast("演示模式无法重启进程；桌面端会立即重启应用使新权限生效");
       }
     } catch (e) {
       toast((e as Error).message || "重启应用失败", true);
@@ -267,115 +297,95 @@ export function PermissionCards({
   };
 
   return (
-    <>
-      <div className="perm-list" role="list">
-        {kinds.map((k) => {
-          const info = PERMISSION_INFO[k];
-          const state: Permission = effectivePerms ? effectivePerms[k] : "unknown";
-          if (state === "notApplicable") return null;
-          const label = PERM_LABEL[state];
-          const done = state === "granted";
-          const isMacRepairable = MAC && k === "inputMonitoring";
-          const showPendingBar = isMacRepairable && !done && Boolean(pendingGrant[k]);
-          const optionalCombo = MAC && k === "inputMonitoring" && !singleKey;
-          return (
-            <div
-              key={k}
-              role="listitem"
-              className={`perm-row${done ? " granted" : state === "denied" || state === "restricted" ? " warn" : ""}${showPendingBar ? " pending" : ""}`}
-            >
-              <div className="perm-row-main">
-                <div className="perm-row-left">
-                  <span className="perm-row-icon" aria-hidden>
-                    <PermissionRowIcon kind={k} />
-                  </span>
-                  <div className="perm-row-copy">
-                    <div className="perm-row-title-line">
-                      <strong className="perm-row-title">{info.title}</strong>
-                      {optionalCombo ? <span className="perm-opt-pill">可选（当前为组合键）</span> : null}
-                    </div>
-                    <div className="perm-row-desc">{info.why}</div>
+    <div className="perm-list" role="list">
+      {kinds.map((k) => {
+        const info = PERMISSION_INFO[k];
+        const state: Permission = (effectivePerms ? effectivePerms[k] : undefined) ?? "unknown";
+        if (state === "notApplicable") return null;
+        const label = PERM_LABEL[state];
+        const done = state === "granted";
+        const isMacRepairable = isMac && (k === "inputMonitoring" || k === "screenRecording");
+        const showPendingBar = isMacRepairable && !done && Boolean(pendingGrant[k]);
+        const optionalCombo = isMac && k === "inputMonitoring" && !singleKey;
+        return (
+          <div
+            key={k}
+            role="listitem"
+            className={`perm-row${done ? " granted" : state === "denied" || state === "restricted" ? " warn" : ""}${showPendingBar ? " pending" : ""}`}
+          >
+            <div className="perm-row-main">
+              <div className="perm-row-left">
+                <span className="perm-row-icon" aria-hidden>
+                  <PermissionRowIcon kind={k} />
+                </span>
+                <div className="perm-row-copy">
+                  <div className="perm-row-title-line">
+                    <strong className="perm-row-title">{info.title}</strong>
+                    {optionalCombo ? <span className="perm-opt-pill">可选（当前为组合键）</span> : null}
                   </div>
+                  <div className="perm-row-desc">{info.why}</div>
                 </div>
-                <div className="perm-row-side">
-                  <PocketBadge tone={label.tone}>{label.text}</PocketBadge>
+              </div>
+              <div className="perm-row-side">
+                <PocketBadge tone={label.tone}>{label.text}</PocketBadge>
+                {!done ? (
                   <div className="perm-row-actions">
-                    {!done ? (
-                      <>
-                        <PocketButton size="sm" variant="primary" onClick={() => void handleGrant(k, state)}>
-                          <ExternalLink size={13} />
-                          <span>{MAC ? "去授权" : "去开启"}</span>
-                        </PocketButton>
-                        {MAC ? (
-                          <PocketButton size="sm" variant="soft" onClick={() => setGuideKind(k)}>
-                            <span>引导与修复</span>
-                          </PocketButton>
-                        ) : (
-                          <PocketButton
-                            size="sm"
-                            variant="ghost"
-                            disabled={checking}
-                            onClick={() => void native.voiceReload().finally(onChanged)}
-                          >
-                            <RefreshCw size={13} />
-                            <span>重新检测</span>
-                          </PocketButton>
-                        )}
-                      </>
-                    ) : MAC ? (
-                      <PocketButton size="sm" variant="ghost" onClick={() => setGuideKind(k)}>
-                        <SlidersHorizontal size={13} />
-                        <span>引导与修复</span>
+                    <PocketButton size="sm" variant="primary" onClick={() => void handleGrant(k, state)}>
+                      <ExternalLink size={13} />
+                      <span>{isMac ? "去授权" : "去开启"}</span>
+                    </PocketButton>
+                    {!isMac ? (
+                      <PocketButton
+                        size="sm"
+                        variant="ghost"
+                        disabled={checking}
+                        onClick={() => void native.voiceReload().finally(onChanged)}
+                      >
+                        <RefreshCw size={13} />
+                        <span>重新检测</span>
                       </PocketButton>
                     ) : null}
                   </div>
+                ) : null}
+              </div>
+            </div>
+
+            {showPendingBar ? (
+              <div className="perm-pending-bar">
+                <div className="perm-pending-status">
+                  <span className="status-dot breathe" aria-hidden />
+                  <span>
+                    {k === "inputMonitoring"
+                      ? "已在系统设置旁打开应用拖拽小窗，开启后需重启生效…"
+                      : "已在系统设置旁打开应用拖拽小窗，开启开关后自动恢复画面…"}
+                  </span>
+                </div>
+                <div className="perm-pending-actions">
+                  <PocketButton
+                    size="sm"
+                    variant="soft"
+                    disabled={relaunching}
+                    onClick={() => void handleRelaunch()}
+                  >
+                    <Power size={13} />
+                    <span>{relaunching ? "正在重启…" : "重启应用生效"}</span>
+                  </PocketButton>
+                  <PocketButton
+                    size="sm"
+                    variant="ghost"
+                    disabled={resettingKind === k}
+                    onClick={() => void handleResetMacPermission(k)}
+                  >
+                    <RotateCcw size={13} />
+                    <span>{resettingKind === k ? "正在重置…" : "重置权限缓存"}</span>
+                  </PocketButton>
                 </div>
               </div>
-
-              {showPendingBar ? (
-                <div className="perm-pending-bar">
-                  <div className="perm-pending-status">
-                    <span className="status-dot breathe" aria-hidden />
-                    <span>已打开系统设置，开启开关后需重启应用生效…</span>
-                  </div>
-                  <div className="perm-pending-actions">
-                    <PocketButton
-                      size="sm"
-                      variant="soft"
-                      disabled={relaunching}
-                      onClick={() => void handleRelaunch()}
-                    >
-                      <Power size={13} />
-                      <span>{relaunching ? "正在重启…" : "重启应用生效"}</span>
-                    </PocketButton>
-                    <PocketButton
-                      size="sm"
-                      variant="ghost"
-                      disabled={resettingKind === k}
-                      onClick={() => void handleResetMacPermission(k)}
-                    >
-                      <RotateCcw size={13} />
-                      <span>
-                        {resettingKind === k ? "正在重置…" : "已打开仍显示未允许？重置此权限缓存"}
-                      </span>
-                    </PocketButton>
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          );
-        })}
-      </div>
-      <PermissionGuideModal
-        kind={guideKind}
-        open={guideKind !== null}
-        onOpenChange={(o) => {
-          if (!o) setGuideKind(null);
-        }}
-        perms={effectivePerms}
-        onRefresh={onChanged}
-      />
-    </>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -441,7 +451,6 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   const [runtime, setRuntime] = useState<VoiceRuntime | null>(null);
   const [checking, setChecking] = useState(false);
   const [hotkeyNote, setHotkeyNote] = useState<{ error?: boolean; text: string } | null>(null);
-  const [keyboardGuideOpen, setKeyboardGuideOpen] = useState(false);
   const [aiState, setAiState] = useState<VoiceAiState | null>(null);
   const [vpModalOpen, setVpModalOpen] = useState(false);
   const refreshingRef = useRef(false);
@@ -699,7 +708,6 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
             size="sm"
             variant="soft"
             onClick={() => {
-              setKeyboardGuideOpen(true);
               void native.openPermissionSettings("keyboard", true);
             }}
           >
@@ -707,13 +715,6 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
           </PocketButton>
         </div>
       ) : null}
-      <PermissionGuideModal
-        kind="keyboard"
-        open={keyboardGuideOpen}
-        onOpenChange={setKeyboardGuideOpen}
-        perms={perms}
-        onRefresh={refresh}
-      />
 
       {!compact ? (
         <>
@@ -940,9 +941,13 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
         </>
       ) : null}
 
-      <div className="set-heading">系统权限</div>
-      {DESKTOP_VOICE && !perms && native.available() ? <div className="faint">没读到权限状态，按下面的路径手动检查。</div> : null}
-      <PermissionCards perms={perms} checking={checking} singleKey={singleKey} onChanged={() => void refresh()} />
+      {!compact ? (
+        <>
+          <div className="set-heading">系统权限</div>
+          {DESKTOP_VOICE && !perms && native.available() ? <div className="faint">没读到权限状态，按下面的路径手动检查。</div> : null}
+          <PermissionCards perms={perms} checking={checking} singleKey={singleKey} onChanged={() => void refresh()} />
+        </>
+      ) : null}
     </div>
   );
 }

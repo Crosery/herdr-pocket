@@ -263,4 +263,6 @@ test("isLoopbackPortalUrl distinguishes remote loopback URLs and portal_frame cl
   });
   assert.equal(portalStore.get().itemsById["ptl-err-1"]?.streamError, undefined);
   assert.equal(portalStore.get().framesById["ptl-err-1"]?.seq, 1);
+  assert.match(readFileSync(join(ROOT, "apps/desktop/src/components/SessionPortalPiP.tsx"), "utf8"), /去授权屏幕录制/);
+  assert.match(readFileSync(join(ROOT, "apps/desktop/src/components/PortalViewerModal.tsx"), "utf8"), /去授权屏幕录制/);
 });

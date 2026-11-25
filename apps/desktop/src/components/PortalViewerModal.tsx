@@ -21,8 +21,9 @@ import {
 } from "lucide-react";
 import type { Agent, FileEntry, PortalItem, RemoteWindowInfo } from "@herdr-pocket/protocol";
 import { FileViewer } from "../views/WorkbenchView";
-import { copyToClipboard, isTauri, openExternalUrl } from "../lib/bridge";
+import { copyToClipboard, detectPlatform, isTauri, openExternalUrl } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
+import { native } from "../lib/native";
 import {
   capturePortalFrameOnce,
   closePortalSurface,
@@ -228,6 +229,14 @@ export function PortalViewerModal({
   const localHostId = useLocalHostDeviceId();
   const isRemoteHost = !isTauri() || !localHostId || (item ? item.hostId !== localHostId : hostId !== localHostId);
   const canOpenUrlLocally = Boolean(item?.url && (!isRemoteHost || !isLoopbackPortalUrl(item.url)));
+  const isMacDesktop = isTauri() && detectPlatform() === "macos";
+  const permNoteMatch = /屏幕录制|抓屏权限|screen_recording/i;
+  const needsMacScreenPerm = Boolean(
+    isMacDesktop &&
+      !isRemoteHost &&
+      (permNoteMatch.test(item?.streamError ?? "") ||
+        (!item && caps?.notes?.some((n) => permNoteMatch.test(n)))),
+  );
 
   const [browserUrlInput, setBrowserUrlInput] = useState("http://127.0.0.1:3000");
   const [navUrlInput, setNavUrlInput] = useState("");
@@ -267,6 +276,33 @@ export function PortalViewerModal({
     if (!open || !itemHostId || !itemId || !itemCanInteract) return;
     return subscribePortalFrames(itemHostId, itemId, 12);
   }, [itemCanInteract, itemHostId, itemId, open]);
+
+  useEffect(() => {
+    if (!open || !needsMacScreenPerm) return;
+    const retryAfterGrant = async () => {
+      const p = await native.getPermissions();
+      if (p?.screenRecording !== "granted") return;
+      void refreshHostPortals(hostId, agent?.key, true).catch(() => {});
+      if (itemHostId && itemId) {
+        void capturePortalFrameOnce(itemHostId, itemId).catch(() => {});
+      }
+    };
+    const off = native.onPermissionsChanged((p) => {
+      if (p.screenRecording !== "granted") return;
+      void refreshHostPortals(hostId, agent?.key, true).catch(() => {});
+      if (itemHostId && itemId) {
+        void capturePortalFrameOnce(itemHostId, itemId).catch(() => {});
+      }
+    });
+    const onFocus = () => {
+      void retryAfterGrant();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      off();
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [agent?.key, hostId, itemHostId, itemId, needsMacScreenPerm, open]);
 
   const hostSessionItems = useMemo(
     () =>
@@ -462,8 +498,18 @@ export function PortalViewerModal({
                 </PocketButton>
               </div>
               {caps?.notes?.length ? (
-                <div className="inline-alert" style={{ marginBottom: 8 }}>
-                  {caps.notes.join("；")}
+                <div className="inline-alert" style={{ marginBottom: 8, alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                  <span>{caps.notes.join("；")}</span>
+                  {needsMacScreenPerm ? (
+                    <PocketButton
+                      size="sm"
+                      variant="primary"
+                      onClick={() => void native.openPermissionSettings("screenRecording", true)}
+                    >
+                      <ExternalLink size={12} />
+                      <span>去授权屏幕录制</span>
+                    </PocketButton>
+                  ) : null}
                 </div>
               ) : null}
               {windows.length === 0 ? (
@@ -694,6 +740,16 @@ export function PortalViewerModal({
                     <div className="faint mono">该地址为远端电脑本地服务 (127.0.0.1)，无法从当前设备直接打开</div>
                   ) : null}
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
+                    {needsMacScreenPerm ? (
+                      <PocketButton
+                        size="sm"
+                        variant="primary"
+                        onClick={() => void native.openPermissionSettings("screenRecording", true)}
+                      >
+                        <ExternalLink size={12} />
+                        <span>去授权屏幕录制</span>
+                      </PocketButton>
+                    ) : null}
                     <PocketButton
                       size="sm"
                       variant="soft"

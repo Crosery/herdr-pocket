@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Herdr Pocket · 授权拖拽</title>
+<!--
+  Floating macOS side-by-side permission companion window (src-tauri/src/perm_companion.rs).
+  Strict CSP: zero inline JS.
+-->
+<style>
+  :root {
+    --pink: #ff6ea4;
+    --accent-soft: rgba(255, 110, 164, 0.14);
+    --accent-text: #b8336a;
+    --mint: #16985f;
+    --mint-bg: rgba(22, 152, 95, 0.12);
+    --mint-line: rgba(22, 152, 95, 0.34);
+    --ink: #2c2038;
+    --ink-soft: #4e3f60;
+    --muted: #786a88;
+    --surface: rgba(255, 250, 253, 0.96);
+    --card: rgba(255, 255, 255, 0.90);
+    --line: rgba(255, 110, 164, 0.30);
+    --btn-bg: rgba(74, 59, 92, 0.07);
+    --btn-hover: rgba(74, 59, 92, 0.14);
+    --btn-line: rgba(74, 59, 92, 0.12);
+    --shadow: 0 12px 30px rgba(184, 51, 106, 0.18), 0 2px 10px rgba(24, 16, 36, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #f6effa;
+      --ink-soft: #dcd0eb;
+      --muted: #b4a7c5;
+      --accent-soft: rgba(255, 126, 178, 0.20);
+      --accent-text: #ff9ec4;
+      --mint: #5de0a6;
+      --mint-bg: rgba(45, 212, 141, 0.16);
+      --mint-line: rgba(45, 212, 141, 0.38);
+      --surface: rgba(28, 22, 38, 0.95);
+      --card: rgba(39, 31, 52, 0.90);
+      --line: rgba(255, 130, 180, 0.32);
+      --btn-bg: rgba(255, 255, 255, 0.09);
+      --btn-hover: rgba(255, 255, 255, 0.16);
+      --btn-line: rgba(255, 255, 255, 0.13);
+      --shadow: 0 14px 32px rgba(0, 0, 0, 0.56), 0 0 0 1px rgba(255, 255, 255, 0.06);
+    }
+  }
+  html[data-theme="light"] {
+    --ink: #2c2038;
+    --ink-soft: #4e3f60;
+    --muted: #786a88;
+    --accent-soft: rgba(255, 110, 164, 0.14);
+    --accent-text: #b8336a;
+    --mint: #16985f;
+    --mint-bg: rgba(22, 152, 95, 0.12);
+    --mint-line: rgba(22, 152, 95, 0.34);
+    --surface: rgba(255, 250, 253, 0.96);
+    --card: rgba(255, 255, 255, 0.90);
+    --line: rgba(255, 110, 164, 0.30);
+    --btn-bg: rgba(74, 59, 92, 0.07);
+    --btn-hover: rgba(74, 59, 92, 0.14);
+    --btn-line: rgba(74, 59, 92, 0.12);
+    --shadow: 0 12px 30px rgba(184, 51, 106, 0.18), 0 2px 10px rgba(24, 16, 36, 0.08);
+  }
+  html[data-theme="dark"] {
+    --ink: #f6effa;
+    --ink-soft: #dcd0eb;
+    --muted: #b4a7c5;
+    --accent-soft: rgba(255, 126, 178, 0.20);
+    --accent-text: #ff9ec4;
+    --mint: #5de0a6;
+    --mint-bg: rgba(45, 212, 141, 0.16);
+    --mint-line: rgba(45, 212, 141, 0.38);
+    --surface: rgba(28, 22, 38, 0.95);
+    --card: rgba(39, 31, 52, 0.90);
+    --line: rgba(255, 130, 180, 0.32);
+    --btn-bg: rgba(255, 255, 255, 0.09);
+    --btn-hover: rgba(255, 255, 255, 0.16);
+    --btn-line: rgba(255, 255, 255, 0.13);
+    --shadow: 0 14px 32px rgba(0, 0, 0, 0.56), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "HarmonyOS Sans SC", system-ui, sans-serif;
+    color: var(--ink);
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px;
+  }
+  .panel {
+    width: 100%;
+    height: 100%;
+    border-radius: 16px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    padding: 10px 12px;
+    gap: 8px;
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    cursor: grab;
+  }
+  .head-title {
+    font-size: 13px;
+    font-weight: 700;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .pill {
+    flex: none;
+    font-size: 10.5px;
+    font-weight: 700;
+    line-height: 15px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    white-space: nowrap;
+  }
+  .panel.granted .pill {
+    background: var(--mint-bg);
+    color: var(--mint);
+    border: 1px solid var(--mint-line);
+  }
+  .grow { flex: 1; min-width: 0; }
+  .close-btn {
+    flex: none;
+    width: 22px;
+    height: 22px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    padding: 0;
+  }
+  .close-btn:hover { background: var(--btn-hover); color: var(--ink); }
+  .close-btn svg { width: 13px; height: 13px; }
+  .hint {
+    font-size: 11.5px;
+    line-height: 15px;
+    color: var(--ink-soft);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .hint svg { width: 13px; height: 13px; flex: none; color: var(--accent-text); }
+  .panel.granted .hint svg { color: var(--mint); }
+  .drag-chip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 12px;
+    background: var(--card);
+    border: 1.5px dashed var(--line);
+    cursor: grab;
+    min-width: 0;
+    transition: transform 100ms ease, border-color 120ms ease, background 120ms ease;
+  }
+  .drag-chip:hover { border-style: solid; }
+  .drag-chip.dragging { transform: scale(0.985); opacity: 0.88; cursor: grabbing; }
+  .panel.granted .drag-chip {
+    border-style: solid;
+    border-color: var(--mint-line);
+    background: var(--mint-bg);
+  }
+  .drag-chip img {
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    flex: none;
+  }
+  .drag-meta { min-width: 0; flex: 1; }
+  .drag-name {
+    font-size: 12.5px;
+    font-weight: 700;
+    line-height: 16px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .drag-path {
+    font-size: 10.5px;
+    line-height: 14px;
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .drag-tag {
+    flex: none;
+    font-size: 10.5px;
+    font-weight: 700;
+    color: var(--accent-text);
+    background: var(--accent-soft);
+    padding: 2px 7px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .panel.granted .drag-tag {
+    color: var(--mint);
+    background: var(--mint-bg);
+    border: 1px solid var(--mint-line);
+  }
+  .foot {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: auto;
+  }
+  .act {
+    height: 26px;
+    padding: 0 8px;
+    border-radius: 8px;
+    border: 1px solid var(--btn-line);
+    background: var(--btn-bg);
+    color: var(--ink-soft);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+  }
+  .act:hover { background: var(--btn-hover); color: var(--ink); }
+  .act[hidden] { display: none; }
+</style>
+</head>
+<body>
+  <div id="panel" class="panel" role="dialog" aria-label="权限拖拽助手">
+    <div class="head" data-tauri-drag-region>
+      <span id="title" class="head-title">屏幕录制</span>
+      <span id="pill" class="pill">待开启</span>
+      <span class="grow" data-tauri-drag-region></span>
+      <button id="btnClose" type="button" class="close-btn" aria-label="关闭"></button>
+    </div>
+    <div id="hint" class="hint"></div>
+    <div id="dragChip" class="drag-chip" role="button" tabindex="0" aria-label="按住拖动 Herdr Pocket.app 到系统设置列表">
+      <img src="assets/brand/logo-160.webp" alt="" width="34" height="34" draggable="false" />
+      <div class="drag-meta">
+        <div class="drag-name">Herdr Pocket.app</div>
+        <div id="bundlePath" class="drag-path">/Applications/Herdr Pocket.app</div>
+      </div>
+      <span id="dragTag" class="drag-tag">按住拖过去</span>
+    </div>
+    <div class="foot">
+      <button id="btnFinder" type="button" class="act">定位 Finder</button>
+      <button id="btnReset" type="button" class="act" hidden>重置缓存</button>
+      <button id="btnRelaunch" type="button" class="act" hidden>重启生效</button>
+    </div>
+  </div>
+  <script src="perm-companion.js"></script>
+</body>
+</html>

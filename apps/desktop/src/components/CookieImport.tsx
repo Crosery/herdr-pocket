@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronLeft, Cookie, Search, ShieldCheck } from "lucide-react";
 import { PocketButton, PocketCheckbox, PocketInput, PocketModal, useToast } from "./PocketUI";
-import { PermissionGuideModal } from "./PermissionGuideModal";
-import { native, type CookieImportResult, type CookieSource, type Permissions } from "../lib/native";
+import { native, type CookieImportResult, type CookieSource } from "../lib/native";
 import { useClientConfig } from "../lib/config";
 import { logger } from "../lib/log";
 
@@ -50,8 +49,6 @@ export function CookieImportDialog({ open, onOpenChange, currentHost }: { open: 
   const [result, setResult] = useState<{ summary: string; notes: string[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [storeKind, setStoreKind] = useState<"persistent" | "session" | null>(null);
-  const [fdaGuideOpen, setFdaGuideOpen] = useState(false);
-  const [perms, setPerms] = useState<Permissions | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -60,11 +57,22 @@ export function CookieImportDialog({ open, onOpenChange, currentHost }: { open: 
     setResult(null);
     setError(null);
     setConfirmAll(false);
-    setFdaGuideOpen(false);
     if (!supported) return;
     void native.listCookieSources().then(setSources, () => setSources([]));
     void native.browserStoreKind().then(setStoreKind, () => setStoreKind(null));
-    void native.getPermissions().then(setPerms, () => setPerms(null));
+  }, [open, supported]);
+
+  useEffect(() => {
+    if (!open || !supported) return;
+    const refreshSources = () => {
+      void native.listCookieSources().then(setSources).catch(() => {});
+    };
+    const offPerms = native.onPermissionsChanged(refreshSources);
+    window.addEventListener("focus", refreshSources);
+    return () => {
+      offPerms();
+      window.removeEventListener("focus", refreshSources);
+    };
   }, [open, supported]);
 
   const choose = (s: CookieSource) => {
@@ -199,7 +207,6 @@ export function CookieImportDialog({ open, onOpenChange, currentHost }: { open: 
                       size="sm"
                       variant="soft"
                       onClick={() => {
-                        setFdaGuideOpen(true);
                         void native.openPermissionSettings("fullDiskAccess", true);
                       }}
                     >
@@ -304,20 +311,6 @@ export function CookieImportDialog({ open, onOpenChange, currentHost }: { open: 
         ) : null}
         {error ? <div className="inline-alert">{error}</div> : null}
       </div>
-      <PermissionGuideModal
-        kind="fullDiskAccess"
-        open={fdaGuideOpen}
-        onOpenChange={setFdaGuideOpen}
-        perms={perms}
-        onRefresh={async () => {
-          const [nextPerms, nextSources] = await Promise.all([
-            native.getPermissions(),
-            native.listCookieSources().catch(() => sources ?? []),
-          ]);
-          if (nextPerms) setPerms(nextPerms);
-          setSources(nextSources);
-        }}
-      />
     </PocketModal>
   );
 }

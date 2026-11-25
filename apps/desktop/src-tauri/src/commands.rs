@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 #[tauri::command]
 pub fn log_write(level: String, kind: String, msg: String, data: Option<Value>) {
@@ -177,21 +177,50 @@ pub async fn permissions_status(app: AppHandle) -> perms::Status {
         .await
         .unwrap_or_else(|_| perms::status());
     if perms::note_change(&s) {
+        let _ = app.emit_to("main", "app://permissions", &s);
         crate::voice::config_changed(&app);
     }
     s
 }
 
 #[tauri::command]
-pub async fn permission_request(kind: String) -> Result<perms::Status, String> {
-    tauri::async_runtime::spawn_blocking(move || perms::request(&kind))
+pub async fn permission_request(app: AppHandle, kind: String) -> Result<perms::Status, String> {
+    let kind_req = kind.clone();
+    let s = tauri::async_runtime::spawn_blocking(move || perms::request(&kind_req))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+    if perms::note_change(&s) {
+        let _ = app.emit_to("main", "app://permissions", &s);
+        crate::voice::config_changed(&app);
+    }
+    Ok(s)
 }
 
 #[tauri::command]
-pub fn permission_open_settings(kind: String, register: Option<bool>) -> Result<(), String> {
-    perms::open_settings_and_register(&kind, register.unwrap_or(false))
+pub async fn permission_open_settings(
+    app: AppHandle,
+    kind: String,
+    register: Option<bool>,
+) -> Result<(), String> {
+    let reg = register.unwrap_or(true);
+    let kind_req = kind.clone();
+    tauri::async_runtime::spawn_blocking(move || perms::open_settings_and_register(&kind_req, reg))
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let s = tauri::async_runtime::spawn_blocking(perms::status)
+        .await
+        .unwrap_or_else(|_| perms::status());
+    if perms::note_change(&s) {
+        let _ = app.emit_to("main", "app://permissions", &s);
+        crate::voice::config_changed(&app);
+    }
+    if perms::state_of(&s, &kind) != perms::State::Granted
+        && crate::perm_companion::supports_companion(&kind)
+    {
+        crate::perm_companion::show(&app, &kind);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -213,6 +242,7 @@ pub async fn reset_mac_permission(app: AppHandle, kind: String) -> Result<perms:
     .await
     .map_err(|e| e.to_string())??;
     if perms::note_change(&s) {
+        let _ = app.emit_to("main", "app://permissions", &s);
         crate::voice::config_changed(&app);
     }
     Ok(s)

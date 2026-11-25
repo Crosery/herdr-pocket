@@ -85,12 +85,13 @@ type HotkeyCheck = bridge.HotkeyCheck;
 
 /** permissions_status in src-tauri/src/perms.rs. */
 export type Permission = "granted" | "denied" | "notDetermined" | "restricted" | "notApplicable" | "unknown";
-export type PermissionKind = "microphone" | "accessibility" | "inputMonitoring" | "keyboard" | "fullDiskAccess";
+export type PermissionKind = "microphone" | "accessibility" | "inputMonitoring" | "screenRecording" | "keyboard" | "fullDiskAccess";
 export interface Permissions {
   platform: string;
   microphone: Permission;
   accessibility: Permission;
   inputMonitoring: Permission;
+  screenRecording?: Permission;
   fullDiskAccess?: Permission;
   /** macOS: what the 🌐/Fn key does now; "none" is needed to use Fn as the dictation key. */
   fnKeyAction?: "none" | "inputSource" | "emoji" | "dictation" | "unknown";
@@ -762,6 +763,8 @@ export const native = {
 
   // Permissions ------------------------------------------------------------
   getPermissions: async (): Promise<Permissions | null> => (inTauri() ? invoke<Permissions>("permissions_status").catch(() => null) : null),
+  onPermissionsChanged: (cb: (p: Permissions) => void): (() => void) =>
+    inTauri() ? onNativeEvent<Permissions>("app://permissions", cb) : () => {},
   requestPermission: (kind: PermissionKind): Promise<Permissions> => invoke<Permissions>("permission_request", { kind }),
   openPermissionSettings: (kind: PermissionKind, register = false): Promise<void> =>
     inTauri() ? invoke("permission_open_settings", { kind, register }) : noop(),
@@ -774,6 +777,7 @@ export const native = {
       microphone: kind === "microphone" ? "notDetermined" : "granted",
       accessibility: mac ? (kind === "accessibility" ? "notDetermined" : "denied") : "notApplicable",
       inputMonitoring: mac ? (kind === "inputMonitoring" ? "notDetermined" : "denied") : "notApplicable",
+      screenRecording: mac ? (kind === "screenRecording" ? "notDetermined" : "denied") : "notApplicable",
       fullDiskAccess: mac ? (kind === "fullDiskAccess" ? "notDetermined" : "denied") : "notApplicable",
       appBundlePath: mac ? "/Applications/Herdr Pocket.app" : undefined,
       notes: [],

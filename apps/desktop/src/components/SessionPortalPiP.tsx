@@ -13,11 +13,12 @@ import {
   X,
 } from "lucide-react";
 import type { Agent, PortalItem } from "@herdr-pocket/protocol";
-import { isTauri } from "../lib/bridge";
+import { detectPlatform, isTauri } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { native } from "../lib/native";
 import { rpcCall } from "../lib/relay";
 import {
+  capturePortalFrameOnce,
   closePortalSurface,
   filterVisiblePortalItems,
   isLoopbackPortalUrl,
@@ -27,6 +28,7 @@ import {
 } from "../lib/portalClient";
 import { liveStore } from "../lib/store";
 import { openWebTab, shellStore } from "../shell/shellStore";
+import { PocketButton } from "./PocketUI";
 
 type ResizeDir = "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
 
@@ -231,12 +233,43 @@ export function SessionPortalPiP({
     };
   }, [agent.key, collapsed, currentHostId, currentId, currentPath, imgPreview?.dataUri, imgPreview?.portalId, isInlineImageFile, visible]);
 
+  const isSameLocalHost = Boolean(isTauriApp && localHostId && current?.hostId === localHostId);
+  const needsMacScreenPerm = Boolean(
+    isTauriApp &&
+      detectPlatform() === "macos" &&
+      isSameLocalHost &&
+      current?.streamError &&
+      /屏幕录制|抓屏权限|screen_recording/i.test(current.streamError),
+  );
+
+  useEffect(() => {
+    if (!needsMacScreenPerm || !currentHostId || !currentId) return;
+    const retryIfGranted = async () => {
+      const p = await native.getPermissions();
+      if (p?.screenRecording === "granted") {
+        void capturePortalFrameOnce(currentHostId, currentId);
+      }
+    };
+    const off = native.onPermissionsChanged((p) => {
+      if (p.screenRecording === "granted") {
+        void capturePortalFrameOnce(currentHostId, currentId);
+      }
+    });
+    const onFocus = () => {
+      void retryIfGranted();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      off();
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [currentHostId, currentId, needsMacScreenPerm]);
+
   if (!items.length || !current) return null;
 
   const frame = framesById[current.id];
   const activeHtml = htmlPreview?.portalId === current.id ? htmlPreview : null;
   const activeImg = imgPreview?.portalId === current.id ? imgPreview : null;
-  const isSameLocalHost = Boolean(isTauriApp && localHostId && current.hostId === localHostId);
   const safeExternalUrl =
     current.url && /^https?:\/\//i.test(current.url) && (isSameLocalHost || !isLoopbackPortalUrl(current.url))
       ? current.url
@@ -472,10 +505,17 @@ export function SessionPortalPiP({
       </div>
 
       {!collapsed ? (
-        <button
-          type="button"
+        <div
+          role="button"
+          tabIndex={0}
           className="session-portal-pip-preview"
           onClick={() => onExpandPortal(current.id)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              onExpandPortal(current.id);
+            }
+          }}
         >
           {current.canInteract && frame ? (
             <img
@@ -502,7 +542,7 @@ export function SessionPortalPiP({
               />
             </div>
           ) : (
-            <div className="session-portal-pip-card">
+            <div className={`session-portal-pip-card${needsMacScreenPerm ? " is-perm" : ""}`}>
               <div className="session-portal-pip-kind">
                 {portalIcon(current.kind)}
                 <span>
@@ -520,15 +560,30 @@ export function SessionPortalPiP({
                 </span>
               </div>
               <div
-                className="session-portal-pip-sub mono truncate"
+                className={`session-portal-pip-sub${current.streamError ? " is-err" : " mono truncate"}`}
                 title={current.streamError || current.subtitle || current.url || current.targetPath || current.title}
               >
                 {current.streamError || current.highlightName || current.subtitle || current.url || current.targetPath || current.title}
               </div>
+              {needsMacScreenPerm ? (
+                <div className="session-portal-pip-card-act">
+                  <PocketButton
+                    size="sm"
+                    variant="primary"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void native.openPermissionSettings("screenRecording", true);
+                    }}
+                  >
+                    <ExternalLink size={12} />
+                    <span>去授权屏幕录制</span>
+                  </PocketButton>
+                </div>
+              ) : null}
             </div>
           )}
-          <span className="session-portal-pip-overlay">点击放大并交互操作</span>
-        </button>
+          {needsMacScreenPerm ? null : <span className="session-portal-pip-overlay">点击放大并交互操作</span>}
+        </div>
       ) : null}
     </div>
   );

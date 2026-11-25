@@ -1,4 +1,4 @@
-const CACHE_NAME = "herdr-pocket-shell-v6";
+const CACHE_NAME = "herdr-pocket-shell-v7";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());

@@ -1,7 +1,8 @@
-//! Permission states for voice input and the system pages that change them.
+//! Permission states for voice input, screen capture, and the system pages that change them.
 //!
-//! macOS: Microphone (recording), Accessibility (pasting into other apps),
-//! Input Monitoring (watching a modifier-only hotkey such as right Option).
+//! macOS: Screen Recording (window portal capture), Microphone (recording),
+//! Accessibility (pasting into other apps), Input Monitoring (watching a
+//! modifier-only hotkey such as right Option).
 //! Windows: the microphone privacy switches; there is nothing to grant for
 //! keyboard hooks or SendInput, but neither reaches apps running as
 //! administrator while this app is not.
@@ -33,6 +34,7 @@ pub struct Status {
     pub microphone: State,
     pub accessibility: State,
     pub input_monitoring: State,
+    pub screen_recording: State,
     pub full_disk_access: State,
     /// macOS: what the fn (globe) key does: `none`, `inputSource`, `emoji` or `dictation`
     /// (absent when the system never stored a choice, and on other systems).
@@ -44,7 +46,12 @@ pub struct Status {
     pub notes: Vec<String>,
 }
 
-pub const KINDS: [&str; 3] = ["microphone", "accessibility", "inputMonitoring"];
+pub const KINDS: [&str; 4] = [
+    "microphone",
+    "accessibility",
+    "inputMonitoring",
+    "screenRecording",
+];
 
 /// Walks `exe` ancestors for the enclosing `.app` bundle (preferring the outermost `.app` in dev/helper layouts).
 pub fn app_bundle_from_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -117,6 +124,8 @@ mod mac {
     extern "C" {
         fn CGPreflightListenEventAccess() -> bool;
         fn CGRequestListenEventAccess() -> bool;
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
     }
 
     #[link(name = "AVFoundation", kind = "framework")]
@@ -214,6 +223,27 @@ mod mac {
             State::Granted
         } else {
             input_monitoring()
+        }
+    }
+
+    pub fn screen_recording() -> State {
+        if unsafe { CGPreflightScreenCaptureAccess() } {
+            State::Granted
+        } else {
+            State::Denied
+        }
+    }
+
+    /// Registers the app in macOS System Settings → Privacy & Security → Screen Recording
+    /// (`CGRequestScreenCaptureAccess`) without prompting if already granted.
+    pub fn request_screen_recording() -> State {
+        if unsafe { CGPreflightScreenCaptureAccess() } {
+            return State::Granted;
+        }
+        if unsafe { CGRequestScreenCaptureAccess() } {
+            State::Granted
+        } else {
+            screen_recording()
         }
     }
 
@@ -345,13 +375,14 @@ pub fn status() -> Status {
             microphone: mac::microphone(),
             accessibility: mac::accessibility(),
             input_monitoring: mac::input_monitoring(),
+            screen_recording: mac::screen_recording(),
             full_disk_access: mac::full_disk_access(),
             fn_key_action: mac::fn_key_action(),
             app_bundle_path: current_app_bundle().map(|p| p.to_string_lossy().into_owned()),
             notes: vec![
+                "屏幕录制：跨端窗口回传与本机浮窗预览时需要。".into(),
                 "麦克风：与小羊实时语音通话和录制声纹时需要。".into(),
                 "输入监控：只用一个修饰键（如右 Option、Fn）做小羊唤醒快捷键时需要。".into(),
-                "若在系统设置里找不到开关，或开启后仍未生效，可直接把引导弹窗内的应用图标拖入系统设置列表。".into(),
             ],
         }
     }
@@ -362,6 +393,7 @@ pub fn status() -> Status {
             microphone: win::microphone(),
             accessibility: State::NotApplicable,
             input_monitoring: State::NotApplicable,
+            screen_recording: State::NotApplicable,
             full_disk_access: State::NotApplicable,
             fn_key_action: None,
             app_bundle_path: None,
@@ -378,6 +410,7 @@ pub fn status() -> Status {
             microphone: State::Unknown,
             accessibility: State::NotApplicable,
             input_monitoring: State::NotApplicable,
+            screen_recording: State::NotApplicable,
             full_disk_access: State::NotApplicable,
             fn_key_action: None,
             app_bundle_path: None,
@@ -403,6 +436,10 @@ pub fn request(kind: &str) -> Result<Status, String> {
         "inputMonitoring" => {
             mac::request_input_monitoring();
         }
+        #[cfg(target_os = "macos")]
+        "screenRecording" => {
+            mac::request_screen_recording();
+        }
         k if KINDS.contains(&k) => {
             // Nothing to ask on this OS: the settings page is the only way.
             open_settings(k)?;
@@ -418,11 +455,14 @@ pub fn request(kind: &str) -> Result<Status, String> {
     Ok(after)
 }
 
-fn state_of(s: &Status, kind: &str) -> State {
+pub(crate) fn state_of(s: &Status, kind: &str) -> State {
     match kind {
         "microphone" => s.microphone,
         "accessibility" => s.accessibility,
-        _ => s.input_monitoring,
+        "inputMonitoring" => s.input_monitoring,
+        "screenRecording" => s.screen_recording,
+        "fullDiskAccess" => s.full_disk_access,
+        _ => State::Unknown,
     }
 }
 
@@ -438,6 +478,9 @@ pub fn settings_url(kind: &str) -> Option<&'static str> {
             ),
             "inputMonitoring" => {
                 Some("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+            }
+            "screenRecording" => {
+                Some("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
             }
             "keyboard" => Some("x-apple.systempreferences:com.apple.Keyboard-Settings.extension"),
             // Safari keeps its cookies where only Full Disk Access reaches.
@@ -461,6 +504,8 @@ pub fn settings_url(kind: &str) -> Option<&'static str> {
 static PROMPTED_AX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static PROMPTED_IM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static PROMPTED_SC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Maps supported permission kinds to macOS `tccutil` service names (strict allowlist).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -469,6 +514,7 @@ pub(crate) fn mac_tcc_service(kind: &str) -> Option<&'static str> {
         "accessibility" => Some("Accessibility"),
         "inputMonitoring" => Some("ListenEvent"),
         "microphone" => Some("Microphone"),
+        "screenRecording" => Some("ScreenCapture"),
         _ => None,
     }
 }
@@ -530,6 +576,16 @@ pub fn open_settings_and_register(kind: &str, register: bool) -> Result<(), Stri
                 "microphone" => {
                     if mac::microphone() == State::NotDetermined
                         && mac::request_microphone() == State::Granted
+                    {
+                        return Ok(());
+                    }
+                }
+                "screenRecording" => {
+                    if mac::screen_recording() == State::Granted {
+                        return Ok(());
+                    }
+                    if !PROMPTED_SC.swap(true, Ordering::Relaxed)
+                        && mac::request_screen_recording() == State::Granted
                     {
                         return Ok(());
                     }
@@ -608,6 +664,7 @@ pub fn reset_mac_permission(app: &tauri::AppHandle, kind: &str) -> Result<Status
         match kind {
             "accessibility" => PROMPTED_AX.store(false, Ordering::Relaxed),
             "inputMonitoring" => PROMPTED_IM.store(false, Ordering::Relaxed),
+            "screenRecording" => PROMPTED_SC.store(false, Ordering::Relaxed),
             _ => {}
         }
 
@@ -705,92 +762,116 @@ mod mac_drag {
         static ACTIVE_DRAG: RefCell<Option<(Retained<PocketAppDragSource>, Retained<NSDraggingSession>)>> = const { RefCell::new(None) };
     }
 
-    pub fn start_app_bundle_drag(app: &tauri::AppHandle) -> Result<bool, String> {
-        let bundle = current_app_bundle().ok_or_else(|| "未找到 Herdr Pocket.app 应用包".to_string())?;
+    fn run_drag_on_main(
+        mtm: MainThreadMarker,
+        handle: &tauri::AppHandle,
+        bundle_str: &str,
+        preferred: Option<&str>,
+    ) -> Result<bool, String> {
+        if (NSEvent::pressedMouseButtons() & 1) == 0 {
+            return Ok(false);
+        }
+        let win = preferred
+            .and_then(|label| handle.get_webview_window(label))
+            .or_else(|| {
+                handle
+                    .get_webview_window("perm-companion")
+                    .filter(|w| w.is_visible().unwrap_or(false))
+            })
+            .or_else(|| handle.get_webview_window("main"))
+            .ok_or("未找到拖拽来源窗口")?;
+        let ns_ptr = win
+            .ns_window()
+            .map_err(|e| format!("获取窗口句柄失败：{e}"))?;
+        if ns_ptr.is_null() {
+            return Err("窗口尚未就绪".into());
+        }
+        let ns_win = unsafe { &*(ns_ptr as *const NSWindow) };
+        let content_view = ns_win.contentView().ok_or("窗口视图尚未就绪")?;
+        let ns_path = NSString::from_str(bundle_str);
+        let file_url = NSURL::fileURLWithPath(&ns_path);
+        let drag_item = if let Some(abs_url) = file_url.absoluteString() {
+            let pb_item = NSPasteboardItem::new();
+            let file_url_uti = NSString::from_str("public.file-url");
+            if !pb_item.setString_forType(&abs_url, &file_url_uti) {
+                let _ = unsafe { pb_item.setString_forType(&abs_url, NSPasteboardTypeFileURL) };
+            }
+            NSDraggingItem::initWithPasteboardWriter(
+                mtm.alloc(),
+                ProtocolObject::from_ref(&*pb_item),
+            )
+        } else {
+            NSDraggingItem::initWithPasteboardWriter(
+                mtm.alloc(),
+                ProtocolObject::from_ref(&*file_url),
+            )
+        };
+        let icon = NSWorkspace::sharedWorkspace().iconForFile(&ns_path);
+        icon.setSize(NSSize::new(56.0, 56.0));
+        let win_loc = ns_win.mouseLocationOutsideOfEventStream();
+        let view_loc = content_view.convertPoint_fromView(win_loc, None);
+        let frame = NSRect::new(
+            NSPoint::new(view_loc.x - 28.0, view_loc.y - 28.0),
+            NSSize::new(56.0, 56.0),
+        );
+        unsafe {
+            drag_item.setDraggingFrame_contents(frame, Some(icon.as_ref()));
+        }
+        let win_num = ns_win.windowNumber();
+        let current_mouse = NSApplication::sharedApplication(mtm)
+            .currentEvent()
+            .filter(|ev| {
+                ev.windowNumber() == win_num
+                    && matches!(
+                        ev.r#type(),
+                        NSEventType::LeftMouseDown | NSEventType::LeftMouseDragged
+                    )
+            });
+        let drag_event = match current_mouse {
+            Some(ev) => ev,
+            None => NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                NSEventType::LeftMouseDragged,
+                win_loc,
+                NSEventModifierFlags::empty(),
+                NSProcessInfo::processInfo().systemUptime(),
+                win_num,
+                None,
+                0,
+                1,
+                1.0,
+            )
+            .ok_or("无法构造拖拽鼠标事件")?,
+        };
+        let source = PocketAppDragSource::new(mtm);
+        let items = NSArray::from_retained_slice(&[drag_item]);
+        let session = content_view.beginDraggingSessionWithItems_event_source(
+            &items,
+            &drag_event,
+            ProtocolObject::from_ref(&*source),
+        );
+        ACTIVE_DRAG.with(|slot| {
+            *slot.borrow_mut() = Some((source, session));
+        });
+        Ok(true)
+    }
+
+    pub fn start_app_bundle_drag_from(
+        app: &tauri::AppHandle,
+        preferred_window_label: Option<&str>,
+    ) -> Result<bool, String> {
+        let bundle =
+            current_app_bundle().ok_or_else(|| "未找到 Herdr Pocket.app 应用包".to_string())?;
         let bundle_str = bundle.to_string_lossy().into_owned();
+        if let Some(mtm) = MainThreadMarker::new() {
+            return run_drag_on_main(mtm, app, &bundle_str, preferred_window_label);
+        }
+        let preferred = preferred_window_label.map(str::to_string);
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<bool, String>>(1);
         let handle = app.clone();
         app.run_on_main_thread(move || {
-            let res = (|| -> Result<bool, String> {
-                if (NSEvent::pressedMouseButtons() & 1) == 0 {
-                    return Ok(false);
-                }
-                let mtm = MainThreadMarker::new().ok_or("必须在主线程发起拖拽")?;
-                let win = handle
-                    .get_webview_window("main")
-                    .ok_or("未找到主窗口")?;
-                let ns_ptr = win
-                    .ns_window()
-                    .map_err(|e| format!("获取窗口句柄失败：{e}"))?;
-                if ns_ptr.is_null() {
-                    return Err("主窗口尚未就绪".into());
-                }
-                let ns_win = unsafe { &*(ns_ptr as *const NSWindow) };
-                let content_view = ns_win.contentView().ok_or("窗口视图尚未就绪")?;
-                let ns_path = NSString::from_str(&bundle_str);
-                let file_url = NSURL::fileURLWithPath(&ns_path);
-                let drag_item = if let Some(abs_url) = file_url.absoluteString() {
-                    let pb_item = NSPasteboardItem::new();
-                    let file_url_uti = NSString::from_str("public.file-url");
-                    if !pb_item.setString_forType(&abs_url, &file_url_uti) {
-                        let _ = unsafe { pb_item.setString_forType(&abs_url, NSPasteboardTypeFileURL) };
-                    }
-                    NSDraggingItem::initWithPasteboardWriter(
-                        mtm.alloc(),
-                        ProtocolObject::from_ref(&*pb_item),
-                    )
-                } else {
-                    NSDraggingItem::initWithPasteboardWriter(
-                        mtm.alloc(),
-                        ProtocolObject::from_ref(&*file_url),
-                    )
-                };
-                let icon = NSWorkspace::sharedWorkspace().iconForFile(&ns_path);
-                icon.setSize(NSSize::new(56.0, 56.0));
-                let win_loc = ns_win.mouseLocationOutsideOfEventStream();
-                let view_loc = content_view.convertPoint_fromView(win_loc, None);
-                let frame = NSRect::new(
-                    NSPoint::new(view_loc.x - 28.0, view_loc.y - 28.0),
-                    NSSize::new(56.0, 56.0),
-                );
-                unsafe {
-                    drag_item.setDraggingFrame_contents(frame, Some(icon.as_ref()));
-                }
-                let current_mouse = NSApplication::sharedApplication(mtm)
-                    .currentEvent()
-                    .filter(|ev| {
-                        matches!(
-                            ev.r#type(),
-                            NSEventType::LeftMouseDown | NSEventType::LeftMouseDragged
-                        )
-                    });
-                let drag_event = match current_mouse {
-                    Some(ev) => ev,
-                    None => NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-                        NSEventType::LeftMouseDragged,
-                        win_loc,
-                        NSEventModifierFlags::empty(),
-                        NSProcessInfo::processInfo().systemUptime(),
-                        ns_win.windowNumber(),
-                        None,
-                        0,
-                        1,
-                        1.0,
-                    )
-                    .ok_or("无法构造拖拽鼠标事件")?,
-                };
-                let source = PocketAppDragSource::new(mtm);
-                let items = NSArray::from_retained_slice(&[drag_item]);
-                let session = content_view.beginDraggingSessionWithItems_event_source(
-                    &items,
-                    &drag_event,
-                    ProtocolObject::from_ref(&*source),
-                );
-                ACTIVE_DRAG.with(|slot| {
-                    *slot.borrow_mut() = Some((source, session));
-                });
-                Ok(true)
-            })();
+            let res = MainThreadMarker::new()
+                .ok_or_else(|| "必须在主线程发起拖拽".to_string())
+                .and_then(|mtm| run_drag_on_main(mtm, &handle, &bundle_str, preferred.as_deref()));
             let _ = tx.send(res);
         })
         .map_err(|e| format!("调度主线程拖拽失败：{e}"))?;
@@ -813,13 +894,21 @@ pub(crate) fn resolve_input_monitoring(hid_access: u32, cg_preflight: bool) -> S
 }
 
 pub fn start_app_bundle_drag(app: &tauri::AppHandle) -> Result<bool, String> {
+    start_app_bundle_drag_from(app, None)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn start_app_bundle_drag_from(
+    app: &tauri::AppHandle,
+    preferred_window_label: Option<&str>,
+) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
-        mac_drag::start_app_bundle_drag(app)
+        mac_drag::start_app_bundle_drag_from(app, preferred_window_label)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = app;
+        let _ = (app, preferred_window_label);
         Ok(false)
     }
 }
@@ -829,7 +918,14 @@ pub fn snapshot_value() -> Value {
 }
 
 fn states_value(s: &Status) -> Value {
-    json!({ "microphone": s.microphone, "accessibility": s.accessibility, "inputMonitoring": s.input_monitoring, "fullDiskAccess": s.full_disk_access, "fnKey": s.fn_key_action })
+    json!({
+        "microphone": s.microphone,
+        "accessibility": s.accessibility,
+        "inputMonitoring": s.input_monitoring,
+        "screenRecording": s.screen_recording,
+        "fullDiskAccess": s.full_disk_access,
+        "fnKey": s.fn_key_action,
+    })
 }
 
 #[cfg(test)]
@@ -857,7 +953,14 @@ mod tests {
     #[test]
     fn settings_url_covers_all_supported_permission_kinds() {
         if cfg!(target_os = "macos") {
-            for k in ["microphone", "accessibility", "inputMonitoring", "keyboard", "fullDiskAccess"] {
+            for k in [
+                "microphone",
+                "accessibility",
+                "inputMonitoring",
+                "screenRecording",
+                "keyboard",
+                "fullDiskAccess",
+            ] {
                 assert!(settings_url(k).is_some(), "missing macOS URL for {k}");
             }
         }
@@ -879,6 +982,7 @@ mod tests {
         assert_eq!(mac_tcc_service("accessibility"), Some("Accessibility"));
         assert_eq!(mac_tcc_service("inputMonitoring"), Some("ListenEvent"));
         assert_eq!(mac_tcc_service("microphone"), Some("Microphone"));
+        assert_eq!(mac_tcc_service("screenRecording"), Some("ScreenCapture"));
         assert_eq!(mac_tcc_service("fullDiskAccess"), None);
         assert_eq!(mac_tcc_service("keyboard"), None);
         assert_eq!(mac_tcc_service("all"), None);

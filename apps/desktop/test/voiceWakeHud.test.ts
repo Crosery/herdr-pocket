@@ -151,6 +151,38 @@ test("Settings, PermissionCards, composers, ShellWork, and App remove dictation 
   );
   assert.ok(permsHtml.includes("麦克风"));
   assert.ok(!permsHtml.includes("辅助功能"));
+  assert.ok(!permsHtml.includes("引导与修复"));
+
+  const allPermsHtml = renderToStaticMarkup(
+    React.createElement(
+      ToastProvider,
+      null,
+      React.createElement(PermissionCards, {
+        perms: {
+          platform: "macos",
+          microphone: "granted",
+          accessibility: "denied",
+          inputMonitoring: "denied",
+          screenRecording: "denied",
+          notes: [],
+        },
+        checking: false,
+        onChanged: () => {},
+        singleKey: true,
+        scope: "all",
+      }),
+    ),
+  );
+  assert.ok(allPermsHtml.includes("屏幕录制"));
+  assert.ok(allPermsHtml.includes("麦克风"));
+  assert.ok(allPermsHtml.includes("输入监控"));
+  assert.ok(allPermsHtml.includes("去授权"));
+  assert.ok(!allPermsHtml.includes("引导与修复"));
+
+  const compactSetupHtml = renderToStaticMarkup(
+    React.createElement(ToastProvider, null, React.createElement(VoiceInputSetup, { compact: true })),
+  );
+  assert.ok(!compactSetupHtml.includes("系统权限"));
 
   assert.ok(!AGENTS_TSX.includes("VoiceMicButton"));
   assert.ok(!ASSISTANT_TSX.includes("VoiceMicButton"));

@@ -19,7 +19,9 @@ mod local_term;
 mod logging;
 mod mainwin;
 mod net;
+mod perm_companion;
 mod perms;
+mod portal_bridge;
 mod redact;
 mod relaylog;
 mod resources;
@@ -549,6 +551,7 @@ fn on_setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     resources::start_telemetry(handle.clone());
     config::start_watch(handle.clone());
     perms::log_states("startup");
+    portal_bridge::start(&handle);
     voice::init(&handle);
     mainwin::init(&handle);
     local_term::warmup(&handle);
@@ -595,6 +598,8 @@ pub(crate) fn prepare_relaunch(handle: &tauri::AppHandle) {
         json!({ "via": "permission" }),
     );
     mainwin::flush_window_state(handle);
+    perm_companion::close(handle);
+    portal_bridge::shutdown();
     local_term::shutdown();
     voice_ai::shutdown();
     voice::shutdown(handle);
@@ -611,6 +616,8 @@ fn on_quit(handle: &tauri::AppHandle, via: &str) {
     }
     logging::info("app", "app quitting", json!({ "via": via }));
     mainwin::flush_window_state(handle);
+    perm_companion::close(handle);
+    portal_bridge::shutdown();
     local_term::shutdown();
     voice_ai::shutdown();
     voice::shutdown(handle);

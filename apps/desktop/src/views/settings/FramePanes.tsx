@@ -760,6 +760,7 @@ export function PrivacyPane() {
   useEffect(() => {
     void native.logInfo().then(setFolder);
     void refreshPerms();
+    return native.onPermissionsChanged((next) => setPerms(next));
   }, [refreshPerms]);
   // "到 pocket.example.com，" with a real relay; "到你连接的中转服务器，" otherwise.
   const relay = server && !isMockServer(server) ? ` ${serverLabel(server)}` : "中转服务器";
@@ -770,7 +771,7 @@ export function PrivacyPane() {
 
       <SetHeading>系统权限</SetHeading>
       <div className="sf-block">
-        <PermissionCards perms={perms} checking={checkingPerms} onChanged={() => void refreshPerms()} singleKey={HOLD_KEYS.has(voice.hotkey ?? "")} />
+        <PermissionCards perms={perms} checking={checkingPerms} onChanged={() => void refreshPerms()} singleKey={HOLD_KEYS.has(voice.hotkey ?? "")} scope="all" />
       </div>
 
       <SetHeading>日志</SetHeading>

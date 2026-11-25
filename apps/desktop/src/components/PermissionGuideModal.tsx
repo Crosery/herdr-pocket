@@ -91,6 +91,18 @@ export function permissionGuideSpec(kind: PermissionKind): PermissionGuideSpec {
           "在列表开启开关；或按住下方「Herdr Pocket.app」拖进列表。",
         ],
       };
+    case "screenRecording":
+      return {
+        title: "屏幕录制",
+        breadcrumbs: ["系统设置", "隐私与安全性", "屏幕录制"],
+        why: "用于跨端窗口回传与本机浮窗预览指定应用画面。",
+        actionLabel: "打开系统设置「屏幕录制」",
+        dragSupported: true,
+        steps: [
+          "打开系统设置「屏幕录制」并开启 Herdr Pocket 开关。",
+          "在列表开启开关；或按住下方「Herdr Pocket.app」拖进列表。",
+        ],
+      };
     case "fullDiskAccess":
       return {
         title: "完全磁盘访问权限",
@@ -124,6 +136,7 @@ function anyPermissionGrantedTransition(prev: Permissions | null, next: Permissi
     (prev.microphone !== "granted" && next.microphone === "granted") ||
     (prev.accessibility !== "granted" && next.accessibility === "granted") ||
     (prev.inputMonitoring !== "granted" && next.inputMonitoring === "granted") ||
+    (prev.screenRecording !== "granted" && next.screenRecording === "granted") ||
     (prev.fullDiskAccess !== "granted" && next.fullDiskAccess === "granted") ||
     (prev.fnKeyAction !== "none" && next.fnKeyAction === "none")
   );
@@ -133,6 +146,7 @@ export function permissionGranted(kind: PermissionKind, perms: Permissions | nul
   if (!perms) return false;
   if (kind === "keyboard") return perms.fnKeyAction === "none";
   if (kind === "fullDiskAccess") return perms.fullDiskAccess === "granted";
+  if (kind === "screenRecording") return perms.screenRecording === "granted";
   return perms[kind] === "granted";
 }
 
@@ -140,6 +154,7 @@ export function permissionStateOf(kind: PermissionKind, perms: Permissions | nul
   if (!perms) return "unknown";
   if (kind === "keyboard") return perms.fnKeyAction === "none" ? "granted" : "denied";
   if (kind === "fullDiskAccess") return perms.fullDiskAccess ?? "unknown";
+  if (kind === "screenRecording") return perms.screenRecording ?? "unknown";
   return perms[kind];
 }
 

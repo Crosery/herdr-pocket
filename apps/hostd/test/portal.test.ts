@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -936,4 +937,89 @@ test("PortalManager surfaces streamError cleanly and short-circuits TCC-denied w
   const browserPortal = mgr.listPortals(fakeAgent.key).find((x) => x.kind === "browser");
   assert.ok(browserPortal);
   assert.match(browserPortal.streamError ?? "", /未安装 Chrome/);
+});
+
+test("OsCaptureDriver delegates macOS check/list/capture through Herdr Pocket desktop bridge socket and falls back cleanly", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hp-sock-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const sockPath = join(dir, "desktop-portal.sock");
+  const seen: string[][] = [];
+  let allowScreen = false;
+
+  const srv = createNetServer((conn) => {
+    let buf = "";
+    conn.on("data", (c) => {
+      buf += c.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      const req = JSON.parse(buf.slice(0, nl)) as { args: string[] };
+      seen.push(req.args);
+      if (req.args[0] === "check") {
+        const out = Buffer.from(JSON.stringify({ screenCapture: allowScreen })).toString("base64");
+        conn.end(`${JSON.stringify({ code: 0, stdoutBase64: out, stderr: "" })}\n`);
+      } else if (req.args[0] === "list") {
+        const out = Buffer.from(
+          JSON.stringify([{ id: "77", appName: "ego lite", title: "bridge-win", pid: 77, bounds: { x: 0, y: 0, width: 800, height: 600 } }]),
+        ).toString("base64");
+        conn.end(`${JSON.stringify({ code: 0, stdoutBase64: out, stderr: "" })}\n`);
+      } else if (req.args[0] === "capture") {
+        if (!allowScreen) {
+          conn.end(`${JSON.stringify({ code: 2, stdoutBase64: "", stderr: "screen_recording_denied" })}\n`);
+        } else {
+          conn.end(`${JSON.stringify({ code: 0, stdoutBase64: Buffer.from("fake-jpg").toString("base64"), stderr: "dims:640x480\n" })}\n`);
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolveListen) => srv.listen(sockPath, resolveListen));
+  t.after(() => srv.close());
+
+  let localExecCalled = 0;
+  const driver = new OsCaptureDriver({
+    platform: "darwin",
+    binDir: join(dir, "bin"),
+    portalBridgeSocket: sockPath,
+    hasCmd: () => false,
+    pathExists: (p) => p === sockPath,
+    execBin: async () => {
+      localExecCalled += 1;
+      return { code: 1, stdout: Buffer.alloc(0), stderr: "" };
+    },
+  });
+
+  const deniedNote = await driver.checkPermissionNote();
+  assert.ok(deniedNote?.includes("Herdr Pocket"));
+  assert.equal(localExecCalled, 0);
+
+  const wins = await driver.listWindows();
+  assert.ok(wins.some((w) => w.id === "77" && w.title === "bridge-win"));
+  assert.equal(localExecCalled, 0);
+
+  const deniedCap = await driver.captureWindow("77");
+  assert.equal(deniedCap, null);
+
+  allowScreen = true;
+  const okCap = await driver.captureWindow("77");
+  assert.equal(okCap?.width, 640);
+  assert.equal(okCap?.height, 480);
+  assert.equal(Buffer.from(okCap!.data, "base64").toString("utf8"), "fake-jpg");
+  assert.equal(localExecCalled, 0);
+  assert.ok(seen.some((a) => a[0] === "check"));
+  assert.ok(seen.some((a) => a[0] === "capture"));
+
+  // Missing socket falls back cleanly without throwing.
+  const fallbackDriver = new OsCaptureDriver({
+    platform: "darwin",
+    binDir: join(dir, "bin-missing"),
+    portalBridgeSocket: join(dir, "missing.sock"),
+    hasCmd: () => false,
+    pathExists: () => false,
+    execBin: async () => {
+      localExecCalled += 1;
+      return { code: 1, stdout: Buffer.alloc(0), stderr: "" };
+    },
+  });
+  const fbCap = await fallbackDriver.captureWindow("99");
+  assert.equal(fbCap, null);
+  assert.ok(localExecCalled >= 1);
 });

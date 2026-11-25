@@ -5729,6 +5729,11 @@ a {
   justify-content: center;
 }
 
+.session-portal-pip-card.is-perm {
+  padding: 12px;
+  gap: 8px;
+}
+
 .session-portal-pip-kind {
   display: flex;
   align-items: center;
@@ -5741,6 +5746,17 @@ a {
 .session-portal-pip-sub {
   font-size: calc(11.5px * var(--ts, 1));
   color: var(--muted);
+}
+
+.session-portal-pip-sub.is-err {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.session-portal-pip-card-act {
+  display: flex;
+  align-items: center;
+  padding-top: 2px;
 }
 
 .session-portal-pip-overlay {
