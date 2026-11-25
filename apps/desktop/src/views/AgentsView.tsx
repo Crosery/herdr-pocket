@@ -1043,7 +1043,11 @@ export function AgentDetailPanel({
   const [modelMenuMode, setModelMenuMode] = useState<"model" | "thinking" | null>(null);
   const [modelMenuOmpTab, setModelMenuOmpTab] = useState<"session" | "roles">("session");
   const hasReasoningEvents = useMemo(() => events.some((e) => e.kind === "reasoning"), [events]);
-  const modelMeta = useAutoAgentModelMeta(agent, { hasReasoningEvents, thinkingLevel: agent.thinkingLevel });
+  const modelMeta = useAutoAgentModelMeta(agent, {
+    hasReasoningEvents,
+    thinkingLevel: agent.thinkingLevel,
+    enabled: chatVisited,
+  });
   const effectiveThinkingLevels = useMemo(() => {
     if (agent.isShell || modelMeta.canSwitchThinking === false) {
       return [];
@@ -1417,7 +1421,7 @@ export function AgentDetailPanel({
   useEffect(() => {
     const wasVisible = prevPollVisibleRef.current;
     prevPollVisibleRef.current = visible;
-    if (!visible || wasVisible) return;
+    if (!visible || wasVisible || !chatVisited) return;
     let alive = true;
     if (!streamLiveRef.current && agent.sessionKey) {
       void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 80 })
@@ -1448,7 +1452,7 @@ export function AgentDetailPanel({
     return () => {
       alive = false;
     };
-  }, [activeSubKey, agent.deviceId, agent.key, agent.sessionKey, visible]);
+  }, [activeSubKey, agent.deviceId, agent.key, agent.sessionKey, chatVisited, visible]);
 
   useEffect(() => {
     if (!chatVisited || agent.isShell) {

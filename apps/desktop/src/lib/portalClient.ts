@@ -189,10 +189,12 @@ const initialState: PortalState = {
 let state: PortalState = initialState;
 const listeners = new Set<() => void>();
 const unsupportedHostVersions = new Map<string, string>();
+const PORTAL_WATCHER_GRACE_MS = 10_000;
 const hostPortalWatchers = new Map<
   string,
   {
     refs: number;
+    disposeTimer?: ReturnType<typeof setTimeout>;
     stop: () => void;
   }
 >();
@@ -232,9 +234,21 @@ export function markHostPortalUnsupported(hostId: string): void {
   unsupportedHostVersions.set(hostId, hostVersionKey(hostId));
 }
 
+export function getPortalWatcherSnapshotForTest(
+  hostId: string,
+): { refs: number; hasDisposeTimer: boolean } | null {
+  const cur = hostPortalWatchers.get(hostId);
+  if (!cur) return null;
+  return { refs: cur.refs, hasDisposeTimer: cur.disposeTimer !== undefined };
+}
+
 export function resetPortalClientStateForTest(): void {
   unsupportedHostVersions.clear();
   for (const w of hostPortalWatchers.values()) {
+    if (w.disposeTimer !== undefined) {
+      clearTimeout(w.disposeTimer);
+      w.disposeTimer = undefined;
+    }
     w.stop();
   }
   hostPortalWatchers.clear();
@@ -484,28 +498,39 @@ export async function sendPortalInput(
 }
 
 export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): () => void {
+  const releaseWatcher = () => {
+    const cur = hostPortalWatchers.get(hostId);
+    if (!cur) return;
+    cur.refs = Math.max(0, cur.refs - 1);
+    if (cur.refs <= 0 && cur.disposeTimer === undefined) {
+      cur.disposeTimer = setTimeout(() => {
+        const latest = hostPortalWatchers.get(hostId);
+        if (latest === cur && cur.refs <= 0) {
+          hostPortalWatchers.delete(hostId);
+          cur.stop();
+        }
+      }, PORTAL_WATCHER_GRACE_MS);
+    }
+  };
+
   const existing = hostPortalWatchers.get(hostId);
   if (existing) {
+    if (existing.disposeTimer !== undefined) {
+      clearTimeout(existing.disposeTimer);
+      existing.disposeTimer = undefined;
+    }
     existing.refs += 1;
-    return () => {
-      const cur = hostPortalWatchers.get(hostId);
-      if (!cur) return;
-      cur.refs -= 1;
-      if (cur.refs <= 0) {
-        hostPortalWatchers.delete(hostId);
-        cur.stop();
-      }
-    };
+    return releaseWatcher;
   }
 
   let alive = true;
   let streamFailed = false;
-  let timer = 0;
+  let timer: ReturnType<typeof setInterval> | null = null;
 
   const stopRecoveryTimer = () => {
-    if (timer) {
-      window.clearInterval(timer);
-      timer = 0;
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
     }
   };
 
@@ -539,7 +564,7 @@ export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): 
   );
 
   // Light recovery poll in case an older relay rejects `stream: "portal"`, stopping immediately if hostd lacks portal.*.
-  timer = window.setInterval(() => {
+  timer = setInterval(() => {
     if (!alive) return;
     if (isHostPortalUnsupported(hostId)) {
       stopRecoveryTimer();
@@ -550,7 +575,7 @@ export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): 
     }
   }, 5000);
 
-  const entry = {
+  const entry: { refs: number; disposeTimer?: ReturnType<typeof setTimeout>; stop: () => void } = {
     refs: 1,
     stop: () => {
       alive = false;
@@ -560,15 +585,7 @@ export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): 
   };
   hostPortalWatchers.set(hostId, entry);
 
-  return () => {
-    const cur = hostPortalWatchers.get(hostId);
-    if (!cur) return;
-    cur.refs -= 1;
-    if (cur.refs <= 0) {
-      hostPortalWatchers.delete(hostId);
-      cur.stop();
-    }
-  };
+  return releaseWatcher;
 }
 
 export function subscribePortalFrames(

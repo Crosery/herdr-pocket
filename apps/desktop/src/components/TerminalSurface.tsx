@@ -78,6 +78,12 @@ import {
 import { logAction, logger } from "../lib/log";
 import { native, type LocalTermCloseEvent, type LocalTermSizeEvent } from "../lib/native";
 import { registerWebglCounter } from "../lib/perfTelemetry";
+import {
+  acquireWebglSlot,
+  getActiveWebglPoolCount,
+  markWebglSlotInactive,
+  releaseWebglSlot,
+} from "../lib/terminalWebglPool";
 import { ingestPortalStreamEvent } from "../lib/portalClient";
 import { isDirectConnected, rpcCall, subscribeStream } from "../lib/relay";
 import { uploadRemoteFile } from "../lib/uploadLargeFile";
@@ -97,12 +103,62 @@ import "../styles/terminal.css";
 
 const tauriEventPromise = native.available() ? import("@tauri-apps/api/event") : null;
 
-const MAX_ACTIVE_WEBGL = 6;
-let activeWebglCount = 0;
-registerWebglCounter(() => activeWebglCount);
+registerWebglCounter(() => getActiveWebglPoolCount());
 
 export function getActiveWebglTerminalCount(): number {
-  return activeWebglCount;
+  return getActiveWebglPoolCount();
+}
+
+const localTermCloseListeners = new Set<(ev: LocalTermCloseEvent) => void>();
+const localTermSizeListeners = new Map<string, Set<(ev: LocalTermSizeEvent) => void>>();
+let localTermMuxPromise: Promise<void> | null = null;
+
+function ensureLocalTermMux(): Promise<void> {
+  if (!native.available()) return Promise.resolve();
+  if (!localTermMuxPromise) {
+    localTermMuxPromise = (async () => {
+      const { listen } = await (tauriEventPromise ?? import("@tauri-apps/api/event"));
+      await Promise.all([
+        listen<LocalTermCloseEvent>("local-term://close", (e) => {
+          for (const fn of localTermCloseListeners) fn(e.payload);
+        }),
+        listen<LocalTermSizeEvent>("local-term://size", (e) => {
+          const set = localTermSizeListeners.get(e.payload.terminal);
+          if (!set) return;
+          for (const fn of set) fn(e.payload);
+        }),
+      ]);
+    })().catch((err) => {
+      localTermMuxPromise = null;
+      throw err;
+    });
+  }
+  return localTermMuxPromise;
+}
+
+function subscribeLocalTermEvents(
+  terminalId: string,
+  onClose: (ev: LocalTermCloseEvent) => void,
+  onSize: (ev: LocalTermSizeEvent) => void,
+): { offClose: () => void; offSize: () => void } {
+  localTermCloseListeners.add(onClose);
+  let sizeSet = localTermSizeListeners.get(terminalId);
+  if (!sizeSet) {
+    sizeSet = new Set();
+    localTermSizeListeners.set(terminalId, sizeSet);
+  }
+  sizeSet.add(onSize);
+  return {
+    offClose: () => {
+      localTermCloseListeners.delete(onClose);
+    },
+    offSize: () => {
+      const cur = localTermSizeListeners.get(terminalId);
+      if (!cur) return;
+      cur.delete(onSize);
+      if (cur.size === 0) localTermSizeListeners.delete(terminalId);
+    },
+  };
 }
 
 export { buildTerminalFontFamily };
@@ -346,6 +402,9 @@ export function TerminalSurface({
   const webglRef = useRef<WebglAddon | null>(null);
   const attachWebglRef = useRef<(() => void) | null>(null);
   const detachWebglRef = useRef<(() => void) | null>(null);
+  const markWebglInactiveRef = useRef<(() => void) | null>(null);
+  const touchWarmWebglRef = useRef<(() => void) | null>(null);
+  const dirtyWhileInactiveRef = useRef(false);
   const localConnRef = useRef<string | null>(null);
   const relayPendingRef = useRef<string[]>([]);
   const relayFlushingRef = useRef(false);
@@ -1344,41 +1403,72 @@ export function TerminalSurface({
     centerScreenVerticalGap(hostEl, term);
     bracketedPasteRef.current = false;
 
-    // GPU WebGL rendering runs strictly on visible, active panes (up to MAX_ACTIVE_WEBGL)
-    // and detaches immediately when hidden or underlaid so WKWebView never retains stale atlases.
-    const detachWebgl = () => {
+    // GPU WebGL rendering uses a warm LRU pool (MAX_WEBGL_POOL = 8) so tab switches
+    // reactivate cached contexts in O(1) without synchronous DomRenderer rebuilds.
+    const poolKey = Symbol(agent.key);
+    let mountWebglRaf = 0;
+
+    const disposeWebglAddon = () => {
       const addon = webglRef.current;
       if (!addon) return;
       webglRef.current = null;
-      activeWebglCount = Math.max(0, activeWebglCount - 1);
       try {
         addon.dispose();
       } catch {
         // ignore already disposed addon
       }
     };
-    const attachWebgl = () => {
-      if (!alive || termRef.current !== term) return;
-      if (!activeRef.current || (underlayRef.current?.childElementCount ?? 0) > 0) {
+    const detachWebgl = () => {
+      releaseWebglSlot(poolKey);
+      disposeWebglAddon();
+    };
+    const markWebglInactive = () => {
+      if (!webglRef.current) return;
+      markWebglSlotInactive(poolKey);
+    };
+    const touchWarmWebgl = () => {
+      if (!alive || termRef.current !== term || !activeRef.current || !webglRef.current) return;
+      if ((underlayRef.current?.childElementCount ?? 0) > 0) {
         detachWebgl();
         return;
       }
-      if (webglRef.current || activeWebglCount >= MAX_ACTIVE_WEBGL) return;
+      acquireWebglSlot(poolKey, disposeWebglAddon);
+    };
+    const attachWebgl = () => {
+      if (!alive || termRef.current !== term) return;
+      if ((underlayRef.current?.childElementCount ?? 0) > 0) {
+        detachWebgl();
+        return;
+      }
+      if (!activeRef.current) {
+        markWebglInactive();
+        return;
+      }
+      if (!acquireWebglSlot(poolKey, disposeWebglAddon)) {
+        if (webglRef.current) disposeWebglAddon();
+        return;
+      }
+      if (webglRef.current) return;
       try {
-        const addon = new WebglAddon();
+        const addon = new WebglAddon(true);
         addon.onContextLoss(() => {
           if (webglRef.current === addon) detachWebgl();
         });
         term.loadAddon(addon);
         webglRef.current = addon;
-        activeWebglCount += 1;
       } catch {
+        releaseWebglSlot(poolKey);
         // Environments without WebGL2 fall back cleanly to xterm's DOM renderer.
       }
     };
     attachWebglRef.current = attachWebgl;
     detachWebglRef.current = detachWebgl;
-    attachWebgl();
+    markWebglInactiveRef.current = markWebglInactive;
+    touchWarmWebglRef.current = touchWarmWebgl;
+    mountWebglRaf = requestAnimationFrame(() => {
+      mountWebglRaf = 0;
+      if (alive) attachWebgl();
+    });
 
     // Ensure OS / Herdr / Nerd fonts load asynchronously right after opening without flashing an already-ready atlas.
     const fontWeightSpec = termCfg.fontWeight >= 600 ? 600 : 400;
@@ -1527,6 +1617,7 @@ export function TerminalSurface({
       scheduleOverlay();
     });
     const dispWriteParsed = term.onWriteParsed(() => {
+      if (!activeRef.current) dirtyWhileInactiveRef.current = true;
       if (wasAtBottomRef.current && term.buffer.active === term.buffer.normal) {
         snapTerminalViewportImmediate(term, true, 0);
       }
@@ -2860,10 +2951,16 @@ export function TerminalSurface({
             flushRaf = 0;
           }
           if (flushTimer) window.clearTimeout(flushTimer);
-          const quietMs = activeLocalConnId ? 75 : 110;
+          const quietMs = initialAttachPending
+            ? 40
+            : chunksHaveOpenSyncOutput(pendingBytes)
+              ? 24
+              : activeLocalConnId
+                ? 12
+                : 20;
           flushTimer = window.setTimeout(
             flushPendingBytes,
-            Math.min(quietMs, Math.max(8, Math.ceil(maxRemain))),
+            Math.min(quietMs, Math.max(4, Math.ceil(maxRemain))),
           );
           return;
         }
@@ -3208,6 +3305,7 @@ export function TerminalSurface({
         const [resolvedLocalId] = await Promise.all([
           localHostIdStore.get() ? Promise.resolve(localHostIdStore.get()) : ensureLocalHostDeviceId(),
           waitLayoutAndFonts(),
+          ensureLocalTermMux(),
         ]);
         if (!alive) return;
         if (!resolvedLocalId || resolvedLocalId !== agent.deviceId) {
@@ -3215,20 +3313,19 @@ export function TerminalSurface({
           startRelayStream();
           return;
         }
-        const { listen } = await (tauriEventPromise ?? import("@tauri-apps/api/event"));
-        if (!alive) return;
-        const [offClose, offSize] = await Promise.all([
-          listen<LocalTermCloseEvent>("local-term://close", (e) => {
-            if (!alive || !activeLocalConnId || e.payload.id !== activeLocalConnId) return;
+        const { offClose, offSize } = subscribeLocalTermEvents(
+          localTermId,
+          (payload) => {
+            if (!alive || !activeLocalConnId || payload.id !== activeLocalConnId) return;
             const closedId = activeLocalConnId;
             flushPendingBytes();
             if (localConnRef.current === closedId) localConnRef.current = null;
             activeLocalConnId = null;
             startRelayStream();
-          }),
-          listen<LocalTermSizeEvent>("local-term://size", (e) => {
-            if (!alive || e.payload.terminal !== localTermId) return;
-            const { cols, rows } = e.payload;
+          },
+          (payload) => {
+            if (!alive || payload.terminal !== localTermId) return;
+            const { cols, rows } = payload;
             ptySizeRef.current = { cols, rows };
             const externalOwner = typeof document === "undefined" || !document.hasFocus() || !activeRef.current;
             if ((cols !== term.cols || rows !== term.rows) && externalOwner) {
@@ -3238,13 +3335,8 @@ export function TerminalSurface({
               refreshCachedCellSize(term);
               scheduleOverlay();
             }
-          }),
-        ]);
-        if (!alive) {
-          offClose();
-          offSize();
-          return;
-        }
+          },
+        );
         unsubLocalClose = offClose;
         unsubLocalSize = offSize;
         await connectLocal(0);
@@ -3429,8 +3521,14 @@ export function TerminalSurface({
       window.clearTimeout(orphanNudgeTimer);
       onMissingVirtualAssetRef.current = null;
       clearOverlaysRef.current = null;
+      if (mountWebglRaf) {
+        cancelAnimationFrame(mountWebglRaf);
+        mountWebglRaf = 0;
+      }
       if (attachWebglRef.current === attachWebgl) attachWebglRef.current = null;
       if (detachWebglRef.current === detachWebgl) detachWebglRef.current = null;
+      if (markWebglInactiveRef.current === markWebglInactive) markWebglInactiveRef.current = null;
+      if (touchWarmWebglRef.current === touchWarmWebgl) touchWarmWebglRef.current = null;
       detachWebgl();
       offSplitSettle?.();
       offSplitSettle = null;
@@ -3539,20 +3637,21 @@ export function TerminalSurface({
     };
   }, [ctxMenu]);
 
-  // Refocus, refit, and repaint synchronously before browser paint when switching back into Terminal mode or focusing this split pane.
+  // Phase 0 (synchronous before paint): mark outgoing WebGL warm or touch incoming warm slot and snap scroll immediately.
+  // Phase 1 (next animation frame): promote cold pane to WebGL, skip unchanged fit() reflows, focus, and sync PTY/overlays.
   useLayoutEffect(() => {
     const localConnId = localConnRef.current;
-    if (localConnId) {
-      void localTermFocus(localConnId, active && focused);
-    }
     if (!active || !termRef.current) {
+      if (localConnId) {
+        void localTermFocus(localConnId, false);
+      }
       pendingViewportSyncRef.current = true;
-      detachWebglRef.current?.();
+      markWebglInactiveRef.current?.();
       return;
     }
     pendingViewportSyncRef.current = true;
     onActivatedAttachRef.current?.();
-    attachWebglRef.current?.();
+    touchWarmWebglRef.current?.();
     const term = termRef.current;
     const stickToBottom = wasAtBottomRef.current;
     const savedOffset = savedOffsetFromBottomRef.current;
@@ -3560,34 +3659,51 @@ export function TerminalSurface({
     if (externalSizeOverrideRef.current) {
       lastResizeSigRef.current = "";
     }
-    if (focusedRef.current) {
-      const prevConn = localConnRef.current;
-      syncResize(term, true);
-      term.focus();
-      if (localConnRef.current === prevConn && externalSizeOverrideRef.current) {
-        externalSizeOverrideRef.current = false;
-      }
-    } else {
-      syncResize(term);
-    }
     if (snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
       pendingViewportSyncRef.current = false;
     }
-    term.refresh(0, Math.max(0, term.rows - 1));
-    paintOverlays();
     const id = requestAnimationFrame(() => {
       onActivatedAttachRef.current?.();
-      if (termRef.current === term) {
-        if (pendingViewportSyncRef.current && snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
-          pendingViewportSyncRef.current = false;
-        }
-        paintOverlays();
+      if (termRef.current !== term || !activeRef.current) return;
+      attachWebglRef.current?.();
+      if (dirtyWhileInactiveRef.current) {
+        dirtyWhileInactiveRef.current = false;
+        term.refresh(0, Math.max(0, term.rows - 1));
       }
+      const hostEl = hostRef.current;
+      const w = hostEl?.clientWidth ?? 0;
+      const h = hostEl?.clientHeight ?? 0;
+      if (w >= 180 && h >= 90) {
+        const sameBox =
+          !externalSizeOverrideRef.current &&
+          term.cols >= 24 &&
+          term.rows >= 6 &&
+          Math.abs(w - lastObservedBoxRef.current.w) < 1 &&
+          Math.abs(h - lastObservedBoxRef.current.h) < 1;
+        if (sameBox) {
+          flushPtyResize(term, focusedRef.current);
+        } else {
+          lastObservedBoxRef.current = { w, h };
+          syncResize(term, focusedRef.current);
+        }
+      }
+      const curConnId = localConnRef.current;
+      if (focusedRef.current) {
+        if (term.textarea) term.textarea.focus({ preventScroll: true });
+        else term.focus();
+      }
+      if (curConnId) {
+        void localTermFocus(curConnId, focusedRef.current);
+      }
+      if (pendingViewportSyncRef.current && snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
+        pendingViewportSyncRef.current = false;
+      }
+      paintOverlays();
     });
     return () => {
       cancelAnimationFrame(id);
     };
-  }, [active, focused, paintOverlays, syncResize]);
+  }, [active, focused, flushPtyResize, paintOverlays, syncResize]);
 
   // Accept dictated text or virtual mobile pad keys when this terminal pane is active and focused.
   useEffect(() => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, ChevronRight, Columns2, History, Laptop, PanelLeft, Pencil, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Terminal, Trash2 } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
@@ -57,7 +57,181 @@ export function StatusMark({ group, compact = false }: { group: ListGroup; compa
   return <span className={`v3-ring${group === "offline" ? " off" : ""}`} aria-label={group === "offline" ? "离线" : "空闲"} />;
 }
 
-export function ShellSidebar({
+const SidebarAgentRow = memo(function SidebarAgentRow({
+  agent,
+  group,
+  primary,
+  secondary,
+  tooltipText,
+  ageLabel,
+  compactBlocked,
+  collapsed,
+  isFocusedAgent,
+  isInSplit,
+  onOpenAgent,
+  onContextMenuAgent,
+}: {
+  agent: Agent;
+  group: ListGroup;
+  primary: string;
+  secondary?: string | null;
+  tooltipText: string;
+  ageLabel: string;
+  compactBlocked: boolean;
+  collapsed: boolean;
+  isFocusedAgent: boolean;
+  isInSplit: boolean;
+  onOpenAgent: (agent: Agent, mods: { altKey: boolean; shiftKey: boolean }) => void;
+  onContextMenuAgent: (x: number, y: number, agent: Agent) => void;
+}) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      draggable
+      data-tauri-drag-region="false"
+      className={`v3-row v3-agent${secondary && !collapsed ? " has-sub" : ""}${isFocusedAgent ? " selected" : isInSplit ? " in-split" : ""}${group === "offline" ? " dim" : ""}`}
+      title={tooltipText}
+      onDragStart={(e) => startPanelDrag(e, { kind: "agent", agentKey: agent.key })}
+      onDragEnd={() => endPanelDrag()}
+      onClick={(e) => onOpenAgent(agent, { altKey: e.altKey, shiftKey: e.shiftKey })}
+      onContextMenu={(e) => {
+        if (collapsed) return;
+        e.preventDefault();
+        onContextMenuAgent(e.clientX, e.clientY, agent);
+      }}
+      onKeyDown={(e) =>
+        (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onOpenAgent(agent, { altKey: false, shiftKey: false }))
+      }
+    >
+      <VendorIcon harness={agent.harness} isShell={agent.isShell} size={16} />
+      {collapsed ? (
+        group === "blocked" ? <span className="v3-corner blocked" aria-label="需要你" /> : null
+      ) : (
+        <div className="v3-agent-body">
+          <div className="v3-agent-top">
+            <span className="v3-agent-title v3-row-label truncate">{primary}</span>
+            <span className="v3-time">{ageLabel}</span>
+            <StatusMark group={group} compact={compactBlocked} />
+          </div>
+          {secondary ? <div className="v3-agent-sub truncate">{secondary}</div> : null}
+        </div>
+      )}
+    </div>
+  );
+});
+
+const SidebarSpaceRow = memo(function SidebarSpaceRow({
+  space,
+  machineName,
+  machineOnline,
+  collapsed,
+  selected,
+  onSelectSpace,
+  onNewTerminal,
+  onDeleteSpace,
+  onContextMenuSpace,
+}: {
+  space: SidebarSpace;
+  machineName: string;
+  machineOnline: boolean;
+  collapsed: boolean;
+  selected: boolean;
+  onSelectSpace: (spaceId: string) => void;
+  onNewTerminal: (host: string, space: string) => void;
+  onDeleteSpace: (space: SidebarSpace) => void;
+  onContextMenuSpace: (x: number, y: number, space: SidebarSpace) => void;
+}) {
+  const pointerActivatedAtRef = useRef(0);
+  const label = space.name;
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
+      className={`v3-row v3-space${space.count === 0 ? " empty" : ""}${selected ? " selected" : ""}`}
+      title={collapsed ? `${machineName} · ${label}` : space.folder || undefined}
+      onPointerDown={(e) => {
+        if (e.button !== 0 || e.ctrlKey || e.metaKey || e.altKey) return;
+        if ((e.target as HTMLElement | null)?.closest("button")) return;
+        pointerActivatedAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
+        onSelectSpace(space.id);
+      }}
+      onClick={(e) => {
+        if ((e.target as HTMLElement | null)?.closest("button")) return;
+        const nowTs = typeof performance !== "undefined" ? performance.now() : Date.now();
+        if (e.detail > 0 && nowTs - pointerActivatedAtRef.current < 2000) {
+          pointerActivatedAtRef.current = 0;
+          return;
+        }
+        pointerActivatedAtRef.current = 0;
+        onSelectSpace(space.id);
+      }}
+      onContextMenu={(e) => {
+        if (!machineOnline || collapsed) return;
+        e.preventDefault();
+        onContextMenuSpace(e.clientX, e.clientY, space);
+      }}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onSelectSpace(space.id))}
+    >
+      <SpaceTileIcon
+        spaceKey={space.id}
+        name={label}
+        folder={space.folder}
+        isWorktree={space.isWorktree}
+        color={space.color}
+        selected={selected}
+        blocked={space.blocked > 0}
+        size="sm"
+      />
+      {collapsed ? null : (
+        <>
+          <span className="v3-row-label truncate">{label}</span>
+          {machineOnline ? (
+            <>
+              <button
+                type="button"
+                className="v3-icon-btn small hover-only"
+                aria-label={`在空间 ${label} 新建终端`}
+                title={`在空间 ${label} 新建终端`}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onNewTerminal(space.deviceId, space.name);
+                }}
+              >
+                <Plus size={12} />
+              </button>
+              <button
+                type="button"
+                className="v3-icon-btn small hover-only danger"
+                aria-label={`关闭空间 ${label}`}
+                title={`关闭空间 ${label}`}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDeleteSpace(space);
+                }}
+              >
+                <Trash2 size={12} />
+              </button>
+            </>
+          ) : null}
+          <span className="v3-count">{space.count}</span>
+          {space.count === 0 ? (
+            <span className="v3-ring" aria-label="暂无运行中 Agent" />
+          ) : space.blocked ? (
+            <span className="v3-need">需要你</span>
+          ) : (
+            <StatusMark group={space.best} />
+          )}
+        </>
+      )}
+    </div>
+  );
+});
+
+export const ShellSidebar = memo(function ShellSidebar({
   collapsed,
   canToggle,
   onToggle,
@@ -121,7 +295,35 @@ export function ShellSidebar({
   const stableGroupOrderRef = useRef<Map<string, string[]>>(new Map());
   const customSpaceIcons = spaceIconStore.use((m) => m);
   const toast = useToast();
-  const setSpaceSel = (next: string | null) => setSelectedSpace(next, (k) => allByKey.get(k), spacesMap);
+  const allByKeyRef = useRef(allByKey);
+  allByKeyRef.current = allByKey;
+  const spacesMapRef = useRef(spacesMap);
+  spacesMapRef.current = spacesMap;
+  const handleSelectSpace = useCallback((next: string | null) => {
+    setSelectedSpace(next, (k) => allByKeyRef.current.get(k), spacesMapRef.current);
+  }, []);
+  const handleOpenAgent = useCallback((a: Agent, mods: { altKey: boolean; shiftKey: boolean }) => {
+    if (mods.altKey) {
+      splitActivePaneWithContent(mods.shiftKey ? "down" : "right", {
+        kind: "agent",
+        agentKey: a.key,
+        ...(a.isShell ? { mode: "term" } : {}),
+      });
+      return;
+    }
+    openAgentTab(a.key);
+  }, []);
+  const handleAgentContextMenu = useCallback((x: number, y: number, a: Agent) => {
+    setSpaceMenu(null);
+    setAgentMenu({ x, y, agent: a });
+  }, []);
+  const handleSpaceContextMenu = useCallback((x: number, y: number, space: SidebarSpace) => {
+    setAgentMenu(null);
+    setSpaceMenu({ x, y, space });
+  }, []);
+  const handleDeleteSpace = useCallback((space: SidebarSpace) => {
+    setDeleteSpaceTarget(space);
+  }, []);
 
   useEffect(() => {
     if (!agentMenu && !spaceMenu) return;
@@ -338,6 +540,26 @@ export function ShellSidebar({
     });
   }, [devices, hoverFreeze, inScope, sort]);
 
+  const agentMetaByKey = useMemo(() => {
+    const out = new Map<string, { group: ListGroup; primary: string; secondary?: string | null; collapsedTip: string; expandedTip: string }>();
+    const multiMachine = machines.length > 1;
+    for (const a of inScope) {
+      const g = listGroup(a, devices);
+      const label = spacedTitle(a);
+      const showMachine = multiMachine && a.deviceId !== primaryMachineId;
+      const machineName = showMachine ? devices[a.deviceId]?.name : undefined;
+      const { primary, secondary } = formatSidebarAgentRow(a, { showMachine, machineName });
+      out.set(a.key, {
+        group: g,
+        primary,
+        secondary,
+        collapsedTip: machineName ? `${machineName} · ${label}` : label,
+        expandedTip: secondary ? `${primary} — ${secondary}` : primary,
+      });
+    }
+    return out;
+  }, [devices, inScope, machines.length, primaryMachineId]);
+
   const focusedContent = activeTab ? focusedLeafOfTab(activeTab).content : null;
   const activeAgentKey = focusedContent?.kind === "agent" ? focusedContent.agentKey : null;
   const activeSplitAgentKeys = useMemo(() => {
@@ -357,62 +579,30 @@ export function ShellSidebar({
     : link === "connecting" ? { text: "正在连接服务器…", action: null, run: null }
     : null;
 
-  const agentRow = (a: Agent) => {
-    const g = listGroup(a, devices);
-    const label = spacedTitle(a);
-    const showMachine = machines.length > 1 && a.deviceId !== primaryMachineId;
-    const machineName = showMachine ? devices[a.deviceId]?.name : undefined;
-    const { primary, secondary } = formatSidebarAgentRow(a, { showMachine, machineName });
+  const renderAgentRow = (a: Agent) => {
+    const meta = agentMetaByKey.get(a.key);
+    const g = meta?.group ?? listGroup(a, devices);
+    const primary = meta?.primary ?? spacedTitle(a);
+    const secondary = meta?.secondary;
     const isFocusedAgent = a.key === activeAgentKey;
     const isInSplit = !isFocusedAgent && activeSplitAgentKeys.has(a.key);
-    const tooltipText = collapsed
-      ? (machineName ? `${machineName} · ${label}` : label)
-      : secondary
-        ? `${primary} — ${secondary}`
-        : primary;
+    const tooltipText = collapsed ? (meta?.collapsedTip ?? primary) : (meta?.expandedTip ?? primary);
     return (
-      <div
+      <SidebarAgentRow
         key={a.key}
-        role="button"
-        tabIndex={0}
-        draggable
-        data-tauri-drag-region="false"
-        className={`v3-row v3-agent${secondary && !collapsed ? " has-sub" : ""}${isFocusedAgent ? " selected" : isInSplit ? " in-split" : ""}${g === "offline" ? " dim" : ""}`}
-        title={tooltipText}
-        onDragStart={(e) => startPanelDrag(e, { kind: "agent", agentKey: a.key })}
-        onDragEnd={() => endPanelDrag()}
-        onClick={(e) => {
-          if (e.altKey) {
-            splitActivePaneWithContent(e.shiftKey ? "down" : "right", {
-              kind: "agent",
-              agentKey: a.key,
-              ...(a.isShell ? { mode: "term" } : {}),
-            });
-            return;
-          }
-          openAgentTab(a.key);
-        }}
-        onContextMenu={(e) => {
-          if (collapsed) return;
-          e.preventDefault();
-          setAgentMenu({ x: e.clientX, y: e.clientY, agent: a });
-        }}
-        onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), openAgentTab(a.key))}
-      >
-        <VendorIcon harness={a.harness} isShell={a.isShell} size={16} />
-        {collapsed ? (
-          g === "blocked" ? <span className="v3-corner blocked" aria-label="需要你" /> : null
-        ) : (
-          <div className="v3-agent-body">
-            <div className="v3-agent-top">
-              <span className="v3-agent-title v3-row-label truncate">{primary}</span>
-              <span className="v3-time">{shortAgo(lastChange(a), now)}</span>
-              <StatusMark group={g} compact={sort === "status" && g === "blocked"} />
-            </div>
-            {secondary ? <div className="v3-agent-sub truncate">{secondary}</div> : null}
-          </div>
-        )}
-      </div>
+        agent={a}
+        group={g}
+        primary={primary}
+        secondary={secondary}
+        tooltipText={tooltipText}
+        ageLabel={shortAgo(lastChange(a), now)}
+        compactBlocked={sort === "status" && g === "blocked"}
+        collapsed={collapsed}
+        isFocusedAgent={isFocusedAgent}
+        isInSplit={isInSplit}
+        onOpenAgent={handleOpenAgent}
+        onContextMenuAgent={handleAgentContextMenu}
+      />
     );
   };
 
@@ -556,79 +746,20 @@ export function ShellSidebar({
                   )}
                   {isFolded && !collapsed
                     ? null
-                    : m.spaces.map((s) => {
-                        const label = s.name;
-                        return (
-                          <div
-                            key={s.id}
-                            role="button"
-                            tabIndex={0}
-                            aria-pressed={selected === s.id}
-                            className={`v3-row v3-space${s.count === 0 ? " empty" : ""}${selected === s.id ? " selected" : ""}`}
-                            title={collapsed ? `${m.name} · ${label}` : s.folder || undefined}
-                            onClick={() => setSpaceSel(s.id)}
-                            onContextMenu={(e) => {
-                              if (!m.online || collapsed) return;
-                              e.preventDefault();
-                              setAgentMenu(null);
-                              setSpaceMenu({ x: e.clientX, y: e.clientY, space: s });
-                            }}
-                            onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setSpaceSel(s.id))}
-                          >
-                            <SpaceTileIcon
-                              spaceKey={s.id}
-                              name={label}
-                              folder={s.folder}
-                              isWorktree={s.isWorktree}
-                              color={s.color}
-                              selected={selected === s.id}
-                              blocked={s.blocked > 0}
-                              size="sm"
-                            />
-                            {collapsed ? null : (
-                              <>
-                                <span className="v3-row-label truncate">{label}</span>
-                                {m.online ? (
-                                  <>
-                                    <button
-                                      type="button"
-                                      className="v3-icon-btn small hover-only"
-                                      aria-label={`在空间 ${label} 新建终端`}
-                                      title={`在空间 ${label} 新建终端`}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        onNewTerminal(m.id, s.name);
-                                      }}
-                                    >
-                                      <Plus size={12} />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="v3-icon-btn small hover-only danger"
-                                      aria-label={`关闭空间 ${label}`}
-                                      title={`关闭空间 ${label}`}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setDeleteSpaceTarget(s);
-                                      }}
-                                    >
-                                      <Trash2 size={12} />
-                                    </button>
-                                  </>
-                                ) : null}
-                                <span className="v3-count">{s.count}</span>
-                                {s.count === 0 ? (
-                                  <span className="v3-ring" aria-label="暂无运行中 Agent" />
-                                ) : s.blocked ? (
-                                  <span className="v3-need">需要你</span>
-                                ) : (
-                                  <StatusMark group={s.best} />
-                                )}
-                              </>
-                            )}
-                          </div>
-                        );
-                      })}
+                    : m.spaces.map((s) => (
+                        <SidebarSpaceRow
+                          key={s.id}
+                          space={s}
+                          machineName={m.name}
+                          machineOnline={m.online}
+                          collapsed={collapsed}
+                          selected={selected === s.id}
+                          onSelectSpace={handleSelectSpace}
+                          onNewTerminal={onNewTerminal}
+                          onDeleteSpace={handleDeleteSpace}
+                          onContextMenuSpace={handleSpaceContextMenu}
+                        />
+                      ))}
                 </div>
               );
             })}
@@ -729,7 +860,7 @@ export function ShellSidebar({
                       {g.key !== "recent" ? isFolded ? <ChevronRight size={12} /> : <ChevronDown size={12} className="hover-only" /> : null}
                     </button>
                   )}
-                  {isFolded && !collapsed ? null : g.list.map(agentRow)}
+                  {isFolded && !collapsed ? null : g.list.map(renderAgentRow)}
                 </div>
               );
             })}
@@ -1007,4 +1138,4 @@ export function ShellSidebar({
         : null}
     </aside>
   );
-}
+});

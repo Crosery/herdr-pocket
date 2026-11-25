@@ -91,6 +91,7 @@ import {
   unsplitTabToTabs,
   visibleTabsForSpace,
   type FrameSection,
+  type ShellTab,
   type SplitDirection,
 } from "./shellStore";
 import { IS_MAC, matchShortcut } from "./shortcuts";
@@ -98,6 +99,9 @@ import { installWindowFocusTelemetry } from "../lib/uiTelemetry";
 import { buildHostSpaces } from "./spaceSync";
 import { useModifierHoldHints } from "./useModifierHoldHints";
 import "../styles/shell.css";
+
+const EMPTY_TABS: ShellTab[] = [];
+const EMPTY_PALETTE_ITEMS: PaletteItem[] = [];
 
 const FRAME_ITEMS: Array<{ id: FrameSection; label: string; icon: PaletteItem["icon"] }> = [
   { id: "look", label: "外观", icon: PaletteIcon },
@@ -176,7 +180,7 @@ export function DesktopShell({
 }) {
   const toast = useToast();
   const palette = shellStore.use((s) => s.palette);
-  const tabs = shellStore.use((s) => s.tabs);
+  const paletteTabs = shellStore.use((s) => (s.palette ? s.tabs : EMPTY_TABS));
   const agentsMap = liveStore.use((s) => s.agents);
   const devices = liveStore.use((s) => s.devices);
   const spacesMap = liveStore.use((s) => s.spaces);
@@ -576,7 +580,7 @@ export function DesktopShell({
 
   // The first time agents arrive with nothing open, open the most urgent one, so the work
   // area shows something useful. Closing every tab afterwards leaves it empty.
-  const autoOpened = useRef(tabs.length > 0);
+  const autoOpened = useRef(shellStore.get().tabs.length > 0);
   useEffect(() => {
     if (autoOpened.current || !agents.length) return;
     autoOpened.current = true;
@@ -589,9 +593,10 @@ export function DesktopShell({
   const isDark = theme === "dark" || (theme === "system" && document.documentElement.getAttribute("data-theme") === "dark");
 
   const items = useMemo<PaletteItem[]>(() => {
+    if (!palette) return EMPTY_PALETTE_ITEMS;
     const list: PaletteItem[] = [];
     const allByAgentKey = allAgents(agentsMap);
-    for (const t of tabs) {
+    for (const t of paletteTabs) {
       const focusedContent = focusedLeafOfTab(t).content;
       const leaves = tabLeaves(t);
       const a = focusedContent.kind === "agent" ? allByAgentKey.find((x) => x.key === focusedContent.agentKey) : undefined;
@@ -882,7 +887,7 @@ export function DesktopShell({
     return list;
     // closeActive reads the store when it runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agents, agentsMap, collapsed, devices, homePage, isDark, newAgent, onConnectRelay, onPairPhone, onReopenGuide, onToggleSidebar, spawnTerminalNow, tabs]);
+  }, [agents, agentsMap, collapsed, devices, homePage, isDark, newAgent, onConnectRelay, onPairPhone, onReopenGuide, onToggleSidebar, palette, paletteTabs, spawnTerminalNow]);
 
   function currentVisibleTabs() {
     const s = shellStore.get();
@@ -1245,6 +1250,13 @@ export function DesktopShell({
     [spawnTerminalNow],
   );
 
+  const handleSidebarNewTerminal = useCallback(
+    (h: string | null, sp: string | null) => {
+      void spawnTerminalNow(h, sp);
+    },
+    [spawnTerminalNow],
+  );
+
   return (
     <div
       className={`v3${collapsed ? " collapsed" : ""}`}
@@ -1258,7 +1270,7 @@ export function DesktopShell({
         onPairPhone={onPairPhone}
         onNewAgent={newAgent}
         onNewSpace={newSpace}
-        onNewTerminal={(h, sp) => void spawnTerminalNow(h, sp)}
+        onNewTerminal={handleSidebarNewTerminal}
       />
       <div className="v3-work">
         <ShellTabs onNewTerminal={handleShellNewTerminal} onNewAgent={handleShellNewAgent} padForLights={collapsed} />

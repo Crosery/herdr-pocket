@@ -24,7 +24,9 @@ interface RpcSample {
 }
 
 const RPC_SAMPLE_CAP = 2000;
+const CLICK_SAMPLE_CAP = 500;
 const SLOW_RPC_MS = 2000;
+const SLOW_CLICK_PAINT_MS = 80;
 const SLOW_RPC_EXCLUDED = new Set(["agent.create", "tools.update", "sessions.resume"]);
 const STARTUP_SAMPLE_DELAY_MS = 3000;
 const PERIODIC_INTERVAL_MS = 30_000;
@@ -32,8 +34,10 @@ const PERIODIC_WINDOW_MS = 5000;
 const SPLIT_WINDOW_MS = 1200;
 
 let webglCountProvider: () => number = () => 0;
+let mountedTabsCountProvider: (() => number) | null = null;
 let started = false;
 let rpcSamples: RpcSample[] = [];
+let clickPaintSamples: number[] = [];
 let longTasks = 0;
 let longTaskMaxMs = 0;
 let splitSamplerCancel: (() => void) | null = null;
@@ -100,6 +104,26 @@ export function registerWebglCounter(reader: () => number): void {
   webglCountProvider = reader;
 }
 
+/** Registers the mounted shell tab count reader cleanly without import cycles. */
+export function registerMountedTabsCounter(reader: (() => number) | null): void {
+  mountedTabsCountProvider = reader;
+}
+
+/** Records a click-to-next-animation-frame latency sample and warns when visible click paint exceeds 80ms. */
+export function recordClickPaintSample(paintMs: number, label: string): void {
+  if (!Number.isFinite(paintMs) || paintMs < 0) return;
+  clickPaintSamples.push(paintMs);
+  if (clickPaintSamples.length > CLICK_SAMPLE_CAP) {
+    clickPaintSamples.splice(0, clickPaintSamples.length - CLICK_SAMPLE_CAP);
+  }
+  if (paintMs > SLOW_CLICK_PAINT_MS) {
+    logger.warn("perf.click", `slow click paint (${Math.round(paintMs)}ms)`, {
+      ms: Math.round(paintMs),
+      label: label.slice(0, 64),
+    });
+  }
+}
+
 /** Records a client RPC completion for periodic summary stats and immediate slow-RPC warnings. */
 export function recordClientRpcSample(method: string, ms: number, viaDirect: boolean, ok: boolean): void {
   if (!Number.isFinite(ms) || ms < 0) return;
@@ -119,8 +143,23 @@ export function recordClientRpcSample(method: string, ms: number, viaDirect: boo
 
 export function resetPerfTelemetryForTest(): void {
   rpcSamples = [];
+  clickPaintSamples = [];
   longTasks = 0;
   longTaskMaxMs = 0;
+}
+
+function summarizeClickWindow(): Record<string, unknown> {
+  const batch = clickPaintSamples;
+  clickPaintSamples = [];
+  if (batch.length === 0) {
+    return { clickCount: 0 };
+  }
+  const sorted = [...batch].sort((a, b) => a - b);
+  return {
+    clickCount: batch.length,
+    clickP50Ms: round1(quantile(sorted, 0.5)),
+    clickMaxMs: round1(sorted[sorted.length - 1]!),
+  };
 }
 
 function summarizeRpcWindow(): Record<string, unknown> {
@@ -176,7 +215,7 @@ function collectShellContext(): Record<string, unknown> {
     termPanes,
     chatPanes,
     webglTerminals: webglCountProvider(),
-    mountedTabs: Math.min(shell.tabs.length, 6),
+    mountedTabs: mountedTabsCountProvider ? mountedTabsCountProvider() : Math.min(shell.tabs.length, 6),
     totalTabs: shell.tabs.length,
     totalAgents: all.length,
     workingAgents,
@@ -315,6 +354,7 @@ export function startDesktopPerfTelemetry(): () => void {
         longTaskMaxMs: ltMax,
         ...collectShellContext(),
         ...summarizeRpcWindow(),
+        ...summarizeClickWindow(),
       };
       if (isLowFpsStats(stats)) {
         logger.warn("perf.fps", `low client fps (${stats.fpsAvg} fps, p95 ${stats.frameP95Ms}ms)`, payload);

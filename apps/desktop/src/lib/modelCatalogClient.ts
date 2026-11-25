@@ -836,10 +836,11 @@ export function computeAutoAgentModelMeta(
  */
 export function useAutoAgentModelMeta(
   agent: Agent,
-  opts?: { hasReasoningEvents?: boolean; thinkingLevel?: string },
+  opts?: { hasReasoningEvents?: boolean; thinkingLevel?: string; enabled?: boolean },
 ): AutoAgentModelMeta {
   const hasReasoningEvents = opts?.hasReasoningEvents;
   const thinkingLevel = opts?.thinkingLevel ?? agent.thinkingLevel;
+  const enabled = opts?.enabled !== false;
 
   const [fetched, setFetched] = useState<{
     key: string;
@@ -872,7 +873,7 @@ export function useAutoAgentModelMeta(
   }, [agent.key, agent.model]);
 
   useEffect(() => {
-    if (agent.isShell) return;
+    if (agent.isShell || !enabled) return;
     let alive = true;
     const force = rev > 0;
     const peers = collectPeerModels(agent);
@@ -888,7 +889,7 @@ export function useAutoAgentModelMeta(
     return () => {
       alive = false;
     };
-  }, [agent.key, agent.deviceId, agent.harness, agent.model, agent.thinkingLevel, agent.sessionKey, agent.source, agent.isShell, hasReasoningEvents, rev]);
+  }, [agent.key, agent.deviceId, agent.harness, agent.model, agent.thinkingLevel, agent.sessionKey, agent.source, agent.isShell, enabled, hasReasoningEvents, rev]);
 
   const refresh = useCallback(() => {
     invalidateModelCatalogCache(agent.key);

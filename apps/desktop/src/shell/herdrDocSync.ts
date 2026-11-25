@@ -473,8 +473,17 @@ export function useHerdrDocSync(): void {
 
   useEffect(() => {
     const ctrl = getSharedController();
+    let lastSeenTabs = shellStore.get().tabs;
+    let shellSyncTimer: ReturnType<typeof setTimeout> | null = null;
     const unsubShell = shellStore.subscribe(() => {
-      ctrl.handleShellChange(shellStore.get());
+      const cur = shellStore.get();
+      if (cur.tabs === lastSeenTabs) return;
+      lastSeenTabs = cur.tabs;
+      if (shellSyncTimer !== null) clearTimeout(shellSyncTimer);
+      shellSyncTimer = setTimeout(() => {
+        shellSyncTimer = null;
+        ctrl.handleShellChange(shellStore.get());
+      }, 24);
     });
     const unsubResizeSettle = onInteractiveResizeSettled(() => {
       ctrl.handleShellChange(shellStore.get());
@@ -523,6 +532,7 @@ export function useHerdrDocSync(): void {
     return () => {
       alive = false;
       unsubShell();
+      if (shellSyncTimer !== null) clearTimeout(shellSyncTimer);
       unsubResizeSettle();
       clearInterval(timer);
       if (docPullTimer) clearTimeout(docPullTimer);

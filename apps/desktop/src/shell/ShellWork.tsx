@@ -38,14 +38,14 @@ import {
   SPLIT_MOTION_MS,
   unitRectToCss,
 } from "./splitMotion";
-import { reportSplitTransitionPerf } from "../lib/perfTelemetry";
+import { registerMountedTabsCounter, reportSplitTransitionPerf } from "../lib/perfTelemetry";
 import { resizeSplitPair, type CssRect, type SplitNode, type UnitRect } from "./splitTree";
 import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
 import { pingRelay, refreshHostSpaces, rpcCall, subscribeStream } from "../lib/relay";
 import { agentSpace, agentTitle, allAgents, createStore, findAgent, liveStore, lookupAgentByKey, settingsStore, spacedTitle } from "../lib/store";
 import { dismissVoiceMessage, hangupVoiceCall, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
-import { homeFolder, listGroup } from "./agentInfo";
+import { homeFolder, listGroup, type ListGroup } from "./agentInfo";
 import { formatHerdrTabLabel } from "./herdrDoc";
 import { StatusMark } from "./ShellSidebar";
 import {
@@ -394,9 +394,11 @@ const TabChip = memo(function TabChip({
   active,
   hasSpaceFilter,
   isRenaming,
-  draggingId,
-  dropTarget,
-  setTabRef,
+  isDragging,
+  dropSide,
+  leadAgent: agent,
+  group,
+  registerTabRef,
   onStartRename,
   onCommitRename,
   onCancelRename,
@@ -412,9 +414,11 @@ const TabChip = memo(function TabChip({
   active: boolean;
   hasSpaceFilter: boolean;
   isRenaming: boolean;
-  draggingId: string | null;
-  dropTarget: { id: string; side: "before" | "after" } | null;
-  setTabRef: (el: HTMLDivElement | null) => void;
+  isDragging: boolean;
+  dropSide: "before" | "after" | null;
+  leadAgent: Agent | undefined;
+  group: ListGroup | null;
+  registerTabRef: (id: string, el: HTMLDivElement | null) => void;
   onStartRename: (id: string) => void;
   onCommitRename: (id: string, name: string) => void;
   onCancelRename: () => void;
@@ -424,8 +428,6 @@ const TabChip = memo(function TabChip({
   onDropTab: (e: ReactDragEvent<HTMLDivElement>, index: number) => void;
   onMenu: (e: ReactMouseEvent, tab: ShellTab) => void;
 }) {
-  const agentsMap = liveStore.use((s) => s.agents);
-  const devices = liveStore.use((s) => s.devices);
   const leaves = useMemo(() => tabLeaves(tab), [tab]);
   const primary = focusedLeafOfTab(tab);
   const primaryContent = primary.content;
@@ -434,22 +436,10 @@ const TabChip = memo(function TabChip({
     [leaves, primary, primaryContent.kind],
   );
   const leadContent = leadLeaf.content;
-  const agent = useMemo(
-    () => (leadContent.kind === "agent" ? lookupAgentByKey(agentsMap, leadContent.agentKey) : undefined),
-    [agentsMap, leadContent],
+  const attachTabRef = useCallback(
+    (el: HTMLDivElement | null) => registerTabRef(tab.id, el),
+    [registerTabRef, tab.id],
   );
-  const group = useMemo(() => {
-    let best: ReturnType<typeof listGroup> | null = null;
-    const rank = { blocked: 4, working: 3, done: 2, idle: 1, offline: 0 };
-    for (const leaf of leaves) {
-      if (leaf.content.kind !== "agent") continue;
-      const a = lookupAgentByKey(agentsMap, leaf.content.agentKey);
-      if (!a) continue;
-      const g = listGroup(a, devices);
-      if (!best || rank[g] > rank[best]) best = g;
-    }
-    return best;
-  }, [agentsMap, devices, leaves]);
   const title = contentTitle(primaryContent, agent);
   const primaryProgram = leadContent.kind === "agent"
     ? (agent ? (agent.isShell ? "Terminal" : resolveVendor(agent.harness, false).label) : "已结束的 Agent")
@@ -467,16 +457,15 @@ const TabChip = memo(function TabChip({
   useEffect(() => {
     if (isRenaming) setDraft(tab.docTabName ?? "");
   }, [isRenaming, tab.docTabName]);
-  const side = dropTarget?.id === tab.id ? dropTarget.side : null;
   return (
     <div
-      ref={setTabRef}
+      ref={attachTabRef}
       role="tab"
       aria-selected={active}
       tabIndex={active ? 0 : -1}
       draggable={total > 1 && !isRenaming}
       data-tauri-drag-region="false"
-      className={`v3-tab${active ? " active" : ""}${primaryContent.kind === "agent" && !agent ? " gone" : ""}${draggingId === tab.id ? " dragging" : ""}${side ? ` drop-${side}` : ""}`}
+      className={`v3-tab${active ? " active" : ""}${primaryContent.kind === "agent" && !agent ? " gone" : ""}${isDragging ? " dragging" : ""}${dropSide ? ` drop-${dropSide}` : ""}`}
       title={
         leaves.length > 1
           ? `${title}（共 ${leaves.length} 个分屏）`
@@ -614,7 +603,7 @@ function MenuItem({ label, keys, icon: Icon, onClick, disabled }: { label: strin
   );
 }
 
-export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTerminal: () => void; onNewAgent: () => void; padForLights: boolean }) {
+export const ShellTabs = memo(function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTerminal: () => void; onNewAgent: () => void; padForLights: boolean }) {
   const toast = useToast();
   const tabs = shellStore.use((s) => s.tabs);
   const rawActive = shellStore.use((s) => s.active);
@@ -622,6 +611,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
   const activeBySpace = shellStore.use((s) => s.activeBySpace);
   const panel = shellStore.use((s) => s.panel);
   const agentsMap = liveStore.use((s) => s.agents);
+  const devices = liveStore.use((s) => s.devices);
   const spacesMap = liveStore.use((s) => s.spaces);
   const homePage = useClientConfig().browser.homePage;
   const [menu, setMenu] = useState<{ x: number; y: number; tab: ShellTab } | null>(null);
@@ -648,6 +638,29 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
     () => activeTabIdForSpace({ tabs, active: rawActive, selectedSpace, activeBySpace }, lookupAgent, spacesMap),
     [activeBySpace, lookupAgent, rawActive, selectedSpace, spacesMap, tabs],
   );
+  const tabChipMeta = useMemo(() => {
+    const rank: Record<ListGroup, number> = { blocked: 4, working: 3, done: 2, idle: 1, offline: 0 };
+    const map = new Map<string, { leadAgent: Agent | undefined; group: ListGroup | null }>();
+    for (const t of visibleTabs) {
+      const leaves = tabLeaves(t);
+      const primary = focusedLeafOfTab(t);
+      const leadLeaf =
+        primary.content.kind === "agent"
+          ? primary
+          : (leaves.find((l) => l.content.kind === "agent") ?? primary);
+      const leadAgent = leadLeaf.content.kind === "agent" ? agentByKey.get(leadLeaf.content.agentKey) : undefined;
+      let best: ListGroup | null = null;
+      for (const leaf of leaves) {
+        if (leaf.content.kind !== "agent") continue;
+        const a = agentByKey.get(leaf.content.agentKey);
+        if (!a) continue;
+        const g = listGroup(a, devices);
+        if (!best || rank[g] > rank[best]) best = g;
+      }
+      map.set(t.id, { leadAgent, group: best });
+    }
+    return map;
+  }, [agentByKey, devices, visibleTabs]);
 
   // Keep the active chip in view on tab switch and tab-strip resize, matching Herdr.app.
   useEffect(() => {
@@ -682,11 +695,29 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
 
   // Smooth FLIP slide animation via Web Animations API only on intra-space tab list additions/removals/reorders.
   useLayoutEffect(() => {
-    const reduced = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const nextTabIdsKey = visibleTabs.map((t) => t.id).join("\u0001");
     const sameSpace = prevTabSpaceRef.current === selectedSpace;
     const idsChanged = prevTabIdsKeyRef.current !== "" && nextTabIdsKey !== prevTabIdsKeyRef.current;
+    prevTabSpaceRef.current = selectedSpace;
+    prevTabIdsKeyRef.current = nextTabIdsKey;
+
+    const reduced = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const shouldAnimate = !reduced && sameSpace && idsChanged && prevRectsRef.current.size > 0;
+    if (!shouldAnimate) {
+      if (idsChanged || !sameSpace || prevRectsRef.current.size === 0) {
+        const raf = requestAnimationFrame(() => {
+          const nextRects = new Map<string, number>();
+          for (const t of visibleTabs) {
+            const el = tabElsRef.current.get(t.id);
+            if (el) nextRects.set(t.id, el.getBoundingClientRect().left);
+          }
+          prevRectsRef.current = nextRects;
+        });
+        return () => cancelAnimationFrame(raf);
+      }
+      return;
+    }
+
     const nextRects = new Map<string, number>();
     for (const t of visibleTabs) {
       const el = tabElsRef.current.get(t.id);
@@ -695,27 +726,23 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       tabAnimsRef.current.delete(el);
       nextRects.set(t.id, el.getBoundingClientRect().left);
     }
-    if (shouldAnimate) {
-      for (const t of visibleTabs) {
-        const el = tabElsRef.current.get(t.id);
-        const prevLeft = prevRectsRef.current.get(t.id);
-        const nextLeft = nextRects.get(t.id);
-        if (!el || prevLeft === undefined || nextLeft === undefined) continue;
-        const dx = prevLeft - nextLeft;
-        if (Math.abs(dx) < 1 || typeof el.animate !== "function") continue;
-        const anim = el.animate(
-          [{ transform: `translateX(${dx}px)` }, { transform: "translateX(0px)" }],
-          { duration: 180, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
-        );
-        tabAnimsRef.current.set(el, anim);
-        anim.onfinish = () => {
-          if (tabAnimsRef.current.get(el) === anim) tabAnimsRef.current.delete(el);
-        };
-      }
+    for (const t of visibleTabs) {
+      const el = tabElsRef.current.get(t.id);
+      const prevLeft = prevRectsRef.current.get(t.id);
+      const nextLeft = nextRects.get(t.id);
+      if (!el || prevLeft === undefined || nextLeft === undefined) continue;
+      const dx = prevLeft - nextLeft;
+      if (Math.abs(dx) < 1 || typeof el.animate !== "function") continue;
+      const anim = el.animate(
+        [{ transform: `translateX(${dx}px)` }, { transform: "translateX(0px)" }],
+        { duration: 180, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+      );
+      tabAnimsRef.current.set(el, anim);
+      anim.onfinish = () => {
+        if (tabAnimsRef.current.get(el) === anim) tabAnimsRef.current.delete(el);
+      };
     }
     prevRectsRef.current = nextRects;
-    prevTabSpaceRef.current = selectedSpace;
-    prevTabIdsKeyRef.current = nextTabIdsKey;
   }, [selectedSpace, visibleTabs]);
 
   const panelBtn = (id: PanelId, label: string, Icon: typeof Plus, keys?: string) => (
@@ -731,18 +758,45 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
     </button>
   );
 
-  const onDragStartTab = (e: ReactDragEvent<HTMLDivElement>, id: string) => {
+  const registerTabRef = useCallback((id: string, el: HTMLDivElement | null) => {
+    if (el) tabElsRef.current.set(id, el);
+    else tabElsRef.current.delete(id);
+  }, []);
+
+  const handleStartRename = useCallback((id: string) => setRenamingId(id), []);
+  const handleCommitRename = useCallback((id: string, nextName: string) => {
+    setRenamingId(null);
+    renameShellTab(id, nextName);
+  }, []);
+  const handleCancelRename = useCallback(() => setRenamingId(null), []);
+  const handleTabMenu = useCallback((e: ReactMouseEvent, tab: ShellTab) => {
+    e.preventDefault();
+    setMenu({ x: e.clientX, y: e.clientY, tab });
+  }, []);
+
+  const draggingIdRef = useRef(draggingId);
+  draggingIdRef.current = draggingId;
+  const visibleTabsRef = useRef(visibleTabs);
+  visibleTabsRef.current = visibleTabs;
+  const dropTargetRef = useRef(dropTarget);
+  dropTargetRef.current = dropTarget;
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  const selectedSpaceRef = useRef(selectedSpace);
+  selectedSpaceRef.current = selectedSpace;
+
+  const onDragStartTab = useCallback((e: ReactDragEvent<HTMLDivElement>, id: string) => {
     setDraggingId(id);
     startTabDrag(e, id);
-  };
+  }, []);
 
-  const onDragEndTab = () => {
+  const onDragEndTab = useCallback(() => {
     setDraggingId(null);
     setDropTarget(null);
     endTabDrag();
-  };
+  }, []);
 
-  const onDragOverTab = (e: ReactDragEvent<HTMLDivElement>, id: string) => {
+  const onDragOverTab = useCallback((e: ReactDragEvent<HTMLDivElement>, id: string) => {
     if (hasWorkspaceDrag(e)) {
       e.preventDefault();
       e.dataTransfer.dropEffect = "copy";
@@ -750,15 +804,18 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       return;
     }
     if (!hasTabDrag(e) && !hasPanelDrag(e) && !hasPaneDrag(e)) return;
-    if (id === draggingId) return;
+    if (id === draggingIdRef.current) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
     const rect = e.currentTarget.getBoundingClientRect();
     const side: "before" | "after" = e.clientX - rect.left < rect.width / 2 ? "before" : "after";
     setDropTarget((prev) => (prev?.id === id && prev.side === side ? prev : { id, side }));
-  };
+  }, []);
 
-  const handleDropAt = (e: ReactDragEvent<HTMLDivElement>, targetTabId?: string, side?: "before" | "after") => {
+  const handleDropAt = useCallback((e: ReactDragEvent<HTMLDivElement>, targetTabId?: string, side?: "before" | "after") => {
+    const curTabs = tabsRef.current;
+    const curVisible = visibleTabsRef.current;
+    const curSpace = selectedSpaceRef.current;
     setFileDropOver(false);
     const paneItem = readPaneDrag(e);
     if (paneItem) {
@@ -768,9 +825,9 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       setDropTarget(null);
       let insertBeforeTabId: string | undefined;
       if (targetTabId && side) {
-        const idx = tabs.findIndex((t) => t.id === targetTabId);
+        const idx = curTabs.findIndex((t) => t.id === targetTabId);
         if (idx >= 0) {
-          insertBeforeTabId = side === "before" ? targetTabId : tabs[idx + 1]?.id;
+          insertBeforeTabId = side === "before" ? targetTabId : curTabs[idx + 1]?.id;
         }
       }
       detachPaneToTab(paneItem.tabId, paneItem.paneId, { insertBeforeTabId });
@@ -783,7 +840,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       e.stopPropagation();
       endWorkspaceDrag();
       if (wsItem.kind === "file") {
-        openFileTab(wsItem.agentKey, wsItem.relPath, wsItem.name, { absPath: wsItem.absPath, spaceKey: selectedSpace });
+        openFileTab(wsItem.agentKey, wsItem.relPath, wsItem.name, { absPath: wsItem.absPath, spaceKey: curSpace });
       } else {
         toast("拖入文件可直接打开标签，文件夹请拖入对话输入框引用");
       }
@@ -798,14 +855,14 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       setDropTarget(null);
       let insertBeforeId: string | undefined;
       if (targetTabId && side) {
-        const idx = tabs.findIndex((t) => t.id === targetTabId);
+        const idx = curTabs.findIndex((t) => t.id === targetTabId);
         if (idx >= 0) {
-          insertBeforeId = side === "before" ? targetTabId : tabs[idx + 1]?.id;
+          insertBeforeId = side === "before" ? targetTabId : curTabs[idx + 1]?.id;
         }
       }
       if (panelItem.kind === "browser") {
         openWebTab(panelItem.url, panelItem.title, {
-          spaceKey: panelItem.spaceKey ?? selectedSpace,
+          spaceKey: panelItem.spaceKey ?? curSpace,
           insertBeforeId,
         });
         if (shellStore.get().panel === "browser") showPanel(null);
@@ -818,25 +875,26 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       return;
     }
 
-    const fromId = readTabDrag(e) ?? draggingId;
+    const fromId = readTabDrag(e) ?? draggingIdRef.current;
     if (!fromId) return;
     e.preventDefault();
     e.stopPropagation();
     if (targetTabId && side) {
       moveTabRelative(fromId, targetTabId, side);
-    } else if (visibleTabs.length > 0) {
-      moveTabRelative(fromId, visibleTabs[visibleTabs.length - 1]!.id, "after");
+    } else if (curVisible.length > 0) {
+      moveTabRelative(fromId, curVisible[curVisible.length - 1]!.id, "after");
     } else {
-      moveTab(fromId, tabs.length - 1);
+      moveTab(fromId, curTabs.length - 1);
     }
     onDragEndTab();
-  };
+  }, [onDragEndTab, toast]);
 
-  const onDropTab = (e: ReactDragEvent<HTMLDivElement>, targetIdx: number) => {
-    const target = visibleTabs[targetIdx];
-    const side = target && dropTarget?.id === target.id ? dropTarget.side : "before";
+  const onDropTab = useCallback((e: ReactDragEvent<HTMLDivElement>, targetIdx: number) => {
+    const target = visibleTabsRef.current[targetIdx];
+    const curDrop = dropTargetRef.current;
+    const side = target && curDrop?.id === target.id ? curDrop.side : "before";
     handleDropAt(e, target?.id, side);
-  };
+  }, [handleDropAt]);
 
   const openPickedLocalFile = async () => {
     const path = await native.pickFile();
@@ -885,34 +943,33 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
           }
         }}
       >
-        {visibleTabs.map((t, i) => (
-          <TabChip
-            key={t.id}
-            tab={t}
-            index={i}
-            total={visibleTabs.length}
-            active={t.id === active}
-            hasSpaceFilter={Boolean(selectedSpace)}
-            isRenaming={renamingId === t.id}
-            draggingId={draggingId}
-            dropTarget={dropTarget}
-            setTabRef={(el) => {
-              if (el) tabElsRef.current.set(t.id, el);
-              else tabElsRef.current.delete(t.id);
-            }}
-            onStartRename={(id) => setRenamingId(id)}
-            onCommitRename={(id, nextName) => {
-              setRenamingId(null);
-              renameShellTab(id, nextName);
-            }}
-            onCancelRename={() => setRenamingId(null)}
-            onDragStartTab={onDragStartTab}
-            onDragEndTab={onDragEndTab}
-            onDragOverTab={onDragOverTab}
-            onDropTab={onDropTab}
-            onMenu={(e, tab) => (e.preventDefault(), setMenu({ x: e.clientX, y: e.clientY, tab }))}
-          />
-        ))}
+        {visibleTabs.map((t, i) => {
+          const meta = tabChipMeta.get(t.id);
+          return (
+            <TabChip
+              key={t.id}
+              tab={t}
+              index={i}
+              total={visibleTabs.length}
+              active={t.id === active}
+              hasSpaceFilter={Boolean(selectedSpace)}
+              isRenaming={renamingId === t.id}
+              isDragging={draggingId === t.id}
+              dropSide={dropTarget?.id === t.id ? dropTarget.side : null}
+              leadAgent={meta?.leadAgent}
+              group={meta?.group ?? null}
+              registerTabRef={registerTabRef}
+              onStartRename={handleStartRename}
+              onCommitRename={handleCommitRename}
+              onCancelRename={handleCancelRename}
+              onDragStartTab={onDragStartTab}
+              onDragEndTab={onDragEndTab}
+              onDragOverTab={onDragOverTab}
+              onDropTab={onDropTab}
+              onMenu={handleTabMenu}
+            />
+          );
+        })}
       </div>
       <button
         className="v3-icon-btn has-hint"
@@ -1157,7 +1214,7 @@ export function ShellTabs({ onNewTerminal, onNewAgent, padForLights }: { onNewTe
       <TabCloseConfirmModal />
     </div>
   );
-}
+});
 
 // Panes ----------------------------------------------------------------------------
 
@@ -2446,7 +2503,7 @@ const TabStage = memo(function TabStage({
   );
 });
 
-export function ShellMain({
+export const ShellMain = memo(function ShellMain({
   onNewTerminal,
   onNewAgent,
   onSplitNewTerminal,
@@ -2470,6 +2527,7 @@ export function ShellMain({
   const active = tabs.find((t) => t.id === activeId) ?? null;
   const [draggingPaneId, setDraggingPaneId] = useState<string | null>(null);
   const keptAgentIdsRef = useRef<string[]>([]);
+  const mountedCountRef = useRef(0);
 
   const agentTabIds = useMemo(
     () => new Set(tabs.filter((t) => tabLeaves(t).some((l) => l.content.kind === "agent")).map((t) => t.id)),
@@ -2495,6 +2553,14 @@ export function ShellMain({
     () => tabs.filter((t) => mountedTabIds.has(t.id)),
     [mountedTabIds, tabs],
   );
+  mountedCountRef.current = mountedTabs.length;
+
+  useEffect(() => {
+    registerMountedTabsCounter(() => mountedCountRef.current);
+    return () => {
+      registerMountedTabsCounter(null);
+    };
+  }, []);
 
   // Keep native WebViews from unmounted inactive tabs alive in hidden containers so pages never reload on tab switch.
   const inactiveWebLeaves = useMemo(() => {
@@ -2542,7 +2608,7 @@ export function ShellMain({
       ))}
     </div>
   );
-}
+});
 
 // Side panel -----------------------------------------------------------------------
 
@@ -2609,8 +2675,7 @@ function useFilesTarget() {
   return resolved;
 }
 
-function useGitTarget() {
-  const filesTarget = useFilesTarget();
+function useGitTarget(filesTarget: ReturnType<typeof useFilesTarget>) {
   const tabs = shellStore.use((s) => s.tabs);
   const activeId = shellStore.use((s) => s.active);
   const selectedSpace = shellStore.use((s) => s.selectedSpace);
@@ -2906,18 +2971,8 @@ function SubagentAsidePanel() {
   );
 }
 
-export function ShellPanel() {
+export const ShellPanel = memo(function ShellPanel() {
   const panel = shellStore.use((s) => s.panel);
-  const width = shellStore.use((s) => s.panelWidth);
-  const aside = shellStore.use((s) => s.subagentAside);
-  const homePage = useClientConfig().browser.homePage;
-  const filesTarget = useFilesTarget();
-  const gitTarget = useGitTarget();
-  const drag = useRef<{ x: number; w: number } | null>(null);
-  const [browserMeta, setBrowserMeta] = useState<{ url: string; title: string }>({
-    url: homePage || "about:blank",
-    title: "浏览器",
-  });
 
   // The browser panel's native view closes with the panel.
   useEffect(() => {
@@ -2925,6 +2980,20 @@ export function ShellPanel() {
   }, [panel]);
 
   if (!panel) return null;
+  return <ShellPanelOpen panel={panel} />;
+});
+
+function ShellPanelOpen({ panel }: { panel: PanelId }) {
+  const width = shellStore.use((s) => s.panelWidth);
+  const aside = shellStore.use((s) => s.subagentAside);
+  const homePage = useClientConfig().browser.homePage;
+  const filesTarget = useFilesTarget();
+  const gitTarget = useGitTarget(filesTarget);
+  const drag = useRef<{ x: number; w: number } | null>(null);
+  const [browserMeta, setBrowserMeta] = useState<{ url: string; title: string }>({
+    url: homePage || "about:blank",
+    title: "浏览器",
+  });
   const onDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     drag.current = { x: e.clientX, w: width };
     e.currentTarget.setPointerCapture(e.pointerId);

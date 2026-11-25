@@ -1,4 +1,5 @@
 import { logger } from "./log";
+import { recordClickPaintSample } from "./perfTelemetry";
 
 const INTERACTIVE_SELECTOR =
   "button, a, [role='button'], [role='tab'], [role='menuitem'], [role='option'], [role='switch'], [role='checkbox'], summary, .agent-card, .mp-tab, .mp-card-btn";
@@ -34,11 +35,23 @@ export function installGlobalActionTelemetry(): () => void {
     const role = hit.getAttribute("role") || undefined;
     const label = safeControlLabel(hit);
     const id = hit.id || hit.getAttribute("data-testid") || undefined;
-    logger.info("ui.click", `${role ?? tag}: ${label}`, {
+    const actionLabel = `${role ?? tag}: ${label}`;
+    logger.info("ui.click", actionLabel, {
       tag,
       ...(role ? { role } : {}),
       ...(id ? { id } : {}),
     });
+    if (
+      typeof document !== "undefined" &&
+      document.visibilityState === "visible" &&
+      typeof requestAnimationFrame === "function"
+    ) {
+      const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+      requestAnimationFrame(() => {
+        const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+        recordClickPaintSample(now - t0, actionLabel);
+      });
+    }
   };
 
   const onCompositionStart = () => {

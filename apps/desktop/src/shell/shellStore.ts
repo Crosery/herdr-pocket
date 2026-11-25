@@ -561,20 +561,75 @@ export const shellStore = createStore<ShellState>({
   peek: null,
 });
 
+const SHELL_PERSIST_DEBOUNCE_MS = 120;
+
+function capturePersistedShellRefs(s: ShellState) {
+  return {
+    tabs: s.tabs,
+    active: s.active,
+    selectedSpace: s.selectedSpace,
+    activeBySpace: s.activeBySpace,
+    navHistoryBySpace: s.navHistoryBySpace,
+    panel: s.panel === "subagent" ? null : s.panel,
+    panelBySpace: s.panelBySpace,
+    panelWidth: s.panelWidth,
+  };
+}
+
 let lastPersistedJson = JSON.stringify(pickPersistedShellState(shellStore.get()));
+let lastObservedPersistedRefs = capturePersistedShellRefs(shellStore.get());
+let shellPersistTimer: ReturnType<typeof setTimeout> | null = null;
 let dirtyBeforeHydrate = false;
 
-shellStore.subscribe(() => {
+/** Flushes pending `shellStore` persistence to `localStorage` immediately (also invoked on page hide/unload). */
+export function flushShellPersistenceNow(): void {
+  if (shellPersistTimer !== null) {
+    clearTimeout(shellPersistTimer);
+    shellPersistTimer = null;
+  }
   const persisted = pickPersistedShellState(shellStore.get());
   const encoded = JSON.stringify(persisted);
   if (encoded === lastPersistedJson) return;
   lastPersistedJson = encoded;
-  dirtyBeforeHydrate = true;
   try {
     localStorage.setItem(KEY, encoded);
   } catch {
     // Storage off: tabs last for this session.
   }
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", flushShellPersistenceNow);
+  window.addEventListener("beforeunload", flushShellPersistenceNow);
+}
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushShellPersistenceNow();
+  });
+}
+
+shellStore.subscribe(() => {
+  const cur = shellStore.get();
+  const nextRefs = capturePersistedShellRefs(cur);
+  if (
+    Object.is(nextRefs.tabs, lastObservedPersistedRefs.tabs) &&
+    Object.is(nextRefs.active, lastObservedPersistedRefs.active) &&
+    Object.is(nextRefs.selectedSpace, lastObservedPersistedRefs.selectedSpace) &&
+    Object.is(nextRefs.activeBySpace, lastObservedPersistedRefs.activeBySpace) &&
+    Object.is(nextRefs.navHistoryBySpace, lastObservedPersistedRefs.navHistoryBySpace) &&
+    Object.is(nextRefs.panel, lastObservedPersistedRefs.panel) &&
+    Object.is(nextRefs.panelBySpace, lastObservedPersistedRefs.panelBySpace) &&
+    Object.is(nextRefs.panelWidth, lastObservedPersistedRefs.panelWidth)
+  ) {
+    return;
+  }
+  lastObservedPersistedRefs = nextRefs;
+  dirtyBeforeHydrate = true;
+  if (shellPersistTimer !== null) clearTimeout(shellPersistTimer);
+  shellPersistTimer = setTimeout(() => {
+    shellPersistTimer = null;
+    flushShellPersistenceNow();
+  }, SHELL_PERSIST_DEBOUNCE_MS);
   scheduleWorkspacePersist();
 });
 
@@ -585,9 +640,14 @@ registerWorkspaceSection("shellState", {
     if (!parsed) return;
     const cur = shellStore.get();
     if (dirtyBeforeHydrate && cur.tabs.length > 0) return;
+    if (shellPersistTimer !== null) {
+      clearTimeout(shellPersistTimer);
+      shellPersistTimer = null;
+    }
     const encoded = JSON.stringify(parsed);
     lastPersistedJson = encoded;
     shellStore.set((s) => ({ ...s, ...parsed }));
+    lastObservedPersistedRefs = capturePersistedShellRefs(shellStore.get());
     try {
       localStorage.setItem(KEY, encoded);
     } catch {
@@ -787,6 +847,15 @@ function activationTransition(
   };
 }
 
+function isTabFocusNoop(tab: ShellTab, leafId: string): boolean {
+  if (!tab.split) {
+    return leafId === (tab.primaryPaneId ?? `p0:${tab.id}`);
+  }
+  const curZoom = tab.split.zoomedPaneId ?? null;
+  const nextZoom = curZoom === leafId ? leafId : null;
+  return tab.split.focusedPaneId === leafId && curZoom === nextZoom;
+}
+
 function focusTabAndLeaf(
   s: ShellState,
   tab: ShellTab,
@@ -798,12 +867,15 @@ function focusTabAndLeaf(
   opts?: { capturePeek?: boolean; baseActiveBySpace?: Record<string, string | null> },
 ): ShellState {
   recordPaneFocus(tab.id, leafId);
-  const nextTabs = s.tabs.map((t) => {
-    if (t.id !== tab.id) return t;
-    const root = updateLeaf ? updateLeafContent(tabRootNode(t), leafId, updateLeaf) : tabRootNode(t);
-    const keepZoom = t.split?.zoomedPaneId === leafId ? leafId : null;
-    return applyRootToTab(t, root, leafId, keepZoom);
-  });
+  const nextTabs =
+    !updateLeaf && isTabFocusNoop(tab, leafId)
+      ? s.tabs
+      : s.tabs.map((t) => {
+          if (t.id !== tab.id) return t;
+          const root = updateLeaf ? updateLeafContent(tabRootNode(t), leafId, updateLeaf) : tabRootNode(t);
+          const keepZoom = t.split?.zoomedPaneId === leafId ? leafId : null;
+          return applyRootToTab(t, root, leafId, keepZoom);
+        });
   return {
     ...s,
     tabs: nextTabs,
@@ -1268,15 +1340,18 @@ export function focusTabPane(tabId: string, paneId: string): void {
     const leaves = tabLeaves(tab);
     if (!leaves.some((l) => l.id === paneId)) return s;
     recordPaneFocus(tabId, paneId);
-    if (s.active === tabId && (!tab.split || (tab.split.focusedPaneId === paneId && !tab.split.zoomedPaneId))) {
+    const noop = isTabFocusNoop(tab, paneId);
+    if (s.active === tabId && noop) {
       return s;
     }
-    const nextTabs = s.tabs.map((t) => {
-      if (t.id !== tabId) return t;
-      const root = tabRootNode(t);
-      const keepZoom = t.split?.zoomedPaneId === paneId ? paneId : null;
-      return applyRootToTab(t, root, paneId, keepZoom);
-    });
+    const nextTabs = noop
+      ? s.tabs
+      : s.tabs.map((t) => {
+          if (t.id !== tabId) return t;
+          const root = tabRootNode(t);
+          const keepZoom = t.split?.zoomedPaneId === paneId ? paneId : null;
+          return applyRootToTab(t, root, paneId, keepZoom);
+        });
     const navPatch =
       s.active !== tabId
         ? activationTransition(s, tabId, s.selectedSpace, lookup, spacesMap)
