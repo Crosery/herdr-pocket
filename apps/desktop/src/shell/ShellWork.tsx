@@ -2524,8 +2524,7 @@ const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
   const [activePortalId, setActivePortalId] = useState<string | null>(null);
 
   const focusedLeaf = activeTab ? focusedLeafOfTab(activeTab) : undefined;
-  const { primaryAgent, hostIds, agentKeys, mode } = useMemo(() => {
-    const keys = new Set<string>();
+  const { primaryAgent, hostIds, mode } = useMemo(() => {
     const hosts = new Set<string>();
     let primary: Agent | undefined;
 
@@ -2534,7 +2533,6 @@ const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
         const a = lookupAgent(focusedLeaf.content.agentKey);
         if (a) {
           primary = a;
-          keys.add(a.key);
           hosts.add(a.deviceId);
         }
       } else if (focusedLeaf.content.kind === "diff") {
@@ -2542,7 +2540,6 @@ const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
           const a = lookupAgent(focusedLeaf.content.agentKey);
           if (a) {
             primary = a;
-            keys.add(a.key);
             hosts.add(a.deviceId);
           }
         }
@@ -2556,7 +2553,6 @@ const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
           const a = lookupAgent(leaf.content.agentKey);
           if (a) {
             if (!primary) primary = a;
-            keys.add(a.key);
             hosts.add(a.deviceId);
           }
         } else if (leaf.content.kind === "diff") {
@@ -2564,7 +2560,6 @@ const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
             const a = lookupAgent(leaf.content.agentKey);
             if (a) {
               if (!primary) primary = a;
-              keys.add(a.key);
               hosts.add(a.deviceId);
             }
           }
@@ -2573,8 +2568,8 @@ const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
       }
     }
 
+    if (localHostId && devices[localHostId]?.online) hosts.add(localHostId);
     if (hosts.size === 0) {
-      if (localHostId && devices[localHostId]?.online) hosts.add(localHostId);
       for (const [id, dev] of Object.entries(devices)) {
         if (dev.online) hosts.add(id);
       }
@@ -2590,7 +2585,6 @@ const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
     return {
       primaryAgent: primary ?? null,
       hostIds: [...hosts],
-      agentKeys: [...keys],
       mode: leafMode,
     };
   }, [activeTab, devices, focusedLeaf, localHostId, lookupAgent]);
@@ -2602,7 +2596,8 @@ const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
       <SessionPortalPiP
         agent={primaryAgent}
         hostIds={hostIds}
-        agentKeys={agentKeys}
+        agentKeys={[]}
+        workspaceWide
         visible={Boolean(activeTab) && !modalOpen}
         mode={mode}
         onExpandPortal={(pid, hid) => {

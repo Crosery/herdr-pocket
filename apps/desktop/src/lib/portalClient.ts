@@ -123,6 +123,7 @@ export function filterVisiblePortalItems(opts: {
   itemsById: Record<string, PortalItem>;
   dismissedIds: Record<string, true>;
   manualIds?: Record<string, true>;
+  openedAtById?: Record<string, number>;
   agent: { deviceId: string; key: string };
   isTauriApp?: boolean;
   localHostId?: string | null;
@@ -134,7 +135,11 @@ export function filterVisiblePortalItems(opts: {
       if (opts.dismissedIds[i.id]) return false;
       return true;
     })
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+    .sort(
+      (a, b) =>
+        (opts.openedAtById?.[b.id] ?? b.updatedAt) - (opts.openedAtById?.[a.id] ?? a.updatedAt) ||
+        a.id.localeCompare(b.id),
+    );
 }
 
 /**
@@ -261,6 +266,7 @@ interface PortalState {
   dismissedIds: Record<string, true>;
   manualIds: Record<string, true>;
   openSeqById: Record<string, number>;
+  openedAtById: Record<string, number>;
 }
 
 const initialState: PortalState = {
@@ -273,6 +279,7 @@ const initialState: PortalState = {
   dismissedIds: {},
   manualIds: {},
   openSeqById: {},
+  openedAtById: {},
 };
 
 export interface PortalResolvedTransport {
@@ -438,21 +445,33 @@ export function ingestPortalStreamEvent(ev: unknown, hostId?: string): void {
         delete heartbeatsById[item.id];
         const ticketsById = { ...prev.ticketsById };
         delete ticketsById[item.id];
-        return { ...prev, itemsById, framesById, heartbeatsById, ticketsById };
+        const openedAtById = { ...prev.openedAtById };
+        delete openedAtById[item.id];
+        return { ...prev, itemsById, framesById, heartbeatsById, ticketsById, openedAtById };
       });
     } else {
       setState((prev) => {
         const dismissedIds = { ...prev.dismissedIds };
         const openSeqById = { ...prev.openSeqById };
+        const openedAtById = { ...prev.openedAtById };
+        const prevItem = prev.itemsById[item.id];
         if (e.action === "opened") {
           delete dismissedIds[item.id];
           openSeqById[item.id] = (openSeqById[item.id] ?? 0) + 1;
+          openedAtById[item.id] = e.at ?? item.updatedAt ?? Date.now();
+        } else if (openedAtById[item.id] === undefined) {
+          openedAtById[item.id] = prevItem?.updatedAt ?? item.updatedAt ?? item.createdAt;
         }
+        const storedItem =
+          e.action === "opened" || !prevItem
+            ? item
+            : { ...item, updatedAt: prevItem.updatedAt };
         return {
           ...prev,
-          itemsById: { ...prev.itemsById, [item.id]: item },
+          itemsById: { ...prev.itemsById, [item.id]: storedItem },
           dismissedIds,
           openSeqById,
+          openedAtById,
         };
       });
     }
@@ -485,15 +504,20 @@ export function ingestPortalStreamEvent(ev: unknown, hostId?: string): void {
       const existing = prev.itemsById[frame.portalId];
       let nextItem: PortalItem | undefined;
       if (existing) {
-        const { streamError: _clearedError, ...restExisting } = existing;
-        nextItem = {
-          ...restExisting,
-          ...(frame.url ? { url: frame.url, subtitle: frame.url } : {}),
-          ...(frame.title ? { title: frame.title } : {}),
-          width: frame.width,
-          height: frame.height,
-          updatedAt: frame.at,
-        };
+        const hadError = Boolean(existing.streamError);
+        const urlChanged = Boolean(frame.url && frame.url !== existing.url);
+        const titleChanged = Boolean(frame.title && frame.title !== existing.title);
+        const sizeChanged = existing.width !== frame.width || existing.height !== frame.height;
+        if (hadError || urlChanged || titleChanged || sizeChanged) {
+          const { streamError: _clearedError, ...restExisting } = existing;
+          nextItem = {
+            ...restExisting,
+            ...(frame.url ? { url: frame.url, subtitle: frame.url } : {}),
+            ...(frame.title ? { title: frame.title } : {}),
+            width: frame.width,
+            height: frame.height,
+          };
+        }
       }
       return {
         ...prev,
@@ -544,25 +568,33 @@ export async function refreshHostPortals(
   }
   setState((prev) => {
     const nextItems = { ...prev.itemsById };
+    const nextOpenedAt = { ...prev.openedAtById };
     if (agentKey) {
       for (const [id, it] of Object.entries(nextItems)) {
         if (it.hostId === hostId && it.agentKey === agentKey && !res.items.some((x) => x.id === id)) {
           delete nextItems[id];
+          delete nextOpenedAt[id];
         }
       }
     } else {
       for (const [id, it] of Object.entries(nextItems)) {
         if (it.hostId === hostId && !res.items.some((x) => x.id === id)) {
           delete nextItems[id];
+          delete nextOpenedAt[id];
         }
       }
     }
     for (const item of res.items) {
-      nextItems[item.id] = item;
+      const prevItem = prev.itemsById[item.id];
+      nextItems[item.id] = prevItem ? { ...item, updatedAt: prevItem.updatedAt } : item;
+      if (nextOpenedAt[item.id] === undefined) {
+        nextOpenedAt[item.id] = prevItem?.updatedAt ?? item.updatedAt ?? item.createdAt;
+      }
     }
     return {
       ...prev,
       itemsById: nextItems,
+      openedAtById: nextOpenedAt,
       capsByHost: { ...prev.capsByHost, [hostId]: res.capabilities },
       ...(res.windows ? { windowsByHost: { ...prev.windowsByHost, [hostId]: res.windows } } : {}),
     };
@@ -589,6 +621,7 @@ export async function openPortalSurface(
       dismissedIds,
       manualIds: { ...prev.manualIds, [res.item.id]: true },
       openSeqById: { ...prev.openSeqById, [res.item.id]: (prev.openSeqById[res.item.id] ?? 0) + 1 },
+      openedAtById: { ...prev.openedAtById, [res.item.id]: res.item.updatedAt ?? Date.now() },
     };
   });
   return res;
@@ -606,7 +639,9 @@ export async function closePortalSurface(hostId: string, portalId: string): Prom
     delete heartbeatsById[portalId];
     const ticketsById = { ...prev.ticketsById };
     delete ticketsById[portalId];
-    return { ...prev, itemsById, framesById, heartbeatsById, ticketsById };
+    const openedAtById = { ...prev.openedAtById };
+    delete openedAtById[portalId];
+    return { ...prev, itemsById, framesById, heartbeatsById, ticketsById, openedAtById };
   });
 }
 

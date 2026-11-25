@@ -580,9 +580,10 @@ jobs:
           path: prev-manifest
       - name: Preserve pre-uploaded notarized macOS DMGs
         run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          retry_gh() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 4 ] && return 1; sleep $((n * 4)); done; }
+          if retry_gh gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             mkdir -p dist-pre
-            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "herdr-pocket-$VERSION-macos-*.dmg" --dir dist-pre 2>/dev/null; then
+            if retry_gh gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "herdr-pocket-$VERSION-macos-*.dmg" --dir dist-pre 2>/dev/null; then
               for f in dist-pre/herdr-pocket-$VERSION-macos-*.dmg; do
                 [ -s "$f" ] && cp -f "$f" "dist/$(basename "$f")" && echo "Preserved notarized asset: $(basename "$f")"
               done
@@ -657,10 +658,18 @@ jobs:
           EOF
           flags=()
           [ "$PRERELEASE" = true ] && flags+=(--prerelease)
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --title "Herdr Pocket $VERSION" --notes-file notes.md
-          else
-            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
-              --title "Herdr Pocket $VERSION" --notes-file notes.md --generate-notes "${flags[@]}"
-          fi
+          for attempt in 1 2 3 4; do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              if gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber && \
+                 gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --title "Herdr Pocket $VERSION" --notes-file notes.md; then
+                break
+              fi
+            else
+              if gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+                   --title "Herdr Pocket $VERSION" --notes-file notes.md --generate-notes "${flags[@]}"; then
+                break
+              fi
+            fi
+            [ "$attempt" -eq 4 ] && exit 1
+            sleep $((attempt * 6))
+          done

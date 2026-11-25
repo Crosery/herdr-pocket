@@ -158,6 +158,7 @@ test("new Batch 2 UI/docs files contain zero emojis", () => {
     "docs/releases/v0.2.25.md",
     "docs/releases/v0.2.42.md",
     "docs/releases/v0.2.43.md",
+    "docs/releases/v0.2.44.md",
   ];
   for (const rel of files) {
     const full = join(ROOT, rel);
@@ -242,9 +243,77 @@ test("SessionPortalPiP surfaces same-machine and remote portals immediately, pre
   const agentsSrc = readFileSync(join(ROOT, "apps/desktop/src/views/AgentsView.tsx"), "utf8");
   const cssSrc = readFileSync(join(ROOT, "apps/desktop/src/styles/app.css"), "utf8");
   assert.match(pipSrc, /onMouseDown=\{\(e\)\s*=>\s*\{[\s\S]*e\.preventDefault\(\);/);
-  assert.match(pipSrc, /mode\s*===\s*"term"\s*\?\s*" in-term"\s*:\s*""/);
+  assert.match(pipSrc, /session-portal-stack-bar/);
+  assert.match(pipSrc, /session-portal-deck-back/);
+  assert.match(pipSrc, /cascade/);
+  assert.match(pipSrc, /bitmapCacheRef/);
   assert.match(agentsSrc, /<SessionPortalPiP[\s\S]*mode=\{activeMode\}/);
+  assert.match(cssSrc, /\.session-portal-pip\s*\{[\s\S]*top:\s*14px;[\s\S]*right:\s*16px;[\s\S]*bottom:\s*auto;/);
+  assert.doesNotMatch(cssSrc, /\.session-portal-pip\s*\{[^}]*bottom:\s*108px;/);
   assert.match(cssSrc, /\.session-portal-pip\.in-term\s*\{[\s\S]*top:\s*14px;/);
+});
+
+test("v0.2.44 multi-window stack preserves deterministic order across frames and updated events without thrashing", (t) => {
+  t.after(() => resetPortalClientStateForTest());
+  const mkItem = (id: string, title: string, ts: number) => ({
+    id,
+    hostId: "h1",
+    agentKey: "h1/hc:t1",
+    kind: "window" as const,
+    title,
+    canInteract: true,
+    transportHint: "p2p" as const,
+    createdAt: ts,
+    updatedAt: ts,
+  });
+
+  ingestPortalStreamEvent({ kind: "portal_event", action: "opened", item: mkItem("ptl-1", "Doc A", 1000), at: 1000 }, "h1");
+  ingestPortalStreamEvent({ kind: "portal_event", action: "opened", item: mkItem("ptl-2", "Browser B", 2000), at: 2000 }, "h1");
+  ingestPortalStreamEvent({ kind: "portal_event", action: "opened", item: mkItem("ptl-3", "Preview C", 3000), at: 3000 }, "h1");
+
+  const order1 = filterVisiblePortalItems({
+    itemsById: portalStore.get().itemsById,
+    dismissedIds: portalStore.get().dismissedIds,
+    openedAtById: portalStore.get().openedAtById,
+    agent: { deviceId: "h1", key: "h1/hc:t1" },
+  }).map((i) => i.id);
+  assert.deepEqual(order1, ["ptl-3", "ptl-2", "ptl-1"]);
+
+  // High-frequency frames and "updated" title changes on ptl-1 must NOT reorder the stack or bump openSeqById.
+  const prevOpenSeq1 = portalStore.get().openSeqById["ptl-1"];
+  ingestPortalStreamEvent(
+    { kind: "portal_frame", portalId: "ptl-1", seq: 1, mime: "image/jpeg", data: "AA==", width: 800, height: 600, at: 99999 },
+    "h1",
+  );
+  ingestPortalStreamEvent(
+    { kind: "portal_event", action: "updated", item: mkItem("ptl-1", "Doc A - Edited", 100000), at: 100000 },
+    "h1",
+  );
+  assert.equal(portalStore.get().openSeqById["ptl-1"], prevOpenSeq1);
+  assert.equal(portalStore.get().itemsById["ptl-1"]?.title, "Doc A - Edited");
+
+  const order2 = filterVisiblePortalItems({
+    itemsById: portalStore.get().itemsById,
+    dismissedIds: portalStore.get().dismissedIds,
+    openedAtById: portalStore.get().openedAtById,
+    agent: { deviceId: "h1", key: "h1/hc:t1" },
+  }).map((i) => i.id);
+  assert.deepEqual(order2, ["ptl-3", "ptl-2", "ptl-1"]);
+
+  // Explicit "opened" promotes the newly triggered portal cleanly.
+  ingestPortalStreamEvent(
+    { kind: "portal_event", action: "opened", item: mkItem("ptl-1", "Doc A - Reopened", 105000), at: 105000 },
+    "h1",
+  );
+  const order3 = filterVisiblePortalItems({
+    itemsById: portalStore.get().itemsById,
+    dismissedIds: portalStore.get().dismissedIds,
+    openedAtById: portalStore.get().openedAtById,
+    agent: { deviceId: "h1", key: "h1/hc:t1" },
+  }).map((i) => i.id);
+  assert.deepEqual(order3, ["ptl-1", "ptl-3", "ptl-2"]);
+  assert.equal(portalStore.get().openSeqById["ptl-1"], (prevOpenSeq1 ?? 0) + 1);
+  resetPortalClientStateForTest();
 });
 
 test("isLoopbackPortalUrl distinguishes remote loopback URLs and portal_frame clears streamError", (t) => {

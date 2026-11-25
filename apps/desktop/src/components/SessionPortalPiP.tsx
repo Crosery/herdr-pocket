@@ -1,16 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type PointerEvent as ReactPointerEvent } from "react";
 import {
   AppWindow,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   ChevronUp,
   ExternalLink,
   FileCode2,
   FolderSearch,
   Globe,
+  Layers,
   Maximize2,
   MousePointer,
+  Rows3,
   X,
 } from "lucide-react";
 import type { Agent, PortalItem } from "@herdr-pocket/protocol";
@@ -36,13 +36,14 @@ import { PocketButton } from "./PocketUI";
 
 type ResizeDir = "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
 
-const PIP_MIN_W = 220;
+const PIP_MIN_W = 240;
 const PIP_MAX_W = 880;
 const PIP_MIN_H = 150;
 const PIP_MAX_H = 680;
-const PIP_MARGIN = 12;
-const PIP_DEFAULT_W = 320;
+const PIP_MARGIN = 14;
+const PIP_DEFAULT_W = 328;
 const PIP_DEFAULT_H = 224;
+const PIP_BITMAP_CACHE_MAX = 6;
 const PIP_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|gif|svg|bmp|ico|avif)$/i;
 
 interface PipBox {
@@ -85,104 +86,76 @@ function portalIcon(kind: PortalItem["kind"]) {
   }
 }
 
-export function SessionPortalPiP({
-  agent,
-  hostIds,
-  agentKeys,
-  visible = true,
-  mode = "chat",
-  onExpandPortal,
-}: {
-  agent?: Agent | null;
-  hostIds?: string[];
-  agentKeys?: string[];
-  visible?: boolean;
-  mode?: "chat" | "term";
+function putBitmapCache(
+  cache: Map<string, ImageBitmap | HTMLImageElement>,
+  portalId: string,
+  src: ImageBitmap | HTMLImageElement,
+): void {
+  const prev = cache.get(portalId);
+  if (prev && prev !== src && "close" in prev && typeof prev.close === "function") {
+    prev.close();
+  }
+  cache.delete(portalId);
+  cache.set(portalId, src);
+  while (cache.size > PIP_BITMAP_CACHE_MAX) {
+    const oldestKey = cache.keys().next().value;
+    if (!oldestKey) break;
+    const evicted = cache.get(oldestKey);
+    cache.delete(oldestKey);
+    if (evicted && "close" in evicted && typeof evicted.close === "function") {
+      evicted.close();
+    }
+  }
+}
+
+interface PortalMiniCardProps {
+  item: PortalItem;
+  contextAgent?: Agent | null;
+  visible: boolean;
+  collapsed?: boolean;
+  isActive: boolean;
+  stackCount?: number;
+  fps?: number;
+  maxWidth?: number;
+  quality?: number;
+  bitmapCacheRef: MutableRefObject<Map<string, ImageBitmap | HTMLImageElement>>;
+  onStartHeaderDrag?: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  onFocusCard?: () => void;
+  onToggleCollapse?: () => void;
   onExpandPortal: (portalId: string, hostId: string) => void;
-}) {
-  const itemsById = portalStore.use((s) => s.itemsById);
-  const framesById = portalStore.use((s) => s.framesById);
-  const dismissedIds = portalStore.use((s) => s.dismissedIds);
-  const manualIds = portalStore.use((s) => s.manualIds);
-  const openSeqById = portalStore.use((s) => s.openSeqById);
+  onClosePortal: (portalId: string, hostId: string) => void;
+}
+
+function PortalMiniCard({
+  item,
+  contextAgent,
+  visible,
+  collapsed = false,
+  isActive,
+  stackCount = 1,
+  fps = 24,
+  maxWidth = 960,
+  quality = 58,
+  bitmapCacheRef,
+  onStartHeaderDrag,
+  onFocusCard,
+  onToggleCollapse,
+  onExpandPortal,
+  onClosePortal,
+}: PortalMiniCardProps) {
+  const frame = portalStore.use((s) => s.framesById[item.id]);
   const agentsMap = liveStore.use((s) => s.agents);
   liveStore.use((s) => s.direct);
   const localHostId = useLocalHostDeviceId();
   const isTauriApp = isTauri();
   const [, setTransportTick] = useState(0);
 
-  const effectiveHostIds = useMemo(() => {
-    const set = new Set<string>();
-    if (agent?.deviceId) set.add(agent.deviceId);
-    if (hostIds) {
-      for (const hid of hostIds) {
-        if (hid) set.add(hid);
-      }
-    }
-    return [...set];
-  }, [agent?.deviceId, hostIds]);
-
-  const effectiveAgentKeys = useMemo(() => {
-    const set = new Set<string>();
-    if (agent?.key) set.add(agent.key);
-    if (agentKeys) {
-      for (const k of agentKeys) {
-        if (k) set.add(k);
-      }
-    }
-    return [...set];
-  }, [agent?.key, agentKeys]);
-
-  const items = useMemo(() => {
-    if (effectiveHostIds.length === 0) return [];
-    if (effectiveHostIds.length === 1 && effectiveAgentKeys.length <= 1 && agent) {
-      return filterVisiblePortalItems({
-        itemsById,
-        dismissedIds,
-        manualIds,
-        agent,
-        isTauriApp,
-        localHostId,
-      });
-    }
-    const hostSet = new Set(effectiveHostIds);
-    const keySet = new Set(effectiveAgentKeys);
-    const matched = new Map<string, PortalItem>();
-    const hostsToScan = effectiveHostIds;
-    const keysToScan = effectiveAgentKeys.length > 0 ? effectiveAgentKeys : [agent?.key ?? ""];
-    for (const hid of hostsToScan) {
-      for (const aKey of keysToScan) {
-        for (const it of filterVisiblePortalItems({
-          itemsById,
-          dismissedIds,
-          manualIds,
-          agent: { deviceId: hid, key: aKey },
-          isTauriApp,
-          localHostId,
-        })) {
-          matched.set(it.id, it);
-        }
-      }
-    }
-    for (const it of Object.values(itemsById)) {
-      if (!hostSet.has(it.hostId) || dismissedIds[it.id]) continue;
-      if (!it.agentKey || keySet.size === 0 || keySet.has(it.agentKey)) {
-        matched.set(it.id, it);
-      }
-    }
-    return [...matched.values()].sort((a, b) => b.updatedAt - a.updatedAt);
-  }, [agent, dismissedIds, effectiveAgentKeys, effectiveHostIds, isTauriApp, itemsById, localHostId, manualIds]);
-
-  const [index, setIndex] = useState(0);
-  const [collapsed, setCollapsed] = useState(false);
-  const [directControl, setDirectControl] = useState(true);
-  const [box, setBox] = useState<PipBox>({ x: null, y: null, w: PIP_DEFAULT_W, h: PIP_DEFAULT_H });
-  const [gesture, setGesture] = useState<"idle" | "drag" | "resize">("idle");
+  const [directControl, setDirectControl] = useState(isActive);
   const [htmlPreview, setHtmlPreview] = useState<{ portalId: string; memUrl?: string | null; srcDoc?: string } | null>(null);
   const [imgPreview, setImgPreview] = useState<{ portalId: string; dataUri: string } | null>(null);
   const [textPreview, setTextPreview] = useState<{ portalId: string; text: string } | null>(null);
   const [pipFps, setPipFps] = useState(0);
-  const rootRef = useRef<HTMLDivElement | null>(null);
+
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const latestSourceRef = useRef<ImageBitmap | HTMLImageElement | null>(null);
@@ -195,104 +168,45 @@ export function SessionPortalPiP({
   const pipPendingMoveRef = useRef<{ nx: number; ny: number; action: "move" | "drag"; button: "left" | "right" | "middle" } | null>(null);
   const pipWheelInFlightRef = useRef(false);
   const pipPendingWheelRef = useRef<{ nx: number; ny: number; deltaX: number; deltaY: number } | null>(null);
-  const prevTopSigRef = useRef<string | null>(null);
 
-  const hostListKey = effectiveHostIds.join("\0");
-  const primaryAgentKey = agent?.key ?? effectiveAgentKeys[0];
-
-  useEffect(() => {
-    if (!visible || !hostListKey) return;
-    const stops = hostListKey.split("\0").filter(Boolean).map((hid) =>
-      subscribeAgentPortalUpdates(hid, primaryAgentKey ?? ""),
-    );
-    return () => {
-      for (const stop of stops) stop();
-    };
-  }, [hostListKey, primaryAgentKey, visible]);
-
-  const topId = items[0]?.id ?? null;
-  const topOpenSeq = topId ? (openSeqById[topId] ?? 0) : 0;
-  useEffect(() => {
-    if (!topId) {
-      prevTopSigRef.current = null;
-      return;
-    }
-    const sig = `${topId}:${topOpenSeq}`;
-    if (sig !== prevTopSigRef.current) {
-      setIndex(0);
-      setCollapsed(false);
-    }
-    prevTopSigRef.current = sig;
-  }, [topId, topOpenSeq]);
+  const resolvedAgentKey = item.agentKey ?? contextAgent?.key;
+  const resolvedAgent = useMemo(() => {
+    if (contextAgent && (!resolvedAgentKey || contextAgent.key === resolvedAgentKey)) return contextAgent;
+    if (resolvedAgentKey) return lookupAgentByKey(agentsMap, resolvedAgentKey);
+    return allAgents(agentsMap).find((a) => a.deviceId === item.hostId);
+  }, [agentsMap, contextAgent, item.hostId, resolvedAgentKey]);
 
   useEffect(() => {
-    const onResize = () => {
-      setBox((prev) => {
-        const sz = clampPipSize(prev.w, prev.h);
-        if (prev.x === null || prev.y === null) {
-          return sz.w === prev.w && sz.h === prev.h ? prev : { ...prev, ...sz };
-        }
-        const pos = clampPipPos(prev.x, prev.y, sz.w, collapsed ? 44 : sz.h);
-        return { ...sz, ...pos };
-      });
-    };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [collapsed]);
-
-  const current = items[Math.min(index, Math.max(0, items.length - 1))];
-  const currentId = current?.id;
-  const currentKind = current?.kind;
-  const currentHostId = current?.hostId;
-  const currentPath = current?.targetPath;
-  const currentTitle = current?.title;
-  const currentMime = current?.mime;
-  const currentCanInteract = Boolean(current?.canInteract);
-  const currentAgentKey = current?.agentKey ?? primaryAgentKey;
-  const currentAgent = useMemo(() => {
-    if (agent && (!currentAgentKey || agent.key === currentAgentKey)) return agent;
-    if (currentAgentKey) return lookupAgentByKey(agentsMap, currentAgentKey);
-    if (currentHostId) return allAgents(agentsMap).find((a) => a.deviceId === currentHostId);
-    return undefined;
-  }, [agent, agentsMap, currentAgentKey, currentHostId]);
+    if (!visible || collapsed || !item.canInteract) return;
+    return subscribePortalFrames(item.hostId, item.id, { fps, maxWidth, quality });
+  }, [collapsed, fps, item.canInteract, item.hostId, item.id, maxWidth, quality, visible]);
 
   useEffect(() => {
-    if (!visible || collapsed || !currentHostId || !currentId || !currentCanInteract) return;
-    return subscribePortalFrames(currentHostId, currentId, { fps: 24, maxWidth: 960, quality: 58 });
-  }, [collapsed, currentCanInteract, currentHostId, currentId, visible]);
-
-  useEffect(() => {
-    if (!visible || collapsed || !currentId) return;
+    if (!visible || collapsed) return;
     const timer = setInterval(() => setTransportTick((n) => n + 1), 1000);
     return () => clearInterval(timer);
-  }, [collapsed, currentId, visible]);
+  }, [collapsed, item.id, visible]);
 
   useEffect(() => {
-    if (!currentId || currentKind !== "html") {
+    if (item.kind !== "html") {
       setHtmlPreview(null);
       return;
     }
-    if (!visible || collapsed || !currentHostId || !currentPath) {
-      return;
-    }
-    if (htmlPreview?.portalId === currentId && (htmlPreview.memUrl || htmlPreview.srcDoc)) {
-      return;
-    }
+    if (!visible || collapsed || !item.targetPath) return;
+    if (htmlPreview?.portalId === item.id && (htmlPreview.memUrl || htmlPreview.srcDoc)) return;
     let alive = true;
-    void rpcCall(currentHostId, "portal.bundleHtml", {
-      ...(currentAgentKey ? { agent: currentAgentKey } : {}),
-      path: currentPath,
-      ...(currentAgent?.cwd ? { cwd: currentAgent.cwd } : {}),
+    void rpcCall(item.hostId, "portal.bundleHtml", {
+      ...(resolvedAgentKey ? { agent: resolvedAgentKey } : {}),
+      path: item.targetPath,
+      ...(resolvedAgent?.cwd ? { cwd: resolvedAgent.cwd } : {}),
     })
       .then(async (res) => {
         if (!alive || !res?.html) return;
         let memUrl: string | null = null;
         if (isTauri() && native.available()) {
-          memUrl = await native.registerMemHtmlPreview(res.title || currentTitle || "preview.html", res.html).catch(() => null);
+          memUrl = await native.registerMemHtmlPreview(res.title || item.title || "preview.html", res.html).catch(() => null);
         }
-        if (alive) {
-          setHtmlPreview({ portalId: currentId, memUrl, srcDoc: res.html });
-        }
+        if (alive) setHtmlPreview({ portalId: item.id, memUrl, srcDoc: res.html });
       })
       .catch(() => {
         if (alive) setHtmlPreview(null);
@@ -300,32 +214,28 @@ export function SessionPortalPiP({
     return () => {
       alive = false;
     };
-  }, [collapsed, currentAgent?.cwd, currentAgentKey, currentHostId, currentId, currentKind, currentPath, currentTitle, htmlPreview?.memUrl, htmlPreview?.portalId, htmlPreview?.srcDoc, visible]);
+  }, [collapsed, htmlPreview?.memUrl, htmlPreview?.portalId, htmlPreview?.srcDoc, item.hostId, item.id, item.kind, item.targetPath, item.title, resolvedAgent?.cwd, resolvedAgentKey, visible]);
 
   const isInlineImageFile =
-    currentKind === "file" && Boolean(currentPath && (PIP_IMAGE_EXT_RE.test(currentPath) || currentMime?.startsWith("image/")));
+    item.kind === "file" && Boolean(item.targetPath && (PIP_IMAGE_EXT_RE.test(item.targetPath) || item.mime?.startsWith("image/")));
 
   useEffect(() => {
-    if (!currentId || !isInlineImageFile) {
+    if (!isInlineImageFile) {
       setImgPreview(null);
       return;
     }
-    if (!visible || collapsed || !currentHostId || !currentPath) {
-      return;
-    }
-    if (imgPreview?.portalId === currentId && imgPreview.dataUri) {
-      return;
-    }
+    if (!visible || collapsed || !item.targetPath) return;
+    if (imgPreview?.portalId === item.id && imgPreview.dataUri) return;
     let alive = true;
-    void rpcCall(currentHostId, "files.readChunk", {
-      ...(currentAgentKey ? { agent: currentAgentKey } : {}),
-      path: currentPath,
+    void rpcCall(item.hostId, "files.readChunk", {
+      ...(resolvedAgentKey ? { agent: resolvedAgentKey } : {}),
+      path: item.targetPath,
       offset: 0,
       length: 1536 * 1024,
     })
       .then((c) => {
         if (!alive || !c?.base64) return;
-        setImgPreview({ portalId: currentId, dataUri: `data:${c.mime || "image/png"};base64,${c.base64}` });
+        setImgPreview({ portalId: item.id, dataUri: `data:${c.mime || "image/png"};base64,${c.base64}` });
       })
       .catch(() => {
         if (alive) setImgPreview(null);
@@ -333,25 +243,25 @@ export function SessionPortalPiP({
     return () => {
       alive = false;
     };
-  }, [collapsed, currentAgentKey, currentHostId, currentId, currentPath, imgPreview?.dataUri, imgPreview?.portalId, isInlineImageFile, visible]);
+  }, [collapsed, imgPreview?.dataUri, imgPreview?.portalId, isInlineImageFile, item.hostId, item.id, item.targetPath, resolvedAgentKey, visible]);
 
-  const isInlineTextFile = currentKind === "file" && !isInlineImageFile;
+  const isInlineTextFile = item.kind === "file" && !isInlineImageFile;
 
   useEffect(() => {
-    if (!currentId || !isInlineTextFile) {
+    if (!isInlineTextFile) {
       setTextPreview(null);
       return;
     }
-    if (!visible || collapsed || !currentHostId || !currentPath) return;
-    if (textPreview?.portalId === currentId && textPreview.text) return;
+    if (!visible || collapsed || !item.targetPath) return;
+    if (textPreview?.portalId === item.id && textPreview.text) return;
     let alive = true;
-    void rpcCall(currentHostId, "files.read", {
-      agent: currentAgentKey ?? "",
-      path: currentPath,
+    void rpcCall(item.hostId, "files.read", {
+      agent: resolvedAgentKey ?? "",
+      path: item.targetPath,
     })
       .then((res) => {
         if (!alive || !res?.text) return;
-        setTextPreview({ portalId: currentId, text: res.text.slice(0, 1200) });
+        setTextPreview({ portalId: item.id, text: res.text.slice(0, 1200) });
       })
       .catch(() => {
         if (alive) setTextPreview(null);
@@ -359,28 +269,28 @@ export function SessionPortalPiP({
     return () => {
       alive = false;
     };
-  }, [collapsed, currentAgentKey, currentHostId, currentId, currentPath, isInlineTextFile, textPreview?.portalId, textPreview?.text, visible]);
+  }, [collapsed, isInlineTextFile, item.hostId, item.id, item.targetPath, resolvedAgentKey, textPreview?.portalId, textPreview?.text, visible]);
 
-  const isSameLocalHost = Boolean(isTauriApp && localHostId && current?.hostId === localHostId);
+  const isSameLocalHost = Boolean(isTauriApp && localHostId && item.hostId === localHostId);
   const needsMacScreenPerm = Boolean(
     isTauriApp &&
       detectPlatform() === "macos" &&
       isSameLocalHost &&
-      current?.streamError &&
-      /屏幕录制|抓屏权限|screen_recording/i.test(current.streamError),
+      item.streamError &&
+      /屏幕录制|抓屏权限|screen_recording/i.test(item.streamError),
   );
 
   useEffect(() => {
-    if (!needsMacScreenPerm || !currentHostId || !currentId) return;
+    if (!needsMacScreenPerm) return;
     const retryIfGranted = async () => {
       const p = await native.getPermissions();
       if (p?.screenRecording === "granted") {
-        void capturePortalFrameOnce(currentHostId, currentId);
+        void capturePortalFrameOnce(item.hostId, item.id);
       }
     };
     const off = native.onPermissionsChanged((p) => {
       if (p.screenRecording === "granted") {
-        void capturePortalFrameOnce(currentHostId, currentId);
+        void capturePortalFrameOnce(item.hostId, item.id);
       }
     });
     const onFocus = () => {
@@ -391,19 +301,18 @@ export function SessionPortalPiP({
       off();
       window.removeEventListener("focus", onFocus);
     };
-  }, [currentHostId, currentId, needsMacScreenPerm]);
+  }, [item.hostId, item.id, needsMacScreenPerm]);
 
-  const currentFrame = currentId ? framesById[currentId] : undefined;
-  const currentCanStream = Boolean(currentCanInteract && currentFrame && (currentFrame.rawBytes?.byteLength || currentFrame.data));
+  const hasStreamFrame = Boolean(item.canInteract && frame && (frame.rawBytes?.byteLength || frame.data));
 
   const drawPipFrame = useCallback(() => {
     const canvas = canvasRef.current;
-    const src = latestSourceRef.current;
+    const src = latestSourceRef.current ?? bitmapCacheRef.current.get(item.id) ?? null;
     const previewEl = previewRef.current;
     if (!canvas || !src || !previewEl) return;
     const r = previewEl.getBoundingClientRect();
-    const w = Math.max(1, Math.round(r.width || box.w));
-    const h = Math.max(1, Math.round(r.height || box.h));
+    const w = Math.max(1, Math.round(r.width || 312));
+    const h = Math.max(1, Math.round(r.height || 184));
     const dpr = typeof window !== "undefined" ? Math.min(2, window.devicePixelRatio || 1) : 1;
     const cw = Math.round(w * dpr);
     const ch = Math.round(h * dpr);
@@ -415,13 +324,22 @@ export function SessionPortalPiP({
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    const imgW = currentFrame?.width ?? current?.width ?? 1280;
-    const imgH = currentFrame?.height ?? current?.height ?? 800;
+    const imgW = frame?.width ?? item.width ?? 1280;
+    const imgH = frame?.height ?? item.height ?? 800;
     const { drawLeft, drawTop, drawW, drawH } = computeContainedRect(w, h, imgW, imgH);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
     ctx.drawImage(src, drawLeft, drawTop, drawW, drawH);
-  }, [box.h, box.w, current?.height, current?.width, currentFrame?.height, currentFrame?.width]);
+  }, [bitmapCacheRef, frame?.height, frame?.width, item.height, item.id, item.width]);
+
+  useEffect(() => {
+    const cached = bitmapCacheRef.current.get(item.id) ?? null;
+    latestSourceRef.current = cached;
+    fpsSamplesRef.current = [];
+    lastFrameSeqRef.current = -1;
+    setPipFps(0);
+    if (cached) drawPipFrame();
+  }, [bitmapCacheRef, drawPipFrame, item.id]);
 
   useEffect(() => {
     drawPipFrame();
@@ -433,16 +351,10 @@ export function SessionPortalPiP({
     const ro = new ResizeObserver(() => drawPipFrame());
     ro.observe(el);
     return () => ro.disconnect();
-  }, [drawPipFrame, collapsed, currentId]);
+  }, [collapsed, drawPipFrame, item.id]);
 
   useEffect(() => {
-    fpsSamplesRef.current = [];
-    lastFrameSeqRef.current = -1;
-    setPipFps(0);
-  }, [currentId]);
-
-  useEffect(() => {
-    if (!visible || collapsed || !currentCanInteract) {
+    if (!visible || collapsed || !item.canInteract) {
       fpsSamplesRef.current = [];
       setPipFps(0);
       return;
@@ -454,20 +366,17 @@ export function SessionPortalPiP({
       setPipFps((prev) => (prev === kept.length ? prev : kept.length));
     }, 500);
     return () => clearInterval(timer);
-  }, [collapsed, currentCanInteract, visible]);
+  }, [collapsed, item.canInteract, visible]);
 
   useEffect(() => {
-    const hasBinary = Boolean(currentFrame?.rawBytes && currentFrame.rawBytes.byteLength > 0);
-    const hasBase64 = Boolean(currentFrame?.data);
-    if (!currentCanStream || !currentFrame || (!hasBinary && !hasBase64)) {
-      const prev = latestSourceRef.current;
-      latestSourceRef.current = null;
-      if (prev && "close" in prev && typeof prev.close === "function") prev.close();
+    const hasBinary = Boolean(frame?.rawBytes && frame.rawBytes.byteLength > 0);
+    const hasBase64 = Boolean(frame?.data);
+    if (!hasStreamFrame || !frame || (!hasBinary && !hasBase64)) {
       return;
     }
 
-    if (currentFrame.seq !== lastFrameSeqRef.current) {
-      lastFrameSeqRef.current = currentFrame.seq;
+    if (frame.seq !== lastFrameSeqRef.current) {
+      lastFrameSeqRef.current = frame.seq;
       const now = Date.now();
       const cutoff = now - 1000;
       const kept = fpsSamplesRef.current.filter((t) => t >= cutoff);
@@ -478,26 +387,25 @@ export function SessionPortalPiP({
 
     const seqToken = ++decodeSeqRef.current;
     let cancelled = false;
-    const mime = currentFrame.mime || "image/jpeg";
+    const mime = frame.mime || "image/jpeg";
 
     const commitSource = (next: ImageBitmap | HTMLImageElement) => {
       if (cancelled || seqToken !== decodeSeqRef.current) {
         if ("close" in next && typeof next.close === "function") next.close();
         return;
       }
-      const prev = latestSourceRef.current;
       latestSourceRef.current = next;
-      if (prev && "close" in prev && typeof prev.close === "function") prev.close();
+      putBitmapCache(bitmapCacheRef.current, item.id, next);
       drawPipFrame();
     };
 
     if (typeof createImageBitmap === "function" && (hasBinary || typeof atob === "function")) {
       try {
         let blob: Blob;
-        if (hasBinary && currentFrame.rawBytes) {
-          blob = new Blob([currentFrame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime });
+        if (hasBinary && frame.rawBytes) {
+          blob = new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime });
         } else {
-          const bin = atob(currentFrame.data);
+          const bin = atob(frame.data);
           const bytes = new Uint8Array(bin.length);
           for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
           blob = new Blob([bytes], { type: mime });
@@ -522,48 +430,36 @@ export function SessionPortalPiP({
     img.onerror = () => {
       if (revokeUrl) URL.revokeObjectURL(revokeUrl);
     };
-    if (hasBinary && currentFrame.rawBytes) {
-      revokeUrl = URL.createObjectURL(new Blob([currentFrame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime }));
+    if (hasBinary && frame.rawBytes) {
+      revokeUrl = URL.createObjectURL(new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime }));
       img.src = revokeUrl;
     } else {
-      img.src = `data:${mime};base64,${currentFrame.data}`;
+      img.src = `data:${mime};base64,${frame.data}`;
     }
     return () => {
       cancelled = true;
       if (revokeUrl) URL.revokeObjectURL(revokeUrl);
     };
-  }, [currentCanStream, currentFrame, drawPipFrame]);
+  }, [bitmapCacheRef, drawPipFrame, frame, hasStreamFrame, item.id]);
 
-  useEffect(() => {
-    return () => {
-      const prev = latestSourceRef.current;
-      latestSourceRef.current = null;
-      if (prev && "close" in prev && typeof prev.close === "function") prev.close();
-    };
-  }, []);
-
-  if (!items.length || !current) return null;
-
-  const frame = currentFrame;
-  const activeHtml = htmlPreview?.portalId === current.id ? htmlPreview : null;
-  const activeImg = imgPreview?.portalId === current.id ? imgPreview : null;
-  const activeText = textPreview?.portalId === current.id ? textPreview : null;
+  const activeHtml = htmlPreview?.portalId === item.id ? htmlPreview : null;
+  const activeImg = imgPreview?.portalId === item.id ? imgPreview : null;
+  const activeText = textPreview?.portalId === item.id ? textPreview : null;
   const safeExternalUrl =
-    current.url && /^https?:\/\//i.test(current.url) && (isSameLocalHost || !isLoopbackPortalUrl(current.url))
-      ? current.url
+    item.url && /^https?:\/\//i.test(item.url) && (isSameLocalHost || !isLoopbackPortalUrl(item.url))
+      ? item.url
       : null;
   const openUrl = safeExternalUrl ?? (activeHtml?.memUrl ? activeHtml.memUrl : null);
-  const hasStreamFrame = Boolean(current.canInteract && frame && (frame.rawBytes?.byteLength || frame.data));
-  const canDirectControl = Boolean(directControl && hasStreamFrame && !current.streamError && !needsMacScreenPerm);
-  const transport = resolvePortalTransport(current.hostId, localHostId, frame);
+  const canDirectControl = Boolean(directControl && hasStreamFrame && !item.streamError && !needsMacScreenPerm);
+  const transport = resolvePortalTransport(item.hostId, localHostId, frame);
   const p2pLabel = pipFps > 0 ? `${transport.label} · ${pipFps}fps` : transport.label;
 
   const clientToPipNormalized = (clientX: number, clientY: number) => {
     const el = previewRef.current;
     if (!el) return { nx: 0.5, ny: 0.5 };
     const r = el.getBoundingClientRect();
-    const imgW = frame?.width ?? current.width ?? 1280;
-    const imgH = frame?.height ?? current.height ?? 800;
+    const imgW = frame?.width ?? item.width ?? 1280;
+    const imgH = frame?.height ?? item.height ?? 800;
     const { drawLeft, drawTop, drawW, drawH } = computeContainedRect(r.width, r.height, imgW, imgH);
     const nx = Math.min(1, Math.max(0, (clientX - r.left - drawLeft) / Math.max(1, drawW)));
     const ny = Math.min(1, Math.max(0, (clientY - r.top - drawTop) / Math.max(1, drawH)));
@@ -583,7 +479,7 @@ export function SessionPortalPiP({
     pipLastMoveAtRef.current = now;
     pipPendingMoveRef.current = null;
     pipMoveInFlightRef.current = true;
-    void sendPortalInput(current.hostId, current.id, {
+    void sendPortalInput(item.hostId, item.id, {
       type: "pointer",
       action: pend.action,
       nx: pend.nx,
@@ -606,7 +502,7 @@ export function SessionPortalPiP({
     }
     pipPendingWheelRef.current = null;
     pipWheelInFlightRef.current = true;
-    void sendPortalInput(current.hostId, current.id, {
+    void sendPortalInput(item.hostId, item.id, {
       type: "wheel",
       nx: pend.nx,
       ny: pend.ny,
@@ -619,6 +515,496 @@ export function SessionPortalPiP({
         if (pipPendingWheelRef.current) flushPipWheel();
       });
   };
+
+  return (
+    <div
+      className={`session-portal-pip-card-shell${isActive ? " is-active" : ""}${collapsed ? " is-collapsed" : ""}`}
+      onMouseDown={(e) => {
+        onFocusCard?.();
+        if (!canDirectControl || !(e.target as HTMLElement).closest(".session-portal-pip-preview")) {
+          e.preventDefault();
+        }
+      }}
+    >
+      <div
+        className={`session-portal-pip-head${onStartHeaderDrag ? " is-draggable" : ""}`}
+        onPointerDown={(e) => {
+          onFocusCard?.();
+          onStartHeaderDrag?.(e);
+        }}
+      >
+        <span className="session-portal-pip-ic">{portalIcon(item.kind)}</span>
+        <span className="session-portal-pip-title truncate" title={item.title}>
+          {item.title}
+        </span>
+        {collapsed && stackCount > 1 ? (
+          <button
+            type="button"
+            className="session-portal-pip-count-badge"
+            title={`展开全部 ${stackCount} 个悬浮窗口`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleCollapse?.();
+            }}
+          >
+            +{stackCount - 1}
+          </button>
+        ) : (
+          <span className="session-portal-pip-badge">{p2pLabel}</span>
+        )}
+        {openUrl && !collapsed ? (
+          <button
+            type="button"
+            className="session-portal-pip-btn"
+            title="在内置浏览器标签打开"
+            aria-label="在内置浏览器标签打开"
+            onClick={() => openWebTab(openUrl, item.title, { spaceKey: shellStore.get().selectedSpace })}
+          >
+            <ExternalLink size={12} />
+          </button>
+        ) : null}
+        {onToggleCollapse ? (
+          <button
+            type="button"
+            className="session-portal-pip-btn"
+            title={collapsed ? "展开小窗预览" : "收起成胶囊"}
+            aria-label={collapsed ? "展开小窗预览" : "收起成胶囊"}
+            onClick={onToggleCollapse}
+          >
+            {collapsed ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
+          </button>
+        ) : null}
+        {item.canInteract && !collapsed ? (
+          <button
+            type="button"
+            className={`session-portal-pip-btn${directControl ? " is-active" : ""}`}
+            title={directControl ? "小窗直控已开启（点击切换为点击放大）" : "开启小窗直控（直接在悬浮窗内操作）"}
+            aria-label={directControl ? "关闭小窗直控" : "开启小窗直控"}
+            aria-pressed={directControl}
+            onClick={() => setDirectControl((v) => !v)}
+          >
+            <MousePointer size={12} />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="session-portal-pip-btn"
+          title="放大进入交互操作"
+          aria-label="放大进入交互操作"
+          onClick={() => onExpandPortal(item.id, item.hostId)}
+        >
+          <Maximize2 size={12} />
+        </button>
+        <button
+          type="button"
+          className="session-portal-pip-btn"
+          title="关闭浮窗"
+          aria-label="关闭浮窗"
+          onClick={() => onClosePortal(item.id, item.hostId)}
+        >
+          <X size={13} />
+        </button>
+      </div>
+
+      {!collapsed ? (
+        <div
+          ref={previewRef}
+          role={canDirectControl ? "application" : "button"}
+          tabIndex={0}
+          className={`session-portal-pip-preview${canDirectControl ? " is-interactive" : ""}`}
+          onClick={() => {
+            onFocusCard?.();
+            if (!canDirectControl) onExpandPortal(item.id, item.hostId);
+          }}
+          onPointerDown={(e) => {
+            onFocusCard?.();
+            if (!canDirectControl) return;
+            if ((e.target as HTMLElement).closest("button")) return;
+            e.preventDefault();
+            previewRef.current?.focus();
+            e.currentTarget.setPointerCapture?.(e.pointerId);
+            const btn: "left" | "right" | "middle" =
+              e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
+            pipDragBtnRef.current = btn;
+            pipPendingMoveRef.current = null;
+            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
+            void sendPortalInput(item.hostId, item.id, {
+              type: "pointer",
+              action: "down",
+              nx,
+              ny,
+              button: btn,
+            }).catch(() => {});
+          }}
+          onPointerMove={(e) => {
+            if (!canDirectControl) return;
+            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
+            pipPendingMoveRef.current = {
+              nx,
+              ny,
+              action: pipDragBtnRef.current ? "drag" : "move",
+              button: pipDragBtnRef.current ?? "left",
+            };
+            flushPipMove();
+          }}
+          onPointerUp={(e) => {
+            if (!canDirectControl) return;
+            const btn = pipDragBtnRef.current;
+            if (!btn) return;
+            pipDragBtnRef.current = null;
+            pipPendingMoveRef.current = null;
+            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
+            void sendPortalInput(item.hostId, item.id, {
+              type: "pointer",
+              action: "up",
+              nx,
+              ny,
+              button: btn,
+            }).catch(() => {});
+          }}
+          onContextMenu={(e) => {
+            if (!canDirectControl) return;
+            e.preventDefault();
+            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
+            void sendPortalInput(item.hostId, item.id, {
+              type: "pointer",
+              action: "click",
+              nx,
+              ny,
+              button: "right",
+            }).catch(() => {});
+          }}
+          onWheel={(e) => {
+            if (!canDirectControl) return;
+            e.preventDefault();
+            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
+            const prev = pipPendingWheelRef.current;
+            if (prev) {
+              prev.nx = nx;
+              prev.ny = ny;
+              prev.deltaX += e.deltaX;
+              prev.deltaY += e.deltaY;
+            } else {
+              pipPendingWheelRef.current = { nx, ny, deltaX: e.deltaX, deltaY: e.deltaY };
+            }
+            flushPipWheel();
+          }}
+          onKeyDown={(e) => {
+            if (canDirectControl) {
+              if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "v") return;
+              e.preventDefault();
+              if (e.key === "Meta" || e.key === "Control" || e.key === "Alt" || e.key === "Shift") return;
+              const mods: string[] = [];
+              if (e.metaKey) mods.push("meta");
+              if (e.ctrlKey) mods.push("ctrl");
+              if (e.altKey) mods.push("alt");
+              if (e.shiftKey) mods.push("shift");
+              if (e.key.length === 1 && mods.length === 0) {
+                void sendPortalInput(item.hostId, item.id, { type: "text", text: e.key }).catch(() => {});
+              } else {
+                void sendPortalInput(item.hostId, item.id, {
+                  type: "key",
+                  key: e.key,
+                  action: "press",
+                  ...(mods.length ? { modifiers: mods } : {}),
+                }).catch(() => {});
+              }
+              return;
+            }
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              onExpandPortal(item.id, item.hostId);
+            }
+          }}
+        >
+          {hasStreamFrame ? (
+            <canvas ref={canvasRef} aria-label={item.title} className="session-portal-pip-img" />
+          ) : activeImg ? (
+            <img
+              src={activeImg.dataUri}
+              alt={item.title}
+              className="session-portal-pip-img"
+              draggable={false}
+            />
+          ) : activeHtml && (activeHtml.memUrl || activeHtml.srcDoc) ? (
+            <div className="session-portal-pip-framewrap">
+              <iframe
+                title={item.title}
+                className="session-portal-pip-iframe"
+                sandbox="allow-scripts"
+                tabIndex={-1}
+                {...(activeHtml.memUrl ? { src: activeHtml.memUrl } : { srcDoc: activeHtml.srcDoc })}
+              />
+            </div>
+          ) : (
+            <div className={`session-portal-pip-card${needsMacScreenPerm ? " is-perm" : ""}`}>
+              <div className="session-portal-pip-kind">
+                {portalIcon(item.kind)}
+                <span>
+                  {item.streamError
+                    ? "画面捕获受限"
+                    : item.kind === "browser"
+                      ? "远程浏览器画面"
+                      : item.kind === "window"
+                        ? "远程桌面窗口"
+                        : item.kind === "reveal"
+                          ? "已定位到远程目录"
+                          : item.kind === "html"
+                            ? "P2P HTML 应用预览"
+                            : "P2P 跨端文件预览"}
+                </span>
+              </div>
+              <div
+                className={`session-portal-pip-sub${item.streamError ? " is-err" : " mono truncate"}`}
+                title={item.streamError || item.subtitle || item.url || item.targetPath || item.title}
+              >
+                {item.streamError || item.highlightName || item.subtitle || item.url || item.targetPath || item.title}
+              </div>
+              {activeText && !item.streamError ? (
+                <pre className="session-portal-pip-text mono">{activeText.text}</pre>
+              ) : null}
+              {needsMacScreenPerm ? (
+                <div className="session-portal-pip-card-act">
+                  <PocketButton
+                    size="sm"
+                    variant="primary"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void native.openPermissionSettings("screenRecording", true);
+                    }}
+                  >
+                    <ExternalLink size={12} />
+                    <span>去授权屏幕录制</span>
+                  </PocketButton>
+                </div>
+              ) : null}
+            </div>
+          )}
+          {needsMacScreenPerm ? null : canDirectControl ? (
+            <button
+              type="button"
+              className="session-portal-pip-expand-chip"
+              onClick={(e) => {
+                e.stopPropagation();
+                onExpandPortal(item.id, item.hostId);
+              }}
+            >
+              放大
+            </button>
+          ) : (
+            <span className="session-portal-pip-overlay">点击放大并交互操作</span>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function SessionPortalPiP({
+  agent,
+  hostIds,
+  agentKeys,
+  workspaceWide = false,
+  visible = true,
+  mode = "chat",
+  onExpandPortal,
+}: {
+  agent?: Agent | null;
+  hostIds?: string[];
+  agentKeys?: string[];
+  workspaceWide?: boolean;
+  visible?: boolean;
+  mode?: "chat" | "term";
+  onExpandPortal: (portalId: string, hostId: string) => void;
+}) {
+  const itemsById = portalStore.use((s) => s.itemsById);
+  const dismissedIds = portalStore.use((s) => s.dismissedIds);
+  const manualIds = portalStore.use((s) => s.manualIds);
+  const openSeqById = portalStore.use((s) => s.openSeqById);
+  const openedAtById = portalStore.use((s) => s.openedAtById);
+  const localHostId = useLocalHostDeviceId();
+  const isTauriApp = isTauri();
+
+  const effectiveHostIds = useMemo(() => {
+    const set = new Set<string>();
+    if (agent?.deviceId) set.add(agent.deviceId);
+    if (hostIds) {
+      for (const hid of hostIds) {
+        if (hid) set.add(hid);
+      }
+    }
+    return [...set];
+  }, [agent?.deviceId, hostIds]);
+
+  const effectiveAgentKeys = useMemo(() => {
+    const set = new Set<string>();
+    if (agentKeys) {
+      for (const k of agentKeys) {
+        if (k) set.add(k);
+      }
+    } else if (agent?.key) {
+      set.add(agent.key);
+    }
+    return [...set];
+  }, [agent?.key, agentKeys]);
+
+  const items = useMemo(() => {
+    if (effectiveHostIds.length === 0) return [];
+    const hostSet = new Set(effectiveHostIds);
+    const sortStable = (arr: PortalItem[]) =>
+      arr.sort(
+        (a, b) =>
+          (openedAtById[b.id] ?? b.updatedAt) - (openedAtById[a.id] ?? a.updatedAt) ||
+          a.id.localeCompare(b.id),
+      );
+
+    if (workspaceWide) {
+      const list = Object.values(itemsById).filter((it) => hostSet.has(it.hostId) && !dismissedIds[it.id]);
+      return sortStable(list);
+    }
+
+    if (effectiveHostIds.length === 1 && effectiveAgentKeys.length <= 1 && agent) {
+      return filterVisiblePortalItems({
+        itemsById,
+        dismissedIds,
+        manualIds,
+        openedAtById,
+        agent,
+        isTauriApp,
+        localHostId,
+      });
+    }
+
+    const keySet = new Set(effectiveAgentKeys);
+    const matched = new Map<string, PortalItem>();
+    const keysToScan = effectiveAgentKeys.length > 0 ? effectiveAgentKeys : [agent?.key ?? ""];
+    for (const hid of effectiveHostIds) {
+      for (const aKey of keysToScan) {
+        for (const it of filterVisiblePortalItems({
+          itemsById,
+          dismissedIds,
+          manualIds,
+          openedAtById,
+          agent: { deviceId: hid, key: aKey },
+          isTauriApp,
+          localHostId,
+        })) {
+          matched.set(it.id, it);
+        }
+      }
+    }
+    for (const it of Object.values(itemsById)) {
+      if (!hostSet.has(it.hostId) || dismissedIds[it.id]) continue;
+      if (!it.agentKey || keySet.size === 0 || keySet.has(it.agentKey)) {
+        matched.set(it.id, it);
+      }
+    }
+    return sortStable([...matched.values()]);
+  }, [agent, dismissedIds, effectiveAgentKeys, effectiveHostIds, isTauriApp, itemsById, localHostId, manualIds, openedAtById, workspaceWide]);
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [stackLayout, setStackLayout] = useState<"stack" | "cascade">("stack");
+  const [collapsed, setCollapsed] = useState(false);
+  const [box, setBox] = useState<PipBox>({ x: null, y: null, w: PIP_DEFAULT_W, h: PIP_DEFAULT_H });
+  const [gesture, setGesture] = useState<"idle" | "drag" | "resize">("idle");
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const bitmapCacheRef = useRef<Map<string, ImageBitmap | HTMLImageElement>>(new Map());
+  const seenOpenSeqRef = useRef<Map<string, number>>(new Map());
+
+  const hostListKey = effectiveHostIds.join("\0");
+  const primaryAgentKey = agent?.key ?? effectiveAgentKeys[0];
+
+  useEffect(() => {
+    if (!visible || !hostListKey) return;
+    const stops = hostListKey.split("\0").filter(Boolean).map((hid) =>
+      subscribeAgentPortalUpdates(hid, primaryAgentKey ?? ""),
+    );
+    return () => {
+      for (const stop of stops) stop();
+    };
+  }, [hostListKey, primaryAgentKey, visible]);
+
+  useEffect(() => {
+    const liveIds = new Set(items.map((it) => it.id));
+    for (const prevId of [...bitmapCacheRef.current.keys()]) {
+      if (!liveIds.has(prevId)) {
+        const cached = bitmapCacheRef.current.get(prevId);
+        bitmapCacheRef.current.delete(prevId);
+        if (cached && "close" in cached && typeof cached.close === "function") cached.close();
+      }
+    }
+    for (const seenKey of [...seenOpenSeqRef.current.keys()]) {
+      if (!liveIds.has(seenKey)) seenOpenSeqRef.current.delete(seenKey);
+    }
+
+    let promotedId: string | null = null;
+    let promotedTs = -1;
+    for (const it of items) {
+      const seq = openSeqById[it.id] ?? 0;
+      const seenSeq = seenOpenSeqRef.current.get(it.id) ?? 0;
+      if (seq > seenSeq) {
+        seenOpenSeqRef.current.set(it.id, seq);
+        const ts = openedAtById[it.id] ?? it.updatedAt;
+        if (ts >= promotedTs) {
+          promotedTs = ts;
+          promotedId = it.id;
+        }
+      } else if (!seenOpenSeqRef.current.has(it.id)) {
+        seenOpenSeqRef.current.set(it.id, seq);
+      }
+    }
+
+    if (promotedId) {
+      setSelectedId(promotedId);
+      setCollapsed(false);
+    } else if (selectedId && !liveIds.has(selectedId)) {
+      setSelectedId(items[0]?.id ?? null);
+    }
+  }, [items, openSeqById, openedAtById, selectedId]);
+
+  useEffect(() => {
+    return () => {
+      for (const cached of bitmapCacheRef.current.values()) {
+        if ("close" in cached && typeof cached.close === "function") cached.close();
+      }
+      bitmapCacheRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      setBox((prev) => {
+        const sz = clampPipSize(prev.w, prev.h);
+        if (prev.x === null || prev.y === null) {
+          return sz.w === prev.w && sz.h === prev.h ? prev : { ...prev, ...sz };
+        }
+        const pos = clampPipPos(prev.x, prev.y, sz.w, collapsed ? 44 : sz.h);
+        return { ...sz, ...pos };
+      });
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [collapsed]);
+
+  const current = useMemo(
+    () => (selectedId ? items.find((i) => i.id === selectedId) : undefined) ?? items[0],
+    [items, selectedId],
+  );
+
+  const cascadeCards = useMemo(() => {
+    if (items.length <= 1) return items;
+    const top = items.slice(0, 3);
+    if (current && !top.some((i) => i.id === current.id)) {
+      return [current, ...top.slice(0, 2)];
+    }
+    return top;
+  }, [current, items]);
+
+  if (!visible || !items.length || !current) return null;
+
+  const isMulti = items.length > 1;
+  const isCascade = isMulti && stackLayout === "cascade" && !collapsed;
+  const backItems = !isCascade && isMulti && !collapsed ? items.filter((i) => i.id !== current.id).slice(0, 2) : [];
 
   const currentAnchorRect = () => {
     const el = rootRef.current;
@@ -636,10 +1022,8 @@ export function SessionPortalPiP({
       };
     }
     return {
-      x: box.x ?? Math.max(PIP_MARGIN, (typeof window !== "undefined" ? window.innerWidth : 1000) - box.w - 24),
-      y:
-        box.y ??
-        (mode === "term" ? 14 : Math.max(PIP_MARGIN, (typeof window !== "undefined" ? window.innerHeight : 700) - box.h - 120)),
+      x: box.x ?? Math.max(PIP_MARGIN, (typeof window !== "undefined" ? window.innerWidth : 1000) - box.w - 16),
+      y: box.y ?? PIP_MARGIN,
       w: box.w,
       h: box.h,
       parentW: typeof window !== "undefined" ? window.innerWidth : 1200,
@@ -647,7 +1031,7 @@ export function SessionPortalPiP({
     };
   };
 
-  const startMoveDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+  const startMoveDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
     e.preventDefault();
     const startX = e.clientX;
@@ -683,8 +1067,8 @@ export function SessionPortalPiP({
     window.addEventListener("pointercancel", finish);
   };
 
-  const startResize = (dir: ResizeDir) => (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0 || collapsed) return;
+  const startResize = (dir: ResizeDir) => (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || collapsed || isCascade) return;
     e.preventDefault();
     e.stopPropagation();
     const startX = e.clientX;
@@ -736,314 +1120,216 @@ export function SessionPortalPiP({
     window.addEventListener("pointercancel", finish);
   };
 
-  const sizeClamp: React.CSSProperties = { maxWidth: "calc(100% - 24px)", maxHeight: "calc(100% - 24px)" };
-  const posStyle: React.CSSProperties =
-    box.x !== null && box.y !== null
+  const sizeClamp: React.CSSProperties = { maxWidth: "calc(100% - 28px)", maxHeight: "calc(100% - 28px)" };
+  const outerExtraH = (!collapsed && isMulti ? 36 : 0) + (backItems.length > 0 ? 14 : 0);
+  const posStyle: React.CSSProperties = isCascade
+    ? { ...sizeClamp }
+    : box.x !== null && box.y !== null
       ? {
           left: box.x,
           top: box.y,
           right: "auto",
           bottom: "auto",
           ...sizeClamp,
-          ...(collapsed ? {} : { width: box.w, height: box.h }),
+          ...(collapsed ? {} : { width: box.w, height: box.h + outerExtraH }),
         }
       : collapsed
         ? sizeClamp
-        : { width: box.w, height: box.h, ...sizeClamp };
+        : { width: box.w, height: box.h + outerExtraH, ...sizeClamp };
 
   const dirs: ResizeDir[] = ["n", "s", "e", "w", "nw", "ne", "sw", "se"];
+
+  const renderStackBar = (inCascade: boolean) => (
+    <div className="session-portal-stack-bar" role="tablist" aria-label="多窗口切换">
+      <div className="session-portal-stack-pills">
+        {items.map((it) => {
+          const active = it.id === current.id;
+          return (
+            <div key={it.id} className={`session-portal-stack-pill${active ? " is-active" : ""}`}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={active}
+                className="session-portal-stack-pill-btn"
+                title={it.title}
+                onClick={() => {
+                  setSelectedId(it.id);
+                  setCollapsed(false);
+                }}
+              >
+                <span className="session-portal-stack-pill-ic">{portalIcon(it.kind)}</span>
+                <span className="truncate">{it.title}</span>
+              </button>
+              <button
+                type="button"
+                className="session-portal-stack-pill-close"
+                aria-label={`关闭 ${it.title}`}
+                title={`关闭 ${it.title}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void closePortalSurface(it.hostId, it.id);
+                }}
+              >
+                <X size={10} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      {!inCascade ? (
+        <button
+          type="button"
+          className="session-portal-stack-toggle"
+          title="展开多窗口叠列预览"
+          aria-label="展开多窗口叠列预览"
+          onClick={() => setStackLayout("cascade")}
+        >
+          <Layers size={11} />
+          <span>叠列 {items.length}</span>
+        </button>
+      ) : null}
+    </div>
+  );
+
+  if (isCascade) {
+    return (
+      <div
+        ref={rootRef}
+        className={`session-portal-pip is-cascade${mode === "term" ? " in-term" : ""}`}
+        style={posStyle}
+        role="region"
+        aria-label={`跨端多窗口叠列 · 共 ${items.length} 个`}
+        onMouseDown={(e) => {
+          if (!(e.target as HTMLElement).closest(".session-portal-pip-preview")) {
+            e.preventDefault();
+          }
+        }}
+      >
+        <div className="session-portal-cascade-bar">
+          <span className="session-portal-cascade-label">
+            <Layers size={12} />
+            <span>已展开 {items.length} 个窗口</span>
+          </span>
+          <div className="session-portal-cascade-acts">
+            <button
+              type="button"
+              className="session-portal-stack-toggle is-active"
+              title="收起为单卡片叠放"
+              aria-label="收起为单卡片叠放"
+              onClick={() => setStackLayout("stack")}
+            >
+              <Rows3 size={11} />
+              <span>叠放收起</span>
+            </button>
+            <button
+              type="button"
+              className="session-portal-pip-btn"
+              title="收起成胶囊"
+              aria-label="收起成胶囊"
+              onClick={() => setCollapsed(true)}
+            >
+              <ChevronUp size={13} />
+            </button>
+          </div>
+        </div>
+        {items.length > 3 ? renderStackBar(true) : null}
+        <div className="session-portal-cascade">
+          {cascadeCards.map((it) => {
+            const active = it.id === current.id;
+            return (
+              <div key={it.id} className={`session-portal-cascade-item${active ? " is-active" : ""}`}>
+                <PortalMiniCard
+                  item={it}
+                  contextAgent={agent}
+                  visible={visible}
+                  isActive={active}
+                  fps={active ? 24 : 10}
+                  maxWidth={800}
+                  quality={54}
+                  bitmapCacheRef={bitmapCacheRef}
+                  onFocusCard={() => setSelectedId(it.id)}
+                  onExpandPortal={onExpandPortal}
+                  onClosePortal={(pid, hid) => void closePortalSurface(hid, pid)}
+                />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
       ref={rootRef}
-      className={`session-portal-pip${mode === "term" ? " in-term" : ""}${collapsed ? " is-collapsed" : ""}${gesture === "drag" ? " is-dragging" : ""}${gesture === "resize" ? " is-resizing" : ""}`}
+      className={`session-portal-pip${mode === "term" ? " in-term" : ""}${collapsed ? " is-collapsed" : ""}${isMulti ? " has-multi" : ""}${gesture === "drag" ? " is-dragging" : ""}${gesture === "resize" ? " is-resizing" : ""}`}
       style={posStyle}
       role="region"
       aria-label={`跨端回传浮窗 · ${current.title}`}
       onMouseDown={(e) => {
-        if (!canDirectControl || !(e.target as HTMLElement).closest(".session-portal-pip-preview")) {
+        if (!(e.target as HTMLElement).closest(".session-portal-pip-preview")) {
           e.preventDefault();
         }
       }}
     >
-      {!collapsed
-        ? dirs.map((d) => (
-            <div
-              key={d}
-              className={`pip-resize-handle pip-resize-${d}`}
-              onPointerDown={startResize(d)}
-              aria-hidden
-            />
-          ))
-        : null}
+      {!collapsed && isMulti ? renderStackBar(false) : null}
 
-      <div className="session-portal-pip-head" onPointerDown={startMoveDrag}>
-        <span className="session-portal-pip-ic">{portalIcon(current.kind)}</span>
-        <span className="session-portal-pip-title truncate" title={current.title}>
-          {current.title}
-        </span>
-        <span className="session-portal-pip-badge">{p2pLabel}</span>
-        {items.length > 1 ? (
-          <div className="session-portal-pip-nav">
-            <button
-              type="button"
-              className="session-portal-pip-btn"
-              aria-label="上一个回传项"
-              onClick={() => setIndex((i) => (i - 1 + items.length) % items.length)}
-            >
-              <ChevronLeft size={12} />
-            </button>
-            <span className="num">{Math.min(index, items.length - 1) + 1}/{items.length}</span>
-            <button
-              type="button"
-              className="session-portal-pip-btn"
-              aria-label="下一个回传项"
-              onClick={() => setIndex((i) => (i + 1) % items.length)}
-            >
-              <ChevronRight size={12} />
-            </button>
-          </div>
-        ) : null}
-        {openUrl ? (
-          <button
-            type="button"
-            className="session-portal-pip-btn"
-            title="在内置浏览器标签打开"
-            aria-label="在内置浏览器标签打开"
-            onClick={() => openWebTab(openUrl, current.title, { spaceKey: shellStore.get().selectedSpace })}
-          >
-            <ExternalLink size={12} />
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="session-portal-pip-btn"
-          title={collapsed ? "展开小窗预览" : "收起小窗"}
-          aria-label={collapsed ? "展开小窗预览" : "收起小窗"}
-          onClick={() => setCollapsed((v) => !v)}
-        >
-          {collapsed ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-        </button>
-        {current.canInteract ? (
-          <button
-            type="button"
-            className={`session-portal-pip-btn${directControl ? " is-active" : ""}`}
-            title={directControl ? "小窗直控已开启（点击切换为点击放大）" : "开启小窗直控（直接在悬浮窗内操作）"}
-            aria-label={directControl ? "关闭小窗直控" : "开启小窗直控"}
-            aria-pressed={directControl}
-            onClick={() => setDirectControl((v) => !v)}
-          >
-            <MousePointer size={12} />
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="session-portal-pip-btn"
-          title="放大进入交互操作"
-          aria-label="放大进入交互操作"
-          onClick={() => onExpandPortal(current.id, current.hostId)}
-        >
-          <Maximize2 size={12} />
-        </button>
-        <button
-          type="button"
-          className="session-portal-pip-btn"
-          title="关闭浮窗"
-          aria-label="关闭浮窗"
-          onClick={() => void closePortalSurface(current.hostId, current.id)}
-        >
-          <X size={13} />
-        </button>
-      </div>
-
-      {!collapsed ? (
-        <div
-          ref={previewRef}
-          role={canDirectControl ? "application" : "button"}
-          tabIndex={0}
-          className={`session-portal-pip-preview${canDirectControl ? " is-interactive" : ""}`}
-          onClick={() => {
-            if (!canDirectControl) onExpandPortal(current.id, current.hostId);
-          }}
-          onPointerDown={(e) => {
-            if (!canDirectControl) return;
-            if ((e.target as HTMLElement).closest("button")) return;
-            e.preventDefault();
-            previewRef.current?.focus();
-            e.currentTarget.setPointerCapture?.(e.pointerId);
-            const btn: "left" | "right" | "middle" =
-              e.button === 2 ? "right" : e.button === 1 ? "middle" : "left";
-            pipDragBtnRef.current = btn;
-            pipPendingMoveRef.current = null;
-            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
-            void sendPortalInput(current.hostId, current.id, {
-              type: "pointer",
-              action: "down",
-              nx,
-              ny,
-              button: btn,
-            }).catch(() => {});
-          }}
-          onPointerMove={(e) => {
-            if (!canDirectControl) return;
-            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
-            pipPendingMoveRef.current = {
-              nx,
-              ny,
-              action: pipDragBtnRef.current ? "drag" : "move",
-              button: pipDragBtnRef.current ?? "left",
-            };
-            flushPipMove();
-          }}
-          onPointerUp={(e) => {
-            if (!canDirectControl) return;
-            const btn = pipDragBtnRef.current;
-            if (!btn) return;
-            pipDragBtnRef.current = null;
-            pipPendingMoveRef.current = null;
-            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
-            void sendPortalInput(current.hostId, current.id, {
-              type: "pointer",
-              action: "up",
-              nx,
-              ny,
-              button: btn,
-            }).catch(() => {});
-          }}
-          onContextMenu={(e) => {
-            if (!canDirectControl) return;
-            e.preventDefault();
-            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
-            void sendPortalInput(current.hostId, current.id, {
-              type: "pointer",
-              action: "click",
-              nx,
-              ny,
-              button: "right",
-            }).catch(() => {});
-          }}
-          onWheel={(e) => {
-            if (!canDirectControl) return;
-            e.preventDefault();
-            const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
-            const prev = pipPendingWheelRef.current;
-            if (prev) {
-              prev.nx = nx;
-              prev.ny = ny;
-              prev.deltaX += e.deltaX;
-              prev.deltaY += e.deltaY;
-            } else {
-              pipPendingWheelRef.current = { nx, ny, deltaX: e.deltaX, deltaY: e.deltaY };
-            }
-            flushPipWheel();
-          }}
-          onKeyDown={(e) => {
-            if (canDirectControl) {
-              if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "v") return;
-              e.preventDefault();
-              if (e.key === "Meta" || e.key === "Control" || e.key === "Alt" || e.key === "Shift") return;
-              const mods: string[] = [];
-              if (e.metaKey) mods.push("meta");
-              if (e.ctrlKey) mods.push("ctrl");
-              if (e.altKey) mods.push("alt");
-              if (e.shiftKey) mods.push("shift");
-              if (e.key.length === 1 && mods.length === 0) {
-                void sendPortalInput(current.hostId, current.id, { type: "text", text: e.key }).catch(() => {});
-              } else {
-                void sendPortalInput(current.hostId, current.id, {
-                  type: "key",
-                  key: e.key,
-                  action: "press",
-                  ...(mods.length ? { modifiers: mods } : {}),
-                }).catch(() => {});
-              }
-              return;
-            }
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              onExpandPortal(current.id, current.hostId);
-            }
-          }}
-        >
-          {hasStreamFrame ? (
-            <canvas ref={canvasRef} aria-label={current.title} className="session-portal-pip-img" />
-          ) : activeImg ? (
-            <img
-              src={activeImg.dataUri}
-              alt={current.title}
-              className="session-portal-pip-img"
-              draggable={false}
-            />
-          ) : activeHtml && (activeHtml.memUrl || activeHtml.srcDoc) ? (
-            <div className="session-portal-pip-framewrap">
-              <iframe
-                title={current.title}
-                className="session-portal-pip-iframe"
-                sandbox="allow-scripts"
-                tabIndex={-1}
-                {...(activeHtml.memUrl ? { src: activeHtml.memUrl } : { srcDoc: activeHtml.srcDoc })}
-              />
-            </div>
-          ) : (
-            <div className={`session-portal-pip-card${needsMacScreenPerm ? " is-perm" : ""}`}>
-              <div className="session-portal-pip-kind">
-                {portalIcon(current.kind)}
-                <span>
-                  {current.streamError
-                    ? "画面捕获受限"
-                    : current.kind === "browser"
-                      ? "远程浏览器画面"
-                      : current.kind === "window"
-                        ? "远程桌面窗口"
-                        : current.kind === "reveal"
-                          ? "已定位到远程目录"
-                          : current.kind === "html"
-                            ? "P2P HTML 应用预览"
-                            : "P2P 跨端文件预览"}
-                </span>
-              </div>
-              <div
-                className={`session-portal-pip-sub${current.streamError ? " is-err" : " mono truncate"}`}
-                title={current.streamError || current.subtitle || current.url || current.targetPath || current.title}
+      <div className={`session-portal-deck-stage${backItems.length > 0 ? " has-back" : ""}`}>
+        {backItems
+          .slice()
+          .reverse()
+          .map((backIt, revIdx) => {
+            const depth = backItems.length - revIdx;
+            return (
+              <button
+                key={backIt.id}
+                type="button"
+                className="session-portal-deck-back"
+                data-depth={String(depth)}
+                title={`切换到 ${backIt.title}`}
+                aria-label={`切换到 ${backIt.title}`}
+                onClick={() => {
+                  setSelectedId(backIt.id);
+                  setCollapsed(false);
+                }}
               >
-                {current.streamError || current.highlightName || current.subtitle || current.url || current.targetPath || current.title}
-              </div>
-              {activeText && !current.streamError ? (
-                <pre className="session-portal-pip-text mono">{activeText.text}</pre>
-              ) : null}
-              {needsMacScreenPerm ? (
-                <div className="session-portal-pip-card-act">
-                  <PocketButton
-                    size="sm"
-                    variant="primary"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void native.openPermissionSettings("screenRecording", true);
-                    }}
-                  >
-                    <ExternalLink size={12} />
-                    <span>去授权屏幕录制</span>
-                  </PocketButton>
-                </div>
-              ) : null}
-            </div>
-          )}
-          {needsMacScreenPerm ? null : canDirectControl ? (
-            <button
-              type="button"
-              className="session-portal-pip-expand-chip"
-              onClick={(e) => {
-                e.stopPropagation();
-                onExpandPortal(current.id, current.hostId);
-              }}
-            >
-              放大
-            </button>
-          ) : (
-            <span className="session-portal-pip-overlay">点击放大并交互操作</span>
-          )}
+                <span className="session-portal-deck-back-head">
+                  {portalIcon(backIt.kind)}
+                  <span className="truncate">{backIt.title}</span>
+                </span>
+              </button>
+            );
+          })}
+
+        <div className="session-portal-deck-front">
+          {!collapsed
+            ? dirs.map((d) => (
+                <div
+                  key={d}
+                  className={`pip-resize-handle pip-resize-${d}`}
+                  onPointerDown={startResize(d)}
+                  aria-hidden
+                />
+              ))
+            : null}
+          <PortalMiniCard
+            item={current}
+            contextAgent={agent}
+            visible={visible}
+            collapsed={collapsed}
+            isActive
+            stackCount={items.length}
+            fps={24}
+            maxWidth={960}
+            quality={58}
+            bitmapCacheRef={bitmapCacheRef}
+            onStartHeaderDrag={startMoveDrag}
+            onToggleCollapse={() => setCollapsed((v) => !v)}
+            onExpandPortal={onExpandPortal}
+            onClosePortal={(pid, hid) => void closePortalSurface(hid, pid)}
+          />
         </div>
-      ) : null}
+      </div>
     </div>
   );
 }

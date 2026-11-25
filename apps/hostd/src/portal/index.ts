@@ -1279,13 +1279,12 @@ export class PortalManager {
             const cap = await this.capture.captureWindow(w.id).catch(() => null);
             if (cap) {
               this.syncItemStreamError(existingPortal, undefined);
-              this.pushWindowPortalUpdate(existingPortal, { title: nextTitle, cap });
+              this.pushWindowPortalUpdate(existingPortal, { title: nextTitle, cap }, "updated");
             } else {
               existingPortal.title = nextTitle;
-              existingPortal.updatedAt = Date.now();
-              this.emitEvent(isBrowserApp || recentAgent ? "opened" : "updated", existingPortal);
+              this.emitEvent("updated", existingPortal);
             }
-          } else if ((isAutoBrowser || recentAgent || workingAgents.length > 0 || isBrowserApp) && !this.checkAndMarkAutoDedup(`delta-retitle\0${w.id}`, 2000)) {
+          } else if ((isAutoBrowser || Boolean(recentAgent) || (isBrowserApp && workingAgents.length > 0)) && !this.checkAndMarkAutoDedup(`delta-retitle\0${w.id}`, 2000)) {
             const { item } = await this.openPortal({
               agentKey: inferredAgent?.key,
               kind: "window",
@@ -1314,7 +1313,7 @@ export class PortalManager {
           }
           if (now - meta.openedAt < 1500) continue;
           meta.missCount += 1;
-          if (meta.missCount >= 2) {
+          if (meta.missCount >= 4) {
             this.closePortal(portalId);
           }
         }
@@ -1327,6 +1326,7 @@ export class PortalManager {
   private pushWindowPortalUpdate(
     existing: PortalItem,
     opts: { title?: string; url?: string; cap: { mime: "image/jpeg" | "image/png"; data: string; rawBytes?: Buffer; width: number; height: number } },
+    action: "opened" | "updated" = "opened",
   ): void {
     const now = Date.now();
     if (opts.title) existing.title = opts.title;
@@ -1336,8 +1336,10 @@ export class PortalManager {
     }
     existing.width = opts.cap.width;
     existing.height = opts.cap.height;
-    existing.updatedAt = now;
-    this.emitEvent("opened", existing);
+    if (action === "opened") {
+      existing.updatedAt = now;
+    }
+    this.emitEvent(action, existing);
     const frame: PortalFramePayload = {
       portalId: existing.id,
       seq: ++this.windowSeq,

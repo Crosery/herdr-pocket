@@ -1397,6 +1397,23 @@ test("PortalManager.observeSubmittedCommand and pollWindowDeltas auto-surface fi
     events.some((e) => e.kind === "portal_event" && e.action === "opened" && e.item.windowId === "9002"),
     "expected opened portal_event for retitled window",
   );
+
+  // 5) Subsequent title updates on an already-open portal emit action="updated", never "opened".
+  const evLenBeforeRetitle2 = events.length;
+  mockWindows = mockWindows.map((w) =>
+    w.id === "9002" ? { ...w, title: "http://127.0.0.1:8764/?t=3" } : w,
+  );
+  await mgr.pollWindowDeltas();
+  const postEvents = events.slice(evLenBeforeRetitle2).filter((e) => e.kind === "portal_event" && e.item.windowId === "9002");
+  assert.ok(
+    postEvents.some((e) => e.kind === "portal_event" && e.action === "updated"),
+    "expected already-open retitled window to emit updated",
+  );
+  assert.equal(
+    postEvents.some((e) => e.kind === "portal_event" && e.action === "opened"),
+    false,
+    "expected already-open retitled window NOT to re-emit opened",
+  );
 });
 
 test("OsCaptureDriver routes capture via v2 bridge and avoids 28ms 60fps cache frame drops", async (t) => {
