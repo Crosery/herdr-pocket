@@ -939,7 +939,10 @@ test("PortalManager surfaces streamError cleanly and short-circuits TCC-denied w
   assert.match(browserPortal.streamError ?? "", /未安装 Chrome/);
 });
 
-test("OsCaptureDriver delegates macOS check/list/capture through Herdr Pocket desktop bridge socket and falls back cleanly", async (t) => {
+test(
+  "OsCaptureDriver delegates macOS check/list/capture through Herdr Pocket desktop bridge socket and falls back cleanly",
+  { skip: process.platform === "win32" },
+  async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hp-sock-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const sockPath = join(dir, "desktop-portal.sock");
