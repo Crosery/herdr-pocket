@@ -4,6 +4,7 @@ import type { PortalFramePayload, PortalInputAction, PortalItem } from "@herdr-p
 import {
   computeContainedRect,
   mapZoomedStagePointer,
+  resolvePortalTransport,
   stepTrackpadCursor,
 } from "../lib/portalClient";
 import { PocketButton } from "./PocketUI";
@@ -40,7 +41,7 @@ export function PortalRemoteStage({
   onZoomChange: (next: number) => void;
   latchedMods: string[];
   onConsumeLatchedMods: () => void;
-  onSendInput: (input: PortalInputAction) => void;
+  onSendInput: (input: PortalInputAction) => Promise<unknown> | void;
   onMetricsChange?: (metrics: StageStreamMetrics) => void;
   placeholder: React.ReactNode;
 }) {
@@ -58,7 +59,10 @@ export function PortalRemoteStage({
   const lastMoveSentAtRef = useRef(0);
   const lastMoveCoordRef = useRef<{ nx: number; ny: number } | null>(null);
   const pendingMoveRef = useRef<{ nx: number; ny: number; button: "left" | "right" | "middle"; action: "move" | "drag"; mods: string[] } | null>(null);
+  const moveInFlightRef = useRef(false);
   const moveRafRef = useRef<number | null>(null);
+  const wheelInFlightRef = useRef(false);
+  const pendingWheelRef = useRef<{ nx: number; ny: number; deltaX: number; deltaY: number; mods: string[] } | null>(null);
 
   // Trackpad touch/pointer state
   const pointersRef = useRef<Map<number, { x: number; y: number; downX: number; downY: number; downAt: number }>>(new Map());
@@ -67,9 +71,12 @@ export function PortalRemoteStage({
   const tpDragActiveRef = useRef(false);
   const panDragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
 
-  // Live FPS / bitrate tracker
-  const statBucketRef = useRef<{ winStart: number; frames: number; bytes: number }>({ winStart: Date.now(), frames: 0, bytes: 0 });
+  // Live sliding-window FPS / KB/s tracker
+  const statSamplesRef = useRef<Array<{ at: number; bytes: number }>>([]);
   const lastSeqRef = useRef<number>(-1);
+  const onMetricsChangeRef = useRef(onMetricsChange);
+  onMetricsChangeRef.current = onMetricsChange;
+  const lastEmittedMetricsRef = useRef<StageStreamMetrics>({ fps: -1, kbps: -1 });
 
   const imgW = frame?.width ?? item.width ?? 1280;
   const imgH = frame?.height ?? item.height ?? 800;
@@ -123,8 +130,35 @@ export function PortalRemoteStage({
     drawCurrentFrame();
   }, [drawCurrentFrame]);
 
+  const emitRollingMetrics = useCallback(() => {
+    const now = Date.now();
+    const kept = statSamplesRef.current.filter((s) => now - s.at <= 1000);
+    statSamplesRef.current = kept;
+    const fps = kept.length;
+    const totalBytes = kept.reduce((acc, s) => acc + s.bytes, 0);
+    const kbps = Math.round(totalBytes / 1024);
+    const prev = lastEmittedMetricsRef.current;
+    if (prev.fps !== fps || prev.kbps !== kbps) {
+      lastEmittedMetricsRef.current = { fps, kbps };
+      onMetricsChangeRef.current?.({ fps, kbps });
+    }
+  }, []);
+
   useEffect(() => {
-    if (!frame?.data) {
+    const timer = setInterval(emitRollingMetrics, 500);
+    return () => clearInterval(timer);
+  }, [emitRollingMetrics]);
+
+  useEffect(() => {
+    statSamplesRef.current = [];
+    lastSeqRef.current = -1;
+    emitRollingMetrics();
+  }, [emitRollingMetrics, item.id]);
+
+  useEffect(() => {
+    const hasBinary = Boolean(frame?.rawBytes && frame.rawBytes.byteLength > 0);
+    const hasBase64 = Boolean(frame?.data);
+    if (!frame || (!hasBinary && !hasBase64)) {
       const prev = latestSourceRef.current;
       latestSourceRef.current = null;
       if (prev && "close" in prev && typeof prev.close === "function") prev.close();
@@ -133,17 +167,12 @@ export function PortalRemoteStage({
 
     if (frame.seq !== lastSeqRef.current) {
       lastSeqRef.current = frame.seq;
-      const now = Date.now();
-      const b = statBucketRef.current;
-      b.frames += 1;
-      b.bytes += Math.round((frame.data.length * 3) / 4);
-      const elapsed = now - b.winStart;
-      if (elapsed >= 1000) {
-        const fps = Math.round((b.frames * 1000) / elapsed);
-        const kbps = Math.round((b.bytes * 8) / elapsed);
-        onMetricsChange?.({ fps, kbps });
-        statBucketRef.current = { winStart: now, frames: 0, bytes: 0 };
-      }
+      const frameBytes =
+        frame.byteLength ??
+        frame.rawBytes?.byteLength ??
+        Math.round((frame.data.length * 3) / 4);
+      statSamplesRef.current.push({ at: Date.now(), bytes: frameBytes });
+      emitRollingMetrics();
     }
 
     if (frame.cursorVisible && frame.cursorX !== undefined && frame.cursorY !== undefined && controlMode === "pointer" && !hovering) {
@@ -165,12 +194,17 @@ export function PortalRemoteStage({
       drawCurrentFrame();
     };
 
-    if (typeof createImageBitmap === "function" && typeof atob === "function") {
+    if (typeof createImageBitmap === "function" && (hasBinary || typeof atob === "function")) {
       try {
-        const bin = atob(frame.data);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-        const blob = new Blob([bytes], { type: mime });
+        let blob: Blob;
+        if (hasBinary && frame.rawBytes) {
+          blob = new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime });
+        } else {
+          const bin = atob(frame.data);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+          blob = new Blob([bytes], { type: mime });
+        }
         void createImageBitmap(blob)
           .then(commitSource)
           .catch(() => {});
@@ -183,12 +217,25 @@ export function PortalRemoteStage({
     }
 
     const img = new Image();
-    img.onload = () => commitSource(img);
-    img.src = `data:${mime};base64,${frame.data}`;
+    let revokeUrl: string | null = null;
+    img.onload = () => {
+      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
+      commitSource(img);
+    };
+    img.onerror = () => {
+      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
+    };
+    if (hasBinary && frame.rawBytes) {
+      revokeUrl = URL.createObjectURL(new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime }));
+      img.src = revokeUrl;
+    } else {
+      img.src = `data:${mime};base64,${frame.data}`;
+    }
     return () => {
       cancelled = true;
+      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
     };
-  }, [controlMode, drawCurrentFrame, frame?.cursorVisible, frame?.cursorX, frame?.cursorY, frame?.data, frame?.mime, frame?.seq, hovering, onMetricsChange]);
+  }, [controlMode, drawCurrentFrame, emitRollingMetrics, frame, hovering]);
 
   useEffect(() => {
     return () => {
@@ -213,33 +260,43 @@ export function PortalRemoteStage({
   };
 
   const scheduleMoveFlush = () => {
-    if (moveRafRef.current !== null) return;
+    if (moveRafRef.current !== null || moveInFlightRef.current) return;
     moveRafRef.current = requestAnimationFrame(() => {
       moveRafRef.current = null;
+      if (moveInFlightRef.current) return;
       const pend = pendingMoveRef.current;
       if (!pend) return;
       const now = Date.now();
-      const minInterval = item.transportHint === "p2p" ? 15 : 28;
+      const isDirect = resolvePortalTransport(item.hostId, null, frame).isDirect;
+      const minInterval = isDirect ? 10 : 22;
       if (now - lastMoveSentAtRef.current < minInterval) {
         scheduleMoveFlush();
         return;
       }
       const prev = lastMoveCoordRef.current;
-      if (prev && Math.hypot(pend.nx - prev.nx, pend.ny - prev.ny) < 0.0015 && pend.action === "move") {
+      if (prev && Math.hypot(pend.nx - prev.nx, pend.ny - prev.ny) < 0.0012 && pend.action === "move") {
         pendingMoveRef.current = null;
         return;
       }
       lastMoveSentAtRef.current = now;
       lastMoveCoordRef.current = { nx: pend.nx, ny: pend.ny };
       pendingMoveRef.current = null;
-      onSendInput({
-        type: "pointer",
-        action: pend.action,
-        nx: pend.nx,
-        ny: pend.ny,
-        button: pend.button,
-        ...(pend.mods.length ? { modifiers: pend.mods } : {}),
-      });
+      moveInFlightRef.current = true;
+      void Promise.resolve(
+        onSendInput({
+          type: "pointer",
+          action: pend.action,
+          nx: pend.nx,
+          ny: pend.ny,
+          button: pend.button,
+          ...(pend.mods.length ? { modifiers: pend.mods } : {}),
+        }),
+      )
+        .catch(() => {})
+        .finally(() => {
+          moveInFlightRef.current = false;
+          if (pendingMoveRef.current) scheduleMoveFlush();
+        });
     });
   };
 
@@ -252,6 +309,46 @@ export function PortalRemoteStage({
   ) => {
     pendingMoveRef.current = { nx, ny, action, button, mods };
     scheduleMoveFlush();
+  };
+
+  const flushWheel = () => {
+    if (wheelInFlightRef.current) return;
+    const pend = pendingWheelRef.current;
+    if (!pend || (pend.deltaX === 0 && pend.deltaY === 0)) {
+      pendingWheelRef.current = null;
+      return;
+    }
+    pendingWheelRef.current = null;
+    wheelInFlightRef.current = true;
+    void Promise.resolve(
+      onSendInput({
+        type: "wheel",
+        nx: pend.nx,
+        ny: pend.ny,
+        deltaX: pend.deltaX,
+        deltaY: pend.deltaY,
+        ...(pend.mods.length ? { modifiers: pend.mods } : {}),
+      }),
+    )
+      .catch(() => {})
+      .finally(() => {
+        wheelInFlightRef.current = false;
+        if (pendingWheelRef.current) flushWheel();
+      });
+  };
+
+  const queueWheelInput = (nx: number, ny: number, deltaX: number, deltaY: number, mods: string[]) => {
+    const prev = pendingWheelRef.current;
+    if (prev) {
+      prev.nx = nx;
+      prev.ny = ny;
+      prev.deltaX += deltaX;
+      prev.deltaY += deltaY;
+      prev.mods = mods;
+    } else {
+      pendingWheelRef.current = { nx, ny, deltaX, deltaY, mods };
+    }
+    flushWheel();
   };
 
   const clientToNormalized = (clientX: number, clientY: number) => {
@@ -362,9 +459,10 @@ export function PortalRemoteStage({
         const { nx, ny } = clientToNormalized(e.clientX, e.clientY);
         setCursorNxNy({ nx, ny });
         dragBtnRef.current = btn;
+        pendingMoveRef.current = null;
         const mods = mergeMods(e);
         triggerRipple(nx, ny, btn === "right");
-        onSendInput({
+        void onSendInput({
           type: "pointer",
           action: "down",
           nx,
@@ -405,13 +503,7 @@ export function PortalRemoteStage({
               const sdy = midY - tf.prevMidY;
               if (Math.hypot(sdx, sdy) > 1.5) {
                 tf.moved = true;
-                onSendInput({
-                  type: "wheel",
-                  nx: cursorNxNy.nx,
-                  ny: cursorNxNy.ny,
-                  deltaX: -sdx * 2,
-                  deltaY: -sdy * 2,
-                });
+                queueWheelInput(cursorNxNy.nx, cursorNxNy.ny, -sdx * 2, -sdy * 2, []);
               }
             }
             tf.prevMidX = midX;
@@ -500,9 +592,10 @@ export function PortalRemoteStage({
         const btn = dragBtnRef.current;
         if (!btn) return;
         dragBtnRef.current = null;
+        pendingMoveRef.current = null;
         const { nx, ny } = clientToNormalized(e.clientX, e.clientY);
         const mods = mergeMods(e);
-        onSendInput({
+        void onSendInput({
           type: "pointer",
           action: "up",
           nx,
@@ -534,14 +627,7 @@ export function PortalRemoteStage({
             ? cursorNxNy
             : clientToNormalized(e.clientX, e.clientY);
         const mods = mergeMods(e);
-        onSendInput({
-          type: "wheel",
-          nx: pt.nx,
-          ny: pt.ny,
-          deltaX: e.deltaX,
-          deltaY: e.deltaY,
-          ...(mods.length ? { modifiers: mods } : {}),
-        });
+        queueWheelInput(pt.nx, pt.ny, e.deltaX, e.deltaY, mods);
       }}
       onKeyDown={(e) => {
         if (controlMode === "view" || !item.canInteract) return;

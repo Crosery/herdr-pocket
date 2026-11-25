@@ -236,7 +236,7 @@ export class Relay {
     this.assistant = new Assistant({
       store: this.store,
       llm: this.buildLlm(),
-      model: opts.llm ? "test" : this.eff.targets[0]?.model,
+      model: opts.llm ? "test" : (this.eff.targets[0]?.model ?? this.eff.fallbackTargets?.[0]?.model),
       name: this.eff.name,
       voice: !!this.eff.live?.apiKey,
       confirm: opts.assistantConfirm,
@@ -261,8 +261,9 @@ export class Relay {
   private buildLlm(): Llm | undefined {
     if (this.opts.llm) return this.opts.llm;
     const e = this.eff;
-    return e.targets.length
-      ? makeLlm({ targets: e.targets, firstByteMs: e.firstByteMs, log: (m) => this.events.record({ kind: "model", level: /fail|error|refus/i.test(m) ? "warn" : "info", msg: m }) })
+    const targets = [...e.targets, ...(e.fallbackTargets ?? [])];
+    return targets.length
+      ? makeLlm({ targets, firstByteMs: e.firstByteMs, log: (m) => this.events.record({ kind: "model", level: /fail|error|refus/i.test(m) ? "warn" : "info", msg: m }) })
       : undefined;
   }
 
@@ -270,7 +271,12 @@ export class Relay {
   private reconfigure(what: "config" | "prompts", by: string, change: string): void {
     if (what === "prompts") setPromptEdits(this.config.promptEdits());
     this.eff = this.config.effective();
-    this.assistant.useModels({ llm: this.buildLlm(), model: this.opts.llm ? "test" : this.eff.targets[0]?.model, name: this.eff.name, voice: !!this.eff.live?.apiKey });
+    this.assistant.useModels({
+      llm: this.buildLlm(),
+      model: this.opts.llm ? "test" : (this.eff.targets[0]?.model ?? this.eff.fallbackTargets?.[0]?.model),
+      name: this.eff.name,
+      voice: !!this.eff.live?.apiKey,
+    });
     this.events.record({ kind: "config", level: "info", msg: `${by}: ${change}` });
     this.toViewers({ type: "assistant_config", rev: this.eff.view.rev, by, what });
   }

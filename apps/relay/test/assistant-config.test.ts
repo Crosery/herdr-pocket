@@ -75,6 +75,10 @@ test("a phone adds a provider and reorders models: it is used at once, and its k
     e.targets.map((t) => `${t.provider}:${t.model}`),
     ["deep:deep-chat", "custom:fast-model"],
   );
+  assert.deepEqual(
+    e.fallbackTargets?.map((t) => `${t.provider}:${t.model}`),
+    ["custom:careful-model"],
+  );
   assert.equal(e.targets[0]!.apiKey, PHONE_KEY);
   assert.equal(e.targets[0]!.baseUrl, "https://api.deep.example.com/v1");
   // The server's provider keeps what only the server knows (headers).
@@ -152,6 +156,7 @@ test("a key goes only to the address it was given for: moving the address does n
   assert.match(said, /phone key dropped: new address/);
   e = cfg.effective();
   assert.equal(e.targets.length, 0);
+  assert.equal(e.fallbackTargets, undefined);
   assert.doesNotMatch(JSON.stringify(store.getSetting("assistant.config")), /"key":/);
   store.close();
 });
@@ -350,4 +355,26 @@ test("phones change models and prompts over the API; the next message uses them 
     await relay.close();
     await new Promise<void>((r) => gw.close(() => r()));
   }
+});
+
+test("phone model override preserves healthy server targets as automatic fallbackTargets", () => {
+  const { cfg, store } = makeStore("fallback-server");
+  cfg.apply(
+    {
+      rev: 0,
+      providers: [{ id: "mimo", label: "MiMo", protocol: "openai", baseUrl: "https://mimo.example.com/v1", apiKey: PHONE_KEY }],
+      models: [{ provider: "mimo", model: "mimo-v2.6-flash" }],
+    },
+    "Phone",
+  );
+  const e = cfg.effective();
+  assert.deepEqual(
+    e.targets.map((t) => `${t.provider}:${t.model}`),
+    ["mimo:mimo-v2.6-flash"],
+  );
+  assert.deepEqual(
+    e.fallbackTargets?.map((t) => `${t.provider}:${t.model}`),
+    ["custom:fast-model", "custom:careful-model"],
+  );
+  store.close();
 });

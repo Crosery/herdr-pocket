@@ -4,6 +4,7 @@ import {
   WEBRTC_BIN_CHUNK_BYTES,
   WEBRTC_CHUNK_CHARS,
   WEBRTC_GET_CHANNEL,
+  WEBRTC_PORTAL_CHANNEL,
   WEBRTC_PUT_CHANNEL,
   WEBRTC_RPC_CHANNEL,
   WEBRTC_STUN_URLS,
@@ -155,6 +156,7 @@ interface ActivePeer {
   peerId: string;
   deviceId: string;
   pc: RTCPeerConnection;
+  portalDc: RTCDataChannel | null;
   lastActiveAt: number;
   closed: boolean;
   cleanup: (reason?: string) => void;
@@ -192,7 +194,7 @@ export class WebRtcDirectServer {
 
     const peerId = `rtc-${randomBytes(8).toString("hex")}`;
     const iceServers =
-      this.opts.iceServers ?? ([{ urls: WEBRTC_STUN_URLS[0] }] satisfies Array<{ urls: string }>);
+      this.opts.iceServers ?? (WEBRTC_STUN_URLS.map((urls) => ({ urls })) satisfies Array<{ urls: string }>);
 
     const pc = new RTCPeerConnection({
       iceServers,
@@ -205,6 +207,7 @@ export class WebRtcDirectServer {
       peerId,
       deviceId,
       pc,
+      portalDc: null,
       lastActiveAt: Date.now(),
       closed: false,
       cleanup: () => {},
@@ -264,6 +267,16 @@ export class WebRtcDirectServer {
           }
         }, () => {
           cleanup("rpc channel closed");
+        });
+      } else if (dc.label === WEBRTC_PORTAL_CHANNEL) {
+        active.portalDc = dc;
+        dc.stateChanged.subscribe((state) => {
+          if (state === "closed" || state === "closing") {
+            if (active.portalDc === dc) active.portalDc = null;
+          }
+        });
+        dc.onMessage.subscribe(() => {
+          touch();
         });
       } else if (dc.label === WEBRTC_PUT_CHANNEL) {
         this.attachPutChannel(dc, touch);
@@ -334,10 +347,12 @@ export class WebRtcDirectServer {
   ): void {
     const partials = new Map<string, PartialRpcChunk>();
     const tag = `webrtc${++this.seq}:`;
+    let binSeq = 0;
 
     const peer: DirectPeer = {
       tag,
       deviceId: active.deviceId,
+      transportKind: "webrtc",
       send: (frame) => {
         if (active.closed || dc.readyState !== "open") return;
         const json = JSON.stringify(frame);
@@ -355,6 +370,45 @@ export class WebRtcDirectServer {
           onDone();
         }
       },
+      sendBinary: (bytes) => {
+        if (active.closed) return;
+        const targetDc = active.portalDc && active.portalDc.readyState === "open" ? active.portalDc : dc;
+        if (targetDc.readyState !== "open") return;
+        if (targetDc.bufferedAmount > 220 * 1024) return;
+        try {
+          if (bytes.byteLength <= WEBRTC_BIN_CHUNK_BYTES) {
+            const pkt = Buffer.allocUnsafe(4 + bytes.byteLength);
+            pkt[0] = 0x50;
+            pkt[1] = 0x4b;
+            pkt[2] = 0x42;
+            pkt[3] = 0x31; // "PKB1"
+            Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).copy(pkt, 4);
+            targetDc.send(pkt);
+            return;
+          }
+          const total = Math.ceil(bytes.byteLength / WEBRTC_BIN_CHUNK_BYTES);
+          if (total > 65535) return;
+          const msgSeq = (++binSeq) >>> 0;
+          const src = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          for (let idx = 0; idx < total; idx++) {
+            const start = idx * WEBRTC_BIN_CHUNK_BYTES;
+            const end = Math.min(bytes.byteLength, start + WEBRTC_BIN_CHUNK_BYTES);
+            const sliceLen = end - start;
+            const pkt = Buffer.allocUnsafe(12 + sliceLen);
+            pkt[0] = 0x50;
+            pkt[1] = 0x4b;
+            pkt[2] = 0x43;
+            pkt[3] = 0x31; // "PKC1"
+            pkt.writeUInt32BE(msgSeq, 4);
+            pkt.writeUInt16BE(idx, 8);
+            pkt.writeUInt16BE(total, 10);
+            src.copy(pkt, 12, start, end);
+            targetDc.send(pkt);
+          }
+        } catch {
+          if (targetDc === dc) onDone();
+        }
+      },
       close: () => {
         try {
           dc.close();
@@ -363,7 +417,11 @@ export class WebRtcDirectServer {
         }
         onDone();
       },
-      bufferedBytes: () => (dc.readyState === "open" ? dc.bufferedAmount : 0),
+      bufferedBytes: () =>
+        Math.max(
+          dc.readyState === "open" ? dc.bufferedAmount : 0,
+          active.portalDc && active.portalDc.readyState === "open" ? active.portalDc.bufferedAmount : 0,
+        ),
     };
 
     const emitWelcome = () => {

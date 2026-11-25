@@ -1073,6 +1073,7 @@ final class PortalEngine: @unchecked Sendable {
   private var heldButtons: Set<String> = []
   private var cachedShareable: (at: Date, content: AnyObject)?
   private let ciContext = CIContext(options: [.cacheIntermediates: false])
+  private let srgbSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
   private let capLock = NSLock()
   private var activeTarget: String?
   private var activeCfgKey: String?
@@ -1191,7 +1192,7 @@ final class PortalEngine: @unchecked Sendable {
     cfg.showsCursor = showCursor
     cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(clampedFps))
     cfg.queueDepth = 3
-    cfg.pixelFormat = kCVPixelFormatType_32BGRA
+    cfg.pixelFormat = persistentStream ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_32BGRA
 
     if !persistentStream {
       do {
@@ -1287,8 +1288,12 @@ final class PortalEngine: @unchecked Sendable {
         let w = CVPixelBufferGetWidth(pxBuf)
         let h = CVPixelBufferGetHeight(pxBuf)
         let ci = CIImage(cvImageBuffer: pxBuf)
-        if let cgImg = ciContext.createCGImage(ci, from: CGRect(x: 0, y: 0, width: w, height: h)),
-           let jpeg = encodeJpeg(cgImg, quality: quality) {
+        let clampedQ = max(0.35, min(0.95, quality))
+        let opts: [CIImageRepresentationOption: Any] = [
+          CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): clampedQ
+        ]
+        if let jpeg = ciContext.jpegRepresentation(of: ci, colorSpace: srgbSpace, options: opts)
+            ?? ciContext.createCGImage(ci, from: CGRect(x: 0, y: 0, width: w, height: h)).flatMap({ encodeJpeg($0, quality: clampedQ) }) {
           capLock.lock()
           cachedFrameJpeg = (seq, cacheKey, jpeg, w, h)
           capLock.unlock()
@@ -1562,6 +1567,7 @@ if cliArgs.first == "serve" {
 export type CaptureWindowResult = {
   mime: "image/jpeg" | "image/png";
   data: string;
+  rawBytes?: Buffer;
   width: number;
   height: number;
   bounds?: RemoteWindowInfo["bounds"];
@@ -1947,6 +1953,7 @@ export class OsCaptureDriver {
   private winHelperBin: string | null = null;
   private winHelperTried = false;
   private macScreenRecordingCache: { denied: boolean; accessibility: boolean; at: number } | null = null;
+  private desktopBridgeVersion: number | null = null;
   private jxaTimedOutUntil = 0;
   private windowsCache: { at: number; list: RemoteWindowInfo[] } | null = null;
   private windowsInflight: Promise<RemoteWindowInfo[]> | null = null;
@@ -2167,11 +2174,30 @@ export class OsCaptureDriver {
     timeoutMs: number,
   ): Promise<{ res: CaptureExecResult; viaBridge: boolean } | null> {
     const channel: "capture" | "control" = args[0] === "capture" ? "capture" : "control";
-    const bridged = await this.execViaDesktopBridge(args, timeoutMs, channel);
-    if (bridged && !bridged.stderr.startsWith("helper_missing:") && bridged.stderr !== "disallowed_command") {
-      return { res: bridged, viaBridge: true };
+    if (
+      channel === "capture" &&
+      !this.deps.portalBridgeSocket &&
+      this.desktopBridgeVersion === null &&
+      !this.deps.execBin &&
+      this.pathExists(this.resolvePortalBridgeSocket())
+    ) {
+      await this.refreshMacPerms();
     }
-    if (!helperPath) return null;
+    const useBridgeForChannel =
+      channel !== "capture" || Boolean(this.deps.portalBridgeSocket) || (this.desktopBridgeVersion ?? 0) >= 2;
+    if (useBridgeForChannel) {
+      const bridged = await this.execViaDesktopBridge(args, timeoutMs, channel);
+      if (bridged && !bridged.stderr.startsWith("helper_missing:") && bridged.stderr !== "disallowed_command") {
+        return { res: bridged, viaBridge: true };
+      }
+    }
+    if (!helperPath) {
+      const bridged = await this.execViaDesktopBridge(args, timeoutMs, channel);
+      if (bridged && !bridged.stderr.startsWith("helper_missing:") && bridged.stderr !== "disallowed_command") {
+        return { res: bridged, viaBridge: true };
+      }
+      return null;
+    }
     if (!this.deps.execBin) {
       const served = await (channel === "capture" ? this.macServeCapture : this.macServeControl).request(
         helperPath,
@@ -2179,6 +2205,12 @@ export class OsCaptureDriver {
         timeoutMs,
       );
       if (served) {
+        if (channel === "capture" && served.code === 2 && !useBridgeForChannel) {
+          const bridged = await this.execViaDesktopBridge(args, timeoutMs, channel);
+          if (bridged && !bridged.stderr.startsWith("helper_missing:") && bridged.stderr !== "disallowed_command") {
+            return { res: bridged, viaBridge: true };
+          }
+        }
         return { res: served, viaBridge: false };
       }
     }
@@ -2200,7 +2232,11 @@ export class OsCaptureDriver {
         const parsed = JSON.parse(execOut.res.stdout.toString("utf8")) as {
           screenCapture?: boolean;
           accessibility?: boolean;
+          bridgeVersion?: number;
         };
+        if (execOut.viaBridge) {
+          this.desktopBridgeVersion = typeof parsed.bridgeVersion === "number" ? parsed.bridgeVersion : 1;
+        }
         const denied = parsed.screenCapture === false;
         const accessibility = parsed.accessibility !== false;
         this.macScreenRecordingCache = { denied, accessibility, at: Date.now() };
@@ -2589,9 +2625,10 @@ export class OsCaptureDriver {
     const maxWidth = Math.max(480, Math.min(2560, Math.round(opts?.maxWidth ?? 1600)));
     const quality = Math.max(40, Math.min(92, Math.round(opts?.quality ?? 72)));
     const showCursor = opts?.showCursor ?? true;
-    const fps = Math.max(1, Math.min(60, Math.round(opts?.fps ?? 30)));
+    const explicitFps = opts?.fps;
+    const fps = Math.max(1, Math.min(60, Math.round(explicitFps ?? 30)));
     const cacheKey = `${windowId}:${maxWidth}:${quality}:${showCursor ? 1 : 0}`;
-    const cacheTtlMs = Math.min(28, Math.max(12, Math.floor(800 / Math.max(12, fps))));
+    const cacheTtlMs = explicitFps === undefined ? 45 : fps >= 45 ? 3 : fps >= 25 ? 6 : 16;
 
     const cached = this.lastFrameCache.get(cacheKey);
     if (cached && Date.now() - cached.at < cacheTtlMs) return cached.frame;
@@ -2657,6 +2694,7 @@ export class OsCaptureDriver {
               return {
                 mime: "image/jpeg",
                 data: r.stdout.toString("base64"),
+                rawBytes: r.stdout,
                 width: meta.width,
                 height: meta.height,
                 ...(meta.cursorX !== undefined ? { cursorX: meta.cursorX, cursorY: meta.cursorY, cursorVisible: meta.cursorVisible } : {}),
@@ -2692,10 +2730,16 @@ export class OsCaptureDriver {
             accessibility: this.macScreenRecordingCache?.accessibility ?? true,
             at: Date.now(),
           };
+          await this.exec(
+            "/usr/bin/sips",
+            ["-Z", String(opts.maxWidth), "-s", "format", "jpeg", "-s", "formatOptions", String(opts.quality), tmp],
+            3000,
+          ).catch(() => null);
           const buf = readFileSync(tmp);
           return {
             mime: "image/jpeg",
             data: buf.toString("base64"),
+            rawBytes: buf,
             width: bounds?.width ?? 1280,
             height: bounds?.height ?? 800,
             captureMs: Math.max(1, Date.now() - t0),
@@ -2726,9 +2770,11 @@ export class OsCaptureDriver {
         const b64Idx = txt.indexOf("|b64:");
         if (b64Idx > 0) {
           const meta = parseCaptureMeta(txt.slice(0, b64Idx), bounds?.width ?? 1280, bounds?.height ?? 800);
+          const data = txt.slice(b64Idx + 5).trim();
           return {
             mime: "image/jpeg",
-            data: txt.slice(b64Idx + 5).trim(),
+            data,
+            rawBytes: Buffer.from(data, "base64"),
             width: meta.width,
             height: meta.height,
             ...(meta.cursorX !== undefined ? { cursorX: meta.cursorX, cursorY: meta.cursorY, cursorVisible: meta.cursorVisible } : {}),
@@ -2751,6 +2797,7 @@ export class OsCaptureDriver {
           return {
             mime: "image/jpeg",
             data: buf.toString("base64"),
+            rawBytes: buf,
             width: meta.width,
             height: meta.height,
             ...(meta.cursorX !== undefined ? { cursorX: meta.cursorX, cursorY: meta.cursorY, cursorVisible: meta.cursorVisible } : {}),
@@ -2777,6 +2824,7 @@ export class OsCaptureDriver {
         return {
           mime: "image/jpeg",
           data: r.stdout.toString("base64"),
+          rawBytes: r.stdout,
           width: bounds?.width ?? 1280,
           height: bounds?.height ?? 800,
           captureMs: Math.max(1, Date.now() - t0),
@@ -2966,7 +3014,7 @@ export class OsCaptureDriver {
   }
 
   async injectInput(windowId: string, input: PortalInputAction): Promise<void> {
-    if (input.type === "config" || input.type === "navigate") return;
+    if (input.type === "ack" || input.type === "config" || input.type === "navigate") return;
     if (input.type === "clipboard") {
       await this.handleClipboard(input.action, input.text);
       return;

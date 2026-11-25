@@ -1670,15 +1670,15 @@
 .t3-work-row {
   flex: 1 1 0;
   min-width: 0;
-  min-height: 26px;
-  padding: 2px 6px;
-  border-radius: 6px;
+  min-height: 28px;
+  padding: 3px 6px;
+  border-radius: 8px;
   border: 0;
   background: transparent;
   color: var(--muted);
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   font-size: calc(13px * var(--ts, 1));
   line-height: 1.45;
   text-align: left;
@@ -1687,68 +1687,86 @@
 }
 
 .t3-work-row:hover {
-  background: color-mix(in srgb, var(--ink) 4.5%, transparent);
+  background: color-mix(in srgb, var(--primary) 5%, transparent);
   color: var(--ink);
 }
 
 .t3-work-ic {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   flex: none;
+  border-radius: 6px;
   display: grid;
   place-items: center;
-  color: var(--faint);
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+  color: var(--muted);
+}
+
+.t3-work-ic.thinking {
+  background: color-mix(in srgb, var(--primary) 13%, var(--surface));
+  color: var(--primary);
 }
 
 .t3-work-ic.running {
+  background: color-mix(in srgb, var(--primary) 14%, var(--surface));
   color: var(--primary);
 }
 
 .t3-work-ic.error {
+  background: var(--blush-soft);
   color: var(--blush-text);
 }
 
 .t3-work-ic.read,
 .t3-work-ic.search,
 .t3-work-ic.web {
-  color: #3a77ad;
+  background: #e8f3ff;
+  color: #2f6e9e;
 }
 
 .t3-work-ic.edit {
-  color: #b4572e;
+  background: #ffefe5;
+  color: #b0522a;
 }
 
 .t3-work-ic.run {
+  background: var(--mint-soft, #e5f7ef);
   color: var(--mint-text);
 }
 
 .t3-work-ic.agent {
+  background: color-mix(in srgb, var(--primary) 13%, var(--surface));
   color: var(--accent-text);
 }
 
 :root[data-theme="dark"] .t3-work-ic.read,
 :root[data-theme="dark"] .t3-work-ic.search,
 :root[data-theme="dark"] .t3-work-ic.web {
-  color: #7cb8f0;
+  background: rgba(124, 184, 240, 0.16);
+  color: #8cc4f8;
 }
 
 :root[data-theme="dark"] .t3-work-ic.edit {
-  color: #f09a72;
+  background: rgba(240, 154, 114, 0.16);
+  color: #f3a47e;
+}
+
+:root[data-theme="dark"] .t3-work-ic.run {
+  background: rgba(74, 200, 148, 0.15);
 }
 
 .t3-work-title {
   flex: none;
-  font-weight: 500;
-  color: var(--muted);
+  font-weight: 600;
+  color: var(--ink);
   white-space: nowrap;
 }
 
 .t3-step-name {
   flex: none;
-  font-family: var(--font-mono);
-  font-size: calc(12px * var(--ts, 1));
+  font-size: calc(12.2px * var(--ts, 1));
   font-weight: 600;
-  color: var(--muted);
+  color: var(--ink);
 }
 
 .t3-work-preview,
@@ -1811,18 +1829,18 @@
 }
 
 .t3-work-children {
-  margin: 2px 0 6px 14px;
+  margin: 2px 0 6px 15px;
   padding-left: 11px;
-  border-left: 1.5px solid var(--divider);
+  border-left: 2px solid color-mix(in srgb, var(--primary) 26%, var(--divider));
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
 }
 
 .t3-thought-detail {
-  margin: 2px 0 6px 14px;
+  margin: 2px 0 6px 15px;
   padding: 3px 0 3px 12px;
-  border-left: 1.5px solid var(--divider);
+  border-left: 2px solid color-mix(in srgb, var(--primary) 26%, var(--divider));
   font-size: calc(12.5px * var(--ts, 1));
   line-height: 1.6;
   color: var(--muted);

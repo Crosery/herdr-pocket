@@ -786,7 +786,7 @@ export class HcAdapter extends EventEmitter {
 
   /** Presses the program's stop key and says what happened (hc watches for an effect). */
   async interrupt(address: string): Promise<string> {
-    const out = await run(this.hcBin, ["interrupt", address, "--json", "--timeout", "5"], { timeoutMs: 20_000 });
+    const out = await run(this.hcBin, ["interrupt", address, "--json", "--timeout", "1"], { timeoutMs: 20_000 });
     try {
       const r = JSON.parse(out) as Record<string, unknown>;
       const said = [r.outcome, r.result, r.message, r.status, r.state].find((v) => typeof v === "string" && v);

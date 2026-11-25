@@ -81,25 +81,45 @@ export interface LlmConfig {
 }
 
 const SLOW_MS = 8_000;
+const QUOTA_COOLDOWN_MS = 5 * 60_000;
+const QUOTA_ERROR_RE = /\b429\b|quota exhausted|insufficient_quota|weekly limit|FreeUsageLimitError|rate[ _-]?limit/i;
 
 export class LlmError extends Error {}
 
 export function makeLlm(cfg: LlmConfig): Llm {
+  const cooldownUntil = new Map<string, number>();
   return async (req) => {
-    let last: unknown;
+    const now = Date.now();
+    const active: LlmTarget[] = [];
+    const cooled: LlmTarget[] = [];
     for (const t of cfg.targets) {
+      const k = `${t.provider}\0${t.model}\0${t.baseUrl}`;
+      if ((cooldownUntil.get(k) ?? 0) > now) cooled.push(t);
+      else active.push(t);
+    }
+    const ordered = active.length ? [...active, ...cooled] : cooled;
+    let last: unknown;
+    for (const t of ordered) {
       if (req.signal?.aborted) throw new LlmError("cancelled");
       const t0 = Date.now();
+      const key = `${t.provider}\0${t.model}\0${t.baseUrl}`;
       const label = `${t.provider}:${t.model}`;
       try {
         const r = await once(t, cfg, req);
+        cooldownUntil.delete(key);
         const ms = Date.now() - t0;
         if (ms > SLOW_MS) cfg.log?.(`${label} slow: ${ms}ms`);
         return r;
       } catch (e) {
         last = e;
         if (req.signal?.aborted) throw e;
-        cfg.log?.(`${label} failed after ${Date.now() - t0}ms: ${(e as Error).message.slice(0, 200)}`);
+        const msg = (e as Error).message;
+        if (QUOTA_ERROR_RE.test(msg)) {
+          cooldownUntil.set(key, Date.now() + QUOTA_COOLDOWN_MS);
+          cfg.log?.(`${label} failed (cooldown 5m) after ${Date.now() - t0}ms: ${msg.slice(0, 200)}`);
+        } else {
+          cfg.log?.(`${label} failed after ${Date.now() - t0}ms: ${msg.slice(0, 200)}`);
+        }
       }
     }
     throw last instanceof Error ? last : new LlmError("model unavailable");

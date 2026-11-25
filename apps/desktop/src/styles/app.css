@@ -5715,6 +5715,11 @@ a {
   color: var(--accent-text);
 }
 
+.session-portal-pip-btn.is-active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
 .session-portal-pip-preview {
   display: flex;
   flex-direction: column;
@@ -5729,6 +5734,11 @@ a {
   cursor: pointer;
   text-align: left;
   overflow: hidden;
+}
+
+.session-portal-pip-preview.is-interactive {
+  cursor: default;
+  outline: none;
 }
 
 .session-portal-pip-img {
@@ -5836,6 +5846,27 @@ a {
 }
 
 .session-portal-pip-preview:hover .session-portal-pip-overlay {
+  opacity: 1;
+  transform: translateY(-1px);
+}
+
+.session-portal-pip-expand-chip {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line-pink);
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  color: var(--accent-text);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  opacity: 0.72;
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.session-portal-pip-preview:hover .session-portal-pip-expand-chip {
   opacity: 1;
   transform: translateY(-1px);
 }

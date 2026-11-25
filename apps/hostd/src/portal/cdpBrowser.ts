@@ -153,6 +153,13 @@ class CdpSession {
   private listeners = new Set<(frame: PortalFramePayload) => void>();
   private loadResolvers = new Set<() => void>();
   private postLoadTimer: NodeJS.Timeout | null = null;
+  private captureInflight: Promise<PortalFramePayload | null> | null = null;
+  private screencastMaxW = VIEWPORT_W;
+  private screencastQuality = 74;
+  private moveInFlight = false;
+  private pendingMove: { x: number; y: number; button: string } | null = null;
+  private wheelInFlight = false;
+  private pendingWheel: { x: number; y: number; deltaX: number; deltaY: number } | null = null;
   url: string;
   title: string;
   canGoBack = false;
@@ -238,11 +245,15 @@ class CdpSession {
         const sessionId = Number(msg.params.sessionId ?? 0);
         void this.cdp("Page.screencastFrameAck", { sessionId }).catch(() => {});
         const meta = msg.params.metadata ?? {};
+        const dataStr = String(msg.params.data);
+        const rawBytes = Buffer.from(dataStr, "base64");
         this.emitFrame({
           portalId: this.portalId,
           seq: ++this.seq,
           mime: "image/jpeg",
-          data: String(msg.params.data),
+          data: dataStr,
+          rawBytes,
+          byteLength: rawBytes.byteLength,
           width: Number(meta.deviceWidth ?? VIEWPORT_W),
           height: Number(meta.deviceHeight ?? VIEWPORT_H),
           url: this.url,
@@ -326,33 +337,97 @@ class CdpSession {
     });
   }
 
+  async updateScreencastConfig(opts: { maxWidth?: number; quality?: number }): Promise<void> {
+    if (this.closed) return;
+    const nextQ = Math.min(88, Math.max(38, Math.round(opts.quality ?? this.screencastQuality)));
+    const nextW = Math.min(VIEWPORT_W, Math.max(640, Math.round(opts.maxWidth ?? this.screencastMaxW)));
+    if (nextQ === this.screencastQuality && nextW === this.screencastMaxW) return;
+    this.screencastQuality = nextQ;
+    this.screencastMaxW = nextW;
+    const nextH = Math.max(360, Math.round((nextW * VIEWPORT_H) / VIEWPORT_W));
+    await this.cdp("Page.startScreencast", {
+      format: "jpeg",
+      quality: nextQ,
+      maxWidth: nextW,
+      maxHeight: nextH,
+      everyNthFrame: 1,
+    }).catch(() => {});
+  }
+
   async captureOnce(force = false): Promise<PortalFramePayload | null> {
     if (!force && this.latestFrame && Date.now() - this.latestFrame.at < 250) {
       return this.latestFrame;
     }
-    try {
-      const r = await this.cdp("Page.captureScreenshot", { format: "jpeg", quality: 75 });
-      if (typeof r?.data === "string" && r.data) {
-        const frame: PortalFramePayload = {
-          portalId: this.portalId,
-          seq: ++this.seq,
-          mime: "image/jpeg",
-          data: r.data,
-          width: VIEWPORT_W,
-          height: VIEWPORT_H,
-          url: this.url,
-          title: this.title,
-          canGoBack: this.canGoBack,
-          canGoForward: this.canGoForward,
-          at: Date.now(),
-        };
-        this.emitFrame(frame);
-        return frame;
+    if (this.captureInflight) return this.captureInflight;
+    const run = (async () => {
+      try {
+        const r = await this.cdp("Page.captureScreenshot", { format: "jpeg", quality: this.screencastQuality });
+        if (typeof r?.data === "string" && r.data) {
+          const rawBytes = Buffer.from(r.data, "base64");
+          const frame: PortalFramePayload = {
+            portalId: this.portalId,
+            seq: ++this.seq,
+            mime: "image/jpeg",
+            data: r.data,
+            rawBytes,
+            byteLength: rawBytes.byteLength,
+            width: VIEWPORT_W,
+            height: VIEWPORT_H,
+            url: this.url,
+            title: this.title,
+            canGoBack: this.canGoBack,
+            canGoForward: this.canGoForward,
+            at: Date.now(),
+          };
+          this.emitFrame(frame);
+          return frame;
+        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
-    }
-    return this.latestFrame;
+      return this.latestFrame;
+    })().finally(() => {
+      if (this.captureInflight === run) this.captureInflight = null;
+    });
+    this.captureInflight = run;
+    return run;
+  }
+
+  private flushPendingMove(): void {
+    if (this.closed || this.moveInFlight || !this.pendingMove) return;
+    const next = this.pendingMove;
+    this.pendingMove = null;
+    this.moveInFlight = true;
+    void this.cdp("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: next.x,
+      y: next.y,
+      button: next.button,
+    })
+      .catch(() => {})
+      .finally(() => {
+        this.moveInFlight = false;
+        if (!this.closed && this.pendingMove) this.flushPendingMove();
+      });
+  }
+
+  private flushPendingWheel(): void {
+    if (this.closed || this.wheelInFlight || !this.pendingWheel) return;
+    const next = this.pendingWheel;
+    this.pendingWheel = null;
+    this.wheelInFlight = true;
+    void this.cdp("Input.dispatchMouseEvent", {
+      type: "mouseWheel",
+      x: next.x,
+      y: next.y,
+      deltaX: Math.round(next.deltaX),
+      deltaY: Math.round(next.deltaY),
+    })
+      .catch(() => {})
+      .finally(() => {
+        this.wheelInFlight = false;
+        if (!this.closed && this.pendingWheel) this.flushPendingWheel();
+      });
   }
 
   async dispatchInput(input: PortalInputAction): Promise<{ url?: string; title?: string }> {
@@ -366,13 +441,17 @@ class CdpSession {
     if (input.type === "pointer") {
       const { x, y } = clampXY(input.nx, input.ny);
       const button = input.button ?? "left";
-      if (input.action === "move") {
-        await this.cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
+      if (input.action === "move" || input.action === "drag") {
+        this.pendingMove = { x, y, button: input.action === "drag" ? button : "none" };
+        this.flushPendingMove();
       } else if (input.action === "down") {
+        this.pendingMove = null;
         await this.cdp("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount: 1 });
       } else if (input.action === "up") {
+        this.pendingMove = null;
         await this.cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount: 1 });
       } else {
+        this.pendingMove = null;
         const count = input.action === "dblclick" ? 2 : 1;
         await this.cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
         await this.cdp("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount: count });
@@ -380,13 +459,15 @@ class CdpSession {
       }
     } else if (input.type === "wheel") {
       const { x, y } = clampXY(input.nx, input.ny);
-      await this.cdp("Input.dispatchMouseEvent", {
-        type: "mouseWheel",
-        x,
-        y,
-        deltaX: Math.round(input.deltaX),
-        deltaY: Math.round(input.deltaY),
-      });
+      if (this.pendingWheel) {
+        this.pendingWheel.x = x;
+        this.pendingWheel.y = y;
+        this.pendingWheel.deltaX += input.deltaX;
+        this.pendingWheel.deltaY += input.deltaY;
+      } else {
+        this.pendingWheel = { x, y, deltaX: input.deltaX, deltaY: input.deltaY };
+      }
+      this.flushPendingWheel();
     } else if (input.type === "text") {
       if (input.text) await this.cdp("Input.insertText", { text: input.text });
     } else if (input.type === "key") {

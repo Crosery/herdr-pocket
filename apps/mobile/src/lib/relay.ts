@@ -20,7 +20,7 @@ import { isMockServer, mockLink, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
 import { onLinkBack } from "./assistantConfig";
 import { applog } from "./applog";
-import { DirectError, DirectLink } from "./direct";
+import { DirectError, DirectLink, classifyDirectAddr } from "./direct";
 
 export class RelayError extends Error {
   code: RpcError["code"];
@@ -411,6 +411,22 @@ class SocketLink implements Link {
     for (const d of Object.values(useLive.getState().devices)) if (d.kind === "host" && d.online) this.tryDirect(d.id, now);
   }
 
+  forceDirectNow(to: string) {
+    const existing = this.direct.get(to);
+    if (existing?.open) {
+      existing.pingNow();
+      return;
+    }
+    const t = this.directTry.get(to);
+    if (t && t.next !== Infinity) t.next = 0;
+    this.tryDirect(to, true);
+  }
+
+  directLink(to: string): DirectLink | null {
+    const d = this.direct.get(to);
+    return d?.open ? d : null;
+  }
+
   /**
    * Opens a direct link to a computer when the phone can reach it. Asked through the relay, which checks
    * who the phone is; a phone on another network simply fails to connect and tries again later.
@@ -438,7 +454,7 @@ class SocketLink implements Link {
         t.fails++;
         // A computer from before direct links: do not ask again while the app runs.
         if (e instanceof RelayError && (e.code === "unsupported" || e.code === "forbidden")) t.next = Infinity;
-        else t.next = Date.now() + Math.min(5 * 60_000, 15_000 * 2 ** Math.min(t.fails - 1, 5));
+        else t.next = Date.now() + Math.min(20_000, 3_000 * 2 ** Math.min(t.fails - 1, 5));
       } finally {
         t.busy = false;
       }
@@ -534,6 +550,35 @@ export function subscribe(to: string, stream: StreamKind, params: unknown, onEve
 
 export function getDirectEndpoint(to: string): { addr: string; port: number } | null {
   return current?.directEndpoint?.(to) ?? null;
+}
+
+export function ensureDirectLinkNow(to: string): void {
+  if (!to || !(current instanceof SocketLink)) return;
+  current.forceDirectNow(to);
+}
+
+export function getDirectTransportInfo(to: string): {
+  isDirect: boolean;
+  label: string;
+  addr: string | null;
+  rttMs: number | null;
+} {
+  const link = current instanceof SocketLink ? current.directLink(to) : null;
+  if (link?.open) {
+    const cls = classifyDirectAddr(link.addr);
+    return {
+      isDirect: true,
+      label: cls.label,
+      addr: link.addr,
+      rttMs: link.getRttMs(),
+    };
+  }
+  return {
+    isDirect: false,
+    label: "中继转发",
+    addr: null,
+    rttMs: null,
+  };
 }
 
 export function pingNow() {

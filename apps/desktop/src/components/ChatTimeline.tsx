@@ -185,6 +185,19 @@ export function InlineImageStrip({
   );
 }
 
+function friendlyStepLabel(name: string): string {
+  const n = name.trim().toLowerCase();
+  if (/^(bash|shell|exec|run_command|command|command_status|send_command_input|terminal)$/.test(n)) return "执行命令";
+  if (/^(read|read_file|view_file|view_file_outline|view_code_item|list_dir|files\.read|files\.list|cat)$/.test(n)) return "读取文件";
+  if (/^(write|write_file|create_file)$/.test(n)) return "创建文件";
+  if (/^(edit|edit_file|multiedit|apply_patch|replace_file_content|multi_replace_file_content)$/.test(n)) return "修改代码";
+  if (/^(grep|glob|search|grep_search|find_by_name|ripgrep|rg|find)$/.test(n)) return "搜索代码";
+  if (/^(webfetch|websearch|search_web|read_url_content|fetch)$/.test(n)) return "浏览网页";
+  if (/^(task|agent|invoke_subagent|send_message|spawn_agent|subagent)$/.test(n)) return "子任务";
+  if (/^todo_?write$/.test(n)) return "更新清单";
+  return name;
+}
+
 function CategoryIcon({ cat }: { cat: ToolCategory }) {
   switch (cat) {
     case "read":
@@ -304,8 +317,8 @@ const ThinkingRowItem = memo(function ThinkingRowItem({
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
-        <span className="t3-work-ic">
-          <Brain size={13} />
+        <span className="t3-work-ic thinking">
+          <Brain size={12} />
         </span>
         <span className="t3-work-title">思考过程</span>
         {!open && preview ? <span className="t3-work-preview truncate">{preview}</span> : null}
@@ -463,7 +476,7 @@ const ToolStepItem = memo(function ToolStepItem({
           <span className={`t3-work-ic ${step.category}`}>
             {step.running ? <span className="act-spin" aria-label="运行中" /> : <CategoryIcon cat={step.category} />}
           </span>
-          <span className="t3-step-name">{step.name}</span>
+          <span className="t3-step-name" title={step.name}>{friendlyStepLabel(step.name)}</span>
           {step.summary ? <span className="t3-work-preview mono truncate" title={step.summary}>{step.summary}</span> : <span className="t3-work-preview" />}
           {step.isError ? (
             <span className="act-step-state error" title="执行失败">
@@ -585,10 +598,15 @@ const ActivityGroupItem = memo(function ActivityGroupItem({
   }, [row.tools]);
   const livePreview = row.activeStep
     ? row.activeStep.summary
-      ? `${row.activeStep.name} · ${row.activeStep.summary}`
-      : row.activeStep.name
+      ? `${friendlyStepLabel(row.activeStep.name)} · ${row.activeStep.summary}`
+      : friendlyStepLabel(row.activeStep.name)
     : row.latestThought || (row.thoughts.length ? row.thoughts[row.thoughts.length - 1] : undefined);
-  const compactSeries = row.series.map((s) => (s.count > 1 ? `${s.name} ×${s.count}` : s.name)).join(" · ");
+  const compactSeries = row.series
+    .map((s) => {
+      const lbl = friendlyStepLabel(s.name);
+      return s.count > 1 ? `${lbl} ×${s.count}` : lbl;
+    })
+    .join(" · ");
 
   return (
     <div className={`t3-work-block${row.running ? " running" : row.failedCount > 0 ? " error" : ""}`}>

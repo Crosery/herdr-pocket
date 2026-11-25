@@ -41,7 +41,9 @@ export interface DirectPeer {
   /** Unique per link, so stream ids of two links (or of a link and the relay) never meet. */
   tag: string;
   deviceId: string;
+  transportKind?: "ws" | "webrtc";
   send(frame: object): void;
+  sendBinary?(bytes: Uint8Array): void;
   close(): void;
   bufferedBytes?(): number;
 }
@@ -216,8 +218,12 @@ export class DirectServer {
     const peer: DirectPeer = {
       tag: `direct${++this.seq}:`,
       deviceId,
+      transportKind: "ws",
       send: (frame) => {
         if (ws.readyState === WebSocket.OPEN) ws.send(cipher.seal(JSON.stringify(frame)), { binary: true });
+      },
+      sendBinary: (bytes) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(cipher.sealBytes(bytes), { binary: true });
       },
       close: () => ws.close(),
       bufferedBytes: () => (ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0),

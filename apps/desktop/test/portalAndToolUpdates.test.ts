@@ -5,7 +5,15 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { canActOnLocalFile } from "../src/lib/localFileActions.ts";
 import { parseFileTarget } from "../src/lib/openFileTarget.ts";
+import { toolInputSummary } from "../src/lib/chatFold.ts";
+import { classifyDirectLinkKind } from "../src/lib/direct.ts";
 import { extractPromptCommandFromXterm, feedLocalCommandLineBuffer } from "../src/lib/terminalCommandExtract.ts";
+import {
+  DirectCipher,
+  decodeBinaryPortalStreamFrame,
+  encodeBinaryPortalStreamFrame,
+  jsChaCha20Poly1305,
+} from "@herdr-pocket/protocol";
 import {
   buildPortalP2pUrl,
   dismissPortalInUi,
@@ -16,8 +24,15 @@ import {
   mapZoomedStagePointer,
   portalStore,
   resetPortalClientStateForTest,
+  resolvePortalTransport,
   stepTrackpadCursor,
 } from "../src/lib/portalClient.ts";
+import {
+  builtinSlashCommands,
+  extractSlashQuery,
+  matchSlashCommands,
+  parseLeadingSlashToken,
+} from "../src/lib/slashCommands.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -142,6 +157,7 @@ test("new Batch 2 UI/docs files contain zero emojis", () => {
     "apps/mobile/src/components/chat.tsx",
     "docs/releases/v0.2.25.md",
     "docs/releases/v0.2.42.md",
+    "docs/releases/v0.2.43.md",
   ];
   for (const rel of files) {
     const full = join(ROOT, rel);
@@ -225,7 +241,7 @@ test("SessionPortalPiP surfaces same-machine and remote portals immediately, pre
   const pipSrc = readFileSync(join(ROOT, "apps/desktop/src/components/SessionPortalPiP.tsx"), "utf8");
   const agentsSrc = readFileSync(join(ROOT, "apps/desktop/src/views/AgentsView.tsx"), "utf8");
   const cssSrc = readFileSync(join(ROOT, "apps/desktop/src/styles/app.css"), "utf8");
-  assert.match(pipSrc, /onMouseDown=\{\(e\)\s*=>\s*\{\s*e\.preventDefault\(\);/);
+  assert.match(pipSrc, /onMouseDown=\{\(e\)\s*=>\s*\{[\s\S]*e\.preventDefault\(\);/);
   assert.match(pipSrc, /mode\s*===\s*"term"\s*\?\s*" in-term"\s*:\s*""/);
   assert.match(agentsSrc, /<SessionPortalPiP[\s\S]*mode=\{activeMode\}/);
   assert.match(cssSrc, /\.session-portal-pip\.in-term\s*\{[\s\S]*top:\s*14px;/);
@@ -420,4 +436,141 @@ test("t3code Chat UI structural contract: unboxed centered layout, no bulky bott
   // AgentsView has 1 pre-existing ✓ at chat-shell-empty; ensure zero other emojis exist.
   const NON_CHECKMARK_EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{2712}\u{2715}-\u{27BF}]/u;
   assert.equal(NON_CHECKMARK_EMOJI_RE.exec(agentsView), null, "unexpected emoji in AgentsView.tsx");
+});
+
+test("v0.2.43 speed & step UI contracts: instant local Cmd+T/Cmd+D, 60 FPS presets, clean JSON step summaries, and mobile Stop button", () => {
+  // 1) toolInputSummary cleanly unwraps complete and streaming partial JSON strings
+  assert.equal(toolInputSummary('{"CommandLine":"pnpm test --filter hostd"}'), "pnpm test --filter hostd");
+  assert.equal(toolInputSummary('{"CommandLine":"mkdir -p apps/web/src'), "mkdir -p apps/web/src");
+  assert.equal(toolInputSummary({ Path: "/tmp/repo/docs/README.md" }), "docs/README.md");
+
+  // 2) DesktopShell skips Relay herdr.command and launches local shells directly on Cmd+T and Cmd+D
+  const desktopShell = readFileSync(join(ROOT, "apps/desktop/src/shell/DesktopShell.tsx"), "utf8");
+  assert.ok(desktopShell.includes("!isLocalDesktop &&\n          splitTarget"), "canUseHerdrPaneSplit must skip local desktop");
+  assert.ok(desktopShell.includes("if (isLocalDesktop) {\n        if (await tryLocalShellCreate()) return;\n      }"));
+
+  // 3) PortalViewerModal and MobilePortalModal expose 60 FPS presets cleanly
+  const viewerModal = readFileSync(join(ROOT, "apps/desktop/src/components/PortalViewerModal.tsx"), "utf8");
+  assert.ok(viewerModal.includes('label: "流畅 · 60帧", fps: 60'));
+  assert.ok(viewerModal.includes('label: "超清 · 60帧", fps: 60'));
+
+  // 4) Mobile chat unifies step rows and detail composer wires Stop interrupt button
+  const mobileChat = readFileSync(join(ROOT, "apps/mobile/src/components/chat.tsx"), "utf8");
+  const mobileDetail = readFileSync(join(ROOT, "apps/mobile/src/components/detail.tsx"), "utf8");
+  assert.ok(mobileChat.includes("friendlyToolMeta"), "mobile chat should map friendly pastel tool tiles");
+  assert.ok(mobileChat.includes("MOBILE_PARTIAL_JSON_KEY_RE"), "mobile chat should unwrap raw JSON CommandLine strings");
+  assert.ok(mobileDetail.includes('call(agent.deviceId, "terminal.interrupt"'), "mobile composer should wire circular Stop interrupt");
+});
+
+test("v0.2.43 binary P2P portal transport, DirectCipher rawBytes, honest transport resolution, and heartbeat store", () => {
+  resetPortalClientStateForTest();
+
+  // 1) Binary PKF1 packet roundtrip
+  const rawImg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+  const pkt = encodeBinaryPortalStreamFrame(
+    "s-bin-1",
+    {
+      portalId: "ptl-bin",
+      seq: 7,
+      mime: "image/jpeg",
+      width: 1280,
+      height: 800,
+      url: "https://example.com",
+      title: "Example",
+      at: 123456,
+    },
+    rawImg,
+  );
+  const decoded = decodeBinaryPortalStreamFrame(pkt);
+  assert.ok(decoded, "expected PKF1 binary packet to decode");
+  assert.equal(decoded.id, "s-bin-1");
+  assert.equal(decoded.meta.portalId, "ptl-bin");
+  assert.equal(decoded.meta.seq, 7);
+  assert.deepEqual([...decoded.bytes], [...rawImg]);
+
+  // 2) DirectCipher.sealBytes / openBytes mixed with JSON text frames
+  const key = new Uint8Array(32).fill(0x5a);
+  const hostCipher = new DirectCipher(jsChaCha20Poly1305, key, 1); // DIRECT_FROM_HOST
+  const viewerCipher = new DirectCipher(jsChaCha20Poly1305, key, 2); // DIRECT_FROM_PHONE
+  const sealedText = hostCipher.seal(JSON.stringify({ type: "pong", t: 100 }));
+  assert.equal(viewerCipher.open(sealedText), JSON.stringify({ type: "pong", t: 100 }));
+  const sealedBin = hostCipher.sealBytes(pkt);
+  const openedBin = viewerCipher.openBytes(sealedBin);
+  assert.ok(openedBin, "expected DirectCipher.openBytes to decrypt raw binary packet");
+  assert.deepEqual([...openedBin], [...pkt]);
+
+  // 3) Address classification and honest resolvePortalTransport (never trusts static transportHint)
+  assert.equal(classifyDirectLinkKind("127.0.0.1", "ws"), "local");
+  assert.equal(classifyDirectLinkKind("100.64.12.34", "ws"), "vpn-p2p");
+  assert.equal(classifyDirectLinkKind("fd7a:115c:a1e0::1", "ws"), "vpn-p2p");
+  assert.equal(classifyDirectLinkKind("192.168.1.25", "ws"), "lan-p2p");
+  assert.equal(classifyDirectLinkKind("192.168.1.25", "webrtc"), "webrtc-p2p");
+
+  const relayResolved = resolvePortalTransport("remote-host", "local-host", null);
+  assert.equal(relayResolved.isDirect, false);
+  assert.equal(relayResolved.kind, "relay");
+  assert.equal(relayResolved.label, "中继转发");
+
+  // 4) portal_heartbeat and binary portal_frame ingestion + closed cleanup
+  const item = {
+    id: "ptl-hb",
+    hostId: "remote-host",
+    agentKey: "remote-host/hc:s1",
+    kind: "browser" as const,
+    title: "Example",
+    canInteract: true,
+    transportHint: "p2p" as const,
+    createdAt: 1000,
+    updatedAt: 1000,
+  };
+  ingestPortalStreamEvent({ kind: "portal_event", action: "opened", item, at: 1000 }, "remote-host");
+  ingestPortalStreamEvent(
+    {
+      kind: "portal_frame",
+      portalId: "ptl-hb",
+      seq: 1,
+      mime: "image/jpeg",
+      data: "",
+      rawBytes: rawImg,
+      width: 1280,
+      height: 800,
+      at: 1010,
+    },
+    "remote-host",
+  );
+  const storedFrame = portalStore.get().framesById["ptl-hb"];
+  assert.ok(storedFrame?.rawBytes);
+  assert.equal(storedFrame?.byteLength, rawImg.byteLength);
+  assert.equal(storedFrame?.transport, "relay");
+
+  ingestPortalStreamEvent({ kind: "portal_heartbeat", portalId: "ptl-hb", fps: 60, idle: true, at: 1850 }, "remote-host");
+  assert.equal(portalStore.get().heartbeatsById["ptl-hb"]?.idle, true);
+  assert.equal(portalStore.get().heartbeatsById["ptl-hb"]?.fps, 60);
+
+  ingestPortalStreamEvent({ kind: "portal_event", action: "closed", item, at: 2000 }, "remote-host");
+  assert.equal(portalStore.get().heartbeatsById["ptl-hb"], undefined);
+  resetPortalClientStateForTest();
+});
+
+test("slash commands support leading backslash trigger, canonical parsing, and synced CLI panels", () => {
+  assert.equal(extractSlashQuery("\\"), "");
+  assert.equal(extractSlashQuery("\\sw"), "sw");
+  assert.equal(extractSlashQuery("  \\think"), "think");
+  assert.equal(extractSlashQuery("\\swarm board"), null);
+
+  const agy = builtinSlashCommands("antigravity");
+  const claude = builtinSlashCommands("claude-code");
+  assert.ok(agy.some((c) => c.name === "/swarm"));
+  assert.ok(agy.some((c) => c.name === "/thinking"));
+  assert.ok(claude.some((c) => c.name === "/swarm"));
+  assert.ok(claude.some((c) => c.name === "/tasks"));
+  assert.ok(claude.some((c) => c.name === "/thinking"));
+
+  const matched = matchSlashCommands(agy, "\\swarm");
+  assert.equal(matched[0]?.name, "/swarm");
+
+  const parsed = parseLeadingSlashToken("\\btw check status", agy);
+  assert.ok(parsed);
+  assert.equal(parsed.rawToken, "/btw");
+  assert.equal(parsed.rest, "check status");
 });

@@ -764,6 +764,11 @@ class SocketClient {
   }
 
   forceDirectNow(to: string): void {
+    const existing = this.direct.get(to);
+    if (existing?.open) {
+      existing.pingNow();
+      return;
+    }
     const t = this.directTry.get(to);
     if (t && t.next !== Infinity) t.next = 0;
     this.tryDirect(to, true);

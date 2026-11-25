@@ -155,9 +155,6 @@ function measureTerminalGrid(splitDirection?: SplitDirection): {
   };
 }
 
-// Cache transient Herdr.app GUI unavailability so local splits don't pay RPC timeouts repeatedly.
-let herdrAppSplitSkipUntil = 0;
-
 /**
  * Desktop shell v3 (R36): Herdr's window skeleton with our colours and words.
  * sidebar 268 (rail 44) | tabs 42 / body (padding 8, gap 8: pane + panel 368) / status 28.
@@ -401,19 +398,19 @@ export function DesktopShell({
         });
       };
 
-      // Path 1: When splitting an existing synced Herdr pane, delegate directly to Herdr.app (`pane.split`)
-      // so both local Mac and remote Mac split inside the exact tab in Herdr.app instead of creating a new tab.
+      // Path 1: For remote hosts, splitting an existing synced Herdr pane delegates to `herdr.command pane.split`.
+      // On this local Mac, spawn directly via `localTermCreateShell` (<10ms) and push layout via `localHerdrDocSet`.
       const isLocalDesktop = isTauri() && native.available() && Boolean(localHostId && hostId === localHostId);
       const canUseHerdrPaneSplit = Boolean(
-        splitTarget &&
+        !isLocalDesktop &&
+          splitTarget &&
           targetTab &&
           targetLeaf &&
           targetLeaf.content.kind === "agent" &&
           activeAgent?.source === "hc" &&
           activeAgent.deviceId === hostId &&
           !targetLeaf.id.startsWith("p0:") &&
-          !targetLeaf.id.startsWith("p-") &&
-          !(isLocalDesktop && Date.now() < herdrAppSplitSkipUntil),
+          !targetLeaf.id.startsWith("p-"),
       );
       if (canUseHerdrPaneSplit && splitTarget && targetTab && targetLeaf) {
         try {
@@ -424,7 +421,7 @@ export function DesktopShell({
               command: "pane.split",
               args: { pane: targetLeaf.id, direction: splitTarget.direction },
             },
-            isLocalDesktop ? 900 : 10_000,
+            10_000,
           );
           const payload = (cmdRes?.result ?? {}) as { terminal?: unknown; pane?: unknown };
           const rawTerm = typeof payload.terminal === "string" ? payload.terminal.trim() : "";
@@ -438,21 +435,14 @@ export function DesktopShell({
             return;
           }
         } catch {
-          if (isLocalDesktop) herdrAppSplitSkipUntil = Date.now() + 15_000;
           // Herdr.app window may be closed on that computer; fall through cleanly to direct hc/agent.create below.
         }
       }
       const tryLocalShellCreate = async (): Promise<boolean> => {
         if (!isLocalDesktop) return false;
         try {
-          let resolvedFolder = folder;
-          let spaceId = matchedKnownSpace?.id;
-          if ((!resolvedFolder || !spaceId) && spaceName) {
-            const spRes = await rpcCall(hostId, "spaces.list", {}, 1_500).catch(() => null);
-            const spMatch = spRes?.spaces.find((sp) => sp.name === spaceName);
-            resolvedFolder = resolvedFolder || spMatch?.folder;
-            spaceId = spaceId || spMatch?.id;
-          }
+          const resolvedFolder = folder;
+          const spaceId = matchedKnownSpace?.id;
           const localDocTabId =
             !splitTarget && spaceId
               ? `tb${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
@@ -479,21 +469,20 @@ export function DesktopShell({
           if (!splitTarget && spaceId) {
             void flushHostNow(hostId);
           }
-          refreshHostSpaces(hostId);
+          window.setTimeout(() => refreshHostSpaces(hostId), 600);
           return true;
         } catch {
           return false;
         }
       };
 
-      // When splitting locally while Herdr.app is closed (or standalone), or when there are no Herdr spaces yet,
-      // spawn directly via local `hc` and preserve the split placement in HerdrDoc.
-      if (isLocalDesktop && (splitTarget || hostSpacesList.length === 0)) {
+      // Always create local shells & splits directly via local `hc` channel0 without relay round-trips.
+      if (isLocalDesktop) {
         if (await tryLocalShellCreate()) return;
       }
 
       try {
-        const spRes = await rpcCall(hostId, "spaces.list", {}, 6_000).catch(() => null);
+        const spRes = !matchedKnownSpace?.id ? await rpcCall(hostId, "spaces.list", {}, 6_000).catch(() => null) : null;
         const spacesForMatch = spRes?.spaces?.length ? spRes.spaces : hostSpacesList;
         const matchedSpace = spaceName
           ? spacesForMatch.find((sp) => sp.name === spaceName)

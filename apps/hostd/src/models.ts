@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import {
   OMP_MODEL_ROLES,
@@ -590,7 +590,7 @@ async function getPiCatalog(): Promise<AgentModelOption[]> {
       });
       return parsePiModelsText(stdout);
     },
-    { backgroundIfColdMs: 600 },
+    { backgroundIfColdMs: 250 },
   );
   return piList.length ? piList : getOmpCatalog();
 }
@@ -608,7 +608,7 @@ async function getAgyCatalog(): Promise<AgentModelOption[]> {
       });
       return parseAgyModelsText(stdout);
     },
-    { backgroundIfColdMs: 600 },
+    { backgroundIfColdMs: 250 },
   );
 }
 
@@ -625,7 +625,7 @@ async function getOpencodeCatalog(): Promise<AgentModelOption[]> {
       });
       return parseOpencodeModelsText(stdout);
     },
-    { backgroundIfColdMs: 600 },
+    { backgroundIfColdMs: 250 },
   );
 }
 
@@ -872,6 +872,12 @@ export async function readOmpLocalConfig(homeDir = homedir()): Promise<{
 }
 
 /** Reads only non-secret model ID and default thinking-level strings from local harness settings files. */
+const LOCAL_CONFIGURED_CACHE_MS = 15_000;
+const localConfiguredCache = new Map<
+  string,
+  { at: number; value: { models: AgentModelOption[]; thinkingByHarness: Record<string, string> } }
+>();
+
 export function readLocalConfiguredModels(homeDir = homedir()): AgentModelOption[] {
   return readLocalConfiguredDetails(homeDir).models;
 }
@@ -880,6 +886,11 @@ function readLocalConfiguredDetails(homeDir = homedir()): {
   models: AgentModelOption[];
   thinkingByHarness: Record<string, string>;
 } {
+  const cacheKey = resolve(homeDir);
+  const cached = localConfiguredCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < LOCAL_CONFIGURED_CACHE_MS) {
+    return cached.value;
+  }
   const out: AgentModelOption[] = [];
   const thinkingByHarness: Record<string, string> = {};
 
@@ -1007,7 +1018,9 @@ function readLocalConfiguredDetails(homeDir = homedir()): {
     }
   }
 
-  return { models: out, thinkingByHarness };
+  const value = { models: out, thinkingByHarness };
+  localConfiguredCache.set(cacheKey, { at: Date.now(), value });
+  return value;
 }
 
 const FALLBACK_PRESETS: Record<string, AgentModelOption[]> = {
@@ -1050,6 +1063,7 @@ export function clearModelsCacheForTest(): void {
   cliCatalogCache.clear();
   cliCatalogInflight.clear();
   cliCatalogFailUntil.clear();
+  localConfiguredCache.clear();
   brainDirCache = null;
   ompRefreshInflight = null;
 }

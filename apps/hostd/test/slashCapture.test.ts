@@ -121,6 +121,13 @@ test("sendAndCaptureSlashCommand captures TUI viewer panels and auto-dismisses w
   assert.equal(classifySlashCommand("codex", "/status"), "viewer");
   assert.equal(classifySlashCommand("claude-code", "/config"), "interactive");
   assert.equal(classifySlashCommand("claude-code", "explain this file"), "normal");
+  assert.equal(classifySlashCommand("antigravity", "/swarm"), "viewer");
+  assert.equal(classifySlashCommand("antigravity", "/swarm board"), "viewer");
+  assert.equal(classifySlashCommand("antigravity", "/swarm add worker"), "normal");
+  assert.equal(classifySlashCommand("claude-code", "/bashes"), "viewer");
+  assert.equal(classifySlashCommand("codex", "/ps"), "viewer");
+  assert.equal(classifySlashCommand("antigravity", "/reasoning"), "interactive");
+  assert.equal(classifySlashCommand("claude-code", "/sandbox"), "interactive");
 
   const keysSent: string[][] = [];
   let screen = "❯ ";

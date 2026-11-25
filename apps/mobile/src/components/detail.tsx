@@ -54,7 +54,7 @@ import { TERM_BG, TERM_FG } from "../lib/ansi";
 import { TermScreen, type ScreenView, type ShownRow } from "../lib/termscreen";
 import { harnessLook } from "../lib/harness";
 import { parseChoices, type Choice } from "../lib/choices";
-import { builtinSlashCommands, extractSlashQuery, matchSlashCommands, mergeSlashCommands, slashCommandIconKind, type SlashIconKind } from "../lib/slashCommands";
+import { BUILTIN_SLASH, builtinSlashCommands, extractSlashQuery, matchSlashCommands, mergeSlashCommands, slashCommandIconKind, type SlashIconKind } from "../lib/slashCommands";
 
 function mobileSlashGlyph(kind: SlashIconKind): keyof typeof MaterialCommunityIcons.glyphMap {
   switch (kind) {
@@ -884,6 +884,14 @@ export function Composer({
   const showInput = mode === "chat" || (extra && boxOnly);
   /** A key press or "让它继续" on its way (messages go out on their own, see lib/outbox). */
   const [sending, setSending] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const stopAgent = useCallback(() => {
+    if (stopping) return;
+    setStopping(true);
+    void call(agent.deviceId, "terminal.interrupt", { agent: agent.key })
+      .catch(() => undefined)
+      .finally(() => setStopping(false));
+  }, [agent.deviceId, agent.key, stopping]);
   /** This phone's messages that wait in the agent's input box: their bubbles say "排队中" already. */
   const mineWaiting = usePending((s) => (s.byAgent[agent.key] ?? []).filter((x) => x.state === "queued" && x.waiting && !x.echo).length);
   useEffect(() => {
@@ -1117,12 +1125,14 @@ export function Composer({
     staleTime: 30_000,
     retry: false,
   });
+  const allSlashCommands = useMemo(() => {
+    const builtins = builtinSlashCommands(agent.harness, agent.isShell);
+    return mergeSlashCommands(builtins, cmdQ.data?.commands ?? []);
+  }, [agent.harness, agent.isShell, cmdQ.data?.commands]);
   const slashMatches = useMemo(() => {
     if (slashQuery === null) return [];
-    const builtins = builtinSlashCommands(agent.harness, agent.isShell);
-    const merged = mergeSlashCommands(builtins, cmdQ.data?.commands ?? []);
-    return matchSlashCommands(merged, slashQuery);
-  }, [agent.harness, agent.isShell, cmdQ.data?.commands, slashQuery]);
+    return matchSlashCommands(allSlashCommands, slashQuery);
+  }, [allSlashCommands, slashQuery]);
 
   useEffect(() => {
     if (!online) return;
@@ -1563,9 +1573,22 @@ export function Composer({
   }, [agent.key, agent.deviceId, agent.title, agent.name, agent.harness, agent.status]);
 
   function send() {
-    const t = text.trim();
+    let t = text.trim();
     const pics = mode === "chat" ? pictures : [];
     if (!t && !pics.length) return;
+    if (mode === "chat" && !agent.isShell && t.startsWith("\\")) {
+      const head = t.slice(1).split(/\s+/)[0] ?? "";
+      if (head) {
+        const slashHead = `/${head}`.toLowerCase();
+        const matchesKnown =
+          allSlashCommands.some((item) => item.name.toLowerCase() === slashHead) ||
+          BUILTIN_SLASH.some((item) => item.name.toLowerCase() === slashHead) ||
+          /^\/(?:btw|usage|model|models|switch|effort|thinking|reasoning)$/i.test(slashHead);
+        if (matchesKnown) {
+          t = `/${t.slice(1)}`;
+        }
+      }
+    }
     const btwMatch = mode === "chat" && !pics.length ? /^\/btw(?:\s+([\s\S]*))?$/i.exec(t) : null;
     if (btwMatch) {
       const question = (btwMatch[1] ?? "").trim();
@@ -1595,7 +1618,7 @@ export function Composer({
       openModelPicker("model", "session");
       return;
     }
-    if (mode === "chat" && !pics.length && /^\/(?:effort|thinking)$/i.test(t) && effectiveThinkingLevels.length > 0) {
+    if (mode === "chat" && !pics.length && /^\/(?:effort|thinking|reasoning)$/i.test(t) && effectiveThinkingLevels.length > 0) {
       setText("");
       openModelPicker("thinking");
       return;
@@ -2402,7 +2425,7 @@ export function Composer({
                       openModelPicker("model", "session");
                       return;
                     }
-                    if (/^\/(?:effort|thinking)$/i.test(cmd.name) && effectiveThinkingLevels.length > 0) {
+                    if (/^\/(?:effort|thinking|reasoning)$/i.test(cmd.name) && effectiveThinkingLevels.length > 0) {
                       setText("");
                       openModelPicker("thinking");
                       return;
@@ -3085,25 +3108,66 @@ export function Composer({
                 </>
               ) : null}
             </View>
-            <View style={{ flexShrink: 0 }}>
-              <SendPill
-                width={metrics.sendWidth}
-                height={metrics.actionHeight}
-                disabled={
-                  !online ||
-                  (isBtwDraft
-                    ? !/^\/btw\s+\S/i.test(text.trim())
-                    : !text.trim() && !pictures.length)
-                }
-                onPress={send}
-                a11y={
-                  isBtwDraft
-                    ? "发送旁路提问（不打断主线）"
-                    : agent.status === "working"
-                      ? "发送（运行中将自动排队）"
-                      : "发送"
-                }
-              />
+            <View style={{ flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }}>
+              {online && agent.status === "working" && !text.trim() && !pictures.length ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="中断当前运行"
+                  disabled={stopping}
+                  onPress={stopAgent}
+                  style={({ pressed }) => ({
+                    width: metrics.actionHeight,
+                    height: metrics.actionHeight,
+                    borderRadius: Math.round(metrics.actionHeight / 2),
+                    alignItems: "center",
+                    justifyContent: "center",
+                    backgroundColor: pressed ? p.primaryPressed : p.primary,
+                    opacity: stopping ? 0.55 : 1,
+                  })}
+                >
+                  <View style={{ width: 11, height: 11, borderRadius: 2.5, backgroundColor: p.onPrimary }} />
+                </Pressable>
+              ) : (
+                <>
+                  {online && agent.status === "working" ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel="中断当前运行"
+                      disabled={stopping}
+                      onPress={stopAgent}
+                      style={({ pressed }) => ({
+                        width: Math.max(30, metrics.actionHeight - 4),
+                        height: Math.max(30, metrics.actionHeight - 4),
+                        borderRadius: Math.round(Math.max(30, metrics.actionHeight - 4) / 2),
+                        alignItems: "center",
+                        justifyContent: "center",
+                        backgroundColor: pressed ? p.surface3 : p.accentContainer,
+                        opacity: stopping ? 0.55 : 1,
+                      })}
+                    >
+                      <View style={{ width: 9, height: 9, borderRadius: 2, backgroundColor: p.accentText }} />
+                    </Pressable>
+                  ) : null}
+                  <SendPill
+                    width={metrics.sendWidth}
+                    height={metrics.actionHeight}
+                    disabled={
+                      !online ||
+                      (isBtwDraft
+                        ? !/^\/btw\s+\S/i.test(text.trim())
+                        : !text.trim() && !pictures.length)
+                    }
+                    onPress={send}
+                    a11y={
+                      isBtwDraft
+                        ? "发送旁路提问（不打断主线）"
+                        : agent.status === "working"
+                          ? "发送（运行中将自动排队）"
+                          : "发送"
+                    }
+                  />
+                </>
+              )}
             </View>
           </View>
         ) : (

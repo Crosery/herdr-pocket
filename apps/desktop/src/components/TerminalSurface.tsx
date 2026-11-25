@@ -56,6 +56,7 @@ import {
   ensureLocalHostDeviceId,
   ensureTerminalFontLoaded,
   fontCatalogStore,
+  getLoadedFontFaceEpoch,
   localHostIdStore,
   useLocalHostDeviceId,
   useTerminalFontCatalog,
@@ -92,6 +93,12 @@ import {
   markWebglSlotInactive,
   releaseWebglSlot,
 } from "../lib/terminalWebglPool";
+import {
+  clearTerminalTextureAtlasSafe,
+  patchWebglAddonInstance,
+  refreshWarmWebglAddon,
+  unregisterWebglAddonInstance,
+} from "../lib/terminalWebglPatch";
 import { ingestPortalStreamEvent } from "../lib/portalClient";
 import { isDirectConnected, rpcCall, subscribeStream } from "../lib/relay";
 import { uploadRemoteFile } from "../lib/uploadLargeFile";
@@ -1357,7 +1364,7 @@ export function TerminalSurface({
           entry.el.style.color = activeSpec.fg;
         }
       }
-      term.clearTextureAtlas?.();
+      clearTerminalTextureAtlasSafe(term, webglRef.current);
       term.refresh(0, Math.max(0, term.rows - 1));
       syncResize(term);
       requestAnimationFrame(paintOverlays);
@@ -1473,6 +1480,7 @@ export function TerminalSurface({
       const addon = webglRef.current;
       if (!addon) return;
       webglRef.current = null;
+      unregisterWebglAddonInstance(addon);
       try {
         addon.dispose();
       } catch {
@@ -1516,6 +1524,7 @@ export function TerminalSurface({
           if (webglRef.current === addon) detachWebgl();
         });
         term.loadAddon(addon);
+        patchWebglAddonInstance(addon);
         webglRef.current = addon;
         wakeTerminalRendererImmediate(term);
         if (wasAtBottomRef.current) snapTerminalViewportImmediate(term, true, 0);
@@ -1534,19 +1543,17 @@ export function TerminalSurface({
       if (alive) attachWebgl();
     });
 
-    // Ensure OS / Herdr / Nerd fonts load asynchronously right after opening without flashing an already-ready atlas.
-    const fontWeightSpec = termCfg.fontWeight >= 600 ? 600 : 400;
-    const wasFontReady =
-      typeof document !== "undefined" &&
-      Boolean(document.fonts?.check?.(`${fontWeightSpec} ${termCfg.fontSize}px ${fontFamily}`));
+    // Only clear and rebuild the shared texture atlas when new FontFace bytes were actually registered or CSS font signature changed.
+    const fontEpochBefore = getLoadedFontFaceEpoch();
     void ensureFontCatalog().then(() => ensureTerminalFontLoaded(termCfg.fontFamily, termCfg.fontWeight >= 600)).then((loaded) => {
       if (loaded && alive && termRef.current === term) {
         const nextFamily = buildTerminalFontFamily(termCfg.fontFamily, fontCatalogStore.get());
         const nextSig = visualSig(nextFamily);
-        if (!wasFontReady || appliedVisualSigRef.current !== nextSig) {
+        const didRegisterNewFaces = getLoadedFontFaceEpoch() !== fontEpochBefore;
+        if (didRegisterNewFaces || appliedVisualSigRef.current !== nextSig) {
           appliedVisualSigRef.current = nextSig;
           term.options.fontFamily = nextFamily;
-          term.clearTextureAtlas?.();
+          clearTerminalTextureAtlasSafe(term, webglRef.current);
           term.refresh(0, Math.max(0, term.rows - 1));
           syncResize(term);
           requestAnimationFrame(paintOverlays);
@@ -3891,6 +3898,7 @@ export function TerminalSurface({
     pendingViewportSyncRef.current = true;
     onActivatedAttachRef.current?.();
     attachWebglRef.current?.();
+    if (webglRef.current) refreshWarmWebglAddon(webglRef.current);
     const term = termRef.current;
     const stickToBottom = wasAtBottomRef.current;
     const savedOffset = savedOffsetFromBottomRef.current;

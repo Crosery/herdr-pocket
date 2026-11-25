@@ -306,3 +306,34 @@ test("MiMo disables thinking on connectivity pings, enables reasoning_effort=low
   assert.deepEqual(synthReq.thinking, { type: "disabled" });
   assert.equal(reasoningTicks, 0);
 });
+
+test("makeLlm falls back on HTTP 429 quota exhausted and skips cooled-down targets on subsequent turns", async () => {
+  seen.length = 0;
+  handler = (path, _body, res) => {
+    if (path.startsWith("/mimo/")) {
+      res
+        .writeHead(429, { "content-type": "application/json" })
+        .end(JSON.stringify({ error: { code: "429", message: "quota exhausted", type: "limitation" } }));
+      return;
+    }
+    stream(res, [{ choices: [{ delta: { content: "备用可用" }, finish_reason: "stop" }] }]);
+  };
+  const mimo: LlmTarget = { provider: "mimo", protocol: "openai", baseUrl: `${base}/mimo/v1`, apiKey: "k-mimo", model: "mimo-v2.6-flash" };
+  const backup: LlmTarget = { provider: "custom", protocol: "openai", baseUrl: `${base}/backup/v1`, apiKey: "k-backup", model: "gpt-6.2-sol-fast" };
+  const logs: string[] = [];
+  const llm = makeLlm({ targets: [mimo, backup], log: (m) => logs.push(m) });
+
+  const r1 = await llm({ system: "s", messages: [{ role: "user", content: "第1次" }], tools: [] });
+  assert.deepEqual(r1.content, [{ type: "text", text: "备用可用" }]);
+  assert.deepEqual(seen.map((s) => s.path), ["/mimo/v1/chat/completions", "/backup/v1/chat/completions"]);
+  assert.ok(logs.some((l) => l.includes("cooldown 5m")));
+
+  const r2 = await llm({ system: "s", messages: [{ role: "user", content: "第2次" }], tools: [] });
+  assert.deepEqual(r2.content, [{ type: "text", text: "备用可用" }]);
+  // While MiMo is in cooldown, turn 2 goes straight to backup without hammering MiMo again.
+  assert.deepEqual(seen.map((s) => s.path), [
+    "/mimo/v1/chat/completions",
+    "/backup/v1/chat/completions",
+    "/backup/v1/chat/completions",
+  ]);
+});

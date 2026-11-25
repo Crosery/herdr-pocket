@@ -44,6 +44,20 @@ const PING_EVERY_MS = 25_000;
 const PONG_WAIT_MS = 20_000;
 const MISSED_PONG_LIMIT = 2;
 
+export function classifyDirectAddr(addr: string): { kind: "local" | "lan-p2p" | "vpn-p2p"; label: string } {
+  const host = addr.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "127.0.0.1" || host === "::1" || host === "localhost") {
+    return { kind: "local", label: "本机直连" };
+  }
+  const m = /^100\.(\d+)\.\d+\.\d+$/.exec(host);
+  if (m) {
+    const oct2 = Number(m[1]);
+    if (oct2 >= 64 && oct2 <= 127) return { kind: "vpn-p2p", label: "Tailscale P2P" };
+  }
+  if (host.startsWith("fd7a:115c:a1e0:")) return { kind: "vpn-p2p", label: "Tailscale P2P" };
+  return { kind: "lan-p2p", label: "局域网 P2P" };
+}
+
 export class DirectError extends Error {
   code: RpcError["code"];
   constructor(code: RpcError["code"], message: string, readonly uncertain = false) {
@@ -72,8 +86,11 @@ export class DirectLink {
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private seq = 0;
   private pingTimer: ReturnType<typeof setInterval>;
+  private initPingTimer: ReturnType<typeof setTimeout> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRxAt = Date.now();
+  private lastPingSentAt = 0;
+  private rttMs: number | null = null;
   private missedPongs = 0;
   private closed = false;
 
@@ -98,6 +115,18 @@ export class DirectLink {
     ws.onclose = () => this.close();
     ws.onerror = () => this.close();
     this.pingTimer = setInterval(() => this.ping(), PING_EVERY_MS);
+    this.initPingTimer = setTimeout(() => {
+      this.initPingTimer = null;
+      this.ping();
+    }, 60);
+  }
+
+  getRttMs(): number | null {
+    return this.rttMs;
+  }
+
+  pingNow(): void {
+    this.ping();
   }
 
   /**
@@ -184,7 +213,10 @@ export class DirectLink {
       if (f.error) p.reject(new DirectError(f.error.code, f.error.message));
       else p.resolve(f.result);
     } else if (f.type === "pong") {
-      // Pong wait already cleared above.
+      const echoedT = typeof f.t === "number" ? f.t : this.lastPingSentAt;
+      if (echoedT > 0) {
+        this.rttMs = Math.max(1, Math.min(9999, Date.now() - echoedT));
+      }
     } else if (f.type === "stream_open" || f.type === "stream_event") this.handlers.onStream(f);
   }
 
@@ -197,7 +229,9 @@ export class DirectLink {
   }
 
   ping() {
-    if (!this.send({ type: "ping", t: Date.now() }) || this.pongTimer) return;
+    const now = Date.now();
+    this.lastPingSentAt = now;
+    if (!this.send({ type: "ping", t: now }) || this.pongTimer) return;
     this.pongTimer = setTimeout(() => {
       this.pongTimer = null;
       if (this.closed) return;
@@ -242,6 +276,10 @@ export class DirectLink {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.pingTimer);
+    if (this.initPingTimer) {
+      clearTimeout(this.initPingTimer);
+      this.initPingTimer = null;
+    }
     if (this.pongTimer) clearTimeout(this.pongTimer);
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);

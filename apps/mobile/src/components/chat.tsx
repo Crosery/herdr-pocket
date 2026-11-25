@@ -329,50 +329,105 @@ export function prettyMaybeJson(v: unknown): string {
   return v;
 }
 
-/** One-line human summary of a tool input. */
+const MOBILE_PARTIAL_JSON_KEY_RE =
+  /"(?:CommandLine|command|cmd|script|Path|file_path|TargetFile|DirectoryPath|path|Pattern|pattern|Query|query|Url|url|toolSummary|description|Summary|Prompt|prompt|Recipient)"\s*:\s*"((?:\\.|[^"])*)/i;
+
+function cleanStepOneLine(raw: string): string {
+  return raw.replace(/\\"/g, '"').replace(/\\n/g, " ").replace(/\\\\/g, "\\").replace(/\s+/g, " ").trim();
+}
+
+/** One-line human summary of a tool input (also unwraps JSON string payloads and streaming partials). */
 export function toolSummary(input: unknown): string {
   if (input == null) return "";
-  if (typeof input === "string") return input;
+  if (typeof input === "string") {
+    const t = input.trim();
+    if (!t) return "";
+    if (t.startsWith("{") || t.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(t) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return toolSummary(parsed);
+        }
+      } catch {
+        const m = MOBILE_PARTIAL_JSON_KEY_RE.exec(t);
+        if (m?.[1]) {
+          const s = cleanStepOneLine(m[1]).replace(/^["']+/, "");
+          return s.length > 120 ? `${s.slice(0, 117)}…` : s;
+        }
+      }
+    }
+    const clean = cleanStepOneLine(t);
+    return clean.length > 120 ? `${clean.slice(0, 117)}…` : clean;
+  }
   if (typeof input !== "object") return String(input);
   const o = input as Record<string, unknown>;
-  for (const k of ["command", "cmd", "file_path", "pattern", "path", "query", "url", "description", "prompt"]) {
+  for (const k of [
+    "CommandLine",
+    "command",
+    "cmd",
+    "script",
+    "Path",
+    "file_path",
+    "TargetFile",
+    "DirectoryPath",
+    "path",
+    "Pattern",
+    "pattern",
+    "Query",
+    "query",
+    "Url",
+    "url",
+    "toolSummary",
+    "description",
+    "Summary",
+    "Prompt",
+    "prompt",
+    "Recipient",
+  ]) {
     const v = o[k];
-    if (typeof v === "string" && v.trim()) return v.trim();
+    if (typeof v === "string" && v.trim()) {
+      const clean = cleanStepOneLine(v);
+      return clean.length > 120 ? `${clean.slice(0, 117)}…` : clean;
+    }
   }
   const s = JSON.stringify(o);
-  return s.length > 160 ? `${s.slice(0, 157)}…` : s;
+  return s === "{}" ? "" : s.length > 140 ? `${s.slice(0, 137)}…` : s;
 }
 
-const TOOL_ICONS: Record<string, "console-line" | "file-edit-outline" | "file-document-outline" | "magnify" | "web" | "robot-outline" | "wrench-outline"> = {
-  bash: "console-line",
-  shell: "console-line",
-  exec: "console-line",
-  edit: "file-edit-outline",
-  write: "file-edit-outline",
-  multiedit: "file-edit-outline",
-  apply_patch: "file-edit-outline",
-  read: "file-document-outline",
-  grep: "magnify",
-  glob: "magnify",
-  search: "magnify",
-  webfetch: "web",
-  websearch: "web",
-  task: "robot-outline",
-  agent: "robot-outline",
-};
-
-function toolIcon(name: string) {
-  return TOOL_ICONS[name.toLowerCase()] ?? "wrench-outline";
+function friendlyToolMeta(
+  name: string,
+  p: Palette,
+): { label: string; icon: "console-line" | "file-edit-outline" | "file-document-outline" | "magnify" | "web" | "robot-outline" | "format-list-checks" | "wrench-outline"; bg: string; fg: string } {
+  const n = name.trim().toLowerCase();
+  if (/^(bash|shell|exec|run_command|command|command_status|send_command_input|terminal)$/.test(n)) {
+    const c = statusColors("working", p.dark);
+    return { label: "执行命令", icon: "console-line", bg: c.bg, fg: c.fg };
+  }
+  if (/^(read|read_file|view_file|view_file_outline|view_code_item|list_dir|files\.read|files\.list|cat)$/.test(n)) {
+    return { label: "读取文件", icon: "file-document-outline", bg: p.dark ? "#22394D" : "#E5F3FF", fg: p.dark ? "#9CD0FA" : "#2D6A9E" };
+  }
+  if (/^(write|write_file|create_file)$/.test(n)) {
+    return { label: "创建文件", icon: "file-edit-outline", bg: p.dark ? "#473026" : "#FFEADF", fg: p.dark ? "#FFB88F" : "#B0522A" };
+  }
+  if (/^(edit|edit_file|multiedit|apply_patch|replace_file_content|multi_replace_file_content)$/.test(n)) {
+    return { label: "修改代码", icon: "file-edit-outline", bg: p.dark ? "#473026" : "#FFEADF", fg: p.dark ? "#FFB88F" : "#B0522A" };
+  }
+  if (/^(grep|glob|search|grep_search|find_by_name|ripgrep|rg|find)$/.test(n)) {
+    return { label: "搜索代码", icon: "magnify", bg: p.dark ? "#22394D" : "#E5F3FF", fg: p.dark ? "#9CD0FA" : "#2D6A9E" };
+  }
+  if (/^(webfetch|websearch|search_web|read_url_content|fetch)$/.test(n)) {
+    return { label: "浏览网页", icon: "web", bg: p.dark ? "#22394D" : "#E5F3FF", fg: p.dark ? "#9CD0FA" : "#2D6A9E" };
+  }
+  if (/^(task|agent|invoke_subagent|send_message|spawn_agent|subagent)$/.test(n)) {
+    return { label: "子任务", icon: "robot-outline", bg: p.dark ? "#3B2433" : "#FFEAF2", fg: p.primary };
+  }
+  if (/^todo_?write$/.test(n)) {
+    return { label: "更新清单", icon: "format-list-checks", bg: p.lavenderContainer, fg: p.dusk };
+  }
+  return { label: name, icon: "wrench-outline", bg: p.lavenderContainer, fg: p.dusk };
 }
 
-/** Each kind of tool gets its own pastel tile: commands mint, edits peach, reading and search sky, helpers lavender. */
-function toolTint(name: string, p: Palette): { bg: string; fg: string } {
-  const icon = toolIcon(name);
-  if (icon === "console-line") return statusColors("working", p.dark);
-  if (icon === "file-edit-outline") return p.dark ? { bg: "#4A3328", fg: "#FFB98F" } : { bg: "#FFE6D8", fg: "#B4572E" };
-  if (icon === "file-document-outline" || icon === "magnify" || icon === "web") return p.dark ? { bg: "#243F55", fg: "#9FD0F5" } : { bg: "#DDEFFC", fg: "#2F6E9E" };
-  return { bg: p.lavenderContainer, fg: p.dusk };
-}
+// Step icon & tint styling is provided uniformly by `friendlyToolMeta`.
 
 // ---------------------------------------------------------------------------
 // Rows
@@ -546,26 +601,54 @@ function ThinkingPill({ text, defaultOpen }: { text: string; defaultOpen?: boole
   useEffect(() => {
     setOpen(Boolean(defaultOpen));
   }, [defaultOpen]);
+  const preview = useMemo(() => text.trim().split("\n").map((l) => l.trim()).find(Boolean) ?? "", [text]);
+  const guideColor = p.dark ? "rgba(255,143,179,0.28)" : "#F7C8DC";
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={open ? "收起思考过程" : "展开思考过程"}
-      onPress={() => setOpen((v) => !v)}
-      style={{ alignSelf: "stretch", paddingHorizontal: 4, paddingVertical: 5, justifyContent: "center" }}
-    >
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 7 }}>
-        <MaterialCommunityIcons name="brain" size={14} color={p.faint} />
-        <Text numberOfLines={1} style={{ flexShrink: 1, color: p.muted, fontFamily: fonts.bodySemi, fontSize: 13 }}>
-          {open ? "思考过程" : text.trim().split("\n")[0]}
-        </Text>
-        <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-right"} size={15} color={p.faint} />
-      </View>
+    <View style={{ alignSelf: "stretch", paddingRight: 14 }}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={open ? "收起思考过程" : "展开思考过程"}
+        onPress={() => setOpen((v) => !v)}
+        style={({ pressed }) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 7,
+          minHeight: 30,
+          paddingHorizontal: 4,
+          paddingVertical: 3,
+          borderRadius: 9,
+          backgroundColor: pressed ? p.surface2 : "transparent",
+        })}
+      >
+        <View
+          style={{
+            width: 22,
+            height: 22,
+            borderRadius: 7,
+            backgroundColor: p.dark ? "#3B2433" : "#FFEAF2",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <MaterialCommunityIcons name="brain" size={13} color={p.primary} />
+        </View>
+        <Text style={{ fontFamily: fonts.bodySemi, fontSize: 12.5, color: p.muted, flexShrink: 0 }}>思考</Text>
+        {!open && preview ? (
+          <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: p.faint }}>
+            {preview}
+          </Text>
+        ) : (
+          <View style={{ flex: 1 }} />
+        )}
+        <MaterialCommunityIcons name={open ? "chevron-down" : "chevron-right"} size={14} color={p.faint} />
+      </Pressable>
       {open ? (
-        <View style={{ marginLeft: 10, paddingLeft: 10, marginTop: 4, borderLeftWidth: 1.5, borderLeftColor: p.divider }}>
-          <Text selectable style={{ color: p.muted, fontSize: 13, lineHeight: 19 }}>{text}</Text>
+        <View style={{ marginLeft: 14, paddingLeft: 11, marginTop: 3, marginBottom: 4, borderLeftWidth: 2, borderLeftColor: guideColor }}>
+          <Text selectable style={{ color: p.muted, fontSize: 12.5, lineHeight: 18.5 }}>{text}</Text>
         </View>
       ) : null}
-    </Pressable>
+    </View>
   );
 }
 
@@ -592,54 +675,89 @@ function ToolCard({ call: c, result, bare }: { call: ToolCall; result?: ToolResu
   const [open, setOpen] = useState(false);
   const failed = result?.is_error;
   const pending = !result;
-  const tint = failed ? p.error : p.muted;
+  const meta = friendlyToolMeta(c.name, p);
   const summary = toolSummary(c.input);
   const input = useMemo(() => (open ? prettyMaybeJson(c.input) : ""), [open, c.input]);
   const output = useMemo(() => (open ? prettyMaybeJson(result?.output ?? "") : ""), [open, result?.output]);
   const state = failed ? "失败" : pending ? "进行中" : "完成";
   const subs = useContext(SubCtx);
   const child = subs?.byCall.get(c.call_id);
+  const guideColor = p.dark ? "rgba(255,143,179,0.28)" : "#F7C8DC";
   return (
     <View
-      style={
-        bare
-          ? { backgroundColor: failed ? p.errorContainer : open ? p.surface2 : "transparent", borderRadius: radius.sm }
-          : { backgroundColor: failed ? p.errorContainer : p.surface2, borderRadius: radius.md, borderWidth: 1, borderColor: failed ? p.error : p.dark ? p.surface3 : "#F6E6EF" }
-      }
+      style={{
+        alignSelf: "stretch",
+        paddingRight: bare ? 0 : 14,
+        backgroundColor: failed ? p.errorContainer : "transparent",
+        borderRadius: 9,
+      }}
     >
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded: open }}
-        accessibilityLabel={`工具 ${c.name}，${state}，${open ? "点按收起" : "点按查看输入和输出"}`}
+        accessibilityLabel={`工具 ${meta.label}，${state}，${open ? "点按收起" : "点按查看输入和输出"}`}
         onPress={() => setOpen((v) => !v)}
-        style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingHorizontal: bare ? space.sm : space.md, minHeight: bare ? 38 : 44 }}
+        style={({ pressed }) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 7,
+          paddingHorizontal: 4,
+          paddingVertical: 3,
+          minHeight: 30,
+          borderRadius: 9,
+          backgroundColor: pressed ? p.surface2 : "transparent",
+        })}
       >
-        <View style={{ width: 28, height: 28, borderRadius: 10, backgroundColor: failed ? p.errorContainer : toolTint(c.name, p).bg, alignItems: "center", justifyContent: "center" }}>
-          <MaterialCommunityIcons name={toolIcon(c.name)} size={16} color={failed ? tint : toolTint(c.name, p).fg} />
+        <View
+          style={{
+            width: 22,
+            height: 22,
+            borderRadius: 7,
+            backgroundColor: failed ? p.errorContainer : meta.bg,
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <MaterialCommunityIcons name={meta.icon} size={13} color={failed ? p.error : meta.fg} />
         </View>
-        <Text style={{ fontFamily: fonts.bodyBold, color: p.ink, fontSize: 13.5 }}>{c.name}</Text>
-        <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.mono, fontSize: 12, color: p.faint }}>
+        <Text style={{ fontFamily: fonts.bodySemi, color: failed ? p.error : p.ink, fontSize: 12.5, flexShrink: 0 }}>
+          {meta.label}
+        </Text>
+        <Text numberOfLines={1} style={{ flex: 1, fontFamily: fonts.mono, fontSize: 11.5, color: p.faint }}>
           {summary}
         </Text>
         {pending ? (
           <PocketSpinner size={12} />
+        ) : failed ? (
+          <MaterialCommunityIcons name="alert-circle" size={14} color={p.error} />
         ) : (
-          failed ? <MaterialCommunityIcons name="alert-circle" size={16} color={p.error} /> : <CuteIcon name="done" size={16} color={statusColors("working", p.dark).fg} fill={p.dark ? "transparent" : statusColors("working", p.dark).bg} strokeWidth={2.4} />
+          <CuteIcon
+            name="done"
+            size={13}
+            color={statusColors("working", p.dark).fg}
+            fill={p.dark ? "transparent" : statusColors("working", p.dark).bg}
+            strokeWidth={2.4}
+          />
         )}
-        <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-down"} size={16} color={p.faint} />
+        <MaterialCommunityIcons name={open ? "chevron-down" : "chevron-right"} size={14} color={p.faint} />
       </Pressable>
       {child && subs ? <SubLink s={child} onPress={() => subs.open(child)} /> : null}
       {open ? (
-        <View style={{ paddingHorizontal: space.md, paddingBottom: space.md, gap: space.sm }}>
+        <View style={{ marginLeft: 14, paddingLeft: 11, marginTop: 3, marginBottom: 4, borderLeftWidth: 2, borderLeftColor: guideColor, gap: space.sm }}>
           {input ? <ToolSection title="输入" body={input} /> : null}
-          {result ? <ToolSection title={failed ? "输出（出错）" : "输出"} body={output || "（没有输出）"} error={failed} /> : <Text style={{ color: p.faint, fontSize: 12 }}>还在运行，结果出来后会显示在这里</Text>}
+          {result ? (
+            <ToolSection title={failed ? "输出（出错）" : "输出"} body={output || "（没有输出）"} error={failed} />
+          ) : (
+            <Text style={{ color: p.faint, fontSize: 12 }}>还在运行，结果出来后会显示在这里</Text>
+          )}
         </View>
       ) : null}
     </View>
   );
 }
 
-/** A run of tool calls on one line; tap to list them, tap one to see its input and output. */
+/** A run of tool calls on one compact borderless step line matching Desktop t3code × Pocket style. */
 function ToolGroup({
   items: tools,
   thoughts,
@@ -664,47 +782,77 @@ function ToolGroup({
   const failed = tools.filter((t) => t.result?.is_error).length;
   const running = tools.filter((t) => !t.result);
   const counts = new Map<string, number>();
-  for (const t of tools) counts.set(t.call.name, (counts.get(t.call.name) ?? 0) + 1);
+  for (const t of tools) {
+    const lbl = friendlyToolMeta(t.call.name, p).label;
+    counts.set(lbl, (counts.get(lbl) ?? 0) + 1);
+  }
   const names = [...counts].map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(" · ");
   const current = running[running.length - 1];
   const children = tools.map((t) => subs?.byCall.get(t.call.call_id)).filter((s): s is SubSession => !!s);
   const thoughtText = latestThought || (thoughts?.length ? thoughts[thoughts.length - 1] : undefined);
+  const guideColor = p.dark ? "rgba(255,143,179,0.28)" : "#F7C8DC";
+  const currentMeta = current ? friendlyToolMeta(current.call.name, p) : null;
+  const currentSummary = current ? toolSummary(current.call.input) : "";
   return (
-    <View style={{ backgroundColor: open ? p.surface2 : "transparent", borderRadius: radius.sm }}>
+    <View style={{ alignSelf: "stretch", paddingRight: 14 }}>
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded: open }}
         accessibilityLabel={`${tools.length ? `用了 ${tools.length} 个工具` : `思考与记录（${entries?.length ?? thoughts?.length ?? 0}）`}${failed ? `，${failed} 个失败` : ""}${running.length ? "，还在运行" : ""}，${open ? "点按收起" : "点按展开"}`}
         onPress={() => setOpen((v) => !v)}
-        style={{ flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 4, minHeight: 30 }}
+        style={({ pressed }) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 7,
+          paddingHorizontal: 4,
+          paddingVertical: 3,
+          minHeight: 30,
+          borderRadius: 9,
+          backgroundColor: pressed ? p.surface2 : "transparent",
+        })}
       >
-        <MaterialCommunityIcons
-          name={failed ? "alert-circle-outline" : "wrench-outline"}
-          size={14}
-          color={failed ? p.error : running.length ? p.primary : p.faint}
-        />
-        <Text style={{ fontFamily: fonts.bodySemi, color: p.muted, fontSize: 13 }}>
-          {tools.length ? (thoughts?.length ? `${tools.length} 个工具 · ${thoughts.length} 段思考` : `${tools.length} 个工具`) : `思考与分析（${thoughts?.length ?? 0}）`}
+        <View
+          style={{
+            width: 22,
+            height: 22,
+            borderRadius: 7,
+            backgroundColor: failed ? p.errorContainer : running.length ? (p.dark ? "#3B2433" : "#FFEAF2") : p.lavenderContainer,
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          {running.length ? (
+            <PocketSpinner size={12} color={p.primary} />
+          ) : (
+            <MaterialCommunityIcons
+              name={failed ? "alert-circle-outline" : "wrench-outline"}
+              size={13}
+              color={failed ? p.error : p.dusk}
+            />
+          )}
+        </View>
+        <Text style={{ fontFamily: fonts.bodySemi, color: failed ? p.error : p.ink, fontSize: 12.5, flexShrink: 0 }}>
+          {tools.length ? (running.length ? `执行中 · ${tools.length} 步` : `${tools.length} 个步骤`) : `思考与分析（${thoughts?.length ?? 0}）`}
         </Text>
         <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: p.faint }}>
           {names}
         </Text>
-        {failed ? <Text style={{ color: p.error, fontFamily: fonts.bodyBold, fontSize: 12 }}>{failed} 个失败</Text> : null}
-        {running.length ? <PocketSpinner size={12} /> : null}
-        <MaterialCommunityIcons name={open ? "chevron-up" : "chevron-right"} size={15} color={p.faint} />
+        {failed ? <Text style={{ color: p.error, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>{failed} 失败</Text> : null}
+        <MaterialCommunityIcons name={open ? "chevron-down" : "chevron-right"} size={14} color={p.faint} />
       </Pressable>
-      {!open && current ? (
-        <Text numberOfLines={1} style={{ paddingHorizontal: space.md, paddingBottom: space.sm, fontFamily: fonts.mono, fontSize: 11.5, color: p.muted }}>
-          正在运行 {current.call.name} {toolSummary(current.call.input)}
+      {!open && current && currentMeta ? (
+        <Text numberOfLines={1} style={{ paddingLeft: 33, paddingBottom: 3, fontFamily: fonts.mono, fontSize: 11.5, color: p.muted }}>
+          {currentMeta.label}{currentSummary ? ` · ${currentSummary}` : ""}
         </Text>
       ) : !open && running.length > 0 && thoughtText ? (
-        <Text numberOfLines={1} style={{ paddingHorizontal: space.md, paddingBottom: space.sm, fontSize: 11.5, color: p.muted }}>
+        <Text numberOfLines={1} style={{ paddingLeft: 33, paddingBottom: 3, fontSize: 11.5, color: p.muted }}>
           {thoughtText}
         </Text>
       ) : null}
       {!open && subs ? children.map((s) => <SubLink key={s.key} s={s} onPress={() => subs.open(s)} />) : null}
       {open ? (
-        <View style={{ paddingHorizontal: space.xs, paddingBottom: space.xs, gap: 4 }}>
+        <View style={{ marginLeft: 14, paddingLeft: 10, marginTop: 3, marginBottom: 4, borderLeftWidth: 2, borderLeftColor: guideColor, gap: 2 }}>
           {entries?.length ? (
             entries.map((entry, idx) =>
               entry.kind === "thinking" ? (
@@ -1650,7 +1798,7 @@ function SessionChatView({
             />
           </View>
         ) : null}
-        <View pointerEvents="box-none" style={{ position: "absolute", right: space.lg, bottom: bottomInset + space.md, alignItems: "flex-end", gap: space.sm }}>
+        <View pointerEvents="box-none" style={{ position: "absolute", right: 10, bottom: bottomInset + space.md, alignItems: "flex-end", gap: 6 }}>
           {jumping ? (
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: p.surface, borderRadius: radius.pill, paddingHorizontal: space.md, minHeight: 36, borderWidth: 1, borderColor: p.divider }}>
               <PocketSpinner size={12} />
@@ -1729,11 +1877,22 @@ function WorkingBadge({
   return (
     <View
       accessibilityLiveRegion="polite"
-      style={{ flexDirection: "row", alignItems: "center", gap: space.sm, paddingTop: space.sm, paddingHorizontal: 4 }}
+      style={{ flexDirection: "row", alignItems: "center", gap: 7, paddingTop: space.sm, paddingHorizontal: 4, paddingRight: 14 }}
     >
-      <PocketSpinner size={12} color={p.primary} />
-      <Text style={{ color: p.muted, fontSize: 13, fontFamily: fonts.bodySemi }}>
-        思考中 · {since ? workedFor(now - since) : "刚开始"}
+      <View
+        style={{
+          width: 22,
+          height: 22,
+          borderRadius: 7,
+          backgroundColor: p.dark ? "#3B2433" : "#FFEAF2",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <PocketSpinner size={12} color={p.primary} />
+      </View>
+      <Text style={{ color: p.muted, fontSize: 12.5, fontFamily: fonts.bodySemi }}>
+        正在思考 · {since ? workedFor(now - since) : "刚开始"}
       </Text>
       {onStop ? (
         <Pressable
@@ -1745,16 +1904,16 @@ function WorkingBadge({
           style={({ pressed }) => ({
             flexDirection: "row",
             alignItems: "center",
-            gap: 3,
-            paddingHorizontal: 8,
-            paddingVertical: 3,
+            gap: 4,
+            paddingHorizontal: 9,
+            paddingVertical: 3.5,
             borderRadius: radius.pill,
             backgroundColor: pressed ? p.surface3 : p.accentContainer,
             opacity: stopping ? 0.55 : 1,
             marginLeft: "auto",
           })}
         >
-          <MaterialCommunityIcons name="stop" size={12} color={p.accentText} />
+          <View style={{ width: 8, height: 8, borderRadius: 2, backgroundColor: p.accentText }} />
           <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>停止</Text>
         </Pressable>
       ) : null}
@@ -1762,7 +1921,7 @@ function WorkingBadge({
   );
 }
 
-/** Small round floating button for the chat's "到开头 / 到最新" jumps. */
+/** Small translucent round floating button for the chat's "到开头 / 到最新" jumps. */
 function JumpButton({ icon, label, badge, onPress }: { icon: "arrow-collapse-up" | "arrow-collapse-down"; label: string; badge?: number; onPress: () => void }) {
   const p = usePalette();
   return (
@@ -1772,25 +1931,26 @@ function JumpButton({ icon, label, badge, onPress }: { icon: "arrow-collapse-up"
       onPress={onPress}
       hitSlop={4}
       style={({ pressed }) => ({
-        width: 44,
-        height: 44,
-        borderRadius: 22,
+        width: 34,
+        height: 34,
+        borderRadius: 17,
         alignItems: "center",
         justifyContent: "center",
         backgroundColor: pressed ? p.surface3 : p.surface,
         borderWidth: 1,
         borderColor: p.divider,
+        opacity: 0.94,
         shadowColor: p.shadow,
-        shadowOpacity: p.dark ? 0 : 0.18,
-        shadowRadius: 8,
-        shadowOffset: { width: 0, height: 3 },
-        elevation: p.dark ? 0 : 3,
+        shadowOpacity: p.dark ? 0 : 0.14,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 2 },
+        elevation: p.dark ? 0 : 2,
       })}
     >
-      <MaterialCommunityIcons name={icon} size={20} color={p.ink} />
+      <MaterialCommunityIcons name={icon} size={17} color={p.ink} />
       {badge ? (
-        <View style={{ position: "absolute", top: -6, right: -6, minWidth: 20, height: 20, borderRadius: 10, paddingHorizontal: 5, alignItems: "center", justifyContent: "center", backgroundColor: p.primary }}>
-          <Text style={{ color: p.onPrimary, fontFamily: fonts.bodyBold, fontSize: 11 }}>{badge > 99 ? "99+" : badge}</Text>
+        <View style={{ position: "absolute", top: -5, right: -5, minWidth: 18, height: 18, borderRadius: 9, paddingHorizontal: 4, alignItems: "center", justifyContent: "center", backgroundColor: p.primary }}>
+          <Text style={{ color: p.onPrimary, fontFamily: fonts.bodyBold, fontSize: 10 }}>{badge > 99 ? "99+" : badge}</Text>
         </View>
       ) : null}
     </Pressable>

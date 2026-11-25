@@ -45,6 +45,7 @@ export interface ServerSetup {
 /** The configuration in force: what the relay runs with, and what phones are shown. */
 export interface EffectiveConfig {
   targets: LlmTarget[];
+  fallbackTargets?: LlmTarget[];
   name: string;
   firstByteMs?: number;
   live?: LiveConfig;
@@ -209,11 +210,24 @@ export class ConfigStore {
       else if (p.issue) warnings.push(`模型 ${m.model} 现在用不了：${named(m.provider)}${p.issue}。`);
       else targets.push({ ...p.target!, model: m.model });
     }
+    const fallbackTargets: LlmTarget[] = [];
+    if (s.models) {
+      const seen = new Set(targets.map((t) => `${t.provider}\0${t.model}`));
+      for (const bt of this.base.targets) {
+        const key = `${bt.provider}\0${bt.model}`;
+        if (seen.has(key)) continue;
+        const p = providers.get(bt.provider);
+        if (!p || p.issue || !p.target) continue;
+        seen.add(key);
+        fallbackTargets.push({ ...p.target, model: bt.model });
+      }
+    }
     if (!targets.length) warnings.push("没有能用的文字模型：小羊只能说自己还没配好。");
     const voice = this.voice(s, warnings);
     const name = s.name ?? this.base.name ?? "小羊";
     return {
       targets,
+      ...(fallbackTargets.length ? { fallbackTargets } : {}),
       name,
       ...(this.base.firstByteMs ? { firstByteMs: this.base.firstByteMs } : {}),
       ...(voice.live ? { live: voice.live } : {}),

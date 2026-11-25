@@ -89,6 +89,21 @@ const CLAUDE_COMMANDS: SlashCommandItem[] = [
   ...CORE_SESSION,
   c("/init", "生成或更新 CLAUDE.md 项目指引", "code"),
   c("/plan", "进入只读规划模式", "code", "[goal]"),
+  c("/effort", "调整当前模型的推理思考等级（low..max/auto）", "model", "[level]"),
+  c("/thinking", "调整或查看扩展思考预算开关", "model", "[level]"),
+  c("/fast", "开关 Fast 快速模式", "model", "[on|off]"),
+  c("/swarm", "查看或协调多 Agent 并行工作流", "skill", "[board|status]"),
+  c("/tasks", "查看并管理后台任务队列", "skill"),
+  c("/bashes", "查看与管理后台 Shell 任务", "code"),
+  c("/todos", "查看当前会话待办事项列表", "session"),
+  c("/skills", "查看、调用或管理已安装技能", "skill", "[name]"),
+  c("/tools", "查看当前可用内置与扩展工具", "code"),
+  c("/sandbox", "配置或切换命令执行沙箱策略", "model"),
+  c("/diff", "查看当前 Git 变更差异", "code"),
+  c("/stats", "查看当前会话统计面板", "session"),
+  c("/branch", "创建并切换到新对话分支", "session"),
+  c("/fork", "分叉当前会话为独立线程", "session"),
+  c("/tree", "浏览会话消息树与分支历史", "session"),
   c("/review", "审查当前代码改动", "code", "[pr]"),
   c("/rewind", "回退消息或文件改动", "session"),
   c("/agents", "管理自定义 Subagent", "skill"),
@@ -106,6 +121,12 @@ const CLAUDE_COMMANDS: SlashCommandItem[] = [
 const CODEX_COMMANDS: SlashCommandItem[] = [
   ...CORE_SESSION,
   c("/init", "初始化 AGENTS.md", "code"),
+  c("/effort", "调整推理思考等级（low..xhigh）", "model", "[level]"),
+  c("/fast", "开关快速优先模式", "model", "[on|off]"),
+  c("/ps", "查看当前运行的后台进程与子任务", "code"),
+  c("/skills", "查看与调用已加载技能", "skill", "[name]"),
+  c("/fork", "分叉当前对话历史", "session"),
+  c("/sandbox", "配置与调整沙箱执行策略", "model"),
   c("/approvals", "设置执行批准与沙箱策略", "model"),
   c("/permissions", "调整工作区权限", "model"),
   c("/diff", "查看 Git 差异", "code"),
@@ -132,6 +153,17 @@ const GEMINI_COMMANDS: SlashCommandItem[] = withUsage([
 const ANTIGRAVITY_COMMANDS: SlashCommandItem[] = [
   ...CORE_SESSION,
   c("/goal", "开启长程目标自动推进", "skill", "<objective>"),
+  c("/effort", "调整当前模型的推理思考等级（low..max）", "model", "[level]"),
+  c("/thinking", "调整当前模型的思考预算或开关", "model", "[level]"),
+  c("/fast", "开关 Fast 快速推理模式", "model", "[on|off]"),
+  c("/swarm", "查看与协调多智能体并发看板", "skill", "[board|status]"),
+  c("/tasks", "查看并管理后台运行任务队列", "skill"),
+  c("/skills", "查看、启用或管理可用技能包", "skill", "[name]"),
+  c("/permissions", "查看或调整工具执行权限策略", "model"),
+  c("/hooks", "配置会话生命周期 Hook", "model"),
+  c("/memory", "查看或更新持久记忆规则", "model"),
+  c("/diff", "查看当前工作区 Git 变更差异", "code"),
+  c("/init", "扫描项目并初始化规则指引文件", "code"),
   c("/plan", "切换分步规划模式", "skill", "[task]"),
   c("/grill-me", "通过问答细化方案", "skill"),
   c("/teamwork", "启动多智能体协作", "skill"),
@@ -429,6 +461,7 @@ const ICON_BY_NAME: Record<string, SlashIconKind> = {
   slow: "speed",
   effort: "speed",
   reasoning: "speed",
+  thinking: "speed",
   prewalk: "speed",
   advisor: "speed",
   permissions: "shield",
@@ -475,6 +508,8 @@ const ICON_BY_NAME: Record<string, SlashIconKind> = {
   drop: "workspace",
   ls: "workspace",
   "add-dir": "workspace",
+  bashes: "workspace",
+  ps: "workspace",
   test: "workspace",
   goal: "goal",
   subgoal: "goal",
@@ -484,10 +519,12 @@ const ICON_BY_NAME: Record<string, SlashIconKind> = {
   hub: "agents",
   team: "agents",
   teamwork: "agents",
+  swarm: "agents",
   background: "agents",
   btw: "agents",
   tan: "agents",
   tasks: "agents",
+  todos: "agents",
   skills: "skill",
   skill: "skill",
   learn: "skill",
@@ -497,8 +534,33 @@ const ICON_BY_NAME: Record<string, SlashIconKind> = {
   "grill-me": "skill",
 };
 
+export const BUILTIN_SLASH: readonly SlashCommandItem[] = (() => {
+  const byName = new Map<string, SlashCommandItem>();
+  const all = [
+    ...CORE_SESSION,
+    ...CLAUDE_COMMANDS,
+    ...OMP_COMMANDS,
+    ...ANTIGRAVITY_COMMANDS,
+    ...CODEX_COMMANDS,
+    ...GEMINI_COMMANDS,
+    ...DSH_COMMANDS,
+    ...HERMES_COMMANDS,
+    ...GROK_COMMANDS,
+    ...CODEBUDDY_COMMANDS,
+    ...PI_COMMANDS,
+    ...OPENCODE_KILO_COMMANDS,
+    ...AIDER_COMMANDS,
+    ...GENERIC_COMMANDS,
+  ];
+  for (const item of all) {
+    const k = item.name.toLowerCase();
+    if (!byName.has(k)) byName.set(k, item);
+  }
+  return [...byName.values()];
+})();
+
 export function slashCommandIconKind(cmd: SlashCommandItem): SlashIconKind {
-  const bare = cmd.name.trim().toLowerCase().replace(/^\//, "");
+  const bare = cmd.name.trim().toLowerCase().replace(/^[/\\]/, "");
   const direct = ICON_BY_NAME[bare];
   if (direct) return direct;
   if (cmd.category === "skill") return "skill";
@@ -521,7 +583,7 @@ export function mergeSlashCommands(builtins: SlashCommandItem[], discovered: Sla
 
 export function extractSlashQuery(text: string): string | null {
   const trimmedLeft = text.replace(/^[ \t]+/, "");
-  if (!trimmedLeft.startsWith("/")) return null;
+  if (!trimmedLeft.startsWith("/") && !trimmedLeft.startsWith("\\")) return null;
   if (/\s/.test(trimmedLeft)) return null;
   return trimmedLeft.slice(1).toLowerCase();
 }
@@ -531,7 +593,7 @@ export function matchSlashCommands(
   query: string,
   category: "all" | SlashCategory = "all",
 ): SlashCommandItem[] {
-  const q = query.trim().toLowerCase().replace(/^\//, "");
+  const q = query.trim().toLowerCase().replace(/^[/\\]/, "");
   const pool = category === "all" ? commands : commands.filter((item) => item.category === category);
   if (!q) return pool;
   const scored: Array<{ item: SlashCommandItem; rank: number }> = [];

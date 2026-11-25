@@ -44,6 +44,7 @@ import {
   openPortalSurface,
   portalStore,
   refreshHostPortals,
+  resolvePortalTransport,
   sendPortalInput,
   subscribePortalFrames,
   syncPortalClipboard,
@@ -67,10 +68,10 @@ const SESSION_LABELS: Record<string, string> = {
 };
 
 const QUALITY_PRESETS: Array<{ id: string; label: string; fps: number; maxWidth: number; quality: number }> = [
-  { id: "smooth", label: "流畅 · 30帧", fps: 30, maxWidth: 1080, quality: 58 },
-  { id: "hd30", label: "高清 · 30帧", fps: 30, maxWidth: 1440, quality: 72 },
-  { id: "hd60", label: "超清 · 60帧", fps: 60, maxWidth: 1600, quality: 78 },
-  { id: "raw60", label: "原画 · 60帧", fps: 60, maxWidth: 2560, quality: 92 },
+  { id: "smooth", label: "流畅 · 60帧", fps: 60, maxWidth: 1280, quality: 54 },
+  { id: "hd30", label: "高清 · 30帧", fps: 30, maxWidth: 1440, quality: 68 },
+  { id: "hd60", label: "超清 · 60帧", fps: 60, maxWidth: 1600, quality: 66 },
+  { id: "raw60", label: "原画 · 60帧", fps: 60, maxWidth: 2240, quality: 82 },
 ];
 
 const MOD_OPTIONS: Array<{ id: string; label: string }> = [
@@ -249,14 +250,23 @@ export function PortalViewerModal({
   const toast = useToast();
   const itemsById = portalStore.use((s) => s.itemsById);
   const framesById = portalStore.use((s) => s.framesById);
+  const heartbeatsById = portalStore.use((s) => s.heartbeatsById);
   const caps = portalStore.use((s) => s.capsByHost[hostId]);
   const windows = portalStore.use((s) => s.windowsByHost[hostId] ?? []);
-  const directAddr = liveStore.use((s) => s.direct[hostId]);
-  const rttMs = liveStore.use((s) => s.rttMs);
+  liveStore.use((s) => s.direct[hostId]);
+  const relayRttMs = liveStore.use((s) => s.rttMs);
+  const [, setTransportTick] = useState(0);
 
   const item = activePortalId ? itemsById[activePortalId] : undefined;
   const frame = item ? framesById[item.id] : undefined;
+  const heartbeat = item ? heartbeatsById[item.id] : undefined;
   const localHostId = useLocalHostDeviceId();
+
+  useEffect(() => {
+    if (!open) return;
+    const timer = setInterval(() => setTransportTick((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, [open]);
   const isRemoteHost = !isTauri() || !localHostId || (item ? item.hostId !== localHostId : hostId !== localHostId);
   const canOpenUrlLocally = Boolean(item?.url && (!isRemoteHost || !isLoopbackPortalUrl(item.url)));
   const isMacDesktop = isTauri() && detectPlatform() === "macos";
@@ -291,7 +301,7 @@ export function PortalViewerModal({
   const [metrics, setMetrics] = useState<StageStreamMetrics>({ fps: 0, kbps: 0 });
   const [clipBusy, setClipBusy] = useState(false);
 
-  const DEFAULT_PRESET = { id: "hd60", label: "超清 · 60帧", fps: 60, maxWidth: 1600, quality: 78 };
+  const DEFAULT_PRESET = { id: "hd60", label: "超清 · 60帧", fps: 60, maxWidth: 1600, quality: 66 };
   const activePreset = QUALITY_PRESETS.find((p) => p.id === presetId) ?? DEFAULT_PRESET;
   const streamCfgRef = useRef({
     fps: activePreset.fps,
@@ -432,9 +442,9 @@ export function PortalViewerModal({
     }
   };
 
-  const handleSendInput = (input: PortalInputAction) => {
+  const handleSendInput = (input: PortalInputAction): Promise<unknown> | void => {
     if (!item || !item.canInteract) return;
-    void sendPortalInput(item.hostId, item.id, input).catch((e: Error) => {
+    return sendPortalInput(item.hostId, item.id, input).catch((e: Error) => {
       if (input.type !== "pointer" || (input.action !== "move" && input.action !== "drag")) {
         toast(e.message || "远控输入失败", true);
       }
@@ -515,11 +525,22 @@ export function PortalViewerModal({
 
   const handleScreenshot = () => {
     if (!frame) return;
-    const a = document.createElement("a");
     const ext = frame.mime === "image/jpeg" ? "jpg" : frame.mime === "image/webp" ? "webp" : "png";
-    a.href = `data:${frame.mime};base64,${frame.data}`;
-    a.download = `remote-${(item?.title || "capture").replace(/[^\w.-]+/g, "_")}.${ext}`;
-    a.click();
+    const filename = `remote-${(item?.title || "capture").replace(/[^\w.-]+/g, "_")}.${ext}`;
+    const a = document.createElement("a");
+    if (frame.rawBytes && frame.rawBytes.byteLength > 0) {
+      const url = URL.createObjectURL(new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: frame.mime }));
+      a.href = url;
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5_000);
+    } else if (frame.data) {
+      a.href = `data:${frame.mime};base64,${frame.data}`;
+      a.download = filename;
+      a.click();
+    } else {
+      return;
+    }
     toast("已保存当前画面截图");
   };
 
@@ -535,7 +556,19 @@ export function PortalViewerModal({
   const sessionLabel = caps ? (SESSION_LABELS[caps.sessionType] ?? caps.sessionType) : "检测中";
   const isRemoteMacHost = caps?.sessionType === "macos";
   const primaryCopyMod = isRemoteMacHost ? ["meta"] : ["ctrl"];
-  const transportLabel = directAddr || item?.transportHint === "p2p" ? "P2P 直连" : "中继传输";
+  const transport = resolvePortalTransport(hostId, localHostId, frame);
+  const transportLabel = transport.label;
+  const rttMs = transport.rttMs ?? relayRttMs;
+  const handleRetryP2p = () => {
+    ensureDirectLinkNow(hostId);
+    toast("正在尝试建立 P2P 直连…");
+  };
+  const fpsStatusText =
+    metrics.fps > 0
+      ? `${metrics.fps} fps · ${metrics.kbps} KB/s`
+      : frame
+        ? `静止省流 · 就绪 ${heartbeat?.fps ?? activePreset.fps}fps`
+        : "等待首帧…";
 
   return (
     <PocketModal
@@ -840,12 +873,26 @@ export function PortalViewerModal({
                 options={QUALITY_PRESETS.map((p) => ({ value: p.id, label: p.label }))}
               />
 
-              <span className="portal-cap-pill accent mono">
-                {transportLabel}
-                {metrics.fps > 0 ? ` · ${metrics.fps}fps` : ""}
-                {metrics.kbps > 0 ? ` · ${metrics.kbps}KB/s` : ""}
-                {typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}
-              </span>
+              {!transport.isDirect ? (
+                <button
+                  type="button"
+                  className="portal-cap-pill accent mono"
+                  style={{ cursor: "pointer" }}
+                  title={transport.addr ? `${transport.label} (${transport.addr})` : "当前走中继传输，点击重试 P2P 直连"}
+                  onClick={handleRetryP2p}
+                >
+                  {transportLabel} · {fpsStatusText}
+                  {typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}
+                </button>
+              ) : (
+                <span
+                  className="portal-cap-pill accent mono"
+                  title={transport.addr ? `${transport.label} (${transport.addr})` : transport.label}
+                >
+                  {transportLabel} · {fpsStatusText}
+                  {typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}
+                </span>
+              )}
 
               <div className="portal-bar-actions">
                 <PocketIconButton
@@ -1144,7 +1191,23 @@ export function PortalViewerModal({
         ) : (
           <div className="portal-file-modal-wrap">
             <div className="portal-interactive-bar">
-              <span className="portal-cap-pill accent">{transportLabel}</span>
+              {!transport.isDirect ? (
+                <button
+                  type="button"
+                  className="portal-cap-pill accent"
+                  style={{ cursor: "pointer" }}
+                  title="当前走中继传输，点击重试 P2P 直连"
+                  onClick={handleRetryP2p}
+                >
+                  {transportLabel}
+                  {typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}
+                </button>
+              ) : (
+                <span className="portal-cap-pill accent">
+                  {transportLabel}
+                  {typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}
+                </span>
+              )}
               <span className="mono truncate grow">{item.targetPath || item.title}</span>
               {agent && item.targetPath ? (
                 <PocketButton

@@ -250,10 +250,32 @@ function shortPath(raw: string): string {
   return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
 }
 
+const PARTIAL_JSON_KEY_RE =
+  /"(?:file_path|path|Path|TargetFile|AbsolutePath|command|CommandLine|cmd|Command|pattern|Pattern|query|Query|url|Url|description|Prompt|prompt|toolSummary)"\s*:\s*"((?:\\.|[^"])*)/i;
+
+function unescapePartialJsonStr(raw: string): string {
+  return raw.replace(/\\"/g, '"').replace(/\\n/g, " ").replace(/\\\\/g, "\\").trim();
+}
+
 /** Extracts a concise single-line target/argument summary from a tool call input. */
 export function toolInputSummary(input: unknown): string {
   if (input == null) return "";
-  if (typeof input === "string") return clipChars(input, 96);
+  if (typeof input === "string") {
+    const t = input.trim();
+    if (!t) return "";
+    if (t.startsWith("{") || t.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(t) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return toolInputSummary(parsed);
+        }
+      } catch {
+        const m = PARTIAL_JSON_KEY_RE.exec(t);
+        if (m?.[1]) return clipChars(unescapePartialJsonStr(m[1]), 96);
+      }
+    }
+    return clipChars(t, 96);
+  }
   if (typeof input !== "object") return clipChars(String(input), 96);
   const o = input as Record<string, unknown>;
   for (const k of [
@@ -269,7 +291,7 @@ export function toolInputSummary(input: unknown): string {
     const v = o[k];
     if (typeof v === "string" && v.trim()) return clipChars(shortPath(v), 72);
   }
-  for (const k of ["command", "CommandLine", "cmd", "Command", "pattern", "Pattern", "query", "Query", "url", "Url", "uri", "description", "Role", "prompt"]) {
+  for (const k of ["command", "CommandLine", "cmd", "Command", "pattern", "Pattern", "query", "Query", "url", "Url", "uri", "description", "toolSummary", "Role", "prompt", "Prompt"]) {
     const v = o[k];
     if (typeof v === "string" && v.trim()) return clipChars(v, 96);
   }

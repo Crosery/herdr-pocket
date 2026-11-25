@@ -5,11 +5,15 @@ import {
   WEBRTC_BIN_CHUNK_BYTES,
   WEBRTC_CHUNK_CHARS,
   WEBRTC_GET_CHANNEL,
+  WEBRTC_PORTAL_CHANNEL,
   WEBRTC_PUT_CHANNEL,
   WEBRTC_RPC_CHANNEL,
   WEBRTC_STUN_URLS,
+  decodeBinaryPortalStreamFrame,
   jsChaCha20Poly1305,
+  utf8Decode,
   type DirectOffer,
+  type PortalFrameTransport,
   type RpcError,
   type RpcMethod,
   type ServerFrame,
@@ -19,6 +23,22 @@ import {
 } from "@herdr-pocket/protocol";
 import { native } from "./native";
 import { logger } from "./log";
+
+export type DirectLinkKind = "local" | "lan-p2p" | "vpn-p2p" | "webrtc-p2p";
+
+/** Classifies a direct transport path from its remote address and socket kind. */
+export function classifyDirectLinkKind(displayAddr: string, transportKind: "ws" | "webrtc"): DirectLinkKind {
+  if (transportKind === "webrtc") return "webrtc-p2p";
+  const host = displayAddr.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "127.0.0.1" || host === "::1" || host === "localhost") return "local";
+  const m = /^100\.(\d+)\.\d+\.\d+$/.exec(host);
+  if (m) {
+    const oct2 = Number(m[1]);
+    if (oct2 >= 64 && oct2 <= 127) return "vpn-p2p";
+  }
+  if (host.startsWith("fd7a:115c:a1e0:")) return "vpn-p2p";
+  return "lan-p2p";
+}
 
 export class DirectError extends Error {
   code: RpcError["code"];
@@ -82,6 +102,14 @@ interface Pending {
 interface PartialRpcChunk {
   total: number;
   parts: Array<string | undefined>;
+  received: number;
+  bytes: number;
+  expiresAt: number;
+}
+
+interface PartialBinaryFrame {
+  total: number;
+  parts: Array<Uint8Array | undefined>;
   received: number;
   bytes: number;
   expiresAt: number;
@@ -245,7 +273,7 @@ async function waitDcBufferedBelow(dc: RTCDataChannel, threshold: number): Promi
 }
 
 type WsDialWinner = { kind: "ws"; ws: WebSocket; cipher: DirectCipher; addr: string; port: number; displayAddr: string };
-type WebRtcDialWinner = { kind: "webrtc"; pc: RTCPeerConnection; dc: RTCDataChannel; peerId: string };
+type WebRtcDialWinner = { kind: "webrtc"; pc: RTCPeerConnection; dc: RTCDataChannel; portalDc: RTCDataChannel; peerId: string };
 type DialWinner = WsDialWinner | WebRtcDialWinner;
 
 function dialCandidate(
@@ -331,10 +359,15 @@ async function dialWebRtc(
     throw new DirectError("unsupported", "当前环境不支持 WebRTC P2P");
   }
   const pc = new RTCPeerConnection({
-    iceServers: [{ urls: WEBRTC_STUN_URLS[0] }],
+    iceServers: WEBRTC_STUN_URLS.map((urls) => ({ urls })),
   });
   const dc = pc.createDataChannel(WEBRTC_RPC_CHANNEL, { ordered: true });
   dc.binaryType = "arraybuffer";
+  const portalDc = pc.createDataChannel(WEBRTC_PORTAL_CHANNEL, {
+    ordered: false,
+    maxRetransmits: 2,
+  });
+  portalDc.binaryType = "arraybuffer";
 
   const gathered: string[] = [];
   let settled = false;
@@ -346,9 +379,15 @@ async function dialWebRtc(
       overallTimer = null;
     }
     dc.onopen = dc.onmessage = dc.onclose = dc.onerror = null;
+    portalDc.onopen = portalDc.onmessage = portalDc.onclose = portalDc.onerror = null;
     pc.onicecandidate = pc.onicegatheringstatechange = pc.onconnectionstatechange = null;
     try {
       dc.close();
+    } catch {
+      // ignore
+    }
+    try {
+      portalDc.close();
     } catch {
       // ignore
     }
@@ -389,7 +428,7 @@ async function dialWebRtc(
           }
           dc.onopen = dc.onmessage = dc.onclose = dc.onerror = null;
           pc.onicecandidate = pc.onicegatheringstatechange = pc.onconnectionstatechange = null;
-          resolve({ kind: "webrtc", pc, dc, peerId: "" });
+          resolve({ kind: "webrtc", pc, dc, portalDc, peerId: "" });
         }
       } catch {
         // ignore non-welcome
@@ -473,9 +512,15 @@ function closeDialWinner(w: DialWinner): void {
     }
   } else {
     w.dc.onopen = w.dc.onmessage = w.dc.onclose = w.dc.onerror = null;
+    w.portalDc.onopen = w.portalDc.onmessage = w.portalDc.onclose = w.portalDc.onerror = null;
     w.pc.onicecandidate = w.pc.onicegatheringstatechange = w.pc.onconnectionstatechange = null;
     try {
       w.dc.close();
+    } catch {
+      // ignore
+    }
+    try {
+      w.portalDc.close();
     } catch {
       // ignore
     }
@@ -490,6 +535,7 @@ function closeDialWinner(w: DialWinner): void {
 export class DirectLink {
   readonly to: string;
   readonly transportKind: "ws" | "webrtc";
+  readonly linkKind: DirectLinkKind;
   readonly addr: string;
   readonly displayAddr: string;
   readonly port: number;
@@ -497,15 +543,20 @@ export class DirectLink {
   private cipher: DirectCipher | null = null;
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
+  private portalDc: RTCDataChannel | null = null;
   private partials = new Map<string, PartialRpcChunk>();
+  private binPartials = new Map<number, PartialBinaryFrame>();
   private handlers: DirectHandlers;
   private pending = new Map<string, Pending>();
   private seq = 0;
   private chunkSeq = 0;
   private pingTimer: ReturnType<typeof setInterval>;
+  private initPingTimer: ReturnType<typeof setTimeout> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private pongGraceTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRxAt = Date.now();
+  private lastPingSentAt = 0;
+  private rttMs: number | null = null;
   private missedPongs = 0;
   private rxChain: Promise<void> = Promise.resolve();
   private closed = false;
@@ -522,6 +573,7 @@ export class DirectLink {
     if (winner.kind === "ws") {
       this.addr = winner.addr;
       this.displayAddr = winner.displayAddr;
+      this.linkKind = classifyDirectLinkKind(winner.displayAddr, "ws");
       this.port = winner.port;
       this.ws = winner.ws;
       this.cipher = winner.cipher;
@@ -540,9 +592,11 @@ export class DirectLink {
     } else {
       this.addr = winner.peerId ? `webrtc:${winner.peerId}` : "webrtc";
       this.displayAddr = "WebRTC P2P";
+      this.linkKind = "webrtc-p2p";
       this.port = 0;
       this.pc = winner.pc;
       this.dc = winner.dc;
+      this.portalDc = winner.portalDc;
 
       winner.dc.onmessage = (ev) => {
         this.handleWebRtcMessage(ev.data);
@@ -555,6 +609,15 @@ export class DirectLink {
         logger.warn("link.direct", `webrtc channel error on ${this.displayAddr}`);
         this.close();
       };
+      winner.portalDc.onmessage = (ev) => {
+        this.handleWebRtcMessage(ev.data);
+      };
+      winner.portalDc.onclose = () => {
+        logger.info("link.direct", `webrtc portal channel closed on ${this.displayAddr}`);
+      };
+      winner.portalDc.onerror = () => {
+        logger.warn("link.direct", `webrtc portal channel error on ${this.displayAddr}`);
+      };
       winner.pc.onconnectionstatechange = () => {
         const st = winner.pc.connectionState;
         if (st === "failed" || st === "closed") {
@@ -565,6 +628,18 @@ export class DirectLink {
     }
 
     this.pingTimer = setInterval(() => this.sendPing(), PING_MS);
+    this.initPingTimer = setTimeout(() => {
+      this.initPingTimer = null;
+      this.sendPing();
+    }, 60);
+  }
+
+  getRttMs(): number | null {
+    return this.rttMs;
+  }
+
+  pingNow(): void {
+    this.sendPing();
   }
 
   get open(): boolean {
@@ -711,17 +786,60 @@ export class DirectLink {
     });
   }
 
+  private decodeAndEmitBinaryFrame(pkt: Uint8Array, transport: PortalFrameTransport): boolean {
+    const decoded = decodeBinaryPortalStreamFrame(pkt);
+    if (!decoded) return false;
+    const rawCopy = new Uint8Array(decoded.bytes.byteLength);
+    rawCopy.set(decoded.bytes);
+    const eventFrame: ServerFrame = {
+      type: "stream_event",
+      id: decoded.id,
+      event: {
+        kind: "portal_frame",
+        portalId: decoded.meta.portalId,
+        seq: decoded.meta.seq,
+        mime: decoded.meta.mime,
+        data: "",
+        rawBytes: rawCopy,
+        byteLength: rawCopy.byteLength,
+        transport,
+        width: decoded.meta.width,
+        height: decoded.meta.height,
+        ...(decoded.meta.url !== undefined ? { url: decoded.meta.url } : {}),
+        ...(decoded.meta.title !== undefined ? { title: decoded.meta.title } : {}),
+        ...(decoded.meta.canGoBack !== undefined ? { canGoBack: decoded.meta.canGoBack } : {}),
+        ...(decoded.meta.canGoForward !== undefined ? { canGoForward: decoded.meta.canGoForward } : {}),
+        ...(decoded.meta.cursorX !== undefined ? { cursorX: decoded.meta.cursorX } : {}),
+        ...(decoded.meta.cursorY !== undefined ? { cursorY: decoded.meta.cursorY } : {}),
+        ...(decoded.meta.cursorVisible !== undefined ? { cursorVisible: decoded.meta.cursorVisible } : {}),
+        ...(decoded.meta.captureMs !== undefined ? { captureMs: decoded.meta.captureMs } : {}),
+        at: decoded.meta.at,
+      },
+    };
+    this.onDecodedFrame(eventFrame);
+    return true;
+  }
+
   private processWsBytes(bytes: Uint8Array): void {
     if (this.closed || !this.cipher) return;
-    const text = this.cipher.open(bytes);
-    if (text === null) {
+    const plain = this.cipher.openBytes(bytes);
+    if (plain === null) {
       logger.warn("link.direct", `cipher open failed on ${this.displayAddr}`);
       this.close();
       return;
     }
+    if (
+      plain.byteLength >= 4 &&
+      plain[0] === 0x50 &&
+      plain[1] === 0x4b &&
+      plain[2] === 0x46 &&
+      plain[3] === 0x31
+    ) {
+      if (this.decodeAndEmitBinaryFrame(plain, this.linkKind)) return;
+    }
     let frame: ServerFrame;
     try {
-      frame = JSON.parse(text) as ServerFrame;
+      frame = JSON.parse(utf8Decode(plain)) as ServerFrame;
     } catch {
       return;
     }
@@ -735,8 +853,66 @@ export class DirectLink {
       raw = data;
     } else {
       const bytes = rawToBytesSync(data);
-      if (bytes && typeof TextDecoder !== "undefined") {
-        raw = new TextDecoder().decode(bytes);
+      if (bytes && bytes.byteLength >= 4) {
+        if (bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x42 && bytes[3] === 0x31) {
+          this.decodeAndEmitBinaryFrame(bytes.subarray(4), "webrtc-p2p");
+          return;
+        }
+        if (
+          bytes.byteLength >= 12 &&
+          bytes[0] === 0x50 &&
+          bytes[1] === 0x4b &&
+          bytes[2] === 0x43 &&
+          bytes[3] === 0x31
+        ) {
+          const msgSeq =
+            ((bytes[4]! << 24) | (bytes[5]! << 16) | (bytes[6]! << 8) | bytes[7]!) >>> 0;
+          const idx = (bytes[8]! << 8) | bytes[9]!;
+          const total = (bytes[10]! << 8) | bytes[11]!;
+          if (total <= 0 || total > 65535 || idx < 0 || idx >= total) return;
+          const now = Date.now();
+          for (const [k, v] of this.binPartials) {
+            if (v.expiresAt < now) this.binPartials.delete(k);
+          }
+          if (!this.binPartials.has(msgSeq) && this.binPartials.size >= 8) {
+            const oldestKey = this.binPartials.keys().next().value;
+            if (oldestKey !== undefined) this.binPartials.delete(oldestKey);
+          }
+          let entry = this.binPartials.get(msgSeq);
+          if (!entry) {
+            entry = { total, parts: new Array(total), received: 0, bytes: 0, expiresAt: now + 8_000 };
+            this.binPartials.set(msgSeq, entry);
+          }
+          if (entry.total !== total) return;
+          const chunk = bytes.subarray(12);
+          if (entry.parts[idx] === undefined) {
+            const copy = new Uint8Array(chunk.byteLength);
+            copy.set(chunk);
+            entry.parts[idx] = copy;
+            entry.bytes += copy.byteLength;
+            entry.received += 1;
+            if (entry.bytes > 8 * 1024 * 1024) {
+              this.binPartials.delete(msgSeq);
+              return;
+            }
+          }
+          entry.expiresAt = now + 8_000;
+          if (entry.received < entry.total) return;
+          this.binPartials.delete(msgSeq);
+          const assembled = new Uint8Array(entry.bytes);
+          let off = 0;
+          for (let i = 0; i < entry.total; i += 1) {
+            const part = entry.parts[i];
+            if (!part) return;
+            assembled.set(part, off);
+            off += part.byteLength;
+          }
+          this.decodeAndEmitBinaryFrame(assembled, "webrtc-p2p");
+          return;
+        }
+      }
+      if (bytes) {
+        raw = utf8Decode(bytes);
       }
     }
     if (!raw) return;
@@ -802,6 +978,13 @@ export class DirectLink {
     this.clearPongTimers();
 
     if (frame.type === "pong") {
+      const echoedT =
+        typeof (frame as { t?: unknown }).t === "number"
+          ? (frame as { t: number }).t
+          : this.lastPingSentAt;
+      if (echoedT > 0) {
+        this.rttMs = Math.max(1, Math.min(9999, Date.now() - echoedT));
+      }
       return;
     }
     if (frame.type === "rpc_result") {
@@ -826,6 +1009,7 @@ export class DirectLink {
       return;
     }
     const now = Date.now();
+    this.lastPingSentAt = now;
     if (!this.send({ type: "ping", t: now })) return;
     if (!this.pongTimer && !this.pongGraceTimer) {
       this.pongTimer = setTimeout(() => {
@@ -1048,12 +1232,25 @@ export class DirectLink {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.pingTimer);
+    if (this.initPingTimer) {
+      clearTimeout(this.initPingTimer);
+      this.initPingTimer = null;
+    }
     this.clearPongTimers();
     this.partials.clear();
+    this.binPartials.clear();
     if (this.ws) {
       this.ws.onopen = this.ws.onmessage = this.ws.onclose = this.ws.onerror = null;
       try {
         this.ws.close();
+      } catch {
+        // ignore
+      }
+    }
+    if (this.portalDc) {
+      this.portalDc.onopen = this.portalDc.onmessage = this.portalDc.onclose = this.portalDc.onerror = null;
+      try {
+        this.portalDc.close();
       } catch {
         // ignore
       }

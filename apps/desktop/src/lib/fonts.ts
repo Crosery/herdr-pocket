@@ -32,6 +32,12 @@ let catalogInflight: Promise<FontCatalog | null> | null = null;
 const loadedFamilies = new Set<string>();
 const loadedFaceIds = new Set<number>();
 const fontLoadInflight = new Map<string, Promise<boolean>>();
+let loadedFontFaceEpoch = 0;
+
+/** Monotonic counter incremented only when a new FontFace is actually added to `document.fonts`. */
+export function getLoadedFontFaceEpoch(): number {
+  return loadedFontFaceEpoch;
+}
 
 export async function refreshLocalHostIdFast(force = false): Promise<string | null> {
   const existing = localHostIdStore.get();
@@ -206,6 +212,7 @@ async function registerFontFace(face: FontFaceMeta, aliasFamily?: string): Promi
     await ff.load();
     document.fonts.add(ff);
     loadedFaceIds.add(face.id);
+    loadedFontFaceEpoch += 1;
     return true;
   } catch {
     return false;

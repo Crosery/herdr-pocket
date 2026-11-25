@@ -59,9 +59,25 @@ function delayMs(ms: number): Promise<void> {
 }
 
 function frameFingerprint(frame: PortalFramePayload): string {
-  const len = frame.data.length;
-  const mid = len >> 1;
-  return `${frame.width}x${frame.height}:${len}:${frame.data.slice(0, 32)}:${frame.data.slice(mid, mid + 32)}:${frame.data.slice(-32)}:${frame.cursorX?.toFixed(3) ?? ""}:${frame.cursorY?.toFixed(3) ?? ""}:${frame.cursorVisible ? 1 : 0}:${frame.url ?? ""}`;
+  const byteLen = frame.rawBytes?.byteLength ?? frame.data.length;
+  let head = "";
+  let mid = "";
+  let tail = "";
+  if (frame.data) {
+    const m = frame.data.length >> 1;
+    head = frame.data.slice(0, 32);
+    mid = frame.data.slice(m, m + 32);
+    tail = frame.data.slice(-32);
+  } else if (frame.rawBytes && frame.rawBytes.byteLength > 0) {
+    const rb = frame.rawBytes;
+    const m = rb.byteLength >> 1;
+    const toHex = (s: number, e: number) =>
+      Buffer.from(rb.buffer, rb.byteOffset + s, Math.max(0, e - s)).toString("hex");
+    head = toHex(0, Math.min(24, rb.byteLength));
+    mid = toHex(m, Math.min(m + 24, rb.byteLength));
+    tail = toHex(Math.max(0, rb.byteLength - 24), rb.byteLength);
+  }
+  return `${frame.width}x${frame.height}:${byteLen}:${head}:${mid}:${tail}:${frame.cursorX?.toFixed(3) ?? ""}:${frame.cursorY?.toFixed(3) ?? ""}:${frame.cursorVisible ? 1 : 0}:${frame.url ?? ""}`;
 }
 
 interface PortalWatcher {
@@ -69,6 +85,7 @@ interface PortalWatcher {
   agentKey?: string;
   send: (ev: PortalStreamEvent) => void;
   timer?: NodeJS.Timeout;
+  heartbeatTimer?: NodeJS.Timeout;
   offBrowser?: () => void;
   fps: number;
   maxWidth: number;
@@ -76,6 +93,15 @@ interface PortalWatcher {
   showCursor: boolean;
   lastHash?: string;
   lastSentAt?: number;
+  hasAck?: boolean;
+  lastSentSeq: number;
+  lastAckedSeq: number;
+  sentAtBySeq: Map<number, number>;
+  rttEwmaMs: number;
+  effectiveQuality: number;
+  effectiveMaxWidth: number;
+  slowStreak: number;
+  fastStreak: number;
 }
 
 export class PortalManager {
@@ -109,6 +135,8 @@ export class PortalManager {
   private browserReviving = new Map<string, Promise<void>>();
   private pokeTimers = new Map<string, NodeJS.Timeout>();
   private streamWatchers = new Map<string, PortalWatcher>();
+  private inputMoveInFlight = new Set<string>();
+  private inputMoveQueued = new Map<string, PortalInputAction>();
 
   constructor(deps: PortalManagerDeps) {
     this.deps = deps;
@@ -141,6 +169,10 @@ export class PortalManager {
 
   isHookRunning(): boolean {
     return Boolean(this.hookServer?.port);
+  }
+
+  hasActiveWatchers(): boolean {
+    return this.streamWatchers.size > 0;
   }
 
   childEnv(terminalId?: string): Record<string, string> {
@@ -181,6 +213,8 @@ export class PortalManager {
     this.windowBaselineSeeded = false;
     this.browserReviving.clear();
     for (const id of [...this.streamWatchers.keys()]) this.unsubscribe(id);
+    this.inputMoveInFlight.clear();
+    this.inputMoveQueued.clear();
     this.hookServer?.stop();
     this.hookServer = null;
     this.browser.closeAll();
@@ -215,7 +249,7 @@ export class PortalManager {
     if (payload.ppid && payload.ppid > 1) {
       const terms = this.deps.getTerminals();
       for (const [addr, t] of terms) {
-        if (t.foreground?.pid === payload.ppid) {
+        if (t.foreground?.pid === payload.ppid || t.pid === payload.ppid) {
           const hit = agents.find((a) => a.localId === addr);
           if (hit) return hit;
         }
@@ -223,9 +257,9 @@ export class PortalManager {
       // Best-effort parent PID walk on Unix (short)
       if (process.platform !== "win32") {
         let cur = payload.ppid;
-        for (let depth = 0; depth < 6 && cur > 1; depth++) {
+        for (let depth = 0; depth < 8 && cur > 1; depth++) {
           for (const [addr, t] of terms) {
-            if (t.foreground?.pid === cur) {
+            if (t.foreground?.pid === cur || t.pid === cur) {
               const hit = agents.find((a) => a.localId === addr);
               if (hit) return hit;
             }
@@ -241,8 +275,16 @@ export class PortalManager {
         }
       }
     }
+    if (this.lastCommandCtx && Date.now() - this.lastCommandCtx.at < 15_000) {
+      const recentHit = agents.find((a) => a.key === this.lastCommandCtx?.agentKey);
+      if (recentHit) return recentHit;
+    }
     if (payload.cwd) {
       const norm = resolve(payload.cwd);
+      const exactWorking = agents.find(
+        (a) => a.status === "working" && a.cwd && (norm === resolve(a.cwd) || norm.startsWith(`${resolve(a.cwd)}/`)),
+      );
+      if (exactWorking) return exactWorking;
       const exact = agents.find((a) => a.cwd && (norm === resolve(a.cwd) || norm.startsWith(`${resolve(a.cwd)}/`)));
       if (exact) return exact;
     }
@@ -484,6 +526,7 @@ export class PortalManager {
           seq: ++this.windowSeq,
           mime: cap.mime,
           data: cap.data,
+          ...(cap.rawBytes ? { rawBytes: cap.rawBytes, byteLength: cap.rawBytes.byteLength } : {}),
           width: cap.width,
           height: cap.height,
           ...(url ? { url } : {}),
@@ -543,6 +586,8 @@ export class PortalManager {
 
   closePortal(portalId: string): void {
     this.autoWindowMeta.delete(portalId);
+    this.inputMoveInFlight.delete(portalId);
+    this.inputMoveQueued.delete(portalId);
     const existing = this.items.get(portalId);
     this.browser.close(portalId);
     if (!existing) return;
@@ -606,6 +651,7 @@ export class PortalManager {
         seq: ++this.windowSeq,
         mime: cap.mime,
         data: cap.data,
+        ...(cap.rawBytes ? { rawBytes: cap.rawBytes, byteLength: cap.rawBytes.byteLength } : {}),
         width: cap.width,
         height: cap.height,
         ...(item.url ? { url: item.url } : {}),
@@ -626,37 +672,56 @@ export class PortalManager {
   private sendFrameToWatcher(w: PortalWatcher, frame: PortalFramePayload, allowDedup = true): void {
     const fp = frameFingerprint(frame);
     const now = Date.now();
-    if (allowDedup && w.lastHash === fp && now - (w.lastSentAt ?? 0) < 900) {
+    if (allowDedup && w.lastHash === fp && now - (w.lastSentAt ?? 0) < 2800) {
       return;
     }
     w.lastHash = fp;
     w.lastSentAt = now;
+    w.lastSentSeq = frame.seq;
+    w.sentAtBySeq.set(frame.seq, now);
+    if (w.sentAtBySeq.size > 32) {
+      const oldest = w.sentAtBySeq.keys().next().value;
+      if (oldest !== undefined) w.sentAtBySeq.delete(oldest);
+    }
     w.send({ kind: "portal_frame", ...frame });
   }
 
   private startWindowWatcherLoop(streamId: string, w: PortalWatcher): void {
     if (w.timer) {
-      clearInterval(w.timer);
+      clearTimeout(w.timer);
       w.timer = undefined;
     }
     const portalId = w.portalId;
     if (!portalId) return;
-    let busy = false;
     let lastErrCapAt = 0;
     const intervalMs = Math.max(16, Math.round(1000 / Math.max(1, w.fps)));
     const pump = () => {
-      if (busy || !this.streamWatchers.has(streamId)) return;
+      if (this.streamWatchers.get(streamId) !== w) return;
       const curItem = this.items.get(portalId);
-      if (curItem?.streamError && Date.now() - lastErrCapAt < 2000) return;
-      busy = true;
+      if (curItem?.streamError && Date.now() - lastErrCapAt < 2000) {
+        w.timer = setTimeout(pump, 200);
+        w.timer.unref?.();
+        return;
+      }
+      // RustDesk-style inflight credit gate: avoid piling unacked frames into sockets/codecs.
+      if (w.hasAck && w.lastSentSeq - w.lastAckedSeq >= 2) {
+        const stalledFor = Date.now() - (w.lastSentAt ?? 0);
+        if (stalledFor < 450) {
+          w.timer = setTimeout(pump, 8);
+          w.timer.unref?.();
+          return;
+        }
+        w.lastAckedSeq = Math.max(w.lastAckedSeq, w.lastSentSeq - 1);
+      }
+      const startedAt = Date.now();
       void this.captureFrame(portalId, {
-        maxWidth: w.maxWidth,
-        quality: w.quality,
+        maxWidth: w.effectiveMaxWidth,
+        quality: w.effectiveQuality,
         showCursor: w.showCursor,
         fps: w.fps,
       })
         .then(({ frame }) => {
-          if (frame && this.streamWatchers.has(streamId)) {
+          if (frame && this.streamWatchers.get(streamId) === w) {
             this.sendFrameToWatcher(w, frame, true);
           } else if (!frame) {
             lastErrCapAt = Date.now();
@@ -664,11 +729,12 @@ export class PortalManager {
         })
         .catch(() => {})
         .finally(() => {
-          busy = false;
+          if (this.streamWatchers.get(streamId) !== w) return;
+          const waitMs = Math.max(2, intervalMs - (Date.now() - startedAt));
+          w.timer = setTimeout(pump, waitMs);
+          w.timer.unref?.();
         });
     };
-    w.timer = setInterval(pump, intervalMs);
-    w.timer.unref?.();
     pump();
   }
 
@@ -682,8 +748,8 @@ export class PortalManager {
       if (!watchers.length) return;
       const lead = watchers[0]!;
       void this.captureFrame(portalId, {
-        maxWidth: lead.maxWidth,
-        quality: lead.quality,
+        maxWidth: lead.effectiveMaxWidth,
+        quality: lead.effectiveQuality,
         showCursor: lead.showCursor,
         fps: lead.fps,
       })
@@ -699,9 +765,77 @@ export class PortalManager {
     this.pokeTimers.set(portalId, t);
   }
 
+  private drainQueuedWindowMove(portalId: string, windowId: string): void {
+    const next = this.inputMoveQueued.get(portalId);
+    if (!next) return;
+    this.inputMoveQueued.delete(portalId);
+    this.inputMoveInFlight.add(portalId);
+    void this.capture
+      .injectInput(windowId, next)
+      .catch(() => {})
+      .finally(() => {
+        this.inputMoveInFlight.delete(portalId);
+        if (this.items.has(portalId) && this.inputMoveQueued.has(portalId)) {
+          this.drainQueuedWindowMove(portalId, windowId);
+        }
+      });
+  }
+
   async sendInput(portalId: string, input: PortalInputAction): Promise<{ url?: string; title?: string; clipboardText?: string }> {
     const item = this.items.get(portalId);
     if (!item) throw new Error("回传窗口不存在或已关闭");
+
+    if (input.type === "ack") {
+      const now = Date.now();
+      for (const w of this.streamWatchers.values()) {
+        if (w.portalId !== portalId) continue;
+        w.hasAck = true;
+        if (input.seq > w.lastAckedSeq) w.lastAckedSeq = input.seq;
+        const sentAt = w.sentAtBySeq.get(input.seq);
+        if (sentAt !== undefined) {
+          w.sentAtBySeq.delete(input.seq);
+          const rtt = Math.max(1, now - sentAt);
+          w.rttEwmaMs = w.rttEwmaMs > 0 ? Math.round(w.rttEwmaMs * 0.7 + rtt * 0.3) : rtt;
+          let abrChanged = false;
+          if (rtt > 105) {
+            w.slowStreak += 1;
+            w.fastStreak = 0;
+            if (w.slowStreak >= 3) {
+              const nextQ = Math.max(38, w.effectiveQuality - 10);
+              const nextW = Math.max(960, Math.round(w.effectiveMaxWidth * 0.82));
+              if (nextQ !== w.effectiveQuality || nextW !== w.effectiveMaxWidth) {
+                w.effectiveQuality = nextQ;
+                w.effectiveMaxWidth = nextW;
+                abrChanged = true;
+              }
+              w.slowStreak = 0;
+            }
+          } else if (rtt < 55) {
+            w.fastStreak += 1;
+            w.slowStreak = 0;
+            if (w.fastStreak >= 8) {
+              const nextQ = Math.min(w.quality, w.effectiveQuality + 6);
+              const nextW = Math.min(w.maxWidth, Math.round(w.effectiveMaxWidth * 1.12));
+              if (nextQ !== w.effectiveQuality || nextW !== w.effectiveMaxWidth) {
+                w.effectiveQuality = nextQ;
+                w.effectiveMaxWidth = nextW;
+                abrChanged = true;
+              }
+              w.fastStreak = 0;
+            }
+          } else {
+            w.slowStreak = 0;
+          }
+          if (abrChanged && item.kind === "browser") {
+            void this.browser.get(portalId)?.updateScreencastConfig({
+              maxWidth: w.effectiveMaxWidth,
+              quality: w.effectiveQuality,
+            });
+          }
+        }
+      }
+      return { title: item.title };
+    }
 
     if (input.type === "config") {
       for (const [streamId, w] of this.streamWatchers) {
@@ -711,16 +845,25 @@ export class PortalManager {
         }
         if (typeof input.maxWidth === "number" && Number.isFinite(input.maxWidth)) {
           w.maxWidth = Math.min(2560, Math.max(480, Math.round(input.maxWidth)));
+          w.effectiveMaxWidth = w.maxWidth;
         }
         if (typeof input.quality === "number" && Number.isFinite(input.quality)) {
           w.quality = Math.min(92, Math.max(40, Math.round(input.quality)));
+          w.effectiveQuality = w.quality;
         }
         if (typeof input.showCursor === "boolean") {
           w.showCursor = input.showCursor;
         }
+        w.slowStreak = 0;
+        w.fastStreak = 0;
         w.lastHash = undefined;
         if (item.kind === "window") {
           this.startWindowWatcherLoop(streamId, w);
+        } else if (item.kind === "browser") {
+          void this.browser.get(portalId)?.updateScreencastConfig({
+            maxWidth: w.effectiveMaxWidth,
+            quality: w.effectiveQuality,
+          });
         }
       }
       if (item.kind === "browser") {
@@ -774,11 +917,28 @@ export class PortalManager {
       return res;
     }
     if (item.kind === "window") {
-      await this.capture.injectInput(item.windowId || "screen:0", input);
-      item.updatedAt = Date.now();
-      if (input.type !== "pointer" || input.action !== "move") {
-        this.scheduleInputPoke(portalId);
+      const targetWin = item.windowId || "screen:0";
+      if (input.type === "pointer" && (input.action === "move" || input.action === "drag")) {
+        if (this.inputMoveInFlight.has(portalId)) {
+          this.inputMoveQueued.set(portalId, input);
+          return { title: item.title };
+        }
+        this.inputMoveInFlight.add(portalId);
+        try {
+          await this.capture.injectInput(targetWin, input);
+        } finally {
+          this.inputMoveInFlight.delete(portalId);
+          if (this.items.has(portalId) && this.inputMoveQueued.has(portalId)) {
+            this.drainQueuedWindowMove(portalId, targetWin);
+          }
+        }
+        item.updatedAt = Date.now();
+        return { title: item.title };
       }
+      this.inputMoveQueued.delete(portalId);
+      await this.capture.injectInput(targetWin, input);
+      item.updatedAt = Date.now();
+      this.scheduleInputPoke(portalId);
       return { title: item.title };
     }
     throw new Error("当前回传类型不支持远程键鼠交互");
@@ -835,17 +995,29 @@ export class PortalManager {
       maxWidth,
       quality,
       showCursor,
+      lastSentSeq: 0,
+      lastAckedSeq: 0,
+      sentAtBySeq: new Map(),
+      rttEwmaMs: 0,
+      effectiveQuality: quality,
+      effectiveMaxWidth: maxWidth,
+      slowStreak: 0,
+      fastStreak: 0,
     };
     this.streamWatchers.set(streamId, entry);
     this.ensureWindowDeltaWatcher();
 
     if (params.portalId) {
+      const pid = params.portalId;
       this.attachBrowserToWatcher(streamId);
-      const item = this.items.get(params.portalId);
+      const item = this.items.get(pid);
       if (item?.kind === "browser") {
-        const sess = this.browser.get(params.portalId);
+        const sess = this.browser.get(pid);
+        if (sess) {
+          void sess.updateScreencastConfig({ maxWidth, quality });
+        }
         if (!sess?.getLatestFrame()) {
-          void this.captureFrame(params.portalId)
+          void this.captureFrame(pid)
             .then(({ frame }) => {
               if (frame && this.streamWatchers.has(streamId)) this.sendFrameToWatcher(entry, frame, false);
             })
@@ -854,6 +1026,25 @@ export class PortalManager {
       } else if (item?.kind === "window") {
         this.startWindowWatcherLoop(streamId, entry);
       }
+      entry.heartbeatTimer = setInterval(() => {
+        if (this.streamWatchers.get(streamId) !== entry) return;
+        const curItem = this.items.get(pid);
+        if (!curItem || curItem.streamError) return;
+        if (Date.now() - (entry.lastSentAt ?? 0) >= 550) {
+          entry.send({
+            kind: "portal_heartbeat",
+            portalId: pid,
+            fps: entry.fps,
+            idle: true,
+            ...(entry.rttEwmaMs > 0 ? { rttMs: Math.round(entry.rttEwmaMs) } : {}),
+            quality: entry.effectiveQuality,
+            ...(curItem.width ? { width: curItem.width } : {}),
+            ...(curItem.height ? { height: curItem.height } : {}),
+            at: Date.now(),
+          });
+        }
+      }, 400);
+      entry.heartbeatTimer.unref?.();
     }
 
     return () => this.unsubscribe(streamId);
@@ -863,7 +1054,8 @@ export class PortalManager {
     const w = this.streamWatchers.get(streamId);
     if (!w) return;
     this.streamWatchers.delete(streamId);
-    if (w.timer) clearInterval(w.timer);
+    if (w.timer) clearTimeout(w.timer);
+    if (w.heartbeatTimer) clearInterval(w.heartbeatTimer);
     w.offBrowser?.();
   }
 
@@ -889,6 +1081,7 @@ export class PortalManager {
     hints: string[],
     beforeIds?: Set<string>,
     beforeTitles?: Map<string, string>,
+    strictFresh = false,
   ): RemoteWindowInfo | undefined {
     const visible = windows.filter((w) => !w.isScreen && (w.bounds?.width ?? 200) >= 140 && (w.bounds?.height ?? 200) >= 100);
     const expandedHints = hints.flatMap((h) => {
@@ -914,11 +1107,13 @@ export class PortalManager {
     if (expandedHints.length) {
       const freshMatch = beforeIds || beforeTitles ? candidates.find((w) => isFreshOrRetitled(w) && matchHint(w)) : undefined;
       if (freshMatch) return freshMatch;
-      const matched = candidates.filter(matchHint);
-      if (matched.length) {
-        return matched.sort(
-          (a, b) => (b.bounds?.width ?? 800) * (b.bounds?.height ?? 600) - (a.bounds?.width ?? 800) * (a.bounds?.height ?? 600),
-        )[0];
+      if (!strictFresh || !(beforeIds || beforeTitles)) {
+        const matched = candidates.filter(matchHint);
+        if (matched.length) {
+          return matched.sort(
+            (a, b) => (b.bounds?.width ?? 800) * (b.bounds?.height ?? 600) - (a.bounds?.width ?? 800) * (a.bounds?.height ?? 600),
+          )[0];
+        }
       }
     }
 
@@ -1004,16 +1199,19 @@ export class PortalManager {
 
     const isWinHost = (this.deps.captureDeps?.platform ?? process.platform) === "win32";
     if (XSERVER_APP_RE.test(w.appName) && (isWinHost || wslFgAgent)) return wslFgAgent;
+
+    const working = agents.filter((a) => a.status === "working");
+    if (working.length === 1) return working[0];
     return undefined;
   }
 
   private ensureWindowDeltaWatcher(): void {
     if (this.windowDeltaTimer) return;
+    const plat = this.deps.captureDeps?.platform ?? process.platform;
+    if (plat === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return;
     this.windowDeltaTimer = setInterval(() => {
-      if (this.streamWatchers.size > 0 || this.deps.hasRemoteViewers()) {
-        void this.pollWindowDeltas().catch(() => {});
-      }
-    }, 1600);
+      void this.pollWindowDeltas().catch(() => {});
+    }, 850);
     this.windowDeltaTimer.unref?.();
   }
 
@@ -1073,8 +1271,10 @@ export class PortalManager {
         }
 
         if (prev.title !== w.title && w.title.trim() !== "") {
-          const isBrowserApp = /ego\s*lite|\bego\b|tabbit|chrome|chromium|safari|arc|firefox|playwright/i.test(w.appName);
+          const isBrowserApp = /ego\s*lite|\bego\b|tabbit|chrome|chromium|safari|arc|edge|brave|firefox|playwright/i.test(w.appName);
           const isAutoBrowser = /\b(?:ego\s*lite|ego|tabbit|chromium|playwright|chrome\s*for\s*testing)\b/i.test(w.appName);
+          const workingAgents = this.deps.getAgents().filter((a) => a.status === "working");
+          const inferredAgent = recentAgent ?? (workingAgents.length === 1 ? workingAgents[0] : undefined);
           if (existingPortal) {
             const cap = await this.capture.captureWindow(w.id).catch(() => null);
             if (cap) {
@@ -1085,9 +1285,9 @@ export class PortalManager {
               existingPortal.updatedAt = Date.now();
               this.emitEvent(isBrowserApp || recentAgent ? "opened" : "updated", existingPortal);
             }
-          } else if ((isAutoBrowser || recentAgent) && !this.checkAndMarkAutoDedup(`delta-retitle\0${w.id}`, 2000)) {
+          } else if ((isAutoBrowser || recentAgent || workingAgents.length > 0 || isBrowserApp) && !this.checkAndMarkAutoDedup(`delta-retitle\0${w.id}`, 2000)) {
             const { item } = await this.openPortal({
-              agentKey: recentAgent?.key,
+              agentKey: inferredAgent?.key,
               kind: "window",
               windowId: w.id,
               title: nextTitle,
@@ -1126,7 +1326,7 @@ export class PortalManager {
 
   private pushWindowPortalUpdate(
     existing: PortalItem,
-    opts: { title?: string; url?: string; cap: { mime: "image/jpeg" | "image/png"; data: string; width: number; height: number } },
+    opts: { title?: string; url?: string; cap: { mime: "image/jpeg" | "image/png"; data: string; rawBytes?: Buffer; width: number; height: number } },
   ): void {
     const now = Date.now();
     if (opts.title) existing.title = opts.title;
@@ -1143,6 +1343,7 @@ export class PortalManager {
       seq: ++this.windowSeq,
       mime: opts.cap.mime,
       data: opts.cap.data,
+      ...(opts.cap.rawBytes ? { rawBytes: opts.cap.rawBytes, byteLength: opts.cap.rawBytes.byteLength } : {}),
       width: opts.cap.width,
       height: opts.cap.height,
       url: existing.url,
@@ -1172,10 +1373,12 @@ export class PortalManager {
     let lastHit: RemoteWindowInfo | undefined;
     let lastPermNote: string | null = null;
 
-    for (const ms of delays) {
+    for (let i = 0; i < delays.length; i += 1) {
+      const ms = delays[i]!;
       if (ms > 0) await delayMs(ms);
+      const strictFresh = Boolean(opts.beforeIds || opts.beforeTitles) && i < delays.length - 1;
       const wins = await this.capture.listWindows().catch(() => []);
-      const hit = this.matchWindowByHint(wins, hints, opts.beforeIds, opts.beforeTitles);
+      const hit = this.matchWindowByHint(wins, hints, opts.beforeIds, opts.beforeTitles, strictFresh);
       if (!hit) continue;
       lastHit = hit;
       const cap = await this.capture.captureWindow(hit.id).catch(() => null);
@@ -1272,6 +1475,11 @@ export class PortalManager {
       .then((wins) => {
         if (this.baselineWindowIds === null) {
           this.baselineWindowIds = new Set(wins.filter((w) => !w.isScreen).map((w) => w.id));
+          if (!this.windowBaselineSeeded && wins.length > 0) {
+            const visible = wins.filter((w) => this.isTrackableAppWindow(w));
+            this.knownWindows = new Map(visible.map((w) => [w.id, { appName: w.appName, title: w.title }]));
+            this.windowBaselineSeeded = true;
+          }
           for (const t of this.deps.getTerminals().values()) {
             if (t.foreground?.pid) this.baselineFgPids.add(t.foreground.pid);
           }
@@ -1294,6 +1502,7 @@ export class PortalManager {
         if (this.deps.hasRemoteViewers()) {
           void this.scanProcessTreePortals().catch(() => {});
         }
+        void this.pollWindowDeltas().catch(() => {});
       }, ms);
       t.unref?.();
       this.scanFollowupTimers.push(t);
@@ -1490,7 +1699,7 @@ export class PortalManager {
     for (const intent of intents) {
       void this.applyAutoPortalIntent(agent, intent).catch(() => {});
     }
-    this.scheduleFollowupScans([350, 1000, 2200]);
+    this.scheduleFollowupScans([250, 800, 1800]);
   }
 
   private resolveTargetWithUniquePrefix(target: string): string | null {
@@ -1545,6 +1754,24 @@ export class PortalManager {
     if (intent.kind === "browser") {
       const url = intent.url || intent.target;
       if (!url) return;
+      const canCdp = await this.browser.hasBrowser().catch(() => false);
+      if (canCdp) {
+        const existingBrowser = [...this.items.values()].find(
+          (i) => i.agentKey === agent.key && i.kind === "browser" && i.url === url && !i.streamError,
+        );
+        if (existingBrowser) {
+          existingBrowser.updatedAt = Date.now();
+          this.emitEvent("opened", existingBrowser);
+          return;
+        }
+        const opened = await this.openPortal({
+          agentKey: agent.key,
+          kind: "browser",
+          url,
+          title: url,
+        }).catch(() => null);
+        if (opened?.item && !opened.item.streamError) return;
+      }
       const wins = await this.capture.listWindows().catch(() => []);
       await this.detectAndOpenWindowPortal({
         agent,
@@ -1575,19 +1802,43 @@ export class PortalManager {
       });
     }
 
-    // Also follow up on any GUI window spawned or retitled via LaunchServices (`open CLAUDE.md` -> Typora / Preview / VS Code, etc.).
-    void this.detectAndOpenWindowPortal({
-      agent,
-      beforeIds: new Set(beforeWins.map((w) => w.id)),
-      beforeTitles: new Map(beforeWins.map((w) => [w.id, w.title])),
-      titleHint: basename(resolvedTarget),
-    }).catch(() => {});
+    if (intent.kind !== "html") {
+      // Also follow up on any GUI window spawned or retitled via LaunchServices (`open CLAUDE.md` -> Typora / Preview / VS Code, etc.).
+      void this.detectAndOpenWindowPortal({
+        agent,
+        beforeIds: new Set(beforeWins.map((w) => w.id)),
+        beforeTitles: new Map(beforeWins.map((w) => [w.id, w.title])),
+        titleHint: basename(resolvedTarget),
+      }).catch(() => {});
+    }
   }
 
   /** Detect `open` / `xdg-open` / `ego-browser` / MCP browser / file-display calls from Agent turns or shell tools. */
   inspectToolCallForPortal(agent: Agent, toolName: string, input: unknown): void {
-    if (!input || typeof input !== "object") return;
-    const inp = input as Record<string, unknown>;
+    let parsedInput: Record<string, unknown> | null = null;
+    if (typeof input === "string") {
+      const trimmed = input.trim();
+      if (!trimmed) return;
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          parsedInput = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Plain string command fallback below
+      }
+      if (!parsedInput) {
+        if (/bash|zsh|shell|exec|terminal|command|run_command/i.test(toolName)) {
+          this.observeSubmittedCommand(agent, trimmed, "agent_tool");
+        }
+        return;
+      }
+    } else if (input && typeof input === "object") {
+      parsedInput = input as Record<string, unknown>;
+    } else {
+      return;
+    }
+    const inp = parsedInput;
 
     if (/bash|zsh|shell|exec|terminal|command/i.test(toolName)) {
       const cmd =
@@ -1601,6 +1852,11 @@ export class PortalManager {
     }
 
     if (/ego[-_]?browser|tabbit|playwright|puppeteer|chrome[-_]?devtools|browser|navigate|goto|open_url|web_preview/i.test(toolName)) {
+      this.lastCommandCtx = {
+        agentKey: agent.key,
+        at: Date.now(),
+        isWsl: false,
+      };
       const url =
         (typeof inp.url === "string" && inp.url) ||
         (typeof inp.href === "string" && inp.href) ||
@@ -1624,6 +1880,11 @@ export class PortalManager {
     }
 
     if (/display_file|open_file|preview_file/i.test(toolName)) {
+      this.lastCommandCtx = {
+        agentKey: agent.key,
+        at: Date.now(),
+        isWsl: false,
+      };
       const raw =
         (typeof inp.path === "string" && inp.path) ||
         (typeof inp.file_path === "string" && inp.file_path) ||

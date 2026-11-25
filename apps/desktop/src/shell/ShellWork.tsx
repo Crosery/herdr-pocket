@@ -6,6 +6,8 @@ import { PocketButton, PocketErrorBoundary, PocketModal, overlayStore, useToast 
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood, resolveVendor } from "../components/MascotAndVendor";
+import { PortalViewerModal } from "../components/PortalViewerModal";
+import { SessionPortalPiP } from "../components/SessionPortalPiP";
 import { serverLabel } from "../components/Sidebar";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
 import { prettyHotkey } from "../components/VoiceInput";
@@ -2508,6 +2510,121 @@ const TabStage = memo(function TabStage({
   );
 });
 
+const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
+  activeTab,
+  lookupAgent,
+}: {
+  activeTab: ShellTab | null;
+  lookupAgent: (key: string) => Agent | undefined;
+}) {
+  const localHostId = useLocalHostDeviceId();
+  const devices = liveStore.use((s) => s.devices);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [modalHostId, setModalHostId] = useState("");
+  const [activePortalId, setActivePortalId] = useState<string | null>(null);
+
+  const focusedLeaf = activeTab ? focusedLeafOfTab(activeTab) : undefined;
+  const { primaryAgent, hostIds, agentKeys, mode } = useMemo(() => {
+    const keys = new Set<string>();
+    const hosts = new Set<string>();
+    let primary: Agent | undefined;
+
+    if (focusedLeaf) {
+      if (focusedLeaf.content.kind === "agent" || focusedLeaf.content.kind === "file") {
+        const a = lookupAgent(focusedLeaf.content.agentKey);
+        if (a) {
+          primary = a;
+          keys.add(a.key);
+          hosts.add(a.deviceId);
+        }
+      } else if (focusedLeaf.content.kind === "diff") {
+        if (focusedLeaf.content.agentKey) {
+          const a = lookupAgent(focusedLeaf.content.agentKey);
+          if (a) {
+            primary = a;
+            keys.add(a.key);
+            hosts.add(a.deviceId);
+          }
+        }
+        if (focusedLeaf.content.deviceId) hosts.add(focusedLeaf.content.deviceId);
+      }
+    }
+
+    if (activeTab) {
+      for (const leaf of tabLeaves(activeTab)) {
+        if (leaf.content.kind === "agent" || leaf.content.kind === "file") {
+          const a = lookupAgent(leaf.content.agentKey);
+          if (a) {
+            if (!primary) primary = a;
+            keys.add(a.key);
+            hosts.add(a.deviceId);
+          }
+        } else if (leaf.content.kind === "diff") {
+          if (leaf.content.agentKey) {
+            const a = lookupAgent(leaf.content.agentKey);
+            if (a) {
+              if (!primary) primary = a;
+              keys.add(a.key);
+              hosts.add(a.deviceId);
+            }
+          }
+          if (leaf.content.deviceId) hosts.add(leaf.content.deviceId);
+        }
+      }
+    }
+
+    if (hosts.size === 0) {
+      if (localHostId && devices[localHostId]?.online) hosts.add(localHostId);
+      for (const [id, dev] of Object.entries(devices)) {
+        if (dev.online) hosts.add(id);
+      }
+    }
+
+    const leafMode: "chat" | "term" =
+      focusedLeaf?.content.kind === "agent"
+        ? (focusedLeaf.content.mode ?? (primary?.isShell ? "term" : "chat"))
+        : primary?.isShell
+          ? "term"
+          : "chat";
+
+    return {
+      primaryAgent: primary ?? null,
+      hostIds: [...hosts],
+      agentKeys: [...keys],
+      mode: leafMode,
+    };
+  }, [activeTab, devices, focusedLeaf, localHostId, lookupAgent]);
+
+  const effectiveModalHostId = modalHostId || primaryAgent?.deviceId || hostIds[0] || localHostId || "";
+
+  return (
+    <>
+      <SessionPortalPiP
+        agent={primaryAgent}
+        hostIds={hostIds}
+        agentKeys={agentKeys}
+        visible={Boolean(activeTab) && !modalOpen}
+        mode={mode}
+        onExpandPortal={(pid, hid) => {
+          setModalHostId(hid);
+          setActivePortalId(pid);
+          setModalOpen(true);
+        }}
+      />
+      {effectiveModalHostId ? (
+        <PortalViewerModal
+          open={modalOpen}
+          onOpenChange={setModalOpen}
+          hostId={effectiveModalHostId}
+          agent={primaryAgent ?? undefined}
+          activePortalId={activePortalId}
+          onSelectPortalId={setActivePortalId}
+        />
+      ) : null}
+    </>
+  );
+});
+
 export const ShellMain = memo(function ShellMain({
   onNewTerminal,
   onNewAgent,
@@ -2534,7 +2651,13 @@ export const ShellMain = memo(function ShellMain({
   const keptAgentIdsRef = useRef<string[]>([]);
   const keptNonAgentIdsRef = useRef<string[]>([]);
   const [prewarmedIds, setPrewarmedIds] = useState<string[]>([]);
+  const [bootHydrated, setBootHydrated] = useState(false);
   const mountedCountRef = useRef(0);
+
+  useEffect(() => {
+    const id = window.setTimeout(() => setBootHydrated(true), 1200);
+    return () => window.clearTimeout(id);
+  }, []);
 
   const agentTabIds = useMemo(
     () => new Set(tabs.filter((t) => tabLeaves(t).some((l) => l.content.kind === "agent")).map((t) => t.id)),
@@ -2571,7 +2694,7 @@ export const ShellMain = memo(function ShellMain({
   }, [activeId, nonAgentTabIds]);
 
   useEffect(() => {
-    if (tabs.length <= 1) return;
+    if (!bootHydrated || tabs.length <= 1) return;
     let alive = true;
     let timer = 0;
     const activeSet = new Set(keptAgentIds);
@@ -2622,13 +2745,14 @@ export const ShellMain = memo(function ShellMain({
       alive = false;
       if (timer) window.clearTimeout(timer);
     };
-  }, [agentTabIds, keptAgentIds, lookupAgent, prewarmedIds, selectedSpace, spacesMap, tabs]);
+  }, [agentTabIds, bootHydrated, keptAgentIds, lookupAgent, prewarmedIds, selectedSpace, spacesMap, tabs]);
 
   const mountedTabIds = useMemo(() => {
+    if (!bootHydrated && activeId) return new Set([activeId]);
     const set = new Set([...keptAgentIds, ...keptNonAgentIds]);
     if (activeId) set.add(activeId);
     return set;
-  }, [activeId, keptAgentIds, keptNonAgentIds]);
+  }, [activeId, bootHydrated, keptAgentIds, keptNonAgentIds]);
 
   const mountedTabs = useMemo(
     () => tabs.filter((t) => mountedTabIds.has(t.id)),
@@ -2687,6 +2811,7 @@ export const ShellMain = memo(function ShellMain({
           />
         </div>
       ))}
+      <WorkspacePortalOverlay activeTab={active} lookupAgent={lookupAgent} />
     </div>
   );
 });

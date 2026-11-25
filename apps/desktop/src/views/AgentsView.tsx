@@ -76,6 +76,7 @@ import { copyToClipboard } from "../lib/bridge";
 import { extractImageTargets } from "../lib/chatImages";
 import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../lib/chatFold";
 import {
+  BUILTIN_SLASH,
   builtinSlashCommands,
   extractSlashQuery,
   matchSlashCommands,
@@ -2130,8 +2131,21 @@ export function AgentDetailPanel({
 
   const submitComposer = (overrideText?: string) => {
     const isOverride = overrideText !== undefined;
-    const raw = (overrideText ?? readComposerFullText()).trim();
+    let raw = (overrideText ?? readComposerFullText()).trim();
     const staged = isOverride ? [] : attachments;
+    if (!agent.isShell && !activeSub && raw.startsWith("\\")) {
+      const head = raw.slice(1).split(/\s+/)[0] ?? "";
+      if (head) {
+        const slashHead = `/${head}`.toLowerCase();
+        const matchesKnown =
+          allSlashCommands.some((item) => item.name.toLowerCase() === slashHead) ||
+          BUILTIN_SLASH.some((item) => item.name.toLowerCase() === slashHead) ||
+          /^\/(?:btw|usage|model|models|switch|effort|thinking|reasoning)$/i.test(slashHead);
+        if (matchesKnown) {
+          raw = `/${raw.slice(1)}`;
+        }
+      }
+    }
     const now = Date.now();
     const sig = `${agent.key}\0${raw}\0${staged.length}`;
     if (!raw && staged.length === 0) return;
@@ -2185,7 +2199,7 @@ export function AgentDetailPanel({
       setModelMenuMode("model");
       return;
     }
-    if (!staged.length && /^\/(?:effort|thinking)$/i.test(raw) && effectiveThinkingLevels.length > 0) {
+    if (!staged.length && /^\/(?:effort|thinking|reasoning)$/i.test(raw) && effectiveThinkingLevels.length > 0) {
       if (!isOverride) {
         setText("");
         composer.clearValue();
@@ -2410,6 +2424,19 @@ export function AgentDetailPanel({
         setModelMenuMode("model");
         return;
       }
+      if (allowAutoSend && normalizeSwitchHarness(agent.harness) === "omp" && /^\/switch$/i.test(cmd.name)) {
+        setText("");
+        setAttachments([]);
+        setModelMenuOmpTab("session");
+        setModelMenuMode("model");
+        return;
+      }
+      if (allowAutoSend && /^\/(?:effort|thinking|reasoning)$/i.test(cmd.name) && effectiveThinkingLevels.length > 0) {
+        setText("");
+        setAttachments([]);
+        setModelMenuMode("thinking");
+        return;
+      }
       if (allowAutoSend && !cmd.argHint && !/^\/btw$/i.test(cmd.name)) {
         setText("");
         setAttachments([]);
@@ -2426,7 +2453,7 @@ export function AgentDetailPanel({
       setText(`${cmd.name} `);
       requestAnimationFrame(() => composer.textareaRef.current?.focus());
     },
-    [agent, composer.textareaRef, isTurnBusy, openUsageView],
+    [agent, composer.textareaRef, effectiveThinkingLevels.length, isTurnBusy, openUsageView],
   );
 
   useEffect(() => {
@@ -3398,15 +3425,17 @@ export function AgentDetailPanel({
         </div>
       </PocketModal>
 
-      <SessionPortalPiP
-        agent={agent}
-        visible={visible}
-        mode={activeMode}
-        onExpandPortal={(pid) => {
-          setActivePortalId(pid);
-          setPortalModalOpen(true);
-        }}
-      />
+      {!embedded ? (
+        <SessionPortalPiP
+          agent={agent}
+          visible={visible}
+          mode={activeMode}
+          onExpandPortal={(pid) => {
+            setActivePortalId(pid);
+            setPortalModalOpen(true);
+          }}
+        />
+      ) : null}
 
       <PortalViewerModal
         open={portalModalOpen}

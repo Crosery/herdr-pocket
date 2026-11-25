@@ -4,6 +4,8 @@ import {
   type HostPortalCapabilities,
   type PortalFileTicket,
   type PortalFramePayload,
+  type PortalFrameTransport,
+  type PortalHeartbeatPayload,
   type PortalInputAction,
   type PortalItem,
   type PortalKind,
@@ -11,7 +13,7 @@ import {
   type RemoteWindowInfo,
 } from "@herdr-pocket/protocol";
 import { logger } from "./log";
-import { getDirectEndpoint, getDirectLink, rpcCall, subscribeStream } from "./relay";
+import { ensureDirectLinkNow, getDirectEndpoint, getDirectLink, rpcCall, subscribeStream } from "./relay";
 import { liveStore } from "./store";
 
 export function encodePortalRelPath(rel: string): string {
@@ -252,6 +254,7 @@ export function stepTrackpadCursor(
 interface PortalState {
   itemsById: Record<string, PortalItem>;
   framesById: Record<string, PortalFramePayload>;
+  heartbeatsById: Record<string, PortalHeartbeatPayload>;
   ticketsById: Record<string, PortalFileTicket>;
   capsByHost: Record<string, HostPortalCapabilities>;
   windowsByHost: Record<string, RemoteWindowInfo[]>;
@@ -263,6 +266,7 @@ interface PortalState {
 const initialState: PortalState = {
   itemsById: {},
   framesById: {},
+  heartbeatsById: {},
   ticketsById: {},
   capsByHost: {},
   windowsByHost: {},
@@ -270,6 +274,56 @@ const initialState: PortalState = {
   manualIds: {},
   openSeqById: {},
 };
+
+export interface PortalResolvedTransport {
+  kind: PortalFrameTransport;
+  isDirect: boolean;
+  label: string;
+  addr: string | null;
+  rttMs: number | null;
+}
+
+const DIRECT_TRANSPORT_LABELS: Record<PortalFrameTransport, string> = {
+  local: "本机直连",
+  "lan-p2p": "局域网 P2P",
+  "vpn-p2p": "Tailscale P2P",
+  "webrtc-p2p": "WebRTC P2P",
+  relay: "中继转发",
+};
+
+/** Resolves actual portal transport strictly from the live direct socket or measured frame delivery path. */
+export function resolvePortalTransport(
+  hostId: string,
+  localHostId?: string | null,
+  frame?: PortalFramePayload | null,
+): PortalResolvedTransport {
+  const link = getDirectLink(hostId);
+  if (link?.open) {
+    return {
+      kind: link.linkKind,
+      isDirect: true,
+      label: DIRECT_TRANSPORT_LABELS[link.linkKind] ?? "P2P 直连",
+      addr: link.displayAddr,
+      rttMs: link.getRttMs(),
+    };
+  }
+  if (localHostId && hostId === localHostId && frame?.transport === "local") {
+    return {
+      kind: "local",
+      isDirect: true,
+      label: DIRECT_TRANSPORT_LABELS.local,
+      addr: "127.0.0.1",
+      rttMs: null,
+    };
+  }
+  return {
+    kind: "relay",
+    isDirect: false,
+    label: DIRECT_TRANSPORT_LABELS.relay,
+    addr: null,
+    rttMs: null,
+  };
+}
 
 let state: PortalState = initialState;
 const listeners = new Set<() => void>();
@@ -368,21 +422,23 @@ export const portalStore = {
   },
 };
 
-export function ingestPortalStreamEvent(ev: unknown): void {
+export function ingestPortalStreamEvent(ev: unknown, hostId?: string): void {
   if (!ev || typeof ev !== "object") return;
   const e = ev as Partial<PortalStreamEvent>;
   if (e.kind === "portal_event" && e.item) {
     const item = e.item;
     if (e.action === "closed") {
       setState((prev) => {
-        if (!prev.itemsById[item.id] && !prev.framesById[item.id]) return prev;
+        if (!prev.itemsById[item.id] && !prev.framesById[item.id] && !prev.heartbeatsById[item.id]) return prev;
         const itemsById = { ...prev.itemsById };
         delete itemsById[item.id];
         const framesById = { ...prev.framesById };
         delete framesById[item.id];
+        const heartbeatsById = { ...prev.heartbeatsById };
+        delete heartbeatsById[item.id];
         const ticketsById = { ...prev.ticketsById };
         delete ticketsById[item.id];
-        return { ...prev, itemsById, framesById, ticketsById };
+        return { ...prev, itemsById, framesById, heartbeatsById, ticketsById };
       });
     } else {
       setState((prev) => {
@@ -402,8 +458,27 @@ export function ingestPortalStreamEvent(ev: unknown): void {
     }
     return;
   }
-  if (e.kind === "portal_frame" && e.portalId && e.data) {
-    const frame = e as PortalFramePayload;
+  if (e.kind === "portal_heartbeat" && e.portalId) {
+    const hb = e as PortalHeartbeatPayload;
+    setState((prev) => ({
+      ...prev,
+      heartbeatsById: { ...prev.heartbeatsById, [hb.portalId]: hb },
+    }));
+    return;
+  }
+  if (e.kind === "portal_frame" && e.portalId && (e.data || e.rawBytes)) {
+    const raw = e as PortalFramePayload;
+    const resolvedTransport =
+      raw.transport ??
+      (hostId ? (getDirectLink(hostId)?.linkKind ?? "relay") : undefined);
+    const frame: PortalFramePayload = {
+      ...raw,
+      byteLength:
+        raw.byteLength ??
+        raw.rawBytes?.byteLength ??
+        (raw.data ? Math.floor((raw.data.length * 3) / 4) : 0),
+      ...(resolvedTransport ? { transport: resolvedTransport } : {}),
+    };
     setState((prev) => {
       const cur = prev.framesById[frame.portalId];
       if (cur && cur.seq >= frame.seq && cur.at >= frame.at) return prev;
@@ -527,9 +602,11 @@ export async function closePortalSurface(hostId: string, portalId: string): Prom
     delete itemsById[portalId];
     const framesById = { ...prev.framesById };
     delete framesById[portalId];
+    const heartbeatsById = { ...prev.heartbeatsById };
+    delete heartbeatsById[portalId];
     const ticketsById = { ...prev.ticketsById };
     delete ticketsById[portalId];
-    return { ...prev, itemsById, framesById, ticketsById };
+    return { ...prev, itemsById, framesById, heartbeatsById, ticketsById };
   });
 }
 
@@ -563,7 +640,7 @@ export function capturePortalFrameOnce(
         }));
       }
       if (res.frame) {
-        ingestPortalStreamEvent({ kind: "portal_frame", ...res.frame });
+        ingestPortalStreamEvent({ kind: "portal_frame", ...res.frame }, hostId);
       }
       return res.frame;
     } catch (err) {
@@ -668,7 +745,7 @@ export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): 
     "portal",
     {},
     (ev) => {
-      if (alive) ingestPortalStreamEvent(ev);
+      if (alive) ingestPortalStreamEvent(ev, hostId);
     },
     (st) => {
       if (!alive) return;
@@ -722,10 +799,28 @@ export function subscribePortalFrames(
   const fps = Math.max(1, Math.min(60, opts.fps ?? 30));
   let alive = true;
   let streamLive = false;
-  let lastStreamFrameAt = 0;
+  let lastStreamActivityAt = 0;
   let busy = false;
+  let ackInFlight = false;
+  let pendingAckSeq = 0;
+  let lastAckedSeq = 0;
 
+  // Kick P2P probe / RTT measurement immediately on viewer open so video doesn't stall on relay backoff.
+  ensureDirectLinkNow(hostId);
   void capturePortalFrameOnce(hostId, portalId, opts).catch(() => {});
+
+  const flushAck = () => {
+    if (!alive || ackInFlight || pendingAckSeq <= lastAckedSeq) return;
+    const seq = pendingAckSeq;
+    ackInFlight = true;
+    lastAckedSeq = seq;
+    void rpcCall(hostId, "portal.input", { portalId, input: { type: "ack", seq } }, 4000)
+      .catch(() => {})
+      .finally(() => {
+        ackInFlight = false;
+        if (alive && pendingAckSeq > lastAckedSeq) flushAck();
+      });
+  };
 
   const unsub = subscribeStream(
     hostId,
@@ -733,29 +828,42 @@ export function subscribePortalFrames(
     {
       portalId,
       fps,
+      binaryFrames: true,
       ...(opts.maxWidth ? { maxWidth: opts.maxWidth } : {}),
       ...(opts.quality ? { quality: opts.quality } : {}),
       ...(opts.showCursor !== undefined ? { showCursor: opts.showCursor } : {}),
     },
     (ev) => {
       if (!alive) return;
-      if (ev?.kind === "portal_frame" && ev.portalId === portalId) {
-        lastStreamFrameAt = Date.now();
+      if (
+        (ev?.kind === "portal_frame" || ev?.kind === "portal_heartbeat") &&
+        ev.portalId === portalId
+      ) {
+        lastStreamActivityAt = Date.now();
       }
-      ingestPortalStreamEvent(ev);
+      if (ev?.kind === "portal_frame" && ev.portalId === portalId && typeof ev.seq === "number") {
+        if (ev.seq > pendingAckSeq) {
+          pendingAckSeq = ev.seq;
+          flushAck();
+        }
+      }
+      ingestPortalStreamEvent(ev, hostId);
     },
     (st) => {
-      if (alive && st?.kind === "live") streamLive = true;
+      if (alive && st?.kind === "live") {
+        streamLive = true;
+        if (lastStreamActivityAt === 0) lastStreamActivityAt = Date.now();
+      }
       if (alive && st?.kind === "error") streamLive = false;
     },
   );
 
-  // Fallback RPC poll only kicks in when push stream isn't delivering (e.g. older relay / stalled stream).
-  const pollInterval = Math.max(90, Math.round(1000 / Math.max(1, Math.min(12, fps))));
+  // Fallback RPC poll only kicks in when push stream stops delivering frames AND heartbeats (>= 2600ms silence).
+  const pollInterval = Math.max(450, Math.round(1000 / Math.max(1, Math.min(4, fps))));
   let lastErrorPollAt = 0;
-  const timer = window.setInterval(() => {
+  const timer = setInterval(() => {
     if (!alive || busy) return;
-    if (streamLive && (lastStreamFrameAt === 0 || Date.now() - lastStreamFrameAt < 1500)) return;
+    if (streamLive && (lastStreamActivityAt === 0 || Date.now() - lastStreamActivityAt < 2600)) return;
     if (state.itemsById[portalId]?.streamError) {
       const now = Date.now();
       if (now - lastErrorPollAt < 4000) return;
@@ -771,7 +879,7 @@ export function subscribePortalFrames(
 
   return () => {
     alive = false;
-    window.clearInterval(timer);
+    clearInterval(timer);
     unsub();
   };
 }

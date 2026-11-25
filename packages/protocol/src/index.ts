@@ -1033,11 +1033,19 @@ export interface PortalFileTicket {
   isDir: boolean;
 }
 
+export type PortalFrameTransport = "local" | "lan-p2p" | "vpn-p2p" | "webrtc-p2p" | "relay";
+
 export interface PortalFramePayload {
   portalId: string;
   seq: number;
   mime: "image/jpeg" | "image/png" | "image/webp";
   data: string;
+  /** Optional raw binary image payload attached client-side for zero-copy Blob/createImageBitmap decoding. */
+  rawBytes?: Uint8Array;
+  /** Actual encoded byte length of the image frame. */
+  byteLength?: number;
+  /** Actual transport path that delivered this frame. */
+  transport?: PortalFrameTransport;
   width: number;
   height: number;
   url?: string;
@@ -1051,9 +1059,22 @@ export interface PortalFramePayload {
   at: number;
 }
 
+export interface PortalHeartbeatPayload {
+  portalId: string;
+  fps: number;
+  idle: boolean;
+  captureMs?: number;
+  rttMs?: number;
+  quality?: number;
+  width?: number;
+  height?: number;
+  at: number;
+}
+
 export type PortalStreamEvent =
   | { kind: "portal_event"; action: "opened" | "updated" | "closed"; item: PortalItem; at: number }
-  | ({ kind: "portal_frame" } & PortalFramePayload);
+  | ({ kind: "portal_frame" } & PortalFramePayload)
+  | ({ kind: "portal_heartbeat" } & PortalHeartbeatPayload);
 
 export type PortalInputAction =
   | {
@@ -1070,7 +1091,8 @@ export type PortalInputAction =
   | { type: "clipboard"; action: "get" | "set"; text?: string }
   | { type: "config"; fps?: number; maxWidth?: number; quality?: number; showCursor?: boolean }
   | { type: "promptPermission"; kind: "accessibility" | "screenRecording" }
-  | { type: "navigate"; action: "goto" | "back" | "forward" | "reload"; url?: string };
+  | { type: "navigate"; action: "goto" | "back" | "forward" | "reload"; url?: string }
+  | { type: "ack"; seq: number };
 
 export const DIRECT_PORTAL_FS_PREFIX = "/v1/portal-fs";
 
@@ -3250,6 +3272,7 @@ export const WEBRTC_STUN_URLS = [
 export const WEBRTC_RPC_CHANNEL = "hp-rpc";
 export const WEBRTC_PUT_CHANNEL = "hp-put";
 export const WEBRTC_GET_CHANNEL = "hp-get";
+export const WEBRTC_PORTAL_CHANNEL = "hp-portal";
 export const WEBRTC_CHUNK_CHARS = 32_000;
 export const WEBRTC_BIN_CHUNK_BYTES = 32 * 1024;
 
@@ -3576,6 +3599,68 @@ export const jsChaCha20Poly1305: DirectAead = {
  * sent: each side counts the frames it sends and receives (a WebSocket keeps them in order), so a frame
  * replayed, dropped or reordered on the way fails to open and the link is closed.
  */
+export const PORTAL_BIN_MAGIC = 0x504b4631; // "PKF1"
+
+export type PortalBinaryFrameMeta = Omit<PortalFramePayload, "data" | "rawBytes">;
+
+/** Encodes a raw image frame packet as `[4B "PKF1"][4B u32BE jsonLen][UTF-8 JSON {id, meta}][imageBytes]`. */
+export function encodeBinaryPortalStreamFrame(
+  streamId: string,
+  meta: PortalBinaryFrameMeta,
+  imageBytes: Uint8Array,
+): Uint8Array {
+  const headerBytes = utf8Encode(JSON.stringify({ id: streamId, meta }));
+  const packet = new Uint8Array(8 + headerBytes.byteLength + imageBytes.byteLength);
+  packet[0] = 0x50;
+  packet[1] = 0x4b;
+  packet[2] = 0x46;
+  packet[3] = 0x31;
+  const jsonLen = headerBytes.byteLength >>> 0;
+  packet[4] = (jsonLen >>> 24) & 0xff;
+  packet[5] = (jsonLen >>> 16) & 0xff;
+  packet[6] = (jsonLen >>> 8) & 0xff;
+  packet[7] = jsonLen & 0xff;
+  packet.set(headerBytes, 8);
+  packet.set(imageBytes, 8 + jsonLen);
+  return packet;
+}
+
+/** Decodes a `"PKF1"` binary portal frame packet produced by `encodeBinaryPortalStreamFrame`. */
+export function decodeBinaryPortalStreamFrame(
+  packet: Uint8Array,
+): { id: string; meta: PortalBinaryFrameMeta; bytes: Uint8Array } | null {
+  if (
+    packet.byteLength < 8 ||
+    packet[0] !== 0x50 ||
+    packet[1] !== 0x4b ||
+    packet[2] !== 0x46 ||
+    packet[3] !== 0x31
+  ) {
+    return null;
+  }
+  const jsonLen =
+    ((packet[4]! << 24) | (packet[5]! << 16) | (packet[6]! << 8) | packet[7]!) >>> 0;
+  if (8 + jsonLen > packet.byteLength || jsonLen === 0 || jsonLen > 512 * 1024) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(utf8Decode(packet.subarray(8, 8 + jsonLen))) as {
+      id?: string;
+      meta?: PortalBinaryFrameMeta;
+    };
+    if (!parsed || typeof parsed.id !== "string" || !parsed.meta || typeof parsed.meta.portalId !== "string") {
+      return null;
+    }
+    return {
+      id: parsed.id,
+      meta: parsed.meta,
+      bytes: packet.subarray(8 + jsonLen),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export class DirectCipher {
   private sent = 0;
   private received = 0;
@@ -3588,17 +3673,28 @@ export class DirectCipher {
     this.me = me;
   }
 
-  seal(text: string): Uint8Array {
-    return this.aead.seal(this.key, directNonce(this.me, this.sent++), utf8Encode(text));
+  /** Seals raw binary bytes with the shared monotonically counted nonce. */
+  sealBytes(plain: Uint8Array): Uint8Array {
+    return this.aead.seal(this.key, directNonce(this.me, this.sent++), plain);
   }
 
-  /** The frame's text, or null when it is not the next frame from the other end. */
-  open(data: Uint8Array): string | null {
+  seal(text: string): Uint8Array {
+    return this.sealBytes(utf8Encode(text));
+  }
+
+  /** Decrypts raw binary bytes or returns null if the frame is out of order or unauthenticated. */
+  openBytes(data: Uint8Array): Uint8Array | null {
     const other = this.me === DIRECT_FROM_PHONE ? DIRECT_FROM_HOST : DIRECT_FROM_PHONE;
     const plain = this.aead.open(this.key, directNonce(other, this.received), data);
     if (!plain) return null;
     this.received++;
-    return utf8Decode(plain);
+    return plain;
+  }
+
+  /** The frame's text, or null when it is not the next frame from the other end. */
+  open(data: Uint8Array): string | null {
+    const plain = this.openBytes(data);
+    return plain ? utf8Decode(plain) : null;
   }
 }
 

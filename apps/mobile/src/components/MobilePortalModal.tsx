@@ -11,22 +11,24 @@ import {
   type FileEntry,
   type HostPortalCapabilities,
   type PortalFramePayload,
+  type PortalHeartbeatPayload,
   type PortalInputAction,
   type PortalItem,
   type PortalStreamEvent,
   type RemoteWindowInfo,
 } from "@herdr-pocket/protocol";
-import { call, getDirectEndpoint, subscribe } from "../lib/relay";
+import { call, ensureDirectLinkNow, getDirectEndpoint, getDirectTransportInfo, subscribe } from "../lib/relay";
 import { friendlyError } from "../lib/session";
+import { useLive } from "../lib/store";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space } from "../theme/tokens";
 import { PocketButton, PocketSpinner } from "./pocket";
 import { Card, PageBackground } from "./ui";
 
 const MOBILE_PRESETS: Array<{ id: string; label: string; fps: number; maxWidth: number; quality: number }> = [
-  { id: "smooth", label: "流畅 30帧", fps: 30, maxWidth: 960, quality: 55 },
-  { id: "hd30", label: "高清 30帧", fps: 30, maxWidth: 1280, quality: 72 },
-  { id: "hd60", label: "超清 60帧", fps: 60, maxWidth: 1600, quality: 78 },
+  { id: "smooth", label: "流畅 60帧", fps: 60, maxWidth: 1080, quality: 54 },
+  { id: "hd30", label: "高清 30帧", fps: 30, maxWidth: 1280, quality: 68 },
+  { id: "hd60", label: "超清 60帧", fps: 60, maxWidth: 1600, quality: 66 },
 ];
 
 const MOBILE_MODS: Array<{ id: string; label: string }> = [
@@ -176,6 +178,8 @@ export function MobilePortalBanner({
 }) {
   const p = usePalette();
   const top = items[0];
+  useLive((s) => s.direct[top?.hostId ?? agent.deviceId]);
+  const transport = getDirectTransportInfo(top?.hostId ?? agent.deviceId);
   if (!top) {
     return (
       <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "flex-end", paddingHorizontal: space.lg, paddingTop: 2 }}>
@@ -228,7 +232,7 @@ export function MobilePortalBanner({
         </Text>
         <Text numberOfLines={1} style={{ fontSize: 11.5, color: p.muted }}>
           {items.length > 1 ? `${items.length} 个回传会话 · ` : ""}
-          {top.transportHint === "p2p" ? "P2P 直连优先" : "Relay 传输"} · 点击展开操作
+          {transport.label} · 点击展开操作
         </Text>
       </View>
       <MaterialCommunityIcons name="chevron-right" size={18} color={p.accentText} />
@@ -253,9 +257,14 @@ export function MobilePortalModal({
 }) {
   const p = usePalette();
   const insets = useSafeAreaInsets();
+  useLive((s) => s.direct[agent.deviceId]);
+  const relayRttMs = useLive((s) => s.rttMs);
   const [selectedId, setSelectedId] = useState<string | null>(initialItem?.id ?? null);
   const [itemPatch, setItemPatch] = useState<PortalItem | null>(null);
   const [frame, setFrame] = useState<PortalFramePayload | null>(null);
+  const [heartbeat, setHeartbeat] = useState<PortalHeartbeatPayload | null>(null);
+  const [metrics, setMetrics] = useState<{ fps: number; kbps: number }>({ fps: 0, kbps: 0 });
+  const [, setTransportTick] = useState(0);
   const [boxSize, setBoxSize] = useState({ width: 320, height: 240 });
   const [urlInput, setUrlInput] = useState("");
   const [textInput, setTextInput] = useState("");
@@ -289,6 +298,13 @@ export function MobilePortalModal({
     if (initialItem) setSelectedId(initialItem.id);
     else if (!selectedId || !items.some((x) => x.id === selectedId)) setSelectedId(items[0]?.id ?? null);
   }, [initialItem, items, selectedId, visible]);
+
+  useEffect(() => {
+    if (!visible) return;
+    ensureDirectLinkNow(agent.deviceId);
+    const timer = setInterval(() => setTransportTick((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, [agent.deviceId, visible]);
 
   useEffect(() => {
     if (!visible) return;
@@ -329,12 +345,35 @@ export function MobilePortalModal({
     }
   }, [active, agent.deviceId]);
 
+  const statSamplesRef = useRef<Array<{ at: number; bytes: number }>>([]);
+  const lastFrameSeqRef = useRef(-1);
+
+  const recomputeMetrics = useCallback(() => {
+    const now = Date.now();
+    const kept = statSamplesRef.current.filter((s) => now - s.at <= 1000);
+    statSamplesRef.current = kept;
+    const fps = kept.length;
+    const totalBytes = kept.reduce((acc, s) => acc + s.bytes, 0);
+    const kbps = Math.round(totalBytes / 1024);
+    setMetrics((prev) => (prev.fps === fps && prev.kbps === kbps ? prev : { fps, kbps }));
+  }, []);
+
   useEffect(() => {
     setDragLocked(false);
     setLatchedMods([]);
     setClipInfo(null);
     setZoom(1);
+    setHeartbeat(null);
+    statSamplesRef.current = [];
+    lastFrameSeqRef.current = -1;
+    setMetrics({ fps: 0, kbps: 0 });
   }, [active?.id]);
+
+  useEffect(() => {
+    if (!visible || !active || (active.kind !== "browser" && active.kind !== "window")) return;
+    const timer = setInterval(recomputeMetrics, 500);
+    return () => clearInterval(timer);
+  }, [active?.id, active?.kind, recomputeMetrics, visible]);
 
   useEffect(() => {
     if (!visible || !active) return;
@@ -346,7 +385,24 @@ export function MobilePortalModal({
       return;
     }
     let alive = true;
+    let ackInFlight = false;
+    let pendingAckSeq = 0;
+    let lastAckedSeq = 0;
     const cfg = presetRef.current;
+
+    const flushAck = () => {
+      if (!alive || ackInFlight || pendingAckSeq <= lastAckedSeq) return;
+      const seq = pendingAckSeq;
+      ackInFlight = true;
+      lastAckedSeq = seq;
+      void call(agent.deviceId, "portal.input", { portalId: active.id, input: { type: "ack", seq } }, 4000)
+        .catch(() => {})
+        .finally(() => {
+          ackInFlight = false;
+          if (alive && pendingAckSeq > lastAckedSeq) flushAck();
+        });
+    };
+
     void call(
       agent.deviceId,
       "portal.frame",
@@ -368,8 +424,23 @@ export function MobilePortalModal({
         if (!alive || !ev) return;
         if (ev.kind === "portal_event" && ev.item && ev.item.id === active.id) {
           setItemPatch(ev.item);
+        } else if (ev.kind === "portal_heartbeat" && ev.portalId === active.id) {
+          setHeartbeat(ev as PortalHeartbeatPayload);
         } else if (ev.kind === "portal_frame" && ev.portalId === active.id && ev.data) {
-          setFrame(ev as PortalFramePayload);
+          const f = ev as PortalFramePayload;
+          setFrame(f);
+          if (typeof f.seq === "number") {
+            if (f.seq !== lastFrameSeqRef.current) {
+              lastFrameSeqRef.current = f.seq;
+              const bytes = f.byteLength ?? Math.round((f.data.length * 3) / 4);
+              statSamplesRef.current.push({ at: Date.now(), bytes });
+              recomputeMetrics();
+            }
+            if (f.seq > pendingAckSeq) {
+              pendingAckSeq = f.seq;
+              flushAck();
+            }
+          }
         }
       },
     );
@@ -377,7 +448,7 @@ export function MobilePortalModal({
       alive = false;
       unsub();
     };
-  }, [active?.id, active?.kind, active?.url, agent.deviceId, visible]);
+  }, [active?.id, active?.kind, active?.url, agent.deviceId, recomputeMetrics, visible]);
 
   const loadPreviewFile = useCallback(
     async (relOrAbs: string) => {
@@ -563,6 +634,40 @@ export function MobilePortalModal({
   const sendInputRef = useRef(sendInput);
   sendInputRef.current = sendInput;
   const panStateRef = useRef({ prevDx: 0, prevDy: 0, downAt: 0, movedPx: 0, lastSentAt: 0 });
+  const moveInFlightRef = useRef(false);
+  const pendingMoveRef = useRef<{ action: "move" | "drag"; nx: number; ny: number } | null>(null);
+  const deviceIdRef = useRef(agent.deviceId);
+  deviceIdRef.current = agent.deviceId;
+
+  const flushTrackpadMove = useCallback(() => {
+    if (moveInFlightRef.current) return;
+    const pend = pendingMoveRef.current;
+    if (!pend) return;
+    const now = Date.now();
+    const minInterval = getDirectTransportInfo(deviceIdRef.current).isDirect ? 14 : 26;
+    const wait = minInterval - (now - panStateRef.current.lastSentAt);
+    if (wait > 0) {
+      setTimeout(flushTrackpadMove, wait);
+      return;
+    }
+    panStateRef.current.lastSentAt = now;
+    pendingMoveRef.current = null;
+    moveInFlightRef.current = true;
+    void sendInputRef
+      .current({
+        type: "pointer",
+        action: pend.action,
+        nx: pend.nx,
+        ny: pend.ny,
+        button: "left",
+      })
+      .finally(() => {
+        moveInFlightRef.current = false;
+        if (pendingMoveRef.current) flushTrackpadMove();
+      });
+  }, []);
+  const flushTrackpadMoveRef = useRef(flushTrackpadMove);
+  flushTrackpadMoveRef.current = flushTrackpadMove;
 
   const trackpadResponder = useMemo(
     () =>
@@ -572,6 +677,7 @@ export function MobilePortalModal({
         onPanResponderTerminationRequest: () => false,
         onPanResponderGrant: () => {
           setStageTouching(true);
+          pendingMoveRef.current = null;
           panStateRef.current = { prevDx: 0, prevDy: 0, downAt: Date.now(), movedPx: 0, lastSentAt: 0 };
         },
         onPanResponderMove: (_evt, g) => {
@@ -584,17 +690,12 @@ export function MobilePortalModal({
           const next = stepMobileCursor(cursorRef.current, ddx, ddy, boxSizeRef.current.width, boxSizeRef.current.height);
           cursorRef.current = next;
           setCursorNxNy(next);
-          const now = Date.now();
-          if (now - st.lastSentAt >= 28) {
-            st.lastSentAt = now;
-            void sendInputRef.current({
-              type: "pointer",
-              action: dragLockRef.current ? "drag" : "move",
-              nx: next.nx,
-              ny: next.ny,
-              button: "left",
-            });
-          }
+          pendingMoveRef.current = {
+            action: dragLockRef.current ? "drag" : "move",
+            nx: next.nx,
+            ny: next.ny,
+          };
+          flushTrackpadMoveRef.current();
         },
         onPanResponderRelease: (_evt, g) => {
           setStageTouching(false);
@@ -602,6 +703,7 @@ export function MobilePortalModal({
           const dt = Date.now() - st.downAt;
           const pt = cursorRef.current;
           if (Math.hypot(g.dx, g.dy) < 8 && st.movedPx < 10 && dt < 260) {
+            pendingMoveRef.current = null;
             const mods = latchedModsRef.current;
             void sendInputRef.current({
               type: "pointer",
@@ -613,13 +715,12 @@ export function MobilePortalModal({
             });
             if (mods.length) setLatchedMods([]);
           } else {
-            void sendInputRef.current({
-              type: "pointer",
+            pendingMoveRef.current = {
               action: dragLockRef.current ? "drag" : "move",
               nx: pt.nx,
               ny: pt.ny,
-              button: "left",
-            });
+            };
+            flushTrackpadMoveRef.current();
           }
         },
         onPanResponderTerminate: () => {
@@ -636,6 +737,16 @@ export function MobilePortalModal({
   const cursorBoxY = boxSize.height / 2 + panOffsetY + (containedBox.drawY + cursorNxNy.ny * containedBox.drawH - boxSize.height / 2) * zoom;
   const isRemoteMac = caps?.sessionType === "macos";
   const primaryCopyMod = isRemoteMac ? ["meta"] : ["ctrl"];
+  const transport = getDirectTransportInfo(agent.deviceId);
+  const effectiveRtt = transport.rttMs ?? (typeof relayRttMs === "number" ? relayRttMs : null);
+  const streamMetricsText =
+    active && (active.kind === "browser" || active.kind === "window")
+      ? metrics.fps > 0
+        ? ` · ${metrics.fps}fps · ${metrics.kbps}KB/s`
+        : frame
+          ? ` · 静止省流 (${heartbeat?.fps ?? activePreset.fps}fps 就绪)`
+          : " · 等待首帧"
+      : "";
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="fullScreen" onRequestClose={onDismiss}>
@@ -657,9 +768,21 @@ export function MobilePortalModal({
             <Text numberOfLines={1} style={{ fontFamily: fonts.cute, fontSize: 18, color: p.ink }}>
               {active ? active.title : "跨端窗口与文件回传"}
             </Text>
-            <Text numberOfLines={1} style={{ fontSize: 12, color: p.muted }}>
-              {active ? (active.transportHint === "p2p" ? "P2P 直连回传" : "中转通道回传") : "投屏 remote 浏览器 / 桌面窗口 / 文件"}
-            </Text>
+            <Pressable
+              disabled={transport.isDirect}
+              onPress={() => {
+                if (!transport.isDirect) {
+                  ensureDirectLinkNow(agent.deviceId);
+                  setClipInfo("正在尝试建立 P2P 直连…");
+                }
+              }}
+            >
+              <Text numberOfLines={1} style={{ fontSize: 12, color: transport.isDirect ? p.accentText : p.muted }}>
+                {active
+                  ? `${transport.label}${streamMetricsText}${effectiveRtt !== null ? ` · ${effectiveRtt}ms` : ""}${!transport.isDirect ? " · 点此重连 P2P" : ""}`
+                  : "投屏 remote 浏览器 / 桌面窗口 / 文件"}
+              </Text>
+            </Pressable>
           </View>
           {active ? (
             <PocketButton size="sm" variant="danger" onPress={() => void closeCurrent()}>

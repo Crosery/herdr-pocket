@@ -32,6 +32,10 @@ const VIEWER_COMMANDS = new Set([
   "/skills",
   "/tools",
   "/commands",
+  "/swarm",
+  "/bashes",
+  "/ps",
+  "/diff",
 ]);
 
 const INTERACTIVE_PICKER_COMMANDS = new Set([
@@ -50,6 +54,13 @@ const INTERACTIVE_PICKER_COMMANDS = new Set([
   "/vim",
   "/theme",
   "/models",
+  "/agents",
+  "/subagent",
+  "/subagents",
+  "/hub",
+  "/extensions",
+  "/memory",
+  "/sandbox",
 ]);
 
 /** Classifies a chat-sent slash command by whether it renders a read-only TUI info panel, an interactive picker, or a normal turn. */
@@ -62,13 +73,15 @@ export function classifySlashCommand(harness: string, rawText: string): SlashTer
   const h = harness.trim().toLowerCase();
 
   if (cmd === "/model" && !args) return "interactive";
-  if ((cmd === "/effort" || cmd === "/thinking") && !args) return "interactive";
-  if (cmd === "/model" || cmd === "/effort" || cmd === "/thinking" || cmd === "/switch") {
+  if ((cmd === "/effort" || cmd === "/thinking" || cmd === "/reasoning") && !args) return "interactive";
+  if (cmd === "/model" || cmd === "/effort" || cmd === "/thinking" || cmd === "/reasoning" || cmd === "/switch") {
     // Switching model/effort with explicit arg can still print inline TUI errors (e.g. Codex/CodeBuddy/Pi).
     return "normal";
   }
   if (VIEWER_COMMANDS.has(cmd)) {
     if (cmd === "/session" && args && args !== "info") return "normal";
+    if (cmd === "/swarm") return !args || args === "board" || args === "status" ? "viewer" : "normal";
+    if (cmd === "/diff" && args) return "normal";
     if ((cmd === "/skills" || cmd === "/tools") && args) return "normal";
     if (h === "omp" && (cmd === "/stats" || cmd === "/help")) return "viewer";
     return "viewer";

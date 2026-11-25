@@ -706,8 +706,15 @@ test("PortalManager binds new Windows X-Server (vcxsrv) windows to recent WSL te
           return { code: 0, stderr: "", stdout: Buffer.from(JSON.stringify(winList)) };
         }
         const m = /@\('capture',\s*'[^']+',\s*'([^']+)'/.exec(cmdStr);
+        if (m?.[1] === "-") {
+          return {
+            code: 0,
+            stderr: "",
+            stdout: Buffer.from(`dims:800x600|cursor:0.5000,0.5000,1|b64:${Buffer.from("win-xserver-jpg").toString("base64")}`),
+          };
+        }
         if (m?.[1]) writeFileSync(m[1], "win-xserver-jpg");
-        return { code: 0, stderr: "", stdout: Buffer.from("640x480") };
+        return { code: 0, stderr: "", stdout: Buffer.from("dims:640x480|cursor:0.5000,0.5000,1") };
       },
     },
   });
@@ -1389,5 +1396,187 @@ test("PortalManager.observeSubmittedCommand and pollWindowDeltas auto-surface fi
   assert.ok(
     events.some((e) => e.kind === "portal_event" && e.action === "opened" && e.item.windowId === "9002"),
     "expected opened portal_event for retitled window",
+  );
+});
+
+test("OsCaptureDriver routes capture via v2 bridge and avoids 28ms 60fps cache frame drops", async (t) => {
+  const state = mkdtempSync(join(tmpdir(), "hp-v2-cap-"));
+  const binDir = join(state, "bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(join(binDir, "hp-mac-portal-v3"), "mock-bin");
+  writeFileSync(join(binDir, "hp-mac-portal-v3.swift"), MAC_SWIFT_SRC);
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+
+  const execCalls: string[][] = [];
+  const driver = new OsCaptureDriver({
+    platform: "darwin",
+    binDir,
+    hasCmd: (c) => c === "swiftc",
+    execBin: async (cmd, args) => {
+      execCalls.push([cmd, ...args]);
+      if (args[0] === "check") {
+        return { code: 0, stderr: "", stdout: Buffer.from(JSON.stringify({ screenCapture: true, accessibility: true, bridgeVersion: 2 })) };
+      }
+      if (args[0] === "capture") {
+        return { code: 0, stderr: "dims:1600x1000\n", stdout: Buffer.from("fast-jpg") };
+      }
+      return { code: 1, stderr: "", stdout: Buffer.alloc(0) };
+    },
+  });
+  const permNote = await driver.checkPermissionNote();
+  assert.equal(permNote, null);
+  const frame = await driver.captureWindow("screen:0", { fps: 60, maxWidth: 1600, quality: 66 });
+  assert.ok(frame && frame.width === 1600 && frame.height === 1000);
+  // Explicit streaming calls use tight 3ms cache (two calls separated by 8ms must both execute rather than returning stale cached frames).
+  await new Promise((r) => setTimeout(r, 8));
+  await driver.captureWindow("screen:0", { fps: 60, maxWidth: 1600, quality: 66 });
+  assert.equal(execCalls.filter((c) => c.includes("capture")).length, 2);
+});
+
+test("PortalManager immediately opens CDP browser on open URL, matches shell t.pid hook, and emits heartbeat/ack telemetry", async (t) => {
+  const state = mkdtempSync(join(tmpdir(), "hp-cdp-fast-"));
+  const binDir = join(state, "bin");
+  mkdirSync(binDir, { recursive: true });
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+
+  const events: PortalStreamEvent[] = [];
+  const fakeAgent = {
+    key: "h1/hc:shell1",
+    deviceId: "h1",
+    source: "hc" as const,
+    localId: "shell1",
+    harness: "shell",
+    where: "终端",
+    cwd: state,
+    status: "idle" as const,
+    isShell: true,
+    updatedAt: Date.now(),
+  };
+
+  let staticMode = false;
+  let frameCounter = 0;
+  const mgr = new PortalManager({
+    hostId: () => "h1",
+    getAgents: () => [fakeAgent],
+    getTerminals: () => new Map([["shell1", { address: "shell1", cwd: state, pid: 500 }]]),
+    getFilesOptions: () => ({ extraRoots: [state] }),
+    getDirectInfo: () => ({ port: 49000, addrs: ["127.0.0.1"], connectedCount: 1 }),
+    hasRemoteViewers: () => true,
+    onPortalEvent: (ev) => events.push(ev),
+    stateDir: state,
+    captureDeps: {
+      platform: "darwin",
+      binDir,
+      hasCmd: (c) => c === "swiftc",
+      listProcesses: async () => [
+        { pid: 1, ppid: 0, name: "launchd" },
+        { pid: 500, ppid: 1, name: "zsh" },
+        { pid: 505, ppid: 500, name: "open" },
+      ],
+      execBin: async (cmd, args) => {
+        if (cmd === "swiftc") {
+          const outIdx = args.indexOf("-o");
+          if (outIdx >= 0 && args[outIdx + 1]) writeFileSync(args[outIdx + 1]!, "mock-bin");
+          return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+        }
+        if (args[0] === "list") return { code: 0, stderr: "", stdout: Buffer.from("[]") };
+        if (args[0] === "capture") {
+          const tag = staticMode ? "static" : `dyn-${++frameCounter}`;
+          return { code: 0, stderr: "dims:1280x800\n", stdout: Buffer.from(`jpeg-${tag}`) };
+        }
+        return { code: 1, stderr: "", stdout: Buffer.alloc(0) };
+      },
+    },
+  });
+  let stopSub: (() => void) | null = null;
+  t.after(() => {
+    stopSub?.();
+    mgr.stop();
+  });
+
+  // 1) Inject stub CdpBrowserPool on mgr.browser so `open https://example.com` opens a CDP browser tab immediately without polling OS windows for 2.6s.
+  const cdpOpenedUrls: string[] = [];
+  const fakeCdpBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+  const stubSessions = new Map<string, Record<string, unknown>>();
+  const mgrAny = mgr as unknown as { browser: Record<string, unknown> };
+  mgrAny.browser = {
+    hasBrowser: async () => true,
+    open: async (portalId: string, url: string) => {
+      cdpOpenedUrls.push(url);
+      const frame = {
+        portalId,
+        seq: 1,
+        mime: "image/jpeg" as const,
+        data: "",
+        rawBytes: fakeCdpBytes,
+        width: 1280,
+        height: 800,
+        url,
+        title: "Example Domain",
+        at: Date.now(),
+      };
+      stubSessions.set(portalId, {
+        url,
+        title: "Example Domain",
+        getLatestFrame: () => frame,
+        captureOnce: async () => frame,
+        onFrame: () => () => {},
+        startScreencast: async () => {},
+        updateScreencastConfig: async () => {},
+        stopScreencast: async () => {},
+        close: () => {},
+      });
+      return { url, title: "Example Domain" };
+    },
+    get: (portalId: string) => stubSessions.get(portalId),
+    close: (portalId: string) => {
+      stubSessions.delete(portalId);
+    },
+    closeAll: () => {
+      stubSessions.clear();
+    },
+  };
+
+  // Trigger shell `open https://example.com` and verify instant CDP browser portal without OS window polling.
+  const t0 = Date.now();
+  mgr.observeSubmittedCommand(fakeAgent, "open https://example.com", "terminal_input");
+  await new Promise((r) => setTimeout(r, 80));
+  assert.ok(cdpOpenedUrls.includes("https://example.com"));
+  const browserPortal = mgr.listPortals(fakeAgent.key).find((p) => p.kind === "browser");
+  assert.ok(browserPortal, "expected browser portal immediately without waiting for OS window poll");
+  assert.ok(Date.now() - t0 < 1000, "CDP launch should not stall on listWindows polling");
+
+  // Also verify JSON-string tool_call inputs in inspectToolCallForPortal open portals cleanly.
+  mgr.inspectToolCallForPortal(fakeAgent, "run_command", JSON.stringify({ CommandLine: "open https://example.org" }));
+  await new Promise((r) => setTimeout(r, 80));
+  assert.ok(cdpOpenedUrls.includes("https://example.org"), "expected JSON-string run_command input to trigger portal");
+
+  // 2) Window stream emits frame -> ack clears inflight -> static screen emits idle heartbeat without duplicate frames.
+  const winOpen = await mgr.openPortal({ agentKey: fakeAgent.key, kind: "window", windowId: "screen:0", title: "Desktop" });
+  const emitted: PortalStreamEvent[] = [];
+  stopSub = mgr.subscribe(
+    "s-hb-1",
+    { portalId: winOpen.item.id, fps: 30, maxWidth: 1280, quality: 60 },
+    (ev) => emitted.push(ev),
+  );
+  await new Promise((r) => setTimeout(r, 120));
+  assert.ok(emitted.some((e) => e.kind === "portal_frame"), "expected initial streamed frame");
+  const firstFrame = emitted.find((e) => e.kind === "portal_frame");
+  if (firstFrame && firstFrame.kind === "portal_frame") {
+    await mgr.sendInput(winOpen.item.id, { type: "ack", seq: firstFrame.seq });
+  }
+  staticMode = true;
+  const heartbeatDeadline = Date.now() + 2000;
+  while (
+    Date.now() < heartbeatDeadline &&
+    !emitted.some((e) => e.kind === "portal_heartbeat" && e.idle === true)
+  ) {
+    await new Promise((r) => setTimeout(r, 80));
+  }
+  stopSub();
+  stopSub = null;
+  assert.ok(
+    emitted.some((e) => e.kind === "portal_heartbeat" && e.idle === true),
+    "expected static stream to emit idle portal_heartbeat telemetry",
   );
 });

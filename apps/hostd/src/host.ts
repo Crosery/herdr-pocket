@@ -5,6 +5,7 @@ import {
   HARNESS_ICON_MAX,
   PROTOCOL_VERSION,
   agentKey,
+  encodeBinaryPortalStreamFrame,
   extractTerminalQueuedMessages,
   parseAgentKey,
   rowsChange,
@@ -15,6 +16,8 @@ import {
   type LayoutSpace,
   type Device,
   type ClientFrame,
+  type PortalBinaryFrameMeta,
+  type PortalFramePayload,
   type RpcError,
   type RpcMethod,
   type RpcMethods,
@@ -167,6 +170,7 @@ export class Host {
   private streamMeta = new Map<string, { from: string; kind: StreamKind; agent: string }>();
   /** Streams opened over a direct link answer there, not through the relay. */
   private streamReply = new Map<string, (f: ClientFrame) => void>();
+  private streamReplyBinary = new Map<string, { send: (bytes: Uint8Array) => void; wireId: string }>();
   private streamPeerBufferedBytes = new Map<string, () => number>();
   /** Phones connected straight to this computer (see direct.ts). */
   direct: DirectServer;
@@ -260,11 +264,12 @@ export class Host {
       getDirectInfo: () => ({
         port: this.direct.port,
         addrs: directAddrs(),
-        connectedCount: this.direct.connected().length,
+        connectedCount: this.direct.connected().length + this.webrtc.connected().length,
       }),
       hasRemoteViewers: () => {
         if (this.direct.connected().length > 0) return true;
-        if (this.streamMeta.size > 0) return true;
+        if (this.webrtc.connected().length > 0) return true;
+        if (this.streamMeta.size > 0 || this.portal.hasActiveWatchers()) return true;
         for (const d of this.devices.values()) {
           if (d.kind === "viewer" && d.online) return true;
         }
@@ -273,9 +278,8 @@ export class Host {
       onPortalEvent: (ev) => {
         if (ev.kind !== "portal_event") return;
         const targetAgent = ev.item.agentKey;
-        if (!targetAgent) return;
         for (const [id, meta] of this.streamMeta) {
-          if (meta.kind === "terminal" && meta.agent === targetAgent) {
+          if (meta.kind === "terminal" && (!targetAgent || meta.agent === targetAgent)) {
             this.sendStream(id, ev);
           }
         }
@@ -360,10 +364,12 @@ export class Host {
       void this.handleRpc({ type: "rpc", id, from: peer.deviceId, method: f.method as RpcMethod, params: f.params }, (x) => peer.send(x));
     } else if (f.type === "stream_subscribe" && id && (f.stream === "terminal" || f.stream === "session" || f.stream === "portal")) {
       const reply = (x: ClientFrame) => peer.send("id" in x && typeof x.id === "string" ? { ...x, id: x.id.slice(peer.tag.length) } : x);
+      const replyBinary = peer.sendBinary ? { send: (bytes: Uint8Array) => peer.sendBinary!(bytes), wireId: id } : undefined;
       void this.handleStreamSubscribe(
         { type: "stream_subscribe", id: peer.tag + id, from: peer.deviceId, stream: f.stream, params: f.params },
         reply,
         peer.bufferedBytes,
+        replyBinary,
       );
     } else if (f.type === "stream_unsubscribe" && id) this.stopStream(peer.tag + id);
   }
@@ -815,7 +821,11 @@ export class Host {
       reply({ type: "rpc_result", id: f.id, result });
       const ms = Date.now() - t0;
       if (MUTATING.has(f.method)) {
-        this.note("info", "rpc", `${f.method} from ${this.who(f.from)} ok`, { ...(callSummary(f.params, result) ?? {}), ms });
+        const inp = f.method === "portal.input" ? (f.params as { input?: { type?: string; action?: string } } | undefined)?.input : undefined;
+        const quietPortalTick = inp?.type === "ack" || (inp?.type === "pointer" && (inp.action === "move" || inp.action === "drag"));
+        if (!quietPortalTick) {
+          this.note("info", "rpc", `${f.method} from ${this.who(f.from)} ok`, { ...(callSummary(f.params, result) ?? {}), ms });
+        }
       } else if (!QUIET_READ_RPCS.has(f.method)) {
         this.note("info", "rpc.read", `${f.method} from ${this.who(f.from)} ok (${ms}ms)`, { ...(callSummary(f.params) ?? {}), ms });
       }
@@ -838,9 +848,42 @@ export class Host {
 
   private sendStream(id: string, event: unknown): void {
     const ev = event as { kind?: string; seq?: number } | null;
-    if (ev?.kind === "portal_frame" && (ev.seq ?? 0) > 1) {
-      const buffered = this.streamPeerBufferedBytes.get(id)?.() ?? (this.ws?.bufferedAmount ?? 0);
-      if (buffered > 256 * 1024) return;
+    if (ev?.kind === "portal_frame") {
+      const pf = event as PortalFramePayload & { kind: "portal_frame" };
+      const binTarget = this.streamReplyBinary?.get(id);
+      if (binTarget) {
+        if ((pf.seq ?? 0) > 1) {
+          const buffered = this.streamPeerBufferedBytes.get(id)?.() ?? 0;
+          if (buffered > 192 * 1024) return;
+        }
+        const imageBytes = pf.rawBytes
+          ? (Buffer.isBuffer(pf.rawBytes) ? pf.rawBytes : Buffer.from(pf.rawBytes))
+          : pf.data
+            ? Buffer.from(pf.data, "base64")
+            : Buffer.alloc(0);
+        if (imageBytes.byteLength > 0) {
+          const { kind: _k, data: _d, rawBytes: _r, ...restMeta } = pf;
+          const meta: PortalBinaryFrameMeta = { ...restMeta, byteLength: imageBytes.byteLength };
+          binTarget.send(encodeBinaryPortalStreamFrame(binTarget.wireId, meta, imageBytes));
+          return;
+        }
+      }
+      if ((pf.seq ?? 0) > 1) {
+        const buffered = this.streamPeerBufferedBytes.get(id)?.() ?? (this.ws?.bufferedAmount ?? 0);
+        if (buffered > 256 * 1024) return;
+      }
+      if (pf.rawBytes !== undefined) {
+        const { rawBytes, ...jsonEv } = pf;
+        if (!jsonEv.data && rawBytes.byteLength > 0) {
+          jsonEv.data = (Buffer.isBuffer(rawBytes) ? rawBytes : Buffer.from(rawBytes)).toString("base64");
+        }
+        if (jsonEv.byteLength === undefined) jsonEv.byteLength = rawBytes.byteLength;
+        const frame: ClientFrame = { type: "stream_event", id, event: jsonEv };
+        const reply = this.streamReply.get(id);
+        if (reply) reply(frame);
+        else this.send(frame);
+        return;
+      }
     }
     const frame: ClientFrame = { type: "stream_event", id, event };
     const reply = this.streamReply.get(id);
@@ -852,6 +895,7 @@ export class Host {
     f: Extract<ServerFrame, { type: "stream_subscribe" }>,
     reply?: (x: ClientFrame) => void,
     bufferedBytes?: () => number,
+    replyBinary?: { send: (bytes: Uint8Array) => void; wireId: string },
   ): Promise<void> {
     const out = reply ?? ((x: ClientFrame) => this.send(x));
     const allow = this.opts.allow ?? [];
@@ -870,8 +914,10 @@ export class Host {
         const meta = { from: f.from, kind: "portal" as StreamKind, agent: agentObj?.key ?? "" };
         this.streamMeta.set(f.id, meta);
         if (reply) this.streamReply.set(f.id, reply);
-      if (bufferedBytes) this.streamPeerBufferedBytes.set(f.id, bufferedBytes);
         if (bufferedBytes) this.streamPeerBufferedBytes.set(f.id, bufferedBytes);
+        if (p.binaryFrames === true && replyBinary) {
+          this.streamReplyBinary?.set(f.id, replyBinary);
+        }
         const stop = this.portal.subscribe(
           f.id,
           {
@@ -885,7 +931,7 @@ export class Host {
           (ev) => this.sendStream(f.id, ev),
         );
         this.streamStops.set(f.id, stop);
-        this.note("info", "stream", `portal stream open from ${this.who(f.from)}`, { direct: Boolean(reply), agent: agentObj?.key });
+        this.note("info", "stream", `portal stream open from ${this.who(f.from)}`, { direct: Boolean(reply), binary: Boolean(p.binaryFrames === true && replyBinary), agent: agentObj?.key });
         out({
           type: "stream_open",
           id: f.id,
@@ -1058,6 +1104,7 @@ export class Host {
       const error: RpcError = e instanceof RpcFailure ? { code: e.code, message: e.message } : { code: "internal", message: String(e) };
       this.streamMeta.delete(f.id);
       this.streamReply.delete(f.id);
+      this.streamReplyBinary?.delete(f.id);
       this.streamPeerBufferedBytes.delete(f.id);
       out({ type: "stream_open", id: f.id, error });
       if (error.code !== "not_found") this.note("warn", "stream", `${f.stream} stream for ${String(agentName)} failed: ${error.code}: ${error.message}`);
@@ -1097,7 +1144,8 @@ export class Host {
     this.streamStops.delete(id);
     this.streamMeta.delete(id);
     this.streamReply.delete(id);
-    this.streamPeerBufferedBytes.delete(id);
+    this.streamReplyBinary?.delete(id);
+    this.streamPeerBufferedBytes?.delete(id);
     if (meta) {
       this.note("info", "stream", `${meta.kind} stream closed ${meta.agent || "(global)"} (${this.who(meta.from)})`);
     }
@@ -1778,18 +1826,32 @@ export class Host {
           tabName: str(p.tabName, 60),
         },
       );
-      await Promise.all([this.hc.list(), this.refreshNames()]);
-      this.publishNow();
       const made = {
         agent: agentKey(this.deviceId, "hc", r.terminal),
         space: r.space,
         ...(r.tab ? { tab: r.tab } : {}),
         terminal: r.terminal,
       };
-      if (!task) return made;
+      const refreshPostCreate = () =>
+        Promise.all([this.hc.list(), this.refreshNames()])
+          .then(() => {
+            this.publishNow();
+          })
+          .catch(() => {});
+      if (!task) {
+        void refreshPostCreate();
+        return made;
+      }
       // `hc run` starts the bare program: the task is typed in like for any other.
-      if (launcher.takesTask && !r.direct) return { ...made, task: "started" as const };
-      if (launcher.id === "shell") return { ...made, task: "failed" as const, taskNote: "终端不接任务" };
+      if (launcher.takesTask && !r.direct) {
+        void refreshPostCreate();
+        return { ...made, task: "started" as const };
+      }
+      if (launcher.id === "shell") {
+        void refreshPostCreate();
+        return { ...made, task: "failed" as const, taskNote: "终端不接任务" };
+      }
+      await refreshPostCreate();
       const typed = await typeFirstTask(
         task,
         {
