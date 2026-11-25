@@ -3,7 +3,17 @@ import type { Terminal as XTerm } from "@xterm/xterm";
 interface XTermCoreInternals {
   _renderService?: {
     _isPaused?: boolean;
+    _needsFullRefresh?: boolean;
+    _charSizeService?: {
+      hasValidSize?: boolean;
+      measure?: () => void;
+    };
+    _pausedResizeTask?: {
+      flush?: () => void;
+    };
     hasRenderer?: () => boolean;
+    handleResize?: (cols: number, rows: number) => void;
+    _renderRows?: (start: number, end: number) => void;
     dimensions?: {
       css?: {
         cell?: { height?: number };
@@ -16,6 +26,54 @@ interface XTermCoreInternals {
     _sync?: (ydisp?: number) => void;
     scrollToLine?: (line: number, immediate?: boolean) => void;
   };
+}
+
+/**
+ * Unpauses xterm's RenderService synchronously before Frame 0 paints when a hidden `.v3-tab-layer`
+ * becomes active (before IntersectionObserver fires asynchronously post-paint), flushing deferred
+ * resize/char-size tasks so dimensions and viewport sync can complete immediately.
+ */
+export function wakeTerminalRendererImmediate(term: Pick<XTerm, "cols" | "rows"> | null | undefined): boolean {
+  if (!term) return false;
+  try {
+    const rs = (term as unknown as { _core?: XTermCoreInternals })._core?._renderService;
+    if (!rs) return false;
+    const wasPaused = Boolean(rs._isPaused);
+    const needsFull = Boolean(rs._needsFullRefresh);
+    if (wasPaused) {
+      rs._isPaused = false;
+      if (rs._charSizeService && !rs._charSizeService.hasValidSize) {
+        rs._charSizeService.measure?.();
+      }
+      rs._pausedResizeTask?.flush?.();
+    }
+    const cellH = rs.dimensions?.css?.cell?.height ?? 0;
+    const canvasH = rs.dimensions?.css?.canvas?.height ?? 0;
+    if ((cellH <= 0 || canvasH <= 0) && term.cols > 0 && term.rows > 0) {
+      rs.handleResize?.(term.cols, term.rows);
+    }
+    return wasPaused || needsFull;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Synchronously paints the visible viewport rows (`0..term.rows - 1`) without waiting for xterm's
+ * next requestAnimationFrame render debouncer. Used both when waking a hidden tab in useLayoutEffect
+ * and right after promoting DomRenderer -> WebglRenderer so no blank white frame appears in between.
+ */
+export function paintTerminalViewportImmediate(term: Pick<XTerm, "cols" | "rows"> | null | undefined): boolean {
+  if (!term) return false;
+  try {
+    const rs = (term as unknown as { _core?: XTermCoreInternals })._core?._renderService;
+    if (!rs || term.rows <= 0 || typeof rs._renderRows !== "function") return false;
+    rs._needsFullRefresh = false;
+    rs._renderRows(0, Math.max(0, term.rows - 1));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

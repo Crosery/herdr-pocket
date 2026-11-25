@@ -1,24 +1,44 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { registerHooks } from "node:module";
 import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import ts from "typescript";
 import type { Agent } from "@herdr-pocket/protocol";
-import { liveStore } from "../src/lib/store.ts";
-import { shellStore, tabLeaves } from "../src/shell/shellStore.ts";
-import {
+
+registerHooks({
+  load(url, context, nextLoad) {
+    if ((url.endsWith(".tsx") || url.endsWith(".ts")) && !url.includes("/node_modules/") && !url.endsWith("attentionCenter.test.ts")) {
+      const sourceText = readFileSync(fileURLToPath(url), "utf8");
+      const out = ts.transpileModule(sourceText, {
+        fileName: fileURLToPath(url),
+        compilerOptions: {
+          module: ts.ModuleKind.ESNext,
+          target: ts.ScriptTarget.ES2022,
+          jsx: ts.JsxEmit.ReactJSX,
+        },
+      });
+      return { format: "module", shortCircuit: true, source: out.outputText };
+    }
+    return nextLoad(url, context);
+  },
+});
+
+const { liveStore, settingsStore } = await import("../src/lib/store.ts");
+const { shellStore, tabLeaves } = await import("../src/shell/shellStore.ts");
+const { PocketDroplet } = await import("../src/components/PocketDroplet.tsx");
+const {
   attentionStore,
-  buildNotchSyncPayload,
   classifyAttentionCategory,
   createAttentionTracker,
   jumpToAttentionAgent,
-  pushNotchNow,
   reconcileAttentionSnapshot,
-  resetNotchSyncDedupeForTest,
   sortAttentionItems,
-  type AttentionItem,
-} from "../src/lib/attentionCenter.ts";
-import { settingsStore } from "../src/lib/store.ts";
+} = await import("../src/lib/attentionCenter.ts");
+type AttentionItem = import("../src/lib/attentionCenter.ts").AttentionItem;
 
 function makeAgent(patch: Partial<Agent> & Pick<Agent, "key">): Agent {
   return {
@@ -111,21 +131,39 @@ test("reconcileAttentionSnapshot suppresses chimes for actively viewed agents an
   assert.equal(focusedNow.items.length, 0);
 });
 
-test("notch-hud.html and notch-hud.js enforce strict CSP and zero emojis", () => {
+test("PocketDroplet renders attention peek popup cleanly with zero emojis and notch-hud assets are removed", () => {
   const testDir = dirname(fileURLToPath(import.meta.url));
-  const html = readFileSync(resolve(testDir, "../public/notch-hud.html"), "utf8");
-  const js = readFileSync(resolve(testDir, "../public/notch-hud.js"), "utf8");
-  const ac = readFileSync(resolve(testDir, "../src/lib/attentionCenter.ts"), "utf8");
+  const desktopRoot = resolve(testDir, "..");
+  assert.equal(existsSync(resolve(desktopRoot, "public/notch-hud.html")), false, "public/notch-hud.html removed");
+  assert.equal(existsSync(resolve(desktopRoot, "public/notch-hud.js")), false, "public/notch-hud.js removed");
+  assert.equal(existsSync(resolve(desktopRoot, "src-tauri/src/notch.rs")), false, "src-tauri/src/notch.rs removed");
 
-  assert.match(html, /Content-Security-Policy/i);
-  assert.match(html, /script-src 'self'/);
-  assert.doesNotMatch(html, /<script>[\s\S]*\S[\s\S]*<\/script>/);
-  assert.match(js, /window\.__notch\s*=/);
-  assert.match(js, /pocket-notch:\/\/jump\?key=/);
+  const ac = readFileSync(resolve(desktopRoot, "src/lib/attentionCenter.ts"), "utf8");
+  const dropletSrc = readFileSync(resolve(desktopRoot, "src/components/PocketDroplet.tsx"), "utf8");
   const emojiRe = /[\u{1F300}-\u{1FAFF}]/u;
-  assert.equal(emojiRe.test(html), false, "notch-hud.html must not contain emojis");
-  assert.equal(emojiRe.test(js), false, "notch-hud.js must not contain emojis");
   assert.equal(emojiRe.test(ac), false, "attentionCenter.ts must not contain emojis");
+  assert.equal(emojiRe.test(dropletSrc), false, "PocketDroplet.tsx must not contain emojis");
+
+  const prevNotif = settingsStore.get().notifications;
+  const prevAtt = attentionStore.get();
+  try {
+    settingsStore.set({ notifications: true });
+    attentionStore.set({
+      items: [
+        { id: "i1", agentKey: "h1/hc:t1", category: "approval", title: "work · app", subtitle: "需要审批确认", ts: 1000 },
+        { id: "i2", agentKey: "h1/hc:t2", category: "completed", title: "work · web", subtitle: "已完成", ts: 900 },
+      ],
+      peek: { id: "i1", agentKey: "h1/hc:t1", category: "approval", title: "work · app", subtitle: "需要审批确认", ts: 1000 },
+      windowFocused: true,
+    });
+    const html = renderToStaticMarkup(React.createElement(PocketDroplet));
+    assert.match(html, /需要审批/);
+    assert.match(html, /work · app/);
+    assert.match(html, /\+1/);
+  } finally {
+    settingsStore.set({ notifications: prevNotif });
+    attentionStore.set(prevAtt);
+  }
 });
 
 test("jumpToAttentionAgent activates existing split pane across spaces, unzooms sibling zoom, and clears its queue entry", () => {
@@ -182,49 +220,4 @@ test("jumpToAttentionAgent activates existing split pane across spaces, unzooms 
   assert.equal(workTab?.split?.zoomedPaneId, undefined);
   assert.equal(tabLeaves(workTab!).length, 2);
   assert.equal(attentionStore.get().items.length, 0);
-});
-
-test("pushNotchNow skips duplicate serialized notch payloads", () => {
-  resetNotchSyncDedupeForTest();
-  attentionStore.set({
-    items: [{ id: "d1/hc:a:done", agentKey: "d1/hc:a", category: "completed", title: "Done", subtitle: "ok", ts: 1234 }],
-    peek: null,
-    windowFocused: true,
-  });
-  assert.equal(pushNotchNow(), true);
-  assert.equal(pushNotchNow(), false);
-  attentionStore.set({
-    items: [{ id: "d1/hc:a:done", agentKey: "d1/hc:a", category: "completed", title: "Done 2", subtitle: "ok", ts: 1235 }],
-    peek: null,
-    windowFocused: true,
-  });
-  assert.equal(pushNotchNow(), true);
-  assert.equal(pushNotchNow(), false);
-});
-
-const DESKTOP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-
-test("notch-hud assets use 小羊提醒 branding, NotchShape SVG geometry, valid mascot assets, and theme payload", () => {
-  const html = readFileSync(resolve(DESKTOP_ROOT, "public/notch-hud.html"), "utf8");
-  const js = readFileSync(resolve(DESKTOP_ROOT, "public/notch-hud.js"), "utf8");
-  assert.equal(html.includes("小羊提醒"), true);
-  assert.equal(html.includes("notchBgPath"), true);
-  assert.equal(js.includes("M 0 0"), true);
-  assert.equal(html.includes("Ovis"), false);
-  assert.equal(js.includes("Ovis"), false);
-  assert.equal(html.includes("brand/mascot/"), false);
-  assert.equal(js.includes("brand/mascot/"), false);
-  assert.equal(js.includes("demo-app"), true);
-  assert.equal(js.includes("assets/mascot/waiting.webp"), true);
-  assert.equal(js.includes("assets/mascot/yay.webp"), true);
-
-  const prevTheme = settingsStore.get().theme;
-  try {
-    settingsStore.set({ theme: "light" });
-    assert.equal(buildNotchSyncPayload().theme, "light");
-    settingsStore.set({ theme: "dark" });
-    assert.equal(buildNotchSyncPayload().theme, "dark");
-  } finally {
-    settingsStore.set({ theme: prevTheme });
-  }
 });

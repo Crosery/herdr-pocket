@@ -18,6 +18,7 @@ export interface HcTerminal {
   name?: string | null;
   labels?: Record<string, string>;
   parent?: string | null;
+  pid?: number;
   foreground?: { argv?: string[]; name?: string | null; cwd?: string; pid?: number } | null;
   created_ms?: number;
   cols?: number;

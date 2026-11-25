@@ -713,7 +713,7 @@ pub fn apply_theme(app: &AppHandle) {
         "dark" => Some(Theme::Dark),
         _ => None,
     };
-    for label in ["main", "voice-hud", "notch-hud"] {
+    for label in ["main", "voice-hud"] {
         if let Some(w) = app.get_window(label) {
             let _ = w.set_theme(theme);
         }

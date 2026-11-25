@@ -399,7 +399,7 @@ export class HcScreens {
       sawFirstEmit = true;
       lastEmitAt = Date.now();
       for (let off = 0; off < combined.length; off += MAX_CHUNK) {
-        onData(combined.subarray(off, off + MAX_CHUNK), curCols, curRows);
+        onData(combined.subarray(off, off + MAX_CHUNK), rawEntry.cols, rawEntry.rows);
       }
     };
 

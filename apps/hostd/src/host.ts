@@ -483,7 +483,10 @@ export class Host {
     const added: string[] = [];
     if (hc) {
       this.sources.push("hc");
-      this.hc.on("change", this.publish);
+      this.hc.on("change", () => {
+        this.publish();
+        this.portal.observeTerminalsUpdated();
+      });
       this.hc.on("doc", () => {
         void this.refreshNames().then(() => this.publish());
       });
@@ -2250,6 +2253,14 @@ export class Host {
           cwd: p.cwd,
         }),
       );
+    },
+    "portal.observeCommand": async (p) => {
+      this.writable();
+      const a = this.resolve(p.agent);
+      if (typeof p.command === "string" && p.command.trim()) {
+        this.portal.observeSubmittedCommand(a, p.command, "terminal_input");
+      }
+      return { ok: true as const };
     },
   };
 }

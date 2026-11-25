@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { DIRECT_PORTAL_FS_PREFIX, type PortalStreamEvent } from "@herdr-pocket/protocol";
 import { DirectServer } from "../src/direct.ts";
+import { CdpBrowserPool, findChromiumBinary } from "../src/portal/cdpBrowser.ts";
 import { PortalManager } from "../src/portal/index.ts";
 import {
   OsCaptureDriver,
@@ -460,4 +463,480 @@ test("OsCaptureDriver.captureWindow coalesces concurrent calls and serves 45ms c
   const c = await driver.captureWindow("screen:0");
   assert.equal(capCalls, 1);
   assert.equal(c?.data, a.data);
+});
+
+test("osCapture handles WSLg, headless WSL X-Server hint, Linux X11 wmctrl/xdotool/xwininfo/xwd, and win32 WSL notes", async () => {
+  // WSLg with /mnt/wslg/runtime-dir and XWayland routes to x11 capture safely
+  const wslgEnv = resolveLinuxGuiEnv({
+    platform: "linux",
+    env: { WSL_DISTRO_NAME: "Ubuntu" },
+    pathExists: (p) => p === "/mnt/wslg/runtime-dir" || p === "/mnt/wslg/.X11-unix",
+    readDir: (p) => (p === "/mnt/wslg/runtime-dir" ? ["wayland-0"] : p === "/mnt/wslg/.X11-unix" ? ["X0"] : []),
+  });
+  assert.equal(wslgEnv.WAYLAND_DISPLAY, "wayland-0");
+  assert.equal(wslgEnv.DISPLAY, ":0");
+  const wslgSession = detectPortalSession({
+    platform: "linux",
+    env: { WSL_DISTRO_NAME: "Ubuntu" },
+    pathExists: (p) => p === "/mnt/wslg/runtime-dir" || p === "/mnt/wslg/.X11-unix",
+    readDir: (p) => (p === "/mnt/wslg/runtime-dir" ? ["wayland-0"] : p === "/mnt/wslg/.X11-unix" ? ["X0"] : []),
+  });
+  assert.equal(wslgSession.sessionType, "x11");
+  assert.equal(wslgSession.desktopEnv, "WSLg");
+
+  // Headless WSL without DISPLAY / WSLg prints VcXsrv / X410 guidance note
+  const wslHeadlessCaps = computeCapabilities({
+    hasCdpBrowser: false,
+    deps: {
+      platform: "linux",
+      env: { WSL_DISTRO_NAME: "Ubuntu" },
+      pathExists: () => false,
+      readDir: () => [],
+    },
+  });
+  assert.equal(wslHeadlessCaps.sessionType, "headless");
+  assert.ok(wslHeadlessCaps.notes?.some((n) => n.includes("VcXsrv") && n.includes("DISPLAY")));
+
+  // Linux GNOME Wayland without gnome-screenshot or XWayland capture reports canCaptureWindow=false
+  const gnomeNoCap = computeCapabilities({
+    hasCdpBrowser: false,
+    deps: {
+      platform: "linux",
+      env: { WAYLAND_DISPLAY: "wayland-0", XDG_CURRENT_DESKTOP: "GNOME" },
+      hasCmd: (c) => c === "gdbus",
+    },
+  });
+  assert.equal(gnomeNoCap.canCaptureWindow, false);
+
+  // Linux X11: wmctrl -lpGx parses WM_CLASS, xwd+convert captures window frames
+  const x11Driver = new OsCaptureDriver({
+    platform: "linux",
+    env: { DISPLAY: ":0", XDG_SESSION_TYPE: "x11" },
+    hasCmd: (c) => ["wmctrl", "xwd", "convert"].includes(c),
+    execBin: async (cmd, args) => {
+      if (cmd === "wmctrl" && args.includes("-lpGx")) {
+        return {
+          code: 0,
+          stderr: "",
+          stdout: Buffer.from("0x01200003  0 4412   100  80   900  640  Navigator.firefox host Mozilla Firefox\n"),
+        };
+      }
+      if (cmd === "xwd") {
+        const outIdx = args.indexOf("-out");
+        if (outIdx >= 0 && args[outIdx + 1]) writeFileSync(args[outIdx + 1]!, "xwd-bytes");
+        return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+      }
+      if (cmd === "convert") {
+        writeFileSync(args[args.length - 1]!, "jpg-from-xwd");
+        return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+      }
+      return { code: 1, stderr: "", stdout: Buffer.alloc(0) };
+    },
+  });
+  const x11Wins = await x11Driver.listWindows();
+  const ff = x11Wins.find((w) => w.id === "0x01200003");
+  assert.ok(ff);
+  assert.equal(ff.appName, "firefox");
+  assert.equal(ff.pid, 4412);
+  const xwdCap = await x11Driver.captureWindow("0x01200003");
+  assert.ok(xwdCap);
+  assert.equal(Buffer.from(xwdCap.data, "base64").toString("utf8"), "jpg-from-xwd");
+
+  // Windows win32 warns when wsl.exe exists without WSLg or X-Server process running
+  const winNoX = new OsCaptureDriver({
+    platform: "win32",
+    env: {},
+    hasCmd: (c) => c === "wsl.exe",
+    pathExists: () => false,
+    listProcesses: async () => [{ pid: 100, ppid: 4, name: "explorer.exe" }],
+  });
+  const note = await winNoX.checkPermissionNote();
+  assert.ok(note?.includes("WSLg"));
+});
+
+test("shims extract Windows start, Start-Process, qlmanage, wsl GUI commands, and direct GUI binaries", () => {
+  assert.deepEqual(extractAutoPortalIntents('cmd /c start "" https://localhost:3000/auth'), [
+    { type: "opener", kind: "browser", target: "https://localhost:3000/auth", url: "https://localhost:3000/auth", reveal: false },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents("Start-Process -FilePath msedge -ArgumentList https://example.com"), [
+    { type: "opener", kind: "browser", target: "https://example.com", url: "https://example.com", reveal: false, app: "msedge" },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents("qlmanage -p demo/chart.png", "/work/app"), [
+    { type: "opener", kind: "file", target: resolve("/work/app", "demo/chart.png"), reveal: false },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents("wsl -d Ubuntu DISPLAY=:0 xeyes"), [
+    { type: "app_window", appHint: "xeyes", label: "X11 xeyes" },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents('wsl -- bash -lc "xdg-open https://localhost:9000/login"'), [
+    { type: "opener", kind: "browser", target: "https://localhost:9000/login", url: "https://localhost:9000/login", reveal: false },
+  ]);
+  assert.deepEqual(extractAutoPortalIntents("firefox http://127.0.0.1:8080"), [
+    { type: "app_window", appHint: "Firefox", label: "Firefox", url: "http://127.0.0.1:8080" },
+  ]);
+});
+
+test("PortalManager discovers child GUI windows via process tree and auto-closes dead portals", async (t) => {
+  const state = mkdtempSync(join(tmpdir(), "hp-ptree-"));
+  const binDir = join(state, "bin");
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+  const events: PortalStreamEvent[] = [];
+  const fakeAgent = {
+    key: "h1/hc:t1",
+    deviceId: "h1",
+    source: "hc" as const,
+    localId: "t1",
+    harness: "shell",
+    where: "测试",
+    cwd: "/tmp",
+    status: "idle" as const,
+    isShell: true,
+    updatedAt: Date.now(),
+  };
+
+  let mockWindows = [
+    { id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true },
+    { id: "100", appName: "Finder", title: "访达", pid: 100, bounds: { x: 0, y: 0, width: 800, height: 600 } },
+  ];
+  let mockProcs = [
+    { pid: 1, ppid: 0, name: "launchd" },
+    { pid: 100, ppid: 1, name: "Finder" },
+    { pid: 500, ppid: 1, name: "zsh" },
+    { pid: 510, ppid: 500, name: "python3" },
+    { pid: 520, ppid: 510, name: "my-gui-app" },
+  ];
+  const terms = new Map([["t1", { address: "t1", cwd: "/tmp", pid: 500, foreground: { pid: 510, argv: ["python3", "app.py"] } }]]);
+
+  const mgr = new PortalManager({
+    hostId: () => "h1",
+    getAgents: () => [fakeAgent],
+    getTerminals: () => terms,
+    getFilesOptions: () => ({ extraRoots: ["/tmp"] }),
+    getDirectInfo: () => ({ port: null, addrs: [], connectedCount: 0 }),
+    hasRemoteViewers: () => true,
+    onPortalEvent: (ev) => events.push(ev),
+    stateDir: state,
+    captureDeps: {
+      platform: "darwin",
+      binDir,
+      hasCmd: (c) => c === "swiftc",
+      listProcesses: async () => mockProcs,
+      execBin: async (cmd, args) => {
+        if (cmd === "swiftc") {
+          const outIdx = args.indexOf("-o");
+          if (outIdx >= 0 && args[outIdx + 1]) writeFileSync(args[outIdx + 1]!, "mock-bin");
+          return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+        }
+        if (args[0] === "list") return { code: 0, stderr: "", stdout: Buffer.from(JSON.stringify(mockWindows.slice(1))) };
+        if (args[0] === "capture") return { code: 0, stderr: "dims:640x480\n", stdout: Buffer.from("jpg-frame") };
+        return { code: 1, stderr: "", stdout: Buffer.alloc(0) };
+      },
+    },
+  });
+  // Seed baseline before child window opens
+  await mgr.scanProcessTreePortals();
+  assert.equal(mgr.listPortals(fakeAgent.key).length, 0);
+
+  // Spawn child window owned by pid 520 -> 510 -> term 500
+  mockWindows = [
+    ...mockWindows,
+    { id: "5201", appName: "my-gui-app", title: "Plot Preview", pid: 520, bounds: { x: 10, y: 10, width: 640, height: 480 } },
+  ];
+  await mgr.scanProcessTreePortals();
+  const opened = mgr.listPortals(fakeAgent.key).filter((p) => p.kind === "window");
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0]!.windowId, "5201");
+  assert.ok(events.some((e) => e.kind === "portal_frame" && e.portalId === opened[0]!.id));
+
+  // Window exits -> removed after 2 missed scans (> 1.2s wait simulated by closing manually via backdated wait not needed if we wait 1.25s? No, verify stay alive <1.2s and test close flow via explicit close check or fast sleep):
+  mockWindows = mockWindows.filter((w) => w.id !== "5201");
+  // Fast check inside <1200ms keeps it alive; after >1200ms + 2 misses it auto-closes:
+  await new Promise((r) => setTimeout(r, 1250));
+  await mgr.scanProcessTreePortals();
+  assert.equal(mgr.listPortals(fakeAgent.key).length, 1);
+  await mgr.scanProcessTreePortals();
+  assert.equal(mgr.listPortals(fakeAgent.key).length, 0);
+  mgr.stop();
+});
+
+test("PortalManager binds new Windows X-Server (vcxsrv) windows to recent WSL terminal", async (t) => {
+  const state = mkdtempSync(join(tmpdir(), "hp-winx-"));
+  const binDir = join(state, "bin");
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+  const fakeAgent = {
+    key: "h1/hc:w1",
+    deviceId: "h1",
+    source: "hc" as const,
+    localId: "w1",
+    harness: "shell",
+    where: "WSL",
+    cwd: "C:\\\\work",
+    status: "idle" as const,
+    isShell: true,
+    updatedAt: Date.now(),
+  };
+  let winList: Array<{ id: string; appName: string; title: string; pid?: number; bounds: { x: number; y: number; width: number; height: number } }> = [];
+  const terms = new Map([["w1", { address: "w1", cwd: "C:\\\\work", pid: 800, foreground: { pid: 810, argv: ["wsl.exe", "xeyes"] } }]]);
+  const mgr = new PortalManager({
+    hostId: () => "h1",
+    getAgents: () => [fakeAgent],
+    getTerminals: () => terms,
+    getFilesOptions: () => ({ extraRoots: ["/tmp"] }),
+    getDirectInfo: () => ({ port: null, addrs: [], connectedCount: 0 }),
+    hasRemoteViewers: () => true,
+    onPortalEvent: () => {},
+    stateDir: state,
+    captureDeps: {
+      platform: "win32",
+      binDir,
+      hasCmd: () => false,
+      listProcesses: async () => [{ pid: 9999, ppid: 4, name: "vcxsrv.exe" }],
+      execBin: async (_cmd, args) => {
+        const cmdStr = args.join(" ");
+        if (/@\('list'\)/.test(cmdStr)) {
+          return { code: 0, stderr: "", stdout: Buffer.from(JSON.stringify(winList)) };
+        }
+        const m = /@\('capture',\s*'[^']+',\s*'([^']+)'/.exec(cmdStr);
+        if (m?.[1]) writeFileSync(m[1], "win-xserver-jpg");
+        return { code: 0, stderr: "", stdout: Buffer.from("640x480") };
+      },
+    },
+  });
+  await mgr.scanProcessTreePortals();
+  winList = [{ id: "778899", appName: "vcxsrv", title: "xeyes", pid: 9999, bounds: { x: 40, y: 40, width: 300, height: 260 } }];
+  await mgr.scanProcessTreePortals();
+  const portals = mgr.listPortals(fakeAgent.key);
+  assert.equal(portals.length, 1);
+  assert.equal(portals[0]!.windowId, "778899");
+  assert.match(portals[0]!.title, /xeyes/);
+  mgr.stop();
+});
+
+test("findChromiumBinary discovers Playwright Chromium and CdpBrowserPool serves concurrent tabs without SingletonLock", async (t) => {
+  const homeTmp = mkdtempSync(join(tmpdir(), "hp-pw-home-"));
+  t.after(() => rmSync(homeTmp, { recursive: true, force: true }));
+  const pwShellBin = join(
+    homeTmp,
+    "Library/Caches/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-mac-arm64/chrome-headless-shell",
+  );
+  mkdirSync(join(homeTmp, "Library/Caches/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-mac-arm64"), {
+    recursive: true,
+  });
+  writeFileSync(pwShellBin, "stub");
+  const foundPw = await findChromiumBinary("darwin", { HOME: homeTmp });
+  assert.ok(foundPw);
+
+  const profileRoot = mkdtempSync(join(tmpdir(), "hp-cdp-pool-"));
+  t.after(() => rmSync(profileRoot, { recursive: true, force: true }));
+
+  const wsEntryUrl = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
+  const fakeScript = join(profileRoot, "fake-chrome.mjs");
+  const fakeBin = process.platform === "win32" ? join(profileRoot, "fake-chrome.cmd") : fakeScript;
+  const spawnsLog = join(profileRoot, "spawns.log");
+  writeFileSync(
+    fakeScript,
+    `#!/usr/bin/env node
+import { appendFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { join } from "node:path";
+import wsPkg from ${JSON.stringify(wsEntryUrl)};
+
+const { WebSocketServer } = wsPkg;
+const udArg = process.argv.find((a) => a.startsWith("--user-data-dir="));
+const userDataDir = udArg ? udArg.slice("--user-data-dir=".length) : "";
+if (!/runtime-\\d+/.test(userDataDir)) process.exit(2);
+const lockPath = join(userDataDir, "SingletonLock");
+try {
+  writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+} catch {
+  process.exit(0);
+}
+appendFileSync(${JSON.stringify(spawnsLog)}, "spawn\\n");
+
+const targets = new Map();
+let seq = 0;
+const fakeJpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(120, 0x41), Buffer.from([0xff, 0xd9])]).toString("base64");
+
+let srvPort = 0;
+const srv = createServer((req, res) => {
+  if (req.url === "/json/list") {
+    res.setHeader("content-type", "application/json");
+    const list = [...targets.values()].map((tgt) => ({
+      id: tgt.id,
+      type: "page",
+      url: tgt.url,
+      title: tgt.title,
+      webSocketDebuggerUrl: \`ws://127.0.0.1:\${srvPort}/devtools/page/\${tgt.id}\`,
+    }));
+    res.end(JSON.stringify(list));
+    return;
+  }
+  res.statusCode = 404;
+  res.end();
+});
+const wss = new WebSocketServer({ noServer: true });
+srv.on("upgrade", (req, sock, head) => {
+  wss.handleUpgrade(req, sock, head, (ws) => {
+    const url = req.url || "";
+    if (url === "/devtools/browser/mock") {
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(String(raw));
+        if (msg.method === "Target.createTarget") {
+          const id = \`tgt-\${++seq}\`;
+          targets.set(id, { id, url: msg.params?.url || "about:blank", title: "about:blank" });
+          ws.send(JSON.stringify({ id: msg.id, result: { targetId: id } }));
+        } else if (msg.method === "Target.closeTarget") {
+          targets.delete(msg.params?.targetId);
+          ws.send(JSON.stringify({ id: msg.id, result: { success: true } }));
+        } else {
+          ws.send(JSON.stringify({ id: msg.id, result: {} }));
+        }
+      });
+      return;
+    }
+    const targetId = url.split("/").pop() || "";
+    ws.on("message", (raw) => {
+      const msg = JSON.parse(String(raw));
+      const tgt = targets.get(targetId);
+      if (msg.method === "Page.navigate" && tgt) {
+        tgt.url = msg.params?.url || tgt.url;
+        tgt.title = \`Portal \${tgt.url}\`;
+        ws.send(JSON.stringify({ id: msg.id, result: { frameId: "f1" } }));
+        ws.send(JSON.stringify({ method: "Page.frameNavigated", params: { frame: { url: tgt.url } } }));
+        ws.send(JSON.stringify({ method: "Page.loadEventFired", params: {} }));
+      } else if (msg.method === "Page.getNavigationHistory" && tgt) {
+        ws.send(JSON.stringify({ id: msg.id, result: { currentIndex: 0, entries: [{ id: 1, url: tgt.url, title: tgt.title }] } }));
+      } else if (msg.method === "Page.captureScreenshot") {
+        ws.send(JSON.stringify({ id: msg.id, result: { data: fakeJpeg } }));
+      } else {
+        ws.send(JSON.stringify({ id: msg.id, result: {} }));
+      }
+    });
+  });
+});
+srv.listen(0, "127.0.0.1", () => {
+  srvPort = srv.address().port;
+  process.stderr.write(\`\\nDevTools listening on ws://127.0.0.1:\${srvPort}/devtools/browser/mock\\n\`);
+});
+const shutdown = () => {
+  try { rmSync(lockPath, { force: true }); } catch {}
+  try { srv.close(); } catch {}
+  process.exit(0);
+};
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+`,
+  );
+  chmodSync(fakeScript, 0o755);
+  if (process.platform === "win32") {
+    writeFileSync(fakeBin, `@echo off\r\n"${process.execPath}" "${fakeScript}" %*\r\n`);
+  }
+
+  const prevChromeEnv = process.env.HERDR_POCKET_CHROME_BIN;
+  process.env.HERDR_POCKET_CHROME_BIN = fakeBin;
+  t.after(() => {
+    if (prevChromeEnv === undefined) delete process.env.HERDR_POCKET_CHROME_BIN;
+    else process.env.HERDR_POCKET_CHROME_BIN = prevChromeEnv;
+  });
+
+  const pool = new CdpBrowserPool(profileRoot);
+  t.after(() => pool.closeAll());
+
+  await Promise.all([
+    pool.open("p1", "http://127.0.0.1:8764/?edition=winter&t=0.1"),
+    pool.open("p2", "http://127.0.0.1:8764/?edition=summer"),
+    pool.open("p3", "http://127.0.0.1:8764/?edition=autumn"),
+  ]);
+
+  assert.equal(readFileSync(spawnsLog, "utf8").trim().split("\n").length, 1);
+
+  for (const id of ["p1", "p2", "p3"]) {
+    const sess = pool.get(id);
+    assert.ok(sess, `missing session ${id}`);
+    const frame = sess.getLatestFrame() ?? (await sess.captureOnce(true));
+    assert.ok(frame && frame.mime === "image/jpeg" && frame.data.length > 100);
+    const bytes = Buffer.from(frame.data, "base64");
+    assert.equal(bytes[0], 0xff);
+    assert.equal(bytes[1], 0xd8);
+  }
+
+  pool.close("p1");
+  assert.equal(pool.get("p1"), undefined);
+  const f2 = await pool.get("p2")!.captureOnce(true);
+  assert.ok(f2 && f2.data.length > 100);
+  pool.closeAll();
+});
+
+test("PortalManager surfaces streamError cleanly and short-circuits TCC-denied window retries", async (t) => {
+  const state = mkdtempSync(join(tmpdir(), "hp-err-portal-"));
+  const binDir = join(state, "bin");
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+  const fakeAgent = {
+    key: "h1/hc:t2x",
+    deviceId: "h1",
+    source: "hc" as const,
+    localId: "t2x",
+    harness: "shell",
+    where: "测试",
+    cwd: "/tmp",
+    status: "idle" as const,
+    isShell: true,
+    updatedAt: Date.now(),
+  };
+
+  const mgr = new PortalManager({
+    hostId: () => "h1",
+    getAgents: () => [fakeAgent],
+    getTerminals: () => new Map([["t2x", { address: "t2x", cwd: "/tmp" }]]),
+    getFilesOptions: () => ({ extraRoots: ["/tmp"] }),
+    getDirectInfo: () => ({ port: null, addrs: [], connectedCount: 0 }),
+    hasRemoteViewers: () => true,
+    onPortalEvent: () => {},
+    stateDir: state,
+    captureDeps: {
+      platform: "darwin",
+      binDir,
+      hasCmd: (c) => c === "swiftc",
+      execBin: async (cmd, args) => {
+        if (cmd === "swiftc") {
+          const outIdx = args.indexOf("-o");
+          if (outIdx >= 0 && args[outIdx + 1]) writeFileSync(args[outIdx + 1]!, "mock-bin");
+          return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+        }
+        if (args[0] === "check") {
+          return { code: 0, stderr: "", stdout: Buffer.from(JSON.stringify({ screenCapture: false })) };
+        }
+        if (args[0] === "list") {
+          return {
+            code: 0,
+            stderr: "",
+            stdout: Buffer.from(
+              JSON.stringify([{ id: "901", appName: "ego lite", title: "ego lite · demo", pid: 901, bounds: { x: 0, y: 0, width: 1000, height: 700 } }]),
+            ),
+          };
+        }
+        if (args[0] === "capture") return { code: 2, stderr: "screen_recording_denied", stdout: Buffer.alloc(0) };
+        return { code: 1, stderr: "could not create image", stdout: Buffer.alloc(0) };
+      },
+    },
+  });
+  t.after(() => mgr.stop());
+
+  const winRes = await mgr.openPortal({ agentKey: fakeAgent.key, kind: "window", windowId: "901" });
+  assert.ok(winRes.item.streamError?.includes("屏幕录制"));
+
+  mgr.browser.open = async () => {
+    throw new Error("未安装 Chrome");
+  };
+  const startedAt = Date.now();
+  mgr.inspectToolCallForPortal(fakeAgent, "run_command", {
+    CommandLine: 'ego-browser nodejs -e "await page.goto(\\"http://127.0.0.1:8764/?edition=winter&t=0.1\\")"',
+  });
+  for (let i = 0; i < 30 && !mgr.listPortals(fakeAgent.key).some((x) => x.kind === "browser"); i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 1200, `expected TCC short-circuit < 1200ms, got ${elapsed}ms`);
+  const browserPortal = mgr.listPortals(fakeAgent.key).find((x) => x.kind === "browser");
+  assert.ok(browserPortal);
+  assert.match(browserPortal.streamError ?? "", /未安装 Chrome/);
 });

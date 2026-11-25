@@ -932,6 +932,10 @@ export interface RpcMethods {
     params: { agent?: string; path: string; cwd?: string; portalId?: string };
     result: { html: string; title: string };
   };
+  "portal.observeCommand": {
+    params: { agent: string; command: string };
+    result: { ok: true };
+  };
 }
 
 export type HostToolId = "app" | "herdr" | "hc" | "uniflo" | "hostd";
@@ -1009,6 +1013,7 @@ export interface PortalItem {
   width?: number;
   height?: number;
   canInteract: boolean;
+  streamError?: string;
   transportHint?: "p2p" | "relay";
   createdAt: number;
   updatedAt: number;
@@ -2916,7 +2921,7 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
   { key: "general.launchAtLogin", type: "boolean", default: false, usedBy: D, label: "开机时启动", doc: "Start the desktop app when you log in." },
   { key: "general.closeToTray", type: "boolean", default: false, usedBy: D, label: "关闭窗口后留在托盘", doc: "Closing the window keeps the app in the menu bar / tray. Off by default: closing the window quits the app." },
   { key: "general.notifications", type: "boolean", default: true, usedBy: D, label: "系统通知", doc: "System notifications when an agent finishes or waits." },
-  { key: "general.dynamicIsland", type: "boolean", default: true, usedBy: D, label: "灵动岛与顶部提醒胶囊", doc: "Show live agent reminders and quick jump in the macOS Dynamic Island / top capsule." },
+  { key: "general.dynamicIsland", type: "boolean", default: false, usedBy: [], label: "灵动岛（已停用）", doc: "Retired macOS Dynamic Island setting; kept for config compatibility." },
   { key: "update.region", type: "enum", values: ["auto", "cn", "global"], default: "auto", usedBy: ALL, label: "下载线路", doc: "auto: by time zone. cn: mirrors first. global: GitHub first.", env: "HERDR_POCKET_MIRROR" },
   { key: "update.preferredSource", type: "string", format: "sourceChoice", default: "auto", usedBy: ALL, label: "首选镜像源", doc: "auto: recommend by time zone and pick lowest-latency reachable source. direct: GitHub directly. Or a mirror prefix URL." },
   { key: "update.autoCheck", type: "boolean", default: true, usedBy: ALL, label: "自动检查更新", doc: "Look for a new release now and then.", env: "HERDR_POCKET_UPDATE_CHECK" },

@@ -18,8 +18,13 @@ import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge"
 import { hasFileJumpModifier, openAgentFileTarget } from "../lib/openFileTarget";
 import { setConfig, useClientConfig } from "../lib/config";
 import { attachTerminalImeBridge, chunkTerminalInputPayload, isImeKeyEvent } from "../lib/terminalIme";
-import { isTerminalRendererReady, snapTerminalViewportImmediate } from "../lib/terminalScroll";
-import { trackTerminalImeEvent, trackTerminalLayoutJump } from "../lib/uiTelemetry";
+import {
+  isTerminalRendererReady,
+  paintTerminalViewportImmediate,
+  snapTerminalViewportImmediate,
+  wakeTerminalRendererImmediate,
+} from "../lib/terminalScroll";
+import { trackTerminalImeEvent, trackTerminalLayoutJump, trackTerminalReveal } from "../lib/uiTelemetry";
 import {
   findLinkAtCell,
   findTerminalLinksForBufferLine,
@@ -362,6 +367,44 @@ function centerScreenVerticalGap(hostEl: HTMLElement | null, term: XTerm): void 
   screen.style.marginTop = spare > 1 ? `${Math.floor(spare / 2)}px` : "";
 }
 
+const LOCAL_ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bO[\s\S]?|\x1b[\s\S]?/g;
+
+function feedLocalCommandLineBuffer(bufRef: { current: string }, raw: string): string[] {
+  const cleaned = raw.replace(LOCAL_ANSI_RE, "");
+  const out: string[] = [];
+  let chars = Array.from(bufRef.current);
+  for (const ch of cleaned) {
+    if (ch === "\r" || ch === "\n") {
+      const line = chars.join("").trim();
+      chars = [];
+      if (line) out.push(line);
+      continue;
+    }
+    if (ch === "\x03" || ch === "\x15") {
+      chars = [];
+      continue;
+    }
+    if (ch === "\x7f" || ch === "\x08") {
+      chars.pop();
+      continue;
+    }
+    if (ch === "\x17") {
+      while (chars.length && chars[chars.length - 1] === " ") chars.pop();
+      while (chars.length && chars[chars.length - 1] !== " ") chars.pop();
+      continue;
+    }
+    const code = ch.codePointAt(0) ?? 0;
+    if (code === 0x09) {
+      if (chars.length < 4096) chars.push(" ");
+      continue;
+    }
+    if (code < 0x20) continue;
+    if (chars.length < 4096) chars.push(ch);
+  }
+  bufRef.current = chars.slice(-4096).join("");
+  return out;
+}
+
 export function TerminalSurface({
   agent,
   active,
@@ -406,6 +449,8 @@ export function TerminalSurface({
   const touchWarmWebglRef = useRef<(() => void) | null>(null);
   const dirtyWhileInactiveRef = useRef(false);
   const localConnRef = useRef<string | null>(null);
+  const localAttachPendingRef = useRef(false);
+  const relayActiveRef = useRef(false);
   const relayPendingRef = useRef<string[]>([]);
   const relayFlushingRef = useRef(false);
   const kittyKeysRef = useRef(new KittyKeyboardState());
@@ -462,6 +507,7 @@ export function TerminalSurface({
   const wasAtBottomRef = useRef(true);
   const savedOffsetFromBottomRef = useRef(0);
   const pendingViewportSyncRef = useRef(true);
+  const localCmdBufRef = useRef("");
 
   const paneOwnsFocus = useCallback(() => {
     if (typeof document === "undefined" || !document.hasFocus()) return false;
@@ -471,6 +517,13 @@ export function TerminalSurface({
     const ae = document.activeElement;
     return ae === termRef.current?.textarea || (ae !== null && hostEl.contains(ae));
   }, []);
+
+  const windowOwnsActivePane = useCallback(
+    () =>
+      activeRef.current &&
+      (typeof document === "undefined" || document.hasFocus() || isInteractiveResizeActive()),
+    [],
+  );
 
   const wrapBracketedPaste = useCallback((text: string): string => {
     const t = termRef.current;
@@ -586,6 +639,10 @@ export function TerminalSurface({
               await new Promise((r) => setTimeout(r, 4));
             }
           }
+          const lines = feedLocalCommandLineBuffer(localCmdBufRef, data);
+          for (const cmdLine of lines) {
+            void rpcCall(agent.deviceId, "portal.observeCommand", { agent: agent.key, command: cmdLine }).catch(() => {});
+          }
           return;
         } catch {
           // If local attach closed unexpectedly, clear and fall through to relay queue.
@@ -700,8 +757,20 @@ export function TerminalSurface({
   const sendPtyResizeNow = useCallback(
     (term: XTerm, forceReclaim = false) => {
       if (term.cols < 24 || term.rows < 6) return;
-      const display = currentDisplay(term);
+      if (
+        !forceReclaim &&
+        ptySizeRef.current !== null &&
+        typeof document !== "undefined" &&
+        !document.hasFocus() &&
+        !isInteractiveResizeActive()
+      ) {
+        return;
+      }
       const localConnId = localConnRef.current;
+      if (!localConnId && (localAttachPendingRef.current || !relayActiveRef.current)) {
+        return;
+      }
+      const display = currentDisplay(term);
       if (forceReclaim) lastResizeSigRef.current = "";
       const sig = `${localConnId ?? "relay"}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}@${display.bg}`;
       if (lastResizeSigRef.current === sig) return;
@@ -788,7 +857,7 @@ export function TerminalSurface({
       ) {
         return;
       }
-      if (externalSizeOverrideRef.current && !forceReclaim && !paneOwnsFocus()) {
+      if (externalSizeOverrideRef.current && !forceReclaim && !paneOwnsFocus() && !windowOwnsActivePane()) {
         return;
       }
       externalSizeOverrideRef.current = false;
@@ -797,7 +866,7 @@ export function TerminalSurface({
       centerScreenVerticalGap(hostRef.current, term);
       flushPtyResize(term, forceReclaim);
     },
-    [flushPtyResize, paneOwnsFocus, refreshCachedCellSize],
+    [flushPtyResize, paneOwnsFocus, refreshCachedCellSize, windowOwnsActivePane],
   );
 
   const paintOverlays = useCallback(() => {
@@ -1387,13 +1456,16 @@ export function TerminalSurface({
     kittyKeys.reset();
 
     hostEl.dataset.ready = "false";
+    const mountStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
     let initialReadyDone = false;
     let initialAttachPending = false;
-    const markHostReady = () => {
+    const markHostReady = (mode: "local" | "relay" | "fallback" = "fallback") => {
       if (initialReadyDone) return;
       initialReadyDone = true;
       initialAttachPending = false;
       hostEl.dataset.ready = "true";
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      trackTerminalReveal(now - mountStartedAt, mode);
     };
     let hostReadyFallback = 0;
     term.open(hostEl);
@@ -1456,6 +1528,8 @@ export function TerminalSurface({
         });
         term.loadAddon(addon);
         webglRef.current = addon;
+        wakeTerminalRendererImmediate(term);
+        paintTerminalViewportImmediate(term);
       } catch {
         releaseWebglSlot(poolKey);
         // Environments without WebGL2 fall back cleanly to xterm's DOM renderer.
@@ -2864,8 +2938,14 @@ export function TerminalSurface({
         if (!initialReadyDone || wasAtBottomRef.current) {
           wasAtBottomRef.current = true;
           savedOffsetFromBottomRef.current = 0;
+          if (activeRef.current) {
+            wakeTerminalRendererImmediate(term);
+          }
           pendingViewportSyncRef.current = !snapTerminalViewportImmediate(term, true, 0);
-          if (!initialReadyDone) markHostReady();
+          if (activeRef.current) {
+            paintTerminalViewportImmediate(term);
+          }
+          if (!initialReadyDone) markHostReady("fallback");
         }
         paintOverlays();
       });
@@ -2885,11 +2965,13 @@ export function TerminalSurface({
     let syncHoldDeadline = 0;
     let initialBurstStartAt = 0;
     let initialRevealQueued = false;
+    let pendingResetBeforeRawFlush = false;
+    let reclaimAfterInitialRaw = false;
     const INPUT_FAST_MS = 200;
     const FLUSH_BYTE_CAP = 512 * 1024;
     const HIDDEN_OUTPUT_CLOCK_MS = 64;
     const SYNC_HOLD_MAX_MS = 32;
-    const INITIAL_BURST_MAX_MS = 650;
+    const INITIAL_BURST_MAX_MS = 80;
 
     const flushPendingBytes = () => {
       flushMicroQueued = false;
@@ -2913,16 +2995,35 @@ export function TerminalSurface({
       pendingByteCount = 0;
       if (alive) {
         const needsInitialReveal = !initialReadyDone;
+        const resetForRaw = pendingResetBeforeRawFlush;
+        const doReclaimAfterRaw = reclaimAfterInitialRaw;
+        if (resetForRaw) {
+          pendingResetBeforeRawFlush = false;
+          term.reset();
+        }
+        if (doReclaimAfterRaw) {
+          reclaimAfterInitialRaw = false;
+        }
         writeSegmented(textDecoder.decode(merged, { stream: true }));
-        if (needsInitialReveal && !initialRevealQueued) {
-          initialRevealQueued = true;
+        if ((needsInitialReveal && !initialRevealQueued) || resetForRaw || doReclaimAfterRaw) {
+          if (needsInitialReveal) initialRevealQueued = true;
           term.write("", () => {
-            initialRevealQueued = false;
+            if (needsInitialReveal) initialRevealQueued = false;
             if (!alive || termRef.current !== term) return;
             wasAtBottomRef.current = true;
             savedOffsetFromBottomRef.current = 0;
+            if (activeRef.current) {
+              wakeTerminalRendererImmediate(term);
+            }
             pendingViewportSyncRef.current = !snapTerminalViewportImmediate(term, true, 0);
-            markHostReady();
+            if (activeRef.current) {
+              paintTerminalViewportImmediate(term);
+            }
+            if (!initialReadyDone) markHostReady(activeLocalConnId ? "local" : "relay");
+            if (doReclaimAfterRaw && (paneOwnsFocus() || windowOwnsActivePane())) {
+              externalSizeOverrideRef.current = false;
+              syncResize(term, true);
+            }
             paintOverlays();
           });
         }
@@ -2941,7 +3042,7 @@ export function TerminalSurface({
       if (!initialReadyDone) {
         if (!initialBurstStartAt) initialBurstStartAt = nowMs;
         const burstElapsed = nowMs - initialBurstStartAt;
-        if (initialAttachPending && burstElapsed >= 450) {
+        if (initialAttachPending && burstElapsed >= 120) {
           initialAttachPending = false;
         }
         const maxRemain = Math.max(0, INITIAL_BURST_MAX_MS - burstElapsed);
@@ -2949,6 +3050,9 @@ export function TerminalSurface({
           if (flushRaf) {
             cancelAnimationFrame(flushRaf);
             flushRaf = 0;
+          }
+          if (!initialAttachPending && flushTimer) {
+            return;
           }
           if (flushTimer) window.clearTimeout(flushTimer);
           const quietMs = initialAttachPending
@@ -3074,7 +3178,7 @@ export function TerminalSurface({
         initialAttachPending = true;
       }
       if (!initialReadyDone && !hostReadyFallback) {
-        hostReadyFallback = window.setTimeout(markHostReady, 950);
+        hostReadyFallback = window.setTimeout(() => markHostReady("relay"), 280);
       }
       let rawModeConfirmed = false;
       const runFallbackRead = () => {
@@ -3085,9 +3189,10 @@ export function TerminalSurface({
             if (alive && !sawRaw && !rawModeConfirmed) writeFallbackScreen((res.ansi || res.text || "").split("\n"));
           })
           .catch(() => {
-            if (alive && !initialReadyDone) markHostReady();
+            if (alive && !initialReadyDone) markHostReady("fallback");
           });
       };
+      relayActiveRef.current = true;
       unsubRelay = subscribeStream(
         agent.deviceId,
         "terminal",
@@ -3106,17 +3211,40 @@ export function TerminalSurface({
               clearTimeout(seedTimer);
               seedTimer = 0;
             }
-            if (!sawRaw) {
+            const evCols = typeof ev.cols === "number" && ev.cols >= 20 ? ev.cols : 0;
+            const evRows = typeof ev.rows === "number" && ev.rows >= 5 ? ev.rows : 0;
+            const wasFirstRaw = !sawRaw;
+            if (wasFirstRaw) {
               sawRaw = true;
               if (fallbackLines.length) {
-                initialReadyDone = false;
+                pendingResetBeforeRawFlush = true;
                 initialBurstStartAt = 0;
                 initialRevealQueued = false;
-                hostEl.dataset.ready = "false";
-                window.clearTimeout(hostReadyFallback);
-                hostReadyFallback = window.setTimeout(markHostReady, 950);
-                term.reset();
               }
+              if (evCols > 0 && evRows > 0 && (evCols !== term.cols || evRows !== term.rows)) {
+                ptySizeRef.current = { cols: evCols, rows: evRows };
+                term.resize(evCols, evRows);
+                refreshCachedCellSize(term);
+                if (paneOwnsFocus() || windowOwnsActivePane()) {
+                  reclaimAfterInitialRaw = true;
+                } else {
+                  externalSizeOverrideRef.current = true;
+                }
+              }
+            } else if (
+              evCols > 0 &&
+              evRows > 0 &&
+              (evCols !== term.cols || evRows !== term.rows) &&
+              !windowOwnsActivePane() &&
+              ptyResizeTimerRef.current === null
+            ) {
+              flushPendingBytes();
+              ptySizeRef.current = { cols: evCols, rows: evRows };
+              lastResizeSigRef.current = "";
+              externalSizeOverrideRef.current = true;
+              term.resize(evCols, evRows);
+              refreshCachedCellSize(term);
+              scheduleOverlay();
             }
             try {
               queueRawBytes(decodeBase64Bytes(ev.data));
@@ -3149,7 +3277,7 @@ export function TerminalSurface({
           }
         },
       );
-      seedTimer = window.setTimeout(runFallbackRead, 900);
+      seedTimer = window.setTimeout(runFallbackRead, 450);
     };
 
     let readyToAttachResolve: (() => void) | null = null;
@@ -3173,14 +3301,16 @@ export function TerminalSurface({
     let triggerLocalReattach: (() => void) | null = null;
     if (native.available() && (agent.source === "hc" || agent.source === "herdr") && agent.localId) {
       const localTermId = agent.localId;
+      localAttachPendingRef.current = true;
       const connectLocal = async (attempt: number): Promise<void> => {
         const gen = ++attachGen;
         if (!alive) return;
+        localAttachPendingRef.current = true;
         if (!initialReadyDone) {
           initialAttachPending = true;
         }
         if (!initialReadyDone && !hostReadyFallback) {
-          hostReadyFallback = window.setTimeout(markHostReady, 950);
+          hostReadyFallback = window.setTimeout(() => markHostReady("local"), 280);
         }
         fitAddon.fit();
         refreshCachedCellSize(term);
@@ -3190,6 +3320,8 @@ export function TerminalSurface({
         const connId = `${localTermId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         activeLocalConnId = connId;
         localConnRef.current = connId;
+        localAttachPendingRef.current = false;
+        relayActiveRef.current = false;
         let preResolveChunks: Uint8Array[] | null = [];
         try {
           const attRes = await native.localTermAttach({
@@ -3215,42 +3347,67 @@ export function TerminalSurface({
             return;
           }
           const dims = fitAddon.proposeDimensions();
-          if (dims && dims.cols > 0 && dims.rows > 0 && (dims.cols !== reqCols || dims.rows !== reqRows)) {
-            fitAddon.fit();
-            refreshCachedCellSize(term);
-            centerScreenVerticalGap(hostEl, term);
-            syncResize(term, true);
-          }
-          ptySizeRef.current = { cols: attRes.cols, rows: attRes.rows };
-          logger.info("term", "term.attach", { mode: "local", cols: attRes.cols, rows: attRes.rows });
-          const display = currentDisplay(term);
-          if (attRes.cols !== term.cols || attRes.rows !== term.rows) {
-            const ownsInitialSize =
-              paneOwnsFocus() ||
-              (activeRef.current && focusedRef.current && (typeof document === "undefined" || document.hasFocus()));
-            if (!ownsInitialSize) {
-              externalSizeOverrideRef.current = true;
-              term.resize(attRes.cols, attRes.rows);
-              refreshCachedCellSize(term);
-            } else {
-              lastResizeSigRef.current = `${connId}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}@${display.bg}`;
-              ptySizeRef.current = { cols: term.cols, rows: term.rows };
-              void native.localTermResize(connId, term.cols, term.rows, display as unknown as Record<string, unknown>).catch(() => {});
-            }
-          } else {
-            lastResizeSigRef.current = `${connId}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}@${display.bg}`;
-          }
-          // Batch buffered pre-resolve PTY chunks with the initial burst so partial scrollback never reveals early.
+          const wantCols = dims && dims.cols >= 20 ? dims.cols : reqCols;
+          const wantRows = dims && dims.rows >= 5 ? dims.rows : reqRows;
+          const ownsInitialSize = paneOwnsFocus() || windowOwnsActivePane();
           const buffered = preResolveChunks;
           preResolveChunks = null;
           initialAttachPending = false;
-          for (const chunk of buffered) {
-            if (!sawRaw) sawRaw = true;
-            queueRawBytes(chunk);
+          const display = currentDisplay(term);
+          ptySizeRef.current = { cols: attRes.cols, rows: attRes.rows };
+          logger.info("term", "term.attach", { mode: "local", cols: attRes.cols, rows: attRes.rows });
+
+          if (attRes.cols !== wantCols || attRes.rows !== wantRows) {
+            if (buffered.length > 0) {
+              // Parse pre-resolve history at `attRes` dimensions so wrapped lines & cursor-up rewrites stay aligned,
+              // then reclaim the local pane's viewport dimensions once the snapshot commits.
+              if (term.cols !== attRes.cols || term.rows !== attRes.rows) {
+                term.resize(attRes.cols, attRes.rows);
+                refreshCachedCellSize(term);
+              }
+              for (const chunk of buffered) {
+                if (!sawRaw) sawRaw = true;
+                queueRawBytes(chunk);
+              }
+              if (ownsInitialSize) {
+                flushPendingBytes();
+                term.write("", () => {
+                  if (!alive || termRef.current !== term || activeLocalConnId !== connId) return;
+                  externalSizeOverrideRef.current = false;
+                  syncResize(term, true);
+                });
+              } else {
+                externalSizeOverrideRef.current = true;
+              }
+            } else if (ownsInitialSize) {
+              externalSizeOverrideRef.current = false;
+              fitAddon.fit();
+              refreshCachedCellSize(term);
+              centerScreenVerticalGap(hostEl, term);
+              lastResizeSigRef.current = `${connId}:${term.cols}x${term.rows}@${display.cell[0]}x${display.cell[1]}@${display.bg}`;
+              ptySizeRef.current = { cols: term.cols, rows: term.rows };
+              void native.localTermResize(connId, term.cols, term.rows, display as unknown as Record<string, unknown>).catch(() => {});
+            } else {
+              externalSizeOverrideRef.current = true;
+              term.resize(attRes.cols, attRes.rows);
+              refreshCachedCellSize(term);
+            }
+          } else {
+            if (term.cols !== wantCols || term.rows !== wantRows) {
+              fitAddon.fit();
+              refreshCachedCellSize(term);
+              centerScreenVerticalGap(hostEl, term);
+            }
+            ptySizeRef.current = { cols: wantCols, rows: wantRows };
+            lastResizeSigRef.current = `${connId}:${wantCols}x${wantRows}@${display.cell[0]}x${display.cell[1]}@${display.bg}`;
+            for (const chunk of buffered) {
+              if (!sawRaw) sawRaw = true;
+              queueRawBytes(chunk);
+            }
           }
           if (buffered.length === 0 && !initialReadyDone) {
             window.clearTimeout(hostReadyFallback);
-            hostReadyFallback = window.setTimeout(markHostReady, 650);
+            hostReadyFallback = window.setTimeout(() => markHostReady("local"), 48);
           }
           if (alive) {
             void localTermFocus(connId, activeRef.current && focusedRef.current);
@@ -3258,6 +3415,7 @@ export function TerminalSurface({
         } catch {
           preResolveChunks = null;
           initialAttachPending = false;
+          localAttachPendingRef.current = false;
           if (localConnRef.current === connId) localConnRef.current = null;
           if (activeLocalConnId === connId) activeLocalConnId = null;
           if (alive && gen === attachGen) startRelayStream();
@@ -3270,6 +3428,9 @@ export function TerminalSurface({
         activeLocalConnId = null;
         if (localConnRef.current === oldId) localConnRef.current = null;
         externalSizeOverrideRef.current = false;
+        reclaimAfterInitialRaw = false;
+        relayActiveRef.current = false;
+        localAttachPendingRef.current = true;
         flushPendingBytes();
         if (oldId) void native.localTermDetach(oldId);
         sawRaw = false;
@@ -3278,17 +3439,19 @@ export function TerminalSurface({
         initialReadyDone = false;
         initialBurstStartAt = 0;
         initialRevealQueued = false;
+        pendingResetBeforeRawFlush = false;
         wasAtBottomRef.current = true;
         savedOffsetFromBottomRef.current = 0;
         pendingViewportSyncRef.current = true;
         hostEl.dataset.ready = "false";
         window.clearTimeout(hostReadyFallback);
-        hostReadyFallback = window.setTimeout(markHostReady, 950);
+        hostReadyFallback = window.setTimeout(() => markHostReady("local"), 280);
         window.clearTimeout(orphanNudgeTimer);
         orphanNudgeTimer = 0;
         pendingBytes = [];
         pendingByteCount = 0;
         lastResizeSigRef.current = "";
+        localCmdBufRef.current = "";
         splitter.reset();
         clearAllTerminalOverlays(false);
         term.reset();
@@ -3309,6 +3472,7 @@ export function TerminalSurface({
         ]);
         if (!alive) return;
         if (!resolvedLocalId || resolvedLocalId !== agent.deviceId) {
+          localAttachPendingRef.current = false;
           if (reattachLocalRef.current === triggerLocalReattach) reattachLocalRef.current = null;
           startRelayStream();
           return;
@@ -3321,20 +3485,25 @@ export function TerminalSurface({
             flushPendingBytes();
             if (localConnRef.current === closedId) localConnRef.current = null;
             activeLocalConnId = null;
+            localAttachPendingRef.current = false;
             startRelayStream();
           },
           (payload) => {
             if (!alive || payload.terminal !== localTermId) return;
             const { cols, rows } = payload;
             ptySizeRef.current = { cols, rows };
-            const externalOwner = typeof document === "undefined" || !document.hasFocus() || !activeRef.current;
-            if ((cols !== term.cols || rows !== term.rows) && externalOwner) {
-              flushPendingBytes();
-              externalSizeOverrideRef.current = true;
-              term.resize(cols, rows);
-              refreshCachedCellSize(term);
-              scheduleOverlay();
+            lastResizeSigRef.current = "";
+            if (cols === term.cols && rows === term.rows) return;
+            if (ptyResizeTimerRef.current !== null && windowOwnsActivePane()) return;
+            if (paneOwnsFocus()) {
+              flushPtyResize(term, false);
+              return;
             }
+            flushPendingBytes();
+            externalSizeOverrideRef.current = true;
+            term.resize(cols, rows);
+            refreshCachedCellSize(term);
+            scheduleOverlay();
           },
         );
         unsubLocalClose = offClose;
@@ -3387,7 +3556,7 @@ export function TerminalSurface({
         lastObservedBoxRef.current = { w, h };
         if (canClaimLayout) externalSizeOverrideRef.current = false;
       }
-      if (externalSizeOverrideRef.current && !paneOwnsFocus()) return;
+      if (externalSizeOverrideRef.current && !paneOwnsFocus() && !windowOwnsActivePane()) return;
       externalSizeOverrideRef.current = false;
 
       if (cellSizeRef.current[0] <= 1 || cellSizeRef.current[1] <= 1) {
@@ -3561,6 +3730,8 @@ export function TerminalSurface({
         if (localConnRef.current === activeLocalConnId) localConnRef.current = null;
         void native.localTermDetach(activeLocalConnId);
       }
+      localAttachPendingRef.current = false;
+      relayActiveRef.current = false;
       lastResizeSigRef.current = "";
       relayPendingRef.current = [];
       dispScroll.dispose();
@@ -3656,11 +3827,23 @@ export function TerminalSurface({
     const stickToBottom = wasAtBottomRef.current;
     const savedOffset = savedOffsetFromBottomRef.current;
     lastActivateAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
-    if (externalSizeOverrideRef.current) {
+    const hostEl = hostRef.current;
+    const w0 = hostEl?.clientWidth ?? 0;
+    const h0 = hostEl?.clientHeight ?? 0;
+    const wokeOrNeedsRefresh = wakeTerminalRendererImmediate(term);
+    const canOwnPane = focusedRef.current || windowOwnsActivePane();
+    if (w0 >= 180 && h0 >= 90 && ((externalSizeOverrideRef.current && canOwnPane) || term.cols < 24 || term.rows < 6)) {
+      lastObservedBoxRef.current = { w: w0, h: h0 };
+      syncResize(term, canOwnPane);
+    } else if (externalSizeOverrideRef.current) {
       lastResizeSigRef.current = "";
     }
     if (snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
       pendingViewportSyncRef.current = false;
+    }
+    if (wokeOrNeedsRefresh || dirtyWhileInactiveRef.current || !webglRef.current) {
+      dirtyWhileInactiveRef.current = false;
+      paintTerminalViewportImmediate(term);
     }
     const id = requestAnimationFrame(() => {
       onActivatedAttachRef.current?.();
@@ -3670,9 +3853,8 @@ export function TerminalSurface({
         dirtyWhileInactiveRef.current = false;
         term.refresh(0, Math.max(0, term.rows - 1));
       }
-      const hostEl = hostRef.current;
-      const w = hostEl?.clientWidth ?? 0;
-      const h = hostEl?.clientHeight ?? 0;
+      const w = hostRef.current?.clientWidth ?? 0;
+      const h = hostRef.current?.clientHeight ?? 0;
       if (w >= 180 && h >= 90) {
         const sameBox =
           !externalSizeOverrideRef.current &&
@@ -3684,7 +3866,7 @@ export function TerminalSurface({
           flushPtyResize(term, focusedRef.current);
         } else {
           lastObservedBoxRef.current = { w, h };
-          syncResize(term, focusedRef.current);
+          syncResize(term, focusedRef.current || windowOwnsActivePane());
         }
       }
       const curConnId = localConnRef.current;
@@ -3703,7 +3885,7 @@ export function TerminalSurface({
     return () => {
       cancelAnimationFrame(id);
     };
-  }, [active, focused, flushPtyResize, paintOverlays, syncResize]);
+  }, [active, focused, flushPtyResize, paintOverlays, syncResize, windowOwnsActivePane]);
 
   // Accept dictated text or virtual mobile pad keys when this terminal pane is active and focused.
   useEffect(() => {

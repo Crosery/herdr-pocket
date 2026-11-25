@@ -403,12 +403,6 @@ export function NotificationsPane() {
           void refreshNotifyChannel();
         }}
       />
-      {isTauri() ? (
-        <ConfigSwitch
-          k="general.dynamicIsland"
-          about="在 macOS 屏幕顶部刘海 / 菜单栏中央联动显示灵动岛提醒与快速跳转"
-        />
-      ) : null}
       <SetRow title="提示音" about="后台 Agent 需要你确认或长任务完成时播放轻柔提示音">
         <PocketSwitch checked={alertSound} onCheckedChange={(v) => updateSettings({ alertSound: v })} label="提示音" />
       </SetRow>
@@ -421,7 +415,7 @@ export function NotificationsPane() {
       </SetRow>
       {isTauri() ? (
         <>
-          <SetRow title="灵动岛与提醒预览" about="触发示例审批、提问与完成提醒，预览顶部灵动岛与窗口内提醒队列">
+          <SetRow title="提醒小弹窗预览" about="触发示例审批、提问与完成提醒，预览窗口内提醒小弹窗与待办队列">
             <PocketButton size="sm" variant="soft" onClick={() => triggerDemoAttentionPreview()}>
               预览提醒效果
             </PocketButton>

@@ -21,9 +21,12 @@ import {
 } from "lucide-react";
 import type { Agent, FileEntry, PortalItem, RemoteWindowInfo } from "@herdr-pocket/protocol";
 import { FileViewer } from "../views/WorkbenchView";
-import { copyToClipboard, openExternalUrl } from "../lib/bridge";
+import { copyToClipboard, isTauri, openExternalUrl } from "../lib/bridge";
+import { useLocalHostDeviceId } from "../lib/fonts";
 import {
+  capturePortalFrameOnce,
   closePortalSurface,
+  isLoopbackPortalUrl,
   mapContainedPointer,
   openPortalSurface,
   portalStore,
@@ -37,7 +40,7 @@ import { openFileTab } from "../shell/shellStore";
 import { PocketButton, PocketIconButton, PocketInput, PocketModal, PocketSelect, useToast } from "./PocketUI";
 
 const SESSION_LABELS: Record<string, string> = {
-  macos: "macOS CoreGraphics",
+  macos: "macOS ScreenCaptureKit",
   win32: "Windows Win32",
   x11: "Linux X11",
   "wayland-wlroots": "Linux Wayland (wlroots)",
@@ -222,12 +225,17 @@ export function PortalViewerModal({
 
   const item = activePortalId ? itemsById[activePortalId] : undefined;
   const frame = item ? framesById[item.id] : undefined;
+  const localHostId = useLocalHostDeviceId();
+  const isRemoteHost = !isTauri() || !localHostId || (item ? item.hostId !== localHostId : hostId !== localHostId);
+  const canOpenUrlLocally = Boolean(item?.url && (!isRemoteHost || !isLoopbackPortalUrl(item.url)));
 
   const [browserUrlInput, setBrowserUrlInput] = useState("http://127.0.0.1:3000");
   const [navUrlInput, setNavUrlInput] = useState("");
   const [targetPathInput, setTargetPathInput] = useState("");
   const [loadingWin, setLoadingWin] = useState(false);
   const [busyAction, setBusyAction] = useState(false);
+  const [retryingFrame, setRetryingFrame] = useState(false);
+  const [waitingSlow, setWaitingSlow] = useState(false);
   const [keyBuffer, setKeyBuffer] = useState("");
   const stageRef = useRef<HTMLDivElement | null>(null);
 
@@ -247,6 +255,14 @@ export function PortalViewerModal({
   const itemHostId = item?.hostId;
   const itemId = item?.id;
   const itemCanInteract = Boolean(item?.canInteract);
+  const hasFrame = Boolean(frame);
+  useEffect(() => {
+    setWaitingSlow(false);
+    if (!open || !itemId || !itemCanInteract || hasFrame) return;
+    const t = window.setTimeout(() => setWaitingSlow(true), 3500);
+    return () => window.clearTimeout(t);
+  }, [hasFrame, itemCanInteract, itemId, open]);
+
   useEffect(() => {
     if (!open || !itemHostId || !itemId || !itemCanInteract) return;
     return subscribePortalFrames(itemHostId, itemId, 12);
@@ -537,15 +553,21 @@ export function PortalViewerModal({
                       >
                         <Copy size={13} />
                       </PocketIconButton>
-                      <PocketButton
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => void openExternalUrl(item.url!)}
-                        title="如果非 localhost 链接，也可直接在当前电脑浏览器打开"
-                      >
-                        <ExternalLink size={12} />
-                        <span>本机打开</span>
-                      </PocketButton>
+                      {canOpenUrlLocally ? (
+                        <PocketButton
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => void openExternalUrl(item.url!)}
+                          title="在当前设备浏览器打开"
+                        >
+                          <ExternalLink size={12} />
+                          <span>本机打开</span>
+                        </PocketButton>
+                      ) : (
+                        <span className="portal-cap-pill" title="该地址仅运行在远端电脑本地回环网卡">
+                          远端本地端口
+                        </span>
+                      )}
                     </>
                   ) : null}
                 </>
@@ -652,14 +674,47 @@ export function PortalViewerModal({
               ) : (
                 <div className="portal-stage-placeholder">
                   <MousePointerClick size={28} />
-                  <div>正在建立画面流…</div>
-                  {caps?.notes?.length ? <div className="faint">{caps.notes.join("；")}</div> : null}
-                  {item.url ? (
-                    <PocketButton size="sm" variant="soft" onClick={() => void openExternalUrl(item.url!)}>
-                      <ExternalLink size={12} />
-                      <span>在当前设备直接打开链接</span>
-                    </PocketButton>
+                  <div>
+                    {item.streamError
+                      ? "暂时无法获取远端画面"
+                      : waitingSlow
+                        ? "暂未收到画面帧"
+                        : "正在建立画面流…"}
+                  </div>
+                  {item.streamError ? (
+                    <div className="faint" style={{ maxWidth: 520, lineHeight: 1.5 }}>{item.streamError}</div>
+                  ) : caps?.notes?.length ? (
+                    <div className="faint" style={{ maxWidth: 520, lineHeight: 1.5 }}>{caps.notes.join("；")}</div>
+                  ) : waitingSlow ? (
+                    <div className="faint" style={{ maxWidth: 520, lineHeight: 1.5 }}>
+                      远端窗口可能已最小化、被遮挡，或当前会话未授予系统屏幕录制权限
+                    </div>
                   ) : null}
+                  {isRemoteHost && item.url && isLoopbackPortalUrl(item.url) ? (
+                    <div className="faint mono">该地址为远端电脑本地服务 (127.0.0.1)，无法从当前设备直接打开</div>
+                  ) : null}
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
+                    <PocketButton
+                      size="sm"
+                      variant="soft"
+                      disabled={retryingFrame}
+                      onClick={() => {
+                        setRetryingFrame(true);
+                        void capturePortalFrameOnce(item.hostId, item.id)
+                          .catch((e: Error) => toast(e.message || "重试捕获失败", true))
+                          .finally(() => setRetryingFrame(false));
+                      }}
+                    >
+                      <RefreshCw size={12} className={retryingFrame ? "pk-spin" : undefined} />
+                      <span>重试捕获</span>
+                    </PocketButton>
+                    {canOpenUrlLocally ? (
+                      <PocketButton size="sm" variant="soft" onClick={() => void openExternalUrl(item.url!)}>
+                        <ExternalLink size={12} />
+                        <span>在当前设备直接打开链接</span>
+                      </PocketButton>
+                    ) : null}
+                  </div>
                 </div>
               )}
             </div>

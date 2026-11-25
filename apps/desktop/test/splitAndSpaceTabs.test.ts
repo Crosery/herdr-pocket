@@ -689,6 +689,11 @@ test("terminal stability and pane-header hover guards cap WebGL contexts and avo
   assert.equal(termSrc.includes("onContextLoss"), true, "WebGL addon must detach cleanly on context loss");
   assert.equal(termSrc.includes("detachWebgl()"), true, "WebGL addon must detach when hidden or showing Kitty underlays");
   assert.equal(termSrc.includes("useLayoutEffect("), true, "TerminalSurface should use useLayoutEffect for synchronous tab-switch repaint");
+  assert.equal(termSrc.includes("windowOwnsActivePane"), true, "TerminalSurface must let visible split panes in focused window reclaim their grid");
+  assert.equal(termSrc.includes("localAttachPendingRef"), true, "TerminalSurface must suppress premature Relay terminal.resize before local attach resolves");
+  const localSizeBlock = termSrc.slice(termSrc.indexOf("(payload) => {\n            if (!alive || payload.terminal !== localTermId)"), termSrc.indexOf("unsubLocalClose = offClose"));
+  assert.equal(localSizeBlock.includes("if (cols === term.cols && rows === term.rows) return"), true);
+  assert.equal(localSizeBlock.includes("term.resize(cols, rows)"), true, "local-term://size must never drop mismatched columns without reclaiming or resizing xterm");
   assert.equal(termSrc.includes("term.reset();\n            return connectLocal"), false, "connectLocal size drift should resize in place instead of term.reset()");
 
   const shellCss = readFileSync(resolve(testDir, "../src/styles/shell.css"), "utf8");

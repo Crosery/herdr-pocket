@@ -20,6 +20,7 @@ import { rpcCall } from "../lib/relay";
 import {
   closePortalSurface,
   filterVisiblePortalItems,
+  isLoopbackPortalUrl,
   portalStore,
   subscribeAgentPortalUpdates,
   subscribePortalFrames,
@@ -223,10 +224,18 @@ export function SessionPortalPiP({
   const frame = framesById[current.id];
   const activeHtml = htmlPreview?.portalId === current.id ? htmlPreview : null;
   const activeImg = imgPreview?.portalId === current.id ? imgPreview : null;
-  const openUrl =
-    (current.url && /^https?:\/\//i.test(current.url) ? current.url : null) ??
-    (activeHtml?.memUrl ? activeHtml.memUrl : null);
-  const p2pLabel = directAddr || current.transportHint === "p2p" ? "P2P 直连" : "中继";
+  const isSameLocalHost = Boolean(isTauriApp && localHostId && current.hostId === localHostId);
+  const safeExternalUrl =
+    current.url && /^https?:\/\//i.test(current.url) && (isSameLocalHost || !isLoopbackPortalUrl(current.url))
+      ? current.url
+      : null;
+  const openUrl = safeExternalUrl ?? (activeHtml?.memUrl ? activeHtml.memUrl : null);
+  const p2pLabel =
+    localHostId && current.hostId === localHostId
+      ? "本机浮窗"
+      : directAddr || current.transportHint === "p2p"
+        ? "P2P 直连"
+        : "中继";
 
   const currentAnchorRect = () => {
     const el = rootRef.current;
@@ -483,19 +492,24 @@ export function SessionPortalPiP({
               <div className="session-portal-pip-kind">
                 {portalIcon(current.kind)}
                 <span>
-                  {current.kind === "browser"
-                    ? "远程浏览器画面"
-                    : current.kind === "window"
-                      ? "远程桌面窗口"
-                      : current.kind === "reveal"
-                        ? "已定位到远程目录"
-                        : current.kind === "html"
-                          ? "P2P HTML 应用预览"
-                          : "P2P 跨端文件预览"}
+                  {current.streamError
+                    ? "画面捕获受限"
+                    : current.kind === "browser"
+                      ? "远程浏览器画面"
+                      : current.kind === "window"
+                        ? "远程桌面窗口"
+                        : current.kind === "reveal"
+                          ? "已定位到远程目录"
+                          : current.kind === "html"
+                            ? "P2P HTML 应用预览"
+                            : "P2P 跨端文件预览"}
                 </span>
               </div>
-              <div className="session-portal-pip-sub mono truncate">
-                {current.highlightName || current.subtitle || current.url || current.targetPath || current.title}
+              <div
+                className="session-portal-pip-sub mono truncate"
+                title={current.streamError || current.subtitle || current.url || current.targetPath || current.title}
+              >
+                {current.streamError || current.highlightName || current.subtitle || current.url || current.targetPath || current.title}
               </div>
             </div>
           )}

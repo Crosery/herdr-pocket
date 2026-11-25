@@ -5,7 +5,15 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { canActOnLocalFile } from "../src/lib/localFileActions.ts";
 import { parseFileTarget } from "../src/lib/openFileTarget.ts";
-import { buildPortalP2pUrl, filterVisiblePortalItems, mapContainedPointer } from "../src/lib/portalClient.ts";
+import {
+  buildPortalP2pUrl,
+  filterVisiblePortalItems,
+  ingestPortalStreamEvent,
+  isLoopbackPortalUrl,
+  mapContainedPointer,
+  portalStore,
+  resetPortalClientStateForTest,
+} from "../src/lib/portalClient.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -136,7 +144,7 @@ test("new Batch 2 UI/docs files contain zero emojis", () => {
   }
 });
 
-test("SessionPortalPiP filters same-machine auto-popups on desktop, preserves terminal focus, and anchors in-term top-right", () => {
+test("SessionPortalPiP surfaces same-machine and remote portals immediately, preserves terminal focus, and anchors in-term top-right", () => {
   const autoItem = {
     id: "ptl-auto",
     hostId: "h1",
@@ -151,7 +159,7 @@ test("SessionPortalPiP filters same-machine auto-popups on desktop, preserves te
   const manualItem = { ...autoItem, id: "ptl-manual", updatedAt: 150 };
   const itemsById = { [autoItem.id]: autoItem, [manualItem.id]: manualItem };
 
-  // Same local Tauri machine hides automatic popups while retaining manually launched portals
+  // Same local Tauri machine now also surfaces newly launched window/browser/file PiPs immediately
   const localVisible = filterVisiblePortalItems({
     itemsById,
     dismissedIds: {},
@@ -162,6 +170,20 @@ test("SessionPortalPiP filters same-machine auto-popups on desktop, preserves te
   });
   assert.deepEqual(
     localVisible.map((i) => i.id),
+    ["ptl-auto", "ptl-manual"],
+  );
+
+  // Dismissing an auto portal hides only the dismissed card
+  const afterDismiss = filterVisiblePortalItems({
+    itemsById,
+    dismissedIds: { [autoItem.id]: true },
+    manualIds: { [manualItem.id]: true },
+    agent: { deviceId: "h1", key: "h1/hc:t1" },
+    isTauriApp: true,
+    localHostId: "h1",
+  });
+  assert.deepEqual(
+    afterDismiss.map((i) => i.id),
     ["ptl-manual"],
   );
 
@@ -199,4 +221,46 @@ test("SessionPortalPiP filters same-machine auto-popups on desktop, preserves te
   assert.match(pipSrc, /mode\s*===\s*"term"\s*\?\s*" in-term"\s*:\s*""/);
   assert.match(agentsSrc, /<SessionPortalPiP[\s\S]*mode=\{activeMode\}/);
   assert.match(cssSrc, /\.session-portal-pip\.in-term\s*\{[\s\S]*top:\s*14px;/);
+});
+
+test("isLoopbackPortalUrl distinguishes remote loopback URLs and portal_frame clears streamError", (t) => {
+  t.after(() => resetPortalClientStateForTest());
+  assert.equal(isLoopbackPortalUrl("http://127.0.0.1:8764/?edition=winter&t=0.1"), true);
+  assert.equal(isLoopbackPortalUrl("http://localhost:3000/auth"), true);
+  assert.equal(isLoopbackPortalUrl("http://[::1]:5173/"), true);
+  assert.equal(isLoopbackPortalUrl("http://0.0.0.0:8080/health"), true);
+  assert.equal(isLoopbackPortalUrl("https://example.com/oauth"), false);
+  assert.equal(isLoopbackPortalUrl(undefined), false);
+
+  ingestPortalStreamEvent({
+    kind: "portal_event",
+    action: "opened",
+    at: 1000,
+    item: {
+      id: "ptl-err-1",
+      hostId: "h-remote",
+      agentKey: "h-remote/hc:t1",
+      kind: "browser",
+      title: "ego lite",
+      url: "http://127.0.0.1:8764/?edition=winter&t=0.1",
+      canInteract: true,
+      streamError: "屏幕录制未授权",
+      createdAt: 1000,
+      updatedAt: 1000,
+    },
+  });
+  assert.equal(portalStore.get().itemsById["ptl-err-1"]?.streamError, "屏幕录制未授权");
+
+  ingestPortalStreamEvent({
+    kind: "portal_frame",
+    portalId: "ptl-err-1",
+    seq: 1,
+    mime: "image/jpeg",
+    data: "abc",
+    width: 1280,
+    height: 820,
+    at: 2000,
+  });
+  assert.equal(portalStore.get().itemsById["ptl-err-1"]?.streamError, undefined);
+  assert.equal(portalStore.get().framesById["ptl-err-1"]?.seq, 1);
 });

@@ -100,8 +100,11 @@ test("SpatialHint renders contextual shortcut badges and shell.css enables progr
   assert.equal(inlineKeysMatch[0].includes("padding: 1px 5px"), true);
 });
 
-test("OS HID modifier resolver suppresses phantom Command popups and hold delay stays responsive", () => {
-  assert.equal(HOLD_DELAY_MS, 450);
+test("OS HID modifier resolver suppresses phantom Command popups and hold delay stays responsive", async () => {
+  assert.equal(HOLD_DELAY_MS, 350);
+
+  const { settingsStore } = await import("../src/lib/store.ts");
+  assert.equal(settingsStore.get().showModifierHoldHints, true, "cmux hold hints enabled by default when never explicitly disabled");
 
   // Unsupported OS never fabricates a chord
   assert.equal(

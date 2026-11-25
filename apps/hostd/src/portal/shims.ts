@@ -77,6 +77,78 @@ export function parseOpenerArgs(tool: string, argv: string[], cwd?: string): Par
     rest = rest.slice(1);
   }
 
+  if (cleanTool === "qlmanage") {
+    const pIdx = rest.indexOf("-p");
+    const targetArg = pIdx >= 0 ? rest[pIdx + 1] : rest.find((a) => !a.startsWith("-"));
+    return targetArg ? classifyTarget(targetArg, { reveal: false, cwd }) : null;
+  }
+
+  if (cleanTool === "start") {
+    let rawStart = "";
+    const positional: string[] = [];
+    for (let i = 0; i < rest.length; i += 1) {
+      const a = rest[i]!;
+      if (/^\/d$/i.test(a)) {
+        i += 1;
+        continue;
+      }
+      if (a.startsWith("/")) continue;
+      positional.push(a);
+    }
+    if (positional.length === 0) return null;
+    if (
+      positional.length >= 2 &&
+      (positional[0] === "" ||
+        (!/^https?:/i.test(positional[0]!) && !/[\\/.]/.test(positional[0]!)))
+    ) {
+      rawStart = positional[1]!;
+    } else {
+      rawStart = positional[0]!;
+    }
+    if (!rawStart) return null;
+    if (/^(?:chrome|msedge|firefox|explorer|notepad)$/i.test(rawStart) && positional.length >= 2) {
+      const idx = positional.indexOf(rawStart);
+      const nextTarget = positional[idx + 1];
+      if (nextTarget) {
+        const p = classifyTarget(nextTarget, { reveal: false, cwd });
+        return { ...p, app: rawStart };
+      }
+      return { kind: "window", target: rawStart, reveal: false, app: rawStart };
+    }
+    return classifyTarget(rawStart, { reveal: false, cwd });
+  }
+
+  if (cleanTool === "start-process" || cleanTool === "saps" || cleanTool === "invoke-item" || cleanTool === "ii") {
+    let target = "";
+    let argList = "";
+    for (let i = 0; i < rest.length; i += 1) {
+      const a = rest[i]!;
+      const low = a.toLowerCase();
+      if (low === "-filepath" || low === "-path" || low === "-literalpath") {
+        target = rest[++i] ?? "";
+        continue;
+      }
+      if (low === "-argumentlist" || low === "-args") {
+        argList = rest[++i] ?? "";
+        continue;
+      }
+      if (a.startsWith("-")) continue;
+      if (!target) target = a;
+    }
+    if (!target) return null;
+    const urlMatch = /(https?:\/\/[^\s"'`<>]+)/i.exec(argList);
+    if (urlMatch?.[1]) {
+      return { kind: "browser", target: urlMatch[1], url: urlMatch[1], reveal: false, app: target };
+    }
+    if (
+      (cleanTool === "start-process" || cleanTool === "saps") &&
+      !/[\\/.]/.test(target)
+    ) {
+      return { kind: "window", target, reveal: false, app: target };
+    }
+    return classifyTarget(target, { reveal: false, cwd });
+  }
+
   let rawTarget = "";
   for (let i = 0; i < rest.length; i += 1) {
     const a = rest[i]!;
@@ -318,6 +390,10 @@ function unwrapCommandPrefix(tokens: string[]): { cmd: string; rest: string[] } 
       }
       continue;
     }
+    if ((base === "cmd" || base === "cmd.exe") && (tokens[idx + 1] === "/c" || tokens[idx + 1] === "/k")) {
+      idx += 2;
+      continue;
+    }
     return { cmd: base, rest: tokens.slice(idx + 1) };
   }
   return null;
@@ -333,7 +409,44 @@ const OPENER_TOOLS = new Set([
   "herdr-pocket-browser",
   "explorer",
   "explorer.exe",
+  "start",
+  "start-process",
+  "saps",
+  "invoke-item",
+  "ii",
+  "qlmanage",
 ]);
+
+const GUI_BINARY_MAP: Record<string, { appHint: string; label: string }> = {
+  "google-chrome": { appHint: "Chrome", label: "Chrome" },
+  "google-chrome-stable": { appHint: "Chrome", label: "Chrome" },
+  chromium: { appHint: "Chromium", label: "Chromium" },
+  "chromium-browser": { appHint: "Chromium", label: "Chromium" },
+  firefox: { appHint: "Firefox", label: "Firefox" },
+  msedge: { appHint: "Microsoft Edge", label: "Microsoft Edge" },
+  "msedge.exe": { appHint: "Microsoft Edge", label: "Microsoft Edge" },
+  "brave-browser": { appHint: "Brave", label: "Brave" },
+  safari: { appHint: "Safari", label: "Safari" },
+  xeyes: { appHint: "xeyes", label: "X11 xeyes" },
+  xclock: { appHint: "xclock", label: "X11 xclock" },
+  xcalc: { appHint: "xcalc", label: "X11 xcalc" },
+  feh: { appHint: "feh", label: "feh 图片查看" },
+  sxiv: { appHint: "sxiv", label: "sxiv 图片查看" },
+  imv: { appHint: "imv", label: "imv 图片查看" },
+  mpv: { appHint: "mpv", label: "mpv 播放器" },
+  ffplay: { appHint: "ffplay", label: "ffplay" },
+  vlc: { appHint: "VLC", label: "VLC" },
+  evince: { appHint: "evince", label: "文档预览" },
+  zathura: { appHint: "zathura", label: "文档预览" },
+  gedit: { appHint: "gedit", label: "gedit" },
+  nautilus: { appHint: "nautilus", label: "文件管理器" },
+  dolphin: { appHint: "dolphin", label: "文件管理器" },
+  thunar: { appHint: "thunar", label: "文件管理器" },
+  notepad: { appHint: "notepad", label: "记事本" },
+  "notepad.exe": { appHint: "notepad", label: "记事本" },
+  mspaint: { appHint: "mspaint", label: "画图" },
+  "mspaint.exe": { appHint: "mspaint", label: "画图" },
+};
 
 function expandTildePath(raw: string): string {
   if (raw === "~") return homedir();
@@ -359,6 +472,43 @@ export function extractAutoPortalIntents(commandLine: string, cwd?: string): Aut
       continue;
     }
 
+    if (cmd === "wsl" || cmd === "wsl.exe") {
+      let i = 0;
+      let innerCwd = effectiveCwd;
+      while (i < rest.length && rest[i]!.startsWith("-")) {
+        const f = rest[i]!;
+        if (f === "-d" || f === "--distribution" || f === "-u" || f === "--user" || f === "--shell-type") {
+          i += 2;
+          continue;
+        }
+        if (f === "--cd" && rest[i + 1]) {
+          innerCwd = rest[i + 1];
+          i += 2;
+          continue;
+        }
+        if (f === "-e" || f === "--exec" || f === "--") {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      const wslTail = rest.slice(i);
+      const tailHead = wslTail[0]?.split("/").pop()?.toLowerCase();
+      if ((tailHead === "bash" || tailHead === "sh" || tailHead === "zsh") && (wslTail[1] === "-c" || wslTail[1] === "-lc") && wslTail[2]) {
+        const inner = extractAutoPortalIntents(wslTail[2], innerCwd);
+        intents.push(...inner);
+      } else if (wslTail.length > 0) {
+        const joined = wslTail.map((t) => (/\s/.test(t) ? JSON.stringify(t) : t)).join(" ");
+        const inner = extractAutoPortalIntents(joined, innerCwd);
+        if (inner.length > 0) {
+          intents.push(...inner);
+        } else {
+          intents.push({ type: "app_window", appHint: "x11", label: "Linux X11 窗口" });
+        }
+      }
+      continue;
+    }
+
     if (OPENER_TOOLS.has(cmd)) {
       const parsed = parseOpenerArgs(cmd, rest, effectiveCwd);
       if (!parsed) continue;
@@ -378,6 +528,19 @@ export function extractAutoPortalIntents(commandLine: string, cwd?: string): Aut
           ...(parsed.app ? { app: parsed.app } : {}),
         });
       }
+      continue;
+    }
+
+    const guiInfo = GUI_BINARY_MAP[cmd];
+    if (guiInfo) {
+      const scanText = rest.join(" ");
+      const urlMatch = /(https?:\/\/[^\s"'`<>()\\;]+)/i.exec(scanText);
+      intents.push({
+        type: "app_window",
+        appHint: guiInfo.appHint,
+        label: guiInfo.label,
+        ...(urlMatch?.[1] ? { url: urlMatch[1] } : {}),
+      });
       continue;
     }
 

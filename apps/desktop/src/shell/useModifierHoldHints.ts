@@ -15,7 +15,7 @@ import {
   type ShortcutModifierChord,
 } from "./shortcuts";
 
-export const HOLD_DELAY_MS = 450;
+export const HOLD_DELAY_MS = 350;
 const OS_MODIFIER_POLL_MS = 160;
 
 export const modifierChordStore = createStore<ShortcutModifierChord | null>(null);

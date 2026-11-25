@@ -9,6 +9,13 @@ import {
   resetPortalClientStateForTest,
   subscribeAgentPortalUpdates,
 } from "../src/lib/portalClient.ts";
+import {
+  isTerminalRendererReady,
+  paintTerminalViewportImmediate,
+  snapTerminalViewportImmediate,
+  wakeTerminalRendererImmediate,
+} from "../src/lib/terminalScroll.ts";
+import { resetUiTelemetryForTest, trackTerminalReveal } from "../src/lib/uiTelemetry.ts";
 import { liveStore } from "../src/lib/store.ts";
 import {
   flushShellPersistenceNow,
@@ -38,6 +45,7 @@ function restoreGlobals(): void {
 function resetStores(): void {
   resetPortalClientStateForTest();
   resetPerfTelemetryForTest();
+  resetUiTelemetryForTest();
   shellStore.set({
     tabs: [],
     active: null,
@@ -196,4 +204,113 @@ test("subscribeAgentPortalUpdates retains host watcher across brief 0-ref tab sw
   const unsub2 = subscribeAgentPortalUpdates("h1", "h1/hc:t2");
   assert.deepEqual(getPortalWatcherSnapshotForTest("h1"), { refs: 1, hasDisposeTimer: false });
   unsub2();
+});
+
+test("wakeTerminalRendererImmediate and paintTerminalViewportImmediate unpause and render Frame 0 safely", () => {
+  let measured = 0;
+  let flushed = 0;
+  let resized: [number, number] | null = null;
+  let rendered: [number, number] | null = null;
+  let scrolledTo: number | null = null;
+
+  const rs = {
+    _isPaused: true,
+    _needsFullRefresh: true,
+    _charSizeService: {
+      hasValidSize: false,
+      measure: () => {
+        measured += 1;
+        rs._charSizeService.hasValidSize = true;
+      },
+    },
+    _pausedResizeTask: {
+      flush: () => {
+        flushed += 1;
+      },
+    },
+    dimensions: {
+      css: {
+        cell: { height: 18 },
+        canvas: { height: 0 },
+      },
+    },
+    hasRenderer: () => true,
+    handleResize: (cols: number, rows: number) => {
+      resized = [cols, rows];
+      rs.dimensions.css.canvas.height = rows * 18;
+    },
+    _renderRows: (start: number, end: number) => {
+      rendered = [start, end];
+    },
+  };
+
+  const normalBuf = { baseY: 120, viewportY: 0 };
+  const fakeTerm = {
+    cols: 100,
+    rows: 30,
+    buffer: { active: normalBuf, normal: normalBuf },
+    scrollToLine: (line: number) => {
+      scrolledTo = line;
+      normalBuf.viewportY = line;
+    },
+    _core: {
+      _renderService: rs,
+      _viewport: {
+        _latestYDisp: 120,
+        _sync: () => {},
+        scrollToLine: (line: number) => {
+          scrolledTo = line;
+          normalBuf.viewportY = line;
+        },
+      },
+    },
+  };
+
+  assert.equal(isTerminalRendererReady(fakeTerm as never), false);
+  const woke = wakeTerminalRendererImmediate(fakeTerm as never);
+  assert.equal(woke, true);
+  assert.equal(rs._isPaused, false);
+  assert.equal(measured, 1);
+  assert.equal(flushed, 1);
+  assert.deepEqual(resized, [100, 30]);
+  assert.equal(isTerminalRendererReady(fakeTerm as never), true);
+
+  assert.equal(snapTerminalViewportImmediate(fakeTerm as never, true, 0), true);
+  assert.equal(scrolledTo, 120);
+
+  const painted = paintTerminalViewportImmediate(fakeTerm as never);
+  assert.equal(painted, true);
+  assert.equal(rs._needsFullRefresh, false);
+  assert.deepEqual(rendered, [0, 29]);
+
+  // Partial or throwing mocks must never crash callers.
+  assert.equal(wakeTerminalRendererImmediate(null), false);
+  assert.equal(paintTerminalViewportImmediate(undefined), false);
+  assert.equal(wakeTerminalRendererImmediate({ cols: 80, rows: 24 } as never), false);
+  assert.equal(paintTerminalViewportImmediate({ cols: 80, rows: 24 } as never), false);
+  const throwingTerm = {
+    cols: 80,
+    rows: 24,
+    get _core() {
+      throw new Error("boom");
+    },
+  };
+  assert.equal(wakeTerminalRendererImmediate(throwingTerm as never), false);
+  assert.equal(paintTerminalViewportImmediate(throwingTerm as never), false);
+});
+
+test("trackTerminalReveal emits term.reveal.slow warning only when duration exceeds 220ms", () => {
+  resetUiTelemetryForTest();
+  const baseLen = logStore.get().entries.length;
+  trackTerminalReveal(180, "local");
+  trackTerminalReveal(220, "relay");
+  assert.equal(logStore.get().entries.length, baseLen);
+
+  trackTerminalReveal(345.6, "local");
+  const added = logStore.get().entries.slice(baseLen);
+  assert.equal(added.length, 1);
+  assert.equal(added[0]!.scope, "term");
+  assert.equal(added[0]!.level, "warn");
+  assert.equal(added[0]!.msg, "term.reveal.slow");
+  assert.deepEqual(added[0]!.data, { ms: 346, mode: "local" });
 });

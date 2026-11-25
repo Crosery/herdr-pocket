@@ -64,7 +64,6 @@ pub struct Native {
     pub launch_at_login: bool,
     /// `general.launchAtLogin` is in the file: only then is the OS login item made to match.
     pub launch_at_login_set: bool,
-    pub dynamic_island: bool,
 }
 
 impl Default for Native {
@@ -90,7 +89,6 @@ impl Default for Native {
             close_to_tray: false,
             launch_at_login: false,
             launch_at_login_set: false,
-            dynamic_island: false,
         }
     }
 }
@@ -169,7 +167,6 @@ impl Native {
             close_to_tray: get_bool(raw, "general.closeToTray", d.close_to_tray),
             launch_at_login: get_bool(raw, "general.launchAtLogin", d.launch_at_login),
             launch_at_login_set: get(raw, "general.launchAtLogin").is_some_and(Value::is_boolean),
-            dynamic_island: get_bool(raw, "general.dynamicIsland", d.dynamic_island),
         }
     }
 }

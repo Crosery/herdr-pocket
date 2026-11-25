@@ -1,8 +1,5 @@
 import type { Agent, AgentStatus, SpaceInfo } from "@herdr-pocket/protocol";
 import { playAttentionChime } from "./alertSound";
-import { isTauri } from "./bridge";
-import { clientConfigStore, isDynamicIslandEnabled } from "./config";
-import { native } from "./native";
 import { rpcCall } from "./relay";
 import { agentSpace, allAgents, createStore, findAgent, liveStore, settingsStore, spacedTitle } from "./store";
 import {
@@ -285,55 +282,6 @@ export const attentionStore = createStore<AttentionState>({
 
 const runtimeTracker = createAttentionTracker();
 let peekTimer: number | null = null;
-let notchTimer: number | null = null;
-let lastNotchSyncJson: string | null = null;
-
-export function buildNotchSyncPayload(): Record<string, unknown> {
-  const st = attentionStore.get();
-  const notifOn = settingsStore.get().notifications;
-  const islandOn = isDynamicIslandEnabled();
-  const prefTheme = settingsStore.get().theme;
-  const domTheme =
-    typeof document !== "undefined" ? document.documentElement.getAttribute("data-theme") : null;
-  const theme =
-    prefTheme === "dark" ||
-    domTheme === "dark" ||
-    (prefTheme === "system" &&
-      domTheme !== "light" &&
-      typeof window !== "undefined" &&
-      Boolean(window.matchMedia?.("(prefers-color-scheme: dark)")?.matches))
-      ? "dark"
-      : "light";
-  const visibleItems = st.items.slice(0, 12);
-  return {
-    enabled: Boolean(notifOn && islandOn),
-    theme,
-    windowFocused: st.windowFocused,
-    demo: runtimeTracker.demoUntil > Date.now(),
-    items: visibleItems.map((it) => ({
-      id: it.id,
-      agentKey: it.agentKey,
-      category: it.category,
-      title: it.title,
-      subtitle: it.subtitle,
-      ts: it.ts,
-    })),
-    peek:
-      notifOn && st.peek
-        ? {
-            id: st.peek.id,
-            agentKey: st.peek.agentKey,
-            category: st.peek.category,
-            title: st.peek.title,
-            subtitle: st.peek.subtitle,
-          }
-        : null,
-  };
-}
-
-export function resetNotchSyncDedupeForTest(): void {
-  lastNotchSyncJson = null;
-}
 
 function clearPeekTimer(): void {
   if (peekTimer !== null && typeof window !== "undefined") {
@@ -349,34 +297,8 @@ function showTransientPeek(item: AttentionItem | null, durationMs = PEEK_DURATIO
     peekTimer = window.setTimeout(() => {
       peekTimer = null;
       attentionStore.set((prev) => (prev.peek?.id === item.id ? { ...prev, peek: null } : prev));
-      scheduleNotchSync(true);
     }, durationMs);
   }
-}
-
-export function pushNotchNow(): boolean {
-  if (notchTimer !== null && typeof window !== "undefined") {
-    window.clearTimeout(notchTimer);
-    notchTimer = null;
-  }
-  const payload = buildNotchSyncPayload();
-  const json = JSON.stringify(payload);
-  if (json === lastNotchSyncJson) return false;
-  lastNotchSyncJson = json;
-  void native.notchSync(payload);
-  return true;
-}
-
-function scheduleNotchSync(immediate = false): void {
-  if (immediate || typeof window === "undefined") {
-    pushNotchNow();
-    return;
-  }
-  if (notchTimer !== null) return;
-  notchTimer = window.setTimeout(() => {
-    notchTimer = null;
-    pushNotchNow();
-  }, 100);
 }
 
 function syncAttentionFromRuntime(): void {
@@ -428,14 +350,12 @@ function syncAttentionFromRuntime(): void {
     if (result.newPeek && notifOn) {
       showTransientPeek(result.newPeek);
     }
-    scheduleNotchSync(Boolean(result.newPeek));
   }
 }
 
 export function dismissAttentionPeek(): void {
   clearPeekTimer();
   attentionStore.set({ peek: null });
-  scheduleNotchSync(true);
 }
 
 export function dismissAttentionItem(id: string): void {
@@ -444,23 +364,20 @@ export function dismissAttentionItem(id: string): void {
     items: prev.items.filter((i) => i.id !== id),
     peek: prev.peek?.id === id ? null : prev.peek,
   }));
-  scheduleNotchSync(true);
 }
 
 export function clearAllAttentionItems(): void {
   runtimeTracker.demoUntil = 0;
   clearPeekTimer();
   attentionStore.set({ items: [], peek: null });
-  scheduleNotchSync(true);
 }
 
 /**
- * Surfaces the desktop window, switches space/tab/split-pane cleanly to `agentKey`,
+ * Switches space/tab/split-pane cleanly to `agentKey`,
  * clears its queued attention alerts, and acknowledges `agent.seen`.
  */
 export function jumpToAttentionAgent(agentKey: string): boolean {
   if (!agentKey) return false;
-  void native.notchFocusMain();
 
   if (!agentKey.startsWith("demo/")) {
     openAgentTab(agentKey, undefined, { trigger: "attention" });
@@ -484,7 +401,6 @@ export function jumpToAttentionAgent(agentKey: string): boolean {
     items: prev.items.filter((i) => i.agentKey !== agentKey),
     peek: prev.peek?.agentKey === agentKey ? null : prev.peek,
   }));
-  scheduleNotchSync(true);
   return true;
 }
 
@@ -531,32 +447,25 @@ export function triggerDemoAttentionPreview(): void {
     ]),
   }));
   showTransientPeek(demoItems[0]!, 6_500);
-  scheduleNotchSync(true);
 }
 
 export function startAttentionCenter(): () => void {
   syncAttentionFromRuntime();
-  scheduleNotchSync(true);
 
   const unsubLive = liveStore.subscribe(syncAttentionFromRuntime);
   const unsubShell = shellStore.subscribe(syncAttentionFromRuntime);
-  const unsubCfg = clientConfigStore.subscribe(() => scheduleNotchSync());
-  const unsubSettings = settingsStore.subscribe(() => scheduleNotchSync());
 
   const onFocus = () => {
     attentionStore.set({ windowFocused: true });
     syncAttentionFromRuntime();
-    scheduleNotchSync(true);
   };
   const onBlur = () => {
     attentionStore.set({ windowFocused: false });
-    scheduleNotchSync(true);
   };
   const onVisibility = () => {
     const focused = !document.hidden && document.hasFocus();
     attentionStore.set({ windowFocused: focused });
     if (focused) syncAttentionFromRuntime();
-    scheduleNotchSync(true);
   };
 
   if (typeof window !== "undefined") {
@@ -565,43 +474,14 @@ export function startAttentionCenter(): () => void {
     document.addEventListener("visibilitychange", onVisibility);
   }
 
-  let unlistenTauri: (() => void) | null = null;
-  let disposed = false;
-  if (isTauri()) {
-    void import("@tauri-apps/api/event").then(({ listen }) =>
-      listen<{ action?: string; agentKey?: string; id?: string }>("notch://action", (ev) => {
-        if (disposed) return;
-        const p = ev.payload ?? {};
-        if (p.action === "jump" && p.agentKey) {
-          jumpToAttentionAgent(p.agentKey);
-        } else if (p.action === "dismiss" && p.id) {
-          dismissAttentionItem(p.id);
-        } else if (p.action === "clear-all") {
-          clearAllAttentionItems();
-        }
-      }).then((fn) => {
-        if (disposed) fn();
-        else unlistenTauri = fn;
-      }),
-    );
-  }
-
   return () => {
-    disposed = true;
     unsubLive();
     unsubShell();
-    unsubCfg();
-    unsubSettings();
     clearPeekTimer();
-    if (notchTimer !== null && typeof window !== "undefined") {
-      window.clearTimeout(notchTimer);
-      notchTimer = null;
-    }
     if (typeof window !== "undefined") {
       window.removeEventListener("focus", onFocus);
       window.removeEventListener("blur", onBlur);
       document.removeEventListener("visibilitychange", onVisibility);
     }
-    unlistenTauri?.();
   };
 }

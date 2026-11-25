@@ -1966,16 +1966,6 @@ pub fn voice_hud_hide(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn notch_sync(app: AppHandle, state: Value) {
-    crate::notch::sync(&app, state);
-}
-
-#[tauri::command]
-pub fn notch_focus_main(app: AppHandle) {
-    crate::mainwin::show_main(&app, "notch.focus");
-}
-
-#[tauri::command]
 pub fn window_start_dragging(app: AppHandle) {
     crate::mainwin::start_dragging(&app);
 }
@@ -2160,14 +2150,23 @@ pub fn query_os_modifiers() -> OsModifierState {
         #[link(name = "CoreGraphics", kind = "framework")]
         extern "C" {
             fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+            fn CGEventSourceFlagsState(state_id: i32) -> u64;
         }
         const COMBINED_SESSION_STATE: i32 = 0; // kCGEventSourceStateCombinedSessionState
+        const HID_SYSTEM_STATE: i32 = 1; // kCGEventSourceStateHIDSystemState
         let ns_flags = NSEvent::modifierFlags_class();
+        let hid_flags = unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) };
         let down = |k: u16| unsafe { CGEventSourceKeyState(COMBINED_SESSION_STATE, k) };
-        let meta = ns_flags.contains(NSEventModifierFlags::Command) && (down(55) || down(54));
-        let ctrl = ns_flags.contains(NSEventModifierFlags::Control) && (down(59) || down(62));
-        let alt = ns_flags.contains(NSEventModifierFlags::Option) && (down(58) || down(61));
-        let shift = ns_flags.contains(NSEventModifierFlags::Shift) && (down(56) || down(60));
+        // Combine real HID driver modifier flags (supports remapped CapsLock/Option->Cmd without Input Monitoring)
+        // with physical hardware key codes while rejecting synthetic session-only events (e.g. WeType XPC).
+        let meta = ns_flags.contains(NSEventModifierFlags::Command)
+            && ((hid_flags & 0x0010_0000) != 0 || down(55) || down(54));
+        let ctrl = ns_flags.contains(NSEventModifierFlags::Control)
+            && ((hid_flags & 0x0004_0000) != 0 || down(59) || down(62));
+        let alt = ns_flags.contains(NSEventModifierFlags::Option)
+            && ((hid_flags & 0x0008_0000) != 0 || down(58) || down(61));
+        let shift = ns_flags.contains(NSEventModifierFlags::Shift)
+            && ((hid_flags & 0x0002_0000) != 0 || down(56) || down(60));
         return OsModifierState {
             supported: true,
             meta,

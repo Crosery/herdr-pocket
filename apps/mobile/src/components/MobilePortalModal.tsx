@@ -206,6 +206,7 @@ export function MobilePortalModal({
   const p = usePalette();
   const insets = useSafeAreaInsets();
   const [selectedId, setSelectedId] = useState<string | null>(initialItem?.id ?? null);
+  const [itemPatch, setItemPatch] = useState<PortalItem | null>(null);
   const [frame, setFrame] = useState<PortalFramePayload | null>(null);
   const [boxSize, setBoxSize] = useState({ width: 320, height: 240 });
   const [urlInput, setUrlInput] = useState("");
@@ -229,11 +230,24 @@ export function MobilePortalModal({
     else if (!selectedId || !items.some((x) => x.id === selectedId)) setSelectedId(items[0]?.id ?? null);
   }, [initialItem, items, selectedId, visible]);
 
-  const active = items.find((x) => x.id === selectedId) ?? items[0] ?? null;
+  const baseActive = items.find((x) => x.id === selectedId) ?? items[0] ?? null;
+  const active = baseActive && itemPatch && itemPatch.id === baseActive.id ? itemPatch : baseActive;
+
+  const fetchFrameOnce = useCallback(async () => {
+    if (!active) return;
+    try {
+      const res = await call(agent.deviceId, "portal.frame", { portalId: active.id }, 12_000);
+      if (res.item) setItemPatch(res.item);
+      if (res.frame) setFrame(res.frame);
+    } catch (e) {
+      setErr(friendlyError(e));
+    }
+  }, [active, agent.deviceId]);
 
   useEffect(() => {
     if (!visible || !active) return;
     setErr(null);
+    setItemPatch(null);
     setUrlInput(active.url ?? "");
     if (active.kind !== "browser" && active.kind !== "window") {
       setFrame(null);
@@ -242,12 +256,17 @@ export function MobilePortalModal({
     let alive = true;
     void call(agent.deviceId, "portal.frame", { portalId: active.id }, 12_000)
       .then((res) => {
-        if (alive && res.frame) setFrame(res.frame);
+        if (!alive) return;
+        if (res.item) setItemPatch(res.item);
+        if (res.frame) setFrame(res.frame);
       })
       .catch(() => {});
     const unsub = subscribe(agent.deviceId, "portal", { portalId: active.id, fps: 10 }, (raw) => {
       const ev = raw as Partial<PortalStreamEvent>;
-      if (alive && ev?.kind === "portal_frame" && ev.portalId === active.id && ev.data) {
+      if (!alive || !ev) return;
+      if (ev.kind === "portal_event" && ev.item && ev.item.id === active.id) {
+        setItemPatch(ev.item);
+      } else if (ev.kind === "portal_frame" && ev.portalId === active.id && ev.data) {
         setFrame(ev as PortalFramePayload);
       }
     });
@@ -503,6 +522,16 @@ export function MobilePortalModal({
                     resizeMode="contain"
                     style={{ width: "100%", height: "100%" }}
                   />
+                ) : active.streamError ? (
+                  <View style={{ alignItems: "center", gap: space.sm, paddingHorizontal: space.lg }}>
+                    <Text style={{ color: p.error, fontSize: 13, fontFamily: fonts.bodyBold, textAlign: "center" }}>
+                      暂时无法获取远端画面
+                    </Text>
+                    <Text style={{ color: p.muted, fontSize: 12, textAlign: "center" }}>{active.streamError}</Text>
+                    <PocketButton size="sm" variant="soft" icon="refresh" onPress={() => void fetchFrameOnce()}>
+                      重试捕获
+                    </PocketButton>
+                  </View>
                 ) : (
                   <View style={{ alignItems: "center", gap: space.sm }}>
                     <PocketSpinner size={24} />

@@ -105,21 +105,31 @@ export function buildPortalP2pSiblingUrl(baseEntryUrl: string, siblingName: stri
   return `${baseEntryUrl.slice(0, idx + 1)}${encodeURIComponent(siblingName)}`;
 }
 
+export function isLoopbackPortalUrl(url?: string | null): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "::1" || host === "0.0.0.0" || /^127\./.test(host);
+  } catch {
+    return /^https?:\/\/(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\])(?::\d+)?(?:[/?#]|$)/i.test(url.trim());
+  }
+}
+
 export function filterVisiblePortalItems(opts: {
   itemsById: Record<string, PortalItem>;
   dismissedIds: Record<string, true>;
-  manualIds: Record<string, true>;
+  manualIds?: Record<string, true>;
   agent: { deviceId: string; key: string };
-  isTauriApp: boolean;
-  localHostId: string | null;
+  isTauriApp?: boolean;
+  localHostId?: string | null;
 }): PortalItem[] {
-  const isSameLocalMachine = opts.isTauriApp && Boolean(opts.localHostId) && opts.agent.deviceId === opts.localHostId;
   return Object.values(opts.itemsById)
     .filter((i) => {
       if (i.hostId !== opts.agent.deviceId) return false;
       if (i.agentKey && i.agentKey !== opts.agent.key) return false;
       if (opts.dismissedIds[i.id]) return false;
-      if (isSameLocalMachine && !opts.manualIds[i.id]) return false;
       return true;
     })
     .sort((a, b) => b.updatedAt - a.updatedAt);
@@ -318,16 +328,18 @@ export function ingestPortalStreamEvent(ev: unknown): void {
       const cur = prev.framesById[frame.portalId];
       if (cur && cur.seq >= frame.seq && cur.at >= frame.at) return prev;
       const existing = prev.itemsById[frame.portalId];
-      const nextItem = existing
-        ? {
-            ...existing,
-            ...(frame.url ? { url: frame.url } : {}),
-            ...(frame.title ? { title: frame.title } : {}),
-            width: frame.width,
-            height: frame.height,
-            updatedAt: frame.at,
-          }
-        : undefined;
+      let nextItem: PortalItem | undefined;
+      if (existing) {
+        const { streamError: _clearedError, ...restExisting } = existing;
+        nextItem = {
+          ...restExisting,
+          ...(frame.url ? { url: frame.url, subtitle: frame.url } : {}),
+          ...(frame.title ? { title: frame.title } : {}),
+          width: frame.width,
+          height: frame.height,
+          updatedAt: frame.at,
+        };
+      }
       return {
         ...prev,
         framesById: { ...prev.framesById, [frame.portalId]: frame },
@@ -618,9 +630,15 @@ export function subscribePortalFrames(
   );
 
   const pollInterval = Math.max(120, Math.round(1000 / Math.max(1, Math.min(8, fps))));
+  let lastErrorPollAt = 0;
   const timer = window.setInterval(() => {
     if (!alive || busy) return;
     if (streamLive && Date.now() - lastStreamFrameAt < 1200) return;
+    if (state.itemsById[portalId]?.streamError) {
+      const now = Date.now();
+      if (now - lastErrorPollAt < 4000) return;
+      lastErrorPollAt = now;
+    }
     busy = true;
     void capturePortalFrameOnce(hostId, portalId)
       .catch(() => {})

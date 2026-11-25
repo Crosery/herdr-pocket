@@ -1703,6 +1703,9 @@ export const mockApi = {
         "<!doctype html><html><body style='font-family:system-ui;padding:20px'><h2>Demo HTML Portal</h2><p>Inline cross-device HTML bundle preview.</p></body></html>";
       return { html, title: hit?.name || "index.html" };
     }
+    if (method === "portal.observeCommand") {
+      return { ok: true };
+    }
     return { ok: true };
   },
   subscribe(

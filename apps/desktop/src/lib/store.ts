@@ -167,7 +167,7 @@ export const settingsStore = createStore<AppSettings>({
   sidebarCollapsed: saved.sidebarCollapsed ?? false,
   sidebarWidth: resolveInitialSidebarWidth(saved),
   h5LayoutMode: saved.h5LayoutMode === "mobile" || saved.h5LayoutMode === "desktop" ? saved.h5LayoutMode : "auto",
-  showModifierHoldHints: saved.modifierHintsExplicit ? (saved.showModifierHoldHints ?? false) : false,
+  showModifierHoldHints: saved.modifierHintsExplicit ? (saved.showModifierHoldHints ?? true) : true,
   alertSound: saved.alertSound ?? true,
   alertChimeOnlyLongTasks: saved.alertChimeOnlyLongTasks ?? false,
   // Installs from before the guide existed already have a server: don't greet them as new.

@@ -81,6 +81,22 @@ export function trackTerminalImeEvent(
   emitThrottled(`ime:${event}`, level, "term", `term.ime.${event}`, meta, 800);
 }
 
+/** Warns when a terminal mount takes excessively long before revealing its first frame. */
+export function trackTerminalReveal(ms: number, mode: "local" | "relay" | "fallback"): void {
+  if (ms <= 220) return;
+  emitThrottled(
+    `term:reveal:${mode}`,
+    "warn",
+    "term",
+    "term.reveal.slow",
+    {
+      ms: Math.max(0, Math.round(ms)),
+      mode,
+    },
+    2_000,
+  );
+}
+
 /** Warns when an active terminal's PTY grid jumps unexpectedly without user resize drag. */
 export function trackTerminalLayoutJump(meta: {
   prevCols: number;

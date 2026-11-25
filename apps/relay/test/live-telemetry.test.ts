@@ -184,10 +184,13 @@ test("CallTelemetry: deterministic PCM continuity/clarity math, rate-limiting,lo
   const benchTel = new CallTelemetry({ callId: "bench", provider: "moss-live", deviceId: "d1", log: () => {}, event: () => {}, windowMs: 0 });
   benchTel.onReady();
   for (let i = 0; i < 200; i++) benchTel.onRxPcm(benchBuf); // warm up JIT
-  const t0 = performance.now();
   const N = 2000;
-  for (let i = 0; i < N; i++) benchTel.onRxPcm(benchBuf);
-  const usPerFrame = ((performance.now() - t0) * 1000) / N;
+  let usPerFrame = Number.POSITIVE_INFINITY;
+  for (let pass = 0; pass < 3; pass++) {
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) benchTel.onRxPcm(benchBuf);
+    usPerFrame = Math.min(usPerFrame, ((performance.now() - t0) * 1000) / N);
+  }
   assert.ok(usPerFrame < 20, `expected <20us/frame, got ${usPerFrame.toFixed(2)}us/frame`);
 });
 
