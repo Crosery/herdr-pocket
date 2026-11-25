@@ -591,7 +591,9 @@ export class CdpBrowserPool {
         ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage"] : []),
         "about:blank",
       ];
-      const proc = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+      const proc = /\.[mc]?js$/i.test(bin)
+        ? spawn(process.execPath, [bin, ...args], { stdio: ["ignore", "ignore", "pipe"], windowsHide: true })
+        : spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
       this.browserProc = proc;
 
       const wsEndpoint = await new Promise<string>((resolve, reject) => {

@@ -726,11 +726,11 @@ test("findChromiumBinary discovers Playwright Chromium and CdpBrowserPool serves
   assert.ok(foundPw);
 
   const profileRoot = mkdtempSync(join(tmpdir(), "hp-cdp-pool-"));
-  t.after(() => rmSync(profileRoot, { recursive: true, force: true }));
+  t.after(() => rmSync(profileRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
 
   const wsEntryUrl = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
   const fakeScript = join(profileRoot, "fake-chrome.mjs");
-  const fakeBin = process.platform === "win32" ? join(profileRoot, "fake-chrome.cmd") : fakeScript;
+  const fakeBin = fakeScript;
   const spawnsLog = join(profileRoot, "spawns.log");
   writeFileSync(
     fakeScript,
@@ -826,10 +826,7 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 `,
   );
-  chmodSync(fakeScript, 0o755);
-  if (process.platform === "win32") {
-    writeFileSync(fakeBin, `@echo off\r\n"${process.execPath}" "${fakeScript}" %*\r\n`);
-  }
+  if (process.platform !== "win32") chmodSync(fakeScript, 0o755);
 
   const prevChromeEnv = process.env.HERDR_POCKET_CHROME_BIN;
   process.env.HERDR_POCKET_CHROME_BIN = fakeBin;
