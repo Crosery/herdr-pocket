@@ -316,6 +316,8 @@
 }
 
 .v3-brand {
+  position: relative;
+  z-index: 6;
   height: 42px;
   flex: none;
   display: flex;
@@ -1385,6 +1387,8 @@
 }
 
 .v3-pane-head {
+  position: relative;
+  z-index: 6;
   height: 30px;
   flex: none;
   display: flex;
@@ -1419,7 +1423,8 @@
 .v3-pane-head:hover .v3-pane-actions,
 .v3-pane:has(> .v3-pane-grip:hover) .v3-pane-actions,
 .v3-pane-actions:focus-within,
-.v3-pane-head[data-menu-open="true"] .v3-pane-actions {
+.v3-pane-head[data-menu-open="true"] .v3-pane-actions,
+:root[data-shortcut-hints] .v3-pane.is-focused .v3-pane-actions {
   opacity: 1;
 }
 
@@ -2186,12 +2191,106 @@
   transform: translateX(-50%) scale(0.92);
 }
 
-:root[data-shortcut-hints="Mod"] .v3-spatial-hint,
-:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint,
-:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint,
-:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint {
-  display: none !important;
-  opacity: 0 !important;
+:root[data-shortcut-hints="Mod"] .v3-spatial-hint[data-chord^="Mod"] {
+  opacity: 1;
+  transform: scale(1);
+}
+:root[data-shortcut-hints="Mod"] .v3-spatial-hint.pos-stack[data-chord^="Mod"] {
+  display: inline-flex;
+}
+:root[data-shortcut-hints="Mod"] .v3-spatial-hint[data-chord^="Mod"]::after {
+  content: attr(data-chip-mod);
+}
+
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint[data-chord="Mod+Shift"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint[data-chord="Mod+Alt+Shift"] {
+  opacity: 1;
+  transform: scale(1);
+}
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-stack[data-chord="Mod+Shift"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-stack[data-chord="Mod+Alt+Shift"] {
+  display: inline-flex;
+}
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint[data-chord="Mod+Shift"]::after,
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint[data-chord="Mod+Alt+Shift"]::after {
+  content: attr(data-chip-mod-shift);
+}
+
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint[data-chord="Mod+Alt"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint[data-chord="Mod+Alt+Shift"] {
+  opacity: 1;
+  transform: scale(1);
+}
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-stack[data-chord="Mod+Alt"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-stack[data-chord="Mod+Alt+Shift"] {
+  display: inline-flex;
+}
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint[data-chord="Mod+Alt"]::after,
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint[data-chord="Mod+Alt+Shift"]::after {
+  content: attr(data-chip-mod-alt);
+}
+
+:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint[data-chord="Mod+Alt+Shift"] {
+  opacity: 1;
+  transform: scale(1);
+}
+:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint.pos-stack[data-chord="Mod+Alt+Shift"] {
+  display: inline-flex;
+}
+:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint[data-chord="Mod+Alt+Shift"]::after {
+  content: attr(data-chip-mod-alt-shift);
+}
+
+:root[data-shortcut-hints="Mod"] .v3-spatial-hint.pos-right[data-chord^="Mod"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-right[data-chord="Mod+Shift"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-right[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-right[data-chord="Mod+Alt"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-right[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint.pos-right[data-chord="Mod+Alt+Shift"] {
+  opacity: 1;
+  transform: translateY(-50%) scale(1);
+}
+
+:root[data-shortcut-hints="Mod"] .v3-spatial-hint.pos-center[data-chord^="Mod"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-center[data-chord="Mod+Shift"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-center[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-center[data-chord="Mod+Alt"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-center[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint.pos-center[data-chord="Mod+Alt+Shift"] {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+:root[data-shortcut-hints="Mod"] .v3-spatial-hint.pos-top[data-chord^="Mod"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-top[data-chord="Mod+Shift"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-top[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-top[data-chord="Mod+Alt"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-top[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint.pos-top[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod"] .v3-spatial-hint.pos-bottom[data-chord^="Mod"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-bottom[data-chord="Mod+Shift"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-bottom[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-bottom[data-chord="Mod+Alt"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-bottom[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint.pos-bottom[data-chord="Mod+Alt+Shift"] {
+  opacity: 1;
+  transform: translateX(-50%) scale(1);
+}
+
+:root[data-shortcut-hints="Mod"] .v3-spatial-hint.pos-top-right[data-chord^="Mod"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-top-right[data-chord="Mod+Shift"],
+:root[data-shortcut-hints="Mod+Shift"] .v3-spatial-hint.pos-top-right[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-top-right[data-chord="Mod+Alt"],
+:root[data-shortcut-hints="Mod+Alt"] .v3-spatial-hint.pos-top-right[data-chord="Mod+Alt+Shift"],
+:root[data-shortcut-hints="Mod+Alt+Shift"] .v3-spatial-hint.pos-top-right[data-chord="Mod+Alt+Shift"] {
+  opacity: 1;
+  transform: scale(1);
+}
+
+:root[data-shortcut-hints="Mod"] .v3-tab:has(.v3-tab-hint[data-chord^="Mod"]) .v3-tab-x,
+:root[data-shortcut-hints="Mod+Shift"] .v3-tab.active:has(.v3-spatial-hint[data-chord="Mod+Shift"]) .v3-tab-x {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .v3-chord-hud {

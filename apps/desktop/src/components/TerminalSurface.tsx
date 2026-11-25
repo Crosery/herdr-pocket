@@ -18,6 +18,7 @@ import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge"
 import { hasFileJumpModifier, openAgentFileTarget } from "../lib/openFileTarget";
 import { setConfig, useClientConfig } from "../lib/config";
 import { attachTerminalImeBridge, chunkTerminalInputPayload, isImeKeyEvent } from "../lib/terminalIme";
+import { isTerminalRendererReady, snapTerminalViewportImmediate } from "../lib/terminalScroll";
 import { trackTerminalImeEvent, trackTerminalLayoutJump } from "../lib/uiTelemetry";
 import {
   findLinkAtCell,
@@ -400,6 +401,8 @@ export function TerminalSurface({
   const isShellRef = useRef(Boolean(agent.isShell));
   isShellRef.current = Boolean(agent.isShell);
   const wasAtBottomRef = useRef(true);
+  const savedOffsetFromBottomRef = useRef(0);
+  const pendingViewportSyncRef = useRef(true);
 
   const paneOwnsFocus = useCallback(() => {
     if (typeof document === "undefined" || !document.hasFocus()) return false;
@@ -507,11 +510,9 @@ export function TerminalSurface({
       const term = termRef.current;
       if (term) {
         if (term.hasSelection()) term.clearSelection();
-        const buf = term.buffer.active;
-        if (buf === term.buffer.normal && buf.viewportY < buf.baseY) {
-          term.scrollToBottom();
-        }
+        savedOffsetFromBottomRef.current = 0;
         wasAtBottomRef.current = true;
+        snapTerminalViewportImmediate(term, true, 0);
       }
       const bpActive =
         bracketedPasteRef.current ||
@@ -1494,20 +1495,41 @@ export function TerminalSurface({
     };
 
     const syncBottomSticky = () => {
-      if (!initialReadyDone || !activeRef.current || hostEl.clientHeight <= 40) return;
+      if (
+        !initialReadyDone ||
+        !activeRef.current ||
+        hostEl.clientHeight <= 40 ||
+        pendingViewportSyncRef.current ||
+        !isTerminalRendererReady(term)
+      ) {
+        return;
+      }
       const buf = term.buffer.active;
       if (buf === term.buffer.normal) {
-        wasAtBottomRef.current = buf.viewportY >= buf.baseY - 1;
+        const atBottom = buf.viewportY >= buf.baseY - 1;
+        wasAtBottomRef.current = atBottom;
+        savedOffsetFromBottomRef.current = atBottom ? 0 : Math.max(0, buf.baseY - buf.viewportY);
       } else {
         wasAtBottomRef.current = true;
+        savedOffsetFromBottomRef.current = 0;
       }
     };
     const dispScroll = term.onScroll(() => {
       syncBottomSticky();
       scheduleOverlay();
     });
-    const dispRender = term.onRender(scheduleOverlay);
+    const dispRender = term.onRender(() => {
+      if (pendingViewportSyncRef.current && activeRef.current) {
+        if (snapTerminalViewportImmediate(term, wasAtBottomRef.current, savedOffsetFromBottomRef.current)) {
+          pendingViewportSyncRef.current = false;
+        }
+      }
+      scheduleOverlay();
+    });
     const dispWriteParsed = term.onWriteParsed(() => {
+      if (wasAtBottomRef.current && term.buffer.active === term.buffer.normal) {
+        snapTerminalViewportImmediate(term, true, 0);
+      }
       syncBottomSticky();
       flushOverlaySoon();
     });
@@ -2748,12 +2770,11 @@ export function TerminalSurface({
       fallbackLines = lines;
       term.write(`\x1b[2J\x1b[H${lines.join("\r\n")}`, () => {
         if (!alive || termRef.current !== term) return;
-        if (!initialReadyDone) {
-          if (term.buffer.active === term.buffer.normal) {
-            term.scrollToBottom();
-          }
+        if (!initialReadyDone || wasAtBottomRef.current) {
           wasAtBottomRef.current = true;
-          markHostReady();
+          savedOffsetFromBottomRef.current = 0;
+          pendingViewportSyncRef.current = !snapTerminalViewportImmediate(term, true, 0);
+          if (!initialReadyDone) markHostReady();
         }
         paintOverlays();
       });
@@ -2807,10 +2828,9 @@ export function TerminalSurface({
           term.write("", () => {
             initialRevealQueued = false;
             if (!alive || termRef.current !== term) return;
-            if (term.buffer.active === term.buffer.normal) {
-              term.scrollToBottom();
-            }
             wasAtBottomRef.current = true;
+            savedOffsetFromBottomRef.current = 0;
+            pendingViewportSyncRef.current = !snapTerminalViewportImmediate(term, true, 0);
             markHostReady();
             paintOverlays();
           });
@@ -3133,7 +3153,7 @@ export function TerminalSurface({
           }
           if (buffered.length === 0 && !initialReadyDone) {
             window.clearTimeout(hostReadyFallback);
-            hostReadyFallback = window.setTimeout(markHostReady, 220);
+            hostReadyFallback = window.setTimeout(markHostReady, 650);
           }
           if (alive) {
             void localTermFocus(connId, activeRef.current && focusedRef.current);
@@ -3162,6 +3182,8 @@ export function TerminalSurface({
         initialBurstStartAt = 0;
         initialRevealQueued = false;
         wasAtBottomRef.current = true;
+        savedOffsetFromBottomRef.current = 0;
+        pendingViewportSyncRef.current = true;
         hostEl.dataset.ready = "false";
         window.clearTimeout(hostReadyFallback);
         hostReadyFallback = window.setTimeout(markHostReady, 950);
@@ -3524,13 +3546,16 @@ export function TerminalSurface({
       void localTermFocus(localConnId, active && focused);
     }
     if (!active || !termRef.current) {
+      pendingViewportSyncRef.current = true;
       detachWebglRef.current?.();
       return;
     }
+    pendingViewportSyncRef.current = true;
     onActivatedAttachRef.current?.();
     attachWebglRef.current?.();
     const term = termRef.current;
     const stickToBottom = wasAtBottomRef.current;
+    const savedOffset = savedOffsetFromBottomRef.current;
     lastActivateAtRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (externalSizeOverrideRef.current) {
       lastResizeSigRef.current = "";
@@ -3545,21 +3570,16 @@ export function TerminalSurface({
     } else {
       syncResize(term);
     }
-    if (stickToBottom && term.buffer.active === term.buffer.normal) {
-      term.scrollToBottom();
-      wasAtBottomRef.current = true;
+    if (snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
+      pendingViewportSyncRef.current = false;
     }
     term.refresh(0, Math.max(0, term.rows - 1));
     paintOverlays();
     const id = requestAnimationFrame(() => {
       onActivatedAttachRef.current?.();
       if (termRef.current === term) {
-        if (
-          stickToBottom &&
-          term.buffer.active === term.buffer.normal &&
-          term.buffer.active.viewportY < term.buffer.active.baseY
-        ) {
-          term.scrollToBottom();
+        if (pendingViewportSyncRef.current && snapTerminalViewportImmediate(term, stickToBottom, savedOffset)) {
+          pendingViewportSyncRef.current = false;
         }
         paintOverlays();
       }

@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   chordIncludesPrefix,
+  IS_MAC,
   remainingSuffixChip,
   shortcutsMatchingChordPrefix,
 } from "../src/shell/shortcuts.ts";
@@ -51,8 +52,27 @@ test("progressive modifier prefix matching includes supersets while holding ⌘ 
   assert.equal(modAltShiftIds.has("unsplitTab"), true);
 });
 
-test("shell.css places modifier chord HUD at top single-line and keeps statusbar overflow visible", () => {
+test("SpatialHint renders contextual shortcut badges and shell.css enables progressive spatial hints + bottom chord HUD", () => {
+  const newTabHint = SpatialHint({ shortcut: "newAgent", corner: "tr" });
+  assert.ok(newTabHint, "SpatialHint returns kbd element for shortcut");
+  assert.equal(newTabHint.type, "kbd");
+  assert.equal(newTabHint.props["data-chord"], "Mod");
+  assert.equal(newTabHint.props["data-chip-mod"], "T");
+  assert.equal(newTabHint.props.className, "v3-spatial-hint pos-tr");
+
+  const splitDownHint = SpatialHint({ shortcut: "splitDown", corner: "bottom", className: "hide-on-bare-mod" });
+  assert.ok(splitDownHint, "SpatialHint returns kbd element for subchord shortcut");
+  assert.equal(splitDownHint.props["data-chord"], "Mod+Shift");
+  assert.equal(splitDownHint.props["data-chip-mod"], IS_MAC ? "⇧D" : "Shift+D");
+  assert.equal(splitDownHint.props["data-chip-mod-shift"], "D");
+  assert.equal(splitDownHint.props.className, "v3-spatial-hint pos-bottom hide-on-bare-mod");
+
+  assert.equal(SpatialHint({ text: "" }), null);
+
   const css = readFileSync(resolve(ROOT, "src/styles/shell.css"), "utf8");
+  assert.equal(css.includes("display: none !important;\n  opacity: 0 !important;"), false);
+  assert.equal(css.includes(':root[data-shortcut-hints="Mod"] .v3-spatial-hint[data-chord^="Mod"]'), true);
+
   const statusMatch = /\.v3-status\s*\{[^}]*\}/.exec(css);
   assert.ok(statusMatch, "found .v3-status block");
   assert.equal(statusMatch[0].includes("overflow: visible"), true);
@@ -61,9 +81,7 @@ test("shell.css places modifier chord HUD at top single-line and keeps statusbar
   assert.ok(hudMatch, "found .v3-chord-hud block");
   assert.equal(hudMatch[0].includes("bottom: 0"), true);
   assert.equal(hudMatch[0].includes("height: 28px"), true);
-  assert.equal(hudMatch[0].includes("top: 74px"), false);
   assert.equal(hudMatch[0].includes("flex-wrap: nowrap"), true);
-  assert.equal(SpatialHint({ shortcut: "newAgent", corner: "tr" }), null);
 
   const itemsMatch = /\.v3-chord-items\s*\{[^}]*\}/.exec(css);
   assert.ok(itemsMatch, "found .v3-chord-items block");
@@ -82,8 +100,8 @@ test("shell.css places modifier chord HUD at top single-line and keeps statusbar
   assert.equal(inlineKeysMatch[0].includes("padding: 1px 5px"), true);
 });
 
-test("OS HID modifier resolver suppresses phantom Command popups and hold delay avoids tap flicker", () => {
-  assert.ok(HOLD_DELAY_MS >= 600, `expected HOLD_DELAY_MS >= 600ms, got ${HOLD_DELAY_MS}`);
+test("OS HID modifier resolver suppresses phantom Command popups and hold delay stays responsive", () => {
+  assert.equal(HOLD_DELAY_MS, 450);
 
   // Unsupported OS never fabricates a chord
   assert.equal(

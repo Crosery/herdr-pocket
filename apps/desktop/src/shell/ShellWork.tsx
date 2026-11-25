@@ -554,7 +554,7 @@ const TabChip = memo(function TabChip({
         corner="right"
         className="v3-tab-hint"
       />
-      {active ? <SpatialHint shortcut="closeWholeTab" corner="tr" /> : null}
+      {active ? <SpatialHint shortcut="closeWholeTab" corner="tr" className="hide-on-bare-mod" /> : null}
       <button
         className="v3-tab-x"
         aria-label={`关闭 ${title}`}
@@ -1563,7 +1563,7 @@ function PaneHead({
             onClick={() => onSplitNewTerminal(tabId, paneId, "down")}
           >
             <Rows2 size={13} />
-            {isFocused ? <SpatialHint text={shortcutText("splitDown")} corner="bottom" /> : null}
+            {isFocused ? <SpatialHint text={shortcutText("splitDown")} corner="bottom" className="hide-on-bare-mod" /> : null}
           </button>
           {isSplit || isZoomed ? (
             <button
@@ -1574,7 +1574,7 @@ function PaneHead({
               onClick={onToggleZoom}
             >
               {isZoomed ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-              {isFocused ? <SpatialHint shortcut="zoomPane" corner="bottom" /> : null}
+              {isFocused ? <SpatialHint shortcut="zoomPane" corner="bottom" className="hide-on-bare-mod" /> : null}
             </button>
           ) : null}
           <button

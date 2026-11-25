@@ -1,17 +1,22 @@
-import { useEffect } from "react";
+import { createElement, useEffect } from "react";
 import { native, type OsModifierState } from "../lib/native";
 import { createStore, settingsStore } from "../lib/store";
 import { isImeKeyEvent } from "../lib/terminalIme";
 import { trackModifierGhostBlocked, trackModifierHudHide, trackModifierHudShow } from "../lib/uiTelemetry";
 import {
   chordFromModifierEvent,
+  chordIncludesPrefix,
+  chordOfKeys,
   IS_MAC,
+  remainingSuffixChip,
+  SHORTCUTS,
+  shortcutText,
   type ShortcutId,
   type ShortcutModifierChord,
 } from "./shortcuts";
 
-export const HOLD_DELAY_MS = 600;
-const OS_MODIFIER_POLL_MS = 200;
+export const HOLD_DELAY_MS = 450;
+const OS_MODIFIER_POLL_MS = 160;
 
 export const modifierChordStore = createStore<ShortcutModifierChord | null>(null);
 
@@ -40,17 +45,64 @@ function isModifierKeyName(key: string): boolean {
   return key === "Meta" || key === "Control" || key === "Alt" || key === "Shift";
 }
 
+function inferChordFromText(text: string): ShortcutModifierChord {
+  if (/(?:⌥⇧|Alt\+Shift)/i.test(text)) return "Mod+Alt+Shift";
+  if (/(?:⇧|Shift)/i.test(text)) return "Mod+Shift";
+  if (/(?:⌥|Alt)/i.test(text)) return "Mod+Alt";
+  return "Mod";
+}
+
+function parseDisplayKeys(displayText: string, chord: ShortcutModifierChord): string[] {
+  const cleaned = displayText
+    .replace(/^⌘/, "")
+    .replace(/^Ctrl\+/i, "")
+    .replace(/^[⌥⇧]+/, "")
+    .replace(/^(?:Alt\+|Shift\+)+/i, "");
+  const parts = chord.split("+");
+  return [...parts, cleaned || displayText];
+}
+
 export type SpatialHintCorner = "tr" | "br" | "center" | "right" | "stack" | "top" | "top-right" | "bottom";
 
-/** Retired floating button/tab corner badges (would overlap adjacent controls); Chord HUD lives strictly inside .v3-status. */
-export function SpatialHint(_props: {
+/** Pure CSS-toggled floating keycap badge matching held modifier prefix `[data-shortcut-hints]`. */
+export function SpatialHint({
+  text,
+  shortcut,
+  chord,
+  corner = "tr",
+  className = "",
+}: {
   text?: string;
   shortcut?: ShortcutId;
   chord?: ShortcutModifierChord;
   corner?: SpatialHintCorner;
   className?: string;
-}): null {
-  return null;
+}) {
+  const displayText = text ?? (shortcut ? shortcutText(shortcut) : "");
+  if (!displayText) return null;
+  const def = shortcut ? SHORTCUTS.find((x) => x.id === shortcut) : undefined;
+  const resolvedChord =
+    chord ?? (def ? chordOfKeys(def.keys) ?? inferChordFromText(displayText) : inferChordFromText(displayText));
+  const resolvedKeys = def?.keys ?? parseDisplayKeys(displayText, resolvedChord);
+  const chipProps: Record<string, string> = {};
+  if (chordIncludesPrefix(resolvedChord, "Mod")) {
+    chipProps["data-chip-mod"] = remainingSuffixChip(resolvedKeys, "Mod");
+  }
+  if (chordIncludesPrefix(resolvedChord, "Mod+Shift")) {
+    chipProps["data-chip-mod-shift"] = remainingSuffixChip(resolvedKeys, "Mod+Shift");
+  }
+  if (chordIncludesPrefix(resolvedChord, "Mod+Alt")) {
+    chipProps["data-chip-mod-alt"] = remainingSuffixChip(resolvedKeys, "Mod+Alt");
+  }
+  if (chordIncludesPrefix(resolvedChord, "Mod+Alt+Shift")) {
+    chipProps["data-chip-mod-alt-shift"] = remainingSuffixChip(resolvedKeys, "Mod+Alt+Shift");
+  }
+  return createElement("kbd", {
+    className: `v3-spatial-hint pos-${corner}${className ? ` ${className}` : ""}`,
+    "data-chord": resolvedChord,
+    "aria-hidden": "true",
+    ...chipProps,
+  });
 }
 
 /**
@@ -80,7 +132,6 @@ export function useModifierHoldHints(): void {
     let activeChord: ShortcutModifierChord | null = null;
     let pendingChord: ShortcutModifierChord | null = null;
     let shownAt = 0;
-    let pointerOverTerminal = false;
 
     const stopPolling = () => {
       if (pollTimer !== null) {
@@ -154,6 +205,50 @@ export function useModifierHoldHints(): void {
       applyChord(null, reason);
     };
 
+    const armHoldTimer = (chord: ShortcutModifierChord) => {
+      pendingChord = chord;
+      if (timer !== null) return;
+      const scheduledGen = gen;
+      timer = window.setTimeout(() => {
+        timer = null;
+        if (disposed || scheduledGen !== gen || !pendingChord) return;
+        if (document.hidden || !document.hasFocus() || document.querySelector("[role=dialog][data-state=open]")) {
+          trackModifierGhostBlocked(
+            pendingChord,
+            { supported: false, meta: false, ctrl: false, alt: false, shift: false },
+            "unfocused",
+          );
+          cancel("blur");
+          return;
+        }
+        const expected = pendingChord;
+        if (!native.available()) {
+          applyChord(expected);
+          return;
+        }
+        void native.queryOsModifiers().then((os) => {
+          if (disposed || scheduledGen !== gen || !pendingChord) return;
+          if (document.hidden || !document.hasFocus() || document.querySelector("[role=dialog][data-state=open]")) {
+            trackModifierGhostBlocked(expected, os, "unfocused");
+            cancel("blur");
+            return;
+          }
+          if (os.supported) {
+            const osChord = chordFromOsModifiers(os, IS_MAC);
+            if (!osChord) {
+              trackModifierGhostBlocked(expected, os, "os_hid");
+              cancel("os_poll_released");
+              return;
+            }
+            pendingChord = osChord;
+            applyChord(osChord);
+            return;
+          }
+          applyChord(expected);
+        });
+      }, HOLD_DELAY_MS);
+    };
+
     const onKeyDown = (e: KeyboardEvent) => {
       const hasDialog = Boolean(document.querySelector("[role=dialog][data-state=open]"));
       if (hasDialog) {
@@ -168,62 +263,17 @@ export function useModifierHoldHints(): void {
         cancel("chord_key");
         return;
       }
-      if (pointerOverTerminal) {
-        cancel("terminal_hover");
-        return;
-      }
       const next = chordFromModifierEvent(e);
       if (!next) {
         cancel("keyup");
         return;
       }
-      pendingChord = next;
       if (activeChord !== null) {
+        pendingChord = next;
         applyChord(next);
         return;
       }
-      if (e.repeat && timer !== null) return;
-      if (timer === null) {
-        const scheduledGen = gen;
-        timer = window.setTimeout(() => {
-          timer = null;
-          if (disposed || scheduledGen !== gen || !pendingChord) return;
-          if (document.hidden || !document.hasFocus() || document.querySelector("[role=dialog][data-state=open]")) {
-            trackModifierGhostBlocked(
-              pendingChord,
-              { supported: false, meta: false, ctrl: false, alt: false, shift: false },
-              "unfocused",
-            );
-            cancel("blur");
-            return;
-          }
-          const expected = pendingChord;
-          if (!native.available()) {
-            applyChord(expected);
-            return;
-          }
-          void native.queryOsModifiers().then((os) => {
-            if (disposed || scheduledGen !== gen || !pendingChord) return;
-            if (document.hidden || !document.hasFocus() || document.querySelector("[role=dialog][data-state=open]")) {
-              trackModifierGhostBlocked(expected, os, "unfocused");
-              cancel("blur");
-              return;
-            }
-            if (os.supported) {
-              const osChord = chordFromOsModifiers(os, IS_MAC);
-              if (!osChord) {
-                trackModifierGhostBlocked(expected, os, "os_hid");
-                cancel("os_poll_released");
-                return;
-              }
-              pendingChord = osChord;
-              applyChord(osChord);
-              return;
-            }
-            applyChord(expected);
-          });
-        }, HOLD_DELAY_MS);
-      }
+      armHoldTimer(next);
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
@@ -235,6 +285,8 @@ export function useModifierHoldHints(): void {
       pendingChord = remaining;
       if (activeChord !== null) {
         applyChord(remaining);
+      } else if (!isModifierKeyName(e.key) && timer === null) {
+        armHoldTimer(remaining);
       }
     };
 
@@ -244,12 +296,6 @@ export function useModifierHoldHints(): void {
     const onWheel = () => cancel("wheel");
     const onBlur = () => cancel("blur");
     const onPointerMove = (e: PointerEvent | MouseEvent) => {
-      const target = e.target as HTMLElement | null;
-      pointerOverTerminal = Boolean(target?.closest?.(".tp-term-host"));
-      if (pointerOverTerminal && (pendingChord !== null || activeChord !== null)) {
-        cancel("terminal_hover");
-        return;
-      }
       if (pendingChord === null && activeChord === null) return;
       const modHeld = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
       if (!modHeld) {

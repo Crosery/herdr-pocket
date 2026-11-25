@@ -998,6 +998,7 @@ export function AgentDetailPanel({
   const [loadOlderError, setLoadOlderError] = useState(false);
   const [hasLoadedOlder, setHasLoadedOlder] = useState(false);
   const prevModeRef = useRef(activeMode);
+  const prevVisibleRef = useRef(visible);
   const [atBottom, setAtBottom] = useState(true);
   const [choiceLines, setChoiceLines] = useState<string[]>([]);
   const [subs, setSubs] = useState<SubSession[]>([]);
@@ -1776,8 +1777,10 @@ export function AgentDetailPanel({
 
   useLayoutEffect(() => {
     const justEnteredChat = prevModeRef.current !== "chat" && activeMode === "chat";
+    const justBecameVisible = !prevVisibleRef.current && visible;
     prevModeRef.current = activeMode;
-    if (activeMode !== "chat") return;
+    prevVisibleRef.current = visible;
+    if (!visible || activeMode !== "chat") return;
     const el = chatScrollRef.current;
     if (!el) return;
     const hasSelectionInside = () => {
@@ -1794,7 +1797,7 @@ export function AgentDetailPanel({
       prevScrollTopRef.current = el.scrollTop;
       return;
     }
-    if (justEnteredChat && initialPositionedRef.current && !stickRef.current) {
+    if ((justEnteredChat || justBecameVisible) && initialPositionedRef.current && !stickRef.current) {
       el.scrollTop = prevScrollTopRef.current;
       return;
     }
@@ -1840,12 +1843,14 @@ export function AgentDetailPanel({
     sending,
     shellChat,
     terminalQueuedItems.length,
+    visible,
   ]);
 
   const chatScrollRafRef = useRef<number>(0);
   const runChatScroll = useCallback(() => {
+    if (!visibleRef.current || activeMode !== "chat") return;
     const el = chatScrollRef.current;
-    if (!el) return;
+    if (!el || el.clientHeight <= 0) return;
     const top = el.scrollTop;
     const prevTop = prevScrollTopRef.current;
     prevScrollTopRef.current = top;
@@ -1865,7 +1870,7 @@ export function AgentDetailPanel({
     ) {
       void loadOlderEvents();
     }
-  }, [activeSub, isPlainShellChat, loadOlderError, loadOlderEvents, loadingOlder, olderCursor]);
+  }, [activeMode, activeSub, isPlainShellChat, loadOlderError, loadOlderEvents, loadingOlder, olderCursor]);
 
   const onChatScroll = useCallback(() => {
     if (chatScrollRafRef.current) return;
