@@ -1,4 +1,4 @@
-export const MAX_WEBGL_POOL = 8;
+export const MAX_WEBGL_POOL = 14;
 
 interface WebglPoolEntry {
   key: symbol;

@@ -462,7 +462,7 @@ jobs:
                 --entitlements apps/desktop/src-tauri/entitlements.plist \
                 --sign "$APPLE_SIGNING_IDENTITY" "$app"
               codesign --verify --deep --strict --verbose=2 "$app"
-              codesign -dv "$app" 2>&1 | grep -q "Authority=Developer ID Application"
+              codesign -dvv "$app" 2>&1 | grep -q "Authority=Developer ID Application"
               codesign -dr - "$app" 2>&1 | grep -q "anchor apple generic"
             elif ! codesign --verify --deep --strict "$app" 2>/dev/null; then
               codesign --force --deep --sign - --entitlements apps/desktop/src-tauri/entitlements.plist "$app"

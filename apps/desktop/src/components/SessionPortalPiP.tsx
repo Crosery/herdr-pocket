@@ -164,8 +164,14 @@ export function SessionPortalPiP({
   }, [collapsed, currentCanInteract, currentHostId, currentId, visible]);
 
   useEffect(() => {
-    if (!visible || collapsed || !currentId || !currentHostId || !currentPath || currentKind !== "html") {
+    if (!currentId || currentKind !== "html") {
       setHtmlPreview(null);
+      return;
+    }
+    if (!visible || collapsed || !currentHostId || !currentPath) {
+      return;
+    }
+    if (htmlPreview?.portalId === currentId && (htmlPreview.memUrl || htmlPreview.srcDoc)) {
       return;
     }
     let alive = true;
@@ -190,14 +196,20 @@ export function SessionPortalPiP({
     return () => {
       alive = false;
     };
-  }, [agent.cwd, agent.key, collapsed, currentHostId, currentId, currentKind, currentPath, currentTitle, visible]);
+  }, [agent.cwd, agent.key, collapsed, currentHostId, currentId, currentKind, currentPath, currentTitle, htmlPreview?.memUrl, htmlPreview?.portalId, htmlPreview?.srcDoc, visible]);
 
   const isInlineImageFile =
     currentKind === "file" && Boolean(currentPath && (PIP_IMAGE_EXT_RE.test(currentPath) || currentMime?.startsWith("image/")));
 
   useEffect(() => {
-    if (!visible || collapsed || !currentId || !currentHostId || !currentPath || !isInlineImageFile) {
+    if (!currentId || !isInlineImageFile) {
       setImgPreview(null);
+      return;
+    }
+    if (!visible || collapsed || !currentHostId || !currentPath) {
+      return;
+    }
+    if (imgPreview?.portalId === currentId && imgPreview.dataUri) {
       return;
     }
     let alive = true;
@@ -217,7 +229,7 @@ export function SessionPortalPiP({
     return () => {
       alive = false;
     };
-  }, [agent.key, collapsed, currentHostId, currentId, currentPath, isInlineImageFile, visible]);
+  }, [agent.key, collapsed, currentHostId, currentId, currentPath, imgPreview?.dataUri, imgPreview?.portalId, isInlineImageFile, visible]);
 
   if (!items.length || !current) return null;
 

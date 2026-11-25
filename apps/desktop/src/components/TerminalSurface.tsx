@@ -1482,7 +1482,7 @@ export function TerminalSurface({
     centerScreenVerticalGap(hostEl, term);
     bracketedPasteRef.current = false;
 
-    // GPU WebGL rendering uses a warm LRU pool (MAX_WEBGL_POOL = 8) so tab switches
+    // GPU WebGL rendering uses a warm LRU pool (MAX_WEBGL_POOL = 14) so tab switches
     // reactivate cached contexts in O(1) without synchronous DomRenderer rebuilds.
     const poolKey = Symbol(agent.key);
     let mountWebglRaf = 0;
@@ -3449,6 +3449,7 @@ export function TerminalSurface({
                   syncResize(term, true);
                 });
               } else {
+                flushPendingBytes();
                 externalSizeOverrideRef.current = true;
               }
             } else if (ownsInitialSize) {
@@ -3478,6 +3479,9 @@ export function TerminalSurface({
             for (const chunk of buffered) {
               if (!sawRaw) sawRaw = true;
               queueRawBytes(chunk);
+            }
+            if (buffered.length > 0) {
+              flushPendingBytes();
             }
           }
           if (buffered.length === 0 && !initialReadyDone) {
@@ -3904,7 +3908,7 @@ export function TerminalSurface({
     }
     pendingViewportSyncRef.current = true;
     onActivatedAttachRef.current?.();
-    touchWarmWebglRef.current?.();
+    attachWebglRef.current?.();
     const term = termRef.current;
     const stickToBottom = wasAtBottomRef.current;
     const savedOffset = savedOffsetFromBottomRef.current;

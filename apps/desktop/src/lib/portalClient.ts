@@ -199,7 +199,7 @@ const initialState: PortalState = {
 let state: PortalState = initialState;
 const listeners = new Set<() => void>();
 const unsupportedHostVersions = new Map<string, string>();
-const PORTAL_WATCHER_GRACE_MS = 10_000;
+const PORTAL_WATCHER_GRACE_MS = 120_000;
 const hostPortalWatchers = new Map<
   string,
   {

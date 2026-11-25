@@ -33,6 +33,8 @@ import {
   beginSplitMotion,
   collapsedEntryUnitRect,
   easeOutQuart,
+  isInteractiveResizeActive,
+  isSplitMotionActive,
   lerpUnitRect,
   setInteractiveResizeActive,
   SPLIT_MOTION_MS,
@@ -81,6 +83,7 @@ import {
   swapTabPanes,
   tabLeaves,
   tabRootNode,
+  tabSpaceKey,
   togglePanel,
   toggleZoomTabPane,
   unsplitTabToTabs,
@@ -2285,7 +2288,9 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
   );
 }
 
-const MAX_KEPT_AGENT_TABS = 24;
+const MAX_KEPT_AGENT_TABS = 64;
+const MAX_KEPT_NON_AGENT_TABS = 12;
+const MAX_PREWARMED_AGENT_TABS = 24;
 
 const TabStage = memo(function TabStage({
   tab,
@@ -2527,27 +2532,103 @@ export const ShellMain = memo(function ShellMain({
   const active = tabs.find((t) => t.id === activeId) ?? null;
   const [draggingPaneId, setDraggingPaneId] = useState<string | null>(null);
   const keptAgentIdsRef = useRef<string[]>([]);
+  const keptNonAgentIdsRef = useRef<string[]>([]);
+  const [prewarmedIds, setPrewarmedIds] = useState<string[]>([]);
   const mountedCountRef = useRef(0);
 
   const agentTabIds = useMemo(
     () => new Set(tabs.filter((t) => tabLeaves(t).some((l) => l.content.kind === "agent")).map((t) => t.id)),
     [tabs],
   );
+  const nonAgentTabIds = useMemo(
+    () => new Set(tabs.filter((t) => !agentTabIds.has(t.id)).map((t) => t.id)),
+    [agentTabIds, tabs],
+  );
   const keptAgentIds = useMemo(() => {
     const pruned = keptAgentIdsRef.current.filter((id) => agentTabIds.has(id));
-    const next =
+    const ordered =
       activeId && agentTabIds.has(activeId)
-        ? [activeId, ...pruned.filter((id) => id !== activeId)].slice(0, MAX_KEPT_AGENT_TABS)
-        : pruned.slice(0, MAX_KEPT_AGENT_TABS);
+        ? [activeId, ...pruned.filter((id) => id !== activeId)]
+        : [...pruned];
+    for (const id of prewarmedIds) {
+      if (agentTabIds.has(id) && !ordered.includes(id)) {
+        ordered.push(id);
+      }
+    }
+    const next = ordered.slice(0, MAX_KEPT_AGENT_TABS);
     keptAgentIdsRef.current = next;
     return next;
-  }, [activeId, agentTabIds]);
+  }, [activeId, agentTabIds, prewarmedIds]);
+
+  const keptNonAgentIds = useMemo(() => {
+    const pruned = keptNonAgentIdsRef.current.filter((id) => nonAgentTabIds.has(id));
+    const next =
+      activeId && nonAgentTabIds.has(activeId)
+        ? [activeId, ...pruned.filter((id) => id !== activeId)].slice(0, MAX_KEPT_NON_AGENT_TABS)
+        : pruned.slice(0, MAX_KEPT_NON_AGENT_TABS);
+    keptNonAgentIdsRef.current = next;
+    return next;
+  }, [activeId, nonAgentTabIds]);
+
+  useEffect(() => {
+    if (tabs.length <= 1) return;
+    let alive = true;
+    let timer = 0;
+    const activeSet = new Set(keptAgentIds);
+    const livePrewarmCount = prewarmedIds.filter((id) => agentTabIds.has(id)).length;
+    if (livePrewarmCount >= MAX_PREWARMED_AGENT_TABS || activeSet.size >= MAX_KEPT_AGENT_TABS) {
+      return;
+    }
+
+    const unmountedAgentTabs = tabs.filter((t) => agentTabIds.has(t.id) && !activeSet.has(t.id));
+    if (unmountedAgentTabs.length === 0) return;
+
+    const pickCandidate = (): ShellTab | undefined => {
+      if (selectedSpace) {
+        const sameSpace = unmountedAgentTabs.find(
+          (t) => tabSpaceKey(t, lookupAgent, spacesMap) === selectedSpace,
+        );
+        if (sameSpace) return sameSpace;
+      }
+      const activeWork = unmountedAgentTabs.find((t) =>
+        tabLeaves(t).some((l) => {
+          if (l.content.kind !== "agent") return false;
+          const st = lookupAgent(l.content.agentKey)?.status;
+          return st === "working" || st === "blocked";
+        }),
+      );
+      return activeWork ?? unmountedAgentTabs[0];
+    };
+
+    const scheduleTick = () => {
+      timer = window.setTimeout(() => {
+        if (!alive) return;
+        if (isSplitMotionActive() || isInteractiveResizeActive()) {
+          scheduleTick();
+          return;
+        }
+        const cand = pickCandidate();
+        if (!cand) return;
+        setPrewarmedIds((prev) => {
+          const filtered = prev.filter((id) => agentTabIds.has(id));
+          if (filtered.includes(cand.id) || filtered.length >= MAX_PREWARMED_AGENT_TABS) return filtered;
+          return [...filtered, cand.id];
+        });
+      }, 280);
+    };
+
+    scheduleTick();
+    return () => {
+      alive = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [agentTabIds, keptAgentIds, lookupAgent, prewarmedIds, selectedSpace, spacesMap, tabs]);
 
   const mountedTabIds = useMemo(() => {
-    const set = new Set(keptAgentIds);
+    const set = new Set([...keptAgentIds, ...keptNonAgentIds]);
     if (activeId) set.add(activeId);
     return set;
-  }, [activeId, keptAgentIds]);
+  }, [activeId, keptAgentIds, keptNonAgentIds]);
 
   const mountedTabs = useMemo(
     () => tabs.filter((t) => mountedTabIds.has(t.id)),

@@ -384,7 +384,7 @@ test("Keep-alive ShellMain, TerminalSurface no-reattach focus/size sync, ResizeO
   const appSrc = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/styles/shell.css", import.meta.url), "utf8");
 
-  assert.match(shellSrc, /MAX_KEPT_AGENT_TABS\s*=\s*24/);
+  assert.match(shellSrc, /MAX_KEPT_AGENT_TABS\s*=\s*64/);
   assert.match(shellSrc, /v3-tab-layer/);
   assert.match(shellSrc, /v3-pane-tool-btn/);
   assert.match(css, /\.v3-tab\s*\{[\s\S]*min-width:\s*78px;[\s\S]*max-width:\s*210px;/);
@@ -684,7 +684,7 @@ test("terminal stability and pane-header hover guards cap WebGL contexts and avo
   const testDir = dirname(fileURLToPath(import.meta.url));
   const termSrc = readFileSync(resolve(testDir, "../src/components/TerminalSurface.tsx"), "utf8");
   const poolSrc = readFileSync(resolve(testDir, "../src/lib/terminalWebglPool.ts"), "utf8");
-  assert.equal(poolSrc.includes("MAX_WEBGL_POOL = 8"), true, "WebGL pool must cap warm/active contexts by MAX_WEBGL_POOL");
+  assert.equal(poolSrc.includes("MAX_WEBGL_POOL = 14"), true, "WebGL pool must cap warm/active contexts by MAX_WEBGL_POOL");
   assert.equal(termSrc.includes("acquireWebglSlot("), true, "TerminalSurface must lease WebGL contexts from terminalWebglPool");
   assert.equal(termSrc.includes("onContextLoss"), true, "WebGL addon must detach cleanly on context loss");
   assert.equal(termSrc.includes("detachWebgl()"), true, "WebGL addon must detach when hidden or showing Kitty underlays");
