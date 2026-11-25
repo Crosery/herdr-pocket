@@ -12,7 +12,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { networkInterfaces } from "node:os";
 import type { Duplex } from "node:stream";
-import { DIRECT_FROM_HOST, DIRECT_PATH, DirectCipher, type DirectAead, type DirectOffer } from "@herdr-pocket/protocol";
+import { DIRECT_FROM_HOST, DIRECT_PATH, DIRECT_PING_PATH, DirectCipher, type DirectAead, type DirectOffer } from "@herdr-pocket/protocol";
 import { WebSocket, WebSocketServer } from "ws";
 
 /** RFC 8439 ChaCha20-Poly1305 from Node's crypto. */
@@ -95,6 +95,23 @@ export class DirectServer {
   async start(): Promise<void> {
     const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
     const http = createServer((req, res) => {
+      const reqPath = (() => {
+        try {
+          return new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+        } catch {
+          return "/";
+        }
+      })();
+      if (reqPath === DIRECT_PING_PATH && (req.method === "GET" || req.method === "HEAD")) {
+        res.writeHead(200, {
+          "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "no-store",
+          "Content-Type": "text/plain; charset=utf-8",
+          "X-Pocket-Host": this.opts.hostId(),
+        });
+        res.end(req.method === "HEAD" ? undefined : "ok");
+        return;
+      }
       if (this.opts.onHttpRequest) {
         void Promise.resolve(this.opts.onHttpRequest(req, res))
           .then((handled) => {
@@ -203,8 +220,15 @@ export class DirectServer {
       },
       close: () => ws.close(),
     };
-    // One link per phone: a new one (the phone came back) replaces the old.
-    for (const [other, p] of this.peers) if (p.deviceId === deviceId) other.close(4000, "replaced");
+    // Allow concurrent direct sockets from multiple tabs/windows on the same viewer (cap 8).
+    const sameDevicePeers: WebSocket[] = [];
+    for (const [other, p] of this.peers) {
+      if (p.deviceId === deviceId) sameDevicePeers.push(other);
+    }
+    while (sameDevicePeers.length >= 8) {
+      const oldest = sameDevicePeers.shift();
+      oldest?.close(4000, "replaced");
+    }
     this.peers.set(ws, peer);
     this.opts.onOpen?.(peer);
     ws.on("message", (data, isBinary) => {

@@ -78,7 +78,7 @@ import { logAction, logger } from "../lib/log";
 import { native, type LocalTermCloseEvent, type LocalTermSizeEvent } from "../lib/native";
 import { registerWebglCounter } from "../lib/perfTelemetry";
 import { ingestPortalStreamEvent } from "../lib/portalClient";
-import { rpcCall, subscribeStream } from "../lib/relay";
+import { isDirectConnected, rpcCall, subscribeStream } from "../lib/relay";
 import { uploadRemoteFile } from "../lib/uploadLargeFile";
 import { settingsStore } from "../lib/store";
 import {
@@ -583,7 +583,11 @@ export function TerminalSurface({
           toast(`「${f.name}」超过 ${Math.floor(LARGE_PUT_LIMITS.maxFileBytes / 1024 / 1024)} MB 上限，无法发送`, true);
           continue;
         }
-        if (f.size > PUT_LIMITS.fileBytes) largeFiles.push(f);
+        const isRaster = f.type.startsWith("image/") || /\.(?:jpe?g|png|webp|gif)$/i.test(f.name);
+        const streamOverP2p =
+          f.size > PUT_LIMITS.fileBytes ||
+          (f.size > 512 * 1024 && !isRaster && (!native.available() || isDirectConnected(agent.deviceId)));
+        if (streamOverP2p) largeFiles.push(f);
         else smallFiles.push(f);
       }
       try {

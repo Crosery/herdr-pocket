@@ -675,6 +675,8 @@ export interface RpcMethods {
    * the computer has direct links off.
    */
   "direct.offer": { params: Record<string, never>; result: DirectOffer };
+  /** WebRTC P2P SDP offer/answer handshake carried through the authenticated relay. */
+  "webrtc.offer": { params: WebRtcOfferParams; result: WebRtcAnswerResult };
   /** What can be created on this computer: spaces, programs, suggested folders. */
   "spaces.list": {
     params: Record<string, never>;
@@ -3215,6 +3217,30 @@ export interface DirectOffer {
 }
 
 export const DIRECT_PATH = "/v1/direct";
+export const DIRECT_PING_PATH = "/v1/direct-ping";
+
+export const WEBRTC_STUN_URLS = [
+  "stun:stun.miwifi.com:3478",
+  "stun:stun.qq.com:3478",
+  "stun:stun.cloudflare.com:3478",
+] as const;
+
+export const WEBRTC_RPC_CHANNEL = "hp-rpc";
+export const WEBRTC_PUT_CHANNEL = "hp-put";
+export const WEBRTC_GET_CHANNEL = "hp-get";
+export const WEBRTC_CHUNK_CHARS = 32_000;
+export const WEBRTC_BIN_CHUNK_BYTES = 32 * 1024;
+
+export interface WebRtcOfferParams {
+  type: "offer";
+  sdp: string;
+}
+
+export interface WebRtcAnswerResult {
+  peerId: string;
+  type: "answer";
+  sdp: string;
+}
 
 /**
  * Authenticated encryption, RFC 8439 ChaCha20-Poly1305 (12-byte nonce, 16-byte tag appended). Each side

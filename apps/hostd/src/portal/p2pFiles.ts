@@ -326,6 +326,39 @@ export class PortalFileTicketStore {
     });
     return true;
   }
+
+  async openDirectRead(opts: {
+    token: string;
+    relPath?: string;
+    start?: number;
+    end?: number;
+    chunkBytes?: number;
+  }): Promise<{
+    size: number;
+    mime: string;
+    start: number;
+    end: number;
+    stream: import("node:fs").ReadStream | null;
+  }> {
+    const asset = await this.resolveCapAsset(opts.token, opts.relPath ?? "");
+    if (asset.size === 0) {
+      if (opts.start && opts.start > 0) {
+        throw new FilesError("bad_request", "请求字节范围无效");
+      }
+      return { size: 0, mime: asset.mime, start: 0, end: -1, stream: null };
+    }
+    const start = opts.start !== undefined ? Math.floor(opts.start) : 0;
+    const end = opts.end !== undefined ? Math.min(asset.size - 1, Math.floor(opts.end)) : asset.size - 1;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start >= asset.size || end < start) {
+      throw new FilesError("bad_request", "请求字节范围无效");
+    }
+    const stream = createReadStream(asset.filePath, {
+      start,
+      end,
+      highWaterMark: opts.chunkBytes ?? 32 * 1024,
+    });
+    return { size: asset.size, mime: asset.mime, start, end, stream };
+  }
 }
 
 export async function readChunkForRpc(

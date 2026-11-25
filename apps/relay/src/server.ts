@@ -149,11 +149,13 @@ interface Join {
 
 interface StreamPending {
   caller: Conn;
+  callerId: string;
   target: string;
 }
 
 const MAX_BODY = 64 * 1024;
 const MAX_AGENTS = 2000;
+const MAX_VIEWER_CONNS_PER_DEVICE = 8;
 const PAIR_FAIL_LIMIT = 10;
 const PAIR_FAIL_WINDOW_MS = 10 * 60 * 1000;
 const JOIN_TTL_MS = 5 * 60 * 1000;
@@ -164,10 +166,13 @@ export class Relay {
   readonly store: Store;
   readonly http: Server;
   private wss: WebSocketServer;
-  private conns = new Map<string, Conn>();
+  private hostConns = new Map<string, Conn>();
+  private viewerConns = new Map<string, Set<Conn>>();
   private agents = new Map<string, Agent[]>();
   private pending = new Map<string, Pending>();
   private streams = new Map<string, StreamPending>();
+  private callerStreams = new Map<Conn, Map<string, string>>();
+  private streamSeq = 0;
   private seq = 0;
   private pairFails = new Map<string, { n: number; since: number }>();
   private joins = new Map<string, Join>();
@@ -300,7 +305,10 @@ export class Relay {
     this.notifyWss.close();
     for (const p of this.pending.values()) clearTimeout(p.timer);
     this.streams.clear();
-    for (const c of this.conns.values()) c.ws.terminate();
+    this.callerStreams.clear();
+    for (const c of this.allConns()) c.ws.terminate();
+    this.hostConns.clear();
+    this.viewerConns.clear();
     this.wss.close();
     await new Promise<void>((r) => this.http.close(() => r()));
     this.releases.close();
@@ -467,7 +475,7 @@ export class Relay {
         version: VERSION,
         protocol: PROTOCOL_VERSION,
         devices: this.store.listDevices().length,
-        online: this.conns.size,
+        online: this.onlineDeviceCount(),
         // Which services are configured (names only, never keys or addresses).
         assistant: [...new Set(this.eff.targets.map((t) => t.provider))],
         voice: this.eff.live ? (this.eff.live.provider ?? "moss-live") : null,
@@ -1141,7 +1149,7 @@ export class Relay {
   /** The relay's own call to a computer (used by the assistant). */
   callHost<M extends RpcMethod>(to: string, method: M, params: RpcParams<M>, timeoutMs?: number): Promise<RpcResult<M>> {
     return new Promise((resolve, reject) => {
-      const target = this.conns.get(to);
+      const target = this.hostConns.get(to);
       if (!target || target.device.kind !== "host") {
         this.rpcEvent({ method, from: "relay", target: to, params, t0: Date.now() }, { code: "offline", message: "这台电脑现在不在线" });
         reject(new HostCallError({ code: "offline", message: "这台电脑现在不在线" }));
@@ -1312,21 +1320,53 @@ export class Relay {
     };
   }
 
-  private toViewers(frame: ServerFrame): void {
-    const data = JSON.stringify(frame);
-    for (const c of this.conns.values()) {
-      if (c.device.kind === "viewer" && c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
+  private *allConns(): IterableIterator<Conn> {
+    for (const c of this.hostConns.values()) yield c;
+    for (const set of this.viewerConns.values()) {
+      for (const c of set) yield c;
     }
   }
 
-  /** Deletes a device, drops its live connection and tells everyone. */
+  private onlineDeviceCount(): number {
+    return this.hostConns.size + this.viewerConns.size;
+  }
+
+  private latestViewerConn(deviceId: string): Conn | undefined {
+    const set = this.viewerConns.get(deviceId);
+    if (!set || set.size === 0) return undefined;
+    let last: Conn | undefined;
+    for (const c of set) last = c;
+    return last;
+  }
+
+  private toViewers(frame: ServerFrame): void {
+    const data = JSON.stringify(frame);
+    for (const set of this.viewerConns.values()) {
+      for (const c of set) {
+        if (c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
+      }
+    }
+  }
+
+  /** Deletes a device, drops its live connection(s) and tells everyone. */
   private removeDevice(id: string, why: string): boolean {
     if (!this.store.deleteDevice(id)) return false;
     this.log(`removed ${id}: ${why}`);
-    const c = this.conns.get(id);
-    if (c) {
-      this.conns.delete(id);
-      c.ws.close(4001, "revoked");
+    const hc = this.hostConns.get(id);
+    if (hc) {
+      this.hostConns.delete(id);
+      this.failPendingForHost(id);
+      this.endStreams(hc);
+      hc.ws.close(4001, "revoked");
+    }
+    const vcSet = this.viewerConns.get(id);
+    if (vcSet) {
+      this.viewerConns.delete(id);
+      for (const vc of vcSet) {
+        this.failPendingForCaller(vc);
+        this.endStreams(vc);
+        vc.ws.close(4001, "revoked");
+      }
     }
     this.agents.delete(id);
     this.broadcast({ type: "device_removed", seq: ++this.seq, id });
@@ -1476,18 +1516,42 @@ export class Relay {
   }
 
   private onConnection(ws: WebSocket, device: Device): void {
-    const prev = this.conns.get(device.id);
-    if (prev) {
-      // A newer connection of the same device wins.
-      this.conns.delete(device.id);
-      prev.ws.close(4000, "replaced");
-      // Before this connection's frames: a phone subscribes again right away, often with the same ids.
-      this.endStreams(prev);
+    const conn: Conn = { ws, device: { ...device }, alive: true };
+    let announceOnline = true;
+    if (device.kind === "host") {
+      const prev = this.hostConns.get(device.id);
+      if (prev) {
+        // A newer connection of the same host wins.
+        this.hostConns.delete(device.id);
+        prev.ws.close(4000, "replaced");
+        // Before this connection's frames: end any streams bound to the previous host socket.
+        this.endStreams(prev);
+      }
+      this.hostConns.set(device.id, conn);
+      this.store.touch(device.id);
+      this.events.record({ kind: "device", msg: `online ${device.kind} "${device.name}"`, device: device.id });
+    } else {
+      let set = this.viewerConns.get(device.id);
+      if (!set) {
+        set = new Set();
+        this.viewerConns.set(device.id, set);
+      }
+      const wasOnline = set.size > 0;
+      announceOnline = !wasOnline;
+      while (set.size >= MAX_VIEWER_CONNS_PER_DEVICE) {
+        const oldest = set.values().next().value;
+        if (!oldest) break;
+        set.delete(oldest);
+        this.failPendingForCaller(oldest);
+        this.endStreams(oldest);
+        oldest.ws.close(4000, "replaced");
+      }
+      set.add(conn);
+      this.store.touch(device.id);
+      if (!wasOnline) {
+        this.events.record({ kind: "device", msg: `online ${device.kind} "${device.name}"`, device: device.id });
+      }
     }
-    const conn: Conn = { ws, device, alive: true };
-    this.conns.set(device.id, conn);
-    this.store.touch(device.id);
-    this.events.record({ kind: "device", msg: `online ${device.kind} "${device.name}"`, device: device.id });
 
     ws.on("pong", () => (conn.alive = true));
     ws.on("message", (data, isBinary) => {
@@ -1503,23 +1567,40 @@ export class Relay {
       this.onFrame(conn, frame);
     });
     ws.on("close", () => {
-      if (this.closing || this.conns.get(device.id) !== conn) return; // shutting down, or replaced
-      this.conns.delete(device.id);
-      this.store.touch(device.id);
-      this.failPendingFor(device.id);
-      this.endStreams(conn);
-      this.events.record({ kind: "device", msg: `offline ${device.kind} "${device.name}"`, device: device.id });
-      if (this.agents.delete(device.id)) {
-        this.broadcast({ type: "agents", seq: ++this.seq, deviceId: device.id, agents: [] });
+      if (this.closing) return;
+      if (device.kind === "host") {
+        if (this.hostConns.get(device.id) !== conn) return; // replaced
+        this.hostConns.delete(device.id);
+        this.store.touch(device.id);
+        this.failPendingForHost(device.id);
+        this.endStreams(conn);
+        this.events.record({ kind: "device", msg: `offline ${device.kind} "${device.name}"`, device: device.id });
+        if (this.agents.delete(device.id)) {
+          this.broadcast({ type: "agents", seq: ++this.seq, deviceId: device.id, agents: [] });
+        }
+        const d = this.store.getDevice(device.id);
+        if (d) this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(d) });
+        return;
       }
-      const d = this.store.getDevice(device.id);
-      if (d) this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(d) });
+      const curSet = this.viewerConns.get(device.id);
+      if (!curSet?.delete(conn)) return; // already removed or replaced
+      this.store.touch(device.id);
+      this.failPendingForCaller(conn);
+      this.endStreams(conn);
+      if (curSet.size === 0) {
+        this.viewerConns.delete(device.id);
+        this.events.record({ kind: "device", msg: `offline ${device.kind} "${device.name}"`, device: device.id });
+        const d = this.store.getDevice(device.id);
+        if (d) this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(d) });
+      }
     });
     ws.on("error", () => {});
 
-    this.send(conn, { type: "welcome", version: PROTOCOL_VERSION, device: this.decorate(device), seq: this.seq });
+    this.send(conn, { type: "welcome", version: PROTOCOL_VERSION, device: this.decorate(conn.device), seq: this.seq });
     this.send(conn, { type: "snapshot", seq: this.seq, devices: this.devices(), agents: this.allAgents() });
-    this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(device) }, device.id);
+    if (announceOnline) {
+      this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(conn.device) }, device.id);
+    }
   }
 
   private onFrame(conn: Conn, frame: ClientFrame): void {
@@ -1564,13 +1645,22 @@ export class Relay {
       case "stream_open": {
         const s = this.streams.get(frame.id);
         if (!s || s.target !== conn.device.id) return;
-        this.send(s.caller, frame);
-        if (frame.error) this.streams.delete(frame.id);
+        this.send(s.caller, { ...frame, id: s.callerId });
+        if (frame.error) {
+          this.streams.delete(frame.id);
+          const byCaller = this.callerStreams.get(s.caller);
+          if (byCaller?.get(s.callerId) === frame.id) {
+            byCaller.delete(s.callerId);
+            if (byCaller.size === 0) this.callerStreams.delete(s.caller);
+          }
+        }
         return;
       }
       case "stream_event": {
         const s = this.streams.get(frame.id);
-        if (s?.target === conn.device.id) this.send(s.caller, frame);
+        if (s?.target === conn.device.id) {
+          this.send(s.caller, { ...frame, id: s.callerId });
+        }
         return;
       }
       case "rpc_result": {
@@ -1609,7 +1699,11 @@ export class Relay {
       fail({ code: "bad_request", message: "stream_subscribe 需要 id、to、stream" });
       return;
     }
-    const target = this.conns.get(frame.to);
+    if (this.viewerConns.has(frame.to)) {
+      fail({ code: "forbidden", message: "只能订阅电脑端的流" });
+      return;
+    }
+    const target = this.hostConns.get(frame.to);
     if (!target) {
       fail({ code: "offline", message: "这台电脑现在不在线" });
       return;
@@ -1618,39 +1712,62 @@ export class Relay {
       fail({ code: "forbidden", message: "只能订阅电脑端的流" });
       return;
     }
-    if (this.streams.has(frame.id)) {
+    let byCaller = this.callerStreams.get(caller);
+    if (byCaller?.has(frame.id)) {
       fail({ code: "bad_request", message: "重复的流 id" });
       return;
     }
-    this.streams.set(frame.id, { caller, target: frame.to });
-    this.send(target, { type: "stream_subscribe", id: frame.id, from: caller.device.id, stream: frame.stream, params: frame.params });
+    if (!byCaller) {
+      byCaller = new Map();
+      this.callerStreams.set(caller, byCaller);
+    }
+    const relayId = !this.streams.has(frame.id) ? frame.id : `vs${++this.streamSeq}:${frame.id}`;
+    this.streams.set(relayId, { caller, callerId: frame.id, target: frame.to });
+    byCaller.set(frame.id, relayId);
+    this.send(target, { type: "stream_subscribe", id: relayId, from: caller.device.id, stream: frame.stream, params: frame.params });
   }
 
   /**
-   * A connection is gone. Its hosts stop streaming to it (else they keep a
-   * screen watch running for nobody, and refuse the same stream id when the
-   * phone comes back); its viewers learn the stream ended, so they subscribe
-   * again once the computer is back (older apps fall back to polling).
+   * A connection is gone. End any streams it subscribed to (and notify target hosts),
+   * and if it is a host connection, notify callers waiting on streams to that host.
    */
   private endStreams(conn: Conn): void {
-    for (const [id, s] of this.streams) {
-      if (s.caller === conn) {
-        this.streams.delete(id);
-        const target = this.conns.get(s.target);
-        if (target) this.send(target, { type: "stream_unsubscribe", id, from: conn.device.id });
-      } else if (s.target === conn.device.id) {
-        this.streams.delete(id);
-        this.send(s.caller, { type: "stream_open", id, error: { code: "offline", message: "这台电脑断开了" } });
+    const byCaller = this.callerStreams.get(conn);
+    if (byCaller) {
+      for (const relayId of byCaller.values()) {
+        const s = this.streams.get(relayId);
+        if (!s) continue;
+        this.streams.delete(relayId);
+        const target = this.hostConns.get(s.target);
+        if (target) this.send(target, { type: "stream_unsubscribe", id: relayId, from: conn.device.id });
+      }
+      this.callerStreams.delete(conn);
+    }
+    if (conn.device.kind !== "host") return;
+    for (const [relayId, s] of this.streams) {
+      if (s.target === conn.device.id) {
+        this.streams.delete(relayId);
+        const callerMap = this.callerStreams.get(s.caller);
+        if (callerMap?.get(s.callerId) === relayId) {
+          callerMap.delete(s.callerId);
+          if (callerMap.size === 0) this.callerStreams.delete(s.caller);
+        }
+        this.send(s.caller, { type: "stream_open", id: s.callerId, error: { code: "offline", message: "这台电脑断开了" } });
       }
     }
   }
 
   private routeStreamUnsubscribe(caller: Conn, frame: Extract<ClientFrame, { type: "stream_unsubscribe" }>): void {
-    const s = this.streams.get(frame.id);
+    const byCaller = this.callerStreams.get(caller);
+    const relayId = byCaller?.get(frame.id);
+    if (!relayId) return;
+    byCaller!.delete(frame.id);
+    if (byCaller!.size === 0) this.callerStreams.delete(caller);
+    const s = this.streams.get(relayId);
     if (!s || s.caller !== caller) return;
-    this.streams.delete(frame.id);
-    const target = this.conns.get(s.target);
-    if (target) this.send(target, { type: "stream_unsubscribe", id: frame.id, from: caller.device.id });
+    this.streams.delete(relayId);
+    const target = this.hostConns.get(s.target);
+    if (target) this.send(target, { type: "stream_unsubscribe", id: relayId, from: caller.device.id });
   }
 
   private routeRpc(caller: Conn, frame: Extract<ClientFrame, { type: "rpc" }>): void {
@@ -1663,7 +1780,11 @@ export class Relay {
       fail({ code: "bad_request", message: "cannot call yourself through the relay" });
       return;
     }
-    const target = this.conns.get(frame.to);
+    if (this.viewerConns.has(frame.to)) {
+      fail({ code: "forbidden", message: "只能调用电脑端（host）" });
+      return;
+    }
+    const target = this.hostConns.get(frame.to);
     if (!target) {
       this.rpcEvent({ method: frame.method, from: caller.device.id, target: frame.to, params: frame.params, t0: Date.now() }, { code: "offline", message: "这台电脑现在不在线" });
       fail({ code: "offline", message: "这台电脑现在不在线" });
@@ -1684,7 +1805,7 @@ export class Relay {
     this.send(target, { type: "rpc", id, from: caller.device.id, method: frame.method, params: frame.params });
   }
 
-  private failPendingFor(deviceId: string): void {
+  private failPendingForHost(deviceId: string): void {
     for (const [id, p] of this.pending) {
       if (p.target === deviceId) {
         clearTimeout(p.timer);
@@ -1693,7 +1814,13 @@ export class Relay {
         this.rpcEvent(p, error);
         if ("resolve" in p.caller) p.caller.reject(new HostCallError(error));
         else this.send(p.caller, { type: "rpc_result", id: p.callerId, error });
-      } else if (!("resolve" in p.caller) && p.caller.device.id === deviceId) {
+      }
+    }
+  }
+
+  private failPendingForCaller(caller: Conn): void {
+    for (const [id, p] of this.pending) {
+      if (!("resolve" in p.caller) && p.caller === caller) {
         clearTimeout(p.timer);
         this.pending.delete(id);
       }
@@ -1701,7 +1828,7 @@ export class Relay {
   }
 
   private sweep(): void {
-    for (const c of this.conns.values()) {
+    for (const c of this.allConns()) {
       if (!c.alive) {
         c.ws.terminate();
         continue;
@@ -1723,7 +1850,7 @@ export class Relay {
   // -------------------------------------------------------------------------
 
   private decorate(d: Device): Device {
-    const live = this.conns.get(d.id);
+    const live = d.kind === "host" ? this.hostConns.get(d.id) : this.latestViewerConn(d.id);
     return {
       ...d,
       online: !!live,
@@ -1748,7 +1875,7 @@ export class Relay {
 
   private broadcast(frame: ServerFrame, exceptId?: string): void {
     const data = JSON.stringify(frame);
-    for (const c of this.conns.values()) {
+    for (const c of this.allConns()) {
       if (c.device.id !== exceptId && c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
     }
   }

@@ -2293,9 +2293,67 @@ fn ensure_tunnel_listener(
     Ok(local_port)
 }
 
+fn probe_direct_http_host(
+    sa: &std::net::SocketAddr,
+    expected_host_id: Option<&str>,
+) -> Result<(), String> {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut probe =
+        TcpStream::connect_timeout(sa, Duration::from_millis(1800)).map_err(|e| format!("{sa}: {e}"))?;
+    let _ = probe.set_nodelay(true);
+    let _ = probe.set_read_timeout(Some(Duration::from_millis(1200)));
+    let _ = probe.set_write_timeout(Some(Duration::from_millis(1200)));
+    probe
+        .write_all(b"GET /v1/direct-ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .map_err(|e| format!("{sa} probe write: {e}"))?;
+
+    let mut buf = [0u8; 512];
+    let mut len = 0usize;
+    loop {
+        match probe.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                len += n;
+                if len == buf.len() || buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => break,
+            Err(e) => return Err(format!("{sa} probe read: {e}")),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf[..len]);
+    if !text.starts_with("HTTP/1.") {
+        return Err(format!("{sa}: not a direct HTTP responder"));
+    }
+    if let Some(want) = expected_host_id.map(str::trim).filter(|s| !s.is_empty()) {
+        for line in text.lines().skip(1) {
+            let trimmed = line.trim_end_matches('\r');
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("x-pocket-host") {
+                    let got = v.trim();
+                    if got != want {
+                        return Err(format!("{sa}: host mismatch (expected {want}, got {got})"));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn open_direct_tunnel_blocking(
     addrs: Vec<String>,
     port: u16,
+    expected_host_id: Option<String>,
 ) -> Result<DirectTunnelInfo, String> {
     use std::net::{IpAddr, SocketAddr, TcpStream};
     use std::sync::mpsc;
@@ -2323,21 +2381,24 @@ pub fn open_direct_tunnel_blocking(
     let total = ips.len();
     for ip in ips {
         let tx_i = tx.clone();
+        let want_host = expected_host_id.clone();
         std::thread::spawn(move || {
             let sa = SocketAddr::new(ip, port);
-            let res = TcpStream::connect_timeout(&sa, Duration::from_millis(2200))
-                .map(|s| {
-                    let _ = s.set_nodelay(true);
-                    (ip, s)
-                })
-                .map_err(|e| format!("{ip}: {e}"));
+            let res = probe_direct_http_host(&sa, want_host.as_deref()).and_then(|()| {
+                TcpStream::connect_timeout(&sa, Duration::from_millis(1500))
+                    .map(|s| {
+                        let _ = s.set_nodelay(true);
+                        (ip, s)
+                    })
+                    .map_err(|e| format!("{ip}: {e}"))
+            });
             let _ = tx_i.send(res);
         });
     }
     drop(tx);
 
-    let deadline = Instant::now() + Duration::from_millis(2400);
-    let mut last_err = String::from("direct TCP race timed out");
+    let deadline = Instant::now() + Duration::from_millis(3200);
+    let mut last_err = String::from("direct HTTP probe timed out");
     for _ in 0..total {
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
@@ -2364,10 +2425,11 @@ pub fn open_direct_tunnel_blocking(
 pub async fn open_direct_tunnel(
     addrs: Vec<String>,
     port: u16,
+    expected_host_id: Option<String>,
 ) -> Result<DirectTunnelInfo, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(open_direct_tunnel_blocking(addrs, port));
+        let _ = tx.send(open_direct_tunnel_blocking(addrs, port, expected_host_id));
     });
     rx.await
         .map_err(|_| "direct tunnel worker aborted".to_string())?
@@ -2625,32 +2687,66 @@ mod tests {
     }
 
     #[test]
-    fn open_direct_tunnel_blocking_races_and_bridges_multiple_streams() {
+    fn open_direct_tunnel_blocking_verifies_http_probe_ignores_silent_syn_and_bridges_streams() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        let echo_srv = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = echo_srv.local_addr().unwrap().port();
+        // Bind a silent TCP acceptor on IPv6 loopback (simulates TUN fake SYN-ACK that accepts TCP and never speaks HTTP).
+        let silent_v6 = TcpListener::bind("[::1]:0").ok();
+        let port = if let Some(ref s6) = silent_v6 {
+            s6.local_addr().unwrap().port()
+        } else {
+            0
+        };
+        let real_srv = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let port = real_srv.local_addr().unwrap().port();
+
+        if let Some(s6) = silent_v6 {
+            std::thread::spawn(move || {
+                for conn in s6.incoming().take(4) {
+                    if let Ok(sock) = conn {
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(2000));
+                            drop(sock);
+                        });
+                    }
+                }
+            });
+        }
+
         std::thread::spawn(move || {
-            for conn in echo_srv.incoming().take(2) {
+            for conn in real_srv.incoming().take(4) {
                 if let Ok(mut sock) = conn {
                     std::thread::spawn(move || {
-                        let mut buf = [0u8; 32];
+                        let mut buf = [0u8; 256];
                         if let Ok(n) = sock.read(&mut buf) {
-                            let _ = sock.write_all(&buf[..n]);
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            if req.starts_with("GET /v1/direct-ping") {
+                                let _ = sock.write_all(
+                                    b"HTTP/1.1 200 OK\r\nX-Pocket-Host: host-expected\r\nContent-Length: 2\r\n\r\nok",
+                                );
+                            } else {
+                                let _ = sock.write_all(&buf[..n]);
+                            }
                         }
                     });
                 }
             }
         });
 
-        let dead_srv = TcpListener::bind("127.0.0.1:0").unwrap();
-        let _dead_port = dead_srv.local_addr().unwrap().port();
-        drop(dead_srv);
-
-        let info = open_direct_tunnel_blocking(
+        // Wrong expected host ID must be rejected cleanly.
+        assert!(open_direct_tunnel_blocking(
             vec!["127.0.0.1".to_string()],
             port,
+            Some("other-host".to_string()),
+        )
+        .is_err());
+
+        // Matching host ID must beat silent [::1] SYN acceptor and bridge streams.
+        let info = open_direct_tunnel_blocking(
+            vec!["::1".to_string(), "127.0.0.1".to_string()],
+            port,
+            Some("host-expected".to_string()),
         )
         .unwrap();
         assert_eq!(info.remote_addr, "127.0.0.1");

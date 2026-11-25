@@ -30,6 +30,7 @@ import type { ScreenLines } from "./hcscreen.ts";
 import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, findPrograms, herdrCommandArgs, installedLaunchers, isHerdrWindowClosedError, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
 import { HerdrAdapter } from "./herdr.ts";
 import { DirectServer, directAddrs, type DirectPeer } from "./direct.ts";
+import { WebRtcDirectServer } from "./webrtc.ts";
 import { PortalManager } from "./portal/index.ts";
 import { ToolUpdateManager } from "./toolUpdate.ts";
 import { UnifloAdapter, harnessId } from "./uniflo.ts";
@@ -167,6 +168,7 @@ export class Host {
   private streamReply = new Map<string, (f: ClientFrame) => void>();
   /** Phones connected straight to this computer (see direct.ts). */
   direct: DirectServer;
+  webrtc: WebRtcDirectServer;
   portal: PortalManager;
   chunkedPut: ChunkedPutManager;
   toolUpdater: ToolUpdateManager;
@@ -322,6 +324,18 @@ export class Host {
         (await this.chunkedPut.handleHttpRequest(req, res)) ||
         (await this.portal.tickets.handleHttpRequest(req, res)),
       log: (m) => this.log(m),
+    });
+    this.webrtc = new WebRtcDirectServer({
+      hostId: () => this.deviceId,
+      onOpen: (peer) => this.note("info", "direct", `webrtc peer open ${this.who(peer.deviceId)} (${peer.tag})`),
+      onFrame: (peer, f) => this.onDirectFrame(peer, f),
+      onClose: (peer) => {
+        this.note("info", "direct", `webrtc peer closed ${this.who(peer.deviceId)} (${peer.tag})`);
+        this.stopStreams((id) => id.startsWith(peer.tag));
+      },
+      chunkedPut: this.chunkedPut,
+      portalTickets: this.portal.tickets,
+      log: (level, kind, msg, data) => this.note(level, kind, msg, data),
     });
   }
 
@@ -539,6 +553,7 @@ export class Host {
     this.portal.stop();
     this.chunkedPut.dispose();
     this.direct.stop();
+    this.webrtc.stop();
     for (const stop of this.streamStops.values()) stop();
     this.streamStops.clear();
     this.streamMeta.clear();
@@ -1585,6 +1600,12 @@ export class Host {
     "direct.offer": async (_p, from) => {
       if (!this.direct.port) throw new RpcFailure("unsupported", "这台电脑没有开直连");
       return this.direct.offer(from);
+    },
+    "webrtc.offer": async (p, from) => {
+      if (this.opts.config.direct === false || process.env.HERDR_POCKET_DIRECT === "0") {
+        throw new RpcFailure("unsupported", "这台电脑没有开直连");
+      }
+      return await this.webrtc.acceptOffer(from, p);
     },
     "session.children": async (p) => {
       const key = await this.sessionOf(p.agent, p.sub);

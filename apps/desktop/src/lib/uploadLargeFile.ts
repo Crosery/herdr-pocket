@@ -1,6 +1,7 @@
 import { DIRECT_PUT_PREFIX } from "@herdr-pocket/protocol";
+import { isHttpsOrigin, type DirectLink } from "./direct";
 import { logger } from "./log";
-import { ensureDirectLinkNow, getDirectEndpoint, rpcCall } from "./relay";
+import { ensureDirectLinkNow, getDirectEndpoint, getDirectLink, isDirectConnected, rpcCall } from "./relay";
 
 function bytesToBase64(bytes: Uint8Array): string {
   const chunk = 0x8000;
@@ -37,24 +38,24 @@ function postRawDirectPut(
   });
 }
 
-async function waitDirectEndpoint(deviceId: string, waitMs: number): Promise<{ addr: string; port: number } | null> {
-  const immediate = getDirectEndpoint(deviceId);
-  if (immediate) return immediate;
+async function waitDirectLink(deviceId: string, waitMs: number): Promise<DirectLink | null> {
+  const immediate = getDirectLink(deviceId);
+  if (immediate?.open) return immediate;
   ensureDirectLinkNow(deviceId);
   const deadline = Date.now() + waitMs;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 80));
-    const hit = getDirectEndpoint(deviceId);
-    if (hit) return hit;
+    const hit = getDirectLink(deviceId);
+    if (hit?.open) return hit;
   }
   return null;
 }
 
 /**
- * Uploads a large non-image file (`> 5 MB`) onto a remote computer using direct P2P HTTP
- * (`POST /v1/direct-put/<token>` via native TCP tunnel when available) or sequential
- * 2 MB `terminal.putChunk` RPC slices over the relay, without materializing the full file
- * in JS memory.
+ * Uploads a non-image or large file onto a remote computer using:
+ * 1. Direct WebRTC binary DataChannel (`hp-put`, works across NAT and HTTPS H5);
+ * 2. Direct P2P HTTP (`POST /v1/direct-put/<token>` via native tunnel or LAN);
+ * 3. Sequential `terminal.putChunk` RPC fallback (routed over DirectLink if connected, else Relay).
  */
 export async function uploadRemoteFile(
   deviceId: string,
@@ -80,18 +81,32 @@ export async function uploadRemoteFile(
   );
 
   let uploadedDirect = false;
+  let transport: "webrtc" | "http-p2p" | "direct-rpc" | "relay" = "relay";
   try {
     if (begin.directToken) {
-      const ep = await waitDirectEndpoint(deviceId, 450);
-      if (ep) {
-        const host = ep.addr.includes(":") ? `[${ep.addr}]` : ep.addr;
-        const url = `http://${host}:${ep.port}${DIRECT_PUT_PREFIX}/${encodeURIComponent(begin.directToken)}`;
-        onProgress?.(0, true);
-        uploadedDirect = await postRawDirectPut(url, file, (pct) => onProgress?.(pct, true));
+      const link = await waitDirectLink(deviceId, 1200);
+      if (link?.open) {
+        if (link.transportKind === "webrtc") {
+          onProgress?.(0, true);
+          uploadedDirect = await link.putFile(begin.directToken, file, (pct) => onProgress?.(pct, true));
+          if (uploadedDirect) transport = "webrtc";
+        }
+        if (!uploadedDirect) {
+          const ep = getDirectEndpoint(deviceId);
+          const isLoopback = ep ? ep.addr === "127.0.0.1" || ep.addr === "localhost" || ep.addr === "::1" : false;
+          if (ep && ep.port > 0 && (!isHttpsOrigin() || isLoopback)) {
+            const host = ep.addr.includes(":") ? `[${ep.addr}]` : ep.addr;
+            const url = `http://${host}:${ep.port}${DIRECT_PUT_PREFIX}/${encodeURIComponent(begin.directToken)}`;
+            onProgress?.(0, true);
+            uploadedDirect = await postRawDirectPut(url, file, (pct) => onProgress?.(pct, true));
+            if (uploadedDirect) transport = "http-p2p";
+          }
+        }
       }
     }
 
     if (!uploadedDirect) {
+      if (isDirectConnected(deviceId)) transport = "direct-rpc";
       const chunkBytes = Math.max(256 * 1024, begin.chunkBytes || 2 * 1024 * 1024);
       const total = Math.max(1, file.size);
       for (let offset = 0, index = 0; offset < file.size; offset += chunkBytes, index += 1) {
@@ -107,21 +122,27 @@ export async function uploadRemoteFile(
           },
           60_000,
         );
-        onProgress?.(Math.min(99, Math.round((Math.min(file.size, offset + buf.byteLength) / total) * 100)), false);
+        onProgress?.(
+          Math.min(99, Math.round((Math.min(file.size, offset + buf.byteLength) / total) * 100)),
+          isDirectConnected(deviceId),
+        );
       }
     }
 
     const fin = await rpcCall(deviceId, "terminal.putFinish", { uploadId: begin.uploadId }, 60_000);
-    onProgress?.(100, uploadedDirect);
+    const viaDirect = uploadedDirect || isDirectConnected(deviceId);
+    onProgress?.(100, viaDirect);
     logger.info("files", "files.upload.done", {
-      viaDirect: uploadedDirect,
+      viaDirect,
+      transport,
       bytes: file.size,
       ms: Date.now() - startedAt,
     });
     return fin.path;
   } catch (err) {
     logger.error("files", `files.upload.error: ${(err as Error)?.message ?? String(err)}`, {
-      viaDirect: uploadedDirect,
+      viaDirect: uploadedDirect || isDirectConnected(deviceId),
+      transport,
       bytes: file.size,
       ms: Date.now() - startedAt,
     });

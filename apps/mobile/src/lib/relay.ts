@@ -169,6 +169,7 @@ class SocketLink implements Link {
       if (s !== "active") {
         // Timers stop in the background; a pong check started now would only misfire on return.
         this.clearPongWait();
+        for (const d of this.direct.values()) d.clearPongWait();
         return;
       }
       // Back in front: the phone may be on another network now. Check the direct links and try again at once.
@@ -462,7 +463,7 @@ class SocketLink implements Link {
 
   call(to: string, method: RpcMethod, params: unknown, timeoutMs: number): Promise<unknown> {
     const link = this.direct.get(to);
-    if (!link?.open || method === "direct.offer") return this.relayCall(to, method, params, timeoutMs);
+    if (!link?.open || method === "direct.offer" || method === "webrtc.offer") return this.relayCall(to, method, params, timeoutMs);
     return link.call(method, params, timeoutMs).catch((e: unknown) => {
       if (!(e instanceof DirectError)) throw e;
       // The link died under a read: ask the relay instead. Anything that changes something is not sent twice.

@@ -39,9 +39,10 @@ export function fromBase64(s: string): Uint8Array {
 
 /** How long one address may take to open and greet. */
 const DIAL_MS = 2500;
-/** Pings keep a link honest: one unanswered for this long closes it, and the relay takes over. */
-const PING_EVERY_MS = 10_000;
-const PONG_WAIT_MS = 4000;
+/** Pings keep a link honest: 2 missed checks over ~40s drop it cleanly without background-wake false drops. */
+const PING_EVERY_MS = 25_000;
+const PONG_WAIT_MS = 20_000;
+const MISSED_PONG_LIMIT = 2;
 
 export class DirectError extends Error {
   code: RpcError["code"];
@@ -72,6 +73,8 @@ export class DirectLink {
   private seq = 0;
   private pingTimer: ReturnType<typeof setInterval>;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastRxAt = Date.now();
+  private missedPongs = 0;
   private closed = false;
 
   private constructor(to: string, addr: string, port: number, ws: WebSocket, cipher: DirectCipher, handlers: DirectHandlers) {
@@ -167,6 +170,12 @@ export class DirectLink {
   }
 
   private onFrame(f: Frame) {
+    this.lastRxAt = Date.now();
+    this.missedPongs = 0;
+    if (this.pongTimer) {
+      clearTimeout(this.pongTimer);
+      this.pongTimer = null;
+    }
     if (f.type === "rpc_result" && f.id) {
       const p = this.pending.get(f.id);
       if (!p) return;
@@ -175,14 +184,34 @@ export class DirectLink {
       if (f.error) p.reject(new DirectError(f.error.code, f.error.message));
       else p.resolve(f.result);
     } else if (f.type === "pong") {
-      if (this.pongTimer) clearTimeout(this.pongTimer);
-      this.pongTimer = null;
+      // Pong wait already cleared above.
     } else if (f.type === "stream_open" || f.type === "stream_event") this.handlers.onStream(f);
+  }
+
+  clearPongWait() {
+    if (this.pongTimer) {
+      clearTimeout(this.pongTimer);
+      this.pongTimer = null;
+    }
+    this.missedPongs = 0;
   }
 
   ping() {
     if (!this.send({ type: "ping", t: Date.now() }) || this.pongTimer) return;
-    this.pongTimer = setTimeout(() => this.close(), PONG_WAIT_MS);
+    this.pongTimer = setTimeout(() => {
+      this.pongTimer = null;
+      if (this.closed) return;
+      if (Date.now() - this.lastRxAt < PONG_WAIT_MS) {
+        this.missedPongs = 0;
+        return;
+      }
+      this.missedPongs += 1;
+      if (this.missedPongs < MISSED_PONG_LIMIT) {
+        this.ping();
+        return;
+      }
+      this.close();
+    }, PONG_WAIT_MS);
   }
 
   call(method: RpcMethod, params: unknown, timeoutMs: number): Promise<unknown> {

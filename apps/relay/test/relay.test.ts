@@ -278,30 +278,50 @@ test("stream subscriptions stay between caller and target host", async () => {
   p.close();
 });
 
-test("a phone that reconnects gets its streams back; the host stops the old ones", async () => {
+test("viewer supports multiple concurrent tabs without kicking earlier sockets; host keeps single active socket", async () => {
   const host = await pair("host", "resub host");
   const phone = await pair("viewer", "resub phone");
-  const h = await Client.open(host.token);
+  const h1 = await Client.open(host.token);
   const p1 = await Client.open(phone.token);
-  await h.next("snapshot");
+  await h1.next("snapshot");
   await p1.next("snapshot");
+
+  // First viewer tab subscribes stream "r1".
   p1.send({ type: "stream_subscribe", id: "r1", to: host.device.id, stream: "terminal", params: { agent: "t1" } });
-  h.send({ type: "stream_open", id: (await h.next("stream_subscribe")).id, result: { kind: "terminal" } });
-  await p1.next("stream_open", (f) => f.id === "r1");
-  // A new socket of the same phone replaces the old one before its close is seen (mobile networks).
+  const sub1 = await h1.next("stream_subscribe");
+  h1.send({ type: "stream_open", id: sub1.id, result: { kind: "terminal" } });
+  assert.equal((await p1.next("stream_open", (f) => f.id === "r1")).error, undefined);
+
+  // Second viewer tab with the same device token opens concurrently WITHOUT closing p1 (4000 replaced),
+  // and may also use the same client-local stream id "r1".
   const p2 = await Client.open(phone.token);
   await p2.next("snapshot");
-  assert.equal((await h.next("stream_unsubscribe", (f) => f.id === "r1")).from, phone.device.id);
-  p2.send({ type: "stream_subscribe", id: "r1", to: host.device.id, stream: "terminal", params: { agent: "t1" } });
-  h.send({ type: "stream_open", id: (await h.next("stream_subscribe", (f) => f.id === "r1")).id, result: { kind: "terminal" } });
+  p2.send({ type: "stream_subscribe", id: "r1", to: host.device.id, stream: "terminal", params: { agent: "t2" } });
+  const sub2 = await h1.next("stream_subscribe");
+  assert.notEqual(sub2.id, sub1.id, "relay isolates colliding stream ids across viewer tabs");
+  h1.send({ type: "stream_open", id: sub2.id, result: { kind: "terminal" } });
   assert.equal((await p2.next("stream_open", (f) => f.id === "r1")).error, undefined);
-  h.send({ type: "stream_event", id: "r1", event: { kind: "terminal", screen: { text: "again" } } });
-  assert.deepEqual((await p2.next("stream_event", (f) => f.id === "r1")).event, { kind: "terminal", screen: { text: "again" } });
-  // The host going away ends the phone's stream, so it can subscribe again once it is back.
-  h.close();
-  assert.equal((await p2.next("stream_open", (f) => f.id === "r1" && !!f.error)).error?.code, "offline");
+
+  // Host events route accurately to each viewer tab using the tab's original stream id "r1".
+  h1.send({ type: "stream_event", id: sub1.id, event: { kind: "terminal", screen: { text: "tab1" } } });
+  h1.send({ type: "stream_event", id: sub2.id, event: { kind: "terminal", screen: { text: "tab2" } } });
+  assert.deepEqual((await p1.next("stream_event", (f) => f.id === "r1")).event, { kind: "terminal", screen: { text: "tab1" } });
+  assert.deepEqual((await p2.next("stream_event", (f) => f.id === "r1")).event, { kind: "terminal", screen: { text: "tab2" } });
+
+  // Closing p1 stops p1's stream on the host, while p2 stays connected and receiving events.
   p1.close();
+  const unsub = await h1.next("stream_unsubscribe", (f) => f.id === sub1.id);
+  assert.equal(unsub.from, phone.device.id);
+  h1.send({ type: "stream_event", id: sub2.id, event: { kind: "terminal", screen: { text: "still-live" } } });
+  assert.deepEqual((await p2.next("stream_event", (f) => f.id === "r1")).event, { kind: "terminal", screen: { text: "still-live" } });
+
+  // A new host connection still replaces the previous host socket and stops active streams.
+  const h2 = await Client.open(host.token);
+  await h2.next("snapshot");
+  assert.equal((await p2.next("stream_open", (f) => f.id === "r1" && !!f.error)).error?.code, "offline");
   p2.close();
+  h1.close();
+  h2.close();
 });
 
 test("host-to-host calls work (joint debugging)", async () => {

@@ -14,7 +14,8 @@ import {
   type StagedAttachment,
 } from "./dropPreview";
 import { logger } from "./log";
-import { rpcCall } from "./relay";
+import { native } from "./native";
+import { isDirectConnected, rpcCall } from "./relay";
 import { allAgents, createStore, liveStore } from "./store";
 import { uploadRemoteFile } from "./uploadLargeFile";
 import { registerWorkspaceSection, scheduleWorkspacePersist } from "./workspacePersist";
@@ -393,7 +394,16 @@ async function deliverOutgoing(send: OutgoingSend, delivery: DeliveryMode = "aut
     if (uploadedPaths?.length) {
       body = textWithFiles(send.text, uploadedPaths);
     } else if (send.attachments.length > 0) {
-      const toUpload = send.attachments.filter((s) => !s.hostRef && s.put);
+      const preferStream = (att: StagedAttachment) =>
+        Boolean(
+          !att.hostRef &&
+            att.file &&
+            (!att.put ||
+              (att.kind !== "image" &&
+                att.file.size > 512 * 1024 &&
+                (!native.available() || isDirectConnected(send.deviceId)))),
+        );
+      const toUpload = send.attachments.filter((s) => !s.hostRef && s.put && !preferStream(s));
       const uploaded = toUpload.length
         ? await rpcCall(
             send.deviceId,
@@ -407,7 +417,7 @@ async function deliverOutgoing(send: OutgoingSend, delivery: DeliveryMode = "aut
       for (const att of send.attachments) {
         if (att.hostRef) {
           paths.push(att.hostRef);
-        } else if (att.put) {
+        } else if (att.put && !preferStream(att)) {
           if (uploadIdx < uploaded.paths.length) {
             paths.push(uploaded.paths[uploadIdx++]!);
           }
@@ -417,7 +427,7 @@ async function deliverOutgoing(send: OutgoingSend, delivery: DeliveryMode = "aut
             send.agentKey,
             att.file,
             (pct, viaDirect) => {
-              const label = `正在上传 ${att.name} · ${pct}%${viaDirect ? " (直连)" : ""}`;
+              const label = `正在上传 ${att.name} · ${pct}%${viaDirect ? " (P2P直连)" : ""}`;
               updateOutgoing(send.agentKey, (list) =>
                 list.map((x) => (x.id === send.id ? { ...x, progressText: label } : x)),
               );

@@ -1338,6 +1338,9 @@ export const mockApi = {
     if (method === "terminal.putAbort") {
       return { ok: true };
     }
+    if (method === "webrtc.offer") {
+      throw new Error("演示模式不支持 WebRTC 直连");
+    }
     if (method === "terminal.send") {
       const textStr = String(params.text ?? "");
       const modelMatch = /^\/model\s+(\S+)/i.exec(textStr.trim());

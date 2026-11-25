@@ -16,8 +16,10 @@ import {
   type RpcResult,
   type ServerFrame,
   type StreamKind,
+  type WebRtcAnswerResult,
+  type WebRtcOfferParams,
 } from "@herdr-pocket/protocol";
-import { DirectError, DirectLink, SAFE_AGAIN } from "./direct";
+import { DirectError, DirectLink, SAFE_AGAIN, isHttpsOrigin } from "./direct";
 import { createIdentityProof } from "./h5Identity";
 import { localHostIdStore, refreshLocalHostIdFast } from "./fonts";
 import { liveStore, settingsStore, updateSettings } from "./store";
@@ -25,7 +27,7 @@ import { appVersion, clearSession, defaultDeviceName, detectPlatform, getLocalPa
 import { isMockServer, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
 import { logger, registerWebLogUploader } from "./log";
-import { onNativeEvent } from "./native";
+import { native, onNativeEvent } from "./native";
 import { recordClientRpcSample } from "./perfTelemetry";
 
 export class RelayError extends Error {
@@ -228,6 +230,7 @@ class SocketClient {
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   private welcomed = false;
+  private pausedHiddenReplace = false;
   private seenNoticeIds = new Set<string>();
   /** Last time anything arrived on the socket (frames and pongs alike). */
   private lastSeen = 0;
@@ -289,6 +292,7 @@ class SocketClient {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
+    this.pausedHiddenReplace = false;
     this.attempt += 1;
     this.connectStartedAt = Date.now();
     this.stuckSince = 0;
@@ -346,13 +350,24 @@ class SocketClient {
     const subs = [...this.subs.values()];
     const pending = [...this.pending.values()];
     this.pending.clear();
-    // The next try is booked before anyone else's code runs, so nothing can end the chain.
+    // The next try is booked before anyone else's code runs, so nothing can end the chain,
+    // except when a hidden background tab is intentionally paused after 4000 replaced.
     if (!this.closed && code !== 4001) {
-      const delay = retryNow ? 0 : this.backoff;
-      if (this.retryTimer) clearTimeout(this.retryTimer);
-      this.retryTimer = setTimeout(() => this.open(), delay);
-      if (!retryNow) this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);
-      logger.warn("relay", `${reason}; reconnect in ${delay} ms`);
+      if (code === 4000 && typeof document !== "undefined" && document.visibilityState === "hidden") {
+        if (this.retryTimer) {
+          clearTimeout(this.retryTimer);
+          this.retryTimer = null;
+        }
+        this.pausedHiddenReplace = true;
+        logger.info("relay", `${reason}; pausing reconnect while tab is hidden`);
+      } else {
+        this.pausedHiddenReplace = false;
+        const delay = retryNow ? 0 : this.backoff;
+        if (this.retryTimer) clearTimeout(this.retryTimer);
+        this.retryTimer = setTimeout(() => this.open(), delay);
+        if (!retryNow) this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);
+        logger.warn("relay", `${reason}; reconnect in ${delay} ms`);
+      }
       if (!this.welcomed) {
         void tokenStillValid(this.server, this.token).then((ok) => {
           if (!ok && !this.closed) {
@@ -393,6 +408,13 @@ class SocketClient {
     this.lastTick = now;
     const ws = this.ws;
     if (!ws) {
+      if (this.pausedHiddenReplace) {
+        if (typeof document === "undefined" || document.visibilityState === "visible") {
+          this.pausedHiddenReplace = false;
+          this.open();
+        }
+        return;
+      }
       if (!this.retryTimer && liveStore.get().link !== "unauthorized") {
         logger.warn("link", "watchdog: no socket and no retry booked");
         this.open();
@@ -433,6 +455,7 @@ class SocketClient {
     if (this.closed) return;
     const link = liveStore.get().link;
     if (link === "unauthorized") return;
+    this.pausedHiddenReplace = false;
     if (settingsStore.get().notifications && !this.notifyWs) this.openNotify();
     this.tryDirectAll(cause.includes("network") || cause.includes("wake"));
     const ws = this.ws;
@@ -757,8 +780,11 @@ class SocketClient {
       try {
         const localId = localHostIdStore.get() ?? (await refreshLocalHostIdFast());
         const preferLoopback = localId !== null && localId === to;
-        const offer = (await this.relayCall(to, "direct.offer", {}, 8_000)) as DirectOffer;
+        const skipDirectOffer = !preferLoopback && !native.available() && isHttpsOrigin();
+        const offer = skipDirectOffer ? null : ((await this.relayCall(to, "direct.offer", {}, 8_000)) as DirectOffer);
         if (this.closed) return;
+        const signalWebRtc = (webrtcOffer: WebRtcOfferParams) =>
+          this.relayCall(to, "webrtc.offer", webrtcOffer, 12_000) as Promise<WebRtcAnswerResult>;
         const link = await DirectLink.open(
           to,
           offer,
@@ -766,7 +792,7 @@ class SocketClient {
             onStream: (frame) => this.onFrame(frame),
             onClose: (l) => this.directGone(l),
           },
-          preferLoopback,
+          { preferLoopback, signalWebRtc },
         );
         if (this.closed) {
           link.close();
@@ -833,7 +859,7 @@ class SocketClient {
     const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
     const elapsed = () => (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
     const link = this.direct.get(to);
-    if (!link?.open || method === "direct.offer") {
+    if (!link?.open || method === "direct.offer" || method === "webrtc.offer") {
       try {
         const out = await this.relayCall(to, method, params, timeoutMs);
         recordClientRpcSample(method, elapsed(), false, true);
@@ -865,6 +891,11 @@ class SocketClient {
       recordClientRpcSample(method, elapsed(), true, false);
       throw new RelayError(err.code, err.message);
     }
+  }
+
+  directLink(to: string): DirectLink | null {
+    const link = this.direct.get(to);
+    return link?.open ? link : null;
   }
 
   directEndpoint(to: string): { addr: string; port: number } | null {
@@ -1013,6 +1044,14 @@ export async function rpcCall<M extends RpcMethod>(
   }
   if (!activeClient) throw new RelayError("offline", "还没连上服务器");
   return activeClient.call(to, method, params, timeoutMs) as Promise<RpcResult<M>>;
+}
+
+export function getDirectLink(to: string): DirectLink | null {
+  return activeClient?.directLink(to) ?? null;
+}
+
+export function isDirectConnected(to: string): boolean {
+  return Boolean(activeClient?.directLink(to));
 }
 
 export function getDirectEndpoint(to: string): { addr: string; port: number } | null {

@@ -205,6 +205,14 @@ interface ChunkUploadSession {
   lastAt: number;
 }
 
+export interface DirectUploadWriter {
+  name: string;
+  totalBytes: number;
+  write(chunk: Buffer | Uint8Array): Promise<void>;
+  finish(): Promise<number>;
+  abort(reason?: string): void;
+}
+
 const CHUNK_UPLOAD_IDLE_MS = 5 * 60_000;
 
 async function moveFileAcrossFs(src: string, dst: string): Promise<void> {
@@ -312,6 +320,73 @@ export class ChunkedPutManager {
     session.receivedBytes = Math.max(session.receivedBytes, offset + buf.length);
     session.lastAt = Date.now();
     return { receivedBytes: session.receivedBytes };
+  }
+
+  openDirectStream(token: string): DirectUploadWriter | null {
+    const session = token ? this.byToken.get(token) : undefined;
+    if (!session) return null;
+    const ws = createWriteStream(session.partPath, { flags: "w", mode: 0o600 });
+    let written = 0;
+    let settled = false;
+    let streamErr: Error | null = null;
+    ws.on("error", (err) => {
+      streamErr = err;
+    });
+
+    return {
+      name: session.name,
+      totalBytes: session.totalBytes,
+      write: async (chunk: Buffer | Uint8Array) => {
+        if (settled) throw streamErr ?? new Error("upload stream already closed");
+        if (streamErr) throw streamErr;
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        written += buf.byteLength;
+        session.lastAt = Date.now();
+        if (written > session.totalBytes + 4096 || written > LARGE_PUT_LIMITS.maxFileBytes) {
+          throw new Error("payload exceeds declared size");
+        }
+        if (ws.write(buf)) return;
+        await new Promise<void>((resolve, reject) => {
+          const onDrain = () => {
+            ws.off("error", onErr);
+            resolve();
+          };
+          const onErr = (err: Error) => {
+            ws.off("drain", onDrain);
+            reject(err);
+          };
+          ws.once("drain", onDrain);
+          ws.once("error", onErr);
+        });
+      },
+      finish: async () => {
+        if (settled) return written;
+        settled = true;
+        if (streamErr) throw streamErr;
+        await new Promise<void>((resolve, reject) => {
+          const onFinish = () => {
+            ws.off("error", onErr);
+            resolve();
+          };
+          const onErr = (err: Error) => {
+            ws.off("finish", onFinish);
+            reject(err);
+          };
+          ws.once("finish", onFinish);
+          ws.once("error", onErr);
+          ws.end();
+        });
+        session.receivedBytes = written;
+        session.lastAt = Date.now();
+        return written;
+      },
+      abort: (reason?: string) => {
+        if (settled) return;
+        settled = true;
+        streamErr = new Error(reason || "aborted");
+        ws.destroy();
+      },
+    };
   }
 
   async handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {

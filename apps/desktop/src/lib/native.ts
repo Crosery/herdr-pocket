@@ -991,8 +991,8 @@ export const native = {
     inTauri() ? invoke<void>("workspace_state_save", { raw }) : Promise.resolve(),
   queryOsModifiers: async (): Promise<OsModifierState> =>
     inTauri() ? invoke<OsModifierState>("query_os_modifiers").catch(() => UNSUPPORTED_OS_MODIFIERS) : UNSUPPORTED_OS_MODIFIERS,
-  openDirectTunnel: async (addrs: string[], port: number): Promise<DirectTunnelInfo | null> =>
-    inTauri() ? invoke<DirectTunnelInfo>("open_direct_tunnel", { addrs, port }).catch(() => null) : null,
+  openDirectTunnel: async (addrs: string[], port: number, expectedHostId?: string): Promise<DirectTunnelInfo | null> =>
+    inTauri() ? invoke<DirectTunnelInfo>("open_direct_tunnel", { addrs, port, expectedHostId }).catch(() => null) : null,
   queryTrafficLightMetrics: async (): Promise<TrafficLightMetrics> =>
     inTauri()
       ? invoke<TrafficLightMetrics>("query_traffic_light_metrics").catch(() => UNSUPPORTED_TRAFFIC_LIGHTS)

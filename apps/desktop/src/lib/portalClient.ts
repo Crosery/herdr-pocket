@@ -11,7 +11,7 @@ import {
   type RemoteWindowInfo,
 } from "@herdr-pocket/protocol";
 import { logger } from "./log";
-import { getDirectEndpoint, rpcCall, subscribeStream } from "./relay";
+import { getDirectEndpoint, getDirectLink, rpcCall, subscribeStream } from "./relay";
 import { liveStore } from "./store";
 
 export function encodePortalRelPath(rel: string): string {
@@ -28,16 +28,75 @@ export function buildPortalP2pUrl(
   ticket: Pick<PortalFileTicket, "token" | "entryPath" | "port" | "addrs">,
   directOverride?: { addr: string; port: number } | null,
 ): string | null {
+  const link = directOverride === undefined ? getDirectLink(hostId) : null;
+  if (link && link.transportKind === "webrtc") return null;
   const endpoint = directOverride !== undefined ? directOverride : getDirectEndpoint(hostId);
   const storeAddr = liveStore.get().direct[hostId];
   const addr = endpoint?.addr ?? storeAddr ?? ticket.addrs[0];
   const port = endpoint?.port ?? ticket.port;
-  // Require an active P2P session unless ticket explicitly targets loopback.
-  if (!endpoint && !storeAddr) return null;
-  if (!addr || !port) return null;
+  // Require an active HTTP-capable P2P session unless override supplied.
+  if (!endpoint && (!storeAddr || storeAddr.startsWith("webrtc:"))) return null;
+  if (!addr || !port || addr.startsWith("webrtc:")) return null;
+  const isLoopback = addr === "127.0.0.1" || addr === "localhost" || addr === "::1";
+  if (!isLoopback && typeof window !== "undefined" && window.location?.protocol === "https:") {
+    return null;
+  }
   const host = addr.includes(":") ? `[${addr}]` : addr;
   const path = ticket.entryPath ? `/${encodePortalRelPath(ticket.entryPath)}` : "/";
   return `http://${host}:${port}${DIRECT_PORTAL_FS_PREFIX}/${encodeURIComponent(ticket.token)}${path}`;
+}
+
+export async function fetchPortalFileP2p(
+  hostId: string,
+  ticket: PortalFileTicket,
+  opts?: {
+    relPath?: string;
+    start?: number;
+    end?: number;
+    signal?: AbortSignal;
+    onProgress?: (loaded: number, total: number) => void;
+  },
+): Promise<{ blob: Blob; mime: string; size: number; via: "http-p2p" | "webrtc" } | null> {
+  if (ticket.isDir) return null;
+  const directUrl = buildPortalP2pUrl(hostId, ticket);
+  if (directUrl) {
+    const targetUrl = opts?.relPath
+      ? `${directUrl.replace(/\/$/, "")}/${encodePortalRelPath(opts.relPath)}`
+      : directUrl;
+    const headers: Record<string, string> = {};
+    if (opts?.start !== undefined) {
+      headers.Range =
+        opts.end !== undefined ? `bytes=${opts.start}-${opts.end}` : `bytes=${opts.start}-`;
+    }
+    const resp = await fetch(targetUrl, {
+      ...(Object.keys(headers).length ? { headers } : {}),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    }).catch(() => null);
+    if (resp && resp.ok) {
+      const blob = await resp.blob();
+      const total = Number.parseInt(resp.headers.get("content-length") ?? "", 10) || blob.size || ticket.size;
+      return {
+        blob,
+        mime: resp.headers.get("content-type") || ticket.mime || blob.type || "application/octet-stream",
+        size: total,
+        via: "http-p2p",
+      };
+    }
+  }
+  const link = getDirectLink(hostId);
+  if (link?.open && link.transportKind === "webrtc") {
+    const got = await link.getFile(
+      {
+        token: ticket.token,
+        ...(opts?.relPath ? { path: opts.relPath } : {}),
+        ...(opts?.start !== undefined ? { start: opts.start } : {}),
+        ...(opts?.end !== undefined ? { end: opts.end } : {}),
+      },
+      opts?.onProgress,
+    );
+    if (got) return { ...got, via: "webrtc" };
+  }
+  return null;
 }
 
 export function buildPortalP2pSiblingUrl(baseEntryUrl: string, siblingName: string): string {

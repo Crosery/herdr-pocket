@@ -892,6 +892,8 @@ export function mockLink(): Link {
         }
         case "tools.updateStatus":
           return demoToolJobs[_to] ?? null;
+        case "webrtc.offer":
+          throw new Error("演示模式不支持 WebRTC 直连");
         case "files.readChunk": {
           const text = "export const demo = true;\n";
           return {

@@ -66,8 +66,8 @@ import {
 import { native } from "../lib/native";
 import { useClientConfig } from "../lib/config";
 import { openAgentFileTarget } from "../lib/openFileTarget";
-import { buildPortalP2pUrl } from "../lib/portalClient";
-import { getDirectEndpoint, rpcCall, RelayError } from "../lib/relay";
+import { buildPortalP2pUrl, fetchPortalFileP2p } from "../lib/portalClient";
+import { getDirectEndpoint, getDirectLink, rpcCall, RelayError } from "../lib/relay";
 import { allAgents, createStore, liveStore, spacedTitle } from "../lib/store";
 import { openWebTab, shellStore, updateResolvedFilePanePath } from "../shell/shellStore";
 import { useWindowHidden } from "../lib/layout";
@@ -721,6 +721,12 @@ export function FileViewer({
       : null;
 
   useEffect(() => {
+    return () => {
+      if (p2pStreamUrl?.startsWith("blob:")) URL.revokeObjectURL(p2pStreamUrl);
+    };
+  }, [p2pStreamUrl]);
+
+  useEffect(() => {
     if (!remoteP2pKey || !agentDeviceId || !agentKey) {
       setP2pStreamUrl(null);
       setP2pResolvedFor(null);
@@ -738,20 +744,43 @@ export function FileViewer({
         if (!alive) return;
         if (ticket.size > 0) setFetchedSize((prev) => prev ?? ticket.size);
         const candidateUrl = !ticket.isDir ? buildPortalP2pUrl(agentDeviceId, ticket) : null;
-        if (!candidateUrl) {
-          setP2pStreamUrl(null);
+        if (candidateUrl) {
+          // Verify P2P HTTP port is directly reachable before pointing iframes/media at it.
+          const ok = await fetch(candidateUrl, {
+            method: "HEAD",
+            ...(ctrl ? { signal: ctrl.signal } : {}),
+          })
+            .then((r) => r.ok)
+            .catch(() => false);
+          if (!alive) return;
+          setP2pStreamUrl(ok ? candidateUrl : null);
           setP2pResolvedFor(remoteP2pKey);
           return;
         }
-        // Verify P2P HTTP port is directly reachable before pointing iframes/media at it.
-        const ok = await fetch(candidateUrl, {
-          method: "HEAD",
-          ...(ctrl ? { signal: ctrl.signal } : {}),
-        })
-          .then((r) => r.ok)
-          .catch(() => false);
-        if (!alive) return;
-        setP2pStreamUrl(ok ? candidateUrl : null);
+        window.clearTimeout(timeout);
+        const link = getDirectLink(agentDeviceId);
+        if (!ticket.isDir && link?.open && link.transportKind === "webrtc" && ticket.size <= 128 * 1024 * 1024) {
+          if (isDirectStreamMedia) {
+            const got = await fetchPortalFileP2p(agentDeviceId, ticket);
+            if (!alive) return;
+            setP2pStreamUrl(got ? URL.createObjectURL(got.blob) : null);
+            setP2pResolvedFor(remoteP2pKey);
+            return;
+          }
+          if (isDirectFetchBinary) {
+            const got = await fetchPortalFileP2p(agentDeviceId, ticket);
+            if (!alive) return;
+            if (got) {
+              const buf = new Uint8Array(await got.blob.arrayBuffer());
+              setFetchedSize(got.size || buf.byteLength);
+              setFetchedBytes(buf);
+            }
+            setP2pStreamUrl(null);
+            setP2pResolvedFor(remoteP2pKey);
+            return;
+          }
+        }
+        setP2pStreamUrl(null);
         setP2pResolvedFor(remoteP2pKey);
       })
       .catch(() => {
@@ -767,7 +796,7 @@ export function FileViewer({
       window.clearTimeout(timeout);
       ctrl?.abort();
     };
-  }, [agentCwd, agentDeviceId, agentKey, remoteP2pKey, tab.absPath, tab.path]);
+  }, [agentCwd, agentDeviceId, agentKey, isDirectFetchBinary, isDirectStreamMedia, remoteP2pKey, tab.absPath, tab.path]);
 
   useEffect(() => {
     setRemoteBundledHtml(null);
@@ -1097,7 +1126,11 @@ export function FileViewer({
     setText("");
     const activeDirectUrl = localStreamUrl || p2pStreamUrl;
     if (activeDirectUrl && isDirectStreamMedia) return;
-    if (activeDirectUrl && isDirectFetchBinary) {
+    if (remoteP2pKey && (isDirectStreamMedia || isDirectFetchBinary) && p2pResolvedFor !== remoteP2pKey) {
+      return;
+    }
+    if (isDirectFetchBinary && fetchedBytes) return;
+    if (activeDirectUrl && isDirectFetchBinary && !activeDirectUrl.startsWith("blob:")) {
       let alive = true;
       fetch(activeDirectUrl)
         .then(async (r) => {
@@ -1123,7 +1156,7 @@ export function FileViewer({
       return;
     }
     read(0).catch((e) => setError(fileError(e)));
-  }, [agentDeviceId, agentKey, isDirectFetchBinary, isDirectStreamMedia, localStreamUrl, p2pStreamUrl, read, tab.absPath, tab.path]);
+  }, [agentDeviceId, agentKey, fetchedBytes, isDirectFetchBinary, isDirectStreamMedia, localStreamUrl, p2pResolvedFor, p2pStreamUrl, read, remoteP2pKey, tab.absPath, tab.path]);
 
   useEffect(() => {
     headStateCbRef.current?.({
@@ -1196,18 +1229,36 @@ export function FileViewer({
         ...(agent.cwd ? { cwd: agent.cwd } : {}),
       })
         .then(async (ticket) => {
-          const directUrl = !ticket.isDir ? buildPortalP2pUrl(agent.deviceId, ticket) : null;
-          if (directUrl) {
-            const resp = await fetch(directUrl);
-            const blob = await resp.blob();
-            const obj = URL.createObjectURL(blob);
+          const p2p = await fetchPortalFileP2p(agent.deviceId, ticket);
+          if (p2p) {
+            const obj = URL.createObjectURL(p2p.blob);
             triggerUrl(obj);
             setTimeout(() => URL.revokeObjectURL(obj), 10_000);
             return;
           }
-          const c = await rpcCall(agent.deviceId, "files.readChunk", { agent: agent.key, path: tab.path, offset: 0, length: 2 * 1024 * 1024 });
-          const bytes = decodeBase64Fast(c.base64);
-          const obj = URL.createObjectURL(new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], { type: c.mime }));
+          // Relay multi-chunk fallback instead of truncating at 2 MB.
+          const maxRelayBytes = 128 * 1024 * 1024;
+          const parts: BlobPart[] = [];
+          let chunkOff = 0;
+          let eof = false;
+          let mime = ticket.mime || "application/octet-stream";
+          while (!eof && chunkOff < maxRelayBytes) {
+            const c = await rpcCall(agent.deviceId, "files.readChunk", {
+              agent: agent.key,
+              path: tab.path,
+              offset: chunkOff,
+              length: 2 * 1024 * 1024,
+            });
+            mime = c.mime || mime;
+            if (!c.bytes || !c.base64) break;
+            const bytes = decodeBase64Fast(c.base64);
+            const copy = new Uint8Array(bytes.byteLength);
+            copy.set(bytes);
+            parts.push(copy.buffer);
+            chunkOff = c.offset + c.bytes;
+            eof = c.eof;
+          }
+          const obj = URL.createObjectURL(new Blob(parts, { type: mime }));
           triggerUrl(obj);
           setTimeout(() => URL.revokeObjectURL(obj), 10_000);
         })
