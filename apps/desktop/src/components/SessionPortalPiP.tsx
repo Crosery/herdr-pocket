@@ -365,6 +365,7 @@ export function SessionPortalPiP({
     window.addEventListener("pointercancel", finish);
   };
 
+  const sizeClamp: React.CSSProperties = { maxWidth: "calc(100% - 24px)", maxHeight: "calc(100% - 24px)" };
   const posStyle: React.CSSProperties =
     box.x !== null && box.y !== null
       ? {
@@ -372,11 +373,12 @@ export function SessionPortalPiP({
           top: box.y,
           right: "auto",
           bottom: "auto",
+          ...sizeClamp,
           ...(collapsed ? {} : { width: box.w, height: box.h }),
         }
       : collapsed
-        ? {}
-        : { width: box.w, height: box.h };
+        ? sizeClamp
+        : { width: box.w, height: box.h, ...sizeClamp };
 
   const dirs: ResizeDir[] = ["n", "s", "e", "w", "nw", "ne", "sw", "se"];
 

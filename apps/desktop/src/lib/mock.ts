@@ -820,6 +820,48 @@ function demoFindFile(reqPath: string) {
   return hit;
 }
 
+type MockTermWatcher = {
+  to: string;
+  agent: string;
+  cols: number;
+  rows: number;
+  onEvent: (ev: any) => void;
+};
+const demoTermWatchers = new Set<MockTermWatcher>();
+
+function buildDemoRawTerminalPayload(agentKey: string): string {
+  const existing = DEMO_TERMINALS[agentKey] ?? [`\x1b[38;5;212mHerdr Agent\x1b[0m · ${agentKey}`];
+  const lines: string[] = [];
+  for (let i = 1; i <= 120; i += 1) {
+    lines.push(`\x1b[90m[${String(i).padStart(3, "0")}]\x1b[0m 检查分屏宽度重排与跨端同步基线状态，验证中文宽字符自动折行对齐 (${agentKey})`);
+  }
+  lines.push(
+    "\x1b[90m+------------------+--------------------+--------------------+----------------------------+\x1b[0m",
+    "| 服务模块         | 独立容器架构       | 前端宿主路径       | 改 UI 要不要重打发布包     |",
+    "|------------------+--------------------+--------------------+----------------------------|",
+    "| xc-servers       | 独立容器运行       | /apps/:appId       | 不需要，直接部署服务端即可 |",
+    "| xc-reminder      | 已拆出至总控台     | apps/console/dist  | 需随总控台版本统一构建发布 |",
+    "\x1b[90m+------------------+--------------------+--------------------+----------------------------+\x1b[0m",
+  );
+  lines.push(...existing);
+  lines.push(
+    "\x1b[90m────────────────────────────────────────────────────────────────────────────────────\x1b[0m",
+    "\x1b[1;34m>\x1b[0m ",
+    "\x1b[90m────────────────────────────────────────────────────────────────────────────────────\x1b[0m",
+    "\x1b[32m●\x1b[0m [16:55:10] cron (every 3 minutes) running",
+    "\x1b[90mGemini 4 Neon (XHigh) · 32% ctx · idle\x1b[0m",
+  );
+  return `${lines.join("\r\n")}\r\n`;
+}
+
+function emitMockTermRaw(agentKey: string, textChunk: string): void {
+  const b64 = demoBytesToBase64(new TextEncoder().encode(textChunk));
+  for (const w of demoTermWatchers) {
+    if (w.agent !== agentKey) continue;
+    w.onEvent({ kind: "terminal_data", data: b64, cols: w.cols, rows: w.rows });
+  }
+}
+
 function demoBytesToBase64(bytes: Uint8Array): string {
   let bin = "";
   for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]!);
@@ -1365,6 +1407,7 @@ export const mockApi = {
       ];
       const term = DEMO_TERMINALS[params.agent] ?? [];
       DEMO_TERMINALS[params.agent] = [...term, `> ${textStr}`, "\x1b[32m✓ 演示指令已送达\x1b[0m"];
+      emitMockTermRaw(String(params.agent), `\r\n\x1b[1;34m>\x1b[0m ${textStr}\r\n\x1b[32m✓ 演示指令已送达\x1b[0m\r\n\x1b[1;34m>\x1b[0m `);
       return { ok: true };
     }
     if (method === "terminal.keys") {
@@ -1373,6 +1416,9 @@ export const mockApi = {
       return { ok: true };
     }
     if (method === "terminal.input") {
+      if (params?.agent && typeof params?.data === "string") {
+        emitMockTermRaw(String(params.agent), String(params.data));
+      }
       return { ok: true };
     }
     if (method === "terminal.kill") {
@@ -1744,6 +1790,34 @@ export const mockApi = {
       }
       return () => {
         demoPortalWatchers.delete(watcher);
+      };
+    }
+    if (stream === "terminal" && params?.raw && typeof params?.agent === "string") {
+      const cols = Math.max(20, Number(params.cols) || 80);
+      const rows = Math.max(5, Number(params.rows) || 24);
+      const watcher: MockTermWatcher = {
+        to,
+        agent: params.agent,
+        cols,
+        rows,
+        onEvent,
+      };
+      demoTermWatchers.add(watcher);
+      let alive = true;
+      queueMicrotask(() => {
+        if (!alive) return;
+        onState?.({ kind: "live", result: { raw: true } });
+        const payload = buildDemoRawTerminalPayload(watcher.agent);
+        onEvent({
+          kind: "terminal_data",
+          data: demoBytesToBase64(new TextEncoder().encode(payload)),
+          cols: watcher.cols,
+          rows: watcher.rows,
+        });
+      });
+      return () => {
+        alive = false;
+        demoTermWatchers.delete(watcher);
       };
     }
     onState?.({ kind: "live" });

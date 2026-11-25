@@ -3348,12 +3348,12 @@ export function TerminalSurface({
           }
         },
       );
-      seedTimer = window.setTimeout(runFallbackRead, 450);
+      seedTimer = window.setTimeout(runFallbackRead, 240);
     };
 
     let readyToAttachResolve: (() => void) | null = null;
     const isLayoutAttachable = () =>
-      activeRef.current && hostEl.clientWidth >= 60 && hostEl.clientHeight >= 40;
+      hostEl.clientWidth >= 60 && hostEl.clientHeight >= 40;
     const notifyAttachReady = () => {
       if (readyToAttachResolve && isLayoutAttachable()) {
         const resolve = readyToAttachResolve;
