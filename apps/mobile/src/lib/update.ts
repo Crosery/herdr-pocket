@@ -42,11 +42,19 @@ interface UpdateState {
   progress: number;
   /** The downloaded APK, once it is there. */
   path: string | null;
+  /** Version belonging to `path` so a newer release supersedes a staged old APK. */
+  downloadedVersion: string | null;
   /** One quiet line for the settings row; null for the default wording. */
   note: string | null;
 }
 
-export const useUpdate = create<UpdateState>()(() => ({ phase: "idle", progress: 0, path: null, note: null }));
+export const useUpdate = create<UpdateState>()(() => ({
+  phase: "idle",
+  progress: 0,
+  path: null,
+  downloadedVersion: null,
+  note: null,
+}));
 
 /** In-app updates install the release APK: Android only. */
 export const updatesSupported = Platform.OS === "android";
@@ -91,11 +99,38 @@ async function fetchWithin(url: string, ms: number, init: RequestInit = {}): Pro
   }
 }
 
+async function fetchRelayLatest(server?: string): Promise<{ latest?: string; manifest?: unknown; notes?: string } | null> {
+  const base = server?.trim().replace(/\/+$/, "");
+  if (!base || isMockServer(base) || !/^https?:\/\//i.test(base)) return null;
+  try {
+    const res = await fetchWithin(`${base}/v1/releases/latest`, 3500, { headers: { "Cache-Control": "no-cache" } });
+    if (!res.ok) return null;
+    const json = (await res.json().catch(() => null)) as { latest?: string; manifest?: unknown; notes?: string } | null;
+    return json && typeof json === "object" ? json : null;
+  } catch {
+    return null;
+  }
+}
+
+function manifestToAndroidRelease(manifest: ReturnType<typeof parseReleaseManifest>, notes = ""): ReleaseInfo | null {
+  const entry = resolveChannelFromManifest(manifest, "android-arm64");
+  if (!entry) return null;
+  return {
+    version: entry.version,
+    url: releaseAssetUrl(entry.version, entry.fileName),
+    fileName: entry.fileName,
+    size: entry.size ?? 0,
+    sha256: entry.sha256,
+    page: `https://github.com/${RELEASE_REPO}/releases/tag/${entry.tag}`,
+    notes,
+  };
+}
+
 /** Resolves Android channel release from `RELEASE-MANIFEST.json` (carries forward APK version across desktop-only releases). */
 async function fetchFromManifest(url: string): Promise<Latest> {
   let res: Response;
   try {
-    res = await fetchWithin(url, 10_000);
+    res = await fetchWithin(url, 10_000, { headers: { "Cache-Control": "no-cache" } });
   } catch {
     return { kind: "unknown", why: "offline" };
   }
@@ -104,20 +139,9 @@ async function fetchFromManifest(url: string): Promise<Latest> {
   }
   const manifest = parseReleaseManifest(await res.text().catch(() => ""));
   if (!manifest) return { kind: "unknown", why: "missing" };
-  const entry = resolveChannelFromManifest(manifest, "android-arm64");
-  if (!entry) return { kind: "none" };
-  return {
-    kind: "release",
-    release: {
-      version: entry.version,
-      url: releaseAssetUrl(entry.version, entry.fileName),
-      fileName: entry.fileName,
-      size: entry.size ?? 0,
-      sha256: entry.sha256,
-      page: `https://github.com/${RELEASE_REPO}/releases/tag/${entry.tag}`,
-      notes: "",
-    },
-  };
+  const release = manifestToAndroidRelease(manifest);
+  if (!release) return { kind: "none" };
+  return { kind: "release", release };
 }
 
 /** Fallback for older releases without `RELEASE-MANIFEST.json`: parses `SHA256SUMS`. */
@@ -170,31 +194,72 @@ async function raceMirrorCalls(fns: Array<() => Promise<Latest>>): Promise<Lates
   }
 }
 
-/** Sources in order until one answers; mirrors race `RELEASE-MANIFEST.json` first, then `SHA256SUMS` / GitHub API. */
-async function fetchLatest(): Promise<Latest> {
+/** Sources in order until one answers; bypasses stale mirror `/latest` whenever Relay or push hint knows a newer version. */
+async function fetchLatest(relayServer?: string, minExpectedVersion?: string): Promise<Latest> {
   const china = inMainlandChina();
+  const relayPromise = fetchRelayLatest(relayServer);
   const manifests = releaseSources(LATEST_MANIFEST_URL, china).map((u) => () => fetchFromManifest(u));
   const sums = releaseSources(LATEST_SUMS_URL, china).map((u) => () => fetchFromSums(u));
+
+  let base: Latest | null = null;
   if (china && manifests.length > 1) {
     const mHit = await raceMirrorCalls(manifests.slice(0, -1));
-    if (mHit) return mHit;
-    const sHit = await raceMirrorCalls(sums.slice(0, -1));
-    if (sHit) return sHit;
-    const rest = [fetchFromApi, manifests[manifests.length - 1]!, sums[sums.length - 1]!];
-    let last: Latest = { kind: "unknown", why: "offline" };
-    for (const attempt of rest) {
-      last = await attempt();
-      if (last.kind !== "unknown") return last;
+    if (mHit) base = mHit;
+    else {
+      const sHit = await raceMirrorCalls(sums.slice(0, -1));
+      if (sHit) base = sHit;
+      else {
+        const rest = [fetchFromApi, manifests[manifests.length - 1]!, sums[sums.length - 1]!];
+        let last: Latest = { kind: "unknown", why: "offline" };
+        for (const attempt of rest) {
+          last = await attempt();
+          if (last.kind !== "unknown") {
+            base = last;
+            break;
+          }
+        }
+        base ??= last;
+      }
     }
-    return last;
+  } else {
+    const tries = [...manifests, fetchFromApi, ...sums];
+    let last: Latest = { kind: "unknown", why: "offline" };
+    for (const attempt of tries) {
+      last = await attempt();
+      if (last.kind !== "unknown") {
+        base = last;
+        break;
+      }
+    }
+    base ??= last;
   }
-  const tries = [...manifests, fetchFromApi, ...sums];
-  let last: Latest = { kind: "unknown", why: "offline" };
-  for (const attempt of tries) {
-    last = await attempt();
-    if (last.kind !== "unknown") return last;
+
+  const relay = await relayPromise;
+  const baseVer = base.kind === "release" ? base.release.version : "";
+  const candidates = [minExpectedVersion, relay?.latest]
+    .map((v) => v?.trim().replace(/^v/i, "") ?? "")
+    .filter((v) => /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(v));
+  let newestHint = "";
+  for (const c of candidates) {
+    if (!newestHint || compareVersions(c, newestHint) > 0) newestHint = c;
   }
-  return last;
+
+  if (newestHint && (!baseVer || compareVersions(newestHint, baseVer) > 0)) {
+    const relayManifest = relay?.manifest ? parseReleaseManifest(JSON.stringify(relay.manifest)) : null;
+    if (relayManifest && compareVersions(relayManifest.releaseVersion, newestHint) >= 0) {
+      const r = manifestToAndroidRelease(relayManifest, typeof relay?.notes === "string" ? shortNotes(relay.notes) : "");
+      if (r && (!baseVer || compareVersions(r.version, baseVer) > 0)) {
+        return { kind: "release", release: r };
+      }
+    }
+    const taggedUrl = releaseAssetUrl(newestHint, "RELEASE-MANIFEST.json");
+    const taggedHit = await raceMirrorCalls(releaseSources(taggedUrl, china).map((u) => () => fetchFromManifest(u)));
+    if (taggedHit?.kind === "release" && (!baseVer || compareVersions(taggedHit.release.version, baseVer) > 0)) {
+      return taggedHit;
+    }
+  }
+
+  return base;
 }
 
 /** The GitHub API: scans recent non-draft releases to find the newest release that ships an Android APK. */
@@ -246,11 +311,22 @@ async function fetchFromApi(): Promise<Latest> {
   return { kind: "none" };
 }
 
+export function notifyReleaseAvailable(version?: string): void {
+  if (!updatesSupported) return;
+  const clean = version?.trim().replace(/^v/i, "") ?? "";
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(clean)) return;
+  const s = useSettings.getState();
+  if (isMockServer(s.server)) return;
+  if (compareVersions(clean, currentVersion()) <= 0) return;
+  if (s.updateRelease && compareVersions(clean, s.updateRelease.version) <= 0) return;
+  void checkForUpdate(false, clean);
+}
+
 /**
  * `manual`: the person tapped "检查更新" and wants an answer. Otherwise this is the quiet
- * background check, which runs at most every 30 minutes.
+ * background check, which runs at most every 30 minutes unless pushed a newer release.
  */
-export async function checkForUpdate(manual = false): Promise<void> {
+export async function checkForUpdate(manual = false, minExpectedVersion?: string): Promise<void> {
   const s = useSettings.getState();
   const { phase } = useUpdate.getState();
   if (phase === "checking" || phase === "downloading") return;
@@ -262,12 +338,15 @@ export async function checkForUpdate(manual = false): Promise<void> {
     if (manual) set({ phase: "latest", note: "演示模式不检查更新" });
     return;
   }
-  if (!manual && Date.now() - s.updateCheckedAt < CHECK_EVERY_MS) {
+  const hasNewerPush =
+    Boolean(minExpectedVersion) &&
+    (!s.updateRelease || compareVersions(minExpectedVersion!, s.updateRelease.version) > 0);
+  if (!manual && !hasNewerPush && Date.now() - s.updateCheckedAt < CHECK_EVERY_MS) {
     syncPhase();
     return;
   }
   if (manual) set({ phase: "checking", note: null });
-  const latest = await fetchLatest();
+  const latest = await fetchLatest(s.server ?? undefined, minExpectedVersion);
   if (latest.kind === "unknown") {
     applog("info", "update", `update check failed: ${latest.why}`);
     // Try again on the next start rather than waiting 30 minutes.
@@ -285,17 +364,32 @@ export async function checkForUpdate(manual = false): Promise<void> {
   syncPhase(null);
 }
 
-/** Phase from what is known, keeping a download that is under way. */
+/** Phase from what is known, superseding any earlier staged APK when a newer release lands. */
 function syncPhase(note: string | null = null): void {
-  const { phase } = useUpdate.getState();
-  if (phase === "downloading" || phase === "ready" || phase === "permission") return;
+  const { phase, downloadedVersion } = useUpdate.getState();
   const r = useSettings.getState().updateRelease;
   const newer = !!r?.url && compareVersions(r.version, currentVersion()) > 0;
+  if (phase === "downloading" || phase === "permission") return;
+  if (phase === "ready") {
+    if (newer && r && r.version !== downloadedVersion) {
+      set({ phase: "available", path: null, downloadedVersion: null, progress: 0, note });
+    }
+    return;
+  }
   set({ phase: newer ? "available" : note || phase !== "idle" ? "latest" : "idle", note });
 }
 
 /** Downloads the newer APK, then opens the installer. Without the native updater, opens the release page. */
 export async function downloadUpdate(): Promise<void> {
+  const curSettings = useSettings.getState();
+  const curRel = curSettings.updateRelease;
+  if (!curRel || !updatesSupported) return;
+  if (Date.now() - curSettings.updateCheckedAt > 5_000) {
+    await Promise.race([
+      checkForUpdate(false, curRel.version),
+      new Promise<void>((res) => setTimeout(res, 3000)),
+    ]);
+  }
   const r = useSettings.getState().updateRelease;
   if (!r || !updatesSupported) return;
   const native = PocketNative;
@@ -304,7 +398,7 @@ export async function downloadUpdate(): Promise<void> {
     return;
   }
   if (useUpdate.getState().phase === "downloading") return;
-  set({ phase: "downloading", progress: 0, note: null });
+  set({ phase: "downloading", progress: 0, downloadedVersion: null, note: null });
   const sub = native.addListener("onUpdateProgress", (e) => {
     if (e.total > 0) set({ progress: Math.min(1, e.received / e.total) });
   });
@@ -327,7 +421,7 @@ export async function downloadUpdate(): Promise<void> {
       }
     }
     if (!path) throw failed ?? new Error("download failed");
-    set({ phase: "ready", path, progress: 1 });
+    set({ phase: "ready", path, downloadedVersion: r.version, progress: 1 });
     installUpdate();
   } catch (e) {
     applog("warn", "update", `download of ${r.version} failed: ${(e as Error)?.message ?? String(e)}`);

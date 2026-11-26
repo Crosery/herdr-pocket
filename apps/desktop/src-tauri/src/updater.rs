@@ -41,6 +41,7 @@ fn updater_client() -> Result<&'static reqwest::Client, String> {
 }
 
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+static DOWNLOAD_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 struct DownloadGuard;
 impl Drop for DownloadGuard {
@@ -268,6 +269,12 @@ fn emit_progress(app: &AppHandle, ev: UpdateProgressEvent) {
 }
 
 #[tauri::command]
+pub fn update_cancel_download() -> bool {
+    DOWNLOAD_EPOCH.fetch_add(1, Ordering::SeqCst);
+    DOWNLOADING.load(Ordering::SeqCst)
+}
+
+#[tauri::command]
 pub async fn update_fetch_github_latest(
     timeout_ms: Option<u64>,
 ) -> Result<GithubLatestRelease, String> {
@@ -275,6 +282,8 @@ pub async fn update_fetch_github_latest(
     let res = crate::net::client()
         .get(GITHUB_LATEST_API)
         .header("Accept", "application/vnd.github+json")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
         .timeout(timeout)
         .send()
         .await
@@ -625,6 +634,7 @@ pub async fn update_download_and_stage(
     {
         return Err("已有更新正在下载中".into());
     }
+    let epoch = DOWNLOAD_EPOCH.load(Ordering::SeqCst);
     let _dl_guard = DownloadGuard;
 
     let dir = updates_dir()?;
@@ -658,10 +668,19 @@ pub async fn update_download_and_stage(
     if !already_verified {
         let mut last_err = String::from("下载失败");
         let mut succeeded = false;
+        let mut superseded = false;
         let candidates = probe_release_sources(client_for_updater()?, &valid_urls).await;
+        if DOWNLOAD_EPOCH.load(Ordering::SeqCst) != epoch {
+            return Err("SUPERSEDED_BY_NEWER_RELEASE".into());
+        }
         let candidate_count = candidates.len();
 
         for (cand_idx, cand) in candidates.into_iter().enumerate() {
+            if DOWNLOAD_EPOCH.load(Ordering::SeqCst) != epoch {
+                let _ = fs::remove_file(&part_path);
+                superseded = true;
+                break;
+            }
             let has_fallback = cand_idx + 1 < candidate_count;
             let url = cand.url;
             let source = source_host_label(&url);
@@ -693,6 +712,7 @@ pub async fn update_download_and_stage(
                     total,
                     &part_path,
                     has_fallback,
+                    epoch,
                 )
                 .await
             } else {
@@ -703,6 +723,7 @@ pub async fn update_download_and_stage(
                     &url,
                     &part_path,
                     has_fallback,
+                    epoch,
                 )
                 .await
             };
@@ -711,6 +732,10 @@ pub async fn update_download_and_stage(
                 Ok(n) => n,
                 Err(e) => {
                     let _ = fs::remove_file(&part_path);
+                    if e == "SUPERSEDED_BY_NEWER_RELEASE" {
+                        superseded = true;
+                        break;
+                    }
                     last_err = e;
                     continue;
                 }
@@ -751,6 +776,11 @@ pub async fn update_download_and_stage(
             break;
         }
 
+        if superseded {
+            let _ = fs::remove_file(&part_path);
+            return Err("SUPERSEDED_BY_NEWER_RELEASE".into());
+        }
+
         if !succeeded {
             emit_progress(
                 &app,
@@ -766,6 +796,10 @@ pub async fn update_download_and_stage(
             );
             return Err(last_err);
         }
+    }
+
+    if DOWNLOAD_EPOCH.load(Ordering::SeqCst) != epoch {
+        return Err("SUPERSEDED_BY_NEWER_RELEASE".into());
     }
 
     emit_progress(
@@ -1123,6 +1157,7 @@ async fn download_parallel_range(
     total_bytes: u64,
     part_path: &Path,
     has_fallback: bool,
+    epoch: u64,
 ) -> Result<u64, String> {
     let client = client_for_updater()?.clone();
     let file = OpenOptions::new()
@@ -1296,8 +1331,17 @@ async fn download_parallel_range(
         }));
     }
 
+    let mut aborted_superseded = false;
     while active_workers.load(Ordering::Relaxed) > 0 {
         tokio::time::sleep(Duration::from_millis(120)).await;
+        if DOWNLOAD_EPOCH.load(Ordering::SeqCst) != epoch {
+            aborted_superseded = true;
+            abort_flag.store(true, Ordering::Relaxed);
+            for h in &handles {
+                h.abort();
+            }
+            break;
+        }
         let cur_dl = downloaded.load(Ordering::Relaxed);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if has_fallback && !abort_flag.load(Ordering::Relaxed) {
@@ -1353,6 +1397,10 @@ async fn download_parallel_range(
         let _ = h.await;
     }
 
+    if aborted_superseded || DOWNLOAD_EPOCH.load(Ordering::SeqCst) != epoch {
+        return Err("SUPERSEDED_BY_NEWER_RELEASE".into());
+    }
+
     if let Ok(guard) = first_err.lock() {
         if let Some(err) = guard.as_ref() {
             return Err(err.clone());
@@ -1384,6 +1432,7 @@ async fn download_single_stream(
     url: &str,
     part_path: &Path,
     has_fallback: bool,
+    epoch: u64,
 ) -> Result<u64, String> {
     let client = client_for_updater()?;
     let resp = match tokio::time::timeout(Duration::from_secs(12), client.get(url).send()).await {
@@ -1404,6 +1453,9 @@ async fn download_single_stream(
     let mut resp = resp;
 
     loop {
+        if DOWNLOAD_EPOCH.load(Ordering::SeqCst) != epoch {
+            return Err("SUPERSEDED_BY_NEWER_RELEASE".into());
+        }
         let chunk_timeout = Duration::from_secs(if has_fallback { STALL_ABORT_SECS } else { 20 });
         match tokio::time::timeout(chunk_timeout, resp.chunk()).await {
             Ok(Ok(Some(chunk))) => {

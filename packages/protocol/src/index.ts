@@ -2130,7 +2130,8 @@ export type ClientFrame =
 
 /** Relay -> client. */
 export type ServerFrame =
-  | { type: "welcome"; version: number; device: Device; seq: number }
+  | { type: "welcome"; version: number; serverVersion?: string; latestRelease?: string; device: Device; seq: number }
+  | { type: "release_update"; version: string; ts: number }
   /** Full state snapshot, sent after welcome to every client. */
   | { type: "snapshot"; seq: number; devices: Device[]; agents: Agent[] }
   | { type: "device"; seq: number; device: Device }

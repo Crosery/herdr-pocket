@@ -1,5 +1,6 @@
 import {
   RELEASE_REPO,
+  compareVersions,
   decideRegion,
   sourceLabel,
   sourcePrefixes,
@@ -7,6 +8,8 @@ import {
   type SourceProbe,
 } from "@herdr-pocket/protocol";
 import {
+  appVersion,
+  cancelUpdateDownload,
   checkReleaseUpdate,
   downloadAndStageUpdate,
   fetchVersionReleaseNotes,
@@ -55,6 +58,7 @@ export interface UpdateState {
   installError: string | null;
   dismissedVersion: string | null;
   minimized: boolean;
+  supersededFrom: string | null;
   manualNotice: string | null;
 }
 
@@ -102,6 +106,7 @@ export const updateStore = createStore<UpdateState>({
   installError: null,
   dismissedVersion: null,
   minimized: false,
+  supersededFrom: null,
   manualNotice: null,
 });
 
@@ -245,9 +250,30 @@ export async function probeMirrorsNow(showToast = false): Promise<SourceProbe[]>
   }
 }
 
-export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Promise<ReleaseUpdateInfo | null> {
+type CheckReason = "manual" | "auto" | "startup" | "push";
+const CHECK_PRIORITY: Record<CheckReason, number> = { auto: 0, startup: 1, push: 2, manual: 3 };
+let queuedCheck: { reason: CheckReason; minExpectedVersion?: string } | null = null;
+
+function pickHigherVer(a?: string, b?: string): string | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return compareVersions(a, b) >= 0 ? a : b;
+}
+
+export async function checkForUpdate(
+  reason: CheckReason,
+  minExpectedVersion?: string,
+): Promise<ReleaseUpdateInfo | null> {
   ensureProgressListener();
-  if (updateStore.get().checking) return updateStore.get().info;
+  if (updateStore.get().checking) {
+    const stronger =
+      queuedCheck && CHECK_PRIORITY[queuedCheck.reason] > CHECK_PRIORITY[reason] ? queuedCheck.reason : reason;
+    queuedCheck = {
+      reason: stronger,
+      minExpectedVersion: pickHigherVer(queuedCheck?.minExpectedVersion, minExpectedVersion),
+    };
+    return updateStore.get().info;
+  }
   updateStore.set({
     checking: true,
     error: null,
@@ -255,30 +281,67 @@ export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Pro
   });
   const { region, mirrors, preferredSource } = clientConfigStore.get().config.update;
   try {
-    // Manual clicks always race fresh sources; startup/background refreshes may reuse recent cache.
+    // Manual and server-push checks always race fresh sources and check explicit tags when needed.
     const info = await checkReleaseUpdate({
       setting: region,
       mirrors: [...mirrors],
       preferredSource,
-      forceRace: reason === "manual",
+      forceRace: reason === "manual" || reason === "push",
+      relayServer: settingsStore.get().server ?? undefined,
+      minExpectedVersion,
     });
     const at = Date.now();
     saveLastCheckedAt(at);
     const prev = updateStore.get();
-    const sameLatestReady = prev.info?.latest === info.latest && prev.installPhase === "ready";
-    const changedVersion = prev.info?.latest !== info.latest;
+    const prevHasUpdate = Boolean(prev.info?.hasUpdate);
+    const prevLatest = prev.info?.latest;
+    const upgradedVersion =
+      prevHasUpdate &&
+      info.hasUpdate &&
+      Boolean(prevLatest) &&
+      compareVersions(info.latest, prevLatest!) > 0;
+    const wasDownloading = upgradedVersion && prev.installPhase === "downloading";
+    if (wasDownloading) {
+      await cancelUpdateDownload();
+    }
+    const sameLatestReady = !upgradedVersion && prevLatest === info.latest && prev.installPhase === "ready";
+    const changedVersion = prevLatest !== info.latest;
     updateStore.set({
       checking: false,
       info,
       probes: mergeProbes(prev.probes, info.probes),
       checkedAt: at,
-      ...(changedVersion ? { minimized: false, installPhase: "idle", progress: null, installError: null } : sameLatestReady ? {} : {}),
+      ...(upgradedVersion
+        ? {
+            supersededFrom: prevLatest!,
+            dismissedVersion: null,
+            minimized: false,
+            installPhase: "idle",
+            progress: null,
+            installError: null,
+          }
+        : !prevHasUpdate && info.hasUpdate
+          ? {
+              supersededFrom: null,
+              minimized: false,
+              installPhase: "idle",
+              progress: null,
+              installError: null,
+            }
+          : changedVersion
+            ? { minimized: false, installPhase: "idle", progress: null, installError: null }
+            : sameLatestReady
+              ? {}
+              : {}),
     });
     if (info.hasUpdate && !info.notes?.body) {
       void fetchReleaseNotes(4000, info.latest).then((notes) => {
         if (!notes) return;
         updateStore.set((cur) => (cur.info && cur.info.latest === info.latest ? { ...cur, info: { ...cur.info, notes } } : cur));
       });
+    }
+    if (wasDownloading) {
+      void startUpdateDownload();
     }
     if (reason === "manual" && !info.hasUpdate) {
       showManualNotice(`当前已是最新版本 v${info.current}`);
@@ -294,13 +357,28 @@ export async function checkForUpdate(reason: "manual" | "auto" | "startup"): Pro
     }
     logger.warn("update", `${reason} check failed: ${msg}`);
     return null;
+  } finally {
+    const next = queuedCheck;
+    queuedCheck = null;
+    if (next) {
+      void checkForUpdate(next.reason, next.minExpectedVersion);
+    }
   }
+}
+
+export function notifyReleaseAvailable(version: string | undefined): void {
+  const clean = version?.trim().replace(/^v/i, "") ?? "";
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(clean)) return;
+  if (compareVersions(clean, appVersion()) <= 0) return;
+  const cur = updateStore.get();
+  if (cur.info?.hasUpdate && compareVersions(clean, cur.info.latest) <= 0) return;
+  void checkForUpdate("push", clean);
 }
 
 export async function startUpdateDownload(): Promise<void> {
   ensureProgressListener();
   const st = updateStore.get();
-  const info = st.info;
+  let info = st.info;
   if (!info?.hasUpdate) return;
   if (
     st.installPhase === "downloading" ||
@@ -309,6 +387,49 @@ export async function startUpdateDownload(): Promise<void> {
     st.installPhase === "restarting"
   ) {
     return;
+  }
+
+  // Pre-download freshness guard: if a newer version landed since the prompt opened, swap directly before downloading.
+  if (Date.now() - (st.checkedAt ?? 0) > 5_000) {
+    const { region, mirrors, preferredSource } = clientConfigStore.get().config.update;
+    try {
+      const fresh = await Promise.race<ReleaseUpdateInfo | null>([
+        checkReleaseUpdate({
+          setting: region,
+          mirrors: [...mirrors],
+          preferredSource,
+          forceRace: true,
+          relayServer: settingsStore.get().server ?? undefined,
+        }).catch(() => null),
+        new Promise<null>((r) => setTimeout(() => r(null), 3_000)),
+      ]);
+      if (fresh) {
+        const at = Date.now();
+        saveLastCheckedAt(at);
+        if (fresh.hasUpdate && compareVersions(fresh.latest, info.latest) > 0) {
+          const prevLatest = info.latest;
+          info = fresh;
+          updateStore.set({
+            info: fresh,
+            checkedAt: at,
+            supersededFrom: prevLatest,
+            dismissedVersion: null,
+            minimized: false,
+            installPhase: "idle",
+            progress: null,
+            installError: null,
+          });
+          if (!fresh.notes?.body) {
+            void fetchReleaseNotes(4000, fresh.latest).then((notes) => {
+              if (!notes) return;
+              updateStore.set((cur) => (cur.info && cur.info.latest === fresh.latest ? { ...cur, info: { ...cur.info, notes } } : cur));
+            });
+          }
+        }
+      }
+    } catch {
+      // keep existing info if quick freshness probe fails
+    }
   }
 
   if (!isTauri()) {
@@ -380,6 +501,7 @@ export async function startUpdateDownload(): Promise<void> {
     }
   } catch (e) {
     const msg = (e as Error).message || "下载或校验更新失败";
+    if (msg === "SUPERSEDED_BY_NEWER_RELEASE") return;
     logger.warn("update", `download/stage failed: ${msg}`);
     updateStore.set({
       installPhase: "error",
@@ -437,9 +559,11 @@ function stripInstallFooter(body: string): string {
  * then falls back to GitHub Releases API when needed.
  */
 export async function fetchReleaseNotes(timeoutMs = 4000, version?: string): Promise<ReleaseNotes | null> {
-  const cached = updateStore.get().info?.notes;
-  if (cached?.body) return cached;
-  const target = (version || updateStore.get().info?.latest || "").trim().replace(/^v/i, "");
+  const curInfo = updateStore.get().info;
+  const target = (version || curInfo?.latest || "").trim().replace(/^v/i, "");
+  if (curInfo?.notes?.body && (!target || curInfo.latest === target)) {
+    return curInfo.notes;
+  }
   if (target) {
     try {
       const { region, mirrors, preferredSource } = clientConfigStore.get().config.update;
@@ -476,6 +600,7 @@ export async function fetchReleaseNotes(timeoutMs = 4000, version?: string): Pro
 const RETRY_BACKOFF_MS = [30_000, 120_000, 600_000];
 
 function focusRecheckMs(): number {
+  if (updateStore.get().info?.hasUpdate) return 15_000;
   return Math.min(
     10 * 60_000,
     Math.max(60_000, clientConfigStore.get().config.update.checkIntervalHours * 3_600_000),
@@ -484,7 +609,7 @@ function focusRecheckMs(): number {
 
 /** Startup check (after 4s, immune to unrelated config loads) + focus/wake re-checks + retry backoff. */
 export function startAutoUpdateChecks(
-  checkFn: (reason: "manual" | "auto" | "startup") => Promise<ReleaseUpdateInfo | null> = checkForUpdate,
+  checkFn: (reason: "manual" | "auto" | "startup" | "push", minExpectedVersion?: string) => Promise<ReleaseUpdateInfo | null> = checkForUpdate,
 ): () => void {
   ensureProgressListener();
   hydrateCachedProbes();
@@ -542,7 +667,7 @@ export function startAutoUpdateChecks(
       return;
     }
 
-    const every = checkIntervalHours * 3_600_000;
+    const every = updateStore.get().info?.hasUpdate ? 60_000 : checkIntervalHours * 3_600_000;
     const last = updateStore.get().checkedAt ?? 0;
     const jitter = every * (Math.random() * 0.2 - 0.1);
     const wait = Math.max(15_000, last + every + jitter - Date.now());

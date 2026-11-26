@@ -802,6 +802,7 @@ pub fn run() {
             commands::open_direct_tunnel,
             updater::update_fetch_github_latest,
             updater::update_download_and_stage,
+            updater::update_cancel_download,
             updater::update_restart_and_apply,
             workspace_state::workspace_state_load,
             workspace_state::workspace_state_save,

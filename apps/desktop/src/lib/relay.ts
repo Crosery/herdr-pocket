@@ -29,6 +29,7 @@ import { loadAssistant, onAssistantFrame } from "./assistant";
 import { logger, registerWebLogUploader } from "./log";
 import { native, onNativeEvent } from "./native";
 import { recordClientRpcSample } from "./perfTelemetry";
+import { notifyReleaseAvailable } from "./updates";
 
 export class RelayError extends Error {
   code: RpcError["code"];
@@ -537,11 +538,15 @@ class SocketClient {
         setLink("online", `attempt ${this.attempt}, ${Date.now() - this.connectStartedAt} ms`);
         this.backoff = 1000;
         this.attempt = 0;
+        notifyReleaseAvailable(f.latestRelease || f.serverVersion);
         void loadAssistant();
         for (const s of this.subs.values()) {
           if (!s.via) this.openStream(s);
         }
         this.tryDirectAll(false);
+        break;
+      case "release_update":
+        notifyReleaseAvailable(f.version);
         break;
       case "snapshot": {
         const devices: Record<string, Device> = {};

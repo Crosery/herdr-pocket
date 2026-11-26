@@ -377,6 +377,8 @@ pub async fn update_fetch_sums(url: String, timeout_ms: Option<u64>) -> Result<S
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(8000).clamp(500, 30_000));
     let res = crate::net::client()
         .get(&url)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
         .timeout(timeout)
         .send()
         .await

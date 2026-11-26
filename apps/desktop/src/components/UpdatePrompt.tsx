@@ -101,7 +101,7 @@ export function UpdatePrompt() {
   }
 
   return (
-    <aside className="update-toast-card" role="status" aria-live="polite" aria-label="软件更新提示">
+    <aside key={info.latest} className="update-toast-card" role="status" aria-live="polite" aria-label="软件更新提示">
       <div className="update-toast-head">
         <XiaoyangOrb mood={phase === "ready" ? "hello" : busy ? "working" : "hello"} size={30} />
         <div className="update-toast-titles">
@@ -110,6 +110,7 @@ export function UpdatePrompt() {
           </div>
           <div className="update-toast-sub">
             v{info.current} → v{info.latest}
+            {st.supersededFrom && st.supersededFrom !== info.latest ? ` · 已直接切换至新版（跳过 v${st.supersededFrom}）` : ""}
           </div>
         </div>
         <button

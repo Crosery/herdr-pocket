@@ -7,12 +7,17 @@ import {
 } from "@herdr-pocket/protocol";
 import { appVersion, checkReleaseUpdate, desktopReleaseChannel, probeUpdateSources, readCachedSourceProbes } from "../src/lib/bridge.ts";
 import { clientConfigStore } from "../src/lib/config.ts";
+import { settingsStore } from "../src/lib/store.ts";
 import {
+  checkForUpdate,
   dismissUpdatePrompt,
+  fetchReleaseNotes,
   minimizeUpdatePrompt,
+  notifyReleaseAvailable,
   probeMirrorsNow,
   restoreUpdatePrompt,
   startAutoUpdateChecks,
+  startUpdateDownload,
   updateStore,
 } from "../src/lib/updates.ts";
 
@@ -217,5 +222,149 @@ test("checkReleaseUpdate reads per-channel RELEASE-MANIFEST.json and ignores unr
     assert.equal(info.hasUpdate, false, "mobile-only 99.0.0 release must NOT trigger desktop update");
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+function multiChannelManifest(ver: string) {
+  return buildReleaseManifest({
+    releaseVersion: ver,
+    sums: {
+      [`herdr-pocket-${ver}.tar.gz`]: "a".repeat(64),
+      [`herdr-pocket-${ver}-macos-arm64.dmg`]: "b".repeat(64),
+      [`herdr-pocket-${ver}-macos-x64.dmg`]: "c".repeat(64),
+      [`herdr-pocket-${ver}-windows-x64-setup.exe`]: "d".repeat(64),
+      [`herdr-pocket-${ver}-linux-x64.AppImage`]: "e".repeat(64),
+    },
+  });
+}
+
+test("notifyReleaseAvailable hot-swaps dismissed/minimized/ready popup and stale notes even when mirror /latest lags", async () => {
+  const realFetch = globalThis.fetch;
+  const prevServer = settingsStore.get().server;
+  settingsStore.set({ server: "" });
+  clientConfigStore.set((prev) => ({
+    ...prev,
+    config: { ...prev.config, update: { ...prev.config.update, region: "global", preferredSource: "direct", mirrors: [] } },
+  }));
+
+  const m91 = multiChannelManifest("99.1.0");
+  const m92 = multiChannelManifest("99.2.0");
+  globalThis.fetch = (async (input: string | URL) => {
+    const u = String(input);
+    if (u.endsWith("/releases/latest/download/RELEASE-MANIFEST.json")) {
+      return new Response(JSON.stringify(m91), { status: 200 });
+    }
+    if (u.endsWith("/releases/download/v99.2.0/RELEASE-MANIFEST.json")) {
+      return new Response(JSON.stringify(m92), { status: 200 });
+    }
+    if (u.endsWith("/releases/download/v99.2.0/RELEASE-NOTES.md")) {
+      return new Response("# Herdr Pocket v99.2.0\n\n- Live popup swap\n", { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    updateStore.set({
+      checking: false,
+      info: {
+        current: appVersion(),
+        latest: "99.1.0",
+        hasUpdate: true,
+        downloadUrl: "https://github.com/Crosery/herdr-pocket/releases/download/v99.1.0/herdr-pocket-99.1.0.tar.gz",
+        downloadUrls: [],
+        pageUrl: "https://github.com/Crosery/herdr-pocket/releases/tag/v99.1.0",
+        notes: { body: "stale 99.1.0 notes", url: "https://example.com/99.1.0", publishedAt: "" },
+        source: "github.com",
+        region: "global",
+        regionReason: "test",
+      },
+      minimized: true,
+      dismissedVersion: "99.1.0",
+      installPhase: "ready",
+      supersededFrom: null,
+      checkedAt: Date.now() - 120_000,
+    });
+
+    notifyReleaseAvailable("99.2.0");
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+      const cur = updateStore.get();
+      if (!cur.checking && cur.info?.latest === "99.2.0" && cur.info?.notes?.body) break;
+    }
+
+    const after = updateStore.get();
+    assert.equal(after.info?.latest, "99.2.0");
+    assert.equal(after.info?.hasUpdate, true);
+    assert.equal(after.minimized, false);
+    assert.equal(after.dismissedVersion, null);
+    assert.equal(after.installPhase, "idle");
+    assert.equal(after.supersededFrom, "99.1.0");
+    assert.match(after.info?.notes?.body ?? "", /Live popup swap/);
+
+    const fetchedNotes = await fetchReleaseNotes(1000, "99.2.0");
+    assert.match(fetchedNotes?.body ?? "", /Live popup swap/);
+  } finally {
+    globalThis.fetch = realFetch;
+    settingsStore.set({ server: prevServer });
+  }
+});
+
+test("startUpdateDownload checks pre-download freshness and upgrades to newer release before downloading", async () => {
+  const realFetch = globalThis.fetch;
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  const prevServer = settingsStore.get().server;
+  let openedUrl = "";
+  (globalThis as Record<string, unknown>).window = {
+    open: (url: string) => {
+      openedUrl = url;
+      return null;
+    },
+  };
+  settingsStore.set({ server: "" });
+  clientConfigStore.set((prev) => ({
+    ...prev,
+    config: { ...prev.config, update: { ...prev.config.update, region: "global", preferredSource: "direct", mirrors: [] } },
+  }));
+
+  const m92 = multiChannelManifest("99.2.0");
+  globalThis.fetch = (async (input: string | URL) => {
+    const u = String(input);
+    if (u.endsWith("/releases/latest/download/RELEASE-MANIFEST.json")) {
+      return new Response(JSON.stringify(m92), { status: 200 });
+    }
+    if (u.endsWith("/releases/download/v99.2.0/RELEASE-NOTES.md")) {
+      return new Response("# Herdr Pocket v99.2.0\n\n- Pre-download guard\n", { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    await checkForUpdate("manual");
+    updateStore.set({
+      info: {
+        current: appVersion(),
+        latest: "99.1.0",
+        hasUpdate: true,
+        downloadUrl: "https://github.com/Crosery/herdr-pocket/releases/download/v99.1.0/herdr-pocket-99.1.0.tar.gz",
+        downloadUrls: [],
+        pageUrl: "https://github.com/Crosery/herdr-pocket/releases/tag/v99.1.0",
+        source: "github.com",
+        region: "global",
+        regionReason: "test",
+      },
+      checkedAt: Date.now() - 20_000,
+      installPhase: "idle",
+      supersededFrom: null,
+    });
+
+    await startUpdateDownload();
+    assert.equal(updateStore.get().info?.latest, "99.2.0");
+    assert.equal(updateStore.get().supersededFrom, "99.1.0");
+    assert.match(openedUrl, /releases\/download\/v99\.2\.0\//);
+  } finally {
+    globalThis.fetch = realFetch;
+    settingsStore.set({ server: prevServer });
+    if (prevWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+    else (globalThis as Record<string, unknown>).window = prevWindow;
   }
 });

@@ -465,6 +465,8 @@ export type UpdateCheckOptions =
       mirrors?: string[];
       preferredSource?: string;
       forceRace?: boolean;
+      relayServer?: string;
+      minExpectedVersion?: string;
     };
 
 async function detectMacArch(): Promise<"arm64" | "x64"> {
@@ -881,6 +883,84 @@ export async function fetchVersionReleaseNotes(
   return null;
 }
 
+interface RelayLatestResponse {
+  latest?: string;
+  relayVersion?: string;
+  manifest?: ReleaseManifest | null;
+  notes?: string | null;
+}
+
+const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+function cleanSemver(raw: string | undefined | null): string | null {
+  if (!raw || typeof raw !== "string") return null;
+  const v = raw.trim().replace(/^v/i, "");
+  return SEMVER_RE.test(v) ? v : null;
+}
+
+async function fetchRelayLatest(relayServer?: string, timeoutMs = 3500): Promise<RelayLatestResponse | null> {
+  const raw = relayServer?.trim().replace(/\/+$/, "");
+  if (!raw || /^demo:/i.test(raw)) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && local)) return null;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${raw}/v1/releases/latest`, { signal: ac.signal, cache: "no-store" });
+    if (!res.ok) return null;
+    const data = (await res.json().catch(() => null)) as RelayLatestResponse | null;
+    return data && typeof data === "object" ? data : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchTaggedManifestOrSums(
+  version: string,
+  sources: string[],
+  timeoutMs = 4500,
+): Promise<{ source: string; version: string; sums: Record<string, string>; manifest?: ReleaseManifest } | null> {
+  const clean = cleanSemver(version);
+  if (!clean || !sources.length) return null;
+  const manifestUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${clean}/RELEASE-MANIFEST.json`;
+  const sumsUrl = `https://github.com/${RELEASE_REPO}/releases/download/v${clean}/SHA256SUMS`;
+  for (const src of sources) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const mRes = await fetchSums(sourceUrl(src, manifestUrl), ctl.signal, timeoutMs);
+      if (mRes.manifest && compareVersions(mRes.manifest.releaseVersion, clean) >= 0) {
+        return { source: src, ...mRes };
+      }
+    } catch {
+      // Fallback to tagged SHA256SUMS on the same source before trying the next source
+      const sCtl = new AbortController();
+      const sTimer = setTimeout(() => sCtl.abort(), timeoutMs);
+      try {
+        const sRes = await fetchSums(sourceUrl(src, sumsUrl), sCtl.signal, timeoutMs);
+        if (compareVersions(sRes.version, clean) >= 0) {
+          return { source: src, ...sRes };
+        }
+      } catch {
+        // try next source
+      } finally {
+        clearTimeout(sTimer);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
+}
+
 /**
  * The newest release and where to download it. Region: HERDR_POCKET_MIRROR, then
  * `update.region`, then the time zone. When `update.preferredSource` pins `"direct"` or a
@@ -889,7 +969,9 @@ export async function fetchVersionReleaseNotes(
  * GitHub Releases API is queried in parallel in the desktop app.
  */
 export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<ReleaseUpdateInfo> {
-  const forceRace = typeof opts === "object" && opts !== null && Boolean(opts.forceRace);
+  const optObj = typeof opts === "object" && opts !== null ? opts : undefined;
+  const forceRace = Boolean(optObj?.forceRace);
+  const relayPromise = fetchRelayLatest(optObj?.relayServer);
   const ghPromise: Promise<GithubLatestRelease | null> = isTauri()
     ? tauriInvoke<GithubLatestRelease>("update_fetch_github_latest", { timeoutMs: DESKTOP_PROBE_TIMEOUT_MS }).catch(() => null)
     : Promise.resolve(null);
@@ -972,9 +1054,46 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
   const macArch = platform === "macos" ? await detectMacArch() : "arm64";
   const channel = desktopReleaseChannel(platform, macArch);
 
-  const gh = await ghPromise;
+  const [gh, relay] = await Promise.all([ghPromise, relayPromise]);
   const ghExpectedAsset = gh ? platformDownloadAsset(gh.version, platform, macArch) : "";
   const ghHasPlatformAsset = Boolean(gh && gh.assets.some((a) => a.name === ghExpectedAsset));
+
+  let newestHint: string | undefined;
+  for (const cand of [
+    cleanSemver(optObj?.minExpectedVersion),
+    cleanSemver(relay?.latest),
+    cleanSemver(relay?.relayVersion),
+    ghHasPlatformAsset ? cleanSemver(gh?.version) : null,
+    cleanSemver(version),
+  ]) {
+    if (cand && (!newestHint || compareVersions(cand, newestHint) > 0)) {
+      newestHint = cand;
+    }
+  }
+
+  // Bypass stale mirror /releases/latest caches whenever Relay, push hint, or GitHub API knows a newer tag.
+  if (newestHint && (!version || compareVersions(newestHint, version) > 0)) {
+    const relayManifest = relay?.manifest ? parseReleaseManifest(JSON.stringify(relay.manifest)) : null;
+    if (relayManifest && compareVersions(relayManifest.releaseVersion, newestHint) >= 0) {
+      version = relayManifest.releaseVersion;
+      manifest = relayManifest;
+      sumsMap = Object.fromEntries(
+        Object.values(relayManifest.channels)
+          .filter((e): e is NonNullable<typeof e> => Boolean(e))
+          .map((e) => [e.fileName, e.sha256]),
+      );
+      if (source === undefined) source = cached ?? base[0] ?? "";
+    } else {
+      const tagSources = orderWithPreferredSource(base, preferredSource, source ?? cached);
+      const tagged = await fetchTaggedManifestOrSums(newestHint, tagSources);
+      if (tagged) {
+        source = tagged.source;
+        version = tagged.version;
+        sumsMap = tagged.sums;
+        manifest = tagged.manifest;
+      }
+    }
+  }
 
   if (version === undefined) {
     if (gh) {
@@ -1018,9 +1137,15 @@ export async function checkReleaseUpdate(opts?: UpdateCheckOptions): Promise<Rel
   const assetSize = chEntry?.size || ghAsset?.size || undefined;
   const assetConfirmed = manifest ? Boolean(chEntry) : sumsMap ? Boolean(sumsMap[assetName]) : Boolean(ghAsset);
   const hasUpdate = assetConfirmed && compareVersions(resolvedVersion, current) > 0;
+  const relayNotes =
+    relay?.notes && cleanSemver(relay.latest) === resolvedVersion
+      ? relay.notes.trim()
+      : "";
   const notes: ReleaseNotesInfo | null = ghMatch?.body
     ? { body: ghMatch.body, url: ghMatch.htmlUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${resolvedVersion}`, publishedAt: ghMatch.publishedAt }
-    : null;
+    : relayNotes
+      ? { body: relayNotes, url: `https://github.com/${RELEASE_REPO}/releases/tag/v${resolvedVersion}`, publishedAt: "" }
+      : null;
 
   return {
     current,
@@ -1047,6 +1172,11 @@ export function downloadAndStageUpdate(params: {
   expectedSha256: string;
 }): Promise<StagedUpdateResult> {
   return call<StagedUpdateResult>("update_download_and_stage", params);
+}
+
+export async function cancelUpdateDownload(): Promise<void> {
+  if (!isTauri()) return;
+  await tauriInvoke<boolean>("update_cancel_download").catch(() => false);
 }
 
 export function restartAndApplyUpdate(): Promise<void> {

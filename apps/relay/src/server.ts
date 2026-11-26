@@ -90,6 +90,7 @@ export interface RelayOptions {
   /** Directory and upstream override for the built-in release cache (`:memory:` tests isolate automatically). */
   releaseCacheDir?: string;
   releaseUpstreamBases?: string[];
+  releasePollIntervalMs?: number;
 }
 
 interface Conn {
@@ -206,6 +207,9 @@ export class Relay {
       dbPath: opts.dbPath,
       cacheDir: opts.releaseCacheDir,
       upstreamBases: opts.releaseUpstreamBases,
+      serverVersion: VERSION,
+      pollIntervalMs: opts.releasePollIntervalMs,
+      onNewRelease: (version) => this.broadcast({ type: "release_update", version, ts: Date.now() }),
       log: this.log,
     });
     this.http = createServer((req, res) => {
@@ -457,6 +461,11 @@ export class Relay {
         "X-Content-Type-Options": "nosniff",
       });
       res.end(req.method === "HEAD" ? undefined : asset.body);
+      return;
+    }
+
+    if ((req.method === "GET" || req.method === "HEAD") && path === "/v1/releases/latest") {
+      await this.releases.handleLatest(req, res, VERSION);
       return;
     }
 
@@ -1629,7 +1638,15 @@ export class Relay {
     });
     ws.on("error", () => {});
 
-    this.send(conn, { type: "welcome", version: PROTOCOL_VERSION, device: this.decorate(conn.device), seq: this.seq });
+    const latestRel = this.releases.latestVersion();
+    this.send(conn, {
+      type: "welcome",
+      version: PROTOCOL_VERSION,
+      serverVersion: VERSION,
+      ...(latestRel ? { latestRelease: latestRel } : {}),
+      device: this.decorate(conn.device),
+      seq: this.seq,
+    });
     this.send(conn, { type: "snapshot", seq: this.seq, devices: this.devices(), agents: this.allAgents() });
     if (announceOnline) {
       this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(conn.device) }, device.id);

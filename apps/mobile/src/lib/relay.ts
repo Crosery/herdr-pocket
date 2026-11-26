@@ -21,6 +21,7 @@ import { loadAssistant, onAssistantFrame } from "./assistant";
 import { onLinkBack } from "./assistantConfig";
 import { applog } from "./applog";
 import { DirectError, DirectLink, classifyDirectAddr } from "./direct";
+import { notifyReleaseAvailable } from "./update";
 
 export class RelayError extends Error {
   code: RpcError["code"];
@@ -273,9 +274,13 @@ class SocketLink implements Link {
       case "welcome":
         this.welcomed = true;
         useLive.setState({ self: f.device, link: "online", lastError: null });
+        notifyReleaseAvailable(f.latestRelease || f.serverVersion);
         // Catch up on anything the assistant said, or another phone changed, while this socket was down.
         void loadAssistant();
         onLinkBack();
+        break;
+      case "release_update":
+        notifyReleaseAvailable(f.version);
         break;
       case "snapshot": {
         const devices = Object.fromEntries(f.devices.map((d) => [d.id, d]));

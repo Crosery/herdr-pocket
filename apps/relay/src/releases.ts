@@ -4,9 +4,21 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import { allReleaseSources, inMainlandChina, RELEASE_REPO } from "@herdr-pocket/protocol";
+import {
+  allReleaseSources,
+  compareVersions,
+  inMainlandChina,
+  LATEST_MANIFEST_URL,
+  LATEST_SUMS_URL,
+  parseReleaseManifest,
+  RELEASE_REPO,
+  releaseAssetUrl,
+  releaseFromSums,
+  type ReleaseManifest,
+} from "@herdr-pocket/protocol";
 
 const TAG_RE = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const ASSET_RE = /^[A-Za-z0-9._-]+$/;
 const METADATA_ASSETS = new Set(["SHA256SUMS", "RELEASE-MANIFEST.json", "RELEASE-NOTES.md"]);
 const ALLOWED_EXT_RE = /\.(?:dmg|apk|ipa|hap|msi|exe|deb|AppImage|tar\.gz|zip)$/i;
@@ -14,13 +26,28 @@ const MAX_ASSET_BYTES = 500 * 1024 * 1024;
 const MAX_CACHED_VERSIONS = 3;
 const HEAD_TIMEOUT_MS = 12_000;
 const STALL_TIMEOUT_MS = 20_000;
+const LATEST_CACHE_TTL_MS = 20_000;
+const LATEST_FETCH_TIMEOUT_MS = 6_000;
 
 export interface ReleaseCacheOptions {
   dbPath: string;
   cacheDir?: string;
   /** Test override: upstream base URLs (`${base}/${tag}/${asset}`). */
   upstreamBases?: string[];
+  /** Current relay semver used as baseline before the first upstream check completes. */
+  serverVersion?: string;
+  /** Override background release polling interval in ms (0 disables polling). */
+  pollIntervalMs?: number;
+  /** Invoked whenever a strictly newer release version than prior known state is observed. */
+  onNewRelease?: (version: string) => void;
   log?: (msg: string) => void;
+}
+
+export interface RelayLatestSnapshot {
+  latest: string | null;
+  manifest?: ReleaseManifest;
+  notes?: string;
+  checkedAt: number;
 }
 
 class ReleaseHttpError extends Error {
@@ -88,7 +115,14 @@ export class ReleaseCache {
   private readonly ephemeral: boolean;
   private readonly upstreamBases?: string[];
   private readonly log: (msg: string) => void;
+  private readonly onNewRelease?: (version: string) => void;
   private inflight = new Map<string, Promise<string>>();
+  private latestKnown: string | null;
+  private latestSnapshot: RelayLatestSnapshot | null = null;
+  private latestInflight: Promise<RelayLatestSnapshot> | null = null;
+  private initTimer: NodeJS.Timeout | null = null;
+  private pollTimer: NodeJS.Timeout | null = null;
+  private closed = false;
 
   constructor(opts: ReleaseCacheOptions) {
     if (opts.cacheDir) {
@@ -103,10 +137,40 @@ export class ReleaseCache {
     }
     this.upstreamBases = opts.upstreamBases?.length ? [...opts.upstreamBases] : undefined;
     this.log = opts.log ?? (() => {});
+    this.onNewRelease = opts.onNewRelease;
+    const baseVer = opts.serverVersion?.trim().replace(/^v/i, "") ?? "";
+    this.latestKnown = SEMVER_RE.test(baseVer) ? baseVer : null;
     mkdirSync(this.dir, { recursive: true });
+
+    const defaultPollMs = this.ephemeral || this.upstreamBases?.length ? 0 : 60_000;
+    const pollMs = typeof opts.pollIntervalMs === "number" ? opts.pollIntervalMs : defaultPollMs;
+    if (pollMs > 0) {
+      this.initTimer = setTimeout(() => {
+        this.initTimer = null;
+        if (!this.closed) void this.checkLatestRelease(true).catch(() => {});
+      }, Math.min(1500, pollMs));
+      this.initTimer.unref?.();
+      this.pollTimer = setInterval(() => {
+        if (!this.closed) void this.checkLatestRelease(true).catch(() => {});
+      }, pollMs);
+      this.pollTimer.unref?.();
+    }
+  }
+
+  latestVersion(): string | null {
+    return this.latestKnown;
   }
 
   close(): void {
+    this.closed = true;
+    if (this.initTimer) {
+      clearTimeout(this.initTimer);
+      this.initTimer = null;
+    }
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
     if (this.ephemeral) {
       try {
         rmSync(this.dir, { recursive: true, force: true });
@@ -114,6 +178,204 @@ export class ReleaseCache {
         // ignore cleanup error
       }
     }
+  }
+
+  private async fetchTextNoCache(url: string, timeoutMs = LATEST_FETCH_TIMEOUT_MS): Promise<string | null> {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        signal: ac.signal,
+        headers: {
+          "User-Agent": "herdr-pocket-relay-cache",
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+        },
+        redirect: "follow",
+      });
+      if (!res.ok) return null;
+      return await res.text();
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async fetchFirstManifest(urls: string[]): Promise<ReleaseManifest | undefined> {
+    if (!urls.length) return undefined;
+    try {
+      return await Promise.any(
+        urls.map(async (u) => {
+          const text = await this.fetchTextNoCache(u);
+          const parsed = text ? parseReleaseManifest(text) : null;
+          if (!parsed) throw new Error("not manifest");
+          return parsed;
+        }),
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async fetchFirstNotes(urls: string[]): Promise<string | undefined> {
+    if (!urls.length) return undefined;
+    try {
+      return await Promise.any(
+        urls.map(async (u) => {
+          const text = await this.fetchTextNoCache(u, 4000);
+          const trimmed = text?.trim() ?? "";
+          if (!trimmed || /^\s*<(?:!doctype|html)\b/i.test(trimmed)) throw new Error("not notes");
+          return trimmed;
+        }),
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async fetchGithubLatest(): Promise<{ version: string; body?: string } | null> {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), LATEST_FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(`https://api.github.com/repos/${RELEASE_REPO}/releases/latest`, {
+        signal: ac.signal,
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "herdr-pocket-relay-cache",
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+        },
+      });
+      if (!res.ok) return null;
+      const json = (await res.json()) as { tag_name?: string; body?: string; draft?: boolean; prerelease?: boolean };
+      if (json.draft || json.prerelease) return null;
+      const v = (json.tag_name ?? "").trim().replace(/^v/i, "");
+      if (!SEMVER_RE.test(v)) return null;
+      return { version: v, body: typeof json.body === "string" && json.body.trim() ? json.body.trim() : undefined };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async checkLatestRelease(force = false): Promise<RelayLatestSnapshot> {
+    if (!force && this.latestSnapshot && Date.now() - this.latestSnapshot.checkedAt < LATEST_CACHE_TTL_MS) {
+      return this.latestSnapshot;
+    }
+    if (this.latestInflight) return this.latestInflight;
+
+    const task = (async (): Promise<RelayLatestSnapshot> => {
+      let manifest: ReleaseManifest | undefined;
+      let notes: string | undefined;
+      let sumsVersion: string | null = null;
+      let ghVersion: string | null = null;
+
+      if (this.upstreamBases?.length) {
+        const manifestUrls = this.upstreamBases.map((b) => `${b.replace(/\/+$/, "")}/latest/RELEASE-MANIFEST.json`);
+        const sumsUrls = this.upstreamBases.map((b) => `${b.replace(/\/+$/, "")}/latest/SHA256SUMS`);
+        const noteUrls = this.upstreamBases.map((b) => `${b.replace(/\/+$/, "")}/latest/RELEASE-NOTES.md`);
+        manifest = await this.fetchFirstManifest(manifestUrls);
+        if (!manifest) {
+          for (const u of sumsUrls) {
+            const txt = await this.fetchTextNoCache(u);
+            const parsed = txt ? releaseFromSums(txt) : null;
+            if (parsed) {
+              sumsVersion = parsed.version;
+              break;
+            }
+          }
+        }
+        notes = await this.fetchFirstNotes(noteUrls);
+      } else {
+        const china = inMainlandChina();
+        const [gh, mirrorManifest] = await Promise.all([
+          this.fetchGithubLatest(),
+          this.fetchFirstManifest(allReleaseSources(LATEST_MANIFEST_URL, china)),
+        ]);
+        if (gh) {
+          ghVersion = gh.version;
+          if (gh.body) notes = gh.body;
+        }
+        manifest = mirrorManifest;
+        if (!ghVersion && !manifest) {
+          for (const u of allReleaseSources(LATEST_SUMS_URL, china)) {
+            const txt = await this.fetchTextNoCache(u);
+            const parsed = txt ? releaseFromSums(txt) : null;
+            if (parsed) {
+              sumsVersion = parsed.version;
+              break;
+            }
+          }
+        }
+      }
+
+      let best: string | null = null;
+      for (const cand of [ghVersion, manifest?.releaseVersion, sumsVersion]) {
+        if (cand && SEMVER_RE.test(cand) && (!best || compareVersions(cand, best) > 0)) {
+          best = cand;
+        }
+      }
+
+      if (best && (!manifest || compareVersions(best, manifest.releaseVersion) > 0)) {
+        const taggedManifestUrls = this.upstreamBases?.length
+          ? this.upstreamBases.map((b) => `${b.replace(/\/+$/, "")}/v${best}/RELEASE-MANIFEST.json`)
+          : allReleaseSources(releaseAssetUrl(best, "RELEASE-MANIFEST.json"), inMainlandChina());
+        const taggedManifest = await this.fetchFirstManifest(taggedManifestUrls);
+        if (taggedManifest) manifest = taggedManifest;
+      }
+
+      if (best && !notes) {
+        const taggedNotesUrls = this.upstreamBases?.length
+          ? this.upstreamBases.map((b) => `${b.replace(/\/+$/, "")}/v${best}/RELEASE-NOTES.md`)
+          : allReleaseSources(releaseAssetUrl(best, "RELEASE-NOTES.md"), inMainlandChina());
+        notes = await this.fetchFirstNotes(taggedNotesUrls);
+      }
+
+      const checkedAt = Date.now();
+      const prevKnown = this.latestKnown;
+      if (best && (!prevKnown || compareVersions(best, prevKnown) > 0)) {
+        this.latestKnown = best;
+        if (prevKnown !== null) {
+          this.log(`releases: detected newer release v${best} (was v${prevKnown})`);
+          this.onNewRelease?.(best);
+        }
+      }
+
+      const snap: RelayLatestSnapshot = {
+        latest: best ?? this.latestKnown,
+        ...(manifest ? { manifest } : {}),
+        ...(notes ? { notes } : {}),
+        checkedAt,
+      };
+      this.latestSnapshot = snap;
+      return snap;
+    })().finally(() => {
+      if (this.latestInflight === task) this.latestInflight = null;
+    });
+
+    this.latestInflight = task;
+    return task;
+  }
+
+  async handleLatest(req: IncomingMessage, res: ServerResponse, relayVersion: string): Promise<void> {
+    const force = (req.url ?? "").includes("refresh=1");
+    const snap = await this.checkLatestRelease(force);
+    const body = JSON.stringify({
+      ok: true,
+      latest: snap.latest ?? this.latestKnown ?? relayVersion,
+      relayVersion,
+      manifest: snap.manifest ?? null,
+      notes: snap.notes ?? null,
+      checkedAt: snap.checkedAt,
+    });
+    res.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    res.end(req.method === "HEAD" ? undefined : body);
   }
 
   async handleDownload(req: IncomingMessage, res: ServerResponse, tag: string, asset: string): Promise<void> {

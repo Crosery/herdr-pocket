@@ -5,6 +5,8 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { WebSocket } from "ws";
+import { buildReleaseManifest, type ServerFrame } from "@herdr-pocket/protocol";
 import { Relay } from "../src/server.ts";
 
 const dirs: string[] = [];
@@ -142,5 +144,125 @@ test("Relay release cache fetches, verifies SHA256SUMS, serves Range 206, hits l
     }
   } finally {
     await relay.close();
+  }
+});
+
+test("Relay /v1/releases/latest, welcome.serverVersion, and WebSocket release_update track upstream upgrades", async () => {
+  let latestVer = "99.1.0";
+  const upstream = createServer((req, res) => {
+    const u = req.url ?? "";
+    const makeManifest = (ver: string) =>
+      JSON.stringify(
+        buildReleaseManifest({
+          releaseVersion: ver,
+          sums: {
+            [`herdr-pocket-${ver}-macos-arm64.dmg`]: sha256(Buffer.from(`dmg-${ver}`)),
+            [`herdr-pocket-${ver}-android-arm64.apk`]: sha256(Buffer.from(`apk-${ver}`)),
+          },
+        }),
+      );
+    if (u === "/latest/RELEASE-MANIFEST.json") {
+      const body = makeManifest(latestVer);
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }).end(body);
+      return;
+    }
+    if (u === "/v99.1.0/RELEASE-MANIFEST.json" || u === "/v99.2.0/RELEASE-MANIFEST.json") {
+      const v = u.slice(2, 8);
+      const body = makeManifest(v);
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }).end(body);
+      return;
+    }
+    if (u === "/latest/RELEASE-NOTES.md") {
+      const body = `# Notes ${latestVer}\n- Ready ${latestVer}`;
+      res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": Buffer.byteLength(body) }).end(body);
+      return;
+    }
+    if (u === "/v99.1.0/RELEASE-NOTES.md" || u === "/v99.2.0/RELEASE-NOTES.md") {
+      const v = u.slice(2, 8);
+      const body = `# Notes ${v}\n- Ready ${v}`;
+      res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": Buffer.byteLength(body) }).end(body);
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  const upPort = await new Promise<number>((resolve) =>
+    upstream.listen(0, "127.0.0.1", () => resolve((upstream.address() as { port: number }).port)),
+  );
+  const adminToken = "admin-rel-watch-0123456789abcdef";
+  const relay = new Relay({
+    dbPath: join(tempDir("pocket-rel-latest-db-"), "relay.db"),
+    adminToken,
+    releaseCacheDir: tempDir("pocket-rel-latest-cache-"),
+    releaseUpstreamBases: [`http://127.0.0.1:${upPort}`],
+    releasePollIntervalMs: 75,
+    log: () => {},
+  });
+  const port = await relay.listen(0, "127.0.0.1");
+  const base = `http://127.0.0.1:${port}`;
+
+  try {
+    const codeRes = await fetch(`${base}/v1/pair/codes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ kind: "viewer" }),
+    });
+    const { code } = (await codeRes.json()) as { code: string };
+    const pairRes = await fetch(`${base}/v1/pair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, name: "RelWatch Viewer", kind: "viewer" }),
+    });
+    const { token } = (await pairRes.json()) as { token: string };
+
+    const frames: ServerFrame[] = [];
+    const waiters: Array<{ pred: (f: ServerFrame) => boolean; resolve: (f: ServerFrame) => void }> = [];
+    const ws = new WebSocket(`${base.replace("http", "ws")}/v1/ws?token=${encodeURIComponent(token)}`);
+    ws.on("message", (d) => {
+      const f = JSON.parse(d.toString()) as ServerFrame;
+      frames.push(f);
+      for (let i = waiters.length - 1; i >= 0; i--) {
+        if (waiters[i]!.pred(f)) {
+          const w = waiters.splice(i, 1)[0]!;
+          w.resolve(f);
+        }
+      }
+    });
+    const nextFrame = (pred: (f: ServerFrame) => boolean, ms = 3000) => {
+      const hit = frames.find(pred);
+      if (hit) return Promise.resolve(hit);
+      return new Promise<ServerFrame>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("timeout waiting for frame")), ms);
+        waiters.push({
+          pred,
+          resolve: (f) => {
+            clearTimeout(timer);
+            resolve(f);
+          },
+        });
+      });
+    };
+
+    const welcome = await nextFrame((f) => f.type === "welcome");
+    assert.equal(welcome.type, "welcome");
+    assert.match(welcome.serverVersion ?? "", /^\d+\.\d+\.\d+/);
+
+    const firstRes = await fetch(`${base}/v1/releases/latest?refresh=1`);
+    assert.equal(firstRes.status, 200);
+    const firstJson = (await firstRes.json()) as { latest: string; notes: string };
+    assert.equal(firstJson.latest, "99.1.0");
+    assert.match(firstJson.notes, /Ready 99\.1\.0/);
+
+    latestVer = "99.2.0";
+    const pushFrame = await nextFrame((f) => f.type === "release_update" && f.version === "99.2.0");
+    assert.equal(pushFrame.type, "release_update");
+
+    const latestRes = await fetch(`${base}/v1/releases/latest`);
+    const latestJson = (await latestRes.json()) as { latest: string; notes: string };
+    assert.equal(latestJson.latest, "99.2.0");
+    assert.match(latestJson.notes, /Ready 99\.2\.0/);
+    ws.terminate();
+  } finally {
+    await relay.close();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
   }
 });
