@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { Agent, AgentStatus, ChatDisplayMode, Device, SpaceInfo } from "@herdr-pocket/protocol";
+import type { Agent, AgentStatus, ChatDisplayMode, Device, PortalDisplayMode, SpaceInfo } from "@herdr-pocket/protocol";
 import { STATUS_ORDER } from "@herdr-pocket/protocol";
 
 export type LinkStatus = "idle" | "connecting" | "online" | "offline" | "unauthorized";
@@ -33,6 +33,7 @@ export interface AppSettings {
   theme: ThemeChoice;
   textScale: number;
   chatDisplayMode: ChatDisplayMode;
+  portalDisplayMode: PortalDisplayMode;
   showShells: boolean;
   notifications: boolean;
   denoise: boolean;
@@ -88,6 +89,7 @@ function persistPrefs(s: AppSettings): void {
     theme: s.theme,
     textScale: s.textScale,
     chatDisplayMode: s.chatDisplayMode,
+    portalDisplayMode: s.portalDisplayMode,
     showShells: s.showShells,
     notifications: s.notifications,
     denoise: s.denoise,
@@ -159,6 +161,13 @@ export const settingsStore = createStore<AppSettings>({
   theme: saved.theme ?? "system",
   textScale: saved.textScale ?? 1,
   chatDisplayMode: saved.chatDisplayMode ?? "standard",
+  portalDisplayMode:
+    saved.portalDisplayMode === "collapsed" ||
+    saved.portalDisplayMode === "fan" ||
+    saved.portalDisplayMode === "tile" ||
+    saved.portalDisplayMode === "cascade"
+      ? saved.portalDisplayMode
+      : "collapsed",
   showShells: saved.showShells ?? false,
   notifications: saved.notifications ?? true,
   denoise: saved.denoise ?? true,

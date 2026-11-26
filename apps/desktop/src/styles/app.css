@@ -1909,6 +1909,7 @@ a {
 :root[data-calm] *::before,
 :root[data-calm] *::after {
   animation-play-state: paused !important;
+  transition-duration: 0.01ms !important;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -5846,9 +5847,23 @@ a {
 }
 
 .session-portal-pip.is-collapsed {
-  width: 268px !important;
+  width: auto !important;
+  min-width: 240px;
+  max-width: min(370px, calc(100% - 28px));
   height: auto !important;
   min-height: 0;
+}
+
+.session-portal-pip.is-tile {
+  width: auto;
+  min-width: 260px;
+  max-width: calc(100% - 28px);
+  height: auto;
+  max-height: calc(100% - 28px);
+  gap: 8px;
+  overflow-y: auto;
+  overflow-x: visible;
+  padding-right: 2px;
 }
 
 .session-portal-pip.is-cascade {
@@ -5878,6 +5893,11 @@ a {
   box-shadow: 0 6px 18px rgba(18, 12, 24, 0.14);
   backdrop-filter: blur(12px);
   flex: none;
+}
+
+.session-portal-stack-bar.is-compact {
+  justify-content: space-between;
+  padding: 5px 8px;
 }
 
 .session-portal-stack-pills {
@@ -5953,6 +5973,13 @@ a {
   background: color-mix(in srgb, var(--ink) 10%, transparent);
 }
 
+.session-portal-mode-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+}
+
 .session-portal-stack-toggle {
   display: inline-flex;
   align-items: center;
@@ -5967,10 +5994,42 @@ a {
   white-space: nowrap;
   flex: none;
   cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.session-portal-stack-toggle.is-active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
 }
 
 .session-portal-stack-toggle:hover {
   filter: brightness(0.97);
+}
+
+.session-portal-card-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  border: 1px solid var(--line-pink);
+  color: var(--accent-text);
+  font-size: 10.5px;
+  font-weight: 800;
+  line-height: 1;
+  flex: none;
+}
+
+.session-portal-card-num.is-mini {
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  font-size: 9.5px;
+  border-radius: 5px;
 }
 
 .session-portal-deck-stage {
@@ -5979,61 +6038,80 @@ a {
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
+  box-sizing: border-box;
 }
 
 .session-portal-deck-stage.has-back {
-  padding-top: 14px;
-  padding-right: 12px;
+  min-height: 150px;
 }
 
 .session-portal-deck-back {
   position: absolute;
-  inset: 14px 12px 0 0;
-  border-radius: 14px;
-  border: 1px solid var(--line-pink);
-  background: color-mix(in srgb, var(--surface-2) 86%, transparent);
-  box-shadow: 0 8px 22px rgba(18, 12, 24, 0.14);
-  backdrop-filter: blur(10px);
+  box-sizing: border-box;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
   padding: 0;
   text-align: left;
   cursor: pointer;
-  transform-origin: top right;
-  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease;
+  overflow: visible;
+  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
 }
 
-.session-portal-deck-back[data-depth="1"] {
-  z-index: 1;
-  transform: translate(6px, -7px) scale(0.975);
-  opacity: 0.92;
+.session-portal-deck-back[data-depth="1"]:not(.is-hovered) .session-portal-pip-card-shell {
+  background: color-mix(in srgb, var(--surface) 97%, var(--surface-2));
 }
 
-.session-portal-deck-back[data-depth="2"] {
-  z-index: 0;
-  transform: translate(12px, -13px) scale(0.95);
-  opacity: 0.78;
+.session-portal-deck-back[data-depth="2"]:not(.is-hovered) .session-portal-pip-card-shell {
+  background: color-mix(in srgb, var(--surface) 92%, var(--surface-2));
 }
 
-.session-portal-deck-back:hover {
+.session-portal-deck-back[data-depth="3"]:not(.is-hovered) .session-portal-pip-card-shell {
+  background: color-mix(in srgb, var(--surface) 87%, var(--surface-2));
+}
+
+.session-portal-deck-back.is-hovered .session-portal-pip-card-shell {
   border-color: var(--primary);
-}
-
-.session-portal-deck-back-head {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 10px;
-  font-size: calc(11px * var(--ts, 1));
-  font-weight: 600;
-  color: var(--muted);
+  box-shadow: 0 14px 34px rgba(18, 12, 24, 0.28), 0 0 0 1px color-mix(in srgb, var(--primary) 38%, transparent);
 }
 
 .session-portal-deck-front {
   position: relative;
-  z-index: 2;
+  z-index: 5;
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
+  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+.session-portal-tile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 260px));
+  gap: 10px;
+}
+
+.session-portal-tile-grid.is-single {
+  grid-template-columns: minmax(260px, 316px);
+}
+
+.session-portal-tile-item {
+  width: 100%;
+  height: 158px;
+  min-width: 0;
+}
+
+.session-portal-tile-item.is-active .session-portal-pip-card-shell {
+  border-color: var(--primary);
+  box-shadow: 0 10px 28px rgba(18, 12, 24, 0.24), 0 0 0 1px color-mix(in srgb, var(--primary) 35%, transparent);
+}
+
+@media (max-width: 620px) {
+  .session-portal-tile-grid {
+    grid-template-columns: minmax(240px, 300px);
+  }
 }
 
 .session-portal-pip-card-shell {

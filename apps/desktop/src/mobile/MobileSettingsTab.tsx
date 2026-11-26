@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ChevronLeft, ChevronRight, Link2, LogOut, QrCode, RefreshCw, ScrollText, Sparkles } from "lucide-react";
+import type { PortalDisplayMode } from "@herdr-pocket/protocol";
 import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
 import { H5InstallAppCard } from "../components/H5InstallAppCard";
 import { XiaoyangOrb } from "../components/MascotAndVendor";
@@ -36,6 +37,13 @@ const THEMES: Array<{ value: ThemeChoice; label: string }> = [
   { value: "dark", label: "深色" },
 ];
 
+const PORTAL_MODES: Array<{ value: PortalDisplayMode; label: string }> = [
+  { value: "collapsed", label: "默认收起" },
+  { value: "fan", label: "叠牌露头" },
+  { value: "tile", label: "平铺" },
+  { value: "cascade", label: "叠列" },
+];
+
 export function MobileSettingsTab({
   onPairPhone,
   onConnectRelay,
@@ -49,6 +57,7 @@ export function MobileSettingsTab({
   const deviceName = settingsStore.use((s) => s.deviceName);
   const theme = settingsStore.use((s) => s.theme);
   const textScale = settingsStore.use((s) => s.textScale);
+  const portalDisplayMode = settingsStore.use((s) => s.portalDisplayMode);
   const showShells = settingsStore.use((s) => s.showShells);
   const link = liveStore.use((s) => s.link);
   const rttMs = liveStore.use((s) => s.rttMs);
@@ -173,6 +182,24 @@ export function MobileSettingsTab({
                 </button>
               );
             })}
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontWeight: 700, fontSize: fs(13.5), marginBottom: 8 }}>跨端小窗默认显示</div>
+          <div className="mp-seg" role="tablist" aria-label="跨端小窗默认显示">
+            {PORTAL_MODES.map((m) => (
+              <button
+                key={m.value}
+                type="button"
+                role="tab"
+                aria-selected={portalDisplayMode === m.value}
+                className={`mp-seg-btn${portalDisplayMode === m.value ? " active" : ""}`}
+                onClick={() => updateSettings({ portalDisplayMode: m.value })}
+              >
+                {m.label}
+              </button>
+            ))}
           </div>
         </div>
 

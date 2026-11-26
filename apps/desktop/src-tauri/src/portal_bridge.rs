@@ -9,7 +9,7 @@ use tauri::AppHandle;
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use crate::local_term::base64_encode;
+    use crate::local_term::{base64_decode, base64_encode};
     use crate::logging;
     use crate::perm_companion;
     use crate::perms::{self, State};
@@ -61,6 +61,7 @@ mod mac {
 
     struct PersistentWorker {
         sig: HelperSignature,
+        bin_mode: bool,
         child: Child,
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
@@ -78,6 +79,7 @@ mod mac {
     struct WorkerSlot {
         worker: Option<PersistentWorker>,
         serve_unsupported_for: Option<HelperSignature>,
+        bin_serve_unsupported_for: Option<HelperSignature>,
     }
 
     pub fn set_app_handle(app: &AppHandle) {
@@ -124,9 +126,13 @@ mod mac {
         Ok((path.to_path_buf(), meta.modified().ok(), meta.len()))
     }
 
-    fn spawn_worker(helper: &Path, sig: HelperSignature) -> Result<PersistentWorker, String> {
+    fn spawn_worker(
+        helper: &Path,
+        sig: HelperSignature,
+        bin_mode: bool,
+    ) -> Result<PersistentWorker, String> {
         let mut child = Command::new(helper)
-            .arg("serve")
+            .arg(if bin_mode { "serve-bin" } else { "serve" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -136,17 +142,43 @@ mod mac {
         let stdout = child.stdout.take().ok_or("worker_stdout_missing")?;
         Ok(PersistentWorker {
             sig,
+            bin_mode,
             child,
             stdin,
             stdout: BufReader::new(stdout),
         })
     }
 
-    fn try_persistent_worker(
+    fn read_bin_packet(stdout: &mut BufReader<ChildStdout>) -> Option<(i32, Vec<u8>, String)> {
+        let mut hdr = [0u8; 16];
+        stdout.read_exact(&mut hdr).ok()?;
+        if &hdr[..4] != b"HPB1" {
+            return None;
+        }
+        let code = i32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let meta_len = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        let out_len = u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]) as usize;
+        if meta_len > 1024 * 1024 || out_len > 64 * 1024 * 1024 {
+            return None;
+        }
+        let mut meta_bytes = vec![0u8; meta_len];
+        if meta_len > 0 && stdout.read_exact(&mut meta_bytes).is_err() {
+            return None;
+        }
+        let mut out_bytes = vec![0u8; out_len];
+        if out_len > 0 && stdout.read_exact(&mut out_bytes).is_err() {
+            return None;
+        }
+        let meta = String::from_utf8_lossy(&meta_bytes).into_owned();
+        Some((code, out_bytes, meta))
+    }
+
+    fn try_persistent_raw(
         slot_cell: &OnceLock<Mutex<WorkerSlot>>,
         helper: &Path,
         args: &[String],
-    ) -> Result<Option<BridgeResponse>, String> {
+        prefer_bin: bool,
+    ) -> Result<Option<(i32, Vec<u8>, String)>, String> {
         let sig = verify_owned_helper(helper)?;
         let cell = slot_cell.get_or_init(|| Mutex::new(WorkerSlot::default()));
         let Ok(mut slot) = cell.lock() else {
@@ -156,64 +188,115 @@ mod mac {
             return Ok(None);
         }
 
-        let need_respawn = match slot.worker.as_mut() {
-            Some(w) if w.sig == sig => matches!(w.child.try_wait(), Ok(Some(_)) | Err(_)),
-            _ => true,
-        };
-        if need_respawn {
-            if let Some(old) = slot.worker.take() {
-                old.stop();
-            }
-            match spawn_worker(helper, sig.clone()) {
-                Ok(w) => slot.worker = Some(w),
-                Err(_) => return Ok(None),
-            }
-        }
+        let try_modes: &[bool] =
+            if prefer_bin && slot.bin_serve_unsupported_for.as_ref() != Some(&sig) {
+                &[true, false]
+            } else {
+                &[false]
+            };
 
-        let Some(w) = slot.worker.as_mut() else {
-            return Ok(None);
-        };
-        let req_line = match serde_json::to_string(&json!({ "args": args })) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
-        };
-        if w.stdin.write_all(req_line.as_bytes()).is_err()
-            || w.stdin.write_all(b"\n").is_err()
-            || w.stdin.flush().is_err()
-        {
-            if let Some(old) = slot.worker.take() {
-                old.stop();
-            }
-            return Ok(None);
-        }
-
-        let mut resp_line = String::new();
-        match w.stdout.read_line(&mut resp_line) {
-            Ok(0) | Err(_) => {
+        for &want_bin in try_modes {
+            let need_respawn = match slot.worker.as_mut() {
+                Some(w) if w.sig == sig && w.bin_mode == want_bin => {
+                    matches!(w.child.try_wait(), Ok(Some(_)) | Err(_))
+                }
+                _ => true,
+            };
+            if need_respawn {
                 if let Some(old) = slot.worker.take() {
                     old.stop();
                 }
-                slot.serve_unsupported_for = Some(sig);
-                Ok(None)
+                match spawn_worker(helper, sig.clone(), want_bin) {
+                    Ok(w) => slot.worker = Some(w),
+                    Err(_) => {
+                        if want_bin {
+                            slot.bin_serve_unsupported_for = Some(sig.clone());
+                            continue;
+                        }
+                        return Ok(None);
+                    }
+                }
             }
-            Ok(_) => match serde_json::from_str::<BridgeResponse>(resp_line.trim()) {
-                Ok(resp) if resp.stderr != "unsupported_serve" => Ok(Some(resp)),
-                _ => {
+
+            let Some(w) = slot.worker.as_mut() else {
+                return Ok(None);
+            };
+            let req_line = match serde_json::to_string(&json!({ "args": args })) {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            };
+            if w.stdin.write_all(req_line.as_bytes()).is_err()
+                || w.stdin.write_all(b"\n").is_err()
+                || w.stdin.flush().is_err()
+            {
+                if let Some(old) = slot.worker.take() {
+                    old.stop();
+                }
+                continue;
+            }
+
+            if w.bin_mode {
+                if let Some((code, out_bytes, stderr)) = read_bin_packet(&mut w.stdout) {
+                    if stderr != "unsupported_serve" {
+                        return Ok(Some((code, out_bytes, stderr)));
+                    }
+                }
+                if let Some(old) = slot.worker.take() {
+                    old.stop();
+                }
+                slot.bin_serve_unsupported_for = Some(sig.clone());
+                continue;
+            }
+
+            let mut resp_line = String::new();
+            match w.stdout.read_line(&mut resp_line) {
+                Ok(0) | Err(_) => {
                     if let Some(old) = slot.worker.take() {
                         old.stop();
                     }
                     slot.serve_unsupported_for = Some(sig);
-                    Ok(None)
+                    return Ok(None);
                 }
-            },
+                Ok(_) => match serde_json::from_str::<BridgeResponse>(resp_line.trim()) {
+                    Ok(resp) if resp.stderr != "unsupported_serve" => {
+                        let raw = base64_decode(resp.stdout_base64.as_bytes()).unwrap_or_default();
+                        return Ok(Some((resp.code, raw, resp.stderr)));
+                    }
+                    _ => {
+                        if let Some(old) = slot.worker.take() {
+                            old.stop();
+                        }
+                        slot.serve_unsupported_for = Some(sig);
+                        return Ok(None);
+                    }
+                },
+            }
+        }
+        Ok(None)
+    }
+
+    fn try_persistent_worker(
+        slot_cell: &OnceLock<Mutex<WorkerSlot>>,
+        helper: &Path,
+        args: &[String],
+    ) -> Result<Option<BridgeResponse>, String> {
+        let prefer_bin = args.first().map(|s| s.as_str()) == Some("capture");
+        match try_persistent_raw(slot_cell, helper, args, prefer_bin)? {
+            Some((code, raw, stderr)) => Ok(Some(BridgeResponse {
+                code,
+                stdout_base64: base64_encode(&raw),
+                stderr,
+                keep_alive: false,
+            })),
+            None => Ok(None),
         }
     }
 
-    fn run_helper_with_timeout(
+    fn run_helper_raw_with_timeout(
         helper: &Path,
         args: &[String],
         timeout: Duration,
-    ) -> Result<BridgeResponse, String> {
+    ) -> Result<(i32, Vec<u8>, String), String> {
         let _ = verify_owned_helper(helper)?;
         let mut child = Command::new(helper)
             .args(args)
@@ -250,12 +333,7 @@ mod mac {
                         let _ = child.wait();
                         let _ = out_handle.join();
                         let _ = err_handle.join();
-                        return Ok(BridgeResponse {
-                            code: -1,
-                            stdout_base64: String::new(),
-                            stderr: "helper_timeout".into(),
-                            keep_alive: false,
-                        });
+                        return Ok((-1, Vec::new(), "helper_timeout".into()));
                     }
                     std::thread::sleep(Duration::from_millis(8));
                 }
@@ -269,12 +347,79 @@ mod mac {
         };
         let stdout = out_handle.join().unwrap_or_default();
         let stderr = err_handle.join().unwrap_or_default();
+        Ok((code, stdout, stderr))
+    }
+
+    fn run_helper_with_timeout(
+        helper: &Path,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<BridgeResponse, String> {
+        let (code, stdout, stderr) = run_helper_raw_with_timeout(helper, args, timeout)?;
         Ok(BridgeResponse {
             code,
             stdout_base64: base64_encode(&stdout),
             stderr,
             keep_alive: false,
         })
+    }
+
+    pub(super) fn is_valid_window_target(target: &str) -> bool {
+        if let Some(idx) = target.strip_prefix("screen:") {
+            return !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit());
+        }
+        !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    pub(super) fn pack_local_capture_packet(code: i32, raw_out: &[u8], stderr: &str) -> Vec<u8> {
+        let status: u8 = if code == 2 {
+            2
+        } else if code != 0 {
+            3
+        } else if raw_out.is_empty() {
+            1
+        } else {
+            0
+        };
+        let meta = stderr.as_bytes();
+        let meta_len = (meta.len().min(u32::MAX as usize)) as u32;
+        let mut pkt = Vec::with_capacity(5 + meta_len as usize + raw_out.len());
+        pkt.push(status);
+        pkt.extend_from_slice(&meta_len.to_be_bytes());
+        pkt.extend_from_slice(&meta[..meta_len as usize]);
+        pkt.extend_from_slice(raw_out);
+        pkt
+    }
+
+    pub fn capture_local_binary_packet(
+        window_id: &str,
+        max_width: u32,
+        quality: u32,
+        show_cursor: bool,
+        fps: u32,
+        since_seq: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        if !is_valid_window_target(window_id) {
+            return Err("invalid_window_target".into());
+        }
+        let helper = default_helper_path().ok_or_else(|| "helper_path_unavailable".to_string())?;
+        let mut args = vec![
+            "capture".to_string(),
+            window_id.to_string(),
+            max_width.clamp(480, 2560).to_string(),
+            quality.clamp(35, 95).to_string(),
+            if show_cursor { "1" } else { "0" }.to_string(),
+            fps.clamp(1, 60).to_string(),
+        ];
+        if let Some(seq) = since_seq.filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
+            args.push(seq.to_string());
+        }
+        if let Ok(Some((code, out, stderr))) = try_persistent_raw(&CAPTURE_WORKER, &helper, &args, true) {
+            return Ok(pack_local_capture_packet(code, &out, &stderr));
+        }
+        let (code, out, stderr) =
+            run_helper_raw_with_timeout(&helper, &args, Duration::from_millis(DEFAULT_TIMEOUT_MS))?;
+        Ok(pack_local_capture_packet(code, &out, &stderr))
     }
 
     pub(super) fn handle_request_line(line: &str, helper_override: Option<&Path>) -> String {
@@ -313,9 +458,9 @@ mod mac {
             let payload = serde_json::to_string(&json!({
                 "screenCapture": st.screen_recording == State::Granted,
                 "accessibility": st.accessibility == State::Granted,
-                "bridgeVersion": 2
+                "bridgeVersion": 3
             }))
-            .unwrap_or_else(|_| "{\"screenCapture\":false,\"accessibility\":false,\"bridgeVersion\":2}".into());
+            .unwrap_or_else(|_| "{\"screenCapture\":false,\"accessibility\":false,\"bridgeVersion\":3}".into());
             return respond(BridgeResponse {
                 code: 0,
                 stdout_base64: base64_encode(payload.as_bytes()),
@@ -514,9 +659,44 @@ pub fn shutdown() {
     mac::shutdown();
 }
 
+#[tauri::command]
+pub async fn local_portal_capture_frame(
+    window_id: String,
+    max_width: Option<u32>,
+    quality: Option<u32>,
+    show_cursor: Option<bool>,
+    fps: Option<u32>,
+    since_seq: Option<String>,
+) -> Result<tauri::ipc::Response, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let pkt = tauri::async_runtime::spawn_blocking(move || {
+            mac::capture_local_binary_packet(
+                &window_id,
+                max_width.unwrap_or(1600),
+                quality.unwrap_or(68),
+                show_cursor.unwrap_or(true),
+                fps.unwrap_or(30),
+                since_seq.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(tauri::ipc::Response::new(pkt))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window_id, max_width, quality, show_cursor, fps, since_seq);
+        Err("local binary capture is only supported on macOS".into())
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::mac::{handle_request_line, is_allowed_subcommand};
+    use super::mac::{
+        handle_request_line, is_allowed_subcommand, is_valid_window_target,
+        pack_local_capture_packet,
+    };
     use crate::local_term::base64_decode;
     use serde_json::Value;
     use std::fs::{self, Permissions};
@@ -563,7 +743,27 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&decoded).unwrap();
         assert!(parsed["screenCapture"].is_boolean());
         assert!(parsed["accessibility"].is_boolean());
-        assert_eq!(parsed["bridgeVersion"], 2);
+        assert_eq!(parsed["bridgeVersion"], 3);
+    }
+
+    #[test]
+    fn local_capture_packet_encodes_status_meta_and_payload() {
+        assert!(is_valid_window_target("screen:0"));
+        assert!(is_valid_window_target("12345"));
+        assert!(!is_valid_window_target("../bad"));
+        assert!(!is_valid_window_target(""));
+
+        let frame_pkt = pack_local_capture_packet(0, b"JPEGDATA", "dims:800x600\nseq:7\n");
+        assert_eq!(frame_pkt[0], 0);
+        let meta_len = u32::from_be_bytes([frame_pkt[1], frame_pkt[2], frame_pkt[3], frame_pkt[4]]) as usize;
+        assert_eq!(&frame_pkt[5..5 + meta_len], b"dims:800x600\nseq:7\n");
+        assert_eq!(&frame_pkt[5 + meta_len..], b"JPEGDATA");
+
+        let idle_pkt = pack_local_capture_packet(0, b"", "unchanged\nseq:7\n");
+        assert_eq!(idle_pkt[0], 1);
+
+        let denied_pkt = pack_local_capture_packet(2, b"", "screen_recording_denied\n");
+        assert_eq!(denied_pkt[0], 2);
     }
 
     #[test]

@@ -8,12 +8,13 @@ import {
   FolderSearch,
   Globe,
   Layers,
+  LayoutGrid,
   Maximize2,
   MousePointer,
   Rows3,
   X,
 } from "lucide-react";
-import type { Agent, PortalItem } from "@herdr-pocket/protocol";
+import type { Agent, PortalDisplayMode, PortalItem } from "@herdr-pocket/protocol";
 import { detectPlatform, isTauri } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { native } from "../lib/native";
@@ -30,7 +31,7 @@ import {
   subscribeAgentPortalUpdates,
   subscribePortalFrames,
 } from "../lib/portalClient";
-import { allAgents, liveStore, lookupAgentByKey } from "../lib/store";
+import { allAgents, liveStore, lookupAgentByKey, settingsStore } from "../lib/store";
 import { openWebTab, shellStore } from "../shell/shellStore";
 import { PocketButton } from "./PocketUI";
 
@@ -43,7 +44,9 @@ const PIP_MAX_H = 680;
 const PIP_MARGIN = 14;
 const PIP_DEFAULT_W = 328;
 const PIP_DEFAULT_H = 224;
-const PIP_BITMAP_CACHE_MAX = 6;
+const PIP_BITMAP_CACHE_MAX = 8;
+const PIP_FAN_STEP_Y = 34;
+const PIP_FAN_STEP_X = 8;
 const PIP_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|gif|svg|bmp|ico|avif)$/i;
 
 interface PipBox {
@@ -114,6 +117,8 @@ interface PortalMiniCardProps {
   visible: boolean;
   collapsed?: boolean;
   isActive: boolean;
+  inDeckBack?: boolean;
+  cardNumber?: number;
   stackCount?: number;
   fps?: number;
   maxWidth?: number;
@@ -122,6 +127,7 @@ interface PortalMiniCardProps {
   onStartHeaderDrag?: (e: ReactPointerEvent<HTMLDivElement>) => void;
   onFocusCard?: () => void;
   onToggleCollapse?: () => void;
+  onQuickLayout?: (mode: "fan" | "tile" | "cascade") => void;
   onExpandPortal: (portalId: string, hostId: string) => void;
   onClosePortal: (portalId: string, hostId: string) => void;
 }
@@ -132,6 +138,8 @@ function PortalMiniCard({
   visible,
   collapsed = false,
   isActive,
+  inDeckBack = false,
+  cardNumber,
   stackCount = 1,
   fps = 24,
   maxWidth = 960,
@@ -140,17 +148,20 @@ function PortalMiniCard({
   onStartHeaderDrag,
   onFocusCard,
   onToggleCollapse,
+  onQuickLayout,
   onExpandPortal,
   onClosePortal,
 }: PortalMiniCardProps) {
   const frame = portalStore.use((s) => s.framesById[item.id]);
+  const heartbeat = portalStore.use((s) => s.heartbeatsById[item.id]);
   const agentsMap = liveStore.use((s) => s.agents);
   liveStore.use((s) => s.direct);
   const localHostId = useLocalHostDeviceId();
   const isTauriApp = isTauri();
   const [, setTransportTick] = useState(0);
 
-  const [directControl, setDirectControl] = useState(isActive);
+  // Never auto-enable mouse forwarding in floating PiP: same-host window portals would warp the user's own cursor away.
+  const [directControl, setDirectControl] = useState(false);
   const [htmlPreview, setHtmlPreview] = useState<{ portalId: string; memUrl?: string | null; srcDoc?: string } | null>(null);
   const [imgPreview, setImgPreview] = useState<{ portalId: string; dataUri: string } | null>(null);
   const [textPreview, setTextPreview] = useState<{ portalId: string; text: string } | null>(null);
@@ -178,8 +189,14 @@ function PortalMiniCard({
 
   useEffect(() => {
     if (!visible || collapsed || !item.canInteract) return;
+    if (fps <= 0) {
+      if (!bitmapCacheRef.current.has(item.id) && !portalStore.get().framesById[item.id]) {
+        void capturePortalFrameOnce(item.hostId, item.id, { maxWidth, quality }).catch(() => {});
+      }
+      return;
+    }
     return subscribePortalFrames(item.hostId, item.id, { fps, maxWidth, quality });
-  }, [collapsed, fps, item.canInteract, item.hostId, item.id, maxWidth, quality, visible]);
+  }, [bitmapCacheRef, collapsed, fps, item.canInteract, item.hostId, item.id, maxWidth, quality, visible]);
 
   useEffect(() => {
     if (!visible || collapsed) return;
@@ -450,9 +467,10 @@ function PortalMiniCard({
       ? item.url
       : null;
   const openUrl = safeExternalUrl ?? (activeHtml?.memUrl ? activeHtml.memUrl : null);
-  const canDirectControl = Boolean(directControl && hasStreamFrame && !item.streamError && !needsMacScreenPerm);
+  const allowDirectControlToggle = Boolean(item.canInteract && !(isSameLocalHost && item.kind === "window"));
+  const canDirectControl = Boolean(allowDirectControlToggle && directControl && hasStreamFrame && !item.streamError && !needsMacScreenPerm);
   const transport = resolvePortalTransport(item.hostId, localHostId, frame);
-  const p2pLabel = pipFps > 0 ? `${transport.label} · ${pipFps}fps` : transport.label;
+  const p2pLabel = pipFps >= 2 && !heartbeat?.idle ? `${transport.label} · ${pipFps}fps` : transport.label;
 
   const clientToPipNormalized = (clientX: number, clientY: number) => {
     const el = previewRef.current;
@@ -520,6 +538,7 @@ function PortalMiniCard({
     <div
       className={`session-portal-pip-card-shell${isActive ? " is-active" : ""}${collapsed ? " is-collapsed" : ""}`}
       onMouseDown={(e) => {
+        if ((e.target as HTMLElement).closest("button")) return;
         onFocusCard?.();
         if (!canDirectControl || !(e.target as HTMLElement).closest(".session-portal-pip-preview")) {
           e.preventDefault();
@@ -529,10 +548,12 @@ function PortalMiniCard({
       <div
         className={`session-portal-pip-head${onStartHeaderDrag ? " is-draggable" : ""}`}
         onPointerDown={(e) => {
+          if ((e.target as HTMLElement).closest("button")) return;
           onFocusCard?.();
           onStartHeaderDrag?.(e);
         }}
       >
+        {cardNumber !== undefined ? <span className="session-portal-card-num">{cardNumber}</span> : null}
         <span className="session-portal-pip-ic">{portalIcon(item.kind)}</span>
         <span className="session-portal-pip-title truncate" title={item.title}>
           {item.title}
@@ -547,18 +568,35 @@ function PortalMiniCard({
               onToggleCollapse?.();
             }}
           >
-            +{stackCount - 1}
+            共 {stackCount} 个
           </button>
         ) : (
           <span className="session-portal-pip-badge">{p2pLabel}</span>
         )}
+        {collapsed && stackCount > 1 && onQuickLayout ? (
+          <button
+            type="button"
+            className="session-portal-pip-btn"
+            title="平铺展开多窗口"
+            aria-label="平铺展开多窗口"
+            onClick={(e) => {
+              e.stopPropagation();
+              onQuickLayout("tile");
+            }}
+          >
+            <LayoutGrid size={12} />
+          </button>
+        ) : null}
         {openUrl && !collapsed ? (
           <button
             type="button"
             className="session-portal-pip-btn"
             title="在内置浏览器标签打开"
             aria-label="在内置浏览器标签打开"
-            onClick={() => openWebTab(openUrl, item.title, { spaceKey: shellStore.get().selectedSpace })}
+            onClick={(e) => {
+              e.stopPropagation();
+              openWebTab(openUrl, item.title, { spaceKey: shellStore.get().selectedSpace });
+            }}
           >
             <ExternalLink size={12} />
           </button>
@@ -569,19 +607,25 @@ function PortalMiniCard({
             className="session-portal-pip-btn"
             title={collapsed ? "展开小窗预览" : "收起成胶囊"}
             aria-label={collapsed ? "展开小窗预览" : "收起成胶囊"}
-            onClick={onToggleCollapse}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleCollapse();
+            }}
           >
             {collapsed ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
           </button>
         ) : null}
-        {item.canInteract && !collapsed ? (
+        {allowDirectControlToggle && !collapsed && !inDeckBack ? (
           <button
             type="button"
             className={`session-portal-pip-btn${directControl ? " is-active" : ""}`}
-            title={directControl ? "小窗直控已开启（点击切换为点击放大）" : "开启小窗直控（直接在悬浮窗内操作）"}
+            title={directControl ? "小窗直控已开启（点击切换为点击放大）" : "开启小窗直控（拖拽控制画面，默认关闭）"}
             aria-label={directControl ? "关闭小窗直控" : "开启小窗直控"}
             aria-pressed={directControl}
-            onClick={() => setDirectControl((v) => !v)}
+            onClick={(e) => {
+              e.stopPropagation();
+              setDirectControl((v) => !v);
+            }}
           >
             <MousePointer size={12} />
           </button>
@@ -591,7 +635,10 @@ function PortalMiniCard({
           className="session-portal-pip-btn"
           title="放大进入交互操作"
           aria-label="放大进入交互操作"
-          onClick={() => onExpandPortal(item.id, item.hostId)}
+          onClick={(e) => {
+            e.stopPropagation();
+            onExpandPortal(item.id, item.hostId);
+          }}
         >
           <Maximize2 size={12} />
         </button>
@@ -600,7 +647,10 @@ function PortalMiniCard({
           className="session-portal-pip-btn"
           title="关闭浮窗"
           aria-label="关闭浮窗"
-          onClick={() => onClosePortal(item.id, item.hostId)}
+          onClick={(e) => {
+            e.stopPropagation();
+            onClosePortal(item.id, item.hostId);
+          }}
         >
           <X size={13} />
         </button>
@@ -614,7 +664,10 @@ function PortalMiniCard({
           className={`session-portal-pip-preview${canDirectControl ? " is-interactive" : ""}`}
           onClick={() => {
             onFocusCard?.();
-            if (!canDirectControl) onExpandPortal(item.id, item.hostId);
+            if (!canDirectControl && !inDeckBack) onExpandPortal(item.id, item.hostId);
+          }}
+          onDoubleClick={() => {
+            if (inDeckBack) onExpandPortal(item.id, item.hostId);
           }}
           onPointerDown={(e) => {
             onFocusCard?.();
@@ -637,13 +690,13 @@ function PortalMiniCard({
             }).catch(() => {});
           }}
           onPointerMove={(e) => {
-            if (!canDirectControl) return;
+            if (!canDirectControl || !pipDragBtnRef.current) return;
             const { nx, ny } = clientToPipNormalized(e.clientX, e.clientY);
             pipPendingMoveRef.current = {
               nx,
               ny,
-              action: pipDragBtnRef.current ? "drag" : "move",
-              button: pipDragBtnRef.current ?? "left",
+              action: "drag",
+              button: pipDragBtnRef.current,
             };
             flushPipMove();
           }}
@@ -792,7 +845,9 @@ function PortalMiniCard({
               放大
             </button>
           ) : (
-            <span className="session-portal-pip-overlay">点击放大并交互操作</span>
+            <span className="session-portal-pip-overlay">
+              {inDeckBack ? "点击置顶查看 · 双击放大" : "点击放大并交互操作"}
+            </span>
           )}
         </div>
       ) : null}
@@ -902,17 +957,55 @@ export function SessionPortalPiP({
     return sortStable([...matched.values()]);
   }, [agent, dismissedIds, effectiveAgentKeys, effectiveHostIds, isTauriApp, itemsById, localHostId, manualIds, openedAtById, workspaceWide]);
 
+  const preferredMode = settingsStore.use((s) => s.portalDisplayMode);
+  const initialLayout: "fan" | "tile" | "cascade" = preferredMode === "collapsed" ? "fan" : preferredMode;
+
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [stackLayout, setStackLayout] = useState<"stack" | "cascade">("stack");
-  const [collapsed, setCollapsed] = useState(false);
+  const [hoveredBackIdx, setHoveredBackIdx] = useState<number | null>(null);
+  const [stackLayout, setStackLayout] = useState<"fan" | "tile" | "cascade">(initialLayout);
+  const [collapsed, setCollapsed] = useState<boolean>(preferredMode === "collapsed");
   const [box, setBox] = useState<PipBox>({ x: null, y: null, w: PIP_DEFAULT_W, h: PIP_DEFAULT_H });
   const [gesture, setGesture] = useState<"idle" | "drag" | "resize">("idle");
   const rootRef = useRef<HTMLDivElement | null>(null);
   const bitmapCacheRef = useRef<Map<string, ImageBitmap | HTMLImageElement>>(new Map());
   const seenOpenSeqRef = useRef<Map<string, number>>(new Map());
+  const userExpandedRef = useRef(false);
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const hostListKey = effectiveHostIds.join("\0");
   const primaryAgentKey = agent?.key ?? effectiveAgentKeys[0];
+
+  const clearHoverTimer = () => {
+    if (hoverTimerRef.current !== null) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  };
+
+  const scheduleHoverIdx = (nextIdx: number | null) => {
+    clearHoverTimer();
+    hoverTimerRef.current = setTimeout(() => {
+      hoverTimerRef.current = null;
+      setHoveredBackIdx(nextIdx);
+    }, 65);
+  };
+
+  useEffect(() => {
+    clearHoverTimer();
+    setHoveredBackIdx(null);
+  }, [collapsed, items.length, selectedId, stackLayout]);
+
+  useEffect(() => () => clearHoverTimer(), []);
+
+  useEffect(() => {
+    userExpandedRef.current = false;
+    if (preferredMode === "collapsed") {
+      setCollapsed(true);
+    } else {
+      setCollapsed(false);
+      setStackLayout(preferredMode);
+    }
+  }, [preferredMode]);
 
   useEffect(() => {
     if (!visible || !hostListKey) return;
@@ -956,11 +1049,14 @@ export function SessionPortalPiP({
 
     if (promotedId) {
       setSelectedId(promotedId);
-      setCollapsed(false);
+      // Respect "默认收起": stay folded in capsule until user explicitly expands it.
+      if (preferredMode !== "collapsed" || userExpandedRef.current) {
+        setCollapsed(false);
+      }
     } else if (selectedId && !liveIds.has(selectedId)) {
       setSelectedId(items[0]?.id ?? null);
     }
-  }, [items, openSeqById, openedAtById, selectedId]);
+  }, [items, openSeqById, openedAtById, preferredMode, selectedId]);
 
   useEffect(() => {
     return () => {
@@ -991,6 +1087,15 @@ export function SessionPortalPiP({
     [items, selectedId],
   );
 
+  const tileCards = useMemo(() => {
+    if (items.length <= 4) return items;
+    const top = items.slice(0, 4);
+    if (current && !top.some((i) => i.id === current.id)) {
+      return [current, ...top.slice(0, 3)];
+    }
+    return top;
+  }, [current, items]);
+
   const cascadeCards = useMemo(() => {
     if (items.length <= 1) return items;
     const top = items.slice(0, 3);
@@ -1003,8 +1108,25 @@ export function SessionPortalPiP({
   if (!visible || !items.length || !current) return null;
 
   const isMulti = items.length > 1;
-  const isCascade = isMulti && stackLayout === "cascade" && !collapsed;
-  const backItems = !isCascade && isMulti && !collapsed ? items.filter((i) => i.id !== current.id).slice(0, 2) : [];
+  const isTile = !collapsed && stackLayout === "tile";
+  const isCascade = isMulti && !collapsed && stackLayout === "cascade";
+  const backItems = !isTile && !isCascade && isMulti && !collapsed ? items.filter((i) => i.id !== current.id).slice(0, 3) : [];
+  const cardIndexOf = (id: string) => items.findIndex((i) => i.id === id) + 1;
+
+  const setExpandedLayout = (next: "fan" | "tile" | "cascade") => {
+    clearHoverTimer();
+    setHoveredBackIdx(null);
+    userExpandedRef.current = true;
+    setStackLayout(next);
+    setCollapsed(false);
+  };
+
+  const setFolded = (nextCollapsed: boolean) => {
+    clearHoverTimer();
+    setHoveredBackIdx(null);
+    userExpandedRef.current = !nextCollapsed;
+    setCollapsed(nextCollapsed);
+  };
 
   const currentAnchorRect = () => {
     const el = rootRef.current;
@@ -1060,7 +1182,13 @@ export function SessionPortalPiP({
       window.removeEventListener("pointerup", finish);
       window.removeEventListener("pointercancel", finish);
       setGesture("idle");
-      if (!moved) onExpandPortal(current.id, current.hostId);
+      if (!moved) {
+        if (collapsed) {
+          setFolded(false);
+        } else {
+          onExpandPortal(current.id, current.hostId);
+        }
+      }
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", finish);
@@ -1068,7 +1196,7 @@ export function SessionPortalPiP({
   };
 
   const startResize = (dir: ResizeDir) => (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0 || collapsed || isCascade) return;
+    if (e.button !== 0 || collapsed || isCascade || isTile) return;
     e.preventDefault();
     e.stopPropagation();
     const startX = e.clientX;
@@ -1120,76 +1248,194 @@ export function SessionPortalPiP({
     window.addEventListener("pointercancel", finish);
   };
 
+  const fanPadY = backItems.length * PIP_FAN_STEP_Y;
+  const fanPadX = backItems.length * PIP_FAN_STEP_X;
+  const fanPeekExpandY = Math.min(128, Math.max(84, Math.round(box.h * 0.56)));
   const sizeClamp: React.CSSProperties = { maxWidth: "calc(100% - 28px)", maxHeight: "calc(100% - 28px)" };
-  const outerExtraH = (!collapsed && isMulti ? 36 : 0) + (backItems.length > 0 ? 14 : 0);
-  const posStyle: React.CSSProperties = isCascade
-    ? { ...sizeClamp }
-    : box.x !== null && box.y !== null
-      ? {
-          left: box.x,
-          top: box.y,
-          right: "auto",
-          bottom: "auto",
-          ...sizeClamp,
-          ...(collapsed ? {} : { width: box.w, height: box.h + outerExtraH }),
-        }
-      : collapsed
-        ? sizeClamp
-        : { width: box.w, height: box.h + outerExtraH, ...sizeClamp };
+  const outerExtraH = (!collapsed && isMulti ? 40 : 0) + fanPadY;
+  const posStyle: React.CSSProperties =
+    isCascade || isTile
+      ? { ...sizeClamp }
+      : box.x !== null && box.y !== null
+        ? {
+            left: box.x,
+            top: box.y,
+            right: "auto",
+            bottom: "auto",
+            ...sizeClamp,
+            ...(collapsed ? {} : { width: box.w + fanPadX, height: box.h + outerExtraH }),
+          }
+        : collapsed
+          ? sizeClamp
+          : { width: box.w + fanPadX, height: box.h + outerExtraH, ...sizeClamp };
 
   const dirs: ResizeDir[] = ["n", "s", "e", "w", "nw", "ne", "sw", "se"];
 
-  const renderStackBar = (inCascade: boolean) => (
-    <div className="session-portal-stack-bar" role="tablist" aria-label="多窗口切换">
-      <div className="session-portal-stack-pills">
-        {items.map((it) => {
-          const active = it.id === current.id;
-          return (
-            <div key={it.id} className={`session-portal-stack-pill${active ? " is-active" : ""}`}>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={active}
-                className="session-portal-stack-pill-btn"
-                title={it.title}
-                onClick={() => {
-                  setSelectedId(it.id);
-                  setCollapsed(false);
-                }}
-              >
-                <span className="session-portal-stack-pill-ic">{portalIcon(it.kind)}</span>
-                <span className="truncate">{it.title}</span>
-              </button>
-              <button
-                type="button"
-                className="session-portal-stack-pill-close"
-                aria-label={`关闭 ${it.title}`}
-                title={`关闭 ${it.title}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void closePortalSurface(it.hostId, it.id);
-                }}
-              >
-                <X size={10} />
-              </button>
-            </div>
-          );
-        })}
-      </div>
-      {!inCascade ? (
-        <button
-          type="button"
-          className="session-portal-stack-toggle"
-          title="展开多窗口叠列预览"
-          aria-label="展开多窗口叠列预览"
-          onClick={() => setStackLayout("cascade")}
-        >
-          <Layers size={11} />
-          <span>叠列 {items.length}</span>
-        </button>
-      ) : null}
+  const renderModeButtons = (activeMode: "fan" | "tile" | "cascade") => (
+    <div className="session-portal-mode-acts" role="group" aria-label="多窗口排列方式">
+      <button
+        type="button"
+        className={`session-portal-stack-toggle${activeMode === "fan" ? " is-active" : ""}`}
+        title="1·2·3·4 叠牌露头"
+        aria-label="叠牌露头"
+        aria-pressed={activeMode === "fan"}
+        onClick={() => setExpandedLayout("fan")}
+      >
+        <Layers size={11} />
+        <span>叠牌</span>
+      </button>
+      <button
+        type="button"
+        className={`session-portal-stack-toggle${activeMode === "tile" ? " is-active" : ""}`}
+        title="多窗口平铺展开"
+        aria-label="平铺展开"
+        aria-pressed={activeMode === "tile"}
+        onClick={() => setExpandedLayout("tile")}
+      >
+        <LayoutGrid size={11} />
+        <span>平铺</span>
+      </button>
+      <button
+        type="button"
+        className={`session-portal-stack-toggle${activeMode === "cascade" ? " is-active" : ""}`}
+        title="纵向叠列对比"
+        aria-label="纵向叠列"
+        aria-pressed={activeMode === "cascade"}
+        onClick={() => setExpandedLayout("cascade")}
+      >
+        <Rows3 size={11} />
+        <span>叠列</span>
+      </button>
     </div>
   );
+
+  const renderStackBar = (activeMode: "fan" | "tile" | "cascade", showModeControls = true) => {
+    if (activeMode === "fan" && items.length <= 4) {
+      return (
+        <div className="session-portal-stack-bar is-compact" role="region" aria-label="多窗口叠牌控制">
+          <span className="session-portal-cascade-label">
+            <Layers size={12} />
+            <span>共 {items.length} 个窗口 · 悬停露头</span>
+          </span>
+          <div className="session-portal-cascade-acts">
+            {showModeControls ? renderModeButtons("fan") : null}
+            <button
+              type="button"
+              className="session-portal-pip-btn"
+              title="收起成胶囊"
+              aria-label="收起成胶囊"
+              onClick={() => setFolded(true)}
+            >
+              <ChevronUp size={13} />
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="session-portal-stack-bar" role="tablist" aria-label="多窗口切换">
+        <div className="session-portal-stack-pills">
+          {items.map((it, idx) => {
+            const active = it.id === current.id;
+            return (
+              <div key={it.id} className={`session-portal-stack-pill${active ? " is-active" : ""}`}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  className="session-portal-stack-pill-btn"
+                  title={it.title}
+                  onClick={() => {
+                    setSelectedId(it.id);
+                    setHoveredBackIdx(null);
+                    setFolded(false);
+                  }}
+                >
+                  <span className="session-portal-card-num is-mini">{idx + 1}</span>
+                  <span className="session-portal-stack-pill-ic">{portalIcon(it.kind)}</span>
+                  <span className="truncate">{it.title}</span>
+                </button>
+                <button
+                  type="button"
+                  className="session-portal-stack-pill-close"
+                  aria-label={`关闭 ${it.title}`}
+                  title={`关闭 ${it.title}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void closePortalSurface(it.hostId, it.id);
+                  }}
+                >
+                  <X size={10} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+        {showModeControls ? renderModeButtons(activeMode) : null}
+      </div>
+    );
+  };
+
+  if (isTile) {
+    return (
+      <div
+        ref={rootRef}
+        className={`session-portal-pip is-tile${mode === "term" ? " in-term" : ""}`}
+        style={posStyle}
+        role="region"
+        aria-label={`跨端多窗口平铺 · 共 ${items.length} 个`}
+        onMouseDown={(e) => {
+          if (!(e.target as HTMLElement).closest(".session-portal-pip-preview")) {
+            e.preventDefault();
+          }
+        }}
+      >
+        <div className="session-portal-cascade-bar">
+          <span className="session-portal-cascade-label">
+            <LayoutGrid size={12} />
+            <span>已平铺 {items.length} 个窗口</span>
+          </span>
+          <div className="session-portal-cascade-acts">
+            {isMulti ? renderModeButtons("tile") : null}
+            <button
+              type="button"
+              className="session-portal-pip-btn"
+              title="收起成胶囊"
+              aria-label="收起成胶囊"
+              onClick={() => setFolded(true)}
+            >
+              <ChevronUp size={13} />
+            </button>
+          </div>
+        </div>
+        {items.length > 4 ? renderStackBar("tile", false) : null}
+        <div className={`session-portal-tile-grid${tileCards.length === 1 ? " is-single" : ""}`}>
+          {tileCards.map((it) => {
+            const active = it.id === current.id;
+            return (
+              <div key={it.id} className={`session-portal-tile-item${active ? " is-active" : ""}`}>
+                <PortalMiniCard
+                  item={it}
+                  contextAgent={agent}
+                  visible={visible}
+                  isActive={active}
+                  cardNumber={cardIndexOf(it.id)}
+                  fps={active ? 30 : 15}
+                  maxWidth={720}
+                  quality={50}
+                  bitmapCacheRef={bitmapCacheRef}
+                  onFocusCard={() => setSelectedId(it.id)}
+                  onExpandPortal={onExpandPortal}
+                  onClosePortal={(pid, hid) => void closePortalSurface(hid, pid)}
+                />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
 
   if (isCascade) {
     return (
@@ -1207,32 +1453,23 @@ export function SessionPortalPiP({
       >
         <div className="session-portal-cascade-bar">
           <span className="session-portal-cascade-label">
-            <Layers size={12} />
+            <Rows3 size={12} />
             <span>已展开 {items.length} 个窗口</span>
           </span>
           <div className="session-portal-cascade-acts">
-            <button
-              type="button"
-              className="session-portal-stack-toggle is-active"
-              title="收起为单卡片叠放"
-              aria-label="收起为单卡片叠放"
-              onClick={() => setStackLayout("stack")}
-            >
-              <Rows3 size={11} />
-              <span>叠放收起</span>
-            </button>
+            {renderModeButtons("cascade")}
             <button
               type="button"
               className="session-portal-pip-btn"
               title="收起成胶囊"
               aria-label="收起成胶囊"
-              onClick={() => setCollapsed(true)}
+              onClick={() => setFolded(true)}
             >
               <ChevronUp size={13} />
             </button>
           </div>
         </div>
-        {items.length > 3 ? renderStackBar(true) : null}
+        {items.length > 3 ? renderStackBar("cascade", false) : null}
         <div className="session-portal-cascade">
           {cascadeCards.map((it) => {
             const active = it.id === current.id;
@@ -1243,7 +1480,8 @@ export function SessionPortalPiP({
                   contextAgent={agent}
                   visible={visible}
                   isActive={active}
-                  fps={active ? 24 : 10}
+                  cardNumber={cardIndexOf(it.id)}
+                  fps={active ? 30 : 15}
                   maxWidth={800}
                   quality={54}
                   bitmapCacheRef={bitmapCacheRef}
@@ -1272,36 +1510,77 @@ export function SessionPortalPiP({
         }
       }}
     >
-      {!collapsed && isMulti ? renderStackBar(false) : null}
+      {!collapsed && isMulti ? renderStackBar("fan", true) : null}
 
-      <div className={`session-portal-deck-stage${backItems.length > 0 ? " has-back" : ""}`}>
-        {backItems
-          .slice()
-          .reverse()
-          .map((backIt, revIdx) => {
-            const depth = backItems.length - revIdx;
-            return (
-              <button
-                key={backIt.id}
-                type="button"
-                className="session-portal-deck-back"
-                data-depth={String(depth)}
-                title={`切换到 ${backIt.title}`}
-                aria-label={`切换到 ${backIt.title}`}
-                onClick={() => {
+      <div
+        className={`session-portal-deck-stage${backItems.length > 0 ? " has-back" : ""}`}
+        style={backItems.length > 0 ? { paddingTop: fanPadY, paddingLeft: fanPadX } : undefined}
+        onMouseLeave={() => {
+          clearHoverTimer();
+          setHoveredBackIdx(null);
+        }}
+      >
+        {backItems.map((backIt, idx) => {
+          const z = idx + 1;
+          const cardNum = cardIndexOf(backIt.id);
+          const isHovered = hoveredBackIdx === idx;
+          const isPartedDown = hoveredBackIdx !== null && idx > hoveredBackIdx;
+          const depth = backItems.length - idx;
+          const shiftY = isPartedDown ? fanPeekExpandY : isHovered ? -2 : 0;
+          return (
+            <div
+              key={backIt.id}
+              className={`session-portal-deck-back${isHovered ? " is-hovered" : ""}${isPartedDown ? " is-parted" : ""}`}
+              data-depth={String(depth)}
+              style={{
+                top: idx * PIP_FAN_STEP_Y,
+                left: idx * PIP_FAN_STEP_X,
+                width: `calc(100% - ${fanPadX}px)`,
+                height: `calc(100% - ${fanPadY}px)`,
+                zIndex: z,
+                transform: `translate3d(0, ${shiftY}px, 0)`,
+              }}
+              onMouseEnter={() => scheduleHoverIdx(idx)}
+            >
+              <PortalMiniCard
+                item={backIt}
+                contextAgent={agent}
+                visible={visible}
+                isActive={false}
+                inDeckBack
+                cardNumber={cardNum}
+                fps={isHovered ? 24 : 0}
+                maxWidth={720}
+                quality={52}
+                bitmapCacheRef={bitmapCacheRef}
+                onFocusCard={() => {
+                  clearHoverTimer();
                   setSelectedId(backIt.id);
-                  setCollapsed(false);
+                  setHoveredBackIdx(null);
+                  setFolded(false);
                 }}
-              >
-                <span className="session-portal-deck-back-head">
-                  {portalIcon(backIt.kind)}
-                  <span className="truncate">{backIt.title}</span>
-                </span>
-              </button>
-            );
-          })}
+                onExpandPortal={onExpandPortal}
+                onClosePortal={(pid, hid) => void closePortalSurface(hid, pid)}
+              />
+            </div>
+          );
+        })}
 
-        <div className="session-portal-deck-front">
+        <div
+          className={`session-portal-deck-front${hoveredBackIdx !== null && backItems.length > 0 ? " is-parted" : ""}`}
+          style={{
+            ...(backItems.length > 0 ? { zIndex: backItems.length + 2 } : {}),
+            ...(backItems.length > 0
+              ? {
+                  transform:
+                    hoveredBackIdx !== null ? `translate3d(0, ${fanPeekExpandY}px, 0)` : "translate3d(0, 0, 0)",
+                }
+              : {}),
+          }}
+          onMouseEnter={() => {
+            if (hoveredBackIdx !== null) scheduleHoverIdx(null);
+          }}
+        >
           {!collapsed
             ? dirs.map((d) => (
                 <div
@@ -1318,13 +1597,15 @@ export function SessionPortalPiP({
             visible={visible}
             collapsed={collapsed}
             isActive
+            cardNumber={cardIndexOf(current.id)}
             stackCount={items.length}
-            fps={24}
+            fps={60}
             maxWidth={960}
-            quality={58}
+            quality={62}
             bitmapCacheRef={bitmapCacheRef}
             onStartHeaderDrag={startMoveDrag}
-            onToggleCollapse={() => setCollapsed((v) => !v)}
+            onToggleCollapse={() => setFolded(!collapsed)}
+            onQuickLayout={(next) => setExpandedLayout(next)}
             onExpandPortal={onExpandPortal}
             onClosePortal={(pid, hid) => void closePortalSurface(hid, pid)}
           />

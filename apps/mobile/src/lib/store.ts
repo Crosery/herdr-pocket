@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
-import type { Agent, ChatDisplayMode, Device } from "@herdr-pocket/protocol";
+import type { Agent, ChatDisplayMode, Device, PortalDisplayMode } from "@herdr-pocket/protocol";
 import type { TermKeyLayout } from "./termkeys";
 
 export const safeAsyncStorage: StateStorage = {
@@ -68,6 +68,7 @@ interface SettingsState {
   themeMode: ThemeMode;
   textScale: number;
   chatDisplayMode: ChatDisplayMode;
+  portalDisplayMode: PortalDisplayMode;
   showShells: boolean;
   /** Agent list device switcher: a host deviceId, or null for all hosts. */
   hostFilter: string | null;
@@ -115,6 +116,7 @@ export const useSettings = create<SettingsState>()(
       themeMode: "system",
       textScale: 1,
       chatDisplayMode: "standard",
+      portalDisplayMode: "collapsed",
       showShells: false,
       hostFilter: null,
       foldedGroups: [],

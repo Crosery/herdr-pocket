@@ -12,7 +12,10 @@ import {
   type PortalStreamEvent,
   type RemoteWindowInfo,
 } from "@herdr-pocket/protocol";
+import { detectPlatform, isTauri } from "./bridge";
+import { localHostIdStore } from "./fonts";
 import { logger } from "./log";
+import { native } from "./native";
 import { ensureDirectLinkNow, getDirectEndpoint, getDirectLink, rpcCall, subscribeStream } from "./relay";
 import { liveStore } from "./store";
 
@@ -825,6 +828,8 @@ export function subscribeAgentPortalUpdates(hostId: string, _agentKey: string): 
   return releaseWatcher;
 }
 
+let localBinaryCaptureSupported = true;
+
 export function subscribePortalFrames(
   hostId: string,
   portalId: string,
@@ -833,88 +838,252 @@ export function subscribePortalFrames(
   const opts = typeof fpsOrOpts === "number" ? { fps: fpsOrOpts } : fpsOrOpts;
   const fps = Math.max(1, Math.min(60, opts.fps ?? 30));
   let alive = true;
-  let streamLive = false;
-  let lastStreamActivityAt = 0;
-  let busy = false;
-  let ackInFlight = false;
-  let pendingAckSeq = 0;
-  let lastAckedSeq = 0;
+  let stopImpl: (() => void) | null = null;
 
-  // Kick P2P probe / RTT measurement immediately on viewer open so video doesn't stall on relay backoff.
-  ensureDirectLinkNow(hostId);
-  void capturePortalFrameOnce(hostId, portalId, opts).catch(() => {});
+  const startRemoteSubscription = () => {
+    if (!alive) return;
+    let streamLive = false;
+    let lastStreamActivityAt = 0;
+    let busy = false;
+    let ackInFlight = false;
+    let ackTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingAckSeq = 0;
+    let lastAckedSeq = 0;
 
-  const flushAck = () => {
-    if (!alive || ackInFlight || pendingAckSeq <= lastAckedSeq) return;
-    const seq = pendingAckSeq;
-    ackInFlight = true;
-    lastAckedSeq = seq;
-    void rpcCall(hostId, "portal.input", { portalId, input: { type: "ack", seq } }, 4000)
-      .catch(() => {})
-      .finally(() => {
-        ackInFlight = false;
-        if (alive && pendingAckSeq > lastAckedSeq) flushAck();
-      });
+    // Kick P2P probe / RTT measurement immediately on viewer open so video doesn't stall on relay backoff.
+    ensureDirectLinkNow(hostId);
+    void capturePortalFrameOnce(hostId, portalId, opts).catch(() => {});
+
+    const flushAck = () => {
+      if (ackTimer !== null) {
+        clearTimeout(ackTimer);
+        ackTimer = null;
+      }
+      if (!alive || ackInFlight || pendingAckSeq <= lastAckedSeq) return;
+      const seq = pendingAckSeq;
+      ackInFlight = true;
+      lastAckedSeq = seq;
+      void rpcCall(hostId, "portal.input", { portalId, input: { type: "ack", seq } }, 4000)
+        .catch(() => {})
+        .finally(() => {
+          ackInFlight = false;
+          if (!alive || pendingAckSeq <= lastAckedSeq) return;
+          if (pendingAckSeq - lastAckedSeq >= 2) {
+            flushAck();
+          } else {
+            ackTimer = setTimeout(flushAck, 28);
+          }
+        });
+    };
+
+    const unsub = subscribeStream(
+      hostId,
+      "portal",
+      {
+        portalId,
+        fps,
+        binaryFrames: true,
+        ...(opts.maxWidth ? { maxWidth: opts.maxWidth } : {}),
+        ...(opts.quality ? { quality: opts.quality } : {}),
+        ...(opts.showCursor !== undefined ? { showCursor: opts.showCursor } : {}),
+      },
+      (ev) => {
+        if (!alive) return;
+        if (
+          (ev?.kind === "portal_frame" || ev?.kind === "portal_heartbeat") &&
+          ev.portalId === portalId
+        ) {
+          lastStreamActivityAt = Date.now();
+        }
+        if (ev?.kind === "portal_frame" && ev.portalId === portalId && typeof ev.seq === "number") {
+          if (ev.seq > pendingAckSeq) {
+            pendingAckSeq = ev.seq;
+            if (pendingAckSeq - lastAckedSeq >= 2) {
+              flushAck();
+            } else if (ackTimer === null && !ackInFlight) {
+              ackTimer = setTimeout(flushAck, 28);
+            }
+          }
+        }
+        ingestPortalStreamEvent(ev, hostId);
+      },
+      (st) => {
+        if (alive && st?.kind === "live") {
+          streamLive = true;
+          if (lastStreamActivityAt === 0) lastStreamActivityAt = Date.now();
+        }
+        if (alive && st?.kind === "error") streamLive = false;
+      },
+    );
+
+    // Fallback RPC poll only kicks in when push stream stops delivering frames AND heartbeats (>= 2600ms silence).
+    const pollInterval = Math.max(450, Math.round(1000 / Math.max(1, Math.min(4, fps))));
+    let lastErrorPollAt = 0;
+    const timer = setInterval(() => {
+      if (!alive || busy) return;
+      if (streamLive && (lastStreamActivityAt === 0 || Date.now() - lastStreamActivityAt < 2600)) return;
+      if (state.itemsById[portalId]?.streamError) {
+        const now = Date.now();
+        if (now - lastErrorPollAt < 4000) return;
+        lastErrorPollAt = now;
+      }
+      busy = true;
+      void capturePortalFrameOnce(hostId, portalId, opts)
+        .catch(() => {})
+        .finally(() => {
+          busy = false;
+        });
+    }, pollInterval);
+
+    stopImpl = () => {
+      if (ackTimer !== null) clearTimeout(ackTimer);
+      clearInterval(timer);
+      unsub();
+    };
   };
 
-  const unsub = subscribeStream(
-    hostId,
-    "portal",
-    {
-      portalId,
-      fps,
-      binaryFrames: true,
-      ...(opts.maxWidth ? { maxWidth: opts.maxWidth } : {}),
-      ...(opts.quality ? { quality: opts.quality } : {}),
-      ...(opts.showCursor !== undefined ? { showCursor: opts.showCursor } : {}),
-    },
-    (ev) => {
-      if (!alive) return;
-      if (
-        (ev?.kind === "portal_frame" || ev?.kind === "portal_heartbeat") &&
-        ev.portalId === portalId
-      ) {
-        lastStreamActivityAt = Date.now();
-      }
-      if (ev?.kind === "portal_frame" && ev.portalId === portalId && typeof ev.seq === "number") {
-        if (ev.seq > pendingAckSeq) {
-          pendingAckSeq = ev.seq;
-          flushAck();
-        }
-      }
-      ingestPortalStreamEvent(ev, hostId);
-    },
-    (st) => {
-      if (alive && st?.kind === "live") {
-        streamLive = true;
-        if (lastStreamActivityAt === 0) lastStreamActivityAt = Date.now();
-      }
-      if (alive && st?.kind === "error") streamLive = false;
-    },
+  const item = state.itemsById[portalId];
+  const isLocalMacWindow = Boolean(
+    localBinaryCaptureSupported &&
+      isTauri() &&
+      detectPlatform() === "macos" &&
+      localHostIdStore.get() === hostId &&
+      item?.kind === "window" &&
+      item.windowId,
   );
 
-  // Fallback RPC poll only kicks in when push stream stops delivering frames AND heartbeats (>= 2600ms silence).
-  const pollInterval = Math.max(450, Math.round(1000 / Math.max(1, Math.min(4, fps))));
-  let lastErrorPollAt = 0;
-  const timer = setInterval(() => {
-    if (!alive || busy) return;
-    if (streamLive && (lastStreamActivityAt === 0 || Date.now() - lastStreamActivityAt < 2600)) return;
-    if (state.itemsById[portalId]?.streamError) {
-      const now = Date.now();
-      if (now - lastErrorPollAt < 4000) return;
-      lastErrorPollAt = now;
-    }
-    busy = true;
-    void capturePortalFrameOnce(hostId, portalId, opts)
-      .catch(() => {})
-      .finally(() => {
-        busy = false;
-      });
-  }, pollInterval);
+  if (isLocalMacWindow && item?.windowId) {
+    const windowId = item.windowId;
+    const intervalMs = Math.max(15, Math.round(1000 / fps));
+    const decoder = typeof TextDecoder !== "undefined" ? new TextDecoder() : null;
+    let sinceSeq: string | undefined;
+    let localSeq = 0;
+    let lastIdleBeatAt = 0;
+    let loopTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const pumpLocal = () => {
+      if (!alive) return;
+      const startedAt = Date.now();
+      void native
+        .localPortalCaptureFrame({
+          windowId,
+          maxWidth: opts.maxWidth ?? 1600,
+          quality: opts.quality ?? 68,
+          showCursor: opts.showCursor ?? true,
+          fps,
+          sinceSeq,
+        })
+        .then((buf) => {
+          if (!alive) return;
+          if (!buf || buf.byteLength < 5) {
+            loopTimer = setTimeout(pumpLocal, 250);
+            return;
+          }
+          const bytes = new Uint8Array(buf);
+          const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          const status = bytes[0];
+          const metaLen = view.getUint32(1, false);
+          const metaEnd = Math.min(bytes.byteLength, 5 + metaLen);
+          const meta = decoder ? decoder.decode(bytes.subarray(5, metaEnd)) : "";
+          const dims = /dims:(\d+)x(\d+)/.exec(meta);
+          const cur = /cursor:([0-9.]+),([0-9.]+),([01])/.exec(meta);
+          const seqMatch = /seq:(\d+)/.exec(meta);
+          const curItem = state.itemsById[portalId];
+          const w = dims ? Number(dims[1]) : (curItem?.width ?? 1280);
+          const h = dims ? Number(dims[2]) : (curItem?.height ?? 800);
+
+          if (status === 2) {
+            if (curItem && !curItem.streamError) {
+              ingestPortalStreamEvent(
+                {
+                  kind: "portal_event",
+                  action: "updated",
+                  item: { ...curItem, streamError: "需开启 Herdr Pocket「屏幕录制」权限以捕获窗口画面" },
+                  at: Date.now(),
+                },
+                hostId,
+              );
+            }
+            loopTimer = setTimeout(pumpLocal, 1200);
+            return;
+          }
+
+          if (status === 1) {
+            if (seqMatch?.[1]) sinceSeq = seqMatch[1];
+            const now = Date.now();
+            if (now - lastIdleBeatAt >= 400) {
+              lastIdleBeatAt = now;
+              ingestPortalStreamEvent(
+                {
+                  kind: "portal_heartbeat",
+                  portalId,
+                  fps,
+                  idle: true,
+                  width: w,
+                  height: h,
+                  at: now,
+                },
+                hostId,
+              );
+            }
+            const wait = Math.max(2, intervalMs - (now - startedAt));
+            loopTimer = setTimeout(pumpLocal, wait);
+            return;
+          }
+
+          if (status === 0 && bytes.byteLength > metaEnd) {
+            if (seqMatch?.[1]) sinceSeq = seqMatch[1];
+            const rawCopy = bytes.slice(metaEnd);
+            ingestPortalStreamEvent(
+              {
+                kind: "portal_frame",
+                portalId,
+                seq: ++localSeq,
+                mime: "image/jpeg",
+                data: "",
+                rawBytes: rawCopy,
+                byteLength: rawCopy.byteLength,
+                transport: "local",
+                width: w,
+                height: h,
+                ...(cur
+                  ? {
+                      cursorX: Math.min(1, Math.max(0, Number(cur[1]))),
+                      cursorY: Math.min(1, Math.max(0, Number(cur[2]))),
+                      cursorVisible: cur[3] === "1",
+                    }
+                  : {}),
+                captureMs: Math.max(1, Date.now() - startedAt),
+                at: Date.now(),
+              },
+              hostId,
+            );
+            const wait = Math.max(1, intervalMs - (Date.now() - startedAt));
+            loopTimer = setTimeout(pumpLocal, wait);
+            return;
+          }
+
+          loopTimer = setTimeout(pumpLocal, 120);
+        })
+        .catch(() => {
+          if (!alive) return;
+          localBinaryCaptureSupported = false;
+          startRemoteSubscription();
+        });
+    };
+
+    pumpLocal();
+    return () => {
+      alive = false;
+      if (loopTimer !== null) clearTimeout(loopTimer);
+      stopImpl?.();
+    };
+  }
+
+  startRemoteSubscription();
 
   return () => {
     alive = false;
-    clearInterval(timer);
-    unsub();
+    stopImpl?.();
   };
 }

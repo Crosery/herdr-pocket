@@ -10,6 +10,7 @@ import { classifyDirectLinkKind } from "../src/lib/direct.ts";
 import { extractPromptCommandFromXterm, feedLocalCommandLineBuffer } from "../src/lib/terminalCommandExtract.ts";
 import {
   DirectCipher,
+  configKeySpec,
   decodeBinaryPortalStreamFrame,
   encodeBinaryPortalStreamFrame,
   jsChaCha20Poly1305,
@@ -642,4 +643,54 @@ test("slash commands support leading backslash trigger, canonical parsing, and s
   assert.ok(parsed);
   assert.equal(parsed.rawToken, "/btw");
   assert.equal(parsed.rest, "check status");
+});
+
+test("SessionPortalPiP prevents cursor self-warp, defaults to collapsed capsule, and supports fan/tile/cascade modes", () => {
+  const spec = configKeySpec("general.portalDisplayMode");
+  assert.ok(spec);
+  assert.equal(spec.default, "collapsed");
+  assert.deepEqual(spec.values, ["collapsed", "fan", "tile", "cascade"]);
+
+  const pipSrc = readFileSync(join(ROOT, "apps/desktop/src/components/SessionPortalPiP.tsx"), "utf8");
+  const modalSrc = readFileSync(join(ROOT, "apps/desktop/src/components/PortalViewerModal.tsx"), "utf8");
+  const cssSrc = readFileSync(join(ROOT, "apps/desktop/src/styles/app.css"), "utf8");
+  const framePanesSrc = readFileSync(join(ROOT, "apps/desktop/src/views/settings/FramePanes.tsx"), "utf8");
+  const panesSrc = readFileSync(join(ROOT, "apps/desktop/src/views/settings/Panes.tsx"), "utf8");
+
+  // Direct control never auto-enabled or sending passive hover move in PiP
+  assert.match(pipSrc, /useState\(false\)/);
+  assert.doesNotMatch(pipSrc, /const \[directControl, setDirectControl\] = useState\(isActive\)/);
+  assert.match(pipSrc, /!\(isSameLocalHost && item\.kind === "window"\)/);
+  assert.match(pipSrc, /if \(!canDirectControl \|\| !pipDragBtnRef\.current\) return;/);
+
+  // Respects user setting (collapsed default) and supports dynamic fan (1,2,3,4 live cards) + tile + cascade
+  assert.match(pipSrc, /settingsStore\.use\(\(s\) => s\.portalDisplayMode\)/);
+  assert.match(pipSrc, /if \(preferredMode !== "collapsed" \|\| userExpandedRef\.current\)/);
+  assert.match(pipSrc, /PIP_FAN_STEP_Y = 34/);
+  assert.match(pipSrc, /hoveredBackIdx/);
+  assert.match(pipSrc, /fanPeekExpandY/);
+  assert.match(pipSrc, /inDeckBack/);
+  assert.match(pipSrc, /session-portal-stack-bar is-compact/);
+  assert.match(pipSrc, /session-portal-card-num/);
+  assert.match(pipSrc, /session-portal-tile-grid/);
+  assert.match(cssSrc, /\.session-portal-pip\.is-tile\s*\{/);
+  assert.match(cssSrc, /\.session-portal-tile-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,/);
+
+  // Full modal also defaults local same-host window previews to read-only ("view")
+  assert.match(modalSrc, /!isRemoteHost && item\.kind === "window"[\s\S]*?setControlMode\("view"\)/);
+
+  // hostd macOS helper guards against warping cursor out of frontmost Herdr Pocket
+  const osCaptureSrc = readFileSync(join(ROOT, "apps/hostd/src/portal/osCapture.ts"), "utf8");
+  assert.match(osCaptureSrc, /isLocalPocketFrontmost\(\)/);
+
+  // Settings panes expose the display mode selector
+  assert.match(framePanesSrc, /PortalDisplayModeControl/);
+  assert.match(panesSrc, /<PortalDisplayModeRow \/>/);
+
+  // 60fps local binary fast-path + smart PiP hover intent & per-card FPS governance
+  const portalClientSrc = readFileSync(join(ROOT, "apps/desktop/src/lib/portalClient.ts"), "utf8");
+  assert.match(portalClientSrc, /localPortalCaptureFrame/);
+  assert.match(pipSrc, /hoverTimerRef/);
+  assert.match(pipSrc, /fps=\{isHovered \? 24 : 0\}/);
+  assert.match(pipSrc, /pipFps >= 2 && !heartbeat\?\.idle/);
 });

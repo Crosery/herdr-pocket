@@ -5,7 +5,7 @@ import { router, type Href } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
+import { PROTOCOL_VERSION, type PortalDisplayMode } from "@herdr-pocket/protocol";
 import { Card, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
 import { Row, RowDivider as Divider, Toggle, type RowIcon as IconName } from "../../components/rows";
 import { ConfigSnackbar } from "../../components/configParts";
@@ -146,6 +146,8 @@ export default function SettingsScreen() {
           </Row>
           <Divider />
           <ChatDisplayModeChoice />
+          <Divider />
+          <PortalDisplayModeChoice />
         </Card>
 
         <SectionHeader title="助理提醒" />
@@ -284,6 +286,37 @@ function ChatDisplayModeChoice() {
           segments={CHAT_MODE_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
           value={mode}
           onChange={(v) => set({ chatDisplayMode: v as "compact" | "standard" | "expanded" })}
+        />
+      </View>
+    </Row>
+  );
+}
+
+const PORTAL_MODE_OPTIONS = [
+  { value: "collapsed", label: "默认收起" },
+  { value: "fan", label: "叠牌露头" },
+  { value: "tile", label: "平铺展开" },
+  { value: "cascade", label: "纵向叠列" },
+] as const;
+
+const PORTAL_MODE_SUB: Record<PortalDisplayMode, string> = {
+  collapsed: "收起为右上角紧凑胶囊，不遮挡对话文字",
+  fan: "默认展开跨端小窗（桌面端呈 1·2·3·4 叠牌露头）",
+  tile: "默认展开跨端小窗（桌面端两列平铺预览）",
+  cascade: "默认展开跨端小窗（桌面端纵向叠列）",
+};
+
+function PortalDisplayModeChoice() {
+  const mode = useSettings((x) => x.portalDisplayMode);
+  const set = useSettings((x) => x.set);
+  return (
+    <Row icon="dock-window" title="跨端小窗默认显示" sub={PORTAL_MODE_SUB[mode]}>
+      <View style={{ paddingTop: space.sm }}>
+        <PocketSegmented
+          compact
+          segments={PORTAL_MODE_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+          value={mode}
+          onChange={(v) => set({ portalDisplayMode: v as PortalDisplayMode })}
         />
       </View>
     </Row>

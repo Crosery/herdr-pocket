@@ -115,6 +115,48 @@ export function ChatDisplayModeRow() {
   );
 }
 
+const PORTAL_DISPLAY_OPTIONS = [
+  { value: "collapsed", label: "默认收起", note: "仅在右上角保留精简胶囊，不遮挡代码与对话文字" },
+  { value: "fan", label: "叠牌露头", note: "像扑克牌一样 1、2、3、4 错位露出标题栏并可切换" },
+  { value: "tile", label: "平铺展开", note: "多窗口在右上角两列平铺并排预览，互不遮挡" },
+  { value: "cascade", label: "纵向叠列", note: "最多 3 个窗口纵向顺排实时预览" },
+] as const;
+
+export function PortalDisplayModeControl({ className = "segmented" }: { className?: string }) {
+  const toast = useToast();
+  const mode = useClientConfig().general.portalDisplayMode;
+  return (
+    <div className={className} role="radiogroup" aria-label="跨端小窗默认显示">
+      {PORTAL_DISPLAY_OPTIONS.map((o) => {
+        const active = mode === o.value;
+        return (
+          <button
+            key={o.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            title={o.note}
+            className={active ? (className === "wf-seg" ? "on" : "active") : ""}
+            onClick={() => void setConfig("general.portalDisplayMode", o.value).catch((e: Error) => toast(e.message, true))}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+export function PortalDisplayModeRow() {
+  const mode = useClientConfig().general.portalDisplayMode;
+  const about = PORTAL_DISPLAY_OPTIONS.find((o) => o.value === mode)?.note ?? "控制跨端小窗弹出时的默认展示形态";
+  return (
+    <SetRow title="跨端小窗默认显示" about={about}>
+      <PortalDisplayModeControl />
+    </SetRow>
+  );
+}
+
 const CANDIDATE_MONO_FONTS = [
   "SF Mono",
   "Menlo",
@@ -466,8 +508,9 @@ export function LookPane() {
       <SetHeading>大小与字体</SetHeading>
       <TextScaleRow />
       <UiFontSettingsSection />
-      <SetHeading>对话</SetHeading>
+      <SetHeading>对话与浮窗</SetHeading>
       <ChatDisplayModeRow />
+      <PortalDisplayModeRow />
       <TerminalSettingsSection />
       <SetHeading>列表</SetHeading>
       <ConfigSwitch k="general.showShells" about="列出普通 Shell 终端" />

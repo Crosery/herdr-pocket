@@ -38,7 +38,7 @@ import { getActiveToken, refreshNotifyChannel, signOut } from "../../lib/relay";
 import { liveStore, relTime, settingsStore, updateSettings, type H5LayoutMode } from "../../lib/store";
 import { useWindowHidden } from "../../lib/layout";
 import { ConfigSelect, ConfigSwitch, PaneTitle, SetHeading, SetRow } from "./rows";
-import { ChatDisplayModeRow, TerminalSettingsSection, UiFontSettingsSection } from "./FramePanes";
+import { ChatDisplayModeRow, PortalDisplayModeRow, TerminalSettingsSection, UiFontSettingsSection } from "./FramePanes";
 import { ToolVersionsSection } from "./ToolVersions";
 
 const PLATFORM_LABEL: Record<string, string> = {
@@ -270,6 +270,7 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
       </SetRow>
       <UiFontSettingsSection />
       <ChatDisplayModeRow />
+      <PortalDisplayModeRow />
       <ConfigSwitch k="general.showShells" about="列出普通 Shell 终端" />
       {!isTauri() ? (
         <>

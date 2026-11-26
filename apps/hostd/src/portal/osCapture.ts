@@ -882,6 +882,13 @@ func activatePid(_ pid: Int32) {
   }
 }
 
+func isLocalPocketFrontmost() -> Bool {
+  guard let front = NSWorkspace.shared.frontmostApplication else { return false }
+  let bid = front.bundleIdentifier ?? ""
+  let name = front.localizedName ?? ""
+  return bid.hasPrefix("dev.crosery.herdrpocket") || name == "Herdr Pocket"
+}
+
 func parseModifierFlags(_ csv: String) -> CGEventFlags {
   var flags = CGEventFlags()
   if csv.isEmpty { return flags }
@@ -973,7 +980,7 @@ func buildWindowListJson() -> Data {
   }
   let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
   let info = (CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]) ?? []
-  let blockedOwners: Set<String> = ["Window Server", "Dock", "Control Center", "Notification Center", "Spotlight"]
+  let blockedOwners: Set<String> = ["Window Server", "Dock", "Control Center", "Notification Center", "Spotlight", "Herdr Pocket", "herdr-pocket-desktop"]
   for w in info {
     guard let wid = w[kCGWindowNumber as String] as? Int,
           let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
@@ -999,7 +1006,7 @@ func buildWindowListJson() -> Data {
   return (try? JSONSerialization.data(withJSONObject: out)) ?? Data("[]".utf8)
 }
 
-func cursorMetaString(w: Int, h: Int, bounds: CGRect) -> String {
+func cursorMetaString(w: Int, h: Int, bounds: CGRect, seq: UInt64 = 0) -> String {
   let pt = CGEvent(source: nil)?.location ?? CGPoint.zero
   let inside = bounds.width > 0 && bounds.height > 0 &&
     pt.x >= bounds.minX && pt.x <= bounds.maxX &&
@@ -1007,9 +1014,9 @@ func cursorMetaString(w: Int, h: Int, bounds: CGRect) -> String {
   let nx = max(0.0, min(1.0, (pt.x - bounds.minX) / max(1.0, bounds.width)))
   let ny = max(0.0, min(1.0, (pt.y - bounds.minY) / max(1.0, bounds.height)))
   return String(
-    format: "dims:%dx%d\\ncursor:%.4f,%.4f,%d\\n",
+    format: "dims:%dx%d\\ncursor:%.4f,%.4f,%d\\nseq:%llu\\n",
     locale: Locale(identifier: "en_US_POSIX"),
-    w, h, nx, ny, inside ? 1 : 0
+    w, h, nx, ny, inside ? 1 : 0, seq
   )
 }
 
@@ -1021,11 +1028,18 @@ final class StreamReceiver: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
   var stoppedError: Error?
 
   func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-    guard type == .screen, sampleBuffer.isValid,
-          let buf = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+    guard type == .screen, sampleBuffer.isValid else { return }
+    if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+       let statusRaw = attachments.first?[SCStreamFrameInfo.status] as? Int,
+       let status = SCFrameStatus(rawValue: statusRaw),
+       status != .complete {
+      return
+    }
+    guard let buf = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
     cond.lock()
     latestBuffer = buf
     latestSeq &+= 1
+    if latestSeq == 0 { latestSeq = 1 }
     cond.broadcast()
     cond.unlock()
   }
@@ -1069,19 +1083,34 @@ func runSync<T>(_ body: @escaping @Sendable () async throws -> T) throws -> T {
   }
 }
 
+@available(macOS 14.0, *)
+private final class StreamSlot {
+  let target: String
+  var cfgKey: String
+  var stream: SCStream
+  var receiver: StreamReceiver
+  var bounds: CGRect
+  var cachedFrameJpeg: (seq: UInt64, key: String, data: Data, w: Int, h: Int)?
+  var lastAccessAt: Date
+
+  init(target: String, cfgKey: String, stream: SCStream, receiver: StreamReceiver, bounds: CGRect, lastAccessAt: Date) {
+    self.target = target
+    self.cfgKey = cfgKey
+    self.stream = stream
+    self.receiver = receiver
+    self.bounds = bounds
+    self.lastAccessAt = lastAccessAt
+  }
+}
+
 final class PortalEngine: @unchecked Sendable {
   private var heldButtons: Set<String> = []
   private var cachedShareable: (at: Date, content: AnyObject)?
   private let ciContext = CIContext(options: [.cacheIntermediates: false])
   private let srgbSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
   private let capLock = NSLock()
-  private var activeTarget: String?
-  private var activeCfgKey: String?
-  private var activeStreamObj: AnyObject?
-  private var activeReceiverObj: AnyObject?
-  private var activeTargetBounds = CGRect.zero
-  private var cachedFrameJpeg: (seq: UInt64, key: String, data: Data, w: Int, h: Int)?
-  private var lastCaptureRequestAt = Date(timeIntervalSince1970: 0)
+  private var slotObjs: [String: AnyObject] = [:]
+  private let maxConcurrentStreams = 6
   private var idleTimer: DispatchSourceTimer?
 
   func startIdleReaper() {
@@ -1100,23 +1129,21 @@ final class PortalEngine: @unchecked Sendable {
 
   @available(macOS 14.0, *)
   private func stopStreamIfIdle() {
+    let now = Date()
+    var evicted: [StreamSlot] = []
     capLock.lock()
-    let shouldStop = activeStreamObj != nil && Date().timeIntervalSince(lastCaptureRequestAt) > 8.0
-    let streamToStop = shouldStop ? (activeStreamObj as? SCStream) : nil
-    let receiverToClear = shouldStop ? (activeReceiverObj as? StreamReceiver) : nil
-    if shouldStop {
-      activeStreamObj = nil
-      activeReceiverObj = nil
-      activeTarget = nil
-      activeCfgKey = nil
-      cachedFrameJpeg = nil
+    for (key, obj) in slotObjs {
+      if let slot = obj as? StreamSlot, now.timeIntervalSince(slot.lastAccessAt) > 8.0 {
+        evicted.append(slot)
+        slotObjs.removeValue(forKey: key)
+      }
     }
     capLock.unlock()
-    if let s = streamToStop {
+    for slot in evicted {
       try? runSync {
-        try await s.stopCapture()
+        try await slot.stream.stopCapture()
       }
-      receiverToClear?.clear()
+      slot.receiver.clear()
     }
   }
 
@@ -1154,11 +1181,11 @@ final class PortalEngine: @unchecked Sendable {
   }
 
   @available(macOS 14.0, *)
-  func capture(target: String, maxDim: Int, quality: Double, showCursor: Bool, fps: Int, persistentStream: Bool) -> (code: Int32, out: Data, err: String) {
+  func capture(target: String, maxDim: Int, quality: Double, showCursor: Bool, fps: Int, persistentStream: Bool, sinceSeq: UInt64 = 0) -> (code: Int32, out: Data, err: String) {
     if !CGPreflightScreenCaptureAccess() {
       return (2, Data(), "screen_recording_denied\\n")
     }
-    lastCaptureRequestAt = Date()
+    let now = Date()
     let clampedFps = max(1, min(60, fps))
 
     var content: SCShareableContent
@@ -1208,62 +1235,74 @@ final class PortalEngine: @unchecked Sendable {
       }
     }
 
-    capLock.lock()
-    lastCaptureRequestAt = Date()
     let cfgKey = "\\(outW)x\\(outH):\\(showCursor ? 1 : 0):\\(clampedFps)"
-    var receiver = activeReceiverObj as? StreamReceiver
-    var stream = activeStreamObj as? SCStream
-    let needRestart = (stream == nil || receiver == nil || activeTarget != target || receiver?.stoppedError != nil)
-    let needUpdate = (!needRestart && activeCfgKey != cfgKey)
-    if needRestart {
-      let oldStream = stream
-      let oldReceiver = receiver
-      activeStreamObj = nil
-      activeReceiverObj = nil
-      activeTarget = target
-      activeCfgKey = cfgKey
-      activeTargetBounds = bounds
-      cachedFrameJpeg = nil
-      capLock.unlock()
-      if let os = oldStream {
-        try? runSync { try await os.stopCapture() }
+    var slot: StreamSlot?
+    var oldToStop: [StreamSlot] = []
+    var needStart = false
+    var needUpdate = false
+
+    capLock.lock()
+    if let existing = slotObjs[target] as? StreamSlot {
+      if existing.receiver.stoppedError != nil {
+        oldToStop.append(existing)
+        slotObjs.removeValue(forKey: target)
+        needStart = true
+      } else {
+        existing.lastAccessAt = now
+        existing.bounds = bounds
+        if existing.cfgKey != cfgKey {
+          existing.cfgKey = cfgKey
+          existing.cachedFrameJpeg = nil
+          needUpdate = true
+        }
+        slot = existing
       }
-      oldReceiver?.clear()
+    } else {
+      needStart = true
+      while slotObjs.count >= maxConcurrentStreams {
+        if let oldestEntry = slotObjs.compactMap({ (k, v) -> (String, StreamSlot)? in
+          guard let s = v as? StreamSlot else { return nil }
+          return (k, s)
+        }).min(by: { $0.1.lastAccessAt < $1.1.lastAccessAt }) {
+          oldToStop.append(oldestEntry.1)
+          slotObjs.removeValue(forKey: oldestEntry.0)
+        } else {
+          break
+        }
+      }
+    }
+    capLock.unlock()
+
+    for os in oldToStop {
+      try? runSync { try await os.stream.stopCapture() }
+      os.receiver.clear()
+    }
+
+    if needStart {
       let newRecv = StreamReceiver()
       let newStream = SCStream(filter: filter, configuration: cfg, delegate: newRecv)
-      let queue = DispatchQueue(label: "hp.scstream", qos: .userInteractive)
+      let queue = DispatchQueue(label: "hp.scstream.\\(target)", qos: .userInteractive)
       do {
         try newStream.addStreamOutput(newRecv, type: .screen, sampleHandlerQueue: queue)
         try runSync {
           try await newStream.startCapture()
         }
-      } catch {
-        // Fall through to one-shot SCScreenshotManager below if SCStream fails on this target
+        let created = StreamSlot(target: target, cfgKey: cfgKey, stream: newStream, receiver: newRecv, bounds: bounds, lastAccessAt: Date())
         capLock.lock()
-        activeStreamObj = nil
-        activeReceiverObj = nil
+        slotObjs[target] = created
         capLock.unlock()
+        slot = created
+      } catch {
+        slot = nil
       }
-      capLock.lock()
-      activeStreamObj = newStream
-      activeReceiverObj = newRecv
-      stream = newStream
-      receiver = newRecv
-      capLock.unlock()
-    } else if needUpdate, let curStream = stream {
-      activeCfgKey = cfgKey
-      activeTargetBounds = bounds
-      cachedFrameJpeg = nil
-      capLock.unlock()
+    } else if needUpdate, let curSlot = slot {
       try? runSync {
-        try await curStream.updateConfiguration(cfg)
+        try await curSlot.stream.updateConfiguration(cfg)
       }
-    } else {
-      activeTargetBounds = bounds
-      capLock.unlock()
     }
 
-    if let recv = receiver {
+    if let active = slot {
+      let recv = active.receiver
       recv.cond.lock()
       if recv.latestBuffer == nil {
         let dl = Date(timeIntervalSinceNow: 0.09)
@@ -1278,8 +1317,14 @@ final class PortalEngine: @unchecked Sendable {
       if let pxBuf = buf {
         let cacheKey = "\\(cfgKey):q\\(Int((quality * 100).rounded()))"
         capLock.lock()
-        if let c = cachedFrameJpeg, c.seq == seq, c.key == cacheKey {
-          let meta = cursorMetaString(w: c.w, h: c.h, bounds: bounds)
+        active.lastAccessAt = Date()
+        if let c = active.cachedFrameJpeg, c.seq == seq, c.key == cacheKey {
+          if sinceSeq > 0 && seq == sinceSeq {
+            let meta = "unchanged\\n" + cursorMetaString(w: c.w, h: c.h, bounds: bounds, seq: seq)
+            capLock.unlock()
+            return (0, Data(), meta)
+          }
+          let meta = cursorMetaString(w: c.w, h: c.h, bounds: bounds, seq: seq)
           capLock.unlock()
           return (0, c.data, meta)
         }
@@ -1295,9 +1340,9 @@ final class PortalEngine: @unchecked Sendable {
         if let jpeg = ciContext.jpegRepresentation(of: ci, colorSpace: srgbSpace, options: opts)
             ?? ciContext.createCGImage(ci, from: CGRect(x: 0, y: 0, width: w, height: h)).flatMap({ encodeJpeg($0, quality: clampedQ) }) {
           capLock.lock()
-          cachedFrameJpeg = (seq, cacheKey, jpeg, w, h)
+          active.cachedFrameJpeg = (seq, cacheKey, jpeg, w, h)
           capLock.unlock()
-          return (0, jpeg, cursorMetaString(w: w, h: h, bounds: bounds))
+          return (0, jpeg, cursorMetaString(w: w, h: h, bounds: bounds, seq: seq))
         }
       }
     }
@@ -1326,6 +1371,10 @@ final class PortalEngine: @unchecked Sendable {
     let cgBtn: CGMouseButton = btn == "right" ? .right : (btn == "middle" ? .center : .left)
 
     if action == "move" || action == "drag" {
+      if action == "move" && isLocalPocketFrontmost() {
+        // Avoid warping the local user's cursor back out of Herdr Pocket when hovering a local portal preview.
+        return
+      }
       CGWarpMouseCursorPosition(pt)
       CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
       let isDrag = action == "drag" || !heldButtons.isEmpty
@@ -1398,7 +1447,7 @@ final class PortalEngine: @unchecked Sendable {
   func handleScroll(_ args: [String]) {
     let dy = Int32(args[1]) ?? 0
     let dx = Int32(args[2]) ?? 0
-    if args.count >= 5, let x = Double(args[3]), let y = Double(args[4]) {
+    if args.count >= 5 && !isLocalPocketFrontmost(), let x = Double(args[3]), let y = Double(args[4]) {
       let pt = CGPoint(x: x, y: y)
       CGWarpMouseCursorPosition(pt)
       CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
@@ -1473,8 +1522,9 @@ final class PortalEngine: @unchecked Sendable {
       let quality = qRaw > 1.0 ? (qRaw / 100.0) : qRaw
       let showCursor = args.count >= 5 ? (args[4] != "0") : true
       let fps = args.count >= 6 ? (Int(args[5]) ?? 30) : 30
+      let sinceSeq = args.count >= 7 ? (UInt64(args[6]) ?? 0) : 0
       if #available(macOS 14.0, *) {
-        return capture(target: target, maxDim: maxDim, quality: quality, showCursor: showCursor, fps: fps, persistentStream: persistentStream)
+        return capture(target: target, maxDim: maxDim, quality: quality, showCursor: showCursor, fps: fps, persistentStream: persistentStream, sinceSeq: sinceSeq)
       } else {
         return (1, Data(), "unsupported_macos_version\\n")
       }
@@ -1521,9 +1571,46 @@ final class PortalEngine: @unchecked Sendable {
   }
 }
 
+func writeBinaryPacket(code: Int32, meta: String, out: Data) {
+  let metaData = Data(meta.utf8)
+  var header = Data(capacity: 16)
+  header.append(contentsOf: [0x48, 0x50, 0x42, 0x31]) // "HPB1"
+  var codeBE = code.bigEndian
+  var metaLenBE = UInt32(clamping: metaData.count).bigEndian
+  var outLenBE = UInt32(clamping: out.count).bigEndian
+  withUnsafeBytes(of: &codeBE) { header.append(contentsOf: $0) }
+  withUnsafeBytes(of: &metaLenBE) { header.append(contentsOf: $0) }
+  withUnsafeBytes(of: &outLenBE) { header.append(contentsOf: $0) }
+  FileHandle.standardOutput.write(header)
+  if !metaData.isEmpty { FileHandle.standardOutput.write(metaData) }
+  if !out.isEmpty { FileHandle.standardOutput.write(out) }
+}
+
 let engine = PortalEngine()
 let cliArgs = Array(CommandLine.arguments.dropFirst())
-if cliArgs.first == "serve" {
+if cliArgs.first == "serve-bin" {
+  engine.startIdleReaper()
+  DispatchQueue.global(qos: .userInteractive).async {
+    while let line = readLine(strippingNewline: true) {
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty { continue }
+      var code: Int32 = -1
+      var out = Data()
+      var meta = "invalid_request"
+      if let data = trimmed.data(using: .utf8),
+         let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let reqArgs = obj["args"] as? [String] {
+        let res = engine.execute(reqArgs, persistentStream: true)
+        code = res.code
+        out = res.out
+        meta = res.err
+      }
+      writeBinaryPacket(code: code, meta: meta, out: out)
+    }
+    exit(0)
+  }
+  RunLoop.main.run()
+} else if cliArgs.first == "serve" {
   engine.startIdleReaper()
   DispatchQueue.global(qos: .userInteractive).async {
     while let line = readLine(strippingNewline: true) {
@@ -1576,6 +1663,8 @@ export type CaptureWindowResult = {
   cursorY?: number;
   cursorVisible?: boolean;
   captureMs?: number;
+  nativeSeq?: string;
+  unchanged?: boolean;
 };
 
 export interface CaptureWindowOptions {
@@ -1583,13 +1672,15 @@ export interface CaptureWindowOptions {
   quality?: number;
   showCursor?: boolean;
   fps?: number;
+  sinceNativeSeq?: string;
+  skipBase64?: boolean;
 }
 
 /** Persistent keep-alive Unix domain socket client that degrades cleanly on one-shot mock servers. */
 class PersistBridgeSocket {
   private sock: Socket | null = null;
   private currentPath = "";
-  private buf = "";
+  private rxChunks: Buffer[] = [];
   private active: { finish: (res: CaptureExecResult | null) => void } | null = null;
   private chain: Promise<void> = Promise.resolve();
   private disposed = false;
@@ -1684,16 +1775,26 @@ class PersistBridgeSocket {
 
           const sock = connectSocket(sockPath);
           this.sock = sock;
-          this.buf = "";
+          this.rxChunks = [];
 
-          sock.on("data", (chunk) => {
-            if (this.sock !== sock) return;
-            this.buf += chunk.toString("utf8");
-            let nl = this.buf.indexOf("\n");
+          const drainLines = () => {
+            let nl = -1;
+            let buf: Buffer | null = null;
+            const ensureBuf = () => {
+              if (!buf && this.rxChunks.length > 0) {
+                buf = this.rxChunks.length === 1 ? this.rxChunks[0]! : Buffer.concat(this.rxChunks);
+                this.rxChunks = buf.length > 0 ? [buf] : [];
+              }
+              return buf;
+            };
+            const merged = ensureBuf();
+            if (!merged) return;
+            let offset = 0;
+            nl = merged.indexOf(0x0a, offset);
             while (nl >= 0) {
-              const line = this.buf.slice(0, nl).trim();
-              this.buf = this.buf.slice(nl + 1);
-              nl = this.buf.indexOf("\n");
+              const line = merged.toString("utf8", offset, nl).trim();
+              offset = nl + 1;
+              nl = merged.indexOf(0x0a, offset);
               if (!line || !this.active) continue;
               try {
                 const parsed = JSON.parse(line) as {
@@ -1707,12 +1808,22 @@ class PersistBridgeSocket {
                 this.active.finish(null);
               }
             }
+            if (offset > 0) {
+              this.rxChunks = offset < merged.length ? [merged.subarray(offset)] : [];
+            }
+          };
+
+          sock.on("data", (chunk: Buffer | string) => {
+            if (this.sock !== sock) return;
+            const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+            this.rxChunks.push(b);
+            if (b.includes(0x0a)) drainLines();
           });
 
           sock.once("end", () => {
             if (this.sock !== sock) return;
-            const trimmed = this.buf.trim();
-            this.buf = "";
+            const trimmed = this.rxChunks.length ? Buffer.concat(this.rxChunks).toString("utf8").trim() : "";
+            this.rxChunks = [];
             if (trimmed && this.active === entry && entry) {
               try {
                 const parsed = JSON.parse(trimmed) as {
@@ -1740,7 +1851,7 @@ class PersistBridgeSocket {
           sock.once("close", () => {
             if (this.sock === sock) {
               this.sock = null;
-              this.buf = "";
+              this.rxChunks = [];
             }
             if (!delivered && entry && this.active === entry) {
               finish(null, false, !reused);
@@ -1766,7 +1877,7 @@ class PersistBridgeSocket {
   private resetSocket(): void {
     const s = this.sock;
     this.sock = null;
-    this.buf = "";
+    this.rxChunks = [];
     if (s && !s.destroyed) {
       try {
         s.destroy();
@@ -1785,19 +1896,24 @@ class PersistBridgeSocket {
   }
 }
 
-/** Persistent child process runner speaking line-delimited JSON (macOS) or base64-TSV (Windows). */
+/** Persistent child process runner speaking binary HPB1 / JSON (macOS) or base64-TSV (Windows). */
 class PersistServeChild {
   private proc: ChildProcess | null = null;
   private binPath = "";
-  private buf = "";
+  private rxChunks: Buffer[] = [];
+  private rxLen = 0;
   private active: { finish: (res: CaptureExecResult | null) => void } | null = null;
   private chain: Promise<void> = Promise.resolve();
   private unsupported = false;
   private disposed = false;
-  private mode: "json" | "tsv";
+  private mode: "json" | "tsv" | "bin";
 
-  constructor(mode: "json" | "tsv") {
+  constructor(mode: "json" | "tsv" | "bin") {
     this.mode = mode;
+  }
+
+  isUnsupported(): boolean {
+    return this.unsupported;
   }
 
   request(bin: string, args: string[], timeoutMs: number): Promise<CaptureExecResult | null> {
@@ -1823,18 +1939,22 @@ class PersistServeChild {
         const timer = setTimeout(() => finish(null, true), Math.max(450, timeoutMs));
 
         if (!this.proc || this.proc.killed || this.proc.exitCode !== null) {
-          this.buf = "";
-          const child = spawn(bin, ["serve"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+          this.rxChunks = [];
+          this.rxLen = 0;
+          const spawnArg = this.mode === "bin" ? "serve-bin" : "serve";
+          const child = spawn(bin, [spawnArg], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
           child.unref?.();
           this.proc = child;
 
-          child.stdout?.on("data", (chunk: Buffer) => {
-            this.buf += chunk.toString("utf8");
-            let nl = this.buf.indexOf("\n");
+          const consumeTextLines = () => {
+            if (!this.rxChunks.length) return;
+            const buf = this.rxChunks.length === 1 ? this.rxChunks[0]! : Buffer.concat(this.rxChunks, this.rxLen);
+            let offset = 0;
+            let nl = buf.indexOf(0x0a, offset);
             while (nl >= 0) {
-              const line = this.buf.slice(0, nl).trim();
-              this.buf = this.buf.slice(nl + 1);
-              nl = this.buf.indexOf("\n");
+              const line = buf.toString("utf8", offset, nl).trim();
+              offset = nl + 1;
+              nl = buf.indexOf(0x0a, offset);
               if (!line || !this.active) continue;
               if (this.mode === "json") {
                 try {
@@ -1864,12 +1984,67 @@ class PersistServeChild {
                 }
               }
             }
+            if (offset > 0) {
+              const rem = buf.subarray(offset);
+              this.rxChunks = rem.length > 0 ? [rem] : [];
+              this.rxLen = rem.length;
+            } else {
+              this.rxChunks = [buf];
+              this.rxLen = buf.length;
+            }
+          };
+
+          const consumeBinaryPackets = () => {
+            if (this.rxLen < 16) return;
+            const buf = this.rxChunks.length === 1 ? this.rxChunks[0]! : Buffer.concat(this.rxChunks, this.rxLen);
+            let offset = 0;
+            while (buf.length - offset >= 16) {
+              if (
+                buf[offset] !== 0x48 ||
+                buf[offset + 1] !== 0x50 ||
+                buf[offset + 2] !== 0x42 ||
+                buf[offset + 3] !== 0x31
+              ) {
+                this.unsupported = true;
+                this.active?.finish(null);
+                this.killProc();
+                return;
+              }
+              const code = buf.readInt32BE(offset + 4);
+              const metaLen = buf.readUInt32BE(offset + 8);
+              const outLen = buf.readUInt32BE(offset + 12);
+              const totalLen = 16 + metaLen + outLen;
+              if (metaLen > 1024 * 1024 || outLen > 64 * 1024 * 1024) {
+                this.unsupported = true;
+                this.active?.finish(null);
+                this.killProc();
+                return;
+              }
+              if (buf.length - offset < totalLen) break;
+              const meta = metaLen > 0 ? buf.toString("utf8", offset + 16, offset + 16 + metaLen) : "";
+              const outSlice = outLen > 0 ? Buffer.from(buf.subarray(offset + 16 + metaLen, offset + totalLen)) : Buffer.alloc(0);
+              offset += totalLen;
+              this.active?.finish({ code, stdout: outSlice, stderr: meta });
+            }
+            const rem = buf.subarray(offset);
+            this.rxChunks = rem.length > 0 ? [rem] : [];
+            this.rxLen = rem.length;
+          };
+
+          child.stdout?.on("data", (chunk: Buffer) => {
+            this.rxChunks.push(chunk);
+            this.rxLen += chunk.length;
+            if (this.mode === "bin") {
+              consumeBinaryPackets();
+            } else if (chunk.includes(0x0a)) {
+              consumeTextLines();
+            }
           });
 
           const onExit = () => {
             if (this.proc === child) this.proc = null;
             if (this.active) {
-              // Binary exited before replying to serve request -> old binary without serve support.
+              // Binary exited before replying to serve request -> old binary without serve/serve-bin support.
               this.unsupported = true;
               const cur = this.active;
               this.active = null;
@@ -1886,7 +2061,7 @@ class PersistServeChild {
           return;
         }
         try {
-          if (this.mode === "json") {
+          if (this.mode === "json" || this.mode === "bin") {
             p.stdin.write(`${JSON.stringify({ args })}\n`);
           } else {
             p.stdin.write(`${args.map((a) => Buffer.from(a, "utf8").toString("base64")).join("\t")}\n`);
@@ -1905,7 +2080,8 @@ class PersistServeChild {
   private killProc(): void {
     const p = this.proc;
     this.proc = null;
-    this.buf = "";
+    this.rxChunks = [];
+    this.rxLen = 0;
     if (p) {
       try {
         p.kill();
@@ -1930,12 +2106,18 @@ function parseCaptureMeta(stderr: string, fallbackW: number, fallbackH: number):
   cursorX?: number;
   cursorY?: number;
   cursorVisible?: boolean;
+  seq?: string;
+  unchanged?: boolean;
 } {
   const dims = /dims:(\d+)x(\d+)/.exec(stderr);
   const cur = /cursor:([0-9.]+),([0-9.]+),([01])/.exec(stderr);
+  const seq = /seq:(\d+)/.exec(stderr);
+  const unchanged = /(?:^|\n)unchanged\b/.test(stderr);
   return {
     width: dims ? Number(dims[1]) : fallbackW,
     height: dims ? Number(dims[2]) : fallbackH,
+    ...(seq && seq[1] !== "0" ? { seq: seq[1] } : {}),
+    ...(unchanged ? { unchanged: true } : {}),
     ...(cur
       ? {
           cursorX: Math.min(1, Math.max(0, Number(cur[1]))),
@@ -1954,6 +2136,7 @@ export class OsCaptureDriver {
   private winHelperTried = false;
   private macScreenRecordingCache: { denied: boolean; accessibility: boolean; at: number } | null = null;
   private desktopBridgeVersion: number | null = null;
+  private macDirectCaptureDenied = false;
   private jxaTimedOutUntil = 0;
   private windowsCache: { at: number; list: RemoteWindowInfo[] } | null = null;
   private windowsInflight: Promise<RemoteWindowInfo[]> | null = null;
@@ -1961,6 +2144,7 @@ export class OsCaptureDriver {
   private lastFrameCache = new Map<string, { at: number; frame: CaptureWindowResult | null }>();
   private bridgeCapture = new PersistBridgeSocket();
   private bridgeControl = new PersistBridgeSocket();
+  private macServeCaptureBin = new PersistServeChild("bin");
   private macServeCapture = new PersistServeChild("json");
   private macServeControl = new PersistServeChild("json");
   private winServeCapture = new PersistServeChild("tsv");
@@ -1973,6 +2157,7 @@ export class OsCaptureDriver {
   dispose(): void {
     this.bridgeCapture.dispose();
     this.bridgeControl.dispose();
+    this.macServeCaptureBin.dispose();
     this.macServeCapture.dispose();
     this.macServeControl.dispose();
     this.winServeCapture.dispose();
@@ -2184,7 +2369,10 @@ export class OsCaptureDriver {
       await this.refreshMacPerms();
     }
     const useBridgeForChannel =
-      channel !== "capture" || Boolean(this.deps.portalBridgeSocket) || (this.desktopBridgeVersion ?? 0) >= 2;
+      channel !== "capture" ||
+      Boolean(this.deps.portalBridgeSocket) ||
+      (this.desktopBridgeVersion ?? 0) >= 2 ||
+      this.macDirectCaptureDenied;
     if (useBridgeForChannel) {
       const bridged = await this.execViaDesktopBridge(args, timeoutMs, channel);
       if (bridged && !bridged.stderr.startsWith("helper_missing:") && bridged.stderr !== "disallowed_command") {
@@ -2199,15 +2387,22 @@ export class OsCaptureDriver {
       return null;
     }
     if (!this.deps.execBin) {
-      const served = await (channel === "capture" ? this.macServeCapture : this.macServeControl).request(
-        helperPath,
-        args,
-        timeoutMs,
-      );
+      let served: CaptureExecResult | null = null;
+      if (channel === "capture") {
+        served = await this.macServeCaptureBin.request(helperPath, args, timeoutMs);
+        if (!served && this.macServeCaptureBin.isUnsupported()) {
+          served = await this.macServeCapture.request(helperPath, args, timeoutMs);
+        }
+      } else {
+        served = await this.macServeControl.request(helperPath, args, timeoutMs);
+      }
       if (served) {
         if (channel === "capture" && served.code === 2 && !useBridgeForChannel) {
           const bridged = await this.execViaDesktopBridge(args, timeoutMs, channel);
           if (bridged && !bridged.stderr.startsWith("helper_missing:") && bridged.stderr !== "disallowed_command") {
+            if (bridged.code === 0) {
+              this.macDirectCaptureDenied = true;
+            }
             return { res: bridged, viaBridge: true };
           }
         }
@@ -2627,36 +2822,59 @@ export class OsCaptureDriver {
     const showCursor = opts?.showCursor ?? true;
     const explicitFps = opts?.fps;
     const fps = Math.max(1, Math.min(60, Math.round(explicitFps ?? 30)));
+    const sinceNativeSeq = opts?.sinceNativeSeq;
+    const skipBase64 = Boolean(opts?.skipBase64);
     const cacheKey = `${windowId}:${maxWidth}:${quality}:${showCursor ? 1 : 0}`;
     const cacheTtlMs = explicitFps === undefined ? 45 : fps >= 45 ? 3 : fps >= 25 ? 6 : 16;
 
-    const cached = this.lastFrameCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < cacheTtlMs) return cached.frame;
-    const inflight = this.captureInflight.get(cacheKey);
-    if (inflight) return inflight;
-    const p = this.captureWindowUncached(windowId, { maxWidth, quality, showCursor, fps })
+    const cached = !sinceNativeSeq ? this.lastFrameCache.get(cacheKey) : undefined;
+    if (cached && cached.frame && !cached.frame.unchanged && Date.now() - cached.at < cacheTtlMs) {
+      const f = cached.frame;
+      return !skipBase64 && !f.data && f.rawBytes ? { ...f, data: f.rawBytes.toString("base64") } : f;
+    }
+
+    const inflightKey = sinceNativeSeq ? `${cacheKey}:s${sinceNativeSeq}` : cacheKey;
+    const existing = this.captureInflight.get(inflightKey);
+    if (existing) {
+      const f = await existing;
+      if (!f) return null;
+      return !skipBase64 && !f.unchanged && !f.data && f.rawBytes ? { ...f, data: f.rawBytes.toString("base64") } : f;
+    }
+
+    const p = this.captureWindowUncached(windowId, {
+      maxWidth,
+      quality,
+      showCursor,
+      fps,
+      sinceNativeSeq,
+      skipBase64,
+    })
       .then((frame) => {
-        if (frame) {
+        if (frame && !frame.unchanged) {
           this.lastFrameCache.set(cacheKey, { at: Date.now(), frame });
           if (this.lastFrameCache.size > 32) {
             const oldest = this.lastFrameCache.keys().next().value;
             if (oldest) this.lastFrameCache.delete(oldest);
           }
-        } else {
+        } else if (!frame) {
           this.lastFrameCache.delete(cacheKey);
         }
         return frame;
       })
       .finally(() => {
-        this.captureInflight.delete(cacheKey);
+        this.captureInflight.delete(inflightKey);
       });
-    this.captureInflight.set(cacheKey, p);
-    return p;
+    this.captureInflight.set(inflightKey, p);
+    const res = await p;
+    if (!res) return null;
+    return !skipBase64 && !res.unchanged && !res.data && res.rawBytes
+      ? { ...res, data: res.rawBytes.toString("base64") }
+      : res;
   }
 
   private async captureWindowUncached(
     windowId: string,
-    opts: { maxWidth: number; quality: number; showCursor: boolean; fps: number },
+    opts: { maxWidth: number; quality: number; showCursor: boolean; fps: number; sinceNativeSeq?: string; skipBase64: boolean },
   ): Promise<CaptureWindowResult | null> {
     const t0 = Date.now();
     const info = detectPortalSession(this.deps);
@@ -2680,23 +2898,44 @@ export class OsCaptureDriver {
             String(opts.quality),
             opts.showCursor ? "1" : "0",
             String(opts.fps),
+            ...(opts.sinceNativeSeq ? [opts.sinceNativeSeq] : []),
           ];
           const execOut = await this.execMacHelper(helper, macArgs, 4800);
           if (execOut) {
             const { res: r } = execOut;
+            const meta = parseCaptureMeta(r.stderr, bounds?.width ?? 1280, bounds?.height ?? 800);
+            if (r.code === 0 && r.stdout.length === 0 && meta.unchanged) {
+              this.macScreenRecordingCache = {
+                denied: false,
+                accessibility: this.macScreenRecordingCache?.accessibility ?? true,
+                at: Date.now(),
+              };
+              return {
+                mime: "image/jpeg",
+                data: "",
+                width: meta.width,
+                height: meta.height,
+                unchanged: true,
+                ...(meta.seq ? { nativeSeq: meta.seq } : {}),
+                ...(meta.cursorX !== undefined ? { cursorX: meta.cursorX, cursorY: meta.cursorY, cursorVisible: meta.cursorVisible } : {}),
+                captureMs: Math.max(1, Date.now() - t0),
+                bounds,
+                pid: target?.pid,
+              };
+            }
             if (r.code === 0 && r.stdout.length > 0) {
               this.macScreenRecordingCache = {
                 denied: false,
                 accessibility: this.macScreenRecordingCache?.accessibility ?? true,
                 at: Date.now(),
               };
-              const meta = parseCaptureMeta(r.stderr, bounds?.width ?? 1280, bounds?.height ?? 800);
               return {
                 mime: "image/jpeg",
-                data: r.stdout.toString("base64"),
+                data: opts.skipBase64 ? "" : r.stdout.toString("base64"),
                 rawBytes: r.stdout,
                 width: meta.width,
                 height: meta.height,
+                ...(meta.seq ? { nativeSeq: meta.seq } : {}),
                 ...(meta.cursorX !== undefined ? { cursorX: meta.cursorX, cursorY: meta.cursorY, cursorVisible: meta.cursorVisible } : {}),
                 captureMs: Math.max(1, Date.now() - t0),
                 bounds,

@@ -1007,6 +1007,24 @@ export const native = {
     inTauri() ? invoke<OsModifierState>("query_os_modifiers").catch(() => UNSUPPORTED_OS_MODIFIERS) : UNSUPPORTED_OS_MODIFIERS,
   openDirectTunnel: async (addrs: string[], port: number, expectedHostId?: string): Promise<DirectTunnelInfo | null> =>
     inTauri() ? invoke<DirectTunnelInfo>("open_direct_tunnel", { addrs, port, expectedHostId }).catch(() => null) : null,
+  localPortalCaptureFrame: async (params: {
+    windowId: string;
+    maxWidth?: number;
+    quality?: number;
+    showCursor?: boolean;
+    fps?: number;
+    sinceSeq?: string;
+  }): Promise<ArrayBuffer | null> =>
+    inTauri()
+      ? invoke<ArrayBuffer>("local_portal_capture_frame", {
+          windowId: params.windowId,
+          maxWidth: params.maxWidth ?? 1600,
+          quality: params.quality ?? 68,
+          showCursor: params.showCursor ?? true,
+          fps: params.fps ?? 30,
+          sinceSeq: params.sinceSeq ?? null,
+        })
+      : null,
   queryTrafficLightMetrics: async (): Promise<TrafficLightMetrics> =>
     inTauri()
       ? invoke<TrafficLightMetrics>("query_traffic_light_metrics").catch(() => UNSUPPORTED_TRAFFIC_LIGHTS)

@@ -857,7 +857,7 @@ export class Host {
       if (binTarget) {
         if ((pf.seq ?? 0) > 1) {
           const buffered = this.streamPeerBufferedBytes.get(id)?.() ?? 0;
-          if (buffered > 192 * 1024) return;
+          if (buffered > 512 * 1024) return;
         }
         const imageBytes = pf.rawBytes
           ? (Buffer.isBuffer(pf.rawBytes) ? pf.rawBytes : Buffer.from(pf.rawBytes))
@@ -930,6 +930,7 @@ export class Host {
             ...(typeof p.maxWidth === "number" ? { maxWidth: p.maxWidth } : {}),
             ...(typeof p.quality === "number" ? { quality: p.quality } : {}),
             ...(typeof p.showCursor === "boolean" ? { showCursor: p.showCursor } : {}),
+            ...(p.binaryFrames === true && replyBinary ? { binaryFrames: true } : {}),
           },
           (ev) => this.sendStream(f.id, ev),
         );
@@ -2337,11 +2338,17 @@ export class Host {
     },
     "portal.frame": async (p) => {
       if (typeof p.portalId !== "string" || !p.portalId) throw new RpcFailure("bad_request", "portalId is required");
-      return this.portal.captureFrame(p.portalId, {
+      const res = await this.portal.captureFrame(p.portalId, {
         ...(typeof p.maxWidth === "number" ? { maxWidth: p.maxWidth } : {}),
         ...(typeof p.quality === "number" ? { quality: p.quality } : {}),
         ...(typeof p.showCursor === "boolean" ? { showCursor: p.showCursor } : {}),
       });
+      if (res.frame?.rawBytes) {
+        const { rawBytes, ...cleanFrame } = res.frame;
+        if (!cleanFrame.data) cleanFrame.data = Buffer.from(rawBytes).toString("base64");
+        return { frame: cleanFrame, item: res.item };
+      }
+      return { frame: res.frame, item: res.item };
     },
     "portal.input": async (p) => {
       this.writable();

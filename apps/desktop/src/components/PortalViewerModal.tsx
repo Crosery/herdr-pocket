@@ -328,6 +328,16 @@ export function PortalViewerModal({
   }, [item?.id]);
 
   useEffect(() => {
+    if (!open || !item) return;
+    if (!isRemoteHost && item.kind === "window") {
+      // Viewing a local OS window inside Pocket on the same computer: default to read-only so pointer moves never warp our own mouse cursor.
+      setControlMode("view");
+    } else {
+      setControlMode(typeof window !== "undefined" && window.innerWidth < 720 ? "trackpad" : "pointer");
+    }
+  }, [isRemoteHost, item?.id, item?.kind, open]);
+
+  useEffect(() => {
     if (!open || !hostId) return;
     ensureDirectLinkNow(hostId);
     setLoadingWin(true);
@@ -564,7 +574,7 @@ export function PortalViewerModal({
     toast("正在尝试建立 P2P 直连…");
   };
   const fpsStatusText =
-    metrics.fps > 0
+    metrics.fps > 0 && !(heartbeat?.idle && metrics.fps <= 1)
       ? `${metrics.fps} fps · ${metrics.kbps} KB/s`
       : frame
         ? `静止省流 · 就绪 ${heartbeat?.fps ?? activePreset.fps}fps`

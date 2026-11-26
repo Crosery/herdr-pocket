@@ -19,7 +19,7 @@ import {
 } from "@herdr-pocket/protocol";
 import { call, ensureDirectLinkNow, getDirectEndpoint, getDirectTransportInfo, subscribe } from "../lib/relay";
 import { friendlyError } from "../lib/session";
-import { useLive } from "../lib/store";
+import { useLive, useSettings } from "../lib/store";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space } from "../theme/tokens";
 import { PocketButton, PocketSpinner } from "./pocket";
@@ -177,16 +177,17 @@ export function MobilePortalBanner({
   onOpenModal: (item?: PortalItem) => void;
 }) {
   const p = usePalette();
+  const portalDisplayMode = useSettings((x) => x.portalDisplayMode);
   const top = items[0];
   useLive((s) => s.direct[top?.hostId ?? agent.deviceId]);
   const transport = getDirectTransportInfo(top?.hostId ?? agent.deviceId);
-  if (!top) {
+  if (!top || portalDisplayMode === "collapsed") {
     return (
       <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "flex-end", paddingHorizontal: space.lg, paddingTop: 2 }}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="打开跨端回传画面"
-          onPress={() => onOpenModal()}
+          accessibilityLabel={top ? `展开跨端回传画面 (${items.length})` : "打开跨端回传画面"}
+          onPress={() => onOpenModal(top ?? undefined)}
           style={({ pressed }) => ({
             flexDirection: "row",
             alignItems: "center",
@@ -194,13 +195,15 @@ export function MobilePortalBanner({
             paddingHorizontal: 10,
             paddingVertical: 5,
             borderRadius: radius.pill,
-            backgroundColor: pressed ? p.surface3 : p.surface2,
+            backgroundColor: pressed ? p.surface3 : top ? p.accentContainer : p.surface2,
             borderWidth: 1,
             borderColor: p.divider,
           })}
         >
-          <MaterialCommunityIcons name="monitor" size={14} color={p.accentText} />
-          <Text style={{ fontSize: 12, fontFamily: fonts.bodyBold, color: p.accentText }}>回传窗口</Text>
+          <MaterialCommunityIcons name={top ? kindIcon(top.kind) : "monitor"} size={14} color={p.accentText} />
+          <Text style={{ fontSize: 12, fontFamily: fonts.bodyBold, color: p.accentText }}>
+            {top ? `回传窗口 · ${items.length}` : "回传窗口"}
+          </Text>
         </Pressable>
       </View>
     );

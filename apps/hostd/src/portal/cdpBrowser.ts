@@ -282,6 +282,8 @@ class CdpSession {
 
     await this.cdp("Page.enable", {});
     await this.cdp("Runtime.enable", {});
+    await this.cdp("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+    await this.cdp("Page.bringToFront", {}).catch(() => {});
     await this.cdp("Emulation.setDeviceMetricsOverride", {
       width: VIEWPORT_W,
       height: VIEWPORT_H,

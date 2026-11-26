@@ -317,6 +317,7 @@ Who reads it: CLI = `herdr-pocket` commands, daemon = `herdr-pocket run`, app = 
 | `general.textScale` | `100` | 80–160 | app | text size of the desktop app, in percent |
 | `general.fontFamily` | `""` | font family name | app | global UI font family of the desktop app (empty: default stack) |
 | `general.chatDisplayMode` | `"standard"` | `compact`, `standard`, `expanded` | app | conversation detail density (`compact`: merged activity groups; `standard`: separate thinking blocks + grouped tool tab; `expanded`: thinking & tool steps expanded) |
+| `general.portalDisplayMode` | `"collapsed"` | `collapsed`, `fan`, `tile`, `cascade` | app | floating portal mini-window mode (`collapsed`: compact capsule; `fan`: staggered 1-2-3-4 card deck; `tile`: side-by-side 2-column grid; `cascade`: vertical column) |
 | `general.showShells` | `false` | boolean | app | list plain shells beside the agents |
 | `general.useLocalLogin` | `true` | boolean | app | when this computer's `herdr-pocket` is logged in, the app joins the same relay with it (it asks that login for a one-time pairing code and pairs as its own device) |
 | `general.launchAtLogin` | `false` | boolean | app | start the app when you log in |
@@ -354,6 +355,7 @@ Who reads it: CLI = `herdr-pocket` commands, daemon = `herdr-pocket run`, app = 
 | `terminal.lineHeight` | `115` | 100–200 | app | line height of the desktop terminal in percent |
 | `terminal.fontWeight` | `500` | 300–700 | app | normal text weight of the desktop terminal (bold stays 700) |
 | `terminal.cursorBlink` | `true` | boolean | app | blink the cursor in the desktop terminal |
+| `plugins.aiBrowser` | `false` | boolean | CLI, daemon, app | enable optional zero-dependency AI TaskSpaces, `@ref` snapshots, visible virtual cursor, and status handoff bar in the built-in browser |
 
 Notes on `voiceInput.hotkey`:
 

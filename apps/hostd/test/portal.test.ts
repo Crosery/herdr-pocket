@@ -1597,3 +1597,26 @@ test("PortalManager immediately opens CDP browser on open URL, matches shell t.p
     "expected static stream to emit idle portal_heartbeat telemetry",
   );
 });
+
+test("macOS Swift portal helper excludes Herdr Pocket windows and refuses passive mouse warps when frontmost", () => {
+  assert.match(MAC_SWIFT_SRC, /"Herdr Pocket"/);
+  assert.match(MAC_SWIFT_SRC, /"herdr-pocket-desktop"/);
+  assert.match(MAC_SWIFT_SRC, /func isLocalPocketFrontmost\(\) -> Bool/);
+  assert.match(MAC_SWIFT_SRC, /if action == "move" && isLocalPocketFrontmost\(\)/);
+  assert.match(MAC_SWIFT_SRC, /!isLocalPocketFrontmost\(\)/);
+});
+
+test("macOS multi-stream SCStream pool, unchanged short-circuit, CDP focus emulation, and zero-rawBytes RPC hold", () => {
+  assert.match(MAC_SWIFT_SRC, /private final class StreamSlot/);
+  assert.match(MAC_SWIFT_SRC, /maxConcurrentStreams = 6/);
+  assert.match(MAC_SWIFT_SRC, /status != \.complete/);
+  assert.match(MAC_SWIFT_SRC, /"unchanged\\n"/);
+  assert.match(MAC_SWIFT_SRC, /cliArgs\.first == "serve-bin"/);
+
+  const cdpSrc = readFileSync(new URL("../src/portal/cdpBrowser.ts", import.meta.url), "utf8");
+  assert.match(cdpSrc, /Emulation\.setFocusEmulationEnabled/);
+
+  const hostSrc = readFileSync(new URL("../src/host.ts", import.meta.url), "utf8");
+  assert.match(hostSrc, /buffered > 512 \* 1024/);
+  assert.match(hostSrc, /"portal\.frame"[\s\S]*const \{ rawBytes, \.\.\.cleanFrame \} = res\.frame/);
+});

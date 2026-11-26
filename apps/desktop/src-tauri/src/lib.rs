@@ -805,6 +805,7 @@ pub fn run() {
             updater::update_restart_and_apply,
             workspace_state::workspace_state_load,
             workspace_state::workspace_state_save,
+            portal_bridge::local_portal_capture_frame,
         ])
         .build(context)
         .expect("error while building Herdr Pocket desktop application");

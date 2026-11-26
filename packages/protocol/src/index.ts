@@ -2936,6 +2936,7 @@ export const CLIENT_CONFIG_FILE = "config.json";
 export const CLIENT_CONFIG_VERSION = 1;
 
 export type ChatDisplayMode = "compact" | "standard" | "expanded";
+export type PortalDisplayMode = "collapsed" | "fan" | "tile" | "cascade";
 
 export interface ClientConfig {
   version: number;
@@ -2945,6 +2946,7 @@ export interface ClientConfig {
     textScale: number;
     fontFamily: string;
     chatDisplayMode: ChatDisplayMode;
+    portalDisplayMode: PortalDisplayMode;
     showShells: boolean;
     useLocalLogin: boolean;
     launchAtLogin: boolean;
@@ -3043,6 +3045,15 @@ export const CLIENT_CONFIG_KEYS: readonly ConfigKeySpec[] = [
     usedBy: D,
     label: "对话展示模式",
     doc: "compact: fold thinking and consecutive tools together. standard: separate thinking blocks, fold consecutive tools into one group. expanded: show every thinking block and tool call.",
+  },
+  {
+    key: "general.portalDisplayMode",
+    type: "enum",
+    values: ["collapsed", "fan", "tile", "cascade"],
+    default: "collapsed",
+    usedBy: D,
+    label: "跨端小窗默认显示",
+    doc: "collapsed: start folded as a compact top-right capsule so text is never covered. fan: staggered 1-2-3-4 fanned card deck peeking each card header. tile: side-by-side 2-column tiled mini-windows. cascade: vertical column.",
   },
   { key: "general.showShells", type: "boolean", default: false, usedBy: D, label: "显示普通终端", doc: "List plain shells beside the agents." },
   { key: "general.useLocalLogin", type: "boolean", default: true, usedBy: D, label: "使用本机 herdr-pocket 的登录", doc: "When this computer's herdr-pocket is logged in (hostd.json), the desktop app joins the same relay with it." },

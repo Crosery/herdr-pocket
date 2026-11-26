@@ -91,6 +91,8 @@ interface PortalWatcher {
   maxWidth: number;
   quality: number;
   showCursor: boolean;
+  binaryFrames?: boolean;
+  lastNativeSeq?: string;
   lastHash?: string;
   lastSentAt?: number;
   hasAck?: boolean;
@@ -606,8 +608,8 @@ export class PortalManager {
 
   async captureFrame(
     portalId: string,
-    opts?: { maxWidth?: number; quality?: number; showCursor?: boolean; fps?: number },
-  ): Promise<{ frame: PortalFramePayload | null; item: PortalItem | null }> {
+    opts?: { maxWidth?: number; quality?: number; showCursor?: boolean; fps?: number; sinceNativeSeq?: string; skipBase64?: boolean },
+  ): Promise<{ frame: PortalFramePayload | null; item: PortalItem | null; unchanged?: boolean; nativeSeq?: string }> {
     const item = this.items.get(portalId) ?? null;
     if (!item) return { frame: null, item: null };
     if (item.kind === "browser") {
@@ -646,11 +648,16 @@ export class PortalManager {
         this.syncItemStreamError(item, permNote ?? "当前无法捕获该系统窗口画面（窗口可能已最小化、关闭，或系统未授予抓屏权限）");
         return { frame: null, item };
       }
+      this.syncItemStreamError(item, undefined);
+      if (cap.unchanged) {
+        return { frame: null, item, unchanged: true, nativeSeq: cap.nativeSeq };
+      }
+      const dataStr = opts?.skipBase64 ? "" : cap.data || (cap.rawBytes ? cap.rawBytes.toString("base64") : "");
       const frame: PortalFramePayload = {
         portalId,
         seq: ++this.windowSeq,
         mime: cap.mime,
-        data: cap.data,
+        data: dataStr,
         ...(cap.rawBytes ? { rawBytes: cap.rawBytes, byteLength: cap.rawBytes.byteLength } : {}),
         width: cap.width,
         height: cap.height,
@@ -663,8 +670,7 @@ export class PortalManager {
       item.width = cap.width;
       item.height = cap.height;
       item.updatedAt = frame.at;
-      this.syncItemStreamError(item, undefined);
-      return { frame, item };
+      return { frame, item, nativeSeq: cap.nativeSeq };
     }
     return { frame: null, item };
   }
@@ -703,15 +709,16 @@ export class PortalManager {
         w.timer.unref?.();
         return;
       }
-      // RustDesk-style inflight credit gate: avoid piling unacked frames into sockets/codecs.
-      if (w.hasAck && w.lastSentSeq - w.lastAckedSeq >= 2) {
+      // TigerVNC ContinuousUpdates / RustDesk-style BDP sliding credit window (up to 6 frames inflight).
+      const maxInflight = w.fps >= 30 ? 6 : 4;
+      if (w.hasAck && w.lastSentSeq - w.lastAckedSeq >= maxInflight) {
         const stalledFor = Date.now() - (w.lastSentAt ?? 0);
-        if (stalledFor < 450) {
-          w.timer = setTimeout(pump, 8);
+        if (stalledFor < 120) {
+          w.timer = setTimeout(pump, 6);
           w.timer.unref?.();
           return;
         }
-        w.lastAckedSeq = Math.max(w.lastAckedSeq, w.lastSentSeq - 1);
+        w.lastAckedSeq = Math.max(w.lastAckedSeq, w.lastSentSeq - 2);
       }
       const startedAt = Date.now();
       void this.captureFrame(portalId, {
@@ -719,18 +726,26 @@ export class PortalManager {
         quality: w.effectiveQuality,
         showCursor: w.showCursor,
         fps: w.fps,
+        sinceNativeSeq: w.lastNativeSeq,
+        skipBase64: Boolean(w.binaryFrames),
       })
-        .then(({ frame }) => {
-          if (frame && this.streamWatchers.get(streamId) === w) {
+        .then(({ frame, unchanged, nativeSeq }) => {
+          if (this.streamWatchers.get(streamId) !== w) return;
+          if (unchanged) {
+            if (nativeSeq) w.lastNativeSeq = nativeSeq;
+            return;
+          }
+          if (frame) {
+            if (nativeSeq) w.lastNativeSeq = nativeSeq;
             this.sendFrameToWatcher(w, frame, true);
-          } else if (!frame) {
+          } else {
             lastErrCapAt = Date.now();
           }
         })
         .catch(() => {})
         .finally(() => {
           if (this.streamWatchers.get(streamId) !== w) return;
-          const waitMs = Math.max(2, intervalMs - (Date.now() - startedAt));
+          const waitMs = Math.max(1, intervalMs - (Date.now() - startedAt));
           w.timer = setTimeout(pump, waitMs);
           w.timer.unref?.();
         });
@@ -857,6 +872,7 @@ export class PortalManager {
         w.slowStreak = 0;
         w.fastStreak = 0;
         w.lastHash = undefined;
+        w.lastNativeSeq = undefined;
         if (item.kind === "window") {
           this.startWindowWatcherLoop(streamId, w);
         } else if (item.kind === "browser") {
@@ -980,7 +996,7 @@ export class PortalManager {
 
   subscribe(
     streamId: string,
-    params: { portalId?: string; agent?: string; fps?: number; maxWidth?: number; quality?: number; showCursor?: boolean },
+    params: { portalId?: string; agent?: string; fps?: number; maxWidth?: number; quality?: number; showCursor?: boolean; binaryFrames?: boolean },
     send: (ev: PortalStreamEvent) => void,
   ): () => void {
     const fps = Math.min(60, Math.max(1, Number(params.fps ?? (params.portalId ? 30 : 0)) || (params.portalId ? 30 : 0)));
@@ -995,6 +1011,7 @@ export class PortalManager {
       maxWidth,
       quality,
       showCursor,
+      ...(params.binaryFrames ? { binaryFrames: true } : {}),
       lastSentSeq: 0,
       lastAckedSeq: 0,
       sentAtBySeq: new Map(),
