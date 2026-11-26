@@ -3,7 +3,8 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { detectStandaloneDisplay } from "../src/lib/pwa.ts";
+import { checkAndApplyH5Update, detectStandaloneDisplay, extractH5EntrySignature } from "../src/lib/pwa.ts";
+import { notifyReleaseAvailable, startAutoUpdateChecks, updateStore } from "../src/lib/updates.ts";
 
 const DESKTOP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -35,6 +36,7 @@ test("PWA manifest.webmanifest, icons, and sw.js are valid and non-empty", () =>
 
   const sw = readFileSync(swPath, "utf8");
   assert.equal(sw.includes("SKIP_WAITING"), true);
+  assert.equal(sw.includes('cache: "no-cache"'), true, "SW must revalidate document navigations against upstream");
 });
 
 test("detectStandaloneDisplay respects navigator.standalone and matchMedia standalone", () => {
@@ -89,4 +91,116 @@ test("app.css avoids duplicate H5 bottom safe-area padding and keeps mobile brea
   const idx859 = css.indexOf("@media (max-width: 859.98px)");
   assert.ok(idx1099 > 0 && idx859 > 0);
   assert.ok(idx1099 < idx859, "@media (max-width: 1099.98px) must come before @media (max-width: 859.98px)");
+});
+
+test("H5 silently detects upstream bundle hash changes without reload loops or voice call interruption", async () => {
+  const v1Html = `<!doctype html><html><head>
+    <script type="module" crossorigin src="./assets/index-AAA11111.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BBB22222.css">
+  </head></html>`;
+  const v2Html = `<!doctype html><html><head>
+    <script type="module" crossorigin src="/pocket/app/assets/index-CCC33333.js"></script>
+    <link rel="stylesheet" crossorigin href="/pocket/app/assets/index-DDD44444.css">
+  </head></html>`;
+  assert.equal(extractH5EntrySignature(v1Html), "assets/index-AAA11111.js|assets/index-BBB22222.css");
+  assert.equal(extractH5EntrySignature(v2Html), "assets/index-CCC33333.js|assets/index-DDD44444.css");
+  assert.equal(extractH5EntrySignature('<script type="module" src="/src/main.tsx"></script>'), null);
+
+  const g = globalThis as Record<string, unknown>;
+  const prevWindow = g.window;
+  const prevDoc = g.document;
+  const prevFetch = globalThis.fetch;
+  const prevSession = g.sessionStorage;
+  const sessionMap = new Map<string, string>();
+
+  g.window = {};
+  g.sessionStorage = {
+    getItem: (k: string) => sessionMap.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      sessionMap.set(k, v);
+    },
+    removeItem: (k: string) => {
+      sessionMap.delete(k);
+    },
+  };
+  g.document = {
+    querySelectorAll: (sel: string) => {
+      if (sel.includes("script")) return [{ getAttribute: () => "./assets/index-AAA11111.js" }];
+      if (sel.includes("link")) return [{ getAttribute: () => "./assets/index-BBB22222.css" }];
+      return [];
+    },
+  };
+
+  let htmlToServe = v1Html;
+  let applyCount = 0;
+  globalThis.fetch = (async () => new Response(htmlToServe, { status: 200 })) as typeof fetch;
+
+  try {
+    // Unchanged upstream does not reload.
+    assert.equal(await checkAndApplyH5Update({ force: true, onApply: async () => { applyCount += 1; } }), false);
+    assert.equal(applyCount, 0);
+
+    // Changed upstream deferred while voice call is active.
+    htmlToServe = v2Html;
+    assert.equal(
+      await checkAndApplyH5Update({ force: true, canReloadNow: () => false, onApply: async () => { applyCount += 1; } }),
+      false,
+    );
+    assert.equal(applyCount, 0);
+
+    // Changed upstream applies once when idle.
+    assert.equal(
+      await checkAndApplyH5Update({ force: true, canReloadNow: () => true, onApply: async () => { applyCount += 1; } }),
+      true,
+    );
+    assert.equal(applyCount, 1);
+
+    // Repeat check for the same upstream signature is blocked by sessionStorage anti-loop guard.
+    assert.equal(
+      await checkAndApplyH5Update({ force: true, canReloadNow: () => true, onApply: async () => { applyCount += 1; } }),
+      false,
+    );
+    assert.equal(applyCount, 1);
+  } finally {
+    globalThis.fetch = prevFetch;
+    if (prevWindow === undefined) delete g.window;
+    else g.window = prevWindow;
+    if (prevDoc === undefined) delete g.document;
+    else g.document = prevDoc;
+    if (prevSession === undefined) delete g.sessionStorage;
+    else g.sessionStorage = prevSession;
+  }
+});
+
+test("H5 web mode never starts desktop auto-update checks or renders UpdatePrompt popup", () => {
+  const g = globalThis as Record<string, unknown>;
+  const prevWindow = g.window;
+  const realSetTimeout = globalThis.setTimeout;
+  const scheduled: number[] = [];
+  (globalThis as Record<string, unknown>).setTimeout = (_cb: () => void, ms: number) => {
+    scheduled.push(ms);
+    return {};
+  };
+
+  g.window = {};
+  try {
+    updateStore.set({ info: null, checking: false });
+    const stop = startAutoUpdateChecks();
+    assert.equal(scheduled.length, 0, "startAutoUpdateChecks must be a no-op on H5 web");
+    stop();
+
+    notifyReleaseAvailable("99.9.9");
+    assert.equal(updateStore.get().checking, false, "notifyReleaseAvailable must not start desktop release fetch on H5");
+    assert.equal(updateStore.get().info, null);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    if (prevWindow === undefined) delete g.window;
+    else g.window = prevWindow;
+  }
+
+  const promptSrc = readFileSync(resolve(DESKTOP_ROOT, "src/components/UpdatePrompt.tsx"), "utf8");
+  assert.ok(promptSrc.includes("if (isH5Web()"), "UpdatePrompt must return null on H5 web");
+
+  const mobileShellSrc = readFileSync(resolve(DESKTOP_ROOT, "src/mobile/MobileAppShell.tsx"), "utf8");
+  assert.equal(mobileShellSrc.includes("<UpdatePrompt"), false, "MobileAppShell must not mount duplicate UpdatePrompt");
 });

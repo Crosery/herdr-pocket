@@ -51,9 +51,17 @@ export interface AppSettings {
   alertSound: boolean;
   /** Only chime for completed tasks that ran >= 45s (blocked/permission always chime when alertSound is on). */
   alertChimeOnlyLongTasks: boolean;
+  /** Show the graduated test-tube ("实体试管") fill visualization in the context window HUD. */
+  contextVialMode: boolean;
+  /** How the sidebar Agent section is grouped: status, space hierarchy, or recent activity. */
+  sidebarAgentGrouping: SidebarAgentGrouping;
+  /** Show page-count badges, P1..PN labels, split-pane rails, and hover links in the sidebar. */
+  showSidebarTopology: boolean;
   /** "done" once the first-run guide was finished or skipped; "later" when closed half way. */
   onboarding: "new" | "later" | "done";
 }
+
+export type SidebarAgentGrouping = "status" | "space" | "recent";
 
 export interface LiveState {
   link: LinkStatus;
@@ -103,6 +111,9 @@ function persistPrefs(s: AppSettings): void {
     modifierHintsExplicit,
     alertSound: s.alertSound,
     alertChimeOnlyLongTasks: s.alertChimeOnlyLongTasks,
+    contextVialMode: s.contextVialMode,
+    sidebarAgentGrouping: s.sidebarAgentGrouping,
+    showSidebarTopology: s.showSidebarTopology,
     onboarding: s.onboarding,
   });
   try {
@@ -151,6 +162,17 @@ export function createStore<T>(initial: T) {
   return { get, set, subscribe, use };
 }
 
+function readLegacySidebarGrouping(): SidebarAgentGrouping {
+  try {
+    if (typeof localStorage !== "undefined" && localStorage.getItem("herdr-pocket-v3-agent-sort") === "recent") {
+      return "recent";
+    }
+  } catch {
+    // ignore
+  }
+  return "status";
+}
+
 const saved = loadPrefs();
 
 export const settingsStore = createStore<AppSettings>({
@@ -179,6 +201,14 @@ export const settingsStore = createStore<AppSettings>({
   showModifierHoldHints: saved.modifierHintsExplicit ? (saved.showModifierHoldHints ?? true) : true,
   alertSound: saved.alertSound ?? true,
   alertChimeOnlyLongTasks: saved.alertChimeOnlyLongTasks ?? false,
+  contextVialMode: saved.contextVialMode ?? true,
+  sidebarAgentGrouping:
+    saved.sidebarAgentGrouping === "status" ||
+    saved.sidebarAgentGrouping === "space" ||
+    saved.sidebarAgentGrouping === "recent"
+      ? saved.sidebarAgentGrouping
+      : readLegacySidebarGrouping(),
+  showSidebarTopology: saved.showSidebarTopology ?? true,
   // Installs from before the guide existed already have a server: don't greet them as new.
   onboarding: saved.onboarding ?? (saved.lastServer ? "done" : "new"),
 });

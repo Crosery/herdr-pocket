@@ -14,6 +14,7 @@ import {
   type StagedAttachment,
 } from "./dropPreview";
 import { logger } from "./log";
+import { localHostIdStore } from "./fonts";
 import { native } from "./native";
 import { isDirectConnected, rpcCall } from "./relay";
 import { allAgents, createStore, liveStore } from "./store";
@@ -645,8 +646,20 @@ export async function steerQueuedPromptNow(
 }
 
 /** Explicit destructive interrupt-and-send ("打断当前轮并发送"). */
+async function fastInterruptAgent(agent: Pick<Agent, "key" | "deviceId"> & Partial<Pick<Agent, "source" | "localId">>): Promise<void> {
+  if (native.available() && localHostIdStore.get() === agent.deviceId && agent.source === "hc" && agent.localId) {
+    try {
+      await native.localTermInterrupt(agent.localId);
+      return;
+    } catch {
+      // fall through to hostd RPC
+    }
+  }
+  await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
+}
+
 export async function interruptAndSendQueuedPrompt(
-  agent: Pick<Agent, "key" | "deviceId" | "status">,
+  agent: Pick<Agent, "key" | "deviceId" | "status"> & Partial<Pick<Agent, "source" | "localId">>,
   id: string,
 ): Promise<void> {
   if (inFlightAgents.has(agent.key)) return;
@@ -658,7 +671,7 @@ export async function interruptAndSendQueuedPrompt(
     const entry = createOutgoingEntry(agent, popped.text.trim(), popped.attachments, "sending");
     updateOutgoing(agent.key, (list) => [...list, entry]);
     if (agent.status === "working") {
-      await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
+      await fastInterruptAgent(agent);
       await waitMs(STEER_SETTLE_MS);
     }
     await deliverOutgoing(entry, "interrupt");
@@ -669,7 +682,7 @@ export async function interruptAndSendQueuedPrompt(
 
 /** Interrupt the running turn from the composer and immediately insert/send the prompt once. */
 export async function interruptComposerNow(
-  agent: Pick<Agent, "key" | "deviceId" | "status">,
+  agent: Pick<Agent, "key" | "deviceId" | "status"> & Partial<Pick<Agent, "source" | "localId">>,
   rawText: string,
   attachments: StagedAttachment[],
 ): Promise<boolean> {
@@ -683,7 +696,7 @@ export async function interruptComposerNow(
     const entry = createOutgoingEntry(agent, clean, attachments, "sending");
     updateOutgoing(agent.key, (list) => [...list, entry]);
     if (agent.status === "working") {
-      await rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch(() => {});
+      await fastInterruptAgent(agent);
       await waitMs(STEER_SETTLE_MS);
     }
     return await deliverOutgoing(entry, "interrupt");

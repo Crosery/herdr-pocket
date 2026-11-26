@@ -2,7 +2,7 @@
 
 - [Project guide](../AGENTS.md) — architecture, commands, runtime topology, and safety boundaries.
 - User/developer README: [English](../README.md) · [简体中文](../README.zh-CN.md) — setup, pairing, relay, hostd, and mobile overview.
-- [README images](readme/) — hero, architecture diagram, feature grid and screenshot showcase used by both READMEs; regenerate with `cd docs/readme/build && pnpm install && pnpm build`.
+- [README assets](readme/) — brand mark (`logo.png`) and Light/Dark multi-device previews (`preview-light.webp`, `preview-dark.webp`) used by `README.md` and `README.zh-CN.md`.
 - [Mobile app README](../apps/mobile/README.md) — Expo development, routes, deep links, Android APK & iOS IPA builds, and native voice/downloader modules.
 - [Desktop app](../apps/desktop/) & [HarmonyOS NEXT shell](../apps/harmony/) — Tauri v2 desktop client (macOS, Windows, Linux) and Stage-Model ArkTS shell sharing the same web bundle.
 - [Deployment units](../deploy/) — systemd relay, Caddy reverse proxy, launchd hostd, and environment template.

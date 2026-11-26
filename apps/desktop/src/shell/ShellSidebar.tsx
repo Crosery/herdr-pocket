@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, ChevronRight, Columns2, History, Laptop, PanelLeft, Pencil, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Terminal, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Columns2, Laptop, PanelLeft, Pencil, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Terminal, Trash2 } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
 import { PocketButton, PocketInput, PocketModal, overlayStore, useToast } from "../components/PocketUI";
@@ -9,22 +9,54 @@ import { assetUrl } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
 import { pingRelay, refreshHostSpaces, rpcCall } from "../lib/relay";
-import { agentSpace, allAgents, clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, liveStore, settingsStore, spacedTitle, updateSettings } from "../lib/store";
+import {
+  agentSpace,
+  allAgents,
+  clampSidebarWidth,
+  DEFAULT_SIDEBAR_WIDTH,
+  liveStore,
+  settingsStore,
+  spacedTitle,
+  updateSettings,
+  type SidebarAgentGrouping,
+} from "../lib/store";
 import { setInteractiveResizeActive } from "./splitMotion";
 import { updateStore } from "../lib/updates";
 import { useVisibleTick } from "../lib/layout";
 import { endPanelDrag, startPanelDrag } from "../lib/fileDrag";
-import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, shortAgo, type ListGroup } from "./agentInfo";
+import { lastChange, listGroup, shortAgo, type ListGroup } from "./agentInfo";
 import { pullHostDocNow } from "./herdrDocSync";
 import { formatSidebarAgentRow } from "./sidebarAgentRow";
+import {
+  buildSidebarAgentSections,
+  computeWorkspaceTopology,
+  formatTopologyBadge,
+  getAgentPlacement,
+  type AgentRowJoinRole,
+  type AgentTopologyPlacement,
+  type SpaceTopology,
+} from "./sidebarTopology";
 import { SPACE_ICON_PRESETS, SpaceTileIcon, setCustomSpaceIcon, spaceIconStore } from "./spaceIcon";
-import { activeTabIdForSpace, closeTabsForSpace, focusedLeafOfTab, openAgentTab, openSettingsFrame, renameSpaceInShellStore, setPalette, setSelectedSpace, shellStore, splitActivePaneWithContent, tabLeaves } from "./shellStore";
+import {
+  activeTabIdForSpace,
+  closeTabsForSpace,
+  focusedLeafOfTab,
+  focusTabPane,
+  openAgentTab,
+  openSettingsFrame,
+  renameSpaceInShellStore,
+  setActiveTab,
+  setPalette,
+  setSelectedSpace,
+  shellStore,
+  splitActivePaneWithContent,
+  tabLeaves,
+} from "./shellStore";
 import { shortcutText } from "./shortcuts";
 import { SpatialHint } from "./useModifierHoldHints";
-import { buildHostSpaces, type SidebarSpace } from "./spaceSync";
+import { buildHostSpaces, spaceColorVars, type SidebarSpace } from "./spaceSync";
 
 const FOLD_KEY = "herdr-pocket-v3-folded";
-const SORT_KEY = "herdr-pocket-v3-agent-sort";
 const SPACES_RATIO_KEY = "herdr-pocket-v3-spaces-ratio";
 
 function clampSpacesRatio(r: unknown): number | null {
@@ -68,6 +100,12 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
   collapsed,
   isFocusedAgent,
   isInSplit,
+  showTopology,
+  placement,
+  joinRole,
+  splitPeerHover,
+  spaceColorFg,
+  onHoverSplit,
   onOpenAgent,
   onContextMenuAgent,
 }: {
@@ -81,17 +119,33 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
   collapsed: boolean;
   isFocusedAgent: boolean;
   isInSplit: boolean;
+  showTopology: boolean;
+  placement?: AgentTopologyPlacement;
+  joinRole: AgentRowJoinRole;
+  splitPeerHover: boolean;
+  spaceColorFg?: string | null;
+  onHoverSplit: (tabId: string | null) => void;
   onOpenAgent: (agent: Agent, mods: { altKey: boolean; shiftKey: boolean }) => void;
   onContextMenuAgent: (x: number, y: number, agent: Agent) => void;
 }) {
+  const badge = showTopology && placement ? formatTopologyBadge(placement) : null;
+  const hasSubLine = Boolean(secondary || badge);
+  const joinClass = showTopology && joinRole !== "single" ? ` ${joinRole}` : "";
+  const splitPeerClass = showTopology && splitPeerHover ? " is-split-peer-hover" : "";
   return (
     <div
       role="button"
       tabIndex={0}
       draggable
       data-tauri-drag-region="false"
-      className={`v3-row v3-agent${secondary && !collapsed ? " has-sub" : ""}${isFocusedAgent ? " selected" : isInSplit ? " in-split" : ""}${group === "offline" ? " dim" : ""}`}
+      className={`v3-row v3-agent${hasSubLine && !collapsed ? " has-sub" : ""}${isFocusedAgent ? " selected" : isInSplit ? " in-split" : ""}${joinClass}${splitPeerClass}${group === "offline" ? " dim" : ""}`}
       title={tooltipText}
+      onMouseEnter={() => {
+        if (showTopology && placement?.isSplit && placement.tabId) onHoverSplit(placement.tabId);
+      }}
+      onMouseLeave={() => {
+        if (showTopology && placement?.isSplit && placement.tabId) onHoverSplit(null);
+      }}
       onDragStart={(e) => startPanelDrag(e, { kind: "agent", agentKey: agent.key })}
       onDragEnd={() => endPanelDrag()}
       onClick={(e) => onOpenAgent(agent, { altKey: e.altKey, shiftKey: e.shiftKey })}
@@ -114,7 +168,36 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
             <span className="v3-time">{ageLabel}</span>
             <StatusMark group={group} compact={compactBlocked} />
           </div>
-          {secondary ? <div className="v3-agent-sub truncate">{secondary}</div> : null}
+          {hasSubLine ? (
+            <div className="v3-agent-sub">
+              <span className="v3-agent-sub-main">
+                {secondary ? (
+                  <>
+                    {showTopology && spaceColorFg ? (
+                      <span className="v3-space-dot" style={{ backgroundColor: spaceColorFg }} aria-hidden="true" />
+                    ) : null}
+                    <span className="truncate">{secondary}</span>
+                  </>
+                ) : null}
+              </span>
+              {badge ? (
+                <span
+                  className={`v3-topo-badge is-${badge.kind}`}
+                  title={
+                    badge.kind === "split" && placement
+                      ? `与另外 ${placement.paneCount - 1} 个窗格在同一窗口分屏（第 ${placement.paneIndex}/${placement.paneCount} 屏）`
+                      : badge.kind === "page" && placement
+                        ? `位于该空间第 ${placement.pageNumber ?? 1} 个独立标签页`
+                        : "尚未在主区打开标签页（点击自动打开）"
+                  }
+                >
+                  {badge.kind === "split" ? <Columns2 size={10} /> : null}
+                  <span>{badge.label}</span>
+                  {badge.slot ? <span className="v3-topo-slot">{badge.slot}</span> : null}
+                </span>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       )}
     </div>
@@ -127,7 +210,14 @@ const SidebarSpaceRow = memo(function SidebarSpaceRow({
   machineOnline,
   collapsed,
   selected,
+  showTopology,
+  pageCount,
+  splitPageCount,
+  paneCount,
+  drawerExpanded,
+  isSplitPeerHover,
   onSelectSpace,
+  onToggleDrawer,
   onNewTerminal,
   onDeleteSpace,
   onContextMenuSpace,
@@ -137,19 +227,27 @@ const SidebarSpaceRow = memo(function SidebarSpaceRow({
   machineOnline: boolean;
   collapsed: boolean;
   selected: boolean;
+  showTopology: boolean;
+  pageCount: number;
+  splitPageCount: number;
+  paneCount: number;
+  drawerExpanded: boolean;
+  isSplitPeerHover: boolean;
   onSelectSpace: (spaceId: string) => void;
+  onToggleDrawer: (space: SidebarSpace) => void;
   onNewTerminal: (host: string, space: string) => void;
   onDeleteSpace: (space: SidebarSpace) => void;
   onContextMenuSpace: (x: number, y: number, space: SidebarSpace) => void;
 }) {
   const pointerActivatedAtRef = useRef(0);
   const label = space.name;
+  const hasSplit = splitPageCount > 0;
   return (
     <div
       role="button"
       tabIndex={0}
       aria-pressed={selected}
-      className={`v3-row v3-space${space.count === 0 ? " empty" : ""}${selected ? " selected" : ""}`}
+      className={`v3-row v3-space${space.count === 0 ? " empty" : ""}${selected ? " selected" : ""}${isSplitPeerHover ? " is-split-peer-hover" : ""}`}
       title={collapsed ? `${machineName} · ${label}` : space.folder || undefined}
       onPointerDown={(e) => {
         if (e.button !== 0 || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -217,6 +315,24 @@ const SidebarSpaceRow = memo(function SidebarSpaceRow({
               </button>
             </>
           ) : null}
+          {showTopology && pageCount > 0 ? (
+            <button
+              type="button"
+              className={`v3-space-pages-pill${drawerExpanded ? " open" : ""}${hasSplit ? " has-split" : ""}${isSplitPeerHover ? " is-peer-hover" : ""}`}
+              aria-expanded={drawerExpanded}
+              aria-label={`${label} 共有 ${pageCount} 个工作页${hasSplit ? `，含 ${splitPageCount} 个分屏` : ""}，点击展开或切换`}
+              title={`${pageCount} 页${paneCount > pageCount ? ` · ${paneCount} 个窗格` : ""}（点击展开标签页与分屏快捷跳转）`}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleDrawer(space);
+              }}
+            >
+              {hasSplit ? <Columns2 size={10} /> : null}
+              <span>{pageCount}页</span>
+              <ChevronDown size={10} className="v3-pill-caret" />
+            </button>
+          ) : null}
           <span className="v3-count">{space.count}</span>
           {space.count === 0 ? (
             <span className="v3-ring" aria-label="暂无运行中 Agent" />
@@ -275,7 +391,10 @@ export const ShellSidebar = memo(function ShellSidebar({
   const now = Date.now();
 
   const [folded, setFolded] = useState<string[]>(() => readJson<string[]>(FOLD_KEY, []));
-  const [sort, setSortState] = useState<"status" | "recent">(() => readJson(SORT_KEY, "status"));
+  const grouping = settingsStore.use((s) => s.sidebarAgentGrouping);
+  const showTopology = settingsStore.use((s) => s.showSidebarTopology);
+  const [expandedSpaceDrawers, setExpandedSpaceDrawers] = useState<string[]>([]);
+  const [hoveredSplitTabId, setHoveredSplitTabId] = useState<string | null>(null);
   const [deleteSpaceTarget, setDeleteSpaceTarget] = useState<SidebarSpace | null>(null);
   const [deletingSpace, setDeletingSpace] = useState(false);
   const [renameSpaceTarget, setRenameSpaceTarget] = useState<SidebarSpace | null>(null);
@@ -441,12 +560,28 @@ export const ShellSidebar = memo(function ShellSidebar({
     setFolded(next);
     writeJson(FOLD_KEY, next);
   };
-  const setSort = (v: "status" | "recent") => {
+  const setGrouping = useCallback((v: SidebarAgentGrouping) => {
     stableGroupOrderRef.current.clear();
     frozenOrderRef.current.clear();
-    setSortState(v);
-    writeJson(SORT_KEY, v);
-  };
+    updateSettings({ sidebarAgentGrouping: v });
+  }, []);
+  const toggleSpaceDrawer = useCallback(
+    (space: SidebarSpace, hasLocalPages: boolean) => {
+      if (!hasLocalPages) {
+        setSelectedSpace(space.id, (k) => allByKeyRef.current.get(k), spacesMapRef.current);
+        void pullHostDocNow(space.deviceId);
+        return;
+      }
+      setExpandedSpaceDrawers((prev) =>
+        prev.includes(space.id) ? prev.filter((x) => x !== space.id) : [...prev, space.id],
+      );
+    },
+    [],
+  );
+  const handleJumpToPage = useCallback((tabId: string, paneId?: string | null) => {
+    setActiveTab(tabId, { trigger: "click" });
+    if (paneId) focusTabPane(tabId, paneId);
+  }, []);
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
 
@@ -475,90 +610,78 @@ export const ShellSidebar = memo(function ShellSidebar({
   const inScope = agents;
   const primaryMachineId = localHostId || machines[0]?.id || null;
 
-  const groups = useMemo(() => {
-    const raw =
-      sort === "recent"
-        ? [{ key: "recent" as const, title: "最近", list: [...inScope].sort((x, y) => lastChange(y) - lastChange(x)) }]
-        : (() => {
-            const by = new Map<ListGroup, Agent[]>();
-            for (const a of inScope) {
-              const g = listGroup(a, devices);
-              by.set(g, [...(by.get(g) ?? []), a]);
-            }
-            return LIST_GROUPS.filter((g) => by.get(g.key)?.length).map((g) => {
-              const items = by.get(g.key)!;
-              const prevOrder = stableGroupOrderRef.current.get(g.key);
-              if (!prevOrder?.length) {
-                return {
-                  key: g.key,
-                  title: g.title,
-                  list: items.sort((x, y) => lastChange(y) - lastChange(x)),
-                };
-              }
-              const prevRank = new Map<string, number>();
-              prevOrder.forEach((k, idx) => prevRank.set(k, idx));
-              const newlyEntered: Agent[] = [];
-              const existing: Agent[] = [];
-              for (const item of items) {
-                if (prevRank.has(item.key)) existing.push(item);
-                else newlyEntered.push(item);
-              }
-              newlyEntered.sort((x, y) => lastChange(y) - lastChange(x));
-              existing.sort((x, y) => prevRank.get(x.key)! - prevRank.get(y.key)!);
-              return {
-                key: g.key,
-                title: g.title,
-                list: [...newlyEntered, ...existing],
-              };
-            });
-          })();
+  const workspaceTopology = useMemo(
+    () =>
+      computeWorkspaceTopology(
+        tabs,
+        activeTab?.id ?? null,
+        (k) => allByKey.get(k),
+        spacesMap,
+        inScope,
+      ),
+    [activeTab?.id, allByKey, inScope, spacesMap, tabs],
+  );
 
-    if (!hoverFreeze) {
+  const sections = useMemo(() => {
+    const nextSections = buildSidebarAgentSections({
+      agents: inScope,
+      devices,
+      topology: workspaceTopology,
+      spacesMap,
+      selectedSpace: selected,
+      grouping,
+      previousOrder: hoverFreeze ? frozenOrderRef.current : stableGroupOrderRef.current,
+    });
+    if (!hoverFreeze && grouping === "status") {
       const nextMap = new Map<string, string[]>();
-      for (const g of raw) {
-        nextMap.set(g.key, g.list.map((a) => a.key));
+      for (const s of nextSections) {
+        nextMap.set(s.groupKey, s.items.map((it) => it.agent.key));
       }
       frozenOrderRef.current = nextMap;
       stableGroupOrderRef.current = nextMap;
-      return raw;
     }
-
-    return raw.map((g) => {
-      const frozen = frozenOrderRef.current.get(g.key);
-      if (!frozen?.length) return g;
-      const rank = new Map<string, number>();
-      frozen.forEach((k, idx) => rank.set(k, idx));
-      const sorted = [...g.list].sort((x, y) => {
-        const rx = rank.get(x.key);
-        const ry = rank.get(y.key);
-        if (rx !== undefined && ry !== undefined) return rx - ry;
-        if (rx !== undefined) return -1;
-        if (ry !== undefined) return 1;
-        return lastChange(y) - lastChange(x);
-      });
-      return { ...g, list: sorted };
-    });
-  }, [devices, hoverFreeze, inScope, sort]);
+    return nextSections;
+  }, [devices, grouping, hoverFreeze, inScope, selected, spacesMap, workspaceTopology]);
 
   const agentMetaByKey = useMemo(() => {
-    const out = new Map<string, { group: ListGroup; primary: string; secondary?: string | null; collapsedTip: string; expandedTip: string }>();
+    const out = new Map<
+      string,
+      {
+        group: ListGroup;
+        primary: string;
+        secondary?: string | null;
+        machineOnlySecondary?: string | null;
+        collapsedTip: string;
+        expandedTip: string;
+      }
+    >();
     const multiMachine = machines.length > 1;
     for (const a of inScope) {
       const g = listGroup(a, devices);
       const label = spacedTitle(a);
       const showMachine = multiMachine && a.deviceId !== primaryMachineId;
-      const machineName = showMachine ? devices[a.deviceId]?.name : undefined;
-      const { primary, secondary } = formatSidebarAgentRow(a, { showMachine, machineName });
+      const machineName = showMachine ? devices[a.deviceId]?.name?.trim() || null : null;
+      const { primary, secondary } = formatSidebarAgentRow(a, { showMachine, machineName: machineName ?? undefined });
+      const placement = getAgentPlacement(a, workspaceTopology, spacesMap);
+      const badge = showTopology ? formatTopologyBadge(placement) : null;
+      const topoNote = badge
+        ? placement.isBackground
+          ? " · 后台未打开标签"
+          : placement.isSplit
+            ? ` · ${badge.label} (${badge.slot})`
+            : ` · ${badge.label}`
+        : "";
       out.set(a.key, {
         group: g,
         primary,
         secondary,
-        collapsedTip: machineName ? `${machineName} · ${label}` : label,
-        expandedTip: secondary ? `${primary} — ${secondary}` : primary,
+        machineOnlySecondary: machineName,
+        collapsedTip: `${machineName ? `${machineName} · ` : ""}${label}${topoNote}`,
+        expandedTip: `${secondary ? `${primary} — ${secondary}` : primary}${topoNote}`,
       });
     }
     return out;
-  }, [devices, inScope, machines.length, primaryMachineId]);
+  }, [devices, inScope, machines.length, primaryMachineId, showTopology, spacesMap, workspaceTopology]);
 
   const focusedContent = activeTab ? focusedLeafOfTab(activeTab).content : null;
   const activeAgentKey = focusedContent?.kind === "agent" ? focusedContent.agentKey : null;
@@ -579,13 +702,20 @@ export const ShellSidebar = memo(function ShellSidebar({
     : link === "connecting" ? { text: "正在连接服务器…", action: null, run: null }
     : null;
 
-  const renderAgentRow = (a: Agent) => {
+  const renderAgentRow = (
+    a: Agent,
+    placementFromSection?: AgentTopologyPlacement,
+    joinRole: AgentRowJoinRole = "single",
+  ) => {
     const meta = agentMetaByKey.get(a.key);
     const g = meta?.group ?? listGroup(a, devices);
     const primary = meta?.primary ?? spacedTitle(a);
-    const secondary = meta?.secondary;
+    const placement = placementFromSection ?? getAgentPlacement(a, workspaceTopology, spacesMap);
+    const secondary = grouping === "space" ? meta?.machineOnlySecondary : meta?.secondary;
+    const spaceColorFg = grouping === "space" ? null : spaceColorVars(placement.spaceColor)?.fg ?? null;
     const isFocusedAgent = a.key === activeAgentKey;
     const isInSplit = !isFocusedAgent && activeSplitAgentKeys.has(a.key);
+    const splitPeerHover = Boolean(hoveredSplitTabId && placement.isSplit && placement.tabId === hoveredSplitTabId);
     const tooltipText = collapsed ? (meta?.collapsedTip ?? primary) : (meta?.expandedTip ?? primary);
     return (
       <SidebarAgentRow
@@ -596,10 +726,16 @@ export const ShellSidebar = memo(function ShellSidebar({
         secondary={secondary}
         tooltipText={tooltipText}
         ageLabel={shortAgo(lastChange(a), now)}
-        compactBlocked={sort === "status" && g === "blocked"}
+        compactBlocked={grouping === "status" && g === "blocked"}
         collapsed={collapsed}
         isFocusedAgent={isFocusedAgent}
         isInSplit={isInSplit}
+        showTopology={showTopology}
+        placement={placement}
+        joinRole={joinRole}
+        splitPeerHover={splitPeerHover}
+        spaceColorFg={spaceColorFg}
+        onHoverSplit={setHoveredSplitTabId}
         onOpenAgent={handleOpenAgent}
         onContextMenuAgent={handleAgentContextMenu}
       />
@@ -630,6 +766,7 @@ export const ShellSidebar = memo(function ShellSidebar({
               const startW = el.getBoundingClientRect().width || sidebarWidth;
               let curW = clampSidebarWidth(startW);
               let rafId = 0;
+              window.getSelection()?.removeAllRanges();
               setSidebarResizing(true);
               setInteractiveResizeActive(true);
               document.documentElement.dataset.splitResizing = "row";
@@ -746,20 +883,92 @@ export const ShellSidebar = memo(function ShellSidebar({
                   )}
                   {isFolded && !collapsed
                     ? null
-                    : m.spaces.map((s) => (
-                        <SidebarSpaceRow
-                          key={s.id}
-                          space={s}
-                          machineName={m.name}
-                          machineOnline={m.online}
-                          collapsed={collapsed}
-                          selected={selected === s.id}
-                          onSelectSpace={handleSelectSpace}
-                          onNewTerminal={onNewTerminal}
-                          onDeleteSpace={handleDeleteSpace}
-                          onContextMenuSpace={handleSpaceContextMenu}
-                        />
-                      ))}
+                    : m.spaces.map((s) => {
+                        const spTopo = workspaceTopology.bySpace.get(s.id);
+                        const pageCount = spTopo ? (spTopo.pages.length > 0 ? spTopo.pages.length : spTopo.declaredTabCount) : 0;
+                        const splitPageCount = spTopo?.splitPageCount ?? 0;
+                        const paneCount = spTopo?.paneCount ?? 0;
+                        const hasLocalPages = (spTopo?.pages.length ?? 0) > 0;
+                        const drawerExpanded =
+                          !collapsed && showTopology && hasLocalPages && expandedSpaceDrawers.includes(s.id);
+                        const isSpacePeerHovered = Boolean(
+                          showTopology && hoveredSplitTabId && workspaceTopology.tabSpaceById.get(hoveredSplitTabId) === s.id,
+                        );
+                        return (
+                          <div key={s.id} className="v3-space-wrap">
+                            <SidebarSpaceRow
+                              space={s}
+                              machineName={m.name}
+                              machineOnline={m.online}
+                              collapsed={collapsed}
+                              selected={selected === s.id}
+                              showTopology={showTopology}
+                              pageCount={pageCount}
+                              splitPageCount={splitPageCount}
+                              paneCount={paneCount}
+                              drawerExpanded={drawerExpanded}
+                              isSplitPeerHover={isSpacePeerHovered}
+                              onSelectSpace={handleSelectSpace}
+                              onToggleDrawer={(sp) => toggleSpaceDrawer(sp, hasLocalPages)}
+                              onNewTerminal={onNewTerminal}
+                              onDeleteSpace={handleDeleteSpace}
+                              onContextMenuSpace={handleSpaceContextMenu}
+                            />
+                            {drawerExpanded && spTopo ? (
+                              <div className="v3-space-pages-drawer" role="region" aria-label={`${s.name} 的标签页与分屏`}>
+                                {spTopo.pages.map((page) => {
+                                  const isPagePeerHovered = hoveredSplitTabId === page.tabId;
+                                  const dotKind = page.hasBlocked ? " blocked" : page.hasWorking ? " working" : "";
+                                  return (
+                                    <div
+                                      key={page.tabId}
+                                      className={`v3-space-page-card${page.active ? " active" : ""}${isPagePeerHovered ? " is-peer-hover" : ""}`}
+                                      onMouseEnter={() => page.isSplit && setHoveredSplitTabId(page.tabId)}
+                                      onMouseLeave={() => page.isSplit && hoveredSplitTabId === page.tabId && setHoveredSplitTabId(null)}
+                                    >
+                                      <button
+                                        type="button"
+                                        className="v3-space-page-head"
+                                        title={`跳转到第 ${page.pageNumber} 页：${page.tabName}`}
+                                        onClick={() => handleJumpToPage(page.tabId)}
+                                      >
+                                        <span className="v3-page-num">P{page.pageNumber}</span>
+                                        {page.isSplit ? (
+                                          <span className="v3-page-split-tag">
+                                            <Columns2 size={10} />
+                                            <span>{page.paneCount}分屏</span>
+                                          </span>
+                                        ) : null}
+                                        <span className="v3-space-page-title truncate">{page.tabName}</span>
+                                        {dotKind ? <span className={`v3-dot${dotKind}`} /> : null}
+                                      </button>
+                                      {page.isSplit ? (
+                                        <div className="v3-space-pane-chips">
+                                          {page.panes.map((pane) => (
+                                            <button
+                                              key={pane.paneId}
+                                              type="button"
+                                              className={`v3-space-pane-chip${page.active && pane.focused ? " is-focused" : ""}${pane.status === "blocked" ? " is-blocked" : ""}`}
+                                              title={`定位到分屏 ${pane.paneIndex}/${pane.paneCount}：${pane.title}`}
+                                              onClick={() => handleJumpToPage(page.tabId, pane.paneId)}
+                                            >
+                                              <span className="v3-pane-idx">{pane.paneIndex}</span>
+                                              {pane.kind === "agent" ? (
+                                                <VendorIcon harness={pane.harness ?? "agent"} isShell={pane.isShell} size={11} />
+                                              ) : null}
+                                              <span className="truncate">{pane.title}</span>
+                                            </button>
+                                          ))}
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
                 </div>
               );
             })}
@@ -791,6 +1000,7 @@ export const ShellSidebar = memo(function ShellSidebar({
               const startH = spacesEl.getBoundingClientRect().height || totalH * 0.42;
               let curRatio = clampSpacesRatio(startH / totalH) ?? 0.42;
               let rafId = 0;
+              window.getSelection()?.removeAllRanges();
               setSpacesResizing(true);
               document.documentElement.dataset.splitResizing = "column";
               e.currentTarget.setPointerCapture(e.pointerId);
@@ -835,32 +1045,71 @@ export const ShellSidebar = memo(function ShellSidebar({
               <span>Agent</span>
               <span className="v3-count v3-sec-count">{inScope.length}</span>
               <span className="grow" />
-              <button
-                className={`v3-icon-btn small${sort === "recent" ? " on" : ""}`}
-                aria-label={sort === "recent" ? "按状态分组" : "按最近排序"}
-                title={sort === "recent" ? "现在按最近排序，点一下按状态分组" : "现在按状态分组，点一下按最近排序"}
-                onClick={() => setSort(sort === "recent" ? "status" : "recent")}
-              >
-                <History size={14} />
-              </button>
+              <div className="v3-seg-mini" role="tablist" aria-label="Agent 列表分组方式">
+                {(
+                  [
+                    { key: "status", label: "状态", title: "按需要你 / 运行中 / 已完成状态分组" },
+                    { key: "space", label: "空间", title: "按所属 Space 与同窗分屏关系聚合" },
+                    { key: "recent", label: "最近", title: "按最近活跃时间排序" },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    role="tab"
+                    aria-selected={grouping === opt.key}
+                    className={`v3-seg-mini-btn${grouping === opt.key ? " active" : ""}`}
+                    title={opt.title}
+                    onClick={() => setGrouping(opt.key)}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
           <div className="v3-block-body">
-            {groups.map((g) => {
-              const id = `g:${g.key}`;
-              const isFolded = folded.includes(id) && g.key !== "recent";
+            {sections.map((g) => {
+              const id = `g:${g.groupKey}`;
+              const isFolded = folded.includes(id) && g.groupKey !== "recent";
+              const spColor = g.kind === "space" ? spaceColorVars(g.spaceColor)?.fg : undefined;
               return (
-                <div key={g.key}>
+                <div key={g.id}>
                   {collapsed ? (
                     <div className="v3-machine-sep" />
                   ) : (
-                    <button className="v3-group-head" aria-expanded={!isFolded} onClick={() => g.key !== "recent" && toggleFold(id)}>
-                      <span>{g.title}</span>
-                      <span className="v3-count">{g.list.length}</span>
-                      {g.key !== "recent" ? isFolded ? <ChevronRight size={12} /> : <ChevronDown size={12} className="hover-only" /> : null}
+                    <button
+                      type="button"
+                      className="v3-group-head"
+                      aria-expanded={!isFolded}
+                      onClick={() => g.groupKey !== "recent" && toggleFold(id)}
+                    >
+                      {g.kind === "space" ? (
+                        <span
+                          className="v3-space-dot lg"
+                          style={spColor ? { backgroundColor: spColor } : undefined}
+                          aria-hidden="true"
+                        />
+                      ) : null}
+                      <span className="truncate">{g.title}</span>
+                      {g.kind === "space" && showTopology && (g.pageCount ?? 0) > 0 ? (
+                        <span className="v3-group-meta">
+                          {g.pageCount}页{(g.splitPageCount ?? 0) > 0 ? " · 含分屏" : ""}
+                        </span>
+                      ) : null}
+                      <span className="v3-count">{g.items.length}</span>
+                      {g.groupKey !== "recent" ? (
+                        isFolded ? (
+                          <ChevronRight size={12} />
+                        ) : (
+                          <ChevronDown size={12} className="hover-only" />
+                        )
+                      ) : null}
                     </button>
                   )}
-                  {isFolded && !collapsed ? null : g.list.map(renderAgentRow)}
+                  {isFolded && !collapsed
+                    ? null
+                    : g.items.map((item) => renderAgentRow(item.agent, item.placement, item.joinRole))}
                 </div>
               );
             })}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import {
   ArrowDown,
   ArrowLeft,
@@ -7,7 +7,6 @@ import {
   Brain,
   ChevronDown,
   ChevronRight,
-  Cpu,
   Folder,
   FolderGit2,
   FolderOpen,
@@ -72,10 +71,14 @@ import { PortalViewerModal } from "../components/PortalViewerModal";
 import { SessionPortalPiP } from "../components/SessionPortalPiP";
 import { FolderExplorerModal, normalizeFolderKey } from "../components/FolderExplorerModal";
 import { VendorAvatar, XiaoyangOrb, statusTone } from "../components/MascotAndVendor";
+import { AskQuestionDeck } from "../components/AskQuestionDeck";
+import { ModelBrandIcon } from "../components/ModelBrandIcon";
 import { ModelSwitchDropdown, formatEffortLabel } from "../components/ModelSwitchDropdown";
 import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
+import { buildAskQuestionDeck, isQuestionToolName, summarizeAskQuestionInput } from "../lib/askQuestion";
+import { computeTurnTelemetry, fmtPctClean } from "../lib/turnTelemetry";
 import { copyToClipboard } from "../lib/bridge";
 import { extractImageTargets } from "../lib/chatImages";
 import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../lib/chatFold";
@@ -347,549 +350,6 @@ function AgentQuickMenu({
   );
 }
 
-export function AgentsView({
-  mobileLayout,
-  selectedKey,
-  onSelectAgent,
-  onOpenWorkbench,
-}: {
-  mobileLayout: boolean;
-  selectedKey: string | null;
-  onSelectAgent: (key: string | null) => void;
-  /** Opens the agent's working folder in the workbench. */
-  onOpenWorkbench?: (agentKey: string) => void;
-}) {
-  const toast = useToast();
-  const agentsMap = liveStore.use((s) => s.agents);
-  const devices = liveStore.use((s) => s.devices);
-  const link = liveStore.use((s) => s.link);
-  const showShells = settingsStore.use((s) => s.showShells);
-  const hostFilterSaved = settingsStore.use((s) => s.hostFilter);
-  const foldedGroups = settingsStore.use((s) => s.foldedGroups);
-  const dark = settingsStore.use((s) => s.theme) === "dark";
-
-  const [statusFilter, setStatusFilter] = useState<AgentStatus | null>(null);
-  const [spaceFilter, setSpaceFilter] = useState<string | null>(null);
-  const [searching, setSearching] = useState(false);
-  const [query, setQuery] = useState("");
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [createOpen, setCreateOpen] = useState(false);
-
-  const hosts = useMemo(() => {
-    const list = Object.values(devices).filter((d) => d.kind === "host");
-    for (const id of Object.keys(agentsMap)) {
-      if (!devices[id]) {
-        list.push({ id, name: id, kind: "host", online: false, createdAt: 0, lastSeenAt: 0 });
-      }
-    }
-    return list.sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
-  }, [devices, agentsMap]);
-
-  const hostFilter = hostFilterSaved && hosts.some((h) => h.id === hostFilterSaved) ? hostFilterSaved : null;
-  const isOnline = useCallback((a: Agent) => devices[a.deviceId]?.online ?? false, [devices]);
-  const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
-
-  const onHost = useMemo(() => all.filter((a) => !hostFilter || a.deviceId === hostFilter), [all, hostFilter]);
-  const spaces = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const a of onHost) {
-      const sp = agentSpace(a);
-      if (sp) m.set(sp, (m.get(sp) ?? 0) + 1);
-    }
-    return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  }, [onHost]);
-
-  const activeSpace = spaceFilter && spaces.some(([s]) => s === spaceFilter) ? spaceFilter : null;
-  const inScope = useMemo(() => onHost.filter((a) => !activeSpace || agentSpace(a) === activeSpace), [onHost, activeSpace]);
-
-  const counts = useMemo(() => {
-    const c: Record<AgentStatus, number> = { blocked: 0, working: 0, done: 0, idle: 0, unknown: 0 };
-    for (const a of inScope) if (isOnline(a)) c[a.status]++;
-    return c;
-  }, [inScope, isOnline]);
-
-  const q = query.trim().toLowerCase();
-  const sections = useMemo(() => {
-    const by: Record<GroupKey, Agent[]> = { blocked: [], working: [], done: [], idle: [], offline: [] };
-    for (const a of inScope) {
-      if (q && ![spacedTitle(a), a.harness, a.where, a.cwd, a.preview].some((s) => s?.toLowerCase().includes(q))) {
-        continue;
-      }
-      const g: GroupKey = !isOnline(a)
-        ? "offline"
-        : a.status === "blocked" || a.status === "working" || a.status === "done"
-          ? a.status
-          : "idle";
-      by[g].push(a);
-    }
-    return GROUPS.filter((g) => by[g.key].length && (!statusFilter || g.key === statusFilter)).map((g) => {
-      const folded = !q && !statusFilter && foldedGroups.includes(g.key);
-      return { key: g.key, title: g.title, count: by[g.key].length, folded, data: folded ? [] : by[g.key].sort(byRecent) };
-    });
-  }, [foldedGroups, inScope, isOnline, q, statusFilter]);
-
-  const toggleGroup = (k: GroupKey) => {
-    updateSettings({
-      foldedGroups: foldedGroups.includes(k) ? foldedGroups.filter((x) => x !== k) : [...foldedGroups, k],
-    });
-  };
-
-  // "按空间": computer, then space, the way the phone app groups them (mobile R25).
-  const [groupMode, setGroupModeState] = useState<GroupMode>(() => readPref<GroupMode>(GROUP_MODE_KEY, "space"));
-  const setGroupMode = (m: GroupMode) => {
-    setGroupModeState(m);
-    writePref(GROUP_MODE_KEY, m);
-  };
-  const [foldedSpaces, setFoldedSpaces] = useState<string[]>(() => readPref<string[]>(FOLDED_SPACES_KEY, []));
-  const toggleSpace = (id: string) => {
-    const next = foldedSpaces.includes(id) ? foldedSpaces.filter((x) => x !== id) : [...foldedSpaces, id];
-    setFoldedSpaces(next);
-    writePref(FOLDED_SPACES_KEY, next);
-  };
-  const groupOf = useCallback(
-    (a: Agent): GroupKey =>
-      !isOnline(a) ? "offline" : a.status === "blocked" || a.status === "working" || a.status === "done" ? a.status : "idle",
-    [isOnline],
-  );
-  const spaceGroups = useMemo(() => {
-    const byDevice = new Map<string, Map<string, Agent[]>>();
-    for (const a of inScope) {
-      if (q && ![spacedTitle(a), a.harness, a.where, a.cwd, a.preview].some((s) => s?.toLowerCase().includes(q))) continue;
-      if (statusFilter && groupOf(a) !== statusFilter) continue;
-      const perSpace = byDevice.get(a.deviceId) ?? new Map<string, Agent[]>();
-      const sp = agentSpace(a) ?? "";
-      perSpace.set(sp, [...(perSpace.get(sp) ?? []), a]);
-      byDevice.set(a.deviceId, perSpace);
-    }
-    const out = [...byDevice.entries()].map(([deviceId, perSpace]) => {
-      const groups = [...perSpace.entries()].map(([space, list]) => {
-        list.sort((x, y) => STATUS_RANK[groupOf(x)] - STATUS_RANK[groupOf(y)] || byRecent(x, y));
-        const tally = { blocked: 0, working: 0, done: 0 };
-        for (const a of list) {
-          const g = groupOf(a);
-          if (g === "blocked" || g === "working" || g === "done") tally[g]++;
-        }
-        const latest = Math.max(...list.map((a) => a.statusSince ?? a.updatedAt));
-        const id = `${deviceId}\u0000${space}`;
-        return { id, space, list, tally, latest, folded: !q && !statusFilter && foldedSpaces.includes(id) };
-      });
-      groups.sort((x, y) => y.tally.blocked - x.tally.blocked || y.latest - x.latest);
-      const device = devices[deviceId];
-      return {
-        deviceId,
-        name: device?.name ?? deviceId,
-        online: device?.online ?? false,
-        count: groups.reduce((n, g) => n + g.list.length, 0),
-        blocked: groups.reduce((n, g) => n + g.tally.blocked, 0),
-        groups,
-      };
-    });
-    return out.sort((x, y) => Number(y.online) - Number(x.online) || y.blocked - x.blocked || x.name.localeCompare(y.name));
-  }, [devices, foldedSpaces, groupOf, inScope, q, statusFilter]);
-
-  const [createTarget, setCreateTarget] = useState<{ host: string | null; space: string | null }>({ host: null, space: null });
-  const openCreate = (host: string | null, space: string | null) => {
-    setCreateTarget({ host, space });
-    setCreateOpen(true);
-  };
-  const [menu, setMenu] = useState<QuickMenuState | null>(null);
-  const [detailTab, setDetailTab] = useState<{ key: string; tab: "chat" | "term" } | null>(null);
-  const [fabCompact, setFabCompact] = useState(false);
-  const lastScrollRef = useRef(0);
-
-  const openAgentAt = (key: string, tab: "chat" | "term") => {
-    setDetailTab({ key, tab });
-    onSelectAgent(key);
-  };
-
-  const selectedAgent = useMemo(() => all.find((a) => a.key === selectedKey) ?? null, [all, selectedKey]);
-  const onlyOfflineHosts = hosts.length > 0 && (hostFilter ? !hosts.find((h) => h.id === hostFilter)?.online : hosts.every((h) => !h.online));
-  const listEmpty = groupMode === "space" ? spaceGroups.length === 0 : sections.length === 0;
-
-  const headline = link === "online" && onlyOfflineHosts && !inScope.length
-    ? "电脑离线，暂时看不到 agent"
-    : counts.blocked
-    ? `有 ${counts.blocked} 个 agent 在等你`
-    : counts.working
-      ? `${counts.working} 个 agent 正在忙`
-      : counts.done
-        ? "大家都忙完啦"
-        : "大家都歇着呢";
-
-  const initialTab = detailTab && detailTab.key === selectedAgent?.key ? detailTab.tab : "chat";
-
-  if (mobileLayout && selectedAgent) {
-    return (
-      <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
-        <AgentDetailPanel
-          key={selectedAgent.key}
-          agent={selectedAgent}
-          initialTab={initialTab}
-          onBack={() => {
-            setDetailTab(null);
-            onSelectAgent(null);
-          }}
-          onOpenWorkbench={onOpenWorkbench}
-          mobile
-        />
-      </div>
-    );
-  }
-
-  const quickActions = menu ? (
-    <AgentQuickMenu
-      state={menu}
-      onClose={() => setMenu(null)}
-      onOpen={(tab) => openAgentAt(menu.agent.key, tab)}
-      onNewHere={() => openCreate(menu.agent.deviceId, agentSpace(menu.agent) ?? null)}
-      onCopyPath={() => {
-        const path = menu.agent.cwd;
-        if (!path) return;
-        void copyToClipboard(path).then((ok) => toast(ok ? "文件夹路径已复制" : "复制失败", !ok));
-      }}
-    />
-  ) : null;
-
-  const rowFor = (agent: Agent, showSpace: boolean) => {
-    const offline = !isOnline(agent);
-    const sub = [
-      showSpace ? agentSpace(agent) : null,
-      // 按空间 already shows the computer as a header.
-      groupMode === "status" ? devices[agent.deviceId]?.name : null,
-      agent.turn ? `第 ${agent.turn} 轮` : null,
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    return (
-      <AgentRow
-        key={agent.key}
-        agent={agent}
-        offline={offline}
-        selected={selectedKey === agent.key}
-        dark={dark}
-        sub={sub || agent.cwd || agent.harness}
-        onOpen={() => openAgentAt(agent.key, "chat")}
-        onMenu={(x, y, sheet) => setMenu({ agent, x, y, sheet: sheet || mobileLayout })}
-      />
-    );
-  };
-
-  const listPane = (
-    <div className="stack" style={{ gap: 12 }}>
-      <div className="between">
-        <div className="row" style={{ minWidth: 0 }}>
-          <PocketIconButton tooltip="筛选电脑与空间" onClick={() => setDrawerOpen(true)}>
-            <Menu size={17} />
-          </PocketIconButton>
-          <div style={{ minWidth: 0 }}>
-            <h2 className="cute-font" style={{ margin: 0, fontSize: fs(22) }}>{greeting()}</h2>
-            <div className="faint truncate" title={headline}>{headline}</div>
-          </div>
-        </div>
-        <div className="row" style={{ gap: 6 }}>
-          <PocketIconButton tooltip="搜索" active={searching} onClick={() => setSearching((v) => !v)}>
-            <Search size={16} />
-          </PocketIconButton>
-          <PocketIconButton tooltip={showShells ? "隐藏普通终端" : "显示普通终端"} active={showShells} onClick={() => updateSettings({ showShells: !showShells })}>
-            <Terminal size={16} />
-          </PocketIconButton>
-          {!mobileLayout ? (
-            <PocketIconButton tooltip="新建 Agent" onClick={() => openCreate(hostFilter, activeSpace)}>
-              <Plus size={17} />
-            </PocketIconButton>
-          ) : listEmpty ? null : (
-            <XiaoyangOrb mood={counts.blocked ? "waiting" : counts.working ? "working" : "hello"} size={44} />
-          )}
-        </div>
-      </div>
-
-      {/* Stat Cards */}
-      <div className="stat-grid">
-        {(
-          [
-            { key: "blocked", label: "需要你", tone: "blush" },
-            { key: "working", label: "工作中", tone: "pink" },
-            { key: "done", label: "已完成", tone: "mint" },
-          ] as const
-        ).map((item) => {
-          const active = statusFilter === item.key;
-          return (
-            <button
-              key={item.key}
-              className={`stat-tile ${item.tone}${active ? " active" : ""}`}
-              onClick={() => setStatusFilter(active ? null : item.key)}
-            >
-              <span style={{ fontSize: fs(12.5), fontWeight: 800 }}>{item.label}</span>
-              <span className="stat-tile-num num">{counts[item.key]}</span>
-            </button>
-          );
-        })}
-      </div>
-
-      <div className="segmented group-toggle" role="tablist" aria-label="分组方式">
-        <button role="tab" aria-selected={groupMode === "space"} className={groupMode === "space" ? "active" : ""} onClick={() => setGroupMode("space")}>
-          按空间
-        </button>
-        <button role="tab" aria-selected={groupMode === "status"} className={groupMode === "status" ? "active" : ""} onClick={() => setGroupMode("status")}>
-          按状态
-        </button>
-      </div>
-
-      {/* Filter Tags */}
-      {hostFilter || activeSpace ? (
-        <div className="row wrap" style={{ gap: 6 }}>
-          {hostFilter ? (
-            <PocketButton size="sm" variant="soft" onClick={() => updateSettings({ hostFilter: null })}>
-              <Laptop size={13} />
-              <span>{hosts.find((h) => h.id === hostFilter)?.name ?? hostFilter}</span>
-              <X size={13} />
-            </PocketButton>
-          ) : null}
-          {activeSpace ? (
-            <PocketButton size="sm" variant="soft" onClick={() => setSpaceFilter(null)}>
-              <span>空间：{activeSpace}</span>
-              <X size={13} />
-            </PocketButton>
-          ) : null}
-        </div>
-      ) : null}
-
-      {searching ? (
-        <PocketInput
-          autoFocus
-          placeholder="搜标题、项目、目录…"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-      ) : null}
-
-      {/* List */}
-      {listEmpty ? (
-        <EmptyState
-          mood="sleepy"
-          title={
-            link !== "online"
-              ? "还在连服务器"
-              : hosts.length === 0
-                ? "还没有电脑加入"
-                : onlyOfflineHosts
-                  ? hostFilter || hosts.length === 1
-                    ? `${hosts.find((h) => h.id === (hostFilter ?? hosts[0]!.id))?.name ?? "这台电脑"}离线了`
-                    : "电脑都离线了"
-                  : q || statusFilter || activeSpace
-                    ? "没有符合条件的 agent"
-                    : "还没有 agent"
-          }
-          body={
-            link !== "online"
-              ? "连上以后，各台电脑上的 agent 会出现在这里。"
-              : hosts.length === 0
-                ? "在电脑上运行 herdr-pocket up，再到“设备”页扫码或配对。"
-                : onlyOfflineHosts
-                  ? "确认那台电脑开着、herdr-pocket 在运行；它重新上线后，agent 会自动出现在这里。"
-                  : q || statusFilter || activeSpace
-                    ? "换个筛选条件试试。"
-                    : "点“新建”在某台电脑上开一个 agent。"
-          }
-          action={
-            <PocketButton size="sm" variant="soft" onClick={() => pingRelay()}>
-              <RefreshCw size={13} />
-              <span>刷新状态</span>
-            </PocketButton>
-          }
-        />
-      ) : groupMode === "space" ? (
-        <div className="stack" style={{ gap: 12 }}>
-          {spaceGroups.map((dev) => (
-            <div key={dev.deviceId} className="stack" style={{ gap: 8 }}>
-              {spaceGroups.length > 1 ? (
-                <div className="computer-head">
-                  <Laptop size={15} />
-                  <span className="truncate">{dev.name}</span>
-                  <span className={`status-pip${dev.online ? " ok" : ""}`} aria-label={dev.online ? "在线" : "离线"} />
-                  <span className="faint num">{dev.count}</span>
-                </div>
-              ) : null}
-              {dev.groups.map((g) => {
-                const label = g.space || "未分空间";
-                return (
-                  <div key={g.id} className="stack" style={{ gap: 6 }}>
-                    <div className="space-head">
-                      <button className="space-head-main" aria-expanded={!g.folded} onClick={() => !q && !statusFilter && toggleSpace(g.id)}>
-                        <SpaceTileIcon
-                          spaceKey={`${dev.deviceId}\u0000${label}`}
-                          name={label}
-                          blocked={g.tally.blocked > 0}
-                          size="md"
-                        />
-                        <span className="space-name truncate">{label}</span>
-                        <span className="faint num">{g.list.length}</span>
-                        <span className="space-dots" aria-label={`需要你 ${g.tally.blocked}，工作中 ${g.tally.working}，已完成 ${g.tally.done}`}>
-                          {g.tally.blocked ? <span className="space-dot blocked num">{g.tally.blocked}</span> : null}
-                          {g.tally.working ? <span className="space-dot working num">{g.tally.working}</span> : null}
-                          {g.tally.done ? <span className="space-dot done num">{g.tally.done}</span> : null}
-                        </span>
-                        <span className="grow" />
-                        {!q && !statusFilter ? g.folded ? <ChevronRight size={16} /> : <ChevronDown size={16} /> : null}
-                      </button>
-                      {g.space && dev.online ? (
-                        <PocketIconButton size="sm" className="space-add" tooltip={`在空间 ${g.space} 新建 agent`} onClick={() => openCreate(dev.deviceId, g.space)}>
-                          <Plus size={14} />
-                        </PocketIconButton>
-                      ) : null}
-                    </div>
-                    {g.folded ? null : g.list.map((agent) => rowFor(agent, false))}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="stack" style={{ gap: 8 }}>
-          {sections.map((sec) => (
-            <div key={sec.key} className="stack" style={{ gap: 6 }}>
-              <button
-                className="between"
-                style={{ border: 0, background: "transparent", padding: "4px 4px", cursor: "pointer", color: "var(--muted)" }}
-                onClick={() => !q && !statusFilter && toggleGroup(sec.key)}
-              >
-                <span style={{ fontWeight: 800, fontSize: fs(13) }}>
-                  {sec.title} <span className="faint num">{sec.count}</span>
-                </span>
-                {!q && !statusFilter ? (sec.folded ? <ChevronRight size={16} /> : <ChevronDown size={16} />) : null}
-              </button>
-              {sec.data.map((agent) => rowFor(agent, true))}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-
-  return (
-    // A flex column, so the narrow list's .mobile-scroll (flex: 1) gets a height and actually scrolls.
-    <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
-      {mobileLayout ? (
-        <div
-          className="mobile-scroll has-fab"
-          onScroll={(e) => {
-            const top = e.currentTarget.scrollTop;
-            const delta = top - lastScrollRef.current;
-            if (Math.abs(delta) > 6) {
-              setFabCompact(delta > 0 && top > 24);
-              lastScrollRef.current = top;
-            }
-          }}
-        >
-          {listPane}
-          <button
-            className={`fab-new${fabCompact ? " compact" : ""}`}
-            aria-label="新建 Agent"
-            onClick={() => openCreate(hostFilter, activeSpace)}
-          >
-            <Plus size={20} />
-            <span className="fab-new-label">新建</span>
-          </button>
-        </div>
-      ) : (
-        <div className="agents-split">
-          <div className="agents-col">{listPane}</div>
-          <div className="detail-pane">
-            {selectedAgent ? (
-              <AgentDetailPanel key={selectedAgent.key} agent={selectedAgent} initialTab={initialTab} onOpenWorkbench={onOpenWorkbench} />
-            ) : listEmpty ? (
-              <div className="detail-hint faint">agent 出现后，点左侧任意一个在这里查看对话和终端。</div>
-            ) : (
-              <EmptyState mood="hello" title="选一个 Agent" body="点左侧任意 agent，在这里查看实时对话、终端输出、子 agent，或者发消息与图片。" />
-            )}
-          </div>
-        </div>
-      )}
-      {quickActions}
-
-      {/* Filter Drawer Modal */}
-      <PocketModal open={drawerOpen} onOpenChange={setDrawerOpen} title="按电脑或空间筛选" width={400}>
-        <div className="stack">
-          <div>
-            <div className="faint" style={{ marginBottom: 6 }}>电脑</div>
-            <div className="stack" style={{ gap: 6 }}>
-              <PocketButton
-                size="sm"
-                variant={!hostFilter ? "primary" : "ghost"}
-                onClick={() => {
-                  updateSettings({ hostFilter: null });
-                  setDrawerOpen(false);
-                }}
-              >
-                全部电脑 ({all.length})
-              </PocketButton>
-              {hosts.map((h) => (
-                <PocketButton
-                  key={h.id}
-                  size="sm"
-                  variant={hostFilter === h.id ? "primary" : "ghost"}
-                  onClick={() => {
-                    updateSettings({ hostFilter: h.id });
-                    setDrawerOpen(false);
-                  }}
-                >
-                  {h.name} {!h.online ? "(离线)" : ""}
-                </PocketButton>
-              ))}
-            </div>
-          </div>
-
-          {spaces.length > 0 ? (
-            <div>
-              <div className="faint" style={{ marginBottom: 6 }}>工作空间</div>
-              <div className="row wrap" style={{ gap: 6 }}>
-                <PocketButton
-                  size="sm"
-                  variant={!activeSpace ? "soft" : "ghost"}
-                  onClick={() => {
-                    setSpaceFilter(null);
-                    setDrawerOpen(false);
-                  }}
-                >
-                  全部空间
-                </PocketButton>
-                {spaces.map(([name, cnt]) => (
-                  <PocketButton
-                    key={name}
-                    size="sm"
-                    variant={activeSpace === name ? "primary" : "ghost"}
-                    onClick={() => {
-                      setSpaceFilter(name);
-                      setDrawerOpen(false);
-                    }}
-                  >
-                    {name} ({cnt})
-                  </PocketButton>
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </div>
-      </PocketModal>
-
-      <CreateAgentModal
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-        hosts={hosts}
-        defaultHost={createTarget.host ?? hostFilter}
-        defaultSpace={createTarget.space ?? activeSpace}
-        onCreated={(info) => {
-          if (info.spaceName) setSpaceFilter(info.spaceName);
-          setDetailTab({ key: info.agentKey, tab: "term" });
-          onSelectAgent(info.agentKey);
-          toast(info.launcher === "shell" ? "已创建并打开终端" : "已创建并打开 Agent");
-        }}
-      />
-    </div>
-  );
-}
-
 function extractClipboardFiles(data: DataTransfer | null): File[] {
   if (!data) return [];
   if (data.files && data.files.length > 0) return Array.from(data.files);
@@ -926,7 +386,7 @@ export interface SubagentHeadInfo {
   onRefresh: () => void;
 }
 
-export function AgentDetailPanel({
+export const AgentDetailPanel = memo(function AgentDetailPanel({
   agent,
   initialTab = "chat",
   mode,
@@ -1114,18 +574,38 @@ export function AgentDetailPanel({
   const attachmentsRef = useRef<StagedAttachment[]>([]);
   attachmentsRef.current = attachments;
 
-  const overlayOpenCount = overlayStore.use((s) => s.open);
-  const settingsOpen = Boolean(shellStore.use((s) => s.settings));
-  const paletteOpen = Boolean(shellStore.use((s) => s.palette));
+  const overlayOpenCount = overlayStore.use((s) => (visible ? s.open : 0));
+  const settingsOpen = shellStore.use((s) => (visible ? Boolean(s.settings) : false));
+  const paletteOpen = shellStore.use((s) => (visible ? Boolean(s.palette) : false));
   const [unreadCount, setUnreadCount] = useState(0);
   const lastTrackedRowIdRef = useRef<string | null>(null);
+  const [chatDomHibernated, setChatDomHibernated] = useState(false);
+
+  useLayoutEffect(() => {
+    if (visible) {
+      setChatDomHibernated(false);
+    }
+  }, [visible]);
+
+  useEffect(() => {
+    if (visible) return;
+    const timer = window.setTimeout(() => {
+      if (visibleRef.current) return;
+      setChatDomHibernated(true);
+      setEvents((prev) => (prev.length > 160 && stickRef.current ? prev.slice(-120) : prev));
+    }, 2500);
+    return () => window.clearTimeout(timer);
+  }, [visible]);
+
   const [winFocused, setWinFocused] = useState(
     () => typeof document === "undefined" || (document.visibilityState === "visible" && document.hasFocus()),
   );
   useEffect(() => {
+    if (!visible) return;
     const sync = () => {
       setWinFocused(typeof document === "undefined" || (document.visibilityState === "visible" && document.hasFocus()));
     };
+    sync();
     window.addEventListener("focus", sync);
     window.addEventListener("blur", sync);
     document.addEventListener("visibilitychange", sync);
@@ -1134,7 +614,7 @@ export function AgentDetailPanel({
       window.removeEventListener("blur", sync);
       document.removeEventListener("visibilitychange", sync);
     };
-  }, []);
+  }, [visible]);
 
   const { queued, outgoing, pendingSwitch, captured, injectedTerminalTexts } = useAgentChatQueue(agent.key);
   const activeSub = subTrail[subTrail.length - 1] ?? null;
@@ -1156,7 +636,7 @@ export function AgentDetailPanel({
   }, [activeMode, agent.status, outgoing.length, sending, visible]);
 
   useEffect(() => {
-    if (!chatVisited) return;
+    if (!chatVisited || (chatDomHibernated && !visible)) return;
     let alive = true;
     const prev = sessionTrackRef.current;
     const sessionSwitched = prev.agentKey !== agent.key || (Boolean(prev.sessionKey) && Boolean(agent.sessionKey) && prev.sessionKey !== agent.sessionKey);
@@ -1254,7 +734,7 @@ export function AgentDetailPanel({
       window.clearInterval(pollTimer);
       unsubSession();
     };
-  }, [agent.deviceId, agent.key, agent.sessionKey, chatVisited]);
+  }, [agent.deviceId, agent.key, agent.sessionKey, chatDomHibernated, chatVisited, visible]);
 
   const lastSeenMarkRef = useRef<string | null>(null);
   const wasVisibleForSeenRef = useRef(false);
@@ -1497,6 +977,13 @@ export function AgentDetailPanel({
 
   const choices = useMemo(() => (activeMode === "chat" && choiceLines.length ? parseChoices(choiceLines) : []), [activeMode, choiceLines]);
   const displayedEvents = activeSub ? subEvents : events;
+  const questionDeck = useMemo(
+    () =>
+      activeMode === "chat" && !activeSub
+        ? buildAskQuestionDeck({ events: displayedEvents, choiceLines, choices })
+        : null,
+    [activeMode, activeSub, choiceLines, choices, displayedEvents],
+  );
   const shellChat = useMemo(() => (isPlainShellChat ? parseTerminalChatTranscript(shellRaw) : null), [isPlainShellChat, shellRaw]);
   const cachedFoldedRef = useRef<ChatRow[]>([]);
   const foldedRows = useMemo(() => {
@@ -1507,6 +994,10 @@ export function AgentDetailPanel({
     return next;
   }, [activeMode, chatDisplayMode, displayedEvents, isPlainShellChat]);
   const isTurnBusy = useMemo(() => isAgentTurnBusy(agent.status, foldedRows), [agent.status, foldedRows]);
+  const composerTelemetry = useMemo(
+    () => computeTurnTelemetry(displayedEvents, usageReport, agent),
+    [agent, displayedEvents, usageReport],
+  );
   const convReconciled = useMemo(
     () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick),
     [agent.status, foldedRows, nowTick, outgoing],
@@ -1687,12 +1178,19 @@ export function AgentDetailPanel({
     for (let i = foldedRows.length - 1; i >= Math.max(0, foldedRows.length - 5); i -= 1) {
       const r = foldedRows[i]!;
       if (r.kind === "activity_group" && r.running) {
-        return r.activeStep
-          ? `${r.activeStep.name}${r.activeStep.summary ? ` · ${clip(r.activeStep.summary, 36)}` : ""}`
-          : "工具调用";
+        if (!r.activeStep) return "工具调用";
+        const label = isQuestionToolName(r.activeStep.name) ? "等待你确认" : r.activeStep.name;
+        const preview = isQuestionToolName(r.activeStep.name)
+          ? summarizeAskQuestionInput(r.activeStep.input, 36)
+          : r.activeStep.summary;
+        return preview ? `${label} · ${clip(preview, 36)}` : label;
       }
       if (r.kind === "tool" && r.step.running) {
-        return `${r.step.name}${r.step.summary ? ` · ${clip(r.step.summary, 36)}` : ""}`;
+        const label = isQuestionToolName(r.step.name) ? "等待你确认" : r.step.name;
+        const preview = isQuestionToolName(r.step.name)
+          ? summarizeAskQuestionInput(r.step.input, 36)
+          : r.step.summary;
+        return preview ? `${label} · ${clip(preview, 36)}` : label;
       }
     }
     return null;
@@ -2314,10 +1812,18 @@ export function AgentDetailPanel({
   };
 
   const interruptTurn = useCallback(() => {
+    if (native.available() && localHostIdStore.get() === agent.deviceId && agent.source === "hc" && agent.localId) {
+      void native.localTermInterrupt(agent.localId).catch(() =>
+        rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) =>
+          toast((e as Error).message, true),
+        ),
+      );
+      return;
+    }
     void rpcCall(agent.deviceId, "terminal.interrupt", { agent: agent.key }).catch((e) =>
       toast((e as Error).message, true),
     );
-  }, [agent.deviceId, agent.key, toast]);
+  }, [agent.deviceId, agent.key, agent.localId, agent.source, toast]);
 
   useEffect(() => {
     const onAgentAction = (ev: Event) => {
@@ -2357,6 +1863,14 @@ export function AgentDetailPanel({
 
   const sendKeys = async (keys: string[]) => {
     try {
+      if (native.available() && localHostIdStore.get() === agent.deviceId && agent.source === "hc" && agent.localId) {
+        try {
+          await native.localTermKeys(agent.localId, keys);
+          return;
+        } catch {
+          // fall through to RPC
+        }
+      }
       await rpcCall(agent.deviceId, "terminal.keys", { agent: agent.key, keys });
     } catch (e) {
       toast((e as Error).message, true);
@@ -2710,7 +2224,7 @@ export function AgentDetailPanel({
             </div>
           ) : null}
 
-          {showEmptyState ? (
+          {chatDomHibernated && !visible && stickRef.current ? null : showEmptyState ? (
             <EmptyState mood="sleepy" title="还没有对话记录" body="在下方发一条消息，或点右上角切换到“终端”直接操作。" />
           ) : (
             <>
@@ -2900,48 +2414,26 @@ export function AgentDetailPanel({
       {termVisited ? (
         <div
           aria-hidden={activeMode !== "term"}
+          inert={activeMode !== "term" || !visible ? true : undefined}
           style={
             activeMode === "term"
               ? { flex: 1, minHeight: 0, display: "flex" }
-              : { position: "absolute", inset: 0, display: "flex", visibility: "hidden", pointerEvents: "none", zIndex: -1 }
+              : {
+                  position: "absolute",
+                  inset: 0,
+                  display: "flex",
+                  visibility: "hidden",
+                  pointerEvents: "none",
+                  userSelect: "none",
+                  WebkitUserSelect: "none",
+                  zIndex: -1,
+                }
           }
         >
           <PocketErrorBoundary resetKey={agent.key} title="终端视图加载出错">
             <TerminalSurface agent={agent} active={visible && activeMode === "term"} focused={focused && visible} />
           </PocketErrorBoundary>
         </div>
-      ) : null}
-
-      {/* Quick Numbered Choices (Chat mode only) */}
-      {activeMode === "chat" && !activeSub && choices.length > 0 ? (
-        <div className="row wrap" style={{ padding: "4px 14px", gap: 6, flexShrink: 0 }}>
-          {choices.map((c) => (
-            <button
-              key={c.key}
-              className={`term-key${c.selected ? " accent" : ""}`}
-              onClick={() => void sendKeys([c.key, "enter"])}
-            >
-              {c.key}. {c.label}
-            </button>
-          ))}
-        </div>
-      ) : null}
-
-      {activeMode === "chat" && !activeSub && usageOpen ? (
-        <AgentUsageCard
-          agent={agent}
-          report={usageReport}
-          loading={usageLoading}
-          error={usageError}
-          onRefresh={openUsageView}
-          onClose={() => setUsageOpen(false)}
-          onOpenModelSwitch={() => setModelMenuMode("model")}
-          onRunInTerminal={() => {
-            setUsageOpen(false);
-            if (agent.status === "working") enqueuePrompt(agent, "/usage", []);
-            else void sendPromptNow(agent, "/usage", []);
-          }}
-        />
       ) : null}
 
       {activeMode === "chat" && !activeSub && btwTurns.length > 0 ? (
@@ -2967,7 +2459,39 @@ export function AgentDetailPanel({
         />
       ) : activeMode === "chat" ? (
         <div className="t3-composer-shell">
-        <div ref={composerCardRef} className={`composer-card${dragOver ? " drop-over" : ""}`} style={{ position: "relative" }}>
+        {usageOpen ? (
+          <AgentUsageCard
+            agent={agent}
+            report={usageReport}
+            events={displayedEvents}
+            loading={usageLoading}
+            error={usageError}
+            onRefresh={openUsageView}
+            onClose={() => setUsageOpen(false)}
+            onOpenModelSwitch={() => setModelMenuMode("model")}
+            onRunInTerminal={() => {
+              setUsageOpen(false);
+              if (agent.status === "working") enqueuePrompt(agent, "/usage", []);
+              else void sendPromptNow(agent, "/usage", []);
+            }}
+          />
+        ) : null}
+        {questionDeck ? (
+          <AskQuestionDeck
+            deck={questionDeck}
+            onSelectKey={(k) => sendKeys([k, "enter"])}
+            onSubmitWriteIn={async (k, customAnswer) => {
+              await sendKeys([k, "enter"]);
+              await new Promise((r) => setTimeout(r, 90));
+              await rpcCall(agent.deviceId, "terminal.input", {
+                agent: agent.key,
+                data: `${customAnswer}\r`,
+              }).catch((e) => toast((e as Error).message, true));
+            }}
+            onOpenTerminal={() => selectMode("term")}
+          />
+        ) : null}
+        <div ref={composerCardRef} className={`composer-card${dragOver ? " drop-over" : ""}${isTurnBusy ? " is-busy" : ""}`} style={{ position: "relative" }}>
           {slashOpen ? (
             <SlashCommandPopup
               commands={matchedSlash}
@@ -2981,7 +2505,7 @@ export function AgentDetailPanel({
           ) : null}
           {pendingSwitch ? (
             <div className="composer-switch-banner" role="status" aria-live="polite">
-              <Cpu size={13} />
+              <ModelBrandIcon model={pendingSwitch.modelId || pendingSwitch.label} size={13} />
               <span className="composer-switch-title">本轮结束后切换</span>
               <span className="composer-switch-target mono truncate" title={pendingSwitch.label}>
                 {pendingSwitch.label}
@@ -3294,7 +2818,7 @@ export function AgentDetailPanel({
                       setModelMenuMode((v) => (v === "model" ? null : "model"));
                     }}
                   >
-                    <Cpu size={13} />
+                    <ModelBrandIcon model={modelMeta.currentModel || agent.model} size={13} />
                     <span className="truncate mono">{(modelMeta.currentModel || agent.model) ? (modelMeta.currentModel || agent.model)!.split("/").pop() : "切换模型"}</span>
                     <ChevronDown size={11} />
                     <SpatialHint shortcut="openModelPicker" corner="top" />
@@ -3326,6 +2850,56 @@ export function AgentDetailPanel({
                 </>
               ) : null}
             </div>
+            {!agent.isShell && !activeSub ? (() => {
+              const ctxPct = composerTelemetry.usedPct;
+              const hasRing = ctxPct !== null;
+              const ringPct = hasRing ? Math.max(0, Math.min(100, ctxPct)) : 0;
+              const r = 5.2;
+              const circ = 2 * Math.PI * r;
+              const offset = circ * (1 - ringPct / 100);
+              const metaParts: string[] = [];
+              if (composerTelemetry.tps !== null) metaParts.push(`${composerTelemetry.tps.toFixed(1)} tok/s`);
+              if (composerTelemetry.cacheHitPct !== null) metaParts.push(`缓存 ${fmtPctClean(composerTelemetry.cacheHitPct)}`);
+              return (
+                <div className="composer-telemetry-group">
+                  {metaParts.length > 0 ? (
+                    <span className="composer-speed-meta mono">{metaParts.join(" · ")}</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    className={`composer-ctx-pill mono${usageOpen ? " open" : ""}`}
+                    aria-expanded={usageOpen}
+                    title={
+                      hasRing
+                        ? `上下文占用 ${fmtPctClean(ringPct)} · 点击查看实体试管与额度详情`
+                        : "查看上下文窗口与模型额度"
+                    }
+                    onClick={() => {
+                      if (usageOpen) setUsageOpen(false);
+                      else openUsageView();
+                    }}
+                  >
+                    <svg className="composer-ctx-ring" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+                      <circle cx="7" cy="7" r={r} fill="none" stroke="currentColor" strokeOpacity="0.2" strokeWidth="1.8" />
+                      {hasRing ? (
+                        <circle
+                          cx="7"
+                          cy="7"
+                          r={r}
+                          fill="none"
+                          stroke={ringPct >= 85 ? "#f43f5e" : ringPct >= 65 ? "#f59e0b" : "var(--primary)"}
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeDasharray={circ}
+                          strokeDashoffset={offset}
+                        />
+                      ) : null}
+                    </svg>
+                    <span>{hasRing ? fmtPctClean(ringPct) : "CTX"}</span>
+                  </button>
+                </div>
+              );
+            })() : null}
             <div className="composer-actions">
               {isTurnBusy && !isBtwDraft && !agent.isShell && !activeSub ? (
                 composer.hasText || attachments.length > 0 ? (
@@ -3451,6 +3025,549 @@ export function AgentDetailPanel({
         agent={agent}
         activePortalId={activePortalId}
         onSelectPortalId={setActivePortalId}
+      />
+    </div>
+  );
+});
+
+export function AgentsView({
+  mobileLayout,
+  selectedKey,
+  onSelectAgent,
+  onOpenWorkbench,
+}: {
+  mobileLayout: boolean;
+  selectedKey: string | null;
+  onSelectAgent: (key: string | null) => void;
+  /** Opens the agent's working folder in the workbench. */
+  onOpenWorkbench?: (agentKey: string) => void;
+}) {
+  const toast = useToast();
+  const agentsMap = liveStore.use((s) => s.agents);
+  const devices = liveStore.use((s) => s.devices);
+  const link = liveStore.use((s) => s.link);
+  const showShells = settingsStore.use((s) => s.showShells);
+  const hostFilterSaved = settingsStore.use((s) => s.hostFilter);
+  const foldedGroups = settingsStore.use((s) => s.foldedGroups);
+  const dark = settingsStore.use((s) => s.theme) === "dark";
+
+  const [statusFilter, setStatusFilter] = useState<AgentStatus | null>(null);
+  const [spaceFilter, setSpaceFilter] = useState<string | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [query, setQuery] = useState("");
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const hosts = useMemo(() => {
+    const list = Object.values(devices).filter((d) => d.kind === "host");
+    for (const id of Object.keys(agentsMap)) {
+      if (!devices[id]) {
+        list.push({ id, name: id, kind: "host", online: false, createdAt: 0, lastSeenAt: 0 });
+      }
+    }
+    return list.sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
+  }, [devices, agentsMap]);
+
+  const hostFilter = hostFilterSaved && hosts.some((h) => h.id === hostFilterSaved) ? hostFilterSaved : null;
+  const isOnline = useCallback((a: Agent) => devices[a.deviceId]?.online ?? false, [devices]);
+  const all = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
+
+  const onHost = useMemo(() => all.filter((a) => !hostFilter || a.deviceId === hostFilter), [all, hostFilter]);
+  const spaces = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of onHost) {
+      const sp = agentSpace(a);
+      if (sp) m.set(sp, (m.get(sp) ?? 0) + 1);
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  }, [onHost]);
+
+  const activeSpace = spaceFilter && spaces.some(([s]) => s === spaceFilter) ? spaceFilter : null;
+  const inScope = useMemo(() => onHost.filter((a) => !activeSpace || agentSpace(a) === activeSpace), [onHost, activeSpace]);
+
+  const counts = useMemo(() => {
+    const c: Record<AgentStatus, number> = { blocked: 0, working: 0, done: 0, idle: 0, unknown: 0 };
+    for (const a of inScope) if (isOnline(a)) c[a.status]++;
+    return c;
+  }, [inScope, isOnline]);
+
+  const q = query.trim().toLowerCase();
+  const sections = useMemo(() => {
+    const by: Record<GroupKey, Agent[]> = { blocked: [], working: [], done: [], idle: [], offline: [] };
+    for (const a of inScope) {
+      if (q && ![spacedTitle(a), a.harness, a.where, a.cwd, a.preview].some((s) => s?.toLowerCase().includes(q))) {
+        continue;
+      }
+      const g: GroupKey = !isOnline(a)
+        ? "offline"
+        : a.status === "blocked" || a.status === "working" || a.status === "done"
+          ? a.status
+          : "idle";
+      by[g].push(a);
+    }
+    return GROUPS.filter((g) => by[g.key].length && (!statusFilter || g.key === statusFilter)).map((g) => {
+      const folded = !q && !statusFilter && foldedGroups.includes(g.key);
+      return { key: g.key, title: g.title, count: by[g.key].length, folded, data: folded ? [] : by[g.key].sort(byRecent) };
+    });
+  }, [foldedGroups, inScope, isOnline, q, statusFilter]);
+
+  const toggleGroup = (k: GroupKey) => {
+    updateSettings({
+      foldedGroups: foldedGroups.includes(k) ? foldedGroups.filter((x) => x !== k) : [...foldedGroups, k],
+    });
+  };
+
+  // "按空间": computer, then space, the way the phone app groups them (mobile R25).
+  const [groupMode, setGroupModeState] = useState<GroupMode>(() => readPref<GroupMode>(GROUP_MODE_KEY, "space"));
+  const setGroupMode = (m: GroupMode) => {
+    setGroupModeState(m);
+    writePref(GROUP_MODE_KEY, m);
+  };
+  const [foldedSpaces, setFoldedSpaces] = useState<string[]>(() => readPref<string[]>(FOLDED_SPACES_KEY, []));
+  const toggleSpace = (id: string) => {
+    const next = foldedSpaces.includes(id) ? foldedSpaces.filter((x) => x !== id) : [...foldedSpaces, id];
+    setFoldedSpaces(next);
+    writePref(FOLDED_SPACES_KEY, next);
+  };
+  const groupOf = useCallback(
+    (a: Agent): GroupKey =>
+      !isOnline(a) ? "offline" : a.status === "blocked" || a.status === "working" || a.status === "done" ? a.status : "idle",
+    [isOnline],
+  );
+  const spaceGroups = useMemo(() => {
+    const byDevice = new Map<string, Map<string, Agent[]>>();
+    for (const a of inScope) {
+      if (q && ![spacedTitle(a), a.harness, a.where, a.cwd, a.preview].some((s) => s?.toLowerCase().includes(q))) continue;
+      if (statusFilter && groupOf(a) !== statusFilter) continue;
+      const perSpace = byDevice.get(a.deviceId) ?? new Map<string, Agent[]>();
+      const sp = agentSpace(a) ?? "";
+      perSpace.set(sp, [...(perSpace.get(sp) ?? []), a]);
+      byDevice.set(a.deviceId, perSpace);
+    }
+    const out = [...byDevice.entries()].map(([deviceId, perSpace]) => {
+      const groups = [...perSpace.entries()].map(([space, list]) => {
+        list.sort((x, y) => STATUS_RANK[groupOf(x)] - STATUS_RANK[groupOf(y)] || byRecent(x, y));
+        const tally = { blocked: 0, working: 0, done: 0 };
+        for (const a of list) {
+          const g = groupOf(a);
+          if (g === "blocked" || g === "working" || g === "done") tally[g]++;
+        }
+        const latest = Math.max(...list.map((a) => a.statusSince ?? a.updatedAt));
+        const id = `${deviceId}\u0000${space}`;
+        return { id, space, list, tally, latest, folded: !q && !statusFilter && foldedSpaces.includes(id) };
+      });
+      groups.sort((x, y) => y.tally.blocked - x.tally.blocked || y.latest - x.latest);
+      const device = devices[deviceId];
+      return {
+        deviceId,
+        name: device?.name ?? deviceId,
+        online: device?.online ?? false,
+        count: groups.reduce((n, g) => n + g.list.length, 0),
+        blocked: groups.reduce((n, g) => n + g.tally.blocked, 0),
+        groups,
+      };
+    });
+    return out.sort((x, y) => Number(y.online) - Number(x.online) || y.blocked - x.blocked || x.name.localeCompare(y.name));
+  }, [devices, foldedSpaces, groupOf, inScope, q, statusFilter]);
+
+  const [createTarget, setCreateTarget] = useState<{ host: string | null; space: string | null }>({ host: null, space: null });
+  const openCreate = (host: string | null, space: string | null) => {
+    setCreateTarget({ host, space });
+    setCreateOpen(true);
+  };
+  const [menu, setMenu] = useState<QuickMenuState | null>(null);
+  const [detailTab, setDetailTab] = useState<{ key: string; tab: "chat" | "term" } | null>(null);
+  const [fabCompact, setFabCompact] = useState(false);
+  const lastScrollRef = useRef(0);
+
+  const openAgentAt = (key: string, tab: "chat" | "term") => {
+    setDetailTab({ key, tab });
+    onSelectAgent(key);
+  };
+
+  const selectedAgent = useMemo(() => all.find((a) => a.key === selectedKey) ?? null, [all, selectedKey]);
+  const onlyOfflineHosts = hosts.length > 0 && (hostFilter ? !hosts.find((h) => h.id === hostFilter)?.online : hosts.every((h) => !h.online));
+  const listEmpty = groupMode === "space" ? spaceGroups.length === 0 : sections.length === 0;
+
+  const headline = link === "online" && onlyOfflineHosts && !inScope.length
+    ? "电脑离线，暂时看不到 agent"
+    : counts.blocked
+    ? `有 ${counts.blocked} 个 agent 在等你`
+    : counts.working
+      ? `${counts.working} 个 agent 正在忙`
+      : counts.done
+        ? "大家都忙完啦"
+        : "大家都歇着呢";
+
+  const initialTab = detailTab && detailTab.key === selectedAgent?.key ? detailTab.tab : "chat";
+
+  if (mobileLayout && selectedAgent) {
+    return (
+      <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
+        <AgentDetailPanel
+          key={selectedAgent.key}
+          agent={selectedAgent}
+          initialTab={initialTab}
+          onBack={() => {
+            setDetailTab(null);
+            onSelectAgent(null);
+          }}
+          onOpenWorkbench={onOpenWorkbench}
+          mobile
+        />
+      </div>
+    );
+  }
+
+  const quickActions = menu ? (
+    <AgentQuickMenu
+      state={menu}
+      onClose={() => setMenu(null)}
+      onOpen={(tab) => openAgentAt(menu.agent.key, tab)}
+      onNewHere={() => openCreate(menu.agent.deviceId, agentSpace(menu.agent) ?? null)}
+      onCopyPath={() => {
+        const path = menu.agent.cwd;
+        if (!path) return;
+        void copyToClipboard(path).then((ok) => toast(ok ? "文件夹路径已复制" : "复制失败", !ok));
+      }}
+    />
+  ) : null;
+
+  const rowFor = (agent: Agent, showSpace: boolean) => {
+    const offline = !isOnline(agent);
+    const sub = [
+      showSpace ? agentSpace(agent) : null,
+      // 按空间 already shows the computer as a header.
+      groupMode === "status" ? devices[agent.deviceId]?.name : null,
+      agent.turn ? `第 ${agent.turn} 轮` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return (
+      <AgentRow
+        key={agent.key}
+        agent={agent}
+        offline={offline}
+        selected={selectedKey === agent.key}
+        dark={dark}
+        sub={sub || agent.cwd || agent.harness}
+        onOpen={() => openAgentAt(agent.key, "chat")}
+        onMenu={(x, y, sheet) => setMenu({ agent, x, y, sheet: sheet || mobileLayout })}
+      />
+    );
+  };
+
+  const listPane = (
+    <div className="stack" style={{ gap: 12 }}>
+      <div className="between">
+        <div className="row" style={{ minWidth: 0 }}>
+          <PocketIconButton tooltip="筛选电脑与空间" onClick={() => setDrawerOpen(true)}>
+            <Menu size={17} />
+          </PocketIconButton>
+          <div style={{ minWidth: 0 }}>
+            <h2 className="cute-font" style={{ margin: 0, fontSize: fs(22) }}>{greeting()}</h2>
+            <div className="faint truncate" title={headline}>{headline}</div>
+          </div>
+        </div>
+        <div className="row" style={{ gap: 6 }}>
+          <PocketIconButton tooltip="搜索" active={searching} onClick={() => setSearching((v) => !v)}>
+            <Search size={16} />
+          </PocketIconButton>
+          <PocketIconButton tooltip={showShells ? "隐藏普通终端" : "显示普通终端"} active={showShells} onClick={() => updateSettings({ showShells: !showShells })}>
+            <Terminal size={16} />
+          </PocketIconButton>
+          {!mobileLayout ? (
+            <PocketIconButton tooltip="新建 Agent" onClick={() => openCreate(hostFilter, activeSpace)}>
+              <Plus size={17} />
+            </PocketIconButton>
+          ) : listEmpty ? null : (
+            <XiaoyangOrb mood={counts.blocked ? "waiting" : counts.working ? "working" : "hello"} size={44} />
+          )}
+        </div>
+      </div>
+
+      {/* Stat Cards */}
+      <div className="stat-grid">
+        {(
+          [
+            { key: "blocked", label: "需要你", tone: "blush" },
+            { key: "working", label: "工作中", tone: "pink" },
+            { key: "done", label: "已完成", tone: "mint" },
+          ] as const
+        ).map((item) => {
+          const active = statusFilter === item.key;
+          return (
+            <button
+              key={item.key}
+              className={`stat-tile ${item.tone}${active ? " active" : ""}`}
+              onClick={() => setStatusFilter(active ? null : item.key)}
+            >
+              <span style={{ fontSize: fs(12.5), fontWeight: 800 }}>{item.label}</span>
+              <span className="stat-tile-num num">{counts[item.key]}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="segmented group-toggle" role="tablist" aria-label="分组方式">
+        <button role="tab" aria-selected={groupMode === "space"} className={groupMode === "space" ? "active" : ""} onClick={() => setGroupMode("space")}>
+          按空间
+        </button>
+        <button role="tab" aria-selected={groupMode === "status"} className={groupMode === "status" ? "active" : ""} onClick={() => setGroupMode("status")}>
+          按状态
+        </button>
+      </div>
+
+      {/* Filter Tags */}
+      {hostFilter || activeSpace ? (
+        <div className="row wrap" style={{ gap: 6 }}>
+          {hostFilter ? (
+            <PocketButton size="sm" variant="soft" onClick={() => updateSettings({ hostFilter: null })}>
+              <Laptop size={13} />
+              <span>{hosts.find((h) => h.id === hostFilter)?.name ?? hostFilter}</span>
+              <X size={13} />
+            </PocketButton>
+          ) : null}
+          {activeSpace ? (
+            <PocketButton size="sm" variant="soft" onClick={() => setSpaceFilter(null)}>
+              <span>空间：{activeSpace}</span>
+              <X size={13} />
+            </PocketButton>
+          ) : null}
+        </div>
+      ) : null}
+
+      {searching ? (
+        <PocketInput
+          autoFocus
+          placeholder="搜标题、项目、目录…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+      ) : null}
+
+      {/* List */}
+      {listEmpty ? (
+        <EmptyState
+          mood="sleepy"
+          title={
+            link !== "online"
+              ? "还在连服务器"
+              : hosts.length === 0
+                ? "还没有电脑加入"
+                : onlyOfflineHosts
+                  ? hostFilter || hosts.length === 1
+                    ? `${hosts.find((h) => h.id === (hostFilter ?? hosts[0]!.id))?.name ?? "这台电脑"}离线了`
+                    : "电脑都离线了"
+                  : q || statusFilter || activeSpace
+                    ? "没有符合条件的 agent"
+                    : "还没有 agent"
+          }
+          body={
+            link !== "online"
+              ? "连上以后，各台电脑上的 agent 会出现在这里。"
+              : hosts.length === 0
+                ? "在电脑上运行 herdr-pocket up，再到“设备”页扫码或配对。"
+                : onlyOfflineHosts
+                  ? "确认那台电脑开着、herdr-pocket 在运行；它重新上线后，agent 会自动出现在这里。"
+                  : q || statusFilter || activeSpace
+                    ? "换个筛选条件试试。"
+                    : "点“新建”在某台电脑上开一个 agent。"
+          }
+          action={
+            <PocketButton size="sm" variant="soft" onClick={() => pingRelay()}>
+              <RefreshCw size={13} />
+              <span>刷新状态</span>
+            </PocketButton>
+          }
+        />
+      ) : groupMode === "space" ? (
+        <div className="stack" style={{ gap: 12 }}>
+          {spaceGroups.map((dev) => (
+            <div key={dev.deviceId} className="stack" style={{ gap: 8 }}>
+              {spaceGroups.length > 1 ? (
+                <div className="computer-head">
+                  <Laptop size={15} />
+                  <span className="truncate">{dev.name}</span>
+                  <span className={`status-pip${dev.online ? " ok" : ""}`} aria-label={dev.online ? "在线" : "离线"} />
+                  <span className="faint num">{dev.count}</span>
+                </div>
+              ) : null}
+              {dev.groups.map((g) => {
+                const label = g.space || "未分空间";
+                return (
+                  <div key={g.id} className="stack" style={{ gap: 6 }}>
+                    <div className="space-head">
+                      <button className="space-head-main" aria-expanded={!g.folded} onClick={() => !q && !statusFilter && toggleSpace(g.id)}>
+                        <SpaceTileIcon
+                          spaceKey={`${dev.deviceId}\u0000${label}`}
+                          name={label}
+                          blocked={g.tally.blocked > 0}
+                          size="md"
+                        />
+                        <span className="space-name truncate">{label}</span>
+                        <span className="faint num">{g.list.length}</span>
+                        <span className="space-dots" aria-label={`需要你 ${g.tally.blocked}，工作中 ${g.tally.working}，已完成 ${g.tally.done}`}>
+                          {g.tally.blocked ? <span className="space-dot blocked num">{g.tally.blocked}</span> : null}
+                          {g.tally.working ? <span className="space-dot working num">{g.tally.working}</span> : null}
+                          {g.tally.done ? <span className="space-dot done num">{g.tally.done}</span> : null}
+                        </span>
+                        <span className="grow" />
+                        {!q && !statusFilter ? g.folded ? <ChevronRight size={16} /> : <ChevronDown size={16} /> : null}
+                      </button>
+                      {g.space && dev.online ? (
+                        <PocketIconButton size="sm" className="space-add" tooltip={`在空间 ${g.space} 新建 agent`} onClick={() => openCreate(dev.deviceId, g.space)}>
+                          <Plus size={14} />
+                        </PocketIconButton>
+                      ) : null}
+                    </div>
+                    {g.folded ? null : g.list.map((agent) => rowFor(agent, false))}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="stack" style={{ gap: 8 }}>
+          {sections.map((sec) => (
+            <div key={sec.key} className="stack" style={{ gap: 6 }}>
+              <button
+                className="between"
+                style={{ border: 0, background: "transparent", padding: "4px 4px", cursor: "pointer", color: "var(--muted)" }}
+                onClick={() => !q && !statusFilter && toggleGroup(sec.key)}
+              >
+                <span style={{ fontWeight: 800, fontSize: fs(13) }}>
+                  {sec.title} <span className="faint num">{sec.count}</span>
+                </span>
+                {!q && !statusFilter ? (sec.folded ? <ChevronRight size={16} /> : <ChevronDown size={16} />) : null}
+              </button>
+              {sec.data.map((agent) => rowFor(agent, true))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    // A flex column, so the narrow list's .mobile-scroll (flex: 1) gets a height and actually scrolls.
+    <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
+      {mobileLayout ? (
+        <div
+          className="mobile-scroll has-fab"
+          onScroll={(e) => {
+            const top = e.currentTarget.scrollTop;
+            const delta = top - lastScrollRef.current;
+            if (Math.abs(delta) > 6) {
+              setFabCompact(delta > 0 && top > 24);
+              lastScrollRef.current = top;
+            }
+          }}
+        >
+          {listPane}
+          <button
+            className={`fab-new${fabCompact ? " compact" : ""}`}
+            aria-label="新建 Agent"
+            onClick={() => openCreate(hostFilter, activeSpace)}
+          >
+            <Plus size={20} />
+            <span className="fab-new-label">新建</span>
+          </button>
+        </div>
+      ) : (
+        <div className="agents-split">
+          <div className="agents-col">{listPane}</div>
+          <div className="detail-pane">
+            {selectedAgent ? (
+              <AgentDetailPanel key={selectedAgent.key} agent={selectedAgent} initialTab={initialTab} onOpenWorkbench={onOpenWorkbench} />
+            ) : listEmpty ? (
+              <div className="detail-hint faint">agent 出现后，点左侧任意一个在这里查看对话和终端。</div>
+            ) : (
+              <EmptyState mood="hello" title="选一个 Agent" body="点左侧任意 agent，在这里查看实时对话、终端输出、子 agent，或者发消息与图片。" />
+            )}
+          </div>
+        </div>
+      )}
+      {quickActions}
+
+      {/* Filter Drawer Modal */}
+      <PocketModal open={drawerOpen} onOpenChange={setDrawerOpen} title="按电脑或空间筛选" width={400}>
+        <div className="stack">
+          <div>
+            <div className="faint" style={{ marginBottom: 6 }}>电脑</div>
+            <div className="stack" style={{ gap: 6 }}>
+              <PocketButton
+                size="sm"
+                variant={!hostFilter ? "primary" : "ghost"}
+                onClick={() => {
+                  updateSettings({ hostFilter: null });
+                  setDrawerOpen(false);
+                }}
+              >
+                全部电脑 ({all.length})
+              </PocketButton>
+              {hosts.map((h) => (
+                <PocketButton
+                  key={h.id}
+                  size="sm"
+                  variant={hostFilter === h.id ? "primary" : "ghost"}
+                  onClick={() => {
+                    updateSettings({ hostFilter: h.id });
+                    setDrawerOpen(false);
+                  }}
+                >
+                  {h.name} {!h.online ? "(离线)" : ""}
+                </PocketButton>
+              ))}
+            </div>
+          </div>
+
+          {spaces.length > 0 ? (
+            <div>
+              <div className="faint" style={{ marginBottom: 6 }}>工作空间</div>
+              <div className="row wrap" style={{ gap: 6 }}>
+                <PocketButton
+                  size="sm"
+                  variant={!activeSpace ? "soft" : "ghost"}
+                  onClick={() => {
+                    setSpaceFilter(null);
+                    setDrawerOpen(false);
+                  }}
+                >
+                  全部空间
+                </PocketButton>
+                {spaces.map(([name, cnt]) => (
+                  <PocketButton
+                    key={name}
+                    size="sm"
+                    variant={activeSpace === name ? "primary" : "ghost"}
+                    onClick={() => {
+                      setSpaceFilter(name);
+                      setDrawerOpen(false);
+                    }}
+                  >
+                    {name} ({cnt})
+                  </PocketButton>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </PocketModal>
+
+      <CreateAgentModal
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        hosts={hosts}
+        defaultHost={createTarget.host ?? hostFilter}
+        defaultSpace={createTarget.space ?? activeSpace}
+        onCreated={(info) => {
+          if (info.spaceName) setSpaceFilter(info.spaceName);
+          setDetailTab({ key: info.agentKey, tab: "term" });
+          onSelectAgent(info.agentKey);
+          toast(info.launcher === "shell" ? "已创建并打开终端" : "已创建并打开 Agent");
+        }}
       />
     </div>
   );

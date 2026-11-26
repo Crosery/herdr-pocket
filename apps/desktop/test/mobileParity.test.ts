@@ -37,4 +37,12 @@ test("MobileAppShell provides 4-tab parity (助理 first, Agents, 设备, 设置
   assert.ok(css.includes("#FFF8FB"), "mobile light gradient matches apps/mobile");
   assert.ok(css.includes("#221D2B"), "mobile dark gradient matches apps/mobile");
   assert.ok(css.includes("54px") && css.includes("30px"), "active tab indicator matches 54x30 pill");
+  assert.ok(
+    css.includes(".mp-shell .assistant-pane-header") && css.includes("--safe-top"),
+    "mobile-parity.css must apply safe-area top inset to real AssistantView header",
+  );
+  assert.equal(css.includes(".assist-shell"), false, "stale .assist-shell selector must not linger");
+  assert.equal(css.includes(".assist-header"), false, "stale .assist-header selector must not linger");
+  assert.ok(css.includes(".mp-top-banners"), "top connection/call banners must respect safe-area top inset");
+  assert.ok(css.includes(".mp-detail-root .mp-scroll"), "detail sub-panes must not duplicate top safe-area padding");
 });

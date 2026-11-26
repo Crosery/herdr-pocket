@@ -225,6 +225,8 @@ export class PortalManager {
   private streamWatchers = new Map<string, PortalWatcher>();
   private inputMoveInFlight = new Set<string>();
   private inputMoveQueued = new Map<string, PortalInputAction>();
+  private capsCache: { value: HostPortalCapabilities; at: number } | null = null;
+  private capsInFlight: Promise<HostPortalCapabilities> | null = null;
 
   constructor(deps: PortalManagerDeps) {
     this.deps = deps;
@@ -316,23 +318,47 @@ export class PortalManager {
     this.capture.dispose();
   }
 
-  async capabilities(): Promise<HostPortalCapabilities> {
-    const hasCdpBrowser = await this.browser.hasBrowser().catch(() => false);
+  async fastCapabilities(): Promise<HostPortalCapabilities> {
+    if (this.capsCache && Date.now() - this.capsCache.at < 60_000) {
+      return this.capsCache.value;
+    }
     const { port } = this.deps.getDirectInfo();
-    const caps = computeCapabilities({
+    return computeCapabilities({
       deps: this.deps.captureDeps,
-      hasCdpBrowser,
+      hasCdpBrowser: false,
       directPort: port,
     });
-    const [permNote, inputPermissionNote] = await Promise.all([
-      this.capture.checkPermissionNote().catch(() => null),
-      this.capture.checkInputPermissionNote().catch(() => null),
-    ]);
-    return {
-      ...caps,
-      ...(inputPermissionNote ? { inputPermissionNote } : {}),
-      ...(permNote ? { notes: [...(caps.notes ?? []), permNote] } : {}),
-    };
+  }
+
+  async capabilities(force = false): Promise<HostPortalCapabilities> {
+    if (!force && this.capsCache && Date.now() - this.capsCache.at < 60_000) {
+      return this.capsCache.value;
+    }
+    if (this.capsInFlight) return this.capsInFlight;
+    const job = (async () => {
+      const hasCdpBrowser = await this.browser.hasBrowser().catch(() => false);
+      const { port } = this.deps.getDirectInfo();
+      const caps = computeCapabilities({
+        deps: this.deps.captureDeps,
+        hasCdpBrowser,
+        directPort: port,
+      });
+      const [permNote, inputPermissionNote] = await Promise.all([
+        this.capture.checkPermissionNote().catch(() => null),
+        this.capture.checkInputPermissionNote().catch(() => null),
+      ]);
+      const full: HostPortalCapabilities = {
+        ...caps,
+        ...(inputPermissionNote ? { inputPermissionNote } : {}),
+        ...(permNote ? { notes: [...(caps.notes ?? []), permNote] } : {}),
+      };
+      this.capsCache = { value: full, at: Date.now() };
+      return full;
+    })().finally(() => {
+      if (this.capsInFlight === job) this.capsInFlight = null;
+    });
+    this.capsInFlight = job;
+    return job;
   }
 
   private resolveAgentForHook(payload: HookOpenPayload): Agent | undefined {

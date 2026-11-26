@@ -3027,7 +3027,8 @@ export function TerminalSurface({
     let reclaimAfterInitialRaw = false;
     const INPUT_FAST_MS = 200;
     const FLUSH_BYTE_CAP = 512 * 1024;
-    const HIDDEN_OUTPUT_CLOCK_MS = 64;
+    const HIDDEN_PENDING_CAP = 256 * 1024;
+    const HIDDEN_OUTPUT_CLOCK_MS = 500;
     const SYNC_HOLD_MAX_MS = 32;
     const INITIAL_BURST_MAX_MS = 80;
 
@@ -3094,6 +3095,12 @@ export function TerminalSurface({
       if (!bytes.length) return;
       pendingBytes.push(bytes);
       pendingByteCount += bytes.length;
+      if (!activeRef.current && pendingByteCount > HIDDEN_PENDING_CAP) {
+        while (pendingBytes.length > 1 && pendingByteCount > HIDDEN_PENDING_CAP) {
+          const dropped = pendingBytes.shift();
+          if (dropped) pendingByteCount = Math.max(0, pendingByteCount - dropped.length);
+        }
+      }
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
       const hitCap = pendingByteCount >= FLUSH_BYTE_CAP;
 

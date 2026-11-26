@@ -173,6 +173,7 @@ enum ReplyTarget {
 }
 
 struct Attachment {
+    terminal: String,
     channel: u32,
     consumed: usize,
     automatic_input: bool,
@@ -972,6 +973,7 @@ pub async fn local_term_attach(
                     s.by_id.insert(
                         id.clone(),
                         Attachment {
+                            terminal: terminal.clone(),
                             channel: pre.channel,
                             consumed,
                             automatic_input: pre.automatic_input,
@@ -1046,6 +1048,7 @@ pub async fn local_term_attach(
                 s.by_id.insert(
                     id.clone(),
                     Attachment {
+                        terminal: terminal.clone(),
                         channel,
                         consumed: 0,
                         automatic_input,
@@ -1218,6 +1221,174 @@ pub async fn local_term_auto_input(id: String, data: String) -> Result<(), Strin
         KIND_DATA
     };
     s.write_frame(ch, kind, data.as_bytes())
+}
+
+fn normalize_hc_key_alias(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    let alias = match low.as_str() {
+        "enter" | "return" => "enter",
+        "esc" | "escape" => "esc",
+        "up" => "up",
+        "down" => "down",
+        "left" => "left",
+        "right" => "right",
+        "tab" => "tab",
+        "shift+tab" => "shift+tab",
+        "shift+enter" => "shift+enter",
+        "backspace" => "backspace",
+        "space" => "space",
+        "ctrl+c" => "ctrl+c",
+        "ctrl+d" => "ctrl+d",
+        "ctrl+l" => "ctrl+l",
+        "ctrl+o" => "ctrl+o",
+        "ctrl+t" => "ctrl+t",
+        "f2" => "f2",
+        "shift+f2" => "shift+f2",
+        "alt+m" => "alt+m",
+        "alt+enter" => "alt+enter",
+        _ if key.chars().count() == 1 => return Some(key.to_string()),
+        _ => return None,
+    };
+    Some(alias.to_string())
+}
+
+fn encode_key_alias_bytes(key: &str) -> Option<Vec<u8>> {
+    let low = key.trim().to_ascii_lowercase();
+    let seq: &[u8] = match low.as_str() {
+        "enter" | "return" => b"\r",
+        "esc" | "escape" => b"\x1b",
+        "up" => b"\x1b[A",
+        "down" => b"\x1b[B",
+        "right" => b"\x1b[C",
+        "left" => b"\x1b[D",
+        "tab" => b"\t",
+        "shift+tab" => b"\x1b[Z",
+        "shift+enter" | "alt+enter" => b"\x1b\r",
+        "backspace" => b"\x7f",
+        "space" => b" ",
+        "ctrl+c" => b"\x03",
+        "ctrl+d" => b"\x04",
+        "ctrl+l" => b"\x0c",
+        "ctrl+o" => b"\x0f",
+        "ctrl+t" => b"\x14",
+        "q" => b"q",
+        "f2" => b"\x1bOQ",
+        "shift+f2" => b"\x1b[1;2Q",
+        "alt+m" => b"\x1bm",
+        _ if key.chars().count() == 1 => return Some(key.as_bytes().to_vec()),
+        _ => return None,
+    };
+    Some(seq.to_vec())
+}
+
+#[tauri::command]
+pub async fn local_term_keys(terminal: String, keys: Vec<String>) -> Result<(), String> {
+    let target = terminal.trim().to_string();
+    if target.is_empty() || keys.is_empty() || keys.len() > 32 {
+        return Err("terminal 与 keys 参数不合法".into());
+    }
+
+    let mut raw_bytes: Vec<u8> = Vec::new();
+    let mut mapped_aliases: Vec<String> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        let alias = normalize_hc_key_alias(k)
+            .ok_or_else(|| format!("不支持的按键：{k}"))?;
+        let bytes = encode_key_alias_bytes(&alias)
+            .ok_or_else(|| format!("不支持的按键：{k}"))?;
+        mapped_aliases.push(alias);
+        raw_bytes.extend_from_slice(&bytes);
+    }
+
+    // Fast path: write raw VT bytes directly onto an active/preattached channel (<0.2ms, zero CLI fork).
+    let client_opt = global_client()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().cloned());
+    if let Some(client) = client_opt {
+        if let Ok(s) = client.state.lock() {
+            if let Some(att) = s.by_id.values().find(|a| a.terminal == target) {
+                if s.write_frame(att.channel, KIND_DATA, &raw_bytes).is_ok() {
+                    return Ok(());
+                }
+            } else if let Some(pre) = s.preattached.get(&target) {
+                if s.write_frame(pre.channel, KIND_DATA, &raw_bytes).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Fallback when terminal has no local stream attachment open yet: invoke local `hc keys`.
+    tauri::async_runtime::spawn_blocking(move || {
+        let hc_bin = crate::find_program_path("hc")
+            .ok_or_else(|| "这台电脑没有安装 hc（herdr-core）".to_string())?;
+        let mut cmd = Command::new(&hc_bin);
+        cmd.arg("keys").arg(&target).args(&mapped_aliases);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = cmd.output().map_err(|e| format!("hc keys 执行失败: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(if err.is_empty() {
+                "hc keys 返回非零状态".into()
+            } else {
+                err
+            });
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn local_term_interrupt(terminal: String) -> Result<String, String> {
+    let target = terminal.trim().to_string();
+    if target.is_empty() {
+        return Err("terminal 不能为空".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let hc_bin = crate::find_program_path("hc")
+            .ok_or_else(|| "这台电脑没有安装 hc（herdr-core）".to_string())?;
+        let mut cmd = Command::new(&hc_bin);
+        cmd.args(["interrupt", &target, "--json", "--timeout", "1"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("hc interrupt 执行失败: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(if err.is_empty() {
+                "hc interrupt 失败".into()
+            } else {
+                err
+            });
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
+            for k in ["outcome", "result", "message", "status", "state"] {
+                if let Some(s) = v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    return Ok(s.to_string());
+                }
+            }
+        }
+        Ok(stdout.trim().chars().take(300).collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2981,8 +3152,9 @@ pub fn local_term_stat_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        base64_encode, decode_header, encode_frame, encode_resize_payload, local_term_stat_image,
-        read_local_image_bytes, sanitize_display, IMAGE_STAGE_DIR_NAME,
+        base64_encode, decode_header, encode_frame, encode_key_alias_bytes, encode_resize_payload,
+        local_term_stat_image, normalize_hc_key_alias, read_local_image_bytes, sanitize_display,
+        IMAGE_STAGE_DIR_NAME,
     };
     use serde_json::json;
 
@@ -3465,5 +3637,19 @@ mod tests {
         unsafe {
             assert!(libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) < 0);
         }
+    }
+
+    #[test]
+    fn key_aliases_and_vt_sequences_match_hc() {
+        assert_eq!(normalize_hc_key_alias("Return").as_deref(), Some("enter"));
+        assert_eq!(normalize_hc_key_alias("Escape").as_deref(), Some("esc"));
+        assert_eq!(normalize_hc_key_alias("1").as_deref(), Some("1"));
+        assert_eq!(normalize_hc_key_alias("unknown-key"), None);
+
+        assert_eq!(encode_key_alias_bytes("enter").as_deref(), Some(&b"\r"[..]));
+        assert_eq!(encode_key_alias_bytes("esc").as_deref(), Some(&b"\x1b"[..]));
+        assert_eq!(encode_key_alias_bytes("shift+tab").as_deref(), Some(&b"\x1b[Z"[..]));
+        assert_eq!(encode_key_alias_bytes("ctrl+c").as_deref(), Some(&b"\x03"[..]));
+        assert_eq!(encode_key_alias_bytes("5").as_deref(), Some(&b"5"[..]));
     }
 }

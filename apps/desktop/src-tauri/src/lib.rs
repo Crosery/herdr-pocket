@@ -779,6 +779,8 @@ pub fn run() {
             local_term::local_term_resize,
             local_term::local_term_detach,
             local_term::local_term_kill,
+            local_term::local_term_keys,
+            local_term::local_term_interrupt,
             local_term::local_herdr_doc_get,
             local_term::local_herdr_doc_set,
             local_term::local_term_read_image,

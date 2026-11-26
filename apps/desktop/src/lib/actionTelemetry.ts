@@ -1,5 +1,5 @@
 import { logger } from "./log";
-import { recordClickPaintSample } from "./perfTelemetry";
+import { recordClickPaintSample, recordKeyPaintSample } from "./perfTelemetry";
 
 const INTERACTIVE_SELECTOR =
   "button, a, [role='button'], [role='tab'], [role='menuitem'], [role='option'], [role='switch'], [role='checkbox'], summary, .agent-card, .mp-tab, .mp-card-btn";
@@ -105,6 +105,29 @@ export function installGlobalActionTelemetry(): () => void {
   };
 
   document.addEventListener("click", onClick, { capture: true, passive: true });
+  const onKeyDown = (ev: KeyboardEvent) => {
+    if (
+      ev.key === "Meta" ||
+      ev.key === "Control" ||
+      ev.key === "Shift" ||
+      ev.key === "Alt"
+    ) {
+      return;
+    }
+    if (
+      typeof document === "undefined" ||
+      document.visibilityState !== "visible" ||
+      typeof requestAnimationFrame !== "function"
+    ) {
+      return;
+    }
+    const startMs = performance.now();
+    const keyName = `${ev.metaKey ? "Cmd+" : ""}${ev.ctrlKey ? "Ctrl+" : ""}${ev.altKey ? "Alt+" : ""}${ev.key}`;
+    requestAnimationFrame(() => {
+      recordKeyPaintSample(performance.now() - startMs, keyName);
+    });
+  };
+  document.addEventListener("keydown", onKeyDown, { capture: true, passive: true });
   document.addEventListener("compositionstart", onCompositionStart, { capture: true, passive: true });
   document.addEventListener("compositionend", onCompositionEnd, { capture: true, passive: true });
   document.addEventListener("drop", onDrop, { capture: true, passive: true });
@@ -113,6 +136,7 @@ export function installGlobalActionTelemetry(): () => void {
 
   return () => {
     document.removeEventListener("click", onClick, { capture: true });
+    document.removeEventListener("keydown", onKeyDown, { capture: true });
     document.removeEventListener("compositionstart", onCompositionStart, { capture: true });
     document.removeEventListener("compositionend", onCompositionEnd, { capture: true });
     document.removeEventListener("drop", onDrop, { capture: true });

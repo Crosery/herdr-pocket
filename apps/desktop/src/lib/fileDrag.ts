@@ -27,9 +27,55 @@ let activeWorkspaceDrag: WorkspaceDragItem | null = null;
 let activeTabDragId: string | null = null;
 let activePanelDrag: PanelDragItem | null = null;
 let activePaneDrag: PaneDragItem | null = null;
+let globalDragBound = false;
+
+function hasAnyActiveDrag(): boolean {
+  return Boolean(activeWorkspaceDrag || activeTabDragId || activePanelDrag || activePaneDrag);
+}
+
+function clearDomSelectionSafe(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.getSelection()?.removeAllRanges();
+  } catch {
+    // ignore WebKit selection edge cases
+  }
+}
+
+function clearGlobalDragIfIdle(): void {
+  if (hasAnyActiveDrag()) return;
+  if (typeof document !== "undefined") {
+    delete document.documentElement.dataset.shellDragging;
+  }
+}
+
+export function beginGlobalShellDrag(): void {
+  clearDomSelectionSafe();
+  if (typeof document !== "undefined") {
+    document.documentElement.dataset.shellDragging = "true";
+  }
+  if (typeof window !== "undefined" && !globalDragBound) {
+    globalDragBound = true;
+    const forceEnd = () => {
+      activeWorkspaceDrag = null;
+      activeTabDragId = null;
+      activePanelDrag = null;
+      activePaneDrag = null;
+      clearGlobalDragIfIdle();
+      clearDomSelectionSafe();
+    };
+    window.addEventListener("dragend", forceEnd, true);
+    window.addEventListener("drop", forceEnd, true);
+  }
+}
+
+export function endGlobalShellDrag(): void {
+  clearGlobalDragIfIdle();
+}
 
 export function startWorkspaceDrag(e: DragEvent<HTMLElement>, item: WorkspaceDragItem): void {
   activeWorkspaceDrag = item;
+  beginGlobalShellDrag();
   try {
     e.dataTransfer.effectAllowed = "copy";
     e.dataTransfer.setData(WORKSPACE_FILE_MIME, JSON.stringify(item));
@@ -41,6 +87,7 @@ export function startWorkspaceDrag(e: DragEvent<HTMLElement>, item: WorkspaceDra
 
 export function endWorkspaceDrag(): void {
   activeWorkspaceDrag = null;
+  endGlobalShellDrag();
 }
 
 export function hasWorkspaceDrag(e: DragEvent<HTMLElement>): boolean {
@@ -72,6 +119,7 @@ export function resolveDropPath(item: WorkspaceDragItem, targetHostId: string): 
 
 export function startTabDrag(e: DragEvent<HTMLElement>, tabId: string): void {
   activeTabDragId = tabId;
+  beginGlobalShellDrag();
   try {
     e.dataTransfer.effectAllowed = "copyMove";
     e.dataTransfer.setData(TAB_DRAG_MIME, tabId);
@@ -83,6 +131,7 @@ export function startTabDrag(e: DragEvent<HTMLElement>, tabId: string): void {
 
 export function endTabDrag(): void {
   activeTabDragId = null;
+  endGlobalShellDrag();
 }
 
 export function hasTabDrag(e: DragEvent<HTMLElement>): boolean {
@@ -103,6 +152,7 @@ export function readTabDrag(e: DragEvent<HTMLElement>): string | null {
 
 export function startPanelDrag(e: DragEvent<HTMLElement>, item: PanelDragItem): void {
   activePanelDrag = item;
+  beginGlobalShellDrag();
   try {
     e.dataTransfer.effectAllowed = "copyMove";
     e.dataTransfer.setData(PANEL_DRAG_MIME, JSON.stringify(item));
@@ -114,6 +164,7 @@ export function startPanelDrag(e: DragEvent<HTMLElement>, item: PanelDragItem): 
 
 export function endPanelDrag(): void {
   activePanelDrag = null;
+  endGlobalShellDrag();
 }
 
 export function hasPanelDrag(e: DragEvent<HTMLElement>): boolean {
@@ -142,6 +193,7 @@ export function readPanelDrag(e: DragEvent<HTMLElement>): PanelDragItem | null {
 
 export function startPaneDrag(e: DragEvent<HTMLElement>, item: PaneDragItem): void {
   activePaneDrag = item;
+  beginGlobalShellDrag();
   try {
     e.dataTransfer.effectAllowed = "copyMove";
     e.dataTransfer.setData(PANE_DRAG_MIME, JSON.stringify(item));
@@ -153,6 +205,7 @@ export function startPaneDrag(e: DragEvent<HTMLElement>, item: PaneDragItem): vo
 
 export function endPaneDrag(): void {
   activePaneDrag = null;
+  endGlobalShellDrag();
 }
 
 export function hasPaneDrag(e: DragEvent<HTMLElement>): boolean {

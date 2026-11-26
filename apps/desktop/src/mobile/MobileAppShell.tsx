@@ -1,6 +1,5 @@
 import { Suspense, lazy, useState, type ReactNode } from "react";
 import { Bot, ChevronLeft, Laptop, MessageSquare, PhoneCall, Settings } from "lucide-react";
-import { UpdatePrompt } from "../components/UpdatePrompt";
 import { EmptyState, PocketButton, PocketIconButton } from "../components/PocketUI";
 import { XiaoyangOrb } from "../components/MascotAndVendor";
 import { assistantStore } from "../lib/assistant";
@@ -74,31 +73,27 @@ export function MobileAppShell({
     onTab("agents");
   };
 
-  return (
-    <div className="mp-shell" style={{ fontSize }}>
-      {banner}
+  const showCallBanner = tab !== "assistant" && callStatus !== "idle";
+  const hasTopBanner = Boolean(banner) || showCallBanner;
 
-      {tab !== "assistant" && callStatus !== "idle" ? (
-        <button
-          type="button"
-          className="between"
-          style={{
-            border: 0,
-            background: "var(--mp-accent-container)",
-            color: "var(--mp-accent-text)",
-            padding: "8px 14px",
-            fontWeight: 700,
-            fontSize: 13,
-            cursor: "pointer",
-            flexShrink: 0,
-          }}
-          onClick={() => onTab("assistant")}
-        >
-          <span className="row" style={{ gap: 6 }}>
-            <PhoneCall size={14} />
-            <span>{callStatus === "connecting" ? "正在接通小羊语音…" : "正在与小羊语音通话中 · 点此回到通话"}</span>
-          </span>
-        </button>
+  return (
+    <div className={`mp-shell${hasTopBanner ? " has-top-banner" : ""}${hideTabs ? " no-tabs" : ""}`} style={{ fontSize }}>
+      {hasTopBanner ? (
+        <div className="mp-top-banners">
+          {banner}
+          {showCallBanner ? (
+            <button
+              type="button"
+              className="between mp-call-banner"
+              onClick={() => onTab("assistant")}
+            >
+              <span className="row" style={{ gap: 6 }}>
+                <PhoneCall size={14} />
+                <span>{callStatus === "connecting" ? "正在接通小羊语音…" : "正在与小羊语音通话中 · 点此回到通话"}</span>
+              </span>
+            </button>
+          ) : null}
+        </div>
       ) : null}
 
       <div className="mp-body">
@@ -208,7 +203,6 @@ export function MobileAppShell({
         </nav>
       ) : null}
 
-      <UpdatePrompt />
       {overlays}
     </div>
   );

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { Brain, Check, ChevronLeft, ChevronRight, Cpu, Search, SlidersHorizontal } from "lucide-react";
+import { Brain, Check, ChevronLeft, ChevronRight, Search, SlidersHorizontal } from "lucide-react";
+import { ModelBrandIcon } from "./ModelBrandIcon";
 import {
   OMP_MODEL_ROLES,
   OMP_QUICK_ROLE_CHIPS,
@@ -497,7 +498,7 @@ export function ModelSwitchDropdown({
                 requestAnimationFrame(() => inputRef.current?.focus());
               }}
             >
-              <Cpu size={12} />
+              <ModelBrandIcon model={resolvedLookupModel || agent.model} size={13} />
               <span className="truncate">会话模型 (/switch)</span>
             </button>
             <button
@@ -706,7 +707,11 @@ export function ModelSwitchDropdown({
                   requestAnimationFrame(() => inputRef.current?.focus());
                 }}
               >
-                <SlidersHorizontal size={13} className="model-pop-ic" />
+                {assigned ? (
+                  <ModelBrandIcon model={assigned} size={14} className="model-pop-ic" />
+                ) : (
+                  <SlidersHorizontal size={13} className="model-pop-ic" />
+                )}
                 <span
                   style={{
                     flex: 1,
@@ -770,10 +775,10 @@ export function ModelSwitchDropdown({
                     else commitModel(entry.id);
                   }}
                 >
-                  <Cpu size={13} className="model-pop-ic" />
-                  <span className="model-pop-id mono truncate">
-                    {editingRole ? `设为 ${editingRole}: ${entry.id}` : `切换到 ${entry.id}`}
-                  </span>
+                <ModelBrandIcon model={entry.id} size={14} className="model-pop-ic" />
+                <span className="model-pop-id mono truncate">
+                  {editingRole ? `设为 ${editingRole}: ${entry.id}` : `切换到 ${entry.id}`}
+                </span>
                   <span className="model-pop-meta">
                     <span className="model-pop-badge">自定义</span>
                   </span>
@@ -804,7 +809,7 @@ export function ModelSwitchDropdown({
                   else commitModel(m.id);
                 }}
               >
-                <Cpu size={13} className="model-pop-ic" />
+                <ModelBrandIcon model={m.id} provider={m.provider} label={m.label} size={14} className="model-pop-ic" />
                 <span
                   className="model-pop-id mono truncate"
                   title={m.label && m.label !== m.id ? `${m.id} · ${m.label}` : m.id}

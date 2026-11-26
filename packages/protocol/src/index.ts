@@ -1364,6 +1364,27 @@ export {
   type ResolveThinkingLevelsInput,
 };
 
+export {
+  MODEL_BRAND_ICONS,
+  resolveModelBrand,
+  type ModelBrandId,
+  type ModelBrandIconSpec,
+  type ModelSvgElement,
+  type ModelSvgGradient,
+  type ModelSvgStop,
+  type ResolveModelBrandOptions,
+} from "./modelIcons.ts";
+
+export {
+  isQuestionToolName,
+  normalizeChoiceLabel,
+  parseAskQuestionInput,
+  summarizeAskQuestionInput,
+  type ParsedAskQuestionPayload,
+  type ParsedQuestionItem,
+  type ParsedQuestionOption,
+} from "./askQuestion.ts";
+
 /** Builds per-harness slash commands / keys to switch model and/or thinking effort cleanly. */
 export function buildHarnessSwitchCommands(
   harness: string,

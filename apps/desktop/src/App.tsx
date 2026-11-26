@@ -167,7 +167,9 @@ function PocketAppShell() {
     const offPerf = startDesktopPerfTelemetry();
     const offActions = installGlobalActionTelemetry();
     const offDrag = installWindowDragBridge();
-    const offPwa = initH5Pwa();
+    const offPwa = initH5Pwa({
+      canReloadNow: () => voiceCallStore.get().status === "idle",
+    });
     return () => {
       offPwa();
       offDrag();
@@ -207,7 +209,7 @@ function PocketAppShell() {
   }, [uiFontFamily]);
 
   useEffect(() => {
-    if (boot !== "ready") return;
+    if (boot !== "ready" || isH5Web()) return;
     return startAutoUpdateChecks();
   }, [boot]);
 
@@ -706,7 +708,7 @@ function PocketAppShell() {
         />
       ) : null}
       <VoiceHud />
-      <UpdatePrompt />
+      {!isH5Web() ? <UpdatePrompt /> : null}
       <PocketModal
         open={Boolean(approveReq)}
         onOpenChange={(open) => {

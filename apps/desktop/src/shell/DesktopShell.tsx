@@ -51,7 +51,8 @@ import { SettingsFrame } from "../views/settings/SettingsFrame";
 import { useClientConfig, clientConfigStore } from "../lib/config";
 import { overlayStore, useToast } from "../components/PocketUI";
 import { installBrowserAiBridgeListeners } from "../lib/browserSpaces";
-import { isTauri } from "../lib/bridge";
+import { isH5Web, isTauri } from "../lib/bridge";
+import { refreshH5Bundle } from "../lib/pwa";
 import { logAction } from "../lib/log";
 import { localHostIdStore, refreshLocalHostIdFast } from "../lib/fonts";
 import { native } from "../lib/native";
@@ -220,32 +221,60 @@ export function DesktopShell({
     }
   }, []);
 
-  // Keep space counts, tabs, and renames synced periodically with Herdr.app while the window is visible.
+  const seenUnknownSpacesRef = useRef<Map<string, number>>(new Map());
+
+  // Track window focus & visibility to pause background GPU animations cleanly,
+  // and keep spaces synced gently without spamming slow spaces.list RPCs.
   useEffect(() => {
-    const sync = () => {
-      if (typeof document !== "undefined" && document.hidden) return;
+    const syncFocusAttr = () => {
+      if (typeof document === "undefined") return;
+      document.documentElement.dataset.appFocused =
+        !document.hidden && document.hasFocus() ? "true" : "false";
+    };
+    const syncSpaces = () => {
+      if (typeof document !== "undefined" && (document.hidden || !document.hasFocus())) return;
       refreshHostSpaces();
     };
-    const timer = window.setInterval(sync, 10_000);
-    document.addEventListener("visibilitychange", sync);
+    const onVisOrFocus = () => {
+      syncFocusAttr();
+      syncSpaces();
+    };
+    syncFocusAttr();
+    const timer = window.setInterval(syncSpaces, 45_000);
+    window.addEventListener("focus", onVisOrFocus);
+    window.addEventListener("blur", syncFocusAttr);
+    document.addEventListener("visibilitychange", onVisOrFocus);
     return () => {
       window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", sync);
+      window.removeEventListener("focus", onVisOrFocus);
+      window.removeEventListener("blur", syncFocusAttr);
+      document.removeEventListener("visibilitychange", onVisOrFocus);
     };
   }, []);
 
-  // If incoming agents reference a space not yet in liveStore.spaces, refresh spaces for that host immediately.
+  // Only refresh spaces when a host introduces a previously unseen space name (60s TTL for CLI-only spaces).
   useEffect(() => {
+    const now = Date.now();
     const spacesByHost = liveStore.get().spaces;
     for (const [hostId, list] of Object.entries(agentsMap)) {
       if (devices[hostId]?.online === false) continue;
       const known = new Set((spacesByHost[hostId] ?? []).map((s) => s.name));
-      if (list.some((a) => {
+      const unknown: string[] = [];
+      for (const a of list) {
         const sp = agentSpace(a);
-        return Boolean(sp && !known.has(sp));
-      })) {
-        refreshHostSpaces(hostId);
+        if (sp && !known.has(sp)) unknown.push(sp);
       }
+      if (unknown.length === 0) continue;
+      unknown.sort();
+      const cacheKey = `${hostId}:${unknown.join("|")}`;
+      const lastAskedAt = seenUnknownSpacesRef.current.get(cacheKey) ?? 0;
+      if (now - lastAskedAt < 60_000) continue;
+      seenUnknownSpacesRef.current.set(cacheKey, now);
+      if (seenUnknownSpacesRef.current.size > 64) {
+        seenUnknownSpacesRef.current.clear();
+        seenUnknownSpacesRef.current.set(cacheKey, now);
+      }
+      refreshHostSpaces(hostId);
     }
   }, [agentsMap, devices]);
 
@@ -831,7 +860,9 @@ export function DesktopShell({
       { id: "agent-thinking", group: "Agent", label: "调整思考强度", keys: ["Mod", "Alt", "T"], icon: Cpu, terms: "thinking effort 思考", run: () => dispatchFocusedAgentAction("openThinkingPicker") },
       { id: "agent-usage", group: "Agent", label: "查看会话用量统计", keys: ["Mod", "Alt", "U"], icon: BarChart2, terms: "usage cost 费用 用量", run: () => dispatchFocusedAgentAction("openUsageCard") },
       { id: "agent-interrupt", group: "Agent", label: "中断当前 Agent 回复", keys: ["Mod", "."], icon: OctagonX, terms: "stop interrupt cancel 停止 中断", run: () => dispatchFocusedAgentAction("interruptAgent") },
-      { id: "check-update", group: "应用", label: "检查软件更新", icon: RefreshCw, terms: "update upgrade 更新 版本", run: () => void checkForUpdate("manual") },
+      isH5Web()
+        ? { id: "check-update", group: "应用", label: "刷新载入最新网页版", icon: RefreshCw, terms: "update upgrade reload 更新 版本 刷新", run: () => void refreshH5Bundle() }
+        : { id: "check-update", group: "应用", label: "检查软件更新", icon: RefreshCw, terms: "update upgrade 更新 版本", run: () => void checkForUpdate("manual") },
     );
     for (const a of [...agents].sort((x, y) => GROUP_RANK[listGroup(x, devices)] - GROUP_RANK[listGroup(y, devices)] || lastChange(y) - lastChange(x))) {
       list.push({

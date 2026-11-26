@@ -22,7 +22,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import type { SubSession } from "@herdr-pocket/protocol";
+import { isQuestionToolName, parseAskQuestionInput, type SubSession } from "@herdr-pocket/protocol";
 import { copyToClipboard } from "../lib/bridge";
 import { extractImageTargets } from "../lib/chatImages";
 import { useLocalHostDeviceId } from "../lib/fonts";
@@ -195,6 +195,7 @@ function friendlyStepLabel(name: string): string {
   if (/^(webfetch|websearch|search_web|read_url_content|fetch)$/.test(n)) return "浏览网页";
   if (/^(task|agent|invoke_subagent|send_message|spawn_agent|subagent)$/.test(n)) return "子任务";
   if (/^todo_?write$/.test(n)) return "更新清单";
+  if (isQuestionToolName(n)) return "向你确认";
   return name;
 }
 
@@ -452,6 +453,10 @@ const ToolStepItem = memo(function ToolStepItem({
   const formattedOutput = useMemo(() => (open && step.result ? prettyMaybeJson(step.result.output) : ""), [open, step.result]);
   const diffLines = useMemo(() => extractInlineEditDiff(step), [step]);
   const todoItems = useMemo(() => (/^todo_?write$/i.test(step.name.trim()) ? extractTodoEntries(step.input) : []), [step.input, step.name]);
+  const questionItems = useMemo(
+    () => (isQuestionToolName(step.name) ? parseAskQuestionInput(step.input).questions : []),
+    [step.input, step.name],
+  );
   const fileTarget = useMemo(() => {
     if (!onOpenFile || (step.category !== "read" && step.category !== "edit") || !step.summary) return null;
     return extractTargetFromLine(step.summary);
@@ -502,6 +507,28 @@ const ToolStepItem = memo(function ToolStepItem({
       {standalone && todoItems.length > 0 ? (
         <div style={{ padding: "2px 0 6px 24px" }}>
           <TodoChecklistCard items={todoItems} />
+        </div>
+      ) : null}
+      {questionItems.length > 0 ? (
+        <div className="chat-q-card t3-indented-block">
+          {questionItems.map((q, qi) => (
+            <div key={qi} className="chat-q-item">
+              <div className="chat-q-title">
+                {q.header ? <span className="chat-q-tag">{q.header}</span> : null}
+                <span>{q.question}</span>
+              </div>
+              {q.options.length > 0 ? (
+                <div className="chat-q-opts">
+                  {q.options.map((opt, oi) => (
+                    <span key={oi} className={`chat-q-opt${opt.recommended ? " rec" : ""}`}>
+                      {opt.recommended ? <span className="chat-q-rec">推荐</span> : null}
+                      <span>{opt.title}</span>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ))}
         </div>
       ) : null}
       {diffLines.length > 0 ? (

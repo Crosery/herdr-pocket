@@ -1,5 +1,6 @@
 import {
   PROTOCOL_VERSION,
+  type Agent,
   type ClientFrame,
   type Device,
   type DeviceKind,
@@ -30,6 +31,61 @@ import { logger, registerWebLogUploader } from "./log";
 import { native, onNativeEvent } from "./native";
 import { recordClientRpcSample } from "./perfTelemetry";
 import { notifyReleaseAvailable } from "./updates";
+
+function shallowEqualAgent(a: Agent, b: Agent): boolean {
+  if (a === b) return true;
+  if (
+    a.key !== b.key ||
+    a.status !== b.status ||
+    a.statusKind !== b.statusKind ||
+    a.statusSince !== b.statusSince ||
+    a.statusNote !== b.statusNote ||
+    a.subscreen !== b.subscreen ||
+    a.errored !== b.errored ||
+    a.turn !== b.turn ||
+    a.title !== b.title ||
+    a.name !== b.name ||
+    a.where !== b.where ||
+    a.model !== b.model ||
+    a.thinkingLevel !== b.thinkingLevel ||
+    a.costUsd !== b.costUsd ||
+    a.contextTokens !== b.contextTokens ||
+    a.contextLimit !== b.contextLimit ||
+    a.subagents !== b.subagents ||
+    a.subagentsWorking !== b.subagentsWorking ||
+    a.queued !== b.queued ||
+    a.queuedText !== b.queuedText ||
+    a.queuedSince !== b.queuedSince ||
+    a.sessionKey !== b.sessionKey ||
+    a.updatedAt !== b.updatedAt
+  ) {
+    return false;
+  }
+  const aq = a.queuedItems;
+  const bq = b.queuedItems;
+  if (aq === bq) return true;
+  if (!aq || !bq || aq.length !== bq.length) return false;
+  for (let i = 0; i < aq.length; i += 1) {
+    if (aq[i] !== bq[i]) return false;
+  }
+  return true;
+}
+
+function reconcileAgentList(prevList: Agent[] | undefined, nextList: Agent[]): Agent[] {
+  if (!prevList || prevList.length === 0) return nextList;
+  const prevByKey = new Map(prevList.map((a) => [a.key, a] as const));
+  let allSame = prevList.length === nextList.length;
+  const out = nextList.map((nextItem, i) => {
+    const prevItem = prevByKey.get(nextItem.key);
+    if (prevItem && shallowEqualAgent(prevItem, nextItem)) {
+      if (allSame && prevList[i] !== prevItem) allSame = false;
+      return prevItem;
+    }
+    allSame = false;
+    return nextItem;
+  });
+  return allSame ? prevList : out;
+}
 
 export class RelayError extends Error {
   code: RpcError["code"];
@@ -549,11 +605,16 @@ class SocketClient {
         notifyReleaseAvailable(f.version);
         break;
       case "snapshot": {
+        const prev = liveStore.get();
         const devices: Record<string, Device> = {};
         for (const d of f.devices) devices[d.id] = d;
-        const agents: Record<string, import("@herdr-pocket/protocol").Agent[]> = {};
-        for (const a of f.agents) (agents[a.deviceId] ??= []).push(a);
-        liveStore.set({ devices, agents, rev: liveStore.get().rev + 1 });
+        const grouped: Record<string, Agent[]> = {};
+        for (const a of f.agents) (grouped[a.deviceId] ??= []).push(a);
+        const agents: Record<string, Agent[]> = {};
+        for (const [hostId, list] of Object.entries(grouped)) {
+          agents[hostId] = reconcileAgentList(prev.agents[hostId], list);
+        }
+        liveStore.set({ devices, agents, rev: prev.rev + 1 });
         for (const d of f.devices) {
           if (d.kind === "host" && !d.online) this.closeDirectFor(d.id);
         }
@@ -592,16 +653,22 @@ class SocketClient {
           return { ...prev, devices, agents, spaces, rev: prev.rev + 1 };
         });
         break;
-      case "agents":
-        liveStore.set((prev) => ({
-          ...prev,
-          agents: { ...prev.agents, [f.deviceId]: f.agents },
-          rev: prev.rev + 1,
-        }));
-        if (liveStore.get().devices[f.deviceId]?.online !== false) {
+      case "agents": {
+        const prev = liveStore.get();
+        const prevList = prev.agents[f.deviceId];
+        const nextList = reconcileAgentList(prevList, f.agents);
+        if (nextList !== prevList) {
+          liveStore.set({
+            ...prev,
+            agents: { ...prev.agents, [f.deviceId]: nextList },
+            rev: prev.rev + 1,
+          });
+        }
+        if (prev.devices[f.deviceId]?.online !== false) {
           this.scheduleSpacesRefresh(f.deviceId, 500);
         }
         break;
+      }
       case "rpc_result": {
         const p = this.pending.get(f.id);
         if (!p) break;

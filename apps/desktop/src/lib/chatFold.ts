@@ -3,10 +3,12 @@ import {
   formatModelSwitchSummary,
   isCommandErrorOutput,
   isDismissedCommandOutput,
+  isQuestionToolName,
   parseLocalCommandOutputTag,
   parseModelSwitchEvent,
   parseSlashCommandTag,
   splitFiles,
+  summarizeAskQuestionInput,
   type ChatDisplayMode,
   type ConvEvent,
 } from "@herdr-pocket/protocol";
@@ -258,8 +260,11 @@ function unescapePartialJsonStr(raw: string): string {
 }
 
 /** Extracts a concise single-line target/argument summary from a tool call input. */
-export function toolInputSummary(input: unknown): string {
+export function toolInputSummary(input: unknown, toolName?: string): string {
   if (input == null) return "";
+  if (isQuestionToolName(toolName)) {
+    return summarizeAskQuestionInput(input, 96);
+  }
   if (typeof input === "string") {
     const t = input.trim();
     if (!t) return "";
@@ -267,7 +272,7 @@ export function toolInputSummary(input: unknown): string {
       try {
         const parsed = JSON.parse(t) as unknown;
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          return toolInputSummary(parsed);
+          return toolInputSummary(parsed, toolName);
         }
       } catch {
         const m = PARTIAL_JSON_KEY_RE.exec(t);
@@ -278,6 +283,9 @@ export function toolInputSummary(input: unknown): string {
   }
   if (typeof input !== "object") return clipChars(String(input), 96);
   const o = input as Record<string, unknown>;
+  if ("questions" in o || ("question" in o && ("options" in o || "choices" in o))) {
+    return summarizeAskQuestionInput(o, 96);
+  }
   for (const k of [
     "file_path",
     "path",
@@ -709,7 +717,7 @@ export function foldConvEvents(events: ConvEvent[], mode: ChatDisplayMode = "sta
           name: e.name,
           category: toolCategory(e.name),
           input: e.input,
-          summary: toolInputSummary(e.input),
+          summary: toolInputSummary(e.input, e.name),
           ts: e.ts,
           running: true,
           isError: false,

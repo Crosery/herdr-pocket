@@ -38,7 +38,13 @@ import { getActiveToken, refreshNotifyChannel, signOut } from "../../lib/relay";
 import { liveStore, relTime, settingsStore, updateSettings, type H5LayoutMode } from "../../lib/store";
 import { useWindowHidden } from "../../lib/layout";
 import { ConfigSelect, ConfigSwitch, PaneTitle, SetHeading, SetRow } from "./rows";
-import { ChatDisplayModeRow, PortalDisplayModeRow, TerminalSettingsSection, UiFontSettingsSection } from "./FramePanes";
+import {
+  ChatDisplayModeRow,
+  PortalDisplayModeRow,
+  SidebarWorkspaceUxRows,
+  TerminalSettingsSection,
+  UiFontSettingsSection,
+} from "./FramePanes";
 import { ToolVersionsSection } from "./ToolVersions";
 
 const PLATFORM_LABEL: Record<string, string> = {
@@ -271,6 +277,7 @@ export function GeneralPane({ onReopenGuide }: { onReopenGuide: () => void }) {
       <UiFontSettingsSection />
       <ChatDisplayModeRow />
       <PortalDisplayModeRow />
+      <SidebarWorkspaceUxRows />
       <ConfigSwitch k="general.showShells" about="列出普通 Shell 终端" />
       {!isTauri() ? (
         <>
@@ -496,7 +503,7 @@ function H5UpdatesPane() {
       <PaneTitle title="更新" />
       <SetRow
         title={`当前网页端版本 v${appVersion()}`}
-        about="网页端与手机桌面应用随中转服务器同步发布，刷新即可载入最新版本"
+        about="线上网页端与手机桌面应用会自动跟随中转服务器更新，无需弹窗安装；也可手动立即刷新"
       >
         <PocketButton size="sm" variant="primary" onClick={() => void refreshH5Bundle()}>
           <RefreshCw size={14} />

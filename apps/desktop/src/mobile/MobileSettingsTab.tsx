@@ -61,7 +61,7 @@ export function MobileSettingsTab({
   const showShells = settingsStore.use((s) => s.showShells);
   const link = liveStore.use((s) => s.link);
   const rttMs = liveStore.use((s) => s.rttMs);
-  const hasUpdate = updateStore.use((s) => Boolean(s.info?.hasUpdate));
+  const hasUpdate = updateStore.use((s) => !isH5Web() && Boolean(s.info?.hasUpdate));
 
   const [subPane, setSubPaneState] = useState<SubPane>(null);
   const [assistantTab, setAssistantTab] = useState<AssistantTab>("models");
@@ -223,9 +223,15 @@ export function MobileSettingsTab({
           <div className="row" style={{ gap: 10 }}>
             <RefreshCw size={17} />
             <div>
-              <div style={{ fontWeight: 700, fontSize: fs(14.5) }}>检查更新与电脑端组件</div>
+              <div style={{ fontWeight: 700, fontSize: fs(14.5) }}>
+                {isH5Web() ? "版本与电脑端组件" : "检查更新与电脑端组件"}
+              </div>
               <div className="faint" style={{ fontSize: fs(12) }}>
-                {hasUpdate ? "发现新版本可用" : `当前版本 v${appVersion()} · 协议 v${PROTOCOL_VERSION}`}
+                {isH5Web()
+                  ? `当前版本 v${appVersion()} · 随中转服务器自动更新`
+                  : hasUpdate
+                    ? "发现新版本可用"
+                    : `当前版本 v${appVersion()} · 协议 v${PROTOCOL_VERSION}`}
               </div>
             </div>
           </div>

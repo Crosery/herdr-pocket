@@ -9,10 +9,12 @@ import {
   formatModelSwitchSummary,
   isCommandErrorOutput,
   isDismissedCommandOutput,
+  isQuestionToolName,
   parseLocalCommandOutputTag,
   parseModelSwitchEvent,
   parseSlashCommandTag,
   sameMessage,
+  summarizeAskQuestionInput,
   type Agent,
   type ChatDisplayMode,
   type ConvEvent,
@@ -33,6 +35,7 @@ import { Md } from "./md";
 import { ReplyDots, SendMark } from "./outbox";
 import { Sparkle } from "./Mascot";
 import { CuteIcon } from "./icons";
+import { ModelBrandIcon } from "./ModelBrandIcon";
 
 const clock = (ts: number) => {
   const d = new Date(ts);
@@ -361,6 +364,9 @@ export function toolSummary(input: unknown): string {
   }
   if (typeof input !== "object") return String(input);
   const o = input as Record<string, unknown>;
+  if ("questions" in o || ("question" in o && ("options" in o || "choices" in o))) {
+    return summarizeAskQuestionInput(o, 110);
+  }
   for (const k of [
     "CommandLine",
     "command",
@@ -423,6 +429,9 @@ function friendlyToolMeta(
   }
   if (/^todo_?write$/.test(n)) {
     return { label: "更新清单", icon: "format-list-checks", bg: p.lavenderContainer, fg: p.dusk };
+  }
+  if (isQuestionToolName(n)) {
+    return { label: "向你确认", icon: "format-list-checks", bg: p.dark ? "#3B2433" : "#FFEAF2", fg: p.primary };
   }
   return { label: name, icon: "wrench-outline", bg: p.lavenderContainer, fg: p.dusk };
 }
@@ -945,7 +954,7 @@ function ModelSwitchBanner({ label, ts }: { label: string; ts: number }) {
           paddingVertical: 3,
         }}
       >
-        <MaterialCommunityIcons name="cpu-64-bit" size={13} color={p.muted} />
+        <ModelBrandIcon model={label} size={13} color={p.muted} />
         <Text numberOfLines={1} style={{ flexShrink: 1, color: p.ink, fontSize: 11.5, fontFamily: fonts.bodyBold }}>
           {label}
         </Text>

@@ -16,6 +16,7 @@ import {
   findModelOptionForModel,
   inferAgentModelAndThinking,
   isNonReasoningModelName,
+  normalizeChoiceLabel,
   normalizeSwitchHarness,
   parseModelSwitchText,
   resolveThinkingLevelsForModel,
@@ -55,6 +56,7 @@ import { TermScreen, type ScreenView, type ShownRow } from "../lib/termscreen";
 import { harnessLook } from "../lib/harness";
 import { parseChoices, type Choice } from "../lib/choices";
 import { BUILTIN_SLASH, builtinSlashCommands, extractSlashQuery, matchSlashCommands, mergeSlashCommands, slashCommandIconKind, type SlashIconKind } from "../lib/slashCommands";
+import { ModelBrandIcon } from "./ModelBrandIcon";
 
 function mobileSlashGlyph(kind: SlashIconKind): keyof typeof MaterialCommunityIcons.glyphMap {
   switch (kind) {
@@ -602,31 +604,55 @@ function WaitingCard({
       </View>
     );
   }
-  const choice = (o: Choice) => (
-    <Pressable
-      key={o.key}
-      disabled={busy}
-      onPress={() => onKey(o.key)}
-      accessibilityRole="button"
-      accessibilityLabel={`选第 ${o.key} 项：${o.label}`}
-      style={({ pressed }) => ({
-        flexDirection: "row",
-        alignItems: "center",
-        gap: space.sm,
-        minHeight: 40,
-        paddingHorizontal: space.md,
-        paddingVertical: 6,
-        borderRadius: radius.md,
-        backgroundColor: pressed ? (o.selected ? p.accentText : p.surface3) : o.selected ? p.primary : p.surface,
-        opacity: busy ? 0.5 : 1,
-      })}
-    >
-      <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13, color: o.selected ? p.onPrimary : c.fg, minWidth: 14 }}>{o.key}</Text>
-      <Text numberOfLines={2} style={{ flex: 1, minWidth: 0, fontFamily: fonts.bodySemi, fontSize: 13.5, color: o.selected ? p.onPrimary : p.ink }}>
-        {o.label}
-      </Text>
-    </Pressable>
-  );
+  const choice = (o: Choice) => {
+    const clean = normalizeChoiceLabel(o.label);
+    return (
+      <Pressable
+        key={o.key}
+        disabled={busy}
+        onPress={() => onKey(o.key)}
+        accessibilityRole="button"
+        accessibilityLabel={`选第 ${o.key} 项：${clean.title}`}
+        style={({ pressed }) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          gap: space.sm,
+          minHeight: 40,
+          paddingHorizontal: space.md,
+          paddingVertical: 6,
+          borderRadius: radius.md,
+          backgroundColor: pressed ? (o.selected ? p.accentText : p.surface3) : o.selected ? p.primary : p.surface,
+          opacity: busy ? 0.5 : 1,
+        })}
+      >
+        <Text style={{ fontFamily: fonts.bodyBold, fontSize: 13, color: o.selected ? p.onPrimary : c.fg, minWidth: 14 }}>{o.key}</Text>
+        <View style={{ flex: 1, minWidth: 0, gap: 1 }}>
+          <Text numberOfLines={2} style={{ fontFamily: fonts.bodySemi, fontSize: 13.5, color: o.selected ? p.onPrimary : p.ink }}>
+            {clean.title}
+          </Text>
+          {clean.description ? (
+            <Text numberOfLines={1} style={{ fontSize: 11.5, color: o.selected ? p.onPrimary : p.muted, opacity: o.selected ? 0.9 : 1 }}>
+              {clean.description}
+            </Text>
+          ) : null}
+        </View>
+        {clean.recommended ? (
+          <View
+            style={{
+              paddingHorizontal: 6,
+              paddingVertical: 2,
+              borderRadius: radius.pill,
+              backgroundColor: o.selected ? "rgba(255,255,255,0.22)" : p.accentContainer,
+            }}
+          >
+            <Text style={{ fontSize: 10.5, fontFamily: fonts.bodyBold, color: o.selected ? p.onPrimary : p.accentText }}>
+              推荐
+            </Text>
+          </View>
+        ) : null}
+      </Pressable>
+    );
+  };
   const answer = (label: string, key: string, a11y: string, primary = false) => (
     <Pressable
       key={key}
@@ -916,6 +942,7 @@ export function Composer({
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageData, setUsageData] = useState<AgentUsageReport | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
+  const [quotaTab, setQuotaTab] = useState<string>("");
   const [modelOpen, setModelOpen] = useState<false | "model" | "thinking">(false);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelData, setModelData] = useState<AgentModelsResult | null>(null);
@@ -1806,7 +1833,7 @@ export function Composer({
             gap: 8,
           }}
         >
-          <MaterialCommunityIcons name="cpu-64-bit" size={16} color={p.accentText} />
+          <ModelBrandIcon model={pendingSwitch.modelId || pendingSwitch.label} size={16} color={p.accentText} />
           <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: p.ink }}>
             <Text style={{ fontFamily: fonts.bodyBold, color: p.accentText }}>本轮结束后切换 · </Text>
             {pendingSwitch.label}
@@ -2317,16 +2344,152 @@ export function Composer({
                 {(usageData.session?.contextTokens ?? agent.contextTokens) !== undefined ? (() => {
                   const ct = usageData.session?.contextTokens ?? agent.contextTokens ?? 0;
                   const cl = usageData.session?.contextLimit ?? agent.contextLimit;
-                  const pct = usageData.session?.contextPct ?? (cl && cl > 0 ? (ct / cl) * 100 : undefined);
+                  const usedPct = usageData.session?.contextPct ?? (cl && cl > 0 ? Math.min(100, (ct / cl) * 100) : undefined);
+                  const remainPct = usedPct !== undefined ? Math.max(0, 100 - usedPct) : undefined;
+                  const cacheDenom = usageData.session
+                    ? usageData.session.input + usageData.session.cacheRead + usageData.session.cacheWrite
+                    : 0;
+                  const cacheHitPct =
+                    usageData.session && usageData.session.cacheRead > 0 && cacheDenom > 0
+                      ? ((usageData.session.cacheRead / cacheDenom) * 100).toFixed(1)
+                      : null;
                   return (
-                    <View style={{ gap: 4 }}>
-                      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-                        <Text style={{ fontSize: 12, color: p.muted }}>上下文窗口</Text>
-                        <Text style={{ fontFamily: fonts.mono, fontSize: 11.5, color: p.ink }}>
-                          {cl ? `${compactNum(ct)} / ${compactNum(cl)} · ${(pct ?? 0).toFixed(1)}%` : `${compactNum(ct)} tokens`}
+                    <View style={{ gap: 5 }}>
+                      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                        <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                          {usedPct !== undefined
+                            ? `${usedPct.toFixed(1)}% 已用 · ${remainPct!.toFixed(1)}% 剩余`
+                            : `${compactNum(ct)} tokens`}
+                        </Text>
+                        <Text style={{ fontFamily: fonts.mono, fontSize: 11.5, color: p.muted }}>
+                          {cl ? `${compactNum(ct)} / ${compactNum(cl)}` : `${compactNum(ct)} tok`}
                         </Text>
                       </View>
-                      {pct !== undefined ? <PocketProgress progress={pct / 100} height={6} /> : null}
+                      {usedPct !== undefined ? (
+                        <PocketProgress
+                          progress={usedPct / 100}
+                          color={usedPct >= 85 ? p.error : usedPct >= 65 ? "#f59e0b" : p.primary}
+                          height={6}
+                        />
+                      ) : null}
+                      {cacheHitPct ? (
+                        <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>
+                          {`缓存命中 ${cacheHitPct}%`}
+                        </Text>
+                      ) : null}
+                    </View>
+                  );
+                })() : null}
+                {(usageData.model || effectiveCurrentModel) ? (
+                  <Pressable
+                    onPress={() => {
+                      setUsageOpen(false);
+                      openModelPicker("model");
+                    }}
+                    style={{
+                      flexDirection: "row",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 8,
+                      paddingHorizontal: 10,
+                      paddingVertical: 7,
+                      borderRadius: radius.sm,
+                      backgroundColor: p.surface2,
+                      borderWidth: 1,
+                      borderColor: p.divider,
+                    }}
+                  >
+                    <Text style={{ fontSize: 11.5, color: p.muted }}>当前模型</Text>
+                    <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
+                      <ModelBrandIcon model={usageData.model || effectiveCurrentModel} size={13} color={p.accentText} />
+                      <Text numberOfLines={1} style={{ fontFamily: fonts.monoBold, fontSize: 11.5, color: p.ink, flexShrink: 1 }}>
+                        {(usageData.model || effectiveCurrentModel || "").split("/").pop()}
+                      </Text>
+                    </View>
+                  </Pressable>
+                ) : null}
+                {usageData.quotas.length > 0 ? (() => {
+                  const fmtResetShort = (resetAt?: number) => {
+                    if (!resetAt) return "";
+                    const mins = Math.max(1, Math.round((resetAt - Date.now()) / 60_000));
+                    if (mins < 60) return `${mins}m`;
+                    const hrs = Math.floor(mins / 60);
+                    const remM = mins % 60;
+                    if (hrs < 24) return remM > 0 ? `${hrs}h${remM}m` : `${hrs}h`;
+                    const d = Math.floor(hrs / 24);
+                    const remH = hrs % 24;
+                    return remH > 0 ? `${d}d${remH}h` : `${d}d`;
+                  };
+                  const groups = new Map<string, { title: string; bars: Array<{ win: string; remain: number; reset: string }> }>();
+                  for (const q of usageData.quotas) {
+                    const low = q.provider.trim().toLowerCase();
+                    const title =
+                      low === "google" || low === "gemini"
+                        ? "Gemini"
+                        : low === "anthropic" || low === "claude"
+                          ? "Claude"
+                          : low === "openai" || low === "codex"
+                            ? "OpenAI"
+                            : q.provider;
+                    const key = title.toLowerCase();
+                    const win = /5\s*(?:小时|h)/i.test(q.label) ? "5h窗口" : /7\s*天|周/i.test(q.label) ? "周额度" : q.label;
+                    const remain = Math.max(0, Math.min(100, Math.round((100 - q.usedPct) * 10) / 10));
+                    const g = groups.get(key) ?? { title, bars: [] };
+                    g.bars.push({ win, remain, reset: fmtResetShort(q.resetAt) });
+                    groups.set(key, g);
+                  }
+                  const list = [...groups.entries()];
+                  const current = list.find(([k]) => k === quotaTab)?.[1] ?? list[0]![1];
+                  const minRemain = current.bars.reduce((acc, b) => Math.min(acc, b.remain), 100);
+                  const health = minRemain >= 50 ? "充裕" : minRemain >= 20 ? "适中" : "紧张";
+                  const healthColor = minRemain >= 50 ? "#10b981" : minRemain >= 20 ? "#f59e0b" : p.error;
+                  return (
+                    <View style={{ gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: p.divider }}>
+                      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                          <ModelBrandIcon model={current.title} size={13} color={p.ink} />
+                          <Text style={{ fontFamily: fonts.bodyBold, fontSize: 12, color: p.ink }}>{current.title}</Text>
+                          <Text style={{ fontSize: 10.5, fontFamily: fonts.bodyBold, color: healthColor }}>{health}</Text>
+                        </View>
+                        {list.length > 1 ? (
+                          <View style={{ flexDirection: "row", backgroundColor: p.surface2, borderRadius: radius.pill, padding: 2, gap: 2 }}>
+                            {list.map(([k, g]) => {
+                              const on = g.title === current.title;
+                              return (
+                                <Pressable
+                                  key={k}
+                                  onPress={() => setQuotaTab(k)}
+                                  style={{
+                                    paddingHorizontal: 8,
+                                    paddingVertical: 2,
+                                    borderRadius: radius.pill,
+                                    backgroundColor: on ? p.surface3 : "transparent",
+                                  }}
+                                >
+                                  <Text style={{ fontSize: 10.5, fontFamily: on ? fonts.bodyBold : fonts.body, color: on ? p.ink : p.muted }}>
+                                    {g.title}
+                                  </Text>
+                                </Pressable>
+                              );
+                            })}
+                          </View>
+                        ) : null}
+                      </View>
+                      {current.bars.map((b, bi) => (
+                        <View key={bi} style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                          <Text style={{ width: 46, fontSize: 11, color: p.muted }}>{b.win}</Text>
+                          <View style={{ flex: 1 }}>
+                            <PocketProgress
+                              progress={b.remain / 100}
+                              color={b.remain < 20 ? p.error : b.remain < 50 ? "#f59e0b" : "#3898ff"}
+                              height={5}
+                            />
+                          </View>
+                          <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.ink }}>
+                            {`${Number.isInteger(b.remain) ? b.remain : b.remain.toFixed(1)}%${b.reset ? ` · ${b.reset}` : ""}`}
+                          </Text>
+                        </View>
+                      ))}
                     </View>
                   );
                 })() : null}
@@ -2366,6 +2529,7 @@ export function Composer({
                   <View style={{ gap: 3 }}>
                     {usageData.models.slice(0, 4).map((m) => (
                       <View key={m.model} style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                        <ModelBrandIcon model={m.model} size={13} color={p.muted} />
                         <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontFamily: fonts.mono, fontSize: 11.5, color: p.ink }}>{m.model}</Text>
                         <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>{m.steps} 步</Text>
                         <Text style={{ fontFamily: fonts.monoBold, fontSize: 11.5, color: p.accentText }}>
@@ -2911,7 +3075,13 @@ export function Composer({
                           opacity: activeModelData.canSwitch === false ? 0.5 : 1,
                         })}
                       >
-                        <MaterialCommunityIcons name="cpu-64-bit" size={14} color={active ? p.accentText : p.muted} />
+                        <ModelBrandIcon
+                          model={m.id}
+                          provider={m.provider}
+                          label={m.label}
+                          size={14}
+                          color={active ? p.accentText : p.muted}
+                        />
                         <Text
                           numberOfLines={1}
                           style={{
@@ -2951,7 +3121,7 @@ export function Composer({
                         backgroundColor: pressed ? p.surface3 : "transparent",
                       })}
                     >
-                      <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} />
+                      <ModelBrandIcon model={trimmedFilter} size={14} color={p.accentText} />
                       <Text numberOfLines={1} style={{ flex: 1, minWidth: 0, fontFamily: fonts.monoBold, fontSize: 12.5, color: p.accentText }}>
                         {editingRole ? `设为 ${editingRole}: ${trimmedFilter}` : `切换到 ${trimmedFilter}`}
                       </Text>
@@ -3045,7 +3215,7 @@ export function Composer({
                     })}
                   >
                     {metrics.showModelIcon ? (
-                      <MaterialCommunityIcons name="cpu-64-bit" size={14} color={p.accentText} style={{ flexShrink: 0 }} />
+                      <ModelBrandIcon model={effectiveCurrentModel} size={14} color={p.accentText} />
                     ) : null}
                     <Text
                       numberOfLines={1}
@@ -3109,6 +3279,36 @@ export function Composer({
               ) : null}
             </View>
             <View style={{ flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }}>
+              {mode === "chat" && !agent.isShell ? (() => {
+                const ct = usageData?.session?.contextTokens ?? agent.contextTokens;
+                const cl = usageData?.session?.contextLimit ?? agent.contextLimit;
+                const rawPct = usageData?.session?.contextPct ?? (cl && cl > 0 && ct !== undefined ? (ct / cl) * 100 : undefined);
+                const label = rawPct !== undefined ? `${Math.round(Math.max(0, Math.min(100, rawPct)))}%` : "CTX";
+                return (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="查看上下文窗口与用量"
+                    onPress={() => {
+                      if (usageOpen) setUsageOpen(false);
+                      else openUsageCard();
+                    }}
+                    style={({ pressed }) => ({
+                      height: metrics.pillHeight,
+                      paddingHorizontal: 8,
+                      borderRadius: Math.round(metrics.pillHeight / 2),
+                      alignItems: "center",
+                      justifyContent: "center",
+                      backgroundColor: pressed ? p.surface3 : usageOpen ? p.accentContainer : p.surface2,
+                      borderWidth: 1,
+                      borderColor: usageOpen ? p.primary : p.divider,
+                    })}
+                  >
+                    <Text style={{ fontFamily: fonts.monoBold, fontSize: 11, color: usageOpen ? p.accentText : p.muted }}>
+                      {label}
+                    </Text>
+                  </Pressable>
+                );
+              })() : null}
               {online && agent.status === "working" && !text.trim() && !pictures.length ? (
                 <Pressable
                   accessibilityRole="button"

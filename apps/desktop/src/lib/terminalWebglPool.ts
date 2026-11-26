@@ -1,4 +1,6 @@
 export const MAX_WEBGL_POOL = 14;
+export const MAX_IDLE_WARM_SLOTS = 3;
+export const IDLE_WARM_DECAY_MS = 45_000;
 
 interface WebglPoolEntry {
   key: symbol;
@@ -9,7 +11,31 @@ interface WebglPoolEntry {
 
 const pool = new Map<symbol, WebglPoolEntry>();
 const pendingEvictTimers = new Map<symbol, ReturnType<typeof setTimeout>>();
+const idleDecayTimers = new Map<symbol, ReturnType<typeof setTimeout>>();
 let touchSeq = 0;
+
+function cancelIdleDecay(key: symbol): void {
+  const timer = idleDecayTimers.get(key);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    idleDecayTimers.delete(key);
+  }
+}
+
+function pruneExcessWarmSlots(): void {
+  const inactive: WebglPoolEntry[] = [];
+  for (const entry of pool.values()) {
+    if (!entry.active) inactive.push(entry);
+  }
+  if (inactive.length <= MAX_IDLE_WARM_SLOTS) return;
+  inactive.sort((a, b) => a.lastTouched - b.lastTouched);
+  const toEvict = inactive.slice(0, inactive.length - MAX_IDLE_WARM_SLOTS);
+  for (const victim of toEvict) {
+    pool.delete(victim.key);
+    cancelIdleDecay(victim.key);
+    victim.evict();
+  }
+}
 
 /** Returns the number of currently active or warm WebGL2 terminal contexts tracked by the pool. */
 export function getActiveWebglPoolCount(): number {
@@ -26,6 +52,7 @@ export function acquireWebglSlot(key: symbol, evict: () => void): boolean {
     existing.active = true;
     existing.lastTouched = ++touchSeq;
     existing.evict = evict;
+    cancelIdleDecay(key);
     return true;
   }
 
@@ -83,10 +110,20 @@ export function markWebglSlotInactive(key: symbol): void {
   if (!entry) return;
   entry.active = false;
   entry.lastTouched = ++touchSeq;
+  cancelIdleDecay(key);
+  const timer = setTimeout(() => {
+    idleDecayTimers.delete(key);
+    const cur = pool.get(key);
+    if (!cur || cur.active) return;
+    pruneExcessWarmSlots();
+  }, IDLE_WARM_DECAY_MS);
+  (timer as { unref?: () => void }).unref?.();
+  idleDecayTimers.set(key, timer);
 }
 
 /** Immediately removes a terminal's slot from the pool (on unmount or underlay DOM fallback). */
 export function releaseWebglSlot(key: symbol): void {
+  cancelIdleDecay(key);
   const pending = pendingEvictTimers.get(key);
   if (pending !== undefined) {
     clearTimeout(pending);
@@ -97,6 +134,10 @@ export function releaseWebglSlot(key: symbol): void {
 
 /** Clears pool state for deterministic unit tests. */
 export function resetWebglPoolForTest(): void {
+  for (const timer of idleDecayTimers.values()) {
+    clearTimeout(timer);
+  }
+  idleDecayTimers.clear();
   for (const timer of pendingEvictTimers.values()) {
     clearTimeout(timer);
   }

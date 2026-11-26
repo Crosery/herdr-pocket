@@ -797,7 +797,9 @@ export function mockLink(): Link {
               total: { key: "total", label: "total", sessions: 44, steps: 890, prompts: 192, input: 3_120_000, output: 495_000, cacheRead: 14_200_000, cacheWrite: 310_000, costUsd: 41.8 },
             },
             quotas: [
-              { provider: "anthropic", account: "us***@example.com", label: "5 小时滑动窗口", usedPct: 34.5, resetAt: Date.now() + 2 * 3_600_000 },
+              { provider: "google", account: "us***@example.com", label: "5 小时滑动窗口", usedPct: 1.0, resetAt: Date.now() + 4 * 3_600_000 + 49 * 60_000 },
+              { provider: "google", account: "us***@example.com", label: "7 天周额度", usedPct: 0.0, resetAt: Date.now() + 6 * 86_400_000 + 23 * 3_600_000 },
+              { provider: "anthropic", account: "us***@example.com", label: "5 小时滑动窗口", usedPct: 34.5, resetAt: Date.now() + 2 * 3_600_000 + 18 * 60_000 },
               { provider: "anthropic", account: "us***@example.com", label: "7 天周额度", usedPct: 18.0, resetAt: Date.now() + 4 * 86_400_000 },
             ],
           };

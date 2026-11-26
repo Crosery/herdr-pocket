@@ -1,5 +1,5 @@
 import { CheckCircle2, Download, Minimize2, RefreshCw, RotateCcw, Sparkles, X } from "lucide-react";
-import { openExternalUrl } from "../lib/bridge";
+import { isH5Web, openExternalUrl } from "../lib/bridge";
 import {
   dismissUpdatePrompt,
   minimizeUpdatePrompt,
@@ -45,7 +45,7 @@ function extractReleaseHighlights(raw: string | undefined): string[] {
 export function UpdatePrompt() {
   const st = updateStore.use((s) => s);
   const viewingUpdatesPane = shellStore.use((s) => s.settings === "updates");
-  if (viewingUpdatesPane) return null;
+  if (isH5Web() || viewingUpdatesPane) return null;
 
   if (!st.info?.hasUpdate) {
     if (!st.manualNotice) return null;

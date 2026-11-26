@@ -1,178 +1,55 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/hero-en-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/readme/hero-en-light.svg" />
-    <img alt="Herdr Pocket — Your AI agents in your pocket, across phone and desktop" src="docs/readme/hero-en-light.svg" width="100%" />
-  </picture>
+  <a href="https://crosery.github.io/herdr-pocket/">
+    <img src="docs/readme/logo.png" alt="Herdr Pocket logo" width="112" height="112" />
+  </a>
+</p>
+
+<h1 align="center">Herdr Pocket</h1>
+
+<p align="center">
+  <strong>Every coding agent on every computer, in your pocket.</strong><br />
+  Remote control Claude Code, Codex, Gemini CLI, OpenCode, OMP, and shells across iOS, Android, HarmonyOS NEXT, macOS, Windows, Linux, and Web.
 </p>
 
 <p align="center">
-  <strong>Control AI coding agents across every computer — from iOS, Android, HarmonyOS NEXT, macOS, Windows, Linux, or any browser.</strong>
+  <a href="https://github.com/Crosery/herdr-pocket/releases"><img alt="Latest Release" src="https://img.shields.io/github/v/release/Crosery/herdr-pocket?style=flat-square&label=release&color=e85d93" /></a>
+  <a href="https://github.com/Crosery/herdr-pocket/actions/workflows/ci.yml"><img alt="CI Status" src="https://img.shields.io/github/actions/workflow/status/Crosery/herdr-pocket/ci.yml?branch=main&style=flat-square&label=ci" /></a>
+  <a href="LICENSE"><img alt="License AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-241b2c?style=flat-square" /></a>
+  <a href="#downloads"><img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android%20%7C%20HarmonyOS%20NEXT-3b2d4a?style=flat-square" /></a>
 </p>
 
 <p align="center">
-  <a href="README.md"><strong>English</strong></a> ·
-  <a href="README.zh-CN.md">简体中文</a> ·
-  <a href="https://crosery.github.io/herdr-pocket/">Official Website</a> ·
-  <a href="https://github.com/Crosery/herdr-pocket/releases">Releases (v0.2.45)</a> ·
-  <a href="docs/deploy/README.md">Self-Hosting Docs</a>
+  <strong>English</strong> &middot;
+  <a href="README.zh-CN.md">简体中文</a> &middot;
+  <a href="#quickstart">Quickstart</a> &middot;
+  <a href="#downloads">Downloads</a> &middot;
+  <a href="docs/deploy/README.md">Self-Hosting</a> &middot;
+  <a href="https://crosery.github.io/herdr-pocket/">Website</a>
 </p>
 
-<p align="center">
-  <img alt="License AGPL-3.0-only" src="https://img.shields.io/badge/license-AGPL--3.0--only-ff4f8b?style=flat-square" />
-  <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20iOS%20%7C%20Android%20%7C%20HarmonyOS%20NEXT-1d1720?style=flat-square" />
-  <img alt="Default Opt-In Plugins" src="https://img.shields.io/badge/plugins-100%25%20opt--in%20%C2%B7%20zero%20lock--in-ff4f8b?style=flat-square" />
-</p>
-
----
-
-## Multi-Device Workspace Showcase
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/showcase-dark.webp" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/readme/showcase-light.webp" />
-    <img alt="Herdr Pocket multi-device showcase: Desktop v3 workbench and mobile clients in light and dark mode" src="docs/readme/showcase-light.webp" width="100%" />
-  </picture>
-</p>
-
-<table align="center">
-  <tr>
-    <td align="center" width="33.3%">
-      <img src="apps/site/public/assets/showcase/desktop-light.webp" alt="Desktop v3 Split Workbench" width="100%" />
-      <br />
-      <strong>v3 Split &amp; Stacked Workbench</strong>
-      <br />
-      <sub>Multi-pane workspaces, <code>/</code> &amp; <code>\</code> command surface, Intent Spaces &amp; Git Worktree isolation.</sub>
-    </td>
-    <td align="center" width="33.3%">
-      <img src="apps/site/public/assets/showcase/browser-ai-light.webp" alt="Multi-Space Built-in Browser and Opt-In AI Cursor" width="100%" />
-      <br />
-      <strong>Space Browser &amp; AI Virtual Cursor</strong>
-      <br />
-      <sub>Multi-space tabs, optional AI pink virtual cursor overlay, CAPTCHA guard &amp; instant human takeover.</sub>
-    </td>
-    <td align="center" width="33.3%">
-      <img src="apps/site/public/assets/showcase/plugins-light.webp" alt="Opt-In Xiaoyang Plugin Center" width="100%" />
-      <br />
-      <strong>Opt-In Plugin Center</strong>
-      <br />
-      <sub>All plugins off by default: enable <code>browser_act</code>, workspace inspection, SSRF-safe web fetch, or custom webhooks only when needed.</sub>
-    </td>
-  </tr>
-</table>
-
----
-
-## Direct Downloads (`v0.2.45`)
-
-Every build below comes straight from [GitHub Releases](https://github.com/Crosery/herdr-pocket/releases) alongside `SHA256SUMS` and Chinese/English release notes.
-
-| Platform | Architecture / Format | Direct Download | Notes |
-| --- | --- | --- | --- |
-| **macOS** | Apple Silicon (`arm64`) `.dmg` | [herdr-pocket-0.2.49-macos-arm64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-macos-arm64.dmg) | Tauri v2 desktop app (M1–M4) |
-| **macOS** | Intel (`x64`) `.dmg` | [herdr-pocket-0.2.49-macos-x64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-macos-x64.dmg) | Tauri v2 desktop app (x86_64) |
-| **Windows** | `x64` NSIS Installer `.exe` | [herdr-pocket-0.2.49-windows-x64-setup.exe](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-windows-x64-setup.exe) | Recommended Windows installer |
-| **Windows** | `x64` Windows Installer `.msi` | [herdr-pocket-0.2.49-windows-x64.msi](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-windows-x64.msi) | Enterprise / MSI deployment |
-| **Linux** | `x64` Portable `.AppImage` | [herdr-pocket-0.2.49-linux-x64.AppImage](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-linux-x64.AppImage) | Zero-install portable image |
-| **Linux** | `x64` Debian/Ubuntu `.deb` | [herdr-pocket-0.2.49-linux-x64.deb](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-linux-x64.deb) | `apt` / `dpkg` package |
-| **Android** | `arm64` Native `.apk` | [herdr-pocket-0.2.49-android-arm64.apk](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-android-arm64.apk) | In-app self-update &amp; voice mode |
-| **HarmonyOS NEXT** | `arm64` Stage-Model `.hap` | [herdr-pocket-0.2.49-harmonyos-arm64.hap](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-harmonyos-arm64.hap) | Native ArkTS shell + Web workbench |
-| **iOS** | `arm64` Sideload `.ipa` | [herdr-pocket-0.2.49-ios-arm64.ipa](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49-ios-arm64.ipa) | AltStore / SideStore / TrollStore |
-| **Relay &amp; Hostd** | Cross-platform `.tar.gz` | [herdr-pocket-0.2.49.tar.gz](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.49/herdr-pocket-0.2.49.tar.gz) | Used by `install-host` &amp; `herdr-pocket update` |
-
----
-
-## Core Capabilities
+<br />
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/features-en-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/readme/features-en-light.svg" />
-    <img alt="Herdr Pocket core features across mobile, desktop, browser space, plugins, and relay" src="docs/readme/features-en-light.svg" width="100%" />
+    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/preview-dark.webp" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/preview-light.webp" />
+    <img alt="Herdr Pocket workspace across desktop split workbench and mobile client" src="docs/readme/preview-light.webp" width="100%" />
   </picture>
 </p>
 
-### 1. Real-Time Agent Control Without Changing Your CLI Workflow
-- **Multi-harness support**: Keep running Claude Code, Codex, OpenCode, Gemini CLI, OMP, or plain shells inside `herdr` on macOS, Linux, or Windows — Pocket attaches without wrapping or breaking your workflow.
-- **Unified `/` & `\` Command Surface**: Typing `/` or `\` opens a synchronized command popup (`/clear`, `/compact`, `/model`, `/resume`, etc.) across mobile, desktop, and H5.
-- **Intent-First Create Space & Git Worktree**: Pick what you want to do, choose your harness and launcher, and optionally spin up an isolated Git Worktree branch in one tap so parallel tasks never collide in one working tree.
-- **Native Terminal + Conversation Stream**: Switch cleanly between structured chat turns (diffs, tool cards, permissions, questions) and crisp native xterm rendering with live terminal graphics.
+## Highlights
 
-### 2. Multi-Space & Multi-Tab Browser + Opt-In AI Virtual Cursor (`plugins.aiBrowser`, off by default)
-- **Workspace-grade browser spaces**: Organize dev previews, docs, and login sessions into separate browser spaces and multi-tab panes directly inside the desktop workbench.
-- **Zero-dependency AI automation when you turn it on**: Keep `plugins.aiBrowser` disabled for zero footprint; flip it on to let agents inspect interactive elements (`@e1`, `@e2`), click, fill, select, scroll, press keys, and stream what they are doing.
-- **Pink Virtual Cursor & Live Human Takeover**: Watch the closed Shadow DOM pink cursor glide across targets with status banners, trigger `我来接管` / `已完成，交还 AI` at any moment, and rely on built-in CAPTCHA / password human-handoff guards.
-- **Scriptable CLI & RPC (`hostd`)**: Drive spaces from agents or scripts via `herdr-pocket browser`:
-
-```sh
-herdr-pocket browser status --json
-herdr-pocket browser open http://localhost:3000 --space work --page app
-herdr-pocket browser snapshot --space work --json
-herdr-pocket browser click @e12 --space work --label "Submit login form"
-herdr-pocket browser fill @e14 "hello" --space work
-herdr-pocket browser handoff --space work --reason "Need human SMS verification"
-herdr-pocket browser resume --space work
-```
-
-### 3. Xiaoyang Assistant & Opt-In Plugin Center (`插件中心`, all `false` by default)
-- **Clean by default, extensible on demand**: Every plugin starts `false` — no surprise background tools, no heavy external dependencies, and zero lock-in.
-- **Built-in Xiaoyang Plugins**: Enable only what you trust in Desktop/Mobile **Plugin Center**:
-  - `browser` (`browser_act`): Let Xiaoyang interact with your Space Browser while staying subject to human handoff rules.
-  - `workspace` (`inspect_workspace`): Safely inspect repository layout and files with bounded output.
-  - `webfetch` (`fetch_webpage`): Fetch web documentation with DNS/IP SSRF blocking (rejects loopback, link-local, RFC1918, and IPv6 ULA targets, including redirects) and 8 KB text truncation.
-  - `webhooks`: Register custom HTTP webhook tools whose bearer secrets are sealed at rest and masked (`••••••••`) across read APIs.
-
-### 4. P2P Cross-Device Portal & Direct File Transfer
-- Run `herdr-pocket open <url-or-file>` from any paired machine or trigger URL/file hooks inside tmux — Pocket detects LAN or WireGuard/Tailscale peers automatically for direct encrypted P2P transfer, falling back seamlessly to your relay.
-
----
-
-## Visual Architecture & AI Ecosystem
-
-<table align="center">
-  <tr>
-    <td align="center" width="33.3%">
-      <img src="apps/site/public/assets/showcase/ecosystem-hero.webp" alt="Cross-device ecosystem hero illustration" width="100%" />
-      <br />
-      <sub>Multi-device unified cockpit</sub>
-    </td>
-    <td align="center" width="33.3%">
-      <img src="apps/site/public/assets/showcase/ai-browser-portal.webp" alt="Space Browser AI virtual cursor & takeover illustration" width="100%" />
-      <br />
-      <sub>AI Virtual Cursor &amp; Human Takeover</sub>
-    </td>
-    <td align="center" width="33.3%">
-      <img src="apps/site/public/assets/showcase/xiaoyang-plugins.webp" alt="Xiaoyang Assistant opt-in Plugin Center illustration" width="100%" />
-      <br />
-      <sub>Xiaoyang Opt-In Plugin Center</sub>
-    </td>
-  </tr>
-</table>
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/architecture-en-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/readme/architecture-en-light.svg" />
-    <img alt="Herdr Pocket architecture diagram connecting Phone/Desktop clients, Self-Hosted Relay, and Computer hostd" src="docs/readme/architecture-en-light.svg" width="100%" />
-  </picture>
-</p>
-
-### How It Works
-- **`apps/relay`**: Lightweight WebSocket + HTTP relay (`Node.js` + SQLite). Stores hashed device tokens (`SHA-256`), manages Xiaoyang assistant state/sealed keys, serves the H5 client (`/app/`), and relays frames when direct P2P isn't reachable.
-- **`apps/hostd`**: Per-computer daemon (`herdr-pocket`). Bridges local `herdr` TUI sockets, Uniflo session logs, Git worktree creation, Portal P2P transfers, and the optional Chromium/bridge AI browser controller.
-- **Clients**:
-  - `apps/desktop`: **React 19 + Tauri v2** native app for macOS, Windows, and Linux.
-  - `apps/mobile`: **Expo SDK 58** native app for Android and iOS.
-  - `apps/harmony`: **HarmonyOS NEXT** Stage-Model ArkTS shell wrapping the shared workbench bundle.
-
----
+- **Zero-Wrapper CLI Compatibility** — Keep running Claude Code, Codex, Gemini CLI, OpenCode, OMP, or plain shells inside `herdr` on macOS, Linux, and Windows. Pocket attaches via live PTY sockets and Uniflo transcripts with a unified `/` & `\` command palette across mobile and desktop.
+- **v3 Split Workbench & Per-Terminal 60 FPS Portals** — Side-by-side chat diffs and live xterm panes, one-click Git Worktree branch isolation, and pane-scoped floating portals (`SessionPortalPiP`) strictly bound to the originating terminal — including live `ego-browser` TaskSpace status and instant human takeover.
+- **Xiaoyang Assistant & Realtime Voice** — Proactive 7-state completion and blocker notices, non-intrusive `/btw` side queries on live sessions, and walking-friendly voice calls with on-device noise suppression and voiceprint lock.
+- **Space Browser & Opt-In Plugins (`false` by default)** — Isolated multi-space browser tabs with optional Shadow-DOM virtual cursor and CAPTCHA/password guards. Built-in plugins (`browser_act`, `inspect_workspace`, SSRF-safe `fetch_webpage`, sealed-secret webhooks) stay completely disabled until enabled.
+- **Self-Hosted Relay + Encrypted P2P Direct Links** — Controlled computers open zero inbound ports. LAN, Tailscale, and WireGuard peers upgrade automatically to direct ChaCha20-Poly1305 / WebRTC streams, with your self-hosted relay as seamless fallback.
 
 ## Quickstart
 
-### 1. Deploy Your Own Relay (2 Minutes)
+### 1. Deploy Your Relay
 
-Pick Docker, native Node + systemd, Fly.io, Render, Kubernetes, or Cloudflare Tunnel without opening firewall ports ([Deployment Guide](docs/deploy/README.md)):
+Supports Docker, native Node + systemd, Fly.io, Render, Kubernetes, and Cloudflare Tunnel with no open firewall ports ([Deployment Guide](docs/deploy/README.md)):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-relay.sh | sudo bash -s -- --domain pocket.example.com
@@ -192,20 +69,69 @@ curl -fsSL https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/i
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Crosery/herdr-pocket/main/scripts/install-host.ps1))) -Server https://pocket.example.com
 ```
 
-*Mainland China mirror supported:* prepend `https://ghfast.top/` before the script URL or run `herdr-pocket update --probe` to benchmark fastest download sources automatically.
+*Mainland China mirror tip:* prepend `https://ghfast.top/` before the script URL, or run `herdr-pocket update --probe` to benchmark the fastest release mirror automatically.
 
-### 3. Open Pocket on Phone or Desktop
+### 3. Pair Any Client
 
-Install the native app from [Direct Downloads](#direct-downloads-v0245), pair once via invite link or QR code (`herdr-pocket pair`), or visit `https://<your-relay>/app/` in any browser.
+Install a native build from [Downloads](#downloads), pair once with `herdr-pocket pair` (QR code or invite link), or open `https://<your-relay>/app/` in any browser.
 
----
+## Downloads
 
-## Security & Trust Model
+Automated builds are published to [GitHub Releases](https://github.com/Crosery/herdr-pocket/releases) with `SHA256SUMS` and Chinese/English release notes.
 
-- **Relay sees plaintext on the wire inside TLS**: Frames between clients and hosts are authenticated and TLS-encrypted in transit, **not** end-to-end encrypted against the relay operator — which is why Herdr Pocket makes self-hosting effortless and under your full control.
-- **Zero-trust defaults**: All AI Browser & Xiaoyang plugins ship **disabled (`false`)**, private IP fetches are blocked by SSRF validation, webhook secrets and LLM API keys are encrypted on disk with `<db>.key` and masked in UI responses, and device tokens are stored only as hashes.
+| Platform | Target / Format | Direct Download | Notes |
+| --- | --- | --- | --- |
+| **macOS** | Apple Silicon (`arm64`) `.dmg` | [herdr-pocket-0.2.50-macos-arm64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-macos-arm64.dmg) | Tauri v2 desktop app |
+| **macOS** | Intel (`x64`) `.dmg` | [herdr-pocket-0.2.50-macos-x64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-macos-x64.dmg) | Tauri v2 desktop app |
+| **Windows** | `x64` NSIS Installer `.exe` | [herdr-pocket-0.2.50-windows-x64-setup.exe](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-windows-x64-setup.exe) | Recommended installer |
+| **Windows** | `x64` MSI Package `.msi` | [herdr-pocket-0.2.50-windows-x64.msi](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-windows-x64.msi) | Silent / enterprise rollout |
+| **Linux** | `x64` `.AppImage` | [herdr-pocket-0.2.50-linux-x64.AppImage](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-linux-x64.AppImage) | Portable bundle |
+| **Linux** | `x64` Debian / Ubuntu `.deb` | [herdr-pocket-0.2.50-linux-x64.deb](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-linux-x64.deb) | `apt` / `dpkg` package |
+| **Android** | `arm64` `.apk` | [herdr-pocket-0.2.50-android-arm64.apk](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-android-arm64.apk) | In-app updates & voice calls |
+| **HarmonyOS NEXT** | `arm64` `.hap` | [herdr-pocket-0.2.50-harmonyos-arm64.hap](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-harmonyos-arm64.hap) | Stage-model ArkTS client |
+| **iOS** | `arm64` `.ipa` | [herdr-pocket-0.2.50-ios-arm64.ipa](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50-ios-arm64.ipa) | AltStore / SideStore / TrollStore |
+| **Relay & Hostd** | Cross-platform `.tar.gz` | [herdr-pocket-0.2.50.tar.gz](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.50/herdr-pocket-0.2.50.tar.gz) | Used by `install-host` & `herdr-pocket update` |
 
----
+## Architecture & Security
+
+```mermaid
+flowchart LR
+  Clients["Clients: iOS · Android · HarmonyOS NEXT · Desktop · Web"]
+  Relay["Self-Hosted Relay (wss + Assistant + /app)"]
+  Hostd["Computer hostd (PTY + Uniflo + P2P Portal + Browser)"]
+  Agents["CLI Agents: Claude Code · Codex · Gemini · OpenCode · OMP"]
+
+  Clients <-->|"TLS WebSocket (outbound)"| Relay
+  Relay <-->|"TLS WebSocket (outbound, no open PC ports)"| Hostd
+  Clients <-.->|"Direct Encrypted P2P (LAN / Tailscale / WebRTC)" .-> Hostd
+  Hostd <--> Agents
+```
+
+- **Workspace layout**:
+  - `packages/protocol`: versioned device, agent, conversation, RPC, stream, and portal wire contracts.
+  - `apps/relay`: Node.js + SQLite WebSocket/HTTP relay, hashed (`SHA-256`) device tokens, sealed `<db>.key` assistant settings, and H5 bundle (`/app/`).
+  - `apps/hostd`: per-computer daemon bridging `hc` PTY sockets, Uniflo transcripts, Git worktrees, strict per-terminal Portal streams, and opt-in `herdr-pocket browser` automation.
+  - `apps/desktop`, `apps/mobile`, `apps/harmony`: Tauri v2 desktop, Expo SDK 58 mobile, and HarmonyOS NEXT ArkTS clients.
+- **Security & trust boundaries**:
+  - **Relay trust model**: Traffic is authenticated per device and encrypted over TLS in transit (direct links use encrypted ChaCha20-Poly1305 / DTLS). Because the relay forwards frames when P2P is unavailable, self-hosting keeps every credential and stream strictly under your own infrastructure.
+  - **Zero-trust plugin defaults**: All AI Browser & Xiaoyang plugins ship `false` by default; outbound fetches enforce DNS/IP SSRF validation against loopback, link-local, and private ranges; API keys and webhook secrets are encrypted at rest and masked on read.
+
+<details>
+<summary>Opt-in Browser CLI (<code>herdr-pocket browser</code>) &amp; Xiaoyang Plugins</summary>
+
+Drive Space Browser sessions from scripts or agent hooks once `plugins.aiBrowser` is enabled:
+
+```sh
+herdr-pocket browser status --json
+herdr-pocket browser open http://localhost:3000 --space work --page app
+herdr-pocket browser snapshot --space work --json
+herdr-pocket browser click @e12 --space work --label "Submit login form"
+herdr-pocket browser fill @e14 "hello" --space work
+herdr-pocket browser handoff --space work --reason "Need human SMS verification"
+herdr-pocket browser resume --space work
+```
+
+</details>
 
 ## Development
 
@@ -218,9 +144,7 @@ pnpm --dir apps/desktop typecheck && pnpm --dir apps/desktop test
 pnpm --dir apps/mobile typecheck
 ```
 
-See [AGENTS.md](AGENTS.md) and [docs/design/ui-component-rules.md](docs/design/ui-component-rules.md) for UI primitive rules, workspace build instructions, and release conventions.
-
----
+See [AGENTS.md](AGENTS.md), [docs/README.md](docs/README.md), and [docs/design/ui-component-rules.md](docs/design/ui-component-rules.md) for UI primitive rules, build targets, and release conventions.
 
 ## License
 

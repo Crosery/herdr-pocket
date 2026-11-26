@@ -2307,7 +2307,7 @@ export class Host {
       const a = p.agent ? this.resolve(p.agent) : undefined;
       const [windows, capabilities] = await Promise.all([
         p.includeWindows ? this.portal.listWindows() : Promise.resolve(undefined),
-        this.portal.capabilities(),
+        p.includeWindows ? this.portal.capabilities(true) : this.portal.fastCapabilities(),
       ]);
       return {
         items: this.portal.listPortals(a?.key),

@@ -175,6 +175,27 @@ const DEMO_EVENTS: Record<string, ConvEvent[]> = {
       kind: "assistant_message",
       text: "发现旧回调允许空 state 参数，需要确认接下来怎么处理：\n\n1. 严格校验 state 并拒绝旧令牌\n2. 开启 7 天兼容过渡期并记录告警日志",
     },
+    {
+      id: "e5",
+      session: "claude:demo-1",
+      ts: now - 90_000,
+      kind: "tool_call",
+      call_id: "c_ask_1",
+      name: "ask_question",
+      input: {
+        questions: JSON.stringify([
+          {
+            question: "确认 OAuth state 空参数兼容策略，请选择下一步执行方式：",
+            options: [
+              "(Recommended) 严格校验 state — 立即阻断空 state 回调请求并校验来源",
+              "开启 7 天兼容过渡期 — 先记录告警日志并放行旧版客户端",
+              "Write-in...",
+            ],
+            is_multi_select: false,
+          },
+        ]),
+      },
+    },
   ],
   "dev-mac/hc:t2": [
     { id: "e21", session: "codex:demo-2", ts: now - 9 * min, kind: "user_message", text: "跑一遍端到端测试并修掉超时的用例，顺便核对 `README.md` 和流程图 `docs/oauth-flow.svg`。\n[Image #1] docs/oauth-flow.svg" },
@@ -219,6 +240,7 @@ const DEMO_TERMINALS: Record<string, string[]> = {
     "\x1b[33m请选择处理方式：\x1b[0m",
     "  \x1b[1m1.\x1b[0m 严格校验 state 并拒绝旧令牌",
     "  \x1b[1m2.\x1b[0m 开启 7 天兼容过渡期并记录告警日志",
+    "  \x1b[1m3.\x1b[0m Write-in...",
     "",
     "\x1b[36m›\x1b[0m 等待你的选择…",
   ],
@@ -1270,7 +1292,9 @@ export const mockApi = {
           total: { key: "total", label: "total", sessions: 44, steps: 890, prompts: 192, input: 3_120_000, output: 495_000, cacheRead: 14_200_000, cacheWrite: 310_000, costUsd: 41.8 },
         },
         quotas: [
-          { provider: "anthropic", account: "us***@example.com", label: "5 小时滑动窗口", usedPct: 34.5, resetAt: Date.now() + 2 * 3_600_000 },
+          { provider: "google", account: "us***@example.com", label: "5 小时滑动窗口", usedPct: 1.0, resetAt: Date.now() + 4 * 3_600_000 + 49 * 60_000 },
+          { provider: "google", account: "us***@example.com", label: "7 天周额度", usedPct: 0.0, resetAt: Date.now() + 6 * 86_400_000 + 23 * 3_600_000 },
+          { provider: "anthropic", account: "us***@example.com", label: "5 小时滑动窗口", usedPct: 34.5, resetAt: Date.now() + 2 * 3_600_000 + 18 * 60_000 },
           { provider: "anthropic", account: "us***@example.com", label: "7 天周额度", usedPct: 18.0, resetAt: Date.now() + 4 * 86_400_000 },
         ],
       };

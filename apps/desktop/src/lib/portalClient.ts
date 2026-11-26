@@ -540,71 +540,85 @@ export function dismissPortalInUi(portalId: string): void {
   }));
 }
 
+const portalListInFlight = new Map<
+  string,
+  Promise<{ items: PortalItem[]; windows?: RemoteWindowInfo[]; capabilities: HostPortalCapabilities }>
+>();
+
 export async function refreshHostPortals(
   hostId: string,
   agentKey?: string,
   includeWindows = false,
 ): Promise<{ items: PortalItem[]; windows?: RemoteWindowInfo[]; capabilities: HostPortalCapabilities }> {
-  if (isHostPortalUnsupported(hostId) && !includeWindows) {
-    return {
-      items: [],
-      capabilities: UNSUPPORTED_PORTAL_CAPS,
-    };
-  }
-  let res: { items: PortalItem[]; windows?: RemoteWindowInfo[]; capabilities: HostPortalCapabilities };
-  try {
-    res = await rpcCall(hostId, "portal.list", {
-      ...(agentKey ? { agent: agentKey } : {}),
-      includeWindows,
-    });
-    unsupportedHostVersions.delete(hostId);
-  } catch (err) {
-    if (isPortalUnsupportedError(err)) {
-      markHostPortalUnsupported(hostId);
-      if (includeWindows) {
-        throw new Error("这台电脑的 herdr-pocket 版本较旧，暂不支持跨端窗口回传，请先更新工具");
-      }
+  const inflightKey = `${hostId}|${agentKey ?? ""}|${includeWindows ? 1 : 0}`;
+  const existing = portalListInFlight.get(inflightKey);
+  if (existing) return existing;
+  const run = (async () => {
+    if (isHostPortalUnsupported(hostId) && !includeWindows) {
       return {
         items: [],
         capabilities: UNSUPPORTED_PORTAL_CAPS,
       };
     }
-    throw err;
-  }
-  setState((prev) => {
-    const nextItems = { ...prev.itemsById };
-    const nextOpenedAt = { ...prev.openedAtById };
-    if (agentKey) {
-      for (const [id, it] of Object.entries(nextItems)) {
-        if (it.hostId === hostId && it.agentKey === agentKey && !res.items.some((x) => x.id === id)) {
-          delete nextItems[id];
-          delete nextOpenedAt[id];
+    let res: { items: PortalItem[]; windows?: RemoteWindowInfo[]; capabilities: HostPortalCapabilities };
+    try {
+      res = await rpcCall(hostId, "portal.list", {
+        ...(agentKey ? { agent: agentKey } : {}),
+        includeWindows,
+      });
+      unsupportedHostVersions.delete(hostId);
+    } catch (err) {
+      if (isPortalUnsupportedError(err)) {
+        markHostPortalUnsupported(hostId);
+        if (includeWindows) {
+          throw new Error("这台电脑的 herdr-pocket 版本较旧，暂不支持跨端窗口回传，请先更新工具");
+        }
+        return {
+          items: [],
+          capabilities: UNSUPPORTED_PORTAL_CAPS,
+        };
+      }
+      throw err;
+    }
+    setState((prev) => {
+      const nextItems = { ...prev.itemsById };
+      const nextOpenedAt = { ...prev.openedAtById };
+      if (agentKey) {
+        for (const [id, it] of Object.entries(nextItems)) {
+          if (it.hostId === hostId && it.agentKey === agentKey && !res.items.some((x) => x.id === id)) {
+            delete nextItems[id];
+            delete nextOpenedAt[id];
+          }
+        }
+      } else {
+        for (const [id, it] of Object.entries(nextItems)) {
+          if (it.hostId === hostId && !res.items.some((x) => x.id === id)) {
+            delete nextItems[id];
+            delete nextOpenedAt[id];
+          }
         }
       }
-    } else {
-      for (const [id, it] of Object.entries(nextItems)) {
-        if (it.hostId === hostId && !res.items.some((x) => x.id === id)) {
-          delete nextItems[id];
-          delete nextOpenedAt[id];
+      for (const item of res.items) {
+        const prevItem = prev.itemsById[item.id];
+        nextItems[item.id] = prevItem ? { ...item, updatedAt: prevItem.updatedAt } : item;
+        if (nextOpenedAt[item.id] === undefined) {
+          nextOpenedAt[item.id] = prevItem?.updatedAt ?? item.updatedAt ?? item.createdAt;
         }
       }
-    }
-    for (const item of res.items) {
-      const prevItem = prev.itemsById[item.id];
-      nextItems[item.id] = prevItem ? { ...item, updatedAt: prevItem.updatedAt } : item;
-      if (nextOpenedAt[item.id] === undefined) {
-        nextOpenedAt[item.id] = prevItem?.updatedAt ?? item.updatedAt ?? item.createdAt;
-      }
-    }
-    return {
-      ...prev,
-      itemsById: nextItems,
-      openedAtById: nextOpenedAt,
-      capsByHost: { ...prev.capsByHost, [hostId]: res.capabilities },
-      ...(res.windows ? { windowsByHost: { ...prev.windowsByHost, [hostId]: res.windows } } : {}),
-    };
+      return {
+        ...prev,
+        itemsById: nextItems,
+        openedAtById: nextOpenedAt,
+        capsByHost: { ...prev.capsByHost, [hostId]: res.capabilities },
+        ...(res.windows ? { windowsByHost: { ...prev.windowsByHost, [hostId]: res.windows } } : {}),
+      };
+    });
+    return res;
+  })().finally(() => {
+    portalListInFlight.delete(inflightKey);
   });
-  return res;
+  portalListInFlight.set(inflightKey, run);
+  return run;
 }
 
 export async function openPortalSurface(

@@ -896,6 +896,10 @@ export const native = {
     inTauri() ? invoke<void>("local_term_detach", { id }).catch(() => {}) : Promise.resolve(),
   localTermKill: (terminal: string): Promise<void> =>
     inTauri() ? invoke<void>("local_term_kill", { terminal }) : Promise.resolve(),
+  localTermKeys: (terminal: string, keys: string[]): Promise<void> =>
+    inTauri() ? invoke<void>("local_term_keys", { terminal, keys }) : Promise.resolve(),
+  localTermInterrupt: (terminal: string): Promise<string> =>
+    inTauri() ? invoke<string>("local_term_interrupt", { terminal }) : Promise.resolve(""),
   localHerdrDocGet: async (): Promise<{ value: HerdrDoc | null; version: number } | null> =>
     inTauri() ? invoke<{ value: HerdrDoc | null; version: number }>("local_herdr_doc_get").catch(() => null) : null,
   localHerdrDocSet: async (

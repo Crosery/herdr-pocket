@@ -14,6 +14,7 @@ import {
   downloadAndStageUpdate,
   fetchVersionReleaseNotes,
   fetchVersionSums,
+  isH5Web,
   isTauri,
   onUpdateProgress,
   openExternalUrl,
@@ -24,6 +25,7 @@ import {
   type ReleaseUpdateInfo,
 } from "./bridge";
 import { clientConfigStore } from "./config";
+import { checkAndApplyH5Update } from "./pwa";
 import { createStore, settingsStore } from "./store";
 import { isMockServer } from "./mock";
 import { logger } from "./log";
@@ -264,6 +266,7 @@ export async function checkForUpdate(
   reason: CheckReason,
   minExpectedVersion?: string,
 ): Promise<ReleaseUpdateInfo | null> {
+  if (isH5Web() && reason !== "manual") return null;
   ensureProgressListener();
   if (updateStore.get().checking) {
     const stronger =
@@ -367,6 +370,10 @@ export async function checkForUpdate(
 }
 
 export function notifyReleaseAvailable(version: string | undefined): void {
+  if (isH5Web()) {
+    void checkAndApplyH5Update({ force: true });
+    return;
+  }
   const clean = version?.trim().replace(/^v/i, "") ?? "";
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(clean)) return;
   if (compareVersions(clean, appVersion()) <= 0) return;
@@ -611,6 +618,8 @@ function focusRecheckMs(): number {
 export function startAutoUpdateChecks(
   checkFn: (reason: "manual" | "auto" | "startup" | "push", minExpectedVersion?: string) => Promise<ReleaseUpdateInfo | null> = checkForUpdate,
 ): () => void {
+  // Online H5 follows the upstream relay bundle silently via Service Worker / entry-asset checks.
+  if (isH5Web()) return () => {};
   ensureProgressListener();
   hydrateCachedProbes();
   let timer: ReturnType<typeof setTimeout> | null = null;

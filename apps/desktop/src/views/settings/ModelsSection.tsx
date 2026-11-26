@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Check, CheckCircle2, Gauge, Loader2, Plus, Star, X, Zap } from "lucide-react";
 import type { AssistantConfigView, ModelRef, ProviderView } from "@herdr-pocket/protocol";
+import { ModelBrandIcon } from "../../components/ModelBrandIcon";
 import { PocketBadge, PocketButton, PocketInput, useToast } from "../../components/PocketUI";
 import { fetchAssistantProviderModels, saveAssistantConfig } from "../../lib/assistant";
 import { modelErrorText } from "../../lib/modelErrors";
@@ -295,6 +296,7 @@ function ModelRow({
       <button type="button" className="mm-row-main" onClick={onTest} disabled={test?.running} title="点一下测速度">
         <span className="mm-sr">第 {i + 1} 个，</span>
         <span className="mm-title">
+          <ModelBrandIcon model={m.model} provider={provider ? providerName(provider) : m.provider} size={15} />
           <span className="mm-name">{m.model}</span>
           {fastest ? <PocketBadge tone="mint">最快</PocketBadge> : null}
         </span>
@@ -525,6 +527,7 @@ function AddModelPanel({ cfg, onClose, onAdded }: { cfg: AssistantConfigView; on
                     className={`mm-pick${on ? " on" : ""}`}
                     onClick={() => setModel(n)}
                   >
+                    <ModelBrandIcon model={n} provider={provider} size={14} />
                     <span className="mm-pick-name">{n}</span>
                     {inUse ? <span className="mm-pick-tag">在用</span> : on ? <CheckCircle2 size={16} /> : null}
                   </button>

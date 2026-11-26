@@ -20,7 +20,7 @@ import { native, type LogFolderInfo, type Permissions } from "../../lib/native";
 import { setConfig, useClientConfig } from "../../lib/config";
 import { isMockServer } from "../../lib/mock";
 import { pingRelay } from "../../lib/relay";
-import { liveStore, relTime, settingsStore, updateSettings } from "../../lib/store";
+import { liveStore, relTime, settingsStore, updateSettings, type SidebarAgentGrouping } from "../../lib/store";
 import { IS_MAC, SHORTCUTS, keyChips } from "../../shell/shortcuts";
 import { openSettingsFrame } from "../../shell/shellStore";
 import { RemoveDeviceDialog } from "../DevicesView";
@@ -499,6 +499,39 @@ export function TerminalSettingsSection() {
   );
 }
 
+const SIDEBAR_GROUPING_OPTIONS: Array<{ value: SidebarAgentGrouping; label: string; note: string }> = [
+  { value: "status", label: "按运行状态", note: "需要你 / 进行中 / 已完成" },
+  { value: "space", label: "按所属空间", note: "按项目 Space 与同窗分屏聚合" },
+  { value: "recent", label: "按最近活跃", note: "最近交互过的 Agent 排在前面" },
+];
+
+export function SidebarWorkspaceUxRows() {
+  const grouping = settingsStore.use((s) => s.sidebarAgentGrouping);
+  const showTopology = settingsStore.use((s) => s.showSidebarTopology);
+  const groupingNote =
+    SIDEBAR_GROUPING_OPTIONS.find((o) => o.value === grouping)?.note ?? "选择侧边栏 Agent 列表的分组方式";
+  return (
+    <>
+      <SetRow title="侧边栏 Agent 分组" about={groupingNote}>
+        <PocketSelect
+          value={grouping}
+          onValueChange={(v) => updateSettings({ sidebarAgentGrouping: v as SidebarAgentGrouping })}
+          options={SIDEBAR_GROUPING_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+        />
+      </SetRow>
+      <SetRow
+        title="显示空间分页与分屏关系"
+        about="显示 Space 页数气泡（点击展开 P1..PN 快捷跳转）、分屏联动标识与同窗高光"
+      >
+        <PocketSwitch
+          checked={showTopology}
+          onCheckedChange={(checked) => updateSettings({ showSidebarTopology: checked })}
+        />
+      </SetRow>
+    </>
+  );
+}
+
 export function LookPane() {
   return (
     <div className="pane">
@@ -512,6 +545,8 @@ export function LookPane() {
       <ChatDisplayModeRow />
       <PortalDisplayModeRow />
       <TerminalSettingsSection />
+      <SetHeading>侧边栏与空间拓扑</SetHeading>
+      <SidebarWorkspaceUxRows />
       <SetHeading>列表</SetHeading>
       <ConfigSwitch k="general.showShells" about="列出普通 Shell 终端" />
       <StartupRows />

@@ -25,21 +25,26 @@ interface RpcSample {
 
 const RPC_SAMPLE_CAP = 2000;
 const CLICK_SAMPLE_CAP = 500;
+const KEY_SAMPLE_CAP = 500;
 const SLOW_RPC_MS = 2000;
 const SLOW_CLICK_PAINT_MS = 80;
+const SLOW_KEY_PAINT_MS = 50;
 const SLOW_RPC_EXCLUDED = new Set(["agent.create", "tools.update", "sessions.resume"]);
 const STARTUP_SAMPLE_DELAY_MS = 3000;
 const PERIODIC_INTERVAL_MS = 30_000;
 const PERIODIC_WINDOW_MS = 5000;
 const SPLIT_WINDOW_MS = 1200;
+const IDLE_RAF_CUTOFF_MS = 35_000;
 
 let webglCountProvider: () => number = () => 0;
 let mountedTabsCountProvider: (() => number) | null = null;
 let started = false;
 let rpcSamples: RpcSample[] = [];
 let clickPaintSamples: number[] = [];
+let keyPaintSamples: number[] = [];
 let longTasks = 0;
 let longTaskMaxMs = 0;
+let lastUserInputAt = 0;
 let splitSamplerCancel: (() => void) | null = null;
 
 function round1(n: number): number {
@@ -112,6 +117,7 @@ export function registerMountedTabsCounter(reader: (() => number) | null): void 
 /** Records a click-to-next-animation-frame latency sample and warns when visible click paint exceeds 80ms. */
 export function recordClickPaintSample(paintMs: number, label: string): void {
   if (!Number.isFinite(paintMs) || paintMs < 0) return;
+  lastUserInputAt = Date.now();
   clickPaintSamples.push(paintMs);
   if (clickPaintSamples.length > CLICK_SAMPLE_CAP) {
     clickPaintSamples.splice(0, clickPaintSamples.length - CLICK_SAMPLE_CAP);
@@ -120,6 +126,22 @@ export function recordClickPaintSample(paintMs: number, label: string): void {
     logger.warn("perf.click", `slow click paint (${Math.round(paintMs)}ms)`, {
       ms: Math.round(paintMs),
       label: label.slice(0, 64),
+    });
+  }
+}
+
+/** Records a keydown-to-next-animation-frame latency sample and warns when paint exceeds 50ms. */
+export function recordKeyPaintSample(paintMs: number, keyLabel: string): void {
+  if (!Number.isFinite(paintMs) || paintMs < 0) return;
+  lastUserInputAt = Date.now();
+  keyPaintSamples.push(paintMs);
+  if (keyPaintSamples.length > KEY_SAMPLE_CAP) {
+    keyPaintSamples.splice(0, keyPaintSamples.length - KEY_SAMPLE_CAP);
+  }
+  if (paintMs > SLOW_KEY_PAINT_MS) {
+    logger.warn("perf.key", `slow key paint (${Math.round(paintMs)}ms)`, {
+      ms: Math.round(paintMs),
+      key: keyLabel.slice(0, 32),
     });
   }
 }
@@ -144,8 +166,24 @@ export function recordClientRpcSample(method: string, ms: number, viaDirect: boo
 export function resetPerfTelemetryForTest(): void {
   rpcSamples = [];
   clickPaintSamples = [];
+  keyPaintSamples = [];
   longTasks = 0;
   longTaskMaxMs = 0;
+  lastUserInputAt = 0;
+}
+
+function summarizeKeyWindow(): Record<string, unknown> {
+  const batch = keyPaintSamples;
+  keyPaintSamples = [];
+  if (batch.length === 0) {
+    return { keyCount: 0 };
+  }
+  const sorted = [...batch].sort((a, b) => a - b);
+  return {
+    keyCount: batch.length,
+    keyP50Ms: round1(quantile(sorted, 0.5)),
+    keyMaxMs: round1(sorted[sorted.length - 1]!),
+  };
 }
 
 function summarizeClickWindow(): Record<string, unknown> {
@@ -337,9 +375,24 @@ export function startDesktopPerfTelemetry(): () => void {
     }
   }
 
+  const markActivity = () => {
+    lastUserInputAt = Date.now();
+  };
+  if (lastUserInputAt === 0) lastUserInputAt = Date.now();
+  window.addEventListener("pointerdown", markActivity, { capture: true, passive: true });
+  window.addEventListener("keydown", markActivity, { capture: true, passive: true });
+  window.addEventListener("wheel", markActivity, { capture: true, passive: true });
+
   let activeWindowCancel: (() => void) | null = null;
   const runSample = () => {
-    if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+    if (
+      typeof document !== "undefined" &&
+      (document.visibilityState !== "visible" ||
+        (typeof document.hasFocus === "function" && !document.hasFocus()) ||
+        Date.now() - lastUserInputAt > IDLE_RAF_CUTOFF_MS)
+    ) {
+      return;
+    }
     activeWindowCancel?.();
     activeWindowCancel = sampleRafWindow(PERIODIC_WINDOW_MS, (stats) => {
       activeWindowCancel = null;
@@ -355,6 +408,7 @@ export function startDesktopPerfTelemetry(): () => void {
         ...collectShellContext(),
         ...summarizeRpcWindow(),
         ...summarizeClickWindow(),
+        ...summarizeKeyWindow(),
       };
       if (isLowFpsStats(stats)) {
         logger.warn("perf.fps", `low client fps (${stats.fpsAvg} fps, p95 ${stats.frameP95Ms}ms)`, payload);
@@ -369,6 +423,9 @@ export function startDesktopPerfTelemetry(): () => void {
 
   return () => {
     started = false;
+    window.removeEventListener("pointerdown", markActivity, true);
+    window.removeEventListener("keydown", markActivity, true);
+    window.removeEventListener("wheel", markActivity, true);
     window.clearTimeout(startupTimer);
     window.clearInterval(intervalTimer);
     activeWindowCancel?.();

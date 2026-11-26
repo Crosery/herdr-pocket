@@ -1,4 +1,4 @@
-const CACHE_NAME = "herdr-pocket-shell-v8";
+const CACHE_NAME = "herdr-pocket-shell-v9";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -53,7 +53,7 @@ self.addEventListener("fetch", (event) => {
 
   if (isDocument) {
     event.respondWith(
-      fetch(req)
+      fetch(req, { cache: "no-cache" })
         .then((res) => {
           if (res && res.status === 200 && res.type === "basic") {
             const copy = res.clone();

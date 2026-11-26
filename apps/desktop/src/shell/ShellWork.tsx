@@ -23,7 +23,7 @@ import {
   updateBrowserTab,
   useBrowserSpaces,
 } from "../lib/browserSpaces";
-import { assetUrl, copyToClipboard, detectPlatform, isTauri } from "../lib/bridge";
+import { assetUrl, copyToClipboard, detectPlatform, isH5Web, isTauri } from "../lib/bridge";
 import { restoreUpdatePrompt, updateStore } from "../lib/updates";
 import {
   ATTENTION_CATEGORY_META,
@@ -1904,6 +1904,7 @@ function SplitSash({
       onPointerDown={(e: ReactPointerEvent<HTMLDivElement>) => {
         if (e.button !== 0) return;
         e.preventDefault();
+        window.getSelection()?.removeAllRanges();
         const rect = stageRef.current?.getBoundingClientRect();
         const totalPx = sash.axis === "row" ? (rect?.width ?? window.innerWidth) : (rect?.height ?? window.innerHeight);
         const spanPx = Math.max(140, totalPx * Math.max(0.1, sash.branchSpanScale));
@@ -1984,6 +1985,10 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
   const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
   const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
   const [dropZone, setDropZone] = useState<SplitDropZone | null>(null);
+  const slotSelectionCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => {
+    slotSelectionCleanupRef.current?.();
+  }, []);
   const attachSlotRef = useCallback(
     (el: HTMLDivElement | null) => {
       if (!slotElsRef) return;
@@ -2135,8 +2140,31 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
       ref={attachSlotRef}
       className="v3-split-slot"
       style={visible ? css : { ...css, display: "none" }}
-      onPointerDownCapture={() => {
+      onPointerDownCapture={(e) => {
         if (!isFocused) focusTabPane(tabId, leaf.id);
+        if (!isSplit || e.button !== 0) return;
+        slotSelectionCleanupRef.current?.();
+        const slotEl = e.currentTarget;
+        const stageEl = slotEl.parentElement;
+        if (!stageEl) return;
+        slotEl.classList.add("is-select-owner");
+        stageEl.classList.add("is-select-locked");
+        const unlock = () => {
+          slotEl.classList.remove("is-select-owner");
+          stageEl.classList.remove("is-select-locked");
+          window.removeEventListener("pointerup", unlock, true);
+          window.removeEventListener("pointercancel", unlock, true);
+          window.removeEventListener("dragstart", unlock, true);
+          window.removeEventListener("blur", unlock);
+          if (slotSelectionCleanupRef.current === unlock) {
+            slotSelectionCleanupRef.current = null;
+          }
+        };
+        slotSelectionCleanupRef.current = unlock;
+        window.addEventListener("pointerup", unlock, true);
+        window.addEventListener("pointercancel", unlock, true);
+        window.addEventListener("dragstart", unlock, true);
+        window.addEventListener("blur", unlock);
       }}
       onDragOver={handleDragOver}
       onDragLeave={(e) => {
@@ -2304,7 +2332,7 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
 
 const MAX_KEPT_AGENT_TABS = 64;
 const MAX_KEPT_NON_AGENT_TABS = 12;
-const MAX_PREWARMED_AGENT_TABS = 24;
+const MAX_PREWARMED_AGENT_TABS = 4;
 
 const TabStage = memo(function TabStage({
   tab,
@@ -2320,17 +2348,29 @@ const TabStage = memo(function TabStage({
   onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
 }) {
   const stageRef = useRef<HTMLDivElement | null>(null);
-  const agentsMap = liveStore.use((s) => s.agents);
   const splitLayout = useMemo(
     () => computeSplitLayout(tabRootNode(tab), tab.split?.zoomedPaneId),
     [tab],
   );
+  const portalShellSig = liveStore.use((s) => {
+    if (!tabActive) return "";
+    const parts: string[] = [];
+    for (const item of splitLayout.leaves) {
+      if (!item.visible || item.leaf.content.kind !== "agent") continue;
+      const key = item.leaf.content.agentKey;
+      if (!key) continue;
+      parts.push(`${key}:${lookupAgentByKey(s.agents, key)?.isShell ? 1 : 0}`);
+    }
+    return parts.join("|");
+  });
   const slotKeys = useMemo(
     () => stableSplitLeafKeys(splitLayout.leaves.map((x) => x.leaf)),
     [splitLayout.leaves],
   );
   const portalHostPaneIds = useMemo(() => {
     const hosts = new Set<string>();
+    if (!tabActive) return hosts;
+    const agentsMap = liveStore.get().agents;
     const byAgent = new Map<string, Array<{ id: string; mode: AgentPaneMode }>>();
     for (const item of splitLayout.leaves) {
       if (!item.visible || item.leaf.content.kind !== "agent") continue;
@@ -2346,7 +2386,7 @@ const TabStage = memo(function TabStage({
       if (picked) hosts.add(picked.id);
     }
     return hosts;
-  }, [agentsMap, splitLayout.leaves]);
+  }, [portalShellSig, splitLayout.leaves, tabActive]);
   const focusedId = focusedLeafOfTab(tab).id;
   const focusedUnit = useMemo(
     () => splitLayout.leaves.find((x) => x.leaf.id === focusedId)?.unit ?? null,
@@ -2640,8 +2680,9 @@ export const ShellMain = memo(function ShellMain({
       return activeWork ?? unmountedAgentTabs[0];
     };
 
+    let idleHandle = 0;
     const scheduleTick = () => {
-      timer = window.setTimeout(() => {
+      const runIdlePrewarm = () => {
         if (!alive) return;
         if (isSplitMotionActive() || isInteractiveResizeActive()) {
           scheduleTick();
@@ -2654,13 +2695,21 @@ export const ShellMain = memo(function ShellMain({
           if (filtered.includes(cand.id) || filtered.length >= MAX_PREWARMED_AGENT_TABS) return filtered;
           return [...filtered, cand.id];
         });
-      }, 280);
+      };
+      if (typeof window.requestIdleCallback === "function") {
+        idleHandle = window.requestIdleCallback(runIdlePrewarm, { timeout: 2000 });
+      } else {
+        timer = window.setTimeout(runIdlePrewarm, 1200);
+      }
     };
 
     scheduleTick();
     return () => {
       alive = false;
       if (timer) window.clearTimeout(timer);
+      if (idleHandle && typeof window.cancelIdleCallback === "function") {
+        window.cancelIdleCallback(idleHandle);
+      }
     };
   }, [agentTabIds, bootHydrated, keptAgentIds, lookupAgent, prewarmedIds, selectedSpace, spacesMap, tabs]);
 
@@ -2676,6 +2725,16 @@ export const ShellMain = memo(function ShellMain({
     [mountedTabIds, tabs],
   );
   mountedCountRef.current = mountedTabs.length;
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      try {
+        window.getSelection()?.removeAllRanges();
+      } catch {
+        // ignore selection reset edge cases
+      }
+    }
+  }, [activeId]);
 
   useEffect(() => {
     registerMountedTabsCounter(() => mountedCountRef.current);
@@ -2708,6 +2767,7 @@ export const ShellMain = memo(function ShellMain({
             key={t.mountKey ?? t.id}
             className={isTabActive ? "v3-tab-layer is-active" : "v3-tab-layer is-hidden"}
             aria-hidden={!isTabActive}
+            inert={!isTabActive || undefined}
           >
             <TabStage
               tab={t}
@@ -3355,6 +3415,7 @@ function ShellPanelOpen({ panel }: { panel: PanelId }) {
 
 function UpdateStatusSegment() {
   const st = updateStore.use((s) => s);
+  if (isH5Web()) return null;
   if (st.checking) {
     return (
       <span className="v3-status-item" title="正在检查新版本">
