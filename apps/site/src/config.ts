@@ -8,7 +8,7 @@ const raw = `https://raw.githubusercontent.com/${repo}/main`;
 export const SITE = {
   name: "Herdr Pocket",
   repo,
-  latestVersion: "0.2.52",
+  latestVersion: "0.2.53",
   githubUrl: `https://github.com/${repo}`,
   releasesUrl: `https://github.com/${repo}/releases`,
   docsUrl: `https://github.com/${repo}#readme`,

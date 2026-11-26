@@ -51,6 +51,7 @@ function shallowEqualAgent(a: Agent, b: Agent): boolean {
     a.costUsd !== b.costUsd ||
     a.contextTokens !== b.contextTokens ||
     a.contextLimit !== b.contextLimit ||
+    a.cacheHitPct !== b.cacheHitPct ||
     a.subagents !== b.subagents ||
     a.subagentsWorking !== b.subagentsWorking ||
     a.queued !== b.queued ||

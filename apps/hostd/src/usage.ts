@@ -117,8 +117,25 @@ export async function getDefaultOmpQuotas(): Promise<AgentQuotaBar[]> {
   }
 }
 
+export interface CachedSessionUsageSummary {
+  steps: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoning: number;
+  costUsd: number;
+  unpricedSteps: number;
+  contextTokens?: number;
+  contextLimit?: number;
+  model?: string;
+}
+
 export interface UsageLike {
-  sessionUsage(sessionKey: string): Promise<{
+  sessionUsage(
+    sessionKey: string,
+    opts?: { skipModels?: boolean },
+  ): Promise<{
     turns: number;
     steps: number;
     prompts: number;
@@ -135,7 +152,14 @@ export interface UsageLike {
     model?: string;
     models: AgentUsageModelRow[];
   }>;
+  cachedSessionSummary?(sessionKey: string): CachedSessionUsageSummary | null;
   usage(since: string | undefined, groupBy: string): Promise<{ since?: number; rows: UsageRow[]; total: UsageRow }>;
+}
+
+function getWarmWindowUsage(since: "24h" | "7d"): { rows: UsageRow[]; total: UsageRow } | null {
+  const hit = windowCache.get(since);
+  if (hit && Date.now() - hit.at < WINDOW_CACHE_MS) return hit.data;
+  return hit?.data ?? null;
 }
 
 async function cachedWindowUsage(uniflo: UsageLike, since: "24h" | "7d"): Promise<{ rows: UsageRow[]; total: UsageRow } | null> {
@@ -172,21 +196,34 @@ export async function getAgentUsageReport(
     uniflo?: UsageLike;
     unifloReady?: boolean;
     sessionKey?: string;
+    lite?: boolean;
     readOmpQuotas?: () => Promise<AgentQuotaBar[]>;
   } = {},
 ): Promise<AgentUsageReport> {
   const effectiveKey = opts.sessionKey ?? agent.sessionKey;
   const uniflo = opts.unifloReady === false ? undefined : opts.uniflo;
+  const isLite = opts.lite === true;
 
   const sessionPromise =
     uniflo && effectiveKey
-      ? uniflo.sessionUsage(effectiveKey).catch(() => null)
+      ? uniflo.sessionUsage(effectiveKey, isLite ? { skipModels: true } : undefined).catch(() => null)
       : Promise.resolve(null);
-  const w24Promise = uniflo ? cachedWindowUsage(uniflo, "24h") : Promise.resolve(null);
-  const w7Promise = uniflo ? cachedWindowUsage(uniflo, "7d") : Promise.resolve(null);
-  const quotaPromise = (opts.readOmpQuotas ?? getDefaultOmpQuotas)().catch(() => []);
+  const w24Promise = uniflo
+    ? isLite
+      ? Promise.resolve(getWarmWindowUsage("24h"))
+      : cachedWindowUsage(uniflo, "24h")
+    : Promise.resolve(null);
+  const w7Promise = uniflo
+    ? isLite
+      ? Promise.resolve(getWarmWindowUsage("7d"))
+      : cachedWindowUsage(uniflo, "7d")
+    : Promise.resolve(null);
+  const quotaPromise = isLite
+    ? Promise.resolve(quotaCache?.bars ?? [])
+    : (opts.readOmpQuotas ?? getDefaultOmpQuotas)().catch(() => []);
 
   const [detail, w24, w7, quotas] = await Promise.all([sessionPromise, w24Promise, w7Promise, quotaPromise]);
+  const cachedSummary = !detail && uniflo && effectiveKey ? (uniflo.cachedSessionSummary?.(effectiveKey) ?? null) : null;
 
   let session: AgentUsageReport["session"] = null;
   if (detail) {
@@ -209,6 +246,24 @@ export async function getAgentUsageReport(
           ? { contextPct: (agent.contextTokens / agent.contextLimit) * 100 }
           : {}),
     };
+  } else if (cachedSummary) {
+    const contextTokens = cachedSummary.contextTokens ?? agent.contextTokens;
+    const contextLimit = cachedSummary.contextLimit ?? agent.contextLimit;
+    session = {
+      turns: agent.turn ?? 0,
+      steps: cachedSummary.steps,
+      prompts: agent.turn ?? 0,
+      input: cachedSummary.input,
+      output: cachedSummary.output,
+      cacheRead: cachedSummary.cacheRead,
+      cacheWrite: cachedSummary.cacheWrite,
+      reasoning: cachedSummary.reasoning,
+      costUsd: cachedSummary.costUsd,
+      unpricedSteps: cachedSummary.unpricedSteps,
+      ...(contextTokens !== undefined ? { contextTokens } : {}),
+      ...(contextLimit !== undefined ? { contextLimit } : {}),
+      ...(contextTokens !== undefined && contextLimit ? { contextPct: (contextTokens / contextLimit) * 100 } : {}),
+    };
   } else if (agent.costUsd !== undefined || agent.contextTokens !== undefined || agent.contextLimit !== undefined) {
     session = {
       turns: agent.turn ?? 0,
@@ -227,10 +282,11 @@ export async function getAgentUsageReport(
     };
   }
 
+  const resolvedModel = detail?.model ?? cachedSummary?.model ?? agent.model;
   return {
     harness: agent.harness,
     ...(effectiveKey ? { sessionKey: effectiveKey } : {}),
-    ...(detail?.model ?? agent.model ? { model: detail?.model ?? agent.model } : {}),
+    ...(resolvedModel ? { model: resolvedModel } : {}),
     session,
     models: detail?.models ?? [],
     day24h: pickHarnessWindow(w24, agent.harness),

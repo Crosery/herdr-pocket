@@ -1,8 +1,9 @@
 import { useEffect, useId, useMemo, useState } from "react";
-import { Gauge, RefreshCw, Terminal, X } from "lucide-react";
+import { Gauge, RefreshCw, Terminal, Timer, X, Zap } from "lucide-react";
 import { resolveModelBrand, type Agent, type AgentUsageReport, type ConvEvent } from "@herdr-pocket/protocol";
 import {
   computeTurnTelemetry,
+  fmtLatencyClean,
   fmtPctClean,
   formatContextScaleMark,
   groupQuotasByProvider,
@@ -44,22 +45,34 @@ function formatEffortTag(level?: string): string {
 
 function ContextTestTube({
   pct,
+  tokens,
   limit,
   tps,
+  isWorking,
   uid,
 }: {
-  pct: number;
+  pct: number | null;
+  tokens: number;
   limit: number;
   tps: number | null;
+  isWorking: boolean;
   uid: string;
 }) {
-  const tone = pctTone(pct);
-  const clamped = Math.max(0, Math.min(100, pct));
+  const hasPct = pct !== null && Number.isFinite(pct);
+  const clamped = hasPct ? Math.max(0, Math.min(100, pct)) : 0;
+  const tone = hasPct ? pctTone(clamped) : "ok";
   const tubeTop = 10;
   const tubeHeight = 136;
-  const fillFraction = clamped <= 0 ? 0.04 : Math.max(0.08, Math.min(0.96, clamped / 100));
+  const fillFraction = hasPct
+    ? clamped <= 0
+      ? 0.05
+      : Math.max(0.08, Math.min(0.96, clamped / 100))
+    : tokens > 0
+      ? Math.min(0.72, Math.max(0.16, Math.log10(Math.max(1000, tokens) / 1000) / 3.2))
+      : 0.05;
   const fillHeight = tubeHeight * fillFraction;
   const surfaceY = tubeTop + tubeHeight - fillHeight;
+  const bubbleAnchorBase = Math.max(6, Math.min(fillHeight - 4, 28));
 
   const stops =
     tone === "bad"
@@ -80,13 +93,19 @@ function ContextTestTube({
         { label: "25%", topPct: "75%" },
       ];
 
-  const wavePath = `M 6 ${surfaceY.toFixed(1)} Q 19 ${(surfaceY - 3).toFixed(1)}, 32 ${surfaceY.toFixed(1)} T 58 ${surfaceY.toFixed(1)} L 58 152 L 6 152 Z`;
+  const frontWaveFillD =
+    "M 0 0 Q 14 -2.8, 28 0 T 56 0 T 84 0 T 112 0 T 140 0 T 168 0 L 168 160 L 0 160 Z";
+  const frontCrestD = "M 0 0 Q 14 -2.8, 28 0 T 56 0 T 84 0 T 112 0 T 140 0 T 168 0";
+  const backWaveFillD =
+    "M -48 -1 Q -36 -3.6, -24 -1 T 0 -1 T 24 -1 T 48 -1 T 72 -1 T 96 -1 T 120 -1 L 120 160 L -48 160 Z";
 
   return (
     <div className="usage-vial-col">
       <div className="usage-vial-head">
         <span>CTX</span>
-        <span className={`mono usage-vial-pct ${tone}`}>{fmtPctClean(clamped)}</span>
+        <span className={`mono usage-vial-pct ${tone}`}>
+          {hasPct ? fmtPctClean(clamped) : tokens > 0 ? fmtTokens(tokens) : "0%"}
+        </span>
       </div>
       <div className="usage-vial-stage">
         <svg
@@ -100,9 +119,9 @@ function ContextTestTube({
             <clipPath id={`${uid}-clip`}>
               <rect x="10" y="10" width="44" height="136" rx="22" ry="22" />
             </clipPath>
-            <linearGradient id={`${uid}-liq`} x1="0" y1="0" x2="0" y2="1">
+            <linearGradient id={`${uid}-liq`} x1="0" y1="0" x2="0" y2="0.72">
               <stop offset="0%" stopColor={stops[0]} stopOpacity="0.96" />
-              <stop offset="100%" stopColor={stops[1]} stopOpacity="0.92" />
+              <stop offset="100%" stopColor={stops[1]} stopOpacity="0.94" />
             </linearGradient>
             <linearGradient id={`${uid}-glass`} x1="0" y1="0" x2="1" y2="0">
               <stop offset="0%" stopColor="rgba(255,255,255,0.22)" />
@@ -125,22 +144,51 @@ function ContextTestTube({
             strokeWidth="1.5"
           />
 
-          {/* Liquid fill clipped to glass cavity */}
+          {/* Liquid fill clipped to glass cavity; GPU compositor transform-only waves */}
           <g clipPath={`url(#${uid}-clip)`}>
-            <path d={wavePath} fill={`url(#${uid}-liq)`} />
-            {/* Meniscus highlight line */}
-            <path
-              d={`M 6 ${surfaceY.toFixed(1)} Q 19 ${(surfaceY - 3).toFixed(1)}, 32 ${surfaceY.toFixed(1)} T 58 ${surfaceY.toFixed(1)}`}
-              fill="none"
-              stroke="rgba(255,255,255,0.58)"
-              strokeWidth="1.4"
-            />
-            {clamped >= 5 ? (
-              <>
-                <circle cx="24" cy={Math.min(138, surfaceY + 11)} r="1.7" fill="rgba(255,255,255,0.48)" />
-                <circle cx="38" cy={Math.min(140, surfaceY + 7)} r="1.2" fill="rgba(255,255,255,0.38)" />
-              </>
-            ) : null}
+            <g
+              className={`usage-vial-level${isWorking ? " is-working" : ""}`}
+              transform={`translate(0 ${surfaceY.toFixed(1)})`}
+              style={{ transform: `translate(0px, ${surfaceY.toFixed(1)}px)` }}
+            >
+              <g className="usage-vial-wave-back">
+                <path d={backWaveFillD} fill={stops[0]} fillOpacity="0.38" />
+              </g>
+              <g className="usage-vial-wave-front">
+                <path d={frontWaveFillD} fill={`url(#${uid}-liq)`} />
+                <path
+                  d={frontCrestD}
+                  fill="none"
+                  stroke="rgba(255,255,255,0.68)"
+                  strokeWidth="1.35"
+                />
+              </g>
+              {fillFraction >= 0.1 ? (
+                <>
+                  <circle
+                    className="usage-vial-bubble b1"
+                    cx="22"
+                    cy={Math.min(bubbleAnchorBase, 19).toFixed(1)}
+                    r="1.6"
+                    fill="rgba(255,255,255,0.52)"
+                  />
+                  <circle
+                    className="usage-vial-bubble b2"
+                    cx="37"
+                    cy={Math.min(bubbleAnchorBase, 25).toFixed(1)}
+                    r="1.2"
+                    fill="rgba(255,255,255,0.42)"
+                  />
+                  <circle
+                    className="usage-vial-bubble b3"
+                    cx="30"
+                    cy={Math.min(bubbleAnchorBase, 14).toFixed(1)}
+                    r="1.0"
+                    fill="rgba(255,255,255,0.36)"
+                  />
+                </>
+              ) : null}
+            </g>
           </g>
 
           {/* Glass reflection overlay & crisp rim */}
@@ -248,11 +296,6 @@ export function AgentUsageCard({
     };
   }, [telemetry, usedPct]);
 
-  const speedBits: string[] = [];
-  if (telemetry.ttftMs !== null) speedBits.push(`TTFT ${(telemetry.ttftMs / 1000).toFixed(2)}s`);
-  if (telemetry.tps !== null) speedBits.push(`TPS ${telemetry.tps.toFixed(1)} tok/s`);
-  if (telemetry.cacheHitPct !== null) speedBits.push(`缓存 ${fmtPctClean(telemetry.cacheHitPct)}`);
-
   const effortTag = formatEffortTag(agent.thinkingLevel);
   const activeModelDisplay = activeModelId
     ? `${activeModelId.split("/").pop()}${effortTag ? ` (${effortTag})` : ""}`
@@ -303,9 +346,11 @@ export function AgentUsageCard({
           <div className={`usage-hud-grid${showVialColumn ? " with-vial" : ""}`}>
             {showVialColumn ? (
               <ContextTestTube
-                pct={usedPct}
+                pct={telemetry.usedPct}
+                tokens={telemetry.contextTokens}
                 limit={telemetry.contextLimit}
                 tps={telemetry.tps}
+                isWorking={agent.status === "working"}
                 uid={uid}
               />
             ) : null}
@@ -317,12 +362,14 @@ export function AgentUsageCard({
                     <span className={`usage-hero-pct mono ${tone}`}>
                       {telemetry.usedPct !== null
                         ? `${fmtPctClean(usedPct)} 已用 · ${fmtPctClean(remainPct)} 剩余`
-                        : `${fmtTokens(telemetry.contextTokens)} tok`}
+                        : telemetry.contextTokens > 0
+                          ? `${fmtTokens(telemetry.contextTokens)} 已用`
+                          : "0 tok"}
                     </span>
                     <span className="usage-hero-tok mono">
                       {telemetry.contextLimit > 0
-                        ? `${fmtTokens(telemetry.contextTokens)} / ${fmtTokens(telemetry.contextLimit)} tok`
-                        : `${fmtTokens(telemetry.contextTokens)} tokens`}
+                        ? `${fmtTokens(telemetry.contextTokens)} / ${telemetry.contextLimitInferred ? "~" : ""}${fmtTokens(telemetry.contextLimit)} tok`
+                        : "窗口上限未知"}
                     </span>
                   </div>
                   {telemetry.contextLimit > 0 ? (
@@ -333,15 +380,46 @@ export function AgentUsageCard({
                       <span className="usage-seg-warn-tick" style={{ left: "80%" }} />
                     </div>
                   ) : null}
-                  <div className="usage-speed-row mono">
-                    <span className="usage-speed-left">
-                      {speedBits.length > 0
-                        ? speedBits.join(" · ")
-                        : `输入 ${fmtTokens(telemetry.inputTokens)} · 输出 ${fmtTokens(telemetry.outputTokens)}`}
-                    </span>
-                    {telemetry.contextLimit > 0 ? (
-                      <span className="usage-speed-right">
-                        {`${fmtTokens(telemetry.contextTokens)} / ${fmtTokens(telemetry.contextLimit)}`}
+                  <div className="usage-metric-pills mono">
+                    {telemetry.cacheHitPct !== null ? (
+                      <span
+                        className="usage-metric-chip usage-cache-chip"
+                        title={`提示词缓存命中率 ${fmtPctClean(telemetry.cacheHitPct)}`}
+                      >
+                        <Zap size={11} className="usage-chip-ic" />
+                        <span>缓存</span>
+                        <span className="usage-cache-bar" aria-hidden="true">
+                          <span
+                            className="usage-cache-bar-fill"
+                            style={{ width: `${Math.max(6, Math.min(100, telemetry.cacheHitPct))}%` }}
+                          />
+                        </span>
+                        <b className="usage-chip-val">{fmtPctClean(telemetry.cacheHitPct)}</b>
+                      </span>
+                    ) : null}
+                    {telemetry.ttftMs !== null ? (
+                      <span
+                        className="usage-metric-chip"
+                        title={`最近一轮首字响应延迟 (TTFT) ${fmtLatencyClean(telemetry.ttftMs)}`}
+                      >
+                        <Timer size={11} className="usage-chip-ic" />
+                        <span>响应</span>
+                        <b className="usage-chip-val">{fmtLatencyClean(telemetry.ttftMs)}</b>
+                      </span>
+                    ) : null}
+                    {telemetry.tps !== null ? (
+                      <span
+                        className="usage-metric-chip"
+                        title={`最近一轮生成吞吐 ${telemetry.tps.toFixed(1)} tokens/s`}
+                      >
+                        <Gauge size={11} className="usage-chip-ic" />
+                        <b className="usage-chip-val">{telemetry.tps.toFixed(1)}</b>
+                        <span>tok/s</span>
+                      </span>
+                    ) : null}
+                    {telemetry.cacheHitPct === null && telemetry.ttftMs === null && telemetry.tps === null ? (
+                      <span className="usage-metric-chip muted">
+                        {`输入 ${fmtTokens(telemetry.inputTokens)} · 输出 ${fmtTokens(telemetry.outputTokens)}`}
                       </span>
                     ) : null}
                   </div>

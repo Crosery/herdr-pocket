@@ -6,6 +6,7 @@ export interface TurnTelemetryMetrics {
   cacheHitPct: number | null;
   contextTokens: number;
   contextLimit: number;
+  contextLimitInferred: boolean;
   usedPct: number | null;
   remainPct: number | null;
   inputTokens: number;
@@ -42,6 +43,12 @@ export function fmtPctClean(pct: number): string {
   const clamped = clampPct(pct);
   const rounded = Math.round(clamped * 10) / 10;
   return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
+}
+
+export function fmtLatencyClean(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "0ms";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(ms >= 10_000 ? 1 : 2)}s`;
 }
 
 export function fmtCompactReset(resetAt?: number): string {
@@ -126,22 +133,53 @@ export function formatContextScaleMark(tokens: number): string {
 }
 
 /**
+ * Infers a conservative fallback context window limit for internal aliases or
+ * harnesses where upstream reporting leaves `context_limit` unset/null.
+ */
+export function inferFallbackContextLimit(model?: string, harness?: string, contextTokens = 0): number {
+  const m = (model ?? "").trim().toLowerCase();
+  const h = (harness ?? "").trim().toLowerCase();
+  if (m.includes("gemini") || h === "antigravity" || h === "gemini" || h === "gemini-cli") {
+    return contextTokens > 1_048_576 ? 2_097_152 : 1_048_576;
+  }
+  if (/\b(?:1m|1000k)\b/.test(m) || /claude[- ]?(?:opus|sonnet)[- ]?(?:4[.-]6|5)/.test(m)) {
+    return 1_000_000;
+  }
+  if (m.includes("claude") || h === "claude" || h === "claude-code") {
+    return contextTokens > 200_000 ? 1_000_000 : 200_000;
+  }
+  if (/(?:gpt-5|gpt-6|codex)/.test(m) || h === "codex") {
+    return contextTokens > 272_000 ? 1_000_000 : 272_000;
+  }
+  return 0;
+}
+
+/**
  * Computes honest TTFT, generation TPS, cache hit %, and context window fill ratios
  * solely from observed conversation events, usage reports, and agent metadata.
  */
 export function computeTurnTelemetry(
   events: ConvEvent[] | undefined,
   report: AgentUsageReport | null | undefined,
-  agent?: Pick<Agent, "contextTokens" | "contextLimit"> | null,
+  agent?: Pick<Agent, "contextTokens" | "contextLimit" | "cacheHitPct" | "model" | "harness"> | null,
 ): TurnTelemetryMetrics {
   const session = report?.session ?? null;
-  const contextLimit = Math.max(0, session?.contextLimit ?? agent?.contextLimit ?? 0);
   const sessionTokens = Math.max(0, session?.contextTokens ?? 0);
   const liveAgentTokens = Math.max(0, agent?.contextTokens ?? 0);
   const contextTokens = Math.max(sessionTokens, liveAgentTokens);
 
+  const rawLimit = Math.max(0, session?.contextLimit ?? agent?.contextLimit ?? 0);
+  const resolvedModel = report?.model || agent?.model;
+  const resolvedHarness = report?.harness || agent?.harness;
+  const inferredLimit =
+    rawLimit === 0 && contextTokens > 0
+      ? inferFallbackContextLimit(resolvedModel, resolvedHarness, contextTokens)
+      : 0;
+  const contextLimit = rawLimit > 0 ? rawLimit : inferredLimit;
+  const contextLimitInferred = rawLimit === 0 && inferredLimit > 0;
+
   let rawPct: number | null = null;
-  if (contextLimit > 0 && contextTokens > 0 && liveAgentTokens > sessionTokens) {
+  if (contextLimit > 0 && contextTokens > 0 && (liveAgentTokens > sessionTokens || contextLimitInferred)) {
     rawPct = clampPct((contextTokens / contextLimit) * 100);
   } else if (typeof session?.contextPct === "number" && Number.isFinite(session.contextPct)) {
     rawPct = clampPct(session.contextPct);
@@ -157,10 +195,16 @@ export function computeTurnTelemetry(
   const outputTokens = Math.max(0, session?.output ?? 0);
 
   const cacheDenom = inputTokens + cacheReadTokens + cacheWriteTokens;
-  const cacheHitPct =
+  const sessionCacheHitPct =
     cacheReadTokens > 0 && cacheDenom > 0
       ? Math.round((cacheReadTokens / cacheDenom) * 1000) / 10
       : null;
+  const cacheHitPct =
+    sessionCacheHitPct !== null
+      ? sessionCacheHitPct
+      : typeof agent?.cacheHitPct === "number" && Number.isFinite(agent.cacheHitPct) && agent.cacheHitPct > 0
+        ? Math.round(clampPct(agent.cacheHitPct) * 10) / 10
+        : null;
 
   let ttftMs: number | null = null;
   let tps: number | null = null;
@@ -220,6 +264,7 @@ export function computeTurnTelemetry(
     cacheHitPct,
     contextTokens,
     contextLimit,
+    contextLimitInferred,
     usedPct,
     remainPct,
     inputTokens,

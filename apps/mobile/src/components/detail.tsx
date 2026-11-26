@@ -58,6 +58,24 @@ import { parseChoices, type Choice } from "../lib/choices";
 import { BUILTIN_SLASH, builtinSlashCommands, extractSlashQuery, matchSlashCommands, mergeSlashCommands, slashCommandIconKind, type SlashIconKind } from "../lib/slashCommands";
 import { ModelBrandIcon } from "./ModelBrandIcon";
 
+function inferMobileFallbackContextLimit(model?: string, harness?: string, contextTokens = 0): number {
+  const m = (model ?? "").trim().toLowerCase();
+  const h = (harness ?? "").trim().toLowerCase();
+  if (m.includes("gemini") || h === "antigravity" || h === "gemini" || h === "gemini-cli") {
+    return contextTokens > 1_048_576 ? 2_097_152 : 1_048_576;
+  }
+  if (/\b(?:1m|1000k)\b/.test(m) || /claude[- ]?(?:opus|sonnet)[- ]?(?:4[.-]6|5)/.test(m)) {
+    return 1_000_000;
+  }
+  if (m.includes("claude") || h === "claude" || h === "claude-code") {
+    return contextTokens > 200_000 ? 1_000_000 : 200_000;
+  }
+  if (/(?:gpt-5|gpt-6|codex)/.test(m) || h === "codex") {
+    return contextTokens > 272_000 ? 1_000_000 : 272_000;
+  }
+  return 0;
+}
+
 function mobileSlashGlyph(kind: SlashIconKind): keyof typeof MaterialCommunityIcons.glyphMap {
   switch (kind) {
     case "usage":
@@ -2343,16 +2361,26 @@ export function Composer({
               <>
                 {(usageData.session?.contextTokens ?? agent.contextTokens) !== undefined ? (() => {
                   const ct = usageData.session?.contextTokens ?? agent.contextTokens ?? 0;
-                  const cl = usageData.session?.contextLimit ?? agent.contextLimit;
-                  const usedPct = usageData.session?.contextPct ?? (cl && cl > 0 ? Math.min(100, (ct / cl) * 100) : undefined);
+                  const rawCl = usageData.session?.contextLimit ?? agent.contextLimit ?? 0;
+                  const inferredCl =
+                    rawCl === 0 && ct > 0
+                      ? inferMobileFallbackContextLimit(usageData.model || agent.model, usageData.harness || agent.harness, ct)
+                      : 0;
+                  const cl = rawCl > 0 ? rawCl : inferredCl > 0 ? inferredCl : undefined;
+                  const usedPct =
+                    inferredCl > 0 && cl
+                      ? Math.min(100, (ct / cl) * 100)
+                      : (usageData.session?.contextPct ?? (cl && cl > 0 ? Math.min(100, (ct / cl) * 100) : undefined));
                   const remainPct = usedPct !== undefined ? Math.max(0, 100 - usedPct) : undefined;
                   const cacheDenom = usageData.session
                     ? usageData.session.input + usageData.session.cacheRead + usageData.session.cacheWrite
                     : 0;
-                  const cacheHitPct =
+                  const cacheHitPctNum =
                     usageData.session && usageData.session.cacheRead > 0 && cacheDenom > 0
-                      ? ((usageData.session.cacheRead / cacheDenom) * 100).toFixed(1)
-                      : null;
+                      ? Math.round((usageData.session.cacheRead / cacheDenom) * 1000) / 10
+                      : typeof agent.cacheHitPct === "number" && agent.cacheHitPct > 0
+                        ? Math.round(agent.cacheHitPct * 10) / 10
+                        : null;
                   return (
                     <View style={{ gap: 5 }}>
                       <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
@@ -2362,7 +2390,7 @@ export function Composer({
                             : `${compactNum(ct)} tokens`}
                         </Text>
                         <Text style={{ fontFamily: fonts.mono, fontSize: 11.5, color: p.muted }}>
-                          {cl ? `${compactNum(ct)} / ${compactNum(cl)}` : `${compactNum(ct)} tok`}
+                          {cl ? `${compactNum(ct)} / ${inferredCl > 0 ? "~" : ""}${compactNum(cl)}` : `${compactNum(ct)} tok`}
                         </Text>
                       </View>
                       {usedPct !== undefined ? (
@@ -2372,10 +2400,45 @@ export function Composer({
                           height={6}
                         />
                       ) : null}
-                      {cacheHitPct ? (
-                        <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>
-                          {`缓存命中 ${cacheHitPct}%`}
-                        </Text>
+                      {cacheHitPctNum !== null ? (
+                        <View
+                          style={{
+                            flexDirection: "row",
+                            alignItems: "center",
+                            alignSelf: "flex-start",
+                            gap: 6,
+                            paddingHorizontal: 8,
+                            paddingVertical: 3,
+                            borderRadius: 999,
+                            backgroundColor: p.surface2,
+                            borderWidth: 1,
+                            borderColor: p.divider,
+                          }}
+                        >
+                          <MaterialCommunityIcons name="lightning-bolt" size={12} color={p.sky} />
+                          <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>缓存</Text>
+                          <View
+                            style={{
+                              width: 34,
+                              height: 5,
+                              borderRadius: 999,
+                              backgroundColor: p.surface3,
+                              overflow: "hidden",
+                            }}
+                          >
+                            <View
+                              style={{
+                                width: `${Math.max(8, Math.min(100, cacheHitPctNum))}%`,
+                                height: "100%",
+                                borderRadius: 999,
+                                backgroundColor: p.sky,
+                              }}
+                            />
+                          </View>
+                          <Text style={{ fontFamily: fonts.monoBold, fontSize: 11, color: p.ink }}>
+                            {`${cacheHitPctNum.toFixed(1)}%`}
+                          </Text>
+                        </View>
                       ) : null}
                     </View>
                   );
@@ -3277,9 +3340,26 @@ export function Composer({
             <View style={{ flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }}>
               {mode === "chat" && !agent.isShell ? (() => {
                 const ct = usageData?.session?.contextTokens ?? agent.contextTokens;
-                const cl = usageData?.session?.contextLimit ?? agent.contextLimit;
-                const rawPct = usageData?.session?.contextPct ?? (cl && cl > 0 && ct !== undefined ? (ct / cl) * 100 : undefined);
-                const label = rawPct !== undefined ? `${Math.round(Math.max(0, Math.min(100, rawPct)))}%` : "CTX";
+                const rawCl = usageData?.session?.contextLimit ?? agent.contextLimit ?? 0;
+                const inferredCl =
+                  rawCl === 0 && ct && ct > 0
+                    ? inferMobileFallbackContextLimit(usageData?.model || agent.model, usageData?.harness || agent.harness, ct)
+                    : 0;
+                const cl = rawCl > 0 ? rawCl : inferredCl;
+                const rawPct =
+                  inferredCl > 0 && ct !== undefined
+                    ? (ct / cl) * 100
+                    : (usageData?.session?.contextPct ?? (cl > 0 && ct !== undefined ? (ct / cl) * 100 : undefined));
+                const label = rawPct !== undefined ? `${Math.round(Math.max(0, Math.min(100, rawPct)))}%` : ct && ct > 0 ? compactNum(ct) : "CTX";
+                const cacheDenom = usageData?.session
+                  ? usageData.session.input + usageData.session.cacheRead + usageData.session.cacheWrite
+                  : 0;
+                const cacheHit =
+                  usageData?.session && usageData.session.cacheRead > 0 && cacheDenom > 0
+                    ? Math.round((usageData.session.cacheRead / cacheDenom) * 100)
+                    : typeof agent.cacheHitPct === "number" && agent.cacheHitPct > 0
+                      ? Math.round(agent.cacheHitPct)
+                      : null;
                 return (
                   <Pressable
                     accessibilityRole="button"
@@ -3292,8 +3372,10 @@ export function Composer({
                       height: metrics.pillHeight,
                       paddingHorizontal: 8,
                       borderRadius: Math.round(metrics.pillHeight / 2),
+                      flexDirection: "row",
                       alignItems: "center",
                       justifyContent: "center",
+                      gap: 5,
                       backgroundColor: pressed ? p.surface3 : usageOpen ? p.accentContainer : p.surface2,
                       borderWidth: 1,
                       borderColor: usageOpen ? p.primary : p.divider,
@@ -3302,6 +3384,17 @@ export function Composer({
                     <Text style={{ fontFamily: fonts.monoBold, fontSize: 11, color: usageOpen ? p.accentText : p.muted }}>
                       {label}
                     </Text>
+                    {cacheHit !== null ? (
+                      <>
+                        <View style={{ width: 1, height: 10, backgroundColor: p.divider }} />
+                        <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>
+                          <MaterialCommunityIcons name="lightning-bolt" size={11} color={usageOpen ? p.accentText : p.sky} />
+                          <Text style={{ fontFamily: fonts.mono, fontSize: 10.5, color: usageOpen ? p.accentText : p.muted }}>
+                            {`${cacheHit}%`}
+                          </Text>
+                        </View>
+                      </>
+                    ) : null}
                   </Pressable>
                 );
               })() : null}
@@ -3386,7 +3479,13 @@ export function InfoView({ agent, bottomInset }: { agent: Agent; bottomInset: nu
   const insets = useSafeAreaInsets();
   const device = useLive((s) => s.devices[agent.deviceId]);
   const look = harnessLook(agent.harness, agent.isShell);
-  const ratio = agent.contextTokens && agent.contextLimit ? agent.contextTokens / agent.contextLimit : null;
+  const effectiveLimit =
+    agent.contextLimit && agent.contextLimit > 0
+      ? agent.contextLimit
+      : agent.contextTokens
+        ? inferMobileFallbackContextLimit(agent.model, agent.harness, agent.contextTokens)
+        : 0;
+  const ratio = agent.contextTokens && effectiveLimit > 0 ? agent.contextTokens / effectiveLimit : null;
   const row = (title: string, value: string | undefined | null, icon: string, mono = false) =>
     value ? (
       <View key={title} accessibilityLabel={`${title}：${value}`} style={{ flexDirection: "row", alignItems: "flex-start", gap: space.md, paddingHorizontal: space.lg, paddingVertical: space.sm + 2, minHeight: 56 }}>
@@ -3414,7 +3513,7 @@ export function InfoView({ agent, bottomInset }: { agent: Agent; bottomInset: nu
           <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
             <Text style={{ fontFamily: fonts.bodyBold, color: p.ink }}>上下文用量</Text>
             <Text style={{ color: p.muted }}>
-              {compactNum(agent.contextTokens)} / {compactNum(agent.contextLimit)}
+              {compactNum(agent.contextTokens)} / {compactNum(effectiveLimit)}
             </Text>
           </View>
           <PocketProgress progress={Math.min(1, ratio)} color={ratio > 0.8 ? p.error : p.lavender} height={8} />

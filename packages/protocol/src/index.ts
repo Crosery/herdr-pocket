@@ -96,6 +96,8 @@ export interface Agent {
   costUsd?: number;
   contextTokens?: number;
   contextLimit?: number;
+  /** Prompt cache hit ratio (`0`–`100`, 1 decimal place) computed from observed session usage. */
+  cacheHitPct?: number;
   /** Subagent sessions spawned by the matched session (Uniflo `parent`). */
   subagents?: number;
   subagentsWorking?: number;
@@ -822,7 +824,7 @@ export interface RpcMethods {
   };
   /** Live token usage, context pressure, model breakdown, and quota report for `/usage`. */
   "agent.usage": {
-    params: { agent: string };
+    params: { agent: string; lite?: boolean };
     result: AgentUsageReport;
   };
   /** Discover available models for switching via `/model` or composer chip. */

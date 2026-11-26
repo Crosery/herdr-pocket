@@ -37,7 +37,30 @@ export interface UnifloSession {
   parent_call?: string;
   started_at?: number;
   status_since?: number;
-  usage?: { cost_usd?: number; last_context_tokens?: number; context_limit?: number; steps?: number };
+  usage?: {
+    input?: number;
+    output?: number;
+    cache_read?: number;
+    cache_write?: number;
+    reasoning?: number;
+    unpriced_steps?: number;
+    cost_usd?: number | null;
+    last_context_tokens?: number;
+    context_limit?: number | null;
+    steps?: number;
+  };
+}
+
+/** Computes 0–100 cache hit ratio (1 decimal place) from Uniflo session usage counters. */
+export function computeSessionCacheHitPct(u: UnifloSession["usage"]): number | undefined {
+  if (!u) return undefined;
+  const cacheRead = typeof u.cache_read === "number" && Number.isFinite(u.cache_read) && u.cache_read > 0 ? u.cache_read : 0;
+  if (cacheRead <= 0) return undefined;
+  const input = typeof u.input === "number" && Number.isFinite(u.input) && u.input > 0 ? u.input : 0;
+  const cacheWrite = typeof u.cache_write === "number" && Number.isFinite(u.cache_write) && u.cache_write > 0 ? u.cache_write : 0;
+  const denom = input + cacheRead + cacheWrite;
+  if (denom <= 0) return undefined;
+  return Math.round((cacheRead / denom) * 1000) / 10;
 }
 
 /** Clock slack between a terminal's creation (hc) and a session's start (Uniflo), same machine. */
@@ -60,7 +83,7 @@ function toInfo(s: UnifloSession): SessionInfo {
     status: s.status === "work" ? "working" : "idle",
     startedAt: s.started_at,
     updatedAt: s.updated_at,
-    costUsd: s.usage?.cost_usd,
+    costUsd: typeof s.usage?.cost_usd === "number" ? s.usage.cost_usd : undefined,
     steps: s.usage?.steps,
     parent: s.parent,
   };
@@ -801,7 +824,14 @@ export class UnifloAdapter {
 
   private sig(): string {
     const kids = [...this.childCounts].map(([k, [n, w]]) => `${k}=${n}/${w}`).join(",");
-    return this.sessions.map((s) => `${s.key}:${s.updated_at}:${s.pid ?? ""}:${s.title ?? ""}`).join("|") + kids;
+    return (
+      this.sessions
+        .map(
+          (s) =>
+            `${s.key}:${s.updated_at}:${s.pid ?? ""}:${s.title ?? ""}:${s.usage?.last_context_tokens ?? ""}:${s.usage?.cache_read ?? ""}`,
+        )
+        .join("|") + kids
+    );
   }
 
   private async get(path: string): Promise<any> {
@@ -1107,6 +1137,7 @@ export class UnifloAdapter {
       const model = s.model ?? meta?.model;
       const thinkingLevel = meta?.thinkingLevel ?? (model ? extractModelExplicitEffort(model) : undefined);
       const queuedItems = (a.status === "working" || a.status === "blocked") && meta?.queuedItems?.length ? meta.queuedItems : undefined;
+      const cacheHitPct = computeSessionCacheHitPct(s.usage);
       // Status stays exactly what herdr shows (the phone must match the desktop
       // app); the transcript only adds title, preview, model, cost, and transcript queue items.
       return {
@@ -1119,9 +1150,10 @@ export class UnifloAdapter {
         ...(thinkingLevel ? { thinkingLevel } : {}),
         ...(queuedItems ? { queuedItems, queued: queuedItems.length, queuedText: Array.from(queuedItems[0]!).length > 80 ? `${Array.from(queuedItems[0]!).slice(0, 80).join("")}…` : queuedItems[0]! } : {}),
         preview: s.preview ? s.preview.slice(0, 200) : undefined,
-        costUsd: s.usage?.cost_usd,
+        costUsd: typeof s.usage?.cost_usd === "number" ? s.usage.cost_usd : undefined,
         contextTokens: s.usage?.last_context_tokens,
-        contextLimit: s.usage?.context_limit,
+        contextLimit: typeof s.usage?.context_limit === "number" ? s.usage.context_limit : undefined,
+        ...(cacheHitPct !== undefined ? { cacheHitPct } : {}),
         subagents: kids?.[0],
         subagentsWorking: kids?.[1],
         updatedAt: Math.max(a.updatedAt, s.updated_at),
@@ -1297,8 +1329,58 @@ export class UnifloAdapter {
     return p;
   }
 
+  /** Synchronous in-memory usage summary for `sessionKey` from already-polled Uniflo sessions. */
+  cachedSessionSummary(sessionKey: string): {
+    steps: number;
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning: number;
+    costUsd: number;
+    unpricedSteps: number;
+    contextTokens?: number;
+    contextLimit?: number;
+    model?: string;
+  } | null {
+    const trimmed = sessionKey.trim();
+    if (!trimmed) return null;
+    const colon = trimmed.indexOf(":");
+    const short = colon >= 0 ? trimmed.length - colon - 1 < 32 : trimmed.length < 32;
+    const hit = (x: UnifloSession) => x.key === trimmed || (short && x.key.startsWith(trimmed));
+    const s = this.sessions.find(hit) ?? this.named.get(trimmed) ?? [...this.named.values()].find(hit);
+    const u = s?.usage;
+    if (!s || !u) return null;
+    const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
+    const optNum = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined);
+    const steps = num(u.steps);
+    const costUsd = num(u.cost_usd);
+    const unpricedSteps =
+      typeof u.unpriced_steps === "number" && Number.isFinite(u.unpriced_steps)
+        ? u.unpriced_steps
+        : u.cost_usd === null && steps > 0
+          ? steps
+          : 0;
+    return {
+      steps,
+      input: num(u.input),
+      output: num(u.output),
+      cacheRead: num(u.cache_read),
+      cacheWrite: num(u.cache_write),
+      reasoning: num(u.reasoning),
+      costUsd,
+      unpricedSteps,
+      ...(optNum(u.last_context_tokens) !== undefined ? { contextTokens: optNum(u.last_context_tokens) } : {}),
+      ...(optNum(u.context_limit) !== undefined ? { contextLimit: optNum(u.context_limit) } : {}),
+      ...(s.model ? { model: s.model } : {}),
+    };
+  }
+
   /** Detailed token, cache, reasoning, context, and per-model breakdown for one Uniflo session key. */
-  async sessionUsage(sessionKey: string): Promise<{
+  async sessionUsage(
+    sessionKey: string,
+    opts?: { skipModels?: boolean },
+  ): Promise<{
     turns: number;
     steps: number;
     prompts: number;
@@ -1326,9 +1408,11 @@ export class UnifloAdapter {
         turns?: Array<Record<string, unknown>>;
         steps?: Array<Record<string, unknown>>;
       }>,
-      this.get(`/v1/usage?q=${encodeURIComponent(sessionKey)}&group_by=model`).catch(() => ({ rows: [] })) as Promise<{
-        rows?: Array<Record<string, unknown>>;
-      }>,
+      opts?.skipModels
+        ? Promise.resolve({ rows: [] as Array<Record<string, unknown>> })
+        : (this.get(`/v1/usage?q=${encodeURIComponent(sessionKey)}&group_by=model`).catch(() => ({ rows: [] })) as Promise<{
+            rows?: Array<Record<string, unknown>>;
+          }>),
     ]);
 
     const totals = detail.totals ?? {};
@@ -1394,7 +1478,7 @@ export class UnifloAdapter {
       statusSince: s.status_since,
       startedAt: s.started_at,
       updatedAt: s.updated_at,
-      costUsd: s.usage?.cost_usd,
+      costUsd: typeof s.usage?.cost_usd === "number" ? s.usage.cost_usd : undefined,
       children: this.childCounts.get(s.key)?.[0] ?? 0,
     }));
   }

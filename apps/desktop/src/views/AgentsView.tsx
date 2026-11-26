@@ -25,6 +25,7 @@ import {
   Terminal,
   Trash2,
   X,
+  Zap,
 } from "lucide-react";
 import {
   PUT_LIMITS,
@@ -78,7 +79,7 @@ import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
 import { buildAskQuestionDeck, isQuestionToolName, summarizeAskQuestionInput } from "../lib/askQuestion";
-import { computeTurnTelemetry, fmtPctClean } from "../lib/turnTelemetry";
+import { computeTurnTelemetry, fmtLatencyClean, fmtPctClean } from "../lib/turnTelemetry";
 import { copyToClipboard } from "../lib/bridge";
 import { extractImageTargets } from "../lib/chatImages";
 import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../lib/chatFold";
@@ -168,6 +169,50 @@ const byRecent = (x: Agent, y: Agent) => (y.statusSince ?? y.updatedAt) - (x.sta
 function clip(s: string, max: number): string {
   const chars = [...s];
   return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : s;
+}
+
+const MAX_USAGE_REPORT_CACHE = 80;
+const usageReportByAgentKey = new Map<string, AgentUsageReport>();
+
+function getCachedUsageReport(key: string): AgentUsageReport | null {
+  const hit = usageReportByAgentKey.get(key) ?? null;
+  if (hit) {
+    usageReportByAgentKey.delete(key);
+    usageReportByAgentKey.set(key, hit);
+  }
+  return hit;
+}
+
+function setCachedUsageReport(key: string, report: AgentUsageReport): void {
+  if (usageReportByAgentKey.has(key)) {
+    usageReportByAgentKey.delete(key);
+  } else if (usageReportByAgentKey.size >= MAX_USAGE_REPORT_CACHE) {
+    const oldest = usageReportByAgentKey.keys().next().value;
+    if (oldest !== undefined) usageReportByAgentKey.delete(oldest);
+  }
+  usageReportByAgentKey.set(key, report);
+}
+
+function mergeUsageReport(
+  prev: AgentUsageReport | null,
+  next: AgentUsageReport,
+  isLite: boolean,
+): AgentUsageReport {
+  if (!isLite || !prev) return next;
+  return {
+    ...next,
+    models: next.models.length > 0 ? next.models : prev.models,
+    quotas: next.quotas.length > 0 ? next.quotas : prev.quotas,
+    day24h: next.day24h ?? prev.day24h,
+    day7d: next.day7d ?? prev.day7d,
+  };
+}
+
+function fmtCompactTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(Math.round(n));
 }
 
 type GroupMode = "space" | "status";
@@ -507,8 +552,12 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
   const [activePortalId, setActivePortalId] = useState<string | null>(null);
   const [usageOpen, setUsageOpen] = useState(false);
   const [usageLoading, setUsageLoading] = useState(false);
-  const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(null);
+  const [usageReport, setUsageReport] = useState<AgentUsageReport | null>(() => getCachedUsageReport(agent.key));
   const [usageError, setUsageError] = useState<string | null>(null);
+  const activeAgentKeyRef = useRef(agent.key);
+  activeAgentKeyRef.current = agent.key;
+  const usageInFlightRef = useRef<string | null>(null);
+  const usageTimerRef = useRef<{ key: string; id: number; targetAt: number } | null>(null);
   const [modelMenuMode, setModelMenuMode] = useState<"model" | "thinking" | null>(null);
   const [modelMenuOmpTab, setModelMenuOmpTab] = useState<"session" | "roles">("session");
   const hasReasoningEvents = useMemo(() => events.some((e) => e.kind === "reasoning"), [events]);
@@ -536,7 +585,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     setTextState(draft.text);
     setAttachmentsState(draft.attachments);
     setUsageOpen(false);
-    setUsageReport(null);
+    setUsageReport(getCachedUsageReport(agent.key));
     setUsageError(null);
     setModelMenuMode(null);
     setModelMenuOmpTab("session");
@@ -1022,28 +1071,65 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     () => computeTurnTelemetry(displayedEvents, usageReport, agent),
     [agent, displayedEvents, usageReport],
   );
+  const commitUsageReport = useCallback((targetKey: string, next: AgentUsageReport, isLite: boolean) => {
+    const merged = mergeUsageReport(getCachedUsageReport(targetKey), next, isLite);
+    setCachedUsageReport(targetKey, merged);
+    if (activeAgentKeyRef.current === targetKey) {
+      setUsageReport(merged);
+    }
+  }, []);
   const usageRefreshMetaRef = useRef<{ key: string; at: number; prevStatus?: string }>({ key: agent.key, at: 0 });
   useEffect(() => {
-    if (!chatVisited || !visible || agent.isShell || !agent.sessionKey) return;
+    return () => {
+      if (usageTimerRef.current) {
+        window.clearTimeout(usageTimerRef.current.id);
+        usageTimerRef.current = null;
+      }
+    };
+  }, [agent.isShell, agent.key, chatVisited, visible]);
+  useEffect(() => {
+    const canFetch =
+      chatVisited &&
+      visible &&
+      !agent.isShell &&
+      (Boolean(agent.sessionKey) || displayedEvents.length > 0 || agent.source === "hc" || agent.source === "herdr");
+    if (!canFetch) return;
     const prev = usageRefreshMetaRef.current;
     const statusLeftWorking = prev.key === agent.key && prev.prevStatus === "working" && agent.status !== "working";
+    usageRefreshMetaRef.current.prevStatus = agent.status;
+    if (usageInFlightRef.current === agent.key && !statusLeftWorking) return;
     const elapsed = Date.now() - (prev.key === agent.key ? prev.at : 0);
     const delay = statusLeftWorking || prev.key !== agent.key ? 150 : elapsed >= 2500 ? 500 : 2500 - elapsed;
-    let alive = true;
-    const timer = window.setTimeout(() => {
-      usageRefreshMetaRef.current = { key: agent.key, at: Date.now(), prevStatus: agent.status };
-      void rpcCall(agent.deviceId, "agent.usage", { agent: agent.key })
-        .then((res) => {
-          if (alive) setUsageReport(res);
-        })
-        .catch(() => {});
+    const targetAt = Date.now() + delay;
+    if (
+      usageTimerRef.current &&
+      usageTimerRef.current.key === agent.key &&
+      usageTimerRef.current.targetAt <= targetAt + 120
+    ) {
+      return;
+    }
+    if (usageTimerRef.current) {
+      window.clearTimeout(usageTimerRef.current.id);
+    }
+    const reqKey = agent.key;
+    const reqDevice = agent.deviceId;
+    const reqStatus = agent.status;
+    const id = window.setTimeout(() => {
+      usageTimerRef.current = null;
+      if (activeAgentKeyRef.current !== reqKey) return;
+      usageRefreshMetaRef.current = { key: reqKey, at: Date.now(), prevStatus: reqStatus };
+      usageInFlightRef.current = reqKey;
+      void rpcCall(reqDevice, "agent.usage", { agent: reqKey, lite: true })
+        .then((res) => commitUsageReport(reqKey, res, true))
+        .catch(() => {})
+        .finally(() => {
+          if (usageInFlightRef.current === reqKey) {
+            usageInFlightRef.current = null;
+          }
+        });
     }, delay);
-    usageRefreshMetaRef.current.prevStatus = agent.status;
-    return () => {
-      alive = false;
-      window.clearTimeout(timer);
-    };
-  }, [agent.contextTokens, agent.deviceId, agent.isShell, agent.key, agent.sessionKey, agent.status, agent.updatedAt, chatVisited, displayedEvents.length, visible]);
+    usageTimerRef.current = { key: reqKey, id, targetAt };
+  }, [agent.cacheHitPct, agent.contextTokens, agent.deviceId, agent.isShell, agent.key, agent.sessionKey, agent.source, agent.status, agent.updatedAt, chatVisited, commitUsageReport, displayedEvents.length, visible]);
   const convReconciled = useMemo(
     () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick),
     [agent.status, foldedRows, nowTick, outgoing],
@@ -1445,14 +1531,23 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
   }, []);
 
   const openUsageView = useCallback(() => {
+    const reqKey = agent.key;
     setUsageOpen(true);
     setUsageLoading(true);
     setUsageError(null);
-    void rpcCall(agent.deviceId, "agent.usage", { agent: agent.key })
-      .then((res) => setUsageReport(res))
-      .catch((e) => setUsageError((e as Error).message || "读取用量统计失败"))
-      .finally(() => setUsageLoading(false));
-  }, [agent.deviceId, agent.key]);
+    void rpcCall(agent.deviceId, "agent.usage", { agent: reqKey })
+      .then((res) => commitUsageReport(reqKey, res, false))
+      .catch((e) => {
+        if (activeAgentKeyRef.current === reqKey) {
+          setUsageError((e as Error).message || "读取用量统计失败");
+        }
+      })
+      .finally(() => {
+        if (activeAgentKeyRef.current === reqKey) {
+          setUsageLoading(false);
+        }
+      });
+  }, [agent.deviceId, agent.key, commitUsageReport]);
 
   const runModelOrThinkingSwitch = useCallback(
     async (opts: { modelId?: string; thinkingLevel?: string }) => {
@@ -2903,48 +2998,94 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
               const ctxPct = composerTelemetry.usedPct;
               const hasRing = ctxPct !== null;
               const ringPct = hasRing ? Math.max(0, Math.min(100, ctxPct)) : 0;
-              const r = 5.2;
+              const ctxColor =
+                hasRing && ringPct >= 85 ? "#f43f5e" : hasRing && ringPct >= 65 ? "#f59e0b" : "var(--primary)";
+              const r = 5.0;
               const circ = 2 * Math.PI * r;
               const offset = circ * (1 - ringPct / 100);
-              const metaParts: string[] = [];
-              if (composerTelemetry.tps !== null) metaParts.push(`${composerTelemetry.tps.toFixed(1)} tok/s`);
-              if (composerTelemetry.cacheHitPct !== null) metaParts.push(`缓存 ${fmtPctClean(composerTelemetry.cacheHitPct)}`);
+              const ctxLabel = hasRing
+                ? ringPct >= 10
+                  ? `${Math.round(ringPct)}%`
+                  : fmtPctClean(ringPct)
+                : composerTelemetry.contextTokens > 0
+                  ? fmtCompactTokens(composerTelemetry.contextTokens)
+                  : "CTX";
+              const cachePct = composerTelemetry.cacheHitPct;
+              const tps = composerTelemetry.tps;
+              const ttftMs = composerTelemetry.ttftMs;
+
+              const titleBits: string[] = [];
+              if (hasRing) {
+                const tokStr =
+                  composerTelemetry.contextLimit > 0
+                    ? ` (${fmtCompactTokens(composerTelemetry.contextTokens)} / ${composerTelemetry.contextLimitInferred ? "~" : ""}${fmtCompactTokens(composerTelemetry.contextLimit)})`
+                    : "";
+                titleBits.push(`上下文占用 ${fmtPctClean(ringPct)}${tokStr}`);
+              } else if (composerTelemetry.contextTokens > 0) {
+                titleBits.push(`上下文已用 ${fmtCompactTokens(composerTelemetry.contextTokens)} tok`);
+              } else {
+                titleBits.push("查看上下文窗口与模型额度");
+              }
+              if (cachePct !== null) titleBits.push(`缓存命中 ${fmtPctClean(cachePct)}`);
+              if (ttftMs !== null) titleBits.push(`首字延迟 ${fmtLatencyClean(ttftMs)}`);
+              if (tps !== null) titleBits.push(`生成 ${tps.toFixed(1)} tok/s`);
+              titleBits.push("点击展开上下文详情");
+              const titleText = titleBits.join(" · ");
+
               return (
                 <div className="composer-telemetry-group">
-                  {metaParts.length > 0 ? (
-                    <span className="composer-speed-meta mono">{metaParts.join(" · ")}</span>
-                  ) : null}
                   <button
                     type="button"
-                    className={`composer-ctx-pill mono${usageOpen ? " open" : ""}`}
+                    className={`composer-hud-pill mono${usageOpen ? " open" : ""}`}
                     aria-expanded={usageOpen}
-                    title={
-                      hasRing
-                        ? `上下文占用 ${fmtPctClean(ringPct)} · 点击查看上下文窗口与额度详情`
-                        : "查看上下文窗口与模型额度"
-                    }
+                    aria-label={titleText}
+                    title={titleText}
                     onClick={() => {
                       if (usageOpen) setUsageOpen(false);
                       else openUsageView();
                     }}
                   >
-                    <svg className="composer-ctx-ring" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
-                      <circle cx="7" cy="7" r={r} fill="none" stroke="currentColor" strokeOpacity="0.2" strokeWidth="1.8" />
-                      {hasRing ? (
-                        <circle
-                          cx="7"
-                          cy="7"
-                          r={r}
-                          fill="none"
-                          stroke={ringPct >= 85 ? "#f43f5e" : ringPct >= 65 ? "#f59e0b" : "var(--primary)"}
-                          strokeWidth="1.8"
-                          strokeLinecap="round"
-                          strokeDasharray={circ}
-                          strokeDashoffset={offset}
-                        />
-                      ) : null}
-                    </svg>
-                    <span>{hasRing ? fmtPctClean(ringPct) : "CTX"}</span>
+                    <span className="composer-hud-ctx">
+                      <svg className="composer-ctx-ring" width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+                        <circle cx="6.5" cy="6.5" r={r} fill="none" stroke="currentColor" strokeOpacity="0.2" strokeWidth="1.75" />
+                        {hasRing ? (
+                          <circle
+                            cx="6.5"
+                            cy="6.5"
+                            r={r}
+                            fill="none"
+                            stroke={ctxColor}
+                            strokeWidth="1.75"
+                            strokeLinecap="round"
+                            strokeDasharray={circ}
+                            strokeDashoffset={offset}
+                          />
+                        ) : null}
+                      </svg>
+                      <span>{ctxLabel}</span>
+                    </span>
+                    {cachePct !== null ? (
+                      <>
+                        <span className="composer-hud-sep" aria-hidden="true" />
+                        <span className="composer-hud-cache">
+                          <Zap size={10.5} className="composer-hud-cache-ic" />
+                          <span className="composer-hud-cache-track" aria-hidden="true">
+                            <span
+                              className="composer-hud-cache-fill"
+                              style={{ width: `${Math.max(8, Math.min(100, cachePct))}%` }}
+                            />
+                          </span>
+                          <span>{`${Math.round(cachePct)}%`}</span>
+                        </span>
+                      </>
+                    ) : tps !== null || ttftMs !== null ? (
+                      <>
+                        <span className="composer-hud-sep" aria-hidden="true" />
+                        <span className="composer-hud-lat">
+                          {tps !== null ? `${Math.round(tps)}/s` : fmtLatencyClean(ttftMs!)}
+                        </span>
+                      </>
+                    ) : null}
                   </button>
                 </div>
               );

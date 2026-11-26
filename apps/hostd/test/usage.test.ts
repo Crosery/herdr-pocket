@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 import type { Agent } from "@herdr-pocket/protocol";
+import { computeSessionCacheHitPct } from "../src/uniflo.ts";
 import { clearUsageCachesForTest, getAgentUsageReport, parseOmpUsageJson } from "../src/usage.ts";
 
 const baseAgent: Agent = {
@@ -104,4 +105,86 @@ test("getAgentUsageReport falls back gracefully without Uniflo using agent snaps
   assert.equal(report.session?.contextLimit, undefined);
   assert.deepEqual(report.models, []);
   assert.equal(report.day24h, null);
+});
+
+test("getAgentUsageReport lite mode skips quotas/models and preserves cachedSessionSummary when sessionUsage fails", async () => {
+  let quotaCalled = false;
+  let usageWindowCalled = false;
+  let receivedSkipModels: boolean | undefined;
+
+  const liteOk = await getAgentUsageReport(baseAgent, {
+    unifloReady: true,
+    lite: true,
+    uniflo: {
+      async sessionUsage(_key, opts) {
+        receivedSkipModels = opts?.skipModels;
+        return {
+          turns: 5,
+          steps: 12,
+          prompts: 5,
+          input: 10_000,
+          output: 2_000,
+          cacheRead: 90_000,
+          cacheWrite: 0,
+          reasoning: 0,
+          costUsd: 0.45,
+          unpricedSteps: 0,
+          contextTokens: 82_000,
+          contextLimit: 200_000,
+          contextPct: 41,
+          model: "gpt-6.2-astra",
+          models: [],
+        };
+      },
+      async usage() {
+        usageWindowCalled = true;
+        return { rows: [], total: { key: "total", label: "total", sessions: 0, steps: 0, prompts: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 } };
+      },
+    },
+    async readOmpQuotas() {
+      quotaCalled = true;
+      return [];
+    },
+  });
+
+  assert.equal(receivedSkipModels, true);
+  assert.equal(quotaCalled, false);
+  assert.equal(usageWindowCalled, false);
+  assert.equal(liteOk.session?.cacheRead, 90_000);
+
+  const fallbackReport = await getAgentUsageReport(baseAgent, {
+    unifloReady: true,
+    lite: true,
+    uniflo: {
+      async sessionUsage() {
+        throw new Error("timeout");
+      },
+      cachedSessionSummary() {
+        return {
+          steps: 18,
+          input: 15_000,
+          output: 3_000,
+          cacheRead: 165_000,
+          cacheWrite: 0,
+          reasoning: 200,
+          costUsd: 0.88,
+          unpricedSteps: 0,
+          contextTokens: 96_000,
+          contextLimit: 200_000,
+          model: "gpt-6.2-astra",
+        };
+      },
+      async usage() {
+        return { rows: [], total: { key: "total", label: "total", sessions: 0, steps: 0, prompts: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 } };
+      },
+    },
+  });
+
+  assert.equal(fallbackReport.session?.cacheRead, 165_000);
+  assert.equal(fallbackReport.session?.input, 15_000);
+  assert.equal(fallbackReport.session?.output, 3_000);
+  assert.equal(fallbackReport.session?.contextTokens, 96_000);
+  assert.equal(fallbackReport.session?.contextLimit, 200_000);
+  assert.equal(fallbackReport.session?.contextPct, 48);
+  assert.equal(computeSessionCacheHitPct({ input: 10_000, cache_read: 90_000, cache_write: 0 }), 90);
 });

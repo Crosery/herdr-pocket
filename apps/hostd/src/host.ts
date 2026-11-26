@@ -1931,6 +1931,7 @@ export class Host {
         uniflo: this.uniflo,
         unifloReady: this.sources.includes("uniflo"),
         sessionKey: key ?? undefined,
+        lite: p.lite === true,
       });
     },
     "agent.models": async (p) => {
