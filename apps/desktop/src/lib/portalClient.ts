@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   DIRECT_PORTAL_FS_PREFIX,
   type HostPortalCapabilities,
@@ -410,6 +410,43 @@ function setState(updater: (prev: PortalState) => PortalState): void {
   for (const fn of listeners) fn();
 }
 
+/** Formats a PortalItem's title cleanly: strips verbose raw OAuth query strings and extracts readable labels. */
+export function formatPortalDisplayTitle(item: Pick<PortalItem, "title" | "url" | "kind" | "egoSpace" | "highlightName" | "targetPath">): string {
+  if (item.egoSpace?.spaceName) {
+    return item.egoSpace.activeTabTitle
+      ? `${item.egoSpace.spaceName} · ${item.egoSpace.activeTabTitle}`
+      : `Ego 空间 · ${item.egoSpace.spaceName}`;
+  }
+  const raw = (item.title || "").trim();
+  const formatUrl = (urlStr: string): string | null => {
+    try {
+      const u = new URL(urlStr);
+      const host = u.port ? `${u.hostname}:${u.port}` : u.hostname;
+      const pathLower = `${u.pathname}${u.search}`.toLowerCase();
+      if (/oauth|authorize|auth|login|signin|sso|callback|token/.test(pathLower)) {
+        return `${host} · 登录授权`;
+      }
+      const cleanPath = u.pathname.replace(/\/+$/, "");
+      if (!cleanPath || cleanPath === "/") return host;
+      const shortPath = cleanPath.length > 22 ? `${cleanPath.slice(0, 19)}…` : cleanPath;
+      return `${host}${shortPath}`;
+    } catch {
+      return null;
+    }
+  };
+  if (raw && !/^https?:\/\//i.test(raw)) {
+    return raw.length > 42 ? `${raw.slice(0, 41)}…` : raw;
+  }
+  const candidate = raw || item.url || "";
+  if (/^https?:\/\//i.test(candidate)) {
+    const formatted = formatUrl(candidate);
+    if (formatted) return formatted;
+  }
+  if (item.highlightName) return item.highlightName;
+  if (item.targetPath) return item.targetPath.split(/[\\/]/).pop() || item.targetPath;
+  return item.kind === "browser" ? "远程浏览器" : item.kind === "window" ? "系统窗口" : "实时预览";
+}
+
 export const portalStore = {
   get: () => state,
   subscribe: (fn: () => void) => {
@@ -419,17 +456,23 @@ export const portalStore = {
     };
   },
   use<T>(selector: (s: PortalState) => T): T {
+    const selectorRef = useRef(selector);
+    selectorRef.current = selector;
     const [val, setVal] = useState(() => selector(state));
+    const current = selector(state);
     useEffect(() => {
-      setVal(selector(state));
+      setVal((prev) => {
+        const next = selectorRef.current(state);
+        return Object.is(prev, next) ? prev : next;
+      });
       return portalStore.subscribe(() => {
         setVal((prev) => {
-          const next = selector(state);
+          const next = selectorRef.current(state);
           return Object.is(prev, next) ? prev : next;
         });
       });
     }, []);
-    return val;
+    return Object.is(val, current) ? val : current;
   },
 };
 
@@ -861,6 +904,7 @@ export function subscribePortalFrames(
     let streamLive = false;
     let lastStreamActivityAt = 0;
     let busy = false;
+    let consecutivePollErrors = 0;
     let ackInFlight = false;
     let ackTimer: ReturnType<typeof setTimeout> | null = null;
     let pendingAckSeq = 0;
@@ -868,7 +912,22 @@ export function subscribePortalFrames(
 
     // Kick P2P probe / RTT measurement immediately on viewer open so video doesn't stall on relay backoff.
     ensureDirectLinkNow(hostId);
-    void capturePortalFrameOnce(hostId, portalId, opts).catch(() => {});
+    void capturePortalFrameOnce(hostId, portalId, opts).catch((err) => {
+      if (!alive) return;
+      consecutivePollErrors += 1;
+      const curItem = state.itemsById[portalId];
+      if (curItem && !curItem.streamError && !state.framesById[portalId] && consecutivePollErrors >= 2) {
+        ingestPortalStreamEvent(
+          {
+            kind: "portal_event",
+            action: "updated",
+            item: { ...curItem, streamError: (err as Error)?.message || "暂时无法获取远端画面" },
+            at: Date.now(),
+          },
+          hostId,
+        );
+      }
+    });
 
     const flushAck = () => {
       if (ackTimer !== null) {
@@ -905,11 +964,13 @@ export function subscribePortalFrames(
       },
       (ev) => {
         if (!alive) return;
+        const hasFrameYet = Boolean(state.framesById[portalId]);
         if (
-          (ev?.kind === "portal_frame" || ev?.kind === "portal_heartbeat") &&
-          ev.portalId === portalId
+          ev?.portalId === portalId &&
+          (ev?.kind === "portal_frame" || (ev?.kind === "portal_heartbeat" && hasFrameYet))
         ) {
           lastStreamActivityAt = Date.now();
+          consecutivePollErrors = 0;
         }
         if (ev?.kind === "portal_frame" && ev.portalId === portalId && typeof ev.seq === "number") {
           if (ev.seq > pendingAckSeq) {
@@ -926,18 +987,21 @@ export function subscribePortalFrames(
       (st) => {
         if (alive && st?.kind === "live") {
           streamLive = true;
-          if (lastStreamActivityAt === 0) lastStreamActivityAt = Date.now();
+          if (lastStreamActivityAt === 0 && state.framesById[portalId]) {
+            lastStreamActivityAt = Date.now();
+          }
         }
         if (alive && st?.kind === "error") streamLive = false;
       },
     );
 
-    // Fallback RPC poll only kicks in when push stream stops delivering frames AND heartbeats (>= 2600ms silence).
+    // Fallback RPC poll kicks in whenever no first frame has arrived OR push stream goes quiet (>= 2600ms).
     const pollInterval = Math.max(450, Math.round(1000 / Math.max(1, Math.min(4, fps))));
     let lastErrorPollAt = 0;
     const timer = setInterval(() => {
       if (!alive || busy) return;
-      if (streamLive && (lastStreamActivityAt === 0 || Date.now() - lastStreamActivityAt < 2600)) return;
+      const hasFrame = Boolean(state.framesById[portalId]);
+      if (hasFrame && streamLive && lastStreamActivityAt > 0 && Date.now() - lastStreamActivityAt < 2600) return;
       if (state.itemsById[portalId]?.streamError) {
         const now = Date.now();
         if (now - lastErrorPollAt < 4000) return;
@@ -945,7 +1009,25 @@ export function subscribePortalFrames(
       }
       busy = true;
       void capturePortalFrameOnce(hostId, portalId, opts)
-        .catch(() => {})
+        .then((res) => {
+          if (res) consecutivePollErrors = 0;
+        })
+        .catch((err) => {
+          if (!alive) return;
+          consecutivePollErrors += 1;
+          const curItem = state.itemsById[portalId];
+          if (curItem && !curItem.streamError && !state.framesById[portalId] && consecutivePollErrors >= 3) {
+            ingestPortalStreamEvent(
+              {
+                kind: "portal_event",
+                action: "updated",
+                item: { ...curItem, streamError: (err as Error)?.message || "画面流连接超时，请点击重连" },
+                at: Date.now(),
+              },
+              hostId,
+            );
+          }
+        })
         .finally(() => {
           busy = false;
         });
@@ -975,6 +1057,7 @@ export function subscribePortalFrames(
     let sinceSeq: string | undefined;
     let localSeq = 0;
     let lastIdleBeatAt = 0;
+    let consecutiveLocalMisses = 0;
     let loopTimer: ReturnType<typeof setTimeout> | null = null;
 
     const pumpLocal = () => {
@@ -992,6 +1075,11 @@ export function subscribePortalFrames(
         .then((buf) => {
           if (!alive) return;
           if (!buf || buf.byteLength < 5) {
+            consecutiveLocalMisses += 1;
+            if (consecutiveLocalMisses >= 4) {
+              startRemoteSubscription();
+              return;
+            }
             loopTimer = setTimeout(pumpLocal, 250);
             return;
           }
@@ -1009,6 +1097,7 @@ export function subscribePortalFrames(
           const h = dims ? Number(dims[2]) : (curItem?.height ?? 800);
 
           if (status === 2) {
+            consecutiveLocalMisses = 0;
             if (curItem && !curItem.streamError) {
               ingestPortalStreamEvent(
                 {
@@ -1025,9 +1114,10 @@ export function subscribePortalFrames(
           }
 
           if (status === 1) {
+            consecutiveLocalMisses = 0;
             if (seqMatch?.[1]) sinceSeq = seqMatch[1];
             const now = Date.now();
-            if (now - lastIdleBeatAt >= 400) {
+            if (localSeq > 0 && now - lastIdleBeatAt >= 400) {
               lastIdleBeatAt = now;
               ingestPortalStreamEvent(
                 {
@@ -1048,6 +1138,7 @@ export function subscribePortalFrames(
           }
 
           if (status === 0 && bytes.byteLength > metaEnd) {
+            consecutiveLocalMisses = 0;
             if (seqMatch?.[1]) sinceSeq = seqMatch[1];
             const rawCopy = bytes.slice(metaEnd);
             ingestPortalStreamEvent(
@@ -1079,7 +1170,13 @@ export function subscribePortalFrames(
             return;
           }
 
-          loopTimer = setTimeout(pumpLocal, 120);
+          consecutiveLocalMisses += 1;
+          if (consecutiveLocalMisses >= 4) {
+            // Local helper couldn't capture this window (e.g. minimized/unavailable): fall back to hostd stream.
+            startRemoteSubscription();
+            return;
+          }
+          loopTimer = setTimeout(pumpLocal, 180);
         })
         .catch(() => {
           if (!alive) return;

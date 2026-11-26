@@ -15,6 +15,14 @@ export type PaneContent =
     }
   | { kind: "web"; webId: string; url: string; title: string; spaceKey?: string | null }
   | {
+      kind: "portal";
+      hostId: string;
+      agentKey: string;
+      title: string;
+      activePortalId?: string;
+      spaceKey?: string | null;
+    }
+  | {
       kind: "diff";
       deviceId: string;
       agentKey?: string;
@@ -600,6 +608,9 @@ function isValidPaneContent(raw: unknown): raw is PaneContent {
   }
   if (c.kind === "web") {
     return typeof c.webId === "string" && typeof c.url === "string" && typeof c.title === "string";
+  }
+  if (c.kind === "portal") {
+    return typeof c.hostId === "string" && typeof c.agentKey === "string" && typeof c.title === "string";
   }
   if (c.kind === "diff") {
     return (

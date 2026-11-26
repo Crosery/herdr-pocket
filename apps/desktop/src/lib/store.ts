@@ -1,6 +1,15 @@
 import { useSyncExternalStore } from "react";
-import type { Agent, AgentStatus, ChatDisplayMode, Device, PortalDisplayMode, SpaceInfo } from "@herdr-pocket/protocol";
+import type { Agent, AgentStatus, ChatDisplayMode, Device, PortalDisplayMode, SpaceInfo, TutorialStatus } from "@herdr-pocket/protocol";
 import { STATUS_ORDER } from "@herdr-pocket/protocol";
+
+export function normalizeTutorialStatus(v: unknown): TutorialStatus {
+  return v === 2 ? 2 : v === 1 ? 1 : 0;
+}
+
+export function mergeTutorialStatus(local: TutorialStatus, server?: TutorialStatus): TutorialStatus {
+  const s = server === 2 ? 2 : server === 1 ? 1 : 0;
+  return (Math.max(local, s) as TutorialStatus);
+}
 
 export type LinkStatus = "idle" | "connecting" | "online" | "offline" | "unauthorized";
 export type ThemeChoice = "system" | "light" | "dark";
@@ -61,6 +70,8 @@ export interface AppSettings {
   showSidebarTopology: boolean;
   /** "done" once the first-run guide was finished or skipped; "later" when closed half way. */
   onboarding: "new" | "later" | "done";
+  /** Interactive first-run sandbox tutorial status: 0=unseen, 1=in-progress/dismissed, 2=completed (synced to relay). */
+  tutorialStatus: TutorialStatus;
 }
 
 export type SidebarAgentGrouping = "status" | "space" | "recent";
@@ -73,6 +84,7 @@ export interface LiveState {
   spaces: Record<string, SpaceInfo[]>;
   direct: Record<string, string>;
   rttMs?: number | null;
+  tutorialServerSynced: boolean;
   rev: number;
 }
 
@@ -119,6 +131,7 @@ function persistPrefs(s: AppSettings): void {
     sidebarStyleScheme: s.sidebarStyleScheme,
     showSidebarTopology: s.showSidebarTopology,
     onboarding: s.onboarding,
+    tutorialStatus: s.tutorialStatus,
   });
   try {
     window.PocketHarmony?.setPref?.(PREF_KEY, payload);
@@ -219,6 +232,7 @@ export const settingsStore = createStore<AppSettings>({
   showSidebarTopology: saved.showSidebarTopology ?? true,
   // Installs from before the guide existed already have a server: don't greet them as new.
   onboarding: saved.onboarding ?? (saved.lastServer ? "done" : "new"),
+  tutorialStatus: normalizeTutorialStatus(saved.tutorialStatus),
 });
 
 export function updateSettings(patch: Partial<AppSettings>): void {
@@ -257,6 +271,7 @@ export const liveStore = createStore<LiveState>({
   spaces: {},
   direct: {},
   rttMs: null,
+  tutorialServerSynced: false,
   rev: 0,
 });
 

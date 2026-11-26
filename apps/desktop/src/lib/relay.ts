@@ -17,13 +17,14 @@ import {
   type RpcResult,
   type ServerFrame,
   type StreamKind,
+  type TutorialStatus,
   type WebRtcAnswerResult,
   type WebRtcOfferParams,
 } from "@herdr-pocket/protocol";
 import { DirectError, DirectLink, SAFE_AGAIN, isHttpsOrigin } from "./direct";
 import { createIdentityProof } from "./h5Identity";
 import { localHostIdStore, refreshLocalHostIdFast } from "./fonts";
-import { liveStore, settingsStore, updateSettings } from "./store";
+import { liveStore, mergeTutorialStatus, normalizeTutorialStatus, settingsStore, updateSettings } from "./store";
 import { appVersion, clearSession, defaultDeviceName, detectPlatform, getLocalPairCode, pushSystemNotification, saveSession, type LocalPairError } from "./bridge";
 import { isMockServer, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
@@ -64,10 +65,22 @@ function shallowEqualAgent(a: Agent, b: Agent): boolean {
   }
   const aq = a.queuedItems;
   const bq = b.queuedItems;
-  if (aq === bq) return true;
-  if (!aq || !bq || aq.length !== bq.length) return false;
-  for (let i = 0; i < aq.length; i += 1) {
-    if (aq[i] !== bq[i]) return false;
+  if (aq !== bq) {
+    if (!aq || !bq || aq.length !== bq.length) return false;
+    for (let i = 0; i < aq.length; i += 1) {
+      if (aq[i] !== bq[i]) return false;
+    }
+  }
+  const ap = a.listeningPorts;
+  const bp = b.listeningPorts;
+  if (ap === bp) return true;
+  if (!ap || !bp || ap.length !== bp.length) return false;
+  for (let i = 0; i < ap.length; i += 1) {
+    const x = ap[i]!;
+    const y = bp[i]!;
+    if (x.port !== y.port || x.pid !== y.pid || x.protocol !== y.protocol || x.title !== y.title || x.url !== y.url) {
+      return false;
+    }
   }
   return true;
 }
@@ -596,11 +609,15 @@ class SocketClient {
         this.backoff = 1000;
         this.attempt = 0;
         notifyReleaseAvailable(f.latestRelease || f.serverVersion);
+        applyServerTutorialStatus(f.tutorialStatus);
         void loadAssistant();
         for (const s of this.subs.values()) {
           if (!s.via) this.openStream(s);
         }
         this.tryDirectAll(false);
+        break;
+      case "tutorial_state":
+        applyServerTutorialStatus(f.status);
         break;
       case "release_update":
         notifyReleaseAvailable(f.version);
@@ -1080,7 +1097,7 @@ export function stopRelayLink(): void {
   activeClient = null;
   currentToken = null;
   setLink("idle");
-  liveStore.set({ devices: {}, agents: {}, spaces: {}, direct: {}, rev: liveStore.get().rev + 1 });
+  liveStore.set({ devices: {}, agents: {}, spaces: {}, direct: {}, tutorialServerSynced: false, rev: liveStore.get().rev + 1 });
 }
 
 export function refreshNotifyChannel(): void {
@@ -1160,6 +1177,48 @@ export function subscribeStream(
   return activeClient.subscribe(to, stream, params, onEvent, onState);
 }
 
+export function applyServerTutorialStatus(serverStatus?: TutorialStatus): void {
+  const local = settingsStore.get().tutorialStatus;
+  if (serverStatus === 0 || serverStatus === 1 || serverStatus === 2) {
+    const merged = mergeTutorialStatus(local, serverStatus);
+    if (merged !== local) {
+      updateSettings({ tutorialStatus: merged });
+    }
+    if (local > serverStatus) {
+      void pushTutorialStatusToServer(merged, false);
+    }
+  }
+  if (!liveStore.get().tutorialServerSynced) {
+    liveStore.set({ tutorialServerSynced: true });
+  }
+}
+
+async function pushTutorialStatusToServer(status: TutorialStatus, reset = false): Promise<void> {
+  const server = settingsStore.get().server;
+  const token = currentToken;
+  if (!server || isMockServer(server) || !token) return;
+  try {
+    await restRequest<{ status: TutorialStatus }>(server, "/v1/tutorial", {
+      method: "PUT",
+      token,
+      body: JSON.stringify({ status, ...(reset ? { reset: true } : {}) }),
+      timeoutMs: 8_000,
+    });
+  } catch {
+    // Older relay without /v1/tutorial or temporarily offline: keep local status safely.
+  }
+}
+
+export async function setTutorialStatus(next: TutorialStatus, opts?: { reset?: boolean }): Promise<void> {
+  const clean = normalizeTutorialStatus(next);
+  const prev = settingsStore.get().tutorialStatus;
+  const target = opts?.reset ? clean : mergeTutorialStatus(prev, clean);
+  if (target !== prev) {
+    updateSettings({ tutorialStatus: target });
+  }
+  await pushTutorialStatusToServer(target, Boolean(opts?.reset));
+}
+
 export async function applyAuthenticatedPairResponse(serverInput: string, res: PairResponse): Promise<void> {
   const server = normalizeServer(serverInput);
   if (!server) throw new RelayError("bad_request", "请填写服务器地址");
@@ -1170,12 +1229,19 @@ export async function applyAuthenticatedPairResponse(serverInput: string, res: P
     deviceName: res.device.name,
     lastServer: isMockServer(server) ? settingsStore.get().lastServer ?? undefined : server,
   });
+  const mergedTutorial = res.tutorialStatus !== undefined
+    ? mergeTutorialStatus(settingsStore.get().tutorialStatus, res.tutorialStatus)
+    : settingsStore.get().tutorialStatus;
   updateSettings({
     server,
     deviceId: res.device.id,
     deviceName: res.device.name,
+    ...(mergedTutorial !== settingsStore.get().tutorialStatus ? { tutorialStatus: mergedTutorial } : {}),
     ...(isMockServer(server) ? {} : { lastServer: server }),
   });
+  if (res.tutorialStatus !== undefined || isMockServer(server)) {
+    liveStore.set({ tutorialServerSynced: true });
+  }
   startRelayLink(server, res.token);
 }
 

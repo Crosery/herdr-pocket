@@ -41,6 +41,7 @@ import { native } from "../lib/native";
 import {
   capturePortalFrameOnce,
   closePortalSurface,
+  formatPortalDisplayTitle,
   isLoopbackPortalUrl,
   openPortalSurface,
   portalStore,
@@ -276,7 +277,7 @@ export function PortalViewerModal({
     isMacDesktop &&
       !isRemoteHost &&
       (permNoteMatch.test(item?.streamError ?? "") ||
-        (!item && caps?.notes?.some((n) => permNoteMatch.test(n)))),
+        ((!item || (item.kind === "window" && !frame)) && caps?.notes?.some((n) => permNoteMatch.test(n)))),
   );
   const inputPermNote = caps?.inputPermissionNote;
   const needsMacAccessPerm = Boolean(isMacDesktop && !isRemoteHost && inputPermNote);
@@ -294,7 +295,7 @@ export function PortalViewerModal({
   );
   const [presetId, setPresetId] = useState<string>("hd60");
   const [showRemoteCursor, setShowRemoteCursor] = useState(true);
-  const [shortcutOpen, setShortcutOpen] = useState(true);
+  const [shortcutOpen, setShortcutOpen] = useState(false);
   const [immersive, setImmersive] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -599,6 +600,14 @@ export function PortalViewerModal({
         .join(" · ")
     : "";
 
+  const displayTitle = item ? formatPortalDisplayTitle(item) : "远程窗口与回传预览";
+  const compactStatusPill =
+    metrics.fps > 0 && !(heartbeat?.idle && metrics.fps <= 1)
+      ? `${transportLabel} · ${metrics.fps}fps${typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}`
+      : frame
+        ? `${transportLabel} · 就绪${typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}`
+        : `${transportLabel} · 等待首帧`;
+
   return (
     <PocketModal
       open={open}
@@ -606,52 +615,79 @@ export function PortalViewerModal({
         if (!next) setImmersive(false);
         onOpenChange(next);
       }}
-      width={immersive ? 1920 : 1060}
-      className={immersive ? "is-immersive" : ""}
-      hideHeader={immersive}
-      title={item ? item.title : "跨端窗口、浏览器与文件回传"}
+      width={immersive ? 1920 : 1120}
+      className={immersive ? "is-immersive is-portal" : "is-portal"}
+      hideHeader
+      title={displayTitle}
       subtitle={
         item
           ? item.egoSpace
             ? `${egoSubtitlePrefix}${item.canInteract ? ` · ${transportLabel}` : " · 仅同步 EG 空间状态"}`
-            : `${transportLabel}${caps ? ` · ${sessionLabel}` : ""}${item.subtitle ? ` · ${item.subtitle}` : ""}`
+            : `${transportLabel}${caps ? ` · ${sessionLabel}` : ""}`
           : `选择远程应用窗口、启动远程浏览器或定位远程文件（${sessionLabel}）`
       }
     >
-      <div className="portal-modal-body">
-        {hostSessionItems.length > 0 ? (
+      <div className="portal-modal-body is-clean">
+        {/* Single clean top chrome bar: tab chips or title on left, close button pinned on right */}
+        <div className="portal-modal-chrome">
           <div className="portal-modal-tabs">
-            {hostSessionItems.map((it) => (
-              <button
-                key={it.id}
-                type="button"
-                className={`portal-tab-chip${item?.id === it.id ? " active" : ""}`}
-                onClick={() => onSelectPortalId(it.id)}
-              >
-                {it.egoSpace ? (
-                  <Compass size={12} />
-                ) : it.kind === "browser" ? (
-                  <Globe size={12} />
-                ) : it.kind === "window" ? (
-                  <AppWindow size={12} />
-                ) : it.kind === "reveal" ? (
-                  <FolderSearch size={12} />
-                ) : (
-                  <FileCode2 size={12} />
-                )}
-                <span className="truncate">{it.title}</span>
-              </button>
-            ))}
-            <button
-              type="button"
-              className={`portal-tab-chip${!item ? " active" : ""}`}
-              onClick={() => onSelectPortalId(null)}
-            >
-              <Monitor size={12} />
-              <span>新建 / 选择窗口</span>
-            </button>
+            {hostSessionItems.length > 0 ? (
+              <>
+                {hostSessionItems.map((it) => {
+                  const chipLabel = formatPortalDisplayTitle(it);
+                  return (
+                    <button
+                      key={it.id}
+                      type="button"
+                      className={`portal-tab-chip${item?.id === it.id ? " active" : ""}`}
+                      title={it.url || it.title}
+                      onClick={() => onSelectPortalId(it.id)}
+                    >
+                      {it.egoSpace ? (
+                        <Compass size={12} />
+                      ) : it.kind === "browser" ? (
+                        <Globe size={12} />
+                      ) : it.kind === "window" ? (
+                        <AppWindow size={12} />
+                      ) : it.kind === "reveal" ? (
+                        <FolderSearch size={12} />
+                      ) : (
+                        <FileCode2 size={12} />
+                      )}
+                      <span className="truncate">{chipLabel}</span>
+                    </button>
+                  );
+                })}
+                <button
+                  type="button"
+                  className={`portal-tab-chip is-add${!item ? " active" : ""}`}
+                  title="新建回传或选择远程窗口"
+                  onClick={() => onSelectPortalId(null)}
+                >
+                  <Monitor size={12} />
+                  <span>新建</span>
+                </button>
+              </>
+            ) : (
+              <div className="portal-chrome-title">
+                <Monitor size={14} />
+                <span className="truncate">{displayTitle}</span>
+                <span className="portal-cap-pill">{sessionLabel}</span>
+              </div>
+            )}
           </div>
-        ) : null}
+          <PocketIconButton
+            size="sm"
+            aria-label="关闭"
+            tooltip="关闭远程窗口"
+            onClick={() => {
+              setImmersive(false);
+              onOpenChange(false);
+            }}
+          >
+            <X size={15} />
+          </PocketIconButton>
+        </div>
 
         {!item ? (
           <div className="portal-launcher">
@@ -782,9 +818,9 @@ export function PortalViewerModal({
           </div>
         ) : item.kind === "browser" || item.kind === "window" ? (
           <div className={`portal-interactive-wrap${immersive ? " is-immersive" : ""}`}>
-            <div className="portal-interactive-bar">
+            <div className="portal-interactive-bar is-compact">
               {item.kind === "browser" ? (
-                <>
+                <div className="portal-browser-nav">
                   <PocketIconButton
                     size="sm"
                     tooltip="后退"
@@ -832,21 +868,19 @@ export function PortalViewerModal({
                         <Copy size={13} />
                       </PocketIconButton>
                       {canOpenUrlLocally ? (
-                        <PocketButton
+                        <PocketIconButton
                           size="sm"
-                          variant="ghost"
+                          tooltip="在当前设备浏览器打开"
                           onClick={() => void openExternalUrl(item.url!)}
-                          title="在当前设备浏览器打开"
                         >
-                          <ExternalLink size={12} />
-                          <span>本机打开</span>
-                        </PocketButton>
+                          <ExternalLink size={13} />
+                        </PocketIconButton>
                       ) : null}
                     </>
                   ) : null}
-                </>
+                </div>
               ) : (
-                <>
+                <div className="portal-window-picker">
                   {windows.length > 0 ? (
                     <PocketSelect
                       size="sm"
@@ -863,114 +897,46 @@ export function PortalViewerModal({
                       }))}
                     />
                   ) : (
-                    <span className="portal-cap-pill truncate">{item.title}</span>
+                    <span className="portal-cap-pill truncate">{displayTitle}</span>
                   )}
-                </>
-              )}
-
-              <div className="portal-mode-seg" role="group" aria-label="操控模式">
-                <button
-                  type="button"
-                  className={`portal-mode-btn${controlMode === "pointer" ? " active" : ""}`}
-                  onClick={() => setControlMode("pointer")}
-                  title="指针直控：移动同步、点击与拖拽直达目标"
-                >
-                  <MousePointer size={12} />
-                  <span>指针</span>
-                </button>
-                <button
-                  type="button"
-                  className={`portal-mode-btn${controlMode === "trackpad" ? " active" : ""}`}
-                  onClick={() => setControlMode("trackpad")}
-                  title="触控板模式：单指划动光标、双击拖拽、双指缩放"
-                >
-                  <Hand size={12} />
-                  <span>触控板</span>
-                </button>
-                <button
-                  type="button"
-                  className={`portal-mode-btn${controlMode === "view" ? " active" : ""}`}
-                  onClick={() => setControlMode("view")}
-                  title="仅观看：锁定远端输入，避免误触"
-                >
-                  <Eye size={12} />
-                  <span>只读</span>
-                </button>
-              </div>
-
-              <PocketSelect
-                size="sm"
-                ariaLabel="画面清晰度与帧率"
-                value={presetId}
-                onValueChange={handleSelectPreset}
-                options={QUALITY_PRESETS.map((p) => ({ value: p.id, label: p.label }))}
-              />
-
-              {!transport.isDirect ? (
-                <button
-                  type="button"
-                  className="portal-cap-pill accent mono"
-                  style={{ cursor: "pointer" }}
-                  title={transport.addr ? `${transport.label} (${transport.addr})` : "当前走中继传输，点击重试 P2P 直连"}
-                  onClick={handleRetryP2p}
-                >
-                  {transportLabel} · {fpsStatusText}
-                  {typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}
-                </button>
-              ) : (
-                <span
-                  className="portal-cap-pill accent mono"
-                  title={transport.addr ? `${transport.label} (${transport.addr})` : transport.label}
-                >
-                  {transportLabel} · {fpsStatusText}
-                  {typeof rttMs === "number" ? ` · ${rttMs}ms` : ""}
-                </span>
+                </div>
               )}
 
               <div className="portal-bar-actions">
+                <PocketSelect
+                  size="sm"
+                  ariaLabel="画面清晰度与帧率"
+                  value={presetId}
+                  onValueChange={handleSelectPreset}
+                  options={QUALITY_PRESETS.map((p) => ({ value: p.id, label: p.label }))}
+                />
+
+                {!transport.isDirect ? (
+                  <button
+                    type="button"
+                    className="portal-cap-pill accent mono"
+                    style={{ cursor: "pointer" }}
+                    title={transport.addr ? `${transport.label} (${transport.addr}) · ${fpsStatusText}` : "当前走中继传输，点击重试 P2P 直连"}
+                    onClick={handleRetryP2p}
+                  >
+                    {compactStatusPill}
+                  </button>
+                ) : (
+                  <span
+                    className="portal-cap-pill accent mono"
+                    title={transport.addr ? `${transport.label} (${transport.addr}) · ${fpsStatusText}` : fpsStatusText}
+                  >
+                    {compactStatusPill}
+                  </span>
+                )}
+
                 <PocketIconButton
                   size="sm"
-                  tooltip={showRemoteCursor ? "隐藏远端原生光标" : "显示远端原生光标"}
-                  active={showRemoteCursor}
-                  onClick={handleToggleCursor}
-                >
-                  <MousePointerClick size={13} />
-                </PocketIconButton>
-                <PocketIconButton
-                  size="sm"
-                  tooltip="缩小画面"
-                  disabled={zoom <= 1}
-                  onClick={() => {
-                    const next = Math.max(1, Math.round((zoom - 0.5) * 10) / 10);
-                    setZoom(next);
-                    if (next <= 1) setPan({ x: 0, y: 0 });
-                  }}
-                >
-                  <ZoomOut size={13} />
-                </PocketIconButton>
-                <PocketIconButton
-                  size="sm"
-                  tooltip={`放大画面（当前 ${Math.round(zoom * 100)}%）`}
-                  disabled={zoom >= 4}
-                  onClick={() => setZoom((z) => Math.min(4, Math.round((z + 0.5) * 10) / 10))}
-                >
-                  <ZoomIn size={13} />
-                </PocketIconButton>
-                <PocketIconButton
-                  size="sm"
-                  tooltip={shortcutOpen ? "收起快捷按键与剪贴板栏" : "展开快捷按键与剪贴板栏"}
+                  tooltip={shortcutOpen ? "收起操控与快捷工具栏" : "展开操控、快捷键、剪贴板与文本输入"}
                   active={shortcutOpen}
                   onClick={() => setShortcutOpen((v) => !v)}
                 >
                   <Keyboard size={13} />
-                </PocketIconButton>
-                <PocketIconButton
-                  size="sm"
-                  tooltip="截图保存当前帧"
-                  disabled={!frame}
-                  onClick={handleScreenshot}
-                >
-                  <Camera size={13} />
                 </PocketIconButton>
                 <PocketIconButton
                   size="sm"
@@ -992,18 +958,6 @@ export function PortalViewerModal({
                 >
                   <Trash2 size={13} />
                 </PocketIconButton>
-                {immersive ? (
-                  <PocketIconButton
-                    size="sm"
-                    tooltip="退出远程窗口"
-                    onClick={() => {
-                      setImmersive(false);
-                      onOpenChange(false);
-                    }}
-                  >
-                    <X size={14} />
-                  </PocketIconButton>
-                ) : null}
               </div>
             </div>
 
@@ -1021,90 +975,171 @@ export function PortalViewerModal({
             ) : null}
 
             {shortcutOpen ? (
-              <div className="portal-shortcut-bar">
-                <div className="portal-shortcut-group">
-                  {MOD_OPTIONS.map((m) => (
+              <div className="portal-tool-drawer">
+                <div className="portal-tool-row">
+                  <div className="portal-mode-seg" role="group" aria-label="操控模式">
                     <button
-                      key={m.id}
                       type="button"
-                      className={`portal-mod-chip mono${latchedMods.includes(m.id) ? " active" : ""}`}
-                      onClick={() => handleToggleMod(m.id)}
-                      title="点击锁定修饰键（将在下次点击或按键后自动生效并释放）"
+                      className={`portal-mode-btn${controlMode === "pointer" ? " active" : ""}`}
+                      onClick={() => setControlMode("pointer")}
+                      title="指针直控：移动同步、点击与拖拽直达目标"
                     >
-                      {m.label}
+                      <MousePointer size={12} />
+                      <span>指针</span>
                     </button>
-                  ))}
+                    <button
+                      type="button"
+                      className={`portal-mode-btn${controlMode === "trackpad" ? " active" : ""}`}
+                      onClick={() => setControlMode("trackpad")}
+                      title="触控板模式：单指划动光标、双击拖拽、双指缩放"
+                    >
+                      <Hand size={12} />
+                      <span>触控板</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`portal-mode-btn${controlMode === "view" ? " active" : ""}`}
+                      onClick={() => setControlMode("view")}
+                      title="仅观看：锁定远端输入，避免误触"
+                    >
+                      <Eye size={12} />
+                      <span>只读</span>
+                    </button>
+                  </div>
+                  <div className="portal-shortcut-group">
+                    <PocketIconButton
+                      size="sm"
+                      tooltip={showRemoteCursor ? "隐藏远端原生光标" : "显示远端原生光标"}
+                      active={showRemoteCursor}
+                      onClick={handleToggleCursor}
+                    >
+                      <MousePointerClick size={13} />
+                    </PocketIconButton>
+                    <PocketIconButton
+                      size="sm"
+                      tooltip="缩小画面"
+                      disabled={zoom <= 1}
+                      onClick={() => {
+                        const next = Math.max(1, Math.round((zoom - 0.5) * 10) / 10);
+                        setZoom(next);
+                        if (next <= 1) setPan({ x: 0, y: 0 });
+                      }}
+                    >
+                      <ZoomOut size={13} />
+                    </PocketIconButton>
+                    <PocketIconButton
+                      size="sm"
+                      tooltip={`放大画面（当前 ${Math.round(zoom * 100)}%）`}
+                      disabled={zoom >= 4}
+                      onClick={() => setZoom((z) => Math.min(4, Math.round((z + 0.5) * 10) / 10))}
+                    >
+                      <ZoomIn size={13} />
+                    </PocketIconButton>
+                    <PocketIconButton
+                      size="sm"
+                      tooltip="截图保存当前帧"
+                      disabled={!frame}
+                      onClick={handleScreenshot}
+                    >
+                      <Camera size={13} />
+                    </PocketIconButton>
+                  </div>
+                  <div className="portal-shortcut-group" style={{ marginLeft: "auto" }}>
+                    <PocketButton
+                      size="sm"
+                      variant="soft"
+                      disabled={clipBusy}
+                      onClick={() => void handlePushClipboard()}
+                    >
+                      <ClipboardPaste size={12} />
+                      <span>推送剪贴板</span>
+                    </PocketButton>
+                    <PocketButton
+                      size="sm"
+                      variant="soft"
+                      disabled={clipBusy}
+                      onClick={() => void handlePullClipboard()}
+                    >
+                      <Clipboard size={12} />
+                      <span>拉取剪贴板</span>
+                    </PocketButton>
+                  </div>
                 </div>
-                <div className="portal-shortcut-group">
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Escape")}>
-                    Esc
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Tab")}>
-                    Tab
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Backspace")}>
-                    退格
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("a", primaryCopyMod)}>
-                    全选
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("c", primaryCopyMod)}>
-                    复制
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("v", primaryCopyMod)}>
-                    粘贴
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("z", primaryCopyMod)}>
-                    撤销
-                  </PocketButton>
-                  <PocketButton
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => sendShortcutKey("Tab", isRemoteMacHost ? ["meta"] : ["alt"])}
-                  >
-                    切换应用
-                  </PocketButton>
-                  <PocketButton
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => sendShortcutKey("ArrowUp", isRemoteMacHost ? ["ctrl"] : ["meta"])}
-                  >
-                    调度中心
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("ArrowLeft")}>
-                    左
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("ArrowUp")}>
-                    上
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("ArrowDown")}>
-                    下
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("ArrowRight")}>
-                    右
-                  </PocketButton>
-                  <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Enter")}>
-                    回车
-                  </PocketButton>
+                <div className="portal-shortcut-bar">
+                  <div className="portal-shortcut-group">
+                    {MOD_OPTIONS.map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        className={`portal-mod-chip mono${latchedMods.includes(m.id) ? " active" : ""}`}
+                        onClick={() => handleToggleMod(m.id)}
+                        title="点击锁定修饰键（将在下次点击或按键后自动生效并释放）"
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="portal-shortcut-group">
+                    <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Escape")}>
+                      Esc
+                    </PocketButton>
+                    <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Tab")}>
+                      Tab
+                    </PocketButton>
+                    <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Backspace")}>
+                      退格
+                    </PocketButton>
+                    <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("a", primaryCopyMod)}>
+                      全选
+                    </PocketButton>
+                    <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("c", primaryCopyMod)}>
+                      复制
+                    </PocketButton>
+                    <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("v", primaryCopyMod)}>
+                      粘贴
+                    </PocketButton>
+                    <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("z", primaryCopyMod)}>
+                      撤销
+                    </PocketButton>
+                    <PocketButton
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => sendShortcutKey("Tab", isRemoteMacHost ? ["meta"] : ["alt"])}
+                    >
+                      切换应用
+                    </PocketButton>
+                    <PocketButton size="sm" variant="ghost" onClick={() => sendShortcutKey("Enter")}>
+                      回车
+                    </PocketButton>
+                  </div>
                 </div>
-                <div className="portal-shortcut-group">
+                <div className="portal-quick-input-bar">
+                  <PocketInput
+                    value={keyBuffer}
+                    onChange={(e) => setKeyBuffer(e.target.value)}
+                    placeholder="发送中文或长文本输入到远端焦点窗口（Enter 发送）…"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && keyBuffer) {
+                        e.preventDefault();
+                        const text = keyBuffer;
+                        setKeyBuffer("");
+                        void sendPortalInput(item.hostId, item.id, { type: "text", text }).then(() =>
+                          sendPortalInput(item.hostId, item.id, { type: "key", key: "Enter" }),
+                        );
+                      }
+                    }}
+                  />
                   <PocketButton
                     size="sm"
                     variant="soft"
-                    disabled={clipBusy}
-                    onClick={() => void handlePushClipboard()}
+                    disabled={!keyBuffer}
+                    onClick={() => {
+                      const text = keyBuffer;
+                      setKeyBuffer("");
+                      void sendPortalInput(item.hostId, item.id, { type: "text", text });
+                    }}
                   >
-                    <ClipboardPaste size={12} />
-                    <span>推送剪贴板</span>
-                  </PocketButton>
-                  <PocketButton
-                    size="sm"
-                    variant="soft"
-                    disabled={clipBusy}
-                    onClick={() => void handlePullClipboard()}
-                  >
-                    <Clipboard size={12} />
-                    <span>拉取剪贴板</span>
+                    发送文本
                   </PocketButton>
                 </div>
               </div>
@@ -1196,36 +1231,6 @@ export function PortalViewerModal({
                 </div>
               }
             />
-
-            <div className="portal-quick-input-bar">
-              <PocketInput
-                value={keyBuffer}
-                onChange={(e) => setKeyBuffer(e.target.value)}
-                placeholder="发送中文或长文本输入到远端焦点窗口（Enter 发送）…"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && keyBuffer) {
-                    e.preventDefault();
-                    const text = keyBuffer;
-                    setKeyBuffer("");
-                    void sendPortalInput(item.hostId, item.id, { type: "text", text }).then(() =>
-                      sendPortalInput(item.hostId, item.id, { type: "key", key: "Enter" }),
-                    );
-                  }
-                }}
-              />
-              <PocketButton
-                size="sm"
-                variant="soft"
-                disabled={!keyBuffer}
-                onClick={() => {
-                  const text = keyBuffer;
-                  setKeyBuffer("");
-                  void sendPortalInput(item.hostId, item.id, { type: "text", text });
-                }}
-              >
-                发送文本
-              </PocketButton>
-            </div>
           </div>
         ) : item.kind === "reveal" ? (
           <RevealExplorer

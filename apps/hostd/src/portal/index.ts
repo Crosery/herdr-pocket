@@ -20,6 +20,7 @@ import { CdpBrowserPool } from "./cdpBrowser.ts";
 import {
   defaultQueryEgoTaskSpaces,
   ownershipToEgoPhase,
+  resolveEgoBrowserBin,
   selectMatchingEgoSpaceWindow,
   type EgoTaskSpaceEntry,
 } from "./egoSpace.ts";
@@ -483,7 +484,11 @@ export class PortalManager {
     const frameEv: PortalStreamEvent = { kind: "portal_frame", ...frame };
     this.deps.onPortalEvent(frameEv);
     for (const w of this.streamWatchers.values()) {
-      if (w.portalId === item.id || (w.agentKey && item.agentKey && w.agentKey === item.agentKey)) {
+      if (
+        w.portalId === item.id ||
+        (w.agentKey && item.agentKey && w.agentKey === item.agentKey) ||
+        (!w.portalId && !w.agentKey)
+      ) {
         w.send(frameEv);
       }
     }
@@ -521,6 +526,7 @@ export class PortalManager {
     const sess = this.browser.get(w.portalId);
     if (sess) {
       const portalId = w.portalId;
+      let initialSync = true;
       w.offBrowser = sess.onFrame((frame) => {
         const item = this.items.get(portalId);
         if (item) {
@@ -535,8 +541,14 @@ export class PortalManager {
           item.height = frame.height;
           if (item.streamError) this.syncItemStreamError(item, undefined);
         }
-        w.send({ kind: "portal_frame", ...frame });
+        const deliver = () => {
+          if (this.streamWatchers.get(wId) !== w) return;
+          this.sendFrameToWatcher(w, frame, false);
+        };
+        if (initialSync) setImmediate(deliver);
+        else deliver();
       });
+      initialSync = false;
     }
   }
 
@@ -1186,7 +1198,7 @@ export class PortalManager {
       entry.heartbeatTimer = setInterval(() => {
         if (this.streamWatchers.get(streamId) !== entry) return;
         const curItem = this.items.get(pid);
-        if (!curItem || curItem.streamError) return;
+        if (!curItem || curItem.streamError || entry.lastSentSeq <= 0) return;
         if (Date.now() - (entry.lastSentAt ?? 0) >= 550) {
           entry.send({
             kind: "portal_heartbeat",
@@ -1545,11 +1557,76 @@ export class PortalManager {
         }
       }
 
-      if (egoChanged && this.egoBindings.size > 0) {
-        void this.syncActiveEgoSpacePortals().catch(() => {});
+      if (egoChanged) {
+        if (this.egoBindings.size > 0) {
+          void this.syncActiveEgoSpacePortals().catch(() => {});
+        }
+        void this.discoverUnboundEgoAgentSpaces().catch(() => {});
       }
     } finally {
       this.windowDeltaInFlight = false;
+    }
+  }
+
+  /** Lists live Ego Lite TaskSpaces on this host so BrowserPanel & PiP can show/sync them. */
+  async listEgoSpaces(serverName?: string): Promise<{ available: boolean; spaces: PortalEgoSpaceState[] }> {
+    const hasCustomQuery = Boolean(this.deps.queryEgoTaskSpaces);
+    const available = hasCustomQuery || Boolean(resolveEgoBrowserBin());
+    if (!available) return { available: false, spaces: [] };
+    const entries = await this.queryEgoSpaces(serverName);
+    const spaces: PortalEgoSpaceState[] = entries.map((e) => ({
+      spaceId: e.id,
+      spaceName: e.name || `Space #${e.id}`,
+      ...(e.ownership ? { ownership: e.ownership } : {}),
+      phase: ownershipToEgoPhase(e.ownership),
+      ...(e.recentTabTitles?.length ? { activeTabTitle: e.recentTabTitles[e.recentTabTitles.length - 1], tabCount: e.recentTabTitles.length } : {}),
+      ...(e.profileName ? { profileName: e.profileName } : {}),
+      ...(serverName ? { serverName } : {}),
+    }));
+    return { available: true, spaces };
+  }
+
+  private baselineEgoSpaceIds: Set<number> | null = null;
+
+  /** Passively discovers newly created agent-owned Ego Lite TaskSpaces even when invoked via subagents/MCP. */
+  private async discoverUnboundEgoAgentSpaces(): Promise<void> {
+    if (!this.deps.queryEgoTaskSpaces && !resolveEgoBrowserBin()) return;
+    const allSpaces = await this.queryEgoSpaces();
+    if (this.baselineEgoSpaceIds === null) {
+      this.baselineEgoSpaceIds = new Set(allSpaces.map((s) => s.id));
+      return;
+    }
+    const claimed = new Set<number>();
+    for (const b of this.egoBindings.values()) {
+      if (b.spaceId !== undefined) claimed.add(b.spaceId);
+    }
+    const freshAgentSpaces = allSpaces.filter(
+      (s) =>
+        s.createdBy === "agent" &&
+        (s.ownership === "agent" || s.ownership === "agentDelegatedToUser") &&
+        !claimed.has(s.id) &&
+        !this.baselineEgoSpaceIds!.has(s.id),
+    );
+    if (freshAgentSpaces.length === 0) return;
+
+    const agents = this.deps.getAgents().filter((a) => !a.isShell);
+    const workingAgents = agents.filter((a) => a.status === "working" || a.status === "blocked");
+    const targetAgent = workingAgents.length === 1 ? workingAgents[0] : workingAgents[0] ?? agents[0];
+    if (!targetAgent) return;
+
+    for (const sp of freshAgentSpaces) {
+      this.baselineEgoSpaceIds.add(sp.id);
+      await this.handleEgoSpaceIntent(
+        targetAgent,
+        {
+          type: "ego_space",
+          spaceId: sp.id,
+          spaceName: sp.name || undefined,
+          action: sp.ownership === "agentDelegatedToUser" ? "等待你接管操作" : "AI 浏览器操作中",
+          handoff: sp.ownership === "agentDelegatedToUser",
+        },
+        "agent_tool",
+      ).catch(() => {});
     }
   }
 

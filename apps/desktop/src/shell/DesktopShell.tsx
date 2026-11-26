@@ -48,6 +48,7 @@ import { PocketDroplet } from "../components/PocketDroplet";
 import { AddDeviceModal } from "../views/DevicesView";
 import { CreateAgentModal } from "../views/AgentsView";
 import { SettingsFrame } from "../views/settings/SettingsFrame";
+import { openInteractiveTutorialReplay } from "../components/TutorialSandboxStage";
 import { useClientConfig, clientConfigStore } from "../lib/config";
 import { overlayStore, useToast } from "../components/PocketUI";
 import { installBrowserAiBridgeListeners } from "../lib/browserSpaces";
@@ -888,6 +889,7 @@ export function DesktopShell({
         terms: "theme dark light 外观",
         run: () => updateSettings({ theme: isDark ? "light" : "dark" }),
       },
+      { id: "tutorial-replay", group: "操作", label: "重温互动教程", icon: BookOpen, terms: "tutorial onboarding 教程 练习 新手", run: openInteractiveTutorialReplay },
       { id: "guide", group: "操作", label: "重新打开新手引导", icon: BookOpen, run: onReopenGuide },
     );
     for (const f of FRAME_ITEMS) {

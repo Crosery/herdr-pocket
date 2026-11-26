@@ -42,6 +42,21 @@ function shellTabRootNode(tab: ShellTab): SplitNode {
       },
     };
   }
+  if (tab.kind === "portal") {
+    return {
+      type: "leaf",
+      id: tab.primaryPaneId ?? `p0:${tab.id}`,
+      weight: 1,
+      content: {
+        kind: "portal",
+        hostId: tab.hostId,
+        agentKey: tab.agentKey,
+        title: tab.title,
+        ...(tab.activePortalId ? { activePortalId: tab.activePortalId } : {}),
+        ...(tab.spaceKey !== undefined ? { spaceKey: tab.spaceKey } : {}),
+      },
+    };
+  }
   return {
     type: "leaf",
     id: tab.primaryPaneId ?? `p0:${tab.id}`,

@@ -20,7 +20,7 @@ import {
 import { native, type LogFolderInfo, type Permissions } from "../../lib/native";
 import { setConfig, useClientConfig } from "../../lib/config";
 import { isMockServer } from "../../lib/mock";
-import { pingRelay } from "../../lib/relay";
+import { pingRelay, refreshHostSpaces, rpcCall } from "../../lib/relay";
 import {
   liveStore,
   relTime,
@@ -1070,12 +1070,37 @@ export function MachinesPane({
   const agents = liveStore.use((s) => s.agents);
   const { hostd, checking, recheck } = useHostdStatus();
   const [removing, setRemoving] = useState<Device | null>(null);
+  const [syncingSpaces, setSyncingSpaces] = useState<"sync" | "migrate" | null>(null);
   const status = linkLabel(link);
   const real = Boolean(server && !isMockServer(server));
   const { desktop, mobile } = useMemo(
     () => partitionDevices(devices, { myId, localHostId }),
     [devices, myId, localHostId],
   );
+  const syncTargetHost = useMemo(() => {
+    if (localHostId && devices[localHostId]?.online) return devices[localHostId]!;
+    return Object.values(devices).find((d) => d.kind === "host" && d.online) ?? null;
+  }, [devices, localHostId]);
+
+  const runSpaceSync = async (mode: "sync" | "migrate") => {
+    if (!syncTargetHost) return;
+    setSyncingSpaces(mode);
+    try {
+      const res = await rpcCall(syncTargetHost.id, "spaces.sync", { mode }, 20_000);
+      refreshHostSpaces(syncTargetHost.id);
+      if (!res.herdrAvailable) {
+        toast("未检测到正在运行的 herdr 终端（已保持 Herdr Core 空间完整）");
+      } else {
+        const parts = [`Core +${res.syncedToCore}`, `Herdr +${res.syncedToHerdr}`];
+        if (mode === "migrate") parts.push(`迁移会话 ${res.migratedAgents} 个`);
+        toast(`空间同步完成：${parts.join(" · ")}`);
+      }
+    } catch (e) {
+      toast((e as Error).message || "空间同步失败", true);
+    } finally {
+      setSyncingSpaces(null);
+    }
+  };
 
   return (
     <div className="pane">
@@ -1146,6 +1171,36 @@ export function MachinesPane({
       </div>
 
       <H5IdentityLockSection />
+
+      {syncTargetHost ? (
+        <>
+          <SetHeading>Herdr ↔ Herdr Core 空间同步</SetHeading>
+          <SetRow
+            title={`无感双向同步（${syncTargetHost.name}）`}
+            about="自动将 herdr 终端与 Herdr Core 的工作空间保持一致，并支持一键把 herdr 会话续跑迁移到 Herdr Core"
+          >
+            <span className="sf-combo">
+              <PocketButton
+                size="sm"
+                variant="soft"
+                disabled={syncingSpaces !== null}
+                onClick={() => void runSpaceSync("sync")}
+              >
+                <RefreshCw size={13} className={syncingSpaces === "sync" ? "pk-spin" : undefined} />
+                <span>{syncingSpaces === "sync" ? "同步中…" : "双向同步"}</span>
+              </PocketButton>
+              <PocketButton
+                size="sm"
+                variant="ghost"
+                disabled={syncingSpaces !== null}
+                onClick={() => void runSpaceSync("migrate")}
+              >
+                <span>{syncingSpaces === "migrate" ? "迁移中…" : "迁移会话"}</span>
+              </PocketButton>
+            </span>
+          </SetRow>
+        </>
+      ) : null}
 
       <SetHeading>桌面端</SetHeading>
       {desktop.length ? (

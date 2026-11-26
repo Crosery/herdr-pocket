@@ -8,7 +8,7 @@ import { normalizeStatus, type Agent } from "@herdr-pocket/protocol";
 import { cleanTitle } from "./util.ts";
 
 /** Subset of herdr's `AgentInfo` (src/api/schema/agents.rs). */
-interface HerdrAgentInfo {
+export interface HerdrAgentInfo {
   terminal_id: string;
   name?: string | null;
   agent?: string | null;
@@ -24,12 +24,23 @@ interface HerdrAgentInfo {
   agent_session?: { source?: string; agent?: string; kind?: string; value?: string } | null;
 }
 
+export interface HerdrWorkspaceInfo {
+  id: string;
+  label: string;
+  folder?: string;
+  active?: boolean;
+  tabs: Array<{ id: string; label?: string }>;
+}
+
 /**
  * Bridges the herdr terminal UI server over its NDJSON socket API
- * (one request per connection). Polls `agent.list`; herdr's agent list is small.
+ * (one request per connection). Polls `agent.list` and `workspace.list`; herdr's list is small.
  */
 export class HerdrAdapter extends EventEmitter {
   agents: HerdrAgentInfo[] = [];
+  workspaces: HerdrWorkspaceInfo[] = [];
+  private workspaceLabels = new Map<string, string>();
+  private tabLabels = new Map<string, string>();
   private socketPath: string;
   private timer: NodeJS.Timeout | null = null;
   private last = "";
@@ -58,19 +69,107 @@ export class HerdrAdapter extends EventEmitter {
     if (this.timer) clearInterval(this.timer);
   }
 
+  async refreshWorkspaces(): Promise<HerdrWorkspaceInfo[]> {
+    try {
+      const wr = await this.call("workspace.list", {}, 5000);
+      const rawList = Array.isArray(wr?.workspaces) ? wr.workspaces : Array.isArray(wr) ? wr : [];
+      const next: HerdrWorkspaceInfo[] = [];
+      const wsLabels = new Map<string, string>();
+      const tbLabels = new Map<string, string>();
+      for (const item of rawList) {
+        if (!item || typeof item !== "object") continue;
+        const rec = item as Record<string, unknown>;
+        const id = String(rec.id ?? rec.workspace_id ?? "").trim();
+        if (!id) continue;
+        const label = String(rec.label ?? rec.name ?? rec.title ?? id).trim() || id;
+        const folder = typeof rec.cwd === "string" && rec.cwd.trim() ? rec.cwd.trim() : typeof rec.folder === "string" && rec.folder.trim() ? rec.folder.trim() : undefined;
+        const rawTabs = Array.isArray(rec.tabs) ? rec.tabs : [];
+        const tabs: Array<{ id: string; label?: string }> = [];
+        for (const t of rawTabs) {
+          if (!t || typeof t !== "object") continue;
+          const tr = t as Record<string, unknown>;
+          const tid = String(tr.id ?? tr.tab_id ?? "").trim();
+          const tlabel = typeof tr.label === "string" && tr.label.trim() ? tr.label.trim() : typeof tr.name === "string" && tr.name.trim() ? tr.name.trim() : undefined;
+          if (tid) {
+            tabs.push({ id: tid, ...(tlabel ? { label: tlabel } : {}) });
+            if (tlabel) tbLabels.set(tid, tlabel);
+          }
+        }
+        wsLabels.set(id, label);
+        next.push({
+          id,
+          label,
+          ...(folder ? { folder } : {}),
+          ...(rec.active ? { active: true } : {}),
+          tabs,
+        });
+      }
+      this.workspaces = next;
+      this.workspaceLabels = wsLabels;
+      this.tabLabels = tbLabels;
+      return next;
+    } catch {
+      return this.workspaces;
+    }
+  }
+
+  async createWorkspace(label: string, cwd?: string): Promise<{ id?: string; label: string }> {
+    const clean = label.trim();
+    const params: Record<string, unknown> = {
+      ...(clean ? { label: clean, name: clean } : {}),
+      ...(cwd?.trim() ? { cwd: cwd.trim() } : {}),
+    };
+    const res = await this.call("workspace.create", params, 8000);
+    await this.refreshWorkspaces().catch(() => {});
+    const id = typeof res?.workspace_id === "string" ? res.workspace_id : typeof res?.id === "string" ? res.id : undefined;
+    return { ...(id ? { id } : {}), label: clean };
+  }
+
+  async renameWorkspace(workspaceId: string, label: string): Promise<void> {
+    await this.call("workspace.rename", { workspace_id: workspaceId, label: label.trim(), name: label.trim() }, 8000);
+    await this.refreshWorkspaces().catch(() => {});
+  }
+
+  resolveWorkspaceName(workspaceId?: string): string | undefined {
+    if (!workspaceId) return undefined;
+    return this.workspaceLabels.get(workspaceId) ?? workspaceId;
+  }
+
+  resolveTabName(tabId?: string): string | undefined {
+    if (!tabId) return undefined;
+    return this.tabLabels.get(tabId) ?? tabId;
+  }
+
   private async refresh(): Promise<void> {
     try {
-      const r = await this.call("agent.list", {});
+      const [r] = await Promise.all([
+        this.call("agent.list", {}),
+        this.refreshWorkspaces().catch(() => []),
+      ]);
       const agents = (r.agents ?? []) as HerdrAgentInfo[];
-      const sig = JSON.stringify(agents.map((a) => [a.terminal_id, a.agent_status, a.title, a.cwd]));
+      // Infer workspace folder from its live agents when workspace.list doesn't include cwd.
+      if (this.workspaces.length > 0 && agents.length > 0) {
+        for (const ws of this.workspaces) {
+          if (ws.folder) continue;
+          const match = agents.find((a) => a.workspace_id === ws.id && (a.foreground_cwd || a.cwd));
+          if (match) ws.folder = (match.foreground_cwd ?? match.cwd) ?? undefined;
+        }
+      }
+      const sig = JSON.stringify([
+        agents.map((a) => [a.terminal_id, a.agent_status, a.title, a.cwd, a.workspace_id, a.tab_id]),
+        this.workspaces.map((w) => [w.id, w.label, w.folder]),
+      ]);
       this.agents = agents;
       if (sig !== this.last) {
         this.last = sig;
         this.emit("change");
       }
     } catch {
-      if (this.agents.length) {
+      if (this.agents.length || this.workspaces.length) {
         this.agents = [];
+        this.workspaces = [];
+        this.workspaceLabels.clear();
+        this.tabLabels.clear();
         this.last = "";
         this.emit("change");
       }
@@ -107,8 +206,14 @@ export class HerdrAdapter extends EventEmitter {
     });
   }
 
-  static toAgent(a: HerdrAgentInfo, deviceId: string): Agent {
+  static toAgent(
+    a: HerdrAgentInfo,
+    deviceId: string,
+    labels?: { workspace?: (id?: string) => string | undefined; tab?: (id?: string) => string | undefined },
+  ): Agent {
     const harness = a.display_agent || a.agent || "agent";
+    const wsName = labels?.workspace?.(a.workspace_id) ?? a.workspace_id;
+    const tabName = labels?.tab?.(a.tab_id) ?? a.tab_id;
     return {
       key: `${deviceId}/herdr:${a.terminal_id}`,
       deviceId,
@@ -116,7 +221,7 @@ export class HerdrAdapter extends EventEmitter {
       localId: a.terminal_id,
       harness,
       title: cleanTitle(a.title ?? a.terminal_title) ?? a.name ?? undefined,
-      where: [a.workspace_id, a.tab_id].filter(Boolean).join(" / ") || undefined,
+      where: [wsName, tabName].filter(Boolean).join(" / ") || undefined,
       cwd: a.foreground_cwd ?? a.cwd ?? undefined,
       status: normalizeStatus(a.agent_status),
       isShell: false,

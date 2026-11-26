@@ -19,9 +19,12 @@ export interface ParsedAskQuestionPayload {
 }
 
 const QUESTION_TOOL_NAMES = new Set([
+  "ask",
   "ask_question",
   "askuserquestion",
   "ask_user_question",
+  "ask_user",
+  "question",
   "request_user_input",
   "ask_followup_question",
 ]);
@@ -31,7 +34,7 @@ export function isQuestionToolName(name?: string | null): boolean {
   return QUESTION_TOOL_NAMES.has(name.trim().toLowerCase());
 }
 
-const WRITE_IN_RE = /^(?:write[- ]?in|other|type something|custom|enter\s+custom|自定义|其他|自由输入|手动输入)\b/i;
+const WRITE_IN_RE = /^(?:write[- ]?in|other|type something|custom|enter\s+custom|none of the above|自定义|其他|自由输入|手动输入)\b/i;
 const RECOMMENDED_PREFIX_RE = /^(?:\(\s*recommended\s*\)|（\s*推荐\s*）|\[\s*recommended\s*\])\s*/i;
 const RECOMMENDED_SUFFIX_RE = /\s*(?:\(\s*recommended\s*\)|（\s*推荐\s*）|\[\s*recommended\s*\])$/i;
 
@@ -134,7 +137,7 @@ function coerceQuestionRecord(item: unknown): ParsedQuestionItem | null {
   return {
     ...(header ? { header } : {}),
     question,
-    multiSelect: Boolean(o.multiSelect ?? o.is_multi_select ?? o.isMultiSelect),
+    multiSelect: Boolean(o.multiSelect ?? o.is_multi_select ?? o.isMultiSelect ?? o.multi),
     options,
   };
 }
@@ -218,4 +221,196 @@ export function summarizeAskQuestionInput(input: unknown, maxLen = 84): string {
     return clipQuestionText(parsed.partialText, maxLen);
   }
   return "等待确认选项";
+}
+
+export interface SelectableChoiceLike {
+  key: string;
+  selected?: boolean;
+}
+
+export interface TerminalChoiceOption {
+  key: string;
+  label: string;
+  selected: boolean;
+  checked?: boolean;
+}
+
+const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+const NUMBERED_OPTION_RE = /^\s*([❯›>▶➜→●▸]\s*)?(\d{1,2})[.)]\s+(.+?)\s*$/;
+const RADIO_CHECK_OPTION_RE = /^\s*([❯›>▶➜→▸]\s*)?(?:(\[[ xX✓✔]\])|([●◉○◯]))\s+(.+?)\s*$/;
+const POINTER_ONLY_OPTION_RE = /^(\s*)([❯›▶▸]|>\s)(.+?)\s*$/;
+const NON_CHOICE_LINE_RE =
+  /(?:alt\+m\s+to\s+send|ctrl\+[a-z]\s+to\s+|enter\s+to\s+select|esc\s+to\s+|use\s+arrow|↑\/↓|←\/→|^\s*[●○◉◯]\s*(?:Thought\s+for|Ran\b|Explored\b|Read\b|Edited\b|Wrote\b|Updated\b|Created\b|Checked\b|Waiting\b|Working\b|Swarm\b)|^\s*\d+\/\d+\s+steps\b|\bctx\s*·\s*(?:working|idle|done)\b|^\s*[─━═┄┈-]{4,}\s*$)/i;
+const CLEAN_TRAILING_HINT_RE = /\s+\((?:esc|y|n|a|p|shift\+tab|tab)\)$/i;
+
+/**
+ * Parses live interactive choice menus from captured terminal screen lines across
+ * Claude Code, Antigravity (`agy`), Codex, Oh My Pi (`omp`), Gemini CLI, OpenCode, and DSH:
+ * 1. Numbered cursor lists (`❯ 1. ...`, `  2. ...`)
+ * 2. Unnumbered radio/checkbox lists (`❯ ○ ...` / `  ○ ...`, `❯ [ ] ...` / `  [x] ...`)
+ * 3. Unnumbered arrow-cursor lists beneath a `? ` question line (`? ...\n❯ Opt A\n  Opt B`)
+ */
+export function parseTerminalChoices(lines: readonly string[], lookback = 36): TerminalChoiceOption[] {
+  const cleaned = lines
+    .map((l) => l.replace(ANSI_SGR_RE, "").replace(/[│┃║]/g, " ").replace(/\s+$/, ""))
+    .filter((l) => l.trim().length > 0)
+    .slice(-lookback);
+  if (cleaned.length === 0) return [];
+
+  // 1. Numbered cursor option run (1, 2, 3...)
+  let bestNum: TerminalChoiceOption[] = [];
+  let runNum: TerminalChoiceOption[] = [];
+  for (const line of cleaned) {
+    if (NON_CHOICE_LINE_RE.test(line)) continue;
+    const m = NUMBERED_OPTION_RE.exec(line);
+    if (!m) continue;
+    const n = Number(m[2]);
+    if (n === 1) runNum = [];
+    if (n !== runNum.length + 1) continue;
+    const rawLabel = m[3]!.replace(CLEAN_TRAILING_HINT_RE, "");
+    const checkMatch = /^\[([ xX✓✔])\]\s*/.exec(rawLabel);
+    const checked = checkMatch ? checkMatch[1] !== " " : undefined;
+    const label = rawLabel.replace(/^\[[ xX✓✔]\]\s*/, "").trim();
+    if (!label) continue;
+    runNum.push({
+      key: String(n),
+      label,
+      selected: Boolean(m[1]),
+      ...(checked !== undefined ? { checked } : {}),
+    });
+    if (runNum.length >= 2) bestNum = [...runNum];
+  }
+  if (bestNum.length >= 2 && bestNum.length <= 9 && bestNum.some((c) => c.selected)) {
+    return bestNum;
+  }
+
+  // 2. Unnumbered radio/checkbox option cluster (`❯ ○ ...` / `  ○ ...` or `❯ [ ] ...` / `  [x] ...`)
+  let bestRadio: TerminalChoiceOption[] = [];
+  let runRadio: TerminalChoiceOption[] = [];
+  for (const line of cleaned) {
+    if (NON_CHOICE_LINE_RE.test(line)) {
+      if (runRadio.length >= 2 && runRadio.some((c) => c.selected)) bestRadio = [...runRadio];
+      runRadio = [];
+      continue;
+    }
+    const m = RADIO_CHECK_OPTION_RE.exec(line);
+    if (!m) {
+      // Allow a single indented description line inside a cluster without breaking it immediately
+      if (runRadio.length > 0 && /^\s{4,}\S/.test(line)) continue;
+      if (runRadio.length >= 2 && runRadio.some((c) => c.selected)) bestRadio = [...runRadio];
+      runRadio = [];
+      continue;
+    }
+    const pointer = Boolean(m[1]);
+    const box = m[2];
+    const radio = m[3];
+    const label = m[4]!.replace(CLEAN_TRAILING_HINT_RE, "").trim();
+    if (!label) continue;
+    const checked = box ? box[1] !== " " : radio === "●" || radio === "◉";
+    const selected = pointer || (!box && (radio === "●" || radio === "◉"));
+    runRadio.push({
+      key: String(runRadio.length + 1),
+      label,
+      selected,
+      ...(box ? { checked } : {}),
+    });
+  }
+  if (runRadio.length >= 2 && runRadio.some((c) => c.selected)) bestRadio = [...runRadio];
+  if (bestRadio.length >= 2 && bestRadio.length <= 9) {
+    return bestRadio;
+  }
+
+  // 3. Unnumbered arrow-cursor menu immediately following a `? ` prompt line (e.g. Antigravity / OMP / Inquirer)
+  let qIdx = -1;
+  for (let i = cleaned.length - 1; i >= 0; i -= 1) {
+    if (/^\s*[?？]\s+\S/.test(cleaned[i]!)) {
+      qIdx = i;
+      break;
+    }
+  }
+  if (qIdx >= 0 && qIdx < cleaned.length - 1) {
+    const afterQ = cleaned.slice(qIdx + 1);
+    const items: TerminalChoiceOption[] = [];
+    let pointerIndent: number | null = null;
+    for (const line of afterQ) {
+      if (NON_CHOICE_LINE_RE.test(line)) break;
+      if (/^\s*[?？]\s+\S/.test(line)) break;
+      const pm = POINTER_ONLY_OPTION_RE.exec(line);
+      if (pm) {
+        const label = pm[3]!.replace(CLEAN_TRAILING_HINT_RE, "").trim();
+        if (!label) continue;
+        pointerIndent = pm[1]!.length;
+        items.push({ key: String(items.length + 1), label, selected: true });
+        continue;
+      }
+      const indentMatch = /^(\s+)(\S.+?)\s*$/.exec(line);
+      if (indentMatch && (pointerIndent === null || indentMatch[1]!.length <= pointerIndent + 4)) {
+        const label = indentMatch[2]!.replace(CLEAN_TRAILING_HINT_RE, "").trim();
+        if (label) items.push({ key: String(items.length + 1), label, selected: false });
+      }
+    }
+    if (items.length >= 2 && items.length <= 9 && items.some((c) => c.selected)) {
+      return items;
+    }
+  }
+
+  return [];
+}
+
+const ARROW_NAV_HARNESSES = new Set([
+  "antigravity",
+  "agy",
+  "claude",
+  "claude-code",
+  "codex",
+  "omp",
+  "oh-my-pi",
+  "pi",
+  "gemini",
+  "gemini-cli",
+  "opencode",
+  "dsh",
+  "qoder",
+  "qwen",
+  "cursor",
+  "aider",
+  "amp",
+  "goose",
+]);
+
+/**
+ * Computes the universal terminal key sequence to select an option across all coding-agent TUIs:
+ * - Arrow-navigated TUIs (Antigravity, Claude Code, Codex, Oh My Pi, Gemini CLI, OpenCode, DSH,
+ *   or any menu with a visible cursor pointer) use relative `up`/`down` moves + `enter` (or `space`
+ *   for multi-select), preventing double-submit and preventing digits like `"1"` from leaking into
+ *   text inputs / queued prompts.
+ * - Plain non-cursor shell `select` / readline prompts fall back to `[targetKey, "enter"]`.
+ */
+export function buildChoiceSelectKeys(params: {
+  entries: readonly SelectableChoiceLike[];
+  targetKey: string;
+  harness?: string | null;
+  multiSelect?: boolean;
+  isShell?: boolean;
+  confirm?: boolean;
+}): string[] {
+  const { entries, targetKey, harness, multiSelect = false, isShell = false, confirm = true } = params;
+  const targetIdx = entries.findIndex((e) => e.key === targetKey);
+  const selectedIdx = entries.findIndex((e) => Boolean(e.selected));
+  const hasCursor = selectedIdx >= 0;
+  const normHarness = (harness ?? "").trim().toLowerCase();
+  const isArrowTui = hasCursor || (!isShell && ARROW_NAV_HARNESSES.has(normHarness));
+
+  if (isArrowTui && targetIdx >= 0) {
+    const fromIdx = hasCursor ? selectedIdx : 0;
+    const delta = targetIdx - fromIdx;
+    const keys: string[] = [];
+    const dir = delta >= 0 ? "down" : "up";
+    const steps = Math.min(20, Math.abs(delta));
+    for (let i = 0; i < steps; i += 1) keys.push(dir);
+    if (confirm) keys.push(multiSelect ? "space" : "enter");
+    return keys;
+  }
+
+  return confirm ? [targetKey, "enter"] : [targetKey];
 }

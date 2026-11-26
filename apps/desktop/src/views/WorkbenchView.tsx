@@ -40,6 +40,7 @@ import {
 } from "../components/FilePreviewRenderers";
 import { CookieImportButton } from "../components/CookieImport";
 import { RichMarkdown } from "../lib/markdown";
+import { detectCodeLanguage, renderSyntaxTokens, tokenizeCodeLines } from "../lib/syntaxHighlight";
 import { copyToClipboard, detectPlatform, openExternalUrl } from "../lib/bridge";
 import {
   decodeBase64Fast,
@@ -1179,6 +1180,11 @@ export function FileViewer({
 
   const shownText = preview && prettyJson !== null ? prettyJson : text;
   const codeLines = useMemo(() => (shownText ? shownText.split("\n") : []), [shownText]);
+  const codeLang = useMemo(() => detectCodeLanguage(data?.language, tab.path || tab.title), [data?.language, tab.path, tab.title]);
+  const tokenizedCodeLines = useMemo(
+    () => (codeLines.length > 0 ? tokenizeCodeLines(codeLines, codeLang) : []),
+    [codeLines, codeLang],
+  );
   const lines = useMemo(() => codeLines.map((_, i) => i + 1).join("\n"), [codeLines]);
 
   useLayoutEffect(() => {
@@ -1549,10 +1555,11 @@ export function FileViewer({
         ) : preview && isTextTable && textTableData ? (
           <PocketDataGrid data={textTableData} actions={compactExternalAction} />
         ) : hlStart !== undefined && codeLines.length <= 5000 ? (
-          <div className="code-lines">
+          <div className="code-lines" data-lang={codeLang}>
             {codeLines.map((lineText, idx) => {
               const ln = idx + 1;
               const isHl = hlEnd !== undefined ? ln >= hlStart && ln <= hlEnd : ln === hlStart;
+              const toks = tokenizedCodeLines[idx];
               return (
                 <div
                   key={ln}
@@ -1560,7 +1567,20 @@ export function FileViewer({
                   className={`code-line${isHl ? " hl" : ""}`}
                 >
                   <span className="code-line-num num" aria-hidden>{ln}</span>
-                  <span className="code-line-src">{lineText || " "}</span>
+                  <span className="code-line-src">{toks ? renderSyntaxTokens(toks) : (lineText || " ")}</span>
+                </div>
+              );
+            })}
+          </div>
+        ) : codeLines.length <= 5000 && codeLang !== "plain" ? (
+          <div className="code-lines" data-lang={codeLang}>
+            {codeLines.map((lineText, idx) => {
+              const ln = idx + 1;
+              const toks = tokenizedCodeLines[idx];
+              return (
+                <div key={ln} className="code-line">
+                  <span className="code-line-num num" aria-hidden>{ln}</span>
+                  <span className="code-line-src">{toks ? renderSyntaxTokens(toks) : (lineText || " ")}</span>
                 </div>
               );
             })}

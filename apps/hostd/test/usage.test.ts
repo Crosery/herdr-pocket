@@ -188,3 +188,55 @@ test("getAgentUsageReport lite mode skips quotas/models and preserves cachedSess
   assert.equal(fallbackReport.session?.contextPct, 48);
   assert.equal(computeSessionCacheHitPct({ input: 10_000, cache_read: 90_000, cache_write: 0 }), 90);
 });
+
+test("getAgentUsageReport forwards session today + recursive subagent cost, steps, and token breakdown", async () => {
+  const report = await getAgentUsageReport(baseAgent, {
+    unifloReady: true,
+    uniflo: {
+      async sessionUsage() {
+        return {
+          turns: 4,
+          steps: 18,
+          prompts: 4,
+          input: 140_000,
+          output: 26_000,
+          cacheRead: 530_000,
+          cacheWrite: 12_000,
+          reasoning: 1_200,
+          costUsd: 1.42,
+          unpricedSteps: 0,
+          todayCostUsd: 0.96,
+          todayUnpricedSteps: 0,
+          todaySteps: 12,
+          todayTokens: { input: 98_000, output: 19_000, cacheRead: 380_000, cacheWrite: 9_000 },
+          subagentCount: 3,
+          subagentSteps: 25,
+          subagentCostUsd: 0.38,
+          subagentUnpricedSteps: 1,
+          subagentTokens: { input: 46_000, output: 11_000, cacheRead: 160_000, cacheWrite: 4_000 },
+          todaySubagentCostUsd: 0.31,
+          todaySubagentSteps: 19,
+          todaySubagentTokens: { input: 39_000, output: 9_500, cacheRead: 138_000, cacheWrite: 3_000 },
+          model: "gpt-6.2-astra",
+          models: [],
+        };
+      },
+      async usage() {
+        return { rows: [], total: { key: "total", label: "total", sessions: 0, steps: 0, prompts: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 } };
+      },
+    },
+    async readOmpQuotas() {
+      return [];
+    },
+  });
+
+  assert.equal(report.session?.todayCostUsd, 0.96);
+  assert.equal(report.session?.todaySteps, 12);
+  assert.equal(report.session?.todayTokens?.input, 98_000);
+  assert.equal(report.session?.subagentCount, 3);
+  assert.equal(report.session?.subagentCostUsd, 0.38);
+  assert.equal(report.session?.subagentUnpricedSteps, 1);
+  assert.deepEqual(report.session?.subagentTokens, { input: 46_000, output: 11_000, cacheRead: 160_000, cacheWrite: 4_000 });
+  assert.equal(report.session?.todaySubagentCostUsd, 0.31);
+  assert.equal(report.session?.todaySubagentSteps, 19);
+});

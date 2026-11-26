@@ -1,11 +1,14 @@
 import { Suspense, lazy, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, Bell, Check, ChevronDown, Columns2, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, HelpCircle, Keyboard, Laptop, Layers, Maximize2, MessageSquare, Minimize2, Pencil, Plus, Rows2, ScreenShare, Search, ShieldAlert, Sparkles, SquareArrowOutUpRight, Terminal, Trash2, X } from "lucide-react";
-import type { Agent, ConvEvent, SubSession } from "@herdr-pocket/protocol";
+import { AlertTriangle, Bell, Check, ChevronDown, Columns2, Compass, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, HelpCircle, Keyboard, Laptop, Layers, Maximize2, MessageSquare, Minimize2, MoreHorizontal, PanelTop, Pencil, Plus, Rows2, ScreenShare, Search, ShieldAlert, Sparkles, SquareArrowOutUpRight, Terminal, Trash2, X } from "lucide-react";
+import type { Agent, ConvEvent, PortalEgoSpaceState, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketInput, PocketModal, PocketSelect, overlayStore, useToast } from "../components/PocketUI";
+import { AgentPortsPopover } from "../components/AgentPortsPopover";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood, resolveVendor } from "../components/MascotAndVendor";
+import { PortalTabPane } from "../components/PortalTabPane";
+import { PortalViewerModal } from "../components/PortalViewerModal";
 import { serverLabel } from "../components/Sidebar";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
 import { prettyHotkey } from "../components/VoiceInput";
@@ -55,6 +58,7 @@ import { registerMountedTabsCounter, reportSplitTransitionPerf } from "../lib/pe
 import { resizeSplitPair, type CssRect, type SplitNode, type UnitRect } from "./splitTree";
 import { native } from "../lib/native";
 import { openAgentFileTarget } from "../lib/openFileTarget";
+import { openPortalSurface } from "../lib/portalClient";
 import { pingRelay, refreshHostSpaces, rpcCall, subscribeStream } from "../lib/relay";
 import { agentSpace, agentTitle, allAgents, createStore, findAgent, liveStore, lookupAgentByKey, settingsStore, spacedTitle } from "../lib/store";
 import { dismissVoiceMessage, hangupVoiceCall, startVoiceCall, voiceCallStore } from "../lib/voiceCall";
@@ -98,6 +102,7 @@ import {
   togglePanel,
   toggleZoomTabPane,
   unsplitTabToTabs,
+  updatePortalTabActive,
   updateWebPane,
   visibleTabsForSpace,
   type AgentPaneMode,
@@ -489,9 +494,11 @@ const TabChip = memo(function TabChip({
               : title
             : primaryContent.kind === "file"
               ? primaryContent.path
-              : primaryContent.kind === "diff"
-                ? `${primaryContent.path} (${primaryContent.staged ? "已暂存" : "工作区"})`
-                : primaryContent.url
+                : primaryContent.kind === "diff"
+                  ? `${primaryContent.path} (${primaryContent.staged ? "已暂存" : "工作区"})`
+                  : primaryContent.kind === "portal"
+                    ? primaryContent.title
+                    : primaryContent.url
       }
       onClick={() => {
         if (!isRenaming) setActiveTab(tab.id);
@@ -519,6 +526,8 @@ const TabChip = memo(function TabChip({
         <FileText size={14} />
       ) : primaryContent.kind === "diff" ? (
         <GitBranch size={14} />
+      ) : primaryContent.kind === "portal" ? (
+        <PanelTop size={14} />
       ) : (
         <Globe size={14} />
       )}
@@ -1385,6 +1394,11 @@ function PaneHead({
     name = content.title;
     sub = content.commit ? `提交 ${content.commit.slice(0, 7)}` : content.staged ? "暂存区变更" : "工作区变更";
     subTitle = content.path;
+  } else if (content.kind === "portal") {
+    icon = <PanelTop size={14} />;
+    name = content.title;
+    sub = agent ? spacedTitle(agent) : "实时预览合集";
+    subTitle = sub;
   } else {
     icon = <Globe size={14} />;
     name = content.title === "about:blank" ? "新网页" : content.title;
@@ -1469,8 +1483,10 @@ function PaneHead({
       <div className="v3-pane-right">
         {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
         {sizeText ? <span className="v3-pane-pill num">{sizeText}</span> : null}
-        {content.kind === "agent" && group && group !== "idle" && group !== "offline" ? <StatusMark group={group} /> : null}
         {content.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
+        {content.kind === "agent" && agent && !inSubView && (agent.listeningPorts?.length ?? 0) > 0 ? (
+          <AgentPortsPopover agent={agent} tabId={tabId} paneId={paneId} />
+        ) : null}
         {content.kind === "agent" && agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
           <SubagentCatalogTrigger
             compact
@@ -1549,7 +1565,7 @@ function PaneHead({
           {content.kind === "agent" && agent && mode && onModeChange ? (
             <button
               type="button"
-              className="v3-icon-btn small has-hint"
+              className="v3-icon-btn small has-hint v3-act-mode"
               aria-label={oppositeMode === "chat" ? "切换到对话视图" : "切换到终端视图"}
               title={`${
                 oppositeMode === "chat"
@@ -1572,7 +1588,7 @@ function PaneHead({
           {content.kind === "agent" && agent ? (
             <button
               type="button"
-              className="v3-icon-btn small"
+              className="v3-icon-btn small v3-act-secondary"
               aria-label="跨端窗口、浏览器与文件回传"
               title="跨端窗口、浏览器与文件回传（P2P）"
               onClick={() => {
@@ -1591,7 +1607,7 @@ function PaneHead({
           {content.kind === "agent" && agent && mode === "term" ? (
             <button
               type="button"
-              className="v3-icon-btn small"
+              className="v3-icon-btn small v3-act-secondary"
               aria-label="在终端中搜索"
               title={`在终端中搜索（${shortcutText("terminalSearch")}）`}
               onClick={() => {
@@ -1606,7 +1622,7 @@ function PaneHead({
           {content.kind === "file" ? (
             <button
               type="button"
-              className="v3-icon-btn small"
+              className="v3-icon-btn small v3-act-secondary"
               aria-label="复制路径"
               title={`复制路径（${content.absPath || content.path}）`}
               onClick={() => {
@@ -1618,7 +1634,7 @@ function PaneHead({
           ) : null}
           <button
             type="button"
-            className="v3-icon-btn small has-hint"
+            className="v3-icon-btn small has-hint v3-act-split"
             aria-label="向右分屏"
             title={`向右分屏（${shortcutText("splitRight")}）`}
             onClick={() => onSplitNewTerminal(tabId, paneId, "right")}
@@ -1628,7 +1644,7 @@ function PaneHead({
           </button>
           <button
             type="button"
-            className="v3-icon-btn small has-hint"
+            className="v3-icon-btn small has-hint v3-act-split"
             aria-label="向下分屏"
             title={`向下分屏（${shortcutText("splitDown")}）`}
             onClick={() => onSplitNewTerminal(tabId, paneId, "down")}
@@ -1639,7 +1655,7 @@ function PaneHead({
           {isSplit || isZoomed ? (
             <button
               type="button"
-              className={`v3-icon-btn small has-hint${isZoomed ? " on" : ""}`}
+              className={`v3-icon-btn small has-hint v3-act-zoom${isZoomed ? " on" : ""}`}
               aria-label={isZoomed ? "还原分屏布局" : "最大化此分屏"}
               title={`${isZoomed ? "还原分屏布局" : "最大化此分屏"}（${shortcutText("zoomPane")}）`}
               onClick={onToggleZoom}
@@ -1650,7 +1666,20 @@ function PaneHead({
           ) : null}
           <button
             type="button"
-            className="v3-icon-btn small has-hint"
+            className="v3-icon-btn small v3-act-more"
+            aria-label="更多分屏操作"
+            title="更多操作（分屏 / 跨端回传 / 缩放）"
+            onClick={(e) => {
+              const r = e.currentTarget.getBoundingClientRect();
+              setPaneMenu(paneMenu ? null : { x: r.left, y: r.bottom + 4 });
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <MoreHorizontal size={13} />
+          </button>
+          <button
+            type="button"
+            className="v3-icon-btn small has-hint v3-act-close"
             aria-label={isSplit ? "关闭此分屏" : "关闭标签"}
             title={`${isSplit ? "关闭此分屏" : "关闭标签"}（${shortcutText("closeTab")}）`}
             onClick={onClose}
@@ -1978,13 +2007,19 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
 }) {
   const { leaf, visible, css } = item;
   const { content } = leaf;
-  const agentKey = content.kind === "agent" || content.kind === "file" ? content.agentKey : content.kind === "diff" ? content.agentKey : undefined;
+  const agentKey =
+    content.kind === "agent" || content.kind === "file" || content.kind === "portal"
+      ? content.agentKey
+      : content.kind === "diff"
+        ? content.agentKey
+        : undefined;
   const agent = useAgent(agentKey);
   const hostDeviceId = agentKey ? (agentKey.split("/")[0] ?? "") : "";
   const hostOffline = liveStore.use((s) => (hostDeviceId ? s.devices[hostDeviceId]?.online === false : false));
   const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
   const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
   const [dropZone, setDropZone] = useState<SplitDropZone | null>(null);
+  const [expandedPortalModal, setExpandedPortalModal] = useState<{ hostId: string; portalId: string | null; agent?: Agent } | null>(null);
   const slotSelectionCleanupRef = useRef<(() => void) | null>(null);
   useEffect(() => () => {
     slotSelectionCleanupRef.current?.();
@@ -2227,6 +2262,19 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
                 tab={{ id: leaf.id, ...content }}
               />
             </PocketErrorBoundary>
+          ) : content.kind === "portal" ? (
+            <PocketErrorBoundary resetKey={paneKey} title="预览合集加载出错">
+              <PortalTabPane
+                hostId={content.hostId}
+                agentKey={content.agentKey}
+                agent={agent}
+                activePortalId={content.activePortalId}
+                onSelectPortalId={(pid) => updatePortalTabActive(tabId, leaf.id, pid)}
+                onExpandModal={(pid, hid) => {
+                  setExpandedPortalModal({ hostId: hid, portalId: pid, agent });
+                }}
+              />
+            </PocketErrorBoundary>
           ) : content.kind === "web" ? (
             <PocketErrorBoundary resetKey={paneKey} title="网页加载出错">
               <WebPane
@@ -2274,6 +2322,20 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
           </div>
         ) : null}
       </section>
+      {expandedPortalModal ? (
+        <PortalViewerModal
+          open
+          onOpenChange={(next) => {
+            if (!next) setExpandedPortalModal(null);
+          }}
+          hostId={expandedPortalModal.hostId}
+          agent={expandedPortalModal.agent}
+          activePortalId={expandedPortalModal.portalId}
+          onSelectPortalId={(pid) =>
+            setExpandedPortalModal((prev) => (prev ? { ...prev, portalId: pid } : null))
+          }
+        />
+      ) : null}
     </div>
   );
 });
@@ -2991,23 +3053,54 @@ function BrowserPanel({
   url?: string;
   onMetaChange: (meta: { url: string; title: string }) => void;
 }) {
+  const toast = useToast();
   const homePage = useClientConfig().browser.homePage;
   const bState = useBrowserSpaces();
   const activeSpace = bState.spaces.find((s) => s.id === bState.activeSpaceId) ?? bState.spaces[0]!;
   const activeTab = activeSpace.tabs.find((t) => t.id === activeSpace.activeTabId) ?? activeSpace.tabs[0]!;
   const [addingSpace, setAddingSpace] = useState(false);
   const [spaceDraft, setSpaceDraft] = useState("");
+  const [egoSpaces, setEgoSpaces] = useState<PortalEgoSpaceState[]>([]);
+  const localHostId = useLocalHostDeviceId();
+  const devices = liveStore.use((s) => s.devices);
+  const activeShellTab = shellStore.use((s) => s.tabs.find((t) => t.id === s.active));
 
-  const spaceOptions = useMemo(
-    () =>
-      bState.spaces.map((sp) => ({
-        value: sp.id,
-        label: sp.name,
-        badge: sp.kind === "ai" ? "AI" : `${sp.tabs.length}`,
-        tone: (sp.kind === "ai" ? "accent" : "default") as "accent" | "default",
-      })),
-    [bState.spaces],
-  );
+  const targetHostId = useMemo(() => {
+    if (localHostId && devices[localHostId]?.online) return localHostId;
+    return Object.values(devices).find((d) => d.kind === "host" && d.online)?.id ?? "";
+  }, [devices, localHostId]);
+
+  const activeAgentKey = useMemo(() => {
+    if (!activeShellTab) return undefined;
+    const f = focusedLeafOfTab(activeShellTab).content;
+    if (f.kind === "agent") return f.agentKey;
+    return tabLeaves(activeShellTab).find((l) => l.content.kind === "agent")?.content.kind === "agent"
+      ? (tabLeaves(activeShellTab).find((l) => l.content.kind === "agent")!.content as { agentKey: string }).agentKey
+      : undefined;
+  }, [activeShellTab]);
+
+  useEffect(() => {
+    if (!targetHostId) {
+      setEgoSpaces([]);
+      return;
+    }
+    let alive = true;
+    const poll = () => {
+      void rpcCall(targetHostId, "portal.egoSpaces", {}, 5_000)
+        .then((res) => {
+          if (alive && res?.available && Array.isArray(res.spaces)) {
+            setEgoSpaces(res.spaces);
+          }
+        })
+        .catch(() => {});
+    };
+    poll();
+    const t = window.setInterval(poll, 6_000);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [targetHostId]);
 
   const submitNewSpace = () => {
     createUserBrowserSpace(spaceDraft.trim() || undefined, homePage || "about:blank");
@@ -3015,51 +3108,89 @@ function BrowserPanel({
     setAddingSpace(false);
   };
 
+  const launchEgoFloatingWindow = (sp: PortalEgoSpaceState) => {
+    if (!targetHostId) return;
+    void openPortalSurface(targetHostId, {
+      ...(activeAgentKey ? { agent: activeAgentKey } : {}),
+      kind: "window",
+      title: `EG 空间 · ${sp.spaceName}`,
+    })
+      .then(() => toast(`已弹出 Ego 空间「${sp.spaceName}」实时小浮窗`))
+      .catch((e: Error) => toast(e.message || "弹出 Ego 小浮窗失败", true));
+  };
+
   return (
     <div className="v3-panel-web">
-      <div className="v3-bspace-bar">
-        <div className="v3-bspace-select">
-          <PocketSelect
-            size="sm"
-            value={activeSpace.id}
-            onValueChange={(id) => selectBrowserSpace(id)}
-            options={spaceOptions}
-            ariaLabel="选择浏览空间"
-          />
+      <div className="v3-bspace-strip" role="tablist" aria-label="浏览空间">
+        <div className="v3-bspace-pills">
+          {bState.spaces.map((sp) => {
+            const isCur = sp.id === activeSpace.id;
+            return (
+              <div key={sp.id} className={`v3-bspace-pill${isCur ? " active" : ""}${sp.kind === "ai" ? " is-ai" : ""}`}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={isCur}
+                  className="v3-bspace-pill-btn"
+                  title={`${sp.name}（${sp.tabs.length} 个标签页）`}
+                  onClick={() => selectBrowserSpace(sp.id)}
+                >
+                  {sp.kind === "ai" ? <Sparkles size={11} /> : <Compass size={11} />}
+                  <span className="truncate">{sp.name}</span>
+                  <span className="v3-bspace-count num">{sp.tabs.length}</span>
+                </button>
+                {sp.id !== "default" ? (
+                  <button
+                    type="button"
+                    className="v3-bspace-pill-x"
+                    aria-label={`关闭浏览空间 ${sp.name}`}
+                    title={`关闭空间 ${sp.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteBrowserSpace(sp.id);
+                    }}
+                  >
+                    <X size={10} />
+                  </button>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
         <button
           type="button"
           className="v3-icon-btn small"
           aria-label="新建浏览空间"
-          title="新建浏览空间"
+          title="新建浏览空间（隔离 Cookie / 任务分组）"
           onClick={() => setAddingSpace((v) => !v)}
         >
           <Plus size={13} />
         </button>
-        {activeSpace.id !== "default" ? (
-          <button
-            type="button"
-            className="v3-icon-btn small"
-            aria-label="关闭当前浏览空间"
-            title="关闭当前浏览空间"
-            onClick={() => deleteBrowserSpace(activeSpace.id)}
-          >
-            <Trash2 size={13} />
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="v3-mini-btn v3-bspace-pop"
-          onClick={() => {
-            openWebTab(activeTab.url, activeTab.title || activeTab.url);
-            showPanel(null);
-          }}
-          title="在顶部标签页打开此网页，或直接拖动标题栏放入"
-        >
-          <SquareArrowOutUpRight size={12} />
-          <span>放入标签栏</span>
-        </button>
       </div>
+
+      {egoSpaces.length > 0 ? (
+        <div className="v3-ego-live-strip" role="region" aria-label="Ego 实时任务空间">
+          <span className="v3-ego-live-label">
+            <Compass size={11} />
+            <span>Ego 空间</span>
+          </span>
+          <div className="v3-ego-live-list">
+            {egoSpaces.map((sp) => (
+              <button
+                key={sp.spaceId ?? sp.spaceName}
+                type="button"
+                className={`v3-ego-chip${sp.phase === "handoff" ? " handoff" : ""}`}
+                title={`${sp.spaceName}${sp.lastAction ? ` · ${sp.lastAction}` : ""}（点击弹出实时小浮窗）`}
+                onClick={() => launchEgoFloatingWindow(sp)}
+              >
+                <span className={`v3-ego-dot ${sp.phase}`} aria-hidden />
+                <span className="truncate">{sp.spaceName}</span>
+                <span className="v3-ego-chip-act">小浮窗</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       {addingSpace ? (
         <form
@@ -3385,6 +3516,20 @@ function ShellPanelOpen({ panel }: { panel: PanelId }) {
         )}
         <span className={`v3-pane-name${showSub ? "" : " grow"}`}>{PANEL_TITLE[panel]}</span>
         {showSub ? <span className="v3-pane-sub grow truncate" title={subTitleText}>{subTitleText}</span> : null}
+        {panel === "browser" ? (
+          <button
+            type="button"
+            className="v3-icon-btn small"
+            aria-label="移入顶部标签页"
+            title="在顶部标签页打开当前网页（也可直接拖动标题栏放入）"
+            onClick={() => {
+              openWebTab(browserMeta.url || homePage || "about:blank", browserMeta.title || browserMeta.url || "网页");
+              showPanel(null);
+            }}
+          >
+            <SquareArrowOutUpRight size={13} />
+          </button>
+        ) : null}
         <button className="v3-icon-btn small" aria-label="关闭面板" onClick={() => showPanel(null)}>
           <X size={13} />
         </button>
@@ -3878,34 +4023,39 @@ export function PeekOverlay() {
               <span className="v3-pane-sub truncate">{agent ? homeFolder(agent.cwd) : ""}</span>
             </>
           )}
-          {agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
-            <SubagentCatalogTrigger
-              compact
-              deviceId={agent.deviceId}
-              agentKey={agent.key}
-              knownCount={subHead.knownCount}
-              subs={subHead.rootSubs}
-              onSelectSub={subHead.onSelectSub}
-              onOpenAside={subHead.onOpenAside}
-              onRefresh={subHead.onRefresh}
-            />
-          ) : null}
-          {agent ? (
-            <ModeSwitchIcons
-              mode={mode}
-              onModeChange={setPeekMode}
-              termAttention={Boolean(agent.subscreen) || agent.status === "blocked"}
-            />
-          ) : null}
-          {agent ? (
-            <button className="v3-mini-btn" onClick={() => openAgentTab(agent.key, mode)}>
-              <ExternalLink size={12} />
-              <span>保留为标签</span>
+          <div className="v3-pane-right">
+            {agent && !inSubView && (agent.listeningPorts?.length ?? 0) > 0 ? (
+              <AgentPortsPopover agent={agent} />
+            ) : null}
+            {agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
+              <SubagentCatalogTrigger
+                compact
+                deviceId={agent.deviceId}
+                agentKey={agent.key}
+                knownCount={subHead.knownCount}
+                subs={subHead.rootSubs}
+                onSelectSub={subHead.onSelectSub}
+                onOpenAside={subHead.onOpenAside}
+                onRefresh={subHead.onRefresh}
+              />
+            ) : null}
+            {agent ? (
+              <ModeSwitchIcons
+                mode={mode}
+                onModeChange={setPeekMode}
+                termAttention={Boolean(agent.subscreen) || agent.status === "blocked"}
+              />
+            ) : null}
+            {agent ? (
+              <button className="v3-mini-btn" onClick={() => openAgentTab(agent.key, mode)}>
+                <ExternalLink size={12} />
+                <span>保留为标签</span>
+              </button>
+            ) : null}
+            <button className="v3-icon-btn small" aria-label="关闭预览" title="关闭（Esc）" onClick={() => setPeek(null)}>
+              <X size={13} />
             </button>
-          ) : null}
-          <button className="v3-icon-btn small" aria-label="关闭预览" title="关闭（Esc）" onClick={() => setPeek(null)}>
-            <X size={13} />
-          </button>
+          </div>
         </div>
         <div className="v3-pane-body">
           {agent ? (

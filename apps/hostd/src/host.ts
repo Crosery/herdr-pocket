@@ -10,10 +10,12 @@ import {
   parseAgentKey,
   rowsChange,
   type Agent,
+  type AgentListeningPort,
   type AgentSource,
   type ConvEvent,
   type HerdrDoc,
   type LayoutSpace,
+  type SpaceInfo,
   type Device,
   type ClientFrame,
   type PortalBinaryFrameMeta,
@@ -53,6 +55,8 @@ import { scanAgentSlashCommands } from "./slash.ts";
 import { askAgentBtw } from "./btw.ts";
 import { getAgentModels, setAgentModelAndThinking } from "./models.ts";
 import { getAgentUsageReport } from "./usage.ts";
+import { scanAgentListeningPorts, stopAgentListeningPort } from "./ports.ts";
+import { mergeHerdrWorkspacesIntoSpaces, syncSpacesBidirectional } from "./spaceBridge.ts";
 import { BrowserPluginError, getBrowserStatus, runBrowserAct, shutdownBrowserPluginCdp } from "./browserPlugin.ts";
 import { run } from "./util.ts";
 import { changedKeys } from "./configcmd.ts";
@@ -73,6 +77,8 @@ const MUTATING = new Set([
   "terminal.putAbort",
   "agent.create",
   "agent.setModel",
+  "agent.ports",
+  "spaces.sync",
   "space.delete",
   "terminal.interrupt",
   "terminal.kill",
@@ -174,6 +180,13 @@ export class Host {
   private streamReply = new Map<string, (f: ClientFrame) => void>();
   private streamReplyBinary = new Map<string, { send: (bytes: Uint8Array) => void; wireId: string }>();
   private streamPeerBufferedBytes = new Map<string, () => number>();
+  private streamSentPortalFrame = new Set<string>();
+  private agentPortsByKey = new Map<string, AgentListeningPort[]>();
+  private agentPortsSig = "";
+  private portsTimer: NodeJS.Timeout | null = null;
+  private portsInFlight = false;
+  private lastSpaceBridgeAt = 0;
+  private spaceBridgeInFlight = false;
   /** Phones connected straight to this computer (see direct.ts). */
   direct: DirectServer;
   webrtc: WebRtcDirectServer;
@@ -461,6 +474,9 @@ export class Host {
     );
     this.screenQueueTimer = setInterval(() => void this.refreshScreenQueues(), this.screenQueueMs);
     this.screenQueueTimer.unref?.();
+    this.portsTimer = setInterval(() => void this.refreshListeningPorts(), 4_000);
+    this.portsTimer.unref?.();
+    void this.refreshListeningPorts();
     const hook = await this.portal.startHookAndShims().catch(() => null);
     if (hook?.execWrapper) this.app.execWrapper = hook.execWrapper;
     await this.startDirect();
@@ -563,6 +579,7 @@ export class Host {
     this.stopTelemetry = null;
     if (this.waitTimer) clearInterval(this.waitTimer);
     if (this.screenQueueTimer) clearInterval(this.screenQueueTimer);
+    if (this.portsTimer) clearInterval(this.portsTimer);
     this.flushLogs();
     this.hc.stop();
     this.herdr.stop();
@@ -576,6 +593,7 @@ export class Host {
     this.streamStops.clear();
     this.streamMeta.clear();
     this.streamReply.clear();
+    this.streamSentPortalFrame.clear();
     this.ws?.close();
   }
 
@@ -640,21 +658,84 @@ export class Host {
       agents.push(a);
     }
     this.sessionHints.prune(live);
-    for (const info of this.herdr.agents) agents.push(HerdrAdapter.toAgent(info, id));
+    const herdrLabels = {
+      workspace: (wsId?: string) => this.herdr.resolveWorkspaceName(wsId),
+      tab: (tabId?: string) => this.herdr.resolveTabName(tabId),
+    };
+    for (const info of this.herdr.agents) agents.push(HerdrAdapter.toAgent(info, id, herdrLabels));
     const enriched = this.waits.decorate(this.uniflo.enrich(agents, pids, hints, created, statusMsgs));
-    if (!this.subscreenByAgent.size) return enriched;
-    const liveKeys = new Set(enriched.map((a) => a.key));
-    for (const k of [...this.subscreenByAgent.keys()]) {
-      if (!liveKeys.has(k)) this.subscreenByAgent.delete(k);
+    if (this.subscreenByAgent.size) {
+      const liveKeys = new Set(enriched.map((a) => a.key));
+      for (const k of [...this.subscreenByAgent.keys()]) {
+        if (!liveKeys.has(k)) this.subscreenByAgent.delete(k);
+      }
     }
     return enriched.map((a) => {
-      if (a.status === "blocked" || a.statusKind) {
-        this.subscreenByAgent.delete(a.key);
-        return a;
+      const ports = this.agentPortsByKey.get(a.key);
+      let next = ports && ports.length > 0 ? { ...a, listeningPorts: ports } : a;
+      if (next.status === "blocked" || next.statusKind) {
+        this.subscreenByAgent.delete(next.key);
+        return next;
       }
-      const sub = this.subscreenByAgent.get(a.key);
-      return sub ? { ...a, subscreen: sub } : a;
+      const sub = this.subscreenByAgent.get(next.key);
+      return sub ? { ...next, subscreen: sub } : next;
     });
+  }
+
+  private async refreshListeningPorts(): Promise<void> {
+    if (this.stopped || this.portsInFlight) return;
+    if (!this.agents.length || this.hc.terminals.size === 0) {
+      if (this.agentPortsByKey.size > 0) {
+        this.agentPortsByKey.clear();
+        this.agentPortsSig = "";
+        this.publish();
+      }
+      return;
+    }
+    this.portsInFlight = true;
+    try {
+      const excludedPorts = new Set<number>([7311]);
+      if (this.direct.port) excludedPorts.add(this.direct.port);
+      const scanned = await scanAgentListeningPorts(this.agents, this.hc.terminals, { excludedPorts });
+      const sig = JSON.stringify(
+        [...scanned.entries()]
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([k, list]) => [k, list.map((p) => [p.port, p.pid, p.protocol, p.title ?? ""])]),
+      );
+      this.agentPortsByKey = scanned;
+      if (sig !== this.agentPortsSig) {
+        this.agentPortsSig = sig;
+        this.publish();
+      }
+    } catch {
+      // keep previous snapshot on transient ps/lsof failure
+    } finally {
+      this.portsInFlight = false;
+    }
+  }
+
+  private scheduleBackgroundSpaceBridge(): void {
+    if (this.stopped || this.opts.readOnly || this.spaceBridgeInFlight) return;
+    if (!this.sources.includes("hc") || !this.sources.includes("herdr")) return;
+    if (Date.now() - this.lastSpaceBridgeAt < 15_000) return;
+    this.spaceBridgeInFlight = true;
+    this.lastSpaceBridgeAt = Date.now();
+    void syncSpacesBidirectional({
+      core: this.hc,
+      herdr: this.herdr,
+      herdrAvailable: true,
+      mirrorToHerdr: true,
+    })
+      .then((res) => {
+        if (res.syncedToCore > 0 || res.syncedToHerdr > 0) {
+          this.note("info", "spaces", `background space bridge synced core:+${res.syncedToCore} herdr:+${res.syncedToHerdr}`);
+          void this.refreshNames().then(() => this.publish());
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.spaceBridgeInFlight = false;
+      });
   }
 
   private publishNow(): void {
@@ -853,10 +934,11 @@ export class Host {
     const ev = event as { kind?: string; seq?: number } | null;
     if (ev?.kind === "portal_frame") {
       const pf = event as PortalFramePayload & { kind: "portal_frame" };
+      const isFirstForStream = this.streamSentPortalFrame ? !this.streamSentPortalFrame.has(id) : (pf.seq ?? 0) <= 1;
       const binTarget = this.streamReplyBinary?.get(id);
       if (binTarget) {
-        if ((pf.seq ?? 0) > 1) {
-          const buffered = this.streamPeerBufferedBytes.get(id)?.() ?? 0;
+        if (!isFirstForStream && (pf.seq ?? 0) > 1) {
+          const buffered = this.streamPeerBufferedBytes?.get(id)?.() ?? 0;
           if (buffered > 512 * 1024) return;
         }
         const imageBytes = pf.rawBytes
@@ -868,11 +950,12 @@ export class Host {
           const { kind: _k, data: _d, rawBytes: _r, ...restMeta } = pf;
           const meta: PortalBinaryFrameMeta = { ...restMeta, byteLength: imageBytes.byteLength };
           binTarget.send(encodeBinaryPortalStreamFrame(binTarget.wireId, meta, imageBytes));
+          this.streamSentPortalFrame?.add(id);
           return;
         }
       }
-      if ((pf.seq ?? 0) > 1) {
-        const buffered = this.streamPeerBufferedBytes.get(id)?.() ?? (this.ws?.bufferedAmount ?? 0);
+      if (!isFirstForStream && (pf.seq ?? 0) > 1) {
+        const buffered = this.streamPeerBufferedBytes?.get(id)?.() ?? (this.ws?.bufferedAmount ?? 0);
         if (buffered > 256 * 1024) return;
       }
       if (pf.rawBytes !== undefined) {
@@ -882,11 +965,13 @@ export class Host {
         }
         if (jsonEv.byteLength === undefined) jsonEv.byteLength = rawBytes.byteLength;
         const frame: ClientFrame = { type: "stream_event", id, event: jsonEv };
-        const reply = this.streamReply.get(id);
+        const reply = this.streamReply?.get(id);
         if (reply) reply(frame);
         else this.send(frame);
+        this.streamSentPortalFrame?.add(id);
         return;
       }
+      this.streamSentPortalFrame?.add(id);
     }
     const frame: ClientFrame = { type: "stream_event", id, event };
     const reply = this.streamReply.get(id);
@@ -1150,6 +1235,7 @@ export class Host {
     this.streamReply.delete(id);
     this.streamReplyBinary?.delete(id);
     this.streamPeerBufferedBytes?.delete(id);
+    this.streamSentPortalFrame.delete(id);
     if (meta) {
       this.note("info", "stream", `${meta.kind} stream closed ${meta.agent || "(global)"} (${this.who(meta.from)})`);
     }
@@ -1767,6 +1853,15 @@ export class Host {
           }
         }
       }
+      if (this.sources.includes("herdr")) {
+        await this.herdr.refreshWorkspaces().catch(() => []);
+        const herdrCounts = new Map<string, number>();
+        for (const a of this.herdr.agents) {
+          if (a.workspace_id) herdrCounts.set(a.workspace_id, (herdrCounts.get(a.workspace_id) ?? 0) + 1);
+        }
+        spaces = mergeHerdrWorkspacesIntoSpaces(spaces, this.herdr.workspaces, herdrCounts);
+        this.scheduleBackgroundSpaceBridge();
+      }
       for (const s of spaces) {
         if (s.folder) this.spaceFolders.set(s.id, s.folder);
       }
@@ -1778,6 +1873,61 @@ export class Host {
         reason,
         typesTask: true,
         ...(standalone ? { standalone } : {}),
+      };
+    },
+    "spaces.sync": async (p) => {
+      this.writable();
+      const herdrAvailable = this.sources.includes("herdr") || (await this.herdr.available());
+      const hasCore = this.sources.includes("hc");
+      const syncRes = await syncSpacesBidirectional({
+        core: hasCore ? this.hc : null,
+        herdr: herdrAvailable ? this.herdr : null,
+        herdrAvailable,
+        mirrorToHerdr: true,
+      });
+      let migratedAgents = 0;
+      if (p?.mode === "migrate" && hasCore && herdrAvailable && this.sources.includes("uniflo")) {
+        await Promise.all([this.hc.list().catch(() => undefined), this.refreshNames().catch(() => undefined)]);
+        this.agents = this.collect();
+        const openSessionKeys = new Set(this.agents.filter((a) => a.source === "hc" && a.sessionKey).map((a) => a.sessionKey!));
+        const installedIds = await this.installed();
+        const coreSpaces = await this.app.spaces(this.hc.terminals).catch(() => this.app.spacesFromDocs(this.hc.terminals));
+        for (const a of this.agents) {
+          if (a.source !== "herdr" || !a.sessionKey || openSessionKeys.has(a.sessionKey)) continue;
+          const wsName = a.where?.split(" / ")[0]?.trim() || "";
+          if (p.herdrSpace && wsName && wsName.toLowerCase() !== p.herdrSpace.trim().toLowerCase()) continue;
+          try {
+            const r = await this.uniflo.resume(a.sessionKey);
+            if (!r.supported) continue;
+            const argv = resumeArgv(r.argv, installedIds);
+            const folder = r.cwd ? checkFolder(r.cwd) : a.cwd ? checkFolder(a.cwd) : undefined;
+            const matchedSpace = coreSpaces.find(
+              (s) =>
+                (wsName && s.name.trim().toLowerCase() === wsName.toLowerCase()) ||
+                (folder && s.folder && s.folder.replace(/[\\/]+$/, "").toLowerCase() === (shortHome(folder) ?? folder).replace(/[\\/]+$/, "").toLowerCase()),
+            );
+            await this.newTerminal(
+              () => this.app.open({ space: matchedSpace?.id, folder, argv }),
+              withProgramPath(argv),
+              folder,
+              { space: matchedSpace?.id, spaceName: matchedSpace?.name ?? (wsName || undefined) },
+            );
+            openSessionKeys.add(a.sessionKey);
+            migratedAgents += 1;
+          } catch {
+            // Best effort per agent; never abort the whole sync.
+          }
+        }
+      }
+      await Promise.all([this.hc.list().catch(() => undefined), this.refreshNames().catch(() => undefined)]);
+      this.publishNow();
+      const listed = await this.handlers["spaces.list"]({}, "local");
+      return {
+        syncedToCore: syncRes.syncedToCore,
+        syncedToHerdr: syncRes.syncedToHerdr,
+        migratedAgents,
+        herdrAvailable: syncRes.herdrAvailable,
+        spaces: listed.spaces,
       };
     },
     "agent.create": async (p) => {
@@ -1975,6 +2125,30 @@ export class Host {
                 : this.hc.snapshotText(a.localId!, 180)
           : undefined,
       });
+    },
+    "agent.ports": async (p) => {
+      const a = this.resolve(p.agent);
+      const excludedPorts = new Set<number>([7311]);
+      if (this.direct.port) excludedPorts.add(this.direct.port);
+      if (p.action === "stop") {
+        this.writable();
+        if (typeof p.pid !== "number" || typeof p.port !== "number" || p.pid <= 1 || p.port <= 0) {
+          throw new RpcFailure("bad_request", "停止服务需要合法的 pid 和 port");
+        }
+        try {
+          const remaining = await stopAgentListeningPort(a, p.pid, p.port, this.hc.terminals, { excludedPorts });
+          this.agentPortsByKey.set(a.key, remaining);
+          this.agentPortsSig = "";
+          this.publishNow();
+          return { ports: remaining };
+        } catch (err) {
+          throw new RpcFailure("bad_request", err instanceof Error ? err.message : String(err));
+        }
+      }
+      const scanned = await scanAgentListeningPorts([a], this.hc.terminals, { excludedPorts });
+      const ports = scanned.get(a.key) ?? [];
+      this.agentPortsByKey.set(a.key, ports);
+      return { ports };
     },
     "space.delete": async (p) => {
       this.writable();
@@ -2395,6 +2569,9 @@ export class Host {
         this.portal.observeSubmittedCommand(a, p.command, "terminal_input");
       }
       return { ok: true as const };
+    },
+    "portal.egoSpaces": async (p) => {
+      return this.portal.listEgoSpaces(p?.serverName);
     },
     "browser.status": async () => {
       return getBrowserStatus();

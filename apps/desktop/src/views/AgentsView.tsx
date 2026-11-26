@@ -78,7 +78,7 @@ import { ModelSwitchDropdown, formatEffortLabel } from "../components/ModelSwitc
 import { SlashCommandPopup } from "../components/SlashCommandPopup";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar } from "../components/SubagentNav";
 import { TerminalSurface } from "../components/TerminalSurface";
-import { buildAskQuestionDeck, isQuestionToolName, summarizeAskQuestionInput } from "../lib/askQuestion";
+import { buildAskQuestionDeck, buildChoiceSelectKeys, isQuestionToolName, summarizeAskQuestionInput } from "../lib/askQuestion";
 import { computeTurnTelemetry, fmtLatencyClean, fmtPctClean } from "../lib/turnTelemetry";
 import { copyToClipboard } from "../lib/bridge";
 import { extractImageTargets } from "../lib/chatImages";
@@ -515,6 +515,8 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
   const prevVisibleRef = useRef(visible);
   const [atBottom, setAtBottom] = useState(true);
   const [choiceLines, setChoiceLines] = useState<string[]>([]);
+  const [choiceRefreshNonce, setChoiceRefreshNonce] = useState(0);
+  const [dismissedAskCallId, setDismissedAskCallId] = useState<string | null>(null);
   const [subs, setSubs] = useState<SubSession[]>([]);
   const [subTrail, setSubTrail] = useState<SubSession[]>([]);
   const [activeChildSubs, setActiveChildSubs] = useState<SubSession[]>([]);
@@ -1033,29 +1035,56 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
   }, [agent.cwd, agent.deviceId, agent.harness, agent.isShell, agent.key, chatVisited]);
 
   useEffect(() => {
-    if (activeMode !== "chat" || agent.status !== "blocked") {
+    setDismissedAskCallId(null);
+  }, [agent.key]);
+
+  useEffect(() => {
+    if (agent.status !== "blocked") {
+      setDismissedAskCallId(null);
+    }
+  }, [agent.status]);
+
+  const refreshChoicesSoon = useCallback(() => {
+    setChoiceRefreshNonce((n) => n + 1);
+    window.setTimeout(() => setChoiceRefreshNonce((n) => n + 1), 180);
+    window.setTimeout(() => setChoiceRefreshNonce((n) => n + 1), 560);
+  }, []);
+
+  useEffect(() => {
+    if (activeMode !== "chat" || activeSub || agent.status !== "blocked") {
       setChoiceLines([]);
       return;
     }
     let alive = true;
-    void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 40 })
-      .then((res) => {
-        if (alive) setChoiceLines((res.ansi || res.text || "").split("\n"));
-      })
-      .catch(() => {});
+    const fetchChoices = () => {
+      void rpcCall(agent.deviceId, "terminal.read", { agent: agent.key, lines: 50 })
+        .then((res) => {
+          if (alive) setChoiceLines((res.ansi || res.text || "").split("\n"));
+        })
+        .catch(() => {});
+    };
+    fetchChoices();
+    const timer = window.setInterval(fetchChoices, 900);
     return () => {
       alive = false;
+      window.clearInterval(timer);
     };
-  }, [activeMode, agent.deviceId, agent.key, agent.status, events.length]);
+  }, [activeMode, activeSub, agent.deviceId, agent.key, agent.status, choiceRefreshNonce, events.length]);
 
   const choices = useMemo(() => (activeMode === "chat" && choiceLines.length ? parseChoices(choiceLines) : []), [activeMode, choiceLines]);
   const displayedEvents = activeSub ? subEvents : events;
   const questionDeck = useMemo(
     () =>
       activeMode === "chat" && !activeSub
-        ? buildAskQuestionDeck({ events: displayedEvents, choiceLines, choices })
+        ? buildAskQuestionDeck({
+            events: displayedEvents,
+            choiceLines,
+            choices,
+            agentStatus: agent.status,
+            dismissedCallId: dismissedAskCallId,
+          })
         : null,
-    [activeMode, activeSub, choiceLines, choices, displayedEvents],
+    [activeMode, activeSub, agent.status, choiceLines, choices, dismissedAskCallId, displayedEvents],
   );
   const shellChat = useMemo(() => (isPlainShellChat ? parseTerminalChatTranscript(shellRaw) : null), [isPlainShellChat, shellRaw]);
   const cachedFoldedRef = useRef<ChatRow[]>([]);
@@ -2018,6 +2047,16 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     }
   };
 
+  /** Sends keys sequentially with brief spacing so Ink/Bubbletea/Ratatui TUIs never drop rapid keystrokes. */
+  const sendKeySequence = async (keys: string[], stepDelayMs = 55) => {
+    for (let i = 0; i < keys.length; i += 1) {
+      await sendKeys([keys[i]!]);
+      if (i + 1 < keys.length) {
+        await new Promise((r) => window.setTimeout(r, stepDelayMs));
+      }
+    }
+  };
+
   const handleFiles = useCallback(
     async (files: FileList | File[] | null) => {
       const list = files ? Array.from(files) : [];
@@ -2623,14 +2662,44 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
         {questionDeck ? (
           <AskQuestionDeck
             deck={questionDeck}
-            onSelectKey={(k) => sendKeys([k, "enter"])}
+            onSelectKey={async (k) => {
+              const keys = buildChoiceSelectKeys({
+                entries: questionDeck.entries,
+                targetKey: k,
+                harness: agent.harness,
+                multiSelect: questionDeck.multiSelect,
+                isShell: agent.isShell,
+                confirm: true,
+              });
+              await sendKeySequence(keys);
+              refreshChoicesSoon();
+            }}
             onSubmitWriteIn={async (k, customAnswer) => {
-              await sendKeys([k, "enter"]);
-              await new Promise((r) => setTimeout(r, 90));
+              const navKeys = buildChoiceSelectKeys({
+                entries: questionDeck.entries,
+                targetKey: k,
+                harness: agent.harness,
+                multiSelect: false,
+                isShell: agent.isShell,
+                confirm: true,
+              });
+              await sendKeySequence(navKeys);
+              await new Promise((r) => window.setTimeout(r, 120));
               await rpcCall(agent.deviceId, "terminal.input", {
                 agent: agent.key,
-                data: `${customAnswer}\r`,
+                data: customAnswer,
               }).catch((e) => toast((e as Error).message, true));
+              await new Promise((r) => window.setTimeout(r, 70));
+              await sendKeys(["enter"]);
+              refreshChoicesSoon();
+            }}
+            onSendRawKey={async (rawKey) => {
+              await sendKeys([rawKey]);
+              refreshChoicesSoon();
+            }}
+            onDismiss={() => {
+              setDismissedAskCallId(questionDeck.callId || "__dismissed__");
+              setChoiceLines([]);
             }}
             onOpenTerminal={() => selectMode("term")}
           />
@@ -2975,7 +3044,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
                         type="button"
                         aria-haspopup="listbox"
                         aria-expanded={modelMenuMode === "thinking"}
-                        className={`composer-model-btn has-hint${modelMenuMode === "thinking" ? " open" : ""}`}
+                        className={`composer-model-btn composer-effort-btn has-hint${modelMenuMode === "thinking" ? " open" : ""}`}
                         title={displayThinking ? `思考等级：${formatEffortLabel(displayThinking)}（点击切换 · ${shortcutText("openThinkingPicker")}）` : `切换思考等级（${shortcutText("openThinkingPicker")}）`}
                         onClick={() => {
                           setSlashDismissedFor(text);
@@ -2984,7 +3053,14 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
                       >
                         <Brain size={13} />
                         <span className="truncate">
-                          {displayThinking ? `思考 · ${formatEffortLabel(displayThinking)}` : "思考等级"}
+                          {displayThinking ? (
+                            <>
+                              <span className="composer-effort-prefix">思考 · </span>
+                              {formatEffortLabel(displayThinking)}
+                            </>
+                          ) : (
+                            "思考等级"
+                          )}
                         </span>
                         <ChevronDown size={11} />
                         <SpatialHint shortcut="openThinkingPicker" corner="top" />
@@ -3062,7 +3138,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
                           />
                         ) : null}
                       </svg>
-                      <span>{ctxLabel}</span>
+                      <span className="composer-hud-pct">{ctxLabel}</span>
                     </span>
                     {cachePct !== null ? (
                       <>

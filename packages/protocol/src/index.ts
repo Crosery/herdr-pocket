@@ -49,6 +49,18 @@ export type AgentSource = "hc" | "herdr" | "uniflo";
  */
 export type AgentStatus = "working" | "blocked" | "done" | "idle" | "unknown";
 
+export interface AgentListeningPort {
+  port: number;
+  pid: number;
+  processName: string;
+  host: string;
+  protocol: "http" | "tcp";
+  title?: string;
+  url?: string;
+}
+
+export type TutorialStatus = 0 | 1 | 2;
+
 export interface Agent {
   /** Globally unique: `<deviceId>/<source>:<localId>`. */
   key: string;
@@ -113,6 +125,8 @@ export interface Agent {
   queuedText?: string;
   /** When the oldest waiting message was typed in (epoch ms). */
   queuedSince?: number;
+  /** Listening TCP ports started inside this agent's terminal process tree (Orca-style service discovery). */
+  listeningPorts?: AgentListeningPort[];
   updatedAt: number;
 }
 
@@ -313,6 +327,10 @@ export interface SubSession {
   startedAt?: number;
   updatedAt: number;
   costUsd?: number;
+  /** Execution steps recorded for this subagent session. */
+  steps?: number;
+  /** Optional role/category extracted from parent tool call or harness metadata. */
+  role?: string;
   /** Its own subagents. */
   children: number;
 }
@@ -842,6 +860,22 @@ export interface RpcMethods {
     params: { agent: string; question: string };
     result: { answer: string; model?: string; durationMs: number };
   };
+  /** List or stop listening TCP ports started inside an agent's terminal process tree. */
+  "agent.ports": {
+    params: { agent: string; action?: "list" | "stop"; pid?: number; port?: number };
+    result: { ports: AgentListeningPort[] };
+  };
+  /** Sync spaces bidirectionally between `herdr` TUI and `herdr-core`, or migrate TUI sessions into `herdr-core`. */
+  "spaces.sync": {
+    params: { mode?: "sync" | "migrate"; herdrSpace?: string };
+    result: {
+      syncedToCore: number;
+      syncedToHerdr: number;
+      migratedAgents: number;
+      herdrAvailable: boolean;
+      spaces: SpaceInfo[];
+    };
+  };
   /** Close a workspace / space (and its terminals) without deleting disk folders. */
   "space.delete": {
     params: { spaceId?: string; spaceName?: string };
@@ -938,6 +972,10 @@ export interface RpcMethods {
   "portal.observeCommand": {
     params: { agent: string; command: string };
     result: { ok: true };
+  };
+  "portal.egoSpaces": {
+    params: { serverName?: string };
+    result: { available: boolean; spaces: PortalEgoSpaceState[] };
   };
   /** Optional zero-dependency AI Browser plugin status (disabled by default via `plugins.aiBrowser`). */
   "browser.status": {
@@ -1269,6 +1307,13 @@ export interface AgentQuotaBar {
   note?: string;
 }
 
+export interface UsageTokenBreakdown {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
 export interface AgentUsageReport {
   harness: string;
   sessionKey?: string;
@@ -1287,6 +1332,21 @@ export interface AgentUsageReport {
     contextTokens?: number;
     contextLimit?: number;
     contextPct?: number;
+    /** Session-scoped usage since local midnight (main session only). */
+    todayCostUsd?: number;
+    todayUnpricedSteps?: number;
+    todaySteps?: number;
+    todayTokens?: UsageTokenBreakdown;
+    /** Aggregated usage across all descendant subagents of this session. */
+    subagentCount?: number;
+    subagentSteps?: number;
+    subagentCostUsd?: number;
+    subagentUnpricedSteps?: number;
+    subagentTokens?: UsageTokenBreakdown;
+    /** Descendant subagent usage since local midnight. */
+    todaySubagentCostUsd?: number;
+    todaySubagentSteps?: number;
+    todaySubagentTokens?: UsageTokenBreakdown;
   } | null;
   models: AgentUsageModelRow[];
   day24h: { harness?: UsageRow; total: UsageRow } | null;
@@ -1378,13 +1438,17 @@ export {
 } from "./modelIcons.ts";
 
 export {
+  buildChoiceSelectKeys,
   isQuestionToolName,
   normalizeChoiceLabel,
   parseAskQuestionInput,
+  parseTerminalChoices,
   summarizeAskQuestionInput,
   type ParsedAskQuestionPayload,
   type ParsedQuestionItem,
   type ParsedQuestionOption,
+  type SelectableChoiceLike,
+  type TerminalChoiceOption,
 } from "./askQuestion.ts";
 
 /** Builds per-harness slash commands / keys to switch model and/or thinking effort cleanly. */
@@ -2169,7 +2233,8 @@ export type ClientFrame =
 
 /** Relay -> client. */
 export type ServerFrame =
-  | { type: "welcome"; version: number; serverVersion?: string; latestRelease?: string; device: Device; seq: number }
+  | { type: "welcome"; version: number; serverVersion?: string; latestRelease?: string; tutorialStatus?: TutorialStatus; device: Device; seq: number }
+  | { type: "tutorial_state"; status: TutorialStatus }
   | { type: "release_update"; version: string; ts: number }
   /** Full state snapshot, sent after welcome to every client. */
   | { type: "snapshot"; seq: number; devices: Device[]; agents: Agent[] }
@@ -2425,6 +2490,7 @@ export interface PairRequest {
 export interface PairResponse {
   device: Device;
   token: string;
+  tutorialStatus?: TutorialStatus;
 }
 
 /** A device asking to join; a paired device scans its QR and approves it. */

@@ -42,7 +42,7 @@ async function pair(kind: "host" | "viewer", name: string) {
   assert.equal(code.status, 200);
   const r = await api("/v1/pair", { body: { code: code.json.code, name, kind } });
   assert.equal(r.status, 200);
-  return r.json as { token: string; device: { id: string } };
+  return r.json as { token: string; device: { id: string }; tutorialStatus?: 0 | 1 | 2 };
 }
 
 class Client {
@@ -351,4 +351,46 @@ test("revoking a device closes its socket and invalidates the token", async () =
   assert.equal(await closed, 4001);
   assert.equal((await api("/v1/devices", { token: phone.token })).status, 401);
   await assert.rejects(Client.open(phone.token));
+});
+
+test("tutorial status persists in relay SQLite, merges monotonically, includes welcome/pair state, and broadcasts tutorial_state", async () => {
+  const viewerA = await pair("viewer", "Tutorial Viewer A");
+  const viewerB = await pair("viewer", "Tutorial Viewer B");
+  assert.equal(viewerA.tutorialStatus, 0);
+
+  const initRes = await api("/v1/tutorial", { token: viewerA.token });
+  assert.equal(initRes.status, 200);
+  assert.equal(initRes.json.status, 0);
+
+  const wsA = await Client.open(viewerA.token);
+  const wsB = await Client.open(viewerB.token);
+  const welcomeA = await wsA.next("welcome");
+  const welcomeB = await wsB.next("welcome");
+  assert.equal(welcomeA.tutorialStatus, 0);
+  assert.equal(welcomeB.tutorialStatus, 0);
+
+  // Advance status 0 -> 2 and verify broadcast to all connected viewers
+  const doneRes = await api("/v1/tutorial", { method: "PUT", token: viewerA.token, body: { status: 2 } });
+  assert.equal(doneRes.status, 200);
+  assert.equal(doneRes.json.status, 2);
+
+  const bcastB = await wsB.next("tutorial_state");
+  assert.equal(bcastB.status, 2);
+
+  // Monotonic protection: downgrading 2 -> 1 without explicit reset keeps 2
+  const monoRes = await api("/v1/tutorial", { method: "PUT", token: viewerB.token, body: { status: 1 } });
+  assert.equal(monoRes.status, 200);
+  assert.equal(monoRes.json.status, 2);
+
+  // Newly paired viewer inherits server tutorialStatus === 2
+  const viewerC = await pair("viewer", "Tutorial Viewer C");
+  assert.equal(viewerC.tutorialStatus, 2);
+
+  // Explicit reset sets back to 0 cleanly
+  const resetRes = await api("/v1/tutorial", { method: "PUT", token: viewerA.token, body: { status: 0, reset: true } });
+  assert.equal(resetRes.status, 200);
+  assert.equal(resetRes.json.status, 0);
+
+  wsA.close();
+  wsB.close();
 });

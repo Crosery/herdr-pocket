@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { ConvEvent } from "@herdr-pocket/protocol";
+import { parseTerminalChoices, type ConvEvent } from "@herdr-pocket/protocol";
 import {
   buildAskQuestionDeck,
+  buildChoiceSelectKeys,
   extractTerminalChoicePrompt,
+  findOpenQuestionToolCall,
+  isQuestionToolName,
   normalizeChoiceLabel,
   parseAskQuestionInput,
   summarizeAskQuestionInput,
@@ -142,4 +145,141 @@ test("buildAskQuestionDeck falls back to structured options when terminal choice
     choices: [],
   });
   assert.equal(afterReply, null);
+});
+
+test("chronological tool_call -> tool_result and non-blocked agentStatus immediately clear AskQuestionDeck (image-132 P0 regression)", () => {
+  const askCall: ConvEvent = {
+    id: "s4666:c0",
+    session: "antigravity:a1",
+    ts: 1000,
+    kind: "tool_call",
+    call_id: "s4666:0",
+    name: "ask_question",
+    input: {
+      questions: JSON.stringify([
+        { question: "对外正式名称怎么定？", is_multi_select: false, options: ["(Recommended) 小吹私人助理", "快捷命令版", "其他"] },
+        { question: "飞书已回复如何划掉？", is_multi_select: false, options: ["(Recommended) 自动划掉", "手动划掉"] },
+        { question: "改造如何分节奏？", is_multi_select: false, options: ["(Recommended) 分两期", "只做个人助理"] },
+      ]),
+    },
+  };
+
+  // Answered chronologically via tool_result -> MUST return null!
+  const answeredEvents: ConvEvent[] = [
+    askCall,
+    { id: "s4667", session: "antigravity:a1", ts: 2000, kind: "tool_result", call_id: "s4666:0", name: "ask_question", output: "A1: 小吹私人助理" },
+  ];
+  assert.deepEqual(findOpenQuestionToolCall(answeredEvents), []);
+  assert.equal(buildAskQuestionDeck({ events: answeredEvents, choiceLines: [], choices: [], agentStatus: "working" }), null);
+
+  // Even before tool_result arrives, reasoning / assistant_message / another tool_call / working status MUST clear zombie deck!
+  assert.deepEqual(
+    findOpenQuestionToolCall([askCall, { id: "s4668:r", session: "antigravity:a1", ts: 1500, kind: "reasoning", text: "Thinking..." }]),
+    [],
+  );
+  assert.equal(
+    buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "working" }),
+    null,
+  );
+  assert.equal(
+    buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "idle" }),
+    null,
+  );
+
+  // While genuinely blocked, user dismiss hides the deck cleanly
+  const blockedDeck = buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "blocked" });
+  assert.ok(blockedDeck);
+  assert.equal(blockedDeck.callId, "s4666:0");
+  assert.equal(
+    buildAskQuestionDeck({ events: [askCall], choiceLines: [], choices: [], agentStatus: "blocked", dismissedCallId: "s4666:0" }),
+    null,
+  );
+});
+
+test("multi-harness Ask parsing & universal arrow-key navigation work across Antigravity, Claude Code, Codex, Oh My Pi, DSH, OpenCode, and shell", () => {
+  // Recognizes tool names across all major harnesses
+  for (const name of ["ask_question", "AskUserQuestion", "ask_user_question", "request_user_input", "ask", "question", "ask_user"]) {
+    assert.equal(isQuestionToolName(name), true, `expected ${name} to be recognized`);
+  }
+
+  // 1. Antigravity unnumbered `? ` cursor prompt (Question 2 of 3)
+  const agyScreen = [
+    "? 当助理检测到你在飞书里已经自己回复了某件事，应该怎么处理「划掉」？",
+    "❯ (Recommended) 自动标为「本人已处理（已划掉）」",
+    "  不自动划掉，仅标注",
+    "  Other",
+  ];
+  const agyChoices = parseTerminalChoices(agyScreen);
+  assert.equal(agyChoices.length, 3);
+  assert.equal(agyChoices[0]!.selected, true);
+  assert.deepEqual(buildChoiceSelectKeys({ entries: agyChoices, targetKey: "1", harness: "antigravity" }), ["enter"]);
+  assert.deepEqual(buildChoiceSelectKeys({ entries: agyChoices, targetKey: "2", harness: "antigravity" }), ["down", "enter"]);
+  assert.deepEqual(buildChoiceSelectKeys({ entries: agyChoices, targetKey: "3", harness: "antigravity" }), ["down", "down", "enter"]);
+
+  // 2. Claude Code numbered multi-select checkboxes + Submit step
+  const claudeMulti = [
+    "❯ 1. [ ] Enable OAuth PKCE",
+    "  2. [x] Keep legacy callback",
+    "  3. [ ] Write-in...",
+  ];
+  const claudeChoices = parseTerminalChoices(claudeMulti);
+  assert.equal(claudeChoices.length, 3);
+  assert.equal(claudeChoices[0]!.checked, false);
+  assert.equal(claudeChoices[1]!.checked, true);
+  assert.deepEqual(buildChoiceSelectKeys({ entries: claudeChoices, targetKey: "2", harness: "claude-code", multiSelect: true }), ["down", "space"]);
+
+  const claudeSubmit = parseTerminalChoices(["❯ 1. Submit answers", "  2. Cancel"]);
+  const submitDeck = buildAskQuestionDeck({
+    events: [
+      {
+        id: "c1",
+        session: "s1",
+        ts: 1000,
+        kind: "tool_call",
+        call_id: "call-1",
+        name: "AskUserQuestion",
+        input: { questions: [{ question: "Q1", options: [{ label: "A" }, { label: "B" }] }, { question: "Q2", options: [{ label: "C" }, { label: "D" }] }] },
+      },
+    ],
+    choiceLines: ["Ready to submit?", "❯ 1. Submit answers", "  2. Cancel"],
+    choices: claudeSubmit,
+    agentStatus: "blocked",
+  });
+  assert.equal(submitDeck?.isSubmitStep, true);
+
+  // 3. Codex CLI `request_user_input` with `›` pointer & `None of the above` write-in
+  const codexChoices = parseTerminalChoices(["› 1. Fast path", "  2. Full rebuild", "  3. None of the above"]);
+  assert.equal(codexChoices.length, 3);
+  assert.equal(normalizeChoiceLabel(codexChoices[2]!.label).isWriteIn, true);
+  assert.deepEqual(buildChoiceSelectKeys({ entries: codexChoices, targetKey: "2", harness: "codex" }), ["down", "enter"]);
+
+  // 4. Oh My Pi (`omp` `ask`) unnumbered radio circles & `multi: true`
+  const ompChoices = parseTerminalChoices(["❯ ● Approve & send", "  ○ Decline"]);
+  assert.equal(ompChoices.length, 2);
+  assert.equal(ompChoices[0]!.selected, true);
+  assert.deepEqual(buildChoiceSelectKeys({ entries: ompChoices, targetKey: "2", harness: "oh-my-pi" }), ["down", "enter"]);
+  const ompParsed = parseAskQuestionInput({ questions: [{ question: "Pick tools", multi: true, options: [{ label: "git" }, { label: "docker" }] }] });
+  assert.equal(ompParsed.questions[0]?.multiSelect, true);
+
+  // 5. DSH / OpenCode active-working terminal logs & queued messages MUST NOT trigger false-positive choices!
+  const noisyWorkingScreen = [
+    "○ Thought for 2m 10s (Core dispatch...)",
+    "● Ran (rm -rf /tmp/test) failed",
+    "● Explored 5 files (dispatch.py)",
+    "▸ 1",
+    "▸ 1 (alt+m to send immediately)",
+    "Gemini 4 Neon (XHigh) · 46% ctx · working",
+  ];
+  assert.deepEqual(parseTerminalChoices(noisyWorkingScreen), []);
+
+  // 6. Plain shell non-cursor select prompt still falls back to digit + enter
+  assert.deepEqual(
+    buildChoiceSelectKeys({
+      entries: [{ key: "1" }, { key: "2" }],
+      targetKey: "2",
+      harness: "zsh",
+      isShell: true,
+    }),
+    ["2", "enter"],
+  );
 });

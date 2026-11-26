@@ -12,6 +12,7 @@ import {
   LayoutGrid,
   Maximize2,
   MousePointer,
+  PanelTop,
   Rows3,
   X,
 } from "lucide-react";
@@ -25,6 +26,7 @@ import {
   closePortalSurface,
   computeContainedRect,
   filterVisiblePortalItems,
+  formatPortalDisplayTitle,
   isLoopbackPortalUrl,
   portalStore,
   resolvePortalTransport,
@@ -33,7 +35,7 @@ import {
   subscribePortalFrames,
 } from "../lib/portalClient";
 import { allAgents, liveStore, lookupAgentByKey, settingsStore } from "../lib/store";
-import { openWebTab, shellStore } from "../shell/shellStore";
+import { openPortalTab, openWebTab, shellStore, tabLeaves } from "../shell/shellStore";
 import { PocketButton } from "./PocketUI";
 
 type ResizeDir = "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
@@ -149,6 +151,7 @@ interface PortalMiniCardProps {
   onFocusCard?: () => void;
   onToggleCollapse?: () => void;
   onQuickLayout?: (mode: "fan" | "tile" | "cascade") => void;
+  onDockToTab?: () => void;
   onExpandPortal: (portalId: string, hostId: string) => void;
   onClosePortal: (portalId: string, hostId: string) => void;
 }
@@ -170,6 +173,7 @@ function PortalMiniCard({
   onFocusCard,
   onToggleCollapse,
   onQuickLayout,
+  onDockToTab,
   onExpandPortal,
   onClosePortal,
 }: PortalMiniCardProps) {
@@ -437,6 +441,31 @@ function PortalMiniCard({
       drawPipFrame();
     };
 
+    let revokeUrl: string | null = null;
+    const loadViaImage = () => {
+      if (cancelled || seqToken !== decodeSeqRef.current) return;
+      const img = new Image();
+      img.onload = () => {
+        if (revokeUrl) {
+          URL.revokeObjectURL(revokeUrl);
+          revokeUrl = null;
+        }
+        commitSource(img);
+      };
+      img.onerror = () => {
+        if (revokeUrl) {
+          URL.revokeObjectURL(revokeUrl);
+          revokeUrl = null;
+        }
+      };
+      if (hasBinary && frame.rawBytes) {
+        revokeUrl = URL.createObjectURL(new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime }));
+        img.src = revokeUrl;
+      } else {
+        img.src = `data:${mime};base64,${frame.data}`;
+      }
+    };
+
     if (typeof createImageBitmap === "function" && (hasBinary || typeof atob === "function")) {
       try {
         let blob: Blob;
@@ -450,30 +479,17 @@ function PortalMiniCard({
         }
         void createImageBitmap(blob)
           .then(commitSource)
-          .catch(() => {});
+          .catch(() => loadViaImage());
         return () => {
           cancelled = true;
+          if (revokeUrl) URL.revokeObjectURL(revokeUrl);
         };
       } catch {
         // fall through
       }
     }
 
-    const img = new Image();
-    let revokeUrl: string | null = null;
-    img.onload = () => {
-      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
-      commitSource(img);
-    };
-    img.onerror = () => {
-      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
-    };
-    if (hasBinary && frame.rawBytes) {
-      revokeUrl = URL.createObjectURL(new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime }));
-      img.src = revokeUrl;
-    } else {
-      img.src = `data:${mime};base64,${frame.data}`;
-    }
+    loadViaImage();
     return () => {
       cancelled = true;
       if (revokeUrl) URL.revokeObjectURL(revokeUrl);
@@ -579,12 +595,14 @@ function PortalMiniCard({
           onStartHeaderDrag?.(e);
         }}
       >
-        {cardNumber !== undefined ? <span className="session-portal-card-num">{cardNumber}</span> : null}
+        {cardNumber !== undefined && !collapsed && stackCount > 1 ? (
+          <span className="session-portal-card-num">{cardNumber}</span>
+        ) : null}
         <span className="session-portal-pip-ic">{portalIcon(item)}</span>
-        <span className="session-portal-pip-title truncate" title={item.title}>
-          {egoSpace ? egoSpace.spaceName : item.title}
+        <span className="session-portal-pip-title truncate" title={item.url || item.title}>
+          {formatPortalDisplayTitle(item)}
         </span>
-        {egoPhase ? (
+        {egoPhase && !collapsed ? (
           <span className={`session-portal-ego-phase ${egoPhase.cls}`}>{egoPhase.label}</span>
         ) : null}
         {collapsed && stackCount > 1 ? (
@@ -597,23 +615,23 @@ function PortalMiniCard({
               onToggleCollapse?.();
             }}
           >
-            共 {stackCount} 个
+            +{stackCount - 1}
           </button>
-        ) : !egoPhase || hasStreamFrame ? (
+        ) : !collapsed && (!egoPhase || hasStreamFrame) ? (
           <span className="session-portal-pip-badge">{p2pLabel}</span>
         ) : null}
-        {collapsed && stackCount > 1 && onQuickLayout ? (
+        {onDockToTab && (!collapsed || stackCount > 1) ? (
           <button
             type="button"
             className="session-portal-pip-btn"
-            title="平铺展开多窗口"
-            aria-label="平铺展开多窗口"
+            title="统一收入标签页查看（避免遮挡终端/对话）"
+            aria-label="统一收入标签页"
             onClick={(e) => {
               e.stopPropagation();
-              onQuickLayout("tile");
+              onDockToTab();
             }}
           >
-            <LayoutGrid size={12} />
+            <PanelTop size={12} />
           </button>
         ) : null}
         {openUrl && !collapsed ? (
@@ -1174,6 +1192,32 @@ export function SessionPortalPiP({
     return top;
   }, [current, items]);
 
+  const tabs = shellStore.use((s) => s.tabs);
+  const dockedPortalTab = useMemo(() => {
+    const key = agent?.key ?? effectiveAgentKeys[0];
+    if (!key) return null;
+    return tabs.find((t) => tabLeaves(t).some((l) => l.content.kind === "portal" && l.content.agentKey === key)) ?? null;
+  }, [agent?.key, effectiveAgentKeys, tabs]);
+
+  const dockHostId = agent?.deviceId ?? current?.hostId ?? "";
+  const dockAgentKey = agent?.key ?? current?.agentKey ?? effectiveAgentKeys[0] ?? "";
+  const handleDockToTab = useCallback(() => {
+    if (!current) return;
+    if (!dockAgentKey) {
+      onExpandPortal(current.id, current.hostId);
+      return;
+    }
+    const label = agent?.title || agent?.name || formatPortalDisplayTitle(current);
+    openPortalTab(dockHostId, dockAgentKey, `${label} · 浮窗 (${items.length})`, {
+      activePortalId: current.id,
+      spaceKey: shellStore.get().selectedSpace,
+    });
+    clearHoverTimer();
+    setHoveredBackIdx(null);
+    userExpandedRef.current = false;
+    setCollapsed(true);
+  }, [agent?.name, agent?.title, clearHoverTimer, current, dockAgentKey, dockHostId, items.length, onExpandPortal]);
+
   if (!visible || !items.length || !current) return null;
 
   const isMulti = items.length > 1;
@@ -1323,9 +1367,60 @@ export function SessionPortalPiP({
   const fanPadX = backItems.length * PIP_FAN_STEP_X;
   const fanPeekExpandY = Math.min(128, Math.max(84, Math.round(effectiveSz.h * 0.56)));
   const isNarrowPane = Boolean(parentDims && parentDims.w < 430);
-  const isCompactPane = Boolean(parentDims && parentDims.w < 240);
+  const isCompactPane = Boolean(parentDims && parentDims.w < 260);
   const compactCls = isCompactPane ? " is-compact-pane" : "";
+  const spaceTightForPip = Boolean(
+    (parentDims && parentDims.w < 340) ||
+      items.length >= 4 ||
+      (parentDims && parentDims.w < 500 && items.length >= 3),
+  );
+
+  // If the pane is too small for floating PiP or portals overflowed, OR the user already docked them into a PortalTab,
+  // render a fixed ultra-compact top-right dock pill that opens/focuses the unified time-ordered PortalTab.
+  if (Boolean(dockedPortalTab) || (spaceTightForPip && collapsed)) {
+    const label = items.length > 1 ? `${items.length} 个预览窗口` : formatPortalDisplayTitle(current);
+    return (
+      <div
+        ref={rootRef}
+        className={`session-portal-pip is-collapsed is-overflow-dock${mode === "term" ? " in-term" : ""}${compactCls}`}
+        role="region"
+        aria-label={`浮窗已收纳 · ${label}`}
+      >
+        <div className="session-portal-pip-card-shell is-collapsed">
+          <div className="session-portal-pip-head">
+            <span className="session-portal-pip-ic">{portalIcon(current)}</span>
+            <span className="session-portal-pip-title truncate" title={current.url || current.title}>
+              {label}
+            </span>
+            <button
+              type="button"
+              className="session-portal-pip-count-badge"
+              title="在统一标签页按时间查看全部预览"
+              onClick={handleDockToTab}
+            >
+              {dockedPortalTab ? "切至标签" : "移入标签"}
+            </button>
+            {!dockedPortalTab ? (
+              <button
+                type="button"
+                className="session-portal-pip-btn"
+                title="仍在此处展开小窗"
+                aria-label="展开小窗"
+                onClick={() => setFolded(false)}
+              >
+                <ChevronDown size={12} />
+              </button>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const sizeClamp: React.CSSProperties = { maxWidth: "calc(100% - 20px)", maxHeight: "calc(100% - 20px)" };
+  const collapsedClamp: React.CSSProperties = {
+    maxWidth: isCompactPane ? "calc(100% - 16px)" : "min(256px, calc(100% - 20px))",
+  };
   const outerExtraH = (!collapsed && isMulti ? 40 : 0) + fanPadY;
   const posStyle: React.CSSProperties =
     isCascade || isTile
@@ -1336,11 +1431,10 @@ export function SessionPortalPiP({
             top: box.y,
             right: "auto",
             bottom: "auto",
-            ...sizeClamp,
-            ...(collapsed ? {} : { width: effectiveSz.w + fanPadX, height: effectiveSz.h + outerExtraH }),
+            ...(collapsed ? collapsedClamp : { ...sizeClamp, width: effectiveSz.w + fanPadX, height: effectiveSz.h + outerExtraH }),
           }
         : collapsed
-          ? sizeClamp
+          ? collapsedClamp
           : { width: effectiveSz.w + fanPadX, height: effectiveSz.h + outerExtraH, ...sizeClamp };
 
   const dirs: ResizeDir[] = ["n", "s", "e", "w", "nw", "ne", "sw", "se"];
@@ -1428,7 +1522,7 @@ export function SessionPortalPiP({
                 >
                   <span className="session-portal-card-num is-mini">{idx + 1}</span>
                   <span className="session-portal-stack-pill-ic">{portalIcon(it)}</span>
-                  <span className="truncate">{it.title}</span>
+                  <span className="truncate">{formatPortalDisplayTitle(it)}</span>
                 </button>
                 <button
                   type="button"
@@ -1666,6 +1760,7 @@ export function SessionPortalPiP({
               ))
             : null}
           <PortalMiniCard
+            key={current.id}
             item={current}
             contextAgent={agent}
             visible={visible}
@@ -1680,6 +1775,7 @@ export function SessionPortalPiP({
             onStartHeaderDrag={startMoveDrag}
             onToggleCollapse={() => setFolded(!collapsed)}
             onQuickLayout={(next) => setExpandedLayout(next)}
+            onDockToTab={dockAgentKey ? handleDockToTab : undefined}
             onExpandPortal={onExpandPortal}
             onClosePortal={(pid, hid) => void closePortalSurface(hid, pid)}
           />

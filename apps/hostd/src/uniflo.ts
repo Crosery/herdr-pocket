@@ -1376,10 +1376,10 @@ export class UnifloAdapter {
     };
   }
 
-  /** Detailed token, cache, reasoning, context, and per-model breakdown for one Uniflo session key. */
+  /** Detailed token, cache, reasoning, context, daily rollup, subagent rollup, and per-model breakdown for one Uniflo session key. */
   async sessionUsage(
     sessionKey: string,
-    opts?: { skipModels?: boolean },
+    opts?: { skipModels?: boolean; includeSubagents?: boolean },
   ): Promise<{
     turns: number;
     steps: number;
@@ -1394,6 +1394,18 @@ export class UnifloAdapter {
     contextTokens?: number;
     contextLimit?: number;
     contextPct?: number;
+    todayCostUsd?: number;
+    todayUnpricedSteps?: number;
+    todaySteps?: number;
+    todayTokens?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    subagentCount?: number;
+    subagentSteps?: number;
+    subagentCostUsd?: number;
+    subagentUnpricedSteps?: number;
+    subagentTokens?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    todaySubagentCostUsd?: number;
+    todaySubagentSteps?: number;
+    todaySubagentTokens?: { input: number; output: number; cacheRead: number; cacheWrite: number };
     model?: string;
     models: AgentUsageModelRow[];
   }> {
@@ -1401,6 +1413,39 @@ export class UnifloAdapter {
       typeof obj?.[k] === "number" && Number.isFinite(obj[k] as number) ? (obj[k] as number) : 0;
     const optN = (obj: Record<string, unknown> | undefined, k: string) =>
       typeof obj?.[k] === "number" && Number.isFinite(obj[k] as number) ? (obj[k] as number) : undefined;
+    const stepTsMs = (step: Record<string, unknown>): number | undefined => {
+      const raw = step.ts ?? step.timestamp ?? step.at ?? step.created_at;
+      if (typeof raw === "number" && Number.isFinite(raw)) return raw > 1e12 ? raw : raw * 1000;
+      if (typeof raw === "string") {
+        const parsed = Date.parse(raw);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+      return undefined;
+    };
+    const startOfToday = (() => {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      return d.getTime();
+    })();
+    const summarizeTodaySteps = (stepList: Array<Record<string, unknown>>) => {
+      let costUsd = 0;
+      let unpricedSteps = 0;
+      let count = 0;
+      const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      for (const st of stepList) {
+        const ts = stepTsMs(st);
+        if (ts === undefined || ts < startOfToday) continue;
+        count += 1;
+        const c = optN(st, "cost_usd");
+        if (c !== undefined) costUsd += c;
+        else unpricedSteps += 1;
+        tokens.input += n(st, "input");
+        tokens.output += n(st, "output");
+        tokens.cacheRead += n(st, "cache_read");
+        tokens.cacheWrite += n(st, "cache_write");
+      }
+      return { costUsd, unpricedSteps, count, tokens };
+    };
 
     const [detail, byModel] = await Promise.all([
       this.get(`/v1/sessions/${encodeURIComponent(sessionKey)}/usage`) as Promise<{
@@ -1438,6 +1483,100 @@ export class UnifloAdapter {
       }))
       .sort((a, b) => b.costUsd - a.costUsd || b.steps - a.steps);
 
+    const todayMain = summarizeTodaySteps(steps);
+    let subagentCount = 0;
+    let subagentSteps = 0;
+    let subagentCostUsd = 0;
+    let subagentUnpricedSteps = 0;
+    const subagentTokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    let todaySubagentCostUsd = 0;
+    let todaySubagentSteps = 0;
+    const todaySubagentTokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+    if (opts?.includeSubagents !== false) {
+      const descendants: UnifloSession[] = [];
+      const visited = new Set<string>([sessionKey]);
+      let frontier = [sessionKey];
+      for (let depth = 0; depth < 3 && frontier.length > 0 && descendants.length < 80; depth += 1) {
+        const batch = frontier.slice(0, 10);
+        frontier = [];
+        const lists = await Promise.all(
+          batch.map((pk) => {
+            const q = new URLSearchParams({ q: `parent:${pk}`, limit: "100" });
+            return (this.get(`/v1/sessions?${q}`).catch(() => []) as Promise<UnifloSession[]>);
+          }),
+        );
+        for (const list of lists) {
+          for (const child of Array.isArray(list) ? list : []) {
+            if (!child?.key || visited.has(child.key)) continue;
+            visited.add(child.key);
+            descendants.push(child);
+            if ((this.childCounts.get(child.key)?.[0] ?? 0) > 0 && descendants.length < 80) {
+              frontier.push(child.key);
+            }
+          }
+        }
+      }
+
+      subagentCount = descendants.length;
+      const crossDayChildren: UnifloSession[] = [];
+      for (const child of descendants) {
+        const u = child.usage as Record<string, unknown> | undefined;
+        const cSteps = n(u, "steps");
+        const cCost = n(u, "cost_usd");
+        const cUnpriced =
+          typeof u?.unpriced_steps === "number" && Number.isFinite(u.unpriced_steps)
+            ? u.unpriced_steps
+            : u?.cost_usd === null && cSteps > 0
+              ? cSteps
+              : 0;
+        const cIn = n(u, "input");
+        const cOut = n(u, "output");
+        const cCacheR = n(u, "cache_read");
+        const cCacheW = n(u, "cache_write");
+        subagentSteps += cSteps;
+        subagentCostUsd += cCost;
+        subagentUnpricedSteps += cUnpriced;
+        subagentTokens.input += cIn;
+        subagentTokens.output += cOut;
+        subagentTokens.cacheRead += cCacheR;
+        subagentTokens.cacheWrite += cCacheW;
+
+        const startedMs = typeof child.started_at === "number" ? (child.started_at > 1e12 ? child.started_at : child.started_at * 1000) : undefined;
+        const updatedMs = typeof child.updated_at === "number" ? (child.updated_at > 1e12 ? child.updated_at : child.updated_at * 1000) : undefined;
+        if (startedMs !== undefined && startedMs >= startOfToday) {
+          todaySubagentCostUsd += cCost;
+          todaySubagentSteps += cSteps;
+          todaySubagentTokens.input += cIn;
+          todaySubagentTokens.output += cOut;
+          todaySubagentTokens.cacheRead += cCacheR;
+          todaySubagentTokens.cacheWrite += cCacheW;
+        } else if (updatedMs !== undefined && updatedMs >= startOfToday) {
+          crossDayChildren.push(child);
+        }
+      }
+      if (crossDayChildren.length > 0) {
+        const sliced = crossDayChildren.slice(0, 12);
+        const childDetails = await Promise.all(
+          sliced.map((c) =>
+            (this.get(`/v1/sessions/${encodeURIComponent(c.key)}/usage`).catch(() => null) as Promise<{
+              steps?: Array<Record<string, unknown>>;
+            } | null>),
+          ),
+        );
+        for (const cd of childDetails) {
+          if (!cd?.steps?.length) continue;
+          const t = summarizeTodaySteps(cd.steps);
+          todaySubagentCostUsd += t.costUsd;
+          todaySubagentSteps += t.count;
+          todaySubagentTokens.input += t.tokens.input;
+          todaySubagentTokens.output += t.tokens.output;
+          todaySubagentTokens.cacheRead += t.tokens.cacheRead;
+          todaySubagentTokens.cacheWrite += t.tokens.cacheWrite;
+        }
+      }
+    }
+
     return {
       turns: turns.length,
       steps: n(totals, "steps") || steps.length,
@@ -1452,6 +1591,22 @@ export class UnifloAdapter {
       contextTokens,
       contextLimit,
       contextPct,
+      todayCostUsd: todayMain.costUsd,
+      todayUnpricedSteps: todayMain.unpricedSteps,
+      todaySteps: todayMain.count,
+      todayTokens: todayMain.tokens,
+      ...(subagentCount > 0
+        ? {
+            subagentCount,
+            subagentSteps,
+            subagentCostUsd,
+            subagentUnpricedSteps,
+            subagentTokens,
+            todaySubagentCostUsd,
+            todaySubagentSteps,
+            todaySubagentTokens,
+          }
+        : {}),
       model: typeof lastStep?.model === "string" ? lastStep.model : models[0]?.model,
       models,
     };
@@ -1479,6 +1634,7 @@ export class UnifloAdapter {
       startedAt: s.started_at,
       updatedAt: s.updated_at,
       costUsd: typeof s.usage?.cost_usd === "number" ? s.usage.cost_usd : undefined,
+      ...(typeof s.usage?.steps === "number" && s.usage.steps > 0 ? { steps: s.usage.steps } : {}),
       children: this.childCounts.get(s.key)?.[0] ?? 0,
     }));
   }

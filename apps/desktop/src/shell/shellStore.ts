@@ -129,6 +129,15 @@ export type FileTab = TabSplitFields & {
   spaceKey?: string | null;
 };
 export type WebTab = TabSplitFields & { id: string; kind: "web"; webId?: string; url: string; title: string; spaceKey?: string | null };
+export type PortalTab = TabSplitFields & {
+  id: string;
+  kind: "portal";
+  hostId: string;
+  agentKey: string;
+  title: string;
+  activePortalId?: string;
+  spaceKey?: string | null;
+};
 export type DiffTab = TabSplitFields & {
   id: string;
   kind: "diff";
@@ -141,7 +150,7 @@ export type DiffTab = TabSplitFields & {
   title: string;
   spaceKey?: string | null;
 };
-export type ShellTab = AgentTab | FileTab | WebTab | DiffTab;
+export type ShellTab = AgentTab | FileTab | WebTab | DiffTab | PortalTab;
 
 /** Side panel sections (Herdr: files / changes; ours adds git, browser, 小羊, and subagent aside). */
 export type PanelId = "files" | "git" | "browser" | "assistant" | "subagent";
@@ -261,6 +270,16 @@ export function tabToPaneContent(tab: ShellTab): PaneContent {
       ...(tab.spaceKey !== undefined ? { spaceKey: tab.spaceKey } : {}),
     };
   }
+  if (tab.kind === "portal") {
+    return {
+      kind: "portal",
+      hostId: tab.hostId,
+      agentKey: tab.agentKey,
+      title: tab.title,
+      ...(tab.activePortalId ? { activePortalId: tab.activePortalId } : {}),
+      ...(tab.spaceKey !== undefined ? { spaceKey: tab.spaceKey } : {}),
+    };
+  }
   return {
     kind: "web",
     webId: tab.webId ?? tab.id,
@@ -312,6 +331,14 @@ export function paneContentSpaceKey(
     return a ? spaceKeyFromAgent(a) : null;
   }
   if (content.kind === "diff") {
+    if (content.spaceKey) return content.spaceKey;
+    if (content.agentKey) {
+      const a = lookupAgent(content.agentKey);
+      if (a) return spaceKeyFromAgent(a);
+    }
+    return null;
+  }
+  if (content.kind === "portal") {
     if (content.spaceKey) return content.spaceKey;
     if (content.agentKey) {
       const a = lookupAgent(content.agentKey);
@@ -467,7 +494,7 @@ function normalizePersistedShellState(rawInput: unknown): PersistedShellState | 
       Boolean(
         t &&
           typeof t.id === "string" &&
-          (t.kind === "agent" || t.kind === "file" || t.kind === "web" || t.kind === "diff"),
+          (t.kind === "agent" || t.kind === "file" || t.kind === "web" || t.kind === "diff" || t.kind === "portal"),
       ),
     )
     .map(normalizePersistedTab);
@@ -723,7 +750,9 @@ function standaloneTabIdForContent(content: PaneContent, existingIds: ReadonlySe
         ? `f:${content.agentKey}:${content.path}`
         : content.kind === "diff"
           ? `d:${content.deviceId}:${content.cwd}:${content.commit ? content.commit : content.staged ? "staged" : "work"}:${content.path}`
-          : content.webId || `w:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+          : content.kind === "portal"
+            ? `pt:${content.agentKey}`
+            : content.webId || `w:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
   if (!existingIds.has(base)) return base;
   return `${base}:${makeSplitId("p")}`;
 }
@@ -764,6 +793,18 @@ export function contentToStandaloneTab(content: PaneContent, id: string, primary
       staged: content.staged,
       ...(content.commit ? { commit: content.commit } : {}),
       title: content.title,
+      ...(content.spaceKey !== undefined ? { spaceKey: content.spaceKey } : {}),
+      ...paneField,
+    };
+  }
+  if (content.kind === "portal") {
+    return {
+      id,
+      kind: "portal",
+      hostId: content.hostId,
+      agentKey: content.agentKey,
+      title: content.title,
+      ...(content.activePortalId ? { activePortalId: content.activePortalId } : {}),
       ...(content.spaceKey !== undefined ? { spaceKey: content.spaceKey } : {}),
       ...paneField,
     };
@@ -1204,6 +1245,91 @@ export function openDiffTab(opts: {
     tabs: [...s.tabs, tab],
     ...activationTransition(s, id, scope, lookup, spacesMap, { capturePeek: true }),
   });
+}
+
+export function openPortalTab(
+  hostId: string,
+  agentKey: string,
+  title: string,
+  opts?: { activePortalId?: string; spaceKey?: string | null; focus?: boolean },
+): void {
+  const s = shellStore.get();
+  const id = `pt:${agentKey}`;
+  const lookup = makeLiveAgentLookup();
+  const spacesMap = liveStore.get().spaces;
+  const agentRef = opts?.spaceKey === undefined ? lookup(agentKey) : undefined;
+  const resolvedAgentSpace = agentRef ? resolveAgentSpaceKey(agentRef, spacesMap) : null;
+  const scope =
+    opts?.spaceKey !== undefined
+      ? opts.spaceKey
+      : (s.selectedSpace ?? (hasNonEmptySpaceName(resolvedAgentSpace) ? resolvedAgentSpace : null));
+  const hit = findTabWithLeaf(s.tabs, (c) => c.kind === "portal" && c.agentKey === agentKey);
+  if (hit) {
+    if (opts?.focus === false) {
+      set((prev) => ({
+        ...prev,
+        tabs: prev.tabs.map((t) =>
+          t.id === hit.tab.id
+            ? applyRootToTab(
+                t,
+                updateLeafContent(tabRootNode(t), hit.leaf.id, (c) =>
+                  c.kind === "portal"
+                    ? { ...c, title, ...(opts?.activePortalId ? { activePortalId: opts.activePortalId } : {}) }
+                    : c,
+                ),
+              )
+            : t,
+        ),
+      }));
+      return;
+    }
+    set(
+      focusTabAndLeaf(
+        s,
+        hit.tab,
+        hit.leaf.id,
+        scope,
+        lookup,
+        spacesMap,
+        (c) =>
+          c.kind === "portal"
+            ? { ...c, title, ...(opts?.activePortalId ? { activePortalId: opts.activePortalId } : {}) }
+            : c,
+        { capturePeek: true },
+      ),
+    );
+    return;
+  }
+  const tab: PortalTab = {
+    id,
+    kind: "portal",
+    hostId,
+    agentKey,
+    title,
+    ...(opts?.activePortalId ? { activePortalId: opts.activePortalId } : {}),
+    ...(scope ? { spaceKey: scope } : {}),
+  };
+  if (opts?.focus === false) {
+    set({ tabs: [...s.tabs, tab] });
+    return;
+  }
+  set({
+    tabs: [...s.tabs, tab],
+    ...activationTransition(s, id, scope, lookup, spacesMap, { capturePeek: true }),
+  });
+}
+
+export function updatePortalTabActive(tabId: string, paneId: string, activePortalId: string): void {
+  set((s) => ({
+    ...s,
+    tabs: s.tabs.map((t) => {
+      if (t.id !== tabId) return t;
+      const root = updateLeafContent(tabRootNode(t), paneId, (c) =>
+        c.kind === "portal" ? { ...c, activePortalId } : c,
+      );
+      return applyRootToTab(t, root);
+    }),
+  }));
 }
 
 export function openWebTab(url: string, title?: string, opts?: { spaceKey?: string | null; insertBeforeId?: string }): void {
@@ -2332,9 +2458,11 @@ export function stableSplitLeafKeys(leaves: readonly SplitLeafNode[]): string[] 
         ? `agent:${c.agentKey}`
         : c.kind === "web"
           ? `web:${c.webId}`
-          : c.kind === "file"
-            ? `file:${c.agentKey}:${c.path}`
-            : `diff:${c.deviceId}:${c.cwd}:${c.commit || (c.staged ? "staged" : "work")}:${c.path}`;
+          : c.kind === "portal"
+            ? `portal:${c.agentKey}`
+            : c.kind === "file"
+              ? `file:${c.agentKey}:${c.path}`
+              : `diff:${c.deviceId}:${c.cwd}:${c.commit || (c.staged ? "staged" : "work")}:${c.path}`;
     const occ = seen.get(base) ?? 0;
     seen.set(base, occ + 1);
     return occ === 0 ? base : `${base}#${occ}`;

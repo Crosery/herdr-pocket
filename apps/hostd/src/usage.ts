@@ -134,7 +134,7 @@ export interface CachedSessionUsageSummary {
 export interface UsageLike {
   sessionUsage(
     sessionKey: string,
-    opts?: { skipModels?: boolean },
+    opts?: { skipModels?: boolean; includeSubagents?: boolean },
   ): Promise<{
     turns: number;
     steps: number;
@@ -149,6 +149,18 @@ export interface UsageLike {
     contextTokens?: number;
     contextLimit?: number;
     contextPct?: number;
+    todayCostUsd?: number;
+    todayUnpricedSteps?: number;
+    todaySteps?: number;
+    todayTokens?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    subagentCount?: number;
+    subagentSteps?: number;
+    subagentCostUsd?: number;
+    subagentUnpricedSteps?: number;
+    subagentTokens?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    todaySubagentCostUsd?: number;
+    todaySubagentSteps?: number;
+    todaySubagentTokens?: { input: number; output: number; cacheRead: number; cacheWrite: number };
     model?: string;
     models: AgentUsageModelRow[];
   }>;
@@ -206,7 +218,7 @@ export async function getAgentUsageReport(
 
   const sessionPromise =
     uniflo && effectiveKey
-      ? uniflo.sessionUsage(effectiveKey, isLite ? { skipModels: true } : undefined).catch(() => null)
+      ? uniflo.sessionUsage(effectiveKey, isLite ? { skipModels: true, includeSubagents: false } : { includeSubagents: true }).catch(() => null)
       : Promise.resolve(null);
   const w24Promise = uniflo
     ? isLite
@@ -245,6 +257,18 @@ export async function getAgentUsageReport(
         : agent.contextTokens !== undefined && agent.contextLimit
           ? { contextPct: (agent.contextTokens / agent.contextLimit) * 100 }
           : {}),
+      ...(detail.todayCostUsd !== undefined ? { todayCostUsd: detail.todayCostUsd } : {}),
+      ...(detail.todayUnpricedSteps !== undefined ? { todayUnpricedSteps: detail.todayUnpricedSteps } : {}),
+      ...(detail.todaySteps !== undefined ? { todaySteps: detail.todaySteps } : {}),
+      ...(detail.todayTokens !== undefined ? { todayTokens: detail.todayTokens } : {}),
+      ...(detail.subagentCount !== undefined ? { subagentCount: detail.subagentCount } : {}),
+      ...(detail.subagentSteps !== undefined ? { subagentSteps: detail.subagentSteps } : {}),
+      ...(detail.subagentCostUsd !== undefined ? { subagentCostUsd: detail.subagentCostUsd } : {}),
+      ...(detail.subagentUnpricedSteps !== undefined ? { subagentUnpricedSteps: detail.subagentUnpricedSteps } : {}),
+      ...(detail.subagentTokens !== undefined ? { subagentTokens: detail.subagentTokens } : {}),
+      ...(detail.todaySubagentCostUsd !== undefined ? { todaySubagentCostUsd: detail.todaySubagentCostUsd } : {}),
+      ...(detail.todaySubagentSteps !== undefined ? { todaySubagentSteps: detail.todaySubagentSteps } : {}),
+      ...(detail.todaySubagentTokens !== undefined ? { todaySubagentTokens: detail.todaySubagentTokens } : {}),
     };
   } else if (cachedSummary) {
     const contextTokens = cachedSummary.contextTokens ?? agent.contextTokens;

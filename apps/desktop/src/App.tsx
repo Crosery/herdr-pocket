@@ -11,6 +11,11 @@ import "./styles/mobile-parity.css";
 import { PairPhoneModal } from "./components/PairPhoneModal";
 import { ConnectRelayPanel, RELAY_EXPLAINER } from "./components/ConnectRelayPanel";
 import { H5InstallAppCard } from "./components/H5InstallAppCard";
+import {
+  TutorialSandboxStage,
+  closeInteractiveTutorialReplay,
+  tutorialReplayStore,
+} from "./components/TutorialSandboxStage";
 import { UpdatePrompt } from "./components/UpdatePrompt";
 import { VoiceHud } from "./components/VoiceInput";
 import { AgentsView } from "./views/AgentsView";
@@ -49,6 +54,7 @@ import {
   getJoinRequest,
   pairWithLocalHostWithin,
   pingRelay,
+  setTutorialStatus,
   signOut,
   startRelayLink,
   stopRelayLink,
@@ -95,6 +101,9 @@ function PocketAppShell() {
   const uiFontFamily = clientConfigStore.use((s) => s.config.general.fontFamily);
   const collapsedPref = settingsStore.use((s) => s.sidebarCollapsed);
   const onboarding = settingsStore.use((s) => s.onboarding);
+  const tutorialStatus = settingsStore.use((s) => s.tutorialStatus);
+  const tutorialServerSynced = liveStore.use((s) => s.tutorialServerSynced);
+  const tutorialReplayOpen = tutorialReplayStore.use((s) => s.open);
   const link = liveStore.use((s) => s.link);
   const agentsMap = liveStore.use((s) => s.agents);
   const unread = assistantStore.use((s) => s.unread);
@@ -135,8 +144,29 @@ function PocketAppShell() {
   const [passkeyErr, setPasskeyErr] = useState<string | null>(null);
   // Desktop without a relay: the guide floats over the (empty) shell and can be closed.
   const [firstGuideClosed, setFirstGuideClosed] = useState(false);
+  const [tutorialGraceElapsed, setTutorialGraceElapsed] = useState(false);
   const mobileRef = useRef(mobileLayout);
   mobileRef.current = mobileLayout;
+
+  // Give the relay up to 1200ms after boot to send welcome.tutorialStatus so cleared-cache returning users never flash the tutorial.
+  useEffect(() => {
+    if (boot !== "ready" || !server || tutorialStatus !== 0 || tutorialServerSynced) {
+      setTutorialGraceElapsed(false);
+      return;
+    }
+    const t = window.setTimeout(() => setTutorialGraceElapsed(true), 1200);
+    return () => window.clearTimeout(t);
+  }, [boot, server, tutorialServerSynced, tutorialStatus]);
+
+  const showAutoTutorial = Boolean(
+    boot === "ready" &&
+      server &&
+      !guide &&
+      !tutorialReplayOpen &&
+      tutorialStatus === 0 &&
+      (tutorialServerSynced || tutorialGraceElapsed),
+  );
+  const activeTutorialMode = tutorialReplayOpen ? "replay" : showAutoTutorial ? "auto" : null;
 
   const maybePromptH5Passkey = useCallback((pairedServer: string, res?: PairResponse | null) => {
     if (!isH5Web() || !res || res.device.passkeyLinked || isMockServer(pairedServer) || !isPasskeySupported()) {
@@ -857,6 +887,27 @@ function PocketAppShell() {
           </div>
         ) : null}
       </PocketModal>
+      {activeTutorialMode ? (
+        <TutorialSandboxStage
+          mode={activeTutorialMode}
+          onComplete={() => {
+            if (activeTutorialMode === "replay") {
+              closeInteractiveTutorialReplay();
+              return;
+            }
+            void setTutorialStatus(2);
+            toast("新手教程已完成，欢迎进入工作台");
+          }}
+          onSkip={() => {
+            if (activeTutorialMode === "replay") {
+              closeInteractiveTutorialReplay();
+              return;
+            }
+            void setTutorialStatus(1);
+            toast("已跳过教程，随时可在「设置 → 重温互动教程」再次体验");
+          }}
+        />
+      ) : null}
     </>
   );
 

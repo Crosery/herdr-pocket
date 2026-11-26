@@ -274,6 +274,9 @@ export function PocketSelect({
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!open) return;
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("pocket:close-popovers", { detail: "modal" }));
+    }
     overlayStore.set((p) => ({ open: p.open + 1 }));
     return () => overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
   }, [open]);
@@ -365,6 +368,9 @@ export function PocketModal({
 }) {
   useEffect(() => {
     if (!open) return;
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("pocket:close-popovers", { detail: "modal" }));
+    }
     overlayStore.set((p) => ({ open: p.open + 1 }));
     return () => overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
   }, [open]);
@@ -379,10 +385,10 @@ export function PocketModal({
               {subtitle ? <Dialog.Description className="sr-only">{subtitle}</Dialog.Description> : null}
             </>
           ) : (
-            <div className="between" style={{ marginBottom: 12 }}>
-              <div>
-                <Dialog.Title className="pk-dialog-title">{title}</Dialog.Title>
-                {subtitle ? <Dialog.Description className="faint">{subtitle}</Dialog.Description> : null}
+            <div className="between pk-dialog-head">
+              <div className="pk-dialog-head-copy">
+                <Dialog.Title className="pk-dialog-title truncate">{title}</Dialog.Title>
+                {subtitle ? <Dialog.Description className="pk-dialog-subtitle faint truncate">{subtitle}</Dialog.Description> : null}
               </div>
               <Dialog.Close asChild>
                 <PocketIconButton size="sm" aria-label="关闭">

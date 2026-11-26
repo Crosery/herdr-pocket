@@ -488,34 +488,77 @@ export function AgentUsageCard({
             </div>
           </div>
 
-          {report ? (
-            <div className="usage-summary-strip mono">
-              {s ? (
-                <>
-                  <span>
-                    费用 <b>{fmtUsd(s.costUsd, s.unpricedSteps, s.steps)}</b>
+          {s ? (() => {
+            const subCount = s.subagentCount ?? 0;
+            const subCost = s.subagentCostUsd ?? 0;
+            const subSteps = s.subagentSteps ?? 0;
+            const subUnpriced = s.subagentUnpricedSteps ?? 0;
+            const totalCost = s.costUsd + subCost;
+            const totalSteps = s.steps + subSteps;
+            const totalUnpriced = s.unpricedSteps + subUnpriced;
+
+            const todayMainCost = s.todayCostUsd ?? s.costUsd;
+            const todaySubCost = s.todaySubagentCostUsd ?? 0;
+            const todayTotalCost = todayMainCost + todaySubCost;
+            const todayMainSteps = s.todaySteps ?? s.steps;
+            const todaySubSteps = s.todaySubagentSteps ?? 0;
+            const todayTotalSteps = todayMainSteps + todaySubSteps;
+            const todayUnpriced = s.todayUnpricedSteps ?? s.unpricedSteps;
+
+            const totalIn = s.input + (s.subagentTokens?.input ?? 0);
+            const totalOut = s.output + (s.subagentTokens?.output ?? 0);
+            const totalCache = s.cacheRead + (s.subagentTokens?.cacheRead ?? 0);
+            const totalTokensAll = totalIn + totalOut;
+
+            return (
+              <div className="usage-kpi-grid" aria-label="当前会话与子 Agent 花费及消耗">
+                <div className="usage-kpi-cell is-focus">
+                  <span className="usage-kpi-label">今日花费{subCount > 0 ? "（含子 Agent）" : ""}</span>
+                  <span className="usage-kpi-val mono num">
+                    {fmtUsd(todayTotalCost, todayUnpriced, todayTotalSteps)}
                   </span>
-                  <span>
-                    <b>{s.turns}</b> 轮 / <b>{s.steps}</b> 步
+                  <span className="usage-kpi-sub mono truncate">
+                    {todaySubCost > 0
+                      ? `主会话 ${fmtUsd(todayMainCost, todayUnpriced, todayMainSteps)} + 子 Agent ${fmtUsd(todaySubCost, 0, todaySubSteps)}`
+                      : `今日 ${todayTotalSteps} 步`}
                   </span>
-                  <span>
-                    入/出 {fmtTokens(s.input)} / {fmtTokens(s.output)}
+                </div>
+
+                <div className="usage-kpi-cell">
+                  <span className="usage-kpi-label">会话累计{subCount > 0 ? "（含子 Agent）" : ""}</span>
+                  <span className="usage-kpi-val mono num">
+                    {fmtUsd(totalCost, totalUnpriced, totalSteps)}
                   </span>
-                  {s.cacheRead > 0 ? <span>缓存 {fmtTokens(s.cacheRead)}</span> : null}
-                </>
-              ) : null}
-              {report.day24h ? (
-                <span>
-                  24h <b>{fmtUsd(report.day24h.total.costUsd, 0, 1)}</b>
-                </span>
-              ) : null}
-              {report.day7d ? (
-                <span>
-                  7d <b>{fmtUsd(report.day7d.total.costUsd, 0, 1)}</b>
-                </span>
-              ) : null}
-            </div>
-          ) : null}
+                  <span className="usage-kpi-sub mono truncate">
+                    {subCount > 0
+                      ? `含 ${subCount} 个子 Agent（${fmtUsd(subCost, subUnpriced, subSteps)}）`
+                      : `共 ${s.turns} 轮对话`}
+                  </span>
+                </div>
+
+                <div className="usage-kpi-cell">
+                  <span className="usage-kpi-label">轮次与步骤</span>
+                  <span className="usage-kpi-val mono num">
+                    {s.turns} 轮 · {totalSteps} 步
+                  </span>
+                  <span className="usage-kpi-sub mono truncate">
+                    {subSteps > 0
+                      ? `主 ${s.steps} 步 + 子 ${subSteps} 步 · 今日 ${todayTotalSteps} 步`
+                      : `今日 ${todayTotalSteps} 步`}
+                  </span>
+                </div>
+
+                <div className="usage-kpi-cell">
+                  <span className="usage-kpi-label">Token 消耗</span>
+                  <span className="usage-kpi-val mono num">{fmtTokens(totalTokensAll)}</span>
+                  <span className="usage-kpi-sub mono truncate">
+                    入 {fmtTokens(totalIn)} · 出 {fmtTokens(totalOut)}
+                    {totalCache > 0 ? ` · 缓存 ${fmtTokens(totalCache)}` : ""}
+                  </span>
+                </div>
+              </div>
+            );
+          })() : null}
         </div>
       )}
     </section>

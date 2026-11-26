@@ -707,7 +707,8 @@ test("terminal stability and pane-header hover guards cap WebGL contexts and avo
   const paneRightSlice = shellWork.slice(paneRightIdx, paneRightEnd);
   const statusIdx = paneRightSlice.indexOf("<StatusMark");
   const subTriggerIdx = paneRightSlice.indexOf("<SubagentCatalogTrigger");
-  assert.ok(statusIdx >= 0 && subTriggerIdx > statusIdx, "StatusMark must precede SubagentCatalogTrigger in PaneHead");
+  assert.equal(statusIdx, -1, "PaneHead must omit redundant StatusMark text when online");
+  assert.ok(subTriggerIdx >= 0, "SubagentCatalogTrigger must stay rendered in PaneHead");
 
   const mockSrc = readFileSync(resolve(testDir, "../src/lib/mock.ts"), "utf8");
   assert.equal(mockSrc.includes('method === "agent.seen"'), true, "desktop mock mode should handle agent.seen done->idle transition");

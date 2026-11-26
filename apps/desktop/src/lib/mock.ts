@@ -75,6 +75,10 @@ const DEMO_AGENTS: Agent[] = [
     contextTokens: 73_266,
     contextLimit: 200_000,
     cacheHitPct: 77.6,
+    listeningPorts: [
+      { port: 5173, pid: 41201, processName: "node", host: "127.0.0.1", protocol: "http", title: "Vite · Demo App", url: "http://localhost:5173" },
+      { port: 8000, pid: 41288, processName: "uvicorn", host: "127.0.0.1", protocol: "http", title: "FastAPI · Auth Docs", url: "http://localhost:8000" },
+    ],
     isShell: false,
     sessionKey: "claude:demo-1",
     updatedAt: now,
@@ -95,8 +99,11 @@ const DEMO_AGENTS: Agent[] = [
     contextTokens: 124_800,
     contextLimit: 272_000,
     cacheHitPct: 91.6,
-    subagents: 2,
-    subagentsWorking: 1,
+    listeningPorts: [
+      { port: 3000, pid: 42110, processName: "node", host: "127.0.0.1", protocol: "http", title: "Next.js Dev", url: "http://localhost:3000" },
+    ],
+    subagents: 5,
+    subagentsWorking: 2,
     queued: 1,
     queuedText: "顺便检查边界用例并补充集成测试",
     queuedItems: ["顺便检查边界用例并补充集成测试"],
@@ -698,15 +705,42 @@ const demoPortals: PortalItem[] = [
     agentKey: "dev-mac/hc:t2",
     terminalId: "t2",
     kind: "browser",
-    title: "GitHub OAuth 登录授权 · 127.0.0.1:8787",
-    subtitle: "http://127.0.0.1:8787/oauth/callback?provider=github",
-    url: "http://127.0.0.1:8787/oauth/callback?provider=github",
+    title: "https://accounts.example.com/v3/signin/oauth/authorize?client_id=9876543210-demo-herdr-pocket.apps.googleusercontent.com&redirect_uri=http%3A%2F%2F127.0.0.1%3A8787%2Foauth%2Fcallback&response_type=code&scope=openid%20email%20profile&state=pkce_demo_very_long_state_token_9283746512",
+    subtitle: "https://accounts.example.com/v3/signin/oauth/authorize?client_id=9876543210-demo-herdr-pocket.apps.googleusercontent.com&redirect_uri=http%3A%2F%2F127.0.0.1%3A8787%2Foauth%2Fcallback&response_type=code&scope=openid%20email%20profile&state=pkce_demo_very_long_state_token_9283746512",
+    url: "https://accounts.example.com/v3/signin/oauth/authorize?client_id=9876543210-demo-herdr-pocket.apps.googleusercontent.com&redirect_uri=http%3A%2F%2F127.0.0.1%3A8787%2Foauth%2Fcallback&response_type=code&scope=openid%20email%20profile&state=pkce_demo_very_long_state_token_9283746512",
     canInteract: true,
     transportHint: "p2p",
     width: 960,
     height: 600,
     createdAt: now - 2 * min,
     updatedAt: now - 10_000,
+  },
+  {
+    id: "ptl-demo-ego",
+    hostId: "dev-mac",
+    agentKey: "dev-mac/hc:t1",
+    terminalId: "t1",
+    kind: "window",
+    windowId: "win:chrome-1",
+    title: "EG 空间 · 登录回调回归验证",
+    subtitle: "正在验证 OAuth 回调重定向",
+    url: "http://localhost:5173/auth/callback",
+    canInteract: true,
+    transportHint: "p2p",
+    width: 1140,
+    height: 760,
+    egoSpace: {
+      spaceId: 12,
+      spaceName: "登录回调回归验证",
+      ownership: "agent",
+      phase: "running",
+      pageLabel: "p1",
+      activeTabTitle: "Demo App · Auth Callback",
+      tabCount: 2,
+      lastAction: "检查重定向参数并截图核验",
+    },
+    createdAt: now - 90_000,
+    updatedAt: now - 5_000,
   },
   {
     id: "ptl-demo-reveal",
@@ -1023,6 +1057,7 @@ export const mockApi = {
         "dev-mac": demoSpacesForHost("dev-mac"),
         "dev-linux": demoSpacesForHost("dev-linux"),
       },
+      tutorialServerSynced: true,
       rev: liveStore.get().rev + 1,
     });
   },
@@ -1055,8 +1090,81 @@ export const mockApi = {
       const children: SubSession[] =
         params.agent === "dev-mac/hc:t2"
           ? [
-              { key: "sub-1", parent: "codex:demo-2", harness: "codex", title: "测试 WS 重连", status: "working", updatedAt: Date.now(), children: 0 },
-              { key: "sub-2", parent: "codex:demo-2", harness: "codex", title: "校验类型定义", status: "idle", updatedAt: Date.now() - 2 * min, children: 0 },
+              {
+                key: "sub-1",
+                parent: "codex:demo-2",
+                harness: "codex",
+                title: "research",
+                role: "research",
+                model: "gpt-5.4",
+                status: "working",
+                statusSince: Date.now() - 48_000,
+                updatedAt: Date.now(),
+                steps: 7,
+                costUsd: 0.14,
+                preview: "排查 WebSocket 断线重连后流订阅状态未重置的根因",
+                children: 0,
+              },
+              {
+                key: "sub-2",
+                parent: "codex:demo-2",
+                harness: "codex",
+                title: "research",
+                role: "research",
+                model: "claude-sonnet-5",
+                status: "working",
+                statusSince: Date.now() - 22_000,
+                updatedAt: Date.now() - 3_000,
+                steps: 4,
+                costUsd: 0.09,
+                preview: "验证多端分屏 240px 窄窗下输入栏与标题栏不重叠",
+                children: 0,
+              },
+              {
+                key: "sub-3",
+                parent: "codex:demo-2",
+                harness: "codex",
+                title: "research",
+                role: "research",
+                model: "claude-haiku-5-5",
+                status: "idle",
+                statusSince: Date.now() - 4 * min,
+                updatedAt: Date.now() - 4 * min,
+                steps: 6,
+                costUsd: 0.04,
+                preview: "[Message] timestamp=2026-11-26T12:10:00Z content=核对 protocol 与 hostd 的端口发现契约定义",
+                children: 0,
+              },
+              {
+                key: "sub-4",
+                parent: "codex:demo-2",
+                harness: "codex",
+                title: "校验类型定义",
+                role: "review",
+                model: "gpt-5.4",
+                status: "idle",
+                statusSince: Date.now() - 7 * min,
+                updatedAt: Date.now() - 7 * min,
+                steps: 5,
+                costUsd: 0.08,
+                preview: "完成 AgentListeningPort 与 AgentUsageReport 字段兼容性审核",
+                children: 0,
+              },
+              {
+                key: "sub-5",
+                parent: "codex:demo-2",
+                harness: "codex",
+                title: "explore",
+                role: "explore",
+                model: "gemini-2.5-pro",
+                status: "idle",
+                statusSince: Date.now() - 12 * min,
+                updatedAt: Date.now() - 12 * min,
+                steps: 3,
+                costUsd: 0.03,
+                preview: "盘点桌面端代码预览高亮组件与暗色主题令牌",
+                children: 0,
+              },
             ]
           : [];
       return { sessions: children };
@@ -1283,6 +1391,18 @@ export const mockApi = {
           reasoning: 1_840,
           costUsd: 1.42,
           unpricedSteps: 0,
+          todayCostUsd: 0.96,
+          todayUnpricedSteps: 0,
+          todaySteps: 12,
+          todayTokens: { input: 98_400, output: 19_210, cacheRead: 382_100, cacheWrite: 9_800 },
+          subagentCount: a?.subagents ?? 2,
+          subagentSteps: 25,
+          subagentCostUsd: 0.38,
+          subagentUnpricedSteps: 0,
+          subagentTokens: { input: 46_200, output: 11_480, cacheRead: 164_000, cacheWrite: 4_100 },
+          todaySubagentCostUsd: 0.31,
+          todaySubagentSteps: 19,
+          todaySubagentTokens: { input: 39_100, output: 9_620, cacheRead: 138_500, cacheWrite: 3_400 },
           contextTokens: 73_266,
           contextLimit: 200_000,
           contextPct: 36.63,
@@ -1941,6 +2061,51 @@ export const mockApi = {
     }
     if (method === "portal.observeCommand") {
       return { ok: true };
+    }
+    if (method === "portal.egoSpaces") {
+      return {
+        available: true,
+        spaces: [
+          {
+            spaceId: 12,
+            spaceName: "登录回调回归验证",
+            ownership: "agent",
+            phase: "working",
+            pageLabel: "p1",
+            activeTabTitle: "Demo App · Auth Callback",
+            tabCount: 2,
+            lastAction: "检查重定向参数并截图核验",
+          },
+          {
+            spaceId: 15,
+            spaceName: "文档站巡检",
+            ownership: "agentDelegatedToUser",
+            phase: "handoff",
+            pageLabel: "p2",
+            activeTabTitle: "SSO 登录确认",
+            tabCount: 1,
+            lastAction: "等待用户完成扫码登录",
+          },
+        ],
+      };
+    }
+    if (method === "agent.ports") {
+      const a = DEMO_AGENTS.find((x) => x.key === params?.agent);
+      if (!a) return { ports: [] };
+      if (params?.action === "stop" && typeof params?.port === "number") {
+        a.listeningPorts = (a.listeningPorts ?? []).filter((p) => p.port !== params.port);
+        mockApi.connect();
+      }
+      return { ports: a.listeningPorts ?? [] };
+    }
+    if (method === "spaces.sync") {
+      return {
+        syncedToCore: 1,
+        syncedToHerdr: 0,
+        migratedAgents: params?.mode === "migrate" ? 1 : 0,
+        herdrAvailable: true,
+        spaces: demoSpacesForHost(to),
+      };
     }
     if (method === "browser.status") {
       const enabled = clientConfigStore.get().config.plugins.aiBrowser;

@@ -1,0 +1,743 @@
+/* Gamified Interactive First-Run Sandbox Tutorial (Light & Dark Tokenized) */
+.tut-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  flex-direction: column;
+  background: var(--page);
+  color: var(--ink);
+  transition: opacity 0.18s ease;
+}
+
+.tut-overlay.is-exiting {
+  opacity: 0;
+  pointer-events: none;
+}
+
+html[data-app-focused="false"] .tut-overlay,
+html[data-app-focused="false"] .tut-overlay * {
+  animation: none !important;
+}
+
+.tut-top-ribbon {
+  position: relative;
+  z-index: 1230;
+  height: 48px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px 0 max(16px, var(--tl-safe-left, 82px));
+  background: var(--surface);
+  border-bottom: 1px solid var(--divider);
+}
+
+.tut-top-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: calc(12.5px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--accent-text);
+}
+
+.tut-top-sep {
+  opacity: 0.45;
+}
+
+.tut-top-sub {
+  font-weight: 500;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tut-skip-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+}
+
+.tut-skip-btn:hover {
+  border-color: var(--line-pink);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.tut-sandbox-frame {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  padding: 14px;
+  gap: 12px;
+  background: var(--page);
+  background-image: var(--aura);
+  overflow: hidden;
+}
+
+.tut-sim-sidebar {
+  width: 244px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 16px;
+  background: var(--surface);
+  border: 1px solid var(--divider);
+  box-shadow: var(--shadow-sm);
+}
+
+.tut-sim-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  color: var(--ink);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.tut-sim-sec-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--faint);
+  margin-top: 4px;
+}
+
+.tut-sim-space {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--divider);
+}
+
+.tut-sim-space.active {
+  background: var(--accent-soft);
+  border-color: var(--line-pink);
+  color: var(--accent-text);
+}
+
+.tut-sim-badge {
+  margin-left: auto;
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.tut-sim-agent {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 10px;
+  border-radius: 11px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.tut-sim-agent:hover,
+.tut-sim-agent.active {
+  border-color: var(--line-pink);
+  background: var(--accent-soft);
+}
+
+.tut-sim-agent.needs-you {
+  border-color: var(--primary);
+}
+
+.tut-sim-agent-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.tut-sim-agent-title {
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.tut-sim-status {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+
+.tut-sim-status.blocked { background: var(--accent-soft); color: var(--accent-text); }
+.tut-sim-status.working { background: var(--sky-soft); color: var(--sky-text); }
+.tut-sim-status.done { background: var(--mint-soft); color: var(--mint-text); }
+
+.tut-sim-agent-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tut-sim-side-foot {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--divider);
+}
+
+.tut-sim-qr-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+  padding: 6px 8px;
+  border-radius: 9px;
+  background: var(--surface-2);
+}
+
+.tut-sim-main {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  background: var(--surface);
+  border: 1px solid var(--divider);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.tut-sim-topbar {
+  height: 40px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--divider);
+}
+
+.tut-sim-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--divider);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.tut-sim-top-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line-pink);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tut-sim-pane {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.tut-sim-pane-head {
+  height: 36px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.tut-sim-pane-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.tut-sim-pane-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.tut-sim-port-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--mint-soft);
+  color: var(--mint-text);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.tut-sim-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tut-sim-mode-btn.active {
+  border-color: var(--line-pink);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.tut-sim-pane-body {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  padding: 18px 22px;
+  overflow-y: auto;
+}
+
+.tut-sim-pip {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  width: 248px;
+  padding: 0;
+  border-radius: 13px;
+  border: 1px solid var(--line-pink);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  text-align: left;
+  cursor: pointer;
+  z-index: 5;
+  animation: fadeSlideUp 0.22s var(--ease-out);
+}
+
+.tut-sim-pip.expanded {
+  width: 286px;
+  border-color: var(--primary);
+}
+
+.tut-sim-pip-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--divider);
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.tut-sim-pip-preview {
+  padding: 14px 12px;
+  background: linear-gradient(135deg, var(--accent-soft), var(--lav-soft));
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.tut-sim-poster-badge {
+  align-self: flex-start;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--accent-text);
+}
+
+.tut-sim-poster-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.tut-sim-poster-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.tut-sim-chat {
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.tut-bubble {
+  padding: 10px 14px;
+  border-radius: 14px;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+.tut-bubble.user {
+  align-self: flex-end;
+  background: var(--accent-soft);
+  color: var(--ink);
+  border: 1px solid var(--line-pink);
+}
+
+.tut-bubble.assistant {
+  align-self: flex-start;
+  background: var(--surface-2);
+  color: var(--ink);
+  border: 1px solid var(--divider);
+}
+
+.tut-bubble.is-new {
+  border-color: var(--line-pink);
+  animation: fadeSlideUp 0.2s var(--ease-out);
+}
+
+.tut-ask-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line-pink);
+  background: var(--surface-2);
+}
+
+.tut-ask-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tut-ask-pill {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.tut-ask-opt {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 11px;
+  border: 1px solid var(--divider);
+  background: var(--surface);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.tut-ask-opt:hover,
+.tut-ask-opt.picked {
+  border-color: var(--primary);
+  background: var(--accent-soft);
+}
+
+.tut-ask-opt.muted-opt {
+  opacity: 0.72;
+  cursor: default;
+}
+
+.tut-ask-key {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: var(--surface-2);
+  border: 1px solid var(--divider);
+  color: var(--accent-text);
+  display: grid;
+  place-items: center;
+  font-size: 11.5px;
+  font-weight: 800;
+  flex: none;
+}
+
+.tut-ask-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+}
+
+.tut-sim-term {
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: var(--tp-term-bg);
+  color: var(--tp-term-fg);
+  border: 1px solid var(--divider);
+  font-size: 12.5px;
+  line-height: 1.75;
+  max-width: 560px;
+}
+
+.tut-term-line.faint { color: var(--faint); }
+.tut-term-line.mint { color: var(--mint-text); font-weight: 700; }
+.tut-term-line.pink { color: var(--accent-text); font-weight: 700; }
+
+/* Spotlight & Guide Layers */
+.tut-mask-svg {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1210;
+  pointer-events: none;
+}
+
+.tut-blocker {
+  position: fixed;
+  z-index: 1211;
+  background: transparent;
+}
+
+.tut-spotlight-ring {
+  position: fixed;
+  z-index: 1212;
+  border-radius: 12px;
+  border: 2px solid var(--primary);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary) 26%, transparent);
+  pointer-events: none;
+  transition: left 0.22s var(--ease-out), top 0.22s var(--ease-out), width 0.22s var(--ease-out), height 0.22s var(--ease-out);
+}
+
+.tut-spotlight-ring.is-pulsing {
+  animation: tutRingPulse 0.4s ease;
+}
+
+@keyframes tutRingPulse {
+  0%, 100% { transform: scale(1); }
+  45% { transform: scale(1.04); }
+}
+
+.tut-guide-card {
+  position: fixed;
+  z-index: 1220;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--line-pink);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: fadeSlideUp 0.2s var(--ease-out);
+}
+
+.tut-guide-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tut-guide-step-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.tut-guide-count {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.tut-progress-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.tut-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary);
+  transition: width 0.24s var(--ease-out);
+}
+
+.tut-guide-title {
+  margin: 2px 0 0;
+  font-size: calc(15px * var(--ts, 1));
+  font-weight: 800;
+  color: var(--ink);
+  line-height: 1.35;
+}
+
+.tut-guide-body {
+  margin: 0;
+  font-size: calc(12.5px * var(--ts, 1));
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.tut-guide-hint {
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--accent-text);
+  padding: 6px 9px;
+  border-radius: 9px;
+  background: var(--accent-soft);
+}
+
+.tut-guide-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+/* Completion Card */
+.tut-finish-backdrop {
+  position: fixed;
+  inset: 48px 0 0;
+  z-index: 1225;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 16, 30, 0.52);
+  backdrop-filter: blur(6px);
+}
+
+.tut-finish-card {
+  width: min(440px, 100%);
+  padding: 24px 24px 22px;
+  border-radius: 22px;
+  border: 1px solid var(--line-pink);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  animation: fadeSlideUp 0.24s var(--ease-out);
+}
+
+.tut-finish-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--mint-soft);
+  color: var(--mint-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.tut-finish-title {
+  margin: 2px 0 0;
+  font-size: 21px;
+  color: var(--ink);
+}
+
+.tut-finish-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.tut-finish-remind {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--divider);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.tut-finish-acts {
+  margin-top: 6px;
+}
+
+@media (max-width: 760px) {
+  .tut-top-sub,
+  .tut-top-sep {
+    display: none;
+  }
+  .tut-sandbox-frame {
+    flex-direction: column;
+    padding: 8px;
+    gap: 8px;
+  }
+  .tut-sim-sidebar {
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 8px;
+  }
+  .tut-sim-brand,
+  .tut-sim-sec-label,
+  .tut-sim-space,
+  .tut-sim-side-foot {
+    display: none;
+  }
+  .tut-sim-agent {
+    flex: 1 1 140px;
+  }
+  .tut-sim-pip {
+    position: static;
+    width: 100%;
+    margin-bottom: 10px;
+  }
+}

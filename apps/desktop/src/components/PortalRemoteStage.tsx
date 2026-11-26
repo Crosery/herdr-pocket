@@ -194,6 +194,31 @@ export function PortalRemoteStage({
       drawCurrentFrame();
     };
 
+    let revokeUrl: string | null = null;
+    const loadViaImage = () => {
+      if (cancelled || seqToken !== decodeSeqRef.current) return;
+      const img = new Image();
+      img.onload = () => {
+        if (revokeUrl) {
+          URL.revokeObjectURL(revokeUrl);
+          revokeUrl = null;
+        }
+        commitSource(img);
+      };
+      img.onerror = () => {
+        if (revokeUrl) {
+          URL.revokeObjectURL(revokeUrl);
+          revokeUrl = null;
+        }
+      };
+      if (hasBinary && frame.rawBytes) {
+        revokeUrl = URL.createObjectURL(new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime }));
+        img.src = revokeUrl;
+      } else {
+        img.src = `data:${mime};base64,${frame.data}`;
+      }
+    };
+
     if (typeof createImageBitmap === "function" && (hasBinary || typeof atob === "function")) {
       try {
         let blob: Blob;
@@ -207,30 +232,17 @@ export function PortalRemoteStage({
         }
         void createImageBitmap(blob)
           .then(commitSource)
-          .catch(() => {});
+          .catch(() => loadViaImage());
         return () => {
           cancelled = true;
+          if (revokeUrl) URL.revokeObjectURL(revokeUrl);
         };
       } catch {
         // fall through to HTMLImageElement
       }
     }
 
-    const img = new Image();
-    let revokeUrl: string | null = null;
-    img.onload = () => {
-      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
-      commitSource(img);
-    };
-    img.onerror = () => {
-      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
-    };
-    if (hasBinary && frame.rawBytes) {
-      revokeUrl = URL.createObjectURL(new Blob([frame.rawBytes as Uint8Array<ArrayBuffer>], { type: mime }));
-      img.src = revokeUrl;
-    } else {
-      img.src = `data:${mime};base64,${frame.data}`;
-    }
+    loadViaImage();
     return () => {
       cancelled = true;
       if (revokeUrl) URL.revokeObjectURL(revokeUrl);

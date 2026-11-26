@@ -6,6 +6,7 @@ import {
   Blocks,
   Cpu,
   FileDown,
+  GraduationCap,
   Info,
   Keyboard,
   Mic,
@@ -18,6 +19,7 @@ import {
   X,
 } from "lucide-react";
 import { overlayStore, useToast } from "../../components/PocketUI";
+import { openInteractiveTutorialReplay } from "../../components/TutorialSandboxStage";
 import { VoiceInputSetup } from "../../components/VoiceInput";
 import { appVersion, detectPlatform, isH5Web } from "../../lib/bridge";
 import { native } from "../../lib/native";
@@ -211,6 +213,18 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
               <div className="sf-nav-sep" role="separator" />
               {OURS.map(navButton)}
             </div>
+            <button
+              type="button"
+              className="sf-outline-btn"
+              style={{ marginBottom: 6 }}
+              onClick={() => {
+                closeSettingsFrame();
+                openInteractiveTutorialReplay();
+              }}
+            >
+              <GraduationCap size={14} />
+              <span>重温互动教程</span>
+            </button>
             <button className="sf-outline-btn" disabled={!native.available()} onClick={() => void exportDiagnostics()}>
               <FileDown size={14} />
               <span>导出诊断</span>

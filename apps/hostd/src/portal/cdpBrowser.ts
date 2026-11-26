@@ -359,6 +359,7 @@ class CdpSession {
     this.screencastQuality = nextQ;
     this.screencastMaxW = nextW;
     const nextH = Math.max(360, Math.round((nextW * VIEWPORT_H) / VIEWPORT_W));
+    await this.cdp("Page.stopScreencast", {}).catch(() => {});
     await this.cdp("Page.startScreencast", {
       format: "jpeg",
       quality: nextQ,
@@ -366,6 +367,7 @@ class CdpSession {
       maxHeight: nextH,
       everyNthFrame: 1,
     }).catch(() => {});
+    void this.captureOnce(true).catch(() => {});
   }
 
   async captureOnce(force = false): Promise<PortalFramePayload | null> {
@@ -375,7 +377,9 @@ class CdpSession {
     if (this.captureInflight) return this.captureInflight;
     const run = (async () => {
       try {
-        const r = await this.cdp("Page.captureScreenshot", { format: "jpeg", quality: this.screencastQuality });
+        const r = await this.cdp("Page.captureScreenshot", { format: "jpeg", quality: this.screencastQuality, fromSurface: true }).catch(() =>
+          this.cdp("Page.captureScreenshot", { format: "jpeg", quality: this.screencastQuality }),
+        );
         if (typeof r?.data === "string" && r.data) {
           const rawBytes = Buffer.from(r.data, "base64");
           const frame: PortalFramePayload = {

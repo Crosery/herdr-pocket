@@ -1,36 +1,16 @@
 import { useState, type ReactNode } from "react";
 import { AlertCircle, Check, Copy, FileText, Info, Sparkles } from "lucide-react";
+import { parseTerminalChoices, type TerminalChoiceOption } from "@herdr-pocket/protocol";
 import { copyToClipboard, openExternalUrl } from "./bridge";
 import { hasFileJumpModifier, looksLikeClickableFilePath } from "./openFileTarget";
+import { HighlightedCodeBlock } from "./syntaxHighlight";
 
 export { hasFileJumpModifier };
 
-export interface ChoiceOption {
-  key: string;
-  label: string;
-  selected: boolean;
-}
+export type ChoiceOption = TerminalChoiceOption;
 
-const OPTION_RE = /^\s*([❯›>▶➜→●]\s*)?(\d{1,2})[.)]\s+(.+?)\s*$/;
-
-export function parseChoices(lines: string[], lookback = 20): ChoiceOption[] {
-  const tail = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "").replace(/\s+$/, "")).filter((l) => l.trim()).slice(-lookback);
-  let best: ChoiceOption[] = [];
-  let run: ChoiceOption[] = [];
-  for (const line of tail) {
-    const m = OPTION_RE.exec(line.replace(/[│┃║]/g, " "));
-    if (!m) continue;
-    const n = Number(m[2]);
-    if (n === 1) run = [];
-    if (n !== run.length + 1) continue;
-    const label = m[3]!
-      .replace(/\s+\((?:esc|y|n|a|p|shift\+tab|tab)\)$/i, "")
-      .replace(/^\[[ x✓✔]\]\s*/i, "")
-      .trim();
-    run.push({ key: String(n), label, selected: Boolean(m[1]) });
-    if (run.length >= 2) best = [...run];
-  }
-  return best.length >= 2 && best.length <= 9 && best.some((c) => c.selected) ? best : [];
+export function parseChoices(lines: string[], lookback = 36): ChoiceOption[] {
+  return parseTerminalChoices(lines, lookback);
 }
 
 function CodeFence({ lang, code }: { lang: string; code: string }) {
@@ -56,7 +36,7 @@ function CodeFence({ lang, code }: { lang: string; code: string }) {
           <span>{copied ? "已复制" : "复制"}</span>
         </button>
       </div>
-      <pre className="md-pre mono">{code}</pre>
+      <HighlightedCodeBlock code={code} language={lang} className="md-pre mono" />
     </div>
   );
 }

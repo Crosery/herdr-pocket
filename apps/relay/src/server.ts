@@ -30,6 +30,7 @@ import {
   type AssistantPluginId,
   type LogLevel,
   type PasskeyAssertionPayload,
+  type TutorialStatus,
   type VoiceProviderId,
   TRANSCRIBE_LIMITS,
   type TranscribeResult,
@@ -114,7 +115,7 @@ interface Pending {
 }
 
 /** Calls that change something on a computer: logged even when they work. Typing keystrokes and "seen" marks are not. */
-const MUTATING = new Set(["terminal.send", "terminal.keys", "agent.create", "agent.setModel", "space.delete", "terminal.interrupt", "terminal.kill", "herdr.command", "herdr.doc.set", "sessions.resume", "tools.update"]);
+const MUTATING = new Set(["terminal.send", "terminal.keys", "agent.create", "agent.setModel", "agent.ports", "spaces.sync", "space.delete", "terminal.interrupt", "terminal.kill", "herdr.command", "herdr.doc.set", "sessions.resume", "tools.update"]);
 /** Calls that may run longer than the usual RPC timeout: a new agent's first task is typed in once its program is up (hostd waits up to 45 s). */
 const SLOW_RPC_MS: Partial<Record<string, number>> = {
   "agent.create": 100_000,
@@ -292,6 +293,13 @@ export class Relay {
     });
     this.events.record({ kind: "config", level: "info", msg: `${by}: ${change}` });
     this.toViewers({ type: "assistant_config", rev: this.eff.view.rev, by, what });
+  }
+
+  private getTutorialStatus(): TutorialStatus {
+    const saved = this.store.getSetting<{ status?: number }>("tutorial");
+    if (saved?.status === 2) return 2;
+    if (saved?.status === 1) return 1;
+    return 0;
   }
 
   /**
@@ -600,7 +608,7 @@ export class Relay {
         });
         this.setAnchorCookie(req, res, rotated.device.id);
         this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(rotated.device) });
-        sendJson(res, 200, { device: this.decorate(rotated.device), token: rotated.token } satisfies PairResponse);
+        sendJson(res, 200, { device: this.decorate(rotated.device), token: rotated.token, tutorialStatus: this.getTutorialStatus() } satisfies PairResponse);
         return;
       }
 
@@ -633,7 +641,7 @@ export class Relay {
       });
       this.setAnchorCookie(req, res, rotated.device.id);
       this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(rotated.device) });
-      sendJson(res, 200, { device: this.decorate(rotated.device), token: rotated.token } satisfies PairResponse);
+      sendJson(res, 200, { device: this.decorate(rotated.device), token: rotated.token, tutorialStatus: this.getTutorialStatus() } satisfies PairResponse);
       return;
     }
 
@@ -709,7 +717,7 @@ export class Relay {
       });
       if (kind === "viewer") this.setAnchorCookie(req, res, device.id);
       this.broadcast({ type: "device", seq: ++this.seq, device: this.decorate(device) });
-      const out: PairResponse = { device: this.decorate(device), token };
+      const out: PairResponse = { device: this.decorate(device), token, tutorialStatus: this.getTutorialStatus() };
       sendJson(res, 200, out);
       return;
     }
@@ -759,7 +767,7 @@ export class Relay {
       let out: JoinClaim = { status: "pending" };
       if (join.state === "denied") out = { status: "denied" };
       else if (join.state === "approved" && join.granted) {
-        out = { status: "approved", ...join.granted };
+        out = { status: "approved", ...join.granted, tutorialStatus: this.getTutorialStatus() };
         if (join.granted.device.kind === "viewer") this.setAnchorCookie(req, res, join.granted.device.id);
       }
       // Answered requests are handed over exactly once.
@@ -979,6 +987,41 @@ export class Relay {
         return;
       }
       sendJson(res, 200, this.overview());
+      return;
+    }
+
+    if (path === "/v1/tutorial") {
+      if (!auth) {
+        sendError(res, 401, "unauthorized", "需要有效的设备令牌");
+        return;
+      }
+      if (req.method === "GET") {
+        const saved = this.store.getSetting<{ status?: number; updatedAt?: number }>("tutorial");
+        sendJson(res, 200, {
+          status: this.getTutorialStatus(),
+          ...(typeof saved?.updatedAt === "number" ? { updatedAt: saved.updatedAt } : {}),
+        });
+        return;
+      }
+      if (req.method === "PUT" || req.method === "POST") {
+        const body = (await readJson(req)) ?? {};
+        const raw = body.status;
+        if (raw !== 0 && raw !== 1 && raw !== 2) {
+          sendError(res, 400, "bad_request", "status 必须是 0、1 或 2");
+          return;
+        }
+        const cur = this.getTutorialStatus();
+        const reset = body.reset === true;
+        const next = (reset ? raw : Math.max(cur, raw)) as TutorialStatus;
+        const updatedAt = Date.now();
+        this.store.putSetting("tutorial", { status: next, updatedAt });
+        if (next !== cur) {
+          this.toViewers({ type: "tutorial_state", status: next });
+        }
+        sendJson(res, 200, { status: next, updatedAt });
+        return;
+      }
+      sendError(res, 405, "bad_request", "method not allowed");
       return;
     }
 
@@ -1658,6 +1701,7 @@ export class Relay {
       version: PROTOCOL_VERSION,
       serverVersion: VERSION,
       ...(latestRel ? { latestRelease: latestRel } : {}),
+      tutorialStatus: this.getTutorialStatus(),
       device: this.decorate(conn.device),
       seq: this.seq,
     });

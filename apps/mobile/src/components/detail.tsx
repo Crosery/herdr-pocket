@@ -11,6 +11,7 @@ import {
   OMP_QUICK_ROLE_CHIPS,
   PUT_LIMITS,
   applyTerminalModelFallback,
+  buildChoiceSelectKeys,
   buildHarnessSwitchCommands,
   clampThinkingLevel,
   findModelOptionForModel,
@@ -550,9 +551,9 @@ export function TerminalView({ agent, active }: { agent: Agent; active: boolean 
 function useScreenTail(agent: Agent, enabled: boolean, lines = 7): { tail: string[]; choices: Choice[] } {
   const q = useQuery({
     queryKey: ["terminal.tail", agent.key],
-    queryFn: () => call(agent.deviceId, "terminal.read", { agent: agent.key, lines: 40 }),
+    queryFn: () => call(agent.deviceId, "terminal.read", { agent: agent.key, lines: 50 }),
     enabled,
-    refetchInterval: enabled ? 4000 : false,
+    refetchInterval: enabled ? 1200 : false,
     retry: false,
   });
   return useMemo(() => {
@@ -566,6 +567,7 @@ function useScreenTail(agent: Agent, enabled: boolean, lines = 7): { tail: strin
 function WaitingCard({
   agent,
   onKey,
+  onPickChoice,
   onRetry,
   busy,
   compact,
@@ -575,6 +577,7 @@ function WaitingCard({
 }: {
   agent: Agent;
   onKey: (key: string) => void;
+  onPickChoice?: (choice: Choice, all: Choice[]) => void;
   onRetry: () => void;
   busy: boolean;
   compact: boolean;
@@ -628,7 +631,7 @@ function WaitingCard({
       <Pressable
         key={o.key}
         disabled={busy}
-        onPress={() => onKey(o.key)}
+        onPress={() => (onPickChoice ? onPickChoice(o, choices) : onKey(o.key))}
         accessibilityRole="button"
         accessibilityLabel={`选第 ${o.key} 项：${clean.title}`}
         style={({ pressed }) => ({
@@ -722,7 +725,9 @@ function WaitingCard({
         <View style={{ gap: 6 }}>
           {choices.slice(0, compact ? 4 : 9).map(choice)}
           <View style={{ flexDirection: "row", gap: 6 }}>
-            {answer("回车", "enter", "按回车选高亮的那项")}
+            {answer("←", "left", "上一题")}
+            {answer("→", "right", "下一题")}
+            {answer("回车", "enter", "按回车确认当前高亮项")}
             {answer("Esc", "esc", "按 Esc 取消")}
           </View>
         </View>
@@ -1195,9 +1200,14 @@ export function Composer({
 
   function refreshSoon() {
     setTimeout(() => {
+      qc.invalidateQueries({ queryKey: ["terminal.tail", agent.key] });
+      qc.invalidateQueries({ queryKey: ["terminal.read", agent.key] });
+    }, 180);
+    setTimeout(() => {
+      qc.invalidateQueries({ queryKey: ["terminal.tail", agent.key] });
       qc.invalidateQueries({ queryKey: ["terminal.read", agent.key] });
       qc.invalidateQueries({ queryKey: ["session.events", agent.key] });
-    }, 1000);
+    }, 650);
   }
 
   const openUsageCard = useCallback(() => {
@@ -1717,18 +1727,28 @@ export function Composer({
     }
   }
 
-  async function press(key: string, haptic: "select" | "heavy" = "select") {
+  async function pressKeys(keys: string[], haptic: "select" | "heavy" = "select") {
+    if (!keys.length) return;
     if (haptic === "heavy") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => undefined);
     else Haptics.selectionAsync().catch(() => undefined);
     setSending(true);
     try {
-      await call(agent.deviceId, "terminal.keys", { agent: agent.key, keys: [key] });
+      for (let i = 0; i < keys.length; i += 1) {
+        await call(agent.deviceId, "terminal.keys", { agent: agent.key, keys: [keys[i]!] });
+        if (i + 1 < keys.length) {
+          await new Promise((r) => setTimeout(r, 55));
+        }
+      }
       refreshSoon();
     } catch (e) {
       setToast((e as Error).message);
     } finally {
       setSending(false);
     }
+  }
+
+  async function press(key: string, haptic: "select" | "heavy" = "select") {
+    return pressKeys([key], haptic);
   }
 
   /** After an error (a dropped connection, a model that failed): ask it to carry on. */
@@ -1788,7 +1808,29 @@ export function Composer({
           </Pressable>
         </View>
       ) : null}
-      {agent.status === "blocked" && online ? <WaitingCard agent={agent} busy={sending} onKey={(k) => press(k)} onRetry={retry} compact={mode === "terminal"} onOpenTerminal={onOpenTerminal} marginLeft={padLeft} marginRight={padRight} /> : null}
+      {agent.status === "blocked" && online ? (
+        <WaitingCard
+          agent={agent}
+          busy={sending}
+          onKey={(k) => press(k)}
+          onPickChoice={(choice, all) => {
+            const keys = buildChoiceSelectKeys({
+              entries: all,
+              targetKey: choice.key,
+              harness: agent.harness,
+              isShell: agent.isShell,
+              multiSelect: all.some((c) => c.checked !== undefined),
+              confirm: true,
+            });
+            void pressKeys(keys);
+          }}
+          onRetry={retry}
+          compact={mode === "terminal"}
+          onOpenTerminal={onOpenTerminal}
+          marginLeft={padLeft}
+          marginRight={padRight}
+        />
+      ) : null}
       {showKeys ? (
       <View style={{ flexDirection: "row", alignItems: "center" }}>
       <ScrollView horizontal style={{ flex: 1 }} showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: space.sm, paddingLeft: padLeft, paddingRight: space.xs, paddingVertical: space.xs }} keyboardShouldPersistTaps="always">
@@ -2552,36 +2594,49 @@ export function Composer({
                     </View>
                   );
                 })() : null}
-                {usageData.session ? (
-                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
-                    <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
-                      <Text style={{ fontSize: 11, color: p.faint }}>累计费用</Text>
-                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
-                        {usageData.session.steps > 0 && usageData.session.unpricedSteps >= usageData.session.steps && usageData.session.costUsd === 0
-                          ? "未计价"
-                          : money(usageData.session.costUsd) ?? "$0.00"}
-                      </Text>
+                {usageData.session ? (() => {
+                  const s = usageData.session;
+                  const subCount = s.subagentCount ?? 0;
+                  const todayTotalCost = (s.todayCostUsd ?? s.costUsd) + (s.todaySubagentCostUsd ?? 0);
+                  const todaySteps = (s.todaySteps ?? s.steps) + (s.todaySubagentSteps ?? 0);
+                  const totalCost = s.costUsd + (s.subagentCostUsd ?? 0);
+                  const totalSteps = s.steps + (s.subagentSteps ?? 0);
+                  const totalIn = s.input + (s.subagentTokens?.input ?? 0);
+                  const totalOut = s.output + (s.subagentTokens?.output ?? 0);
+                  const totalCache = s.cacheRead + (s.subagentTokens?.cacheRead ?? 0);
+                  return (
+                    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+                      <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.accentContainer }}>
+                        <Text style={{ fontSize: 11, color: p.accentText }}>今日花费{subCount > 0 ? "（含子）" : ""}</Text>
+                        <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.accentText }}>
+                          {todaySteps > 0 && (s.todayUnpricedSteps ?? s.unpricedSteps) >= todaySteps && todayTotalCost === 0
+                            ? "未计价"
+                            : money(todayTotalCost) ?? "$0.00"}
+                        </Text>
+                      </View>
+                      <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                        <Text style={{ fontSize: 11, color: p.faint }}>会话累计{subCount > 0 ? `（含${subCount}子）` : ""}</Text>
+                        <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                          {totalSteps > 0 && (s.unpricedSteps + (s.subagentUnpricedSteps ?? 0)) >= totalSteps && totalCost === 0
+                            ? "未计价"
+                            : money(totalCost) ?? "$0.00"}
+                        </Text>
+                      </View>
+                      <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                        <Text style={{ fontSize: 11, color: p.faint }}>轮次与步数</Text>
+                        <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
+                          {`${s.turns} 轮 · ${totalSteps} 步`}
+                        </Text>
+                      </View>
+                      <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
+                        <Text style={{ fontSize: 11, color: p.faint }}>Token（入/出/缓存）</Text>
+                        <Text style={{ fontFamily: fonts.monoBold, fontSize: 11.5, color: p.ink }}>
+                          {`${compactNum(totalIn)} / ${compactNum(totalOut)}${totalCache > 0 ? ` · ${compactNum(totalCache)}` : ""}`}
+                        </Text>
+                      </View>
                     </View>
-                    <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
-                      <Text style={{ fontSize: 11, color: p.faint }}>轮次与步数</Text>
-                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
-                        {`${usageData.session.turns} 轮 · ${usageData.session.steps} 步`}
-                      </Text>
-                    </View>
-                    <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
-                      <Text style={{ fontSize: 11, color: p.faint }}>输入 / 输出</Text>
-                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
-                        {`${compactNum(usageData.session.input)} / ${compactNum(usageData.session.output)}`}
-                      </Text>
-                    </View>
-                    <View style={{ flexGrow: 1, minWidth: "46%", padding: 8, borderRadius: radius.sm, backgroundColor: p.surface2 }}>
-                      <Text style={{ fontSize: 11, color: p.faint }}>缓存读取</Text>
-                      <Text style={{ fontFamily: fonts.monoBold, fontSize: 12.5, color: p.ink }}>
-                        {compactNum(usageData.session.cacheRead)}
-                      </Text>
-                    </View>
-                  </View>
-                ) : (
+                  );
+                })() : (
                   <Text style={{ fontSize: 12, color: p.faint }}>暂无详细会话统计</Text>
                 )}
                 {usageData.models.length > 0 ? (
@@ -2597,12 +2652,6 @@ export function Composer({
                       </View>
                     ))}
                   </View>
-                ) : null}
-                {usageData.day24h || usageData.day7d ? (
-                  <Text style={{ fontFamily: fonts.mono, fontSize: 11, color: p.muted }}>
-                    {usageData.day24h ? `24h 合计 ${money(usageData.day24h.total.costUsd) ?? "$0.00"}  ` : ""}
-                    {usageData.day7d ? `7d 合计 ${money(usageData.day7d.total.costUsd) ?? "$0.00"}` : ""}
-                  </Text>
                 ) : null}
               </>
             ) : null}

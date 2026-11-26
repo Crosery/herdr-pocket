@@ -20,6 +20,7 @@ import {
 import type { Agent, GitFileChange, GitFileStatusCode, GitStatusResult, RpcResult } from "@herdr-pocket/protocol";
 import { rpcCall } from "../lib/relay";
 import { buildSplitDiffRows, parseUnifiedPatch } from "../lib/gitDiff";
+import { detectCodeLanguage, highlightSingleLine } from "../lib/syntaxHighlight";
 import { liveStore } from "../lib/store";
 import { openDiffTab, openFileTab, type DiffTab } from "../shell/shellStore";
 import { PocketSelect, useToast } from "./PocketUI";
@@ -537,6 +538,7 @@ export function DiffTabView({ tab }: { tab: DiffTab }) {
 
   const unifiedLines = useMemo(() => (diff?.patch ? parseUnifiedPatch(diff.patch) : []), [diff?.patch]);
   const splitRows = useMemo(() => (diff?.patch ? buildSplitDiffRows(diff.patch) : []), [diff?.patch]);
+  const diffLang = useMemo(() => detectCodeLanguage(null, tab.path), [tab.path]);
 
   const toggleStage = async () => {
     try {
@@ -630,7 +632,10 @@ export function DiffTabView({ tab }: { tab: DiffTab }) {
                   <tr key={idx} className={ln.kind === "add" ? "diff-line-add" : ln.kind === "del" ? "diff-line-del" : undefined}>
                     <td className="diff-ln">{ln.oldNo ?? ""}</td>
                     <td className="diff-ln">{ln.newNo ?? ""}</td>
-                    <td className="diff-code">{ln.kind === "add" ? `+${ln.text}` : ln.kind === "del" ? `-${ln.text}` : ` ${ln.text}`}</td>
+                    <td className="diff-code">
+                      {ln.kind === "add" ? "+" : ln.kind === "del" ? "-" : " "}
+                      {highlightSingleLine(ln.text, diffLang)}
+                    </td>
                   </tr>
                 ),
               )}
@@ -656,13 +661,13 @@ export function DiffTabView({ tab }: { tab: DiffTab }) {
                       {r.left.no ?? ""}
                     </td>
                     <td className={`diff-code diff-split-sep${r.left.kind === "del" ? " diff-line-del" : r.left.kind === "empty" ? " diff-line-empty" : ""}`}>
-                      {r.left.text}
+                      {r.left.kind === "empty" ? "" : highlightSingleLine(r.left.text, diffLang)}
                     </td>
                     <td className={`diff-ln${r.right.kind === "add" ? " diff-line-add" : r.right.kind === "empty" ? " diff-line-empty" : ""}`}>
                       {r.right.no ?? ""}
                     </td>
                     <td className={`diff-code${r.right.kind === "add" ? " diff-line-add" : r.right.kind === "empty" ? " diff-line-empty" : ""}`}>
-                      {r.right.text}
+                      {r.right.kind === "empty" ? "" : highlightSingleLine(r.right.text, diffLang)}
                     </td>
                   </tr>
                 ),

@@ -167,6 +167,9 @@ function paneEntryTitle(
     const base = content.path.split(/[\\/]/).filter(Boolean).pop();
     return { title: content.title || base || "Diff", agent: undefined };
   }
+  if (content.kind === "portal") {
+    return { title: content.title || "浮窗预览", agent: undefined };
+  }
   return { title: content.title || content.url || "浏览器", agent: undefined };
 }
 

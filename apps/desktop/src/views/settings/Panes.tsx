@@ -12,6 +12,7 @@ import {
   sourcePrefixes,
 } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketInput, PocketSelect, PocketSwitch, PocketTextarea, useToast, type SelectOption } from "../../components/PocketUI";
+import { openInteractiveTutorialReplay } from "../../components/TutorialSandboxStage";
 import { H5InstallAppCard } from "../../components/H5InstallAppCard";
 import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { CookieImportButton } from "../../components/CookieImport";
@@ -161,15 +162,21 @@ export function StartupRows() {
 }
 
 function GuideRow({ onReopenGuide }: { onReopenGuide: () => void }) {
-  if (!isTauri()) return null;
   return (
     <>
-      <SetHeading>新手引导</SetHeading>
-      <SetRow title="重新打开新手引导" about="重走本机连接与语音配置">
-        <PocketButton size="sm" variant="soft" onClick={onReopenGuide}>
-          打开引导
+      <SetHeading>新手互动教程</SetHeading>
+      <SetRow title="重温新手互动教程" about="在独立模拟练习环境中体验 5 步上手流程，不会影响任何真实任务">
+        <PocketButton size="sm" variant="soft" onClick={openInteractiveTutorialReplay}>
+          开始练习
         </PocketButton>
       </SetRow>
+      {isTauri() ? (
+        <SetRow title="重新打开首次接入向导" about="重走本机连接与语音配置">
+          <PocketButton size="sm" variant="ghost" onClick={onReopenGuide}>
+            打开向导
+          </PocketButton>
+        </SetRow>
+      ) : null}
     </>
   );
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, HelpCircle, PencilLine, Terminal, X } from "lucide-react";
+import { ArrowRight, Check, ChevronLeft, ChevronRight, CornerDownLeft, HelpCircle, PencilLine, Terminal, X } from "lucide-react";
 import type { AskQuestionDeckState, DeckChoiceEntry } from "../lib/askQuestion";
 import { PocketBadge } from "./PocketUI";
 
@@ -7,11 +7,15 @@ export function AskQuestionDeck({
   deck,
   onSelectKey,
   onSubmitWriteIn,
+  onSendRawKey,
+  onDismiss,
   onOpenTerminal,
 }: {
   deck: AskQuestionDeckState;
   onSelectKey: (key: string) => Promise<void> | void;
   onSubmitWriteIn: (key: string, text: string) => Promise<void> | void;
+  onSendRawKey?: (key: string) => Promise<void> | void;
+  onDismiss?: () => void;
   onOpenTerminal?: () => void;
 }) {
   const [writeInEntry, setWriteInEntry] = useState<DeckChoiceEntry | null>(null);
@@ -23,7 +27,7 @@ export function AskQuestionDeck({
     setWriteInEntry(null);
     setWriteInText("");
     setBusyKey(null);
-  }, [deck.question, deck.entries.length]);
+  }, [deck.callId, deck.question, deck.currentQuestionIndex, deck.entries.length]);
 
   useEffect(() => {
     if (writeInEntry) {
@@ -58,51 +62,78 @@ export function AskQuestionDeck({
     }
   };
 
+  const handleRawKey = async (key: string) => {
+    if (!onSendRawKey || busyKey) return;
+    setBusyKey(`raw:${key}`);
+    try {
+      await onSendRawKey(key);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
   return (
     <section className="ask-deck" aria-label="等待选择确认">
       <div className="ask-deck-head">
         <div className="ask-deck-badge-row">
           <span className="ask-deck-pill">
             <HelpCircle size={12} aria-hidden="true" />
-            <span>需要你确认</span>
+            <span>{deck.isSubmitStep ? "确认提交" : "需要你确认"}</span>
           </span>
           {deck.header ? <span className="ask-deck-header-tag">{deck.header}</span> : null}
-          {deck.totalQuestions > 1 ? (
+          {deck.multiSelect ? <span className="ask-deck-header-tag">可多选</span> : null}
+          {deck.totalQuestions > 1 && !deck.isSubmitStep ? (
             <span className="ask-deck-counter mono">
               问题 {deck.currentQuestionIndex + 1} / {deck.totalQuestions}
             </span>
           ) : null}
         </div>
-        {onOpenTerminal ? (
-          <button
-            type="button"
-            className="ask-deck-term-link"
-            onClick={onOpenTerminal}
-            title="切换到终端视图交互"
-          >
-            <Terminal size={12} />
-            <span>切到终端</span>
-          </button>
-        ) : null}
+        <div className="ask-deck-head-acts">
+          {onOpenTerminal ? (
+            <button
+              type="button"
+              className="ask-deck-term-link"
+              onClick={onOpenTerminal}
+              title="切换到终端视图直接交互"
+            >
+              <Terminal size={12} />
+              <span>切到终端</span>
+            </button>
+          ) : null}
+          {onDismiss ? (
+            <button
+              type="button"
+              className="ask-deck-close"
+              onClick={onDismiss}
+              aria-label="暂时收起确认卡片"
+              title="暂时收起（可随时切到终端操作）"
+            >
+              <X size={13} />
+            </button>
+          ) : null}
+        </div>
       </div>
 
       <div className="ask-deck-question">{deck.question}</div>
 
-      <div className="ask-deck-options" role="listbox" aria-label="可选项">
+      <div className="ask-deck-options" role="listbox" aria-multiselectable={deck.multiSelect || undefined} aria-label="可选项">
         {deck.entries.map((entry) => {
           const isEditingWriteIn = writeInEntry?.key === entry.key;
           const isBusy = busyKey === entry.key;
+          const isChecked = Boolean(entry.checked);
           return (
             <button
               key={entry.key}
               type="button"
               role="option"
-              aria-selected={entry.selected || isEditingWriteIn}
+              aria-selected={deck.multiSelect ? isChecked : entry.selected || isEditingWriteIn}
               disabled={busyKey !== null}
-              className={`ask-deck-opt${entry.selected ? " selected" : ""}${entry.recommended ? " recommended" : ""}${isEditingWriteIn ? " editing" : ""}`}
+              className={`ask-deck-opt${entry.selected ? " selected" : ""}${isChecked ? " checked" : ""}${entry.recommended ? " recommended" : ""}${isEditingWriteIn ? " editing" : ""}`}
               onClick={() => void handleOptionClick(entry)}
             >
-              <span className="ask-deck-key mono">{entry.key}</span>
+              <span className={`ask-deck-key mono${isChecked ? " is-checked" : ""}`}>
+                {deck.multiSelect ? (isChecked ? <Check size={11} /> : entry.key) : entry.key}
+              </span>
               <span className="ask-deck-opt-body">
                 <span className="ask-deck-opt-top">
                   <span className="ask-deck-opt-title">{entry.title}</span>
@@ -113,7 +144,13 @@ export function AskQuestionDeck({
                   <span className="ask-deck-opt-desc">{entry.description}</span>
                 ) : null}
               </span>
-              {isBusy ? <span className="act-spin" aria-label="提交中" /> : <ArrowRight size={13} className="ask-deck-arrow" />}
+              {isBusy ? (
+                <span className="act-spin" aria-label="提交中" />
+              ) : deck.multiSelect ? (
+                <span className="ask-deck-check-hint">{isChecked ? "已选" : "勾选"}</span>
+              ) : (
+                <ArrowRight size={13} className="ask-deck-arrow" />
+              )}
             </button>
           );
         })}
@@ -154,6 +191,58 @@ export function AskQuestionDeck({
           >
             <X size={13} />
           </button>
+        </div>
+      ) : null}
+
+      {onSendRawKey ? (
+        <div className="ask-deck-foot">
+          <div className="ask-deck-foot-left">
+            {deck.totalQuestions > 1 ? (
+              <>
+                <button
+                  type="button"
+                  className="ask-deck-foot-btn"
+                  disabled={busyKey !== null}
+                  title="切到上一题（发送 ←）"
+                  onClick={() => void handleRawKey("left")}
+                >
+                  <ChevronLeft size={12} />
+                  <span>上一题</span>
+                </button>
+                <button
+                  type="button"
+                  className="ask-deck-foot-btn"
+                  disabled={busyKey !== null}
+                  title="切到下一题（发送 →）"
+                  onClick={() => void handleRawKey("right")}
+                >
+                  <span>下一题</span>
+                  <ChevronRight size={12} />
+                </button>
+              </>
+            ) : null}
+            <button
+              type="button"
+              className="ask-deck-foot-btn"
+              disabled={busyKey !== null}
+              title="发送 Esc 取消当前提问"
+              onClick={() => void handleRawKey("esc")}
+            >
+              <span>取消 (Esc)</span>
+            </button>
+          </div>
+          {deck.multiSelect || deck.isSubmitStep ? (
+            <button
+              type="button"
+              className="ask-deck-foot-btn primary"
+              disabled={busyKey !== null}
+              title="发送 Enter 提交当前选择"
+              onClick={() => void handleRawKey("enter")}
+            >
+              <CornerDownLeft size={12} />
+              <span>{deck.isSubmitStep ? "确认提交" : "提交所选 (Enter)"}</span>
+            </button>
+          ) : null}
         </div>
       ) : null}
     </section>

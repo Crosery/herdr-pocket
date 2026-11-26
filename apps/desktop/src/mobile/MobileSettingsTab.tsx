@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { ChevronLeft, ChevronRight, Link2, LogOut, QrCode, RefreshCw, ScrollText, Sparkles } from "lucide-react";
+import { ChevronLeft, ChevronRight, GraduationCap, Link2, LogOut, QrCode, RefreshCw, ScrollText, Sparkles } from "lucide-react";
 import type { PortalDisplayMode } from "@herdr-pocket/protocol";
 import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
 import { H5InstallAppCard } from "../components/H5InstallAppCard";
 import { XiaoyangOrb } from "../components/MascotAndVendor";
 import { PocketButton, PocketIconButton, PocketModal, PocketSwitch, fs } from "../components/PocketUI";
+import { openInteractiveTutorialReplay } from "../components/TutorialSandboxStage";
 import { serverLabel } from "../components/Sidebar";
 import { appVersion, isH5Web } from "../lib/bridge";
 import { signOut } from "../lib/relay";
@@ -233,6 +234,16 @@ export function MobileSettingsTab({
                     ? "发现新版本可用"
                     : `当前版本 v${appVersion()} · 协议 v${PROTOCOL_VERSION}`}
               </div>
+            </div>
+          </div>
+          <ChevronRight size={16} className="faint" />
+        </button>
+        <button type="button" className="mp-setting-row" onClick={() => openInteractiveTutorialReplay()}>
+          <div className="row" style={{ gap: 10 }}>
+            <GraduationCap size={17} style={{ color: "var(--mp-accent-text)" }} />
+            <div>
+              <div style={{ fontWeight: 700, fontSize: fs(14.5) }}>重温互动教程</div>
+              <div className="faint" style={{ fontSize: fs(12) }}>在安全练习环境快速回顾 5 步核心用法</div>
             </div>
           </div>
           <ChevronRight size={16} className="faint" />

@@ -9,38 +9,142 @@ import {
   GitBranch,
   PanelRightOpen,
   RefreshCw,
+  Search,
 } from "lucide-react";
 import type { SubSession } from "@herdr-pocket/protocol";
 import { rpcCall } from "../lib/relay";
+import { relTime } from "../lib/store";
+import { shellStore } from "../shell/shellStore";
+import { ModelBrandIcon } from "./ModelBrandIcon";
+import { overlayStore } from "./PocketUI";
 
-export function subLabel(s: Pick<SubSession, "key" | "title" | "preview">): string {
-  const t = s.title?.trim();
-  if (t) return t;
-  const line = s.preview?.trim().split("\n").map((l) => l.trim()).find(Boolean);
-  if (line) return line.length > 48 ? `${line.slice(0, 47)}…` : line;
-  return s.key;
+const ROLE_LABELS: Record<string, { label: string; tone: "lav" | "sky" | "mint" | "pink" | "warn" }> = {
+  research: { label: "调研", tone: "lav" },
+  researcher: { label: "调研", tone: "lav" },
+  explore: { label: "探索", tone: "sky" },
+  explorer: { label: "探索", tone: "sky" },
+  review: { label: "审核", tone: "warn" },
+  reviewer: { label: "审核", tone: "warn" },
+  code: { label: "编码", tone: "mint" },
+  coder: { label: "编码", tone: "mint" },
+  worker: { label: "执行", tone: "mint" },
+  task: { label: "任务", tone: "mint" },
+  test: { label: "测试", tone: "sky" },
+  tester: { label: "测试", tone: "sky" },
+  qa: { label: "质检", tone: "warn" },
+  plan: { label: "规划", tone: "lav" },
+  planner: { label: "规划", tone: "lav" },
+  "image-generator": { label: "生图", tone: "pink" },
+  self: { label: "子会话", tone: "pink" },
+  subagent: { label: "子会话", tone: "pink" },
+  general: { label: "通用", tone: "lav" },
+};
+
+function cleanPreviewHeadline(raw?: string): string {
+  if (!raw) return "";
+  let text = raw.replace(/\r\n?/g, "\n").trim();
+  if (!text) return "";
+  // Strip system-injected message wrappers like `[Message] timestamp=... content=...` or `<SYSTEM_MESSAGE>`
+  text = text
+    .replace(/<\/?SYSTEM_MESSAGE>/gi, " ")
+    .replace(/^\[Message\][^\n]*?\bcontent=/i, "")
+    .replace(/^#+\s*/gm, "");
+  const firstLine = text
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l && !/^timestamp=|^sender=|^priority=/i.test(l));
+  if (!firstLine) return "";
+  const cleaned = firstLine.replace(/\s+/g, " ").trim();
+  return cleaned.length > 56 ? `${cleaned.slice(0, 55)}…` : cleaned;
 }
 
+export interface SubagentDisplayInfo {
+  headline: string;
+  roleLabel?: string;
+  roleTone: "lav" | "sky" | "mint" | "pink" | "warn";
+  secondary?: string;
+}
+
+/**
+ * Separates generic subagent role slugs (`research`, `explore`, `self`, etc.) into a
+ * semantic role badge while promoting the real task prompt / preview into the row headline.
+ */
+export function parseSubagentDisplay(
+  s: Pick<SubSession, "key" | "title" | "preview" | "role" | "harness">,
+): SubagentDisplayInfo {
+  const rawTitle = s.title?.trim() ?? "";
+  const rawRole = s.role?.trim() ?? "";
+  const titleSlug = rawTitle.toLowerCase();
+  const roleSlug = rawRole.toLowerCase();
+
+  const matchedRole = ROLE_LABELS[roleSlug] ?? ROLE_LABELS[titleSlug];
+  const isGenericTitle = !rawTitle || Boolean(ROLE_LABELS[titleSlug]) || /^[a-z0-9_-]{2,20}$/.test(rawTitle) && rawTitle === titleSlug;
+  const previewLine = cleanPreviewHeadline(s.preview);
+
+  if (isGenericTitle) {
+    const headline = previewLine || rawTitle || s.key;
+    const roleLabel = matchedRole?.label ?? (rawRole || (rawTitle && rawTitle !== headline ? rawTitle : undefined));
+    return {
+      headline,
+      ...(roleLabel ? { roleLabel } : {}),
+      roleTone: matchedRole?.tone ?? "lav",
+      secondary: rawTitle && rawTitle !== headline && !matchedRole ? rawTitle : undefined,
+    };
+  }
+
+  return {
+    headline: rawTitle.length > 56 ? `${rawTitle.slice(0, 55)}…` : rawTitle,
+    ...(matchedRole ? { roleLabel: matchedRole.label } : rawRole ? { roleLabel: rawRole } : {}),
+    roleTone: matchedRole?.tone ?? "pink",
+    secondary: previewLine && previewLine !== rawTitle ? previewLine : undefined,
+  };
+}
+
+export function subLabel(s: Pick<SubSession, "key" | "title" | "preview" | "role" | "harness">): string {
+  return parseSubagentDisplay(s).headline;
+}
+
+/**
+ * Computes honest duration for a subagent:
+ * - Working: elapsed since `startedAt ?? statusSince`
+ * - Completed with explicit `startedAt`: elapsed `updatedAt - startedAt` (if >= 1s)
+ * - Completed without `startedAt`: NEVER fabricates `"0秒"` from `statusSince === updatedAt`; returns `relTime(updatedAt)` instead.
+ */
 export function fmtSubDuration(s: SubSession, now: number): string | null {
-  const end = s.status === "working" ? now : (s.updatedAt || now);
-  const start = s.startedAt ?? s.statusSince;
-  if (!start || end < start) return null;
-  const sec = Math.max(0, Math.floor((end - start) / 1000));
-  if (sec < 60) return `${sec}秒`;
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}分${String(sec % 60).padStart(2, "0")}秒`;
-  const hr = Math.floor(min / 60);
-  return `${hr}时${String(min % 60).padStart(2, "0")}分`;
+  if (s.status === "working") {
+    const start = s.startedAt ?? s.statusSince;
+    if (!start || now < start) return "运行中";
+    const sec = Math.max(1, Math.floor((now - start) / 1000));
+    if (sec < 60) return `${sec}秒`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}分${String(sec % 60).padStart(2, "0")}秒`;
+    const hr = Math.floor(min / 60);
+    return `${hr}时${String(min % 60).padStart(2, "0")}分`;
+  }
+  if (s.startedAt && s.updatedAt && s.updatedAt > s.startedAt) {
+    const sec = Math.floor((s.updatedAt - s.startedAt) / 1000);
+    if (sec >= 1) {
+      if (sec < 60) return `${sec}秒`;
+      const min = Math.floor(sec / 60);
+      if (min < 60) return `${min}分${String(sec % 60).padStart(2, "0")}秒`;
+      const hr = Math.floor(min / 60);
+      return `${hr}时${String(min % 60).padStart(2, "0")}分`;
+    }
+  }
+  return s.updatedAt ? relTime(s.updatedAt) : null;
 }
 
-function clampPopoverPos(rect: DOMRect, menuWidth = 340): { top: number; left: number; maxWidth: number } {
+function clampPopoverPos(rect: DOMRect, menuWidth = 412): { top: number; left: number; maxWidth: number } {
   if (typeof window === "undefined") return { top: rect.bottom + 6, left: rect.left, maxWidth: menuWidth };
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  const width = Math.min(menuWidth, Math.max(240, vw - 16));
-  const left = Math.max(8, Math.min(vw - width - 8, rect.left));
-  const estHeight = 320;
-  const top = rect.bottom + 6 + estHeight > vh - 8 && rect.top - estHeight > 12 ? Math.max(8, rect.top - 6 - estHeight) : rect.bottom + 6;
+  const width = Math.min(menuWidth, Math.max(264, vw - 16));
+  const left = Math.max(8, Math.min(vw - width - 8, rect.right - width));
+  const estHeight = 390;
+  const top =
+    rect.bottom + 6 + estHeight > vh - 8 && rect.top - estHeight > 12
+      ? Math.max(8, rect.top - 6 - estHeight)
+      : rect.bottom + 6;
   return { top, left, maxWidth: width };
 }
 
@@ -84,12 +188,14 @@ function SubTreeRows({
         const hasKids = item.children > 0 || Boolean(kids?.length);
         const isExpanded = hasKids && expanded.has(item.key);
         const isCurrent = item.key === activeSubKey;
-        const label = subLabel(item);
+        const disp = parseSubagentDisplay(item);
         const dur = fmtSubDuration(item, now);
-        const preview = item.preview?.trim().split("\n")[0]?.trim();
-        const showPreview = preview && preview !== label ? preview : item.harness;
-        const statusText = item.status === "working" ? "进行中" : "已完成";
-        const costText = item.costUsd !== undefined && item.costUsd > 0 ? `$${item.costUsd.toFixed(item.costUsd >= 1 ? 2 : 3)}` : null;
+        const isWorking = item.status === "working";
+        const costText =
+          item.costUsd !== undefined && item.costUsd > 0
+            ? `$${item.costUsd.toFixed(item.costUsd >= 1 ? 2 : 3)}`
+            : null;
+        const stepsText = item.steps !== undefined && item.steps > 0 ? `${item.steps} 步` : null;
 
         return (
           <div key={item.key} className="sub-tree-node">
@@ -99,8 +205,8 @@ function SubTreeRows({
               aria-level={level}
               aria-current={isCurrent ? "page" : undefined}
               aria-expanded={hasKids ? isExpanded : undefined}
-              className={`sub-tree-row${isCurrent ? " current" : ""}`}
-              style={{ paddingLeft: 8 + (level - 1) * 14 }}
+              className={`sub-tree-card${isCurrent ? " current" : ""}${isWorking ? " is-working" : ""}`}
+              style={{ marginLeft: (level - 1) * 14 }}
               onClick={() => {
                 onSelectSub(item, trailPrefix);
                 closeMenu();
@@ -127,7 +233,7 @@ function SubTreeRows({
                   type="button"
                   tabIndex={-1}
                   className={`sub-tree-disclose${isExpanded ? " open" : ""}`}
-                  aria-label={isExpanded ? `收起 ${label} 的下级子 Agent` : `展开 ${label} 的下级子 Agent`}
+                  aria-label={isExpanded ? `收起 ${disp.headline} 的下级子 Agent` : `展开 ${disp.headline} 的下级子 Agent`}
                   onClick={(e) => {
                     e.stopPropagation();
                     onToggleBranch(item);
@@ -135,27 +241,34 @@ function SubTreeRows({
                 >
                   <ChevronRight size={12} />
                 </button>
-              ) : (
-                <span className="sub-tree-disclose-spacer" aria-hidden />
-              )}
-
-              <span className={`sub-dot ${item.status === "working" ? "working" : "done"}`} aria-label={statusText} />
-
-              <span className="sub-tree-content">
-                <span className="sub-tree-title truncate">{label}</span>
-                <span className="sub-tree-meta truncate">
-                  <span>{statusText}</span>
-                  {item.model ? <span> · {item.model}</span> : null}
-                  {showPreview ? <span> · {showPreview}</span> : null}
-                </span>
-              </span>
-
-              {dur || costText ? (
-                <span className="sub-tree-metrics">
-                  {dur ? <span className="num">{dur}</span> : null}
-                  {costText ? <span className="num">{costText}</span> : null}
-                </span>
               ) : null}
+
+              <span className={`sub-dot ${isWorking ? "working" : "done"}`} aria-label={isWorking ? "进行中" : "已完成"} />
+
+              <div className="sub-tree-content">
+                <div className="sub-tree-headline-row">
+                  {disp.roleLabel ? (
+                    <span className={`sub-role-chip tone-${disp.roleTone}`}>{disp.roleLabel}</span>
+                  ) : null}
+                  <span className="sub-tree-title truncate" title={disp.headline}>
+                    {disp.headline}
+                  </span>
+                </div>
+                <div className="sub-tree-meta-row">
+                  {item.model ? (
+                    <span className="sub-meta-chip mono">
+                      <ModelBrandIcon model={item.model} size={11} />
+                      <span className="truncate">{item.model}</span>
+                    </span>
+                  ) : null}
+                  {stepsText ? <span className="sub-meta-chip num">{stepsText}</span> : null}
+                  {dur ? <span className="sub-meta-chip num">{dur}</span> : null}
+                  {costText ? <span className="sub-meta-chip cost mono num">{costText}</span> : null}
+                  {disp.secondary && !item.model ? (
+                    <span className="sub-meta-sec truncate">{disp.secondary}</span>
+                  ) : null}
+                </div>
+              </div>
 
               {isCurrent ? (
                 <span className="sub-tree-current-ic" aria-label="当前查看">
@@ -165,8 +278,8 @@ function SubTreeRows({
                 <button
                   type="button"
                   className="sub-tree-aside-btn"
-                  title="在右侧边栏打开"
-                  aria-label={`在侧边栏打开 ${label}`}
+                  title="在右侧边栏并排打开"
+                  aria-label={`在侧边栏打开 ${disp.headline}`}
                   onClick={(e) => {
                     e.stopPropagation();
                     onOpenAside(item, trailPrefix);
@@ -181,7 +294,7 @@ function SubTreeRows({
             {isExpanded ? (
               <div role="group" className="sub-tree-children">
                 {loadingMap[item.key] && !(kids?.length) ? (
-                  <div className="sub-pop-notice" style={{ paddingLeft: 26 + level * 14 }}>
+                  <div className="sub-pop-notice" style={{ paddingLeft: 18 + level * 14 }}>
                     <span className="act-spin" aria-hidden />
                     <span>正在加载下级子 Agent…</span>
                   </div>
@@ -203,7 +316,7 @@ function SubTreeRows({
                     closeMenu={closeMenu}
                   />
                 ) : (
-                  <div className="sub-pop-notice" style={{ paddingLeft: 26 + level * 14 }}>暂无下级子 Agent</div>
+                  <div className="sub-pop-notice" style={{ paddingLeft: 18 + level * 14 }}>暂无下级子 Agent</div>
                 )}
               </div>
             ) : null}
@@ -214,8 +327,10 @@ function SubTreeRows({
   );
 }
 
+type SubFilter = "all" | "working" | "done";
+
 /**
- * DeepSeek-Harness-style subagent catalog trigger button & hover/click portal tree popover.
+ * Pocket-styled Subagent Catalog trigger pill & card-list popover (click-to-open, overlayStore-managed).
  */
 export function SubagentCatalogTrigger({
   deviceId,
@@ -253,13 +368,12 @@ export function SubagentCatalogTrigger({
   const [loadingMap, setLoadingMap] = useState<Record<string, boolean>>({});
   const [rootLoading, setRootLoading] = useState(false);
   const [rootFetched, setRootFetched] = useState<SubSession[] | null>(null);
+  const [filter, setFilter] = useState<SubFilter>("all");
+  const [query, setQuery] = useState("");
   const [now, setNow] = useState(() => Date.now());
 
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const pinnedRef = useRef(false);
-  const hoverOpenRef = useRef<number | undefined>(undefined);
-  const hoverCloseRef = useRef<number | undefined>(undefined);
   const popId = useId();
 
   const items = useMemo(() => (subs.length > 0 ? subs : rootFetched ?? []), [rootFetched, subs]);
@@ -267,10 +381,28 @@ export function SubagentCatalogTrigger({
   const workingCount = items.filter((s) => s.status === "working").length;
   const doneCount = items.filter((s) => s.status !== "working").length;
 
+  const filteredItems = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return items.filter((it) => {
+      if (filter === "working" && it.status !== "working") return false;
+      if (filter === "done" && it.status === "working") return false;
+      if (!q) return true;
+      const d = parseSubagentDisplay(it);
+      return (
+        d.headline.toLowerCase().includes(q) ||
+        (d.roleLabel?.toLowerCase().includes(q) ?? false) ||
+        (it.model?.toLowerCase().includes(q) ?? false) ||
+        (it.title?.toLowerCase().includes(q) ?? false)
+      );
+    });
+  }, [filter, items, query]);
+
   useEffect(() => {
     setRootFetched(null);
     setChildrenMap({});
     setExpanded(new Set());
+    setFilter("all");
+    setQuery("");
   }, [agentKey, parentSubKey]);
 
   useEffect(() => {
@@ -286,7 +418,7 @@ export function SubagentCatalogTrigger({
       const res = await rpcCall(deviceId, "session.children", { agent: agentKey, ...(parentSubKey ? { sub: parentSubKey } : {}) });
       setRootFetched(res.sessions);
     } catch {
-      // silent fallback to existing items
+      // silent fallback
     } finally {
       setRootLoading(false);
     }
@@ -325,41 +457,33 @@ export function SubagentCatalogTrigger({
     [childrenMap, fetchChildBranch, loadingMap],
   );
 
-  const clearTimers = () => {
-    if (hoverOpenRef.current !== undefined) {
-      window.clearTimeout(hoverOpenRef.current);
-      hoverOpenRef.current = undefined;
-    }
-    if (hoverCloseRef.current !== undefined) {
-      window.clearTimeout(hoverCloseRef.current);
-      hoverCloseRef.current = undefined;
-    }
-  };
+  const openMenu = useCallback(() => {
+    const el = triggerRef.current;
+    if (!el) return;
+    setCoords(clampPopoverPos(el.getBoundingClientRect()));
+    setNow(Date.now());
+    setOpen(true);
+    if (items.length === 0) void fetchRoot();
+  }, [fetchRoot, items.length]);
 
-  const openMenu = useCallback(
-    (pin: boolean) => {
-      clearTimers();
-      const el = triggerRef.current;
-      if (!el) return;
-      pinnedRef.current = pin;
-      setCoords(clampPopoverPos(el.getBoundingClientRect()));
-      setNow(Date.now());
-      setOpen(true);
-      if (items.length === 0) void fetchRoot();
-    },
-    [fetchRoot, items.length],
-  );
+  const activeTabId = shellStore.use((s) => s.active);
+  const selectedSpace = shellStore.use((s) => s.selectedSpace);
 
   const closeMenu = useCallback(() => {
-    clearTimers();
-    pinnedRef.current = false;
     setOpen(false);
   }, []);
 
-  useEffect(() => clearTimers, []);
+  useEffect(() => {
+    setOpen(false);
+  }, [activeTabId, agentKey, selectedSpace]);
 
   useEffect(() => {
     if (!open) return;
+    window.dispatchEvent(new CustomEvent("pocket:close-popovers", { detail: popId }));
+    overlayStore.set((p) => ({ open: p.open + 1 }));
+    const onPeerOpen = (e: Event) => {
+      if ((e as CustomEvent<string>).detail !== popId) closeMenu();
+    };
     const onPointerDown = (e: Event) => {
       const target = e.target as Node | null;
       if (target && !triggerRef.current?.contains(target) && !menuRef.current?.contains(target)) {
@@ -377,37 +501,23 @@ export function SubagentCatalogTrigger({
       const el = triggerRef.current;
       if (el) setCoords(clampPopoverPos(el.getBoundingClientRect()));
     };
-    document.addEventListener("pointerdown", onPointerDown);
-    document.addEventListener("click", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
+    window.addEventListener("pocket:close-popovers", onPeerOpen);
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("resize", onScrollOrResize);
     return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
-      document.removeEventListener("click", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("pocket:close-popovers", onPeerOpen);
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("resize", onScrollOrResize);
+      overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
     };
-  }, [closeMenu, open]);
+  }, [closeMenu, open, popId]);
 
   if (variant === "count" && totalCount === 0) return null;
 
-  const scheduleHoverOpen = () => {
-    clearTimers();
-    if (open) return;
-    hoverOpenRef.current = window.setTimeout(() => {
-      openMenu(false);
-    }, 150);
-  };
-
-  const scheduleHoverClose = () => {
-    clearTimers();
-    if (pinnedRef.current) return;
-    hoverCloseRef.current = window.setTimeout(() => {
-      closeMenu();
-    }, 140);
-  };
-
   const onTreeKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement)?.tagName === "INPUT") return;
     const nodes = menuRef.current
       ? Array.from(menuRef.current.querySelectorAll<HTMLElement>('[role="treeitem"]'))
       : [];
@@ -433,23 +543,23 @@ export function SubagentCatalogTrigger({
       <button
         ref={triggerRef}
         type="button"
-        className={variant === "switcher" ? "sub-switcher-btn" : `sub-cat-btn${compact ? " compact" : ""}`}
+        className={
+          variant === "switcher"
+            ? "sub-switcher-btn"
+            : `sub-cat-btn${compact ? " compact" : ""}${workingCount > 0 ? " is-working" : ""}${open ? " is-open" : ""}`
+        }
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={open ? popId : undefined}
         title={variant === "switcher" ? `切换子 Agent：${switcherTitle || ""}` : `查看 ${totalCount} 个子 Agent`}
-        onPointerEnter={(e) => {
-          if (e.pointerType !== "touch") scheduleHoverOpen();
-        }}
-        onPointerLeave={scheduleHoverClose}
         onClick={() => {
-          if (open && pinnedRef.current) closeMenu();
-          else openMenu(true);
+          if (open) closeMenu();
+          else openMenu();
         }}
         onKeyDown={(e) => {
           if (e.key === "ArrowDown") {
             e.preventDefault();
-            openMenu(true);
+            openMenu();
             window.setTimeout(() => {
               menuRef.current?.querySelector<HTMLElement>('[role="treeitem"]')?.focus();
             }, 20);
@@ -467,7 +577,13 @@ export function SubagentCatalogTrigger({
               <GitBranch size={12} />
               {workingCount > 0 ? <span className="sub-cat-dot" /> : null}
             </span>
-            <span>{compact ? `${totalCount}` : `${totalCount} 个子 Agent`}</span>
+            <span className="num">
+              {compact
+                ? workingCount > 0
+                  ? `${workingCount}/${totalCount}`
+                  : `${totalCount}`
+                : `${totalCount} 个子 Agent`}
+            </span>
             <ChevronDown size={11} className="sub-cat-chev" />
           </>
         )}
@@ -479,28 +595,49 @@ export function SubagentCatalogTrigger({
               ref={menuRef}
               id={popId}
               role="dialog"
-              aria-label="子 Agent 列表"
+              aria-label="子 Agent 目录"
               className="sub-pop"
               style={{ top: coords.top, left: coords.left, width: coords.maxWidth }}
-              onPointerEnter={(e) => {
-                if (e.pointerType !== "touch" && hoverCloseRef.current !== undefined) {
-                  window.clearTimeout(hoverCloseRef.current);
-                  hoverCloseRef.current = undefined;
-                }
-              }}
-              onPointerLeave={scheduleHoverClose}
               onKeyDown={onTreeKeyDown}
             >
               <div className="sub-pop-head">
-                <span className="sub-pop-title">子 Agent 目录</span>
-                <span className="sub-pop-progress">
-                  {[
-                    doneCount > 0 ? `${doneCount} 已完成` : "",
-                    workingCount > 0 ? `${workingCount} 进行中` : "",
-                  ]
-                    .filter(Boolean)
-                    .join(" · ") || `${totalCount} 项`}
+                <span className="sub-pop-title">
+                  <GitBranch size={13} />
+                  <span>子 Agent · {totalCount}</span>
                 </span>
+                <div className="sub-pop-filters" role="tablist" aria-label="按状态筛选">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={filter === "all"}
+                    className={`sub-filter-pill${filter === "all" ? " active" : ""}`}
+                    onClick={() => setFilter("all")}
+                  >
+                    全部 {items.length || totalCount}
+                  </button>
+                  {workingCount > 0 ? (
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={filter === "working"}
+                      className={`sub-filter-pill working${filter === "working" ? " active" : ""}`}
+                      onClick={() => setFilter("working")}
+                    >
+                      进行中 {workingCount}
+                    </button>
+                  ) : null}
+                  {doneCount > 0 ? (
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={filter === "done"}
+                      className={`sub-filter-pill${filter === "done" ? " active" : ""}`}
+                      onClick={() => setFilter("done")}
+                    >
+                      已完成 {doneCount}
+                    </button>
+                  ) : null}
+                </div>
                 <button
                   type="button"
                   className="sub-pop-refresh"
@@ -511,19 +648,34 @@ export function SubagentCatalogTrigger({
                   <RefreshCw size={12} className={rootLoading ? "spin" : ""} />
                 </button>
               </div>
+              {items.length >= 5 ? (
+                <div className="sub-pop-search-wrap">
+                  <Search size={12} className="sub-pop-search-ic" />
+                  <input
+                    type="text"
+                    className="sub-pop-search"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="按任务摘要、角色或模型筛选…"
+                    aria-label="搜索子 Agent"
+                  />
+                </div>
+              ) : null}
               <div className="sub-pop-body" role="tree" aria-label="子 Agent 树">
                 {rootLoading && items.length === 0 ? (
                   <div className="sub-pop-notice">
                     <span className="act-spin" aria-hidden />
                     <span>正在加载子 Agent…</span>
                   </div>
-                ) : items.length === 0 ? (
-                  <div className="sub-pop-notice">暂无子 Agent 记录</div>
+                ) : filteredItems.length === 0 ? (
+                  <div className="sub-pop-notice">
+                    {items.length === 0 ? "暂无子 Agent 记录" : "没有匹配当前筛选的子 Agent"}
+                  </div>
                 ) : (
                   <SubTreeRows
                     deviceId={deviceId}
                     agentKey={agentKey}
-                    items={items}
+                    items={filteredItems}
                     trailPrefix={baseTrail}
                     activeSubKey={activeSubKey}
                     childrenMap={childrenMap}
