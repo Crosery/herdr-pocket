@@ -1,6 +1,25 @@
-import { useEffect, useRef, useState } from "react";
-import { Bell, Check, ChevronRight, Mic, MicOff, Minimize2, Phone, PhoneOff, Send, Trash2, X } from "lucide-react";
-import type { AssistantItem } from "@herdr-pocket/protocol";
+import { useEffect, useRef, useState, type ReactElement } from "react";
+import {
+  AlertTriangle,
+  Bell,
+  Check,
+  CheckCircle2,
+  ChevronRight,
+  Flag,
+  Hand,
+  Mic,
+  MicOff,
+  Minimize2,
+  Moon,
+  PauseCircle,
+  Phone,
+  PhoneOff,
+  Send,
+  Sparkles,
+  Trash2,
+  X,
+} from "lucide-react";
+import type { AssistantItem, Notice } from "@herdr-pocket/protocol";
 import { EmptyState, PocketBadge, PocketButton, PocketCard, PocketIconButton, PocketModal, fs, useToast } from "../components/PocketUI";
 import { XiaoyangOrb, resolveCallMascotMood } from "../components/MascotAndVendor";
 import {
@@ -44,6 +63,33 @@ export function resolveCallStartedAt(state: { status: VoiceCallState["status"]; 
 voiceCallStore.subscribe(() => {
   resolveCallStartedAt(voiceCallStore.get() as CallStateView);
 });
+
+/** Visual tone, pulse animation, and semantic icon for proactive wake/reminder notice pills. */
+export function noticeBadgeVisual(n: Pick<Notice, "kind" | "verdict">): {
+  tone: "pink" | "lav" | "mint" | "sky" | "blush" | "warn" | "neutral";
+  pulse: boolean;
+  icon: ReactElement;
+} {
+  const verdict = n.verdict ?? (n.kind === "blocked" ? "decide" : n.kind === "done" ? "ok" : undefined);
+  switch (verdict) {
+    case "ok":
+      return { tone: "mint", pulse: false, icon: <CheckCircle2 size={12} /> };
+    case "running":
+      return { tone: "sky", pulse: true, icon: <Sparkles size={12} /> };
+    case "progress":
+      return { tone: "pink", pulse: false, icon: <Flag size={12} /> };
+    case "decide":
+      return { tone: "warn", pulse: false, icon: <Hand size={12} /> };
+    case "paused":
+      return { tone: "lav", pulse: false, icon: <Moon size={12} /> };
+    case "stopped":
+      return { tone: "neutral", pulse: false, icon: <PauseCircle size={12} /> };
+    case "failed":
+      return { tone: "blush", pulse: false, icon: <AlertTriangle size={12} /> };
+    default:
+      return { tone: "lav", pulse: false, icon: <Bell size={12} /> };
+  }
+}
 
 /** Format elapsed call time as mm:ss once the call is active. */
 export function formatCallDuration(startedAt: number | null | undefined, now = Date.now()): string {
@@ -397,12 +443,16 @@ function AssistantBubble({
 
   if (item.notice) {
     const n = item.notice;
+    const vis = noticeBadgeVisual(n);
     return (
       <div className="bubble-row assistant">
         <PocketCard soft>
           <div className="stack" style={{ gap: 6 }}>
             <div className="between">
-              <PocketBadge tone={n.kind === "blocked" ? "blush" : n.kind === "done" ? "mint" : "lav"}>{n.title}</PocketBadge>
+              <PocketBadge tone={vis.tone} pulse={vis.pulse}>
+                {vis.icon}
+                <span>{n.title}</span>
+              </PocketBadge>
               <span className="faint num">{fmtClock(n.ts)}</span>
             </div>
             <div>{n.body}</div>

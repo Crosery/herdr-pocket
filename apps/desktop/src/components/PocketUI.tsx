@@ -146,7 +146,7 @@ export function PocketBadge({
   pulse = false,
   children,
 }: {
-  tone?: "pink" | "lav" | "mint" | "blush" | "warn" | "neutral";
+  tone?: "pink" | "lav" | "mint" | "sky" | "blush" | "warn" | "neutral";
   pulse?: boolean;
   children: ReactNode;
 }) {

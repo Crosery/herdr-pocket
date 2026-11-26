@@ -63,6 +63,10 @@ export interface Palette {
   shadow: string;
   error: string;
   errorContainer: string;
+  sky: string;
+  skyContainer: string;
+  warn: string;
+  warnContainer: string;
   dusk: string; // reasoning / planning
   duskContainer: string;
 }
@@ -94,6 +98,10 @@ export function makePalette(dark: boolean): Palette {
       shadow: "#000000",
       error: "#FFA3AF",
       errorContainer: "#45262C",
+      sky: "#8AD4F5",
+      skyContainer: "#1E3442",
+      warn: "#FFC48A",
+      warnContainer: "#422E1B",
       dusk: "#C7B6FF",
       duskContainer: "#332B4D",
     };
@@ -123,6 +131,10 @@ export function makePalette(dark: boolean): Palette {
     shadow: "#E58AAE",
     error: "#B83A52",
     errorContainer: "#FFE6E9",
+    sky: "#1B6B93",
+    skyContainer: "#E1F3FC",
+    warn: "#9A5212",
+    warnContainer: "#FFF0DE",
     dusk: "#6E51D2",
     duskContainer: "#F1EBFF",
   };

@@ -141,7 +141,35 @@ export function splitScript(raw: string, maxSay = MAX_SAY, maxKeep = MAX_KEEP): 
 
 export type WakeVerdict = NoticeVerdict | "skip";
 
-const VERDICTS: Record<string, WakeVerdict> = { 成了: "ok", 要你定: "decide", 没成: "failed", 不用说: "skip" };
+const VERDICTS: Record<string, WakeVerdict> = {
+  成了: "ok",
+  做完了: "ok",
+  跑完了: "ok",
+  还在跑: "running",
+  运行中: "running",
+  构建中: "running",
+  有进展: "progress",
+  阶段完成: "progress",
+  推进中: "progress",
+  要你定: "decide",
+  等你: "decide",
+  等恢复: "paused",
+  暂歇: "paused",
+  额度用完: "paused",
+  停下了: "stopped",
+  停了: "stopped",
+  已停下: "stopped",
+  没成: "failed",
+  没跑成: "failed",
+  出错了: "failed",
+  受阻: "failed",
+  不用说: "skip",
+};
+const VERDICT_PREFIX_RE = new RegExp(
+  `^(${Object.keys(VERDICTS)
+    .sort((a, b) => b.length - a.length)
+    .join("|")})(?:[：:。，,\\s]+(.*))?$`,
+);
 
 /**
  * What the assistant reported after looking at a stopped agent:
@@ -167,7 +195,7 @@ export function parseWake(raw: string): { verdict: WakeVerdict; say: string; det
   let known = VERDICTS[firstNorm];
   let sentenceLines = known ? lines.slice(1) : lines;
   if (!known && firstRaw) {
-    const m = /^(成了|要你定|没成|不用说)(?:[：:。\s]+(.*))?$/.exec(firstRaw.replace(/^[【\[]\s*|\s*[】\]]$/g, ""));
+    const m = VERDICT_PREFIX_RE.exec(firstRaw.replace(/^[【\[]\s*|\s*[】\]]$/g, ""));
     if (m) {
       known = VERDICTS[m[1]!];
       sentenceLines = [m[2]?.trim() ?? "", ...lines.slice(1)].filter(Boolean);

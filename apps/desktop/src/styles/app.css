@@ -762,6 +762,11 @@ a {
   color: var(--mint-text);
 }
 
+.pk-badge.sky {
+  background: var(--sky-soft);
+  color: var(--sky-text);
+}
+
 .pk-badge.blush {
   background: var(--blush-soft);
   color: var(--blush-text);

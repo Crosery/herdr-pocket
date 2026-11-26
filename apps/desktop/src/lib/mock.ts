@@ -332,6 +332,21 @@ let demoAssistantState: AssistantState = {
       text: "「重构登录回调与权限校验」在等你做决定。",
       notice: { id: "n1", kind: "blocked", title: "workstation · 需要你", body: "OAuth state 校验策略需要选择 1 或 2", verdict: "decide", agent: "dev-mac/hc:t1", ts: now - 3 * min },
     },
+    {
+      id: "m3",
+      ts: now - 1 * min,
+      role: "notice",
+      text: "「release」桌面全量测试已通过，鸿蒙构建还在后台执行，暂时不用管。",
+      notice: {
+        id: "n2",
+        kind: "done",
+        title: "release · 还在跑",
+        body: "桌面全量测试已通过，鸿蒙构建还在后台执行，暂时不用管。",
+        verdict: "running",
+        agent: "dev-mac/hc:t2",
+        ts: now - 1 * min,
+      },
+    },
   ],
 };
 

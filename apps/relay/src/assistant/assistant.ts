@@ -1680,8 +1680,15 @@ export class Assistant {
     const looked = said.length ? await this.look(wakeBatch(handles, said), true, this.opts.wakeTimeoutMs ?? 60_000) : null;
     const told = looked && looked.verdict !== "skip" && looked.say ? looked : null;
     const say = told?.say ?? `${agents.length} 个停了：${handles.slice(0, 3).join("、")}。`;
+    const verdict: NoticeVerdict = told ? (told.verdict as NoticeVerdict) : "stopped";
     for (const a of agents) if (this.stillStopped(a.key)) this.reasons.set(a.key, say);
-    await this.emit({ kind: "done", title: `${agents.length} 个停了`, body: say, verdict: told ? (told.verdict as NoticeVerdict) : "stopped", details: told?.details || `停下的：${handles.join("、")}` });
+    await this.emit({
+      kind: "done",
+      title: told && verdict !== "stopped" ? `${agents.length} 个 · ${VERDICT_TITLE[verdict]}` : `${agents.length} 个停了`,
+      body: say,
+      verdict,
+      details: told?.details || `停下的：${handles.join("、")}`,
+    });
   }
 
   /** Hourly and daily ceilings on wake-ups; over them the fixed sentence is used. */
@@ -2287,7 +2294,15 @@ interface Stop {
   desk: boolean;
 }
 
-const VERDICT_TITLE: Record<NoticeVerdict, string> = { ok: "跑完了", decide: "等你", failed: "没跑成", stopped: "停了" };
+const VERDICT_TITLE: Record<NoticeVerdict, string> = {
+  ok: "跑完了",
+  running: "还在跑",
+  progress: "有进展",
+  decide: "等你",
+  paused: "等恢复",
+  stopped: "已停下",
+  failed: "出错了",
+};
 
 /**
  * A short name for every agent that is not a plain shell (4.4): the name given

@@ -19,6 +19,7 @@ export type CuteIconName =
   | "newChat"
   | "bell"
   | "plus"
+  | "flag"
   | "chevronRight"
   | "alert"
   | "pause"
@@ -146,6 +147,14 @@ function shape(name: CuteIconName, ink: string, fill: string, w: number) {
       );
     case "plus":
       return <Path d="M12 5.5 V18.5 M5.5 12 H18.5" {...line} />;
+    case "flag":
+      // A milestone flag: steady progress made on a long task.
+      return (
+        <G>
+          <Path d="M6.5 4.5 V20" {...line} />
+          <Path d="M6.5 5.2 H16.8 C18 5.2 18.6 6.5 17.8 7.5 L15.8 9.8 L17.8 12.1 C18.6 13.1 18 14.4 16.8 14.4 H6.5 Z" {...body} />
+        </G>
+      );
     case "alert":
       // A soft warning triangle: something went wrong.
       return (

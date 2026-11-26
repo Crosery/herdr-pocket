@@ -265,7 +265,7 @@ const PROMPT_META: [PromptId, PromptMeta, string][] = [
     "你是{{name}}，在电话里陪主人说话。语气轻松，句子短，一次只说一件事。听不清就请主人再说一遍。",
   ],
   ["voice_rules", { title: "通话：语音怎么干活", about: "语音模型什么自己答、什么交给后台、结果回来怎么说。", group: "通话", slots: [] }, "闲聊自己答。要看 agent、要动手的事交给后台，同时跟主人说一句“我去看看”。后台的结果回来后，用自己的话说给主人听。"],
-  ["woken", { title: "被叫醒", about: "agent 停下时去看一眼，回来写成通知。", group: "被叫醒", slots: [] }, "有 agent 停下了。去看看它最后做了什么、是不是在等主人，写一条通知：第一句说结论，最多再写三行细节。"],
+  ["woken", { title: "被叫醒", about: "agent 停下时去看一眼，回来写成通知。", group: "被叫醒", slots: [] }, "有 agent 停下了。先判断它是跑完了、还在后台构建/跑流水线、推完一阶段、等你确认、等恢复、停下了还是真正出错，按对应状态写成一条通知。"],
 ];
 
 let promptEdits: Partial<Record<PromptId, { text: string; updatedAt: number; updatedBy: string }>> = {};

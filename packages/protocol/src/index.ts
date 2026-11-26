@@ -1842,7 +1842,7 @@ export interface Notice {
   title: string;
   /** The one sentence the assistant says about it. Also the phone notification text. */
   body: string;
-  /** What the assistant found when it looked: ok = it worked, decide = the person has to choose, failed = it did not work, stopped = it stopped without a clear result. */
+  /** What the assistant found when it looked: ok = done, running = main turn ended while background build/subtask continues, progress = milestone done or earlier context truncated with clean step, decide = waiting for the person, paused = quota/network/external wait, stopped = stopped without clear result, failed = genuine error/failure. */
   verdict?: NoticeVerdict;
   /** A few more lines for the chat (plain text or simple markdown); never read aloud. */
   details?: string;
@@ -1850,7 +1850,7 @@ export interface Notice {
   ts: number;
 }
 
-export type NoticeVerdict = "ok" | "decide" | "failed" | "stopped";
+export type NoticeVerdict = "ok" | "running" | "progress" | "decide" | "paused" | "stopped" | "failed";
 
 export interface AssistantItem {
   id: string;

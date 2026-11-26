@@ -22,12 +22,18 @@ export function noticeLook(n: Pick<Notice, "kind" | "verdict">, p: Palette): { i
   switch (verdict) {
     case "ok":
       return { icon: "done", ...statusColors("working", p.dark) };
+    case "running":
+      return { icon: "working", fg: p.sky, bg: p.skyContainer };
+    case "progress":
+      return { icon: "flag", fg: p.accentText, bg: p.accentContainer };
     case "decide":
-      return { icon: "blocked", ...statusColors("blocked", p.dark) };
-    case "failed":
-      return { icon: "alert", fg: p.error, bg: p.errorContainer };
+      return { icon: "blocked", fg: p.warn, bg: p.warnContainer };
+    case "paused":
+      return { icon: "idle", fg: p.dusk, bg: p.duskContainer };
     case "stopped":
       return { icon: "pause", ...statusColors("idle", p.dark) };
+    case "failed":
+      return { icon: "alert", fg: p.error, bg: p.errorContainer };
     default:
       return { icon: "bell", fg: p.dusk, bg: p.duskContainer };
   }

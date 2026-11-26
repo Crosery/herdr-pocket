@@ -268,7 +268,7 @@ test("a finished turn wakes the assistant to look; what it found reaches the pus
   publish([agent("t5", "done", "重构网关")]);
   const n = await push.next((f) => f.type === "notice");
   assert.equal(n.notice.kind, "done");
-  assert.equal(n.notice.title, "重构网关 · 没跑成");
+  assert.equal(n.notice.title, "重构网关 · 出错了");
   assert.equal(n.notice.verdict, "failed");
   assert.equal(n.notice.body, "重构网关说测试全过，可最后一次测试挂了两个。");
   assert.match(n.notice.details, /pnpm test 报了 2 个失败/);
@@ -373,7 +373,7 @@ test("what counts as stopped: short turns, the desk, subagents, watching, batche
   await sleep(20);
   publish([agent("a7", "done", "说不清的")]);
   const unclear = await push.next((f) => f.type === "notice");
-  assert.equal(unclear.notice.title, "说不清的 · 停了");
+  assert.equal(unclear.notice.title, "说不清的 · 已停下");
   assert.equal(unclear.notice.verdict, "stopped");
   assert.equal(unclear.notice.body, "它停在一半，看不出是不是做完了。");
   wake = () => {
@@ -426,14 +426,15 @@ test("what counts as stopped: short turns, the desk, subagents, watching, batche
   wake = (req) => {
     looks++;
     assert.match(String(req.messages[0]!.content), /^\[叫醒\] 4 个 agent 在十秒内都停了：批一、批二、批三、批四。/);
-    return text("没成\n四个都停了，是额度用完了，周二早上恢复。");
+    return text("等恢复\n四个都停了，是额度用完了，周二早上恢复。");
   };
   const batch = (status: Agent["status"]) => ["批一", "批二", "批三", "批四"].map((t, i) => agent(`c${i}`, status, t, status === "working" ? long : {}));
   publish(batch("working"));
   await sleep(20);
   publish(batch("done"));
   const many = await push.next((f) => f.type === "notice");
-  assert.equal(many.notice.title, "4 个停了");
+  assert.equal(many.notice.title, "4 个 · 等恢复");
+  assert.equal(many.notice.verdict, "paused");
   assert.equal(many.notice.body, "四个都停了，是额度用完了，周二早上恢复。");
   assert.equal(many.notice.agent, undefined);
   await quiet();
@@ -788,18 +789,28 @@ test("the warmer voice: soft openers and particles stay, service talk still goes
   ];
   for (const p of prompts) assert.doesNotMatch(p, /一个字就(够|行)|最多说两三个字|不加开头，不加结尾/);
   assert.match(systemPrompt("小羊", "call", ""), /要说出口的话\n---\n备查/);
-  assert.match(systemPrompt("小羊", "woken", ""), /成了、要你定、没成、不用说/);
+  assert.match(systemPrompt("小羊", "woken", ""), /成了、还在跑、有进展、要你定、等恢复、停下了、没成、不用说/);
   assert.match(systemPrompt("小羊", "text", ""), /口气温和|温温和和/);
   assert.match(systemPrompt("小羊", "text", ""), /不说客服腔/);
 });
 
-test("what the assistant found when woken: four verdicts, an unknown first line, missing parts", () => {
+test("what the assistant found when woken: all seven verdicts, inline aliases, an unknown first line, missing parts", () => {
   assert.deepEqual(parseWake("成了\n接口文档跑完了，四十多个接口都补上了示例。\n---\n- 让它做的：补示例\n- 补了 43 个"), {
     verdict: "ok",
     say: "接口文档跑完了，四十多个接口都补上了示例。",
     details: "- 让它做的：补示例\n- 补了 43 个",
   });
+  assert.deepEqual(parseWake("还在跑\n鸿蒙构建还在后台继续跑，暂时不用你管。"), {
+    verdict: "running",
+    say: "鸿蒙构建还在后台继续跑，暂时不用你管。",
+    details: "",
+  });
+  assert.equal(parseWake("有进展\n登录模块改完并跑过单测，这轮只查了局部上下文。").verdict, "progress");
   assert.equal(parseWake("结论：要你定。\n迁移脚本停了，问回滚用快照还是反向脚本。").verdict, "decide");
+  assert.equal(parseWake("等恢复\n模型额度用完了，九点恢复后接着跑。").verdict, "paused");
+  assert.equal(parseWake("停下了\n中途被人打断了。").verdict, "stopped");
+  assert.equal(parseWake("结论：还在跑\n鸿蒙构建还在后台跑，暂时不用你管。").verdict, "running");
+  assert.equal(parseWake("【有进展】\n阶段单测过了。").verdict, "progress");
   assert.equal(parseWake("【没成】\n登录页没跑成，依赖装不上。").verdict, "failed");
   assert.deepEqual(parseWake("不用说"), { verdict: "skip", say: "", details: "" });
   assert.deepEqual(parseWake("【结论】\n不用说\n【一句话】\n它只是把脚本放在输入框里。"), { verdict: "skip", say: "", details: "" });
@@ -979,13 +990,13 @@ test("wake 429 quota exhaustion pauses wake retries for 5m without error spam an
   await sleep(25);
   publish([agent("q1", "done", "任务一")]);
   const n1 = await push.next((f) => f.type === "notice");
-  assert.equal(n1.notice.title, "任务一 · 停了");
+  assert.equal(n1.notice.title, "任务一 · 已停下");
   assert.equal(wakeAttempts, 1);
 
   publish([agent("q2", "working", "任务二", ran(5 * 60_000))]);
   await sleep(25);
   publish([agent("q2", "done", "任务二")]);
   const n2 = await push.next((f) => f.type === "notice");
-  assert.equal(n2.notice.title, "任务二 · 停了");
+  assert.equal(n2.notice.title, "任务二 · 已停下");
   assert.equal(wakeAttempts, 1, "second stop within 5m cooldown must skip wake LLM call");
 });
