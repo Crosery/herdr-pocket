@@ -149,6 +149,7 @@ export function createBufferedEventMerger(
   let prePageBuffer: ConvEvent[] = [];
   let liveBatch: ConvEvent[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastFlushAt = 0;
   let fallbackTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
     fallbackTimer = null;
     if (!disposed) onInitialReady();
@@ -190,13 +191,15 @@ export function createBufferedEventMerger(
     }
     liveBatch.push(ev);
     if (flushTimer === null) {
+      const delay = Date.now() - lastFlushAt < 24 ? 16 : 0;
       flushTimer = setTimeout(() => {
         flushTimer = null;
         if (disposed || !liveBatch.length) return;
         const batch = liveBatch;
         liveBatch = [];
+        lastFlushAt = Date.now();
         applyMerge(batch);
-      }, 16);
+      }, delay);
     }
   };
 

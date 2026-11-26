@@ -9,6 +9,7 @@ import {
   shouldAutoDrainQueue,
   type OutgoingSendLike,
 } from "../src/lib/chatQueueLogic.ts";
+import { computeTurnTelemetry } from "../src/lib/turnTelemetry.ts";
 import {
   KittyApcSplitter,
   KittyKeyboardState,
@@ -427,4 +428,54 @@ test("chatQueueLogic: isAgentTurnBusy detects running tools on status flicker an
     segs.map((x) => (x.kind === "row" ? x.row.id : `out:${x.send.id}`)),
     ["t1", "out:qt-1"],
   );
+});
+
+test("chatQueueLogic & computeTurnTelemetry: attachment-only sends reconcile cleanly and fresher agent tokens win", () => {
+  const imgOnlySend: OutgoingSendLike = {
+    id: "img-1",
+    text: "",
+    attachedCount: 1,
+    ts: 100_000,
+    state: "sent",
+  };
+  const emptyUserRow: ChatRow = {
+    kind: "user",
+    id: "u-img",
+    text: "",
+    ts: 100_200,
+    attachedLines: [],
+    attachedCount: 0,
+  };
+  const reconciled = reconcileOutgoingSends([imgOnlySend], [emptyUserRow], "working", 105_000);
+  assert.deepEqual(reconciled.matchedIds, ["img-1"]);
+  assert.equal(reconciled.unmatched.length, 0);
+
+  const metrics = computeTurnTelemetry(
+    [],
+    {
+      harness: "antigravity",
+      generatedAt: 100_000,
+      quotas: [],
+      session: {
+        turns: 10,
+        steps: 100,
+        prompts: 10,
+        input: 10_000,
+        output: 2_000,
+        cacheRead: 168_000,
+        cacheWrite: 0,
+        reasoning: 0,
+        costUsd: 1,
+        unpricedSteps: 0,
+        contextTokens: 178_000,
+        contextLimit: 1_050_000,
+        contextPct: 17.8,
+        models: [],
+      },
+    },
+    { contextTokens: 341_250, contextLimit: 1_050_000 },
+  );
+  assert.equal(metrics.contextTokens, 341_250);
+  assert.equal(metrics.usedPct, 32.5);
+  assert.equal(metrics.remainPct, 67.5);
 });

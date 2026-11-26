@@ -2381,11 +2381,7 @@ export function Composer({
                   );
                 })() : null}
                 {(usageData.model || effectiveCurrentModel) ? (
-                  <Pressable
-                    onPress={() => {
-                      setUsageOpen(false);
-                      openModelPicker("model");
-                    }}
+                  <View
                     style={{
                       flexDirection: "row",
                       alignItems: "center",
@@ -2406,7 +2402,7 @@ export function Composer({
                         {(usageData.model || effectiveCurrentModel || "").split("/").pop()}
                       </Text>
                     </View>
-                  </Pressable>
+                  </View>
                 ) : null}
                 {usageData.quotas.length > 0 ? (() => {
                   const fmtResetShort = (resetAt?: number) => {

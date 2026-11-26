@@ -1,7 +1,6 @@
 import { useEffect, useId, useMemo, useState } from "react";
 import { Gauge, RefreshCw, Terminal, X } from "lucide-react";
 import { resolveModelBrand, type Agent, type AgentUsageReport, type ConvEvent } from "@herdr-pocket/protocol";
-import { settingsStore, updateSettings } from "../lib/store";
 import {
   computeTurnTelemetry,
   fmtPctClean,
@@ -183,7 +182,6 @@ export function AgentUsageCard({
   error,
   onRefresh,
   onClose,
-  onOpenModelSwitch,
   onRunInTerminal,
 }: {
   agent: Agent;
@@ -193,11 +191,9 @@ export function AgentUsageCard({
   error: string | null;
   onRefresh: () => void;
   onClose: () => void;
-  onOpenModelSwitch: () => void;
   onRunInTerminal?: () => void;
 }) {
   const uid = useId().replace(/:/g, "");
-  const vialMode = settingsStore.use((s) => s.contextVialMode);
   const s = report?.session ?? null;
 
   const telemetry = useMemo(
@@ -262,7 +258,7 @@ export function AgentUsageCard({
     ? `${activeModelId.split("/").pop()}${effortTag ? ` (${effortTag})` : ""}`
     : "未识别模型";
 
-  const showVialColumn = vialMode && hasContext;
+  const showVialColumn = hasContext;
 
   return (
     <section className="usage-card" aria-label="上下文与用量仪表盘">
@@ -273,16 +269,6 @@ export function AgentUsageCard({
           <span className="usage-sub">{report?.harness || agent.harness}</span>
         </div>
         <div className="usage-card-actions">
-          <button
-            type="button"
-            className={`usage-vial-toggle${vialMode ? " on" : ""}`}
-            aria-pressed={vialMode}
-            title="切换实体试管液位展示"
-            onClick={() => updateSettings({ contextVialMode: !vialMode })}
-          >
-            <span className="usage-vial-dot" aria-hidden="true" />
-            <span>实体试管</span>
-          </button>
           <PocketIconButton
             size="sm"
             aria-label="刷新用量"
@@ -364,18 +350,13 @@ export function AgentUsageCard({
                 <div className="usage-empty">暂无当前上下文窗口读数</div>
               )}
 
-              <button
-                type="button"
-                className="usage-current-model-row"
-                onClick={onOpenModelSwitch}
-                title="点击切换模型或思考等级"
-              >
+              <div className="usage-current-model-row" aria-label={`当前模型 ${activeModelDisplay}`}>
                 <span className="usage-current-label">当前模型</span>
                 <span className="usage-current-value">
                   <ModelBrandIcon model={activeModelId} size={14} />
                   <span className="mono truncate">{activeModelDisplay}</span>
                 </span>
-              </button>
+              </div>
 
               {activeQuotaGroup ? (
                 <div className="usage-quota-panel">

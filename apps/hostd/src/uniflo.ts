@@ -702,16 +702,26 @@ export class UnifloAdapter {
       // Whatever came while the stream was down is read once from the page.
       this.wakeAll();
     } else if (j.type === "event" && j.event && typeof j.event.session === "string") {
-      const set = this.liveListeners.get(j.event.session);
-      const needsToolHook = Boolean(this.onLiveToolCall && j.event.kind === "tool_call");
-      if (!set?.size && !needsToolHook) return;
+      const eventSession = j.event.session;
+      const targets = new Set<LiveListener>();
+      for (const [k, s] of this.liveListeners.entries()) {
+        if (k === eventSession || (k.length < eventSession.length && eventSession.startsWith(k))) {
+          for (const fn of s) targets.add(fn);
+        }
+      }
+      const kind = j.event.kind;
+      if (kind === "user_message" || kind === "assistant_message" || kind === "turn_end" || kind === "usage") {
+        this.refreshSoon();
+      }
+      const needsToolHook = Boolean(this.onLiveToolCall && kind === "tool_call");
+      if (!targets.size && !needsToolHook) return;
       const e = sameAsPage(j.event) ? toConvEvent(j.event) : undefined;
       if (e === null) return; // a usage tick or an empty notice: nothing to show
       if (e && e.kind === "tool_call" && this.onLiveToolCall) {
-        this.onLiveToolCall(j.event.session, e);
+        this.onLiveToolCall(eventSession, e);
       }
-      if (set?.size) {
-        for (const fn of [...set]) fn(e ?? null);
+      if (targets.size) {
+        for (const fn of [...targets]) fn(e ?? null);
       }
     } else if (j.type === "session" && j.session?.key) {
       // A new session (a fresh start, `/clear`, a subagent) or a changed one: match agents now, not in 8 s.
@@ -728,7 +738,7 @@ export class UnifloAdapter {
     this.soonTimer = setTimeout(() => {
       this.soonTimer = null;
       void this.refresh();
-    }, Math.max(150, this.lastRefresh + 1000 - Date.now()));
+    }, Math.max(80, this.lastRefresh + 300 - Date.now()));
     this.soonTimer.unref?.();
   }
 

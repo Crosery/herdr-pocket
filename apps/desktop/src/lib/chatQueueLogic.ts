@@ -93,12 +93,14 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
     }
 
     const isSlash = send.text.trim().startsWith("/");
+    const isAttachmentOnly = !send.text.trim() && send.attachedCount > 0;
     let hitIdx = -1;
     const userHit = users.find(
       ({ r, i }) =>
         !claimed.has(i) &&
         (r.ts ?? 0) >= send.ts - ECHO_SLACK_MS &&
-        sameMessage(transcriptForm(r), send.text, send.attachedCount > 0),
+        (sameMessage(transcriptForm(r), send.text, send.attachedCount > 0) ||
+          (isAttachmentOnly && !r.text.trim())),
     );
     if (userHit) {
       hitIdx = userHit.i;

@@ -615,7 +615,6 @@ a {
   max-height: min(308px, calc(var(--radix-select-content-available-height, 320px) - 12px));
   overflow-y: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
 }
 
 .pk-select-item {
@@ -1936,6 +1935,22 @@ html[data-app-focused="false"] *,
   transition-duration: 0.01ms !important;
 }
 
+/* Finite entrance animations (starting at opacity: 0) must skip rather than freeze invisible when unfocused or idle. */
+html[data-app-focused="false"] .settings-frame[data-state="open"],
+html[data-app-focused="false"] .v3-droplet,
+html[data-app-focused="false"] .v3-chord-hud,
+html[data-app-focused="false"] .update-toast-card,
+:root[data-idle] .settings-frame[data-state="open"],
+:root[data-idle] .v3-droplet,
+:root[data-idle] .v3-chord-hud,
+:root[data-idle] .update-toast-card,
+:root[data-calm] .settings-frame[data-state="open"],
+:root[data-calm] .v3-droplet,
+:root[data-calm] .v3-chord-hud,
+:root[data-calm] .update-toast-card {
+  animation: none !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -1946,26 +1961,30 @@ html[data-app-focused="false"] *,
   }
 }
 
-/* Windows (WebView2) shows chunky classic scrollbars; macOS keeps its overlay ones. */
-:root[data-platform="windows"] * {
-  scrollbar-width: thin;
-  scrollbar-color: var(--divider) transparent;
+/* Seamless Pocket scrollbars: invisible at rest, feather-thin translucent pill on hover/active. */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
 }
 
-:root[data-platform="windows"] ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-
-:root[data-platform="windows"] ::-webkit-scrollbar-thumb {
-  background: var(--divider);
-  border-radius: 999px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
-}
-
-:root[data-platform="windows"] ::-webkit-scrollbar-track {
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
   background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+
+*:hover::-webkit-scrollbar-thumb,
+*:focus-within::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--ink) 15%, transparent);
+}
+
+::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:active {
+  background: color-mix(in srgb, var(--ink) 28%, transparent);
 }
 
 .wrap-anywhere {
@@ -5115,53 +5134,13 @@ html[data-app-focused="false"] *,
   flex-shrink: 0;
 }
 
-.usage-vial-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 24px;
-  padding: 0 10px;
-  border-radius: 999px;
-  border: 1px solid var(--divider);
-  background: var(--surface);
-  color: var(--muted);
-  font: inherit;
-  font-size: calc(11px * var(--ts, 1));
-  font-weight: 600;
-  cursor: pointer;
-  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
-}
-
-.usage-vial-toggle:hover {
-  border-color: var(--line-pink);
-  color: var(--ink);
-}
-
-.usage-vial-toggle.on {
-  border-color: color-mix(in srgb, #4d8eff 50%, var(--line-pink));
-  background: color-mix(in srgb, #3a6bff 12%, var(--surface));
-  color: var(--ink);
-}
-
-.usage-vial-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--faint);
-  transition: background 0.15s ease, box-shadow 0.15s ease;
-}
-
-.usage-vial-toggle.on .usage-vial-dot {
-  background: #4fa6ff;
-  box-shadow: 0 0 6px rgba(79, 166, 255, 0.75);
-}
-
 .usage-card-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 12px 14px;
   max-height: min(410px, 56vh);
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
@@ -5370,19 +5349,17 @@ html[data-app-focused="false"] *,
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
+  overflow: hidden;
   padding: 6px 10px;
   border-radius: 9px;
   border: 1px solid var(--divider);
   background: var(--surface-2);
   color: var(--ink);
   font: inherit;
-  cursor: pointer;
-  transition: border-color 0.14s ease, background 0.14s ease;
-}
-
-.usage-current-model-row:hover {
-  border-color: var(--line-pink);
-  background: var(--surface-3);
+  cursor: default;
 }
 
 .usage-current-label {
@@ -5394,8 +5371,11 @@ html[data-app-focused="false"] *,
 .usage-current-value {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 6px;
+  flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
   font-size: calc(12px * var(--ts, 1));
   font-weight: 700;
   color: var(--ink);
@@ -5668,7 +5648,6 @@ html[data-app-focused="false"] *,
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
   padding: 5px;
   display: flex;
   flex-direction: column;
@@ -5875,7 +5854,6 @@ html[data-app-focused="false"] *,
   padding-left: 14px;
   max-height: 112px;
   overflow-y: auto;
-  scrollbar-width: thin;
 }
 
 .update-toast-note-line {

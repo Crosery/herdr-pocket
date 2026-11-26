@@ -55,13 +55,16 @@ export interface AppSettings {
   contextVialMode: boolean;
   /** How the sidebar Agent section is grouped: status, space hierarchy, or recent activity. */
   sidebarAgentGrouping: SidebarAgentGrouping;
-  /** Show page-count badges, P1..PN labels, split-pane rails, and hover links in the sidebar. */
+  /** Visual presentation scheme ("a" cluster cards, "b" machine subheaders, "c" split glyphs) for the sidebar Agent list. */
+  sidebarStyleScheme: SidebarStyleScheme;
+  /** Show page-count badges, location tags, split-pane clusters, and hover links in the sidebar. */
   showSidebarTopology: boolean;
   /** "done" once the first-run guide was finished or skipped; "later" when closed half way. */
   onboarding: "new" | "later" | "done";
 }
 
 export type SidebarAgentGrouping = "status" | "space" | "recent";
+export type SidebarStyleScheme = "a" | "b" | "c";
 
 export interface LiveState {
   link: LinkStatus;
@@ -113,6 +116,7 @@ function persistPrefs(s: AppSettings): void {
     alertChimeOnlyLongTasks: s.alertChimeOnlyLongTasks,
     contextVialMode: s.contextVialMode,
     sidebarAgentGrouping: s.sidebarAgentGrouping,
+    sidebarStyleScheme: s.sidebarStyleScheme,
     showSidebarTopology: s.showSidebarTopology,
     onboarding: s.onboarding,
   });
@@ -208,6 +212,10 @@ export const settingsStore = createStore<AppSettings>({
     saved.sidebarAgentGrouping === "recent"
       ? saved.sidebarAgentGrouping
       : readLegacySidebarGrouping(),
+  sidebarStyleScheme:
+    saved.sidebarStyleScheme === "b" || saved.sidebarStyleScheme === "c"
+      ? saved.sidebarStyleScheme
+      : "a",
   showSidebarTopology: saved.showSidebarTopology ?? true,
   // Installs from before the guide existed already have a server: don't greet them as new.
   onboarding: saved.onboarding ?? (saved.lastServer ? "done" : "new"),

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Laptop, Monitor, Plus, QrCode, RefreshCw, Server, Smartphone, Trash2, Upload } from "lucide-react";
 import { configKeySpec, type Device } from "@herdr-pocket/protocol";
+import { VendorIcon } from "../../components/MascotAndVendor";
 import { PocketBadge, PocketButton, PocketInput, PocketSelect, PocketSwitch, useToast } from "../../components/PocketUI";
 import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { PermissionCards, prettyHotkey } from "../../components/VoiceInput";
@@ -20,7 +21,16 @@ import { native, type LogFolderInfo, type Permissions } from "../../lib/native";
 import { setConfig, useClientConfig } from "../../lib/config";
 import { isMockServer } from "../../lib/mock";
 import { pingRelay } from "../../lib/relay";
-import { liveStore, relTime, settingsStore, updateSettings, type SidebarAgentGrouping } from "../../lib/store";
+import {
+  liveStore,
+  relTime,
+  settingsStore,
+  updateSettings,
+  type SidebarAgentGrouping,
+  type SidebarStyleScheme,
+} from "../../lib/store";
+import { SidebarDeviceChip, SplitMatrixGlyph } from "../../shell/ShellSidebar";
+import type { AgentTopologyPlacement } from "../../shell/sidebarTopology";
 import { IS_MAC, SHORTCUTS, keyChips } from "../../shell/shortcuts";
 import { openSettingsFrame } from "../../shell/shellStore";
 import { RemoveDeviceDialog } from "../DevicesView";
@@ -505,8 +515,343 @@ const SIDEBAR_GROUPING_OPTIONS: Array<{ value: SidebarAgentGrouping; label: stri
   { value: "recent", label: "按最近活跃", note: "最近交互过的 Agent 排在前面" },
 ];
 
+const SIDEBAR_SCHEME_OPTIONS: Array<{ value: SidebarStyleScheme; label: string; tag: string; note: string }> = [
+  {
+    value: "a",
+    label: "方案 A（默认）",
+    tag: "同窗聚合卡",
+    note: "同空间自动聚拢，同窗分屏收纳进柔和圆角卡，左侧固定电脑小标",
+  },
+  {
+    value: "b",
+    label: "方案 B",
+    tag: "按电脑分栏",
+    note: "状态组内先按电脑划分小标题，整条副行全宽留给空间与页面位置",
+  },
+  {
+    value: "c",
+    label: "方案 C",
+    tag: "微缩分屏图",
+    note: "左侧固定电脑小标，右侧用微缩窗口分屏小格直观标明所在格位",
+  },
+];
+
+const PREVIEW_PLACEMENTS: Record<string, AgentTopologyPlacement> = {
+  split1: {
+    agentKey: "p1",
+    tabId: "t-split",
+    paneId: "pane-1",
+    spaceKey: "local\0伊吹工坊",
+    spaceName: "伊吹工坊",
+    spaceColor: "ansi4",
+    pageNumber: 1,
+    pageTotal: 4,
+    paneIndex: 1,
+    paneCount: 2,
+    isSplit: true,
+    isBackground: false,
+    isActiveTab: true,
+    isFocusedPane: true,
+    siblingAgentKeys: ["p2"],
+  },
+  split2: {
+    agentKey: "p2",
+    tabId: "t-split",
+    paneId: "pane-2",
+    spaceKey: "local\0伊吹工坊",
+    spaceName: "伊吹工坊",
+    spaceColor: "ansi4",
+    pageNumber: 1,
+    pageTotal: 4,
+    paneIndex: 2,
+    paneCount: 2,
+    isSplit: true,
+    isBackground: false,
+    isActiveTab: true,
+    isFocusedPane: false,
+    siblingAgentKeys: ["p1"],
+  },
+  singleLocal: {
+    agentKey: "p3",
+    tabId: "t-tan",
+    paneId: "pane-tan",
+    spaceKey: "local\0弹唱",
+    spaceName: "弹唱",
+    spaceColor: "ansi5",
+    pageNumber: 3,
+    pageTotal: 4,
+    paneIndex: 1,
+    paneCount: 1,
+    isSplit: false,
+    isBackground: false,
+    isActiveTab: false,
+    isFocusedPane: false,
+    siblingAgentKeys: [],
+  },
+  singleRemote: {
+    agentKey: "p4",
+    tabId: "t-remote",
+    paneId: "pane-remote",
+    spaceKey: "remote\0测试",
+    spaceName: "测试",
+    spaceColor: "ansi6",
+    pageNumber: 2,
+    pageTotal: 3,
+    paneIndex: 1,
+    paneCount: 1,
+    isSplit: false,
+    isBackground: false,
+    isActiveTab: false,
+    isFocusedPane: false,
+    siblingAgentKeys: [],
+  },
+};
+
+function PreviewAgentLine({
+  harness,
+  title,
+  age,
+  selected,
+  running,
+  device,
+  spaceName,
+  spaceColor,
+  subOverride,
+  placement,
+  scheme,
+}: {
+  harness: string;
+  title: string;
+  age: string;
+  selected?: boolean;
+  running?: boolean;
+  device?: { label: string; fullLabel: string; isLocal: boolean } | null;
+  spaceName?: string;
+  spaceColor?: string;
+  subOverride?: string;
+  placement: AgentTopologyPlacement;
+  scheme: SidebarStyleScheme;
+}) {
+  const glyph = scheme === "c" ? <SplitMatrixGlyph placement={placement} /> : null;
+  const badge =
+    scheme !== "c" && !subOverride
+      ? placement.isSplit
+        ? `${placement.paneCount}分屏 ${placement.paneIndex}/${placement.paneCount}`
+        : `第${placement.pageNumber ?? 1}页`
+      : null;
+  return (
+    <div className={`v3-row v3-agent has-sub${selected ? " selected" : ""}`}>
+      <VendorIcon harness={harness} isShell={false} size={15} />
+      <div className="v3-agent-body">
+        <div className="v3-agent-top">
+          <span className="v3-agent-title v3-row-label truncate">{title}</span>
+          <span className="v3-time">{age}</span>
+          {running ? <span className="v3-spinner" aria-hidden="true" /> : <span className="v3-ring" aria-hidden="true" />}
+        </div>
+        <div className="v3-agent-sub">
+          <span className="v3-agent-sub-main">
+            {device ? <SidebarDeviceChip label={device.label} fullLabel={device.fullLabel} isLocal={device.isLocal} /> : null}
+            {subOverride ? (
+              <span className="truncate">{subOverride}</span>
+            ) : spaceName ? (
+              <>
+                {spaceColor ? <span className="v3-space-dot" style={{ backgroundColor: spaceColor }} aria-hidden="true" /> : null}
+                <span className="truncate">{spaceName}</span>
+              </>
+            ) : null}
+          </span>
+          {glyph}
+          {badge ? (
+            <span className={`v3-topo-badge ${placement.isSplit ? "is-split" : "is-page"}`}>
+              <span>{badge}</span>
+            </span>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SidebarSchemePreview({ scheme }: { scheme: SidebarStyleScheme }) {
+  const activeMeta = SIDEBAR_SCHEME_OPTIONS.find((o) => o.value === scheme) ?? SIDEBAR_SCHEME_OPTIONS[0]!;
+  return (
+    <div className="sf-sidebar-scheme-preview" role="region" aria-label={`侧边栏样式实时预览：${activeMeta.label}`}>
+      <div className="sf-scheme-preview-head">
+        <span>实时效果预览</span>
+        <span className="sf-scheme-preview-tag">{activeMeta.label} · {activeMeta.tag}</span>
+      </div>
+      <div className="sf-scheme-preview-rail">
+        <div className="v3-group-head" style={{ marginTop: 0, cursor: "default" }}>
+          <span>运行中</span>
+          <span className="v3-count">4</span>
+        </div>
+
+        {scheme === "b" ? (
+          <>
+            <div className="v3-dev-subhdr">
+              <SidebarDeviceChip label="本机 MacBook · 3" fullLabel="本机 · MacBook" isLocal />
+              <span className="v3-dev-subhdr-line" />
+            </div>
+            <div className="v3-split-cluster">
+              <div className="v3-split-cluster-hd">
+                <span className="v3-space-dot" style={{ backgroundColor: "#3b82f6" }} aria-hidden="true" />
+                <span className="truncate">伊吹工坊</span>
+                <span className="v3-split-cluster-badge">同窗 2分屏</span>
+              </div>
+              <PreviewAgentLine
+                harness="gemini"
+                title="Tsing 服务问题排查"
+                age="刚刚"
+                selected
+                running
+                subOverride="分屏格 1/2"
+                placement={PREVIEW_PLACEMENTS.split1!}
+                scheme={scheme}
+              />
+              <PreviewAgentLine
+                harness="gemini"
+                title="NewAPI 内测需求联调"
+                age="5分"
+                running
+                subOverride="分屏格 2/2"
+                placement={PREVIEW_PLACEMENTS.split2!}
+                scheme={scheme}
+              />
+            </div>
+            <PreviewAgentLine
+              harness="claude-code"
+              title="Linux Agent Handover"
+              age="12分"
+              running
+              spaceName="弹唱"
+              spaceColor="#e85d93"
+              placement={PREVIEW_PLACEMENTS.singleLocal!}
+              scheme={scheme}
+            />
+            <div className="v3-dev-subhdr">
+              <SidebarDeviceChip label="家里的 Mac · 1" fullLabel="家里的 Mac" isLocal={false} />
+              <span className="v3-dev-subhdr-line" />
+            </div>
+            <PreviewAgentLine
+              harness="codex"
+              title="Connecting Colab Container"
+              age="1时"
+              running
+              spaceName="测试"
+              spaceColor="#06b6d4"
+              placement={PREVIEW_PLACEMENTS.singleRemote!}
+              scheme={scheme}
+            />
+          </>
+        ) : scheme === "c" ? (
+          <>
+            <PreviewAgentLine
+              harness="gemini"
+              title="Tsing 服务问题排查"
+              age="刚刚"
+              selected
+              running
+              device={{ label: "本机", fullLabel: "本机 · MacBook", isLocal: true }}
+              spaceName="伊吹工坊"
+              spaceColor="#3b82f6"
+              placement={PREVIEW_PLACEMENTS.split1!}
+              scheme={scheme}
+            />
+            <PreviewAgentLine
+              harness="gemini"
+              title="NewAPI 内测需求联调"
+              age="5分"
+              running
+              device={{ label: "本机", fullLabel: "本机 · MacBook", isLocal: true }}
+              spaceName="伊吹工坊"
+              spaceColor="#3b82f6"
+              placement={PREVIEW_PLACEMENTS.split2!}
+              scheme={scheme}
+            />
+            <PreviewAgentLine
+              harness="claude-code"
+              title="Linux Agent Handover"
+              age="12分"
+              running
+              device={{ label: "本机", fullLabel: "本机 · MacBook", isLocal: true }}
+              spaceName="弹唱"
+              spaceColor="#e85d93"
+              placement={PREVIEW_PLACEMENTS.singleLocal!}
+              scheme={scheme}
+            />
+            <PreviewAgentLine
+              harness="codex"
+              title="Connecting Colab Container"
+              age="1时"
+              running
+              device={{ label: "家里的 Mac", fullLabel: "家里的 Mac", isLocal: false }}
+              spaceName="测试"
+              spaceColor="#06b6d4"
+              placement={PREVIEW_PLACEMENTS.singleRemote!}
+              scheme={scheme}
+            />
+          </>
+        ) : (
+          <>
+            <div className="v3-split-cluster">
+              <div className="v3-split-cluster-hd">
+                <SidebarDeviceChip label="本机" fullLabel="本机 · MacBook" isLocal />
+                <span className="v3-space-dot" style={{ backgroundColor: "#3b82f6" }} aria-hidden="true" />
+                <span className="truncate">伊吹工坊</span>
+                <span className="v3-split-cluster-badge">同窗 2分屏</span>
+              </div>
+              <PreviewAgentLine
+                harness="gemini"
+                title="Tsing 服务问题排查"
+                age="刚刚"
+                selected
+                running
+                subOverride="分屏格 1/2"
+                placement={PREVIEW_PLACEMENTS.split1!}
+                scheme={scheme}
+              />
+              <PreviewAgentLine
+                harness="gemini"
+                title="NewAPI 内测需求联调"
+                age="5分"
+                running
+                subOverride="分屏格 2/2"
+                placement={PREVIEW_PLACEMENTS.split2!}
+                scheme={scheme}
+              />
+            </div>
+            <PreviewAgentLine
+              harness="claude-code"
+              title="Linux Agent Handover"
+              age="12分"
+              running
+              device={{ label: "本机", fullLabel: "本机 · MacBook", isLocal: true }}
+              spaceName="弹唱"
+              spaceColor="#e85d93"
+              placement={PREVIEW_PLACEMENTS.singleLocal!}
+              scheme={scheme}
+            />
+            <PreviewAgentLine
+              harness="codex"
+              title="Connecting Colab Container"
+              age="1时"
+              running
+              device={{ label: "家里的 Mac", fullLabel: "家里的 Mac", isLocal: false }}
+              spaceName="测试"
+              spaceColor="#06b6d4"
+              placement={PREVIEW_PLACEMENTS.singleRemote!}
+              scheme={scheme}
+            />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function SidebarWorkspaceUxRows() {
   const grouping = settingsStore.use((s) => s.sidebarAgentGrouping);
+  const styleScheme = settingsStore.use((s) => s.sidebarStyleScheme);
   const showTopology = settingsStore.use((s) => s.showSidebarTopology);
   const groupingNote =
     SIDEBAR_GROUPING_OPTIONS.find((o) => o.value === grouping)?.note ?? "选择侧边栏 Agent 列表的分组方式";
@@ -519,9 +864,37 @@ export function SidebarWorkspaceUxRows() {
           options={SIDEBAR_GROUPING_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
         />
       </SetRow>
+      <div className="sf-scheme-block">
+        <div className="sf-scheme-block-head">
+          <div className="set-label">侧边栏排布样式</div>
+          <div className="set-about">默认按方案 A 展示；切换方案 B / C 可在下方面板与真实侧栏实时生效</div>
+        </div>
+        <div className="sf-scheme-cards" role="radiogroup" aria-label="侧边栏排布样式">
+          {SIDEBAR_SCHEME_OPTIONS.map((opt) => {
+            const active = styleScheme === opt.value;
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                className={`sf-scheme-card${active ? " active" : ""}`}
+                onClick={() => updateSettings({ sidebarStyleScheme: opt.value })}
+              >
+                <div className="sf-scheme-card-top">
+                  <span className="sf-scheme-card-title">{opt.label}</span>
+                  <span className="sf-scheme-card-tag">{opt.tag}</span>
+                </div>
+                <div className="sf-scheme-card-note">{opt.note}</div>
+              </button>
+            );
+          })}
+        </div>
+        <SidebarSchemePreview scheme={styleScheme} />
+      </div>
       <SetRow
         title="显示空间分页与分屏关系"
-        about="显示 Space 页数气泡（点击展开 P1..PN 快捷跳转）、分屏联动标识与同窗高光"
+        about="显示 Space 页数标记（点击展开第 1..N 页快捷跳转）、同窗分屏聚合卡与悬停联动"
       >
         <PocketSwitch
           checked={showTopology}

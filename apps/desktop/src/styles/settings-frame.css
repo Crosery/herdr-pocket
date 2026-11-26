@@ -190,7 +190,6 @@
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
-  scrollbar-gutter: stable;
   outline: none;
 }
 
@@ -514,7 +513,6 @@
   color: #f4eef8;
   white-space: nowrap;
   overflow-x: auto;
-  scrollbar-width: thin;
 }
 
 .sf-ui-preview {
@@ -528,7 +526,131 @@
   line-height: 1.5;
   white-space: nowrap;
   overflow-x: auto;
-  scrollbar-width: thin;
+}
+
+.sf-scheme-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--divider);
+}
+
+.sf-scheme-block-head {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.sf-scheme-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+@container sfpage (max-width: 500px) {
+  .sf-scheme-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+.sf-scheme-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  padding: 10px 11px;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+
+.sf-scheme-card:hover {
+  border-color: color-mix(in srgb, var(--line-pink) 70%, transparent);
+  background: var(--surface);
+}
+
+.sf-scheme-card.active {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--accent-soft) 52%, var(--surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--line-pink) 65%, transparent);
+}
+
+.sf-scheme-card-top {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.sf-scheme-card-title {
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.sf-scheme-card-tag {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  color: var(--muted);
+  font-size: calc(10px * var(--ts, 1));
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.sf-scheme-card.active .sf-scheme-card-tag {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.sf-scheme-card-note {
+  font-size: calc(11px * var(--ts, 1));
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.sf-sidebar-scheme-preview {
+  border-radius: 12px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sf-scheme-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 650;
+  color: var(--muted);
+}
+
+.sf-scheme-preview-tag {
+  color: var(--accent-text);
+}
+
+.sf-scheme-preview-rail {
+  width: min(100%, 288px);
+  border-radius: 10px;
+  border: 1px solid var(--v3-border);
+  background: var(--v3-bg);
+  padding: 6px 8px 8px;
+  box-shadow: var(--shadow-sm);
+}
+
+.sf-scheme-preview-rail .v3-row.v3-agent {
+  cursor: default;
 }
 
 /* A narrow page (the frame at its 640 px minimum): controls drop under their text.

@@ -1,5 +1,5 @@
 import type { Agent, Device, SpaceInfo } from "@herdr-pocket/protocol";
-import { agentSpace, agentTitle, type SidebarAgentGrouping } from "../lib/store";
+import { agentSpace, agentTitle, type SidebarAgentGrouping, type SidebarStyleScheme } from "../lib/store";
 import { GROUP_RANK, LIST_GROUPS, lastChange, listGroup, type ListGroup } from "./agentInfo";
 import {
   focusedLeafOfTab,
@@ -84,10 +84,22 @@ export interface TopologyBadge {
 
 export type AgentRowJoinRole = "single" | "split-first" | "split-mid" | "split-last";
 
+export interface CompactDeviceBadge {
+  deviceId: string;
+  label: string;
+  fullLabel: string;
+  isLocal: boolean;
+}
+
+export interface SidebarAgentDeviceHeader extends CompactDeviceBadge {
+  count: number;
+}
+
 export interface SidebarAgentItem {
   agent: Agent;
   placement: AgentTopologyPlacement;
   joinRole: AgentRowJoinRole;
+  deviceHeader?: SidebarAgentDeviceHeader;
 }
 
 export interface SidebarAgentSection {
@@ -405,23 +417,46 @@ export function getAgentPlacement(
   );
 }
 
+/** Formats concise human-readable computer chips (`本机` or short remote host name). */
+export function formatCompactDeviceBadge(
+  deviceId: string,
+  devices: Record<string, Device>,
+  localHostId?: string | null,
+): CompactDeviceBadge {
+  const rawName = devices[deviceId]?.name?.trim() || deviceId;
+  if (localHostId && deviceId === localHostId) {
+    return {
+      deviceId,
+      label: "本机",
+      fullLabel: devices[deviceId]?.name?.trim() ? `本机 · ${rawName}` : "本机",
+      isLocal: true,
+    };
+  }
+  const short = rawName.replace(/^[A-Za-z0-9_.-]+\s*的\s*/, "").trim() || rawName;
+  return {
+    deviceId,
+    label: short,
+    fullLabel: rawName,
+    isLocal: false,
+  };
+}
+
 /** Formats concise user-facing page/split/background badges for an Agent row. */
 export function formatTopologyBadge(p: AgentTopologyPlacement): TopologyBadge {
   if (p.isBackground) {
     return { kind: "bg", label: "后台" };
   }
   if (p.isSplit) {
-    const label = p.pageNumber !== null ? `P${p.pageNumber} · ${p.paneCount}分屏` : `${p.paneCount}分屏`;
     return {
       kind: "split",
-      label,
+      label: `${p.paneCount}分屏`,
       slot: `${p.paneIndex}/${p.paneCount}`,
     };
   }
   if (p.pageNumber !== null) {
     return {
       kind: "page",
-      label: p.pageTotal > 1 ? `P${p.pageNumber}/${p.pageTotal}` : `P${p.pageNumber}`,
+      label: `第${p.pageNumber}页`,
     };
   }
   return { kind: "page", label: "独立页" };
@@ -451,9 +486,82 @@ function assignJoinRoles(
   });
 }
 
+function clusterRowsBySpaceAndSplit(
+  rows: ReadonlyArray<{ agent: Agent; placement: AgentTopologyPlacement }>,
+): Array<{ agent: Agent; placement: AgentTopologyPlacement }> {
+  interface Cluster {
+    key: string;
+    unassigned: number;
+    latest: number;
+    rows: Array<{ agent: Agent; placement: AgentTopologyPlacement }>;
+  }
+  const byCluster = new Map<string, Cluster>();
+  for (const row of rows) {
+    const key = `${row.agent.deviceId}\u0000${row.placement.spaceKey ?? UNASSIGNED_SPACE_KEY}`;
+    const existing = byCluster.get(key);
+    const ch = lastChange(row.agent);
+    if (existing) {
+      existing.latest = Math.max(existing.latest, ch);
+      existing.rows.push(row);
+    } else {
+      byCluster.set(key, {
+        key,
+        unassigned: row.placement.spaceKey ? 0 : 1,
+        latest: ch,
+        rows: [row],
+      });
+    }
+  }
+  const orderedClusters = [...byCluster.values()].sort(
+    (a, b) => a.unassigned - b.unassigned || b.latest - a.latest || a.key.localeCompare(b.key),
+  );
+  const out: Array<{ agent: Agent; placement: AgentTopologyPlacement }> = [];
+  for (const cl of orderedClusters) {
+    cl.rows.sort((x, y) => {
+      const px = x.placement;
+      const py = y.placement;
+      if (px.isBackground !== py.isBackground) return px.isBackground ? 1 : -1;
+      if (!px.isBackground && !py.isBackground) {
+        const pageDiff = (px.pageNumber ?? 9999) - (py.pageNumber ?? 9999);
+        if (pageDiff !== 0) return pageDiff;
+        if (px.tabId && py.tabId) {
+          if (px.tabId === py.tabId) return px.paneIndex - py.paneIndex;
+          return px.tabId.localeCompare(py.tabId);
+        }
+      }
+      return lastChange(y.agent) - lastChange(x.agent) || x.agent.key.localeCompare(y.agent.key);
+    });
+    out.push(...cl.rows);
+  }
+  return out;
+}
+
+function attachContiguousDeviceHeaders(
+  items: SidebarAgentItem[],
+  devices: Record<string, Device>,
+  localHostId?: string | null,
+): SidebarAgentItem[] {
+  let i = 0;
+  while (i < items.length) {
+    const devId = items[i]!.agent.deviceId;
+    let j = i + 1;
+    while (j < items.length && items[j]!.agent.deviceId === devId) j += 1;
+    items[i] = {
+      ...items[i]!,
+      deviceHeader: {
+        ...formatCompactDeviceBadge(devId, devices, localHostId),
+        count: j - i,
+      },
+    };
+    i = j;
+  }
+  return items;
+}
+
 /**
  * Builds sidebar Agent sections across all three view modes (`status`, `space`, `recent`),
- * preserving per-group stability on hover and computing visual split-rail connectors (`joinRole`).
+ * supporting Scheme A (co-split clusters), Scheme B (machine subheaders), and Scheme C (split glyphs)
+ * while preserving per-group stability during pointer hover.
  */
 export function buildSidebarAgentSections(opts: {
   agents: readonly Agent[];
@@ -462,21 +570,39 @@ export function buildSidebarAgentSections(opts: {
   spacesMap: Record<string, readonly SpaceInfo[]>;
   selectedSpace: string | null;
   grouping: SidebarAgentGrouping;
+  scheme?: SidebarStyleScheme;
+  localHostId?: string | null;
+  hoverFreeze?: boolean;
   previousOrder?: ReadonlyMap<string, string[]>;
 }): SidebarAgentSection[] {
-  const { agents, devices, topology, spacesMap, selectedSpace, grouping, previousOrder } = opts;
+  const {
+    agents,
+    devices,
+    topology,
+    spacesMap,
+    selectedSpace,
+    grouping,
+    scheme = "a",
+    localHostId = null,
+    hoverFreeze = false,
+    previousOrder,
+  } = opts;
 
   if (grouping === "recent") {
     const sorted = [...agents]
       .sort((x, y) => lastChange(y) - lastChange(x))
       .map((agent) => ({ agent, placement: getAgentPlacement(agent, topology, spacesMap) }));
+    const items = assignJoinRoles(sorted);
+    if (scheme === "b") {
+      attachContiguousDeviceHeaders(items, devices, localHostId);
+    }
     return [
       {
         id: "recent",
         kind: "recent",
         title: "最近",
         groupKey: "recent",
-        items: assignJoinRoles(sorted),
+        items,
       },
     ];
   }
@@ -579,11 +705,8 @@ export function buildSidebarAgentSections(opts: {
 
   return LIST_GROUPS.filter((g) => by.get(g.key)?.length).map((g) => {
     const list = [...by.get(g.key)!];
-    const prevOrder = previousOrder?.get(g.key);
-    let orderedAgents: Agent[];
-    if (!prevOrder?.length) {
-      orderedAgents = list.sort((x, y) => lastChange(y) - lastChange(x));
-    } else {
+    const prevOrder = hoverFreeze ? previousOrder?.get(g.key) : undefined;
+    if (prevOrder?.length) {
       const rank = new Map<string, number>();
       prevOrder.forEach((k, idx) => rank.set(k, idx));
       const newlyEntered: Agent[] = [];
@@ -594,18 +717,82 @@ export function buildSidebarAgentSections(opts: {
       }
       newlyEntered.sort((x, y) => lastChange(y) - lastChange(x));
       existing.sort((x, y) => rank.get(x.key)! - rank.get(y.key)!);
-      orderedAgents = [...newlyEntered, ...existing];
+      const orderedAgents = [...newlyEntered, ...existing];
+      const rows = orderedAgents.map((agent) => ({
+        agent,
+        placement: getAgentPlacement(agent, topology, spacesMap),
+      }));
+      const items = assignJoinRoles(rows);
+      if (scheme === "b") {
+        attachContiguousDeviceHeaders(items, devices, localHostId);
+      }
+      return {
+        id: g.key,
+        kind: "status",
+        title: g.title,
+        groupKey: g.key,
+        items,
+      };
     }
-    const rows = orderedAgents.map((agent) => ({
+
+    const rawRows = list.map((agent) => ({
       agent,
       placement: getAgentPlacement(agent, topology, spacesMap),
     }));
+
+    if (scheme === "b") {
+      const byDevice = new Map<string, { rows: Array<{ agent: Agent; placement: AgentTopologyPlacement }>; latest: number }>();
+      for (const r of rawRows) {
+        const dId = r.agent.deviceId;
+        const cur = byDevice.get(dId);
+        const ch = lastChange(r.agent);
+        if (cur) {
+          cur.latest = Math.max(cur.latest, ch);
+          cur.rows.push(r);
+        } else {
+          byDevice.set(dId, { rows: [r], latest: ch });
+        }
+      }
+      const orderedDevs = [...byDevice.entries()].sort(([aId, aInfo], [bId, bInfo]) => {
+        const aLoc = localHostId && aId === localHostId ? 1 : 0;
+        const bLoc = localHostId && bId === localHostId ? 1 : 0;
+        if (aLoc !== bLoc) return bLoc - aLoc;
+        const aOn = devices[aId]?.online ? 1 : 0;
+        const bOn = devices[bId]?.online ? 1 : 0;
+        if (aOn !== bOn) return bOn - aOn;
+        return bInfo.latest - aInfo.latest || aId.localeCompare(bId);
+      });
+      const items: SidebarAgentItem[] = [];
+      for (const [devId, info] of orderedDevs) {
+        const clustered = clusterRowsBySpaceAndSplit(info.rows);
+        const devItems = assignJoinRoles(clustered);
+        if (devItems.length > 0) {
+          devItems[0] = {
+            ...devItems[0]!,
+            deviceHeader: {
+              ...formatCompactDeviceBadge(devId, devices, localHostId),
+              count: devItems.length,
+            },
+          };
+          items.push(...devItems);
+        }
+      }
+      return {
+        id: g.key,
+        kind: "status",
+        title: g.title,
+        groupKey: g.key,
+        items,
+      };
+    }
+
+    const clustered = clusterRowsBySpaceAndSplit(rawRows);
     return {
       id: g.key,
       kind: "status",
       title: g.title,
       groupKey: g.key,
-      items: assignJoinRoles(rows),
+      items: assignJoinRoles(clustered),
     };
   });
 }

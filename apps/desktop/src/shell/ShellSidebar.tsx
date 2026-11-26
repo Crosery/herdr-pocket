@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, ChevronRight, Columns2, Laptop, PanelLeft, Pencil, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Terminal, Trash2 } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
@@ -19,6 +19,7 @@ import {
   spacedTitle,
   updateSettings,
   type SidebarAgentGrouping,
+  type SidebarStyleScheme,
 } from "../lib/store";
 import { setInteractiveResizeActive } from "./splitMotion";
 import { updateStore } from "../lib/updates";
@@ -30,11 +31,13 @@ import { formatSidebarAgentRow } from "./sidebarAgentRow";
 import {
   buildSidebarAgentSections,
   computeWorkspaceTopology,
+  formatCompactDeviceBadge,
   formatTopologyBadge,
   getAgentPlacement,
   type AgentRowJoinRole,
   type AgentTopologyPlacement,
-  type SpaceTopology,
+  type CompactDeviceBadge,
+  type SidebarAgentItem,
 } from "./sidebarTopology";
 import { SPACE_ICON_PRESETS, SpaceTileIcon, setCustomSpaceIcon, spaceIconStore } from "./spaceIcon";
 import {
@@ -81,6 +84,125 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
+/** Fixed compact device badge (`本机` / short remote host) for narrow sidebars and settings previews. */
+export function SidebarDeviceChip({
+  label,
+  fullLabel,
+  isLocal,
+}: {
+  label: string;
+  fullLabel?: string;
+  isLocal: boolean;
+}) {
+  return (
+    <span className={`v3-dev-chip ${isLocal ? "is-local" : "is-remote"}`} title={fullLabel || label}>
+      {isLocal ? <Laptop size={9.5} /> : <Server size={9.5} />}
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
+/** Minimal geometric window/split glyph replacing opaque text codes in Scheme C (no emoji). */
+export function SplitMatrixGlyph({ placement }: { placement: AgentTopologyPlacement }) {
+  if (placement.isBackground) {
+    return (
+      <span className="v3-win-glyph is-bg" title="后台未打开标签页（点击自动打开）">
+        <svg width="12" height="10" viewBox="0 0 12 10" aria-hidden="true">
+          <rect x="1" y="1" width="10" height="8" rx="1.8" fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="2 1.5" />
+        </svg>
+        <span>后台</span>
+      </span>
+    );
+  }
+  if (!placement.isSplit || placement.paneCount <= 1) {
+    const pageNum = placement.pageNumber;
+    return (
+      <span className="v3-win-glyph" title={pageNum !== null ? `位于第 ${pageNum} 个独立标签页` : "独立标签页"}>
+        <svg width="12" height="10" viewBox="0 0 12 10" aria-hidden="true">
+          <rect x="1" y="1" width="10" height="8" rx="1.8" fill="none" stroke="currentColor" strokeWidth="1.35" />
+        </svg>
+        {pageNum !== null ? <span>{pageNum}页</span> : null}
+      </span>
+    );
+  }
+  if (placement.paneCount === 2) {
+    const s1 = placement.paneIndex === 1;
+    const s2 = placement.paneIndex === 2;
+    return (
+      <span className="v3-win-glyph is-split" title={`同窗口 2 分屏（第 ${placement.paneIndex}/2 格）`}>
+        <svg width="14" height="10" viewBox="0 0 14 10" aria-hidden="true">
+          <rect
+            x="1"
+            y="1"
+            width="5.5"
+            height="8"
+            rx="1.1"
+            fill={s1 ? "currentColor" : "none"}
+            fillOpacity={s1 ? 0.88 : 0}
+            stroke="currentColor"
+            strokeWidth="1.1"
+          />
+          <rect
+            x="7.5"
+            y="1"
+            width="5.5"
+            height="8"
+            rx="1.1"
+            fill={s2 ? "currentColor" : "none"}
+            fillOpacity={s2 ? 0.88 : 0}
+            stroke="currentColor"
+            strokeWidth="1.1"
+          />
+        </svg>
+        <span>{placement.paneIndex}/2</span>
+      </span>
+    );
+  }
+  const leftOn = placement.paneIndex === 1;
+  const midOn = placement.paneIndex > 1 && placement.paneIndex < placement.paneCount;
+  const rightOn = placement.paneIndex >= placement.paneCount;
+  return (
+    <span className="v3-win-glyph is-split" title={`同窗口 ${placement.paneCount} 分屏（第 ${placement.paneIndex}/${placement.paneCount} 格）`}>
+      <svg width="15" height="10" viewBox="0 0 15 10" aria-hidden="true">
+        <rect
+          x="1"
+          y="1"
+          width="3.5"
+          height="8"
+          rx="0.9"
+          fill={leftOn ? "currentColor" : "none"}
+          fillOpacity={leftOn ? 0.88 : 0}
+          stroke="currentColor"
+          strokeWidth="1"
+        />
+        <rect
+          x="5.75"
+          y="1"
+          width="3.5"
+          height="8"
+          rx="0.9"
+          fill={midOn ? "currentColor" : "none"}
+          fillOpacity={midOn ? 0.88 : 0}
+          stroke="currentColor"
+          strokeWidth="1"
+        />
+        <rect
+          x="10.5"
+          y="1"
+          width="3.5"
+          height="8"
+          rx="0.9"
+          fill={rightOn ? "currentColor" : "none"}
+          fillOpacity={rightOn ? 0.88 : 0}
+          stroke="currentColor"
+          strokeWidth="1"
+        />
+      </svg>
+      <span>{placement.paneIndex}/{placement.paneCount}</span>
+    </span>
+  );
+}
+
 /** Status mark at the right of a row: spinner, 需要你 chip, done dot or idle ring. */
 export function StatusMark({ group, compact = false }: { group: ListGroup; compact?: boolean }) {
   if (group === "working") return <span className="v3-spinner" aria-label="运行中" />;
@@ -94,6 +216,7 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
   group,
   primary,
   secondary,
+  deviceChip,
   tooltipText,
   ageLabel,
   compactBlocked,
@@ -101,6 +224,8 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
   isFocusedAgent,
   isInSplit,
   showTopology,
+  styleScheme,
+  inCluster,
   placement,
   joinRole,
   splitPeerHover,
@@ -113,6 +238,7 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
   group: ListGroup;
   primary: string;
   secondary?: string | null;
+  deviceChip?: CompactDeviceBadge | null;
   tooltipText: string;
   ageLabel: string;
   compactBlocked: boolean;
@@ -120,6 +246,8 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
   isFocusedAgent: boolean;
   isInSplit: boolean;
   showTopology: boolean;
+  styleScheme: SidebarStyleScheme;
+  inCluster?: boolean;
   placement?: AgentTopologyPlacement;
   joinRole: AgentRowJoinRole;
   splitPeerHover: boolean;
@@ -128,8 +256,11 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
   onOpenAgent: (agent: Agent, mods: { altKey: boolean; shiftKey: boolean }) => void;
   onContextMenuAgent: (x: number, y: number, agent: Agent) => void;
 }) {
-  const badge = showTopology && placement ? formatTopologyBadge(placement) : null;
-  const hasSubLine = Boolean(secondary || badge);
+  const showGlyph = !inCluster && showTopology && styleScheme === "c" && Boolean(placement);
+  const badge = !inCluster && showTopology && styleScheme !== "c" && placement ? formatTopologyBadge(placement) : null;
+  const subLabel = inCluster && showTopology && placement?.isSplit ? `分屏格 ${placement.paneIndex}/${placement.paneCount}` : secondary;
+  const showDeviceChip = !inCluster && Boolean(deviceChip);
+  const hasSubLine = Boolean(subLabel || showDeviceChip || badge || showGlyph);
   const joinClass = showTopology && joinRole !== "single" ? ` ${joinRole}` : "";
   const splitPeerClass = showTopology && splitPeerHover ? " is-split-peer-hover" : "";
   return (
@@ -171,16 +302,21 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
           {hasSubLine ? (
             <div className="v3-agent-sub">
               <span className="v3-agent-sub-main">
-                {secondary ? (
+                {showDeviceChip && deviceChip ? (
+                  <SidebarDeviceChip label={deviceChip.label} fullLabel={deviceChip.fullLabel} isLocal={deviceChip.isLocal} />
+                ) : null}
+                {subLabel ? (
                   <>
                     {showTopology && spaceColorFg ? (
                       <span className="v3-space-dot" style={{ backgroundColor: spaceColorFg }} aria-hidden="true" />
                     ) : null}
-                    <span className="truncate">{secondary}</span>
+                    <span className="truncate">{subLabel}</span>
                   </>
                 ) : null}
               </span>
-              {badge ? (
+              {showGlyph && placement ? (
+                <SplitMatrixGlyph placement={placement} />
+              ) : badge ? (
                 <span
                   className={`v3-topo-badge is-${badge.kind}`}
                   title={
@@ -372,7 +508,8 @@ export const ShellSidebar = memo(function ShellSidebar({
   const link = liveStore.use((s) => s.link);
   const server = settingsStore.use((s) => s.server);
   const showShells = settingsStore.use((s) => s.showShells);
-  const localHostId = useLocalHostDeviceId();
+  const rawLocalHostId = useLocalHostDeviceId();
+  const localHostId = rawLocalHostId ?? (isMockServer(server) ? "dev-mac" : null);
   const tabs = shellStore.use((s) => s.tabs);
   const rawActive = shellStore.use((s) => s.active);
   const spaceSel = shellStore.use((s) => s.selectedSpace);
@@ -392,6 +529,7 @@ export const ShellSidebar = memo(function ShellSidebar({
 
   const [folded, setFolded] = useState<string[]>(() => readJson<string[]>(FOLD_KEY, []));
   const grouping = settingsStore.use((s) => s.sidebarAgentGrouping);
+  const styleScheme = settingsStore.use((s) => s.sidebarStyleScheme);
   const showTopology = settingsStore.use((s) => s.showSidebarTopology);
   const [expandedSpaceDrawers, setExpandedSpaceDrawers] = useState<string[]>([]);
   const [hoveredSplitTabId, setHoveredSplitTabId] = useState<string | null>(null);
@@ -630,7 +768,10 @@ export const ShellSidebar = memo(function ShellSidebar({
       spacesMap,
       selectedSpace: selected,
       grouping,
-      previousOrder: hoverFreeze ? frozenOrderRef.current : stableGroupOrderRef.current,
+      scheme: styleScheme,
+      localHostId,
+      hoverFreeze,
+      previousOrder: hoverFreeze ? frozenOrderRef.current : undefined,
     });
     if (!hoverFreeze && grouping === "status") {
       const nextMap = new Map<string, string[]>();
@@ -641,7 +782,7 @@ export const ShellSidebar = memo(function ShellSidebar({
       stableGroupOrderRef.current = nextMap;
     }
     return nextSections;
-  }, [devices, grouping, hoverFreeze, inScope, selected, spacesMap, workspaceTopology]);
+  }, [devices, grouping, hoverFreeze, inScope, localHostId, selected, spacesMap, styleScheme, workspaceTopology]);
 
   const agentMetaByKey = useMemo(() => {
     const out = new Map<
@@ -649,20 +790,19 @@ export const ShellSidebar = memo(function ShellSidebar({
       {
         group: ListGroup;
         primary: string;
-        secondary?: string | null;
-        machineOnlySecondary?: string | null;
+        spaceSecondary: string | null;
+        deviceBadge: CompactDeviceBadge;
         collapsedTip: string;
         expandedTip: string;
       }
     >();
-    const multiMachine = machines.length > 1;
     for (const a of inScope) {
       const g = listGroup(a, devices);
       const label = spacedTitle(a);
-      const showMachine = multiMachine && a.deviceId !== primaryMachineId;
-      const machineName = showMachine ? devices[a.deviceId]?.name?.trim() || null : null;
-      const { primary, secondary } = formatSidebarAgentRow(a, { showMachine, machineName: machineName ?? undefined });
+      const { primary, secondary: rowSpace } = formatSidebarAgentRow(a, { showMachine: false });
       const placement = getAgentPlacement(a, workspaceTopology, spacesMap);
+      const devBadge = formatCompactDeviceBadge(a.deviceId, devices, localHostId);
+      const spaceSecondary = rowSpace || placement.spaceName || null;
       const badge = showTopology ? formatTopologyBadge(placement) : null;
       const topoNote = badge
         ? placement.isBackground
@@ -671,17 +811,18 @@ export const ShellSidebar = memo(function ShellSidebar({
             ? ` · ${badge.label} (${badge.slot})`
             : ` · ${badge.label}`
         : "";
+      const fullWhere = [devBadge.fullLabel, spaceSecondary].filter(Boolean).join(" · ");
       out.set(a.key, {
         group: g,
         primary,
-        secondary,
-        machineOnlySecondary: machineName,
-        collapsedTip: `${machineName ? `${machineName} · ` : ""}${label}${topoNote}`,
-        expandedTip: `${secondary ? `${primary} — ${secondary}` : primary}${topoNote}`,
+        spaceSecondary,
+        deviceBadge: devBadge,
+        collapsedTip: `${devBadge.fullLabel} · ${label}${topoNote}`,
+        expandedTip: `${primary}${fullWhere ? ` — ${fullWhere}` : ""}${topoNote}`,
       });
     }
     return out;
-  }, [devices, inScope, machines.length, primaryMachineId, showTopology, spacesMap, workspaceTopology]);
+  }, [devices, inScope, localHostId, showTopology, spacesMap, workspaceTopology]);
 
   const focusedContent = activeTab ? focusedLeafOfTab(activeTab).content : null;
   const activeAgentKey = focusedContent?.kind === "agent" ? focusedContent.agentKey : null;
@@ -703,16 +844,26 @@ export const ShellSidebar = memo(function ShellSidebar({
     : null;
 
   const renderAgentRow = (
-    a: Agent,
-    placementFromSection?: AgentTopologyPlacement,
-    joinRole: AgentRowJoinRole = "single",
+    item: SidebarAgentItem,
+    opts?: { inCluster?: boolean; isSpaceGroup?: boolean; isUnassignedSpace?: boolean },
   ) => {
+    const a = item.agent;
+    const placement = item.placement;
+    const joinRole = item.joinRole;
     const meta = agentMetaByKey.get(a.key);
     const g = meta?.group ?? listGroup(a, devices);
     const primary = meta?.primary ?? spacedTitle(a);
-    const placement = placementFromSection ?? getAgentPlacement(a, workspaceTopology, spacesMap);
-    const secondary = grouping === "space" ? meta?.machineOnlySecondary : meta?.secondary;
-    const spaceColorFg = grouping === "space" ? null : spaceColorVars(placement.spaceColor)?.fg ?? null;
+    const secondary = opts?.isSpaceGroup && !opts?.isUnassignedSpace ? null : (meta?.spaceSecondary ?? null);
+    const spaceColorFg = opts?.isSpaceGroup ? null : spaceColorVars(placement.spaceColor)?.fg ?? null;
+    const devBadge = meta?.deviceBadge ?? formatCompactDeviceBadge(a.deviceId, devices, localHostId);
+    const showRowDeviceChip =
+      styleScheme === "b"
+        ? opts?.isSpaceGroup && opts?.isUnassignedSpace
+          ? devBadge
+          : null
+        : opts?.isSpaceGroup && !opts?.isUnassignedSpace
+          ? null
+          : devBadge;
     const isFocusedAgent = a.key === activeAgentKey;
     const isInSplit = !isFocusedAgent && activeSplitAgentKeys.has(a.key);
     const splitPeerHover = Boolean(hoveredSplitTabId && placement.isSplit && placement.tabId === hoveredSplitTabId);
@@ -724,6 +875,7 @@ export const ShellSidebar = memo(function ShellSidebar({
         group={g}
         primary={primary}
         secondary={secondary}
+        deviceChip={showRowDeviceChip}
         tooltipText={tooltipText}
         ageLabel={shortAgo(lastChange(a), now)}
         compactBlocked={grouping === "status" && g === "blocked"}
@@ -731,6 +883,8 @@ export const ShellSidebar = memo(function ShellSidebar({
         isFocusedAgent={isFocusedAgent}
         isInSplit={isInSplit}
         showTopology={showTopology}
+        styleScheme={styleScheme}
+        inCluster={opts?.inCluster}
         placement={placement}
         joinRole={joinRole}
         splitPeerHover={splitPeerHover}
@@ -740,6 +894,82 @@ export const ShellSidebar = memo(function ShellSidebar({
         onContextMenuAgent={handleAgentContextMenu}
       />
     );
+  };
+
+  const renderSectionItems = (items: SidebarAgentItem[], isSpaceGroup: boolean, isUnassignedSpace: boolean) => {
+    const nodes: ReactNode[] = [];
+    let i = 0;
+    while (i < items.length) {
+      const cur = items[i]!;
+      if (!collapsed && styleScheme === "b" && cur.deviceHeader) {
+        const hdr = cur.deviceHeader;
+        nodes.push(
+          <div key={`devhdr-${hdr.deviceId}-${cur.agent.key}`} className="v3-dev-subhdr">
+            <SidebarDeviceChip
+              label={`${hdr.isLocal ? hdr.fullLabel : hdr.label} · ${hdr.count}`}
+              fullLabel={hdr.fullLabel}
+              isLocal={hdr.isLocal}
+            />
+            <span className="v3-dev-subhdr-line" />
+          </div>,
+        );
+      }
+      const canCluster =
+        !collapsed &&
+        showTopology &&
+        (styleScheme === "a" || styleScheme === "b") &&
+        cur.joinRole === "split-first" &&
+        Boolean(cur.placement.tabId);
+      if (canCluster) {
+        const tabId = cur.placement.tabId!;
+        const clusterItems: SidebarAgentItem[] = [cur];
+        let j = i + 1;
+        while (
+          j < items.length &&
+          items[j]!.placement.isSplit &&
+          items[j]!.placement.tabId === tabId &&
+          !items[j]!.deviceHeader
+        ) {
+          clusterItems.push(items[j]!);
+          j += 1;
+        }
+        if (clusterItems.length >= 2) {
+          const first = clusterItems[0]!;
+          const clusterMeta = agentMetaByKey.get(first.agent.key);
+          const clusterSpace = clusterMeta?.spaceSecondary || first.placement.spaceName || "同一窗口";
+          const clusterColorFg = spaceColorVars(first.placement.spaceColor)?.fg ?? null;
+          const clusterDev = clusterMeta?.deviceBadge ?? formatCompactDeviceBadge(first.agent.deviceId, devices, localHostId);
+          const isClusterPeerHover = hoveredSplitTabId === tabId;
+          nodes.push(
+            <div
+              key={`cluster-${tabId}-${first.agent.key}`}
+              className={`v3-split-cluster${isClusterPeerHover ? " is-peer-hover" : ""}`}
+              onMouseEnter={() => setHoveredSplitTabId(tabId)}
+              onMouseLeave={() => hoveredSplitTabId === tabId && setHoveredSplitTabId(null)}
+            >
+              <div className="v3-split-cluster-hd">
+                {styleScheme === "a" && !isSpaceGroup ? (
+                  <SidebarDeviceChip label={clusterDev.label} fullLabel={clusterDev.fullLabel} isLocal={clusterDev.isLocal} />
+                ) : null}
+                {clusterColorFg && !isSpaceGroup ? (
+                  <span className="v3-space-dot" style={{ backgroundColor: clusterColorFg }} aria-hidden="true" />
+                ) : null}
+                <span className="truncate">
+                  {isSpaceGroup ? `第${first.placement.pageNumber ?? 1}页` : clusterSpace}
+                </span>
+                <span className="v3-split-cluster-badge">同窗 {first.placement.paneCount}分屏</span>
+              </div>
+              {clusterItems.map((ci) => renderAgentRow(ci, { inCluster: true, isSpaceGroup, isUnassignedSpace }))}
+            </div>,
+          );
+          i = j;
+          continue;
+        }
+      }
+      nodes.push(renderAgentRow(cur, { inCluster: false, isSpaceGroup, isUnassignedSpace }));
+      i += 1;
+    }
+    return nodes;
   };
 
   return (
@@ -932,7 +1162,7 @@ export const ShellSidebar = memo(function ShellSidebar({
                                         title={`跳转到第 ${page.pageNumber} 页：${page.tabName}`}
                                         onClick={() => handleJumpToPage(page.tabId)}
                                       >
-                                        <span className="v3-page-num">P{page.pageNumber}</span>
+                                        <span className="v3-page-num">第{page.pageNumber}页</span>
                                         {page.isSplit ? (
                                           <span className="v3-page-split-tag">
                                             <Columns2 size={10} />
@@ -1072,7 +1302,13 @@ export const ShellSidebar = memo(function ShellSidebar({
             {sections.map((g) => {
               const id = `g:${g.groupKey}`;
               const isFolded = folded.includes(id) && g.groupKey !== "recent";
-              const spColor = g.kind === "space" ? spaceColorVars(g.spaceColor)?.fg : undefined;
+              const isSpaceGroup = g.kind === "space";
+              const isUnassignedSpace = g.groupKey === "space:__unassigned__";
+              const spColor = isSpaceGroup ? spaceColorVars(g.spaceColor)?.fg : undefined;
+              const spaceDevBadge =
+                isSpaceGroup && !isUnassignedSpace && g.items[0]
+                  ? formatCompactDeviceBadge(g.items[0].agent.deviceId, devices, localHostId)
+                  : null;
               return (
                 <div key={g.id}>
                   {collapsed ? (
@@ -1084,7 +1320,7 @@ export const ShellSidebar = memo(function ShellSidebar({
                       aria-expanded={!isFolded}
                       onClick={() => g.groupKey !== "recent" && toggleFold(id)}
                     >
-                      {g.kind === "space" ? (
+                      {isSpaceGroup ? (
                         <span
                           className="v3-space-dot lg"
                           style={spColor ? { backgroundColor: spColor } : undefined}
@@ -1092,7 +1328,10 @@ export const ShellSidebar = memo(function ShellSidebar({
                         />
                       ) : null}
                       <span className="truncate">{g.title}</span>
-                      {g.kind === "space" && showTopology && (g.pageCount ?? 0) > 0 ? (
+                      {spaceDevBadge ? (
+                        <SidebarDeviceChip label={spaceDevBadge.label} fullLabel={spaceDevBadge.fullLabel} isLocal={spaceDevBadge.isLocal} />
+                      ) : null}
+                      {isSpaceGroup && showTopology && (g.pageCount ?? 0) > 0 ? (
                         <span className="v3-group-meta">
                           {g.pageCount}页{(g.splitPageCount ?? 0) > 0 ? " · 含分屏" : ""}
                         </span>
@@ -1109,7 +1348,7 @@ export const ShellSidebar = memo(function ShellSidebar({
                   )}
                   {isFolded && !collapsed
                     ? null
-                    : g.items.map((item) => renderAgentRow(item.agent, item.placement, item.joinRole))}
+                    : renderSectionItems(g.items, isSpaceGroup, isUnassignedSpace)}
                 </div>
               );
             })}

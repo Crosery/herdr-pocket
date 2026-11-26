@@ -106,8 +106,6 @@
 .tp-term-host .xterm-viewport {
   background-color: var(--tp-term-bg, #17191d);
   overflow-x: hidden;
-  scrollbar-width: thin;
-  scrollbar-color: var(--tp-term-scroll, rgba(255, 255, 255, 0.18)) transparent;
 }
 
 .tp-term-host .xterm-viewport::-webkit-scrollbar {

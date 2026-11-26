@@ -5,6 +5,7 @@ import type { ShellTab } from "../src/shell/shellStore.ts";
 import {
   buildSidebarAgentSections,
   computeWorkspaceTopology,
+  formatCompactDeviceBadge,
   formatTopologyBadge,
 } from "../src/shell/sidebarTopology.ts";
 
@@ -141,19 +142,19 @@ test("computeWorkspaceTopology indexes multi-page Space, 3-way split panes, sing
   const p5 = topo.byAgent.get("mac1/a5")!;
   const p6 = topo.byAgent.get("mac1/a6")!;
 
-  assert.deepEqual(formatTopologyBadge(p1), { kind: "split", label: "P1 · 3分屏", slot: "1/3" });
-  assert.deepEqual(formatTopologyBadge(p2), { kind: "split", label: "P1 · 3分屏", slot: "2/3" });
+  assert.deepEqual(formatTopologyBadge(p1), { kind: "split", label: "3分屏", slot: "1/3" });
+  assert.deepEqual(formatTopologyBadge(p2), { kind: "split", label: "3分屏", slot: "2/3" });
   assert.equal(p2.isFocusedPane, true);
   assert.deepEqual(p2.siblingAgentKeys, ["mac1/a1", "mac1/a3"]);
-  assert.deepEqual(formatTopologyBadge(p3), { kind: "split", label: "P1 · 3分屏", slot: "3/3" });
-  assert.deepEqual(formatTopologyBadge(p4), { kind: "page", label: "P2/3" });
-  assert.deepEqual(formatTopologyBadge(p5), { kind: "split", label: "P3 · 2分屏", slot: "2/2" });
+  assert.deepEqual(formatTopologyBadge(p3), { kind: "split", label: "3分屏", slot: "3/3" });
+  assert.deepEqual(formatTopologyBadge(p4), { kind: "page", label: "第2页" });
+  assert.deepEqual(formatTopologyBadge(p5), { kind: "split", label: "2分屏", slot: "2/2" });
   assert.deepEqual(formatTopologyBadge(p6), { kind: "bg", label: "后台" });
   assert.equal(p6.spaceKey, "mac1\u0000ibuki-next");
 
   const pocket = topo.bySpace.get("mac1\u0000herdr-pocket")!;
   assert.equal(pocket.pageCount, 1);
-  assert.deepEqual(formatTopologyBadge(topo.byAgent.get("mac1/a7")!), { kind: "page", label: "P1" });
+  assert.deepEqual(formatTopologyBadge(topo.byAgent.get("mac1/a7")!), { kind: "page", label: "第1页" });
 
   // Verify space grouping puts co-split siblings adjacent and assigns split-first / split-mid / split-last rails.
   const spaceSections = buildSidebarAgentSections({
@@ -179,5 +180,140 @@ test("computeWorkspaceTopology indexes multi-page Space, 3-way split panes, sing
       ["a5", "single"],
       ["a6", "single"],
     ],
+  );
+});
+
+test("formatCompactDeviceBadge and Sidebar Schemes A/B/C group same-space splits and expose devices in status mode", () => {
+  const multiDevices: Record<string, Device> = {
+    mac1: { id: "mac1", name: "Crosery 的 MacBook", kind: "host", online: true, lastSeen: 1_700_000_000_000 },
+    mac2: { id: "mac2", name: "家里的 Mac", kind: "host", online: true, lastSeen: 1_700_000_000_000 },
+  };
+  const multiSpaces: Record<string, SpaceInfo[]> = {
+    mac1: [
+      { id: "sp-1", name: "伊吹工坊", folder: "~/work/ibuki", color: "ansi4", tabs: 1 },
+      { id: "sp-2", name: "弹唱", folder: "~/work/strum", color: "ansi5", tabs: 1 },
+    ],
+    mac2: [{ id: "sp-r", name: "测试", folder: "~/work/test", color: "ansi6", tabs: 1 }],
+  };
+
+  assert.deepEqual(formatCompactDeviceBadge("mac1", multiDevices, "mac1"), {
+    deviceId: "mac1",
+    label: "本机",
+    fullLabel: "本机 · Crosery 的 MacBook",
+    isLocal: true,
+  });
+  assert.deepEqual(formatCompactDeviceBadge("mac2", multiDevices, "mac1"), {
+    deviceId: "mac2",
+    label: "家里的 Mac",
+    fullLabel: "家里的 Mac",
+    isLocal: false,
+  });
+
+  // Intentionally interleave statusSince so same-tab split panes (a1 + a3) are not contiguous by pure timestamp.
+  const multiAgents: Agent[] = [
+    makeAgent("a1", { deviceId: "mac1", where: "伊吹工坊 / p1", status: "working", statusSince: 1_700_000_090_000 }),
+    {
+      ...makeAgent("r1", { status: "working", statusSince: 1_700_000_080_000 }),
+      key: "mac2/r1",
+      deviceId: "mac2",
+      where: "测试 / p1",
+    },
+    makeAgent("a3", { deviceId: "mac1", where: "伊吹工坊 / p2", status: "working", statusSince: 1_700_000_070_000 }),
+    makeAgent("a2", { deviceId: "mac1", where: "弹唱 / p1", status: "working", statusSince: 1_700_000_085_000 }),
+  ];
+  const byKey = new Map(multiAgents.map((a) => [a.key, a] as const));
+  const tabs: ShellTab[] = [
+    {
+      id: "tab-ibuki-split",
+      kind: "agent",
+      agentKey: "mac1/a1",
+      docHostId: "mac1",
+      docSpaceId: "sp-1",
+      docSpaceName: "伊吹工坊",
+      split: {
+        focusedPaneId: "p1",
+        zoomedPaneId: null,
+        root: {
+          id: "root",
+          type: "row",
+          children: [
+            { id: "p1", type: "leaf", weight: 1, content: { kind: "agent", agentKey: "mac1/a1" } },
+            { id: "p2", type: "leaf", weight: 1, content: { kind: "agent", agentKey: "mac1/a3" } },
+          ],
+        },
+      },
+    },
+    {
+      id: "tab-tan",
+      kind: "agent",
+      agentKey: "mac1/a2",
+      docHostId: "mac1",
+      docSpaceId: "sp-2",
+      docSpaceName: "弹唱",
+    },
+    {
+      id: "tab-remote",
+      kind: "agent",
+      agentKey: "mac2/r1",
+      docHostId: "mac2",
+      docSpaceId: "sp-r",
+      docSpaceName: "测试",
+    },
+  ];
+  const topo = computeWorkspaceTopology(tabs, "tab-ibuki-split", (k) => byKey.get(k), multiSpaces, multiAgents);
+
+  // Scheme A: co-split panes (a1, a3) are clustered adjacently with split-first / split-last in status mode.
+  const schemeASections = buildSidebarAgentSections({
+    agents: multiAgents,
+    devices: multiDevices,
+    topology: topo,
+    spacesMap: multiSpaces,
+    selectedSpace: null,
+    grouping: "status",
+    scheme: "a",
+    localHostId: "mac1",
+  });
+  assert.deepEqual(
+    schemeASections[0]!.items.map((it) => [it.agent.key, it.joinRole]),
+    [
+      ["mac1/a1", "split-first"],
+      ["mac1/a3", "split-last"],
+      ["mac1/a2", "single"],
+      ["mac2/r1", "single"],
+    ],
+  );
+
+  // Scheme B: partitions items inside each status group by computer with deviceHeader subheaders.
+  const schemeBSections = buildSidebarAgentSections({
+    agents: multiAgents,
+    devices: multiDevices,
+    topology: topo,
+    spacesMap: multiSpaces,
+    selectedSpace: null,
+    grouping: "status",
+    scheme: "b",
+    localHostId: "mac1",
+  });
+  assert.equal(schemeBSections[0]!.items[0]!.deviceHeader?.isLocal, true);
+  assert.equal(schemeBSections[0]!.items[0]!.deviceHeader?.count, 3);
+  assert.equal(schemeBSections[0]!.items[3]!.deviceHeader?.deviceId, "mac2");
+  assert.equal(schemeBSections[0]!.items[3]!.deviceHeader?.count, 1);
+
+  // Hover freeze preserves exact prior order until hover ends.
+  const frozen = buildSidebarAgentSections({
+    agents: multiAgents,
+    devices: multiDevices,
+    topology: topo,
+    spacesMap: multiSpaces,
+    selectedSpace: null,
+    grouping: "status",
+    scheme: "a",
+    localHostId: "mac1",
+    hoverFreeze: true,
+    previousOrder: new Map([["working", ["mac2/r1", "mac1/a2", "mac1/a1", "mac1/a3"]]]),
+  });
+  assert.deepEqual(
+    frozen[0]!.items.map((it) => it.agent.key),
+    ["mac2/r1", "mac1/a2", "mac1/a1", "mac1/a3"],
   );
 });

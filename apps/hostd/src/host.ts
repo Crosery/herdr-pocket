@@ -190,7 +190,7 @@ export class Host {
   private lastPublished = "";
   private log: (msg: string) => void;
   private opts: HostOptions;
-  private publish = debounce(() => this.publishNow(), 300);
+  private publish = debounce(() => this.publishNow(), 100);
   /** Space and tab names from the desktop app; the last good copy is kept while its window is closed. */
   private names: AppNames | undefined;
   private namesSig = "";

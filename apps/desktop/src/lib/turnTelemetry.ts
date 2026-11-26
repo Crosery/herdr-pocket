@@ -136,10 +136,14 @@ export function computeTurnTelemetry(
 ): TurnTelemetryMetrics {
   const session = report?.session ?? null;
   const contextLimit = Math.max(0, session?.contextLimit ?? agent?.contextLimit ?? 0);
-  const contextTokens = Math.max(0, session?.contextTokens ?? agent?.contextTokens ?? 0);
+  const sessionTokens = Math.max(0, session?.contextTokens ?? 0);
+  const liveAgentTokens = Math.max(0, agent?.contextTokens ?? 0);
+  const contextTokens = Math.max(sessionTokens, liveAgentTokens);
 
   let rawPct: number | null = null;
-  if (typeof session?.contextPct === "number" && Number.isFinite(session.contextPct)) {
+  if (contextLimit > 0 && contextTokens > 0 && liveAgentTokens > sessionTokens) {
+    rawPct = clampPct((contextTokens / contextLimit) * 100);
+  } else if (typeof session?.contextPct === "number" && Number.isFinite(session.contextPct)) {
     rawPct = clampPct(session.contextPct);
   } else if (contextLimit > 0 && contextTokens > 0) {
     rawPct = clampPct((contextTokens / contextLimit) * 100);

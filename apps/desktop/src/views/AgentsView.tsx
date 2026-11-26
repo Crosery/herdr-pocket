@@ -460,6 +460,8 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
   }, [activeMode, agent.deviceId, agent.source, localHostId, termVisited, visible]);
 
   const [events, setEvents] = useState<ConvEvent[]>([]);
+  const eventsLenRef = useRef(0);
+  eventsLenRef.current = events.length;
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [loadOlderError, setLoadOlderError] = useState(false);
@@ -580,22 +582,39 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
   const [unreadCount, setUnreadCount] = useState(0);
   const lastTrackedRowIdRef = useRef<string | null>(null);
   const [chatDomHibernated, setChatDomHibernated] = useState(false);
+  const [streamHibernated, setStreamHibernated] = useState(false);
 
   useLayoutEffect(() => {
     if (visible) {
       setChatDomHibernated(false);
+      setStreamHibernated(false);
     }
   }, [visible]);
 
   useEffect(() => {
+    if (agent.status === "working") {
+      setStreamHibernated(false);
+    }
+  }, [agent.status]);
+
+  useEffect(() => {
     if (visible) return;
-    const timer = window.setTimeout(() => {
+    const domTimer = window.setTimeout(() => {
       if (visibleRef.current) return;
       setChatDomHibernated(true);
       setEvents((prev) => (prev.length > 160 && stickRef.current ? prev.slice(-120) : prev));
     }, 2500);
-    return () => window.clearTimeout(timer);
-  }, [visible]);
+    const streamTimer =
+      agent.status !== "working"
+        ? window.setTimeout(() => {
+            if (!visibleRef.current) setStreamHibernated(true);
+          }, 45_000)
+        : undefined;
+    return () => {
+      window.clearTimeout(domTimer);
+      if (streamTimer !== undefined) window.clearTimeout(streamTimer);
+    };
+  }, [agent.status, visible]);
 
   const [winFocused, setWinFocused] = useState(
     () => typeof document === "undefined" || (document.visibilityState === "visible" && document.hasFocus()),
@@ -635,8 +654,10 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     return () => window.clearInterval(timer);
   }, [activeMode, agent.status, outgoing.length, sending, visible]);
 
+  const sessionStreamPaused = !chatVisited || streamHibernated;
+
   useEffect(() => {
-    if (!chatVisited || (chatDomHibernated && !visible)) return;
+    if (sessionStreamPaused) return;
     let alive = true;
     const prev = sessionTrackRef.current;
     const sessionSwitched = prev.agentKey !== agent.key || (Boolean(prev.sessionKey) && Boolean(agent.sessionKey) && prev.sessionKey !== agent.sessionKey);
@@ -670,6 +691,9 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     const merger = createBufferedEventMerger((batch) => {
       if (alive) setEvents((prevList) => mergeConvEvents(prevList, batch));
     });
+    if (!sessionSwitched && eventsLenRef.current > 0) {
+      merger.onInitialReady();
+    }
 
     void rpcCall(agent.deviceId, "session.events", { agent: agent.key, limit: 200 })
       .then((res) => {
@@ -734,7 +758,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
       window.clearInterval(pollTimer);
       unsubSession();
     };
-  }, [agent.deviceId, agent.key, agent.sessionKey, chatDomHibernated, chatVisited, visible]);
+  }, [agent.deviceId, agent.key, agent.sessionKey, sessionStreamPaused]);
 
   const lastSeenMarkRef = useRef<string | null>(null);
   const wasVisibleForSeenRef = useRef(false);
@@ -998,6 +1022,28 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     () => computeTurnTelemetry(displayedEvents, usageReport, agent),
     [agent, displayedEvents, usageReport],
   );
+  const usageRefreshMetaRef = useRef<{ key: string; at: number; prevStatus?: string }>({ key: agent.key, at: 0 });
+  useEffect(() => {
+    if (!chatVisited || !visible || agent.isShell || !agent.sessionKey) return;
+    const prev = usageRefreshMetaRef.current;
+    const statusLeftWorking = prev.key === agent.key && prev.prevStatus === "working" && agent.status !== "working";
+    const elapsed = Date.now() - (prev.key === agent.key ? prev.at : 0);
+    const delay = statusLeftWorking || prev.key !== agent.key ? 150 : elapsed >= 2500 ? 500 : 2500 - elapsed;
+    let alive = true;
+    const timer = window.setTimeout(() => {
+      usageRefreshMetaRef.current = { key: agent.key, at: Date.now(), prevStatus: agent.status };
+      void rpcCall(agent.deviceId, "agent.usage", { agent: agent.key })
+        .then((res) => {
+          if (alive) setUsageReport(res);
+        })
+        .catch(() => {});
+    }, delay);
+    usageRefreshMetaRef.current.prevStatus = agent.status;
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [agent.contextTokens, agent.deviceId, agent.isShell, agent.key, agent.sessionKey, agent.status, agent.updatedAt, chatVisited, displayedEvents.length, visible]);
   const convReconciled = useMemo(
     () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick),
     [agent.status, foldedRows, nowTick, outgoing],
@@ -2300,6 +2346,9 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
                     const outImgs = !imgAtts.length
                       ? extractImageTargets([...(seg.send.uploadedPaths ?? []), seg.send.text])
                       : [];
+                    const syncedPastSend =
+                      seg.send.state === "sent" &&
+                      displayedEvents.some((ev) => ev.kind !== "system" && ev.ts >= seg.send.ts - 1000);
                     return (
                       <div key={seg.send.id} className="bubble-row user">
                         {seg.send.text ? <div className="bubble user">{seg.send.text}</div> : null}
@@ -2340,14 +2389,15 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
                         ) : null}
                         <div className={`bubble-send-meta${seg.send.state === "failed" ? " error" : ""}`}>
                           <span>
-                            {clockStr(seg.send.ts)} ·{" "}
                             {seg.send.state === "sending"
-                              ? seg.send.progressText || "发送中…"
+                              ? `${clockStr(seg.send.ts)} · ${seg.send.progressText || "发送中…"}`
                               : seg.send.state === "failed"
-                                ? `发送失败${seg.send.error ? `：${clip(seg.send.error, 40)}` : ""}`
+                                ? `${clockStr(seg.send.ts)} · 发送失败${seg.send.error ? `：${clip(seg.send.error, 40)}` : ""}`
                                 : seg.send.state === "queued_terminal"
-                                  ? "终端排队中 · 本轮结束后自动处理"
-                                  : "等待会话同步…"}
+                                  ? `${clockStr(seg.send.ts)} · 终端排队中 · 本轮结束后自动处理`
+                                  : syncedPastSend
+                                    ? clockStr(seg.send.ts)
+                                    : `${clockStr(seg.send.ts)} · 等待会话同步…`}
                           </span>
                           {seg.send.state === "failed" ? (
                             <>
@@ -2468,7 +2518,6 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
             error={usageError}
             onRefresh={openUsageView}
             onClose={() => setUsageOpen(false)}
-            onOpenModelSwitch={() => setModelMenuMode("model")}
             onRunInTerminal={() => {
               setUsageOpen(false);
               if (agent.status === "working") enqueuePrompt(agent, "/usage", []);
@@ -2871,7 +2920,7 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
                     aria-expanded={usageOpen}
                     title={
                       hasRing
-                        ? `上下文占用 ${fmtPctClean(ringPct)} · 点击查看实体试管与额度详情`
+                        ? `上下文占用 ${fmtPctClean(ringPct)} · 点击查看上下文窗口与额度详情`
                         : "查看上下文窗口与模型额度"
                     }
                     onClick={() => {
