@@ -1070,6 +1070,21 @@ export interface RemoteWindowInfo {
   scaleFactor?: number;
 }
 
+export type EgoSpacePhase = "running" | "handoff" | "user" | "finished" | "idle";
+
+export interface PortalEgoSpaceState {
+  spaceId?: number;
+  spaceName: string;
+  ownership?: string;
+  phase: EgoSpacePhase;
+  pageLabel?: string;
+  activeTabTitle?: string;
+  tabCount?: number;
+  lastAction?: string;
+  serverName?: string;
+  profileName?: string;
+}
+
 export interface PortalItem {
   id: string;
   hostId: string;
@@ -1083,6 +1098,7 @@ export interface PortalItem {
   highlightName?: string;
   url?: string;
   windowId?: string;
+  egoSpace?: PortalEgoSpaceState;
   mime?: string;
   size?: number;
   width?: number;

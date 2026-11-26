@@ -9,6 +9,7 @@ import {
   Clipboard,
   ClipboardPaste,
   Columns2,
+  Compass,
   Copy,
   ExternalLink,
   Eye,
@@ -360,7 +361,7 @@ export function PortalViewerModal({
   useEffect(() => {
     if (!open || !itemHostId || !itemId || !itemCanInteract) return;
     return subscribePortalFrames(itemHostId, itemId, streamCfgRef.current);
-  }, [itemCanInteract, itemHostId, itemId, open]);
+  }, [item?.windowId, itemCanInteract, itemHostId, itemId, open]);
 
   useEffect(() => {
     if (!open || (!needsMacScreenPerm && !needsMacAccessPerm)) return;
@@ -392,7 +393,7 @@ export function PortalViewerModal({
   const hostSessionItems = useMemo(
     () =>
       Object.values(itemsById)
-        .filter((i) => i.hostId === hostId && (!agent?.key || !i.agentKey || i.agentKey === agent.key))
+        .filter((i) => i.hostId === hostId && (!agent?.key || i.agentKey === agent.key))
         .sort((a, b) => b.updatedAt - a.updatedAt),
     [agent?.key, hostId, itemsById],
   );
@@ -580,6 +581,24 @@ export function PortalViewerModal({
         ? `静止省流 · 就绪 ${heartbeat?.fps ?? activePreset.fps}fps`
         : "等待首帧…";
 
+  const egoSubtitlePrefix = item?.egoSpace
+    ? [
+        item.egoSpace.phase === "handoff"
+          ? "等你接管"
+          : item.egoSpace.phase === "user"
+            ? "已移交"
+            : item.egoSpace.phase === "idle"
+              ? "空间就绪"
+              : "AI 操作中",
+        item.egoSpace.spaceId !== undefined ? `#${item.egoSpace.spaceId}` : undefined,
+        item.egoSpace.pageLabel,
+        item.egoSpace.activeTabTitle,
+        item.egoSpace.lastAction,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
+
   return (
     <PocketModal
       open={open}
@@ -593,7 +612,9 @@ export function PortalViewerModal({
       title={item ? item.title : "跨端窗口、浏览器与文件回传"}
       subtitle={
         item
-          ? `${transportLabel}${caps ? ` · ${sessionLabel}` : ""}${item.subtitle ? ` · ${item.subtitle}` : ""}`
+          ? item.egoSpace
+            ? `${egoSubtitlePrefix}${item.canInteract ? ` · ${transportLabel}` : " · 仅同步 EG 空间状态"}`
+            : `${transportLabel}${caps ? ` · ${sessionLabel}` : ""}${item.subtitle ? ` · ${item.subtitle}` : ""}`
           : `选择远程应用窗口、启动远程浏览器或定位远程文件（${sessionLabel}）`
       }
     >
@@ -607,7 +628,9 @@ export function PortalViewerModal({
                 className={`portal-tab-chip${item?.id === it.id ? " active" : ""}`}
                 onClick={() => onSelectPortalId(it.id)}
               >
-                {it.kind === "browser" ? (
+                {it.egoSpace ? (
+                  <Compass size={12} />
+                ) : it.kind === "browser" ? (
                   <Globe size={12} />
                 ) : it.kind === "window" ? (
                   <AppWindow size={12} />
@@ -1102,16 +1125,32 @@ export function PortalViewerModal({
               onMetricsChange={setMetrics}
               placeholder={
                 <div className="portal-stage-placeholder">
-                  <MousePointerClick size={28} />
+                  {item.egoSpace ? <Compass size={28} /> : <MousePointerClick size={28} />}
                   <div>
                     {item.streamError
                       ? "暂时无法获取远端画面"
-                      : waitingSlow
-                        ? "暂未收到画面帧"
-                        : "正在建立画面流…"}
+                      : item.egoSpace && !item.windowId
+                        ? `EG 空间「${item.egoSpace.spaceName}」状态同步中`
+                        : waitingSlow
+                          ? "暂未收到画面帧"
+                          : "正在建立画面流…"}
                   </div>
                   {item.streamError ? (
                     <div className="faint" style={{ maxWidth: 520, lineHeight: 1.5 }}>{item.streamError}</div>
+                  ) : item.egoSpace && !item.windowId ? (
+                    <div className="faint" style={{ maxWidth: 520, lineHeight: 1.5 }}>
+                      {[
+                        item.egoSpace.phase === "handoff"
+                          ? "等待你接管验证"
+                          : item.egoSpace.phase === "user"
+                            ? "已移交用户"
+                            : "AI 正在操作该 TaskSpace",
+                        item.egoSpace.activeTabTitle,
+                        item.egoSpace.lastAction,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </div>
                   ) : caps?.notes?.length ? (
                     <div className="faint" style={{ maxWidth: 520, lineHeight: 1.5 }}>{caps.notes.join("；")}</div>
                   ) : waitingSlow ? (

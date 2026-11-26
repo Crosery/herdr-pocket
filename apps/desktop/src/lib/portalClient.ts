@@ -131,10 +131,11 @@ export function filterVisiblePortalItems(opts: {
   isTauriApp?: boolean;
   localHostId?: string | null;
 }): PortalItem[] {
+  if (!opts.agent.key) return [];
   return Object.values(opts.itemsById)
     .filter((i) => {
       if (i.hostId !== opts.agent.deviceId) return false;
-      if (i.agentKey && i.agentKey !== opts.agent.key) return false;
+      if (i.agentKey !== opts.agent.key) return false;
       if (opts.dismissedIds[i.id]) return false;
       return true;
     })
@@ -507,16 +508,17 @@ export function ingestPortalStreamEvent(ev: unknown, hostId?: string): void {
       const existing = prev.itemsById[frame.portalId];
       let nextItem: PortalItem | undefined;
       if (existing) {
+        const isEgo = Boolean(existing.egoSpace);
         const hadError = Boolean(existing.streamError);
-        const urlChanged = Boolean(frame.url && frame.url !== existing.url);
-        const titleChanged = Boolean(frame.title && frame.title !== existing.title);
+        const urlChanged = Boolean(!isEgo && frame.url && frame.url !== existing.url);
+        const titleChanged = Boolean(!isEgo && frame.title && frame.title !== existing.title);
         const sizeChanged = existing.width !== frame.width || existing.height !== frame.height;
         if (hadError || urlChanged || titleChanged || sizeChanged) {
           const { streamError: _clearedError, ...restExisting } = existing;
           nextItem = {
             ...restExisting,
-            ...(frame.url ? { url: frame.url, subtitle: frame.url } : {}),
-            ...(frame.title ? { title: frame.title } : {}),
+            ...(urlChanged && frame.url ? { url: frame.url, subtitle: frame.url } : {}),
+            ...(titleChanged && frame.title ? { title: frame.title } : {}),
             width: frame.width,
             height: frame.height,
           };

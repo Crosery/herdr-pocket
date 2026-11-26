@@ -631,7 +631,7 @@ export function mockLink(): Link {
     const ev: PortalStreamEvent = { kind: "portal_event", action, item, at: now() };
     for (const w of portalWatchers) {
       if (w.hostId !== item.hostId) continue;
-      if (w.agentKey && item.agentKey && w.agentKey !== item.agentKey) continue;
+      if (w.agentKey && item.agentKey !== w.agentKey) continue;
       if (w.portalId && w.portalId !== item.id) continue;
       w.onEvent(ev);
     }
@@ -911,7 +911,7 @@ export function mockLink(): Link {
         case "portal.list": {
           const rp = (params ?? {}) as { agent?: string; includeWindows?: boolean };
           const items = demoPortals
-            .filter((it) => it.hostId === _to && (!rp.agent || !it.agentKey || it.agentKey === rp.agent))
+            .filter((it) => it.hostId === _to && (!rp.agent || it.agentKey === rp.agent))
             .sort((a, b) => b.updatedAt - a.updatedAt);
           const windows: RemoteWindowInfo[] | undefined = rp.includeWindows
             ? [{ id: "screen:0", appName: "Remote Display", title: "主屏幕", bounds: { x: 0, y: 0, width: 1440, height: 900 }, isScreen: true }]

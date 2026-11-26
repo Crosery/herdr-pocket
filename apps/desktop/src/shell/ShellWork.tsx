@@ -6,8 +6,6 @@ import { PocketButton, PocketErrorBoundary, PocketInput, PocketModal, PocketSele
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood, resolveVendor } from "../components/MascotAndVendor";
-import { PortalViewerModal } from "../components/PortalViewerModal";
-import { SessionPortalPiP } from "../components/SessionPortalPiP";
 import { serverLabel } from "../components/Sidebar";
 import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
 import { prettyHotkey } from "../components/VoiceInput";
@@ -1957,6 +1955,7 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
   isZoomed,
   focusedUnit,
   tabActive,
+  portalHost = true,
   draggingPaneId,
   slotElsRef,
   onDraggingPaneChange,
@@ -1970,6 +1969,7 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
   isZoomed: boolean;
   focusedUnit?: UnitRect | null;
   tabActive: boolean;
+  portalHost?: boolean;
   draggingPaneId: string | null;
   slotElsRef?: React.MutableRefObject<Map<string, HTMLDivElement>>;
   onDraggingPaneChange: (paneId: string | null) => void;
@@ -2216,6 +2216,7 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
                   key={agent.key}
                   agent={agent}
                   embedded
+                  portalHost={portalHost}
                   visible={visible && tabActive}
                   focused={isFocused && visible && tabActive}
                   mode={mode}
@@ -2319,6 +2320,7 @@ const TabStage = memo(function TabStage({
   onSplitNewTerminal: (tabId: string, paneId: string, direction: SplitDirection) => void;
 }) {
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const agentsMap = liveStore.use((s) => s.agents);
   const splitLayout = useMemo(
     () => computeSplitLayout(tabRootNode(tab), tab.split?.zoomedPaneId),
     [tab],
@@ -2327,6 +2329,24 @@ const TabStage = memo(function TabStage({
     () => stableSplitLeafKeys(splitLayout.leaves.map((x) => x.leaf)),
     [splitLayout.leaves],
   );
+  const portalHostPaneIds = useMemo(() => {
+    const hosts = new Set<string>();
+    const byAgent = new Map<string, Array<{ id: string; mode: AgentPaneMode }>>();
+    for (const item of splitLayout.leaves) {
+      if (!item.visible || item.leaf.content.kind !== "agent") continue;
+      const key = item.leaf.content.agentKey;
+      if (!key) continue;
+      const resolvedMode = resolveAgentMode(item.leaf.content.mode, lookupAgentByKey(agentsMap, key));
+      const list = byAgent.get(key) ?? [];
+      list.push({ id: item.leaf.id, mode: resolvedMode });
+      byAgent.set(key, list);
+    }
+    for (const list of byAgent.values()) {
+      const picked = list.find((x) => x.mode === "term") ?? list[0];
+      if (picked) hosts.add(picked.id);
+    }
+    return hosts;
+  }, [agentsMap, splitLayout.leaves]);
   const focusedId = focusedLeafOfTab(tab).id;
   const focusedUnit = useMemo(
     () => splitLayout.leaves.find((x) => x.leaf.id === focusedId)?.unit ?? null,
@@ -2496,6 +2516,7 @@ const TabStage = memo(function TabStage({
           isZoomed={zoomedId === item.leaf.id}
           focusedUnit={focusedUnit}
           tabActive={tabActive}
+          portalHost={portalHostPaneIds.has(item.leaf.id)}
           draggingPaneId={draggingPaneId}
           slotElsRef={slotElsRef}
           onDraggingPaneChange={onDraggingPaneChange}
@@ -2518,116 +2539,6 @@ const TabStage = memo(function TabStage({
           ))
         : null}
     </div>
-  );
-});
-
-const WorkspacePortalOverlay = memo(function WorkspacePortalOverlay({
-  activeTab,
-  lookupAgent,
-}: {
-  activeTab: ShellTab | null;
-  lookupAgent: (key: string) => Agent | undefined;
-}) {
-  const localHostId = useLocalHostDeviceId();
-  const devices = liveStore.use((s) => s.devices);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [modalHostId, setModalHostId] = useState("");
-  const [activePortalId, setActivePortalId] = useState<string | null>(null);
-
-  const focusedLeaf = activeTab ? focusedLeafOfTab(activeTab) : undefined;
-  const { primaryAgent, hostIds, mode } = useMemo(() => {
-    const hosts = new Set<string>();
-    let primary: Agent | undefined;
-
-    if (focusedLeaf) {
-      if (focusedLeaf.content.kind === "agent" || focusedLeaf.content.kind === "file") {
-        const a = lookupAgent(focusedLeaf.content.agentKey);
-        if (a) {
-          primary = a;
-          hosts.add(a.deviceId);
-        }
-      } else if (focusedLeaf.content.kind === "diff") {
-        if (focusedLeaf.content.agentKey) {
-          const a = lookupAgent(focusedLeaf.content.agentKey);
-          if (a) {
-            primary = a;
-            hosts.add(a.deviceId);
-          }
-        }
-        if (focusedLeaf.content.deviceId) hosts.add(focusedLeaf.content.deviceId);
-      }
-    }
-
-    if (activeTab) {
-      for (const leaf of tabLeaves(activeTab)) {
-        if (leaf.content.kind === "agent" || leaf.content.kind === "file") {
-          const a = lookupAgent(leaf.content.agentKey);
-          if (a) {
-            if (!primary) primary = a;
-            hosts.add(a.deviceId);
-          }
-        } else if (leaf.content.kind === "diff") {
-          if (leaf.content.agentKey) {
-            const a = lookupAgent(leaf.content.agentKey);
-            if (a) {
-              if (!primary) primary = a;
-              hosts.add(a.deviceId);
-            }
-          }
-          if (leaf.content.deviceId) hosts.add(leaf.content.deviceId);
-        }
-      }
-    }
-
-    if (localHostId && devices[localHostId]?.online) hosts.add(localHostId);
-    if (hosts.size === 0) {
-      for (const [id, dev] of Object.entries(devices)) {
-        if (dev.online) hosts.add(id);
-      }
-    }
-
-    const leafMode: "chat" | "term" =
-      focusedLeaf?.content.kind === "agent"
-        ? (focusedLeaf.content.mode ?? (primary?.isShell ? "term" : "chat"))
-        : primary?.isShell
-          ? "term"
-          : "chat";
-
-    return {
-      primaryAgent: primary ?? null,
-      hostIds: [...hosts],
-      mode: leafMode,
-    };
-  }, [activeTab, devices, focusedLeaf, localHostId, lookupAgent]);
-
-  const effectiveModalHostId = modalHostId || primaryAgent?.deviceId || hostIds[0] || localHostId || "";
-
-  return (
-    <>
-      <SessionPortalPiP
-        agent={primaryAgent}
-        hostIds={hostIds}
-        agentKeys={[]}
-        workspaceWide
-        visible={Boolean(activeTab) && !modalOpen}
-        mode={mode}
-        onExpandPortal={(pid, hid) => {
-          setModalHostId(hid);
-          setActivePortalId(pid);
-          setModalOpen(true);
-        }}
-      />
-      {effectiveModalHostId ? (
-        <PortalViewerModal
-          open={modalOpen}
-          onOpenChange={setModalOpen}
-          hostId={effectiveModalHostId}
-          agent={primaryAgent ?? undefined}
-          activePortalId={activePortalId}
-          onSelectPortalId={setActivePortalId}
-        />
-      ) : null}
-    </>
   );
 });
 
@@ -2817,7 +2728,6 @@ export const ShellMain = memo(function ShellMain({
           />
         </div>
       ))}
-      <WorkspacePortalOverlay activeTab={active} lookupAgent={lookupAgent} />
     </div>
   );
 });

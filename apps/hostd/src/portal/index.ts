@@ -6,6 +6,7 @@ import { basename, dirname, resolve } from "node:path";
 import type {
   Agent,
   HostPortalCapabilities,
+  PortalEgoSpaceState,
   PortalFileTicket,
   PortalFramePayload,
   PortalInputAction,
@@ -16,9 +17,26 @@ import type {
 } from "@herdr-pocket/protocol";
 import { stateDir } from "@herdr-pocket/update";
 import { CdpBrowserPool } from "./cdpBrowser.ts";
+import {
+  defaultQueryEgoTaskSpaces,
+  ownershipToEgoPhase,
+  selectMatchingEgoSpaceWindow,
+  type EgoTaskSpaceEntry,
+} from "./egoSpace.ts";
 import { OsCaptureDriver, computeCapabilities, type OsCaptureDeps } from "./osCapture.ts";
 import { PortalFileTicketStore, bundleHtmlForRelay, listDirectoryForPortal, mimeForFilename, readChunkForRpc } from "./p2pFiles.ts";
-import { PortalHookServer, TerminalInputLineTracker, classifyTarget, ensurePortalShims, extractAutoPortalIntents, parseOpenerArgs, type AutoPortalIntent, type HookOpenPayload } from "./shims.ts";
+import {
+  PortalHookServer,
+  TerminalInputLineTracker,
+  classifyTarget,
+  ensurePortalShims,
+  extractAutoPortalIntents,
+  parseEgoScreenSnapshot,
+  parseOpenerArgs,
+  type AutoPortalIntent,
+  type EgoScreenSnapshot,
+  type HookOpenPayload,
+} from "./shims.ts";
 import type { FilesOptions } from "../files.ts";
 
 export interface PortalManagerDeps {
@@ -30,11 +48,14 @@ export interface PortalManagerDeps {
   hasRemoteViewers: () => boolean;
   onPortalEvent: (event: PortalStreamEvent) => void;
   captureDeps?: OsCaptureDeps;
+  queryEgoTaskSpaces?: (serverName?: string) => Promise<EgoTaskSpaceEntry[]>;
   stateDir?: string;
 }
 
 const MAX_PORTAL_ITEMS = 40;
 const AUTO_DEDUP_MS = 4000;
+const PENDING_WINDOW_INTENT_TTL_MS = 8000;
+const EGO_SPACE_SYNC_MS = 2500;
 const SCREEN_FOREGROUND_THROTTLE_MS = 8000;
 const PROCESS_TREE_MAX_HOPS = 14;
 const XSERVER_APP_RE = /\b(?:vcxsrv|x410|xming|xwin|mobaxterm|msrdc|wslg)\b/i;
@@ -53,6 +74,68 @@ const APP_ALIASES: Record<string, string[]> = {
   safari: ["safari"],
   x11: ["vcxsrv", "x410", "xming", "xwin", "mobaxterm", "msrdc", "wslg", "x11", "xeyes", "xclock", "xcalc"],
 };
+
+interface PendingWindowIntent {
+  agentKey: string;
+  expiresAt: number;
+  appHints: string[];
+  titleHint?: string;
+  urlHint?: string;
+  isWsl?: boolean;
+}
+
+interface AgentEgoSpaceBinding {
+  agentKey: string;
+  serverName?: string;
+  spaceId?: number;
+  spaceName?: string;
+  pageLabel?: string;
+  screenPageTitle?: string;
+  url?: string;
+  lastAction?: string;
+  handoffHint?: boolean;
+  beforeSpaceIds?: Set<number>;
+  confirmedInEgoLite?: boolean;
+  portalId?: string;
+  updatedAt: number;
+}
+
+function expandAppHints(hints: string[]): string[] {
+  return hints.flatMap((h) => {
+    const lower = h.trim().toLowerCase();
+    return APP_ALIASES[lower] ?? (lower ? [lower] : []);
+  });
+}
+
+function titleMatchesHint(w: RemoteWindowInfo, hint?: string): boolean {
+  const clean = hint?.trim().toLowerCase();
+  if (!clean) return false;
+  const app = w.appName.toLowerCase();
+  const title = w.title.toLowerCase();
+  if (app.includes(clean) || title.includes(clean)) return true;
+  const dot = clean.lastIndexOf(".");
+  if (dot > 2) {
+    const stem = clean.slice(0, dot);
+    if (stem.length >= 3 && (title.includes(stem) || app.includes(stem))) return true;
+  }
+  return false;
+}
+
+function buildEgoSubtitle(egoSpace: PortalEgoSpaceState, url?: string): string {
+  const phaseLabel =
+    egoSpace.phase === "handoff"
+      ? "等你接管"
+      : egoSpace.phase === "user"
+        ? "已移交"
+        : egoSpace.phase === "idle"
+          ? "空间就绪"
+          : "AI 操作中";
+  const parts = [phaseLabel];
+  if (egoSpace.activeTabTitle) parts.push(egoSpace.activeTabTitle);
+  else if (url) parts.push(url);
+  if (egoSpace.lastAction) parts.push(egoSpace.lastAction);
+  return parts.join(" · ");
+}
 
 function delayMs(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -125,7 +208,10 @@ export class PortalManager {
   private baselineInitPromise: Promise<void> | null = null;
   private autoWindowMeta = new Map<string, { portalId: string; windowId: string; openedAt: number; missCount: number }>();
   private lastTerminalFgPid = new Map<string, number>();
-  private lastCommandCtx: { agentKey: string; at: number; isWsl: boolean } | null = null;
+  private pendingWindowIntents = new Map<string, PendingWindowIntent[]>();
+  private egoBindings = new Map<string, AgentEgoSpaceBinding>();
+  private egoSyncTimer: NodeJS.Timeout | null = null;
+  private egoSyncInFlight = new Map<string, Promise<PortalItem | null>>();
   private scanTimer: NodeJS.Timeout | null = null;
   private scanFollowupTimers: NodeJS.Timeout[] = [];
   private scanInFlight: Promise<void> | null = null;
@@ -206,11 +292,18 @@ export class PortalManager {
       clearInterval(this.windowDeltaTimer);
       this.windowDeltaTimer = null;
     }
+    if (this.egoSyncTimer) {
+      clearInterval(this.egoSyncTimer);
+      this.egoSyncTimer = null;
+    }
     for (const t of this.scanFollowupTimers) clearTimeout(t);
     this.scanFollowupTimers = [];
     for (const t of this.pokeTimers.values()) clearTimeout(t);
     this.pokeTimers.clear();
     this.autoWindowMeta.clear();
+    this.pendingWindowIntents.clear();
+    this.egoBindings.clear();
+    this.egoSyncInFlight.clear();
     this.knownWindows.clear();
     this.windowBaselineSeeded = false;
     this.browserReviving.clear();
@@ -277,19 +370,6 @@ export class PortalManager {
         }
       }
     }
-    if (this.lastCommandCtx && Date.now() - this.lastCommandCtx.at < 15_000) {
-      const recentHit = agents.find((a) => a.key === this.lastCommandCtx?.agentKey);
-      if (recentHit) return recentHit;
-    }
-    if (payload.cwd) {
-      const norm = resolve(payload.cwd);
-      const exactWorking = agents.find(
-        (a) => a.status === "working" && a.cwd && (norm === resolve(a.cwd) || norm.startsWith(`${resolve(a.cwd)}/`)),
-      );
-      if (exactWorking) return exactWorking;
-      const exact = agents.find((a) => a.cwd && (norm === resolve(a.cwd) || norm.startsWith(`${resolve(a.cwd)}/`)));
-      if (exact) return exact;
-    }
     return undefined;
   }
 
@@ -310,8 +390,17 @@ export class PortalManager {
     if (!parsed) return { handled: false };
 
     const agent = this.resolveAgentForHook(payload);
+    if (!agent) {
+      // Strict per-terminal lineage: never open unattributed portals or leak across terminals.
+      return { handled: false };
+    }
     if (parsed.kind === "window" && parsed.app) {
-      this.markAutoDedup(`${agent?.key ?? ""}\0win\0${parsed.app.toLowerCase()}`);
+      this.markAutoDedup(`${agent.key}\0win\0${parsed.app.toLowerCase()}`);
+      this.recordPendingWindowIntent(agent.key, {
+        appHints: expandAppHints([parsed.app]),
+        titleHint: parsed.app,
+        urlHint: parsed.url,
+      });
       void this.detectAndOpenWindowPortal({
         agent,
         appHint: parsed.app,
@@ -321,9 +410,9 @@ export class PortalManager {
       return { handled: isHeadless || forceHandled };
     }
 
-    this.markAutoDedup(`${agent?.key ?? ""}\0${parsed.kind}\0${parsed.url || parsed.target}`);
+    this.markAutoDedup(`${agent.key}\0${parsed.kind}\0${parsed.url || parsed.target}`);
     const opened = await this.openPortal({
-      agentKey: agent?.key,
+      agentKey: agent.key,
       kind: parsed.kind,
       target: parsed.target,
       url: parsed.url,
@@ -349,7 +438,7 @@ export class PortalManager {
     const ev: PortalStreamEvent = { kind: "portal_event", action, item, at: Date.now() };
     this.deps.onPortalEvent(ev);
     for (const w of this.streamWatchers.values()) {
-      if (w.agentKey && item.agentKey && w.agentKey !== item.agentKey) continue;
+      if (w.agentKey && item.agentKey !== w.agentKey) continue;
       if (w.portalId && w.portalId !== item.id && action !== "opened") continue;
       w.send(ev);
     }
@@ -433,6 +522,7 @@ export class PortalManager {
     windowId?: string;
     reveal?: boolean;
     title?: string;
+    egoSpace?: PortalEgoSpaceState;
   }): Promise<{ item: PortalItem; ticket?: PortalFileTicket }> {
     const now = Date.now();
     const agent = opts.agentKey ? this.deps.getAgents().find((a) => a.key === opts.agentKey) : undefined;
@@ -478,19 +568,22 @@ export class PortalManager {
     let url = opts.url ?? (kind === "browser" ? targetPath : undefined);
     let title =
       opts.title?.trim() ||
-      (kind === "window"
-        ? opts.windowId === "screen:0"
-          ? "远程桌面"
-          : "系统窗口"
-        : kind === "browser"
-          ? url || "远程浏览器"
-          : targetPath
-            ? basename(targetPath)
-            : "回传视图");
+      (opts.egoSpace
+        ? `EG 空间 · ${opts.egoSpace.spaceName}`
+        : kind === "window"
+          ? opts.windowId === "screen:0"
+            ? "远程桌面"
+            : "系统窗口"
+          : kind === "browser"
+            ? url || "远程浏览器"
+            : targetPath
+              ? basename(targetPath)
+              : "回传视图");
     let streamError: string | undefined;
     let initialFrame: PortalFramePayload | null = null;
     let width: number | undefined;
     let height: number | undefined;
+    let resolvedWindowId = opts.windowId;
 
     if (kind === "browser") {
       if (!url) throw new Error("需要提供网页 URL");
@@ -513,40 +606,46 @@ export class PortalManager {
             : browserMsg;
       }
     } else if (kind === "window") {
-      const winId = opts.windowId || "screen:0";
-      const wins = await this.capture.listWindows().catch(() => []);
-      const hit = wins.find((w) => w.id === winId);
-      if (hit) {
-        title = opts.title?.trim() || `${hit.appName} · ${hit.title}`;
-      }
-      const cap = await this.capture.captureWindow(winId).catch(() => null);
-      if (cap) {
-        width = cap.width;
-        height = cap.height;
-        initialFrame = {
-          portalId,
-          seq: ++this.windowSeq,
-          mime: cap.mime,
-          data: cap.data,
-          ...(cap.rawBytes ? { rawBytes: cap.rawBytes, byteLength: cap.rawBytes.byteLength } : {}),
-          width: cap.width,
-          height: cap.height,
-          ...(url ? { url } : {}),
-          title,
-          ...(cap.cursorX !== undefined ? { cursorX: cap.cursorX, cursorY: cap.cursorY, cursorVisible: cap.cursorVisible } : {}),
-          ...(cap.captureMs !== undefined ? { captureMs: cap.captureMs } : {}),
-          at: now,
-        };
+      if (opts.egoSpace && !opts.windowId) {
+        resolvedWindowId = undefined;
       } else {
-        if (hit?.bounds) {
-          width = hit.bounds.width;
-          height = hit.bounds.height;
+        const winId = opts.windowId || "screen:0";
+        resolvedWindowId = winId;
+        const wins = await this.capture.listWindows().catch(() => []);
+        const hit = wins.find((w) => w.id === winId);
+        if (hit && !opts.egoSpace) {
+          title = opts.title?.trim() || `${hit.appName} · ${hit.title}`;
         }
-        const permNote = await this.capture.checkPermissionNote().catch(() => null);
-        streamError = permNote ?? "当前无法捕获该系统窗口画面（窗口可能已最小化、关闭，或系统未授予抓屏权限）";
+        const cap = await this.capture.captureWindow(winId).catch(() => null);
+        if (cap) {
+          width = cap.width;
+          height = cap.height;
+          initialFrame = {
+            portalId,
+            seq: ++this.windowSeq,
+            mime: cap.mime,
+            data: cap.data,
+            ...(cap.rawBytes ? { rawBytes: cap.rawBytes, byteLength: cap.rawBytes.byteLength } : {}),
+            width: cap.width,
+            height: cap.height,
+            ...(url ? { url } : {}),
+            title,
+            ...(cap.cursorX !== undefined ? { cursorX: cap.cursorX, cursorY: cap.cursorY, cursorVisible: cap.cursorVisible } : {}),
+            ...(cap.captureMs !== undefined ? { captureMs: cap.captureMs } : {}),
+            at: now,
+          };
+        } else {
+          if (hit?.bounds) {
+            width = hit.bounds.width;
+            height = hit.bounds.height;
+          }
+          const permNote = await this.capture.checkPermissionNote().catch(() => null);
+          streamError = permNote ?? "当前无法捕获该系统窗口画面（窗口可能已最小化、关闭，或系统未授予抓屏权限）";
+        }
       }
     }
 
+    const canInteract = kind === "browser" || (kind === "window" && Boolean(resolvedWindowId));
     const item: PortalItem = {
       id: portalId,
       hostId: this.deps.hostId(),
@@ -554,8 +653,9 @@ export class PortalManager {
       ...(agent?.localId ? { terminalId: agent.localId } : {}),
       kind,
       title,
-      subtitle:
-        kind === "reveal" && highlightName
+      subtitle: opts.egoSpace
+        ? buildEgoSubtitle(opts.egoSpace, url)
+        : kind === "reveal" && highlightName
           ? `定位文件：${highlightName}`
           : kind === "browser"
             ? url
@@ -564,12 +664,13 @@ export class PortalManager {
       ...(parentDir ? { parentDir } : {}),
       ...(highlightName ? { highlightName } : {}),
       ...(url ? { url } : {}),
-      ...(opts.windowId ? { windowId: opts.windowId } : kind === "window" ? { windowId: "screen:0" } : {}),
+      ...(resolvedWindowId ? { windowId: resolvedWindowId } : {}),
+      ...(opts.egoSpace ? { egoSpace: opts.egoSpace } : {}),
       ...(mime ? { mime } : {}),
       ...(size !== undefined ? { size } : {}),
       ...(width !== undefined ? { width } : {}),
       ...(height !== undefined ? { height } : {}),
-      canInteract: kind === "browser" || kind === "window",
+      canInteract,
       ...(streamError ? { streamError } : {}),
       transportHint,
       createdAt: now,
@@ -593,13 +694,20 @@ export class PortalManager {
     const existing = this.items.get(portalId);
     this.browser.close(portalId);
     if (!existing) return;
+    if (existing.agentKey) {
+      const binding = this.egoBindings.get(existing.agentKey);
+      if (binding?.portalId === portalId) {
+        this.egoBindings.delete(existing.agentKey);
+        this.maybeStopEgoSpaceSyncTimer();
+      }
+    }
     this.items.delete(portalId);
     this.emitEvent("closed", existing);
   }
 
   listPortals(agentKey?: string): PortalItem[] {
     const all = [...this.items.values()];
-    return (agentKey ? all.filter((i) => !i.agentKey || i.agentKey === agentKey) : all).sort((a, b) => b.updatedAt - a.updatedAt);
+    return (agentKey ? all.filter((i) => i.agentKey === agentKey) : all).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   async listWindows(): Promise<RemoteWindowInfo[]> {
@@ -642,6 +750,9 @@ export class PortalManager {
       return { frame, item };
     }
     if (item.kind === "window") {
+      if (item.egoSpace && !item.windowId) {
+        return { frame: null, item };
+      }
       const cap = await this.capture.captureWindow(item.windowId || "screen:0", opts);
       if (!cap) {
         const permNote = await this.capture.checkPermissionNote().catch(() => null);
@@ -933,6 +1044,9 @@ export class PortalManager {
       return res;
     }
     if (item.kind === "window") {
+      if (item.egoSpace && !item.windowId) {
+        throw new Error("当前 EG 浏览器空间暂未关联可操控的独立窗口");
+      }
       const targetWin = item.windowId || "screen:0";
       if (input.type === "pointer" && (input.action === "move" || input.action === "drag")) {
         if (this.inputMoveInFlight.has(portalId)) {
@@ -1040,7 +1154,7 @@ export class PortalManager {
             })
             .catch(() => {});
         }
-      } else if (item?.kind === "window") {
+      } else if (item?.kind === "window" && (!item.egoSpace || item.windowId)) {
         this.startWindowWatcherLoop(streamId, entry);
       }
       entry.heartbeatTimer = setInterval(() => {
@@ -1093,18 +1207,78 @@ export class PortalManager {
     return false;
   }
 
+  private recordPendingWindowIntent(
+    agentKey: string,
+    intent: Omit<PendingWindowIntent, "agentKey" | "expiresAt">,
+    ttlMs = PENDING_WINDOW_INTENT_TTL_MS,
+  ): void {
+    const now = Date.now();
+    this.prunePendingWindowIntents(now);
+    const list = this.pendingWindowIntents.get(agentKey) ?? [];
+    list.push({
+      agentKey,
+      expiresAt: now + ttlMs,
+      ...intent,
+    });
+    if (list.length > 16) list.splice(0, list.length - 16);
+    this.pendingWindowIntents.set(agentKey, list);
+  }
+
+  private prunePendingWindowIntents(now = Date.now()): void {
+    for (const [key, list] of this.pendingWindowIntents) {
+      const alive = list.filter((it) => it.expiresAt > now);
+      if (alive.length > 0) this.pendingWindowIntents.set(key, alive);
+      else this.pendingWindowIntents.delete(key);
+    }
+  }
+
+  private hasUnexpiredPendingIntents(): boolean {
+    this.prunePendingWindowIntents();
+    return this.pendingWindowIntents.size > 0;
+  }
+
+  private hasPendingWslIntentForAgent(agentKey: string): boolean {
+    this.prunePendingWindowIntents();
+    return Boolean(this.pendingWindowIntents.get(agentKey)?.some((it) => it.isWsl));
+  }
+
+  private matchPendingWindowIntent(w: RemoteWindowInfo): Agent | undefined {
+    this.prunePendingWindowIntents();
+    const agents = this.deps.getAgents();
+    const appLower = w.appName.toLowerCase();
+    let best: { agent: Agent; expiresAt: number } | null = null;
+    for (const [agentKey, list] of this.pendingWindowIntents) {
+      const agent = agents.find((a) => a.key === agentKey);
+      if (!agent) continue;
+      for (const intent of list) {
+        let matches = false;
+        if (intent.appHints.length > 0) {
+          matches = intent.appHints.some((h) => appLower.includes(h) || w.title.toLowerCase().includes(h));
+        }
+        if (!matches && intent.titleHint && titleMatchesHint(w, intent.titleHint)) {
+          matches = true;
+        }
+        if (!matches && intent.isWsl && XSERVER_APP_RE.test(w.appName)) {
+          matches = true;
+        }
+        if (matches && (!best || intent.expiresAt > best.expiresAt)) {
+          best = { agent, expiresAt: intent.expiresAt };
+        }
+      }
+    }
+    return best?.agent;
+  }
+
   private matchWindowByHint(
     windows: RemoteWindowInfo[],
     hints: string[],
     beforeIds?: Set<string>,
     beforeTitles?: Map<string, string>,
     strictFresh = false,
+    titleHint?: string,
   ): RemoteWindowInfo | undefined {
     const visible = windows.filter((w) => !w.isScreen && (w.bounds?.width ?? 200) >= 140 && (w.bounds?.height ?? 200) >= 100);
-    const expandedHints = hints.flatMap((h) => {
-      const lower = h.trim().toLowerCase();
-      return APP_ALIASES[lower] ?? (lower ? [lower] : []);
-    });
+    const expandedHints = expandAppHints(hints);
     const allowPocket = expandedHints.some((h) => h.includes("herdr pocket"));
     const candidates = visible.filter((w) => allowPocket || !w.appName.toLowerCase().includes("herdr pocket"));
 
@@ -1134,11 +1308,11 @@ export class PortalManager {
       }
     }
 
-    if (beforeIds || beforeTitles) {
-      const freshNonTerm = candidates.find(
-        (w) => isFreshOrRetitled(w) && !TERMINAL_APP_NAMES.has(w.appName.toLowerCase()),
+    if ((beforeIds || beforeTitles) && titleHint) {
+      const freshTitleMatch = candidates.find(
+        (w) => isFreshOrRetitled(w) && !TERMINAL_APP_NAMES.has(w.appName.toLowerCase()) && titleMatchesHint(w, titleHint),
       );
-      if (freshNonTerm) return freshNonTerm;
+      if (freshTitleMatch) return freshTitleMatch;
     }
     return undefined;
   }
@@ -1171,9 +1345,10 @@ export class PortalManager {
     return true;
   }
 
-  private resolveOwnerAgentForWindow(
+  private resolveProcessTreeOwnerAgent(
     w: RemoteWindowInfo,
     procs: Map<number, { ppid: number; name: string }>,
+    opts: { isNewWindow?: boolean; requireNonBaselineForExistingWin?: boolean } = {},
   ): Agent | undefined {
     const agents = this.deps.getAgents();
     const terms = this.deps.getTerminals();
@@ -1193,32 +1368,30 @@ export class PortalManager {
       if (t.pid) termPidToAgent.set(t.pid, agent);
     }
 
+    const isNew = opts.isNewWindow ?? true;
     if (w.pid && (fgPidToAgent.size > 0 || termPidToAgent.size > 0)) {
       let cur = w.pid;
       const seen = new Set<number>();
       for (let hop = 0; hop < PROCESS_TREE_MAX_HOPS && cur > 1 && !seen.has(cur); hop += 1) {
         seen.add(cur);
         const fgHit = fgPidToAgent.get(cur);
-        if (fgHit) return fgHit;
+        if (fgHit && (!opts.requireNonBaselineForExistingWin || isNew || !this.baselineFgPids.has(cur))) {
+          return fgHit;
+        }
         const termHit = termPidToAgent.get(cur);
-        if (termHit) return termHit;
+        if (termHit && isNew) {
+          return termHit;
+        }
         const p = procs.get(cur);
         if (!p || !p.ppid || p.ppid === cur) break;
         cur = p.ppid;
       }
     }
 
-    const recentAgent =
-      this.lastCommandCtx && Date.now() - this.lastCommandCtx.at < 20_000
-        ? agents.find((a) => a.key === this.lastCommandCtx?.agentKey)
-        : undefined;
-    if (recentAgent) return recentAgent;
-
     const isWinHost = (this.deps.captureDeps?.platform ?? process.platform) === "win32";
-    if (XSERVER_APP_RE.test(w.appName) && (isWinHost || wslFgAgent)) return wslFgAgent;
-
-    const working = agents.filter((a) => a.status === "working");
-    if (working.length === 1) return working[0];
+    if (isNew && XSERVER_APP_RE.test(w.appName) && wslFgAgent && (isWinHost || this.hasPendingWslIntentForAgent(wslFgAgent.key))) {
+      return wslFgAgent;
+    }
     return undefined;
   }
 
@@ -1233,8 +1406,8 @@ export class PortalManager {
   }
 
   /**
-   * Watches OS-wide window additions and title updates so newly launched windows or browsers
-   * (e.g. `open CLAUDE.md`, `ego-browser`, GUI apps launched outside PTY process trees) auto-surface in `SessionPortalPiP`.
+   * Watches OS window deltas strictly for child windows whose lineage traces back to a terminal PTY process
+   * or an explicit per-terminal command launch intent — never surfacing unrelated OS windows.
    */
   async pollWindowDeltas(): Promise<void> {
     if (this.windowDeltaInFlight) return;
@@ -1249,31 +1422,41 @@ export class PortalManager {
         return;
       }
 
-      const newWindows = visible.filter((w) => !this.knownWindows.has(w.id));
+      const egoChanged =
+        visible.some((w) => {
+          if (!/ego\s*lite/i.test(w.appName)) return false;
+          const prev = this.knownWindows.get(w.id);
+          return !prev || prev.title !== w.title;
+        }) ||
+        [...this.knownWindows.entries()].some(
+          ([id, meta]) => /ego\s*lite/i.test(meta.appName) && !visible.some((w) => w.id === id),
+        );
+
+      const newWindows = visible.filter((w) => !this.knownWindows.has(w.id) && !/ego\s*lite/i.test(w.appName));
       const procs = newWindows.some((w) => w.pid)
         ? await this.capture.listProcessParents().catch(() => new Map<number, { ppid: number; name: string }>())
         : new Map<number, { ppid: number; name: string }>();
-
-      const recentAgent =
-        this.lastCommandCtx && Date.now() - this.lastCommandCtx.at < 15_000
-          ? this.deps.getAgents().find((a) => a.key === this.lastCommandCtx?.agentKey)
-          : undefined;
 
       for (const w of visible) {
         const prev = this.knownWindows.get(w.id);
         const existingPortal = [...this.items.values()].find((i) => i.kind === "window" && i.windowId === w.id);
         const nextTitle = `${w.appName}${w.title && w.title !== w.appName ? ` · ${w.title}` : ""}`;
+        const isEgoApp = /ego\s*lite/i.test(w.appName);
 
         if (!prev) {
+          if (isEgoApp) continue;
           if (existingPortal) {
             const meta = this.autoWindowMeta.get(existingPortal.id);
             if (meta) meta.missCount = 0;
             continue;
           }
           if (this.checkAndMarkAutoDedup(`delta-open\0${w.id}`, 2000)) continue;
-          const owner = this.resolveOwnerAgentForWindow(w, procs);
+          const owner =
+            this.resolveProcessTreeOwnerAgent(w, procs, { isNewWindow: true }) ??
+            this.matchPendingWindowIntent(w);
+          if (!owner) continue;
           const { item } = await this.openPortal({
-            agentKey: owner?.key,
+            agentKey: owner.key,
             kind: "window",
             windowId: w.id,
             title: nextTitle,
@@ -1288,11 +1471,8 @@ export class PortalManager {
         }
 
         if (prev.title !== w.title && w.title.trim() !== "") {
-          const isBrowserApp = /ego\s*lite|\bego\b|tabbit|chrome|chromium|safari|arc|edge|brave|firefox|playwright/i.test(w.appName);
-          const isAutoBrowser = /\b(?:ego\s*lite|ego|tabbit|chromium|playwright|chrome\s*for\s*testing)\b/i.test(w.appName);
-          const workingAgents = this.deps.getAgents().filter((a) => a.status === "working");
-          const inferredAgent = recentAgent ?? (workingAgents.length === 1 ? workingAgents[0] : undefined);
           if (existingPortal) {
+            if (existingPortal.egoSpace) continue;
             const cap = await this.capture.captureWindow(w.id).catch(() => null);
             if (cap) {
               this.syncItemStreamError(existingPortal, undefined);
@@ -1301,19 +1481,22 @@ export class PortalManager {
               existingPortal.title = nextTitle;
               this.emitEvent("updated", existingPortal);
             }
-          } else if ((isAutoBrowser || Boolean(recentAgent) || (isBrowserApp && workingAgents.length > 0)) && !this.checkAndMarkAutoDedup(`delta-retitle\0${w.id}`, 2000)) {
-            const { item } = await this.openPortal({
-              agentKey: inferredAgent?.key,
-              kind: "window",
-              windowId: w.id,
-              title: nextTitle,
-            });
-            this.autoWindowMeta.set(item.id, {
-              portalId: item.id,
-              windowId: w.id,
-              openedAt: Date.now(),
-              missCount: 0,
-            });
+          } else if (!isEgoApp) {
+            const pendingOwner = this.matchPendingWindowIntent(w);
+            if (pendingOwner && !this.checkAndMarkAutoDedup(`delta-retitle\0${w.id}`, 2000)) {
+              const { item } = await this.openPortal({
+                agentKey: pendingOwner.key,
+                kind: "window",
+                windowId: w.id,
+                title: nextTitle,
+              });
+              this.autoWindowMeta.set(item.id, {
+                portalId: item.id,
+                windowId: w.id,
+                openedAt: Date.now(),
+                missCount: 0,
+              });
+            }
           }
         }
       }
@@ -1334,6 +1517,10 @@ export class PortalManager {
             this.closePortal(portalId);
           }
         }
+      }
+
+      if (egoChanged && this.egoBindings.size > 0) {
+        void this.syncActiveEgoSpacePortals().catch(() => {});
       }
     } finally {
       this.windowDeltaInFlight = false;
@@ -1397,7 +1584,7 @@ export class PortalManager {
       if (ms > 0) await delayMs(ms);
       const strictFresh = Boolean(opts.beforeIds || opts.beforeTitles) && i < delays.length - 1;
       const wins = await this.capture.listWindows().catch(() => []);
-      const hit = this.matchWindowByHint(wins, hints, opts.beforeIds, opts.beforeTitles, strictFresh);
+      const hit = this.matchWindowByHint(wins, hints, opts.beforeIds, opts.beforeTitles, strictFresh, opts.titleHint);
       if (!hit) continue;
       lastHit = hit;
       const cap = await this.capture.captureWindow(hit.id).catch(() => null);
@@ -1544,7 +1731,7 @@ export class PortalManager {
     }
     if (!this.deps.hasRemoteViewers()) return;
 
-    const recentCmd = Boolean(this.lastCommandCtx && Date.now() - this.lastCommandCtx.at < 15_000);
+    const recentCmd = this.hasUnexpiredPendingIntents();
     if (!fgChanged && this.autoWindowMeta.size === 0 && !recentCmd) return;
 
     if (fgChanged) {
@@ -1577,70 +1764,20 @@ export class PortalManager {
         (w) => !w.isScreen && (w.bounds?.width ?? 200) >= 80 && (w.bounds?.height ?? 200) >= 60,
       );
 
-      const agents = this.deps.getAgents();
-      const terms = this.deps.getTerminals();
-      const fgPidToAgent = new Map<number, Agent>();
-      const termPidToAgent = new Map<number, Agent>();
-      let wslFgAgent: Agent | undefined;
-
-      for (const agent of agents) {
-        const t = terms.get(agent.localId);
-        if (!t) continue;
-        if (t.foreground?.pid) {
-          fgPidToAgent.set(t.foreground.pid, agent);
-          if (!wslFgAgent && t.foreground.argv?.some((arg) => /\bwsl(?:\.exe)?\b/i.test(arg))) {
-            wslFgAgent = agent;
-          }
-        }
-        if (t.pid) termPidToAgent.set(t.pid, agent);
-      }
-
       const procs = visible.some((w) => w.pid)
         ? await this.capture.listProcessParents().catch(() => new Map<number, { ppid: number; name: string }>())
         : new Map<number, { ppid: number; name: string }>();
 
-      const recentAgent =
-        this.lastCommandCtx && Date.now() - this.lastCommandCtx.at < 15_000
-          ? agents.find((a) => a.key === this.lastCommandCtx?.agentKey)
-          : undefined;
-
-      const matchWindowAgent = (w: RemoteWindowInfo): Agent | undefined => {
-        const appLower = w.appName.toLowerCase();
-        if (TERMINAL_APP_NAMES.has(appLower) || appLower.includes("herdr pocket")) return undefined;
-
-        const isNewWindow = !(this.baselineWindowIds?.has(w.id));
-        if (w.pid && (fgPidToAgent.size > 0 || termPidToAgent.size > 0)) {
-          let cur = w.pid;
-          const seen = new Set<number>();
-          for (let hop = 0; hop < PROCESS_TREE_MAX_HOPS && cur > 1 && !seen.has(cur); hop += 1) {
-            seen.add(cur);
-            const fgHit = fgPidToAgent.get(cur);
-            if (fgHit && (isNewWindow || !this.baselineFgPids.has(cur))) {
-              return fgHit;
-            }
-            const termHit = termPidToAgent.get(cur);
-            if (termHit && isNewWindow) {
-              return termHit;
-            }
-            const p = procs.get(cur);
-            if (!p || !p.ppid || p.ppid === cur) break;
-            cur = p.ppid;
-          }
-        }
-
-        const isWinHost = (this.deps.captureDeps?.platform ?? process.platform) === "win32";
-        if (
-          isNewWindow &&
-          XSERVER_APP_RE.test(w.appName) &&
-          (isWinHost || Boolean(this.lastCommandCtx?.isWsl) || Boolean(wslFgAgent))
-        ) {
-          return recentAgent ?? wslFgAgent;
-        }
-        return undefined;
-      };
-
       for (const w of visible) {
-        const matchedAgent = matchWindowAgent(w);
+        const appLower = w.appName.toLowerCase();
+        if (TERMINAL_APP_NAMES.has(appLower) || appLower.includes("herdr pocket") || /ego\s*lite/i.test(w.appName)) {
+          continue;
+        }
+        const isNewWindow = !(this.baselineWindowIds?.has(w.id));
+        const matchedAgent = this.resolveProcessTreeOwnerAgent(w, procs, {
+          isNewWindow,
+          requireNonBaselineForExistingWin: true,
+        });
         if (!matchedAgent) continue;
 
         const existing = [...this.items.values()].find(
@@ -1705,20 +1842,25 @@ export class PortalManager {
   observeSubmittedCommand(
     agent: Agent,
     commandText: string,
-    _source: "terminal_input" | "user_send" | "agent_tool" | "foreground" = "terminal_input",
+    source: "terminal_input" | "user_send" | "agent_tool" | "foreground" = "terminal_input",
   ): void {
     if (!commandText) return;
-    this.lastCommandCtx = {
-      agentKey: agent.key,
-      at: Date.now(),
-      isWsl: /\bwsl(?:\.exe)?\b|\bDISPLAY\s*=/i.test(commandText),
-    };
+    const isWsl = /\bwsl(?:\.exe)?\b|\bDISPLAY\s*=/i.test(commandText);
     const liveCwd = this.deps.getTerminals().get(agent.localId)?.cwd || agent.cwd || undefined;
     const intents = extractAutoPortalIntents(commandText, liveCwd);
-    for (const intent of intents) {
-      void this.applyAutoPortalIntent(agent, intent).catch(() => {});
+    if (isWsl && !intents.some((i) => i.type === "app_window" || i.type === "ego_space")) {
+      this.recordPendingWindowIntent(agent.key, {
+        appHints: expandAppHints(["x11"]),
+        titleHint: "X11",
+        isWsl: true,
+      });
     }
-    this.scheduleFollowupScans([250, 800, 1800]);
+    for (const intent of intents) {
+      void this.applyAutoPortalIntent(agent, intent, source).catch(() => {});
+    }
+    if (intents.length > 0 || isWsl) {
+      this.scheduleFollowupScans([250, 800, 1800]);
+    }
   }
 
   private resolveTargetWithUniquePrefix(target: string): string | null {
@@ -1738,10 +1880,296 @@ export class PortalManager {
     return null;
   }
 
-  private async applyAutoPortalIntent(agent: Agent, intent: AutoPortalIntent): Promise<void> {
+  private async queryEgoSpaces(serverName?: string): Promise<EgoTaskSpaceEntry[]> {
+    if (this.deps.queryEgoTaskSpaces) {
+      return this.deps.queryEgoTaskSpaces(serverName).catch(() => []);
+    }
+    // Avoid shelling out to a developer machine's live Ego Lite daemon during mocked captureDeps unit tests.
+    if (this.deps.captureDeps?.execBin) return [];
+    return defaultQueryEgoTaskSpaces(serverName).catch(() => []);
+  }
+
+  private maybeStopEgoSpaceSyncTimer(): void {
+    if (this.egoBindings.size === 0 && this.egoSyncTimer) {
+      clearInterval(this.egoSyncTimer);
+      this.egoSyncTimer = null;
+    }
+  }
+
+  private ensureEgoSpaceSyncTimer(): void {
+    if (this.egoSyncTimer || this.egoBindings.size === 0) return;
+    this.egoSyncTimer = setInterval(() => {
+      if (this.egoBindings.size === 0) {
+        this.maybeStopEgoSpaceSyncTimer();
+        return;
+      }
+      void this.syncActiveEgoSpacePortals().catch(() => {});
+    }, EGO_SPACE_SYNC_MS);
+    this.egoSyncTimer.unref?.();
+  }
+
+  private async syncActiveEgoSpacePortals(): Promise<void> {
+    const agents = this.deps.getAgents();
+    for (const [agentKey, binding] of [...this.egoBindings.entries()]) {
+      const agent = agents.find((a) => a.key === agentKey);
+      if (!agent) {
+        if (binding.portalId) this.closePortal(binding.portalId);
+        this.egoBindings.delete(agentKey);
+        continue;
+      }
+      await this.syncEgoSpaceForAgent(agent).catch(() => {});
+    }
+    this.maybeStopEgoSpaceSyncTimer();
+  }
+
+  private async handleEgoSpaceIntent(
+    agent: Agent,
+    intent: Extract<AutoPortalIntent, { type: "ego_space" }>,
+    source: "terminal_input" | "user_send" | "agent_tool" | "foreground" = "agent_tool",
+  ): Promise<void> {
+    if (intent.finish?.closeSpace) {
+      const existing = this.egoBindings.get(agent.key);
+      if (existing?.portalId) {
+        this.closePortal(existing.portalId);
+      }
+      this.egoBindings.delete(agent.key);
+      this.maybeStopEgoSpaceSyncTimer();
+      return;
+    }
+
+    let binding = this.egoBindings.get(agent.key);
+    const isFreshBinding = !binding;
+    if (!binding) {
+      binding = {
+        agentKey: agent.key,
+        updatedAt: Date.now(),
+      };
+      this.egoBindings.set(agent.key, binding);
+    }
+
+    if (intent.spaceId !== undefined && binding.spaceId !== undefined && intent.spaceId !== binding.spaceId) {
+      delete binding.screenPageTitle;
+      delete binding.confirmedInEgoLite;
+    }
+    if (intent.serverName) binding.serverName = intent.serverName;
+    if (intent.spaceId !== undefined) binding.spaceId = intent.spaceId;
+    if (intent.spaceName) binding.spaceName = intent.spaceName;
+    if (intent.pageLabel) binding.pageLabel = intent.pageLabel;
+    if (intent.url) binding.url = intent.url;
+    if (intent.handoff) binding.handoffHint = true;
+    else if (source !== "foreground") binding.handoffHint = false;
+    if (intent.action && (source !== "foreground" || !binding.lastAction)) {
+      binding.lastAction = intent.action;
+    }
+    binding.updatedAt = Date.now();
+
+    if (isFreshBinding && intent.spaceId === undefined && !intent.spaceName) {
+      const preSpaces = await this.queryEgoSpaces(intent.serverName);
+      if (preSpaces.length > 0 && !binding.beforeSpaceIds) {
+        binding.beforeSpaceIds = new Set(preSpaces.map((s) => s.id));
+      }
+    }
+
+    if (isFreshBinding || source !== "foreground" || intent.spaceId !== undefined || intent.spaceName) {
+      this.ensureEgoSpaceSyncTimer();
+    }
+    await this.syncEgoSpaceForAgent(agent, source !== "foreground");
+  }
+
+  private async handleEgoSpaceSnapshot(agent: Agent, snap: EgoScreenSnapshot, fgArgv?: string[]): Promise<void> {
+    const binding = this.egoBindings.get(agent.key);
+    const hasEgoFg = Boolean(fgArgv?.some((arg) => /\bego-browser\b/i.test(arg)));
+    if (!binding && !hasEgoFg && !snap.spaceName) return;
+
+    await this.handleEgoSpaceIntent(
+      agent,
+      {
+        type: "ego_space",
+        ...(snap.spaceId !== undefined ? { spaceId: snap.spaceId } : {}),
+        ...(snap.spaceName ? { spaceName: snap.spaceName } : {}),
+        ...(snap.pageLabel ? { pageLabel: snap.pageLabel } : {}),
+      },
+      "foreground",
+    );
+    const latest = this.egoBindings.get(agent.key);
+    if (latest && snap.pageTitle && latest.screenPageTitle !== snap.pageTitle) {
+      latest.screenPageTitle = snap.pageTitle;
+      await this.syncEgoSpaceForAgent(agent, false);
+    }
+  }
+
+  private syncEgoSpaceForAgent(agent: Agent, forceRefreshFrame = false): Promise<PortalItem | null> {
+    const inflight = this.egoSyncInFlight.get(agent.key);
+    if (inflight) {
+      return inflight.then(() => this.runSyncEgoSpaceForAgent(agent, forceRefreshFrame));
+    }
+    const p = this.runSyncEgoSpaceForAgent(agent, forceRefreshFrame).finally(() => {
+      if (this.egoSyncInFlight.get(agent.key) === p) {
+        this.egoSyncInFlight.delete(agent.key);
+      }
+    });
+    this.egoSyncInFlight.set(agent.key, p);
+    return p;
+  }
+
+  private async runSyncEgoSpaceForAgent(agent: Agent, forceRefreshFrame = false): Promise<PortalItem | null> {
+    const binding = this.egoBindings.get(agent.key);
+    if (!binding) return null;
+
+    const allSpaces = await this.queryEgoSpaces(binding.serverName);
+    const claimedByOthers = new Set<number>();
+    for (const [k, other] of this.egoBindings) {
+      if (k !== agent.key && other.spaceId !== undefined) claimedByOthers.add(other.spaceId);
+    }
+
+    let entry: EgoTaskSpaceEntry | undefined;
+    if (binding.spaceId !== undefined) {
+      entry = allSpaces.find((s) => s.id === binding.spaceId);
+    }
+    if (!entry && binding.spaceName) {
+      entry = allSpaces.find(
+        (s) =>
+          s.createdBy === "agent" &&
+          !claimedByOthers.has(s.id) &&
+          (s.name === binding.spaceName || s.taskId === binding.spaceName),
+      );
+    }
+    if (!entry && binding.beforeSpaceIds) {
+      entry = allSpaces.find(
+        (s) => s.createdBy === "agent" && !binding.beforeSpaceIds!.has(s.id) && !claimedByOthers.has(s.id),
+      );
+    }
+
+    if (entry) {
+      binding.spaceId = entry.id;
+      binding.confirmedInEgoLite = true;
+      if (!binding.spaceName && entry.name) binding.spaceName = entry.name;
+    } else if (
+      binding.confirmedInEgoLite &&
+      binding.spaceId !== undefined &&
+      allSpaces.length > 0 &&
+      !allSpaces.some((s) => s.id === binding.spaceId)
+    ) {
+      if (binding.portalId) this.closePortal(binding.portalId);
+      this.egoBindings.delete(agent.key);
+      this.maybeStopEgoSpaceSyncTimer();
+      return null;
+    }
+
+    const spaceName =
+      entry?.name || binding.spaceName || (binding.spaceId !== undefined ? `Space #${binding.spaceId}` : "临时任务空间");
+    const activeTabTitle =
+      binding.screenPageTitle || entry?.recentTabTitles?.[entry.recentTabTitles.length - 1] || entry?.recentTabTitles?.[0];
+    const phase = ownershipToEgoPhase(entry?.ownership, binding.handoffHint);
+
+    const egoSpace: PortalEgoSpaceState = {
+      ...(entry?.id !== undefined ? { spaceId: entry.id } : binding.spaceId !== undefined ? { spaceId: binding.spaceId } : {}),
+      spaceName,
+      ...(entry?.ownership ? { ownership: entry.ownership } : {}),
+      phase,
+      ...(binding.pageLabel ? { pageLabel: binding.pageLabel } : {}),
+      ...(activeTabTitle ? { activeTabTitle } : {}),
+      ...(entry?.recentTabTitles?.length ? { tabCount: entry.recentTabTitles.length } : {}),
+      ...(binding.lastAction ? { lastAction: binding.lastAction } : {}),
+      ...(binding.serverName ? { serverName: binding.serverName } : {}),
+      ...(entry?.profileName ? { profileName: entry.profileName } : {}),
+    };
+
+    const wins = await this.capture.listWindows().catch(() => []);
+    const matchedWin = selectMatchingEgoSpaceWindow(
+      wins,
+      {
+        spaceId: egoSpace.spaceId,
+        spaceName: entry?.name || binding.spaceName,
+        activeTabTitle,
+        recentTabTitles: entry?.recentTabTitles,
+      },
+      allSpaces,
+    );
+
+    const nextTitle = `EG 空间 · ${spaceName}`;
+    const nextSubtitle = buildEgoSubtitle(egoSpace, binding.url);
+
+    const existing = binding.portalId ? this.items.get(binding.portalId) : undefined;
+    if (existing) {
+      const prevWindowId = existing.windowId;
+      const changedMeta =
+        existing.title !== nextTitle ||
+        existing.subtitle !== nextSubtitle ||
+        existing.url !== binding.url ||
+        JSON.stringify(existing.egoSpace) !== JSON.stringify(egoSpace) ||
+        prevWindowId !== matchedWin?.id;
+
+      existing.title = nextTitle;
+      existing.subtitle = nextSubtitle;
+      if (binding.url) existing.url = binding.url;
+      existing.egoSpace = egoSpace;
+
+      if (matchedWin) {
+        existing.windowId = matchedWin.id;
+        existing.canInteract = true;
+        if (prevWindowId !== matchedWin.id || forceRefreshFrame) {
+          const cap = await this.capture.captureWindow(matchedWin.id).catch(() => null);
+          if (cap) {
+            this.syncItemStreamError(existing, undefined);
+            this.pushWindowPortalUpdate(existing, { title: nextTitle, url: binding.url, cap }, "updated");
+          } else if (changedMeta || prevWindowId !== matchedWin.id) {
+            existing.updatedAt = Date.now();
+            this.emitEvent("updated", existing);
+          }
+          if (prevWindowId !== matchedWin.id) {
+            for (const [streamId, w] of this.streamWatchers) {
+              if (w.portalId === existing.id && !w.timer) {
+                this.startWindowWatcherLoop(streamId, w);
+              }
+            }
+          }
+          return existing;
+        }
+      } else if (prevWindowId && wins.length > 0 && !matchedWin) {
+        delete existing.windowId;
+        delete existing.streamError;
+        existing.canInteract = false;
+      }
+
+      if (changedMeta) {
+        existing.updatedAt = Date.now();
+        this.emitEvent("updated", existing);
+      }
+      return existing;
+    }
+
+    const { item } = await this.openPortal({
+      agentKey: agent.key,
+      kind: "window",
+      ...(matchedWin ? { windowId: matchedWin.id } : {}),
+      ...(binding.url ? { url: binding.url } : {}),
+      title: nextTitle,
+      egoSpace,
+    });
+    binding.portalId = item.id;
+    return item;
+  }
+
+  private async applyAutoPortalIntent(
+    agent: Agent,
+    intent: AutoPortalIntent,
+    source: "terminal_input" | "user_send" | "agent_tool" | "foreground" = "terminal_input",
+  ): Promise<void> {
+    if (intent.type === "ego_space") {
+      await this.handleEgoSpaceIntent(agent, intent, source);
+      return;
+    }
+
     if (intent.type === "app_window") {
       const dedupKey = `${agent.key}\0win\0${intent.appHint.toLowerCase()}\0${intent.url ?? ""}`;
       if (this.checkAndMarkAutoDedup(dedupKey, 2500)) return;
+      this.recordPendingWindowIntent(agent.key, {
+        appHints: expandAppHints([intent.appHint]),
+        titleHint: intent.label,
+        urlHint: intent.url,
+        isWsl: intent.appHint.toLowerCase() === "x11",
+      });
       const appLower = intent.appHint.toLowerCase();
       const immediate = appLower.includes("ego") || appLower.includes("tabbit");
       await this.detectAndOpenWindowPortal({
@@ -1758,10 +2186,16 @@ export class PortalManager {
     if (this.checkAndMarkAutoDedup(`${agent.key}\0${intent.kind}\0${dedupId}`, 3500)) return;
 
     if (intent.app) {
+      this.recordPendingWindowIntent(agent.key, {
+        appHints: expandAppHints([intent.app]),
+        titleHint: intent.target ? basename(intent.target) : intent.app,
+        urlHint: intent.url,
+      });
       const wins = await this.capture.listWindows().catch(() => []);
       await this.detectAndOpenWindowPortal({
         agent,
         appHint: intent.app,
+        titleHint: intent.target ? basename(intent.target) : intent.app,
         urlHint: intent.url,
         beforeIds: new Set(wins.map((w) => w.id)),
         beforeTitles: new Map(wins.map((w) => [w.id, w.title])),
@@ -1791,6 +2225,11 @@ export class PortalManager {
         }).catch(() => null);
         if (opened?.item && !opened.item.streamError) return;
       }
+      this.recordPendingWindowIntent(agent.key, {
+        appHints: expandAppHints(BROWSER_WINDOW_HINTS),
+        titleHint: url,
+        urlHint: url,
+      });
       const wins = await this.capture.listWindows().catch(() => []);
       await this.detectAndOpenWindowPortal({
         agent,
@@ -1822,7 +2261,11 @@ export class PortalManager {
     }
 
     if (intent.kind !== "html") {
-      // Also follow up on any GUI window spawned or retitled via LaunchServices (`open CLAUDE.md` -> Typora / Preview / VS Code, etc.).
+      this.recordPendingWindowIntent(agent.key, {
+        appHints: [],
+        titleHint: basename(resolvedTarget),
+      });
+      // Follow up on GUI windows explicitly matching the opened filename (e.g. `open CLAUDE.md` -> Typora / Preview).
       void this.detectAndOpenWindowPortal({
         agent,
         beforeIds: new Set(beforeWins.map((w) => w.id)),
@@ -1871,27 +2314,44 @@ export class PortalManager {
     }
 
     if (/ego[-_]?browser|tabbit|playwright|puppeteer|chrome[-_]?devtools|browser|navigate|goto|open_url|web_preview/i.test(toolName)) {
-      this.lastCommandCtx = {
-        agentKey: agent.key,
-        at: Date.now(),
-        isWsl: false,
-      };
       const url =
         (typeof inp.url === "string" && inp.url) ||
         (typeof inp.href === "string" && inp.href) ||
         (typeof inp.target === "string" && /^https?:/i.test(inp.target) && inp.target) ||
         undefined;
-      const appHint = /ego/i.test(toolName)
-        ? "ego lite"
-        : /tabbit/i.test(toolName)
-          ? "Tabbit"
-          : BROWSER_WINDOW_HINTS;
+      if (/ego/i.test(toolName)) {
+        const spaceName =
+          (typeof inp.spaceName === "string" && inp.spaceName) ||
+          (typeof inp.taskSpace === "string" && inp.taskSpace) ||
+          undefined;
+        const spaceId = typeof inp.spaceId === "number" ? inp.spaceId : undefined;
+        const pageLabel = typeof inp.page === "string" ? inp.page : undefined;
+        void this.handleEgoSpaceIntent(
+          agent,
+          {
+            type: "ego_space",
+            ...(spaceName ? { spaceName } : {}),
+            ...(spaceId !== undefined ? { spaceId } : {}),
+            ...(pageLabel ? { pageLabel } : {}),
+            ...(url ? { url } : {}),
+            action: url ? `访问 ${url}` : "执行页面操作",
+          },
+          "agent_tool",
+        ).catch(() => {});
+        return;
+      }
+      const appHint = /tabbit/i.test(toolName) ? "Tabbit" : BROWSER_WINDOW_HINTS;
       const dedupKey = `${agent.key}\0mcp\0${Array.isArray(appHint) ? "browser" : appHint}\0${url ?? ""}`;
       if (this.checkAndMarkAutoDedup(dedupKey, 2500)) return;
+      this.recordPendingWindowIntent(agent.key, {
+        appHints: expandAppHints(Array.isArray(appHint) ? appHint : [appHint]),
+        titleHint: /tabbit/i.test(toolName) ? "Tabbit" : url,
+        urlHint: url,
+      });
       void this.detectAndOpenWindowPortal({
         agent,
         appHint,
-        titleHint: /ego/i.test(toolName) ? "ego lite 浏览器" : /tabbit/i.test(toolName) ? "Tabbit 浏览器" : undefined,
+        titleHint: /tabbit/i.test(toolName) ? "Tabbit 浏览器" : undefined,
         urlHint: url,
         immediate: true,
       }).catch(() => {});
@@ -1899,11 +2359,6 @@ export class PortalManager {
     }
 
     if (/display_file|open_file|preview_file/i.test(toolName)) {
-      this.lastCommandCtx = {
-        agentKey: agent.key,
-        at: Date.now(),
-        isWsl: false,
-      };
       const raw =
         (typeof inp.path === "string" && inp.path) ||
         (typeof inp.file_path === "string" && inp.file_path) ||
@@ -1928,17 +2383,27 @@ export class PortalManager {
         const prevAt = this.lastForegroundCheckAt.get(agent.key) ?? 0;
         if (Date.now() - prevAt >= SCREEN_FOREGROUND_THROTTLE_MS) {
           this.lastForegroundCheckAt.set(agent.key, Date.now());
-          this.observeSubmittedCommand(agent, joined, "foreground");
+          if (/\bego-browser\b/i.test(joined)) {
+            const intents = extractAutoPortalIntents(joined);
+            for (const it of intents) {
+              if (it.type === "ego_space") {
+                void this.handleEgoSpaceIntent(agent, it, "foreground").catch(() => {});
+              }
+            }
+          } else {
+            this.observeSubmittedCommand(agent, joined, "foreground");
+          }
         }
       }
     }
 
     if (!screenText) return;
-    if (/\[p\d+\s+"[^"]*"\s+\|\s+space\s+"/.test(screenText)) {
+    const snap = parseEgoScreenSnapshot(screenText);
+    if (snap) {
       const prevAt = this.lastForegroundCheckAt.get(agent.key) ?? 0;
-      if (Date.now() - prevAt >= SCREEN_FOREGROUND_THROTTLE_MS) {
+      if (Date.now() - prevAt >= SCREEN_FOREGROUND_THROTTLE_MS || this.egoBindings.has(agent.key)) {
         this.lastForegroundCheckAt.set(agent.key, Date.now());
-        this.observeSubmittedCommand(agent, "ego-browser nodejs", "foreground");
+        void this.handleEgoSpaceSnapshot(agent, snap, fgArgv).catch(() => {});
       }
     }
 

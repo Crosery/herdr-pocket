@@ -27,6 +27,7 @@ import {
   TerminalInputLineTracker,
   extractAutoPortalIntents,
   extractCommandFromTerminalScreenLine,
+  parseEgoScreenSnapshot,
   parseOpenerArgs,
 } from "../src/portal/shims.ts";
 import { UnifloAdapter } from "../src/uniflo.ts";
@@ -313,8 +314,51 @@ test("extractAutoPortalIntents parses open, open -R, open -a, cd && open, ego-br
     extractAutoPortalIntents(
       "ego-browser nodejs <<'EOF'\nconst task = await taskSpace(\"login check\");\nawait page.goto(\"http://127.0.0.1:5173/home\");\nEOF",
     ),
-    [{ type: "app_window", appHint: "ego lite", label: "ego lite · login check", url: "http://127.0.0.1:5173/home" }],
+    [
+      {
+        type: "ego_space",
+        spaceName: "login check",
+        url: "http://127.0.0.1:5173/home",
+        action: "访问 127.0.0.1:5173/home",
+      },
+    ],
   );
+  assert.deepEqual(
+    extractAutoPortalIntents(
+      'ego-browser --ego-server-name=app-a nodejs -e "const task = await takeOverTaskSpace(41); const p1 = task.page(\\"p2\\"); await task.handOff();"',
+    ),
+    [
+      {
+        type: "ego_space",
+        serverName: "app-a",
+        spaceId: 41,
+        pageLabel: "p2",
+        handoff: true,
+        action: "等待你接管验证",
+      },
+    ],
+  );
+  assert.deepEqual(
+    extractAutoPortalIntents('ego-browser nodejs -e "const task = await taskSpace(41); await task.finish({ keep: [] });"'),
+    [
+      {
+        type: "ego_space",
+        spaceId: 41,
+        finish: { closeSpace: true },
+        action: "已完成并关闭空间",
+      },
+    ],
+  );
+  assert.deepEqual(
+    extractAutoPortalIntents('ego-browser nodejs -e "console.log(JSON.stringify(await listTaskSpaces()))"'),
+    [],
+  );
+  assert.deepEqual(parseEgoScreenSnapshot('[p1 "New API 目录" | space "check-api"]\n{ taskSpaceId: 41 }'), {
+    pageLabel: "p1",
+    pageTitle: "New API 目录",
+    spaceName: "check-api",
+    spaceId: 41,
+  });
   assert.deepEqual(extractAutoPortalIntents("ego-browser skill"), []);
   assert.deepEqual(extractAutoPortalIntents('git commit -m "open window" && echo "open a.html"'), []);
 });
@@ -938,12 +982,26 @@ test("PortalManager surfaces streamError cleanly and short-circuits TCC-denied w
   const winRes = await mgr.openPortal({ agentKey: fakeAgent.key, kind: "window", windowId: "901" });
   assert.ok(winRes.item.streamError?.includes("屏幕录制"));
 
+  // ego-browser binds to the EG Space portal and surfaces TCC streamError immediately without blocking retries
+  const egoStartedAt = Date.now();
+  mgr.inspectToolCallForPortal(fakeAgent, "run_command", {
+    CommandLine: 'ego-browser nodejs -e "await page.goto(\\"http://127.0.0.1:8764/?edition=winter&t=0.1\\")"',
+  });
+  for (let i = 0; i < 30 && !mgr.listPortals(fakeAgent.key).some((x) => Boolean(x.egoSpace)); i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(Date.now() - egoStartedAt < 1200);
+  const egoPortal = mgr.listPortals(fakeAgent.key).find((x) => Boolean(x.egoSpace));
+  assert.ok(egoPortal);
+  assert.match(egoPortal.streamError ?? "", /屏幕录制/);
+
+  // MCP browser tool call short-circuits TCC retries and surfaces CDP fallback error cleanly
   mgr.browser.open = async () => {
     throw new Error("未安装 Chrome");
   };
   const startedAt = Date.now();
-  mgr.inspectToolCallForPortal(fakeAgent, "run_command", {
-    CommandLine: 'ego-browser nodejs -e "await page.goto(\\"http://127.0.0.1:8764/?edition=winter&t=0.1\\")"',
+  mgr.inspectToolCallForPortal(fakeAgent, "browser_navigate", {
+    url: "http://127.0.0.1:8764/?edition=winter&t=0.1",
   });
   for (let i = 0; i < 30 && !mgr.listPortals(fakeAgent.key).some((x) => x.kind === "browser"); i += 1) {
     await new Promise((r) => setTimeout(r, 20));
@@ -1375,36 +1433,44 @@ test("PortalManager.observeSubmittedCommand and pollWindowDeltas auto-surface fi
   await mgr.pollWindowDeltas();
   assert.equal(mgr.listPortals(fakeAgent.key).filter((p) => p.kind === "window").length, 0);
 
-  // 3) LaunchServices reparented window (ppid=1) appears -> auto-opens window portal
+  // 3) Unrelated newly opened OS windows (QQ / Chrome) do NOT auto-open portals, whereas explicit `open CLAU` matches Typora · CLAUDE.md
   mockWindows = [
     ...mockWindows,
+    { id: "9009", appName: "QQ", title: "视频播放器", pid: 779, bounds: { x: 40, y: 40, width: 640, height: 480 } },
     { id: "9001", appName: "Typora", title: "CLAUDE.md", pid: 777, bounds: { x: 20, y: 20, width: 900, height: 700 } },
   ];
   await mgr.pollWindowDeltas();
+  assert.equal(mgr.listPortals(fakeAgent.key).find((p) => p.windowId === "9009"), undefined, "unrelated QQ window must never open a portal");
   const win9001 = mgr.listPortals(fakeAgent.key).find((p) => p.windowId === "9001");
-  assert.ok(win9001, "expected new ppid=1 Typora window to auto-open");
+  assert.ok(win9001, "expected new ppid=1 Typora window matching `open CLAU` to auto-open");
 
-  // 4) Existing browser window retitles (?t=1 -> ?t=2) and Screen Recording fails -> opens with streamError populated
-  captureFail = true;
+  // 4) Unrequested browser retitles MUST NOT auto-open portals when no command launched them; once agent runs ego-browser and Screen Recording fails -> opens with streamError populated
   mockWindows = mockWindows.map((w) =>
     w.id === "9002" ? { ...w, title: "http://127.0.0.1:8764/?t=2" } : w,
   );
   await mgr.pollWindowDeltas();
+  assert.equal(mgr.listPortals(fakeAgent.key).find((p) => p.windowId === "9002"), undefined, "unrequested browser retitle must NOT auto-open");
+
+  captureFail = true;
+  mgr.observeSubmittedCommand(fakeAgent, 'ego-browser nodejs -e "await page.goto(\\"http://127.0.0.1:8764/?t=2\\")"', "agent_tool");
+  for (let i = 0; i < 25 && !mgr.listPortals(fakeAgent.key).some((p) => p.windowId === "9002"); i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
   const win9002 = mgr.listPortals(fakeAgent.key).find((p) => p.windowId === "9002");
-  assert.ok(win9002, "expected retitled ego lite window to surface");
+  assert.ok(win9002, "expected explicit ego-browser command to surface target ego lite window");
   assert.ok(win9002.streamError && win9002.streamError.length > 0, "expected TCC capture error to be surfaced as streamError");
   assert.ok(
     events.some((e) => e.kind === "portal_event" && e.action === "opened" && e.item.windowId === "9002"),
-    "expected opened portal_event for retitled window",
+    "expected opened portal_event for explicit ego-browser window",
   );
 
   // 5) Subsequent title updates on an already-open portal emit action="updated", never "opened".
   const evLenBeforeRetitle2 = events.length;
   mockWindows = mockWindows.map((w) =>
-    w.id === "9002" ? { ...w, title: "http://127.0.0.1:8764/?t=3" } : w,
+    w.id === "9001" ? { ...w, title: "CLAUDE.md - Edited" } : w,
   );
   await mgr.pollWindowDeltas();
-  const postEvents = events.slice(evLenBeforeRetitle2).filter((e) => e.kind === "portal_event" && e.item.windowId === "9002");
+  const postEvents = events.slice(evLenBeforeRetitle2).filter((e) => e.kind === "portal_event" && e.item.windowId === "9001");
   assert.ok(
     postEvents.some((e) => e.kind === "portal_event" && e.action === "updated"),
     "expected already-open retitled window to emit updated",
@@ -1414,6 +1480,161 @@ test("PortalManager.observeSubmittedCommand and pollWindowDeltas auto-surface fi
     false,
     "expected already-open retitled window NOT to re-emit opened",
   );
+});
+
+test("PortalManager binds ego-browser TaskSpaces strictly per-terminal, isolates personal user spaces, and syncs phase/handoff/close", async (t) => {
+  const state = mkdtempSync(join(tmpdir(), "hp-ego-space-"));
+  const binDir = join(state, "bin");
+  mkdirSync(binDir, { recursive: true });
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+
+  const agent1 = {
+    key: "h1/hc:t1",
+    deviceId: "h1",
+    source: "hc" as const,
+    localId: "t1",
+    harness: "claude-code",
+    where: "空间A",
+    cwd: state,
+    status: "working" as const,
+    isShell: false,
+    updatedAt: Date.now(),
+  };
+  const agent2 = {
+    ...agent1,
+    key: "h1/hc:t2",
+    localId: "t2",
+    status: "idle" as const,
+  };
+
+  let mockSpaces = [
+    {
+      id: 0,
+      name: "",
+      taskId: "",
+      createdBy: "user",
+      ownership: "user",
+      profileId: "Default",
+      profileName: "Xi",
+      recentTabTitles: ["问伊吹 · 伊吹工坊"],
+    },
+    {
+      id: 41,
+      name: "checkout-flow",
+      taskId: "checkout-flow",
+      createdBy: "agent",
+      ownership: "agent",
+      profileId: "Default",
+      profileName: "Xi",
+      recentTabTitles: ["结算台"],
+    },
+  ];
+  let mockWindows = [
+    { id: "screen:0", appName: "macOS 桌面", title: "主屏幕", isScreen: true },
+    { id: "win-user-0", appName: "ego lite", title: "问伊吹 · 伊吹工坊", pid: 900, bounds: { x: 0, y: 0, width: 1200, height: 800 } },
+  ];
+
+  const events: PortalStreamEvent[] = [];
+  const mgr = new PortalManager({
+    hostId: () => "h1",
+    getAgents: () => [agent1, agent2],
+    getTerminals: () =>
+      new Map([
+        ["t1", { address: "t1", cwd: state, pid: 500 }],
+        ["t2", { address: "t2", cwd: state, pid: 600 }],
+      ]),
+    getFilesOptions: () => ({ extraRoots: [state] }),
+    getDirectInfo: () => ({ port: null, addrs: [], connectedCount: 0 }),
+    hasRemoteViewers: () => true,
+    onPortalEvent: (ev) => events.push(ev),
+    queryEgoTaskSpaces: async () => mockSpaces,
+    stateDir: state,
+    captureDeps: {
+      platform: "darwin",
+      binDir,
+      hasCmd: (c) => c === "swiftc",
+      listProcesses: async () => [
+        { pid: 1, ppid: 0, name: "launchd" },
+        { pid: 500, ppid: 1, name: "zsh" },
+        { pid: 600, ppid: 1, name: "zsh" },
+        { pid: 900, ppid: 1, name: "ego lite" },
+      ],
+      execBin: async (cmd, args) => {
+        if (cmd === "swiftc") {
+          const outIdx = args.indexOf("-o");
+          if (outIdx >= 0 && args[outIdx + 1]) writeFileSync(args[outIdx + 1]!, "mock-bin");
+          return { code: 0, stderr: "", stdout: Buffer.alloc(0) };
+        }
+        if (args[0] === "list") return { code: 0, stderr: "", stdout: Buffer.from(JSON.stringify(mockWindows.slice(1))) };
+        if (args[0] === "capture") return { code: 0, stderr: "dims:1200x800\n", stdout: Buffer.from("ego-frame") };
+        return { code: 1, stderr: "", stdout: Buffer.alloc(0) };
+      },
+    },
+  });
+  t.after(() => mgr.stop());
+
+  await mgr.pollWindowDeltas();
+  // Unrelated QQ window appears -> neither terminal gets a portal
+  mockWindows = [
+    ...mockWindows,
+    { id: "win-qq", appName: "QQ", title: "视频播放器", pid: 888, bounds: { x: 20, y: 20, width: 600, height: 400 } },
+  ];
+  await mgr.pollWindowDeltas();
+  assert.equal(mgr.listPortals(agent1.key).length, 0);
+  assert.equal(mgr.listPortals(agent2.key).length, 0);
+
+  // Terminal 1 runs ego-browser creating/using TaskSpace "checkout-flow" BEFORE its OS window opens.
+  // Must show EG Space state WITHOUT capturing the user's personal Space #0 window ("问伊吹 · 伊吹工坊").
+  mgr.inspectToolCallForPortal(agent1, "run_command", {
+    CommandLine: `ego-browser nodejs <<'EOF'\nconst task = await taskSpace("checkout-flow");\nawait task.page("p1").goto("http://127.0.0.1:5173/checkout");\nEOF`,
+  });
+  for (let i = 0; i < 25 && mgr.listPortals(agent1.key).length === 0; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const p1Initial = mgr.listPortals(agent1.key)[0]!;
+  assert.ok(p1Initial, "expected EG Space portal on launching terminal 1");
+  assert.equal(p1Initial.agentKey, agent1.key);
+  assert.equal(p1Initial.windowId, undefined, "must never bind user Space #0 window as Agent Space window");
+  assert.equal(p1Initial.canInteract, false);
+  assert.equal(p1Initial.egoSpace?.spaceId, 41);
+  assert.equal(p1Initial.egoSpace?.spaceName, "checkout-flow");
+  assert.equal(p1Initial.egoSpace?.phase, "running");
+  assert.equal(p1Initial.egoSpace?.activeTabTitle, "结算台");
+  assert.equal(mgr.listPortals(agent2.key).length, 0, "sibling terminal 2 must stay completely isolated");
+
+  // Once the Agent Space #41 window appears, pollWindowDeltas attaches ONLY that window to terminal 1.
+  mockWindows = [
+    ...mockWindows,
+    { id: "win-agent-41", appName: "ego lite", title: "checkout-flow · 结算台", pid: 900, bounds: { x: 100, y: 60, width: 1200, height: 800 } },
+  ];
+  await mgr.pollWindowDeltas();
+  for (let i = 0; i < 20 && mgr.listPortals(agent1.key)[0]?.windowId !== "win-agent-41"; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const p1WithWin = mgr.listPortals(agent1.key)[0]!;
+  assert.equal(p1WithWin.windowId, "win-agent-41");
+  assert.equal(p1WithWin.canInteract, true);
+  assert.equal(mgr.listPortals(agent2.key).length, 0);
+
+  // HandOff transitions EG Space state to "handoff" ("等你接管").
+  mockSpaces = mockSpaces.map((s) => (s.id === 41 ? { ...s, ownership: "agentDelegatedToUser" } : s));
+  mgr.inspectToolCallForPortal(agent1, "run_command", {
+    CommandLine: 'ego-browser nodejs -e "const task = await taskSpace(41); await task.handOff();"',
+  });
+  for (let i = 0; i < 20 && mgr.listPortals(agent1.key)[0]?.egoSpace?.phase !== "handoff"; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(mgr.listPortals(agent1.key)[0]?.egoSpace?.phase, "handoff");
+
+  // finish({ keep: [] }) closes the Space portal cleanly.
+  mgr.inspectToolCallForPortal(agent1, "run_command", {
+    CommandLine: 'ego-browser nodejs -e "const task = await taskSpace(41); await task.finish({ keep: [] });"',
+  });
+  for (let i = 0; i < 20 && mgr.listPortals(agent1.key).length > 0; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.equal(mgr.listPortals(agent1.key).length, 0);
+  assert.ok(events.some((e) => e.kind === "portal_event" && e.action === "closed" && e.item.id === p1Initial.id));
 });
 
 test("OsCaptureDriver routes capture via v2 bridge and avoids 28ms 60fps cache frame drops", async (t) => {

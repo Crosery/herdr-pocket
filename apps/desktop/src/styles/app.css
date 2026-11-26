@@ -5835,10 +5835,10 @@ a {
   z-index: 44;
   width: 328px;
   height: 224px;
-  min-width: 240px;
-  min-height: 150px;
-  max-width: calc(100vw - 24px);
-  max-height: calc(100vh - 24px);
+  min-width: min(188px, calc(100% - 20px));
+  min-height: 120px;
+  max-width: calc(100% - 24px);
+  max-height: calc(100% - 24px);
   display: flex;
   flex-direction: column;
   background: transparent;
@@ -5853,18 +5853,43 @@ a {
 
 .session-portal-pip.is-collapsed {
   width: auto !important;
-  min-width: 240px;
-  max-width: min(370px, calc(100% - 28px));
+  min-width: 0;
+  max-width: min(370px, calc(100% - 24px));
   height: auto !important;
   min-height: 0;
 }
 
+.session-portal-pip.is-compact-pane {
+  right: 8px;
+  top: 10px;
+  max-width: calc(100% - 16px) !important;
+}
+
+.session-portal-pip.is-compact-pane .session-portal-pip-head {
+  padding: 5px 6px;
+  gap: 4px;
+}
+
+.session-portal-pip.is-compact-pane .session-portal-pip-btn {
+  width: 18px;
+  height: 18px;
+}
+
+.session-portal-pip.is-compact-pane.is-collapsed .session-portal-card-num,
+.session-portal-pip.is-compact-pane.is-collapsed .session-portal-pip-expand-btn {
+  display: none;
+}
+
+.session-portal-pip.is-compact-pane.is-collapsed .session-portal-pip-title {
+  display: none;
+}
+
 .session-portal-pip.is-tile {
   width: auto;
-  min-width: 260px;
-  max-width: calc(100% - 28px);
+  min-width: 210px;
+  max-width: calc(100% - 24px);
   height: auto;
-  max-height: calc(100% - 28px);
+  max-height: calc(100% - 24px);
   gap: 8px;
   overflow-y: auto;
   overflow-x: visible;
@@ -5873,8 +5898,9 @@ a {
 
 .session-portal-pip.is-cascade {
   width: 316px;
+  max-width: calc(100% - 24px);
   height: auto;
-  max-height: calc(100% - 28px);
+  max-height: calc(100% - 24px);
   gap: 8px;
   overflow-y: auto;
   overflow-x: visible;
@@ -6098,8 +6124,9 @@ a {
   gap: 10px;
 }
 
-.session-portal-tile-grid.is-single {
-  grid-template-columns: minmax(260px, 316px);
+.session-portal-tile-grid.is-single,
+.session-portal-tile-grid.is-narrow {
+  grid-template-columns: minmax(180px, 1fr);
 }
 
 .session-portal-tile-item {
@@ -6174,7 +6201,8 @@ a {
 }
 
 .session-portal-cascade-item {
-  width: 312px;
+  width: 100%;
+  max-width: 312px;
   height: 184px;
   flex: none;
 }
@@ -6249,6 +6277,91 @@ a {
   background: var(--accent-soft);
   color: var(--accent-text);
   flex: none;
+}
+
+.session-portal-ego-phase {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line-pink);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  white-space: nowrap;
+  flex: none;
+}
+
+.session-portal-ego-phase.is-handoff {
+  background: color-mix(in srgb, var(--amber, #f59e0b) 16%, var(--surface));
+  border-color: color-mix(in srgb, var(--amber, #f59e0b) 44%, transparent);
+  color: var(--amber, #b45309);
+}
+
+.session-portal-ego-phase.is-user {
+  background: color-mix(in srgb, var(--green, #22c55e) 14%, var(--surface));
+  border-color: color-mix(in srgb, var(--green, #22c55e) 40%, transparent);
+  color: var(--green, #15803d);
+}
+
+.session-portal-ego-phase.is-idle {
+  background: var(--surface-2);
+  border-color: var(--divider);
+  color: var(--muted);
+}
+
+.session-portal-ego-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  background: color-mix(in srgb, var(--accent-soft) 45%, var(--surface));
+  border-bottom: 1px solid var(--divider);
+  min-width: 0;
+  flex: none;
+}
+
+.session-portal-ego-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.session-portal-ego-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 5px;
+  border: 1px solid var(--divider);
+  background: var(--surface);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.session-portal-ego-meta {
+  font-size: calc(11px * var(--ts, 1));
+  color: var(--ink);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.session-portal-ego-card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.session-portal-ego-action {
+  font-size: calc(11px * var(--ts, 1));
+  font-weight: 600;
+  color: var(--accent-text);
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line-pink);
+  background: var(--accent-soft);
+  max-width: 100%;
 }
 
 .session-portal-pip-nav {

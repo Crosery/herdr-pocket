@@ -38,11 +38,27 @@ const MOBILE_MODS: Array<{ id: string; label: string }> = [
   { id: "shift", label: "Shift" },
 ];
 
-function kindIcon(kind: PortalItem["kind"]): "web" | "monitor" | "folder-open-outline" | "file-document-outline" {
-  if (kind === "browser") return "web";
-  if (kind === "window") return "monitor";
-  if (kind === "reveal") return "folder-open-outline";
+function portalItemIcon(item: Pick<PortalItem, "kind" | "egoSpace">): "compass-outline" | "web" | "monitor" | "folder-open-outline" | "file-document-outline" {
+  if (item.egoSpace) return "compass-outline";
+  if (item.kind === "browser") return "web";
+  if (item.kind === "window") return "monitor";
+  if (item.kind === "reveal") return "folder-open-outline";
   return "file-document-outline";
+}
+
+function egoPhaseText(phase?: string): string {
+  switch (phase) {
+    case "handoff":
+      return "等你接管";
+    case "user":
+      return "已移交";
+    case "finished":
+      return "已完成";
+    case "idle":
+      return "空间就绪";
+    default:
+      return "AI 操作中";
+  }
 }
 
 function computeContainedBox(boxW: number, boxH: number, imgW?: number, imgH?: number): {
@@ -152,6 +168,7 @@ export function useAgentPortals(hostId: string, agentKey: string, hostVersion?: 
       const ev = raw as Partial<PortalStreamEvent>;
       if (ev?.kind !== "portal_event" || !ev.item) return;
       const item = ev.item;
+      if (agentKey && item.agentKey !== agentKey) return;
       setItems((prev) => {
         if (ev.action === "closed") return prev.filter((x) => x.id !== item.id);
         const idx = prev.findIndex((x) => x.id === item.id);
@@ -200,14 +217,27 @@ export function MobilePortalBanner({
             borderColor: p.divider,
           })}
         >
-          <MaterialCommunityIcons name={top ? kindIcon(top.kind) : "monitor"} size={14} color={p.accentText} />
+          <MaterialCommunityIcons name={top ? portalItemIcon(top) : "monitor"} size={14} color={p.accentText} />
           <Text style={{ fontSize: 12, fontFamily: fonts.bodyBold, color: p.accentText }}>
-            {top ? `回传窗口 · ${items.length}` : "回传窗口"}
+            {top
+              ? top.egoSpace
+                ? `EG · ${egoPhaseText(top.egoSpace.phase)}`
+                : `回传窗口 · ${items.length}`
+              : "回传窗口"}
           </Text>
         </Pressable>
       </View>
     );
   }
+  const egoBannerSummary = top.egoSpace
+    ? [
+        egoPhaseText(top.egoSpace.phase),
+        top.egoSpace.spaceId !== undefined ? `#${top.egoSpace.spaceId}` : undefined,
+        top.egoSpace.activeTabTitle || top.egoSpace.lastAction,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
   return (
     <Pressable
       accessibilityRole="button"
@@ -228,14 +258,14 @@ export function MobilePortalBanner({
         gap: space.sm,
       })}
     >
-      <MaterialCommunityIcons name={kindIcon(top.kind)} size={18} color={p.accentText} />
+      <MaterialCommunityIcons name={portalItemIcon(top)} size={18} color={p.accentText} />
       <View style={{ flex: 1, minWidth: 0 }}>
         <Text numberOfLines={1} style={{ fontFamily: fonts.bodyBold, fontSize: 13.5, color: p.ink }}>
           {top.title}
         </Text>
         <Text numberOfLines={1} style={{ fontSize: 11.5, color: p.muted }}>
           {items.length > 1 ? `${items.length} 个回传会话 · ` : ""}
-          {transport.label} · 点击展开操作
+          {top.egoSpace ? egoBannerSummary : `${transport.label} · 点击展开操作`}
         </Text>
       </View>
       <MaterialCommunityIcons name="chevron-right" size={18} color={p.accentText} />
@@ -782,7 +812,15 @@ export function MobilePortalModal({
             >
               <Text numberOfLines={1} style={{ fontSize: 12, color: transport.isDirect ? p.accentText : p.muted }}>
                 {active
-                  ? `${transport.label}${streamMetricsText}${effectiveRtt !== null ? ` · ${effectiveRtt}ms` : ""}${!transport.isDirect ? " · 点此重连 P2P" : ""}`
+                  ? active.egoSpace
+                    ? `${[
+                        egoPhaseText(active.egoSpace.phase),
+                        active.egoSpace.spaceId !== undefined ? `#${active.egoSpace.spaceId}` : undefined,
+                        active.egoSpace.activeTabTitle || active.egoSpace.lastAction,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}${active.canInteract ? ` · ${transport.label}${streamMetricsText}` : " · 仅同步 EG 空间状态"}`
+                    : `${transport.label}${streamMetricsText}${effectiveRtt !== null ? ` · ${effectiveRtt}ms` : ""}${!transport.isDirect ? " · 点此重连 P2P" : ""}`
                   : "投屏 remote 浏览器 / 桌面窗口 / 文件"}
               </Text>
             </Pressable>
@@ -833,7 +871,7 @@ export function MobilePortalModal({
                       borderColor: sel ? p.primary : p.divider,
                     }}
                   >
-                    <MaterialCommunityIcons name={kindIcon(it.kind)} size={14} color={sel ? p.onPrimary : p.accentText} />
+                    <MaterialCommunityIcons name={portalItemIcon(it)} size={14} color={sel ? p.onPrimary : p.accentText} />
                     <Text numberOfLines={1} style={{ maxWidth: 140, fontSize: 12.5, fontFamily: fonts.bodyBold, color: sel ? p.onPrimary : p.ink }}>
                       {it.title}
                     </Text>
@@ -1067,6 +1105,16 @@ export function MobilePortalModal({
                     <PocketButton size="sm" variant="soft" icon="refresh" onPress={() => void fetchFrameOnce()}>
                       重试捕获
                     </PocketButton>
+                  </View>
+                ) : active.egoSpace && !active.windowId ? (
+                  <View style={{ alignItems: "center", gap: space.xs, paddingHorizontal: space.lg }}>
+                    <MaterialCommunityIcons name="compass-outline" size={26} color={p.accentText} />
+                    <Text style={{ color: p.ink, fontSize: 13.5, fontFamily: fonts.bodyBold, textAlign: "center" }}>
+                      {`EG 空间「${active.egoSpace.spaceName}」· ${egoPhaseText(active.egoSpace.phase)}`}
+                    </Text>
+                    <Text style={{ color: p.muted, fontSize: 12, textAlign: "center" }}>
+                      {[active.egoSpace.activeTabTitle, active.egoSpace.lastAction].filter(Boolean).join(" · ") || "当前仅同步 EG 空间状态"}
+                    </Text>
                   </View>
                 ) : (
                   <View style={{ alignItems: "center", gap: space.sm }}>

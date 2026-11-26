@@ -3,6 +3,7 @@ import {
   AppWindow,
   ChevronDown,
   ChevronUp,
+  Compass,
   ExternalLink,
   FileCode2,
   FolderSearch,
@@ -14,7 +15,7 @@ import {
   Rows3,
   X,
 } from "lucide-react";
-import type { Agent, PortalDisplayMode, PortalItem } from "@herdr-pocket/protocol";
+import type { Agent, EgoSpacePhase, PortalItem } from "@herdr-pocket/protocol";
 import { detectPlatform, isTauri } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { native } from "../lib/native";
@@ -37,11 +38,11 @@ import { PocketButton } from "./PocketUI";
 
 type ResizeDir = "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
 
-const PIP_MIN_W = 240;
+const PIP_MIN_W = 188;
 const PIP_MAX_W = 880;
-const PIP_MIN_H = 150;
+const PIP_MIN_H = 144;
 const PIP_MAX_H = 680;
-const PIP_MARGIN = 14;
+const PIP_MARGIN = 10;
 const PIP_DEFAULT_W = 328;
 const PIP_DEFAULT_H = 224;
 const PIP_BITMAP_CACHE_MAX = 8;
@@ -56,18 +57,22 @@ interface PipBox {
   h: number;
 }
 
-function clampPipSize(w: number, h: number): { w: number; h: number } {
-  const maxW = typeof window !== "undefined" ? Math.min(PIP_MAX_W, Math.max(PIP_MIN_W, window.innerWidth - PIP_MARGIN * 2)) : PIP_MAX_W;
-  const maxH = typeof window !== "undefined" ? Math.min(PIP_MAX_H, Math.max(PIP_MIN_H, window.innerHeight - PIP_MARGIN * 2)) : PIP_MAX_H;
+function clampPipSize(w: number, h: number, parentW?: number, parentH?: number): { w: number; h: number } {
+  const boundW = parentW && parentW > 0 ? parentW : typeof window !== "undefined" ? window.innerWidth : PIP_MAX_W;
+  const boundH = parentH && parentH > 0 ? parentH : typeof window !== "undefined" ? window.innerHeight : PIP_MAX_H;
+  const minW = Math.min(PIP_MIN_W, Math.max(116, boundW - PIP_MARGIN * 2));
+  const minH = Math.min(PIP_MIN_H, Math.max(100, boundH - PIP_MARGIN * 2));
+  const maxW = Math.min(PIP_MAX_W, Math.max(minW, boundW - PIP_MARGIN * 2));
+  const maxH = Math.min(PIP_MAX_H, Math.max(minH, boundH - PIP_MARGIN * 2));
   return {
-    w: Math.round(Math.max(PIP_MIN_W, Math.min(maxW, w))),
-    h: Math.round(Math.max(PIP_MIN_H, Math.min(maxH, h))),
+    w: Math.round(Math.max(minW, Math.min(maxW, w))),
+    h: Math.round(Math.max(minH, Math.min(maxH, h))),
   };
 }
 
-function clampPipPos(x: number, y: number, w: number, h: number): { x: number; y: number } {
-  const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
-  const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+function clampPipPos(x: number, y: number, w: number, h: number, parentW?: number, parentH?: number): { x: number; y: number } {
+  const vw = parentW && parentW > 0 ? parentW : typeof window !== "undefined" ? window.innerWidth : 1200;
+  const vh = parentH && parentH > 0 ? parentH : typeof window !== "undefined" ? window.innerHeight : 800;
   const maxX = Math.max(PIP_MARGIN, vw - w - PIP_MARGIN);
   const maxY = Math.max(PIP_MARGIN, vh - h - PIP_MARGIN);
   return {
@@ -76,8 +81,24 @@ function clampPipPos(x: number, y: number, w: number, h: number): { x: number; y
   };
 }
 
-function portalIcon(kind: PortalItem["kind"]) {
-  switch (kind) {
+function egoPhaseMeta(phase: EgoSpacePhase): { label: string; cls: string } {
+  switch (phase) {
+    case "handoff":
+      return { label: "等你接管", cls: "is-handoff" };
+    case "user":
+      return { label: "已移交", cls: "is-user" };
+    case "finished":
+      return { label: "已完成", cls: "is-idle" };
+    case "idle":
+      return { label: "空间就绪", cls: "is-idle" };
+    default:
+      return { label: "AI 操作中", cls: "is-running" };
+  }
+}
+
+function portalIcon(item: Pick<PortalItem, "kind" | "egoSpace">) {
+  if (item.egoSpace) return <Compass size={13} />;
+  switch (item.kind) {
     case "browser":
       return <Globe size={13} />;
     case "window":
@@ -196,7 +217,7 @@ function PortalMiniCard({
       return;
     }
     return subscribePortalFrames(item.hostId, item.id, { fps, maxWidth, quality });
-  }, [bitmapCacheRef, collapsed, fps, item.canInteract, item.hostId, item.id, maxWidth, quality, visible]);
+  }, [bitmapCacheRef, collapsed, fps, item.canInteract, item.hostId, item.id, item.windowId, maxWidth, quality, visible]);
 
   useEffect(() => {
     if (!visible || collapsed) return;
@@ -471,6 +492,11 @@ function PortalMiniCard({
   const canDirectControl = Boolean(allowDirectControlToggle && directControl && hasStreamFrame && !item.streamError && !needsMacScreenPerm);
   const transport = resolvePortalTransport(item.hostId, localHostId, frame);
   const p2pLabel = pipFps >= 2 && !heartbeat?.idle ? `${transport.label} · ${pipFps}fps` : transport.label;
+  const egoSpace = item.egoSpace;
+  const egoPhase = egoSpace ? egoPhaseMeta(egoSpace.phase) : null;
+  const egoSummaryText = egoSpace
+    ? [egoSpace.activeTabTitle, egoSpace.lastAction].filter(Boolean).join(" · ") || item.url || "EG 浏览器空间"
+    : "";
 
   const clientToPipNormalized = (clientX: number, clientY: number) => {
     const el = previewRef.current;
@@ -554,10 +580,13 @@ function PortalMiniCard({
         }}
       >
         {cardNumber !== undefined ? <span className="session-portal-card-num">{cardNumber}</span> : null}
-        <span className="session-portal-pip-ic">{portalIcon(item.kind)}</span>
+        <span className="session-portal-pip-ic">{portalIcon(item)}</span>
         <span className="session-portal-pip-title truncate" title={item.title}>
-          {item.title}
+          {egoSpace ? egoSpace.spaceName : item.title}
         </span>
+        {egoPhase ? (
+          <span className={`session-portal-ego-phase ${egoPhase.cls}`}>{egoPhase.label}</span>
+        ) : null}
         {collapsed && stackCount > 1 ? (
           <button
             type="button"
@@ -570,9 +599,9 @@ function PortalMiniCard({
           >
             共 {stackCount} 个
           </button>
-        ) : (
+        ) : !egoPhase || hasStreamFrame ? (
           <span className="session-portal-pip-badge">{p2pLabel}</span>
-        )}
+        ) : null}
         {collapsed && stackCount > 1 && onQuickLayout ? (
           <button
             type="button"
@@ -632,7 +661,7 @@ function PortalMiniCard({
         ) : null}
         <button
           type="button"
-          className="session-portal-pip-btn"
+          className="session-portal-pip-btn session-portal-pip-expand-btn"
           title="放大进入交互操作"
           aria-label="放大进入交互操作"
           onClick={(e) => {
@@ -655,6 +684,27 @@ function PortalMiniCard({
           <X size={13} />
         </button>
       </div>
+
+      {!collapsed && egoSpace ? (
+        <div className="session-portal-ego-strip">
+          {(egoSpace.spaceId !== undefined || egoSpace.pageLabel || (egoSpace.tabCount ?? 0) > 1) ? (
+            <span className="session-portal-ego-tags">
+              {egoSpace.spaceId !== undefined ? (
+                <span className="session-portal-ego-tag mono">#{egoSpace.spaceId}</span>
+              ) : null}
+              {egoSpace.pageLabel ? (
+                <span className="session-portal-ego-tag mono">{egoSpace.pageLabel}</span>
+              ) : null}
+              {egoSpace.tabCount && egoSpace.tabCount > 1 ? (
+                <span className="session-portal-ego-tag">{egoSpace.tabCount} 标签</span>
+              ) : null}
+            </span>
+          ) : null}
+          <span className="session-portal-ego-meta truncate" title={egoSummaryText}>
+            {egoSummaryText}
+          </span>
+        </div>
+      ) : null}
 
       {!collapsed ? (
         <div
@@ -792,27 +842,43 @@ function PortalMiniCard({
           ) : (
             <div className={`session-portal-pip-card${needsMacScreenPerm ? " is-perm" : ""}`}>
               <div className="session-portal-pip-kind">
-                {portalIcon(item.kind)}
+                {portalIcon(item)}
                 <span>
                   {item.streamError
                     ? "画面捕获受限"
-                    : item.kind === "browser"
-                      ? "远程浏览器画面"
-                      : item.kind === "window"
-                        ? "远程桌面窗口"
-                        : item.kind === "reveal"
-                          ? "已定位到远程目录"
-                          : item.kind === "html"
-                            ? "P2P HTML 应用预览"
-                            : "P2P 跨端文件预览"}
+                    : egoSpace
+                      ? "EG 浏览器空间状态"
+                      : item.kind === "browser"
+                        ? "远程浏览器画面"
+                        : item.kind === "window"
+                          ? "远程桌面窗口"
+                          : item.kind === "reveal"
+                            ? "已定位到远程目录"
+                            : item.kind === "html"
+                              ? "P2P HTML 应用预览"
+                              : "P2P 跨端文件预览"}
                 </span>
               </div>
               <div
                 className={`session-portal-pip-sub${item.streamError ? " is-err" : " mono truncate"}`}
                 title={item.streamError || item.subtitle || item.url || item.targetPath || item.title}
               >
-                {item.streamError || item.highlightName || item.subtitle || item.url || item.targetPath || item.title}
+                {item.streamError
+                  ? item.streamError
+                  : egoSpace
+                    ? egoSpace.activeTabTitle || item.url || egoSpace.spaceName
+                    : item.highlightName || item.subtitle || item.url || item.targetPath || item.title}
               </div>
+              {egoSpace && !item.streamError ? (
+                <div className="session-portal-ego-card-row">
+                  {egoSpace.lastAction ? (
+                    <span className="session-portal-ego-action truncate">{egoSpace.lastAction}</span>
+                  ) : null}
+                  {egoSpace.profileName ? (
+                    <span className="session-portal-ego-tag">{egoSpace.profileName}</span>
+                  ) : null}
+                </div>
+              ) : null}
               {activeText && !item.streamError ? (
                 <pre className="session-portal-pip-text mono">{activeText.text}</pre>
               ) : null}
@@ -846,7 +912,11 @@ function PortalMiniCard({
             </button>
           ) : (
             <span className="session-portal-pip-overlay">
-              {inDeckBack ? "点击置顶查看 · 双击放大" : "点击放大并交互操作"}
+              {inDeckBack
+                ? "点击置顶查看 · 双击放大"
+                : egoSpace && !item.canInteract
+                  ? "点击查看空间详情"
+                  : "点击放大并交互操作"}
             </span>
           )}
         </div>
@@ -859,7 +929,6 @@ export function SessionPortalPiP({
   agent,
   hostIds,
   agentKeys,
-  workspaceWide = false,
   visible = true,
   mode = "chat",
   onExpandPortal,
@@ -867,7 +936,6 @@ export function SessionPortalPiP({
   agent?: Agent | null;
   hostIds?: string[];
   agentKeys?: string[];
-  workspaceWide?: boolean;
   visible?: boolean;
   mode?: "chat" | "term";
   onExpandPortal: (portalId: string, hostId: string) => void;
@@ -905,18 +973,12 @@ export function SessionPortalPiP({
 
   const items = useMemo(() => {
     if (effectiveHostIds.length === 0) return [];
-    const hostSet = new Set(effectiveHostIds);
     const sortStable = (arr: PortalItem[]) =>
       arr.sort(
         (a, b) =>
           (openedAtById[b.id] ?? b.updatedAt) - (openedAtById[a.id] ?? a.updatedAt) ||
           a.id.localeCompare(b.id),
       );
-
-    if (workspaceWide) {
-      const list = Object.values(itemsById).filter((it) => hostSet.has(it.hostId) && !dismissedIds[it.id]);
-      return sortStable(list);
-    }
 
     if (effectiveHostIds.length === 1 && effectiveAgentKeys.length <= 1 && agent) {
       return filterVisiblePortalItems({
@@ -930,11 +992,10 @@ export function SessionPortalPiP({
       });
     }
 
-    const keySet = new Set(effectiveAgentKeys);
+    if (effectiveAgentKeys.length === 0) return [];
     const matched = new Map<string, PortalItem>();
-    const keysToScan = effectiveAgentKeys.length > 0 ? effectiveAgentKeys : [agent?.key ?? ""];
     for (const hid of effectiveHostIds) {
-      for (const aKey of keysToScan) {
+      for (const aKey of effectiveAgentKeys) {
         for (const it of filterVisiblePortalItems({
           itemsById,
           dismissedIds,
@@ -948,14 +1009,8 @@ export function SessionPortalPiP({
         }
       }
     }
-    for (const it of Object.values(itemsById)) {
-      if (!hostSet.has(it.hostId) || dismissedIds[it.id]) continue;
-      if (!it.agentKey || keySet.size === 0 || keySet.has(it.agentKey)) {
-        matched.set(it.id, it);
-      }
-    }
     return sortStable([...matched.values()]);
-  }, [agent, dismissedIds, effectiveAgentKeys, effectiveHostIds, isTauriApp, itemsById, localHostId, manualIds, openedAtById, workspaceWide]);
+  }, [agent, dismissedIds, effectiveAgentKeys, effectiveHostIds, isTauriApp, itemsById, localHostId, manualIds, openedAtById]);
 
   const preferredMode = settingsStore.use((s) => s.portalDisplayMode);
   const initialLayout: "fan" | "tile" | "cascade" = preferredMode === "collapsed" ? "fan" : preferredMode;
@@ -965,6 +1020,7 @@ export function SessionPortalPiP({
   const [stackLayout, setStackLayout] = useState<"fan" | "tile" | "cascade">(initialLayout);
   const [collapsed, setCollapsed] = useState<boolean>(preferredMode === "collapsed");
   const [box, setBox] = useState<PipBox>({ x: null, y: null, w: PIP_DEFAULT_W, h: PIP_DEFAULT_H });
+  const [parentDims, setParentDims] = useState<{ w: number; h: number } | null>(null);
   const [gesture, setGesture] = useState<"idle" | "drag" | "resize">("idle");
   const rootRef = useRef<HTMLDivElement | null>(null);
   const bitmapCacheRef = useRef<Map<string, ImageBitmap | HTMLImageElement>>(new Map());
@@ -1067,20 +1123,33 @@ export function SessionPortalPiP({
     };
   }, []);
 
+  const hasRenderedStage = visible && items.length > 0;
   useEffect(() => {
-    const onResize = () => {
+    if (!hasRenderedStage) return;
+    const syncToParent = () => {
+      const parent = rootRef.current?.offsetParent as HTMLElement | null;
+      const pw = parent?.clientWidth;
+      const ph = parent?.clientHeight;
+      if (pw && ph) {
+        setParentDims((prev) => (prev && prev.w === pw && prev.h === ph ? prev : { w: pw, h: ph }));
+      }
       setBox((prev) => {
-        const sz = clampPipSize(prev.w, prev.h);
-        if (prev.x === null || prev.y === null) {
-          return sz.w === prev.w && sz.h === prev.h ? prev : { ...prev, ...sz };
-        }
-        const pos = clampPipPos(prev.x, prev.y, sz.w, collapsed ? 44 : sz.h);
-        return { ...sz, ...pos };
+        if (prev.x === null || prev.y === null) return prev;
+        const sz = clampPipSize(prev.w, prev.h, pw, ph);
+        const pos = clampPipPos(prev.x, prev.y, sz.w, collapsed ? 44 : sz.h, pw, ph);
+        return pos.x === prev.x && pos.y === prev.y ? prev : { ...prev, ...pos };
       });
     };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [collapsed]);
+    syncToParent();
+    const parent = rootRef.current?.offsetParent as HTMLElement | null;
+    const ro = typeof ResizeObserver !== "undefined" && parent ? new ResizeObserver(syncToParent) : null;
+    if (ro && parent) ro.observe(parent);
+    window.addEventListener("resize", syncToParent);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener("resize", syncToParent);
+    };
+  }, [collapsed, hasRenderedStage]);
 
   const current = useMemo(
     () => (selectedId ? items.find((i) => i.id === selectedId) : undefined) ?? items[0],
@@ -1134,11 +1203,12 @@ export function SessionPortalPiP({
     if (el && parent) {
       const r = el.getBoundingClientRect();
       const pr = parent.getBoundingClientRect();
+      const sz = clampPipSize(box.w, box.h, parent.clientWidth, parent.clientHeight);
       return {
         x: box.x ?? Math.round(r.left - pr.left),
         y: box.y ?? Math.round(r.top - pr.top),
-        w: box.w,
-        h: box.h,
+        w: sz.w,
+        h: sz.h,
         parentW: parent.clientWidth,
         parentH: parent.clientHeight,
       };
@@ -1225,7 +1295,7 @@ export function SessionPortalPiP({
         nextH = orig.h - dy;
         nextY = origBottom - Math.max(PIP_MIN_H, Math.min(PIP_MAX_H, nextH));
       }
-      const clampedSz = clampPipSize(nextW, nextH);
+      const clampedSz = clampPipSize(nextW, nextH, orig.parentW, orig.parentH);
       if (dir.includes("w")) nextX = origRight - clampedSz.w;
       if (dir.includes("n")) nextY = origBottom - clampedSz.h;
       const maxX = Math.max(PIP_MARGIN, orig.parentW - clampedSz.w - PIP_MARGIN);
@@ -1248,10 +1318,14 @@ export function SessionPortalPiP({
     window.addEventListener("pointercancel", finish);
   };
 
+  const effectiveSz = parentDims ? clampPipSize(box.w, box.h, parentDims.w, parentDims.h) : { w: box.w, h: box.h };
   const fanPadY = backItems.length * PIP_FAN_STEP_Y;
   const fanPadX = backItems.length * PIP_FAN_STEP_X;
-  const fanPeekExpandY = Math.min(128, Math.max(84, Math.round(box.h * 0.56)));
-  const sizeClamp: React.CSSProperties = { maxWidth: "calc(100% - 28px)", maxHeight: "calc(100% - 28px)" };
+  const fanPeekExpandY = Math.min(128, Math.max(84, Math.round(effectiveSz.h * 0.56)));
+  const isNarrowPane = Boolean(parentDims && parentDims.w < 430);
+  const isCompactPane = Boolean(parentDims && parentDims.w < 240);
+  const compactCls = isCompactPane ? " is-compact-pane" : "";
+  const sizeClamp: React.CSSProperties = { maxWidth: "calc(100% - 20px)", maxHeight: "calc(100% - 20px)" };
   const outerExtraH = (!collapsed && isMulti ? 40 : 0) + fanPadY;
   const posStyle: React.CSSProperties =
     isCascade || isTile
@@ -1263,11 +1337,11 @@ export function SessionPortalPiP({
             right: "auto",
             bottom: "auto",
             ...sizeClamp,
-            ...(collapsed ? {} : { width: box.w + fanPadX, height: box.h + outerExtraH }),
+            ...(collapsed ? {} : { width: effectiveSz.w + fanPadX, height: effectiveSz.h + outerExtraH }),
           }
         : collapsed
           ? sizeClamp
-          : { width: box.w + fanPadX, height: box.h + outerExtraH, ...sizeClamp };
+          : { width: effectiveSz.w + fanPadX, height: effectiveSz.h + outerExtraH, ...sizeClamp };
 
   const dirs: ResizeDir[] = ["n", "s", "e", "w", "nw", "ne", "sw", "se"];
 
@@ -1353,7 +1427,7 @@ export function SessionPortalPiP({
                   }}
                 >
                   <span className="session-portal-card-num is-mini">{idx + 1}</span>
-                  <span className="session-portal-stack-pill-ic">{portalIcon(it.kind)}</span>
+                  <span className="session-portal-stack-pill-ic">{portalIcon(it)}</span>
                   <span className="truncate">{it.title}</span>
                 </button>
                 <button
@@ -1381,7 +1455,7 @@ export function SessionPortalPiP({
     return (
       <div
         ref={rootRef}
-        className={`session-portal-pip is-tile${mode === "term" ? " in-term" : ""}`}
+        className={`session-portal-pip is-tile${mode === "term" ? " in-term" : ""}${compactCls}`}
         style={posStyle}
         role="region"
         aria-label={`跨端多窗口平铺 · 共 ${items.length} 个`}
@@ -1410,7 +1484,7 @@ export function SessionPortalPiP({
           </div>
         </div>
         {items.length > 4 ? renderStackBar("tile", false) : null}
-        <div className={`session-portal-tile-grid${tileCards.length === 1 ? " is-single" : ""}`}>
+        <div className={`session-portal-tile-grid${tileCards.length === 1 ? " is-single" : ""}${isNarrowPane ? " is-narrow" : ""}`}>
           {tileCards.map((it) => {
             const active = it.id === current.id;
             return (
@@ -1441,7 +1515,7 @@ export function SessionPortalPiP({
     return (
       <div
         ref={rootRef}
-        className={`session-portal-pip is-cascade${mode === "term" ? " in-term" : ""}`}
+        className={`session-portal-pip is-cascade${mode === "term" ? " in-term" : ""}${compactCls}`}
         style={posStyle}
         role="region"
         aria-label={`跨端多窗口叠列 · 共 ${items.length} 个`}
@@ -1500,7 +1574,7 @@ export function SessionPortalPiP({
   return (
     <div
       ref={rootRef}
-      className={`session-portal-pip${mode === "term" ? " in-term" : ""}${collapsed ? " is-collapsed" : ""}${isMulti ? " has-multi" : ""}${gesture === "drag" ? " is-dragging" : ""}${gesture === "resize" ? " is-resizing" : ""}`}
+      className={`session-portal-pip${mode === "term" ? " in-term" : ""}${collapsed ? " is-collapsed" : ""}${isMulti ? " has-multi" : ""}${compactCls}${gesture === "drag" ? " is-dragging" : ""}${gesture === "resize" ? " is-resizing" : ""}`}
       style={posStyle}
       role="region"
       aria-label={`跨端回传浮窗 · ${current.title}`}

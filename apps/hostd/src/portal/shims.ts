@@ -39,7 +39,40 @@ export type AutoPortalIntent =
       appHint: string;
       label: string;
       url?: string;
+    }
+  | {
+      type: "ego_space";
+      serverName?: string;
+      spaceId?: number;
+      spaceName?: string;
+      pageLabel?: string;
+      url?: string;
+      action?: string;
+      handoff?: boolean;
+      finish?: { closeSpace: boolean };
     };
+
+export interface EgoScreenSnapshot {
+  pageLabel?: string;
+  pageTitle?: string;
+  spaceName?: string;
+  spaceId?: number;
+}
+
+/** Parses `ego-browser` terminal snapshot headers (`[p1 "Title" | space "Name"]`) and printed `taskSpaceId`. */
+export function parseEgoScreenSnapshot(screenText: string): EgoScreenSnapshot | null {
+  if (!screenText) return null;
+  const header = /\[(p\d+)\s+"([^"\r\n]{0,120})"\s+\|\s+space\s+"([^"\r\n]{1,80})"/.exec(screenText);
+  const idMatch = /\btaskSpaceId["']?\s*:\s*(\d+)/.exec(screenText);
+  if (!header && !idMatch) return null;
+  const parsedId = idMatch?.[1] !== undefined ? Number(idMatch[1]) : undefined;
+  return {
+    ...(header?.[1] ? { pageLabel: header[1] } : {}),
+    ...(header?.[2] ? { pageTitle: header[2].trim() } : {}),
+    ...(header?.[3] ? { spaceName: header[3].trim() } : {}),
+    ...(parsedId !== undefined && Number.isFinite(parsedId) ? { spaceId: parsedId } : {}),
+  };
+}
 
 export function classifyTarget(rawTarget: string, opts: { reveal?: boolean; isDir?: boolean; cwd?: string } = {}): ParsedOpenInvocation {
   let target = rawTarget.trim().replace(/^["']|["']$/g, "");
@@ -454,6 +487,95 @@ function expandTildePath(raw: string): string {
   return raw;
 }
 
+function formatShortUrlAction(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    const tail = `${u.host}${u.pathname === "/" ? "" : u.pathname}`;
+    return tail.length > 42 ? `访问 ${tail.slice(0, 41)}…` : `访问 ${tail}`;
+  } catch {
+    return rawUrl.length > 42 ? `访问 ${rawUrl.slice(0, 41)}…` : `访问 ${rawUrl}`;
+  }
+}
+
+function parseEgoBrowserIntent(rest: string[], heredocBody: string): Extract<AutoPortalIntent, { type: "ego_space" }> | null {
+  let serverName: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < rest.length; i += 1) {
+    const tok = rest[i]!;
+    if (tok === "--help" || tok === "-h" || tok === "--version" || tok === "-v") return null;
+    if (tok.startsWith("--ego-server-name=")) {
+      serverName = tok.slice("--ego-server-name=".length).trim() || undefined;
+      continue;
+    }
+    if (tok === "--ego-server-name") {
+      serverName = rest[i + 1]?.trim() || undefined;
+      i += 1;
+      continue;
+    }
+    if (!tok.startsWith("-")) positional.push(tok);
+  }
+  const sub = positional[0]?.toLowerCase();
+  if (sub && (sub === "skill" || sub === "help" || sub === "upgrade" || sub === "import")) {
+    return null;
+  }
+
+  const scanText = `${rest.join(" ")}\n${heredocBody}`;
+  const isReadOnlyProbe =
+    /\b(?:listTaskSpaces|profiles|help)\s*\(/.test(scanText) &&
+    !/\b(?:taskSpace|claimTaskSpace|takeOverTaskSpace)\s*\(|\.(?:goto|click|dblclick|hover|dragAndDrop|fill|selectOption|focus|press|setInputFiles|snapshot|screenshot|reload|handOff|finish|newPage|adopt)\s*\(/.test(
+      scanText,
+    );
+  if (isReadOnlyProbe) return null;
+
+  const spaceName = /\btaskSpace\(\s*["']([^"'\n]{1,80})["']/.exec(scanText)?.[1]?.trim() || undefined;
+  const spaceIdStr =
+    /\b(?:taskSpace|claimTaskSpace|takeOverTaskSpace)\(\s*(\d+)\s*[,)]/.exec(scanText)?.[1] ??
+    /\bSPACE_ID\s*=\s*(\d+)\b/.exec(scanText)?.[1];
+  const spaceIdNum = spaceIdStr !== undefined ? Number(spaceIdStr) : undefined;
+  const spaceId = spaceIdNum !== undefined && Number.isFinite(spaceIdNum) ? spaceIdNum : undefined;
+  const pageLabel = /\.page\(\s*["']([^"'\n]{1,24})["']\s*\)/.exec(scanText)?.[1]?.trim() || undefined;
+  const urlMatch =
+    /\.goto\(\s*["'](https?:\/\/[^"'\s]+)["']/.exec(scanText) ?? /(https?:\/\/[^\s"'`<>()\\;]+)/i.exec(scanText);
+  const url = urlMatch?.[1];
+  const handoff = /\.handOff\s*\(/.test(scanText);
+  const finishMatch = /\.finish\s*\(([^)]*)\)/.exec(scanText);
+  const finish = finishMatch
+    ? { closeSpace: /\bkeep\s*:\s*\[\s*\]/.test(finishMatch[1] ?? "") }
+    : undefined;
+  const pointerLabel =
+    /\b(?:click|dblclick|hover|dragAndDrop|mouse\.(?:click|move|wheel))\([^)\n;]*?\blabel\s*:\s*["']([^"'\n]{1,40})["']/.exec(
+      scanText,
+    )?.[1]?.trim() || undefined;
+
+  const action = finish
+    ? finish.closeSpace
+      ? "已完成并关闭空间"
+      : "已完成并保留页面"
+    : handoff
+      ? "等待你接管验证"
+      : pointerLabel
+        ? pointerLabel
+        : url
+          ? formatShortUrlAction(url)
+          : /\.snapshot\s*\(/.test(scanText)
+            ? "读取页面结构"
+            : /\.screenshot\s*\(/.test(scanText)
+              ? "截取空间画面"
+              : "执行页面操作";
+
+  return {
+    type: "ego_space",
+    ...(serverName ? { serverName } : {}),
+    ...(spaceId !== undefined ? { spaceId } : {}),
+    ...(spaceName ? { spaceName } : {}),
+    ...(pageLabel ? { pageLabel } : {}),
+    ...(url ? { url } : {}),
+    action,
+    ...(handoff ? { handoff: true } : {}),
+    ...(finish ? { finish } : {}),
+  };
+}
+
 /** Extracts file/browser/window auto-portal intents from shell commands while ignoring quoted prose. */
 export function extractAutoPortalIntents(commandLine: string, cwd?: string): AutoPortalIntent[] {
   if (!commandLine || !commandLine.trim()) return [];
@@ -545,6 +667,11 @@ export function extractAutoPortalIntents(commandLine: string, cwd?: string): Aut
     }
 
     if (cmd === "ego-browser" || cmd === "tabbit" || cmd === "agent-browser") {
+      if (cmd === "ego-browser") {
+        const egoIntent = parseEgoBrowserIntent(rest, seg.heredocBody);
+        if (egoIntent) intents.push(egoIntent);
+        continue;
+      }
       const nonFlag = rest.find((t) => !t.startsWith("-"))?.toLowerCase();
       if (
         rest.some((t) => t === "--help" || t === "-h" || t === "--version" || t === "-v") ||
@@ -555,15 +682,7 @@ export function extractAutoPortalIntents(commandLine: string, cwd?: string): Aut
       const scanText = `${rest.join(" ")}\n${seg.heredocBody}`;
       const urlMatch = /(https?:\/\/[^\s"'`<>()\\;]+)/i.exec(scanText);
       const url = urlMatch?.[1];
-      if (cmd === "ego-browser") {
-        const spaceMatch = /taskSpace\(\s*["']([^"'\n]{1,60})["']/.exec(scanText);
-        intents.push({
-          type: "app_window",
-          appHint: "ego lite",
-          label: spaceMatch?.[1] ? `ego lite · ${spaceMatch[1]}` : "ego lite 浏览器",
-          ...(url ? { url } : {}),
-        });
-      } else if (cmd === "tabbit") {
+      if (cmd === "tabbit") {
         intents.push({
           type: "app_window",
           appHint: "Tabbit",

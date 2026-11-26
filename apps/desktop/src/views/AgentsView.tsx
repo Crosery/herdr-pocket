@@ -936,6 +936,7 @@ export function AgentDetailPanel({
   onSubHeadChange,
   mobile = false,
   embedded = false,
+  portalHost = true,
   focused = true,
   visible = true,
 }: {
@@ -949,6 +950,8 @@ export function AgentDetailPanel({
   mobile?: boolean;
   /** Inside a v3 pane: the pane header already shows harness, title, folder, and mode switcher. */
   embedded?: boolean;
+  /** Whether this pane instance should mount the floating per-terminal portal window. */
+  portalHost?: boolean;
   /** Whether this pane holds focus within a split tab. */
   focused?: boolean;
   /** Whether the hosting tab/slot is currently visible on screen. */
@@ -3429,10 +3432,10 @@ export function AgentDetailPanel({
         </div>
       </PocketModal>
 
-      {!embedded ? (
+      {portalHost ? (
         <SessionPortalPiP
           agent={agent}
-          visible={visible}
+          visible={visible && !portalModalOpen}
           mode={activeMode}
           onExpandPortal={(pid) => {
             setActivePortalId(pid);

@@ -160,6 +160,7 @@ test("new Batch 2 UI/docs files contain zero emojis", () => {
     "docs/releases/v0.2.42.md",
     "docs/releases/v0.2.43.md",
     "docs/releases/v0.2.44.md",
+    "docs/releases/v0.2.49.md",
   ];
   for (const rel of files) {
     const full = join(ROOT, rel);
@@ -693,4 +694,99 @@ test("SessionPortalPiP prevents cursor self-warp, defaults to collapsed capsule,
   assert.match(pipSrc, /hoverTimerRef/);
   assert.match(pipSrc, /fps=\{isHovered \? 24 : 0\}/);
   assert.match(pipSrc, /pipFps >= 2 && !heartbeat\?\.idle/);
+});
+
+test("v0.2.49 strict per-terminal portal lineage, per-pane placement, ResizeObserver bounds, and EG Space UI contracts", () => {
+  const unattributedItem = {
+    id: "ptl-unattr",
+    hostId: "h1",
+    kind: "window" as const,
+    title: "QQ · 视频播放器",
+    canInteract: true,
+    createdAt: 100,
+    updatedAt: 200,
+  };
+  const otherAgentItem = {
+    id: "ptl-t2",
+    hostId: "h1",
+    agentKey: "h1/hc:t2",
+    kind: "window" as const,
+    title: "EG 空间 · other",
+    canInteract: true,
+    createdAt: 100,
+    updatedAt: 210,
+  };
+  const ownEgoItem = {
+    id: "ptl-t1",
+    hostId: "h1",
+    agentKey: "h1/hc:t1",
+    kind: "window" as const,
+    title: "EG 空间 · checkout-flow",
+    egoSpace: {
+      spaceId: 41,
+      spaceName: "checkout-flow",
+      phase: "handoff" as const,
+      pageLabel: "p1",
+      activeTabTitle: "结算台",
+      lastAction: "等待你接管验证",
+    },
+    canInteract: false,
+    createdAt: 100,
+    updatedAt: 220,
+  };
+
+  const visibleForT1 = filterVisiblePortalItems({
+    itemsById: {
+      [unattributedItem.id]: unattributedItem,
+      [otherAgentItem.id]: otherAgentItem,
+      [ownEgoItem.id]: ownEgoItem,
+    },
+    dismissedIds: {},
+    agent: { deviceId: "h1", key: "h1/hc:t1" },
+  });
+  assert.deepEqual(
+    visibleForT1.map((x) => x.id),
+    ["ptl-t1"],
+  );
+  assert.deepEqual(
+    filterVisiblePortalItems({
+      itemsById: { [ownEgoItem.id]: ownEgoItem },
+      dismissedIds: {},
+      agent: { deviceId: "h1", key: "" },
+    }),
+    [],
+  );
+
+  // Per-pane mounting in ShellWork -> AgentDetailPanel (no global WorkspacePortalOverlay)
+  const shellWorkSrc = readFileSync(join(ROOT, "apps/desktop/src/shell/ShellWork.tsx"), "utf8");
+  const agentsSrc = readFileSync(join(ROOT, "apps/desktop/src/views/AgentsView.tsx"), "utf8");
+  const pipSrc = readFileSync(join(ROOT, "apps/desktop/src/components/SessionPortalPiP.tsx"), "utf8");
+  const modalSrc = readFileSync(join(ROOT, "apps/desktop/src/components/PortalViewerModal.tsx"), "utf8");
+  const cssSrc = readFileSync(join(ROOT, "apps/desktop/src/styles/app.css"), "utf8");
+  const mobileSrc = readFileSync(join(ROOT, "apps/mobile/src/components/MobilePortalModal.tsx"), "utf8");
+
+  assert.doesNotMatch(shellWorkSrc, /WorkspacePortalOverlay/);
+  assert.doesNotMatch(shellWorkSrc, /workspaceWide/);
+  assert.match(shellWorkSrc, /portalHost=\{portalHostPaneIds\.has\(item\.leaf\.id\)\}/);
+  assert.match(agentsSrc, /\{portalHost \? \(\s*<SessionPortalPiP/);
+  assert.doesNotMatch(agentsSrc, /\{!embedded \? \(\s*<SessionPortalPiP/);
+
+  // SessionPortalPiP removes workspaceWide and clamps via ResizeObserver to offsetParent
+  assert.doesNotMatch(pipSrc, /workspaceWide/);
+  assert.doesNotMatch(pipSrc, /!it\.agentKey/);
+  assert.match(pipSrc, /ResizeObserver/);
+  assert.match(pipSrc, /session-portal-ego-phase/);
+  assert.match(pipSrc, /session-portal-ego-strip/);
+  assert.doesNotMatch(modalSrc, /!i\.agentKey/);
+
+  assert.match(cssSrc, /\.session-portal-pip\s*\{[\s\S]*max-width:\s*calc\(100% - 24px\)/);
+  assert.doesNotMatch(cssSrc, /\.session-portal-pip\s*\{[^}]*100vw/);
+  assert.match(cssSrc, /\.session-portal-tile-grid\.is-narrow/);
+  assert.match(cssSrc, /\.session-portal-ego-phase/);
+
+  // Mobile portal listener enforces strict agentKey isolation & surfaces EG Space status with zero emojis
+  assert.match(mobileSrc, /if \(agentKey && item\.agentKey !== agentKey\) return;/);
+  assert.match(mobileSrc, /egoPhaseText/);
+  const EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
+  assert.equal(EMOJI_RE.exec(mobileSrc), null);
 });

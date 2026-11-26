@@ -844,7 +844,7 @@ function emitMockPortalEvent(action: "opened" | "updated" | "closed", item: Port
   const ev: PortalStreamEvent = { kind: "portal_event", action, item, at: Date.now() };
   for (const w of demoPortalWatchers) {
     if (w.to !== item.hostId) continue;
-    if (w.agent && item.agentKey && w.agent !== item.agentKey) continue;
+    if (w.agent && item.agentKey !== w.agent) continue;
     if (w.portalId && w.portalId !== item.id) continue;
     w.onEvent(ev);
   }
@@ -1731,7 +1731,7 @@ export const mockApi = {
     if (method === "portal.list") {
       const agentFilter = typeof params?.agent === "string" ? params.agent : undefined;
       const items = demoPortals
-        .filter((p) => p.hostId === to && (!agentFilter || !p.agentKey || p.agentKey === agentFilter))
+        .filter((p) => p.hostId === to && (!agentFilter || p.agentKey === agentFilter))
         .sort((a, b) => b.updatedAt - a.updatedAt);
       return {
         items,
@@ -1970,7 +1970,7 @@ export const mockApi = {
       const portalId = typeof params?.portalId === "string" ? params.portalId : undefined;
       const watcher: MockPortalWatcher = { to, agent, portalId, onEvent };
       demoPortalWatchers.add(watcher);
-      const items = demoPortals.filter((p) => p.hostId === to && (!agent || !p.agentKey || p.agentKey === agent));
+      const items = demoPortals.filter((p) => p.hostId === to && (!agent || p.agentKey === agent));
       onState?.({ kind: "live", result: { items } });
       let timer: ReturnType<typeof setInterval> | null = null;
       if (portalId) {

@@ -1,7 +1,7 @@
 {
   "name": "@herdr-pocket/desktop",
   "private": true,
-  "version": "0.2.48",
+  "version": "0.2.49",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
