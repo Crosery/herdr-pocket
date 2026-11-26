@@ -7,6 +7,7 @@ import {
   useMemo,
   useState,
   type ButtonHTMLAttributes,
+  type CSSProperties,
   type ErrorInfo,
   type InputHTMLAttributes,
   type ReactNode,
@@ -144,14 +145,18 @@ export function PocketCard({
 export function PocketBadge({
   tone = "neutral",
   pulse = false,
+  className = "",
+  style,
   children,
 }: {
   tone?: "pink" | "lav" | "mint" | "sky" | "blush" | "warn" | "neutral";
   pulse?: boolean;
+  className?: string;
+  style?: CSSProperties;
   children: ReactNode;
 }) {
   return (
-    <span className={`pk-badge ${tone}`}>
+    <span className={`pk-badge ${tone}${className ? ` ${className}` : ""}`} style={style}>
       {pulse ? <span className="status-dot breathe" /> : null}
       {children}
     </span>

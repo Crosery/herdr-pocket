@@ -1,10 +1,33 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = join(HERE, "dist");
-const ASSETS_DIR = join(DIST_DIR, "admin-assets");
+let overrideDir: string | null = null;
+let overrideVersion: string | null = null;
+
+function activeDistDir(): string {
+  return overrideDir ?? DIST_DIR;
+}
+
+/** Switches the runtime Admin UI directory to a verified synced release copy (or resets to shipped `dist`). */
+export function setAdminDistDir(dir: string | null, version?: string | null): boolean {
+  if (!dir) {
+    overrideDir = null;
+    overrideVersion = null;
+    return true;
+  }
+  const index = join(dir, "index.html");
+  if (!existsSync(index)) return false;
+  overrideDir = resolve(dir);
+  overrideVersion = version ?? null;
+  return true;
+}
+
+export function getAdminDistVersion(): string | null {
+  return overrideVersion;
+}
 
 const MIME: Record<string, string> = {
   ".js": "application/javascript; charset=utf-8",
@@ -20,7 +43,7 @@ const MIME: Record<string, string> = {
 
 /** GET /admin: serves the built React + Radix Web Console HTML shell. */
 export function adminPage(): string {
-  return readFileSync(join(DIST_DIR, "index.html"), "utf8");
+  return readFileSync(join(activeDistDir(), "index.html"), "utf8");
 }
 
 /**
@@ -40,7 +63,7 @@ export function adminAsset(rawRel: string): { body: Buffer; type: string; immuta
 
   let rootReal: string;
   try {
-    rootReal = realpathSync(ASSETS_DIR);
+    rootReal = realpathSync(join(activeDistDir(), "admin-assets"));
   } catch {
     return null;
   }

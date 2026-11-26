@@ -124,6 +124,7 @@ export interface AssistantAction {
 
 export interface AdminOverview {
   version: string;
+  uiVersion?: string;
   protocol: number;
   startedAt: number;
   devices: number;

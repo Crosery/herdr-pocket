@@ -1,1 +1,1 @@
-export { adminPage, adminAsset } from "./admin/index.ts";
+export { adminPage, adminAsset, setAdminDistDir, getAdminDistVersion } from "./admin/index.ts";

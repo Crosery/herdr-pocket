@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { checkAndApplyH5Update, detectStandaloneDisplay, extractH5EntrySignature } from "../src/lib/pwa.ts";
 import { notifyReleaseAvailable, startAutoUpdateChecks, updateStore } from "../src/lib/updates.ts";
+import { checkAndApplyAdminUpdate, extractAdminEntrySignature } from "../../admin/src/lib/autoUpdate.ts";
 
 const DESKTOP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -35,6 +36,8 @@ test("PWA manifest.webmanifest, icons, and sw.js are valid and non-empty", () =>
   }
 
   const sw = readFileSync(swPath, "utf8");
+  assert.equal(sw.includes("herdr-pocket-shell-v11"), true);
+  assert.equal(sw.includes("__pocket_check"), true, "SW must bypass cache-probing requests");
   assert.equal(sw.includes("SKIP_WAITING"), true);
   assert.equal(sw.includes('cache: "no-cache"'), true, "SW must revalidate document navigations against upstream");
 });
@@ -75,16 +78,26 @@ test("detectStandaloneDisplay respects navigator.standalone and matchMedia stand
   }
 });
 
-test("app.css avoids duplicate H5 bottom safe-area padding and keeps mobile breakpoints ordered", () => {
+test("app.css and mobile-parity.css pin iOS standalone root, handle keyboard height, and align H5 cards", () => {
   const css = readFileSync(resolve(DESKTOP_ROOT, "src/styles/app.css"), "utf8");
+  const mobileCss = readFileSync(resolve(DESKTOP_ROOT, "src/styles/mobile-parity.css"), "utf8");
 
-  const h5RootBlock = /html\[data-client="h5"\],\s*html\[data-client="h5"\] body,\s*html\[data-client="h5"\] #root\s*\{[^}]*\}/.exec(css);
-  assert.ok(h5RootBlock, "found html[data-client=h5] root block");
-  assert.equal(h5RootBlock[0].includes("padding-bottom"), false);
+  const standaloneRoot = /html\[data-client="h5"\]\[data-standalone="true"\],\s*html\[data-client="h5"\]\[data-standalone="true"\] body,\s*html\[data-client="h5"\]\[data-standalone="true"\] #root\s*\{[^}]*\}/.exec(css);
+  assert.ok(standaloneRoot, "found standalone H5 fixed root block");
+  assert.equal(standaloneRoot[0].includes("position: fixed"), true);
+  assert.equal(standaloneRoot[0].includes("inset: 0"), true);
+  assert.equal(standaloneRoot[0].includes("100dvh"), false, "iOS standalone root must not rely on 100dvh");
+
+  const mpShell = /\.mp-shell\s*\{[^}]*\}/.exec(mobileCss);
+  assert.ok(mpShell, "found .mp-shell block");
+  assert.equal(mpShell[0].includes("height: 100%;"), true);
+  assert.equal(mpShell[0].includes("100dvh"), false, ".mp-shell must inherit root 100% height rather than 100dvh");
+  assert.equal(mobileCss.includes('html[data-kb-open="true"] .mp-shell .mp-tabbar'), true);
+  assert.equal(mobileCss.includes(".mp-shell .bubble-row.is-card"), true);
 
   const authBlock = /\.h5-auth-screen\s*\{[^}]*\}/.exec(css);
   assert.ok(authBlock, "found .h5-auth-screen block");
-  assert.equal(authBlock[0].includes("height: 100dvh"), true);
+  assert.equal(authBlock[0].includes("height: 100%;"), true);
   assert.equal(authBlock[0].includes("overflow-y: auto"), true);
 
   const idx1099 = css.indexOf("@media (max-width: 1099.98px)");
@@ -203,4 +216,78 @@ test("H5 web mode never starts desktop auto-update checks or renders UpdatePromp
 
   const mobileShellSrc = readFileSync(resolve(DESKTOP_ROOT, "src/mobile/MobileAppShell.tsx"), "utf8");
   assert.equal(mobileShellSrc.includes("<UpdatePrompt"), false, "MobileAppShell must not mount duplicate UpdatePrompt");
+});
+
+test("Admin console silently detects upstream admin-assets signature changes without reload loops", async () => {
+  const v1Html = `<!doctype html><html><head>
+    <script type="module" crossorigin src="./admin-assets/index-ADM11111.js"></script>
+    <link rel="stylesheet" crossorigin href="./admin-assets/index-ADM22222.css">
+  </head></html>`;
+  const v2Html = `<!doctype html><html><head>
+    <script type="module" crossorigin src="/pocket/admin-assets/index-ADM33333.js"></script>
+    <link rel="stylesheet" crossorigin href="/pocket/admin-assets/index-ADM44444.css">
+  </head></html>`;
+  assert.equal(extractAdminEntrySignature(v1Html), "admin-assets/index-ADM11111.js|admin-assets/index-ADM22222.css");
+  assert.equal(extractAdminEntrySignature(v2Html), "admin-assets/index-ADM33333.js|admin-assets/index-ADM44444.css");
+
+  const g = globalThis as Record<string, unknown>;
+  const prevWindow = g.window;
+  const prevDoc = g.document;
+  const prevFetch = globalThis.fetch;
+  const prevSession = g.sessionStorage;
+  const sessionMap = new Map<string, string>();
+
+  g.window = { location: { pathname: "/pocket/admin", search: "" } };
+  g.sessionStorage = {
+    getItem: (k: string) => sessionMap.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      sessionMap.set(k, v);
+    },
+    removeItem: (k: string) => {
+      sessionMap.delete(k);
+    },
+  };
+  g.document = {
+    querySelectorAll: (sel: string) => {
+      if (sel.includes("script")) return [{ getAttribute: () => "./admin-assets/index-ADM11111.js" }];
+      if (sel.includes("link")) return [{ getAttribute: () => "./admin-assets/index-ADM22222.css" }];
+      return [];
+    },
+  };
+
+  let htmlToServe = v1Html;
+  let applyCount = 0;
+  globalThis.fetch = (async () => new Response(htmlToServe, { status: 200 })) as typeof fetch;
+
+  try {
+    assert.equal(await checkAndApplyAdminUpdate({ force: true, onApply: () => { applyCount += 1; } }), false);
+    assert.equal(applyCount, 0);
+
+    htmlToServe = v2Html;
+    assert.equal(
+      await checkAndApplyAdminUpdate({ force: true, canReloadNow: () => false, onApply: () => { applyCount += 1; } }),
+      false,
+    );
+    assert.equal(applyCount, 0);
+
+    assert.equal(
+      await checkAndApplyAdminUpdate({ force: true, canReloadNow: () => true, onApply: () => { applyCount += 1; } }),
+      true,
+    );
+    assert.equal(applyCount, 1);
+
+    assert.equal(
+      await checkAndApplyAdminUpdate({ force: true, canReloadNow: () => true, onApply: () => { applyCount += 1; } }),
+      false,
+    );
+    assert.equal(applyCount, 1);
+  } finally {
+    globalThis.fetch = prevFetch;
+    if (prevWindow === undefined) delete g.window;
+    else g.window = prevWindow;
+    if (prevDoc === undefined) delete g.document;
+    else g.document = prevDoc;
+    if (prevSession === undefined) delete g.sessionStorage;
+    else g.sessionStorage = prevSession;
+  }
 });

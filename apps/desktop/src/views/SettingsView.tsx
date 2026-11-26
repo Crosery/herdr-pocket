@@ -4,7 +4,7 @@ import { XiaoyangOrb } from "../components/MascotAndVendor";
 import { PocketBadge } from "../components/PocketUI";
 import { serverLabel } from "../components/Sidebar";
 import { VoiceInputSetup } from "../components/VoiceInput";
-import { isTauri } from "../lib/bridge";
+import { isH5Web, isTauri } from "../lib/bridge";
 import { liveStore, settingsStore } from "../lib/store";
 import { updateStore } from "../lib/updates";
 import { AssistantSettings, type AssistantTab } from "./settings/AssistantSettings";
@@ -64,7 +64,7 @@ export function SettingsView({
   const [assistantTab, setAssistantTab] = useState<AssistantTab>("models");
   // Narrow windows show the list first, then one pane with a way back.
   const [mobilePane, setMobilePane] = useState(false);
-  const updateReady = updateStore.use((s) => Boolean(s.info?.hasUpdate));
+  const updateReady = updateStore.use((s) => !isH5Web() && Boolean(s.info?.hasUpdate));
   const server = settingsStore.use((s) => s.server);
   const deviceName = settingsStore.use((s) => s.deviceName);
   const link = liveStore.use((s) => s.link);

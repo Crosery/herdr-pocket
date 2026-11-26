@@ -4,6 +4,30 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = join(HERE, "dist");
+let overrideDir: string | null = null;
+let overrideVersion: string | null = null;
+
+function activeDistDir(): string {
+  return overrideDir ?? DIST_DIR;
+}
+
+/** Switches the runtime web bundle directory to a verified synced release copy (or resets to shipped `dist`). */
+export function setWebDistDir(dir: string | null, version?: string | null): boolean {
+  if (!dir) {
+    overrideDir = null;
+    overrideVersion = null;
+    return true;
+  }
+  const index = join(dir, "index.html");
+  if (!existsSync(index)) return false;
+  overrideDir = resolve(dir);
+  overrideVersion = version ?? null;
+  return true;
+}
+
+export function getWebDistVersion(): string | null {
+  return overrideVersion;
+}
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -28,13 +52,13 @@ const MIME: Record<string, string> = {
 };
 
 export function hasWebBundle(): boolean {
-  return existsSync(join(DIST_DIR, "index.html"));
+  return existsSync(join(activeDistDir(), "index.html"));
 }
 
 /** GET /app/: serves the shared subpath-safe H5 web client HTML shell. */
 export function webPage(): string | null {
   try {
-    return readFileSync(join(DIST_DIR, "index.html"), "utf8");
+    return readFileSync(join(activeDistDir(), "index.html"), "utf8");
   } catch {
     return null;
   }
@@ -57,7 +81,7 @@ export function webAsset(rawRel: string): { body: Buffer; type: string; immutabl
 
   let rootReal: string;
   try {
-    rootReal = realpathSync(DIST_DIR);
+    rootReal = realpathSync(activeDistDir());
   } catch {
     return null;
   }

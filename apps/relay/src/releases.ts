@@ -1,9 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
+import { gunzipSync } from "node:zlib";
+import { readTar } from "@herdr-pocket/update";
 import {
   allReleaseSources,
   compareVersions,
@@ -38,6 +40,10 @@ export interface ReleaseCacheOptions {
   serverVersion?: string;
   /** Override background release polling interval in ms (0 disables polling). */
   pollIntervalMs?: number;
+  /** Auto-download & unpack newer `web/dist` and `admin/dist` bundles into writable cache state. */
+  autoSyncUiBundles?: boolean;
+  /** Invoked whenever a strictly newer verified UI bundle (`web` + `admin`) is active on disk. */
+  onUiBundleSynced?: (info: { version: string; webDir: string; adminDir: string }) => void;
   /** Invoked whenever a strictly newer release version than prior known state is observed. */
   onNewRelease?: (version: string) => void;
   log?: (msg: string) => void;
@@ -112,12 +118,18 @@ function parseByteRange(header: string | undefined, total: number): { start: num
  */
 export class ReleaseCache {
   readonly dir: string;
+  readonly uiBundlesDir: string;
   private readonly ephemeral: boolean;
   private readonly upstreamBases?: string[];
   private readonly log: (msg: string) => void;
   private readonly onNewRelease?: (version: string) => void;
+  private readonly onUiBundleSynced?: (info: { version: string; webDir: string; adminDir: string }) => void;
+  private readonly autoSyncUiBundles: boolean;
+  private readonly serverVer: string | null;
   private inflight = new Map<string, Promise<string>>();
+  private uiSyncInflight = new Map<string, Promise<boolean>>();
   private latestKnown: string | null;
+  private activeUiVer: string | null;
   private latestSnapshot: RelayLatestSnapshot | null = null;
   private latestInflight: Promise<RelayLatestSnapshot> | null = null;
   private initTimer: NodeJS.Timeout | null = null;
@@ -135,12 +147,18 @@ export class ReleaseCache {
       this.dir = join(dirname(opts.dbPath), "release-cache");
       this.ephemeral = false;
     }
+    this.uiBundlesDir = join(this.dir, "ui-bundles");
     this.upstreamBases = opts.upstreamBases?.length ? [...opts.upstreamBases] : undefined;
     this.log = opts.log ?? (() => {});
     this.onNewRelease = opts.onNewRelease;
+    this.onUiBundleSynced = opts.onUiBundleSynced;
+    this.autoSyncUiBundles = opts.autoSyncUiBundles ?? (!this.ephemeral && !this.upstreamBases?.length);
     const baseVer = opts.serverVersion?.trim().replace(/^v/i, "") ?? "";
-    this.latestKnown = SEMVER_RE.test(baseVer) ? baseVer : null;
+    this.serverVer = SEMVER_RE.test(baseVer) ? baseVer : null;
+    this.latestKnown = this.serverVer;
+    this.activeUiVer = this.serverVer;
     mkdirSync(this.dir, { recursive: true });
+    this.restoreLatestUiBundle();
 
     const defaultPollMs = this.ephemeral || this.upstreamBases?.length ? 0 : 60_000;
     const pollMs = typeof opts.pollIntervalMs === "number" ? opts.pollIntervalMs : defaultPollMs;
@@ -159,6 +177,118 @@ export class ReleaseCache {
 
   latestVersion(): string | null {
     return this.latestKnown;
+  }
+
+  activeUiVersion(): string | null {
+    return this.activeUiVer;
+  }
+
+  private restoreLatestUiBundle(): void {
+    try {
+      if (!existsSync(this.uiBundlesDir)) return;
+      const cands = readdirSync(this.uiBundlesDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && TAG_RE.test(d.name))
+        .map((d) => ({ ver: d.name.slice(1), full: join(this.uiBundlesDir, d.name) }))
+        .filter((c) => SEMVER_RE.test(c.ver) && (!this.serverVer || compareVersions(c.ver, this.serverVer) > 0))
+        .sort((a, b) => compareVersions(b.ver, a.ver));
+      for (const c of cands) {
+        const webDir = join(c.full, "web");
+        const adminDir = join(c.full, "admin");
+        if (existsSync(join(webDir, "index.html")) && existsSync(join(adminDir, "index.html"))) {
+          this.activeUiVer = c.ver;
+          this.onUiBundleSynced?.({ version: c.ver, webDir, adminDir });
+          return;
+        }
+      }
+    } catch {
+      // non-fatal cache restore error
+    }
+  }
+
+  async syncUiBundleForVersion(version: string): Promise<boolean> {
+    if (!SEMVER_RE.test(version)) return false;
+    if (this.activeUiVer && compareVersions(this.activeUiVer, version) >= 0) return false;
+    const existing = this.uiSyncInflight.get(version);
+    if (existing) return existing;
+
+    const job = (async (): Promise<boolean> => {
+      const tag = `v${version}`;
+      const asset = `herdr-pocket-${version}.tar.gz`;
+      const tarPath = await this.ensureCached(tag, asset);
+      const entries = readTar(gunzipSync(readFileSync(tarPath)));
+      mkdirSync(this.uiBundlesDir, { recursive: true });
+      const stageDir = join(this.uiBundlesDir, `.stage-${tag}-${randomBytes(4).toString("hex")}`);
+      const stageWeb = join(stageDir, "web");
+      const stageAdmin = join(stageDir, "admin");
+      const destDir = join(this.uiBundlesDir, tag);
+
+      const safeWrite = (baseDir: string, relRaw: string, data: Buffer) => {
+        if (!relRaw || relRaw.includes("\0") || relRaw.includes("\\") || relRaw.startsWith("/")) return;
+        const parts = relRaw.split("/").filter(Boolean);
+        if (!parts.length || parts.some((p) => p === "." || p === "..")) return;
+        const outPath = resolve(baseDir, ...parts);
+        if (!outPath.startsWith(resolve(baseDir) + sep)) return;
+        mkdirSync(dirname(outPath), { recursive: true });
+        writeFileSync(outPath, data, { mode: 0o644 });
+      };
+
+      try {
+        for (const e of entries) {
+          if (e.type !== "file") continue;
+          const norm = e.name.replace(/\\/g, "/").replace(/^\.\//, "");
+          const slash = norm.indexOf("/");
+          const inner = slash > 0 ? norm.slice(slash + 1) : norm;
+          if (inner.startsWith("apps/relay/src/web/dist/")) {
+            safeWrite(stageWeb, inner.slice("apps/relay/src/web/dist/".length), e.data);
+          } else if (inner.startsWith("apps/relay/src/admin/dist/")) {
+            safeWrite(stageAdmin, inner.slice("apps/relay/src/admin/dist/".length), e.data);
+          }
+        }
+        const webIndex = join(stageWeb, "index.html");
+        const adminIndex = join(stageAdmin, "index.html");
+        if (!existsSync(webIndex) || !existsSync(adminIndex) || statSync(webIndex).size === 0 || statSync(adminIndex).size === 0) {
+          rmSync(stageDir, { recursive: true, force: true });
+          return false;
+        }
+        if (existsSync(destDir)) rmSync(destDir, { recursive: true, force: true });
+        renameSync(stageDir, destDir);
+        const webDir = join(destDir, "web");
+        const adminDir = join(destDir, "admin");
+        this.activeUiVer = version;
+        this.onUiBundleSynced?.({ version, webDir, adminDir });
+        this.pruneOldUiBundles(tag);
+        this.log(`releases: hot-synced H5 & admin UI bundles to ${tag}`);
+        return true;
+      } catch (err) {
+        rmSync(stageDir, { recursive: true, force: true });
+        throw err;
+      }
+    })().finally(() => {
+      if (this.uiSyncInflight.get(version) === job) this.uiSyncInflight.delete(version);
+    });
+
+    this.uiSyncInflight.set(version, job);
+    return job;
+  }
+
+  private pruneOldUiBundles(keepTag: string): void {
+    try {
+      if (!existsSync(this.uiBundlesDir)) return;
+      const dirs = readdirSync(this.uiBundlesDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && TAG_RE.test(d.name))
+        .map((d) => ({ name: d.name, ver: d.name.slice(1), full: join(this.uiBundlesDir, d.name) }))
+        .sort((a, b) => (SEMVER_RE.test(b.ver) && SEMVER_RE.test(a.ver) ? compareVersions(b.ver, a.ver) : 0));
+      let kept = 0;
+      for (const d of dirs) {
+        if (d.name === keepTag || kept < 2) {
+          kept += 1;
+          continue;
+        }
+        rmSync(d.full, { recursive: true, force: true });
+      }
+    } catch {
+      // non-fatal prune error
+    }
   }
 
   close(): void {
@@ -333,6 +463,15 @@ export class ReleaseCache {
         notes = await this.fetchFirstNotes(taggedNotesUrls);
       }
 
+      let uiSyncedNow = false;
+      if (best && this.autoSyncUiBundles && (!this.activeUiVer || compareVersions(best, this.activeUiVer) > 0)) {
+        try {
+          uiSyncedNow = await this.syncUiBundleForVersion(best);
+        } catch (err) {
+          this.log(`releases: UI bundle hot-sync for v${best} skipped (${err instanceof Error ? err.message : String(err)})`);
+        }
+      }
+
       const checkedAt = Date.now();
       const prevKnown = this.latestKnown;
       if (best && (!prevKnown || compareVersions(best, prevKnown) > 0)) {
@@ -341,6 +480,8 @@ export class ReleaseCache {
           this.log(`releases: detected newer release v${best} (was v${prevKnown})`);
           this.onNewRelease?.(best);
         }
+      } else if (uiSyncedNow && best) {
+        this.onNewRelease?.(best);
       }
 
       const snap: RelayLatestSnapshot = {

@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { overlayStore, useToast } from "../../components/PocketUI";
 import { VoiceInputSetup } from "../../components/VoiceInput";
-import { appVersion, detectPlatform } from "../../lib/bridge";
+import { appVersion, detectPlatform, isH5Web } from "../../lib/bridge";
 import { native } from "../../lib/native";
 import { isMockServer } from "../../lib/mock";
 import { liveStore, settingsStore } from "../../lib/store";
@@ -72,7 +72,7 @@ const ALL = [...HERDR_ORDER, ...OURS];
 export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onReopenGuide }: SettingsFrameProps) {
   const toast = useToast();
   const section = shellStore.use((s) => s.settings);
-  const updateReady = updateStore.use((s) => Boolean(s.info?.hasUpdate));
+  const updateReady = updateStore.use((s) => !isH5Web() && Boolean(s.info?.hasUpdate));
   const open = section !== null;
   const bodyRef = useRef<HTMLDivElement>(null);
   const navRef = useRef<HTMLElement>(null);

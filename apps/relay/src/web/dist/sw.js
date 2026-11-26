@@ -1,4 +1,4 @@
-const CACHE_NAME = "herdr-pocket-shell-v10";
+const CACHE_NAME = "herdr-pocket-shell-v11";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -37,6 +37,7 @@ self.addEventListener("fetch", (event) => {
 
   const p = url.pathname;
   if (
+    url.searchParams.has("__pocket_check") ||
     p.includes("/v1/") ||
     p.includes("/p/") ||
     p.includes("/j/") ||

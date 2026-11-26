@@ -40,7 +40,7 @@ function stampPackage(file) {
 stampPackage(join(root, "package.json"));
 for (const dir of ["packages", "apps"]) {
   for (const name of readdirSync(join(root, dir))) {
-    if (dir === "apps" && name !== "relay" && name !== "hostd" && name !== "desktop") continue;
+    if (dir === "apps" && name !== "relay" && name !== "hostd" && name !== "desktop" && name !== "admin") continue;
     stampPackage(join(root, dir, name, "package.json"));
   }
 }

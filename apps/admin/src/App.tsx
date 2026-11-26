@@ -27,6 +27,7 @@ import {
   type Device,
   type PromptView,
 } from "./lib/api";
+import { initAdminAutoUpdate } from "./lib/autoUpdate";
 import { XiaoyangOrb } from "./components/MascotAndVendor";
 import {
   PocketButton,
@@ -93,6 +94,21 @@ function ConsoleInner() {
   const [config, setConfig] = useState<AssistantConfigView | null>(null);
   const [prompts, setPrompts] = useState<PromptView[]>([]);
   const [refreshing, setRefreshing] = useState(false);
+  const autoUpdaterRef = useRef<ReturnType<typeof initAdminAutoUpdate> | null>(null);
+
+  useEffect(() => {
+    const updater = initAdminAutoUpdate();
+    autoUpdaterRef.current = updater;
+    return () => {
+      autoUpdaterRef.current = null;
+      updater.dispose();
+    };
+  }, []);
+
+  const serverVersionTag = overview ? `${overview.version}:${overview.uiVersion ?? overview.version}` : "";
+  useEffect(() => {
+    if (serverVersionTag) autoUpdaterRef.current?.checkNow(true);
+  }, [serverVersionTag]);
 
   const applyTheme = useCallback((nextDark: boolean, origin?: { x: number; y: number }) => {
     const val = nextDark ? "dark" : "light";
@@ -308,7 +324,7 @@ function ConsoleInner() {
             <div className="grow">
               <h1 className="brand-title">Herdr Pocket</h1>
               <div className="faint num">
-                {overview ? `v${overview.version} · 已运行 ${fmtUptime(overview.startedAt)}` : "连接中…"}
+                {overview ? `v${overview.uiVersion || overview.version} · 已运行 ${fmtUptime(overview.startedAt)}` : "连接中…"}
               </div>
             </div>
           </div>
@@ -452,7 +468,7 @@ function ConsoleInner() {
 
           {route === "logs" ? <LogsView devices={devices} /> : null}
 
-          <PocketRibbonFooter version={overview?.version} protocol={overview?.protocol} />
+          <PocketRibbonFooter version={overview?.uiVersion || overview?.version} protocol={overview?.protocol} />
         </main>
       </div>
 

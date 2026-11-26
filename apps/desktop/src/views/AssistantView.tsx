@@ -410,7 +410,7 @@ function AssistantBubble({
       }
     };
     return (
-      <div className="bubble-row assistant">
+      <div className="bubble-row assistant is-card">
         <PocketCard soft>
           <div className="stack" style={{ gap: 8 }}>
             <div style={{ fontWeight: 700 }}>{a.summary}</div>
@@ -445,15 +445,15 @@ function AssistantBubble({
     const n = item.notice;
     const vis = noticeBadgeVisual(n);
     return (
-      <div className="bubble-row assistant">
+      <div className="bubble-row assistant is-card">
         <PocketCard soft>
           <div className="stack" style={{ gap: 6 }}>
-            <div className="between">
-              <PocketBadge tone={vis.tone} pulse={vis.pulse}>
-                {vis.icon}
-                <span>{n.title}</span>
+            <div className="between" style={{ gap: 8, minWidth: 0 }}>
+              <PocketBadge tone={vis.tone} pulse={vis.pulse} style={{ minWidth: 0, maxWidth: "100%", overflow: "hidden" }}>
+                <span style={{ flexShrink: 0, display: "inline-flex" }}>{vis.icon}</span>
+                <span className="truncate">{n.title}</span>
               </PocketBadge>
-              <span className="faint num">{fmtClock(n.ts)}</span>
+              <span className="faint num" style={{ flexShrink: 0 }}>{fmtClock(n.ts)}</span>
             </div>
             <div>{n.body}</div>
             {n.details ? <RichMarkdown text={n.details} /> : null}

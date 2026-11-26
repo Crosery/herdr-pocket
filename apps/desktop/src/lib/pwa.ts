@@ -92,7 +92,7 @@ export async function checkAndApplyH5Update(opts?: {
   autoCheckInFlight = (async () => {
     lastAutoCheckAt = Date.now();
     try {
-      const res = await fetch("./", { cache: "no-store", credentials: "same-origin" });
+      const res = await fetch(`./?__pocket_check=${Date.now()}`, { cache: "no-store", credentials: "same-origin" });
       if (!res.ok) return false;
       const html = await res.text();
       const upstreamSig = extractH5EntrySignature(html);
@@ -145,20 +145,145 @@ export function detectStandaloneDisplay(): boolean {
   );
 }
 
-/** Syncs PWA standalone state, captures install prompt events, registers `./sw.js`, and silently follows upstream H5 updates. */
+/** Checks whether the focused element is a text input or terminal textarea where the soft keyboard opens. */
+function isEditableTarget(el: Element | null): boolean {
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") {
+    return !(el as HTMLInputElement).readOnly && !(el as HTMLInputElement).disabled;
+  }
+  return (el as HTMLElement).isContentEditable || el.classList.contains("xterm-helper-textarea");
+}
+
+/** Measures native `env(safe-area-inset-top/bottom)` in CSS pixels via a hidden fixed probe. */
+function readNativeSafeAreaInsets(): { top: number; bottom: number } {
+  const root = document.documentElement;
+  if (!root || !document.body) return { top: 0, bottom: 0 };
+  const probe = document.createElement("div");
+  probe.style.cssText =
+    "position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;" +
+    "padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);";
+  document.body.appendChild(probe);
+  try {
+    const cs = window.getComputedStyle(probe);
+    const top = Number.parseFloat(cs.paddingTop) || 0;
+    const bottom = Number.parseFloat(cs.paddingBottom) || 0;
+    return { top, bottom };
+  } finally {
+    probe.remove();
+  }
+}
+
+/** Syncs PWA standalone state, iOS safe-area/keyboard layout, captures install prompt events, registers `./sw.js`, and silently follows upstream H5 updates. */
 export function initH5Pwa(opts?: { canReloadNow?: () => boolean }): () => void {
   if (!isH5Web() || typeof window === "undefined" || typeof document === "undefined") {
     return () => {};
   }
 
   canReloadHook = opts?.canReloadNow ?? null;
+  const root = document.documentElement;
+
+  let appliedFallbackSafe = false;
+  const syncSafeAreaFallback = (standalone: boolean) => {
+    const ua = navigator.userAgent || "";
+    const isIosPhone = /iPhone|iPod/i.test(ua);
+    const maxDim = Math.max(window.screen?.width ?? 0, window.screen?.height ?? 0);
+    const isModernIosPhone = isIosPhone && maxDim >= 812;
+    const landscape = window.innerWidth > window.innerHeight;
+    if (!standalone || !isModernIosPhone || landscape) {
+      if (appliedFallbackSafe) {
+        root.style.removeProperty("--safe-top");
+        root.style.removeProperty("--safe-bottom");
+        appliedFallbackSafe = false;
+      }
+      return;
+    }
+    const nativeInsets = readNativeSafeAreaInsets();
+    if (nativeInsets.top > 0) {
+      if (appliedFallbackSafe) {
+        root.style.removeProperty("--safe-top");
+        root.style.removeProperty("--safe-bottom");
+        appliedFallbackSafe = false;
+      }
+      return;
+    }
+    // Cold-boot standalone iOS WebKit can briefly report env(safe-area-inset-top) as 0px.
+    const fallbackTop = maxDim >= 852 ? 54 : 47;
+    root.style.setProperty("--safe-top", `${fallbackTop}px`);
+    root.style.setProperty("--safe-bottom", "34px");
+    appliedFallbackSafe = true;
+  };
 
   const syncStandalone = () => {
     const standalone = detectStandaloneDisplay();
-    document.documentElement.setAttribute("data-standalone", standalone ? "true" : "false");
+    root.setAttribute("data-standalone", standalone ? "true" : "false");
     pwaStore.set({ standalone });
+    syncSafeAreaFallback(standalone);
   };
   syncStandalone();
+  const safeRaf = typeof window.requestAnimationFrame === "function"
+    ? window.requestAnimationFrame(() => syncSafeAreaFallback(detectStandaloneDisplay()))
+    : 0;
+
+  let lastLandscape = window.innerWidth > window.innerHeight;
+  let baselineHeight = Math.max(window.innerHeight || 0, window.visualViewport?.height || 0);
+  let blurTimer: number | null = null;
+  let orientTimer: number | null = null;
+
+  const updateViewportMetrics = () => {
+    const landscape = window.innerWidth > window.innerHeight;
+    if (landscape !== lastLandscape) {
+      lastLandscape = landscape;
+      baselineHeight = Math.max(window.innerHeight || 0, window.visualViewport?.height || 0);
+    }
+    const vvHeight = window.visualViewport?.height ?? window.innerHeight;
+    const vvOffsetTop = window.visualViewport?.offsetTop ?? 0;
+    baselineHeight = Math.max(baselineHeight, window.innerHeight || 0, vvHeight || 0);
+
+    const editableFocused = isEditableTarget(document.activeElement);
+    const heightDelta = baselineHeight - vvHeight;
+    if (editableFocused && heightDelta > 110) {
+      root.setAttribute("data-kb-open", "true");
+      root.style.setProperty("--h5-vv-height", `${Math.round(vvHeight)}px`);
+      if (window.scrollY !== 0 || vvOffsetTop > 0) {
+        window.scrollTo(0, 0);
+      }
+    } else if (!editableFocused || heightDelta <= 80) {
+      const wasOpen = root.getAttribute("data-kb-open") === "true";
+      root.removeAttribute("data-kb-open");
+      root.style.removeProperty("--h5-vv-height");
+      if (wasOpen && (window.scrollY !== 0 || vvOffsetTop > 0)) {
+        window.scrollTo(0, 0);
+      }
+    }
+    syncSafeAreaFallback(detectStandaloneDisplay());
+  };
+
+  const onViewportResize = () => updateViewportMetrics();
+  const onFocusIn = () => updateViewportMetrics();
+  const onFocusOut = () => {
+    if (blurTimer !== null) window.clearTimeout(blurTimer);
+    blurTimer = window.setTimeout(() => {
+      blurTimer = null;
+      updateViewportMetrics();
+    }, 60);
+  };
+  const onOrientationChange = () => {
+    if (orientTimer !== null) window.clearTimeout(orientTimer);
+    orientTimer = window.setTimeout(() => {
+      orientTimer = null;
+      lastLandscape = window.innerWidth > window.innerHeight;
+      baselineHeight = Math.max(window.innerHeight || 0, window.visualViewport?.height || 0);
+      updateViewportMetrics();
+    }, 180);
+  };
+
+  window.visualViewport?.addEventListener("resize", onViewportResize);
+  window.visualViewport?.addEventListener("scroll", onViewportResize);
+  window.addEventListener("resize", onViewportResize);
+  window.addEventListener("orientationchange", onOrientationChange);
+  document.addEventListener("focusin", onFocusIn);
+  document.addEventListener("focusout", onFocusOut);
 
   const mqStandalone = typeof window.matchMedia === "function" ? window.matchMedia("(display-mode: standalone)") : null;
   const onDisplayChange = () => syncStandalone();
@@ -173,7 +298,8 @@ export function initH5Pwa(opts?: { canReloadNow?: () => boolean }): () => void {
   const onAppInstalled = () => {
     deferredPrompt = null;
     pwaStore.set({ standalone: true, canPromptInstall: false });
-    document.documentElement.setAttribute("data-standalone", "true");
+    root.setAttribute("data-standalone", "true");
+    syncSafeAreaFallback(true);
   };
 
   window.addEventListener("beforeinstallprompt", onBeforeInstall);
@@ -200,6 +326,7 @@ export function initH5Pwa(opts?: { canReloadNow?: () => boolean }): () => void {
   };
   const onPageShow = (ev: PageTransitionEvent) => {
     if (ev.persisted) checkUpstream(true);
+    syncSafeAreaFallback(detectStandaloneDisplay());
   };
   const onOnline = () => checkUpstream(false);
 
@@ -237,7 +364,16 @@ export function initH5Pwa(opts?: { canReloadNow?: () => boolean }): () => void {
 
   return () => {
     canReloadHook = null;
+    if (safeRaf && typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(safeRaf);
+    if (blurTimer !== null) window.clearTimeout(blurTimer);
+    if (orientTimer !== null) window.clearTimeout(orientTimer);
     window.clearTimeout(bootTimer);
+    window.visualViewport?.removeEventListener("resize", onViewportResize);
+    window.visualViewport?.removeEventListener("scroll", onViewportResize);
+    window.removeEventListener("resize", onViewportResize);
+    window.removeEventListener("orientationchange", onOrientationChange);
+    document.removeEventListener("focusin", onFocusIn);
+    document.removeEventListener("focusout", onFocusOut);
     mqStandalone?.removeEventListener?.("change", onDisplayChange);
     window.removeEventListener("beforeinstallprompt", onBeforeInstall);
     window.removeEventListener("appinstalled", onAppInstalled);

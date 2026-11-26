@@ -44,8 +44,8 @@ import { ConfigError, ConfigStore, Sealer, type EffectiveConfig } from "./assist
 import { isPromptId, promptView, promptViews, setPromptEdits } from "./assistant/prompts.ts";
 import { startCall, endAllCalls, type LiveConfig } from "./assistant/live.ts";
 import { EventLog, levelsFrom, parseSince, type EventInput } from "./eventlog.ts";
-import { adminPage, adminAsset } from "./admin.ts";
-import { webAsset, webPage } from "./web/index.ts";
+import { adminPage, adminAsset, setAdminDistDir } from "./admin.ts";
+import { webAsset, webPage, setWebDistDir } from "./web/index.ts";
 import {
   ChallengeStore,
   formatAnchorCookieHeader,
@@ -91,6 +91,7 @@ export interface RelayOptions {
   releaseCacheDir?: string;
   releaseUpstreamBases?: string[];
   releasePollIntervalMs?: number;
+  autoSyncUiBundles?: boolean;
 }
 
 interface Conn {
@@ -192,6 +193,7 @@ export class Relay {
   private eff: EffectiveConfig;
   private dictation: TranscribeLimiter;
   private releases: ReleaseCache;
+  private ownUiBundleSynced = false;
 
   private opts: RelayOptions;
 
@@ -209,6 +211,12 @@ export class Relay {
       upstreamBases: opts.releaseUpstreamBases,
       serverVersion: VERSION,
       pollIntervalMs: opts.releasePollIntervalMs,
+      autoSyncUiBundles: opts.autoSyncUiBundles,
+      onUiBundleSynced: ({ version, webDir, adminDir }) => {
+        setWebDistDir(webDir, version);
+        setAdminDistDir(adminDir, version);
+        this.ownUiBundleSynced = true;
+      },
       onNewRelease: (version) => this.broadcast({ type: "release_update", version, ts: Date.now() }),
       log: this.log,
     });
@@ -323,6 +331,11 @@ export class Relay {
     this.wss.close();
     await new Promise<void>((r) => this.http.close(() => r()));
     this.releases.close();
+    if (this.ownUiBundleSynced) {
+      setWebDistDir(null);
+      setAdminDistDir(null);
+      this.ownUiBundleSynced = false;
+    }
     this.store.close();
   }
 
@@ -1337,6 +1350,7 @@ export class Relay {
     }
     return {
       version: VERSION,
+      uiVersion: this.releases.activeUiVersion() ?? VERSION,
       protocol: PROTOCOL_VERSION,
       startedAt: STARTED,
       devices: devices.length,

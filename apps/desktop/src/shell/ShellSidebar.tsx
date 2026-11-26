@@ -5,7 +5,7 @@ import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
 import { PocketButton, PocketInput, PocketModal, overlayStore, useToast } from "../components/PocketUI";
 import { serverLabel } from "../components/Sidebar";
-import { assetUrl } from "../lib/bridge";
+import { assetUrl, isH5Web } from "../lib/bridge";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { isMockServer } from "../lib/mock";
 import { pingRelay, refreshHostSpaces, rpcCall } from "../lib/relay";
@@ -523,7 +523,7 @@ export const ShellSidebar = memo(function ShellSidebar({
     );
     return id ? (tabs.find((t) => t.id === id) ?? null) : null;
   }, [activeBySpace, allByKey, rawActive, spaceSel, spacesMap, tabs]);
-  const updateReady = updateStore.use((s) => Boolean(s.info?.hasUpdate));
+  const updateReady = updateStore.use((s) => !isH5Web() && Boolean(s.info?.hasUpdate));
   useVisibleTick(30_000); // re-render so the ages move
   const now = Date.now();
 

@@ -24,6 +24,7 @@ const VERSION_STAMP_FILES = new Set([
   "apps/relay/package.json",
   "apps/hostd/package.json",
   "apps/desktop/package.json",
+  "apps/admin/package.json",
   "packages/protocol/package.json",
   "packages/update/package.json",
   "apps/desktop/src-tauri/tauri.conf.json",
@@ -86,6 +87,7 @@ export function groupMatchesPath(group, filePath) {
     case "bundle":
       return (
         filePath.startsWith("apps/relay/") ||
+        filePath.startsWith("apps/admin/") ||
         filePath.startsWith("apps/hostd/") ||
         filePath.startsWith("packages/protocol/") ||
         filePath.startsWith("packages/update/") ||
@@ -95,6 +97,7 @@ export function groupMatchesPath(group, filePath) {
     case "image":
       return (
         filePath.startsWith("apps/relay/") ||
+        filePath.startsWith("apps/admin/") ||
         filePath.startsWith("packages/protocol/") ||
         filePath.startsWith("packages/update/") ||
         filePath === "Dockerfile"

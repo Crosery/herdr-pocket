@@ -100,7 +100,7 @@ function PocketAppShell() {
   const unread = assistantStore.use((s) => s.unread);
   const pendingActions = assistantStore.use((s) => s.items.filter((i) => i.action?.state === "pending").length);
   const callMessage = voiceCallStore.use((s) => s.message);
-  const updateReady = updateStore.use((s) => Boolean(s.info?.hasUpdate));
+  const updateReady = updateStore.use((s) => !isH5Web() && Boolean(s.info?.hasUpdate));
 
   useEnergyAttributes();
   const tier = useViewportTier();

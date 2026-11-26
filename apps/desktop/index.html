@@ -20,6 +20,8 @@
   <script>
     (function () {
       try {
+        var sa = navigator.standalone === true || (window.matchMedia && (window.matchMedia("(display-mode: standalone)").matches || window.matchMedia("(display-mode: fullscreen)").matches));
+        document.documentElement.setAttribute("data-standalone", sa ? "true" : "false");
         var raw = localStorage.getItem("herdr-pocket-client-prefs-v1");
         var saved = raw ? JSON.parse(raw).theme : localStorage.getItem("herdr-pocket-client-theme");
         var dark = saved === "dark" || (saved !== "light" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
