@@ -223,7 +223,7 @@ function RevealExplorer({
         {previewTarget ? (
           <FileViewer
             key={`${item.hostId}:${previewTarget}`}
-            tab={{ path: previewTarget, title: previewName, absPath: previewTarget }}
+            tab={{ path: previewTarget, title: previewName, absPath: previewTarget, deviceId: item.hostId }}
             agent={agent}
           />
         ) : (
@@ -572,7 +572,7 @@ export function PortalViewerModal({
   const transportLabel = transport.label;
   const rttMs = transport.rttMs ?? relayRttMs;
   const handleRetryP2p = () => {
-    ensureDirectLinkNow(hostId);
+    ensureDirectLinkNow(hostId, true);
     toast("正在尝试建立 P2P 直连…");
   };
   const fpsStatusText =
@@ -1306,7 +1306,7 @@ export function PortalViewerModal({
             <div className="portal-file-viewer-host">
               <FileViewer
                 key={`${item.hostId}:${item.targetPath || item.title}`}
-                tab={{ path: item.targetPath || item.title, title: item.title, absPath: item.targetPath }}
+                tab={{ path: item.targetPath || item.title, title: item.title, absPath: item.targetPath, deviceId: item.hostId }}
                 agent={agent}
                 embedded
               />

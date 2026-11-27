@@ -58,6 +58,10 @@ export async function flushWebRelayLogs(): Promise<void> {
 
 export function registerWebLogUploader(fn: ((batch: WebRelayLogEntry[]) => Promise<boolean>) | null): void {
   webUploader = fn;
+  if (!fn && webUploadTimer) {
+    clearInterval(webUploadTimer);
+    webUploadTimer = null;
+  }
   if (fn && !webUploadTimer && typeof window !== "undefined") {
     webUploadTimer = setInterval(() => {
       void flushWebRelayLogs();

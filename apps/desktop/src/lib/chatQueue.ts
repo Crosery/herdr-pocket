@@ -16,7 +16,7 @@ import {
 import { logger } from "./log";
 import { localHostIdStore } from "./fonts";
 import { native } from "./native";
-import { isDirectConnected, rpcCall } from "./relay";
+import { getDirectLink, isDirectConnected, rpcCall } from "./relay";
 import { allAgents, createStore, liveStore } from "./store";
 import { uploadRemoteFile } from "./uploadLargeFile";
 import { registerWorkspaceSection, scheduleWorkspacePersist } from "./workspacePersist";
@@ -395,11 +395,14 @@ async function deliverOutgoing(send: OutgoingSend, delivery: DeliveryMode = "aut
     if (uploadedPaths?.length) {
       body = textWithFiles(send.text, uploadedPaths);
     } else if (send.attachments.length > 0) {
+      const direct = getDirectLink(send.deviceId);
+      const isWebRtcDirect = Boolean(direct?.open && direct.transportKind === "webrtc");
       const preferStream = (att: StagedAttachment) =>
         Boolean(
           !att.hostRef &&
             att.file &&
             (!att.put ||
+              (isWebRtcDirect && att.file.size > 64 * 1024) ||
               (att.kind !== "image" &&
                 att.file.size > 512 * 1024 &&
                 (!native.available() || isDirectConnected(send.deviceId)))),

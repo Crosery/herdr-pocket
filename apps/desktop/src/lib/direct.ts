@@ -50,12 +50,16 @@ export class DirectError extends Error {
   }
 }
 
-/** Read-only RPCs safe to replay over the relay if the direct socket drops mid-flight. */
+/** Read-only or idempotent RPCs safe to replay over the relay if the direct socket drops mid-flight. */
 export const SAFE_AGAIN = new Set<RpcMethod>([
   "host.info",
   "agents.list",
   "spaces.list",
   "terminal.read",
+  "terminal.resize",
+  "terminal.put",
+  "terminal.putBegin",
+  "terminal.putAbort",
   "session.events",
   "session.children",
   "sessions.list",
@@ -66,6 +70,7 @@ export const SAFE_AGAIN = new Set<RpcMethod>([
   "herdr.layout",
   "herdr.doc.get",
   "agent.seen",
+  "agent.ports",
   "files.list",
   "files.read",
   "folders.list",
@@ -91,6 +96,7 @@ export type WebRtcSignaler = (offer: WebRtcOfferParams) => Promise<WebRtcAnswerR
 export interface DirectHandlers {
   onStream: (frame: ServerFrame) => void;
   onClose: (link: DirectLink) => void;
+  onRtt?: (link: DirectLink, rttMs: number) => void;
 }
 
 interface Pending {
@@ -120,10 +126,14 @@ const DIAL_REMOTE_MS = 2800;
 const DIAL_WEBRTC_MS = 6500;
 const WEBRTC_GATHER_WAIT_MS = 700;
 const WEBRTC_SRFLX_GRACE_MS = 120;
-const PING_MS = 25_000;
-const PONG_WAIT_MS = 20_000;
+const PING_MS = 20_000;
+const PONG_WAIT_MS = 10_000;
 const PONG_DRAIN_GRACE_MS = 250;
 const MISSED_PONG_LIMIT = 2;
+const TIMEOUT_EVICT_LIMIT = 2;
+const WEBRTC_CONGESTED_BYTES = 64 * 1024;
+const PUT_OPEN_TIMEOUT_MS = 8_000;
+const PUT_IDLE_TIMEOUT_MS = 20_000;
 const RPC_MAX_UTF8_BYTES = 44 * 1024;
 const RPC_MAX_PARTIAL_BYTES = 32 * 1024 * 1024;
 const DC_HIGH_WATER = 512 * 1024;
@@ -555,9 +565,13 @@ export class DirectLink {
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private pongGraceTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRxAt = Date.now();
+  /** Last time a bidirectional response (`pong` or `rpc_result`) proved client -> host -> client works. */
+  private lastBidirectionalRxAt = Date.now();
   private lastPingSentAt = 0;
   private rttMs: number | null = null;
   private missedPongs = 0;
+  private consecutiveTimeouts = 0;
+  private pongWaiters: Array<(rttMs: number | null) => void> = [];
   private rxChain: Promise<void> = Promise.resolve();
   private closed = false;
 
@@ -638,8 +652,47 @@ export class DirectLink {
     return this.rttMs;
   }
 
+  getBufferedAmount(): number {
+    if (this.closed) return 0;
+    if (this.transportKind === "webrtc") {
+      return this.dc?.readyState === "open" ? this.dc.bufferedAmount ?? 0 : 0;
+    }
+    return this.ws?.readyState === WebSocket.OPEN ? this.ws.bufferedAmount ?? 0 : 0;
+  }
+
+  /** True when the direct channel is backed up or recently timed out and interactive writes should bypass it. */
+  isCongested(): boolean {
+    if (!this.open) return true;
+    if (this.consecutiveTimeouts > 0) return true;
+    if (this.transportKind === "webrtc" && this.getBufferedAmount() > WEBRTC_CONGESTED_BYTES) {
+      return true;
+    }
+    return false;
+  }
+
   pingNow(): void {
     this.sendPing();
+  }
+
+  /** Actively measures direct RTT via ping/pong (resolves `null` if link is closed or times out). */
+  measureRtt(timeoutMs = 3_500): Promise<number | null> {
+    if (!this.open) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (val: number | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(val);
+      };
+      const timer = setTimeout(() => {
+        const idx = this.pongWaiters.indexOf(done);
+        if (idx >= 0) this.pongWaiters.splice(idx, 1);
+        done(null);
+      }, timeoutMs);
+      this.pongWaiters.push(done);
+      this.sendPing();
+    });
   }
 
   get open(): boolean {
@@ -973,21 +1026,33 @@ export class DirectLink {
   }
 
   private onDecodedFrame(frame: ServerFrame): void {
-    this.lastRxAt = Date.now();
-    this.missedPongs = 0;
-    this.clearPongTimers();
+    const now = Date.now();
+    this.lastRxAt = now;
 
     if (frame.type === "pong") {
+      this.lastBidirectionalRxAt = now;
+      this.missedPongs = 0;
+      this.consecutiveTimeouts = 0;
+      this.clearPongTimers();
       const echoedT =
         typeof (frame as { t?: unknown }).t === "number"
           ? (frame as { t: number }).t
           : this.lastPingSentAt;
       if (echoedT > 0) {
-        this.rttMs = Math.max(1, Math.min(9999, Date.now() - echoedT));
+        const measured = Math.max(1, Math.min(9999, now - echoedT));
+        this.rttMs = measured;
+        this.handlers.onRtt?.(this, measured);
+        for (const w of this.pongWaiters.splice(0)) w(measured);
+      } else {
+        for (const w of this.pongWaiters.splice(0)) w(this.rttMs);
       }
       return;
     }
     if (frame.type === "rpc_result") {
+      this.lastBidirectionalRxAt = now;
+      this.missedPongs = 0;
+      this.consecutiveTimeouts = 0;
+      this.clearPongTimers();
       const p = this.pending.get(frame.id);
       if (!p) return;
       this.pending.delete(frame.id);
@@ -1015,7 +1080,8 @@ export class DirectLink {
       this.pongTimer = setTimeout(() => {
         this.pongTimer = null;
         if (this.closed || isPageHidden()) return;
-        if (Date.now() - this.lastRxAt < PONG_WAIT_MS) {
+        // Only bidirectional responses (pong / rpc_result) prove client -> host -> client is alive.
+        if (Date.now() - this.lastBidirectionalRxAt < PONG_WAIT_MS) {
           this.missedPongs = 0;
           return;
         }
@@ -1023,7 +1089,7 @@ export class DirectLink {
         this.pongGraceTimer = setTimeout(() => {
           this.pongGraceTimer = null;
           if (this.closed || isPageHidden()) return;
-          if (Date.now() - this.lastRxAt < PONG_WAIT_MS + PONG_DRAIN_GRACE_MS) {
+          if (Date.now() - this.lastBidirectionalRxAt < PONG_WAIT_MS + PONG_DRAIN_GRACE_MS) {
             this.missedPongs = 0;
             return;
           }
@@ -1032,37 +1098,70 @@ export class DirectLink {
             this.sendPing();
             return;
           }
-          logger.warn("link.direct", `direct pong timeout on ${this.displayAddr} (${Date.now() - this.lastRxAt}ms idle)`);
+          logger.warn(
+            "link.direct",
+            `direct pong timeout on ${this.displayAddr} (${Date.now() - this.lastBidirectionalRxAt}ms bidirectional idle, ${Date.now() - this.lastRxAt}ms rx idle)`,
+          );
           this.close();
         }, PONG_DRAIN_GRACE_MS);
       }, PONG_WAIT_MS);
     }
   }
 
-  private send(frame: Record<string, unknown>): boolean {
-    if (!this.open) return false;
+  /**
+   * Sends a frame over WS or WebRTC DataChannel.
+   * Returns `"sent"` on success, `"not_sent"` when refused before transmitting any bytes
+   * (e.g. closed or WebRTC send buffer full), or `"failed_midway"` if a multi-chunk send threw mid-stream.
+   */
+  private sendFrame(frame: Record<string, unknown>): "sent" | "not_sent" | "failed_midway" {
+    if (!this.open) return "not_sent";
+    let json: string;
     try {
-      const json = JSON.stringify(frame);
-      if (this.transportKind === "ws") {
-        if (!this.cipher || !this.ws) return false;
+      json = JSON.stringify(frame);
+    } catch {
+      return "not_sent";
+    }
+    if (this.transportKind === "ws") {
+      if (!this.cipher || !this.ws) return "not_sent";
+      try {
         this.ws.send(this.cipher.seal(json));
-        return true;
+        return "sent";
+      } catch {
+        this.close();
+        return "not_sent";
       }
-      if (!this.dc || this.dc.readyState !== "open") return false;
-      const parts = splitWebRtcRpcPayload(json);
+    }
+    if (!this.dc || this.dc.readyState !== "open") return "not_sent";
+    const parts = splitWebRtcRpcPayload(json);
+    // Avoid head-of-line deadlocking the ordered hp-rpc DataChannel with a large burst when SCTP buffer is already full.
+    if (parts.length > 1 && (this.dc.bufferedAmount ?? 0) > DC_HIGH_WATER) {
+      logger.warn(
+        "link.direct",
+        `webrtc rpc buffer saturated (${this.dc.bufferedAmount}B); refusing ${parts.length}-chunk frame pre-send`,
+      );
+      return "not_sent";
+    }
+    let chunksSent = 0;
+    try {
       if (parts.length === 1) {
         this.dc.send(parts[0]!);
-        return true;
+        return "sent";
       }
       const id = `c${++this.chunkSeq}`;
       for (let idx = 0; idx < parts.length; idx += 1) {
         this.dc.send(JSON.stringify({ type: "__chunk", id, idx, total: parts.length, part: parts[idx] }));
+        chunksSent += 1;
       }
-      return true;
-    } catch {
+      return "sent";
+    } catch (err) {
+      logger.warn("link.direct", `webrtc send failed after ${chunksSent}/${parts.length} chunks: ${String(err)}`);
       this.close();
-      return false;
+      return chunksSent > 0 ? "failed_midway" : "not_sent";
     }
+  }
+
+  private send(frame: Record<string, unknown>): boolean {
+    return this.sendFrame(frame) === "sent";
   }
 
   /** Streams a Blob/File directly over a dedicated ordered binary WebRTC DataChannel (`hp-put`). */
@@ -1073,9 +1172,18 @@ export class DirectLink {
 
     return await new Promise<boolean>((resolve) => {
       let settled = false;
+      let stallTimer: ReturnType<typeof setTimeout> | null = null;
+      const bumpTimer = (ms: number) => {
+        if (stallTimer) clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => finish(false), ms);
+      };
       const finish = (ok: boolean) => {
         if (settled) return;
         settled = true;
+        if (stallTimer) {
+          clearTimeout(stallTimer);
+          stallTimer = null;
+        }
         dc.onopen = dc.onmessage = dc.onclose = dc.onerror = null;
         try {
           dc.close();
@@ -1084,6 +1192,7 @@ export class DirectLink {
         }
         resolve(ok);
       };
+      bumpTimer(PUT_OPEN_TIMEOUT_MS);
 
       const startUpload = async () => {
         try {
@@ -1098,16 +1207,19 @@ export class DirectLink {
             }
             if (settled || dc.readyState !== "open") return;
             dc.send(buf);
+            bumpTimer(PUT_IDLE_TIMEOUT_MS);
             sent += buf.byteLength;
             onProgress?.(Math.min(99, Math.round((sent / total) * 100)));
           }
           dc.send(JSON.stringify({ type: "eof" }));
+          bumpTimer(PUT_IDLE_TIMEOUT_MS);
         } catch {
           finish(false);
         }
       };
 
       dc.onopen = () => {
+        bumpTimer(PUT_OPEN_TIMEOUT_MS);
         try {
           dc.send(JSON.stringify({ type: "put", token }));
         } catch {
@@ -1116,6 +1228,7 @@ export class DirectLink {
       };
       dc.onmessage = (ev) => {
         if (typeof ev.data !== "string") return;
+        bumpTimer(PUT_IDLE_TIMEOUT_MS);
         try {
           const msg = JSON.parse(ev.data) as { type?: string; receivedBytes?: number };
           if (msg.type === "ready") {
@@ -1203,19 +1316,35 @@ export class DirectLink {
 
   call(method: RpcMethod, params: unknown, timeoutMs = 15_000): Promise<unknown> {
     if (!this.open) {
-      return Promise.reject(new DirectError("offline", "直连已断开", true));
+      return Promise.reject(new DirectError("offline", "直连已断开", false));
     }
     const id = `d${++this.seq}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.consecutiveTimeouts += 1;
+        const staleBidirectional = Date.now() - this.lastBidirectionalRxAt > PONG_WAIT_MS;
+        const shouldEvict =
+          this.consecutiveTimeouts >= TIMEOUT_EVICT_LIMIT ||
+          (this.transportKind === "webrtc" && this.getBufferedAmount() > WEBRTC_CONGESTED_BYTES) ||
+          staleBidirectional;
         reject(new DirectError("timeout", "直连请求超时", true));
+        if (shouldEvict) {
+          logger.warn(
+            "link.direct",
+            `evicting stalled direct link on ${this.displayAddr} (${method} timed out, timeouts=${this.consecutiveTimeouts}, buf=${this.getBufferedAmount()}B)`,
+          );
+          this.close();
+        } else {
+          this.sendPing();
+        }
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      if (!this.send({ type: "rpc", id, to: this.to, method, params })) {
+      const status = this.sendFrame({ type: "rpc", id, to: this.to, method, params });
+      if (status !== "sent") {
         this.pending.delete(id);
         clearTimeout(timer);
-        reject(new DirectError("offline", "直连已断开", true));
+        reject(new DirectError("offline", "直连已断开", status === "failed_midway"));
       }
     });
   }
@@ -1237,6 +1366,7 @@ export class DirectLink {
       this.initPingTimer = null;
     }
     this.clearPongTimers();
+    for (const w of this.pongWaiters.splice(0)) w(null);
     this.partials.clear();
     this.binPartials.clear();
     if (this.ws) {

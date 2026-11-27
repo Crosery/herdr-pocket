@@ -1,6 +1,6 @@
 {
   "name": "@herdr-pocket/hostd",
-  "version": "0.2.58",
+  "version": "0.2.59",
   "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",

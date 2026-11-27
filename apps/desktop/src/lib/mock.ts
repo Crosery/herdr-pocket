@@ -1051,12 +1051,26 @@ export const mockApi = {
     for (const a of DEMO_AGENTS) (agents[a.deviceId] ??= []).push(a);
     liveStore.set({
       link: "online",
+      hasSnapshot: true,
       devices: Object.fromEntries(DEMO_DEVICES.map((d) => [d.id, d])),
       agents,
       spaces: {
         "dev-mac": demoSpacesForHost("dev-mac"),
         "dev-linux": demoSpacesForHost("dev-linux"),
       },
+      direct: { "dev-mac": "127.0.0.1" },
+      directMeta: {
+        "dev-mac": {
+          addr: "127.0.0.1",
+          linkKind: "local",
+          rttMs: 2,
+          connectedAt: Date.now(),
+        },
+      },
+      hostProbeRttMs: { "dev-mac": 2, "dev-linux": 44 },
+      rttMs: 28,
+      relayConnectMs: 112,
+      lastPongAt: Date.now(),
       tutorialServerSynced: true,
       rev: liveStore.get().rev + 1,
     });

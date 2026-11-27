@@ -50,6 +50,7 @@ export function InstanceRuntimePopover({
   // Port state
   const [livePorts, setLivePorts] = useState<AgentListeningPort[] | null>(null);
   const [portsLoading, setPortsLoading] = useState(false);
+  const [portsUnsupported, setPortsUnsupported] = useState(false);
   const [stoppingPort, setStoppingPort] = useState<number | null>(null);
 
   // Subagent state
@@ -95,6 +96,7 @@ export function InstanceRuntimePopover({
 
   useEffect(() => {
     setLivePorts(null);
+    setPortsUnsupported(false);
     setFetchedSubs(null);
     setChildrenMap({});
     setExpanded(new Set());
@@ -112,13 +114,20 @@ export function InstanceRuntimePopover({
     return () => window.clearInterval(t);
   }, [open, workingCount]);
 
-  const refreshPorts = useCallback(async () => {
+  const refreshPorts = useCallback(async (opts?: { silent?: boolean }) => {
     setPortsLoading(true);
     try {
       const res = await rpcCall(agent.deviceId, "agent.ports", { agent: agent.key, action: "list" }, 8_000);
+      setPortsUnsupported(false);
       setLivePorts(res.ports);
     } catch (e) {
-      toast((e as Error).message || "刷新端口失败", true);
+      const err = e as { code?: string; message?: string };
+      const msg = err?.message || "";
+      if (err?.code === "unsupported" || /unknown|unsupported|不支持/i.test(msg)) {
+        setPortsUnsupported(true);
+      } else if (!opts?.silent) {
+        toast(msg || "刷新端口失败", true);
+      }
     } finally {
       setPortsLoading(false);
     }
@@ -151,9 +160,11 @@ export function InstanceRuntimePopover({
       setOpen(true);
       if (tab === "subs" && subs.length === 0 && subTotalCount > 0) {
         void refreshSubs();
+      } else if (tab === "ports" && ports.length === 0) {
+        void refreshPorts({ silent: true });
       }
     },
-    [activeTab, open, refreshSubs, subTotalCount, subs.length],
+    [activeTab, open, ports.length, refreshPorts, refreshSubs, subTotalCount, subs.length],
   );
 
   useEffect(() => {
@@ -340,7 +351,10 @@ export function InstanceRuntimePopover({
                     role="tab"
                     aria-selected={activeTab === "ports"}
                     className={`inst-pop-tab port${activeTab === "ports" ? " active" : ""}`}
-                    onClick={() => setActiveTab("ports")}
+                    onClick={() => {
+                      setActiveTab("ports");
+                      if (ports.length === 0) void refreshPorts({ silent: true });
+                    }}
                   >
                     <Radio size={12} />
                     <span>端口 {ports.length}</span>
@@ -441,6 +455,10 @@ export function InstanceRuntimePopover({
                         </div>
                       );
                     })
+                  ) : portsUnsupported ? (
+                    <div className="sub-pop-notice">当前电脑的 hostd 版本较旧，升级并重启 hostd 后即可扫描监听端口</div>
+                  ) : portsLoading ? (
+                    <div className="sub-pop-notice">正在扫描监听端口…</div>
                   ) : (
                     <div className="sub-pop-notice">暂无监听端口（点右上角 ↻ 重新检测）</div>
                   )

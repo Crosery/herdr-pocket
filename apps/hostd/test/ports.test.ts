@@ -4,6 +4,7 @@ import type { Agent } from "@herdr-pocket/protocol";
 import {
   clearPortProbeCacheForTest,
   extractHtmlTitle,
+  parseLsofCwds,
   parseLsofListeners,
   parseSsListeners,
   parseWinNetstatListeners,
@@ -156,4 +157,74 @@ test("stopAgentListeningPort verifies process ownership before signaling SIGTERM
   const remaining = await stopAgentListeningPort(sampleAgent, 1050, 5173, terminals, deps);
   assert.deepEqual(killed, [1050]);
   assert.deepEqual(remaining, []);
+});
+
+test("scanAgentListeningPorts ignores agent harness IPC ports and attributes detached PPID=1 dev servers via project CWD", async () => {
+  assert.deepEqual(
+    parseLsofCwds("p500\nn/work/app/apps/web\np501\nn/work/my\\x20app\n"),
+    new Map([
+      [500, "/work/app/apps/web"],
+      [501, "/work/my app"],
+    ]),
+  );
+
+  const containerAgent: Agent = { ...sampleAgent, key: "h1/hc:t-root", localId: "t-root", cwd: "/work" };
+  const repoAgent: Agent = { ...sampleAgent, key: "h1/hc:t-repo", localId: "t-repo", harness: "antigravity", cwd: "/work/demo-repo" };
+  const terminals = new Map<string, PortTerminalRef>([
+    ["t-root", { address: "t-root", pid: 100, cwd: "/work" }],
+    ["t-repo", { address: "t-repo", pid: 200, foreground: { pid: 201, cwd: "/work/demo-repo" }, cwd: "/work/demo-repo" }],
+  ]);
+
+  const procs = new Map<number, { ppid: number; name: string }>([
+    [100, { ppid: 1, name: "zsh" }],
+    [200, { ppid: 1, name: "zsh" }],
+    [201, { ppid: 200, name: "agy" }],
+    [202, { ppid: 201, name: "python3" }], // child server of agy
+    [301, { ppid: 1, name: "node" }], // detached vite in monorepo subdir
+    [302, { ppid: 1, name: "nginx" }], // detached nginx master
+    [303, { ppid: 302, name: "nginx" }], // detached nginx worker (same port)
+    [304, { ppid: 1, name: "adb" }], // ignored daemon in same cwd
+    [305, { ppid: 1, name: "OrbStack\\x20Helper" }], // ignored container helper in same cwd
+    [306, { ppid: 1, name: "node" }], // detached server in unrelated sibling project under /work
+    [307, { ppid: 1, name: "node" }], // detached server inside nested git sub-repo
+  ]);
+
+  const listeners = [
+    { pid: 201, processName: "agy", host: "127.0.0.1", port: 62495 }, // agent internal IPC — MUST ignore
+    { pid: 202, processName: "python3", host: "127.0.0.1", port: 18736 }, // tree match
+    { pid: 301, processName: "node", host: "127.0.0.1", port: 5173 }, // detached subpath match
+    { pid: 302, processName: "nginx", host: "127.0.0.1", port: 18191 }, // detached exact match
+    { pid: 303, processName: "nginx", host: "127.0.0.1", port: 18191 }, // duplicate port
+    { pid: 304, processName: "adb", host: "127.0.0.1", port: 5037 }, // ignored
+    { pid: 305, processName: "OrbStack\\x20Helper", host: "127.0.0.1", port: 15432 }, // ignored
+    { pid: 306, processName: "node", host: "127.0.0.1", port: 8888 }, // sibling under non-project /work
+    { pid: 307, processName: "node", host: "127.0.0.1", port: 9999 }, // nested .git boundary
+  ];
+
+  const cwds = new Map<number, string>([
+    [301, "/work/demo-repo/apps/console"],
+    [302, "/work/demo-repo"],
+    [303, "/work/demo-repo"],
+    [304, "/work/demo-repo"],
+    [305, "/work/demo-repo"],
+    [306, "/work/other-service"],
+    [307, "/work/demo-repo/vendor/subrepo"],
+  ]);
+
+  const mapped = await scanAgentListeningPorts([containerAgent, repoAgent], terminals, {
+    selfPid: 99999,
+    listProcessParents: async () => procs,
+    listListeners: async () => listeners,
+    listProcessCwds: async () => cwds,
+    isProjectRoot: (dir) => dir === "/work/demo-repo",
+    hasGitDir: (dir) => dir === "/work/demo-repo" || dir === "/work/demo-repo/vendor/subrepo",
+    probeHttp: async () => ({ protocol: "http" as const }),
+  });
+
+  // Container directory `/work` (not a project root) must NOT steal sibling `/work/other-service`.
+  assert.equal(mapped.get(containerAgent.key), undefined);
+
+  // `repoAgent` gets its child server + detached monorepo & exact-cwd servers, excluding `agy`, `adb`, `OrbStack Helper`, and nested `.git` sub-repo.
+  const repoPorts = (mapped.get(repoAgent.key) ?? []).map((p) => p.port);
+  assert.deepEqual(repoPorts, [5173, 18191, 18736]);
 });

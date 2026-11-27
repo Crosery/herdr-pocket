@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Copy, Laptop, Monitor, Plus, QrCode, RefreshCw, Server, Smartphone, Trash2, Upload } from "lucide-react";
+import { Activity, Copy, Laptop, Monitor, Plus, QrCode, Radio, RefreshCw, Server, Smartphone, Trash2, Upload, Zap } from "lucide-react";
 import { configKeySpec, type Device } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../../components/MascotAndVendor";
 import { PocketBadge, PocketButton, PocketInput, PocketSelect, PocketSwitch, useToast } from "../../components/PocketUI";
 import { LocalHostDeps } from "../../components/LocalHostDeps";
 import { PermissionCards, prettyHotkey } from "../../components/VoiceInput";
 import { serverLabel } from "../../components/Sidebar";
-import { copyToClipboard } from "../../lib/bridge";
+import { appVersion, copyToClipboard } from "../../lib/bridge";
 import { partitionDevices, type ClassifiedDevice } from "../../lib/deviceRole";
 import {
   buildTerminalFontFamily,
@@ -20,12 +20,14 @@ import {
 import { native, type LogFolderInfo, type Permissions } from "../../lib/native";
 import { setConfig, useClientConfig } from "../../lib/config";
 import { isMockServer } from "../../lib/mock";
-import { pingRelay, refreshHostSpaces, rpcCall } from "../../lib/relay";
+import { classifyLatency, describeHostTransport, isOlderVersion, summarizeDirectError } from "../../lib/networkMeta";
+import { ensureDirectLinkNow, measureHostRtt, measureRelayRtt, pingRelay, refreshHostSpaces, rpcCall } from "../../lib/relay";
 import {
   liveStore,
   relTime,
   settingsStore,
   updateSettings,
+  type DirectHostMeta,
   type SidebarAgentGrouping,
   type SidebarStyleScheme,
 } from "../../lib/store";
@@ -1010,16 +1012,39 @@ export function KeyboardPane() {
 function DeviceRow({
   item,
   agents,
+  directAddr,
+  directMeta,
+  probeRttMs,
+  relayRttMs,
+  probing,
+  onProbe,
+  onTryDirect,
   onRemove,
 }: {
   item: ClassifiedDevice;
   agents?: number;
+  directAddr?: string;
+  directMeta?: DirectHostMeta;
+  probeRttMs?: number;
+  relayRttMs?: number | null;
+  probing?: boolean;
+  onProbe?: () => void;
+  onTryDirect?: () => void;
   onRemove?: () => void;
 }) {
   const { device: d, isCurrentDevice, isLocalHost, isExecutionHost, roleLabel, mergedViewer } = item;
   const online = d.online || Boolean(mergedViewer?.online);
+  const isHost = d.kind === "host";
+  const transport = isHost ? describeHostTransport(directAddr, directMeta) : null;
+  const shownRtt = isHost
+    ? (directAddr ? (directMeta?.rttMs ?? probeRttMs ?? null) : (probeRttMs ?? relayRttMs ?? null))
+    : null;
+  const quality = classifyLatency(shownRtt);
+  const directDiag = isHost && online && !directAddr ? summarizeDirectError(directMeta?.lastError) : null;
+  const outdatedHost = isHost && isOlderVersion(d.version, appVersion());
+
   const meta = [
-    d.kind === "host" ? `${agents ?? 0} 个 Agent` : null,
+    isHost ? `${agents ?? 0} 个 Agent` : null,
     d.platform,
     d.version ? `v${d.version}` : null,
     online ? "在线" : `上次 ${relTime(d.lastSeenAt)}`,
@@ -1027,27 +1052,75 @@ function DeviceRow({
     .filter(Boolean)
     .join(" · ");
   const roleTone = isLocalHost ? "mint" : isExecutionHost ? "lav" : "neutral";
+  const showActionBar = Boolean((isHost && online && (onProbe || (!directAddr && onTryDirect))) || (isHost && onRemove));
   return (
-    <SetRow
-      title={
-        <span className="sf-device">
-          {d.kind === "host" || isExecutionHost ? <Laptop size={15} /> : roleLabel.includes("控制端") && !roleLabel.includes("手机") && !roleLabel.includes("便携") ? <Monitor size={15} /> : <Smartphone size={15} />}
-          <span className="truncate">{d.name}</span>
-          {isCurrentDevice ? <PocketBadge tone="pink">当前设备 · 本机</PocketBadge> : null}
-          <PocketBadge tone={roleTone}>{roleLabel}</PocketBadge>
+    <div className="sf-net-card">
+      <div className="sf-net-card-top">
+        <div className="sf-net-card-main">
+          <div className="sf-net-card-title">
+            {isHost || isExecutionHost ? (
+              <Laptop size={15} />
+            ) : roleLabel.includes("控制端") && !roleLabel.includes("手机") && !roleLabel.includes("便携") ? (
+              <Monitor size={15} />
+            ) : (
+              <Smartphone size={15} />
+            )}
+            <span className="truncate">{d.name}</span>
+            {isCurrentDevice ? <PocketBadge tone="pink">当前设备 · 本机</PocketBadge> : null}
+            <PocketBadge tone={roleTone}>{roleLabel}</PocketBadge>
+            {outdatedHost ? <PocketBadge tone="lav">可升级</PocketBadge> : null}
+          </div>
+          <div className="sf-net-card-meta">{meta}</div>
+          {directDiag ? <div className="sf-net-card-diag">{directDiag}</div> : null}
+        </div>
+        <span className="sf-combo" style={{ flexWrap: "nowrap" }}>
+          {isHost && online && transport ? (
+            <span
+              className={`sf-rtt-pill is-${quality.level}`}
+              title={
+                transport.addr
+                  ? `${transport.label} (${transport.addr})${typeof shownRtt === "number" ? ` · ${shownRtt} ms` : ""}`
+                  : `${transport.label}${typeof shownRtt === "number" ? ` · ${shownRtt} ms` : ""}`
+              }
+            >
+              <span className="sf-rtt-dot" aria-hidden />
+              <span>{transport.label}</span>
+              <span className="mono">{typeof shownRtt === "number" ? `${shownRtt} ms` : "待测"}</span>
+            </span>
+          ) : (
+            <span className={`sf-dot${online ? " on" : ""}`} aria-label={online ? "在线" : "离线"} />
+          )}
+          {!showActionBar && onRemove ? (
+            <button className="sf-icon-btn" aria-label={`移除 ${d.name}`} title="移除授权" onClick={onRemove}>
+              <Trash2 size={14} />
+            </button>
+          ) : null}
         </span>
-      }
-      about={meta}
-    >
-      <span className="sf-combo">
-        <span className={`sf-dot${online ? " on" : ""}`} aria-label={online ? "在线" : "离线"} />
-        {onRemove ? (
-          <button className="sf-icon-btn" aria-label={`移除 ${d.name}`} title="移除授权" onClick={onRemove}>
-            <Trash2 size={14} />
-          </button>
-        ) : null}
-      </span>
-    </SetRow>
+      </div>
+      {showActionBar ? (
+        <div className="sf-net-card-actions">
+          {isHost && online && onProbe ? (
+            <PocketButton size="sm" variant="soft" disabled={probing} onClick={onProbe}>
+              <Activity size={13} className={probing ? "pk-spin" : undefined} />
+              <span>{probing ? "测速中…" : "测速"}</span>
+            </PocketButton>
+          ) : null}
+          {isHost && online && !directAddr && onTryDirect ? (
+            <PocketButton size="sm" variant="ghost" onClick={onTryDirect}>
+              <Zap size={13} />
+              <span>尝试直连</span>
+            </PocketButton>
+          ) : null}
+          {onRemove ? (
+            <span className="sf-net-card-action-end">
+              <button className="sf-icon-btn" aria-label={`移除 ${d.name}`} title="移除授权" onClick={onRemove}>
+                <Trash2 size={14} />
+              </button>
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -1068,19 +1141,98 @@ export function MachinesPane({
   const link = liveStore.use((s) => s.link);
   const devices = liveStore.use((s) => s.devices);
   const agents = liveStore.use((s) => s.agents);
+  const directMap = liveStore.use((s) => s.direct);
+  const directMeta = liveStore.use((s) => s.directMeta);
+  const hostProbeRttMs = liveStore.use((s) => s.hostProbeRttMs);
+  const relayRttMs = liveStore.use((s) => s.rttMs);
+  const relayConnectMs = liveStore.use((s) => s.relayConnectMs);
+  const lastPongAt = liveStore.use((s) => s.lastPongAt);
   const { hostd, checking, recheck } = useHostdStatus();
   const [removing, setRemoving] = useState<Device | null>(null);
   const [syncingSpaces, setSyncingSpaces] = useState<"sync" | "migrate" | null>(null);
+  const [probingAll, setProbingAll] = useState(false);
+  const [probingHostId, setProbingHostId] = useState<string | null>(null);
   const status = linkLabel(link);
   const real = Boolean(server && !isMockServer(server));
-  const { desktop, mobile } = useMemo(
+  const { desktop, mobile, desktopOnlineCount, mobileOnlineCount } = useMemo(
     () => partitionDevices(devices, { myId, localHostId }),
     [devices, myId, localHostId],
+  );
+  const onlineHosts = useMemo(
+    () => Object.values(devices).filter((d) => d.kind === "host" && d.online),
+    [devices],
+  );
+  const directHostCount = useMemo(
+    () => onlineHosts.filter((h) => Boolean(directMap[h.id])).length,
+    [onlineHosts, directMap],
+  );
+  const totalAgentsCount = useMemo(
+    () =>
+      Object.values(agents)
+        .flat()
+        .filter((a) => !a.isShell).length,
+    [agents],
   );
   const syncTargetHost = useMemo(() => {
     if (localHostId && devices[localHostId]?.online) return devices[localHostId]!;
     return Object.values(devices).find((d) => d.kind === "host" && d.online) ?? null;
   }, [devices, localHostId]);
+
+  const runProbeAll = useCallback(
+    async (silent = false) => {
+      if (link !== "online") {
+        if (!silent) toast("尚未连上中转服务器", true);
+        return;
+      }
+      setProbingAll(true);
+      try {
+        const hosts = Object.values(liveStore.get().devices).filter((d) => d.kind === "host" && d.online);
+        const [relayMs] = await Promise.all([
+          measureRelayRtt(4_000),
+          ...hosts.map((h) => measureHostRtt(h.id, 4_000)),
+        ]);
+        if (!silent) {
+          toast(typeof relayMs === "number" ? `测速完成 · 中继延迟 ${relayMs} ms` : "测速完成");
+        }
+      } finally {
+        setProbingAll(false);
+      }
+    },
+    [link, toast],
+  );
+
+  const runProbeSingleHost = useCallback(
+    async (hostId: string, hostName: string) => {
+      setProbingHostId(hostId);
+      try {
+        const res = await measureHostRtt(hostId, 4_000);
+        if (typeof res.rttMs === "number") {
+          toast(`${hostName} · ${res.via === "direct" ? "直连" : "中继"} ${res.rttMs} ms`);
+        } else {
+          toast(`${hostName} 测速超时`, true);
+        }
+      } finally {
+        setProbingHostId((cur) => (cur === hostId ? null : cur));
+      }
+    },
+    [toast],
+  );
+
+  // Auto-populate live relay & host latencies when opening this pane so metrics never stay blank.
+  useEffect(() => {
+    if (link !== "online") return;
+    const staleRelay = typeof relayRttMs !== "number" || !lastPongAt || Date.now() - lastPongAt > 15_000;
+    const missingHost = onlineHosts.some((h) => {
+      const dm = directMeta[h.id];
+      const hasDirectRtt = Boolean(directMap[h.id] && typeof dm?.rttMs === "number");
+      return !hasDirectRtt && typeof hostProbeRttMs[h.id] !== "number";
+    });
+    if (staleRelay || missingHost) {
+      void runProbeAll(true);
+    }
+    // Intentionally run once per online transition or mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [link]);
 
   const runSpaceSync = async (mode: "sync" | "migrate") => {
     if (!syncTargetHost) return;
@@ -1102,40 +1254,141 @@ export function MachinesPane({
     }
   };
 
+  const relayQuality = classifyLatency(link === "online" ? relayRttMs : null);
+  const localDirectRtt = localHostId
+    ? (directMeta[localHostId]?.rttMs ?? hostProbeRttMs[localHostId] ?? null)
+    : null;
+  const localDirectActive = Boolean(localHostId && directMap[localHostId]);
+
   return (
     <div className="pane">
-      <PaneTitle title="电脑与中继" />
+      <div className="sf-pane-head-row">
+        <PaneTitle title="电脑与中继" />
+        <span className="sf-net-overview-title">实时链路与延迟</span>
+        <PocketButton
+          size="sm"
+          variant="soft"
+          disabled={probingAll || link !== "online"}
+          onClick={() => void runProbeAll(false)}
+        >
+          <Activity size={13} className={probingAll ? "pk-spin" : undefined} />
+          <span>{probingAll ? "测速中…" : "一键测速"}</span>
+        </PocketButton>
+      </div>
+
+      <div className="sf-net-grid">
+        <div className="sf-net-stat">
+          <span className="sf-net-stat-label">
+            <Activity size={12} aria-hidden />
+            <span>中继延迟</span>
+          </span>
+          <div className="sf-net-stat-val">
+            {link !== "online" ? (
+              <span className="mono">离线</span>
+            ) : typeof relayRttMs === "number" ? (
+              <span className="sf-net-stat-num">
+                <span className="mono">{relayRttMs}</span>
+                <span className="sf-net-stat-unit">ms</span>
+              </span>
+            ) : (
+              <span className="mono">测速中</span>
+            )}
+            {link === "online" && typeof relayRttMs === "number" ? (
+              <PocketBadge tone={relayQuality.tone}>{relayQuality.label}</PocketBadge>
+            ) : null}
+          </div>
+          <span className="sf-net-stat-sub truncate">
+            {link === "online"
+              ? relayConnectMs
+                ? `建连 ${relayConnectMs} ms${lastPongAt ? ` · 心跳 ${relTime(lastPongAt)}` : ""}`
+                : serverLabel(server)
+              : status.text}
+          </span>
+        </div>
+
+        <div className="sf-net-stat">
+          <span className="sf-net-stat-label">
+            <Radio size={12} aria-hidden />
+            <span>直连通道</span>
+          </span>
+          <div className="sf-net-stat-val">
+            <span className="mono">
+              {directHostCount}/{onlineHosts.length}
+            </span>
+            <PocketBadge tone={directHostCount > 0 ? "mint" : "neutral"}>
+              {directHostCount > 0 ? "已启用直连" : "中继模式"}
+            </PocketBadge>
+          </div>
+          <span className="sf-net-stat-sub truncate">
+            {onlineHosts.length === 0
+              ? "暂无在线主机"
+              : `${directHostCount} 台直连 · ${Math.max(0, onlineHosts.length - directHostCount)} 台经中继`}
+          </span>
+        </div>
+
+        <div className="sf-net-stat">
+          <span className="sf-net-stat-label">
+            <Laptop size={12} aria-hidden />
+            <span>设备与 Agent</span>
+          </span>
+          <div className="sf-net-stat-val">
+            <span className="mono">{totalAgentsCount}</span>
+            <span className="faint" style={{ fontSize: "calc(12px * var(--ts, 1))", fontWeight: 600 }}>个 Agent</span>
+          </div>
+          <span className="sf-net-stat-sub truncate">
+            电脑 {desktopOnlineCount}/{desktop.length} · 移动 {mobileOnlineCount}/{mobile.length}
+          </span>
+        </div>
+      </div>
 
       <SetHeading>本机服务</SetHeading>
-      <SetRow
-        title={
-          hostd === null
-            ? checking
-              ? "正在检查…"
-              : "未检测到 herdr-pocket"
-            : hostd.configured
-              ? `已登录（${hostd.deviceName || "本机"}）`
-              : hostd.installed
-                ? "已安装，未登录"
-                : "本机未接入"
-        }
-        about={
-          hostd === null
-            ? "仅作为控制端连接远程设备"
-            : hostd.configured
-              ? `本机优先直连（${serverLabel(hostd.server ?? null)}）`
-              : hostd.installed
-                ? "在终端运行 herdr-pocket up"
-                : "安装并登录后可作为运行主机"
-        }
-      >
-        <span className="sf-combo">
-          <span className={`sf-dot${hostd?.configured ? " on" : ""}`} aria-hidden />
-          <button className="sf-icon-btn" aria-label="重新检查" title="重新检查" disabled={checking} onClick={recheck}>
-            <RefreshCw size={14} />
-          </button>
-        </span>
-      </SetRow>
+      <div className="sf-net-card">
+        <div className="sf-net-card-top">
+          <div className="sf-net-card-main">
+            <div className="sf-net-card-title">
+              <Laptop size={15} />
+              <span>
+                {hostd === null
+                  ? checking
+                    ? "正在检查…"
+                    : "未检测到 herdr-pocket"
+                  : hostd.configured
+                    ? `已登录（${hostd.deviceName || "本机"}）`
+                    : hostd.installed
+                      ? "已安装，未登录"
+                      : "本机未接入"}
+              </span>
+              {hostd?.configured ? (
+                <PocketBadge tone={localDirectActive ? "mint" : "neutral"}>
+                  {localDirectActive ? "本地直连中" : "已就绪"}
+                </PocketBadge>
+              ) : null}
+            </div>
+            <div className="sf-net-card-meta">
+              {hostd === null
+                ? "仅作为控制端连接远程设备"
+                : hostd.configured
+                  ? `本机优先直连（${serverLabel(hostd.server ?? null)}）`
+                  : hostd.installed
+                    ? "在终端运行 herdr-pocket up"
+                    : "安装并登录后可作为运行主机"}
+            </div>
+          </div>
+          <span className="sf-combo">
+            {localDirectActive ? (
+              <span className={`sf-rtt-pill is-${classifyLatency(localDirectRtt).level}`}>
+                <span className="sf-rtt-dot" aria-hidden />
+                <span className="mono">{typeof localDirectRtt === "number" ? `${localDirectRtt} ms` : "127.0.0.1"}</span>
+              </span>
+            ) : (
+              <span className={`sf-dot${hostd?.configured ? " on" : ""}`} aria-hidden />
+            )}
+            <button className="sf-icon-btn" aria-label="重新检查" title="重新检查" disabled={checking} onClick={recheck}>
+              <RefreshCw size={14} className={checking ? "pk-spin" : undefined} />
+            </button>
+          </span>
+        </div>
+      </div>
       {hostd && !hostd.configured ? (
         <div className="sf-block">
           <LocalHostDeps status={hostd} server={real ? server! : undefined} checking={checking} onRecheck={recheck} />
@@ -1143,31 +1396,65 @@ export function MachinesPane({
       ) : null}
 
       <SetHeading>中转服务器</SetHeading>
-      <SetRow title={serverLabel(server)} about={`${status.text} · 这台设备在服务器上叫“${deviceName || "未命名"}”。`}>
-        <span className={`sf-dot${link === "online" ? " on" : link === "connecting" ? " busy" : " off"}`} aria-label={status.text} />
-      </SetRow>
-      <div className="sf-actions">
-        <PocketButton size="sm" variant="ghost" onClick={() => pingRelay()}>
-          <RefreshCw size={14} />
-          <span>立即重连</span>
-        </PocketButton>
-        <PocketButton size="sm" variant="ghost" onClick={onConnectRelay}>
-          <Server size={14} />
-          <span>换一个服务器</span>
-        </PocketButton>
-        {real ? (
+      <div className="sf-net-card">
+        <div className="sf-net-card-top">
+          <div className="sf-net-card-main">
+            <div className="sf-net-card-title">
+              <Server size={15} />
+              <span className="mono truncate">{serverLabel(server)}</span>
+              <PocketBadge tone={link === "online" ? "mint" : link === "connecting" ? "lav" : "pink"}>
+                {status.text}
+              </PocketBadge>
+            </div>
+            <div className="sf-net-card-meta">
+              这台设备在服务器上叫“{deviceName || "未命名"}”
+              {link === "online" && relayConnectMs ? ` · 本次建连 ${relayConnectMs} ms` : ""}
+            </div>
+          </div>
+          <span className="sf-combo">
+            {link === "online" ? (
+              <span className={`sf-rtt-pill is-${relayQuality.level}`}>
+                <span className="sf-rtt-dot" aria-hidden />
+                <span className="mono">{typeof relayRttMs === "number" ? `${relayRttMs} ms` : "待测"}</span>
+                <span>{relayQuality.label}</span>
+              </span>
+            ) : (
+              <span className={`sf-dot${link === "connecting" ? " busy" : " off"}`} aria-label={status.text} />
+            )}
+          </span>
+        </div>
+        <div className="sf-net-card-actions">
           <PocketButton
             size="sm"
-            variant="ghost"
-            onClick={async () => {
-              const ok = await copyToClipboard(server!);
-              toast(ok ? "服务器地址已复制" : "复制失败", !ok);
-            }}
+            variant="soft"
+            disabled={probingAll || link !== "online"}
+            onClick={() => void runProbeAll(false)}
           >
-            <Copy size={14} />
-            <span>复制地址</span>
+            <Activity size={13} className={probingAll ? "pk-spin" : undefined} />
+            <span>测速</span>
           </PocketButton>
-        ) : null}
+          <PocketButton size="sm" variant="ghost" onClick={() => pingRelay()}>
+            <RefreshCw size={13} />
+            <span>立即重连</span>
+          </PocketButton>
+          <PocketButton size="sm" variant="ghost" onClick={onConnectRelay}>
+            <Server size={13} />
+            <span>换一个服务器</span>
+          </PocketButton>
+          {real ? (
+            <PocketButton
+              size="sm"
+              variant="ghost"
+              onClick={async () => {
+                const ok = await copyToClipboard(server!);
+                toast(ok ? "服务器地址已复制" : "复制失败", !ok);
+              }}
+            >
+              <Copy size={13} />
+              <span>复制地址</span>
+            </PocketButton>
+          ) : null}
+        </div>
       </div>
 
       <H5IdentityLockSection />
@@ -1204,14 +1491,34 @@ export function MachinesPane({
 
       <SetHeading>桌面端</SetHeading>
       {desktop.length ? (
-        desktop.map((item) => (
-          <DeviceRow
-            key={item.device.id}
-            item={item}
-            agents={item.device.kind === "host" ? agents[item.device.id]?.filter((a) => !a.isShell).length ?? 0 : undefined}
-            onRemove={item.isCurrentDevice ? undefined : () => setRemoving(item.device)}
-          />
-        ))
+        <div className="sf-device-list">
+          {desktop.map((item) => {
+            const id = item.device.id;
+            const isHost = item.device.kind === "host";
+            return (
+              <DeviceRow
+                key={id}
+                item={item}
+                agents={isHost ? agents[id]?.filter((a) => !a.isShell).length ?? 0 : undefined}
+                directAddr={isHost ? directMap[id] : undefined}
+                directMeta={isHost ? directMeta[id] : undefined}
+                probeRttMs={isHost ? hostProbeRttMs[id] : undefined}
+                relayRttMs={relayRttMs}
+                probing={probingHostId === id || probingAll}
+                onProbe={isHost ? () => void runProbeSingleHost(id, item.device.name) : undefined}
+                onTryDirect={
+                  isHost
+                    ? () => {
+                        ensureDirectLinkNow(id, true);
+                        toast(`正在尝试与 ${item.device.name} 建立直连…`);
+                      }
+                    : undefined
+                }
+                onRemove={item.isCurrentDevice ? undefined : () => setRemoving(item.device)}
+              />
+            );
+          })}
+        </div>
       ) : (
         <div className="faint sf-note">暂无已接入的桌面端</div>
       )}
@@ -1224,13 +1531,15 @@ export function MachinesPane({
 
       <SetHeading>移动端</SetHeading>
       {mobile.length ? (
-        mobile.map((item) => (
-          <DeviceRow
-            key={item.device.id}
-            item={item}
-            onRemove={item.isCurrentDevice ? undefined : () => setRemoving(item.device)}
-          />
-        ))
+        <div className="sf-device-list">
+          {mobile.map((item) => (
+            <DeviceRow
+              key={item.device.id}
+              item={item}
+              onRemove={item.isCurrentDevice ? undefined : () => setRemoving(item.device)}
+            />
+          ))}
+        </div>
       ) : (
         <div className="faint sf-note">暂无已配对的移动端</div>
       )}

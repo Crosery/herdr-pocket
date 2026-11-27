@@ -490,6 +490,200 @@
   font-size: calc(12.5px * var(--ts, 1));
 }
 
+/* Machines & Relay telemetry cards ----------------------------------------- */
+
+.settings-frame .sf-pane-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.settings-frame .sf-pane-head-row .sf-pane-title {
+  margin: 0;
+}
+
+.settings-frame .sf-net-overview-title {
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.settings-frame .sf-net-stat-num {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+}
+
+.settings-frame .sf-net-stat-unit {
+  font-size: calc(12px * var(--ts, 1));
+  font-weight: 650;
+  color: var(--muted);
+}
+
+.settings-frame .sf-net-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.settings-frame .sf-net-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 13px;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+}
+
+.settings-frame .sf-net-stat-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.settings-frame .sf-net-stat-val {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: calc(19px * var(--ts, 1));
+  font-weight: 800;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+.settings-frame .sf-net-stat-sub {
+  font-size: calc(11.5px * var(--ts, 1));
+  color: var(--faint);
+}
+
+.settings-frame .sf-net-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+  background: var(--surface-2);
+  margin-bottom: 6px;
+}
+
+.settings-frame .sf-net-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.settings-frame .sf-net-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.settings-frame .sf-net-card-title {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  font-size: calc(13.5px * var(--ts, 1));
+  font-weight: 700;
+  color: var(--ink);
+  min-width: 0;
+}
+
+.settings-frame .sf-net-card-meta {
+  font-size: calc(12px * var(--ts, 1));
+  color: var(--muted);
+  min-width: 0;
+}
+
+.settings-frame .sf-net-card-diag {
+  font-size: calc(11.5px * var(--ts, 1));
+  color: var(--faint);
+  min-width: 0;
+}
+
+.settings-frame .sf-net-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.settings-frame .sf-net-card-action-end {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+}
+
+.settings-frame .sf-device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.settings-frame .sf-rtt-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: calc(11.5px * var(--ts, 1));
+  font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.settings-frame .sf-rtt-pill.is-good {
+  border-color: color-mix(in srgb, var(--mint-text) 28%, transparent);
+  background: color-mix(in srgb, var(--mint) 16%, var(--surface));
+  color: var(--mint-text);
+}
+
+.settings-frame .sf-rtt-pill.is-warn {
+  border-color: color-mix(in srgb, var(--lav) 38%, transparent);
+  background: color-mix(in srgb, var(--lav-soft) 72%, var(--surface));
+  color: var(--ink);
+}
+
+.settings-frame .sf-rtt-pill.is-high {
+  border-color: color-mix(in srgb, var(--blush-text) 34%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.settings-frame .sf-rtt-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+  .settings-frame .sf-net-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .sf-term-font-ctrl {
   display: flex;
   flex-direction: column;

@@ -649,11 +649,14 @@ export function DesktopShell({
       const focusedContent = focusedLeafOfTab(t).content;
       const leaves = tabLeaves(t);
       const a = focusedContent.kind === "agent" ? allByAgentKey.find((x) => x.key === focusedContent.agentKey) : undefined;
+      const waitingInitialSync = !liveStore.get().hasSnapshot && (liveStore.get().link === "connecting" || liveStore.get().link === "idle");
       const baseLabel =
         focusedContent.kind === "agent"
           ? a
             ? agentTitle(a)
-            : "已结束的 Agent"
+            : waitingInitialSync
+              ? "正在连接…"
+              : "已结束的 Agent"
           : focusedContent.title === "about:blank"
             ? "新网页"
             : focusedContent.title;

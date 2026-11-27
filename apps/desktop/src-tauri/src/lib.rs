@@ -603,6 +603,7 @@ pub(crate) fn prepare_relaunch(handle: &tauri::AppHandle) {
     perm_companion::close(handle);
     portal_bridge::shutdown();
     local_term::shutdown();
+    commands::close_voice_preview_dsp_sync();
     voice_ai::shutdown();
     voice::shutdown(handle);
     browser::on_exit(handle);
@@ -621,6 +622,7 @@ fn on_quit(handle: &tauri::AppHandle, via: &str) {
     perm_companion::close(handle);
     portal_bridge::shutdown();
     local_term::shutdown();
+    commands::close_voice_preview_dsp_sync();
     voice_ai::shutdown();
     voice::shutdown(handle);
     browser::on_exit(handle);
@@ -758,6 +760,9 @@ pub fn run() {
             commands::voice_ai_start_test,
             commands::voice_ai_stop_test,
             commands::voice_ai_preview_process,
+            commands::voice_ai_preview_live_open,
+            commands::voice_ai_preview_live_process,
+            commands::voice_ai_preview_live_close,
             browser::browser_open,
             browser::browser_set_bounds,
             browser::browser_navigate,

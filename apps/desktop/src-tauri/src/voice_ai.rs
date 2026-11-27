@@ -1918,6 +1918,7 @@ pub mod dsp {
         noise_psd: [f64; 161],
         prev_gain: [f64; 161],
         frames: usize,
+        last_speech_active: bool,
     }
 
     impl Default for SpectralNoiseGate {
@@ -1930,6 +1931,7 @@ pub mod dsp {
                 noise_psd: [1e-5; 161],
                 prev_gain: [1.0; 161],
                 frames: 0,
+                last_speech_active: false,
             }
         }
     }
@@ -1938,6 +1940,10 @@ pub mod dsp {
         pub const HOP: usize = 160;
         const N: usize = 320;
         const BINS: usize = 161;
+
+        pub fn last_speech_active(&self) -> bool {
+            self.last_speech_active
+        }
 
         pub fn process_hop(&mut self, x: &[f32], out: &mut [f32]) {
             let keep = Self::N - Self::HOP;
@@ -1956,43 +1962,58 @@ pub mod dsp {
                 psd[k] = re[k] * re[k] + im[k] * im[k];
             }
 
-            // Track stationary noise PSD smoothly: fast downward decay, slow upward tracking on quiet bins.
+            // Detect strong tonal/harmonic speech energy in 200..3200 Hz (bins 4..64) so
+            // immediate speech on frame 0 is never absorbed into the stationary noise floor.
             self.frames += 1;
             let mut speech_energy = 0.0f64;
+            let mut speech_peak = 0.0f64;
             let mut noise_energy = 0.0f64;
+            for k in 4..64 {
+                speech_energy += psd[k];
+                if psd[k] > speech_peak {
+                    speech_peak = psd[k];
+                }
+            }
+            let mean_speech_bin = speech_energy / 60.0;
+            let tonality = speech_peak / mean_speech_bin.max(1e-9);
+            let strong_tonal_speech = speech_energy > 25.0 && tonality >= 9.0;
+
             for k in 1..Self::BINS {
                 let p = psd[k];
                 if self.frames <= 4 {
+                    let capped = if strong_tonal_speech { p.min(0.5) } else { p };
                     self.noise_psd[k] = if self.frames == 1 {
-                        p.max(1e-7)
+                        capped.max(1e-7)
                     } else {
-                        0.5 * self.noise_psd[k] + 0.5 * p.max(1e-7)
+                        0.5 * self.noise_psd[k] + 0.5 * capped.max(1e-7)
                     };
                 } else if p < self.noise_psd[k] {
-                    self.noise_psd[k] = 0.78 * self.noise_psd[k] + 0.22 * p.max(1e-8);
-                } else if p < self.noise_psd[k] * 2.4 {
-                    self.noise_psd[k] = 0.96 * self.noise_psd[k] + 0.04 * p;
+                    self.noise_psd[k] = 0.90 * self.noise_psd[k] + 0.10 * p.max(1e-8);
+                } else if !strong_tonal_speech && p < self.noise_psd[k] * 4.5 {
+                    self.noise_psd[k] = 0.92 * self.noise_psd[k] + 0.08 * p;
                 }
-                if (4..100).contains(&k) {
-                    speech_energy += p;
+                if (4..64).contains(&k) {
                     noise_energy += self.noise_psd[k];
                 }
             }
 
             let frame_snr = speech_energy / noise_energy.max(1e-8);
-            let gate_scale = if frame_snr < 1.35 { 0.35 } else { 1.0 };
+            self.last_speech_active = frame_snr >= 2.1 || strong_tonal_speech;
+            let gate_scale = if self.last_speech_active { 1.0 } else { 0.22 };
+            let oversub = if self.last_speech_active { 1.5 } else { 2.0 };
 
             let mut raw_gain = [1.0f64; Self::BINS];
             raw_gain[0] = 0.0; // Suppress DC bin
             for k in 1..Self::BINS {
-                let n = self.noise_psd[k] * 1.45;
+                let n = self.noise_psd[k] * oversub;
                 let post = (psd[k] - n).max(0.0) / (psd[k] + 1e-9);
-                let g = (post.sqrt() * gate_scale).clamp(0.08, 1.0);
+                let g = (post.sqrt() * gate_scale).clamp(0.06, 1.0);
                 raw_gain[k] = 0.55 * self.prev_gain[k] + 0.45 * g;
                 self.prev_gain[k] = raw_gain[k];
             }
 
             // Smooth gain slightly across adjacent frequency bins to prevent musical noise.
+            re[0] = 0.0;
             for k in 1..(Self::BINS - 1) {
                 let g = if k > 1 {
                     0.2 * raw_gain[k - 1] + 0.6 * raw_gain[k] + 0.2 * raw_gain[k + 1]
@@ -2061,10 +2082,18 @@ pub mod dsp {
         pub const MAX_PEAK: f32 = 0.92;
 
         pub fn process_in_place(&mut self, buf: &mut [f32]) {
+            self.process_in_place_gated(buf, true);
+        }
+
+        /// Enhances vocal clarity & levels quiet speech while NEVER boosting noise-only frames
+        /// when `allow_boost` is false (so post-denoise residual noise stays attenuated).
+        pub fn process_in_place_gated(&mut self, buf: &mut [f32], allow_boost: bool) {
             if buf.is_empty() {
                 return;
             }
-            self.presence.process_in_place(buf);
+            if allow_boost {
+                self.presence.process_in_place(buf);
+            }
 
             for chunk in buf.chunks_mut(160) {
                 let mut sq = 0.0f64;
@@ -2074,16 +2103,18 @@ pub mod dsp {
                     peak = peak.max(v.abs());
                 }
                 let rms = (sq / (chunk.len().max(1) as f64)).sqrt() as f32;
-                if rms < self.noise_rms {
+                if !allow_boost {
+                    self.noise_rms = 0.92 * self.noise_rms + 0.08 * rms;
+                } else if rms < self.noise_rms {
                     self.noise_rms = 0.88 * self.noise_rms + 0.12 * rms;
                 } else if rms < self.noise_rms * 1.8 {
                     self.noise_rms = 0.992 * self.noise_rms + 0.008 * rms;
                 }
-                self.noise_rms = self.noise_rms.clamp(0.0004, 0.012);
+                self.noise_rms = self.noise_rms.clamp(0.0004, 0.08);
 
-                let active = rms > (self.noise_rms * 2.2).max(0.002);
+                let active = allow_boost && rms > (self.noise_rms * 2.5).max(0.008);
                 let mut want = if active {
-                    (0.11 / rms.max(0.002)).clamp(1.0, 3.2)
+                    (0.11 / rms.max(0.008)).clamp(1.0, 2.2)
                 } else {
                     1.0
                 };
@@ -5421,18 +5452,22 @@ struct TseRingBuffers {
     bypassed: bool,
     stopped: bool,
     slow_steps: usize,
+    need_samples: usize,
+    busy: bool,
 }
 
 struct TseRing {
     shared: Arc<Mutex<TseRingBuffers>>,
     wake: Arc<std::sync::Condvar>,
+    done_wake: Arc<std::sync::Condvar>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TseRing {
     const PREBUFFER_SAMPLES: usize = 896;
 
-    fn start(mut ext: models::TargetExtractor) -> Self {
+    fn start_with_mode(mut ext: models::TargetExtractor, sync_offline: bool) -> Self {
+        let init_need = ext.required_input_samples();
         let shared = Arc::new(Mutex::new(TseRingBuffers {
             in_ring: Vec::with_capacity(4096),
             in_read: 0,
@@ -5442,10 +5477,14 @@ impl TseRing {
             bypassed: false,
             stopped: false,
             slow_steps: 0,
+            need_samples: init_need,
+            busy: false,
         }));
         let wake = Arc::new(std::sync::Condvar::new());
+        let done_wake = Arc::new(std::sync::Condvar::new());
         let sh = shared.clone();
         let wk = wake.clone();
+        let dwk = done_wake.clone();
 
         let worker = std::thread::Builder::new()
             .name("pocket-live-tse".into())
@@ -5457,9 +5496,12 @@ impl TseRing {
                     };
                     loop {
                         if guard.stopped || guard.bypassed {
+                            guard.busy = false;
+                            dwk.notify_all();
                             return;
                         }
                         let need = ext.required_input_samples();
+                        guard.need_samples = need;
                         if guard.in_ring.len() - guard.in_read >= need {
                             let start = guard.in_read;
                             let slice = guard.in_ring[start..start + need].to_vec();
@@ -5469,8 +5511,11 @@ impl TseRing {
                                 guard.in_ring.drain(..drain_n);
                                 guard.in_read = 0;
                             }
+                            guard.busy = true;
                             break slice;
                         }
+                        guard.busy = false;
+                        dwk.notify_all();
                         guard = match wk.wait(guard) {
                             Ok(g) => g,
                             Err(_) => return,
@@ -5485,31 +5530,39 @@ impl TseRing {
                     Ok(g) => g,
                     Err(_) => return,
                 };
+                guard.busy = false;
                 if guard.stopped {
+                    dwk.notify_all();
                     return;
                 }
                 match step_res {
                     Ok((tse_audio, raw_audio, ms)) => {
-                        let budget_ms = if cur_k <= 5 { 38.0 } else { 60.0 };
-                        if ms > budget_ms {
-                            guard.slow_steps += 1;
-                            if guard.slow_steps >= 3 {
-                                guard.slow_steps = 0;
-                                if cur_k <= 5 {
-                                    ext.set_k_frames(8);
-                                } else {
-                                    guard.bypassed = true;
-                                    return;
+                        if !sync_offline {
+                            let budget_ms = if cur_k <= 5 { 38.0 } else { 60.0 };
+                            if ms > budget_ms {
+                                guard.slow_steps += 1;
+                                if guard.slow_steps >= 3 {
+                                    guard.slow_steps = 0;
+                                    if cur_k <= 5 {
+                                        ext.set_k_frames(8);
+                                    } else {
+                                        guard.bypassed = true;
+                                        dwk.notify_all();
+                                        return;
+                                    }
                                 }
+                            } else {
+                                guard.slow_steps = 0;
                             }
-                        } else {
-                            guard.slow_steps = 0;
                         }
+                        guard.need_samples = ext.required_input_samples();
                         guard.out_tse.extend_from_slice(&tse_audio);
                         guard.out_raw.extend_from_slice(&raw_audio);
+                        dwk.notify_all();
                     }
                     Err(_) => {
                         guard.bypassed = true;
+                        dwk.notify_all();
                         return;
                     }
                 }
@@ -5519,6 +5572,7 @@ impl TseRing {
         Self {
             shared,
             wake,
+            done_wake,
             worker,
         }
     }
@@ -5528,6 +5582,7 @@ impl TseRing {
         hpf_320: &[f32; 320],
         out_tse: &mut [f32; 320],
         out_raw: &mut [f32; 320],
+        blocking: bool,
     ) -> bool {
         let mut guard = match self.shared.lock() {
             Ok(g) => g,
@@ -5538,6 +5593,22 @@ impl TseRing {
         }
         guard.in_ring.extend_from_slice(hpf_320);
         self.wake.notify_one();
+
+        if blocking {
+            while !guard.bypassed
+                && !guard.stopped
+                && (guard.out_tse.len() - guard.out_read) < 320
+                && (guard.busy || (guard.in_ring.len() - guard.in_read) >= guard.need_samples)
+            {
+                guard = match self.done_wake.wait(guard) {
+                    Ok(g) => g,
+                    Err(_) => return false,
+                };
+            }
+            if guard.bypassed {
+                return false;
+            }
+        }
 
         let avail = guard.out_tse.len() - guard.out_read;
         if avail < 320 {
@@ -5562,6 +5633,7 @@ impl Drop for TseRing {
         if let Ok(mut guard) = self.shared.lock() {
             guard.stopped = true;
             self.wake.notify_all();
+            self.done_wake.notify_all();
         }
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
@@ -5599,6 +5671,7 @@ pub struct LiveCallProcessor {
     smoothed_tse_atten_db: f64,
     suppressing_residual: bool,
     gate_phase: usize,
+    sync_offline: bool,
 }
 
 #[allow(dead_code)]
@@ -5618,11 +5691,19 @@ impl LiveCallProcessor {
         Self::with_config(load_config())
     }
 
-    pub fn with_config(cfg: VoiceAiConfig) -> Self {
-        Self::with_config_and_ort(cfg, true)
+    pub fn new_offline_preview() -> Self {
+        Self::with_config_and_mode(load_config(), true, true)
     }
 
-    fn with_config_and_ort(mut cfg: VoiceAiConfig, use_ort: bool) -> Self {
+    pub fn with_config(cfg: VoiceAiConfig) -> Self {
+        Self::with_config_and_mode(cfg, true, false)
+    }
+
+    fn with_config_and_ort(cfg: VoiceAiConfig, use_ort: bool) -> Self {
+        Self::with_config_and_mode(cfg, use_ort, false)
+    }
+
+    fn with_config_and_mode(mut cfg: VoiceAiConfig, use_ort: bool, sync_offline: bool) -> Self {
         cfg.tier = sanitize_tier(&cfg.tier);
         cfg.threshold = clamp_threshold(cfg.threshold);
 
@@ -5666,8 +5747,9 @@ impl LiveCallProcessor {
         let want_identity = enrolled.is_some() || first_lock_mode;
         let want_tse = effective_tier == "tse" && enrolled.is_some() && tse_files_ready;
 
+        let want_vad = want_identity || want_tse || (cfg.denoise && cfg.enhance_vocal);
         let loaded = if use_ort && (cfg.denoise || want_identity || want_tse) {
-            cached_live_models(cfg.denoise, want_identity || want_tse, want_identity, want_tse)
+            cached_live_models(cfg.denoise, want_vad, want_identity, want_tse)
         } else {
             None
         };
@@ -5683,7 +5765,7 @@ impl LiveCallProcessor {
             None
         };
 
-        let vad = if want_identity || want_tse {
+        let vad = if want_vad {
             loaded
                 .as_ref()
                 .and_then(|m| m.vad.as_ref().map(|sess| models::Vad::new(&m.rt, sess)))
@@ -5698,7 +5780,7 @@ impl LiveCallProcessor {
                 let sample = load_owner_sample()?;
                 let (enr, _) = models::VoxLockEnrollment::compute(&m.rt, te, &sample).ok()?;
                 let ext = models::TargetExtractor::new(&m.rt, tc, &Arc::new(enr)).ok()?;
-                Some(TseRing::start(ext))
+                Some(TseRing::start_with_mode(ext, sync_offline))
             })
         } else {
             None
@@ -5775,6 +5857,48 @@ impl LiveCallProcessor {
             smoothed_tse_atten_db: 0.0,
             suppressing_residual: false,
             gate_phase: Self::RAMP_SAMPLES,
+            sync_offline,
+        }
+    }
+
+    pub fn used_dpdf(&self) -> bool {
+        self.denoiser.is_some()
+    }
+
+    pub fn used_tse(&self) -> bool {
+        self.tse.is_some()
+    }
+
+    pub fn sv_active(&self) -> bool {
+        self.has_sv
+    }
+
+    pub fn is_suppressing(&self) -> bool {
+        self.suppressing_residual
+    }
+
+    pub fn engine_label(&self) -> String {
+        if !self.cfg.denoise && !self.cfg.enhance_vocal && !self.has_sv && self.tse.is_none() {
+            return "直通（增强已全部关闭）".into();
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        if self.denoiser.is_some() {
+            parts.push("DPDFNet 神经降噪");
+        } else if self.cfg.denoise {
+            parts.push("纯 Rust 基础降噪");
+        }
+        if self.tse.is_some() {
+            parts.push("VoxLock 声纹分离");
+        } else if self.has_sv {
+            parts.push("ERes2NetV2 声纹门控");
+        }
+        if self.cfg.enhance_vocal {
+            parts.push("人声增强");
+        }
+        if parts.is_empty() {
+            "纯 Rust 基础降噪".into()
+        } else {
+            parts.join(" + ")
         }
     }
 
@@ -5794,7 +5918,7 @@ impl LiveCallProcessor {
         self.poll_sv_results();
         let mut clean_hpf = [0.0f32; 320];
         self.hpf64.process_slice(&in_f32, &mut clean_hpf);
-        if self.has_sv || self.tse.is_some() {
+        if self.vad.is_some() || self.has_sv || self.tse.is_some() {
             self.feed_clean_vad(&clean_hpf);
         }
 
@@ -5804,7 +5928,7 @@ impl LiveCallProcessor {
         let mut raw_aligned = audio_buf;
         let tse_in = audio_buf;
         let used_tse = if let Some(ref tse) = self.tse {
-            tse.push_and_pop_320(&tse_in, &mut audio_buf, &mut raw_aligned)
+            tse.push_and_pop_320(&tse_in, &mut audio_buf, &mut raw_aligned, self.sync_offline)
         } else {
             false
         };
@@ -5841,7 +5965,14 @@ impl LiveCallProcessor {
         }
 
         if self.cfg.enhance_vocal {
-            self.enhancer.process_in_place(&mut audio_buf);
+            let allow_boost = if self.vad.is_some() {
+                self.last_vad_prob >= Self::SPEECH_PROB
+            } else if self.cfg.denoise {
+                self.noise_gate.last_speech_active()
+            } else {
+                true
+            };
+            self.enhancer.process_in_place_gated(&mut audio_buf, allow_boost);
         } else if self.cfg.denoise {
             for s in &mut audio_buf {
                 *s = dsp::soft_limit(*s);
@@ -5953,6 +6084,23 @@ impl LiveCallProcessor {
         if tx.send(SvJob { slice, is_end }).is_ok() {
             self.sv_in_flight = true;
             self.since_check_w = 0;
+            if self.sync_offline {
+                if let Some(ref rx) = self.sv_rx {
+                    if let Ok(res) = rx.recv() {
+                        self.sv_in_flight = false;
+                        if !res.emb.is_empty() {
+                            self.sv_tracker.apply_result(
+                                &res.emb,
+                                res.used_samples,
+                                res.is_end,
+                                self.speaking,
+                                self.tse.is_some(),
+                                self.smoothed_tse_atten_db,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -6056,6 +6204,38 @@ pub struct VoiceAiPreviewResult {
     pub sv_active: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceAiPreviewLiveInfo {
+    pub active: bool,
+    pub used_dpdf: bool,
+    pub used_tse: bool,
+    pub sv_active: bool,
+    pub engine_label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceAiPreviewLiveChunk {
+    pub pcm_base64: String,
+    pub level: f32,
+    pub suppressed: bool,
+}
+
+/// Opens a dedicated real-time `LiveCallProcessor` for the Settings "戴耳机实时耳返" preview
+/// studio, always honoring the user's current denoise / enhance / voiceprint settings.
+pub fn preview_live_open_processor() -> (LiveCallProcessor, VoiceAiPreviewLiveInfo) {
+    let proc = LiveCallProcessor::new();
+    let info = VoiceAiPreviewLiveInfo {
+        active: true,
+        used_dpdf: proc.used_dpdf(),
+        used_tse: proc.used_tse(),
+        sv_active: proc.sv_active(),
+        engine_label: proc.engine_label(),
+    };
+    (proc, info)
+}
+
 /// Runs an offline PCM16 mono 16kHz clip through the exact same `LiveCallProcessor`
 /// DSP/DPDFNet/VoxLock/Voiceprint chain used during real voice calls so users can
 /// hear real A/B before-and-after results immediately when toggling settings.
@@ -6074,10 +6254,10 @@ pub fn preview_process_pcm_bytes(pcm_bytes: &[u8]) -> Result<VoiceAiPreviewResul
     }
 
     let t0 = Instant::now();
-    let mut proc = LiveCallProcessor::new();
-    let used_dpdf = proc.denoiser.is_some();
-    let used_tse = proc.tse.is_some();
-    let sv_active = proc.has_sv;
+    let mut proc = LiveCallProcessor::new_offline_preview();
+    let used_dpdf = proc.used_dpdf();
+    let used_tse = proc.used_tse();
+    let sv_active = proc.sv_active();
 
     let mut out_bytes = Vec::with_capacity(sample_count * 2);
     let mut in_sq = 0.0f64;
@@ -6856,5 +7036,43 @@ mod tests {
         assert!(res.in_rms_db > -25.0 && res.in_rms_db <= 0.0);
         assert!(res.out_rms_db.is_finite());
         assert!(res.suppressed_ratio >= 0.0 && res.suppressed_ratio <= 1.0);
+    }
+
+    #[test]
+    fn preview_live_open_processor_runs_real_pipeline_and_reports_honest_engine_label() {
+        let mut cfg = VoiceAiConfig::default();
+        cfg.denoise = true;
+        cfg.enhance_vocal = true;
+        let mut proc = LiveCallProcessor::with_config_and_mode(cfg, false, false);
+        assert!(!proc.used_dpdf());
+        assert!(!proc.used_tse());
+        assert!(!proc.sv_active());
+        assert!(proc.engine_label().contains("纯 Rust 基础降噪"));
+
+        // Feed 15 frames (300ms) of stationary broadband noise and verify real attenuation.
+        let mut seed: u32 = 0x1234_5678;
+        let mut in_energy = 0.0f64;
+        let mut out_energy = 0.0f64;
+        for f in 0..20 {
+            let mut frame = [0i16; 320];
+            for s in &mut frame {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let n = (((seed >> 16) as i16) as f32) / 32768.0 * 0.08;
+                *s = (n * 32767.0) as i16;
+            }
+            let (out, _lvl) = proc.process_frame_320(&frame);
+            if f >= 8 {
+                for &x in &frame {
+                    in_energy += (f64::from(x) / 32768.0).powi(2);
+                }
+                for &y in &out {
+                    out_energy += (f64::from(y) / 32768.0).powi(2);
+                }
+            }
+        }
+        assert!(
+            out_energy < in_energy,
+            "LiveCallProcessor must actually process and attenuate stationary noise (in={in_energy}, out={out_energy})"
+        );
     }
 }

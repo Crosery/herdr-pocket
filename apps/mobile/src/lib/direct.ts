@@ -39,10 +39,11 @@ export function fromBase64(s: string): Uint8Array {
 
 /** How long one address may take to open and greet. */
 const DIAL_MS = 2500;
-/** Pings keep a link honest: 2 missed checks over ~40s drop it cleanly without background-wake false drops. */
-const PING_EVERY_MS = 25_000;
-const PONG_WAIT_MS = 20_000;
+/** Pings keep a link honest: 2 missed checks drop a dead link cleanly without background-wake false drops. */
+const PING_EVERY_MS = 20_000;
+const PONG_WAIT_MS = 10_000;
 const MISSED_PONG_LIMIT = 2;
+const TIMEOUT_EVICT_LIMIT = 2;
 
 export function classifyDirectAddr(addr: string): { kind: "local" | "lan-p2p" | "vpn-p2p"; label: string } {
   const host = addr.trim().toLowerCase().replace(/^\[|\]$/g, "");
@@ -89,9 +90,11 @@ export class DirectLink {
   private initPingTimer: ReturnType<typeof setTimeout> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRxAt = Date.now();
+  private lastBidirectionalRxAt = Date.now();
   private lastPingSentAt = 0;
   private rttMs: number | null = null;
   private missedPongs = 0;
+  private consecutiveTimeouts = 0;
   private closed = false;
 
   private constructor(to: string, addr: string, port: number, ws: WebSocket, cipher: DirectCipher, handlers: DirectHandlers) {
@@ -199,13 +202,16 @@ export class DirectLink {
   }
 
   private onFrame(f: Frame) {
-    this.lastRxAt = Date.now();
-    this.missedPongs = 0;
-    if (this.pongTimer) {
-      clearTimeout(this.pongTimer);
-      this.pongTimer = null;
-    }
+    const now = Date.now();
+    this.lastRxAt = now;
     if (f.type === "rpc_result" && f.id) {
+      this.lastBidirectionalRxAt = now;
+      this.missedPongs = 0;
+      this.consecutiveTimeouts = 0;
+      if (this.pongTimer) {
+        clearTimeout(this.pongTimer);
+        this.pongTimer = null;
+      }
       const p = this.pending.get(f.id);
       if (!p) return;
       this.pending.delete(f.id);
@@ -213,9 +219,16 @@ export class DirectLink {
       if (f.error) p.reject(new DirectError(f.error.code, f.error.message));
       else p.resolve(f.result);
     } else if (f.type === "pong") {
+      this.lastBidirectionalRxAt = now;
+      this.missedPongs = 0;
+      this.consecutiveTimeouts = 0;
+      if (this.pongTimer) {
+        clearTimeout(this.pongTimer);
+        this.pongTimer = null;
+      }
       const echoedT = typeof f.t === "number" ? f.t : this.lastPingSentAt;
       if (echoedT > 0) {
-        this.rttMs = Math.max(1, Math.min(9999, Date.now() - echoedT));
+        this.rttMs = Math.max(1, Math.min(9999, now - echoedT));
       }
     } else if (f.type === "stream_open" || f.type === "stream_event") this.handlers.onStream(f);
   }
@@ -235,7 +248,7 @@ export class DirectLink {
     this.pongTimer = setTimeout(() => {
       this.pongTimer = null;
       if (this.closed) return;
-      if (Date.now() - this.lastRxAt < PONG_WAIT_MS) {
+      if (Date.now() - this.lastBidirectionalRxAt < PONG_WAIT_MS) {
         this.missedPongs = 0;
         return;
       }
@@ -249,17 +262,27 @@ export class DirectLink {
   }
 
   call(method: RpcMethod, params: unknown, timeoutMs: number): Promise<unknown> {
+    if (!this.open) {
+      return Promise.reject(new DirectError("offline", "直连断开了", false));
+    }
     const id = `d${Date.now().toString(36)}${(this.seq++).toString(36)}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.consecutiveTimeouts += 1;
+        const staleBidirectional = Date.now() - this.lastBidirectionalRxAt > PONG_WAIT_MS;
         reject(new DirectError("timeout", "电脑那边没有及时回应", true));
+        if (this.consecutiveTimeouts >= TIMEOUT_EVICT_LIMIT || staleBidirectional) {
+          this.close();
+        } else {
+          this.ping();
+        }
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       if (!this.send({ type: "rpc", id, to: this.to, method, params })) {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(new DirectError("offline", "直连断开了"));
+        reject(new DirectError("offline", "直连断开了", false));
       }
     });
   }

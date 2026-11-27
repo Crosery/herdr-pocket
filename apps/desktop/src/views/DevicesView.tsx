@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { Check, Copy, Laptop, Monitor, Plus, Smartphone, Trash2 } from "lucide-react";
+import { Activity, Check, Copy, Laptop, Monitor, Plus, Smartphone, Trash2 } from "lucide-react";
 import type { Device, DeviceKind, PairCode } from "@herdr-pocket/protocol";
 import { EmptyState, PocketBadge, PocketButton, PocketCard, PocketIconButton, PocketModal, fs, useToast } from "../components/PocketUI";
 import { copyToClipboard, isH5Web } from "../lib/bridge";
 import { partitionDevices, type ClassifiedDevice } from "../lib/deviceRole";
 import { useLocalHostDeviceId } from "../lib/fonts";
 import { installHostCommand } from "../components/LocalHostDeps";
-import { createPairCode, getActiveToken, revokeDevice } from "../lib/relay";
+import { classifyLatency, describeHostTransport } from "../lib/networkMeta";
+import { createPairCode, getActiveToken, measureHostRtt, measureRelayRtt, revokeDevice } from "../lib/relay";
 import { isMockServer } from "../lib/mock";
 import { liveStore, relTime, settingsStore } from "../lib/store";
 
@@ -22,9 +23,14 @@ export function DevicesView({
 }) {
   const devicesMap = liveStore.use((s) => s.devices);
   const agentsMap = liveStore.use((s) => s.agents);
+  const directMap = liveStore.use((s) => s.direct);
+  const directMeta = liveStore.use((s) => s.directMeta);
+  const hostProbeRttMs = liveStore.use((s) => s.hostProbeRttMs);
+  const relayRttMs = liveStore.use((s) => s.rttMs);
   const myId = settingsStore.use((s) => s.deviceId);
   const localHostId = useLocalHostDeviceId();
   const [inviteOpen, setInviteOpen] = useState(false);
+  const [probing, setProbing] = useState(false);
   useEffect(() => {
     if (addHostNonce) setInviteOpen(true);
   }, [addHostNonce]);
@@ -36,6 +42,16 @@ export function DevicesView({
   );
   const totalCount = desktop.length + mobile.length;
 
+  const probeAll = async () => {
+    setProbing(true);
+    try {
+      const onlineHosts = Object.values(devicesMap).filter((d) => d.kind === "host" && d.online);
+      await Promise.all([measureRelayRtt(4_000), ...onlineHosts.map((h) => measureHostRtt(h.id, 4_000))]);
+    } finally {
+      setProbing(false);
+    }
+  };
+
   const renderCard = (item: ClassifiedDevice) => {
     const d = item.device;
     const isHost = d.kind === "host";
@@ -44,6 +60,11 @@ export function DevicesView({
     const isDesktopViewer = !isHost && /控制端|desktop|桌面/i.test(item.roleLabel) && !/手机/.test(item.roleLabel);
     const Icon = isHost ? Laptop : isDesktopViewer ? Monitor : Smartphone;
     const roleTone = item.isLocalHost ? "mint" : item.isExecutionHost ? "lav" : "neutral";
+    const transport = isHost ? describeHostTransport(directMap[d.id], directMeta[d.id]) : null;
+    const shownRtt = isHost
+      ? (directMap[d.id] ? (directMeta[d.id]?.rttMs ?? hostProbeRttMs[d.id] ?? null) : (hostProbeRttMs[d.id] ?? relayRttMs ?? null))
+      : null;
+    const latInfo = classifyLatency(shownRtt);
     return (
       <PocketCard key={d.id}>
         <div className="device-card">
@@ -56,9 +77,17 @@ export function DevicesView({
                 <span className="device-name" title={d.name}>{d.name}</span>
                 {item.isCurrentDevice ? <PocketBadge tone="pink">当前设备 · 本机</PocketBadge> : null}
                 {item.isCurrentDevice && !isHost ? null : <PocketBadge tone={roleTone}>{item.roleLabel}</PocketBadge>}
-                <PocketBadge tone={online ? "mint" : "neutral"} pulse={online}>
-                  {online ? "在线" : "离线"}
-                </PocketBadge>
+                {isHost && online && transport ? (
+                  <PocketBadge tone={latInfo.tone}>
+                    <span className="mono">
+                      {transport.shortLabel}{typeof shownRtt === "number" ? ` · ${shownRtt}ms` : ""}
+                    </span>
+                  </PocketBadge>
+                ) : (
+                  <PocketBadge tone={online ? "mint" : "neutral"} pulse={online}>
+                    {online ? "在线" : "离线"}
+                  </PocketBadge>
+                )}
               </div>
               <div className="faint device-meta">
                 {[
@@ -99,9 +128,14 @@ export function DevicesView({
             <h2 className="cute-font" style={{ margin: 0, fontSize: fs(26) }}>设备管理</h2>
             <div className="faint">
               桌面运行载体 {desktopOnlineCount}/{desktop.length} · 移动控制端 {mobileOnlineCount}/{mobile.length}
+              {typeof relayRttMs === "number" ? ` · 中继 ${relayRttMs} ms` : ""}
             </div>
           </div>
           <div className="row wrap" style={{ gap: 8 }}>
+            <PocketButton variant="ghost" disabled={probing} onClick={() => void probeAll()}>
+              <Activity size={15} className={probing ? "pk-spin" : undefined} />
+              <span>{probing ? "测速中…" : "测速"}</span>
+            </PocketButton>
             {onPairPhone ? (
               <PocketButton variant="soft" onClick={onPairPhone}>
                 <Smartphone size={15} />

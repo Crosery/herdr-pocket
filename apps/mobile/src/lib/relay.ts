@@ -151,9 +151,10 @@ type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; time
 /** `via`: the direct link carrying it; none means the relay. */
 type Stream = { id: string; to: string; stream: StreamKind; params: unknown; onEvent: StreamEvent; onState?: StreamEvent; via?: DirectLink };
 
-/** Reads that may simply be asked again through the relay when a direct link dies under them. */
+/** Reads or idempotent RPCs that may safely replay through the relay when a direct link dies under them. */
 const SAFE_AGAIN = new Set<RpcMethod>([
-  "agents.list", "terminal.read", "session.events", "session.children", "spaces.list", "host.info", "agent.seen",
+  "agents.list", "terminal.read", "terminal.resize", "terminal.put", "terminal.putBegin", "terminal.putAbort",
+  "session.events", "session.children", "spaces.list", "host.info", "agent.seen", "agent.ports",
   "herdr.layout", "folders.list", "sessions.list", "sessions.search", "sessions.read", "sessions.usage", "harness.icons",
   "tools.check", "tools.updateStatus", "files.readChunk", "portal.list", "portal.frame", "portal.fileTicket", "portal.dirList", "portal.bundleHtml",
 ]);
@@ -522,8 +523,8 @@ class SocketLink implements Link {
     if (!link?.open || method === "direct.offer" || method === "webrtc.offer") return this.relayCall(to, method, params, timeoutMs);
     return link.call(method, params, timeoutMs).catch((e: unknown) => {
       if (!(e instanceof DirectError)) throw e;
-      // The link died under a read: ask the relay instead. Anything that changes something is not sent twice.
-      if ((e.code === "offline" || e.code === "timeout") && SAFE_AGAIN.has(method)) return this.relayCall(to, method, params, timeoutMs);
+      // The link died under a safe read/upload or failed before sending any bytes: replay via relay.
+      if ((e.code === "offline" || e.code === "timeout") && (SAFE_AGAIN.has(method) || !e.uncertain)) return this.relayCall(to, method, params, timeoutMs);
       if (e.code !== "not_found") applog("warn", "rpc", `${method} failed over the direct link: ${e.code}: ${e.message}`, { to });
       throw new RelayError(e.code, e.message, e.uncertain);
     });

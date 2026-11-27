@@ -193,7 +193,7 @@ export function PortalTabPane({
         <div className="portal-tab-stage-wrap">
           <FileViewer
             key={`${active.hostId}:${active.targetPath || active.title}`}
-            tab={{ path: active.targetPath || active.title, title: active.title, absPath: active.targetPath }}
+            tab={{ path: active.targetPath || active.title, title: active.title, absPath: active.targetPath, deviceId: active.hostId }}
             agent={agent}
             embedded
           />

@@ -1,9 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Headphones, Mic, Play, Square, Volume2 } from "lucide-react";
-import { native, type VoiceAiPreviewResult, type VoiceAiState } from "../lib/native";
+import { Download, Headphones, Mic, Play, ShieldAlert, Square, Volume2 } from "lucide-react";
+import {
+  native,
+  type VoiceAiPreviewLiveInfo,
+  type VoiceAiPreviewResult,
+  type VoiceAiState,
+} from "../lib/native";
+import {
+  defaultVoiceAiDownloadLabel,
+  isVoiceAiCancelMessage,
+  startVoiceAiDownload,
+  voiceAiDownloadStore,
+} from "../lib/voiceAiDownload";
 import { PocketBadge, PocketButton, PocketCheckbox, useToast } from "./PocketUI";
 
 const TARGET_RATE = 16_000;
+const LIVE_BLOCK_SAMPLES = 640; // 40ms = exact 2x320 frames for zero-click STFT/DPDFNet/VoxLock streaming
 const MAX_RECORD_MS = 5_000;
 const HEADPHONE_RE = /headphone|headset|earphone|earbud|airpods|buds|beats|bose|sony|wh-|wf-|bluetooth|耳机|头戴/i;
 
@@ -42,6 +54,7 @@ function pcm16ToBase64(pcm: Int16Array): string {
 }
 
 function base64ToFloat32(b64: string): Float32Array {
+  if (!b64) return new Float32Array(0);
   const bin = atob(b64);
   const samples = Math.floor(bin.length / 2);
   const out = new Float32Array(samples);
@@ -54,11 +67,28 @@ function base64ToFloat32(b64: string): Float32Array {
   return out;
 }
 
-export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
+function int16ToFloat32(pcm: Int16Array): Float32Array {
+  const out = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) {
+    out[i] = pcm[i]! / 32768;
+  }
+  return out;
+}
+
+export function VoicePreviewStudio({
+  aiState,
+  onStateChange,
+}: {
+  aiState: VoiceAiState;
+  onStateChange?: (next: VoiceAiState) => void;
+}) {
   const toast = useToast();
+  const vpDownload = voiceAiDownloadStore.use((s) => s);
   const [detectedHeadphone, setDetectedHeadphone] = useState<string | null>(null);
   const [headphoneConfirmed, setHeadphoneConfirmed] = useState(false);
   const [liveOn, setLiveOn] = useState(false);
+  const [liveInfo, setLiveInfo] = useState<VoiceAiPreviewLiveInfo | null>(null);
+  const [liveSuppressed, setLiveSuppressed] = useState(false);
   const [listenMode, setListenMode] = useState<"processed" | "raw">("processed");
   const [recording, setRecording] = useState(false);
   const [recordSec, setRecordSec] = useState(0);
@@ -69,9 +99,18 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
   const [playing, setPlaying] = useState<"raw" | "processed" | null>(null);
   const [bars, setBars] = useState<number[]>(() => Array.from({ length: 28 }, () => 5));
 
+  const listenModeRef = useRef<"processed" | "raw">(listenMode);
+  listenModeRef.current = listenMode;
+
   const liveCtxRef = useRef<AudioContext | null>(null);
   const liveStreamRef = useRef<MediaStream | null>(null);
-  const liveNodesRef = useRef<{
+  const liveProcRef = useRef<ScriptProcessorNode | null>(null);
+  const liveNativeActiveRef = useRef(false);
+  const liveSessionIdRef = useRef(0);
+  const liveNextPlayAtRef = useRef(0);
+  const liveQueueRef = useRef<Int16Array[]>([]);
+  const liveDrainingRef = useRef(false);
+  const liveWebNodesRef = useRef<{
     rawGain: GainNode;
     procGain: GainNode;
     hpf: BiquadFilterNode;
@@ -84,8 +123,16 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
   const playSrcRef = useRef<AudioBufferSourceNode | null>(null);
   const playRafRef = useRef<number | null>(null);
 
+  const isDownloading = vpDownload.downloading || aiState.downloading;
+  const dlPct = Math.round((vpDownload.downloading ? vpDownload.progress : aiState.progress) * 100);
+  const dpdfReady = Boolean(aiState.ortReady && aiState.dpdfReady);
+  const svReady = Boolean(aiState.ortReady && aiState.svReady);
+  const needNeuralDenoiseModel = aiState.denoise && !dpdfReady;
+  const needVoiceprintModel = (aiState.filter || aiState.firstSpeaker) && !svReady;
   const canUseLive = Boolean(detectedHeadphone) || headphoneConfirmed;
-  const estLatencyMs = aiState.tier === "tse" && aiState.filter ? 148 : 42;
+  const estLatencyMs = native.available()
+    ? (aiState.tier === "tse" && aiState.filter && aiState.tseReady ? 148 : 65)
+    : 35;
 
   const refreshOutputs = useCallback(async () => {
     try {
@@ -127,11 +174,24 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
   }, []);
 
   const stopLiveMonitor = useCallback(() => {
+    liveSessionIdRef.current += 1;
+    liveQueueRef.current = [];
+    liveDrainingRef.current = false;
+    liveNextPlayAtRef.current = 0;
     if (liveRafRef.current != null) {
       cancelAnimationFrame(liveRafRef.current);
       liveRafRef.current = null;
     }
-    liveNodesRef.current = null;
+    liveWebNodesRef.current = null;
+    if (liveProcRef.current) {
+      try {
+        liveProcRef.current.onaudioprocess = null;
+        liveProcRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      liveProcRef.current = null;
+    }
     if (liveStreamRef.current) {
       liveStreamRef.current.getTracks().forEach((t) => t.stop());
       liveStreamRef.current = null;
@@ -140,7 +200,13 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
       void liveCtxRef.current.close().catch(() => {});
       liveCtxRef.current = null;
     }
+    if (liveNativeActiveRef.current) {
+      liveNativeActiveRef.current = false;
+      void native.voiceAiPreviewLiveClose();
+    }
     setLiveOn(false);
+    setLiveInfo(null);
+    setLiveSuppressed(false);
     setBars(Array.from({ length: 28 }, () => 5));
   }, []);
 
@@ -152,9 +218,9 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
     };
   }, [stopLiveMonitor, stopPlayback]);
 
-  // Keep live monitor DSP nodes synced with switches & listen mode in real time.
+  // Keep Web-fallback monitor nodes synced in browser/H5 mode.
   useEffect(() => {
-    const nodes = liveNodesRef.current;
+    const nodes = liveWebNodesRef.current;
     if (!nodes) return;
     nodes.rawGain.gain.value = listenMode === "raw" ? 0.92 : 0;
     nodes.procGain.gain.value = listenMode === "processed" ? 0.92 : 0;
@@ -162,8 +228,23 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
     nodes.presence.gain.value = aiState.enhanceVocal ? 5.2 : 0;
   }, [listenMode, aiState.denoise, aiState.enhanceVocal]);
 
-  // Re-run real Rust/DSP LiveCallProcessor whenever parameters change on an existing 5s clip.
-  const configSig = `${aiState.denoise}:${aiState.enhanceVocal}:${aiState.tier}:${aiState.filter}:${aiState.firstSpeaker}:${aiState.threshold.toFixed(2)}:${aiState.enrolled}`;
+  const configSig = `${aiState.denoise}:${aiState.enhanceVocal}:${aiState.tier}:${aiState.filter}:${aiState.firstSpeaker}:${aiState.threshold.toFixed(2)}:${aiState.enrolled}:${Boolean(aiState.ortReady)}:${aiState.dpdfReady}:${aiState.svReady}:${aiState.tseReady}`;
+
+  // Hot-reload the live Rust LiveCallProcessor whenever settings or downloaded models change during ear-return.
+  useEffect(() => {
+    if (!liveOn || !liveNativeActiveRef.current) return;
+    const sessionId = liveSessionIdRef.current;
+    void native
+      .voiceAiPreviewLiveOpen()
+      .then((info) => {
+        if (liveSessionIdRef.current === sessionId) {
+          setLiveInfo(info);
+        }
+      })
+      .catch(() => {});
+  }, [liveOn, configSig]);
+
+  // Re-run real Rust/DSP LiveCallProcessor whenever parameters or downloaded models change on an existing 5s clip.
   useEffect(() => {
     if (!rawBase64) return;
     let cancelled = false;
@@ -184,6 +265,22 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
     };
   }, [rawBase64, configSig, toast]);
 
+  const schedulePlaybackChunk = (ctx: AudioContext, samples: Float32Array) => {
+    if (!samples.length || ctx.state === "closed") return;
+    const buf = ctx.createBuffer(1, samples.length, TARGET_RATE);
+    buf.getChannelData(0).set(samples);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    const now = ctx.currentTime;
+    if (liveNextPlayAtRef.current < now + 0.012 || liveNextPlayAtRef.current > now + 0.22) {
+      liveNextPlayAtRef.current = now + 0.032;
+    }
+    const startAt = liveNextPlayAtRef.current;
+    liveNextPlayAtRef.current = startAt + buf.duration;
+    src.start(startAt);
+  };
+
   const startLiveMonitor = async () => {
     if (!canUseLive) {
       toast("外放扬声器下请先戴好耳机并勾选确认，避免啸叫", true);
@@ -195,6 +292,116 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
     }
     stopPlayback();
     recStopRef.current?.();
+
+    // Desktop Tauri mode: stream raw 16kHz PCM16 through the REAL Rust/ONNX LiveCallProcessor
+    // (DPDFNet + Silero VAD + ERes2NetV2 + VoxLock v2), never a faked WebAudio EQ.
+    if (native.available()) {
+      const sessionId = liveSessionIdRef.current + 1;
+      liveSessionIdRef.current = sessionId;
+      try {
+        const info = await native.voiceAiPreviewLiveOpen();
+        if (liveSessionIdRef.current !== sessionId) {
+          void native.voiceAiPreviewLiveClose();
+          return;
+        }
+        liveNativeActiveRef.current = true;
+        setLiveInfo(info);
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
+        if (liveSessionIdRef.current !== sessionId) {
+          stream.getTracks().forEach((t) => t.stop());
+          void native.voiceAiPreviewLiveClose();
+          liveNativeActiveRef.current = false;
+          return;
+        }
+        void refreshOutputs();
+
+        const ctx = new AudioContext({ latencyHint: "interactive" });
+        const src = ctx.createMediaStreamSource(stream);
+        const proc = ctx.createScriptProcessor(1024, 1, 1);
+        const silent = ctx.createGain();
+        silent.gain.value = 0;
+
+        let pending = new Int16Array(0);
+        const drain = async () => {
+          if (liveDrainingRef.current) return;
+          liveDrainingRef.current = true;
+          try {
+            while (liveQueueRef.current.length > 0 && liveSessionIdRef.current === sessionId) {
+              const block = liveQueueRef.current.shift()!;
+              const b64 = pcm16ToBase64(block);
+              const res = await native.voiceAiPreviewLiveProcess(b64);
+              if (liveSessionIdRef.current !== sessionId || !liveCtxRef.current) break;
+              setLiveSuppressed(Boolean(res.suppressed));
+              const outFloat =
+                listenModeRef.current === "raw"
+                  ? int16ToFloat32(block)
+                  : base64ToFloat32(res.pcmBase64);
+              schedulePlaybackChunk(liveCtxRef.current, outFloat);
+              let rms = res.level;
+              if (listenModeRef.current === "raw") {
+                let sq = 0;
+                for (let i = 0; i < outFloat.length; i += 4) sq += outFloat[i]! * outFloat[i]!;
+                rms = Math.min(1, Math.sqrt(sq / Math.max(1, outFloat.length / 4)) * 4);
+              }
+              const barH = Math.max(4, Math.min(34, Math.round(4 + rms * 30)));
+              setBars((prev) => [...prev.slice(1), barH]);
+            }
+          } catch {
+            // transient IPC hiccup; keep session alive
+          } finally {
+            liveDrainingRef.current = false;
+            if (liveQueueRef.current.length > 0 && liveSessionIdRef.current === sessionId) {
+              void drain();
+            }
+          }
+        };
+
+        proc.onaudioprocess = (ev) => {
+          if (liveSessionIdRef.current !== sessionId) return;
+          const input = ev.inputBuffer.getChannelData(0);
+          const chunk16k = resampleTo16k(input, ctx.sampleRate);
+          const merged = new Int16Array(pending.length + chunk16k.length);
+          merged.set(pending, 0);
+          merged.set(chunk16k, pending.length);
+          let offset = 0;
+          while (offset + LIVE_BLOCK_SAMPLES <= merged.length) {
+            const block = merged.slice(offset, offset + LIVE_BLOCK_SAMPLES);
+            offset += LIVE_BLOCK_SAMPLES;
+            if (liveQueueRef.current.length >= 3) {
+              liveQueueRef.current.shift();
+            }
+            liveQueueRef.current.push(block);
+          }
+          pending = merged.slice(offset);
+          if (liveQueueRef.current.length > 0) {
+            void drain();
+          }
+        };
+
+        src.connect(proc);
+        proc.connect(silent);
+        silent.connect(ctx.destination);
+
+        liveStreamRef.current = stream;
+        liveCtxRef.current = ctx;
+        liveProcRef.current = proc;
+        setLiveOn(true);
+        return;
+      } catch (e) {
+        toast((e as Error).message || "无法打开麦克风进行实时模型耳返", true);
+        stopLiveMonitor();
+        return;
+      }
+    }
+
+    // Browser / H5 non-Tauri fallback (clearly labeled as browser DSP).
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -239,7 +446,14 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
 
       liveStreamRef.current = stream;
       liveCtxRef.current = ctx;
-      liveNodesRef.current = { rawGain, procGain, hpf, presence };
+      liveWebNodesRef.current = { rawGain, procGain, hpf, presence };
+      setLiveInfo({
+        active: false,
+        usedDpdf: false,
+        usedTse: false,
+        svActive: false,
+        engineLabel: "浏览器基础试听（桌面端可试听本地 AI 神经模型）",
+      });
       setLiveOn(true);
 
       const bins = new Uint8Array(analyser.frequencyBinCount);
@@ -258,6 +472,18 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
     } catch (e) {
       toast((e as Error).message || "无法打开麦克风进行耳返试听", true);
       stopLiveMonitor();
+    }
+  };
+
+  const handleDownloadNeuralModel = async (target: "base" | "sv") => {
+    const label = defaultVoiceAiDownloadLabel(target, aiState);
+    toast(`已开始在后台下载${target === "base" ? "神经降噪引擎 (DPDFNet + VAD)" : "灵巧声纹模型"}`);
+    try {
+      const next = await startVoiceAiDownload(target, label);
+      onStateChange?.(next);
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (!isVoiceAiCancelMessage(msg)) toast(msg, true);
     }
   };
 
@@ -404,9 +630,15 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
     src.start();
   };
 
-  const statusTone = liveOn ? "mint" : recording ? "blush" : playing ? "pink" : "neutral";
+  const activeDpdf = liveOn ? Boolean(liveInfo?.usedDpdf) : Boolean(processed?.usedDpdf ?? dpdfReady);
+  const activeTse = liveOn ? Boolean(liveInfo?.usedTse) : Boolean(processed?.usedTse);
+  const activeSv = liveOn ? Boolean(liveInfo?.svActive) : Boolean(processed?.svActive);
+
+  const statusTone = liveOn ? (liveSuppressed ? "blush" : "mint") : recording ? "blush" : playing ? "pink" : "neutral";
   const statusLabel = liveOn
-    ? `实时耳返中 · 约 ${estLatencyMs} ms`
+    ? liveSuppressed
+      ? "实时耳返中 · 声纹拦截中"
+      : `${liveInfo?.engineLabel || "实时耳返中"} · 约 ${estLatencyMs} ms`
     : recording
       ? `录音中 · ${recordSec.toFixed(1)}s / 5.0s`
       : playing === "raw"
@@ -448,6 +680,34 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
       </div>
 
       <div className="vlab-body">
+        {needNeuralDenoiseModel || needVoiceprintModel ? (
+          <div className="vlab-route-bar warn">
+            <span className="row" style={{ gap: 6, flex: 1, minWidth: 0 }}>
+              <ShieldAlert size={14} style={{ flexShrink: 0 }} />
+              <span>
+                {needNeuralDenoiseModel
+                  ? "当前尚未下载本地神经网络降噪模型（DPDFNet + VAD），外放音乐/环境人声不会被神经模型过滤。"
+                  : "当前已开启声纹过滤，但尚未下载本地声纹模型（ERes2NetV2），旁人声音暂无法拦截。"}
+              </span>
+            </span>
+            <PocketButton
+              size="sm"
+              variant="soft"
+              disabled={isDownloading}
+              onClick={() => void handleDownloadNeuralModel(needVoiceprintModel ? "sv" : "base")}
+            >
+              <Download size={12} />
+              <span>
+                {isDownloading
+                  ? `后台下载中 ${dlPct}%`
+                  : needVoiceprintModel
+                    ? "下载声纹+降噪模型"
+                    : "下载神经降噪模型"}
+              </span>
+            </PocketButton>
+          </div>
+        ) : null}
+
         {!canUseLive ? (
           <div className="vlab-route-bar warn">
             <span className="row" style={{ gap: 6, flex: 1, minWidth: 0 }}>
@@ -466,7 +726,7 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
         ) : (
           <div className="vlab-route-bar">
             <span className="truncate" style={{ flex: 1, minWidth: 0 }}>
-              {detectedHeadphone ? `已检测到耳机（${detectedHeadphone}）` : "已确认佩戴耳机"} · 边说边切下方开关立刻听差别
+              {detectedHeadphone ? `已检测到耳机（${detectedHeadphone}）` : "已确认佩戴耳机"} · 实时经过本地真实模型链路，切换下方开关立刻听差别
             </span>
             <div className="segmented" role="tablist" aria-label="实时耳返监听源">
               <button
@@ -494,23 +754,28 @@ export function VoicePreviewStudio({ aiState }: { aiState: VoiceAiState }) {
         <div className="vlab-wave-box">
           <div className="row wrap" style={{ justifyContent: "space-between", gap: 6 }}>
             <div className="row wrap" style={{ gap: 6 }}>
-              <PocketBadge tone={aiState.denoise ? "mint" : "neutral"}>
-                {aiState.denoise ? (processed?.usedDpdf ? "降噪 · DPDFNet" : "降噪 · 已开") : "降噪 · 已关"}
+              <PocketBadge tone={!aiState.denoise ? "neutral" : activeDpdf ? "mint" : "warn"}>
+                {!aiState.denoise ? "降噪 · 已关" : activeDpdf ? "降噪 · DPDFNet 神经模型" : "降噪 · 仅基础静态去噪"}
               </PocketBadge>
               <PocketBadge tone={aiState.enhanceVocal ? "pink" : "neutral"}>
                 {aiState.enhanceVocal ? "人声增强 · 已开" : "人声增强 · 已关"}
               </PocketBadge>
-              <PocketBadge tone={aiState.enrolled && aiState.filter ? "lav" : "neutral"}>
-                {aiState.enrolled && aiState.filter
-                  ? processed?.usedTse
-                    ? "声纹分离 · VoxLock"
-                    : "只认我的声音 · 已开"
-                  : "声纹过滤 · 未开"}
+              <PocketBadge tone={activeTse || activeSv ? "lav" : needVoiceprintModel ? "warn" : "neutral"}>
+                {activeTse
+                  ? "声纹分离 · VoxLock"
+                  : activeSv
+                    ? "声纹门控 · ERes2NetV2"
+                    : needVoiceprintModel
+                      ? "声纹过滤 · 待下载模型"
+                      : "声纹过滤 · 未开"}
               </PocketBadge>
             </div>
             {processed ? (
               <span className="mono faint" style={{ fontSize: 11 }}>
-                原 {processed.inRmsDb} dB → 现 {processed.outRmsDb} dB · {processed.processMs} ms
+                原 {processed.inRmsDb} dB → 现 {processed.outRmsDb} dB
+                {processed.suppressedRatio > 0 ? ` · 声纹拦截 ${Math.round(processed.suppressedRatio * 100)}%` : ""}
+                {" · "}
+                {processed.processMs} ms
               </span>
             ) : null}
           </div>

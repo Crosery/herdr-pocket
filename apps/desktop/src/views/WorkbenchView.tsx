@@ -592,7 +592,16 @@ export function FileViewer({
   embedded = false,
   onHeadState,
 }: {
-  tab: { path: string; title: string; absPath?: string; line?: number; endLine?: number };
+  tab: {
+    path: string;
+    title: string;
+    absPath?: string;
+    line?: number;
+    endLine?: number;
+    agentKey?: string;
+    agent?: string;
+    deviceId?: string;
+  };
   agent: Agent | undefined;
   embedded?: boolean;
   onHeadState?: (s: FileViewerHeadState) => void;
@@ -648,9 +657,14 @@ export function FileViewer({
   const platform = detectPlatform();
   const revealLabel = revealInFolderLabel(platform);
   const revealShort = revealInFolderShortLabel(platform);
+  const ownerKey = tab.agentKey ?? tab.agent;
+  const inferredAgentDeviceId =
+    agent?.deviceId ??
+    tab.deviceId ??
+    (ownerKey && ownerKey.includes("/") ? ownerKey.slice(0, ownerKey.indexOf("/")) : undefined);
   const canRevealLocal = canActOnLocalFile({
     nativeAvailable: native.available(),
-    agentDeviceId: agent?.deviceId,
+    agentDeviceId: inferredAgentDeviceId,
     agentCwd: agent?.cwd,
     localHostId: localId,
     path: tab.path,

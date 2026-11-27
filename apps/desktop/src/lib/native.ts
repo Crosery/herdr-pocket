@@ -325,6 +325,20 @@ export interface VoiceAiPreviewResult {
   svActive: boolean;
 }
 
+export interface VoiceAiPreviewLiveInfo {
+  active: boolean;
+  usedDpdf: boolean;
+  usedTse: boolean;
+  svActive: boolean;
+  engineLabel: string;
+}
+
+export interface VoiceAiPreviewLiveChunk {
+  pcmBase64: string;
+  level: number;
+  suppressed: boolean;
+}
+
 const DEMO_VOICE_AI_KEY = "herdr-pocket-demo-voice-ai-v1";
 const demoProgressListeners = new Set<(e: VoiceAiProgressEvent) => void>();
 const demoEnrollListeners = new Set<(e: VoiceAiEnrollEvent) => void>();
@@ -839,10 +853,43 @@ export const native = {
       inRmsDb: inDb,
       outRmsDb: outDb,
       suppressedRatio: Math.round((suppressed / n) * 1000) / 1000,
-      usedDpdf: cfg.denoise,
-      usedTse: cfg.tier === "tse" && cfg.filter,
-      svActive: cfg.enrolled && cfg.filter,
+      usedDpdf: cfg.denoise && cfg.ortReady === true && cfg.dpdfReady,
+      usedTse: cfg.tier === "tse" && cfg.filter && cfg.tseReady,
+      svActive: cfg.enrolled && cfg.filter && cfg.svReady,
     };
+  },
+  voiceAiPreviewLiveOpen: async (): Promise<VoiceAiPreviewLiveInfo> => {
+    if (inTauri()) {
+      return invoke<VoiceAiPreviewLiveInfo>("voice_ai_preview_live_open");
+    }
+    const cfg = getDemoVoiceAi();
+    const usedDpdf = cfg.denoise && Boolean(cfg.ortReady && cfg.dpdfReady);
+    const usedTse = cfg.tier === "tse" && cfg.filter && cfg.tseReady;
+    const svActive = cfg.enrolled && cfg.filter && cfg.svReady;
+    const parts: string[] = [];
+    if (usedDpdf) parts.push("DPDFNet 神经降噪");
+    else if (cfg.denoise) parts.push("浏览器基础降噪");
+    if (usedTse) parts.push("VoxLock 声纹分离");
+    else if (svActive) parts.push("ERes2NetV2 声纹门控");
+    if (cfg.enhanceVocal) parts.push("人声增强");
+    return {
+      active: false,
+      usedDpdf,
+      usedTse,
+      svActive,
+      engineLabel: parts.length ? parts.join(" + ") : "直通（增强已全部关闭）",
+    };
+  },
+  voiceAiPreviewLiveProcess: async (pcmBase64: string): Promise<VoiceAiPreviewLiveChunk> => {
+    if (inTauri()) {
+      return invoke<VoiceAiPreviewLiveChunk>("voice_ai_preview_live_process", { pcmBase64 });
+    }
+    return { pcmBase64, level: 0, suppressed: false };
+  },
+  voiceAiPreviewLiveClose: async (): Promise<void> => {
+    if (inTauri()) {
+      await invoke<void>("voice_ai_preview_live_close").catch(() => {});
+    }
   },
   onVoiceAiProgress: (cb: (e: VoiceAiProgressEvent) => void): (() => void) => {
     if (inTauri()) return onNativeEvent<VoiceAiProgressEvent>("voice-ai://progress", cb);

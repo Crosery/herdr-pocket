@@ -1,4 +1,7 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { Agent, AgentListeningPort } from "@herdr-pocket/protocol";
 
@@ -22,6 +25,9 @@ export interface PortScannerDeps {
   platform?: NodeJS.Platform;
   listListeners?: () => Promise<RawListener[]>;
   listProcessParents?: () => Promise<Map<number, { ppid: number; name: string }>>;
+  listProcessCwds?: (pids: readonly number[]) => Promise<Map<number, string>>;
+  isProjectRoot?: (dir: string) => boolean;
+  hasGitDir?: (dir: string) => boolean;
   probeHttp?: (host: string, port: number) => Promise<{ protocol: "http" | "tcp"; title?: string }>;
   killPid?: (pid: number) => void;
   selfPid?: number;
@@ -30,15 +36,18 @@ export interface PortScannerDeps {
 
 const MAX_HOPS = 16;
 const PROBE_CACHE_TTL_MS = 25_000;
+const PROJECT_ROOT_MARKERS = [".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod"] as const;
 const IGNORED_PROCS = new Set([
+  // OS / system services
   "rapportd",
   "controlcenter",
   "airplayxpchelper",
   "sharingd",
   "identityservicesd",
   "sshd",
-  "mDNSResponder".toLowerCase(),
+  "mdnsresponder",
   "systemd-resolved",
+  // Herdr / Pocket / Uniflo infrastructure
   "uniflo",
   "herdr",
   "herdr-app",
@@ -47,7 +56,110 @@ const IGNORED_PROCS = new Set([
   "ego helper",
   "herdr pocket",
   "herdr-pocket",
+  // Agent CLI harnesses & interactive shells (their internal IPC ports must never be shown or killed)
+  "agy",
+  "antigravity",
+  "antigravity-cli",
+  "omp",
+  "claude",
+  "claude-code",
+  "codex",
+  "gemini",
+  "opencode",
+  "pi",
+  "aider",
+  "goose",
+  "zsh",
+  "bash",
+  "sh",
+  "fish",
+  "tmux",
+  "screen",
+  // Browser / container / ADB / desktop app daemons
+  "adb",
+  "chrome-headless-shell",
+  "google chrome",
+  "chromium",
+  "msedge",
+  "orbstack",
+  "orbstack helper",
+  "com.docker.backend",
+  "docker",
+  "docker-proxy",
+  "limactl",
+  "qemu-system-aarch64",
+  "qemu-system-x86_64",
+  "feishu",
+  "lark",
+  "lark helper",
+  "qq",
+  "wechat",
+  "wechatweb",
+  "wechatdevtools",
+  "figma_agent",
+  "zed",
+  "code",
+  "cursor",
+  "rclone",
+  "netdisk_service",
+  "ibuki",
+  "ibukinas2",
 ]);
+
+function normalizeDir(dir: string | null | undefined): string {
+  if (!dir) return "";
+  const trimmed = dir.trim();
+  if (!trimmed) return "";
+  if (trimmed === "/") return "/";
+  return trimmed.replace(/[\\/]+$/, "");
+}
+
+function defaultGenericDirs(): ReadonlySet<string> {
+  const home = normalizeDir(homedir());
+  const set = new Set<string>(["/", "/tmp", "/private/tmp", "/var", "/private/var"]);
+  if (home) {
+    set.add(home);
+    set.add(join(home, "tmp"));
+    set.add(join(home, "Desktop"));
+    set.add(join(home, "Downloads"));
+    set.add(join(home, "Documents"));
+  }
+  return set;
+}
+
+function defaultHasGitDir(dir: string): boolean {
+  try {
+    return existsSync(join(dir, ".git"));
+  } catch {
+    return false;
+  }
+}
+
+function defaultIsProjectRoot(dir: string): boolean {
+  for (const marker of PROJECT_ROOT_MARKERS) {
+    try {
+      if (existsSync(join(dir, marker))) return true;
+    } catch {
+      // ignore
+    }
+  }
+  return false;
+}
+
+function hasGitBoundaryBetween(childDir: string, parentDir: string, hasGitDir: (dir: string) => boolean): boolean {
+  let cur = childDir;
+  while (cur && cur.length > parentDir.length) {
+    if (hasGitDir(cur)) return true;
+    const up = dirname(cur);
+    if (!up || up === cur) break;
+    cur = up;
+  }
+  return false;
+}
+
+function decodeLsofEscapes(raw: string): string {
+  return raw.replace(/\\x([0-9a-fA-F]{2})/g, (_m, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+}
 
 const probeCache = new Map<string, { at: number; protocol: "http" | "tcp"; title?: string }>();
 
@@ -69,7 +181,7 @@ export function parseLsofListeners(stdout: string): RawListener[] {
       pid = Number.parseInt(val, 10) || 0;
       cmd = "";
     } else if (tag === "c") {
-      cmd = val;
+      cmd = decodeLsofEscapes(val);
     } else if (tag === "n" && pid > 0) {
       const m = /^(.+):(\d+)$/.exec(val);
       if (!m) continue;
@@ -205,6 +317,41 @@ export async function defaultListListeners(
   }
 }
 
+/** Parses `lsof -a -p <pids> -d cwd -Fn` machine-readable output into pid -> cwd map. */
+export function parseLsofCwds(stdout: string): Map<number, string> {
+  const out = new Map<number, string>();
+  let pid = 0;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    if (!rawLine) continue;
+    const tag = rawLine[0];
+    const val = rawLine.slice(1).trim();
+    if (tag === "p") {
+      pid = Number.parseInt(val, 10) || 0;
+    } else if (tag === "n" && pid > 0 && val) {
+      out.set(pid, normalizeDir(decodeLsofEscapes(val)));
+    }
+  }
+  return out;
+}
+
+export async function defaultListProcessCwds(
+  pids: readonly number[],
+  plat: NodeJS.Platform = process.platform,
+): Promise<Map<number, string>> {
+  const uniq = [...new Set(pids.filter((p) => Number.isFinite(p) && p > 1))];
+  if (uniq.length === 0 || plat === "win32") return new Map();
+  try {
+    const { stdout } = await execFileAsync(
+      "lsof",
+      ["-a", "-p", uniq.join(","), "-d", "cwd", "-Fn"],
+      { timeout: 2000, maxBuffer: 2 * 1024 * 1024 },
+    );
+    return parseLsofCwds(stdout);
+  } catch {
+    return new Map();
+  }
+}
+
 export function extractHtmlTitle(html: string): string | undefined {
   const m = /<title[^>]*>([^<]{1,120})<\/title>/i.exec(html);
   if (!m?.[1]) return undefined;
@@ -264,13 +411,18 @@ export async function defaultProbeHttp(host: string, port: number): Promise<{ pr
 function isExcludedListener(l: RawListener, selfPid: number, excludedPorts?: ReadonlySet<number>): boolean {
   if (l.pid === selfPid) return true;
   if (excludedPorts?.has(l.port)) return true;
-  const nameLower = l.processName.trim().toLowerCase();
+  const nameLower = decodeLsofEscapes(l.processName).trim().toLowerCase();
   if (IGNORED_PROCS.has(nameLower)) return true;
+  for (const ignored of IGNORED_PROCS) {
+    if (nameLower.startsWith(`${ignored} `)) return true;
+  }
   return false;
 }
 
 /**
- * Attributes listening TCP ports strictly to their owning Agent terminal process trees.
+ * Attributes listening TCP ports to their owning Agent terminal process trees, with a strict
+ * project-CWD fallback for detached/daemonized dev servers (e.g. `nohup vite &`, `next-server`,
+ * `nginx`, background Python servers reparented to PID 1).
  */
 export async function scanAgentListeningPorts(
   agents: readonly Agent[],
@@ -282,15 +434,24 @@ export async function scanAgentListeningPorts(
 
   const plat = deps.platform ?? process.platform;
   const selfPid = deps.selfPid ?? process.pid;
+  const genericDirs = defaultGenericDirs();
+  const isProjectRoot = deps.isProjectRoot ?? defaultIsProjectRoot;
+  const hasGitDir = deps.hasGitDir ?? defaultHasGitDir;
 
   const pidToAgent = new Map<number, Agent>();
+  const agentCwds: Array<{ agent: Agent; cwd: string }> = [];
   for (const agent of agents) {
     const t = terminals.get(agent.localId);
-    if (!t) continue;
-    if (t.foreground?.pid && t.foreground.pid > 1) pidToAgent.set(t.foreground.pid, agent);
-    if (t.pid && t.pid > 1) pidToAgent.set(t.pid, agent);
+    if (t) {
+      if (t.foreground?.pid && t.foreground.pid > 1) pidToAgent.set(t.foreground.pid, agent);
+      if (t.pid && t.pid > 1) pidToAgent.set(t.pid, agent);
+    }
+    const effCwd = normalizeDir(t?.foreground?.cwd || t?.cwd || agent.cwd);
+    if (effCwd && !genericDirs.has(effCwd)) {
+      agentCwds.push({ agent, cwd: effCwd });
+    }
   }
-  if (pidToAgent.size === 0) return result;
+  if (pidToAgent.size === 0 && agentCwds.length === 0) return result;
 
   const procs = await (deps.listProcessParents ? deps.listProcessParents() : defaultListProcessParents(plat));
   const rawListeners = await (deps.listListeners ? deps.listListeners() : defaultListListeners(plat, procs));
@@ -298,6 +459,7 @@ export async function scanAgentListeningPorts(
 
   const matched: Array<{ agent: Agent; listener: RawListener }> = [];
   const seenAgentPort = new Set<string>();
+  const unmatchedListeners: RawListener[] = [];
 
   for (const listener of rawListeners) {
     if (isExcludedListener(listener, selfPid, deps.excludedPorts)) continue;
@@ -315,11 +477,60 @@ export async function scanAgentListeningPorts(
       if (!p || !p.ppid || p.ppid === cur) break;
       cur = p.ppid;
     }
-    if (!owner) continue;
+    if (!owner) {
+      unmatchedListeners.push(listener);
+      continue;
+    }
     const dedup = `${owner.key}:${listener.port}`;
     if (seenAgentPort.has(dedup)) continue;
     seenAgentPort.add(dedup);
     matched.push({ agent: owner, listener });
+  }
+
+  // Fallback for detached/daemonized dev servers (e.g. `nohup`, `nginx`, `next-server`) whose
+  // parent chain reparented to PID 1: match by process CWD to the deepest owning project workspace.
+  if (unmatchedListeners.length > 0 && agentCwds.length > 0) {
+    const candidatePids = unmatchedListeners.map((l) => l.pid);
+    const cwdByPid = await (deps.listProcessCwds
+      ? deps.listProcessCwds(candidatePids)
+      : defaultListProcessCwds(candidatePids, plat));
+    const projectRootCache = new Map<string, boolean>();
+    const checkProjectRoot = (dir: string): boolean => {
+      let cached = projectRootCache.get(dir);
+      if (cached === undefined) {
+        cached = isProjectRoot(dir);
+        projectRootCache.set(dir, cached);
+      }
+      return cached;
+    };
+
+    for (const listener of unmatchedListeners) {
+      const lcwd = normalizeDir(cwdByPid.get(listener.pid));
+      if (!lcwd || genericDirs.has(lcwd)) continue;
+      let bestLen = 0;
+      let owners: Agent[] = [];
+      for (const item of agentCwds) {
+        const exact = lcwd === item.cwd;
+        const subpath =
+          !exact &&
+          lcwd.startsWith(`${item.cwd}/`) &&
+          checkProjectRoot(item.cwd) &&
+          !hasGitBoundaryBetween(lcwd, item.cwd, hasGitDir);
+        if (!exact && !subpath) continue;
+        if (item.cwd.length > bestLen) {
+          bestLen = item.cwd.length;
+          owners = [item.agent];
+        } else if (item.cwd.length === bestLen) {
+          owners.push(item.agent);
+        }
+      }
+      for (const owner of owners) {
+        const dedup = `${owner.key}:${listener.port}`;
+        if (seenAgentPort.has(dedup)) continue;
+        seenAgentPort.add(dedup);
+        matched.push({ agent: owner, listener });
+      }
+    }
   }
 
   if (matched.length === 0) return result;

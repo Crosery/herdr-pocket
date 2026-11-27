@@ -400,8 +400,8 @@ function TabCloseConfirmModal() {
 
 // Tabs bar ---------------------------------------------------------------------
 
-function contentTitle(content: PaneContent, agent: Agent | undefined): string {
-  if (content.kind === "agent") return agent ? agentTitle(agent) : "已结束的 Agent";
+function contentTitle(content: PaneContent, agent: Agent | undefined, connecting = false): string {
+  if (content.kind === "agent") return agent ? agentTitle(agent) : connecting ? "正在连接…" : "已结束的 Agent";
   if (content.kind === "web") return content.title === "about:blank" ? "新网页" : content.title;
   return content.title;
 }
@@ -459,9 +459,10 @@ const TabChip = memo(function TabChip({
     (el: HTMLDivElement | null) => registerTabRef(tab.id, el),
     [registerTabRef, tab.id],
   );
-  const title = contentTitle(primaryContent, agent);
+  const waitingInitialSync = liveStore.use((s) => !s.hasSnapshot && (s.link === "connecting" || s.link === "idle"));
+  const title = contentTitle(primaryContent, agent, waitingInitialSync);
   const primaryProgram = leadContent.kind === "agent"
-    ? (agent ? (agent.isShell ? "Terminal" : resolveVendor(agent.harness, false).label) : "已结束的 Agent")
+    ? (agent ? (agent.isShell ? "Terminal" : resolveVendor(agent.harness, false).label) : waitingInitialSync ? "正在连接…" : "已结束的 Agent")
     : undefined;
   const primaryLiveTitle = leadContent.kind === "agent" && agent ? (agent.name || agent.title) : undefined;
   const isHerdrTab = Boolean(tab.docTabId || leadContent.kind === "agent" || hasSpaceFilter);
@@ -1337,11 +1338,19 @@ function PaneHead({
   const platform = detectPlatform();
   const revealLabel = revealInFolderLabel(platform);
   const revealShortLabel = revealInFolderShortLabel(platform);
+  const waitingInitialSync = liveStore.use((s) => !s.hasSnapshot && (s.link === "connecting" || s.link === "idle"));
+  const inferredFileDeviceId =
+    content.kind === "file"
+      ? agent?.deviceId ??
+        (content.agentKey && content.agentKey.includes("/")
+          ? content.agentKey.slice(0, content.agentKey.indexOf("/"))
+          : undefined)
+      : undefined;
   const canRevealLocal =
     content.kind === "file" &&
     canActOnLocalFile({
       nativeAvailable: native.available(),
-      agentDeviceId: agent?.deviceId,
+      agentDeviceId: inferredFileDeviceId,
       agentCwd: agent?.cwd,
       localHostId,
       path: content.path,
@@ -1389,7 +1398,7 @@ function PaneHead({
   let subTitle = "";
   if (content.kind === "agent") {
     icon = agent ? <VendorIcon harness={agent.harness} isShell={agent.isShell} size={14} /> : <File size={14} />;
-    name = agent ? spacedTitle(agent) : "这个 Agent 已经结束了";
+    name = agent ? spacedTitle(agent) : waitingInitialSync ? "正在连接服务器…" : "这个 Agent 已经结束了";
     sub = agent ? homeFolder(agent.cwd) || agent.where || "" : "";
     subTitle = sub;
   } else if (content.kind === "file") {
@@ -2014,6 +2023,7 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
   const agent = useAgent(agentKey);
   const hostDeviceId = agentKey ? (agentKey.split("/")[0] ?? "") : "";
   const hostOffline = liveStore.use((s) => (hostDeviceId ? s.devices[hostDeviceId]?.online === false : false));
+  const waitingInitialSync = liveStore.use((s) => !s.hasSnapshot && (s.link === "connecting" || s.link === "idle"));
   const [subHead, setSubHead] = useState<SubagentHeadInfo | null>(null);
   const [fileHead, setFileHead] = useState<FileViewerHeadState | null>(null);
   const [dropZone, setDropZone] = useState<SplitDropZone | null>(null);
@@ -2046,7 +2056,9 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
     content.kind === "agent"
       ? agent
         ? spacedTitle(agent)
-        : "已结束的 Agent"
+        : waitingInitialSync
+          ? "正在连接…"
+          : "已结束的 Agent"
       : content.kind === "web"
         ? content.title === "about:blank"
           ? "新网页"
@@ -2299,6 +2311,13 @@ const SplitPaneSlot = memo(function SplitPaneSlot({
                   onBack={() => requestClosePane(tabId, leaf.id)}
                   onOpenWorkbench={() => showPanel("files")}
                 />
+              ) : waitingInitialSync ? (
+                <div className="v3-pane-empty">
+                  <p>正在连接服务器并同步 Agent 列表…</p>
+                  <PocketButton size="sm" variant="soft" onClick={() => pingRelay()}>
+                    立即重连
+                  </PocketButton>
+                </div>
               ) : (
                 <div className="v3-pane-empty">
                   <p>{hostOffline ? "这台电脑暂时离线了。" : "这个 Agent 已经结束，或者它的电脑离线了。"}</p>

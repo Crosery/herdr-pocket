@@ -241,8 +241,10 @@ const SILENT_DEAD_MS = 2 * HEARTBEAT_MS;
 const TIMER_GAP_MS = 3 * TICK_MS;
 const PONG_TIMEOUT_MS = 8_000;
 const WAKE_PONG_TIMEOUT_MS = 4_000;
-const CONNECT_TIMEOUT_MS = 12_000;
+const CONNECT_TIMEOUT_MS = 20_000;
 const MAX_BACKOFF_MS = 15_000;
+const SOFT_WAKE_DEBOUNCE_MS = 1_500;
+const MIN_FORCE_DIRECT_COOLDOWN_MS = 15_000;
 
 /** Native "app://wake" (src-tauri/src/mainwin.rs): window focus/show, Dock reopen, network change. */
 const WAKE_EVENT = "app://wake";
@@ -282,6 +284,8 @@ interface DirectTryState {
   busy: boolean;
   next: number;
   fails: number;
+  lastFailAt: number;
+  lastError: string | null;
 }
 
 class SocketClient {
@@ -299,6 +303,8 @@ class SocketClient {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
+  private initPingTimer: ReturnType<typeof setTimeout> | null = null;
+  private pongWaiters: Array<(rttMs: number | null) => void> = [];
   private closed = false;
   private welcomed = false;
   private pausedHiddenReplace = false;
@@ -306,6 +312,7 @@ class SocketClient {
   /** Last time anything arrived on the socket (frames and pongs alike). */
   private lastSeen = 0;
   private lastPing = 0;
+  private lastSoftWakeAt = 0;
   private connectStartedAt = 0;
   private attempt = 0;
   private lastTick = Date.now();
@@ -418,6 +425,11 @@ class SocketClient {
       }
     }
     this.clearPong();
+    if (this.initPingTimer) {
+      clearTimeout(this.initPingTimer);
+      this.initPingTimer = null;
+    }
+    for (const w of this.pongWaiters.splice(0)) w(null);
     const subs = [...this.subs.values()];
     const pending = [...this.pending.values()];
     this.pending.clear();
@@ -439,7 +451,7 @@ class SocketClient {
         if (!retryNow) this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);
         logger.warn("relay", `${reason}; reconnect in ${delay} ms`);
       }
-      if (!this.welcomed) {
+      if (!this.welcomed && (code === 1008 || this.attempt >= 3)) {
         void tokenStillValid(this.server, this.token).then((ok) => {
           if (!ok && !this.closed) {
             setLink("unauthorized", "token no longer valid");
@@ -526,18 +538,31 @@ class SocketClient {
     if (this.closed) return;
     const link = liveStore.get().link;
     if (link === "unauthorized") return;
+    const now = Date.now();
+    const isNetwork = cause.includes("network");
+    const isUser = cause.includes("user");
+    if (!isNetwork && !isUser && now - this.lastSoftWakeAt < SOFT_WAKE_DEBOUNCE_MS) {
+      return;
+    }
+    if (!isNetwork && !isUser) this.lastSoftWakeAt = now;
+
     this.pausedHiddenReplace = false;
     if (settingsStore.get().notifications && !this.notifyWs) this.openNotify();
-    this.tryDirectAll(cause.includes("network") || cause.includes("wake"));
+    // Only bypass direct-link backoff on real network changes or explicit user actions (never on every window focus).
+    this.tryDirectAll(isNetwork || isUser);
     const ws = this.ws;
     if (ws?.readyState === WebSocket.OPEN) {
       // One ping in flight is enough (focus and app wake usually arrive together).
-      if (this.pongTimer || Date.now() - this.lastPing < 2_000) return;
+      if (this.pongTimer || now - this.lastPing < 2_000) return;
       logger.debug("link", `${cause}: checking the link`);
       this.ping(WAKE_PONG_TIMEOUT_MS, `${cause}: no pong`);
       return;
     }
-    if (ws?.readyState === WebSocket.CONNECTING && Date.now() - this.connectStartedAt < 5_000) return;
+    if (ws?.readyState === WebSocket.CONNECTING) {
+      // Never kill a healthy in-flight startup handshake on focus/shown/visible events; watchdog handles real timeouts.
+      if (!isNetwork && !isUser) return;
+      if (!isUser && now - this.connectStartedAt < 4_000) return;
+    }
     this.backoff = 1000;
     this.reconnect(cause);
   }
@@ -603,9 +628,11 @@ class SocketClient {
 
   private onFrame(f: ServerFrame): void {
     switch (f.type) {
-      case "welcome":
+      case "welcome": {
         this.welcomed = true;
-        setLink("online", `attempt ${this.attempt}, ${Date.now() - this.connectStartedAt} ms`);
+        const connectMs = Math.max(1, Date.now() - this.connectStartedAt);
+        setLink("online", `attempt ${this.attempt}, ${connectMs} ms`);
+        liveStore.set({ relayConnectMs: connectMs });
         this.backoff = 1000;
         this.attempt = 0;
         notifyReleaseAvailable(f.latestRelease || f.serverVersion);
@@ -615,7 +642,15 @@ class SocketClient {
           if (!s.via) this.openStream(s);
         }
         this.tryDirectAll(false);
+        if (this.initPingTimer) clearTimeout(this.initPingTimer);
+        this.initPingTimer = setTimeout(() => {
+          this.initPingTimer = null;
+          if (!this.closed && this.ws?.readyState === WebSocket.OPEN && !this.pongTimer) {
+            this.ping(PONG_TIMEOUT_MS, "pong timeout");
+          }
+        }, 120);
         break;
+      }
       case "tutorial_state":
         applyServerTutorialStatus(f.status);
         break;
@@ -632,11 +667,12 @@ class SocketClient {
         for (const [hostId, list] of Object.entries(grouped)) {
           agents[hostId] = reconcileAgentList(prev.agents[hostId], list);
         }
-        liveStore.set({ devices, agents, rev: prev.rev + 1 });
+        liveStore.set({ hasSnapshot: true, devices, agents, rev: prev.rev + 1 });
         for (const d of f.devices) {
           if (d.kind === "host" && !d.online) this.closeDirectFor(d.id);
         }
-        this.tryDirectAll(true);
+        // Respect backoff for unreachable remote hosts across reconnects; local loopback still dials immediately.
+        this.tryDirectAll(false);
         for (const d of f.devices) {
           if (d.kind === "host" && d.online) this.scheduleSpacesRefresh(d.id, 0);
         }
@@ -716,9 +752,17 @@ class SocketClient {
       }
       case "pong": {
         this.clearPong();
+        const now = Date.now();
         if (this.lastPing > 0) {
-          const rttMs = Math.max(1, Date.now() - this.lastPing);
-          liveStore.set((prev) => (prev.rttMs === rttMs ? prev : { ...prev, rttMs }));
+          const rttMs = Math.max(1, now - this.lastPing);
+          liveStore.set((prev) =>
+            prev.rttMs === rttMs && prev.lastPongAt === now
+              ? prev
+              : { ...prev, rttMs, lastPongAt: now },
+          );
+          for (const w of this.pongWaiters.splice(0)) w(rttMs);
+        } else {
+          for (const w of this.pongWaiters.splice(0)) w(liveStore.get().rttMs ?? null);
         }
         break;
       }
@@ -853,21 +897,51 @@ class SocketClient {
     }
   }
 
-  forceDirectNow(to: string): void {
+  forceDirectNow(to: string, manual = false): void {
     const existing = this.direct.get(to);
     if (existing?.open) {
       existing.pingNow();
       return;
     }
     const t = this.directTry.get(to);
-    if (t && t.next !== Infinity) t.next = 0;
+    if (t) {
+      if (!manual && t.fails > 0 && Date.now() - t.lastFailAt < MIN_FORCE_DIRECT_COOLDOWN_MS) {
+        return;
+      }
+      if (manual || t.next !== Infinity) t.next = 0;
+    }
     this.tryDirect(to, true);
+  }
+
+  private directRttUpdated(link: DirectLink, rttMs: number): void {
+    if (this.direct.get(link.to) !== link) return;
+    liveStore.set((prev) => {
+      const cur = prev.directMeta[link.to];
+      if (cur && cur.rttMs === rttMs && cur.addr === link.displayAddr && cur.linkKind === link.linkKind) {
+        return prev;
+      }
+      return {
+        ...prev,
+        directMeta: {
+          ...prev.directMeta,
+          [link.to]: {
+            addr: link.displayAddr,
+            linkKind: link.linkKind,
+            rttMs,
+            connectedAt: cur?.connectedAt ?? Date.now(),
+            lastError: null,
+            lastAttemptAt: cur?.lastAttemptAt ?? Date.now(),
+          },
+        },
+        hostProbeRttMs: { ...prev.hostProbeRttMs, [link.to]: rttMs },
+      };
+    });
   }
 
   private tryDirect(to: string, now: boolean): void {
     if (this.closed || this.ws?.readyState !== WebSocket.OPEN) return;
     if (this.direct.get(to)?.open) return;
-    const t = this.directTry.get(to) ?? { busy: false, next: 0, fails: 0 };
+    const t = this.directTry.get(to) ?? { busy: false, next: 0, fails: 0, lastFailAt: 0, lastError: null };
     this.directTry.set(to, t);
     if (t.busy || t.next === Infinity || (!now && Date.now() < t.next)) return;
     t.busy = true;
@@ -886,6 +960,7 @@ class SocketClient {
           {
             onStream: (frame) => this.onFrame(frame),
             onClose: (l) => this.directGone(l),
+            onRtt: (l, rttMs) => this.directRttUpdated(l, rttMs),
           },
           { preferLoopback, signalWebRtc },
         );
@@ -895,19 +970,51 @@ class SocketClient {
         }
         t.fails = 0;
         t.next = 0;
+        t.lastError = null;
         this.direct.set(to, link);
-        liveStore.set((prev) => ({ ...prev, direct: { ...prev.direct, [to]: link.displayAddr } }));
+        const nowAt = Date.now();
+        liveStore.set((prev) => ({
+          ...prev,
+          direct: { ...prev.direct, [to]: link.displayAddr },
+          directMeta: {
+            ...prev.directMeta,
+            [to]: {
+              addr: link.displayAddr,
+              linkKind: link.linkKind,
+              rttMs: link.getRttMs(),
+              connectedAt: nowAt,
+              lastError: null,
+              lastAttemptAt: nowAt,
+            },
+          },
+        }));
         logger.info("link", `direct link to ${liveStore.get().devices[to]?.name ?? to} via ${link.displayAddr}`);
         this.rehome(to);
       } catch (e) {
         t.fails += 1;
-        logger.warn("link.direct", `direct attempt #${t.fails} to ${liveStore.get().devices[to]?.name ?? to} failed: ${(e as Error)?.message ?? String(e)}`);
+        t.lastFailAt = Date.now();
+        const errMsg = (e as Error)?.message ?? String(e);
+        t.lastError = errMsg;
+        logger.warn("link.direct", `direct attempt #${t.fails} to ${liveStore.get().devices[to]?.name ?? to} failed: ${errMsg}`);
+        liveStore.set((prev) => ({
+          ...prev,
+          directMeta: {
+            ...prev.directMeta,
+            [to]: {
+              addr: prev.directMeta[to]?.addr ?? "",
+              linkKind: prev.directMeta[to]?.linkKind ?? "webrtc-p2p",
+              rttMs: null,
+              lastError: errMsg,
+              lastAttemptAt: t.lastFailAt,
+            },
+          },
+        }));
         if (e instanceof RelayError && (e.code === "unsupported" || e.code === "forbidden")) {
           t.next = Infinity;
         } else {
           const isLocal = localHostIdStore.get() === to;
-          const capMs = isLocal ? 15_000 : 25_000;
-          const baseMs = isLocal ? 2_000 : 4_000;
+          const capMs = isLocal ? 15_000 : 60_000;
+          const baseMs = isLocal ? 2_000 : 5_000;
           t.next = Date.now() + Math.min(capMs, baseMs * 2 ** Math.min(t.fails - 1, 5));
         }
       } finally {
@@ -922,12 +1029,20 @@ class SocketClient {
     liveStore.set((prev) => {
       const direct = { ...prev.direct };
       delete direct[link.to];
-      return { ...prev, direct };
+      const directMeta = { ...prev.directMeta };
+      if (directMeta[link.to]) {
+        directMeta[link.to] = {
+          ...directMeta[link.to]!,
+          rttMs: null,
+          lastAttemptAt: Date.now(),
+        };
+      }
+      return { ...prev, direct, directMeta };
     });
     if (this.closed) return;
     logger.info("link", `direct link closed (${link.to}), using relay`);
     const t = this.directTry.get(link.to);
-    if (t && t.next !== Infinity) t.next = Date.now() + 2_000;
+    if (t && t.next !== Infinity) t.next = Date.now() + 3_000;
     this.rehome(link.to);
   }
 
@@ -954,7 +1069,14 @@ class SocketClient {
     const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
     const elapsed = () => (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
     const link = this.direct.get(to);
-    if (!link?.open || method === "direct.offer" || method === "webrtc.offer") {
+    const relayReady = this.ws?.readyState === WebSocket.OPEN;
+    const avoidWebRtcBulkOnRpc =
+      relayReady &&
+      link?.transportKind === "webrtc" &&
+      (method === "terminal.put" || method === "terminal.putChunk");
+    const bypassCongestedDirect = Boolean(relayReady && link?.open && link.isCongested());
+
+    if (!link?.open || method === "direct.offer" || method === "webrtc.offer" || avoidWebRtcBulkOnRpc || bypassCongestedDirect) {
       try {
         const out = await this.relayCall(to, method, params, timeoutMs);
         recordClientRpcSample(method, elapsed(), false, true);
@@ -973,7 +1095,7 @@ class SocketClient {
         recordClientRpcSample(method, elapsed(), true, false);
         throw err;
       }
-      if ((err.code === "offline" || err.code === "timeout") && SAFE_AGAIN.has(method)) {
+      if ((err.code === "offline" || err.code === "timeout") && (SAFE_AGAIN.has(method) || err.uncertain === false)) {
         try {
           const fallback = await this.relayCall(to, method, params, timeoutMs);
           recordClientRpcSample(method, elapsed(), false, true);
@@ -985,6 +1107,53 @@ class SocketClient {
       }
       recordClientRpcSample(method, elapsed(), true, false);
       throw new RelayError(err.code, err.message);
+    }
+  }
+
+  measureRelayRtt(timeoutMs = 4_000): Promise<number | null> {
+    if (this.closed || this.ws?.readyState !== WebSocket.OPEN) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (val: number | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(val);
+      };
+      const timer = setTimeout(() => {
+        const idx = this.pongWaiters.indexOf(done);
+        if (idx >= 0) this.pongWaiters.splice(idx, 1);
+        done(null);
+      }, timeoutMs);
+      this.pongWaiters.push(done);
+      this.ping(PONG_TIMEOUT_MS, "pong timeout");
+    });
+  }
+
+  async measureHostRtt(hostId: string, timeoutMs = 4_000): Promise<{ rttMs: number | null; via: "direct" | "relay" }> {
+    const link = this.direct.get(hostId);
+    if (link?.open) {
+      const rtt = await link.measureRtt(timeoutMs);
+      if (rtt !== null) {
+        return { rttMs: rtt, via: "direct" };
+      }
+    }
+    if (this.closed || this.ws?.readyState !== WebSocket.OPEN) {
+      return { rttMs: null, via: "relay" };
+    }
+    const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+    try {
+      await this.relayCall(hostId, "host.info", {}, timeoutMs);
+      const rttMs = Math.max(1, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0));
+      liveStore.set((prev) => ({
+        ...prev,
+        hostProbeRttMs: { ...prev.hostProbeRttMs, [hostId]: rttMs },
+      }));
+      return { rttMs, via: "relay" };
+    } catch {
+      return { rttMs: null, via: "relay" };
     }
   }
 
@@ -1034,6 +1203,11 @@ class SocketClient {
   close(): void {
     this.closed = true;
     this.clearPong();
+    if (this.initPingTimer) {
+      clearTimeout(this.initPingTimer);
+      this.initPingTimer = null;
+    }
+    for (const w of this.pongWaiters.splice(0)) w(null);
     for (const d of [...this.direct.values()]) d.close();
     this.direct.clear();
     for (const t of this.spaceTimers.values()) clearTimeout(t);
@@ -1097,7 +1271,20 @@ export function stopRelayLink(): void {
   activeClient = null;
   currentToken = null;
   setLink("idle");
-  liveStore.set({ devices: {}, agents: {}, spaces: {}, direct: {}, tutorialServerSynced: false, rev: liveStore.get().rev + 1 });
+  liveStore.set({
+    hasSnapshot: false,
+    devices: {},
+    agents: {},
+    spaces: {},
+    direct: {},
+    directMeta: {},
+    hostProbeRttMs: {},
+    rttMs: null,
+    relayConnectMs: null,
+    lastPongAt: null,
+    tutorialServerSynced: false,
+    rev: liveStore.get().rev + 1,
+  });
 }
 
 export function refreshNotifyChannel(): void {
@@ -1153,10 +1340,42 @@ export function getDirectEndpoint(to: string): { addr: string; port: number } | 
   return activeClient?.directEndpoint(to) ?? null;
 }
 
-export function ensureDirectLinkNow(hostId: string): void {
+export function ensureDirectLinkNow(hostId: string, manual = false): void {
   const s = settingsStore.get();
   if (!hostId || (s.server && isMockServer(s.server))) return;
-  activeClient?.forceDirectNow(hostId);
+  activeClient?.forceDirectNow(hostId, manual);
+}
+
+export async function measureRelayRtt(timeoutMs = 4_000): Promise<number | null> {
+  const s = settingsStore.get();
+  if (s.server && isMockServer(s.server)) {
+    const rtt = 24 + Math.floor(Math.random() * 12);
+    liveStore.set({ rttMs: rtt, lastPongAt: Date.now() });
+    return rtt;
+  }
+  if (!activeClient) return null;
+  return activeClient.measureRelayRtt(timeoutMs);
+}
+
+export async function measureHostRtt(
+  hostId: string,
+  timeoutMs = 4_000,
+): Promise<{ rttMs: number | null; via: "direct" | "relay" }> {
+  const s = settingsStore.get();
+  if (s.server && isMockServer(s.server)) {
+    const isDirect = Boolean(liveStore.get().direct[hostId]);
+    const rttMs = isDirect ? 2 : 36 + Math.floor(Math.random() * 16);
+    liveStore.set((prev) => ({
+      ...prev,
+      hostProbeRttMs: { ...prev.hostProbeRttMs, [hostId]: rttMs },
+      ...(isDirect && prev.directMeta[hostId]
+        ? { directMeta: { ...prev.directMeta, [hostId]: { ...prev.directMeta[hostId]!, rttMs } } }
+        : {}),
+    }));
+    return { rttMs, via: isDirect ? "direct" : "relay" };
+  }
+  if (!activeClient) return { rttMs: null, via: "relay" };
+  return activeClient.measureHostRtt(hostId, timeoutMs);
 }
 
 export function subscribeStream(

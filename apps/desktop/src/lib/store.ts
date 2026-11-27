@@ -77,13 +77,29 @@ export interface AppSettings {
 export type SidebarAgentGrouping = "status" | "space" | "recent";
 export type SidebarStyleScheme = "a" | "b" | "c";
 
+export type DirectTransportKind = "local" | "lan-p2p" | "vpn-p2p" | "webrtc-p2p";
+
+export interface DirectHostMeta {
+  addr: string;
+  linkKind: DirectTransportKind;
+  rttMs: number | null;
+  connectedAt?: number;
+  lastError?: string | null;
+  lastAttemptAt?: number;
+}
+
 export interface LiveState {
   link: LinkStatus;
+  hasSnapshot: boolean;
   devices: Record<string, Device>;
   agents: Record<string, Agent[]>;
   spaces: Record<string, SpaceInfo[]>;
   direct: Record<string, string>;
+  directMeta: Record<string, DirectHostMeta>;
+  hostProbeRttMs: Record<string, number>;
   rttMs?: number | null;
+  relayConnectMs?: number | null;
+  lastPongAt?: number | null;
   tutorialServerSynced: boolean;
   rev: number;
 }
@@ -266,11 +282,16 @@ export function applyThemeAttribute(choice: ThemeChoice): void {
 
 export const liveStore = createStore<LiveState>({
   link: "idle",
+  hasSnapshot: false,
   devices: {},
   agents: {},
   spaces: {},
   direct: {},
+  directMeta: {},
+  hostProbeRttMs: {},
   rttMs: null,
+  relayConnectMs: null,
+  lastPongAt: null,
   tutorialServerSynced: false,
   rev: 0,
 });

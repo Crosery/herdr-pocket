@@ -1972,6 +1972,137 @@ pub async fn voice_ai_preview_process(
     .map_err(|e| e.to_string())?
 }
 
+struct PreviewLiveSession {
+    proc: crate::voice_ai::LiveCallProcessor,
+    rem: Vec<i16>,
+}
+
+static PREVIEW_DSP_PROC: std::sync::OnceLock<std::sync::Mutex<Option<PreviewLiveSession>>> =
+    std::sync::OnceLock::new();
+static PREVIEW_DSP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn preview_dsp_cell() -> &'static std::sync::Mutex<Option<PreviewLiveSession>> {
+    PREVIEW_DSP_PROC.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub(crate) fn close_voice_preview_dsp_sync() {
+    PREVIEW_DSP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let prev = preview_dsp_cell().lock().ok().and_then(|mut g| g.take());
+    drop(prev);
+}
+
+#[tauri::command]
+pub async fn voice_ai_preview_live_open() -> crate::voice_ai::VoiceAiPreviewLiveInfo {
+    let gen = PREVIEW_DSP_GEN
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        .wrapping_add(1);
+    let prev = preview_dsp_cell().lock().ok().and_then(|mut g| g.take());
+    let (proc, info) = tauri::async_runtime::spawn_blocking(move || {
+        drop(prev);
+        crate::voice_ai::preview_live_open_processor()
+    })
+    .await
+    .unwrap_or_else(|_| crate::voice_ai::preview_live_open_processor());
+
+    if PREVIEW_DSP_GEN.load(std::sync::atomic::Ordering::SeqCst) != gen {
+        std::thread::spawn(move || drop(proc));
+        return crate::voice_ai::VoiceAiPreviewLiveInfo {
+            active: false,
+            used_dpdf: false,
+            used_tse: false,
+            sv_active: false,
+            engine_label: String::new(),
+        };
+    }
+
+    if let Ok(mut guard) = preview_dsp_cell().lock() {
+        *guard = Some(PreviewLiveSession {
+            proc,
+            rem: Vec::with_capacity(640),
+        });
+    } else {
+        std::thread::spawn(move || drop(proc));
+    }
+    info
+}
+
+#[tauri::command]
+pub async fn voice_ai_preview_live_process(
+    pcm_base64: String,
+) -> Result<crate::voice_ai::VoiceAiPreviewLiveChunk, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = crate::local_term::base64_decode(pcm_base64.as_bytes())
+            .ok_or_else(|| "音频数据编码无效".to_string())?;
+        let usable_bytes = bytes.len().min(MAX_DSP_INPUT_BYTES) & !1;
+        if usable_bytes == 0 {
+            return Ok(crate::voice_ai::VoiceAiPreviewLiveChunk {
+                pcm_base64: String::new(),
+                level: 0.0,
+                suppressed: false,
+            });
+        }
+        let mut guard = preview_dsp_cell()
+            .lock()
+            .map_err(|_| "试听 DSP 处理器忙".to_string())?;
+        let Some(sess) = guard.as_mut() else {
+            return Ok(crate::voice_ai::VoiceAiPreviewLiveChunk {
+                pcm_base64: String::new(),
+                level: 0.0,
+                suppressed: false,
+            });
+        };
+        for chunk in bytes[..usable_bytes].chunks_exact(2) {
+            sess.rem.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        let full_frames = sess.rem.len() / 320;
+        if full_frames == 0 {
+            return Ok(crate::voice_ai::VoiceAiPreviewLiveChunk {
+                pcm_base64: String::new(),
+                level: 0.0,
+                suppressed: sess.proc.is_suppressing(),
+            });
+        }
+        let consume = full_frames * 320;
+        let mut out_bytes = Vec::with_capacity(consume * 2);
+        let mut sq_sum = 0.0f64;
+        let mut suppressed = false;
+        for frame in sess.rem[..consume].chunks_exact(320) {
+            let (out_frame, _lvl) = sess.proc.process_frame_320(frame);
+            if sess.proc.is_suppressing() {
+                suppressed = true;
+            }
+            for &s in &out_frame {
+                let f = f64::from(s) / 32768.0;
+                sq_sum += f * f;
+                out_bytes.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        sess.rem.drain(..consume);
+        let raw_lvl = ((sq_sum / (consume as f64)).sqrt() as f32) * 4.0;
+        let level = if raw_lvl.is_finite() {
+            raw_lvl.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        Ok(crate::voice_ai::VoiceAiPreviewLiveChunk {
+            pcm_base64: crate::local_term::base64_encode(&out_bytes),
+            level,
+            suppressed,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn voice_ai_preview_live_close() {
+    PREVIEW_DSP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let prev = preview_dsp_cell().lock().ok().and_then(|mut g| g.take());
+    if let Some(p) = prev {
+        let _ = tauri::async_runtime::spawn_blocking(move || drop(p)).await;
+    }
+}
+
 #[tauri::command]
 pub fn voice_ai_stop_test() -> bool {
     crate::voice_ai::stop_test()

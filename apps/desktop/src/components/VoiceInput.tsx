@@ -809,19 +809,41 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
       {!compact && aiState ? (
             <>
               {!audioOnly ? <div className="set-heading">本地音频增强与声纹</div> : null}
-              <VoicePreviewStudio aiState={aiState} />
+              <VoicePreviewStudio aiState={aiState} onStateChange={setAiState} />
 
               <div className="set-row">
                 <div className="set-text">
                   <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                     <span className="set-title">语音降噪与人声增强</span>
-                    <PocketBadge tone={aiState.ortReady && aiState.dpdfReady ? "mint" : "lav"}>
-                      {aiState.ortReady && aiState.dpdfReady ? "DPDFNet + Silero VAD" : "纯 Rust DSP"}
+                    <PocketBadge tone={aiState.ortReady && aiState.dpdfReady ? "mint" : "warn"}>
+                      {aiState.ortReady && aiState.dpdfReady ? "DPDFNet + Silero VAD" : "仅纯 Rust 基础降噪"}
                     </PocketBadge>
                   </div>
-                  <div className="set-about">本地实时降噪与频段增强，不上传原始环境音</div>
+                  <div className="set-about">
+                    {aiState.ortReady && aiState.dpdfReady
+                      ? "本地神经网络实时降噪与频段增强，不上传原始环境音"
+                      : "未下载神经降噪模型时仅能过滤微弱底噪，下载 DPDFNet 后可强效抑制背景人声与外放杂音"}
+                  </div>
                 </div>
-                <div className="set-control">
+                <div className="set-control" style={{ gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  {!aiState.ortReady || !aiState.dpdfReady ? (
+                    <PocketButton
+                      size="sm"
+                      variant="soft"
+                      disabled={vpDownload.downloading || aiState.downloading}
+                      onClick={() => {
+                        toast("已开始在后台下载神经降噪模型（DPDFNet + VAD）");
+                        void startVoiceAiDownload("base", defaultVoiceAiDownloadLabel("base", aiState))
+                          .then(setAiState)
+                          .catch((e) => {
+                            const msg = (e as Error).message;
+                            if (!isVoiceAiCancelMessage(msg)) toast(msg, true);
+                          });
+                      }}
+                    >
+                      {vpDownload.downloading || aiState.downloading ? "后台下载中…" : "下载神经降噪模型"}
+                    </PocketButton>
+                  ) : null}
                   <PocketSwitch
                     checked={aiState.denoise}
                     onCheckedChange={(v) => void updateAiConfig({ denoise: v })}

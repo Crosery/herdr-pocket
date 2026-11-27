@@ -250,4 +250,11 @@ test("voiceAiDownload regression guardrails: closing modal or leaving mobile scr
   assert.equal(mobileScreen.includes("PocketNative?.cancelVoiceModel"), false);
   assert.equal(mobileScreen.includes("stopCaptureOnly"), true);
   assert.equal(mobileScreen.includes("if (!mountedRef.current) return;"), true);
+
+  // VoicePreviewStudio live ear-return must stream through real Rust LiveCallProcessor, not fake WebAudio EQ.
+  const previewStudio = readFileSync(join(repoRoot, "apps/desktop/src/components/VoicePreviewStudio.tsx"), "utf8");
+  assert.equal(previewStudio.includes("native.voiceAiPreviewLiveOpen"), true);
+  assert.equal(previewStudio.includes("native.voiceAiPreviewLiveProcess"), true);
+  assert.equal(previewStudio.includes("native.voiceAiPreviewLiveClose"), true);
+  assert.equal(previewStudio.includes("下载神经降噪模型"), true);
 });
