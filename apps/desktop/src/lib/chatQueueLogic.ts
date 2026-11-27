@@ -1,10 +1,12 @@
-import { matchesOptimisticCommand, sameMessage, type AgentStatus } from "@herdr-pocket/protocol";
+import { matchesOptimisticCommand, sameMessage, textWithFiles, type AgentStatus } from "@herdr-pocket/protocol";
 import type { ChatRow } from "./chatFold";
 
 export interface OutgoingSendLike {
   id: string;
   text: string;
   attachedCount: number;
+  uploadedPaths?: string[];
+  attachedNames?: string[];
   ts: number;
   state: "sending" | "sent" | "queued_terminal" | "failed";
 }
@@ -61,6 +63,21 @@ function transcriptForm(row: Extract<ChatRow, { kind: "user" }>): string {
     : row.text;
 }
 
+function unescapeShellPath(s: string): string {
+  return s.replace(/\\([ ()[\]'"])/g, "$1");
+}
+
+function outgoingMatchesUserText(said: string, send: OutgoingSendLike): boolean {
+  const hasFiles = send.attachedCount > 0 || Boolean(send.uploadedPaths?.length);
+  if (sameMessage(said, send.text, hasFiles)) return true;
+  if (send.uploadedPaths?.length) {
+    const withPaths = textWithFiles(send.text, send.uploadedPaths);
+    if (sameMessage(said, withPaths, true)) return true;
+    if (sameMessage(unescapeShellPath(said), withPaths, true)) return true;
+  }
+  return false;
+}
+
 /**
  * Reconciles optimistic outgoing messages against folded timeline rows so
  * confirmed user turns drop without duplicate bubbles and recent replies clear awaiting state.
@@ -98,8 +115,8 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
     const userHit = users.find(
       ({ r, i }) =>
         !claimed.has(i) &&
-        (r.ts ?? 0) >= send.ts - ECHO_SLACK_MS &&
-        (sameMessage(transcriptForm(r), send.text, send.attachedCount > 0) ||
+        ((r.ts ?? 0) === 0 || (r.ts ?? 0) >= send.ts - ECHO_SLACK_MS) &&
+        (outgoingMatchesUserText(transcriptForm(r), send) ||
           (isAttachmentOnly && !r.text.trim())),
     );
     if (userHit) {
@@ -252,7 +269,7 @@ export function filterTerminalQueuedItems<T extends OutgoingSendLike>(
   const recentUsers = foldedRows ? foldedRows.slice(-8).filter((r) => r.kind === "user") : [];
   return rawItems.filter((qText) => {
     if (!qText.trim()) return false;
-    if (unmatched.some((u) => sameMessage(qText, u.text))) return false;
+    if (unmatched.some((u) => outgoingMatchesUserText(qText, u))) return false;
     if (queuedTexts.some((q) => sameMessage(qText, q))) return false;
     if (injectedList.some((inj) => sameMessage(qText, inj))) return false;
     if (recentUsers.some((r) => sameMessage(qText, transcriptForm(r)))) return false;

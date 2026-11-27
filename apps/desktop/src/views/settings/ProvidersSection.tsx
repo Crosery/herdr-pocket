@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AppWindow, CheckCircle2, ChevronDown, CloudDownload, KeyRound, Loader2, Plus, RotateCcw, Save, Server, Sparkles, Trash2, Zap } from "lucide-react";
+import { AppWindow, ChevronDown, CloudDownload, KeyRound, Loader2, Plus, RotateCcw, Save, Server, Sparkles, Trash2, Zap } from "lucide-react";
 import {
   PROVIDER_PRESETS,
   type AssistantConfigView,
@@ -11,7 +11,8 @@ import {
   type ProviderPresetItem,
   type ProviderView,
 } from "@herdr-pocket/protocol";
-import { PocketButton, PocketInput, PocketSelect, PocketSwitch, useToast } from "../../components/PocketUI";
+import { ModelBrandIcon } from "../../components/ModelBrandIcon";
+import { PocketBadge, PocketButton, PocketCheckbox, PocketInput, PocketSelect, PocketSwitch, useToast } from "../../components/PocketUI";
 import { fetchAssistantProviderModels, saveAssistantConfig } from "../../lib/assistant";
 import { modelErrorText } from "../../lib/modelErrors";
 import { relTime } from "../../lib/store";
@@ -26,7 +27,7 @@ const ALL_PROVIDER_PRESETS: readonly ProviderPresetItem[] = [
 
 const ID = /^[a-z][a-z0-9-]{0,31}$/;
 const HTTP = /^https?:\/\/\S+$/i;
-const SCAN_SHOWN = 36;
+const LOCAL_URL_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/|$)/i;
 
 function deriveProviderId(presetId: string | null, label: string, url: string, existing: readonly string[]): string {
   const taken = new Set(existing);
@@ -65,8 +66,14 @@ export function ProvidersSection({ cfg }: { cfg: AssistantConfigView }) {
     <section className="mm-section" aria-labelledby="mm-providers">
       <div className="mm-head">
         <h3 id="mm-providers" className="mm-head-title">
-          服务商
+          服务商 · {cfg.providers.length}
         </h3>
+        <div className="mm-head-actions">
+          <PocketButton size="sm" variant="primary" onClick={() => setOpen(open === "new" ? null : "new")}>
+            <Plus size={13} />
+            <span>{open === "new" ? "收起添加" : "添加服务商"}</span>
+          </PocketButton>
+        </div>
       </div>
       <div className="mm-card">
         <ul className="pv-list">
@@ -503,32 +510,58 @@ function ProviderEditor({ cfg, current, onClose }: { cfg: AssistantConfigView; c
             <span>{scanning ? "扫描中" : "扫描模型"}</span>
           </PocketButton>
         </div>
-        {scanning && !scanned ? <div className="mm-field-hint">正在自动扫描上游可用模型…</div> : null}
-        {scanError ? <div className="mm-field-hint">没扫到模型列表：{modelErrorText(scanError).title}。可以直接在下面手动填模型名。</div> : null}
+        {scanning && !scanned ? <div className="mm-field-hint">正在自动翻页扫描上游全部可用模型…</div> : null}
+        {scanError ? (
+          <div className="mm-field-error">
+            没扫到模型列表：{modelErrorText(scanError).title}
+            {LOCAL_URL_RE.test(url.trim())
+              ? "（提示：远程中继无法直连本机 127.0.0.1，请在下方手动填写模型名，或将服务部署在中继可达地址）"
+              : `（${scanError.slice(0, 120)}）`}
+          </div>
+        ) : null}
         {scanned && scanned.length ? (
           <>
-            {scanned.length > 8 ? <PocketInput mono value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={`搜索模型（共 ${scanned.length} 个）`} aria-label="搜索扫描到的模型" /> : null}
-            <div className="mm-pick-list" role="group" aria-label="扫描到的模型">
-              {shown.slice(0, SCAN_SHOWN).map((n) => {
+            <div className="row" style={{ gap: 8, alignItems: "center" }}>
+              <div className="grow" style={{ minWidth: 0 }}>
+                <PocketInput
+                  mono
+                  value={filter}
+                  onChange={(e) => setFilter(e.target.value)}
+                  placeholder={`在全部 ${scanned.length} 个模型中搜索（滚动查看全部）…`}
+                  aria-label="搜索扫描到的模型"
+                />
+              </div>
+              <PocketBadge tone="pink">
+                {filter.trim() ? `命中 ${shown.length} / ${scanned.length}` : `共 ${scanned.length} 个`}
+              </PocketBadge>
+            </div>
+            <div className="mm-pick-list xy-scan-list" role="group" aria-label="扫描到的模型">
+              {shown.map((n) => {
                 const inUse = usedNames.has(n);
                 const on = picked.includes(n);
+                const togglePick = () => {
+                  if (inUse) return;
+                  setPicked((prev) => (prev.includes(n) ? prev.filter((x) => x !== n) : [...prev, n]));
+                };
                 return (
-                  <button
+                  <div
                     key={n}
-                    type="button"
-                    role="checkbox"
-                    aria-checked={on}
-                    disabled={inUse}
-                    className={`mm-pick${on ? " on" : ""}`}
-                    onClick={() => setPicked((prev) => (prev.includes(n) ? prev.filter((x) => x !== n) : [...prev, n]))}
+                    className={`mm-pick xy-scan-row${on ? " on" : ""}${inUse ? " in-use" : ""}`}
+                    onClick={togglePick}
                   >
+                    <PocketCheckbox
+                      checked={inUse || on}
+                      disabled={inUse}
+                      ariaLabel={inUse ? `${n} 已在使用中` : `勾选模型 ${n}`}
+                      onCheckedChange={() => togglePick()}
+                    />
+                    <ModelBrandIcon model={n} provider={label || id} size={14} />
                     <span className="mm-pick-name">{n}</span>
-                    {inUse ? <span className="mm-pick-tag">在用</span> : on ? <CheckCircle2 size={16} /> : null}
-                  </button>
+                    {inUse ? <span className="mm-pick-tag">在用</span> : null}
+                  </div>
                 );
               })}
             </div>
-            {shown.length > SCAN_SHOWN ? <div className="mm-field-hint">仅显示前 {SCAN_SHOWN} 个，可用上方输入框筛选更多</div> : null}
           </>
         ) : null}
         <div className="mm-field">

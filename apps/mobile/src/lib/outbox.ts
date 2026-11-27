@@ -274,7 +274,7 @@ export function followSends(sends: PendingSend[], rows: readonly ConvRow[], agen
   const open = sends.filter((x) => !x.echo && x.state !== "failed").sort((a, b) => Number(a.state === "uncertain") - Number(b.state === "uncertain") || a.ts - b.ts);
   for (const x of open) {
     const isSlash = x.text.trim().startsWith("/");
-    let hitIdx = users.findIndex(({ r, i }) => !claimed.has(i) && (r.ts ?? 0) >= x.ts - ECHO_SLACK_MS && sameMessage(r.text ?? "", x.text, !!x.pictures?.length));
+    let hitIdx = users.findIndex(({ r, i }) => !claimed.has(i) && ((r.ts ?? 0) === 0 || (r.ts ?? 0) >= x.ts - ECHO_SLACK_MS) && sameMessage(r.text ?? "", x.text, !!x.pictures?.length));
     let matchedRowIdx = hitIdx >= 0 ? users[hitIdx]!.i : -1;
     if (matchedRowIdx < 0 && isSlash) {
       matchedRowIdx = rows.findIndex(

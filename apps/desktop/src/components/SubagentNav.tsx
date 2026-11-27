@@ -2,11 +2,10 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type Keyboard
 import { createPortal } from "react-dom";
 import {
   ArrowLeft,
+  Bot,
   Check,
-  ChevronDown,
   ChevronRight,
   ChevronsUpDown,
-  GitBranch,
   PanelRightOpen,
   RefreshCw,
   Search,
@@ -134,7 +133,7 @@ export function fmtSubDuration(s: SubSession, now: number): string | null {
   return s.updatedAt ? relTime(s.updatedAt) : null;
 }
 
-function clampPopoverPos(rect: DOMRect, menuWidth = 412): { top: number; left: number; maxWidth: number } {
+export function clampPopoverPos(rect: DOMRect, menuWidth = 386): { top: number; left: number; maxWidth: number } {
   if (typeof window === "undefined") return { top: rect.bottom + 6, left: rect.left, maxWidth: menuWidth };
   const vw = window.innerWidth;
   const vh = window.innerHeight;
@@ -165,7 +164,7 @@ interface SubTreeRowsProps {
   closeMenu: () => void;
 }
 
-function SubTreeRows({
+export function SubTreeRows({
   deviceId,
   agentKey,
   items,
@@ -254,18 +253,33 @@ function SubTreeRows({
                     {disp.headline}
                   </span>
                 </div>
-                <div className="sub-tree-meta-row">
+                <div className="inst-pop-sub-meta">
                   {item.model ? (
-                    <span className="sub-meta-chip mono">
+                    <>
                       <ModelBrandIcon model={item.model} size={11} />
-                      <span className="truncate">{item.model}</span>
-                    </span>
+                      <span className="mono truncate">{item.model}</span>
+                    </>
                   ) : null}
-                  {stepsText ? <span className="sub-meta-chip num">{stepsText}</span> : null}
-                  {dur ? <span className="sub-meta-chip num">{dur}</span> : null}
-                  {costText ? <span className="sub-meta-chip cost mono num">{costText}</span> : null}
+                  {stepsText ? (
+                    <>
+                      {item.model ? <span>·</span> : null}
+                      <span className="num">{stepsText}</span>
+                    </>
+                  ) : null}
+                  {dur ? (
+                    <>
+                      {item.model || stepsText ? <span>·</span> : null}
+                      <span className="num">{dur}</span>
+                    </>
+                  ) : null}
+                  {costText ? (
+                    <>
+                      {item.model || stepsText || dur ? <span>·</span> : null}
+                      <span className="mono num" style={{ color: "var(--accent-text)" }}>{costText}</span>
+                    </>
+                  ) : null}
                   {disp.secondary && !item.model ? (
-                    <span className="sub-meta-sec truncate">{disp.secondary}</span>
+                    <span className="truncate">{disp.secondary}</span>
                   ) : null}
                 </div>
               </div>
@@ -379,7 +393,6 @@ export function SubagentCatalogTrigger({
   const items = useMemo(() => (subs.length > 0 ? subs : rootFetched ?? []), [rootFetched, subs]);
   const totalCount = Math.max(knownCount, items.length);
   const workingCount = items.filter((s) => s.status === "working").length;
-  const doneCount = items.filter((s) => s.status !== "working").length;
 
   const filteredItems = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -574,7 +587,7 @@ export function SubagentCatalogTrigger({
         ) : (
           <>
             <span className="sub-cat-ic" aria-hidden>
-              <GitBranch size={12} />
+              <Bot size={13} />
               {workingCount > 0 ? <span className="sub-cat-dot" /> : null}
             </span>
             <span className="num">
@@ -584,7 +597,6 @@ export function SubagentCatalogTrigger({
                   : `${totalCount}`
                 : `${totalCount} 个子 Agent`}
             </span>
-            <ChevronDown size={11} className="sub-cat-chev" />
           </>
         )}
       </button>
@@ -600,55 +612,33 @@ export function SubagentCatalogTrigger({
               style={{ top: coords.top, left: coords.left, width: coords.maxWidth }}
               onKeyDown={onTreeKeyDown}
             >
-              <div className="sub-pop-head">
+              <div className="inst-pop-head">
                 <span className="sub-pop-title">
-                  <GitBranch size={13} />
+                  <Bot size={13} />
                   <span>子 Agent · {totalCount}</span>
                 </span>
-                <div className="sub-pop-filters" role="tablist" aria-label="按状态筛选">
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={filter === "all"}
-                    className={`sub-filter-pill${filter === "all" ? " active" : ""}`}
-                    onClick={() => setFilter("all")}
-                  >
-                    全部 {items.length || totalCount}
-                  </button>
+                <div className="row" style={{ gap: 6 }}>
                   {workingCount > 0 ? (
                     <button
                       type="button"
-                      role="tab"
-                      aria-selected={filter === "working"}
-                      className={`sub-filter-pill working${filter === "working" ? " active" : ""}`}
-                      onClick={() => setFilter("working")}
+                      className={`inst-pop-only-active${filter === "working" ? " on" : ""}`}
+                      onClick={() => setFilter((f) => (f === "working" ? "all" : "working"))}
                     >
                       进行中 {workingCount}
                     </button>
                   ) : null}
-                  {doneCount > 0 ? (
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={filter === "done"}
-                      className={`sub-filter-pill${filter === "done" ? " active" : ""}`}
-                      onClick={() => setFilter("done")}
-                    >
-                      已完成 {doneCount}
-                    </button>
-                  ) : null}
+                  <button
+                    type="button"
+                    className="sub-pop-refresh"
+                    aria-label="刷新子 Agent 列表"
+                    title="刷新"
+                    onClick={() => void fetchRoot()}
+                  >
+                    <RefreshCw size={12} className={rootLoading ? "spin" : ""} />
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  className="sub-pop-refresh"
-                  aria-label="刷新子 Agent 列表"
-                  title="刷新"
-                  onClick={() => void fetchRoot()}
-                >
-                  <RefreshCw size={12} className={rootLoading ? "spin" : ""} />
-                </button>
               </div>
-              {items.length >= 5 ? (
+              {items.length >= 3 ? (
                 <div className="sub-pop-search-wrap">
                   <Search size={12} className="sub-pop-search-ic" />
                   <input
@@ -656,7 +646,7 @@ export function SubagentCatalogTrigger({
                     className="sub-pop-search"
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
-                    placeholder="按任务摘要、角色或模型筛选…"
+                    placeholder="筛选子 Agent…"
                     aria-label="搜索子 Agent"
                   />
                 </div>

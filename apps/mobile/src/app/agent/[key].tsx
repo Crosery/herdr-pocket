@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { View } from "react-native";
+import { Pressable, View } from "react-native";
 import { Text } from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Stack, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useHeaderHeight } from "expo-router/react-navigation";
@@ -102,6 +103,9 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
     else if (tab === "terminal") setTermVisited(true);
   }, [tab]);
   const subs = agent.subagents ?? 0;
+  const ports = agent.listeningPorts ?? [];
+  const runtimeTotal = ports.length + subs;
+  const showRuntimeTab = runtimeTotal > 0;
 
   // Opening a finished agent is looking at it: herdr stops counting it as "已完成", on the desktop too.
   useEffect(() => {
@@ -127,14 +131,15 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
   }, [agent.key, agent.deviceId, agent.status, agent.turn]);
 
   const meta = [agent.where, money(agent.costUsd)].filter(Boolean).join(" · ");
+  const good = statusColors("working", p.dark);
   const icons: Partial<Record<Tab, PocketIcon>> = { chat: "chat-processing-outline", terminal: "console", info: "information-outline" };
   // Four tabs don't fit with icons on a phone; icons only when there are three.
   const buttons = ([
     { value: "chat", label: "对话" },
     { value: "terminal", label: "终端" },
-    ...(subs > 0 ? [{ value: "subs" as const, label: "子 agent" }] : []),
+    ...(showRuntimeTab ? [{ value: "subs" as const, label: `实例(${runtimeTotal})` }] : []),
     { value: "info", label: "信息" },
-  ] as { value: Tab; label: string }[]).map((b) => ({ ...b, icon: subs > 0 ? undefined : icons[b.value] }));
+  ] as { value: Tab; label: string }[]).map((b) => ({ ...b, icon: showRuntimeTab ? undefined : icons[b.value] }));
 
   const padLeft = horizontalPad(space.lg, insets.left);
   const padRight = horizontalPad(space.lg, insets.right);
@@ -147,15 +152,39 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
         <View style={{ flexShrink: 0, paddingLeft: padLeft, paddingRight: padRight, paddingTop: space.xs, gap: space.sm }}>
           <View style={{ flexDirection: "row", gap: space.sm, alignItems: "center", minHeight: 30 }}>
             <HarnessAvatar harness={agent.harness} isShell={agent.isShell} size={28} />
-            <View style={{ flexShrink: 1, minWidth: 0, maxWidth: "48%" }}>
+            <View style={{ flexShrink: 1, minWidth: 0, maxWidth: "42%" }}>
               <DeviceLine agent={agent} />
             </View>
-            <Text numberOfLines={1} style={{ flex: 1, minWidth: 40, color: p.muted, fontSize: 12.5 }}>
+            {ports.length > 0 ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`监听端口 :${ports[0]?.port}，点按查看实例端口`}
+                onPress={() => setTab("subs")}
+                style={({ pressed }) => ({
+                  flexShrink: 0,
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 3,
+                  backgroundColor: good.bg,
+                  borderRadius: radius.pill,
+                  paddingHorizontal: 7,
+                  paddingVertical: 3,
+                  opacity: pressed ? 0.7 : 1,
+                })}
+              >
+                <MaterialCommunityIcons name="access-point" size={12} color={good.fg} />
+                <Text style={{ color: good.fg, fontFamily: fonts.monoBold, fontSize: 11.5 }}>
+                  :{ports[0]?.port}
+                  {ports.length > 1 ? ` +${ports.length - 1}` : ""}
+                </Text>
+              </Pressable>
+            ) : null}
+            <Text numberOfLines={1} style={{ flex: 1, minWidth: 32, color: p.muted, fontSize: 12.5 }}>
               {meta}
             </Text>
             <StatusPill status={agent.status} label={agentStatusLabel(agent)} compact />
           </View>
-          <PocketSegmented value={tab} onChange={setTab} segments={buttons} compact={subs > 0} />
+          <PocketSegmented value={tab} onChange={setTab} segments={buttons} compact={showRuntimeTab} />
         </View>
         <MobilePortalBanner
           agent={agent}
@@ -176,7 +205,19 @@ function MainDetail({ agent, initialTab }: { agent: Agent; initialTab?: Tab }) {
               <TerminalView agent={agent} active={tab === "terminal"} />
             </View>
           ) : null}
-          {tab === "subs" ? <SubagentList agent={agent} trail={[]} active bottomInset={insets.bottom} /> : null}
+          {tab === "subs" ? (
+            <SubagentList
+              agent={agent}
+              trail={[]}
+              active
+              bottomInset={insets.bottom}
+              onPortalsChanged={refreshPortals}
+              onOpenPortal={(item) => {
+                setPortalFocus(item);
+                setPortalOpen(true);
+              }}
+            />
+          ) : null}
           {tab === "info" ? <InfoView agent={agent} bottomInset={0} /> : null}
         </View>
         {tab === "chat" || tab === "terminal" ? (
@@ -248,7 +289,7 @@ function SubDetail({ agent, sub, trail }: { agent: Agent; sub: string; trail: Cr
             onChange={setTab}
             segments={[
               { value: "chat", label: "对话", icon: "chat-processing-outline" },
-              { value: "subs", label: `子 agent ${kids}`, icon: "source-branch" },
+              { value: "subs", label: `子 agent ${kids}`, icon: "robot-outline" },
             ]}
           />
         ) : null}

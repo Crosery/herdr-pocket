@@ -134,10 +134,17 @@ function makeAgents(): Agent[] {
     ag(HOST_A, "t47", "claude-code", "blocked", "要不要删掉旧的迁移脚本？", "和弦本 / 1", "/Users/me/code/chord-book", 2 * MIN, {
       sessionKey: "claude:demo-1", model: "claude-opus-5-5", turn: 14, costUsd: 1.58, contextTokens: 112_811, contextLimit: 1_000_000, cacheHitPct: 77.6,
       preview: "把和弦图组件改成可以左右滑动切换的", subagents: 2, subagentsWorking: 1,
+      listeningPorts: [
+        { port: 5173, pid: 41203, processName: "vite", host: "127.0.0.1", protocol: "http", title: "Vite Dev Server", url: "http://127.0.0.1:5173" },
+        { port: 8787, pid: 41289, processName: "node", host: "127.0.0.1", protocol: "http", title: "API Mock Server", url: "http://127.0.0.1:8787" },
+      ],
     }),
     ag(HOST_A, "t4f", "claude-code", "working", "桌宠动画改用 Rust 渲染", "桌面宠物 / 1", "/Users/me/code/desk-pet", 40_000, {
       sessionKey: "claude:demo-2", model: "claude-opus-5-5", turn: 20, costUsd: 0.92, contextTokens: 64_200, contextLimit: 1_000_000, cacheHitPct: 91.6,
       queued: 1, queuedText: "渲染完了顺便把帧率打到日志里", queuedItems: ["渲染完了顺便把帧率打到日志里"], queuedSince: now() - 25_000,
+      listeningPorts: [
+        { port: 3000, pid: 52018, processName: "next-server", host: "127.0.0.1", protocol: "http", title: "Preview UI", url: "http://127.0.0.1:3000" },
+      ],
     }),
     ag(HOST_A, "t4m", "omp", "working", "博客平台 登录鉴权重构", "博客平台 / 1", "/Users/me/code/blog-platform", 3 * MIN, { sessionKey: "omp:demo-3", model: "gpt-5.5", turn: 2 }),
     ag(HOST_A, "t4q", "omp", "done", "notes-cli 0.2.8 发布检查", "notes-cli / 1", "/Users/me/code/notes-cli", 25 * MIN, { sessionKey: "omp:demo-4", turn: 6 }),
@@ -846,6 +853,18 @@ export function mockLink(): Link {
           agents = agents.map((a) => (a.key === p.agent && a.status === "done" ? { ...a, status: "idle" } : a));
           publish();
           return { ok: true };
+        case "agent.ports": {
+          const ap = (params ?? {}) as { agent?: string; action?: "list" | "stop"; pid?: number; port?: number };
+          const hit = agents.find((a) => a.key === ap.agent);
+          if (!hit) return { ports: [] };
+          if (ap.action === "stop" && typeof ap.port === "number") {
+            const nextPorts = (hit.listeningPorts ?? []).filter((pt) => pt.port !== ap.port);
+            agents = agents.map((a) => (a.key === hit.key ? { ...a, listeningPorts: nextPorts } : a));
+            publish();
+            return { ports: nextPorts };
+          }
+          return { ports: hit.listeningPorts ?? [] };
+        }
         case "tools.check": {
           const t = ensureHostTools(_to);
           t.latest = {

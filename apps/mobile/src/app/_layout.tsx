@@ -87,6 +87,7 @@ function Navigator() {
         <Stack.Screen name="join" options={{ title: "让它加入", animation: "fade" }} />
         <Stack.Screen name="pair-new" options={{ title: "邀请设备", animation: "slide_from_bottom" }} />
         <Stack.Screen name="agent/[key]" options={{ title: "" }} />
+        <Stack.Screen name="display-settings" options={{ title: "显示与排版" }} />
         <Stack.Screen name="assistant" options={{ headerShown: false, animation: "none" }} />
       </Stack>
       <PocketToast

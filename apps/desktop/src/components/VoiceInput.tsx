@@ -16,6 +16,7 @@ import { configKeySpec } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketIconButton, PocketSelect, PocketSwitch, useToast } from "./PocketUI";
 import { XiaoyangOrb, resolveCallMascotMood } from "./MascotAndVendor";
 import { VoiceprintModal } from "./VoiceprintModal";
+import { VoicePreviewStudio } from "./VoicePreviewStudio";
 import { assistantStore, loadAssistant } from "../lib/assistant";
 import { detectPlatform } from "../lib/bridge";
 import { VOICEPRINT_SENSITIVITY_OPTIONS } from "../lib/voicePresets";
@@ -451,7 +452,7 @@ export function HotkeyRecorder({ value, onChange, disabled }: { value: string | 
 }
 
 /** Settings pane body and onboarding step for Xiaoyang voice wake & local DSP (config.json voiceInput.*). */
-export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
+export function VoiceInputSetup({ compact = false, audioOnly = false }: { compact?: boolean; audioOnly?: boolean }) {
   const toast = useToast();
   const cfg = useClientConfig().voiceInput;
   const server = settingsStore.use((s) => s.server);
@@ -641,12 +642,14 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
   const realtimeReady = Boolean(assistantVoice || (server && isMockServer(server)));
 
   return (
-    <div className="stack" style={{ gap: compact ? 12 : 4 }}>
-      {compact ? (
-        <div className="muted">
-          在任何应用里按一下 <span className="kbd">{prettyHotkey(cfg.hotkey)}</span> 即可悬浮唤起小羊实时语音通话，再按一次挂断。
-        </div>
-      ) : null}
+    <div className="stack" style={{ gap: compact || audioOnly ? 10 : 4 }}>
+      {!audioOnly ? (
+        <>
+          {compact ? (
+            <div className="muted">
+              在任何应用里按一下 <span className="kbd">{prettyHotkey(cfg.hotkey)}</span> 即可悬浮唤起小羊实时语音通话，再按一次挂断。
+            </div>
+          ) : null}
 
       {!DESKTOP_VOICE ? (
         <div className="inline-alert soft">
@@ -725,8 +728,10 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
           </PocketButton>
         </div>
       ) : null}
+        </>
+      ) : null}
 
-      {!compact ? (
+      {!compact && !audioOnly ? (
         <>
           <div className="set-row">
             <div className="set-text">
@@ -770,10 +775,13 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
               </PocketButton>
             </div>
           </div>
+        </>
+      ) : null}
 
-          {aiState ? (
+      {!compact && aiState ? (
             <>
-              <div className="set-heading">本地音频增强与声纹</div>
+              {!audioOnly ? <div className="set-heading">本地音频增强与声纹</div> : null}
+              <VoicePreviewStudio aiState={aiState} />
 
               <div className="set-row">
                 <div className="set-text">
@@ -947,11 +955,9 @@ export function VoiceInputSetup({ compact = false }: { compact?: boolean }) {
                 onStateChange={setAiState}
               />
             </>
-          ) : null}
-        </>
       ) : null}
 
-      {!compact ? (
+      {!compact && !audioOnly ? (
         <>
           <div className="set-heading">系统权限</div>
           {DESKTOP_VOICE && !perms && native.available() ? <div className="faint">没读到权限状态，按下面的路径手动检查。</div> : null}

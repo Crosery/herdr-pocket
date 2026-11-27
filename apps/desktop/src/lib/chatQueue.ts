@@ -437,11 +437,19 @@ async function deliverOutgoing(send: OutgoingSend, delivery: DeliveryMode = "aut
           paths.push(uploadedPath);
         }
       }
-      updateOutgoing(send.agentKey, (list) =>
-        list.map((x) => (x.id === send.id && x.progressText ? { ...x, progressText: undefined } : x)),
-      );
       uploadedPaths = paths;
       body = textWithFiles(send.text, paths);
+      updateOutgoing(send.agentKey, (list) =>
+        list.map((x) =>
+          x.id === send.id
+            ? {
+                ...x,
+                ...(x.progressText ? { progressText: undefined } : {}),
+                ...(uploadedPaths?.length ? { uploadedPaths } : {}),
+              }
+            : x,
+        ),
+      );
     }
     const sendRes = await rpcCall(send.deviceId, "terminal.send", {
       agent: send.agentKey,

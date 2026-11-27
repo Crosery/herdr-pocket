@@ -81,16 +81,16 @@ Automated builds are published to [GitHub Releases](https://github.com/Crosery/h
 
 | Platform | Target / Format | Direct Download | Notes |
 | --- | --- | --- | --- |
-| **macOS** | Apple Silicon (`arm64`) `.dmg` | [herdr-pocket-0.2.55-macos-arm64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-macos-arm64.dmg) | Tauri v2 desktop app |
-| **macOS** | Intel (`x64`) `.dmg` | [herdr-pocket-0.2.55-macos-x64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-macos-x64.dmg) | Tauri v2 desktop app |
-| **Windows** | `x64` NSIS Installer `.exe` | [herdr-pocket-0.2.55-windows-x64-setup.exe](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-windows-x64-setup.exe) | Recommended installer |
-| **Windows** | `x64` MSI Package `.msi` | [herdr-pocket-0.2.55-windows-x64.msi](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-windows-x64.msi) | Silent / enterprise rollout |
-| **Linux** | `x64` `.AppImage` | [herdr-pocket-0.2.55-linux-x64.AppImage](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-linux-x64.AppImage) | Portable bundle |
-| **Linux** | `x64` Debian / Ubuntu `.deb` | [herdr-pocket-0.2.55-linux-x64.deb](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-linux-x64.deb) | `apt` / `dpkg` package |
-| **Android** | `arm64` `.apk` | [herdr-pocket-0.2.55-android-arm64.apk](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-android-arm64.apk) | In-app updates & voice calls |
-| **HarmonyOS NEXT** | `arm64` `.hap` | [herdr-pocket-0.2.55-harmonyos-arm64.hap](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-harmonyos-arm64.hap) | Stage-model ArkTS client |
-| **iOS** | `arm64` `.ipa` | [herdr-pocket-0.2.55-ios-arm64.ipa](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55-ios-arm64.ipa) | AltStore / SideStore / TrollStore |
-| **Relay & Hostd** | Cross-platform `.tar.gz` | [herdr-pocket-0.2.55.tar.gz](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.55/herdr-pocket-0.2.55.tar.gz) | Used by `install-host` & `herdr-pocket update` |
+| **macOS** | Apple Silicon (`arm64`) `.dmg` | [herdr-pocket-0.2.56-macos-arm64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-macos-arm64.dmg) | Tauri v2 desktop app |
+| **macOS** | Intel (`x64`) `.dmg` | [herdr-pocket-0.2.56-macos-x64.dmg](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-macos-x64.dmg) | Tauri v2 desktop app |
+| **Windows** | `x64` NSIS Installer `.exe` | [herdr-pocket-0.2.56-windows-x64-setup.exe](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-windows-x64-setup.exe) | Recommended installer |
+| **Windows** | `x64` MSI Package `.msi` | [herdr-pocket-0.2.56-windows-x64.msi](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-windows-x64.msi) | Silent / enterprise rollout |
+| **Linux** | `x64` `.AppImage` | [herdr-pocket-0.2.56-linux-x64.AppImage](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-linux-x64.AppImage) | Portable bundle |
+| **Linux** | `x64` Debian / Ubuntu `.deb` | [herdr-pocket-0.2.56-linux-x64.deb](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-linux-x64.deb) | `apt` / `dpkg` package |
+| **Android** | `arm64` `.apk` | [herdr-pocket-0.2.56-android-arm64.apk](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-android-arm64.apk) | In-app updates & voice calls |
+| **HarmonyOS NEXT** | `arm64` `.hap` | [herdr-pocket-0.2.56-harmonyos-arm64.hap](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-harmonyos-arm64.hap) | Stage-model ArkTS client |
+| **iOS** | `arm64` `.ipa` | [herdr-pocket-0.2.56-ios-arm64.ipa](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56-ios-arm64.ipa) | AltStore / SideStore / TrollStore |
+| **Relay & Hostd** | Cross-platform `.tar.gz` | [herdr-pocket-0.2.56.tar.gz](https://github.com/Crosery/herdr-pocket/releases/download/v0.2.56/herdr-pocket-0.2.56.tar.gz) | Used by `install-host` & `herdr-pocket update` |
 
 ## Architecture & Security
 

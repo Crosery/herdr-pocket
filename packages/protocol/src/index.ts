@@ -416,18 +416,38 @@ export function textWithFiles(text: string, paths: string[]): string {
 }
 
 /**
- * A trailing line that stands for a picture: a path `textWithFiles` appended,
- * Claude Code's `[Image #n]` / `[Image #n, WxH]` marks, or Uniflo's `[image]` blocks.
+ * A trailing line that stands for an attached file/picture: a path `textWithFiles`
+ * appended (image or any non-image file/folder), Claude Code's `[Image #n]` /
+ * `[Image #n, WxH]` marks, or Uniflo's `[image]` blocks.
  */
 const IMAGE_TAG = /\[Image #\d+(?:,\s*\d+\s*[x×]\s*\d+)?\]/gi;
 const HAS_IMAGE_TAG = /\[Image #\d+(?:,\s*\d+\s*[x×]\s*\d+)?\]/i;
 const IMAGE_BLOCK = /\[image\]/gi;
 const TRAILING_IMAGE_BLOCKS = /(?:\s*\[image\])+$/i;
 const PICTURE_LINE = /^(?:(?:\/|[A-Za-z]:\\).*\.(?:jpe?g|png|webp|gif)|(?:\[Image #\d+(?:,\s*\d+\s*[x×]\s*\d+)?\]\s*)+|(?:\[image\]\s*)+)$/i;
-/** An absolute path: `/…` (macOS, Linux) or `C:\…` (Windows). */
-const FILE_PATH = /^(?:\/|[A-Za-z]:\\)/;
+/** Absolute Unix (`/dir/...`), home (`~/...`), or Windows (`C:\...`) file path line (rejecting slash commands, URLs, and shell pipelines). */
+const ATTACHED_PATH_CORE = /^(?:\/[^\s/]+\/.+|~\/[^\s/].*|[A-Za-z]:\\.+)$/;
+const ATTACHED_PATH_REJECT = /(?:^\/\/|^https?:\/\/|[|;&<>`]|\s--?[a-zA-Z]|[。！？；]$)/i;
 
-/** Undoes `textWithFiles`: the words, the picture marks/paths, and how many pictures those are. */
+function unwrapAttachedPath(line: string): string {
+  let s = line.trim();
+  if (s.startsWith("@")) s = s.slice(1).trim();
+  if (
+    s.length >= 2 &&
+    ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+export function isAttachedPathLine(line: string): boolean {
+  const s = unwrapAttachedPath(line);
+  if (!s || ATTACHED_PATH_REJECT.test(s)) return false;
+  return ATTACHED_PATH_CORE.test(s);
+}
+
+/** Undoes `textWithFiles`: the words, the attached file/picture marks or paths, and how many attachments those are. */
 export function splitFiles(message: string): { text: string; lines: string[]; count: number } {
   const all = message.replace(/\s+$/, "").split("\n");
   const popped: string[] = [];
@@ -437,7 +457,7 @@ export function splitFiles(message: string): { text: string; lines: string[]; co
       all.pop();
       continue;
     }
-    if (!PICTURE_LINE.test(top)) break;
+    if (!PICTURE_LINE.test(top) && !isAttachedPathLine(top)) break;
     popped.unshift(all.pop()!.trim());
   }
   const inlineBlocks: string[] = [];
@@ -463,8 +483,8 @@ export function splitFiles(message: string): { text: string; lines: string[]; co
     const next = line.replace(IMAGE_TAG, "").replace(/[ \t]{2,}/g, " ").trim();
     if (next) cleaned.push(next);
   }
-  const pathLines = popped.filter((l) => FILE_PATH.test(l));
-  const poppedTagLines = popped.filter((l) => !FILE_PATH.test(l) && HAS_IMAGE_TAG.test(l));
+  const pathLines = popped.filter((l) => isAttachedPathLine(l));
+  const poppedTagLines = popped.filter((l) => !isAttachedPathLine(l) && HAS_IMAGE_TAG.test(l));
   const poppedTags = popped.flatMap((l) => l.match(IMAGE_TAG) ?? []);
   const poppedBlocks = popped.flatMap((l) => l.match(IMAGE_BLOCK) ?? []);
   const totalTags = inlineTags.length + poppedTags.length;
@@ -474,7 +494,7 @@ export function splitFiles(message: string): { text: string; lines: string[]; co
     ...pathLines,
     ...inlineTags,
     ...poppedTagLines,
-    ...(totalTags === 0 ? [...popped.filter((l) => !FILE_PATH.test(l)), ...inlineBlocks] : []),
+    ...(totalTags === 0 ? [...popped.filter((l) => !isAttachedPathLine(l)), ...inlineBlocks] : []),
   ];
   return { text: cleaned.join("\n").trim(), lines, count };
 }

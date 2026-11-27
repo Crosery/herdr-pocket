@@ -113,11 +113,33 @@ export const AgentRow = memo(function AgentRow({ agent, offline, deviceName, pla
           <Text numberOfLines={1} style={{ flexShrink: 1, minWidth: 0, fontSize: 13, color: offline ? p.faint : p.muted }}>
             {sub}
           </Text>
+          {agent.listeningPorts?.length ? (
+            <View
+              accessibilityLabel={`监听 ${agent.listeningPorts.length} 个端口，主端口 ${agent.listeningPorts[0]?.port}`}
+              style={{
+                flexShrink: 0,
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 3,
+                backgroundColor: statusColors("working", p.dark).bg,
+                borderRadius: radius.pill,
+                paddingHorizontal: 6,
+                paddingVertical: 1,
+              }}
+            >
+              <MaterialCommunityIcons name="access-point" size={11} color={statusColors("working", p.dark).fg} />
+              <Text style={{ color: statusColors("working", p.dark).fg, fontFamily: fonts.monoBold, fontSize: 11 }}>
+                :{agent.listeningPorts[0]?.port}
+                {agent.listeningPorts.length > 1 ? ` +${agent.listeningPorts.length - 1}` : ""}
+              </Text>
+            </View>
+          ) : null}
           {agent.subagents ? (
             <View
               accessibilityLabel={`${agent.subagents} 个子 agent${agent.subagentsWorking ? `，${agent.subagentsWorking} 个在忙` : ""}`}
               style={{ flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: p.lavenderContainer, borderRadius: radius.pill, paddingHorizontal: 7, paddingVertical: 1 }}
             >
+              <MaterialCommunityIcons name="robot-outline" size={12} color={p.ink} />
               {agent.subagentsWorking ? <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: statusColors("working", p.dark).fg }} /> : null}
               <Text style={{ color: p.ink, fontFamily: fonts.bodySemi, fontSize: 11.5 }}>子 agent {agent.subagents}</Text>
             </View>

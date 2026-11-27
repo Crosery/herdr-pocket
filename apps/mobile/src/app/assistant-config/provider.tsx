@@ -24,7 +24,8 @@ import {
 } from "@herdr-pocket/protocol";
 import { Card, EmptyState, PageBackground } from "../../components/ui";
 import { Chip, Chips, ConfigSnackbar, ConfirmDialog, Field, Input, KeyField, LoadState, Pill, SaveBar, useLeaveGuard } from "../../components/configParts";
-import { PocketButton, PocketChip, PocketChips, PocketSpinner } from "../../components/pocket";
+import { PocketButton, PocketSpinner } from "../../components/pocket";
+import { ModelBrandIcon } from "../../components/ModelBrandIcon";
 import { PocketKeyboardAvoidingView } from "../../components/PocketKeyboardAvoidingView";
 import { Toggle } from "../../components/rows";
 import { modelErrorText } from "../../lib/modelErrors";
@@ -46,6 +47,8 @@ const ALL_PRESETS: readonly ProviderPresetItem[] = [
 
 const ID = /^[a-z][a-z0-9-]{0,31}$/;
 const HTTP = /^https?:\/\/\S+$/i;
+const LOCAL_URL_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/|$)/i;
+const INITIAL_SHOW_MODELS = 40;
 const PROTOCOLS: readonly ModelProtocol[] = ["openai", "openai-responses", "anthropic", "gemini", "ollama"];
 const AUTHS: { value: ModelAuth | null; label: string }[] = [
   { value: null, label: "按协议默认" },
@@ -147,6 +150,7 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [filterText, setFilterText] = useState("");
+  const [showAllScanned, setShowAllScanned] = useState(false);
   const [selectedModels, setSelectedModels] = useState<string[]>(() => (!editId && firstPreset?.recommendedModel ? [firstPreset.recommendedModel] : []));
   const [manualModel, setManualModel] = useState("");
   const [makeMain, setMakeMain] = useState(!editId);
@@ -488,8 +492,13 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
             ) : null}
 
             {scanError ? (
-              <View style={{ gap: 2 }}>
-                <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 18 }}>没扫到模型列表：{modelErrorText(scanError).title}。可以直接在下面手动填模型名。</Text>
+              <View style={{ gap: 4 }}>
+                <Text style={{ color: p.error, fontSize: 12.5, lineHeight: 18 }}>
+                  没扫到模型列表：{modelErrorText(scanError).title}
+                  {LOCAL_URL_RE.test(baseUrl.trim())
+                    ? "（远程中继无法直连本机 127.0.0.1，请在下方手动填模型名）"
+                    : "。可以直接在下面手动填模型名。"}
+                </Text>
                 <Text numberOfLines={2} style={{ color: p.faint, fontSize: 11.5, lineHeight: 16 }}>
                   {scanError}
                 </Text>
@@ -498,15 +507,75 @@ function ProviderForm({ config, current, editId, title }: { config: AssistantCon
 
             {scanned && scanned.length > 0 ? (
               <View style={{ gap: space.sm }}>
-                {scanned.length > 8 ? (
-                  <Input value={filterText} onChangeText={setFilterText} placeholder={`搜索模型（共 ${scanned.length} 个）`} autoCapitalize="none" mono accessibilityLabel="搜索扫描到的模型" />
+                <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+                  <View style={{ flex: 1 }}>
+                    <Input
+                      value={filterText}
+                      onChangeText={(t) => {
+                        setFilterText(t);
+                        if (t.trim()) setShowAllScanned(true);
+                      }}
+                      placeholder={`搜索全部 ${scanned.length} 个模型…`}
+                      autoCapitalize="none"
+                      mono
+                      accessibilityLabel="搜索扫描到的模型"
+                    />
+                  </View>
+                  <Pill text={filterText.trim() ? `${filteredModels.length}/${scanned.length}` : `共 ${scanned.length}`} tone="primary" />
+                </View>
+
+                <View style={{ borderRadius: radius.md, borderWidth: 1, borderColor: p.divider, overflow: "hidden", backgroundColor: p.surface }}>
+                  {(showAllScanned || filterText.trim() ? filteredModels : filteredModels.slice(0, INITIAL_SHOW_MODELS)).map((m, idx) => {
+                    const inUse = users.some((u) => u.model === m);
+                    const checked = inUse || selectedModels.includes(m);
+                    return (
+                      <Pressable
+                        key={m}
+                        accessibilityRole="checkbox"
+                        accessibilityState={{ checked, disabled: inUse }}
+                        disabled={inUse}
+                        onPress={() => toggleModel(m)}
+                        style={({ pressed }) => ({
+                          flexDirection: "row",
+                          alignItems: "center",
+                          gap: 10,
+                          minHeight: 44,
+                          paddingHorizontal: space.md,
+                          paddingVertical: 8,
+                          borderTopWidth: idx > 0 ? 1 : 0,
+                          borderTopColor: p.divider,
+                          backgroundColor: checked && !inUse ? p.accentContainer : pressed ? p.surface2 : "transparent",
+                          opacity: inUse ? 0.6 : 1,
+                        })}
+                      >
+                        <MaterialCommunityIcons
+                          name={checked ? "checkbox-marked" : "checkbox-blank-outline"}
+                          size={20}
+                          color={checked ? (inUse ? p.faint : p.primary) : p.faint}
+                        />
+                        <ModelBrandIcon model={m} provider={label || pid} size={15} color={checked && !inUse ? p.accentText : p.ink} />
+                        <Text
+                          numberOfLines={1}
+                          style={{
+                            flex: 1,
+                            fontFamily: fonts.mono,
+                            fontSize: 13,
+                            color: checked && !inUse ? p.accentText : p.ink,
+                          }}
+                        >
+                          {m}
+                        </Text>
+                        {inUse ? <Pill text="在用" tone="plain" /> : null}
+                      </Pressable>
+                    );
+                  })}
+                </View>
+
+                {!showAllScanned && !filterText.trim() && filteredModels.length > INITIAL_SHOW_MODELS ? (
+                  <PocketButton size="sm" variant="soft" onPress={() => setShowAllScanned(true)}>
+                    展开全部 {filteredModels.length} 个模型（剩余 {filteredModels.length - INITIAL_SHOW_MODELS} 个）
+                  </PocketButton>
                 ) : null}
-                <PocketChips multi>
-                  {filteredModels.slice(0, 36).map((m) => (
-                    <PocketChip key={m} multi mono on={selectedModels.includes(m)} onPress={() => toggleModel(m)} label={m} />
-                  ))}
-                </PocketChips>
-                {filteredModels.length > 36 ? <Text style={{ color: p.faint, fontSize: 12 }}>仅显示前 36 个，可用上方输入框筛选更多</Text> : null}
               </View>
             ) : null}
 

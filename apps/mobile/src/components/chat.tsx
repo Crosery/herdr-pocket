@@ -559,9 +559,20 @@ const UserBubble = memo(function UserBubble({ text, injected, ts, send, agentKey
             <Image key={i} source={{ uri }} accessibilityLabel={`发送的第 ${i + 1} 张图片`} style={{ width: 64, height: 64, borderRadius: radius.sm, backgroundColor: p.surface2 }} />
           ))}
         </View>
-      ) : shown.count ? (
-        <FoldChip label={`图片 ×${shown.count}`} icon="image-outline" body={shown.lines.join("\n")} align="flex-end" a11y={`这条消息带了 ${shown.count} 张图片`} />
-      ) : null}
+      ) : shown.count ? (() => {
+        const allImg = shown.lines.length > 0 && shown.lines.every((l) => /\.(?:jpe?g|png|webp|gif)$/i.test(l) || /^\[(?:Image|image)/i.test(l.trim()));
+        const singleName = shown.lines.length === 1 ? (shown.lines[0]!.split(/[\\/]/).filter(Boolean).pop() || "") : "";
+        const label = allImg ? `图片 ×${shown.count}` : shown.count === 1 && singleName ? singleName : `附件 ×${shown.count}`;
+        return (
+          <FoldChip
+            label={label}
+            icon={allImg ? "image-outline" : "paperclip"}
+            body={shown.lines.join("\n")}
+            align="flex-end"
+            a11y={allImg ? `这条消息带了 ${shown.count} 张图片` : `这条消息带了 ${shown.count} 个附件`}
+          />
+        );
+      })() : null}
       {injected ? <FoldChip label="附加内容" icon="paperclip" body={injected} align="flex-end" a11y="这条消息的附加内容" /> : null}
       {send && agentKey ? (
         <SendMark send={send} agentKey={agentKey} time={clock(send.ts)} />
@@ -911,7 +922,7 @@ function SubLink({ s, onPress }: { s: SubSession; onPress: () => void }) {
         backgroundColor: pressed ? p.surface3 : p.lavenderContainer,
       })}
     >
-      <MaterialCommunityIcons name="source-branch" size={16} color={p.ink} />
+      <MaterialCommunityIcons name="robot-outline" size={16} color={p.ink} />
       <Text style={{ flex: 1, color: p.ink, fontFamily: fonts.bodyBold, fontSize: 13.5 }}>查看子 agent 对话</Text>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: c.bg, borderRadius: radius.pill, paddingHorizontal: 8, paddingVertical: 2 }}>
         <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: c.fg }} />

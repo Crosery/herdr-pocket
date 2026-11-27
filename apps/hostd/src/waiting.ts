@@ -31,9 +31,11 @@ export interface InputWaitsOptions {
 const fold = (s: string) => s.replace(/\s+/g, "");
 
 function formatWaitPreview(raw: string): string {
-  const { text, count } = splitFiles(raw);
+  const { text, lines, count } = splitFiles(raw);
   const words = text.replace(/\s+/g, " ").trim();
-  return count ? [words, `图片 ×${count}`].filter(Boolean).join(" · ") : words;
+  if (!count) return words;
+  const allImg = lines.length > 0 && lines.every((l) => /\.(?:jpe?g|png|webp|gif)$/i.test(l) || /^\[(?:Image|image)/i.test(l.trim()));
+  return [words, `${allImg ? "图片" : "附件"} ×${count}`].filter(Boolean).join(" · ");
 }
 
 function sameQueuedPreview(a: string, b: string): boolean {

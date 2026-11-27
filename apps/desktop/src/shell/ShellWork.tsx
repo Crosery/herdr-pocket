@@ -3,14 +3,14 @@ import { createPortal } from "react-dom";
 import { AlertTriangle, Bell, Check, ChevronDown, Columns2, Compass, Copy, Equal, ExternalLink, EyeOff, File, FileText, FolderOpen, FolderTree, GitBranch, Globe, GripHorizontal, HelpCircle, Keyboard, Laptop, Layers, Maximize2, MessageSquare, Minimize2, MoreHorizontal, PanelTop, Pencil, Plus, Rows2, ScreenShare, Search, ShieldAlert, Sparkles, SquareArrowOutUpRight, Terminal, Trash2, X } from "lucide-react";
 import type { Agent, ConvEvent, PortalEgoSpaceState, SubSession } from "@herdr-pocket/protocol";
 import { PocketButton, PocketErrorBoundary, PocketInput, PocketModal, PocketSelect, overlayStore, useToast } from "../components/PocketUI";
-import { AgentPortsPopover } from "../components/AgentPortsPopover";
+import { InstanceRuntimePopover } from "../components/InstanceRuntimePopover";
 import { ChatTimelineRows } from "../components/ChatTimeline";
 import { DiffTabView, GitPanel } from "../components/GitPanel";
 import { XiaoyangOrb, VendorIcon, mascotAssetPath, resolveCallMascotMood, resolveVendor } from "../components/MascotAndVendor";
 import { PortalTabPane } from "../components/PortalTabPane";
 import { PortalViewerModal } from "../components/PortalViewerModal";
 import { serverLabel } from "../components/Sidebar";
-import { SubagentCatalogTrigger, SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
+import { SubagentHeaderLineage, SubagentReadOnlyBar, subLabel } from "../components/SubagentNav";
 import { prettyHotkey } from "../components/VoiceInput";
 import { AgentDetailPanel, type SubagentHeadInfo } from "../views/AgentsView";
 import { FileTree, FileViewer, WebPane, type FileViewerHeadState } from "../views/WorkbenchView";
@@ -1494,20 +1494,8 @@ function PaneHead({
         {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
         {sizeText ? <span className="v3-pane-pill num">{sizeText}</span> : null}
         {content.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
-        {content.kind === "agent" && agent && !inSubView && (agent.listeningPorts?.length ?? 0) > 0 ? (
-          <AgentPortsPopover agent={agent} tabId={tabId} paneId={paneId} />
-        ) : null}
-        {content.kind === "agent" && agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
-          <SubagentCatalogTrigger
-            compact
-            deviceId={agent.deviceId}
-            agentKey={agent.key}
-            knownCount={subHead.knownCount}
-            subs={subHead.rootSubs}
-            onSelectSub={subHead.onSelectSub}
-            onOpenAside={subHead.onOpenAside}
-            onRefresh={subHead.onRefresh}
-          />
+        {content.kind === "agent" && agent && !inSubView ? (
+          <InstanceRuntimePopover agent={agent} subHead={subHead} tabId={tabId} paneId={paneId} />
         ) : null}
         {previewToggleable && fileHead ? (
           <div className="v3-mode-switch" role="group" aria-label="视图">
@@ -4034,20 +4022,8 @@ export function PeekOverlay() {
             </>
           )}
           <div className="v3-pane-right">
-            {agent && !inSubView && (agent.listeningPorts?.length ?? 0) > 0 ? (
-              <AgentPortsPopover agent={agent} />
-            ) : null}
-            {agent && !inSubView && subHead && (subHead.knownCount > 0 || subHead.rootSubs.length > 0) ? (
-              <SubagentCatalogTrigger
-                compact
-                deviceId={agent.deviceId}
-                agentKey={agent.key}
-                knownCount={subHead.knownCount}
-                subs={subHead.rootSubs}
-                onSelectSub={subHead.onSelectSub}
-                onOpenAside={subHead.onOpenAside}
-                onRefresh={subHead.onRefresh}
-              />
+            {agent && !inSubView ? (
+              <InstanceRuntimePopover agent={agent} subHead={subHead} />
             ) : null}
             {agent ? (
               <ModeSwitchIcons

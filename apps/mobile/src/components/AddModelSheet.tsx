@@ -12,11 +12,12 @@ import { changeConfig, listProviderModels, modelKey, PROTOCOL_LABEL, providerNam
 import { modelErrorText } from "../lib/modelErrors";
 import { useSettings } from "../lib/store";
 import { Field, Input } from "./configParts";
+import { ModelBrandIcon } from "./ModelBrandIcon";
 import { PocketButton, PocketChip, PocketChips, PocketSegmented, PocketSheet, PocketSpinner } from "./pocket";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space, statusColors } from "../theme/tokens";
 
-const SHOWN = 30;
+const INITIAL_SHOWN = 40;
 
 /** Mount it with a new `key` each time it opens: it starts fresh, on the main model's provider. */
 export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible: boolean; onDismiss: () => void; config: AssistantConfigView; onAdded: (m: ModelRef, asMain: boolean) => void }) {
@@ -25,6 +26,7 @@ export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible
   const [provider, setProvider] = useState<string | null>(config.models[0]?.provider ?? config.providers[0]?.id ?? null);
   const [model, setModel] = useState("");
   const [place, setPlace] = useState<"fallback" | "main">(config.models.length ? "fallback" : "main");
+  const [showAll, setShowAll] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -83,7 +85,10 @@ export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible
               <PocketChip
                 key={x.id}
                 on={provider === x.id}
-                onPress={() => setProvider(x.id)}
+                onPress={() => {
+                  setProvider(x.id);
+                  setShowAll(false);
+                }}
                 label={providerName(x)}
                 a11y={`服务商 ${providerName(x)}，${PROTOCOL_LABEL[x.protocol]}，${ok ? "密钥已设" : "还没有密钥"}`}
                 lead={<View style={{ width: 8, height: 8, borderRadius: 4, marginLeft: 6, backgroundColor: ok ? statusColors("working", p.dark).fg : p.error }} />}
@@ -124,15 +129,15 @@ export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible
             <Text style={{ color: p.muted, fontSize: 13.5, lineHeight: 20 }}>列表里没有名字里带“{name}”的，照你填的加也行。</Text>
           ) : (
             <View style={{ backgroundColor: p.surface, borderRadius: radius.card, paddingVertical: space.xs, overflow: "hidden" }}>
-              {matches.slice(0, SHOWN).map((n, i) => {
+              {(showAll ? matches : matches.slice(0, INITIAL_SHOWN)).map((n, i) => {
                 const inUse = used.has(modelKey({ provider, model: n }));
                 const on = name === n;
                 return (
                   <View key={n}>
                     {i ? <View style={{ height: 1, backgroundColor: p.divider, marginHorizontal: space.md }} /> : null}
                     <Pressable
-                      accessibilityRole="radio"
-                      accessibilityState={{ checked: on, disabled: inUse }}
+                      accessibilityRole="checkbox"
+                      accessibilityState={{ checked: on || inUse, disabled: inUse }}
                       accessibilityLabel={inUse ? `${n}，已经在用` : n}
                       disabled={inUse}
                       onPress={() => setModel(n)}
@@ -140,23 +145,33 @@ export function AddModelSheet({ visible, onDismiss, config, onAdded }: { visible
                         flexDirection: "row",
                         alignItems: "center",
                         gap: space.sm,
-                        minHeight: 46,
+                        minHeight: 44,
                         paddingHorizontal: space.md,
                         backgroundColor: on ? p.accentContainer : pressed ? p.surface3 : "transparent",
-                        opacity: inUse ? 0.5 : 1,
+                        opacity: inUse ? 0.55 : 1,
                       })}
                     >
-                      <Text numberOfLines={1} style={{ flex: 1, color: p.ink, fontFamily: on ? fonts.monoBold : fonts.mono, fontSize: 13.5 }}>
+                      <MaterialCommunityIcons
+                        name={on || inUse ? "checkbox-marked" : "checkbox-blank-outline"}
+                        size={19}
+                        color={on || inUse ? p.primary : p.faint}
+                      />
+                      <ModelBrandIcon model={n} provider={chosen ? providerName(chosen) : provider} size={15} color={on ? p.accentText : p.ink} />
+                      <Text numberOfLines={1} style={{ flex: 1, color: p.ink, fontFamily: on ? fonts.monoBold : fonts.mono, fontSize: 13 }}>
                         {n}
                       </Text>
-                      {inUse ? <Text style={{ color: p.faint, fontFamily: fonts.bodySemi, fontSize: 12 }}>在用</Text> : on ? <MaterialCommunityIcons name="check-circle" size={18} color={p.accentText} /> : null}
+                      {inUse ? <Text style={{ color: p.faint, fontFamily: fonts.bodySemi, fontSize: 11.5 }}>在用</Text> : null}
                     </Pressable>
                   </View>
                 );
               })}
             </View>
           )}
-          {matches.length > SHOWN ? <Text style={{ color: p.faint, fontSize: 12.5 }}>还有 {matches.length - SHOWN} 个，在上面输入几个字筛一下</Text> : null}
+          {!showAll && matches.length > INITIAL_SHOWN ? (
+            <PocketButton size="sm" variant="soft" onPress={() => setShowAll(true)}>
+              展开全部 {matches.length} 个模型（还有 {matches.length - INITIAL_SHOWN} 个）
+            </PocketButton>
+          ) : null}
         </Field>
       ) : null}
 

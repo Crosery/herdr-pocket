@@ -312,6 +312,19 @@ export interface VoiceAiTestEvent {
   inferMs?: number;
 }
 
+export interface VoiceAiPreviewResult {
+  pcmBase64: string;
+  sampleRate: number;
+  durationMs: number;
+  processMs: number;
+  inRmsDb: number;
+  outRmsDb: number;
+  suppressedRatio: number;
+  usedDpdf: boolean;
+  usedTse: boolean;
+  svActive: boolean;
+}
+
 const DEMO_VOICE_AI_KEY = "herdr-pocket-demo-voice-ai-v1";
 const demoProgressListeners = new Set<(e: VoiceAiProgressEvent) => void>();
 const demoEnrollListeners = new Set<(e: VoiceAiEnrollEvent) => void>();
@@ -758,6 +771,78 @@ export const native = {
     if (inTauri()) return invoke<boolean>("voice_ai_stop_test");
     stopDemoTestTimer();
     return true;
+  },
+  voiceAiPreviewProcess: async (pcmBase64: string): Promise<VoiceAiPreviewResult> => {
+    if (inTauri()) return invoke<VoiceAiPreviewResult>("voice_ai_preview_process", { pcmBase64 });
+    // Real lightweight PCM16 DSP fallback for Web/H5/Demo preview (HPF + noise gate + vocal presence + soft limit).
+    const t0 = performance.now();
+    const bin = atob(pcmBase64);
+    const len = bin.length - (bin.length % 2);
+    const samples = len / 2;
+    const raw = new Int16Array(samples);
+    for (let i = 0; i < samples; i++) {
+      const lo = bin.charCodeAt(i * 2);
+      const hi = bin.charCodeAt(i * 2 + 1);
+      const v = (hi << 8) | lo;
+      raw[i] = v >= 0x8000 ? v - 0x10000 : v;
+    }
+    const cfg = getDemoVoiceAi();
+    const out = new Int16Array(samples);
+    let inSq = 0;
+    let outSq = 0;
+    let prevIn = 0;
+    let prevOut = 0;
+    let prevPres = 0;
+    let env = 0;
+    let suppressed = 0;
+    for (let i = 0; i < samples; i++) {
+      const x = raw[i]! / 32768;
+      inSq += x * x;
+      let y = x;
+      if (cfg.denoise) {
+        // Simple 1st-order ~90Hz HPF + soft noise floor gate
+        y = 0.965 * (prevOut + x - prevIn);
+        prevIn = x;
+        prevOut = y;
+        env = 0.96 * env + 0.04 * Math.abs(y);
+        if (env < 0.014) {
+          const g = Math.max(0.08, env / 0.014);
+          y *= g;
+          if (g < 0.35) suppressed += 1;
+        }
+      }
+      if (cfg.enhanceVocal) {
+        // Gentle presence emphasis + soft tanh limiter
+        const hi = y - prevPres * 0.72;
+        prevPres = y;
+        y = Math.tanh((y + hi * 0.32) * 1.25);
+      } else if (cfg.denoise) {
+        y = Math.tanh(y * 1.05);
+      }
+      outSq += y * y;
+      out[i] = Math.max(-32768, Math.min(32767, Math.round(y * 32767)));
+    }
+    const u8 = new Uint8Array(out.buffer);
+    let outBin = "";
+    const CHUNK = 8192;
+    for (let i = 0; i < u8.length; i += CHUNK) {
+      outBin += String.fromCharCode(...u8.subarray(i, i + CHUNK));
+    }
+    const n = Math.max(1, samples);
+    const inDb = Math.round(20 * Math.log10(Math.max(1e-6, Math.sqrt(inSq / n))) * 10) / 10;
+    const outDb = Math.round(20 * Math.log10(Math.max(1e-6, Math.sqrt(outSq / n))) * 10) / 10;
+    return {
+      pcmBase64: btoa(outBin),
+      sampleRate: 16000,
+      durationMs: Math.round((samples / 16000) * 1000),
+      processMs: Math.round((performance.now() - t0) * 10) / 10,
+      inRmsDb: inDb,
+      outRmsDb: outDb,
+      suppressedRatio: Math.round((suppressed / n) * 1000) / 1000,
+      usedDpdf: cfg.denoise,
+      usedTse: cfg.tier === "tse" && cfg.filter,
+      svActive: cfg.enrolled && cfg.filter,
+    };
   },
   onVoiceAiProgress: (cb: (e: VoiceAiProgressEvent) => void): (() => void) => {
     if (inTauri()) return onNativeEvent<VoiceAiProgressEvent>("voice-ai://progress", cb);

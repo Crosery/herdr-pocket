@@ -174,7 +174,7 @@ export function AgentPortsPopover({
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={open ? popId : undefined}
-        title={`此会话正在监听 ${ports.map((p) => `:${p.port}`).join("、")}（点击预览或管理）`}
+        title={`此实例正在监听 ${ports.map((p) => `:${p.port}`).join("、")}（点击预览或管理）`}
         onClick={() => {
           if (open) {
             setOpen(false);
@@ -185,7 +185,7 @@ export function AgentPortsPopover({
           setOpen(true);
         }}
       >
-        <span className="port-pill-dot" aria-hidden />
+        <Radio size={12} aria-hidden />
         <span className="mono">:{first.port}</span>
         {extraCount > 0 ? <span className="port-pill-extra mono">+{extraCount}</span> : null}
       </button>

@@ -244,6 +244,13 @@ function extractTargetFromLine(line: string): string | null {
     .replace(/^@/, "")
     .replace(/^["'`<]+|["'`>]+$/g, "");
   if (looksLikeClickableFilePath(cleaned)) return cleaned;
+  // Trailing attached paths (e.g. `/Users/me/Downloads/新录音 (1).txt`) may contain spaces.
+  if (
+    /^(?:\/[^\s/]+\/.+|~\/[^\s/].*|[A-Za-z]:\\.+)$/.test(cleaned) &&
+    !/[|;&<>`]/.test(cleaned)
+  ) {
+    return cleaned;
+  }
   const tokens = line.trim().split(/\s+/);
   for (const raw of tokens) {
     const t = raw.replace(/^@/, "").replace(/^["'`(<]+|["'`>),.;]+$/g, "");
@@ -807,7 +814,7 @@ const UserRowItem = memo(function UserRowItem({
     return row.attachedLines
       .map((line) => {
         const target = extractTargetFromLine(line);
-        const label = (target || line).split("/").filter(Boolean).pop() || line;
+        const label = (target || line).split(/[\\/]/).filter(Boolean).pop() || line;
         return { raw: line, target, label };
       })
       .filter((att) => {

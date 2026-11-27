@@ -17,7 +17,8 @@ import { Row, RowDivider } from "../../components/rows";
 import { ConfigSnackbar, ConfirmDialog, LoadState, Note, Pill, WarningCard } from "../../components/configParts";
 import { PocketButton, PocketSpinner, RowAction } from "../../components/pocket";
 import { AddModelSheet } from "../../components/AddModelSheet";
-import { changeConfig, loadConfig, modelKey, PROTOCOL_LABEL, providerName, speedLine, testModel, useAssistantConfig, useConfigWatch, type ModelTest } from "../../lib/assistantConfig";
+import { ModelBrandIcon } from "../../components/ModelBrandIcon";
+import { changeConfig, loadConfig, modelKey, PROTOCOL_LABEL, providerName, testModel, useAssistantConfig, useConfigWatch, type ModelTest } from "../../lib/assistantConfig";
 import { modelErrorText } from "../../lib/modelErrors";
 import { relTime } from "../../lib/format";
 import { usePalette } from "../../theme/theme";
@@ -150,30 +151,32 @@ export default function ModelsScreen() {
             </View>
           }
         />
-        <Text style={{ color: p.muted, fontSize: 13, lineHeight: 19, paddingHorizontal: space.xs, paddingBottom: space.sm }}>
+        <Text style={{ color: p.muted, fontSize: 12.5, lineHeight: 18, paddingHorizontal: space.xs, paddingBottom: space.sm }}>
           {editing
-            ? "用上下箭头排顺序，排第一的就是主模型；去掉后几秒内可以撤销。"
-            : "小羊从上往下用：第 1 个是主模型，它出错或一直不说话时换下一个。点一个模型，测测它多快开口。"}
+            ? "上下箭头调顺序，第 1 个为主模型；移除后可撤销。"
+            : "第 1 个为主模型，出错或沉默时按序顺延；点延迟徽标可单测。"}
         </Text>
-        <Card style={{ paddingVertical: space.sm }}>
+        <Card style={{ paddingVertical: 4, overflow: "hidden" }}>
           {models.length ? (
             models.map((m, i) => (
-              <ModelItem
-                key={modelKey(m)}
-                m={m}
-                i={i}
-                count={models.length}
-                provider={providers.get(m.provider)}
-                test={tests[modelKey(m)]}
-                fastest={fastest?.i === i}
-                busy={busy}
-                editing={editing}
-                onTest={() => void testModel(m)}
-                onMakeMain={() => makeMain(i)}
-                onUp={() => move(i, -1)}
-                onDown={() => move(i, 1)}
-                onRemove={() => remove(i)}
-              />
+              <View key={modelKey(m)}>
+                {i > 0 ? <RowDivider /> : null}
+                <ModelItem
+                  m={m}
+                  i={i}
+                  count={models.length}
+                  provider={providers.get(m.provider)}
+                  test={tests[modelKey(m)]}
+                  fastest={fastest?.i === i}
+                  busy={busy}
+                  editing={editing}
+                  onTest={() => void testModel(m)}
+                  onMakeMain={() => makeMain(i)}
+                  onUp={() => move(i, -1)}
+                  onDown={() => move(i, 1)}
+                  onRemove={() => remove(i)}
+                />
+              </View>
             ))
           ) : (
             <View style={{ padding: space.lg, gap: space.xs }}>
@@ -281,33 +284,7 @@ export default function ModelsScreen() {
   );
 }
 
-/** The order badge: a pink "主" for the main model, a soft number for each fallback, joined by a thin rail. */
-function OrderBadge({ i, count }: { i: number; count: number }) {
-  const p = usePalette();
-  const main = i === 0;
-  const rail = p.dark ? p.surface3 : "#F3DCE6";
-  return (
-    <View style={{ width: 34, alignItems: "center" }}>
-      <View style={{ width: 2, flex: 1, minHeight: 6, backgroundColor: i ? rail : "transparent" }} />
-      <View
-        style={{
-          width: 30,
-          height: 30,
-          borderRadius: 15,
-          alignItems: "center",
-          justifyContent: "center",
-          backgroundColor: main ? p.primary : p.accentContainer,
-          borderWidth: main ? 0 : 1,
-          borderColor: p.dark ? p.surface3 : "#FFD3E2",
-        }}
-      >
-        <Text style={{ color: main ? p.onPrimary : p.accentText, fontFamily: main ? fonts.cute : fonts.bodyBold, fontSize: main ? 15 : 13.5, lineHeight: 20 }}>{main ? "主" : i + 1}</Text>
-      </View>
-      <View style={{ width: 2, flex: 1, minHeight: 6, backgroundColor: i < count - 1 ? rail : "transparent" }} />
-    </View>
-  );
-}
-
+/** Compact Agent-style model row (no tall vertical timeline rail). */
 function ModelItem({
   m,
   i,
@@ -338,41 +315,140 @@ function ModelItem({
   onRemove: () => void;
 }) {
   const p = usePalette();
-  // The badge carries the place in the order; the words only say main or fallback, so there is one numbering.
-  const role = i === 0 ? "主模型" : "备用";
-  const from = provider ? `${providerName(provider)} · ${PROTOCOL_LABEL[provider.protocol]}` : `服务商 ${m.provider} 不在了`;
+  const isMain = i === 0;
+  const from = provider ? `${providerName(provider)} · ${PROTOCOL_LABEL[provider.protocol]}` : `${m.provider} 不在了`;
+  const good = statusColors("working", p.dark);
+  const msVal = test && !test.running && test.ok ? (test.firstMs ?? test.totalMs ?? null) : null;
+  const failed = test && !test.running && !test.ok ? modelErrorText(test.error) : null;
+
   return (
-    <View style={{ flexDirection: "row", alignItems: "stretch", paddingLeft: space.md, paddingRight: space.md, gap: space.sm }}>
-      <OrderBadge i={i} count={count} />
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`第 ${i + 1} 个，${role}：${m.model}，${from}。点一下测速度`}
-        onPress={onTest}
-        disabled={test?.running}
-        style={({ pressed }) => ({ flex: 1, gap: 3, paddingVertical: space.md, opacity: pressed ? 0.6 : 1 })}
-      >
-        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: space.sm, rowGap: 3 }}>
-          <Text style={{ flexShrink: 1, fontFamily: fonts.bodyBold, fontSize: 15.5, color: p.ink }}>{m.model}</Text>
-          {fastest ? <Pill text="最快" tone="good" /> : null}
+    <View
+      style={{
+        backgroundColor: isMain ? p.accentContainer : "transparent",
+        paddingHorizontal: space.md,
+        paddingVertical: 10,
+      }}
+    >
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 9, minHeight: 38 }}>
+        <View
+          style={{
+            width: 22,
+            height: 22,
+            borderRadius: 7,
+            alignItems: "center",
+            justifyContent: "center",
+            backgroundColor: isMain ? p.primary : p.surface2,
+            borderWidth: isMain ? 0 : 1,
+            borderColor: p.divider,
+          }}
+        >
+          <Text
+            style={{
+              color: isMain ? p.onPrimary : p.faint,
+              fontFamily: isMain ? fonts.bodyBold : fonts.mono,
+              fontSize: 11,
+            }}
+          >
+            {isMain ? "主" : i + 1}
+          </Text>
         </View>
-        <Text numberOfLines={1} style={{ color: provider ? p.muted : p.error, fontSize: 12.5 }}>
-          {role} · {from}
-        </Text>
-        <TestLine test={test} />
-      </Pressable>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+
+        <ModelBrandIcon
+          model={m.model}
+          provider={provider ? providerName(provider) : m.provider}
+          size={16}
+          color={isMain ? p.accentText : p.ink}
+        />
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${isMain ? "主模型" : `第 ${i + 1} 备用`}：${m.model}，${from}`}
+          disabled={editing || isMain || busy}
+          onPress={onMakeMain}
+          style={({ pressed }) => ({ flex: 1, minWidth: 0, gap: 2, opacity: pressed ? 0.65 : 1 })}
+        >
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <Text
+              numberOfLines={1}
+              style={{
+                flexShrink: 1,
+                fontFamily: fonts.mono,
+                fontSize: 13,
+                fontWeight: isMain ? "700" : "600",
+                color: isMain ? p.accentText : p.ink,
+              }}
+            >
+              {m.model}
+            </Text>
+            {fastest ? <Pill text="最快" tone="good" /> : null}
+          </View>
+          <Text numberOfLines={1} style={{ color: provider ? p.faint : p.error, fontSize: 11.5 }}>
+            {from}
+          </Text>
+        </Pressable>
+
         {editing ? (
-          <>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
             <RowAction icon="arrow-up" a11y={`${m.model} 上移`} disabled={busy || i === 0} onPress={onUp} />
             <RowAction icon="arrow-down" a11y={`${m.model} 下移`} disabled={busy || i === count - 1} onPress={onDown} />
             <RowAction icon="close" danger a11y={`去掉 ${m.model}`} disabled={busy || count === 1} onPress={onRemove} />
-          </>
-        ) : i > 0 ? (
-          <PocketButton size="sm" variant="soft" disabled={busy} onPress={onMakeMain} a11y={`把 ${m.model} 设为主模型`}>
-            设为主
-          </PocketButton>
-        ) : null}
+          </View>
+        ) : (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`测速 ${m.model}`}
+              disabled={test?.running}
+              onPress={onTest}
+              style={({ pressed }) => ({
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 3,
+                minHeight: 28,
+                paddingHorizontal: 8,
+                borderRadius: radius.pill,
+                borderWidth: 1,
+                borderColor: failed ? p.error : msVal != null ? good.fg : p.divider,
+                backgroundColor: failed ? p.errorContainer : msVal != null ? good.bg : p.surface,
+                opacity: pressed ? 0.65 : 1,
+              })}
+            >
+              {test?.running ? (
+                <PocketSpinner size={11} />
+              ) : failed ? (
+                <MaterialCommunityIcons name="alert-circle-outline" size={12} color={p.error} />
+              ) : msVal != null ? (
+                <MaterialCommunityIcons name="lightning-bolt" size={12} color={good.fg} />
+              ) : (
+                <MaterialCommunityIcons name="speedometer" size={12} color={p.faint} />
+              )}
+              <Text
+                numberOfLines={1}
+                style={{
+                  fontFamily: msVal != null ? fonts.mono : fonts.bodySemi,
+                  fontSize: 11,
+                  color: failed ? p.error : msVal != null ? good.fg : p.muted,
+                  maxWidth: 74,
+                }}
+              >
+                {test?.running ? "测速" : failed ? failed.title : msVal != null ? `${(msVal / 1000).toFixed(2)}s` : "测速"}
+              </Text>
+            </Pressable>
+            {isMain ? (
+              <MaterialCommunityIcons name="check" size={16} color={p.accentText} />
+            ) : (
+              <PocketButton size="sm" variant="soft" disabled={busy} onPress={onMakeMain} a11y={`把 ${m.model} 设为主模型`}>
+                设为主
+              </PocketButton>
+            )}
+          </View>
+        )}
       </View>
+      {failed?.detail ? (
+        <Text numberOfLines={2} style={{ color: p.error, fontSize: 11.5, marginTop: 4, paddingLeft: 31 }}>
+          {failed.detail}
+        </Text>
+      ) : null}
     </View>
   );
 }
@@ -404,44 +480,5 @@ function ProviderRow({ x, used }: { x: ProviderView; used: number }) {
         {x.baseUrl || "还没有地址"}
       </Text>
     </Row>
-  );
-}
-
-/** The last test: first word prominently, then the whole answer; or, in plain words, why it failed. */
-function TestLine({ test }: { test: ModelTest | undefined }) {
-  const p = usePalette();
-  if (!test) return <Text style={{ color: p.faint, fontSize: 12.5, lineHeight: 19 }}>点一下测测速度</Text>;
-  if (test.running) {
-    return (
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 6, minHeight: 19 }}>
-        <PocketSpinner size={12} />
-        <Text style={{ color: p.muted, fontSize: 12.5 }}>正在测…</Text>
-      </View>
-    );
-  }
-  if (!test.ok) {
-    const e = modelErrorText(test.error);
-    return (
-      <View accessibilityLabel={`没通：${e.title}`} style={{ flexDirection: "row", alignItems: "flex-start", gap: 4 }}>
-        <MaterialCommunityIcons name="alert-circle-outline" size={15} color={p.error} style={{ marginTop: 2 }} />
-        <View style={{ flex: 1, gap: 1 }}>
-          <Text style={{ color: p.error, fontFamily: fonts.bodyBold, fontSize: 13, lineHeight: 19 }}>没通：{e.title}</Text>
-          {e.detail ? (
-            <Text numberOfLines={2} style={{ color: p.faint, fontSize: 11.5, lineHeight: 16 }}>
-              {e.detail}
-            </Text>
-          ) : null}
-        </View>
-      </View>
-    );
-  }
-  const good = statusColors("working", p.dark).fg;
-  const [first, ...rest] = speedLine(test).split(" · ");
-  return (
-    <View accessibilityLabel={speedLine(test) || "通了"} style={{ flexDirection: "row", alignItems: "center", gap: 3, flexWrap: "wrap" }}>
-      <MaterialCommunityIcons name="lightning-bolt" size={15} color={good} />
-      <Text style={{ color: good, fontFamily: fonts.bodyBold, fontSize: 14 }}>{first || "通了"}</Text>
-      {rest.length ? <Text style={{ color: p.muted, fontSize: 12.5 }}> · {rest.join(" · ")}</Text> : null}
-    </View>
   );
 }

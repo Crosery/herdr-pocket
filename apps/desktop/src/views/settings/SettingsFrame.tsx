@@ -13,6 +13,7 @@ import {
   Palette,
   RefreshCw,
   ScrollText,
+  Search,
   Server,
   Shield,
   Sparkles,
@@ -45,27 +46,39 @@ export interface SettingsFrameProps {
   onReopenGuide: () => void;
 }
 
-type Item = { id: FrameSection; title: string; icon: ComponentType<{ size?: number }> };
+type Item = { id: FrameSection; title: string; subtitle: string; keys: string; icon: ComponentType<{ size?: number }> };
 
-/** Herdr's sections first, then ours (docs/design/desktop-v2.md, "设置"). */
-const HERDR_ORDER: Item[] = [
-  { id: "look", title: "外观", icon: Palette },
-  { id: "keyboard", title: "键盘", icon: Keyboard },
-  { id: "machines", title: "电脑与中继", icon: Server },
-  { id: "alerts", title: "提醒", icon: Bell },
-  { id: "updates", title: "更新", icon: RefreshCw },
-  { id: "privacy", title: "隐私", icon: Shield },
+const NAV_GROUPS: Array<{ label: string; items: Item[] }> = [
+  {
+    label: "基础",
+    items: [
+      { id: "look", title: "外观", subtitle: "主题、字号、对话密度与侧边栏样式", keys: "主题 浅色 暗色 字号 字体 终端 侧边栏 小窗 theme font", icon: Palette },
+      { id: "keyboard", title: "键盘", subtitle: "全局快捷键与操作热键", keys: "快捷键 热键 shortcut keybind", icon: Keyboard },
+      { id: "machines", title: "电脑与中继", subtitle: "本机服务、远程桌面、手机配对与空间同步", keys: "主机 设备 扫码 空间同步 迁移 中转 服务器 relay host", icon: Server },
+      { id: "alerts", title: "提醒", subtitle: "桌面通知与任务完成提示音", keys: "通知 提示音 静音 alert sound", icon: Bell },
+      { id: "updates", title: "更新", subtitle: "桌面端与本机工具版本检查", keys: "版本 镜像 组件 升级 update", icon: RefreshCw },
+      { id: "privacy", title: "隐私", subtitle: "系统权限与本地数据边界", keys: "权限 脱敏 隐私 privacy", icon: Shield },
+    ],
+  },
+  {
+    label: "小羊与扩展",
+    items: [
+      { id: "voice", title: "语音唤醒与声纹", subtitle: "本地降噪、人声增强、声纹过滤与实时试听", keys: "降噪 主动降噪 人声 响度 清晰度 声纹 耳返 试听 过滤 通话 voice", icon: Mic },
+      { id: "assistant", title: "小羊助理", subtitle: "多端同步，模型、服务商与提示词改完即时生效", keys: "文字模型 服务商 扫描 音色 提示词 assistant model provider", icon: Sparkles },
+      { id: "plugins", title: "插件中心", subtitle: "按需开启的浏览器、Webhook 与巡检能力", keys: "浏览器 Webhook 巡检 plugin", icon: Blocks },
+    ],
+  },
+  {
+    label: "系统",
+    items: [
+      { id: "browser", title: "浏览器与文件", subtitle: "内置浏览器主页、Cookie 导入与文件树选项", keys: "主页 Cookie 隐藏文件 browser", icon: AppWindow },
+      { id: "performance", title: "性能与资源", subtitle: "内存占用、帧率与省电策略", keys: "省电 内存 CPU 缓存 perf", icon: Cpu },
+      { id: "logs", title: "日志与诊断", subtitle: "客户端与中继运行日志排查", keys: "导出 服务器日志 诊断 log", icon: ScrollText },
+      { id: "about", title: "关于", subtitle: "版本信息、配置路径与新手引导", keys: "版本 配置文件 新手引导 about", icon: Info },
+    ],
+  },
 ];
-const OURS: Item[] = [
-  { id: "voice", title: "语音唤醒与声纹", icon: Mic },
-  { id: "assistant", title: "小羊助理", icon: Sparkles },
-  { id: "plugins", title: "插件中心", icon: Blocks },
-  { id: "browser", title: "浏览器与文件", icon: AppWindow },
-  { id: "performance", title: "性能与资源", icon: Cpu },
-  { id: "logs", title: "日志与诊断", icon: ScrollText },
-  { id: "about", title: "关于", icon: Info },
-];
-const ALL = [...HERDR_ORDER, ...OURS];
+const ALL: Item[] = NAV_GROUPS.flatMap((g) => g.items);
 
 /**
  * Settings as a modal frame over the window, after Herdr's: a section list on the left, one
@@ -80,6 +93,7 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
   const navRef = useRef<HTMLElement>(null);
   // Kept while the frame is closed, so 小羊助理 reopens on the same sub-tab.
   const [assistantTab, setAssistantTab] = useState<AssistantTab>("models");
+  const [navQuery, setNavQuery] = useState("");
 
   // The built-in browser is a native view drawn above the page: it hides while this is open.
   useEffect(() => {
@@ -133,7 +147,7 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
         tabIndex={on ? 0 : -1}
         onClick={() => openSettingsFrame(s.id)}
       >
-        <Icon size={16} />
+        <Icon size={15} />
         <span className="grow truncate">{s.title}</span>
         {s.id === "updates" && updateReady ? <span className="sf-update-dot" aria-label="有新版本" /> : null}
       </button>
@@ -185,7 +199,20 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
     }
   })();
 
-  const title = ALL.find((s) => s.id === section)?.title ?? "设置";
+  const currentItem = ALL.find((s) => s.id === section);
+  const title = currentItem?.title ?? "设置";
+  const subtitle = currentItem?.subtitle ?? "";
+  const q = navQuery.trim().toLowerCase();
+  const filteredGroups = NAV_GROUPS.map((g) => ({
+    label: g.label,
+    items: g.items.filter(
+      (it) =>
+        !q ||
+        it.title.toLowerCase().includes(q) ||
+        it.subtitle.toLowerCase().includes(q) ||
+        it.keys.toLowerCase().includes(q),
+    ),
+  })).filter((g) => g.items.length > 0);
 
   return (
     <Dialog.Root open={open} onOpenChange={(v) => !v && closeSettingsFrame()}>
@@ -224,57 +251,69 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
         >
           <nav className="sf-nav" ref={navRef} aria-label="设置分类" onKeyDown={onNavKey}>
             <Dialog.Title className="sf-title">设置</Dialog.Title>
-            <div className="sf-nav-list">
-              {HERDR_ORDER.map(navButton)}
-              <div className="sf-nav-sep" role="separator" />
-              {OURS.map(navButton)}
+            <div className="sf-search-wrap">
+              <Search size={12} className="sf-search-ic" aria-hidden />
+              <input
+                type="text"
+                className="sf-search-input"
+                value={navQuery}
+                onChange={(e) => setNavQuery(e.target.value)}
+                placeholder="搜索设置…"
+                aria-label="搜索设置项"
+              />
             </div>
-            <button
-              type="button"
-              className="sf-outline-btn"
-              style={{ marginBottom: 6 }}
-              onClick={() => {
-                closeSettingsFrame();
-                openInteractiveTutorialReplay();
-              }}
-            >
-              <GraduationCap size={14} />
-              <span>重温新手引导</span>
-            </button>
-            <button className="sf-outline-btn" disabled={!native.available()} onClick={() => void exportDiagnostics()}>
-              <FileDown size={14} />
-              <span>导出诊断</span>
-            </button>
-          </nav>
-          <div className="sf-main" style={{ flexDirection: "column" }}>
-            <div
-              style={{
-                flex: "0 0 auto",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 12,
-                padding: "10px 14px 10px 28px",
-                borderBottom: "1px solid var(--divider)",
-                background: "var(--surface)",
-              }}
-            >
-              <span
-                style={{
-                  fontSize: "calc(14px * var(--ts, 1))",
-                  fontWeight: 700,
-                  lineHeight: 1.4,
-                  color: "var(--ink)",
+            <div className="sf-nav-list">
+              {filteredGroups.length ? (
+                filteredGroups.map((g, gi) => (
+                  <div key={g.label} className="sf-nav-group">
+                    {gi > 0 ? <div className="sf-nav-sep" role="separator" /> : null}
+                    <div className="sf-nav-group-label">{g.label}</div>
+                    {g.items.map(navButton)}
+                  </div>
+                ))
+              ) : (
+                <div className="faint" style={{ padding: "10px 8px", fontSize: 12 }}>
+                  未找到匹配项
+                </div>
+              )}
+            </div>
+            <div className="sf-nav-footer">
+              <button
+                type="button"
+                className="sf-outline-btn"
+                title="重温新手引导"
+                onClick={() => {
+                  closeSettingsFrame();
+                  openInteractiveTutorialReplay();
                 }}
               >
-                {title}
-              </span>
+                <GraduationCap size={13} />
+                <span>引导</span>
+              </button>
+              <button
+                type="button"
+                className="sf-outline-btn"
+                title="导出诊断信息"
+                disabled={!native.available()}
+                onClick={() => void exportDiagnostics()}
+              >
+                <FileDown size={13} />
+                <span>诊断</span>
+              </button>
+            </div>
+          </nav>
+          <div className="sf-main" style={{ flexDirection: "column" }}>
+            <div className="sf-main-head">
+              <div className="sf-main-head-left">
+                <span className="sf-main-head-title">{title}</span>
+                {subtitle ? <span className="sf-main-head-sub truncate">{subtitle}</span> : null}
+              </div>
               <Dialog.Close className="sf-close" aria-label="关闭设置" style={{ position: "static" }}>
                 <X size={15} />
               </Dialog.Close>
             </div>
-            <div className="sf-body" ref={bodyRef} role="region" aria-label={title} tabIndex={-1} style={{ minHeight: 0 }}>
-              <div className="sf-page" style={{ paddingTop: 18 }}>
+            <div className="sf-body tinted" ref={bodyRef} role="region" aria-label={title} tabIndex={-1} style={{ minHeight: 0 }}>
+              <div className="sf-page" style={{ paddingTop: 16 }}>
                 {pane}
               </div>
             </div>

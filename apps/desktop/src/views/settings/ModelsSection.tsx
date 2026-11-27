@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Check, CheckCircle2, Gauge, Loader2, Plus, Star, X, Zap } from "lucide-react";
+import { AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Check, CheckCircle2, Gauge, Loader2, Plus, Search, Star, X, Zap } from "lucide-react";
 import type { AssistantConfigView, ModelRef, ProviderView } from "@herdr-pocket/protocol";
 import { ModelBrandIcon } from "../../components/ModelBrandIcon";
-import { PocketBadge, PocketButton, PocketInput, useToast } from "../../components/PocketUI";
+import { PocketBadge, PocketButton, PocketCheckbox, PocketInput, useToast } from "../../components/PocketUI";
 import { fetchAssistantProviderModels, saveAssistantConfig } from "../../lib/assistant";
 import { modelErrorText } from "../../lib/modelErrors";
 import { answered, keyState, MAX_MODELS, modelKey, PROTOCOL_LABEL, providerName, speedLine, testModel, useModelTests, type ModelTest } from "./modelTests";
@@ -20,6 +20,7 @@ export function ModelsSection({ cfg }: { cfg: AssistantConfigView }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [filterQuery, setFilterQuery] = useState("");
   /** A fresh add panel each time it opens. */
   const [addKey, setAddKey] = useState(0);
   const [notice, setNotice] = useState<{ id: number; text: string; undo?: ModelRef[] } | null>(null);
@@ -105,9 +106,14 @@ export function ModelsSection({ cfg }: { cfg: AssistantConfigView }) {
       ) : null}
 
       <div className="mm-head">
-        <h3 id="mm-using" className="mm-head-title">
-          正在用
-        </h3>
+        <div className="row" style={{ gap: 8, minWidth: 0, flexWrap: "wrap" }}>
+          <h3 id="mm-using" className="mm-head-title">
+            正在用 · {models.length} / {MAX_MODELS}
+          </h3>
+          <span className="mm-note small">
+            {editing ? "上下调整顺延顺序，第 1 个为主模型" : "第 1 个为主模型，出错或沉默时按序顺延"}
+          </span>
+        </div>
         <div className="mm-head-actions">
           {editing ? null : (
             <PocketButton
@@ -135,35 +141,75 @@ export function ModelsSection({ cfg }: { cfg: AssistantConfigView }) {
               <span>{editing ? "完成" : "调整顺序"}</span>
             </PocketButton>
           ) : null}
+          {!editing ? (
+            <PocketButton
+              size="sm"
+              variant="primary"
+              disabled={full}
+              onClick={() => {
+                if (adding) {
+                  setAdding(false);
+                } else {
+                  setAddKey((n) => n + 1);
+                  setAdding(true);
+                }
+              }}
+            >
+              <Plus size={13} />
+              <span>{adding ? "收起添加" : "添加模型"}</span>
+            </PocketButton>
+          ) : null}
         </div>
       </div>
-      <p className="mm-note">
-        {editing
-          ? "用上下箭头排顺序，排第一的就是主模型；去掉后几秒内可以撤销。"
-          : "小羊从上往下用：第 1 个是主模型，它出错或一直不说话时换下一个。点一个模型，测测它多快开口。"}
-      </p>
 
-      <div className="mm-card">
+      <div className="xy-model-card">
+        {models.length >= 4 && !editing ? (
+          <div className="model-pop-search">
+            <Search size={13} className="model-pop-search-ic" />
+            <input
+              type="text"
+              className="model-pop-input mono"
+              value={filterQuery}
+              onChange={(e) => setFilterQuery(e.target.value)}
+              placeholder="筛选已配置模型或服务商…"
+              aria-label="筛选已配置模型"
+            />
+            <span className="faint" style={{ fontSize: 11, whiteSpace: "nowrap" }}>
+              点延迟徽标单测
+            </span>
+          </div>
+        ) : null}
         {models.length ? (
-          <ol className="mm-list">
-            {models.map((m, i) => (
-              <ModelRow
-                key={modelKey(m)}
-                m={m}
-                i={i}
-                count={models.length}
-                provider={providers.get(m.provider)}
-                test={tests[modelKey(m)]}
-                fastest={fastest?.i === i}
-                busy={busy}
-                editing={editing}
-                onTest={() => void testModel(m)}
-                onMakeMain={() => makeMain(i)}
-                onUp={() => move(i, -1)}
-                onDown={() => move(i, 1)}
-                onRemove={() => remove(i)}
-              />
-            ))}
+          <ol className="xy-model-list">
+            {models
+              .map((m, i) => ({ m, i, provider: providers.get(m.provider) }))
+              .filter(({ m, provider }) => {
+                const q = filterQuery.trim().toLowerCase();
+                if (!q) return true;
+                return (
+                  m.model.toLowerCase().includes(q) ||
+                  m.provider.toLowerCase().includes(q) ||
+                  (provider ? providerName(provider).toLowerCase().includes(q) : false)
+                );
+              })
+              .map(({ m, i, provider }) => (
+                <ModelRow
+                  key={modelKey(m)}
+                  m={m}
+                  i={i}
+                  count={models.length}
+                  provider={provider}
+                  test={tests[modelKey(m)]}
+                  fastest={fastest?.i === i}
+                  busy={busy}
+                  editing={editing}
+                  onTest={() => void testModel(m)}
+                  onMakeMain={() => makeMain(i)}
+                  onUp={() => move(i, -1)}
+                  onDown={() => move(i, 1)}
+                  onRemove={() => remove(i)}
+                />
+              ))}
           </ol>
         ) : (
           <div className="mm-empty">
@@ -171,7 +217,7 @@ export function ModelsSection({ cfg }: { cfg: AssistantConfigView }) {
             <span>先加一个服务商，再从它那里挑模型。</span>
           </div>
         )}
-        {editing ? null : adding ? (
+        {!editing && adding ? (
           <AddModelPanel
             key={addKey}
             cfg={cfg}
@@ -182,25 +228,7 @@ export function ModelsSection({ cfg }: { cfg: AssistantConfigView }) {
               void testModel(m);
             }}
           />
-        ) : (
-          <button
-            type="button"
-            className="mm-add-row"
-            disabled={full}
-            onClick={() => {
-              setAddKey((n) => n + 1);
-              setAdding(true);
-            }}
-          >
-            <span className="mm-add-icon">
-              <Plus size={17} />
-            </span>
-            <span className="mm-add-text">
-              <span className="mm-add-title">添加模型</span>
-              <span className="mm-add-sub">{full ? `最多 ${MAX_MODELS} 个，先去掉一个` : "从服务商那里挑一个，可以当备用或直接设为主模型"}</span>
-            </span>
-          </button>
-        )}
+        ) : null}
       </div>
 
       {notice ? (
@@ -247,17 +275,7 @@ export function ModelsSection({ cfg }: { cfg: AssistantConfigView }) {
   );
 }
 
-/** The order badge: a pink "主" for the main model, a soft number for each fallback, joined by a thin rail. */
-function OrderBadge({ i, count }: { i: number; count: number }) {
-  return (
-    <span className="mm-rail" aria-hidden="true">
-      <span className={`mm-rail-line${i ? "" : " none"}`} />
-      <span className={`mm-badge${i === 0 ? " main" : ""}`}>{i === 0 ? "主" : i + 1}</span>
-      <span className={`mm-rail-line${i < count - 1 ? "" : " none"}`} />
-    </span>
-  );
-}
-
+/** Compact Agent-style model row: order chip + brand icon + mono name + provider pill + speed pill + action. */
 function ModelRow({
   m,
   i,
@@ -287,43 +305,111 @@ function ModelRow({
   onDown: () => void;
   onRemove: () => void;
 }) {
-  // The badge carries the place in the order; the words only say main or fallback, so there is one numbering.
-  const role = i === 0 ? "主模型" : "备用";
-  const from = provider ? `${providerName(provider)} · ${PROTOCOL_LABEL[provider.protocol]}` : `服务商 ${m.provider} 不在了`;
+  const isMain = i === 0;
+  const from = provider ? `${providerName(provider)} · ${PROTOCOL_LABEL[provider.protocol]}` : `${m.provider} 不在了`;
+  const failedTitle = test && !test.running && !test.ok ? modelErrorText(test.error).title : null;
+  const msVal = test && !test.running && test.ok ? (test.firstMs ?? test.totalMs ?? null) : null;
+  const speedClass =
+    test?.running
+      ? ""
+      : failedTitle
+        ? "bad"
+        : msVal != null
+          ? msVal < 1000
+            ? "good"
+            : "warn"
+          : "idle";
+
   return (
-    <li className={`mm-row${i === 0 ? " main" : ""}`}>
-      <OrderBadge i={i} count={count} />
-      <button type="button" className="mm-row-main" onClick={onTest} disabled={test?.running} title="点一下测速度">
-        <span className="mm-sr">第 {i + 1} 个，</span>
-        <span className="mm-title">
-          <ModelBrandIcon model={m.model} provider={provider ? providerName(provider) : m.provider} size={15} />
-          <span className="mm-name">{m.model}</span>
+    <li className="xy-model-li">
+      <div
+        className={`xy-model-row${isMain ? " current" : ""}${!editing && !isMain ? " can-promote" : ""}`}
+        onClick={() => {
+          if (!editing && !isMain && !busy) onMakeMain();
+        }}
+      >
+        <span className="xy-order-chip" aria-label={isMain ? "主模型" : `第 ${i + 1} 备用`}>
+          {isMain ? "主" : i + 1}
+        </span>
+        <ModelBrandIcon model={m.model} provider={provider ? providerName(provider) : m.provider} size={15} />
+        <span className="xy-model-name" title={m.model}>
+          {m.model}
+        </span>
+        <span className="xy-model-meta">
+          <span className={`model-pop-badge${provider ? "" : " gone"}`}>{from}</span>
           {fastest ? <PocketBadge tone="mint">最快</PocketBadge> : null}
+          {editing ? (
+            <>
+              <button type="button" className="mm-icon-btn" aria-label={`${m.model} 上移`} disabled={busy || i === 0} onClick={(e) => (e.stopPropagation(), onUp())}>
+                <ArrowUp size={13} />
+              </button>
+              <button type="button" className="mm-icon-btn" aria-label={`${m.model} 下移`} disabled={busy || i === count - 1} onClick={(e) => (e.stopPropagation(), onDown())}>
+                <ArrowDown size={13} />
+              </button>
+              <button type="button" className="mm-icon-btn danger" aria-label={`去掉 ${m.model}`} disabled={busy || count === 1} onClick={(e) => (e.stopPropagation(), onRemove())}>
+                <X size={13} />
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className={`xy-speed-pill ${speedClass}`}
+                disabled={test?.running}
+                aria-label={`测速 ${m.model}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onTest();
+                }}
+              >
+                {test?.running ? (
+                  <>
+                    <Loader2 size={11} className="mm-spin" />
+                    <span>测速中</span>
+                  </>
+                ) : failedTitle ? (
+                  <>
+                    <AlertCircle size={11} />
+                    <span className="truncate" style={{ maxWidth: 86 }}>{failedTitle}</span>
+                  </>
+                ) : msVal != null ? (
+                  <>
+                    {msVal <= 650 ? <Zap size={11} /> : null}
+                    <span>{(msVal / 1000).toFixed(2)}s</span>
+                  </>
+                ) : (
+                  <>
+                    <Gauge size={11} />
+                    <span>测速</span>
+                  </>
+                )}
+              </button>
+              {isMain ? (
+                <span className="xy-main-pill">
+                  <span>主模型</span>
+                  <Check size={12} />
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="xy-set-main-btn"
+                  disabled={busy}
+                  aria-label={`把 ${m.model} 设为主模型`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onMakeMain();
+                  }}
+                >
+                  设为主
+                </button>
+              )}
+            </>
+          )}
         </span>
-        <span className={`mm-sub${provider ? "" : " gone"}`}>
-          {role} · {from}
-        </span>
-        <TestLine test={test} />
-      </button>
-      <div className="mm-actions">
-        {editing ? (
-          <>
-            <button type="button" className="mm-icon-btn" aria-label={`${m.model} 上移`} disabled={busy || i === 0} onClick={onUp}>
-              <ArrowUp size={15} />
-            </button>
-            <button type="button" className="mm-icon-btn" aria-label={`${m.model} 下移`} disabled={busy || i === count - 1} onClick={onDown}>
-              <ArrowDown size={15} />
-            </button>
-            <button type="button" className="mm-icon-btn danger" aria-label={`去掉 ${m.model}`} disabled={busy || count === 1} onClick={onRemove}>
-              <X size={15} />
-            </button>
-          </>
-        ) : i > 0 ? (
-          <PocketButton size="sm" variant="soft" disabled={busy} onClick={onMakeMain} aria-label={`把 ${m.model} 设为主模型`}>
-            设为主
-          </PocketButton>
-        ) : null}
       </div>
+      {failedTitle && test && !test.running && !test.ok && modelErrorText(test.error).detail ? (
+        <div className="xy-model-err">{modelErrorText(test.error).detail}</div>
+      ) : null}
     </li>
   );
 }
@@ -361,10 +447,8 @@ export function TestLine({ test }: { test: ModelTest | undefined }) {
   );
 }
 
-const SHOWN = 30;
-
 /**
- * 添加模型, inline under the list (no dialog): pick a provider, type a model name or click
+ * 添加模型, inline under the list (no dialog): pick a provider, type a model name or check
  * one it lists, say whether it is a fallback (goes last) or the new main model.
  */
 function AddModelPanel({ cfg, onClose, onAdded }: { cfg: AssistantConfigView; onClose: () => void; onAdded: (m: ModelRef, asMain: boolean) => void }) {
@@ -513,29 +597,34 @@ function AddModelPanel({ cfg, onClose, onAdded }: { cfg: AssistantConfigView; on
           ) : !matches.length ? (
             <div className="mm-field-hint">列表里没有名字里带“{name}”的，照你填的加也行。</div>
           ) : (
-            <div className="mm-pick-list" role="radiogroup" aria-label="它列出的模型">
-              {matches.slice(0, SHOWN).map((n) => {
+            <div className="mm-pick-list xy-scan-list" role="radiogroup" aria-label="它列出的模型">
+              {matches.map((n) => {
                 const inUse = used.has(modelKey({ provider, model: n }));
                 const on = name === n;
                 return (
-                  <button
+                  <div
                     key={n}
-                    type="button"
-                    role="radio"
-                    aria-checked={on}
-                    disabled={inUse}
-                    className={`mm-pick${on ? " on" : ""}`}
-                    onClick={() => setModel(n)}
+                    className={`mm-pick xy-scan-row${on ? " on" : ""}${inUse ? " in-use" : ""}`}
+                    onClick={() => {
+                      if (!inUse) setModel(n);
+                    }}
                   >
+                    <PocketCheckbox
+                      checked={inUse || on}
+                      disabled={inUse}
+                      ariaLabel={inUse ? `${n} 已在使用中` : `选择模型 ${n}`}
+                      onCheckedChange={() => {
+                        if (!inUse) setModel(n);
+                      }}
+                    />
                     <ModelBrandIcon model={n} provider={provider} size={14} />
                     <span className="mm-pick-name">{n}</span>
-                    {inUse ? <span className="mm-pick-tag">在用</span> : on ? <CheckCircle2 size={16} /> : null}
-                  </button>
+                    {inUse ? <span className="mm-pick-tag">在用</span> : null}
+                  </div>
                 );
               })}
             </div>
           )}
-          {matches.length > SHOWN ? <div className="mm-field-hint">还有 {matches.length - SHOWN} 个，在上面输入几个字筛一下</div> : null}
         </div>
       ) : null}
 

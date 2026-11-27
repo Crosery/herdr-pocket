@@ -706,9 +706,13 @@ test("terminal stability and pane-header hover guards cap WebGL contexts and avo
   const paneRightEnd = shellWork.indexOf("<div className=\"v3-pane-actions\">", paneRightIdx);
   const paneRightSlice = shellWork.slice(paneRightIdx, paneRightEnd);
   const statusIdx = paneRightSlice.indexOf("<StatusMark");
-  const subTriggerIdx = paneRightSlice.indexOf("<SubagentCatalogTrigger");
+  const instTriggerIdx = paneRightSlice.indexOf("<InstanceRuntimePopover");
   assert.equal(statusIdx, -1, "PaneHead must omit redundant StatusMark text when online");
-  assert.ok(subTriggerIdx >= 0, "SubagentCatalogTrigger must stay rendered in PaneHead");
+  assert.ok(instTriggerIdx >= 0, "InstanceRuntimePopover must stay rendered in PaneHead");
+  const instSrc = readFileSync(resolve(testDir, "../src/components/InstanceRuntimePopover.tsx"), "utf8");
+  assert.equal(instSrc.includes("<Bot "), true, "InstanceRuntimePopover must use Bot icon for subagents");
+  assert.equal(instSrc.includes("<Radio "), true, "InstanceRuntimePopover must use Radio icon for listening ports");
+  assert.equal(instSrc.includes("GitBranch"), false, "InstanceRuntimePopover must not use GitBranch for subagents");
 
   const mockSrc = readFileSync(resolve(testDir, "../src/lib/mock.ts"), "utf8");
   assert.equal(mockSrc.includes('method === "agent.seen"'), true, "desktop mock mode should handle agent.seen done->idle transition");

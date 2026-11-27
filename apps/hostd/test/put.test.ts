@@ -100,6 +100,38 @@ test("splitFiles and sameMessage strip harness image marks without losing words 
   assert.equal(sameMessage("", "", true), false);
   assert.equal(sameMessage("测试完了再提交， 别直接推", "测试完了再提交，别直接推"), true);
   assert.equal(sameMessage("[Image #1]别的文字\n[image]", "图片里面有什么", true), false);
+
+  // Non-image trailing file attachments (txt/md/pdf/spaces/tilde/Windows/@-prefixed/quoted) must also split & match.
+  assert.deepEqual(splitFiles("请整理纪要：\n1. 总结\n/Users/me/Downloads/会议记录 (1).txt"), {
+    text: "请整理纪要：\n1. 总结",
+    lines: ["/Users/me/Downloads/会议记录 (1).txt"],
+    count: 1,
+  });
+  assert.deepEqual(splitFiles("看看这两份文档\n~/Downloads/spec.md\nC:\\Users\\me\\report.pdf"), {
+    text: "看看这两份文档",
+    lines: ["~/Downloads/spec.md", "C:\\Users\\me\\report.pdf"],
+    count: 2,
+  });
+  assert.equal(
+    sameMessage("请整理纪要：\n1. 总结\n/Users/me/Downloads/会议记录 (1).txt", "请整理纪要：\n1. 总结", true),
+    true,
+  );
+  assert.equal(
+    sameMessage("请整理纪要\n@/Users/me/Downloads/会议记录 (1).txt", "请整理纪要", true),
+    true,
+  );
+  // Slash commands, protocol-relative URLs, and shell commands with flags must NOT be stripped as attachments.
+  assert.deepEqual(splitFiles("/compact"), { text: "/compact", lines: [], count: 0 });
+  assert.deepEqual(splitFiles("/model anthropic/claude-sonnet-4"), {
+    text: "/model anthropic/claude-sonnet-4",
+    lines: [],
+    count: 0,
+  });
+  assert.deepEqual(splitFiles("运行命令\n/usr/bin/node index.js --port 3000"), {
+    text: "运行命令\n/usr/bin/node index.js --port 3000",
+    lines: [],
+    count: 0,
+  });
 });
 
 test("putThrough hands over an owner-only temporary copy and removes it afterwards", async () => {

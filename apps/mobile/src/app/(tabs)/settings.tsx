@@ -9,7 +9,7 @@ import { PROTOCOL_VERSION, type PortalDisplayMode } from "@herdr-pocket/protocol
 import { Card, PageBackground, PageTitle, SectionHeader } from "../../components/ui";
 import { Row, RowDivider as Divider, Toggle, type RowIcon as IconName } from "../../components/rows";
 import { ConfigSnackbar } from "../../components/configParts";
-import { PocketDialog, PocketProgress, PocketSegmented, PocketSpinner } from "../../components/pocket";
+import { PocketDialog, PocketProgress, PocketSpinner } from "../../components/pocket";
 import { HostToolsSheet } from "../../components/HostToolsSheet";
 import { Bow, Mascot } from "../../components/Mascot";
 import { useLive, useSettings, type ThemeMode } from "../../lib/store";
@@ -26,12 +26,9 @@ import { usePalette } from "../../theme/theme";
 import { fonts, radius, space } from "../../theme/tokens";
 
 const LINK_TEXT = { idle: "未连接", connecting: "连接中…", online: "已连接", offline: "断开了，重连中", unauthorized: "授权失效" } as const;
-const SCALES = [
-  { value: 0.85, label: "小", glyph: 13 },
-  { value: 1, label: "标准", glyph: 16 },
-  { value: 1.15, label: "大", glyph: 19 },
-  { value: 1.3, label: "特大", glyph: 22 },
-] as const;
+const SCALE_LABEL: Record<number, string> = { 0.85: "小", 1: "标准", 1.15: "大", 1.3: "特大" };
+const CHAT_MODE_LABEL = { compact: "精简", standard: "标准", expanded: "全展示" } as const;
+const PORTAL_MODE_LABEL: Record<PortalDisplayMode, string> = { collapsed: "默认收起", fan: "叠牌露头", tile: "平铺展开", cascade: "纵向叠列" };
 const THEMES: { value: ThemeMode; label: string }[] = [
   { value: "system", label: "跟随系统" },
   { value: "light", label: "浅色" },
@@ -141,13 +138,7 @@ export default function SettingsScreen() {
             <ThemeChoice />
           </Row>
           <Divider />
-          <Row icon="format-size" title="对话字号" sub="聊天和 agent 对话里文字的大小">
-            <TextScaleChoice />
-          </Row>
-          <Divider />
-          <ChatDisplayModeChoice />
-          <Divider />
-          <PortalDisplayModeChoice />
+          <DisplaySettingsEntryRow />
         </Card>
 
         <SectionHeader title="助理提醒" />
@@ -193,11 +184,6 @@ export default function SettingsScreen() {
 
         <SectionHeader title="通话声音" />
         <VoiceLocalCard demo={demo} />
-
-        <SectionHeader title="列表" />
-        <Card style={{ paddingVertical: space.xs }}>
-          <ShellsRow />
-        </Card>
 
         <SectionHeader title="连接" />
         <Card style={{ paddingVertical: space.xs }}>
@@ -270,98 +256,26 @@ function ThemeChoice() {
   );
 }
 
-const CHAT_MODE_OPTIONS = [
-  { value: "compact", label: "精简" },
-  { value: "standard", label: "标准" },
-  { value: "expanded", label: "全展示" },
-] as const;
-
-const CHAT_MODE_SUB = {
-  compact: "精简：把思考过程和连续工具折叠为一条",
-  standard: "标准：文字思考独立成块，连续工具归到同一个标签",
-  expanded: "全展示：独立展示每次思考与各个工具调用",
-} as const;
-
-function ChatDisplayModeChoice() {
-  const mode = useSettings((x) => x.chatDisplayMode);
-  const set = useSettings((x) => x.set);
-  return (
-    <Row icon="view-agenda-outline" title="对话展示模式" sub={CHAT_MODE_SUB[mode]}>
-      <View style={{ paddingTop: space.sm }}>
-        <PocketSegmented
-          compact
-          segments={CHAT_MODE_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
-          value={mode}
-          onChange={(v) => set({ chatDisplayMode: v as "compact" | "standard" | "expanded" })}
-        />
-      </View>
-    </Row>
-  );
-}
-
-const PORTAL_MODE_OPTIONS = [
-  { value: "collapsed", label: "默认收起" },
-  { value: "fan", label: "叠牌露头" },
-  { value: "tile", label: "平铺展开" },
-  { value: "cascade", label: "纵向叠列" },
-] as const;
-
-const PORTAL_MODE_SUB: Record<PortalDisplayMode, string> = {
-  collapsed: "收起为右上角紧凑胶囊，不遮挡对话文字",
-  fan: "默认展开跨端小窗（桌面端呈 1·2·3·4 叠牌露头）",
-  tile: "默认展开跨端小窗（桌面端两列平铺预览）",
-  cascade: "默认展开跨端小窗（桌面端纵向叠列）",
-};
-
-function PortalDisplayModeChoice() {
-  const mode = useSettings((x) => x.portalDisplayMode);
-  const set = useSettings((x) => x.set);
-  return (
-    <Row icon="dock-window" title="跨端小窗默认显示" sub={PORTAL_MODE_SUB[mode]}>
-      <View style={{ paddingTop: space.sm }}>
-        <PocketSegmented
-          compact
-          segments={PORTAL_MODE_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
-          value={mode}
-          onChange={(v) => set({ portalDisplayMode: v as PortalDisplayMode })}
-        />
-      </View>
-    </Row>
-  );
-}
-
-/** The four sizes and a sample bubble in the chosen one. */
-function TextScaleChoice() {
-  const p = usePalette();
-  const { width } = useWindowDimensions();
+function DisplaySettingsEntryRow() {
   const textScale = useSettings((x) => x.textScale);
-  const set = useSettings((x) => x.set);
+  const chatDisplayMode = useSettings((x) => x.chatDisplayMode);
+  const portalDisplayMode = useSettings((x) => x.portalDisplayMode);
+  const showShells = useSettings((x) => x.showShells);
+  const summary = [
+    `${SCALE_LABEL[textScale] ?? "标准"}字号`,
+    CHAT_MODE_LABEL[chatDisplayMode],
+    `小窗${PORTAL_MODE_LABEL[portalDisplayMode]}`,
+    showShells ? "含普通终端" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
-    <>
-      <View accessibilityRole="radiogroup" style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: width < 360 ? space.sm : space.md, paddingTop: space.md }}>
-        {SCALES.map((x) => {
-          const on = textScale === x.value;
-          return (
-            <Pressable
-              key={x.value}
-              accessibilityRole="radio"
-              accessibilityState={{ checked: on }}
-              accessibilityLabel={`字号${x.label}`}
-              onPress={() => set({ textScale: x.value })}
-              style={{ width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center", backgroundColor: on ? p.primary : p.surface3, borderWidth: on ? 0 : 1, borderColor: p.divider }}
-            >
-              <Text style={{ fontFamily: fonts.bodyBold, fontSize: x.glyph, lineHeight: x.glyph + 6, color: on ? p.onPrimary : p.muted }}>A</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-      <View style={{ flexDirection: "row", alignItems: "flex-end", gap: space.sm, paddingTop: space.md }}>
-        <Mascot size={30} />
-        <View style={{ flexShrink: 1, minWidth: 0, backgroundColor: p.surface3, borderRadius: radius.md, borderBottomLeftRadius: 5, paddingHorizontal: space.md, paddingVertical: 7 }}>
-          <Text style={{ color: p.ink, fontSize: 15.5 * textScale, lineHeight: 22 * textScale }}>迁移脚本跑完了，测试全过。</Text>
-        </View>
-      </View>
-    </>
+    <Row
+      icon="tune-variant"
+      title="显示与排版"
+      sub={summary}
+      onPress={() => router.push("/display-settings" as Href)}
+    />
   );
 }
 
@@ -437,19 +351,6 @@ function AlertsCard({ demo }: { demo: boolean }) {
         </>
       ) : null}
     </Card>
-  );
-}
-
-function ShellsRow() {
-  const showShells = useSettings((x) => x.showShells);
-  const set = useSettings((x) => x.set);
-  return (
-    <Row
-      icon="console-line"
-      title="显示普通终端"
-      sub="没在跑 agent 的 shell 窗口"
-      right={<Toggle label="显示普通终端" value={showShells} onChange={(v) => set({ showShells: v })} />}
-    />
   );
 }
 

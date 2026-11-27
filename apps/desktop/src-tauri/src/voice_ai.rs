@@ -6040,6 +6040,95 @@ impl Drop for LiveCallProcessor {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceAiPreviewResult {
+    pub pcm_base64: String,
+    pub sample_rate: u32,
+    pub duration_ms: u32,
+    pub process_ms: f64,
+    pub in_rms_db: f32,
+    pub out_rms_db: f32,
+    pub suppressed_ratio: f32,
+    pub used_dpdf: bool,
+    pub used_tse: bool,
+    pub sv_active: bool,
+}
+
+/// Runs an offline PCM16 mono 16kHz clip through the exact same `LiveCallProcessor`
+/// DSP/DPDFNet/VoxLock/Voiceprint chain used during real voice calls so users can
+/// hear real A/B before-and-after results immediately when toggling settings.
+pub fn preview_process_pcm_bytes(pcm_bytes: &[u8]) -> Result<VoiceAiPreviewResult, String> {
+    const MAX_BYTES: usize = VOICE_RATE * 2 * 12; // up to 12 seconds mono 16kHz PCM16
+    if pcm_bytes.len() < 640 {
+        return Err("音频样本太短，请至少录制 1 秒语音".into());
+    }
+    if pcm_bytes.len() > MAX_BYTES {
+        return Err("试听样本超过 12 秒上限".into());
+    }
+    let sample_count = pcm_bytes.len() / 2;
+    let mut samples = Vec::with_capacity(sample_count);
+    for chunk in pcm_bytes.chunks_exact(2) {
+        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+
+    let t0 = Instant::now();
+    let mut proc = LiveCallProcessor::new();
+    let used_dpdf = proc.denoiser.is_some();
+    let used_tse = proc.tse.is_some();
+    let sv_active = proc.has_sv;
+
+    let mut out_bytes = Vec::with_capacity(sample_count * 2);
+    let mut in_sq = 0.0f64;
+    let mut out_sq = 0.0f64;
+    let mut total_frames = 0u32;
+    let mut suppressed_frames = 0u32;
+
+    for frame in samples.chunks(320) {
+        total_frames += 1;
+        let mut padded = [0i16; 320];
+        padded[..frame.len()].copy_from_slice(frame);
+        for &s in frame {
+            let f = f64::from(s) / 32768.0;
+            in_sq += f * f;
+        }
+        let (out_frame, _) = proc.process_frame_320(&padded);
+        if proc.suppressing_residual {
+            suppressed_frames += 1;
+        }
+        for &s in &out_frame[..frame.len()] {
+            let f = f64::from(s) / 32768.0;
+            out_sq += f * f;
+            out_bytes.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+
+    let n = (sample_count as f64).max(1.0);
+    let in_rms = (in_sq / n).sqrt().max(1e-6);
+    let out_rms = (out_sq / n).sqrt().max(1e-6);
+    let in_rms_db = ((20.0 * in_rms.log10()) as f32 * 10.0).round() / 10.0;
+    let out_rms_db = ((20.0 * out_rms.log10()) as f32 * 10.0).round() / 10.0;
+    let suppressed_ratio = if total_frames > 0 {
+        ((suppressed_frames as f32 / total_frames as f32) * 1000.0).round() / 1000.0
+    } else {
+        0.0
+    };
+    let process_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+
+    Ok(VoiceAiPreviewResult {
+        pcm_base64: crate::local_term::base64_encode(&out_bytes),
+        sample_rate: VOICE_RATE as u32,
+        duration_ms: ((sample_count as u64 * 1000) / (VOICE_RATE as u64)) as u32,
+        process_ms,
+        in_rms_db,
+        out_rms_db,
+        suppressed_ratio,
+        used_dpdf,
+        used_tse,
+        sv_active,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Comprehensive unit tests
 // ---------------------------------------------------------------------------
@@ -6742,5 +6831,29 @@ mod tests {
             *guard = None;
         }
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn preview_process_pcm_bytes_returns_equal_length_pcm_and_metrics() {
+        // Reject too-short inputs cleanly.
+        assert!(preview_process_pcm_bytes(&[0u8; 100]).is_err());
+
+        // 0.2s mono 16kHz sine wave (3200 samples = 6400 bytes).
+        let sample_count = 3200usize;
+        let mut pcm = Vec::with_capacity(sample_count * 2);
+        for i in 0..sample_count {
+            let v = 0.25 * (2.0 * PI * 300.0 * (i as f64) / 16000.0).sin();
+            let s = (v * 32767.0) as i16;
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+        let res = preview_process_pcm_bytes(&pcm).expect("preview processing should succeed");
+        let decoded = crate::local_term::base64_decode(res.pcm_base64.as_bytes())
+            .expect("valid base64 output");
+        assert_eq!(decoded.len(), pcm.len());
+        assert_eq!(res.sample_rate, 16_000);
+        assert_eq!(res.duration_ms, 200);
+        assert!(res.in_rms_db > -25.0 && res.in_rms_db <= 0.0);
+        assert!(res.out_rms_db.is_finite());
+        assert!(res.suppressed_ratio >= 0.0 && res.suppressed_ratio <= 1.0);
     }
 }

@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Bot,
   Brain,
   ChevronDown,
   ChevronRight,
@@ -17,6 +18,7 @@ import {
   Paperclip,
   Pencil,
   Plus,
+  Radio,
   RefreshCw,
   ScreenShare,
   Search,
@@ -311,7 +313,29 @@ export function AgentRow({
         <div style={{ fontWeight: 800, fontSize: fs(14.5) }} className="truncate">
           {title}
         </div>
-        <div className="faint truncate">{sub}</div>
+        <div className="row" style={{ gap: 6, minWidth: 0, flexWrap: "nowrap" }}>
+          <span className="faint truncate" style={{ minWidth: 0 }}>{sub}</span>
+          {agent.listeningPorts?.length ? (
+            <span className="v3-port-chip mono" title={`监听端口 ${agent.listeningPorts.map((p) => `:${p.port}`).join("、")}`}>
+              <Radio size={9.5} aria-hidden />
+              <span>:{agent.listeningPorts[0]?.port}{agent.listeningPorts.length > 1 ? ` +${agent.listeningPorts.length - 1}` : ""}</span>
+            </span>
+          ) : null}
+          {agent.subagents ? (
+            <span
+              className="v3-port-chip"
+              style={{
+                background: "var(--lav-soft)",
+                borderColor: "color-mix(in srgb, var(--lavender) 35%, transparent)",
+                color: "var(--ink)",
+              }}
+              title={`${agent.subagents} 个子 Agent`}
+            >
+              <Bot size={9.5} aria-hidden />
+              <span className="num">{agent.subagents}</span>
+            </span>
+          ) : null}
+        </div>
       </div>
       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
         <PocketBadge tone={offline ? "neutral" : statusTone(agent.status)} pulse={!offline && (agent.status === "working" || agent.status === "blocked")}>

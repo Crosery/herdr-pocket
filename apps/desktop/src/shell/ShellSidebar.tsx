@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, ChevronRight, Columns2, Laptop, PanelLeft, Pencil, Plus, QrCode, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Terminal, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Columns2, Laptop, PanelLeft, Pencil, Plus, QrCode, Radio, Rows2, Search, Server, Settings, SquareArrowOutUpRight, Terminal, Trash2 } from "lucide-react";
 import type { Agent } from "@herdr-pocket/protocol";
 import { VendorIcon } from "../components/MascotAndVendor";
 import { PocketButton, PocketInput, PocketModal, overlayStore, useToast } from "../components/PocketUI";
@@ -260,7 +260,8 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
   const badge = !inCluster && showTopology && styleScheme !== "c" && placement ? formatTopologyBadge(placement) : null;
   const subLabel = inCluster && showTopology && placement?.isSplit ? `分屏格 ${placement.paneIndex}/${placement.paneCount}` : secondary;
   const showDeviceChip = !inCluster && Boolean(deviceChip);
-  const hasSubLine = Boolean(subLabel || showDeviceChip || badge || showGlyph);
+  const ports = agent.listeningPorts ?? [];
+  const hasSubLine = Boolean(subLabel || showDeviceChip || badge || showGlyph || ports.length > 0);
   const joinClass = showTopology && joinRole !== "single" ? ` ${joinRole}` : "";
   const splitPeerClass = showTopology && splitPeerHover ? " is-split-peer-hover" : "";
   return (
@@ -312,6 +313,15 @@ const SidebarAgentRow = memo(function SidebarAgentRow({
                     ) : null}
                     <span className="truncate">{subLabel}</span>
                   </>
+                ) : null}
+                {ports.length > 0 ? (
+                  <span
+                    className="v3-port-chip"
+                    title={`监听端口 ${ports.map((p) => `:${p.port}`).join("、")}`}
+                  >
+                    <Radio size={9.5} aria-hidden />
+                    <span>:{ports[0]!.port}{ports.length > 1 ? ` +${ports.length - 1}` : ""}</span>
+                  </span>
                 ) : null}
               </span>
               {showGlyph && placement ? (

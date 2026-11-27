@@ -757,6 +757,7 @@ pub fn run() {
             commands::voice_ai_enroll_from_pcm,
             commands::voice_ai_start_test,
             commands::voice_ai_stop_test,
+            commands::voice_ai_preview_process,
             browser::browser_open,
             browser::browser_set_bounds,
             browser::browser_navigate,

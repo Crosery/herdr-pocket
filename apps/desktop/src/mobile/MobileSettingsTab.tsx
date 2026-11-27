@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { ChevronLeft, ChevronRight, GraduationCap, Link2, LogOut, QrCode, RefreshCw, ScrollText, Sparkles } from "lucide-react";
+import { ChevronLeft, ChevronRight, GraduationCap, Link2, LogOut, Mic, QrCode, RefreshCw, ScrollText, Sliders, Sparkles } from "lucide-react";
 import type { PortalDisplayMode } from "@herdr-pocket/protocol";
 import { PROTOCOL_VERSION } from "@herdr-pocket/protocol";
 import { H5InstallAppCard } from "../components/H5InstallAppCard";
 import { XiaoyangOrb } from "../components/MascotAndVendor";
 import { PocketButton, PocketIconButton, PocketModal, PocketSwitch, fs } from "../components/PocketUI";
 import { openInteractiveTutorialReplay } from "../components/TutorialSandboxStage";
+import { VoiceInputSetup } from "../components/VoiceInput";
 import { serverLabel } from "../components/Sidebar";
 import { appVersion, isH5Web } from "../lib/bridge";
 import { signOut } from "../lib/relay";
@@ -15,7 +16,7 @@ import { AssistantSettings, type AssistantTab } from "../views/settings/Assistan
 import { LogsPane } from "../views/settings/LogsPane";
 import { UpdatesPane } from "../views/settings/Panes";
 
-type SubPane = "assistant" | "updates" | "logs" | null;
+type SubPane = "assistant" | "display" | "voice" | "updates" | "logs" | null;
 
 const LINK_LABELS: Record<string, string> = {
   idle: "未连接",
@@ -75,7 +76,15 @@ export function MobileSettingsTab({
 
   if (subPane) {
     const title =
-      subPane === "assistant" ? "小羊助理设置" : subPane === "updates" ? "组件与版本更新" : "运行日志与诊断";
+      subPane === "assistant"
+        ? "小羊助理设置"
+        : subPane === "display"
+          ? "显示与排版"
+          : subPane === "voice"
+            ? "降噪、声纹与试听"
+            : subPane === "updates"
+              ? "组件与版本更新"
+              : "运行日志与诊断";
     return (
       <div className="mp-detail-root">
         <div className="mp-detail-header">
@@ -88,6 +97,60 @@ export function MobileSettingsTab({
         </div>
         <div className="mp-scroll">
           {subPane === "assistant" ? <AssistantSettings subTab={assistantTab} onSubTab={setAssistantTab} /> : null}
+          {subPane === "voice" ? <VoiceInputSetup audioOnly /> : null}
+          {subPane === "display" ? (
+            <div className="mp-card stack" style={{ gap: 14 }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: fs(13.5), marginBottom: 8 }}>文字大小</div>
+                <div className="mp-scale-grid">
+                  {SCALES.map((sc) => {
+                    const active = Math.abs(textScale - sc.value) < 0.04;
+                    return (
+                      <button
+                        key={sc.value}
+                        type="button"
+                        className={`mp-scale-tile${active ? " active" : ""}`}
+                        onClick={() => updateSettings({ textScale: sc.value })}
+                      >
+                        <span style={{ fontSize: sc.glyph, fontWeight: 800, lineHeight: 1.1 }}>A</span>
+                        <span style={{ fontSize: 11.5, fontWeight: 700 }}>{sc.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <div style={{ fontWeight: 700, fontSize: fs(13.5), marginBottom: 8 }}>跨端小窗默认显示</div>
+                <div className="mp-seg" role="tablist" aria-label="跨端小窗默认显示">
+                  {PORTAL_MODES.map((m) => (
+                    <button
+                      key={m.value}
+                      type="button"
+                      role="tab"
+                      aria-selected={portalDisplayMode === m.value}
+                      className={`mp-seg-btn${portalDisplayMode === m.value ? " active" : ""}`}
+                      onClick={() => updateSettings({ portalDisplayMode: m.value })}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="between" style={{ paddingTop: 8, borderTop: "1px solid var(--mp-divider)" }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: fs(14) }}>显示普通终端</div>
+                  <div className="faint" style={{ fontSize: fs(12) }}>在 Agents 列表包含非 AI 的 Shell 终端</div>
+                </div>
+                <PocketSwitch
+                  checked={showShells}
+                  onCheckedChange={(v) => updateSettings({ showShells: v })}
+                  label="显示普通终端"
+                />
+              </div>
+            </div>
+          ) : null}
           {subPane === "updates" ? <UpdatesPane /> : null}
           {subPane === "logs" ? <LogsPane /> : null}
         </div>
@@ -96,6 +159,8 @@ export function MobileSettingsTab({
   }
 
   const dotColor = link === "online" ? "#3FB68B" : link === "connecting" ? "var(--mp-lavender)" : "var(--mp-error)";
+  const scaleLabel = SCALES.find((sc) => Math.abs(textScale - sc.value) < 0.04)?.label ?? "标准";
+  const portalLabel = PORTAL_MODES.find((m) => m.value === portalDisplayMode)?.label ?? "默认收起";
 
   return (
     <div className="mp-scroll">
@@ -130,26 +195,11 @@ export function MobileSettingsTab({
         </div>
       </div>
 
-      {/* Assistant Config */}
-      <div className="mp-section-head"><span>小羊助理</span></div>
-      <div className="mp-card-list">
-        <button type="button" className="mp-setting-row" onClick={() => openSubPane("assistant")}>
-          <div className="row" style={{ gap: 10 }}>
-            <Sparkles size={18} style={{ color: "var(--mp-accent-text)" }} />
-            <div>
-              <div style={{ fontWeight: 700, fontSize: fs(14.5) }}>模型、音色与提示词</div>
-              <div className="faint" style={{ fontSize: fs(12) }}>多端共享配置</div>
-            </div>
-          </div>
-          <ChevronRight size={16} className="faint" />
-        </button>
-      </div>
-
-      {/* Appearance */}
+      {/* Appearance & Display (streamlined: Theme stays inline, typography & portal live in subpage) */}
       <div className="mp-section-head"><span>外观与显示</span></div>
-      <div className="mp-card stack" style={{ gap: 12 }}>
-        <div>
-          <div style={{ fontWeight: 700, fontSize: fs(13.5), marginBottom: 8 }}>主题风格</div>
+      <div className="mp-card-list">
+        <div style={{ padding: "10px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ fontWeight: 700, fontSize: fs(13.5) }}>主题风格</div>
           <div className="mp-seg" role="tablist" aria-label="主题切换">
             {THEMES.map((t) => (
               <button
@@ -165,56 +215,46 @@ export function MobileSettingsTab({
             ))}
           </div>
         </div>
-
-        <div>
-          <div style={{ fontWeight: 700, fontSize: fs(13.5), marginBottom: 8 }}>文字大小</div>
-          <div className="mp-scale-grid">
-            {SCALES.map((sc) => {
-              const active = Math.abs(textScale - sc.value) < 0.04;
-              return (
-                <button
-                  key={sc.value}
-                  type="button"
-                  className={`mp-scale-tile${active ? " active" : ""}`}
-                  onClick={() => updateSettings({ textScale: sc.value })}
-                >
-                  <span style={{ fontSize: sc.glyph, fontWeight: 800, lineHeight: 1.1 }}>A</span>
-                  <span style={{ fontSize: 11.5, fontWeight: 700 }}>{sc.label}</span>
-                </button>
-              );
-            })}
+        <button
+          type="button"
+          className="mp-setting-row"
+          style={{ borderTop: "1px solid var(--mp-divider)" }}
+          onClick={() => openSubPane("display")}
+        >
+          <div className="row" style={{ gap: 10 }}>
+            <Sliders size={17} style={{ color: "var(--mp-lavender)" }} />
+            <div style={{ fontWeight: 700, fontSize: fs(14) }}>显示与排版</div>
           </div>
-        </div>
-
-        <div>
-          <div style={{ fontWeight: 700, fontSize: fs(13.5), marginBottom: 8 }}>跨端小窗默认显示</div>
-          <div className="mp-seg" role="tablist" aria-label="跨端小窗默认显示">
-            {PORTAL_MODES.map((m) => (
-              <button
-                key={m.value}
-                type="button"
-                role="tab"
-                aria-selected={portalDisplayMode === m.value}
-                className={`mp-seg-btn${portalDisplayMode === m.value ? " active" : ""}`}
-                onClick={() => updateSettings({ portalDisplayMode: m.value })}
-              >
-                {m.label}
-              </button>
-            ))}
+          <div className="row" style={{ gap: 4 }}>
+            <span className="faint" style={{ fontSize: fs(12) }}>{scaleLabel}字号 · {portalLabel}</span>
+            <ChevronRight size={16} className="faint" />
           </div>
-        </div>
+        </button>
+      </div>
 
-        <div className="between" style={{ paddingTop: 4, borderTop: "1px solid var(--mp-divider)" }}>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: fs(14) }}>显示普通终端</div>
-            <div className="faint" style={{ fontSize: fs(12) }}>在 Agents 列表包含非 AI 的 Shell 终端</div>
+      {/* Assistant & Voice */}
+      <div className="mp-section-head"><span>小羊与语音</span></div>
+      <div className="mp-card-list">
+        <button type="button" className="mp-setting-row" onClick={() => openSubPane("assistant")}>
+          <div className="row" style={{ gap: 10 }}>
+            <Sparkles size={17} style={{ color: "var(--mp-accent-text)" }} />
+            <div>
+              <div style={{ fontWeight: 700, fontSize: fs(14) }}>小羊助理</div>
+              <div className="faint" style={{ fontSize: fs(12) }}>文字模型、服务商、音色与提示词</div>
+            </div>
           </div>
-          <PocketSwitch
-            checked={showShells}
-            onCheckedChange={(v) => updateSettings({ showShells: v })}
-            label="显示普通终端"
-          />
-        </div>
+          <ChevronRight size={16} className="faint" />
+        </button>
+        <button type="button" className="mp-setting-row" onClick={() => openSubPane("voice")}>
+          <div className="row" style={{ gap: 10 }}>
+            <Mic size={17} style={{ color: "var(--mp-lavender)" }} />
+            <div>
+              <div style={{ fontWeight: 700, fontSize: fs(14) }}>降噪、声纹与试听</div>
+              <div className="faint" style={{ fontSize: fs(12) }}>支持实时耳返与 5 秒 A/B 对比</div>
+            </div>
+          </div>
+          <ChevronRight size={16} className="faint" />
+        </button>
       </div>
 
       {/* Components & Diagnostics */}

@@ -337,3 +337,77 @@ test("makeLlm falls back on HTTP 429 quota exhausted and skips cooled-down targe
     "/backup/v1/chat/completions",
   ]);
 });
+
+test("listModels: Anthropic Bearer fallback on 401 + has_more/after_id pagination", async () => {
+  seen.length = 0;
+  handler = (path, _body, res) => {
+    const req = seen.at(-1)!;
+    if (req.headers.authorization !== "Bearer k-gw") {
+      res.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ error: "bearer required" }));
+      return;
+    }
+    if (!path.includes("after_id=")) {
+      res.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify({
+          data: [{ id: "claude-opus-4-6" }, { id: "claude-sonnet-4-6" }],
+          has_more: true,
+          last_id: "claude-sonnet-4-6",
+        }),
+      );
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" }).end(
+      JSON.stringify({
+        data: [{ id: "claude-haiku-4-5" }],
+        has_more: false,
+      }),
+    );
+  };
+  const models = await listModels({
+    provider: "custom",
+    protocol: "anthropic",
+    baseUrl: `${base}/anth/v1`,
+    apiKey: "k-gw",
+    model: "",
+  });
+  assert.deepEqual(models, ["claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"]);
+  assert.equal(seen[0]!.headers["x-api-key"], "k-gw");
+  assert.equal(seen[1]!.headers.authorization, "Bearer k-gw");
+  assert.ok(seen[2]!.path.includes("after_id=claude-sonnet-4-6"));
+});
+
+test("listModels: Gemini nextPageToken pagination & OpenAI prefixed /v1 fallback beyond 500 models", async () => {
+  seen.length = 0;
+  handler = (path, _body, res) => {
+    if (path.startsWith("/g/v1beta/models")) {
+      if (!path.includes("pageToken=p2")) {
+        res.writeHead(200, { "content-type": "application/json" }).end(
+          JSON.stringify({ models: [{ name: "models/gemini-2.5-pro" }], nextPageToken: "p2" }),
+        );
+      } else {
+        res.writeHead(200, { "content-type": "application/json" }).end(
+          JSON.stringify({ models: [{ name: "models/gemini-2.5-flash" }] }),
+        );
+      }
+      return;
+    }
+    if (path === "/gw/models") {
+      res.writeHead(404).end("not found");
+      return;
+    }
+    if (path === "/gw/v1/models") {
+      const data = Array.from({ length: 620 }, (_, i) => ({ id: `model-${String(i).padStart(4, "0")}` }));
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ data }));
+      return;
+    }
+    res.writeHead(404).end();
+  };
+
+  const gem = await listModels({ provider: "gem", protocol: "gemini", baseUrl: `${base}/g`, apiKey: "k", model: "" });
+  assert.deepEqual(gem, ["gemini-2.5-flash", "gemini-2.5-pro"]);
+
+  const many = await listModels({ provider: "gw", protocol: "openai", baseUrl: `${base}/gw`, apiKey: "k", model: "" });
+  assert.equal(many.length, 620);
+  assert.equal(many[0], "model-0000");
+  assert.equal(many[619], "model-0619");
+});

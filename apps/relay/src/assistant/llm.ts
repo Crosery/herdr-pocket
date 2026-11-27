@@ -198,49 +198,200 @@ export function authHeaders(t: LlmTarget): Record<string, string> {
 
 async function fetchWithRootV1Fallback(url: string, base: string, suffix: string, init: RequestInit): Promise<Response> {
   const res = await fetch(url, init);
-  if (res.status === 404 && isRootPath(base)) {
+  if (res.status === 404 && (isRootPath(base) || !/\/v1(?:$|\/)/i.test(base))) {
     return fetch(`${base}/v1${suffix}`, init);
   }
   return res;
 }
 
-/** The model names a provider lists; empty when it lists none or throws on refusal. */
-export async function listModels(t: LlmTarget): Promise<string[]> {
-  const base = t.baseUrl.replace(/\/+$/, "");
-  const hdrs = { ...authHeaders(t), ...t.headers };
-  let res: Response;
-  if (t.protocol === "anthropic") {
-    res = await fetch(`${anthropicRoot(base)}/v1/models?limit=1000`, {
-      headers: { "anthropic-version": "2023-06-01", ...hdrs },
-      signal: AbortSignal.timeout(10_000),
-    });
-  } else if (t.protocol === "gemini") {
-    res = await fetch(`${geminiRoot(base)}/models?pageSize=1000`, {
-      headers: hdrs,
-      signal: AbortSignal.timeout(10_000),
-    });
-  } else if (t.protocol === "ollama") {
-    const oBase = ollamaRoot(base);
-    res = await fetch(`${oBase}/api/tags`, { headers: hdrs, signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) {
-      res = await fetch(`${oBase}/v1/models`, { headers: hdrs, signal: AbortSignal.timeout(10_000) });
-    }
-  } else {
-    res = await fetchWithRootV1Fallback(`${base}/models`, base, "/models", {
-      headers: hdrs,
-      signal: AbortSignal.timeout(10_000),
-    });
+const MAX_MODEL_PAGES = 20;
+const MAX_LISTED_MODELS = 5000;
+
+interface ParsedModelsPage {
+  ids: string[];
+  hasMore: boolean;
+  lastId?: string;
+  nextPageToken?: string;
+}
+
+function parseModelsBody(raw: unknown): ParsedModelsPage {
+  if (Array.isArray(raw)) {
+    const ids = raw
+      .map((m) => (typeof m === "string" ? m : typeof (m as { id?: unknown })?.id === "string" ? (m as { id: string }).id : typeof (m as { name?: unknown })?.name === "string" ? (m as { name: string }).name.replace(/^models\//, "") : ""))
+      .filter(Boolean);
+    return { ids, hasMore: false };
   }
-  if (!res.ok) throw new LlmError(`${t.provider}: HTTP ${res.status} ${scrub((await res.text().catch(() => "")).slice(0, 160), t.apiKey)}`);
-  const body = (await res.json().catch(() => ({}))) as {
-    data?: Array<{ id?: unknown }>;
+  const body = (raw && typeof raw === "object" ? raw : {}) as {
+    data?: unknown;
     models?: Array<{ id?: unknown; name?: unknown }>;
+    has_more?: unknown;
+    last_id?: unknown;
+    nextPageToken?: unknown;
   };
-  const fromData = (Array.isArray(body.data) ? body.data : []).map((m) => m?.id).filter((x): x is string => typeof x === "string" && !!x);
+  const dataArr = Array.isArray(body.data)
+    ? body.data
+    : body.data && typeof body.data === "object" && Array.isArray((body.data as { models?: unknown }).models)
+      ? ((body.data as { models: unknown[] }).models)
+      : [];
+  const fromData = dataArr
+    .map((m) => (typeof m === "string" ? m : typeof (m as { id?: unknown })?.id === "string" ? (m as { id: string }).id : typeof (m as { name?: unknown })?.name === "string" ? (m as { name: string }).name.replace(/^models\//, "") : ""))
+    .filter(Boolean);
   const fromModels = (Array.isArray(body.models) ? body.models : [])
     .map((m) => (typeof m?.name === "string" ? m.name.replace(/^models\//, "") : typeof m?.id === "string" ? m.id : ""))
     .filter(Boolean);
-  return [...new Set([...fromData, ...fromModels])].sort().slice(0, 500);
+  const ids = [...fromData, ...fromModels];
+  const lastId = typeof body.last_id === "string" && body.last_id ? body.last_id : ids.length ? ids[ids.length - 1] : undefined;
+  const nextPageToken = typeof body.nextPageToken === "string" && body.nextPageToken ? body.nextPageToken : undefined;
+  return {
+    ids,
+    hasMore: body.has_more === true,
+    lastId,
+    nextPageToken,
+  };
+}
+
+/** The model names a provider lists; follows pagination and auth/path fallbacks. */
+export async function listModels(t: LlmTarget): Promise<string[]> {
+  const base = t.baseUrl.replace(/\/+$/, "");
+  const collected = new Set<string>();
+  const collect = (ids: string[]) => {
+    for (const id of ids) {
+      if (collected.size < MAX_LISTED_MODELS) collected.add(id);
+    }
+  };
+
+  if (t.protocol === "anthropic") {
+    let activeHdrs: Record<string, string> = { "anthropic-version": "2023-06-01", ...authHeaders(t), ...t.headers };
+    let endpoint = `${anthropicRoot(base)}/v1/models`;
+    let useLimit = true;
+    let afterId: string | undefined;
+
+    for (let page = 0; page < MAX_MODEL_PAGES; page++) {
+      const qs = new URLSearchParams();
+      if (useLimit) qs.set("limit", "1000");
+      if (afterId) qs.set("after_id", afterId);
+      const url = qs.size ? `${endpoint}?${qs.toString()}` : endpoint;
+
+      let res = await fetch(url, { headers: activeHdrs, signal: AbortSignal.timeout(10_000) });
+
+      // Many third-party Anthropic-compatible gateways require Authorization: Bearer instead of x-api-key.
+      if (page === 0 && (res.status === 401 || res.status === 403) && !t.auth && t.apiKey) {
+        const bearerHdrs: Record<string, string> = {
+          "anthropic-version": "2023-06-01",
+          authorization: `Bearer ${t.apiKey}`,
+          ...t.headers,
+        };
+        const retry = await fetch(url, { headers: bearerHdrs, signal: AbortSignal.timeout(10_000) });
+        if (retry.ok || (retry.status !== 401 && retry.status !== 403)) {
+          activeHdrs = bearerHdrs;
+          res = retry;
+        }
+      }
+
+      // Some gateways reject ?limit=1000 with 400/422.
+      if (page === 0 && useLimit && (res.status === 400 || res.status === 422)) {
+        useLimit = false;
+        res = await fetch(endpoint, { headers: activeHdrs, signal: AbortSignal.timeout(10_000) });
+      }
+
+      // Custom prefixed base URLs that already serve /models directly without /v1.
+      if (page === 0 && res.status === 404 && endpoint !== `${base}/models`) {
+        endpoint = `${base}/models`;
+        const altUrl = useLimit ? `${endpoint}?limit=1000` : endpoint;
+        res = await fetch(altUrl, { headers: activeHdrs, signal: AbortSignal.timeout(10_000) });
+      }
+
+      if (!res.ok) {
+        if (page > 0 && collected.size > 0) break;
+        throw new LlmError(`${t.provider}: HTTP ${res.status} ${scrub((await res.text().catch(() => "")).slice(0, 160), t.apiKey)}`);
+      }
+      const parsed = parseModelsBody(await res.json().catch(() => ({})));
+      const before = collected.size;
+      collect(parsed.ids);
+      if (!parsed.hasMore || !parsed.lastId || parsed.lastId === afterId || collected.size === before || collected.size >= MAX_LISTED_MODELS) {
+        break;
+      }
+      afterId = parsed.lastId;
+    }
+    return [...collected].sort();
+  }
+
+  const hdrs = { ...authHeaders(t), ...t.headers };
+
+  if (t.protocol === "gemini") {
+    const root = geminiRoot(base);
+    let pageToken: string | undefined;
+    for (let page = 0; page < MAX_MODEL_PAGES; page++) {
+      const qs = new URLSearchParams({ pageSize: "1000" });
+      if (pageToken) qs.set("pageToken", pageToken);
+      const res = await fetch(`${root}/models?${qs.toString()}`, {
+        headers: hdrs,
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) {
+        if (page > 0 && collected.size > 0) break;
+        throw new LlmError(`${t.provider}: HTTP ${res.status} ${scrub((await res.text().catch(() => "")).slice(0, 160), t.apiKey)}`);
+      }
+      const parsed = parseModelsBody(await res.json().catch(() => ({})));
+      const before = collected.size;
+      collect(parsed.ids);
+      if (!parsed.nextPageToken || parsed.nextPageToken === pageToken || collected.size === before || collected.size >= MAX_LISTED_MODELS) {
+        break;
+      }
+      pageToken = parsed.nextPageToken;
+    }
+    return [...collected].sort();
+  }
+
+  if (t.protocol === "ollama") {
+    const oBase = ollamaRoot(base);
+    let res = await fetch(`${oBase}/api/tags`, { headers: hdrs, signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) {
+      res = await fetch(`${oBase}/v1/models`, { headers: hdrs, signal: AbortSignal.timeout(10_000) });
+    }
+    if (!res.ok) throw new LlmError(`${t.provider}: HTTP ${res.status} ${scrub((await res.text().catch(() => "")).slice(0, 160), t.apiKey)}`);
+    collect(parseModelsBody(await res.json().catch(() => ({}))).ids);
+    return [...collected].sort();
+  }
+
+  // OpenAI Chat / OpenAI Responses: support prefixed /v1 fallback and cursor pagination when exposed.
+  let endpoint = `${base}/models`;
+  let afterId: string | undefined;
+  for (let page = 0; page < MAX_MODEL_PAGES; page++) {
+    let res: Response;
+    if (page === 0) {
+      res = await fetchWithRootV1Fallback(endpoint, base, "/models", {
+        headers: hdrs,
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.url) {
+        try {
+          const resolved = new URL(res.url);
+          endpoint = `${resolved.origin}${resolved.pathname}`;
+        } catch {
+          // keep endpoint
+        }
+      }
+    } else {
+      const qs = new URLSearchParams({ after: afterId! });
+      res = await fetch(`${endpoint}?${qs.toString()}`, {
+        headers: hdrs,
+        signal: AbortSignal.timeout(10_000),
+      });
+    }
+    if (!res.ok) {
+      if (page > 0 && collected.size > 0) break;
+      throw new LlmError(`${t.provider}: HTTP ${res.status} ${scrub((await res.text().catch(() => "")).slice(0, 160), t.apiKey)}`);
+    }
+    const parsed = parseModelsBody(await res.json().catch(() => ({})));
+    const before = collected.size;
+    collect(parsed.ids);
+    if (!parsed.hasMore || !parsed.lastId || parsed.lastId === afterId || collected.size === before || collected.size >= MAX_LISTED_MODELS) {
+      break;
+    }
+    afterId = parsed.lastId;
+  }
+  return [...collected].sort();
 }
 
 /** What a protocol needs to know while a stream is read. */

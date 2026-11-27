@@ -1960,6 +1960,19 @@ pub async fn voice_ai_start_test(
 }
 
 #[tauri::command]
+pub async fn voice_ai_preview_process(
+    pcm_base64: String,
+) -> Result<crate::voice_ai::VoiceAiPreviewResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = crate::local_term::base64_decode(pcm_base64.as_bytes())
+            .ok_or_else(|| "音频数据编码无效".to_string())?;
+        crate::voice_ai::preview_process_pcm_bytes(&bytes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub fn voice_ai_stop_test() -> bool {
     crate::voice_ai::stop_test()
 }

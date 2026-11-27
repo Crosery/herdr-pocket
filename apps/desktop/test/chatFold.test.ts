@@ -479,3 +479,79 @@ test("chatQueueLogic & computeTurnTelemetry: attachment-only sends reconcile cle
   assert.equal(metrics.usedPct, 32.5);
   assert.equal(metrics.remainPct, 67.5);
 });
+
+test("reconcileOutgoingSends: non-image file attachments (absolute, relative, shell-escaped, ts=0) never leave duplicate bubbles", () => {
+  const promptText =
+    "这是会议纪要，需要处理以下事项：\n1. 总结纪要。\n2. 梳理逻辑。\n3. 确认待办。";
+  const absPath = "/Users/me/Downloads/新录音 (1).txt";
+
+  // 1. Absolute non-image .txt path echoed by Uniflo (exact reproduction of duplicate bubble bug)
+  const foldedAbs = foldConvEvents(
+    [
+      {
+        id: "u-abs",
+        session: "s1",
+        ts: 200_500,
+        kind: "user_message",
+        text: `${promptText}\n${absPath}`,
+      },
+    ],
+    "standard",
+  );
+  assert.equal(foldedAbs.length, 1);
+  assert.equal(foldedAbs[0]!.kind, "user");
+  if (foldedAbs[0]!.kind === "user") {
+    assert.equal(foldedAbs[0]!.text, promptText);
+    assert.deepEqual(foldedAbs[0]!.attachedLines, [absPath]);
+    assert.equal(foldedAbs[0]!.attachedCount, 1);
+  }
+  const sendAbs: OutgoingSendLike = {
+    id: "out-abs",
+    text: promptText,
+    attachedCount: 1,
+    uploadedPaths: [absPath],
+    ts: 200_000,
+    state: "sent",
+  };
+  const recAbs = reconcileOutgoingSends([sendAbs], foldedAbs, "working", 205_000);
+  assert.deepEqual(recAbs.matchedIds, ["out-abs"]);
+  assert.equal(recAbs.unmatched.length, 0);
+
+  // Even before uploadedPaths is stored on OutgoingSend (SSE echoes before terminal.send returns)
+  const sendBeforePaths: OutgoingSendLike = {
+    id: "out-race",
+    text: promptText,
+    attachedCount: 1,
+    ts: 200_000,
+    state: "sending",
+  };
+  const recRace = reconcileOutgoingSends([sendBeforePaths], foldedAbs, "working", 201_000);
+  assert.deepEqual(recRace.matchedIds, ["out-race"]);
+  assert.equal(recRace.unmatched.length, 0);
+
+  // 2. Relative cross-host dragged file path matched via uploadedPaths + ts=0 fallback
+  const relPath = "docs/spec.md";
+  const foldedRel = foldConvEvents(
+    [
+      {
+        id: "u-rel",
+        session: "s1",
+        ts: 0,
+        kind: "user_message",
+        text: `帮我看一下\n${relPath}`,
+      },
+    ],
+    "standard",
+  );
+  const sendRel: OutgoingSendLike = {
+    id: "out-rel",
+    text: "帮我看一下",
+    attachedCount: 1,
+    uploadedPaths: [relPath],
+    ts: 300_000,
+    state: "sent",
+  };
+  const recRel = reconcileOutgoingSends([sendRel], foldedRel, "working", 302_000);
+  assert.deepEqual(recRel.matchedIds, ["out-rel"]);
+  assert.equal(recRel.unmatched.length, 0);
+});
