@@ -1,4 +1,11 @@
-import { matchesOptimisticCommand, sameMessage, textWithFiles, type AgentStatus } from "@herdr-pocket/protocol";
+import {
+  isStaleWorkingAfterTurnEnd,
+  matchesOptimisticCommand,
+  sameMessage,
+  textWithFiles,
+  type AgentStatus,
+  type ConvEvent,
+} from "@herdr-pocket/protocol";
 import type { ChatRow } from "./chatFold";
 
 export interface OutgoingSendLike {
@@ -11,15 +18,50 @@ export interface OutgoingSendLike {
   state: "sending" | "sent" | "queued_terminal" | "failed";
 }
 
+export interface AgentTurnBusyContext {
+  statusSince?: number;
+  events?: readonly ConvEvent[];
+  now?: number;
+  hasRecentOutgoing?: boolean;
+}
+
+const ORPHAN_RUNNING_ROW_MAX_AGE_MS = 12_000;
+
 /** True when the agent is actively executing or streaming a tool/activity turn. */
-export function isAgentTurnBusy(status: AgentStatus | undefined, rows: readonly ChatRow[]): boolean {
-  if (status === "working") return true;
+export function isAgentTurnBusy(
+  status: AgentStatus | undefined,
+  rows: readonly ChatRow[],
+  ctx?: AgentTurnBusyContext,
+): boolean {
+  const now = ctx?.now ?? Date.now();
+  if (status === "working") {
+    if (
+      ctx?.events &&
+      isStaleWorkingAfterTurnEnd({
+        status,
+        statusSince: ctx.statusSince,
+        events: ctx.events,
+        now,
+        hasRecentOutgoing: ctx.hasRecentOutgoing,
+      })
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (status === "blocked") return false;
   for (let i = rows.length - 1; i >= Math.max(0, rows.length - 3); i -= 1) {
     const r = rows[i];
     if (!r) continue;
     if (r.kind === "assistant" || r.kind === "turn_end" || r.kind === "user") break;
-    if (r.kind === "activity_group" && r.running) return true;
-    if (r.kind === "tool" && r.step.running) return true;
+    if ((r.kind === "activity_group" && r.running) || (r.kind === "tool" && r.step.running)) {
+      const ts = rowTs(r);
+      // Only treat an unmatched running row as live work while `status` is idle/done if it started
+      // moments ago (bridging SSE-ahead-of-hc lag). Stale orphaned tool_calls from interrupted turns
+      // must never trap the composer in queue mode.
+      if (ts > 0 && now - ts > ORPHAN_RUNNING_ROW_MAX_AGE_MS) continue;
+      return true;
+    }
   }
   return false;
 }
@@ -87,6 +129,7 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
   rows: ChatRow[],
   agentStatus: AgentStatus,
   now: number,
+  busyOverride?: boolean,
 ): {
   unmatched: T[];
   matchedIds: string[];
@@ -160,7 +203,7 @@ export function reconcileOutgoingSends<T extends OutgoingSendLike>(
     (best, cur) => (!best || cur.ts > best.ts ? cur : best),
     undefined,
   );
-  const busyNow = isAgentTurnBusy(agentStatus, rows);
+  const busyNow = busyOverride ?? isAgentTurnBusy(agentStatus, rows, { now });
   if (
     lastSend &&
     lastSend.state !== "queued_terminal" &&

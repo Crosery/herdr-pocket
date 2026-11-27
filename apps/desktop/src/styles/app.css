@@ -4077,7 +4077,8 @@ html[data-app-focused="false"] .update-toast-card,
 }
 
 /* U5: one-line composer hint. */
-.composer-input-wrap textarea::placeholder {
+.composer-input-wrap textarea::placeholder,
+.composer-input-wrap textarea::-webkit-input-placeholder {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -23,6 +23,7 @@ import {
 import { call, subscribe } from "../lib/relay";
 import { splitPictures } from "../lib/attach";
 import { followSends, forget, useCapturedCommands } from "../lib/outbox";
+import { recordMobileSessionEvents } from "../lib/chatQueue";
 import { useLive, usePending, useSettings, type PendingSend } from "../lib/store";
 import { fixCjkEmphasis, hasList } from "../lib/markdown";
 import { openSub, SUB_STATUS, type Crumb } from "../lib/subnav";
@@ -1379,6 +1380,10 @@ function SessionChatView({
     hasPageDataRef.current = q.data !== undefined;
     if (q.data !== undefined) flushBufferedRef.current?.();
   }, [conv, q.data]);
+  useEffect(() => {
+    if (sub) return;
+    recordMobileSessionEvents(agent.key, liveEvents);
+  }, [agent.key, sub, liveEvents]);
   useEffect(() => {
     if (!active) return;
     let opened = false;

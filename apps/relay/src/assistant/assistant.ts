@@ -59,6 +59,39 @@ import { timeZone, utcOffset, zoneLabel, zoneName } from "./timezone.ts";
 
 export { clip, noEmoji } from "./speech.ts";
 
+/**
+ * Returns the most recent unfinished `tool_call` in `events` — i.e., one that has no
+ * matching `tool_result` (by `call_id`) and was NOT already superseded by an
+ * `assistant_message`, `turn_end`, or newer `user_message`.
+ * Prevents stale completed commands from being fed to `wakeBlocked` as "wants to run".
+ */
+export function findPendingBlockedToolCall(
+  events: readonly ConvEvent[],
+): Extract<ConvEvent, { kind: "tool_call" }> | undefined {
+  const completedCallIds = new Set<string>();
+  let sawUnmatchedToolResult = false;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const e = events[i]!;
+    if (e.kind === "tool_result") {
+      if (e.call_id) completedCallIds.add(e.call_id);
+      else sawUnmatchedToolResult = true;
+      continue;
+    }
+    if (e.kind === "turn_end" || e.kind === "user_message") {
+      return undefined;
+    }
+    if (e.kind === "assistant_message" && e.text.trim().length > 0) {
+      return undefined;
+    }
+    if (e.kind === "tool_call") {
+      if (e.call_id && completedCallIds.has(e.call_id)) continue;
+      if (!e.call_id && sawUnmatchedToolResult) continue;
+      return e;
+    }
+  }
+  return undefined;
+}
+
 export interface AssistantHost {
   devices(): Device[];
   agents(): Agent[];
@@ -1611,11 +1644,36 @@ export class Assistant {
     const looked = material ? await this.look(material, false, this.opts.blockedWakeTimeoutMs ?? 25_000) : null;
     // Approved at the desk while the assistant was looking: nothing left to tell.
     if (!watching.length && this.agentByKey(key)?.status !== "blocked") return;
-    // Being asked for is always worth telling: "不用说" is not accepted here.
+    // If the model verified the live screen and found it is not actually blocked (false alarm:
+    // idle/done/background-running), suppress the noisy "等你" push unless a reminder is watching.
+    if (
+      !watching.length &&
+      looked &&
+      (looked.verdict === "skip" || looked.verdict === "running" || looked.verdict === "ok" || looked.verdict === "progress")
+    ) {
+      this.event({
+        kind: "wake",
+        msg: `suppressed false blocked alert for ${handle} (${looked.verdict})`,
+        data: { agent: key, verdict: looked.verdict },
+      });
+      return;
+    }
     const told = looked && looked.verdict !== "skip" && looked.say ? looked : null;
+    const verdict: NoticeVerdict =
+      told && (told.verdict === "failed" || told.verdict === "paused")
+        ? told.verdict
+        : "decide";
+    const title = verdict === "decide" ? `${handle} · 等你` : `${handle} · ${VERDICT_TITLE[verdict]}`;
     const say = told?.say ?? `${handle}在等你。`;
     if (this.agentByKey(key)?.status === "blocked") this.reasons.set(key, say);
-    await this.emit({ kind: watching.length ? "reminder" : "blocked", title: `${handle} · 等你`, body: say, verdict: "decide", details: told?.details || undefined, agent: key });
+    await this.emit({
+      kind: watching.length ? "reminder" : "blocked",
+      title,
+      body: say,
+      verdict,
+      details: told?.details || undefined,
+      agent: key,
+    });
   }
 
   /** A turn ended and stayed ended: look at it alone, or together with the others that stopped with it. */
@@ -1849,8 +1907,8 @@ export class Assistant {
     } catch {
       /* the conversation may still say what it wants */
     }
-    const call = (await this.recentEvents(a, 10)).reverse().find((e) => e.kind === "tool_call");
-    const wants = call?.kind === "tool_call" ? `${call.name}：${clip(oneLine(toolInput(call.input)), 300)}` : undefined;
+    const call = findPendingBlockedToolCall(await this.recentEvents(a, 10));
+    const wants = call ? `${call.name}：${clip(oneLine(toolInput(call.input)), 300)}` : undefined;
     if (!terminal && !wants) return null;
     return wakeBlocked({
       handle,

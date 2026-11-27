@@ -240,7 +240,7 @@ const NUMBERED_OPTION_RE = /^\s*([❯›>▶➜→●▸]\s*)?(\d{1,2})[.)]\s+(.
 const RADIO_CHECK_OPTION_RE = /^\s*([❯›>▶➜→▸]\s*)?(?:(\[[ xX✓✔]\])|([●◉○◯]))\s+(.+?)\s*$/;
 const POINTER_ONLY_OPTION_RE = /^(\s*)([❯›▶▸]|>\s)(.+?)\s*$/;
 const NON_CHOICE_LINE_RE =
-  /(?:alt\+m\s+to\s+send|ctrl\+[a-z]\s+to\s+|enter\s+to\s+select|esc\s+to\s+|use\s+arrow|↑\/↓|←\/→|^\s*[●○◉◯]\s*(?:Thought\s+for|Ran\b|Explored\b|Read\b|Edited\b|Wrote\b|Updated\b|Created\b|Checked\b|Waiting\b|Working\b|Swarm\b)|^\s*\d+\/\d+\s+steps\b|\bctx\s*·\s*(?:working|idle|done)\b|^\s*[─━═┄┈-]{4,}\s*$)/i;
+  /(?:alt\+m\s+to\s+send|ctrl\+[a-z]\s+to\s+|enter\s+to\s+select|esc\s+to\s+|use\s+arrow|↑\/↓|←\/→|^\s*[●○◉◯]\s*\[\d{2}:\d{2}(?::\d{2})?\]|^\s*[●○◉◯]\s*(?:Thought\s+for|Ran\b|Explored\b|Read\b|Reading\b|Edited\b|Editing\b|Wrote\b|Writing\b|Updated\b|Updating\b|Created\b|Creating\b|Checked\b|Checking\b|Waiting\b|Working\b|Swarm\b|Scheduling\b|Running\b|Searching\b|Listing\b|Calling\b|Fetching\b)|^\s*\d+\/\d+\s+steps\b|\b\d+\s+artifacts?\s*·\s*\/artifact\s+to\s+review\b|\bctx\s*·\s*(?:working|idle|done|reviewing)\b|^\s*[─━═┄┈-]{4,}\s*$)/i;
 const CLEAN_TRAILING_HINT_RE = /\s+\((?:esc|y|n|a|p|shift\+tab|tab)\)$/i;
 
 /**
@@ -285,11 +285,25 @@ export function parseTerminalChoices(lines: readonly string[], lookback = 36): T
   }
 
   // 2. Unnumbered radio/checkbox option cluster (`❯ ○ ...` / `  ○ ...` or `❯ [ ] ...` / `  [x] ...`)
+  interface RadioCandidate extends TerminalChoiceOption {
+    hasPointer: boolean;
+    isBox: boolean;
+    isUnfilledRadio: boolean;
+  }
+  const acceptRadioRun = (run: readonly RadioCandidate[]): TerminalChoiceOption[] | null => {
+    if (run.length < 2 || run.length > 9) return null;
+    if (!run.some((c) => c.selected)) return null;
+    const hasPointerOrBox = run.some((c) => c.hasPointer || c.isBox);
+    // Reject pure all-filled bullet lists (`● task 1`, `● task 2`) with no cursor pointer and no unfilled `○`/`◯`.
+    if (!hasPointerOrBox && !run.some((c) => c.isUnfilledRadio)) return null;
+    return run.map(({ hasPointer: _p, isBox: _b, isUnfilledRadio: _u, ...opt }) => opt);
+  };
   let bestRadio: TerminalChoiceOption[] = [];
-  let runRadio: TerminalChoiceOption[] = [];
+  let runRadio: RadioCandidate[] = [];
   for (const line of cleaned) {
     if (NON_CHOICE_LINE_RE.test(line)) {
-      if (runRadio.length >= 2 && runRadio.some((c) => c.selected)) bestRadio = [...runRadio];
+      const accepted = acceptRadioRun(runRadio);
+      if (accepted) bestRadio = accepted;
       runRadio = [];
       continue;
     }
@@ -297,7 +311,8 @@ export function parseTerminalChoices(lines: readonly string[], lookback = 36): T
     if (!m) {
       // Allow a single indented description line inside a cluster without breaking it immediately
       if (runRadio.length > 0 && /^\s{4,}\S/.test(line)) continue;
-      if (runRadio.length >= 2 && runRadio.some((c) => c.selected)) bestRadio = [...runRadio];
+      const accepted = acceptRadioRun(runRadio);
+      if (accepted) bestRadio = accepted;
       runRadio = [];
       continue;
     }
@@ -313,9 +328,13 @@ export function parseTerminalChoices(lines: readonly string[], lookback = 36): T
       label,
       selected,
       ...(box ? { checked } : {}),
+      hasPointer: pointer,
+      isBox: Boolean(box),
+      isUnfilledRadio: !box && (radio === "○" || radio === "◯"),
     });
   }
-  if (runRadio.length >= 2 && runRadio.some((c) => c.selected)) bestRadio = [...runRadio];
+  const trailingAccepted = acceptRadioRun(runRadio);
+  if (trailingAccepted) bestRadio = trailingAccepted;
   if (bestRadio.length >= 2 && bestRadio.length <= 9) {
     return bestRadio;
   }

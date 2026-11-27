@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { SHELL_HARNESSES, normalizeStatus, type Agent, type AgentStatus, type TerminalDisplay } from "@herdr-pocket/protocol";
+import { SHELL_HARNESSES, normalizeStatus, parseTerminalChoices, type Agent, type AgentStatus, type TerminalDisplay } from "@herdr-pocket/protocol";
 import { base, cleanTitle, debounce, lineSplitter, run } from "./util.ts";
 import { HcScreens, type ScreenLines, type ScreenSnapshot } from "./hcscreen.ts";
 import { defaultHcBin, programName } from "./platform.ts";
@@ -99,6 +99,131 @@ export interface SubscreenDetection {
 }
 
 const ACTIVE_INPUT_PROMPT_RE = /^(?:[❯›>](?:\s|$).*|.*\bshift\+tab\s+to\s+cycle\b.*|.*\?\s+for\s+shortcuts\b.*)$/i;
+const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+const AGY_REVIEW_STATUS_RE = /\bctx\s*·\s*reviewing\b/i;
+const AGY_NON_WORKING_FOOTER_RE = /\bctx\s*·\s*(?:idle|done|reviewing)\b/i;
+const AGY_WORKING_FOOTER_RE = /\bctx\s*·\s*workin/i;
+const AGY_ARTIFACT_HINT_RE = /\b\d+\s+artifacts?\s*·\s*\/artifact\s+to\s+review\b/i;
+const AGY_IDLE_PROMPT_LINE_RE = /^>\s*$/;
+const AGY_COMPOSER_PROMPT_LINE_RE = /^>(?:\s.*)?$/;
+const AGY_BORDER_LINE_RE = /^[─━═┄┈-]{8,}$/;
+const AGY_ACTIVE_SPINNER_RE =
+  /^[⣾⣽⣻⢿⡿⣟⣯⣷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✢✶✳✻✽]\s+\S|^●\s+Running\b|\(\s*(?:[^()]*[•·]\s*)?esc\s+(?:to\s+)?(?:cancel|interrupt)\s*\)/i;
+const AGY_MODAL_APPROVAL_RE =
+  /\b(?:do you want to (?:proceed|continue|run|edit|create|delete|execute|allow)|would you like to|allow (?:once|always|execution|this tool)|allow tool execution|permission required|approve\s+plan\?|proceed\?|yes,?\s*(?:and\s+)?(?:proceed|allow|don't ask again)|press (?:a )?number to choose|press enter to (?:approve|proceed|confirm|submit)|\[y\/n\]|\(y\/n\)|enter to submit answer)\b|是否允许|允许执行|是否继续|按数字选择|输入.{0,8}回答|确认执行|授权确认/i;
+
+/**
+ * True when an agent's raw `hc` status matches the Antigravity `· reviewing` false-block
+ * signature (`antigravity` + `blocked` + `permission` + `"Approve plan"`), which needs
+ * live terminal screen verification before alerting the user.
+ */
+export function isAntigravityReviewBlockCandidate(opts: {
+  harness: string;
+  status: AgentStatus;
+  statusKind?: Agent["statusKind"];
+  statusNote?: string;
+}): boolean {
+  if (opts.status !== "blocked") return false;
+  if (opts.harness.toLowerCase() !== "antigravity") return false;
+  if (opts.statusKind && opts.statusKind !== "permission") return false;
+  return (opts.statusNote ?? "").trim().toLowerCase() === "approve plan";
+}
+
+/**
+ * `hc` 0.1.x can keep reporting Antigravity (`agy`) as `status: "working"` indefinitely
+ * whenever background commands (`● [HH:MM:SS] ... running`) or Swarm workers
+ * (`● Agent(worker: ...) Working`) appear in the footer below `>`, even though Antigravity's
+ * own status bar says `· idle` / `· done` / `· reviewing` and no turn spinner is active.
+ * Returns true ONLY when the live screen unambiguously shows a non-working footer + framed
+ * composer prompt (`>`) with zero active spinner / foreground `Running` line above it.
+ */
+export function isFalseAntigravityWorkingState(opts: {
+  harness: string;
+  status: AgentStatus;
+  screen: string;
+}): boolean {
+  if (opts.status !== "working") return false;
+  if (opts.harness.toLowerCase() !== "antigravity") return false;
+
+  const nonEmpty = opts.screen
+    .split("\n")
+    .map((l) => l.replace(ANSI_SGR_RE, "").trim())
+    .filter(Boolean);
+  if (nonEmpty.length === 0) return false;
+
+  const tail24 = nonEmpty.slice(-24);
+  const footerLines = tail24.slice(-3);
+  if (footerLines.some((l) => AGY_WORKING_FOOTER_RE.test(l))) return false;
+  if (!footerLines.some((l) => AGY_NON_WORKING_FOOTER_RE.test(l))) return false;
+
+  let promptIdx = -1;
+  for (let i = tail24.length - 1; i >= 1; i -= 1) {
+    if (
+      AGY_COMPOSER_PROMPT_LINE_RE.test(tail24[i]!) &&
+      AGY_BORDER_LINE_RE.test(tail24[i - 1]!) &&
+      i + 1 < tail24.length &&
+      AGY_BORDER_LINE_RE.test(tail24[i + 1]!)
+    ) {
+      promptIdx = i;
+      break;
+    }
+  }
+  if (promptIdx < 1) return false;
+
+  // Hard veto: never demote if a foreground spinner, `● Running`, or interrupt hint is visible above the composer.
+  const aboveComposer = tail24.slice(Math.max(0, promptIdx - 12), promptIdx - 1);
+  if (aboveComposer.some((l) => AGY_ACTIVE_SPINNER_RE.test(l))) return false;
+
+  return true;
+}
+
+/**
+ * `hc` 0.1.x can misclassify Antigravity's footer status `· reviewing` (left on screen after
+ * an artifact was produced earlier in the session) as `blocked / permission / "Approve plan"`.
+ * Returns true ONLY when the live screen unambiguously shows an idle composer (`>` inside
+ * horizontal rules) + `· reviewing` / `/artifact to review` footer with NO interactive
+ * approval dialog, NO question prompt, and NO selectable terminal choice menu.
+ */
+export function isFalseAntigravityReviewBlock(opts: {
+  harness: string;
+  status: AgentStatus;
+  statusKind?: Agent["statusKind"];
+  statusNote?: string;
+  screen: string;
+}): boolean {
+  if (!isAntigravityReviewBlockCandidate(opts)) return false;
+
+  const rawLines = opts.screen.split("\n").map((l) => l.replace(ANSI_SGR_RE, "").trimEnd());
+  const nonEmpty = rawLines.map((l) => l.trim()).filter(Boolean);
+  if (nonEmpty.length === 0) return false;
+
+  const tail16 = nonEmpty.slice(-16);
+  const hasReviewFooter =
+    tail16.some((l) => AGY_REVIEW_STATUS_RE.test(l)) ||
+    tail16.some((l) => AGY_ARTIFACT_HINT_RE.test(l));
+  if (!hasReviewFooter) return false;
+
+  let promptIdx = -1;
+  for (let i = tail16.length - 1; i >= 0; i -= 1) {
+    if (AGY_IDLE_PROMPT_LINE_RE.test(tail16[i]!)) {
+      promptIdx = i;
+      break;
+    }
+  }
+  if (promptIdx <= 0 || promptIdx + 1 >= tail16.length) return false;
+
+  const hasUpperRule = AGY_BORDER_LINE_RE.test(tail16[promptIdx - 1]!);
+  const hasLowerRule = AGY_BORDER_LINE_RE.test(tail16[promptIdx + 1]!);
+  if (!hasUpperRule || !hasLowerRule) return false;
+
+  // Hard vetoes: never demote if a real interactive menu or approval prompt is on screen.
+  if (parseTerminalChoices(rawLines).length > 0) return false;
+  if (isInteractiveApprovalOrQuestion(tail16.slice(promptIdx - 1).join("\n"))) return false;
+  const aboveComposer = tail16.slice(Math.max(0, promptIdx - 4), promptIdx - 1).join("\n");
+  if (aboveComposer && AGY_MODAL_APPROVAL_RE.test(aboveComposer)) return false;
+
+  return true;
+}
 
 /**
  * True when the tail of the visible viewport shows an active chat composer prompt

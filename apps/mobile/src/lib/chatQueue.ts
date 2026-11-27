@@ -7,11 +7,17 @@
 import { AppState } from "react-native";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
-import { buildHarnessSwitchCommands, stripModelEffortSuffix, type Agent } from "@herdr-pocket/protocol";
+import {
+  buildHarnessSwitchCommands,
+  isStaleWorkingAfterTurnEnd,
+  stripModelEffortSuffix,
+  type Agent,
+  type ConvEvent,
+} from "@herdr-pocket/protocol";
 import type { Attachment } from "./attach";
 import { sendOut, type SendResult } from "./outbox";
 import { call } from "./relay";
-import { safeAsyncStorage, useLive } from "./store";
+import { safeAsyncStorage, useLive, usePending } from "./store";
 
 export interface MobileQueuedPrompt {
   id: string;
@@ -206,8 +212,48 @@ export const useMobileQueue = create<MobileQueueState>()(
 
 const inFlight = new Set<string>();
 const dispatchState = new Map<string, { lastDispatchedAt: number; sawWorking: boolean; idleSince?: number }>();
+const latestEventsByAgent = new Map<string, readonly ConvEvent[]>();
 let watcherInstalled = false;
 const IDLE_DEBOUNCE_MS = 600;
+const RECENT_OUTGOING_MS = 15_000;
+
+export function recordMobileSessionEvents(agentKey: string, events: readonly ConvEvent[]): void {
+  if (!events.length) {
+    latestEventsByAgent.delete(agentKey);
+  } else {
+    latestEventsByAgent.set(agentKey, events);
+  }
+}
+
+export function getMobileSessionEvents(agentKey: string): readonly ConvEvent[] | undefined {
+  return latestEventsByAgent.get(agentKey);
+}
+
+/**
+ * True when an agent is genuinely busy executing a turn. Guards against older `hostd` / `hc`
+ * instances stuck on `status: "working"` long after `turn_end` was recorded in the transcript.
+ */
+export function isMobileAgentEffectivelyWorking(
+  agent: Pick<Agent, "key" | "status" | "statusSince">,
+  eventsOverride?: readonly ConvEvent[],
+  now = Date.now(),
+): boolean {
+  if (agent.status !== "working") return false;
+  const events = eventsOverride ?? latestEventsByAgent.get(agent.key);
+  if (!events || !events.length) return true;
+  const track = dispatchState.get(agent.key);
+  const pendingList = usePending.getState().byAgent[agent.key] ?? [];
+  const hasRecentOutgoing =
+    (track ? now - track.lastDispatchedAt < RECENT_OUTGOING_MS : false) ||
+    pendingList.some((p) => p.state !== "failed" && now - p.ts < RECENT_OUTGOING_MS);
+  return !isStaleWorkingAfterTurnEnd({
+    status: agent.status,
+    statusSince: agent.statusSince,
+    events,
+    now,
+    hasRecentOutgoing,
+  });
+}
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -401,7 +447,8 @@ function runDrainTick(): void {
     if (!agent) continue;
     const online = Boolean(live.devices[agent.deviceId]?.online);
     if (!online || inFlight.has(key) || qState.steering[key]) continue;
-    if (agent.status !== "idle" && agent.status !== "done") continue;
+    const staleWorking = agent.status === "working" && !isMobileAgentEffectivelyWorking(agent, undefined, now);
+    if (agent.status !== "idle" && agent.status !== "done" && !staleWorking) continue;
     const track = dispatchState.get(key);
     if (track?.idleSince && now - track.idleSince < IDLE_DEBOUNCE_MS) continue;
     if (now - (track?.lastDispatchedAt ?? 0) < DRAIN_COOLDOWN_MS) continue;
@@ -424,7 +471,8 @@ function runDrainTick(): void {
     if (!agent) continue;
     const online = Boolean(live.devices[agent.deviceId]?.online);
     if (!online || inFlight.has(key) || nextQueueState.steering[key]) continue;
-    if (agent.status !== "idle" && agent.status !== "done") continue;
+    const staleWorking = agent.status === "working" && !isMobileAgentEffectivelyWorking(agent, undefined, now);
+    if (agent.status !== "idle" && agent.status !== "done" && !staleWorking) continue;
     const track = dispatchState.get(key);
     if (track?.idleSince && now - track.idleSince < IDLE_DEBOUNCE_MS) continue;
     if (now - (track?.lastDispatchedAt ?? 0) < DRAIN_COOLDOWN_MS) continue;

@@ -29,7 +29,13 @@ import {
   type TerminalDisplay,
   type TerminalRowsEvent,
 } from "@herdr-pocket/protocol";
-import { HcAdapter, type AppNames } from "./hc.ts";
+import {
+  HcAdapter,
+  isAntigravityReviewBlockCandidate,
+  isFalseAntigravityReviewBlock,
+  isFalseAntigravityWorkingState,
+  type AppNames,
+} from "./hc.ts";
 import { sendAndCaptureSlashCommand } from "./slashCapture.ts";
 import type { ScreenLines } from "./hcscreen.ts";
 import { HerdrApp, NoDesktopApp, checkFolder, collectTerminalIdsFromRoot, createWorktreeFolder, findPrograms, herdrCommandArgs, installedLaunchers, isHerdrWindowClosedError, launcherArgv, resolveSpaceFolder, resumeArgv, shortHome, withProgramPath } from "./create.ts";
@@ -196,6 +202,10 @@ export class Host {
   private sendQueues = new Map<string, Array<{ id: string; text: string; enter: boolean; delivery?: "auto" | "steer" }>>();
   private queueSeq = 0;
   private subscreenByAgent = new Map<string, "viewer" | "pager">();
+  /** Keys whose raw `hc` `antigravity` "Approve plan" block was verified against live screen as idle `· reviewing`. */
+  private falseReviewBlockedByAgent = new Map<string, string>();
+  /** Keys whose raw `hc` `antigravity` "working" state was verified against live screen as idle (background tasks only). */
+  private falseWorkingByAgent = new Map<string, string>();
   private stopped = false;
   private backoff = 1000;
   /** How often the relay link is pinged; a ping still unanswered at the next one drops the link. */
@@ -663,16 +673,49 @@ export class Host {
       tab: (tabId?: string) => this.herdr.resolveTabName(tabId),
     };
     for (const info of this.herdr.agents) agents.push(HerdrAdapter.toAgent(info, id, herdrLabels));
-    const enriched = this.waits.decorate(this.uniflo.enrich(agents, pids, hints, created, statusMsgs));
-    if (this.subscreenByAgent.size) {
-      const liveKeys = new Set(enriched.map((a) => a.key));
+    const unifloEnriched = this.uniflo.enrich(agents, pids, hints, created, statusMsgs);
+    if (this.subscreenByAgent.size || this.falseReviewBlockedByAgent.size || this.falseWorkingByAgent.size) {
+      const liveKeys = new Set(unifloEnriched.map((a) => a.key));
       for (const k of [...this.subscreenByAgent.keys()]) {
         if (!liveKeys.has(k)) this.subscreenByAgent.delete(k);
       }
+      for (const k of [...this.falseReviewBlockedByAgent.keys()]) {
+        if (!liveKeys.has(k)) this.falseReviewBlockedByAgent.delete(k);
+      }
+      for (const k of [...this.falseWorkingByAgent.keys()]) {
+        if (!liveKeys.has(k)) this.falseWorkingByAgent.delete(k);
+      }
     }
+    const normalized = unifloEnriched.map((a) => {
+      let next = a;
+      if (isAntigravityReviewBlockCandidate(next)) {
+        const sig = `${next.statusSince ?? 0}:${next.turn ?? 0}:${next.statusNote ?? ""}`;
+        const demotedSig = this.falseReviewBlockedByAgent.get(next.key);
+        if (demotedSig === sig) {
+          next = { ...next, status: "idle", statusKind: undefined, statusNote: undefined };
+        } else if (demotedSig !== undefined) {
+          this.falseReviewBlockedByAgent.delete(next.key);
+        }
+      } else {
+        this.falseReviewBlockedByAgent.delete(next.key);
+      }
+      if (next.status === "working" && next.harness.toLowerCase() === "antigravity") {
+        const sig = `${next.statusSince ?? 0}:${next.turn ?? 0}`;
+        const demotedSig = this.falseWorkingByAgent.get(next.key);
+        if (demotedSig === sig) {
+          next = { ...next, status: "idle" };
+        } else if (demotedSig !== undefined) {
+          this.falseWorkingByAgent.delete(next.key);
+        }
+      } else {
+        this.falseWorkingByAgent.delete(next.key);
+      }
+      return next;
+    });
+    const enriched = this.waits.decorate(normalized);
     return enriched.map((a) => {
       const ports = this.agentPortsByKey.get(a.key);
-      let next = ports && ports.length > 0 ? { ...a, listeningPorts: ports } : a;
+      const next = ports && ports.length > 0 ? { ...a, listeningPorts: ports } : a;
       if (next.status === "blocked" || next.statusKind) {
         this.subscreenByAgent.delete(next.key);
         return next;
@@ -758,6 +801,9 @@ export class Host {
     if (data === this.lastPublished) return;
     this.lastPublished = data;
     this.send({ type: "agents", agents: this.agents });
+    if (this.agents.some((a) => a.source === "hc" && isAntigravityReviewBlockCandidate(a))) {
+      void this.refreshScreenQueues();
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1333,7 +1379,12 @@ export class Host {
         !a.isShell &&
         a.source === "hc" &&
         !this.sendQueues.has(a.key) &&
-        (a.status === "working" || a.status === "blocked" || subscribedTermAgents.has(a.key) || this.subscreenByAgent.has(a.key)),
+        (a.status === "working" ||
+          a.status === "blocked" ||
+          subscribedTermAgents.has(a.key) ||
+          this.subscreenByAgent.has(a.key) ||
+          this.falseReviewBlockedByAgent.has(a.key) ||
+          this.falseWorkingByAgent.has(a.key)),
     );
     const activeKeys = new Set(inspectable.filter((a) => a.status === "working" || a.status === "blocked").map((a) => a.key));
     let changed = this.waits.pruneScreenQueued(activeKeys);
@@ -1355,12 +1406,63 @@ export class Host {
           try {
             const snap = await this.hc.snapshotWithMeta(a.localId, 60);
             const text = snap?.text ?? (await this.hc.read(a.localId, 60)).text;
-            if (a.status === "working" || a.status === "blocked") {
+            const rawTerm = this.hc.terminals.get(a.localId);
+            const rawHarness = rawTerm ? HcAdapter.harness(rawTerm) : a.harness;
+            const rawStatus = rawTerm ? HcAdapter.status(rawTerm) : a.status;
+            const rawStatusKind = rawTerm ? HcAdapter.statusKind(rawTerm) : a.statusKind;
+            const rawStatusNote = rawTerm ? HcAdapter.note(rawTerm) : a.statusNote;
+            if (isAntigravityReviewBlockCandidate({ harness: rawHarness, status: rawStatus, statusKind: rawStatusKind, statusNote: rawStatusNote })) {
+              const rawSig = `${rawTerm?.status_ms ?? a.statusSince ?? 0}:${rawTerm?.turn ?? a.turn ?? 0}:${rawStatusNote ?? ""}`;
+              const isFalseBlock = isFalseAntigravityReviewBlock({
+                harness: rawHarness,
+                status: rawStatus,
+                statusKind: rawStatusKind,
+                statusNote: rawStatusNote,
+                screen: text,
+              });
+              if (isFalseBlock) {
+                if (this.falseReviewBlockedByAgent.get(a.key) !== rawSig) {
+                  this.falseReviewBlockedByAgent.set(a.key, rawSig);
+                  changed = true;
+                  this.note("info", "hc.false_block", `demoted false antigravity "Approve plan" review block on ${a.localId}`, { agent: a.key });
+                }
+              } else if (this.falseReviewBlockedByAgent.delete(a.key)) {
+                changed = true;
+              }
+            } else if (this.falseReviewBlockedByAgent.delete(a.key)) {
+              changed = true;
+            }
+            if (rawStatus === "working" && rawHarness.toLowerCase() === "antigravity") {
+              const rawWorkSig = `${rawTerm?.status_ms ?? a.statusSince ?? 0}:${rawTerm?.turn ?? a.turn ?? 0}`;
+              const isFalseWork = isFalseAntigravityWorkingState({
+                harness: rawHarness,
+                status: rawStatus,
+                screen: text,
+              });
+              if (isFalseWork) {
+                if (this.falseWorkingByAgent.get(a.key) !== rawWorkSig) {
+                  this.falseWorkingByAgent.set(a.key, rawWorkSig);
+                  changed = true;
+                  this.note("info", "hc.false_working", `demoted false antigravity "working" state (footer idle) on ${a.localId}`, { agent: a.key });
+                }
+              } else if (this.falseWorkingByAgent.delete(a.key)) {
+                changed = true;
+              }
+            } else if (this.falseWorkingByAgent.delete(a.key)) {
+              changed = true;
+            }
+            if (
+              !this.falseWorkingByAgent.has(a.key) &&
+              !this.falseReviewBlockedByAgent.has(a.key) &&
+              (a.status === "working" || a.status === "blocked")
+            ) {
               if (this.waits.setScreenQueued(a.key, extractTerminalQueuedMessages(text, a.harness))) {
                 changed = true;
               }
+            } else if (this.waits.setScreenQueued(a.key, [])) {
+              changed = true;
             }
-            const fgArgv = this.hc.terminals.get(a.localId)?.foreground?.argv;
+            const fgArgv = rawTerm?.foreground?.argv;
             this.portal.inspectScreenForOAuth(a, text, fgArgv);
             const sub = this.hc.detectSubscreenFromSnapshot(a.localId, { text, altScreen: snap?.altScreen });
             if (sub) {
@@ -1644,9 +1746,12 @@ export class Host {
       }
       // In a turn, the program keeps typed text in its input box until the turn ends.
       const waiting = p.enter !== false && status === "working";
+      const clearedFalseWorking = p.enter !== false && this.falseWorkingByAgent.delete(a.key);
       if (waiting) {
         this.waits.add(a.key, queued.id, p.text, Date.now());
         this.watchWaits();
+        this.publish();
+      } else if (clearedFalseWorking) {
         this.publish();
       }
       return { ok: true as const, queueId: queued.id, position: queued.position, agentStatus: status, waiting };

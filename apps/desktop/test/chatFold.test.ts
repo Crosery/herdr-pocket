@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ConvEvent } from "@herdr-pocket/protocol";
+import { isStaleWorkingAfterTurnEnd, type ConvEvent } from "@herdr-pocket/protocol";
 import { createBufferedEventMerger, foldConvEvents, mergeConvEvents, type ChatRow } from "../src/lib/chatFold.ts";
 import {
   interleaveOptimisticSends,
@@ -416,7 +416,10 @@ test("chatQueueLogic: isAgentTurnBusy detects running tools on status flicker an
     ts: 100_000,
     step: { id: "t1", callId: "c1", name: "Bash", category: "run", input: {}, summary: "pnpm test", ts: 100_000, running: true, isError: false },
   };
-  assert.equal(isAgentTurnBusy("idle", [runningToolRow]), true);
+  assert.equal(isAgentTurnBusy("idle", [runningToolRow], { now: 103_000 }), true);
+  // Stale orphaned running tool (>12s old) while idle/blocked must NOT trap the composer in queue mode.
+  assert.equal(isAgentTurnBusy("idle", [runningToolRow], { now: 120_000 }), false);
+  assert.equal(isAgentTurnBusy("blocked", [runningToolRow], { now: 103_000 }), false);
   assert.equal(isAgentTurnBusy("working", []), true);
   assert.equal(isAgentTurnBusy("idle", [{ kind: "assistant", id: "a1", text: "done", ts: 102_000 }]), false);
 
@@ -427,6 +430,81 @@ test("chatQueueLogic: isAgentTurnBusy detects running tools on status flicker an
   assert.deepEqual(
     segs.map((x) => (x.kind === "row" ? x.row.id : `out:${x.send.id}`)),
     ["t1", "out:qt-1"],
+  );
+});
+
+test("chatQueueLogic & protocol: isStaleWorkingAfterTurnEnd prevents false queueing when working status outlives turn_end", () => {
+  const statusSinceOld = 1_795_747_354_000; // 5.5 hours earlier (hc stuck on background footer)
+  const turnEndTs = 1_795_766_765_000;
+  const nowLater = turnEndTs + 7 * 60_000; // 7 minutes after turn_end
+  const finishedEvents: ConvEvent[] = [
+    { id: "u1", session: "s1", ts: turnEndTs - 40_000, pos: "1", kind: "user_message", text: "检查一下状态" },
+    { id: "a1", session: "s1", ts: turnEndTs - 5_000, pos: "2", kind: "assistant_message", text: "已检查完成" },
+    { id: "te1", session: "s1", ts: turnEndTs, pos: "3", kind: "turn_end" },
+    { id: "us1", session: "s1", ts: turnEndTs + 50, pos: "4", kind: "usage", input: 100, output: 20 },
+  ];
+
+  assert.equal(
+    isStaleWorkingAfterTurnEnd({
+      status: "working",
+      statusSince: statusSinceOld,
+      events: finishedEvents,
+      now: nowLater,
+    }),
+    true,
+  );
+  assert.equal(
+    isAgentTurnBusy("working", [], {
+      statusSince: statusSinceOld,
+      events: finishedEvents,
+      now: nowLater,
+    }),
+    false,
+  );
+
+  // Within the 5s settle window after turn_end: still treated as busy.
+  assert.equal(
+    isAgentTurnBusy("working", [], {
+      statusSince: statusSinceOld,
+      events: finishedEvents,
+      now: turnEndTs + 3_000,
+    }),
+    true,
+  );
+
+  // If the client just sent a message (`hasRecentOutgoing: true`): stay busy so rapid follow-ups queue safely.
+  assert.equal(
+    isAgentTurnBusy("working", [], {
+      statusSince: statusSinceOld,
+      events: finishedEvents,
+      now: nowLater,
+      hasRecentOutgoing: true,
+    }),
+    true,
+  );
+
+  // If `statusSince` flipped to "working" AFTER turn_end (new turn genuinely started): stay busy.
+  assert.equal(
+    isAgentTurnBusy("working", [], {
+      statusSince: turnEndTs + 10_000,
+      events: finishedEvents,
+      now: nowLater,
+    }),
+    true,
+  );
+
+  // If a newer turn event arrived after turn_end (e.g. reasoning / tool_call / user_message): stay busy.
+  const activeNextTurn: ConvEvent[] = [
+    ...finishedEvents,
+    { id: "u2", session: "s1", ts: turnEndTs + 20_000, pos: "5", kind: "user_message", text: "继续" },
+  ];
+  assert.equal(
+    isAgentTurnBusy("working", [], {
+      statusSince: statusSinceOld,
+      events: activeNextTurn,
+      now: nowLater,
+    }),
+    true,
   );
 });
 

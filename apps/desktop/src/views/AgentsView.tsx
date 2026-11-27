@@ -101,6 +101,7 @@ import {
   closeInteractiveCommandPanel,
   dismissCapturedCommand,
   dismissOutgoingSend,
+  drainAgentQueueIfReady,
   enqueuePrompt,
   injectTerminalQueuedNow,
   interruptAndSendQueuedPrompt,
@@ -1119,7 +1120,25 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     cachedFoldedRef.current = next;
     return next;
   }, [activeMode, chatDisplayMode, displayedEvents, isPlainShellChat]);
-  const isTurnBusy = useMemo(() => isAgentTurnBusy(agent.status, foldedRows), [agent.status, foldedRows]);
+  const hasRecentOutgoing = useMemo(
+    () => outgoing.some((s) => s.state !== "failed" && nowTick - s.ts < 15_000),
+    [nowTick, outgoing],
+  );
+  const isTurnBusy = useMemo(
+    () =>
+      isAgentTurnBusy(agent.status, foldedRows, {
+        statusSince: agent.statusSince,
+        events: displayedEvents,
+        now: nowTick,
+        hasRecentOutgoing,
+      }),
+    [agent.status, agent.statusSince, displayedEvents, foldedRows, hasRecentOutgoing, nowTick],
+  );
+  useEffect(() => {
+    if (hostOnline && queued.length > 0 && !isTurnBusy && agent.status === "working") {
+      drainAgentQueueIfReady(agent);
+    }
+  }, [agent, hostOnline, isTurnBusy, queued.length]);
   const composerTelemetry = useMemo(
     () => computeTurnTelemetry(displayedEvents, usageReport, agent),
     [agent, displayedEvents, usageReport],
@@ -1184,8 +1203,8 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
     usageTimerRef.current = { key: reqKey, id, targetAt };
   }, [agent.cacheHitPct, agent.contextTokens, agent.deviceId, agent.isShell, agent.key, agent.sessionKey, agent.source, agent.status, agent.updatedAt, chatVisited, commitUsageReport, displayedEvents.length, visible]);
   const convReconciled = useMemo(
-    () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick),
-    [agent.status, foldedRows, nowTick, outgoing],
+    () => reconcileOutgoingSends(outgoing, foldedRows, agent.status, nowTick, isTurnBusy),
+    [agent.status, foldedRows, isTurnBusy, nowTick, outgoing],
   );
   const reconciled = useMemo(() => {
     if (!isPlainShellChat || !shellChat) return convReconciled;
@@ -2131,6 +2150,12 @@ export const AgentDetailPanel = memo(function AgentDetailPanel({
       requestAnimationFrame(() => composer.textareaRef.current?.focus({ preventScroll: true }));
     }
   }, [activeMode, activeSub, composer.textareaRef, focused, visible]);
+
+  useLayoutEffect(() => {
+    if (visible && activeMode === "chat" && !activeSub) {
+      composer.syncSize();
+    }
+  }, [activeMode, activeSub, composer.syncSize, visible]);
 
   const pickSlashCommand = useCallback(
     (cmd: SlashCommandItem, allowAutoSend: boolean) => {

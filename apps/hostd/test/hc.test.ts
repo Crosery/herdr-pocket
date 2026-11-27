@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HcAdapter, detectDismissableSubscreen, endsInPanel, isInteractiveApprovalOrQuestion, isViewerSubscreen } from "../src/hc.ts";
+import {
+  HcAdapter,
+  detectDismissableSubscreen,
+  endsInPanel,
+  isFalseAntigravityReviewBlock,
+  isFalseAntigravityWorkingState,
+  isInteractiveApprovalOrQuestion,
+  isViewerSubscreen,
+} from "../src/hc.ts";
 
 /** These fakes are shell scripts: Windows can't run them (CI there runs the rest). */
 const SH = { skip: process.platform === "win32" && "shell-script fakes" };
@@ -510,4 +518,175 @@ test("dismissSubscreens inspects visible viewport only (history=0) and stops if 
   assert.ok(historyArgs.length >= 2 && historyArgs.every((h) => h === 0));
   // Raw input must send Esc (\x1b), never Ctrl+O (\x0f), and abort on the first unchanged pass.
   assert.deepEqual(rawInputs, ["\x1b"]);
+});
+
+test("isFalseAntigravityReviewBlock demotes idle reviewing screens while preserving genuine approvals", () => {
+  const falseReviewScreen = [
+    "已检查完毕，等待下一轮 cron 自动巡检（之前讨论过 approve 流程）。",
+    "                              1 artifact · /artifact to review",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "  ● [12:15:38] cron (every 3 minutes) running",
+    "  ● [12:10:53] nginx -g 'daemon off;' -c /tmp/nginx.conf running",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon (XHigh) · 15% ctx · reviewing",
+  ].join("\n");
+
+  assert.equal(
+    isFalseAntigravityReviewBlock({
+      harness: "antigravity",
+      status: "blocked",
+      statusKind: "permission",
+      statusNote: "Approve plan",
+      screen: falseReviewScreen,
+    }),
+    true,
+  );
+
+  // Real Antigravity approval modal with selectable options must NEVER be demoted.
+  const realApprovalModal = [
+    "Approve plan?",
+    "❯ 1. Proceed",
+    "  2. Review changes",
+    "  3. Reject",
+    "Gemini 4 Neon (XHigh) · 15% ctx · reviewing",
+  ].join("\n");
+  assert.equal(
+    isFalseAntigravityReviewBlock({
+      harness: "antigravity",
+      status: "blocked",
+      statusKind: "permission",
+      statusNote: "Approve plan",
+      screen: realApprovalModal,
+    }),
+    false,
+  );
+
+  // Explicit modal question right above composer must NEVER be demoted.
+  const realPermissionPrompt = [
+    "Permission required: Allow execution of rm -rf build?",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon (XHigh) · 15% ctx · reviewing",
+  ].join("\n");
+  assert.equal(
+    isFalseAntigravityReviewBlock({
+      harness: "antigravity",
+      status: "blocked",
+      statusKind: "permission",
+      statusNote: "Approve plan",
+      screen: realPermissionPrompt,
+    }),
+    false,
+  );
+
+  // Different harness or different statusNote must NEVER be demoted.
+  assert.equal(
+    isFalseAntigravityReviewBlock({
+      harness: "claude-code",
+      status: "blocked",
+      statusKind: "permission",
+      statusNote: "Approve plan",
+      screen: falseReviewScreen,
+    }),
+    false,
+  );
+  assert.equal(
+    isFalseAntigravityReviewBlock({
+      harness: "antigravity",
+      status: "blocked",
+      statusKind: "permission",
+      statusNote: "Allow bash command",
+      screen: falseReviewScreen,
+    }),
+    false,
+  );
+});
+
+test("isFalseAntigravityWorkingState demotes idle footer with background tasks while preserving real working turns", () => {
+  // Case 1: Idle composer with Swarm workers + background commands below `>` (footer literally says `· idle`).
+  const idleSwarmFooterScreen = [
+    "已汇总完本轮检查结果，等待下一条指令。",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "  ● Agent(worker-a) Working",
+    "  ● [15:37:47] python3 scripts/listener.py running",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon (XHigh) · 43% ctx · idle",
+  ].join("\n");
+  assert.equal(
+    isFalseAntigravityWorkingState({
+      harness: "antigravity",
+      status: "working",
+      screen: idleSwarmFooterScreen,
+    }),
+    true,
+  );
+
+  // Case 2: Idle composer with single background command running below `>` and `· done` / `· reviewing` footer.
+  const idleBgTaskScreen = [
+    "已将配置写入，随时可继续。",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "  ● [15:37:47] python3 watch.py --poll running",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon (XHigh) · 32% ctx · done",
+  ].join("\n");
+  assert.equal(
+    isFalseAntigravityWorkingState({
+      harness: "antigravity",
+      status: "working",
+      screen: idleBgTaskScreen,
+    }),
+    true,
+  );
+
+  // Case 3: Active working turn with narrow truncated `· workin` + spinner + `● Running` must NEVER be demoted.
+  const activeWorkingNarrowScreen = [
+    "● Running pnpm test",
+    "⣯ 2/4 steps (esc to interrupt)",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon (XHigh) · 43% ctx · workin",
+  ].join("\n");
+  assert.equal(
+    isFalseAntigravityWorkingState({
+      harness: "antigravity",
+      status: "working",
+      screen: activeWorkingNarrowScreen,
+    }),
+    false,
+  );
+
+  // Case 4: Active foreground spinner or `(esc to interrupt)` above composer even if footer hasn't flipped yet.
+  const activeSpinnerAboveComposer = [
+    "⣾ 0/4 steps (esc to cancel)",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon (XHigh) · 43% ctx · idle",
+  ].join("\n");
+  assert.equal(
+    isFalseAntigravityWorkingState({
+      harness: "antigravity",
+      status: "working",
+      screen: activeSpinnerAboveComposer,
+    }),
+    false,
+  );
+
+  // Case 5: Non-antigravity harness must NEVER be demoted.
+  assert.equal(
+    isFalseAntigravityWorkingState({
+      harness: "claude-code",
+      status: "working",
+      screen: idleSwarmFooterScreen,
+    }),
+    false,
+  );
 });

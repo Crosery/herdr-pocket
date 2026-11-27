@@ -167,7 +167,11 @@ export function wakeFinished(m: {
 
 export function wakeBlocked(m: { handle: string; harness: string; device: string; duration: string; key: string; reminder?: string; wants?: string; terminal?: string }): string {
   return sections(
-    [`[叫醒] ${m.handle} 卡住了，在等我，已经等了 ${m.duration}。这次的结论固定是“要你定”，不用工具，直接按格式回。`, `程序：${m.harness} | 电脑：${m.device}`, `key：${m.key}`],
+    [
+      `[叫醒] ${m.handle} 标为在等我，已经等了 ${m.duration}。先对照终端最后几行核实它是不是真的停在审批、提问或报错等待：若是，结论写“要你定”；若终端只是空闲提示符、已经做完或仅后台任务正常在跑（误报），按实际写“不用说”“还在跑”或“成了”，不要编造它在等你审批。不用工具，直接按格式回。`,
+      `程序：${m.harness} | 电脑：${m.device}`,
+      `key：${m.key}`,
+    ],
     [
       ["我之前交代你的：", m.reminder],
       ["它想执行的：", m.wants],

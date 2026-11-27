@@ -1,4 +1,14 @@
-import { useLayoutEffect, useRef, useState, type ChangeEvent, type CompositionEvent, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type CompositionEvent,
+  type FocusEvent,
+  type KeyboardEvent,
+} from "react";
 
 /**
  * Window (ms) right after `compositionend` during which a `keydown("Enter")`
@@ -7,8 +17,9 @@ import { useLayoutEffect, useRef, useState, type ChangeEvent, type CompositionEv
  */
 export const IME_GUARD_MS = 80;
 
-const MIN_TEXTAREA_PX = 34;
-const MAX_TEXTAREA_PX = 200;
+export const MIN_TEXTAREA_PX = 36;
+export const MAX_TEXTAREA_PX = 200;
+const MIN_MEASURABLE_WIDTH_PX = 32;
 
 export interface ComposerImeGate {
   composing: boolean;
@@ -61,9 +72,24 @@ export function composerEnterAction(
   return "submit";
 }
 
-function resizeTextarea(el: HTMLTextAreaElement | null, composing = false): void {
+export function resizeComposerTextarea(el: HTMLTextAreaElement | null, composing = false): void {
   if (!el) return;
   if (el.scrollLeft !== 0) el.scrollLeft = 0;
+
+  // Invariant: an empty textarea MUST always sit at single-line height, even if
+  // voice/IME composition was cancelled, cleared, blurred, or a cached tab was hidden.
+  if (el.value.length === 0) {
+    const emptyHeight = `${MIN_TEXTAREA_PX}px`;
+    if (el.style.height !== emptyHeight) el.style.height = emptyHeight;
+    if (el.style.overflowY !== "hidden") el.style.overflowY = "hidden";
+    if (el.scrollTop !== 0) el.scrollTop = 0;
+    return;
+  }
+
+  // Skip scrollHeight measurement while hidden or collapsed to a tiny width so
+  // off-screen/mid-transition reflows can never inflate the composer to MAX_TEXTAREA_PX.
+  if (el.clientWidth < MIN_MEASURABLE_WIDTH_PX) return;
+
   if (composing) {
     // Never collapse height to 0px during active voice/IME composition, which shifts cursor baseline.
     const curH = el.clientHeight || MIN_TEXTAREA_PX;
@@ -79,6 +105,7 @@ function resizeTextarea(el: HTMLTextAreaElement | null, composing = false): void
   el.style.height = `${h}px`;
   el.style.overflowY = sh > MAX_TEXTAREA_PX ? "auto" : "hidden";
   if (sh > MAX_TEXTAREA_PX) el.scrollTop = prevTop;
+  else if (el.scrollTop !== 0) el.scrollTop = 0;
 }
 
 /**
@@ -93,7 +120,9 @@ export function useComposerInput(
   onCompositionChange?: (composing: boolean) => void,
   onValueChange?: (next: string) => void,
 ) {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const roRef = useRef<ResizeObserver | null>(null);
+  const lastWidthRef = useRef<number>(-1);
   const gateRef = useRef<ComposerImeGate>(createImeGate());
   const valueRef = useRef(value);
   const onSubmitRef = useRef(onSubmit);
@@ -109,21 +138,56 @@ export function useComposerInput(
   const [isComposing, setIsComposing] = useState(false);
   const [hasComposingText, setHasComposingText] = useState(false);
   const unmanagedDuringIme = Boolean(onValueChange);
+  const unmanagedRef = useRef(unmanagedDuringIme);
+  unmanagedRef.current = unmanagedDuringIme;
+
+  const setTextareaNode = useCallback((node: HTMLTextAreaElement | null) => {
+    if (roRef.current) {
+      roRef.current.disconnect();
+      roRef.current = null;
+    }
+    textareaRef.current = node;
+    lastWidthRef.current = node ? node.clientWidth : -1;
+    if (!node) return;
+    if (unmanagedRef.current && !gateRef.current.composing && node.value !== valueRef.current) {
+      node.value = valueRef.current;
+    }
+    resizeComposerTextarea(node, gateRef.current.composing);
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => {
+        const w = node.clientWidth;
+        const widthChanged = w !== lastWidthRef.current;
+        if (widthChanged) lastWidthRef.current = w;
+        const emptyBloated = node.value.length === 0 && node.clientHeight > MIN_TEXTAREA_PX + 2;
+        if (widthChanged || emptyBloated) {
+          resizeComposerTextarea(node, gateRef.current.composing);
+        }
+      });
+      ro.observe(node);
+      roRef.current = ro;
+    }
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (roRef.current) {
+        roRef.current.disconnect();
+        roRef.current = null;
+      }
+    },
+    [],
+  );
 
   useLayoutEffect(() => {
     const el = textareaRef.current;
     if (unmanagedDuringIme && !gateRef.current.composing && el && el.value !== value) {
       el.value = value;
     }
-    resizeTextarea(el, gateRef.current.composing);
+    resizeComposerTextarea(el, gateRef.current.composing);
   }, [unmanagedDuringIme, value]);
 
-  useLayoutEffect(() => {
-    const el = textareaRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => resizeTextarea(el, gateRef.current.composing));
-    ro.observe(el);
-    return () => ro.disconnect();
+  const syncSize = useCallback(() => {
+    resizeComposerTextarea(textareaRef.current, gateRef.current.composing);
   }, []);
 
   const syncHasText = (raw: string) => {
@@ -142,7 +206,7 @@ export function useComposerInput(
     const el = e.currentTarget;
     if (el) {
       syncHasText(el.value);
-      resizeTextarea(el, true);
+      resizeComposerTextarea(el, true);
     }
   };
 
@@ -152,11 +216,12 @@ export function useComposerInput(
     setIsComposing(false);
     setHasComposingText(false);
     onCompChangeRef.current?.(false);
-    const committed = e.currentTarget?.value;
-    if (typeof committed === "string") {
-      onValueChangeRef.current?.(committed);
+    const el = e.currentTarget ?? textareaRef.current;
+    if (el) {
+      onValueChangeRef.current?.(el.value);
+      resizeComposerTextarea(el, false);
     }
-    requestAnimationFrame(() => resizeTextarea(textareaRef.current, false));
+    requestAnimationFrame(() => resizeComposerTextarea(textareaRef.current, false));
   };
 
   const onBlur = () => {
@@ -165,9 +230,17 @@ export function useComposerInput(
     setIsComposing(false);
     setHasComposingText(false);
     onCompChangeRef.current?.(false);
-    if (wasComposing && textareaRef.current) {
-      onValueChangeRef.current?.(textareaRef.current.value);
+    const el = textareaRef.current;
+    if (el) {
+      if (wasComposing) {
+        onValueChangeRef.current?.(el.value);
+      }
+      resizeComposerTextarea(el, false);
     }
+  };
+
+  const onFocus = (e: FocusEvent<HTMLTextAreaElement>) => {
+    resizeComposerTextarea(e.currentTarget, gateRef.current.composing);
   };
 
   const onChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
@@ -177,11 +250,12 @@ export function useComposerInput(
       Boolean((e.nativeEvent as unknown as { isComposing?: boolean } | undefined)?.isComposing);
     if (evComposing) {
       syncHasText(el.value);
-      resizeTextarea(el, true);
+      resizeComposerTextarea(el, true);
       return;
     }
     setHasComposingText(false);
     onValueChangeRef.current?.(el.value);
+    resizeComposerTextarea(el, false);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -217,7 +291,7 @@ export function useComposerInput(
     const el = textareaRef.current;
     if (el) {
       el.value = "";
-      resizeTextarea(el, false);
+      resizeComposerTextarea(el, false);
     }
   };
 
@@ -227,14 +301,16 @@ export function useComposerInput(
     hasText: Boolean(value.trim()) || (isComposing && hasComposingText),
     readValue,
     clearValue,
+    syncSize,
     textareaProps: {
-      ref: textareaRef,
+      ref: setTextareaNode,
       rows: 1,
       ...(unmanagedDuringIme ? { defaultValue: value, onChange } : {}),
       onCompositionStart,
       onCompositionUpdate,
       onCompositionEnd,
       onBlur,
+      onFocus,
       onKeyDown,
     },
   };

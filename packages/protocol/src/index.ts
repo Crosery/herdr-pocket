@@ -620,6 +620,48 @@ export function extractTerminalQueuedMessages(screen: string, _harness?: string)
   return found.slice(0, 20);
 }
 
+const STALE_WORKING_AFTER_TURN_END_MS = 5_000;
+const STALE_WORKING_STATUS_SLACK_MS = 1_500;
+
+/**
+ * True when an agent's reported `"working"` status is demonstrably stale relative to its
+ * live conversation transcript: the trailing meaningful event is a completed `turn_end`
+ * at least 5 seconds ago, no newer turn activity arrived after it, no outgoing prompt
+ * from this client is still awaiting a reply, and `statusSince` predates `turn_end`
+ * (meaning the terminal status monitor never left `"working"` when the turn ended —
+ * e.g. `hc` stuck on Antigravity background-task footer lines).
+ */
+export function isStaleWorkingAfterTurnEnd(opts: {
+  status: AgentStatus | undefined;
+  statusSince?: number;
+  events?: readonly ConvEvent[];
+  now?: number;
+  hasRecentOutgoing?: boolean;
+}): boolean {
+  if (opts.status !== "working") return false;
+  if (opts.hasRecentOutgoing) return false;
+  if (!opts.events || opts.events.length === 0) return false;
+  if (typeof opts.statusSince !== "number" || !Number.isFinite(opts.statusSince) || opts.statusSince <= 0) {
+    return false;
+  }
+
+  let lastMeaningful: ConvEvent | undefined;
+  for (let i = opts.events.length - 1; i >= 0; i -= 1) {
+    const ev = opts.events[i];
+    if (!ev || ev.kind === "usage") continue;
+    lastMeaningful = ev;
+    break;
+  }
+  if (!lastMeaningful || lastMeaningful.kind !== "turn_end") return false;
+  const turnEndTs = lastMeaningful.ts;
+  if (!Number.isFinite(turnEndTs) || turnEndTs <= 0) return false;
+
+  const now = opts.now ?? Date.now();
+  if (now - turnEndTs < STALE_WORKING_AFTER_TURN_END_MS) return false;
+
+  return opts.statusSince <= turnEndTs - STALE_WORKING_STATUS_SLACK_MS;
+}
+
 // ---------------------------------------------------------------------------
 // RPC methods a host serves (callable by viewers and by other hosts)
 // ---------------------------------------------------------------------------

@@ -39,7 +39,9 @@ import {
   cancelMobilePendingSwitch,
   enqueueMobilePrompt,
   ensureMobileQueueWatcher,
+  getMobileSessionEvents,
   interruptAndSendMobileQueuedPrompt,
+  isMobileAgentEffectivelyWorking,
   moveMobileQueuedPromptToTop,
   popMobileQueuedPromptForEdit,
   removeMobileQueuedPrompt,
@@ -1272,7 +1274,13 @@ export function Composer({
     const desc = [cleanModel, cleanThinking ? `思考 ${cleanThinking}` : undefined].filter(Boolean).join(" · ");
     const plan = buildHarnessSwitchCommands(agent.harness, { modelId: cleanModel, thinkingLevel: cleanThinking });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
-    if (agent.status === "working") {
+    const liveEvents =
+      getMobileSessionEvents(agent.key) ??
+      qc
+        .getQueriesData<{ events?: ConvEvent[] }>({ queryKey: ["session.events", agent.key, null] })
+        .map(([, d]) => d?.events)
+        .find((ev) => Array.isArray(ev) && ev.length > 0);
+    if (isMobileAgentEffectivelyWorking(agent, liveEvents)) {
       scheduleMobilePendingSwitch(agent, {
         ...(cleanModel ? { modelId: cleanModel } : {}),
         ...(cleanThinking ? { thinkingLevel: cleanThinking } : {}),
@@ -1697,7 +1705,14 @@ export function Composer({
       setPictures((cur) => cur.filter((x) => !pics.includes(x)));
     }
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
-    if (mode === "chat" && agent.status === "working") {
+    const cachedEvents =
+      getMobileSessionEvents(agent.key) ??
+      qc
+        .getQueriesData<{ events?: ConvEvent[] }>({ queryKey: ["session.events", agent.key, null] })
+        .map(([, d]) => d?.events)
+        .find((ev) => Array.isArray(ev) && ev.length > 0);
+    const isWorkingNow = isMobileAgentEffectivelyWorking(agent, cachedEvents, now);
+    if (mode === "chat" && isWorkingNow) {
       enqueueMobilePrompt(agent, t, pics);
       return;
     }
@@ -2002,7 +2017,7 @@ export function Composer({
                   <MaterialCommunityIcons name="flash-outline" size={13} color={p.accentText} />
                   <Text style={{ color: p.accentText, fontFamily: fonts.bodyBold, fontSize: 11.5 }}>插队</Text>
                 </Pressable>
-                {agent.status === "working" ? (
+                {isMobileAgentEffectivelyWorking(agent) ? (
                   <Pressable
                     disabled={!online || isSteering}
                     accessibilityRole="button"

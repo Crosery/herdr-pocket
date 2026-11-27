@@ -7,7 +7,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { Agent, AssistantItem, ServerFrame } from "@herdr-pocket/protocol";
 import { Relay } from "../src/server.ts";
 import type { Llm, LlmRequest, LlmResult } from "../src/assistant/llm.ts";
-import { Assistant, handlesFor, noEmoji, promisesLookWithoutTools } from "../src/assistant/assistant.ts";
+import { Assistant, findPendingBlockedToolCall, handlesFor, noEmoji, promisesLookWithoutTools } from "../src/assistant/assistant.ts";
 import { Store } from "../src/store.ts";
 import { filterTalk, normName, parseWake, splitScript, spokenTime } from "../src/assistant/speech.ts";
 import { personaPrompt, systemPrompt, voiceInstructions } from "../src/assistant/prompts.ts";
@@ -972,6 +972,73 @@ test("woken inspection reads terminal fallback when current turn has no assistan
   assert.match(material, /我让它做的：\n把终端打包问题修掉/);
   assert.doesNotMatch(material, /上一轮的旧回答/);
   assert.match(material, /它的终端最后 40 行：\nBundling Herdr Pocket\.app/);
+});
+
+test("findPendingBlockedToolCall ignores completed tool calls and onBlocked suppresses false-alarm verdicts", async () => {
+  // 1. Completed tool_call (with matching tool_result or later assistant_message) must NOT be treated as pending.
+  assert.equal(
+    findPendingBlockedToolCall([
+      { id: "1", session: "s", ts: 1, kind: "tool_call", call_id: "c1", name: "run_command", input: { command: "lark-cli im list" } },
+      { id: "2", session: "s", ts: 2, kind: "tool_result", call_id: "c1", output: "ok", is_error: false },
+      { id: "3", session: "s", ts: 3, kind: "assistant_message", text: "巡检完毕，暂无新消息。" },
+    ]),
+    undefined,
+  );
+  assert.equal(
+    findPendingBlockedToolCall([
+      { id: "1", session: "s", ts: 1, kind: "tool_call", call_id: "c1", name: "run_command", input: { command: "echo hi" } },
+      { id: "2", session: "s", ts: 2, kind: "tool_result", call_id: "c1", output: "hi", is_error: false },
+    ]),
+    undefined,
+  );
+  // 2. Genuinely pending tool_call (no tool_result yet) IS returned.
+  const pending = findPendingBlockedToolCall([
+    { id: "1", session: "s", ts: 1, kind: "tool_call", call_id: "c1", name: "run_command", input: { command: "rm -rf dist" } },
+  ]);
+  assert.equal(pending?.call_id, "c1");
+
+  // 3. When blockedMaterial runs on an idle reviewing terminal with only completed tool calls,
+  // `wants` is omitted and a model verdict of "还在跑" / "不用说" suppresses the noisy "等你" alert.
+  let seenBlockedMaterial = "";
+  const { publish } = await fakeHost("Mac FalseBlock", (method) => {
+    if (method === "terminal.read") {
+      return {
+        text: "1 artifact · /artifact to review\n────────────\n>\n────────────\n  ● [12:15:38] cron running\nGemini 4 Neon · 15% ctx · reviewing",
+      };
+    }
+    if (method === "session.events") {
+      return {
+        sessionKey: "antigravity:fb1",
+        more: false,
+        events: [
+          { id: "e1", session: "antigravity:fb1", ts: 1, kind: "tool_call", call_id: "c1", name: "run_command", input: { command: "lark-cli read" } },
+          { id: "e2", session: "antigravity:fb1", ts: 2, kind: "tool_result", call_id: "c1", output: "done", is_error: false },
+          { id: "e3", session: "antigravity:fb1", ts: 3, kind: "assistant_message", text: "已检查完。" },
+        ],
+      };
+    }
+    return undefined;
+  });
+  const phone = await pair("viewer", "FalseBlock Phone");
+  const push = await Sock.open("/v1/notify", phone.token);
+  await push.next((f) => f.type === "hello");
+
+  wake = (req) => {
+    seenBlockedMaterial = String(req.messages[0]?.content ?? "");
+    return text("还在跑\n后台定时任务在跑，界面是空闲提示符，不需要审批。");
+  };
+
+  publish([agent("fb1", "working", "飞书巡检")]);
+  await sleep(25);
+  publish([agent("fb1", "blocked", "飞书巡检")]);
+  await sleep(120);
+  assert.ok(seenBlockedMaterial.length > 0, "wakeBlocked should have inspected the terminal");
+  assert.doesNotMatch(seenBlockedMaterial, /它想执行的/, "completed tool_call must not be fed as wants");
+  assert.equal(
+    push.frames.some((f) => f.type === "notice" && f.notice.title.includes("飞书巡检")),
+    false,
+    "false-alarm blocked verdict (还在跑) must not emit a 等你 alert",
+  );
 });
 
 test("wake 429 quota exhaustion pauses wake retries for 5m without error spam and falls back cleanly", async () => {

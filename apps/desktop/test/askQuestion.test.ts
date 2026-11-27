@@ -283,3 +283,33 @@ test("multi-harness Ask parsing & universal arrow-key navigation work across Ant
     ["2", "enter"],
   );
 });
+
+test("parseTerminalChoices rejects Antigravity reviewing footer and background task bullet lists (IMG_0092 regression)", () => {
+  const antigravityReviewingScreen = [
+    "已完成巡检，当前无新消息。",
+    "                              1 artifact · /artifact to review",
+    "──────────────────────────────────────────────────────────────",
+    ">",
+    "──────────────────────────────────────────────────────────────",
+    "  ● [12:15:38] cron (every 3 minutes) running",
+    "  ● [12:10:53] nginx -g 'daemon off;' -c /tmp/nginx.conf running",
+    "──────────────────────────────────────────────────────────────",
+    "Gemini 4 Neon (XHigh) · 15% ctx · reviewing",
+  ];
+  assert.deepEqual(parseTerminalChoices(antigravityReviewingScreen), []);
+
+  // Pure all-filled bullet lists with no cursor pointer and no unfilled radio (`○`) are log lists, not menus.
+  assert.deepEqual(
+    parseTerminalChoices([
+      "  ● Background worker A running",
+      "  ● Background worker B running",
+    ]),
+    [],
+  );
+
+  // Genuine radio menus (with at least one unfilled `○` or an explicit pointer) still parse cleanly.
+  const validRadio = parseTerminalChoices(["  ● Keep current config", "  ○ Reset to defaults"]);
+  assert.equal(validRadio.length, 2);
+  assert.equal(validRadio[0]!.selected, true);
+  assert.equal(validRadio[1]!.selected, false);
+});

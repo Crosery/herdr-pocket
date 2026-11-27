@@ -931,6 +931,28 @@ function runQueueDrainTick(): void {
   }
 }
 
+/**
+ * Drains the next queued prompt for `agent` when the chat transcript proves the agent's
+ * turn has already ended (`!isTurnBusy`) even if an older `hostd` is still reporting stale `"working"`.
+ */
+export function drainAgentQueueIfReady(agent: Pick<Agent, "key" | "deviceId" | "status">): void {
+  const now = Date.now();
+  if (inFlightAgents.has(agent.key)) return;
+  const live = liveStore.get();
+  if (!live.devices[agent.deviceId]?.online) return;
+  const queue = chatQueueStore.get().queuedByAgent[agent.key] ?? EMPTY_QUEUED;
+  if (!queue.length) return;
+  const track = dispatchState.get(agent.key);
+  if (track && now - track.lastDispatchedAt < DRAIN_COOLDOWN_MS) return;
+  const nextItem = queue[0]!;
+  updateQueued(agent.key, (list) => list.slice(1));
+  inFlightAgents.add(agent.key);
+  dispatchState.set(agent.key, { lastDispatchedAt: now, sawWorking: false });
+  void sendPromptNow(agent, nextItem.text, nextItem.attachments).finally(() => {
+    inFlightAgents.delete(agent.key);
+  });
+}
+
 export function ensureChatQueueWatcher(): void {
   if (watcherInstalled || typeof window === "undefined") return;
   watcherInstalled = true;
