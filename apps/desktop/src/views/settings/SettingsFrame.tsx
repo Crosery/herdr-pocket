@@ -193,7 +193,23 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
         <Dialog.Overlay className="sf-backdrop" />
         <Dialog.Content
           className="settings-frame"
+          data-tour="settings-frame"
           aria-describedby={undefined}
+          onPointerDownOutside={(e) => {
+            if ((e.target as HTMLElement | null)?.closest?.('[data-tour-ui="true"]')) {
+              e.preventDefault();
+            }
+          }}
+          onInteractOutside={(e) => {
+            if ((e.target as HTMLElement | null)?.closest?.('[data-tour-ui="true"]')) {
+              e.preventDefault();
+            }
+          }}
+          onFocusOutside={(e) => {
+            if ((e.target as HTMLElement | null)?.closest?.('[data-tour-ui="true"]')) {
+              e.preventDefault();
+            }
+          }}
           onEscapeKeyDown={(e) => {
             const target = e.target as HTMLElement | null;
             if (target?.dataset?.escapeLocal === "true") {
@@ -223,7 +239,7 @@ export function SettingsFrame({ onPairPhone, onConnectRelay, onAddComputer, onRe
               }}
             >
               <GraduationCap size={14} />
-              <span>重温互动教程</span>
+              <span>重温新手引导</span>
             </button>
             <button className="sf-outline-btn" disabled={!native.available()} onClick={() => void exportDiagnostics()}>
               <FileDown size={14} />

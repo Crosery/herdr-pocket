@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Laptop, Monitor, MoreHorizontal, Plus, Smartphone } from "lucide-react";
 import type { Device } from "@herdr-pocket/protocol";
 import { PocketBadge, PocketButton, PocketIconButton, PocketModal, fs } from "../components/PocketUI";
@@ -25,6 +25,22 @@ export function MobileDevicesTab({
   const [confirmRemove, setConfirmRemove] = useState<Device | null>(null);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
+
+  useEffect(() => {
+    const onTourCommand = (ev: Event) => {
+      const cmd = (ev as CustomEvent<{ action?: string }>).detail?.action;
+      if (cmd === "closeModals") {
+        setInviteOpen(false);
+        setMoreDevice(null);
+        setConfirmRemove(null);
+        setToolsOpen(false);
+      } else if (cmd === "openAddComputer") {
+        setInviteOpen(true);
+      }
+    };
+    window.addEventListener("pocket:tour-command", onTourCommand);
+    return () => window.removeEventListener("pocket:tour-command", onTourCommand);
+  }, []);
 
   const { desktop, mobile, desktopOnlineCount, mobileOnlineCount } = useMemo(
     () => partitionDevices(devicesMap, { myId, localHostId }),
@@ -103,7 +119,7 @@ export function MobileDevicesTab({
             {onlineCount} 台在线 · 共 {totalCount} 台
           </div>
         </div>
-        <div className="row" style={{ gap: 6 }}>
+        <div className="row" style={{ gap: 6 }} data-tour="mp-devices-actions">
           <PocketButton size="sm" variant="soft" onClick={onPairPhone}>
             配对手机
           </PocketButton>

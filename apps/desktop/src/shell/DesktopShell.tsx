@@ -200,6 +200,31 @@ export function DesktopShell({
   useEffect(() => startAttentionCenter(), []);
   useEffect(() => installWindowFocusTelemetry(), []);
   useEffect(() => installBrowserAiBridgeListeners(() => showPanel("browser")), []);
+  useEffect(() => {
+    const onTourCommand = (ev: Event) => {
+      const cmd = (ev as CustomEvent<{ action?: string }>).detail?.action;
+      if (cmd === "closeModals") {
+        setCreate(null);
+        setAddComputer(false);
+        setHelpOpen(false);
+        closeSettingsFrame();
+        window.dispatchEvent(new CustomEvent("pocket:close-popovers", { detail: "tour" }));
+      } else if (cmd === "openMachinesSettings") {
+        setCreate(null);
+        setAddComputer(false);
+        openSettingsFrame("machines");
+      } else if (cmd === "openAddComputer") {
+        openSettingsFrame("machines");
+        setAddComputer(true);
+      } else if (cmd === "openCreateSpace") {
+        closeSettingsFrame();
+        setAddComputer(false);
+        setCreate({ host: null, space: null, preferNewSpace: true });
+      }
+    };
+    window.addEventListener("pocket:tour-command", onTourCommand);
+    return () => window.removeEventListener("pocket:tour-command", onTourCommand);
+  }, []);
 
   const agents = useMemo(() => allAgents(agentsMap).filter((a) => showShells || !a.isShell), [agentsMap, showShells]);
   const hosts = useMemo(() => Object.values(devices).filter((d) => d.kind === "host"), [devices]);
@@ -889,8 +914,8 @@ export function DesktopShell({
         terms: "theme dark light 外观",
         run: () => updateSettings({ theme: isDark ? "light" : "dark" }),
       },
-      { id: "tutorial-replay", group: "操作", label: "重温互动教程", icon: BookOpen, terms: "tutorial onboarding 教程 练习 新手", run: openInteractiveTutorialReplay },
-      { id: "guide", group: "操作", label: "重新打开新手引导", icon: BookOpen, run: onReopenGuide },
+      { id: "tutorial-replay", group: "操作", label: "重温新手引导", icon: BookOpen, terms: "tutorial onboarding 教程 引导 新手", run: openInteractiveTutorialReplay },
+      { id: "guide", group: "操作", label: "重新打开首次接入向导", icon: BookOpen, run: onReopenGuide },
     );
     for (const f of FRAME_ITEMS) {
       list.push({

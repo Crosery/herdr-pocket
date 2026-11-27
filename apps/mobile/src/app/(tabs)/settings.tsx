@@ -218,6 +218,13 @@ export default function SettingsScreen() {
             sub="查看并直接更新已连接电脑上的 hc、Herdr、uniflo 与守护进程"
             onPress={() => setHostToolsOpen(true)}
           />
+          <Divider />
+          <Row
+            icon="compass-outline"
+            title="重温新手引导"
+            sub="直接在真实页面走一遍添加电脑、扫码配对、新建空间与小羊助理"
+            onPress={() => useLive.setState({ tutorialReplayOpen: true })}
+          />
         </Card>
 
         <View style={{ alignItems: "center", gap: 6, paddingTop: space.xxxl }}>

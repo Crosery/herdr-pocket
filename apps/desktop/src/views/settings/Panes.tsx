@@ -164,10 +164,10 @@ export function StartupRows() {
 function GuideRow({ onReopenGuide }: { onReopenGuide: () => void }) {
   return (
     <>
-      <SetHeading>新手互动教程</SetHeading>
-      <SetRow title="重温新手互动教程" about="在独立模拟练习环境中体验 5 步上手流程，不会影响任何真实任务">
+      <SetHeading>新手实景引导</SetHeading>
+      <SetRow title="重温新手引导" about="直接在真实工作台界面逐步高亮演示：添加电脑、手机扫码、创建空间、新建 Tab、分屏与右侧面板">
         <PocketButton size="sm" variant="soft" onClick={openInteractiveTutorialReplay}>
-          开始练习
+          开始引导
         </PocketButton>
       </SetRow>
       {isTauri() ? (

@@ -137,7 +137,7 @@ export function PairPhoneModal({
   onNeedRelay?: () => void;
 }) {
   return (
-    <PocketModal open={open} onOpenChange={onOpenChange} title="扫码连接手机" subtitle="手机扫码后就能随时查看、回复所有电脑上的 Agent" width={600}>
+    <PocketModal open={open} onOpenChange={onOpenChange} title="扫码连接手机" subtitle="手机扫码后就能随时查看、回复所有电脑上的 Agent" width={600} dataTour="pair-phone-modal">
       {open ? <PairPhonePanel onNeedRelay={onNeedRelay} /> : null}
     </PocketModal>
   );

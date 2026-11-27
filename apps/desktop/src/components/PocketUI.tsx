@@ -355,6 +355,7 @@ export function PocketModal({
   width = 520,
   className = "",
   hideHeader = false,
+  dataTour,
   children,
 }: {
   open: boolean;
@@ -364,6 +365,7 @@ export function PocketModal({
   width?: number;
   className?: string;
   hideHeader?: boolean;
+  dataTour?: string;
   children: ReactNode;
 }) {
   useEffect(() => {
@@ -374,11 +376,23 @@ export function PocketModal({
     overlayStore.set((p) => ({ open: p.open + 1 }));
     return () => overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
   }, [open]);
+  const preventTourOutside = (e: { target: EventTarget | null; preventDefault: () => void }) => {
+    if ((e.target as HTMLElement | null)?.closest?.('[data-tour-ui="true"]')) {
+      e.preventDefault();
+    }
+  };
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="pk-overlay" />
-        <Dialog.Content className={`pk-dialog${className ? ` ${className}` : ""}`} style={{ maxWidth: width }}>
+        <Dialog.Content
+          className={`pk-dialog${className ? ` ${className}` : ""}`}
+          style={{ maxWidth: width }}
+          data-tour={dataTour}
+          onPointerDownOutside={preventTourOutside}
+          onInteractOutside={preventTourOutside}
+          onFocusOutside={preventTourOutside}
+        >
           {hideHeader ? (
             <>
               <Dialog.Title className="sr-only">{title}</Dialog.Title>

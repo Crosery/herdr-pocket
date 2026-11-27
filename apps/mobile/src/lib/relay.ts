@@ -14,8 +14,9 @@ import {
   type RpcResult,
   type ServerFrame,
   type StreamKind,
+  type TutorialStatus,
 } from "@herdr-pocket/protocol";
-import { useLive } from "./store";
+import { mergeMobileTutorialStatus, useLive, useSettings } from "./store";
 import { isMockServer, mockLink, mockApi } from "./mock";
 import { loadAssistant, onAssistantFrame } from "./assistant";
 import { onLinkBack } from "./assistantConfig";
@@ -107,6 +108,24 @@ export async function answerJoinRequest(server: string, token: string, id: strin
   const r = await rest<{ device?: Device }>(server, `/v1/join/${encodeURIComponent(id)}/${allow ? "approve" : "deny"}`, { method: "POST", token });
   applog("info", "pair", `${allow ? "approved" : "denied"} a join request${r.device ? ` for "${r.device.name}"` : ""}`);
   return r.device ?? null;
+}
+
+export async function persistTutorialStatus(server: string | null, token: string | null, status: TutorialStatus): Promise<void> {
+  const merged = mergeMobileTutorialStatus(useSettings.getState().tutorialStatus, status);
+  useSettings.getState().set({ tutorialStatus: merged });
+  if (!server || !token || isMockServer(server)) return;
+  try {
+    const r = await rest<{ status?: TutorialStatus }>(server, "/v1/tutorial", {
+      method: "POST",
+      token,
+      body: JSON.stringify({ status: merged }),
+    });
+    if (r.status !== undefined) {
+      useSettings.getState().set({ tutorialStatus: mergeMobileTutorialStatus(merged, r.status) });
+    }
+  } catch {
+    // Offline or older relay: local monotonic state already saved.
+  }
 }
 
 /** False only when the relay positively says this token is no longer valid. */
@@ -271,14 +290,30 @@ class SocketLink implements Link {
 
   private onFrame(f: ServerFrame) {
     switch (f.type) {
-      case "welcome":
+      case "welcome": {
         this.welcomed = true;
-        useLive.setState({ self: f.device, link: "online", lastError: null });
+        const mergedTutorial =
+          f.tutorialStatus !== undefined
+            ? mergeMobileTutorialStatus(useSettings.getState().tutorialStatus, f.tutorialStatus)
+            : useSettings.getState().tutorialStatus;
+        if (mergedTutorial !== useSettings.getState().tutorialStatus) {
+          useSettings.getState().set({ tutorialStatus: mergedTutorial });
+        }
+        useLive.setState({ self: f.device, link: "online", lastError: null, tutorialServerSynced: true });
         notifyReleaseAvailable(f.latestRelease || f.serverVersion);
         // Catch up on anything the assistant said, or another phone changed, while this socket was down.
         void loadAssistant();
         onLinkBack();
         break;
+      }
+      case "tutorial_state": {
+        const mergedTutorial = mergeMobileTutorialStatus(useSettings.getState().tutorialStatus, f.status);
+        if (mergedTutorial !== useSettings.getState().tutorialStatus) {
+          useSettings.getState().set({ tutorialStatus: mergedTutorial });
+        }
+        useLive.setState({ tutorialServerSynced: true });
+        break;
+      }
       case "release_update":
         notifyReleaseAvailable(f.version);
         break;

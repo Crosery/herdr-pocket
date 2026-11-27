@@ -4102,6 +4102,7 @@ export function CreateAgentModal({
             : "选择工作目录并添加新标签到对应空间"
         }
         width={540}
+        dataTour="create-agent-modal"
       >
         <div className="stack">
           {hosts.length > 0 && (hostPickerOpen || (!preferNewSpace && hosts.length > 1)) ? (

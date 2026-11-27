@@ -182,6 +182,7 @@ export function MobileAppShell({
               <button
                 key={item.id}
                 type="button"
+                data-tour={`mp-tab-${item.id}`}
                 className={`mp-tab-btn${active ? " active" : ""}`}
                 onClick={() => {
                   if (item.id === "agents" && tab === "agents") {

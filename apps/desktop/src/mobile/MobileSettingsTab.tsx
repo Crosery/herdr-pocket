@@ -238,12 +238,12 @@ export function MobileSettingsTab({
           </div>
           <ChevronRight size={16} className="faint" />
         </button>
-        <button type="button" className="mp-setting-row" onClick={() => openInteractiveTutorialReplay()}>
+        <button type="button" data-tour="mp-settings-tutorial" className="mp-setting-row" onClick={() => openInteractiveTutorialReplay()}>
           <div className="row" style={{ gap: 10 }}>
             <GraduationCap size={17} style={{ color: "var(--mp-accent-text)" }} />
             <div>
-              <div style={{ fontWeight: 700, fontSize: fs(14.5) }}>重温互动教程</div>
-              <div className="faint" style={{ fontSize: fs(12) }}>在安全练习环境快速回顾 5 步核心用法</div>
+              <div style={{ fontWeight: 700, fontSize: fs(14.5) }}>重温新手引导</div>
+              <div className="faint" style={{ fontSize: fs(12) }}>在真实界面逐步演示添加电脑、扫码配对与新建任务</div>
             </div>
           </div>
           <ChevronRight size={16} className="faint" />

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Menu, Plus, Search, Terminal, X } from "lucide-react";
 import type { Agent, AgentStatus, Device } from "@herdr-pocket/protocol";
 import { XiaoyangOrb } from "../components/MascotAndVendor";
@@ -69,6 +69,19 @@ export function MobileAgentsTab({
   const [foldedGroups, setFoldedGroups] = useState<GroupKey[]>([]);
   const [fabCompact, setFabCompact] = useState(false);
   const lastScrollRef = useRef(0);
+
+  useEffect(() => {
+    const onTourCommand = (ev: Event) => {
+      const cmd = (ev as CustomEvent<{ action?: string }>).detail?.action;
+      if (cmd === "closeModals") {
+        setCreateOpen(false);
+        setDrawerOpen(false);
+        setMenu(null);
+      }
+    };
+    window.addEventListener("pocket:tour-command", onTourCommand);
+    return () => window.removeEventListener("pocket:tour-command", onTourCommand);
+  }, []);
 
   const hosts = useMemo(() => {
     const list: Device[] = Object.values(devices).filter((d) => d.kind === "host");
@@ -224,9 +237,11 @@ export function MobileAgentsTab({
         <div className="stack" style={{ gap: 12 }}>
           <div className="between" style={{ gap: 8 }}>
             <div className="row" style={{ gap: 8, minWidth: 0 }}>
-              <PocketIconButton tooltip="筛选电脑与空间" onClick={() => setDrawerOpen(true)}>
-                <Menu size={18} />
-              </PocketIconButton>
+              <span data-tour="mp-agents-drawer-btn" style={{ display: "inline-flex" }}>
+                <PocketIconButton tooltip="筛选电脑与空间" onClick={() => setDrawerOpen(true)}>
+                  <Menu size={18} />
+                </PocketIconButton>
+              </span>
               <div style={{ minWidth: 0 }}>
                 <h1 className="cute-font mp-page-title" style={{ fontSize: 22 }}>{greeting()}</h1>
                 <div className="mp-page-sub truncate">{headline}</div>
@@ -385,6 +400,7 @@ export function MobileAgentsTab({
 
       <button
         type="button"
+        data-tour="mp-agents-fab"
         className={`fab-new${fabCompact ? " compact" : ""}`}
         aria-label="新建 Agent"
         onClick={() => openCreate(hostFilter, activeSpace)}

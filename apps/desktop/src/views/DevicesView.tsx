@@ -227,7 +227,7 @@ export function AddDeviceModal({ open, onOpenChange }: { open: boolean; onOpenCh
   const hostCmd = installHostCommand(srv);
 
   return (
-    <PocketModal open={open} onOpenChange={onOpenChange} title="添加新设备" subtitle="选择新设备类型，使用二维码或命令行接入" width={480}>
+    <PocketModal open={open} onOpenChange={onOpenChange} title="添加新设备" subtitle="选择新设备类型，使用二维码或命令行接入" width={480} dataTour="add-device-modal">
       <div className="stack">
         <div className="segmented" style={{ alignSelf: "flex-start" }}>
           <button className={kind === "host" ? "active" : ""} onClick={() => setKind("host")}>接入电脑 (Host)</button>

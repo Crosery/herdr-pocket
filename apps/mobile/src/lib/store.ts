@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { create } from "zustand";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
-import type { Agent, ChatDisplayMode, Device, PortalDisplayMode } from "@herdr-pocket/protocol";
+import type { Agent, ChatDisplayMode, Device, PortalDisplayMode, TutorialStatus } from "@herdr-pocket/protocol";
 import type { TermKeyLayout } from "./termkeys";
 
 export const safeAsyncStorage: StateStorage = {
@@ -101,6 +101,8 @@ interface SettingsState {
   voiceTier: "auto" | "denoise" | "sv" | "tse";
   voiceFirstSpeaker: boolean;
   voiceprint: SavedVoiceprint | null;
+  /** First-run real-UI walkthrough progress synced monotonically with the relay (0=new, 1=skipped, 2=done). */
+  tutorialStatus: TutorialStatus;
   hydrated: boolean;
   set: (patch: Partial<Omit<SettingsState, "set" | "hydrated">>) => void;
   signOut: () => void;
@@ -138,6 +140,7 @@ export const useSettings = create<SettingsState>()(
       voiceTier: "auto",
       voiceFirstSpeaker: false,
       voiceprint: null,
+      tutorialStatus: 0,
       hydrated: false,
       set: (patch) => set(patch),
       signOut: () =>
@@ -172,6 +175,10 @@ interface LiveState {
   lastError: string | null;
   /** Computers this phone reaches directly (no relay): device id -> the address used. */
   direct: Record<string, string>;
+  /** True once the relay has sent welcome.tutorialStatus for this connection. */
+  tutorialServerSynced: boolean;
+  /** Manual replay trigger from Settings. */
+  tutorialReplayOpen: boolean;
   reset: () => void;
 }
 
@@ -183,8 +190,26 @@ export const useLive = create<LiveState>()((set) => ({
   agents: {},
   lastError: null,
   direct: {},
-  reset: () => set({ link: "idle", rttMs: null, self: null, devices: {}, agents: {}, lastError: null, direct: {} }),
+  tutorialServerSynced: false,
+  tutorialReplayOpen: false,
+  reset: () =>
+    set({
+      link: "idle",
+      rttMs: null,
+      self: null,
+      devices: {},
+      agents: {},
+      lastError: null,
+      direct: {},
+      tutorialServerSynced: false,
+      tutorialReplayOpen: false,
+    }),
 }));
+
+export function mergeMobileTutorialStatus(local: TutorialStatus, incoming: unknown): TutorialStatus {
+  const n = incoming === 2 ? 2 : incoming === 1 ? 1 : 0;
+  return (n > local ? n : local) as TutorialStatus;
+}
 
 export function allAgents(agents: Record<string, Agent[]>): Agent[] {
   return Object.values(agents).flat();

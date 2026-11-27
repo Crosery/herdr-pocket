@@ -582,18 +582,24 @@ const TabChip = memo(function TabChip({
   );
 });
 
-function Popup({ x, y, onClose, children, width = 220 }: { x: number; y: number; onClose: () => void; children: React.ReactNode; width?: number }) {
+function Popup({ x, y, onClose, children, width = 220, dataTour }: { x: number; y: number; onClose: () => void; children: React.ReactNode; width?: number; dataTour?: string }) {
   useEffect(() => {
-    const off = () => onClose();
+    const off = (e?: Event) => {
+      if ((e?.target as HTMLElement | null)?.closest?.('[data-tour-ui="true"]')) return;
+      onClose();
+    };
+    const closeAll = () => onClose();
     const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("pointerdown", off);
-    window.addEventListener("blur", off);
+    window.addEventListener("blur", closeAll);
     window.addEventListener("keydown", esc);
+    window.addEventListener("pocket:close-popovers", closeAll);
     overlayStore.set((p) => ({ open: p.open + 1 }));
     return () => {
       window.removeEventListener("pointerdown", off);
-      window.removeEventListener("blur", off);
+      window.removeEventListener("blur", closeAll);
       window.removeEventListener("keydown", esc);
+      window.removeEventListener("pocket:close-popovers", closeAll);
       overlayStore.set((p) => ({ open: Math.max(0, p.open - 1) }));
     };
   }, [onClose]);
@@ -601,6 +607,7 @@ function Popup({ x, y, onClose, children, width = 220 }: { x: number; y: number;
     <div
       className="ctx-menu v3-popup"
       role="menu"
+      data-tour={dataTour}
       // Menus open inside header/tabs bars: a press on a menu must not move the window.
       data-tauri-drag-region="false"
       style={{
@@ -994,34 +1001,37 @@ export const ShellTabs = memo(function ShellTabs({ onNewTerminal, onNewAgent, pa
           );
         })}
       </div>
-      <button
-        className="v3-icon-btn has-hint"
-        aria-label="新建终端"
-        title={`新建终端（${shortcutText("newAgent")}）· 右键查看更多`}
-        onClick={onNewTerminal}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          const r = e.currentTarget.getBoundingClientRect();
-          setNewMenu({ x: r.left, y: r.bottom + 4 });
-        }}
-      >
-        <Plus size={16} />
-        <SpatialHint text={shortcutText("newAgent")} corner="tr" />
-      </button>
-      <button
-        className="v3-icon-btn small"
-        aria-label="更多新建选项"
-        title="新建终端、Agent、网页或文件…"
-        onClick={(e) => {
-          const r = e.currentTarget.getBoundingClientRect();
-          setNewMenu(newMenu ? null : { x: r.left, y: r.bottom + 4 });
-        }}
-        onPointerDown={(e) => e.stopPropagation()}
-      >
-        <ChevronDown size={13} />
-      </button>
+      <div className="v3-tabs-new-group" data-tour="tabs-new-group" style={{ display: "inline-flex", alignItems: "center", gap: 2, flex: "none" }}>
+        <button
+          className="v3-icon-btn has-hint"
+          aria-label="新建终端"
+          title={`新建终端（${shortcutText("newAgent")}）· 右键查看更多`}
+          onClick={onNewTerminal}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            const r = e.currentTarget.getBoundingClientRect();
+            setNewMenu({ x: r.left, y: r.bottom + 4 });
+          }}
+        >
+          <Plus size={16} />
+          <SpatialHint text={shortcutText("newAgent")} corner="tr" />
+        </button>
+        <button
+          className="v3-icon-btn small"
+          aria-label="更多新建选项"
+          title="新建终端、Agent、网页或文件…"
+          data-tour="tabs-new-dropdown-btn"
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            setNewMenu(newMenu ? null : { x: r.left, y: r.bottom + 4 });
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <ChevronDown size={13} />
+        </button>
+      </div>
       <div className="v3-tabs-drag-gap" aria-hidden="true" />
-      <div className="v3-tabs-right">
+      <div className="v3-tabs-right" data-tour="tabs-right-panels">
         {panelBtn("files", "文件", FolderTree, shortcutText("togglePanel"))}
         {panelBtn("git", "Git", GitBranch, shortcutText("toggleGit"))}
         {panelBtn("browser", "浏览器", Globe, shortcutText("toggleBrowser"))}
@@ -1029,7 +1039,7 @@ export const ShellTabs = memo(function ShellTabs({ onNewTerminal, onNewAgent, pa
       </div>
 
       {newMenu ? (
-        <Popup x={newMenu.x} y={newMenu.y} onClose={() => setNewMenu(null)}>
+        <Popup x={newMenu.x} y={newMenu.y} onClose={() => setNewMenu(null)} dataTour="tabs-new-popup">
           <MenuItem label="新建终端" icon={Terminal} keys={shortcutText("newAgent")} onClick={() => (setNewMenu(null), onNewTerminal())} />
           <MenuItem label="新建 Agent…" icon={Plus} onClick={() => (setNewMenu(null), onNewAgent())} />
           <MenuItem label="打开网页" icon={Globe} onClick={() => (setNewMenu(null), openWebTab(homePage || "about:blank", undefined, { spaceKey: selectedSpace }))} />
@@ -1480,7 +1490,7 @@ function PaneHead({
           )}
         </>
       )}
-      <div className="v3-pane-right">
+      <div className="v3-pane-right" data-tour="pane-actions" data-tour-focused={isFocused ? "true" : undefined}>
         {lineBadge ? <span className="v3-pane-pill accent">{lineBadge}</span> : null}
         {sizeText ? <span className="v3-pane-pill num">{sizeText}</span> : null}
         {content.kind === "agent" && group === "offline" ? <span className="v3-pane-off">电脑离线</span> : null}
@@ -2373,7 +2383,7 @@ function EmptyMain({ onNewTerminal, onNewAgent }: { onNewTerminal: () => void; o
         }
       }}
     >
-      <div className="v3-blank">
+      <div className="v3-blank" data-tour="shell-main-empty">
         <div className="v3-blank-mascot">
           <XiaoyangOrb mood="hello" size={72} />
         </div>
@@ -3478,7 +3488,7 @@ function ShellPanelOpen({ panel }: { panel: PanelId }) {
   const showSub = Boolean(subTitleText);
 
   return (
-    <aside className="v3-panel" style={{ width }} aria-label={PANEL_TITLE[panel]}>
+    <aside className="v3-panel" data-tour="shell-panel" style={{ width }} aria-label={PANEL_TITLE[panel]}>
       <div
         className="v3-panel-resize"
         role="separator"

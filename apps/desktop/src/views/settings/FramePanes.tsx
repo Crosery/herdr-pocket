@@ -1216,7 +1216,7 @@ export function MachinesPane({
         <div className="faint sf-note">暂无已接入的桌面端</div>
       )}
       <div className="sf-actions">
-        <PocketButton size="sm" variant="ghost" onClick={onAddComputer}>
+        <PocketButton size="sm" variant="ghost" data-tour="machines-add-computer" onClick={onAddComputer}>
           <Plus size={14} />
           <span>添加电脑</span>
         </PocketButton>
@@ -1235,7 +1235,7 @@ export function MachinesPane({
         <div className="faint sf-note">暂无已配对的移动端</div>
       )}
       <div className="sf-actions">
-        <PocketButton size="sm" variant="soft" onClick={onPairPhone}>
+        <PocketButton size="sm" variant="soft" data-tour="machines-pair-phone" onClick={onPairPhone}>
           <QrCode size={14} />
           <span>扫码连接手机</span>
         </PocketButton>

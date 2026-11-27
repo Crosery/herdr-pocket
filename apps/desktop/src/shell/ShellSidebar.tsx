@@ -1055,6 +1055,7 @@ export const ShellSidebar = memo(function ShellSidebar({
           className={`v3-block v3-block-spaces${!collapsed && spacesRatio !== null ? " has-ratio" : ""}`}
           style={!collapsed && spacesRatio !== null ? ({ "--v3-spaces-ratio": String(spacesRatio) } as CSSProperties) : undefined}
           aria-label="空间"
+          data-tour="sidebar-spaces-block"
         >
           {collapsed ? null : (
             <div className="v3-block-head">
@@ -1065,6 +1066,7 @@ export const ShellSidebar = memo(function ShellSidebar({
                 className="v3-icon-btn small"
                 aria-label="新建空间"
                 title={`新建空间（${shortcutText("newSpace")}）`}
+                data-tour="sidebar-new-space"
                 onClick={() => onNewSpace(null)}
               >
                 <Plus size={14} />
@@ -1267,6 +1269,7 @@ export const ShellSidebar = memo(function ShellSidebar({
         <section
           className="v3-block v3-block-agents"
           aria-label="Agent"
+          data-tour="sidebar-agents-block"
           onPointerEnter={() => setHoverFreeze(true)}
           onPointerLeave={() => setHoverFreeze(false)}
         >
@@ -1275,7 +1278,7 @@ export const ShellSidebar = memo(function ShellSidebar({
               <span>Agent</span>
               <span className="v3-count v3-sec-count">{inScope.length}</span>
               <span className="grow" />
-              <div className="v3-seg-mini" role="tablist" aria-label="Agent 列表分组方式">
+              <div className="v3-seg-mini" role="tablist" aria-label="Agent 列表分组方式" data-tour="sidebar-agents-grouping">
                 {(
                   [
                     { key: "status", label: "状态", title: "按需要你 / 运行中 / 已完成状态分组" },
@@ -1362,7 +1365,7 @@ export const ShellSidebar = memo(function ShellSidebar({
       </div>
 
       <div className="v3-footer">
-        <button className="v3-foot-row has-hint" title={collapsed ? "设置" : `设置（${shortcutText("settings")}）`} onClick={() => openSettingsFrame(updateReady ? "updates" : "look")}>
+        <button className="v3-foot-row has-hint" data-tour="sidebar-settings" title={collapsed ? "设置" : `设置（${shortcutText("settings")}）`} onClick={() => openSettingsFrame(updateReady ? "updates" : "look")}>
           <Settings size={14} />
           {collapsed ? null : <span className="grow truncate">设置</span>}
           {updateReady ? <span className="v3-update-dot" aria-label="有新版本" /> : null}
@@ -1370,6 +1373,7 @@ export const ShellSidebar = memo(function ShellSidebar({
         </button>
         <button
           className="v3-foot-row"
+          data-tour="sidebar-server"
           title={collapsed ? "连接中转服务器" : connected ? "查看电脑与中继" : undefined}
           onClick={() => (server && !demo ? openSettingsFrame("machines") : onConnectRelay())}
         >
@@ -1379,7 +1383,7 @@ export const ShellSidebar = memo(function ShellSidebar({
           )}
           <span className={`v3-dot ${connected ? "ok" : link === "connecting" ? "warn" : "off"}${collapsed ? " corner" : ""}`} aria-label={connected ? "已连接" : "未连接"} />
         </button>
-        <button className="v3-foot-row" title={collapsed ? "扫码连接手机" : undefined} onClick={onPairPhone}>
+        <button className="v3-foot-row" data-tour="sidebar-pair-phone" title={collapsed ? "扫码连接手机" : undefined} onClick={onPairPhone}>
           <QrCode size={14} />
           {collapsed ? null : <span className="grow truncate">扫码连接手机</span>}
         </button>

@@ -5,6 +5,7 @@ import { CuteIcon, type CuteIconName } from "../../components/icons";
 import { useSettings, useLive, allAgents } from "../../lib/store";
 import { useAssistant } from "../../lib/assistant";
 import { UpdatePrompt } from "../../components/UpdatePrompt";
+import { MobileWalkthroughOverlay } from "../../components/MobileWalkthroughOverlay";
 import { usePalette } from "../../theme/theme";
 import { fonts } from "../../theme/tokens";
 
@@ -84,6 +85,7 @@ export default function TabsLayout() {
         />
       </Tabs>
       <UpdatePrompt />
+      <MobileWalkthroughOverlay />
     </>
   );
 }

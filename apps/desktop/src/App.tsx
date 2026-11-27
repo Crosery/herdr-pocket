@@ -463,11 +463,28 @@ function PocketAppShell() {
       if (detail?.agentKey) setSelectedAgent(detail.agentKey);
       setTab("agents");
     };
+    const onTourCommand = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ action?: string; tab?: TabId }>).detail;
+      if (detail?.action === "closeModals") {
+        setPairOpen(false);
+        setRelayOpen(false);
+        setCmdOpen(false);
+      } else if (detail?.action === "openPairPhone") {
+        setRelayOpen(false);
+        setCmdOpen(false);
+        setPairOpen(true);
+      } else if (detail?.action === "setMobileTab" && detail.tab) {
+        setSelectedAgent(null);
+        setTab(detail.tab);
+      }
+    };
     window.addEventListener("pocket:open-mobile-file", onOpenMobileFile);
     window.addEventListener("pocket:workbench-back-to-agent", onBackToAgent);
+    window.addEventListener("pocket:tour-command", onTourCommand);
     return () => {
       window.removeEventListener("pocket:open-mobile-file", onOpenMobileFile);
       window.removeEventListener("pocket:workbench-back-to-agent", onBackToAgent);
+      window.removeEventListener("pocket:tour-command", onTourCommand);
     };
   }, []);
 
@@ -890,13 +907,19 @@ function PocketAppShell() {
       {activeTutorialMode ? (
         <TutorialSandboxStage
           mode={activeTutorialMode}
+          mobileLayout={mobileLayout}
+          mobileTab={tab}
+          isDemo={Boolean(server && isMockServer(server))}
+          sidebarCollapsed={rail}
+          canToggleSidebar={tier !== "rail"}
+          onSetSidebarCollapsed={(next) => updateSettings({ sidebarCollapsed: next })}
           onComplete={() => {
             if (activeTutorialMode === "replay") {
               closeInteractiveTutorialReplay();
               return;
             }
             void setTutorialStatus(2);
-            toast("新手教程已完成，欢迎进入工作台");
+            toast("新手引导已完成，开始使用工作台吧");
           }}
           onSkip={() => {
             if (activeTutorialMode === "replay") {
@@ -904,7 +927,7 @@ function PocketAppShell() {
               return;
             }
             void setTutorialStatus(1);
-            toast("已跳过教程，随时可在「设置 → 重温互动教程」再次体验");
+            toast("已退出引导，随时可在「设置 → 重温新手引导」再次查看");
           }}
         />
       ) : null}
