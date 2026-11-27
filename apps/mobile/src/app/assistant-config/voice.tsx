@@ -18,6 +18,7 @@ import { changeConfig, flash, loadConfig, loadVoices, useAssistantConfig, useCon
 import { useSettings } from "../../lib/store";
 import { isMockServer } from "../../lib/mock";
 import { isVoiceprintLegacy, voiceprintSupported } from "../../lib/voice";
+import { useMobileVoiceModelDownload } from "../../lib/voiceModelDownload";
 import { usePalette } from "../../theme/theme";
 import { fonts, space } from "../../theme/tokens";
 
@@ -108,20 +109,24 @@ function VoiceForm({ config }: { config: AssistantConfigView }) {
   const voiceDenoise = useSettings((x) => x.voiceDenoise);
   const voiceFilter = useSettings((x) => x.voiceFilter);
   const voiceprint = useSettings((x) => x.voiceprint);
+  const vpDownloading = useMobileVoiceModelDownload((s) => s.downloading);
+  const vpDownloadProgress = useMobileVoiceModelDownload((s) => s.progress);
   const server = useSettings((x) => x.server);
   const localOk = voiceprintSupported || isMockServer(server);
   const legacy = isVoiceprintLegacy(voiceprint);
   const localSub = !localOk
     ? "需要装新版 App"
-    : `${voiceDenoise ? "降噪已开" : "降噪关着"} · ${
-        legacy
-          ? "声纹引擎已升级，请重录一次"
-          : voiceprint
-            ? voiceFilter
-              ? "只提取你的声音"
-              : "声纹已存（暂停提取）"
-            : "未录声纹"
-      }`;
+    : vpDownloading
+      ? `正在后台下载声纹模型 · ${Math.round(vpDownloadProgress * 100)}%`
+      : `${voiceDenoise ? "降噪已开" : "降噪关着"} · ${
+          legacy
+            ? "声纹引擎已升级，请重录一次"
+            : voiceprint
+              ? voiceFilter
+                ? "只提取你的声音"
+                : "声纹已存（暂停提取）"
+              : "未录声纹"
+        }`;
 
   /** Picking a SOTA preset fills provider, endpoint and model cleanly (synced with desktop). */
   function applyPreset(preset: VoiceModelPreset) {

@@ -23,6 +23,16 @@ import {
 } from "../lib/voicePresets";
 import { deleteVoiceprintFromRelay, pushVoiceprintToRelay } from "../lib/voiceprintSync";
 import {
+  cancelVoiceAiDownload,
+  clearVoiceAiDownloadError,
+  defaultVoiceAiDownloadLabel,
+  ensureVoiceAiDownloadWatcher,
+  isVoiceAiCancelMessage,
+  startVoiceAiDownload,
+  syncVoiceAiDownloadFromState,
+  voiceAiDownloadStore,
+} from "../lib/voiceAiDownload";
+import {
   PocketBadge,
   PocketButton,
   PocketModal,
@@ -32,7 +42,7 @@ import {
   useToast,
 } from "./PocketUI";
 
-type Phase = "idle" | "downloading" | "recording" | "finishing" | "testing";
+type Phase = "idle" | "recording" | "finishing" | "testing";
 
 export interface VoiceprintModalProps {
   open: boolean;
@@ -86,9 +96,8 @@ export function VoiceprintModal({
   onStateChange,
 }: VoiceprintModalProps) {
   const toast = useToast();
+  const dl = voiceAiDownloadStore.use((s) => s);
   const [phase, setPhase] = useState<Phase>("idle");
-  const [dlLabel, setDlLabel] = useState("声纹模型");
-  const [dlProgress, setDlProgress] = useState(0);
   const [level, setLevel] = useState(0);
   const [seconds, setSeconds] = useState(0);
   const [recFull, setRecFull] = useState(false);
@@ -99,10 +108,17 @@ export function VoiceprintModal({
   const [askClear, setAskClear] = useState(false);
   const phaseRef = useRef<Phase>(phase);
   phaseRef.current = phase;
+  const openRef = useRef(open);
+  openRef.current = open;
+  const bgNotifiedRef = useRef(false);
 
-  const stopTransientWork = useCallback(() => {
+  const isDownloading = dl.downloading || aiState.downloading;
+  const activeDlLabel = dl.label || aiState.dlLabel || "声纹模型";
+  const activeDlProgress = dl.downloading ? dl.progress : aiState.progress;
+
+  /** Only stops active microphone capture (enroll/test); model downloads keep running in background. */
+  const stopCaptureWork = useCallback(() => {
     const cur = phaseRef.current;
-    if (cur === "downloading") void native.voiceAiCancelDownload();
     if (cur === "recording" || cur === "finishing") void native.voiceAiCancelEnroll();
     if (cur === "testing") void native.voiceAiStopTest();
     setPhase("idle");
@@ -113,21 +129,27 @@ export function VoiceprintModal({
   }, []);
 
   useEffect(() => {
+    ensureVoiceAiDownloadWatcher();
+  }, []);
+
+  useEffect(() => {
+    syncVoiceAiDownloadFromState(aiState);
+  }, [aiState]);
+
+  useEffect(() => {
+    if (!open || !dl.lastState) return;
+    onStateChange(dl.lastState);
+  }, [open, dl.lastState, onStateChange]);
+
+  useEffect(() => {
     if (!open) {
-      stopTransientWork();
+      stopCaptureWork();
       setError(null);
       setAskClear(false);
       setTestResult(null);
       return;
     }
-    const offProg = native.onVoiceAiProgress((e) => {
-      if (e.dlLabel) setDlLabel(e.dlLabel);
-      setDlProgress(e.progress);
-      if (e.dlError) setError(e.dlError);
-      if (!e.downloading && e.done) {
-        void native.voiceAiState().then(onStateChange);
-      }
-    });
+    bgNotifiedRef.current = false;
     const offEnroll = native.onVoiceAiEnroll((e: VoiceAiEnrollEvent) => {
       setLevel(e.level);
       setSeconds(e.seconds);
@@ -141,37 +163,46 @@ export function VoiceprintModal({
       }
     });
     return () => {
-      offProg();
       offEnroll();
       offTest();
     };
-  }, [open, onStateChange, stopTransientWork]);
+  }, [open, stopCaptureWork]);
 
-  const busy = phase !== "idle";
+  const busy = isDownloading || phase !== "idle";
 
   const ensureModelForTier = async (target: "sv" | "tse"): Promise<boolean> => {
-    const needSv = !aiState.svReady || !aiState.dpdfReady || !aiState.vadReady;
+    const needSv = !aiState.svReady || !aiState.dpdfReady || !aiState.vadReady || !aiState.ortReady;
     const needTse = target === "tse" && !aiState.tseReady;
     if (!needSv && !needTse) return true;
     setError(null);
-    setPhase("downloading");
-    setDlLabel(
-      target === "tse"
-        ? `旗舰声纹分离包（约 ${aiState.tseSizeMb} MB）`
-        : `灵巧声纹模型（约 ${aiState.svSizeMb} MB）`,
-    );
-    setDlProgress(0);
+    clearVoiceAiDownloadError();
+    const label = defaultVoiceAiDownloadLabel(target, aiState);
     try {
-      const next = await native.voiceAiDownload(target);
+      const next = await startVoiceAiDownload(target, label);
       onStateChange(next);
       return true;
     } catch (e) {
       const msg = (e as Error).message || "模型下载失败";
-      if (!/取消/.test(msg)) setError(msg);
+      if (!isVoiceAiCancelMessage(msg) && openRef.current) setError(msg);
       return false;
-    } finally {
-      setPhase((cur) => (cur === "downloading" ? "idle" : cur));
     }
+  };
+
+  const handleCancelDownload = async () => {
+    await cancelVoiceAiDownload();
+    const fresh = await native.voiceAiState().catch(() => null);
+    if (fresh) onStateChange(fresh);
+  };
+
+  const handleRequestOpenChange = (next: boolean) => {
+    if (!next) {
+      stopCaptureWork();
+      if (isDownloading && !bgNotifiedRef.current) {
+        bgNotifiedRef.current = true;
+        toast("声纹模型将在后台继续下载，完成后会提醒你");
+      }
+    }
+    onOpenChange(next);
   };
 
   const handleSelectTier = async (nextTier: VoiceAiTier) => {
@@ -180,9 +211,9 @@ export function VoiceprintModal({
     try {
       const updated = await native.voiceAiSetConfig({ tier: nextTier });
       onStateChange(updated);
-      if (nextTier === "sv" && !updated.svReady) {
+      if (nextTier === "sv" && (!updated.svReady || !updated.dpdfReady || !updated.vadReady || !updated.ortReady)) {
         await ensureModelForTier("sv");
-      } else if (nextTier === "tse" && (!updated.svReady || !updated.tseReady)) {
+      } else if (nextTier === "tse" && (!updated.svReady || !updated.tseReady || !updated.dpdfReady || !updated.vadReady || !updated.ortReady)) {
         await ensureModelForTier("tse");
       }
     } catch (e) {
@@ -212,6 +243,8 @@ export function VoiceprintModal({
       aiState.tier === "tse" ||
       (aiState.tier === "auto" && aiState.recommendedTier === "tse");
     if (!(await ensureModelForTier(wantTse ? "tse" : "sv"))) return;
+    // Modal was closed while downloading in background: do not silently open the microphone.
+    if (!openRef.current) return;
     try {
       setSeconds(0);
       setLevel(0);
@@ -259,6 +292,8 @@ export function VoiceprintModal({
     setTestResult(null);
     setTestSpeaking(false);
     if (!(await ensureModelForTier("sv"))) return;
+    // Modal was closed while downloading in background: do not silently start mic testing.
+    if (!openRef.current) return;
     try {
       await native.voiceAiStartTest(aiState.threshold);
       setPhase("testing");
@@ -323,10 +358,7 @@ export function VoiceprintModal({
   return (
     <PocketModal
       open={open}
-      onOpenChange={(next) => {
-        if (!next) stopTransientWork();
-        onOpenChange(next);
-      }}
+      onOpenChange={handleRequestOpenChange}
       title="只认我的声音"
       subtitle="声纹模型与特征均留在本地设备，不上传云端"
       width={560}
@@ -487,10 +519,10 @@ export function VoiceprintModal({
           </div>
         </div>
 
-        {error ? (
+        {error || dl.error ? (
           <div className="inline-alert" role="alert">
             <XCircle size={15} style={{ flexShrink: 0 }} />
-            <span className="grow">{error}</span>
+            <span className="grow">{error || dl.error}</span>
           </div>
         ) : null}
 
@@ -505,15 +537,15 @@ export function VoiceprintModal({
             background: "var(--surface-2)",
           }}
         >
-          {phase === "downloading" ? (
+          {isDownloading ? (
             <>
               <div className="between" style={{ gap: 8 }}>
-                <span style={{ fontWeight: 700, fontSize: fs(13) }}>
-                  <Download size={14} style={{ verticalAlign: "-2px", marginRight: 6 }} />
-                  正在准备 {dlLabel}
+                <span className="row" style={{ gap: 6, fontWeight: 700, fontSize: fs(13), minWidth: 0 }}>
+                  <Download size={14} style={{ flexShrink: 0, color: "var(--accent-text)" }} />
+                  <span className="truncate">正在后台下载 {activeDlLabel}</span>
                 </span>
-                <span className="mono" style={{ fontSize: fs(12.5), color: "var(--accent-text)" }}>
-                  {Math.round(dlProgress * 100)}%
+                <span className="mono" style={{ fontSize: fs(12.5), color: "var(--accent-text)", flexShrink: 0 }}>
+                  {Math.round(activeDlProgress * 100)}%
                 </span>
               </div>
               <div
@@ -526,7 +558,7 @@ export function VoiceprintModal({
               >
                 <div
                   style={{
-                    width: `${Math.round(dlProgress * 100)}%`,
+                    width: `${Math.round(activeDlProgress * 100)}%`,
                     height: "100%",
                     borderRadius: 999,
                     background: "var(--primary)",
@@ -534,13 +566,23 @@ export function VoiceprintModal({
                   }}
                 />
               </div>
-              <div className="row" style={{ justifyContent: "flex-end" }}>
+              <div className="faint" style={{ fontSize: fs(12), lineHeight: 1.45 }}>
+                默认在后台下载，关闭此弹窗不会中断进度，完成后会自动提醒你。
+              </div>
+              <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
                 <PocketButton
                   size="sm"
                   variant="ghost"
-                  onClick={() => void native.voiceAiCancelDownload().then(() => setPhase("idle"))}
+                  onClick={() => void handleCancelDownload()}
                 >
                   取消下载
+                </PocketButton>
+                <PocketButton
+                  size="sm"
+                  variant="soft"
+                  onClick={() => handleRequestOpenChange(false)}
+                >
+                  后台下载
                 </PocketButton>
               </div>
             </>

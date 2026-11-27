@@ -20,6 +20,7 @@ import { useAssistantConfig, useConfigWatch, VOICE_LABEL } from "../../lib/assis
 import { alertsInBackground, alertsSupported, askNotificationPermission, refreshAlertState, useAlerts } from "../../lib/alerts";
 import { checkForUpdate, currentVersion, downloadUpdate, installUpdate, resumeInstallIfAllowed, updatesSupported, useNewRelease, useUpdate } from "../../lib/update";
 import { isVoiceprintLegacy, syncNativeVoice, voiceprintSupported } from "../../lib/voice";
+import { useMobileVoiceModelDownload } from "../../lib/voiceModelDownload";
 import { horizontalPad } from "../../lib/layoutMetrics";
 import { PocketNative } from "../../../modules/pocket-native";
 import { usePalette } from "../../theme/theme";
@@ -448,20 +449,24 @@ function VoiceLocalCard({ demo }: { demo: boolean }) {
   const voiceFilter = useSettings((x) => x.voiceFilter);
   const voiceFirstSpeaker = useSettings((x) => x.voiceFirstSpeaker);
   const voiceprint = useSettings((x) => x.voiceprint);
+  const vpDownloading = useMobileVoiceModelDownload((s) => s.downloading);
+  const vpDownloadProgress = useMobileVoiceModelDownload((s) => s.progress);
   const set = useSettings((x) => x.set);
   const ok = voiceprintSupported || demo;
   const legacy = isVoiceprintLegacy(voiceprint) || (!demo && !voiceprint && Boolean(PocketNative?.voiceState?.()?.legacyEnrolled));
   const vpSub = !ok
     ? "需要装新版 App"
-    : legacy
-      ? "声纹引擎已升级，请重录一次"
-      : voiceprint
-        ? voiceFilter
-          ? `已开启 · 实时提取你的声纹人声（约 ${Math.round(voiceprint.seconds)} 秒）`
-          : `已录入（约 ${Math.round(voiceprint.seconds)} 秒）· 暂时关闭`
-        : voiceFirstSpeaker
-          ? "已开启首个说话人锁定 · 自动屏蔽旁人插话"
-          : "未录入 · 任何人说话或外放都会传给小羊";
+    : vpDownloading
+      ? `正在后台下载声纹模型 · ${Math.round(vpDownloadProgress * 100)}%`
+      : legacy
+        ? "声纹引擎已升级，请重录一次"
+        : voiceprint
+          ? voiceFilter
+            ? `已开启 · 实时提取你的声纹人声（约 ${Math.round(voiceprint.seconds)} 秒）`
+            : `已录入（约 ${Math.round(voiceprint.seconds)} 秒）· 暂时关闭`
+          : voiceFirstSpeaker
+            ? "已开启首个说话人锁定 · 自动屏蔽旁人插话"
+            : "未录入 · 任何人说话或外放都会传给小羊";
   return (
     <Card style={{ paddingVertical: space.xs }}>
       <Row

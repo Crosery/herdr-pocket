@@ -36,7 +36,7 @@ test("PWA manifest.webmanifest, icons, and sw.js are valid and non-empty", () =>
   }
 
   const sw = readFileSync(swPath, "utf8");
-  assert.equal(sw.includes("herdr-pocket-shell-v16"), true);
+  assert.equal(sw.includes("herdr-pocket-shell-v17"), true);
   assert.equal(sw.includes("__pocket_check"), true, "SW must bypass cache-probing requests");
   assert.equal(sw.includes("SKIP_WAITING"), true);
   assert.equal(sw.includes('cache: "no-cache"'), true, "SW must revalidate document navigations against upstream");

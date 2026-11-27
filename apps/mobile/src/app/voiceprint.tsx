@@ -19,10 +19,15 @@ import { applog, uploadAppLog } from "../lib/applog";
 import { useSettings } from "../lib/store";
 import { isMockServer } from "../lib/mock";
 import { isVoiceprintLegacy, micAllowed, syncNativeVoice, useVoice, VOICEPRINT_MODEL_VERSION } from "../lib/voice";
+import {
+  cancelMobileVoiceModelDownload,
+  startMobileVoiceModelDownload,
+  useMobileVoiceModelDownload,
+} from "../lib/voiceModelDownload";
 import { usePalette } from "../theme/theme";
 import { fonts, radius, space, statusColors } from "../theme/tokens";
 
-type Phase = "idle" | "downloading" | "recording" | "finishing" | "testing";
+type Phase = "idle" | "recording" | "finishing" | "testing";
 
 const TIER_TITLE: Record<"denoise" | "sv" | "tse", string> = {
   denoise: "暂不启用声纹（建议关闭声纹）",
@@ -90,8 +95,10 @@ export default function VoiceprintScreen() {
   );
   const [benchBusy, setBenchBusy] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
-  const [dlLabel, setDlLabel] = useState("声纹与人声模型");
-  const [dlProgress, setDlProgress] = useState(0);
+  const dlDownloading = useMobileVoiceModelDownload((s) => s.downloading);
+  const dlLabel = useMobileVoiceModelDownload((s) => s.label);
+  const dlProgress = useMobileVoiceModelDownload((s) => s.progress);
+  const dlCompletedSeq = useMobileVoiceModelDownload((s) => s.completedSeq);
   const [level, setLevel] = useState(0);
   const [seconds, setSeconds] = useState(0);
   const [recFull, setRecFull] = useState(false);
@@ -102,6 +109,7 @@ export default function VoiceprintScreen() {
   const [toast, setToast] = useState<string | null>(null);
   const [askClear, setAskClear] = useState(false);
   const demoTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const mountedRef = useRef(true);
   const thresholdRef = useRef(voiceThreshold);
   thresholdRef.current = voiceThreshold;
   const lastTestLogAt = useRef(0);
@@ -117,9 +125,9 @@ export default function VoiceprintScreen() {
     }
   }, []);
 
-  const stopAny = useCallback(() => {
+  /** Only stops active microphone capture on unmount; model downloads continue in background. */
+  const stopCaptureOnly = useCallback(() => {
     stopDemo();
-    PocketNative?.cancelVoiceModel?.();
     PocketNative?.cancelVoiceEnroll?.();
     PocketNative?.stopVoiceTest?.();
     if (pendingFlush.current) {
@@ -146,11 +154,15 @@ export default function VoiceprintScreen() {
   }, [demo, benchBusy]);
 
   useEffect(() => {
+    mountedRef.current = true;
     if (!demo && !bench && PocketNative?.benchmarkVoiceDevice) {
       void runBenchmark();
     }
-    return () => stopAny();
-  }, [stopAny]);
+    return () => {
+      mountedRef.current = false;
+      stopCaptureOnly();
+    };
+  }, [stopCaptureOnly]);
 
   const refreshModelFlags = useCallback(() => {
     if (demo) {
@@ -165,10 +177,11 @@ export default function VoiceprintScreen() {
   }, [demo]);
 
   useEffect(() => {
+    refreshModelFlags();
+  }, [dlCompletedSeq, refreshModelFlags]);
+
+  useEffect(() => {
     if (!PocketNative) return;
-    const s1 = PocketNative.addListener("onVoiceModelProgress", (e) => {
-      if (e.total > 0) setDlProgress(Math.min(1, e.received / e.total));
-    });
     const s2 = PocketNative.addListener("onEnrollProgress", (e) => {
       setLevel(e.level);
       setSeconds(e.seconds);
@@ -215,7 +228,6 @@ export default function VoiceprintScreen() {
       }
     });
     return () => {
-      s1.remove();
       s2.remove();
       s3.remove();
     };
@@ -225,26 +237,17 @@ export default function VoiceprintScreen() {
     if (demo) return true;
     if (target === "sv" && svReady) return true;
     if (target === "tse" && svReady && tseReady) return true;
-    const dl = PocketNative?.prepareVoiceTier ?? PocketNative?.prepareVoiceModel;
-    if (!dl) {
-      setError("这个版本的 App 还没带声纹功能，先更新 App");
-      return false;
-    }
-    setPhase("downloading");
-    setDlLabel(target === "sv" ? `灵巧声纹模型（约 ${svSizeMb} MB）` : `旗舰人声分离包（总计约 ${modelSizeMb} MB）`);
-    setDlProgress(0);
     setError(null);
-    try {
-      await (PocketNative?.prepareVoiceTier ? PocketNative.prepareVoiceTier(target) : PocketNative!.prepareVoiceModel!());
-      refreshModelFlags();
-      return true;
-    } catch (e) {
-      const msg = (e as Error).message || "下载失败";
-      if (!/cancel/i.test(msg)) setError(msg);
-      return false;
-    } finally {
-      setPhase((cur) => (cur === "downloading" ? "idle" : cur));
+    const label = target === "sv" ? `灵巧声纹模型（约 ${svSizeMb} MB）` : `旗舰人声分离包（总计约 ${modelSizeMb} MB）`;
+    const res = await startMobileVoiceModelDownload(target, label);
+    if (mountedRef.current) {
+      if (res.ok) {
+        refreshModelFlags();
+      } else if (!res.cancelled && res.error) {
+        setError(res.error);
+      }
     }
+    return res.ok;
   }
 
   async function chooseTier(next: VoiceTier) {
@@ -296,6 +299,7 @@ export default function VoiceprintScreen() {
     }
     const wantTse = effectiveChoice === "tse" || (effectiveChoice === "auto" && bench?.tier === "tse");
     if (!(await ensureTierModel(wantTse ? "tse" : "sv"))) return;
+    if (!mountedRef.current) return;
     if (!PocketNative?.startVoiceEnroll) {
       setError("这个版本的 App 还没带声纹功能，先更新 App");
       return;
@@ -438,6 +442,7 @@ export default function VoiceprintScreen() {
       return;
     }
     if (!(await ensureTierModel("sv"))) return;
+    if (!mountedRef.current) return;
     if (!PocketNative?.startVoiceTest) return;
     try {
       syncNativeVoice();
@@ -463,7 +468,7 @@ export default function VoiceprintScreen() {
 
   function clearVoiceprint() {
     setAskClear(false);
-    stopAny();
+    stopCaptureOnly();
     setPhase("idle");
     set({ voiceprint: null });
     setNativeLegacy(false);
@@ -477,7 +482,7 @@ export default function VoiceprintScreen() {
 
   const sensitivity = SENSITIVITY.find((x) => Math.abs(x.value - voiceThreshold) < 0.02) ?? SENSITIVITY[1];
   const good = statusColors("working", p.dark);
-  const busy = phase !== "idle";
+  const busy = dlDownloading || phase !== "idle";
   const activeRoute = testResult?.route ?? testRoute;
 
   const enrolledDetails =
@@ -683,17 +688,20 @@ export default function VoiceprintScreen() {
             )}
           </View>
 
-          {enrolledDetails && phase === "idle" ? (
+          {enrolledDetails && !dlDownloading && phase === "idle" ? (
             <Text style={{ color: p.faint, fontSize: 12, fontVariant: ["tabular-nums"] }}>{enrolledDetails}</Text>
           ) : null}
 
-          {phase === "downloading" ? (
+          {dlDownloading ? (
             <View style={{ gap: space.sm }}>
               <Text style={{ color: p.ink, fontSize: 14 }}>
-                正在准备{dlLabel}，{Math.round(dlProgress * 100)}%
+                正在后台下载{dlLabel}，{Math.round(dlProgress * 100)}%
               </Text>
               <PocketProgress progress={dlProgress} height={8} />
-              <PocketButton variant="ghost" onPress={() => PocketNative?.cancelVoiceModel?.()} style={{ alignSelf: "flex-end" }}>
+              <Text style={{ color: p.faint, fontSize: 12, lineHeight: 17 }}>
+                默认在后台下载，返回其他页面不会中断进度。
+              </Text>
+              <PocketButton variant="ghost" onPress={cancelMobileVoiceModelDownload} style={{ alignSelf: "flex-end" }}>
                 取消下载
               </PocketButton>
             </View>

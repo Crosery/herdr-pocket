@@ -3791,13 +3791,14 @@ pub async fn download_tier(app: &AppHandle, tier: &str) -> Result<VoiceAiState, 
         })
         .await;
         if let Err(e) = res {
+            let err_msg = if e == "已取消下载" { None } else { Some(e.clone()) };
             emit_progress(
                 app,
                 &DownloadSnapshot {
                     downloading: false,
                     progress: 0.0,
                     dl_label: None,
-                    dl_error: Some(e.clone()),
+                    dl_error: err_msg,
                 },
                 completed_bytes,
                 total_bytes,

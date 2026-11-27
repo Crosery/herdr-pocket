@@ -38,6 +38,7 @@ import { isMockServer } from "./lib/mock";
 import { native, type TrafficLightMetrics } from "./lib/native";
 import { installWindowDragBridge } from "./lib/windowDrag";
 import { ensureChatQueueWatcher } from "./lib/chatQueue";
+import { ensureVoiceAiDownloadWatcher, voiceAiDownloadStore } from "./lib/voiceAiDownload";
 import {
   buildCuteFontFamily,
   buildUiFontFamily,
@@ -242,6 +243,31 @@ function PocketAppShell() {
     if (boot !== "ready" || isH5Web()) return;
     return startAutoUpdateChecks();
   }, [boot]);
+
+  const vpCompletedSeq = voiceAiDownloadStore.use((s) => s.completedSeq);
+  const vpCompletedLabel = voiceAiDownloadStore.use((s) => s.completedLabel);
+  const vpFailedSeq = voiceAiDownloadStore.use((s) => s.failedSeq);
+  const vpFailedMessage = voiceAiDownloadStore.use((s) => s.failedMessage);
+  const lastVpDoneSeqRef = useRef(vpCompletedSeq);
+  const lastVpFailSeqRef = useRef(vpFailedSeq);
+
+  useEffect(() => {
+    ensureVoiceAiDownloadWatcher();
+  }, []);
+
+  useEffect(() => {
+    if (vpCompletedSeq > lastVpDoneSeqRef.current) {
+      lastVpDoneSeqRef.current = vpCompletedSeq;
+      toast(`${vpCompletedLabel ?? "声纹模型"}已下载完成，可随时录入声纹`);
+    }
+  }, [vpCompletedSeq, vpCompletedLabel, toast]);
+
+  useEffect(() => {
+    if (vpFailedSeq > lastVpFailSeqRef.current) {
+      lastVpFailSeqRef.current = vpFailedSeq;
+      if (vpFailedMessage) toast(vpFailedMessage, true);
+    }
+  }, [vpFailedSeq, vpFailedMessage, toast]);
 
   useEffect(() => {
     applyThemeAttribute(theme);

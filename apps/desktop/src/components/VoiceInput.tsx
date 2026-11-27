@@ -22,6 +22,15 @@ import { detectPlatform } from "../lib/bridge";
 import { VOICEPRINT_SENSITIVITY_OPTIONS } from "../lib/voicePresets";
 import { decodeAudioFileToPcm16Base64, pullVoiceprintFromRelay, pushVoiceprintToRelay } from "../lib/voiceprintSync";
 import {
+  cancelVoiceAiDownload,
+  defaultVoiceAiDownloadLabel,
+  ensureVoiceAiDownloadWatcher,
+  isVoiceAiCancelMessage,
+  startVoiceAiDownload,
+  syncVoiceAiDownloadFromState,
+  voiceAiDownloadStore,
+} from "../lib/voiceAiDownload";
+import {
   native,
   type Permission,
   type PermissionKind,
@@ -468,6 +477,7 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
   const singleKey = isModifierKey(cfg.hotkey);
 
   const [vpBusy, setVpBusy] = useState(false);
+  const vpDownload = voiceAiDownloadStore.use((s) => s);
   const audioImportRef = useRef<HTMLInputElement | null>(null);
   const autoPulledVpRef = useRef(false);
 
@@ -485,6 +495,7 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
       setRuntime(r);
       if (ai) {
         setAiState(ai);
+        syncVoiceAiDownloadFromState(ai);
         const srv = settingsStore.get().server;
         if (!ai.enrolled && srv && !isMockServer(srv) && !autoPulledVpRef.current) {
           autoPulledVpRef.current = true;
@@ -503,6 +514,16 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
       setChecking(false);
     }
   }, []);
+
+  useEffect(() => {
+    ensureVoiceAiDownloadWatcher();
+  }, []);
+
+  useEffect(() => {
+    if (vpDownload.lastState) {
+      setAiState(vpDownload.lastState);
+    }
+  }, [vpDownload.lastState]);
 
   useEffect(() => {
     void refresh();
@@ -558,15 +579,21 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
     try {
       const next = await native.voiceAiSetConfig({ tier: nextTier });
       setAiState(next);
-      if (nextTier === "sv" && !next.svReady) {
-        setAiState(await native.voiceAiDownload("sv"));
-      } else if (nextTier === "tse" && (!next.svReady || !next.tseReady)) {
-        setAiState(await native.voiceAiDownload("tse"));
+      syncVoiceAiDownloadFromState(next);
+      if (nextTier === "sv" && (!next.svReady || !next.dpdfReady || !next.vadReady || !next.ortReady)) {
+        toast("已开始在后台下载灵巧声纹模型");
+        setAiState(await startVoiceAiDownload("sv", defaultVoiceAiDownloadLabel("sv", next)));
+      } else if (nextTier === "tse" && (!next.svReady || !next.tseReady || !next.dpdfReady || !next.vadReady || !next.ortReady)) {
+        toast("已开始在后台下载旗舰声纹分离包");
+        setAiState(await startVoiceAiDownload("tse", defaultVoiceAiDownloadLabel("tse", next)));
       }
     } catch (e) {
       const msg = (e as Error).message;
-      if (!/取消/.test(msg)) toast(msg, true);
-      void native.voiceAiState().then(setAiState);
+      if (!isVoiceAiCancelMessage(msg)) toast(msg, true);
+      void native.voiceAiState().then((st) => {
+        setAiState(st);
+        syncVoiceAiDownloadFromState(st);
+      });
     }
   };
 
@@ -592,9 +619,9 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
     setVpBusy(true);
     try {
       let current = await native.voiceAiState();
-      if (!current.svReady || !current.vadReady) {
-        toast("正在下载声纹提取模型，完成后自动导入…");
-        current = await native.voiceAiDownload("sv");
+      if (!current.svReady || !current.vadReady || !current.dpdfReady || !current.ortReady) {
+        toast("正在后台下载声纹提取模型，完成后自动导入…");
+        current = await startVoiceAiDownload("sv", defaultVoiceAiDownloadLabel("sv", current));
         setAiState(current);
       }
       const pcmB64 = await decodeAudioFileToPcm16Base64(file);
@@ -603,7 +630,8 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
       void pushVoiceprintToRelay().catch(() => {});
       toast(`已从音频提取声纹（${res.seconds.toFixed(1)}s），并同步开启只认我的声音`);
     } catch (e) {
-      toast((e as Error).message || "音频提取声纹失败", true);
+      const msg = (e as Error).message || "音频提取声纹失败";
+      if (!isVoiceAiCancelMessage(msg)) toast(msg, true);
     } finally {
       setVpBusy(false);
       if (audioImportRef.current) audioImportRef.current.value = "";
@@ -816,22 +844,59 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
                 </div>
               </div>
 
+              {(() => {
+                const aiDownloading = vpDownload.downloading || aiState.downloading;
+                const aiDlProgress = vpDownload.downloading ? vpDownload.progress : aiState.progress;
+                const aiDlPct = Math.round(aiDlProgress * 100);
+                const aiDlLabel = vpDownload.label || aiState.dlLabel || "声纹模型";
+                const aiDlError = vpDownload.error || aiState.dlError;
+                return (
+                  <>
               <div className="set-row">
                 <div className="set-text">
-                  <div className="set-title">声纹与人声分离档位</div>
+                  <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                    <span className="set-title">声纹与人声分离档位</span>
+                    {aiDownloading ? (
+                      <PocketBadge tone="lav" className="mono">
+                        后台下载中 {aiDlPct}%
+                      </PocketBadge>
+                    ) : null}
+                  </div>
                   <div className="set-about">
-                    {aiState.downloading
-                      ? `正在准备 ${aiState.dlLabel ?? "模型"} · ${Math.round(aiState.progress * 100)}%`
-                      : aiState.dlError
-                        ? aiState.dlError
+                    {aiDownloading
+                      ? `正在后台下载 ${aiDlLabel} · ${aiDlPct}%（离开此页或关闭弹窗仍会继续）`
+                      : aiDlError
+                        ? aiDlError
                         : aiState.recommendReason || "自动按本机算力匹配声纹模型"}
                   </div>
+                  {aiDownloading ? (
+                    <div
+                      style={{
+                        height: 6,
+                        marginTop: 6,
+                        maxWidth: 320,
+                        borderRadius: 999,
+                        background: "var(--surface-3)",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${aiDlPct}%`,
+                          height: "100%",
+                          borderRadius: 999,
+                          background: "var(--primary)",
+                          transition: "width 120ms ease",
+                        }}
+                      />
+                    </div>
+                  ) : null}
                 </div>
                 <div className="set-control" style={{ gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                   <PocketSelect
                     ariaLabel="声纹与人声分离档位"
                     value={aiState.tier}
-                    disabled={aiState.downloading}
+                    disabled={aiDownloading}
                     onValueChange={(v) => void selectAiTier(v as VoiceAiTier)}
                     options={[
                       {
@@ -849,13 +914,13 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
                       { value: "denoise", label: "仅降噪与人声增强" },
                     ]}
                   />
-                  {aiState.downloading ? (
+                  {aiDownloading ? (
                     <PocketButton
                       size="sm"
                       variant="ghost"
-                      onClick={() => void native.voiceAiCancelDownload().then(() => native.voiceAiState().then(setAiState))}
+                      onClick={() => void cancelVoiceAiDownload().then(() => native.voiceAiState().then(setAiState))}
                     >
-                      取消
+                      取消下载
                     </PocketButton>
                   ) : null}
                 </div>
@@ -872,14 +937,16 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
                           : "已录入"
                         : "未录入"}
                     </PocketBadge>
-                    <PocketBadge tone={aiState.svReady ? "mint" : "neutral"}>
-                      {aiState.svReady ? "模型已就绪" : "首次需下载模型"}
+                    <PocketBadge tone={aiDownloading ? "lav" : aiState.svReady ? "mint" : "neutral"}>
+                      {aiDownloading ? `后台下载中 ${aiDlPct}%` : aiState.svReady ? "模型已就绪" : "首次需下载模型"}
                     </PocketBadge>
                   </div>
                   <div className="set-about">
-                    {aiState.svReady
-                      ? "仅保留本人声音，忽略周围旁人说话（模型已永久缓存本机）"
-                      : "首次录制或导入音频会下载约 68–210 MB 本地模型，下载一次永久缓存"}
+                    {aiDownloading
+                      ? `正在后台准备 ${aiDlLabel}（${aiDlPct}%），可随时点右侧查看进度`
+                      : aiState.svReady
+                        ? "仅保留本人声音，忽略周围旁人说话（模型已永久缓存本机）"
+                        : "首次录制或导入音频会在后台下载约 68–210 MB 本地模型，下载一次永久缓存"}
                   </div>
                 </div>
                 <div className="set-control" style={{ gap: 8, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
@@ -932,7 +999,7 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
                   <PocketButton
                     size="sm"
                     variant="ghost"
-                    disabled={vpBusy || aiState.downloading}
+                    disabled={vpBusy || aiDownloading}
                     onClick={() => audioImportRef.current?.click()}
                   >
                     {vpBusy ? "处理中…" : "导入音频"}
@@ -943,10 +1010,13 @@ export function VoiceInputSetup({ compact = false, audioOnly = false }: { compac
                     disabled={vpBusy}
                     onClick={() => setVpModalOpen(true)}
                   >
-                    {aiState.enrolled ? "管理声纹" : "录制声纹"}
+                    {aiDownloading ? `下载进度 ${aiDlPct}%` : aiState.enrolled ? "管理声纹" : "录制声纹"}
                   </PocketButton>
                 </div>
               </div>
+                  </>
+                );
+              })()}
 
               <VoiceprintModal
                 open={vpModalOpen}
